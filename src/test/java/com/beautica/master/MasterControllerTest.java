@@ -173,6 +173,18 @@ class MasterControllerTest {
     }
 
     @Test
+    @DisplayName("GET /{masterId} — the response carries no `bookable` field (flag removed; visibility lives in search/roster)")
+    void should_omitBookableField_when_publicGetMasterDetail() throws Exception {
+        var masterId = UUID.randomUUID();
+        when(masterService.getMasterDetail(masterId)).thenReturn(stubMasterDetail(masterId, UUID.randomUUID()));
+
+        mockMvc.perform(get(MASTERS_URL + "/" + masterId).accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.masterId").value(masterId.toString()))
+                .andExpect(jsonPath("$.data.bookable").doesNotExist());
+    }
+
+    @Test
     @DisplayName("GET /{masterId} — 404 when master does not exist")
     void should_return404_when_getMasterWithUnknownId() throws Exception {
         var unknownMasterId = UUID.randomUUID();

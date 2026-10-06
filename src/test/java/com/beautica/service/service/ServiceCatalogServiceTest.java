@@ -53,6 +53,7 @@ import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -125,6 +126,9 @@ class ServiceCatalogServiceTest {
     @Mock
     private SalonCatalogCacheEvictor salonCatalogCacheEvictor;
 
+    @Mock
+    private com.beautica.master.service.MasterSearchVisibilityGuard searchVisibilityGuard;
+
     // Phase 307 D4 — unassignServiceFromMaster's per-assignment future-CONFIRMED-booking guard.
     // Only the unassign tests below stub these; every other test in this class throws (or
     // succeeds) before that guard is reached, so they never touch either mock.
@@ -133,6 +137,9 @@ class ServiceCatalogServiceTest {
 
     @Mock
     private java.time.Clock clock;
+
+    @Mock
+    private ServicePhotoBlobPurger servicePhotoBlobPurger;
 
     @InjectMocks
     private ServiceCatalogService serviceCatalogService;
@@ -530,7 +537,7 @@ class ServiceCatalogServiceTest {
         AssignServiceToMasterRequest request = new AssignServiceToMasterRequest(serviceDefId, null, null, null, null);
 
         MasterServiceResponse result = serviceCatalogService.assignServiceToMaster(
-                salonId, masterId, request);
+                ACTOR_ID, salonId, masterId, request);
 
         assertThat(result).isNotNull();
         assertThat(result.masterId())
@@ -599,7 +606,7 @@ class ServiceCatalogServiceTest {
         AssignServiceToMasterRequest request = new AssignServiceToMasterRequest(serviceDefId, null, null, null, null);
 
         MasterServiceResponse result = serviceCatalogService.assignServiceToMaster(
-                salonId, masterId, request);
+                ACTOR_ID, salonId, masterId, request);
 
         assertThat(result).isNotNull();
         assertThat(result.serviceDefinition().serviceTypeId())
@@ -614,6 +621,114 @@ class ServiceCatalogServiceTest {
 
         verify(serviceRepository).findByIdWithServiceType(serviceDefId);
         verify(serviceRepository, never()).findById(serviceDefId);
+    }
+
+    @Test
+    @DisplayName("assignServiceToMaster — Phase 345: the owner-row guard's 403 propagates before any "
+            + "definition lookup or write (SALON_ADMIN on the owner's own row)")
+    void should_throwForbidden_when_ownerRowGuardDeniesAssign() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        Salon salon = mock(Salon.class);
+        when(salon.getId()).thenReturn(salonId);
+        Master master = mock(Master.class);
+        when(master.getSalon()).thenReturn(salon);
+        when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
+        doThrow(new ForbiddenException("Access denied"))
+                .when(authz).enforceOwnerMasterRowWritableByOwnerOnly(ACTOR_ID, master);
+        AssignServiceToMasterRequest request =
+                new AssignServiceToMasterRequest(UUID.randomUUID(), null, null, null, null);
+
+        assertThatThrownBy(() ->
+                serviceCatalogService.assignServiceToMaster(ACTOR_ID, salonId, masterId, request))
+                .isInstanceOf(ForbiddenException.class);
+
+        verifyNoInteractions(serviceRepository);
+        verify(masterServiceRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("assignServiceToMaster — Phase 345 audit: the service-layer salon-management re-check "
+            + "denies before the master is even loaded")
+    void should_throwForbiddenBeforeAnyLoad_when_salonManagementRecheckDeniesAssign() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        doThrow(new ForbiddenException("Access denied"))
+                .when(authz).enforceCanManageSalon(ACTOR_ID, salonId);
+        AssignServiceToMasterRequest request =
+                new AssignServiceToMasterRequest(UUID.randomUUID(), null, null, null, null);
+
+        assertThatThrownBy(() ->
+                serviceCatalogService.assignServiceToMaster(ACTOR_ID, salonId, masterId, request))
+                .isInstanceOf(ForbiddenException.class);
+
+        verifyNoInteractions(masterRepository, serviceRepository, masterServiceRepository);
+    }
+
+    @Test
+    @DisplayName("assignServiceToMaster — Phase 345 audit: the happy path re-proves salon management "
+            + "for the caller-supplied actor")
+    void should_reCheckSalonManagement_when_assignSucceeds() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+        Salon salon = mock(Salon.class);
+        when(salon.getId()).thenReturn(salonId);
+        Master master = mock(Master.class);
+        when(master.getId()).thenReturn(masterId);
+        when(master.getSalon()).thenReturn(salon);
+        ServiceDefinition serviceDef = mock(ServiceDefinition.class);
+        when(serviceDef.getId()).thenReturn(serviceDefId);
+        when(serviceDef.getOwnerType()).thenReturn(OwnerType.SALON);
+        when(serviceDef.getOwnerId()).thenReturn(salonId);
+        when(serviceDef.getBasePrice()).thenReturn(new BigDecimal("350.00"));
+        when(serviceDef.getBaseDurationMinutes()).thenReturn(60);
+        when(serviceDef.isActive()).thenReturn(true);
+        MasterServiceAssignment savedAssignment = mock(MasterServiceAssignment.class);
+        when(savedAssignment.getId()).thenReturn(UUID.randomUUID());
+        when(savedAssignment.getMaster()).thenReturn(master);
+        when(savedAssignment.getServiceDefinition()).thenReturn(serviceDef);
+        when(savedAssignment.isActive()).thenReturn(true);
+        when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
+        when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(serviceDef));
+        when(masterServiceRepository.findByMasterIdAndServiceDefinitionId(masterId, serviceDefId))
+                .thenReturn(Optional.empty());
+        when(masterServiceRepository.save(any(MasterServiceAssignment.class))).thenReturn(savedAssignment);
+        AssignServiceToMasterRequest request = new AssignServiceToMasterRequest(serviceDefId, null, null, null, null);
+
+        serviceCatalogService.assignServiceToMaster(ACTOR_ID, salonId, masterId, request);
+
+        var order = org.mockito.Mockito.inOrder(authz, masterRepository);
+        order.verify(authz).enforceCanManageSalon(ACTOR_ID, salonId);
+        order.verify(masterRepository).findById(masterId);
+    }
+
+    @Test
+    @DisplayName("unassignServiceFromMaster — Phase 345: the owner-row guard's 403 propagates before "
+            + "the future-booking check or any write")
+    void should_throwForbidden_when_ownerRowGuardDeniesUnassign() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+        Salon salon = mock(Salon.class);
+        when(salon.getId()).thenReturn(salonId);
+        Master master = mock(Master.class);
+        when(master.getSalon()).thenReturn(salon);
+        MasterServiceAssignment assignment = mock(MasterServiceAssignment.class);
+        when(assignment.isActive()).thenReturn(true);
+        when(assignment.getMaster()).thenReturn(master);
+        when(masterServiceRepository.findByMasterIdAndServiceDefinitionId(masterId, serviceDefId))
+                .thenReturn(Optional.of(assignment));
+        doThrow(new ForbiddenException("Access denied"))
+                .when(authz).enforceOwnerMasterRowWritableByOwnerOnly(ACTOR_ID, master);
+
+        assertThatThrownBy(() ->
+                serviceCatalogService.unassignServiceFromMaster(ACTOR_ID, salonId, masterId, serviceDefId))
+                .isInstanceOf(ForbiddenException.class);
+
+        verify(assignment, never()).setActive(false);
+        verifyNoInteractions(bookingRepository);
+        verify(masterServiceRepository, never()).save(any());
     }
 
     @Test
@@ -635,7 +750,7 @@ class ServiceCatalogServiceTest {
         AssignServiceToMasterRequest request = new AssignServiceToMasterRequest(serviceDefId, null, null, null, null);
 
         assertThatThrownBy(() ->
-                serviceCatalogService.assignServiceToMaster(salonId, masterId, request))
+                serviceCatalogService.assignServiceToMaster(ACTOR_ID, salonId, masterId, request))
                 .isInstanceOf(ForbiddenException.class);
 
         verify(masterServiceRepository, never()).save(any());
@@ -666,7 +781,7 @@ class ServiceCatalogServiceTest {
         AssignServiceToMasterRequest request = new AssignServiceToMasterRequest(serviceDefId, null, null, null, null);
 
         assertThatThrownBy(() ->
-                serviceCatalogService.assignServiceToMaster(salonId, masterId, request))
+                serviceCatalogService.assignServiceToMaster(ACTOR_ID, salonId, masterId, request))
                 .isInstanceOf(ForbiddenException.class)
                 .hasMessageContaining("does not belong to this salon");
 
@@ -706,7 +821,7 @@ class ServiceCatalogServiceTest {
         AssignServiceToMasterRequest request = new AssignServiceToMasterRequest(serviceDefId, null, null, null, null);
 
         assertThatThrownBy(() ->
-                serviceCatalogService.assignServiceToMaster(salonId, masterId, request))
+                serviceCatalogService.assignServiceToMaster(ACTOR_ID, salonId, masterId, request))
                 .isInstanceOf(DuplicateServiceException.class)
                 .satisfies(ex -> {
                     DuplicateServiceException dup = (DuplicateServiceException) ex;
@@ -747,7 +862,7 @@ class ServiceCatalogServiceTest {
         AssignServiceToMasterRequest request = new AssignServiceToMasterRequest(serviceDefId, null, null, null, null);
 
         assertThatThrownBy(() ->
-                serviceCatalogService.assignServiceToMaster(salonId, masterId, request))
+                serviceCatalogService.assignServiceToMaster(ACTOR_ID, salonId, masterId, request))
                 .isInstanceOf(NotFoundException.class);
 
         // D1 must fire before the assignment lookup is ever consulted — no reactivation branch
@@ -795,7 +910,7 @@ class ServiceCatalogServiceTest {
         AssignServiceToMasterRequest request = new AssignServiceToMasterRequest(serviceDefId, null, null, null, null);
 
         assertThatThrownBy(() ->
-                serviceCatalogService.assignServiceToMaster(salonId, masterId, request))
+                serviceCatalogService.assignServiceToMaster(ACTOR_ID, salonId, masterId, request))
                 .as("an existing ACTIVE assignment must not route this into D2's duplicate branch "
                         + "once the definition itself is deactivated")
                 .isInstanceOf(NotFoundException.class)
@@ -833,7 +948,7 @@ class ServiceCatalogServiceTest {
         AssignServiceToMasterRequest request = new AssignServiceToMasterRequest(serviceDefId, null, null, null, null);
 
         assertThatThrownBy(() ->
-                serviceCatalogService.assignServiceToMaster(salonId, masterId, request))
+                serviceCatalogService.assignServiceToMaster(ACTOR_ID, salonId, masterId, request))
                 .as("a caller probing another salon's id must get 403, not a 404 that would "
                         + "confirm the id exists")
                 .isInstanceOf(ForbiddenException.class)
@@ -1551,6 +1666,8 @@ class ServiceCatalogServiceTest {
         // refresh their min_effective_price after deactivation — stub must be present.
         when(masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId))
                 .thenReturn(List.of(masterA, masterB));
+        when(serviceRepository.findByIdForUpdate(serviceDefId)).thenReturn(
+                java.util.Optional.of(ServiceDefinition.builder().id(serviceDefId).build()));
         when(serviceRepository.deactivateById(serviceDefId)).thenReturn(1);
 
         serviceCatalogService.deactivateServiceDefinition(actorId, serviceDefId);
@@ -1569,7 +1686,8 @@ class ServiceCatalogServiceTest {
     void should_throwNotFoundException_when_serviceDefinitionDoesNotExist() {
         UUID actorId = UUID.randomUUID();
         UUID missing = UUID.randomUUID();
-        when(serviceRepository.deactivateById(missing)).thenReturn(0);
+        // lock finds no row → 404 before any UPDATE
+        when(serviceRepository.findByIdForUpdate(missing)).thenReturn(java.util.Optional.empty());
 
         assertThatThrownBy(() -> serviceCatalogService.deactivateServiceDefinition(actorId, missing))
                 .isInstanceOf(NotFoundException.class)
@@ -1577,10 +1695,46 @@ class ServiceCatalogServiceTest {
     }
 
     @Test
+    @DisplayName("deactivate row-locks the definition BEFORE the UPDATE and purges the key read from the LOCKED row")
+    void should_purgeKeyFromLockedRow_when_deactivatingDefinitionWithPhoto() {
+        UUID actorId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+        String key = "services/" + serviceDefId + "/1-a.jpg";
+        when(serviceRepository.findByIdForUpdate(serviceDefId)).thenReturn(java.util.Optional.of(
+                ServiceDefinition.builder().id(serviceDefId).photoR2Key(key).build()));
+        when(serviceRepository.deactivateById(serviceDefId)).thenReturn(1);
+
+        serviceCatalogService.deactivateServiceDefinition(actorId, serviceDefId);
+
+        var order = org.mockito.Mockito.inOrder(serviceRepository, servicePhotoBlobPurger);
+        order.verify(serviceRepository).findByIdForUpdate(serviceDefId);
+        order.verify(serviceRepository).deactivateById(serviceDefId);
+        order.verify(servicePhotoBlobPurger).purgeAfterCommit(serviceDefId, key);
+    }
+
+    @Test
+    @DisplayName("deactivate of a definition without an uploaded photo registers no blob purge")
+    void should_notPurge_when_deactivatedDefinitionHasNoPhotoKey() {
+        UUID actorId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+        when(serviceRepository.findByIdForUpdate(serviceDefId)).thenReturn(java.util.Optional.of(
+                ServiceDefinition.builder().id(serviceDefId).build()));
+        when(serviceRepository.deactivateById(serviceDefId)).thenReturn(1);
+
+        serviceCatalogService.deactivateServiceDefinition(actorId, serviceDefId);
+
+        verifyNoInteractions(servicePhotoBlobPurger);
+    }
+
+    @Test
     @DisplayName("uses deactivateById (bulk UPDATE) rather than save — deactivation must not trigger a full entity replace")
     void should_useDeactivateById_not_save_when_deactivating() {
         UUID actorId = UUID.randomUUID();
         UUID serviceDefId = UUID.randomUUID();
+
+        when(serviceRepository.findByIdForUpdate(serviceDefId)).thenReturn(
+
+                java.util.Optional.of(ServiceDefinition.builder().id(serviceDefId).build()));
 
         when(serviceRepository.deactivateById(serviceDefId)).thenReturn(1);
 
@@ -1600,6 +1754,8 @@ class ServiceCatalogServiceTest {
         // No master performs it — the branch the guard exists for.
         when(masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId))
                 .thenReturn(List.of());
+        when(serviceRepository.findByIdForUpdate(serviceDefId)).thenReturn(
+                java.util.Optional.of(ServiceDefinition.builder().id(serviceDefId).build()));
         when(serviceRepository.deactivateById(serviceDefId)).thenReturn(1);
 
         serviceCatalogService.deactivateServiceDefinition(actorId, serviceDefId);

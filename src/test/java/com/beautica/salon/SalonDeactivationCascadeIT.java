@@ -535,6 +535,26 @@ class SalonDeactivationCascadeIT extends AbstractIntegrationTest {
     }
 
     @Test
+    @DisplayName("phase 343 TC-9 — keyed logo + cover: both STORED keys are purged after commit (key wins over the "
+            + "URL, which here is not even an R2 URL) and all four pointer columns are nulled")
+    void should_purgeStoredImageKeys_when_salonWithKeyedLogoAndCoverDeactivated() {
+        Salon salon = createSalon();
+        String logoKey = "salons/" + salon.salonId() + "/logo/l.jpg";
+        String coverKey = "salons/" + salon.salonId() + "/cover/c.jpg";
+        jdbcTemplate.update("UPDATE salons SET avatar_url = ?, avatar_r2_key = ?, cover_image_url = ?, "
+                        + "cover_r2_key = ? WHERE id = ?",
+                "https://elsewhere.example/a.jpg", logoKey, "https://elsewhere.example/b.jpg", coverKey,
+                salon.salonId());
+
+        salonService.deactivateSalon(salon.ownerId(), salon.salonId());
+
+        verify(r2StorageService).deleteFiles(List.of(logoKey, coverKey));
+        var cols = jdbcTemplate.queryForMap("SELECT avatar_url, avatar_r2_key, cover_image_url, cover_r2_key "
+                + "FROM salons WHERE id = ?", salon.salonId());
+        assertThat(cols.values()).as("every image pointer column is nulled").containsOnlyNulls();
+    }
+
+    @Test
     @DisplayName("phase 268 case 8 — media belonging to a DIFFERENT salon is untouched")
     void should_notTouchMediaOfOtherSalons_when_salonDeactivated() {
         Salon salon = createSalon();
@@ -576,7 +596,7 @@ class SalonDeactivationCascadeIT extends AbstractIntegrationTest {
     @Test
     @DisplayName("phase 268 GAP fix, ordering pin — R2 delete is actually ATTEMPTED for a "
             + "staff-uploaded salon photo's key, proving deactivateSalon's pre-read "
-            + "(mediaRepository.findByEntityTypeAndEntityId, SalonService.java around line 957-958) "
+            + "(mediaRepository.findMediaKeysByEntityTypeAndEntityId in SalonService.deactivateSalon) "
             + "ran BEFORE deleteSalonStaff hard-deleted the uploader and cascaded the row away. "
             + "The row-count-only assertion in the previous test cannot tell these two orderings "
             + "apart — both end with the row gone, one via this sweep's own DB delete, the other "

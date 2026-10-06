@@ -3,6 +3,7 @@ package com.beautica.salon.entity;
 import com.beautica.common.AuditableEntity;
 import com.beautica.location.SettlementDisplayNames;
 import com.beautica.user.User;
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.FetchType;
@@ -13,6 +14,7 @@ import jakarta.persistence.Index;
 import jakarta.persistence.JoinColumn;
 import jakarta.persistence.ManyToOne;
 import jakarta.persistence.Table;
+import lombok.AccessLevel;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Getter;
@@ -108,17 +110,41 @@ public class Salon extends AuditableEntity {
     @Column(name = "instagram_url")
     private String instagramUrl;
 
-    @Column(name = "avatar_url")
+    // ---- Phase 343 image pointers (logo + cover) ----------------------------
+    // All four columns are updatable = false: the ONLY writers are SalonRepository's targeted
+    // native pointer writes (writeLogoPointers / writeCoverPointers, under the row lock) and
+    // nullImageUrls (salon teardown). Hibernate updates every column of a dirty entity, so a
+    // concurrent PATCH /salons/{id} (admin-reachable) that loaded the row before an upload
+    // committed would otherwise write the superseded pointer back over the new one — leaving the
+    // row pointing at a blob the upload already purged. Excluding them from entity UPDATEs makes
+    // that lost update impossible. No setters: replaceImage keeps the managed instance in step
+    // with the native write so the response built from it is current.
+
+    /** Salon logo (square, 1:1 crop on mobile). V189: https-only CHECK. */
+    @Setter(AccessLevel.NONE)
+    @Column(name = "avatar_url", updatable = false)
     private String avatarUrl;
 
+    /** R2 key of {@link #avatarUrl}; V189 CHECK pins it under {@code salons/<id>/logo/}. NULL on legacy rows. */
+    @JsonIgnore
+    @Setter(AccessLevel.NONE)
+    @Column(name = "avatar_r2_key", length = 500, updatable = false)
+    private String avatarR2Key;
+
     /**
-     * Wide hero/banner image shown at the top of the public salon profile (Phase 13.6).
-     * Nullable — salons without a cover image fall back to a plain header on the client.
-     * No CHECK constraint yet (V103): there is no upload endpoint until the Phase 9
-     * media feature ships, so URL-format validation is deferred to that migration.
+     * Wide hero/banner image shown at the top of the public salon profile (Phase 13.6; 16:9 crop on
+     * mobile). Nullable — salons without a cover image fall back to a plain header on the client.
+     * Uploaded since Phase 343 (OWNER only); V189 adds the https-only CHECK.
      */
-    @Column(name = "cover_image_url", length = 2048)
+    @Setter(AccessLevel.NONE)
+    @Column(name = "cover_image_url", length = 2048, updatable = false)
     private String coverImageUrl;
+
+    /** R2 key of {@link #coverImageUrl}; V189 CHECK pins it under {@code salons/<id>/cover/}. NULL on legacy rows. */
+    @JsonIgnore
+    @Setter(AccessLevel.NONE)
+    @Column(name = "cover_r2_key", length = 500, updatable = false)
+    private String coverR2Key;
 
     /**
      * Persisted rating aggregate — mirrors {@code Master#avgRating}'s exact JPA style
@@ -155,5 +181,33 @@ public class Salon extends AuditableEntity {
     public void applySettlementDisplayNames(SettlementDisplayNames names) {
         this.city = names == null ? null : names.city();
         this.region = names == null ? null : names.region();
+    }
+
+    /** The current pointers of one image slot (Phase 343). */
+    public SalonImagePointer imagePointer(SalonImageSlot slot) {
+        return switch (slot) {
+            case LOGO -> new SalonImagePointer(avatarUrl, avatarR2Key);
+            case COVER -> new SalonImagePointer(coverImageUrl, coverR2Key);
+        };
+    }
+
+    /**
+     * Replaces one image slot's pointers IN MEMORY and returns the superseded pair. Persisting is the
+     * caller's job via {@code SalonRepository#writeLogoPointers}/{@code #writeCoverPointers} — the columns
+     * are {@code updatable = false} (see the field block). {@code (null, null)} clears the slot.
+     */
+    public SalonImagePointer replaceImage(SalonImageSlot slot, String url, String key) {
+        SalonImagePointer previous = imagePointer(slot);
+        switch (slot) {
+            case LOGO -> {
+                this.avatarUrl = url;
+                this.avatarR2Key = key;
+            }
+            case COVER -> {
+                this.coverImageUrl = url;
+                this.coverR2Key = key;
+            }
+        }
+        return previous;
     }
 }

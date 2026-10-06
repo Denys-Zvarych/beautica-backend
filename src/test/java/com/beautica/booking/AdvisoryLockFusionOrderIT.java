@@ -44,6 +44,10 @@ import static org.assertj.core.api.Assertions.assertThat;
  *       (header row lock, {@code FOR UPDATE})</li>
  *   <li>{@code AppointmentRepository#consumeCancelToken} — AppointmentRepository.java:78
  *       (implicit {@code UPDATE} row lock)</li>
+ *   <li>{@code SalonRepository#findByIdForUpdate} (Phase 343 salon logo/cover, audit cycle 1) —
+ *       {@code CROSS JOIN (SELECT set_config(...)) lock_cfg} beside a {@code FOR NO KEY UPDATE OF s} scan: the
+ *       join-source shape, covered by the second test (its locking step sits ABOVE the join); end-to-end
+ *       ceiling pinned by {@code SalonImageIT#should_return409AndDiscardBlob_when_salonLockHeldPastLockTimeout}</li>
  * </ul>
  *
  * <p><b>Two distinct fusion shapes, one test each.</b> Six of the seven put {@code set_config} in a

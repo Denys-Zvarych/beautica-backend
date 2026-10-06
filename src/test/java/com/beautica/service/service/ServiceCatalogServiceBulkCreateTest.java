@@ -122,6 +122,9 @@ class ServiceCatalogServiceBulkCreateTest {
     // this collaborator (evictSalonCatalogAfterCommit -> salonCatalogCacheEvictor.evict). Mocked
     // (rather than left null) so that call is a no-op default-Mockito-stub instead of an NPE.
     @Mock private SalonCatalogCacheEvictor salonCatalogCacheEvictor;
+
+    @Mock
+    private com.beautica.master.service.MasterSearchVisibilityGuard searchVisibilityGuard;
     // 2026-09-13 audit (S1): bulkCreateSalonMasterServices now re-proves the controller's
     // canManageSalon gate at the service layer. Without this mock @InjectMocks injects NULL for the
     // parameter and EVERY salon-branch test below NPEs before reaching its own assertion — which is
@@ -446,6 +449,29 @@ class ServiceCatalogServiceBulkCreateTest {
 
         assertThat(result).hasSize(1);
         verify(masterServiceRepository, never()).existsActiveServiceForMaster(any());
+    }
+
+    @Test
+    @DisplayName("salon on-behalf bulk — Phase 345: the owner-row guard's 403 propagates before any "
+            + "service-type lookup or write (SALON_ADMIN on the owner's own row)")
+    void should_throwForbidden_when_ownerRowGuardDeniesBulk() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        Salon salon = org.mockito.Mockito.mock(Salon.class);
+        when(salon.getId()).thenReturn(salonId);
+        Master master = org.mockito.Mockito.mock(Master.class);
+        when(master.getSalon()).thenReturn(salon);
+        when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
+        org.mockito.Mockito.doThrow(new ForbiddenException("Access denied"))
+                .when(authz).enforceOwnerMasterRowWritableByOwnerOnly(ACTOR_ID, master);
+        var request = new BulkCreateServicesRequest(List.of(fixedItem(UUID.randomUUID(), 45, "250.00")));
+
+        assertThatThrownBy(() ->
+                serviceCatalogService.bulkCreateSalonMasterServices(ACTOR_ID, salonId, masterId, request))
+                .isInstanceOf(ForbiddenException.class);
+
+        org.mockito.Mockito.verifyNoInteractions(serviceTypeRepository, serviceRepository);
+        verify(masterServiceRepository, never()).save(any());
     }
 
     // ── Phase 302 D2/D3/D4 — salon-owned definitions are REUSED, never duplicated ──

@@ -1,5 +1,6 @@
 package com.beautica.auth.filter;
 
+import com.beautica.common.security.BearerTokenExtractor;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.github.benmanes.caffeine.cache.LoadingCache;
 import io.github.bucket4j.Bandwidth;
@@ -19,12 +20,30 @@ import org.springframework.web.util.UrlPathHelper;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.UUID;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 @Component
 public class AuthRateLimitFilter extends OncePerRequestFilter {
 
     private static final byte[] TOO_MANY_REQUESTS_BODY =
             "{\"error\":\"Too many requests\"}".getBytes(StandardCharsets.UTF_8);
+
+    /**
+     * Request attribute set on a catalogue-browse / public-profile GET that carries a
+     * {@code Bearer} token (B8 regression fix, 2026-10-05). This filter runs BEFORE
+     * {@code JwtAuthenticationFilter}, so it cannot tell a real owner's token from a forged one;
+     * instead of charging the anonymous per-IP {@code catalogueBrowseBuckets} it DEFERS the
+     * decision, storing the already-resolved, length-clamped client-IP bucket key under this
+     * attribute. {@code BookingRateLimitFilter} (after the JWT filter) then charges the caller's
+     * per-PRINCIPAL bucket when the token authenticated, or falls back to
+     * {@code catalogueBrowseBuckets} under this exact IP key when it did not (forged, expired,
+     * revoked, refresh-token-as-bearer, …) — so presenting a bogus bearer never skips throttling.
+     * Request attributes are server-side only; a client cannot set one.
+     */
+    public static final String CATALOGUE_BROWSE_DEFERRED_IP_KEY_ATTRIBUTE =
+            AuthRateLimitFilter.class.getName() + ".catalogueBrowseDeferredIpKey";
 
     private static final String REGISTER_PATH = "/api/v1/auth/register";
     private static final String REGISTER_IM_PATH = "/api/v1/auth/register/independent-master";
@@ -64,6 +83,10 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     private static final String WORKING_DAYS_PATH_SUFFIX = "/working-days";
     private static final String DEVICE_TOKEN_PATH = "/api/v1/devices/token";
     private static final String MEDIA_PATH_PREFIX = "/api/v1/media/";
+    // Phase 343 salon logo/cover: POST/DELETE /api/v1/salons/{salonId}/media/{slot}. Same R2 upload cost
+    // class as /api/v1/media/*, so it shares mediaUploadBuckets (see isSalonImagePath).
+    private static final String SALON_IMAGE_PATH_PREFIX = "/api/v1/salons/";
+    private static final String SALON_IMAGE_SEGMENT = "/media/";
     private static final String PROFILE_UPDATE_PATH = "/api/v1/independent-masters/me/profile";
     private static final String USER_ME_PATH = "/api/v1/users/me";
     private static final String IM_LOCALITY_PATH = "/api/v1/independent-masters/me";
@@ -85,10 +108,13 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     //        prefix+suffix rule covers the salon-side single-creates (same technique as
     //        BULK_SALON_SERVICES above). It cannot collide with the bulk route, which ends in
     //        "/services/bulk", nor with the salon-invite route, which ends in "/invite".
-    //   3. prefix PATCH/DELETE /api/v1/services/{serviceDefId} and .../{serviceDefId}/photo
-    //      — one prefix covers the update, photo-update and deactivate routes. It cannot collide
+    //   3. prefix PATCH/DELETE /api/v1/services/{serviceDefId}
+    //      — one prefix covers the update and deactivate routes. It cannot collide
     //        with /api/v1/service-categories/** or /api/v1/service-types/**, which do not start
     //        with the literal "services/" segment.
+    //      The photo routes POST/DELETE /api/v1/services/{serviceDefId}/photo are NOT in this
+    //      bucket: they are R2 image writes and share mediaUploadBuckets (see isServicePhotoPath),
+    //      matched by the earlier media branch so this prefix rule never sees them.
     //
     // Phase 309 added GET /api/v1/salons/{salonId}/masters/{masterId}/services (the salon
     // management read) at the SAME prefix+suffix as shape 2's salon single-create POST. It does
@@ -113,7 +139,24 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // route under that prefix ends in the literal "/services" (unlike the salon side), so a plain
     // prefix+suffix check is unambiguous here — no disambiguation helper needed.
     private static final String MASTER_SERVICES_PATH_SUFFIX = "/services";
+    // permitAll public profile/roster reads, throttled to cap id-sweeps (audit 2026-10-05,
+    // finding 2; the roster reads run an uncached bookability EXISTS gate per request via
+    // MasterRepository#findBookableIdsBySalonId): GET /api/v1/masters/{id}, GET /api/v1/masters/by-salon/{salonId},
+    // GET /api/v1/salons/{id} and GET /api/v1/salons/{id}/masters. The {id} segment is captured as
+    // ANY single segment ([^/]+) and accepted only if it parses as a UUID exactly the way Spring's
+    // router does (see isUuidPathVariable) — NOT a bare prefix, so the authenticated siblings at the
+    // same prefix (/masters/me, /salons/mine, /masters/by-salon, …) never enter the anonymous per-IP
+    // bucket (cycle-2 B8), and NOT a strict canonical-36-char regex either: Spring trims the path
+    // variable and UUID.fromString accepts short forms, so "%20<uuid>", "<uuid>%20" and
+    // "a1b2c3d-e4f-…" all reach the handler and used to skip the throttle (re-audit 2026-10-05).
+    // Group 1 = the {id} of the single-segment reads, group 2 = the {id} of /salons/{id}/masters.
+    private static final Pattern PUBLIC_PROFILE_READ_PATH = Pattern.compile(
+            "^/api/v1/(?:masters/(?:by-salon/)?|salons/)([^/]+)$"
+                    + "|^/api/v1/salons/([^/]+)/masters$");
     private static final String SERVICE_DEF_WRITE_PATH_PREFIX = "/api/v1/services/";
+    // Phase 342 service photo: POST/DELETE /api/v1/services/{serviceDefId}/photo. Same R2 upload cost
+    // class as /api/v1/media/*, so it shares mediaUploadBuckets (see isServicePhotoPath).
+    private static final String SERVICE_PHOTO_SEGMENT = "/photo";
     // Salon-scoped invite POST carries the {salonId} variable, so it is matched by prefix +
     // suffix (same technique as BULK_SALON_SERVICES above): /api/v1/salons/{salonId}/invite.
     // This is the actual HTTP path SalonController.inviteMaster exposes to SALON_OWNER and
@@ -413,15 +456,12 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // is generous for a human onboarding their team one invite at a time while bounding both
     // automated probing and e-mail abuse; any abuse is still attributable to the authenticated
     // SALON_OWNER principal. IP-keyed for consistency with every other bucket here (JWT is
-    // parsed in JwtAuthenticationFilter, which runs AFTER this filter). Built internally (not
-    // an injected @Qualifier bean) so the public 16-arg constructor — depended on by several
-    // slice/regression tests — stays unchanged.
-    private static final long INVITE_CAPACITY = 15;
-    private static final Duration INVITE_WINDOW = Duration.ofMinutes(1);
+    // parsed in JwtAuthenticationFilter, which runs AFTER this filter). The capacity/window now
+    // live in RateLimitConfig#inviteBuckets() (app.rate-limit.invite-capacity, default 15 / 60 s)
+    // so local seeding can raise it; the 429 path reuses RETRY_AFTER_SECONDS (60-second window).
     // Capacity/window for GET /api/v1/auth/invite/validate and POST /api/v1/auth/invite/accept
     // are @Value-configurable in RateLimitConfig (inviteValidateBuckets() / inviteAcceptBuckets(),
-    // defaults 30/60s and 20/15min) — UNLIKE inviteBuckets/salonInviteBuckets above, which are
-    // built internally. Reason for the split: InviteControllerIT alone drives dozens of real HTTP
+    // defaults 30/60s and 20/15min) — UNLIKE salonInviteBuckets below, which is built internally. Reason for the split: InviteControllerIT alone drives dozens of real HTTP
     // calls against these two exact endpoints from 127.0.0.1 across its test methods (unlike the
     // send-invite path, which existing integration coverage reaches only a handful of times), so a
     // fixed low cap would make the test suite itself trip the throttle. Making the cap
@@ -436,9 +476,9 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // client honouring Retry-After would spin-retry every 60 s against a budget that will not
     // have refilled. The validate bucket reuses RETRY_AFTER_SECONDS (its window is 60 s).
     private static final int INVITE_ACCEPT_RETRY_AFTER_SECONDS = 900;
-    // Per-IP cap for POST /api/v1/salons/{salonId}/invite (15 / 60 s) — mirrors INVITE_CAPACITY
-    // / INVITE_WINDOW above (kept as its own dedicated constants, not shared, so the two
-    // endpoints can be tuned independently). Phase 21.1 (multi-admin relaxation) widened the
+    // Per-IP cap for POST /api/v1/salons/{salonId}/invite (15 / 60 s) — mirrors the
+    // app.rate-limit.invite-capacity default for POST /auth/invite (kept as its own dedicated
+    // constants, not shared, so the two endpoints can be tuned independently). Phase 21.1 (multi-admin relaxation) widened the
     // population that can reach InviteService.sendInvite through this path from SALON_OWNER-only
     // to SALON_OWNER + SALON_ADMIN, so the residual already-registered/active-invite timing
     // side-channel documented on InviteService.sendInvite is now reachable by more principals.
@@ -525,7 +565,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // rejects a repeat caller), so an authenticated token-holder is a DoS amplifier
     // without this guard (10/min).
     private final LoadingCache<String, Bucket> bulkServiceSetupBuckets;
-    // Per-IP bucket for the SINGLE-item service write routes (create / update / photo / delete).
+    // Per-IP bucket for the SINGLE-item service write routes (create / update / delete). The
+    // service photo routes are R2 uploads and draw on mediaUploadBuckets instead.
     // Every one of them was previously unthrottled, which made single-create a strictly BETTER
     // service_definitions row-growth lever than the bulk endpoint bulkServiceSetupBuckets caps —
     // and one that skips the per-master advisory lock too. 60/min; see
@@ -577,8 +618,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     private final LoadingCache<String, Bucket> searchSuggestionBuckets;
     // Per-IP bucket for POST /api/v1/auth/invite — the compensating control for the residual
     // timing oracle in InviteService.sendInvite (the already-registered / active-invite
-    // branches return fast). Built internally rather than injected so the public 16-arg
-    // constructor stays stable for the slice/regression tests that construct this filter directly.
+    // branches return fast). An injected @Qualifier bean (RateLimitConfig#inviteBuckets) so the
+    // capacity is configurable via app.rate-limit.invite-capacity (default 15 / 60 s).
     private final LoadingCache<String, Bucket> inviteBuckets;
     // Per-IP bucket for GET /api/v1/auth/invite/validate — the LOW-fix flood guard for the
     // permitAll() invite-preview read that previously fell through the unconditional non-POST
@@ -653,7 +694,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             @Qualifier("serviceWriteBuckets") LoadingCache<String, Bucket> serviceWriteBuckets,
             @Qualifier("inviteValidateBuckets") LoadingCache<String, Bucket> inviteValidateBuckets,
             @Qualifier("inviteAcceptBuckets") LoadingCache<String, Bucket> inviteAcceptBuckets,
-            @Qualifier("catalogueBrowseBuckets") LoadingCache<String, Bucket> catalogueBrowseBuckets) {
+            @Qualifier("catalogueBrowseBuckets") LoadingCache<String, Bucket> catalogueBrowseBuckets,
+            @Qualifier("inviteBuckets") LoadingCache<String, Bucket> inviteBuckets) {
         this.registerBuckets = registerBuckets;
         this.loginBuckets = loginBuckets;
         this.refreshBuckets = refreshBuckets;
@@ -676,6 +718,7 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         this.inviteValidateBuckets = inviteValidateBuckets;
         this.inviteAcceptBuckets = inviteAcceptBuckets;
         this.catalogueBrowseBuckets = catalogueBrowseBuckets;
+        this.inviteBuckets = inviteBuckets;
         this.otpVerifyBuckets = Caffeine.newBuilder()
                 .maximumSize(100_000)
                 .expireAfterAccess(OTP_VERIFY_WINDOW.plusMinutes(5))
@@ -717,12 +760,6 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                 .expireAfterAccess(SEARCH_SUGGESTIONS_WINDOW.plusMinutes(5))
                 .build(key -> Bucket.builder()
                         .addLimit(searchSuggestionBandwidth())
-                        .build());
-        this.inviteBuckets = Caffeine.newBuilder()
-                .maximumSize(100_000)
-                .expireAfterAccess(INVITE_WINDOW.plusMinutes(5))
-                .build(key -> Bucket.builder()
-                        .addLimit(inviteBandwidth())
                         .build());
         this.salonInviteBuckets = Caffeine.newBuilder()
                 .maximumSize(100_000)
@@ -858,13 +895,6 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                 .build();
     }
 
-    private static Bandwidth inviteBandwidth() {
-        return BandwidthBuilder.builder()
-                .capacity(INVITE_CAPACITY)
-                .refillIntervally(INVITE_CAPACITY, INVITE_WINDOW)
-                .build();
-    }
-
     private static Bandwidth salonInviteBandwidth() {
         return BandwidthBuilder.builder()
                 .capacity(SALON_INVITE_CAPACITY)
@@ -893,6 +923,43 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                 .build();
     }
 
+    /**
+     * True for exactly {@code /api/v1/salons/{salonId}/media/{slot}} — one non-empty {@code {salonId}} segment,
+     * the literal {@code media} segment, one non-empty {@code {slot}} segment and nothing after it (Phase 343).
+     */
+    static boolean isSalonImagePath(String path) {
+        if (path == null || !path.startsWith(SALON_IMAGE_PATH_PREFIX)) {
+            return false;
+        }
+        String rest = path.substring(SALON_IMAGE_PATH_PREFIX.length());
+        int idEnd = rest.indexOf('/');
+        if (idEnd <= 0) {
+            return false;
+        }
+        String tail = rest.substring(idEnd);
+        return tail.startsWith(SALON_IMAGE_SEGMENT)
+                && tail.length() > SALON_IMAGE_SEGMENT.length()
+                && tail.indexOf('/', SALON_IMAGE_SEGMENT.length()) < 0;
+    }
+
+    /**
+     * True for exactly {@code /api/v1/services/{serviceDefId}/photo} — one non-empty {@code {serviceDefId}}
+     * segment followed by the literal {@code photo} segment, tolerating one trailing {@code /} (Phase 342).
+     * The input is the already decoded/normalized match path (see {@link #resolveMatchPath}), so
+     * {@code %2F}, {@code ;matrix} and {@code ./} spellings arrive here in canonical form.
+     */
+    static boolean isServicePhotoPath(String path) {
+        if (path == null || !path.startsWith(SERVICE_DEF_WRITE_PATH_PREFIX)) {
+            return false;
+        }
+        String rest = path.substring(SERVICE_DEF_WRITE_PATH_PREFIX.length());
+        if (rest.endsWith("/")) {
+            rest = rest.substring(0, rest.length() - 1);
+        }
+        int idEnd = rest.indexOf('/');
+        return idEnd > 0 && rest.substring(idEnd).equals(SERVICE_PHOTO_SEGMENT);
+    }
+
     @Override
     protected void doFilterInternal(HttpServletRequest request,
                                     HttpServletResponse response,
@@ -913,8 +980,15 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         // DELETE /api/v1/media/portfolio/{id} are also covered. Public GET
         // listings (/api/v1/salons/{id}/portfolio etc.) are intentionally NOT
         // rate-limited here — they're read-only and cached behind R2/CDN.
+        // Phase 343: the salon logo/cover routes (/api/v1/salons/{salonId}/media/{slot}) share the same
+        // bucket — one R2 upload per call, same abuse profile as the avatar.
+        // Phase 342: the service photo routes (/api/v1/services/{serviceDefId}/photo) join it too —
+        // POST uploads up to 6 MB to R2 and DELETE removes the R2 object, mirroring avatar POST/DELETE.
+        // Matched here, before the service-write PATCH/DELETE prefix branch, so DELETE .../photo is
+        // charged to the media bucket rather than serviceWriteBuckets.
         if ((HttpMethod.POST.matches(method) || HttpMethod.DELETE.matches(method))
-                && path.startsWith(MEDIA_PATH_PREFIX)) {
+                && (path.startsWith(MEDIA_PATH_PREFIX) || isSalonImagePath(path)
+                        || isServicePhotoPath(path))) {
             applyRateLimit(request, response, filterChain, mediaUploadBuckets, RETRY_AFTER_SECONDS);
             return;
         }
@@ -1020,10 +1094,40 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         // the JWT filter and is the app's only per-authenticated-user Bucket4j mechanism (the same
         // reason DELETE /api/v1/users/me lives there), against its own salonMasterServicesRead
         // bucket at the same 60/min capacity.
+        //
+        // Audit 2026-10-05 (finding 2) widened the bucket to the public PROFILE reads
+        // (PUBLIC_PROFILE_READ_PATH): GET /masters/{id}, GET /salons/{id}, GET /salons/{id}/masters
+        // and GET /masters/by-salon/{id} are permitAll, so the bucket caps id-sweeps against them;
+        // the two roster reads also run an UNCACHED bookability EXISTS gate on every request
+        // (MasterRepository#findBookableIdsBySalonId), which a sweep would otherwise drive. Same
+        // per-IP capacity (app.rate-limit.catalogue-browse-capacity), deliberately ONE bucket: a
+        // profile visit spends ~3 tokens (detail + services + roster), so a crawler is capped at
+        // ~20 profiles/min per IP while a human never notices.
+        //
+        // B8 regression fix (2026-10-05): GET /salons/{id} is ALSO the salon owner/admin management
+        // screen's read (mobile salonManagementProfileProvider), and GET /salons/{id} +
+        // GET /masters/{id}/services back the master/owner own-profile screens — all with a token.
+        // A request carrying a Bearer token is therefore NOT charged here: it is deferred to
+        // BookingRateLimitFilter (post-JWT), which charges the PRINCIPAL's
+        // catalogueBrowsePrincipalBuckets when the token authenticated and falls back to THIS
+        // per-IP bucket (key handed over via CATALOGUE_BROWSE_DEFERRED_IP_KEY_ATTRIBUTE) when it
+        // did not — so a forged bearer cannot be used to skip throttling. Anonymous callers are
+        // charged here exactly as before.
         if (HttpMethod.GET.matches(method)
                 && (isSalonCatalogueServicesPath(path)
                         || (path.startsWith(MASTER_AVAILABILITY_PATH_PREFIX)
-                                && path.endsWith(MASTER_SERVICES_PATH_SUFFIX)))) {
+                                && path.endsWith(MASTER_SERVICES_PATH_SUFFIX))
+                        || isPublicProfileReadPath(path))) {
+            if (BearerTokenExtractor.extract(request) != null) {
+                // NOT charged on any bucket here — not even the authenticated per-IP ceiling. This
+                // filter runs before JWT validation, so charging the ceiling here let a junk
+                // "Bearer x" flood from a shared CGNAT IP drain it and 429 every real signed-in user
+                // behind that IP (re-audit 2026-10-05 follow-up, LOW). BookingRateLimitFilter charges
+                // the ceiling post-JWT, for authenticated principals only.
+                request.setAttribute(CATALOGUE_BROWSE_DEFERRED_IP_KEY_ATTRIBUTE, resolveBucketKey(request));
+                filterChain.doFilter(request, response);
+                return;
+            }
             applyRateLimit(request, response, filterChain, catalogueBrowseBuckets, RETRY_AFTER_SECONDS);
             return;
         }
@@ -1075,10 +1179,10 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             return;
         }
 
-        // Service-definition MUTATE rate-limit: PATCH /api/v1/services/{serviceDefId},
-        // PATCH /api/v1/services/{serviceDefId}/photo and DELETE /api/v1/services/{serviceDefId} —
-        // matched by prefix, which covers all three and cannot reach the sibling
-        // /api/v1/service-categories/** or /api/v1/service-types/** namespaces. Checked before the
+        // Service-definition MUTATE rate-limit: PATCH /api/v1/services/{serviceDefId} and
+        // DELETE /api/v1/services/{serviceDefId} — matched by prefix, which covers both and cannot
+        // reach the sibling /api/v1/service-categories/** or /api/v1/service-types/** namespaces.
+        // DELETE .../photo never reaches here: the media branch above claims it. Checked before the
         // POST-only guard below so these PATCH/DELETE routes are covered; without this branch they
         // fell through to it entirely unthrottled, the same gap as the creates above. They share
         // ONE bucket with the creates by design — same class of single-item catalogue write.
@@ -1297,6 +1401,39 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     }
 
     /**
+     * True for the four public profile reads ({@link #PUBLIC_PROFILE_READ_PATH}) when — and only
+     * when — the {@code {id}} segment would bind to a {@code UUID} path variable in Spring MVC.
+     *
+     * <p>{@code path} is already percent-decoded by {@link #resolveMatchPath} (via
+     * {@link UrlPathHelper}, as Spring's router decodes path variables), so {@code %20} arrives
+     * here as a literal space. Spring's {@code StringToUUIDConverter} binds
+     * {@code UUID.fromString(source.trim())} after a {@code hasText} guard, and
+     * {@code UUID.fromString} accepts non-canonical short spellings — so this applies that exact
+     * parse instead of a canonical-only regex that a padded or short spelling slipped past. The
+     * literal siblings ({@code me}, {@code mine}, {@code by-salon}) never parse, so they stay out.
+     */
+    static boolean isPublicProfileReadPath(String path) {
+        Matcher matcher = PUBLIC_PROFILE_READ_PATH.matcher(path);
+        if (!matcher.matches()) {
+            return false;
+        }
+        String segment = matcher.group(1) != null ? matcher.group(1) : matcher.group(2);
+        return isUuidPathVariable(segment);
+    }
+
+    private static boolean isUuidPathVariable(String segment) {
+        if (!StringUtils.hasText(segment)) {
+            return false;
+        }
+        try {
+            UUID.fromString(segment.trim());
+            return true;
+        } catch (IllegalArgumentException ex) {
+            return false;
+        }
+    }
+
+    /**
      * True only for {@code /api/v1/salons/{salonId}/services} — the public catalogue-browse GET —
      * never for {@code /api/v1/salons/{salonId}/masters/{masterId}/services} (Phase 309's
      * authenticated salon-management read), even though both share the literal
@@ -1331,24 +1468,34 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                                 LoadingCache<String, Bucket> cache,
                                 int retryAfterSeconds,
                                 long tokens) throws ServletException, IOException {
-        String ip = resolveClientIp(request);
-        // Clamp to max IPv6 length (45 chars) to prevent oversized Caffeine cache keys
-        // crafted via a long X-Forwarded-For header value.
-        if (ip.length() > 45) {
-            ip = request.getRemoteAddr();
-        }
-        Bucket bucket = cache.get(ip);
+        Bucket bucket = cache.get(resolveBucketKey(request));
 
         if (bucket.tryConsume(tokens)) {
             filterChain.doFilter(request, response);
         } else {
-            response.setStatus(429);
-            response.setContentType("application/json");
-            response.setHeader("X-Content-Type-Options", "nosniff");
-            response.setHeader("Retry-After", String.valueOf(retryAfterSeconds));
-            response.setContentLength(TOO_MANY_REQUESTS_BODY.length);
-            response.getOutputStream().write(TOO_MANY_REQUESTS_BODY);
+            writeTooManyRequests(response, retryAfterSeconds);
         }
+    }
+
+    private static void writeTooManyRequests(HttpServletResponse response, int retryAfterSeconds)
+            throws IOException {
+        response.setStatus(429);
+        response.setContentType("application/json");
+        response.setHeader("X-Content-Type-Options", "nosniff");
+        response.setHeader("Retry-After", String.valueOf(retryAfterSeconds));
+        response.setContentLength(TOO_MANY_REQUESTS_BODY.length);
+        response.getOutputStream().write(TOO_MANY_REQUESTS_BODY);
+    }
+
+    /**
+     * The per-IP bucket key: the resolved client IP, clamped to the max IPv6 length (45 chars) to
+     * prevent oversized Caffeine cache keys crafted via a long X-Forwarded-For header value. Also
+     * the key handed to BookingRateLimitFilter via {@link #CATALOGUE_BROWSE_DEFERRED_IP_KEY_ATTRIBUTE},
+     * so both filters charge the identical per-IP bucket entry.
+     */
+    private String resolveBucketKey(HttpServletRequest request) {
+        String ip = resolveClientIp(request);
+        return ip.length() > 45 ? request.getRemoteAddr() : ip;
     }
 
     private String resolveClientIp(HttpServletRequest request) {

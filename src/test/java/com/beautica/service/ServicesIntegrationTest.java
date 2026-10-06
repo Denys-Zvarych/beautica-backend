@@ -13,7 +13,6 @@ import com.beautica.service.dto.MasterServiceResponse;
 import com.beautica.service.dto.SalonServiceCatalogResponse;
 import com.beautica.service.dto.ServiceDefinitionResponse;
 import com.beautica.service.dto.UpdateServiceDefinitionRequest;
-import com.beautica.service.dto.UpdateServicePhotoRequest;
 import com.beautica.service.service.ServiceCatalogService;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -36,6 +35,9 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
 import java.math.BigDecimal;
@@ -79,6 +81,7 @@ class ServicesIntegrationTest extends AbstractIntegrationTest {
 
     @AfterEach
     void cleanUp() {
+        SecurityContextHolder.clearContext();
         jdbcTemplate.execute("DELETE FROM master_services");
         jdbcTemplate.execute("DELETE FROM service_definitions");
         jdbcTemplate.execute("DELETE FROM invite_tokens");
@@ -96,6 +99,8 @@ class ServicesIntegrationTest extends AbstractIntegrationTest {
                 "integ-owner-full-" + System.nanoTime() + "@beautica.test");
         UUID salonId = fixtures.createSalon(ownerToken, "Full Flow Salon");
         UUID masterId = fixtures.createSalonMaster(salonId);
+        // The public /masters/{id}/services lists only BOOKABLE services (2026-10-05) — needs hours.
+        fixtures.seedUsableSchedule(masterId);
 
         var createRequest = new CreateServiceDefinitionRequest(
                 "Shellac Manicure",
@@ -444,8 +449,10 @@ class ServicesIntegrationTest extends AbstractIntegrationTest {
      * a change to it is a prompt to re-derive the arithmetic rather than to bump the number.
      *
      * <p>Driven through the service bean rather than HTTP so the count covers this transaction
-     * alone — an HTTP request would fold in the JWT filter's user lookup and the authz guard's
-     * ownership query, both unrelated to the flush ordering under test.
+     * alone — an HTTP request would fold in the JWT filter's user lookup. Since Phase 345 the
+     * service method itself opens with {@code enforceCanManageServiceDefinition} (one
+     * {@code findOwnerUserId} projection for a SALON_OWNER actor), so the caller's identity is
+     * placed in the {@code SecurityContextHolder} exactly as the JWT filter would.
      */
     @Test
     @DisplayName("PATCH combining category + serviceTypeId emits exactly ONE entity UPDATE — "
@@ -468,6 +475,7 @@ class ServicesIntegrationTest extends AbstractIntegrationTest {
         var combined = new UpdateServiceDefinitionRequest(
                 null, null, "NAIL_SERVICE", null, null, null, null, null, null, nailTypeId);
 
+        UUID ownerUserId = authenticateAsOwnerOf(salonId);
         Statistics statistics = emf.unwrap(SessionFactory.class).getStatistics();
         statistics.setStatisticsEnabled(true);
         statistics.clear();
@@ -475,7 +483,7 @@ class ServicesIntegrationTest extends AbstractIntegrationTest {
         // Act
         log.debug("Act: PATCH service {} with BOTH category=NAIL_SERVICE and serviceTypeId={} "
                 + "through the service bean, counting statements", serviceDefId, nailTypeId);
-        serviceCatalogService.updateServiceDefinition(serviceDefId, combined);
+        serviceCatalogService.updateServiceDefinition(ownerUserId, serviceDefId, combined);
 
         long entityUpdates = statistics.getEntityUpdateCount();
         long statements = statistics.getPrepareStatementCount();
@@ -489,7 +497,8 @@ class ServicesIntegrationTest extends AbstractIntegrationTest {
                         + "Observed %s.", entityUpdates)
                 .isEqualTo(1L);
         assertThat(statements)
-                .as("absolute JDBC statement gate (house pattern): findByIdWithServiceType + the "
+                .as("absolute JDBC statement gate (house pattern): the Phase 345 ownership projection "
+                        + "(findOwnerUserId) + findByIdWithServiceType + the "
                         + "category-active check + the service-type resolve + the V121 duplicate "
                         + "finder + the single UPDATE + the affected-master lookup. A rise means a "
                         + "new query on this path — re-derive the arithmetic, do not bump the "
@@ -504,7 +513,22 @@ class ServicesIntegrationTest extends AbstractIntegrationTest {
     }
 
     /** Derived from a run — see the gate's javadoc for the per-statement arithmetic. */
-    private static final long PATCH_COMBINED_STATEMENTS = 6L;
+    private static final long PATCH_COMBINED_STATEMENTS = 7L;
+
+    /**
+     * Puts the salon owner in the {@code SecurityContextHolder} the way {@code JwtAuthenticationFilter}
+     * does (user id in {@code details}, single {@code ROLE_*} authority) for the direct service-bean
+     * call above, whose service-layer guard reads the caller from there. Cleared in {@link #cleanUp()}.
+     */
+    private UUID authenticateAsOwnerOf(UUID salonId) {
+        UUID ownerUserId = jdbcTemplate.queryForObject(
+                "SELECT owner_id FROM salons WHERE id = ?", UUID.class, salonId);
+        var token = new UsernamePasswordAuthenticationToken(
+                ownerUserId, null, List.of(new SimpleGrantedAuthority("ROLE_SALON_OWNER")));
+        token.setDetails(ownerUserId);
+        SecurityContextHolder.getContext().setAuthentication(token);
+        return ownerUserId;
+    }
 
     // ── Phase 306 — SALON_ADMIN parity on service management ───────────────────
 
@@ -535,31 +559,6 @@ class ServicesIntegrationTest extends AbstractIntegrationTest {
         assertThat(body.data().name()).isEqualTo("Класичний манікюр (адмін)");
     }
 
-    @Test
-    @DisplayName("Phase 306 case 2: PATCH /services/{id}/photo — 200 when SALON_ADMIN of the salon sets the photo")
-    void should_return200_when_salonAdminPatchesServicePhoto() throws Exception {
-        // Arrange
-        String ownerToken = fixtures.createSalonOwnerAndGetToken(
-                "p306-owner-photo-" + System.nanoTime() + "@beautica.test");
-        UUID salonId = fixtures.createSalon(ownerToken, "P306 Admin Photo Salon");
-        UUID serviceDefId = fixtures.createServiceDefinition(ownerToken, salonId, "Педикюр");
-        String adminToken = fixtures.createSalonAdminAndGetToken(
-                salonId, "p306-admin-photo-" + System.nanoTime() + "@beautica.test");
-
-        var photoRequest = new UpdateServicePhotoRequest("https://cdn.beautica.test/photo.jpg");
-
-        // Act
-        log.debug("Act: PATCH /api/v1/services/{}/photo as SALON_ADMIN of the owning salon — must be allowed", serviceDefId);
-        ResponseEntity<String> resp = restTemplate.exchange(
-                "/api/v1/services/" + serviceDefId + "/photo", HttpMethod.PATCH,
-                new HttpEntity<>(photoRequest, fixtures.bearerHeaders(adminToken)), String.class);
-
-        // Assert
-        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
-        var body = objectMapper.readValue(
-                resp.getBody(), new TypeReference<ApiResponse<ServiceDefinitionResponse>>() {});
-        assertThat(body.data().photoUrl()).isEqualTo("https://cdn.beautica.test/photo.jpg");
-    }
 
     @Test
     @DisplayName("Phase 306 case 3: POST /salons/{s}/masters/{m}/services — 201 when SALON_ADMIN single-assigns a service to a master of their salon (D4)")
@@ -617,7 +616,7 @@ class ServicesIntegrationTest extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("Phase 306 case 6 (regression): SALON_OWNER retains full CRUD on services — create, single-assign, PATCH, photo, DELETE")
+    @DisplayName("Phase 306 case 6 (regression): SALON_OWNER retains full CRUD on services — create, single-assign, PATCH, DELETE")
     void should_retainAccess_when_salonOwnerPerformsFullServiceLifecycle() throws Exception {
         // Arrange
         String ownerToken = fixtures.createSalonOwnerAndGetToken(
@@ -643,15 +642,8 @@ class ServicesIntegrationTest extends AbstractIntegrationTest {
                 new HttpEntity<>(patch, fixtures.bearerHeaders(ownerToken)), String.class);
         assertThat(patchResp.getStatusCode()).isEqualTo(HttpStatus.OK);
 
-        // photo
-        var photoRequest = new UpdateServicePhotoRequest("https://cdn.beautica.test/owner-regress.jpg");
-        ResponseEntity<String> photoResp = restTemplate.exchange(
-                "/api/v1/services/" + serviceDefId + "/photo", HttpMethod.PATCH,
-                new HttpEntity<>(photoRequest, fixtures.bearerHeaders(ownerToken)), String.class);
-        assertThat(photoResp.getStatusCode()).isEqualTo(HttpStatus.OK);
-
         // delete
-        log.debug("Act: full owner lifecycle on service {} — create/assign/patch/photo already passed, now DELETE", serviceDefId);
+        log.debug("Act: full owner lifecycle on service {} — create/assign/patch already passed, now DELETE", serviceDefId);
         ResponseEntity<String> deleteResp = restTemplate.exchange(
                 "/api/v1/services/" + serviceDefId, HttpMethod.DELETE,
                 new HttpEntity<>(fixtures.bearerHeaders(ownerToken)), String.class);

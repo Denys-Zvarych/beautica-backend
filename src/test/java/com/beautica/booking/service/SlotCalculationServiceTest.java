@@ -676,14 +676,16 @@ class SlotCalculationServiceTest {
      * {@code SlotCalculationServiceCacheTest}; this unit test only owns the cache-name set.
      */
     @Test
-    @DisplayName("evictMasterAvailabilityCaches — sweeps all three availability caches by master prefix")
+    @DisplayName("evictMasterAvailabilityCaches — sweeps the three availability caches AND the per-master "
+            + "strict verdict (master-bookable-assignments) by master prefix")
     void should_sweepAllAvailabilityCaches_when_evictMasterAvailabilityCachesCalled() {
         UUID masterId = UUID.randomUUID();
 
         slotCalculationService.evictMasterAvailabilityCaches(masterId);
 
         verify(cacheEvictor).evictByMasterPrefix(
-                masterId, "available-slots", "master-service-bookable", "master-bookable-days");
+                masterId, "available-slots", "master-service-bookable", "master-bookable-days",
+                "master-bookable-assignments");
     }
 
     @Test

@@ -15,6 +15,7 @@ import com.beautica.master.entity.MasterType;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
+import com.beautica.service.repository.MasterServiceRepository;
 import com.beautica.service.repository.ServiceRepository;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
@@ -42,6 +43,12 @@ public class AuthorizationService {
     private final ServiceRepository serviceRepository;
     private final BookingRepository bookingRepository;
     /**
+     * Read only by {@link #adminBlockedByOwnerAssignment} (Phase 345 catalogue gate) — one
+     * {@code EXISTS} on {@code master_services}, issued solely for a {@code SALON_ADMIN} actor on a
+     * SALON-owned definition the admin can otherwise manage.
+     */
+    private final MasterServiceRepository masterServiceRepository;
+    /**
      * Request-lifetime memo of {@code users.salon_id} for the calling actor — shared with
      * {@code StaffBookingScopeResolver} so a {@code SALON_ADMIN} staff-booking request issues that
      * projection once, not once per consumer (perf MEDIUM, 2026-08-18). See
@@ -58,6 +65,14 @@ public class AuthorizationService {
      * for the call sites it must never be extended to.
      */
     private final SalonScopeFactMemo salonScopeFactMemo;
+
+    /**
+     * Phase 345 catalogue gate denial text — for logs and the exception only. The client still
+     * receives the generic {@code "Access denied"} body from {@code GlobalExceptionHandler}; the
+     * reason is deliberately not exposed.
+     */
+    static final String OWNER_PERFORMED_SERVICE_MESSAGE =
+            "Service is performed by the salon owner; only the owner can change it";
 
     /**
      * Returns true when actorId has management access to the given salon.
@@ -84,9 +99,24 @@ public class AuthorizationService {
         return hasManagementAccess(salonId, actorId, actorRole);
     }
 
+    /**
+     * OWNERSHIP only — never admits a {@code SALON_ADMIN} (unlike {@link #hasManagementAccess} /
+     * {@link #canManageSalon}). The single predicate behind every OWNER-only salon gate (Phase 343: salon
+     * logo/cover). The service layer re-proves it against the locked salon row itself
+     * ({@code SalonService#lockOwnedActiveSalon}), so no query-issuing {@code enforce*} twin exists.
+     */
     public boolean isOwnerOf(UUID salonId, UUID actorId) {
-        if (salonId == null) return false;
+        if (salonId == null || actorId == null) return false;
         return salonRepository.existsByIdAndOwnerId(salonId, actorId);
+    }
+
+    /**
+     * SpEL form of {@link #isOwnerOf(UUID, UUID)} for {@code @PreAuthorize("hasRole('SALON_OWNER') and
+     * @authz.isOwnerOf(authentication, #salonId)")} (Phase 343 D2). A missing or non-UUID principal is
+     * simply "not the owner" (false → 403), never an exception thrown out of the SpEL evaluation.
+     */
+    public boolean isOwnerOf(Authentication auth, UUID salonId) {
+        return isOwnerOf(salonId, AuthenticationUtils.userIdOrNull(auth));
     }
 
     /**
@@ -156,9 +186,7 @@ public class AuthorizationService {
             // (owner-operated) masters: authority derives from salon management access.
             // Explicit SALON_OWNER case prevents silent fallthrough if new MasterType values are added.
             if (m.getMasterType() == MasterType.SALON_OWNER) {
-                return m.getSalon() != null
-                        && m.getSalon().getOwner() != null
-                        && m.getSalon().getOwner().getId().equals(actorId);
+                return isOwnerOfSalonOwnerRow(m, actorId);
             }
             // Remaining types (SALON_MASTER): authorize via salon management access.
             return m.getSalon() != null && hasManagementAccess(m.getSalon().getId(), actorId, actorRole);
@@ -191,9 +219,7 @@ public class AuthorizationService {
             // (owner-operated) masters: authority derives from salon management access.
             // Explicit SALON_OWNER case prevents silent fallthrough if new MasterType values are added.
             if (m.getMasterType() == MasterType.SALON_OWNER) {
-                return m.getSalon() != null
-                        && m.getSalon().getOwner() != null
-                        && m.getSalon().getOwner().getId().equals(actorId);
+                return isOwnerOfSalonOwnerRow(m, actorId);
             }
             // Remaining types (SALON_MASTER): authorize via salon management access.
             return m.getSalon() != null && hasManagementAccess(m.getSalon().getId(), actorId, actorRole);
@@ -265,8 +291,8 @@ public class AuthorizationService {
      * <p><b>Defense-in-depth.</b> {@code ServiceCatalogService#getSalonMasterServices} re-derives
      * the identical own-row grant from {@code actorId} before falling back to its own {@code
      * hasManagementAccess} check, so a future non-HTTP caller of that service method cannot
-     * bypass this SpEL gate (Phase 310) — same idiom as {@code enforceCanManageServiceDefinition}
-     * re-proving {@code canManageServiceDefinition}.
+     * bypass this SpEL gate (Phase 310) — the same defense-in-depth intent as
+     * {@link #enforceCanManageServiceDefinition}, which is the sole service-definition write gate.
      */
     public boolean canReadSalonMasterServices(Authentication auth, UUID salonId, UUID masterId) {
         return isOwnerAdminOrSelfMaster(auth, salonId, masterId);
@@ -285,10 +311,10 @@ public class AuthorizationService {
      * private helper so the shared traversal is written once (promote-don't-duplicate), but they
      * are two named, independently-evolvable public symbols.
      *
-     * <p>{@code canManageServiceDefinition} is NOT touched by this phase — its
-     * {@code SALON_MASTER}/{@code CLIENT} fast-reject (Phase 306 D2, a deliberate timing-oracle
-     * property) continues to gate {@code PATCH /services/{serviceDefId}} and
-     * {@code DELETE /services/{id}}, which a master must stay out of (D6).
+     * <p>The service-definition write gate is NOT widened by this phase —
+     * {@code PATCH /services/{serviceDefId}} and {@code DELETE /services/{id}} keep a
+     * controller role gate that excludes {@code SALON_MASTER}/{@code CLIENT}, plus
+     * {@link #enforceCanManageServiceDefinition} in the service layer; a master must stay out (D6).
      *
      * <p><b>Cross-tenant fix (post-311 audit).</b> {@link #isOwnerAdminOrSelfMaster}'s management
      * branch does NOT itself verify {@code masterId} belongs to {@code salonId} — deliberately, for
@@ -508,8 +534,9 @@ public class AuthorizationService {
      * The memo holds repository FACTS, never grants — this method still evaluates the whole
      * predicate itself, so the defense-in-depth property is unchanged. And the memo's "any future
      * call site that reads this AFTER a write that could move a salon's owner must not use it"
-     * warning is honoured: the only two callers are
-     * {@code ServiceCatalogService#unassignServiceFromMaster} and
+     * warning is honoured: the only callers are
+     * {@code ServiceCatalogService#assignServiceToMaster} (Phase 345 audit re-check),
+     * {@code #unassignServiceFromMaster} and
      * {@code #bulkCreateSalonMasterServices}, which write {@code master_services} rows (and, in the
      * bulk case, {@code service_definitions}) and touch neither {@code salons.owner_id} nor
      * {@code masters.salon_id}. The entity overload {@link #enforceCanManageSalon(UUID, Salon)}
@@ -523,22 +550,19 @@ public class AuthorizationService {
 
     /**
      * Service-layer (defense-in-depth) ownership guard for a {@link ServiceDefinition}
-     * mutation, the actorId-accepting twin of {@link #canManageServiceDefinition}.
+     * mutation — the ONLY ownership gate for it (Phase 345 removed the dead SpEL twin
+     * {@code canManageServiceDefinition}; every write endpoint uses a role-only
+     * {@code @PreAuthorize} and calls this after the role gate, anti-bug §D).
      *
-     * <p>Reuses the same {@code findOwnerUserId} projection the SpEL {@code @PreAuthorize}
-     * gate uses, so no entity is loaded twice and no new query is introduced. A missing
-     * definition is treated as access-denied (403), consistent with the SpEL variant which
-     * returns {@code false} for an unknown id (anti-bug §B/§D — never leak existence via
-     * a distinct status).
+     * <p>Uses the narrow {@code findOwnerUserId} projection, so no entity is loaded. A missing
+     * definition is treated as access-denied (403), never a 404 (anti-bug §B/§D — never leak
+     * existence via a distinct status).
      *
-     * <p>Phase 306 D3 — shares the SpEL gate's projection AND its predicate shape: SALON-owned
+     * <p>Phase 306 D3 — predicate shape: SALON-owned
      * (non-null {@code salonId}) resolves through salon-management access (admitting the salon's
      * SALON_OWNER and SALON_ADMIN — see {@link #canManageServiceOwnerAccess}), INDEPENDENT_MASTER-
-     * owned (null {@code salonId}) still resolves by identity. Kept equivalent to
-     * {@link #canManageServiceDefinition} on purpose — this is the service-layer half of DELETE's
-     * defense-in-depth (called from {@code ServiceCatalogService.deactivateServiceDefinition}), so
-     * D5's SALON_ADMIN widening at the controller's role gate is meaningless unless this predicate
-     * agrees.
+     * owned (null {@code salonId}) still resolves by identity. D5's SALON_ADMIN widening at the
+     * controller's role gate is meaningless unless this predicate agrees.
      *
      * <p>Per-role query cost (Phase 306 audit fix #1, backend-perf MEDIUM — restored, not traded
      * away): INDEPENDENT_MASTER-owned → 1 query ({@code findOwnerUserId} only). SALON-owned +
@@ -559,21 +583,128 @@ public class AuthorizationService {
      * INDEPENDENT_MASTER-owned branch touch {@code SecurityContextHolder} too — deliberate: a
      * guard that only fires on one branch is the drift this closes. Still zero extra queries.
      *
-     * @throws ForbiddenException if {@code actorId} is not the authenticated principal, or the
-     *                            actor cannot manage the definition's parent
+     * <p><b>Phase 345 catalogue gate.</b> After the grant above, a {@code SALON_ADMIN} is still
+     * refused a definition the salon owner performs — see {@link #adminBlockedByOwnerAssignment}.
+     *
+     * @throws ForbiddenException if {@code actorId} is not the authenticated principal, the
+     *                            actor cannot manage the definition's parent, or the actor is a
+     *                            {@code SALON_ADMIN} and the definition is assigned to the owner's row
      */
     public void enforceCanManageServiceDefinition(UUID actorId, UUID serviceDefId) {
         UUID principalId = principalId(SecurityContextHolder.getContext().getAuthentication());
         if (!principalId.equals(actorId)) {
             throw new ForbiddenException("Access denied");
         }
-        boolean allowed = serviceRepository.findOwnerUserId(serviceDefId)
-                .map(access -> canManageServiceOwnerAccess(access, actorId,
-                        access.getSalonId() != null ? roleFromCurrentAuthentication() : null))
-                .orElse(false);
-        if (!allowed) {
+        ServiceRepository.ServiceOwnerAccess access =
+                serviceRepository.findOwnerUserId(serviceDefId).orElse(null);
+        if (access == null) {
             throw new ForbiddenException("Access denied");
         }
+        Role actorRole = access.getSalonId() != null ? roleFromCurrentAuthentication() : null;
+        if (!canManageServiceOwnerAccess(access, actorId, actorRole)) {
+            throw new ForbiddenException("Access denied");
+        }
+        if (adminBlockedByOwnerAssignment(serviceDefId, actorRole)) {
+            throw new ForbiddenException(OWNER_PERFORMED_SERVICE_MESSAGE);
+        }
+    }
+
+    /**
+     * Phase 345 catalogue gate (architect decision 2026-10-06). A {@code SALON_ADMIN} cannot write
+     * a SALON definition that has an ACTIVE assignment on the salon owner's own
+     * ({@code SALON_OWNER}-typed) master row — whether the definition is owner-only or shared with
+     * other masters, because a catalogue-level edit (price, duration, photo, deactivation) changes
+     * what the owner performs. Without it, the row-level gate
+     * ({@link #enforceOwnerMasterRowWritableByOwnerOnly}) is bypassed through
+     * {@code PATCH/DELETE /services/&#123;id&#125;} and the photo endpoints.
+     *
+     * <p>Admits: the owner (always), an admin on a definition not assigned to the owner (or whose
+     * owner assignment is deactivated). INDEPENDENT_MASTER definitions are unaffected: callers pass
+     * a {@code null} role for a non-salon-scoped definition, so the {@code EXISTS} is issued only
+     * for a {@code SALON_ADMIN} on a SALON-owned definition — never for an owner or an independent
+     * master.
+     *
+     * @param actorRole the actor's role, or {@code null} when the definition is not salon-scoped
+     */
+    private boolean adminBlockedByOwnerAssignment(UUID serviceDefId, @Nullable Role actorRole) {
+        return actorRole == Role.SALON_ADMIN
+                && masterServiceRepository.existsActiveOwnerRowAssignment(serviceDefId);
+    }
+
+    /**
+     * Phase 345 (user decision 2026-10-05) — the salon owner's OWN master row is writable by the
+     * owner only. Applied by every {@code master_services} write on a salon master row (single
+     * assign, band edit, unassign, bulk/setup create) AFTER the caller's existing salon-management
+     * gate and AFTER the row has been loaded and proven to belong to the path's salon, so it adds
+     * no query of its own: it narrows that gate for exactly one row and leaves every other master
+     * (and the owner's access to their own row) untouched.
+     *
+     * <p>Mirrors the schedule gate ({@link #canManageMasterSchedule} /
+     * {@link #enforceCanManageMasterSchedule}), which already admits only the salon owner on a
+     * {@code SALON_OWNER} row — both now share {@link #isOwnerOfSalonOwnerRow}, and both identify
+     * the owner's row by {@code master_type = SALON_OWNER} alone (the type the owner-master
+     * enrolment writes; a salon owner never holds a {@code SALON_MASTER}-typed row).
+     *
+     * <p><b>Zero statements on a non-owner row.</b> The type is a column of the already-loaded
+     * master, so a regular {@code SALON_MASTER} write never touches {@code master.getSalon()} — a
+     * {@code user == salon.owner} comparison would lazy-load the salon on EVERY write and break the
+     * statement budgets {@code MasterServiceBandEditIT} Cases 31/32 pin. A write on the owner's own
+     * row proves the actor is that owner through the memoised ownership fact (below).
+     *
+     * <p>Reads are not affected: this is never called on a read path.
+     *
+     * <p><b>The actor must BE the current principal</b> (Phase 345 audit, same split-identity
+     * guard as {@link #enforceCanManageServiceDefinition}); asserted first, before the type check,
+     * so it fires on every row — one ThreadLocal read, never a query.
+     *
+     * <p><b>Owner-row proof is memoised</b> (Phase 345 audit, perf LOW): the salon id is read off
+     * the master's FK (a lazy proxy's id never initialises it) and ownership is answered by
+     * {@link SalonScopeFactMemo#ownsSalon} — the SAME fact the caller's preceding salon-management
+     * gate ({@link #enforceCanManageSalon(UUID, UUID)} / {@link #enforceCanEditMasterServiceBand})
+     * already memoised for a {@code SALON_OWNER} actor, so the owner's own-row write costs zero
+     * extra statements instead of a salon {@code SELECT}. Memo-safe per its contract: every caller
+     * writes {@code master_services} / {@code service_definitions} only, never
+     * {@code salons.owner_id} or {@code masters.salon_id}.
+     *
+     * @throws ForbiddenException if {@code actorId} is not the authenticated principal, or
+     *                            {@code master} is the salon owner's own row and {@code actorId}
+     *                            is not that owner (e.g. a {@code SALON_ADMIN})
+     */
+    public void enforceOwnerMasterRowWritableByOwnerOnly(UUID actorId, Master master) {
+        UUID principalId = principalId(SecurityContextHolder.getContext().getAuthentication());
+        if (!principalId.equals(actorId)) {
+            throw new ForbiddenException("Access denied");
+        }
+        if (master.getMasterType() == MasterType.SALON_OWNER && !ownsSalonOfMasterMemoised(master, actorId)) {
+            throw new ForbiddenException("Access denied");
+        }
+    }
+
+    /**
+     * {@code actorId} owns the salon {@code master} belongs to, via the request memo — no salon
+     * entity load. Fails CLOSED on a salon-less row.
+     */
+    private boolean ownsSalonOfMasterMemoised(Master master, UUID actorId) {
+        Salon salon = master.getSalon();
+        if (salon == null) {
+            return false;
+        }
+        UUID salonId = salon.getId();
+        return salonScopeFactMemo.ownsSalon(salonId, actorId,
+                () -> salonRepository.existsByIdAndOwnerId(salonId, actorId));
+    }
+
+    /**
+     * The owner-row grant shared by the schedule/master gates, whose callers already hold the
+     * salon (fetched by {@code findByIdWithUserAndSalon} or the service's graph load):
+     * {@code actorId} owns the salon the row belongs to. Fails CLOSED on a salon-less or
+     * owner-less row. {@link #enforceOwnerMasterRowWritableByOwnerOnly} deliberately uses
+     * {@link #ownsSalonOfMasterMemoised} instead — its master is loaded without the salon.
+     */
+    private static boolean isOwnerOfSalonOwnerRow(Master master, UUID actorId) {
+        return master.getSalon() != null
+                && master.getSalon().getOwner() != null
+                && master.getSalon().getOwner().getId().equals(actorId);
     }
 
     public void enforceCanManageMaster(UUID actorId, Master master) {
@@ -587,9 +718,7 @@ public class AuthorizationService {
             // Non-INDEPENDENT branch covers BOTH SALON_MASTER (invited) and SALON_OWNER
             // (owner-operated) masters: authority derives from salon management access.
             // Explicit SALON_OWNER case prevents silent fallthrough if new MasterType values are added.
-            allowed = master.getSalon() != null
-                    && master.getSalon().getOwner() != null
-                    && master.getSalon().getOwner().getId().equals(actorId);
+            allowed = isOwnerOfSalonOwnerRow(master, actorId);
         } else {
             // Remaining types (SALON_MASTER): authorize via salon management access.
             allowed = master.getSalon() != null && hasManagementAccess(master.getSalon().getId(), actorId);
@@ -610,9 +739,7 @@ public class AuthorizationService {
             // Non-INDEPENDENT branch covers BOTH SALON_MASTER (invited) and SALON_OWNER
             // (owner-operated) masters: authority derives from salon management access.
             // Explicit SALON_OWNER case prevents silent fallthrough if new MasterType values are added.
-            allowed = master.getSalon() != null
-                    && master.getSalon().getOwner() != null
-                    && master.getSalon().getOwner().getId().equals(actorId);
+            allowed = isOwnerOfSalonOwnerRow(master, actorId);
         } else {
             // Remaining types (SALON_MASTER): authorize via salon management access.
             allowed = master.getSalon() != null && hasManagementAccess(master.getSalon().getId(), actorId);
@@ -807,51 +934,8 @@ public class AuthorizationService {
     }
 
     /**
-     * Returns true iff the authenticated actor may manage the parent entity of the given
-     * ServiceDefinition — Phase 306 D1: salon-management access, not ownership:
-     *   ownerType == SALON              → actor must have management access to that salon
-     *                                      (owner OR admin of it — {@link #hasManagementAccess})
-     *   ownerType == INDEPENDENT_MASTER → actor must be the master's own user (unchanged)
-     *
-     * Returns false — causing 403 — when the service definition does not exist.
-     *
-     * <p>Role fast-path (D2): CLIENT and SALON_MASTER can never manage a ServiceDefinition, so
-     * they are rejected immediately without any DB round-trip (timing-oracle MEDIUM-1). Only
-     * SALON_OWNER, SALON_ADMIN and INDEPENDENT_MASTER proceed to the ownership query — SALON_ADMIN
-     * was excluded here before Phase 306; {@code canManageSalon} already admitted it, so the two
-     * gates had drifted (background section of the phase doc).
-     *
-     * <p>A single JPQL projection query ({@link ServiceRepository.ServiceOwnerAccess}, D3)
-     * resolves the owner's user UUID, the salon id (when SALON-owned), AND the salon's owner id
-     * directly, eliminating the two-query chain used previously.
-     *
-     * <p>Per-role query cost (Phase 306 audit fix #1, backend-perf MEDIUM — D3's single-query
-     * property restored, not traded away): INDEPENDENT_MASTER-owned → 1 query. SALON-owned +
-     * SALON_OWNER actor → 1 query (in-memory {@code salonOwnerId} compare — the projection's
-     * {@code salonOwnerId} rides the same {@code LEFT JOIN Salon s} that resolves {@code salonId},
-     * so no {@code hasManagementAccess} round-trip is needed). SALON-owned + SALON_ADMIN actor →
-     * 2 queries ({@code findOwnerUserId} then {@code hasManagementAccess}'s
-     * {@code findSalonIdById} — the admin's salon assignment is not in the JWT, so this second
-     * round-trip is unavoidable). See {@link #canManageServiceOwnerAccess} for the shared
-     * predicate this method and {@link #enforceCanManageServiceDefinition} both delegate to.
-     */
-    public boolean canManageServiceDefinition(Authentication auth, UUID serviceDefId) {
-        boolean mayManage = auth.getAuthorities().stream().anyMatch(a ->
-                a.getAuthority().equals("ROLE_SALON_OWNER")
-                        || a.getAuthority().equals("ROLE_SALON_ADMIN")
-                        || a.getAuthority().equals("ROLE_INDEPENDENT_MASTER"));
-        if (!mayManage) return false;  // CLIENT / SALON_MASTER → 403, no DB hit
-        UUID actorId = principalId(auth);
-        Role actorRole = roleFromAuthentication(auth);
-        return serviceRepository.findOwnerUserId(serviceDefId)
-                .map(access -> canManageServiceOwnerAccess(access, actorId, actorRole))
-                .orElse(false);
-    }
-
-    /**
-     * Shared predicate behind {@link #canManageServiceDefinition} and
-     * {@link #enforceCanManageServiceDefinition} — kept in ONE place so the SpEL gate and the
-     * service-layer defense-in-depth guard cannot drift (Phase 306 audit finding #4/case 16).
+     * Ownership predicate behind {@link #enforceCanManageServiceDefinition} (its SpEL twin
+     * {@code canManageServiceDefinition} was removed in Phase 345 as dead code).
      *
      * <p>{@code actorRole} may be {@code null} when {@code access.getSalonId() == null}
      * (INDEPENDENT_MASTER-owned branch never needs a role, so callers without an

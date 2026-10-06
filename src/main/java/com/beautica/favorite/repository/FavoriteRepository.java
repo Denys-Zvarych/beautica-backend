@@ -1,5 +1,6 @@
 package com.beautica.favorite.repository;
 
+import com.beautica.master.repository.MasterBookabilitySql;
 import com.beautica.favorite.entity.Favorite;
 import com.beautica.favorite.entity.FavoriteTargetType;
 import com.beautica.service.entity.MasterServiceAssignment;
@@ -11,6 +12,7 @@ import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.LocalDate;
 import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
@@ -137,7 +139,7 @@ public interface FavoriteRepository extends JpaRepository<Favorite, UUID> {
      * An earlier revision projected {@code users} unconditionally and left the suppression to the
      * mobile client, which is not a server-side control. What changed since is only the fallback:
      * the card now shows the SALON's street (public business data, already returned unmasked by
-     * {@link #findFavoriteSalonRows(UUID, Pageable)} and by the public salon profile) instead of
+     * {@link #findFavoriteSalonRows(UUID, LocalDate, Pageable)} and by the public salon profile) instead of
      * showing nothing at all.
      *
      * <p><b>{@code sal.id} / {@code sal.name} (13, 14)</b> back the card's affiliation line —
@@ -178,6 +180,13 @@ public interface FavoriteRepository extends JpaRepository<Favorite, UUID> {
      * {@code LEFT JOIN salons} in the count query; the paged query already joins {@code sal} for
      * the salon-locality columns, so it costs nothing there.
      *
+     * <p><b>Bookability filter on read (locked product decision 2026-10-05).</b> A favourited
+     * master who is not bookable — no active service, or no schedule — is HIDDEN (not dimmed), via
+     * the shared {@link MasterBookabilitySql#BOOKABLE_MASTER_M} rule search applies. The favourite
+     * row itself is kept: once the master is configured again it reappears. Mirrored in the count
+     * query so page metadata and content agree. This list also backs the mobile home favourites
+     * rail, so the rail inherits the filter.
+     *
      * <p><b>Anti-Bug audit LOW-1 (2026-07) → re-audit LOW (2026-08), now RESOLVED.</b> The
      * locality {@code COALESCE} was originally argued to be provably equivalent to a
      * {@code CASE WHEN sal.id IS NOT NULL …} guard, on the ground that {@code sal.*} was always
@@ -192,7 +201,7 @@ public interface FavoriteRepository extends JpaRepository<Favorite, UUID> {
      * (LIMIT/OFFSET). The
      * stable {@code ORDER BY f.created_at DESC, f.target_id} is preserved as a total order
      * so paging never drops or duplicates a row across pages. The unbounded
-     * {@link #findFavoriteMasterRows(UUID)} overload below exists only for the legacy
+     * {@link #findFavoriteMasterRows(UUID, LocalDate)} overload below exists only for the legacy
      * single-page service path and its unit tests; the controller never calls it.
      */
     @Query(value = """
@@ -222,6 +231,7 @@ public interface FavoriteRepository extends JpaRepository<Favorite, UUID> {
               AND f.target_type = 'MASTER'
               AND m.is_active = true
               AND (m.salon_id IS NULL OR sal.is_active = true)
+              AND """ + MasterBookabilitySql.BOOKABLE_MASTER_M + """
             ORDER BY f.created_at DESC, f.target_id
             """,
             countQuery = """
@@ -233,12 +243,16 @@ public interface FavoriteRepository extends JpaRepository<Favorite, UUID> {
               AND f.target_type = 'MASTER'
               AND m.is_active = true
               AND (m.salon_id IS NULL OR sal.is_active = true)
+              AND """ + MasterBookabilitySql.BOOKABLE_MASTER_M + """
             """,
             nativeQuery = true)
-    Page<Object[]> findFavoriteMasterRows(@Param("clientId") UUID clientId, Pageable pageable);
+    Page<Object[]> findFavoriteMasterRows(
+            @Param("clientId") UUID clientId,
+            @Param(MasterBookabilitySql.TODAY_PARAM) LocalDate today,
+            Pageable pageable);
 
     /**
-     * Unbounded single-page variant of {@link #findFavoriteMasterRows(UUID, Pageable)}.
+     * Unbounded single-page variant of {@link #findFavoriteMasterRows(UUID, LocalDate, Pageable)}.
      * Retained only for the legacy {@code FavoriteService.listMasterFavorites(UUID)}
      * overload and its unit tests — the controller exclusively uses the paginated form.
      */
@@ -269,9 +283,12 @@ public interface FavoriteRepository extends JpaRepository<Favorite, UUID> {
               AND f.target_type = 'MASTER'
               AND m.is_active = true
               AND (m.salon_id IS NULL OR sal.is_active = true)
+              AND """ + MasterBookabilitySql.BOOKABLE_MASTER_M + """
             ORDER BY f.created_at DESC, f.target_id
             """, nativeQuery = true)
-    List<Object[]> findFavoriteMasterRows(@Param("clientId") UUID clientId);
+    List<Object[]> findFavoriteMasterRows(
+            @Param("clientId") UUID clientId,
+            @Param(MasterBookabilitySql.TODAY_PARAM) LocalDate today);
 
     /**
      * Per-client favorited-salons projection for {@code GET /favorites/salons}.
@@ -308,13 +325,18 @@ public interface FavoriteRepository extends JpaRepository<Favorite, UUID> {
      * deleted.
      *
      * <p><b>{@code s.is_active = true} is load-bearing</b> (2026-08 security audit), for the
-     * same reason as {@link #findFavoriteMasterRows(UUID, Pageable)}: {@code salons.is_active}
+     * same reason as {@link #findFavoriteMasterRows(UUID, LocalDate, Pageable)}: {@code salons.is_active}
      * is a real soft-delete flag and a favourite row outlives it, so a deactivated salon would
      * otherwise keep a dead card in every client's favourites. Mirrored in the count query.
      *
+     * <p><b>Bookability filter on read (locked product decision 2026-10-05).</b> A favourited salon
+     * with no bookable master is HIDDEN, via the shared {@link MasterBookabilitySql#BOOKABLE_SALON_S}
+     * rule search applies; the favourite row is kept and the salon reappears once a master is
+     * configured. Mirrored in the count query.
+     *
      * <p><b>Pagination (§E-3, §J):</b> bounded by {@code Pageable}; the stable
      * {@code ORDER BY f.created_at DESC, s.id} is a total order so paging is consistent.
-     * The unbounded {@link #findFavoriteSalonRows(UUID)} overload below is the legacy
+     * The unbounded {@link #findFavoriteSalonRows(UUID, LocalDate)} overload below is the legacy
      * single-page path used by its unit tests only; the controller never calls it.
      */
     @Query(value = """
@@ -332,6 +354,7 @@ public interface FavoriteRepository extends JpaRepository<Favorite, UUID> {
             WHERE f.client_id = :clientId
               AND f.target_type = 'SALON'
               AND s.is_active = true
+              AND """ + MasterBookabilitySql.BOOKABLE_SALON_S + """
             ORDER BY f.created_at DESC, s.id
             """,
             countQuery = """
@@ -341,12 +364,16 @@ public interface FavoriteRepository extends JpaRepository<Favorite, UUID> {
             WHERE f.client_id = :clientId
               AND f.target_type = 'SALON'
               AND s.is_active = true
+              AND """ + MasterBookabilitySql.BOOKABLE_SALON_S + """
             """,
             nativeQuery = true)
-    Page<Object[]> findFavoriteSalonRows(@Param("clientId") UUID clientId, Pageable pageable);
+    Page<Object[]> findFavoriteSalonRows(
+            @Param("clientId") UUID clientId,
+            @Param(MasterBookabilitySql.TODAY_PARAM) LocalDate today,
+            Pageable pageable);
 
     /**
-     * Unbounded single-page variant of {@link #findFavoriteSalonRows(UUID, Pageable)}.
+     * Unbounded single-page variant of {@link #findFavoriteSalonRows(UUID, LocalDate, Pageable)}.
      * Retained only for the legacy {@code FavoriteService.listSalonFavorites(UUID)}
      * overload and its unit tests — the controller exclusively uses the paginated form.
      */
@@ -365,9 +392,12 @@ public interface FavoriteRepository extends JpaRepository<Favorite, UUID> {
             WHERE f.client_id = :clientId
               AND f.target_type = 'SALON'
               AND s.is_active = true
+              AND """ + MasterBookabilitySql.BOOKABLE_SALON_S + """
             ORDER BY f.created_at DESC, s.id
             """, nativeQuery = true)
-    List<Object[]> findFavoriteSalonRows(@Param("clientId") UUID clientId);
+    List<Object[]> findFavoriteSalonRows(
+            @Param("clientId") UUID clientId,
+            @Param(MasterBookabilitySql.TODAY_PARAM) LocalDate today);
 
     /**
      * Per-client favorited-services page for {@code GET /favorites/services} — the BEAUTY

@@ -1,5 +1,6 @@
 package com.beautica.config;
 
+import com.beautica.booking.service.BookingMasterService;
 import com.beautica.client.service.ClientPassportService;
 import com.beautica.common.cache.UserProfileCacheEvictor;
 import com.beautica.location.SettlementDisplayNameResolver;
@@ -707,7 +708,9 @@ public class CacheConfig {
         // keyed on the slug. permitAll + uncached previously meant a DB master lookup +
         // bounded service-list query per hit (scrape / DB-amplification surface). A short
         // 60-sec TTL caps that fan-out while a freshly-edited profile self-heals within a
-        // minute, so NO @CacheEvict wiring is needed. sync=true on the @Cacheable annotation
+        // minute. Exception (Phase 344 c1): avatar writes evict the slug key after commit via
+        // MasterProfileCacheEvictor, because a replaced/deleted avatar's blob is purged — a stale
+        // entry would render a broken image, not just an old one. sync=true on the @Cacheable annotation
         // collapses the thundering herd when a popular slug expires (Anti-Bug §F-7).
         manager.registerCustomCache("booking-slug-info",
                 Caffeine.newBuilder()
@@ -726,6 +729,17 @@ public class CacheConfig {
         registerMetered(manager, meterRegistry, "salon-service-catalog",
                 Caffeine.newBuilder()
                         .maximumSize(500)
+                        .expireAfterWrite(60, TimeUnit.SECONDS));
+        // Strict per-master verdict (BookingMasterService#getBookableAssignmentIds) behind the public
+        // GET /masters/{id}/services client filter — keyed
+        // [masterId] (one-element list), so the existing by-master afterCommit sweeps
+        // (SlotCalculationService BOOKING_WRITE_CACHES, MasterScheduleService SCHEDULE_WRITE_CACHES)
+        // evict it with no parallel wiring; assignment writes evict the key directly. 60-sec TTL
+        // backstop, sync=true on the @Cacheable (the read is permitAll — §F-7). Sized like
+        // master-service-bookable: one small id set per browsed master.
+        registerMetered(manager, meterRegistry, BookingMasterService.BOOKABLE_ASSIGNMENTS_CACHE,
+                Caffeine.newBuilder()
+                        .maximumSize(2000)
                         .expireAfterWrite(60, TimeUnit.SECONDS));
         // Phase 13.6 (perf follow-up) — approved+active PlatformCategory ordering backing
         // ServiceCatalogService#buildCategoryOrderAndNames. Mirrors service-categories's config: this

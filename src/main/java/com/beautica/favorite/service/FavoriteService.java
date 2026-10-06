@@ -18,6 +18,7 @@ import com.beautica.location.DiscoveryLocationResolver.DiscoveryLabels;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
 import com.beautica.master.repository.MasterRepository;
+import com.beautica.master.service.ScheduleDateMath;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.OwnerType;
@@ -100,6 +101,9 @@ public class FavoriteService {
     private final FavoritePersistenceService favoritePersistenceService;
     private final FavoriteCategoryResolver favoriteCategoryResolver;
     private final ServiceCatalogService serviceCatalogService;
+    // Bound "today" for the bookability fragments in the master/salon favourite queries
+    // (MasterBookabilitySql#TODAY_PARAM) — the app clock's Kyiv date, never the DB clock.
+    private final ScheduleDateMath scheduleDateMath;
 
     /**
      * Favorites the target for {@code clientUserId} (the authenticated principal).
@@ -138,7 +142,7 @@ public class FavoriteService {
     @Transactional(readOnly = true)
     public Page<FavoriteMasterResponse> listMasterFavorites(UUID clientUserId, Pageable pageable) {
         Page<Object[]> rows = favoriteRepository.findFavoriteMasterRows(
-                clientUserId, SortWhitelist.stripSort(pageable));
+                clientUserId, scheduleDateMath.today(), SortWhitelist.stripSort(pageable));
         if (rows.isEmpty()) {
             // No label resolution for an empty page (no N+1); preserve page metadata.
             return rows.map(row -> (FavoriteMasterResponse) null);
@@ -156,7 +160,7 @@ public class FavoriteService {
     @Transactional(readOnly = true)
     public Page<FavoriteSalonResponse> listSalonFavorites(UUID clientUserId, Pageable pageable) {
         Page<Object[]> rows = favoriteRepository.findFavoriteSalonRows(
-                clientUserId, SortWhitelist.stripSort(pageable));
+                clientUserId, scheduleDateMath.today(), SortWhitelist.stripSort(pageable));
         if (rows.isEmpty()) {
             // No label resolution for an empty page (no N+1); preserve page metadata.
             return rows.map(row -> (FavoriteSalonResponse) null);
@@ -174,7 +178,7 @@ public class FavoriteService {
      */
     @Transactional(readOnly = true)
     public List<FavoriteMasterResponse> listMasterFavorites(UUID clientUserId) {
-        List<Object[]> rows = favoriteRepository.findFavoriteMasterRows(clientUserId);
+        List<Object[]> rows = favoriteRepository.findFavoriteMasterRows(clientUserId, scheduleDateMath.today());
         if (rows.isEmpty()) {
             return List.of();
         }
@@ -195,7 +199,7 @@ public class FavoriteService {
      */
     @Transactional(readOnly = true)
     public List<FavoriteSalonResponse> listSalonFavorites(UUID clientUserId) {
-        List<Object[]> rows = favoriteRepository.findFavoriteSalonRows(clientUserId);
+        List<Object[]> rows = favoriteRepository.findFavoriteSalonRows(clientUserId, scheduleDateMath.today());
         if (rows.isEmpty()) {
             return List.of();
         }

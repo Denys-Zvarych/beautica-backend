@@ -202,14 +202,16 @@ public class BookingTestFixtures {
      * 60-minute default through the delegate above.
      */
     public UUID createIndependentMasterService(UUID masterId, String serviceName, int durationMinutes) {
-        UUID userId = jdbcTemplate.queryForObject("SELECT user_id FROM masters WHERE id = ?", UUID.class, masterId);
+        // owner_id is the masters.id — the production ownership rule for an INDEPENDENT_MASTER
+        // definition (ServiceCatalogService#addIndependentMasterService, MasterBookabilitySql). It
+        // used to be users.id, which no production path writes and the bookability gate rejects.
         UUID serviceDefId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO service_definitions (id, owner_type, owner_id, name, service_type_id, "
                         + "base_duration_minutes, base_price, buffer_minutes_after, is_active, created_at, updated_at) "
                         + "VALUES (?, 'INDEPENDENT_MASTER', ?, ?, ?, ?, 500.00, 0, true, NOW(), NOW())",
-                serviceDefId, userId, serviceName,
-                resolveUnusedServiceTypeId("INDEPENDENT_MASTER", userId), durationMinutes);
+                serviceDefId, masterId, serviceName,
+                resolveUnusedServiceTypeId("INDEPENDENT_MASTER", masterId), durationMinutes);
         UUID masterServiceId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) "

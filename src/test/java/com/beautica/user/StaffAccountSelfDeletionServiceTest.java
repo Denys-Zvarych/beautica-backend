@@ -91,13 +91,19 @@ class StaffAccountSelfDeletionServiceTest {
     @Mock
     private AccountBlobPurgeRegistrar accountBlobPurgeRegistrar;
 
+    @Mock
+    private com.beautica.service.repository.ServiceRepository serviceRepository;
+
+    @Mock
+    private com.beautica.service.service.ServicePhotoBlobPurger servicePhotoBlobPurger;
+
     private StaffAccountSelfDeletionService service;
 
     private StaffAccountSelfDeletionService newService() {
         return new StaffAccountSelfDeletionService(
                 userRepository, masterRepository, salonRepository, mediaRepository, bookingService,
                 staffAccountDisposalService, staffClientReferenceAuditService, authService,
-                accountBlobPurgeRegistrar);
+                accountBlobPurgeRegistrar, serviceRepository, servicePhotoBlobPurger);
     }
 
     private static User buildUser(UUID id, Role role, UUID salonId) {
@@ -114,7 +120,7 @@ class StaffAccountSelfDeletionServiceTest {
         lenient().when(salonRepository.existsByOwnerId(userId)).thenReturn(false);
         lenient().when(staffClientReferenceAuditService.runAuditForStaffUserIds(List.of(userId)))
                 .thenReturn(StaffClientReferenceAuditResult.of(List.of(), Instant.EPOCH));
-        lenient().when(mediaRepository.findByUploaderId(userId)).thenReturn(List.of());
+        lenient().when(mediaRepository.findMediaKeysByUploaderIdIn(List.of(userId))).thenReturn(List.of());
     }
 
     // ── role guard ──────────────────────────────────────────────────────────────────────────
@@ -216,7 +222,7 @@ class StaffAccountSelfDeletionServiceTest {
         verify(staffAccountDisposalService)
                 .dispose(userId, salonId, List.of(userId), StaffDisposalReason.SELF_DELETE);
         verify(authService).denylistAccessToken("token-123");
-        verify(accountBlobPurgeRegistrar).registerAfterCommit(eq(userId), any(), eq(List.of()));
+        verify(accountBlobPurgeRegistrar).registerAfterCommit(any(User.class), eq(List.of()));
     }
 
     // ── SALON_MASTER / INDEPENDENT_MASTER happy paths — booking cascade ────────────────────────
@@ -293,6 +299,36 @@ class StaffAccountSelfDeletionServiceTest {
         verify(bookingService).disposeFutureConfirmedForMasterSelfDelete(
                 eq(userId), eq(masterId), eq(null), any());
         verify(staffAccountDisposalService)
+                .dispose(userId, null, List.of(userId), StaffDisposalReason.SELF_DELETE);
+    }
+
+    @Test
+    @DisplayName("INDEPENDENT_MASTER: the service catalogue is row-locked, photos cleared and deactivated BEFORE "
+            + "the booking cascade and the masters-row disposal (lock order service_definitions before masters)")
+    void should_lockServiceCatalogue_beforeBookingCascadeAndMastersDisposal_forIndependentMaster() {
+        UUID userId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        User user = buildUser(userId, Role.INDEPENDENT_MASTER, null);
+        Master master = buildMaster(masterId, userId);
+        when(userRepository.findByIdForUpdate(userId)).thenReturn(Optional.of(user));
+        stubCleanPreconditions(userId);
+        when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
+        when(bookingService.findFutureConfirmedBookingCandidatesForMaster(masterId)).thenReturn(List.of());
+        service = newService();
+
+        service.deleteOwnAccount(userId, "token");
+
+        InOrder order = inOrder(serviceRepository, bookingService, staffAccountDisposalService);
+        order.verify(serviceRepository).lockAllByOwnerOrderById(
+                com.beautica.service.entity.OwnerType.INDEPENDENT_MASTER, masterId);
+        order.verify(serviceRepository).clearPhotosByOwner(
+                com.beautica.service.entity.OwnerType.INDEPENDENT_MASTER, masterId);
+        order.verify(serviceRepository).deactivateAllByOwner(
+                com.beautica.service.entity.OwnerType.INDEPENDENT_MASTER, masterId);
+        order.verify(bookingService).acquireMasterLockForSelfDelete(masterId);
+        order.verify(bookingService).disposeFutureConfirmedForMasterSelfDelete(
+                eq(userId), eq(masterId), eq(null), any());
+        order.verify(staffAccountDisposalService)
                 .dispose(userId, null, List.of(userId), StaffDisposalReason.SELF_DELETE);
     }
 
@@ -427,7 +463,7 @@ class StaffAccountSelfDeletionServiceTest {
 
         service.deleteOwnAccount(userId, "token");
 
-        verify(accountBlobPurgeRegistrar).registerAfterCommit(userId, "avatars/staff-key", List.of());
+        verify(accountBlobPurgeRegistrar).registerAfterCommit(user, List.of());
     }
 
     @Test

@@ -38,6 +38,13 @@ app:
     # (cycle-2 audit, B8): ITs drive many real GETs as one owner token, which would otherwise
     # exhaust that user's 60/min bucket.
     salon-master-services-read-capacity: 100000
+    # Same reasoning, for authenticated callers of the catalogue-browse / public-profile GETs,
+    # now keyed on the principal (B8 regression fix, 2026-10-05): ITs drive many real
+    # GET /salons/{id} and GET /masters/{id}/services as one owner token.
+    catalogue-browse-principal-capacity: 100000
+    # Same reasoning, for the per-IP ceiling on Bearer-carrying catalogue-browse / public-profile
+    # GETs (security re-audit 2026-10-05): every IT runs from 127.0.0.1 with many owner tokens.
+    catalogue-browse-authenticated-ip-capacity: 100000
     # Same reasoning again, for the three expensive salon-board reads keyed on the principal
     # (the unthrottled salon-board reads finding, backend-security 2026-09-20):
     # BookingSalonBookingsIT, BookingSalonBookingsPartitionIT and
@@ -112,7 +119,6 @@ app:
     access-key-id: test
     secret-access-key: test
     bucket: test-bucket
-    endpoint: http://localhost:9000
   firebase:
     service-account: test
   frontend:

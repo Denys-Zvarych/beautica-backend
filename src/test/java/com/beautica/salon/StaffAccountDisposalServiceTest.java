@@ -1,5 +1,9 @@
 package com.beautica.salon;
 
+import com.beautica.media.entity.EntityType;
+import com.beautica.media.repository.UploaderMediaKey;
+import com.beautica.media.service.AccountBlobPointers;
+import com.beautica.user.UserAvatarPointers;
 import com.beautica.auth.Role;
 import com.beautica.auth.TokensValidAfterCache;
 import com.beautica.common.cache.UserProfileCacheEvictor;
@@ -41,6 +45,7 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
@@ -82,6 +87,12 @@ class StaffAccountDisposalServiceTest {
     @Mock
     private UserProfileCacheEvictor userProfileCacheEvictor;
 
+    @Mock
+    private com.beautica.media.repository.MediaRepository mediaRepository;
+
+    @Mock
+    private com.beautica.user.AccountBlobPurgeRegistrar accountBlobPurgeRegistrar;
+
     private StaffAccountDisposalService service;
 
     /** Bound to dispose()'s own logger: the audit line's wording is part of its contract. */
@@ -104,7 +115,7 @@ class StaffAccountDisposalServiceTest {
     private StaffAccountDisposalService newService() {
         return new StaffAccountDisposalService(
                 userRepository, inviteTokenRepository, masterRepository, clock,
-                tokensValidAfterCache, userProfileCacheEvictor);
+                tokensValidAfterCache, userProfileCacheEvictor, mediaRepository, accountBlobPurgeRegistrar);
     }
 
     private static Master masterWithUser(UUID masterId, UUID userId, String firstName, String lastName) {
@@ -127,7 +138,7 @@ class StaffAccountDisposalServiceTest {
         service.dispose(UUID.randomUUID(), UUID.randomUUID(), List.of(), StaffDisposalReason.SALON_DELETION);
 
         verifyNoInteractions(userRepository, inviteTokenRepository, masterRepository,
-                tokensValidAfterCache, userProfileCacheEvictor);
+                tokensValidAfterCache, userProfileCacheEvictor, mediaRepository, accountBlobPurgeRegistrar);
     }
 
     @Test
@@ -309,8 +320,91 @@ class StaffAccountDisposalServiceTest {
 
         service.dispose(actorId, salonId, List.of(staffUserId), StaffDisposalReason.SALON_DELETION);
 
+        verify(userRepository).lockAvatarPointersByIdIn(List.of(staffUserId));
         verify(userRepository).deleteAllByIdInBatch(eq(List.of(staffUserId)));
         verifyNoMoreInteractions(userRepository);
+    }
+
+    @Test
+    @DisplayName("H1/S-L2: avatar pointers are row-locked, then media keys read, then ONE purge registered — "
+            + "all BEFORE the users delete")
+    void should_lockPointersThenRegisterPurge_beforeUsersDelete_when_reasonIsNotSelfDelete() {
+        UUID salonId = UUID.randomUUID();
+        UUID staffUserId = UUID.randomUUID();
+        UploaderMediaKey media = new UploaderMediaKey(staffUserId, "portfolio/x.jpg", EntityType.MASTER, UUID.randomUUID());
+        when(userRepository.lockAvatarPointersByIdIn(List.of(staffUserId)))
+                .thenReturn(List.of(avatarPointers(staffUserId, "avatars/" + staffUserId + "/a.jpg", null)));
+        when(mediaRepository.findMediaKeysByUploaderIdIn(List.of(staffUserId))).thenReturn(List.of(media));
+        lenient().when(masterRepository.findAllByUserIdInWithUser(List.of(staffUserId))).thenReturn(List.of());
+        service = newService();
+
+        service.dispose(UUID.randomUUID(), salonId, List.of(staffUserId), StaffDisposalReason.MASTER_REMOVAL);
+
+        var order = inOrder(userRepository, mediaRepository, accountBlobPurgeRegistrar);
+        order.verify(userRepository).lockAvatarPointersByIdIn(List.of(staffUserId));
+        order.verify(mediaRepository).findMediaKeysByUploaderIdIn(List.of(staffUserId));
+        order.verify(accountBlobPurgeRegistrar).registerAfterCommit(List.of(new AccountBlobPointers(
+                staffUserId, "avatars/" + staffUserId + "/a.jpg", null, List.of(media))));
+        order.verify(userRepository).deleteAllByIdInBatch(List.of(staffUserId));
+    }
+
+    @Test
+    @DisplayName("P-M1: a multi-user disposal registers exactly ONE purge carrying every user's pointers")
+    void should_registerSinglePurgeForAllUsers_when_batchDisposed() {
+        UUID salonId = UUID.randomUUID();
+        UUID userA = UUID.randomUUID();
+        UUID userB = UUID.randomUUID();
+        UploaderMediaKey mediaB = new UploaderMediaKey(userB, "portfolio/b.jpg", EntityType.MASTER, UUID.randomUUID());
+        when(userRepository.lockAvatarPointersByIdIn(List.of(userA, userB))).thenReturn(List.of(
+                avatarPointers(userA, "avatars/" + userA + "/a.jpg", null), avatarPointers(userB, null, null)));
+        when(mediaRepository.findMediaKeysByUploaderIdIn(List.of(userA, userB))).thenReturn(List.of(mediaB));
+        lenient().when(masterRepository.findAllByUserIdInWithUser(List.of(userA, userB))).thenReturn(List.of());
+        service = newService();
+
+        service.dispose(UUID.randomUUID(), salonId, List.of(userA, userB), StaffDisposalReason.SALON_DELETION);
+
+        verify(accountBlobPurgeRegistrar, times(1)).registerAfterCommit(List.of(
+                new AccountBlobPointers(userA, "avatars/" + userA + "/a.jpg", null, List.of()),
+                new AccountBlobPointers(userB, null, null, List.of(mediaB))));
+    }
+
+    @Test
+    @DisplayName("H1: SALON_DELETION leaves the salon's own portfolio rows to the salon sweep (no double purge)")
+    void should_skipSalonOwnMediaRows_when_reasonIsSalonDeletion() {
+        UUID salonId = UUID.randomUUID();
+        UUID staffUserId = UUID.randomUUID();
+        UploaderMediaKey salonRow = new UploaderMediaKey(staffUserId, "portfolio/salons/s.jpg", EntityType.SALON, salonId);
+        when(userRepository.lockAvatarPointersByIdIn(List.of(staffUserId)))
+                .thenReturn(List.of(avatarPointers(staffUserId, null, null)));
+        when(mediaRepository.findMediaKeysByUploaderIdIn(List.of(staffUserId))).thenReturn(List.of(salonRow));
+        lenient().when(masterRepository.findAllByUserIdInWithUser(List.of(staffUserId))).thenReturn(List.of());
+        service = newService();
+
+        service.dispose(UUID.randomUUID(), salonId, List.of(staffUserId), StaffDisposalReason.SALON_DELETION);
+
+        verify(accountBlobPurgeRegistrar).registerAfterCommit(
+                List.of(new AccountBlobPointers(staffUserId, null, null, List.of())));
+    }
+
+    private static UserAvatarPointers avatarPointers(UUID id, String key, String url) {
+        return new UserAvatarPointers() {
+            @Override public UUID getId() { return id; }
+            @Override public String getAvatarR2Key() { return key; }
+            @Override public String getAvatarUrl() { return url; }
+        };
+    }
+
+    @Test
+    @DisplayName("H1: SELF_DELETE never registers a purge here — the self-delete service owns its own sweep")
+    void should_notRegisterBlobPurge_when_reasonIsSelfDelete() {
+        UUID staffUserId = UUID.randomUUID();
+        lenient().when(masterRepository.findAllByUserIdInWithUser(List.of(staffUserId))).thenReturn(List.of());
+        service = newService();
+
+        service.dispose(staffUserId, UUID.randomUUID(), List.of(staffUserId), StaffDisposalReason.SELF_DELETE);
+
+        verifyNoInteractions(accountBlobPurgeRegistrar);
+        verifyNoInteractions(mediaRepository);
     }
 
     @Test

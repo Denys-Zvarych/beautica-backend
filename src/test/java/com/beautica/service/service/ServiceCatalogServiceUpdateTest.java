@@ -2,6 +2,7 @@ package com.beautica.service.service;
 
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.DuplicateServiceException;
+import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.notification.EmailService;
@@ -33,9 +34,11 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 /**
@@ -89,8 +92,17 @@ class ServiceCatalogServiceUpdateTest {
     @Mock
     private SalonCatalogCacheEvictor salonCatalogCacheEvictor;
 
+    @Mock
+    private com.beautica.master.service.MasterSearchVisibilityGuard searchVisibilityGuard;
+
+    @Mock
+    private com.beautica.common.security.AuthorizationService authz;
+
     @InjectMocks
     private ServiceCatalogService serviceCatalogService;
+
+    /** Principal passed to {@code updateServiceDefinition}; {@code authz} is a no-op mock unless stubbed. */
+    private static final UUID ACTOR_ID = UUID.randomUUID();
 
     // ── helpers ────────────────────────────────────────────────────────────────
 
@@ -137,7 +149,7 @@ class ServiceCatalogServiceUpdateTest {
         var request = new UpdateServiceDefinitionRequest(
                 "New Manicure", null, null, null, null, PriceType.FIXED, new BigDecimal("400.00"), null, null, null);
 
-        ServiceDefinitionResponse result = serviceCatalogService.updateServiceDefinition(serviceDefId, request);
+        ServiceDefinitionResponse result = serviceCatalogService.updateServiceDefinition(ACTOR_ID, serviceDefId, request);
 
         assertThat(result).isNotNull();
         assertThat(result.name()).isEqualTo("New Manicure");
@@ -167,7 +179,7 @@ class ServiceCatalogServiceUpdateTest {
         // Only baseDurationMinutes is non-null — all other fields must remain unchanged (price block absent)
         var request = new UpdateServiceDefinitionRequest(null, null, null, 90, null, null, null, null, null, null);
 
-        serviceCatalogService.updateServiceDefinition(serviceDefId, request);
+        serviceCatalogService.updateServiceDefinition(ACTOR_ID, serviceDefId, request);
 
         ArgumentCaptor<ServiceDefinition> captor = ArgumentCaptor.forClass(ServiceDefinition.class);
         verify(serviceRepository).saveAndFlush(captor.capture());
@@ -207,7 +219,7 @@ class ServiceCatalogServiceUpdateTest {
 
         var request = new UpdateServiceDefinitionRequest(null, null, "HAIRCUT", null, null, null, null, null, null, null);
 
-        ServiceDefinitionResponse result = serviceCatalogService.updateServiceDefinition(serviceDefId, request);
+        ServiceDefinitionResponse result = serviceCatalogService.updateServiceDefinition(ACTOR_ID, serviceDefId, request);
 
         assertThat(result.category()).isEqualTo("HAIRCUT");
 
@@ -234,7 +246,7 @@ class ServiceCatalogServiceUpdateTest {
 
         var request = new UpdateServiceDefinitionRequest("New Name", null, null, null, null, null, null, null, null, null);
 
-        serviceCatalogService.updateServiceDefinition(serviceDefId, request);
+        serviceCatalogService.updateServiceDefinition(ACTOR_ID, serviceDefId, request);
 
         // findMasterIdsByServiceDefinitionId must be called to identify affected masters
         verify(masterServiceRepository).findMasterIdsByServiceDefinitionId(serviceDefId);
@@ -256,7 +268,7 @@ class ServiceCatalogServiceUpdateTest {
 
         var request = new UpdateServiceDefinitionRequest(null, null, "NAIL_ART", null, null, null, null, null, null, null);
 
-        assertThatThrownBy(() -> serviceCatalogService.updateServiceDefinition(serviceDefId, request))
+        assertThatThrownBy(() -> serviceCatalogService.updateServiceDefinition(ACTOR_ID, serviceDefId, request))
                 .isInstanceOf(BusinessException.class)
                 .hasMessageContaining("Unknown category")
                 .extracting("status").hasToString("400 BAD_REQUEST");
@@ -277,7 +289,7 @@ class ServiceCatalogServiceUpdateTest {
 
         var request = new UpdateServiceDefinitionRequest(null, null, "RETIRED", null, null, null, null, null, null, null);
 
-        assertThatThrownBy(() -> serviceCatalogService.updateServiceDefinition(serviceDefId, request))
+        assertThatThrownBy(() -> serviceCatalogService.updateServiceDefinition(ACTOR_ID, serviceDefId, request))
                 .isInstanceOf(BusinessException.class)
                 .hasMessageContaining("Unknown category")
                 .extracting("status").hasToString("400 BAD_REQUEST");
@@ -297,7 +309,7 @@ class ServiceCatalogServiceUpdateTest {
 
         var request = new UpdateServiceDefinitionRequest(null, null, "DOES_NOT_EXIST", null, null, null, null, null, null, null);
 
-        assertThatThrownBy(() -> serviceCatalogService.updateServiceDefinition(serviceDefId, request))
+        assertThatThrownBy(() -> serviceCatalogService.updateServiceDefinition(ACTOR_ID, serviceDefId, request))
                 .isInstanceOf(BusinessException.class)
                 .hasMessageContaining("Unknown category")
                 .extracting("status").hasToString("400 BAD_REQUEST");
@@ -306,6 +318,23 @@ class ServiceCatalogServiceUpdateTest {
     }
 
     // ── updateServiceDefinition — error cases ─────────────────────────────────
+
+    @Test
+    @DisplayName("refuses a SALON_ADMIN PATCH on an owner-performed definition before loading or writing anything (Phase 345)")
+    void should_throwForbidden_when_adminPatchesOwnerAssignedDefinition() {
+        // Arrange
+        UUID serviceDefId = UUID.randomUUID();
+        doThrow(new ForbiddenException("owner-performed"))
+                .when(authz).enforceCanManageServiceDefinition(ACTOR_ID, serviceDefId);
+        var request = new UpdateServiceDefinitionRequest("X", null, null, null, null, null, null, null, null, null);
+
+        // Act + Assert
+        assertThatThrownBy(() -> serviceCatalogService.updateServiceDefinition(ACTOR_ID, serviceDefId, request))
+                .isInstanceOf(ForbiddenException.class)
+                .hasMessage("owner-performed");
+
+        verifyNoInteractions(serviceRepository, masterServiceRepository, salonCatalogCacheEvictor);
+    }
 
     @Test
     @DisplayName("throws NotFoundException when service definition does not exist on update")
@@ -317,78 +346,42 @@ class ServiceCatalogServiceUpdateTest {
         var request = new UpdateServiceDefinitionRequest("X", null, null, null, null, null, null, null, null, null);
 
         assertThatThrownBy(() ->
-                serviceCatalogService.updateServiceDefinition(nonExistentId, request))
+                serviceCatalogService.updateServiceDefinition(ACTOR_ID, nonExistentId, request))
                 .isInstanceOf(NotFoundException.class)
                 .hasMessageContaining(nonExistentId.toString());
 
         verify(serviceRepository, never()).saveAndFlush(any());
     }
 
-    // ── updateServicePhoto — happy path ───────────────────────────────────────
+    // ── evictServicePhotoCaches (Phase 342 — replaces updateServicePhoto) ──────
 
     @Test
-    @DisplayName("sets photoUrl and returns updated response when service definition exists")
-    void should_setPhotoUrl_when_serviceDefinitionExists() {
+    @DisplayName("evicts masterServices for every master using the definition after a photo change")
+    void should_evictMasterServicesCache_when_photoChanged() {
         UUID serviceDefId = UUID.randomUUID();
-        UUID ownerId = UUID.randomUUID();
-        String photoUrl = "https://pub-abc123.r2.dev/services/photo.jpg";
-        ServiceDefinition existing = buildDefinition(serviceDefId, ownerId);
-
-        ServiceDefinition saved = buildDefinition(serviceDefId, ownerId);
-        saved.setPhotoUrl(photoUrl);
-
-        when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(existing));
-        when(serviceRepository.save(any(ServiceDefinition.class))).thenReturn(saved);
-        when(masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId))
-                .thenReturn(List.of());
-
-        ServiceDefinitionResponse result = serviceCatalogService.updateServicePhoto(serviceDefId, photoUrl);
-
-        assertThat(result).isNotNull();
-        assertThat(result.photoUrl()).isEqualTo(photoUrl);
-
-        ArgumentCaptor<ServiceDefinition> captor = ArgumentCaptor.forClass(ServiceDefinition.class);
-        verify(serviceRepository).save(captor.capture());
-        assertThat(captor.getValue().getPhotoUrl()).isEqualTo(photoUrl);
-    }
-
-    @Test
-    @DisplayName("evicts masterServices cache for affected masters after photo update")
-    void should_evictMasterServicesCache_when_photoUpdated() {
-        UUID serviceDefId = UUID.randomUUID();
-        UUID ownerId = UUID.randomUUID();
         UUID masterId = UUID.randomUUID();
-        String photoUrl = "https://example.com/photo.jpg";
-        ServiceDefinition existing = buildDefinition(serviceDefId, ownerId);
-
-        when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(existing));
-        when(serviceRepository.save(any(ServiceDefinition.class))).thenReturn(existing);
+        var mockCache = org.mockito.Mockito.mock(org.springframework.cache.Cache.class);
         when(masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId))
                 .thenReturn(List.of(masterId));
-
-        var mockCache = org.mockito.Mockito.mock(org.springframework.cache.Cache.class);
         when(cacheManager.getCache("masterServices")).thenReturn(mockCache);
 
-        serviceCatalogService.updateServicePhoto(serviceDefId, photoUrl);
+        serviceCatalogService.evictServicePhotoCaches(serviceDefId, OwnerType.INDEPENDENT_MASTER, UUID.randomUUID());
 
-        verify(masterServiceRepository).findMasterIdsByServiceDefinitionId(serviceDefId);
+        verify(mockCache).evict(masterId);
+        verifyNoInteractions(salonCatalogCacheEvictor);
     }
 
-    // ── updateServicePhoto — error cases ──────────────────────────────────────
-
     @Test
-    @DisplayName("throws NotFoundException when service definition does not exist on photo update")
-    void should_throwNotFoundException_when_serviceDefinitionNotFoundOnPhotoUpdate() {
-        UUID nonExistentId = UUID.randomUUID();
+    @DisplayName("evicts the owning salon's catalogue entry for a SALON-owned definition")
+    void should_evictSalonCatalogue_when_salonOwnedPhotoChanged() {
+        UUID serviceDefId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        when(masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId)).thenReturn(List.of());
+        when(cacheManager.getCache("masterServices")).thenReturn(null);
 
-        when(serviceRepository.findByIdWithServiceType(nonExistentId)).thenReturn(Optional.empty());
+        serviceCatalogService.evictServicePhotoCaches(serviceDefId, OwnerType.SALON, salonId);
 
-        assertThatThrownBy(() ->
-                serviceCatalogService.updateServicePhoto(nonExistentId, "https://example.com/photo.jpg"))
-                .isInstanceOf(NotFoundException.class)
-                .hasMessageContaining(nonExistentId.toString());
-
-        verify(serviceRepository, never()).save(any());
+        verify(salonCatalogCacheEvictor).evict(salonId);
     }
 
     // ── updateServiceDefinition — serviceTypeId PATCH (Phase 16.3) ─────────────
@@ -420,7 +413,7 @@ class ServiceCatalogServiceUpdateTest {
         var request = new UpdateServiceDefinitionRequest(
                 null, null, null, null, null, null, null, null, null, newTypeId);
 
-        serviceCatalogService.updateServiceDefinition(serviceDefId, request);
+        serviceCatalogService.updateServiceDefinition(ACTOR_ID, serviceDefId, request);
 
         verify(serviceTypeLookup).getById(newTypeId);
 
@@ -458,7 +451,7 @@ class ServiceCatalogServiceUpdateTest {
         var request = new UpdateServiceDefinitionRequest(
                 null, null, null, null, null, null, null, null, null, newTypeId);
 
-        assertThatThrownBy(() -> serviceCatalogService.updateServiceDefinition(serviceDefId, request))
+        assertThatThrownBy(() -> serviceCatalogService.updateServiceDefinition(ACTOR_ID, serviceDefId, request))
                 .isInstanceOf(DuplicateServiceException.class)
                 .satisfies(ex -> assertThat(((DuplicateServiceException) ex).getExistingServiceDefId())
                         .isEqualTo(existingDefId));
@@ -498,7 +491,7 @@ class ServiceCatalogServiceUpdateTest {
         var request = new UpdateServiceDefinitionRequest(
                 null, null, null, null, null, null, null, null, null, sameTypeId);
 
-        serviceCatalogService.updateServiceDefinition(serviceDefId, request);
+        serviceCatalogService.updateServiceDefinition(ACTOR_ID, serviceDefId, request);
 
         // Pins that excludeId is the definition's own id — passing null here would make every
         // no-op type re-submit a false 409.
@@ -536,7 +529,7 @@ class ServiceCatalogServiceUpdateTest {
         var request = new UpdateServiceDefinitionRequest(
                 null, null, "HAIRCUT", null, null, null, null, null, null, newTypeId);
 
-        assertThatThrownBy(() -> serviceCatalogService.updateServiceDefinition(serviceDefId, request))
+        assertThatThrownBy(() -> serviceCatalogService.updateServiceDefinition(ACTOR_ID, serviceDefId, request))
                 .isInstanceOf(DuplicateServiceException.class)
                 .satisfies(ex -> assertThat(((DuplicateServiceException) ex).getExistingServiceDefId())
                         .isEqualTo(existingDefId));
@@ -588,7 +581,7 @@ class ServiceCatalogServiceUpdateTest {
 
         // Without the translation the PATCH path would surface the GENERIC 409
         // ("Request conflicts with existing data") carrying no data.code.
-        assertThatThrownBy(() -> serviceCatalogService.updateServiceDefinition(serviceDefId, request))
+        assertThatThrownBy(() -> serviceCatalogService.updateServiceDefinition(ACTOR_ID, serviceDefId, request))
                 .isInstanceOf(DuplicateServiceException.class);
     }
 
@@ -617,7 +610,7 @@ class ServiceCatalogServiceUpdateTest {
         var request = new UpdateServiceDefinitionRequest(
                 null, null, "HAIRCUT", null, null, null, null, null, null, newTypeId);
 
-        serviceCatalogService.updateServiceDefinition(serviceDefId, request);
+        serviceCatalogService.updateServiceDefinition(ACTOR_ID, serviceDefId, request);
 
         ArgumentCaptor<ServiceDefinition> captor = ArgumentCaptor.forClass(ServiceDefinition.class);
         verify(serviceRepository).saveAndFlush(captor.capture());
@@ -643,7 +636,7 @@ class ServiceCatalogServiceUpdateTest {
         var request = new UpdateServiceDefinitionRequest(
                 null, null, null, null, null, null, null, null, null, inactiveTypeId);
 
-        assertThatThrownBy(() -> serviceCatalogService.updateServiceDefinition(serviceDefId, request))
+        assertThatThrownBy(() -> serviceCatalogService.updateServiceDefinition(ACTOR_ID, serviceDefId, request))
                 .isInstanceOf(BusinessException.class)
                 .hasMessageContaining("Service type is not active")
                 .extracting("status").hasToString("400 BAD_REQUEST");
@@ -669,7 +662,7 @@ class ServiceCatalogServiceUpdateTest {
         var request = new UpdateServiceDefinitionRequest(
                 null, null, null, null, null, null, null, null, null, mismatchedTypeId);
 
-        assertThatThrownBy(() -> serviceCatalogService.updateServiceDefinition(serviceDefId, request))
+        assertThatThrownBy(() -> serviceCatalogService.updateServiceDefinition(ACTOR_ID, serviceDefId, request))
                 .isInstanceOf(BusinessException.class)
                 .hasMessageContaining("does not belong to the selected category")
                 .extracting("status").hasToString("400 BAD_REQUEST");
@@ -696,7 +689,7 @@ class ServiceCatalogServiceUpdateTest {
         var request = new UpdateServiceDefinitionRequest(
                 null, null, null, 75, null, null, null, null, null, null);
 
-        serviceCatalogService.updateServiceDefinition(serviceDefId, request);
+        serviceCatalogService.updateServiceDefinition(ACTOR_ID, serviceDefId, request);
 
         // The lookup must never be hit when serviceTypeId is null — no resolve, no clear.
         verify(serviceTypeLookup, never()).getById(any());
@@ -737,7 +730,7 @@ class ServiceCatalogServiceUpdateTest {
         var request = new UpdateServiceDefinitionRequest(
                 null, null, "HAIR", null, null, null, null, null, null, null);
 
-        assertThatThrownBy(() -> serviceCatalogService.updateServiceDefinition(serviceDefId, request))
+        assertThatThrownBy(() -> serviceCatalogService.updateServiceDefinition(ACTOR_ID, serviceDefId, request))
                 .isInstanceOf(BusinessException.class)
                 .hasMessageContaining("service type does not belong to the selected category")
                 .extracting("status").hasToString("400 BAD_REQUEST");
@@ -769,7 +762,7 @@ class ServiceCatalogServiceUpdateTest {
         var request = new UpdateServiceDefinitionRequest(
                 null, null, "HAIR", null, null, null, null, null, null, null);
 
-        serviceCatalogService.updateServiceDefinition(serviceDefId, request);
+        serviceCatalogService.updateServiceDefinition(ACTOR_ID, serviceDefId, request);
 
         // No re-resolve of the type, but the existing matching type must survive and persist.
         verify(serviceTypeLookup, never()).getById(any());
@@ -806,7 +799,7 @@ class ServiceCatalogServiceUpdateTest {
         var request = new UpdateServiceDefinitionRequest(
                 "   ", null, null, null, null, null, null, null, null, null);
 
-        serviceCatalogService.updateServiceDefinition(serviceDefId, request);
+        serviceCatalogService.updateServiceDefinition(ACTOR_ID, serviceDefId, request);
 
         ArgumentCaptor<ServiceDefinition> captor = ArgumentCaptor.forClass(ServiceDefinition.class);
         verify(serviceRepository).saveAndFlush(captor.capture());
@@ -839,7 +832,7 @@ class ServiceCatalogServiceUpdateTest {
         var request = new UpdateServiceDefinitionRequest(
                 " ", null, null, null, null, null, null, null, null, newTypeId);
 
-        serviceCatalogService.updateServiceDefinition(serviceDefId, request);
+        serviceCatalogService.updateServiceDefinition(ACTOR_ID, serviceDefId, request);
 
         ArgumentCaptor<ServiceDefinition> captor = ArgumentCaptor.forClass(ServiceDefinition.class);
         verify(serviceRepository).saveAndFlush(captor.capture());
@@ -864,7 +857,7 @@ class ServiceCatalogServiceUpdateTest {
         var request = new UpdateServiceDefinitionRequest(
                 null, null, null, null, 20, null, null, null, null, null);
 
-        serviceCatalogService.updateServiceDefinition(serviceDefId, request);
+        serviceCatalogService.updateServiceDefinition(ACTOR_ID, serviceDefId, request);
 
         ArgumentCaptor<ServiceDefinition> captor = ArgumentCaptor.forClass(ServiceDefinition.class);
         verify(serviceRepository).saveAndFlush(captor.capture());
@@ -885,7 +878,7 @@ class ServiceCatalogServiceUpdateTest {
         var request = new UpdateServiceDefinitionRequest(
                 "   ", null, null, null, null, null, null, null, null, null);
 
-        assertThatThrownBy(() -> serviceCatalogService.updateServiceDefinition(serviceDefId, request))
+        assertThatThrownBy(() -> serviceCatalogService.updateServiceDefinition(ACTOR_ID, serviceDefId, request))
                 .isInstanceOf(BusinessException.class)
                 .hasMessageContaining("Name or service type is required")
                 .extracting("status").hasToString("400 BAD_REQUEST");

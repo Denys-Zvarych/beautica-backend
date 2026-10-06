@@ -2,6 +2,7 @@ package com.beautica.support.service;
 
 import com.beautica.config.SupportProperties;
 import com.beautica.common.exception.BusinessException;
+import com.beautica.common.exception.ServiceUnavailableMessages;
 import com.beautica.notification.EmailService;
 import com.beautica.support.dto.ContactSupportRequest;
 import com.beautica.support.dto.ContactSupportResponse;
@@ -92,7 +93,7 @@ public class SupportService {
             log.warn("Support contact rejected — SUPPORT_EMAIL is not configured");
             throw new BusinessException(
                     HttpStatus.SERVICE_UNAVAILABLE,
-                    "Support channel is not configured");
+                    ServiceUnavailableMessages.SUPPORT_NOT_CONFIGURED);
         }
         return email;
     }

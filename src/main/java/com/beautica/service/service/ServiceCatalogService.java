@@ -2,12 +2,14 @@ package com.beautica.service.service;
 
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.common.exception.BusinessException;
+import com.beautica.common.exception.ServiceUnavailableMessages;
 import com.beautica.common.exception.DuplicateServiceException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
 import com.beautica.master.repository.MasterRepository;
+import com.beautica.master.service.MasterSearchVisibilityGuard;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.service.dto.AssignServiceToMasterRequest;
 import com.beautica.service.dto.BulkCreateServicesRequest;
@@ -108,6 +110,10 @@ public class ServiceCatalogService {
     private final com.beautica.common.security.AuthorizationService authz;
     private final com.beautica.booking.service.SlotCalculationService slotCalculationService;
     private final SalonCatalogCacheEvictor salonCatalogCacheEvictor;
+    // Clears discovery search only when an assignment write flips a master's search membership
+    // (audit 2026-10-05, finding 1) — never on band, photo or definition-content edits.
+    private final MasterSearchVisibilityGuard searchVisibilityGuard;
+    private final ServicePhotoBlobPurger servicePhotoBlobPurger;
     // Phase 307 D4 — the per-assignment future-CONFIRMED-booking guard on unassignServiceFromMaster.
     // Direct cross-feature repository injection, matching this class's existing MasterRepository/
     // SalonRepository fields above rather than a new booking-service seam (REUSE-FIRST — no new
@@ -159,9 +165,16 @@ public class ServiceCatalogService {
 
     @Transactional
     public MasterServiceResponse assignServiceToMaster(
+            UUID actorId,
             UUID salonId,
             UUID masterId,
             AssignServiceToMasterRequest request) {
+
+        // Defense-in-depth (Phase 345 audit) — re-prove the controller's
+        // @PreAuthorize("@authz.canManageSalon(...)") gate from the caller-supplied actorId before
+        // loading anything, exactly as unassignServiceFromMaster / bulkCreateSalonMasterServices do.
+        // Memoised: the SpEL gate's owner read is not repeated.
+        authz.enforceCanManageSalon(actorId, salonId);
 
         // Type-agnostic: accepts SALON_MASTER, SALON_OWNER, and INDEPENDENT_MASTER rows equally.
         // A SALON_OWNER-type master row has salon_id = the owner's salon, so the salon-membership
@@ -172,6 +185,8 @@ public class ServiceCatalogService {
         if (master.getSalon() == null || !master.getSalon().getId().equals(salonId)) {
             throw new ForbiddenException("Access denied");
         }
+        // Phase 345 — the salon owner's own row is the owner's alone (a SALON_ADMIN is 403 here).
+        authz.enforceOwnerMasterRowWritableByOwnerOnly(actorId, master);
 
         ServiceDefinition serviceDef = serviceRepository.findByIdWithServiceType(request.serviceDefId())
                 .orElseThrow(() -> new NotFoundException("Service definition not found: " + request.serviceDefId()));
@@ -189,6 +204,8 @@ public class ServiceCatalogService {
         if (!serviceDef.isActive()) {
             throw new NotFoundException("Service definition not found: " + request.serviceDefId());
         }
+
+        MasterSearchVisibilityGuard.Snapshot searchBefore = searchVisibilityGuard.capture(List.of(masterId));
 
         // Phase 307 D6 — ACTIVE-agnostic lookup, not existsByMasterIdAndServiceDefinitionId:
         // master_services' UNIQUE (master_id, service_def_id) is NOT partial, so an existing
@@ -235,6 +252,8 @@ public class ServiceCatalogService {
         // PERF-M2: keep the pre-computed min_effective_price in sync so the
         // search index reflects the new assignment immediately on next cache miss.
         masterRepository.refreshMinEffectivePrice(masterId);
+        // A master's first bookable service can make them (or their salon) discoverable.
+        searchVisibilityGuard.clearSearchCachesIfFlipped(searchBefore);
 
         // Evict after commit so a parallel reader cannot repopulate the cache with
         // the pre-insert DB snapshot between eviction and commit (anti-bug §F).
@@ -314,6 +333,8 @@ public class ServiceCatalogService {
         if (master.getSalon() == null || !master.getSalon().getId().equals(salonId)) {
             throw new ForbiddenException("Access denied");
         }
+        // Phase 345 — the salon owner's own row is the owner's alone (a SALON_ADMIN is 403 here).
+        authz.enforceOwnerMasterRowWritableByOwnerOnly(actorId, master);
         ServiceDefinition serviceDef = assignment.getServiceDefinition();
         if (serviceDef.getOwnerType() != OwnerType.SALON || !serviceDef.getOwnerId().equals(salonId)) {
             throw new ForbiddenException("Service definition does not belong to this salon");
@@ -456,6 +477,8 @@ public class ServiceCatalogService {
         if (master.getSalon() == null || !master.getSalon().getId().equals(salonId)) {
             throw new ForbiddenException("Access denied");
         }
+        // Phase 345 — the salon owner's own row is the owner's alone (a SALON_ADMIN is 403 here).
+        authz.enforceOwnerMasterRowWritableByOwnerOnly(actorId, master);
 
         ServiceDefinition serviceDef = assignment.getServiceDefinition();
         if (serviceDef.getOwnerType() != OwnerType.SALON || !serviceDef.getOwnerId().equals(salonId)) {
@@ -489,10 +512,13 @@ public class ServiceCatalogService {
         evictBookableFutureSlotsCache(List.of(masterId));
         evictSalonCatalogAfterCommit(salonId);
 
+        MasterSearchVisibilityGuard.Snapshot searchBefore = searchVisibilityGuard.capture(List.of(masterId));
         // D1 — soft unassign: flip is_active, never delete the row.
         assignment.setActive(false);
 
         masterRepository.refreshMinEffectivePrice(masterId);
+        // Losing the last active service drops the master (and maybe the salon) from search.
+        searchVisibilityGuard.clearSearchCachesIfFlipped(searchBefore);
     }
 
     /**
@@ -530,6 +556,7 @@ public class ServiceCatalogService {
         // client a deep-linkable existingServiceDefId on the rare conflict. See the method javadoc.
         assertNoActiveDuplicate(OwnerType.INDEPENDENT_MASTER, master.getId(), serviceType, null);
 
+        MasterSearchVisibilityGuard.Snapshot searchBefore = searchVisibilityGuard.capture(List.of(master.getId()));
         ServiceDefinition definition = ServiceDefinition.builder()
                 .ownerType(OwnerType.INDEPENDENT_MASTER)
                 .ownerId(master.getId())
@@ -578,6 +605,7 @@ public class ServiceCatalogService {
         // PERF-M2: keep the pre-computed min_effective_price in sync for the
         // independent master's own search entry.
         masterRepository.refreshMinEffectivePrice(master.getId());
+        searchVisibilityGuard.clearSearchCachesIfFlipped(searchBefore);
 
         // Evict only this master's cache entry after commit — replacing allEntries=true
         // to avoid cold-miss DB round-trips for all other masters (anti-bug §F).
@@ -658,6 +686,8 @@ public class ServiceCatalogService {
         if (master.getSalon() == null || !master.getSalon().getId().equals(salonId)) {
             throw new ForbiddenException("Access denied");
         }
+        // Phase 345 — the salon owner's own row is the owner's alone (a SALON_ADMIN is 403 here).
+        authz.enforceOwnerMasterRowWritableByOwnerOnly(actorId, master);
 
         return bulkCreateForMaster(master, OwnerType.SALON, salonId, request);
     }
@@ -812,6 +842,7 @@ public class ServiceCatalogService {
         // createSingleFromBulkItem's own javadoc has always claimed.
         Map<UUID, MasterServiceAssignment> reactivateAssignmentByTypeId =
                 loadReactivationTargets(reactivateAssignmentIdByTypeId);
+        MasterSearchVisibilityGuard.Snapshot searchBefore = searchVisibilityGuard.capture(List.of(master.getId()));
 
         List<MasterServiceResponse> created = request.items().stream()
                 .map(item -> createSingleFromBulkItem(
@@ -829,6 +860,7 @@ public class ServiceCatalogService {
         // Keep the pre-computed min_effective_price in sync for the master's search entry
         // (PERF-M2) and evict the master's services cache after commit (anti-bug §F).
         masterRepository.refreshMinEffectivePrice(master.getId());
+        searchVisibilityGuard.clearSearchCachesIfFlipped(searchBefore);
         evictMasterServicesCache(List.of(master.getId()));
         // Phase 304 D1: a SALON-branch batch persists SALON-owned definitions/assignments, which
         // can change what GET /salons/{salonId}/services returns — evict that salon's catalogue
@@ -882,7 +914,7 @@ public class ServiceCatalogService {
             // only the exception's simple class name, at DEBUG, for server-side triage.
             log.debug("Bulk-setup lock wait exceeded lock_timeout: {}", ex.getClass().getSimpleName());
             throw new BusinessException(HttpStatus.SERVICE_UNAVAILABLE,
-                    "Service setup is busy for this master, please retry");
+                    ServiceUnavailableMessages.SERVICE_SETUP_BUSY);
         }
         if (lockResult == null) {
             throw new BusinessException(HttpStatus.INTERNAL_SERVER_ERROR,
@@ -1269,6 +1301,8 @@ public class ServiceCatalogService {
         // every master (replacing allEntries=true, anti-bug §F).
         List<UUID> affectedMasterIds =
                 masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId);
+        // Deactivation CAN flip search membership (a master's last active service) — bracket it.
+        MasterSearchVisibilityGuard.Snapshot searchBefore = searchVisibilityGuard.capture(affectedMasterIds);
 
         // Step 2: register the targeted eviction to run after commit so a parallel
         // reader cannot repopulate stale entries between eviction and commit.
@@ -1300,9 +1334,24 @@ public class ServiceCatalogService {
 
         // Step 3: execute the update; check after registration so the callback is a
         // no-op when the method throws (transaction rolls back, afterCommit never fires).
+        // Phase 342 D6: row-lock the definition FIRST (the same single-row FOR UPDATE the photo upload/delete
+        // use), read the photo's R2 key from the LOCKED row, then deactivate (the UPDATE nulls the pointers
+        // itself — Phase 342 F) and delete the blob after commit (best-effort). A pre-lock read left a window
+        // where an upload committing between the read and the UPDATE had its NEW pointer nulled while only
+        // the stale key was purged — an orphaned blob. Now such an upload either commits before the lock
+        // (its key is the one read) or blocks until this commit and then answers 404 on its in-lock
+        // active re-check.
+        ServiceDefinition locked = serviceRepository.findByIdForUpdate(serviceDefId)
+                .orElseThrow(() -> new NotFoundException("Service definition not found: " + serviceDefId));
+        String photoKey = locked.getPhotoR2Key();
+
         int updated = serviceRepository.deactivateById(serviceDefId);
         if (updated == 0) {
             throw new NotFoundException("Service definition not found: " + serviceDefId);
+        }
+
+        if (photoKey != null) {
+            servicePhotoBlobPurger.purgeAfterCommit(serviceDefId, photoKey);
         }
 
         // Fix MEDIUM-6 PERF: replace N individual UPDATE round-trips with a single bulk
@@ -1310,23 +1359,25 @@ public class ServiceCatalogService {
         if (!affectedMasterIds.isEmpty()) {
             masterRepository.refreshMinEffectivePriceForAll(affectedMasterIds);
         }
+        searchVisibilityGuard.clearSearchCachesIfFlipped(searchBefore);
     }
 
     /**
      * Applies a partial update to a {@link ServiceDefinition}.
      *
      * <p>Only non-null fields in the request are written; null fields are treated as
-     * "no change". Ownership is verified by the {@code @PreAuthorize} guard on the
-     * controller — callers must enforce the same guard.
+     * "no change". The controller applies the role-only fast gate; ownership (plus the Phase 345
+     * owner-performed catalogue gate for {@code SALON_ADMIN}) is enforced here first via
+     * {@code enforceCanManageServiceDefinition} — same split as {@link #deactivateServiceDefinition}.
      *
      * <p>After the update commits, the {@code masterServices} cache entries for all
      * masters using this definition are evicted (anti-bug §F afterCommit pattern)
      * so that the next read reflects the new data.
      */
     @Transactional
-    // Ownership verified by @PreAuthorize("@authz.canManageServiceDefinition") on the controller.
-    public ServiceDefinitionResponse updateServiceDefinition(UUID serviceDefId,
+    public ServiceDefinitionResponse updateServiceDefinition(UUID actorId, UUID serviceDefId,
             UpdateServiceDefinitionRequest request) {
+        authz.enforceCanManageServiceDefinition(actorId, serviceDefId);
 
         ServiceDefinition definition = serviceRepository.findByIdWithServiceType(serviceDefId)
                 .orElseThrow(() -> new NotFoundException("Service definition not found: " + serviceDefId));
@@ -1352,29 +1403,14 @@ public class ServiceCatalogService {
     }
 
     /**
-     * Sets or replaces the photo URL for a {@link ServiceDefinition}.
-     *
-     * <p>Ownership is verified by the {@code @PreAuthorize} guard on the controller.
-     * After the update commits, the {@code masterServices} cache entries for all
-     * masters using this definition are evicted (anti-bug §F).
+     * Evicts the caches a service-photo change invalidates (Phase 342; the exact set the removed
+     * {@code updateServicePhoto} evicted): {@code masterServices} for every master using the definition
+     * and the owning salon's catalogue entry. Called by {@code MediaService} AFTER its write transaction
+     * has committed, so both evictors take their no-transaction (immediate) branch.
      */
-    @Transactional
-    // Ownership verified by @PreAuthorize("@authz.canManageServiceDefinition") on the controller.
-    public ServiceDefinitionResponse updateServicePhoto(UUID serviceDefId, String photoUrl) {
-        ServiceDefinition definition = serviceRepository.findByIdWithServiceType(serviceDefId)
-                .orElseThrow(() -> new NotFoundException("Service definition not found: " + serviceDefId));
-
-        definition.setPhotoUrl(photoUrl);
-
-        ServiceDefinition saved = serviceRepository.save(definition);
-
-        List<UUID> affectedMasterIds =
-                masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId);
-        evictMasterServicesCache(affectedMasterIds);
-        // A photo change alters the catalogue's rendered content (perf/security #2).
-        evictSalonCatalogAfterCommit(salonCatalogIdOf(saved));
-
-        return ServiceDefinitionResponse.from(saved);
+    public void evictServicePhotoCaches(UUID serviceDefId, OwnerType ownerType, UUID ownerId) {
+        evictMasterServicesCache(masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId));
+        evictSalonCatalogAfterCommit(ownerType == OwnerType.SALON ? ownerId : null);
     }
 
     /**
@@ -1919,13 +1955,20 @@ public class ServiceCatalogService {
     }
 
     /**
-     * Evicts the given master IDs from the "masterServices" cache.
+     * Evicts the given master IDs from the "masterServices" cache and from
+     * {@code master-bookable-assignments} (the strict per-master verdict behind the public services
+     * tab, keyed {@code [masterId]}) — an assignment
+     * write can add or remove a bookable service.
      *
      * <p>When a Spring transaction is active (the normal production path), the eviction is
      * deferred to {@code afterCommit} so a concurrent reader cannot repopulate the cache
      * with a pre-commit DB snapshot. When no transaction is active (e.g., in unit tests or
      * programmatic non-transactional callers), the eviction runs immediately — same net
      * effect as the former {@code @CacheEvict} annotation.
+     *
+     * <p>Discovery search is NOT cleared here: most callers (band, photo, definition-content edits)
+     * cannot change search membership. The writes that can bracket their mutation with
+     * {@link MasterSearchVisibilityGuard}, which clears only on an actual verdict flip.
      */
     private void evictMasterServicesCache(List<UUID> masterIds) {
         if (TransactionSynchronizationManager.isSynchronizationActive()) {
@@ -1933,15 +1976,21 @@ public class ServiceCatalogService {
                     new TransactionSynchronization() {
                         @Override
                         public void afterCommit() {
-                            var cache = cacheManager.getCache("masterServices");
-                            if (cache != null) masterIds.forEach(cache::evict);
+                            evictMasterServicesNow(masterIds);
                         }
                     }
             );
         } else {
-            var cache = cacheManager.getCache("masterServices");
-            if (cache != null) masterIds.forEach(cache::evict);
+            evictMasterServicesNow(masterIds);
         }
+    }
+
+    private void evictMasterServicesNow(List<UUID> masterIds) {
+        var cache = cacheManager.getCache("masterServices");
+        if (cache != null) masterIds.forEach(cache::evict);
+        var bookable = cacheManager.getCache(
+                com.beautica.booking.service.BookingMasterService.BOOKABLE_ASSIGNMENTS_CACHE);
+        if (bookable != null) masterIds.forEach(id -> bookable.evict(List.of(id)));
     }
 
     /**

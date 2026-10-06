@@ -4,6 +4,8 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.location.DiscoveryLocationKey;
 import com.beautica.location.DiscoveryLocationResolver;
 import com.beautica.location.DiscoveryLocationResolver.DiscoveryLabels;
+import com.beautica.master.repository.MasterBookabilitySql;
+import com.beautica.master.service.ScheduleDateMath;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.salon.repository.SalonSearchProjection;
 import com.beautica.search.dto.LocationFilter;
@@ -33,6 +35,10 @@ import org.springframework.data.domain.Pageable;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import java.math.BigDecimal;
+import java.time.Clock;
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -111,7 +117,7 @@ class SearchServiceTest {
     void setUp() {
         service = new SearchService(
                 salonRepository, discoveryLocationResolver, serviceTypeSlugResolver,
-                platformCategoryLabelResolver, cacheManager);
+                platformCategoryLabelResolver, cacheManager, new ScheduleDateMath(FIXED_CLOCK));
         ReflectionTestUtils.setField(service, "entityManager", entityManager);
         sqlCaptor = ArgumentCaptor.forClass(String.class);
         // The seam passes through the (cityId, districtId) pair by default;
@@ -176,6 +182,13 @@ class SearchServiceTest {
         when(dataQuery.getResultList()).thenReturn((List) rowsWithCount);
     }
 
+    /**
+     * 22:30Z on 5 Oct 2026 = 01:30 on 6 Oct in Kyiv (UTC+3): the instant at which a UTC session date
+     * and the Kyiv civil date disagree — the exact window the CURRENT_DATE defect lived in.
+     */
+    private static final Clock FIXED_CLOCK = Clock.fixed(Instant.parse("2026-10-05T22:30:00Z"), ZoneOffset.UTC);
+    private static final LocalDate KYIV_TODAY_AT_FIXED_CLOCK = LocalDate.of(2026, 10, 6);
+
     private static final UUID CITY_ID = UUID.fromString("11111111-1111-1111-1111-111111111111");
     private static final UUID DISTRICT_ID = UUID.fromString("22222222-2222-2222-2222-222222222222");
 
@@ -207,6 +220,39 @@ class SearchServiceTest {
                 20,
                 null
         );
+    }
+
+    // ── bookability "today" — bound from the app Clock, never the DB clock ────
+
+    @Test
+    @DisplayName("dynamic master search binds :bookableToday as the Kyiv civil date of the app Clock "
+            + "(22:30Z → next day in Kyiv), and the SQL carries no DB now-source")
+    void should_bindKyivDateOfAppClock_when_masterSearchSplicesBookability() {
+        stubNativeQueries(List.of(), 0L);
+
+        service.searchMasters(cityRequest(), PageRequest.of(0, 20));
+
+        verify(dataQuery).setParameter(MasterBookabilitySql.TODAY_PARAM, KYIV_TODAY_AT_FIXED_CLOCK);
+        assertThat(sqlCaptor.getAllValues().get(0))
+                .contains(":" + MasterBookabilitySql.TODAY_PARAM)
+                .doesNotContainIgnoringCase("CURRENT_TIMESTAMP")
+                .doesNotContainIgnoringCase("CURRENT_DATE")
+                .doesNotContainIgnoringCase("now()");
+    }
+
+    @Test
+    @DisplayName("static salon search passes the Kyiv civil date of the app Clock as the today argument")
+    void should_passKyivDateOfAppClock_when_staticSalonSearchRuns() {
+        List<SalonSearchProjection> stubRows = oneSalonProjectionList();
+        ArgumentCaptor<LocalDate> todayCaptor = ArgumentCaptor.forClass(LocalDate.class);
+        when(salonRepository.findActiveByCityIdNoPriceAsProjection(
+                eq(CITY_ID), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(),
+                todayCaptor.capture()))
+                .thenReturn(stubRows);
+
+        service.searchSalons(salonRequest(CITY_ID, null), PageRequest.of(0, 20));
+
+        assertThat(todayCaptor.getValue()).isEqualTo(KYIV_TODAY_AT_FIXED_CLOCK);
     }
 
     // ── FK location filter — district-primary ────────────────────────────────
@@ -577,17 +623,17 @@ class SearchServiceTest {
         // unfinished stub if nested inside when(salonRepository...).
         List<SalonSearchProjection> stubRows = oneSalonProjectionList();
         when(salonRepository.findActiveByDistrictIdNoPriceAsProjection(
-                eq(DISTRICT_ID), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong()))
+                eq(DISTRICT_ID), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any()))
                 .thenReturn(stubRows);
 
         service.searchSalons(salonRequest(CITY_ID, DISTRICT_ID), PageRequest.of(0, 20));
 
         // No price bounds → no-price variant (no COUNT lateral).
         verify(salonRepository, times(1)).findActiveByDistrictIdNoPriceAsProjection(
-                eq(DISTRICT_ID), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong());
-        verify(salonRepository, never()).findActiveByDistrictIdAsProjection(any(), any(), any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong());
-        verify(salonRepository, never()).findActiveByCityIdNoPriceAsProjection(any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong());
-        verify(salonRepository, never()).findByIsActiveTrueNoPriceAsProjection(any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong());
+                eq(DISTRICT_ID), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any());
+        verify(salonRepository, never()).findActiveByDistrictIdAsProjection(any(), any(), any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any());
+        verify(salonRepository, never()).findActiveByCityIdNoPriceAsProjection(any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any());
+        verify(salonRepository, never()).findByIsActiveTrueNoPriceAsProjection(any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any());
         // Must NOT touch the full-entity variants — they hydrate unnecessary columns.
         verify(salonRepository, never()).findActiveByDistrictId(any(), any());
         verify(salonRepository, never()).findActiveByCityId(any(), any());
@@ -599,16 +645,16 @@ class SearchServiceTest {
     void should_dispatchToCityRepoMethod_when_onlyCityResolved() {
         List<SalonSearchProjection> stubRows = oneSalonProjectionList();
         when(salonRepository.findActiveByCityIdNoPriceAsProjection(
-                eq(CITY_ID), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong()))
+                eq(CITY_ID), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any()))
                 .thenReturn(stubRows);
 
         service.searchSalons(salonRequest(CITY_ID, null), PageRequest.of(0, 20));
 
         verify(salonRepository, times(1)).findActiveByCityIdNoPriceAsProjection(
-                eq(CITY_ID), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong());
-        verify(salonRepository, never()).findActiveByCityIdAsProjection(any(), any(), any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong());
-        verify(salonRepository, never()).findActiveByDistrictIdNoPriceAsProjection(any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong());
-        verify(salonRepository, never()).findByIsActiveTrueNoPriceAsProjection(any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong());
+                eq(CITY_ID), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any());
+        verify(salonRepository, never()).findActiveByCityIdAsProjection(any(), any(), any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any());
+        verify(salonRepository, never()).findActiveByDistrictIdNoPriceAsProjection(any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any());
+        verify(salonRepository, never()).findByIsActiveTrueNoPriceAsProjection(any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any());
         verify(salonRepository, never()).findActiveByDistrictId(any(), any());
         verify(salonRepository, never()).findActiveByCityId(any(), any());
         verify(salonRepository, never()).findByIsActiveTrue(any());
@@ -618,15 +664,15 @@ class SearchServiceTest {
     @DisplayName("salon search dispatches to the no-price active-only variant when no locality filter and no price bounds are supplied (HIGH PERF gate)")
     void should_dispatchToActiveOnlyRepoMethod_when_noLocalityFilter() {
         List<SalonSearchProjection> stubRows = oneSalonProjectionList();
-        when(salonRepository.findByIsActiveTrueNoPriceAsProjection(any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong()))
+        when(salonRepository.findByIsActiveTrueNoPriceAsProjection(any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any()))
                 .thenReturn(stubRows);
 
         service.searchSalons(salonRequest(null, null), PageRequest.of(0, 20));
 
-        verify(salonRepository, times(1)).findByIsActiveTrueNoPriceAsProjection(any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong());
-        verify(salonRepository, never()).findByIsActiveTrueAsProjection(any(), any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong());
-        verify(salonRepository, never()).findActiveByDistrictIdNoPriceAsProjection(any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong());
-        verify(salonRepository, never()).findActiveByCityIdNoPriceAsProjection(any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong());
+        verify(salonRepository, times(1)).findByIsActiveTrueNoPriceAsProjection(any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any());
+        verify(salonRepository, never()).findByIsActiveTrueAsProjection(any(), any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any());
+        verify(salonRepository, never()).findActiveByDistrictIdNoPriceAsProjection(any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any());
+        verify(salonRepository, never()).findActiveByCityIdNoPriceAsProjection(any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any());
         verify(salonRepository, never()).findActiveByDistrictId(any(), any());
         verify(salonRepository, never()).findActiveByCityId(any(), any());
         verify(salonRepository, never()).findByIsActiveTrue(any());
@@ -637,7 +683,7 @@ class SearchServiceTest {
     void should_dispatchToPriceVariant_when_priceBoundSupplied() {
         List<SalonSearchProjection> stubRows = oneSalonProjectionList();
         when(salonRepository.findActiveByCityIdAsProjection(
-                eq(CITY_ID), any(), any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong()))
+                eq(CITY_ID), any(), any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any()))
                 .thenReturn(stubRows);
         SalonSearchRequest request = new SalonSearchRequest(
                 new LocationFilter(CITY_ID, null), null, null, null,
@@ -646,8 +692,8 @@ class SearchServiceTest {
         service.searchSalons(request, PageRequest.of(0, 20));
 
         verify(salonRepository, times(1)).findActiveByCityIdAsProjection(
-                eq(CITY_ID), any(), any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong());
-        verify(salonRepository, never()).findActiveByCityIdNoPriceAsProjection(any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong());
+                eq(CITY_ID), any(), any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any());
+        verify(salonRepository, never()).findActiveByCityIdNoPriceAsProjection(any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any());
     }
 
     @Test
@@ -658,7 +704,7 @@ class SearchServiceTest {
         when(proj.getAvatarUrl()).thenReturn("https://cdn.example.com/avatar.jpg");
 
         when(salonRepository.findActiveByCityIdNoPriceAsProjection(
-                eq(CITY_ID), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong()))
+                eq(CITY_ID), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any()))
                 .thenReturn(List.of(proj));
         when(discoveryLocationResolver.resolveLabels(any(), any()))
                 .thenReturn(new DiscoveryLabels(
@@ -683,7 +729,7 @@ class SearchServiceTest {
         SalonSearchProjection b = stubProjection(UUID.randomUUID(), "B", CITY_ID, DISTRICT_ID);
         SalonSearchProjection c = stubProjection(UUID.randomUUID(), "C", CITY_ID, DISTRICT_ID);
         when(salonRepository.findActiveByCityIdNoPriceAsProjection(
-                eq(CITY_ID), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong()))
+                eq(CITY_ID), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any()))
                 .thenReturn(List.of(a, b, c));
 
         Page<SalonSearchResult> page =
@@ -1168,7 +1214,7 @@ class SearchServiceTest {
 
         verify(entityManager, never()).createNativeQuery(anyString());
         verify(salonRepository).findByIsActiveTrueNoPriceAsProjection(
-                any(), any(), any(), any(), isNull(), anyString(), anyInt(), anyLong());
+                any(), any(), any(), any(), isNull(), anyString(), anyInt(), anyLong(), any());
     }
 
     @Test
@@ -1209,7 +1255,9 @@ class SearchServiceTest {
                 .as("owner_type without owner_id is a HALF gate: an active cross-owner "
                         + "master_services row would then make a master discoverable by another "
                         + "owner's service name. Every gate must carry BOTH halves.")
-                .isEqualTo(countOccurrences(sql, ".owner_type = 'INDEPENDENT_MASTER'"))
+                // Any owner_type, not only INDEPENDENT_MASTER: the always-on bookability gate
+                // (MasterBookabilitySql) carries a SALON arm too, and it must be paired as well.
+                .isEqualTo(countOccurrences(sql, ".owner_type = '"))
                 .isPositive();
         assertThat(sql)
                 .as("the pre-filter spells the owner as the sub-query's own ms.master_id (inner-only "
@@ -1229,7 +1277,9 @@ class SearchServiceTest {
 
         String sql = sqlCaptor.getAllValues().get(0);
         assertThat(countOccurrences(sql, ".owner_id = "))
-                .isEqualTo(countOccurrences(sql, ".owner_type = 'INDEPENDENT_MASTER'"))
+                // Any owner_type, not only INDEPENDENT_MASTER: the always-on bookability gate
+                // (MasterBookabilitySql) carries a SALON arm too, and it must be paired as well.
+                .isEqualTo(countOccurrences(sql, ".owner_type = '"))
                 .isPositive();
         assertThat(sql)
                 .as("the exact group predicate (aliases msg/sdg) is emitted for >1 token and "
@@ -1545,7 +1595,7 @@ class SearchServiceTest {
     void should_forwardQAndPriceBounds_toSalonRepo() {
         List<SalonSearchProjection> stubRows = oneSalonProjectionList();
         when(salonRepository.findActiveByCityIdAsProjection(
-                eq(CITY_ID), any(), any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong()))
+                eq(CITY_ID), any(), any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any()))
                 .thenReturn(stubRows);
         SalonSearchRequest request = new SalonSearchRequest(
                 new LocationFilter(CITY_ID, null), "glow", null, null,
@@ -1561,7 +1611,7 @@ class SearchServiceTest {
                 eq("%glow%"), isNull(), isNull(), isNull(),
                 eq(new BigDecimal("100.00")),
                 eq(new BigDecimal("500.00")),
-                anyString(), anyInt(), anyLong());
+                anyString(), anyInt(), anyLong(), any());
     }
 
     @Test
@@ -1572,7 +1622,7 @@ class SearchServiceTest {
         // No price bounds → no-price city variant (HIGH PERF gate).
         when(salonRepository.findActiveByCityIdNoPriceAsProjection(
                 eq(CITY_ID), any(), any(), any(), any(), any(),
-                sortModeCaptor.capture(), anyInt(), anyLong()))
+                sortModeCaptor.capture(), anyInt(), anyLong(), any()))
                 .thenReturn(stubRows);
         SalonSearchRequest request = new SalonSearchRequest(
                 new LocationFilter(CITY_ID, null), null, null, SearchSort.PRICE_ASC,
@@ -1594,7 +1644,7 @@ class SearchServiceTest {
         ArgumentCaptor<Long> offsetCaptor = ArgumentCaptor.forClass(Long.class);
         when(salonRepository.findActiveByCityIdNoPriceAsProjection(
                 eq(CITY_ID), any(), any(), any(), any(), any(), anyString(),
-                limitCaptor.capture(), offsetCaptor.capture()))
+                limitCaptor.capture(), offsetCaptor.capture(), any()))
                 .thenReturn(stubRows);
 
         service.searchSalons(salonRequest(CITY_ID, null), PageRequest.of(2, 15));
@@ -1609,7 +1659,7 @@ class SearchServiceTest {
         SalonSearchProjection proj = stubProjection(UUID.randomUUID(), "Glow", CITY_ID, DISTRICT_ID);
         when(proj.getTotalCount()).thenReturn(137L);
         when(salonRepository.findActiveByCityIdNoPriceAsProjection(
-                eq(CITY_ID), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong()))
+                eq(CITY_ID), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any()))
                 .thenReturn(List.of(proj));
 
         Page<SalonSearchResult> page =

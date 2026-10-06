@@ -8,7 +8,7 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
-import com.beautica.media.entity.MediaFile;
+import com.beautica.media.repository.UploaderMediaKey;
 import com.beautica.media.repository.MediaRepository;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.salon.service.StaffAccountDisposalService;
@@ -16,6 +16,9 @@ import com.beautica.salon.audit.AuditOutcome;
 import com.beautica.salon.audit.StaffClientReferenceAuditResult;
 import com.beautica.salon.service.StaffClientReferenceAuditService;
 import com.beautica.salon.service.StaffDisposalReason;
+import com.beautica.service.entity.OwnerType;
+import com.beautica.service.repository.ServiceRepository;
+import com.beautica.service.service.ServicePhotoBlobPurger;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
@@ -78,6 +81,8 @@ public class StaffAccountSelfDeletionService {
     private final StaffClientReferenceAuditService staffClientReferenceAuditService;
     private final AuthService authService;
     private final AccountBlobPurgeRegistrar accountBlobPurgeRegistrar;
+    private final ServiceRepository serviceRepository;
+    private final ServicePhotoBlobPurger servicePhotoBlobPurger;
 
     private static final Set<Role> SELF_DELETABLE_ROLES =
             Set.of(Role.SALON_ADMIN, Role.SALON_MASTER, Role.INDEPENDENT_MASTER);
@@ -139,8 +144,8 @@ public class StaffAccountSelfDeletionService {
         }
 
         // Step 4 — pre-read external-storage pointers BEFORE anything cascades them away.
-        List<MediaFile> mediaRows = mediaRepository.findByUploaderId(userId);
-        String avatarR2Key = user.getAvatarR2Key();
+        // Scalar projection (P-L1) — no MediaFile entities loaded into the persistence context.
+        List<UploaderMediaKey> mediaRows = mediaRepository.findMediaKeysByUploaderIdIn(List.of(userId));
         UUID salonId = user.getSalonId();
 
         // Step 5 — resolve the caller's OWN masters row, if any. SALON_ADMIN has none (D3 — no
@@ -152,6 +157,27 @@ public class StaffAccountSelfDeletionService {
         if (user.getRole() == Role.SALON_MASTER || user.getRole() == Role.INDEPENDENT_MASTER) {
             master = masterRepository.findByUserId(userId)
                     .orElseThrow(() -> new ForbiddenException("Access denied"));
+        }
+
+        // Step 5b — Phase 342 D6: an independent master's own service catalogue keeps uploaded photos in R2
+        // (service_definitions has no FK to the master, so nothing cascades). Row-lock the catalogue (id order)
+        // and read the keys from the LOCKED rows, null the pointers, and DEACTIVATE the definitions (never
+        // delete: historical bookings reference them — same semantics as SalonService#deactivateSalon). The
+        // deactivation is what makes a photo upload that takes the row lock after this commit answer 404 on
+        // its in-lock active re-check, so it can never write a pointer nobody will purge.
+        // LOCK ORDER (service_definitions BEFORE masters): ServiceCatalogService#deactivateServiceDefinition
+        // locks the definition then UPDATEs masters; the disposal below deletes the masters row, so the
+        // locks must be taken here, ahead of every masters write, to avoid a deadlock with a concurrent
+        // service delete.
+        List<ServicePhotoBlobPurger.ServicePhotoBlob> servicePhotoKeys = List.of();
+        if (master != null && user.getRole() == Role.INDEPENDENT_MASTER) {
+            servicePhotoKeys = serviceRepository
+                    .lockAllByOwnerOrderById(OwnerType.INDEPENDENT_MASTER, master.getId()).stream()
+                    .filter(sd -> sd.getPhotoR2Key() != null)
+                    .map(sd -> new ServicePhotoBlobPurger.ServicePhotoBlob(sd.getId(), sd.getPhotoR2Key()))
+                    .toList();
+            serviceRepository.clearPhotosByOwner(OwnerType.INDEPENDENT_MASTER, master.getId());
+            serviceRepository.deactivateAllByOwner(OwnerType.INDEPENDENT_MASTER, master.getId());
         }
 
         // Step 6 — the master-role booking cascade (Q3). SALON_ADMIN skips this entirely — no
@@ -208,10 +234,13 @@ public class StaffAccountSelfDeletionService {
 
         // Step 9 — R2 blob sweep, registered to run strictly after commit (Anti-Bug §O8), via the
         // promoted AccountBlobPurgeRegistrar (Phase 301 — shared with ClientAccountDeletionService,
-        // never re-typed). Deliberately NOT swept by staffAccountDisposalService.dispose itself —
-        // that shared seam's other three callers (removeAdmin/removeMaster/deleteSalonStaff) leak
-        // R2 blobs today (R6, pre-existing, out of scope); only THIS self-delete path sweeps.
-        accountBlobPurgeRegistrar.registerAfterCommit(userId, avatarR2Key, mediaRows);
+        // never re-typed). staffAccountDisposalService.dispose sweeps for the owner-initiated callers
+        // but skips StaffDisposalReason.SELF_DELETE, so this path is the only sweeper here (no double purge).
+        accountBlobPurgeRegistrar.registerAfterCommit(user, mediaRows);
+
+        // Step 9b — Phase 342 D6: delete the independent master's service-photo blobs after commit. The keys
+        // were read from the row-locked catalogue in Step 5b (before any masters write).
+        servicePhotoBlobPurger.purgeAfterCommit(servicePhotoKeys);
 
         // Step 10 — audit trail. Ids and counts only, never an email or any other PII.
         log.info("Staff/independent-master account self-delete: user {} (role {}) deleted, "

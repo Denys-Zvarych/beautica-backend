@@ -5,6 +5,12 @@ import com.beautica.common.cache.UserProfileCacheEvictor;
 import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.master.service.MasterService;
+import com.beautica.media.entity.EntityType;
+import com.beautica.media.repository.MediaRepository;
+import com.beautica.media.repository.UploaderMediaKey;
+import com.beautica.media.service.AccountBlobPointers;
+import com.beautica.user.AccountBlobPurgeRegistrar;
+import com.beautica.user.UserAvatarPointers;
 import com.beautica.user.InviteTokenRepository;
 import com.beautica.user.UserRepository;
 import lombok.RequiredArgsConstructor;
@@ -14,7 +20,10 @@ import org.springframework.stereotype.Service;
 
 import java.time.Clock;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 
@@ -45,6 +54,8 @@ public class StaffAccountDisposalService {
     private final Clock clock;
     private final TokensValidAfterCache tokensValidAfterCache;
     private final UserProfileCacheEvictor userProfileCacheEvictor;
+    private final MediaRepository mediaRepository;
+    private final AccountBlobPurgeRegistrar accountBlobPurgeRegistrar;
 
     /**
      * HARD-DELETES the given {@code staffUserIds}' accounts, and the {@code masters} rows behind
@@ -133,13 +144,13 @@ public class StaffAccountDisposalService {
      * Deleting a row is idempotent by construction — an empty {@code staffUserIds} writes nothing.
      * The phase 291 scrub marker column and its guard are gone with the column (V158).
      *
-     * <h3>Known limit — R2 avatar blobs</h3>
+     * <h3>R2 blobs (avatar + {@code media_files}) — swept after commit (§O-8)</h3>
      * {@code media_files} cascades on {@code uploader_id} and {@code users.avatar_r2_key} vanishes
-     * with the row, so the R2 objects behind both are orphaned (§O-8). That is phase 268's media
-     * purge, explicitly out of scope here for the three owner-initiated callers — recorded, not
-     * forgotten (Phase 301 R6). The new self-delete caller sweeps R2 itself, from its OWN
-     * after-commit registrar, never from inside this shared seam — see
-     * {@code StaffAccountSelfDeletionService}.
+     * with the row, so BEFORE the users delete this method row-locks and pre-reads each disposed user's
+     * avatar pointers and {@code media_files} keys and registers ONE after-commit purge for the batch via
+     * {@link AccountBlobPurgeRegistrar} (the same registrar the self-delete flows use). A rolled-back
+     * disposal fires nothing. {@link StaffDisposalReason#SELF_DELETE} is skipped here: {@code
+     * StaffAccountSelfDeletionService} registers its own sweep, and registering twice would double-purge.
      *
      * <h3>{@code salonId == null} — the ONE additive change since promotion (Phase 301 §3a)</h3>
      * An {@code INDEPENDENT_MASTER} was never invited into any salon and carries no {@code
@@ -202,6 +213,10 @@ public class StaffAccountDisposalService {
         for (UUID staffUserId : staffUserIds) {
             tokensValidAfterCache.invalidateAfterCommit(staffUserId);
             userProfileCacheEvictor.evictAfterCommit(staffUserId);
+        }
+
+        if (reason != StaffDisposalReason.SELF_DELETE) {
+            registerBlobPurges(salonId, staffUserIds, reason);
         }
 
         // ── step 1 of the binding order: settle every masters row that references a staff
@@ -298,5 +313,39 @@ public class StaffAccountDisposalService {
                         + "{} master row(s) detached{}{}{}",
                 reason.label(), staffUserIds.size(), deleted, detached,
                 staffIdsClause, salonClause, actorClause);
+    }
+
+    /**
+     * Pre-reads every disposed user's blob pointers BEFORE the users delete cascades them away and registers
+     * ONE after-commit purge for the whole batch (P-M1).
+     *
+     * <ol>
+     *   <li>{@code lockAvatarPointersByIdIn} — {@code SELECT … FOR UPDATE ORDER BY id} (S-L2): a concurrent
+     *       avatar replace by a removed member either committed before this read (its new key is read and
+     *       purged) or blocks on the row lock until the delete commits and then discards its own new blob.
+     *       Scalar projection, no managed entities (P-L2).</li>
+     *   <li>{@code findMediaKeysByUploaderIdIn} — scalar projection, no uploader fetch (P-L1).</li>
+     * </ol>
+     * Only key/id scalars reach the after-commit closure (P-L3).
+     */
+    private void registerBlobPurges(
+            @Nullable UUID salonId, List<UUID> staffUserIds, StaffDisposalReason reason) {
+        List<UserAvatarPointers> avatars = userRepository.lockAvatarPointersByIdIn(staffUserIds);
+        Map<UUID, List<UploaderMediaKey>> mediaByUploader = new HashMap<>();
+        for (UploaderMediaKey media : mediaRepository.findMediaKeysByUploaderIdIn(staffUserIds)) {
+            // A salon deletion already sweeps the salon's own portfolio rows (SalonService pre-reads them and
+            // MediaService#deleteBySalon purges them after commit) — skip them here to avoid a double purge.
+            if (reason == StaffDisposalReason.SALON_DELETION && salonId != null
+                    && media.entityType() == EntityType.SALON && salonId.equals(media.entityId())) {
+                continue;
+            }
+            mediaByUploader.computeIfAbsent(media.uploaderId(), id -> new ArrayList<>()).add(media);
+        }
+        List<AccountBlobPointers> accounts = new ArrayList<>(avatars.size());
+        for (UserAvatarPointers avatar : avatars) {
+            accounts.add(new AccountBlobPointers(avatar.getId(), avatar.getAvatarR2Key(), avatar.getAvatarUrl(),
+                    mediaByUploader.getOrDefault(avatar.getId(), List.of())));
+        }
+        accountBlobPurgeRegistrar.registerAfterCommit(accounts);
     }
 }

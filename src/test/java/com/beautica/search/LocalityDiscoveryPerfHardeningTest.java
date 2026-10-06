@@ -1,5 +1,6 @@
 package com.beautica.search;
 
+import com.beautica.support.BookableMasterSeeder;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.location.DiscoveryLocationResolver;
 import com.beautica.search.dto.SalonSearchRequest;
@@ -236,7 +237,7 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
                         null, null, null, null, null, 0, 20, null));
 
         String plan = salonsProbe()
-                .explainWithOnly(CITY_INDEX, fillLocalityBinds(productionSql, kyivCityId));
+                .explainWithOnlyNoPrimaryKey(CITY_INDEX, fillLocalityBinds(productionSql, kyivCityId));
         log.info("AC1 salon city-filter REAL production SQL:\n{}\n\nCAPABILITY plan "
                 + "(only {} left on salons, seqscan+bitmapscan off):\n{}",
                 productionSql, CITY_INDEX, plan);
@@ -272,7 +273,7 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
                         null, null, null, null, null, 0, 20, null));
 
         String plan = salonsProbe()
-                .explainWithOnly(DISTRICT_INDEX, fillLocalityBinds(productionSql, districtId));
+                .explainWithOnlyNoPrimaryKey(DISTRICT_INDEX, fillLocalityBinds(productionSql, districtId));
         log.info("AC1 salon district-filter REAL production SQL:\n{}\n\nCAPABILITY plan "
                 + "(only {} left on salons, seqscan+bitmapscan off):\n{}",
                 productionSql, DISTRICT_INDEX, plan);
@@ -652,10 +653,18 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
         String stringBindsNeutralised =
                 capturedSql.replaceAll("(?i)cast\\(\\s*\\?\\s+as\\s+text\\)", "CAST(NULL AS text)");
 
+        // Step 1b: the bookability "today" binds (MasterBookabilitySql#TODAY_PARAM, bound from the
+        // app clock since the 2026-10-05 audit) — matched STRUCTURALLY on the four date clauses
+        // that carry them (`<col> [- n] <=|>= ?`), so they can never be confused with the locality
+        // uuid bind, and filled with the Kyiv civil date the production binder would send.
+        String todayFilled = stringBindsNeutralised.replaceAll(
+                "(?i)((?:ws\\.valid_from|ws\\.valid_to|se\\.date)(?:\\s*-\\s*\\d+)?\\s*(?:<=|>=))\\s*\\?",
+                "$1 DATE '" + java.time.LocalDate.now(com.beautica.common.TimeZones.KYIV) + "'");
+
         // Step 2: pagination, matched structurally on the inner Top-N tail.
         // Preserving the real LIMIT lets the planner stop early on the index path —
         // exactly the production execution shape.
-        String paginationFilled = stringBindsNeutralised
+        String paginationFilled = todayFilled
                 .replaceAll("(?i)limit\\s+\\?\\s+offset\\s+\\?", "LIMIT 20 OFFSET 0");
 
         long remaining = paginationFilled.chars().filter(c -> c == '?').count();
@@ -686,6 +695,8 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
                 "INSERT INTO salons (id, owner_id, name, city, city_id, is_active, created_at, updated_at) "
                         + "VALUES (?, ?, ?, ?, ?, true, NOW(), NOW())",
                 salonId, ownerId, "PerfActiveSalon-" + salonId, city, cityId);
+        // Discoverable only with >=1 bookable master (MasterBookabilitySql, 2026-10-05).
+        BookableMasterSeeder.addBookableSalonMaster(jdbcTemplate, salonId);
     }
 
     private UUID oblastIdByCity(String cityNameUk) {
@@ -735,6 +746,8 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
                 "INSERT INTO masters (id, user_id, master_type, avg_rating, review_count, is_active, created_at, updated_at) "
                         + "VALUES (?, ?, 'INDEPENDENT_MASTER', ?::numeric, 1, true, NOW(), NOW())",
                 masterId, masterUserId, avgRating);
+        // Discoverable only with an active service + hours (MasterBookabilitySql, 2026-10-05).
+        BookableMasterSeeder.makeIndependentBookable(jdbcTemplate, masterId);
     }
 
     // seedActiveSalonsInDistrict / seedSalonsAcrossManyCities were DELETED with the

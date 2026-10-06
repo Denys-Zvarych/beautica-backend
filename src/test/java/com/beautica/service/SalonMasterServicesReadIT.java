@@ -288,6 +288,8 @@ class SalonMasterServicesReadIT extends AbstractIntegrationTest {
                 "owner-309-c7-" + System.nanoTime() + "@beautica.test");
         UUID salonId = fixtures.createSalon(ownerToken, "Phase 309 Case 7 Salon");
         UUID masterId = fixtures.createSalonMaster(salonId);
+        // The client view of /masters/{id}/services lists only BOOKABLE services (2026-10-05).
+        fixtures.seedUsableSchedule(masterId);
         UUID definitionId = fixtures.createServiceDefinition(ownerToken, salonId, "Phase 309 Case 7 Service");
         assignWithOverride(ownerToken, salonId, masterId, definitionId, new BigDecimal("275.50"));
 

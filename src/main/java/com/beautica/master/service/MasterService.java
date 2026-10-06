@@ -79,6 +79,9 @@ public class MasterService {
     private final com.beautica.booking.service.BookingSlugService bookingSlugService;
     private final AuthorizationService authorizationService;
     private final SlotCalculationService slotCalculationService;
+    // Binds MasterBookabilitySql's :bookableToday (Kyiv civil date from the app clock) for the
+    // public salon roster gate — the same source search binds, so the two cannot disagree.
+    private final ScheduleDateMath scheduleDateMath;
     private final SalonCatalogCacheEvictor salonCatalogCacheEvictor;
     // Audit-fix cycle 2 (LOW — GET /users/me caching). Every method in this class that
     // creates, reactivates or deactivates a `masters` row also flips
@@ -412,10 +415,13 @@ public class MasterService {
             }
         }
 
-        // Ownership already enforced by @PreAuthorize("@authz.canManageMasterSchedule(...)") on
-        // the controller — no redundant DB round-trip needed here.
+        // Controller gate: @PreAuthorize("@authz.canManageMasterSchedule(...)"). Re-proved here
+        // against the loaded row (Phase 345 audit, defense-in-depth): the graph load already holds
+        // user + salon, so the check costs no query on the owner/independent arms — and it keeps
+        // a SALON_ADMIN off the salon owner's own row even if the controller gate drifts.
         var master = masterRepository.findByIdWithUserAndSalon(masterId)
                 .orElseThrow(() -> new NotFoundException("Master not found"));
+        authorizationService.enforceCanManageMasterSchedule(actorId, master);
 
         // Merge against ALL existing rows (incl. inactive). The DB unique key is
         // (master_id, day_of_week) unconditionally, so matching only active rows would miss a
@@ -1312,12 +1318,33 @@ public class MasterService {
      */
     private static final Set<String> SORTABLE_CALENDAR_PROPERTIES = Set.of("startsAt");
 
-    // Fix 8: use JOIN FETCH query to eliminate per-master user lazy-loads
+    /**
+     * The public salon roster — the single implementation behind both
+     * {@code GET /masters/by-salon/{salonId}} and {@code GET /salons/{salonId}/masters}
+     * ({@code SalonService#getMastersBySalon} delegates here).
+     *
+     * <p>Lists only client-visible masters — the CHEAP structural rule
+     * ({@code MasterBookabilitySql}: ≥1 active, correctly-owned service AND working hours within the
+     * 180-day horizon), the same predicate discovery search applies. It never walks the free-slot
+     * calendar, so a fully booked master stays listed; an auto-enrolled owner-master or an invited
+     * master without services / working hours is not shown. The id gate
+     * ({@link MasterRepository#findBookableIdsBySalonId}, bounded by one salon's headcount) runs
+     * first; no visible master → empty page with no roster query. Otherwise the ids narrow the
+     * {@code JOIN FETCH m.user} roster query in SQL ({@code m.id IN :ids}), so paging, sort and
+     * {@code totalElements} stay exact and the mapping stays N+1-free. The management roster
+     * ({@code SalonService#getSalonStaff}) is deliberately NOT gated.
+     */
     @Transactional(readOnly = true)
     public Page<MasterSummaryResponse> getMastersByPage(UUID salonId, Pageable pageable) {
         Pageable safePageable = SortWhitelist.apply(
                 pageable, SORTABLE_MASTER_PROPERTIES, DEFAULT_MASTER_SORT, MASTER_ID_TIEBREAKER);
-        return masterRepository.findBySalonIdAndIsActiveTrueWithUser(salonId, safePageable)
+        List<UUID> bookableMasterIds =
+                masterRepository.findBookableIdsBySalonId(salonId, scheduleDateMath.today());
+        if (bookableMasterIds.isEmpty()) {
+            return Page.empty(safePageable);
+        }
+        return masterRepository
+                .findBySalonIdAndIdInAndIsActiveTrueWithUser(salonId, bookableMasterIds, safePageable)
                 .map(MasterSummaryResponse::from);
     }
 

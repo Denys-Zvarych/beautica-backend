@@ -1,5 +1,6 @@
 package com.beautica.search;
 
+import com.beautica.support.BookableMasterSeeder;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.search.dto.LocationFilter;
 import com.beautica.search.dto.MasterSearchRequest;
@@ -138,7 +139,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @DisplayName("searchMasters — an INDEPENDENT_MASTER's street/buildingNo/locationNote come back "
             + "POPULATED from the real projection (guards silent blanking on index/enum drift)")
     void should_projectOwnAddress_when_independentMasterMatchesSearch() {
-        UUID masterId = seedMaster("Київ", "4.50");
+        UUID masterId = seedMasterWithCity("Київ", "4.50");
         jdbcTemplate.update(
                 "UPDATE users SET street = ?, building_no = ?, location_note = ? "
                         + "WHERE id = (SELECT user_id FROM masters WHERE id = ?)",
@@ -263,7 +264,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @DisplayName("GET /search/salons — an out-of-range page reports the TRUE total, not 0")
     void should_reportTrueTotal_when_salonPageIsPastTheEnd() throws Exception {
         for (int i = 0; i < 3; i++) {
-            seedActiveSalon("Київ", null);
+            seedBookableActiveSalon("Київ", null);
         }
 
         // Static (unfiltered) salon path — same single-query pagination trade as the
@@ -812,21 +813,25 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("GET /search/masters — master without master_services rows surfaces with null minEffectivePrice when no filter applied")
-    void should_returnMasterWithNullPrice_when_masterHasNoMasterServicesRows_andNoFilter() throws Exception {
-        UUID masterId = seedMasterWithoutServices("Київ", "4.00");
+    @DisplayName("GET /search/masters — a scheduled master with NO master_services rows is not discoverable "
+            + "(bookability: >=1 active service AND hours, 2026-10-05); a sibling with one service is")
+    void should_excludeMaster_when_masterHasNoMasterServicesRows() throws Exception {
+        UUID withoutServices = seedMasterWithoutServices("Київ", "4.00");
+        UUID withService = seedMasterWithCity("Київ", "4.00");
 
-        log.debug("Act: GET {}?city=Київ — JOIN must be elided, master visible with null price", MASTERS_URL);
         ResponseEntity<String> response = restTemplate.exchange(
                 MASTERS_URL + "?location.cityId=" + majorCityIdByName("Київ") + "&page=0&size=20", HttpMethod.GET,
                 anonymous(), String.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
         JsonNode page = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(masterIds(page))
+                .as("the service-less master has hours (seedMaster), so only the missing service excludes it")
+                .containsExactly(withService.toString())
+                .doesNotContain(withoutServices.toString());
         assertThat(page.path("totalElements").asLong()).isEqualTo(1L);
-        assertThat(page.path("data").get(0).path("masterId").asText()).isEqualTo(masterId.toString());
         assertThat(page.path("data").get(0).path("minEffectivePrice").isNull())
-                .as("no service-join branch → minEffectivePrice must project NULL")
+                .as("a JDBC-seeded service leaves min_effective_price NULL → projected as JSON null")
                 .isTrue();
     }
 
@@ -853,8 +858,8 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons — finds salons by city when salons exist in city")
     void should_findSalonsByCity_when_salonsExistInCity() throws Exception {
-        seedActiveSalon("Київ", "Region-A");
-        seedActiveSalon("Львів", "Region-B");
+        seedBookableActiveSalon("Київ", "Region-A");
+        seedBookableActiveSalon("Львів", "Region-B");
 
         ResponseEntity<String> response = restTemplate.exchange(
                 SALONS_URL + "?location.cityId=" + majorCityIdByName("Київ") + "&page=0&size=20", HttpMethod.GET,
@@ -869,7 +874,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons — empty page when no salons match city")
     void should_returnEmptyList_when_noSalonsMatchCity() throws Exception {
-        seedActiveSalon("Київ", null);
+        seedBookableActiveSalon("Київ", null);
 
         ResponseEntity<String> response = restTemplate.exchange(
                 SALONS_URL + "?location.cityId=" + majorCityIdByName("Одеса") + "&page=0&size=20", HttpMethod.GET,
@@ -887,7 +892,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         assertThat(cache).as("search:salons:browse cache must be registered").isNotNull();
         cache.clear();
 
-        seedActiveSalon("Київ", null);
+        seedBookableActiveSalon("Київ", null);
 
         ResponseEntity<String> response = restTemplate.exchange(
                 SALONS_URL + "?location.cityId=" + majorCityIdByName("Київ") + "&page=0&size=20", HttpMethod.GET,
@@ -906,7 +911,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         assertThat(cache).as("search:salons:browse cache must be registered").isNotNull();
         cache.clear();
 
-        seedActiveSalon("Київ", null);
+        seedBookableActiveSalon("Київ", null);
 
         ResponseEntity<String> response = restTemplate.exchange(
                 SALONS_URL + "?location.cityId=" + majorCityIdByName("Київ") + "&page=5&size=1", HttpMethod.GET,
@@ -1036,6 +1041,10 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         UUID salonMasterId = seedSalonMasterWithSalonDistrictAndUserDistrict(
                 "Київ", district, district, "4.95");
         // An independent master in the same district — still discoverable.
+        // Give the SALON_MASTER a salon service too, so its exclusion below is the role rule under
+        // test, not a missing service (bookability, 2026-10-05).
+        BookableMasterSeeder.assignNewSalonService(jdbcTemplate, jdbcTemplate.queryForObject(
+                "SELECT salon_id FROM masters WHERE id = ?", UUID.class, salonMasterId), salonMasterId);
         UUID independentId = seedIndependentMasterInDistrict("Київ", district, "4.10");
 
         log.debug("Act: GET {} by district — SALON_MASTER must be excluded (salon-page only), INDEPENDENT_MASTER returned", MASTERS_URL);
@@ -1110,7 +1119,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons — non-districted salon has resolved cityLabel and a null districtLabel")
     void should_returnNullDistrictLabel_when_salonCityIsNotDistricted() throws Exception {
-        seedActiveSalon("Львів", null);
+        seedBookableActiveSalon("Львів", null);
 
         ResponseEntity<String> response = restTemplate.exchange(
                 SALONS_URL + "?location.cityId=" + majorCityIdByName("Львів") + "&page=0&size=20",
@@ -1200,25 +1209,19 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("GET /search/salons — priceMin AND priceMax both null when the salon has no active priced services")
-    void should_returnNullPriceRange_when_salonHasNoActiveServices() throws Exception {
+    @DisplayName("GET /search/salons — a salon whose only service (definition AND assignment) is INACTIVE "
+            + "is not a search result (bookability, 2026-10-05)")
+    void should_excludeSalon_when_salonHasNoActiveServices() throws Exception {
         UUID salonId = seedActiveSalon("Київ", null);
         UUID masterId = seedSalonMasterFor(salonId, "Київ", "4.00");
-        // Only an INACTIVE service exists — it must not contribute to the band.
-        // Salon-owned def is itself inactive (is_active = false) → it must not
-        // contribute to the salon's price band / serviceNames. (The bookable gate
-        // additionally requires an active master_services link on an active master;
-        // here the link is inactive too, so the salon prices to null either way.)
+        // The master has hours (seedSalonMasterFor); only the inactive service keeps it unbookable.
         seedSalonServiceForMaster(masterId, salonId, "MANICURE", "FIXED",
                 new BigDecimal("300.00"), null, false, false);
 
-        JsonNode row = singleSalonRow("Київ", null);
-        assertThat(row.path("priceMin").isNull())
-                .as("no active priced service → priceMin is JSON null")
-                .isTrue();
-        assertThat(row.path("priceMax").isNull())
-                .as("no active priced service → priceMax is JSON null")
-                .isTrue();
+        JsonNode data = salonSearch("?location.cityId=" + majorCityIdByName("Київ") + "&page=0&size=20");
+
+        assertThat(salonIds(data)).doesNotContain(salonId.toString());
+        assertThat(data.path("totalElements").asLong()).isZero();
     }
 
     @Test
@@ -1273,25 +1276,18 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("GET /search/salons — serviceNames is an empty array (never null) for a salon with no active priced services")
-    void should_returnEmptySalonServiceNames_when_salonHasNoActiveServices() throws Exception {
+    @DisplayName("GET /search/salons — a salon whose only service has an ACTIVE definition but an "
+            + "INACTIVE assignment is not a search result (bookability, 2026-10-05)")
+    void should_excludeSalon_when_onlyServiceAssignmentIsInactive() throws Exception {
         UUID salonId = seedActiveSalon("Київ", null);
         UUID masterId = seedSalonMasterFor(salonId, "Київ", "4.00");
-        // Only an INACTIVE service — it must not contribute to serviceNames.
-        // Salon-owned def is itself inactive (is_active = false) → it must not
-        // contribute to the salon's price band / serviceNames. (The bookable gate
-        // additionally requires an active master_services link on an active master;
-        // here the link is inactive too, so the salon prices to null either way.)
         seedSalonServiceForMaster(masterId, salonId, "MANICURE", "FIXED",
-                new BigDecimal("300.00"), null, false, false);
+                new BigDecimal("300.00"), null, true, false);
 
-        JsonNode row = singleSalonRow("Київ", null);
-        assertThat(row.path("serviceNames").isArray())
-                .as("service-less salon → empty array")
-                .isTrue();
-        assertThat(row.path("serviceNames").size())
-                .as("service-less salon → serviceNames is [] (never null)")
-                .isZero();
+        JsonNode data = salonSearch("?location.cityId=" + majorCityIdByName("Київ") + "&page=0&size=20");
+
+        assertThat(salonIds(data)).doesNotContain(salonId.toString());
+        assertThat(data.path("totalElements").asLong()).isZero();
     }
 
     // ── Phase 23.x — rotated-master leak (salon bookable gate correlation) ────────
@@ -1350,6 +1346,11 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         UUID salonB = seedActiveSalon("Львів", null);
         UUID rotatedMaster = seedSalonMasterFor(salonB, "Львів", "4.00");
         linkMasterToOwnedDef(rotatedMaster, defA, null, true); // active link, but master now in salon B
+        // Since the bookability decision (2026-10-05) a salon with no bookable master is not listed at
+        // all, so salon A gets ONE in-salon bookable master of its own (a 500.00 "Seeded Service …").
+        // The leak under test is unchanged: A must be priced and previewed off THAT master only, never
+        // off the rotated master's 300.00 «Кератин ротований».
+        BookableMasterSeeder.addBookableSalonMaster(jdbcTemplate, salonA);
 
         // Control — salon C (Kyiv) whose in-salon active master keeps its offering bookable. This proves
         // the correlation does not null EVERY salon's projection — a genuine in-salon master still surfaces.
@@ -1363,25 +1364,25 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         JsonNode data = salonSearch("?location.cityId=" + majorCityIdByName("Київ") + "&page=0&size=20");
 
         assertThat(salonIds(data))
-                .as("both Kyiv salons are listed on the unfiltered city search (salon A is still an active "
-                        + "salon; only its rotated-master offering is suppressed)")
+                .as("both Kyiv salons are listed on the unfiltered city search (salon A has its own "
+                        + "bookable master; only its rotated-master offering is suppressed)")
                 .containsExactlyInAnyOrder(salonA.toString(), salonC.toString());
         assertThat(data.path("totalElements").asLong()).isEqualTo(2L);
 
         JsonNode rowA = salonRowById(data, salonA);
-        assertThat(rowA.path("serviceNames").isArray())
-                .as("salon A serviceNames must be a JSON array")
-                .isTrue();
-        assertThat(rowA.path("serviceNames").size())
-                .as("rotated-master leak: salon A must expose NO serviceNames (its only performing master "
-                        + "left for salon B) — serviceNames lateral mm2.salon_id = t.id excludes it")
-                .isZero();
-        assertThat(rowA.path("priceMin").isNull())
-                .as("rotated-master leak: salon A price band floor must be NULL (no in-salon performing master)")
-                .isTrue();
-        assertThat(rowA.path("priceMax").isNull())
-                .as("rotated-master leak: salon A price band ceiling must be NULL (no in-salon performing master)")
-                .isTrue();
+        java.util.List<String> namesA = new java.util.ArrayList<>();
+        rowA.path("serviceNames").forEach(n -> namesA.add(n.asText()));
+        assertThat(namesA)
+                .as("rotated-master leak: salon A must NOT preview the rotated master's service — the "
+                        + "serviceNames lateral's mm2.salon_id = t.id excludes it")
+                .doesNotContain("Кератин ротований")
+                .hasSize(1);
+        assertThat(new BigDecimal(rowA.path("priceMin").asText()))
+                .as("rotated-master leak: salon A's floor comes from its in-salon master (500), never "
+                        + "the rotated master's 300 (mad.salon_id = s.id)")
+                .isEqualByComparingTo(new BigDecimal("500.00"));
+        assertThat(new BigDecimal(rowA.path("priceMax").asText()))
+                .isEqualByComparingTo(new BigDecimal("500.00"));
 
         JsonNode rowC = salonRowById(data, salonC);
         java.util.List<String> namesC = new java.util.ArrayList<>();
@@ -1540,8 +1541,8 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — ?q matches the master's last name case-insensitively")
     void should_matchMasterByName_caseInsensitively_when_qSupplied() throws Exception {
-        UUID match = seedNamedIndependentMaster("Київ", "4.50", "Olena", "Kovalenko");
-        seedNamedIndependentMaster("Київ", "4.50", "Ivan", "Petrenko");
+        UUID match = seedBookableNamedIndependentMaster("Київ", "4.50", "Olena", "Kovalenko");
+        seedBookableNamedIndependentMaster("Київ", "4.50", "Ivan", "Petrenko");
 
         // Lower-case query must still hit "Kovalenko" (ILIKE, case-insensitive).
         ResponseEntity<String> response = restTemplate.exchange(
@@ -1592,19 +1593,19 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("GET /search/masters — serviceNames is an empty array (not null) for a master with no active services")
-    void should_returnEmptyServiceNames_when_masterHasNoServices() throws Exception {
-        seedNamedIndependentMaster("Київ", "4.50", "Solo", "Master");
+    @DisplayName("GET /search/masters — a master whose ONLY service assignment is INACTIVE is not "
+            + "discoverable (bookability needs an ACTIVE service, 2026-10-05)")
+    void should_excludeMaster_when_onlyServiceAssignmentIsInactive() throws Exception {
+        UUID masterId = seedBookableNamedIndependentMaster("Київ", "4.50", "Solo", "Master");
+        jdbcTemplate.update("UPDATE master_services SET is_active = false WHERE master_id = ?", masterId);
 
         ResponseEntity<String> response = restTemplate.exchange(
                 MASTERS_URL + "?location.cityId=" + majorCityIdByName("Київ") + "&page=0&size=20",
                 HttpMethod.GET, anonymous(), String.class);
 
-        JsonNode row = objectMapper.readTree(response.getBody()).path("data").path("data").get(0);
-        assertThat(row.path("serviceNames").isArray()).isTrue();
-        assertThat(row.path("serviceNames").size())
-                .as("service-less master → empty array, never null")
-                .isZero();
+        JsonNode page = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(masterIds(page)).doesNotContain(masterId.toString());
+        assertThat(page.path("totalElements").asLong()).isZero();
     }
 
     // ── Phase 19.7 regression — category-scoped serviceNames preview ──────────
@@ -1800,25 +1801,23 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("GET /search/salons — a salon with no active priced service is excluded once a price bound is supplied")
-    void should_excludeUnpricedSalon_when_priceFilterApplied() throws Exception {
-        seedActiveSalon("Київ", null);   // no master / no services → NULL band
+    @DisplayName("GET /search/salons — minPrice above a bookable salon's whole band excludes it; below it "
+            + "keeps it (a listed salon always has a band since bookability, 2026-10-05)")
+    void should_excludeSalon_when_minPriceAboveItsBand() throws Exception {
+        UUID salonId = seedBookableActiveSalon("Київ", null);   // one 500.00 service
 
-        ResponseEntity<String> response = restTemplate.exchange(
-                SALONS_URL + "?location.cityId=" + majorCityIdByName("Київ") + "&minPrice=100&page=0&size=20",
-                HttpMethod.GET, anonymous(), String.class);
+        JsonNode above = salonSearch("?location.cityId=" + majorCityIdByName("Київ") + "&minPrice=600&page=0&size=20");
+        JsonNode below = salonSearch("?location.cityId=" + majorCityIdByName("Київ") + "&minPrice=100&page=0&size=20");
 
-        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
-        assertThat(data.path("totalElements").asLong())
-                .as("NULL price band fails the overlap predicate once a bound is set")
-                .isZero();
+        assertThat(above.path("totalElements").asLong()).isZero();
+        assertThat(salonIds(below)).containsExactly(salonId.toString());
     }
 
     @Test
     @DisplayName("GET /search/salons — ?q matches the salon name case-insensitively")
     void should_matchSalonByName_caseInsensitively_when_qSupplied() throws Exception {
-        UUID glow = seedNamedSalon("Київ", "Glow Studio");
-        seedNamedSalon("Київ", "Shine Bar");
+        UUID glow = seedBookableNamedSalon("Київ", "Glow Studio");
+        seedBookableNamedSalon("Київ", "Shine Bar");
 
         ResponseEntity<String> response = restTemplate.exchange(
                 SALONS_URL + "?q=glow&page=0&size=20", HttpMethod.GET, anonymous(), String.class);
@@ -1918,8 +1917,8 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — location.cityId narrows masters to that city and excludes others (server-side filter proof)")
     void should_narrowMastersByCity_andExcludeOtherCities() throws Exception {
-        UUID inKyiv = seedNamedIndependentMaster("Київ", "4.50", "Kyiv", "Master");
-        seedNamedIndependentMaster("Львів", "4.90", "Lviv", "Master");
+        UUID inKyiv = seedBookableNamedIndependentMaster("Київ", "4.50", "Kyiv", "Master");
+        seedBookableNamedIndependentMaster("Львів", "4.90", "Lviv", "Master");
 
         ResponseEntity<String> response = restTemplate.exchange(
                 MASTERS_URL + "?location.cityId=" + majorCityIdByName("Київ") + "&page=0&size=20",
@@ -1937,8 +1936,8 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — ?q matches the master's FIRST name case-insensitively (Cyrillic фолд: q=олена matches 'Олена')")
     void should_matchMasterByFirstName_caseInsensitively_cyrillic_when_qSupplied() throws Exception {
-        UUID match = seedNamedIndependentMaster("Київ", "4.50", "Олена", "Коваленко");
-        seedNamedIndependentMaster("Київ", "4.50", "Іван", "Петренко");
+        UUID match = seedBookableNamedIndependentMaster("Київ", "4.50", "Олена", "Коваленко");
+        seedBookableNamedIndependentMaster("Київ", "4.50", "Іван", "Петренко");
 
         // Lower-case Cyrillic query must still hit the capitalised first name
         // "Олена" — proves ILIKE case-folds Ukrainian letters, not just ASCII.
@@ -1954,12 +1953,64 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         assertThat(data.path("data").get(0).path("masterId").asText()).isEqualTo(match.toString());
     }
 
+    private static final String SEARCH_AVATAR = "https://cdn.beautica.test/avatars/search-avatar.jpg";
+
+    @Test
+    @DisplayName("GET /search/masters — avatarUrl is mapped per row (set -> value, unset -> null), plain listing")
+    void should_mapAvatarUrlPerRow_when_mastersListedPlain() throws Exception {
+        UUID[] ids = seedAvatarMasters();
+
+        JsonNode rows = objectMapper.readTree(restTemplate.exchange(
+                MASTERS_URL + "?location.cityId=" + majorCityIdByName("Київ") + "&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class).getBody()).path("data").path("data");
+
+        assertAvatarsForSeeded(rows, ids);
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — avatarUrl is mapped per row (set -> value, unset -> null), ?q free-text")
+    void should_mapAvatarUrlPerRow_when_mastersListedByQ() throws Exception {
+        UUID[] ids = seedAvatarMasters();
+
+        JsonNode rows = objectMapper.readTree(restTemplate.exchange(
+                MASTERS_URL + "?q=avatar&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class).getBody()).path("data").path("data");
+
+        assertAvatarsForSeeded(rows, ids);
+    }
+
+    private UUID[] seedAvatarMasters() {
+        UUID withAvatar = seedBookableNamedIndependentMaster("Київ", "4.50", "Avatarella", "Withpic");
+        UUID withoutAvatar = seedBookableNamedIndependentMaster("Київ", "4.50", "Avatarina", "Nopic");
+        jdbcTemplate.update(
+                "UPDATE users SET avatar_url = ? WHERE id = (SELECT user_id FROM masters WHERE id = ?)",
+                SEARCH_AVATAR, withAvatar);
+        return new UUID[] {withAvatar, withoutAvatar};
+    }
+
+    private static void assertAvatarsForSeeded(JsonNode rows, UUID[] ids) {
+        java.util.Set<String> seeded = java.util.Set.of(ids[0].toString(), ids[1].toString());
+        java.util.List<JsonNode> scoped = new java.util.ArrayList<>();
+        rows.forEach(r -> {
+            if (seeded.contains(r.path("masterId").asText())) {
+                scoped.add(r);
+            }
+        });
+
+        assertThat(scoped)
+                .extracting(r -> r.path("masterId").asText(),
+                        r -> r.path("avatarUrl").isNull() ? null : r.path("avatarUrl").asText())
+                .containsExactlyInAnyOrder(
+                        org.assertj.core.api.Assertions.tuple(ids[0].toString(), SEARCH_AVATAR),
+                        org.assertj.core.api.Assertions.tuple(ids[1].toString(), null));
+    }
+
     @Test
     @DisplayName("GET /search/masters — a literal '%' in ?q is escaped (matches a literal percent, NOT used as a wildcard)")
     void should_treatPercentInQ_asLiteral_notWildcard() throws Exception {
         // One master whose last name literally contains '%', one that does not.
-        UUID literal = seedNamedIndependentMaster("Київ", "4.50", "Anna", "50%off");
-        seedNamedIndependentMaster("Київ", "4.50", "Boris", "Plainname");
+        UUID literal = seedBookableNamedIndependentMaster("Київ", "4.50", "Anna", "50%off");
+        seedBookableNamedIndependentMaster("Київ", "4.50", "Boris", "Plainname");
 
         // q="%off" — if '%' were treated as a SQL wildcard, the pattern would be
         // %%off% and match anything ending in "off"; escaped, it matches only the
@@ -1982,9 +2033,9 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — a literal '_' in ?q is escaped (single-underscore is not the any-char wildcard)")
     void should_treatUnderscoreInQ_asLiteral_notWildcard() throws Exception {
-        UUID literal = seedNamedIndependentMaster("Київ", "4.50", "Anna", "a_b");
+        UUID literal = seedBookableNamedIndependentMaster("Київ", "4.50", "Anna", "a_b");
         // "axb" would be matched by an UNescaped '_' wildcard (a<any>b) — it must NOT match.
-        seedNamedIndependentMaster("Київ", "4.50", "Boris", "axb");
+        seedBookableNamedIndependentMaster("Київ", "4.50", "Boris", "axb");
 
         ResponseEntity<String> response = restTemplate.exchange(
                 rawUri(MASTERS_URL + "?q=" + enc("a_b") + "&page=0&size=20"),
@@ -2001,8 +2052,8 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons — a literal '%' in ?q is escaped against the salon name (not a wildcard)")
     void should_treatPercentInSalonQ_asLiteral_notWildcard() throws Exception {
-        UUID literal = seedNamedSalon("Київ", "Glow 50%");
-        seedNamedSalon("Київ", "Shine Bar 50 off");
+        UUID literal = seedBookableNamedSalon("Київ", "Glow 50%");
+        seedBookableNamedSalon("Київ", "Shine Bar 50 off");
 
         ResponseEntity<String> response = restTemplate.exchange(
                 rawUri(SALONS_URL + "?q=" + enc("50%") + "&page=0&size=20"),
@@ -2080,9 +2131,10 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — ?sort=REVIEWS_DESC orders by descending review_count")
     void should_orderByReviewsDescending_when_sortReviewsDesc() throws Exception {
-        seedMasterWithReviewCount("Київ", "4.00", 2);
-        seedMasterWithReviewCount("Київ", "4.00", 50);
-        seedMasterWithReviewCount("Київ", "4.00", 17);
+        for (int reviews : new int[] {2, 50, 17}) {
+            BookableMasterSeeder.assignNewIndependentService(
+                    jdbcTemplate, seedMasterWithReviewCount("Київ", "4.00", reviews));
+        }
 
         ResponseEntity<String> response = restTemplate.exchange(
                 MASTERS_URL + "?location.cityId=" + majorCityIdByName("Київ") + "&sort=REVIEWS_DESC&page=0&size=20",
@@ -3409,11 +3461,11 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @DisplayName("GET /search/masters?q=… — two tokens both in NAME columns match the one master carrying both; single-token decoys are excluded")
     void should_matchOnlyMasterCarryingBothNameTokens_when_fullNameQueried() throws Exception {
 
-        UUID target = seedNamedIndependentMaster("Київ", "4.90", "Вікторія", "Руденко");
+        UUID target = seedBookableNamedIndependentMaster("Київ", "4.90", "Вікторія", "Руденко");
         // Decoys: each carries exactly ONE of the two tokens. Under group-scoped ANDed
         // token semantics neither may match.
-        seedNamedIndependentMaster("Київ", "4.80", "Вікторія", "Панченко");
-        seedNamedIndependentMaster("Київ", "4.70", "Олег", "Руденко");
+        seedBookableNamedIndependentMaster("Київ", "4.80", "Вікторія", "Панченко");
+        seedBookableNamedIndependentMaster("Київ", "4.70", "Олег", "Руденко");
 
         JsonNode data = masterSearchRaw("?q=" + enc("Вікторія Руденко") + "&page=0&size=20");
 
@@ -3427,8 +3479,8 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @DisplayName("GET /search/masters?q=… — reversing token ORDER and flipping CASE returns the identical row set")
     void should_returnIdenticalRows_when_tokenOrderReversedAndCaseFlipped() throws Exception {
 
-        UUID target = seedNamedIndependentMaster("Київ", "4.90", "Вікторія", "Руденко");
-        seedNamedIndependentMaster("Київ", "4.80", "Вікторія", "Панченко");
+        UUID target = seedBookableNamedIndependentMaster("Київ", "4.90", "Вікторія", "Руденко");
+        seedBookableNamedIndependentMaster("Київ", "4.80", "Вікторія", "Панченко");
 
         java.util.List<String> natural =
                 masterIds(masterSearchRaw("?q=" + enc("Вікторія Руденко") + "&page=0&size=20"));
@@ -3475,8 +3527,8 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     void should_matchSameRow_when_apostropheIsStraightOrCurly() throws Exception {
 
         // Stored names use the straight U+0027 (write-side normalisation).
-        UUID target = seedNamedIndependentMaster("Київ", "4.90", "В'ячеслав", "Мар'яненко");
-        seedNamedIndependentMaster("Київ", "4.80", "Олег", "Безапострофа");
+        UUID target = seedBookableNamedIndependentMaster("Київ", "4.90", "В'ячеслав", "Мар'яненко");
+        seedBookableNamedIndependentMaster("Київ", "4.80", "Олег", "Безапострофа");
 
         java.util.List<String> straight =
                 masterIds(masterSearchRaw("?q=" + enc("В'ячеслав") + "&page=0&size=20"));
@@ -3811,8 +3863,10 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
 
         UUID priced = seedMaster("Київ", "4.50");
         seedServiceWithCategory(priced, priced, "HAIRCUT", new BigDecimal("300.00"), true, true);
-        // No services at all → min_effective_price stays NULL.
-        UUID unpriced = seedMasterWithoutServices("Київ", "4.90");
+        // Discoverable (one owned active service + hours) but unpriced: the JDBC-seeded service
+        // never refreshes the denormalised min_effective_price, so it stays NULL. (A master with no
+        // service at all is no longer listed — bookability, 2026-10-05.)
+        UUID unpriced = seedMasterWithCity("Київ", "4.90");
 
         assertThat(masterIds(masterSearch(
                 "?location.cityId=" + cityId + "&sort=PRICE_DESC&page=0&size=20")))
@@ -4387,6 +4441,8 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
                 "INSERT INTO masters (id, user_id, master_type, avg_rating, review_count, is_active, created_at, updated_at) " +
                         "VALUES (?, ?, 'INDEPENDENT_MASTER', ?::numeric, 1, true, NOW(), NOW())",
                 masterId, userId, avgRating);
+        // Discoverable only with hours (MasterBookabilitySql, 2026-10-05).
+        seedUsableScheduleFor(masterId);
         return masterId;
     }
 
@@ -4629,6 +4685,9 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
                 "INSERT INTO masters (id, user_id, master_type, avg_rating, review_count, is_active, created_at, updated_at) " +
                         "VALUES (?, ?, 'INDEPENDENT_MASTER', ?::numeric, 1, true, NOW(), NOW())",
                 masterId, userId, avgRating);
+        // Discoverable only with hours (MasterBookabilitySql, 2026-10-05).
+        seedUsableScheduleFor(masterId);
+        BookableMasterSeeder.assignNewIndependentService(jdbcTemplate, masterId);
         return masterId;
     }
 
@@ -4647,6 +4706,8 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
                 "INSERT INTO salons (id, owner_id, name, city, city_id, district_id, is_active, created_at, updated_at) " +
                         "VALUES (?, ?, ?, ?, ?, ?, true, NOW(), NOW())",
                 salonId, ownerId, name, city, cityId, districtId);
+        // Discoverable only with >=1 bookable master (MasterBookabilitySql, 2026-10-05).
+        BookableMasterSeeder.addBookableSalonMaster(jdbcTemplate, salonId);
         return salonId;
     }
 
@@ -4728,6 +4789,8 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
                 "INSERT INTO masters (id, user_id, master_type, avg_rating, review_count, is_active, created_at, updated_at) " +
                         "VALUES (?, ?, 'INDEPENDENT_MASTER', ?::numeric, 1, true, NOW(), NOW())",
                 masterId, masterUserId, avgRating);
+        // Discoverable only with hours (MasterBookabilitySql, 2026-10-05).
+        seedUsableScheduleFor(masterId);
 
         return masterId;
     }
@@ -4771,9 +4834,37 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         return masterId;
     }
 
-    /** Convenience: seeds a master without any services. */
+    /**
+     * Convenience: seeds a DISCOVERABLE master — one owned active service plus hours — for tests
+     * that do not care about the service itself (MasterBookabilitySql: a master with no active
+     * service is not listed, 2026-10-05). The JDBC service leaves {@code min_effective_price} NULL.
+     */
     private UUID seedMasterWithCity(String city, String avgRating) {
-        return seedMaster(city, avgRating);
+        UUID masterId = seedMaster(city, avgRating);
+        BookableMasterSeeder.assignNewIndependentService(jdbcTemplate, masterId);
+        return masterId;
+    }
+
+    /** {@link #seedNamedIndependentMaster} made discoverable with one owned active service. */
+    private UUID seedBookableNamedIndependentMaster(String city, String avgRating,
+                                                    String firstName, String lastName) {
+        UUID masterId = seedNamedIndependentMaster(city, avgRating, firstName, lastName);
+        BookableMasterSeeder.assignNewIndependentService(jdbcTemplate, masterId);
+        return masterId;
+    }
+
+    /** {@link #seedActiveSalon} made discoverable with one bookable SALON_MASTER (500.00 service). */
+    private UUID seedBookableActiveSalon(String city, String region) {
+        UUID salonId = seedActiveSalon(city, region);
+        BookableMasterSeeder.addBookableSalonMaster(jdbcTemplate, salonId);
+        return salonId;
+    }
+
+    /** {@link #seedNamedSalon} made discoverable with one bookable SALON_MASTER (500.00 service). */
+    private UUID seedBookableNamedSalon(String city, String name) {
+        UUID salonId = seedNamedSalon(city, name);
+        BookableMasterSeeder.addBookableSalonMaster(jdbcTemplate, salonId);
+        return salonId;
     }
 
     /**

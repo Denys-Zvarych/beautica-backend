@@ -77,7 +77,7 @@ class BookingRateLimitFilterTest {
      */
     private BookingRateLimitFilter filterWith(LoadingCache<String, Bucket> writeBuckets) {
         return new BookingRateLimitFilter(
-                writeBuckets, generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
+                writeBuckets, generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
     }
 
     /**
@@ -87,7 +87,7 @@ class BookingRateLimitFilterTest {
      */
     private BookingRateLimitFilter filterWithDeclineBuckets(LoadingCache<String, Bucket> declineBuckets) {
         return new BookingRateLimitFilter(
-                generousBuckets(), declineBuckets, generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
+                generousBuckets(), declineBuckets, generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
     }
 
     /**
@@ -97,7 +97,7 @@ class BookingRateLimitFilterTest {
      */
     private BookingRateLimitFilter filterWithOverrideBuckets(LoadingCache<String, Bucket> overrideBuckets) {
         return new BookingRateLimitFilter(
-                generousBuckets(), generousBuckets(), overrideBuckets, generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
+                generousBuckets(), generousBuckets(), overrideBuckets, generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
     }
 
     /**
@@ -109,7 +109,7 @@ class BookingRateLimitFilterTest {
      */
     private BookingRateLimitFilter filterWithStaffSmsBuckets(LoadingCache<String, Bucket> staffSmsBuckets) {
         return new BookingRateLimitFilter(
-                generousBuckets(), generousBuckets(), generousBuckets(), staffSmsBuckets, generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
+                generousBuckets(), generousBuckets(), generousBuckets(), staffSmsBuckets, generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
     }
 
     /**
@@ -120,7 +120,7 @@ class BookingRateLimitFilterTest {
     private BookingRateLimitFilter filterWithSelfDeleteBuckets(LoadingCache<String, Bucket> selfDeleteBuckets) {
         return new BookingRateLimitFilter(
                 generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), selfDeleteBuckets,
-                generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
+                generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
     }
 
     /**
@@ -133,7 +133,7 @@ class BookingRateLimitFilterTest {
             LoadingCache<String, Bucket> readBuckets) {
         return new BookingRateLimitFilter(
                 generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(),
-                generousBuckets(), readBuckets, generousBuckets(), generousBuckets(), OBJECT_MAPPER);
+                generousBuckets(), readBuckets, generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
     }
 
     private static MockHttpServletRequest getSalonMasterServices(UUID salonId, UUID masterId) {
@@ -151,7 +151,7 @@ class BookingRateLimitFilterTest {
             LoadingCache<String, Bucket> boardBuckets) {
         return new BookingRateLimitFilter(
                 generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(),
-                generousBuckets(), generousBuckets(), boardBuckets, generousBuckets(), OBJECT_MAPPER);
+                generousBuckets(), generousBuckets(), boardBuckets, generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
     }
 
     /**
@@ -163,7 +163,7 @@ class BookingRateLimitFilterTest {
             LoadingCache<String, Bucket> feedBuckets) {
         return new BookingRateLimitFilter(
                 generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(),
-                generousBuckets(), generousBuckets(), generousBuckets(), feedBuckets, OBJECT_MAPPER);
+                generousBuckets(), generousBuckets(), generousBuckets(), feedBuckets, generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
     }
 
     private static MockHttpServletRequest getNotificationFeed() {
@@ -546,7 +546,7 @@ class BookingRateLimitFilterTest {
         LoadingCache<String, Bucket> declineBuckets = singleSlotBuckets();
         BookingRateLimitFilter filter =
                 new BookingRateLimitFilter(
-                        writeBuckets, declineBuckets, generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
+                        writeBuckets, declineBuckets, generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
         authenticateAs(UUID.randomUUID());
 
         // Exhaust the create/reschedule bucket.
@@ -1060,7 +1060,7 @@ class BookingRateLimitFilterTest {
         LoadingCache<String, Bucket> overrideBuckets = singleSlotBuckets();
         BookingRateLimitFilter filter =
                 new BookingRateLimitFilter(
-                        generousBuckets(), declineBuckets, overrideBuckets, generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
+                        generousBuckets(), declineBuckets, overrideBuckets, generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
         authenticateAs(UUID.randomUUID());
 
         // Exhaust the decline bucket.
@@ -1225,7 +1225,7 @@ class BookingRateLimitFilterTest {
     @DisplayName("should_notShareBudgets_when_sameStaffAlternatesClientCreateAndStaffCreate")
     void should_notShareBudgets_when_sameStaffAlternatesClientCreateAndStaffCreate() throws Exception {
         BookingRateLimitFilter filter = new BookingRateLimitFilter(
-                singleSlotBuckets(), generousBuckets(), generousBuckets(), singleSlotBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
+                singleSlotBuckets(), generousBuckets(), generousBuckets(), singleSlotBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
         authenticateAs(UUID.randomUUID());
 
         // Spend the whole client-create budget.
@@ -1681,7 +1681,7 @@ class BookingRateLimitFilterTest {
         LoadingCache<String, Bucket> selfDeleteBuckets = singleSlotBuckets();
         BookingRateLimitFilter filter = new BookingRateLimitFilter(
                 writeBuckets, generousBuckets(), generousBuckets(), generousBuckets(), selfDeleteBuckets,
-                        generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
+                        generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
         authenticateAs(UUID.randomUUID());
 
         filter.doFilterInternal(postCreate(), new MockHttpServletResponse(), new MockFilterChain());

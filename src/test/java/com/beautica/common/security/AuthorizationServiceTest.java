@@ -13,6 +13,7 @@ import com.beautica.master.entity.MasterType;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
+import com.beautica.service.repository.MasterServiceRepository;
 import com.beautica.service.repository.ServiceRepository;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
@@ -67,6 +68,10 @@ class AuthorizationServiceTest {
 
     @Mock
     private BookingRepository bookingRepository;
+
+    /** Phase 345 catalogue gate — {@code existsActiveOwnerRowAssignment} only. */
+    @Mock
+    private MasterServiceRepository masterServiceRepository;
 
     /**
      * A REAL instance, not a mock (perf MEDIUM, 2026-08-18): in production this is a
@@ -930,21 +935,6 @@ class AuthorizationServiceTest {
                 .hasMessageContaining("Access denied");
     }
 
-    // ── canManageServiceDefinition — byte-unchanged proof (Phase 311 D5) ───────
-
-    @Test
-    @DisplayName("Phase 311 mutation 8's pin: canManageServiceDefinition still fast-rejects "
-            + "SALON_MASTER — adding ROLE_SALON_MASTER to its role list would turn this RED")
-    void should_stillFastRejectSalonMaster_when_canManageServiceDefinitionCalled_phase311Pin() {
-        UUID serviceDefId = UUID.randomUUID();
-        Authentication auth = mockAuth(UUID.randomUUID(), "ROLE_SALON_MASTER");
-
-        boolean result = authorizationService.canManageServiceDefinition(auth, serviceDefId);
-
-        assertThat(result).isFalse();
-        verifyNoInteractions(serviceRepository);
-    }
-
     // ── enforceCanManageSalon ──────────────────────────────────────────────────
 
     @Test
@@ -1322,179 +1312,6 @@ class AuthorizationServiceTest {
         verify(salonRepository, never()).findOwnerIdById(any());
     }
 
-    // ── canManageServiceDefinition (Phase 306 D1-D3) ────────────────────────────
-
-    @Test
-    @DisplayName("canManageServiceDefinition returns true via SALON path when actor owns the salon "
-            + "(in-memory salonOwnerId compare, fix #1 — no salonRepository round-trip)")
-    void should_returnTrue_when_actorOwnsSalonServiceDefinition() {
-        UUID actorId = UUID.randomUUID();
-        UUID salonId = UUID.randomUUID();
-        UUID serviceDefId = UUID.randomUUID();
-
-        when(serviceRepository.findOwnerUserId(serviceDefId))
-                .thenReturn(Optional.of(salonOwnerAccess(actorId, salonId)));
-
-        Authentication auth = mockAuth(actorId, "ROLE_SALON_OWNER");
-
-        boolean result = authorizationService.canManageServiceDefinition(auth, serviceDefId);
-
-        assertThat(result).isTrue();
-        verify(salonRepository, never()).existsByIdAndOwnerId(any(), any());
-    }
-
-    @Test
-    @DisplayName("canManageServiceDefinition returns false via SALON path when actor does not own the salon "
-            + "(in-memory salonOwnerId compare, fix #1 — no salonRepository round-trip)")
-    void should_returnFalse_when_actorDoesNotOwnSalonServiceDefinition() {
-        UUID actorId = UUID.randomUUID();
-        UUID salonId = UUID.randomUUID();
-        UUID serviceDefId = UUID.randomUUID();
-        UUID salonOwnerUserId = UUID.randomUUID();
-
-        when(serviceRepository.findOwnerUserId(serviceDefId))
-                .thenReturn(Optional.of(salonOwnerAccess(salonOwnerUserId, salonId)));
-
-        Authentication auth = mockAuth(actorId, "ROLE_SALON_OWNER");
-
-        boolean result = authorizationService.canManageServiceDefinition(auth, serviceDefId);
-
-        assertThat(result).isFalse();
-        verify(salonRepository, never()).existsByIdAndOwnerId(any(), any());
-    }
-
-    @Test
-    @DisplayName("canManageServiceDefinition — case 12: returns true for a SALON_ADMIN of the owning salon")
-    void should_returnTrue_when_salonAdminOfOwningSalonManagesServiceDefinition() {
-        UUID actorId = UUID.randomUUID();
-        UUID salonId = UUID.randomUUID();
-        UUID serviceDefId = UUID.randomUUID();
-        UUID salonOwnerUserId = UUID.randomUUID();
-
-        when(serviceRepository.findOwnerUserId(serviceDefId))
-                .thenReturn(Optional.of(salonOwnerAccess(salonOwnerUserId, salonId)));
-        when(userRepository.findSalonIdById(actorId)).thenReturn(Optional.of(salonId));
-
-        Authentication auth = mockAuth(actorId, "ROLE_SALON_ADMIN");
-
-        boolean result = authorizationService.canManageServiceDefinition(auth, serviceDefId);
-
-        assertThat(result)
-                .as("D3 must resolve a SALON_ADMIN through hasManagementAccess, not the stale "
-                        + "ownerUserId.equals(actorId) identity check the admin's actor id can never satisfy")
-                .isTrue();
-    }
-
-    @Test
-    @DisplayName("canManageServiceDefinition — case 13: returns false for a SALON_ADMIN of a DIFFERENT salon")
-    void should_returnFalse_when_salonAdminOfDifferentSalonManagesServiceDefinition() {
-        UUID actorId = UUID.randomUUID();
-        UUID salonId = UUID.randomUUID();
-        UUID otherSalonId = UUID.randomUUID();
-        UUID serviceDefId = UUID.randomUUID();
-        UUID salonOwnerUserId = UUID.randomUUID();
-
-        when(serviceRepository.findOwnerUserId(serviceDefId))
-                .thenReturn(Optional.of(salonOwnerAccess(salonOwnerUserId, salonId)));
-        when(userRepository.findSalonIdById(actorId)).thenReturn(Optional.of(otherSalonId));
-
-        Authentication auth = mockAuth(actorId, "ROLE_SALON_ADMIN");
-
-        boolean result = authorizationService.canManageServiceDefinition(auth, serviceDefId);
-
-        assertThat(result).isFalse();
-    }
-
-    @Test
-    @DisplayName("canManageServiceDefinition returns true via INDEPENDENT_MASTER path when actor is the master's user")
-    void should_returnTrue_when_actorIsIndependentMasterOwner() {
-        UUID actorId = UUID.randomUUID();
-        UUID serviceDefId = UUID.randomUUID();
-
-        when(serviceRepository.findOwnerUserId(serviceDefId))
-                .thenReturn(Optional.of(independentMasterOwnerAccess(actorId)));
-
-        Authentication auth = mockAuth(actorId, "ROLE_INDEPENDENT_MASTER");
-
-        boolean result = authorizationService.canManageServiceDefinition(auth, serviceDefId);
-
-        assertThat(result).isTrue();
-    }
-
-    @Test
-    @DisplayName("canManageServiceDefinition — case 15: returns false for a DIFFERENT INDEPENDENT_MASTER (D3's unchanged arm)")
-    void should_returnFalse_when_differentIndependentMasterManagesServiceDefinition() {
-        UUID actorId = UUID.randomUUID();
-        UUID ownerMasterUserId = UUID.randomUUID();
-        UUID serviceDefId = UUID.randomUUID();
-
-        when(serviceRepository.findOwnerUserId(serviceDefId))
-                .thenReturn(Optional.of(independentMasterOwnerAccess(ownerMasterUserId)));
-
-        Authentication auth = mockAuth(actorId, "ROLE_INDEPENDENT_MASTER");
-
-        boolean result = authorizationService.canManageServiceDefinition(auth, serviceDefId);
-
-        assertThat(result).isFalse();
-    }
-
-    @Test
-    @DisplayName("canManageServiceDefinition returns false when service definition does not exist")
-    void should_returnFalse_when_serviceDefinitionDoesNotExist() {
-        UUID actorId = UUID.randomUUID();
-        UUID serviceDefId = UUID.randomUUID();
-
-        when(serviceRepository.findOwnerUserId(serviceDefId)).thenReturn(Optional.empty());
-
-        Authentication auth = mockAuth(actorId, "ROLE_SALON_OWNER");
-
-        boolean result = authorizationService.canManageServiceDefinition(auth, serviceDefId);
-
-        assertThat(result).isFalse();
-        verify(salonRepository, never()).findById(any());
-        verify(masterRepository, never()).findById(any());
-    }
-
-    @Test
-    @DisplayName("canManageServiceDefinition — case 14: returns false without DB hit when actor has ROLE_CLIENT (MEDIUM-1 role fast-path, timing-oracle)")
-    void should_returnFalse_withoutDbHit_when_clientCallsCanManageServiceDefinition() {
-        UUID serviceDefId = UUID.randomUUID();
-        Authentication auth = mockAuth(UUID.randomUUID(), "ROLE_CLIENT");
-
-        boolean result = authorizationService.canManageServiceDefinition(auth, serviceDefId);
-
-        assertThat(result).isFalse();
-        verify(serviceRepository, never()).findOwnerUserId(any());
-    }
-
-    @Test
-    @DisplayName("canManageServiceDefinition — case 14: returns false without DB hit when actor has ROLE_SALON_MASTER (MEDIUM-1 role fast-path, timing-oracle; D6 — SALON_MASTER gains nothing)")
-    void should_returnFalse_withoutDbHit_when_salonMasterCallsCanManageServiceDefinition() {
-        UUID serviceDefId = UUID.randomUUID();
-        Authentication auth = mockAuth(UUID.randomUUID(), "ROLE_SALON_MASTER");
-
-        boolean result = authorizationService.canManageServiceDefinition(auth, serviceDefId);
-
-        assertThat(result).isFalse();
-        verify(serviceRepository, never()).findOwnerUserId(any());
-    }
-
-    @Test
-    @DisplayName("canManageServiceDefinition consults the repository (no longer role-fast-pathed away) when actor has ROLE_SALON_ADMIN — Phase 306 D2 widening")
-    void should_hitRepository_when_salonAdminCallsCanManageServiceDefinition() {
-        UUID actorId = UUID.randomUUID();
-        UUID serviceDefId = UUID.randomUUID();
-
-        when(serviceRepository.findOwnerUserId(serviceDefId)).thenReturn(Optional.empty());
-
-        Authentication auth = mockAuth(actorId, "ROLE_SALON_ADMIN");
-
-        boolean result = authorizationService.canManageServiceDefinition(auth, serviceDefId);
-
-        assertThat(result).isFalse();
-        verify(serviceRepository).findOwnerUserId(serviceDefId);
-    }
-
     // ── enforceCanManageServiceDefinition (B14 service-layer guard, Phase 306 D3) ─
 
     @Test
@@ -1584,8 +1401,8 @@ class AuthorizationServiceTest {
         SecurityContextHolder.getContext()
                 .setAuthentication(mockAuth(actorId, "ROLE_INDEPENDENT_MASTER"));
 
-        // Unknown id is treated as access-denied (403), consistent with canManageServiceDefinition —
-        // never a distinct 404 that would leak existence (anti-bug §B/§D).
+        // Unknown id is treated as access-denied (403) — never a distinct 404 that would leak
+        // existence (anti-bug §B/§D).
         assertThatThrownBy(() -> authorizationService.enforceCanManageServiceDefinition(actorId, missing))
                 .isInstanceOf(ForbiddenException.class)
                 .hasMessageContaining("Access denied");
@@ -1639,161 +1456,184 @@ class AuthorizationServiceTest {
                 .doesNotThrowAnyException();
     }
 
+    // ── Phase 345 catalogue gate — admin vs owner-performed definitions ─────────────────────
+    // Architect decision 2026-10-06: a SALON_ADMIN cannot write a SALON definition with an
+    // ACTIVE assignment on the owner's SALON_OWNER row (owner-only OR shared). The EXISTS runs
+    // only for a SALON_ADMIN on a salon-scoped definition.
+
     @Test
-    @DisplayName("case 16: canManageServiceDefinition and enforceCanManageServiceDefinition agree on every branch — the two must not drift")
-    void should_agree_betweenCanManageAndEnforce_acrossEveryBranch() {
+    @DisplayName("Phase 345: enforceCanManageServiceDefinition refuses a SALON_ADMIN of the owning salon "
+            + "when the definition is assigned to the owner's row")
+    void should_throwForbidden_when_adminEnforcesOnOwnerPerformedDefinition() {
+        UUID adminId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
-        UUID otherSalonId = UUID.randomUUID();
         UUID serviceDefId = UUID.randomUUID();
-        UUID salonOwnerUserId = UUID.randomUUID();
-
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(adminId, "ROLE_SALON_ADMIN"));
         when(serviceRepository.findOwnerUserId(serviceDefId))
-                .thenReturn(Optional.of(salonOwnerAccess(salonOwnerUserId, salonId)));
+                .thenReturn(Optional.of(salonOwnerAccess(UUID.randomUUID(), salonId)));
+        when(userRepository.findSalonIdById(adminId)).thenReturn(Optional.of(salonId));
+        when(masterServiceRepository.existsActiveOwnerRowAssignment(serviceDefId)).thenReturn(true);
 
-        // Admin of the SAME salon: both methods must agree ALLOWED.
-        UUID matchingAdminId = UUID.randomUUID();
-        when(userRepository.findSalonIdById(matchingAdminId)).thenReturn(Optional.of(salonId));
-        Authentication allowedAuth = mockAuth(matchingAdminId, "ROLE_SALON_ADMIN");
-        SecurityContextHolder.getContext().setAuthentication(allowedAuth);
+        assertThatThrownBy(() -> authorizationService.enforceCanManageServiceDefinition(adminId, serviceDefId))
+                .isInstanceOf(ForbiddenException.class)
+                .hasMessage(AuthorizationService.OWNER_PERFORMED_SERVICE_MESSAGE);
+    }
 
-        assertThat(authorizationService.canManageServiceDefinition(allowedAuth, serviceDefId))
-                .as("canManageServiceDefinition must allow the matching admin")
-                .isTrue();
-        assertThatCode(() -> authorizationService.enforceCanManageServiceDefinition(matchingAdminId, serviceDefId))
-                .as("enforceCanManageServiceDefinition must agree and not throw")
+    @Test
+    @DisplayName("Phase 345: a SALON_ADMIN of the owning salon is still admitted when the "
+            + "definition has no active owner-row assignment")
+    void should_allowAdmin_when_definitionNotAssignedToOwnerRow() {
+        UUID adminId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(adminId, "ROLE_SALON_ADMIN"));
+        when(serviceRepository.findOwnerUserId(serviceDefId))
+                .thenReturn(Optional.of(salonOwnerAccess(UUID.randomUUID(), salonId)));
+        when(userRepository.findSalonIdById(adminId)).thenReturn(Optional.of(salonId));
+        when(masterServiceRepository.existsActiveOwnerRowAssignment(serviceDefId)).thenReturn(false);
+
+        assertThatCode(() -> authorizationService.enforceCanManageServiceDefinition(adminId, serviceDefId))
+                .doesNotThrowAnyException();
+        verify(masterServiceRepository).existsActiveOwnerRowAssignment(serviceDefId);
+    }
+
+    @Test
+    @DisplayName("Phase 345: the salon OWNER passes and the owner-row EXISTS is never issued")
+    void should_allowOwnerWithoutExistsQuery_when_ownerManagesDefinition() {
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(ownerId, "ROLE_SALON_OWNER"));
+        when(serviceRepository.findOwnerUserId(serviceDefId))
+                .thenReturn(Optional.of(salonOwnerAccess(ownerId, salonId)));
+
+        assertThatCode(() -> authorizationService.enforceCanManageServiceDefinition(ownerId, serviceDefId))
+                .doesNotThrowAnyException();
+        verify(masterServiceRepository, never()).existsActiveOwnerRowAssignment(any());
+    }
+
+    @Test
+    @DisplayName("Phase 345: an INDEPENDENT_MASTER definition never issues the owner-row EXISTS")
+    void should_neverQueryOwnerRowAssignment_when_definitionIsIndependentMasterOwned() {
+        UUID masterUserId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+        SecurityContextHolder.getContext()
+                .setAuthentication(mockAuth(masterUserId, "ROLE_INDEPENDENT_MASTER"));
+        when(serviceRepository.findOwnerUserId(serviceDefId))
+                .thenReturn(Optional.of(independentMasterOwnerAccess(masterUserId)));
+
+        assertThatCode(() -> authorizationService.enforceCanManageServiceDefinition(masterUserId, serviceDefId))
+                .doesNotThrowAnyException();
+        verifyNoInteractions(masterServiceRepository);
+    }
+
+    @Test
+    @DisplayName("Phase 345: an admin who is NOT granted (foreign salon) is denied by the salon gate first — "
+            + "the owner-row EXISTS is never issued")
+    void should_notQueryOwnerRowAssignment_when_adminAlreadyDeniedBySalonGate() {
+        UUID adminId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(adminId, "ROLE_SALON_ADMIN"));
+        when(serviceRepository.findOwnerUserId(serviceDefId))
+                .thenReturn(Optional.of(salonOwnerAccess(UUID.randomUUID(), UUID.randomUUID())));
+        when(userRepository.findSalonIdById(adminId)).thenReturn(Optional.of(UUID.randomUUID()));
+
+        assertThatThrownBy(() -> authorizationService.enforceCanManageServiceDefinition(adminId, serviceDefId))
+                .isInstanceOf(ForbiddenException.class)
+                .hasMessage("Access denied");
+        verifyNoInteractions(masterServiceRepository);
+    }
+
+    // ── enforceCanManageServiceDefinition — coverage carried over from the removed SpEL twin ──
+    // canManageServiceDefinition was deleted (dead since every service-definition write moved to a
+    // role-only @PreAuthorize + this service-layer guard). The behaviours its tests pinned that no
+    // enforce test above already covered are re-proved here against the surviving gate.
+
+    @Test
+    @DisplayName("enforceCanManageServiceDefinition admits the SALON_OWNER of the owning salon with "
+            + "exactly ONE query (in-memory salonOwnerId compare, Phase 306 audit fix #1)")
+    void should_notThrow_withSingleQuery_when_salonOwnerEnforces() {
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(ownerId, "ROLE_SALON_OWNER"));
+        when(serviceRepository.findOwnerUserId(serviceDefId))
+                .thenReturn(Optional.of(salonOwnerAccess(ownerId, salonId)));
+
+        assertThatCode(() -> authorizationService.enforceCanManageServiceDefinition(ownerId, serviceDefId))
                 .doesNotThrowAnyException();
 
-        // Admin of a DIFFERENT salon: both methods must agree DENIED.
-        UUID otherAdminId = UUID.randomUUID();
-        when(userRepository.findSalonIdById(otherAdminId)).thenReturn(Optional.of(otherSalonId));
-        Authentication deniedAuth = mockAuth(otherAdminId, "ROLE_SALON_ADMIN");
-        SecurityContextHolder.getContext().setAuthentication(deniedAuth);
-
-        assertThat(authorizationService.canManageServiceDefinition(deniedAuth, serviceDefId))
-                .as("canManageServiceDefinition must deny the mismatched admin")
-                .isFalse();
-        assertThatThrownBy(() -> authorizationService.enforceCanManageServiceDefinition(otherAdminId, serviceDefId))
-                .as("enforceCanManageServiceDefinition must agree and throw")
-                .isInstanceOf(ForbiddenException.class);
-    }
-
-    @Test
-    @DisplayName("case 16b (Phase 306 audit fix #4): canManageServiceDefinition and "
-            + "enforceCanManageServiceDefinition agree on the SALON_OWNER branch — the branch "
-            + "fix #1 changed, and case 16 alone never exercised (it only covered SALON_ADMIN)")
-    void should_agree_betweenCanManageAndEnforce_onSalonOwnerBranch() {
-        UUID salonId = UUID.randomUUID();
-        UUID serviceDefId = UUID.randomUUID();
-
-        // Matching owner: both methods must agree ALLOWED.
-        UUID matchingOwnerId = UUID.randomUUID();
-        when(serviceRepository.findOwnerUserId(serviceDefId))
-                .thenReturn(Optional.of(salonOwnerAccess(matchingOwnerId, salonId)));
-        Authentication allowedAuth = mockAuth(matchingOwnerId, "ROLE_SALON_OWNER");
-        SecurityContextHolder.getContext().setAuthentication(allowedAuth);
-
-        assertThat(authorizationService.canManageServiceDefinition(allowedAuth, serviceDefId))
-                .as("canManageServiceDefinition must allow the matching owner")
-                .isTrue();
-        assertThatCode(() -> authorizationService.enforceCanManageServiceDefinition(matchingOwnerId, serviceDefId))
-                .as("enforceCanManageServiceDefinition must agree and not throw")
-                .doesNotThrowAnyException();
-
-        // Mismatched salon owner: both methods must agree DENIED.
-        UUID actualOwnerId = UUID.randomUUID();
-        UUID otherActorId = UUID.randomUUID();
-        UUID otherServiceDefId = UUID.randomUUID();
-        when(serviceRepository.findOwnerUserId(otherServiceDefId))
-                .thenReturn(Optional.of(salonOwnerAccess(actualOwnerId, salonId)));
-        Authentication deniedAuth = mockAuth(otherActorId, "ROLE_SALON_OWNER");
-        SecurityContextHolder.getContext().setAuthentication(deniedAuth);
-
-        assertThat(authorizationService.canManageServiceDefinition(deniedAuth, otherServiceDefId))
-                .as("canManageServiceDefinition must deny the mismatched owner")
-                .isFalse();
-        assertThatThrownBy(() -> authorizationService.enforceCanManageServiceDefinition(otherActorId, otherServiceDefId))
-                .as("enforceCanManageServiceDefinition must agree and throw")
-                .isInstanceOf(ForbiddenException.class);
-    }
-
-    @Test
-    @DisplayName("case 16c (Phase 306 audit fix #4): canManageServiceDefinition and "
-            + "enforceCanManageServiceDefinition agree on the orphaned salonId=null/ownerUserId=null "
-            + "case (fix #2) — both deny cleanly, neither NPEs")
-    void should_agree_betweenCanManageAndEnforce_onOrphanedDefinition() {
-        UUID actorId = UUID.randomUUID();
-        UUID serviceDefId = UUID.randomUUID();
-
-        when(serviceRepository.findOwnerUserId(serviceDefId))
-                .thenReturn(Optional.of(salonOwnerAccess(null, null)));
-
-        Authentication auth = mockAuth(actorId, "ROLE_SALON_OWNER");
-        // A2 (cycle-3 audit): enforce* now reads the principal from the context, so bind the SAME
-        // auth both calls are meant to compare — otherwise the enforce leg would deny on identity
-        // rather than on the orphaned row, and the agreement claim would be vacuous.
-        SecurityContextHolder.getContext().setAuthentication(auth);
-
-        assertThat(authorizationService.canManageServiceDefinition(auth, serviceDefId))
-                .as("canManageServiceDefinition must deny an orphaned definition")
-                .isFalse();
-        assertThatThrownBy(() -> authorizationService.enforceCanManageServiceDefinition(actorId, serviceDefId))
-                .as("enforceCanManageServiceDefinition must agree and throw (not NPE)")
-                .isInstanceOf(ForbiddenException.class);
-    }
-
-    // ── QA gap pins, Phase 306 audit (2026-09-09) — see the OPEN findings the fix cycle owns ──
-
-    @Test
-    @DisplayName("canManageServiceDefinition — FIXED (security LOW, Phase 306 audit fix #2): "
-            + "returns false (clean deny) instead of throwing for an orphaned SALON-owned "
-            + "definition (salonId=null AND ownerUserId=null — its salon row was deleted; "
-            + "SalonService.java:1026 deactivates definitions but never deletes them, and "
-            + "owner_id carries no FK). Was should_throwNpe_when_serviceDefinitionIsOrphanedWith"
-            + "NullSalonAndOwner before the fix — inverted, not deleted, per the audit note.")
-    void should_returnFalse_when_serviceDefinitionIsOrphanedWithNullSalonAndOwner() {
-        UUID actorId = UUID.randomUUID();
-        UUID serviceDefId = UUID.randomUUID();
-
-        // salonId == null routes into the INDEPENDENT_MASTER identity arm
-        // (Objects.equals(access.getOwnerUserId(), actorId)) even though this is NOT an
-        // INDEPENDENT_MASTER-owned definition — it is an orphan. Objects.equals(null, actorId)
-        // is a safe false, never an NPE.
-        when(serviceRepository.findOwnerUserId(serviceDefId))
-                .thenReturn(Optional.of(salonOwnerAccess(null, null)));
-
-        Authentication auth = mockAuth(actorId, "ROLE_SALON_OWNER");
-
-        boolean result = authorizationService.canManageServiceDefinition(auth, serviceDefId);
-
-        assertThat(result)
-                .as("an orphaned definition (deleted salon, no FK) belongs to nobody — fail "
-                        + "CLOSED with a clean 403, never a 500 NullPointerException")
-                .isFalse();
-    }
-
-    @Test
-    @DisplayName("canManageServiceDefinition — FIXED (backend-perf MEDIUM, Phase 306 audit fix #1): "
-            + "the SALON_OWNER arm costs exactly ONE query (findOwnerUserId only, in-memory "
-            + "salonOwnerId compare) — D3's single-query property restored, not traded away. Was "
-            + "should_issueTwoSequentialQueries_when_salonOwnerManagesServiceDefinition_perfMediumPin "
-            + "before the fix — inverted, not deleted, per the audit note.")
-    void should_issueOneQuery_when_salonOwnerManagesServiceDefinition() {
-        UUID actorId = UUID.randomUUID();
-        UUID salonId = UUID.randomUUID();
-        UUID serviceDefId = UUID.randomUUID();
-
-        when(serviceRepository.findOwnerUserId(serviceDefId))
-                .thenReturn(Optional.of(salonOwnerAccess(actorId, salonId)));
-
-        Authentication auth = mockAuth(actorId, "ROLE_SALON_OWNER");
-
-        boolean result = authorizationService.canManageServiceDefinition(auth, serviceDefId);
-
-        assertThat(result).isTrue();
         verify(serviceRepository, times(1)).findOwnerUserId(serviceDefId);
-        // Pre-fix this second query fired unconditionally for every SALON_OWNER PATCH/DELETE
-        // (D3's projection now carries salonOwnerId, so the SALON_OWNER arm never needs it).
         verify(salonRepository, never()).existsByIdAndOwnerId(any(), any());
+    }
+
+    @Test
+    @DisplayName("enforceCanManageServiceDefinition refuses a SALON_OWNER who does not own the "
+            + "definition's salon, without a salonRepository round-trip")
+    void should_throwForbidden_when_differentSalonOwnerEnforces() {
+        UUID actorId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(actorId, "ROLE_SALON_OWNER"));
+        when(serviceRepository.findOwnerUserId(serviceDefId))
+                .thenReturn(Optional.of(salonOwnerAccess(UUID.randomUUID(), UUID.randomUUID())));
+
+        assertThatThrownBy(() -> authorizationService.enforceCanManageServiceDefinition(actorId, serviceDefId))
+                .isInstanceOf(ForbiddenException.class)
+                .hasMessage("Access denied");
+
+        verify(salonRepository, never()).existsByIdAndOwnerId(any(), any());
+    }
+
+    @Test
+    @DisplayName("enforceCanManageServiceDefinition refuses an orphaned definition (salonId=null AND "
+            + "ownerUserId=null — Phase 306 audit fix #2): clean 403, never an NPE")
+    void should_throwForbidden_when_serviceDefinitionIsOrphanedOnEnforce() {
+        UUID actorId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(actorId, "ROLE_SALON_OWNER"));
+        when(serviceRepository.findOwnerUserId(serviceDefId))
+                .thenReturn(Optional.of(salonOwnerAccess(null, null)));
+
+        assertThatThrownBy(() -> authorizationService.enforceCanManageServiceDefinition(actorId, serviceDefId))
+                .as("an orphaned definition belongs to nobody — fail closed with 403, never a 500")
+                .isInstanceOf(ForbiddenException.class)
+                .hasMessage("Access denied");
+    }
+
+    @Test
+    @DisplayName("enforceCanManageServiceDefinition refuses a SALON_MASTER on a salon definition "
+            + "(Phase 306 D6 / Phase 311 D5 — the service layer never widens to SALON_MASTER)")
+    void should_throwForbidden_when_salonMasterEnforcesOnSalonDefinition() {
+        UUID masterUserId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+        SecurityContextHolder.getContext()
+                .setAuthentication(mockAuth(masterUserId, "ROLE_SALON_MASTER"));
+        when(serviceRepository.findOwnerUserId(serviceDefId))
+                .thenReturn(Optional.of(salonOwnerAccess(UUID.randomUUID(), salonId)));
+
+        assertThatThrownBy(() ->
+                authorizationService.enforceCanManageServiceDefinition(masterUserId, serviceDefId))
+                .isInstanceOf(ForbiddenException.class)
+                .hasMessage("Access denied");
+
+        verifyNoInteractions(salonRepository, userRepository, masterServiceRepository);
+    }
+
+    @Test
+    @DisplayName("enforceCanManageServiceDefinition refuses a CLIENT on a salon definition")
+    void should_throwForbidden_when_clientEnforcesOnSalonDefinition() {
+        UUID clientId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(clientId, "ROLE_CLIENT"));
+        when(serviceRepository.findOwnerUserId(serviceDefId))
+                .thenReturn(Optional.of(salonOwnerAccess(UUID.randomUUID(), UUID.randomUUID())));
+
+        assertThatThrownBy(() -> authorizationService.enforceCanManageServiceDefinition(clientId, serviceDefId))
+                .isInstanceOf(ForbiddenException.class)
+                .hasMessage("Access denied");
+
+        verifyNoInteractions(salonRepository, userRepository, masterServiceRepository);
     }
 
     // ── canManageBooking ───────────────────────────────────────────────────────
@@ -3966,6 +3806,119 @@ class AuthorizationServiceTest {
                 .as("null salon on SALON_OWNER-type master must yield ForbiddenException on schedule enforce");
     }
 
+    // ── enforceOwnerMasterRowWritableByOwnerOnly — Phase 345 (2026-10-05 decision) ──────
+    //
+    // Audit fixes: the actor must BE the authenticated principal (asserted before the type check),
+    // and the owner-row proof reads the memoised existsByIdAndOwnerId off the master's salon FK
+    // instead of lazy-loading salon.owner. No request is bound in these unit tests, so the memo
+    // degrades to a direct repository read and the verify(...) counts below stay exact.
+
+    /** A SALON_OWNER-typed master row sitting in {@code salonId} — salon is an id-only proxy. */
+    private static Master ownerRowIn(UUID salonId) {
+        Salon salon = mock(Salon.class);
+        when(salon.getId()).thenReturn(salonId);
+        Master master = mock(Master.class);
+        when(master.getMasterType()).thenReturn(MasterType.SALON_OWNER);
+        when(master.getSalon()).thenReturn(salon);
+        return master;
+    }
+
+    @Test
+    @DisplayName("enforceOwnerMasterRowWritableByOwnerOnly — the salon owner may write their own SALON_OWNER row "
+            + "(one memoised ownership read, no salon.owner traversal)")
+    void should_notThrow_when_ownerWritesOwnSalonOwnerRow() {
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        Master master = ownerRowIn(salonId);
+        when(salonRepository.existsByIdAndOwnerId(salonId, ownerId)).thenReturn(true);
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(ownerId, "ROLE_SALON_OWNER"));
+
+        authorizationService.enforceOwnerMasterRowWritableByOwnerOnly(ownerId, master);
+
+        verify(salonRepository).existsByIdAndOwnerId(salonId, ownerId);
+        verify(master.getSalon(), never()).getOwner();
+        verifyNoInteractions(masterRepository, userRepository);
+    }
+
+    @Test
+    @DisplayName("enforceOwnerMasterRowWritableByOwnerOnly — a SALON_ADMIN (any non-owner actor) is 403 on the owner's SALON_OWNER row")
+    void should_throwForbidden_when_nonOwnerWritesSalonOwnerRow() {
+        UUID adminId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        Master master = ownerRowIn(salonId);
+        when(salonRepository.existsByIdAndOwnerId(salonId, adminId)).thenReturn(false);
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(adminId, "ROLE_SALON_ADMIN"));
+
+        assertThatThrownBy(() -> authorizationService.enforceOwnerMasterRowWritableByOwnerOnly(adminId, master))
+                .isInstanceOf(ForbiddenException.class);
+    }
+
+    @Test
+    @DisplayName("enforceOwnerMasterRowWritableByOwnerOnly — a regular SALON_MASTER row is a no-op that "
+            + "never touches the (lazy) salon — zero statements on the common write path")
+    void should_notThrowNorReadSalon_when_actorWritesRegularSalonMasterRow() {
+        UUID actorId = UUID.randomUUID();
+        Master master = mock(Master.class);
+        when(master.getMasterType()).thenReturn(MasterType.SALON_MASTER);
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(actorId, "ROLE_SALON_ADMIN"));
+
+        authorizationService.enforceOwnerMasterRowWritableByOwnerOnly(actorId, master);
+
+        verify(master, never()).getSalon();
+        verifyNoInteractions(masterRepository, salonRepository, userRepository);
+    }
+
+    @Test
+    @DisplayName("enforceOwnerMasterRowWritableByOwnerOnly — fails CLOSED on a salon-less SALON_OWNER row")
+    void should_throwForbidden_when_salonOwnerRowHasNullSalon() {
+        UUID actorId = UUID.randomUUID();
+        Master master = mock(Master.class);
+        when(master.getMasterType()).thenReturn(MasterType.SALON_OWNER);
+        when(master.getSalon()).thenReturn(null);
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(actorId, "ROLE_SALON_OWNER"));
+
+        assertThatThrownBy(() -> authorizationService.enforceOwnerMasterRowWritableByOwnerOnly(actorId, master))
+                .isInstanceOf(ForbiddenException.class);
+        verifyNoInteractions(salonRepository);
+    }
+
+    @Test
+    @DisplayName("enforceOwnerMasterRowWritableByOwnerOnly — refuses an actorId that is not the authenticated "
+            + "principal, even when that actorId genuinely owns the row's salon")
+    void should_throwForbidden_when_ownerRowActorIsNotTheAuthenticatedPrincipal() {
+        UUID principalAdminId = UUID.randomUUID();
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        // Lenient: the principal assertion refuses before the row is inspected at all — the stubs
+        // describe a row the impersonated owner genuinely owns, so only the identity check denies.
+        Salon salon = mock(Salon.class);
+        lenient().when(salon.getId()).thenReturn(salonId);
+        Master master = mock(Master.class);
+        lenient().when(master.getMasterType()).thenReturn(MasterType.SALON_OWNER);
+        lenient().when(master.getSalon()).thenReturn(salon);
+        lenient().when(salonRepository.existsByIdAndOwnerId(salonId, ownerId)).thenReturn(true);
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(principalAdminId, "ROLE_SALON_ADMIN"));
+
+        assertThatThrownBy(() -> authorizationService.enforceOwnerMasterRowWritableByOwnerOnly(ownerId, master))
+                .as("an admin's context must never authorize an owner-row write made on the owner's behalf")
+                .isInstanceOf(ForbiddenException.class);
+        verify(master, never()).getMasterType();
+        verifyNoInteractions(salonRepository);
+    }
+
+    @Test
+    @DisplayName("enforceOwnerMasterRowWritableByOwnerOnly — principal assertion fires BEFORE the type check "
+            + "(a mismatched actor is refused even on a regular SALON_MASTER row)")
+    void should_throwForbidden_when_salonMasterRowActorIsNotTheAuthenticatedPrincipal() {
+        Master master = mock(Master.class);
+        lenient().when(master.getMasterType()).thenReturn(MasterType.SALON_MASTER);
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(UUID.randomUUID(), "ROLE_SALON_OWNER"));
+
+        assertThatThrownBy(() -> authorizationService.enforceOwnerMasterRowWritableByOwnerOnly(UUID.randomUUID(), master))
+                .isInstanceOf(ForbiddenException.class);
+        verify(master, never()).getMasterType();
+    }
+
     // TODO(24.7): AuthorizationService.enforceCanManageBooking was deleted in Phase 24.2 — it had
     // zero remaining production callers once declineBooking/notCompleteBooking moved to
     // enforceCanCancelBooking (which also admits SALON_ADMIN via hasProviderAuthorityOverBooking,
@@ -4126,5 +4079,47 @@ class AuthorizationServiceTest {
     // admin; its salon arm, its salonId != null guard and its independent-master arm are pinned by
     // the per-row cases above (should_*_hasProviderAuthorityOverBooking, ~line 1950 onward). What is
     // gone is only the coverage of the batched FORM of that rule, which no longer exists.
+
+    // ── Phase 343 — OWNER-only salon image gate (isOwnerOf) ─────────────────────────────────────
+
+    @Test
+    @DisplayName("Phase 343 TC-12: isOwnerOf is false for the SALON_ADMIN assigned to the salon — "
+            + "ownership only, the admin arm of hasManagementAccess is never consulted")
+    void should_returnFalse_when_isOwnerOfCalledByAssignedAdmin() {
+        UUID salonId = UUID.randomUUID();
+        UUID adminId = UUID.randomUUID();
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(adminId, "ROLE_SALON_ADMIN"));
+        lenient().when(userRepository.findSalonIdById(adminId)).thenReturn(java.util.Optional.of(salonId));
+        when(salonRepository.existsByIdAndOwnerId(salonId, adminId)).thenReturn(false);
+
+        boolean owner = authorizationService.isOwnerOf(mockAuth(adminId, "ROLE_SALON_ADMIN"), salonId);
+
+        assertThat(owner).isFalse();
+        verify(userRepository, never()).findSalonIdById(any());
+    }
+
+    @Test
+    @DisplayName("Phase 343: isOwnerOf(Authentication, salonId) delegates to the ownership query with the principal id")
+    void should_returnOwnership_when_isOwnerOfCalledWithAuthentication() {
+        UUID salonId = UUID.randomUUID();
+        UUID ownerId = UUID.randomUUID();
+        when(salonRepository.existsByIdAndOwnerId(salonId, ownerId)).thenReturn(true);
+
+        assertThat(authorizationService.isOwnerOf(mockAuth(ownerId, "ROLE_SALON_OWNER"), salonId)).isTrue();
+    }
+
+    @Test
+    @DisplayName("Phase 343: isOwnerOf(Authentication, salonId) is false (never a throw, never a query) for a "
+            + "missing or non-UUID principal")
+    void should_returnFalse_when_isOwnerOfPrincipalMalformed() {
+        UUID salonId = UUID.randomUUID();
+        var noDetails = new UsernamePasswordAuthenticationToken("u", null,
+                List.of(new SimpleGrantedAuthority("ROLE_SALON_OWNER")));
+        noDetails.setDetails("not-a-uuid");
+
+        assertThat(authorizationService.isOwnerOf((Authentication) null, salonId)).isFalse();
+        assertThat(authorizationService.isOwnerOf(noDetails, salonId)).isFalse();
+        verifyNoInteractions(salonRepository);
+    }
 
 }

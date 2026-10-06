@@ -356,7 +356,7 @@ public class UserService {
      * hot CLIENT profile write stays at its current query count.
      */
     private UUID resolveMasterIdForEviction(UUID userId, Role role) {
-        if (role == Role.CLIENT || role == Role.SALON_ADMIN) {
+        if (!role.canOwnMasterRow()) {
             return null;
         }
         return masterRepository.findIdByUserId(userId).orElse(null);

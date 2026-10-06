@@ -3,11 +3,13 @@ package com.beautica.search.service;
 import com.beautica.booking.dto.BookingDetailResponse;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.location.DiscoveryLocationKey;
+import com.beautica.master.service.ScheduleDateMath;
 import com.beautica.location.DiscoveryLocationResolver;
 import com.beautica.location.DiscoveryLocationResolver.DiscoveryLabels;
 import com.beautica.master.entity.MasterType;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.salon.repository.SalonSearchProjection;
+import com.beautica.master.repository.MasterBookabilitySql;
 import com.beautica.salon.repository.SalonSearchSql;
 import com.beautica.search.dto.LocationFilter;
 import com.beautica.search.dto.MasterSearchRequest;
@@ -33,6 +35,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
+import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -296,6 +299,9 @@ public class SearchService {
     private final ServiceTypeSlugResolver serviceTypeSlugResolver;
     private final PlatformCategoryLabelResolver platformCategoryLabelResolver;
     private final CacheManager cacheManager;
+    // Source of the bound "today" every bookability fragment reads (MasterBookabilitySql#TODAY_PARAM):
+    // the Kyiv civil date of the app Clock, so search and the strict slot verdict agree on the date.
+    private final ScheduleDateMath scheduleDateMath;
 
     /**
      * Discover masters matching optional location (FK, district-primary),
@@ -385,7 +391,7 @@ public class SearchService {
         // lateral and re-expand the work).
         SqlAndParams dataSql = buildMasterSearchSql(filters, pageable);
         Query dataQuery = entityManager.createNativeQuery(dataSql.sql());
-        bind(dataQuery, dataSql.params());
+        bind(dataQuery, dataSql);
 
         @SuppressWarnings("unchecked")
         List<Object[]> rawRows = dataQuery.getResultList();
@@ -596,7 +602,7 @@ public class SearchService {
                 cityId, districtId, category, qTokens, qCategories, minPrice, maxPrice,
                 sort, serviceTypes, pageable);
         Query dataQuery = entityManager.createNativeQuery(dataSql.sql());
-        bind(dataQuery, dataSql.params());
+        bind(dataQuery, dataSql);
 
         @SuppressWarnings("unchecked")
         List<Object[]> rawRows = dataQuery.getResultList();
@@ -669,27 +675,28 @@ public class SearchService {
         String sortMode = sort.name();
         int limit = pageable.getPageSize();
         long offset = pageable.getOffset();
+        LocalDate today = scheduleDateMath.today();
         if (districtId != null) {
             return noPriceFilter
                     ? salonRepository.findActiveByDistrictIdNoPriceAsProjection(
-                            districtId, category, q[0], q[1], q[2], q[3], sortMode, limit, offset)
+                            districtId, category, q[0], q[1], q[2], q[3], sortMode, limit, offset, today)
                     : salonRepository.findActiveByDistrictIdAsProjection(
                             districtId, category, q[0], q[1], q[2], q[3],
-                            minPrice, maxPrice, sortMode, limit, offset);
+                            minPrice, maxPrice, sortMode, limit, offset, today);
         }
         if (cityId != null) {
             return noPriceFilter
                     ? salonRepository.findActiveByCityIdNoPriceAsProjection(
-                            cityId, category, q[0], q[1], q[2], q[3], sortMode, limit, offset)
+                            cityId, category, q[0], q[1], q[2], q[3], sortMode, limit, offset, today)
                     : salonRepository.findActiveByCityIdAsProjection(
                             cityId, category, q[0], q[1], q[2], q[3],
-                            minPrice, maxPrice, sortMode, limit, offset);
+                            minPrice, maxPrice, sortMode, limit, offset, today);
         }
         return noPriceFilter
                 ? salonRepository.findByIsActiveTrueNoPriceAsProjection(
-                        q[0], q[1], q[2], q[3], category, sortMode, limit, offset)
+                        q[0], q[1], q[2], q[3], category, sortMode, limit, offset, today)
                 : salonRepository.findByIsActiveTrueAsProjection(
-                        q[0], q[1], q[2], q[3], minPrice, maxPrice, category, sortMode, limit, offset);
+                        q[0], q[1], q[2], q[3], minPrice, maxPrice, category, sortMode, limit, offset, today);
     }
 
     // ── location seam (M2) ────────────────────────────────────────────────────
@@ -1273,10 +1280,8 @@ public class SearchService {
         sb.append("SELECT m.id AS master_id, ")
                 .append("u.first_name AS first_name, u.last_name AS last_name, ")
                 .append("m.avg_rating AS avg_rating, m.review_count AS review_count, ")
-                // Avatar column does not yet exist on users/masters as a search
-                // projection source. Emit NULL so the projection still maps
-                // cleanly until a future phase wires master avatar storage.
-                .append("CAST(NULL AS TEXT) AS avatar_url, ")
+                // Master avatar lives on users.avatar_url (V38); `u` is already joined.
+                .append("u.avatar_url AS avatar_url, ")
                 // Discovery-locality FK ids (district-primary via salon link
                 // for SALON_MASTER, else the user's own). Labels are resolved
                 // through the M2 seam; these carry the ids only.
@@ -1352,6 +1357,10 @@ public class SearchService {
      */
     public static void appendMasterActiveIndependentPredicate(StringBuilder sb, Map<String, Object> params) {
         sb.append("m.is_active = true AND u.is_active = true AND u.role = :includedRole ");
+        // Bookability (locked 2026-10-05): ALWAYS require ≥1 active owned service AND a schedule —
+        // the shared MasterBookabilitySql rule, so browse, ?q, filters and the suggestions master
+        // branch (which reuses this method) cannot list a master nobody can book.
+        sb.append("AND").append(MasterBookabilitySql.bookableMaster("m")).append(' ');
         params.put("includedRole", ROLE_INDEPENDENT_MASTER);
     }
 
@@ -1992,7 +2001,8 @@ public class SearchService {
      * Appends the coarse <em>bookable gate</em> for a salon-owned {@code service_definitions}
      * row aliased {@code defAlias}, correlated to the salon aliased {@code salonAlias}: an
      * {@code EXISTS} that the def is actively performed by at least one active master
-     * <em>belonging to that salon</em>. Mirrors the catalogue's canonical coarse gate
+     * <em>belonging to that salon</em> who has a schedule ({@code MasterBookabilitySql#hasSchedule},
+     * bookability decision 2026-10-05). Mirrors the catalogue's canonical coarse gate
      * {@code ServiceRepository.findBookableServicesBySalon}
      * ({@code EXISTS(MasterServiceAssignment WHERE serviceDefinition = sd AND isActive AND
      * master.isActive AND master.salon.id = salonId)}).
@@ -2019,11 +2029,24 @@ public class SearchService {
                 .append("JOIN masters mx ON mx.id = msx.master_id AND mx.is_active = true ")
                 .append("AND mx.salon_id = ").append(salonAlias).append(".id ")
                 .append("WHERE msx.service_def_id = ").append(defAlias).append(".id ")
-                .append("AND msx.is_active = true) ");
+                .append("AND msx.is_active = true ")
+                // The performing master must have a schedule (MasterBookabilitySql) — the same
+                // per-master rule the price band and the salon-level gate apply.
+                .append("AND").append(MasterBookabilitySql.hasSchedule("mx"))
+                .append(") ");
     }
 
-    private static void bind(Query query, Map<String, Object> params) {
-        params.forEach(query::setParameter);
+    /**
+     * Binds the builder's params plus, when the SQL splices a bookability fragment, the Kyiv
+     * "today" from the app clock ({@link MasterBookabilitySql#TODAY_PARAM}). Bound here rather
+     * than in each builder because the builders are static and shared, and the fragments they
+     * emit are conditional — the SQL text is the one authority on whether the parameter exists.
+     */
+    private void bind(Query query, SqlAndParams sqlAndParams) {
+        sqlAndParams.params().forEach(query::setParameter);
+        if (MasterBookabilitySql.referencesToday(sqlAndParams.sql())) {
+            query.setParameter(MasterBookabilitySql.TODAY_PARAM, scheduleDateMath.today());
+        }
     }
 
     /**
@@ -2064,7 +2087,7 @@ public class SearchService {
      */
     private long probeTotalForEmptyPage(SqlAndParams probeSql, int totalCountIdx) {
         Query probeQuery = entityManager.createNativeQuery(probeSql.sql());
-        bind(probeQuery, probeSql.params());
+        bind(probeQuery, probeSql);
 
         @SuppressWarnings("unchecked")
         List<Object[]> probeRows = probeQuery.getResultList();
@@ -2129,6 +2152,15 @@ public class SearchService {
         appendSalonPriceAggregateLateral(inner, hasCategory, serviceTypes);
 
         inner.append("WHERE s.is_active = true ");
+        // Bookability (locked 2026-10-05): ALWAYS require ≥1 bookable master. With a slug filter
+        // the per-slug EXISTS below (appendSalonServiceTypeExists) already demands an active
+        // master of THIS salon performing an active salon service AND passing the schedule
+        // fragment — strictly stronger than MasterBookabilitySql#bookableSalon — so emitting the
+        // salon gate too would only re-run the schedule check for the same masters (perf audit
+        // 2026-10-05, finding 3). Without slugs it is the only membership gate and stays.
+        if (serviceTypes.isEmpty()) {
+            inner.append("AND").append(MasterBookabilitySql.bookableSalon("s")).append(' ');
+        }
         if (districtId != null) {
             inner.append("AND s.district_id = :districtId ");
             params.put("districtId", districtId);
@@ -2245,7 +2277,10 @@ public class SearchService {
                 .append("JOIN masters mad ON mad.id = ms.master_id AND mad.is_active = true ")
                 .append("AND mad.salon_id = s.id ")
                 .append("WHERE sd.owner_type = 'SALON' AND sd.owner_id = s.id ")
-                .append("AND ms.is_active = true ");
+                .append("AND ms.is_active = true ")
+                // Only masters with a schedule price the band — the static pr lateral's rule
+                // (SalonSearchSql), previously missing on this dynamic path.
+                .append("AND").append(MasterBookabilitySql.hasSchedule("mad")).append(' ');
         // Slug precedence: scope the price band to the matched services. Category
         // narrows only when no slug filter is active (defensive — this path always
         // carries slugs).

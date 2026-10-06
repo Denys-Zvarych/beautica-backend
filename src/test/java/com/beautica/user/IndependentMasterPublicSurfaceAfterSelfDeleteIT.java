@@ -1,5 +1,6 @@
 package com.beautica.user;
 
+import com.beautica.support.BookableMasterSeeder;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.booking.BookingTestFixtures;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -99,6 +100,8 @@ class IndependentMasterPublicSurfaceAfterSelfDeleteIT extends AbstractIntegratio
     void should_disappearFromSearch_afterSelfDelete() throws Exception {
         String email = "im-surface-" + System.nanoTime() + "@beautica.test";
         UUID masterId = fixtures.createIndependentMaster(email);
+        // Search lists only bookable masters (active owned service + hours, 2026-10-05).
+        BookableMasterSeeder.makeIndependentBookable(jdbcTemplate, masterId);
         String token = fixtures.tokenFor(email);
 
         // Fixture check — present BEFORE the delete.
@@ -141,6 +144,15 @@ class IndependentMasterPublicSurfaceAfterSelfDeleteIT extends AbstractIntegratio
         csd.insertFavorite(clientId, "MASTER", masterId);
         String clientToken = fixtures.tokenFor(emailOf(clientId));
         String masterToken = fixtures.tokenFor(masterEmail);
+        // Favourites list only bookable masters (2026-10-05): make the master bookable and prove the
+        // favourite IS listed before the delete, so the absence below is the delete's doing.
+        BookableMasterSeeder.makeIndependentBookable(jdbcTemplate, masterId);
+        assertThat(objectMapper.readTree(restTemplate.exchange(
+                        "/api/v1/favorites/masters", HttpMethod.GET,
+                        new HttpEntity<>(fixtures.bearerHeaders(clientToken)), String.class).getBody())
+                .path("data").path("data").findValuesAsText("masterId"))
+                .as("precondition: the favourite is listed while the master is active and bookable")
+                .contains(masterId.toString());
 
         restTemplate.exchange("/api/v1/users/me", HttpMethod.DELETE,
                 new HttpEntity<>(fixtures.bearerHeaders(masterToken)), Void.class);

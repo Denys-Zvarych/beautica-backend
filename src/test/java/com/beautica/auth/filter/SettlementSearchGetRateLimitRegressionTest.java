@@ -84,7 +84,7 @@ class SettlementSearchGetRateLimitRegressionTest {
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(),
-                permissive(), permissive(), permissive(), permissive(), permissive(), permissive());
+                permissive(), permissive(), permissive(), permissive(), permissive(), permissive(), permissive());
     }
 
     private MockHttpServletRequest get(String path) {

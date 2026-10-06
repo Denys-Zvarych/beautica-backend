@@ -1323,6 +1323,9 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
                 .isEqualTo(2L);
 
         // ── and the PUBLISHED band matches what was submitted, not a reshaped combination ──
+        // The client view of /masters/{id}/services lists only BOOKABLE services (2026-10-05), so
+        // the master needs hours for the client-facing band to be observable at all.
+        fixtures.seedUsableSchedule(secondMasterId);
         List<MasterServiceResponse> menu = publicMenuOf(secondMasterId);
         MasterServiceResponse renderedRangeOverFixed = menu.stream()
                 .filter(row -> row.serviceDefinition().id().equals(fixedDefId)).findFirst().orElseThrow();
@@ -1375,6 +1378,9 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
                 .as("the shared definition's own floor is untouched")
                 .isEqualByComparingTo("400.00");
 
+        // The client view of /masters/{id}/services lists only BOOKABLE services (2026-10-05), so
+        // the master needs hours for the client-facing band to be observable at all.
+        fixtures.seedUsableSchedule(secondMasterId);
         List<MasterServiceResponse> menu = publicMenuOf(secondMasterId);
         MasterServiceResponse rendered = menu.get(0);
         assertThat(rendered.priceMax())
@@ -1444,6 +1450,9 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
                 .as("reuse mints no definition")
                 .isEqualTo(2L);
 
+        // The client view of /masters/{id}/services lists only BOOKABLE services (2026-10-05), so
+        // the master needs hours for the client-facing band to be observable at all.
+        fixtures.seedUsableSchedule(secondMasterId);
         List<MasterServiceResponse> menu = publicMenuOf(secondMasterId);
         assertThat(menu).hasSize(2);
         MasterServiceResponse renderedFixed = menu.stream()
@@ -1755,7 +1764,7 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
                 String.class);
 
         assertThat(adminPatch.getStatusCode())
-                .as("Phase 306 D3: canManageServiceDefinition resolves a SALON_ADMIN of the owning "
+                .as("Phase 306 D3: enforceCanManageServiceDefinition resolves a SALON_ADMIN of the owning "
                         + "salon through hasManagementAccess, not the stale identity check")
                 .isEqualTo(HttpStatus.OK);
         assertThat(definitionRow(defId))

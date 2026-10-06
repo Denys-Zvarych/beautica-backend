@@ -1,5 +1,6 @@
 package com.beautica.favorite;
 
+import com.beautica.support.BookableMasterSeeder;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.booking.BookingTestFixtures;
 import com.beautica.common.exception.BusinessException;
@@ -127,6 +128,8 @@ class FavoriteMigrationIT extends AbstractIntegrationTest {
     void should_projectMasterOwnAddress_when_listingMasterFavorites() {
         UUID clientId = createClient("addr-client@beautica.test");
         UUID master = createIndependentMaster("addr-independent-master@beautica.test");
+        // Favourites list only bookable providers (2026-10-05) — make the fixture bookable.
+        createIndependentMasterService(master);
         jdbcTemplate.update(
                 "UPDATE users SET street = 'Master Street', building_no = '12B', "
                         + "location_note = 'master note' WHERE id = "
@@ -176,6 +179,8 @@ class FavoriteMigrationIT extends AbstractIntegrationTest {
                         + "location_note = 'salon note' WHERE id = ?", salonId);
 
         UUID salonMaster = createSalonMaster(salonId, "addr-mask-salon-master@beautica.test");
+        // Favourites list only bookable providers (2026-10-05) — make the fixture bookable.
+        createSalonMasterService(salonMaster, salonId, true, true);
         jdbcTemplate.update(
                 "UPDATE users SET street = 'Master Street', building_no = '12B', "
                         + "location_note = 'master note' WHERE id = "
@@ -204,6 +209,8 @@ class FavoriteMigrationIT extends AbstractIntegrationTest {
     void should_projectSalonAddress_when_listingSalonFavorites() {
         UUID clientId = createClient("salon-addr-client@beautica.test");
         UUID salonId = createSalon("salon-addr-owner@beautica.test");
+        // Favourites list only bookable providers (2026-10-05) — a bookable master with an UNCATEGORISED service (no chip).
+        BookableMasterSeeder.addBookableSalonMaster(jdbcTemplate, salonId);
         jdbcTemplate.update(
                 "UPDATE salons SET street = 'Derybasivska', building_no = '7', "
                         + "location_note = '2nd floor' WHERE id = ?", salonId);
@@ -230,6 +237,8 @@ class FavoriteMigrationIT extends AbstractIntegrationTest {
         UUID clientId = createClient("roundtrip-client@beautica.test");
         UUID salonId = createSalon("roundtrip-owner@beautica.test");
         UUID salonMaster = createSalonMaster(salonId, "roundtrip-master@beautica.test");
+        // Favourites list only bookable providers (2026-10-05) — make the fixture bookable.
+        createSalonMasterService(salonMaster, salonId, true, true);
 
         favoriteService.addFavorite(clientId, FavoriteTargetType.MASTER, salonMaster);
 
@@ -456,6 +465,8 @@ class FavoriteMigrationIT extends AbstractIntegrationTest {
     void should_hideButKeepFavorite_when_favoritedMasterDeactivated() {
         UUID clientId = createClient("deact-fav-master-client@beautica.test");
         UUID master = createIndependentMaster("deact-fav-master-master@beautica.test");
+        // Favourites list only bookable providers (2026-10-05) — make the fixture bookable.
+        createIndependentMasterService(master);
         favoriteService.addFavorite(clientId, FavoriteTargetType.MASTER, master);
 
         assertThat(favoriteService.listMasterFavorites(clientId, Pageable.ofSize(20)).getContent())
@@ -576,6 +587,8 @@ class FavoriteMigrationIT extends AbstractIntegrationTest {
     void should_hideButKeepFavorite_when_favoritedSalonDeactivated() {
         UUID clientId = createClient("deact-fav-salon-client@beautica.test");
         UUID salonId = createSalon("deact-fav-salon-owner@beautica.test");
+        // Favourites list only bookable providers (2026-10-05) — a bookable master with an UNCATEGORISED service (no chip).
+        BookableMasterSeeder.addBookableSalonMaster(jdbcTemplate, salonId);
         favoriteService.addFavorite(clientId, FavoriteTargetType.SALON, salonId);
 
         assertThat(favoriteService.listSalonFavorites(clientId, Pageable.ofSize(20)).getContent())
@@ -752,10 +765,13 @@ class FavoriteMigrationIT extends AbstractIntegrationTest {
      * never {@code null} — for a provider with no active categorisable service at all.
      */
     @Test
-    @DisplayName("categories is an EMPTY list, never null, when the master has no active service")
-    void should_returnEmptyCategories_when_masterHasNoActiveService() {
+    @DisplayName("categories is an EMPTY list, never null, when the master's only active service is uncategorised")
+    void should_returnEmptyCategories_when_masterOnlyServiceIsUncategorised() {
         UUID clientId = createClient("cat-none-client@beautica.test");
         UUID masterId = createIndependentMaster("cat-none-master@beautica.test");
+        // A master with NO active service is no longer listed at all (bookability, 2026-10-05), so
+        // the "no chip" case is an active service carrying no category.
+        clearCategory(createIndependentMasterService(masterId));
         favoriteService.addFavorite(clientId, FavoriteTargetType.MASTER, masterId);
 
         List<FavoriteMasterResponse> result = favoriteService.listMasterFavorites(clientId);
@@ -860,6 +876,8 @@ class FavoriteMigrationIT extends AbstractIntegrationTest {
     void should_excludeSalonCategory_when_noMasterPerformsTheService() {
         UUID clientId = createClient("cat-salon-unperformed-client@beautica.test");
         UUID salonId = createSalon("cat-salon-unperformed-owner@beautica.test");
+        // Favourites list only bookable providers (2026-10-05) — a bookable master with an UNCATEGORISED service (no chip).
+        BookableMasterSeeder.addBookableSalonMaster(jdbcTemplate, salonId);
         jdbcTemplate.update(
                 "INSERT INTO service_definitions (id, owner_type, owner_id, name, service_type_id, "
                         + "base_duration_minutes, base_price, buffer_minutes_after, category, "
@@ -885,6 +903,8 @@ class FavoriteMigrationIT extends AbstractIntegrationTest {
     void should_excludeSalonCategory_when_performingMasterIsInactive() {
         UUID clientId = createClient("cat-salon-inactive-master-client@beautica.test");
         UUID salonId = createSalon("cat-salon-inactive-master-owner@beautica.test");
+        // Favourites list only bookable providers (2026-10-05) — a bookable master with an UNCATEGORISED service (no chip).
+        BookableMasterSeeder.addBookableSalonMaster(jdbcTemplate, salonId);
         UUID master = createSalonMaster(salonId, "cat-salon-inactive-master-m@beautica.test");
         UUID service = createSalonMasterService(master, salonId, true, true);
         setCategory(service, "NAIL_SERVICE");
@@ -912,6 +932,10 @@ class FavoriteMigrationIT extends AbstractIntegrationTest {
         UUID clientId = createClient("cat-cross-salon-client@beautica.test");
         UUID salonA = createSalon("cat-cross-salon-a@beautica.test");
         UUID salonB = createSalon("cat-cross-salon-b@beautica.test");
+        // Favourites list only bookable salons (2026-10-05): each gets a bookable master whose
+        // seeded service is UNCATEGORISED, so it contributes no chip.
+        BookableMasterSeeder.addBookableSalonMaster(jdbcTemplate, salonA);
+        BookableMasterSeeder.addBookableSalonMaster(jdbcTemplate, salonB);
         UUID masterOfA = createSalonMaster(salonA, "cat-cross-salon-master@beautica.test");
         // Service DEFINITION owned by salon B, but the only assignment performing it belongs to
         // a master of salon A — the exact cross-salon shape the predicate must reject.
@@ -1012,6 +1036,8 @@ class FavoriteMigrationIT extends AbstractIntegrationTest {
         // review_count to their V4 column DEFAULTs (0.00 / 0) — which is exactly what the copy
         // this replaced spelled out by hand.
         UUID ownerMaster = fixtures.createOwnerAsMaster(employingSalon, ownerUserId);
+        // Favourites list only bookable providers (2026-10-05) — make the fixture bookable.
+        BookableMasterSeeder.makeBookable(jdbcTemplate, employingSalon, ownerMaster);
         favoriteService.addFavorite(clientId, FavoriteTargetType.MASTER, ownerMaster);
 
         List<FavoriteMasterResponse> masters =
@@ -1140,19 +1166,21 @@ class FavoriteMigrationIT extends AbstractIntegrationTest {
                 "INSERT INTO masters (id, user_id, master_type, avg_rating, review_count, is_active, created_at, updated_at) "
                         + "VALUES (?, ?, 'INDEPENDENT_MASTER', 0.00, 0, true, NOW(), NOW())",
                 masterId, userId);
+        // Favourites list only bookable masters (hours + active service, 2026-10-05).
+        BookableMasterSeeder.seedUsableSchedule(jdbcTemplate, masterId);
         return masterId;
     }
 
     private UUID createIndependentMasterService(UUID masterId) {
-        UUID userId = jdbcTemplate.queryForObject(
-                "SELECT user_id FROM masters WHERE id = ?", UUID.class, masterId);
+        // owner_id = masters.id — the production shape (ServiceCatalogService#addIndependentMasterService);
+        // the former users.id key was a stale fixture the bookability ownership rule rejects.
         UUID serviceDefId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO service_definitions "
                         + "(id, owner_type, owner_id, name, service_type_id, base_duration_minutes, base_price, "
                         + "buffer_minutes_after, is_active, created_at, updated_at) "
                         + "VALUES (?, 'INDEPENDENT_MASTER', ?, 'Test Service', ?, 60, 500.00, 0, true, NOW(), NOW())",
-                serviceDefId, userId, resolveUnusedServiceTypeId("INDEPENDENT_MASTER", userId));
+                serviceDefId, masterId, resolveUnusedServiceTypeId("INDEPENDENT_MASTER", masterId));
         UUID masterServiceId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) "
@@ -1177,6 +1205,8 @@ class FavoriteMigrationIT extends AbstractIntegrationTest {
                         + "is_active, created_at, updated_at) "
                         + "VALUES (?, ?, ?, 'SALON_MASTER', 0.00, 0, true, NOW(), NOW())",
                 masterId, userId, salonId);
+        // Favourites list only bookable masters/salons (hours + active service, 2026-10-05).
+        BookableMasterSeeder.seedUsableSchedule(jdbcTemplate, masterId);
         return masterId;
     }
 

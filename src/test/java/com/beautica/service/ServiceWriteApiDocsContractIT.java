@@ -77,7 +77,7 @@ class ServiceWriteApiDocsContractIT extends AbstractIntegrationTest {
             "post,  /api/v1/salons/{salonId}/masters/{masterId}/services/bulk,  409",
             "patch, /api/v1/services/{serviceDefId},                            409",
             "post,  /api/v1/salons/{salonId}/masters/{masterId}/services,       409",
-            "patch, /api/v1/services/{serviceDefId}/photo,                      429"
+            "post,  /api/v1/services/{serviceDefId}/photo,                       429"
     })
     @DisplayName("each typed service write endpoint documents a schema-bearing 200 response")
     void should_documentTypedSuccessBody_when_writeEndpointAlsoDeclaresErrorResponse(
