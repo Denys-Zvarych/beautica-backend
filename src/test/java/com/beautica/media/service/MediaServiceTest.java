@@ -123,6 +123,7 @@ class MediaServiceTest {
     @Mock private Cache portfolioCache;
     @Mock private com.beautica.service.repository.ServiceRepository serviceRepo;
     @Mock private com.beautica.service.service.ServiceCatalogService serviceCatalogService;
+    @Mock private com.beautica.common.security.AuthorizationService authz;
     @Mock private com.beautica.service.service.ServicePhotoBlobPurger servicePhotoBlobPurger;
     @Mock private com.beautica.common.cache.UserProfileCacheEvictor userProfileCacheEvictor;
     @Mock private com.beautica.common.cache.MasterProfileCacheEvictor masterProfileCacheEvictor;
@@ -171,13 +172,15 @@ class MediaServiceTest {
         lenient().when(cacheManager.getCache("portfolio")).thenReturn(portfolioCache);
         lenient().when(portfolioCache.evictIfPresent(any())).thenReturn(true);
         service = new MediaService(r2, mediaRepo, userRepo, salonRepo, masterRepo, fixedClock, txRead, txWrite, cacheManager,
-                serviceRepo, serviceCatalogService, servicePhotoBlobPurger,
+                serviceRepo, serviceCatalogService, authz, servicePhotoBlobPurger,
                 new AfterCommitBlobPurger(r2, new SyncTaskExecutor(),
                         new io.micrometer.core.instrument.simple.SimpleMeterRegistry()),
                 userProfileCacheEvictor, masterProfileCacheEvictor);
     }
 
     private static final UUID MASTER_ID_FOR_PURGE = UUID.randomUUID();
+    /** Principal passed to the service-photo writes; {@code authz} is a no-op mock unless a test stubs it. */
+    private static final UUID ACTOR_ID = UUID.randomUUID();
 
     /** The storage-enabled probe ({@code isEnabled}) is allowed; any blob write/delete is not. */
     private void verifyNoStorageWrites() {
@@ -564,7 +567,7 @@ class MediaServiceTest {
             return null;
         }).when(throwingPurger).purgeAfterCommit(anyCollection(), anyString());
         MediaService withThrowingPurge = new MediaService(r2, mediaRepo, userRepo, salonRepo, masterRepo, fixedClock,
-                txRead, txWrite, cacheManager, serviceRepo, serviceCatalogService, servicePhotoBlobPurger,
+                txRead, txWrite, cacheManager, serviceRepo, serviceCatalogService, authz, servicePhotoBlobPurger,
                 throwingPurger, new UserProfileCacheEvictor(cacheManager), new MasterProfileCacheEvictor(cacheManager));
 
         assertThatThrownBy(() -> withThrowingPurge.deleteAvatar(userId))
@@ -626,7 +629,7 @@ class MediaServiceTest {
         lenient().when(cacheManager.getCache(SearchCacheNames.MASTERS_BROWSE)).thenReturn(browse);
         lenient().when(cacheManager.getCache(SearchCacheNames.MASTERS_QUERY)).thenReturn(query);
         MediaService withRealEvictors = new MediaService(r2, mediaRepo, userRepo, salonRepo, masterRepo, fixedClock,
-                txRead, txWrite, cacheManager, serviceRepo, serviceCatalogService, servicePhotoBlobPurger,
+                txRead, txWrite, cacheManager, serviceRepo, serviceCatalogService, authz, servicePhotoBlobPurger,
                 new AfterCommitBlobPurger(r2, new SyncTaskExecutor(),
                         new io.micrometer.core.instrument.simple.SimpleMeterRegistry()),
                 new UserProfileCacheEvictor(cacheManager), new MasterProfileCacheEvictor(cacheManager));
@@ -1644,7 +1647,7 @@ class MediaServiceTest {
         var def = definition(id, null, null);
         givenActiveLockedDefinition(id, def);
 
-        var response = service.uploadServicePhoto(id, jpegFile());
+        var response = service.uploadServicePhoto(ACTOR_ID, id, jpegFile());
 
         assertThat(def.getPhotoR2Key()).startsWith("services/" + id + "/").endsWith(".jpg");
         assertThat(def.getPhotoUrl()).isEqualTo("https://cdn.test/" + def.getPhotoR2Key());
@@ -1662,7 +1665,7 @@ class MediaServiceTest {
         var def = definition(id, "https://cdn.test/" + oldKey, oldKey);
         givenActiveLockedDefinition(id, def);
 
-        service.uploadServicePhoto(id, jpegFile());
+        service.uploadServicePhoto(ACTOR_ID, id, jpegFile());
 
         var order = inOrder(r2, serviceRepo, servicePhotoBlobPurger);
         order.verify(r2).uploadFile(anyString(), any(), anyLong(), eq("image/jpeg"));
@@ -1679,7 +1682,7 @@ class MediaServiceTest {
         var def = definition(id, "https://legacy.test/p.jpg", null);
         givenActiveLockedDefinition(id, def);
 
-        service.uploadServicePhoto(id, jpegFile());
+        service.uploadServicePhoto(ACTOR_ID, id, jpegFile());
 
         verify(r2, never()).deleteFile(any());
         verify(servicePhotoBlobPurger).purgeAfterCommit(id, null);
@@ -1696,7 +1699,7 @@ class MediaServiceTest {
         givenActiveLockedDefinition(id, def);
         doThrow(new IllegalStateException("r2 down")).when(r2).uploadFile(anyString(), any(), anyLong(), anyString());
 
-        assertThatThrownBy(() -> service.uploadServicePhoto(id, jpegFile()))
+        assertThatThrownBy(() -> service.uploadServicePhoto(ACTOR_ID, id, jpegFile()))
                 .isInstanceOf(IllegalStateException.class);
 
         assertThat(def.getPhotoR2Key()).isEqualTo(oldKey);
@@ -1715,7 +1718,7 @@ class MediaServiceTest {
         givenActiveLockedDefinition(id, def);
         when(serviceRepo.save(def)).thenThrow(new IllegalStateException("db down"));
 
-        assertThatThrownBy(() -> service.uploadServicePhoto(id, jpegFile()))
+        assertThatThrownBy(() -> service.uploadServicePhoto(ACTOR_ID, id, jpegFile()))
                 .isInstanceOf(IllegalStateException.class);
 
         String uploadedKey = capturedUploadedKey();
@@ -1740,7 +1743,7 @@ class MediaServiceTest {
         }).when(txWrite).execute(any());
         when(serviceRepo.findById(id)).thenReturn(Optional.of(def));
 
-        assertThatThrownBy(() -> service.uploadServicePhoto(id, jpegFile()))
+        assertThatThrownBy(() -> service.uploadServicePhoto(ACTOR_ID, id, jpegFile()))
                 .isInstanceOf(IllegalStateException.class);
 
         assertThat(def.getPhotoR2Key()).isEqualTo(capturedUploadedKey());
@@ -1757,7 +1760,7 @@ class MediaServiceTest {
         when(serviceRepo.save(def)).thenThrow(new IllegalStateException("db down"));
         when(serviceRepo.findById(id)).thenThrow(new IllegalStateException("db still down"));
 
-        assertThatThrownBy(() -> service.uploadServicePhoto(id, jpegFile()))
+        assertThatThrownBy(() -> service.uploadServicePhoto(ACTOR_ID, id, jpegFile()))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessage("db down");
 
@@ -1773,7 +1776,7 @@ class MediaServiceTest {
         var def = definition(id, "https://cdn.test/" + oldKey, oldKey, false);
         givenActiveLockedDefinition(id, def);
 
-        assertThatThrownBy(() -> service.uploadServicePhoto(id, jpegFile()))
+        assertThatThrownBy(() -> service.uploadServicePhoto(ACTOR_ID, id, jpegFile()))
                 .isInstanceOf(NotFoundException.class);
 
         String uploadedKey = capturedUploadedKey();
@@ -1793,9 +1796,9 @@ class MediaServiceTest {
 
         // Both uploads pass the read-gate and upload before either write; the row lock then serialises the
         // writes, so the second one reads the CURRENT key (the first writer's), not the original.
-        service.uploadServicePhoto(id, jpegFile());
+        service.uploadServicePhoto(ACTOR_ID, id, jpegFile());
         String firstKey = def.getPhotoR2Key();
-        service.uploadServicePhoto(id, jpegFile());
+        service.uploadServicePhoto(ACTOR_ID, id, jpegFile());
         String secondKey = def.getPhotoR2Key();
 
         assertThat(firstKey).isNotEqualTo(originalKey);
@@ -1811,7 +1814,7 @@ class MediaServiceTest {
     void uploadServicePhoto_whenStorageDisabled_throws503BeforeAnyDelete() {
         when(r2.isEnabled()).thenReturn(false);
 
-        assertThatThrownBy(() -> service.uploadServicePhoto(UUID.randomUUID(), jpegFile()))
+        assertThatThrownBy(() -> service.uploadServicePhoto(ACTOR_ID, UUID.randomUUID(), jpegFile()))
                 .isInstanceOfSatisfying(BusinessException.class, ex ->
                         assertThat(ex.getStatus()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE));
 
@@ -1825,7 +1828,7 @@ class MediaServiceTest {
         UUID id = UUID.randomUUID();
         when(serviceRepo.findIdIfDefinitionAndOwnerActive(id)).thenReturn(Optional.empty());
 
-        assertThatThrownBy(() -> service.uploadServicePhoto(id, jpegFile()))
+        assertThatThrownBy(() -> service.uploadServicePhoto(ACTOR_ID, id, jpegFile()))
                 .isInstanceOf(NotFoundException.class);
 
         verifyNoStorageWrites();
@@ -1838,7 +1841,7 @@ class MediaServiceTest {
         var svg = new MockMultipartFile("file", "a.svg", "image/svg+xml",
                 "<svg xmlns=\"http://www.w3.org/2000/svg\"/>".getBytes(StandardCharsets.UTF_8));
 
-        assertThatThrownBy(() -> service.uploadServicePhoto(UUID.randomUUID(), svg))
+        assertThatThrownBy(() -> service.uploadServicePhoto(ACTOR_ID, UUID.randomUUID(), svg))
                 .isInstanceOfSatisfying(BusinessException.class, ex ->
                         assertThat(ex.getStatus()).isEqualTo(HttpStatus.BAD_REQUEST));
 
@@ -1854,7 +1857,7 @@ class MediaServiceTest {
         var def = definition(id, "https://cdn.test/" + key, key);
         givenActiveLockedDefinition(id, def);
 
-        service.deleteServicePhoto(id);
+        service.deleteServicePhoto(ACTOR_ID, id);
 
         assertThat(def.getPhotoR2Key()).isNull();
         assertThat(def.getPhotoUrl()).isNull();
@@ -1872,7 +1875,7 @@ class MediaServiceTest {
         var def = definition(id, "https://legacy.test/p.jpg", null);
         givenActiveLockedDefinition(id, def);
 
-        service.deleteServicePhoto(id);
+        service.deleteServicePhoto(ACTOR_ID, id);
 
         assertThat(def.getPhotoUrl()).isNull();
         verify(serviceRepo).save(def);
@@ -1887,7 +1890,7 @@ class MediaServiceTest {
         UUID id = UUID.randomUUID();
         givenActiveLockedDefinition(id, definition(id, null, null));
 
-        service.deleteServicePhoto(id);
+        service.deleteServicePhoto(ACTOR_ID, id);
 
         verifyNoStorageWrites();
         verify(serviceRepo, never()).save(any());
@@ -1900,7 +1903,7 @@ class MediaServiceTest {
         UUID id = UUID.randomUUID();
         when(serviceRepo.findIdIfDefinitionAndOwnerActive(id)).thenReturn(Optional.empty());
 
-        assertThatThrownBy(() -> service.deleteServicePhoto(id)).isInstanceOf(NotFoundException.class);
+        assertThatThrownBy(() -> service.deleteServicePhoto(ACTOR_ID, id)).isInstanceOf(NotFoundException.class);
 
         verify(serviceRepo, never()).save(any());
         verifyNoInteractions(serviceCatalogService, servicePhotoBlobPurger);
@@ -1914,10 +1917,39 @@ class MediaServiceTest {
         var def = definition(id, "https://cdn.test/" + key, key, false);
         givenActiveLockedDefinition(id, def);
 
-        assertThatThrownBy(() -> service.deleteServicePhoto(id)).isInstanceOf(NotFoundException.class);
+        assertThatThrownBy(() -> service.deleteServicePhoto(ACTOR_ID, id)).isInstanceOf(NotFoundException.class);
 
         assertThat(def.getPhotoR2Key()).isEqualTo(key);
         verifyNoInteractions(servicePhotoBlobPurger, serviceCatalogService);
+    }
+
+    @Test
+    @DisplayName("uploadServicePhoto refuses a SALON_ADMIN on an owner-performed definition before any storage or DB work (Phase 345)")
+    void should_throwForbidden_when_adminUploadsPhotoForOwnerAssignedDefinition() {
+        UUID id = UUID.randomUUID();
+        doThrow(new ForbiddenException("owner-performed")).when(authz).enforceCanManageServiceDefinition(ACTOR_ID, id);
+
+        assertThatThrownBy(() -> service.uploadServicePhoto(ACTOR_ID, id, jpegFile()))
+                .isInstanceOf(ForbiddenException.class)
+                .hasMessage("owner-performed");
+
+        verify(r2, never()).isEnabled();
+        verifyNoStorageWrites();
+        verifyNoInteractions(serviceRepo, serviceCatalogService, servicePhotoBlobPurger);
+    }
+
+    @Test
+    @DisplayName("deleteServicePhoto refuses a SALON_ADMIN on an owner-performed definition before any DB work (Phase 345)")
+    void should_throwForbidden_when_adminDeletesPhotoForOwnerAssignedDefinition() {
+        UUID id = UUID.randomUUID();
+        doThrow(new ForbiddenException("owner-performed")).when(authz).enforceCanManageServiceDefinition(ACTOR_ID, id);
+
+        assertThatThrownBy(() -> service.deleteServicePhoto(ACTOR_ID, id))
+                .isInstanceOf(ForbiddenException.class)
+                .hasMessage("owner-performed");
+
+        verifyNoStorageWrites();
+        verifyNoInteractions(serviceRepo, serviceCatalogService, servicePhotoBlobPurger, txWrite);
     }
 
     private static MockMultipartFile jpegFile() {

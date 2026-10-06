@@ -3,6 +3,7 @@ package com.beautica.media.service;
 import com.beautica.common.cache.MasterProfileCacheEvictor;
 import com.beautica.common.cache.UserProfileCacheEvictor;
 import com.beautica.common.exception.BusinessException;
+import com.beautica.common.security.AuthorizationService;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.media.repository.MediaRepository;
 import com.beautica.salon.dto.SalonResponse;
@@ -93,7 +94,7 @@ class MediaServiceSalonImageTest {
         service = new MediaService(r2, mock(MediaRepository.class), mock(UserRepository.class), salonRepo,
                 mock(MasterRepository.class), Clock.fixed(Instant.parse("2026-10-04T10:00:00Z"), ZoneOffset.UTC),
                 txRead, txWrite, mock(CacheManager.class), mock(ServiceRepository.class),
-                mock(ServiceCatalogService.class), mock(ServicePhotoBlobPurger.class),
+                mock(ServiceCatalogService.class), mock(AuthorizationService.class), mock(ServicePhotoBlobPurger.class),
                 new AfterCommitBlobPurger(r2, new SyncTaskExecutor(), new SimpleMeterRegistry()),
                 mock(UserProfileCacheEvictor.class), mock(MasterProfileCacheEvictor.class), salonService);
     }

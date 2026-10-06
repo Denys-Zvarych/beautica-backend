@@ -30,7 +30,7 @@ import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-class ServiceTestFixtures {
+public class ServiceTestFixtures {
 
     static final String TEST_PASSWORD = "Str0ngP@ss1!";
 
@@ -39,7 +39,7 @@ class ServiceTestFixtures {
     private final ObjectMapper objectMapper;
     private final PasswordEncoder passwordEncoder;
 
-    ServiceTestFixtures(
+    public ServiceTestFixtures(
             TestRestTemplate restTemplate,
             JdbcTemplate jdbcTemplate,
             ObjectMapper objectMapper,
@@ -51,7 +51,7 @@ class ServiceTestFixtures {
         this.passwordEncoder = passwordEncoder;
     }
 
-    String createSalonOwnerAndGetToken(String email) throws Exception {
+    public String createSalonOwnerAndGetToken(String email) throws Exception {
         String hash = passwordEncoder.encode(TEST_PASSWORD);
         jdbcTemplate.update(
                 "INSERT INTO users (id, email, password_hash, role, is_active, email_verified) VALUES (?, ?, ?, 'SALON_OWNER', true, true)",
@@ -64,7 +64,7 @@ class ServiceTestFixtures {
         return body.data().accessToken();
     }
 
-    UUID createSalon(String ownerToken, String name) throws Exception {
+    public UUID createSalon(String ownerToken, String name) throws Exception {
         // Vinnytsia has no urban districts in the official KATOTTH classifier, so
         // no districtId is required — only cityId is mandatory for provider locality.
         UUID cityId = LocalityTestLookup.majorCityIdByName(jdbcTemplate, "Вінниця");
@@ -104,7 +104,7 @@ class ServiceTestFixtures {
         return salonId;
     }
 
-    UUID createSalonMaster(UUID salonId) {
+    public UUID createSalonMaster(UUID salonId) {
         UUID masterUserId = UUID.randomUUID();
         String masterEmail = "master-" + UUID.randomUUID() + "@beautica.test";
         String hash = passwordEncoder.encode(TEST_PASSWORD);
@@ -130,7 +130,7 @@ class ServiceTestFixtures {
         return parsed.data().id();
     }
 
-    UUID createServiceDefinition(String ownerToken, UUID salonId, String name) throws Exception {
+    public UUID createServiceDefinition(String ownerToken, UUID salonId, String name) throws Exception {
         UUID serviceTypeId = resolveServiceTypeIdForCategory("NAIL_SERVICE");
         return createServiceDefinition(ownerToken, salonId,
                 new CreateServiceDefinitionRequest(name, null, "NAIL_SERVICE", 60, 0,
@@ -188,7 +188,7 @@ class ServiceTestFixtures {
      * canManageSalon resolves the admin's authority via users.salon_id, so the assignment
      * must be persisted for the on-behalf bulk endpoint to authorize the admin.
      */
-    String createSalonAdminAndGetToken(UUID salonId, String email) throws Exception {
+    public String createSalonAdminAndGetToken(UUID salonId, String email) throws Exception {
         String hash = passwordEncoder.encode(TEST_PASSWORD);
         jdbcTemplate.update(
                 "INSERT INTO users (id, email, password_hash, role, salon_id, is_active, email_verified) "
@@ -258,7 +258,7 @@ class ServiceTestFixtures {
     }
 
     /** Seeds an email-verified CLIENT and logs in, returning a fresh access token. */
-    String createClientAndGetToken(String email) throws Exception {
+    public String createClientAndGetToken(String email) throws Exception {
         jdbcTemplate.update(
                 "INSERT INTO users (id, email, password_hash, role, is_active, email_verified) "
                         + "VALUES (?, ?, ?, 'CLIENT', true, true)",
@@ -289,7 +289,7 @@ class ServiceTestFixtures {
     }
 
     /** Resolves the master row id created when an independent master registers (1:1 with the user). */
-    UUID resolveMasterIdForUserEmail(String email) {
+    public UUID resolveMasterIdForUserEmail(String email) {
         return jdbcTemplate.queryForObject(
                 "SELECT m.id FROM masters m JOIN users u ON u.id = m.user_id WHERE u.email = ?",
                 UUID.class, email);
@@ -301,7 +301,7 @@ class ServiceTestFixtures {
      * selectable for the bulk-create flow. Distinct categories preferred is not required;
      * the test only needs valid, resolvable ids.
      */
-    java.util.List<SeededServiceType> activeSelectableServiceTypes(int limit) {
+    public java.util.List<SeededServiceType> activeSelectableServiceTypes(int limit) {
         return jdbcTemplate.query(
                 "SELECT st.id, st.name_uk, st.platform_category_name "
                         + "FROM service_types st "
@@ -379,7 +379,7 @@ class ServiceTestFixtures {
                 "SELECT min_effective_price FROM masters WHERE id = ?", BigDecimal.class, masterId);
     }
 
-    record SeededServiceType(UUID id, String nameUk, String platformCategoryName) {
+    public record SeededServiceType(UUID id, String nameUk, String platformCategoryName) {
     }
 
     /**
@@ -439,7 +439,7 @@ class ServiceTestFixtures {
         }
     }
 
-    HttpHeaders bearerHeaders(String token) {
+    public HttpHeaders bearerHeaders(String token) {
         HttpHeaders headers = new HttpHeaders();
         headers.setBearerAuth(token);
         headers.setContentType(MediaType.APPLICATION_JSON);

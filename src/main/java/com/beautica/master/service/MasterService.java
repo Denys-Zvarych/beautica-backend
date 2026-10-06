@@ -415,10 +415,13 @@ public class MasterService {
             }
         }
 
-        // Ownership already enforced by @PreAuthorize("@authz.canManageMasterSchedule(...)") on
-        // the controller — no redundant DB round-trip needed here.
+        // Controller gate: @PreAuthorize("@authz.canManageMasterSchedule(...)"). Re-proved here
+        // against the loaded row (Phase 345 audit, defense-in-depth): the graph load already holds
+        // user + salon, so the check costs no query on the owner/independent arms — and it keeps
+        // a SALON_ADMIN off the salon owner's own row even if the controller gate drifts.
         var master = masterRepository.findByIdWithUserAndSalon(masterId)
                 .orElseThrow(() -> new NotFoundException("Master not found"));
+        authorizationService.enforceCanManageMasterSchedule(actorId, master);
 
         // Merge against ALL existing rows (incl. inactive). The DB unique key is
         // (master_id, day_of_week) unconditionally, so matching only active rows would miss a

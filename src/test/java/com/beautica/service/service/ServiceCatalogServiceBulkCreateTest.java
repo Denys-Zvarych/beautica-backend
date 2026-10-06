@@ -451,6 +451,29 @@ class ServiceCatalogServiceBulkCreateTest {
         verify(masterServiceRepository, never()).existsActiveServiceForMaster(any());
     }
 
+    @Test
+    @DisplayName("salon on-behalf bulk — Phase 345: the owner-row guard's 403 propagates before any "
+            + "service-type lookup or write (SALON_ADMIN on the owner's own row)")
+    void should_throwForbidden_when_ownerRowGuardDeniesBulk() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        Salon salon = org.mockito.Mockito.mock(Salon.class);
+        when(salon.getId()).thenReturn(salonId);
+        Master master = org.mockito.Mockito.mock(Master.class);
+        when(master.getSalon()).thenReturn(salon);
+        when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
+        org.mockito.Mockito.doThrow(new ForbiddenException("Access denied"))
+                .when(authz).enforceOwnerMasterRowWritableByOwnerOnly(ACTOR_ID, master);
+        var request = new BulkCreateServicesRequest(List.of(fixedItem(UUID.randomUUID(), 45, "250.00")));
+
+        assertThatThrownBy(() ->
+                serviceCatalogService.bulkCreateSalonMasterServices(ACTOR_ID, salonId, masterId, request))
+                .isInstanceOf(ForbiddenException.class);
+
+        org.mockito.Mockito.verifyNoInteractions(serviceTypeRepository, serviceRepository);
+        verify(masterServiceRepository, never()).save(any());
+    }
+
     // ── Phase 302 D2/D3/D4 — salon-owned definitions are REUSED, never duplicated ──
 
     /** A master row already bound to {@code salonId}, as the on-behalf path resolves it. */

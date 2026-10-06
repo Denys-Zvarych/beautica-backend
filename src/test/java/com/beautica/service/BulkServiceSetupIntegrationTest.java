@@ -1764,7 +1764,7 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
                 String.class);
 
         assertThat(adminPatch.getStatusCode())
-                .as("Phase 306 D3: canManageServiceDefinition resolves a SALON_ADMIN of the owning "
+                .as("Phase 306 D3: enforceCanManageServiceDefinition resolves a SALON_ADMIN of the owning "
                         + "salon through hasManagementAccess, not the stale identity check")
                 .isEqualTo(HttpStatus.OK);
         assertThat(definitionRow(defId))

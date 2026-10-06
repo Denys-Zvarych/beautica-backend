@@ -7,6 +7,7 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.exception.ServiceUnavailableMessages;
+import com.beautica.common.security.AuthorizationService;
 import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.media.dto.AvatarResponse;
@@ -148,6 +149,8 @@ public class MediaService {
     private final CacheManager cacheManager;
     private final ServiceRepository serviceRepo;
     private final ServiceCatalogService serviceCatalogService;
+    /** Phase 345: service-layer ownership + owner-performed catalogue gate on the service-photo writes. */
+    private final AuthorizationService authz;
     private final ServicePhotoBlobPurger servicePhotoBlobPurger;
     private final AfterCommitBlobPurger afterCommitBlobPurger;
     private final UserProfileCacheEvictor userProfileCacheEvictor;
@@ -170,6 +173,7 @@ public class MediaService {
                         CacheManager cacheManager,
                         ServiceRepository serviceRepo,
                         ServiceCatalogService serviceCatalogService,
+                        AuthorizationService authz,
                         ServicePhotoBlobPurger servicePhotoBlobPurger,
                         AfterCommitBlobPurger afterCommitBlobPurger,
                         UserProfileCacheEvictor userProfileCacheEvictor,
@@ -189,6 +193,7 @@ public class MediaService {
         this.cacheManager = cacheManager;
         this.serviceRepo = serviceRepo;
         this.serviceCatalogService = serviceCatalogService;
+        this.authz = authz;
         this.servicePhotoBlobPurger = servicePhotoBlobPurger;
         this.afterCommitBlobPurger = afterCommitBlobPurger;
         this.userProfileCacheEvictor = userProfileCacheEvictor;
@@ -212,12 +217,13 @@ public class MediaService {
                  CacheManager cacheManager,
                  ServiceRepository serviceRepo,
                  ServiceCatalogService serviceCatalogService,
+                 AuthorizationService authz,
                  ServicePhotoBlobPurger servicePhotoBlobPurger,
                  AfterCommitBlobPurger afterCommitBlobPurger,
                  UserProfileCacheEvictor userProfileCacheEvictor,
                  MasterProfileCacheEvictor masterProfileCacheEvictor) {
         this(r2, mediaRepo, userRepo, salonRepo, masterRepo, clock, txRead, txWrite, cacheManager, serviceRepo,
-                serviceCatalogService, servicePhotoBlobPurger, afterCommitBlobPurger, userProfileCacheEvictor,
+                serviceCatalogService, authz, servicePhotoBlobPurger, afterCommitBlobPurger, userProfileCacheEvictor,
                 masterProfileCacheEvictor, null);
     }
 
@@ -233,6 +239,7 @@ public class MediaService {
                  CacheManager cacheManager,
                  ServiceRepository serviceRepo,
                  ServiceCatalogService serviceCatalogService,
+                 AuthorizationService authz,
                  ServicePhotoBlobPurger servicePhotoBlobPurger,
                  AfterCommitBlobPurger afterCommitBlobPurger,
                  UserProfileCacheEvictor userProfileCacheEvictor,
@@ -249,6 +256,7 @@ public class MediaService {
         this.cacheManager = cacheManager;
         this.serviceRepo = serviceRepo;
         this.serviceCatalogService = serviceCatalogService;
+        this.authz = authz;
         this.servicePhotoBlobPurger = servicePhotoBlobPurger;
         this.afterCommitBlobPurger = afterCommitBlobPurger;
         this.userProfileCacheEvictor = userProfileCacheEvictor;
@@ -412,8 +420,8 @@ public class MediaService {
     // ----------------------------------------------------------- service photo
 
     /**
-     * Sets or replaces the single photo of a service definition (Phase 342). Authorization
-     * ({@code canManageServiceDefinition}) is enforced by the controller's {@code @PreAuthorize}; an
+     * Sets or replaces the single photo of a service definition (Phase 342). Authorization is a
+     * role gate on the controller plus {@code enforceCanManageServiceDefinition} below; an
      * inactive definition (or one whose salon is inactive) answers 404 like every other service endpoint.
      *
      * <p><b>Deliberately NOT the avatar flow's "SEC-2 ordering"</b> (delete old blob, upload new, write
@@ -435,7 +443,11 @@ public class MediaService {
      * Because unique keys are never reused and every committed writer deletes the key it replaced under
      * the row lock, N concurrent uploads leave exactly one live blob.
      */
-    public ServiceDefinitionResponse uploadServicePhoto(UUID serviceDefId, MultipartFile file) {
+    public ServiceDefinitionResponse uploadServicePhoto(UUID actorId, UUID serviceDefId, MultipartFile file) {
+        // Phase 345: ownership + SALON_ADMIN owner-performed gate at the service layer — the controller is
+        // role-only (anti-bug §D), so a non-HTTP caller cannot bypass it. Runs before the storage probe so a
+        // forbidden caller never learns whether storage is enabled.
+        authz.enforceCanManageServiceDefinition(actorId, serviceDefId);
         requireStorageEnabled();
         try (SniffedUpload upload = openAndSniff(file)) {
             return uploadServicePhotoSniffed(serviceDefId, file, upload);
@@ -482,7 +494,9 @@ public class MediaService {
      * orphan) and never a live pointer to a deleted blob. A legacy row (URL, no key) has its URL cleared
      * and nothing deleted in R2.
      */
-    public void deleteServicePhoto(UUID serviceDefId) {
+    public void deleteServicePhoto(UUID actorId, UUID serviceDefId) {
+        // Phase 345: same service-layer gate as uploadServicePhoto (controller is role-only).
+        authz.enforceCanManageServiceDefinition(actorId, serviceDefId);
         requireActiveServiceDefinition(serviceDefId);
 
         PhotoCleared cleared = txWrite.execute(status -> {

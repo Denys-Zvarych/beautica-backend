@@ -56,12 +56,12 @@ public interface ServiceRepository extends JpaRepository<ServiceDefinition, UUID
 
     /**
      * Resolves the {@link ServiceOwnerAccess} projection in a single query, avoiding the
-     * two-query chain (load ServiceDefinition + load Salon or Master) previously used in
-     * AuthorizationService.canManageServiceDefinition.
+     * two-query chain (load ServiceDefinition + load Salon or Master) previously used by the
+     * service-definition ownership gate (now {@code AuthorizationService.enforceCanManageServiceDefinition}).
      *
      * <p>Phase 306 D3 — extended beyond the bare owner user UUID to also project the definition's
-     * salon id (see {@link ServiceOwnerAccess}), so {@code canManageServiceDefinition} and
-     * {@code enforceCanManageServiceDefinition} can resolve a SALON_ADMIN via salon-management
+     * salon id (see {@link ServiceOwnerAccess}), so {@code enforceCanManageServiceDefinition}
+     * can resolve a SALON_ADMIN via salon-management
      * access in the SAME query, not a second round-trip.
      *
      * <p>{@code salonId} and {@code salonOwnerId} ride for free on the existing {@code Salon s}

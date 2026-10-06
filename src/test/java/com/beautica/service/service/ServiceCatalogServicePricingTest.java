@@ -93,8 +93,14 @@ class ServiceCatalogServicePricingTest {
     @Mock
     private com.beautica.master.service.MasterSearchVisibilityGuard searchVisibilityGuard;
 
+    @Mock
+    private com.beautica.common.security.AuthorizationService authz;
+
     @InjectMocks
     private ServiceCatalogService serviceCatalogService;
+
+    /** Principal passed to {@code updateServiceDefinition}; {@code authz} is a no-op mock unless stubbed. */
+    private static final UUID ACTOR_ID = UUID.randomUUID();
 
     /**
      * Stubs an active MANICURE {@link com.beautica.service.entity.ServiceType} so a create request
@@ -235,7 +241,7 @@ class ServiceCatalogServicePricingTest {
                 null, null, null, null, null,
                 PriceType.RANGE, null, new BigDecimal("600.00"), new BigDecimal("1000.00"), null);
 
-        serviceCatalogService.updateServiceDefinition(serviceDefId, request);
+        serviceCatalogService.updateServiceDefinition(ACTOR_ID, serviceDefId, request);
 
         ArgumentCaptor<ServiceDefinition> captor = ArgumentCaptor.forClass(ServiceDefinition.class);
         verify(serviceRepository).saveAndFlush(captor.capture());
@@ -276,7 +282,7 @@ class ServiceCatalogServicePricingTest {
         var request = new UpdateServiceDefinitionRequest(
                 "New Manicure", null, null, null, null, null, null, null, null, null);
 
-        serviceCatalogService.updateServiceDefinition(serviceDefId, request);
+        serviceCatalogService.updateServiceDefinition(ACTOR_ID, serviceDefId, request);
 
         ArgumentCaptor<ServiceDefinition> captor = ArgumentCaptor.forClass(ServiceDefinition.class);
         verify(serviceRepository).saveAndFlush(captor.capture());
@@ -319,7 +325,7 @@ class ServiceCatalogServicePricingTest {
                 null, null, null, null, null,
                 PriceType.RANGE, null, new BigDecimal("900.00"), new BigDecimal("1800.00"), null);
 
-        serviceCatalogService.updateServiceDefinition(serviceDefId, request);
+        serviceCatalogService.updateServiceDefinition(ACTOR_ID, serviceDefId, request);
 
         ArgumentCaptor<ServiceDefinition> captor = ArgumentCaptor.forClass(ServiceDefinition.class);
         verify(serviceRepository).saveAndFlush(captor.capture());

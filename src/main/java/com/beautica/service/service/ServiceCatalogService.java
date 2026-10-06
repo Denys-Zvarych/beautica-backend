@@ -165,9 +165,16 @@ public class ServiceCatalogService {
 
     @Transactional
     public MasterServiceResponse assignServiceToMaster(
+            UUID actorId,
             UUID salonId,
             UUID masterId,
             AssignServiceToMasterRequest request) {
+
+        // Defense-in-depth (Phase 345 audit) — re-prove the controller's
+        // @PreAuthorize("@authz.canManageSalon(...)") gate from the caller-supplied actorId before
+        // loading anything, exactly as unassignServiceFromMaster / bulkCreateSalonMasterServices do.
+        // Memoised: the SpEL gate's owner read is not repeated.
+        authz.enforceCanManageSalon(actorId, salonId);
 
         // Type-agnostic: accepts SALON_MASTER, SALON_OWNER, and INDEPENDENT_MASTER rows equally.
         // A SALON_OWNER-type master row has salon_id = the owner's salon, so the salon-membership
@@ -178,6 +185,8 @@ public class ServiceCatalogService {
         if (master.getSalon() == null || !master.getSalon().getId().equals(salonId)) {
             throw new ForbiddenException("Access denied");
         }
+        // Phase 345 — the salon owner's own row is the owner's alone (a SALON_ADMIN is 403 here).
+        authz.enforceOwnerMasterRowWritableByOwnerOnly(actorId, master);
 
         ServiceDefinition serviceDef = serviceRepository.findByIdWithServiceType(request.serviceDefId())
                 .orElseThrow(() -> new NotFoundException("Service definition not found: " + request.serviceDefId()));
@@ -324,6 +333,8 @@ public class ServiceCatalogService {
         if (master.getSalon() == null || !master.getSalon().getId().equals(salonId)) {
             throw new ForbiddenException("Access denied");
         }
+        // Phase 345 — the salon owner's own row is the owner's alone (a SALON_ADMIN is 403 here).
+        authz.enforceOwnerMasterRowWritableByOwnerOnly(actorId, master);
         ServiceDefinition serviceDef = assignment.getServiceDefinition();
         if (serviceDef.getOwnerType() != OwnerType.SALON || !serviceDef.getOwnerId().equals(salonId)) {
             throw new ForbiddenException("Service definition does not belong to this salon");
@@ -466,6 +477,8 @@ public class ServiceCatalogService {
         if (master.getSalon() == null || !master.getSalon().getId().equals(salonId)) {
             throw new ForbiddenException("Access denied");
         }
+        // Phase 345 — the salon owner's own row is the owner's alone (a SALON_ADMIN is 403 here).
+        authz.enforceOwnerMasterRowWritableByOwnerOnly(actorId, master);
 
         ServiceDefinition serviceDef = assignment.getServiceDefinition();
         if (serviceDef.getOwnerType() != OwnerType.SALON || !serviceDef.getOwnerId().equals(salonId)) {
@@ -673,6 +686,8 @@ public class ServiceCatalogService {
         if (master.getSalon() == null || !master.getSalon().getId().equals(salonId)) {
             throw new ForbiddenException("Access denied");
         }
+        // Phase 345 — the salon owner's own row is the owner's alone (a SALON_ADMIN is 403 here).
+        authz.enforceOwnerMasterRowWritableByOwnerOnly(actorId, master);
 
         return bulkCreateForMaster(master, OwnerType.SALON, salonId, request);
     }
@@ -1351,17 +1366,18 @@ public class ServiceCatalogService {
      * Applies a partial update to a {@link ServiceDefinition}.
      *
      * <p>Only non-null fields in the request are written; null fields are treated as
-     * "no change". Ownership is verified by the {@code @PreAuthorize} guard on the
-     * controller — callers must enforce the same guard.
+     * "no change". The controller applies the role-only fast gate; ownership (plus the Phase 345
+     * owner-performed catalogue gate for {@code SALON_ADMIN}) is enforced here first via
+     * {@code enforceCanManageServiceDefinition} — same split as {@link #deactivateServiceDefinition}.
      *
      * <p>After the update commits, the {@code masterServices} cache entries for all
      * masters using this definition are evicted (anti-bug §F afterCommit pattern)
      * so that the next read reflects the new data.
      */
     @Transactional
-    // Ownership verified by @PreAuthorize("@authz.canManageServiceDefinition") on the controller.
-    public ServiceDefinitionResponse updateServiceDefinition(UUID serviceDefId,
+    public ServiceDefinitionResponse updateServiceDefinition(UUID actorId, UUID serviceDefId,
             UpdateServiceDefinitionRequest request) {
+        authz.enforceCanManageServiceDefinition(actorId, serviceDefId);
 
         ServiceDefinition definition = serviceRepository.findByIdWithServiceType(serviceDefId)
                 .orElseThrow(() -> new NotFoundException("Service definition not found: " + serviceDefId));

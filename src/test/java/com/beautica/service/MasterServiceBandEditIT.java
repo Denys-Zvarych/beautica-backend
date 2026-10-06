@@ -1125,6 +1125,54 @@ class MasterServiceBandEditIT extends AbstractIntegrationTest {
                 .isLessThanOrEqualTo(BULK_CREATE_STATEMENT_BOUND);
     }
 
+    // ── Case 33 (Phase 345 audit, perf LOW) — the owner's OWN-row band edit ────────────────────
+
+    /**
+     * Case 30's shape on the owner's own {@code SALON_OWNER} master row, which additionally passes
+     * {@code AuthorizationService#enforceOwnerMasterRowWritableByOwnerOnly}. That gate used to prove
+     * ownership via {@code master.getSalon().getOwner()} — a lazy salon load, one extra SELECT on
+     * every owner-row write. It now reads the salon id off the master's FK and answers ownership
+     * from {@code SalonScopeFactMemo}, which the preceding band gate already populated for this
+     * request — zero extra statements.
+     *
+     * <p>Bounded AT the measured figure ({@link #OWNER_ROW_BAND_STATEMENT_BOUND}): the lazy-load
+     * path costs exactly one more, so a measured+1 bound would be vacuous for this regression.
+     */
+    @Test
+    @DisplayName("Case 33 (Phase 345): a SALON_OWNER band PATCH on their OWN master row adds no salon "
+            + "load — the owner-row gate is served from the request's ownership memo")
+    void should_notLoadSalon_when_salonOwnerEditsOwnRowBand() throws Exception {
+        String ownerEmail = "owner-345-c33-" + System.nanoTime() + "@beautica.test";
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(ownerEmail);
+        UUID salonId = fixtures.createSalon(ownerToken, "Phase 345 Case 33 Salon");
+        UUID ownerMasterId = fixtures.resolveMasterIdForUserEmail(ownerEmail);
+        UUID typeId = fixtures.activeSelectableServiceTypes(1).get(0).id();
+        Assignment assignment = bulkCreateFixed(
+                ownerToken, salonId, ownerMasterId, typeId, new BigDecimal("600.00"));
+
+        // Warm anything process-wide before measuring, then measure ONE PATCH end to end.
+        patchBand(ownerToken, salonId, ownerMasterId, assignment.definitionId(),
+                new UpdateMasterServiceBandRequest(PriceType.FIXED, new BigDecimal("700.00"), null, null, null, null))
+                .response();
+
+        long total = measureStatements(() -> patchBand(
+                ownerToken, salonId, ownerMasterId, assignment.definitionId(),
+                new UpdateMasterServiceBandRequest(PriceType.FIXED, new BigDecimal("800.00"), null, null, null, null))
+                .response());
+
+        assertThat(total)
+                .as("Phase 345 — the owner-row gate must reuse the memoised ownership fact, not "
+                        + "lazy-load the salon; measured %s", total)
+                .isLessThanOrEqualTo(OWNER_ROW_BAND_STATEMENT_BOUND);
+    }
+
+    /**
+     * MEASURED bound for case 33: 5 with the memo (JWT user lookup, the band gate's two facts, the
+     * assignment load, the UPDATE), 6 with the old {@code getSalon().getOwner()} lazy load (verified
+     * 2026-10-06 by reverting the gate and re-measuring) — bounded AT the measured figure.
+     */
+    private static final long OWNER_ROW_BAND_STATEMENT_BOUND = 5L;
+
     // ── shared setup + HTTP plumbing ─────────────────────────────────────────────────────────────
 
     private void unassign(String token, UUID salonId, UUID masterId, UUID serviceDefId) {

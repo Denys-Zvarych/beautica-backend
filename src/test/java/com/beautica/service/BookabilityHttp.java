@@ -23,23 +23,23 @@ import static org.assertj.core.api.Assertions.assertThat;
  * an asserting GET that unwraps {@code ApiResponse.data}, the id extractor for a
  * {@code PageResponse} body, and the favourite write. One copy instead of one per suite.
  */
-final class BookabilityHttp {
+public final class BookabilityHttp {
 
     private final TestRestTemplate restTemplate;
     private final ObjectMapper objectMapper;
 
-    BookabilityHttp(TestRestTemplate restTemplate, ObjectMapper objectMapper) {
+    public BookabilityHttp(TestRestTemplate restTemplate, ObjectMapper objectMapper) {
         this.restTemplate = restTemplate;
         this.objectMapper = objectMapper;
     }
 
     /** Anonymous GET; asserts 200 and returns the {@code data} node. */
-    JsonNode get(String url) throws Exception {
+    public JsonNode get(String url) throws Exception {
         return get(url, null);
     }
 
     /** GET as {@code token} (null = anonymous); asserts 200 and returns the {@code data} node. */
-    JsonNode get(String url, String token) throws Exception {
+    public JsonNode get(String url, String token) throws Exception {
         HttpEntity<?> entity = token == null ? HttpEntity.EMPTY : new HttpEntity<>(bearer(token));
         ResponseEntity<String> response = restTemplate.exchange(url, HttpMethod.GET, entity, String.class);
         assertThat(response.getStatusCode()).as("GET %s → %s", url, response.getBody()).isEqualTo(HttpStatus.OK);
@@ -50,7 +50,7 @@ final class BookabilityHttp {
      * Master ids on the public salon roster ({@code GET /salons/{id}/masters}, anonymous) — the
      * per-salon client-visibility surface, gated by the same cheap rule as search.
      */
-    List<String> rosterIds(UUID salonId) throws Exception {
+    public List<String> rosterIds(UUID salonId) throws Exception {
         return ids(get("/api/v1/salons/" + salonId + "/masters"), "masterId");
     }
 
@@ -76,7 +76,7 @@ final class BookabilityHttp {
     }
 
     /** The {@code field} of every row of a {@code PageResponse} {@code data} node, in order. */
-    static List<String> ids(JsonNode page, String field) {
+    public static List<String> ids(JsonNode page, String field) {
         List<String> ids = new ArrayList<>();
         page.path("data").forEach(row -> ids.add(row.path(field).asText()));
         return ids;

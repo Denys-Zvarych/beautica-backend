@@ -196,6 +196,31 @@ public interface MasterServiceRepository extends JpaRepository<MasterServiceAssi
             @Param("masterId") UUID masterId);
 
     /**
+     * Phase 345 catalogue gate (architect decision 2026-10-06): true iff the definition has an
+     * ACTIVE assignment on a {@code SALON_OWNER}-typed master row — i.e. the salon owner performs
+     * it. {@code AuthorizationService} then refuses a {@code SALON_ADMIN} write on the definition,
+     * whether it is owner-only or shared with other masters.
+     *
+     * <p>Served by {@code idx_master_services_service_def_active} (V104, partial
+     * {@code WHERE is_active = true}) — leading column {@code service_def_id}.
+     *
+     * <p>A real {@code EXISTS} (native — JPQL has no select-list EXISTS), so Postgres stops at the
+     * first matching row instead of counting every active assignment of a widely-shared definition.
+     * {@code master_type} is persisted as {@code EnumType.STRING}, hence the literal.
+     */
+    @Query(value = """
+            SELECT EXISTS (
+                SELECT 1
+                FROM master_services ms
+                JOIN masters m ON m.id = ms.master_id
+                WHERE ms.service_def_id = :serviceDefId
+                  AND ms.is_active = true
+                  AND m.master_type = 'SALON_OWNER'
+            )
+            """, nativeQuery = true)
+    boolean existsActiveOwnerRowAssignment(@Param("serviceDefId") UUID serviceDefId);
+
+    /**
      * Returns a master's active service assignments whose linked service definition is
      * <em>also</em> active.
      *

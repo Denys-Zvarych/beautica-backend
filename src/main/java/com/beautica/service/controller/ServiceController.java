@@ -211,7 +211,10 @@ public class ServiceController {
 
     // Also authorizes a SALON_OWNER assigning services to their OWN owner-operated
     // master row (master_type = SALON_OWNER): that row's salon_id equals #salonId, so
-    // masterBelongsToSalon resolves true. No owner-specific branch is required.
+    // masterBelongsToSalon resolves true. The converse is NOT symmetric (Phase 345): a SALON_ADMIN
+    // passes this gate for the owner's row but is refused 403 in the service layer by
+    // AuthorizationService#enforceOwnerMasterRowWritableByOwnerOnly — the same rule the PATCH band
+    // edit, DELETE unassign and POST .../services/bulk below apply.
     @io.swagger.v3.oas.annotations.responses.ApiResponses({
             // Same lone-@ApiResponse guard as every other write endpoint in this file: an
             // explicit set without the 200 would be read by springdoc as the COMPLETE response
@@ -237,10 +240,11 @@ public class ServiceController {
     public ResponseEntity<ApiResponse<MasterServiceResponse>> assignServiceToMaster(
             @PathVariable UUID salonId,
             @Parameter(description = "Master row id (NOT a user id)") @PathVariable UUID masterId,
-            @Valid @RequestBody AssignServiceToMasterRequest request
+            @Valid @RequestBody AssignServiceToMasterRequest request,
+            Authentication authentication
     ) {
-        MasterServiceResponse response =
-                serviceCatalogService.assignServiceToMaster(salonId, masterId, request);
+        MasterServiceResponse response = serviceCatalogService.assignServiceToMaster(
+                AuthenticationUtils.userId(authentication), salonId, masterId, request);
         return ResponseEntity.status(201).body(ApiResponse.ok(response));
     }
 
@@ -256,9 +260,9 @@ public class ServiceController {
      * ALSO admits the {@code SALON_MASTER} whose own {@code masters} row is {@code #masterId} —
      * they may edit their own band and nothing else (Phase 306 D6 / Phase 310 D5 still hold for
      * every other endpoint). The predicate is a NEW, independent entry point from
-     * {@code canReadSalonMasterServices}; it does not reuse or widen that read gate, and
-     * {@code canManageServiceDefinition} — which still fast-rejects {@code SALON_MASTER} — is
-     * untouched.
+     * {@code canReadSalonMasterServices}; it does not reuse or widen that read gate, and the
+     * service-definition write gate ({@code enforceCanManageServiceDefinition} behind a role gate
+     * that excludes {@code SALON_MASTER}) is untouched.
      *
      * <p><b>D4 — {@code null} means "leave unchanged"; {@code clearBand}/{@code
      * clearDurationOverride} are the explicit reverts.</b> See
@@ -605,7 +609,8 @@ public class ServiceController {
      * {@link #assignServiceToMaster}). SALON_ADMIN inclusion is intentional and matches the
      * confirmed contract — admins manage masters' menus but own no services themselves.
      * The owner-operated master row resolves through the same path (its {@code salon_id}
-     * equals {@code salonId}).
+     * equals {@code salonId}) — for the OWNER only: a SALON_ADMIN is 403 on that one row (Phase
+     * 345, {@code AuthorizationService#enforceOwnerMasterRowWritableByOwnerOnly}).
      *
      * <p>Additive: callable whether the target master's catalogue is empty or already populated.
      * The whole batch is created in one transaction (all-or-nothing). The only 409 this endpoint
@@ -689,10 +694,9 @@ public class ServiceController {
      * <p>Only non-null fields in the request body are applied; omitted fields retain
      * their current values (PATCH semantics).
      *
-     * <p>Authorization uses the same {@code canManageServiceDefinition} SpEL expression
-     * as DELETE: a single DB lookup resolves the owner user UUID and compares it to the
-     * authenticated principal. No redundant role guard is added at the controller level
-     * because ownership implies the required role (anti-bug §D).
+     * <p>Authorization uses the same split as DELETE (anti-bug §D): a role-only fast gate here,
+     * ownership plus the Phase 345 owner-performed catalogue gate enforced once inside the service
+     * via {@code enforceCanManageServiceDefinition}.
      */
     @io.swagger.v3.oas.annotations.responses.ApiResponses({
             // Explicit success response so springdoc does NOT treat the lone 409 below as the
@@ -712,20 +716,22 @@ public class ServiceController {
                     responseCode = "429", description = RATE_LIMITED_429)
     })
     @PatchMapping("/services/{serviceDefId}")
-    @PreAuthorize("@authz.canManageServiceDefinition(authentication, #serviceDefId)")
+    @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN','INDEPENDENT_MASTER')")
     public ResponseEntity<ApiResponse<ServiceDefinitionResponse>> updateServiceDefinition(
             @PathVariable UUID serviceDefId,
-            @Valid @RequestBody UpdateServiceDefinitionRequest request
+            @Valid @RequestBody UpdateServiceDefinitionRequest request,
+            Authentication authentication
     ) {
-        ServiceDefinitionResponse response =
-                serviceCatalogService.updateServiceDefinition(serviceDefId, request);
+        ServiceDefinitionResponse response = serviceCatalogService.updateServiceDefinition(
+                AuthenticationUtils.userId(authentication), serviceDefId, request);
         return ResponseEntity.ok(ApiResponse.ok(response));
     }
 
     /**
      * Uploads (sets or replaces) the single photo of a service definition as multipart/form-data
      * (Phase 342). Validation (JPEG/PNG/WebP by magic bytes, 5 MB), R2 storage and the 503-when-storage-off
-     * guard live in {@link MediaService}; this method is HTTP only.
+     * guard live in {@link MediaService}; this method is HTTP only. Role-only gate here; ownership and the
+     * Phase 345 owner-performed catalogue gate are enforced in {@link MediaService} (anti-bug §D split).
      */
     @io.swagger.v3.oas.annotations.responses.ApiResponses({
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
@@ -734,13 +740,15 @@ public class ServiceController {
                     responseCode = "429", description = RATE_LIMITED_429)
     })
     @PostMapping(value = "/services/{serviceDefId}/photo", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
-    @PreAuthorize("@authz.canManageServiceDefinition(authentication, #serviceDefId)")
+    @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN','INDEPENDENT_MASTER')")
     public ResponseEntity<ApiResponse<ServiceDefinitionResponse>> uploadServicePhoto(
             @PathVariable UUID serviceDefId,
             @Parameter(content = @Content(mediaType = MediaType.MULTIPART_FORM_DATA_VALUE))
-            @RequestParam("file") MultipartFile file
+            @RequestParam("file") MultipartFile file,
+            Authentication authentication
     ) {
-        return ResponseEntity.ok(ApiResponse.ok(mediaService.uploadServicePhoto(serviceDefId, file)));
+        return ResponseEntity.ok(ApiResponse.ok(mediaService.uploadServicePhoto(
+                AuthenticationUtils.userId(authentication), serviceDefId, file)));
     }
 
     /** Removes the service photo and its R2 blob. Idempotent — 204 even when there is no photo. */
@@ -750,9 +758,12 @@ public class ServiceController {
                     responseCode = "429", description = RATE_LIMITED_429)
     })
     @DeleteMapping("/services/{serviceDefId}/photo")
-    @PreAuthorize("@authz.canManageServiceDefinition(authentication, #serviceDefId)")
-    public ResponseEntity<Void> deleteServicePhoto(@PathVariable UUID serviceDefId) {
-        mediaService.deleteServicePhoto(serviceDefId);
+    @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN','INDEPENDENT_MASTER')")
+    public ResponseEntity<Void> deleteServicePhoto(
+            @PathVariable UUID serviceDefId,
+            Authentication authentication
+    ) {
+        mediaService.deleteServicePhoto(AuthenticationUtils.userId(authentication), serviceDefId);
         return ResponseEntity.noContent().build();
     }
 }

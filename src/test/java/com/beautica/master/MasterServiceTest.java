@@ -128,6 +128,9 @@ class MasterServiceTest {
     // this class, none of which assert on awaitingClosure.
     @Spy private Clock clock = Clock.systemUTC();
 
+    // Phase 345 audit — upsertWorkingHours re-proves enforceCanManageMasterSchedule on the loaded row.
+    @Mock private com.beautica.common.security.AuthorizationService authorizationService;
+
     @InjectMocks
     private MasterService masterService;
 
@@ -814,6 +817,7 @@ class MasterServiceTest {
         assertThat(result).hasSize(1);
         assertThat(result.get(0).dayOfWeek()).isEqualTo(1);
         verify(workingHoursRepository).saveAll(anyList());
+        verify(authorizationService).enforceCanManageMasterSchedule(ownerId, master);
     }
 
     // ── upsertWorkingHours — inactive-row reuse (regression: UNIQUE(master_id, day_of_week) 23505) ──
@@ -887,10 +891,30 @@ class MasterServiceTest {
     }
 
     @Test
+    @DisplayName("upsertWorkingHours — Phase 345 audit: a SALON_ADMIN on the owner's SALON_OWNER row is 403 "
+            + "from the service-layer re-check, and nothing is read or written past the master load")
+    void should_throwForbiddenAndWriteNothing_when_adminUpsertsOwnerRowWorkingHours() {
+        UUID adminId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        Master ownerRow = mock(Master.class);
+        var request = new WorkingHoursRequest(1, LocalTime.of(9, 0), LocalTime.of(17, 0), true);
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(ownerRow));
+        org.mockito.Mockito.doThrow(new ForbiddenException("Access denied"))
+                .when(authorizationService).enforceCanManageMasterSchedule(adminId, ownerRow);
+
+        assertThatThrownBy(() ->
+                masterService.upsertWorkingHours(adminId, masterId, List.of(request)))
+                .isInstanceOf(ForbiddenException.class);
+
+        verify(authorizationService).enforceCanManageMasterSchedule(adminId, ownerRow);
+        verifyNoInteractions(workingHoursRepository);
+    }
+
+    @Test
     @DisplayName("should_throwNotFound_when_upsertWorkingHours_masterMissing")
     void should_throwNotFound_when_upsertWorkingHours_masterMissing_explicit() {
-        // Authorization is exclusively enforced by @PreAuthorize on MasterController — not re-checked here.
-        // This test verifies the service throws NotFoundException when master is absent.
+        // The service-layer schedule re-check (Phase 345 audit) needs the loaded row, so an absent
+        // master is a NotFoundException before any authorization call.
         UUID actorId = UUID.randomUUID();
         UUID masterId = UUID.randomUUID();
         var request = new WorkingHoursRequest(2, LocalTime.of(10, 0), LocalTime.of(18, 0), true);
