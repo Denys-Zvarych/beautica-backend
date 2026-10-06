@@ -3,6 +3,7 @@ package com.beautica.salon;
 import com.beautica.auth.InviteService;
 import com.beautica.auth.Role;
 import com.beautica.common.security.AuthorizationService;
+import com.beautica.common.cache.MasterCachePrefixEvictor;
 import com.beautica.config.CacheConfig;
 import com.beautica.location.LocalityWriteValidator;
 import com.beautica.location.repository.CityRepository;
@@ -45,7 +46,10 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 @SpringBootTest(
-        classes = {SalonService.class, CacheConfig.class, SalonServiceCacheTest.TxConfig.class},
+        // MasterCachePrefixEvictor is the REAL bean (needs only CacheConfig's CacheManager), so
+        // SalonService's logo search-page eviction runs against the real caches under test.
+        classes = {SalonService.class, CacheConfig.class, MasterCachePrefixEvictor.class,
+                SalonServiceCacheTest.TxConfig.class},
         webEnvironment = SpringBootTest.WebEnvironment.NONE
 )
 @DisplayName("SalonService — @Cacheable/@CacheEvict behaviour")
