@@ -1,5 +1,6 @@
 package com.beautica.salon;
 
+import com.beautica.common.cache.MasterCachePrefixEvictor;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.security.AuthorizationService;
@@ -31,6 +32,7 @@ import org.springframework.cache.caffeine.CaffeineCache;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.PageRequest;
+import org.springframework.test.util.ReflectionTestUtils;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
@@ -82,6 +84,9 @@ class SalonServiceSalonImageTest {
         salon = Salon.builder().id(salonId).owner(owner).name("S").cityId(UUID.randomUUID()).isActive(true)
                 .avatarUrl("https://cdn.example/old.jpg").avatarR2Key("salons/" + salonId + "/logo/old.jpg")
                 .build();
+        // A REAL evictor over the mocked CacheManager: the search-page scan now lives there, and the
+        // eviction assertions below must exercise it, not a mock of it.
+        ReflectionTestUtils.setField(salonService, "cachePrefixEvictor", new MasterCachePrefixEvictor(cacheManager));
         TransactionSynchronizationManager.initSynchronization();
     }
 

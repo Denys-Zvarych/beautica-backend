@@ -184,6 +184,9 @@ public class SalonService {
     // Runs the whole after-commit salon purge body on blobPurgeExecutor (perf P-L2) so the committing
     // thread neither holds its connection across the R2 batch nor opens the follow-up REQUIRES_NEW ones.
     private final AfterCommitBlobPurger afterCommitBlobPurger;
+    // Owns every native cache scan (CacheKeyScanOwnershipTest) — the logo-change search-page
+    // eviction delegates its by-value scan here.
+    private final com.beautica.common.cache.MasterCachePrefixEvictor cachePrefixEvictor;
 
     /**
      * Hard ceiling on rows returned by {@link #listSalonInvites}.
@@ -767,22 +770,10 @@ public class SalonService {
         TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
             @Override
             public void afterCommit() {
-                for (String cacheName : SearchCacheNames.SALONS_ALL) {
-                    evictSalonSearchPages(cacheManager.getCache(cacheName), salonId);
-                }
+                cachePrefixEvictor.evictByValueNow(
+                        cached -> pageListsSalon(cached, salonId), SearchCacheNames.SALONS_ALL);
             }
         });
-    }
-
-    private static void evictSalonSearchPages(Cache cache, UUID salonId) {
-        if (cache == null) {
-            return;
-        }
-        if (cache.getNativeCache() instanceof com.github.benmanes.caffeine.cache.Cache<?, ?> caffeineCache) {
-            caffeineCache.asMap().values().removeIf(cached -> pageListsSalon(cached, salonId));
-        } else {
-            cache.clear();
-        }
     }
 
     private static boolean pageListsSalon(Object cached, UUID salonId) {

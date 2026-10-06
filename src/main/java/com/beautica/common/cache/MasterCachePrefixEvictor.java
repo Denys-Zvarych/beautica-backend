@@ -7,6 +7,7 @@ import org.springframework.stereotype.Component;
 
 import java.util.List;
 import java.util.UUID;
+import java.util.function.Predicate;
 
 /**
  * The single home for "evict every entry of these caches whose key starts with this masterId", run
@@ -83,6 +84,27 @@ public class MasterCachePrefixEvictor {
     public void evictByKeyPrefixNow(UUID keyPrefix, String... cacheNames) {
         for (String cacheName : cacheNames) {
             evictOne(cacheName, keyPrefix);
+        }
+    }
+
+    /**
+     * Evicts every entry of each named cache whose VALUE satisfies {@code valueMatch}, on the calling
+     * thread. For caches whose keys cannot identify the entity (e.g. salon search pages keyed by filter
+     * tuple, where a salon is found only by scanning each cached page's rows). Lives here so native
+     * cache scans keep a single owner ({@code CacheKeyScanOwnershipTest}). A non-Caffeine {@link Cache}
+     * falls back to {@link Cache#clear()}, same as {@link #evictOne}.
+     */
+    public void evictByValueNow(Predicate<Object> valueMatch, Iterable<String> cacheNames) {
+        for (String cacheName : cacheNames) {
+            Cache springCache = cacheManager.getCache(cacheName);
+            if (springCache == null) {
+                continue;
+            }
+            if (springCache.getNativeCache() instanceof com.github.benmanes.caffeine.cache.Cache<?, ?> caffeineCache) {
+                caffeineCache.asMap().values().removeIf(valueMatch);
+            } else {
+                springCache.clear();
+            }
         }
     }
 
