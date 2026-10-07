@@ -37,6 +37,7 @@ import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.security.AuthenticationUtils;
 import com.beautica.common.security.AuthorizationService;
 import com.beautica.master.entity.Master;
+import com.beautica.master.entity.MasterType;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.salon.entity.Salon;
 import com.beautica.notification.entity.OutboxEventType;
@@ -724,12 +725,34 @@ public class BookingService {
             UUID actorUserId, Authentication auth, List<BookingStatus> status,
             LocalDate from, LocalDate to, List<UUID> serviceId, BookingPartition partition,
             Pageable pageable) {
+        return getMyBookings(actorUserId, auth, status, from, to, serviceId, partition, null, pageable);
+    }
+
+    /**
+     * Phase 354 — {@code asMaster} overload backing {@code GET /bookings/me?asMaster=}. Same
+     * contract as the 8-argument overload above, which delegates here with {@code asMaster =
+     * null}; absent/{@code false} is therefore byte-identical to pre-354 behaviour by
+     * construction.
+     *
+     * <p>{@code asMaster == true}: a {@code SALON_OWNER} is served the MASTER view of their own
+     * {@code SALON_OWNER}-type master row (see {@link #resolveOwnerMasterScope}) through the very
+     * same query dispatch {@code SALON_MASTER}/{@code INDEPENDENT_MASTER} use ({@link
+     * #findMasterScopedIdPage}) — status visibility, partition rules, sort and the {@code
+     * serviceId} predicate are the master scope exactly. Master roles: no-op (already
+     * master-scoped). {@code CLIENT}: 400. {@code SALON_ADMIN}: the existing 403, unchanged.
+     */
+    @Transactional(readOnly = true)
+    public PageResponse<BookingDetailResponse> getMyBookings(
+            UUID actorUserId, Authentication auth, List<BookingStatus> status,
+            LocalDate from, LocalDate to, List<UUID> serviceId, BookingPartition partition,
+            Boolean asMaster, Pageable pageable) {
         // Role is already encoded in the JWT-derived authority — no DB round-trip needed to
         // resolve the role. Only SALON_OWNER requires a DB call to fetch the associated salonId.
         // AuthenticationUtils.role is the single source of truth for this read (B14): it scans
         // ALL authorities, ignores unrecognised ROLE_* strings instead of throwing, and rejects a
         // multi-role principal — do NOT reintroduce a local extractor here or in getMyBookedDays.
         Role role = AuthenticationUtils.role(auth);
+        boolean masterView = resolveAsMasterFlag(role, asMaster);
 
         // Phase 28.2 precedence rule: partition present -> status predicate is never built at all.
         Set<BookingStatus> statuses = (partition != null || status == null || status.isEmpty())
@@ -763,7 +786,7 @@ public class BookingService {
 
         Page<BookingDetailResponse> page = role == Role.CLIENT
                 ? listClientBookings(actorUserId, statuses, fromTs, toExclusive, serviceIds, partition, now, normalizedPageable)
-                : listProviderBookings(role, actorUserId, statuses, fromTs, toExclusive, serviceIds, partition, now, normalizedPageable);
+                : listProviderBookings(role, actorUserId, masterView, statuses, fromTs, toExclusive, serviceIds, partition, now, normalizedPageable);
 
         return PageResponse.of(
                 page.getContent(),
@@ -829,6 +852,19 @@ public class BookingService {
      */
     @Transactional(readOnly = true)
     public List<LocalDate> getMyBookedDays(UUID actorUserId, Authentication auth, LocalDate from, LocalDate to) {
+        return getMyBookedDays(actorUserId, auth, from, to, null);
+    }
+
+    /**
+     * Phase 354 — {@code asMaster} overload backing {@code GET /bookings/me/booked-days?asMaster=}.
+     * Same contract as the 4-argument overload above (which delegates here with {@code null});
+     * {@code asMaster == true} routes a {@code SALON_OWNER} to the master booked-days query for
+     * their own master row — the identical rule {@link #getMyBookings(UUID, Authentication, List,
+     * LocalDate, LocalDate, List, BookingPartition, Boolean, Pageable)} applies.
+     */
+    @Transactional(readOnly = true)
+    public List<LocalDate> getMyBookedDays(
+            UUID actorUserId, Authentication auth, LocalDate from, LocalDate to, Boolean asMaster) {
         if (from == null || to == null) {
             throw new BusinessException(HttpStatus.BAD_REQUEST, "Both 'from' and 'to' are required");
         }
@@ -843,14 +879,17 @@ public class BookingService {
 
         // Same shared, hardened role read getMyBookings uses — see the comment there.
         Role role = AuthenticationUtils.role(auth);
+        boolean masterView = resolveAsMasterFlag(role, asMaster);
 
         List<java.sql.Date> bookedDates = switch (role) {
             case CLIENT -> bookingRepository.findBookedDatesByClientId(actorUserId, fromTs, toExclusive);
-            case SALON_MASTER, INDEPENDENT_MASTER -> {
-                Master master = resolveProviderMasterScope(role, actorUserId);
-                yield bookingRepository.findBookedDatesByMasterId(master.getId(), fromTs, toExclusive);
-            }
+            case SALON_MASTER, INDEPENDENT_MASTER -> findMasterScopedBookedDates(
+                    resolveProviderMasterScope(role, actorUserId), fromTs, toExclusive);
             case SALON_OWNER -> {
+                if (masterView) {
+                    yield findMasterScopedBookedDates(
+                            resolveOwnerMasterScope(actorUserId), fromTs, toExclusive);
+                }
                 List<UUID> salonIds = salonRepository.findIdsByOwnerIdAndIsActiveTrue(actorUserId);
                 yield salonIds.isEmpty()
                         ? List.of()
@@ -1658,6 +1697,61 @@ public class BookingService {
     }
 
     /**
+     * Phase 354 — the {@code SALON_OWNER} counterpart of {@link #resolveProviderMasterScope} for
+     * {@code ?asMaster=true}: the caller's own {@code SALON_OWNER}-type master row, resolved
+     * through the same {@link MasterRepository#findByUserId} lookup. An inactive row (the owner
+     * toggled their master profile off — the toggle deactivates, never deletes) is DENIED with the
+     * same 403 a deactivated {@code SALON_MASTER} gets; a row of any other type cannot be the
+     * owner's own master view and is denied identically. No row at all is the existing 404.
+     */
+    private Master resolveOwnerMasterScope(UUID actorUserId) {
+        Master master = masterRepository.findByUserId(actorUserId)
+                .orElseThrow(() -> new NotFoundException("Master profile not found"));
+        if (master.getMasterType() != MasterType.SALON_OWNER || !master.isActive()) {
+            throw new ForbiddenException("Access denied");
+        }
+        return master;
+    }
+
+    /**
+     * Phase 354 — validates {@code ?asMaster=} against the caller's role and answers whether the
+     * owner master view applies. {@code null}/{@code false} is always {@code false} (pre-354
+     * behaviour). {@code true} is rejected with 400 for {@code CLIENT}; for every provider role it
+     * passes through — the master roles ignore it (already master-scoped) and {@code SALON_ADMIN}
+     * still hits its existing 403 in the role dispatch.
+     */
+    private static boolean resolveAsMasterFlag(Role role, Boolean asMaster) {
+        if (!Boolean.TRUE.equals(asMaster)) {
+            return false;
+        }
+        if (role == Role.CLIENT) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST, "asMaster is only valid for provider roles");
+        }
+        return true;
+    }
+
+    /**
+     * The master-scoped ID-page dispatch shared by {@code SALON_MASTER}/{@code
+     * INDEPENDENT_MASTER} and the Phase 354 owner master view — one body, so the owner's
+     * «Записи» tab can never drift from the independent master's list.
+     */
+    private Page<UUID> findMasterScopedIdPage(
+            Master master, Set<BookingStatus> statuses, OffsetDateTime from, OffsetDateTime toExclusive,
+            Set<UUID> serviceIds, BookingPartition partition, OffsetDateTime now, Pageable pageable) {
+        return partition != null
+                ? bookingRepository.findIdsByMasterIdFilteredByPartition(
+                        master.getId(), partition, now, from, toExclusive, serviceIds, pageable)
+                : bookingRepository.findIdsByMasterIdFiltered(
+                        master.getId(), statuses, from, toExclusive, serviceIds, pageable);
+    }
+
+    /** Booked-days twin of {@link #findMasterScopedIdPage}, shared the same way. */
+    private List<java.sql.Date> findMasterScopedBookedDates(
+            Master master, OffsetDateTime fromTs, OffsetDateTime toExclusive) {
+        return bookingRepository.findBookedDatesByMasterId(master.getId(), fromTs, toExclusive);
+    }
+
+    /**
      * Provider path — ID-page + graph hydrate (Fix H1), then the batched review-existence
      * queries (one per review DIRECTION — see {@link #loadProviderReviewBatch} for the
      * provider&rarr;client one and its salon-ownership companion) and the two-query label
@@ -1670,22 +1764,24 @@ public class BookingService {
      * branch inside one shared query method.
      */
     private Page<BookingDetailResponse> listProviderBookings(
-            Role role, UUID actorUserId, Set<BookingStatus> statuses,
+            Role role, UUID actorUserId, boolean masterView, Set<BookingStatus> statuses,
             OffsetDateTime from, OffsetDateTime toExclusive,
             Set<UUID> serviceIds, BookingPartition partition, OffsetDateTime now, Pageable pageable) {
         // Two-query pattern (Fix H1 — HHH90003004): first fetch a page of IDs using
         // plain JPQL with no JOIN FETCH (so the DB applies LIMIT/OFFSET correctly), then
         // batch-hydrate only those IDs with the full association graph in a second query.
         Page<UUID> idPage = switch (role) {
-            case SALON_MASTER, INDEPENDENT_MASTER -> {
-                Master master = resolveProviderMasterScope(role, actorUserId);
-                yield partition != null
-                        ? bookingRepository.findIdsByMasterIdFilteredByPartition(
-                                master.getId(), partition, now, from, toExclusive, serviceIds, pageable)
-                        : bookingRepository.findIdsByMasterIdFiltered(
-                                master.getId(), statuses, from, toExclusive, serviceIds, pageable);
-            }
+            case SALON_MASTER, INDEPENDENT_MASTER -> findMasterScopedIdPage(
+                    resolveProviderMasterScope(role, actorUserId),
+                    statuses, from, toExclusive, serviceIds, partition, now, pageable);
             case SALON_OWNER -> {
+                // Phase 354: ?asMaster=true — the owner's OWN master-row bookings, through the
+                // exact query dispatch the master roles above use (no parallel query).
+                if (masterView) {
+                    yield findMasterScopedIdPage(
+                            resolveOwnerMasterScope(actorUserId),
+                            statuses, from, toExclusive, serviceIds, partition, now, pageable);
+                }
                 // Fix HIGH-1: salonId is on Salon.owner_id, NOT on User.salonId.
                 // userRepository.findSalonIdById always returned empty for SALON_OWNER,
                 // causing a guaranteed BusinessException (500). Resolved via SalonRepository

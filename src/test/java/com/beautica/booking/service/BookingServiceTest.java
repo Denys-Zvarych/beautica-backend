@@ -3839,6 +3839,145 @@ class BookingServiceTest {
         verify(bookingRepository).findIdsByMasterIdFiltered(masterId, Set.of(BookingStatus.CONFIRMED), null, null, null, normalizedUnpaged());
     }
 
+    // ── Phase 354 — ?asMaster=true (owner-as-master own-bookings scope) ───────────────────────────
+
+    @Test
+    @DisplayName("SALON_OWNER + asMaster=true runs the MASTER branch scoped to the owner's own master row, "
+            + "never the salon branch")
+    void should_useMasterBranchWithOwnRowId_when_salonOwnerListsAsMaster() {
+        UUID ownerId = UUID.randomUUID();
+        UUID ownerMasterId = UUID.randomUUID();
+        Pageable pageable = Pageable.unpaged();
+        when(masterRepository.findByUserId(ownerId))
+                .thenReturn(Optional.of(buildMaster(ownerMasterId, MasterType.SALON_OWNER)));
+        when(bookingRepository.findIdsByMasterIdFiltered(ownerMasterId, null, null, null, null, normalizedUnpaged()))
+                .thenReturn(Page.empty());
+
+        var result = bookingService.getMyBookings(
+                ownerId, buildAuth(Role.SALON_OWNER), null, null, null, null, null, true, pageable);
+
+        assertThat(result.totalElements()).isZero();
+        verify(bookingRepository).findIdsByMasterIdFiltered(ownerMasterId, null, null, null, null, normalizedUnpaged());
+        verify(bookingRepository, never()).findIdsBySalonIdsFiltered(any(), any(), any(), any(), any(), any());
+        verifyNoInteractions(salonRepository);
+    }
+
+    @Test
+    @DisplayName("SALON_OWNER + asMaster=true + partition routes to the master partition query with the "
+            + "owner's own row id")
+    void should_useMasterPartitionQuery_when_salonOwnerListsAsMasterWithPartition() {
+        UUID ownerId = UUID.randomUUID();
+        UUID ownerMasterId = UUID.randomUUID();
+        Pageable pageable = Pageable.unpaged();
+        when(masterRepository.findByUserId(ownerId))
+                .thenReturn(Optional.of(buildMaster(ownerMasterId, MasterType.SALON_OWNER)));
+        when(bookingRepository.findIdsByMasterIdFilteredByPartition(
+                        eq(ownerMasterId), eq(BookingPartition.UPCOMING), any(), any(), any(), any(), any()))
+                .thenReturn(Page.empty());
+
+        bookingService.getMyBookings(ownerId, buildAuth(Role.SALON_OWNER),
+                null, null, null, null, BookingPartition.UPCOMING, true, pageable);
+
+        verify(bookingRepository).findIdsByMasterIdFilteredByPartition(
+                eq(ownerMasterId), eq(BookingPartition.UPCOMING), any(), any(), any(), any(), any());
+        verifyNoInteractions(salonRepository);
+    }
+
+    @Test
+    @DisplayName("SALON_OWNER with asMaster=false keeps the salon branch unchanged and never reads the master row")
+    void should_useSalonBranch_when_salonOwnerListsWithAsMasterFalse() {
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        Pageable pageable = Pageable.unpaged();
+        when(salonRepository.findIdsByOwnerIdAndIsActiveTrue(ownerId)).thenReturn(List.of(salonId));
+        when(bookingRepository.findIdsBySalonIdsFiltered(List.of(salonId), null, null, null, null, normalizedUnpaged()))
+                .thenReturn(Page.empty());
+
+        bookingService.getMyBookings(ownerId, buildAuth(Role.SALON_OWNER), null, null, null, null, null, false, pageable);
+
+        verify(bookingRepository).findIdsBySalonIdsFiltered(List.of(salonId), null, null, null, null, normalizedUnpaged());
+        verifyNoInteractions(masterRepository);
+    }
+
+    @Test
+    @DisplayName("SALON_MASTER + asMaster=true is a no-op — same master-scoped query as without the flag")
+    void should_keepMasterBranch_when_salonMasterListsAsMaster() {
+        UUID actorId = UUID.randomUUID();
+        Pageable pageable = Pageable.unpaged();
+        when(masterRepository.findByUserId(actorId)).thenReturn(Optional.of(master));
+        when(bookingRepository.findIdsByMasterIdFiltered(masterId, null, null, null, null, normalizedUnpaged()))
+                .thenReturn(Page.empty());
+
+        bookingService.getMyBookings(actorId, buildAuth(Role.SALON_MASTER), null, null, null, null, null, true, pageable);
+
+        verify(bookingRepository).findIdsByMasterIdFiltered(masterId, null, null, null, null, normalizedUnpaged());
+        verifyNoInteractions(salonRepository);
+    }
+
+    @Test
+    @DisplayName("CLIENT + asMaster=true is a 400 and runs no query")
+    void should_throwBadRequest_when_clientListsAsMaster() {
+        Pageable pageable = Pageable.unpaged();
+
+        assertThatThrownBy(() -> bookingService.getMyBookings(
+                clientId, buildAuth(Role.CLIENT), null, null, null, null, null, true, pageable))
+                .isInstanceOf(BusinessException.class)
+                .hasMessage("asMaster is only valid for provider roles")
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus()).isEqualTo(HttpStatus.BAD_REQUEST));
+        verifyNoInteractions(bookingRepository, masterRepository, salonRepository);
+    }
+
+    @Test
+    @DisplayName("SALON_OWNER + asMaster=true with an INACTIVE own master row is a 403, no booking query")
+    void should_throwForbidden_when_salonOwnerListsAsMasterWithInactiveRow() {
+        UUID ownerId = UUID.randomUUID();
+        Master inactive = buildMaster(UUID.randomUUID(), MasterType.SALON_OWNER);
+        setField(inactive, "isActive", false);
+        when(masterRepository.findByUserId(ownerId)).thenReturn(Optional.of(inactive));
+
+        assertThatThrownBy(() -> bookingService.getMyBookings(
+                ownerId, buildAuth(Role.SALON_OWNER), null, null, null, null, null, true, Pageable.unpaged()))
+                .isInstanceOf(ForbiddenException.class)
+                .hasMessage("Access denied");
+        verifyNoInteractions(bookingRepository, salonRepository);
+    }
+
+    @Test
+    @DisplayName("SALON_OWNER + asMaster=true whose master row is not SALON_OWNER-typed is a 403")
+    void should_throwForbidden_when_salonOwnerListsAsMasterWithNonOwnerTypedRow() {
+        UUID ownerId = UUID.randomUUID();
+        when(masterRepository.findByUserId(ownerId))
+                .thenReturn(Optional.of(buildMaster(UUID.randomUUID(), MasterType.SALON_MASTER)));
+
+        assertThatThrownBy(() -> bookingService.getMyBookings(
+                ownerId, buildAuth(Role.SALON_OWNER), null, null, null, null, null, true, Pageable.unpaged()))
+                .isInstanceOf(ForbiddenException.class)
+                .hasMessage("Access denied");
+        verifyNoInteractions(bookingRepository);
+    }
+
+    @Test
+    @DisplayName("SALON_OWNER + asMaster=true with NO master row at all is a 404 and never falls back to the salon branch")
+    void should_throwNotFound_when_salonOwnerListsAsMasterWithoutMasterRow() {
+        UUID ownerId = UUID.randomUUID();
+        when(masterRepository.findByUserId(ownerId)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> bookingService.getMyBookings(
+                ownerId, buildAuth(Role.SALON_OWNER), null, null, null, null, null, true, Pageable.unpaged()))
+                .isInstanceOf(NotFoundException.class)
+                .hasMessage("Master profile not found");
+        verifyNoInteractions(bookingRepository, salonRepository);
+    }
+
+    @Test
+    @DisplayName("SALON_ADMIN + asMaster=true keeps the existing 403")
+    void should_throwForbidden_when_salonAdminListsAsMaster() {
+        assertThatThrownBy(() -> bookingService.getMyBookings(UUID.randomUUID(), buildAuth(Role.SALON_ADMIN),
+                null, null, null, null, null, true, Pageable.unpaged()))
+                .isInstanceOf(ForbiddenException.class);
+        verifyNoInteractions(bookingRepository);
+    }
+
     @Test
     @DisplayName("ForbiddenException is thrown when SALON_ADMIN calls getMyBookings")
     void should_throwForbidden_when_salonAdminListsBookings() {
@@ -3957,6 +4096,151 @@ class BookingServiceTest {
         assertThatThrownBy(() -> bookingService.getMyBookedDays(salonAdminId, buildAuth(Role.SALON_ADMIN), from, to))
                 .isInstanceOf(ForbiddenException.class);
         verifyNoInteractions(bookingRepository);
+    }
+
+    // ── Phase 354 — getMyBookedDays ?asMaster=true ───────────────────────────────────────────────
+
+    @Test
+    @DisplayName("SALON_OWNER + asMaster=true reads booked days through the MASTER query for the owner's own row")
+    void should_returnMasterScopedDates_when_salonOwnerRequestsBookedDaysAsMaster() {
+        LocalDate from = LocalDate.of(2026, 9, 1);
+        LocalDate to = LocalDate.of(2026, 9, 30);
+        OffsetDateTime fromTs = from.atStartOfDay(KYIV).toOffsetDateTime();
+        OffsetDateTime toExclusive = to.plusDays(1).atStartOfDay(KYIV).toOffsetDateTime();
+        UUID ownerId = UUID.randomUUID();
+        UUID ownerMasterId = UUID.randomUUID();
+        List<LocalDate> expected = List.of(LocalDate.of(2026, 9, 12));
+        when(masterRepository.findByUserId(ownerId))
+                .thenReturn(Optional.of(buildMaster(ownerMasterId, MasterType.SALON_OWNER)));
+        when(bookingRepository.findBookedDatesByMasterId(ownerMasterId, fromTs, toExclusive))
+                .thenReturn(expected.stream().map(java.sql.Date::valueOf).toList());
+
+        var result = bookingService.getMyBookedDays(ownerId, buildAuth(Role.SALON_OWNER), from, to, true);
+
+        assertThat(result).isEqualTo(expected);
+        verify(bookingRepository, never()).findBookedDatesBySalonIds(any(), any(), any());
+        verifyNoInteractions(salonRepository);
+    }
+
+    @Test
+    @DisplayName("SALON_OWNER booked days with asMaster=false keep the salon branch and never read the master row")
+    void should_returnSalonScopedDates_when_salonOwnerRequestsBookedDaysWithAsMasterFalse() {
+        LocalDate from = LocalDate.of(2026, 9, 1);
+        LocalDate to = LocalDate.of(2026, 9, 30);
+        OffsetDateTime fromTs = from.atStartOfDay(KYIV).toOffsetDateTime();
+        OffsetDateTime toExclusive = to.plusDays(1).atStartOfDay(KYIV).toOffsetDateTime();
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        when(salonRepository.findIdsByOwnerIdAndIsActiveTrue(ownerId)).thenReturn(List.of(salonId));
+        when(bookingRepository.findBookedDatesBySalonIds(List.of(salonId), fromTs, toExclusive)).thenReturn(List.of());
+
+        bookingService.getMyBookedDays(ownerId, buildAuth(Role.SALON_OWNER), from, to, false);
+
+        verify(bookingRepository).findBookedDatesBySalonIds(List.of(salonId), fromTs, toExclusive);
+        verifyNoInteractions(masterRepository);
+    }
+
+    @Test
+    @DisplayName("INDEPENDENT_MASTER booked days + asMaster=true is a no-op — same master query")
+    void should_returnMasterScopedDates_when_independentMasterRequestsBookedDaysAsMaster() {
+        LocalDate from = LocalDate.of(2026, 8, 1);
+        LocalDate to = LocalDate.of(2026, 8, 10);
+        OffsetDateTime fromTs = from.atStartOfDay(KYIV).toOffsetDateTime();
+        OffsetDateTime toExclusive = to.plusDays(1).atStartOfDay(KYIV).toOffsetDateTime();
+        UUID actorId = UUID.randomUUID();
+        when(masterRepository.findByUserId(actorId)).thenReturn(Optional.of(master));
+        when(bookingRepository.findBookedDatesByMasterId(masterId, fromTs, toExclusive)).thenReturn(List.of());
+
+        bookingService.getMyBookedDays(actorId, buildAuth(Role.INDEPENDENT_MASTER), from, to, true);
+
+        verify(bookingRepository).findBookedDatesByMasterId(masterId, fromTs, toExclusive);
+        verifyNoInteractions(salonRepository);
+    }
+
+    @Test
+    @DisplayName("CLIENT booked days + asMaster=true is a 400 and runs no query")
+    void should_throwBadRequest_when_clientRequestsBookedDaysAsMaster() {
+        LocalDate from = LocalDate.of(2026, 9, 1);
+        LocalDate to = LocalDate.of(2026, 9, 30);
+
+        assertThatThrownBy(() -> bookingService.getMyBookedDays(clientId, buildAuth(Role.CLIENT), from, to, true))
+                .isInstanceOf(BusinessException.class)
+                .hasMessage("asMaster is only valid for provider roles")
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus()).isEqualTo(HttpStatus.BAD_REQUEST));
+        verifyNoInteractions(bookingRepository);
+    }
+
+    @Test
+    @DisplayName("SALON_OWNER booked days + asMaster=true with an INACTIVE own master row is a 403")
+    void should_throwForbidden_when_salonOwnerRequestsBookedDaysAsMasterWithInactiveRow() {
+        UUID ownerId = UUID.randomUUID();
+        Master inactive = buildMaster(UUID.randomUUID(), MasterType.SALON_OWNER);
+        setField(inactive, "isActive", false);
+        when(masterRepository.findByUserId(ownerId)).thenReturn(Optional.of(inactive));
+
+        assertThatThrownBy(() -> bookingService.getMyBookedDays(
+                ownerId, buildAuth(Role.SALON_OWNER), LocalDate.of(2026, 9, 1), LocalDate.of(2026, 9, 30), true))
+                .isInstanceOf(ForbiddenException.class)
+                .hasMessage("Access denied");
+        verifyNoInteractions(bookingRepository);
+    }
+
+    @Test
+    @DisplayName("SALON_OWNER booked days + asMaster=true with NO master row is a 404 and never reads salon days")
+    void should_throwNotFound_when_salonOwnerRequestsBookedDaysAsMasterWithoutMasterRow() {
+        UUID ownerId = UUID.randomUUID();
+        when(masterRepository.findByUserId(ownerId)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> bookingService.getMyBookedDays(
+                ownerId, buildAuth(Role.SALON_OWNER), LocalDate.of(2026, 9, 1), LocalDate.of(2026, 9, 30), true))
+                .isInstanceOf(NotFoundException.class)
+                .hasMessage("Master profile not found");
+        verifyNoInteractions(bookingRepository, salonRepository);
+    }
+
+    @Test
+    @DisplayName("SALON_OWNER booked days + asMaster=true whose master row is not SALON_OWNER-typed is a 403, "
+            + "no booked-days query")
+    void should_throwForbidden_when_salonOwnerRequestsBookedDaysAsMasterWithNonOwnerTypedRow() {
+        UUID ownerId = UUID.randomUUID();
+        when(masterRepository.findByUserId(ownerId))
+                .thenReturn(Optional.of(buildMaster(UUID.randomUUID(), MasterType.SALON_MASTER)));
+
+        assertThatThrownBy(() -> bookingService.getMyBookedDays(
+                ownerId, buildAuth(Role.SALON_OWNER), LocalDate.of(2026, 9, 1), LocalDate.of(2026, 9, 30), true))
+                .isInstanceOf(ForbiddenException.class)
+                .hasMessage("Access denied");
+        verifyNoInteractions(bookingRepository, salonRepository);
+    }
+
+    @Test
+    @DisplayName("SALON_ADMIN booked days + asMaster=true keeps the existing 403 and never reads a master row")
+    void should_throwForbidden_when_salonAdminRequestsBookedDaysAsMaster() {
+        assertThatThrownBy(() -> bookingService.getMyBookedDays(UUID.randomUUID(), buildAuth(Role.SALON_ADMIN),
+                LocalDate.of(2026, 9, 1), LocalDate.of(2026, 9, 30), true))
+                .isInstanceOf(ForbiddenException.class);
+        verifyNoInteractions(bookingRepository, masterRepository);
+    }
+
+    @Test
+    @DisplayName("SALON_OWNER booked days with asMaster=null (param absent) keeps the salon branch — "
+            + "the 5-arg overload's null is the pre-354 contract")
+    void should_returnSalonScopedDates_when_salonOwnerRequestsBookedDaysWithAsMasterNull() {
+        LocalDate from = LocalDate.of(2026, 9, 1);
+        LocalDate to = LocalDate.of(2026, 9, 30);
+        OffsetDateTime fromTs = from.atStartOfDay(KYIV).toOffsetDateTime();
+        OffsetDateTime toExclusive = to.plusDays(1).atStartOfDay(KYIV).toOffsetDateTime();
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        List<LocalDate> expected = List.of(LocalDate.of(2026, 9, 3));
+        when(salonRepository.findIdsByOwnerIdAndIsActiveTrue(ownerId)).thenReturn(List.of(salonId));
+        when(bookingRepository.findBookedDatesBySalonIds(List.of(salonId), fromTs, toExclusive))
+                .thenReturn(expected.stream().map(java.sql.Date::valueOf).toList());
+
+        var result = bookingService.getMyBookedDays(ownerId, buildAuth(Role.SALON_OWNER), from, to, null);
+
+        assertThat(result).isEqualTo(expected);
+        verifyNoInteractions(masterRepository);
     }
 
     @Test

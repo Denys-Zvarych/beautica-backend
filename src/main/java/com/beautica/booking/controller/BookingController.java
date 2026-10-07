@@ -184,12 +184,19 @@ public class BookingController {
                     + "behaviour against a backend that does not yet know `partition`. Omit for "
                     + "byte-identical pre-Phase-28 behaviour.")
             @RequestParam(required = false) BookingPartition partition,
+            // Phase 354: additive-optional; absent/false => byte-identical pre-354 behaviour.
+            @Parameter(description = "SALON_OWNER only: list the caller's own master-row bookings "
+                    + "(the master view) instead of every salon they own. Ignored for master roles. "
+                    + "When true: CLIENT gets 400; SALON_ADMIN gets 403; an owner whose own master "
+                    + "row is inactive or not owner-typed gets 403; an owner with no master row "
+                    + "gets 404. Absent or false keeps the default behaviour.")
+            @RequestParam(required = false) Boolean asMaster,
             @PageableDefault(size = 20, sort = "startsAt", direction = Sort.Direction.DESC) Pageable pageable,
             Authentication auth
     ) {
         return ApiResponse.ok(bookingService.getMyBookings(
                 AuthenticationUtils.userId(auth), auth, status, from, to, serviceId, partition,
-                clampGiantOffset(pageable)));
+                asMaster, clampGiantOffset(pageable)));
     }
 
     // Phase 29.4: three path segments (/me/unclosed-count), same collision-avoidance rationale as
@@ -215,10 +222,17 @@ public class BookingController {
             @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate from,
             @Parameter(description = "Range end (inclusive), local Europe/Kyiv day. Required.")
             @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate to,
+            // Phase 354: additive-optional; absent/false => byte-identical pre-354 behaviour.
+            @Parameter(description = "SALON_OWNER only: list the caller's own master-row bookings "
+                    + "(the master view) instead of every salon they own. Ignored for master roles. "
+                    + "When true: CLIENT gets 400; SALON_ADMIN gets 403; an owner whose own master "
+                    + "row is inactive or not owner-typed gets 403; an owner with no master row "
+                    + "gets 404. Absent or false keeps the default behaviour.")
+            @RequestParam(required = false) Boolean asMaster,
             Authentication auth
     ) {
         return ApiResponse.ok(bookingService.getMyBookedDays(
-                AuthenticationUtils.userId(auth), auth, from, to));
+                AuthenticationUtils.userId(auth), auth, from, to, asMaster));
     }
 
     /**
