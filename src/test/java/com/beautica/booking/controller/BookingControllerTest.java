@@ -153,7 +153,9 @@ class BookingControllerTest {
                 // reviewByClient (Phase 317 additive) — BookingService is mocked in this slice, so
                 // the field is a literal; the fetch that populates it on GET /bookings/{id} is
                 // pinned by the booking ITs, not by a controller-slice stub.
-                null
+                null,
+                // clientAvgRating / clientReviewCount (two-sided ratings additive) — literal stub
+                new BigDecimal("4.50"), 7
         );
     }
 

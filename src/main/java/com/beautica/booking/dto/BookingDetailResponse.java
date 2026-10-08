@@ -486,7 +486,24 @@ public record BookingDetailResponse(
                         + "booking through GET /bookings/{id} to learn that. This is the same "
                         + "explicitly-surface-scoped contract providerCanReviewClient already "
                         + "documents on this DTO.")
-        ClientAuthoredReviewResponse reviewByClient
+        ClientAuthoredReviewResponse reviewByClient,
+        // Two-sided ratings. Appended LAST like every field above. Same denormalized-column read as
+        // the masterAvgRating/masterReviewCount pair (users.avg_rating / users.review_count, kept
+        // current by ClientReviewRepository's recalculation), off the `client` User already
+        // materialised for clientAvatarUrl — no extra query, join or N+1 on any path.
+        @Schema(types = {"number", "null"}, nullable = true,
+                description = "The booking client's aggregate rating from providers' reviews of "
+                        + "them, 1.00-5.00, read off the denormalized users.avg_rating column. NULL "
+                        + "when clientReviewCount is 0 (the unreviewed state is not a rating — "
+                        + "render 'no reviews yet', never 0) and NULL for a guest/no-client "
+                        + "booking. Number only: review comments are never exposed here. Intended "
+                        + "for provider viewers; a client viewer only ever receives their own.")
+        BigDecimal clientAvgRating,
+        @Schema(types = {"integer", "null"}, nullable = true,
+                description = "How many provider reviews clientAvgRating is computed from. 0 for "
+                        + "an unreviewed registered client; NULL for a guest/no-client booking "
+                        + "(no account, so 'unknown' rather than 'zero').")
+        Integer clientReviewCount
 ) {
 
     /**
@@ -687,7 +704,12 @@ public record BookingDetailResponse(
                 // different aggregate (reviews), is reachable from no association on Booking, and
                 // only the DETAIL call path pays the statement that fetches it. Every other caller
                 // of this factory passes null on purpose; see the component's own @Schema.
-                reviewByClient
+                reviewByClient,
+                // Two-sided ratings — scalars off the SAME `client` row as clientAvatarUrl above
+                // (already LEFT JOIN FETCHed by both hydrating queries): no statement added. The
+                // zero-review normalisation reuses masterAvgRatingOrNull, not a parallel helper.
+                client != null ? masterAvgRatingOrNull(client.getReviewCount(), client.getAvgRating()) : null,
+                client != null ? client.getReviewCount() : null
         );
     }
 }

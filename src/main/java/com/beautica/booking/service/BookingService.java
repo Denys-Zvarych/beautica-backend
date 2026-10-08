@@ -606,7 +606,14 @@ public class BookingService {
                 // only", and populating it on ONE of the four listing surfaces would make a null
                 // mean two different things depending on which list a row came from. Widen all
                 // four together or none.
-                null);
+                null,
+                // Two-sided ratings — the caller's own rating off the already-joined client row;
+                // same shared normalisation as the entity path.
+                // Null-safe: a null count (no client row) yields null/null, matching the entity
+                // path's guest semantics.
+                p.clientReviewCount() == null ? null
+                        : BookingDetailResponse.masterAvgRatingOrNull(p.clientReviewCount(), p.clientAvgRating()),
+                p.clientReviewCount());
     }
 
     /**

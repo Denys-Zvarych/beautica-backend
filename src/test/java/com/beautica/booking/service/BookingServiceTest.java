@@ -3394,7 +3394,9 @@ class BookingServiceTest {
                 new BigDecimal("4.75"), 12,
                 // Phase B2 salonId — this fixture is an INDEPENDENT_MASTER row, so null is the
                 // correct value; the salon case has its own fixture below.
-                null);
+                null,
+                // Two-sided ratings clientAvgRating/clientReviewCount
+                new BigDecimal("4.50"), 7);
     }
 
     @Test
@@ -3413,6 +3415,27 @@ class BookingServiceTest {
         assertThat(result.data()).hasSize(1);
         assertThat(result.data().get(0).masterProfessionalTitle()).isEqualTo("Перукар-стиліст");
         assertThat(result.data().get(0).locationNote()).isEqualTo("3-й поверх, код 1234");
+    }
+
+    @Test
+    @DisplayName("getMyBookings (CLIENT) maps clientAvgRating/clientReviewCount from the projection, and nulls the average at zero reviews")
+    void should_mapClientRating_when_clientProjectionRowCarriesIt() {
+        var reviewed = firstClientRowFor(clientProjectionRow(null, null));
+        var unreviewed = firstClientRowFor(clientProjectionRowWithCeiling(null));
+
+        assertThat(reviewed.clientAvgRating()).isEqualByComparingTo(new BigDecimal("4.50"));
+        assertThat(reviewed.clientReviewCount()).isEqualTo(7);
+        assertThat(unreviewed.clientAvgRating()).isNull();
+        assertThat(unreviewed.clientReviewCount()).isZero();
+    }
+
+    @Test
+    @DisplayName("getMyBookings (CLIENT) maps a null clientReviewCount to null/null (no unboxing NPE)")
+    void should_mapNullClientRatingAndCount_when_projectionClientReviewCountIsNull() {
+        var row = firstClientRowFor(clientProjectionRowWithCeilingAndClientCount(null, null));
+
+        assertThat(row.clientAvgRating()).isNull();
+        assertThat(row.clientReviewCount()).isNull();
     }
 
     @Test
@@ -3442,6 +3465,11 @@ class BookingServiceTest {
 
     private com.beautica.booking.repository.ClientBookingDetailProjection clientProjectionRowWithCeiling(
             java.math.BigDecimal priceMaxAtBooking) {
+        return clientProjectionRowWithCeilingAndClientCount(priceMaxAtBooking, 0);
+    }
+
+    private com.beautica.booking.repository.ClientBookingDetailProjection clientProjectionRowWithCeilingAndClientCount(
+            java.math.BigDecimal priceMaxAtBooking, Integer clientReviewCount) {
         return new com.beautica.booking.repository.ClientBookingDetailProjection(
                 bookingId, clientId, masterId, masterServiceId, "Manicure",
                 BookingStatus.CONFIRMED,
@@ -3463,7 +3491,9 @@ class BookingServiceTest {
                 // Phase B1 masterAvgRating/masterReviewCount — irrelevant here too.
                 new BigDecimal("4.20"), 3,
                 // Phase B2 salonId — irrelevant to price-ceiling assertions.
-                null);
+                null,
+                // Two-sided ratings clientAvgRating/clientReviewCount — unreviewed client
+                clientReviewCount == null ? null : new BigDecimal("0.00"), clientReviewCount);
     }
 
     private com.beautica.booking.dto.BookingDetailResponse firstClientRowFor(
@@ -3527,7 +3557,9 @@ class BookingServiceTest {
                 null,
                 masterAvgRating, masterReviewCount,
                 // Phase B2 salonId — irrelevant to the rating normalisation.
-                null);
+                null,
+                // Two-sided ratings clientAvgRating/clientReviewCount — unreviewed client
+                null, 0);
     }
 
     @Test
@@ -3576,7 +3608,9 @@ class BookingServiceTest {
                 null,
                 null,
                 new BigDecimal("4.20"), 3,
-                salonId);
+                salonId,
+                // Two-sided ratings clientAvgRating/clientReviewCount — unreviewed client
+                null, 0);
     }
 
     /**
@@ -3643,7 +3677,9 @@ class BookingServiceTest {
                 null,
                 new BigDecimal("4.20"), 3,
                 // Phase B2 salonId — irrelevant to the categoryKey normalisation.
-                null);
+                null,
+                // Two-sided ratings clientAvgRating/clientReviewCount — unreviewed client
+                null, 0);
     }
 
     @Test
@@ -3696,7 +3732,9 @@ class BookingServiceTest {
                 // Phase B1 masterAvgRating/masterReviewCount — irrelevant to ordering.
                 new BigDecimal("4.20"), 3,
                 // Phase B2 salonId — irrelevant to ordering.
-                null);
+                null,
+                // Two-sided ratings clientAvgRating/clientReviewCount — unreviewed client
+                null, 0);
     }
 
     // ── Phase 26.7.1 security finding (LOW): the CLIENT branch's order re-imposition had no

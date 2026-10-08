@@ -131,6 +131,13 @@ public record ClientBookingDetailProjection(
         // the salon aggregate a client must invalidate. Since phase 242 the `s` alias is itself
         // `LEFT JOIN b.salon`, so `s.id` would now give the same answer — the explicit `b.salon.id`
         // is kept because it needs no join at all and states the intent at the point of use.
-        UUID salonId
+        UUID salonId,
+        // Two-sided ratings: the client's denormalized users.avg_rating / review_count, selected
+        // RAW off the ALREADY-PRESENT `JOIN b.client` (same row as clientAvatarUrl) — no extra
+        // join or query. Normalised in BookingDetailResponse#masterAvgRatingOrNull. Appended last.
+        // clientReviewCount is boxed so a future LEFT JOIN with a null client yields null, not an
+        // unboxing failure in the JPQL constructor (-> 500).
+        BigDecimal clientAvgRating,
+        Integer clientReviewCount
 ) {
 }

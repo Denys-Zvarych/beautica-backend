@@ -6,6 +6,7 @@ import com.beautica.auth.dto.LoginRequest;
 import com.beautica.booking.dto.BookingDetailResponse;
 import com.beautica.common.ApiResponse;
 import com.beautica.config.TestSecurityConfig;
+import com.beautica.review.repository.ClientReviewRepository;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -21,6 +22,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.lang.reflect.RecordComponent;
 import java.math.BigDecimal;
@@ -82,6 +84,12 @@ class BookingDetailContractIT extends AbstractIntegrationTest {
     @Autowired
     private PasswordEncoder passwordEncoder;
 
+    @Autowired
+    private ClientReviewRepository clientReviewRepository;
+
+    @Autowired
+    private TransactionTemplate transactionTemplate;
+
     @Test
     @DisplayName("GET /bookings/{id} (entity path) and the matching row of GET /bookings/me "
             + "(CLIENT projection path) return IDENTICAL values for EVERY BookingDetailResponse "
@@ -89,6 +97,7 @@ class BookingDetailContractIT extends AbstractIntegrationTest {
             + "shape that let COALESCE leak the master's personal locationNote (HIGH regression)")
     void should_matchEveryDtoField_when_salonEmployedMasterBookingFetchedViaBothPaths() throws Exception {
         Fixture fx = seedSalonBookingWithDivergentAddresses();
+        seedClientReviewAggregate(fx);
         UUID bookingId = insertConfirmedBooking(fx);
         String clientToken = tokenFor(fx.clientEmail());
 
@@ -181,6 +190,28 @@ class BookingDetailContractIT extends AbstractIntegrationTest {
                 .isEqualByComparingTo(MASTER_AVG_RATING);
         assertThat(single.get("masterReviewCount").asInt()).isEqualTo(MASTER_REVIEW_COUNT);
         assertThat(listItem.get("masterReviewCount").asInt()).isEqualTo(MASTER_REVIEW_COUNT);
+
+        // clientAvgRating/clientReviewCount non-vacuity. ClientBookingDetailProjection is built
+        // POSITIONALLY by the JPQL constructor expression, so a reorder of its trailing components
+        // compiles and only misbehaves at runtime. The reflective loop above compares both fields,
+        // but would compare null == null / 0 == 0 against column defaults; the seeded aggregate
+        // (two real client_reviews rows, recalculated) is what lets a swapped or shifted
+        // projection argument fail HERE, on both paths, with distinct avg (4.50) and count (2).
+        assertThat(new BigDecimal(single.get("clientAvgRating").asText()))
+                .as("entity path must serve the seeded client rating, actual=%s", single.get("clientAvgRating"))
+                .isEqualByComparingTo(CLIENT_AVG_RATING);
+        assertThat(new BigDecimal(listItem.get("clientAvgRating").asText()))
+                .as("CLIENT projection path must serve the same client rating, actual=%s",
+                        listItem.get("clientAvgRating"))
+                .isEqualByComparingTo(CLIENT_AVG_RATING);
+        assertThat(single.get("clientReviewCount").asInt()).isEqualTo(CLIENT_REVIEW_COUNT);
+        assertThat(listItem.get("clientReviewCount").asInt()).isEqualTo(CLIENT_REVIEW_COUNT);
+        assertThat(listItem.get("clientReviewCount").asInt())
+                .as("the client's count must never be read from the master's slot")
+                .isNotEqualTo(listItem.get("masterReviewCount").asInt());
+        assertThat(new BigDecimal(listItem.get("clientAvgRating").asText()))
+                .as("the client's rating must never be read from the master's slot")
+                .isNotEqualByComparingTo(new BigDecimal(listItem.get("masterAvgRating").asText()));
 
         // salonId non-vacuity (Phase B2). The reflective loop above already compares the field,
         // but it would compare null == null for an independent master's booking; this fixture
@@ -508,7 +539,181 @@ class BookingDetailContractIT extends AbstractIntegrationTest {
         }
     }
 
+    @Test
+    @DisplayName("GET /bookings/{id} — the booking's own master (provider) receives the client's "
+            + "real client_reviews aggregate (avg + count) on the entity path and on the provider list row")
+    void should_serveClientRatingAggregate_when_providerReadsBookingOfReviewedClient() throws Exception {
+        Fixture fx = seedSalonBookingWithDivergentAddresses();
+        seedClientReviewAggregate(fx);
+        UUID bookingId = insertConfirmedBooking(fx);
+        String masterToken = tokenFor(jdbcTemplate.queryForObject(
+                "SELECT email FROM users WHERE id = ?", String.class, fx.masterUserId()));
+
+        JsonNode detail = getBookingDetail(bookingId, masterToken);
+        JsonNode listRow = findInMyBookings(bookingId, masterToken);
+
+        assertThat(listRow).as("the master must see booking %s on their timeline", bookingId).isNotNull();
+        for (JsonNode row : List.of(detail, listRow)) {
+            assertThat(new BigDecimal(row.get("clientAvgRating").asText()))
+                    .as("clientAvgRating, actual=%s", row.get("clientAvgRating"))
+                    .isEqualByComparingTo(CLIENT_AVG_RATING);
+            assertThat(row.get("clientReviewCount").asInt()).isEqualTo(CLIENT_REVIEW_COUNT);
+        }
+    }
+
+    @Test
+    @DisplayName("GET /bookings/{id} — a registered client with zero provider reviews serves "
+            + "clientAvgRating null and clientReviewCount 0 (unreviewed is not a rating)")
+    void should_serveNullRatingAndZeroCount_when_registeredClientHasNoReviews() throws Exception {
+        Fixture fx = seedSalonBookingWithDivergentAddresses();
+        UUID bookingId = insertConfirmedBooking(fx);
+        String masterToken = tokenFor(jdbcTemplate.queryForObject(
+                "SELECT email FROM users WHERE id = ?", String.class, fx.masterUserId()));
+
+        JsonNode detail = getBookingDetail(bookingId, masterToken);
+
+        assertThat(detail.get("clientAvgRating").isNull())
+                .as("clientAvgRating must be null, actual=%s", detail.get("clientAvgRating")).isTrue();
+        assertThat(detail.get("clientReviewCount").asInt()).isZero();
+    }
+
+    @Test
+    @DisplayName("GET /bookings/{id} — a guest (no client account) booking serves "
+            + "clientAvgRating null and clientReviewCount null")
+    void should_serveNullClientRatingAndCount_when_bookingIsGuestBooking() throws Exception {
+        Fixture fx = seedSalonBookingWithDivergentAddresses();
+        UUID bookingId = insertGuestBooking(fx);
+        String masterToken = tokenFor(jdbcTemplate.queryForObject(
+                "SELECT email FROM users WHERE id = ?", String.class, fx.masterUserId()));
+
+        JsonNode detail = getBookingDetail(bookingId, masterToken);
+
+        assertThat(detail.get("clientAvgRating").isNull())
+                .as("guest clientAvgRating must be an explicit null, actual=%s", detail.get("clientAvgRating"))
+                .isTrue();
+        assertThat(detail.get("clientReviewCount").isNull())
+                .as("guest clientReviewCount must be an explicit null (unknown, not zero), actual=%s",
+                        detail.get("clientReviewCount"))
+                .isTrue();
+    }
+
+    @Test
+    @DisplayName("GET /bookings/{id} — 403 with no clientAvgRating/clientReviewCount when a DIFFERENT "
+            + "client reads someone else's booking")
+    void should_notExposeClientRating_when_otherClientReadsBooking() throws Exception {
+        Fixture fx = seedSalonBookingWithDivergentAddresses();
+        seedClientReviewAggregate(fx);
+        UUID bookingId = insertConfirmedBooking(fx);
+
+        JsonNode legitimate = getBookingDetail(bookingId, tokenFor(fx.clientEmail()));
+        assertThat(legitimate.get("clientReviewCount").asInt())
+                .as("premise — the owner read really carries the rating, so absence below is meaningful")
+                .isEqualTo(CLIENT_REVIEW_COUNT);
+
+        String otherEmail = "contract-other-client-" + System.nanoTime() + "@beautica.test";
+        createUser(otherEmail, "CLIENT", null);
+
+        ResponseEntity<String> resp = restTemplate.exchange(
+                BOOKINGS_URL + "/" + bookingId, HttpMethod.GET,
+                new HttpEntity<>(bearerHeaders(tokenFor(otherEmail))), String.class);
+
+        assertThat(resp.getStatusCode())
+                .as("a different CLIENT must be denied, body=%s", resp.getBody())
+                .isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(collectFieldNames(objectMapper.readTree(resp.getBody())))
+                .as("no rating key may appear anywhere in the 403 tree, body=%s", resp.getBody())
+                .doesNotContain("clientAvgRating", "clientReviewCount");
+        assertThat(resp.getBody())
+                .as("the seeded rating value must not leak into the raw 403 body")
+                .doesNotContain(CLIENT_AVG_RATING.toPlainString());
+    }
+
+    @Test
+    @DisplayName("GET /bookings/{id} — 403 with no clientAvgRating/clientReviewCount when a "
+            + "SALON_MASTER of a DIFFERENT salon reads someone else's booking")
+    void should_notExposeClientRating_when_foreignSalonMasterReadsBooking() throws Exception {
+        Fixture fx = seedSalonBookingWithDivergentAddresses();
+        seedClientReviewAggregate(fx);
+        UUID bookingId = insertConfirmedBooking(fx);
+
+        JsonNode legitimate = getBookingDetail(bookingId, tokenFor(fx.clientEmail()));
+        assertThat(legitimate.get("clientReviewCount").asInt())
+                .as("premise — an authorized read carries the rating, so absence below is meaningful")
+                .isEqualTo(CLIENT_REVIEW_COUNT);
+
+        Fixture otherSalon = seedSalonBookingWithDivergentAddresses();
+        assertThat(otherSalon.salonId())
+                .as("premise — the foreign master must belong to a different salon")
+                .isNotEqualTo(fx.salonId());
+        String foreignMasterEmail = jdbcTemplate.queryForObject(
+                "SELECT email FROM users WHERE id = ?", String.class, otherSalon.masterUserId());
+
+        ResponseEntity<String> resp = restTemplate.exchange(
+                BOOKINGS_URL + "/" + bookingId, HttpMethod.GET,
+                new HttpEntity<>(bearerHeaders(tokenFor(foreignMasterEmail))), String.class);
+
+        assertThat(resp.getStatusCode())
+                .as("a foreign-salon SALON_MASTER must be denied, body=%s", resp.getBody())
+                .isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(collectFieldNames(objectMapper.readTree(resp.getBody())))
+                .as("no rating key may appear anywhere in the 403 tree, body=%s", resp.getBody())
+                .doesNotContain("clientAvgRating", "clientReviewCount");
+        assertThat(resp.getBody())
+                .as("the seeded rating value must not leak into the raw 403 body")
+                .doesNotContain(CLIENT_AVG_RATING.toPlainString());
+    }
+
     // ── helpers ────────────────────────────────────────────────────────────────
+
+    private static final BigDecimal CLIENT_AVG_RATING = new BigDecimal("4.50");
+    private static final int CLIENT_REVIEW_COUNT = 2;
+
+    /**
+     * Seeds a REAL provider-to-client aggregate: two past COMPLETED bookings for the fixture's
+     * client, one client_reviews row each (5 and 4), then the production recalculation
+     * ({@code ClientReviewRepository#recalculateClientRating}) writes users.avg_rating/review_count
+     * — so the 4.50 / 2 under test is derived, not hand-set.
+     */
+    private void seedClientReviewAggregate(Fixture fx) {
+        int[] ratings = {5, 4};
+        for (int i = 0; i < ratings.length; i++) {
+            UUID pastBookingId = UUID.randomUUID();
+            int daysAgo = 10 + i * 2;
+            jdbcTemplate.update(
+                    "INSERT INTO bookings (id, client_id, master_id, master_service_id, salon_id, status, "
+                            + "starts_at, ends_at, price_at_booking, duration_minutes_at_booking, "
+                            + "buffer_minutes_at_booking, booking_source, created_at, updated_at) "
+                            + "VALUES (?, ?, ?, ?, ?, 'COMPLETED', NOW() - make_interval(days => ?), "
+                            + "NOW() - make_interval(days => ?) + interval '1 hour', 500.00, 60, 0, 'APP', "
+                            + "NOW(), NOW())",
+                    pastBookingId, fx.clientId(), fx.masterId(), fx.masterServiceId(), fx.salonId(),
+                    daysAgo, daysAgo);
+            jdbcTemplate.update(
+                    "INSERT INTO client_reviews (id, booking_id, subject_client_id, author_master_id, "
+                            + "salon_id, rating) VALUES (?, ?, ?, ?, ?, ?)",
+                    UUID.randomUUID(), pastBookingId, fx.clientId(), fx.masterId(), fx.salonId(), ratings[i]);
+        }
+        transactionTemplate.executeWithoutResult(
+                status -> clientReviewRepository.recalculateClientRating(fx.clientId()));
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT review_count FROM users WHERE id = ?", Integer.class, fx.clientId()))
+                .as("fixture sanity — recalculation must have produced the aggregate")
+                .isEqualTo(CLIENT_REVIEW_COUNT);
+    }
+
+    private UUID insertGuestBooking(Fixture fx) {
+        UUID bookingId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO bookings (id, master_id, master_service_id, salon_id, status, "
+                        + "starts_at, ends_at, price_at_booking, duration_minutes_at_booking, "
+                        + "buffer_minutes_at_booking, booking_source, guest_name, guest_surname, "
+                        + "guest_phone, cancel_token, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, ?, 'CONFIRMED', NOW() + interval '1 day', "
+                        + "NOW() + interval '1 day 1 hour', 500.00, 60, 0, 'LINK', 'Гість', "
+                        + "'Тестовий', '+380509998877', ?, NOW(), NOW())",
+                bookingId, fx.masterId(), fx.masterServiceId(), fx.salonId(), UUID.randomUUID());
+        return bookingId;
+    }
 
     private static final String CLIENT_FIRST_NAME = "Оксана";
     private static final String CLIENT_LAST_NAME = "Кравченко";

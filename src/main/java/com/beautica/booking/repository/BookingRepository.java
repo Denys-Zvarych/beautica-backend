@@ -666,7 +666,9 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
                 b.client.avatarUrl,
                 m.avgRating,
                 m.reviewCount,
-                b.salon.id
+                b.salon.id,
+                b.client.avgRating,
+                b.client.reviewCount
             )
             FROM Booking b
             JOIN b.client
