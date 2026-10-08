@@ -29,9 +29,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  * predicate), and at a salon only the booking's OWNER/ADMIN complete AND rate; the invited
  * {@code SALON_MASTER} does neither. The independent master is unchanged.
  *
- * <p>The assigned {@code SALON_ADMIN} cannot read {@code GET /bookings/{id}} or {@code GET
- * /bookings/me} (pre-existing view-gate decision, locked at phase 24.2); their flag is observed on
- * the salon board, {@code GET /bookings/salon/{salonId}}.
+ * <p>The assigned {@code SALON_ADMIN} reads {@code GET /bookings/{id}} since phase 356 (not {@code
+ * GET /bookings/me}); their flag is observed on detail and on the salon board, {@code GET
+ * /bookings/salon/{salonId}}.
  */
 @Import(TestSecurityConfig.class)
 @DisplayName("Salon client-feedback authority — complete, flag, rate agree per role (phase 355)")
@@ -91,14 +91,12 @@ class SalonClientFeedbackAuthorityIT extends AbstractIntegrationTest {
         assertThat(patchComplete(bookingId, token)).isEqualTo(HttpStatus.NO_CONTENT);
         assertThat(dbStatus(bookingId)).isEqualTo("COMPLETED");
 
-        // Phase 356 widens the admin view gate (admin may read GET /bookings/{id}); it will update this
-        // 403 assertion and observe the flag on detail as well.
-        assertThat(getStatus(BOOKINGS_URL + "/" + bookingId, token))
-                .as("pre-existing: the admin view gate excludes GET /bookings/{id}")
-                .isEqualTo(HttpStatus.FORBIDDEN);
+        // Phase 356: the assigned admin may read GET /bookings/{id}; the flag is observed there too.
+        boolean detail = detailFlag(bookingId, token);
         boolean board = boardFlag(salon.salonId(), bookingId, token);
         HttpStatus rate = rate(bookingId, token);
 
+        assertThat(detail).as("detail flag").isTrue();
         assertThat(board).as("salon-board flag").isTrue();
         assertThat(rate).as("rate").isEqualTo(HttpStatus.CREATED);
     }

@@ -105,24 +105,12 @@ class ProviderCanReviewClientIT extends AbstractIntegrationTest {
     }
 
     /**
-     * NOT the "true" case the track-27 spec originally asked for. Investigation found that
-     * {@code GET /bookings/{id}} is gated by {@code AuthorizationService#enforceCanViewBooking}
-     * — a SEPARATE, pre-existing, and deliberately owner-only predicate (see
-     * {@code isAuthorizedToManageBooking}'s javadoc: "Do NOT broaden this predicate... the
-     * divergence [from the provider-action predicate, which DOES admit SALON_ADMIN] is
-     * intentional", locked at Phase 24.2) that NEVER admits {@code SALON_ADMIN} — assigned or
-     * not. So an assigned admin 403s on the view gate before {@code providerCanReviewClient} is
-     * ever computed, even though {@code hasProviderAuthorityOverBooking} (the predicate this
-     * field reuses, and the one {@code POST /client-reviews} enforces) WOULD admit them. This
-     * pins that real, pre-existing behaviour rather than asserting a 200+true outcome the system
-     * cannot produce — flagged to the requester rather than silently widening the view gate,
-     * which is a separate authorization-scope decision this task did not ask for.
+     * Phase 356 — an assigned, active {@code SALON_ADMIN} passes {@code enforceCanViewBooking}, so
+     * {@code providerCanReviewClient} is reachable for this role via {@code GET /bookings/{id}}.
      */
     @Test
-    @DisplayName("403 (NOT the DTO) — an assigned SALON_ADMIN cannot reach GET /bookings/{id} at "
-            + "all; the pre-existing owner-only view gate excludes SALON_ADMIN regardless of "
-            + "assignment, so providerCanReviewClient is unreachable for this role via this endpoint")
-    void should_return403_when_assignedSalonAdminViewsBookingDetail() throws Exception {
+    @DisplayName("200 + providerCanReviewClient true — an assigned SALON_ADMIN reads GET /bookings/{id} (phase 356)")
+    void should_return200WithFlag_when_assignedSalonAdminViewsBookingDetail() throws Exception {
         Salon salon = createSalon("pcrc-admin-owner-" + System.nanoTime() + "@beautica.test");
         String adminEmail = "pcrc-admin-" + System.nanoTime() + "@beautica.test";
         createUser(adminEmail, "SALON_ADMIN", salon.salonId());
@@ -134,11 +122,9 @@ class ProviderCanReviewClientIT extends AbstractIntegrationTest {
                 BOOKINGS_URL + "/" + bookingId, HttpMethod.GET,
                 new HttpEntity<>(bearerHeaders(tokenFor(adminEmail))), String.class);
 
-        assertThat(resp.getStatusCode())
-                .as("enforceCanViewBooking excludes SALON_ADMIN unconditionally — even an admin "
-                        + "assigned to this exact salon — so this 403s before providerCanReviewClient "
-                        + "is ever computed; body=%s", resp.getBody())
-                .isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(resp.getStatusCode()).as("body=%s", resp.getBody()).isEqualTo(HttpStatus.OK);
+        assertThat(objectMapper.readTree(resp.getBody()).path("data").path("providerCanReviewClient").asBoolean())
+                .isTrue();
     }
 
     /**
@@ -685,9 +671,8 @@ class ProviderCanReviewClientIT extends AbstractIntegrationTest {
                         + "they are admitted by isAuthorizedToManageBooking, which carries no "
                         + "liveness term and must not acquire one")
                 .isEqualTo(HttpStatus.OK);
-        // A SALON_ADMIN control is deliberately absent: enforceCanViewBooking excludes that role
-        // unconditionally, deactivated master or not — pinned by
-        // should_return403_when_assignedSalonAdminViewsBookingDetail above.
+        // A SALON_ADMIN control is deliberately absent: since phase 356 an admin is denied here because
+        // the performer is inactive — pinned by SalonAdminBookingViewIT.
     }
 
     // ── HTTP helpers ─────────────────────────────────────────────────────────────

@@ -82,9 +82,10 @@ import java.util.UUID;
  * <p><b>Guest (LINK) bookings.</b> A guest booking has no registered account —
  * {@code client_id} is {@code NULL} (V89 {@code chk_bookings_guest_fields}) — so {@code clientId}
  * is nullable here. {@code clientFirstName}/{@code clientLastName} fall back to the booking's
- * OTP-verified {@code guestName}/{@code guestSurname} so the owning provider (the only actor who
- * can ever reach a guest booking's detail view — {@code enforceCanViewBooking} never admits a
- * CLIENT actor onto a null-client booking) still has a name to put on their calendar.
+ * OTP-verified {@code guestName}/{@code guestSurname} so the viewing provider side (the performing
+ * provider, the salon owner, and — since phase 356 — an assigned, active {@code SALON_ADMIN} of the
+ * booking's salon; {@code enforceCanViewBooking} never admits a CLIENT actor onto a null-client
+ * booking) still has a name to put on their calendar.
  * {@code guestPhone} is deliberately NOT surfaced by this DTO — it is SMS-transport PII, not
  * calendar-display PII, and has no field here to leak into. {@code clientAvatarUrl} has NO guest
  * fallback and is always {@code null} for a guest booking: there is no account, hence no uploaded

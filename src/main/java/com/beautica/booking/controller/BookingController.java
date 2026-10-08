@@ -121,6 +121,10 @@ public class BookingController {
 
     @GetMapping("/{bookingId}")
     @PreAuthorize("isAuthenticated()")
+    @Operation(summary = "Get a booking",
+            description = "200 for the owning client, the performing master, the salon owner, or an "
+                    + "assigned, active salon admin of the booking's salon. 403 for anyone else "
+                    + "(also when the booking does not exist).")
     public ApiResponse<BookingDetailResponse> getBooking(
             @PathVariable UUID bookingId,
             Authentication auth

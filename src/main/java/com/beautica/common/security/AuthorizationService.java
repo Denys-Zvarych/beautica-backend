@@ -1034,8 +1034,9 @@ public class AuthorizationService {
      *   <li>{@code actorRole == SALON_MASTER} → {@code masterIsActive && masterUserId == actorId} —
      *       the ONLY branch that reads {@code masterIsActive}, so a deactivated stylist loses view
      *       of bookings they used to perform.</li>
-     *   <li>{@code SALON_ADMIN} → structurally excluded; no branch above admits it. Do NOT widen
-     *       this method to admit {@code SALON_ADMIN} — {@code NotificationViewAssembler} grants
+     *   <li>{@code SALON_ADMIN} → excluded from THIS predicate; no branch above admits it
+     *       ({@link #enforceCanViewBooking} admits an assigned admin via {@code hasManagementAccess},
+     *       phase 356). Do NOT widen this method to admit {@code SALON_ADMIN} — {@code NotificationViewAssembler} grants
      *       admin visibility itself, via a live "still assigned to this salon" check that has no
      *       equivalent here (see that class's {@code isVisible}/{@code managesSalon}), exactly the
      *       divergence {@link #isAuthorizedToManageBooking}'s javadoc already documents between
@@ -1828,7 +1829,14 @@ public class AuthorizationService {
      * guard are copied verbatim from {@link #isPerformingMasterOfRow} so the two cannot disagree
      * about who the performing master is.
      *
-     * <p><b>OWNER/ADMIN are unaffected.</b> They are admitted by {@link
+     * <p><b>Phase 356 — assigned SALON_ADMIN.</b> {@link #isAuthorizedToManageBooking} excludes
+     * {@code SALON_ADMIN}; this method admits an assigned, active admin through its own final leg
+     * via {@link #hasManagementAccess(UUID, UUID)} (live assignment + {@code users.is_active}),
+     * for an active performing master whose live salon equals the booking's own salon snapshot
+     * (the salon board's filter), so a rotated master's old-salon history stays invisible to the
+     * new salon's admin.
+     *
+     * <p><b>OWNER is unaffected.</b> The owner is admitted by {@link
      * #isAuthorizedToManageBooking} above, which never reaches this branch and carries no liveness
      * term — a salon owner keeps full view of a booking whose master has since been deactivated,
      * exactly as they keep complete/decline/reschedule over it (see {@link BookingReviewAccess}'s
@@ -1850,6 +1858,20 @@ public class AuthorizationService {
                 && roleFromCurrentAuthentication() == Role.SALON_MASTER
                 && masterUserId(performer) != null
                 && masterUserId(performer).equals(actorUserId)) {
+            return;
+        }
+        // Phase 356 — an ASSIGNED, ACTIVE SALON_ADMIN may view a booking performed at their salon.
+        // Liveness (still assigned + users.is_active) comes from hasManagementAccess; the performer
+        // must be active and the salon is the master's LIVE one, so a detached/rotated master never
+        // matches. Independent masters have no salon and can never match. The booking's own salon
+        // snapshot must ALSO equal the master's live salon (the board filters on b.salon_id), so after
+        // a rotation the new salon's admin cannot read the old salon's history.
+        if (roleFromCurrentAuthentication() == Role.SALON_ADMIN
+                && performer.isActive()
+                && performer.getSalon() != null
+                && booking.getSalon() != null
+                && booking.getSalon().getId().equals(performer.getSalon().getId())
+                && hasManagementAccess(performer.getSalon().getId(), actorUserId)) {
             return;
         }
         throw new ForbiddenException("Access denied");
@@ -1917,7 +1939,8 @@ public class AuthorizationService {
         // ID-ownership checks below, which a SALON_MASTER cannot satisfy because their userId is
         // never equal to the salon owner's userId.
         //
-        // SALON_ADMIN exclusion: implicit via ownership semantics — SALON_ADMIN has a distinct userId
+        // SALON_ADMIN exclusion (from THIS predicate; enforceCanViewBooking admits an assigned admin via
+        // hasManagementAccess — phase 356): implicit via ownership semantics — SALON_ADMIN has a distinct userId
         // from the salon owner, so the owner-ID equality check below always returns false for them.
         Master master = booking.getMaster();
         if (master.getMasterType() == MasterType.INDEPENDENT_MASTER) {

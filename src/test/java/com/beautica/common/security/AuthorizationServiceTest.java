@@ -2959,6 +2959,101 @@ class AuthorizationServiceTest {
                 .isInstanceOf(ForbiddenException.class);
     }
 
+    // ── enforceCanViewBooking — phase 356 SALON_ADMIN leg, one test per conjunct ──
+
+    /** Admin actor + booking whose snapshot salon / performer salon / active flag are chosen by the caller. */
+    private Booking adminLegBooking(UUID bookingSalonId, UUID performerSalonId, boolean performerActive) {
+        User salonOwner = mock(User.class);
+        lenient().when(salonOwner.getId()).thenReturn(UUID.randomUUID());
+        User client = mock(User.class);
+        lenient().when(client.getId()).thenReturn(UUID.randomUUID());
+        Master master = mock(Master.class);
+        lenient().when(master.getMasterType()).thenReturn(MasterType.SALON_MASTER);
+        lenient().when(master.isActive()).thenReturn(performerActive);
+        if (performerSalonId != null) {
+            Salon performerSalon = mock(Salon.class);
+            lenient().when(performerSalon.getId()).thenReturn(performerSalonId);
+            lenient().when(performerSalon.getOwner()).thenReturn(salonOwner);
+            lenient().when(master.getSalon()).thenReturn(performerSalon);
+        }
+        Booking booking = mock(Booking.class);
+        lenient().when(booking.getMaster()).thenReturn(master);
+        lenient().when(booking.getClient()).thenReturn(client);
+        if (bookingSalonId != null) {
+            Salon bookingSalon = mock(Salon.class);
+            lenient().when(bookingSalon.getId()).thenReturn(bookingSalonId);
+            lenient().when(booking.getSalon()).thenReturn(bookingSalon);
+        }
+        return booking;
+    }
+
+    @Test
+    @DisplayName("enforceCanViewBooking admits an assigned admin when performer is active, has a salon equal to the booking's, and hasManagementAccess holds")
+    void should_admitAdmin_when_allPhase356ConjunctsHold() {
+        UUID adminId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        Booking booking = adminLegBooking(salonId, salonId, true);
+        when(userRepository.findSalonIdById(adminId)).thenReturn(Optional.of(salonId));
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(adminId, "ROLE_SALON_ADMIN"));
+
+        assertThatCode(() -> authorizationService.enforceCanViewBooking(adminId, booking))
+                .doesNotThrowAnyException();
+        verify(userRepository).findSalonIdById(adminId);
+    }
+
+    @Test
+    @DisplayName("enforceCanViewBooking denies an admin when the performing master is inactive, without the assignment lookup")
+    void should_denyAdmin_when_performerInactive() {
+        UUID adminId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        Booking booking = adminLegBooking(salonId, salonId, false);
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(adminId, "ROLE_SALON_ADMIN"));
+
+        assertThatThrownBy(() -> authorizationService.enforceCanViewBooking(adminId, booking))
+                .isInstanceOf(ForbiddenException.class).hasMessage("Access denied");
+        verify(userRepository, never()).findSalonIdById(any());
+    }
+
+    @Test
+    @DisplayName("enforceCanViewBooking denies an admin when the performing master has no salon, without the assignment lookup")
+    void should_denyAdmin_when_performerHasNoSalon() {
+        UUID adminId = UUID.randomUUID();
+        Booking booking = adminLegBooking(UUID.randomUUID(), null, true);
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(adminId, "ROLE_SALON_ADMIN"));
+
+        assertThatThrownBy(() -> authorizationService.enforceCanViewBooking(adminId, booking))
+                .isInstanceOf(ForbiddenException.class).hasMessage("Access denied");
+        verify(userRepository, never()).findSalonIdById(any());
+    }
+
+    @Test
+    @DisplayName("enforceCanViewBooking denies an admin when the booking's salon differs from the performer's live salon (rotated master)")
+    void should_denyAdmin_when_bookingSalonDiffersFromPerformerSalon() {
+        UUID adminId = UUID.randomUUID();
+        UUID performerSalonId = UUID.randomUUID();
+        Booking booking = adminLegBooking(UUID.randomUUID(), performerSalonId, true);
+        lenient().when(userRepository.findSalonIdById(adminId)).thenReturn(Optional.of(performerSalonId));
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(adminId, "ROLE_SALON_ADMIN"));
+
+        assertThatThrownBy(() -> authorizationService.enforceCanViewBooking(adminId, booking))
+                .isInstanceOf(ForbiddenException.class).hasMessage("Access denied");
+        verify(userRepository, never()).findSalonIdById(any());
+    }
+
+    @Test
+    @DisplayName("enforceCanViewBooking denies an admin when hasManagementAccess is false (assigned to a different salon)")
+    void should_denyAdmin_when_hasManagementAccessFalse() {
+        UUID adminId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        Booking booking = adminLegBooking(salonId, salonId, true);
+        when(userRepository.findSalonIdById(adminId)).thenReturn(Optional.of(UUID.randomUUID()));
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(adminId, "ROLE_SALON_ADMIN"));
+
+        assertThatThrownBy(() -> authorizationService.enforceCanViewBooking(adminId, booking))
+                .isInstanceOf(ForbiddenException.class).hasMessage("Access denied");
+        verify(userRepository).findSalonIdById(adminId);
+    }
+
     /**
      * Phase-242 audit, finding 1 (MEDIUM) — the owning client is admitted WITHOUT the salon walk.
      *
