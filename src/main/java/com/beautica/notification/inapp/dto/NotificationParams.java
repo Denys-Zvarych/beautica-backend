@@ -29,6 +29,10 @@ import java.time.Instant;
  * @param startsAt         the start of the (visit) booking. Null for {@code INVITE_ACCEPTED}.
  * @param salonName        the salon's name, or null for an independent-master booking or an
  *                          {@code INVITE_ACCEPTED} row.
+ * @param masterName       the performing master's display name, only for a salon-staff recipient
+ *                         (owner/admin) of a salon {@code BOOKING_CREATED},
+ *                         {@code BOOKING_CANCELLED_BY_CLIENT} or {@code BOOKING_RESCHEDULED} who is
+ *                         not themselves the performing master. Null otherwise.
  * @param subjectName      {@code INVITE_ACCEPTED} only — the new teammate's display name.
  * @param subjectRole      {@code INVITE_ACCEPTED} only — {@code SALON_ADMIN} or
  *                          {@code SALON_MASTER}.
@@ -39,6 +43,7 @@ public record NotificationParams(
         int serviceCount,
         @Schema(types = {"string", "null"}, format = "date-time", nullable = true) Instant startsAt,
         @Schema(types = {"string", "null"}, nullable = true) String salonName,
+        @Schema(types = {"string", "null"}, nullable = true) String masterName,
         @Schema(types = {"string", "null"}, nullable = true) String subjectName,
         @Schema(types = {"string", "null"}, nullable = true) Role subjectRole
 ) {

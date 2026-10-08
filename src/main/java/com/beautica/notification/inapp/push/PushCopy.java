@@ -140,9 +140,12 @@ public final class PushCopy {
         String when = whenLabel(startsAt);
         boolean rescheduled = type == InAppNotificationType.BOOKING_RESCHEDULED;
         String time = rescheduled ? "новий час: " + when : when;
-        return clientRecipient
-                ? serviceLabel + ", " + time + " — " + counterpart
-                : counterpart + " — " + serviceLabel + ", " + time;
+        if (clientRecipient) {
+            return serviceLabel + ", " + time + " — " + counterpart;
+        }
+        String line = counterpart + " — " + serviceLabel + ", " + time;
+        String master = sanitize(params.masterName());
+        return master == null ? line : line + " · майстер " + master;
     }
 
     private static String inviteBody(NotificationParams params) {

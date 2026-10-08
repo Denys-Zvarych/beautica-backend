@@ -108,6 +108,89 @@ class InAppPushEndToEndIT extends AbstractInAppPushFlowIT {
     }
 
     @Test
+    @DisplayName("owner and admin push body for BOOKING_CREATED ends with ' · майстер <name>'; the "
+            + "performing master's own push has no master suffix")
+    void should_appendPerformingMasterToOwnerAndAdminPush_when_clientBooksSalonMaster() throws Exception {
+        Rig rig = seedRigWithProviderDeviceTokens();
+        jdbcTemplate.update("UPDATE users SET first_name = 'Ірина', last_name = 'Мельник' WHERE id = ?",
+                rig.masterUserId());
+        clientBooks(rig, startsAt());
+
+        drainWorker.drain();
+
+        List<Message> sent = awaitSends(3);
+        Map<String, String> bodyByToken = new HashMap<>();
+        for (Message m : sent) {
+            bodyByToken.put(targetTokenOf(m), bodyOf(m));
+        }
+        assertThat(bodyByToken.get(tokenOf(rig.ownerId()))).endsWith(" · майстер Ірина Мельник");
+        assertThat(bodyByToken.get(tokenOf(rig.adminId()))).endsWith(" · майстер Ірина Мельник");
+        assertThat(bodyByToken.get(tokenOf(rig.masterUserId())))
+                .as("the performer is not told their own name, actual=%s", bodyByToken.get(tokenOf(rig.masterUserId())))
+                .doesNotContain("майстер").contains(CLIENT_NAME);
+    }
+
+    private void assertMasterSuffixOnlyForStaff(Rig rig, List<Message> pushes) {
+        Map<String, String> bodyByToken = new HashMap<>();
+        for (Message m : pushes) {
+            bodyByToken.put(targetTokenOf(m), bodyOf(m));
+        }
+        assertThat(bodyByToken).as("one push per provider").hasSize(3);
+        assertThat(bodyByToken.get(tokenOf(rig.ownerId()))).endsWith(" · майстер Ірина Мельник");
+        assertThat(bodyByToken.get(tokenOf(rig.adminId()))).endsWith(" · майстер Ірина Мельник");
+        assertThat(bodyByToken.get(tokenOf(rig.masterUserId())))
+                .as("the performer is not told their own name, actual=%s", bodyByToken.get(tokenOf(rig.masterUserId())))
+                .doesNotContain("майстер");
+    }
+
+    @Test
+    @DisplayName("client cancels: owner and admin BOOKING_CANCELLED_BY_CLIENT push bodies end with "
+            + "' · майстер <name>', the performing master's body has no 'майстер'")
+    void should_appendPerformingMasterToCancelPush_when_clientCancelsSalonBooking() throws Exception {
+        Rig rig = seedRigWithProviderDeviceTokens();
+        jdbcTemplate.update("UPDATE users SET first_name = 'Ірина', last_name = 'Мельник' WHERE id = ?",
+                rig.masterUserId());
+        UUID bookingId = clientBooks(rig, startsAt());
+        drainWorker.drain();
+        awaitSends(3);
+
+        ResponseEntity<String> cancel = restTemplate.exchange(
+                "/api/v1/bookings/" + bookingId + "/cancel", HttpMethod.PATCH,
+                new HttpEntity<>(objectMapper.writeValueAsString(Map.of("cancellationReason", "CLIENT_CANCELLED")),
+                        fixtures.bearerHeaders(rig.clientToken())), String.class);
+        assertThat(cancel.getStatusCode()).as("cancel must succeed — body=%s", cancel.getBody())
+                .isEqualTo(HttpStatus.NO_CONTENT);
+        drainWorker.drain();
+
+        assertMasterSuffixOnlyForStaff(rig, awaitSends(6).stream()
+                .filter(m -> "BOOKING_CANCELLED_BY_CLIENT".equals(safeData(m).get("type"))).toList());
+    }
+
+    @Test
+    @DisplayName("client reschedules: owner and admin BOOKING_RESCHEDULED push bodies end with "
+            + "' · майстер <name>', the performing master's body has no 'майстер'")
+    void should_appendPerformingMasterToReschedulePush_when_clientReschedulesSalonBooking() throws Exception {
+        Rig rig = seedRigWithProviderDeviceTokens();
+        jdbcTemplate.update("UPDATE users SET first_name = 'Ірина', last_name = 'Мельник' WHERE id = ?",
+                rig.masterUserId());
+        UUID bookingId = clientBooks(rig, startsAt());
+        drainWorker.drain();
+        awaitSends(3);
+
+        ResponseEntity<String> resched = restTemplate.exchange(
+                "/api/v1/bookings/" + bookingId + "/reschedule", HttpMethod.PATCH,
+                new HttpEntity<>(objectMapper.writeValueAsString(Map.of(
+                        "newStartsAt", startsAt().plusHours(3).toOffsetDateTime().toString())),
+                        fixtures.bearerHeaders(rig.clientToken())), String.class);
+        assertThat(resched.getStatusCode()).as("reschedule must succeed — body=%s", resched.getBody())
+                .isEqualTo(HttpStatus.OK);
+        drainWorker.drain();
+
+        assertMasterSuffixOnlyForStaff(rig, awaitSends(6).stream()
+                .filter(m -> "BOOKING_RESCHEDULED".equals(safeData(m).get("type"))).toList());
+    }
+
+    @Test
     @DisplayName("client cancels with a note: a second push per provider (BOOKING_CANCELLED_BY_CLIENT), "
             + "the cancellation note is in neither the outbox rows nor the push")
     void should_pushCancellationWithoutNote_when_clientCancelsWithNote() throws Exception {
