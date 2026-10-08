@@ -84,6 +84,11 @@ class BookingSalonBookingsIT extends AbstractIntegrationTest {
 
     private BookingTestFixtures fixtures;
 
+    @org.junit.jupiter.api.AfterEach
+    void clearSecurityContext() {
+        SecurityContextHolder.clearContext();
+    }
+
     @BeforeEach
     void seedFixtures() {
         fixtures = new BookingTestFixtures(restTemplate, jdbcTemplate, objectMapper, passwordEncoder);
@@ -733,24 +738,16 @@ class BookingSalonBookingsIT extends AbstractIntegrationTest {
     // answered SALON_ADMIN through manageableSalonIds' assigned-salon leg. Section 6 proved that
     // arm GRANTED; section 6b proved it NARROWED to the master's LIVE salon.
     //
-    // Phase 320 deleted the arm, the batched method and manageableSalonIds' role in this flag
-    // outright. Locked product decision: "salon owner or salon admin can complete the booking, and
-    // after it only salon master can leave the feedback". The flag is now
-    // `master.user_id == actor && master.is_active`, resolved in memory off the fetch-joined graph,
-    // so neither an owner nor an admin can read TRUE on a booking one of their STAFF performed —
-    // and the live-salon-vs-snapshot question 6b existed for no longer participates in the answer
-    // at all. Both tests below were rewritten onto what the endpoint now decides.
-    //
-    // The one shape that still reads TRUE for a caller of this endpoint is the OWNER-AS-MASTER row
-    // (MasterService#createMasterForOwner → master_type = 'SALON_OWNER', user_id = the owner). That
-    // is the separation section 6b now pins, and it is load-bearing rather than incidental: it is
-    // the only fixture on this board that can tell "performer-only" apart from "nobody, ever".
+    // Phase 355 (reverses 320): owner AND assigned admin of the master's salon read TRUE on every
+    // completed review-eligible row, whoever performed it; a salon master never reaches this board
+    // (and reads FALSE everywhere else). The flag is AuthorizationService
+    // #filterBookingIdsWithProviderAuthority — the page-scoped twin of canProviderReviewClient.
 
     @Test
     @DisplayName("an assigned SALON_ADMIN listing a COMPLETED booking gets providerCanReviewClient "
-            + "FALSE — they may complete the booking, but the client review belongs to the master "
-            + "who performed it (phase 320); the page itself must still resolve cleanly, never 500")
-    void should_returnProviderCanReviewClientFalse_when_adminListsCompletedBooking() throws Exception {
+            + "TRUE — they complete the booking and rate its client (phase 355); the page itself "
+            + "must still resolve cleanly, never 500")
+    void should_returnProviderCanReviewClientTrue_when_adminListsCompletedBooking() throws Exception {
         String ownerEmail = "bsb-admin-review-owner-" + System.nanoTime() + "@beautica.test";
         BookingTestFixtures.SalonFixture salon = fixtures.createSalon(ownerEmail);
         String adminEmail = "bsb-admin-review-" + System.nanoTime() + "@beautica.test";
@@ -774,14 +771,12 @@ class BookingSalonBookingsIT extends AbstractIntegrationTest {
                 .isEqualTo(bookingId.toString());
         assertThat(row.path("providerCanReviewClient").asBoolean())
                 .as("every review precondition is satisfied — COMPLETED, registered client, no "
-                        + "existing review — so this false is the phase-320 authority term and "
-                        + "nothing else. The controller also no longer names SALON_ADMIN in its "
-                        + "hasAnyRole for POST /client-reviews, so the CTA this flag gates would "
-                        + "403 if it were ever shown.")
-                .isFalse();
+                        + "existing review — and the admin is assigned to the master's salon, so the "
+                        + "phase-355 authority term admits them; POST /client-reviews agrees (201).")
+                .isTrue();
     }
 
-    // ── 6b — the ONE shape that still reads TRUE on this board ────────────────
+    // ── 6b — the owner reads TRUE on owner-as-master and staff-performed rows alike ────
     //
     // Without this test, "performer-only" and "hardcoded false on the salon board" are
     // indistinguishable here: the endpoint admits only SALON_OWNER and SALON_ADMIN, and neither is
@@ -791,10 +786,10 @@ class BookingSalonBookingsIT extends AbstractIntegrationTest {
     // collapses the flag to a constant, in either direction, fails one half or the other.
 
     @Test
-    @DisplayName("on ONE owner's salon page, the booking the OWNER personally performed (an "
-            + "owner-as-master row) carries providerCanReviewClient=TRUE while the booking their "
-            + "STAFF master performed carries FALSE — the phase-320 performer term, end to end")
-    void should_separateOwnerAsMasterFromStaffMaster_when_ownerListsTheSalonBoard() throws Exception {
+    @DisplayName("on ONE owner's salon page, BOTH the booking the OWNER personally performed (an "
+            + "owner-as-master row) AND the booking their STAFF master performed carry "
+            + "providerCanReviewClient=TRUE — the phase-355 owner term, end to end")
+    void should_flagEveryRow_when_ownerListsTheSalonBoard() throws Exception {
         String suffix = "-" + System.nanoTime() + "@beautica.test";
         String ownerEmail = "bsb-320-owner" + suffix;
         BookingTestFixtures.SalonFixture salon = fixtures.createSalon(ownerEmail);
@@ -823,10 +818,11 @@ class BookingSalonBookingsIT extends AbstractIntegrationTest {
                         + "owner/admin caller fails HERE.")
                 .isTrue();
         assertThat(providerCanReviewClient(root, staffPerformedId))
-                .as("the same owner, the same page, the same salon — but a booking their STAFF "
-                        + "master performed. A mutant that re-adds the salon-ownership arm flips "
-                        + "this to true and fails HERE. Both halves are needed.")
-                .isFalse();
+                .as("the same owner, the same page, the same salon — a booking their STAFF "
+                        + "master performed. Phase 355: the owner completes AND rates, whoever "
+                        + "performed. A mutant that restores the performer-only term flips this to "
+                        + "false and fails HERE. Both halves are needed.")
+                .isTrue();
     }
 
     /**
@@ -929,8 +925,14 @@ class BookingSalonBookingsIT extends AbstractIntegrationTest {
      * consumer of the probe's result is a supplier {@code providerCanReviewClient} evaluates ONLY
      * after {@code hasProviderAuthority} has already passed. The gate keeps its full discriminating
      * power — the mutation below still adds its own independent +1, now 4 -&gt; 5.
+     *
+     * <p><b>Baseline moved 4 -&gt; 6 (Phase 355, reverses 320).</b> The owner holds review authority
+     * over every completed row of their salon again, so the page pays the TWO page-scoped lookups
+     * phase 320 had removed: the batched {@code SalonRepository#findIdsByIdInAndOwnerId} (one
+     * statement for the whole page, never per row) and the {@code client_reviews} probe over the now
+     * non-empty authority set. RE-DERIVED FROM A RUN (2026-10-08: 6 at one row and 6 at five).
      */
-    private static final long SALON_OWNER_COMPLETED_PAGE_STATEMENTS = 4L;
+    private static final long SALON_OWNER_COMPLETED_PAGE_STATEMENTS = 6L;
 
     @Test
     @DisplayName("SALON_OWNER scope, COMPLETED (review-eligible) page — the per-row "
@@ -947,6 +949,9 @@ class BookingSalonBookingsIT extends AbstractIntegrationTest {
 
         Pageable pageable = PageRequest.of(0, 20);
         Statistics statistics = statistics();
+        // Phase 355: the page-scoped authority filter reads the actor's role from the SecurityContext
+        // (the endpoint is @PreAuthorize'd to owner/admin, so production always has one).
+        SecurityContextHolder.getContext().setAuthentication(ownerAuthentication(ownerId));
 
         seedCompletedBookingsAcrossDistinctMasters(clientId, salon, 1);
         statistics.clear();
@@ -1036,7 +1041,7 @@ class BookingSalonBookingsIT extends AbstractIntegrationTest {
      * a per-row one — which is precisely why the pair and the per-row delta are asserted
      * separately. A rise in the delta is still the per-row N+1 coming back.
      */
-    private static final long ROTATED_MASTER_ONE_ROW_STATEMENTS = 4L;
+    private static final long ROTATED_MASTER_ONE_ROW_STATEMENTS = 5L; // Phase 355: +1 batched salon-ownership lookup (empty result, so no client_reviews probe)
 
     /**
      * Five-row counterpart of {@link #ROTATED_MASTER_ONE_ROW_STATEMENTS}. DERIVED FROM A RUN.
@@ -1049,7 +1054,7 @@ class BookingSalonBookingsIT extends AbstractIntegrationTest {
      * number of rotated-master rows — is unchanged, and {@link #ROTATED_MASTER_PER_ROW_STATEMENTS}
      * still derives 0 from the pair.
      */
-    private static final long ROTATED_MASTER_FIVE_ROW_STATEMENTS = 4L;
+    private static final long ROTATED_MASTER_FIVE_ROW_STATEMENTS = 5L; // Phase 355: flat — the lookup is one statement for the page
 
     /**
      * The marginal JDBC cost of each additional rotated-master row, derived as

@@ -52,28 +52,24 @@ class ClientReviewIT extends AbstractIntegrationTest {
     private PasswordEncoder passwordEncoder;
 
     /**
-     * Phase 320 — the actor moved from the salon OWNER to the PERFORMING MASTER. Locked product
-     * decision: "salon owner or salon admin can complete the booking, and after it only salon
-     * master can leave the feedback". The owner now gets 403 here (pinned by
-     * {@link #should_return403_when_salonOwnerReviewsClientOfTheirMastersBooking}); everything else
-     * this test asserts — the 201 body, the {@code client_reviews} row, the after-commit
-     * recalculation of {@code users.avg_rating}/{@code review_count} — is unchanged.
+     * Phase 355 — at a salon the booking's {@code SALON_OWNER} rates the client (reverses phase 320,
+     * where the performing salon master did). The 201 body, the {@code client_reviews} row and the
+     * after-commit recalculation of {@code users.avg_rating}/{@code review_count} are unchanged.
      */
     @Test
-    @DisplayName("201 when the PERFORMING SALON_MASTER reviews the client of a COMPLETED booking, and "
-            + "the client's users.avg_rating/review_count are recalculated after commit")
-    void should_return201_and_recalculateRating_when_performingMasterReviewsClientOfCompletedBooking() throws Exception {
+    @DisplayName("201 when the SALON_OWNER reviews the client of a COMPLETED booking performed by a "
+            + "salon master, and the client's users.avg_rating/review_count are recalculated after commit")
+    void should_return201_and_recalculateRating_when_salonOwnerReviewsClientOfCompletedBooking() throws Exception {
         Salon salon = createSalon("clirev-happy-owner-" + System.nanoTime() + "@beautica.test");
         UUID clientId = createUser("clirev-happy-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
         UUID bookingId = insertBooking(clientId, salon.masterId, salon.salonId, "COMPLETED");
 
         String body = "{\"bookingId\":\"" + bookingId + "\",\"rating\":5,\"comment\":\"Чудовий клієнт\"}";
         ResponseEntity<String> resp = restTemplate.exchange(
-                URL, HttpMethod.POST, new HttpEntity<>(body, bearerHeaders(tokenFor(salon.masterEmail))), String.class);
+                URL, HttpMethod.POST, new HttpEntity<>(body, bearerHeaders(tokenFor(salon.ownerEmail))), String.class);
 
         assertThat(resp.getStatusCode())
-                .as("the master who performed this completed booking must be able to review its "
-                        + "client — body: %s", resp.getBody())
+                .as("the owner of the booking's salon must be able to review its client — body: %s", resp.getBody())
                 .isEqualTo(HttpStatus.CREATED);
 
         JsonNode data = objectMapper.readTree(resp.getBody()).path("data");
@@ -105,10 +101,10 @@ class ClientReviewIT extends AbstractIntegrationTest {
 
         String body = "{\"bookingId\":\"" + bookingId + "\",\"rating\":4}";
         ResponseEntity<String> resp = restTemplate.exchange(
-                URL, HttpMethod.POST, new HttpEntity<>(body, bearerHeaders(tokenFor(salon.masterEmail))), String.class);
+                URL, HttpMethod.POST, new HttpEntity<>(body, bearerHeaders(tokenFor(salon.ownerEmail))), String.class);
 
         assertThat(resp.getStatusCode())
-                .as("the PERFORMING MASTER clears the authorization gate, so this 400 is the "
+                .as("the OWNER clears the authorization gate, so this 400 is the "
                         + "eligibility rule speaking, not a 403 in disguise: reviewing the client "
                         + "of a still-open, non-elapsed CONFIRMED booking must be rejected with 400")
                 .isEqualTo(HttpStatus.BAD_REQUEST);
@@ -129,7 +125,7 @@ class ClientReviewIT extends AbstractIntegrationTest {
 
         String body = "{\"bookingId\":\"" + bookingId + "\",\"rating\":4}";
         ResponseEntity<String> resp = restTemplate.exchange(
-                URL, HttpMethod.POST, new HttpEntity<>(body, bearerHeaders(tokenFor(salon.masterEmail))), String.class);
+                URL, HttpMethod.POST, new HttpEntity<>(body, bearerHeaders(tokenFor(salon.ownerEmail))), String.class);
 
         assertThat(resp.getStatusCode())
                 .as("an elapsed-but-unclosed CONFIRMED booking must stay unreviewable on the "
@@ -158,7 +154,7 @@ class ClientReviewIT extends AbstractIntegrationTest {
 
         String body = "{\"bookingId\":\"" + bookingId + "\",\"rating\":4}";
         ResponseEntity<String> resp = restTemplate.exchange(
-                URL, HttpMethod.POST, new HttpEntity<>(body, bearerHeaders(tokenFor(salon.masterEmail))), String.class);
+                URL, HttpMethod.POST, new HttpEntity<>(body, bearerHeaders(tokenFor(salon.ownerEmail))), String.class);
 
         assertThat(resp.getStatusCode())
                 .as("NOT_COMPLETED is an explicit no-show marking, never reviewable regardless of endsAt")
@@ -174,7 +170,7 @@ class ClientReviewIT extends AbstractIntegrationTest {
         Salon salon = createSalon("clirev-dup-owner-" + System.nanoTime() + "@beautica.test");
         UUID clientId = createUser("clirev-dup-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
         UUID bookingId = insertBooking(clientId, salon.masterId, salon.salonId, "COMPLETED");
-        String token = tokenFor(salon.masterEmail);
+        String token = tokenFor(salon.ownerEmail);
         String body = "{\"bookingId\":\"" + bookingId + "\",\"rating\":3}";
 
         ResponseEntity<String> first = restTemplate.exchange(
@@ -200,7 +196,7 @@ class ClientReviewIT extends AbstractIntegrationTest {
 
         String body = "{\"bookingId\":\"" + bookingId + "\",\"rating\":4}";
         ResponseEntity<String> resp = restTemplate.exchange(
-                URL, HttpMethod.POST, new HttpEntity<>(body, bearerHeaders(tokenFor(salon.masterEmail))), String.class);
+                URL, HttpMethod.POST, new HttpEntity<>(body, bearerHeaders(tokenFor(salon.ownerEmail))), String.class);
 
         assertThat(resp.getStatusCode())
                 .as("reviewing a guest (null-client) booking must be rejected — no account exists to review")
@@ -246,18 +242,14 @@ class ClientReviewIT extends AbstractIntegrationTest {
     }
 
     /**
-     * Phase 316 — INVERTED. This test previously asserted 403 on the premise that the
-     * {@code @PreAuthorize} role list "never admits" {@code SALON_MASTER}, "same as
-     * decline/complete/reschedule". The role list now names {@code SALON_MASTER} and the SpEL
-     * {@code @authz.canReviewClient} decides per booking. The three sibling actions named in that
-     * old premise are UNCHANGED and still 403 for this role — {@code BookingCompletionSecurityIT},
-     * {@code BookingProviderRescheduleIT} and {@code BookingSecurityTest} are the gates that say so,
-     * and the negative case immediately below keeps the narrowness of this one honest.
+     * Phase 355 — INVERTED from phase 316. The invited {@code SALON_MASTER} may not rate the client,
+     * not even of the booking they performed: the role is out of the controller's role list and
+     * rejected inside {@code canReviewClient}. Owner/admin rate instead.
      */
     @Test
-    @DisplayName("201 when a SALON_MASTER reviews the client of the booking THEY performed "
-            + "(phase 316 — the one provider write the read-only role holds)")
-    void should_return201_when_salonMasterReviewsClientOfOwnPerformedBooking() throws Exception {
+    @DisplayName("403 when a SALON_MASTER tries to review the client of the booking THEY performed "
+            + "(phase 355 — reverses 316/320)")
+    void should_return403_when_salonMasterReviewsClientOfOwnPerformedBooking() throws Exception {
         Salon salon = createSalon("clirev-sm-owner-" + System.nanoTime() + "@beautica.test");
         UUID clientId = createUser("clirev-sm-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
         UUID bookingId = insertBooking(clientId, salon.masterId, salon.salonId, "COMPLETED");
@@ -267,19 +259,14 @@ class ClientReviewIT extends AbstractIntegrationTest {
                 URL, HttpMethod.POST, new HttpEntity<>(body, bearerHeaders(tokenFor(salon.masterEmail))), String.class);
 
         assertThat(resp.getStatusCode())
-                .as("the salon master PERFORMED this booking — body=%s", resp.getBody())
-                .isEqualTo(HttpStatus.CREATED);
+                .as("a salon master never rates the client at a salon — body=%s", resp.getBody())
+                .isEqualTo(HttpStatus.FORBIDDEN);
         assertThat(jdbcTemplate.queryForObject(
                 "SELECT COUNT(*) FROM client_reviews WHERE booking_id = ?", Integer.class, bookingId))
-                .as("the review is actually persisted, not merely un-403'd at the gate")
-                .isEqualTo(1);
+                .isZero();
     }
 
-    /**
-     * The narrowness half of phase 316 on the WRITE path, and the test that would go red if the new
-     * predicate were ever folded into {@code hasProviderAuthorityOverBooking}'s salon arm: two
-     * masters at ONE salon, the non-performing one attempting the write.
-     */
+    /** A salon master is rejected for a colleague's booking too (role gate; unchanged outcome). */
     @Test
     @DisplayName("403 when a SALON_MASTER attempts to review the client of a COLLEAGUE's booking at "
             + "the SAME salon — phase 316 is per-booking, never per-salon")
@@ -303,30 +290,7 @@ class ClientReviewIT extends AbstractIntegrationTest {
                 .isZero();
     }
 
-    /**
-     * Phase 316 narrowness across the SALON boundary — the arm the colleague case above cannot
-     * reach. Both tests end in 403, but for structurally different reasons, and only this one
-     * exercises the claim that <b>salon identity never enters the performer arm at all</b>:
-     *
-     * <ul>
-     *   <li>the colleague case ({@link #should_return403_when_salonMasterReviewsColleaguesBookingsClient})
-     *       has {@code v.salonId() == actor's salon}, so it pins that a SHARED salon does not
-     *       promote a non-performer;</li>
-     *   <li>this case has {@code v.salonId() != actor's salon}, so it pins that {@code
-     *       AuthorizationService#isPerformingMasterOfRow} reads {@code masterUserId} and NOTHING
-     *       else. A refactor that "helpfully" widened the performer arm to
-     *       {@code masterUserId.equals(actor) || salonId.equals(actorSalonId)} — the shape a reader
-     *       reaches for when asked to let a salon's masters review "their salon's" clients — leaves
-     *       the colleague case red but would ALSO have left it red before phase 316; only a
-     *       cross-salon fixture separates "the grant is per-booking" from "the grant is per-salon
-     *       and this actor's salon happens to match".</li>
-     * </ul>
-     *
-     * <p>Note the actor is a {@code SALON_MASTER} at a REAL, different salon rather than a
-     * salon-less one: an actor with {@code users.salon_id = NULL} would be denied by any
-     * salon-comparing mutant too (null never equals a salon id), and the test would go green
-     * against the very widening it exists to catch.
-     */
+    /** A salon master at a DIFFERENT salon is rejected as well. */
     @Test
     @DisplayName("403 when a SALON_MASTER attempts to review the client of ANOTHER SALON's booking "
             + "— the performer arm reads masters.user_id and never a salon id")
@@ -356,32 +320,8 @@ class ClientReviewIT extends AbstractIntegrationTest {
     }
 
     /**
-     * <b>The phase-316 security MEDIUM, now fixed and pinned.</b> Was {@code @Disabled} and red
-     * (201 CREATED) for exactly one commit; the {@code masters.is_active} conjunct on
-     * {@code AuthorizationService#isPerformingMasterOfRow} turned it green.
-     *
-     * <p>The finding, kept because it is the reason this test exists.
-     * {@code DELETE /masters/&#123;masterId&#125;}
-     * ({@code MasterService#deactivateMaster}) flips {@code masters.is_active = false} and NOTHING
-     * else: the {@code users} row keeps {@code is_active = true} (so the account still logs in),
-     * keeps {@code role = SALON_MASTER} (so {@code @PreAuthorize}'s role list still admits it) and
-     * {@code masters.user_id} is untouched (so
-     * {@code AuthorizationService#isPerformingMasterOfRow} still matches). A master the salon has
-     * removed therefore RETAINS the phase-316 write on every booking they ever performed, for as
-     * long as their account exists.
-     *
-     * <p>Contrast {@code MasterDetachmentContractIT} case 17, which was green even before the fix:
-     * a DETACHED master ({@code user_id IS NULL}) already failed closed, because that path nulls
-     * the very column this one leaves in place.
-     *
-     * <p><b>The fix is NOT "deny any inactive master" in
-     * {@code hasProviderAuthorityOverBooking}.</b> That kernel also gates
-     * complete/decline/reschedule for OWNERS and admins, and an owner's salon-arm authority has
-     * nothing to do with a {@code masters} row's activity — it stays byte-unchanged. The conjunct
-     * lives only on the phase-316 predicate and its {@link
-     * com.beautica.booking.repository.BookingReviewAccess} projection twin. This test and
-     * {@link #should_return201_when_salonMasterReviewsClientOfOwnPerformedBooking} are the pair
-     * that keeps it that shape: the grant is revoked by DEACTIVATION, not by being a salon master.
+     * A deactivated salon master (still logged in on an unexpired token) is rejected. Since phase 355
+     * every salon master is rejected by role; this pins that deactivation does not reopen anything.
      */
     @Test
     @DisplayName("403 when a SALON_MASTER who has been DEACTIVATED (DELETE /masters/{id}) reviews "
@@ -422,32 +362,24 @@ class ClientReviewIT extends AbstractIntegrationTest {
     }
 
     /**
-     * Phase 316 D1 (locked) — FIRST WRITER WINS, and the loser is a 409, never a second row. The
-     * {@code client_reviews.booking_id} uniqueness is unchanged and there are no per-author
-     * reviews.
-     *
-     * <p><b>Phase 320 rewrote the FIRST writer.</b> This used to have the salon OWNER create review
-     * #1 and the performing master lose the race. The owner can no longer create it at all (403 —
-     * {@link #should_return403_when_salonOwnerReviewsClientOfTheirMastersBooking}), so that
-     * precondition is unreachable. The rule it pins is not about WHO wrote first, only that the
-     * booking already carries a review, so the same master now posts twice: attempt #1 is the
-     * 201 that establishes the row, attempt #2 is the 409. That is also the shape the mobile app
-     * actually produces — a double-tap on the CTA.
+     * Phase 316 D1 (locked) — FIRST WRITER WINS, the loser is a 409, never a second row
+     * ({@code client_reviews.booking_id} uniqueness). Phase 355: the writer is the salon OWNER; the
+     * double-tap on the CTA is the realistic shape.
      */
     @Test
-    @DisplayName("409 when the performing SALON_MASTER posts a second client review for a booking "
+    @DisplayName("409 when the SALON_OWNER posts a second client review for a booking "
             + "that already has one — one review per booking, first writer wins (phase 316 D1)")
-    void should_return409_when_performingMasterReviewsTheSameBookingTwice() throws Exception {
+    void should_return409_when_ownerReviewsTheSameBookingTwice() throws Exception {
         Salon salon = createSalon("clirev-sm-race-owner-" + System.nanoTime() + "@beautica.test");
         UUID clientId = createUser("clirev-sm-race-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
         UUID bookingId = insertBooking(clientId, salon.masterId, salon.salonId, "COMPLETED");
-        String masterToken = tokenFor(salon.masterEmail);
+        String masterToken = tokenFor(salon.ownerEmail);
 
         String body = "{\"bookingId\":\"" + bookingId + "\",\"rating\":5}";
         ResponseEntity<String> first = restTemplate.exchange(
                 URL, HttpMethod.POST, new HttpEntity<>(body, bearerHeaders(masterToken)), String.class);
         assertThat(first.getStatusCode())
-                .as("premise — the performing master writes FIRST; body=%s", first.getBody())
+                .as("premise — the owner writes FIRST; body=%s", first.getBody())
                 .isEqualTo(HttpStatus.CREATED);
 
         ResponseEntity<String> second = restTemplate.exchange(
@@ -463,48 +395,16 @@ class ClientReviewIT extends AbstractIntegrationTest {
     }
 
     /**
-     * Phase 320, the NEW gate. The locked product decision splits closing from reviewing: this
-     * owner may (and in production does) {@code PATCH .../complete} the booking, and is then
-     * refused its client review. Asserted through the write endpoint because that is where the
-     * decision is enforced; the read-side mirror is
-     * {@code ProviderCanReviewClientIT#should_returnFalse_when_salonOwnerViewsBookingPerformedByTheirMaster}.
+     * Phase 355 — the other half of the closing/rating split: the owner who closes the booking is
+     * the one who rates its client; the salon master who performed it is not.
      */
     @Test
-    @DisplayName("403 when the SALON_OWNER tries to review the client of a booking one of their "
-            + "MASTERS performed — completing is theirs, reviewing is the performing master's (320)")
-    void should_return403_when_salonOwnerReviewsClientOfTheirMastersBooking() throws Exception {
-        Salon salon = createSalon("clirev-320-owner-" + System.nanoTime() + "@beautica.test");
-        UUID clientId = createUser("clirev-320-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
-        UUID bookingId = insertBooking(clientId, salon.masterId, salon.salonId, "COMPLETED");
-
-        String body = "{\"bookingId\":\"" + bookingId + "\",\"rating\":5}";
-        ResponseEntity<String> resp = restTemplate.exchange(
-                URL, HttpMethod.POST, new HttpEntity<>(body, bearerHeaders(tokenFor(salon.ownerEmail))), String.class);
-
-        assertThat(resp.getStatusCode())
-                .as("the owner is not this booking's masters.user_id — body: %s", resp.getBody())
-                .isEqualTo(HttpStatus.FORBIDDEN);
-        assertThat(jdbcTemplate.queryForObject(
-                "SELECT COUNT(*) FROM client_reviews WHERE booking_id = ?", Integer.class, bookingId))
-                .as("no row may be written by a denied actor")
-                .isZero();
-    }
-
-    /**
-     * Phase 320 — the SALON_ADMIN twin. The admin is rejected TWICE over now: the controller's
-     * {@code hasAnyRole(...)} no longer names {@code SALON_ADMIN}, and {@code @authz.canReviewClient}
-     * would deny them anyway because {@code MasterType} has no admin member, so no
-     * {@code masters.user_id} can ever be an admin. Pinned so that re-adding the role to the
-     * controller cannot silently re-grant the write.
-     */
-    @Test
-    @DisplayName("403 when an ASSIGNED SALON_ADMIN tries to review the client of a booking at the "
-            + "salon they administer (phase 320)")
-    void should_return403_when_assignedSalonAdminReviewsClientOfSalonBooking() throws Exception {
-        Salon salon = createSalon("clirev-320-admin-owner-" + System.nanoTime() + "@beautica.test");
-        String adminEmail = "clirev-320-admin-" + System.nanoTime() + "@beautica.test";
+    @DisplayName("201 when the SALON_ADMIN assigned to the booking's salon reviews the client (phase 355)")
+    void should_return201_when_assignedSalonAdminReviewsClientOfSalonBooking() throws Exception {
+        Salon salon = createSalon("clirev-355-admin-owner-" + System.nanoTime() + "@beautica.test");
+        String adminEmail = "clirev-355-admin-" + System.nanoTime() + "@beautica.test";
         createUser(adminEmail, "SALON_ADMIN", salon.salonId);
-        UUID clientId = createUser("clirev-320-admin-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
+        UUID clientId = createUser("clirev-355-admin-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
         UUID bookingId = insertBooking(clientId, salon.masterId, salon.salonId, "COMPLETED");
 
         String body = "{\"bookingId\":\"" + bookingId + "\",\"rating\":5}";
@@ -512,12 +412,98 @@ class ClientReviewIT extends AbstractIntegrationTest {
                 URL, HttpMethod.POST, new HttpEntity<>(body, bearerHeaders(tokenFor(adminEmail))), String.class);
 
         assertThat(resp.getStatusCode())
-                .as("an assigned admin may complete this booking but never review its client — "
-                        + "body: %s", resp.getBody())
-                .isEqualTo(HttpStatus.FORBIDDEN);
+                .as("an assigned admin completes AND rates — body: %s", resp.getBody())
+                .isEqualTo(HttpStatus.CREATED);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM client_reviews WHERE booking_id = ?", Integer.class, bookingId))
+                .isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("403 when the assigned SALON_ADMIN has been DEACTIVATED (live token) and tries to review the client")
+    void should_return403_when_deactivatedAdminReviewsClient() throws Exception {
+        Salon salon = createSalon("clirev-355-deact-owner-" + System.nanoTime() + "@beautica.test");
+        String adminEmail = "clirev-355-deact-admin-" + System.nanoTime() + "@beautica.test";
+        UUID adminId = createUser(adminEmail, "SALON_ADMIN", salon.salonId);
+        UUID clientId = createUser("clirev-355-deact-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
+        UUID bookingId = insertBooking(clientId, salon.masterId, salon.salonId, "COMPLETED");
+        String token = tokenFor(adminEmail);
+        jdbcTemplate.update("UPDATE users SET is_active = false WHERE id = ?", adminId);
+
+        String body = "{\"bookingId\":\"" + bookingId + "\",\"rating\":5}";
+        ResponseEntity<String> resp = restTemplate.exchange(
+                URL, HttpMethod.POST, new HttpEntity<>(body, bearerHeaders(token)), String.class);
+
+        assertThat(resp.getStatusCode()).as("body: %s", resp.getBody()).isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM client_reviews WHERE booking_id = ?", Integer.class, bookingId)).isZero();
+    }
+
+    @Test
+    @DisplayName("403 when a SALON_ADMIN assigned to a DIFFERENT salon reviews the client (phase 355)")
+    void should_return403_when_adminOfAnotherSalonReviewsClient() throws Exception {
+        Salon salon = createSalon("clirev-355-xadmin-owner-" + System.nanoTime() + "@beautica.test");
+        Salon other = createSalon("clirev-355-xadmin-other-" + System.nanoTime() + "@beautica.test");
+        String adminEmail = "clirev-355-xadmin-" + System.nanoTime() + "@beautica.test";
+        createUser(adminEmail, "SALON_ADMIN", other.salonId);
+        UUID clientId = createUser("clirev-355-xadmin-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
+        UUID bookingId = insertBooking(clientId, salon.masterId, salon.salonId, "COMPLETED");
+
+        String body = "{\"bookingId\":\"" + bookingId + "\",\"rating\":5}";
+        ResponseEntity<String> resp = restTemplate.exchange(
+                URL, HttpMethod.POST, new HttpEntity<>(body, bearerHeaders(tokenFor(adminEmail))), String.class);
+
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
         assertThat(jdbcTemplate.queryForObject(
                 "SELECT COUNT(*) FROM client_reviews WHERE booking_id = ?", Integer.class, bookingId))
                 .isZero();
+    }
+
+    @Test
+    @DisplayName("201 when the SALON_OWNER reviews the client of a booking they PERFORMED themselves "
+            + "(owner-as-master row) — still the owner, so allowed (phase 355)")
+    void should_return201_when_ownerReviewsClientOfOwnPerformedBooking() throws Exception {
+        Salon salon = createSalon("clirev-355-ownmaster-" + System.nanoTime() + "@beautica.test");
+        UUID ownerUserId = jdbcTemplate.queryForObject(
+                "SELECT owner_id FROM salons WHERE id = ?", UUID.class, salon.salonId);
+        UUID ownerMasterId = new BookingTestFixtures(restTemplate, jdbcTemplate, objectMapper, passwordEncoder)
+                .createOwnerAsMaster(salon.salonId, ownerUserId);
+        UUID clientId = createUser("clirev-355-ownmaster-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
+        UUID bookingId = insertBooking(clientId, ownerMasterId, salon.salonId, "COMPLETED");
+
+        String body = "{\"bookingId\":\"" + bookingId + "\",\"rating\":4}";
+        ResponseEntity<String> resp = restTemplate.exchange(
+                URL, HttpMethod.POST, new HttpEntity<>(body, bearerHeaders(tokenFor(salon.ownerEmail))), String.class);
+
+        assertThat(resp.getStatusCode()).as("body: %s", resp.getBody()).isEqualTo(HttpStatus.CREATED);
+    }
+
+    /**
+     * Legacy rows: phase 320 let salon masters write {@code client_reviews}; those rows stay. One
+     * review per booking, so the owner's later attempt is the ordinary duplicate 409 (no migration,
+     * no backfill, no deletion).
+     */
+    @Test
+    @DisplayName("409 when the SALON_OWNER rates a booking already rated by its salon master under "
+            + "phase 320 — legacy row kept (phase 355)")
+    void should_return409_when_ownerRatesBookingAlreadyRatedByItsSalonMaster() throws Exception {
+        Salon salon = createSalon("clirev-355-legacy-" + System.nanoTime() + "@beautica.test");
+        UUID clientId = createUser("clirev-355-legacy-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
+        UUID bookingId = insertBooking(clientId, salon.masterId, salon.salonId, "COMPLETED");
+        jdbcTemplate.update(
+                "INSERT INTO client_reviews (booking_id, subject_client_id, author_master_id, salon_id, rating) "
+                        + "VALUES (?, ?, ?, ?, 3)",
+                bookingId, clientId, salon.masterId, salon.salonId);
+
+        String body = "{\"bookingId\":\"" + bookingId + "\",\"rating\":5}";
+        ResponseEntity<String> resp = restTemplate.exchange(
+                URL, HttpMethod.POST, new HttpEntity<>(body, bearerHeaders(tokenFor(salon.ownerEmail))), String.class);
+
+        assertThat(resp.getStatusCode()).as("body: %s", resp.getBody()).isEqualTo(HttpStatus.CONFLICT);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT rating FROM client_reviews WHERE booking_id = ?", Integer.class, bookingId))
+                .as("the legacy row is untouched")
+                .isEqualTo(3);
     }
 
     @Test

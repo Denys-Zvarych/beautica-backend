@@ -65,18 +65,6 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  *       {@code user_id IS NOT NULL} → case 16 red.</li>
  * </ul>
  *
- * <p><b>Two further mutation checks</b> added with case 17 (2026-09-15 QA pass, phase 316), on
- * {@code AuthorizationService#isPerformingMasterOfRow} — the ONLY null-handling in the phase-316
- * grant:
- * <ul>
- *   <li>Drop the {@code masterUserId != null} guard entirely
- *       ({@code masterUserId.equals(actorUserId)}) → case 17's first assertion goes red with a
- *       <b>500</b>, the NPE-inside-SpEL shape case 11 exists for, rather than the 403 it asserts.</li>
- *   <li>Invert it to fail OPEN ({@code masterUserId == null || masterUserId.equals(actorUserId)}) —
- *       the shape a reader reaches for when told "a detached master has no owner, so let the
- *       performer through" → case 17's first assertion goes red with a <b>201</b>, and nothing else
- *       in this class or in {@code ClientReviewIT} moves.</li>
- * </ul>
  */
 @DisplayName("V157 — detachable master + staff-delete FK relaxation (phase 294)")
 class MasterDetachmentContractIT extends AbstractIntegrationTest {
@@ -681,23 +669,18 @@ class MasterDetachmentContractIT extends AbstractIntegrationTest {
      * {@code @PreAuthorize} role list that phase 316 added them to. Only the SpEL predicate stands
      * between them and the write, which is what makes this worth a test rather than an argument.
      *
-     * <p><b>Phase 320 — the owner's control changed from 201 to 403, and moved to a DIFFERENT
-     * capability.</b> This case used to close with "the salon owner still gets 201" as its
-     * non-vacuity control: proof that the 403 above came from the null-{@code user_id} guard and
-     * not from {@code findCompletionAccessById} regressing to an INNER join (the case-13 bug). The
-     * locked product decision ("salon owner or salon admin can complete the booking, and after it
-     * only salon master can leave the feedback") means the owner is now denied the REVIEW too, so
-     * that control would assert the 403 this test already asserts — vacuous. The control therefore
-     * moved to the capability the owner DID keep: {@code PATCH .../complete}, which still runs off
-     * the untouched {@code hasProviderAuthorityOverBooking} and still reads
-     * {@code findCompletionAccessById}. It detects exactly the same INNER-join regression, on
-     * exactly the same detached row. It is evaluated LAST because it mutates the booking's status.
+     * <p><b>Phase 355 — the grant is the owner/admin kernel, not the performing master.</b> The
+     * ex-master is now rejected by ROLE ({@code SALON_MASTER} never rates), so the null-
+     * {@code user_id} guard the original case existed for is gone with the performer arm. What the
+     * case still pins is the OTHER direction: a detached performing master must not stop the salon
+     * OWNER from rating (the {@code findCompletionAccessById} LEFT JOIN, case 13's bug, would 403
+     * them). Phase 316 added the case; phases 320 and 355 each flipped one of its two halves.
      */
     @Test
-    @DisplayName("case 17 — a DETACHED master's booking confers the review grant on NOBODY: the "
-            + "ex-master gets 403, and so does the salon OWNER since phase 320 — while the owner "
-            + "keeps /complete over the same detached row")
-    void should_grantClientReviewToNobody_when_theBookingsPerformingMasterIsDetached() throws Exception {
+    @DisplayName("case 17 — a DETACHED master (an ex-SALON_MASTER with a live token) gets 403 on "
+            + "POST /client-reviews, while the salon OWNER still rates the same detached row (201, "
+            + "phase 355)")
+    void should_denyTheExMasterButAdmitTheOwner_when_theBookingsPerformingMasterIsDetached() throws Exception {
         BookingTestFixtures.VisitFixture visit = fixtures.createConfirmedVisit("mdc-316-detach", 1);
         UUID bookingId = leadBookingId(visit.id());
         BookingTestFixtures.SalonFixture salon = fixtures.createSalon(email("316-detach-owner"));
@@ -720,38 +703,28 @@ class MasterDetachmentContractIT extends AbstractIntegrationTest {
 
         ResponseEntity<String> exMasterResp = postClientReview(bookingId, 4, exMasterToken);
         assertThat(exMasterResp.getStatusCode())
-                .as("the performer arm compares against a NULL masters.user_id and must fail "
-                        + "closed — body=%s", exMasterResp.getBody())
+                .as("an ex-SALON_MASTER with an unexpired token never rates the client (role gate) "
+                        + "— body=%s", exMasterResp.getBody())
                 .isEqualTo(HttpStatus.FORBIDDEN);
         assertThat(jdbcTemplate.queryForObject(
                 "SELECT COUNT(*) FROM client_reviews WHERE booking_id = ?", Integer.class, bookingId))
                 .as("and writes nothing")
                 .isZero();
 
+        // Phase 355 — the non-vacuity control: the salon OWNER rates the same detached row (201). Owner
+        // authority is keyed on the booking's salon, not on masters.user_id, and reads the same
+        // findCompletionAccessById LEFT JOIN projection as /complete (case 13), so a 403 here would be
+        // that join regressing to an INNER one. The 403 above is therefore the role gate speaking, not
+        // the projection failing.
         ResponseEntity<String> ownerResp = postClientReview(bookingId, 5, ownerToken);
         assertThat(ownerResp.getStatusCode())
-                .as("phase 320 — the owner is not this booking's masters.user_id either, so the "
-                        + "review is denied to them as well; NOBODY may review it — body=%s",
-                        ownerResp.getBody())
-                .isEqualTo(HttpStatus.FORBIDDEN);
+                .as("phase 355 — the owner of the booking's salon may rate the client even though the "
+                        + "performing master has been detached — body=%s", ownerResp.getBody())
+                .isEqualTo(HttpStatus.CREATED);
         assertThat(jdbcTemplate.queryForObject(
                 "SELECT COUNT(*) FROM client_reviews WHERE booking_id = ?", Integer.class, bookingId))
-                .as("and no row is written by either actor")
-                .isZero();
-
-        // Non-vacuity control, phase 320 — the capability the owner KEPT. /complete runs off the
-        // untouched hasProviderAuthorityOverBooking and reads the same findCompletionAccessById
-        // projection, so a 403 here (and not above) is the INNER JOIN bm.user regression case 13
-        // guards. Last, because it mutates the booking's status.
-        jdbcTemplate.update("UPDATE bookings SET status = 'CONFIRMED' WHERE id = ?", bookingId);
-        ResponseEntity<String> completeResp = restTemplate.exchange(
-                "/api/v1/bookings/" + bookingId + "/complete", HttpMethod.PATCH,
-                new HttpEntity<>(fixtures.bearerHeaders(ownerToken)), String.class);
-        assertThat(completeResp.getStatusCode())
-                .as("control — the owner keeps /complete over a detached master's booking exactly "
-                        + "as case 13 pins; a 403 here is findCompletionAccessById's LEFT JOIN "
-                        + "having regressed to an INNER one — body=%s", completeResp.getBody())
-                .isEqualTo(HttpStatus.NO_CONTENT);
+                .as("the owner's review is the only row")
+                .isEqualTo(1);
     }
 
     // ── fixtures / helpers ─────────────────────────────────────────────────────────────────────

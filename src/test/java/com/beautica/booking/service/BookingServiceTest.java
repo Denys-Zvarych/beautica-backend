@@ -2670,13 +2670,10 @@ class BookingServiceTest {
     }
 
     @Test
-    @DisplayName("Phase 320 — providerCanReviewClient on the salon board is the PERFORMING-MASTER "
-            + "term alone (AuthorizationService#isPerformingMasterOfBooking), evaluated in memory "
-            + "for a COMPLETED booking with a registered client. The batched salon-ownership "
-            + "lookup the Phase 319 N+1 fix introduced is gone with the salon arm it resolved: an "
-            + "owner or admin may still COMPLETE the booking, but only the master who performed it "
-            + "may rate its client, so hasProviderAuthorityOverBooking must never be consulted "
-            + "here — neither per row nor batched.")
+    @DisplayName("Phase 355 — providerCanReviewClient on the salon board comes from the page-scoped "
+            + "authority batch (AuthorizationService#filterBookingIdsWithProviderAuthority) for a "
+            + "COMPLETED booking with a registered client; hasProviderAuthorityOverBooking is "
+            + "never called per row.")
     void should_computeProviderCanReviewClient_when_bookingIsCompletedWithRegisteredClient() {
         UUID actorId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
@@ -2689,21 +2686,21 @@ class BookingServiceTest {
                 .thenReturn(List.of(completedBooking));
         when(reviewRepository.findReviewedBookingIds(List.of(bookingId))).thenReturn(List.of());
         when(clientReviewRepository.findReviewedBookingIds(List.of(bookingId))).thenReturn(List.of());
-        when(authz.isPerformingMasterOfBooking(actorId, completedBooking)).thenReturn(true);
+        when(authz.filterBookingIdsWithProviderAuthority(actorId, List.of(completedBooking)))
+                .thenReturn(java.util.Set.of(bookingId));
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
 
         var result = bookingService.getSalonBookings(actorId, salonId, null, null, null, null, null, pageable);
 
         assertThat(result.data()).hasSize(1);
         assertThat(result.data().get(0).providerCanReviewClient()).isTrue();
-        verify(authz).isPerformingMasterOfBooking(actorId, completedBooking);
+        verify(authz).filterBookingIdsWithProviderAuthority(actorId, List.of(completedBooking));
         verify(authz, never()).hasProviderAuthorityOverBooking(any(), any());
     }
 
     @Test
-    @DisplayName("Phase 320 — the salon board row of a booking the actor did NOT perform reads "
-            + "providerCanReviewClient FALSE even though the actor is the SALON_OWNER who may "
-            + "complete it: the locked decision hands the review to the performing master alone")
+    @DisplayName("Phase 355 — the salon board row reads providerCanReviewClient FALSE when the "
+            + "authority batch does not admit the actor (e.g. a SALON_MASTER, or another salon's owner)")
     void should_returnProviderCanReviewClientFalse_when_actorIsNotThePerformingMaster() {
         UUID actorId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
@@ -2715,7 +2712,8 @@ class BookingServiceTest {
         when(bookingRepository.findAllByIdsWithGraph(List.of(bookingId)))
                 .thenReturn(List.of(completedBooking));
         when(reviewRepository.findReviewedBookingIds(List.of(bookingId))).thenReturn(List.of());
-        when(authz.isPerformingMasterOfBooking(actorId, completedBooking)).thenReturn(false);
+        when(authz.filterBookingIdsWithProviderAuthority(actorId, List.of(completedBooking)))
+                .thenReturn(java.util.Set.of());
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
 
         var result = bookingService.getSalonBookings(actorId, salonId, null, null, null, null, null, pageable);
@@ -2757,11 +2755,10 @@ class BookingServiceTest {
         assertThat(result.data()).hasSize(1);
         assertThat(result.data().get(0).providerCanReviewClient()).isFalse();
         verify(authz, never()).hasProviderAuthorityOverBooking(any(), any());
-        // Phase 320 — the cost gate must short-circuit before the performing-master term is
-        // evaluated at all. Asserted against isPerformingMasterOfBooking, the collaborator the
-        // candidate filter actually guards: without this the assertion above would be vacuous,
-        // since hasProviderAuthorityOverBooking is no longer called on this path under ANY input.
-        verify(authz, never()).isPerformingMasterOfBooking(any(), any());
+        // Phase 355 — the cost gate must short-circuit before the authority batch is consulted.
+        // Asserted against filterBookingIdsWithProviderAuthority, the collaborator the candidate
+        // filter actually guards; hasProviderAuthorityOverBooking is never called on this path.
+        verify(authz, never()).filterBookingIdsWithProviderAuthority(any(UUID.class), any());
         verifyNoInteractions(clientReviewRepository);
     }
 
@@ -4889,10 +4886,10 @@ class BookingServiceTest {
         assertThat(getBookingWith(BookingStatus.COMPLETED, true).canReview()).isFalse();
     }
 
-    // ── getBooking — providerCanReviewClient truth table (track 27.x / Phase 27.5, narrowed 320) ──
+    // ── getBooking — providerCanReviewClient truth table (track 27.x / Phase 27.5, re-widened 355) ──
     //
     // providerCanReviewClient = !authz.isOwningClientViewer(actor, booking)
-    //     && authz.isPerformingMasterOfBooking(actor, booking)
+    //     && authz.canProviderReviewClient(actor, booking)
     //     && BookingClosureRule.isProviderReviewEligible(status)
     //     && booking.getClient() != null
     //     && !clientReviewRepository.existsByBookingId(booking.getId())
@@ -4909,23 +4906,18 @@ class BookingServiceTest {
     // AND, and (unlike the IT) able to pin the short-circuit ordering: a later collaborator must
     // never be consulted once an earlier condition has already failed.
     //
-    // PHASE 320 — the authority term is the PERFORMING MASTER, and nothing else. It used to be
-    // isPerformingMasterOfBooking UNIONED with hasProviderAuthorityOverBooking, which is why these
-    // cases stubbed the latter. The locked product decision — "salon owner or salon admin can
-    // complete the booking, and after it only salon master can leave the feedback" — deleted that
-    // disjunct, so a SALON_OWNER/SALON_ADMIN who is not the performer now reads false here. The
-    // stubs moved with the predicate; nothing else about this truth table changed. Owner and admin
-    // keep /complete, /not-complete, /decline and /reschedule — those run off the UNTOUCHED
-    // hasProviderAuthorityOverBooking, which must never reappear on this path.
+    // PHASE 355 — the authority term is authz.canProviderReviewClient: the completion kernel
+    // (independent master, or owner/admin of the master's salon) with SALON_MASTER excluded by role.
+    // The rule itself is unit-tested in AuthorizationServiceTest; here it is a mocked collaborator.
 
     @Test
-    @DisplayName("providerCanReviewClient is true when the actor IS the performing master of a COMPLETED, non-guest, unreviewed booking")
+    @DisplayName("providerCanReviewClient is true when the actor may rate the client of a COMPLETED, non-guest, unreviewed booking")
     void should_returnProviderCanReviewClientTrue_when_authorityCompletedNoReview() {
         Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.COMPLETED);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
         when(reviewRepository.findViewByBookingId(bookingId)).thenReturn(Optional.empty());
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
-        when(authz.isPerformingMasterOfBooking(clientId, booking)).thenReturn(true);
+        when(authz.canProviderReviewClient(clientId, booking)).thenReturn(true);
         when(clientReviewRepository.existsByBookingId(bookingId)).thenReturn(false);
 
         BookingDetailResponse result = bookingService.getBooking(clientId, bookingId);
@@ -4935,18 +4927,18 @@ class BookingServiceTest {
     }
 
     @Test
-    @DisplayName("providerCanReviewClient is false when the actor is NOT the performing master, even on a COMPLETED unreviewed booking — a SALON_OWNER/SALON_ADMIN who may COMPLETE it still reads false (Phase 320) — and the review-existence check is never reached")
+    @DisplayName("providerCanReviewClient is false when authz denies the actor (e.g. a SALON_MASTER, a CLIENT, another salon's owner/admin), even on a COMPLETED unreviewed booking — and the review-existence check is never reached")
     void should_returnProviderCanReviewClientFalse_when_actorLacksProviderAuthority() {
         Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.COMPLETED);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
         when(reviewRepository.findViewByBookingId(bookingId)).thenReturn(Optional.empty());
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
-        when(authz.isPerformingMasterOfBooking(clientId, booking)).thenReturn(false);
+        when(authz.canProviderReviewClient(clientId, booking)).thenReturn(false);
 
         BookingDetailResponse result = bookingService.getBooking(clientId, bookingId);
 
         assertThat(result.providerCanReviewClient())
-                .as("a CLIENT, a peer SALON_MASTER, a foreign viewer, and (Phase 320) the SALON_OWNER or SALON_ADMIN of the booking's own salon must all be denied the provider-review CTA — only the performing master gets it")
+                .as("whenever authz.canProviderReviewClient denies the viewer (SALON_MASTER, CLIENT, foreign owner/admin) the provider-review CTA must be false")
                 .isFalse();
         verify(clientReviewRepository, never()).existsByBookingId(any());
     }
@@ -4962,7 +4954,7 @@ class BookingServiceTest {
         // Not review-eligible short-circuits canReview before its own review-existence
         // query too — no reviewRepository stub needed here.
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
-        when(authz.isPerformingMasterOfBooking(clientId, booking)).thenReturn(true);
+        when(authz.canProviderReviewClient(clientId, booking)).thenReturn(true);
 
         BookingDetailResponse result = bookingService.getBooking(clientId, bookingId);
 
@@ -4983,7 +4975,7 @@ class BookingServiceTest {
                 ZonedDateTime.now(clock).minusHours(3).toOffsetDateTime());
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
-        when(authz.isPerformingMasterOfBooking(clientId, booking)).thenReturn(true);
+        when(authz.canProviderReviewClient(clientId, booking)).thenReturn(true);
 
         BookingDetailResponse result = bookingService.getBooking(clientId, bookingId);
 
@@ -5004,7 +4996,7 @@ class BookingServiceTest {
                 ZonedDateTime.now(clock).minusHours(3).toOffsetDateTime());
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
-        when(authz.isPerformingMasterOfBooking(clientId, booking)).thenReturn(true);
+        when(authz.canProviderReviewClient(clientId, booking)).thenReturn(true);
 
         BookingDetailResponse result = bookingService.getBooking(clientId, bookingId);
 
@@ -5026,7 +5018,7 @@ class BookingServiceTest {
         // No client short-circuits canReview even though the booking is COMPLETED — no
         // reviewRepository stub needed here.
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
-        when(authz.isPerformingMasterOfBooking(clientId, guestBooking)).thenReturn(true);
+        when(authz.canProviderReviewClient(clientId, guestBooking)).thenReturn(true);
 
         BookingDetailResponse result = bookingService.getBooking(clientId, bookingId);
 
@@ -5042,7 +5034,7 @@ class BookingServiceTest {
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
         when(reviewRepository.findViewByBookingId(bookingId)).thenReturn(Optional.empty());
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
-        when(authz.isPerformingMasterOfBooking(clientId, booking)).thenReturn(true);
+        when(authz.canProviderReviewClient(clientId, booking)).thenReturn(true);
         when(clientReviewRepository.existsByBookingId(bookingId)).thenReturn(true);
 
         BookingDetailResponse result = bookingService.getBooking(clientId, bookingId);
@@ -5056,16 +5048,15 @@ class BookingServiceTest {
     //
     // The pre-filter in BookingService#loadProviderReviewBatch narrows the page to
     // (client != null && BookingClosureRule.isProviderReviewEligible(status)) BEFORE evaluating
-    // AuthorizationService#isPerformingMasterOfBooking and issuing
+    // AuthorizationService#filterBookingIdsWithProviderAuthority and issuing
     // ClientReviewRepository#findReviewedBookingIds. Every existing providerCanReviewClient test
     // exercises the FINAL conjunction (which re-checks isProviderReviewEligible on its own), so a
     // pre-filter mutation is invisible there. These two tests instead assert on the pre-filter's
     // only observable effect: which bookings reach the authority term and the review-existence
     // query.
     //
-    // Phase 320 — the batched AuthorizationService#filterBookingIdsWithProviderAuthority these used
-    // to assert against is deleted along with the salon arm of the review predicate. The pre-filter
-    // is unchanged and still observable, now through the in-memory performing-master term.
+    // Phase 355 — the batched AuthorizationService#filterBookingIdsWithProviderAuthority is the
+    // authority term again; the pre-filter is observable through which rows are handed to it.
 
     @Test
     @DisplayName("loadProviderReviewBatch's pre-filter submits ONLY the COMPLETED booking to the "
@@ -5087,14 +5078,15 @@ class BookingServiceTest {
                 .thenReturn(List.of(completedBooking, elapsedConfirmedBooking));
         when(reviewRepository.findReviewedBookingIds(pageIds)).thenReturn(List.of());
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
-        when(authz.isPerformingMasterOfBooking(actorId, completedBooking)).thenReturn(true);
+        when(authz.filterBookingIdsWithProviderAuthority(Role.SALON_OWNER, actorId, List.of(completedBooking)))
+                .thenReturn(java.util.Set.of(completedBooking.getId()));
         when(clientReviewRepository.findReviewedBookingIds(List.of(completedBooking.getId())))
                 .thenReturn(List.of());
 
         bookingService.getMyBookings(actorId, buildAuth(Role.SALON_OWNER), null, null, null, null, pageable);
 
-        verify(authz).isPerformingMasterOfBooking(actorId, completedBooking);
-        verify(authz, never()).isPerformingMasterOfBooking(actorId, elapsedConfirmedBooking);
+        // Only the COMPLETED row reaches the authority batch; the elapsed CONFIRMED sibling never does.
+        verify(authz).filterBookingIdsWithProviderAuthority(Role.SALON_OWNER, actorId, List.of(completedBooking));
         verify(clientReviewRepository).findReviewedBookingIds(List.of(completedBooking.getId()));
     }
 
@@ -5121,7 +5113,32 @@ class BookingServiceTest {
 
         bookingService.getMyBookings(actorId, buildAuth(Role.SALON_OWNER), null, null, null, null, pageable);
 
-        verify(authz, never()).isPerformingMasterOfBooking(any(), any());
+        verify(authz, never()).filterBookingIdsWithProviderAuthority(any(), any(), any());
+        verify(clientReviewRepository, never()).findReviewedBookingIds(any());
+    }
+
+    @Test
+    @DisplayName("Phase 355 — when the authority batch admits nobody (the empty set a SALON_MASTER gets), "
+            + "every /bookings/me row reads providerCanReviewClient FALSE and client_reviews is never probed")
+    void should_readFlagFalseOnEveryRow_when_authorityBatchIsEmpty() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        Pageable pageable = Pageable.unpaged();
+        Booking completedBooking = buildBooking(UUID.randomUUID(), client, master, msa, BookingStatus.COMPLETED);
+        List<UUID> pageIds = List.of(completedBooking.getId());
+
+        when(salonRepository.findIdsByOwnerIdAndIsActiveTrue(actorId)).thenReturn(List.of(salonId));
+        when(bookingRepository.findIdsBySalonIdsFiltered(List.of(salonId), null, null, null, null, normalizedUnpaged()))
+                .thenReturn(new PageImpl<>(pageIds));
+        when(bookingRepository.findAllByIdsWithGraph(pageIds)).thenReturn(List.of(completedBooking));
+        when(reviewRepository.findReviewedBookingIds(pageIds)).thenReturn(List.of());
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
+        when(authz.filterBookingIdsWithProviderAuthority(Role.SALON_OWNER, actorId, List.of(completedBooking)))
+                .thenReturn(java.util.Set.of());
+
+        var page = bookingService.getMyBookings(actorId, buildAuth(Role.SALON_OWNER), null, null, null, null, pageable);
+
+        assertThat(page.data()).allSatisfy(b -> assertThat(b.providerCanReviewClient()).isFalse());
         verify(clientReviewRepository, never()).findReviewedBookingIds(any());
     }
 
