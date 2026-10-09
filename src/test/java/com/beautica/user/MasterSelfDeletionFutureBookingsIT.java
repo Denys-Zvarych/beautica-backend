@@ -133,22 +133,24 @@ class MasterSelfDeletionFutureBookingsIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("a mixed-master visit: only the deleting master's own leg is DECLINED, the sibling "
-            + "master's leg stays CONFIRMED, the header stays CONFIRMED (one sibling remains), and "
-            + "exactly ONE MASTER_REMOVED outbox row is enqueued for the whole visit — complements "
+    @DisplayName("two masters each with their own visit (V190: one master per visit): only the "
+            + "deleting master's visit is DECLINED, the other master's leg and header stay CONFIRMED, "
+            + "and exactly ONE MASTER_REMOVED outbox row is enqueued — complements "
             + "MasterSelfDeleteBookingDisposalIT's identical booking/header assertions with the D12 "
             + "outbox-row-count angle that class deliberately does not cover")
-    void should_declineOnlyOwnLeg_andEnqueueExactlyOneOutboxRow_when_mixedMasterVisit() throws Exception {
+    void should_declineOnlyOwnVisit_andEnqueueExactlyOneOutboxRow_when_otherMasterHasSeparateVisit() throws Exception {
         ClientSelfDeleteTestFixtures.Salon salon = csd.createSalon();
         ClientSelfDeleteTestFixtures.SecondMaster masterB = csd.addSecondMaster(salon);
         UUID clientId = csd.createClient();
-        UUID appointmentId = csd.insertAppointmentHeader(clientId, salon.salonId(), "CONFIRMED");
+        // V190: a visit has a single master, so masterB's leg lives in its own appointment header.
+        UUID appointmentAId = csd.insertAppointmentHeader(clientId, salon.salonId(), "CONFIRMED");
+        UUID appointmentBId = csd.insertAppointmentHeader(clientId, salon.salonId(), "CONFIRMED");
         UUID masterALegId = csd.insertBooking(
                 clientId, salon.masterId(), salon.masterServiceId(), salon.salonId(),
-                "CONFIRMED", FUTURE, appointmentId);
+                "CONFIRMED", FUTURE, appointmentAId);
         UUID masterBLegId = csd.insertBooking(
                 clientId, masterB.masterId(), masterB.masterServiceId(), salon.salonId(),
-                "CONFIRMED", FUTURE.plusHours(1), appointmentId);
+                "CONFIRMED", FUTURE.plusHours(1), appointmentBId);
         String token = fixtures.tokenFor(emailOf(salon.masterUserId()));
 
         ResponseEntity<Void> response = restTemplate.exchange(
@@ -160,12 +162,13 @@ class MasterSelfDeletionFutureBookingsIT extends AbstractIntegrationTest {
         assertThat(bookingStatus(masterBLegId))
                 .as("masterB never self-deleted — their leg is untouched")
                 .isEqualTo("CONFIRMED");
-        assertThat(appointmentStatus(appointmentId))
-                .as("one sibling remains CONFIRMED — the all-or-nothing header status stays CONFIRMED")
+        assertThat(appointmentStatus(appointmentBId))
+                .as("masterB's own visit is untouched — header stays CONFIRMED")
                 .isEqualTo("CONFIRMED");
+        assertThat(appointmentStatus(appointmentAId)).isEqualTo("DECLINED");
         assertThat(masterRemovedAggregateIds())
-                .as("exactly one MASTER_REMOVED row for the whole visit (D12), even though only one "
-                        + "of its two legs was a candidate for this master's own cascade at all")
+                .as("exactly one MASTER_REMOVED row (D12) — masterA's visit only; masterB's visit "
+                        + "is not part of this master's cascade at all")
                 .containsExactly(masterALegId);
     }
 

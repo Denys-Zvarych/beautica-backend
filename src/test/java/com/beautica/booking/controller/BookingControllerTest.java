@@ -1,6 +1,8 @@
 package com.beautica.booking.controller;
 
 import com.beautica.booking.service.BookingService;
+import com.beautica.booking.service.PendingBookingActionsService;
+import com.beautica.booking.dto.PendingBookingActionsCountResponse;
 import com.beautica.booking.dto.CreateBookingRequest;
 import com.beautica.booking.dto.BookingDetailResponse;
 import com.beautica.booking.dto.CancelBookingRequest;
@@ -96,6 +98,7 @@ class BookingControllerTest {
     @Autowired private MockMvc mockMvc;
     @Autowired private ObjectMapper objectMapper;
     @MockBean private BookingService bookingService;
+    @MockBean private PendingBookingActionsService pendingBookingActionsService;
     @MockBean(name = "authz") private AuthorizationService authorizationService;
     @MockBean private JwtTokenProvider jwtTokenProvider;
 
@@ -2683,6 +2686,58 @@ class BookingControllerTest {
                 .andExpect(jsonPath("$.success").value(false));
 
         org.mockito.Mockito.verify(bookingService, org.mockito.Mockito.never()).notCompleteBooking(any(), any(), any());
+    }
+
+    // ── Phase 357: archive pending-actions badge ──────────────────────────────
+
+    @Test
+    @DisplayName("GET /me/pending-actions/count — 401 when unauthenticated")
+    void should_return401_when_pendingActionsCountCalledWithoutAuthentication() throws Exception {
+        mockMvc.perform(get(BOOKINGS_URL + "/me/pending-actions/count"))
+                .andExpect(status().isUnauthorized());
+
+        org.mockito.Mockito.verify(pendingBookingActionsService, org.mockito.Mockito.never())
+                .countForMe(any(), any(), org.mockito.ArgumentMatchers.anyBoolean());
+    }
+
+    @Test
+    @DisplayName("GET /me/pending-actions/count — 403 for a CLIENT (role gate)")
+    void should_return403_when_clientRequestsMyPendingActionsCount() throws Exception {
+        mockMvc.perform(get(BOOKINGS_URL + "/me/pending-actions/count")
+                        .with(authenticatedAs(UUID.randomUUID(), "client@beautica.test", Role.CLIENT)))
+                .andExpect(status().isForbidden());
+
+        org.mockito.Mockito.verify(pendingBookingActionsService, org.mockito.Mockito.never())
+                .countForMe(any(), any(), org.mockito.ArgumentMatchers.anyBoolean());
+    }
+
+    @Test
+    @DisplayName("GET /me/pending-actions/count — 200 with the service's count for an INDEPENDENT_MASTER")
+    void should_return200_when_independentMasterRequestsMyPendingActionsCount() throws Exception {
+        var masterId = UUID.randomUUID();
+        when(pendingBookingActionsService.countForMe(eq(masterId), any(), eq(false)))
+                .thenReturn(PendingBookingActionsCountResponse.of(2, 1));
+
+        mockMvc.perform(get(BOOKINGS_URL + "/me/pending-actions/count")
+                        .with(authenticatedAs(masterId, "master@beautica.test", Role.INDEPENDENT_MASTER)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.count").value(3))
+                .andExpect(jsonPath("$.data.toClose").value(2))
+                .andExpect(jsonPath("$.data.toRateClient").value(1));
+    }
+
+    @Test
+    @DisplayName("GET /salon/{salonId}/pending-actions/count — 403 when authz denies salon management")
+    void should_return403_when_salonPendingActionsCountAuthzDenies() throws Exception {
+        var salonId = UUID.randomUUID();
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(false);
+
+        mockMvc.perform(get(BOOKINGS_URL + "/salon/" + salonId + "/pending-actions/count")
+                        .with(authenticatedAs(UUID.randomUUID(), "owner@beautica.test", Role.SALON_OWNER)))
+                .andExpect(status().isForbidden());
+
+        org.mockito.Mockito.verify(pendingBookingActionsService, org.mockito.Mockito.never())
+                .countForSalon(any());
     }
 
 }

@@ -55,6 +55,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @ActiveProfiles("test")
 @Import(TestSecurityConfig.class)
+@org.springframework.test.context.TestPropertySource(properties = "spring.datasource.hikari.maximum-pool-size=20") // 10 racing threads need >5 connections
 @DisplayName("Booking — concurrency: exactly one booking wins when 10 threads race for the same slot")
 class BookingConcurrencyTest {
 

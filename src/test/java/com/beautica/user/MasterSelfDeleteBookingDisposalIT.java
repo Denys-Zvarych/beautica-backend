@@ -87,20 +87,23 @@ class MasterSelfDeleteBookingDisposalIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("a multi-master appointment header SURVIVES CONFIRMED when only one of its two "
-            + "masters self-deletes — the other master's leg keeps the header CONFIRMED, and the "
-            + "departing master's own leg is DECLINED, not deleted")
-    void should_surviveAppointmentHeader_when_siblingMasterLegRemains() throws Exception {
+    @DisplayName("another master's visit (its own appointment header) SURVIVES CONFIRMED when a "
+            + "different master self-deletes — the departing master's own leg is DECLINED, not "
+            + "deleted, and the other master's header and leg are untouched")
+    void should_surviveOtherMastersAppointment_when_siblingMasterSelfDeletes() throws Exception {
         ClientSelfDeleteTestFixtures.Salon salon = csd.createSalon();
         ClientSelfDeleteTestFixtures.SecondMaster masterB = csd.addSecondMaster(salon);
         UUID clientId = csd.createClient();
-        UUID appointmentId = csd.insertAppointmentHeader(clientId, salon.salonId(), "CONFIRMED");
+        // V190 (one master per visit): masterB's leg can no longer share masterA's header, so each
+        // master gets their own appointment header.
+        UUID appointmentAId = csd.insertAppointmentHeader(clientId, salon.salonId(), "CONFIRMED");
+        UUID appointmentBId = csd.insertAppointmentHeader(clientId, salon.salonId(), "CONFIRMED");
         UUID masterALegId = csd.insertBooking(
                 clientId, salon.masterId(), salon.masterServiceId(), salon.salonId(),
-                "CONFIRMED", FUTURE, appointmentId);
+                "CONFIRMED", FUTURE, appointmentAId);
         UUID masterBLegId = csd.insertBooking(
                 clientId, masterB.masterId(), masterB.masterServiceId(), salon.salonId(),
-                "CONFIRMED", FUTURE, appointmentId);
+                "CONFIRMED", FUTURE, appointmentBId);
         String token = fixtures.tokenFor(emailOf(salon.masterUserId()));
 
         ResponseEntity<Void> response = restTemplate.exchange(
@@ -118,13 +121,15 @@ class MasterSelfDeleteBookingDisposalIT extends AbstractIntegrationTest {
         assertThat(bookingStatus(masterBLegId))
                 .as("masterB's own leg is untouched by masterA's self-delete")
                 .isEqualTo("CONFIRMED");
-        assertThat(csd.appointmentExists(appointmentId))
-                .as("the header still has a surviving CONFIRMED leg (masterB's) — it must NOT collapse")
+        assertThat(csd.appointmentExists(appointmentBId))
+                .as("masterB's visit header is untouched and must NOT collapse")
                 .isTrue();
-        assertThat(appointmentStatus(appointmentId))
-                .as("one sibling is still CONFIRMED, so the all-or-nothing header status stays "
-                        + "CONFIRMED too")
+        assertThat(appointmentStatus(appointmentBId))
+                .as("masterB's visit stays CONFIRMED")
                 .isEqualTo("CONFIRMED");
+        assertThat(csd.appointmentExists(appointmentAId))
+                .as("masterA's fully-declined header is KEPT (Phase 337)")
+                .isTrue();
     }
 
     @Test

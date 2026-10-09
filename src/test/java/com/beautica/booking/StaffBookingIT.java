@@ -1,5 +1,6 @@
 package com.beautica.booking;
 
+import org.springframework.test.context.TestPropertySource;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.booking.dto.AppointmentDetailResponse;
 import com.beautica.booking.dto.StaffBookingCommand;
@@ -73,6 +74,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * <p>Fixture data uses no occupied-territory locality references.
  */
 @DisplayName("StaffBookingIT — staff walk-in create against a real schedule + real constraints")
+@TestPropertySource(properties = "spring.datasource.hikari.maximum-pool-size=20") // 8 racers in the walk-in budget race
 @Import(StaffBookingIT.FrozenKyivClockConfig.class)
 class StaffBookingIT extends AbstractIntegrationTest {
 

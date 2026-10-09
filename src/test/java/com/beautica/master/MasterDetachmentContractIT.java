@@ -352,43 +352,40 @@ class MasterDetachmentContractIT extends AbstractIntegrationTest {
                 .doesNotContain(DETACHED_LAST);
     }
 
-    // ── case 10 — 2026-09 audit finding 2: the all-items visit guard is not defeatable ──────────
+    // ── case 10 — V190 supersedes the 2026-09 audit finding 2 scenario ──────────────────────────
 
     /**
-     * <b>RED before the fix</b> — {@code BookingRepository#findAllCompletionAccessByAppointmentId}
-     * INNER-joined {@code bm.user}, so the foreign DETACHED master's item simply VANISHED from the
-     * projection. {@code access.isEmpty()} stayed false (the actor's own item survived) and
-     * {@code allMatch} then passed over the SURVIVING SUBSET — the whole visit was declined, 204,
-     * including the item whose master the actor has no authority over whatsoever. That is the
-     * method's own javadoc contract inverted: it fetches every row precisely so that a single
-     * disagreeing item denies the call.
-     *
-     * <p>The mixed-master visit is built by raw SQL on purpose. It is not reachable through any
-     * writer today ({@code VisitPlanner.planChainedItems} resolves every item off ONE master) and
-     * nothing in the schema forbids it — which is exactly why the projection must not assume it
-     * away. Same rationale the repository javadoc gives for refusing the old {@code Limit.of(1)}.
+     * Originally (2026-09 audit finding 2) this built a mixed-master visit by raw SQL and proved the
+     * all-items decline guard fail-closed when one item belonged to a foreign DETACHED master. V190
+     * ({@code trg_bookings_single_master_per_appointment}) now forbids a mixed-master visit at the
+     * DB level, so that fixture is unreachable; the service-level guard stays as defence in depth
+     * but can no longer be exercised through a persisted row. This case now pins the new rule: the
+     * UPDATE that would re-point one item at a foreign (detached) master is REJECTED with SQLSTATE
+     * 23514 and the visit is left fully intact and CONFIRMED.
      */
     @Test
-    @DisplayName("case 10 — a whole-visit decline is REFUSED when one item belongs to a foreign "
-            + "DETACHED master, instead of silently authorizing over the surviving items "
-            + "(audit finding 2)")
-    void should_return403_when_visitContainsDetachedForeignMasterItem() throws Exception {
+    @DisplayName("case 10 — re-pointing one visit item to a foreign DETACHED master is rejected by "
+            + "the V190 single-master-per-appointment trigger (SQLSTATE 23514); the visit is untouched")
+    void should_rejectMixedMasterVisit_when_itemRepointedToForeignDetachedMaster() throws Exception {
         BookingTestFixtures.VisitFixture visit = fixtures.createConfirmedVisit("mdc-mixed", 2);
         List<UUID> itemIds = itemIdsOf(visit.id());
         assertThat(itemIds).as("fixture must produce a two-item visit").hasSize(2);
         UUID foreignMasterId = fixtures.createIndependentMaster(email("foreign-detached"));
         detach(foreignMasterId);
-        jdbcTemplate.update(
-                "UPDATE bookings SET master_id = ? WHERE id = ?", foreignMasterId, itemIds.get(1));
 
-        ResponseEntity<String> response = restTemplate.exchange(
-                "/api/v1/appointments/" + visit.id() + "/decline", HttpMethod.PATCH,
-                new HttpEntity<>(fixtures.bearerHeaders(visit.masterToken())), String.class);
+        assertThatThrownBy(() -> jdbcTemplate.update(
+                "UPDATE bookings SET master_id = ? WHERE id = ?", foreignMasterId, itemIds.get(1)))
+                .isInstanceOf(DataIntegrityViolationException.class)
+                .hasRootCauseInstanceOf(java.sql.SQLException.class)
+                .satisfies(ex -> assertThat(((java.sql.SQLException) org.springframework.core.NestedExceptionUtils
+                        .getMostSpecificCause(ex)).getSQLState()).isEqualTo("23514"));
 
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
-        // Fail-closed means nothing moved — not even the item the actor DOES own.
+        // The rejected UPDATE rolled back — both items are still CONFIRMED and on the original master.
         assertThat(statusOfBooking(itemIds.get(0))).isEqualTo("CONFIRMED");
         assertThat(statusOfBooking(itemIds.get(1))).isEqualTo("CONFIRMED");
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT master_id FROM bookings WHERE id = ?", UUID.class, itemIds.get(1)))
+                .isEqualTo(visit.masterId());
     }
 
     // ── case 11 — 2026-09 audit finding 3: @PreAuthorize denies, never 500s ─────────────────────

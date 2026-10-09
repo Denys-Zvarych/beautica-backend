@@ -107,10 +107,10 @@ public class ClientSelfDeleteTestFixtures {
 
     /**
      * A SECOND {@code SALON_MASTER} + {@code master_services} row in the SAME {@code salon} —
-     * needed to build a multi-service-visit {@code appointments} header whose legs belong to TWO
-     * different masters, so a self-deleting master's booking-disposal cascade can be proven to
-     * collapse the header only when it becomes fully childless, never when a sibling master's leg
-     * survives.
+     * needed to prove a self-deleting master's booking-disposal cascade leaves ANOTHER master's
+     * visit (its own {@code appointments} header) untouched. A single visit cannot span two masters
+     * (V190 trigger {@code trg_bookings_single_master_per_appointment}), so give each master their
+     * own header.
      */
     public SecondMaster addSecondMaster(Salon salon) {
         UUID masterUserId = createUser(
