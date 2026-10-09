@@ -61,6 +61,11 @@ import java.util.UUID;
                 // the surviving index with identical row/heap-block counts. Do not re-add.
                 // The master-scope sibling above is NOT redundant — there is no
                 // (master_id, status, starts_at) partial index for it to fall back to.
+                // partial indexes (V191, keyed (col) INCLUDE (id)): pending-actions toRateClient
+                // leg, WHERE status='COMPLETED' AND client_id IS NOT NULL. JPA cannot encode the
+                // predicate nor INCLUDE (§E-6, same convention as V123 note above) — mirrored by key only.
+                @Index(name = "idx_bookings_master_completed_client", columnList = "master_id"),
+                @Index(name = "idx_bookings_salon_completed_client", columnList = "salon_id"),
                 // partial UNIQUE index (V90): cancel-token lookup for the public guest-cancel page.
                 // JPA cannot encode WHERE cancel_token IS NOT NULL nor the partial-uniqueness —
                 // the predicate + UNIQUE live in V90 only (V90 dropped the V89 full unique

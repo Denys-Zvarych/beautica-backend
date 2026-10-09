@@ -433,8 +433,12 @@ public class BookingService {
      * {@code Instant.now()} / {@code OffsetDateTime.now()} (Anti-Bug §G), and {@link
      * TimeZones#KYIV} must never appear here — see {@code BookingSpecifications#partition}'s
      * javadoc for the clock/timezone invariant this mirrors.
+     *
+     * @apiNote package-visible since phase 357 so {@code PendingBookingActionsService} shares the
+     *     exact same clock expression as the archive. It performs no authorization: callers must
+     *     already have role-gated the request.
      */
-    private OffsetDateTime resolveNow() {
+    OffsetDateTime resolveNow() {
         return OffsetDateTime.ofInstant(clock.instant(), ZoneOffset.UTC);
     }
 
@@ -1646,8 +1650,13 @@ public class BookingService {
      * the role here and not there would make {@code GET /bookings/me} deny rows that {@code GET
      * /bookings/&#123;id&#125;} still serves. The role split is therefore the same one the view
      * guard makes, not a judgement about which providers deserve their history.
+     *
+     * @apiNote package-visible since phase 357. Performs no role check of its own: callers must
+     *     already have role-gated the request, and must NEVER pass {@code SALON_MASTER} (a salon
+     *     master has no provider-wide scope here, and only the {@code SALON_MASTER} branch above
+     *     applies the liveness guard that a count/read path would then silently inherit).
      */
-    private Master resolveProviderMasterScope(Role role, UUID actorUserId) {
+    Master resolveProviderMasterScope(Role role, UUID actorUserId) {
         Master master = masterRepository.findByUserId(actorUserId)
                 .orElseThrow(() -> new NotFoundException("Master profile not found"));
         if (role == Role.SALON_MASTER && !master.isActive()) {
@@ -1663,8 +1672,11 @@ public class BookingService {
      * toggled their master profile off — the toggle deactivates, never deletes) is DENIED with the
      * same 403 a deactivated {@code SALON_MASTER} gets; a row of any other type cannot be the
      * owner's own master view and is denied identically. No row at all is the existing 404.
+     *
+     * @apiNote package-visible since phase 357. Performs no role check: callers must already have
+     *     role-gated to {@code SALON_OWNER} (the master-type guard is not an authorization check).
      */
-    private Master resolveOwnerMasterScope(UUID actorUserId) {
+    Master resolveOwnerMasterScope(UUID actorUserId) {
         Master master = masterRepository.findByUserId(actorUserId)
                 .orElseThrow(() -> new NotFoundException("Master profile not found"));
         if (master.getMasterType() != MasterType.SALON_OWNER || !master.isActive()) {

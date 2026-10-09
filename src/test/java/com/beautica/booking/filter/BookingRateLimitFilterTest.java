@@ -1870,6 +1870,71 @@ class BookingRateLimitFilterTest {
     }
 
     @Test
+    @DisplayName("phase 357: both pending-actions count routes are matched by the salon-board budget "
+            + "and 429 after the cap")
+    void should_return429_when_pendingActionsCountRoutesExceedBoardBudget() throws Exception {
+        UUID salonId = UUID.randomUUID();
+
+        for (String path : List.of(
+                "/api/v1/bookings/me/pending-actions/count",
+                "/api/v1/bookings/salon/" + salonId + "/pending-actions/count")) {
+            BookingRateLimitFilter filter = filterWithSalonBoardReadBuckets(singleSlotBuckets());
+            authenticateAs(UUID.randomUUID());
+
+            var first = new MockHttpServletResponse();
+            filter.doFilterInternal(new MockHttpServletRequest("GET", path), first, new MockFilterChain());
+            var second = new MockHttpServletResponse();
+            var secondChain = new MockFilterChain();
+            filter.doFilterInternal(new MockHttpServletRequest("GET", path), second, secondChain);
+
+            assertThat(first.getStatus()).as("first %s must pass", path).isNotEqualTo(429);
+            assertThat(second.getStatus()).as("second %s must be throttled", path).isEqualTo(429);
+            assertThat(secondChain.getRequest()).isNull();
+        }
+    }
+
+    @Test
+    @DisplayName("phase 357: an UPPERCASE-hex salon id is still matched by the pending-actions salon arm")
+    void should_bucketPendingActionsCount_when_salonIdIsUppercase() throws Exception {
+        String path = "/api/v1/bookings/salon/" + UUID.randomUUID().toString().toUpperCase()
+                + "/pending-actions/count";
+        BookingRateLimitFilter filter = filterWithSalonBoardReadBuckets(singleSlotBuckets());
+        authenticateAs(UUID.randomUUID());
+
+        var first = new MockHttpServletResponse();
+        filter.doFilterInternal(new MockHttpServletRequest("GET", path), first, new MockFilterChain());
+        var second = new MockHttpServletResponse();
+        var secondChain = new MockFilterChain();
+        filter.doFilterInternal(new MockHttpServletRequest("GET", path), second, secondChain);
+
+        assertThat(first.getStatus()).isNotEqualTo(429);
+        assertThat(second.getStatus()).isEqualTo(429);
+        assertThat(secondChain.getRequest()).isNull();
+    }
+
+    @Test
+    @DisplayName("phase 357: pending-actions look-alikes are NOT matched")
+    void should_notMatch_whenPendingActionsPathIsALookAlike() throws Exception {
+        UUID salonId = UUID.randomUUID();
+        BookingRateLimitFilter filter = filterWithSalonBoardReadBuckets(singleSlotBuckets());
+        authenticateAs(UUID.randomUUID());
+
+        for (String path : List.of(
+                "/api/v1/bookings/me/pending-actions/count/x",
+                "/api/v1/bookings/me/pending-actions",
+                "/api/v1/bookings/salon/" + salonId + "/pending-actions/other",
+                "/api/v1/bookings/salon/" + salonId + "/pending-actions/count/x",
+                "/api/v1/bookings/salon/me/pending-actions/count",
+                "/api/v1/bookings/salon/not-a-uuid/pending-actions/count")) {
+            for (int i = 0; i < 3; i++) {
+                var response = new MockHttpServletResponse();
+                filter.doFilterInternal(new MockHttpServletRequest("GET", path), response, new MockFilterChain());
+                assertThat(response.getStatus()).as("%s must stay unbucketed", path).isNotEqualTo(429);
+            }
+        }
+    }
+
+    @Test
     @DisplayName("salon-board throttle: each of the three routes is matched — a route left out "
             + "of the matcher "
             + "would be silently unbucketed and this loop is what catches it")

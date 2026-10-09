@@ -235,6 +235,12 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
     private static final String SALON_MASTERS_EFFECTIVE_SCHEDULE_SUFFIX = "/masters/effective-schedule";
     private static final String SALON_BOOKINGS_PREFIX = "/api/v1/bookings/salon/";
     private static final String BOOKED_DAYS_SEGMENT = "booked-days";
+    /** Phase 357: the «Архів» badge count — {@code /bookings/me/pending-actions/count} and {@code /bookings/salon/{id}/pending-actions/count}. */
+    private static final String PENDING_ACTIONS_ME_PATH = "/api/v1/bookings/me/pending-actions/count";
+    private static final java.util.regex.Pattern SALON_ID_SHAPE = java.util.regex.Pattern.compile(
+            "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}");
+    private static final String PENDING_ACTIONS_SEGMENT = "pending-actions";
+    private static final String COUNT_SEGMENT = "count";
     private static final String RESCHEDULE_SUFFIX = "/reschedule";
     private static final String CANCEL_SUFFIX = "/cancel";
     private static final String COMPLETE_SUFFIX = "/complete";
@@ -614,8 +620,9 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
     }
 
     /**
-     * True for exactly the three salon-board reads {@link #SALON_MASTERS_EFFECTIVE_SCHEDULE_SUFFIX}
-     * documents, and nothing else.
+     * True for exactly the salon-board reads that {@link #SALON_MASTERS_EFFECTIVE_SCHEDULE_SUFFIX}
+     * documents, plus the two phase-357 pending-actions counts (own scope and salon scope), and
+     * nothing else.
      *
      * <p>Every arm is bounded by SEGMENT COUNT, not by {@code startsWith}/{@code endsWith} alone, so
      * a future deeper sub-route under either prefix is left unbucketed and visible rather than
@@ -623,6 +630,9 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
      * single-booking read — cannot match: it does not carry the literal {@code salon} segment.
      */
     private static boolean isSalonBoardReadPath(String path) {
+        if (PENDING_ACTIONS_ME_PATH.equals(path)) {
+            return true;                                                     // phase 357 badge, own scope
+        }
         if (path.startsWith(SALON_MASTER_SERVICES_PREFIX)
                 && path.endsWith(SALON_MASTERS_EFFECTIVE_SCHEDULE_SUFFIX)) {
             String salonId = path.substring(
@@ -636,6 +646,11 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
         String[] segments = path.substring(SALON_BOOKINGS_PREFIX.length()).split("/", -1);
         if (segments.length == 1) {
             return !segments[0].isEmpty();                                   // the board/archive list
+        }
+        if (segments.length == 3) {                                          // phase 357 badge, salon scope
+            return SALON_ID_SHAPE.matcher(segments[0]).matches()             // UUID-shaped: `me` etc. 400s unbucketed
+                    && PENDING_ACTIONS_SEGMENT.equals(segments[1])
+                    && COUNT_SEGMENT.equals(segments[2]);
         }
         return segments.length == 2
                 && !segments[0].isEmpty()
