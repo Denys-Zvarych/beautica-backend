@@ -20,7 +20,7 @@ class PushCopyTest {
     private static final Instant STARTS_AT = Instant.parse("2026-10-03T11:30:00Z");
 
     private static NotificationParams bookingParams(String counterpart, String service, int count) {
-        return new NotificationParams(counterpart, service, count, STARTS_AT, "Salon", null, null);
+        return new NotificationParams(counterpart, service, count, STARTS_AT, "Salon", null, null, null);
     }
 
     @ParameterizedTest
@@ -44,6 +44,26 @@ class PushCopyTest {
                 .isEqualTo("Запис перенесено");
         assertThat(PushCopy.title(InAppNotificationType.BOOKING_CREATED, true))
                 .isEqualTo(PushCopy.title(InAppNotificationType.BOOKING_CREATED, false));
+    }
+
+    @Test
+    @DisplayName("provider body appends the performing master when masterName is set; client body never does")
+    void should_appendMaster_when_masterNameSet() {
+        NotificationParams withMaster = new NotificationParams(
+                "Олена Коваленко", "Манікюр", 1, STARTS_AT, "Salon", "Ірина Мельник", null, null);
+
+        assertThat(PushCopy.body(InAppNotificationType.BOOKING_CREATED, false, withMaster))
+                .isEqualTo("Олена Коваленко — Манікюр, сб, 3 жовтня, 14:30 · майстер Ірина Мельник");
+        assertThat(PushCopy.body(InAppNotificationType.BOOKING_CREATED, true, withMaster))
+                .isEqualTo("Манікюр, сб, 3 жовтня, 14:30 — Олена Коваленко");
+    }
+
+    @Test
+    @DisplayName("provider body is byte-identical when masterName is null")
+    void should_matchLegacyBody_when_masterNameNull() {
+        assertThat(PushCopy.body(InAppNotificationType.BOOKING_CREATED, false,
+                bookingParams("Олена Коваленко", "Манікюр", 1)))
+                .isEqualTo("Олена Коваленко — Манікюр, сб, 3 жовтня, 14:30");
     }
 
     @Test
@@ -98,9 +118,9 @@ class PushCopyTest {
     @DisplayName("invite-accepted names the new teammate and role")
     void should_nameTeammateAndRole_when_inviteAccepted() {
         NotificationParams admin = new NotificationParams(
-                null, null, 0, null, null, "Ірина Мельник", Role.SALON_ADMIN);
+                null, null, 0, null, null, null, "Ірина Мельник", Role.SALON_ADMIN);
         NotificationParams master = new NotificationParams(
-                null, null, 0, null, null, "Ірина Мельник", Role.SALON_MASTER);
+                null, null, 0, null, null, null, "Ірина Мельник", Role.SALON_MASTER);
 
         assertThat(PushCopy.body(InAppNotificationType.INVITE_ACCEPTED, false, admin))
                 .isEqualTo("Ірина Мельник тепер у команді — адміністратор");
@@ -124,10 +144,10 @@ class PushCopyTest {
         assertThat(PushCopy.body(InAppNotificationType.BOOKING_CREATED, false,
                 bookingParams("Олена", null, 1))).isEqualTo(PushCopy.GENERIC_BODY);
         assertThat(PushCopy.body(InAppNotificationType.BOOKING_CREATED, false,
-                new NotificationParams("Олена", "Манікюр", 1, null, null, null, null)))
+                new NotificationParams("Олена", "Манікюр", 1, null, null, null, null, null)))
                 .isEqualTo(PushCopy.GENERIC_BODY);
         assertThat(PushCopy.body(InAppNotificationType.INVITE_ACCEPTED, false,
-                new NotificationParams(null, null, 0, null, null, null, null)))
+                new NotificationParams(null, null, 0, null, null, null, null, null)))
                 .isEqualTo(PushCopy.GENERIC_BODY);
     }
 
@@ -276,6 +296,6 @@ class PushCopyTest {
         assertThat(java.util.Arrays.stream(NotificationParams.class.getRecordComponents())
                 .map(java.lang.reflect.RecordComponent::getName))
                 .containsExactly("counterpartName", "serviceName", "serviceCount", "startsAt",
-                        "salonName", "subjectName", "subjectRole");
+                        "salonName", "masterName", "subjectName", "subjectRole");
     }
 }

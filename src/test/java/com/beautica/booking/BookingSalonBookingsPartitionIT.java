@@ -263,6 +263,7 @@ class BookingSalonBookingsPartitionIT extends AbstractIntegrationTest {
      */
     @AfterEach
     void refreezeClock() {
+        org.springframework.security.core.context.SecurityContextHolder.clearContext();
         CLOCK.freeze();
     }
 
@@ -993,8 +994,14 @@ class BookingSalonBookingsPartitionIT extends AbstractIntegrationTest {
      * information. What WOULD invalidate the claim is a new DTO field dereferencing an association
      * absent from that fetch graph, and the defence against that is to add it to
      * {@code findAllByIdsWithGraph} in the same change — not a bigger fixture in this file.
+     *
+     * <p><b>Baseline moved 4 -&gt; 6 (Phase 355, reverses 320).</b> The owner holds review authority
+     * over every completed row of their salon again, so the page pays the TWO page-scoped lookups
+     * phase 320 had removed: the batched {@code SalonRepository#findIdsByIdInAndOwnerId} (one
+     * statement for the whole page, never per row; owner authority keyed on the masters' live salon) and the {@code client_reviews} probe over the now
+     * non-empty authority set. RE-DERIVED FROM A RUN (2026-10-08: 6 at one row and 6 at five).
      */
-    private static final long SALON_HISTORY_PAGE_STATEMENTS = 4L;
+    private static final long SALON_HISTORY_PAGE_STATEMENTS = 6L;
 
     // Moved 5 -> 4 for the unscoped client-review probe finding (backend-security 2026-09-20),
     // tracking its sibling
@@ -1017,6 +1024,13 @@ class BookingSalonBookingsPartitionIT extends AbstractIntegrationTest {
 
         Pageable pageable = PageRequest.of(0, 20);
         Statistics statistics = statistics();
+        // Phase 355: the page-scoped authority filter reads the actor's role from the SecurityContext
+        // (the endpoint is @PreAuthorize'd to owner/admin, so production always has one).
+        var ownerToken = new org.springframework.security.authentication.UsernamePasswordAuthenticationToken(
+                ownerId.toString(), null,
+                List.of(new org.springframework.security.core.authority.SimpleGrantedAuthority("ROLE_SALON_OWNER")));
+        ownerToken.setDetails(ownerId);
+        org.springframework.security.core.context.SecurityContextHolder.getContext().setAuthentication(ownerToken);
 
         seedCompletedHistoryAcrossDistinctMasters(clientId, salon, 1);
         statistics.clear();

@@ -224,7 +224,10 @@ public abstract class AbstractIntegrationTest {
     }
 
     private static final PostgreSQLContainer<?> POSTGRES =
-            new PostgreSQLContainer<>("postgres:16-alpine");
+            new PostgreSQLContainer<>("postgres:16-alpine")
+                    // Every cached Spring context holds its own Hikari pool; the default
+                    // max_connections=100 is exhausted on CI ("too many clients already").
+                    .withCommand("postgres", "-c", "max_connections=300");
 
     static {
         POSTGRES.start();

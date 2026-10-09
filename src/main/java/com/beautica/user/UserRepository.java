@@ -23,7 +23,13 @@ public interface UserRepository extends JpaRepository<User, UUID> {
 
     boolean existsByEmail(String email);
 
-    @Query("SELECT u.salonId FROM User u WHERE u.id = :userId")
+    /**
+     * The user's assigned salon id, EMPTY for a missing or DEACTIVATED ({@code is_active = false})
+     * user. The liveness predicate lives in this one statement (no extra round trip) because every
+     * caller uses the result as an admin's management authority: a deactivated admin keeps login
+     * until the JWT expires and must not keep complete / decline / rate / staff-management rights.
+     */
+    @Query("SELECT u.salonId FROM User u WHERE u.id = :userId AND u.isActive = true")
     Optional<UUID> findSalonIdById(@Param("userId") UUID userId);
 
     /**

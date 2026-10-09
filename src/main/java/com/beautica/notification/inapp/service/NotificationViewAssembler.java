@@ -278,12 +278,13 @@ public class NotificationViewAssembler {
 
         NotificationTarget target = new NotificationTarget(
                 kind, booking.getId(), row.getAppointmentId(), booking.getSalon() != null ? booking.getSalon().getId() : null);
-        NotificationParams params = buildBookingParams(booking, visit, actorRole);
+        NotificationParams params = buildBookingParams(row.getType(), booking, visit, actorId, actorRole);
         return new NotificationResponse(
                 row.getId(), row.getType(), row.getCreatedAt(), row.getReadAt() != null, target, params);
     }
 
-    private NotificationParams buildBookingParams(Booking booking, BookingVisit visit, Role actorRole) {
+    private NotificationParams buildBookingParams(
+            InAppNotificationType type, Booking booking, BookingVisit visit, UUID actorId, Role actorRole) {
         Master master = booking.getMaster();
         Salon salon = booking.getSalon();
         User client = booking.getClient();
@@ -302,8 +303,40 @@ public class NotificationViewAssembler {
                 serviceCount,
                 booking.getStartsAt().toInstant(),
                 salon != null ? salon.getName() : null,
+                performingMasterName(type, master, salon, actorId, actorRole, isSingleMaster(visit)),
                 null,
                 null);
+    }
+
+    /**
+     * Salon-side recipients (owner/admin) of a salon booking-created/cancelled-by-client/rescheduled
+     * event learn which master performs it — unless they ARE that master (the owner can be). Reads
+     * only the already-hydrated master/user graph (loaded for {@link #isVisible}); no query.
+     */
+    static String performingMasterName(
+            InAppNotificationType type, Master master, Salon salon, UUID actorId, Role actorRole,
+            boolean singleMaster) {
+        boolean eligibleType = type == InAppNotificationType.BOOKING_CREATED
+                || type == InAppNotificationType.BOOKING_CANCELLED_BY_CLIENT
+                || type == InAppNotificationType.BOOKING_RESCHEDULED;
+        boolean salonStaff = actorRole == Role.SALON_OWNER || actorRole == Role.SALON_ADMIN;
+        if (salon == null || !eligibleType || !salonStaff || !singleMaster) {
+            return null;
+        }
+        User masterUser = master.getUser();
+        if (masterUser != null && masterUser.getId().equals(actorId)) {
+            return null;
+        }
+        return masterDisplayName(master);
+    }
+
+    /**
+     * Defensive: visits are single-master by construction, but the params are built from the
+     * visit's first item — if items ever span masters, no single name is correct, so omit it.
+     */
+    static boolean isSingleMaster(BookingVisit visit) {
+        return visit == null || visit.items().stream()
+                .map(b -> b.getMaster().getId()).distinct().count() <= 1;
     }
 
     private static String clientDisplayName(Booking booking, User client) {
@@ -406,7 +439,7 @@ public class NotificationViewAssembler {
         User subject = stillManages && row.getSubjectUserId() != null
                 ? subjectsById.get(row.getSubjectUserId()) : null;
         NotificationParams params = subject == null ? null : new NotificationParams(
-                null, null, 0, null, null,
+                null, null, 0, null, null, null,
                 joinName(subject.getFirstName(), subject.getLastName()), subject.getRole());
 
         return new NotificationResponse(

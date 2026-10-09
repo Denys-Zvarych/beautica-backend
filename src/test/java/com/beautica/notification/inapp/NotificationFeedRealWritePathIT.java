@@ -164,6 +164,8 @@ class NotificationFeedRealWritePathIT extends AbstractIntegrationTest {
         String clientToken = fixtures.tokenFor(emailOf(clientId));
         ZonedDateTime startsAt = tomorrowAtNoon();
 
+        jdbcTemplate.update("UPDATE users SET first_name = 'Ірина', last_name = 'Мельник' WHERE id = ?",
+                rig.masterUserId());
         UUID bookingId = createBooking(clientToken, rig.masterId(), rig.masterServiceId(), startsAt);
 
         for (Map.Entry<String, UUID> recipient : Map.of(
@@ -187,12 +189,200 @@ class NotificationFeedRealWritePathIT extends AbstractIntegrationTest {
             assertThat(Instant.parse(row.path("params").path("startsAt").asText()))
                     .as("params.startsAt must be the booking's real start instant")
                     .isEqualTo(startsAt.toInstant());
+            boolean performer = recipient.getValue().equals(rig.masterUserId());
+            if (performer) {
+                assertThat(row.path("params").path("masterName").isNull())
+                        .as("the performing master themselves gets no masterName").isTrue();
+            } else {
+                assertThat(row.path("params").path("masterName").asText())
+                        .as("owner/admin of a salon booking learn the performing master")
+                        .isEqualTo("Ірина Мельник");
+            }
             assertThat(unreadCountFor(token)).as("unread-count must match the single item").isEqualTo(1);
         }
 
         JsonNode clientFeed = feedFor(clientToken);
         assertThat(clientFeed).as("the booking client is the actor — never a recipient of their own create").isEmpty();
         assertThat(unreadCountFor(clientToken)).isZero();
+    }
+
+    @Test
+    @DisplayName("owner performs the booking: owner gets masterName null, admin gets the owner's name")
+    void should_omitMasterNameForOwner_when_ownerIsPerformingMaster() throws Exception {
+        SalonRig rig = seedSalonRig();
+        UUID ownerMasterId = fixtures.createOwnerAsMaster(rig.salonId(), rig.ownerId());
+        UUID ownerServiceId = fixtures.createSalonService(rig.salonId(), ownerMasterId);
+        fixtures.addWorkingHoursForEveryDay(ownerMasterId);
+        jdbcTemplate.update("UPDATE users SET first_name = 'Марта', last_name = 'Власник' WHERE id = ?",
+                rig.ownerId());
+        UUID clientId = createNamedClient("Оксана", "Гончарук");
+        String clientToken = fixtures.tokenFor(emailOf(clientId));
+
+        createBooking(clientToken, ownerMasterId, ownerServiceId, tomorrowAtNoon());
+
+        JsonNode ownerRow = feedFor(fixtures.tokenFor(rig.ownerEmail())).get(0);
+        JsonNode adminRow = feedFor(fixtures.tokenFor(rig.adminEmail())).get(0);
+        assertThat(ownerRow.path("params").path("masterName").isNull()).isTrue();
+        assertThat(adminRow.path("params").path("masterName").asText()).isEqualTo("Марта Власник");
+    }
+
+    @Test
+    @DisplayName("independent-master booking: masterName is null for the master")
+    void should_omitMasterName_when_independentMasterBooking() throws Exception {
+        String masterEmail = "rwp-indep-" + System.nanoTime() + "@beautica.test";
+        UUID masterId = fixtures.createIndependentMaster(masterEmail);
+        UUID serviceId = fixtures.createIndependentMasterService(masterId);
+        fixtures.addWorkingHoursForEveryDay(masterId);
+        UUID clientId = createNamedClient("Оксана", "Гончарук");
+        String clientToken = fixtures.tokenFor(emailOf(clientId));
+
+        createBooking(clientToken, masterId, serviceId, tomorrowAtNoon());
+
+        JsonNode row = feedFor(fixtures.tokenFor(masterEmail)).get(0);
+        assertThat(row.path("params").path("masterName").isNull()).isTrue();
+    }
+
+    // ── masterName gate — remaining types / recipients (QA gap fill) ────────────────────────────
+
+    private static final String PERFORMER_NAME = "Ірина Мельник";
+
+    private UUID bookAsNamedClient(SalonRig rig, String clientToken) throws Exception {
+        jdbcTemplate.update("UPDATE users SET first_name = 'Ірина', last_name = 'Мельник' WHERE id = ?",
+                rig.masterUserId());
+        return createBooking(clientToken, rig.masterId(), rig.masterServiceId(), tomorrowAtNoon());
+    }
+
+    @Test
+    @DisplayName("client cancels a salon booking: owner and admin BOOKING_CANCELLED_BY_CLIENT rows carry "
+            + "the performing master's name, the performing master's own row does not")
+    void should_includeMasterName_when_clientCancelsSalonBooking() throws Exception {
+        SalonRig rig = seedSalonRig();
+        String clientToken = fixtures.tokenFor(emailOf(createNamedClient("Оксана", "Гончарук")));
+        UUID bookingId = bookAsNamedClient(rig, clientToken);
+
+        ResponseEntity<String> cancel = restTemplate.exchange(
+                BOOKINGS_URL + "/" + bookingId + "/cancel", HttpMethod.PATCH,
+                new HttpEntity<>(objectMapper.writeValueAsString(Map.of("cancellationReason", "CLIENT_CANCELLED")),
+                        headers(clientToken)), String.class);
+        assertThat(cancel.getStatusCode()).as("cancel must succeed — body=%s", cancel.getBody())
+                .isEqualTo(HttpStatus.NO_CONTENT);
+
+        for (String email : List.of(rig.ownerEmail(), rig.adminEmail())) {
+            JsonNode row = findByType(feedFor(fixtures.tokenFor(email)), "BOOKING_CANCELLED_BY_CLIENT");
+            assertThat(row.path("params").path("masterName").asText())
+                    .as("salon staff recipient %s must learn the performing master", email)
+                    .isEqualTo(PERFORMER_NAME);
+        }
+        JsonNode masterRow = findByType(feedFor(fixtures.tokenFor(emailOf(rig.masterUserId()))),
+                "BOOKING_CANCELLED_BY_CLIENT");
+        assertThat(masterRow.path("params").path("masterName").isNull())
+                .as("the performing master is never told their own name").isTrue();
+    }
+
+    @Test
+    @DisplayName("client reschedules a salon booking: owner and admin BOOKING_RESCHEDULED rows carry the "
+            + "performing master's name, the performing master's own row does not")
+    void should_includeMasterName_when_clientReschedulesSalonBooking() throws Exception {
+        SalonRig rig = seedSalonRig();
+        String clientToken = fixtures.tokenFor(emailOf(createNamedClient("Оксана", "Гончарук")));
+        UUID bookingId = bookAsNamedClient(rig, clientToken);
+
+        ResponseEntity<String> resched = restTemplate.exchange(
+                BOOKINGS_URL + "/" + bookingId + "/reschedule", HttpMethod.PATCH,
+                new HttpEntity<>(objectMapper.writeValueAsString(Map.of(
+                        "newStartsAt", tomorrowAtNoon().plusHours(3).toOffsetDateTime().toString())),
+                        headers(clientToken)), String.class);
+        assertThat(resched.getStatusCode()).as("reschedule must succeed — body=%s", resched.getBody())
+                .isEqualTo(HttpStatus.OK);
+
+        for (String email : List.of(rig.ownerEmail(), rig.adminEmail())) {
+            JsonNode row = findByType(feedFor(fixtures.tokenFor(email)), "BOOKING_RESCHEDULED");
+            assertThat(row.path("params").path("masterName").asText())
+                    .as("salon staff recipient %s must learn the performing master", email)
+                    .isEqualTo(PERFORMER_NAME);
+        }
+        JsonNode masterRow = findByType(feedFor(fixtures.tokenFor(emailOf(rig.masterUserId()))),
+                "BOOKING_RESCHEDULED");
+        assertThat(masterRow.path("params").path("masterName").isNull()).isTrue();
+    }
+
+    @Test
+    @DisplayName("provider reschedules: the CLIENT's BOOKING_RESCHEDULED row has masterName null "
+            + "(the name is for salon staff only)")
+    void should_omitMasterNameForClient_when_providerReschedules() throws Exception {
+        SalonRig rig = seedSalonRig();
+        String clientToken = fixtures.tokenFor(emailOf(createNamedClient("Оксана", "Гончарук")));
+        UUID bookingId = bookAsNamedClient(rig, clientToken);
+
+        ResponseEntity<String> resched = restTemplate.exchange(
+                BOOKINGS_URL + "/" + bookingId + "/reschedule", HttpMethod.PATCH,
+                new HttpEntity<>(objectMapper.writeValueAsString(Map.of(
+                        "newStartsAt", tomorrowAtNoon().plusHours(3).toOffsetDateTime().toString())),
+                        headers(fixtures.tokenFor(rig.adminEmail()))), String.class);
+        assertThat(resched.getStatusCode()).as("provider reschedule must succeed — body=%s", resched.getBody())
+                .isEqualTo(HttpStatus.OK);
+
+        JsonNode clientRow = findByType(feedFor(clientToken), "BOOKING_RESCHEDULED");
+        assertThat(clientRow.path("params").path("counterpartName").asText())
+                .as("sanity — a params object is rendered for the client").isNotBlank();
+        assertThat(clientRow.path("params").path("masterName").isNull())
+                .as("client row must not carry masterName, actual=%s", clientRow.path("params")).isTrue();
+    }
+
+    @Test
+    @DisplayName("client reviews a completed salon booking over real HTTP: the owner's REVIEW_RECEIVED "
+            + "row (type outside the three) renders masterName null")
+    void should_omitMasterNameForOwner_when_reviewReceivedViaRealEndpoint() throws Exception {
+        SalonRig rig = seedSalonRig();
+        String clientToken = fixtures.tokenFor(emailOf(createNamedClient("Оксана", "Гончарук")));
+        UUID bookingId = bookAsNamedClient(rig, clientToken);
+        jdbcTemplate.update("UPDATE bookings SET starts_at = NOW() - interval '1 hour' WHERE id = ?", bookingId);
+        ResponseEntity<String> completeResp = restTemplate.exchange(
+                BOOKINGS_URL + "/" + bookingId + "/complete", HttpMethod.PATCH,
+                new HttpEntity<>("", headers(fixtures.tokenFor(rig.ownerEmail()))), String.class);
+        assertThat(completeResp.getStatusCode()).as("complete must succeed — body=%s", completeResp.getBody())
+                .isEqualTo(HttpStatus.NO_CONTENT);
+        ResponseEntity<String> reviewResp = restTemplate.exchange(
+                "/api/v1/reviews", HttpMethod.POST,
+                new HttpEntity<>(objectMapper.writeValueAsString(
+                        Map.of("bookingId", bookingId.toString(), "rating", 5, "comment", "Great!")),
+                        headers(clientToken)), String.class);
+        assertThat(reviewResp.getStatusCode()).as("review create must succeed — body=%s", reviewResp.getBody())
+                .isEqualTo(HttpStatus.CREATED);
+
+        JsonNode row = findByType(feedFor(fixtures.tokenFor(rig.ownerEmail())), "REVIEW_RECEIVED");
+
+        assertThat(row.path("params").path("counterpartName").asText())
+                .as("sanity — the row resolves with params for the owner, actual=%s", row.path("params"))
+                .isEqualTo("Оксана Гончарук");
+        assertThat(row.path("params").path("masterName").isNull())
+                .as("REVIEW_RECEIVED must not carry masterName, actual=%s", row.path("params")).isTrue();
+    }
+
+    @Test
+    @DisplayName("the booking client's own feed row never carries masterName; an owner of ANOTHER salon "
+            + "sees no row at all")
+    void should_neverLeakMasterName_when_clientOrForeignOwnerReads() throws Exception {
+        SalonRig rigA = seedSalonRig();
+        SalonRig rigB = seedSalonRig();
+        String clientToken = fixtures.tokenFor(emailOf(createNamedClient("Оксана", "Гончарук")));
+        UUID bookingId = bookAsNamedClient(rigA, clientToken);
+        // a CLIENT-addressed row of an eligible type, written raw (a client is never a CREATED recipient)
+        jdbcTemplate.update("""
+                INSERT INTO in_app_notification (id, recipient_user_id, type, booking_id, salon_id, dedup_key)
+                VALUES (?, ?, 'BOOKING_RESCHEDULED', ?, ?, ?)
+                """, UUID.randomUUID(), jdbcTemplate.queryForObject(
+                        "SELECT client_id FROM bookings WHERE id = ?", UUID.class, bookingId),
+                bookingId, rigA.salonId(), "BOOKING_RESCHEDULED:" + bookingId + ":1");
+
+        JsonNode clientRow = findByType(feedFor(clientToken), "BOOKING_RESCHEDULED");
+        JsonNode foreignOwnerFeed = feedFor(fixtures.tokenFor(rigB.ownerEmail()));
+
+        assertThat(clientRow.path("params").path("masterName").isNull())
+                .as("client row must not carry masterName, actual=%s", clientRow.path("params")).isTrue();
+        assertThat(foreignOwnerFeed).as("an owner of another salon has no row, actual=%s", foreignOwnerFeed)
+                .isEmpty();
+        assertThat(foreignOwnerFeed.toString()).doesNotContain(PERFORMER_NAME);
     }
 
     // ── gap 2 — a visit (multi-service) item ────────────────────────────────────────────────────

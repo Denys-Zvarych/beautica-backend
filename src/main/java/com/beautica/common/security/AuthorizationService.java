@@ -29,6 +29,7 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.UUID;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
@@ -1033,8 +1034,9 @@ public class AuthorizationService {
      *   <li>{@code actorRole == SALON_MASTER} → {@code masterIsActive && masterUserId == actorId} —
      *       the ONLY branch that reads {@code masterIsActive}, so a deactivated stylist loses view
      *       of bookings they used to perform.</li>
-     *   <li>{@code SALON_ADMIN} → structurally excluded; no branch above admits it. Do NOT widen
-     *       this method to admit {@code SALON_ADMIN} — {@code NotificationViewAssembler} grants
+     *   <li>{@code SALON_ADMIN} → excluded from THIS predicate; no branch above admits it
+     *       ({@link #enforceCanViewBooking} admits an assigned admin via {@code hasManagementAccess},
+     *       phase 356). Do NOT widen this method to admit {@code SALON_ADMIN} — {@code NotificationViewAssembler} grants
      *       admin visibility itself, via a live "still assigned to this salon" check that has no
      *       equivalent here (see that class's {@code isVisible}/{@code managesSalon}), exactly the
      *       divergence {@link #isAuthorizedToManageBooking}'s javadoc already documents between
@@ -1094,11 +1096,10 @@ public class AuthorizationService {
      * Everything that decides the result — the independent-master arm, the {@code salonId != null}
      * guard, the conjunct order — lives here and is shared verbatim.
      *
-     * <p><b>Phase 320 — the page-scoped BATCHED form that also funnelled through here is gone.</b>
-     * It existed solely to resolve the salon arm of the {@code providerCanReviewClient} listing
-     * flag; that flag is now the single term {@link #isPerformingMasterOfBooking}, so the batch had
-     * no remaining caller. This kernel is untouched and still gates complete / not-complete /
-     * decline / reschedule for owner and admin alike.
+     * <p><b>Phase 355</b> — the page-scoped batched form
+     * ({@link #filterBookingIdsWithProviderAuthority(Role, UUID, List)}) also funnels through here
+     * again, for the {@code providerCanReviewClient} listing flag. This kernel is untouched and gates
+     * complete / not-complete / decline / reschedule / review for owner and admin alike.
      *
      * <p>Named distinctly rather than overloading {@code hasProviderAuthorityOverBooking}: with a
      * {@code Predicate} and a {@link Role} in the same trailing position, a {@code null} literal at
@@ -1622,150 +1623,145 @@ public class AuthorizationService {
     }
 
     /**
-     * SpEL {@code @PreAuthorize} predicate for {@code POST /client-reviews} (Phase 27.5 — REVERSES
-     * the previously-deferred/out-of-scope status of master&rarr;client reviews).
+     * SpEL {@code @PreAuthorize} predicate for {@code POST /client-reviews}.
      *
-     * <p><b>Phase 320 — the predicate is now ONE term: the performing master, and nobody else.</b>
-     * Phase 316 admitted the performing master via {@link #isPerformingMasterOfRow} UNIONED onto
-     * {@link #hasProviderAuthorityOverBooking}; the locked product decision ("salon owner or salon
-     * admin can complete the booking, and after it only salon master can leave the feedback")
-     * deletes that second disjunct. This must stay byte-for-byte the same decision as {@link
-     * #enforceCanReviewClient} — see that method for the full rationale, including why {@link
-     * #hasProviderAuthorityOverBooking} itself is untouched (owner/admin keep complete / decline /
-     * reschedule) and why an owner-as-master still qualifies on their own performed bookings.
+     * <p><b>Phase 355 — at a salon only the booking's OWNER/ADMIN may rate the client; the invited
+     * {@code SALON_MASTER} may not.</b> Reverses phase 320 (performing master as sole rater). The
+     * decision is {@link #hasProviderAuthorityOverBooking} — the same kernel completion uses, so
+     * "who may complete" and "who may rate after completing" are one rule — evaluated over the
+     * {@link BookingCompletionAccess} projection. That kernel is untouched (it also gates decline /
+     * cancel / reschedule). An independent master rates their own booking; an owner/admin of a
+     * DIFFERENT salon is denied; an owner who also performed the booking is still the owner.
      *
-     * <p>{@code ROLE_CLIENT} keeps its fast-reject: a client is never a provider on any booking,
-     * and {@code bookings.client_id} is a {@code Role.CLIENT} row asserted at insert, so it can
-     * never equal {@code masters.user_id}. {@code ROLE_SALON_MASTER}'s fast-reject stays GONE — the
-     * answer genuinely depends on which booking is being asked about, so the projection has to be
-     * read. A missing booking still maps to {@code false} (403, no existence oracle).
-     *
-     * <p><b>{@link BookingRepository#findReviewAccessById} is still the right projection.</b> Both
-     * legs it feeds this method are still consulted — {@code masterUserId} for the identity
-     * comparison and {@code masterIsActive} for the liveness conjunct. Only its {@code salonId}
-     * leg, which existed for the deleted authority disjunct, is now unread here.
+     * <p>{@code ROLE_CLIENT} and {@code ROLE_SALON_MASTER} are rejected up front with no DB round
+     * trip (mirrors {@link #canCompleteBooking}). A missing booking maps to {@code false} (403, no
+     * existence oracle). Must stay the same decision as {@link #canProviderReviewClient}, which the
+     * service-layer guard and the {@code providerCanReviewClient} flag both call.
      */
     public boolean canReviewClient(Authentication auth, UUID bookingId) {
         boolean cannotReview = auth.getAuthorities().stream().anyMatch(a ->
-                a.getAuthority().equals("ROLE_CLIENT"));
+                a.getAuthority().equals("ROLE_SALON_MASTER")
+                        || a.getAuthority().equals("ROLE_CLIENT"));
         if (cannotReview) return false;
         UUID actorId = principalId(auth);
+        Role actorRole = roleFromAuthentication(auth);
+        // Independent-master arm additionally requires a LIVE master row (masters.is_active): a
+        // deactivated independent master keeps login and role, so liveness is checked here.
         return bookingRepository.findReviewAccessById(bookingId)
-                .map(v -> isPerformingMasterOfRow(v.masterUserId(), v.masterIsActive(), actorId))
+                .map(v -> (v.salonId() != null || v.masterIsActive())
+                        && hasProviderAuthorityOverBooking(
+                                v.salonId() == null, v.masterUserId(), v.salonId(), actorId, actorRole))
                 .orElse(false);
     }
 
     /**
-     * Phase 316 — the ONLY booking-scoped write authority a {@code SALON_MASTER} holds, and only
-     * over the booking they themselves performed. Admits any actor whose {@code users} row IS the
-     * booking's {@code masters.user_id}: the salon master this phase exists for, and (already
-     * admitted by {@link #hasProviderAuthorityOverBooking}'s independent-master arm, so this is a
-     * no-op for them) an {@code INDEPENDENT_MASTER} on their own booking.
+     * The ONE entity-level provider-review-authority predicate (Phase 355): {@code
+     * !SALON_MASTER && !CLIENT && hasProviderAuthorityOverBooking(actor, booking)}. Called by
+     * {@link #enforceCanReviewClient} (the 403) and by {@code BookingService}'s detail-view {@code
+     * providerCanReviewClient} flag, so the flag and the permission can never drift.
      *
-     * <p><b>Deliberately its own entry point, NOT a widening of {@link
-     * #hasProviderAuthorityOverBooking}.</b> That kernel also gates {@code /complete}, {@code
-     * /not-complete}, {@code /decline} and {@code /reschedule} ({@link #canCompleteBooking},
-     * {@link #canCancelBooking}, {@link #canRescheduleBooking}, {@link
-     * #enforceCanCompleteBooking}, {@link #enforceCanCancelBooking}, {@link
-     * #enforceCanRescheduleBooking}, {@link #enforceCanManageAppointment}) — the four actions a
-     * salon master must stay locked out of, and the reason its "actor is the performing master"
-     * arm is reachable only when {@code independentMasterBooking == true} (which implies {@code
-     * salonId == null}). Adding a salon-master leg there would hand the read-only role every one
-     * of them in a single edit. {@code grep isPerformingMasterOfBooking} must therefore stay the
-     * complete answer to "where may a SALON_MASTER write against a booking?" — exactly the
-     * property {@link #canEditMasterServiceBand} holds for {@code master_services} (Phase 311 D5).
-     *
-     * <p><b>The grant LAPSES when the master is deactivated</b> — {@code masters.is_active} is a
-     * conjunct, not a comment. {@code MasterService#deactivateMasterInternal} (reached by {@code
-     * DELETE /masters/&#123;masterId&#125;}) flips that flag and NOTHING else: the staff {@code
-     * users} row, its {@code SALON_MASTER} role and its login all survive, because {@code
-     * AuthService} gates on {@code user.isActive()}, never on the master row. Without this conjunct
-     * a fired stylist would log in on unexpired credentials and keep writing {@code client_reviews}
-     * against every client they ever served — each one moving that client's aggregate rating
-     * through {@code ClientReviewEventListener} — indefinitely. The conjunct is FIRST so a
-     * deactivated master short-circuits before the identity comparison.
-     *
-     * <p><b>This must NOT be pushed down into {@link #hasProviderAuthorityOverBooking}.</b> That
-     * kernel has the opposite requirement: a salon owner or admin keeps complete / not-complete /
-     * decline / reschedule over a booking whose master has since been deactivated. Hence the
-     * separate {@link BookingReviewAccess} projection for the SpEL twin — see its javadoc.
-     *
-     * <p><b>Reads no {@code SecurityContext} and issues no statement</b> — but NOT for the reason
-     * an earlier revision of this javadoc gave. It claimed {@code master.getUser().getId()} was "an
-     * IDENTIFIER read served off the uninitialised proxy"; that is false here. {@code Master} and
-     * {@code User} both use FIELD-access {@code @Id}, so Hibernate has no getter to intercept and
-     * {@code getId()} on a genuine proxy WOULD initialise it — as would {@code isActive()}, which
-     * is not an identifier at all. What actually makes both reads free is that every loading graph
-     * reaching this method fetches the master and its user outright:
-     * {@code JOIN FETCH b.master m} + {@code LEFT JOIN FETCH m.user} in {@code
-     * BookingRepository#findByIdWithFullGraph}, {@code #findAllByIdsWithGraph} and {@code
-     * #findByAppointmentIdWithGraph}. <b>Delete either fetch join and this method starts issuing a
-     * SELECT per booking</b> — an N+1 on the provider list page, not a compile error. That is also
-     * why no role lookup is needed: the comparison is against {@code masters.user_id}, which no
-     * {@code CLIENT} and no salon {@code owner_id} can equal. It matters twice over — the {@code
-     * GET /bookings/&#123;id&#125;} detail path calls this through {@code
-     * BookingService#computeProviderCanReviewClient} on a booking hydrated WITHOUT {@code m.salon},
-     * and {@code BookingPriceRangeContractIT} drives that path directly, with no {@code
-     * SecurityContextHolder} populated at all.
-     *
-     * <p>Fail-closed on a DETACHED master (V157 / phase 294 D1 — {@code masters.user_id} is NULL
-     * once the staff account is hard-deleted): {@code null} never equals a non-null {@code
-     * actorUserId}, so a booking whose performer's account is gone confers this grant on nobody.
-     * Doubly so now — {@code SalonService#removeMaster} deactivates the row as well as NULLing
-     * {@code user_id}, so both conjuncts deny independently.
+     * <p>The role comes from the {@code SecurityContext}; with no authenticated principal it fails
+     * closed ({@code false}). The explicit {@code SALON_MASTER} rejection is defence in depth: the
+     * kernel does not know roles for a salon master who is also a salon member.
      */
-    public boolean isPerformingMasterOfBooking(UUID actorUserId, Booking booking) {
-        Master master = booking.getMaster();
-        return isPerformingMasterOfRow(masterUserId(master), master.isActive(), actorUserId);
+    public boolean canProviderReviewClient(UUID actorUserId, Booking booking) {
+        Role actorRole = currentRoleOrNull();
+        if (actorRole == null || actorRole == Role.SALON_MASTER || actorRole == Role.CLIENT) {
+            return false;
+        }
+        return isLiveIfIndependent(booking.getMaster()) && hasProviderAuthorityOverBooking(actorUserId, booking);
+    }
+
+    /** An INDEPENDENT_MASTER's master row must be active; salon-typed masters are not liveness-gated. */
+    private static boolean isLiveIfIndependent(Master master) {
+        return master.getMasterType() != MasterType.INDEPENDENT_MASTER || master.isActive();
     }
 
     /**
-     * Projection twin of {@link #isPerformingMasterOfBooking} — same decision, over the {@code
-     * masterUserId}/{@code masterIsActive} legs of a {@link BookingReviewAccess} row rather than a
-     * hydrated entity, so the SpEL gate and the service-layer guard cannot drift apart. See that
-     * method's javadoc for the whole rationale, including why the liveness conjunct is here and
-     * never folded into {@link #hasProviderAuthorityOverRow}.
-     */
-    private static boolean isPerformingMasterOfRow(
-            @Nullable UUID masterUserId, boolean masterIsActive, UUID actorUserId) {
-        return masterIsActive && masterUserId != null && masterUserId.equals(actorUserId);
-    }
-
-    /**
-     * Service-layer defense-in-depth guard (Phase 27.5) — the entity-based twin of {@link
-     * #canReviewClient}, for {@code ClientReviewService.create} to call after its own single load
-     * (mirrors {@link #enforceCanCancelBooking}/{@link #enforceCanRescheduleBooking}).
-     *
-     * <p><b>Phase 320 — ONE term, not a union: only the PERFORMING master may review the client.</b>
-     * Locked product decision: "salon owner or salon admin can complete the booking, and after it
-     * only salon master can leave the feedback". The {@link #hasProviderAuthorityOverBooking}
-     * disjunct this guard carried since Phase 27.5 is GONE — an owner or admin who closes a booking
-     * no longer inherits the right to rate the client of a visit they did not perform. Only the
-     * person who sat with the client has something to say about them.
-     *
-     * <p><b>{@link #hasProviderAuthorityOverBooking} itself is deliberately UNTOUCHED.</b> The same
-     * kernel gates {@code /complete}, {@code /not-complete}, {@code /decline} and {@code
-     * /reschedule}; owner and admin keep every one of those. Narrowing happened HERE, at the four
-     * review call sites, precisely so that closing authority and reviewing authority could part
-     * company without one edit silently revoking the other.
-     *
-     * <p><b>Two consequences that are the rule working, not gaps to backfill.</b> (1) An
-     * owner-as-master keeps the right — {@code MasterService#createMasterForOwner} writes a {@code
-     * masters} row with {@code master_type = 'SALON_OWNER'} and {@code user_id = }the owner, and
-     * {@link #isPerformingMasterOfBooking} reads {@code booking.master.user_id}, never a role or a
-     * salon, so that owner matches on their OWN performed bookings and on nobody else's. (2) When
-     * the performing master is deactivated the booking becomes unreviewable by anyone — {@code
-     * masters.is_active} still gates (see {@link #isPerformingMasterOfBooking}) and there is no
-     * longer an owner arm behind it. Do not add a fallback.
-     *
-     * <p>Still the entity-based twin of {@link #canReviewClient}, evaluating the identical single
-     * term over a hydrated entity rather than a {@link BookingReviewAccess} projection. A
-     * divergence between the two would show up as a CTA the write endpoint rejects, or a 403 after
-     * a green {@code @PreAuthorize} — which is why neither side re-derives the predicate.
+     * Service-layer defense-in-depth guard — the entity-based twin of {@link #canReviewClient},
+     * for {@code ClientReviewService.create} to call after its own single load. Throws on exactly
+     * what {@link #canProviderReviewClient} answers {@code false} to. (Phase 355; reverses 320.)
      */
     public void enforceCanReviewClient(UUID actorUserId, Booking booking) {
-        if (!isPerformingMasterOfBooking(actorUserId, booking)) {
+        if (!canProviderReviewClient(actorUserId, booking)) {
             throw new ForbiddenException("Access denied");
+        }
+    }
+
+    /**
+     * Page-scoped batched form of {@link #canProviderReviewClient} for the {@code GET
+     * /bookings/me} listing: of the supplied bookings (hydrated with {@code b.master} and {@code
+     * m.user}), the ids the actor may rate the client of. At most ONE statement for the whole page
+     * (owner: {@link SalonRepository#findIdsByIdInAndOwnerId} over the page's live salon ids;
+     * admin: the memoised assigned-salon lookup) — never one per row (anti-bug §E).
+     *
+     * <p>Same decision as the per-row twin: the independent-master arm, plus the master's LIVE
+     * salon being one the actor owns/administers. {@code SALON_MASTER}/{@code CLIENT} (and any
+     * other role) short-circuit to an empty set with no statement. Takes the role explicitly and
+     * reads no {@code SecurityContext}, so it can be driven directly without one.
+     */
+    public Set<UUID> filterBookingIdsWithProviderAuthority(
+            Role actorRole, UUID actorId, List<Booking> bookings) {
+        if (actorRole != Role.SALON_OWNER && actorRole != Role.SALON_ADMIN
+                && actorRole != Role.INDEPENDENT_MASTER) {
+            return Set.of();
+        }
+        Set<UUID> liveSalonIds = bookings.stream()
+                .map(Booking::getMaster)
+                .filter(m -> m.getMasterType() != MasterType.INDEPENDENT_MASTER)
+                .map(AuthorizationService::liveSalonId)
+                .filter(Objects::nonNull)
+                .collect(Collectors.toSet());
+        Set<UUID> managedSalonIds = Set.of();
+        if (!liveSalonIds.isEmpty()) {
+            if (actorRole == Role.SALON_OWNER) {
+                managedSalonIds = Set.copyOf(salonRepository.findIdsByIdInAndOwnerId(liveSalonIds, actorId));
+            } else if (actorRole == Role.SALON_ADMIN) {
+                managedSalonIds = actorSalonAssignmentMemo
+                        .salonIdOf(actorId, () -> userRepository.findSalonIdById(actorId))
+                        .filter(liveSalonIds::contains)
+                        .map(Set::of)
+                        .orElse(Set.of());
+            }
+        }
+        Set<UUID> managed = managedSalonIds;
+        return bookings.stream()
+                .filter(b -> isLiveIfIndependent(b.getMaster()))
+                .filter(b -> hasProviderAuthorityOverRow(
+                        b.getMaster().getMasterType() == MasterType.INDEPENDENT_MASTER,
+                        masterUserId(b.getMaster()),
+                        liveSalonId(b.getMaster()),
+                        actorId,
+                        managed::contains))
+                .map(Booking::getId)
+                .collect(Collectors.toSet());
+    }
+
+    /**
+     * As {@link #filterBookingIdsWithProviderAuthority(Role, UUID, List)}, role read from the
+     * SecurityContext; fails closed (empty set, no statement) with no authenticated principal.
+     */
+    public Set<UUID> filterBookingIdsWithProviderAuthority(UUID actorId, List<Booking> bookings) {
+        Role role = currentRoleOrNull();
+        if (role == null) {
+            return Set.of();
+        }
+        return filterBookingIdsWithProviderAuthority(role, actorId, bookings);
+    }
+
+    /** Identifier-only read of a master's LIVE salon id — never initialises the proxy. */
+    @Nullable
+    private static UUID liveSalonId(Master master) {
+        Salon salon = master.getSalon();
+        return salon == null ? null : salon.getId();
+    }
+
+    @Nullable
+    private Role currentRoleOrNull() {
+        try {
+            return roleFromCurrentAuthentication();
+        } catch (ForbiddenException e) {
+            return null;
         }
     }
 
@@ -1833,7 +1829,14 @@ public class AuthorizationService {
      * guard are copied verbatim from {@link #isPerformingMasterOfRow} so the two cannot disagree
      * about who the performing master is.
      *
-     * <p><b>OWNER/ADMIN are unaffected.</b> They are admitted by {@link
+     * <p><b>Phase 356 — assigned SALON_ADMIN.</b> {@link #isAuthorizedToManageBooking} excludes
+     * {@code SALON_ADMIN}; this method admits an assigned, active admin through its own final leg
+     * via {@link #hasManagementAccess(UUID, UUID)} (live assignment + {@code users.is_active}),
+     * for an active performing master whose live salon equals the booking's own salon snapshot
+     * (the salon board's filter), so a rotated master's old-salon history stays invisible to the
+     * new salon's admin.
+     *
+     * <p><b>OWNER is unaffected.</b> The owner is admitted by {@link
      * #isAuthorizedToManageBooking} above, which never reaches this branch and carries no liveness
      * term — a salon owner keeps full view of a booking whose master has since been deactivated,
      * exactly as they keep complete/decline/reschedule over it (see {@link BookingReviewAccess}'s
@@ -1855,6 +1858,20 @@ public class AuthorizationService {
                 && roleFromCurrentAuthentication() == Role.SALON_MASTER
                 && masterUserId(performer) != null
                 && masterUserId(performer).equals(actorUserId)) {
+            return;
+        }
+        // Phase 356 — an ASSIGNED, ACTIVE SALON_ADMIN may view a booking performed at their salon.
+        // Liveness (still assigned + users.is_active) comes from hasManagementAccess; the performer
+        // must be active and the salon is the master's LIVE one, so a detached/rotated master never
+        // matches. Independent masters have no salon and can never match. The booking's own salon
+        // snapshot must ALSO equal the master's live salon (the board filters on b.salon_id), so after
+        // a rotation the new salon's admin cannot read the old salon's history.
+        if (roleFromCurrentAuthentication() == Role.SALON_ADMIN
+                && performer.isActive()
+                && performer.getSalon() != null
+                && booking.getSalon() != null
+                && booking.getSalon().getId().equals(performer.getSalon().getId())
+                && hasManagementAccess(performer.getSalon().getId(), actorUserId)) {
             return;
         }
         throw new ForbiddenException("Access denied");
@@ -1922,7 +1939,8 @@ public class AuthorizationService {
         // ID-ownership checks below, which a SALON_MASTER cannot satisfy because their userId is
         // never equal to the salon owner's userId.
         //
-        // SALON_ADMIN exclusion: implicit via ownership semantics — SALON_ADMIN has a distinct userId
+        // SALON_ADMIN exclusion (from THIS predicate; enforceCanViewBooking admits an assigned admin via
+        // hasManagementAccess — phase 356): implicit via ownership semantics — SALON_ADMIN has a distinct userId
         // from the salon owner, so the owner-ID equality check below always returns false for them.
         Master master = booking.getMaster();
         if (master.getMasterType() == MasterType.INDEPENDENT_MASTER) {

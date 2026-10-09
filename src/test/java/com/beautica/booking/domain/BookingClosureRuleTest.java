@@ -7,6 +7,8 @@ import jakarta.persistence.criteria.CriteriaQuery;
 import jakarta.persistence.criteria.Path;
 import jakarta.persistence.criteria.Predicate;
 import jakarta.persistence.criteria.Root;
+import jakarta.persistence.criteria.Subquery;
+import com.beautica.review.entity.ClientReview;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -177,6 +179,41 @@ class BookingClosureRuleTest {
         verify(statusPath).in(EnumSet.of(BookingStatus.CONFIRMED));
         verify(cb).lessThan(endsAtPath, NOW);
         verify(cb).and(confirmedIn, endsAtLt);
+        verify(cb, never()).or(any(Predicate.class), any(Predicate.class));
+    }
+
+    @Test
+    @DisplayName("Phase 357 awaitingProviderClientReview() is status IN (COMPLETED) AND client IS NOT NULL "
+            + "AND NOT EXISTS (client_reviews row for the booking) — the SQL twin of providerCanReviewClient's "
+            + "data half")
+    @SuppressWarnings("unchecked")
+    void should_composeCompletedClientPresentAndNoReview_when_buildingAwaitingProviderClientReview() {
+        Path<Object> clientPath = mock(Path.class);
+        Predicate completedIn = mock(Predicate.class);
+        Predicate hasClient = mock(Predicate.class);
+        Predicate existsPred = mock(Predicate.class);
+        Predicate notExists = mock(Predicate.class);
+        Subquery<Integer> sub = mock(Subquery.class);
+        Root<ClientReview> crRoot = mock(Root.class);
+        Path<Object> crBookingPath = mock(Path.class);
+        doReturn(clientPath).when(root).get("client");
+        doReturn(completedIn).when(statusPath).in(EnumSet.of(BookingStatus.COMPLETED));
+        doReturn(hasClient).when(cb).isNotNull(clientPath);
+        doReturn(sub).when(query).subquery(Integer.class);
+        doReturn(crRoot).when(sub).from(ClientReview.class);
+        doReturn(crBookingPath).when(crRoot).get("booking");
+        doReturn(sub).when(sub).select(any());
+        doReturn(sub).when(sub).where(any(Predicate.class));
+        doReturn(existsPred).when(cb).exists(sub);
+        doReturn(notExists).when(cb).not(existsPred);
+        doReturn(mock(Predicate.class)).when(cb).and(any(Predicate.class), any(Predicate.class));
+
+        BookingClosureRule.awaitingProviderClientReview().toPredicate(root, query, cb);
+
+        verify(statusPath).in(EnumSet.of(BookingStatus.COMPLETED));
+        verify(cb).isNotNull(clientPath);
+        verify(query).subquery(Integer.class);
+        verify(cb).not(existsPred);
         verify(cb, never()).or(any(Predicate.class), any(Predicate.class));
     }
 }

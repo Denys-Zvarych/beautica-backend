@@ -6,7 +6,9 @@ import com.beautica.booking.dto.CreateBookingRequest;
 import com.beautica.booking.dto.CancelBookingRequest;
 import com.beautica.booking.dto.RescheduleBookingRequest;
 import com.beautica.booking.dto.StatusUpdateRequest;
+import com.beautica.booking.dto.PendingBookingActionsCountResponse;
 import com.beautica.booking.dto.UnclosedCountResponse;
+import com.beautica.booking.service.PendingBookingActionsService;
 import com.beautica.booking.enums.BookingPartition;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.service.BookingService;
@@ -90,6 +92,7 @@ public class BookingController {
     private static final int MAX_CLAMPED_OFFSET = 20_000;
 
     private final BookingService bookingService;
+    private final PendingBookingActionsService pendingBookingActionsService;
 
     /**
      * Creates a booking and returns the enriched detail view.
@@ -121,6 +124,10 @@ public class BookingController {
 
     @GetMapping("/{bookingId}")
     @PreAuthorize("isAuthenticated()")
+    @Operation(summary = "Get a booking",
+            description = "200 for the owning client, the performing master, the salon owner, or an "
+                    + "assigned, active salon admin of the booking's salon. 403 for anyone else "
+                    + "(also when the booking does not exist).")
     public ApiResponse<BookingDetailResponse> getBooking(
             @PathVariable UUID bookingId,
             Authentication auth
@@ -184,12 +191,40 @@ public class BookingController {
                     + "behaviour against a backend that does not yet know `partition`. Omit for "
                     + "byte-identical pre-Phase-28 behaviour.")
             @RequestParam(required = false) BookingPartition partition,
+            // Phase 354: additive-optional; absent/false => byte-identical pre-354 behaviour.
+            @Parameter(description = "SALON_OWNER only: list the caller's own master-row bookings "
+                    + "(the master view) instead of every salon they own. Ignored for master roles. "
+                    + "When true: CLIENT gets 400; SALON_ADMIN gets 403; an owner whose own master "
+                    + "row is inactive or not owner-typed gets 403; an owner with no master row "
+                    + "gets 404. Absent or false keeps the default behaviour.")
+            @RequestParam(required = false) Boolean asMaster,
             @PageableDefault(size = 20, sort = "startsAt", direction = Sort.Direction.DESC) Pageable pageable,
             Authentication auth
     ) {
         return ApiResponse.ok(bookingService.getMyBookings(
                 AuthenticationUtils.userId(auth), auth, status, from, to, serviceId, partition,
-                clampGiantOffset(pageable)));
+                asMaster, clampGiantOffset(pageable)));
+    }
+
+    // Phase 357: literal segments declared beside unclosed-count, ahead of any /{bookingId} mapping.
+    @Operation(summary = "Bookings awaiting provider action (close or rate client) — archive badge")
+    @GetMapping("/me/pending-actions/count")
+    @PreAuthorize("hasAnyRole('INDEPENDENT_MASTER','SALON_OWNER')")
+    public ApiResponse<PendingBookingActionsCountResponse> getMyPendingActionsCount(
+            Authentication auth,
+            @Parameter(description = "SALON_OWNER only: true counts the owner's own master-row bookings. "
+                    + "Without it a SALON_OWNER is 403 (use the salon endpoint).")
+            @RequestParam(required = false) Boolean asMaster) {
+        return ApiResponse.ok(pendingBookingActionsService.countForMe(
+                AuthenticationUtils.userId(auth), auth, Boolean.TRUE.equals(asMaster)));
+    }
+
+    @Operation(summary = "Bookings awaiting provider action (close or rate client) — archive badge")
+    @GetMapping("/salon/{salonId}/pending-actions/count")
+    @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN') and @authz.canManageSalon(authentication, #salonId)")
+    public ApiResponse<PendingBookingActionsCountResponse> getSalonPendingActionsCount(
+            @PathVariable UUID salonId) {
+        return ApiResponse.ok(pendingBookingActionsService.countForSalon(salonId));
     }
 
     // Phase 29.4: three path segments (/me/unclosed-count), same collision-avoidance rationale as
@@ -215,10 +250,17 @@ public class BookingController {
             @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate from,
             @Parameter(description = "Range end (inclusive), local Europe/Kyiv day. Required.")
             @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate to,
+            // Phase 354: additive-optional; absent/false => byte-identical pre-354 behaviour.
+            @Parameter(description = "SALON_OWNER only: list the caller's own master-row bookings "
+                    + "(the master view) instead of every salon they own. Ignored for master roles. "
+                    + "When true: CLIENT gets 400; SALON_ADMIN gets 403; an owner whose own master "
+                    + "row is inactive or not owner-typed gets 403; an owner with no master row "
+                    + "gets 404. Absent or false keeps the default behaviour.")
+            @RequestParam(required = false) Boolean asMaster,
             Authentication auth
     ) {
         return ApiResponse.ok(bookingService.getMyBookedDays(
-                AuthenticationUtils.userId(auth), auth, from, to));
+                AuthenticationUtils.userId(auth), auth, from, to, asMaster));
     }
 
     /**

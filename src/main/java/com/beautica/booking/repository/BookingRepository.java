@@ -666,7 +666,9 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
                 b.client.avatarUrl,
                 m.avgRating,
                 m.reviewCount,
-                b.salon.id
+                b.salon.id,
+                b.client.avgRating,
+                b.client.reviewCount
             )
             FROM Booking b
             JOIN b.client
@@ -1268,24 +1270,10 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     Optional<BookingCompletionAccess> findCompletionAccessById(@Param("bookingId") UUID bookingId);
 
     /**
-     * Review-authorization projection (Phase 316) — {@link #findCompletionAccessById}'s pair plus
-     * {@code masters.is_active}, for {@code AuthorizationService.canReviewClient} alone.
-     *
-     * <p><b>Why this is a second method and not a third component on {@code
-     * BookingCompletionAccess}.</b> The Phase 316 grant ("the performing SALON_MASTER may review the
-     * client of their OWN booking") must LAPSE when that master is deactivated — otherwise a fired
-     * stylist keeps writing {@code client_reviews} against every client they ever served, moving
-     * that client's aggregate rating, for as long as their credentials live ({@code
-     * MasterService.deactivateMasterInternal} flips {@code masters.is_active} only; the {@code
-     * users} row, the {@code SALON_MASTER} role and login all survive). The completion kernel
-     * fed by {@code BookingCompletionAccess} must do the OPPOSITE — a salon owner or admin keeps
-     * complete / not-complete / decline / reschedule over a deactivated master's bookings — so it
-     * must never see an {@code is_active} conjunct. Sharing one projection is how that conjunct
-     * would leak into the kernel on the next edit. See {@link BookingReviewAccess}.
-     *
-     * <p>{@code bm.user} is a {@code LEFT JOIN} for exactly the reason spelled out on {@link
-     * #findCompletionAccessById} (V157 / phase 294 D1 — a DETACHED master's booking must still
-     * project, so the SALON OWNER arm keeps firing) and must stay one.
+     * Review-authorization projection (Phase 355) — {@link #findCompletionAccessById}'s pair plus
+     * {@code masters.is_active}, for {@code AuthorizationService.canReviewClient} alone, so the
+     * independent-master arm can require a live master row. Kept separate from the completion
+     * projection (see {@link BookingReviewAccess}). {@code bm.user} stays a LEFT JOIN (detached masters).
      */
     @Query("""
             SELECT new com.beautica.booking.repository.BookingReviewAccess(

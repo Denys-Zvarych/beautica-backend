@@ -137,7 +137,7 @@ class InAppPushDispatcherTest {
         world(row(InAppNotificationType.BOOKING_CREATED, null), Role.SALON_OWNER);
         viewIs(InAppNotificationType.BOOKING_CREATED,
                 new NotificationTarget(TargetKind.BOOKING, bookingId, appointmentId, salonId),
-                new NotificationParams("Олена Коваленко", "Манікюр", 1, STARTS_AT, "Salon", null, null));
+                new NotificationParams("Олена Коваленко", "Манікюр", 1, STARTS_AT, "Salon", null, null, null));
 
         PushPlan plan = planFor();
 
@@ -160,7 +160,7 @@ class InAppPushDispatcherTest {
         world(row(InAppNotificationType.INVITE_ACCEPTED, null), Role.SALON_OWNER);
         viewIs(InAppNotificationType.INVITE_ACCEPTED,
                 new NotificationTarget(TargetKind.SALON_TEAM, null, null, salonId),
-                new NotificationParams(null, null, 0, null, null, "Ірина Мельник", Role.SALON_MASTER));
+                new NotificationParams(null, null, 0, null, null, null, "Ірина Мельник", Role.SALON_MASTER));
 
         PushPlan plan = planFor();
 
@@ -186,7 +186,7 @@ class InAppPushDispatcherTest {
         world(row(InAppNotificationType.BOOKING_DECLINED, null), Role.CLIENT);
         viewIs(InAppNotificationType.BOOKING_DECLINED,
                 new NotificationTarget(TargetKind.BOOKING, bookingId, null, salonId),
-                new NotificationParams("Салон Оазис", "Манікюр", 1, STARTS_AT, "Салон Оазис", null, null));
+                new NotificationParams("Салон Оазис", "Манікюр", 1, STARTS_AT, "Салон Оазис", null, null, null));
 
         assertThat(planFor().title()).isEqualTo("Ваш запис скасовано");
     }
@@ -197,7 +197,7 @@ class InAppPushDispatcherTest {
         world(row(InAppNotificationType.BOOKING_CREATED, null), Role.INDEPENDENT_MASTER);
         viewIs(InAppNotificationType.BOOKING_CREATED,
                 new NotificationTarget(TargetKind.BOOKING, bookingId, null, null),
-                new NotificationParams("SENTINEL-NAME", "SENTINEL-SERVICE", 1, STARTS_AT, null, null, null));
+                new NotificationParams("SENTINEL-NAME", "SENTINEL-SERVICE", 1, STARTS_AT, null, null, null, null));
 
         PushPlan plan = planFor();
 
@@ -302,7 +302,7 @@ class InAppPushDispatcherTest {
         stubUsers(user(recipientId, Role.SALON_OWNER), user(recipientB, Role.CLIENT));
         stubTokens(token(recipientId, "a"), token(recipientB, "b"));
         NotificationTarget target = new NotificationTarget(TargetKind.BOOKING, bookingId, null, salonId);
-        NotificationParams params = new NotificationParams("Олена", "Манікюр", 1, STARTS_AT, "S", null, null);
+        NotificationParams params = new NotificationParams("Олена", "Манікюр", 1, STARTS_AT, "S", null, null, null);
         Map<UUID, NotificationResponse> views = Map.of(
                 n1, new NotificationResponse(n1, InAppNotificationType.BOOKING_CREATED, Instant.now(), false, target, params),
                 n2, new NotificationResponse(n2, InAppNotificationType.BOOKING_CREATED, Instant.now(), false, target, params),
