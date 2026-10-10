@@ -6,8 +6,11 @@ import com.beautica.media.entity.MediaType;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
 
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -39,14 +42,28 @@ public interface MediaRepository extends JpaRepository<MediaFile, UUID> {
     Optional<MediaFile> findByUploaderIdAndMediaType(UUID uploaderId, MediaType mediaType);
 
     /**
-     * Find every media file uploaded by the given user. Drives the SEC-2
-     * {@code MediaService.deleteByUploader} sweep — R2 blobs must be deleted
-     * before the {@code users} row is dropped, otherwise
-     * {@code ON DELETE CASCADE} leaves the R2 objects orphaned.
-     *
-     * <p>Spring Data property traversal walks {@code uploader.id}; backed by the
-     * composite index {@code idx_media_files_uploader_media (uploader_id, media_type)}
-     * via leftmost-prefix.
+     * Every media file uploaded by any of {@code uploaderIds}, as scalars — the account-deletion pre-read (one
+     * query for the whole disposed set), captured BEFORE the {@code ON DELETE CASCADE} on
+     * {@code media_files.uploader_id} drops the rows. Projection only — no entity, no uploader JOIN FETCH
+     * (backend-perf P-L1).
      */
-    List<MediaFile> findByUploaderId(UUID uploaderId);
+    @Query("""
+            SELECT new com.beautica.media.repository.UploaderMediaKey(m.uploader.id, m.r2Key, m.entityType, m.entityId)
+            FROM MediaFile m
+            WHERE m.uploader.id IN :uploaderIds
+            """)
+    List<UploaderMediaKey> findMediaKeysByUploaderIdIn(@Param("uploaderIds") Collection<UUID> uploaderIds);
+
+    /**
+     * Scalar pointers of every media file attached to {@code (entityType, entityId)} — the salon-deletion
+     * pre-read, captured inside the deletion transaction (before a staff hard-delete can cascade a row away) and
+     * handed to the after-commit purge task. Projection only — no entity, no uploader proxy (P-L3).
+     */
+    @Query("""
+            SELECT new com.beautica.media.repository.MediaFileKey(m.id, m.r2Key, m.entityType, m.entityId)
+            FROM MediaFile m
+            WHERE m.entityType = :entityType AND m.entityId = :entityId
+            """)
+    List<MediaFileKey> findMediaKeysByEntityTypeAndEntityId(@Param("entityType") EntityType entityType,
+                                                            @Param("entityId") UUID entityId);
 }

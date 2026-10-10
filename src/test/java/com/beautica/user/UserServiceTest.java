@@ -291,9 +291,8 @@ class UserServiceTest {
         assertThat(response.hasMasterProfile())
                 .as("the owner-as-master toggle is ON — the flag must echo the active row's existence")
                 .isTrue();
-        // Pins the finder by name and by argument: the SALON-SCOPED sibling
-        // (existsByUserIdAndSalonIdAndMasterTypeAndIsActiveTrue) must never be used here, since
-        // GET /users/me has no path salon and users.salon_id would answer the wrong question.
+        // Pins the finder by name and by argument: a salon-scoped lookup must never be used here,
+        // since GET /users/me has no path salon and users.salon_id would answer the wrong question.
         verify(masterRepository, times(1))
                 .existsByUserIdAndMasterTypeAndIsActiveTrue(userId, MasterType.SALON_OWNER);
     }
@@ -1027,6 +1026,37 @@ class UserServiceTest {
                 .isInstanceOf(ForbiddenException.class);
 
         verify(userRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("updateMasterProfile succeeds for SALON_OWNER and writes title + bio (phase 361)")
+    void should_updateTitleAndBio_when_salonOwnerCallsUpdateMasterProfile() {
+        UUID userId = UUID.randomUUID();
+        User user = buildUser(userId, "owner@example.com", Role.SALON_OWNER, "Olena", "Koval", "+380630000000");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        MasterPublicProfileResponse response = userService.updateMasterProfile(userId,
+                new MasterProfileUpdateRequest(null, null, null, "bio text", null, "Майстер манікюру"));
+
+        assertThat(user.getBio()).isEqualTo("bio text");
+        assertThat(user.getProfessionalTitle()).isEqualTo("Майстер манікюру");
+        assertThat(response.professionalTitle()).isEqualTo("Майстер манікюру");
+    }
+
+    @Test
+    @DisplayName("updateMasterProfile throws ForbiddenException when user role is SALON_ADMIN")
+    void should_throwForbiddenException_when_salonAdminCallsUpdateMasterProfile() {
+        UUID userId = UUID.randomUUID();
+        User user = buildUser(userId, "admin@example.com", Role.SALON_ADMIN, "Test", "Admin", "+380671234567");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        assertThatThrownBy(() -> userService.updateMasterProfile(
+                userId, new MasterProfileUpdateRequest(null, null, null, "bio", null, "x")))
+                .isInstanceOf(ForbiddenException.class);
+
+        assertThat(user.getProfessionalTitle()).isNull();
     }
 
     @Test

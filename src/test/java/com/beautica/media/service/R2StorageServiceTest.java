@@ -178,12 +178,20 @@ class R2StorageServiceTest {
     }
 
     @Test
+    @DisplayName("isEnabled reflects whether an S3Client is wired")
+    void should_reflectFlag_when_isEnabledCalled() {
+        assertThat(new R2StorageService(Optional.empty(), BUCKET, PUBLIC_URL).isEnabled()).isFalse();
+        assertThat(new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL).isEnabled()).isTrue();
+    }
+
+    @Test
     @DisplayName("throws IllegalStateException when R2 is enabled and bucket name is blank")
     void should_throwIllegalState_when_r2EnabledAndBucketNameIsBlank() {
         assertThatThrownBy(() ->
                 new R2StorageService(Optional.of(s3Client), "", PUBLIC_URL))
             .isInstanceOf(IllegalStateException.class)
-            .hasMessageContaining("bucket-name");
+            .hasMessageContaining("app.cloudflare-r2.bucket is blank")
+            .hasMessageNotContaining("bucket-name");
     }
 
     @Test
@@ -552,6 +560,21 @@ class R2StorageServiceTest {
         Optional<String> key = service.extractKeyFromPublicUrl("https://evil.example.com/portfolio/salons/s1/photo.jpg");
 
         assertThat(key).isEmpty();
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {
+            "https://pub.example.r2.dev//abs/path.jpg",
+            "https://pub.example.r2.dev/avatars/../secrets/x.jpg",
+            "https://pub.example.r2.dev/avatars/u/x.jpg?token=1",
+            "https://pub.example.r2.dev/avatars/u/x.jpg#frag",
+            "https://pub.example.r2.dev/avatars/u\\x.jpg",
+            "https://pub.example.r2.dev.evil.com/avatars/u/x.jpg"})
+    @DisplayName("extractKeyFromPublicUrl rejects absolute paths, traversal, query/fragment, backslashes and look-alike hosts")
+    void should_returnEmpty_when_urlRemainderIsNotAPlainRelativeKey(String url) {
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+
+        assertThat(service.extractKeyFromPublicUrl(url)).isEmpty();
     }
 
     @Test

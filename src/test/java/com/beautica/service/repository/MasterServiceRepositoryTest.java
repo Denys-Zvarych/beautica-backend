@@ -19,6 +19,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.orm.jpa.TestEntityManager;
 
 import org.springframework.data.domain.PageRequest;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 
 import java.math.BigDecimal;
 import java.time.Instant;
@@ -796,5 +797,113 @@ class MasterServiceRepositoryTest extends AbstractDataJpaTest {
                 .hasSize(1);
         assertThat(rows.get(0)[0]).isEqualTo(salon.getId());
         assertThat(rows.get(0)[1]).isEqualTo("MANICURE");
+    }
+
+    // ── existsActiveOwnerRowAssignment — Phase 345 catalogue gate ─────────────────────────────
+    // True iff the definition has an ACTIVE assignment on a SALON_OWNER-typed master row.
+
+    /** Real BCrypt (cost 4), never a fake hash string (§M.5). Encoded once per class. */
+    private static final String OWNER_GATE_PASSWORD_HASH =
+            new BCryptPasswordEncoder(4).encode("test-password");
+
+    /** One salon with an owner-operated row, a regular staff row, and one SALON definition. */
+    private record OwnerGateFixture(Master ownerRow, Master staffRow, ServiceDefinition salonDef) {}
+
+    private OwnerGateFixture ownerGateFixture() {
+        User owner = new User("gate-owner-" + UUID.randomUUID() + "@example.com",
+                OWNER_GATE_PASSWORD_HASH, Role.SALON_OWNER, "Gate", "Owner", "+380501110000");
+        em.persist(owner);
+        Salon salon = Salon.builder()
+                .cityId(testCityId()).owner(owner).name("Gate Salon").isActive(true).build();
+        em.persist(salon);
+        Master ownerRow = Master.builder()
+                .user(owner).salon(salon).masterType(MasterType.SALON_OWNER)
+                .avgRating(BigDecimal.ZERO).reviewCount(0).isActive(true).build();
+        em.persist(ownerRow);
+        User staff = new User("gate-staff-" + UUID.randomUUID() + "@example.com",
+                OWNER_GATE_PASSWORD_HASH, Role.SALON_MASTER, "Gate", "Staff", "+380501110001");
+        em.persist(staff);
+        Master staffRow = Master.builder()
+                .user(staff).salon(salon).masterType(MasterType.SALON_MASTER)
+                .avgRating(BigDecimal.ZERO).reviewCount(0).isActive(true).build();
+        em.persist(staffRow);
+        ServiceDefinition salonDef = ServiceDefinition.builder()
+                .ownerType(OwnerType.SALON).ownerId(salon.getId())
+                .name("Gate Pedicure").category("PEDICURE").baseDurationMinutes(60)
+                .priceType(PriceType.FIXED).basePrice(new BigDecimal("500.00"))
+                .serviceType(persistServiceType("Педикюр гейт", "Gate Pedicure"))
+                .isActive(true).build();
+        em.persist(salonDef);
+        return new OwnerGateFixture(ownerRow, staffRow, salonDef);
+    }
+
+    private void assign(Master master, ServiceDefinition def, boolean active) {
+        em.persist(MasterServiceAssignment.builder()
+                .master(master).serviceDefinition(def).isActive(active).build());
+    }
+
+    @Test
+    @DisplayName("existsActiveOwnerRowAssignment — true when the owner's row holds an ACTIVE assignment")
+    void should_returnTrue_when_ownerRowHasActiveAssignment() {
+        OwnerGateFixture f = ownerGateFixture();
+        assign(f.ownerRow(), f.salonDef(), true);
+        em.flush();
+        em.clear();
+
+        boolean exists = masterServiceRepository.existsActiveOwnerRowAssignment(f.salonDef().getId());
+
+        assertThat(exists).isTrue();
+    }
+
+    @Test
+    @DisplayName("existsActiveOwnerRowAssignment — false when the owner's only assignment is INACTIVE")
+    void should_returnFalse_when_ownerRowAssignmentIsInactive() {
+        OwnerGateFixture f = ownerGateFixture();
+        assign(f.ownerRow(), f.salonDef(), false);
+        em.flush();
+        em.clear();
+
+        boolean exists = masterServiceRepository.existsActiveOwnerRowAssignment(f.salonDef().getId());
+
+        assertThat(exists).isFalse();
+    }
+
+    @Test
+    @DisplayName("existsActiveOwnerRowAssignment — false when only a non-owner (SALON_MASTER) row is assigned")
+    void should_returnFalse_when_onlyNonOwnerRowIsAssigned() {
+        OwnerGateFixture f = ownerGateFixture();
+        assign(f.staffRow(), f.salonDef(), true);
+        em.flush();
+        em.clear();
+
+        boolean exists = masterServiceRepository.existsActiveOwnerRowAssignment(f.salonDef().getId());
+
+        assertThat(exists).isFalse();
+    }
+
+    @Test
+    @DisplayName("existsActiveOwnerRowAssignment — true when the definition is shared by the owner and another master")
+    void should_returnTrue_when_definitionSharedByOwnerAndOtherMaster() {
+        OwnerGateFixture f = ownerGateFixture();
+        assign(f.staffRow(), f.salonDef(), true);
+        assign(f.ownerRow(), f.salonDef(), true);
+        em.flush();
+        em.clear();
+
+        boolean exists = masterServiceRepository.existsActiveOwnerRowAssignment(f.salonDef().getId());
+
+        assertThat(exists).isTrue();
+    }
+
+    @Test
+    @DisplayName("existsActiveOwnerRowAssignment — false when the definition has no assignment at all")
+    void should_returnFalse_when_definitionHasNoAssignment() {
+        OwnerGateFixture f = ownerGateFixture();
+        em.flush();
+        em.clear();
+
+        boolean exists = masterServiceRepository.existsActiveOwnerRowAssignment(f.salonDef().getId());
+
+        assertThat(exists).isFalse();
     }
 }

@@ -48,7 +48,7 @@ public class SlotCalculationService {
     private static final String BOOKABLE_DAYS_CACHE = "master-bookable-days";
 
     /**
-     * The three per-master availability caches a BOOKING write invalidates, all evicted together by
+     * The per-master availability caches a BOOKING write invalidates, all evicted together by
      * master prefix — see {@link #evictMasterAvailabilityCaches}.
      *
      * <p>Deliberately the same set, and the same technique, that a SCHEDULE write already sweeps via
@@ -60,6 +60,10 @@ public class SlotCalculationService {
             SLOTS_CACHE,
             BOOKABLE_CACHE,
             BOOKABLE_DAYS_CACHE,
+            // The per-master strict verdict (BookingMasterService#getBookableAssignmentIds, keyed
+            // [masterId]): a booking taking a master's last free slot flips it, and with it the
+            // GET /masters/{id} bookable flag and the public services tab (audit 2026-10-05, finding 2).
+            BookingMasterService.BOOKABLE_ASSIGNMENTS_CACHE,
     };
 
     /**
@@ -519,7 +523,7 @@ public class SlotCalculationService {
 
         // Guard: master must be BOOKABLE to expose any slots. All chained assignments share the same
         // master (they are loaded master-scoped), so the first one's master carries the liveness flag.
-        // deactivateOwnerMaster (and the general deactivateMaster) sets masters.is_active = false
+        // MasterService#deactivateMaster sets masters.is_active = false
         // but leaves master_services rows intact — check the master entity itself here.
         //
         // The salon term (MasterBookability, 2026-08 re-audit LOW) stops a closed salon's master from

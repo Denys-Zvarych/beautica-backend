@@ -71,7 +71,7 @@ class SearchSuggestionsGetRateLimitRegressionTest {
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(),
-                permissive(), permissive(), permissive(), permissive(), permissive(), permissive());
+                permissive(), permissive(), permissive(), permissive(), permissive(), permissive(), permissive());
     }
 
     private MockHttpServletRequest get(String path) {

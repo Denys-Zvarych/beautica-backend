@@ -6,6 +6,7 @@ import com.beautica.config.TestSecurityConfig;
 import com.beautica.salon.dto.SiblingSalonOption;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.assertj.core.groups.Tuple;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -21,7 +22,9 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -48,6 +51,8 @@ class SalonSiblingSalonsEndpointIT extends AbstractIntegrationTest {
     private static final Logger log = LoggerFactory.getLogger(SalonSiblingSalonsEndpointIT.class);
 
     private static final String SIBLINGS_URL = "/api/v1/salons/%s/sibling-salons";
+    /** Stand-in for {@code R2StorageService.publicUrlPrefix}; fixture URLs are built from it. */
+    private static final String MEDIA_PUBLIC_URL_PREFIX = "https://media.beautica.test";
 
     @Autowired
     private TestRestTemplate restTemplate;
@@ -183,7 +188,7 @@ class SalonSiblingSalonsEndpointIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("the picker row carries id + name + short address, and nothing more")
+    @DisplayName("the picker row carries id + name + short address + logo URL, and nothing more")
     void should_exposeOnlyPickerFields_when_listingSiblings() throws Exception {
         // Arrange — the response was narrowed from SalonResponse (Security LOW / Perf LOW-1): an
         // assigned SALON_ADMIN must not receive the owner's UUID, nor the phone/instagram/avatar/
@@ -209,13 +214,14 @@ class SalonSiblingSalonsEndpointIT extends AbstractIntegrationTest {
         var row = objectMapper.readTree(response.getBody()).get("data").get(0);
         assertThat(row.fieldNames())
                 .toIterable()
-                .as("the picker row is exactly id + name + short address — any other key means the "
-                        + "response widened back towards SalonResponse")
-                .containsExactlyInAnyOrder("id", "name", "street", "buildingNo");
+                .as("the picker row is exactly id + name + short address + logo URL — any other "
+                        + "key means the response widened back towards SalonResponse")
+                .containsExactlyInAnyOrder("id", "name", "street", "buildingNo", "avatarUrl");
         assertThat(dataOf(response))
                 .singleElement()
-                .as("the four fields the picker DOES need must all carry their persisted values")
-                .isEqualTo(new SiblingSalonOption(siblingId, "Shape Sibling Salon", "вул. Хрещатик", "12Б"));
+                .as("the fields the picker DOES need must all carry their persisted values")
+                .isEqualTo(new SiblingSalonOption(
+                        siblingId, "Shape Sibling Salon", "вул. Хрещатик", "12Б", null));
     }
 
     @Test
@@ -431,7 +437,98 @@ class SalonSiblingSalonsEndpointIT extends AbstractIntegrationTest {
                 .isEqualTo(HttpStatus.UNAUTHORIZED);
     }
 
+    @Test
+    @DisplayName("avatarUrl carries the sibling's persisted logo URL when one is set")
+    void should_returnAvatarUrl_when_siblingHasLogo() throws Exception {
+        // Arrange — phase 369: the picker renders each sibling's logo, so the persisted
+        // salons.avatar_url must reach the wire verbatim. A second, logo-less sibling in the same
+        // response proves the value is per-row, not a constant or the source salon's logo.
+        UUID ownerId = fixtures.insertUser("owner-logo-sib-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
+        UUID sourceSalonId = fixtures.insertSalon(ownerId, "Logo Source Salon");
+        UUID logoSiblingId = fixtures.insertSalon(ownerId, "Logo Sibling Salon");
+        UUID plainSiblingId = fixtures.insertSalon(ownerId, "Plain Sibling Salon");
+        String logoUrl = setLogo(logoSiblingId);
+        String ownerToken = fixtures.loginAndGetToken(fixtures.emailOf(ownerId));
+
+        // Act
+        ResponseEntity<String> response = get(sourceSalonId, ownerToken);
+
+        // Assert
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(dataOf(response))
+                .as("each sibling carries its OWN avatar_url — the logo one its URL, the other null")
+                .extracting(SiblingSalonOption::id, SiblingSalonOption::avatarUrl)
+                .containsExactlyInAnyOrder(
+                        Tuple.tuple(logoSiblingId, logoUrl),
+                        Tuple.tuple(plainSiblingId, null));
+    }
+
+    @Test
+    @DisplayName("avatarUrl is an explicit JSON null when the sibling has no logo")
+    void should_returnNullAvatarUrl_when_siblingHasNoLogo() throws Exception {
+        // Arrange
+        UUID ownerId = fixtures.insertUser("owner-nologo-sib-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
+        UUID sourceSalonId = fixtures.insertSalon(ownerId, "No-Logo Source Salon");
+        fixtures.insertSalon(ownerId, "No-Logo Sibling Salon");
+        String ownerToken = fixtures.loginAndGetToken(fixtures.emailOf(ownerId));
+
+        // Act
+        ResponseEntity<String> response = get(sourceSalonId, ownerToken);
+
+        // Assert — the key is present and null (the mobile model reads it as nullable), not absent.
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        var row = objectMapper.readTree(response.getBody()).get("data").get(0);
+        assertThat(row.has("avatarUrl")).as("avatarUrl key must be present").isTrue();
+        assertThat(row.get("avatarUrl").isNull()).as("avatarUrl must be JSON null").isTrue();
+    }
+
+    @Test
+    @DisplayName("no sibling row carries an R2 key field — only the public avatarUrl")
+    void should_notExposeAvatarR2Key_when_siblingHasLogo() throws Exception {
+        // Arrange — avatar_r2_key is the storage-internal column (it addresses the blob for
+        // replace/delete); only the read-model URL may leave the backend. Seeded on the sibling so a
+        // leaked column would have a value to show.
+        UUID ownerId = fixtures.insertUser("owner-r2key-sib-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
+        UUID sourceSalonId = fixtures.insertSalon(ownerId, "R2 Key Source Salon");
+        UUID siblingId = fixtures.insertSalon(ownerId, "R2 Key Sibling Salon");
+        setLogo(siblingId);
+        UUID adminUserId = fixtures.insertAdmin("admin-r2key-" + System.nanoTime() + "@beautica.test", sourceSalonId);
+        String adminToken = fixtures.loginAndGetToken(fixtures.emailOf(adminUserId));
+
+        // Act
+        ResponseEntity<String> response = get(sourceSalonId, adminToken);
+
+        // Assert — a field-name check, not a value check: in production the public URL is
+        // prefix + "/" + key (R2StorageService#buildPublicUrl), so the key's VALUE legitimately
+        // appears inside avatarUrl. What must never reach the wire is the separate key column.
+        // The SQL-level guarantee (column not projected) lives in SalonSiblingProjectionShapeIT.
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        var rows = objectMapper.readTree(response.getBody()).get("data");
+        assertThat(rows).as("premise — the logo sibling must be in the response").isNotEmpty();
+        for (var row : rows) {
+            List<String> fieldNames = new ArrayList<>();
+            row.fieldNames().forEachRemaining(fieldNames::add);
+            assertThat(fieldNames)
+                    .as("sibling row fields must not include any R2 key field")
+                    .doesNotContain("avatarR2Key")
+                    .noneMatch(name -> name.toLowerCase(Locale.ROOT).contains("r2key"));
+        }
+    }
+
     // ── helpers ────────────────────────────────────────────────────────────────
+
+    /**
+     * Persists a logo pointer pair satisfying the V189 CHECKs; returns the URL. Built exactly as
+     * production does ({@code R2StorageService#buildPublicUrl}: {@code prefix + "/" + key}), so the
+     * key is the URL's path — tests must not rely on the key value being absent from the body.
+     */
+    private String setLogo(UUID salonId) {
+        String r2Key = "salons/" + salonId + "/logo/" + System.nanoTime() + ".webp";
+        String url = MEDIA_PUBLIC_URL_PREFIX + "/" + r2Key;
+        jdbcTemplate.update(
+                "UPDATE salons SET avatar_url = ?, avatar_r2_key = ? WHERE id = ?", url, r2Key, salonId);
+        return url;
+    }
 
     private ResponseEntity<String> get(UUID salonId, String token) {
         return restTemplate.exchange(

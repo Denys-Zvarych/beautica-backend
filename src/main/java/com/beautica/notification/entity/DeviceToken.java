@@ -24,7 +24,13 @@ import lombok.Setter;
 import java.util.UUID;
 
 @Entity
-@Table(name = "device_tokens", indexes = @Index(name = "idx_device_tokens_user_active", columnList = "user_id, is_active"))
+@Table(name = "device_tokens", indexes = {
+        // Mirror only: V31 creates this as a PARTIAL index (user_id) WHERE is_active = true; JPA @Index
+        // cannot express a predicate, so the column list is user_id alone.
+        @Index(name = "idx_device_tokens_user_active", columnList = "user_id"),
+        @Index(name = "idx_device_tokens_user_id", columnList = "user_id"),
+        @Index(name = "ux_device_tokens_token", columnList = "token", unique = true)
+})
 @Getter
 @Setter
 @NoArgsConstructor

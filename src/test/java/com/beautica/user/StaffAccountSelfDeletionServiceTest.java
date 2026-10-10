@@ -2,6 +2,7 @@ package com.beautica.user;
 
 import com.beautica.auth.AuthService;
 import com.beautica.auth.Role;
+import com.beautica.booking.repository.SalonClosureBookingCandidate;
 import com.beautica.booking.service.BookingService;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
@@ -29,6 +30,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import java.time.Instant;
+import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -89,13 +91,19 @@ class StaffAccountSelfDeletionServiceTest {
     @Mock
     private AccountBlobPurgeRegistrar accountBlobPurgeRegistrar;
 
+    @Mock
+    private com.beautica.service.repository.ServiceRepository serviceRepository;
+
+    @Mock
+    private com.beautica.service.service.ServicePhotoBlobPurger servicePhotoBlobPurger;
+
     private StaffAccountSelfDeletionService service;
 
     private StaffAccountSelfDeletionService newService() {
         return new StaffAccountSelfDeletionService(
                 userRepository, masterRepository, salonRepository, mediaRepository, bookingService,
                 staffAccountDisposalService, staffClientReferenceAuditService, authService,
-                accountBlobPurgeRegistrar);
+                accountBlobPurgeRegistrar, serviceRepository, servicePhotoBlobPurger);
     }
 
     private static User buildUser(UUID id, Role role, UUID salonId) {
@@ -112,7 +120,7 @@ class StaffAccountSelfDeletionServiceTest {
         lenient().when(salonRepository.existsByOwnerId(userId)).thenReturn(false);
         lenient().when(staffClientReferenceAuditService.runAuditForStaffUserIds(List.of(userId)))
                 .thenReturn(StaffClientReferenceAuditResult.of(List.of(), Instant.EPOCH));
-        lenient().when(mediaRepository.findByUploaderId(userId)).thenReturn(List.of());
+        lenient().when(mediaRepository.findMediaKeysByUploaderIdIn(List.of(userId))).thenReturn(List.of());
     }
 
     // ── role guard ──────────────────────────────────────────────────────────────────────────
@@ -214,7 +222,7 @@ class StaffAccountSelfDeletionServiceTest {
         verify(staffAccountDisposalService)
                 .dispose(userId, salonId, List.of(userId), StaffDisposalReason.SELF_DELETE);
         verify(authService).denylistAccessToken("token-123");
-        verify(accountBlobPurgeRegistrar).registerAfterCommit(eq(userId), any(), eq(List.of()));
+        verify(accountBlobPurgeRegistrar).registerAfterCommit(any(User.class), eq(List.of()));
     }
 
     // ── SALON_MASTER / INDEPENDENT_MASTER happy paths — booking cascade ────────────────────────
@@ -228,27 +236,29 @@ class StaffAccountSelfDeletionServiceTest {
         UUID masterId = UUID.randomUUID();
         User user = buildUser(userId, Role.SALON_MASTER, salonId);
         Master master = buildMaster(masterId, userId);
-        List<UUID> futureBookingIds = List.of(UUID.randomUUID(), UUID.randomUUID());
+        List<SalonClosureBookingCandidate> futureBookingCandidates =
+                fixedSizeCandidateList(2, masterId);
         when(userRepository.findByIdForUpdate(userId)).thenReturn(Optional.of(user));
         stubCleanPreconditions(userId);
         when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
-        when(bookingService.findFutureConfirmedBookingIdsForMaster(masterId)).thenReturn(futureBookingIds);
+        when(bookingService.findFutureConfirmedBookingCandidatesForMaster(masterId))
+                .thenReturn(futureBookingCandidates);
         service = newService();
 
         service.deleteOwnAccount(userId, "token");
 
         verify(bookingService).acquireMasterLockForSelfDelete(masterId);
         verify(bookingService).disposeFutureConfirmedForMasterSelfDelete(
-                userId, masterId, salonId, futureBookingIds);
+                userId, masterId, salonId, futureBookingCandidates);
         verify(staffAccountDisposalService)
                 .dispose(userId, salonId, List.of(userId), StaffDisposalReason.SELF_DELETE);
     }
 
     @Test
     @DisplayName("residual-race fix (2026-09): acquireMasterLockForSelfDelete is called BEFORE "
-            + "findFutureConfirmedBookingIdsForMaster — not merely before the write — closing the "
-            + "gap where a booking committed between an unlocked read and a later lock would "
-            + "silently survive the cascade")
+            + "findFutureConfirmedBookingCandidatesForMaster — not merely before the write — "
+            + "closing the gap where a booking committed between an unlocked read and a later lock "
+            + "would silently survive the cascade")
     void should_acquireMasterLock_beforeReadingFutureBookingIds() {
         UUID userId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
@@ -258,14 +268,14 @@ class StaffAccountSelfDeletionServiceTest {
         when(userRepository.findByIdForUpdate(userId)).thenReturn(Optional.of(user));
         stubCleanPreconditions(userId);
         when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
-        when(bookingService.findFutureConfirmedBookingIdsForMaster(masterId)).thenReturn(List.of());
+        when(bookingService.findFutureConfirmedBookingCandidatesForMaster(masterId)).thenReturn(List.of());
         service = newService();
 
         service.deleteOwnAccount(userId, "token");
 
         InOrder order = inOrder(bookingService);
         order.verify(bookingService).acquireMasterLockForSelfDelete(masterId);
-        order.verify(bookingService).findFutureConfirmedBookingIdsForMaster(masterId);
+        order.verify(bookingService).findFutureConfirmedBookingCandidatesForMaster(masterId);
         order.verify(bookingService).disposeFutureConfirmedForMasterSelfDelete(
                 eq(userId), eq(masterId), eq(salonId), any());
     }
@@ -281,7 +291,7 @@ class StaffAccountSelfDeletionServiceTest {
         when(userRepository.findByIdForUpdate(userId)).thenReturn(Optional.of(user));
         stubCleanPreconditions(userId);
         when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
-        when(bookingService.findFutureConfirmedBookingIdsForMaster(masterId)).thenReturn(List.of());
+        when(bookingService.findFutureConfirmedBookingCandidatesForMaster(masterId)).thenReturn(List.of());
         service = newService();
 
         service.deleteOwnAccount(userId, "token");
@@ -289,6 +299,36 @@ class StaffAccountSelfDeletionServiceTest {
         verify(bookingService).disposeFutureConfirmedForMasterSelfDelete(
                 eq(userId), eq(masterId), eq(null), any());
         verify(staffAccountDisposalService)
+                .dispose(userId, null, List.of(userId), StaffDisposalReason.SELF_DELETE);
+    }
+
+    @Test
+    @DisplayName("INDEPENDENT_MASTER: the service catalogue is row-locked, photos cleared and deactivated BEFORE "
+            + "the booking cascade and the masters-row disposal (lock order service_definitions before masters)")
+    void should_lockServiceCatalogue_beforeBookingCascadeAndMastersDisposal_forIndependentMaster() {
+        UUID userId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        User user = buildUser(userId, Role.INDEPENDENT_MASTER, null);
+        Master master = buildMaster(masterId, userId);
+        when(userRepository.findByIdForUpdate(userId)).thenReturn(Optional.of(user));
+        stubCleanPreconditions(userId);
+        when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
+        when(bookingService.findFutureConfirmedBookingCandidatesForMaster(masterId)).thenReturn(List.of());
+        service = newService();
+
+        service.deleteOwnAccount(userId, "token");
+
+        InOrder order = inOrder(serviceRepository, bookingService, staffAccountDisposalService);
+        order.verify(serviceRepository).lockAllByOwnerOrderById(
+                com.beautica.service.entity.OwnerType.INDEPENDENT_MASTER, masterId);
+        order.verify(serviceRepository).clearPhotosByOwner(
+                com.beautica.service.entity.OwnerType.INDEPENDENT_MASTER, masterId);
+        order.verify(serviceRepository).deactivateAllByOwner(
+                com.beautica.service.entity.OwnerType.INDEPENDENT_MASTER, masterId);
+        order.verify(bookingService).acquireMasterLockForSelfDelete(masterId);
+        order.verify(bookingService).disposeFutureConfirmedForMasterSelfDelete(
+                eq(userId), eq(masterId), eq(null), any());
+        order.verify(staffAccountDisposalService)
                 .dispose(userId, null, List.of(userId), StaffDisposalReason.SELF_DELETE);
     }
 
@@ -303,7 +343,7 @@ class StaffAccountSelfDeletionServiceTest {
         when(userRepository.findByIdForUpdate(userId)).thenReturn(Optional.of(user));
         stubCleanPreconditions(userId);
         when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
-        when(bookingService.findFutureConfirmedBookingIdsForMaster(masterId)).thenReturn(List.of());
+        when(bookingService.findFutureConfirmedBookingCandidatesForMaster(masterId)).thenReturn(List.of());
         service = newService();
 
         service.deleteOwnAccount(userId, "token");
@@ -341,11 +381,11 @@ class StaffAccountSelfDeletionServiceTest {
         UUID masterId = UUID.randomUUID();
         User user = buildUser(userId, Role.SALON_MASTER, salonId);
         Master master = buildMaster(masterId, userId);
-        List<UUID> exactlyAtCap = fixedSizeIdList(500);
+        List<SalonClosureBookingCandidate> exactlyAtCap = fixedSizeCandidateList(500, masterId);
         when(userRepository.findByIdForUpdate(userId)).thenReturn(Optional.of(user));
         stubCleanPreconditions(userId);
         when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
-        when(bookingService.findFutureConfirmedBookingIdsForMaster(masterId)).thenReturn(exactlyAtCap);
+        when(bookingService.findFutureConfirmedBookingCandidatesForMaster(masterId)).thenReturn(exactlyAtCap);
         service = newService();
 
         service.deleteOwnAccount(userId, "token");
@@ -364,11 +404,11 @@ class StaffAccountSelfDeletionServiceTest {
         UUID masterId = UUID.randomUUID();
         User user = buildUser(userId, Role.SALON_MASTER, UUID.randomUUID());
         Master master = buildMaster(masterId, userId);
-        List<UUID> overCap = fixedSizeIdList(501);
+        List<SalonClosureBookingCandidate> overCap = fixedSizeCandidateList(501, masterId);
         when(userRepository.findByIdForUpdate(userId)).thenReturn(Optional.of(user));
         stubCleanPreconditions(userId);
         when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
-        when(bookingService.findFutureConfirmedBookingIdsForMaster(masterId)).thenReturn(overCap);
+        when(bookingService.findFutureConfirmedBookingCandidatesForMaster(masterId)).thenReturn(overCap);
         service = newService();
 
         assertThatThrownBy(() -> service.deleteOwnAccount(userId, "token"))
@@ -392,11 +432,11 @@ class StaffAccountSelfDeletionServiceTest {
         UUID masterId = UUID.randomUUID();
         User user = buildUser(userId, Role.INDEPENDENT_MASTER, null);
         Master master = buildMaster(masterId, userId);
-        List<UUID> overCap = fixedSizeIdList(501);
+        List<SalonClosureBookingCandidate> overCap = fixedSizeCandidateList(501, masterId);
         when(userRepository.findByIdForUpdate(userId)).thenReturn(Optional.of(user));
         stubCleanPreconditions(userId);
         when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
-        when(bookingService.findFutureConfirmedBookingIdsForMaster(masterId)).thenReturn(overCap);
+        when(bookingService.findFutureConfirmedBookingCandidatesForMaster(masterId)).thenReturn(overCap);
         service = newService();
 
         assertThatThrownBy(() -> service.deleteOwnAccount(userId, "token"))
@@ -423,7 +463,7 @@ class StaffAccountSelfDeletionServiceTest {
 
         service.deleteOwnAccount(userId, "token");
 
-        verify(accountBlobPurgeRegistrar).registerAfterCommit(userId, "avatars/staff-key", List.of());
+        verify(accountBlobPurgeRegistrar).registerAfterCommit(user, List.of());
     }
 
     @Test
@@ -441,9 +481,14 @@ class StaffAccountSelfDeletionServiceTest {
         verify(authService).denylistAccessToken(null);
     }
 
-    private static List<UUID> fixedSizeIdList(int size) {
-        List<UUID> ids = new ArrayList<>(size);
-        Stream.generate(UUID::randomUUID).limit(size).forEach(ids::add);
-        return ids;
+    /** Standalone candidates (no appointment) — one distinct booking id each, all future/CONFIRMED. */
+    private static List<SalonClosureBookingCandidate> fixedSizeCandidateList(int size, UUID masterId) {
+        OffsetDateTime startsAt = OffsetDateTime.now().plusDays(1);
+        List<SalonClosureBookingCandidate> candidates = new ArrayList<>(size);
+        Stream.generate(UUID::randomUUID)
+                .limit(size)
+                .forEach(id -> candidates.add(
+                        new SalonClosureBookingCandidate(id, null, masterId, startsAt)));
+        return candidates;
     }
 }

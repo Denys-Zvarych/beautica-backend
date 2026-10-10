@@ -1,5 +1,6 @@
 package com.beautica.notification.repository;
 
+import org.springframework.test.context.TestPropertySource;
 import com.beautica.AbstractDataJpaTest;
 import com.beautica.notification.entity.NotificationOutboxEntry;
 import com.beautica.notification.entity.OutboxEventType;
@@ -64,6 +65,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * {@code SELECT ... FOR UPDATE SKIP LOCKED} reproduces the double-claim here).
  */
 @DisplayName("NotificationOutbox — concurrent claim + stale-claim reclaim")
+@TestPropertySource(properties = "spring.datasource.hikari.maximum-pool-size=20") // 8 concurrent claimers need >5 connections
 class NotificationOutboxConcurrentClaimTest extends AbstractDataJpaTest {
 
     @Autowired

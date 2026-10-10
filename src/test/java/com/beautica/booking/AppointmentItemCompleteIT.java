@@ -417,7 +417,10 @@ class AppointmentItemCompleteIT extends AbstractIntegrationTest {
      * authz projection, {@code findByAppointmentIdWithGraph}, {@code lockHeaderIfConfirmed},
      * {@code existsConfirmedById} freshness re-check, the target's own {@code save} flush, the
      * conditional header-collapse {@code UPDATE}, the {@code STATUS_CHANGED} outbox {@code INSERT},
-     * and the {@code REVIEW_REQUESTED} outbox {@code INSERT}.
+     * the {@code REVIEW_REQUESTED} outbox {@code INSERT}, and the {@code REVIEW_REQUESTED} in-app
+     * feed {@code INSERT} ({@code InAppNotificationRepository#insertForRecipients} — audit-fix cycle
+     * 1, findings 1-3: ONE statement, client-only recipient, no reload and no admin lookup for this
+     * INDEPENDENT_MASTER scenario).
      *
      * <p>Follows the same precedent as {@code BookingPriceRangeContractIT}'s
      * {@code OWNER_DETAIL_STATEMENTS_ROTATED} gate and {@code MultiServiceNotificationIT}'s sibling-
@@ -427,7 +430,18 @@ class AppointmentItemCompleteIT extends AbstractIntegrationTest {
      * {@code findByAppointmentIdWithGraph} or an extra lock/lookup added ahead of the freshness
      * re-check.
      */
-    private static final long COMPLETE_ITEM_STATEMENTS = 8L;
+    // Audit-fix cycle 1 (findings 1-3), 8 -> 9. The conditional REVIEW_REQUESTED in-app notification
+    // (InAppNotificationService#notifyVisitEvent) used to reload the appointment's item graph
+    // (BookingRepository#findByAppointmentIdWithGraph) AND the appointment's client id
+    // (AppointmentRepository#findClientIdById) — both redundant, since completeAppointmentItem's own
+    // `items` list (already loaded via loadItemsOrThrow for the freshness re-check) already carries
+    // everything the recipient resolution needs — then wrote ITS one recipient (clientOnly, no admin
+    // lookup, single-service INDEPENDENT_MASTER visit) via a per-recipient insertIgnoringDuplicate
+    // call. That was 11 (8 + 2 reloads + 1 insert); removing both reloads and passing `items.get(0)`
+    // directly drops it back to 9 (8 + 1) — the ONE insertForRecipients statement is unavoidable (a
+    // real row must be written), so this is the "+1, re-baselined deliberately" case, not a full
+    // return to 8.
+    private static final long COMPLETE_ITEM_STATEMENTS = 9L;
 
     @Test
     @DisplayName("STATEMENT-COUNT GATE: completing the only item of a single-service visit costs a "

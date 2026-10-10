@@ -21,6 +21,8 @@ import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.security.AuthorizationService;
 import com.beautica.master.entity.Master;
+import com.beautica.notification.inapp.entity.InAppNotificationType;
+import com.beautica.notification.inapp.service.InAppNotificationService;
 import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.salon.entity.Salon;
 import com.beautica.service.service.SalonCatalogCacheEvictor;
@@ -88,6 +90,9 @@ public class AppointmentTransitionService {
     private final AppointmentService appointmentService;
     private final ApplicationEventPublisher eventPublisher;
     private final Clock clock;
+    // Phase 333 — see InAppNotificationService's class javadoc for why this is a separate seam from
+    // outboxService, never called from it.
+    private final InAppNotificationService inAppNotificationService;
 
     /**
      * Client-initiated visit cancel — the visit HEADER and every item move to {@code CANCELLED}
@@ -130,6 +135,12 @@ public class AppointmentTransitionService {
         // No revenue eviction on a client cancel — a CANCELLED visit never enters revenue (mirrors
         // BookingService#cancelBooking).
         persistAndNotify(appointment, items, null);
+        // Phase 333, matrix row 2 — provider set (owner + admins + performing master); the CLIENT is
+        // the actor and is excluded. Once per appointment (visit granularity). `items.get(0)` is
+        // already the graph-fetched item loadItemsOrThrow loaded above — never reloaded (audit-fix
+        // cycle 1, finding 1).
+        inAppNotificationService.notifyVisitEvent(
+                InAppNotificationType.BOOKING_CANCELLED_BY_CLIENT, appointmentId, items.get(0), clientId);
     }
 
     /**
@@ -162,6 +173,12 @@ public class AppointmentTransitionService {
 
         // No revenue eviction on a decline (mirrors BookingService#declineBooking).
         persistAndNotify(ctx.appointment(), ctx.items(), null);
+        // Phase 333, matrix row 3 — client (if registered) + performing master unless actor. Once
+        // per appointment (visit granularity) — incl. walk-ins (restricted to the master cell inside
+        // InAppNotificationService, since a walk-in's clientId is always null). `ctx.firstItem()`
+        // is already loaded — never reloaded (audit-fix cycle 1, finding 1).
+        inAppNotificationService.notifyVisitEvent(
+                InAppNotificationType.BOOKING_DECLINED, appointmentId, ctx.firstItem(), actorId);
     }
 
     /**
@@ -288,6 +305,10 @@ public class AppointmentTransitionService {
 
         // Reference the DECLINED CHILD (not item 0) so the client notification names the right service.
         outboxService.enqueueStatusChanged(target.getId());
+        // Phase 333, matrix row 3 — per-item, booking-keyed (visit granularity does not apply to a
+        // per-service decline): client (if registered) + performing master unless actor. `target` is
+        // already loaded (via loadItemsOrThrow above) — never reloaded (audit-fix cycle 1, finding 1).
+        inAppNotificationService.notifyBookingEvent(InAppNotificationType.BOOKING_DECLINED, target, actorId);
 
         // Single-item availability eviction — reuse the whole-visit after-commit hook over a one-item
         // list; a declined child frees only its own slot. No revenue impact on a decline (null actor).
@@ -419,6 +440,36 @@ public class AppointmentTransitionService {
     }
 
     /**
+     * No-authorization overload of {@link #declineAppointmentItems(UUID, UUID, List,
+     * AppointmentProviderNoteRequest, boolean)} (Phase 337) — used ONLY by {@code
+     * BookingService#disposeFutureConfirmedForMasterSelfDelete}'s appointment-visit leg, via {@code
+     * BookingService#declineFutureConfirmed}'s {@code skipProviderAuthorization} branch.
+     *
+     * <p><b>Why this overload has to exist.</b> A self-deleting {@code SALON_MASTER} is a
+     * READ-ONLY role and structurally fails EVERY provider-authority predicate in {@link
+     * AuthorizationService} — including {@link AuthorizationService#enforceCanManageAppointment},
+     * the check the other two overloads run — even over a visit that is entirely their OWN (see
+     * {@code StaffAccountSelfDeletionService}'s class Javadoc, "the structural surprise driving the
+     * booking-disposal design"). Its one caller has ALREADY established provider authority a
+     * different way before reaching here: ownership of the departing account's OWN {@code masters}
+     * row ({@code masterRepository.existsByIdAndUserId}), asserted once per self-delete in {@code
+     * BookingService#disposeFutureConfirmedForMasterSelfDelete}. Skips straight to {@link
+     * #declineAppointmentItemsAfterAuth} — the exact same load, header lock, batched freshness
+     * recheck, write, header collapse and (opt-in) eviction every other overload runs; only the
+     * authorization step is different, because it already happened, elsewhere, by a different
+     * predicate.
+     *
+     * <p>Do NOT widen this overload's visibility, and do not add a second caller. A future caller
+     * of this shape must ALSO have already proven provider authority by an equivalent ownership
+     * check of its own — this is never a generic "skip auth" escape hatch.
+     */
+    List<Booking> declineAppointmentItems(
+            UUID appointmentId, List<UUID> bookingIds, AppointmentProviderNoteRequest req,
+            boolean evictAfterCommit) {
+        return declineAppointmentItemsAfterAuth(appointmentId, bookingIds, req, evictAfterCommit);
+    }
+
+    /**
      * Shared post-authorization core of both {@link #declineAppointmentItems(UUID, UUID, List,
      * AppointmentProviderNoteRequest, boolean)} overloads (perf finding 2, 2026-09 re-audit split)
      * — everything the original single method did AFTER its authorization check, unchanged.
@@ -487,6 +538,96 @@ public class AppointmentTransitionService {
     }
 
     /**
+     * Batched multi-VISIT decline (Phase 337 perf re-audit, Finding 1) — the O(1)-statement analogue
+     * of {@link #declineAppointmentItemsAfterAuth} for every appointment-visit {@code
+     * BookingService#declineFutureConfirmed} needs to decline in ONE cascade call, instead of ~4
+     * round trips (load items, header {@code FOR UPDATE} lock, freshness re-check, header collapse)
+     * PER DISTINCT appointment. Shared by all three {@code declineFutureConfirmed} callers — salon
+     * closure, master removal, and master self-delete (Phase 337) — REUSE-FIRST: one batched leg,
+     * never a per-cascade near-duplicate.
+     *
+     * <p><b>No authorization of its own.</b> Exactly like the single-visit no-authorization overload
+     * ({@link #declineAppointmentItems(UUID, List, AppointmentProviderNoteRequest, boolean)}), this
+     * method trusts the caller completely: {@code BookingService#declineFutureConfirmed} either
+     * already authorized every appointment id in {@code bookingIdsByAppointmentId} (owner-initiated
+     * cascades, via ONE batched call to {@link AuthorizationService#enforceCanManageAppointments(UUID,
+     * java.util.Collection, Map)} BEFORE calling here — superseded from an earlier per-visit loop over
+     * the single-id {@link AuthorizationService#enforceCanManageAppointment(UUID, UUID, Map)} overload,
+     * see that batched method's own Javadoc) or has already established authority a different way
+     * ({@code skipProviderAuthorization} — the master self-delete cascade). Do not add a caller that
+     * skips that step.
+     *
+     * <p>Mechanism, mirroring {@link BookingRepository#declineConfirmedBulk}'s standalone-leg
+     * pattern, widened to also cover the header:
+     * <ol>
+     *   <li>ONE bulk header lock ({@link AppointmentRepository#lockHeadersIfConfirmedBulk}) — every
+     *       header in {@code bookingIdsByAppointmentId.keySet()}, locked in ascending id order so two
+     *       cascades racing over an overlapping header set can never deadlock against each other —
+     *       the same canonical appointments-before-bookings lock order every per-item path already
+     *       takes, just batched;</li>
+     *   <li>ONE bulk conditional write — reuses {@link BookingRepository#declineConfirmedBulk} AS-IS
+     *       (D5: the note is always {@code null} for this cascade, identical to the standalone leg)
+     *       over the FLATTENED set of every targeted child id across every visit; the {@code WHERE
+     *       status = 'CONFIRMED'} clause IS the freshness re-check, evaluated per row inside the one
+     *       statement — there is no separate {@code SELECT} the way the per-visit path's {@link
+     *       BookingRepository#findConfirmedIdsByAppointmentId} needed, because this statement folds
+     *       "check" and "act" together exactly as {@code declineConfirmedBulk}'s own Javadoc explains
+     *       for the standalone leg;</li>
+     *   <li>ONE bulk header collapse ({@link
+     *       AppointmentRepository#collapseHeadersIfNoConfirmedSiblingsRemainBulk}) over every header
+     *       this call actually locked in step 1.</li>
+     * </ol>
+     * Total: 3 statements for the WHOLE cascade, regardless of how many distinct appointment-visits
+     * it touches — down from {@code ~4 × V} for {@code V} distinct visits under the per-visit path.
+     *
+     * <p><b>Semantics preserved bit-for-bit against the per-visit path this replaces:</b> which legs
+     * get declined (a child is declined iff it was CONFIRMED at the write statement's own arrival at
+     * that row — the exact predicate the per-visit path's post-lock freshness recheck applied); header
+     * status transitions (a header collapses iff it was CONFIRMED and, after the write, has no
+     * CONFIRMED child left); no header note is ever written, no child note either (D5); eviction and
+     * the D12 outbox pick are untouched — this method returns only declined booking ids, never
+     * entities, and the caller performs its own representative pick and after-commit eviction exactly
+     * as before, unaffected by this change.
+     *
+     * @param bookingIdsByAppointmentId every appointment-visit to decline, appointmentId → its
+     *                                   targeted CONFIRMED child ids — every id already known
+     *                                   CONFIRMED at the caller's own candidate scan, moments earlier
+     *                                   in this SAME transaction; may be empty, in which case this
+     *                                   method issues NO query at all
+     * @param reason                     {@link CancellationReason#name()} stamped on every declined
+     *                                   child and every collapsed header — always {@code
+     *                                   PROVIDER_UNAVAILABLE} for this cascade's three callers
+     * @param now                        the SAME {@code now} the caller resolved once at the top of
+     *                                   its own scan (D3) — stamped onto every affected child's
+     *                                   {@code updated_at}, never re-read here
+     * @return every booking id, across every visit, that THIS CALL actually transitioned to {@code
+     *         DECLINED} — a subset of the union of {@code bookingIdsByAppointmentId}'s values, never
+     *         a superset
+     */
+    Set<UUID> declineAppointmentItemsBulk(
+            Map<UUID, List<UUID>> bookingIdsByAppointmentId, CancellationReason reason, OffsetDateTime now) {
+        if (bookingIdsByAppointmentId.isEmpty()) {
+            return Set.of();
+        }
+
+        List<UUID> lockedAppointmentIds =
+                appointmentRepository.lockHeadersIfConfirmedBulk(bookingIdsByAppointmentId.keySet());
+
+        List<UUID> allBookingIds = bookingIdsByAppointmentId.values().stream()
+                .flatMap(List::stream)
+                .toList();
+        List<UUID> declinedIds = bookingRepository.declineConfirmedBulk(
+                allBookingIds, reason.name(), null, now.toInstant());
+
+        if (!lockedAppointmentIds.isEmpty()) {
+            appointmentRepository.collapseHeadersIfNoConfirmedSiblingsRemainBulk(
+                    lockedAppointmentIds, BookingStatus.DECLINED.name(), reason.name(), null);
+        }
+
+        return Set.copyOf(declinedIds);
+    }
+
+    /**
      * Provider-initiated visit completion — the header and every item move to {@code COMPLETED}.
      * Mirrors {@code BookingService#completeBooking} (authority via
      * {@link AuthorizationService#enforceCanCompleteBooking}); no note, no cancellation reason. Also
@@ -528,6 +669,10 @@ public class AppointmentTransitionService {
         // by construction. Guest visits have no client to review with — skip (mirrors the single path).
         if (ctx.appointment().getClient() != null) {
             outboxService.enqueueReviewRequested(ctx.firstItem().getId());
+            // Phase 333, matrix row 7 — client only. Once per appointment (visit granularity).
+            // `ctx.firstItem()` is already loaded — never reloaded (audit-fix cycle 1, finding 1).
+            inAppNotificationService.notifyVisitEvent(
+                    InAppNotificationType.REVIEW_REQUESTED, appointmentId, ctx.firstItem(), actorId);
         }
 
         // Announce the completion as a domain fact so other feature packages can react without
@@ -684,6 +829,12 @@ public class AppointmentTransitionService {
         // target and never one per service. See this method's own "Review prompt" Javadoc paragraph.
         if (visitClosed && items.get(0).getClient() != null) {
             outboxService.enqueueReviewRequested(items.get(0).getId());
+            // Phase 333, matrix row 7 — client only, once per VISIT (fires only when this call
+            // closed the whole visit, mirroring the review-prompt condition immediately above).
+            // `items.get(0)` is already loaded (via loadItemsOrThrow above) — never reloaded
+            // (audit-fix cycle 1, finding 1).
+            inAppNotificationService.notifyVisitEvent(
+                    InAppNotificationType.REVIEW_REQUESTED, appointmentId, items.get(0), actorId);
         }
 
         // Single-item availability eviction, PLUS the actor's revenue dashboard (a COMPLETED item
@@ -724,6 +875,10 @@ public class AppointmentTransitionService {
         // Evict the actor's revenue dashboard, keyed on the actor id exactly as
         // BookingService#notCompleteBooking does.
         persistAndNotify(ctx.appointment(), ctx.items(), actorId);
+        // Phase 333, matrix row 6 — client only (if registered). Once per appointment. `ctx.firstItem()`
+        // is already loaded — never reloaded (audit-fix cycle 1, finding 1).
+        inAppNotificationService.notifyVisitEvent(
+                InAppNotificationType.BOOKING_NOT_COMPLETED, appointmentId, ctx.firstItem(), actorId);
     }
 
     /**
@@ -761,32 +916,18 @@ public class AppointmentTransitionService {
      * {@code no_overlapping_bookings} GIST EXCLUDE remains the authoritative backstop on each
      * update (mapped to the same 409 below).
      *
-     * <p><b>Header lock (cycle-5 audit finding 1, 2026-08-03 — fixed here).</b> Before this fix this
-     * method took NO appointment-header lock at all — unlike every per-child mutator in this class
-     * (per-item decline, per-item cancel, per-item reschedule), which all lock the header first, per
-     * the canonical appointments-before-bookings order (cycle-2 audit finding 1) — so a whole-visit
-     * reschedule racing any per-child write was never serialized against it. Now locks the header,
-     * in the canonical header→client→master order, via {@link #lockAppointmentHeaderBeforeItemReschedule}
-     * — the SAME conditional lock ({@code AppointmentRepository#lockHeaderIfConfirmed})
-     * {@link #rescheduleAppointmentItem} already takes, matching this method's own precondition
-     * ("CONFIRMED, or fail") rather than the unconditional {@link #lockHeaderForWholeVisitTransition}
-     * the cancel/decline/complete/not-complete quartet use. Immediately follows with a scalar
-     * freshness re-check ({@link BookingRepository#findConfirmedIdsByAppointmentId}) against the
-     * items this call is about to move: the lock alone only proves the HEADER is still CONFIRMED,
-     * not that every ITEM this call already loaded (necessarily before any lock could protect that
-     * read) is still individually CONFIRMED — a concurrent per-service decline can leave the header
-     * CONFIRMED (a sibling remains) while flipping ONE of this block's own targets. {@code Booking}
-     * now carries {@code @DynamicUpdate} (G1, cycle-7 audit 2026-08-03), so this re-plan's own save
-     * would only write {@code starts_at}/{@code ends_at} (+ {@code updated_at}) for that item and
-     * could no longer clobber the decline's {@code status} column even without this check — but
-     * proceeding anyway would silently move a now-DECLINED leg back onto the calendar at a new
-     * time, resurrecting it in effect (its status stays whatever the decline set, but it is no
-     * longer a valid, bookable member of this re-planned block). A mismatch aborts with the same
-     * 409 shape as every other conflict below — a clean, retryable loss of the race. Both the lock
-     * and the re-check run AFTER
-     * {@link #assertVisitStartsOnAvailableSlot} and the in-memory re-plan, preserving the existing
-     * tight-lock-window discipline (only the client/master advisory locks and the DB writes below were
-     * ever inside the lock window; this adds one more cheap, indexed lookup, not a new DB-heavy step).
+     * <p><b>Header lock (cycle-5 audit finding 1, 2026-08-03 — fixed here).</b> Locks the header in
+     * the canonical client→master→header order (AFTER both advisory locks, matching every cascade),
+     * via {@link #lockAppointmentHeaderBeforeItemReschedule} — the SAME conditional lock
+     * ({@code AppointmentRepository#lockHeaderIfConfirmed}) {@link #rescheduleAppointmentItem}
+     * already takes, matching this method's own precondition ("CONFIRMED, or fail") rather than the
+     * unconditional {@link #lockHeaderForWholeVisitTransition} the cancel/decline/complete/not-complete
+     * quartet use. The per-item freshness re-check is FUSED into the post-lock guard statement
+     * ({@link PostLockRescheduleGuard#assertVisitItemsStillConfirmedAndFree}): the items were loaded
+     * necessarily BEFORE any lock, and a concurrent per-service decline can leave the header
+     * CONFIRMED (a sibling remains) while flipping ONE of this block's own targets, so that
+     * statement re-counts, fresh from the DB, that every target is still CONFIRMED (the same 409
+     * "Visit changed concurrently" on mismatch) — no separate probe statement is needed.
      *
      * <p><b>Notification</b> is actor-branched exactly like the single-booking path: reuses
      * {@code NotificationOutboxService#enqueueBookingRescheduled} verbatim, referencing the FIRST
@@ -839,35 +980,6 @@ public class AppointmentTransitionService {
         List<VisitPlanner.PlannedWindow> windows = visitPlanner.replanFromNewStart(confirmedItems, newFirstStart);
         OffsetDateTime newLastEnd = windows.get(windows.size() - 1).endsAt();
 
-        // Cycle-5 audit finding 1 (2026-08-03) — canonical appointments-before-bookings lock order
-        // (cycle-2 audit finding 1), applied here for the FIRST time on this method: everything
-        // above (the unlocked resolve/authz/status/elapsed checks, the availability query, and the
-        // in-memory re-plan) stays exactly where it was — only the lock itself is new, positioned
-        // here, immediately before the client/master advisory locks, so header→client→master is the
-        // full acquisition order. Reuses lockAppointmentHeaderBeforeItemReschedule — the SAME
-        // conditional lock rescheduleAppointmentItem already takes for this exact seam — rather than
-        // inventing a new one; a false result means a concurrent per-child writer moved the header
-        // out of CONFIRMED since the unlocked check above, reported as the same 409 shape that
-        // caller uses for its own analogous false case.
-        if (!lockAppointmentHeaderBeforeItemReschedule(appointmentId)) {
-            throw new BusinessException(HttpStatus.CONFLICT, "Visit is no longer CONFIRMED");
-        }
-
-        // Freshness re-check, immediately after the lock — see this method's own "Header lock"
-        // Javadoc paragraph for why this is required, not optional, once ANY item is loaded before
-        // the lock exists to protect that read: the lock above proves the HEADER is still
-        // CONFIRMED, not that every item THIS call is about to move is. A scalar,
-        // entity-manager-bypassing projection (never re-touches the already-managed, possibly-stale
-        // Booking instances) is the only way to answer that without poisoning — or being poisoned
-        // by — the identity map.
-        Set<UUID> stillConfirmedIds = bookingRepository.findConfirmedIdsByAppointmentId(appointmentId);
-        boolean anyTargetLeftConfirmed = confirmedItems.stream()
-                .map(Booking::getId)
-                .anyMatch(id -> !stillConfirmedIds.contains(id));
-        if (anyTargetLeftConfirmed) {
-            throw new BusinessException(HttpStatus.CONFLICT, "Visit changed concurrently — please retry");
-        }
-
         // Same critical section as doCreateAppointment / rescheduleBooking, client-then-master
         // order — deadlock freedom (see BookingRepository.acquireClientAdvisoryLockWithTimeout).
         User owningClient = appointment.getClient();
@@ -885,11 +997,25 @@ public class AppointmentTransitionService {
             throw new BusinessException(HttpStatus.INTERNAL_SERVER_ERROR, "Advisory lock acquisition failed");
         }
 
+        // Global lock order: client(1) advisory → master(0) advisory → appointment header → booking
+        // rows. The header lock sits AFTER both advisory locks: every cascade (master self-delete/
+        // removal, schedule override, client self-delete) takes client→master advisory first, then
+        // header rows, so taking the header first here deadlocked against them. Reuses
+        // lockAppointmentHeaderBeforeItemReschedule (the SAME conditional lock
+        // rescheduleAppointmentItem takes); false means a concurrent writer moved the header out of
+        // CONFIRMED since the unlocked check above.
+        if (!lockAppointmentHeaderBeforeItemReschedule(appointmentId)) {
+            throw new BusinessException(HttpStatus.CONFLICT, "Visit is no longer CONFIRMED");
+        }
+
         // ONE span overlap check over the WHOLE new block, excluding the visit's own rows — the
         // same "check once, insert/update N" shape doCreateAppointment uses for creation.
-        if (bookingRepository.existsOverlapExcludingAppointment(masterId, newFirstStart, newLastEnd, appointmentId)) {
-            throw new BusinessException(HttpStatus.CONFLICT, "Slot not available");
-        }
+        // The same statement also re-reads, fresh from the DB, that EVERY item being moved is still
+        // CONFIRMED (a cascade holding the master lock may have declined one) — PostLockRescheduleGuard.
+        PostLockRescheduleGuard.assertVisitItemsStillConfirmedAndFree(
+                bookingRepository, masterId, newFirstStart, newLastEnd, appointmentId,
+                confirmedItems.stream().map(Booking::getId).toList(),
+                "Visit changed concurrently — please retry");
 
         for (int i = 0; i < confirmedItems.size(); i++) {
             VisitPlanner.PlannedWindow window = windows.get(i);
@@ -907,6 +1033,10 @@ public class AppointmentTransitionService {
         // Phase 27.3 outbox family, reused verbatim: referencing the FIRST (confirmed) item only
         // (never one per service) — the drain worker addresses the OTHER party from that one booking.
         outboxService.enqueueBookingRescheduled(saved.get(0).getId(), initiatedByProvider);
+        // Phase 333, matrix row 4 — once per appointment (visit granularity). `saved.get(0)` is the
+        // same managed item instance already loaded — never reloaded (audit-fix cycle 1, finding 1).
+        inAppNotificationService.notifyRescheduledVisit(
+                appointmentId, saved.get(0), initiatedByProvider, newFirstStart.toInstant(), actorUserId);
 
         registerRescheduleEviction(masterId, salonIdOfMaster(master));
 
@@ -926,7 +1056,8 @@ public class AppointmentTransitionService {
      * method performs NO follower re-layout, NO cascade and NO gap-closing. After it runs the
      * visit's items may have gaps between them; the appointment stays ONE appointment with ALL of
      * its items. What is NOT relaxed is the no-sibling-overlap invariant (phase 30.3) —
-     * {@link #assertNoSiblingOverlap} plus the master-scoped {@code existsOverlapExcluding} plus the
+     * {@link #assertNoSiblingOverlap} plus the post-lock fused guard
+     * ({@link PostLockRescheduleGuard#assertBookingStillConfirmedAndFree}) plus the
      * DB's {@code no_overlapping_bookings} EXCLUDE constraint all still forbid a moved item from
      * colliding with a CONFIRMED sibling of the SAME visit (a self-double-book of one master).
      *
@@ -945,34 +1076,24 @@ public class AppointmentTransitionService {
      * {@link #assertVisitNotElapsedForClient} is deliberately never called here: an elapsed sibling
      * must not freeze a still-future leg, which is exactly the outcome this feature exists to avoid.
      *
-     * <p><b>Lock order: header → client → master</b> (canonical appointments-before-bookings order,
-     * cycle-2 audit finding 1) — {@link #lockAppointmentHeaderBeforeItemReschedule} runs first and,
+     * <p><b>Lock order: client → master → header</b> (canonical appointments-before-bookings order;
+     * the header lock runs AFTER both advisory locks, matching every cascade) —
+     * {@link #lockAppointmentHeaderBeforeItemReschedule} runs after both advisory locks and,
      * UNLIKE its other caller ({@code BookingService#rescheduleBooking}, phase 30.2), a {@code false}
      * result here IS a 409: on this appointment-scoped route the header is a named part of the
      * request, so a non-CONFIRMED header is a genuine conflict the caller must see.
      *
-     * <p><b>Freshness re-check (F1, HIGH, cycle-6 audit 2026-08-03 — fixed here).</b> Immediately
-     * after the header lock above succeeds, and BEFORE {@code target} is mutated, this method
-     * re-verifies {@code target}'s OWN status via {@link BookingRepository#existsConfirmedById} — a
-     * scalar, entity-manager-bypassing probe, never a second entity load of {@code target} itself.
-     * Before this fix, the lock above only proved the HEADER was still CONFIRMED; it said nothing
-     * about {@code target}, which was loaded (via {@link #loadItemsOrThrow}) necessarily BEFORE any
-     * lock could protect that read. A per-service decline or a per-service client cancel of THIS
-     * SAME leg (fired near-concurrently at the two sibling per-item endpoints) leaves the header
-     * CONFIRMED — a sibling remains — so BOTH operations' header-lock guard passes. {@code Booking}
-     * now carries {@code @DynamicUpdate} (G1, cycle-7 audit 2026-08-03): this method only calls
-     * {@code target.reschedule(...)}, which touches {@code startsAt}/{@code endsAt} alone, so the
-     * status field stays at its loaded (stale, {@code CONFIRMED}) value and Hibernate's dirty-check
-     * finds it UNCHANGED from the load-time snapshot — the resulting UPDATE never mentions
-     * {@code status} at all, and the concurrent decline/cancel's terminal status structurally
-     * cannot be resurrected by this save, WITH OR WITHOUT this recheck. What the recheck still
-     * prevents is the resulting incoherent state where a leg the client just cancelled (or the
-     * provider just declined) silently acquires a brand-new time while remaining in that terminal
-     * status — a confusing outcome for the caller even though no column is corrupted. A mismatch
-     * aborts with the same 409 shape as every other conflict below — a clean, retryable loss of the
-     * race. Runs BEFORE the client/master advisory locks, preserving the existing tight-lock-window
-     * discipline (mirrors
-     * {@link #rescheduleAppointment}'s identical placement).
+     * <p><b>Freshness re-check (F1, HIGH, cycle-6 audit 2026-08-03).</b> {@code target} was loaded
+     * (via {@link #loadItemsOrThrow}) necessarily BEFORE any lock could protect that read, and the
+     * header lock alone only proves the HEADER is still CONFIRMED: a per-service decline or client
+     * cancel of THIS SAME leg leaves the header CONFIRMED (a sibling remains). The re-check is
+     * FUSED into the post-lock guard statement
+     * ({@link PostLockRescheduleGuard#assertBookingStillConfirmedAndFree}), which re-reads
+     * {@code target}'s status fresh from the DB (same 409 "Service changed concurrently") before
+     * {@code target} is mutated — no separate probe statement is needed. {@code Booking} carries
+     * {@code @DynamicUpdate} (G1), so the save cannot resurrect a concurrent terminal status; what
+     * the re-check prevents is a leg the client just cancelled (or the provider just declined)
+     * silently acquiring a brand-new time while remaining in that terminal status.
      *
      * @throws ForbiddenException             missing, foreign, or guest visit (uniform 403)
      * @throws NotFoundException              {@code bookingId} is not a child of {@code appointmentId} (404)
@@ -1054,21 +1175,6 @@ public class AppointmentTransitionService {
         // Phase 30.3 layer 1 — in-memory sibling pre-check, before any lock, zero extra queries.
         assertNoSiblingOverlap(items, bookingId, newStartsAt, newEndsAt);
 
-        // Lock order: header → client → master (canonical, cycle-2 audit finding 1). Unlike
-        // BookingService#rescheduleBooking's use of this SAME method (phase 30.2), a false result
-        // here IS a 409 — the header is a named part of THIS route's request (phase 30.1 D4).
-        if (!lockAppointmentHeaderBeforeItemReschedule(appointmentId)) {
-            throw new BusinessException(HttpStatus.CONFLICT, "Visit is no longer CONFIRMED");
-        }
-
-        // Freshness re-check (F1, HIGH, cycle-6 audit 2026-08-03) — see this method's own
-        // "Freshness re-check" Javadoc paragraph above for the full rationale. `target` was loaded
-        // before this lock existed to protect that read; the lock alone only proves the HEADER is
-        // still CONFIRMED, not that THIS specific item still is.
-        if (!bookingRepository.existsConfirmedById(target.getId())) {
-            throw new BusinessException(HttpStatus.CONFLICT, "Service changed concurrently — please retry");
-        }
-
         Integer lockResult;
         User owningClient = appointment.getClient();
         if (owningClient != null) {
@@ -1076,7 +1182,7 @@ public class AppointmentTransitionService {
             // OVERRIDE (product decision 2026-08-22, widened 2026-08-26): req.allowClientOverlap()
             // mirrors BookingService#doCreateBooking's / #rescheduleBooking's identical opt-in —
             // skips ONLY this self-conflict check. assertNoSiblingOverlap above (in-visit
-            // self-double-book), the master-scoped existsOverlapExcluding below and the
+            // self-double-book), the post-lock PostLockRescheduleGuard below and the
             // no_overlapping_bookings EXCLUDE constraint still run unconditionally regardless of
             // this flag. Defaults false (primitive boolean), so an absent/omitted field
             // reproduces today's behaviour byte-for-byte.
@@ -1103,13 +1209,23 @@ public class AppointmentTransitionService {
             throw new BusinessException(HttpStatus.INTERNAL_SERVER_ERROR, "Advisory lock acquisition failed");
         }
 
+        // Global lock order: client(1) → master(0) → appointment header → booking rows (header AFTER
+        // both advisory locks, matching every cascade). Unlike
+        // BookingService#rescheduleBooking's use of this SAME method (phase 30.2), a false result
+        // here IS a 409 — the header is a named part of THIS route's request (phase 30.1 D4).
+        if (!lockAppointmentHeaderBeforeItemReschedule(appointmentId)) {
+            throw new BusinessException(HttpStatus.CONFLICT, "Visit is no longer CONFIRMED");
+        }
+
         // Phase 30.3 layer 3 — booking-scoped exclusion (excludes ONLY the moving row), so a
         // CONFIRMED sibling of the SAME visit IS caught. Never existsOverlapExcludingAppointment,
         // whose appointment-wide exclusion is blind to siblings by construction (30.3's single
         // highest-risk mistake, called out in three phase docs).
-        if (bookingRepository.existsOverlapExcluding(masterId, newStartsAt, newEndsAt, bookingId)) {
-            throw new BusinessException(HttpStatus.CONFLICT, "Slot not available");
-        }
+        // Fused fresh-from-DB CONFIRMED re-check of the moving item (F1 freshness re-check: `target`
+        // was loaded before the lock) — see PostLockRescheduleGuard.
+        PostLockRescheduleGuard.assertBookingStillConfirmedAndFree(
+                bookingRepository, masterId, newStartsAt, newEndsAt, bookingId,
+                "Service changed concurrently — please retry");
 
         target.reschedule(newStartsAt, newEndsAt);
         Booking saved;
@@ -1127,6 +1243,11 @@ public class AppointmentTransitionService {
 
         // Reference the MOVED CHILD (never item 0) so the notification names the right service.
         outboxService.enqueueBookingRescheduled(saved.getId(), initiatedByProvider);
+        // Phase 333, matrix row 4 — per-item, booking-keyed (a per-item reschedule stays per-booking,
+        // never visit-level). `saved` is `target` post-reschedule (same managed instance) — never
+        // reloaded (audit-fix cycle 1, finding 1).
+        inAppNotificationService.notifyRescheduled(
+                saved, initiatedByProvider, newStartsAt.toInstant(), actorUserId);
 
         registerRescheduleEviction(masterId, salonIdOfMaster(master));
 
@@ -1630,7 +1751,7 @@ public class AppointmentTransitionService {
      * Terminal siblings are exempt: their slots are released.
      *
      * <p>Runs before any lock, over the already-loaded item list, at zero extra queries. It exists
-     * for DETERMINISM, not for safety — the booking-scoped {@code existsOverlapExcluding} call and
+     * for DETERMINISM, not for safety — the booking-scoped post-lock {@link PostLockRescheduleGuard} overlap check and
      * the DB's {@code no_overlapping_bookings} EXCLUDE constraint already make the overlap
      * unreachable. Without it a same-visit collision would surface as
      * {@code CLIENT_BOOKING_CONFLICT} for an account-bound visit but as {@code "Slot not available"}

@@ -34,7 +34,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * ({@link SalonService#getSiblingSalons}).
  *
  * <h2>Why this gate exists</h2>
- * The whole justification for this read path is "ONE statement, four columns, no {@code users}
+ * The whole justification for this read path is "ONE statement, five columns, no {@code users}
  * join". Every other test in the salon package is blind to it:
  * {@link SalonSiblingSalonsEndpointIT} asserts the wire shape,
  * {@link SalonSiblingRotationParityIT} asserts the predicate, {@code SalonServiceSiblingSalonsTest}
@@ -48,7 +48,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <ol>
  *   <li><b>One statement.</b> A picker open must not be an N+1 or a two-query
  *       resolve-then-read.</li>
- *   <li><b>Four projected columns.</b> The select list's arity, not its text — it must equal
+ *   <li><b>Five projected columns.</b> The select list's arity, not its text — it must equal
  *       {@link SiblingSalonOption}'s component count. A widened DTO or a reverted
  *       {@code SELECT s} (22 {@code salons} columns) fails here whatever the columns are named.</li>
  *   <li><b>No {@code users} table anywhere in the emitted SQL.</b> This is what
@@ -76,8 +76,11 @@ class SalonSiblingProjectionShapeIT extends AbstractIntegrationTest {
     /** Matches the {@code users} table (or an alias of it) as a whole word, not as a substring. */
     private static final Pattern USERS_TABLE = Pattern.compile("\\busers\\b");
 
-    /** {@link SiblingSalonOption} carries id + name + street + buildingNo, and nothing else. */
-    private static final int PROJECTED_COLUMNS = 4;
+    /** {@link SiblingSalonOption} carries id + name + street + buildingNo + avatarUrl, and nothing else. */
+    private static final int PROJECTED_COLUMNS = 5;
+
+    /** The storage-internal R2 key column — must never be selected on this path. */
+    private static final Pattern AVATAR_R2_KEY_COLUMN = Pattern.compile("\\bavatar_r2_key\\b");
 
     @Autowired
     private SalonService salonService;
@@ -104,8 +107,8 @@ class SalonSiblingProjectionShapeIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("one statement, four columns, no users table, no hydrated entity")
-    void should_emitOneFourColumnSalonsSelect_when_listingSiblings() {
+    @DisplayName("one statement, five columns, no users table, no R2 key, no hydrated entity")
+    void should_emitOneFiveColumnSalonsSelect_when_listingSiblings() {
         // Arrange — two real siblings, so an empty result cannot make any assertion vacuous.
         UUID ownerId = fixtures.insertUser(
                 "owner-shape-sql-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
@@ -147,6 +150,11 @@ class SalonSiblingProjectionShapeIT extends AbstractIntegrationTest {
                             + "here means an association (JOIN FETCH s.owner, or an owner path "
                             + "expression that is not the FK) came back, dragging 38 users columns "
                             + "including password_hash into every picker open — captured=%s", captured)
+                    .isFalse();
+
+            softly.assertThat(AVATAR_R2_KEY_COLUMN.matcher(sql).find())
+                    .as("the logo's R2 object key is storage-internal — the picker projects "
+                            + "avatar_url only, never avatar_r2_key — sql=%s", sql)
                     .isFalse();
 
             softly.assertThat(hydratedEntities)

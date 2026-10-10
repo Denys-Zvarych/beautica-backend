@@ -45,7 +45,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * share the same JVM thread (JUnit reuses the same caller thread by default).
  */
 @SpringBootTest(
-        classes = AsyncConfig.class,
+        classes = {AsyncConfig.class, FirebaseConfig.class}, // pushTaskPool @DependsOn("firebaseConfig")
         webEnvironment = SpringBootTest.WebEnvironment.NONE
 )
 @ActiveProfiles("test")

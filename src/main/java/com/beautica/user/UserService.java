@@ -28,9 +28,11 @@ import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.util.Comparator;
+import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
@@ -38,6 +40,14 @@ import java.util.stream.IntStream;
 @Slf4j
 @Service
 public class UserService {
+
+    /**
+     * Roles admitted by {@link #updateMasterProfile}: the union of the two controllers' role gates
+     * (IndependentMasterController: INDEPENDENT_MASTER + SALON_OWNER; MasterController: SALON_MASTER).
+     * Pinned against both {@code @PreAuthorize} annotations by MasterProfileWriteRolesDriftTest.
+     */
+    public static final Set<Role> MASTER_PROFILE_WRITE_ROLES =
+            EnumSet.of(Role.INDEPENDENT_MASTER, Role.SALON_MASTER, Role.SALON_OWNER);
 
     /** Public {@code GET /masters/{masterId}} DTO cache, keyed by masterId (see MasterService). */
     private static final String MASTER_DETAIL_CACHE = "master-detail";
@@ -169,13 +179,12 @@ public class UserService {
     }
 
     /**
-     * The owner-as-master toggle state (Phase 265): {@code true} iff an <em>active</em> master row
-     * of type {@code SALON_OWNER} exists for this user. Derived on every read — the toggle IS that
-     * row, so there is no column to read and no migration in this phase.
+     * {@code true} iff an <em>active</em> master row of type {@code SALON_OWNER} exists for this
+     * user (Phase 265). Derived on every read — there is no column. Since Phase 346 this is always
+     * {@code true} for the owner of a live salon (the owner-master toggle endpoints were removed).
      *
-     * <p>The {@code isActive} predicate is the whole point. {@code DELETE
-     * /api/v1/salons/&#123;salonId&#125;/master} deactivates rather than hard-deletes, so a bare
-     * existence check would report every owner who has ever opted in as permanently opted in.
+     * <p>The {@code isActive} predicate stays: salon deletion ({@code deactivateMasters}) and
+     * {@code DELETE /masters/{masterId}} deactivate rather than hard-delete the row.
      *
      * <p>The role short-circuit ahead of the query is an optimisation that provably cannot change
      * the answer, not a second source of truth: {@code MasterService.createMasterForOwner} is the
@@ -292,14 +301,14 @@ public class UserService {
 
         Role role = user.getRole();
         // Load-bearing UNION backstop — do NOT delete as "redundant with @PreAuthorize".
-        // This single service method serves TWO single-role controllers:
-        // IndependentMasterController gates INDEPENDENT_MASTER, MasterController gates
-        // SALON_MASTER. Neither controller alone admits the other's role, so only the
-        // union {INDEPENDENT_MASTER, SALON_MASTER} may write here — and only the service,
-        // seeing both call sites, can enforce that union. It is the intentional
-        // defence-in-depth guard (§D / B14) that keeps CLIENT (and any future role wired
-        // to a third caller) out of this write path.
-        if (role != Role.INDEPENDENT_MASTER && role != Role.SALON_MASTER) {
+        // This single service method serves TWO controllers: IndependentMasterController gates
+        // {INDEPENDENT_MASTER, SALON_OWNER} (owner is always a master, phase 361) and
+        // MasterController gates SALON_MASTER. Neither controller alone admits the other's
+        // roles, so only the union {INDEPENDENT_MASTER, SALON_MASTER, SALON_OWNER} may write
+        // here — and only the service, seeing both call sites, can enforce that union. It is
+        // the intentional defence-in-depth guard (§D / B14) that keeps CLIENT, SALON_ADMIN (and
+        // any future role wired to a third caller) out of this write path.
+        if (!MASTER_PROFILE_WRITE_ROLES.contains(role)) {
             throw new ForbiddenException("Profile update not permitted for role: " + role);
         }
 
@@ -327,7 +336,7 @@ public class UserService {
         }
         if (request.professionalTitle() != null) {
             // Clear-field semantics: the mobile edit screen sends "" to remove a stored
-            // title. This path is already gated to INDEPENDENT_MASTER / SALON_MASTER, so
+            // title. This path is already gated to INDEPENDENT_MASTER / SALON_MASTER / SALON_OWNER, so
             // no CLIENT can reach it — the role guard needed on /users/me is unnecessary here.
             String trimmed = request.professionalTitle().strip();
             user.setProfessionalTitle(trimmed.isBlank() ? null : trimmed);
@@ -356,7 +365,7 @@ public class UserService {
      * hot CLIENT profile write stays at its current query count.
      */
     private UUID resolveMasterIdForEviction(UUID userId, Role role) {
-        if (role == Role.CLIENT || role == Role.SALON_ADMIN) {
+        if (!role.canOwnMasterRow()) {
             return null;
         }
         return masterRepository.findIdByUserId(userId).orElse(null);
@@ -432,6 +441,12 @@ public class UserService {
                 // free-text page that matched the old name. Iterating
                 // SearchCacheNames.MASTERS_ALL keeps a future third partition from being
                 // silently missed here.
+                // SALON_OWNER (and SALON_MASTER) are deliberately NOT cleared: master search is
+                // restricted to u.role = INDEPENDENT_MASTER (SearchService#appendMasterActiveIndependentPredicate)
+                // and the salon search SQL/SalonSearchResult carry only salons.name — no staff
+                // first/last name or professional title — so an owner rename cannot stale a cached
+                // search page. Pinned by SearchResultStaffNameFreeTest; if a salon result ever gains
+                // a staff-name field, evict SearchCacheNames.SALONS_ALL here for SALON_OWNER.
                 if (searchAffected && role == Role.INDEPENDENT_MASTER) {
                     for (String cacheName : SearchCacheNames.MASTERS_ALL) {
                         Cache search = cacheManager.getCache(cacheName);

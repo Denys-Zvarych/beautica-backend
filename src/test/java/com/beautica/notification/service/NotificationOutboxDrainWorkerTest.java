@@ -6,6 +6,7 @@ import com.beautica.notification.crypto.OutboxPayloadCipher;
 import com.beautica.notification.entity.NotificationOutboxEntry;
 import com.beautica.notification.entity.OutboxEventType;
 import com.beautica.notification.entity.OutboxStatus;
+import com.beautica.notification.inapp.push.InAppPushDispatcher;
 import com.beautica.notification.repository.NotificationOutboxRepository;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
@@ -35,6 +36,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 /**
@@ -78,6 +80,9 @@ class NotificationOutboxDrainWorkerTest {
 
     @Mock
     private OutboxPayloadCipher cipher;
+
+    @Mock
+    private InAppPushDispatcher inAppPushDispatcher;
 
     @InjectMocks
     private NotificationOutboxDrainWorker worker;
@@ -126,6 +131,159 @@ class NotificationOutboxDrainWorkerTest {
         assertThat(outboxEntry.getStatus()).isEqualTo(OutboxStatus.SENT);
     }
 
+    // ── Phase 339: INAPP_PUSH dispatches to InAppPushDispatcher ───────────────
+
+    private static InAppPushDispatcher.PushPlan plan() {
+        return new InAppPushDispatcher.PushPlan(UUID.randomUUID(), "T", "B", Map.of(), List.of());
+    }
+
+    @Test
+    @DisplayName("INAPP_PUSH ids are pre-loaded in ONE prepare call, the plan is dispatched, the entry ends SENT, "
+            + "and the aggregate_id is never fed to the booking pre-load")
+    void should_callInAppPushDispatcher_when_inAppPushEntryProcessed() {
+        UUID feedRowId = UUID.randomUUID();
+        NotificationOutboxEntry outboxEntry = entry(OutboxEventType.INAPP_PUSH, 0, null, feedRowId);
+        InAppPushDispatcher.PushPlan plan = plan();
+
+        when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
+        when(bookingRepository.findAllByIdsWithGraph(org.mockito.ArgumentMatchers.argThat(ids -> ids.isEmpty())))
+                .thenReturn(List.of());
+        when(inAppPushDispatcher.prepare(List.of(feedRowId))).thenReturn(Map.of(feedRowId, plan));
+
+        worker.drain();
+
+        verify(inAppPushDispatcher, times(1)).dispatch(plan);
+        assertThat(outboxEntry.getStatus()).isEqualTo(OutboxStatus.SENT);
+        verifyNoInteractions(notificationService);
+    }
+
+    @Test
+    @DisplayName("INAPP_PUSH with no plan (row gone/read, recipient gone or token-less) is a D8 skip: SENT, no FCM hand-off")
+    void should_markSentWithoutDispatch_when_noPlanForPushEntry() {
+        UUID feedRowId = UUID.randomUUID();
+        NotificationOutboxEntry outboxEntry = entry(OutboxEventType.INAPP_PUSH, 0, null, feedRowId);
+
+        when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
+        when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of());
+        when(inAppPushDispatcher.prepare(any())).thenReturn(Map.of());
+
+        worker.drain();
+
+        verify(inAppPushDispatcher, never()).dispatch(any());
+        assertThat(outboxEntry.getStatus()).isEqualTo(OutboxStatus.SENT);
+        assertThat(outboxEntry.getAttempts()).isZero();
+    }
+
+    @Test
+    @DisplayName("INAPP_PUSH whose dispatch throws is retried (PENDING, attempts+1), never lost")
+    void should_retryInAppPush_when_dispatcherThrows() {
+        UUID feedRowId = UUID.randomUUID();
+        NotificationOutboxEntry outboxEntry = entry(OutboxEventType.INAPP_PUSH, 0, null, feedRowId);
+        InAppPushDispatcher.PushPlan plan = plan();
+
+        when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
+        when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of());
+        when(inAppPushDispatcher.prepare(any())).thenReturn(Map.of(feedRowId, plan));
+        org.mockito.Mockito.doThrow(new IllegalStateException("boom"))
+                .when(inAppPushDispatcher).dispatch(plan);
+
+        worker.drain();
+
+        assertThat(outboxEntry.getStatus()).isEqualTo(OutboxStatus.PENDING);
+        assertThat(outboxEntry.getAttempts()).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("executor rejection re-queues the entry WITHOUT counting an attempt and stops the rest of the batch")
+    void should_requeueWithoutAttempt_andStopBatch_when_pushExecutorRejects() {
+        UUID id1 = UUID.randomUUID();
+        UUID id2 = UUID.randomUUID();
+        UUID id3 = UUID.randomUUID();
+        NotificationOutboxEntry sent = entry(OutboxEventType.INAPP_PUSH, 0, null, id1);
+        NotificationOutboxEntry rejected = entry(OutboxEventType.INAPP_PUSH, 1, null, id2);
+        NotificationOutboxEntry untouched = entry(OutboxEventType.INAPP_PUSH, 2, null, id3);
+        InAppPushDispatcher.PushPlan p1 = plan();
+        InAppPushDispatcher.PushPlan p2 = plan();
+        InAppPushDispatcher.PushPlan p3 = plan();
+
+        when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(sent, rejected, untouched));
+        when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of());
+        when(inAppPushDispatcher.prepare(any())).thenReturn(Map.of(id1, p1, id2, p2, id3, p3));
+        // lenient: dispatch(p1) legitimately runs with different args than the stubbed p2.
+        lenient().doThrow(new org.springframework.core.task.TaskRejectedException("queue full"))
+                .when(inAppPushDispatcher).dispatch(p2);
+
+        worker.drain();
+
+        assertThat(sent.getStatus()).isEqualTo(OutboxStatus.SENT);
+        assertThat(rejected.getStatus()).isEqualTo(OutboxStatus.PENDING);
+        assertThat(rejected.getAttempts()).as("a rejection is backpressure, not a failed attempt").isEqualTo(1);
+        assertThat(untouched.getStatus()).isEqualTo(OutboxStatus.PENDING);
+        assertThat(untouched.getAttempts()).isEqualTo(2);
+        verify(inAppPushDispatcher, never()).dispatch(p3);
+    }
+
+    @Test
+    @DisplayName("a raw RejectedExecutionException is treated the same: no attempt burned, a row at attempts=2 "
+            + "is NOT driven to DEAD")
+    void should_notDeadLetter_when_rawRejectedExecutionAtLastAttempt() {
+        UUID feedRowId = UUID.randomUUID();
+        NotificationOutboxEntry outboxEntry = entry(OutboxEventType.INAPP_PUSH, 2, null, feedRowId);
+        InAppPushDispatcher.PushPlan plan = plan();
+
+        when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
+        when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of());
+        when(inAppPushDispatcher.prepare(any())).thenReturn(Map.of(feedRowId, plan));
+        doThrow(new java.util.concurrent.RejectedExecutionException("saturated"))
+                .when(inAppPushDispatcher).dispatch(plan);
+
+        worker.drain();
+
+        assertThat(outboxEntry.getStatus()).isEqualTo(OutboxStatus.PENDING);
+        assertThat(outboxEntry.getAttempts()).isEqualTo(2);
+        assertThat(outboxEntry.getLastError()).isNull();
+    }
+
+    @Test
+    @DisplayName("S3: a prepare() failure fails ONLY the INAPP_PUSH entries (attempt+1, error = exception class "
+            + "name); the e-mail entry of the same batch is still dispatched and SENT")
+    void should_failOnlyPushEntries_when_prepareThrows() {
+        UUID bookingId = UUID.randomUUID();
+        UUID feedRowId = UUID.randomUUID();
+        NotificationOutboxEntry emailEntry = entry(OutboxEventType.NEW_BOOKING, 0, null, bookingId);
+        NotificationOutboxEntry pushEntry = entry(OutboxEventType.INAPP_PUSH, 0, null, feedRowId);
+        Booking booking = mock(Booking.class);
+
+        when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(emailEntry, pushEntry));
+        when(booking.getId()).thenReturn(bookingId);
+        when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(booking));
+        when(inAppPushDispatcher.prepare(any())).thenThrow(new IllegalStateException("secret-detail"));
+
+        worker.drain();
+
+        assertThat(emailEntry.getStatus()).isEqualTo(OutboxStatus.SENT);
+        verify(notificationService, times(1)).notifyNewBooking(BookingVisit.single(booking));
+        assertThat(pushEntry.getStatus()).isEqualTo(OutboxStatus.PENDING);
+        assertThat(pushEntry.getAttempts()).isEqualTo(1);
+        assertThat(pushEntry.getLastError()).isEqualTo("IllegalStateException");
+        verify(inAppPushDispatcher, never()).dispatch(any());
+    }
+
+    @Test
+    @DisplayName("S3: a push entry already at its last attempt goes DEAD when prepare() throws")
+    void should_deadLetterPushEntry_when_prepareThrowsAtLastAttempt() {
+        NotificationOutboxEntry pushEntry = entry(OutboxEventType.INAPP_PUSH, 2, null, UUID.randomUUID());
+
+        when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(pushEntry));
+        when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of());
+        when(inAppPushDispatcher.prepare(any())).thenThrow(new IllegalStateException("boom"));
+
+        worker.drain();
+
+        assertThat(pushEntry.getStatus()).isEqualTo(OutboxStatus.DEAD);
+        assertThat(pushEntry.getAttempts()).isEqualTo(3);
+    }
+
     // ── Test 2: STATUS_CHANGED dispatches to notifyBookingStatusChanged ───────
 
     @Test
@@ -152,7 +310,7 @@ class NotificationOutboxDrainWorkerTest {
     void should_decryptInviteUrlSealedAndDispatch_when_inviteEntryProcessed() throws Exception {
         // Arrange — use a real ObjectMapper so JSON deserialisation is actually exercised.
         NotificationOutboxDrainWorker workerWithRealMapper = new NotificationOutboxDrainWorker(
-                outboxRepository, notificationService, bookingRepository, visitResolver, REAL_MAPPER, cipher);
+                outboxRepository, notificationService, bookingRepository, visitResolver, REAL_MAPPER, cipher, inAppPushDispatcher);
         ReflectionTestUtils.setField(workerWithRealMapper, "self", workerWithRealMapper);
 
         UUID aggregateId = UUID.randomUUID();
@@ -187,7 +345,7 @@ class NotificationOutboxDrainWorkerTest {
     @DisplayName("entry transitions to DEAD without dispatch when cipher.open throws on corrupt ciphertext")
     void should_dead_letter_when_cipherOpenThrows() throws Exception {
         NotificationOutboxDrainWorker workerWithRealMapper = new NotificationOutboxDrainWorker(
-                outboxRepository, notificationService, bookingRepository, visitResolver, REAL_MAPPER, cipher);
+                outboxRepository, notificationService, bookingRepository, visitResolver, REAL_MAPPER, cipher, inAppPushDispatcher);
         ReflectionTestUtils.setField(workerWithRealMapper, "self", workerWithRealMapper);
 
         UUID aggregateId = UUID.randomUUID();
@@ -223,7 +381,7 @@ class NotificationOutboxDrainWorkerTest {
     @DisplayName("entry transitions to DEAD without invoking cipher when inviteUrlSealed is missing from payload")
     void should_dead_letter_when_inviteUrlSealedMissing() throws Exception {
         NotificationOutboxDrainWorker workerWithRealMapper = new NotificationOutboxDrainWorker(
-                outboxRepository, notificationService, bookingRepository, visitResolver, REAL_MAPPER, cipher);
+                outboxRepository, notificationService, bookingRepository, visitResolver, REAL_MAPPER, cipher, inAppPushDispatcher);
         ReflectionTestUtils.setField(workerWithRealMapper, "self", workerWithRealMapper);
 
         UUID aggregateId = UUID.randomUUID();
@@ -589,7 +747,7 @@ class NotificationOutboxDrainWorkerTest {
     @DisplayName("INVITE entry with malformed JSON payload is dead-lettered without throwing")
     void should_setStatusToPending_when_invitePayloadIsInvalidJson() {
         NotificationOutboxDrainWorker workerWithRealMapper = new NotificationOutboxDrainWorker(
-                outboxRepository, notificationService, bookingRepository, visitResolver, REAL_MAPPER, cipher);
+                outboxRepository, notificationService, bookingRepository, visitResolver, REAL_MAPPER, cipher, inAppPushDispatcher);
         ReflectionTestUtils.setField(workerWithRealMapper, "self", workerWithRealMapper);
 
         UUID aggregateId = UUID.randomUUID();

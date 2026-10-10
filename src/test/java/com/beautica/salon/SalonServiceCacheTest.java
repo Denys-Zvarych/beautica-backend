@@ -3,6 +3,7 @@ package com.beautica.salon;
 import com.beautica.auth.InviteService;
 import com.beautica.auth.Role;
 import com.beautica.common.security.AuthorizationService;
+import com.beautica.common.cache.MasterCachePrefixEvictor;
 import com.beautica.config.CacheConfig;
 import com.beautica.location.LocalityWriteValidator;
 import com.beautica.location.repository.CityRepository;
@@ -45,7 +46,10 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 @SpringBootTest(
-        classes = {SalonService.class, CacheConfig.class, SalonServiceCacheTest.TxConfig.class},
+        // MasterCachePrefixEvictor is the REAL bean (needs only CacheConfig's CacheManager), so
+        // SalonService's logo search-page eviction runs against the real caches under test.
+        classes = {SalonService.class, CacheConfig.class, MasterCachePrefixEvictor.class,
+                SalonServiceCacheTest.TxConfig.class},
         webEnvironment = SpringBootTest.WebEnvironment.NONE
 )
 @DisplayName("SalonService — @Cacheable/@CacheEvict behaviour")
@@ -164,6 +168,9 @@ class SalonServiceCacheTest {
     @MockBean com.beautica.favorite.repository.FavoriteRepository favoriteRepository;
     @MockBean com.beautica.media.repository.MediaRepository mediaRepository;
     @MockBean com.beautica.media.service.MediaService mediaService;
+    // Phase 342: deactivateSalon purges uploaded service-photo blobs via the shared purger.
+    @MockBean com.beautica.service.service.ServicePhotoBlobPurger servicePhotoBlobPurger;
+    @MockBean com.beautica.media.service.AfterCommitBlobPurger afterCommitBlobPurger;
     // Commit ac0a19e: SalonService now constructor-depends on MasterScheduleService (parameter 8)
     // and ScheduleDateMath (parameter 9) for the salon-staff schedule read-through. WITHOUT BOTH
     // the whole context fails to load with "No qualifying bean of type ..." — and supplying only

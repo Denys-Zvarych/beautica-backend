@@ -24,12 +24,15 @@ import jakarta.servlet.http.HttpServletResponse;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.test.mock.mockito.MockBean;
+import org.springframework.mock.web.MockMultipartFile;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.HttpMethod;
@@ -57,14 +60,16 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.authentication;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.csrf;
 import com.beautica.service.dto.UpdateServiceDefinitionRequest;
-import com.beautica.service.dto.UpdateServicePhotoRequest;
+import com.beautica.media.service.MediaService;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.patch;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.multipart;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
@@ -119,6 +124,9 @@ class ServiceControllerTest {
     @MockBean
     private ServiceCatalogService serviceCatalogService;
 
+    @MockBean
+    private MediaService mediaService;
+
     @MockBean(name = "authz")
     private AuthorizationService authorizationService;
 
@@ -130,6 +138,9 @@ class ServiceControllerTest {
 
     @MockBean
     private SalonServiceFavoriteDecorator salonServiceFavoriteDecorator;
+
+    @MockBean
+    private com.beautica.service.service.MasterServiceBookabilityFilter masterServiceBookabilityFilter;
 
     /**
      * Default passthrough stub for every test that does not care about {@code isFavorite}
@@ -144,6 +155,10 @@ class ServiceControllerTest {
                 .thenAnswer(invocation -> invocation.getArgument(0));
         when(salonServiceFavoriteDecorator.decorate(any(), any()))
                 .thenAnswer(invocation -> invocation.getArgument(0));
+        // Bookability narrowing is covered by MasterServiceBookabilityFilterTest and the
+        // MasterServicesTabVisibilityIT; this slice asserts the wiring, so pass through.
+        when(masterServiceBookabilityFilter.forViewer(any(), any(), any()))
+                .thenAnswer(invocation -> invocation.getArgument(1));
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -385,7 +400,7 @@ class ServiceControllerTest {
 
         when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
         when(authorizationService.masterBelongsToSalon(masterId, salonId)).thenReturn(true);
-        when(serviceCatalogService.assignServiceToMaster(eq(salonId), eq(masterId), any(AssignServiceToMasterRequest.class)))
+        when(serviceCatalogService.assignServiceToMaster(any(), eq(salonId), eq(masterId), any(AssignServiceToMasterRequest.class)))
                 .thenReturn(stub);
 
         log.debug("Act: POST /api/v1/salons/{}/masters/{}/services — assign service to master", salonId, masterId);
@@ -413,7 +428,7 @@ class ServiceControllerTest {
 
         when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
         when(authorizationService.masterBelongsToSalon(masterId, salonId)).thenReturn(true);
-        when(serviceCatalogService.assignServiceToMaster(eq(salonId), eq(masterId), any()))
+        when(serviceCatalogService.assignServiceToMaster(any(), eq(salonId), eq(masterId), any()))
                 .thenThrow(new BusinessException(HttpStatus.CONFLICT, "Already assigned"));
 
         log.debug("Act: POST assign — service layer throws a generic untyped BusinessException(CONFLICT)");
@@ -440,7 +455,7 @@ class ServiceControllerTest {
         // masterBelongsToSalon were ever consulted; the annotation is gone, so those two decide alone.
         when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
         when(authorizationService.masterBelongsToSalon(masterId, salonId)).thenReturn(true);
-        when(serviceCatalogService.assignServiceToMaster(eq(salonId), eq(masterId), any(AssignServiceToMasterRequest.class)))
+        when(serviceCatalogService.assignServiceToMaster(any(), eq(salonId), eq(masterId), any(AssignServiceToMasterRequest.class)))
                 .thenReturn(stub);
 
         log.debug("Act: POST /api/v1/salons/{}/masters/{}/services as SALON_ADMIN — must be allowed (D4)", salonId, masterId);
@@ -475,7 +490,7 @@ class ServiceControllerTest {
                         .content(objectMapper.writeValueAsString(request)))
                 .andExpect(status().isForbidden());
 
-        verify(serviceCatalogService, never()).assignServiceToMaster(any(), any(), any());
+        verify(serviceCatalogService, never()).assignServiceToMaster(any(), any(), any(), any());
     }
 
     @Test
@@ -495,7 +510,7 @@ class ServiceControllerTest {
                         .content(objectMapper.writeValueAsString(request)))
                 .andExpect(status().isForbidden());
 
-        verify(serviceCatalogService, never()).assignServiceToMaster(any(), any(), any());
+        verify(serviceCatalogService, never()).assignServiceToMaster(any(), any(), any(), any());
     }
 
     // ── PATCH /api/v1/salons/{salonId}/masters/{masterId}/services/{serviceDefId} — Phase 311 ──
@@ -1663,7 +1678,7 @@ class ServiceControllerTest {
                         .content(body))
                 .andExpect(status().isBadRequest());
 
-        verify(serviceCatalogService, never()).assignServiceToMaster(any(), any(), any());
+        verify(serviceCatalogService, never()).assignServiceToMaster(any(), any(), any(), any());
     }
 
     @Test
@@ -1685,7 +1700,7 @@ class ServiceControllerTest {
                         .content(body))
                 .andExpect(status().isBadRequest());
 
-        verify(serviceCatalogService, never()).assignServiceToMaster(any(), any(), any());
+        verify(serviceCatalogService, never()).assignServiceToMaster(any(), any(), any(), any());
     }
 
 
@@ -2096,8 +2111,7 @@ class ServiceControllerTest {
                 "Updated Manicure", null, null, null, null, PriceType.FIXED, new BigDecimal("400.00"), null, null, null);
         var stub = stubServiceDefResponse(serviceDefId, "Updated Manicure");
 
-        when(authorizationService.canManageServiceDefinition(any(), eq(serviceDefId))).thenReturn(true);
-        when(serviceCatalogService.updateServiceDefinition(eq(serviceDefId), any(UpdateServiceDefinitionRequest.class)))
+        when(serviceCatalogService.updateServiceDefinition(eq(userId), eq(serviceDefId), any(UpdateServiceDefinitionRequest.class)))
                 .thenReturn(stub);
 
         log.debug("Act: PATCH /api/v1/services/{} as SALON_OWNER — update name and price", serviceDefId);
@@ -2121,8 +2135,7 @@ class ServiceControllerTest {
         var request = new UpdateServiceDefinitionRequest(null, null, null, 90, null, null, null, null, null, null);
         var stub = stubServiceDefResponse(serviceDefId, "Manicure");
 
-        when(authorizationService.canManageServiceDefinition(any(), eq(serviceDefId))).thenReturn(true);
-        when(serviceCatalogService.updateServiceDefinition(eq(serviceDefId), any(UpdateServiceDefinitionRequest.class)))
+        when(serviceCatalogService.updateServiceDefinition(eq(userId), eq(serviceDefId), any(UpdateServiceDefinitionRequest.class)))
                 .thenReturn(stub);
 
         log.debug("Act: PATCH /api/v1/services/{} with only baseDurationMinutes — partial PATCH", serviceDefId);
@@ -2136,12 +2149,14 @@ class ServiceControllerTest {
     }
 
     @Test
-    @DisplayName("PATCH /services/{id} — 403 when a different owner tries to update")
+    @DisplayName("PATCH /services/{id} — 403 when a different owner tries to update (service-layer enforce throws ForbiddenException)")
     void should_return403_when_nonOwnerUpdatesServiceDefinition() throws Exception {
         var userId = UUID.randomUUID();
         var serviceDefId = UUID.randomUUID();
-
-        when(authorizationService.canManageServiceDefinition(any(), eq(serviceDefId))).thenReturn(false);
+        // §D split: the owner passes the role-only gate; the service-layer
+        // enforceCanManageServiceDefinition refuses the non-owner → GlobalExceptionHandler 403.
+        when(serviceCatalogService.updateServiceDefinition(eq(userId), eq(serviceDefId), any()))
+                .thenThrow(new ForbiddenException("Access denied"));
 
         log.debug("Act: PATCH /api/v1/services/{} with wrong owner — must return 403", serviceDefId);
         mockMvc.perform(patch("/api/v1/services/" + serviceDefId)
@@ -2149,18 +2164,18 @@ class ServiceControllerTest {
                         .with(csrf())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"name\":\"Hijack\"}"))
-                .andExpect(status().isForbidden());
+                .andExpect(status().isForbidden())
+                .andExpect(jsonPath("$.message").value("Access denied"));
     }
 
     @Test
-    @DisplayName("PATCH /services/{id} — 403 when non-existent service definition (canManageServiceDefinition returns false)")
+    @DisplayName("PATCH /services/{id} — 403 when owner targets a non-existent service definition (service-layer enforce treats unknown id as denied)")
     void should_return403_when_patchingNonExistentServiceDefinition() throws Exception {
         var userId = UUID.randomUUID();
         var nonExistentId = UUID.randomUUID();
-
-        // canManageServiceDefinition returns false when service definition does not exist
-        // (findOwnerUserId returns empty → orElse(false)) — same behaviour as DELETE.
-        when(authorizationService.canManageServiceDefinition(any(), eq(nonExistentId))).thenReturn(false);
+        // enforceCanManageServiceDefinition denies an unknown id (no existence oracle) — same as DELETE.
+        when(serviceCatalogService.updateServiceDefinition(eq(userId), eq(nonExistentId), any()))
+                .thenThrow(new ForbiddenException("Access denied"));
 
         log.debug("Act: PATCH /api/v1/services/{} with valid token but missing service def — must return 403", nonExistentId);
         mockMvc.perform(patch("/api/v1/services/" + nonExistentId)
@@ -2169,6 +2184,40 @@ class ServiceControllerTest {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"name\":\"Ghost\"}"))
                 .andExpect(status().isForbidden());
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @EnumSource(value = Role.class, names = {"CLIENT", "SALON_MASTER"})
+    @DisplayName("PATCH /services/{id} — 403 at the role-only gate for a role that never manages the catalogue; service never reached")
+    void should_return403_when_nonManagingRolePatchesServiceDefinition(Role role) throws Exception {
+        var serviceDefId = UUID.randomUUID();
+
+        mockMvc.perform(patch("/api/v1/services/" + serviceDefId)
+                        .with(authenticatedAs(UUID.randomUUID(), "x@beautica.test", role))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"name\":\"X\"}"))
+                .andExpect(status().isForbidden());
+
+        verifyNoInteractions(serviceCatalogService);
+    }
+
+    @Test
+    @DisplayName("PATCH /services/{id} — SALON_ADMIN passes the role gate; the service receives the admin's userId as actorId")
+    void should_passAdminIdToService_when_salonAdminPatchesServiceDefinition() throws Exception {
+        var adminUserId = UUID.randomUUID();
+        var serviceDefId = UUID.randomUUID();
+        when(serviceCatalogService.updateServiceDefinition(eq(adminUserId), eq(serviceDefId), any()))
+                .thenReturn(stubServiceDefResponse(serviceDefId, "Renamed"));
+
+        mockMvc.perform(patch("/api/v1/services/" + serviceDefId)
+                        .with(authenticatedAs(adminUserId, "admin@beautica.test", Role.SALON_ADMIN))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"name\":\"Renamed\"}"))
+                .andExpect(status().isOk());
+
+        verify(serviceCatalogService).updateServiceDefinition(eq(adminUserId), eq(serviceDefId), any());
     }
 
     @Test
@@ -2190,7 +2239,6 @@ class ServiceControllerTest {
         var userId = UUID.randomUUID();
         var serviceDefId = UUID.randomUUID();
 
-        when(authorizationService.canManageServiceDefinition(any(), eq(serviceDefId))).thenReturn(true);
 
         log.debug("Act: PATCH /api/v1/services/{} with baseDurationMinutes=481 — must return 400", serviceDefId);
         mockMvc.perform(patch("/api/v1/services/" + serviceDefId)
@@ -2207,7 +2255,6 @@ class ServiceControllerTest {
         var userId = UUID.randomUUID();
         var serviceDefId = UUID.randomUUID();
 
-        when(authorizationService.canManageServiceDefinition(any(), eq(serviceDefId))).thenReturn(true);
 
         log.debug("Act: PATCH /api/v1/services/{} with price=123.456 — must return 400", serviceDefId);
         mockMvc.perform(patch("/api/v1/services/" + serviceDefId)
@@ -2218,11 +2265,16 @@ class ServiceControllerTest {
                 .andExpect(status().isBadRequest());
     }
 
-    // ── PATCH /api/v1/services/{serviceDefId}/photo ────────────────────────────
+    // ── POST/DELETE /api/v1/services/{serviceDefId}/photo (Phase 342) ──────────
+
+    private static MockMultipartFile jpegPart() {
+        return new MockMultipartFile("file", "p.jpg", "image/jpeg",
+                new byte[] {(byte) 0xFF, (byte) 0xD8, (byte) 0xFF, (byte) 0xE0, 0, 0, 0, 0, 0, 0, 0, 0});
+    }
 
     @Test
-    @DisplayName("PATCH /services/{id}/photo — 200 when owner sets photo URL")
-    void should_return200_when_ownerSetsServicePhoto() throws Exception {
+    @DisplayName("POST /services/{id}/photo — 200 when owner uploads a photo")
+    void should_return200_when_ownerUploadsServicePhoto() throws Exception {
         var userId = UUID.randomUUID();
         var serviceDefId = UUID.randomUUID();
         var photoUrl = "https://pub-abc123.r2.dev/services/photo.jpg";
@@ -2230,83 +2282,114 @@ class ServiceControllerTest {
                 serviceDefId, "Manicure", null, null, 60, 10, true, null, null, null, photoUrl,
                 PriceType.FIXED, new BigDecimal("350.00"), null, "350 ₴", null);
 
-        when(authorizationService.canManageServiceDefinition(any(), eq(serviceDefId))).thenReturn(true);
-        when(serviceCatalogService.updateServicePhoto(eq(serviceDefId), eq(photoUrl)))
-                .thenReturn(stub);
+        when(mediaService.uploadServicePhoto(eq(userId), eq(serviceDefId), any())).thenReturn(stub);
 
-        log.debug("Act: PATCH /api/v1/services/{}/photo as SALON_OWNER — set photo URL", serviceDefId);
-        mockMvc.perform(patch("/api/v1/services/" + serviceDefId + "/photo")
+        mockMvc.perform(multipart("/api/v1/services/" + serviceDefId + "/photo").file(jpegPart())
                         .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
-                        .with(csrf())
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"photoUrl\":\"" + photoUrl + "\"}"))
+                        .with(csrf()))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.success").value(true))
                 .andExpect(jsonPath("$.data.photoUrl").value(photoUrl));
     }
 
     @Test
-    @DisplayName("PATCH /services/{id}/photo — 403 when a different owner tries to set photo")
-    void should_return403_when_nonOwnerSetsServicePhoto() throws Exception {
+    @DisplayName("POST /services/{id}/photo — 403 when caller may not manage the service (service-layer enforce throws ForbiddenException)")
+    void should_return403_when_nonOwnerUploadsServicePhoto() throws Exception {
         var userId = UUID.randomUUID();
         var serviceDefId = UUID.randomUUID();
+        when(mediaService.uploadServicePhoto(eq(userId), eq(serviceDefId), any()))
+                .thenThrow(new ForbiddenException("Access denied"));
 
-        when(authorizationService.canManageServiceDefinition(any(), eq(serviceDefId))).thenReturn(false);
-
-        log.debug("Act: PATCH /api/v1/services/{}/photo with wrong owner — must return 403", serviceDefId);
-        mockMvc.perform(patch("/api/v1/services/" + serviceDefId + "/photo")
+        mockMvc.perform(multipart("/api/v1/services/" + serviceDefId + "/photo").file(jpegPart())
                         .with(authenticatedAs(userId, "other@beautica.test", Role.SALON_OWNER))
-                        .with(csrf())
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"photoUrl\":\"https://example.com/photo.jpg\"}"))
+                        .with(csrf()))
+                .andExpect(status().isForbidden())
+                .andExpect(jsonPath("$.message").value("Access denied"));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @EnumSource(value = Role.class, names = {"CLIENT", "SALON_MASTER"})
+    @DisplayName("POST /services/{id}/photo — 403 at the role-only gate for a non-managing role; service never reached")
+    void should_return403_when_nonManagingRoleUploadsServicePhoto(Role role) throws Exception {
+        mockMvc.perform(multipart("/api/v1/services/" + UUID.randomUUID() + "/photo").file(jpegPart())
+                        .with(authenticatedAs(UUID.randomUUID(), "x@beautica.test", role))
+                        .with(csrf()))
                 .andExpect(status().isForbidden());
+
+        verifyNoInteractions(mediaService);
     }
 
     @Test
-    @DisplayName("PATCH /services/{id}/photo — 400 when photoUrl uses plain HTTP (not HTTPS)")
-    void should_return400_when_photoUrlIsNotHttps() throws Exception {
-        var userId = UUID.randomUUID();
-        var serviceDefId = UUID.randomUUID();
-
-        when(authorizationService.canManageServiceDefinition(any(), eq(serviceDefId))).thenReturn(true);
-
-        log.debug("Act: PATCH /api/v1/services/{}/photo with http:// URL — @Pattern must reject with 400", serviceDefId);
-        mockMvc.perform(patch("/api/v1/services/" + serviceDefId + "/photo")
-                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
-                        .with(csrf())
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"photoUrl\":\"http://insecure.example.com/photo.jpg\"}"))
-                .andExpect(status().isBadRequest());
-    }
-
-    @Test
-    @DisplayName("PATCH /services/{id}/photo — 400 when photoUrl is null")
-    void should_return400_when_photoUrlIsNull() throws Exception {
-        var userId = UUID.randomUUID();
-        var serviceDefId = UUID.randomUUID();
-
-        when(authorizationService.canManageServiceDefinition(any(), eq(serviceDefId))).thenReturn(true);
-
-        log.debug("Act: PATCH /api/v1/services/{}/photo with null photoUrl — @NotNull must reject with 400", serviceDefId);
-        mockMvc.perform(patch("/api/v1/services/" + serviceDefId + "/photo")
-                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
-                        .with(csrf())
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"photoUrl\":null}"))
-                .andExpect(status().isBadRequest());
-    }
-
-    @Test
-    @DisplayName("PATCH /services/{id}/photo — 401 when no Authorization header is present")
-    void should_return401_when_patchPhotoWithoutAuth() throws Exception {
-        var anyId = UUID.randomUUID();
-
-        log.debug("Act: PATCH /api/v1/services/{}/photo without Authorization header — must return 401", anyId);
-        mockMvc.perform(patch("/api/v1/services/" + anyId + "/photo")
-                        .with(csrf())
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"photoUrl\":\"https://example.com/photo.jpg\"}"))
+    @DisplayName("POST /services/{id}/photo — 401 without authentication")
+    void should_return401_when_uploadPhotoWithoutAuth() throws Exception {
+        mockMvc.perform(multipart("/api/v1/services/" + UUID.randomUUID() + "/photo").file(jpegPart())
+                        .with(csrf()))
                 .andExpect(status().isUnauthorized());
+    }
+
+    @Test
+    @DisplayName("POST /services/{id}/photo — 415 for a JSON body (multipart only)")
+    void should_return415_when_uploadPhotoIsJson() throws Exception {
+        var serviceDefId = UUID.randomUUID();
+
+        mockMvc.perform(post("/api/v1/services/" + serviceDefId + "/photo")
+                        .with(authenticatedAs(UUID.randomUUID(), "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"photoUrl\":\"https://example.com/p.jpg\"}"))
+                .andExpect(status().isUnsupportedMediaType());
+    }
+
+    @Test
+    @DisplayName("PATCH /services/{id}/photo — removed (405)")
+    void should_return405_when_patchPhoto() throws Exception {
+        var serviceDefId = UUID.randomUUID();
+
+        mockMvc.perform(patch("/api/v1/services/" + serviceDefId + "/photo")
+                        .with(authenticatedAs(UUID.randomUUID(), "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"photoUrl\":\"https://example.com/p.jpg\"}"))
+                .andExpect(status().isMethodNotAllowed());
+    }
+
+    @Test
+    @DisplayName("DELETE /services/{id}/photo — 204 when owner deletes the photo; service receives the owner's userId as actorId")
+    void should_return204_when_ownerDeletesServicePhoto() throws Exception {
+        var userId = UUID.randomUUID();
+        var serviceDefId = UUID.randomUUID();
+
+        mockMvc.perform(delete("/api/v1/services/" + serviceDefId + "/photo")
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf()))
+                .andExpect(status().isNoContent());
+        verify(mediaService).deleteServicePhoto(userId, serviceDefId);
+    }
+
+    @Test
+    @DisplayName("DELETE /services/{id}/photo — 403 when caller may not manage the service (service-layer enforce throws ForbiddenException)")
+    void should_return403_when_nonOwnerDeletesServicePhoto() throws Exception {
+        var userId = UUID.randomUUID();
+        var serviceDefId = UUID.randomUUID();
+        doThrow(new ForbiddenException("Access denied")).when(mediaService).deleteServicePhoto(userId, serviceDefId);
+
+        mockMvc.perform(delete("/api/v1/services/" + serviceDefId + "/photo")
+                        .with(authenticatedAs(userId, "other@beautica.test", Role.SALON_OWNER))
+                        .with(csrf()))
+                .andExpect(status().isForbidden())
+                .andExpect(jsonPath("$.message").value("Access denied"));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @EnumSource(value = Role.class, names = {"CLIENT", "SALON_MASTER"})
+    @DisplayName("DELETE /services/{id}/photo — 403 at the role-only gate for a non-managing role; service never reached")
+    void should_return403_when_nonManagingRoleDeletesServicePhoto(Role role) throws Exception {
+        mockMvc.perform(delete("/api/v1/services/" + UUID.randomUUID() + "/photo")
+                        .with(authenticatedAs(UUID.randomUUID(), "x@beautica.test", role))
+                        .with(csrf()))
+                .andExpect(status().isForbidden());
+
+        verifyNoInteractions(mediaService);
     }
 
     // ── MEDIUM-2: empty-string name guard ─────────────────────────────────────
@@ -2317,7 +2400,6 @@ class ServiceControllerTest {
         var userId = UUID.randomUUID();
         var serviceDefId = UUID.randomUUID();
 
-        when(authorizationService.canManageServiceDefinition(any(), eq(serviceDefId))).thenReturn(true);
 
         log.debug("Act: PATCH /api/v1/services/{} with name=\"\" — @Size(min=1) must reject with 400", serviceDefId);
         mockMvc.perform(patch("/api/v1/services/" + serviceDefId)
@@ -2325,42 +2407,6 @@ class ServiceControllerTest {
                         .with(csrf())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"name\":\"\"}"))
-                .andExpect(status().isBadRequest());
-    }
-
-    // ── MEDIUM-3: tightened photo URL pattern ─────────────────────────────────
-
-    @Test
-    @DisplayName("PATCH /services/{id}/photo — 400 when photoUrl is 'https:// ' (bare scheme with space, MEDIUM-3)")
-    void should_return400_when_photoUrlIsHttpsSpaceOnly() throws Exception {
-        var userId = UUID.randomUUID();
-        var serviceDefId = UUID.randomUUID();
-
-        when(authorizationService.canManageServiceDefinition(any(), eq(serviceDefId))).thenReturn(true);
-
-        log.debug("Act: PATCH /api/v1/services/{}/photo with photoUrl='https:// ' — @Pattern must reject with 400", serviceDefId);
-        mockMvc.perform(patch("/api/v1/services/" + serviceDefId + "/photo")
-                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
-                        .with(csrf())
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"photoUrl\":\"https:// \"}"))
-                .andExpect(status().isBadRequest());
-    }
-
-    @Test
-    @DisplayName("PATCH /services/{id}/photo — 400 when photoUrl has no host after scheme (MEDIUM-3)")
-    void should_return400_when_photoUrlHasNoHost() throws Exception {
-        var userId = UUID.randomUUID();
-        var serviceDefId = UUID.randomUUID();
-
-        when(authorizationService.canManageServiceDefinition(any(), eq(serviceDefId))).thenReturn(true);
-
-        log.debug("Act: PATCH /api/v1/services/{}/photo with photoUrl='https://' — @Pattern must reject with 400", serviceDefId);
-        mockMvc.perform(patch("/api/v1/services/" + serviceDefId + "/photo")
-                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
-                        .with(csrf())
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"photoUrl\":\"https://\"}"))
                 .andExpect(status().isBadRequest());
     }
 
@@ -2790,8 +2836,7 @@ class ServiceControllerTest {
         var request = new UpdateServiceDefinitionRequest(
                 null, null, null, null, null, null, null, null, null, UUID.randomUUID());
 
-        when(authorizationService.canManageServiceDefinition(any(), eq(serviceDefId))).thenReturn(true);
-        when(serviceCatalogService.updateServiceDefinition(eq(serviceDefId), any(UpdateServiceDefinitionRequest.class)))
+        when(serviceCatalogService.updateServiceDefinition(eq(userId), eq(serviceDefId), any(UpdateServiceDefinitionRequest.class)))
                 .thenThrow(new com.beautica.common.exception.DuplicateServiceException(
                         "Класичне нарощення", existingServiceDefId));
 
@@ -2847,7 +2892,7 @@ class ServiceControllerTest {
 
         when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
         when(authorizationService.masterBelongsToSalon(masterId, salonId)).thenReturn(true);
-        when(serviceCatalogService.assignServiceToMaster(eq(salonId), eq(masterId), any()))
+        when(serviceCatalogService.assignServiceToMaster(any(), eq(salonId), eq(masterId), any()))
                 .thenThrow(new com.beautica.common.exception.DuplicateServiceException(
                         "Манікюр", serviceDefId));
 
@@ -2876,7 +2921,7 @@ class ServiceControllerTest {
 
         when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
         when(authorizationService.masterBelongsToSalon(masterId, salonId)).thenReturn(true);
-        when(serviceCatalogService.assignServiceToMaster(eq(salonId), eq(masterId), any()))
+        when(serviceCatalogService.assignServiceToMaster(any(), eq(salonId), eq(masterId), any()))
                 .thenThrow(new com.beautica.common.exception.NotFoundException(
                         "Service definition not found: " + serviceDefId));
 

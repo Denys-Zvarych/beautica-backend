@@ -40,8 +40,8 @@ public interface ClientReviewRepository extends JpaRepository<ClientReview, UUID
      * to make, and folding an {@code actorId} in here would duplicate, in JPQL, the ownership rule
      * {@code AuthorizationService#filterBookingIdsWithProviderAuthority} owns, giving two
      * implementations that can drift — the rule now lives in
-     * {@code AuthorizationService#isPerformingMasterOfBooking} (Phase 320: only the booking's
-     * performing master may review its client). It is safe ONLY because <b>every</b> caller passes
+     * {@code AuthorizationService#canProviderReviewClient} (Phase 355: the booking's salon
+     * owner/admin, or the independent master on their own booking). It is safe ONLY because <b>every</b> caller passes
      * ids already narrowed to bookings the actor holds provider authority over, and skips the call
      * when that set is empty. There are TWO, not one:
      * <ul>

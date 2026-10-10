@@ -17,6 +17,8 @@ import com.beautica.auth.phoneotp.GuestTokenProvider;
 import com.beautica.config.BookingSmsProperties;
 import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
+import com.beautica.notification.inapp.entity.InAppNotificationType;
+import com.beautica.notification.inapp.service.InAppNotificationService;
 import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.ServiceDefinition;
@@ -71,6 +73,9 @@ public class GuestBookingService {
     private final VisitPlanner visitPlanner;
     private final String frontendBaseUrl;
     private final Clock kyivClock;
+    // Phase 333 — see InAppNotificationService's class javadoc for why this is a separate seam from
+    // outboxService, never called from it.
+    private final InAppNotificationService inAppNotificationService;
 
     public GuestBookingService(
             GuestTokenProvider guestTokenProvider,
@@ -85,7 +90,8 @@ public class GuestBookingService {
             SalonCatalogCacheEvictor salonCatalogCacheEvictor,
             VisitPlanner visitPlanner,
             @Value("${app.frontend.base-url}") String frontendBaseUrl,
-            Clock clock) {
+            Clock clock,
+            InAppNotificationService inAppNotificationService) {
         this.guestTokenProvider = guestTokenProvider;
         this.masterRepository = masterRepository;
         this.masterServiceRepository = masterServiceRepository;
@@ -99,6 +105,7 @@ public class GuestBookingService {
         this.visitPlanner = visitPlanner;
         this.frontendBaseUrl = frontendBaseUrl;
         this.kyivClock = clock.withZone(TimeZones.KYIV);
+        this.inAppNotificationService = inAppNotificationService;
     }
 
     /**
@@ -223,6 +230,11 @@ public class GuestBookingService {
         Booking saved = persistBooking(master, msa, req, guestPhone);
 
         outboxService.enqueueNewBooking(saved.getId());
+        // Phase 333, matrix row 1 — provider set (owner + admins + performing master); the guest has
+        // no user account, so there is no actor to exclude (null is a safe Set#remove no-op). `saved`
+        // carries the real `master`/`salon` instances persistBooking built — never reloaded
+        // (audit-fix cycle 1, finding 1).
+        inAppNotificationService.notifyBookingEvent(InAppNotificationType.BOOKING_CREATED, saved, null);
 
         String cancelUrl = buildCancelUrl(saved.getCancelToken().toString());
         registerAfterCommit(master, msa, saved, guestPhone, cancelUrl);
@@ -299,6 +311,11 @@ public class GuestBookingService {
 
         // EXACTLY ONE new-visit notification (referencing the first item — never one per service).
         outboxService.enqueueNewBooking(saved.get(0).getId());
+        // Phase 333, matrix row 1 — provider set; no actor (guest, no user account). `saved.get(0)`
+        // carries the real `master`/`salon` instances built above — never reloaded (audit-fix
+        // cycle 1, finding 1).
+        inAppNotificationService.notifyVisitEvent(
+                InAppNotificationType.BOOKING_CREATED, appointment.getId(), saved.get(0), null);
 
         String cancelUrl = buildCancelUrl(cancelToken.toString());
         registerVisitAfterCommit(master, items, saved.get(0), guestPhone, cancelUrl);
@@ -346,7 +363,8 @@ public class GuestBookingService {
         // lock/overlap/save sequence instead of becoming a third copy of it. Byte-for-byte the same
         // repository calls, the same 409 message and the same DataIntegrityViolationException
         // translation this method has always made — see that class's Javadoc.
-        BookingSlotLockGuard.lockMasterAndAssertFree(bookingRepository, master.getId(), startsAt, endsAt);
+        BookingSlotLockGuard.lockMasterAndAssertFree(
+                bookingRepository, master.getId(), startsAt, endsAt);
 
         // Freeze the RANGE ceiling beside the floor (V119), by the same rule and at the same
         // moment as the registered-client path (BookingService#doCreateBooking). Null = single

@@ -166,6 +166,20 @@ public class ServiceDefinition extends AuditableEntity {
     private String photoUrl;
 
     /**
+     * R2 object key of the uploaded service photo (Phase 342). Internal only — never exposed in a DTO.
+     * Null for services without a photo and for legacy rows whose {@code photoUrl} was set before the
+     * upload endpoint existed (no key is known for those, so no blob is ever deleted for them).
+     *
+     * <p><b>External-storage cleanup contract (§O8).</b> Service definitions are soft-deleted
+     * (deactivated), never hard-deleted, so no {@code ON DELETE CASCADE} drops this pointer. Every path
+     * that deactivates a definition (service delete, salon delete, independent-master self-delete) must
+     * pre-read the key, null the pointers and delete the blob after commit via {@code
+     * ServicePhotoBlobPurger}.
+     */
+    @Column(name = "photo_r2_key", length = 500)
+    private String photoR2Key;
+
+    /**
      * The finer service taxonomy (the column service-type search filters on). Mandatory on
      * every creation path — DB column {@code service_type_id} is NOT NULL with an
      * {@code ON DELETE RESTRICT} FK (V111), so an untyped service can never be persisted and a

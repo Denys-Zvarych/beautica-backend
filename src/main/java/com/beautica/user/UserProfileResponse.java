@@ -62,16 +62,15 @@ public record UserProfileResponse(
 
         /**
          * Whether the signed-in user currently has an <em>active</em> master row of type
-         * {@code SALON_OWNER} — i.e. the state of the owner's «Я також працюю як майстер»
-         * toggle (Phase 265). Derived on every read from the row itself; there is deliberately
-         * no {@code has_master_profile} column and no migration, because the toggle is the row
-         * and a column would be a second source of truth that drifts the moment either of
-         * {@code POST}/{@code DELETE /api/v1/salons/&#123;salonId&#125;/master} is touched.
+         * {@code SALON_OWNER} (Phase 265). Derived on every read from the row itself; there is
+         * deliberately no {@code has_master_profile} column.
          *
-         * <p>Defaults to ON in practice: {@code SalonService.createSalon} auto-creates the
-         * owner-master row on first-salon registration, so every owner registered to date reads
-         * {@code true}. A client that assumes {@code false} until proven otherwise will show
-         * existing owners an unchecked box describing a state they are not in.
+         * <p><b>Always {@code true} for the owner of a live salon (Phase 346).</b> The owner is
+         * always a master of their salon: {@code SalonService.createSalon} creates the active
+         * owner-master row, the Phase 12.4 {@code POST}/{@code DELETE
+         * /api/v1/salons/&#123;salonId&#125;/master} toggle was removed, and Flyway V192
+         * reactivated any stray inactive owner row on a live salon. The field is kept for
+         * contract compatibility; its removal is a later backlog item.
          *
          * <p>{@code false} for every non-{@code SALON_OWNER} role — a {@code CLIENT} or a
          * {@code SALON_ADMIN} has no owner-master row by construction, and an
@@ -81,7 +80,7 @@ public record UserProfileResponse(
          * by {@code GET /api/v1/masters/me}, which Phase 265 widened to {@code SALON_OWNER} and
          * which already carries {@code bio}, {@code avgRating}, {@code reviewCount},
          * {@code professionalTitle} and {@code avatarUrl}. The boolean exists so the app does not
-         * fire that call speculatively and take a 404 for an owner who has opted out.
+         * fire that call speculatively and take a 404 for a user with no owner-master row.
          */
         boolean hasMasterProfile,
 
@@ -103,7 +102,19 @@ public record UserProfileResponse(
          */
         @Schema(types = {"string", "null"}, nullable = true, description = "Bare hromada adjective of the saved settlement, "
                 + "populated only when its name is ambiguous within its oblast; null otherwise.")
-        String cityHromadaNameUk
+        String cityHromadaNameUk,
+
+        /**
+         * The caller's own avatar — {@code users.avatar_url} (Phase 344). {@code null} when no
+         * avatar is set. Read off the same {@code users} row as every other field here, so no
+         * extra query. Written ONLY by {@code POST/DELETE /api/v1/media/avatar}, which take the
+         * target from the JWT and nothing else — a personal avatar is self-only for every role.
+         * {@code PATCH /users/me} deliberately does not accept it ({@link UpdateProfileRequest}
+         * carries no such field).
+         */
+        @Schema(types = {"string", "null"}, nullable = true, description = "The caller's own avatar "
+                + "URL (https); null when no avatar is set. Written only via /api/v1/media/avatar.")
+        String avatarUrl
 ) {
 
     // NOTE — there is deliberately NO `from(User)` convenience overload.
@@ -163,7 +174,8 @@ public record UserProfileResponse(
                 user.getSalonId(),
                 hasMasterProfile,
                 settlement == null ? null : settlement.settlementType(),
-                settlement == null ? null : settlement.hromadaNameUk()
+                settlement == null ? null : settlement.hromadaNameUk(),
+                user.getAvatarUrl()
         );
     }
 }

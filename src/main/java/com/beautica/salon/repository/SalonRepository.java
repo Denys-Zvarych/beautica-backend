@@ -4,9 +4,12 @@ import com.beautica.salon.dto.SiblingSalonOption;
 import com.beautica.salon.entity.Salon;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
+import jakarta.persistence.QueryHint;
+import org.hibernate.jpa.HibernateHints;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.jpa.repository.QueryHints;
 import org.springframework.data.repository.query.Param;
 
 import java.util.Collection;
@@ -72,6 +75,22 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
     @Query("SELECT s.id FROM Salon s WHERE s.owner.id = :ownerId AND s.isActive = true")
     List<UUID> findIdsByOwnerIdAndIsActiveTrue(@Param("ownerId") UUID ownerId);
 
+    /** One (owner, active salon) pair — the projection of {@link #findOwnedActiveSalonPairs}. */
+    interface OwnerSalonPair {
+        UUID getOwnerId();
+
+        UUID getSalonId();
+    }
+
+    /**
+     * Batch sibling of {@link #findIdsByOwnerIdAndIsActiveTrue}: the active salons of EVERY owner in
+     * {@code ownerIds} in ONE statement (same predicate), for the push drain's multi-recipient
+     * assemble. Owners with no active salon simply contribute no pair.
+     */
+    @Query("SELECT s.owner.id AS ownerId, s.id AS salonId FROM Salon s "
+            + "WHERE s.owner.id IN :ownerIds AND s.isActive = true")
+    List<OwnerSalonPair> findOwnedActiveSalonPairs(@Param("ownerIds") Collection<UUID> ownerIds);
+
     /**
      * "Is {@code id} a salon owned by {@code ownerId}?" — the hottest authorization predicate in
      * the application: every {@code @PreAuthorize("@authz.canManageSalon(...)")} endpoint reaches
@@ -114,13 +133,9 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
      * caller de-duplicates the page's salon ids first, and a page with no salon-employed master
      * skips the call entirely.
      *
-     * <p><b>Phase 320 — currently has NO production caller.</b> Its only one was
+     * <p><b>Phase 355 — caller restored:</b>
      * {@code AuthorizationService#filterBookingIdsWithProviderAuthority}, the page-scoped batched
-     * provider-authority filter behind the {@code providerCanReviewClient} listing flag. That flag
-     * is now the single term {@code AuthorizationService#isPerformingMasterOfBooking} (only the
-     * performing master may review the client), so the filter — and with it this query's caller —
-     * was deleted. Kept, with its {@code SalonRepositoryTest} coverage, as the ready-made batched
-     * form for the next page-scoped ownership question; delete it if none arrives.
+     * provider-authority filter behind the {@code providerCanReviewClient} listing flag.
      *
      * <p><b>Deliberately carries no {@code isActive} predicate</b>, unlike
      * {@link #findIdsByOwnerIdAndIsActiveTrue}. The per-row predicate this batches — the
@@ -192,8 +207,8 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
      *
      * <p><b>Constructor projection, not an entity (Perf LOW-B).</b> Returning {@code Salon} made
      * Hibernate select all 22 {@code salons} columns and hydrate one managed entity per row just to
-     * build a 4-field {@code SiblingSalonOption}. {@code SELECT new …} emits exactly the four
-     * columns the DTO carries and hydrates nothing into the persistence context, so this finder is
+     * build a 5-field {@code SiblingSalonOption}. {@code SELECT new …} emits exactly the five
+     * columns the DTO carries ({@code avatar_url} included, {@code avatar_r2_key} never) and hydrates nothing into the persistence context, so this finder is
      * structurally incapable of dragging an association (or a widened row) back in — see
      * {@code SalonSiblingProjectionShapeIT}.
      *
@@ -206,7 +221,8 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
      * path; it only narrows the heap fetch.
      */
     @Query("""
-            SELECT new com.beautica.salon.dto.SiblingSalonOption(s.id, s.name, s.street, s.buildingNo)
+            SELECT new com.beautica.salon.dto.SiblingSalonOption(
+                    s.id, s.name, s.street, s.buildingNo, s.avatarUrl)
             FROM Salon s
             WHERE s.isActive = true
               AND s.id <> :salonId
@@ -248,9 +264,93 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
      * sweep (D8) — so this is its own tiny transaction, not a mutation the caller's {@code @Transactional}
      * boundary covers.
      */
+    /*
+     * Phase 343: also nulls both R2-key columns (V189). Native, because the four image columns are
+     * updatable = false on the entity (see Salon's image field block) — the targeted native statements
+     * in this file are their only writers.
+     */
     @Modifying
-    @Query("UPDATE Salon s SET s.avatarUrl = null, s.coverImageUrl = null WHERE s.id = :salonId")
+    @QueryHints(@QueryHint(name = HibernateHints.HINT_NATIVE_SPACES, value = "salons"))
+    @Query(value = """
+            UPDATE salons
+            SET avatar_url = NULL, avatar_r2_key = NULL, cover_image_url = NULL, cover_r2_key = NULL
+            WHERE id = :salonId
+            """, nativeQuery = true)
     int nullImageUrls(@Param("salonId") UUID salonId);
+
+    /**
+     * Phase 343 read-gate in ONE statement: the salon's {@code is_active} flag, present only when
+     * {@code ownerId} owns it. Empty = not the owner (or no such salon) → 403; {@code false} = owned but
+     * deactivated → 404 — the same 403-before-404 order as the locked re-check.
+     */
+    @Query("SELECT s.isActive FROM Salon s WHERE s.id = :salonId AND s.owner.id = :ownerId")
+    Optional<Boolean> findIsActiveByIdAndOwnerId(@Param("salonId") UUID salonId, @Param("ownerId") UUID ownerId);
+
+    /**
+     * Row-locks a salon for the Phase 343 logo/cover write, so two concurrent uploads/deletes — or an upload
+     * and {@code deactivateSalon} (whose {@code is_active} UPDATE takes the same lock) — serialise and each
+     * reads the pointer the other committed.
+     *
+     * <p><b>{@code FOR NO KEY UPDATE}, never {@code FOR UPDATE} / {@code PESSIMISTIC_WRITE}</b> (perf audit
+     * cycle 1). {@code FOR UPDATE} conflicts with the {@code FOR KEY SHARE} every FK check takes on the
+     * referenced row, so it would stall each concurrent booking/appointment/review/notification insert that
+     * references this salon for as long as the upload transaction holds the lock. {@code NO KEY UPDATE} still
+     * conflicts with itself (and with a plain non-key {@code UPDATE}), which is all the serialisation needs.
+     * Pinned by {@code SalonImageIT#should_notBlockAppointmentInsert_when_uploadHoldsSalonLock}.
+     *
+     * <p><b>3s {@code lock_timeout}, fused into the same round trip</b> — the
+     * {@code set_config('lock_timeout', '3s', true)} shape of {@code BookingRepository
+     * #acquireAdvisoryLockWithTimeout} (transaction-scoped, reset at commit/rollback). A wait beyond it fails
+     * with {@code 55P03} → {@code CannotAcquireLockException} → 409 via
+     * {@code GlobalExceptionHandler#handlePessimisticLockingFailure}. The one-row config subquery is joined,
+     * so it is evaluated before {@code LockRows} attempts the row lock ({@code FOR NO KEY UPDATE OF s} locks
+     * only the salon row).
+     */
+    @QueryHints(@QueryHint(name = HibernateHints.HINT_NATIVE_SPACES, value = "salons"))
+    @Query(value = """
+            SELECT s.* FROM salons s
+            CROSS JOIN (SELECT set_config('lock_timeout', '3s', true)) lock_cfg
+            WHERE s.id = :salonId
+            FOR NO KEY UPDATE OF s
+            """, nativeQuery = true)
+    Optional<Salon> findByIdForUpdate(@Param("salonId") UUID salonId);
+
+    /** Phase 343 — persists the logo pointers. Caller holds the {@link #findByIdForUpdate} lock. */
+    @Modifying
+    @QueryHints(@QueryHint(name = HibernateHints.HINT_NATIVE_SPACES, value = "salons"))
+    @Query(value = "UPDATE salons SET avatar_url = :url, avatar_r2_key = :r2Key WHERE id = :salonId",
+            nativeQuery = true)
+    int writeLogoPointers(@Param("salonId") UUID salonId, @Param("url") String url, @Param("r2Key") String r2Key);
+
+    /** Phase 343 — persists the cover pointers. Caller holds the {@link #findByIdForUpdate} lock. */
+    @Modifying
+    @QueryHints(@QueryHint(name = HibernateHints.HINT_NATIVE_SPACES, value = "salons"))
+    @Query(value = "UPDATE salons SET cover_image_url = :url, cover_r2_key = :r2Key WHERE id = :salonId",
+            nativeQuery = true)
+    int writeCoverPointers(@Param("salonId") UUID salonId, @Param("url") String url, @Param("r2Key") String r2Key);
+
+    /**
+     * Row-locks the salon and returns its CURRENT image pointers (Phase 343 D8) — {@code deactivateSalon}'s
+     * pre-read for the after-commit R2 purge. A plain entity read would return the persistence context's
+     * snapshot, which a logo/cover upload committed in between could have superseded (its new blob would then
+     * be orphaned); the locking read waits for that upload and reads what it committed, and any later upload
+     * blocks until the deletion commits, then finds the salon inactive (404, new blob discarded).
+     *
+     * <p>{@code FOR NO KEY UPDATE}, the lock {@code deactivateSalon} already held before Phase 343 via its
+     * non-key {@code is_active} UPDATE (auto-flushed just before this query by the declared query space) —
+     * so this read adds no lock strength and FK inserts referencing the salon are never blocked by it. No
+     * {@code lock_timeout} here: the deletion's own 30s transaction timeout bounds it, unchanged since pre-343.
+     * Query space declared so Hibernate auto-flushes only pending {@code salons} changes (perf P-L3).
+     */
+    @QueryHints(@QueryHint(name = HibernateHints.HINT_NATIVE_SPACES, value = "salons"))
+    @Query(value = """
+            SELECT s.avatar_url AS "avatarUrl", s.avatar_r2_key AS "avatarR2Key",
+                   s.cover_image_url AS "coverImageUrl", s.cover_r2_key AS "coverR2Key"
+            FROM salons s
+            WHERE s.id = :salonId
+            FOR NO KEY UPDATE
+            """, nativeQuery = true)
+    Optional<SalonImagePointers> lockImagePointers(@Param("salonId") UUID salonId);
 
     // True iff the given owner already has at least one salon (primary or not).
     // Used in SalonService.createSalon to decide is_primary = true/false.
@@ -345,7 +445,6 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
      */
     @Query(value = SalonSearchSql.STATIC_PROJECTION_HEAD
             + SalonSearchSql.STATIC_DISTRICT_PREDICATE
-            + SalonSearchSql.STATIC_CATEGORY_GATE
             + SalonSearchSql.STATIC_Q_GROUP_PREDICATE
             + SalonSearchSql.STATIC_PRICE_PREDICATE
             + SalonSearchSql.STATIC_ORDER_LIMIT_TAIL
@@ -364,7 +463,8 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
             @Param("maxPrice") java.math.BigDecimal maxPrice,
             @Param("sortMode") String sortMode,
             @Param("limit") int limit,
-            @Param("offset") long offset
+            @Param("offset") long offset,
+            @Param(com.beautica.master.repository.MasterBookabilitySql.TODAY_PARAM) java.time.LocalDate today
     );
 
     /**
@@ -386,7 +486,6 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
      */
     @Query(value = SalonSearchSql.STATIC_PROJECTION_HEAD
             + SalonSearchSql.STATIC_DISTRICT_PREDICATE
-            + SalonSearchSql.STATIC_CATEGORY_GATE
             + SalonSearchSql.STATIC_Q_GROUP_PREDICATE
             + SalonSearchSql.STATIC_ORDER_LIMIT_TAIL
             + SalonSearchSql.STATIC_NAME_PREVIEW_LATERAL
@@ -402,7 +501,8 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
             @Param("q3") String q3,
             @Param("sortMode") String sortMode,
             @Param("limit") int limit,
-            @Param("offset") long offset
+            @Param("offset") long offset,
+            @Param(com.beautica.master.repository.MasterBookabilitySql.TODAY_PARAM) java.time.LocalDate today
     );
 
     /**
@@ -444,7 +544,6 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
      */
     @Query(value = SalonSearchSql.STATIC_PROJECTION_HEAD
             + SalonSearchSql.STATIC_CITY_PREDICATE
-            + SalonSearchSql.STATIC_CATEGORY_GATE
             + SalonSearchSql.STATIC_Q_GROUP_PREDICATE
             + SalonSearchSql.STATIC_PRICE_PREDICATE
             + SalonSearchSql.STATIC_ORDER_LIMIT_TAIL
@@ -463,7 +562,8 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
             @Param("maxPrice") java.math.BigDecimal maxPrice,
             @Param("sortMode") String sortMode,
             @Param("limit") int limit,
-            @Param("offset") long offset
+            @Param("offset") long offset,
+            @Param(com.beautica.master.repository.MasterBookabilitySql.TODAY_PARAM) java.time.LocalDate today
     );
 
     /**
@@ -477,7 +577,6 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
      */
     @Query(value = SalonSearchSql.STATIC_PROJECTION_HEAD
             + SalonSearchSql.STATIC_CITY_PREDICATE
-            + SalonSearchSql.STATIC_CATEGORY_GATE
             + SalonSearchSql.STATIC_Q_GROUP_PREDICATE
             + SalonSearchSql.STATIC_ORDER_LIMIT_TAIL
             + SalonSearchSql.STATIC_NAME_PREVIEW_LATERAL
@@ -493,7 +592,8 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
             @Param("q3") String q3,
             @Param("sortMode") String sortMode,
             @Param("limit") int limit,
-            @Param("offset") long offset
+            @Param("offset") long offset,
+            @Param(com.beautica.master.repository.MasterBookabilitySql.TODAY_PARAM) java.time.LocalDate today
     );
 
     /**
@@ -521,7 +621,6 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
      * <p>Used exclusively by {@link SearchService#findSalonsByLocation}.
      */
     @Query(value = SalonSearchSql.STATIC_PROJECTION_HEAD
-            + SalonSearchSql.STATIC_CATEGORY_GATE
             + SalonSearchSql.STATIC_Q_GROUP_PREDICATE
             + SalonSearchSql.STATIC_PRICE_PREDICATE
             + SalonSearchSql.STATIC_ORDER_LIMIT_TAIL
@@ -539,7 +638,8 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
             @Param("category") String category,
             @Param("sortMode") String sortMode,
             @Param("limit") int limit,
-            @Param("offset") long offset
+            @Param("offset") long offset,
+            @Param(com.beautica.master.repository.MasterBookabilitySql.TODAY_PARAM) java.time.LocalDate today
     );
 
     /**
@@ -550,7 +650,6 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
      * both price bounds are null and no locality filter was supplied.
      */
     @Query(value = SalonSearchSql.STATIC_PROJECTION_HEAD
-            + SalonSearchSql.STATIC_CATEGORY_GATE
             + SalonSearchSql.STATIC_Q_GROUP_PREDICATE
             + SalonSearchSql.STATIC_ORDER_LIMIT_TAIL
             + SalonSearchSql.STATIC_NAME_PREVIEW_LATERAL
@@ -565,6 +664,7 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
             @Param("category") String category,
             @Param("sortMode") String sortMode,
             @Param("limit") int limit,
-            @Param("offset") long offset
+            @Param("offset") long offset,
+            @Param(com.beautica.master.repository.MasterBookabilitySql.TODAY_PARAM) java.time.LocalDate today
     );
 }

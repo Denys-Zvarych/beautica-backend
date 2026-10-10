@@ -125,13 +125,9 @@ class ReviewLoopIT extends AbstractIntegrationTest {
                 .as("review email must carry the booking-scoped review deep link")
                 .isEqualTo(FRONTEND_BASE + "/bookings/" + bookingId + "/review");
 
-        ArgumentCaptor<Map<String, String>> pushData = ArgumentCaptor.forClass(Map.class);
-        verify(pushService, times(1))
-                .sendToUser(eq(clientId), anyString(), anyString(), pushData.capture());
-        assertThat(pushData.getValue())
-                .as("push payload must target the client with a REVIEW_REQUESTED type + bookingId")
-                .containsEntry("type", "REVIEW_REQUESTED")
-                .containsEntry("bookingId", bookingId.toString());
+        // Phase 339: the legacy REVIEW_REQUESTED push leg is gone — push now comes only from the
+        // in-app write path (INAPP_PUSH, FIREBASE_ENABLED=false here), so draining sends none.
+        verify(pushService, never()).sendToDevices(any(), any(), anyString(), anyString(), any());
     }
 
     @Test

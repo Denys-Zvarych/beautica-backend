@@ -6,6 +6,7 @@ import com.beautica.auth.dto.InviteRequest;
 import com.beautica.common.exception.EmailAlreadyRegisteredException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.master.service.MasterService;
+import com.beautica.notification.inapp.service.InAppNotificationService;
 import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.user.InviteToken;
@@ -70,6 +71,9 @@ class InviteServiceAdminTest {
     @Mock
     private AuthResponseBuilder authResponseBuilder;
 
+    @Mock
+    private InAppNotificationService inAppNotificationService;
+
     private InviteService inviteService;
 
     @BeforeEach
@@ -86,7 +90,8 @@ class InviteServiceAdminTest {
                 invitePersistenceService,
                 "http://localhost:3000",
                 48L,
-                Clock.systemUTC()
+                Clock.systemUTC(),
+                inAppNotificationService
         );
     }
 

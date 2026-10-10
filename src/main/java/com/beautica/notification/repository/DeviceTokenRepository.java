@@ -29,14 +29,52 @@ public interface DeviceTokenRepository extends JpaRepository<DeviceToken, UUID> 
     List<DeviceToken> findByUserIdAndIsActiveTrue(UUID userId);
 
     /**
-     * Idempotency pre-check for POST /api/v1/devices/token.
-     * Backed by the UNIQUE (user_id, token) index from the V29 migration —
-     * an index-only scan that avoids the JPA persistence-context allocation
-     * of {@code findByUserIdAndToken}.
+     * Phase 339 (D10) — atomically registers {@code token} for {@code userId}: inserts it, or, when
+     * the token already exists under ANY user (a shared device switching accounts) or is inactive,
+     * rebinds it to the caller, refreshes {@code platform} and re-activates it. One statement, so two
+     * concurrent registrations of the same token can never interleave a reassign/exists/save sequence
+     * (no lost update, no unique-violation 500).
+     *
+     * <p>{@code ON CONFLICT (token)} is the governing arbiter: {@code ux_device_tokens_token} (V185)
+     * makes the token globally unique. V29's redundant {@code UNIQUE (user_id, token)} is dropped by
+     * V186 — while it existed it could fire before the arbiter on a same-user concurrent upsert. Repeating
+     * the call for the same owner is idempotent (one row, same owner).
+     *
+     * @return the number of rows written (always 1 — inserted or updated)
      */
-    boolean existsByUserIdAndToken(UUID userId, String token);
+    @Modifying
+    @Query(value = """
+            INSERT INTO device_tokens (id, user_id, token, platform, is_active)
+            VALUES (gen_random_uuid(), :userId, :token, :platform, true)
+            ON CONFLICT (token) DO UPDATE
+               SET user_id = EXCLUDED.user_id,
+                   platform = EXCLUDED.platform,
+                   is_active = true,
+                   updated_at = now()
+            """, nativeQuery = true)
+    int upsertToken(@Param("token") String token, @Param("userId") UUID userId,
+                    @Param("platform") String platform);
 
-    @Query("SELECT dt.id AS id, dt.token AS token FROM DeviceToken dt WHERE dt.user.id = :userId AND dt.isActive = true")
+    /** A token row plus its owner — the batch lookup's projection (phase 339 drain pre-load). */
+    interface UserDeviceToken extends DeviceTokenSummary {
+        UUID getUserId();
+    }
+
+    /**
+     * Phase 339 — active tokens of EVERY user in {@code userIds} in one statement, for the outbox
+     * drainer's pre-load block (one query per batch instead of one per push). Backed by
+     * {@code idx_device_tokens_user_active}.
+     */
+    @Query("SELECT dt.id AS id, dt.token AS token, dt.user.id AS userId FROM DeviceToken dt "
+            + "WHERE dt.user.id IN :userIds AND dt.isActive = true")
+    List<UserDeviceToken> findActiveTokensByUserIdIn(@Param("userIds") Collection<UUID> userIds);
+
+    /**
+     * The user's ACTIVE tokens, and none at all when the USER is deactivated — the push ownership
+     * re-check relies on this so an account deactivated between prepare and send gets no push.
+     */
+    @Query("SELECT dt.id AS id, dt.token AS token FROM DeviceToken dt "
+            + "WHERE dt.user.id = :userId AND dt.isActive = true AND dt.user.isActive = true")
     List<DeviceTokenSummary> findActiveTokenSummaryByUserId(@Param("userId") java.util.UUID userId);
 
     @Transactional

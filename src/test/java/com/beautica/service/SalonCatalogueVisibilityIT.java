@@ -62,7 +62,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <h2>REUSE-FIRST</h2>
  * Built on the same {@link ServiceTestFixtures} harness as {@code BulkServiceSetupIntegrationTest}
  * and {@code ServiceCatalogFavoriteCacheIT} — {@code createSalonMaster}, {@code seedUsableSchedule},
- * {@code enableOwnerAsMaster}, {@code insertActiveDefinitionWithoutAssignment} and
+ * {@code ownerMasterId}, {@code insertActiveDefinitionWithoutAssignment} and
  * {@code applyV164Backfill} are all shared fixture methods (the last three promoted here from
  * {@code BulkServiceSetupIntegrationTest} so this class's case 12 reuses the exact V164 recipe
  * Phase 303 already established, rather than re-deriving it).
@@ -381,7 +381,7 @@ class SalonCatalogueVisibilityIT extends AbstractIntegrationTest {
         String ownerToken = fixtures.createSalonOwnerAndGetToken(
                 "owner-305-c10-" + System.nanoTime() + "@beautica.test");
         UUID salonId = fixtures.createSalon(ownerToken, "Phase 305 Case 10 Salon");
-        UUID ownerMasterId = fixtures.enableOwnerAsMaster(ownerToken, salonId);
+        UUID ownerMasterId = fixtures.ownerMasterId(salonId);
         fixtures.seedUsableSchedule(ownerMasterId);
 
         Assignment assignment = bulkCreateOneService(ownerToken, salonId, ownerMasterId, seededTypes.get(0).id());

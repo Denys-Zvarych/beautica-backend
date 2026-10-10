@@ -109,7 +109,7 @@ class SalonServiceRemoveMasterTest {
         UUID salonId = UUID.randomUUID();
         UUID masterId = UUID.randomUUID();
         // Deliberately NOT MasterType.SALON_OWNER — that would be caught by the earlier D6 guard
-        // first, which is exactly the "guards 2 and 5 would have to be reordered" scenario this
+        // first, which is exactly the "guards 3 and 5 would have to be reordered" scenario this
         // test exists to catch.
         Master master = buildAttachedMaster(masterId, MasterType.SALON_MASTER, salonId, actorId);
 
@@ -147,6 +147,48 @@ class SalonServiceRemoveMasterTest {
                 .isInstanceOf(BusinessException.class)
                 .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
                         .isEqualTo(HttpStatus.CONFLICT));
+
+        verifyNoInteractions(staffClientReferenceAuditService, bookingService);
+        verify(masterService, never()).deactivateMaster(any(), any(Master.class));
+    }
+
+    @Test
+    @DisplayName("Phase 346: throws 409 CONFLICT with the permanent-row message when the target is the "
+            + "salon owner's own SALON_OWNER master row")
+    void should_throwConflictWithPermanentRowMessage_when_masterTypeIsSalonOwner() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        Master master = buildAttachedMaster(masterId, MasterType.SALON_OWNER, salonId, actorId);
+
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
+
+        assertThatThrownBy(() -> salonService.removeMaster(actorId, salonId, masterId))
+                .isInstanceOf(BusinessException.class)
+                .hasMessage("The salon owner's master profile cannot be removed")
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
+                        .isEqualTo(HttpStatus.CONFLICT));
+
+        verifyNoInteractions(staffClientReferenceAuditService, bookingService);
+        verify(masterService, never()).deactivateMaster(any(), any(Master.class));
+    }
+
+    @Test
+    @DisplayName("Phase 346: another salon's SALON_OWNER row yields the membership 403, never the "
+            + "type-revealing 409 — membership is checked before master type")
+    void should_throwForbidden_when_targetIsOwnerMasterRowOfAnotherSalon() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        Master foreignOwnerMaster = buildAttachedMaster(masterId, MasterType.SALON_OWNER,
+                UUID.randomUUID(), UUID.randomUUID());
+
+        when(masterRepository.findByIdWithUserAndSalon(masterId))
+                .thenReturn(Optional.of(foreignOwnerMaster));
+
+        assertThatThrownBy(() -> salonService.removeMaster(actorId, salonId, masterId))
+                .isInstanceOf(ForbiddenException.class)
+                .hasMessage("Master does not belong to this salon");
 
         verifyNoInteractions(staffClientReferenceAuditService, bookingService);
         verify(masterService, never()).deactivateMaster(any(), any(Master.class));

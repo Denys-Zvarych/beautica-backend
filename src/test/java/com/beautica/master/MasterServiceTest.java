@@ -18,6 +18,7 @@ import com.beautica.master.entity.MasterType;
 import com.beautica.master.entity.WorkingHours;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.master.repository.WorkingHoursRepository;
+import com.beautica.master.service.ScheduleDateMath;
 import com.beautica.master.service.MasterService;
 import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
@@ -47,6 +48,7 @@ import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.math.BigDecimal;
+import java.time.LocalDate;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.OffsetDateTime;
@@ -94,6 +96,8 @@ class MasterServiceTest {
     // afterCommit eviction callback NPEs the instant any deactivate/reactivate path is replayed
     // under an active transaction synchronization (see should_evict* guard tests below).
     @Mock private com.beautica.booking.service.SlotCalculationService slotCalculationService;
+    // Public-roster gate (getMastersByPage) binds :bookableToday from the app-clock Kyiv date.
+    @Mock private ScheduleDateMath scheduleDateMath;
     @Mock private com.beautica.service.service.SalonCatalogCacheEvictor salonCatalogCacheEvictor;
     // Prefix-eviction fix: the master-calendar / available-slots afterCommit callbacks now delegate to
     // the shared evictor, so @InjectMocks must have one to wire or every deactivate/reactivate path
@@ -123,6 +127,9 @@ class MasterServiceTest {
     // return null from #instant() and NPE) — the exact instant is irrelevant to every test in
     // this class, none of which assert on awaitingClosure.
     @Spy private Clock clock = Clock.systemUTC();
+
+    // Phase 345 audit — upsertWorkingHours re-proves enforceCanManageMasterSchedule on the loaded row.
+    @Mock private com.beautica.common.security.AuthorizationService authorizationService;
 
     @InjectMocks
     private MasterService masterService;
@@ -678,33 +685,6 @@ class MasterServiceTest {
     }
 
     @Test
-    @DisplayName("deactivateOwnerMaster — after commit evicts master-service-bookable (by masterId) AND salon-service-catalog (by salonId)")
-    void should_evictBothBookabilityCaches_when_deactivateOwnerMaster() {
-        UUID actorUserId = UUID.randomUUID();
-        UUID masterId = UUID.randomUUID();
-        UUID salonId = UUID.randomUUID();
-
-        Salon salon = mock(Salon.class);
-        when(salon.getId()).thenReturn(salonId);
-
-        Master master = Master.builder()
-                .masterType(MasterType.SALON_OWNER)
-                .isActive(true)
-                .build();
-        ReflectionTestUtils.setField(master, "id", masterId);
-        ReflectionTestUtils.setField(master, "salon", salon);
-
-        when(masterRepository.findByUserIdWithSalon(actorUserId)).thenReturn(Optional.of(master));
-
-        runAndReplayAfterCommit(() -> masterService.deactivateOwnerMaster(actorUserId, salonId));
-
-        verify(slotCalculationService).evictMasterAvailabilityCaches(masterId);
-        verify(salonCatalogCacheEvictor).evict(salonId);
-        verify(eventPublisher).publishEvent(
-                new com.beautica.master.event.SalonStaffChangedEvent(salonId));
-    }
-
-    @Test
     @DisplayName("createMasterForOwner (reactivation branch) — after commit evicts master-service-bookable (by masterId) AND salon-service-catalog (by salonId)")
     void should_evictBothBookabilityCaches_when_reactivatingInactiveOwnerMaster() {
         UUID userId = UUID.randomUUID();
@@ -810,6 +790,7 @@ class MasterServiceTest {
         assertThat(result).hasSize(1);
         assertThat(result.get(0).dayOfWeek()).isEqualTo(1);
         verify(workingHoursRepository).saveAll(anyList());
+        verify(authorizationService).enforceCanManageMasterSchedule(ownerId, master);
     }
 
     // ── upsertWorkingHours — inactive-row reuse (regression: UNIQUE(master_id, day_of_week) 23505) ──
@@ -883,10 +864,30 @@ class MasterServiceTest {
     }
 
     @Test
+    @DisplayName("upsertWorkingHours — Phase 345 audit: a SALON_ADMIN on the owner's SALON_OWNER row is 403 "
+            + "from the service-layer re-check, and nothing is read or written past the master load")
+    void should_throwForbiddenAndWriteNothing_when_adminUpsertsOwnerRowWorkingHours() {
+        UUID adminId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        Master ownerRow = mock(Master.class);
+        var request = new WorkingHoursRequest(1, LocalTime.of(9, 0), LocalTime.of(17, 0), true);
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(ownerRow));
+        org.mockito.Mockito.doThrow(new ForbiddenException("Access denied"))
+                .when(authorizationService).enforceCanManageMasterSchedule(adminId, ownerRow);
+
+        assertThatThrownBy(() ->
+                masterService.upsertWorkingHours(adminId, masterId, List.of(request)))
+                .isInstanceOf(ForbiddenException.class);
+
+        verify(authorizationService).enforceCanManageMasterSchedule(adminId, ownerRow);
+        verifyNoInteractions(workingHoursRepository);
+    }
+
+    @Test
     @DisplayName("should_throwNotFound_when_upsertWorkingHours_masterMissing")
     void should_throwNotFound_when_upsertWorkingHours_masterMissing_explicit() {
-        // Authorization is exclusively enforced by @PreAuthorize on MasterController — not re-checked here.
-        // This test verifies the service throws NotFoundException when master is absent.
+        // The service-layer schedule re-check (Phase 345 audit) needs the loaded row, so an absent
+        // master is a NotFoundException before any authorization call.
         UUID actorId = UUID.randomUUID();
         UUID masterId = UUID.randomUUID();
         var request = new WorkingHoursRequest(2, LocalTime.of(10, 0), LocalTime.of(18, 0), true);
@@ -1148,6 +1149,94 @@ class MasterServiceTest {
 
         assertThat(master.isActive()).isTrue();
         verify(eventPublisher, never()).publishEvent(any(Object.class));
+    }
+
+    // ── deactivateMaster — Phase 346 audit-fix cycle 1: the owner row is not deactivatable ──
+
+    @Test
+    @DisplayName("deactivateMaster — Phase 346: 409 when the owner deactivates their own SALON_OWNER row "
+            + "via DELETE /masters/{id}; row stays active, nothing published or evicted")
+    void should_return409_when_ownerDeactivatesOwnMasterRowViaMastersEndpoint() {
+        UUID ownerId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        Master ownerRow = ownerMasterRow(ownerId, masterId, UUID.randomUUID());
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(ownerRow));
+
+        Throwable thrown = org.assertj.core.api.Assertions.catchThrowable(
+                () -> masterService.deactivateMaster(ownerId, masterId));
+
+        assertThat(thrown).isInstanceOf(BusinessException.class)
+                .hasMessage(MasterService.OWNER_MASTER_NOT_REMOVABLE);
+        assertThat(((BusinessException) thrown).getStatus()).isEqualTo(HttpStatus.CONFLICT);
+        assertThat(ownerRow.isActive()).as("the owner is always a master of their salon").isTrue();
+        verify(eventPublisher, never()).publishEvent(any(Object.class));
+        verify(slotCalculationService, never()).evictMasterAvailabilityCaches(any());
+        verify(userProfileCacheEvictor, never()).evictAfterCommit(any());
+    }
+
+    @Test
+    @DisplayName("deactivateMaster — Phase 346: a caller who may not manage the owner row gets 403, "
+            + "not the type-revealing 409 (authorization runs first)")
+    void should_throwForbiddenNotConflict_when_foreignActorTargetsOwnerMasterRow() {
+        UUID ownerId = UUID.randomUUID();
+        UUID foreignActorId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        Master ownerRow = ownerMasterRow(ownerId, masterId, UUID.randomUUID());
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(ownerRow));
+
+        assertThatThrownBy(() -> masterService.deactivateMaster(foreignActorId, masterId))
+                .isInstanceOf(ForbiddenException.class);
+
+        assertThat(ownerRow.isActive()).isTrue();
+    }
+
+    @Test
+    @DisplayName("deactivateMaster(UUID, Master) — Phase 346 defensive guard: 409 for a SALON_OWNER "
+            + "row; row stays active, nothing published or evicted")
+    void should_return409_when_entityOverloadReceivesOwnerMasterRow() {
+        UUID ownerId = UUID.randomUUID();
+        Master ownerRow = ownerMasterRow(ownerId, UUID.randomUUID(), UUID.randomUUID());
+
+        Throwable thrown = org.assertj.core.api.Assertions.catchThrowable(
+                () -> masterService.deactivateMaster(ownerId, ownerRow));
+
+        assertThat(thrown).isInstanceOf(BusinessException.class)
+                .hasMessage(MasterService.OWNER_MASTER_NOT_REMOVABLE);
+        assertThat(((BusinessException) thrown).getStatus()).isEqualTo(HttpStatus.CONFLICT);
+        assertThat(ownerRow.isActive()).isTrue();
+        verify(eventPublisher, never()).publishEvent(any(Object.class));
+        verify(slotCalculationService, never()).evictMasterAvailabilityCaches(any());
+        verify(userProfileCacheEvictor, never()).evictAfterCommit(any());
+    }
+
+    @Test
+    @DisplayName("deactivateMasters — Phase 346: the salon-deletion cascade still deactivates the "
+            + "owner's SALON_OWNER row (only the single-master path refuses it)")
+    void should_deactivateOwnerRow_when_salonDeletionCascadeRuns() {
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        Master ownerRow = ownerMasterRow(ownerId, UUID.randomUUID(), salonId);
+        when(userRepository.findRoleById(ownerId)).thenReturn(Optional.of(Role.SALON_OWNER));
+        when(salonRepository.existsByIdAndOwnerId(salonId, ownerId)).thenReturn(true);
+
+        masterService.deactivateMasters(ownerId, List.of(ownerRow), salonId);
+
+        assertThat(ownerRow.isActive()).isFalse();
+        verify(eventPublisher).publishEvent(new com.beautica.master.event.SalonStaffChangedEvent(salonId));
+    }
+
+    /** An active SALON_OWNER-type row whose user IS the salon's owner (same mock), as persisted. */
+    private Master ownerMasterRow(UUID ownerId, UUID masterId, UUID salonId) {
+        User owner = mock(User.class);
+        lenient().when(owner.getId()).thenReturn(ownerId);
+        Salon salon = mock(Salon.class);
+        lenient().when(salon.getId()).thenReturn(salonId);
+        lenient().when(salon.getOwner()).thenReturn(owner);
+        Master master = Master.builder().masterType(MasterType.SALON_OWNER).isActive(true).build();
+        ReflectionTestUtils.setField(master, "id", masterId);
+        ReflectionTestUtils.setField(master, "user", owner);
+        ReflectionTestUtils.setField(master, "salon", salon);
+        return master;
     }
 
     // ── deactivateMasters — Phase 290 batch cascade (findings #2, #3, #5) ────────
@@ -1631,42 +1720,6 @@ class MasterServiceTest {
         verify(masterRepository, never()).save(any());
     }
 
-    // ── createMasterForOwner (UUID overload) — delegates to entity overload ──
-
-    @Test
-    @DisplayName("should_throwNotFound_when_salonMissing")
-    void should_throwNotFound_when_salonMissing() {
-        UUID userId = UUID.randomUUID();
-        UUID salonId = UUID.randomUUID();
-
-        // UUID overload loads user then salon — role is not checked until inside the entity
-        // overload, but we never reach it because salonRepository returns empty first.
-        User user = mock(User.class);
-
-        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
-        when(salonRepository.findById(salonId)).thenReturn(Optional.empty());
-
-        assertThatThrownBy(() -> masterService.createMasterForOwner(userId, salonId))
-                .isInstanceOf(NotFoundException.class);
-
-        verify(masterRepository, never()).save(any());
-    }
-
-    @Test
-    @DisplayName("should_throwNotFound_when_userMissing")
-    void should_throwNotFound_when_userMissing() {
-        UUID userId = UUID.randomUUID();
-        UUID salonId = UUID.randomUUID();
-
-        when(userRepository.findById(userId)).thenReturn(Optional.empty());
-
-        assertThatThrownBy(() -> masterService.createMasterForOwner(userId, salonId))
-                .isInstanceOf(NotFoundException.class);
-
-        verify(salonRepository, never()).findById(any());
-        verify(masterRepository, never()).save(any());
-    }
-
     // ── getMastersByPage ───────────────────────────────────────────────────────
 
     @Test
@@ -1699,7 +1752,11 @@ class MasterServiceTest {
                 Sort.by(Sort.Direction.DESC, "avgRating").and(Sort.by(Sort.Direction.ASC, "id")));
 
         Page<Master> masterPage = new PageImpl<>(List.of(master), expectedNormalized, 1);
-        when(masterRepository.findBySalonIdAndIsActiveTrueWithUser(salonId, expectedNormalized))
+        LocalDate today = LocalDate.of(2026, 10, 5);
+        when(scheduleDateMath.today()).thenReturn(today);
+        when(masterRepository.findBookableIdsBySalonId(salonId, today)).thenReturn(List.of(masterId));
+        when(masterRepository.findBySalonIdAndIdInAndIsActiveTrueWithUser(
+                salonId, List.of(masterId), expectedNormalized))
                 .thenReturn(masterPage);
 
         Page<MasterSummaryResponse> result = masterService.getMastersByPage(salonId, pageable);
@@ -1708,7 +1765,25 @@ class MasterServiceTest {
         assertThat(result.getContent()).hasSize(1);
         assertThat(result.getContent().get(0).masterId()).isEqualTo(masterId);
         assertThat(result.getContent().get(0).masterType()).isEqualTo(MasterType.SALON_MASTER);
-        verify(masterRepository).findBySalonIdAndIsActiveTrueWithUser(salonId, expectedNormalized);
+        verify(masterRepository).findBookableIdsBySalonId(salonId, today);
+        verify(masterRepository).findBySalonIdAndIdInAndIsActiveTrueWithUser(
+                salonId, List.of(masterId), expectedNormalized);
+        verify(masterRepository, never()).findBySalonIdAndIsActiveTrueWithUser(any(), any());
+    }
+
+    @Test
+    @DisplayName("getMastersByPage returns an empty page without a roster query when no master is bookable")
+    void should_returnEmptyPageWithoutRosterQuery_when_noMasterIsBookable() {
+        UUID salonId = UUID.randomUUID();
+        LocalDate today = LocalDate.of(2026, 10, 5);
+        when(scheduleDateMath.today()).thenReturn(today);
+        when(masterRepository.findBookableIdsBySalonId(salonId, today)).thenReturn(List.of());
+
+        Page<MasterSummaryResponse> result = masterService.getMastersByPage(salonId, Pageable.ofSize(10));
+
+        assertThat(result.getContent()).isEmpty();
+        assertThat(result.getTotalElements()).isZero();
+        verify(masterRepository, never()).findBySalonIdAndIdInAndIsActiveTrueWithUser(any(), any(), any());
     }
 
     @Test
@@ -1836,4 +1911,5 @@ class MasterServiceTest {
         assertThat(from.getValue().toInstant()).isEqualTo(Instant.parse("2026-01-31T22:00:00Z"));
         assertThat(to.getValue().toInstant()).isEqualTo(Instant.parse("2026-02-28T22:00:00Z"));
     }
+
 }

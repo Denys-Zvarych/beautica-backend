@@ -25,9 +25,20 @@ if [[ ! -d "${TEMPLATES_DIR}" ]]; then
   exit 1
 fi
 
+# processResources copies symlinked templates into the jar, but a plain `grep -r` skips symlinks
+# met during traversal: a symlinked template would evade the scan. No template may be a symlink
+# (trailing slash: the templates dir itself may be a link in CI, which is followed deliberately).
+SYMLINKS="$(find "${TEMPLATES_DIR}/" -type l 2>/dev/null || true)"
+if [[ -n "${SYMLINKS}" ]]; then
+  echo "forbid_th_utext_in_email: symlinks are forbidden under templates/email/ (they bypass the scan" >&2
+  echo "but are packaged into the jar):" >&2
+  echo "${SYMLINKS}" >&2
+  exit 1
+fi
+
 # Matches the actual attribute usage (`th:utext="..."`), not a documentation comment merely
 # mentioning the string (e.g. "No th:utext anywhere" in a template's variable-doc header).
-MATCHES="$(grep -rEn 'th:utext[[:space:]]*=' "${TEMPLATES_DIR}" || true)"
+MATCHES="$(grep -REn 'th:utext[[:space:]]*=' "${TEMPLATES_DIR}" || true)"
 
 if [[ -n "${MATCHES}" ]]; then
   echo "forbid_th_utext_in_email: th:utext is forbidden under templates/email/ — it renders" >&2

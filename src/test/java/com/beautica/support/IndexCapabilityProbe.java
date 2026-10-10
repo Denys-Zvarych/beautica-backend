@@ -92,6 +92,29 @@ public class IndexCapabilityProbe {
      *     which reads like a cost problem; naming it here localises it immediately.
      */
     public String explainWithOnly(String indexName, String sql) {
+        return explainWithOnly(indexName, sql, false);
+    }
+
+    /**
+     * {@link #explainWithOnly} that ALSO drops the probed table's primary-key constraint (with
+     * {@code CASCADE}, so referencing foreign keys go too) inside the same rolled-back transaction.
+     *
+     * <p><b>When the plain probe is not enough.</b> The class javadoc's argument that a primary key on
+     * {@code id} "cannot supply that scan key however the planner costs it" is true, but the pkey can
+     * still WIN as a full-index scan with a residual {@code Filter} once the query joins the probed
+     * table on {@code id}: the join's equivalence class makes the pkey ordering a useful pathkey, so
+     * Postgres builds that path, and on a near-empty test table it ties with the probed index on cost
+     * and can be chosen arbitrarily. The salon discovery query joins {@code salons.id} since the
+     * bookability gate ({@code MasterBookabilitySql#BOOKABLE_SALON_S}, a semi-join on
+     * {@code masters.salon_id = s.id}), which is exactly that shape. Removing the pkey leaves the
+     * probed index as the only non-disabled access path, so "is the predicate an Index Cond" is
+     * again a structural question. Nothing escapes the {@code ROLLBACK}.
+     */
+    public String explainWithOnlyNoPrimaryKey(String indexName, String sql) {
+        return explainWithOnly(indexName, sql, true);
+    }
+
+    private String explainWithOnly(String indexName, String sql, boolean dropPrimaryKey) {
         List<String> droppable = droppableIndexes();
         if (!droppable.contains(indexName)) {
             throw new IllegalStateException("cannot probe '" + indexName + "': no such droppable "
@@ -112,6 +135,11 @@ public class IndexCapabilityProbe {
                 for (String index : droppable) {
                     if (!index.equals(indexName)) {
                         statement.execute("DROP INDEX " + index);
+                    }
+                }
+                if (dropPrimaryKey) {
+                    for (String pk : primaryKeyConstraints()) {
+                        statement.execute("ALTER TABLE " + table + " DROP CONSTRAINT " + pk + " CASCADE");
                     }
                 }
                 return explain(statement, sql);
@@ -136,6 +164,13 @@ public class IndexCapabilityProbe {
                   AND NOT EXISTS (SELECT 1 FROM pg_constraint k WHERE k.conindid = c.oid)
                 ORDER BY c.relname
                 """.formatted(table), String.class);
+    }
+
+    /** The probed table's primary-key constraint name(s) — bare identifiers from the catalog. */
+    private List<String> primaryKeyConstraints() {
+        return jdbcTemplate.queryForList(
+                "SELECT conname FROM pg_constraint WHERE conrelid = '%s'::regclass AND contype = 'p'"
+                        .formatted(table), String.class);
     }
 
     private static String explain(Statement statement, String sql) throws SQLException {

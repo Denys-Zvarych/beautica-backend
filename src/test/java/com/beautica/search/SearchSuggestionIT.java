@@ -1,5 +1,6 @@
 package com.beautica.search;
 
+import com.beautica.support.BookableMasterSeeder;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.search.repository.SearchSuggestionAvailabilityRepository;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -141,6 +142,9 @@ class SearchSuggestionIT extends AbstractIntegrationTest {
                 "INSERT INTO masters (id, user_id, master_type, avg_rating, review_count, is_active, "
                         + "created_at, updated_at) VALUES (?, ?, 'INDEPENDENT_MASTER', 4.5, 0, ?, NOW(), NOW())",
                 masterId, userId, active);
+        // A performing master must have hours to be discoverable (MasterBookabilitySql, 2026-10-05);
+        // these fixtures model performing masters, so every one gets a usable weekly template.
+        BookableMasterSeeder.seedUsableSchedule(jdbcTemplate, masterId);
         return masterId;
     }
 
@@ -162,6 +166,9 @@ class SearchSuggestionIT extends AbstractIntegrationTest {
                         + "is_active, created_at, updated_at) "
                         + "VALUES (?, ?, ?, 'SALON_MASTER', 4.5, 0, ?, NOW(), NOW())",
                 masterId, userId, salonId, active);
+        // A performing master must have hours to be discoverable (MasterBookabilitySql, 2026-10-05);
+        // these fixtures model performing masters, so every one gets a usable weekly template.
+        BookableMasterSeeder.seedUsableSchedule(jdbcTemplate, masterId);
         return masterId;
     }
 

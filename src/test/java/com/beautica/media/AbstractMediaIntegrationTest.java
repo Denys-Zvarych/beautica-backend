@@ -17,6 +17,7 @@ import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.util.LinkedMultiValueMap;
 import org.springframework.util.MultiValueMap;
 
+import java.util.Arrays;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -70,6 +71,22 @@ abstract class AbstractMediaIntegrationTest extends AbstractIntegrationTest {
         return salonId;
     }
 
+    /** Email-verified account of any role, optionally assigned to {@code salonId} (staff roles). Phase 343. */
+    protected UUID insertUser(String email, String role, UUID salonId) {
+        UUID id = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO users (id, email, password_hash, role, is_active, email_verified, salon_id) "
+                        + "VALUES (?, ?, ?, ?, true, true, ?)",
+                id, email, passwordEncoder().encode(TEST_PASSWORD), role, salonId);
+        return id;
+    }
+
+    protected static HttpHeaders authHeaders(String token) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.setBearerAuth(token);
+        return headers;
+    }
+
     protected String loginAndGetToken(String email) throws Exception {
         ResponseEntity<String> resp = restTemplate().postForEntity(
                 "/api/v1/auth/login", new LoginRequest(email, TEST_PASSWORD), String.class);
@@ -84,6 +101,24 @@ abstract class AbstractMediaIntegrationTest extends AbstractIntegrationTest {
             @Override
             public String getFilename() {
                 return "a.jpg";
+            }
+        });
+        return body;
+    }
+
+    /** The 5 MB per-file cap ({@code spring.servlet.multipart.max-file-size} = {@code MediaService.MAX_FILE_BYTES}). */
+    static final int FIVE_MB = 5 * 1024 * 1024;
+
+    /** A {@code size}-byte JPEG part: real JPEG magic bytes, space-padded. Used to probe the multipart size caps. */
+    protected static MultiValueMap<String, Object> jpegMultipartBodyOfSize(int size) {
+        byte[] bytes = new byte[size];
+        Arrays.fill(bytes, (byte) 0x20);
+        System.arraycopy(JPEG_HEADER, 0, bytes, 0, JPEG_HEADER.length);
+        MultiValueMap<String, Object> body = new LinkedMultiValueMap<>();
+        body.add("file", new ByteArrayResource(bytes) {
+            @Override
+            public String getFilename() {
+                return "sized.jpg";
             }
         });
         return body;

@@ -32,7 +32,8 @@ public final class DataJpaPostgresContainer {
 
     @SuppressWarnings("resource") // Singleton — never closed; JVM exit handles cleanup via Ryuk.
     public static final PostgreSQLContainer<?> INSTANCE =
-            new PostgreSQLContainer<>("postgres:16-alpine");
+            new PostgreSQLContainer<>("postgres:16-alpine")
+                    .withCommand("postgres", "-c", "max_connections=300");
 
     static {
         INSTANCE.start();

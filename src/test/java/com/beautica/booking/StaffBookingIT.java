@@ -1,5 +1,6 @@
 package com.beautica.booking;
 
+import org.springframework.test.context.TestPropertySource;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.booking.dto.AppointmentDetailResponse;
 import com.beautica.booking.dto.StaffBookingCommand;
@@ -73,6 +74,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * <p>Fixture data uses no occupied-territory locality references.
  */
 @DisplayName("StaffBookingIT — staff walk-in create against a real schedule + real constraints")
+@TestPropertySource(properties = "spring.datasource.hikari.maximum-pool-size=20") // 8 racers in the walk-in budget race
 @Import(StaffBookingIT.FrozenKyivClockConfig.class)
 class StaffBookingIT extends AbstractIntegrationTest {
 
@@ -728,7 +730,50 @@ class StaffBookingIT extends AbstractIntegrationTest {
          * <p>Measured against an isolated, freshly-seeded master per N (own salon, own working-hours
          * row, distinct guest phone) so no fixture reuse across N could shift the count via warm
          * caches or an already-loaded row.
+         *
+         * <p><b>Re-baselined again (Phase 337 QA CRITICAL fix), 14 &rarr; 15, then back to 14.</b>
+         * {@code BookingSlotLockGuard.lockMasterAndAssertFree} first grew a SECOND statement here —
+         * {@code MasterBookabilityGuard#assertStillBookableAfterLock}, a scalar {@code
+         * MasterRepository#isBookableFresh} SELECT — immediately after the per-master advisory lock
+         * and before the former {@code existsOverlap}, closing a race where a create queued behind a
+         * concurrent self-delete on that SAME lock could otherwise insert a CONFIRMED booking for the
+         * master the self-delete had just detached. The Phase 337 follow-up (LOW perf) then fused
+         * that bookability re-check and the overlap re-check into ONE statement —
+         * {@code BookingRepository#findPostLockBookabilityAndOverlap}, run by
+         * {@code PostLockSlotGuard#assertStillFreeAfterLock} — so the count returns to 14 while the
+         * race-closing behaviour is unchanged (pinned by
+         * {@code MasterSelfDeleteCreateRaceConcurrencyIT}). Fixed, not per-item either way: this and
+         * its N=10 sibling moved together at each re-baseline, so the anti-N+1 property the pair
+         * exists to pin is unaffected.
          */
+        // Re-baselined (Phase 333, in-app notification feed), 14 -> 16, THEN corrected by audit-fix
+        // cycle 1 (findings 1-3), 16 -> 14 (back to the pre-333 baseline, measured, not assumed).
+        //
+        // The 14 -> 16 re-baseline undercounted: the comment claimed "TWO fixed statements" (a visit-
+        // item reload plus the recipient insert), but InAppNotificationService#notifyVisitEvent's OLD
+        // implementation unconditionally ran a SECOND reload too --
+        // AppointmentRepository#findClientIdById -- even for this walk-in (BOOKING_CREATED, row 1w),
+        // whose masterOnly() recipient resolution never consumes clientId at all (finding 2). The
+        // real count under that code was 17, not 16, and the pin was silently wrong until this audit
+        // measured it directly rather than trusting the comment.
+        //
+        // Audit-fix cycle 1 (findings 1-3) removes BOTH reloads: StaffBookingService now calls
+        // notifyVisitEvent with `saved.get(0)` -- the already-persisted, already-managed first
+        // chained booking this method just built, carrying real (non-proxy) `master`/`salon`
+        // instances -- so notifyVisitEvent never touches BookingRepository or AppointmentRepository
+        // at all. AND, specific to THIS fixture (seedStatementCountMaster -> seedSalonMaster,
+        // master_type = SALON_OWNER): the acting staff user (seed.staffUserId()) IS the performing
+        // master's own user (seed.masterUserId()) -- an owner-operated salon booking their own
+        // calendar -- so masterOnly()'s one-recipient set is exactly {actorId} and is emptied by the
+        // uniform actor-exclusion step BEFORE any INSERT is attempted. Net: 14 (pre-333 baseline) + 0
+        // (no row is written at all for this specific self-booking fixture) = 14. A DIFFERENT fixture
+        // (a salon admin booking on behalf of an invited SALON_MASTER, e.g. this class's ordinary
+        // WalkInCreate fixtures) WOULD pay the one unavoidable INSERT -- see
+        // StaffBookingEndpointIT$InAppFeed#should_costPinnedStatementCount_when_adminCreatesWalkInForDifferentMaster
+        // (QA audit-fix, LOW perf) for that shape's own statement accounting, pinned at
+        // CREATE_FIXED_STATEMENTS + 1 there -- this ledger does not duplicate it. Fixed, not per-item:
+        // this and its N=10 sibling below moved together, 16 to 14, so the anti-N+1 property the pair
+        // exists to pin is unaffected.
         private static final long CREATE_FIXED_STATEMENTS = 14L;
 
         /**

@@ -53,18 +53,60 @@ class PushNotificationServiceTest {
         DeviceTokenRepository.DeviceTokenSummary tokenB = buildSummary(UUID.randomUUID(), "fcm-token-b");
         when(deviceTokenRepository.findActiveTokenSummaryByUserId(userId)).thenReturn(List.of(tokenA, tokenB));
 
-        pushNotificationService.sendToUser(userId, "Title", "Body", Map.of());
+        pushNotificationService.sendToDevices(userId, List.of(tokenA, tokenB), "Title", "Body", Map.of());
 
         verify(firebaseSender, times(2)).send(any(Message.class));
     }
 
     @Test
-    @DisplayName("should do nothing when user has no active tokens")
-    void should_doNothing_when_userHasNoActiveTokens() throws Exception {
+    @DisplayName("should do nothing, and run no ownership query, when the plan carries no tokens")
+    void should_doNothing_when_noTokens() throws Exception {
         UUID userId = UUID.randomUUID();
+
+        pushNotificationService.sendToDevices(userId, List.of(), "Title", "Body", Map.of());
+
+        verify(firebaseSender, never()).send(any(Message.class));
+        verify(deviceTokenRepository, never()).findActiveTokenSummaryByUserId(any());
+    }
+
+    @Test
+    @DisplayName("S4: a token re-registered to another user after prepare is NOT pushed to; one query per push")
+    void should_skipToken_when_tokenNoLongerOwnedByRecipient() throws Exception {
+        UUID userId = UUID.randomUUID();
+        DeviceTokenRepository.DeviceTokenSummary kept = buildSummary(UUID.randomUUID(), "still-mine");
+        DeviceTokenRepository.DeviceTokenSummary moved = buildSummary(UUID.randomUUID(), "now-on-another-user");
+        when(deviceTokenRepository.findActiveTokenSummaryByUserId(userId)).thenReturn(List.of(kept));
+        ArgumentCaptor<Message> captor = ArgumentCaptor.forClass(Message.class);
+
+        pushNotificationService.sendToDevices(userId, List.of(kept, moved), "Title", "Body", Map.of());
+
+        verify(firebaseSender, times(1)).send(captor.capture());
+        assertThat(getTokenFromMessage(captor.getValue())).isEqualTo("still-mine");
+        verify(deviceTokenRepository, times(1)).findActiveTokenSummaryByUserId(userId);
+    }
+
+    @Test
+    @DisplayName("S4: a deactivated token (no longer in the recipient's active set) is not pushed to")
+    void should_sendNothing_when_allTokensDeactivated() throws Exception {
+        UUID userId = UUID.randomUUID();
+        DeviceTokenRepository.DeviceTokenSummary token = buildSummary(UUID.randomUUID(), "was-active");
         when(deviceTokenRepository.findActiveTokenSummaryByUserId(userId)).thenReturn(List.of());
 
-        pushNotificationService.sendToUser(userId, "Title", "Body", Map.of());
+        pushNotificationService.sendToDevices(userId, List.of(token), "Title", "Body", Map.of());
+
+        verify(firebaseSender, never()).send(any(Message.class));
+    }
+
+    @Test
+    @DisplayName("S4: fails closed — if the ownership query throws, nothing is sent and nothing escapes")
+    void should_sendNothingAndNotThrow_when_ownershipQueryFails() throws Exception {
+        UUID userId = UUID.randomUUID();
+        DeviceTokenRepository.DeviceTokenSummary token = mock(DeviceTokenRepository.DeviceTokenSummary.class);
+        when(deviceTokenRepository.findActiveTokenSummaryByUserId(userId))
+                .thenThrow(new IllegalStateException("db down"));
+
+        assertThatCode(() -> pushNotificationService.sendToDevices(userId, List.of(token), "T", "B", Map.of()))
+                .doesNotThrowAnyException();
 
         verify(firebaseSender, never()).send(any(Message.class));
     }
@@ -80,7 +122,7 @@ class PushNotificationServiceTest {
         when(mockEx.getMessagingErrorCode()).thenReturn(MessagingErrorCode.UNREGISTERED);
         doThrow(mockEx).when(firebaseSender).send(any(Message.class));
 
-        pushNotificationService.sendToUser(userId, "Title", "Body", null);
+        pushNotificationService.sendToDevices(userId, List.of(token), "Title", "Body", null);
 
         verify(deviceTokenRepository).deleteByUserIdAndTokenIn(
                 eq(userId),
@@ -98,7 +140,7 @@ class PushNotificationServiceTest {
         when(mockEx.getMessagingErrorCode()).thenReturn(MessagingErrorCode.INVALID_ARGUMENT);
         doThrow(mockEx).when(firebaseSender).send(any(Message.class));
 
-        pushNotificationService.sendToUser(userId, "Title", "Body", null);
+        pushNotificationService.sendToDevices(userId, List.of(token), "Title", "Body", null);
 
         verify(deviceTokenRepository).deleteByUserIdAndTokenIn(
                 eq(userId),
@@ -116,7 +158,7 @@ class PushNotificationServiceTest {
         when(mockEx.getMessagingErrorCode()).thenReturn(MessagingErrorCode.INTERNAL);
         doThrow(mockEx).when(firebaseSender).send(any(Message.class));
 
-        assertThatCode(() -> pushNotificationService.sendToUser(userId, "Title", "Body", null))
+        assertThatCode(() -> pushNotificationService.sendToDevices(userId, List.of(token), "Title", "Body", null))
                 .doesNotThrowAnyException();
         verify(deviceTokenRepository, never()).deleteByUserIdAndTokenIn(any(), any());
     }
@@ -132,7 +174,7 @@ class PushNotificationServiceTest {
         ArgumentCaptor<Message> captor = ArgumentCaptor.forClass(Message.class);
 
         // Act
-        pushNotificationService.sendToUser(userId, longTitle, "Body", Map.of());
+        pushNotificationService.sendToDevices(userId, List.of(token), longTitle, "Body", Map.of());
 
         // Assert
         verify(firebaseSender).send(captor.capture());
@@ -146,7 +188,7 @@ class PushNotificationServiceTest {
     @DisplayName("NullPointerException thrown when userId is null")
     void should_throwNullPointerException_when_userIdIsNull() {
         // Act + Assert
-        assertThatThrownBy(() -> pushNotificationService.sendToUser(null, "title", "body", Map.of()))
+        assertThatThrownBy(() -> pushNotificationService.sendToDevices(null, List.of(), "title", "body", Map.of()))
                 .isInstanceOf(NullPointerException.class)
                 .hasMessageContaining("userId must not be null");
     }
@@ -159,6 +201,12 @@ class PushNotificationServiceTest {
         Field titleField = notification.getClass().getDeclaredField("title");
         titleField.setAccessible(true);
         return (String) titleField.get(notification);
+    }
+
+    private static String getTokenFromMessage(Message message) throws Exception {
+        Field tokenField = Message.class.getDeclaredField("token");
+        tokenField.setAccessible(true);
+        return (String) tokenField.get(message);
     }
 
     private static String getBodyFromMessage(Message message) throws Exception {
@@ -180,12 +228,63 @@ class PushNotificationServiceTest {
         String longBody = "B".repeat(600);
         ArgumentCaptor<Message> captor = ArgumentCaptor.forClass(Message.class);
 
-        pushNotificationService.sendToUser(userId, "Title", longBody, Map.of());
+        pushNotificationService.sendToDevices(userId, List.of(token), "Title", longBody, Map.of());
 
         verify(firebaseSender).send(captor.capture());
         String capturedBody = getBodyFromMessage(captor.getValue());
         assertThat(capturedBody).isNotNull();
         assertThat(capturedBody.length()).isLessThanOrEqualTo(500);
+    }
+
+    @Test
+    @DisplayName("should truncate by code point, never leaving a lone surrogate, when emoji straddle the limit")
+    void should_notSplitSurrogatePair_when_truncatingEmojiText() throws Exception {
+        UUID userId = UUID.randomUUID();
+        DeviceTokenRepository.DeviceTokenSummary token = buildSummary(UUID.randomUUID(), "fcm-token-emoji");
+        when(deviceTokenRepository.findActiveTokenSummaryByUserId(userId)).thenReturn(List.of(token));
+        // 99 BMP chars + 5 astral emoji: a UTF-16 cut at 100 would land BETWEEN a surrogate pair.
+        String title = "A".repeat(99) + "💅".repeat(5);
+        String body = "B".repeat(499) + "💅".repeat(5);
+        ArgumentCaptor<Message> captor = ArgumentCaptor.forClass(Message.class);
+
+        pushNotificationService.sendToDevices(userId, List.of(token), title, body, Map.of());
+
+        verify(firebaseSender).send(captor.capture());
+        String sentTitle = getTitleFromMessage(captor.getValue());
+        String sentBody = getBodyFromMessage(captor.getValue());
+        assertThat(sentTitle.codePointCount(0, sentTitle.length())).isEqualTo(100);
+        assertThat(sentBody.codePointCount(0, sentBody.length())).isEqualTo(500);
+        assertThat(Character.isHighSurrogate(sentTitle.charAt(sentTitle.length() - 1))).isFalse();
+        assertThat(Character.isHighSurrogate(sentBody.charAt(sentBody.length() - 1))).isFalse();
+    }
+
+    @Test
+    @DisplayName("sendToDevices fans out to the PRE-LOADED tokens that are still owned (one ownership query)")
+    void should_sendToPreloadedTokens_when_sendToDevices() throws Exception {
+        UUID userId = UUID.randomUUID();
+        DeviceTokenRepository.DeviceTokenSummary tokenA = buildSummary(UUID.randomUUID(), "pre-a");
+        DeviceTokenRepository.DeviceTokenSummary tokenB = buildSummary(UUID.randomUUID(), "pre-b");
+        when(deviceTokenRepository.findActiveTokenSummaryByUserId(userId)).thenReturn(List.of(tokenA, tokenB));
+
+        pushNotificationService.sendToDevices(userId, List.of(tokenA, tokenB), "Title", "Body", Map.of());
+
+        verify(firebaseSender, times(2)).send(any(Message.class));
+        verify(deviceTokenRepository, times(1)).findActiveTokenSummaryByUserId(userId);
+    }
+
+    @Test
+    @DisplayName("sendToDevices purges a stale pre-loaded token on UNREGISTERED")
+    void should_deleteStaleToken_when_sendToDevicesGetsUnregistered() throws Exception {
+        UUID userId = UUID.randomUUID();
+        DeviceTokenRepository.DeviceTokenSummary token = buildSummary(UUID.randomUUID(), "pre-stale");
+        when(deviceTokenRepository.findActiveTokenSummaryByUserId(userId)).thenReturn(List.of(token));
+        FirebaseMessagingException mockEx = mock(FirebaseMessagingException.class);
+        when(mockEx.getMessagingErrorCode()).thenReturn(MessagingErrorCode.UNREGISTERED);
+        doThrow(mockEx).when(firebaseSender).send(any(Message.class));
+
+        pushNotificationService.sendToDevices(userId, List.of(token), "Title", "Body", null);
+
+        verify(deviceTokenRepository).deleteByUserIdAndTokenIn(eq(userId), argThat(c -> c.contains("pre-stale")));
     }
 
     @Test
@@ -196,7 +295,7 @@ class PushNotificationServiceTest {
         when(deviceTokenRepository.findActiveTokenSummaryByUserId(userId)).thenReturn(List.of(token));
         doThrow(new RuntimeException("unexpected")).when(firebaseSender).send(any(Message.class));
 
-        assertThatCode(() -> pushNotificationService.sendToUser(userId, "T", "B", Map.of()))
+        assertThatCode(() -> pushNotificationService.sendToDevices(userId, List.of(token), "T", "B", Map.of()))
                 .doesNotThrowAnyException();
         verify(deviceTokenRepository, never()).deleteByUserIdAndTokenIn(any(), any());
     }
@@ -213,7 +312,7 @@ class PushNotificationServiceTest {
         when(mockEx.getMessagingErrorCode()).thenReturn(MessagingErrorCode.UNREGISTERED);
         doThrow(mockEx).when(firebaseSender).send(any(Message.class));
 
-        pushNotificationService.sendToUser(userId, "Title", "Body", Map.of());
+        pushNotificationService.sendToDevices(userId, List.of(token1, token2), "Title", "Body", Map.of());
 
         ArgumentCaptor<Collection<String>> tokensCaptor = ArgumentCaptor.forClass(Collection.class);
         verify(deviceTokenRepository, times(1)).deleteByUserIdAndTokenIn(eq(userId), tokensCaptor.capture());

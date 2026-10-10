@@ -29,14 +29,17 @@ import static org.assertj.core.api.Assertions.assertThat;
  *   <li>{@code POST   /api/v1/salons/{salonId}/services}</li>
  *   <li>{@code POST   /api/v1/salons/{salonId}/masters/{masterId}/services}</li>
  *   <li>{@code PATCH  /api/v1/services/{serviceDefId}}</li>
- *   <li>{@code PATCH  /api/v1/services/{serviceDefId}/photo}</li>
  *   <li>{@code DELETE /api/v1/services/{serviceDefId}}</li>
  * </ul>
+ *
+ * <p>The service photo routes ({@code POST/DELETE /api/v1/services/{serviceDefId}/photo}) are R2
+ * image writes and draw on {@code mediaUploadBuckets} instead — covered in
+ * {@code AuthRateLimitFilterTest.MediaUploadEndpoint}.
  *
  * <p>That gap undercut {@code bulkServiceSetupBuckets}' own rationale: the bulk path is capped at
  * 10/min per IP specifically to bound {@code service_definitions} row growth, but an attacker
  * chasing that growth just looped the unthrottled single-create instead — the strictly better
- * lever, and one that skips the per-master advisory lock too. The filter now caps all six routes
+ * lever, and one that skips the per-master advisory lock too. The filter now caps all five routes
  * at {@code app.rate-limit.service-write-capacity} (60 / 60 s per IP) via {@code serviceWriteBuckets}.
  *
  * <p>The production bucket is an injected {@code @Qualifier} bean whose capacity is raised to
@@ -88,7 +91,7 @@ class ServiceWriteRateLimitRegressionTest {
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), tinyServiceWriteCache(), permissive(), permissive(),
-                permissive());
+                permissive(), permissive());
     }
 
     private MockHttpServletRequest write(String method, String uri) {
@@ -105,7 +108,6 @@ class ServiceWriteRateLimitRegressionTest {
             "POST,   /api/v1/salons/SALON/services",
             "POST,   /api/v1/salons/SALON/masters/MASTER/services",
             "PATCH,  /api/v1/services/DEF",
-            "PATCH,  /api/v1/services/DEF/photo",
             "DELETE, /api/v1/services/DEF"
     })
     @DisplayName("should_return429_when_singleServiceWriteExceedsPerIpCap")
@@ -145,7 +147,7 @@ class ServiceWriteRateLimitRegressionTest {
     @Test
     @DisplayName("should_shareOneBucketAcrossRoutes_when_differentSingleWriteRoutesAreMixed")
     void should_shareOneBucketAcrossRoutes_when_differentSingleWriteRoutesAreMixed() throws Exception {
-        // All six routes are one class of write and share ONE bucket by design: a caller must not
+        // All five routes are one class of write and share ONE bucket by design: a caller must not
         // be able to multiply their budget by rotating create -> patch -> delete.
         AuthRateLimitFilter filter = filterWithTinyServiceWriteBucket();
 

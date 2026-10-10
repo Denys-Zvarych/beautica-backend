@@ -2,13 +2,17 @@ package com.beautica.user;
 
 import com.beautica.auth.Role;
 import jakarta.persistence.LockModeType;
+import jakarta.persistence.QueryHint;
+import org.hibernate.jpa.HibernateHints;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Lock;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.jpa.repository.QueryHints;
 import org.springframework.data.repository.query.Param;
 
 import java.time.Instant;
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -19,7 +23,13 @@ public interface UserRepository extends JpaRepository<User, UUID> {
 
     boolean existsByEmail(String email);
 
-    @Query("SELECT u.salonId FROM User u WHERE u.id = :userId")
+    /**
+     * The user's assigned salon id, EMPTY for a missing or DEACTIVATED ({@code is_active = false})
+     * user. The liveness predicate lives in this one statement (no extra round trip) because every
+     * caller uses the result as an admin's management authority: a deactivated admin keeps login
+     * until the JWT expires and must not keep complete / decline / rate / staff-management rights.
+     */
+    @Query("SELECT u.salonId FROM User u WHERE u.id = :userId AND u.isActive = true")
     Optional<UUID> findSalonIdById(@Param("userId") UUID userId);
 
     /**
@@ -58,6 +68,24 @@ public interface UserRepository extends JpaRepository<User, UUID> {
      * caller cannot use this predicate to probe non-admin users assigned to a salon.
      */
     boolean existsByIdAndSalonIdAndRole(UUID id, UUID salonId, Role role);
+
+    /** One (user, assigned salon) pair — the projection of {@link #findSalonAssignments}. */
+    interface UserSalonPair {
+        UUID getUserId();
+
+        UUID getSalonId();
+    }
+
+    /**
+     * Batch form of {@link #existsByIdAndSalonIdAndRole}: the salon assignment of EVERY user in
+     * {@code userIds} that has {@code role} and a salon, in ONE statement (same predicate — id, role,
+     * salon_id equality), so the push drain can answer "does this admin still belong to this salon" for
+     * all admin recipients without a statement per pair.
+     */
+    @Query("SELECT u.id AS userId, u.salonId AS salonId FROM User u "
+            + "WHERE u.id IN :userIds AND u.role = :role AND u.salonId IS NOT NULL")
+    List<UserSalonPair> findSalonAssignments(@Param("userIds") Collection<UUID> userIds,
+                                             @Param("role") Role role);
 
     /**
      * Backs {@link com.beautica.salon.service.SalonService#getSalonStaff} — the
@@ -127,6 +155,28 @@ public interface UserRepository extends JpaRepository<User, UUID> {
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("SELECT u FROM User u WHERE u.id = :userId")
     Optional<User> findByIdForUpdate(@Param("userId") UUID userId);
+
+    /**
+     * Row-locks the given users ({@code FOR UPDATE}, ordered by id so two concurrent batches always lock in
+     * the same order and cannot deadlock) and returns only their avatar pointers — staff disposal's pre-read
+     * (security S-L2 / perf P-L2). Holding the lock until the {@code users} delete commits means a concurrent
+     * avatar replace ({@code MediaService} locks the same row via {@link #findByIdForUpdate}) either committed
+     * BEFORE this read (its new key is what is read here and purged) or blocks until the delete commits and
+     * then finds no row (its failure path discards the new blob). No managed entity is loaded.
+     *
+     * <p>The native query declares its query space ({@code users}) via {@link HibernateHints#HINT_NATIVE_SPACES}
+     * (perf P-L3): without it Hibernate cannot tell which tables a native statement touches and auto-flushes
+     * (dirty-checking) the WHOLE persistence context first. With it, only pending {@code users} changes flush.
+     */
+    @QueryHints(@QueryHint(name = HibernateHints.HINT_NATIVE_SPACES, value = "users"))
+    @Query(value = """
+            SELECT u.id AS "id", u.avatar_r2_key AS "avatarR2Key", u.avatar_url AS "avatarUrl"
+            FROM users u
+            WHERE u.id IN (:ids)
+            ORDER BY u.id
+            FOR UPDATE
+            """, nativeQuery = true)
+    List<UserAvatarPointers> lockAvatarPointersByIdIn(@Param("ids") Collection<UUID> ids);
 
     /**
      * Single bounded statement that nulls the verification code material on

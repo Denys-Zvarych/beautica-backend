@@ -77,7 +77,7 @@ class BookingRateLimitFilterTest {
      */
     private BookingRateLimitFilter filterWith(LoadingCache<String, Bucket> writeBuckets) {
         return new BookingRateLimitFilter(
-                writeBuckets, generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
+                writeBuckets, generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
     }
 
     /**
@@ -87,7 +87,7 @@ class BookingRateLimitFilterTest {
      */
     private BookingRateLimitFilter filterWithDeclineBuckets(LoadingCache<String, Bucket> declineBuckets) {
         return new BookingRateLimitFilter(
-                generousBuckets(), declineBuckets, generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
+                generousBuckets(), declineBuckets, generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
     }
 
     /**
@@ -97,7 +97,7 @@ class BookingRateLimitFilterTest {
      */
     private BookingRateLimitFilter filterWithOverrideBuckets(LoadingCache<String, Bucket> overrideBuckets) {
         return new BookingRateLimitFilter(
-                generousBuckets(), generousBuckets(), overrideBuckets, generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
+                generousBuckets(), generousBuckets(), overrideBuckets, generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
     }
 
     /**
@@ -109,7 +109,7 @@ class BookingRateLimitFilterTest {
      */
     private BookingRateLimitFilter filterWithStaffSmsBuckets(LoadingCache<String, Bucket> staffSmsBuckets) {
         return new BookingRateLimitFilter(
-                generousBuckets(), generousBuckets(), generousBuckets(), staffSmsBuckets, generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
+                generousBuckets(), generousBuckets(), generousBuckets(), staffSmsBuckets, generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
     }
 
     /**
@@ -120,7 +120,7 @@ class BookingRateLimitFilterTest {
     private BookingRateLimitFilter filterWithSelfDeleteBuckets(LoadingCache<String, Bucket> selfDeleteBuckets) {
         return new BookingRateLimitFilter(
                 generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), selfDeleteBuckets,
-                generousBuckets(), generousBuckets(), OBJECT_MAPPER);
+                generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
     }
 
     /**
@@ -133,7 +133,7 @@ class BookingRateLimitFilterTest {
             LoadingCache<String, Bucket> readBuckets) {
         return new BookingRateLimitFilter(
                 generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(),
-                generousBuckets(), readBuckets, generousBuckets(), OBJECT_MAPPER);
+                generousBuckets(), readBuckets, generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
     }
 
     private static MockHttpServletRequest getSalonMasterServices(UUID salonId, UUID masterId) {
@@ -151,7 +151,35 @@ class BookingRateLimitFilterTest {
             LoadingCache<String, Bucket> boardBuckets) {
         return new BookingRateLimitFilter(
                 generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(),
-                generousBuckets(), generousBuckets(), boardBuckets, OBJECT_MAPPER);
+                generousBuckets(), generousBuckets(), boardBuckets, generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
+    }
+
+    /**
+     * Builds a filter with the given notification-feed bucket and UNRELATED, generously-sized
+     * siblings — the mirror of {@link #filterWith(LoadingCache)} for the four in-app notification
+     * feed endpoints (phase 334), which share ONE bucket across GET and PATCH alike.
+     */
+    private BookingRateLimitFilter filterWithNotificationFeedBuckets(
+            LoadingCache<String, Bucket> feedBuckets) {
+        return new BookingRateLimitFilter(
+                generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(),
+                generousBuckets(), generousBuckets(), generousBuckets(), feedBuckets, generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
+    }
+
+    private static MockHttpServletRequest getNotificationFeed() {
+        return new MockHttpServletRequest("GET", "/api/v1/notifications");
+    }
+
+    private static MockHttpServletRequest getUnreadCount() {
+        return new MockHttpServletRequest("GET", "/api/v1/notifications/unread-count");
+    }
+
+    private static MockHttpServletRequest patchMarkRead(UUID id) {
+        return new MockHttpServletRequest("PATCH", "/api/v1/notifications/" + id + "/read");
+    }
+
+    private static MockHttpServletRequest patchMarkAllRead() {
+        return new MockHttpServletRequest("PATCH", "/api/v1/notifications/read-all");
     }
 
     private static MockHttpServletRequest getSalonEffectiveSchedule(UUID salonId) {
@@ -518,7 +546,7 @@ class BookingRateLimitFilterTest {
         LoadingCache<String, Bucket> declineBuckets = singleSlotBuckets();
         BookingRateLimitFilter filter =
                 new BookingRateLimitFilter(
-                        writeBuckets, declineBuckets, generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
+                        writeBuckets, declineBuckets, generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
         authenticateAs(UUID.randomUUID());
 
         // Exhaust the create/reschedule bucket.
@@ -1032,7 +1060,7 @@ class BookingRateLimitFilterTest {
         LoadingCache<String, Bucket> overrideBuckets = singleSlotBuckets();
         BookingRateLimitFilter filter =
                 new BookingRateLimitFilter(
-                        generousBuckets(), declineBuckets, overrideBuckets, generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
+                        generousBuckets(), declineBuckets, overrideBuckets, generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
         authenticateAs(UUID.randomUUID());
 
         // Exhaust the decline bucket.
@@ -1197,7 +1225,7 @@ class BookingRateLimitFilterTest {
     @DisplayName("should_notShareBudgets_when_sameStaffAlternatesClientCreateAndStaffCreate")
     void should_notShareBudgets_when_sameStaffAlternatesClientCreateAndStaffCreate() throws Exception {
         BookingRateLimitFilter filter = new BookingRateLimitFilter(
-                singleSlotBuckets(), generousBuckets(), generousBuckets(), singleSlotBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
+                singleSlotBuckets(), generousBuckets(), generousBuckets(), singleSlotBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
         authenticateAs(UUID.randomUUID());
 
         // Spend the whole client-create budget.
@@ -1653,7 +1681,7 @@ class BookingRateLimitFilterTest {
         LoadingCache<String, Bucket> selfDeleteBuckets = singleSlotBuckets();
         BookingRateLimitFilter filter = new BookingRateLimitFilter(
                 writeBuckets, generousBuckets(), generousBuckets(), generousBuckets(), selfDeleteBuckets,
-                        generousBuckets(), generousBuckets(), OBJECT_MAPPER);
+                        generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
         authenticateAs(UUID.randomUUID());
 
         filter.doFilterInternal(postCreate(), new MockHttpServletResponse(), new MockFilterChain());
@@ -1842,6 +1870,71 @@ class BookingRateLimitFilterTest {
     }
 
     @Test
+    @DisplayName("phase 357: both pending-actions count routes are matched by the salon-board budget "
+            + "and 429 after the cap")
+    void should_return429_when_pendingActionsCountRoutesExceedBoardBudget() throws Exception {
+        UUID salonId = UUID.randomUUID();
+
+        for (String path : List.of(
+                "/api/v1/bookings/me/pending-actions/count",
+                "/api/v1/bookings/salon/" + salonId + "/pending-actions/count")) {
+            BookingRateLimitFilter filter = filterWithSalonBoardReadBuckets(singleSlotBuckets());
+            authenticateAs(UUID.randomUUID());
+
+            var first = new MockHttpServletResponse();
+            filter.doFilterInternal(new MockHttpServletRequest("GET", path), first, new MockFilterChain());
+            var second = new MockHttpServletResponse();
+            var secondChain = new MockFilterChain();
+            filter.doFilterInternal(new MockHttpServletRequest("GET", path), second, secondChain);
+
+            assertThat(first.getStatus()).as("first %s must pass", path).isNotEqualTo(429);
+            assertThat(second.getStatus()).as("second %s must be throttled", path).isEqualTo(429);
+            assertThat(secondChain.getRequest()).isNull();
+        }
+    }
+
+    @Test
+    @DisplayName("phase 357: an UPPERCASE-hex salon id is still matched by the pending-actions salon arm")
+    void should_bucketPendingActionsCount_when_salonIdIsUppercase() throws Exception {
+        String path = "/api/v1/bookings/salon/" + UUID.randomUUID().toString().toUpperCase()
+                + "/pending-actions/count";
+        BookingRateLimitFilter filter = filterWithSalonBoardReadBuckets(singleSlotBuckets());
+        authenticateAs(UUID.randomUUID());
+
+        var first = new MockHttpServletResponse();
+        filter.doFilterInternal(new MockHttpServletRequest("GET", path), first, new MockFilterChain());
+        var second = new MockHttpServletResponse();
+        var secondChain = new MockFilterChain();
+        filter.doFilterInternal(new MockHttpServletRequest("GET", path), second, secondChain);
+
+        assertThat(first.getStatus()).isNotEqualTo(429);
+        assertThat(second.getStatus()).isEqualTo(429);
+        assertThat(secondChain.getRequest()).isNull();
+    }
+
+    @Test
+    @DisplayName("phase 357: pending-actions look-alikes are NOT matched")
+    void should_notMatch_whenPendingActionsPathIsALookAlike() throws Exception {
+        UUID salonId = UUID.randomUUID();
+        BookingRateLimitFilter filter = filterWithSalonBoardReadBuckets(singleSlotBuckets());
+        authenticateAs(UUID.randomUUID());
+
+        for (String path : List.of(
+                "/api/v1/bookings/me/pending-actions/count/x",
+                "/api/v1/bookings/me/pending-actions",
+                "/api/v1/bookings/salon/" + salonId + "/pending-actions/other",
+                "/api/v1/bookings/salon/" + salonId + "/pending-actions/count/x",
+                "/api/v1/bookings/salon/me/pending-actions/count",
+                "/api/v1/bookings/salon/not-a-uuid/pending-actions/count")) {
+            for (int i = 0; i < 3; i++) {
+                var response = new MockHttpServletResponse();
+                filter.doFilterInternal(new MockHttpServletRequest("GET", path), response, new MockFilterChain());
+                assertThat(response.getStatus()).as("%s must stay unbucketed", path).isNotEqualTo(429);
+            }
+        }
+    }
+
+    @Test
     @DisplayName("salon-board throttle: each of the three routes is matched — a route left out "
             + "of the matcher "
             + "would be silently unbucketed and this loop is what catches it")
@@ -1938,6 +2031,102 @@ class BookingRateLimitFilterTest {
                         .isNotEqualTo(429);
                 assertThat(chain.getRequest()).isNotNull();
             }
+        }
+    }
+
+    // ── notification-feed throttle (phase 334) ─────────────────────────────────────────────
+
+    @Test
+    @DisplayName("notification-feed throttle: all four endpoints share ONE per-user budget — "
+            + "listing, unread-count, mark-read and mark-all-read draw from the same bucket")
+    void should_return429_when_theFourNotificationFeedEndpointsShareOnePerUserBudget() throws Exception {
+        BookingRateLimitFilter filter = filterWithNotificationFeedBuckets(singleSlotBuckets());
+        authenticateAs(UUID.randomUUID());
+
+        var first = new MockHttpServletResponse();
+        filter.doFilterInternal(getNotificationFeed(), first, new MockFilterChain());
+
+        var second = new MockHttpServletResponse();
+        var secondChain = new MockFilterChain();
+        filter.doFilterInternal(getUnreadCount(), second, secondChain);
+
+        assertThat(first.getStatus()).as("the first feed request must pass").isNotEqualTo(429);
+        assertThat(second.getStatus())
+                .as("a DIFFERENT endpoint (unread-count) by the same principal must spend the "
+                        + "shared per-user bucket")
+                .isEqualTo(429);
+        assertThat(secondChain.getRequest())
+                .as("a throttled request must not reach the controller")
+                .isNull();
+    }
+
+    @Test
+    @DisplayName("notification-feed throttle: each of the four routes/methods is matched")
+    void should_matchEveryOneOfTheFourNotificationFeedEndpoints() throws Exception {
+        UUID id = UUID.randomUUID();
+
+        for (MockHttpServletRequest request : List.of(
+                getNotificationFeed(), getUnreadCount(), patchMarkRead(id), patchMarkAllRead())) {
+            BookingRateLimitFilter filter = filterWithNotificationFeedBuckets(singleSlotBuckets());
+            authenticateAs(UUID.randomUUID());
+
+            filter.doFilterInternal(
+                    new MockHttpServletRequest(request.getMethod(), request.getRequestURI()),
+                    new MockHttpServletResponse(), new MockFilterChain());
+            var second = new MockHttpServletResponse();
+            filter.doFilterInternal(
+                    new MockHttpServletRequest(request.getMethod(), request.getRequestURI()),
+                    second, new MockFilterChain());
+
+            assertThat(second.getStatus())
+                    .as("%s %s must be matched by the notification-feed matcher",
+                            request.getMethod(), request.getRequestURI())
+                    .isEqualTo(429);
+        }
+    }
+
+    @Test
+    @DisplayName("notification-feed throttle: per-principal budgets, and the response carries "
+            + "Retry-After: 60")
+    void should_keepNotificationFeedBudgetsPerPrincipal_andAdvertiseRetryAfter() throws Exception {
+        BookingRateLimitFilter filter = filterWithNotificationFeedBuckets(singleSlotBuckets());
+
+        authenticateAs(UUID.randomUUID());
+        filter.doFilterInternal(getNotificationFeed(), new MockHttpServletResponse(), new MockFilterChain());
+        var exhausted = new MockHttpServletResponse();
+        filter.doFilterInternal(getNotificationFeed(), exhausted, new MockFilterChain());
+
+        assertThat(exhausted.getStatus()).as("arrange check — user A is spent").isEqualTo(429);
+        assertThat(exhausted.getHeader("Retry-After")).isEqualTo("60");
+
+        authenticateAs(UUID.randomUUID());
+        var response = new MockHttpServletResponse();
+        var chain = new MockFilterChain();
+        filter.doFilterInternal(getNotificationFeed(), response, chain);
+
+        assertThat(response.getStatus())
+                .as("user B keeps their own budget")
+                .isNotEqualTo(429);
+        assertThat(chain.getRequest()).isNotNull();
+    }
+
+    @Test
+    @DisplayName("notification-feed throttle scoping: a look-alike future path is NOT matched")
+    void should_notMatch_whenPathIsALookAlikeOfNotificationFeed() throws Exception {
+        BookingRateLimitFilter filter = filterWithNotificationFeedBuckets(singleSlotBuckets());
+        authenticateAs(UUID.randomUUID());
+
+        for (int i = 0; i < 3; i++) {
+            var response = new MockHttpServletResponse();
+            var chain = new MockFilterChain();
+            filter.doFilterInternal(
+                    new MockHttpServletRequest("GET", "/api/v1/notifications-legacy"),
+                    response, chain);
+            assertThat(response.getStatus())
+                    .as("a path merely sharing the PREFIX text, without the \"/\" boundary, must not "
+                            + "be matched")
+                    .isNotEqualTo(429);
+            assertThat(chain.getRequest()).isNotNull();
         }
     }
 }

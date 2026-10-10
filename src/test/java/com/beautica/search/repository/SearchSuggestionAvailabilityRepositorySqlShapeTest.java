@@ -38,7 +38,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 @DisplayName("SearchSuggestionAvailabilityRepository — SQL-shape invariant (finding 1)")
 class SearchSuggestionAvailabilityRepositorySqlShapeTest {
 
-    private static final Pattern NAMED_PARAM = Pattern.compile(":([A-Za-z][A-Za-z0-9]*)");
+    // (?<!:) — a Postgres `::date` cast (the Kyiv-date spelling MasterBookabilitySql emits) is not a
+    // bind parameter; Hibernate treats `::` as an escaped cast, so must this extraction.
+    private static final Pattern NAMED_PARAM = Pattern.compile("(?<!:):([A-Za-z][A-Za-z0-9]*)");
     private static final Pattern UUID_LITERAL =
             Pattern.compile("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}");
 
@@ -120,10 +122,13 @@ class SearchSuggestionAvailabilityRepositorySqlShapeTest {
         while (paramMatcher.find()) {
             foundParams.add(paramMatcher.group(1));
         }
+        // bookableToday: the app-clock Kyiv date every bookability fragment reads (audit 2026-10-05,
+        // finding 7) — bound by the repository from ScheduleDateMath, never caller-supplied.
+        String today = com.beautica.master.repository.MasterBookabilitySql.TODAY_PARAM;
         Set<String> allowed = switch (mode) {
-            case NATIONAL -> Set.of("includedRole");
-            case CITY -> Set.of("includedRole", "cityId");
-            case DISTRICT -> Set.of("includedRole", "districtId");
+            case NATIONAL -> Set.of("includedRole", today);
+            case CITY -> Set.of("includedRole", "cityId", today);
+            case DISTRICT -> Set.of("includedRole", "districtId", today);
         };
 
         assertThat(foundParams)

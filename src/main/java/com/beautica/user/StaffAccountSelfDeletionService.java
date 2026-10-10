@@ -2,12 +2,13 @@ package com.beautica.user;
 
 import com.beautica.auth.AuthService;
 import com.beautica.auth.Role;
+import com.beautica.booking.repository.SalonClosureBookingCandidate;
 import com.beautica.booking.service.BookingService;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
-import com.beautica.media.entity.MediaFile;
+import com.beautica.media.repository.UploaderMediaKey;
 import com.beautica.media.repository.MediaRepository;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.salon.service.StaffAccountDisposalService;
@@ -15,6 +16,9 @@ import com.beautica.salon.audit.AuditOutcome;
 import com.beautica.salon.audit.StaffClientReferenceAuditResult;
 import com.beautica.salon.service.StaffClientReferenceAuditService;
 import com.beautica.salon.service.StaffDisposalReason;
+import com.beautica.service.entity.OwnerType;
+import com.beautica.service.repository.ServiceRepository;
+import com.beautica.service.service.ServicePhotoBlobPurger;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
@@ -77,6 +81,8 @@ public class StaffAccountSelfDeletionService {
     private final StaffClientReferenceAuditService staffClientReferenceAuditService;
     private final AuthService authService;
     private final AccountBlobPurgeRegistrar accountBlobPurgeRegistrar;
+    private final ServiceRepository serviceRepository;
+    private final ServicePhotoBlobPurger servicePhotoBlobPurger;
 
     private static final Set<Role> SELF_DELETABLE_ROLES =
             Set.of(Role.SALON_ADMIN, Role.SALON_MASTER, Role.INDEPENDENT_MASTER);
@@ -138,8 +144,8 @@ public class StaffAccountSelfDeletionService {
         }
 
         // Step 4 — pre-read external-storage pointers BEFORE anything cascades them away.
-        List<MediaFile> mediaRows = mediaRepository.findByUploaderId(userId);
-        String avatarR2Key = user.getAvatarR2Key();
+        // Scalar projection (P-L1) — no MediaFile entities loaded into the persistence context.
+        List<UploaderMediaKey> mediaRows = mediaRepository.findMediaKeysByUploaderIdIn(List.of(userId));
         UUID salonId = user.getSalonId();
 
         // Step 5 — resolve the caller's OWN masters row, if any. SALON_ADMIN has none (D3 — no
@@ -153,24 +159,46 @@ public class StaffAccountSelfDeletionService {
                     .orElseThrow(() -> new ForbiddenException("Access denied"));
         }
 
+        // Step 5b — Phase 342 D6: an independent master's own service catalogue keeps uploaded photos in R2
+        // (service_definitions has no FK to the master, so nothing cascades). Row-lock the catalogue (id order)
+        // and read the keys from the LOCKED rows, null the pointers, and DEACTIVATE the definitions (never
+        // delete: historical bookings reference them — same semantics as SalonService#deactivateSalon). The
+        // deactivation is what makes a photo upload that takes the row lock after this commit answer 404 on
+        // its in-lock active re-check, so it can never write a pointer nobody will purge.
+        // LOCK ORDER (service_definitions BEFORE masters): ServiceCatalogService#deactivateServiceDefinition
+        // locks the definition then UPDATEs masters; the disposal below deletes the masters row, so the
+        // locks must be taken here, ahead of every masters write, to avoid a deadlock with a concurrent
+        // service delete.
+        List<ServicePhotoBlobPurger.ServicePhotoBlob> servicePhotoKeys = List.of();
+        if (master != null && user.getRole() == Role.INDEPENDENT_MASTER) {
+            servicePhotoKeys = serviceRepository
+                    .lockAllByOwnerOrderById(OwnerType.INDEPENDENT_MASTER, master.getId()).stream()
+                    .filter(sd -> sd.getPhotoR2Key() != null)
+                    .map(sd -> new ServicePhotoBlobPurger.ServicePhotoBlob(sd.getId(), sd.getPhotoR2Key()))
+                    .toList();
+            serviceRepository.clearPhotosByOwner(OwnerType.INDEPENDENT_MASTER, master.getId());
+            serviceRepository.deactivateAllByOwner(OwnerType.INDEPENDENT_MASTER, master.getId());
+        }
+
         // Step 6 — the master-role booking cascade (Q3). SALON_ADMIN skips this entirely — no
         // masters row, no provider bookings (Q3/Q6).
         //
         // Residual-race fix (2026-09 re-audit): the per-master advisory lock is acquired FIRST,
         // via BookingService#acquireMasterLockForSelfDelete, BEFORE the read below builds the
-        // fixed futureBookingIds list — not merely before the write at the bottom of this block.
-        // A booking that committed for this master between an unlocked read and a later-acquired
-        // lock would never appear in futureBookingIds; disposeFutureConfirmedForMasterSelfDelete's
-        // own internal re-scan only maps appointment ids for the already-fixed list, it never
-        // grows the list itself, so that booking would survive the cascade. Holding the lock
-        // across the read, the cap check below, and the eventual decline+delete call closes that
-        // gap. See BookingService#acquireMasterLockForSelfDelete's javadoc for the full mechanism.
-        List<UUID> futureBookingIds = List.of();
+        // fixed futureBookingCandidates list — not merely before the write at the bottom of this
+        // block. A booking that committed for this master between an unlocked read and a
+        // later-acquired lock would never appear in futureBookingCandidates; the write seam no
+        // longer re-scans at all (perf re-audit, 2026-09, Finding 2 — the candidate list read here
+        // is threaded straight through, never re-queried), so that booking would survive the
+        // cascade. Holding the lock across the read, the cap check below, and the eventual
+        // decline+delete call closes that gap. See BookingService#acquireMasterLockForSelfDelete's
+        // javadoc for the full mechanism.
+        List<SalonClosureBookingCandidate> futureBookingCandidates = List.of();
         if (master != null) {
             UUID masterId = master.getId();
             bookingService.acquireMasterLockForSelfDelete(masterId);
-            futureBookingIds = bookingService.findFutureConfirmedBookingIdsForMaster(masterId);
-            if (futureBookingIds.size() > MAX_FUTURE_BOOKINGS_PER_STAFF_SELF_DELETE) {
+            futureBookingCandidates = bookingService.findFutureConfirmedBookingCandidatesForMaster(masterId);
+            if (futureBookingCandidates.size() > MAX_FUTURE_BOOKINGS_PER_STAFF_SELF_DELETE) {
                 // Fails BEFORE any write — mirrors ClientAccountDeletionService's identical
                 // ordering. Two distinct messages (D5, Phase 301 Q3f/R4): a SALON_MASTER cannot
                 // cancel their own bookings (every existing decline seam 403s them), so they are
@@ -178,17 +206,18 @@ public class StaffAccountSelfDeletionService {
                 // self-remedy first.
                 String message = user.getRole() == Role.SALON_MASTER
                         ? ("Забагато майбутніх записів (%d). Зверніться до власника салону, щоб він "
-                                + "видалив вас у розділі «Команда».").formatted(futureBookingIds.size())
+                                + "видалив вас у розділі «Команда».").formatted(futureBookingCandidates.size())
                         : ("Забагато майбутніх записів (%d). Спочатку скасуйте або завершіть майбутні "
                                 + "записи (максимум %d) і спробуйте ще раз.")
-                                .formatted(futureBookingIds.size(), MAX_FUTURE_BOOKINGS_PER_STAFF_SELF_DELETE);
+                                .formatted(futureBookingCandidates.size(), MAX_FUTURE_BOOKINGS_PER_STAFF_SELF_DELETE);
                 throw new BusinessException(HttpStatus.UNPROCESSABLE_ENTITY, message);
             }
 
             // Bulk-declines then hard-deletes every future CONFIRMED booking, collapses childless
             // appointment headers, and evicts the slot/calendar caches — see that method's own
             // javadoc for why this cannot reuse the shared salon/master-removal decline cascade.
-            bookingService.disposeFutureConfirmedForMasterSelfDelete(userId, masterId, salonId, futureBookingIds);
+            bookingService.disposeFutureConfirmedForMasterSelfDelete(
+                    userId, masterId, salonId, futureBookingCandidates);
         }
 
         // Step 7 — the account + masters-row hard delete itself (D1/D2), delegated to the SAME
@@ -205,14 +234,17 @@ public class StaffAccountSelfDeletionService {
 
         // Step 9 — R2 blob sweep, registered to run strictly after commit (Anti-Bug §O8), via the
         // promoted AccountBlobPurgeRegistrar (Phase 301 — shared with ClientAccountDeletionService,
-        // never re-typed). Deliberately NOT swept by staffAccountDisposalService.dispose itself —
-        // that shared seam's other three callers (removeAdmin/removeMaster/deleteSalonStaff) leak
-        // R2 blobs today (R6, pre-existing, out of scope); only THIS self-delete path sweeps.
-        accountBlobPurgeRegistrar.registerAfterCommit(userId, avatarR2Key, mediaRows);
+        // never re-typed). staffAccountDisposalService.dispose sweeps for the owner-initiated callers
+        // but skips StaffDisposalReason.SELF_DELETE, so this path is the only sweeper here (no double purge).
+        accountBlobPurgeRegistrar.registerAfterCommit(user, mediaRows);
+
+        // Step 9b — Phase 342 D6: delete the independent master's service-photo blobs after commit. The keys
+        // were read from the row-locked catalogue in Step 5b (before any masters write).
+        servicePhotoBlobPurger.purgeAfterCommit(servicePhotoKeys);
 
         // Step 10 — audit trail. Ids and counts only, never an email or any other PII.
         log.info("Staff/independent-master account self-delete: user {} (role {}) deleted, "
                         + "{} future booking(s) disposed of",
-                userId, user.getRole(), futureBookingIds.size());
+                userId, user.getRole(), futureBookingCandidates.size());
     }
 }

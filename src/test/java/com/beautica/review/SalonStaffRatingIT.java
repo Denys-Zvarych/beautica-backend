@@ -1,5 +1,6 @@
 package com.beautica.review;
 
+import com.beautica.support.BookableMasterSeeder;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.favorite.dto.FavoriteSalonResponse;
 import com.beautica.favorite.entity.FavoriteTargetType;
@@ -171,6 +172,8 @@ class SalonStaffRatingIT extends AbstractIntegrationTest {
         UUID salonId = insertSalon("fav-rating-owner@beautica.test", "Fav Rating Salon");
         UUID high = insertSalonMaster(salonId, "fav-rating-high@beautica.test");
         UUID low = insertSalonMaster(salonId, "fav-rating-low@beautica.test");
+        // Favourites list only bookable salons (2026-10-05): give the salon a bookable master.
+        BookableMasterSeeder.makeBookable(jdbcTemplate, salonId, high);
         insertReview(salonId, high, clientId, 5);
         insertReview(salonId, low, clientId, 1);
         insertReview(salonId, low, clientId, 1);
@@ -207,6 +210,9 @@ class SalonStaffRatingIT extends AbstractIntegrationTest {
         UUID clientId = insertClient("null-rating-client@beautica.test");
         UUID salonId = insertSalon("null-rating-owner@beautica.test", "Null Rating Salon");
         UUID master = insertSalonMaster(salonId, "null-rating-master@beautica.test");
+        // Favourites list only bookable salons (2026-10-05). A SEPARATE, unreviewed bookable master
+        // keeps the salon listed after the reviewed one is deactivated, without adding a score.
+        BookableMasterSeeder.addBookableSalonMaster(jdbcTemplate, salonId);
         insertReview(salonId, master, clientId, 5);
         favoriteService.addFavorite(clientId, FavoriteTargetType.SALON, salonId);
         publishStaffChangedInCommittedTransaction(salonId);

@@ -31,7 +31,7 @@ public record MasterSummaryResponse(
                 // Free — the User is already graph-fetched (findBySalonId...WithUser) and
                 // dereferenced above for firstName/lastName, so no new N+1 is introduced.
                 master.getUser().getProfessionalTitle(),
-                null, // TODO: map from user.avatarUrl once Phase 2-B adds it to User
+                master.getUser().getAvatarUrl(),
                 BookingDetailResponse.masterAvgRatingOrNull(
                         master.getReviewCount(), master.getAvgRating()),
                 master.getReviewCount(),

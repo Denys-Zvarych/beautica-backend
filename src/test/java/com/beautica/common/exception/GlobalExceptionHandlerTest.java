@@ -28,6 +28,8 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.ParameterizedTest;
 import org.slf4j.LoggerFactory;
 import org.springframework.core.MethodParameter;
 import org.springframework.dao.CannotAcquireLockException;
@@ -488,6 +490,49 @@ class GlobalExceptionHandlerTest {
         assertThat(response.getBody().message())
                 .as("422 user-facing copy must be surfaced verbatim")
                 .isEqualTo("Скасування недоступне — менше ніж 2 год до запису");
+    }
+
+    @ParameterizedTest(name = "503 echoes allow-listed message: {0}")
+    @MethodSource("allowListedServiceUnavailableMessages")
+    @DisplayName("503 echoes every allow-listed fixed message unchanged")
+    void should_echoMessage_when_serviceUnavailableMessageIsAllowListed(String message) {
+        var response = handler.handleBusiness(new BusinessException(HttpStatus.SERVICE_UNAVAILABLE, message));
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
+        assertThat(response.getBody().message()).isEqualTo(message);
+    }
+
+    static java.util.stream.Stream<String> allowListedServiceUnavailableMessages() {
+        return ServiceUnavailableMessages.ALLOWED.stream();
+    }
+
+    @Test
+    @DisplayName("the 503 allow-list contains exactly the expected set")
+    void should_containExactlyExpectedMessages_when_inspectingServiceUnavailableAllowList() {
+        assertThat(ServiceUnavailableMessages.ALLOWED).containsExactlyInAnyOrder(
+                "Media storage is not configured",
+                "Service setup is busy for this master, please retry",
+                "Support channel is not configured",
+                "Could not send the verification code");
+    }
+
+    @Test
+    @DisplayName("503 with a non-allow-listed message returns the generic string and leaks nothing")
+    void should_returnGenericMessage_when_serviceUnavailableMessageNotAllowListed() {
+        var ex = new BusinessException(HttpStatus.SERVICE_UNAVAILABLE, "jdbc:postgresql://db:5432 refused");
+
+        var response = handler.handleBusiness(ex);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
+        assertThat(response.getBody().message()).isEqualTo("Service temporarily unavailable");
+    }
+
+    @Test
+    @DisplayName("503 with a null message returns the generic string")
+    void should_returnGenericMessage_when_serviceUnavailableMessageNull() {
+        var response = handler.handleBusiness(new BusinessException(HttpStatus.SERVICE_UNAVAILABLE, null));
+
+        assertThat(response.getBody().message()).isEqualTo("Service temporarily unavailable");
     }
 
     @Test

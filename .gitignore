@@ -140,3 +140,7 @@ docs/backend-phases/data/katottg-2025-07-02-free.json
 # allow-list entry. Ignoring this file is what keeps it out of that scan -- un-ignore it and
 # the guard goes red.
 docs/backend-phases/data/katottg-2025-05-16.json
+
+# Client Firebase configs
+google-services.json
+GoogleService-Info.plist

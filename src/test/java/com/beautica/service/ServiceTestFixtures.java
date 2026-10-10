@@ -4,7 +4,6 @@ import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.LoginRequest;
 import com.beautica.auth.dto.RegisterIndependentMasterRequest;
 import com.beautica.common.ApiResponse;
-import com.beautica.master.dto.MasterDetailResponse;
 import com.beautica.service.dto.CreateServiceDefinitionRequest;
 import com.beautica.service.entity.PriceType;
 import com.beautica.service.dto.MasterServiceResponse;
@@ -30,7 +29,7 @@ import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-class ServiceTestFixtures {
+public class ServiceTestFixtures {
 
     static final String TEST_PASSWORD = "Str0ngP@ss1!";
 
@@ -39,7 +38,7 @@ class ServiceTestFixtures {
     private final ObjectMapper objectMapper;
     private final PasswordEncoder passwordEncoder;
 
-    ServiceTestFixtures(
+    public ServiceTestFixtures(
             TestRestTemplate restTemplate,
             JdbcTemplate jdbcTemplate,
             ObjectMapper objectMapper,
@@ -51,7 +50,7 @@ class ServiceTestFixtures {
         this.passwordEncoder = passwordEncoder;
     }
 
-    String createSalonOwnerAndGetToken(String email) throws Exception {
+    public String createSalonOwnerAndGetToken(String email) throws Exception {
         String hash = passwordEncoder.encode(TEST_PASSWORD);
         jdbcTemplate.update(
                 "INSERT INTO users (id, email, password_hash, role, is_active, email_verified) VALUES (?, ?, ?, 'SALON_OWNER', true, true)",
@@ -64,7 +63,7 @@ class ServiceTestFixtures {
         return body.data().accessToken();
     }
 
-    UUID createSalon(String ownerToken, String name) throws Exception {
+    public UUID createSalon(String ownerToken, String name) throws Exception {
         // Vinnytsia has no urban districts in the official KATOTTH classifier, so
         // no districtId is required — only cityId is mandatory for provider locality.
         UUID cityId = LocalityTestLookup.majorCityIdByName(jdbcTemplate, "Вінниця");
@@ -104,7 +103,7 @@ class ServiceTestFixtures {
         return salonId;
     }
 
-    UUID createSalonMaster(UUID salonId) {
+    public UUID createSalonMaster(UUID salonId) {
         UUID masterUserId = UUID.randomUUID();
         String masterEmail = "master-" + UUID.randomUUID() + "@beautica.test";
         String hash = passwordEncoder.encode(TEST_PASSWORD);
@@ -130,7 +129,7 @@ class ServiceTestFixtures {
         return parsed.data().id();
     }
 
-    UUID createServiceDefinition(String ownerToken, UUID salonId, String name) throws Exception {
+    public UUID createServiceDefinition(String ownerToken, UUID salonId, String name) throws Exception {
         UUID serviceTypeId = resolveServiceTypeIdForCategory("NAIL_SERVICE");
         return createServiceDefinition(ownerToken, salonId,
                 new CreateServiceDefinitionRequest(name, null, "NAIL_SERVICE", 60, 0,
@@ -188,7 +187,7 @@ class ServiceTestFixtures {
      * canManageSalon resolves the admin's authority via users.salon_id, so the assignment
      * must be persisted for the on-behalf bulk endpoint to authorize the admin.
      */
-    String createSalonAdminAndGetToken(UUID salonId, String email) throws Exception {
+    public String createSalonAdminAndGetToken(UUID salonId, String email) throws Exception {
         String hash = passwordEncoder.encode(TEST_PASSWORD);
         jdbcTemplate.update(
                 "INSERT INTO users (id, email, password_hash, role, salon_id, is_active, email_verified) "
@@ -258,7 +257,7 @@ class ServiceTestFixtures {
     }
 
     /** Seeds an email-verified CLIENT and logs in, returning a fresh access token. */
-    String createClientAndGetToken(String email) throws Exception {
+    public String createClientAndGetToken(String email) throws Exception {
         jdbcTemplate.update(
                 "INSERT INTO users (id, email, password_hash, role, is_active, email_verified) "
                         + "VALUES (?, ?, ?, 'CLIENT', true, true)",
@@ -273,23 +272,20 @@ class ServiceTestFixtures {
     }
 
     /**
-     * Materialises the owner-operated {@code masters} row (the Phase 12.4
-     * {@code POST /salons/{salonId}/master} endpoint) and returns its {@code masters.id}. That
-     * row's {@code salon_id} is the owner's own salon, so it takes the salon bulk-create branch
-     * with no special-casing (Phase 302 D5).
+     * Returns the {@code masters.id} of the salon's owner-operated row. {@code createSalon}
+     * creates that active {@code SALON_OWNER} row with the owner's first salon, and it is
+     * permanent (Phase 346 removed the Phase 12.4 toggle endpoints). Its {@code salon_id} is the
+     * owner's own salon, so it takes the salon bulk-create branch with no special-casing
+     * (Phase 302 D5).
      */
-    UUID enableOwnerAsMaster(String ownerToken, UUID salonId) throws Exception {
-        ResponseEntity<String> resp = restTemplate.exchange(
-                "/api/v1/salons/" + salonId + "/master", HttpMethod.POST,
-                new HttpEntity<>(bearerHeaders(ownerToken)), String.class);
-        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
-        return objectMapper.readValue(
-                resp.getBody(), new TypeReference<ApiResponse<MasterDetailResponse>>() {})
-                .data().masterId();
+    UUID ownerMasterId(UUID salonId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT id FROM masters WHERE salon_id = ? AND master_type = 'SALON_OWNER' AND is_active = true",
+                UUID.class, salonId);
     }
 
     /** Resolves the master row id created when an independent master registers (1:1 with the user). */
-    UUID resolveMasterIdForUserEmail(String email) {
+    public UUID resolveMasterIdForUserEmail(String email) {
         return jdbcTemplate.queryForObject(
                 "SELECT m.id FROM masters m JOIN users u ON u.id = m.user_id WHERE u.email = ?",
                 UUID.class, email);
@@ -301,7 +297,7 @@ class ServiceTestFixtures {
      * selectable for the bulk-create flow. Distinct categories preferred is not required;
      * the test only needs valid, resolvable ids.
      */
-    java.util.List<SeededServiceType> activeSelectableServiceTypes(int limit) {
+    public java.util.List<SeededServiceType> activeSelectableServiceTypes(int limit) {
         return jdbcTemplate.query(
                 "SELECT st.id, st.name_uk, st.platform_category_name "
                         + "FROM service_types st "
@@ -363,18 +359,7 @@ class ServiceTestFixtures {
      * today's so the fixture cannot go stale when the suite runs after 17:00 local.
      */
     void seedUsableSchedule(UUID masterId) {
-        UUID scheduleId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO weekly_schedules (id, master_id, valid_from, valid_to, created_at, updated_at) "
-                        + "VALUES (?, ?, ?, NULL, NOW(), NOW())",
-                scheduleId, masterId, java.time.LocalDate.now(java.time.ZoneId.of("Europe/Kyiv")));
-        for (int isoDow = 1; isoDow <= 7; isoDow++) {
-            jdbcTemplate.update(
-                    "INSERT INTO working_intervals (id, schedule_id, day_of_week, start_time, end_time) "
-                            + "VALUES (?, ?, ?, ?, ?)",
-                    UUID.randomUUID(), scheduleId, isoDow,
-                    java.time.LocalTime.of(9, 0), java.time.LocalTime.of(17, 0));
-        }
+        com.beautica.support.BookableMasterSeeder.seedUsableSchedule(jdbcTemplate, masterId);
     }
 
     /**
@@ -390,7 +375,7 @@ class ServiceTestFixtures {
                 "SELECT min_effective_price FROM masters WHERE id = ?", BigDecimal.class, masterId);
     }
 
-    record SeededServiceType(UUID id, String nameUk, String platformCategoryName) {
+    public record SeededServiceType(UUID id, String nameUk, String platformCategoryName) {
     }
 
     /**
@@ -450,7 +435,7 @@ class ServiceTestFixtures {
         }
     }
 
-    HttpHeaders bearerHeaders(String token) {
+    public HttpHeaders bearerHeaders(String token) {
         HttpHeaders headers = new HttpHeaders();
         headers.setBearerAuth(token);
         headers.setContentType(MediaType.APPLICATION_JSON);

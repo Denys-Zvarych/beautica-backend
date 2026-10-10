@@ -68,6 +68,10 @@ class MediaSecurityTest extends AbstractMediaIntegrationTest {
     private static final String AVATAR_URL = "/api/v1/media/avatar";
     private static final String PORTFOLIO_URL = "/api/v1/media/portfolio";
 
+    /** Multipart part names a caller might try to smuggle a target user through (Phase 344 TC-3). */
+    private static final List<String> SMUGGLED_TARGET_FIELDS =
+            List.of("userId", "targetUserId", "adminId", "ownerId");
+
     @Autowired
     private TestRestTemplate restTemplate;
 
@@ -97,6 +101,7 @@ class MediaSecurityTest extends AbstractMediaIntegrationTest {
 
     @BeforeEach
     void seedFixtures() {
+        when(r2StorageService.isEnabled()).thenReturn(true);
         // Stub R2 so test paths do not fan out to a real bucket. buildPublicUrl
         // returns a deterministic URL so MediaFileResponse.url has a value.
         when(r2StorageService.buildPublicUrl(anyString()))
@@ -135,6 +140,92 @@ class MediaSecurityTest extends AbstractMediaIntegrationTest {
                 .as("avatar key must be scoped to user A (path prefix '/avatars/<userA>/...')")
                 .isNotNull()
                 .contains("avatars/" + userAId + "/");
+    }
+
+    // ── Phase 344 TC-2 — a smuggled target id never redirects an avatar write ─
+
+    @Test
+    @DisplayName("POST /media/avatar?userId=B with a userId=B part — only the caller A's avatar changes (Phase 344 TC-2)")
+    void should_writeOnlyCallerAvatar_when_uploadSmugglesOtherUserId() throws Exception {
+        String emailA = "p344-a-" + System.nanoTime() + "@beautica.test";
+        UUID userAId = insertClient(emailA);
+        UUID userBId = insertClient("p344-b-" + System.nanoTime() + "@beautica.test");
+        String bUrlBefore = seedAvatar(userBId);
+        String tokenA = loginAndGetToken(emailA);
+        MultiValueMap<String, Object> body = jpegMultipartBody();
+        body.add("userId", userBId.toString());
+
+        ResponseEntity<String> resp = restTemplate.exchange(
+                AVATAR_URL + "?userId=" + userBId, HttpMethod.POST,
+                new HttpEntity<>(body, bearerMultipartHeaders(tokenA)), String.class);
+
+        assertThat(resp.getStatusCode())
+                .as("the smuggled userId is ignored, not rejected — the JWT alone names the target")
+                .isEqualTo(HttpStatus.OK);
+        assertThat(avatarUrlOf(userAId))
+                .as("caller A's own avatar must be written under avatars/<A>/")
+                .startsWith("https://cdn.example/avatars/" + userAId + "/");
+        assertAvatarUntouched(userBId, bUrlBefore);
+    }
+
+    @Test
+    @DisplayName("DELETE /media/avatar?userId=B — only the caller A's avatar is cleared (Phase 344 TC-2)")
+    void should_clearOnlyCallerAvatar_when_deleteSmugglesOtherUserId() throws Exception {
+        String emailA = "p344-da-" + System.nanoTime() + "@beautica.test";
+        UUID userAId = insertClient(emailA);
+        UUID userBId = insertClient("p344-db-" + System.nanoTime() + "@beautica.test");
+        seedAvatar(userAId);
+        String bUrlBefore = seedAvatar(userBId);
+        String tokenA = loginAndGetToken(emailA);
+
+        ResponseEntity<String> resp = restTemplate.exchange(
+                AVATAR_URL + "?userId=" + userBId, HttpMethod.DELETE,
+                new HttpEntity<>(bearerHeaders(tokenA)), String.class);
+
+        assertThat(resp.getStatusCode().is2xxSuccessful())
+                .as("DELETE must succeed for the caller; got %s", resp.getStatusCode())
+                .isTrue();
+        assertThat(avatarUrlOf(userAId)).as("caller A's own avatar must be cleared").isNull();
+        assertAvatarUntouched(userBId, bUrlBefore);
+    }
+
+    // ── Phase 344 TC-3 — an owner cannot set their salon admin's photo ────────
+
+    @Test
+    @DisplayName("SALON_OWNER naming their admin in every reachable place — owner's avatar changes, admin's does not (Phase 344 TC-3)")
+    void should_writeOnlyOwnerAvatar_when_ownerTargetsAdminEverywhere() throws Exception {
+        String ownerEmail = "p344-owner-" + System.nanoTime() + "@beautica.test";
+        UUID ownerId = insertSalonOwner(ownerEmail);
+        UUID salonId = insertSalon(ownerId, "P344 Salon " + System.nanoTime());
+        UUID adminId = insertSalonAdmin("p344-admin-" + System.nanoTime() + "@beautica.test", salonId);
+        String adminUrlBefore = seedAvatar(adminId);
+        String ownerToken = loginAndGetToken(ownerEmail);
+        String target = adminId.toString();
+        MultiValueMap<String, Object> body = jpegMultipartBody();
+        for (String field : SMUGGLED_TARGET_FIELDS) {
+            body.add(field, target);
+        }
+        HttpHeaders headers = bearerMultipartHeaders(ownerToken);
+        headers.add("X-User-Id", target);
+        String query = "?userId=" + target + "&targetUserId=" + target + "&adminId=" + target
+                + "&salonId=" + salonId;
+
+        ResponseEntity<String> resp = restTemplate.exchange(
+                AVATAR_URL + query, HttpMethod.POST, new HttpEntity<>(body, headers), String.class);
+        ResponseEntity<String> pathResp = restTemplate.exchange(
+                AVATAR_URL + "/" + target, HttpMethod.POST,
+                new HttpEntity<>(jpegMultipartBody(), bearerMultipartHeaders(ownerToken)), String.class);
+
+        assertThat(resp.getStatusCode()).as("owner's own upload must succeed").isEqualTo(HttpStatus.OK);
+        assertThat(pathResp.getStatusCode().value())
+                .as("there is no /media/avatar/{userId} route — a path-addressed write must be a clean "
+                        + "404/405, never a 2xx and never a 5xx; got %s body=%s",
+                        pathResp.getStatusCode(), pathResp.getBody())
+                .isIn(HttpStatus.NOT_FOUND.value(), HttpStatus.METHOD_NOT_ALLOWED.value());
+        assertThat(avatarUrlOf(ownerId))
+                .as("the owner's own avatar is what changes")
+                .startsWith("https://cdn.example/avatars/" + ownerId + "/");
+        assertAvatarUntouched(adminId, adminUrlBefore);
     }
 
     // ── #12 — SEC-1 contract: owner A cannot upload portfolio for salon B ────
@@ -301,6 +392,37 @@ class MediaSecurityTest extends AbstractMediaIntegrationTest {
                 com.beautica.media.entity.MediaType.PORTFOLIO.name(),
                 key, "https://cdn.example/" + key);
         return mediaId;
+    }
+
+    private UUID insertSalonAdmin(String email, UUID salonId) {
+        UUID id = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO users (id, email, password_hash, role, is_active, email_verified, salon_id) "
+                        + "VALUES (?, ?, ?, 'SALON_ADMIN', true, true, ?)",
+                id, email, passwordEncoder.encode(TEST_PASSWORD), salonId);
+        return id;
+    }
+
+    /** Gives {@code userId} an existing avatar (V188-valid pointers) so "untouched" is observable. */
+    private String seedAvatar(UUID userId) {
+        String key = "avatars/" + userId + "/seed.jpg";
+        String url = "https://cdn.example/" + key;
+        jdbcTemplate.update("UPDATE users SET avatar_r2_key = ?, avatar_url = ? WHERE id = ?", key, url, userId);
+        return url;
+    }
+
+    private String avatarUrlOf(UUID userId) {
+        return jdbcTemplate.queryForObject("SELECT avatar_url FROM users WHERE id = ?", String.class, userId);
+    }
+
+    private void assertAvatarUntouched(UUID userId, String expectedUrl) {
+        assertThat(avatarUrlOf(userId))
+                .as("user %s's avatar_url must be untouched by another user's write", userId)
+                .isEqualTo(expectedUrl);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT avatar_r2_key FROM users WHERE id = ?", String.class, userId))
+                .as("user %s's avatar_r2_key must be untouched by another user's write", userId)
+                .isEqualTo("avatars/" + userId + "/seed.jpg");
     }
 
     private static HttpHeaders bearerHeaders(String token) {

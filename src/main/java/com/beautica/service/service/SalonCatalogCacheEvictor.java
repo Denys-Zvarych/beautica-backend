@@ -9,7 +9,7 @@ import java.util.UUID;
 
 /**
  * Dedicated single-key eviction for the {@code salon-service-catalog} cache backing
- * {@link ServiceCatalogService#getSalonServiceCatalog} (keyed by {@code salonId}).
+ * {@link ServiceCatalogService#getSalonServiceCatalog}, keyed by {@code salonId}.
  *
  * <p><b>Why a separate bean.</b> The catalogue verdict is invalidated from write paths in
  * three different packages — schedule writes ({@code MasterScheduleService}), booking writes

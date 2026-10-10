@@ -1,8 +1,6 @@
 package com.beautica.media;
 
-import com.beautica.common.ApiResponse;
 import com.beautica.config.TestSecurityConfig;
-import com.beautica.media.dto.AvatarResponse;
 import com.beautica.media.dto.MediaFileResponse;
 import com.beautica.media.entity.EntityType;
 import com.beautica.media.repository.MediaRepository;
@@ -13,6 +11,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -39,6 +40,7 @@ import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.atLeastOnce;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.times;
@@ -100,6 +102,7 @@ class MediaIntegrationTest extends AbstractMediaIntegrationTest {
 
     @BeforeEach
     void configureClientAndR2() {
+        when(r2StorageService.isEnabled()).thenReturn(true);
         when(r2StorageService.buildPublicUrl(anyString()))
                 .thenAnswer(inv -> "https://cdn.example/" + inv.getArgument(0));
         doNothing().when(r2StorageService).uploadFile(anyString(), any(), anyLong(), anyString());
@@ -163,7 +166,7 @@ class MediaIntegrationTest extends AbstractMediaIntegrationTest {
         String firstKey = jdbcTemplate.queryForObject(
                 "SELECT avatar_r2_key FROM users WHERE id = ?", String.class, userId);
 
-        // Act — second upload (must trigger r2.deleteFile(firstKey) before writing)
+        // Act — second upload (the superseded first key is purged after commit via deleteFiles)
         log.debug("Act: POST {} second time as user={} — first key must be deleted", AVATAR_URL, userId);
         ResponseEntity<String> second = restTemplate.exchange(
                 AVATAR_URL, HttpMethod.POST,
@@ -181,9 +184,10 @@ class MediaIntegrationTest extends AbstractMediaIntegrationTest {
                 .isNotEqualTo(firstKey);
 
         // Assert — R2 delete invoked with the first (now-superseded) key
-        ArgumentCaptor<String> deletedKey = ArgumentCaptor.forClass(String.class);
-        verify(r2StorageService, atLeastOnce()).deleteFile(deletedKey.capture());
-        assertThat(deletedKey.getAllValues())
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<java.util.Collection<String>> deletedKeys = ArgumentCaptor.forClass(java.util.Collection.class);
+        verify(r2StorageService, atLeastOnce()).deleteFiles(deletedKeys.capture());
+        assertThat(deletedKeys.getAllValues().stream().flatMap(java.util.Collection::stream).toList())
                 .as("R2 delete must have been called with the original avatar key")
                 .contains(firstKey);
     }
@@ -330,40 +334,46 @@ class MediaIntegrationTest extends AbstractMediaIntegrationTest {
                 .hasSize(1);
     }
 
-    // ── Fix 7 — r2Enabled=false shape test ───────────────────────────────────
+    // ── Phase 343 audit — multipart size boundary on the avatar + portfolio routes ──────────
+    // max-request-size (6MB) sits above max-file-size (5MB) so the multipart envelope no longer
+    // turns an exactly-5 MB image into a 413; the per-file cap still rejects 5 MB + 1 byte.
 
-    @Test
-    @DisplayName("POST /media/avatar — 200 with valid avatarUrl shape when R2 is disabled (mock mode)")
-    void should_returnExpectedShape_when_r2IsDisabled_onAvatarUpload() throws Exception {
-        // Arrange — R2StorageService is @MockBean; buildPublicUrl returns a stub URL
-        // (configured in @BeforeEach). This exercises the full controller → service path
-        // with the feature-flag-disabled no-op stubs, confirming the response shape.
-        String email = "media-it-r2-off-" + System.nanoTime() + "@beautica.test";
-        insertClient(email);
-        String token = loginAndGetToken(email);
+    @ParameterizedTest(name = "{0} with an exactly-5 MB JPEG → {1}")
+    @CsvSource({AVATAR_URL + ", 200", PORTFOLIO_URL + ", 201"})
+    @DisplayName("boundary: an exactly-5 MB JPEG passes the multipart layer and the service cap")
+    void should_acceptUpload_when_fileIsExactlyFiveMegabytes(String url, int expectedStatus) throws Exception {
+        // Arrange
+        String token = salonOwnerToken("exact-5mb");
 
         // Act
-        ResponseEntity<String> resp = restTemplate.exchange(
-                AVATAR_URL, HttpMethod.POST,
-                new HttpEntity<>(jpegMultipartBody(), bearerMultipartHeaders(token)),
-                String.class);
+        ResponseEntity<String> resp = restTemplate.exchange(url, HttpMethod.POST,
+                new HttpEntity<>(jpegMultipartBodyOfSize(FIVE_MB), bearerMultipartHeaders(token)), String.class);
 
-        // Assert — HTTP status
-        assertThat(resp.getStatusCode())
-                .as("avatar upload in disabled-R2 mode must still return 200")
-                .isEqualTo(HttpStatus.OK);
+        // Assert
+        assertThat(resp.getStatusCode().value()).as("body=%s", resp.getBody()).isEqualTo(expectedStatus);
+        verify(r2StorageService).uploadFile(anyString(), any(), eq((long) FIVE_MB), anyString());
+    }
 
-        // Assert — response body shape
-        var body = objectMapper.readValue(
-                resp.getBody(), new TypeReference<ApiResponse<AvatarResponse>>() {});
-        assertThat(body.success())
-                .as("ApiResponse.success must be true")
-                .isTrue();
-        assertThat(body.data())
-                .as("AvatarResponse must be present")
-                .isNotNull();
-        assertThat(body.data().avatarUrl())
-                .as("avatarUrl must be non-blank — stub buildPublicUrl returns https://cdn.example/...")
-                .isNotBlank();
+    @ParameterizedTest(name = "{0} with a 5 MB + 1 byte JPEG → 413")
+    @ValueSource(strings = {AVATAR_URL, PORTFOLIO_URL})
+    @DisplayName("boundary: a 5 MB + 1 byte JPEG is rejected with 413 at the multipart layer, no R2 upload")
+    void should_return413_when_fileIsFiveMegabytesPlusOneByte(String url) throws Exception {
+        // Arrange
+        String token = salonOwnerToken("over-5mb");
+
+        // Act
+        ResponseEntity<String> resp = restTemplate.exchange(url, HttpMethod.POST,
+                new HttpEntity<>(jpegMultipartBodyOfSize(FIVE_MB + 1), bearerMultipartHeaders(token)), String.class);
+
+        // Assert
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.PAYLOAD_TOO_LARGE);
+        verify(r2StorageService, never()).uploadFile(anyString(), any(), anyLong(), anyString());
+    }
+
+    private String salonOwnerToken(String tag) throws Exception {
+        String email = "media-it-" + tag + "-" + System.nanoTime() + "@beautica.test";
+        UUID ownerId = insertSalonOwner(email);
+        insertSalon(ownerId, "Boundary Salon " + tag);
+        return loginAndGetToken(email);
     }
 }

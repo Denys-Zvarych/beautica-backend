@@ -543,9 +543,10 @@ class FlexiblePricingContractIT extends AbstractIntegrationTest {
                 new HttpEntity<>(objectMapper.writeValueAsString(patch), fixtures.bearerHeaders(ownerToken)),
                 String.class);
 
-        // The ownership SpEL resolves the (missing) owner first and denies access → 403,
-        // which is the documented existence-oracle-safe behaviour for canManageServiceDefinition
-        // (findOwnerUserId empty → orElse(false)). Assert the actor is not granted access.
+        // The ownership gate resolves the (missing) owner first and denies access → 403,
+        // which is the documented existence-oracle-safe behaviour of
+        // enforceCanManageServiceDefinition (findOwnerUserId empty → Forbidden). Assert the actor
+        // is not granted access.
         assertThat(resp.getStatusCode())
                 .as("an unknown service id must NOT return 2xx, body=%s", resp.getBody())
                 .isIn(HttpStatus.FORBIDDEN, HttpStatus.NOT_FOUND);

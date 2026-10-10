@@ -1,5 +1,6 @@
 package com.beautica.search;
 
+import com.beautica.support.BookableMasterSeeder;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.location.DiscoveryLocationResolver;
 import com.beautica.search.dto.LocationFilter;
@@ -135,6 +136,8 @@ class SearchReworkRegressionTest extends AbstractIntegrationTest {
                 "INSERT INTO salons (id, owner_id, name, city, region, city_id, is_active, created_at, updated_at) "
                         + "VALUES (?, ?, ?, 'Киев', 'kyiv-oblast-RU', ?, true, NOW(), NOW())",
                 salonId, ownerId, "RegressionSalon", kyivCityId);
+        // Discoverable only with >=1 bookable master (MasterBookabilitySql, 2026-10-05).
+        BookableMasterSeeder.addBookableSalonMaster(jdbcTemplate, salonId);
 
         // Search by the taxonomy city_id of "Київ". Pre-fix this returned 0
         // (free-text "Київ" != stored "Киев"); post-fix the FK matches.
@@ -178,6 +181,7 @@ class SearchReworkRegressionTest extends AbstractIntegrationTest {
                 "INSERT INTO masters (id, user_id, master_type, avg_rating, review_count, is_active, created_at, updated_at) "
                         + "VALUES (?, ?, 'INDEPENDENT_MASTER', 4.5::numeric, 1, true, NOW(), NOW())",
                 masterId, masterUserId);
+        BookableMasterSeeder.makeIndependentBookable(jdbcTemplate, masterId);
 
         ResponseEntity<String> response = restTemplate.exchange(
                 MASTERS_URL + "?location.cityId=" + kyivCityId + "&page=0&size=20",
@@ -418,6 +422,8 @@ class SearchReworkRegressionTest extends AbstractIntegrationTest {
                         + "is_active, created_at, updated_at) "
                         + "VALUES (?, ?, ?, 'SALON_MASTER', 4.5::numeric, 2, true, NOW(), NOW())",
                 masterId, masterUserId, salonId);
+        // Bookable, so the exclusion below is the role/locality rule under test, not bookability.
+        BookableMasterSeeder.makeBookable(jdbcTemplate, salonId, masterId);
 
         ResponseEntity<String> underPersonalDistrict = restTemplate.exchange(
                 MASTERS_URL + "?location.cityId=" + ownerPersonalCity
@@ -459,6 +465,9 @@ class SearchReworkRegressionTest extends AbstractIntegrationTest {
                 "INSERT INTO masters (id, user_id, salon_id, master_type, avg_rating, review_count, is_active, created_at, updated_at) "
                         + "VALUES (?, ?, ?, 'SALON_MASTER', 4.7::numeric, 3, true, NOW(), NOW())",
                 masterId, masterUserId, salonId);
+        // Bookable: the salon must be discoverable, and an excluded SALON_MASTER must be excluded
+        // for its role, not for lacking services/hours (MasterBookabilitySql, 2026-10-05).
+        BookableMasterSeeder.makeBookable(jdbcTemplate, salonId, masterId);
         return masterId;
     }
 
@@ -480,6 +489,7 @@ class SearchReworkRegressionTest extends AbstractIntegrationTest {
                 "INSERT INTO masters (id, user_id, master_type, avg_rating, review_count, is_active, created_at, updated_at) "
                         + "VALUES (?, ?, 'INDEPENDENT_MASTER', 4.2::numeric, 1, true, NOW(), NOW())",
                 masterId, userId);
+        BookableMasterSeeder.makeIndependentBookable(jdbcTemplate, masterId);
         return masterId;
     }
 

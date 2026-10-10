@@ -19,11 +19,13 @@ import org.springframework.stereotype.Service;
 import java.time.OffsetDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.Map;
-import java.util.UUID;
 import java.util.regex.Pattern;
 
 /**
- * Thin notification-side facade that dispatches email, push, and (guest-only) SMS notifications.
+ * Thin notification-side facade that dispatches email and (guest-only) SMS notifications. Push is
+ * NOT sent from here (phase 339): every Android push is fanned out from the in-app feed write path
+ * via the {@code INAPP_PUSH} outbox event ({@code InAppPushDispatcher}), so each event has exactly
+ * one push source.
  *
  * <p>Methods are synchronous — invoked by {@code NotificationOutboxDrainWorker}, which already
  * runs after the originating transaction has committed (Phase 3 of the drain: {@code
@@ -36,8 +38,6 @@ import java.util.regex.Pattern;
 @Slf4j
 @Service
 public class NotificationService {
-
-    private static final int PUSH_BODY_MAX_LENGTH = 256;
 
     /** Cyrillic SMS segments are ~70 chars; 120 keeps a decline note to two segments. */
     private static final int SMS_COMMENT_MAX_LENGTH = 120;
@@ -79,7 +79,6 @@ public class NotificationService {
     private static final Pattern BARE_IPV4 = Pattern.compile("\\d{1,3}(?:\\.\\d{1,3}){3}");
 
     private final EmailNotificationService emailService;
-    private final PushNotificationService pushService;
     private final SmsService smsService;
     private final BookingSmsProperties smsProperties;
     private final String frontendBaseUrl;
@@ -87,13 +86,11 @@ public class NotificationService {
     // Explicit constructor — @RequiredArgsConstructor cannot bind the @Value frontend base URL.
     public NotificationService(
             EmailNotificationService emailService,
-            PushNotificationService pushService,
             SmsService smsService,
             BookingSmsProperties smsProperties,
             @Value("${app.frontend.base-url}") String frontendBaseUrl
     ) {
         this.emailService = emailService;
-        this.pushService = pushService;
         this.smsService = smsService;
         this.smsProperties = smsProperties;
         this.frontendBaseUrl = frontendBaseUrl;
@@ -116,25 +113,13 @@ public class NotificationService {
         if (masterUser == null) {
             return;
         }
-        String masterEmail = masterUser.getEmail();
-        UUID masterUserId = masterUser.getId();
-        String clientName = resolveClientName(booking);
-        String bookingId = booking.getId().toString();
-
-        emailService.sendNewBookingEmail(masterEmail, visit);
-        pushService.sendToUser(
-                masterUserId,
-                "Нове бронювання",
-                truncate("Клієнт " + clientName + " забронював " + bookedSubject(visit)),
-                Map.of("type", "NEW_BOOKING", "bookingId", bookingId)
-        );
+        emailService.sendNewBookingEmail(masterUser.getEmail(), visit);
     }
 
     /**
-     * What the push body says was booked: the service NAME for a single-service booking (unchanged
-     * pre-visit wording), or a numeral phrase — «3 послуги», «5 послуг» — for a multi-service visit.
-     * A visit's full service list is not pushed: the push body is capped at
-     * {@link #PUSH_BODY_MAX_LENGTH} and up to ten names would be truncated mid-name.
+     * What the guest SMS says was booked: the service NAME for a single-service booking, or a
+     * numeral phrase — «3 послуги», «5 послуг» — for a multi-service visit. A visit's full service
+     * list is not named: up to ten names would blow the SMS segment budget.
      */
     private static String bookedSubject(BookingVisit visit) {
         return visit.isMultiService()
@@ -222,20 +207,10 @@ public class NotificationService {
         }
         BookingStatus status = booking.getStatus();
         String clientEmail = booking.getClient().getEmail();
-        UUID clientUserId = booking.getClient().getId();
-        String serviceName = safe(booking.getMasterService().getServiceDefinition().getName());
         String bookingId = booking.getId().toString();
 
         switch (status) {
-            case CONFIRMED -> {
-                emailService.sendBookingConfirmedEmail(clientEmail, visit);
-                pushService.sendToUser(
-                        clientUserId,
-                        "Бронювання підтверджено",
-                        truncate("Ваше бронювання на " + bookedSubject(visit) + " підтверджено"),
-                        Map.of("type", "BOOKING_CONFIRMED", "bookingId", bookingId)
-                );
-            }
+            case CONFIRMED -> emailService.sendBookingConfirmedEmail(clientEmail, visit);
             // A decline arrives by TWO different routes and they need OPPOSITE copy — see
             // isWholeVisitDecline. Getting this wrong in either direction misinforms the client:
             // naming the whole visit for a per-item decline cancels services that are still on;
@@ -244,20 +219,8 @@ public class NotificationService {
             case DECLINED -> {
                 if (isWholeVisitDecline(visit)) {
                     emailService.sendVisitDeclinedEmail(clientEmail, visit);
-                    pushService.sendToUser(
-                            clientUserId,
-                            "Бронювання скасовано",
-                            truncate("Ваше бронювання на " + bookedSubject(visit) + " скасовано"),
-                            Map.of("type", "BOOKING_DECLINED", "bookingId", bookingId)
-                    );
                 } else {
                     emailService.sendBookingDeclinedEmail(clientEmail, booking);
-                    pushService.sendToUser(
-                            clientUserId,
-                            "Бронювання скасовано",
-                            truncate("Ваше бронювання на " + serviceName + " скасовано"),
-                            Map.of("type", "BOOKING_DECLINED", "bookingId", bookingId)
-                    );
                 }
             }
             default -> log.debug("No notification action for booking status [{}], bookingId={}", status, bookingId);
@@ -275,18 +238,7 @@ public class NotificationService {
         if (masterUser == null) {
             return;
         }
-        String masterEmail = masterUser.getEmail();
-        UUID masterUserId = masterUser.getId();
-        String serviceName = safe(booking.getMasterService().getServiceDefinition().getName());
-        String bookingId = booking.getId().toString();
-
-        emailService.sendBookingRescheduledEmail(masterEmail, booking);
-        pushService.sendToUser(
-                masterUserId,
-                "Бронювання перенесено",
-                truncate("Клієнт переніс бронювання на " + serviceName),
-                Map.of("type", "BOOKING_RESCHEDULED", "bookingId", bookingId)
-        );
+        emailService.sendBookingRescheduledEmail(masterUser.getEmail(), booking);
     }
 
     /**
@@ -306,18 +258,7 @@ public class NotificationService {
             log.debug("Skipping client-facing BOOKING_RESCHEDULED for account-less guest booking {}", booking.getId());
             return;
         }
-        String clientEmail = booking.getClient().getEmail();
-        UUID clientUserId = booking.getClient().getId();
-        String serviceName = safe(booking.getMasterService().getServiceDefinition().getName());
-        String bookingId = booking.getId().toString();
-
-        emailService.sendBookingRescheduledClientEmail(clientEmail, booking);
-        pushService.sendToUser(
-                clientUserId,
-                "Бронювання перенесено",
-                truncate("Ваш майстер переніс бронювання на " + serviceName),
-                Map.of("type", "BOOKING_RESCHEDULED", "bookingId", bookingId)
-        );
+        emailService.sendBookingRescheduledClientEmail(booking.getClient().getEmail(), booking);
     }
 
     /**
@@ -336,19 +277,9 @@ public class NotificationService {
             return;
         }
         String clientEmail = booking.getClient().getEmail();
-        UUID clientUserId = booking.getClient().getId();
-        String serviceName = safe(booking.getMasterService().getServiceDefinition().getName());
-        String bookingId = booking.getId().toString();
-
-        String reviewUrl = buildReviewUrl(bookingId);
+        String reviewUrl = buildReviewUrl(booking.getId().toString());
 
         emailService.sendReviewRequestEmail(clientEmail, booking, reviewUrl);
-        pushService.sendToUser(
-                clientUserId,
-                "Оцініть візит",
-                truncate("Як пройшов ваш візит на " + serviceName + "? Залиште відгук"),
-                Map.of("type", "REVIEW_REQUESTED", "bookingId", bookingId)
-        );
     }
 
     /**
@@ -363,8 +294,7 @@ public class NotificationService {
      * <p>A guest (LINK) booking still has a real master to nudge (guests only lack a client
      * account — see {@link #notifyNewBooking(BookingVisit)}), so unlike the client-facing notify
      * methods above, there is no {@code booking.getClient() == null} guard to skip: the recipient
-     * here never depends on the client existing. {@link #resolveClientName(Booking)} already
-     * handles the guest case for the copy that names the client in the reminder.
+     * here never depends on the client existing.
      */
     public void notifyClosureReminder(Booking booking) {
         User masterUser = providerRecipient(booking, "CLOSURE_REMINDER");
@@ -372,18 +302,9 @@ public class NotificationService {
             return;
         }
         String masterEmail = masterUser.getEmail();
-        UUID masterUserId = masterUser.getId();
-        String clientName = resolveClientName(booking);
-        String serviceName = safe(booking.getMasterService().getServiceDefinition().getName());
         String bookingId = booking.getId().toString();
 
         emailService.sendClosureReminderEmail(masterEmail, booking, buildBookingUrl(bookingId));
-        pushService.sendToUser(
-                masterUserId,
-                "Позначте візит",
-                truncate("Візит з " + clientName + " на " + serviceName + " завершився — закрийте його"),
-                Map.of("type", "CLOSURE_REMINDER", "bookingId", bookingId)
-        );
     }
 
     /**
@@ -420,17 +341,7 @@ public class NotificationService {
             }
             return;
         }
-        String clientEmail = booking.getClient().getEmail();
-        UUID clientUserId = booking.getClient().getId();
-        String bookingId = booking.getId().toString();
-
-        emailService.sendSalonClosedEmail(clientEmail, visit);
-        pushService.sendToUser(
-                clientUserId,
-                "Салон закрито",
-                truncate("Салон закрився, і ваше бронювання на " + bookedSubject(visit) + " скасовано"),
-                Map.of("type", "SALON_CLOSED", "bookingId", bookingId)
-        );
+        emailService.sendSalonClosedEmail(booking.getClient().getEmail(), visit);
     }
 
     /**
@@ -462,18 +373,7 @@ public class NotificationService {
             }
             return;
         }
-        String clientEmail = booking.getClient().getEmail();
-        UUID clientUserId = booking.getClient().getId();
-        String bookingId = booking.getId().toString();
-
-        emailService.sendMasterRemovedEmail(clientEmail, visit);
-        pushService.sendToUser(
-                clientUserId,
-                "Майстра більше немає в салоні",
-                truncate("Майстер, який мав прийняти вас на " + bookedSubject(visit) + ", більше не "
-                        + "працює в цьому салоні, і ваше бронювання скасовано"),
-                Map.of("type", "MASTER_REMOVED", "bookingId", bookingId)
-        );
+        emailService.sendMasterRemovedEmail(booking.getClient().getEmail(), visit);
     }
 
     public void notifyClientCancelled(Booking booking) {
@@ -481,19 +381,7 @@ public class NotificationService {
         if (masterUser == null) {
             return;
         }
-        String masterEmail = masterUser.getEmail();
-        UUID masterUserId = masterUser.getId();
-        String clientName = resolveClientName(booking);
-        String serviceName = safe(booking.getMasterService().getServiceDefinition().getName());
-        String bookingId = booking.getId().toString();
-
-        emailService.sendClientCancelledEmail(masterEmail, booking);
-        pushService.sendToUser(
-                masterUserId,
-                "Клієнт скасував бронювання",
-                truncate(clientName + " скасував бронювання на " + serviceName),
-                Map.of("type", "CLIENT_CANCELLED", "bookingId", bookingId)
-        );
+        emailService.sendClientCancelledEmail(masterUser.getEmail(), booking);
     }
 
     /**
@@ -535,27 +423,6 @@ public class NotificationService {
                     "app.frontend.base-url must use HTTPS scheme for non-localhost origins, got: " + frontendBaseUrl);
         }
         return frontendBaseUrl + "/bookings/" + bookingId;
-    }
-
-    /**
-     * Resolves the display name of the person who made this booking, for the master-facing
-     * {@code NEW_BOOKING} / {@code CLIENT_CANCELLED} notifications.
-     *
-     * <p>A guest (LINK) booking has no registered account (V89 {@code chk_bookings_guest_fields}
-     * — {@code client_id} is null), so {@code booking.getClient()} unconditionally would NPE the
-     * outbox drain for every single guest booking (both on creation and on the guest's own
-     * token-based cancellation via {@link com.beautica.booking.service.BookingCancellationService}
-     * — {@code CLIENT_CANCELLED} is guest-only; there is no authenticated-client caller). Falls
-     * back to the OTP-verified guest identity, mirroring {@code BookingDetailResponse.from}.
-     * This is the master's own booking, so surfacing the guest's name is not a PII leak;
-     * {@code guestPhone} is intentionally never read here.
-     */
-    private static String resolveClientName(Booking booking) {
-        var client = booking.getClient();
-        if (client != null) {
-            return (safe(client.getFirstName()) + " " + safe(client.getLastName())).trim();
-        }
-        return (safe(booking.getGuestName()) + " " + safe(booking.getGuestSurname())).trim();
     }
 
     /**
@@ -811,10 +678,5 @@ public class NotificationService {
 
     private static String safe(String value) {
         return value == null ? "" : value;
-    }
-
-    private static String truncate(String value) {
-        if (value.length() <= PUSH_BODY_MAX_LENGTH) return value;
-        return value.substring(0, PUSH_BODY_MAX_LENGTH - 1) + "…";
     }
 }

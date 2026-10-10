@@ -27,6 +27,10 @@ import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyCollection;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 
 /**
@@ -65,7 +69,16 @@ class SalonDeactivationCascadeIT extends AbstractIntegrationTest {
     @Autowired
     private PasswordEncoder passwordEncoder;
 
-    @Autowired
+    /**
+     * {@code @SpyBean}, not plain {@code @Autowired} (perf MEDIUM, phase 337 cycle-2 audit): this
+     * class's own direct {@code declineConfirmedBulk}/{@code findAllCompletionAccessByAppointmentId(s)}
+     * calls (cases 19/20 and the two statement-count cases below) still go through the REAL
+     * repository — Spring's {@code @SpyBean} wraps rather than replaces it — but spying lets the
+     * statement-count cases below {@code verify(...)} exactly which projection method {@code
+     * SalonService#deactivateSalon}'s cascade calls, and how many times, without adding a second
+     * bean of the same type.
+     */
+    @SpyBean
     private BookingRepository bookingRepository;
 
     @Autowired
@@ -380,6 +393,40 @@ class SalonDeactivationCascadeIT extends AbstractIntegrationTest {
                 .isEqualTo("CANCELLED");
     }
 
+    @Test
+    @DisplayName("perf MEDIUM (phase 337 cycle-2 audit) — a ONE-appointment-visit closure cascade "
+            + "authorizes via the batched projection exactly once, never the per-visit single-id form")
+    void should_issueOneBatchedAuthorizationStatement_when_cascadeHasOneAppointmentVisit() {
+        Salon salon = createSalon();
+        UUID clientId = createClient();
+        insertVisit(clientId, salon, FUTURE, 1);
+
+        salonService.deactivateSalon(salon.ownerId(), salon.salonId());
+
+        verify(bookingRepository, times(1)).findAllCompletionAccessByAppointmentIds(anyCollection());
+        verify(bookingRepository, never()).findAllCompletionAccessByAppointmentId(any());
+    }
+
+    @Test
+    @DisplayName("perf MEDIUM (phase 337 cycle-2 audit) — a TWENTY-appointment-visit closure "
+            + "cascade STILL authorizes via the batched projection exactly ONCE — the query count is "
+            + "FLAT in the number of visits. Before this fix, AuthorizationService#enforceCanManageAppointment "
+            + "(actor, appointmentId, memo) was called once per distinct appointment-visit, each issuing "
+            + "its own findAllCompletionAccessByAppointmentId statement — 20 statements for this fixture, "
+            + "not 1")
+    void should_issueOneBatchedAuthorizationStatement_when_cascadeHasTwentyAppointmentVisits() {
+        Salon salon = createSalon();
+        UUID clientId = createClient();
+        for (int i = 0; i < 20; i++) {
+            insertVisit(clientId, salon, FUTURE.plusHours(2L * i), 1);
+        }
+
+        salonService.deactivateSalon(salon.ownerId(), salon.salonId());
+
+        verify(bookingRepository, times(1)).findAllCompletionAccessByAppointmentIds(anyCollection());
+        verify(bookingRepository, never()).findAllCompletionAccessByAppointmentId(any());
+    }
+
     // ── Phase 268 — catalogue deactivation, favourites hard-delete, media purge ───────────────
 
     @Test
@@ -488,6 +535,26 @@ class SalonDeactivationCascadeIT extends AbstractIntegrationTest {
     }
 
     @Test
+    @DisplayName("phase 343 TC-9 — keyed logo + cover: both STORED keys are purged after commit (key wins over the "
+            + "URL, which here is not even an R2 URL) and all four pointer columns are nulled")
+    void should_purgeStoredImageKeys_when_salonWithKeyedLogoAndCoverDeactivated() {
+        Salon salon = createSalon();
+        String logoKey = "salons/" + salon.salonId() + "/logo/l.jpg";
+        String coverKey = "salons/" + salon.salonId() + "/cover/c.jpg";
+        jdbcTemplate.update("UPDATE salons SET avatar_url = ?, avatar_r2_key = ?, cover_image_url = ?, "
+                        + "cover_r2_key = ? WHERE id = ?",
+                "https://elsewhere.example/a.jpg", logoKey, "https://elsewhere.example/b.jpg", coverKey,
+                salon.salonId());
+
+        salonService.deactivateSalon(salon.ownerId(), salon.salonId());
+
+        verify(r2StorageService).deleteFiles(List.of(logoKey, coverKey));
+        var cols = jdbcTemplate.queryForMap("SELECT avatar_url, avatar_r2_key, cover_image_url, cover_r2_key "
+                + "FROM salons WHERE id = ?", salon.salonId());
+        assertThat(cols.values()).as("every image pointer column is nulled").containsOnlyNulls();
+    }
+
+    @Test
     @DisplayName("phase 268 case 8 — media belonging to a DIFFERENT salon is untouched")
     void should_notTouchMediaOfOtherSalons_when_salonDeactivated() {
         Salon salon = createSalon();
@@ -529,7 +596,7 @@ class SalonDeactivationCascadeIT extends AbstractIntegrationTest {
     @Test
     @DisplayName("phase 268 GAP fix, ordering pin — R2 delete is actually ATTEMPTED for a "
             + "staff-uploaded salon photo's key, proving deactivateSalon's pre-read "
-            + "(mediaRepository.findByEntityTypeAndEntityId, SalonService.java around line 957-958) "
+            + "(mediaRepository.findMediaKeysByEntityTypeAndEntityId in SalonService.deactivateSalon) "
             + "ran BEFORE deleteSalonStaff hard-deleted the uploader and cascaded the row away. "
             + "The row-count-only assertion in the previous test cannot tell these two orderings "
             + "apart — both end with the row gone, one via this sweep's own DB delete, the other "

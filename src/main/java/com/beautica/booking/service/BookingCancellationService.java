@@ -10,6 +10,8 @@ import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.util.Placeholders;
 import com.beautica.config.BookingSmsProperties;
 import com.beautica.master.entity.Master;
+import com.beautica.notification.inapp.entity.InAppNotificationType;
+import com.beautica.notification.inapp.service.InAppNotificationService;
 import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.service.service.SalonCatalogCacheEvictor;
 import org.springframework.http.HttpStatus;
@@ -60,6 +62,9 @@ public class BookingCancellationService {
     private final BookingSmsProperties smsProperties;
     private final SalonCatalogCacheEvictor salonCatalogCacheEvictor;
     private final Clock kyivClock;
+    // Phase 333 — see InAppNotificationService's class javadoc for why this is a separate seam from
+    // outboxService, never called from it.
+    private final InAppNotificationService inAppNotificationService;
 
     public BookingCancellationService(
             GuestVisitCancellationService guestVisitCancellationService,
@@ -69,7 +74,8 @@ public class BookingCancellationService {
             SlotCalculationService slotCalculationService,
             BookingSmsProperties smsProperties,
             SalonCatalogCacheEvictor salonCatalogCacheEvictor,
-            Clock clock) {
+            Clock clock,
+            InAppNotificationService inAppNotificationService) {
         this.guestVisitCancellationService = guestVisitCancellationService;
         this.bookingRepository = bookingRepository;
         this.outboxService = outboxService;
@@ -78,6 +84,7 @@ public class BookingCancellationService {
         this.smsProperties = smsProperties;
         this.salonCatalogCacheEvictor = salonCatalogCacheEvictor;
         this.kyivClock = clock.withZone(TimeZones.KYIV);
+        this.inAppNotificationService = inAppNotificationService;
     }
 
     /**
@@ -130,6 +137,11 @@ public class BookingCancellationService {
         // propagation); the drain worker delivers the push after commit. Reuses the
         // existing CLIENT_CANCELLED event — the same one the authenticated cancel path uses.
         outboxService.enqueueClientCancelled(booking.getId());
+        // Phase 333, matrix row 2 — provider set; no actor (guest, no user account). `booking` is
+        // the same full-graph instance loadCancellableOrThrow loaded above — never reloaded
+        // (audit-fix cycle 1, finding 1).
+        inAppNotificationService.notifyBookingEvent(
+                InAppNotificationType.BOOKING_CANCELLED_BY_CLIENT, booking, null);
 
         // Guest cancellation SMS dispatched only after commit — a rolled-back cancel
         // sends nothing.

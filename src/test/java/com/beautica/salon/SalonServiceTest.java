@@ -178,6 +178,15 @@ class SalonServiceTest {
     @Mock
     private com.beautica.media.service.MediaService mediaService;
 
+    // Phase 342: deactivateSalon hands the uploaded-photo keys (read from the row-locked catalogue)
+    // to the shared purger after commit.
+    @Mock
+    private com.beautica.service.service.ServicePhotoBlobPurger servicePhotoBlobPurger;
+
+    // Perf P-L2: the after-commit salon media purge is submitted as ONE task through this seam.
+    @Mock
+    private com.beautica.media.service.AfterCommitBlobPurger afterCommitBlobPurger;
+
     @Mock
     private org.springframework.transaction.PlatformTransactionManager transactionManager;
 
@@ -1358,6 +1367,165 @@ class SalonServiceTest {
         verify(salonRepository, never()).save(any());
         verify(salonRepository, never()).findById(any());
         verify(salonRepository, never()).existsByIdAndOwnerId(any(), any());
+        // Phase 342 D6: the catalogue is row-locked, pointers cleared, then blobs purged — nothing else.
+        verify(serviceRepository).lockAllByOwnerOrderById(com.beautica.service.entity.OwnerType.SALON, salonId);
+        verify(serviceRepository).clearPhotosByOwner(com.beautica.service.entity.OwnerType.SALON, salonId);
+        verify(serviceRepository).deactivateAllByOwner(com.beautica.service.entity.OwnerType.SALON, salonId);
+        verify(servicePhotoBlobPurger).purgeAfterCommit(List.of());
+        org.mockito.Mockito.verifyNoMoreInteractions(serviceRepository, servicePhotoBlobPurger);
+    }
+
+    @Test
+    @DisplayName("deactivateSalon — row-locks the service catalogue BEFORE the booking decline cascade, the first masters read of the staff cascade, and the photo clear / deactivate (deadlock lock order)")
+    void should_lockServiceCatalogueBeforeAnyMastersWrite_when_deactivateSalon() {
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        Salon salon = buildSalon(salonId, owner, "Active Salon");
+        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(salonRepository.findByIdAndOwnerId(salonId, ownerId)).thenReturn(Optional.of(salon));
+        stubCleanEmptyStaffCascade(salonId);
+
+        salonService.deactivateSalon(ownerId, salonId);
+
+        var order = org.mockito.Mockito.inOrder(serviceRepository, bookingService, masterRepository);
+        order.verify(serviceRepository).lockAllByOwnerOrderById(com.beautica.service.entity.OwnerType.SALON, salonId);
+        order.verify(bookingService).declineFutureConfirmedBookingsForSalonClosure(ownerId, salonId);
+        order.verify(masterRepository).findBySalonIdAndIsActiveTrueWithUser(eq(salonId), any());
+        order.verify(serviceRepository).clearPhotosByOwner(com.beautica.service.entity.OwnerType.SALON, salonId);
+        order.verify(serviceRepository).deactivateAllByOwner(com.beautica.service.entity.OwnerType.SALON, salonId);
+    }
+
+    @Test
+    @DisplayName("deactivateSalon — purges exactly the photo keys read from the locked catalogue rows, skipping rows without a photo")
+    void should_purgeLockedPhotoKeys_when_deactivateSalon() {
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        Salon salon = buildSalon(salonId, owner, "Active Salon");
+        UUID withPhotoId = UUID.randomUUID();
+        var withPhoto = org.mockito.Mockito.mock(com.beautica.service.entity.ServiceDefinition.class);
+        when(withPhoto.getId()).thenReturn(withPhotoId);
+        when(withPhoto.getPhotoR2Key()).thenReturn("services/abc/photo.jpg");
+        var withoutPhoto = org.mockito.Mockito.mock(com.beautica.service.entity.ServiceDefinition.class);
+        when(withoutPhoto.getPhotoR2Key()).thenReturn(null);
+
+        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(salonRepository.findByIdAndOwnerId(salonId, ownerId)).thenReturn(Optional.of(salon));
+        stubCleanEmptyStaffCascade(salonId);
+        when(serviceRepository.lockAllByOwnerOrderById(com.beautica.service.entity.OwnerType.SALON, salonId))
+                .thenReturn(List.of(withPhoto, withoutPhoto));
+
+        salonService.deactivateSalon(ownerId, salonId);
+
+        verify(servicePhotoBlobPurger).purgeAfterCommit(List.of(
+                new com.beautica.service.service.ServicePhotoBlobPurger.ServicePhotoBlob(
+                        withPhotoId, "services/abc/photo.jpg")));
+    }
+
+    @Test
+    @DisplayName("deactivateSalon — afterCommit submits the WHOLE media purge as one blobPurgeExecutor task (R2 sweep, then pointer null), nothing inline")
+    void should_dispatchSalonPurgeAsOneTask_when_deactivateSalonCommits() {
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        Salon salon = buildSalon(salonId, owner, "Active Salon");
+        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(salonRepository.findByIdAndOwnerId(salonId, ownerId)).thenReturn(Optional.of(salon));
+        stubCleanEmptyStaffCascade(salonId);
+        org.springframework.transaction.support.TransactionSynchronizationManager.initSynchronization();
+        ArgumentCaptor<Runnable> task = ArgumentCaptor.forClass(Runnable.class);
+
+        try {
+            salonService.deactivateSalon(ownerId, salonId);
+            org.springframework.transaction.support.TransactionSynchronizationManager.getSynchronizations()
+                    .forEach(org.springframework.transaction.support.TransactionSynchronization::afterCommit);
+        } finally {
+            org.springframework.transaction.support.TransactionSynchronizationManager.clearSynchronization();
+        }
+
+        verify(mediaService, never()).deleteBySalon(any(), any(), any());
+        verify(salonRepository, never()).nullImageUrls(any());
+        verify(afterCommitBlobPurger).dispatchTask(task.capture(), org.mockito.ArgumentMatchers.anyInt(),
+                eq("salon-purge"));
+        task.getValue().run();
+        var order = org.mockito.Mockito.inOrder(mediaService, salonRepository);
+        order.verify(mediaService).deleteBySalon(eq(salonId), any(), any());
+        order.verify(salonRepository).nullImageUrls(salonId);
+    }
+
+    @Test
+    @DisplayName("deactivateSalon — keyCount counts only logo/cover keys that resolve under the salon's own prefix, "
+            + "and the task receives resolved keys + scalar media pointers (no entities)")
+    void should_countOnlyResolvedImageKeys_when_salonPurgeDispatched() {
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        Salon salon = buildSalon(salonId, owner, "Active Salon");
+        String ownLogoUrl = "https://cdn.example/salons/" + salonId + "/logo/l.jpg";
+        String foreignCoverUrl = "https://cdn.example/salons/" + UUID.randomUUID() + "/cover/c.jpg";
+        // Phase 343 D8: the pointers come from the FOR UPDATE-locked row (legacy url-only here), not the entity.
+        when(salonRepository.lockImagePointers(salonId)).thenReturn(Optional.of(
+                new com.beautica.salon.repository.SalonImagePointers() {
+                    @Override public String getAvatarUrl() { return ownLogoUrl; }
+                    @Override public String getAvatarR2Key() { return null; }
+                    @Override public String getCoverImageUrl() { return foreignCoverUrl; }
+                    @Override public String getCoverR2Key() { return null; }
+                }));
+        String logoKey = "salons/" + salonId + "/logo/l.jpg";
+        var media = new com.beautica.media.repository.MediaFileKey(UUID.randomUUID(),
+                "portfolio/salons/" + salonId + "/p.jpg", com.beautica.media.entity.EntityType.SALON, salonId);
+        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(salonRepository.findByIdAndOwnerId(salonId, ownerId)).thenReturn(Optional.of(salon));
+        when(mediaRepository.findMediaKeysByEntityTypeAndEntityId(
+                com.beautica.media.entity.EntityType.SALON, salonId)).thenReturn(List.of(media));
+        when(mediaService.resolveSalonImageKey(salonId, null, ownLogoUrl)).thenReturn(logoKey);
+        when(mediaService.resolveSalonImageKey(salonId, null, foreignCoverUrl)).thenReturn(null);
+        stubCleanEmptyStaffCascade(salonId);
+        org.springframework.transaction.support.TransactionSynchronizationManager.initSynchronization();
+        ArgumentCaptor<Runnable> task = ArgumentCaptor.forClass(Runnable.class);
+
+        try {
+            salonService.deactivateSalon(ownerId, salonId);
+            org.springframework.transaction.support.TransactionSynchronizationManager.getSynchronizations()
+                    .forEach(org.springframework.transaction.support.TransactionSynchronization::afterCommit);
+        } finally {
+            org.springframework.transaction.support.TransactionSynchronizationManager.clearSynchronization();
+        }
+        verify(afterCommitBlobPurger).dispatchTask(task.capture(), eq(2), eq("salon-purge"));
+        task.getValue().run();
+
+        verify(mediaService).deleteBySalon(salonId, List.of(logoKey), List.of(media));
+    }
+
+    @Test
+    @DisplayName("deactivateSalon — no active synchronization: the media purge is skipped (never dispatched)")
+    void should_skipSalonPurge_when_noSynchronizationActive() {
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        Salon salon = buildSalon(salonId, owner, "Active Salon");
+        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(salonRepository.findByIdAndOwnerId(salonId, ownerId)).thenReturn(Optional.of(salon));
+        stubCleanEmptyStaffCascade(salonId);
+        ch.qos.logback.classic.Logger logger = (ch.qos.logback.classic.Logger)
+                org.slf4j.LoggerFactory.getLogger(SalonService.class);
+        var appender = new ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+
+        try {
+            salonService.deactivateSalon(ownerId, salonId);
+        } finally {
+            logger.detachAppender(appender);
+        }
+
+        verify(afterCommitBlobPurger, never()).dispatchTask(any(), org.mockito.ArgumentMatchers.anyInt(), any());
+        assertThat(appender.list).anySatisfy(e -> {
+            assertThat(e.getLevel()).isEqualTo(ch.qos.logback.classic.Level.WARN);
+            assertThat(e.getFormattedMessage()).contains("Salon media purge skipped").contains("keyCount=0")
+                    .doesNotContain("salons/");
+        });
     }
 
     @Test
@@ -1498,51 +1666,18 @@ class SalonServiceTest {
     }
 
     @Test
-    @DisplayName("getMastersBySalon — maps Page<Master> to Page<MasterSummaryResponse> via from() factory")
-    void should_returnMasterSummaries_when_getMastersBySalon() {
+    @DisplayName("getMastersBySalon — delegates to the single bookability-gated roster in MasterService#getMastersByPage")
+    void should_delegateToGatedMasterRoster_when_getMastersBySalon() {
         UUID salonId = UUID.randomUUID();
         Pageable pageable = Pageable.ofSize(10);
-
-        UUID masterId = UUID.randomUUID();
-        UUID userId = UUID.randomUUID();
-        User user = buildUser(userId, "master@beautica.test", Role.SALON_MASTER);
-        Master master = Master.builder()
-                .masterType(MasterType.SALON_MASTER)
-                .user(user)
-                .isActive(true)
-                .build();
-        ReflectionTestUtils.setField(master, "id", masterId);
-
-        // The service no longer forwards the caller's Pageable verbatim: SortWhitelist.apply
-        // validates it against SORTABLE_MASTER_PROPERTIES and, because the incoming Pageable is
-        // unsorted and the underlying query has no ORDER BY of its own, substitutes the default
-        // sort plus the mandatory unique `id` tiebreaker. Stubbing/verifying with this exact
-        // normalized instance (rather than any(Pageable.class)) is deliberate — it pins that
-        // contract, so silently dropping the whitelist or the tiebreaker reddens this test.
-        Pageable expectedNormalized = PageRequest.of(0, 10,
-                Sort.by(Sort.Direction.DESC, "avgRating").and(Sort.by(Sort.Direction.ASC, "id")));
-
-        Page<Master> pageOfMasters = new PageImpl<>(List.of(master), expectedNormalized, 1);
-        when(masterRepository.findBySalonIdAndIsActiveTrueWithUser(salonId, expectedNormalized))
-                .thenReturn(pageOfMasters);
+        Page<MasterSummaryResponse> gated = new PageImpl<>(List.of(), pageable, 0);
+        when(masterService.getMastersByPage(salonId, pageable)).thenReturn(gated);
 
         var result = salonService.getMastersBySalon(salonId, pageable);
 
-        assertThat(result.getTotalElements()).isEqualTo(1);
-        assertThat(result.getContent().get(0).masterId()).isEqualTo(masterId);
-        verify(masterRepository).findBySalonIdAndIsActiveTrueWithUser(salonId, expectedNormalized);
-    }
-
-    @Test
-    @DisplayName("getMastersBySalon rejects a dotted sort path with a 400 before touching the repository")
-    void should_throwBadRequest_when_getMastersBySalonSortIsDottedPath() {
-        UUID salonId = UUID.randomUUID();
-        Pageable oracleAttempt = PageRequest.of(0, 10, Sort.by(Sort.Direction.ASC, "user.passwordHash"));
-
-        assertThatThrownBy(() -> salonService.getMastersBySalon(salonId, oracleAttempt))
-                .isInstanceOf(BusinessException.class)
-                .hasFieldOrPropertyWithValue("status", HttpStatus.BAD_REQUEST);
-
+        assertThat(result).isSameAs(gated);
+        verify(masterService).getMastersByPage(salonId, pageable);
+        // No parallel, ungated roster read survives in SalonService.
         verifyNoInteractions(masterRepository);
     }
 
@@ -1598,4 +1733,5 @@ class SalonServiceTest {
         ReflectionTestUtils.setField(salon, "createdAt", Instant.now());
         return salon;
     }
+
 }

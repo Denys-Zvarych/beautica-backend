@@ -21,6 +21,7 @@ import org.springframework.security.crypto.password.PasswordEncoder;
 
 import java.sql.Timestamp;
 import java.time.OffsetDateTime;
+import java.util.List;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -33,7 +34,7 @@ import static org.mockito.Mockito.verify;
  * raw-SQL fixture conventions for the analogous staff hard-delete track.
  *
  * <p>Everything at the Mockito level is already covered by {@link ClientAccountDeletionServiceTest}
- * (9 unit tests) — this class exists for what a mock cannot prove: that Postgres actually accepts
+ * — this class exists for what a mock cannot prove: that Postgres actually accepts
  * the writes under the real V162/V163 schema, that the CASCADE FKs actually fire, and that the
  * caller's OWN access token — obtained through a real login — really stops authenticating
  * afterwards.
@@ -103,9 +104,10 @@ class ClientAccountHardDeleteIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("a future CONFIRMED booking is cancelled through the ordinary client-cancel path "
-            + "(CLIENT_CANCELLED + the fixed system note) and then physically deleted")
-    void should_cancelThenDeleteFutureBooking_withClientCancelledReasonAndSystemNote() throws Exception {
+    @DisplayName("Phase 338: a future CONFIRMED booking is cancelled through the BATCHED "
+            + "self-delete cancel entry point (CLIENT_CANCELLED + the fixed system note) and then "
+            + "KEPT, detached with the sentinel — never physically deleted (perf audit item 2)")
+    void should_cancelAndKeepFutureBooking_withClientCancelledReasonAndSystemNote() throws Exception {
         UUID clientId = csd.createClient();
         String token = fixtures.tokenFor(emailOf(clientId));
         ClientSelfDeleteTestFixtures.Salon salon = csd.createSalon();
@@ -115,16 +117,24 @@ class ClientAccountHardDeleteIT extends AbstractIntegrationTest {
                 new HttpEntity<>(fixtures.bearerHeaders(token)), Void.class);
 
         ArgumentCaptor<CancelBookingRequest> captor = ArgumentCaptor.forClass(CancelBookingRequest.class);
-        verify(bookingService).cancelBooking(eq(clientId), eq(futureBookingId), captor.capture());
+        verify(bookingService).cancelFutureConfirmedBookingsForClientSelfDelete(
+                eq(clientId), eq(List.of(futureBookingId)), captor.capture());
         assertThat(captor.getValue().cancellationReason())
-                .as("D4 — the ORDINARY client-cancel reason, never a provider-side decline reason")
+                .as("Phase 338 — the ORDINARY client-cancel reason, never a provider-side decline reason")
                 .isEqualTo(CancellationReason.CLIENT_CANCELLED);
         assertThat(captor.getValue().comment())
                 .as("the fixed Ukrainian system note, verbatim")
                 .isEqualTo(SELF_DELETE_NOTE);
         assertThat(csd.bookingExists(futureBookingId))
-                .as("D4 — cancelled THEN physically deleted, never left as a CANCELLED row")
-                .isFalse();
+                .as("Phase 338 — cancelled and KEPT, never physically deleted")
+                .isTrue();
+        assertThat(bookingStatusOf(futureBookingId)).isEqualTo("CANCELLED");
+        assertThat(clientIdOf(futureBookingId)).isNull();
+        assertThat(guestNameOf(futureBookingId))
+                .as("the same detach sentinel a past booking already gets")
+                .isEqualTo("Видалений клієнт");
+        assertThat(guestSurnameOf(futureBookingId)).isNull();
+        assertThat(clientDetachedAtOf(futureBookingId)).isNotNull();
     }
 
     @Test
@@ -183,6 +193,10 @@ class ClientAccountHardDeleteIT extends AbstractIntegrationTest {
 
     private UUID clientIdOf(UUID bookingId) {
         return jdbcTemplate.queryForObject("SELECT client_id FROM bookings WHERE id = ?", UUID.class, bookingId);
+    }
+
+    private String bookingStatusOf(UUID bookingId) {
+        return jdbcTemplate.queryForObject("SELECT status FROM bookings WHERE id = ?", String.class, bookingId);
     }
 
     private String guestNameOf(UUID bookingId) {

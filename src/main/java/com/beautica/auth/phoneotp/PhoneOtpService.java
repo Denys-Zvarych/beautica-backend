@@ -1,6 +1,7 @@
 package com.beautica.auth.phoneotp;
 
 import com.beautica.common.exception.BusinessException;
+import com.beautica.common.exception.ServiceUnavailableMessages;
 import com.beautica.notification.sms.OtpSmsSender;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -129,7 +130,7 @@ public class PhoneOtpService {
         } catch (RuntimeException e) {
             log.warn("OTP send failed for {}: {}", maskPhone(phone), e.getClass().getSimpleName());
             throw new BusinessException(
-                    HttpStatus.SERVICE_UNAVAILABLE, "Could not send the verification code");
+                    HttpStatus.SERVICE_UNAVAILABLE, ServiceUnavailableMessages.OTP_SEND_FAILED);
         }
     }
 

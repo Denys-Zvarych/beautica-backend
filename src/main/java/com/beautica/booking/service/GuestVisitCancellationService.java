@@ -12,6 +12,8 @@ import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.util.Placeholders;
 import com.beautica.config.BookingSmsProperties;
 import com.beautica.master.entity.Master;
+import com.beautica.notification.inapp.entity.InAppNotificationType;
+import com.beautica.notification.inapp.service.InAppNotificationService;
 import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.service.service.SalonCatalogCacheEvictor;
 import org.springframework.http.HttpStatus;
@@ -62,6 +64,9 @@ public class GuestVisitCancellationService {
     private final BookingSmsProperties smsProperties;
     private final SalonCatalogCacheEvictor salonCatalogCacheEvictor;
     private final Clock kyivClock;
+    // Phase 333 — see InAppNotificationService's class javadoc for why this is a separate seam from
+    // outboxService, never called from it.
+    private final InAppNotificationService inAppNotificationService;
 
     public GuestVisitCancellationService(
             AppointmentRepository appointmentRepository,
@@ -71,7 +76,8 @@ public class GuestVisitCancellationService {
             SlotCalculationService slotCalculationService,
             BookingSmsProperties smsProperties,
             SalonCatalogCacheEvictor salonCatalogCacheEvictor,
-            Clock clock) {
+            Clock clock,
+            InAppNotificationService inAppNotificationService) {
         this.appointmentRepository = appointmentRepository;
         this.bookingRepository = bookingRepository;
         this.outboxService = outboxService;
@@ -80,6 +86,7 @@ public class GuestVisitCancellationService {
         this.smsProperties = smsProperties;
         this.salonCatalogCacheEvictor = salonCatalogCacheEvictor;
         this.kyivClock = clock.withZone(TimeZones.KYIV);
+        this.inAppNotificationService = inAppNotificationService;
     }
 
     /**
@@ -137,6 +144,11 @@ public class GuestVisitCancellationService {
         // ONE master notification for the whole visit (referencing the first item — never one per
         // service), reusing the CLIENT_CANCELLED event the single guest-cancel path uses.
         outboxService.enqueueClientCancelled(first.getId());
+        // Phase 333, matrix row 2 — provider set; no actor (guest, no user account). `first` is
+        // already the graph-fetched item loadLiveVisitItems loaded above — never reloaded
+        // (audit-fix cycle 1, finding 1).
+        inAppNotificationService.notifyVisitEvent(
+                InAppNotificationType.BOOKING_CANCELLED_BY_CLIENT, appointmentId, first, null);
 
         registerAfterCommit(items);
         return true;

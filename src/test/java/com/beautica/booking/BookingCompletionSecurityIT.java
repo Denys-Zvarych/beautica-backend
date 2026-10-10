@@ -172,6 +172,56 @@ class BookingCompletionSecurityIT extends AbstractIntegrationTest {
     }
 
     @Test
+    @DisplayName("PATCH /complete — SALON_ADMIN assigned to a DIFFERENT salon is denied with 403 (phase 355)")
+    void should_return403_when_adminOfAnotherSalonAttemptsComplete() {
+        Salon salon = createSalon("compl-sec-xadmin-owner-" + System.nanoTime() + "@beautica.test");
+        Salon other = createSalon("compl-sec-xadmin-other-" + System.nanoTime() + "@beautica.test");
+        String adminEmail = "compl-sec-xadmin-" + System.nanoTime() + "@beautica.test";
+        createUser(adminEmail, "SALON_ADMIN", other.salonId);
+        UUID bookingId = insertConfirmedSalonBooking(salon);
+
+        ResponseEntity<Void> resp = patchComplete(bookingId, tokenFor(adminEmail));
+
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(dbStatus(bookingId)).isEqualTo("CONFIRMED");
+    }
+
+    @Test
+    @DisplayName("PATCH /appointments/{id}/complete — SALON_MASTER is denied with 403 and the visit stays "
+            + "CONFIRMED (phase 355: completion at a salon is owner/admin/independent only)")
+    void should_return403_when_salonMasterAttemptsCompleteVisit() throws Exception {
+        Salon salon = createSalon("compl-sec-sm-visit-owner-" + System.nanoTime() + "@beautica.test");
+        BookingTestFixtures fixtures =
+                new BookingTestFixtures(restTemplate, jdbcTemplate, objectMapper, passwordEncoder);
+        BookingTestFixtures.VisitFixture visit = fixtures.createConfirmedVisit("compl-sec-sm-visit", 2);
+
+        ResponseEntity<Void> resp = restTemplate.exchange(
+                "/api/v1/appointments/" + visit.id() + "/complete", HttpMethod.PATCH,
+                new HttpEntity<>(bearerHeaders(tokenFor(salon.masterEmail))), Void.class);
+
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(jdbcTemplate.queryForList(
+                "SELECT DISTINCT status FROM bookings WHERE appointment_id = ?", String.class, visit.id()))
+                .containsExactly("CONFIRMED");
+    }
+
+    @Test
+    @DisplayName("PATCH /complete — a DEACTIVATED SALON_ADMIN (live token) is denied with 403")
+    void should_return403_when_deactivatedAdminAttemptsComplete() {
+        Salon salon = createSalon("compl-sec-deact-owner-" + System.nanoTime() + "@beautica.test");
+        String adminEmail = "compl-sec-deact-admin-" + System.nanoTime() + "@beautica.test";
+        UUID adminId = createUser(adminEmail, "SALON_ADMIN", salon.salonId);
+        UUID bookingId = insertConfirmedSalonBooking(salon);
+        String token = tokenFor(adminEmail);
+        jdbcTemplate.update("UPDATE users SET is_active = false WHERE id = ?", adminId);
+
+        ResponseEntity<Void> resp = patchComplete(bookingId, token);
+
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(dbStatus(bookingId)).isEqualTo("CONFIRMED");
+    }
+
+    @Test
     @DisplayName("PATCH /complete — CLIENT is denied with 403")
     void should_return403_when_clientAttemptsComplete() {
         Salon salon = createSalon("compl-sec-cli-owner-" + System.nanoTime() + "@beautica.test");

@@ -1,6 +1,7 @@
 package com.beautica.booking.repository;
 
 import com.beautica.booking.entity.Appointment;
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -38,19 +39,18 @@ public interface AppointmentRepository extends JpaRepository<Appointment, UUID> 
             @Param("clientId") UUID clientId,
             @Param("idempotencyKey") String idempotencyKey);
 
-    // ── CLIENT account self-deletion detach loop (Phase 300 D4) ───────────────
+    // ── CLIENT account self-deletion detach loop (Phase 338 — supersedes Phase 300 D4) ────────
 
     /**
      * Every visit header still attached to {@code clientId} — the header-side twin of {@link
      * com.beautica.booking.repository.BookingRepository#findByClientId}, used by {@code
      * ClientAccountDeletionService} AFTER the client's future {@code CONFIRMED} booking legs have
-     * already been cancelled and physically deleted. The caller resolves ALL headers' survivorship
-     * in ONE round trip via {@code BookingRepository#findAppointmentIdsWithSurvivingBookings}
-     * (perf finding 1, 2026-09 audit — replaces a per-header {@code existsByAppointmentId} probe): a
-     * header whose id is absent from that set is physically deleted, a header whose id is present
-     * (at least one surviving past/terminal child) is detached via
-     * {@link Appointment#detachClient(String, java.time.Instant)} — never both, never implicitly
-     * inferred from the header's own status.
+     * already been cancelled through the ordinary client-cancel path (Phase 338 — KEPT, never
+     * physically deleted). Every header this returns is therefore unconditionally detached via
+     * {@link Appointment#detachClient(String, java.time.Instant)} — a header can no longer end up
+     * CHILDLESS via this flow (every leg it ever had still exists, cancelled or otherwise), so the
+     * caller no longer needs to partition survivors from childless headers the way Phase 300 D4
+     * required.
      */
     List<Appointment> findByClientId(UUID clientId);
 
@@ -188,8 +188,11 @@ public interface AppointmentRepository extends JpaRepository<Appointment, UUID> 
      * precondition.
      *
      * <p><b>Lock order (cycle-2 audit finding 1 — lock-order inversion / deadlock risk).</b>
-     * Establishes the canonical {@code appointments}-row-before-{@code bookings}-rows lock order for
-     * the whole-visit family: the per-item paths ({@code BookingService#cancelBooking},
+     * Global lock order: client(1) advisory → master(0) advisory → {@code appointments} header row →
+     * {@code bookings} rows (the reschedule paths take the header AFTER both advisory locks; the
+     * header-only decline/cancel/complete paths take no advisory lock). Establishes the
+     * {@code appointments}-row-before-{@code bookings}-rows order for the whole-visit family: the
+     * per-item paths ({@code BookingService#cancelBooking},
      * {@code AppointmentTransitionService#declineAppointmentItem}) already lock the header before
      * writing their own single child row (via {@link #lockHeaderIfConfirmed}); this method gives the
      * whole-visit callers the identical ordering guarantee, taken explicitly and eagerly — a real,
@@ -309,6 +312,101 @@ public interface AppointmentRepository extends JpaRepository<Appointment, UUID> 
             """, nativeQuery = true)
     int collapseHeaderIfNoConfirmedSiblingsRemain(
             @Param("appointmentId") UUID appointmentId,
+            @Param("target") String target,
+            @Param("reason") String reason,
+            @Param("note") String note);
+
+    // ── Batched multi-VISIT decline (Phase 337 perf re-audit, Finding 1) ─────────────────────────
+
+    /**
+     * Bulk twin of {@link #lockHeaderIfConfirmed} — locks EVERY still-{@code CONFIRMED} header in
+     * {@code appointmentIds} via {@code SELECT ... FOR UPDATE} in ONE round trip, instead of one
+     * lock statement per distinct appointment-visit. Used ONLY by {@code
+     * AppointmentTransitionService#declineAppointmentItemsBulk} (the batched sibling of {@link
+     * #lockHeaderIfConfirmed}'s per-visit caller, {@code declineAppointmentItemsAfterAuth}) — the
+     * O(1)-statement leg of {@code BookingService#declineFutureConfirmed}'s appointment-visit
+     * decline, shared by all three of its callers (salon closure, master removal, master
+     * self-delete).
+     *
+     * <p><b>Deterministic {@code ORDER BY id} — deadlock avoidance, not cosmetic.</b> {@code
+     * appointments.id} is a UUID primary key with a btree index; a {@code WHERE id IN (:ids) ORDER
+     * BY id} predicate lets the planner satisfy the ordering via that SAME index (no separate
+     * {@code Sort} node), so rows are locked in ascending-id order as the index scan yields them.
+     * Two concurrent calls to this method over overlapping id sets therefore always attempt their
+     * locks in the SAME relative order and can never deadlock against each other — the standard
+     * technique for bulk row locking, mirrored here at the header level exactly as {@code
+     * BookingRepository#declineConfirmedBulk} already relies on Postgres's own per-row evaluation
+     * for the (unordered, single-statement) bookings write.
+     *
+     * <p>{@code lock_timeout} fused exactly as {@link #lockHeaderIfConfirmed} — a header contended
+     * by an unrelated concurrent writer aborts this whole batch with a clean 409 after 3s rather
+     * than parking a Hikari connection indefinitely.
+     *
+     * @return the ids, a subset of {@code appointmentIds} (never a superset), that were CONFIRMED
+     *         and are now locked by this transaction — {@code
+     *         AppointmentTransitionService#declineAppointmentItemsBulk} MUST pass exactly this set,
+     *         never the full input set, to {@link #collapseHeadersIfNoConfirmedSiblingsRemainBulk}
+     */
+    @Query(value = """
+            SELECT id FROM (
+                SELECT set_config('lock_timeout', '3s', true) AS lock_cfg, a.id AS id
+                  FROM appointments a
+                 WHERE a.id IN (:appointmentIds) AND a.status = 'CONFIRMED'
+                 ORDER BY a.id
+                 FOR UPDATE
+            ) locked
+            """, nativeQuery = true)
+    List<UUID> lockHeadersIfConfirmedBulk(@Param("appointmentIds") Collection<UUID> appointmentIds);
+
+    /**
+     * Bulk twin of {@link #collapseHeaderIfNoConfirmedSiblingsRemain} — collapses EVERY header in
+     * {@code appointmentIds} that has no CONFIRMED child left, in ONE conditional {@code UPDATE},
+     * instead of one collapse statement per visit. Callers MUST have already locked every id in
+     * {@code appointmentIds} via {@link #lockHeadersIfConfirmedBulk} in the SAME transaction — same
+     * "why the lock is not optional" rationale as the per-visit method's own Javadoc (a bare
+     * conditional {@code UPDATE} with no preceding lock cannot serialize against a truly-concurrent
+     * sibling transition; the lock step is what forces the second transaction to observe the
+     * first's committed write).
+     *
+     * <p><b>No {@code flushAutomatically}/{@code clearAutomatically}, unlike the per-visit method.</b>
+     * The per-visit path needs {@code flushAutomatically = true} to flush a pending ORM-managed
+     * child {@code save()} before this statement's {@code NOT EXISTS} subquery runs. This bulk
+     * caller never goes through the ORM for the child write at all — {@code
+     * BookingRepository#declineConfirmedBulk} is a native statement that writes straight through to
+     * the database, visible to this later statement in the SAME transaction without any Hibernate
+     * flush. {@code clearAutomatically} is likewise unneeded: this leg never loads an {@code
+     * Appointment} or child {@code Booking} entity into the persistence context in the first place,
+     * so there is nothing stale to detach.
+     *
+     * @param appointmentIds the ids {@link #lockHeadersIfConfirmedBulk} actually locked — passing a
+     *                       wider set is harmless (a not-locked id's row simply fails the {@code
+     *                       status = 'CONFIRMED'} predicate as a no-op replay) but wastes a row scan
+     * @param target         {@link com.beautica.booking.enums.BookingStatus#name()} — always {@code
+     *                       DECLINED} for this cascade's three callers
+     * @param reason         {@link com.beautica.booking.enums.CancellationReason#name()} — always
+     *                       {@code PROVIDER_UNAVAILABLE}
+     * @param note           always {@code null} (D5 — whole-visit decline carries no reason); kept
+     *                       as a parameter, not hardcoded, for the same future-reuse rationale
+     *                       {@link BookingRepository#declineConfirmedBulk}'s own {@code
+     *                       providerComment} parameter documents
+     * @return the ids, a subset of {@code appointmentIds}, that THIS CALL actually collapsed
+     */
+    @Query(value = """
+            UPDATE appointments
+               SET status = :target,
+                   cancellation_reason = :reason,
+                   client_cancellation_note = :note
+             WHERE id IN (:appointmentIds)
+               AND status = 'CONFIRMED'
+               AND NOT EXISTS (
+                   SELECT 1 FROM bookings b
+                    WHERE b.appointment_id = appointments.id
+                      AND b.status = 'CONFIRMED'
+               )
+            RETURNING id
+            """, nativeQuery = true)
+    List<UUID> collapseHeadersIfNoConfirmedSiblingsRemainBulk(
+            @Param("appointmentIds") Collection<UUID> appointmentIds,
             @Param("target") String target,
             @Param("reason") String reason,
             @Param("note") String note);

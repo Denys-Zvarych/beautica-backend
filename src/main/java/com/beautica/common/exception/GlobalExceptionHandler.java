@@ -311,6 +311,9 @@ public class GlobalExceptionHandler {
             // constants, SQL, IDs, or bound values — so echoing ex.getMessage() here is
             // safe and intended, unlike the genericised CONFLICT/BAD_REQUEST branches.
             case UNPROCESSABLE_ENTITY -> ex.getMessage();
+            // 503: echo only allow-listed fixed strings (ServiceUnavailableMessages); anything
+            // else collapses to a generic message so an ad-hoc 503 can never leak internals.
+            case SERVICE_UNAVAILABLE -> ServiceUnavailableMessages.safe(ex.getMessage());
             default -> "Request could not be completed";
         };
         return ResponseEntity
@@ -676,7 +679,7 @@ public class GlobalExceptionHandler {
 
     /**
      * Thrown by the multipart resolver when an uploaded request body exceeds the
-     * configured {@code spring.servlet.multipart.max-*-size} (5 MB). Without this
+     * configured {@code spring.servlet.multipart.max-*-size} (5 MB per file, 6 MB per request). Without this
      * mapping the generic {@code Exception} fallback turns an oversized upload into
      * a 500. The correct status is 413 Payload Too Large. The static message does
      * not echo the configured limit (no internal-config disclosure, §I).

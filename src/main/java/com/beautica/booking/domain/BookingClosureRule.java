@@ -5,6 +5,7 @@ import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.repository.BookingSpecifications;
 import org.springframework.data.jpa.domain.Specification;
 
+import com.beautica.review.entity.ClientReview;
 import java.time.OffsetDateTime;
 import java.util.EnumSet;
 
@@ -93,6 +94,26 @@ public final class BookingClosureRule {
     public static Specification<Booking> awaitingClosure(OffsetDateTime now) {
         return BookingSpecifications.statusIn(EnumSet.of(BookingStatus.CONFIRMED))
                 .and(BookingSpecifications.endsAtBefore(now));
+    }
+
+    /**
+     * Phase 357 — the SQL form of the data half of {@code BookingService#computeProviderCanReviewClient}:
+     * {@code status = COMPLETED AND client IS NOT NULL AND NOT EXISTS (client_reviews row for the
+     * booking)}. That method is its twin and MUST stay in step (status via {@link
+     * #isProviderReviewEligible}, guest exclusion, one-review-per-booking); the actor-authority half
+     * lives in the scope the caller ANDs on. Backs the «Архів» badge count — never a window.
+     */
+    public static Specification<Booking> awaitingProviderClientReview() {
+        Specification<Booking> completed = BookingSpecifications.statusIn(
+                EnumSet.of(BookingStatus.COMPLETED));
+        Specification<Booking> hasClient = (root, query, cb) -> cb.isNotNull(root.get("client"));
+        Specification<Booking> noReview = (root, query, cb) -> {
+            var sub = query.subquery(Integer.class);
+            var cr = sub.from(ClientReview.class);
+            sub.select(cb.literal(1)).where(cb.equal(cr.get("booking"), root));
+            return cb.not(cb.exists(sub));
+        };
+        return completed.and(hasClient).and(noReview);
     }
 
     /**

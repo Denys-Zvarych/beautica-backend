@@ -221,16 +221,21 @@ class IndependentMasterProfileUpdateTest {
     }
 
     @Test
-    @DisplayName("PATCH /me/profile — 403 when SALON_OWNER role calls the endpoint")
-    void should_return403_when_salonOwnerRoleCallsProfileEndpoint() throws Exception {
+    @DisplayName("PATCH /me/profile — 200 when SALON_OWNER calls the endpoint (phase 361: owner is always a master)")
+    void should_return200_when_salonOwnerRoleCallsProfileEndpoint() throws Exception {
         var ownerId = UUID.randomUUID();
+        var phone = "+380671234567";
+
+        when(userService.updateMasterProfile(eq(ownerId), any(MasterProfileUpdateRequest.class)))
+                .thenReturn(stubProfile(phone, null, null));
 
         mockMvc.perform(patch(PATCH_PROFILE_URL)
                         .with(authenticatedAs(ownerId, "owner@beautica.test", Role.SALON_OWNER))
                         .with(csrf())
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content(validRequestBody("+380671234567", null, null)))
-                .andExpect(status().isForbidden());
+                        .content(validRequestBody(phone, null, null)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.phoneNumber").value(phone));
     }
 
     @Test

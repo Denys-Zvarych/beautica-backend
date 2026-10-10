@@ -503,6 +503,43 @@ class BookingDetailResponseTest {
     }
 
     @Test
+    @DisplayName("clientAvgRating/clientReviewCount are read off the already-loaded client row when "
+            + "the client has reviews")
+    void should_mapClientRating_when_clientHasReviews() {
+        when(clientUser.getAvgRating()).thenReturn(new BigDecimal("4.50"));
+        when(clientUser.getReviewCount()).thenReturn(7);
+
+        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW, null);
+
+        assertThat(response.clientAvgRating()).isEqualByComparingTo(new BigDecimal("4.50"));
+        assertThat(response.clientReviewCount()).isEqualTo(7);
+    }
+
+    @Test
+    @DisplayName("clientAvgRating is NULL — never 0.00 — for a client with zero reviews, while "
+            + "clientReviewCount stays 0")
+    void should_returnNullClientAvgRating_when_clientHasNoReviews() {
+        when(clientUser.getAvgRating()).thenReturn(new BigDecimal("0.00"));
+        when(clientUser.getReviewCount()).thenReturn(0);
+
+        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW, null);
+
+        assertThat(response.clientAvgRating()).isNull();
+        assertThat(response.clientReviewCount()).isZero();
+    }
+
+    @Test
+    @DisplayName("clientAvgRating and clientReviewCount are both null on a guest (no-client) booking")
+    void should_returnNullClientRating_when_bookingHasNoRegisteredClient() {
+        when(booking.getClient()).thenReturn(null);
+
+        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW, null);
+
+        assertThat(response.clientAvgRating()).isNull();
+        assertThat(response.clientReviewCount()).isNull();
+    }
+
+    @Test
     @DisplayName("masterAvgRatingOrNull suppresses the stored average only at reviewCount == 0 — "
             + "a single review with a genuine 1.00 average is still surfaced")
     void should_surfaceGenuineLowRating_when_masterHasExactlyOneReview() {

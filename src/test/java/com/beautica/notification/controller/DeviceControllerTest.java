@@ -4,16 +4,11 @@ import com.beautica.auth.JwtAuthenticationFilter;
 import com.beautica.auth.JwtTokenProvider;
 import com.beautica.auth.Role;
 import com.beautica.config.WebMvcTestSupport;
-import com.beautica.notification.entity.DeviceToken;
-import com.beautica.notification.entity.Platform;
 import com.beautica.notification.repository.DeviceTokenRepository;
-import com.beautica.user.User;
-import com.beautica.user.UserRepository;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.servlet.http.HttpServletResponse;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
-import org.mockito.ArgumentCaptor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -38,14 +33,12 @@ import org.springframework.test.web.servlet.request.RequestPostProcessor;
 import java.util.List;
 import java.util.UUID;
 
-import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
-import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.when;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.authentication;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.csrf;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
@@ -55,8 +48,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 /**
  * {@code @WebMvcTest} slice for {@link DeviceController}.
  *
- * <p>{@link DeviceTokenRepository} and {@link UserRepository} are {@code @MockBean}s;
- * no real database is required.
+ * <p>{@link DeviceTokenRepository} is a {@code @MockBean}; no real database is required.
  */
 @WebMvcTest(DeviceController.class)
 @TestPropertySource(properties = "app.frontend.base-url=http://localhost:3000")
@@ -99,9 +91,6 @@ class DeviceControllerTest {
     private DeviceTokenRepository deviceTokenRepository;
 
     @MockBean
-    private UserRepository userRepository;
-
-    @MockBean
     private JwtTokenProvider jwtTokenProvider;
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -113,14 +102,16 @@ class DeviceControllerTest {
         return authentication(token);
     }
 
+    private void verifyNoUpsert() {
+        verify(deviceTokenRepository, never()).upsertToken(anyString(), any(UUID.class), anyString());
+    }
+
     // ── POST /api/v1/devices/token ────────────────────────────────────────────
 
     @Test
     @DisplayName("POST /devices/token — 204 when authenticated client registers a valid token")
     void should_return204_when_validTokenRegistered() throws Exception {
         var userId = UUID.randomUUID();
-        when(userRepository.getReferenceById(userId)).thenReturn(mock(User.class));
-        when(deviceTokenRepository.existsByUserIdAndToken(userId, "abc")).thenReturn(false);
 
         String body = "{\"token\":\"abc\",\"platform\":\"ANDROID\"}";
 
@@ -132,7 +123,7 @@ class DeviceControllerTest {
                         .content(body))
                 .andExpect(status().isNoContent());
 
-        verify(deviceTokenRepository).save(any(DeviceToken.class));
+        verify(deviceTokenRepository).upsertToken("abc", userId, "ANDROID");
     }
 
     @Test
@@ -150,7 +141,7 @@ class DeviceControllerTest {
                         .content(body))
                 .andExpect(status().isBadRequest());
 
-        verify(deviceTokenRepository, never()).save(any(DeviceToken.class));
+        verifyNoUpsert();
     }
 
     @Test
@@ -168,7 +159,7 @@ class DeviceControllerTest {
                         .content(body))
                 .andExpect(status().isBadRequest());
 
-        verify(deviceTokenRepository, never()).save(any(DeviceToken.class));
+        verifyNoUpsert();
     }
 
     @Test
@@ -183,39 +174,34 @@ class DeviceControllerTest {
                         .content(body))
                 .andExpect(status().isUnauthorized());
 
-        verify(deviceTokenRepository, never()).save(any(DeviceToken.class));
+        verifyNoUpsert();
     }
 
     @Test
-    @DisplayName("POST /devices/token — 204 (idempotent) and no save when token already registered for user")
-    void should_return204_andSkipSave_when_tokenAlreadyRegistered() throws Exception {
+    @DisplayName("POST /devices/token — a repeat registration is still 204 (one idempotent upsert, no pre-check)")
+    void should_return204_when_sameTokenRegisteredTwice() throws Exception {
         var userId = UUID.randomUUID();
-        when(deviceTokenRepository.existsByUserIdAndToken(userId, "abc")).thenReturn(true);
-
         String body = "{\"token\":\"abc\",\"platform\":\"ANDROID\"}";
 
-        log.debug("Act: POST /api/v1/devices/token where existsByUserIdAndToken=true — must return 204 without saving");
-        mockMvc.perform(post("/api/v1/devices/token")
-                        .with(authenticatedAs(userId, "client@beautica.test", Role.CLIENT))
-                        .with(csrf())
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content(body))
-                .andExpect(status().isNoContent());
+        for (int i = 0; i < 2; i++) {
+            mockMvc.perform(post("/api/v1/devices/token")
+                            .with(authenticatedAs(userId, "client@beautica.test", Role.CLIENT))
+                            .with(csrf())
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content(body))
+                    .andExpect(status().isNoContent());
+        }
 
-        verify(deviceTokenRepository, never()).save(any(DeviceToken.class));
+        verify(deviceTokenRepository, times(2)).upsertToken("abc", userId, "ANDROID");
     }
 
     @Test
-    @DisplayName("POST /devices/token — saved entity carries authenticated principal's userId, not body-supplied data")
+    @DisplayName("POST /devices/token — upsert carries the principal's userId and the body's platform, never a body-supplied owner")
     void should_callRepositoryWithPrincipalUserId_when_register() throws Exception {
         var principalUserId = UUID.randomUUID();
-        var principalUser = mock(User.class);
-        when(userRepository.getReferenceById(principalUserId)).thenReturn(principalUser);
-        when(deviceTokenRepository.existsByUserIdAndToken(eq(principalUserId), anyString())).thenReturn(false);
+        String body = "{\"token\":\"abc\",\"platform\":\"IOS\",\"userId\":\"" + UUID.randomUUID() + "\"}";
 
-        String body = "{\"token\":\"abc\",\"platform\":\"ANDROID\"}";
-
-        log.debug("Act: POST authenticated as principalUserId — captured DeviceToken must reference that user");
+        log.debug("Act: POST authenticated as principalUserId — the upsert must bind to that user");
         mockMvc.perform(post("/api/v1/devices/token")
                         .with(authenticatedAs(principalUserId, "client@beautica.test", Role.CLIENT))
                         .with(csrf())
@@ -223,16 +209,7 @@ class DeviceControllerTest {
                         .content(body))
                 .andExpect(status().isNoContent());
 
-        verify(userRepository).getReferenceById(eq(principalUserId));
-
-        ArgumentCaptor<DeviceToken> captor = ArgumentCaptor.forClass(DeviceToken.class);
-        verify(deviceTokenRepository).save(captor.capture());
-        DeviceToken saved = captor.getValue();
-
-        assertThat(saved.getUser()).isSameAs(principalUser);
-        assertThat(saved.getToken()).isEqualTo("abc");
-        assertThat(saved.getPlatform()).isEqualTo(Platform.ANDROID);
-        assertThat(saved.isActive()).isTrue();
+        verify(deviceTokenRepository).upsertToken(eq("abc"), eq(principalUserId), eq("IOS"));
     }
 
     @Test
@@ -240,8 +217,6 @@ class DeviceControllerTest {
     void should_return204_when_tokenIs500CharsLong() throws Exception {
         var userId = UUID.randomUUID();
         String token500 = "a".repeat(500);
-        when(userRepository.getReferenceById(userId)).thenReturn(mock(User.class));
-        when(deviceTokenRepository.existsByUserIdAndToken(userId, token500)).thenReturn(false);
 
         String body = objectMapper.writeValueAsString(
                 java.util.Map.of("token", token500, "platform", "ANDROID"));
@@ -254,7 +229,7 @@ class DeviceControllerTest {
                         .content(body))
                 .andExpect(status().isNoContent());
 
-        verify(deviceTokenRepository).save(any(DeviceToken.class));
+        verify(deviceTokenRepository).upsertToken(token500, userId, "ANDROID");
     }
 
     @Test
@@ -274,7 +249,7 @@ class DeviceControllerTest {
                         .content(body))
                 .andExpect(status().isBadRequest());
 
-        verify(deviceTokenRepository, never()).save(any(DeviceToken.class));
+        verifyNoUpsert();
     }
 
     // ── DELETE /api/v1/devices/token ──────────────────────────────────────────
@@ -346,7 +321,7 @@ class DeviceControllerTest {
                         .content(body))
                 .andExpect(status().isBadRequest());
 
-        verify(deviceTokenRepository, never()).save(any(DeviceToken.class));
+        verifyNoUpsert();
     }
 
     @Test

@@ -1,5 +1,6 @@
 package com.beautica.config;
 
+import java.util.Objects;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.RejectedExecutionHandler;
 import java.util.concurrent.ThreadPoolExecutor;
@@ -7,47 +8,90 @@ import java.util.concurrent.TimeUnit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.aop.interceptor.AsyncUncaughtExceptionHandler;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.DependsOn;
 import org.springframework.context.annotation.Profile;
 import org.springframework.core.task.SyncTaskExecutor;
+import org.springframework.core.task.TaskDecorator;
 import org.springframework.core.task.TaskExecutor;
 import org.springframework.scheduling.annotation.AsyncConfigurer;
 import org.springframework.scheduling.annotation.EnableAsync;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import org.springframework.security.task.DelegatingSecurityContextTaskExecutor;
 
+/**
+ * Async executors and their shutdown budget.
+ *
+ * <h4>Shutdown budget — sequential worst case ~170 s</h4>
+ * <p>Each pool drains in its own {@code destroy()}, and Spring runs those calls SEQUENTIALLY, so the
+ * worst case is the SUM of every {@code awaitTerminationSeconds} (an idle pool returns at once; the sum
+ * is reached only when every pool is still busy): 30+20+20+20+30+30+10+10 = 170 s.
+ *
+ * <p><b>The deploy platform's SIGTERM→SIGKILL window must be at least this worst case.</b> A shorter
+ * window kills the JVM mid-drain, losing the non-recoverable work below AND the abandonment report. On
+ * Railway set {@code RAILWAY_DEPLOYMENT_DRAINING_SECONDS} (&ge; 170) accordingly; the repo carries no such
+ * configuration. The push pool must drain before {@code FirebaseConfig} is destroyed
+ * ({@code @DependsOn}, see {@code AsyncConfigShutdownOrderingTest}).
+ *
+ * <pre>
+ * pool                       await  what is cut off, and is it recoverable?
+ * pushTaskPool                 30 s  push nudges; at-most-once after hand-off, the in-app feed row is the
+ *                                    source of truth. Outbox entry already SENT, so a cut push is not retried
+ *                                    but nothing is lost from the feed. Drains BEFORE FirebaseConfig.destroy().
+ * emailTaskPool                20 s  auth/password-reset OTP mails (user re-requests) and ops admin
+ *                                    notifications (fire-and-forget). NOT outbox-backed -> cut = lost.
+ * supportEmailTaskPool         20 s  Help/Contact mails. NOT outbox-backed -> cut = lost (user can resend).
+ * smsSendExecutor              20 s  walk-in booking confirmation SMS. NOT recoverable (mildest loss).
+ * smsReminderDispatchExecutor  30 s  one hand-off task per hourly batch; cut = whole batch un-fanned-out.
+ *                                    NOT recoverable (reminderSent already committed); reported at ERROR.
+ * smsReminderExecutor          30 s  guest 24h reminder SMS. NOT recoverable (reminderSent already
+ *                                    committed); reported at ERROR. ~6 s drains a full queue at healthy RTT.
+ * cacheEvictionExecutor        10 s  in-memory Caffeine scans; the cache dies with the JVM -> irrelevant.
+ * blobPurgeExecutor            10 s  after-commit R2 deletes of already-dereferenced blobs; cut = accepted
+ *                                    orphan blob (never a dangling pointer), same policy as a failed delete;
+ *                                    reported at WARN with task + key counts.
+ * total (sequential worst)    170 s
+ * </pre>
+ * Outbox-driven work (invite/booking email, push fan-out) is re-queued by the outbox drain worker on the
+ * next boot unless the hand-off was already accepted (push: see
+ * {@code PushNotificationService#sendToDevices}). Raising any value raises the required platform window.
+ */
 @Configuration
 @EnableAsync
 public class AsyncConfig implements AsyncConfigurer {
 
     private static final Logger log = LoggerFactory.getLogger(AsyncConfig.class);
 
+    static final int EMAIL_SHUTDOWN_GRACE_SECONDS = 20;
+    static final int SUPPORT_EMAIL_SHUTDOWN_GRACE_SECONDS = 20;
+    static final int PUSH_SHUTDOWN_GRACE_SECONDS = 30;
+    static final int SMS_SEND_SHUTDOWN_GRACE_SECONDS = 20;
+    static final int CACHE_EVICTION_SHUTDOWN_GRACE_SECONDS = 10;
+    static final int BLOB_PURGE_SHUTDOWN_GRACE_SECONDS = 10;
+    static final int BLOB_PURGE_POOL_SIZE = 2;
+    static final int BLOB_PURGE_QUEUE_CAPACITY = 500;
+
     /**
-     * Shutdown grace shared by both guest-reminder pools, and the number reported in the abandonment log
+     * Shutdown grace of {@code smsReminderDispatchExecutor}: its task is a hand-off loop, not provider I/O.
+     */
+    static final int REMINDER_DISPATCH_SHUTDOWN_GRACE_SECONDS = 30;
+
+    /**
+     * Shutdown grace of the guest-reminder send pool, and the number reported in the abandonment log
      * line so the counts beside it are interpretable. Deliberately NOT raised to cover the worst-case
      * drain — see {@link #smsReminderExecutor()}.
      */
     static final int REMINDER_SHUTDOWN_GRACE_SECONDS = 30;
 
-    // SMTP pool for invite and admin notification emails — FCM/APNs push gets a dedicated pool in Phase 5.8+.
-    // Wrapped in DelegatingSecurityContextTaskExecutor so the calling thread's SecurityContext
-    // (Authentication / actor identity) propagates into async tasks. Without this wrapper any
-    // @Async method reading SecurityContextHolder.getContext().getAuthentication() observes null.
-    @Bean(name = "emailExecutor")
-    public TaskExecutor emailExecutor() {
-        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
-        executor.setCorePoolSize(2);
-        executor.setMaxPoolSize(5);
-        executor.setQueueCapacity(150);
-        executor.setThreadNamePrefix("email-");
-        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.AbortPolicy());
-        executor.setWaitForTasksToCompleteOnShutdown(true);
-        executor.setAwaitTerminationSeconds(20);
-        // Propagate the webapp classloader into email-* threads so that
-        // ServiceLoader (jakarta.mail.util.StreamProvider) resolves META-INF/services/
-        // entries from the application classpath rather than the system classloader.
-        executor.setTaskDecorator(runnable -> {
+    /**
+     * Webapp-classloader propagation shared by the three SecurityContext-wrapped pools: lets
+     * ServiceLoader-based libs (jakarta.mail {@code StreamProvider}, FCM/APNs SDKs) resolve
+     * {@code META-INF/services/} entries from the application classpath rather than the system loader.
+     */
+    private static TaskDecorator classLoaderPropagatingDecorator() {
+        return runnable -> {
             ClassLoader cl = Thread.currentThread().getContextClassLoader();
             return () -> {
                 ClassLoader prev = Thread.currentThread().getContextClassLoader();
@@ -58,9 +102,58 @@ public class AsyncConfig implements AsyncConfigurer {
                     Thread.currentThread().setContextClassLoader(prev);
                 }
             };
-        });
+        };
+    }
+
+    /**
+     * Inner pool of {@link #emailExecutor(ThreadPoolTaskExecutor)}. Registered as its OWN bean so Spring
+     * manages its lifecycle: with {@code waitForTasksToCompleteOnShutdown=true} a
+     * {@link ThreadPoolTaskExecutor} bean drains its queue (within {@code awaitTerminationSeconds}) in its
+     * {@code destroy()} during singleton destruction. Hidden inside a
+     * {@link DelegatingSecurityContextTaskExecutor} it would never be shut down — in-flight sends would
+     * race collaborators' destroy callbacks and DevTools restarts would leak threads and classloaders.
+     * {@code defaultCandidate = false}: never autowired by type, only by explicit
+     * {@code @Qualifier}; inject {@code emailExecutor}.
+     */
+    @Bean(name = "emailTaskPool", defaultCandidate = false)
+    public ThreadPoolTaskExecutor emailTaskPool() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(2);
+        executor.setMaxPoolSize(5);
+        executor.setQueueCapacity(150);
+        executor.setThreadNamePrefix("email-");
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.AbortPolicy());
+        executor.setWaitForTasksToCompleteOnShutdown(true);
+        executor.setAwaitTerminationSeconds(EMAIL_SHUTDOWN_GRACE_SECONDS);
+        executor.setTaskDecorator(classLoaderPropagatingDecorator());
         executor.initialize();
-        return new DelegatingSecurityContextTaskExecutor(executor);
+        return executor;
+    }
+
+    // SMTP pool for invite and admin notification emails — FCM/APNs push gets a dedicated pool in Phase 5.8+.
+    // Wrapped in DelegatingSecurityContextTaskExecutor so the calling thread's SecurityContext
+    // (Authentication / actor identity) propagates into async tasks. Without this wrapper any
+    // @Async method reading SecurityContextHolder.getContext().getAuthentication() observes null.
+    // The wrapped pool is its own bean (emailTaskPool) so Spring owns its shutdown.
+    @Bean(name = "emailExecutor")
+    public TaskExecutor emailExecutor(@Qualifier("emailTaskPool") ThreadPoolTaskExecutor emailTaskPool) {
+        return new DelegatingSecurityContextTaskExecutor(emailTaskPool);
+    }
+
+    /** Inner pool of {@link #supportEmailExecutor(ThreadPoolTaskExecutor)} — see {@link #emailTaskPool()}. */
+    @Bean(name = "supportEmailTaskPool", defaultCandidate = false)
+    public ThreadPoolTaskExecutor supportEmailTaskPool() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(1);
+        executor.setMaxPoolSize(2);
+        executor.setQueueCapacity(20);
+        executor.setThreadNamePrefix("support-email-");
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.AbortPolicy());
+        executor.setWaitForTasksToCompleteOnShutdown(true);
+        executor.setAwaitTerminationSeconds(SUPPORT_EMAIL_SHUTDOWN_GRACE_SECONDS);
+        executor.setTaskDecorator(classLoaderPropagatingDecorator());
+        executor.initialize();
+        return executor;
     }
 
     // Dedicated SMTP pool for Help/Contact-us support emails — isolated from emailExecutor
@@ -69,38 +162,20 @@ public class AsyncConfig implements AsyncConfigurer {
     // already per-IP rate-limited (5/hr). Same SecurityContext + classloader propagation rationale
     // as emailExecutor (jakarta.mail StreamProvider ServiceLoader resolution).
     @Bean(name = "supportEmailExecutor")
-    public TaskExecutor supportEmailExecutor() {
-        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
-        executor.setCorePoolSize(1);
-        executor.setMaxPoolSize(2);
-        executor.setQueueCapacity(20);
-        executor.setThreadNamePrefix("support-email-");
-        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.AbortPolicy());
-        executor.setWaitForTasksToCompleteOnShutdown(true);
-        executor.setAwaitTerminationSeconds(20);
-        // Propagate the webapp classloader into support-email-* threads so that
-        // ServiceLoader (jakarta.mail.util.StreamProvider) resolves META-INF/services/
-        // entries from the application classpath rather than the system classloader.
-        executor.setTaskDecorator(runnable -> {
-            ClassLoader cl = Thread.currentThread().getContextClassLoader();
-            return () -> {
-                ClassLoader prev = Thread.currentThread().getContextClassLoader();
-                Thread.currentThread().setContextClassLoader(cl);
-                try {
-                    runnable.run();
-                } finally {
-                    Thread.currentThread().setContextClassLoader(prev);
-                }
-            };
-        });
-        executor.initialize();
-        return new DelegatingSecurityContextTaskExecutor(executor);
+    public TaskExecutor supportEmailExecutor(
+            @Qualifier("supportEmailTaskPool") ThreadPoolTaskExecutor supportEmailTaskPool) {
+        return new DelegatingSecurityContextTaskExecutor(supportEmailTaskPool);
     }
 
-    // FCM/APNs push — dedicated pool to prevent SMTP starvation under push burst.
-    // Same SecurityContext propagation rationale as emailExecutor.
-    @Bean(name = "pushExecutor")
-    public TaskExecutor pushExecutor() {
+    /**
+     * Inner pool of {@link #pushExecutor(ThreadPoolTaskExecutor)} — see {@link #emailTaskPool()}.
+     * {@code @DependsOn("firebaseConfig")} makes Spring destroy this pool (draining in-flight pushes via
+     * {@code destroy()}) BEFORE {@code FirebaseConfig.destroy()} deletes the {@code FirebaseApp}; without
+     * it the order would only be an accident of registration order.
+     */
+    @Bean(name = "pushTaskPool", defaultCandidate = false)
+    @DependsOn("firebaseConfig")
+    public ThreadPoolTaskExecutor pushTaskPool() {
         ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
         executor.setCorePoolSize(4);
         executor.setMaxPoolSize(20);
@@ -108,23 +183,19 @@ public class AsyncConfig implements AsyncConfigurer {
         executor.setThreadNamePrefix("push-");
         executor.setRejectedExecutionHandler(new ThreadPoolExecutor.AbortPolicy());
         executor.setWaitForTasksToCompleteOnShutdown(true);
-        executor.setAwaitTerminationSeconds(30);
-        // Same classloader propagation as emailExecutor — future ServiceLoader-based libs
-        // (FCM SDK, APNs provider) need the webapp classloader on push-* threads.
-        executor.setTaskDecorator(runnable -> {
-            ClassLoader cl = Thread.currentThread().getContextClassLoader();
-            return () -> {
-                ClassLoader prev = Thread.currentThread().getContextClassLoader();
-                Thread.currentThread().setContextClassLoader(cl);
-                try {
-                    runnable.run();
-                } finally {
-                    Thread.currentThread().setContextClassLoader(prev);
-                }
-            };
-        });
+        executor.setAwaitTerminationSeconds(PUSH_SHUTDOWN_GRACE_SECONDS);
+        executor.setTaskDecorator(classLoaderPropagatingDecorator());
         executor.initialize();
-        return new DelegatingSecurityContextTaskExecutor(executor);
+        return executor;
+    }
+
+    // FCM/APNs push — dedicated pool to prevent SMTP starvation under push burst.
+    // Same SecurityContext propagation rationale as emailExecutor. pushTaskPool is drained in its
+    // destroy() BEFORE firebaseConfig is destroyed, guaranteed by @DependsOn("firebaseConfig") on
+    // pushTaskPool (dependents are destroyed first) — so queued pushes finish before FirebaseConfig.destroy().
+    @Bean(name = "pushExecutor")
+    public TaskExecutor pushExecutor(@Qualifier("pushTaskPool") ThreadPoolTaskExecutor pushTaskPool) {
+        return new DelegatingSecurityContextTaskExecutor(pushTaskPool);
     }
 
     /**
@@ -181,7 +252,7 @@ public class AsyncConfig implements AsyncConfigurer {
     @Profile("!test")
     public TaskExecutor smsReminderDispatchExecutor() {
         ThreadPoolTaskExecutor executor =
-                new ReminderLossReportingTaskExecutor("smsReminderDispatchExecutor", REMINDER_SHUTDOWN_GRACE_SECONDS);
+                new ReminderLossReportingTaskExecutor("smsReminderDispatchExecutor", REMINDER_DISPATCH_SHUTDOWN_GRACE_SECONDS);
         executor.setCorePoolSize(1);
         executor.setMaxPoolSize(1);
         executor.setAllowCoreThreadTimeOut(true);
@@ -321,7 +392,7 @@ public class AsyncConfig implements AsyncConfigurer {
         // Drain on shutdown: a queued confirmation still has a real client waiting for it, and the
         // grace is short because the queue is small and the sends are independent.
         executor.setWaitForTasksToCompleteOnShutdown(true);
-        executor.setAwaitTerminationSeconds(20);
+        executor.setAwaitTerminationSeconds(SMS_SEND_SHUTDOWN_GRACE_SECONDS);
         executor.initialize();
         return executor;
     }
@@ -541,7 +612,7 @@ public class AsyncConfig implements AsyncConfigurer {
         // Drain the queue on shutdown: a dropped eviction outlives the JVM only as a stale entry in a
         // cache that dies with it, but an in-flight one must not be interrupted mid-scan.
         executor.setWaitForTasksToCompleteOnShutdown(true);
-        executor.setAwaitTerminationSeconds(10);
+        executor.setAwaitTerminationSeconds(CACHE_EVICTION_SHUTDOWN_GRACE_SECONDS);
         executor.initialize();
         return executor;
     }
@@ -561,6 +632,130 @@ public class AsyncConfig implements AsyncConfigurer {
     @Bean(name = "cacheEvictionExecutor")
     @Profile("test")
     public TaskExecutor syncCacheEvictionExecutor() {
+        return new SyncTaskExecutor();
+    }
+
+    /**
+     * Pool for after-commit R2 blob purges ({@code AfterCommitBlobPurger}) — backend-perf P-M2.
+     *
+     * <p>An {@code afterCommit} callback runs on the committing thread while it still holds its pooled
+     * Hikari connection (measurements on {@link #smsReminderDispatchExecutor()}), so an inline R2
+     * {@code DeleteObjects} round-trip (30 s socket cap) pinned one of the 10 production connections per
+     * avatar replace / account delete / staff removal. The callback now submits ONE task here and returns.
+     *
+     * <p><b>Why not an existing pool.</b> {@code cacheEvictionExecutor} is {@code CallerRunsPolicy} by design
+     * (in-memory work, a dropped eviction is a correctness bug) — under saturation it would run the R2
+     * round-trip right back on the committing thread. {@code emailExecutor}/{@code pushExecutor} are SMTP /
+     * FCM pools wrapped in a SecurityContext propagator; sharing them would let a slow R2 starve mail/push.
+     *
+     * <p><b>{@code AbortPolicy} + bounded queue.</b> A purge whose blob is already dereferenced in the DB is
+     * the cheapest possible loss — an orphan blob, the same outcome as a failed delete — so a rejection is
+     * dropped and logged by the submitter (key list omitted) instead of back-pressuring a request thread.
+     * {@code core == max} for the reason given on {@link #smsReminderExecutor()} (a pool only grows past its
+     * core once the queue is full); {@code allowCoreThreadTimeOut} lets both die back when idle.
+     *
+     * <p>No {@link DelegatingSecurityContextTaskExecutor}: the task takes a key list, nothing
+     * principal-derived. {@code @Profile("!test")} — see {@link #syncBlobPurgeExecutor()}.
+     */
+    @Bean(name = "blobPurgeExecutor")
+    @Profile("!test")
+    public TaskExecutor blobPurgeExecutor() {
+        // Loss-reporting subclass (perf PERF-2): the 10 s drain can abandon up to BLOB_PURGE_QUEUE_CAPACITY
+        // queued purges; without it they vanish behind Spring's count-less timeout warning.
+        ThreadPoolTaskExecutor executor = new BlobPurgeLossReportingTaskExecutor(BLOB_PURGE_SHUTDOWN_GRACE_SECONDS);
+        executor.setCorePoolSize(BLOB_PURGE_POOL_SIZE);
+        executor.setMaxPoolSize(BLOB_PURGE_POOL_SIZE);
+        executor.setAllowCoreThreadTimeOut(true);
+        executor.setKeepAliveSeconds(60);
+        executor.setQueueCapacity(BLOB_PURGE_QUEUE_CAPACITY);
+        executor.setThreadNamePrefix("blob-purge-");
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.AbortPolicy());
+        executor.initialize();
+        return executor;
+    }
+
+    /**
+     * One {@code blobPurgeExecutor} task plus the number of R2 keys it would delete. {@code AfterCommitBlobPurger}
+     * submits every purge wrapped in this, so {@link BlobPurgeLossReportingTaskExecutor} can report how many
+     * KEYS a truncated shutdown orphaned, not just how many opaque tasks. Counts only — the body is never
+     * rendered (its {@code toString} is not called; keys embed user/entity UUIDs).
+     */
+    public record BlobPurgeTask(Runnable body, int keyCount) implements Runnable {
+
+        public BlobPurgeTask {
+            Objects.requireNonNull(body, "body");
+        }
+
+        @Override
+        public void run() {
+            body.run();
+        }
+    }
+
+    /**
+     * {@link ThreadPoolTaskExecutor} for {@link #blobPurgeExecutor()} that reports, at WARN, the purges its
+     * shutdown grace ABANDONED (perf PERF-2) — the same {@link #shutdown()} hook, for the same reason, as
+     * {@link ReminderLossReportingTaskExecutor}: only after {@code super.shutdown()} returns is the queue
+     * genuinely abandoned. WARN, not ERROR: an abandoned purge is an orphan blob (storage cost), never lost
+     * user data. Silent on a clean drain. Counts only ({@link #LOSS_EVENT}, queued tasks, the orphaned key
+     * total summed from {@link BlobPurgeTask#keyCount()}, in-flight tasks, grace).
+     */
+    static final class BlobPurgeLossReportingTaskExecutor extends ThreadPoolTaskExecutor {
+
+        /** Stable, machine-greppable alert token. Changing it silently disables downstream alerting. */
+        static final String LOSS_EVENT = "event=blob_purges_lost_on_shutdown";
+
+        private final int graceSeconds;
+
+        BlobPurgeLossReportingTaskExecutor(int graceSeconds) {
+            this.graceSeconds = graceSeconds;
+            setWaitForTasksToCompleteOnShutdown(true);
+            setAwaitTerminationSeconds(graceSeconds);
+        }
+
+        @Override
+        public void shutdown() {
+            super.shutdown();
+            reportAbandonedWork();
+        }
+
+        void reportAbandonedWork() {
+            int queuedTasksAbandoned;
+            long queuedKeysOrphaned = 0;
+            int inFlightTasksKilled;
+            try {
+                ThreadPoolExecutor pool = getThreadPoolExecutor();
+                Runnable[] queued = pool.getQueue().toArray(new Runnable[0]);
+                queuedTasksAbandoned = queued.length;
+                for (Runnable task : queued) {
+                    if (task instanceof BlobPurgeTask purge) {
+                        queuedKeysOrphaned += purge.keyCount();
+                    }
+                }
+                inFlightTasksKilled = pool.getActiveCount();
+            } catch (IllegalStateException e) {
+                return; // Never initialized — it cannot have been carrying work.
+            }
+            if (queuedTasksAbandoned == 0 && inFlightTasksKilled == 0) {
+                return;
+            }
+            log.warn("{} executor=blobPurgeExecutor queuedTasksAbandoned={} queuedKeysOrphaned={} "
+                            + "inFlightTasksKilled={} graceSeconds={} — queued blobs are already dereferenced "
+                            + "in the DB and are now orphaned in R2; in-flight deletes were cut, outcome unknown",
+                    LOSS_EVENT, queuedTasksAbandoned, queuedKeysOrphaned, inFlightTasksKilled, graceSeconds);
+        }
+    }
+
+    /**
+     * Test-profile counterpart of {@link #blobPurgeExecutor()}: purges run INLINE, so an integration test
+     * asserts on the mocked R2 the moment the request returns (Anti-Bug §M — no sleeps, no races). Same
+     * bean name, mutually exclusive profile, so the {@code @Qualifier} in {@code AfterCommitBlobPurger}
+     * resolves in every profile. The production pool is pinned by {@code AsyncConfigTest} and its
+     * off-thread hand-off by {@code AfterCommitBlobPurgerTest}.
+     */
+    @Bean(name = "blobPurgeExecutor")
+    @Profile("test")
+    public TaskExecutor syncBlobPurgeExecutor() {
         return new SyncTaskExecutor();
     }
 

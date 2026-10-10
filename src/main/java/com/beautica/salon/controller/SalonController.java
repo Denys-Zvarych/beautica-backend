@@ -241,15 +241,17 @@ public class SalonController {
      * {@link SalonService#getSiblingSalons} for that coupling.
      *
      * <p><b>Returns {@link SiblingSalonOption}, not {@code SalonResponse}.</b> A picker needs the
-     * id it will submit plus enough text to tell two salons apart. The full {@code SalonResponse}
+     * id it will submit, enough text to tell two salons apart, and the logo it renders
+     * ({@code avatarUrl} — already public for any active salon). The full {@code SalonResponse}
      * additionally handed an assigned {@code SALON_ADMIN} the owner's UUID and every sibling's
-     * {@code description}, {@code phone}, {@code instagramUrl}, {@code avatarUrl}, legacy
-     * city/region/address, {@code isPrimary} and {@code createdAt} — for salons they hold no
-     * assignment to. See that record's Javadoc.
+     * {@code description}, {@code phone}, {@code instagramUrl}, legacy city/region/address,
+     * {@code isPrimary} and {@code createdAt} — for salons they hold no assignment to. See that
+     * record's Javadoc.
      */
     @Operation(summary = "List sibling salons of the same owner",
             description = "Active salons sharing this salon's owner, excluding this salon itself, "
-                    + "as id + name + short address. Backs the rotate-admin destination picker. "
+                    + "as id + name + short address + logo URL. Backs the rotate-admin destination "
+                    + "picker. "
                     + "Requires management access to the salon (owner or assigned admin).")
     @GetMapping("/{salonId}/sibling-salons")
     @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN') and @authz.canManageSalon(authentication, #salonId)")

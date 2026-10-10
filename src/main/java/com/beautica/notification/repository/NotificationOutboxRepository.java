@@ -188,11 +188,28 @@ public interface NotificationOutboxRepository extends JpaRepository<Notification
      * "no client PII duplicated into the payload" convention). That means physically deleting a
      * booking with a still-{@code PENDING} outbox row pointing at it orphans the row: the drain
      * worker's {@code getBooking()} finds nothing, throws {@code IllegalStateException}, and the
-     * row is retried into {@code DEAD}. Callers that hard-delete a booking in the same transaction
-     * MUST call this first (or in the same flush) for that booking's id — see
-     * {@code ClientAccountDeletionService#deleteOwnAccount} step 4/5 for the canonical case
-     * (self-delete cancels future bookings, enqueueing {@code STATUS_CHANGED} rows, then physically
-     * deletes those same bookings two statements later).
+     * row is retried into {@code DEAD}. A caller that hard-deletes a booking in the same
+     * transaction MUST call this first (or in the same flush) for that booking's id — scoped to
+     * EXACTLY the event type(s) its own write superseded, never a blanket sweep of every row on
+     * that aggregate id (a scope-free call here would also destroy an unrelated, still-PENDING row
+     * addressed to the same booking, e.g. an undrained {@code BOOKING_RESCHEDULED} — the security
+     * finding that retired this method's own former caller, see below).
+     *
+     * <p><b>Currently unused in production code (Phase 338 perf/security audit, item 1/3).</b>
+     * {@code ClientAccountDeletionService#deleteOwnAccount} was this method's sole production
+     * caller, deleting every per-booking {@code STATUS_CHANGED} row a future-booking cancel cascade
+     * had just enqueued, with no event-type filter, before physically deleting those same bookings.
+     * Two changes retired that call site entirely: (1) future bookings are now CANCELLED and KEPT,
+     * never hard-deleted (Phase 338 — REVERSES the earlier cancel-then-delete design this method
+     * was written for), so there is no longer a hard-delete to protect against in the first place;
+     * (2) the cancel cascade itself was rerouted through {@code
+     * BookingService#cancelFutureConfirmedBookingsForClientSelfDelete} /
+     * {@code #cancelBookingForBatch}, which never calls {@code enqueueStatusChanged} at all — so
+     * there is no per-booking row to delete even if a hard-delete still existed. Retained (rather
+     * than removed) as a general bulk-delete utility, with its own regression coverage in
+     * {@code NotificationOutboxRepositoryTest} — any future caller MUST scope {@code aggregateIds}
+     * to bookings it is ACTUALLY about to hard-delete, and should prefer filtering to the specific
+     * event type(s) being superseded over a blanket per-aggregate delete.
      *
      * <p>Deliberately participates in the CALLER's transaction (unlike
      * {@link #deleteByStatusInAndUpdatedAtBefore}, which is an isolated housekeeping sweep) — this
@@ -205,13 +222,9 @@ public interface NotificationOutboxRepository extends JpaRepository<Notification
      * followed by one {@code entityManager.remove()} per matched row — never a single {@code
      * DELETE ... WHERE ... IN (...)} statement (confirmed by decompiling {@code
      * JpaQueryExecution$DeleteExecution#doExecute}: {@code getResultList()} then a {@code remove()}
-     * loop). For {@code ClientAccountDeletionService}'s 50-booking cap that loop was invisible (at
-     * most one {@code hibernate.jdbc.batch_size=50} flush), but {@code
-     * StaffAccountSelfDeletionService}'s 500-booking cap could turn it into up to 10 batched
-     * round trips instead of one, contradicting this cascade's otherwise-O(1)-statement design.
-     * The explicit {@code @Modifying @Query} below restores the single-statement bulk delete —
-     * the same shape {@code declineConfirmedBulk} and {@code deleteAllByIdInBatch} already use
-     * elsewhere in this exact cascade — for both callers, without changing either one's code.
+     * loop). The explicit {@code @Modifying @Query} below restores the single-statement bulk delete
+     * — the same shape {@code declineConfirmedBulk} and {@code deleteAllByIdInBatch} already use
+     * elsewhere in this cascade family — for whichever future caller needs it.
      *
      * @param aggregateIds the aggregate ids (booking ids) whose pending outbox rows must go; the
      *                     caller guards the empty-collection case (an {@code IN ()} is wasted work)

@@ -82,8 +82,9 @@ public class IndependentMasterController {
      * the three human-readable profile fields displayed on the master detail screen:
      * phone number, bio, and Instagram handle.
      *
-     * <p>Role gate: {@code INDEPENDENT_MASTER} only — same as {@code PATCH /me}.
-     * No further ownership check is needed; the authenticated user ID is resolved
+     * <p>Role gate: {@code INDEPENDENT_MASTER} or {@code SALON_OWNER} (the owner is always a
+     * master, phase 346/361). {@code PATCH /me} (locality) stays {@code INDEPENDENT_MASTER} only —
+     * the owner's location is the salon's. No further ownership check is needed; the authenticated user ID is resolved
      * from the JWT ({@link AuthenticationUtils#userId}) and the service writes only that row.
      *
      * @param request        validated profile update body
@@ -91,7 +92,7 @@ public class IndependentMasterController {
      * @return updated user profile wrapped in {@link ApiResponse}
      */
     @PatchMapping("/me/profile")
-    @PreAuthorize("hasRole('INDEPENDENT_MASTER')")
+    @PreAuthorize("hasAnyRole('INDEPENDENT_MASTER', 'SALON_OWNER')")
     public ResponseEntity<ApiResponse<MasterPublicProfileResponse>> updateProfile(
             @Valid @RequestBody MasterProfileUpdateRequest request,
             Authentication authentication

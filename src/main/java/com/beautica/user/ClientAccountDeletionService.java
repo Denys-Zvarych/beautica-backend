@@ -9,13 +9,13 @@ import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.CancellationReason;
 import com.beautica.booking.repository.AppointmentRepository;
 import com.beautica.booking.repository.BookingRepository;
+import com.beautica.booking.repository.SalonClosureBookingCandidate;
 import com.beautica.booking.service.BookingService;
 import com.beautica.common.cache.UserProfileCacheEvictor;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
-import com.beautica.media.entity.MediaFile;
+import com.beautica.media.repository.UploaderMediaKey;
 import com.beautica.media.repository.MediaRepository;
-import com.beautica.notification.repository.NotificationOutboxRepository;
 import com.beautica.review.repository.ClientReviewRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -25,10 +25,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Clock;
 import java.time.Instant;
-import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.List;
-import java.util.Set;
 import java.util.UUID;
 
 /**
@@ -39,6 +36,14 @@ import java.util.UUID;
  * deleted_at}. Everything that must survive for the PROVIDER's sake is detached first — see the
  * per-step notes below and the {@code ## Decisions} block in
  * {@code docs/backend-phases/phase-300-client-account-self-deletion.md}.
+ *
+ * <p><b>Phase 338 — REVERSES Phase 300 D4.</b> D4 read "a future booking is cancelled THEN
+ * deleted, never detached — there is no 'future receipt' to preserve." Per the 2026-09-28 product
+ * decision reversing it ("during deletion of ... client — all future bookings should be cancelled
+ * and the notification should be sent"), every future {@code CONFIRMED} booking is now CANCELLED
+ * and KEPT, detached with the SAME sentinel a past booking already gets — mirroring the master
+ * self-delete reversal Phase 337 already made for DECLINED bookings. See {@code
+ * docs/backend-phases/phase-338-client-self-delete-keeps-cancelled-future-bookings.md}.
  *
  * <p>Mirrors the disposal ORDER of {@code SalonService#disposeStaffAccounts} exactly (REUSE-FIRST):
  * pre-read external-storage pointers, settle every row that references the account being deleted,
@@ -54,14 +59,20 @@ public class ClientAccountDeletionService {
 
     /**
      * Perf finding 2 (2026-09 audit, MEDIUM — raised independently by both security and perf).
-     * {@code cancelBooking} cannot be batched (it interleaves per-booking reads/writes — the
-     * per-visit header-collapse logic REQUIRES this; see the loop's own comment below, which the
-     * fix must not touch) and issues ~4-6 statements per call, so an unbounded future-booking count
-     * can approach or exceed {@link #DELETE_ACCOUNT_TIMEOUT_SECONDS}, turning a self-delete into a
-     * bare 500 instead of a clean, actionable error. A client with more than this many future
-     * CONFIRMED bookings is directed to cancel some first — a business rule, not a technical limit,
-     * so it is enforced BEFORE any row is touched (see the guard right after the lookup below),
-     * never mid-loop.
+     * The per-booking TRANSITION itself cannot be batched into fewer statements — the two-phase
+     * header lock/collapse and the freshness recheck each require their own per-booking round trip
+     * (see {@code BookingService#cancelBookingCore}'s own Javadoc) — and still issue several
+     * statements per booking. Phase 338's own perf follow-up
+     * ({@code BookingService#cancelFutureConfirmedBookingsForClientSelfDelete}) collapsed the ONE
+     * batchable part — the initial full-graph load, previously one {@code findByIdWithFullGraph}
+     * round trip PER booking — into a single {@code findAllByIdsWithGraph} query up front, which
+     * measurably lowers the per-booking cost but does not make it O(1) for the whole cascade. An
+     * unbounded future-booking count can therefore still approach or exceed
+     * {@link #DELETE_ACCOUNT_TIMEOUT_SECONDS}, turning a self-delete into a bare 500 instead of a
+     * clean, actionable error. A client with more than this many future CONFIRMED bookings is
+     * directed to cancel some first — a business rule, not a technical limit, so it is enforced
+     * BEFORE any row is touched (see the guard right after the candidate read below), never
+     * mid-loop.
      */
     static final int MAX_FUTURE_BOOKINGS_PER_SELF_DELETE = 50;
 
@@ -83,7 +94,6 @@ public class ClientAccountDeletionService {
     private final BookingRepository bookingRepository;
     private final AppointmentRepository appointmentRepository;
     private final BookingService bookingService;
-    private final NotificationOutboxRepository notificationOutboxRepository;
     private final ClientReviewRepository clientReviewRepository;
     private final MediaRepository mediaRepository;
     private final TokensValidAfterCache tokensValidAfterCache;
@@ -124,20 +134,40 @@ public class ClientAccountDeletionService {
 
         // Step 3 — pre-read external-storage pointers BEFORE anything cascades them away. Mirrors
         // SalonService's own pre-read-before-cascade pattern for salon media rows.
-        List<MediaFile> mediaRows = mediaRepository.findByUploaderId(clientUserId);
-        String avatarR2Key = user.getAvatarR2Key();
+        // Scalar projection (P-L1) — no MediaFile entities loaded into the persistence context.
+        List<UploaderMediaKey> mediaRows = mediaRepository.findMediaKeysByUploaderIdIn(List.of(clientUserId));
 
         Instant now = clock.instant();
 
+        // Step 3.5 — client advisory lock (salt 1), Phase 338 race fix. Acquired BEFORE the
+        // future-booking candidate read below and held across it, the cap check, and every
+        // cancelBooking call that follows — mirroring disposeFutureConfirmedForMasterSelfDelete's
+        // acquireMasterLockForSelfDelete precondition (Phase 337) exactly, salt 1 instead of salt 0.
+        // Without this, a concurrent POST /bookings/POST /appointments for this SAME client — which
+        // already takes this SAME lock before its own write — is invisible to this method's row lock
+        // on `users` (a SELECT ... FOR UPDATE and a pg_advisory_xact_lock do not serialize against
+        // each other). See acquireClientLockForSelfDelete's own Javadoc for the full mechanism and
+        // why the widened V162 CHECK already rules out silent corruption either way.
+        bookingService.acquireClientLockForSelfDelete(clientUserId);
+
         // Step 4 — cancel every future CONFIRMED booking through the ORDINARY client cancel path
-        // (D4). NEVER the salon/master bulk-decline seam: that cascade hardcodes DECLINED +
-        // PROVIDER_UNAVAILABLE and writes provider_comment — wrong status, wrong actor, wrong
-        // note field for a client-initiated self-delete. cancelBooking's own header lock/collapse
-        // logic runs per booking exactly as it would for a normal client cancel, so a
-        // partially-cancelled Appointment (one leg already COMPLETED, the other future and just
-        // cancelled here) collapses correctly instead of being force-declined as a whole visit.
-        List<UUID> futureBookingIds = bookingService.findFutureConfirmedBookingIdsForClient(clientUserId);
-        if (futureBookingIds.size() > MAX_FUTURE_BOOKINGS_PER_SELF_DELETE) {
+        // (Phase 338 — REVERSES D4). NEVER the salon/master bulk-decline seam: that cascade
+        // hardcodes DECLINED + PROVIDER_UNAVAILABLE and writes provider_comment — wrong status,
+        // wrong actor, wrong note field for a client-initiated self-delete. cancelBooking's own
+        // header lock/collapse logic runs per booking exactly as it would for a normal client
+        // cancel, so a partially-cancelled Appointment (one leg already COMPLETED, the other
+        // future and just cancelled here) collapses correctly instead of being force-declined as a
+        // whole visit.
+        //
+        // Perf audit (2026-09, item 2 — MEDIUM): routed through the BATCHED entry point
+        // (BookingService#cancelFutureConfirmedBookingsForClientSelfDelete), never a per-booking
+        // loop calling the ordinary cancelBooking(UUID, UUID, CancelBookingRequest) — that overload
+        // re-queries the booking's full graph on every call; the batched entry point preloads every
+        // candidate's graph in ONE query and feeds each preloaded entity into the SAME per-booking
+        // transition body (REUSE-FIRST — see that method's own Javadoc for the full mechanism).
+        List<SalonClosureBookingCandidate> futureCandidates =
+                bookingService.findFutureConfirmedBookingCandidatesForClient(clientUserId);
+        if (futureCandidates.size() > MAX_FUTURE_BOOKINGS_PER_SELF_DELETE) {
             // Fails BEFORE any write — no partial cancellation, nothing to roll back. 422 so the
             // client message is echoed verbatim (GlobalExceptionHandler#handleBusiness), matching
             // the existing UNPROCESSABLE_ENTITY convention for deliberate, user-facing domain copy
@@ -146,67 +176,50 @@ public class ClientAccountDeletionService {
                     HttpStatus.UNPROCESSABLE_ENTITY,
                     ("Забагато активних записів (%d) для видалення акаунту. Спочатку скасуйте частину "
                             + "майбутніх записів (максимум %d) і спробуйте ще раз.")
-                            .formatted(futureBookingIds.size(), MAX_FUTURE_BOOKINGS_PER_SELF_DELETE));
+                            .formatted(futureCandidates.size(), MAX_FUTURE_BOOKINGS_PER_SELF_DELETE));
         }
+        List<UUID> futureBookingIds = futureCandidates.stream()
+                .map(SalonClosureBookingCandidate::bookingId).toList();
         CancelBookingRequest cancelRequest =
                 new CancelBookingRequest(CancellationReason.CLIENT_CANCELLED, SELF_DELETE_CANCELLATION_NOTE);
-        for (UUID bookingId : futureBookingIds) {
-            bookingService.cancelBooking(clientUserId, bookingId, cancelRequest);
-        }
+        bookingService.cancelFutureConfirmedBookingsForClientSelfDelete(
+                clientUserId, futureBookingIds, cancelRequest);
 
-        // Step 5 — physically delete the now-CANCELLED future booking rows. D4: a future booking
-        // is cancelled THEN deleted, never detached — there is no "future receipt" to preserve.
+        // Step 5 — Phase 338: the just-cancelled future bookings are KEPT, never physically
+        // deleted (REVERSES D4's "cancelled THEN deleted, never detached"). They are detached
+        // together with the past bookings in step 6 below.
         //
-        // The cancelBooking loop above (step 4) enqueued one STATUS_CHANGED notification_outbox row
-        // per booking (BookingService#cancelBooking -> outboxService.enqueueStatusChanged). That
-        // row's aggregate_id is a raw UUID with NO FK to bookings (V32) — nothing at the DB level
-        // stops us deleting the very booking it points at. Left alone, the drain worker would claim
-        // the orphaned row, fail to re-hydrate the booking, throw IllegalStateException, and
-        // dead-letter it on every self-delete that cancels a future booking. So the just-enqueued
-        // outbox rows for these ids are removed HERE, in the same transaction, immediately before
-        // the booking rows themselves go — do not read this as redundant cleanup.
+        // Perf audit (2026-09, item 3 — LOW, resolves item 1's security finding by construction):
+        // the batched cancel entry point above never writes a per-booking STATUS_CHANGED outbox
+        // row in the first place (see its own Javadoc) — unlike the old per-booking cancelBooking
+        // loop, which enqueued one PER BOOKING and required deleting them all again here with a
+        // scope-free deleteByAggregateIdIn that would ALSO have destroyed any other still-PENDING
+        // outbox row addressed to one of these same bookings (e.g. an undrained
+        // BOOKING_RESCHEDULED). Nothing to clean up any more — only the ONE CLIENT_CANCELLED row
+        // per affected VISIT is enqueued (enqueueClientCancelledPerVisit, reusing the SAME event
+        // type GuestVisitCancellationService writes for a guest's whole-visit cancel).
         if (!futureBookingIds.isEmpty()) {
-            notificationOutboxRepository.deleteByAggregateIdIn(futureBookingIds);
-            bookingRepository.deleteAllByIdInBatch(futureBookingIds);
+            bookingService.enqueueClientCancelledPerVisit(futureCandidates);
         }
 
-        // Step 6 — every visit header still attached to this client, now that its future legs are
-        // gone: childless (every leg was a future CONFIRMED one, now deleted) is physically
-        // deleted; a header with at least one surviving (past/terminal) child is detached, never
-        // both, never inferred from the header's own status alone.
-        //
-        // Perf finding 1 (2026-09 audit, HIGH): survivorship for EVERY remaining header is resolved
-        // in ONE set-based query (findAppointmentIdsWithSurvivingBookings), never a per-appointment
-        // existsByAppointmentId probe in the loop — that was N sequential Neon round trips (~1.5-4.5s
-        // for a 150-header client) held inside this transaction's row lock on the users row. The
-        // partition below is pure in-memory Set membership.
+        // Step 6 — every visit header still attached to this client is unconditionally DETACHED,
+        // never deleted (Phase 338). Since future CONFIRMED legs are now KEPT rather than deleted
+        // (step 4/5 above), no header can ever end up CHILDLESS via this flow any more — every leg
+        // it ever had still exists, cancelled or otherwise — so the Phase 300 D4 survivorship
+        // partition (findAppointmentIdsWithSurvivingBookings) is gone along with the childless-delete
+        // branch it fed.
         List<Appointment> remainingAppointments = appointmentRepository.findByClientId(clientUserId);
-        List<UUID> remainingAppointmentIds = remainingAppointments.stream().map(Appointment::getId).toList();
-        Set<UUID> appointmentIdsWithSurvivingBookings = remainingAppointmentIds.isEmpty()
-                // Guard the empty case: appointment_id IN () is wasted work (or dialect-dependent
-                // undefined behaviour) when the caller already knows the answer is "none".
-                ? Set.of()
-                : new HashSet<>(bookingRepository.findAppointmentIdsWithSurvivingBookings(remainingAppointmentIds));
-        List<UUID> childlessAppointmentIds = new ArrayList<>();
-        int detachedAppointments = 0;
         for (Appointment appointment : remainingAppointments) {
-            if (appointmentIdsWithSurvivingBookings.contains(appointment.getId())) {
-                appointment.detachClient(DETACHED_CLIENT_LABEL, now);
-                detachedAppointments++;
-            } else {
-                childlessAppointmentIds.add(appointment.getId());
-            }
-        }
-        if (!childlessAppointmentIds.isEmpty()) {
-            appointmentRepository.deleteAllByIdInBatch(childlessAppointmentIds);
+            appointment.detachClient(DETACHED_CLIENT_LABEL, now);
         }
 
-        // Step 6 (bookings) — every booking row still attached to this client is, by
-        // construction, past or terminal (every future CONFIRMED one was deleted in step 5).
-        // ONE Hibernate UPDATE per row writing the sentinel, nulling client and stamping
-        // clientDetachedAt together — mirrors Master#detach: the whole-row CHECK
-        // (chk_bookings_guest_fields, V162) is evaluated against the result, so splitting this
-        // into two statements would leave an intermediate row no arm of the CHECK accepts.
+        // Step 6 (bookings) — every booking row still attached to this client — past/terminal rows
+        // unchanged since Phase 300, plus the just-cancelled future rows Phase 338 now keeps — is
+        // detached here, together, in the same uniform loop. ONE Hibernate UPDATE per row writing
+        // the sentinel, nulling client and stamping clientDetachedAt together — mirrors
+        // Master#detach: the whole-row CHECK (chk_bookings_guest_fields, V162) is evaluated against
+        // the result, so splitting this into two statements would leave an intermediate row no arm
+        // of the CHECK accepts.
         List<Booking> remainingBookings = bookingRepository.findByClientId(clientUserId);
         for (Booking booking : remainingBookings) {
             booking.detachClient(DETACHED_CLIENT_LABEL, now);
@@ -253,22 +266,19 @@ public class ClientAccountDeletionService {
         authService.denylistAccessToken(accessToken);
 
         // Step 12 — R2 blob sweep, registered to run strictly after commit (D "external-storage
-        // cleanup contract", Anti-Bug Playbook §O8). Never called inline: MediaService#deleteByUploader
-        // opens its own PROPAGATION_REQUIRES_NEW transactions, so an outer rollback here would leave
-        // blobs already destroyed. See MediaService#purgeUserBlobsAfterCommit's own Javadoc for why
+        // cleanup contract", Anti-Bug Playbook §O8). Never purged inline: an R2 delete inside this
+        // transaction would leave a rolled-back account pointing at already-destroyed blobs. See MediaService#purgeUserBlobsAfterCommit's own Javadoc for why
         // this is R2-only (the DB rows are already gone via CASCADE by the time this callback runs).
         // Phase 301: promoted to AccountBlobPurgeRegistrar so the staff/independent-master
         // self-delete flow can share the identical after-commit registration shape.
-        accountBlobPurgeRegistrar.registerAfterCommit(clientUserId, avatarR2Key, mediaRows);
+        accountBlobPurgeRegistrar.registerAfterCommit(user, mediaRows);
 
         // Step 13 — audit trail. Ids and counts only, never an email or any other PII (this repo's
         // logging convention) — a hard delete of the account is the single most consequential
         // mutation this service performs; it must leave a record even though the row it names is
         // gone.
-        log.info("Client account self-delete: user {} deleted, {} future booking(s) cancelled+deleted, "
-                        + "{} appointment header(s) deleted, {} appointment header(s) detached, "
-                        + "{} booking(s) detached",
-                clientUserId, futureBookingIds.size(), childlessAppointmentIds.size(),
-                detachedAppointments, remainingBookings.size());
+        log.info("Client account self-delete: user {} deleted, {} future booking(s) cancelled+kept, "
+                        + "{} appointment header(s) detached, {} booking(s) detached",
+                clientUserId, futureBookingIds.size(), remainingAppointments.size(), remainingBookings.size());
     }
 }

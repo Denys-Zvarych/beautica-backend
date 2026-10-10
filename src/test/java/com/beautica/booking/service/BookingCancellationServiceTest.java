@@ -8,6 +8,7 @@ import com.beautica.config.BookingSmsProperties;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.master.entity.Master;
+import com.beautica.notification.inapp.service.InAppNotificationService;
 import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.notification.sms.SmsService;
 import com.beautica.service.entity.MasterServiceAssignment;
@@ -60,6 +61,7 @@ class BookingCancellationServiceTest {
     @Mock private SmsService smsService;
     @Mock private SlotCalculationService slotCalculationService;
     @Mock private com.beautica.service.service.SalonCatalogCacheEvictor salonCatalogCacheEvictor;
+    @Mock private InAppNotificationService inAppNotificationService;
 
     private BookingCancellationService service;
 
@@ -68,7 +70,7 @@ class BookingCancellationServiceTest {
         service = new BookingCancellationService(
                 guestVisitCancellationService, bookingRepository, outboxService, smsDispatcher(),
                 slotCalculationService, new BookingSmsProperties(), salonCatalogCacheEvictor,
-                Clock.fixed(NOW.toInstant(), ZoneOffset.UTC));
+                Clock.fixed(NOW.toInstant(), ZoneOffset.UTC), inAppNotificationService);
     }
 
     /**

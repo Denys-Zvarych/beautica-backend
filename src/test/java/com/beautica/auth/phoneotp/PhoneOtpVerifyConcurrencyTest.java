@@ -1,5 +1,6 @@
 package com.beautica.auth.phoneotp;
 
+import org.springframework.test.context.TestPropertySource;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.config.TestSecurityConfig;
@@ -45,6 +46,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * itself: every {@code verifyOtp} commits independently. Mirrors
  * {@code PasswordResetConcurrencyTest}.
  */
+@TestPropertySource(properties = "spring.datasource.hikari.maximum-pool-size=40") // 16 threads, each REQUIRES_NEW (2 conns) — avoids pool deadlock
 @Import(TestSecurityConfig.class)
 @DisplayName("PhoneOtpService — verify attempt counter is atomic under concurrency")
 class PhoneOtpVerifyConcurrencyTest extends AbstractIntegrationTest {

@@ -72,8 +72,12 @@ spring:
     multipart:
       # Image uploads are bounded at 5 MB — aligned with MediaService.MAX_FILE_BYTES (5 MB).
       # Oversized requests are rejected at the Tomcat layer before reaching the controller.
+      # max-request-size sits 1 MB above max-file-size: the request cap counts the multipart
+      # envelope (boundaries + part headers) too, so at 5MB an exactly-5 MB image got a 413.
+      # The per-file cap (and the service-level caps) still enforce 5 MB per file / per request
+      # total (SupportService.MAX_TOTAL_BYTES).
       max-file-size: 5MB
-      max-request-size: 5MB
+      max-request-size: 6MB
       # Explicit temp directory avoids platform-specific default locations on non-Railway hosts.
       location: ${java.io.tmpdir}/beautica-uploads
 
@@ -160,9 +164,9 @@ server:
     # effect immediately should a handler ever back-fill Content-Length.
     min-response-size: 1KB
   tomcat:
-    # Swallow up to 5 MB of an oversized request body so Tomcat returns a clean 413
-    # rather than aborting the TCP connection mid-stream. Matches the multipart cap above.
-    max-swallow-size: 5MB
+    # Swallow up to 6 MB of an oversized request body so Tomcat returns a clean 413
+    # rather than aborting the TCP connection mid-stream. Matches max-request-size above.
+    max-swallow-size: 6MB
 
 notification:
   outbox:
@@ -174,6 +178,22 @@ notification:
       # worst-case Phase 2 dispatch window for a full batch (~33 min at BATCH_SIZE=50) — see
       # NotificationOutboxDrainWorker#drain() javadoc.
       stale-claim-threshold: 60m
+  inapp:
+    # Phase 335 — retention window for the in-app notification feed (in_app_notification):
+    # rows (read or unread) older than this are hard-deleted by InAppNotificationCleanupJob's
+    # daily sweep. Validated to [7, 365] by InAppNotificationRetentionProperties.
+    retention-days: 90
+    cleanup:
+      # Kill switch, checked at the top of every scheduled run (not a bean-creation gate — see
+      # InAppNotificationCleanupProperties javadoc). Production default is on; the test profile
+      # turns it off so the real scheduler never fires mid @SpringBootTest.
+      enabled: true
+      # Off the top of the hour and clear of the existing 03:00-03:57 UTC cleanup cluster
+      # (outbox purge 03:00, verification 03:17, password-reset 03:42, refresh-token 03:57) —
+      # see InAppNotificationCleanupJob's javadoc. Overridable for ops tuning / test pinning.
+      cron: "0 12 4 * * *"
+      batch-size: 1000
+      max-batches-per-run: 50
 
 management:
   endpoints:
@@ -221,6 +241,8 @@ app:
     secret-access-key: ${CLOUDFLARE_R2_SECRET_ACCESS_KEY:}
     bucket: ${CLOUDFLARE_R2_BUCKET:beautica-media}
     endpoint: ${CLOUDFLARE_R2_ENDPOINT:}
+    # Endpoint host must end with .r2.cloudflarestorage.com unless this opt-out is true.
+    allow-custom-endpoint: ${CLOUDFLARE_R2_ALLOW_CUSTOM_ENDPOINT:false}
     public-url: ${CLOUDFLARE_R2_PUBLIC_URL:}
   firebase:
     service-account: ${FIREBASE_SERVICE_ACCOUNT:}
@@ -393,6 +415,10 @@ app:
     # Sends no email; higher cap tolerates legitimate new-password typo retries
     # against a single emailed token.
     reset-password-capacity: 10
+    # POST /api/v1/auth/invite — 15/min per IP (60 s window). Timing-oracle + invite-email
+    # flood guard (see RateLimitConfig#inviteCapacity). Local seeding raises it via
+    # scripts/start-backend.sh (APP_RATE_LIMIT_INVITE_CAPACITY); prod keeps 15.
+    invite-capacity: 15
   outbox:
     # Base64-encoded 32-byte (AES-256) symmetric key for OutboxPayloadCipher.
     # Generate with: openssl rand -base64 32

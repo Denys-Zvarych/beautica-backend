@@ -12,6 +12,16 @@ import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
 
+/**
+ * Normalizes a libpq-style {@code DATABASE_URL} into a JDBC URL + credentials.
+ *
+ * <p><b>Planning-cost dependency (keep the DIRECT Neon endpoint).</b> Large bookability predicates
+ * (e.g. {@code MasterRepository#findBookableIdsBySalonId}) cost ~7 ms to plan vs ~0.3 ms to
+ * execute. pgjdbc server-prepares a statement after 5 uses (default {@code prepareThreshold=5}),
+ * which hides that cost. Pointing {@code DATABASE_URL} at Neon's pooled {@code -pooler} endpoint
+ * (PgBouncer transaction mode) with {@code prepareThreshold=0} disables server-side prepares, so
+ * every request would pay the ~7 ms plan.
+ */
 public class DatabaseUrlNormalizerPostProcessor implements EnvironmentPostProcessor {
 
     private static final Set<String> LIBPQ_ONLY_PARAMS = Set.of("channel_binding", "sslnegotiation");

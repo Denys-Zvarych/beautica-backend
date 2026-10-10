@@ -1,5 +1,6 @@
 package com.beautica.config;
 
+import com.beautica.booking.service.BookingMasterService;
 import com.beautica.client.service.ClientPassportService;
 import com.beautica.common.cache.UserProfileCacheEvictor;
 import com.beautica.location.SettlementDisplayNameResolver;
@@ -133,7 +134,7 @@ public class CacheConfig {
      *                         Spring stores NullValue for "this user has no active master row" and
      *                         the miss is memoised too — which is why eviction is BIDIRECTIONAL,
      *                         firing on create/reactivate as well as deactivate. See the invariant
-     *                         block on MasterService#deactivateOwnerMaster.
+     *                         block above MasterService#evictUserKeyedMasterCachesAfterCommit.
      *   user-profile        — userId→UserProfileResponse DTO for GET /users/me — 5 min TTL, max
      *                         2000 entries. CROSS-AGGREGATE: hasMasterProfile is derived from a
      *                         `masters` row this cache's owning service does not write, so
@@ -341,8 +342,8 @@ public class CacheConfig {
         // Public GET /masters/{masterId} — 5 min TTL (shorter than master-detail-by-user
         // since discovery pages cache across many callers; 1000 entries covers active masters
         // at current scale). sync=true is specified on the @Cacheable annotation.
-        // Explicit per-key eviction runs afterCommit in MasterService.deactivateMaster,
-        // deactivateOwnerMaster, and the reactivation branch of createMasterForOwner.
+        // Explicit per-key eviction runs afterCommit in MasterService.deactivateMaster
+        // and the reactivation branch of createMasterForOwner.
         // Profile-text writes (bio/phone/locality via UserService) rely solely on this TTL
         // because UserService holds only userId, not masterId — documented trade-off.
         manager.registerCustomCache("master-detail",
@@ -360,8 +361,8 @@ public class CacheConfig {
         // The price is that "no row" is now a CACHED FACT, so the eviction contract became
         // BIDIRECTIONAL: before, only deactivation could stale this cache (a miss was never stored);
         // now creation and reactivation stale it too, and every such path must evict. The complete,
-        // named path list — and why it is exhaustive — lives in the invariant block inside
-        // MasterService#deactivateOwnerMaster. Do not add a fourth create path without reading it.
+        // named path list — and why it is exhaustive — lives in the invariant block above
+        // MasterService#evictUserKeyedMasterCachesAfterCommit. Do not add a path without reading it.
         //
         // Phase 265 audit (finding 6): 500 → 1000. GET /masters/me was widened to SALON_OWNER,
         // and SalonService#createSalon auto-creates the owner-master row on first-salon
@@ -707,7 +708,9 @@ public class CacheConfig {
         // keyed on the slug. permitAll + uncached previously meant a DB master lookup +
         // bounded service-list query per hit (scrape / DB-amplification surface). A short
         // 60-sec TTL caps that fan-out while a freshly-edited profile self-heals within a
-        // minute, so NO @CacheEvict wiring is needed. sync=true on the @Cacheable annotation
+        // minute. Exception (Phase 344 c1): avatar writes evict the slug key after commit via
+        // MasterProfileCacheEvictor, because a replaced/deleted avatar's blob is purged — a stale
+        // entry would render a broken image, not just an old one. sync=true on the @Cacheable annotation
         // collapses the thundering herd when a popular slug expires (Anti-Bug §F-7).
         manager.registerCustomCache("booking-slug-info",
                 Caffeine.newBuilder()
@@ -726,6 +729,17 @@ public class CacheConfig {
         registerMetered(manager, meterRegistry, "salon-service-catalog",
                 Caffeine.newBuilder()
                         .maximumSize(500)
+                        .expireAfterWrite(60, TimeUnit.SECONDS));
+        // Strict per-master verdict (BookingMasterService#getBookableAssignmentIds) behind the public
+        // GET /masters/{id}/services client filter — keyed
+        // [masterId] (one-element list), so the existing by-master afterCommit sweeps
+        // (SlotCalculationService BOOKING_WRITE_CACHES, MasterScheduleService SCHEDULE_WRITE_CACHES)
+        // evict it with no parallel wiring; assignment writes evict the key directly. 60-sec TTL
+        // backstop, sync=true on the @Cacheable (the read is permitAll — §F-7). Sized like
+        // master-service-bookable: one small id set per browsed master.
+        registerMetered(manager, meterRegistry, BookingMasterService.BOOKABLE_ASSIGNMENTS_CACHE,
+                Caffeine.newBuilder()
+                        .maximumSize(2000)
                         .expireAfterWrite(60, TimeUnit.SECONDS));
         // Phase 13.6 (perf follow-up) — approved+active PlatformCategory ordering backing
         // ServiceCatalogService#buildCategoryOrderAndNames. Mirrors service-categories's config: this

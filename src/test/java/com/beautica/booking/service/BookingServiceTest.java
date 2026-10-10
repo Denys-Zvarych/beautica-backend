@@ -18,6 +18,7 @@ import com.beautica.booking.enums.CancellationReason;
 import com.beautica.booking.repository.AppointmentRepository;
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.booking.repository.SalonClosureBookingCandidate;
+import com.beautica.booking.repository.TestPostLockSlotCheck;
 import com.beautica.common.exception.BookingElapsedException;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ClientBookingConflictException;
@@ -29,6 +30,7 @@ import com.beautica.master.entity.MasterType;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.master.service.ScheduleDateMath;
 import com.beautica.booking.service.SlotCalculationService;
+import com.beautica.notification.inapp.service.InAppNotificationService;
 import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.PriceType;
@@ -66,6 +68,7 @@ import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
+import java.util.Collection;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
@@ -108,8 +111,6 @@ class BookingServiceTest {
     @Mock
     private NotificationOutboxService outboxService;
     @Mock
-    private com.beautica.notification.repository.NotificationOutboxRepository notificationOutboxRepository;
-    @Mock
     private SlotCalculationService slotCalculationService;
     @Mock
     private com.beautica.review.repository.ReviewRepository reviewRepository;
@@ -127,6 +128,8 @@ class BookingServiceTest {
     private AppointmentTransitionService appointmentTransitionService;
     @Mock
     private AppointmentRepository appointmentRepository;
+    @Mock
+    private InAppNotificationService inAppNotificationService;
 
     private Clock clock;
 
@@ -159,7 +162,6 @@ class BookingServiceTest {
                 salonRepository,
                 authz,
                 outboxService,
-                notificationOutboxRepository,
                 slotCalculationService,
                 reviewRepository,
                 clientReviewRepository,
@@ -174,7 +176,8 @@ class BookingServiceTest {
                 dateMath,
                 appointmentTransitionService,
                 appointmentRepository,
-                eventPublisher
+                eventPublisher,
+                inAppNotificationService
         );
 
         clientId = UUID.randomUUID();
@@ -194,6 +197,15 @@ class BookingServiceTest {
         // is STRICT_STUBS) keeps every pre-existing standalone-path test's intent unchanged; the
         // dedicated negative tests for this recheck override it to false explicitly.
         lenient().when(bookingRepository.existsConfirmedById(any())).thenReturn(true);
+
+        // Phase 337 fix: doCreateBooking now re-checks bookability AFTER the advisory lock
+        // (PostLockSlotGuard, closing the self-delete-race CRITICAL) fused, since the Phase 337
+        // follow-up, with the overlap re-check into a single findPostLockBookabilityAndOverlap
+        // statement. Defaulting to "still bookable, no overlap" here (lenient — only the create
+        // tests reach this call) keeps every pre-existing create-path test's intent unchanged; the
+        // dedicated negative tests below override it per-scenario.
+        lenient().when(bookingRepository.findPostLockBookabilityAndOverlap(any(), any(), any()))
+                .thenReturn(Optional.of(new TestPostLockSlotCheck(true, false)));
     }
 
     // ── helpers ────────────────────────────────────────────────────────────────
@@ -339,7 +351,8 @@ class BookingServiceTest {
     void should_createBooking_when_slotAvailableAndNoConflict() {
         when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msa));
-        when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(false);
+        when(bookingRepository.findPostLockBookabilityAndOverlap(any(), any(), any()))
+                .thenReturn(Optional.of(new TestPostLockSlotCheck(true, false)));
         when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
         Booking saved = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
         when(bookingRepository.saveAndFlush(any())).thenReturn(saved);
@@ -365,7 +378,8 @@ class BookingServiceTest {
 
         when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(ownerMaster));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(ownerMsa));
-        when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(false);
+        when(bookingRepository.findPostLockBookabilityAndOverlap(any(), any(), any()))
+                .thenReturn(Optional.of(new TestPostLockSlotCheck(true, false)));
         when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
 
         Booking saved = buildBooking(bookingId, client, ownerMaster, ownerMsa, BookingStatus.CONFIRMED);
@@ -408,7 +422,8 @@ class BookingServiceTest {
         when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msa));
         when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
-        when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(true);
+        when(bookingRepository.findPostLockBookabilityAndOverlap(any(), any(), any()))
+                .thenReturn(Optional.of(new TestPostLockSlotCheck(true, true)));
         stubCreateSlotAvailable();
 
         assertThatThrownBy(() -> bookingService.createBooking(clientId, null, validRequest()))
@@ -451,7 +466,7 @@ class BookingServiceTest {
         // every other client racing for the same popular master may be waiting on) is never
         // touched for a conflict that is entirely about this client's own calendar.
         verify(bookingRepository, never()).acquireAdvisoryLock(any());
-        verify(bookingRepository, never()).existsOverlap(any(), any(), any());
+        verify(bookingRepository, never()).findPostLockBookabilityAndOverlap(any(), any(), any());
         verify(bookingRepository, never()).saveAndFlush(any());
     }
 
@@ -462,7 +477,8 @@ class BookingServiceTest {
         when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msa));
         when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
-        when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(false);
+        when(bookingRepository.findPostLockBookabilityAndOverlap(any(), any(), any()))
+                .thenReturn(Optional.of(new TestPostLockSlotCheck(true, false)));
         Booking saved = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
         when(bookingRepository.saveAndFlush(any())).thenReturn(saved);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(saved));
@@ -480,7 +496,7 @@ class BookingServiceTest {
         inOrder.verify(bookingRepository).acquireClientAdvisoryLockWithTimeout(clientId);
         inOrder.verify(bookingRepository).findFirstConflictingClientBookingId(eq(clientId), any(), any());
         inOrder.verify(bookingRepository).acquireAdvisoryLock(masterId);
-        inOrder.verify(bookingRepository).existsOverlap(eq(masterId), any(), any());
+        inOrder.verify(bookingRepository).findPostLockBookabilityAndOverlap(eq(masterId), any(), any());
 
         // The master lock still uses the PLAIN (non-fused) query — the 3s lock_timeout set by
         // acquireClientAdvisoryLockWithTimeout is transaction-scoped (set_config(..., true)),
@@ -576,7 +592,8 @@ class BookingServiceTest {
         when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(salonMaster));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
                 .thenReturn(Optional.of(msa));
-        when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(false);
+        when(bookingRepository.findPostLockBookabilityAndOverlap(any(), any(), any()))
+                .thenReturn(Optional.of(new TestPostLockSlotCheck(true, false)));
         when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
         Booking saved = buildBooking(bookingId, client, salonMaster, msa, BookingStatus.CONFIRMED);
         when(bookingRepository.saveAndFlush(any())).thenReturn(saved);
@@ -601,7 +618,8 @@ class BookingServiceTest {
         when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
                 .thenReturn(Optional.of(msa));
-        when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(false);
+        when(bookingRepository.findPostLockBookabilityAndOverlap(any(), any(), any()))
+                .thenReturn(Optional.of(new TestPostLockSlotCheck(true, false)));
         when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
         Booking saved = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
         when(bookingRepository.saveAndFlush(any())).thenReturn(saved);
@@ -675,7 +693,8 @@ class BookingServiceTest {
     void should_proceedPastTimeCheck_when_startsAtIsExactly15MinutesFromNow() {
         when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msa));
-        when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(false);
+        when(bookingRepository.findPostLockBookabilityAndOverlap(any(), any(), any()))
+                .thenReturn(Optional.of(new TestPostLockSlotCheck(true, false)));
         when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
         Booking saved = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
         when(bookingRepository.saveAndFlush(any())).thenReturn(saved);
@@ -726,7 +745,8 @@ class BookingServiceTest {
                 masterServiceId, master, serviceDef, new BigDecimal("250.00"), 45);
         when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msaWithOverrides));
-        when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(false);
+        when(bookingRepository.findPostLockBookabilityAndOverlap(any(), any(), any()))
+                .thenReturn(Optional.of(new TestPostLockSlotCheck(true, false)));
         when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
         Booking saved = buildBooking(bookingId, client, master, msaWithOverrides, BookingStatus.CONFIRMED);
         setField(saved, "priceAtBooking", new BigDecimal("250.00"));
@@ -749,7 +769,8 @@ class BookingServiceTest {
     void should_fallBackToBaseValues_when_noOverrides() {
         when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msa));
-        when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(false);
+        when(bookingRepository.findPostLockBookabilityAndOverlap(any(), any(), any()))
+                .thenReturn(Optional.of(new TestPostLockSlotCheck(true, false)));
         when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
         Booking saved = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
         when(bookingRepository.saveAndFlush(any())).thenReturn(saved);
@@ -770,7 +791,8 @@ class BookingServiceTest {
     void should_enqueueNewBookingNotification_when_bookingCreated() {
         when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msa));
-        when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(false);
+        when(bookingRepository.findPostLockBookabilityAndOverlap(any(), any(), any()))
+                .thenReturn(Optional.of(new TestPostLockSlotCheck(true, false)));
         when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
         Booking saved = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
         when(bookingRepository.saveAndFlush(any())).thenReturn(saved);
@@ -1079,15 +1101,13 @@ class BookingServiceTest {
                 .thenReturn(List.of(
                         new SalonClosureBookingCandidate(earliestBookingId, appointmentId, masterId, earliestStart),
                         new SalonClosureBookingCandidate(laterBookingId, appointmentId, masterId, laterStart)));
-        Booking survivingSibling = buildBookingStartingAt(
-                laterBookingId, client, master, msa, BookingStatus.CONFIRMED, laterStart);
-        // declineAppointmentItems' own G3 batched freshness recheck filters out whatever raced away
-        // internally — this simulates it returning ONLY the surviving sibling, i.e. the
+        // declineAppointmentItemsBulk's own batched freshness recheck filters out whatever raced
+        // away internally — this simulates it returning ONLY the surviving sibling, i.e. the
         // earliest-startsAt item (the pre-fix D12 pick) lost its own race.
-        when(appointmentTransitionService.declineAppointmentItems(
-                eq(actorId), eq(appointmentId), eq(List.of(earliestBookingId, laterBookingId)),
-                any(), eq(false), any()))
-                .thenReturn(List.of(survivingSibling));
+        when(appointmentTransitionService.declineAppointmentItemsBulk(
+                eq(Map.of(appointmentId, List.of(earliestBookingId, laterBookingId))),
+                eq(CancellationReason.PROVIDER_UNAVAILABLE), any()))
+                .thenReturn(Set.of(laterBookingId));
 
         bookingService.declineFutureConfirmedBookingsForSalonClosure(actorId, salonId);
 
@@ -1096,13 +1116,17 @@ class BookingServiceTest {
     }
 
     @Test
-    @DisplayName("declineFutureConfirmedBookingsForSalonClosure — perf finding 2, 2026-09 re-audit: "
-            + "every appointment-visit in the cascade shares ONE management-access memo instance, "
-            + "never a fresh one per visit — the memo is what lets AuthorizationService answer the "
-            + "SALON_OWNER ownership question at most once per distinct salon for the WHOLE "
-            + "cascade instead of once per visit (see AuthorizationServiceTest for the "
-            + "existsByIdAndOwnerId query-count proof at the AuthorizationService layer itself)")
-    void should_shareOneManagementAccessMemo_when_cascadeSpansMultipleAppointmentVisits() {
+    @DisplayName("declineFutureConfirmedBookingsForSalonClosure — perf MEDIUM, phase 337 cycle-2 "
+            + "audit: the WHOLE cascade's appointment-visit authorization is now ONE call to "
+            + "enforceCanManageAppointments, carrying every distinct appointment-visit id AND the "
+            + "pre-seeded management-access memo — never one enforceCanManageAppointment call per "
+            + "visit (superseded: the memo instance used to be proven shared ACROSS repeated calls; "
+            + "now there is only one call, so there is nothing left to share it across — see "
+            + "AuthorizationServiceTest for the existsByIdAndOwnerId query-count proof, and its "
+            + "'agrees with the single-id overload' tests, at the AuthorizationService layer itself). "
+            + "Authorization still runs BEFORE the batched decline write (perf re-audit, 2026-09, "
+            + "Finding 1, unchanged by this fix)")
+    void should_issueOneBatchedAuthorizationCall_when_cascadeSpansMultipleAppointmentVisits() {
         UUID actorId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
         UUID appointmentId1 = UUID.randomUUID();
@@ -1117,30 +1141,28 @@ class BookingServiceTest {
                 .thenReturn(List.of(
                         new SalonClosureBookingCandidate(bookingId1, appointmentId1, masterId, start1),
                         new SalonClosureBookingCandidate(bookingId2, appointmentId2, masterId, start2)));
-        Booking declined1 = buildBookingStartingAt(bookingId1, client, master, msa, BookingStatus.CONFIRMED, start1);
-        Booking declined2 = buildBookingStartingAt(bookingId2, client, master, msa, BookingStatus.CONFIRMED, start2);
-        when(appointmentTransitionService.declineAppointmentItems(
-                eq(actorId), eq(appointmentId1), eq(List.of(bookingId1)), any(), eq(false), any()))
-                .thenReturn(List.of(declined1));
-        when(appointmentTransitionService.declineAppointmentItems(
-                eq(actorId), eq(appointmentId2), eq(List.of(bookingId2)), any(), eq(false), any()))
-                .thenReturn(List.of(declined2));
+        when(appointmentTransitionService.declineAppointmentItemsBulk(any(), any(), any()))
+                .thenReturn(Set.of(bookingId1, bookingId2));
 
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<Collection<UUID>> appointmentIdsCaptor = ArgumentCaptor.forClass(Collection.class);
         @SuppressWarnings("unchecked")
         ArgumentCaptor<Map<AuthorizationService.MemoKey, Boolean>> memoCaptor = ArgumentCaptor.forClass(Map.class);
 
         bookingService.declineFutureConfirmedBookingsForSalonClosure(actorId, salonId);
 
-        verify(appointmentTransitionService, times(2)).declineAppointmentItems(
-                eq(actorId), any(), any(), any(), eq(false), memoCaptor.capture());
-        List<Map<AuthorizationService.MemoKey, Boolean>> memos = memoCaptor.getAllValues();
-        assertThat(memos.get(0))
-                .as("the SAME memo instance is threaded through every appointment-visit call in "
-                        + "one cascade — never a fresh map per visit")
-                .isSameAs(memos.get(1));
-        assertThat(memos.get(0).get(new AuthorizationService.MemoKey(actorId, salonId)))
+        verify(authz, times(1)).enforceCanManageAppointments(
+                eq(actorId), appointmentIdsCaptor.capture(), memoCaptor.capture());
+        verify(authz, never()).enforceCanManageAppointment(any(), any(), any());
+        assertThat(appointmentIdsCaptor.getValue())
+                .as("every distinct appointment-visit in the cascade is authorized in the ONE call")
+                .containsExactlyInAnyOrder(appointmentId1, appointmentId2);
+        assertThat(memoCaptor.getValue().get(new AuthorizationService.MemoKey(actorId, salonId)))
                 .as("pre-seeded true from the ownership self-assertion this method already ran")
                 .isTrue();
+        verify(appointmentTransitionService).declineAppointmentItemsBulk(
+                eq(Map.of(appointmentId1, List.of(bookingId1), appointmentId2, List.of(bookingId2))),
+                eq(CancellationReason.PROVIDER_UNAVAILABLE), any());
     }
 
     // ── declineFutureConfirmedBookingsForMasterRemoval (Phase 298 — master-removal sibling of the
@@ -1235,14 +1257,10 @@ class BookingServiceTest {
                 .thenReturn(List.of(
                         new SalonClosureBookingCandidate(earliestBookingId, appointmentId, targetMasterId, earliestStart),
                         new SalonClosureBookingCandidate(laterBookingId, appointmentId, targetMasterId, laterStart)));
-        Booking earliestBooking = buildBookingStartingAt(
-                earliestBookingId, client, master, msa, BookingStatus.CONFIRMED, earliestStart);
-        Booking laterBooking = buildBookingStartingAt(
-                laterBookingId, client, master, msa, BookingStatus.CONFIRMED, laterStart);
-        when(appointmentTransitionService.declineAppointmentItems(
-                eq(actorId), eq(appointmentId), eq(List.of(earliestBookingId, laterBookingId)),
-                any(), eq(false), any()))
-                .thenReturn(List.of(earliestBooking, laterBooking));
+        when(appointmentTransitionService.declineAppointmentItemsBulk(
+                eq(Map.of(appointmentId, List.of(earliestBookingId, laterBookingId))),
+                eq(CancellationReason.PROVIDER_UNAVAILABLE), any()))
+                .thenReturn(Set.of(earliestBookingId, laterBookingId));
 
         bookingService.declineFutureConfirmedBookingsForMasterRemoval(actorId, salonId, targetMasterId);
 
@@ -1758,9 +1776,8 @@ class BookingServiceTest {
 
     @Test
     @DisplayName("rescheduling an appointment CHILD locks the visit header via "
-            + "AppointmentTransitionService#lockAppointmentHeaderBeforeItemReschedule BEFORE the "
-            + "client/master advisory locks — canonical appointments-before-bookings lock order "
-            + "(phase 30.2, cycle-2 audit finding 1)")
+            + "AppointmentTransitionService#lockAppointmentHeaderBeforeItemReschedule AFTER the "
+            + "client/master advisory locks — global lock order client -> master -> header")
     void should_lockAppointmentHeaderBeforeItemReschedule_when_reschedulingAppointmentChild() {
         UUID appointmentId = UUID.randomUUID();
         Appointment appointment = Appointment.builder().id(appointmentId).build();
@@ -1770,7 +1787,7 @@ class BookingServiceTest {
         RescheduleBookingRequest req = new RescheduleBookingRequest(newStartsAt, false);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
         stubRescheduleSlotAvailable(newStartsAt);
-        when(bookingRepository.existsOverlapExcluding(eq(masterId), any(), any(), eq(bookingId))).thenReturn(false);
+        when(bookingRepository.findPostLockConfirmedAndOverlapExcluding(eq(masterId), any(), any(), eq(bookingId))).thenReturn(PostLockRescheduleChecks.free());
         when(bookingRepository.saveAndFlush(any())).thenAnswer(inv -> inv.getArgument(0));
         when(appointmentTransitionService.lockAppointmentHeaderBeforeItemReschedule(appointmentId))
                 .thenReturn(true);
@@ -1779,8 +1796,8 @@ class BookingServiceTest {
 
         assertThat(booking.getStartsAt()).isEqualTo(newStartsAt);
         InOrder inOrder = inOrder(appointmentTransitionService, bookingRepository);
-        inOrder.verify(appointmentTransitionService).lockAppointmentHeaderBeforeItemReschedule(appointmentId);
         inOrder.verify(bookingRepository).acquireAdvisoryLock(masterId);
+        inOrder.verify(appointmentTransitionService).lockAppointmentHeaderBeforeItemReschedule(appointmentId);
         inOrder.verify(bookingRepository).saveAndFlush(any());
         // No phase-2 collapse call exists for reschedule (phase 30.2 D2) — the item stays CONFIRMED.
         verify(appointmentTransitionService, never())
@@ -1797,7 +1814,7 @@ class BookingServiceTest {
         RescheduleBookingRequest req = new RescheduleBookingRequest(newStartsAt, false);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
         stubRescheduleSlotAvailable(newStartsAt);
-        when(bookingRepository.existsOverlapExcluding(eq(masterId), any(), any(), eq(bookingId))).thenReturn(false);
+        when(bookingRepository.findPostLockConfirmedAndOverlapExcluding(eq(masterId), any(), any(), eq(bookingId))).thenReturn(PostLockRescheduleChecks.free());
         when(bookingRepository.saveAndFlush(any())).thenAnswer(inv -> inv.getArgument(0));
 
         bookingService.rescheduleBooking(clientId, bookingId, req);
@@ -2033,7 +2050,7 @@ class BookingServiceTest {
         RescheduleBookingRequest req = new RescheduleBookingRequest(newStartsAt, false);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
         stubRescheduleSlotAvailable(newStartsAt);
-        when(bookingRepository.existsOverlapExcluding(eq(masterId), any(), any(), eq(bookingId))).thenReturn(false);
+        when(bookingRepository.findPostLockConfirmedAndOverlapExcluding(eq(masterId), any(), any(), eq(bookingId))).thenReturn(PostLockRescheduleChecks.free());
         when(bookingRepository.saveAndFlush(any())).thenAnswer(inv -> inv.getArgument(0));
 
         BookingDetailResponse result = bookingService.rescheduleBooking(clientId, bookingId, req);
@@ -2076,7 +2093,7 @@ class BookingServiceTest {
         RescheduleBookingRequest req = new RescheduleBookingRequest(newStartsAt, false);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
         stubRescheduleSlotAvailable(newStartsAt);
-        when(bookingRepository.existsOverlapExcluding(eq(masterId), any(), any(), eq(bookingId))).thenReturn(false);
+        when(bookingRepository.findPostLockConfirmedAndOverlapExcluding(eq(masterId), any(), any(), eq(bookingId))).thenReturn(PostLockRescheduleChecks.free());
         when(bookingRepository.saveAndFlush(any())).thenAnswer(inv -> inv.getArgument(0));
 
         BookingDetailResponse result = bookingService.rescheduleBooking(clientId, bookingId, req);
@@ -2215,6 +2232,28 @@ class BookingServiceTest {
     }
 
     @Test
+    @DisplayName("409 is thrown, with no mutation/save/outbox, when the booking was DECLINED by a cascade "
+            + "while the reschedule queued on the master lock (fused post-lock freshness re-check)")
+    void should_throw409AndNotMutate_when_rescheduleBookingDeclinedWhileQueuedOnMasterLock() {
+        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        OffsetDateTime originalStart = booking.getStartsAt();
+        OffsetDateTime newStartsAt = ZonedDateTime.now(clock).plusHours(4).toOffsetDateTime();
+        RescheduleBookingRequest req = new RescheduleBookingRequest(newStartsAt, false);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        stubRescheduleSlotAvailable(newStartsAt);
+        when(bookingRepository.findPostLockConfirmedAndOverlapExcluding(eq(masterId), any(), any(), eq(bookingId)))
+                .thenReturn(PostLockRescheduleChecks.stale());
+
+        assertThatThrownBy(() -> bookingService.rescheduleBooking(clientId, bookingId, req))
+                .isInstanceOf(BusinessException.class)
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus()).isEqualTo(HttpStatus.CONFLICT));
+
+        assertThat(booking.getStartsAt()).isEqualTo(originalStart);
+        verify(bookingRepository, never()).saveAndFlush(any());
+        verify(outboxService, never()).enqueueBookingRescheduled(any(), anyBoolean());
+    }
+
+    @Test
     @DisplayName("409 is thrown when the new time overlaps another booking, with the booking's own row excluded via existsOverlapExcluding")
     void should_throw409_when_rescheduleOverlapsAnotherBooking() {
         Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
@@ -2222,14 +2261,14 @@ class BookingServiceTest {
         RescheduleBookingRequest req = new RescheduleBookingRequest(newStartsAt, false);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
         stubRescheduleSlotAvailable(newStartsAt);
-        when(bookingRepository.existsOverlapExcluding(eq(masterId), any(), any(), eq(bookingId))).thenReturn(true);
+        when(bookingRepository.findPostLockConfirmedAndOverlapExcluding(eq(masterId), any(), any(), eq(bookingId))).thenReturn(PostLockRescheduleChecks.overlap());
 
         assertThatThrownBy(() -> bookingService.rescheduleBooking(clientId, bookingId, req))
                 .isInstanceOf(BusinessException.class)
                 .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
                         .isEqualTo(HttpStatus.CONFLICT));
         // Self-exclusion: overlap is checked excluding this booking's own id
-        verify(bookingRepository).existsOverlapExcluding(eq(masterId), any(), any(), eq(bookingId));
+        verify(bookingRepository).findPostLockConfirmedAndOverlapExcluding(eq(masterId), any(), any(), eq(bookingId));
         verify(bookingRepository, never()).saveAndFlush(any());
         verify(outboxService, never()).enqueueBookingRescheduled(any(), anyBoolean());
     }
@@ -2266,7 +2305,7 @@ class BookingServiceTest {
         verify(bookingRepository).findFirstConflictingClientBookingIdExcluding(
                 eq(clientId), any(), any(), eq(bookingId));
         verify(bookingRepository, never()).acquireAdvisoryLock(any());
-        verify(bookingRepository, never()).existsOverlapExcluding(any(), any(), any(), any());
+        verify(bookingRepository, never()).findPostLockConfirmedAndOverlapExcluding(any(), any(), any(), any());
         verify(bookingRepository, never()).saveAndFlush(any());
         verify(outboxService, never()).enqueueBookingRescheduled(any(), anyBoolean());
     }
@@ -2284,7 +2323,7 @@ class BookingServiceTest {
         RescheduleBookingRequest req = new RescheduleBookingRequest(newStartsAt, false);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
         stubRescheduleSlotAvailable(newStartsAt);
-        when(bookingRepository.existsOverlapExcluding(eq(masterId), any(), any(), eq(bookingId))).thenReturn(false);
+        when(bookingRepository.findPostLockConfirmedAndOverlapExcluding(eq(masterId), any(), any(), eq(bookingId))).thenReturn(PostLockRescheduleChecks.free());
         when(bookingRepository.saveAndFlush(any())).thenAnswer(inv -> inv.getArgument(0));
 
         bookingService.rescheduleBooking(clientId, bookingId, req);
@@ -2306,7 +2345,7 @@ class BookingServiceTest {
         OffsetDateTime newStartsAt = ZonedDateTime.now(clock).plusHours(4).toOffsetDateTime();
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
         stubRescheduleSlotAvailable(newStartsAt);
-        when(bookingRepository.existsOverlapExcluding(eq(masterId), any(), any(), eq(bookingId))).thenReturn(false);
+        when(bookingRepository.findPostLockConfirmedAndOverlapExcluding(eq(masterId), any(), any(), eq(bookingId))).thenReturn(PostLockRescheduleChecks.free());
         when(bookingRepository.saveAndFlush(any())).thenAnswer(inv -> inv.getArgument(0));
         bookingService.rescheduleBooking(clientId, bookingId, new RescheduleBookingRequest(newStartsAt, false));
         assertThat(booking.getStatus()).isEqualTo(BookingStatus.CONFIRMED);
@@ -2631,13 +2670,10 @@ class BookingServiceTest {
     }
 
     @Test
-    @DisplayName("Phase 320 — providerCanReviewClient on the salon board is the PERFORMING-MASTER "
-            + "term alone (AuthorizationService#isPerformingMasterOfBooking), evaluated in memory "
-            + "for a COMPLETED booking with a registered client. The batched salon-ownership "
-            + "lookup the Phase 319 N+1 fix introduced is gone with the salon arm it resolved: an "
-            + "owner or admin may still COMPLETE the booking, but only the master who performed it "
-            + "may rate its client, so hasProviderAuthorityOverBooking must never be consulted "
-            + "here — neither per row nor batched.")
+    @DisplayName("Phase 355 — providerCanReviewClient on the salon board comes from the page-scoped "
+            + "authority batch (AuthorizationService#filterBookingIdsWithProviderAuthority) for a "
+            + "COMPLETED booking with a registered client; hasProviderAuthorityOverBooking is "
+            + "never called per row.")
     void should_computeProviderCanReviewClient_when_bookingIsCompletedWithRegisteredClient() {
         UUID actorId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
@@ -2650,21 +2686,21 @@ class BookingServiceTest {
                 .thenReturn(List.of(completedBooking));
         when(reviewRepository.findReviewedBookingIds(List.of(bookingId))).thenReturn(List.of());
         when(clientReviewRepository.findReviewedBookingIds(List.of(bookingId))).thenReturn(List.of());
-        when(authz.isPerformingMasterOfBooking(actorId, completedBooking)).thenReturn(true);
+        when(authz.filterBookingIdsWithProviderAuthority(actorId, List.of(completedBooking)))
+                .thenReturn(java.util.Set.of(bookingId));
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
 
         var result = bookingService.getSalonBookings(actorId, salonId, null, null, null, null, null, pageable);
 
         assertThat(result.data()).hasSize(1);
         assertThat(result.data().get(0).providerCanReviewClient()).isTrue();
-        verify(authz).isPerformingMasterOfBooking(actorId, completedBooking);
+        verify(authz).filterBookingIdsWithProviderAuthority(actorId, List.of(completedBooking));
         verify(authz, never()).hasProviderAuthorityOverBooking(any(), any());
     }
 
     @Test
-    @DisplayName("Phase 320 — the salon board row of a booking the actor did NOT perform reads "
-            + "providerCanReviewClient FALSE even though the actor is the SALON_OWNER who may "
-            + "complete it: the locked decision hands the review to the performing master alone")
+    @DisplayName("Phase 355 — the salon board row reads providerCanReviewClient FALSE when the "
+            + "authority batch does not admit the actor (e.g. a SALON_MASTER, or another salon's owner)")
     void should_returnProviderCanReviewClientFalse_when_actorIsNotThePerformingMaster() {
         UUID actorId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
@@ -2676,7 +2712,8 @@ class BookingServiceTest {
         when(bookingRepository.findAllByIdsWithGraph(List.of(bookingId)))
                 .thenReturn(List.of(completedBooking));
         when(reviewRepository.findReviewedBookingIds(List.of(bookingId))).thenReturn(List.of());
-        when(authz.isPerformingMasterOfBooking(actorId, completedBooking)).thenReturn(false);
+        when(authz.filterBookingIdsWithProviderAuthority(actorId, List.of(completedBooking)))
+                .thenReturn(java.util.Set.of());
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
 
         var result = bookingService.getSalonBookings(actorId, salonId, null, null, null, null, null, pageable);
@@ -2718,11 +2755,10 @@ class BookingServiceTest {
         assertThat(result.data()).hasSize(1);
         assertThat(result.data().get(0).providerCanReviewClient()).isFalse();
         verify(authz, never()).hasProviderAuthorityOverBooking(any(), any());
-        // Phase 320 — the cost gate must short-circuit before the performing-master term is
-        // evaluated at all. Asserted against isPerformingMasterOfBooking, the collaborator the
-        // candidate filter actually guards: without this the assertion above would be vacuous,
-        // since hasProviderAuthorityOverBooking is no longer called on this path under ANY input.
-        verify(authz, never()).isPerformingMasterOfBooking(any(), any());
+        // Phase 355 — the cost gate must short-circuit before the authority batch is consulted.
+        // Asserted against filterBookingIdsWithProviderAuthority, the collaborator the candidate
+        // filter actually guards; hasProviderAuthorityOverBooking is never called on this path.
+        verify(authz, never()).filterBookingIdsWithProviderAuthority(any(UUID.class), any());
         verifyNoInteractions(clientReviewRepository);
     }
 
@@ -3355,7 +3391,9 @@ class BookingServiceTest {
                 new BigDecimal("4.75"), 12,
                 // Phase B2 salonId — this fixture is an INDEPENDENT_MASTER row, so null is the
                 // correct value; the salon case has its own fixture below.
-                null);
+                null,
+                // Two-sided ratings clientAvgRating/clientReviewCount
+                new BigDecimal("4.50"), 7);
     }
 
     @Test
@@ -3374,6 +3412,27 @@ class BookingServiceTest {
         assertThat(result.data()).hasSize(1);
         assertThat(result.data().get(0).masterProfessionalTitle()).isEqualTo("Перукар-стиліст");
         assertThat(result.data().get(0).locationNote()).isEqualTo("3-й поверх, код 1234");
+    }
+
+    @Test
+    @DisplayName("getMyBookings (CLIENT) maps clientAvgRating/clientReviewCount from the projection, and nulls the average at zero reviews")
+    void should_mapClientRating_when_clientProjectionRowCarriesIt() {
+        var reviewed = firstClientRowFor(clientProjectionRow(null, null));
+        var unreviewed = firstClientRowFor(clientProjectionRowWithCeiling(null));
+
+        assertThat(reviewed.clientAvgRating()).isEqualByComparingTo(new BigDecimal("4.50"));
+        assertThat(reviewed.clientReviewCount()).isEqualTo(7);
+        assertThat(unreviewed.clientAvgRating()).isNull();
+        assertThat(unreviewed.clientReviewCount()).isZero();
+    }
+
+    @Test
+    @DisplayName("getMyBookings (CLIENT) maps a null clientReviewCount to null/null (no unboxing NPE)")
+    void should_mapNullClientRatingAndCount_when_projectionClientReviewCountIsNull() {
+        var row = firstClientRowFor(clientProjectionRowWithCeilingAndClientCount(null, null));
+
+        assertThat(row.clientAvgRating()).isNull();
+        assertThat(row.clientReviewCount()).isNull();
     }
 
     @Test
@@ -3403,6 +3462,11 @@ class BookingServiceTest {
 
     private com.beautica.booking.repository.ClientBookingDetailProjection clientProjectionRowWithCeiling(
             java.math.BigDecimal priceMaxAtBooking) {
+        return clientProjectionRowWithCeilingAndClientCount(priceMaxAtBooking, 0);
+    }
+
+    private com.beautica.booking.repository.ClientBookingDetailProjection clientProjectionRowWithCeilingAndClientCount(
+            java.math.BigDecimal priceMaxAtBooking, Integer clientReviewCount) {
         return new com.beautica.booking.repository.ClientBookingDetailProjection(
                 bookingId, clientId, masterId, masterServiceId, "Manicure",
                 BookingStatus.CONFIRMED,
@@ -3424,7 +3488,9 @@ class BookingServiceTest {
                 // Phase B1 masterAvgRating/masterReviewCount — irrelevant here too.
                 new BigDecimal("4.20"), 3,
                 // Phase B2 salonId — irrelevant to price-ceiling assertions.
-                null);
+                null,
+                // Two-sided ratings clientAvgRating/clientReviewCount — unreviewed client
+                clientReviewCount == null ? null : new BigDecimal("0.00"), clientReviewCount);
     }
 
     private com.beautica.booking.dto.BookingDetailResponse firstClientRowFor(
@@ -3488,7 +3554,9 @@ class BookingServiceTest {
                 null,
                 masterAvgRating, masterReviewCount,
                 // Phase B2 salonId — irrelevant to the rating normalisation.
-                null);
+                null,
+                // Two-sided ratings clientAvgRating/clientReviewCount — unreviewed client
+                null, 0);
     }
 
     @Test
@@ -3537,7 +3605,9 @@ class BookingServiceTest {
                 null,
                 null,
                 new BigDecimal("4.20"), 3,
-                salonId);
+                salonId,
+                // Two-sided ratings clientAvgRating/clientReviewCount — unreviewed client
+                null, 0);
     }
 
     /**
@@ -3604,7 +3674,9 @@ class BookingServiceTest {
                 null,
                 new BigDecimal("4.20"), 3,
                 // Phase B2 salonId — irrelevant to the categoryKey normalisation.
-                null);
+                null,
+                // Two-sided ratings clientAvgRating/clientReviewCount — unreviewed client
+                null, 0);
     }
 
     @Test
@@ -3657,7 +3729,9 @@ class BookingServiceTest {
                 // Phase B1 masterAvgRating/masterReviewCount — irrelevant to ordering.
                 new BigDecimal("4.20"), 3,
                 // Phase B2 salonId — irrelevant to ordering.
-                null);
+                null,
+                // Two-sided ratings clientAvgRating/clientReviewCount — unreviewed client
+                null, 0);
     }
 
     // ── Phase 26.7.1 security finding (LOW): the CLIENT branch's order re-imposition had no
@@ -3800,6 +3874,145 @@ class BookingServiceTest {
         verify(bookingRepository).findIdsByMasterIdFiltered(masterId, Set.of(BookingStatus.CONFIRMED), null, null, null, normalizedUnpaged());
     }
 
+    // ── Phase 354 — ?asMaster=true (owner-as-master own-bookings scope) ───────────────────────────
+
+    @Test
+    @DisplayName("SALON_OWNER + asMaster=true runs the MASTER branch scoped to the owner's own master row, "
+            + "never the salon branch")
+    void should_useMasterBranchWithOwnRowId_when_salonOwnerListsAsMaster() {
+        UUID ownerId = UUID.randomUUID();
+        UUID ownerMasterId = UUID.randomUUID();
+        Pageable pageable = Pageable.unpaged();
+        when(masterRepository.findByUserId(ownerId))
+                .thenReturn(Optional.of(buildMaster(ownerMasterId, MasterType.SALON_OWNER)));
+        when(bookingRepository.findIdsByMasterIdFiltered(ownerMasterId, null, null, null, null, normalizedUnpaged()))
+                .thenReturn(Page.empty());
+
+        var result = bookingService.getMyBookings(
+                ownerId, buildAuth(Role.SALON_OWNER), null, null, null, null, null, true, pageable);
+
+        assertThat(result.totalElements()).isZero();
+        verify(bookingRepository).findIdsByMasterIdFiltered(ownerMasterId, null, null, null, null, normalizedUnpaged());
+        verify(bookingRepository, never()).findIdsBySalonIdsFiltered(any(), any(), any(), any(), any(), any());
+        verifyNoInteractions(salonRepository);
+    }
+
+    @Test
+    @DisplayName("SALON_OWNER + asMaster=true + partition routes to the master partition query with the "
+            + "owner's own row id")
+    void should_useMasterPartitionQuery_when_salonOwnerListsAsMasterWithPartition() {
+        UUID ownerId = UUID.randomUUID();
+        UUID ownerMasterId = UUID.randomUUID();
+        Pageable pageable = Pageable.unpaged();
+        when(masterRepository.findByUserId(ownerId))
+                .thenReturn(Optional.of(buildMaster(ownerMasterId, MasterType.SALON_OWNER)));
+        when(bookingRepository.findIdsByMasterIdFilteredByPartition(
+                        eq(ownerMasterId), eq(BookingPartition.UPCOMING), any(), any(), any(), any(), any()))
+                .thenReturn(Page.empty());
+
+        bookingService.getMyBookings(ownerId, buildAuth(Role.SALON_OWNER),
+                null, null, null, null, BookingPartition.UPCOMING, true, pageable);
+
+        verify(bookingRepository).findIdsByMasterIdFilteredByPartition(
+                eq(ownerMasterId), eq(BookingPartition.UPCOMING), any(), any(), any(), any(), any());
+        verifyNoInteractions(salonRepository);
+    }
+
+    @Test
+    @DisplayName("SALON_OWNER with asMaster=false keeps the salon branch unchanged and never reads the master row")
+    void should_useSalonBranch_when_salonOwnerListsWithAsMasterFalse() {
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        Pageable pageable = Pageable.unpaged();
+        when(salonRepository.findIdsByOwnerIdAndIsActiveTrue(ownerId)).thenReturn(List.of(salonId));
+        when(bookingRepository.findIdsBySalonIdsFiltered(List.of(salonId), null, null, null, null, normalizedUnpaged()))
+                .thenReturn(Page.empty());
+
+        bookingService.getMyBookings(ownerId, buildAuth(Role.SALON_OWNER), null, null, null, null, null, false, pageable);
+
+        verify(bookingRepository).findIdsBySalonIdsFiltered(List.of(salonId), null, null, null, null, normalizedUnpaged());
+        verifyNoInteractions(masterRepository);
+    }
+
+    @Test
+    @DisplayName("SALON_MASTER + asMaster=true is a no-op — same master-scoped query as without the flag")
+    void should_keepMasterBranch_when_salonMasterListsAsMaster() {
+        UUID actorId = UUID.randomUUID();
+        Pageable pageable = Pageable.unpaged();
+        when(masterRepository.findByUserId(actorId)).thenReturn(Optional.of(master));
+        when(bookingRepository.findIdsByMasterIdFiltered(masterId, null, null, null, null, normalizedUnpaged()))
+                .thenReturn(Page.empty());
+
+        bookingService.getMyBookings(actorId, buildAuth(Role.SALON_MASTER), null, null, null, null, null, true, pageable);
+
+        verify(bookingRepository).findIdsByMasterIdFiltered(masterId, null, null, null, null, normalizedUnpaged());
+        verifyNoInteractions(salonRepository);
+    }
+
+    @Test
+    @DisplayName("CLIENT + asMaster=true is a 400 and runs no query")
+    void should_throwBadRequest_when_clientListsAsMaster() {
+        Pageable pageable = Pageable.unpaged();
+
+        assertThatThrownBy(() -> bookingService.getMyBookings(
+                clientId, buildAuth(Role.CLIENT), null, null, null, null, null, true, pageable))
+                .isInstanceOf(BusinessException.class)
+                .hasMessage("asMaster is only valid for provider roles")
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus()).isEqualTo(HttpStatus.BAD_REQUEST));
+        verifyNoInteractions(bookingRepository, masterRepository, salonRepository);
+    }
+
+    @Test
+    @DisplayName("SALON_OWNER + asMaster=true with an INACTIVE own master row is a 403, no booking query")
+    void should_throwForbidden_when_salonOwnerListsAsMasterWithInactiveRow() {
+        UUID ownerId = UUID.randomUUID();
+        Master inactive = buildMaster(UUID.randomUUID(), MasterType.SALON_OWNER);
+        setField(inactive, "isActive", false);
+        when(masterRepository.findByUserId(ownerId)).thenReturn(Optional.of(inactive));
+
+        assertThatThrownBy(() -> bookingService.getMyBookings(
+                ownerId, buildAuth(Role.SALON_OWNER), null, null, null, null, null, true, Pageable.unpaged()))
+                .isInstanceOf(ForbiddenException.class)
+                .hasMessage("Access denied");
+        verifyNoInteractions(bookingRepository, salonRepository);
+    }
+
+    @Test
+    @DisplayName("SALON_OWNER + asMaster=true whose master row is not SALON_OWNER-typed is a 403")
+    void should_throwForbidden_when_salonOwnerListsAsMasterWithNonOwnerTypedRow() {
+        UUID ownerId = UUID.randomUUID();
+        when(masterRepository.findByUserId(ownerId))
+                .thenReturn(Optional.of(buildMaster(UUID.randomUUID(), MasterType.SALON_MASTER)));
+
+        assertThatThrownBy(() -> bookingService.getMyBookings(
+                ownerId, buildAuth(Role.SALON_OWNER), null, null, null, null, null, true, Pageable.unpaged()))
+                .isInstanceOf(ForbiddenException.class)
+                .hasMessage("Access denied");
+        verifyNoInteractions(bookingRepository);
+    }
+
+    @Test
+    @DisplayName("SALON_OWNER + asMaster=true with NO master row at all is a 404 and never falls back to the salon branch")
+    void should_throwNotFound_when_salonOwnerListsAsMasterWithoutMasterRow() {
+        UUID ownerId = UUID.randomUUID();
+        when(masterRepository.findByUserId(ownerId)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> bookingService.getMyBookings(
+                ownerId, buildAuth(Role.SALON_OWNER), null, null, null, null, null, true, Pageable.unpaged()))
+                .isInstanceOf(NotFoundException.class)
+                .hasMessage("Master profile not found");
+        verifyNoInteractions(bookingRepository, salonRepository);
+    }
+
+    @Test
+    @DisplayName("SALON_ADMIN + asMaster=true keeps the existing 403")
+    void should_throwForbidden_when_salonAdminListsAsMaster() {
+        assertThatThrownBy(() -> bookingService.getMyBookings(UUID.randomUUID(), buildAuth(Role.SALON_ADMIN),
+                null, null, null, null, null, true, Pageable.unpaged()))
+                .isInstanceOf(ForbiddenException.class);
+        verifyNoInteractions(bookingRepository);
+    }
+
     @Test
     @DisplayName("ForbiddenException is thrown when SALON_ADMIN calls getMyBookings")
     void should_throwForbidden_when_salonAdminListsBookings() {
@@ -3918,6 +4131,151 @@ class BookingServiceTest {
         assertThatThrownBy(() -> bookingService.getMyBookedDays(salonAdminId, buildAuth(Role.SALON_ADMIN), from, to))
                 .isInstanceOf(ForbiddenException.class);
         verifyNoInteractions(bookingRepository);
+    }
+
+    // ── Phase 354 — getMyBookedDays ?asMaster=true ───────────────────────────────────────────────
+
+    @Test
+    @DisplayName("SALON_OWNER + asMaster=true reads booked days through the MASTER query for the owner's own row")
+    void should_returnMasterScopedDates_when_salonOwnerRequestsBookedDaysAsMaster() {
+        LocalDate from = LocalDate.of(2026, 9, 1);
+        LocalDate to = LocalDate.of(2026, 9, 30);
+        OffsetDateTime fromTs = from.atStartOfDay(KYIV).toOffsetDateTime();
+        OffsetDateTime toExclusive = to.plusDays(1).atStartOfDay(KYIV).toOffsetDateTime();
+        UUID ownerId = UUID.randomUUID();
+        UUID ownerMasterId = UUID.randomUUID();
+        List<LocalDate> expected = List.of(LocalDate.of(2026, 9, 12));
+        when(masterRepository.findByUserId(ownerId))
+                .thenReturn(Optional.of(buildMaster(ownerMasterId, MasterType.SALON_OWNER)));
+        when(bookingRepository.findBookedDatesByMasterId(ownerMasterId, fromTs, toExclusive))
+                .thenReturn(expected.stream().map(java.sql.Date::valueOf).toList());
+
+        var result = bookingService.getMyBookedDays(ownerId, buildAuth(Role.SALON_OWNER), from, to, true);
+
+        assertThat(result).isEqualTo(expected);
+        verify(bookingRepository, never()).findBookedDatesBySalonIds(any(), any(), any());
+        verifyNoInteractions(salonRepository);
+    }
+
+    @Test
+    @DisplayName("SALON_OWNER booked days with asMaster=false keep the salon branch and never read the master row")
+    void should_returnSalonScopedDates_when_salonOwnerRequestsBookedDaysWithAsMasterFalse() {
+        LocalDate from = LocalDate.of(2026, 9, 1);
+        LocalDate to = LocalDate.of(2026, 9, 30);
+        OffsetDateTime fromTs = from.atStartOfDay(KYIV).toOffsetDateTime();
+        OffsetDateTime toExclusive = to.plusDays(1).atStartOfDay(KYIV).toOffsetDateTime();
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        when(salonRepository.findIdsByOwnerIdAndIsActiveTrue(ownerId)).thenReturn(List.of(salonId));
+        when(bookingRepository.findBookedDatesBySalonIds(List.of(salonId), fromTs, toExclusive)).thenReturn(List.of());
+
+        bookingService.getMyBookedDays(ownerId, buildAuth(Role.SALON_OWNER), from, to, false);
+
+        verify(bookingRepository).findBookedDatesBySalonIds(List.of(salonId), fromTs, toExclusive);
+        verifyNoInteractions(masterRepository);
+    }
+
+    @Test
+    @DisplayName("INDEPENDENT_MASTER booked days + asMaster=true is a no-op — same master query")
+    void should_returnMasterScopedDates_when_independentMasterRequestsBookedDaysAsMaster() {
+        LocalDate from = LocalDate.of(2026, 8, 1);
+        LocalDate to = LocalDate.of(2026, 8, 10);
+        OffsetDateTime fromTs = from.atStartOfDay(KYIV).toOffsetDateTime();
+        OffsetDateTime toExclusive = to.plusDays(1).atStartOfDay(KYIV).toOffsetDateTime();
+        UUID actorId = UUID.randomUUID();
+        when(masterRepository.findByUserId(actorId)).thenReturn(Optional.of(master));
+        when(bookingRepository.findBookedDatesByMasterId(masterId, fromTs, toExclusive)).thenReturn(List.of());
+
+        bookingService.getMyBookedDays(actorId, buildAuth(Role.INDEPENDENT_MASTER), from, to, true);
+
+        verify(bookingRepository).findBookedDatesByMasterId(masterId, fromTs, toExclusive);
+        verifyNoInteractions(salonRepository);
+    }
+
+    @Test
+    @DisplayName("CLIENT booked days + asMaster=true is a 400 and runs no query")
+    void should_throwBadRequest_when_clientRequestsBookedDaysAsMaster() {
+        LocalDate from = LocalDate.of(2026, 9, 1);
+        LocalDate to = LocalDate.of(2026, 9, 30);
+
+        assertThatThrownBy(() -> bookingService.getMyBookedDays(clientId, buildAuth(Role.CLIENT), from, to, true))
+                .isInstanceOf(BusinessException.class)
+                .hasMessage("asMaster is only valid for provider roles")
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus()).isEqualTo(HttpStatus.BAD_REQUEST));
+        verifyNoInteractions(bookingRepository);
+    }
+
+    @Test
+    @DisplayName("SALON_OWNER booked days + asMaster=true with an INACTIVE own master row is a 403")
+    void should_throwForbidden_when_salonOwnerRequestsBookedDaysAsMasterWithInactiveRow() {
+        UUID ownerId = UUID.randomUUID();
+        Master inactive = buildMaster(UUID.randomUUID(), MasterType.SALON_OWNER);
+        setField(inactive, "isActive", false);
+        when(masterRepository.findByUserId(ownerId)).thenReturn(Optional.of(inactive));
+
+        assertThatThrownBy(() -> bookingService.getMyBookedDays(
+                ownerId, buildAuth(Role.SALON_OWNER), LocalDate.of(2026, 9, 1), LocalDate.of(2026, 9, 30), true))
+                .isInstanceOf(ForbiddenException.class)
+                .hasMessage("Access denied");
+        verifyNoInteractions(bookingRepository);
+    }
+
+    @Test
+    @DisplayName("SALON_OWNER booked days + asMaster=true with NO master row is a 404 and never reads salon days")
+    void should_throwNotFound_when_salonOwnerRequestsBookedDaysAsMasterWithoutMasterRow() {
+        UUID ownerId = UUID.randomUUID();
+        when(masterRepository.findByUserId(ownerId)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> bookingService.getMyBookedDays(
+                ownerId, buildAuth(Role.SALON_OWNER), LocalDate.of(2026, 9, 1), LocalDate.of(2026, 9, 30), true))
+                .isInstanceOf(NotFoundException.class)
+                .hasMessage("Master profile not found");
+        verifyNoInteractions(bookingRepository, salonRepository);
+    }
+
+    @Test
+    @DisplayName("SALON_OWNER booked days + asMaster=true whose master row is not SALON_OWNER-typed is a 403, "
+            + "no booked-days query")
+    void should_throwForbidden_when_salonOwnerRequestsBookedDaysAsMasterWithNonOwnerTypedRow() {
+        UUID ownerId = UUID.randomUUID();
+        when(masterRepository.findByUserId(ownerId))
+                .thenReturn(Optional.of(buildMaster(UUID.randomUUID(), MasterType.SALON_MASTER)));
+
+        assertThatThrownBy(() -> bookingService.getMyBookedDays(
+                ownerId, buildAuth(Role.SALON_OWNER), LocalDate.of(2026, 9, 1), LocalDate.of(2026, 9, 30), true))
+                .isInstanceOf(ForbiddenException.class)
+                .hasMessage("Access denied");
+        verifyNoInteractions(bookingRepository, salonRepository);
+    }
+
+    @Test
+    @DisplayName("SALON_ADMIN booked days + asMaster=true keeps the existing 403 and never reads a master row")
+    void should_throwForbidden_when_salonAdminRequestsBookedDaysAsMaster() {
+        assertThatThrownBy(() -> bookingService.getMyBookedDays(UUID.randomUUID(), buildAuth(Role.SALON_ADMIN),
+                LocalDate.of(2026, 9, 1), LocalDate.of(2026, 9, 30), true))
+                .isInstanceOf(ForbiddenException.class);
+        verifyNoInteractions(bookingRepository, masterRepository);
+    }
+
+    @Test
+    @DisplayName("SALON_OWNER booked days with asMaster=null (param absent) keeps the salon branch — "
+            + "the 5-arg overload's null is the pre-354 contract")
+    void should_returnSalonScopedDates_when_salonOwnerRequestsBookedDaysWithAsMasterNull() {
+        LocalDate from = LocalDate.of(2026, 9, 1);
+        LocalDate to = LocalDate.of(2026, 9, 30);
+        OffsetDateTime fromTs = from.atStartOfDay(KYIV).toOffsetDateTime();
+        OffsetDateTime toExclusive = to.plusDays(1).atStartOfDay(KYIV).toOffsetDateTime();
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        List<LocalDate> expected = List.of(LocalDate.of(2026, 9, 3));
+        when(salonRepository.findIdsByOwnerIdAndIsActiveTrue(ownerId)).thenReturn(List.of(salonId));
+        when(bookingRepository.findBookedDatesBySalonIds(List.of(salonId), fromTs, toExclusive))
+                .thenReturn(expected.stream().map(java.sql.Date::valueOf).toList());
+
+        var result = bookingService.getMyBookedDays(ownerId, buildAuth(Role.SALON_OWNER), from, to, null);
+
+        assertThat(result).isEqualTo(expected);
+        verifyNoInteractions(masterRepository);
     }
 
     @Test
@@ -4528,10 +4886,10 @@ class BookingServiceTest {
         assertThat(getBookingWith(BookingStatus.COMPLETED, true).canReview()).isFalse();
     }
 
-    // ── getBooking — providerCanReviewClient truth table (track 27.x / Phase 27.5, narrowed 320) ──
+    // ── getBooking — providerCanReviewClient truth table (track 27.x / Phase 27.5, re-widened 355) ──
     //
     // providerCanReviewClient = !authz.isOwningClientViewer(actor, booking)
-    //     && authz.isPerformingMasterOfBooking(actor, booking)
+    //     && authz.canProviderReviewClient(actor, booking)
     //     && BookingClosureRule.isProviderReviewEligible(status)
     //     && booking.getClient() != null
     //     && !clientReviewRepository.existsByBookingId(booking.getId())
@@ -4548,23 +4906,18 @@ class BookingServiceTest {
     // AND, and (unlike the IT) able to pin the short-circuit ordering: a later collaborator must
     // never be consulted once an earlier condition has already failed.
     //
-    // PHASE 320 — the authority term is the PERFORMING MASTER, and nothing else. It used to be
-    // isPerformingMasterOfBooking UNIONED with hasProviderAuthorityOverBooking, which is why these
-    // cases stubbed the latter. The locked product decision — "salon owner or salon admin can
-    // complete the booking, and after it only salon master can leave the feedback" — deleted that
-    // disjunct, so a SALON_OWNER/SALON_ADMIN who is not the performer now reads false here. The
-    // stubs moved with the predicate; nothing else about this truth table changed. Owner and admin
-    // keep /complete, /not-complete, /decline and /reschedule — those run off the UNTOUCHED
-    // hasProviderAuthorityOverBooking, which must never reappear on this path.
+    // PHASE 355 — the authority term is authz.canProviderReviewClient: the completion kernel
+    // (independent master, or owner/admin of the master's salon) with SALON_MASTER excluded by role.
+    // The rule itself is unit-tested in AuthorizationServiceTest; here it is a mocked collaborator.
 
     @Test
-    @DisplayName("providerCanReviewClient is true when the actor IS the performing master of a COMPLETED, non-guest, unreviewed booking")
+    @DisplayName("providerCanReviewClient is true when the actor may rate the client of a COMPLETED, non-guest, unreviewed booking")
     void should_returnProviderCanReviewClientTrue_when_authorityCompletedNoReview() {
         Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.COMPLETED);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
         when(reviewRepository.findViewByBookingId(bookingId)).thenReturn(Optional.empty());
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
-        when(authz.isPerformingMasterOfBooking(clientId, booking)).thenReturn(true);
+        when(authz.canProviderReviewClient(clientId, booking)).thenReturn(true);
         when(clientReviewRepository.existsByBookingId(bookingId)).thenReturn(false);
 
         BookingDetailResponse result = bookingService.getBooking(clientId, bookingId);
@@ -4574,18 +4927,18 @@ class BookingServiceTest {
     }
 
     @Test
-    @DisplayName("providerCanReviewClient is false when the actor is NOT the performing master, even on a COMPLETED unreviewed booking — a SALON_OWNER/SALON_ADMIN who may COMPLETE it still reads false (Phase 320) — and the review-existence check is never reached")
+    @DisplayName("providerCanReviewClient is false when authz denies the actor (e.g. a SALON_MASTER, a CLIENT, another salon's owner/admin), even on a COMPLETED unreviewed booking — and the review-existence check is never reached")
     void should_returnProviderCanReviewClientFalse_when_actorLacksProviderAuthority() {
         Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.COMPLETED);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
         when(reviewRepository.findViewByBookingId(bookingId)).thenReturn(Optional.empty());
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
-        when(authz.isPerformingMasterOfBooking(clientId, booking)).thenReturn(false);
+        when(authz.canProviderReviewClient(clientId, booking)).thenReturn(false);
 
         BookingDetailResponse result = bookingService.getBooking(clientId, bookingId);
 
         assertThat(result.providerCanReviewClient())
-                .as("a CLIENT, a peer SALON_MASTER, a foreign viewer, and (Phase 320) the SALON_OWNER or SALON_ADMIN of the booking's own salon must all be denied the provider-review CTA — only the performing master gets it")
+                .as("whenever authz.canProviderReviewClient denies the viewer (SALON_MASTER, CLIENT, foreign owner/admin) the provider-review CTA must be false")
                 .isFalse();
         verify(clientReviewRepository, never()).existsByBookingId(any());
     }
@@ -4601,7 +4954,7 @@ class BookingServiceTest {
         // Not review-eligible short-circuits canReview before its own review-existence
         // query too — no reviewRepository stub needed here.
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
-        when(authz.isPerformingMasterOfBooking(clientId, booking)).thenReturn(true);
+        when(authz.canProviderReviewClient(clientId, booking)).thenReturn(true);
 
         BookingDetailResponse result = bookingService.getBooking(clientId, bookingId);
 
@@ -4622,7 +4975,7 @@ class BookingServiceTest {
                 ZonedDateTime.now(clock).minusHours(3).toOffsetDateTime());
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
-        when(authz.isPerformingMasterOfBooking(clientId, booking)).thenReturn(true);
+        when(authz.canProviderReviewClient(clientId, booking)).thenReturn(true);
 
         BookingDetailResponse result = bookingService.getBooking(clientId, bookingId);
 
@@ -4643,7 +4996,7 @@ class BookingServiceTest {
                 ZonedDateTime.now(clock).minusHours(3).toOffsetDateTime());
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
-        when(authz.isPerformingMasterOfBooking(clientId, booking)).thenReturn(true);
+        when(authz.canProviderReviewClient(clientId, booking)).thenReturn(true);
 
         BookingDetailResponse result = bookingService.getBooking(clientId, bookingId);
 
@@ -4665,7 +5018,7 @@ class BookingServiceTest {
         // No client short-circuits canReview even though the booking is COMPLETED — no
         // reviewRepository stub needed here.
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
-        when(authz.isPerformingMasterOfBooking(clientId, guestBooking)).thenReturn(true);
+        when(authz.canProviderReviewClient(clientId, guestBooking)).thenReturn(true);
 
         BookingDetailResponse result = bookingService.getBooking(clientId, bookingId);
 
@@ -4681,7 +5034,7 @@ class BookingServiceTest {
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
         when(reviewRepository.findViewByBookingId(bookingId)).thenReturn(Optional.empty());
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
-        when(authz.isPerformingMasterOfBooking(clientId, booking)).thenReturn(true);
+        when(authz.canProviderReviewClient(clientId, booking)).thenReturn(true);
         when(clientReviewRepository.existsByBookingId(bookingId)).thenReturn(true);
 
         BookingDetailResponse result = bookingService.getBooking(clientId, bookingId);
@@ -4695,16 +5048,15 @@ class BookingServiceTest {
     //
     // The pre-filter in BookingService#loadProviderReviewBatch narrows the page to
     // (client != null && BookingClosureRule.isProviderReviewEligible(status)) BEFORE evaluating
-    // AuthorizationService#isPerformingMasterOfBooking and issuing
+    // AuthorizationService#filterBookingIdsWithProviderAuthority and issuing
     // ClientReviewRepository#findReviewedBookingIds. Every existing providerCanReviewClient test
     // exercises the FINAL conjunction (which re-checks isProviderReviewEligible on its own), so a
     // pre-filter mutation is invisible there. These two tests instead assert on the pre-filter's
     // only observable effect: which bookings reach the authority term and the review-existence
     // query.
     //
-    // Phase 320 — the batched AuthorizationService#filterBookingIdsWithProviderAuthority these used
-    // to assert against is deleted along with the salon arm of the review predicate. The pre-filter
-    // is unchanged and still observable, now through the in-memory performing-master term.
+    // Phase 355 — the batched AuthorizationService#filterBookingIdsWithProviderAuthority is the
+    // authority term again; the pre-filter is observable through which rows are handed to it.
 
     @Test
     @DisplayName("loadProviderReviewBatch's pre-filter submits ONLY the COMPLETED booking to the "
@@ -4726,14 +5078,15 @@ class BookingServiceTest {
                 .thenReturn(List.of(completedBooking, elapsedConfirmedBooking));
         when(reviewRepository.findReviewedBookingIds(pageIds)).thenReturn(List.of());
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
-        when(authz.isPerformingMasterOfBooking(actorId, completedBooking)).thenReturn(true);
+        when(authz.filterBookingIdsWithProviderAuthority(Role.SALON_OWNER, actorId, List.of(completedBooking)))
+                .thenReturn(java.util.Set.of(completedBooking.getId()));
         when(clientReviewRepository.findReviewedBookingIds(List.of(completedBooking.getId())))
                 .thenReturn(List.of());
 
         bookingService.getMyBookings(actorId, buildAuth(Role.SALON_OWNER), null, null, null, null, pageable);
 
-        verify(authz).isPerformingMasterOfBooking(actorId, completedBooking);
-        verify(authz, never()).isPerformingMasterOfBooking(actorId, elapsedConfirmedBooking);
+        // Only the COMPLETED row reaches the authority batch; the elapsed CONFIRMED sibling never does.
+        verify(authz).filterBookingIdsWithProviderAuthority(Role.SALON_OWNER, actorId, List.of(completedBooking));
         verify(clientReviewRepository).findReviewedBookingIds(List.of(completedBooking.getId()));
     }
 
@@ -4760,7 +5113,32 @@ class BookingServiceTest {
 
         bookingService.getMyBookings(actorId, buildAuth(Role.SALON_OWNER), null, null, null, null, pageable);
 
-        verify(authz, never()).isPerformingMasterOfBooking(any(), any());
+        verify(authz, never()).filterBookingIdsWithProviderAuthority(any(), any(), any());
+        verify(clientReviewRepository, never()).findReviewedBookingIds(any());
+    }
+
+    @Test
+    @DisplayName("Phase 355 — when the authority batch admits nobody (the empty set a SALON_MASTER gets), "
+            + "every /bookings/me row reads providerCanReviewClient FALSE and client_reviews is never probed")
+    void should_readFlagFalseOnEveryRow_when_authorityBatchIsEmpty() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        Pageable pageable = Pageable.unpaged();
+        Booking completedBooking = buildBooking(UUID.randomUUID(), client, master, msa, BookingStatus.COMPLETED);
+        List<UUID> pageIds = List.of(completedBooking.getId());
+
+        when(salonRepository.findIdsByOwnerIdAndIsActiveTrue(actorId)).thenReturn(List.of(salonId));
+        when(bookingRepository.findIdsBySalonIdsFiltered(List.of(salonId), null, null, null, null, normalizedUnpaged()))
+                .thenReturn(new PageImpl<>(pageIds));
+        when(bookingRepository.findAllByIdsWithGraph(pageIds)).thenReturn(List.of(completedBooking));
+        when(reviewRepository.findReviewedBookingIds(pageIds)).thenReturn(List.of());
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
+        when(authz.filterBookingIdsWithProviderAuthority(Role.SALON_OWNER, actorId, List.of(completedBooking)))
+                .thenReturn(java.util.Set.of());
+
+        var page = bookingService.getMyBookings(actorId, buildAuth(Role.SALON_OWNER), null, null, null, null, pageable);
+
+        assertThat(page.data()).allSatisfy(b -> assertThat(b.providerCanReviewClient()).isFalse());
         verify(clientReviewRepository, never()).findReviewedBookingIds(any());
     }
 

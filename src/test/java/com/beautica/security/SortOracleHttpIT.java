@@ -2,6 +2,7 @@ package com.beautica.security;
 
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.config.TestSecurityConfig;
+import com.beautica.support.BookableMasterSeeder;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
@@ -77,6 +78,7 @@ class SortOracleHttpIT extends AbstractIntegrationTest {
     private PasswordEncoder passwordEncoder;
 
     private UUID salonId;
+    private UUID masterId;
     private String clientToken;
     private String masterToken;
     private String ownerToken;
@@ -93,11 +95,16 @@ class SortOracleHttpIT extends AbstractIntegrationTest {
 
         String masterEmail = "master-" + UUID.randomUUID() + "@test.com";
         UUID masterUserId = createUser(masterEmail, "SALON_MASTER", salonId);
+        masterId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO masters (id, user_id, salon_id, master_type, avg_rating, review_count, "
                         + "is_active, created_at, updated_at) "
                         + "VALUES (?, ?, ?, 'SALON_MASTER', 0.00, 0, true, NOW(), NOW())",
-                UUID.randomUUID(), masterUserId, salonId);
+                masterId, masterUserId, salonId);
+        // The public roster lists only bookable masters; without a service + hours the whitelisted
+        // positive controls would answer 200 from the empty-page short-circuit and never run the
+        // sorted roster query they are meant to prove works.
+        BookableMasterSeeder.makeBookable(jdbcTemplate, salonId, masterId);
 
         String clientEmail = "client-" + UUID.randomUUID() + "@test.com";
         createUser(clientEmail, "CLIENT", null);
@@ -136,12 +143,16 @@ class SortOracleHttpIT extends AbstractIntegrationTest {
     @DisplayName("GET /salons/{id}/masters (permitAll, NO token) — positive control: the SAME "
             + "unauthenticated request without a dotted sort returns 200, proving the 400 above "
             + "is attributable to the sort parameter and not to the missing token or fixture")
-    void should_return200_when_anonymousCallerSortsSalonMastersByWhitelistedProperty() {
+    void should_return200_when_anonymousCallerSortsSalonMastersByWhitelistedProperty() throws Exception {
         var response = restTemplate.exchange(
                 "/api/v1/salons/" + salonId + "/masters?sort=avgRating,desc",
                 HttpMethod.GET, HttpEntity.EMPTY, String.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(objectMapper.readTree(response.getBody()).path("data").path("data"))
+                .as("the sorted roster query actually ran and returned the bookable fixture master")
+                .extracting(row -> row.path("masterId").asText())
+                .containsExactly(masterId.toString());
     }
 
     @Test

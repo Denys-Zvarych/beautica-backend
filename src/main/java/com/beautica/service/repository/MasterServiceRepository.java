@@ -196,6 +196,31 @@ public interface MasterServiceRepository extends JpaRepository<MasterServiceAssi
             @Param("masterId") UUID masterId);
 
     /**
+     * Phase 345 catalogue gate (architect decision 2026-10-06): true iff the definition has an
+     * ACTIVE assignment on a {@code SALON_OWNER}-typed master row — i.e. the salon owner performs
+     * it. {@code AuthorizationService} then refuses a {@code SALON_ADMIN} write on the definition,
+     * whether it is owner-only or shared with other masters.
+     *
+     * <p>Served by {@code idx_master_services_service_def_active} (V104, partial
+     * {@code WHERE is_active = true}) — leading column {@code service_def_id}.
+     *
+     * <p>A real {@code EXISTS} (native — JPQL has no select-list EXISTS), so Postgres stops at the
+     * first matching row instead of counting every active assignment of a widely-shared definition.
+     * {@code master_type} is persisted as {@code EnumType.STRING}, hence the literal.
+     */
+    @Query(value = """
+            SELECT EXISTS (
+                SELECT 1
+                FROM master_services ms
+                JOIN masters m ON m.id = ms.master_id
+                WHERE ms.service_def_id = :serviceDefId
+                  AND ms.is_active = true
+                  AND m.master_type = 'SALON_OWNER'
+            )
+            """, nativeQuery = true)
+    boolean existsActiveOwnerRowAssignment(@Param("serviceDefId") UUID serviceDefId);
+
+    /**
      * Returns a master's active service assignments whose linked service definition is
      * <em>also</em> active.
      *
@@ -495,6 +520,41 @@ public interface MasterServiceRepository extends JpaRepository<MasterServiceAssi
               AND sd.isActive = true
             """)
     List<MasterServiceAssignment> findBookableAssignmentsBySalon(@Param("salonId") UUID salonId);
+
+    /**
+     * Master-scoped sibling of {@link #findBookableAssignmentsBySalon}: the strict-verdict
+     * candidates of each given master, for the public
+     * {@code GET /masters/{id}/services} tab ({@code BookingMasterService#getBookableAssignmentIds}), which feed them to the same
+     * {@code SlotCalculationService#filterBookableAssignmentsBatch} the salon catalogue uses.
+     *
+     * <p>Ownership follows the master's CURRENT context, the same rule as
+     * {@code MasterBookabilitySql}: a salon-attached master's definition must be SALON-owned by that
+     * salon (closing the rotated-master / cross-salon leaks exactly as the salon finder does), a
+     * salon-less master's must be INDEPENDENT_MASTER-owned by that master. {@code s.isActive} is
+     * required for a salon-attached master because {@code SalonService.deactivateSalon} does not
+     * cascade to {@code masters.is_active} — the {@code MasterBookability#isBookable} rule.
+     *
+     * <p>{@code LEFT JOIN FETCH m.salon} keeps salon-less independent masters. Bounded by the caller's
+     * id set (one master for a detail read); callers MUST short-circuit an empty {@code masterIds}.
+     */
+    @Query("""
+            SELECT msa FROM MasterServiceAssignment msa
+            JOIN FETCH msa.serviceDefinition sd
+            JOIN FETCH msa.master m
+            LEFT JOIN FETCH m.salon s
+            WHERE m.id IN :masterIds
+              AND m.isActive = true
+              AND msa.isActive = true
+              AND sd.isActive = true
+              AND ((s IS NOT NULL AND s.isActive = true
+                    AND sd.ownerType = com.beautica.service.entity.OwnerType.SALON
+                    AND sd.ownerId = s.id)
+                OR (s IS NULL
+                    AND sd.ownerType = com.beautica.service.entity.OwnerType.INDEPENDENT_MASTER
+                    AND sd.ownerId = m.id))
+            """)
+    List<MasterServiceAssignment> findBookableAssignmentsByMasterIds(
+            @Param("masterIds") Collection<UUID> masterIds);
 
     /**
      * Cross-salon sibling of {@link #findBookableAssignmentsBySalon}, keyed by a SET of SALON-owned

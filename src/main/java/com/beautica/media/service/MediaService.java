@@ -1,9 +1,13 @@
 package com.beautica.media.service;
 
 import com.beautica.auth.Role;
+import com.beautica.common.cache.MasterProfileCacheEvictor;
+import com.beautica.common.cache.UserProfileCacheEvictor;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
+import com.beautica.common.exception.ServiceUnavailableMessages;
+import com.beautica.common.security.AuthorizationService;
 import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.media.dto.AvatarResponse;
@@ -11,12 +15,25 @@ import com.beautica.media.dto.MediaFileResponse;
 import com.beautica.media.entity.EntityType;
 import com.beautica.media.entity.MediaFile;
 import com.beautica.media.entity.MediaType;
+import com.beautica.media.repository.MediaFileKey;
 import com.beautica.media.repository.MediaRepository;
+import com.beautica.media.repository.UploaderMediaKey;
+import com.beautica.salon.dto.SalonResponse;
 import com.beautica.salon.entity.Salon;
+import com.beautica.salon.entity.SalonImagePointer;
+import com.beautica.salon.entity.SalonImageSlot;
 import com.beautica.salon.repository.SalonRepository;
+import com.beautica.salon.service.SalonService;
+import com.beautica.service.dto.ServiceDefinitionResponse;
+import com.beautica.service.entity.OwnerType;
+import com.beautica.service.entity.ServiceDefinition;
+import com.beautica.service.repository.ServiceRepository;
+import com.beautica.service.service.ServiceCatalogService;
+import com.beautica.service.service.ServicePhotoBlobPurger;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.cache.Cache;
 import org.springframework.cache.CacheManager;
@@ -33,6 +50,7 @@ import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Sort;
 
+import java.io.BufferedInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.time.Clock;
@@ -53,29 +71,31 @@ import java.util.function.Supplier;
  * The resulting key matches the pattern {@code [A-Za-z0-9/_\-.]{1,256}}, so the
  * defense-in-depth key validator in {@code R2StorageService} is not required here.
  *
- * <p><b>Content-type spoofing defense.</b> {@link #detectMimeType(MultipartFile)} reads
+ * <p><b>Content-type spoofing defense.</b> {@link #openAndSniff(MultipartFile)} reads
  * the first 12 bytes of the file and matches against the magic-byte signatures for
  * JPEG, PNG, and WebP. SVG is intentionally rejected (it is XML and can carry
  * {@code <script>}). The detected MIME — never {@code file.getContentType()} — is
  * what gets passed to {@link R2StorageService#uploadFile} and stored as the extension.
  *
- * <p><b>Stream lifecycle.</b> {@code MultipartFile.getInputStream()} returns a fresh
- * stream on each call. The AWS SDK's {@code RequestBody.fromInputStream} does not
- * close the caller's stream, so every call site in this class uses try-with-resources.
+ * <p><b>Stream lifecycle.</b> The upload stream is opened ONCE per upload
+ * ({@code getInputStream()} is called a single time): it is wrapped in a {@code BufferedInputStream},
+ * sniffed with mark/reset and passed on, rewound, to R2. The AWS SDK's
+ * {@code RequestBody.fromInputStream} does not close the caller's stream, so the upload methods
+ * close it via try-with-resources on {@code SniffedUpload}.
  *
  * <p><b>Transaction scoping (Perf MEDIUM #1 + #2).</b> There is no class-level
  * {@link Transactional} annotation — R2 HTTP calls (which can block up to the 30 s
  * socket timeout) must never run while a HikariCP connection is held. Each public
  * method uses two {@link TransactionTemplate}s: {@code txRead} for short read-only
- * lookups and {@code txWrite} for the persistence step. R2 calls always happen
- * <b>between</b> the two transactions, never inside one.
+ * lookups and {@code txWrite} for the persistence step. R2 calls never run inside one:
+ * uploads happen before the write transaction, and every delete of a blob a live row
+ * pointed at runs strictly AFTER that row's transaction commits, on {@code blobPurgeExecutor}
+ * ({@link AfterCommitBlobPurger}) — a failed or rolled-back write never touches R2 (M1).
  *
- * <p><b>SEC-2 (BLOCKER carry-forward from Phase 7.1 audit).</b>
- * {@link #deleteByUploader(UUID)} purges every R2 blob owned by a user before the
- * caller deletes the {@code users} row — the {@code ON DELETE CASCADE} on
- * {@code media_files.uploader_id} would otherwise leave R2 objects orphaned because
- * the DB has no hook into R2. Any future user-deletion flow MUST call this BEFORE
- * deleting the row.
+ * <p><b>SEC-2 / §O8 — account deletion.</b> The {@code ON DELETE CASCADE} on
+ * {@code media_files.uploader_id} has no hook into R2, so every user-deletion flow captures the
+ * account's blob pointers BEFORE the delete and registers {@link #purgeUserBlobsAfterCommit}
+ * via {@code AccountBlobPurgeRegistrar} (client/staff self-delete, staff disposal).
  *
  * <p><b>Phase 7.7 — portfolio cache.</b> {@link #getPortfolio} is the public
  * unauthenticated read path; it is annotated with {@link Cacheable} on the
@@ -101,9 +121,22 @@ public class MediaService {
 
     /** Number of bytes inspected for the magic-byte check. WebP's signature needs the 9th–12th. */
     private static final int HEADER_BYTES = 12;
+    private static final int SNIFF_BUFFER_BYTES = 8192;
 
     /** Cache name for the public portfolio listing — must match {@code CacheConfig.cacheManager()}. */
     static final String PORTFOLIO_CACHE = "portfolio";
+
+    /** Log-only labels for {@link AfterCommitBlobPurger} (never a key). */
+    private static final String AVATAR_PURGE_CONTEXT = "avatar";
+    private static final String ACCOUNT_PURGE_CONTEXT = "account-delete";
+    private static final String PORTFOLIO_PURGE_CONTEXT = "portfolio-delete";
+    private static final String SALON_IMAGE_PURGE_CONTEXT = "salon-image";
+
+    /** Phase 343 D4 key root for salon logo/cover blobs: {@code salons/<salonId>/{logo,cover}/...}. */
+    private static final String SALON_IMAGE_KEY_ROOT = "salons/";
+    /** Portfolio key roots written by {@link #resolvePortfolioTarget} — the ONLY {@code media_files} writer. */
+    private static final String SALON_PORTFOLIO_KEY_ROOT = "portfolio/salons/";
+    private static final String MASTER_PORTFOLIO_KEY_ROOT = "portfolio/independent/";
 
     private final R2StorageService r2;
     private final MediaRepository mediaRepo;
@@ -114,6 +147,20 @@ public class MediaService {
     private final TransactionTemplate txRead;
     private final TransactionTemplate txWrite;
     private final CacheManager cacheManager;
+    private final ServiceRepository serviceRepo;
+    private final ServiceCatalogService serviceCatalogService;
+    /** Phase 345: service-layer ownership + owner-performed catalogue gate on the service-photo writes. */
+    private final AuthorizationService authz;
+    private final ServicePhotoBlobPurger servicePhotoBlobPurger;
+    private final AfterCommitBlobPurger afterCommitBlobPurger;
+    private final UserProfileCacheEvictor userProfileCacheEvictor;
+    private final MasterProfileCacheEvictor masterProfileCacheEvictor;
+    /**
+     * Phase 343 salon-side steps (read-gate, locked pointer write, cache evictions, response mapping). Resolved
+     * lazily: {@code SalonService} already depends on this class (salon teardown sweep), so a direct constructor
+     * dependency would be a bean cycle.
+     */
+    private final Supplier<SalonService> salonService;
 
     @Autowired
     public MediaService(R2StorageService r2,
@@ -123,7 +170,15 @@ public class MediaService {
                         MasterRepository masterRepo,
                         Clock clock,
                         PlatformTransactionManager transactionManager,
-                        CacheManager cacheManager) {
+                        CacheManager cacheManager,
+                        ServiceRepository serviceRepo,
+                        ServiceCatalogService serviceCatalogService,
+                        AuthorizationService authz,
+                        ServicePhotoBlobPurger servicePhotoBlobPurger,
+                        AfterCommitBlobPurger afterCommitBlobPurger,
+                        UserProfileCacheEvictor userProfileCacheEvictor,
+                        MasterProfileCacheEvictor masterProfileCacheEvictor,
+                        ObjectProvider<SalonService> salonServiceProvider) {
         this.r2 = r2;
         this.mediaRepo = mediaRepo;
         this.userRepo = userRepo;
@@ -136,6 +191,14 @@ public class MediaService {
         this.txWrite = new TransactionTemplate(transactionManager);
         this.txWrite.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
         this.cacheManager = cacheManager;
+        this.serviceRepo = serviceRepo;
+        this.serviceCatalogService = serviceCatalogService;
+        this.authz = authz;
+        this.servicePhotoBlobPurger = servicePhotoBlobPurger;
+        this.afterCommitBlobPurger = afterCommitBlobPurger;
+        this.userProfileCacheEvictor = userProfileCacheEvictor;
+        this.masterProfileCacheEvictor = masterProfileCacheEvictor;
+        this.salonService = salonServiceProvider::getObject;
     }
 
     /**
@@ -151,7 +214,37 @@ public class MediaService {
                  Clock clock,
                  TransactionTemplate txRead,
                  TransactionTemplate txWrite,
-                 CacheManager cacheManager) {
+                 CacheManager cacheManager,
+                 ServiceRepository serviceRepo,
+                 ServiceCatalogService serviceCatalogService,
+                 AuthorizationService authz,
+                 ServicePhotoBlobPurger servicePhotoBlobPurger,
+                 AfterCommitBlobPurger afterCommitBlobPurger,
+                 UserProfileCacheEvictor userProfileCacheEvictor,
+                 MasterProfileCacheEvictor masterProfileCacheEvictor) {
+        this(r2, mediaRepo, userRepo, salonRepo, masterRepo, clock, txRead, txWrite, cacheManager, serviceRepo,
+                serviceCatalogService, authz, servicePhotoBlobPurger, afterCommitBlobPurger, userProfileCacheEvictor,
+                masterProfileCacheEvictor, null);
+    }
+
+    /** Test-only constructor with the Phase 343 {@link SalonService} collaborator ({@code null} = not wired). */
+    MediaService(R2StorageService r2,
+                 MediaRepository mediaRepo,
+                 UserRepository userRepo,
+                 SalonRepository salonRepo,
+                 MasterRepository masterRepo,
+                 Clock clock,
+                 TransactionTemplate txRead,
+                 TransactionTemplate txWrite,
+                 CacheManager cacheManager,
+                 ServiceRepository serviceRepo,
+                 ServiceCatalogService serviceCatalogService,
+                 AuthorizationService authz,
+                 ServicePhotoBlobPurger servicePhotoBlobPurger,
+                 AfterCommitBlobPurger afterCommitBlobPurger,
+                 UserProfileCacheEvictor userProfileCacheEvictor,
+                 MasterProfileCacheEvictor masterProfileCacheEvictor,
+                 SalonService salonService) {
         this.r2 = r2;
         this.mediaRepo = mediaRepo;
         this.userRepo = userRepo;
@@ -161,77 +254,438 @@ public class MediaService {
         this.txRead = txRead;
         this.txWrite = txWrite;
         this.cacheManager = cacheManager;
+        this.serviceRepo = serviceRepo;
+        this.serviceCatalogService = serviceCatalogService;
+        this.authz = authz;
+        this.servicePhotoBlobPurger = servicePhotoBlobPurger;
+        this.afterCommitBlobPurger = afterCommitBlobPurger;
+        this.userProfileCacheEvictor = userProfileCacheEvictor;
+        this.masterProfileCacheEvictor = masterProfileCacheEvictor;
+        this.salonService = () -> {
+            if (salonService == null) {
+                throw new IllegalStateException("SalonService not wired in this test fixture");
+            }
+            return salonService;
+        };
+    }
+
+    /**
+     * Uploads must fail loudly when storage is off — otherwise an empty URL and a key for a
+     * non-existent blob would be persisted. Deletes stay no-ops (account/salon sweeps).
+     */
+    private void requireStorageEnabled() {
+        if (!r2.isEnabled()) {
+            throw new BusinessException(HttpStatus.SERVICE_UNAVAILABLE, ServiceUnavailableMessages.MEDIA_STORAGE_NOT_CONFIGURED);
+        }
     }
 
     // ------------------------------------------------------------------ avatar
 
     public AvatarResponse uploadAvatar(UUID userId, MultipartFile file) {
-        String detectedMime = detectMimeType(file);
+        requireStorageEnabled();
+        try (SniffedUpload upload = openAndSniff(file)) {
+            return uploadAvatarSniffed(userId, file, upload);
+        }
+    }
 
-        // Step 1 — short read tx: capture the existing avatar key (if any). The
-        // connection is released before any R2 call is made.
-        String oldKey = txRead(() -> userRepo.findById(userId)
-                .orElseThrow(() -> new NotFoundException("User not found: " + userId))
-                .getAvatarR2Key());
+    private AvatarResponse uploadAvatarSniffed(UUID userId, MultipartFile file, SniffedUpload upload) {
+        String detectedMime = upload.mime();
 
-        // Step 2 — R2 work runs OUTSIDE any transaction (Perf MEDIUM #1). SEC-2: delete
-        // the old blob BEFORE uploading the new one so a failure here cannot leave two
-        // blobs in R2.
-        if (oldKey != null) {
-            r2.deleteFile(oldKey);
+        // Step 1 — read-gate (404 for an unknown user); no lock held, connection released before R2.
+        // existsById: a COUNT-style probe, no User entity hydrated just to be discarded.
+        if (!txRead(() -> userRepo.existsById(userId))) {
+            throw new NotFoundException("User not found: " + userId);
         }
 
-        String newKey = buildKey("avatars/" + userId + "/", detectedMime);
-        try (InputStream in = file.getInputStream()) {
-            r2.uploadFile(newKey, in, file.getSize(), detectedMime);
-        } catch (IOException ex) {
-            log.error("Failed to read avatar upload stream for user={}: {}", userId, ex.getClass().getSimpleName());
-            throw new BusinessException(HttpStatus.BAD_REQUEST, "Failed to read uploaded file");
-        }
+        // Step 2 — upload the NEW blob first, under a fresh unique key, outside any transaction. The old
+        // blob is untouched, so a failed upload leaves the old avatar fully intact (same flow as the
+        // service photo — see uploadServicePhoto).
+        String newKey = buildKey(avatarPrefix(userId), detectedMime);
+        r2.uploadFile(newKey, upload.stream(), file.getSize(), detectedMime);
         String newUrl = r2.buildPublicUrl(newKey);
 
-        // Step 3 — short write tx: persist the new key/url. Re-load the user inside the
-        // tx so we never carry a detached entity across a network round-trip.
-        txWrite.execute(status -> {
-            User u = userRepo.findById(userId)
-                    .orElseThrow(() -> new NotFoundException("User not found: " + userId));
-            u.setAvatarR2Key(newKey);
-            u.setAvatarUrl(newUrl);
-            userRepo.save(u);
-            return null;
-        });
+        // Step 3 — short write tx: row-lock the user, read the CURRENT pointers (whatever a concurrent
+        // replace committed), write the new ones, and register the after-commit delete of exactly the
+        // superseded blob. If the write fails, delete the NEW blob — but only if it is not referenced.
+        try {
+            txWrite.execute(status -> replaceAvatarLocked(userId, newKey, newUrl));
+        } catch (RuntimeException ex) {
+            discardAvatarBlobUnlessCommitted(userId, newKey);
+            throw ex;
+        }
 
         return new AvatarResponse(newUrl);
     }
 
+    /** Locked write step of the avatar replace: runs inside {@code txWrite}. */
+    private Void replaceAvatarLocked(UUID userId, String newKey, String newUrl) {
+        User u = userRepo.findByIdForUpdate(userId)
+                .orElseThrow(() -> new NotFoundException("User not found: " + userId));
+        String supersededKey = resolveAvatarKey(userId, u.getAvatarR2Key(), u.getAvatarUrl());
+        u.setAvatarR2Key(newKey);
+        u.setAvatarUrl(newUrl);
+        // No save(): u is MANAGED (loaded by findByIdForUpdate in this tx) — dirty checking flushes it on commit.
+        // afterCommit hooks (we are inside txWrite): a rolled-back write fires neither. Cache evictions are
+        // registered BEFORE the blob purge so a throwing purge callback can never skip them.
+        evictAvatarRenderingCachesAfterCommit(userId, u.getRole());
+        purgeAvatarKeyAfterCommit(userId, supersededKey);
+        return null;
+    }
+
+    /**
+     * Failure cleanup for the avatar replace — same "discard unless committed" rule as
+     * {@link #discardBlobUnlessCommitted}: a failure from the COMMIT acknowledgement may have committed, so the
+     * row is re-read and the new blob deleted ONLY when positively known not to be referenced.
+     */
+    private void discardAvatarBlobUnlessCommitted(UUID userId, String newKey) {
+        discardBlobUnlessReferenced(newKey, "avatar",
+                () -> userRepo.findById(userId).map(User::getAvatarR2Key).orElse(null));
+    }
+
+    /**
+     * Removes the avatar. DB pointers are cleared FIRST under the row lock (both, whenever either is set —
+     * a legacy row carries only {@code avatar_url}); the blob is deleted after commit, so an R2 failure never
+     * leaves a live pointer to a deleted object. A legacy row's key is recovered from its URL.
+     */
     public void deleteAvatar(UUID userId) {
-        // Step 1 — read tx: capture the current key. Releases the connection before R2.
-        String key = txRead(() -> userRepo.findById(userId)
-                .orElseThrow(() -> new NotFoundException("User not found: " + userId))
-                .getAvatarR2Key());
-
-        if (key == null) {
-            return;
-        }
-
-        // Step 2 — R2 delete OUTSIDE any transaction. SEC-2 ordering: R2 first, DB second.
-        r2.deleteFile(key);
-
-        // Step 3 — write tx: clear the fields on a fresh load.
         txWrite.execute(status -> {
-            User u = userRepo.findById(userId)
+            User u = userRepo.findByIdForUpdate(userId)
                     .orElseThrow(() -> new NotFoundException("User not found: " + userId));
+            if (u.getAvatarR2Key() == null && u.getAvatarUrl() == null) {
+                return null;
+            }
+            String key = resolveAvatarKey(userId, u.getAvatarR2Key(), u.getAvatarUrl());
             u.setAvatarR2Key(null);
             u.setAvatarUrl(null);
-            userRepo.save(u);
+            // No save(): u is MANAGED (findByIdForUpdate in this tx) — dirty checking flushes it on commit.
+            // Evictions registered BEFORE the blob purge so a throwing purge callback can never skip them.
+            evictAvatarRenderingCachesAfterCommit(userId, u.getRole());
+            purgeAvatarKeyAfterCommit(userId, key);
             return null;
         });
+    }
+
+    /**
+     * Registers the after-commit eviction of every cache that renders {@code users.avatar_url} (Phase 344):
+     * {@code user-profile} for every role, plus — only when the user owns a {@code masters} row — the
+     * master-profile caches ({@code master-detail-by-user}, {@code master-by-user}, {@code master-detail},
+     * {@code booking-slug-info}; discovery only for an {@code INDEPENDENT_MASTER}). Must run inside
+     * {@code txWrite}: the master keys are resolved there and the evictions fire only if that transaction
+     * commits (§F-2). A role that can never own a {@code masters} row ({@link Role#canOwnMasterRow}) skips the
+     * key lookup — the same short-circuit {@code UserService} applies.
+     */
+    private void evictAvatarRenderingCachesAfterCommit(UUID userId, Role role) {
+        userProfileCacheEvictor.evictAfterCommit(userId);
+        // users.role is NOT NULL; a null here (unreachable) falls through to the lookup — a spare
+        // evict is harmless, a skipped one serves a stale avatar.
+        if (role != null && !role.canOwnMasterRow()) {
+            return;
+        }
+        masterRepo.findCacheKeysByUserId(userId).ifPresent(keys ->
+                masterProfileCacheEvictor.evictAfterCommit(userId, keys.masterId(), keys.bookingSlug(), role));
+    }
+
+    private static String avatarPrefix(UUID userId) {
+        return "avatars/" + userId + "/";
+    }
+
+    /**
+     * The single place that decides which R2 object an avatar owns. Prefers the stored key; for a legacy row
+     * (URL set, key null) recovers it from the public URL via {@link R2StorageService#extractKeyFromPublicUrl}
+     * (host/prefix verified, no traversal). Either way the key is accepted ONLY under {@code avatars/<userId>/}
+     * — a foreign or corrupted pointer must never become an arbitrary-object delete. Returns {@code null}
+     * when there is nothing safe to delete.
+     */
+    public String resolveAvatarKey(UUID userId, String avatarR2Key, String avatarUrl) {
+        String prefix = avatarPrefix(userId);
+        String candidate = avatarR2Key != null
+                ? avatarR2Key
+                : r2.extractKeyFromPublicUrl(avatarUrl).orElse(null);
+        return candidate != null && candidate.startsWith(prefix) && !candidate.contains("..")
+                ? candidate
+                : null;
+    }
+
+    /**
+     * After-commit best-effort delete of a superseded/cleared avatar blob. The R2 round-trip runs on the
+     * bounded {@code blobPurgeExecutor} (P-M2), never on the committing thread; a rollback purges nothing.
+     */
+    private void purgeAvatarKeyAfterCommit(UUID userId, String key) {
+        if (key == null || !key.startsWith(avatarPrefix(userId))) {
+            return;
+        }
+        afterCommitBlobPurger.purgeAfterCommit(List.of(key), AVATAR_PURGE_CONTEXT);
+    }
+
+    // ----------------------------------------------------------- service photo
+
+    /**
+     * Sets or replaces the single photo of a service definition (Phase 342). Authorization is a
+     * role gate on the controller plus {@code enforceCanManageServiceDefinition} below; an
+     * inactive definition (or one whose salon is inactive) answers 404 like every other service endpoint.
+     *
+     * <p><b>Deliberately NOT the avatar flow's "SEC-2 ordering"</b> (delete old blob, upload new, write
+     * row). That order loses the old photo when the upload fails, and two concurrent uploads both read the
+     * same old key so one orphans a blob. This flow is instead:
+     * <ol>
+     *   <li>read-gate (404 when inactive), no lock held;</li>
+     *   <li>upload the NEW blob under a fresh unique key, outside any transaction;</li>
+     *   <li>{@code txWrite}: row-lock the definition ({@code FOR UPDATE}), re-check it is still active
+     *       (race with deactivate), read the CURRENT key (whatever a concurrent upload committed), write
+     *       the new key/url;</li>
+     *   <li>after commit, delete exactly that superseded key via {@link ServicePhotoBlobPurger}
+     *       (best-effort — a failure is an accepted orphan, never a lost photo);</li>
+     *   <li>if the write fails or the definition went inactive, delete the NEW blob best-effort and
+     *       rethrow, so the old photo and its pointer stay intact — but ONLY after re-reading the row and
+     *       confirming it does not reference the new key (see {@link #discardBlobUnlessCommitted}): a
+     *       failure surfacing from the COMMIT acknowledgement may have actually committed.</li>
+     * </ol>
+     * Because unique keys are never reused and every committed writer deletes the key it replaced under
+     * the row lock, N concurrent uploads leave exactly one live blob.
+     */
+    public ServiceDefinitionResponse uploadServicePhoto(UUID actorId, UUID serviceDefId, MultipartFile file) {
+        // Phase 345: ownership + SALON_ADMIN owner-performed gate at the service layer — the controller is
+        // role-only (anti-bug §D), so a non-HTTP caller cannot bypass it. Runs before the storage probe so a
+        // forbidden caller never learns whether storage is enabled.
+        authz.enforceCanManageServiceDefinition(actorId, serviceDefId);
+        requireStorageEnabled();
+        try (SniffedUpload upload = openAndSniff(file)) {
+            return uploadServicePhotoSniffed(serviceDefId, file, upload);
+        }
+    }
+
+    private ServiceDefinitionResponse uploadServicePhotoSniffed(
+            UUID serviceDefId, MultipartFile file, SniffedUpload upload) {
+        requireActiveServiceDefinition(serviceDefId);
+
+        String newKey = buildKey("services/" + serviceDefId + "/", upload.mime());
+        r2.uploadFile(newKey, upload.stream(), file.getSize(), upload.mime());
+        String newUrl = r2.buildPublicUrl(newKey);
+
+        PhotoResult result;
+        try {
+            result = txWrite.execute(status -> replacePhotoLocked(serviceDefId, newKey, newUrl));
+        } catch (RuntimeException ex) {
+            discardBlobUnlessCommitted(serviceDefId, newKey);
+            throw ex;
+        }
+
+        // Post-commit by construction (txWrite.execute returned) — same cache set the former PATCH evicted.
+        serviceCatalogService.evictServicePhotoCaches(serviceDefId, result.ownerType(), result.ownerId());
+        return result.body();
+    }
+
+    /** Locked write step of the replace: runs inside {@code txWrite}. */
+    private PhotoResult replacePhotoLocked(UUID serviceDefId, String newKey, String newUrl) {
+        ServiceDefinition definition = lockActiveDefinition(serviceDefId);
+        String supersededKey = definition.getPhotoR2Key();
+        definition.setPhotoR2Key(newKey);
+        definition.setPhotoUrl(newUrl);
+        ServiceDefinition saved = serviceRepo.save(definition);
+        // Registered as an afterCommit hook (we are inside txWrite); a rolled-back write never fires it.
+        servicePhotoBlobPurger.purgeAfterCommit(serviceDefId, supersededKey);
+        return toPhotoResult(saved);
+    }
+
+    /**
+     * Removes a service definition's photo. Idempotent: a definition with no photo is a no-op (204, no R2
+     * call). DB pointers are cleared FIRST under the row lock; the blob (by stored KEY) is deleted after
+     * commit via {@link ServicePhotoBlobPurger}, so an R2 failure still leaves the DB cleared (accepted
+     * orphan) and never a live pointer to a deleted blob. A legacy row (URL, no key) has its URL cleared
+     * and nothing deleted in R2.
+     */
+    public void deleteServicePhoto(UUID actorId, UUID serviceDefId) {
+        // Phase 345: same service-layer gate as uploadServicePhoto (controller is role-only).
+        authz.enforceCanManageServiceDefinition(actorId, serviceDefId);
+        requireActiveServiceDefinition(serviceDefId);
+
+        PhotoCleared cleared = txWrite.execute(status -> {
+            ServiceDefinition definition = lockActiveDefinition(serviceDefId);
+            if (definition.getPhotoR2Key() == null && definition.getPhotoUrl() == null) {
+                return null;
+            }
+            String key = definition.getPhotoR2Key();
+            definition.setPhotoR2Key(null);
+            definition.setPhotoUrl(null);
+            serviceRepo.save(definition);
+            servicePhotoBlobPurger.purgeAfterCommit(serviceDefId, key);
+            return new PhotoCleared(definition.getOwnerType(), definition.getOwnerId());
+        });
+
+        if (cleared != null) {
+            serviceCatalogService.evictServicePhotoCaches(serviceDefId, cleared.ownerType(), cleared.ownerId());
+        }
+    }
+
+    /** Read-gate: 404 unless the definition AND (for a salon-owned one) its salon are active. */
+    private void requireActiveServiceDefinition(UUID serviceDefId) {
+        txRead(() -> serviceRepo.findIdIfDefinitionAndOwnerActive(serviceDefId)
+                .orElseThrow(() -> new NotFoundException("Service definition not found: " + serviceDefId)));
+    }
+
+    /**
+     * Row-locks the definition and re-checks it is still active — the in-lock half of the 404 rule (a
+     * deactivate that committed between the read-gate and here). An owning salon's deactivation
+     * deactivates all its definitions in the same transaction, so the definition's own flag covers it.
+     */
+    private ServiceDefinition lockActiveDefinition(UUID serviceDefId) {
+        return serviceRepo.findByIdForUpdate(serviceDefId)
+                .filter(ServiceDefinition::isActive)
+                .orElseThrow(() -> new NotFoundException("Service definition not found: " + serviceDefId));
+    }
+
+    /**
+     * Failure cleanup for the replace. A {@link RuntimeException} out of {@code txWrite.execute} does not
+     * prove the write rolled back: a failure on the COMMIT acknowledgement (connection drop, timeout) can
+     * leave the new key committed, and deleting that blob would leave the row pointing at a deleted object.
+     * So rather than classify exceptions as pre- or post-commit, re-read the row's current key in a fresh
+     * read transaction and delete the new blob ONLY when the row is positively known NOT to reference it.
+     * If the re-read itself fails the outcome is unknown, so the blob is kept: an orphaned blob is an
+     * accepted, harmless leak, a dangling pointer is user-visible data loss.
+     */
+    private void discardBlobUnlessCommitted(UUID serviceDefId, String newKey) {
+        discardBlobUnlessReferenced(newKey, "service photo",
+                () -> serviceRepo.findById(serviceDefId).map(ServiceDefinition::getPhotoR2Key).orElse(null));
+    }
+
+    /**
+     * The shared "discard unless committed" body of every upload-first replace (avatar, service photo, salon
+     * logo/cover): re-reads the row's CURRENT key in a fresh read transaction and deletes {@code newKey} ONLY
+     * when the row is positively known not to reference it. An unreadable outcome keeps the blob (accepted
+     * orphan) — a dangling pointer would be user-visible data loss.
+     *
+     * @param label        non-PII log label ("avatar", "service photo", ...)
+     * @param currentKeyOf reads the row's current key ({@code null} when the row or key is absent)
+     */
+    private void discardBlobUnlessReferenced(String newKey, String label, Supplier<String> currentKeyOf) {
+        boolean referenced;
+        try {
+            referenced = newKey.equals(txRead(currentKeyOf));
+        } catch (RuntimeException readEx) {
+            log.warn("Could not verify {} commit state; keeping new blob (key=[key omitted]): {}",
+                    label, readEx.getClass().getSimpleName());
+            return;
+        }
+        if (!referenced) {
+            discardUnreferencedBlob(newKey);
+        }
+    }
+
+    /** Best-effort delete of a freshly uploaded blob that no committed row references. */
+    private void discardUnreferencedBlob(String key) {
+        try {
+            r2.deleteFile(key);
+        } catch (RuntimeException cleanupEx) {
+            // Key embeds the definition UUID — omit it from the log.
+            log.warn("Failed to discard unreferenced blob (key=[key omitted]): {}",
+                    cleanupEx.getClass().getSimpleName());
+        }
+    }
+
+    private record PhotoCleared(OwnerType ownerType, UUID ownerId) {}
+
+    private record PhotoResult(ServiceDefinitionResponse body,
+                               OwnerType ownerType, UUID ownerId) {}
+
+    private static PhotoResult toPhotoResult(ServiceDefinition saved) {
+        return new PhotoResult(ServiceDefinitionResponse.from(saved), saved.getOwnerType(), saved.getOwnerId());
+    }
+
+    // ------------------------------------------------------- salon logo / cover
+
+    /**
+     * Sets or replaces a salon's logo or cover (Phase 343). OWNER only: the controller's
+     * {@code @PreAuthorize} admits only the salon's {@code SALON_OWNER}, and the salon-side steps re-prove
+     * ownership both before the R2 upload ({@link SalonService#requireOwnedActiveSalon}) and under the row
+     * lock ({@link SalonService#replaceSalonImageLocked}). Same flow as {@link #uploadServicePhoto}: storage
+     * gate (503), single-open sniff, read-gate (403/404), upload the NEW blob under a fresh unique key outside
+     * any transaction, then a short locked write that captures the superseded pointer; after commit, the
+     * superseded blob is purged (only under {@code salons/<salonId>/<slot>/}); a failed write discards the new
+     * blob unless the row is found to reference it ({@link #discardBlobUnlessReferenced}).
+     */
+    public SalonResponse uploadSalonImage(UUID actorId, UUID salonId, SalonImageSlot slot, MultipartFile file) {
+        requireStorageEnabled();
+        try (SniffedUpload upload = openAndSniff(file)) {
+            return uploadSalonImageSniffed(actorId, salonId, slot, file, upload);
+        }
+    }
+
+    private SalonResponse uploadSalonImageSniffed(
+            UUID actorId, UUID salonId, SalonImageSlot slot, MultipartFile file, SniffedUpload upload) {
+        salonService.get().requireOwnedActiveSalon(actorId, salonId);
+
+        String newKey = buildKey(slot.keyPrefix(salonId), upload.mime());
+        r2.uploadFile(newKey, upload.stream(), file.getSize(), upload.mime());
+        String newUrl = r2.buildPublicUrl(newKey);
+
+        try {
+            return txWrite.execute(status -> replaceSalonImageLocked(actorId, salonId, slot, newKey, newUrl));
+        } catch (RuntimeException ex) {
+            discardBlobUnlessReferenced(newKey, "salon image", () -> salonRepo.findById(salonId)
+                    .map(salon -> salon.imagePointer(slot).key())
+                    .orElse(null));
+            throw ex;
+        }
+    }
+
+    /** Locked write step of the salon-image replace: runs inside {@code txWrite}. */
+    private SalonResponse replaceSalonImageLocked(
+            UUID actorId, UUID salonId, SalonImageSlot slot, String newKey, String newUrl) {
+        SalonService.SalonImageWrite write =
+                salonService.get().replaceSalonImageLocked(actorId, salonId, slot, newUrl, newKey);
+        // Registered AFTER SalonService's cache evictions, so a throwing purge callback can never skip them.
+        purgeSalonImageKeyAfterCommit(salonId, slot, write.superseded());
+        return write.body();
+    }
+
+    /**
+     * Removes a salon's logo or cover (Phase 343 D7). Storage off answers 503 BEFORE any DB change (unlike the
+     * avatar delete, the salon images are R2-only, so clearing the pointer while the blob cannot be deleted is
+     * refused). An empty slot is a 204 no-op with no R2 call. Otherwise both pointers are cleared under the row
+     * lock and the blob is purged after commit.
+     */
+    public void deleteSalonImage(UUID actorId, UUID salonId, SalonImageSlot slot) {
+        requireStorageEnabled();
+        txWrite.execute(status -> {
+            SalonImagePointer cleared = salonService.get().clearSalonImageLocked(actorId, salonId, slot);
+            purgeSalonImageKeyAfterCommit(salonId, slot, cleared);
+            return null;
+        });
+    }
+
+    /**
+     * After-commit purge of a superseded/cleared salon image (D5 step 6, D6). Prefers the stored key; a legacy
+     * row (URL only) has its key recovered from the URL. Either way the key is purged ONLY under
+     * {@code salons/<salonId>/<slot>/} — anything else is an accepted orphan, WARN-logged without the URL/key.
+     */
+    private void purgeSalonImageKeyAfterCommit(UUID salonId, SalonImageSlot slot, SalonImagePointer pointer) {
+        if (pointer == null || pointer.isEmpty()) {
+            return;
+        }
+        String candidate = pointer.key() != null
+                ? pointer.key()
+                : r2.extractKeyFromPublicUrl(pointer.url()).orElse(null);
+        if (candidate == null || !candidate.startsWith(slot.keyPrefix(salonId)) || candidate.contains("..")) {
+            log.warn("Salon image purge skipped: superseded pointer outside the salon's own slot prefix; blob left "
+                    + "as an accepted orphan (salon={}, slot={}, pointer=[omitted])", salonId, slot);
+            return;
+        }
+        log.debug("Salon image purge registered (salon={}, slot={})", salonId, slot);
+        afterCommitBlobPurger.purgeAfterCommit(List.of(candidate), SALON_IMAGE_PURGE_CONTEXT);
     }
 
     // --------------------------------------------------------------- portfolio
 
     public MediaFileResponse uploadPortfolioPhoto(UUID actorId, Role actorRole, MultipartFile file) {
-        String detectedMime = detectMimeType(file);
+        requireStorageEnabled();
+        try (SniffedUpload upload = openAndSniff(file)) {
+            return uploadPortfolioSniffed(actorId, actorRole, file, upload);
+        }
+    }
+
+    private MediaFileResponse uploadPortfolioSniffed(
+            UUID actorId, Role actorRole, MultipartFile file, SniffedUpload upload) {
+        String detectedMime = upload.mime();
 
         // Step 1 — read tx: resolve the owning entity from the authenticated principal.
         // SEC-1: never trust a UUID from the request body — the salon/master is resolved
@@ -240,12 +694,7 @@ public class MediaService {
 
         // Step 2 — R2 upload OUTSIDE any transaction.
         String key = buildKey(target.prefix(), detectedMime);
-        try (InputStream in = file.getInputStream()) {
-            r2.uploadFile(key, in, file.getSize(), detectedMime);
-        } catch (IOException ex) {
-            log.error("Failed to read portfolio upload stream for user={}: {}", actorId, ex.getClass().getSimpleName());
-            throw new BusinessException(HttpStatus.BAD_REQUEST, "Failed to read uploaded file");
-        }
+        r2.uploadFile(key, upload.stream(), file.getSize(), detectedMime);
         String publicUrl = r2.buildPublicUrl(key);
 
         // Step 3 — write tx: insert the row.
@@ -268,34 +717,43 @@ public class MediaService {
         return MediaFileResponse.from(saved);
     }
 
+    /**
+     * Removes one portfolio photo. Same M1 invariant as {@link #deleteAvatar}: the DB row is deleted FIRST, inside
+     * {@code txWrite}, and the blob is purged only AFTER that transaction commits (via
+     * {@link AfterCommitBlobPurger#purgeAfterCommit}, on {@code blobPurgeExecutor}). A failed or rolled-back row
+     * delete therefore never touches R2 — the listing can never point at a deleted object. An R2 failure after
+     * commit is an accepted orphan blob (WARN + counter, key omitted).
+     *
+     * <p>Security SEC-N1 (same S-L5 gate as every sweep): the key reaches R2 ONLY when it sits under its own
+     * row's portfolio root — a corrupted / raw-SQL-written {@code r2_key} must never become an arbitrary-object
+     * delete. A mismatch skips R2 (counted WARN, key omitted) but the row is still removed.
+     */
     public void deletePortfolioPhoto(UUID actorId, UUID mediaId) {
-        // Step 1 — read tx: load the row, enforce ownership, capture the R2 key and the
-        // owning (entityType, entityId) pair needed for post-commit cache eviction.
-        DeleteTarget target = txRead(() -> {
-            MediaFile mf = mediaRepo.findById(mediaId)
-                    .orElseThrow(() -> new NotFoundException("Media not found: " + mediaId));
-            if (!mf.getUploader().getId().equals(actorId)) {
-                throw new ForbiddenException("Not allowed to delete this media");
-            }
-            return new DeleteTarget(mf.getR2Key(), mf.getEntityType(), mf.getEntityId());
-        });
+        DeleteTarget target = txWrite.execute(status -> deletePortfolioRowLocked(actorId, mediaId));
 
-        // Step 2 — R2 delete OUTSIDE any transaction. SEC-2 ordering: R2 first; an
-        // orphaned DB row can be cleaned up by a re-run, but a leaked R2 blob cannot.
-        r2.deleteFile(target.r2Key());
-
-        // Step 3 — write tx: delete the row by id (avoids carrying the detached entity).
-        txWrite.execute(status -> {
-            mediaRepo.deleteById(mediaId);
-            return null;
-        });
-
-        // Step 4 — Phase 7.7: post-commit cache eviction. txWrite.execute() returns only
-        // after commit, so this runs strictly after the row has been removed.
+        // Phase 7.7: post-commit cache eviction. txWrite.execute() returns only after commit.
         evictPortfolioCache(target.entityType(), target.entityId());
     }
 
-    /** Resolved data for a portfolio delete — captured during the read tx. */
+    /** Write step of {@link #deletePortfolioPhoto}: runs inside {@code txWrite}; registers the after-commit purge. */
+    private DeleteTarget deletePortfolioRowLocked(UUID actorId, UUID mediaId) {
+        MediaFile mf = mediaRepo.findById(mediaId)
+                .orElseThrow(() -> new NotFoundException("Media not found: " + mediaId));
+        if (!mf.getUploader().getId().equals(actorId)) {
+            throw new ForbiddenException("Not allowed to delete this media");
+        }
+        DeleteTarget target = new DeleteTarget(mf.getR2Key(), mf.getEntityType(), mf.getEntityId());
+        mediaRepo.delete(mf);
+        if (isOwnPortfolioKey(target.entityType(), target.entityId(), target.r2Key())) {
+            // afterCommit hook (we are inside txWrite): a rolled-back delete never fires it.
+            afterCommitBlobPurger.purgeAfterCommit(List.of(target.r2Key()), PORTFOLIO_PURGE_CONTEXT);
+        } else {
+            logSkippedPortfolioKeys(1);
+        }
+        return target;
+    }
+
+    /** Resolved data for a portfolio delete — captured inside the write tx, scalars only. */
     private record DeleteTarget(String r2Key, EntityType entityType, UUID entityId) {}
 
     /**
@@ -387,295 +845,256 @@ public class MediaService {
         }
     }
 
-    // ---------------------------------------------------------- SEC-2 sweeper
+    // ---------------------------------------------------------- salon sweeper
 
     /**
-     * Purge every R2 blob owned by the given user, then drop the DB pointers to them.
-     * Must be called BEFORE a {@code users} row is deleted — otherwise the
-     * {@code ON DELETE CASCADE} on {@code media_files.uploader_id} fires first and leaves
-     * R2 objects orphaned with no DB pointer to recover them.
+     * Shared R2-plus-DB sweep body (REUSE-FIRST, Phase 268 D3), called only by {@link #deleteBySalon} — which
+     * itself runs strictly after the salon-deletion transaction has committed, so this method is NOT bound by the
+     * after-commit M1 rule that governs live writes (there is no live pointer left to protect: the salon is gone).
      *
-     * <p><b>Covers BOTH blob families a user owns</b> (Anti-Bug Playbook §O8):
-     * <ul>
-     *   <li>every {@code media_files} row uploaded by them (portfolio photos), and</li>
-     *   <li>their avatar — which lives in {@code users.avatar_r2_key}, NOT in
-     *       {@code media_files}: {@link #uploadAvatar} writes the key straight onto the
-     *       {@code users} row and never inserts a {@code MediaFile}. A media-rows-only
-     *       sweep therefore left the avatar blob publicly retrievable forever after
-     *       account deletion, at a URL every provider the client ever booked with holds
-     *       (it is emitted as {@code clientAvatarUrl} on {@code BookingDetailResponse}).</li>
-     * </ul>
+     * <p><b>Order:</b> R2 FIRST — {@code extraKeys} (blobs that live OUTSIDE {@code media_files}, i.e. a salon's
+     * logo/cover), then every own-prefix {@code rows} key in one batched {@code DeleteObjects} — THEN one batched
+     * DB delete of {@code rows}, THEN post-commit portfolio-cache eviction. R2 deletion is best-effort: a failed
+     * key is WARN-logged (key omitted) and the DB rows are still dropped — an accepted orphan blob, never a live
+     * pointer to a deleted one.
      *
-     * <p>R2 deletion is best-effort throughout — mirroring the pre-existing per-row policy
-     * rather than introducing a second one: a failure is logged at WARN and the sweep
-     * continues, so a transient R2 outage cannot abort it and strand the remaining blobs.
-     * The DB pointer is dropped either way, and that carries an honest downside: when the R2
-     * delete FAILS, this method still nulls the pointer, leaving the blob in R2 with no DB
-     * key left to reconcile against — an ORPHANED blob. That is the accepted cost of a
-     * teardown that always completes and is safe to re-run; the alternative (keep the pointer
-     * on R2 failure) is worse, because it re-exposes a deleted user's photo at a live,
-     * retrievable URL. Ordering is always R2-first-then-DB, so aside from that accepted orphan
-     * the only other outcome is a crash landing between the two steps, which leaves a pointer
-     * to an already-gone blob (harmless) — never a live pointer to a deleted blob. Durable
-     * orphan reconciliation (a delete log or a periodic bucket-vs-DB sweep) is intentionally
-     * out of scope until an account-deletion flow actually calls this method.
+     * <p><b>Deliberately does NOT short-circuit on {@code rows.isEmpty()}</b> — a salon with a logo/cover but
+     * zero portfolio photos (or the reverse) must still be swept. The only no-op is BOTH lists empty.
      *
-     * <p>The avatar sweep runs FIRST, before the {@code rows.isEmpty()} short-circuit below —
-     * a user with an avatar but no portfolio photos is the common case for a {@code CLIENT}
-     * and must not fall through the early return.
-     *
-     * <p><b>Wiring contract (out of scope for Phase 7.5):</b> a future user-deletion
-     * flow must call this method before deleting the {@code users} row.
+     * @param rows      scalar {@code media_files} pointers (no entities), pre-read by the caller
+     * @param extraKeys already-verified R2 keys for blobs that are not {@code media_files} rows
+     * @param evictType together with {@code evictId}, an explicit portfolio-cache entry to evict in addition to
+     *                  whatever {@code rows} themselves resolve to (covers the rows-empty case)
      */
-    public void deleteByUploader(UUID uploaderId) {
-        // Step 0 — avatar blob (users.avatar_r2_key), which is NOT a media_files row.
-        sweepAvatar(uploaderId);
-
-        // Step 1 — read tx: collect the rows. Connection released before any R2 call.
-        List<MediaFile> rows = txRead(() -> mediaRepo.findByUploaderId(uploaderId));
-
-        // Steps 2-4 (R2 deletes, batch DB delete, post-commit cache eviction) are the
-        // shared sweep body — see sweepBlobs. No extra (non-media_files) keys on this path,
-        // and no single explicit entity to evict beyond whatever the rows themselves carry
-        // (a user may have contributed to more than one entity historically).
-        sweepBlobs(rows, List.of(), null, null);
-    }
-
-    /**
-     * Shared R2-plus-DB sweep body, promoted (REUSE-FIRST, Phase 268 D3) from what used to be
-     * {@link #deleteByUploader}'s steps 1-4 alone. Both {@link #deleteByUploader} and
-     * {@link #deleteBySalon} call this — no second implementation of the ordering/failure/eviction
-     * policy documented on {@link #deleteByUploader}'s own Javadoc, which still governs this method
-     * verbatim (R2-first-then-DB, per-row best-effort, orphans accepted on R2 failure, keys never
-     * logged).
-     *
-     * <p><b>Order:</b> {@code extraKeys} (blobs that live OUTSIDE {@code media_files} — a user's
-     * avatar-adjacent columns are handled by {@link #sweepAvatar} instead, but a salon's
-     * {@code avatar_url}/{@code cover_image_url} are exactly this shape) are deleted from R2
-     * FIRST, then every {@code rows} entry, THEN one batched DB delete of {@code rows}, THEN
-     * post-commit portfolio-cache eviction.
-     *
-     * <p><b>Deliberately does NOT short-circuit on {@code rows.isEmpty()}</b> the way the
-     * pre-promotion code did — a salon with an avatar/cover but zero portfolio photos (or the
-     * reverse) must still have its {@code extraKeys} swept. The only true no-op case is BOTH lists
-     * empty.
-     *
-     * @param rows      {@code media_files} rows to purge from R2 and the DB, collected under a read
-     *                  transaction by the caller (connection already released before this runs)
-     * @param extraKeys R2 keys for blobs that are not {@code media_files} rows (e.g. a salon's
-     *                  avatar/cover) — deleted from R2 but never touch {@code mediaRepo}
-     * @param evictType together with {@code evictId}, an explicit portfolio-cache entry to evict in
-     *                  addition to whatever {@code rows} themselves resolve to — needed so a
-     *                  rows-empty, extraKeys-only sweep still evicts the right entity. Either may be
-     *                  {@code null} when the caller has no single entity to name beyond {@code rows}
-     *                  (e.g. {@link #deleteByUploader}, whose rows may span more than one entity).
-     */
-    private void sweepBlobs(List<MediaFile> rows, List<String> extraKeys, EntityType evictType, UUID evictId) {
+    private void sweepBlobs(List<MediaFileKey> rows, List<String> extraKeys, EntityType evictType, UUID evictId) {
         if (rows.isEmpty() && extraKeys.isEmpty()) {
             return;
         }
 
         // R2 deletes OUTSIDE any transaction, batched into as few DeleteObjects round-trips as
-        // R2StorageService#deleteFiles allows (Phase 268 perf follow-up — was one HTTP round-trip
-        // per key). Extra keys first, then rows, matching the pre-batching order.
+        // R2StorageService#deleteFiles allows. Extra keys first, then rows.
         List<String> allKeys = new ArrayList<>(extraKeys.size() + rows.size());
         allKeys.addAll(extraKeys);
-        for (MediaFile row : rows) {
-            allKeys.add(row.getR2Key());
+        int skipped = 0;
+        for (MediaFileKey row : rows) {
+            if (isOwnPortfolioKey(row.entityType(), row.entityId(), row.r2Key())) {
+                allKeys.add(row.r2Key());
+            } else {
+                skipped++;
+            }
         }
+        logSkippedPortfolioKeys(skipped);
 
-        // r2.deleteFiles never throws for a delete failure, partial or total (see its Javadoc) —
-        // it returns the subset of keys it could not delete. A single object's failure must not
-        // abort the sweep, so that returned set is only logged, never re-thrown; the DB rows are
-        // still dropped below regardless of which keys failed — same accepted-orphan policy the
-        // per-key loop this replaced already had.
-        Set<String> failedKeys = r2.deleteFiles(allKeys);
+        // r2.deleteFiles never throws for a delete failure, partial or total (see its Javadoc) — it returns the
+        // keys it could not delete. Only logged, never re-thrown; the DB rows are still dropped below.
+        Set<String> failedKeys = allKeys.isEmpty() ? Set.of() : r2.deleteFiles(allKeys);
         for (String ignored : failedKeys) {
             // Key may encode an entity UUID — omit from WARN log to avoid PII in log aggregators.
             log.warn("R2 delete failed during media sweep (key=[key omitted])");
         }
 
-        // Write tx: batch delete every media_files row. Skipped when there are none — extraKeys
-        // alone never touch mediaRepo.
         if (!rows.isEmpty()) {
+            // deleteAllByIdInBatch: ONE `DELETE ... WHERE id IN (...)` (perf PERF-1) — no per-row merge SELECT.
+            // Safe because MediaFile has no cascades, no orphanRemoval and no removal listener.
+            List<UUID> ids = rows.stream().map(MediaFileKey::id).toList();
             txWrite.execute(status -> {
-                mediaRepo.deleteAll(rows);
+                mediaRepo.deleteAllByIdInBatch(ids);
                 return null;
             });
         }
 
-        // Post-commit portfolio-cache eviction — every distinct (entityType, entityId) the rows
-        // themselves carry, PLUS the caller's explicit (evictType, evictId) when given (covers the
-        // rows-empty, extraKeys-only case, where nothing in `rows` would otherwise name the entity).
         Set<String> distinctKeys = new HashSet<>();
-        for (MediaFile row : rows) {
-            distinctKeys.add(portfolioCacheKey(row.getEntityType(), row.getEntityId()));
+        for (MediaFileKey row : rows) {
+            distinctKeys.add(portfolioCacheKey(row.entityType(), row.entityId()));
         }
         if (evictType != null && evictId != null) {
             distinctKeys.add(portfolioCacheKey(evictType, evictId));
         }
-        if (!distinctKeys.isEmpty()) {
-            Cache cache = cacheManager.getCache(PORTFOLIO_CACHE);
-            if (cache != null) {
-                for (String key : distinctKeys) {
-                    cache.evictIfPresent(key);
-                }
-            }
-        }
+        evictPortfolioCacheKeys(distinctKeys);
     }
 
     /**
-     * Purges a salon's imagery from R2 permanently — the Phase 268 D2/D3 sweep called by
-     * {@code SalonService} AFTER its deletion transaction commits (D4/D8: never inline inside that
-     * transaction, since {@link #txRead}/{@link #txWrite} would otherwise join it and hold a
-     * connection across dozens of sequential R2 round-trips).
+     * Purges a salon's imagery from R2 permanently — the Phase 268 D2/D3 sweep that {@code SalonService} runs on
+     * {@code blobPurgeExecutor} AFTER its deletion transaction commits (D4/D8: never inline inside that
+     * transaction, since {@link #txWrite} would otherwise hold a connection across R2 round-trips).
      *
-     * <p>Covers all three imagery sets a deleted salon can carry (phase doc D2 table):
-     * <ul>
-     *   <li>every {@code media_files} row with {@code entity_type = SALON, entity_id = salonId}
-     *       (the portfolio) — {@code preReadRows}, already collected by the caller INSIDE the
-     *       deletion transaction, before {@code deleteSalonStaff} could hard-delete a staff
-     *       uploader and cascade the row away (the gap the phase doc did not cover — see
-     *       {@code SalonService.deactivateSalon}'s Javadoc);</li>
-     *   <li>{@code salons.avatar_url} — recovered to a key via {@link
-     *       R2StorageService#extractKeyFromPublicUrl}, since (unlike a user) a salon stores only
-     *       the public URL, never the raw key;</li>
-     *   <li>{@code salons.cover_image_url} — same recovery.</li>
-     * </ul>
+     * <p>Covers all three imagery sets a deleted salon can carry (phase doc D2 table): the {@code media_files}
+     * portfolio rows ({@code preReadRows}, captured as scalars INSIDE the deletion transaction, before a staff
+     * hard-delete could cascade one away), and the logo/cover keys the caller resolved from
+     * {@code salons.avatar_url}/{@code cover_image_url} via {@link #resolveSalonImageKey}.
      *
-     * <p>A {@code null} or foreign-prefixed URL yields no key (D2 safety guard) and is silently
-     * skipped — never guessed at. The DB pointer columns themselves are nulled by the caller
-     * ({@code SalonRepository#nullImageUrls}) AFTER this method returns, preserving the D4
-     * R2-first-then-DB ordering at the SalonService level exactly as this method preserves it
-     * internally for {@code media_files} rows.
+     * <p>Every {@code salonImageKeys} entry is RE-VERIFIED here against {@code salons/<salonId>/} (security S-M1,
+     * defence in depth — no caller can hand this method an unchecked key); a mismatch is skipped and counted. The
+     * {@code salons} pointer columns are nulled by the caller AFTER this returns (D4 R2-first-then-DB).
      *
-     * @param salonId       the deleted salon's id, used only to name the explicit cache-eviction
-     *                      entry (D3) — every row in {@code preReadRows} is already scoped to it
-     * @param avatarUrl     the salon's {@code avatar_url} at the moment it was deactivated, or
-     *                      {@code null}
-     * @param coverImageUrl the salon's {@code cover_image_url} at the moment it was deactivated, or
-     *                      {@code null}
-     * @param preReadRows   the salon's {@code media_files} rows, read by the caller before any
-     *                      staff hard-delete could cascade one away
+     * @param salonId        the deleted salon's id — scopes the key check and names the explicit cache eviction
+     * @param salonImageKeys logo/cover keys already resolved by {@link #resolveSalonImageKey} (never URLs)
+     * @param preReadRows    the salon's {@code media_files} pointers, read before any staff hard-delete
      */
-    public void deleteBySalon(UUID salonId, String avatarUrl, String coverImageUrl, List<MediaFile> preReadRows) {
-        List<String> extraKeys = new ArrayList<>(2);
-        r2.extractKeyFromPublicUrl(avatarUrl).ifPresent(extraKeys::add);
-        r2.extractKeyFromPublicUrl(coverImageUrl).ifPresent(extraKeys::add);
+    public void deleteBySalon(UUID salonId, List<String> salonImageKeys, List<MediaFileKey> preReadRows) {
+        List<String> extraKeys = new ArrayList<>(salonImageKeys.size());
+        int skipped = 0;
+        for (String key : salonImageKeys) {
+            if (isOwnSalonImageKey(salonId, key)) {
+                extraKeys.add(key);
+            } else {
+                skipped++;
+            }
+        }
+        if (skipped > 0) {
+            log.warn("Salon image purge skipped keys outside the salon's own prefix (salon={}, skippedCount={}, "
+                    + "keys=[omitted])", salonId, skipped);
+        }
 
         sweepBlobs(preReadRows, extraKeys, EntityType.SALON, salonId);
     }
 
     /**
-     * Permanently purges a self-deleted CLIENT's R2 blobs — the Phase 300 D4/§9 counterpart of
-     * {@link #deleteBySalon}, called by {@code ClientAccountDeletionService} AFTER its deletion
-     * transaction commits (mirroring {@code SalonService}'s {@code purgeSalonMediaAfterCommit}
-     * registration shape exactly).
+     * The single place that decides which R2 object a salon logo/cover URL owns (security S-M1, mirrors
+     * {@link #resolveAvatarKey(UUID, String, String)}). The key is recovered from the public URL via
+     * {@link R2StorageService#extractKeyFromPublicUrl} (host verified, no traversal) and accepted ONLY under
+     * the salon's own phase-343 root {@code salons/<salonId>/} — a foreign or corrupted pointer (another
+     * salon's object, a user avatar, a portfolio key) must never become an arbitrary-object delete. A
+     * mismatch is skipped with a WARN that omits the URL/key. Returns {@code null} when nothing is safe.
      *
-     * <p><b>R2-ONLY — deliberately does NOT reuse {@link #sweepBlobs}.</b> {@code sweepBlobs} also
-     * issues a DB {@code mediaRepo.deleteAll(rows)}, which is exactly right for {@link
-     * #deleteBySalon} (a salon's OWN portfolio rows do not automatically cascade away — only a
-     * hard-deleted STAFF uploader's rows do) but is WRONG here: {@code media_files.uploader_id}
-     * {@code ON DELETE CASCADE}s directly off {@code users.id} (V37:8), so by the time this
-     * {@code afterCommit} callback runs, {@code preReadRows} and the caller's own avatar-column
-     * update have ALREADY vanished from the database — {@code preReadRows} are DETACHED entities
-     * pointing at rows that no longer exist. Calling {@code mediaRepo.deleteAll} on them would
-     * either no-op or throw ({@code merge()} tries to reload a row that is gone), for zero benefit:
-     * the only thing actually left to clean up is the R2 BLOBS themselves, which are outside the
-     * transaction and were never touched by the CASCADE.
-     *
-     * <p><b>Do NOT call {@link #deleteByUploader} inline instead</b> — see that method's own
-     * Javadoc and this class's caller's Javadoc: it opens its OWN {@code PROPAGATION_REQUIRES_NEW}
-     * transactions, so calling it from inside {@code ClientAccountDeletionService}'s own {@code
-     * @Transactional} would let an outer rollback leave the blobs already destroyed.
-     *
-     * <p>Best-effort throughout, same policy as every other sweep in this class: a partial or
-     * total R2 failure is logged at WARN (key omitted) and never re-thrown — the {@code users} row
-     * is already gone by the time this runs, so there is nothing left to roll back to.
-     *
-     * @param clientUserId  the deleted client's id, used only to name the portfolio-cache eviction
-     *                      entry for each distinct {@code (entityType, entityId)} in {@code
-     *                      preReadRows} — a CLIENT never legitimately owns a portfolio entry today
-     *                      (only SALON_OWNER/INDEPENDENT_MASTER/SALON_ADMIN upload one), but this
-     *                      stays correct if that ever changes
-     * @param avatarR2Key   the deleted client's {@code users.avatar_r2_key} at the moment of
-     *                      deletion, pre-read by the caller before the row vanished, or {@code
-     *                      null} if the client never had an avatar
-     * @param preReadRows   the client's {@code media_files} rows, pre-read by the caller (via
-     *                      {@code mediaRepo.findByUploaderId}) before the {@code users} DELETE
-     *                      cascaded them away
+     * <p>Phase 343 D8 key-first: the stored {@code r2Key} (V189) wins and is accepted only under
+     * {@code salons/<salonId>/}; a NULL key (legacy row) falls back to recovering it from {@code url}.
      */
-    public void purgeUserBlobsAfterCommit(UUID clientUserId, String avatarR2Key, List<MediaFile> preReadRows) {
-        List<String> keys = new ArrayList<>(preReadRows.size() + 1);
-        if (avatarR2Key != null) {
-            keys.add(avatarR2Key);
+    public String resolveSalonImageKey(UUID salonId, String r2Key, String url) {
+        if (r2Key == null) {
+            return resolveSalonImageKey(salonId, url);
         }
-        for (MediaFile row : preReadRows) {
-            keys.add(row.getR2Key());
+        if (isOwnSalonImageKey(salonId, r2Key)) {
+            return r2Key;
         }
-        if (keys.isEmpty()) {
-            return;
-        }
+        log.warn("Salon image purge skipped: key outside the salon's own key prefix (salon={}, key=[omitted])",
+                salonId);
+        return null;
+    }
 
-        Set<String> failedKeys = r2.deleteFiles(keys);
-        for (String ignored : failedKeys) {
-            // Key may encode an entity UUID — omit from WARN log to avoid PII in log aggregators.
-            log.warn("R2 delete failed during client self-delete blob purge (client={}, key=[key omitted])",
-                    clientUserId);
+    /** URL-only form of {@link #resolveSalonImageKey(UUID, String, String)} — a legacy (key-less) row. */
+    public String resolveSalonImageKey(UUID salonId, String url) {
+        if (url == null) {
+            return null;
         }
+        String candidate = r2.extractKeyFromPublicUrl(url).orElse(null);
+        if (isOwnSalonImageKey(salonId, candidate)) {
+            return candidate;
+        }
+        log.warn("Salon image purge skipped: URL outside the salon's own key prefix (salon={}, url=[omitted])",
+                salonId);
+        return null;
+    }
 
-        Set<String> distinctCacheKeys = new HashSet<>();
-        for (MediaFile row : preReadRows) {
-            distinctCacheKeys.add(portfolioCacheKey(row.getEntityType(), row.getEntityId()));
-        }
-        if (!distinctCacheKeys.isEmpty()) {
-            Cache cache = cacheManager.getCache(PORTFOLIO_CACHE);
-            if (cache != null) {
-                for (String key : distinctCacheKeys) {
-                    cache.evictIfPresent(key);
-                }
-            }
+    /** S-M1 shape check shared by {@link #resolveSalonImageKey} and {@link #deleteBySalon}'s re-verification. */
+    static boolean isOwnSalonImageKey(UUID salonId, String key) {
+        return salonId != null && key != null && key.startsWith(SALON_IMAGE_KEY_ROOT + salonId + "/")
+                && !key.contains("..");
+    }
+
+    private static void addIfPresent(List<String> keys, String key) {
+        if (key != null) {
+            keys.add(key);
         }
     }
 
     /**
-     * Avatar half of {@link #deleteByUploader}: purge the {@code users.avatar_r2_key} blob
-     * and null both avatar columns.
-     *
-     * <p>Deliberately tolerant where {@link #deleteAvatar} is strict. {@code deleteAvatar}
-     * serves an authenticated request and 404s on a missing user; this runs inside a
-     * teardown sweep that must be safe to re-run and safe to call when the {@code users} row
-     * has already gone (e.g. a retried deletion), so an absent user is a no-op. Same
-     * tolerance the media-rows sweep already applies via its {@code rows.isEmpty()} return.
+     * The {@code media_files.r2_key} root a portfolio blob of {@code (entityType, entityId)} must live under —
+     * derived from {@link #resolvePortfolioTarget}, the only writer: {@code portfolio/salons/<salonId>/} for
+     * {@code SALON}, {@code portfolio/independent/<masterId>/} for {@code MASTER}. {@code USER} (and a null
+     * type/id) has no portfolio root, so returns {@code null}.
      */
-    private void sweepAvatar(UUID uploaderId) {
-        // Read tx: capture the key, release the connection before the R2 round-trip.
-        String key = txRead(() -> userRepo.findById(uploaderId)
-                .map(User::getAvatarR2Key)
-                .orElse(null));
+    static String portfolioKeyPrefix(EntityType entityType, UUID entityId) {
+        if (entityType == null || entityId == null) {
+            return null;
+        }
+        return switch (entityType) {
+            case SALON -> SALON_PORTFOLIO_KEY_ROOT + entityId + "/";
+            case MASTER -> MASTER_PORTFOLIO_KEY_ROOT + entityId + "/";
+            case USER -> null;
+        };
+    }
+
+    /**
+     * Security S-L5: a {@code media_files.r2_key} reaches an R2 delete only when it sits under its OWN row's
+     * portfolio root (plus V39's no-traversal shape), so a corrupted or raw-SQL-written row can never turn an
+     * account/salon sweep into an arbitrary-object delete.
+     */
+    static boolean isOwnPortfolioKey(EntityType entityType, UUID entityId, String key) {
+        String prefix = portfolioKeyPrefix(entityType, entityId);
+        return prefix != null && key != null && key.startsWith(prefix) && !key.contains("..");
+    }
+
+    private static void logSkippedPortfolioKeys(int skipped) {
+        if (skipped > 0) {
+            log.warn("Media purge skipped keys outside their entity's portfolio prefix (skippedCount={}, keys=[omitted])",
+                    skipped);
+        }
+    }
+
+    /**
+     * Permanently purges the R2 blobs of one or more hard-deleted accounts — called from the single
+     * {@code afterCommit} that {@code AccountBlobPurgeRegistrar} registers (client/staff self-delete, and ONE
+     * registration for a whole staff-disposal batch — P-M1). By then the {@code users} rows and their
+     * cascaded {@code media_files} rows are gone, so this is R2-only plus portfolio-cache eviction (never
+     * {@link #sweepBlobs}, whose {@code mediaRepo.deleteAllByIdInBatch} would target vanished rows).
+     *
+     * <p>The avatar pointer is RE-VERIFIED here against {@code avatars/<userId>/} (S-L1); the R2 round-trip
+     * is handed to {@code blobPurgeExecutor} via {@link AfterCommitBlobPurger#dispatch} so the committing
+     * thread does not hold its JDBC connection across R2 (P-M2). Best-effort: failures are WARN-logged
+     * (keys omitted) and never re-thrown.
+     *
+     * @param accounts scalar pointers captured BEFORE the delete (no entities — P-L3)
+     */
+    public void purgeUserBlobsAfterCommit(List<AccountBlobPointers> accounts) {
+        List<String> keys = new ArrayList<>();
+        Set<String> distinctCacheKeys = new HashSet<>();
+        int skipped = 0;
+        for (AccountBlobPointers account : accounts) {
+            addIfPresent(keys, verifiedAccountAvatarKey(account));
+            for (UploaderMediaKey media : account.media()) {
+                if (isOwnPortfolioKey(media.entityType(), media.entityId(), media.r2Key())) {
+                    keys.add(media.r2Key());
+                } else {
+                    skipped++;
+                }
+                distinctCacheKeys.add(portfolioCacheKey(media.entityType(), media.entityId()));
+            }
+        }
+        logSkippedPortfolioKeys(skipped);
+        evictPortfolioCacheKeys(distinctCacheKeys);
+        // ONE batched DeleteObjects hand-off for every account (P-M1; deleteFiles chunks at 1000), run on
+        // blobPurgeExecutor so the committing thread releases its JDBC connection without waiting on R2 (P-M2).
+        afterCommitBlobPurger.dispatch(keys, ACCOUNT_PURGE_CONTEXT);
+    }
+
+    /**
+     * Re-checks the avatar pointer against {@code avatars/<userId>/} at the purge boundary (security S-L1):
+     * no caller can hand this method an unchecked key. A non-null pointer that fails the check is skipped
+     * with a WARN (key/url omitted).
+     */
+    private String verifiedAccountAvatarKey(AccountBlobPointers account) {
+        if (account.avatarR2Key() == null && account.avatarUrl() == null) {
+            return null;
+        }
+        String key = resolveAvatarKey(account.userId(), account.avatarR2Key(), account.avatarUrl());
         if (key == null) {
+            log.warn("Account avatar purge skipped: pointer outside avatars/<userId>/ (user={}, key=[omitted])",
+                    account.userId());
+        }
+        return key;
+    }
+
+    private void evictPortfolioCacheKeys(Set<String> cacheKeys) {
+        if (cacheKeys.isEmpty()) {
             return;
         }
-
-        // R2 delete OUTSIDE any transaction, best-effort — same policy as the row loop.
-        try {
-            r2.deleteFile(key);
-        } catch (RuntimeException ex) {
-            // Key embeds the user UUID — omit it from the log to keep PII out of aggregators.
-            log.warn("R2 delete failed during deleteByUploader avatar sweep (uploader={}, key=[key omitted]): {}",
-                    uploaderId, ex.getClass().getSimpleName());
+        Cache cache = cacheManager.getCache(PORTFOLIO_CACHE);
+        if (cache != null) {
+            for (String key : cacheKeys) {
+                cache.evictIfPresent(key);
+            }
         }
-
-        // Write tx: clear the pointers on a fresh load, so no detached entity crosses the
-        // network round-trip above.
-        txWrite.execute(status -> {
-            userRepo.findById(uploaderId).ifPresent(u -> {
-                u.setAvatarR2Key(null);
-                u.setAvatarUrl(null);
-                userRepo.save(u);
-            });
-            return null;
-        });
     }
 
     // -------------------------------------------------------------- internals
@@ -694,13 +1113,13 @@ public class MediaService {
             Salon salon = salonRepo.findTopByOwnerIdAndIsActiveTrueOrderByCreatedAtAsc(actorId)
                     .orElseThrow(() -> new ForbiddenException("No active salon found for owner"));
             return new PortfolioTarget(EntityType.SALON, salon.getId(),
-                    "portfolio/salons/" + salon.getId() + "/");
+                    portfolioKeyPrefix(EntityType.SALON, salon.getId()));
         }
         if (actorRole == Role.INDEPENDENT_MASTER) {
             Master master = masterRepo.findByUserId(actorId)
                     .orElseThrow(() -> new ForbiddenException("No master profile found for user"));
             return new PortfolioTarget(EntityType.MASTER, master.getId(),
-                    "portfolio/independent/" + master.getId() + "/");
+                    portfolioKeyPrefix(EntityType.MASTER, master.getId()));
         }
         throw new ForbiddenException("Role not allowed to upload portfolio photos");
     }
@@ -709,13 +1128,28 @@ public class MediaService {
     private record PortfolioTarget(EntityType entityType, UUID entityId, String prefix) {}
 
     /**
-     * Inspect the first {@value #HEADER_BYTES} bytes of the upload and resolve the
-     * canonical MIME type. Validates size and emptiness up-front. Never trusts
-     * {@code file.getContentType()} or {@code file.getOriginalFilename()}.
-     *
-     * @throws BusinessException with HTTP 400 for every rejection path
+     * The upload stream, opened exactly once, positioned at byte 0 after the magic-byte sniff,
+     * together with the detected MIME. The caller passes {@link #stream()} straight to R2 and
+     * closes this holder (which closes the stream).
      */
-    private String detectMimeType(MultipartFile file) {
+    private record SniffedUpload(String mime, InputStream stream) implements AutoCloseable {
+        @Override
+        public void close() {
+            try {
+                stream.close();
+            } catch (IOException ex) {
+                log.warn("Failed to close upload stream: {}", ex.getClass().getSimpleName());
+            }
+        }
+    }
+
+    /**
+     * Opens the upload stream once, sniffs the magic bytes (mark/reset on a
+     * {@link BufferedInputStream}) and returns the stream rewound to byte 0 with the detected MIME.
+     * The buffer is larger than {@link #HEADER_BYTES}, which is also the mark limit, so
+     * {@code reset()} can never fail.
+     */
+    private SniffedUpload openAndSniff(MultipartFile file) {
         if (file.isEmpty()) {
             throw new BusinessException(HttpStatus.BAD_REQUEST, "File must not be empty");
         }
@@ -723,17 +1157,39 @@ public class MediaService {
             throw new BusinessException(HttpStatus.BAD_REQUEST, "File exceeds 5 MB limit");
         }
 
-        byte[] header = new byte[HEADER_BYTES];
-        try (InputStream in = file.getInputStream()) {
-            int read = in.read(header, 0, HEADER_BYTES);
+        InputStream in = null;
+        try {
+            in = new BufferedInputStream(file.getInputStream(), SNIFF_BUFFER_BYTES);
+            in.mark(HEADER_BYTES);
+            byte[] header = new byte[HEADER_BYTES];
+            int read = in.readNBytes(header, 0, HEADER_BYTES);
             if (read < 4) {
                 throw new BusinessException(HttpStatus.BAD_REQUEST, "File too small");
             }
+            in.reset();
+            return new SniffedUpload(detectMimeType(header), in);
         } catch (IOException ex) {
+            closeQuietly(in);
             log.warn("Failed to read upload header: {}", ex.getClass().getSimpleName());
             throw new BusinessException(HttpStatus.BAD_REQUEST, "Failed to read uploaded file");
+        } catch (BusinessException ex) {
+            closeQuietly(in);
+            throw ex;
         }
+    }
 
+    private static void closeQuietly(InputStream in) {
+        if (in == null) {
+            return;
+        }
+        try {
+            in.close();
+        } catch (IOException ignored) {
+            // best effort — already failing the request
+        }
+    }
+
+    private String detectMimeType(byte[] header) {
         // JPEG: FF D8 FF
         if ((header[0] & 0xFF) == 0xFF
                 && (header[1] & 0xFF) == 0xD8

@@ -85,7 +85,7 @@ public class R2StorageService {
 
         if (r2Enabled) {
             if (!StringUtils.hasText(bucketName)) {
-                throw new IllegalStateException("R2 is enabled but app.cloudflare-r2.bucket-name is blank");
+                throw new IllegalStateException("R2 is enabled but app.cloudflare-r2.bucket is blank");
             }
             if (!StringUtils.hasText(publicUrlPrefix)) {
                 throw new IllegalStateException("R2 is enabled but app.cloudflare-r2.public-url is blank");
@@ -95,6 +95,11 @@ public class R2StorageService {
             log.warn("R2StorageService disabled — uploadFile/deleteFile are no-ops, "
                     + "buildPublicUrl returns empty string");
         }
+    }
+
+    /** {@code true} when a real {@link S3Client} is wired (R2 enabled). */
+    public boolean isEnabled() {
+        return r2Enabled;
     }
 
     /**
@@ -286,6 +291,8 @@ public class R2StorageService {
      *       be turned into a delete against a guessed key.</li>
      *   <li>The remainder after stripping the prefix is blank → empty. A bare prefix with nothing
      *       after it is not a key.</li>
+     *   <li>The remainder starts with {@code /}, contains {@code ..}, {@code ?}, {@code #}, a backslash
+     *       or a control character → empty (absolute path / traversal / non-key URL parts).</li>
      * </ol>
      *
      * @param url a previously-stored public URL, possibly {@code null}, blank, foreign, or
@@ -303,7 +310,14 @@ public class R2StorageService {
             return Optional.empty();
         }
         String key = url.substring(publicUrlPrefix.length() + 1);
-        return StringUtils.hasText(key) ? Optional.of(key) : Optional.empty();
+        if (!StringUtils.hasText(key) || key.startsWith("/") || key.contains("..")
+                || key.contains("?") || key.contains("#") || key.contains("\\")
+                || key.chars().anyMatch(Character::isISOControl)) {
+            // Prefix match proves the host (the prefix is scheme+host[+path]); the remainder must still be a
+            // plain relative key — never an absolute path, a traversal, a query/fragment or a control char.
+            return Optional.empty();
+        }
+        return Optional.of(key);
     }
 
     private static String stripTrailingSlash(String url) {

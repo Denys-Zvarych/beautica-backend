@@ -1,18 +1,58 @@
 name: PR Validate
 
+# Run titles are a CONTRACT, not cosmetics: the ci-gate mirror (irrelevant-label events) and nightly.yml
+# find "their" run by title. Titles are built from event data only, never from the (author-controlled)
+# PR title:
+#   real pull_request run   pr-<number> <head sha>
+#   irrelevant-label run    label-noop pr-<number>
+#   workflow_dispatch       dispatch:<reason>:<token>      (nightly.yml passes token = its run id-attempt)
+#   push                    (GitHub default: commit message)
+run-name: >-
+  ${{ github.event_name == 'pull_request' && (
+  github.event.action == 'labeled' && github.event.label.name != 'full-ci' && format('label-noop pr-{0}', github.event.pull_request.number)
+  || format('pr-{0} {1}', github.event.pull_request.number, github.event.pull_request.head.sha))
+  || github.event_name == 'workflow_dispatch' && format('dispatch:{0}:{1}', inputs.reason, inputs.token)
+  || github.event.head_commit.message }}
+
 # ──────────────────────────────────────────────────────────────────────────
-# REGRESSION MERGE-GATE
+# REGRESSION MERGE-GATE (phases 358-360: selective tests + sharded full runs)
 #
-# This workflow is the regression gate for the backend. It compiles main +
-# test sources and runs the FULL test suite on every pull request targeting
-# `dev` and `main`. A failure of the `Compile (gate)`, `Build`, or
-# `Run tests` step fails the whole check.
+# Pull requests run only the test classes the affected-test selector says can
+# observe the change (scripts/ci/select-tests.sh, src/test/java/com/beautica/ci).
+# FULL suites run on: push to dev/main, workflow_dispatch (the nightly run dispatches
+# this workflow on `dev`, see nightly.yml), PRs labelled `full-ci`, and any PR that touches CI
+# infrastructure. Full runs, and selective runs above 120 classes, are sharded across 3 runners,
+# balanced by class weight (heavy integration tests spread evenly, see TestSharder).
 #
-# REQUIRED GITHUB SETTING (cannot be set from code — the repo admin must do this):
-#   In GitHub → Settings → Branches → Branch protection rules, for both `dev`
-#   and `main`, enable "Require status checks to pass before merging" and add
-#   the "Build & Test" check (this job) as a required status check. Without
-#   that setting a red check does NOT block the merge button.
+#   plan           decides mode + non-empty shards. NO project compile: selector = plain javac of JDK-only classes
+#   plan           (also) th:utext email-template guard: the BASE copy of the script, run AFTER selection
+#   gates          compile + `build -x test`; skipped when mode=none
+#   selector-self-test  only when CI infra changed
+#   test           matrix shard, skipped when mode=none
+#   verify         proves every selected class executed (runs the BASE copy of the script, read-only token)
+#   report         publishes results (write token, no PR code, no scripts); presentation only, NOT a ci-gate need
+#   ci-gate        the ONLY required status check (if: always(), skipped != failure)
+#
+# TRUST MODEL. A pull_request run executes the PR's own code, so the gate must not be decided by it:
+#   * the selector, its rules and select-tests.sh run from the merge commit's BASE parent
+#     (`git archive HEAD^1`), analysing the PR tree; the PR cannot edit the rules applied to it;
+#   * "CI infra changed" is computed in plain workflow shell from `git diff HEAD^1 HEAD` and forces
+#     mode=full whatever the selector says; ci-gate re-asserts mode/count (fails closed);
+#   * verify-selected-ran.sh is taken from the base, never the PR tree;
+#   * NOTHING PR-owned executes in `plan`: the th:utext guard runs the BASE copy of its script (against
+#     the PR's templates as data) only AFTER the selection step. A PR-owned script running first could
+#     write $GITHUB_ENV / $GITHUB_PATH / .git/config and subvert the base-owned selector. Where the base
+#     has no such script (bootstrap) the plan skips the guard with a warning and the `gates` job runs the
+#     PR copy instead (gates makes no trusted decision; it can only fail);
+#   * .github/CODEOWNERS makes changes to this file, scripts/ci and the selector need the owner.
+# Residual (GitHub cannot be told otherwise from code): the workflow FILE of a pull_request run is the
+# PR's copy, so editing this file is only stopped by CODEOWNERS + "Require review from Code Owners".
+#
+# REQUIRED GITHUB SETTINGS (cannot be set from code — the repo admin must do this):
+#   Settings -> Branches -> branch protection rules for `dev` and `main`: require the
+#   "CI Gate" check (job `ci-gate`) and REMOVE the old "Build & Test" check from the
+#   required list. Keep "Check Migration Immutability" and the gitleaks check required.
+#   Also enable "Require review from Code Owners" so .github/CODEOWNERS is enforced.
 # ──────────────────────────────────────────────────────────────────────────
 
 on:
@@ -20,15 +60,43 @@ on:
     branches:
       - main
       - dev
-  # Defense-in-depth: also compile + test the merged tip of the
-  # protected branches. The pull_request trigger does not cover a
-  # merge-commit or a direct push reaching dev/main. This job is
-  # prod-secret-free (test profile + CI dummy JWT only), so it is
-  # safe to run on push.
+    # `labeled` so adding `full-ci` re-runs as a full run. Other labels must not restart or cancel
+    # the real run: they get their own concurrency group (below), skip every job, and only the
+    # ci-gate job runs, mirroring the real run's conclusion (a bare green no-op gate for the same
+    # SHA could satisfy the required check while the real run is still pending or has failed).
+    types: [opened, synchronize, reopened, labeled]
+  # Defense-in-depth: also compile + test the merged tip of the protected branches.
+  # This job is prod-secret-free (test profile + CI dummy JWT only), so it is safe on push.
   push:
     branches:
       - main
       - dev
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Why this run was started (nightly adds --rerun so Gradle re-executes every test)'
+        required: false
+        default: manual
+        type: string
+      token:
+        description: 'Unique marker echoed into the run title so a dispatcher can find exactly this run (nightly.yml)'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+# Never cancels dev/main/dispatch runs. Every dispatch gets its own group (its run id), so a
+# replacement can never cancel the nightly a watcher is waiting on, nor a push run. Label-noop runs
+# live in one group per PR with cancel-in-progress: a newer irrelevant label cancels the older mirror,
+# so at most one mirror holds a runner per PR; they never cancel (or are cancelled by) the real run.
+concurrency:
+  group: >-
+    ${{ github.event_name == 'workflow_dispatch' && format('pr-validate-dispatch-{0}', github.run_id)
+    || format('pr-validate-{0}{1}', github.event.pull_request.number || format('{0}-{1}', github.event_name, github.ref),
+    github.event.action == 'labeled' && github.event.label.name != 'full-ci' && '-label-noop' || '') }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # CI-only, non-production dummy value. The `test` Spring profile
 # (src/test/resources/application-test.yml) hardcodes all other infrastructure
@@ -39,17 +107,205 @@ env:
   CI_DUMMY_JWT_SECRET: ci-only-dummy-jwt-secret-not-a-real-secret-min-32-bytes
 
 jobs:
-  build-and-test:
-    name: Build & Test
+  plan:
+    name: Plan
+    # Irrelevant-label events do nothing here; ci-gate mirrors the real run instead.
+    if: github.event.action != 'labeled' || github.event.label.name == 'full-ci'
     runs-on: ubuntu-latest
-    permissions:
-      checks: write
-      pull-requests: write
-      contents: read
+    timeout-minutes: 10
+    outputs:
+      mode: ${{ steps.select.outputs.mode }}
+      count: ${{ steps.select.outputs.count }}
+      total: ${{ steps.select.outputs.total }}
+      shards: ${{ steps.select.outputs.shard_matrix }}
+      ci-changed: ${{ steps.select.outputs.ci_changed }}
+      trusted-sha: ${{ steps.select.outputs.trusted_sha }}
+      # 'true' when the th:utext guard ran in this job from a trusted (base) copy; otherwise gates runs it.
+      forbid-in-plan: ${{ steps.select.outputs.forbid_in_plan }}
+    steps:
+      # A pull_request checkout is the merge commit (parents: base tip, PR head). Depth 2 is exactly
+      # enough to diff it against its base parent; other events need only the tip.
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+          fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 1 }}
 
+      - name: Set up Java 21
+        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4.8.0
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # No Gradle and no project compile here: the selector is JDK-only and select-tests.sh builds
+      # it with javac (a second or two), from the BASE parent's copy on pull requests.
+      - name: Select tests
+        id: select
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          FULL_CI_LABEL: ${{ github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'full-ci') }}
+          HEAD_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # Selector outputs live OUTSIDE the PR tree (a committed build/ci* symlink must not redirect a write).
+          export CI_OUT_DIR="$RUNNER_TEMP/ci-out" PROJECT_ROOT="$GITHUB_WORKSPACE"
+          trusted="$GITHUB_WORKSPACE"      # tree whose script + selector decide; the PR tree itself except on PRs
+          trusted_sha="$HEAD_COMMIT"
+          infra=""
+          forbid_script="$GITHUB_WORKSPACE/scripts/forbid_th_utext_in_email.sh"   # non-PR events: the pushed/dispatched ref itself
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            read -r -a parents <<<"$(git rev-list --parents -n 1 HEAD)"
+            [[ ${#parents[@]} -eq 3 ]] || { echo "::error::pull_request checkout is not a merge commit"; exit 1; }
+            base_sha=${parents[1]}
+            # CI-infrastructure guard, deliberately NOT part of the selector: computed from the git
+            # diff in plain shell so no edit to selector/rules/script can switch it off.
+            # Everything SelectorRules treats as ALWAYS_FULL that can alter HOW tests run (build wiring,
+            # test resources, shared test bases/support/config, docker). Kept in step with
+            # SelectorRules + .github/CODEOWNERS by CiInfraCoverageTest. -z + quotepath=false: NUL-separated
+            # raw paths, so non-ASCII file names are matched instead of arriving as "\320\260..." octal.
+            infra_re='^(\.github/|scripts/ci/|scripts/forbid_th_utext_in_email\.sh$|src/test/java/com/beautica/ci/|build\.gradle\.kts$|settings\.gradle\.kts$|gradle\.properties$|gradle/|gradlew|docker/|Dockerfile|src/test/resources/|src/test/java/com/beautica/([^/]+\.java$|(.*/)?Abstract[^/]*\.java$|(.*/)?support/|(.*/)?[^/]*Support\.java$|(.*/)?Test[^/]*Config[^/]*\.java$))'
+            infra=$(git -c core.quotepath=false diff -z --no-renames --name-only "$base_sha" HEAD \
+              | grep -zE "$infra_re" | tr '\0' '\n' || true)
+            if git cat-file -e "$base_sha:scripts/ci/select-tests.sh" 2>/dev/null; then
+              trusted="$RUNNER_TEMP/trusted"; trusted_sha="$base_sha"
+              mkdir -p "$trusted"
+              extract=(scripts/ci src/test/java/com/beautica/ci)
+              forbid_script=""
+              if git cat-file -e "$base_sha:scripts/forbid_th_utext_in_email.sh" 2>/dev/null; then
+                extract+=(scripts/forbid_th_utext_in_email.sh)
+                forbid_script="$trusted/scripts/forbid_th_utext_in_email.sh"
+              fi
+              git archive "$base_sha" "${extract[@]}" | tar -x -C "$trusted"
+              if [[ -n "$forbid_script" ]]; then
+                # The guard resolves the templates relative to ITS OWN location: point that at the PR's
+                # templates (data only; grep never executes them).
+                mkdir -p "$trusted/src/main/resources/templates"
+                ln -s "$GITHUB_WORKSPACE/src/main/resources/templates/email" "$trusted/src/main/resources/templates/email"
+              fi
+            else
+              forbid_script=""
+              # Bootstrap: the base has no selector yet (the PR introducing it). Nothing to trust, so
+              # use the PR tree and force a full run.
+              infra="${infra:-bootstrap: base has no scripts/ci}"
+            fi
+          fi
+          if [[ "$EVENT_NAME" != "pull_request" ]]; then
+            "$trusted/scripts/ci/select-tests.sh" --force-full "full run: $EVENT_NAME"
+          elif [[ -n "$infra" ]]; then
+            # The self-test job runs com.beautica.ci.* on this path; do not run it a second time in the shards.
+            EXCLUDE_PREFIX=com.beautica.ci. "$trusted/scripts/ci/select-tests.sh" \
+              --force-full "CI infrastructure changed: $(head -1 <<<"$infra")" true
+          elif [[ "$FULL_CI_LABEL" == "true" ]]; then
+            "$trusted/scripts/ci/select-tests.sh" --force-full "full run: label full-ci"
+          else
+            # BASE_SHA..HEAD is exactly what the test jobs check out and run (the merge commit).
+            BASE_SHA="$base_sha" HEAD_SHA="$(git rev-parse HEAD)" "$trusted/scripts/ci/select-tests.sh"
+          fi
+          # selection.env is KEY=VALUE per line (REASON is single-line); publish as lower-case outputs.
+          while IFS='=' read -r key value; do
+            echo "${key,,}=$value" >> "$GITHUB_OUTPUT"
+          done < "$RUNNER_TEMP/ci-out/selection.env"
+          echo "trusted_sha=$trusted_sha" >> "$GITHUB_OUTPUT"
+          echo "forbid_script=$forbid_script" >> "$GITHUB_OUTPUT"
+          if [[ -n "$forbid_script" ]]; then echo "forbid_in_plan=true" >> "$GITHUB_OUTPUT"; else echo "forbid_in_plan=false" >> "$GITHUB_OUTPUT"; fi
+
+      # Phase 25.6 — email is the one place in this app that renders free-text user input
+      # (booking notes). th:utext bypasses Thymeleaf's HTML escaping; this gate fails the build if it is
+      # ever introduced under templates/email/. Runs the BASE copy of the script (see TRUST MODEL), and only
+      # after "Select tests", so no PR-owned code has executed in this job before the selection decision.
+      - name: Forbid th:utext in email templates (trusted copy)
+        env:
+          FORBID_SCRIPT: ${{ steps.select.outputs.forbid_script }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$FORBID_SCRIPT" ]]; then
+            echo "::warning::base has no scripts/forbid_th_utext_in_email.sh (bootstrap): skipped in plan, the gates job runs the PR copy"
+            exit 0
+          fi
+          bash "$FORBID_SCRIPT"
+
+      - name: Summarise selection
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          source "$RUNNER_TEMP/ci-out/selection.env"
+          # REASON and the class list can carry PR-controlled path names: drop markdown/HTML
+          # metacharacters and non-printables, cap the length, and show them in a code span.
+          reason_safe=$(printf '%s' "$REASON" | tr -d '`<>&' | tr -c '[:print:]' ' ' | cut -c1-300)
+          {
+            echo "## Test selection"
+            echo
+            echo "- Mode: **$MODE**"
+            echo "- Reason: \`$reason_safe\`"
+            echo "- Test classes: $COUNT of $TOTAL, in $SHARDS shard(s), shard weights: ${SHARD_WEIGHTS:-n/a}"
+            echo
+            echo "<details><summary>Selected test classes</summary>"
+            echo
+            echo '```'
+            tr -d '`<>&' < "$RUNNER_TEMP/ci-out/selected-tests.txt"
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload selection
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: selection
+          path: ${{ runner.temp }}/ci-out/
+          retention-days: 7
+
+  gates:
+    name: Gates
+    needs: plan
+    # Nothing to compile when no test class is affected; ci-gate does not require this job then.
+    if: needs.plan.outputs.mode != 'none'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout code
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      # The compile gate and the full build live here (not in plan, not twice): they are skipped
+      # when nothing test-relevant changed.
+      - name: Set up Java 21
+        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4.8.0
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@748248ddd2a24f49513d8f472f81c3a07d4d50e1 # v4.4.4
+        with:
+          # Only dev/main runs write the shared Gradle cache; PRs read it (dev is not the default
+          # branch, so the action's own default would leave dev's cache cold).
+          cache-read-only: ${{ github.ref != 'refs/heads/dev' && github.ref != 'refs/heads/main' }}
+
+      # Bootstrap only (plan had no trusted copy of the script). The PR copy is safe to run here: this job
+      # decides nothing, a failure can only turn the gate red.
+      - name: Forbid th:utext in email templates (PR copy, bootstrap)
+        if: needs.plan.outputs.forbid-in-plan != 'true'
+        run: bash ./scripts/forbid_th_utext_in_email.sh
+
+      - name: Compile and build
+        run: ./gradlew compileJava compileTestJava build -x test
+        env:
+          JWT_SECRET: ${{ env.CI_DUMMY_JWT_SECRET }}
+
+  selector-self-test:
+    name: Selector self-test
+    needs: plan
+    # Only when CI infrastructure changed (the plan forces mode=full then; this job adds the
+    # fail-loud falsification and is the only run of com.beautica.ci.*, excluded from the shards).
+    if: needs.plan.outputs.ci-changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
 
       - name: Set up Java 21
         uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4.8.0
@@ -59,82 +315,342 @@ jobs:
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@748248ddd2a24f49513d8f472f81c3a07d4d50e1 # v4.4.4
+        with:
+          cache-read-only: ${{ github.ref != 'refs/heads/dev' && github.ref != 'refs/heads/main' }}
 
-      # Phase 25.6 — email is the one place in this app that renders free-text user input
-      # (booking notes). th:utext bypasses Thymeleaf's HTML escaping; this gate fails the
-      # build immediately if it is ever introduced under templates/email/.
-      - name: Forbid th:utext in email templates
-        run: ./scripts/forbid_th_utext_in_email.sh
-
-      # Fast fail: compile main + test sources before the heavier build/test
-      # steps. This is the explicit compile half of the regression gate and
-      # surfaces a broken build in seconds rather than after the full suite.
-      - name: Compile (gate)
-        run: ./gradlew compileJava compileTestJava
+      - name: Run selector tests
+        run: ./gradlew test --tests "com.beautica.ci.*"
         env:
           JWT_SECRET: ${{ env.CI_DUMMY_JWT_SECRET }}
 
-      - name: Build
-        run: ./gradlew build -x test
-        env:
-          JWT_SECRET: ${{ env.CI_DUMMY_JWT_SECRET }}
+      - name: verify-selected-ran.sh accepts classes that ran
+        run: |
+          printf '%s\n' com.beautica.ci.AffectedTestSelectorTest com.beautica.ci.TestShardingTest > "$RUNNER_TEMP/real.txt"
+          ./scripts/ci/verify-selected-ran.sh "$RUNNER_TEMP/real.txt"
+
+      - name: verify-selected-ran.sh rejects a class that did not run
+        run: |
+          printf '%s\n' com.beautica.DoesNotExistTest > "$RUNNER_TEMP/bogus.txt"
+          if ./scripts/ci/verify-selected-ran.sh "$RUNNER_TEMP/bogus.txt"; then
+            echo "::error::verify-selected-ran.sh accepted a class that never ran"
+            exit 1
+          fi
+
+      # A selected class whose every test was skipped/@Disabled has a report with tests > 0 but ran nothing.
+      - name: verify-selected-ran.sh rejects all-skipped, accepts partly-skipped
+        run: |
+          set -euo pipefail
+          d="$RUNNER_TEMP/skipfix"; mkdir -p "$d"
+          printf '%s\n' '<testsuite name="a.AllSkipped" tests="3" skipped="3" failures="0" errors="0">' > "$d/TEST-a.AllSkipped.xml"
+          printf '%s\n' '<testsuite name="a.PartSkipped" tests="3" skipped="1" failures="0" errors="0">' > "$d/TEST-a.PartSkipped.xml"
+          echo a.AllSkipped > "$RUNNER_TEMP/allskipped.txt"
+          echo a.PartSkipped > "$RUNNER_TEMP/partskipped.txt"
+          if ./scripts/ci/verify-selected-ran.sh "$RUNNER_TEMP/allskipped.txt" "$d"; then
+            echo "::error::verify-selected-ran.sh accepted an all-skipped class"
+            exit 1
+          fi
+          ./scripts/ci/verify-selected-ran.sh "$RUNNER_TEMP/partskipped.txt" "$d"
+
+      # mode full|selective always selects >= 1 class, so an empty list means the selector broke.
+      - name: verify-selected-ran.sh rejects an empty selection list
+        run: |
+          : > "$RUNNER_TEMP/empty.txt"
+          if ./scripts/ci/verify-selected-ran.sh "$RUNNER_TEMP/empty.txt" "$RUNNER_TEMP"; then
+            echo "::error::verify-selected-ran.sh accepted an empty selection list"
+            exit 1
+          fi
+
+  test:
+    name: Test (shard ${{ matrix.shard }})
+    needs: plan
+    if: needs.plan.outputs.mode == 'full' || needs.plan.outputs.mode == 'selective'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # Separate runners = separate Docker hosts: no shared-Postgres "too many clients".
+        shard: ${{ fromJSON(needs.plan.outputs.shards || '[0]') }}
+    steps:
+      # Default checkout = the merge commit, the same tree plan diffed (HEAD^1..HEAD).
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Java 21
+        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4.8.0
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # Each shard compiles for itself: Gradle's up-to-date state cannot be transplanted between
+      # runners, and org.gradle.caching=true plus a dev-written cache already restores unchanged
+      # compile outputs. The per-shard compile runs in parallel, so it costs runner-minutes, not wall clock.
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@748248ddd2a24f49513d8f472f81c3a07d4d50e1 # v4.4.4
+        with:
+          cache-read-only: ${{ github.ref != 'refs/heads/dev' && github.ref != 'refs/heads/main' }}
+
+      - name: Download selection
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: selection
+          path: ${{ runner.temp }}/ci-out
 
       - name: Run tests
-        run: ./gradlew test -PtestLogLevel=INFO -PtestRootLogLevel=INFO
         env:
           JWT_SECRET: ${{ env.CI_DUMMY_JWT_SECRET }}
+          SHARD: ${{ matrix.shard }}
+          RUN_REASON: ${{ inputs.reason }}
+        run: |
+          set -euo pipefail
+          list="$RUNNER_TEMP/ci-out/shard-${SHARD}.txt"
+          if [[ ! -s "$list" ]]; then
+            echo "Shard $SHARD has no test classes; nothing to run."
+            exit 0
+          fi
+          args=(test -PtestLogLevel=INFO -PtestRootLogLevel=INFO "-PtestSelection=$list")
+          # Nightly is the safety net: re-execute everything instead of replaying cached results.
+          if [[ "$RUN_REASON" == "nightly" ]]; then args+=(--rerun); fi
+          ./gradlew "${args[@]}"
 
-      - name: Publish test results
-        uses: dorny/test-reporter@31a54ee7ebcacc03a09ea97a7e5465a47b84aea5 # v1.9.1
-        if: always()
-        with:
-          name: JUnit Tests
-          path: build/test-results/test/**/*.xml
-          reporter: java-junit
-          fail-on-error: false
-
-      - name: Upload test reports
+      - name: Upload test results
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: test-reports
+          name: test-results-${{ matrix.shard }}
+          path: build/test-results/test/*.xml
+          retention-days: 7
+          if-no-files-found: ignore
+
+      # HTML reports are only useful for a red shard.
+      - name: Upload test reports
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: test-reports-${{ matrix.shard }}
           path: build/reports/tests/
           retention-days: 7
+          if-no-files-found: ignore
 
-      # ────────────────────────────────────────────────────────────────────
-      # OpenAPI contract artifact (mobile contract-drift source)
-      #
-      # The mobile client (beautica-mobile) is code-generated from this
-      # backend's SpringDoc spec. To let a mobile contract-drift job consume a
-      # known-good spec we want to publish the serialized OpenAPI JSON here as
-      # a build artifact.
-      #
-      # NOT WIRED AS A FULL IN-CI EXPORT — and intentionally so:
-      #   The spec is served at runtime from /api-docs by the live Spring
-      #   context. Serializing it in CI means *booting the app*, which under
-      #   the `test` profile requires a real PostgreSQL (Testcontainers
-      #   supplies it only during `./gradlew test`, not for a standalone
-      #   `bootRun`) plus R2 / Firebase / SMTP placeholders. The `prod`
-      #   profile additionally sets `springdoc.api-docs.enabled: false`, so the
-      #   deployed instance does not expose it either. Standing all of that up
-      #   purely to dump a JSON file is the kind of heavy boot the task scope
-      #   explicitly asks us to avoid.
-      #
-      # HOW THE MOBILE SIDE SHOULD FETCH THE SPEC (current contract):
-      #   1. Run the backend locally with the `local` profile
-      #      (`./gradlew bootRun --args='--spring.profiles.active=local'`),
-      #      which keeps `springdoc.api-docs.enabled: true`.
-      #   2. Fetch the serialized spec:
-      #         curl -fsS http://localhost:8080/api-docs > openapi.json
-      #      (Swagger UI lives at http://localhost:8080/swagger-ui.html.)
-      #   3. Feed openapi.json to the mobile OpenAPI-codegen client
-      #      (see beautica-backend/openapi_generator_config.json).
-      #
-      # TODO(contract-drift): When a dedicated spec-export is justified, add a
-      #   `springdoc-openapi-gradle-plugin` `generateOpenApiDocs` task here,
-      #   backed by a `services: postgres` container + the `local`/`test`
-      #   profile, and upload the resulting openapi.json as an artifact named
-      #   `openapi-spec`. The mobile contract-drift job then downloads that
-      #   artifact instead of pointing at a running backend. Tracked so the
-      #   mobile client never silently drifts from the backend contract.
-      # ────────────────────────────────────────────────────────────────────
+  # Least privilege: read-only token, and the script comes from the BASE (trusted-sha), never the PR
+  # tree. Gradle's failOnNoMatchingTests only fails when the WHOLE filter matches nothing, so prove,
+  # across all shards, that each selected class produced a report with tests > 0.
+  verify:
+    name: Verify selection ran
+    needs: [plan, test]
+    if: always() && (needs.plan.outputs.mode == 'full' || needs.plan.outputs.mode == 'selective')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout trusted scripts
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ needs.plan.outputs.trusted-sha }}
+          sparse-checkout: scripts/ci
+          persist-credentials: false
+
+      - name: Download selection
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: selection
+          path: ${{ runner.temp }}/ci-out
+
+      - name: Download shard results
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: test-results-*
+          path: build/merged-results
+          merge-multiple: true
+
+      - name: Verify every selected class executed
+        run: |
+          ./scripts/ci/verify-selected-ran.sh "$RUNNER_TEMP/ci-out/selected-tests.txt" build/merged-results "$RUNNER_TEMP/ci-out/report-aliases.txt"
+          echo "Executed test-class reports: $(find build/merged-results -name '*.xml' | wc -l)" >> "$GITHUB_STEP_SUMMARY"
+
+  # Holds the write scope, so it runs NO repository scripts and checks out NO pull-request code: it
+  # downloads artifacts and hands them to the pinned reporter action. The trusted (base) checkout
+  # is sparse and exists only because the reporter lists tracked files with `git ls-files`.
+  report:
+    name: Report
+    needs: [plan, test]
+    if: always() && (needs.plan.outputs.mode == 'full' || needs.plan.outputs.mode == 'selective')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      checks: write
+      contents: read
+    steps:
+      - name: Checkout trusted tree (no PR code)
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ needs.plan.outputs.trusted-sha }}
+          sparse-checkout: src/test/java
+          persist-credentials: false
+
+      - name: Download shard results
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: test-results-*
+          path: build/merged-results
+          merge-multiple: true
+
+      - name: Publish test results
+        uses: dorny/test-reporter@31a54ee7ebcacc03a09ea97a7e5465a47b84aea5 # v1.9.1
+        with:
+          name: JUnit Tests
+          path: build/merged-results/*.xml
+          reporter: java-junit
+          fail-on-error: false
+
+  ci-gate:
+    name: CI Gate
+    needs: [plan, gates, selector-self-test, test, verify]
+    if: always()
+    runs-on: ubuntu-latest
+    # Normally seconds; an irrelevant-label event waits for the real run it mirrors.
+    timeout-minutes: 90
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      # An irrelevant label must neither restart the pipeline nor report a bare green: it reports
+      # whatever the real run for the same head SHA concludes (and waits for it if still running).
+      - name: Mirror the real run (irrelevant label)
+        if: github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name != 'full-ci'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          # The real run is found by its constant run-name prefix "pr-<number> " (built from event data, never
+          # the author-controlled PR title) AND head sha AND the PR number GitHub attaches to the run.
+          # pull_requests[] is empty for fork PRs, which is accepted: the run-name already carries the number.
+          # shellcheck disable=SC2016  # $pr is a jq variable, not shell
+          real_filter='.workflow_runs | map(select(
+              (.path | startswith(".github/workflows/pr-validate.yml"))
+              and (.display_title | startswith("pr-" + $pr + " "))
+              and ((.pull_requests | length) == 0 or (.pull_requests | map(.number | tostring) | index($pr) != null))
+            )) | sort_by(.created_at) | last // empty'
+          run_json=""
+          # The real run is normally already queued; poll ~2 min before giving up.
+          for _ in $(seq 1 20); do
+            run_json=$(gh api "repos/$GH_REPO/actions/runs?event=pull_request&head_sha=$HEAD_SHA&per_page=50" 2>/dev/null \
+              | jq -c --arg pr "$PR" "$real_filter" || true)
+            [[ -n "$run_json" ]] && break
+            sleep 6
+          done
+          [[ -n "$run_json" ]] || { echo "::error::no real pr-validate run (pr-$PR) found for $HEAD_SHA after 2 min"; exit 1; }
+          id=$(jq -r .id <<<"$run_json")
+          created=$(jq -r .created_at <<<"$run_json")
+          echo "Mirroring run $id"
+          status=$(jq -r .status <<<"$run_json")
+          # Already finished (the common case after a quick label): report immediately, no waiting runner.
+          if [[ "$status" != "completed" ]]; then
+            gh run watch "$id" --interval 30 >/dev/null || true
+          fi
+          conclusion=$(gh api "repos/$GH_REPO/actions/runs/$id" --jq .conclusion)
+          echo "Real run $id concluded: $conclusion"
+          case "$conclusion" in
+            success) ;;
+            cancelled)
+              # A newer push cancels this SHA's run. The newer run (a different head sha) is the one to look at.
+              newer=$(gh api "repos/$GH_REPO/actions/runs?event=pull_request&branch=$HEAD_REF&per_page=50" \
+                | jq --arg pr "$PR" --arg sha "$HEAD_SHA" --arg created "$created" \
+                  '[.workflow_runs[] | select((.display_title | startswith("pr-" + $pr + " ")) and .head_sha != $sha and .created_at > $created)] | length')
+              if [[ "$newer" -gt 0 ]]; then
+                echo "::error::the real run for $HEAD_SHA was cancelled because a newer commit was pushed to PR $PR; this label event belongs to a superseded SHA. Check the newer run."
+              else
+                echo "::error::the real run for $HEAD_SHA was cancelled (no newer run found); re-run it."
+              fi
+              exit 1 ;;
+            *) echo "::error::the real run for $HEAD_SHA concluded '$conclusion'"; exit 1 ;;
+          esac
+
+      # The single required check. `skipped` is fine ONLY where the plan says the job was not
+      # needed; a failed `plan` makes every dependent skip, which must not read as green. Unknown or
+      # inconsistent plan output fails closed.
+      - name: Aggregate results
+        if: github.event_name != 'pull_request' || github.event.action != 'labeled' || github.event.label.name == 'full-ci'
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          fail=0
+          result() { jq -r --arg k "$1" '.[$k].result' <<<"$NEEDS"; }
+          mode=$(jq -r '.plan.outputs.mode // ""' <<<"$NEEDS")
+          count=$(jq -r '.plan.outputs.count // ""' <<<"$NEEDS")
+          ci_changed=$(jq -r '.plan.outputs["ci-changed"] // ""' <<<"$NEEDS")
+          echo "plan=$(result plan) mode=${mode:-?} count=${count:-?} gates=$(result gates) self-test=$(result selector-self-test) test=$(result test) verify=$(result verify)"
+
+          require_success() { [[ "$(result "$1")" == "success" ]] || { echo "::error::$1 must succeed (got $(result "$1"))"; fail=1; }; }
+          require_success plan
+          # `report` is deliberately not a need: it only publishes a check, it decides nothing.
+          case "$mode" in
+            full | selective) require_success gates; require_success test; require_success verify
+              [[ "$count" =~ ^[1-9][0-9]*$ ]] || { echo "::error::mode=$mode needs a positive class count (got '$count')"; fail=1; } ;;
+            none)
+              [[ "$count" == "0" ]] || { echo "::error::mode=none needs count=0 (got '$count')"; fail=1; } ;;
+            *) echo "::error::unknown mode '$mode'"; fail=1 ;;
+          esac
+          # Only pull requests may be anything but a full run; CI-infra changes are always full.
+          if [[ "$EVENT_NAME" != "pull_request" && "$mode" != "full" ]]; then
+            echo "::error::$EVENT_NAME run must be mode=full (got '$mode')"; fail=1
+          fi
+          if [[ "$ci_changed" == "true" ]]; then
+            require_success selector-self-test
+            [[ "$mode" == "full" ]] || { echo "::error::CI infrastructure changed but mode=$mode"; fail=1; }
+          fi
+
+          for job in $(jq -r 'keys[]' <<<"$NEEDS"); do
+            case "$(result "$job")" in
+              failure|cancelled) echo "::error::$job finished as $(result "$job")"; fail=1 ;;
+            esac
+          done
+          exit "$fail"
+
+
+# ────────────────────────────────────────────────────────────────────
+# OpenAPI contract artifact (mobile contract-drift source)
+#
+# The mobile client (beautica-mobile) is code-generated from this
+# backend's SpringDoc spec. To let a mobile contract-drift job consume a
+# known-good spec we want to publish the serialized OpenAPI JSON here as
+# a build artifact.
+#
+# NOT WIRED AS A FULL IN-CI EXPORT — and intentionally so:
+#   The spec is served at runtime from /api-docs by the live Spring
+#   context. Serializing it in CI means *booting the app*, which under
+#   the `test` profile requires a real PostgreSQL (Testcontainers
+#   supplies it only during `./gradlew test`, not for a standalone
+#   `bootRun`) plus R2 / Firebase / SMTP placeholders. The `prod`
+#   profile additionally sets `springdoc.api-docs.enabled: false`, so the
+#   deployed instance does not expose it either. Standing all of that up
+#   purely to dump a JSON file is the kind of heavy boot the task scope
+#   explicitly asks us to avoid.
+#
+# HOW THE MOBILE SIDE SHOULD FETCH THE SPEC (current contract):
+#   1. Run the backend locally with the `local` profile
+#      (`./gradlew bootRun --args='--spring.profiles.active=local'`),
+#      which keeps `springdoc.api-docs.enabled: true`.
+#   2. Fetch the serialized spec:
+#         curl -fsS http://localhost:8080/api-docs > openapi.json
+#      (Swagger UI lives at http://localhost:8080/swagger-ui.html.)
+#   3. Feed openapi.json to the mobile OpenAPI-codegen client
+#      (see beautica-backend/openapi_generator_config.json).
+#
+# TODO(contract-drift): When a dedicated spec-export is justified, add a
+#   `springdoc-openapi-gradle-plugin` `generateOpenApiDocs` task here,
+#   backed by a `services: postgres` container + the `local`/`test`
+#   profile, and upload the resulting openapi.json as an artifact named
+#   `openapi-spec`. The mobile contract-drift job then downloads that
+#   artifact instead of pointing at a running backend. Tracked so the
+#   mobile client never silently drifts from the backend contract.
+# ────────────────────────────────────────────────────────────────────

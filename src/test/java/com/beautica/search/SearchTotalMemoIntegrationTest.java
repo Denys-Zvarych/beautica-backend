@@ -1,5 +1,6 @@
 package com.beautica.search;
 
+import com.beautica.support.BookableMasterSeeder;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.search.dto.LocationFilter;
 import com.beautica.search.dto.MasterSearchRequest;
@@ -270,6 +271,8 @@ class SearchTotalMemoIntegrationTest extends AbstractIntegrationTest {
                     "INSERT INTO masters (id, user_id, master_type, avg_rating, review_count, is_active, created_at, updated_at) "
                             + "VALUES (?, ?, 'INDEPENDENT_MASTER', 4.5, 1, true, NOW(), NOW())",
                     masterId, masterUserId);
+            // Discoverable only with a service + hours (MasterBookabilitySql, 2026-10-05).
+            BookableMasterSeeder.makeIndependentBookable(jdbcTemplate, masterId);
         }
     }
 
@@ -292,6 +295,8 @@ class SearchTotalMemoIntegrationTest extends AbstractIntegrationTest {
                     "INSERT INTO salons (id, owner_id, name, city, city_id, is_active, created_at, updated_at) "
                             + "VALUES (?, ?, ?, ?, ?, true, NOW(), NOW())",
                     salonId, ownerId, "MemoSalon-" + salonId, city, cityId);
+            // A salon is discoverable only with >=1 bookable master (MasterBookabilitySql).
+            BookableMasterSeeder.addBookableSalonMaster(jdbcTemplate, salonId);
         }
     }
 }

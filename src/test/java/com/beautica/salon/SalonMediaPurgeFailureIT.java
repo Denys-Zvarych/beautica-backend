@@ -88,7 +88,7 @@ class SalonMediaPurgeFailureIT extends AbstractIntegrationTest {
                 salonId, ownerId, "Salon-" + salonId, testCityId());
 
         doThrow(new RuntimeException("simulated media-purge failure"))
-                .when(mediaService).deleteBySalon(any(), any(), any(), anyList());
+                .when(mediaService).deleteBySalon(any(), anyList(), anyList());
 
         assertThatCode(() -> salonService.deactivateSalon(ownerId, salonId))
                 .as("purgeSalonMediaAfterCommit wraps the whole afterCommit body in try/catch — "

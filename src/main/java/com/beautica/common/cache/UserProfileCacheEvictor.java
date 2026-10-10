@@ -34,7 +34,7 @@ import java.util.UUID;
  *       {@code masters} row, because each flips {@code hasMasterProfile}:
  *       {@code createMasterForIndependentUser}, {@code createMasterFromInvite},
  *       {@code createMasterForOwner} (both the create and the reactivate branch),
- *       {@code deactivateOwnerMaster}, {@code deactivateMaster}.</li>
+ *       {@code deactivateMaster}.</li>
  *   <li>{@code SalonService#createSalon} — syncs the owner's locality columns onto their
  *       {@code users} row, and on first-salon registration auto-creates the owner-master row.</li>
  *   <li>{@code SalonService#removeAdmin} / {@code #rotateAdmin} — mutate {@code users.salon_id},
@@ -48,13 +48,16 @@ import java.util.UUID;
  *       path ever set {@code User.isActive = false} (see {@code UserRepository
  *       .findBySalonIdAndRoleAndIsActiveTrue}'s javadoc for the sibling gap this same phase
  *       closed).</li>
+ *   <li>{@code MediaService#uploadAvatar} / {@code #deleteAvatar} (Phase 344) — write
+ *       {@code users.avatar_url}, which {@code UserProfileResponse.avatarUrl} surfaces. Account
+ *       self-delete also clears it, but the row is gone, so it is not a writer of a live entry.</li>
  * </ul>
  *
  * <p><b>Deliberately NOT writers</b>, each verified against the field list on
  * {@code UserProfileResponse} rather than assumed:
  * <ul>
- *   <li>Avatar / media writes ({@code User#setAvatarUrl}, {@code #setAvatarR2Key}) — neither field
- *       appears on {@code UserProfileResponse}; the avatar is served by the media endpoints.</li>
+ *   <li>{@code User#setAvatarR2Key} — the storage key is not on the DTO (its sibling
+ *       {@code avatarUrl} is; see the writer list above).</li>
  *   <li>Password reset and session invalidation ({@code User#setTokensValidAfter},
  *       {@code #setPasswordHash}, every {@code passwordReset*} / {@code verificationCode*}
  *       column) — none is on the DTO, and several are secrets that must never be.</li>

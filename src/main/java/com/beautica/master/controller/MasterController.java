@@ -73,8 +73,8 @@ public class MasterController {
      * The authenticated provider's own master profile.
      *
      * <p><b>Phase 265 — {@code SALON_OWNER} added to the role gate.</b> An owner who has opted in
-     * as a master (the «Я також працюю як майстер» toggle, backed by
-     * {@code POST/DELETE /api/v1/salons/{salonId}/master}) owns a {@code Master} row with
+     * as a master (since Phase 346 every owner of a live salon: the row is created with the
+     * salon and is permanent) owns a {@code Master} row with
      * {@code masterType = SALON_OWNER}, and
      * {@link MasterService#getMyMasterDetail(UUID)} already resolves it through
      * {@code masterRepository.findActiveByUserIdWithUserAndSalon(userId)} — a finder with NO
@@ -482,8 +482,9 @@ public class MasterController {
      * self-service route to update bio, phone, or Instagram handle.
      *
      * <p>Delegates to {@link UserService#updateMasterProfile} — the same service
-     * method used by the independent master path. The service has no internal role
-     * assertion blocking {@code SALON_MASTER}, and sharing the implementation is
+     * method used by the independent master path. The service carries a union role
+     * backstop ({@link UserService#MASTER_PROFILE_WRITE_ROLES}: INDEPENDENT_MASTER, SALON_MASTER,
+     * SALON_OWNER) that admits {@code SALON_MASTER} and rejects every other role, and sharing the implementation is
      * intentional: the DB columns written ({@code phone_number}, {@code bio},
      * {@code instagram}) are role-agnostic.
      *
