@@ -180,7 +180,28 @@ tasks.withType<Test> {
     // buys several chances to release memory across the suite without paying for
     // a cold Spring context boot on every single test class.
     maxHeapSize = "3g"
-    forkEvery = 100
+    // -PtestForkEvery=N overrides for tuning; default unchanged. A CI shard holds ~220 classes (a third
+    // of the suite), so 100 gives 3 JVMs per shard: the same restart density (one per ~100 classes)
+    // the 397-class sizing above was chosen for. Shards are weight-balanced, so the class COUNT per
+    // shard varies, but the heavy classes that actually pressure memory are spread evenly across them.
+    forkEvery = (project.findProperty("testForkEvery") as String?)?.toLong() ?: 100
+
+    // Phase 359/360 selective + sharded CI: `-PtestSelection=<file>` restricts the run to the test
+    // classes (one FQN per line) the affected-test selector emitted (scripts/ci/select-tests.sh).
+    // Each FQN also matches its JUnit @Nested classes (`Outer$Inner`), which Gradle reports as
+    // separate classes. failOnNoMatchingTests only fires when NOTHING matches, so CI additionally
+    // runs scripts/ci/verify-selected-ran.sh. Without the property behaviour is unchanged.
+    (project.findProperty("testSelection") as String?)?.let { selectionFile ->
+        val selected = file(selectionFile).readLines().map { it.trim() }.filter { it.isNotEmpty() }
+        require(selected.isNotEmpty()) { "-PtestSelection=$selectionFile lists no test classes" }
+        filter {
+            selected.forEach { fqn ->
+                includeTestsMatching(fqn)
+                includeTestsMatching("$fqn\$*")
+            }
+            isFailOnNoMatchingTests = true
+        }
+    }
 
     val testLogLevel = (project.findProperty("testLogLevel") as String?) ?: "TRACE"
     val testRootLogLevel = (project.findProperty("testRootLogLevel") as String?) ?: "INFO"

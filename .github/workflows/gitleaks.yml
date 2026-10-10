@@ -44,6 +44,8 @@ jobs:
           # fetch-depth: 0 pulls the ENTIRE history so the scheduled deep scan
           # and the PR/push diff range both have every commit available.
           fetch-depth: 0
+          # No authenticated git after checkout (scan is local-only).
+          persist-credentials: false
 
       - name: Gitleaks
         uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7  # v2.3.x — keep updated via Dependabot

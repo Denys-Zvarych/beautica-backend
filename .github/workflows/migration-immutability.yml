@@ -33,6 +33,7 @@ jobs:
           # REQUIRED: full history so the three-dot merge-base diff
           # ("$BASE_SHA...HEAD") can resolve. Do not lower this.
           fetch-depth: 0
+          persist-credentials: false
 
       # Event-aware base-revision resolution. This is the ONLY place
       # event type is interpreted; the gate step (and its hermetic
@@ -533,6 +534,7 @@ jobs:
           # ("$BASE_SHA...HEAD") and "git ls-tree $BASE_SHA" can resolve.
           # Do not lower this.
           fetch-depth: 0
+          persist-credentials: false
 
       # Event-aware base-revision resolution. This is the ONLY place
       # event type is interpreted; the gate step (and its hermetic
@@ -1318,6 +1320,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
 
       - name: Assert every SHARED block is byte-identical across gate and mirror
         run: |
