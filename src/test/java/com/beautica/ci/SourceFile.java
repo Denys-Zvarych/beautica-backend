@@ -18,6 +18,8 @@ record SourceFile(String path, boolean test, String pkg, String simpleName, Stri
     private static final Pattern TEST_ANNOTATION = Pattern.compile(
         "(?m)^\\s*@(?:Test|ParameterizedTest|RepeatedTest|TestFactory|TestTemplate|Nested)\\b");
 
+    private static final Pattern NESTED = Pattern.compile("(?m)^\\s*@Nested\\b");
+
     private static final Pattern COMMENTS = Pattern.compile("/\\*.*?\\*/|^[ \\t]*//[^\\n]*", Pattern.DOTALL | Pattern.MULTILINE);
 
     static SourceFile parse(String path, String body) {
@@ -83,6 +85,18 @@ record SourceFile(String path, boolean test, String pkg, String simpleName, Stri
         }
         boolean named = simpleName.endsWith("Test") || simpleName.endsWith("IT") || simpleName.endsWith("Tests");
         return named || TEST_ANNOTATION.matcher(body).find();
+    }
+
+    /** True when the class declares a JUnit {@code @Nested} inner class (Gradle reports those under THIS class, not a subclass). */
+    boolean declaresNested() {
+        return NESTED.matcher(codeWithoutComments()).find();
+    }
+
+    /** The (possibly qualified) name after {@code extends} on the top-level class declaration, or null. */
+    String superclassName() {
+        Matcher m = Pattern.compile("\\bclass\\s+" + simpleName + "\\b(?:\\s*<[^{]*?>)?\\s+extends\\s+([\\w.]+)")
+            .matcher(codeWithoutComments());
+        return m.find() ? m.group(1) : null;
     }
 
     private static List<String> parseImports(String body) {

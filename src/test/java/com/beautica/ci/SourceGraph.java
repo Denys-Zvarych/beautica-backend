@@ -70,6 +70,42 @@ final class SourceGraph {
         return path == null ? null : files.get(path);
     }
 
+    /**
+     * Superclasses of {@code fqn} (nearest first, same repo only) that declare {@code @Nested} inner
+     * classes. JUnit/Gradle report those inner classes under the DECLARING class
+     * ({@code TEST-<ancestor>$Inner.xml}), so a subclass without direct tests gets only an empty stub report.
+     */
+    List<String> nestedAncestors(String fqn) {
+        List<String> out = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        SourceFile current = fileByFqn(fqn);
+        while (current != null && seen.add(current.path())) {
+            SourceFile parent = superclassOf(current);
+            if (parent != null && parent.declaresNested()) {
+                out.add(parent.fqn());
+            }
+            current = parent;
+        }
+        return out;
+    }
+
+    private SourceFile superclassOf(SourceFile f) {
+        String name = f.superclassName();
+        if (name == null) {
+            return null;
+        }
+        if (name.contains(".")) {
+            return fileByFqn(name);
+        }
+        for (String imp : f.imports()) {
+            String candidate = imp.endsWith(".*") ? imp.substring(0, imp.length() - 1) + name : imp;
+            if (candidate.endsWith("." + name) && fileByFqn(candidate) != null) {
+                return fileByFqn(candidate);
+            }
+        }
+        return fileByFqn(f.pkg().isEmpty() ? name : f.pkg() + "." + name);
+    }
+
     List<SourceFile> filesOfPackage(String pkg) {
         return byPackage.getOrDefault(pkg, List.of());
     }

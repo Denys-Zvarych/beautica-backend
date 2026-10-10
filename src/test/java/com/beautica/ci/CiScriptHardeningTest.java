@@ -226,4 +226,69 @@ class CiScriptHardeningTest {
 
         assertThat(r.exit()).isZero();
     }
+
+    private static final Path VERIFY = REPO.resolve("scripts/ci/verify-selected-ran.sh");
+    private static final String LEGACY = "com.beautica.booking.LegacyShapeIT";
+    private static final String BASE = "com.beautica.booking.AbstractShapeIT";
+
+    private static final String RAN = "<testsuite name=\"%s\" tests=\"3\" skipped=\"%d\" failures=\"0\" errors=\"0\">\n";
+
+    /** Results dir shaped like Gradle's for a base-declared @Nested: the base reports, the subclass has a 0-test stub. */
+    private Path nestedResults(int skipped) throws IOException {
+        Path results = Files.createDirectories(tmp.resolve("results"));
+        Files.writeString(results.resolve("TEST-" + LEGACY + ".xml"), RAN.formatted(LEGACY, 0).replace("tests=\"3\"", "tests=\"0\""));
+        Files.writeString(results.resolve("TEST-" + BASE + "$Reads.xml"), RAN.formatted(BASE + "$Reads", skipped));
+        return results;
+    }
+
+    private Path selection(String aliasLines) throws IOException {
+        Path dir = Files.createDirectories(tmp.resolve("selection"));
+        Files.writeString(dir.resolve("selected-tests.txt"), LEGACY + "\n");
+        if (aliasLines != null) {
+            Files.writeString(dir.resolve("report-aliases.txt"), aliasLines);
+        }
+        return dir;
+    }
+
+    @Test
+    void should_passVerify_when_baseDeclaredNestedReportedAndAliasListed() throws Exception {
+        Path results = nestedResults(0);
+        Path dir = selection(LEGACY + "\t" + BASE + "\n");
+
+        Result r = run(tmp, Map.of(), List.of(), "bash", VERIFY.toString(), dir.resolve("selected-tests.txt").toString(), results.toString());
+
+        assertThat(r.exit()).as(r.output()).isZero();
+    }
+
+    @Test
+    void should_failVerify_when_baseDeclaredNestedReportedButNoAlias() throws Exception {
+        Path results = nestedResults(0);
+        Path dir = selection(null);
+
+        Result r = run(tmp, Map.of(), List.of(), "bash", VERIFY.toString(), dir.resolve("selected-tests.txt").toString(), results.toString());
+
+        assertThat(r.exit()).isEqualTo(1);
+        assertThat(r.output()).contains("NOT EXECUTED: " + LEGACY);
+    }
+
+    @Test
+    void should_failVerify_when_aliasListedButBaseReportsAllSkipped() throws Exception {
+        Path results = nestedResults(3);
+        Path dir = selection(LEGACY + "\t" + BASE + "\n");
+
+        Result r = run(tmp, Map.of(), List.of(), "bash", VERIFY.toString(), dir.resolve("selected-tests.txt").toString(), results.toString());
+
+        assertThat(r.exit()).isEqualTo(1);
+    }
+
+    @Test
+    void should_honourExplicitAliasArgument_when_passedAsThirdParameter() throws Exception {
+        Path results = nestedResults(0);
+        Path dir = selection(null);
+        Path aliases = Files.writeString(tmp.resolve("elsewhere.txt"), LEGACY + "\t" + BASE + "\n");
+
+        Result r = run(tmp, Map.of(), List.of(), "bash", VERIFY.toString(), dir.resolve("selected-tests.txt").toString(), results.toString(), aliases.toString());
+
+        assertThat(r.exit()).as(r.output()).isZero();
+    }
 }

@@ -468,7 +468,7 @@ jobs:
 
       - name: Verify every selected class executed
         run: |
-          ./scripts/ci/verify-selected-ran.sh "$RUNNER_TEMP/ci-out/selected-tests.txt" build/merged-results
+          ./scripts/ci/verify-selected-ran.sh "$RUNNER_TEMP/ci-out/selected-tests.txt" build/merged-results "$RUNNER_TEMP/ci-out/report-aliases.txt"
           echo "Executed test-class reports: $(find build/merged-results -name '*.xml' | wc -l)" >> "$GITHUB_STEP_SUMMARY"
 
   # Holds the write scope, so it runs NO repository scripts and checks out NO pull-request code: it

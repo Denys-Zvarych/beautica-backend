@@ -9,6 +9,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Random;
 import java.util.Set;
+import java.util.function.Function;
 import java.util.function.ToIntFunction;
 import org.junit.jupiter.api.Test;
 
@@ -121,5 +122,51 @@ class TestShardingTest {
     @Test
     void should_rejectNonPositiveShardCount_when_split() {
         assertThatThrownBy(() -> TestSharder.split(List.of("a.BTest"), BY_NAME, 0)).isInstanceOf(IllegalArgumentException.class);
+    }
+
+    private static final String BASE = "com.beautica.nest.AbstractShapeIT";
+
+    private static List<String> nestedAncestors(String fqn) {
+        return fqn.contains("ShapeIT") ? List.of(BASE) : List.of();
+    }
+
+    @Test
+    void should_keepNestedFamilyInOneShard_when_subclassesShareAncestor() {
+        List<String> suite = new ArrayList<>(List.of("com.beautica.nest.LegacyShapeIT", "com.beautica.nest.VisitShapeIT"));
+        for (int i = 0; i < 9; i++) {
+            suite.add("com.beautica.slow.S" + i + "IT");
+        }
+
+        for (int shards = 2; shards <= 5; shards++) {
+            List<List<String>> split = TestSharder.split(suite, BY_NAME, shards, TestShardingTest::nestedAncestors);
+
+            long withFamily = split.stream().filter(s -> s.contains("com.beautica.nest.LegacyShapeIT") || s.contains("com.beautica.nest.VisitShapeIT")).count();
+            assertThat(withFamily).as("shards=" + shards).isEqualTo(1L);
+            assertThat(split.stream().flatMap(List::stream)).hasSize(suite.size());
+        }
+    }
+
+    @Test
+    void should_splitFamily_when_noAncestorInformationIsGiven() {
+        List<String> suite = List.of("com.beautica.nest.LegacyShapeIT", "com.beautica.nest.VisitShapeIT");
+
+        List<List<String>> split = TestSharder.split(suite, BY_NAME, 2);
+
+        assertThat(split.stream().filter(s -> !s.isEmpty()).count()).isEqualTo(2L);
+    }
+
+    @Test
+    void should_mergeFamilies_when_classesShareOnlyOneOfTwoAncestors() {
+        List<String> suite = List.of("a.XIT", "a.YIT", "a.ZIT", "a.WIT");
+        Function<String, List<String>> ancestors = fqn -> switch (fqn) {
+            case "a.XIT" -> List.of("a.B1");
+            case "a.YIT" -> List.of("a.B1", "a.B2");
+            case "a.ZIT" -> List.of("a.B2");
+            default -> List.of();
+        };
+
+        List<List<String>> split = TestSharder.split(suite, BY_NAME, 2, ancestors);
+
+        assertThat(split).containsExactlyInAnyOrder(List.of("a.XIT", "a.YIT", "a.ZIT"), List.of("a.WIT"));
     }
 }

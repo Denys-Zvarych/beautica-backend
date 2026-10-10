@@ -25,7 +25,8 @@ import java.util.regex.Pattern;
  * --all                 emit every concrete test class instead of computing a selection
  * --list FILE           emit the FQNs listed in FILE instead of computing a selection
  * --shard I/N           keep only shard I of N of the emitted list
- * --shards N --out-dir D  write selected-tests.txt and shard-0..N-1.txt into D (weight-balanced, see TestSharder)
+ * --shards N --out-dir D  write selected-tests.txt, report-aliases.txt and shard-0..N-1.txt into D
+ *                       (weight-balanced, see TestSharder; classes sharing a @Nested-declaring ancestor stay in one shard)
  * --exclude PREFIX      drop FQNs starting with PREFIX from every emitted list (repeatable)
  * --out FILE            write the (sharded) FQN list to FILE
  * </pre>
@@ -83,6 +84,18 @@ public final class AffectedTestSelector {
             return SelectorRules.HEAVY_TEST_WEIGHT;
         }
         return WEB_MVC_TEST.matcher(file.body()).find() ? SelectorRules.SLICE_TEST_WEIGHT : SelectorRules.LIGHT_TEST_WEIGHT;
+    }
+
+    /** Superclasses of {@code fqn} declaring {@code @Nested} classes: their reports are filed under the ancestor's name. */
+    List<String> nestedAncestorsOf(String fqn) {
+        return graph.nestedAncestors(fqn);
+    }
+
+    /** Lines {@code <selectedFqn>\t<ancestorFqn>} for the report-aliases.txt sidecar, sorted. */
+    List<String> reportAliases(List<String> selected) {
+        return selected.stream().distinct().sorted()
+            .flatMap(fqn -> nestedAncestorsOf(fqn).stream().map(ancestor -> fqn + "\t" + ancestor))
+            .toList();
     }
 
     List<String> allTestClasses() {
@@ -208,7 +221,7 @@ public final class AffectedTestSelector {
             .toList();
         List<String> tests = all;
         if (cli.shardIndex >= 0) {
-            tests = TestSharder.split(all, selector::weightOf, cli.shardCount).get(cli.shardIndex);
+            tests = TestSharder.split(all, selector::weightOf, cli.shardCount, selector::nestedAncestorsOf).get(cli.shardIndex);
         }
         String shardWeights = null;
         if (cli.out != null) {
@@ -218,7 +231,8 @@ public final class AffectedTestSelector {
         if (cli.outDir != null) {
             Files.createDirectories(cli.outDir);
             Files.write(cli.outDir.resolve("selected-tests.txt"), all);
-            List<List<String>> shards = TestSharder.split(all, selector::weightOf, cli.shards);
+            Files.write(cli.outDir.resolve("report-aliases.txt"), selector.reportAliases(all));
+            List<List<String>> shards = TestSharder.split(all, selector::weightOf, cli.shards, selector::nestedAncestorsOf);
             for (int i = 0; i < shards.size(); i++) {
                 Files.write(cli.outDir.resolve("shard-" + i + ".txt"), shards.get(i));
             }

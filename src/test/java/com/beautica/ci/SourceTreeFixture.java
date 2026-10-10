@@ -37,6 +37,16 @@ final class SourceTreeFixture {
         return test(fqn, List.of(), "", "");
     }
 
+    /** A test class with a custom header: {@code extendsClause} (e.g. {@code "extends Base"}) and body text verbatim. */
+    SourceTreeFixture subclassTest(String fqn, List<String> imports, String extendsClause, String body) {
+        int dot = fqn.lastIndexOf('.');
+        StringBuilder sb = new StringBuilder("package ").append(fqn, 0, dot).append(";\n");
+        imports.forEach(i -> sb.append("import ").append(i).append(";\n"));
+        sb.append("class ").append(fqn.substring(dot + 1)).append(' ').append(extendsClause).append(" {\n").append(body).append("\n}\n");
+        files.put(testPath(fqn), sb.toString());
+        return this;
+    }
+
     SourceTreeFixture abstractTest(String fqn, List<String> imports, String refs) {
         files.put(testPath(fqn), source(fqn, imports, "", "abstract class", refs));
         return this;

@@ -566,6 +566,77 @@ class AffectedTestSelectorTest {
             .isInstanceOf(IllegalArgumentException.class);
     }
 
+    private static final String NESTED_BASE = "com.beautica.nest.AbstractShapeIT";
+
+    /** Abstract base declaring @Nested; Legacy has no direct test, Visit has one; Plain extends a base WITHOUT @Nested. */
+    private static SourceTreeFixture nestedFamilyTree() {
+        SourceTreeFixture tree = new SourceTreeFixture()
+            .abstractTest(NESTED_BASE, List.of(), "@Nested\nclass Reads { @Test void r() { } }")
+            .abstractTest("com.beautica.nest.AbstractPlainIT", List.of(), "")
+            .subclassTest("com.beautica.nest.LegacyShapeIT", List.of(), "extends AbstractShapeIT", "")
+            .subclassTest("com.beautica.nest.VisitShapeIT", List.of(), "extends AbstractShapeIT", "@Test void own() { }")
+            .subclassTest("com.beautica.nest.PlainIT", List.of(), "extends AbstractPlainIT", "@Test void own() { }");
+        tree.files().put(SourceTreeFixture.testPath("com.beautica.other.MidIT"),
+            "package com.beautica.other;\nimport " + NESTED_BASE + ";\nabstract class MidIT extends AbstractShapeIT { }\n");
+        tree.subclassTest("com.beautica.other.DeepIT", List.of(), "extends MidIT", "");
+        return tree;
+    }
+
+    @Test
+    void should_emitAliasToNestedDeclaringBase_when_subclassHasNoDirectTests() {
+        AffectedTestSelector selector = new AffectedTestSelector(nestedFamilyTree().graph(), p -> Optional.empty());
+
+        List<String> aliases = selector.reportAliases(selector.allTestClasses());
+
+        assertThat(aliases).containsExactly(
+            "com.beautica.nest.LegacyShapeIT\t" + NESTED_BASE,
+            "com.beautica.nest.VisitShapeIT\t" + NESTED_BASE,
+            "com.beautica.other.DeepIT\t" + NESTED_BASE);
+    }
+
+    @Test
+    void should_emitAliasThroughIntermediateAbstractClass_when_importedBaseIsTwoLevelsUp() {
+        SourceTreeFixture tree = nestedFamilyTree();
+        tree.files().put(SourceTreeFixture.testPath("com.beautica.other.DeepIT"),
+            "package com.beautica.other;\nclass DeepIT extends MidIT { }\n");
+        AffectedTestSelector selector = new AffectedTestSelector(tree.graph(), p -> Optional.empty());
+
+        assertThat(selector.reportAliases(List.of("com.beautica.other.DeepIT")))
+            .containsExactly("com.beautica.other.DeepIT\t" + NESTED_BASE);
+    }
+
+    @Test
+    void should_writeAliasSidecarAndKeepFamilyInOneShard_when_cliGetsOutDir(@TempDir Path root) throws IOException {
+        nestedFamilyTree().files().forEach((path, body) -> {
+            try {
+                write(root, path, body);
+            } catch (IOException e) {
+                throw new java.io.UncheckedIOException(e);
+            }
+        });
+        Path outDir = root.resolve("out");
+
+        runCli("--root", root.toString(), "--all", "--shards", "3", "--out-dir", outDir.toString());
+
+        assertThat(Files.readAllLines(outDir.resolve("report-aliases.txt"))).contains(
+            "com.beautica.nest.LegacyShapeIT\t" + NESTED_BASE, "com.beautica.nest.VisitShapeIT\t" + NESTED_BASE);
+        for (int i = 0; i < 3; i++) {
+            List<String> shard = Files.readAllLines(outDir.resolve("shard-" + i + ".txt"));
+            assertThat(shard.contains("com.beautica.nest.LegacyShapeIT")).isEqualTo(shard.contains("com.beautica.nest.VisitShapeIT"));
+            assertThat(shard.contains("com.beautica.nest.LegacyShapeIT")).isEqualTo(shard.contains("com.beautica.other.DeepIT"));
+        }
+    }
+
+    @Test
+    void should_writeEmptyAliasFile_when_noClassInheritsNested(@TempDir Path root) throws IOException {
+        write(root, SourceTreeFixture.testPath("com.beautica.a.ATest"), "package com.beautica.a;\nclass ATest { @Test void t() { } }\n");
+        Path outDir = root.resolve("out");
+
+        runCli("--root", root.toString(), "--all", "--shards", "1", "--out-dir", outDir.toString());
+
+        assertThat(Files.readAllLines(outDir.resolve("report-aliases.txt"))).isEmpty();
+    }
+
     private static Path write(Path root, String rel, String body) throws IOException {
         Path file = root.resolve(rel);
         Files.createDirectories(file.getParent());

@@ -10,6 +10,8 @@
 # Writes (OUT_DIR; CI_OUT_DIR in CI, which MUST be outside the checked-out PR tree; local default build/ci):
 #   selection.env       MODE / REASON / COUNT / TOTAL / SHARDS / SHARD_MATRIX (non-empty shards only) / CI_CHANGED / SHARD_WEIGHTS
 #   selected-tests.txt  FQNs to run (every test class when MODE=full)
+#   report-aliases.txt  `<selectedFqn><TAB><ancestorFqn>`: test classes whose @Nested reports are filed under an abstract
+#                       ancestor (TEST-<ancestor>$Inner.xml); read by verify-selected-ran.sh. Those families share a shard.
 #   shard-<i>.txt       the same list split into SHARDS weight-balanced shards (TestSharder)
 # MODE=none writes empty lists. Any failure to decide falls back to MODE=full.
 #
@@ -126,7 +128,7 @@ write_env() { # mode reason count total shards ci_changed shard_weights
 decide() {
   local proot=$1 changes=$2 deleted=$3 forced=$4 ci_changed=$5 tmp mode reason count total shards weights
   mkdir -p "$OUT_DIR"
-  rm -f "$OUT_DIR"/shard-*.txt "$OUT_DIR/selected-tests.txt"
+  rm -f "$OUT_DIR"/shard-*.txt "$OUT_DIR/selected-tests.txt" "$OUT_DIR/report-aliases.txt"
   tmp="$OUT_DIR/.first"
   if [[ -n "$forced" ]]; then
     out=$(selector --root "$proot" --all --out "$tmp") || return 1

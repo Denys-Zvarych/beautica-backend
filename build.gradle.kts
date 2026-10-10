@@ -189,8 +189,11 @@ tasks.withType<Test> {
     // Phase 359/360 selective + sharded CI: `-PtestSelection=<file>` restricts the run to the test
     // classes (one FQN per line) the affected-test selector emitted (scripts/ci/select-tests.sh).
     // Each FQN also matches its JUnit @Nested classes (`Outer$Inner`), which Gradle reports as
-    // separate classes. failOnNoMatchingTests only fires when NOTHING matches, so CI additionally
-    // runs scripts/ci/verify-selected-ran.sh. Without the property behaviour is unchanged.
+    // separate classes. Nested classes declared in an abstract base are reported under the BASE
+    // (`TEST-Base$Inner.xml`; the concrete subclass gets a 0-test stub): the selector lists those
+    // subclass -> base pairs in report-aliases.txt and keeps such a family on one shard so report
+    // file names never collide across shards. failOnNoMatchingTests only fires when NOTHING
+    // matches, so CI additionally runs scripts/ci/verify-selected-ran.sh. Without the property behaviour is unchanged.
     (project.findProperty("testSelection") as String?)?.let { selectionFile ->
         val selected = file(selectionFile).readLines().map { it.trim() }.filter { it.isNotEmpty() }
         require(selected.isNotEmpty()) { "-PtestSelection=$selectionFile lists no test classes" }
