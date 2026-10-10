@@ -1166,6 +1166,35 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         }
     }
 
+    @Test
+    @DisplayName("GET /search/masters — Phase 361: bookable SALON_OWNER master absent, INDEPENDENT_MASTER present (predicate u.role = INDEPENDENT_MASTER)")
+    void should_excludeSalonOwnerMaster_when_ownerHasBookableMasterRow() throws Exception {
+        UUID salonId = BookableMasterSeeder.insertSalon(jdbcTemplate, "OwnerMasterSalon-" + UUID.randomUUID());
+        UUID ownerUserId = jdbcTemplate.queryForObject(
+                "SELECT owner_id FROM salons WHERE id = ?", UUID.class, salonId);
+        UUID ownerMasterId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO masters (id, user_id, salon_id, master_type, is_active, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, 'SALON_OWNER', true, NOW(), NOW())",
+                ownerMasterId, ownerUserId, salonId);
+        BookableMasterSeeder.makeBookable(jdbcTemplate, salonId, ownerMasterId);
+        UUID independentId = seedMasterWithCity("Вінниця", "4.10");
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                MASTERS_URL + "?location.cityId=" + majorCityIdByName("Вінниця") + "&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(response.getBody()).path("data");
+        assertThat(data.path("totalElements").asLong())
+                .as("only the INDEPENDENT_MASTER is discoverable; body=%s", response.getBody())
+                .isEqualTo(1L);
+        assertThat(data.path("data").get(0).path("masterId").asText())
+                .as("the single returned master is the independent one, never the owner-master")
+                .isEqualTo(independentId.toString())
+                .isNotEqualTo(ownerMasterId.toString());
+    }
+
     // ── Phase 19.7 — salon price range (decision 5) ───────────────────────────
 
     @Test

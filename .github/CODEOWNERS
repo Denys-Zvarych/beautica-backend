@@ -1,0 +1,23 @@
+# Changes to the regression merge-gate (selector, rules, workflows, build wiring) and to anything that
+# can alter HOW tests execute (test bases/support/config/resources, Gradle wiring, docker) need the owner.
+# Enforced by branch protection "Require review from Code Owners" on dev and main.
+# Keep in step with SelectorRules.ALWAYS_FULL_GLOB_SOURCES and the infra regex in pr-validate.yml:
+# CiInfraCoverageTest fails when a test-affecting glob is not owned here.
+/.github/**                                   @Denys-Zvarych
+/scripts/ci/**                                @Denys-Zvarych
+/scripts/forbid_th_utext_in_email.sh          @Denys-Zvarych
+/.gitleaks*                                   @Denys-Zvarych
+/src/test/java/com/beautica/ci/**             @Denys-Zvarych
+/build.gradle.kts                             @Denys-Zvarych
+/settings.gradle.kts                          @Denys-Zvarych
+/gradle.properties                            @Denys-Zvarych
+/gradle/**                                    @Denys-Zvarych
+/gradlew*                                     @Denys-Zvarych
+/Dockerfile                                   @Denys-Zvarych
+/docker/**                                    @Denys-Zvarych
+/src/test/resources/**                        @Denys-Zvarych
+/src/test/java/com/beautica/*.java            @Denys-Zvarych
+/src/test/java/com/beautica/**/Abstract*.java @Denys-Zvarych
+/src/test/java/com/beautica/**/support/**     @Denys-Zvarych
+/src/test/java/com/beautica/**/*Support.java  @Denys-Zvarych
+/src/test/java/com/beautica/**/Test*Config*.java @Denys-Zvarych
