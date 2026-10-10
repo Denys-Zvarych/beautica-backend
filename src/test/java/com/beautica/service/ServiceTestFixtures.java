@@ -4,7 +4,6 @@ import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.LoginRequest;
 import com.beautica.auth.dto.RegisterIndependentMasterRequest;
 import com.beautica.common.ApiResponse;
-import com.beautica.master.dto.MasterDetailResponse;
 import com.beautica.service.dto.CreateServiceDefinitionRequest;
 import com.beautica.service.entity.PriceType;
 import com.beautica.service.dto.MasterServiceResponse;
@@ -273,19 +272,16 @@ public class ServiceTestFixtures {
     }
 
     /**
-     * Materialises the owner-operated {@code masters} row (the Phase 12.4
-     * {@code POST /salons/{salonId}/master} endpoint) and returns its {@code masters.id}. That
-     * row's {@code salon_id} is the owner's own salon, so it takes the salon bulk-create branch
-     * with no special-casing (Phase 302 D5).
+     * Returns the {@code masters.id} of the salon's owner-operated row. {@code createSalon}
+     * creates that active {@code SALON_OWNER} row with the owner's first salon, and it is
+     * permanent (Phase 346 removed the Phase 12.4 toggle endpoints). Its {@code salon_id} is the
+     * owner's own salon, so it takes the salon bulk-create branch with no special-casing
+     * (Phase 302 D5).
      */
-    UUID enableOwnerAsMaster(String ownerToken, UUID salonId) throws Exception {
-        ResponseEntity<String> resp = restTemplate.exchange(
-                "/api/v1/salons/" + salonId + "/master", HttpMethod.POST,
-                new HttpEntity<>(bearerHeaders(ownerToken)), String.class);
-        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
-        return objectMapper.readValue(
-                resp.getBody(), new TypeReference<ApiResponse<MasterDetailResponse>>() {})
-                .data().masterId();
+    UUID ownerMasterId(UUID salonId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT id FROM masters WHERE salon_id = ? AND master_type = 'SALON_OWNER' AND is_active = true",
+                UUID.class, salonId);
     }
 
     /** Resolves the master row id created when an independent master registers (1:1 with the user). */

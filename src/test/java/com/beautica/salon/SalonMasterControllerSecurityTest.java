@@ -7,7 +7,6 @@ import com.beautica.booking.dto.BookingResponse;
 import com.beautica.booking.dto.CreateBookingRequest;
 import com.beautica.common.ApiResponse;
 import com.beautica.config.TestSecurityConfig;
-import com.beautica.master.dto.MasterDetailResponse;
 import com.beautica.notification.service.NotificationOutboxService;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -36,7 +35,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * Phase 12.7 — negative-only integration tests pinning the authorization boundary on the
- * owner-as-master enable/disable surface.
+ * owner-as-master surface. The enable/disable toggle cases were removed with the endpoints in
+ * Phase 346; {@code OwnerMasterSelfServiceIT} pins that they are gone.
  *
  * <p>Tests use real HTTP through {@link TestRestTemplate} backed by a Testcontainers PostgreSQL
  * instance. All data is inserted via direct JDBC to keep setup fast and to avoid exercising
@@ -51,7 +51,6 @@ class SalonMasterControllerSecurityTest extends AbstractIntegrationTest {
 
     private static final Logger log = LoggerFactory.getLogger(SalonMasterControllerSecurityTest.class);
 
-    private static final String SALON_MASTER_URL = "/api/v1/salons/%s/master";
     private static final String REMOVE_MASTER_URL = "/api/v1/salons/%s/masters/%s";
     private static final String MASTERS_SLOTS_URL = "/api/v1/masters/%s/slots";
     private static final String BOOKINGS_URL = "/api/v1/bookings";
@@ -70,133 +69,19 @@ class SalonMasterControllerSecurityTest extends AbstractIntegrationTest {
     @MockBean
     private NotificationOutboxService notificationOutboxService;
 
-    // ── Test 1: SALON_ADMIN → POST enable → 403 ──────────────────────────────
-
-    @Test
-    @DisplayName("POST /{salonId}/master — 403 when SALON_ADMIN calls enable (role guard blocks before authz)")
-    void should_return403_when_salonAdminCallsEnableOwnerMaster() throws Exception {
-        // Arrange
-        UUID ownerId = insertUser("admin-enable-owner-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
-        UUID salonId = insertSalon(ownerId, "Admin Enable Test Salon");
-        UUID adminId = insertSalonAdminUser("admin-enable-admin-" + System.nanoTime() + "@beautica.test", salonId);
-        String adminToken = loginAndGetToken(
-                jdbcTemplate.queryForObject("SELECT email FROM users WHERE id = ?", String.class, adminId));
-
-        // Act
-        log.debug("Act: POST {} as SALON_ADMIN — role guard must deny with 403", String.format(SALON_MASTER_URL, salonId));
-        ResponseEntity<String> response = restTemplate.exchange(
-                String.format(SALON_MASTER_URL, salonId), HttpMethod.POST,
-                new HttpEntity<>(bearerHeaders(adminToken)),
-                String.class);
-
-        // Assert
-        assertThat(response.getStatusCode())
-                .as("SALON_ADMIN must be denied access to enable owner-master, salonId=%s", salonId)
-                .isEqualTo(HttpStatus.FORBIDDEN);
-    }
-
-    // ── Test 2: SALON_MASTER → POST enable → 403 ─────────────────────────────
-
-    @Test
-    @DisplayName("POST /{salonId}/master — 403 when SALON_MASTER calls enable (role guard blocks before authz)")
-    void should_return403_when_salonMasterCallsEnableOwnerMaster() throws Exception {
-        // Arrange
-        UUID ownerId = insertUser("sm-enable-owner-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
-        UUID salonId = insertSalon(ownerId, "SalonMaster Enable Test Salon");
-        UUID salonMasterUserId = insertSalonMasterUser(
-                "sm-enable-master-" + System.nanoTime() + "@beautica.test", salonId);
-        String masterToken = loginAndGetToken(
-                jdbcTemplate.queryForObject("SELECT email FROM users WHERE id = ?", String.class, salonMasterUserId));
-
-        // Act
-        log.debug("Act: POST {} as SALON_MASTER — role guard must deny with 403", String.format(SALON_MASTER_URL, salonId));
-        ResponseEntity<String> response = restTemplate.exchange(
-                String.format(SALON_MASTER_URL, salonId), HttpMethod.POST,
-                new HttpEntity<>(bearerHeaders(masterToken)),
-                String.class);
-
-        // Assert
-        assertThat(response.getStatusCode())
-                .as("SALON_MASTER must be denied access to enable owner-master, salonId=%s", salonId)
-                .isEqualTo(HttpStatus.FORBIDDEN);
-    }
-
-    // ── Test 3: CLIENT → POST enable → 403 ───────────────────────────────────
-
-    @Test
-    @DisplayName("POST /{salonId}/master — 403 when CLIENT calls enable")
-    void should_return403_when_clientCallsEnableOwnerMaster() throws Exception {
-        // Arrange
-        UUID ownerId = insertUser("client-enable-owner-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
-        UUID salonId = insertSalon(ownerId, "Client Enable Test Salon");
-        UUID clientId = insertUser("client-enable-client-" + System.nanoTime() + "@beautica.test", "CLIENT");
-        String clientToken = loginAndGetToken(
-                jdbcTemplate.queryForObject("SELECT email FROM users WHERE id = ?", String.class, clientId));
-
-        // Act
-        log.debug("Act: POST {} as CLIENT — role guard must deny with 403", String.format(SALON_MASTER_URL, salonId));
-        ResponseEntity<String> response = restTemplate.exchange(
-                String.format(SALON_MASTER_URL, salonId), HttpMethod.POST,
-                new HttpEntity<>(bearerHeaders(clientToken)),
-                String.class);
-
-        // Assert
-        assertThat(response.getStatusCode())
-                .as("CLIENT must be denied access to enable owner-master, salonId=%s", salonId)
-                .isEqualTo(HttpStatus.FORBIDDEN);
-    }
-
-    // ── Test 4: Owner B on Salon A → POST enable → 403 (IDOR pin) ────────────
-
-    @Test
-    @DisplayName("POST /{salonId}/master — 403 when SALON_OWNER of salon B targets salon A (IDOR boundary)")
-    void should_return403_when_ownerBEnablesMasterInSalonOwnedByOwnerA() throws Exception {
-        // Arrange — salon A owned by owner A
-        UUID ownerAId = insertUser("idor-owner-a-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
-        UUID salonAId = insertSalon(ownerAId, "Salon A");
-
-        // Arrange — owner B has their own salon, does NOT own salon A
-        UUID ownerBId = insertUser("idor-owner-b-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
-        insertSalon(ownerBId, "Salon B");
-        String ownerBToken = loginAndGetToken(
-                jdbcTemplate.queryForObject("SELECT email FROM users WHERE id = ?", String.class, ownerBId));
-
-        // Act — owner B targets salon A
-        log.debug("Act: POST {} with Owner B token targeting salon A — canManageSalon must block with 403",
-                String.format(SALON_MASTER_URL, salonAId));
-        ResponseEntity<String> response = restTemplate.exchange(
-                String.format(SALON_MASTER_URL, salonAId), HttpMethod.POST,
-                new HttpEntity<>(bearerHeaders(ownerBToken)),
-                String.class);
-
-        // Assert
-        assertThat(response.getStatusCode())
-                .as("Owner B must not be able to enable owner-master in salon A (IDOR), salonAId=%s", salonAId)
-                .isEqualTo(HttpStatus.FORBIDDEN);
-    }
-
-    // ── Test 5: After enable→disable, GET /{masterId}/slots returns empty list ─
+    // ── Inactive owner-master row → GET /{masterId}/slots returns empty list ──
 
     @Test
     @DisplayName("GET /{masterId}/slots — empty list (not 404) after owner-master is disabled")
     void should_returnEmptySlots_when_ownerMasterIsDisabled() throws Exception {
-        // Arrange — create owner, salon, enable owner-master via API, assign service, add hours
+        // Arrange — owner, salon and an ACTIVE owner-master row via JDBC (Phase 346 removed the
+        // Phase 12.4 enable/disable endpoints this test used to drive), service, hours.
         UUID ownerId = insertUser("slots-owner-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
         UUID salonId = insertSalon(ownerId, "Slots Disabled Test Salon");
-        String ownerToken = loginAndGetToken(
-                jdbcTemplate.queryForObject("SELECT email FROM users WHERE id = ?", String.class, ownerId));
-
-        // Enable the owner-master via the Phase 12.4 endpoint
-        ResponseEntity<String> enableResp = restTemplate.exchange(
-                String.format(SALON_MASTER_URL, salonId), HttpMethod.POST,
-                new HttpEntity<>(bearerHeaders(ownerToken)),
-                String.class);
-        assertThat(enableResp.getStatusCode())
-                .as("enable owner-master must return 200")
-                .isEqualTo(HttpStatus.OK);
-        var enableBody = objectMapper.readValue(enableResp.getBody(),
-                new TypeReference<ApiResponse<MasterDetailResponse>>() {});
-        UUID masterId = enableBody.data().masterId();
+        UUID masterId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO masters (id, user_id, salon_id, master_type, is_active, created_at, updated_at) VALUES (?, ?, ?, 'SALON_OWNER', true, NOW(), NOW())",
+                masterId, ownerId, salonId);
 
         // Insert a service definition and working hours via JDBC (bypassing full booking flow)
         UUID serviceDefId = UUID.randomUUID();
@@ -213,14 +98,8 @@ class SalonMasterControllerSecurityTest extends AbstractIntegrationTest {
                     UUID.randomUUID(), masterId, day);
         }
 
-        // Disable the owner-master via the Phase 12.4 endpoint
-        ResponseEntity<Void> disableResp = restTemplate.exchange(
-                String.format(SALON_MASTER_URL, salonId), HttpMethod.DELETE,
-                new HttpEntity<>(bearerHeaders(ownerToken)),
-                Void.class);
-        assertThat(disableResp.getStatusCode())
-                .as("disable owner-master must return 204")
-                .isEqualTo(HttpStatus.NO_CONTENT);
+        // Deactivate the row out-of-band — the state salon deletion (deactivateMasters) leaves.
+        jdbcTemplate.update("UPDATE masters SET is_active = false WHERE id = ?", masterId);
 
         // Act — fetch slots for tomorrow; master is inactive so no slots should be bookable
         // An authenticated caller is needed because GET /{masterId}/slots requires isAuthenticated()
@@ -322,8 +201,7 @@ class SalonMasterControllerSecurityTest extends AbstractIntegrationTest {
     // ── Phase 297 — DELETE /{salonId}/masters/{masterId} role matrix ─────────
 
     /**
-     * Negative-only role matrix for the Phase 297 single-master-removal endpoint, mirroring
-     * this class's existing coverage of the sibling {@code /{salonId}/master} endpoint above.
+     * Negative-only role matrix for the Phase 297 single-master-removal endpoint.
      * Full business-logic and one HTTP-level IDOR case ({@code masterBelongsToSalon}) live in
      * {@code MasterRemovalIT} — these four pin the {@code @PreAuthorize} expression itself
      * ({@code hasRole('SALON_OWNER') and canManageSalon and masterBelongsToSalon}) independently,

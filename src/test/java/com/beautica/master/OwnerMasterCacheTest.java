@@ -33,7 +33,6 @@ import java.time.LocalDate;
 import java.util.Optional;
 import java.util.UUID;
 
-import com.beautica.common.cache.CacheKeyFixtures;
 import com.beautica.common.cache.UserProfileCacheEvictor;
 import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.PageRequest;
@@ -52,8 +51,12 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
- * Phase 12.7 — unit-style cache test verifying that {@link MasterService#deactivateOwnerMaster}
- * evicts both the {@code master-by-user} and {@code master-calendar} caches after commit.
+ * Phase 12.7 — unit-style cache test verifying that owner-master lifecycle writes evict the
+ * user-keyed and calendar/slot caches after commit. Phase 346 removed
+ * {@code deactivateOwnerMaster} and (audit-fix cycle 1) made {@link MasterService#deactivateMaster}
+ * refuse a SALON_OWNER row with 409, so the ONLY remaining legal deactivation of an owner-master
+ * row is the salon-deletion cascade {@link MasterService#deactivateMasters}; the deactivation
+ * cases drive that path. The refused path is pinned too: a 409 must evict nothing.
  *
  * <p>Modelled exactly after {@link MasterServiceCacheTest}: loads only
  * {@code MasterService} and {@code CacheConfig}, mocks every repository, and wraps each
@@ -81,7 +84,7 @@ import static org.mockito.Mockito.when;
         webEnvironment = SpringBootTest.WebEnvironment.NONE
 )
 @Import(OwnerMasterCacheTest.TransactionConfig.class)
-@DisplayName("MasterService#deactivateOwnerMaster — cache eviction after commit (Phase 12.7)")
+@DisplayName("MasterService owner-master lifecycle — cache eviction after commit (Phase 12.7)")
 class OwnerMasterCacheTest {
 
     @TestConfiguration
@@ -157,8 +160,8 @@ class OwnerMasterCacheTest {
     // ── master-by-user eviction ───────────────────────────────────────────────
 
     @Test
-    @DisplayName("deactivateOwnerMaster evicts the owner's master-by-user cache entry after commit")
-    void should_evictMasterByUserCacheForOwner_when_deactivateOwnerMasterCommits() {
+    @DisplayName("salon-deletion deactivateMasters on the owner-master row evicts the owner's master-by-user cache entry after commit")
+    void should_evictMasterByUserCacheForOwner_when_ownerMasterDeactivationCommits() {
         // Arrange
         Cache masterByUserCache = cacheManager.getCache("master-by-user");
         assertThat(masterByUserCache).isNotNull();
@@ -168,23 +171,23 @@ class OwnerMasterCacheTest {
                 .as("cache entry must be present before deactivation")
                 .isNotNull();
 
-        stubOwnerMasterForDeactivation();
+        Master ownerMaster = stubOwnerMasterForSalonDeletion();
 
         // Act — wrap in transaction so afterCommit() fires synchronously
         transactionTemplate.execute(status -> {
-            masterService.deactivateOwnerMaster(ACTOR_USER_ID, SALON_ID);
+            masterService.deactivateMasters(ACTOR_USER_ID, List.of(ownerMaster), SALON_ID);
             return null;
         });
 
         // Assert
         assertThat(masterByUserCache.get(ACTOR_USER_ID))
-                .as("master-by-user cache entry for the owner must be evicted after deactivateOwnerMaster commits")
+                .as("master-by-user cache entry for the owner must be evicted after deactivateMaster commits")
                 .isNull();
     }
 
     @Test
-    @DisplayName("deactivateOwnerMaster evicts only the owner's entry, leaving other users' entries intact")
-    void should_evictOnlyOwnerEntry_andLeaveOtherUserEntryIntact_when_deactivateOwnerMasterCommits() {
+    @DisplayName("salon-deletion deactivateMasters on the owner-master row evicts only the owner's entry, leaving other users' entries intact")
+    void should_evictOnlyOwnerEntry_andLeaveOtherUserEntryIntact_when_ownerMasterDeactivationCommits() {
         // Arrange
         Cache masterByUserCache = cacheManager.getCache("master-by-user");
         assertThat(masterByUserCache).isNotNull();
@@ -193,11 +196,11 @@ class OwnerMasterCacheTest {
         masterByUserCache.put(ACTOR_USER_ID, "owner-master");
         masterByUserCache.put(otherUserId, "other-master");
 
-        stubOwnerMasterForDeactivation();
+        Master ownerMaster = stubOwnerMasterForSalonDeletion();
 
         // Act
         transactionTemplate.execute(status -> {
-            masterService.deactivateOwnerMaster(ACTOR_USER_ID, SALON_ID);
+            masterService.deactivateMasters(ACTOR_USER_ID, List.of(ownerMaster), SALON_ID);
             return null;
         });
 
@@ -212,52 +215,13 @@ class OwnerMasterCacheTest {
 
     // ── master-detail-by-user eviction (Phase 265) ────────────────────────────
 
-    @Test
-    @DisplayName("deactivateOwnerMaster evicts the owner's master-detail-by-user entry (GET /masters/me) after commit")
-    void should_evictMasterDetailByUserCacheForOwner_when_deactivateOwnerMasterCommits() {
-        // Arrange — this cache backs GET /masters/me, which Phase 265 widened to SALON_OWNER.
-        // Without the eviction an owner who toggles «Я також працюю як майстер» OFF keeps being
-        // served their own master profile for the rest of the 10-minute TTL, while GET /users/me's
-        // hasMasterProfile (derived on read, never cached) already reads false — the two disagree
-        // inside a single screen.
-        Cache detailByUserCache = cacheManager.getCache("master-detail-by-user");
-        assertThat(detailByUserCache)
-                .as("master-detail-by-user must be registered by the real CacheConfig")
-                .isNotNull();
-
-        UUID otherUserId = UUID.randomUUID();
-        detailByUserCache.put(ACTOR_USER_ID, "cached-owner-master-detail");
-        detailByUserCache.put(otherUserId, "unrelated-master-detail");
-
-        stubOwnerMasterForDeactivation();
-
-        // Act — the TransactionTemplate commits synchronously, so afterCommit() runs inline.
-        transactionTemplate.execute(status -> {
-            masterService.deactivateOwnerMaster(ACTOR_USER_ID, SALON_ID);
-            return null;
-        });
-
-        // Assert
-        assertThat(detailByUserCache.get(ACTOR_USER_ID))
-                .as("the deactivated owner's GET /masters/me entry must be gone after commit")
-                .isNull();
-        assertThat(detailByUserCache.get(otherUserId))
-                .as("eviction is per-key — an unrelated provider's entry must survive (§F-6)")
-                .isNotNull();
-    }
-
     /**
-     * Audit fix, finding 3 — {@code deactivateMaster} is the SECOND reachable deactivation path
-     * for an owner-master row: {@code AuthorizationService#canManageMaster} authorizes
-     * {@code MasterType.SALON_OWNER} rows, so {@code DELETE /api/v1/masters/&#123;masterId&#125;}
-     * deactivates the same row the «Я також працюю як майстер» toggle owns. Before the fix only
-     * {@code deactivateOwnerMaster} evicted {@code master-detail-by-user}, so the Phase 265
-     * invariant ("no stale GET /masters/me entry can survive a deactivation") held on one of two
-     * paths — and the no-counterpart claim documented on the reactivation branch of
-     * {@code createMasterForOwner} rested on it.
+     * Phase 265 invariant: no stale GET /masters/me entry can survive a deactivation. Since Phase
+     * 346 (audit-fix cycle 1) the salon-deletion cascade is the only path that still deactivates an
+     * owner-master row, so this is where the invariant must hold.
      */
     @Test
-    @DisplayName("deactivateMaster evicts the master's master-detail-by-user entry (GET /masters/me) after commit")
+    @DisplayName("salon-deletion deactivateMasters evicts the owner's master-detail-by-user entry (GET /masters/me) after commit")
     void should_evictMasterDetailByUserCache_when_deactivateMasterCommits() {
         // Arrange
         Cache detailByUserCache = cacheManager.getCache("master-detail-by-user");
@@ -269,19 +233,19 @@ class OwnerMasterCacheTest {
         detailByUserCache.put(ACTOR_USER_ID, "cached-owner-master-detail");
         detailByUserCache.put(otherUserId, "unrelated-master-detail");
 
-        stubMasterForStaffDeactivation();
+        Master ownerMaster = stubOwnerMasterForSalonDeletion();
 
         // Act — the TransactionTemplate commits synchronously, so afterCommit() runs inline.
         transactionTemplate.execute(status -> {
-            masterService.deactivateMaster(ACTOR_USER_ID, MASTER_ID);
+            masterService.deactivateMasters(ACTOR_USER_ID, List.of(ownerMaster), SALON_ID);
             return null;
         });
 
         // Assert
         assertThat(detailByUserCache.get(ACTOR_USER_ID))
                 .as("the deactivated master's GET /masters/me entry must be gone after commit — "
-                        + "otherwise an owner who deactivated their own master row through "
-                        + "DELETE /masters/{masterId} keeps being served it for the 10-minute TTL")
+                        + "otherwise an owner whose salon was deleted keeps being served their "
+                        + "master profile for the 10-minute TTL")
                 .isNull();
         assertThat(detailByUserCache.get(otherUserId))
                 .as("eviction is per-key — an unrelated provider's entry must survive (§F-6)")
@@ -290,7 +254,7 @@ class OwnerMasterCacheTest {
 
     // ── NEGATIVE CACHING + create/reactivate eviction (audit-fix cycle 2) ─────
     //
-    // These four tests guard the invariant rewritten in MasterService#deactivateOwnerMaster:
+    // These four tests guard the invariant above MasterService#evictUserKeyedMasterCachesAfterCommit:
     // master-detail-by-user memoises the MISS as well as the hit, so eviction is bidirectional and
     // every CREATE and REACTIVATE path must evict — not just the deactivate paths cycle 1 covered.
     // The create side is the half most likely to rot: its failure mode is a 404 on a profile that
@@ -328,8 +292,8 @@ class OwnerMasterCacheTest {
      * THE new invariant, and the one most likely to rot: a REACTIVATION must drop the cached miss.
      *
      * <p>This is the highest-probability key in the whole cache to be holding {@code Optional
-     * .empty()} — the matching toggle-OFF evicted it moments earlier, and any read in the interval
-     * re-cached the miss. Without the evict, an owner who turns «Я також працюю як майстер» back ON
+     * .empty()} — the deactivation evicted it, and any read in the interval re-cached the miss.
+     * Without the evict, an owner whose row is reactivated (a new salon after a deleted one)
      * gets 404 on their own reactivated profile for the rest of the 10-minute TTL while GET
      * /users/me's hasMasterProfile already reads true.
      */
@@ -356,7 +320,7 @@ class OwnerMasterCacheTest {
     }
 
     /**
-     * The CREATE branch of the same method — reached by POST /salons/{salonId}/master when no row
+     * The CREATE branch of the same method — reached by SalonService.createSalon when no row
      * exists at all. Unlike the two registration-time create paths this one is NOT provably a
      * no-op: it is driven by an existing, long-lived owner account whose userId can already hold a
      * cached miss from any earlier GET /masters/me.
@@ -423,57 +387,25 @@ class OwnerMasterCacheTest {
     // the whole risk of caching GET /users/me. These three tests are that guard.
 
     @Test
-    @DisplayName("deactivateOwnerMaster evicts the owner's user-profile entry (GET /users/me) after commit")
-    void should_evictUserProfileCache_when_deactivateOwnerMasterCommits() {
-        // Arrange
-        Cache userProfileCache = cacheManager.getCache(UserProfileCacheEvictor.USER_PROFILE_CACHE);
-        assertThat(userProfileCache)
-                .as("user-profile must be registered by the real CacheConfig")
-                .isNotNull();
-        UUID otherUserId = UUID.randomUUID();
-        userProfileCache.put(ACTOR_USER_ID, "cached-profile-with-hasMasterProfile-true");
-        userProfileCache.put(otherUserId, "unrelated-profile");
-
-        stubOwnerMasterForDeactivation();
-
-        // Act
-        transactionTemplate.execute(status -> {
-            masterService.deactivateOwnerMaster(ACTOR_USER_ID, SALON_ID);
-            return null;
-        });
-
-        // Assert
-        assertThat(userProfileCache.get(ACTOR_USER_ID))
-                .as("toggling «Я також працюю як майстер» OFF flips hasMasterProfile to false; a "
-                        + "surviving entry means GET /users/me keeps claiming the profile exists "
-                        + "for the full 5-minute TTL")
-                .isNull();
-        assertThat(userProfileCache.get(otherUserId))
-                .as("per-key eviction — an unrelated user's profile must survive (§F-6)")
-                .isNotNull();
-    }
-
-    @Test
-    @DisplayName("deactivateMaster evicts the master's user-profile entry (GET /users/me) after commit")
+    @DisplayName("salon-deletion deactivateMasters evicts the owner's user-profile entry (GET /users/me) after commit")
     void should_evictUserProfileCache_when_deactivateMasterCommits() {
-        // Arrange — DELETE /masters/{masterId} reaches owner-master rows too, since
-        // AuthorizationService#canManageMaster authorizes MasterType.SALON_OWNER.
+        // Arrange — salon deletion deactivates the owner-master row, flipping hasMasterProfile.
         Cache userProfileCache = cacheManager.getCache(UserProfileCacheEvictor.USER_PROFILE_CACHE);
         assertThat(userProfileCache).isNotNull();
         userProfileCache.put(ACTOR_USER_ID, "cached-profile-with-hasMasterProfile-true");
 
-        stubMasterForStaffDeactivation();
+        Master ownerMaster = stubOwnerMasterForSalonDeletion();
 
         // Act
         transactionTemplate.execute(status -> {
-            masterService.deactivateMaster(ACTOR_USER_ID, MASTER_ID);
+            masterService.deactivateMasters(ACTOR_USER_ID, List.of(ownerMaster), SALON_ID);
             return null;
         });
 
         // Assert
         assertThat(userProfileCache.get(ACTOR_USER_ID))
-                .as("the second deactivation path must evict user-profile too, or the "
-                        + "cross-aggregate contract holds on only one of the two paths")
+                .as("the salon-deletion deactivation must evict user-profile too, or GET /users/me "
+                        + "keeps reporting hasMasterProfile=true for the TTL")
                 .isNull();
     }
 
@@ -501,8 +433,8 @@ class OwnerMasterCacheTest {
     // ── master-calendar eviction ──────────────────────────────────────────────
 
     @Test
-    @DisplayName("deactivateOwnerMaster clears the master-calendar cache after commit")
-    void should_clearMasterCalendarCache_when_deactivateOwnerMasterCommits() {
+    @DisplayName("salon-deletion deactivateMasters on the owner-master row clears the master-calendar cache after commit")
+    void should_clearMasterCalendarCache_when_ownerMasterDeactivationCommits() {
         // Arrange
         Cache calendarCache = cacheManager.getCache("master-calendar");
         assertThat(calendarCache).isNotNull();
@@ -513,23 +445,23 @@ class OwnerMasterCacheTest {
         // matched the equally-wrong production predicate and so kept a broken eviction green.
         Object calendarKey = populateRealCalendarEntry(MASTER_ID);
 
-        stubOwnerMasterForDeactivation();
+        Master ownerMaster = stubOwnerMasterForSalonDeletion();
 
         // Act — wrap in transaction so afterCommit() fires synchronously
         transactionTemplate.execute(status -> {
-            masterService.deactivateOwnerMaster(ACTOR_USER_ID, SALON_ID);
+            masterService.deactivateMasters(ACTOR_USER_ID, List.of(ownerMaster), SALON_ID);
             return null;
         });
 
         // Assert
         assertThat(calendarCache.get(calendarKey))
-                .as("master-calendar cache must be fully cleared after deactivateOwnerMaster commits")
+                .as("master-calendar cache must be fully cleared after deactivateMaster commits")
                 .isNull();
     }
 
     @Test
-    @DisplayName("deactivateOwnerMaster evicts both master-by-user and master-calendar caches in one commit")
-    void should_evictBothCaches_when_deactivateOwnerMasterCommits() {
+    @DisplayName("salon-deletion deactivateMasters on the owner-master row evicts both master-by-user and master-calendar caches in one commit")
+    void should_evictBothCaches_when_ownerMasterDeactivationCommits() {
         // Arrange
         Cache masterByUserCache = cacheManager.getCache("master-by-user");
         Cache calendarCache = cacheManager.getCache("master-calendar");
@@ -537,60 +469,80 @@ class OwnerMasterCacheTest {
         assertThat(calendarCache).isNotNull();
 
         masterByUserCache.put(ACTOR_USER_ID, "cached-master");
-        // Real proxy again — see should_clearMasterCalendarCache_when_deactivateOwnerMasterCommits.
+        // Real proxy again — see should_clearMasterCalendarCache_when_ownerMasterDeactivationCommits.
         Object calendarKey = populateRealCalendarEntry(MASTER_ID);
 
-        stubOwnerMasterForDeactivation();
+        Master ownerMaster = stubOwnerMasterForSalonDeletion();
 
         // Act
         transactionTemplate.execute(status -> {
-            masterService.deactivateOwnerMaster(ACTOR_USER_ID, SALON_ID);
+            masterService.deactivateMasters(ACTOR_USER_ID, List.of(ownerMaster), SALON_ID);
             return null;
         });
 
         // Assert — both caches must be in a clean state after a single deactivation
         assertThat(masterByUserCache.get(ACTOR_USER_ID))
-                .as("master-by-user entry must be evicted after deactivateOwnerMaster")
+                .as("master-by-user entry must be evicted after deactivateMaster")
                 .isNull();
         assertThat(calendarCache.get(calendarKey))
-                .as("master-calendar must be cleared after deactivateOwnerMaster")
+                .as("master-calendar must be cleared after deactivateMaster")
                 .isNull();
     }
 
     // ── available-slots eviction ──────────────────────────────────────────────
 
     @Test
-    @DisplayName("deactivateOwnerMaster clears the available-slots cache after commit")
-    void should_clearAvailableSlotsCacheAfterCommit_when_deactivateOwnerMasterCommits() {
-        // Arrange
-        Cache availableSlotsCache = cacheManager.getCache("available-slots");
-        assertThat(availableSlotsCache).isNotNull();
-
-        // SlotCalculationService is a @MockBean here (MasterService only calls it, it is not the
-        // subject), so its real @Cacheable proxy is not reachable from this context — the key is
-        // seeded via CacheKeyFixtures.spelKey instead of by hand. That helper is not a guess: it is
-        // pinned against the real SlotCalculationService#getAvailableSlots proxy by
-        // CachePrefixEvictionKeyShapeTest, which asserts Spring's actual key equals its output. This
-        // test therefore covers the WRITE-PATH wiring (does deactivation register a slot eviction at
-        // all), while the key shape itself is proven against ground truth over there.
-        Object slotKey = CacheKeyFixtures.spelKey(MASTER_ID, LocalDate.now(), UUID.randomUUID());
-        availableSlotsCache.put(slotKey, "sentinel-slots-value");
-        assertThat(availableSlotsCache.get(slotKey))
-                .as("sentinel must be present in available-slots cache before deactivation")
-                .isNotNull();
-
-        stubOwnerMasterForDeactivation();
+    @DisplayName("salon-deletion deactivateMasters on the owner-master row sweeps the master's availability caches after commit")
+    void should_evictMasterAvailabilityCachesAfterCommit_when_ownerMasterDeactivationCommits() {
+        // Arrange — deactivateMasters delegates the available-slots sweep to
+        // SlotCalculationService#evictMasterAvailabilityCaches (by master, §F-2), a @MockBean here,
+        // so the wiring is asserted on the delegate; the sweep itself is SlotCalculationService's own
+        // test subject. (The removed deactivateOwnerMaster swept the cache inline instead.)
+        Master ownerMaster = stubOwnerMasterForSalonDeletion();
 
         // Act — wrap in transaction so afterCommit() fires synchronously
         transactionTemplate.execute(status -> {
-            masterService.deactivateOwnerMaster(ACTOR_USER_ID, SALON_ID);
+            masterService.deactivateMasters(ACTOR_USER_ID, List.of(ownerMaster), SALON_ID);
             return null;
         });
 
         // Assert
-        assertThat(availableSlotsCache.get(slotKey))
-                .as("available-slots cache must be fully cleared after deactivateOwnerMaster commits")
-                .isNull();
+        verify(slotCalculationService).evictMasterAvailabilityCaches(MASTER_ID);
+    }
+
+    // ── refused path: DELETE /masters/{masterId} on the owner row (Phase 346 audit-fix cycle 1) ──
+
+    @Test
+    @DisplayName("deactivateMaster on the owner-master row is refused (409) and evicts nothing")
+    void should_throwConflictAndEvictNothing_when_deactivateMasterTargetsOwnerRow() {
+        // Arrange
+        Cache masterByUserCache = cacheManager.getCache("master-by-user");
+        Cache detailByUserCache = cacheManager.getCache("master-detail-by-user");
+        Cache userProfileCache = cacheManager.getCache(UserProfileCacheEvictor.USER_PROFILE_CACHE);
+        assertThat(masterByUserCache).isNotNull();
+        assertThat(detailByUserCache).isNotNull();
+        assertThat(userProfileCache).isNotNull();
+        masterByUserCache.put(ACTOR_USER_ID, "cached-master");
+        detailByUserCache.put(ACTOR_USER_ID, "cached-owner-master-detail");
+        userProfileCache.put(ACTOR_USER_ID, "cached-profile");
+        Master ownerMaster = stubOwnerMasterForSalonDeletion();
+
+        // Act
+        Throwable thrown = org.assertj.core.api.Assertions.catchThrowable(() ->
+                transactionTemplate.execute(status -> {
+                    masterService.deactivateMaster(ACTOR_USER_ID, MASTER_ID);
+                    return null;
+                }));
+
+        // Assert
+        assertThat(thrown)
+                .isInstanceOf(com.beautica.common.exception.BusinessException.class)
+                .hasMessage(MasterService.OWNER_MASTER_NOT_REMOVABLE);
+        verify(ownerMaster, never()).setActive(false);
+        assertThat(masterByUserCache.get(ACTOR_USER_ID)).as("nothing changed — nothing evicted").isNotNull();
+        assertThat(detailByUserCache.get(ACTOR_USER_ID)).isNotNull();
+        assertThat(userProfileCache.get(ACTOR_USER_ID)).isNotNull();
+        verify(slotCalculationService, never()).evictMasterAvailabilityCaches(MASTER_ID);
     }
 
     // ── helper ────────────────────────────────────────────────────────────────
@@ -625,32 +577,19 @@ class OwnerMasterCacheTest {
     }
 
     /**
-     * Stubs the {@link MasterRepository#findByUserId} call that {@code deactivateOwnerMaster}
-     * uses to locate the owner-master row. The returned mock has type {@code SALON_OWNER} and
-     * is associated with {@link #SALON_ID} so the filter chain inside the service method passes.
-     *
-     * <p>{@code master.setActive(false)} is a no-op on the mock; Hibernate dirty-checking is not
-     * exercised here because there is no real JPA session. The purpose of the test is exclusively
-     * to verify the cache eviction callbacks fire after commit.
-     */
-    /**
-     * Stubs the {@link MasterRepository#findByIdWithUserAndSalon} call that the STAFF path
-     * {@code deactivateMaster} uses. The row is typed {@code SALON_OWNER} on purpose: that is
-     * exactly the row {@code AuthorizationService#canManageMaster} lets an owner deactivate
-     * through {@code DELETE /masters/&#123;masterId&#125;}, which is what makes this a second
-     * deactivation path for the Phase 265 toggle rather than a staff-only concern.
+     * The owner's own {@code SALON_OWNER} master row, JOIN-FETCHed with {@code user} exactly as
+     * {@code SalonService}'s salon-deletion cascade hands it to {@link MasterService#deactivateMasters},
+     * plus the two lookups that path's {@code assertCanManageSalonStaff} makes for an owner actor.
      * {@code getUser().getId()} must resolve, since that is the cache key the service evicts by.
+     * Also stubs {@code findByIdWithUserAndSalon} so the refused single-master path can load it.
      */
-    private void stubMasterForStaffDeactivation() {
+    private Master stubOwnerMasterForSalonDeletion() {
         var user = mock(com.beautica.user.User.class);
         when(user.getId()).thenReturn(ACTOR_USER_ID);
 
         var salon = mock(com.beautica.salon.entity.Salon.class);
         when(salon.getId()).thenReturn(SALON_ID);
-        // A SALON_OWNER-type master row's own user IS the salon's owner by construction — same
-        // person, same mock. Phase 290 finding #5's ownership guard (assertCanManageMaster)
-        // checks master.getSalon().getOwner(), so this must be wired for the deactivateMaster
-        // call sites below (actorId == ACTOR_USER_ID) to pass authorization realistically.
+        // A SALON_OWNER-type master row's own user IS the salon's owner by construction.
         when(salon.getOwner()).thenReturn(user);
 
         Master master = mock(Master.class);
@@ -659,12 +598,16 @@ class OwnerMasterCacheTest {
         when(master.getSalon()).thenReturn(salon);
         when(master.getUser()).thenReturn(user);
 
+        when(userRepository.findRoleById(ACTOR_USER_ID))
+                .thenReturn(Optional.of(com.beautica.auth.Role.SALON_OWNER));
+        when(salonRepository.existsByIdAndOwnerId(SALON_ID, ACTOR_USER_ID)).thenReturn(true);
         when(masterRepository.findByIdWithUserAndSalon(MASTER_ID)).thenReturn(Optional.of(master));
+        return master;
     }
 
     /**
-     * An active salon owned by {@link #ACTOR_USER_ID}, as {@code SalonService.createSalon} and the
-     * Phase 12.4 re-enable endpoint pass it: {@code createMasterForOwner} checks
+     * An active salon owned by {@link #ACTOR_USER_ID}, as {@code SalonService.createSalon} passes
+     * it: {@code createMasterForOwner} checks
      * {@code isActive()} and {@code getOwner().getId()} before touching the row.
      */
     private com.beautica.salon.entity.Salon activeOwnedSalon() {
@@ -703,20 +646,6 @@ class OwnerMasterCacheTest {
         when(master.getSalon()).thenReturn(salon);
         when(master.isActive()).thenReturn(false);
 
-        when(masterRepository.findByUserIdWithSalon(ACTOR_USER_ID)).thenReturn(Optional.of(master));
-    }
-
-    private void stubOwnerMasterForDeactivation() {
-        var salon = mock(com.beautica.salon.entity.Salon.class);
-        when(salon.getId()).thenReturn(SALON_ID);
-
-        Master master = mock(Master.class);
-        when(master.getId()).thenReturn(MASTER_ID);
-        when(master.getMasterType()).thenReturn(MasterType.SALON_OWNER);
-        when(master.getSalon()).thenReturn(salon);
-
-        // deactivateOwnerMaster now calls findByUserIdWithSalon (MEDIUM F2 fix) —
-        // stub the new graph method so the filter chain resolves correctly.
         when(masterRepository.findByUserIdWithSalon(ACTOR_USER_ID)).thenReturn(Optional.of(master));
     }
 }

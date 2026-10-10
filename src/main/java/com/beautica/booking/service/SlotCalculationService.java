@@ -523,7 +523,7 @@ public class SlotCalculationService {
 
         // Guard: master must be BOOKABLE to expose any slots. All chained assignments share the same
         // master (they are loaded master-scoped), so the first one's master carries the liveness flag.
-        // deactivateOwnerMaster (and the general deactivateMaster) sets masters.is_active = false
+        // MasterService#deactivateMaster sets masters.is_active = false
         // but leaves master_services rows intact — check the master entity itself here.
         //
         // The salon term (MasterBookability, 2026-08 re-audit LOW) stops a closed salon's master from

@@ -86,7 +86,7 @@ class MasterServiceRotateTest {
     @Mock private org.springframework.context.ApplicationEventPublisher eventPublisher;
 
     // Audit-fix cycle 2: MasterService evicts the affected user's cached profile after commit
-    // (deactivateOwnerMaster, deactivateMaster). @InjectMocks passes null for an UNDECLARED
+    // (deactivateMaster, createMasterForOwner). @InjectMocks passes null for an UNDECLARED
     // collaborator silently — declared so no path here NPEs on a null evictor.
     @Mock private com.beautica.common.cache.UserProfileCacheEvictor userProfileCacheEvictor;
 
@@ -151,7 +151,7 @@ class MasterServiceRotateTest {
         // evicted — it stores the same MasterDetailResponse embedding `salon`.
         verify(masterDetailByUserCache).evict(masterUserId);
         // MEDIUM fix: master-by-user must be evicted on every write path that mutates this row,
-        // mirroring deactivateMaster/deactivateOwnerMaster/createMasterForOwner.
+        // mirroring deactivateMaster/createMasterForOwner.
         verify(masterByUserCache).evict(masterUserId);
         // Mobile Phase 111 — a rotation changes TWO staff sets, so it must publish TWICE: the
         // source salon loses this master's scores, the destination gains them. Verifying only

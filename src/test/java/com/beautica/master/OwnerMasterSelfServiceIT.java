@@ -76,6 +76,10 @@ class OwnerMasterSelfServiceIT extends AbstractIntegrationTest {
     private static final int BAND_DURATION = 90;
     /** {@code GlobalExceptionHandler.handleForbidden} body message for every {@code ForbiddenException}. */
     private static final String FORBIDDEN_MESSAGE = "Access denied";
+    /** {@code GlobalExceptionHandler} body message for every 409 {@code BusinessException}. */
+    private static final String CONFLICT_MESSAGE = "Request could not be completed due to a conflict";
+    /** Phase 346 — what Spring answers for the removed {@code POST/DELETE /salons/{id}/master}. */
+    private static final HttpStatus REMOVED_ENDPOINT_STATUS = HttpStatus.NOT_FOUND;
     private static final UpdateMasterServiceBandRequest BAND_PATCH =
             new UpdateMasterServiceBandRequest(null, null, null, BAND_DURATION, null, null);
     /** Catalogue-level PATCH body: a rename + a new base price (null fields stay untouched). */
@@ -528,6 +532,124 @@ class OwnerMasterSelfServiceIT extends AbstractIntegrationTest {
         assertThat(scheduleSnapshot(owner.masterId()))
                 .as("weekly schedule, its windows, the override and working hours are all untouched")
                 .isEqualTo(before);
+    }
+
+    // ── 9. the owner-master row is permanent (Phase 346) ────────────────────────────────────
+
+    @Test
+    @DisplayName("Phase 346: POST and DELETE /salons/{id}/master are gone — never 2xx, row stays active")
+    void should_notBeRoutable_when_ownerCallsRemovedToggleEndpoints() throws Exception {
+        OwnerSalon owner = registerOwnerWithSalon("toggle-gone");
+        String url = "/api/v1/salons/" + owner.salonId() + "/master";
+
+        ResponseEntity<String> post = exchange(url, HttpMethod.POST, null, owner.token());
+        ResponseEntity<String> delete = exchange(url, HttpMethod.DELETE, null, owner.token());
+
+        assertThat(post.getStatusCode()).as("POST: %s", post.getBody()).isEqualTo(REMOVED_ENDPOINT_STATUS);
+        assertThat(delete.getStatusCode()).as("DELETE: %s", delete.getBody()).isEqualTo(REMOVED_ENDPOINT_STATUS);
+        assertThat(jdbcTemplate.queryForObject("SELECT is_active FROM masters WHERE id = ?",
+                Boolean.class, owner.masterId()))
+                .as("the owner-master row is untouched by either call").isTrue();
+    }
+
+    @Test
+    @DisplayName("Phase 346: DELETE /salons/{id}/masters/{ownerMasterId} is still 409; the row stays active")
+    void should_return409_when_ownerRemovesOwnMasterRow() throws Exception {
+        OwnerSalon owner = registerOwnerWithSalon("remove-own");
+
+        ResponseEntity<String> response = exchange(
+                "/api/v1/salons/" + owner.salonId() + "/masters/" + owner.masterId(),
+                HttpMethod.DELETE, null, owner.token());
+
+        // GlobalExceptionHandler renders every 409 BusinessException with the generic conflict
+        // envelope, so the reworded service message ("The salon owner's master profile cannot be
+        // removed") is pinned in SalonServiceRemoveMasterTest, not over HTTP.
+        assertThat(response.getStatusCode()).as(response.getBody()).isEqualTo(HttpStatus.CONFLICT);
+        assertThat(readBody(response).path("message").asText())
+                .isEqualTo(CONFLICT_MESSAGE);
+        assertThat(jdbcTemplate.queryForObject("SELECT is_active FROM masters WHERE id = ?",
+                Boolean.class, owner.masterId()))
+                .as("the owner-master row stays active").isTrue();
+    }
+
+    @Test
+    @DisplayName("Phase 346 audit-fix: DELETE /masters/{ownerMasterId} by the owner is 409; the row stays "
+            + "active and the owner stays in «Команда»")
+    void should_return409_when_ownerDeactivatesOwnMasterRowViaMastersEndpoint() throws Exception {
+        OwnerSalon owner = registerOwnerWithSalon("deactivate-own");
+
+        ResponseEntity<String> response = exchange(
+                "/api/v1/masters/" + owner.masterId(), HttpMethod.DELETE, null, owner.token());
+
+        assertThat(response.getStatusCode()).as(response.getBody()).isEqualTo(HttpStatus.CONFLICT);
+        assertThat(readBody(response).path("message").asText()).isEqualTo(CONFLICT_MESSAGE);
+        assertThat(jdbcTemplate.queryForObject("SELECT is_active FROM masters WHERE id = ?",
+                Boolean.class, owner.masterId()))
+                .as("the owner is always a master of their salon — no deactivation").isTrue();
+        assertThat(staffMasterIds(owner)).as("«Команда»").contains(owner.masterId().toString());
+    }
+
+    @Test
+    @DisplayName("Phase 346 audit-fix (no regression): DELETE /masters/{invitedSalonMasterId} by the owner "
+            + "still deactivates an invited SALON_MASTER — 204")
+    void should_deactivateInvitedSalonMaster_when_ownerDeletesViaMastersEndpoint() throws Exception {
+        OwnerSalon owner = registerOwnerWithSalon("deactivate-staff");
+        UUID staffMasterId = fixtures.createSalonMaster(owner.salonId());
+
+        ResponseEntity<String> response = exchange(
+                "/api/v1/masters/" + staffMasterId, HttpMethod.DELETE, null, owner.token());
+
+        assertThat(response.getStatusCode()).as(response.getBody()).isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(jdbcTemplate.queryForObject("SELECT is_active FROM masters WHERE id = ?",
+                Boolean.class, staffMasterId))
+                .as("the invited master is deactivated").isFalse();
+    }
+
+    @Test
+    @DisplayName("Phase 346 QA: a SALON_ADMIN of the salon calling DELETE /masters/{ownerMasterId} gets 403 "
+            + "(authorization before the type-revealing 409); the owner row stays active")
+    void should_return403_when_salonAdminDeactivatesOwnerMasterRow() throws Exception {
+        OwnerSalon owner = registerOwnerWithSalon("admin-deactivate-owner");
+        String adminToken = fixtures.createSalonAdminAndGetToken(owner.salonId(),
+                uniqueEmail("admin-deactivate-owner"));
+
+        ResponseEntity<String> response = exchange(
+                "/api/v1/masters/" + owner.masterId(), HttpMethod.DELETE, null, adminToken);
+
+        assertThat(response.getStatusCode()).as(response.getBody()).isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(readBody(response).path("message").asText()).isEqualTo(FORBIDDEN_MESSAGE);
+        assertThat(jdbcTemplate.queryForObject("SELECT is_active FROM masters WHERE id = ?",
+                Boolean.class, owner.masterId()))
+                .as("the admin cannot deactivate the owner's master row").isTrue();
+    }
+
+    @Test
+    @DisplayName("Phase 346 QA: after both owner-row removals are refused (409), the configured owner is "
+            + "still on the client salon page / salon search (warm caches) and a client can still book them")
+    void should_keepOwnerVisibleAndBookable_when_ownerRowRemovalRefused() throws Exception {
+        OwnerSalon owner = registerOwnerWithSalon("refused-still-bookable");
+        UUID assignmentId = configureOwnerMaster(owner);
+        String clientToken = newClient("refused-still-bookable");
+        assertVisibleToClients(owner, clientToken);
+
+        ResponseEntity<String> viaMasters = exchange(
+                "/api/v1/masters/" + owner.masterId(), HttpMethod.DELETE, null, owner.token());
+        ResponseEntity<String> viaSalon = exchange(
+                "/api/v1/salons/" + owner.salonId() + "/masters/" + owner.masterId(),
+                HttpMethod.DELETE, null, owner.token());
+        assertThat(viaMasters.getStatusCode()).as(viaMasters.getBody()).isEqualTo(HttpStatus.CONFLICT);
+        assertThat(viaSalon.getStatusCode()).as(viaSalon.getBody()).isEqualTo(HttpStatus.CONFLICT);
+
+        assertVisibleToClients(owner, clientToken);
+        LocalDate day = LocalDate.now(TimeZones.KYIV).plusDays(DAYS_AHEAD);
+        ResponseEntity<String> booking = exchange("/api/v1/bookings", HttpMethod.POST,
+                new CreateBookingRequest(owner.masterId(), assignmentId,
+                        ZonedDateTime.of(day, CLIENT_SLOT, TimeZones.KYIV), null, null, false),
+                clientToken);
+        assertThat(booking.getStatusCode()).as(booking.getBody()).isEqualTo(HttpStatus.CREATED);
+        assertThat(readBody(booking).path("data").path("masterId").asText())
+                .as("the booking lands on the owner's own master row")
+                .isEqualTo(owner.masterId().toString());
     }
 
     // ── assertions ──────────────────────────────────────────────────────────────────────────

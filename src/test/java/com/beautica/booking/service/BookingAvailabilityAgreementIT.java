@@ -703,7 +703,7 @@ class BookingAvailabilityAgreementIT extends AbstractIntegrationTest {
         UUID svc = addService(m, 60, 0);
         seedInterval(m.masterId(), day, day, day.getDayOfWeek().getValue(),
                 LocalTime.of(9, 0), LocalTime.of(17, 0));
-        // Deactivate the master out-of-band (deactivateOwnerMaster leaves master_services intact).
+        // Deactivate the master out-of-band (deactivateMaster leaves master_services intact).
         jdbcTemplate.update("UPDATE masters SET is_active = false WHERE id = ?", m.masterId());
 
         assertThat(bookableDay(m.masterId(), day, svc))

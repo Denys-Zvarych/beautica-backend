@@ -3,7 +3,6 @@ package com.beautica.service;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.common.ApiResponse;
 import com.beautica.config.TestSecurityConfig;
-import com.beautica.master.dto.MasterDetailResponse;
 import com.beautica.service.dto.AssignServiceToMasterRequest;
 import com.beautica.service.dto.MasterServiceResponse;
 import com.fasterxml.jackson.core.type.TypeReference;
@@ -56,18 +55,11 @@ class OwnerMasterServiceAssignmentTest extends AbstractIntegrationTest {
     // -------------------------------------------------------------------------
 
     /**
-     * Calls the Phase 12.4 endpoint to enable the owner-as-master row for the given salon
-     * and returns the resulting master UUID.
+     * Returns the owner-as-master row {@code createSalon} created with the owner's first salon
+     * (permanent since Phase 346, which removed the Phase 12.4 toggle endpoint).
      */
-    private UUID enableOwnerMaster(String ownerToken, UUID salonId) throws Exception {
-        ResponseEntity<String> resp = restTemplate.exchange(
-                "/api/v1/salons/" + salonId + "/master", HttpMethod.POST,
-                new HttpEntity<>(fixtures.bearerHeaders(ownerToken)),
-                String.class);
-        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
-        var body = objectMapper.readValue(resp.getBody(),
-                new TypeReference<ApiResponse<MasterDetailResponse>>() {});
-        return body.data().masterId();
+    private UUID ownerMasterId(UUID salonId) {
+        return fixtures.ownerMasterId(salonId);
     }
 
     // -------------------------------------------------------------------------
@@ -81,7 +73,7 @@ class OwnerMasterServiceAssignmentTest extends AbstractIntegrationTest {
         String ownerToken = fixtures.createSalonOwnerAndGetToken(
                 "owner-master-assign-" + System.nanoTime() + "@beautica.test");
         UUID salonId = fixtures.createSalon(ownerToken, "Owner Master Salon");
-        UUID masterId = enableOwnerMaster(ownerToken, salonId);
+        UUID masterId = ownerMasterId(salonId);
         UUID serviceDefId = fixtures.createServiceDefinition(ownerToken, salonId, "Haircut");
 
         var assignRequest = new AssignServiceToMasterRequest(serviceDefId, null, null, null, null);
@@ -126,7 +118,7 @@ class OwnerMasterServiceAssignmentTest extends AbstractIntegrationTest {
         String ownerBToken = fixtures.createSalonOwnerAndGetToken(
                 "owner-b-" + System.nanoTime() + "@beautica.test");
         UUID salonBId = fixtures.createSalon(ownerBToken, "Salon B");
-        UUID masterIdInSalonB = enableOwnerMaster(ownerBToken, salonBId);
+        UUID masterIdInSalonB = ownerMasterId(salonBId);
         UUID serviceDefInSalonB = fixtures.createServiceDefinition(ownerBToken, salonBId, "Pedicure");
 
         var assignRequest = new AssignServiceToMasterRequest(serviceDefInSalonB, null, null, null, null);
@@ -151,7 +143,7 @@ class OwnerMasterServiceAssignmentTest extends AbstractIntegrationTest {
         String ownerToken = fixtures.createSalonOwnerAndGetToken(
                 "owner-public-svc-" + System.nanoTime() + "@beautica.test");
         UUID salonId = fixtures.createSalon(ownerToken, "Public Services Salon");
-        UUID masterId = enableOwnerMaster(ownerToken, salonId);
+        UUID masterId = ownerMasterId(salonId);
         UUID serviceDefId = fixtures.createServiceDefinition(ownerToken, salonId, "Threading");
 
         var assignRequest = new AssignServiceToMasterRequest(serviceDefId, null, null, null, null);
@@ -191,7 +183,7 @@ class OwnerMasterServiceAssignmentTest extends AbstractIntegrationTest {
         String ownerToken = fixtures.createSalonOwnerAndGetToken(
                 "owner-dup-assign-" + System.nanoTime() + "@beautica.test");
         UUID salonId = fixtures.createSalon(ownerToken, "Duplicate Assign Salon");
-        UUID masterId = enableOwnerMaster(ownerToken, salonId);
+        UUID masterId = ownerMasterId(salonId);
         UUID serviceDefId = fixtures.createServiceDefinition(ownerToken, salonId, "Waxing");
 
         var assignRequest = new AssignServiceToMasterRequest(serviceDefId, null, null, null, null);
@@ -226,7 +218,7 @@ class OwnerMasterServiceAssignmentTest extends AbstractIntegrationTest {
         String ownerAToken = fixtures.createSalonOwnerAndGetToken(
                 "owner-a-svcdef-" + System.nanoTime() + "@beautica.test");
         UUID salonAId = fixtures.createSalon(ownerAToken, "Salon A SvcDef");
-        UUID masterAId = enableOwnerMaster(ownerAToken, salonAId);
+        UUID masterAId = ownerMasterId(salonAId);
 
         // Arrange — owner B creates a service definition in their own salon
         String ownerBToken = fixtures.createSalonOwnerAndGetToken(
