@@ -31,8 +31,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * {@link MasterRepositoryBookingSlugTest}.
  *
  * <h2>The mutation the {@code isActive} case exists to catch</h2>
- * {@code DELETE /api/v1/salons/&#123;salonId&#125;/master} <em>deactivates</em> the owner-master
- * row rather than hard-deleting it ({@code MasterService#deactivateOwnerMaster} sets
+ * Salon deletion and {@code DELETE /api/v1/masters/&#123;masterId&#125;} <em>deactivate</em> the
+ * owner-master row rather than hard-deleting it ({@code MasterService#deactivateMaster} sets
  * {@code is_active = false}). Rename the finder to {@code existsByUserIdAndMasterType} — i.e. drop
  * the active predicate, leaving mere row existence — and
  * {@link #should_returnFalse_when_ownerMasterRowIsInactive} goes RED while everything else stays

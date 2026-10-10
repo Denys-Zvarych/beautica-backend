@@ -73,8 +73,8 @@ public class MasterController {
      * The authenticated provider's own master profile.
      *
      * <p><b>Phase 265 — {@code SALON_OWNER} added to the role gate.</b> An owner who has opted in
-     * as a master (the «Я також працюю як майстер» toggle, backed by
-     * {@code POST/DELETE /api/v1/salons/{salonId}/master}) owns a {@code Master} row with
+     * as a master (since Phase 346 every owner of a live salon: the row is created with the
+     * salon and is permanent) owns a {@code Master} row with
      * {@code masterType = SALON_OWNER}, and
      * {@link MasterService#getMyMasterDetail(UUID)} already resolves it through
      * {@code masterRepository.findActiveByUserIdWithUserAndSalon(userId)} — a finder with NO

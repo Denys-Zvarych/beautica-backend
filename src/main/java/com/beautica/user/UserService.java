@@ -169,13 +169,12 @@ public class UserService {
     }
 
     /**
-     * The owner-as-master toggle state (Phase 265): {@code true} iff an <em>active</em> master row
-     * of type {@code SALON_OWNER} exists for this user. Derived on every read — the toggle IS that
-     * row, so there is no column to read and no migration in this phase.
+     * {@code true} iff an <em>active</em> master row of type {@code SALON_OWNER} exists for this
+     * user (Phase 265). Derived on every read — there is no column. Since Phase 346 this is always
+     * {@code true} for the owner of a live salon (the owner-master toggle endpoints were removed).
      *
-     * <p>The {@code isActive} predicate is the whole point. {@code DELETE
-     * /api/v1/salons/&#123;salonId&#125;/master} deactivates rather than hard-deletes, so a bare
-     * existence check would report every owner who has ever opted in as permanently opted in.
+     * <p>The {@code isActive} predicate stays: salon deletion ({@code deactivateMasters}) and
+     * {@code DELETE /masters/{masterId}} deactivate rather than hard-delete the row.
      *
      * <p>The role short-circuit ahead of the query is an optimisation that provably cannot change
      * the answer, not a second source of truth: {@code MasterService.createMasterForOwner} is the

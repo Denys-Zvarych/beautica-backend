@@ -291,9 +291,8 @@ class UserServiceTest {
         assertThat(response.hasMasterProfile())
                 .as("the owner-as-master toggle is ON — the flag must echo the active row's existence")
                 .isTrue();
-        // Pins the finder by name and by argument: the SALON-SCOPED sibling
-        // (existsByUserIdAndSalonIdAndMasterTypeAndIsActiveTrue) must never be used here, since
-        // GET /users/me has no path salon and users.salon_id would answer the wrong question.
+        // Pins the finder by name and by argument: a salon-scoped lookup must never be used here,
+        // since GET /users/me has no path salon and users.salon_id would answer the wrong question.
         verify(masterRepository, times(1))
                 .existsByUserIdAndMasterTypeAndIsActiveTrue(userId, MasterType.SALON_OWNER);
     }

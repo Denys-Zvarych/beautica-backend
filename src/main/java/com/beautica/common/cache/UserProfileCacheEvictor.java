@@ -34,7 +34,7 @@ import java.util.UUID;
  *       {@code masters} row, because each flips {@code hasMasterProfile}:
  *       {@code createMasterForIndependentUser}, {@code createMasterFromInvite},
  *       {@code createMasterForOwner} (both the create and the reactivate branch),
- *       {@code deactivateOwnerMaster}, {@code deactivateMaster}.</li>
+ *       {@code deactivateMaster}.</li>
  *   <li>{@code SalonService#createSalon} — syncs the owner's locality columns onto their
  *       {@code users} row, and on first-salon registration auto-creates the owner-master row.</li>
  *   <li>{@code SalonService#removeAdmin} / {@code #rotateAdmin} — mutate {@code users.salon_id},

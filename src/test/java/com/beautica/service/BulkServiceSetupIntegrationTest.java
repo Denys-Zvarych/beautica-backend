@@ -1666,15 +1666,10 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
                 "owner-302-selfmaster-" + System.nanoTime() + "@beautica.test");
         UUID salonId = fixtures.createSalon(ownerToken, "Phase 302 Owner-Master Salon");
 
-        // The Phase 12.4 endpoint that materialises the owner-operated master row. Its salon_id is
-        // the owner's own salon, so master.getSalon() != null and the salon branch applies.
-        ResponseEntity<String> enable = restTemplate.exchange(
-                "/api/v1/salons/" + salonId + "/master", HttpMethod.POST,
-                new HttpEntity<>(fixtures.bearerHeaders(ownerToken)), String.class);
-        assertThat(enable.getStatusCode()).isEqualTo(HttpStatus.OK);
-        UUID ownerMasterId = objectMapper.readValue(enable.getBody(),
-                new TypeReference<ApiResponse<com.beautica.master.dto.MasterDetailResponse>>() {})
-                .data().masterId();
+        // createSalon materialises the owner-operated master row with the first salon. Its
+        // salon_id is the owner's own salon, so master.getSalon() != null and the salon branch
+        // applies.
+        UUID ownerMasterId = fixtures.ownerMasterId(salonId);
         fixtures.seedUsableSchedule(ownerMasterId);
 
         log.debug("Act: owner bulk-creates for their OWN master row");

@@ -1657,6 +1657,10 @@ public class SalonService {
      * guards where the salon-wide deletion path had structural invariants to lean on instead:
      * <ol>
      *   <li>{@code masterId} resolves to a master row at all → {@link NotFoundException}</li>
+     *   <li>{@code salonId} re-check against the loaded row's own salon — defense-in-depth
+     *       re-check of {@code @authz.masterBelongsToSalon} on the controller, mirroring {@link
+     *       #removeAdmin(UUID, UUID, UUID)}'s re-check of {@code adminBelongsToSalon}. Runs BEFORE
+     *       the type check so another salon's row yields 403, never a type-revealing 409</li>
      *   <li>the row IS a {@code SALON_MASTER}-type master (D6) — a positive assertion, not merely
      *       an exclusion of {@code SALON_OWNER}. Phase 295's owner exemption is structural for the
      *       salon-wide deletion path — {@code resolveSalonStaffUserIds} can never select an
@@ -1664,7 +1668,7 @@ public class SalonService {
      *       {@code masterBelongsToSalon} is true for the owner's own row too, so left unguarded
      *       this endpoint could hard-delete the salon's owner. A positive assertion also closes
      *       {@code INDEPENDENT_MASTER}: today that type never carries a non-null {@code salon}, so
-     *       the D5 belongs-to-salon check below happens to catch it too, but that is a DB-unenforced
+     *       the D5 belongs-to-salon check above happens to catch it too, but that is a DB-unenforced
      *       cross-file invariant (no CHECK constraint ties {@code master_type} to {@code salon_id}
      *       nullability) — {@link MasterService#deactivateMaster(UUID, Master)}, which this method
      *       calls, skips its own {@code assertCanManageMaster} (whose {@code INDEPENDENT_MASTER}
@@ -1674,9 +1678,6 @@ public class SalonService {
      *   <li>the row is not already {@link Master#isDetached() detached} — a detached row has no
      *       account left to delete, and re-detaching it would overwrite the name snapshot with
      *       {@code null} and trip {@code chk_masters_detachment_coherent}</li>
-     *   <li>{@code salonId} re-check against the loaded row's own salon — defense-in-depth
-     *       re-check of {@code @authz.masterBelongsToSalon} on the controller, mirroring {@link
-     *       #removeAdmin(UUID, UUID, UUID)}'s re-check of {@code adminBelongsToSalon}</li>
      *   <li>self-removal — {@code actorId} cannot remove their own master row, mirroring {@link
      *       #removeAdmin(UUID, UUID, UUID)}'s self-removal guard</li>
      *   <li>{@link StaffClientReferenceAuditService#runAuditForStaffUserIds(List)} against the
@@ -1719,20 +1720,21 @@ public class SalonService {
         Master master = masterRepository.findByIdWithUserAndSalon(masterId)
                 .orElseThrow(() -> new NotFoundException("Master not found: " + masterId));
 
+        // Membership BEFORE type: a foreign row must never yield a type-revealing 409.
+        if (master.getSalon() == null || !salonId.equals(master.getSalon().getId())) {
+            throw new ForbiddenException("Master does not belong to this salon");
+        }
+
         if (master.getMasterType() != MasterType.SALON_MASTER) {
             throw new BusinessException(
                     HttpStatus.CONFLICT,
                     master.getMasterType() == MasterType.SALON_OWNER
-                            ? "Use DELETE /salons/{salonId}/master to disable your own master profile"
+                            ? MasterService.OWNER_MASTER_NOT_REMOVABLE
                             : "Only an invited SALON_MASTER may be removed here");
         }
 
         if (master.isDetached()) {
             throw new BusinessException(HttpStatus.CONFLICT, "Master is already detached");
-        }
-
-        if (master.getSalon() == null || !salonId.equals(master.getSalon().getId())) {
-            throw new ForbiddenException("Master does not belong to this salon");
         }
 
         UUID masterUserId = master.getUser().getId();

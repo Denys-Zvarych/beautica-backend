@@ -134,7 +134,7 @@ public class CacheConfig {
      *                         Spring stores NullValue for "this user has no active master row" and
      *                         the miss is memoised too — which is why eviction is BIDIRECTIONAL,
      *                         firing on create/reactivate as well as deactivate. See the invariant
-     *                         block on MasterService#deactivateOwnerMaster.
+     *                         block above MasterService#evictUserKeyedMasterCachesAfterCommit.
      *   user-profile        — userId→UserProfileResponse DTO for GET /users/me — 5 min TTL, max
      *                         2000 entries. CROSS-AGGREGATE: hasMasterProfile is derived from a
      *                         `masters` row this cache's owning service does not write, so
@@ -342,8 +342,8 @@ public class CacheConfig {
         // Public GET /masters/{masterId} — 5 min TTL (shorter than master-detail-by-user
         // since discovery pages cache across many callers; 1000 entries covers active masters
         // at current scale). sync=true is specified on the @Cacheable annotation.
-        // Explicit per-key eviction runs afterCommit in MasterService.deactivateMaster,
-        // deactivateOwnerMaster, and the reactivation branch of createMasterForOwner.
+        // Explicit per-key eviction runs afterCommit in MasterService.deactivateMaster
+        // and the reactivation branch of createMasterForOwner.
         // Profile-text writes (bio/phone/locality via UserService) rely solely on this TTL
         // because UserService holds only userId, not masterId — documented trade-off.
         manager.registerCustomCache("master-detail",
@@ -361,8 +361,8 @@ public class CacheConfig {
         // The price is that "no row" is now a CACHED FACT, so the eviction contract became
         // BIDIRECTIONAL: before, only deactivation could stale this cache (a miss was never stored);
         // now creation and reactivation stale it too, and every such path must evict. The complete,
-        // named path list — and why it is exhaustive — lives in the invariant block inside
-        // MasterService#deactivateOwnerMaster. Do not add a fourth create path without reading it.
+        // named path list — and why it is exhaustive — lives in the invariant block above
+        // MasterService#evictUserKeyedMasterCachesAfterCommit. Do not add a path without reading it.
         //
         // Phase 265 audit (finding 6): 500 → 1000. GET /masters/me was widened to SALON_OWNER,
         // and SalonService#createSalon auto-creates the owner-master row on first-salon

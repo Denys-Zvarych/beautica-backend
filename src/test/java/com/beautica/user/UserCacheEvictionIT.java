@@ -100,6 +100,15 @@ class UserCacheEvictionIT extends AbstractIntegrationTest {
     @Autowired
     private Clock clock;
 
+    @Autowired
+    private UserRepository userRepository;
+
+    @Autowired
+    private com.beautica.salon.repository.SalonRepository salonRepository;
+
+    @Autowired
+    private com.beautica.master.repository.MasterRepository masterRepository;
+
     @Test
     @DisplayName("returns the FRESH bio on the second read — the cached DTO with the old bio was evicted afterCommit")
     void should_returnFreshBioAfterUpdate_when_afterCommitEvictionFires() {
@@ -278,9 +287,16 @@ class UserCacheEvictionIT extends AbstractIntegrationTest {
                         + "must report true — otherwise the flip below proves nothing")
                 .isTrue();
 
-        // Act 1 — toggle «Я також працюю як майстер» OFF through MasterService.
+        // Act 1 — deactivate the owner-master row through MasterService's salon-deletion cascade:
+        // since Phase 346 (audit-fix cycle 1) that is the only path that may deactivate an owner
+        // row — DELETE /masters/{masterId} refuses it with 409.
+        UUID ownerMasterId = jdbcTemplate.queryForObject(
+                "SELECT id FROM masters WHERE user_id = ?", UUID.class, ownerId);
         transactionTemplate.executeWithoutResult(status ->
-                masterService.deactivateOwnerMaster(ownerId, salonId));
+                masterService.deactivateMasters(
+                        ownerId,
+                        java.util.List.of(masterRepository.findByIdWithUserAndSalon(ownerMasterId).orElseThrow()),
+                        salonId));
 
         // Assert 1 — a `masters` write must have invalidated a `users` cache.
         assertThat(transactionTemplate.execute(status -> userService.getProfile(ownerId))
@@ -291,9 +307,11 @@ class UserCacheEvictionIT extends AbstractIntegrationTest {
                         + "/masters/me, which now 404s, for the full 5-minute TTL")
                 .isFalse();
 
-        // Act 2 — toggle back ON, exercising the reactivation branch.
+        // Act 2 — reactivate, exercising createMasterForOwner's reactivation branch.
         transactionTemplate.executeWithoutResult(status ->
-                masterService.createMasterForOwner(ownerId, salonId));
+                masterService.createMasterForOwner(
+                        userRepository.findById(ownerId).orElseThrow(),
+                        salonRepository.findById(salonId).orElseThrow()));
 
         // Assert 2 — the inverse direction, which the deactivate-only contract of cycle 1 missed.
         assertThat(transactionTemplate.execute(status -> userService.getProfile(ownerId))

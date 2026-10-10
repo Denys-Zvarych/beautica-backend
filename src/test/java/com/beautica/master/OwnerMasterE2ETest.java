@@ -57,7 +57,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <ol>
  *   <li>Owner registers (JDBC insert) and logs in.</li>
  *   <li>Owner creates a salon via POST /api/v1/salons.</li>
- *   <li>Owner enables their owner-master profile via POST /api/v1/salons/{id}/master.</li>
+ *   <li>Owner reads the owner-master profile createSalon created, via GET /api/v1/masters/me.</li>
  *   <li>Owner sets working hours via PATCH /api/v1/masters/{id}/working-hours.</li>
  *   <li>Owner creates a service definition via POST /api/v1/salons/{id}/services.</li>
  *   <li>Owner assigns the service to the owner-master via POST /api/v1/salons/{id}/masters/{id}/services.</li>
@@ -97,7 +97,7 @@ class OwnerMasterE2ETest extends AbstractIntegrationTest {
     // ── E2E happy path ────────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("Full lifecycle: owner enables master → client books (auto-confirmed) → owner completes → revenue appears in dashboard")
+    @DisplayName("Full lifecycle: owner is master from salon creation → client books (auto-confirmed) → owner completes → revenue appears in dashboard")
     void should_completeFullBookingLifecycle_when_ownerOperatesAsOwnMaster() throws Exception {
 
         // ── Step 1: register an owner and a client via JDBC ──────────────────
@@ -139,19 +139,21 @@ class OwnerMasterE2ETest extends AbstractIntegrationTest {
         UUID salonId = salonBody.data().id();
         log.debug("Step 2 complete — salonId={}", salonId);
 
-        // ── Step 3: enable owner-master ───────────────────────────────────────
-        ResponseEntity<String> enableResp = restTemplate.exchange(
-                SALONS_URL + "/" + salonId + "/master", HttpMethod.POST,
+        // ── Step 3: read the owner-master row createSalon created ─────────────
+        // Phase 346: the row is created with the first salon and is permanent — there is no
+        // enable endpoint any more. GET /masters/me is the path the app uses to read it.
+        ResponseEntity<String> meResp = restTemplate.exchange(
+                "/api/v1/masters/me", HttpMethod.GET,
                 new HttpEntity<>(bearerHeaders(ownerToken)),
                 String.class);
-        assertThat(enableResp.getStatusCode())
-                .as("enable owner-master must return 200")
+        assertThat(meResp.getStatusCode())
+                .as("GET /masters/me must return 200 for an owner right after first-salon creation")
                 .isEqualTo(HttpStatus.OK);
-        var enableBody = objectMapper.readValue(enableResp.getBody(),
+        var meBody = objectMapper.readValue(meResp.getBody(),
                 new TypeReference<ApiResponse<MasterDetailResponse>>() {});
-        UUID masterId = enableBody.data().masterId();
-        assertThat(enableBody.data().masterType().name())
-                .as("enabled master must have type SALON_OWNER")
+        UUID masterId = meBody.data().masterId();
+        assertThat(meBody.data().masterType().name())
+                .as("the auto-created master must have type SALON_OWNER")
                 .isEqualTo("SALON_OWNER");
         log.debug("Step 3 complete — masterId={}", masterId);
 
