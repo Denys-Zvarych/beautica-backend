@@ -482,8 +482,9 @@ public class MasterController {
      * self-service route to update bio, phone, or Instagram handle.
      *
      * <p>Delegates to {@link UserService#updateMasterProfile} — the same service
-     * method used by the independent master path. The service has no internal role
-     * assertion blocking {@code SALON_MASTER}, and sharing the implementation is
+     * method used by the independent master path. The service carries a union role
+     * backstop ({@link UserService#MASTER_PROFILE_WRITE_ROLES}: INDEPENDENT_MASTER, SALON_MASTER,
+     * SALON_OWNER) that admits {@code SALON_MASTER} and rejects every other role, and sharing the implementation is
      * intentional: the DB columns written ({@code phone_number}, {@code bio},
      * {@code instagram}) are role-agnostic.
      *
