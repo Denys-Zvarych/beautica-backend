@@ -14,7 +14,7 @@ import com.beautica.booking.service.BookingService;
 import com.beautica.common.cache.UserProfileCacheEvictor;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
-import com.beautica.media.repository.UploaderMediaKey;
+import com.beautica.media.repository.MediaFileKey;
 import com.beautica.media.repository.MediaRepository;
 import com.beautica.review.repository.ClientReviewRepository;
 import lombok.RequiredArgsConstructor;
@@ -132,10 +132,10 @@ public class ClientAccountDeletionService {
             throw new BusinessException("Only a CLIENT account with no salon affiliation can self-delete");
         }
 
-        // Step 3 — pre-read external-storage pointers BEFORE anything cascades them away. Mirrors
-        // SalonService's own pre-read-before-cascade pattern for salon media rows.
+        // Step 3 — pre-read external-storage pointers BEFORE the account's rows are deleted (step 8b).
+        // Entity-keyed (Phase 363): a CLIENT has no masters row, so only its own USER rows qualify.
         // Scalar projection (P-L1) — no MediaFile entities loaded into the persistence context.
-        List<UploaderMediaKey> mediaRows = mediaRepository.findMediaKeysByUploaderIdIn(List.of(clientUserId));
+        List<MediaFileKey> mediaRows = mediaRepository.findAccountMediaKeys(List.of(clientUserId), List.of());
 
         Instant now = clock.instant();
 
@@ -242,12 +242,16 @@ public class ClientAccountDeletionService {
         // EntityManager.
         bookingRepository.flush();
 
+        // Step 8b — Phase 363 D4: media_files.uploader_id is audit-only since V193 (ON DELETE SET NULL),
+        // so the account's own media rows are deleted explicitly, by entity, never by uploader.
+        mediaRepository.deleteAccountMedia(List.of(clientUserId), List.of());
+
         // Step 9 — the hard delete (D1). reviews.client_id / bookings.client_id /
         // appointments.client_id are all ON DELETE SET NULL (V162) but every row that FK would
         // touch has already been detached above, so the CHECK is already satisfied and the FK
         // fires as a pure no-op RI action. Every other FK on users (refresh_tokens, device_tokens,
-        // media_files, password_reset_tickets, favorites) is a plain CASCADE and needs no explicit
-        // call here.
+        // password_reset_tickets, favorites) is a plain CASCADE and needs no explicit call here;
+        // media_files.uploader_id is SET NULL (V193) and its own rows went in step 8b.
         userRepository.deleteAllByIdInBatch(List.of(clientUserId));
 
         // Step 10 — LOAD-BEARING FOR SECURITY, not a perf nicety (mirrors the phase 295 audit

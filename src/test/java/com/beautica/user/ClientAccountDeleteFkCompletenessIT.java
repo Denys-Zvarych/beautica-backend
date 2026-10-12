@@ -34,7 +34,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * NULL), {@code reviews.client_id} (V40→V162 SET NULL), {@code client_reviews.subject_client_id}
  * (V128, NO ACTION — deleted by the service, not relaxed), {@code favorites.client_id} (V92
  * CASCADE), {@code refresh_tokens.user_id} (V1 CASCADE), {@code device_tokens.user_id} (V29
- * CASCADE), {@code media_files.uploader_id} (V37 CASCADE), {@code password_reset_tickets.user_id}
+ * CASCADE), {@code media_files.uploader_id} (V193 SET NULL — the account's own USER rows are deleted explicitly, Phase 363), {@code password_reset_tickets.user_id}
  * (V55→V107 rename, CASCADE), {@code platform_categories.requested_by_user_id} (V65 SET NULL),
  * {@code service_type_suggestion.requested_by_user_id} (V76 SET NULL).
  *
@@ -171,6 +171,12 @@ class ClientAccountDeleteFkCompletenessIT extends AbstractIntegrationTest {
 
         // client_reviews (provider -> client) are DELETED outright (D3), never detached.
         assertThat(csd.count("SELECT COUNT(*) FROM client_reviews WHERE subject_client_id = ?", clientId))
+                .isZero();
+
+        // Phase 363: uploader_id is SET NULL since V193, so the account's own USER media row is deleted
+        // explicitly by entity — no orphan row survives the account.
+        assertThat(csd.count(
+                "SELECT COUNT(*) FROM media_files WHERE entity_type = 'USER' AND entity_id = ?", clientId))
                 .isZero();
     }
 

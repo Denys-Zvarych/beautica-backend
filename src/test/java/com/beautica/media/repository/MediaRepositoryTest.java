@@ -5,6 +5,9 @@ import com.beautica.auth.Role;
 import com.beautica.media.entity.EntityType;
 import com.beautica.media.entity.MediaFile;
 import com.beautica.media.entity.MediaType;
+import com.beautica.master.entity.Master;
+import com.beautica.master.entity.MasterType;
+import com.beautica.salon.entity.Salon;
 import com.beautica.user.User;
 import jakarta.persistence.EntityManagerFactory;
 import org.hibernate.SessionFactory;
@@ -17,8 +20,8 @@ import org.springframework.boot.test.autoconfigure.orm.jpa.TestEntityManager;
 import jakarta.persistence.PersistenceException;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 
+import java.math.BigDecimal;
 import java.util.List;
-import java.util.Optional;
 import java.util.UUID;
 
 import org.springframework.data.domain.Page;
@@ -40,11 +43,8 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * <ul>
  *   <li>{@code findByEntityTypeAndEntityId} filters by both columns — same {@code entity_id}
  *       under a different {@code entity_type} must not bleed across.</li>
- *   <li>{@code findByUploaderIdAndMediaType} is declared as {@link Optional} despite no DB
- *       UNIQUE constraint on {@code (uploader_id, media_type)}, so multiple AVATAR rows
- *       for the same uploader must surface as
- *       {@link IncorrectResultSizeDataAccessException} — pinned here so a future schema
- *       change (partial unique index) is a deliberate, test-visible decision.</li>
+ *   <li>the account-deletion finders are keyed on the owning entity only, never on
+ *       {@code uploader_id} (Phase 363).</li>
  *   <li>{@code uploader} is {@code FetchType.LAZY} — the entity-type/entity-id finder
  *       must not eagerly load the {@link User} proxy.</li>
  * </ul>
@@ -126,26 +126,155 @@ class MediaRepositoryTest extends AbstractDataJpaTest {
     }
 
     @Test
-    @DisplayName("Returns Optional.empty() when the uploader has no AVATAR row")
-    void should_returnEmpty_when_uploaderHasNoAvatar() {
-        Optional<MediaFile> result = repo.findByUploaderIdAndMediaType(uploader.getId(), MediaType.AVATAR);
-
-        assertThat(result).isEmpty();
-    }
-
-    @Test
-    @DisplayName("Returns the single AVATAR row when the uploader has exactly one")
-    void should_returnAvatar_when_uploaderHasOneAvatar() {
-        MediaFile avatar = buildMedia(uploader, EntityType.USER, uploader.getId(), MediaType.AVATAR);
-        em.persist(avatar);
+    @DisplayName("Phase 363: findAccountMediaKeys reads the account's USER rows and its masters' MASTER rows — "
+            + "never a SALON row, even one the same user uploaded")
+    void should_readOnlyOwnEntityRows_when_findAccountMediaKeys() {
+        UUID masterId = UUID.randomUUID();
+        MediaFile own = buildMedia(uploader, EntityType.USER, uploader.getId(), MediaType.AVATAR);
+        MediaFile portfolio = buildMedia(uploader, EntityType.MASTER, masterId, MediaType.PORTFOLIO);
+        MediaFile salonPhoto = buildMedia(uploader, EntityType.SALON, UUID.randomUUID(), MediaType.PORTFOLIO);
+        MediaFile foreign = buildMedia(uploader, EntityType.MASTER, UUID.randomUUID(), MediaType.PORTFOLIO);
+        em.persist(own);
+        em.persist(portfolio);
+        em.persist(salonPhoto);
+        em.persist(foreign);
         em.flush();
         em.clear();
 
-        Optional<MediaFile> result = repo.findByUploaderIdAndMediaType(uploader.getId(), MediaType.AVATAR);
+        List<MediaFileKey> keys = repo.findAccountMediaKeys(List.of(uploader.getId()), List.of(masterId));
 
-        assertThat(result).isPresent();
-        assertThat(result.get().getMediaType()).isEqualTo(MediaType.AVATAR);
-        assertThat(result.get().getId()).isEqualTo(avatar.getId());
+        assertThat(keys).extracting(MediaFileKey::id).containsExactlyInAnyOrder(own.getId(), portfolio.getId());
+    }
+
+    @Test
+    @DisplayName("Phase 363: deleteAccountMedia removes exactly the account's own rows and leaves SALON rows alone")
+    void should_deleteOnlyOwnEntityRows_when_deleteAccountMedia() {
+        UUID masterId = UUID.randomUUID();
+        MediaFile portfolio = buildMedia(uploader, EntityType.MASTER, masterId, MediaType.PORTFOLIO);
+        MediaFile salonPhoto = buildMedia(uploader, EntityType.SALON, UUID.randomUUID(), MediaType.PORTFOLIO);
+        em.persist(portfolio);
+        em.persist(salonPhoto);
+        em.flush();
+        em.clear();
+
+        int deleted = repo.deleteAccountMedia(List.of(uploader.getId()), List.of(masterId));
+
+        assertThat(deleted).isEqualTo(1);
+        assertThat(repo.findById(portfolio.getId())).isEmpty();
+        assertThat(repo.findById(salonPhoto.getId())).isPresent();
+    }
+
+    @Test
+    @DisplayName("Phase 363: an empty master-id list is a valid bind (client accounts have no masters row)")
+    void should_acceptEmptyMasterIds_when_findAccountMediaKeys() {
+        List<MediaFileKey> keys = repo.findAccountMediaKeys(List.of(uploader.getId()), List.of());
+
+        assertThat(keys).isEmpty();
+    }
+
+    @Test
+    @DisplayName("Phase 362 F2: countPortfolioOfActiveSalon counts PORTFOLIO rows of an active salon, "
+            + "and is empty for an inactive or unknown salon")
+    void should_countPortfolio_when_salonActive_andBeEmpty_otherwise() {
+        Salon active = persistSalon(true);
+        Salon inactive = persistSalon(false);
+        em.persist(buildMedia(uploader, EntityType.SALON, active.getId(), MediaType.PORTFOLIO));
+        em.persist(buildMedia(uploader, EntityType.SALON, active.getId(), MediaType.PORTFOLIO));
+        em.persist(buildMedia(uploader, EntityType.MASTER, active.getId(), MediaType.PORTFOLIO));
+        em.flush();
+        em.clear();
+
+        assertThat(repo.countPortfolioOfActiveSalon(active.getId())).contains(2L);
+        assertThat(repo.countPortfolioOfActiveSalon(inactive.getId())).isEmpty();
+        assertThat(repo.countPortfolioOfActiveSalon(UUID.randomUUID())).isEmpty();
+    }
+
+    @Test
+    @DisplayName("Phase 362 G3: findPortfolioRowOfActiveSalon loads only this active salon's PORTFOLIO row — "
+            + "another salon's row, a non-portfolio row, a MASTER row and an inactive salon all come back empty")
+    void should_findOnlyOwnPortfolioRow_when_salonActive() {
+        Salon salonA = persistSalon(true);
+        Salon salonB = persistSalon(true);
+        Salon inactive = persistSalon(false);
+        MediaFile own = buildMedia(uploader, EntityType.SALON, salonA.getId(), MediaType.PORTFOLIO);
+        MediaFile otherSalons = buildMedia(uploader, EntityType.SALON, salonB.getId(), MediaType.PORTFOLIO);
+        MediaFile avatar = buildMedia(uploader, EntityType.SALON, salonA.getId(), MediaType.AVATAR);
+        MediaFile masterTyped = buildMedia(uploader, EntityType.MASTER, salonA.getId(), MediaType.PORTFOLIO);
+        MediaFile ofInactive = buildMedia(uploader, EntityType.SALON, inactive.getId(), MediaType.PORTFOLIO);
+        List.of(own, otherSalons, avatar, masterTyped, ofInactive).forEach(em::persist);
+        em.flush();
+        em.clear();
+
+        assertThat(repo.findPortfolioRowOfActiveSalon(own.getId(), salonA.getId()))
+                .map(MediaFile::getId).contains(own.getId());
+        assertThat(repo.findPortfolioRowOfActiveSalon(otherSalons.getId(), salonA.getId())).isEmpty();
+        assertThat(repo.findPortfolioRowOfActiveSalon(avatar.getId(), salonA.getId())).isEmpty();
+        assertThat(repo.findPortfolioRowOfActiveSalon(masterTyped.getId(), salonA.getId())).isEmpty();
+        assertThat(repo.findPortfolioRowOfActiveSalon(ofInactive.getId(), inactive.getId())).isEmpty();
+        assertThat(repo.findPortfolioRowOfActiveSalon(UUID.randomUUID(), salonA.getId())).isEmpty();
+    }
+
+    @Test
+    @DisplayName("Phase 362 H3: findPortfolioRowOfMasterUser loads only the caller's own master PORTFOLIO row — "
+            + "another master's row, a SALON row, an avatar row and an unknown id all come back empty")
+    void should_findOnlyOwnMasterPortfolioRow_when_scopedByUser() {
+        User ownerUser = persistUser(Role.INDEPENDENT_MASTER);
+        User otherUser = persistUser(Role.INDEPENDENT_MASTER);
+        Master ownMaster = persistIndependentMaster(ownerUser);
+        Master otherMaster = persistIndependentMaster(otherUser);
+        Salon salon = persistSalon(true);
+        MediaFile own = buildMedia(uploader, EntityType.MASTER, ownMaster.getId(), MediaType.PORTFOLIO);
+        MediaFile othersRow = buildMedia(ownerUser, EntityType.MASTER, otherMaster.getId(), MediaType.PORTFOLIO);
+        MediaFile salonRow = buildMedia(ownerUser, EntityType.SALON, salon.getId(), MediaType.PORTFOLIO);
+        MediaFile avatar = buildMedia(ownerUser, EntityType.USER, ownerUser.getId(), MediaType.AVATAR);
+        List.of(own, othersRow, salonRow, avatar).forEach(em::persist);
+        em.flush();
+        em.clear();
+
+        assertThat(repo.findPortfolioRowOfMasterUser(own.getId(), ownerUser.getId()))
+                .as("own row — matched by owning entity, not uploader")
+                .map(MediaFile::getId).contains(own.getId());
+        assertThat(repo.findPortfolioRowOfMasterUser(othersRow.getId(), ownerUser.getId()))
+                .as("another master's row (uploaded by the caller)").isEmpty();
+        assertThat(repo.findPortfolioRowOfMasterUser(salonRow.getId(), ownerUser.getId())).as("salon row").isEmpty();
+        assertThat(repo.findPortfolioRowOfMasterUser(avatar.getId(), ownerUser.getId())).as("avatar row").isEmpty();
+        assertThat(repo.findPortfolioRowOfMasterUser(UUID.randomUUID(), ownerUser.getId())).as("unknown id").isEmpty();
+    }
+
+    private User persistUser(Role role) {
+        User user = new User(
+                "media-m-" + UUID.randomUUID() + "@test.com",
+                new BCryptPasswordEncoder(4).encode("test-password"),
+                role,
+                "Media",
+                "Master",
+                "+380501111112"
+        );
+        em.persist(user);
+        return user;
+    }
+
+    private Master persistIndependentMaster(User user) {
+        Master master = Master.builder()
+                .user(user)
+                .masterType(MasterType.INDEPENDENT_MASTER)
+                .avgRating(BigDecimal.ZERO)
+                .reviewCount(0)
+                .isActive(true)
+                .build();
+        em.persist(master);
+        return master;
+    }
+
+    private Salon persistSalon(boolean active) {
+        Salon salon = Salon.builder()
+                .cityId(testCityId())
+                .owner(uploader)
+                .name("Media Salon")
+                .isActive(active)
+                .build();
+        em.persist(salon);
+        return salon;
     }
 
     @Test

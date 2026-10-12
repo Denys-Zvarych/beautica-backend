@@ -8,7 +8,9 @@ import com.beautica.media.dto.MediaFileResponse;
 import com.beautica.media.entity.EntityType;
 import com.beautica.media.service.MediaService;
 import lombok.RequiredArgsConstructor;
+import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;
+import io.swagger.v3.oas.annotations.responses.ApiResponses;
 import io.swagger.v3.oas.annotations.media.Content;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
@@ -37,9 +39,11 @@ import java.util.UUID;
  * <p><b>SEC-1 (BLOCKER carry-forward from Phase 7.1 audit).</b> The {@code userId} /
  * {@code actorId} for every authenticated mutation is derived from the
  * {@link Authentication} principal. There is intentionally no request-body or
- * path-variable field that lets a caller name a target user/salon/master —
+ * path-variable field that lets a caller name a target user/master —
  * {@link MediaService} resolves the owning entity server-side from the actor's
- * role. This eliminates the IDOR vector flagged in the Phase 7.1 audit.
+ * role. This eliminates the IDOR vector flagged in the Phase 7.1 audit. (Salon
+ * portfolio writes name the salon explicitly and are gated by {@code canManageSalon}
+ * on {@link SalonMediaController} — Phase 362.)
  *
  * <p><b>Path layout.</b> Base mapping is {@code /api/v1} (not {@code /api/v1/media})
  * because the public listing endpoints diverge from the media root —
@@ -79,10 +83,30 @@ public class MediaController {
         mediaService.deleteAvatar(userId);
     }
 
-    // ── portfolio (uploads — SALON_OWNER + INDEPENDENT_MASTER only) ───────────
+    // ── portfolio writes (INDEPENDENT_MASTER only — Phase 362 D4) ──────────────
+    // Salon portfolios are written through SalonMediaController (/salons/{salonId}/portfolio).
 
+    @Operation(summary = "Add a photo to the caller's own master portfolio (INDEPENDENT_MASTER only)",
+            description = "Multipart field `file`: JPEG, PNG or WebP (detected by magic bytes), max 5 MB. "
+                    + "A portfolio holds at most " + MediaService.MAX_PORTFOLIO_PHOTOS + " photos; the next upload "
+                    + "is rejected with 409 (`data.code` = `PORTFOLIO_LIMIT_REACHED`). Salon portfolios use POST /api/v1/salons/{salonId}/portfolio.")
+    @ApiResponses({
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(responseCode = "201", useReturnTypeSchema = true),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(responseCode = "400",
+                    description = "Empty/oversized file or unsupported image format"),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(responseCode = "401", description = "Not authenticated"),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(responseCode = "403",
+                    description = "Caller is not an INDEPENDENT_MASTER with a master profile"),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(responseCode = "409",
+                    description = "Portfolio photo limit reached — `data.code` is `PORTFOLIO_LIMIT_REACHED`. On this "
+                            + "endpoint 409 means the cap and nothing else."),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(responseCode = "503",
+                    description = "Media storage is not configured, or the portfolio is busy (a concurrent upload "
+                            + "held the lock past its timeout) — the busy case carries a `Retry-After` header "
+                            + "(seconds); retry after it. Nothing was stored.")
+    })
     @PostMapping(value = "/media/portfolio", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
-    @PreAuthorize("hasAnyRole('SALON_OWNER', 'INDEPENDENT_MASTER')")
+    @PreAuthorize("hasRole('INDEPENDENT_MASTER')")
     @ResponseStatus(HttpStatus.CREATED)
     public ApiResponse<MediaFileResponse> uploadPortfolioPhoto(
             @Parameter(content = @Content(mediaType = MediaType.MULTIPART_FORM_DATA_VALUE))
@@ -94,8 +118,20 @@ public class MediaController {
         return ApiResponse.ok(mediaService.uploadPortfolioPhoto(actorId, actorRole, file));
     }
 
+    @Operation(summary = "Remove a photo from the caller's own master portfolio (INDEPENDENT_MASTER only)",
+            description = "Only rows of the caller's own master portfolio; a salon photo is 404 here "
+                    + "(use DELETE /api/v1/salons/{salonId}/portfolio/{mediaId}).")
+    @ApiResponses({
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(responseCode = "204"),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(responseCode = "401", description = "Not authenticated"),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(responseCode = "403",
+                    description = "Caller is not an INDEPENDENT_MASTER"),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(responseCode = "404",
+                    description = "Not a photo of the caller's own master portfolio (unknown id, a salon photo "
+                            + "or another master's photo — deliberately indistinguishable)")
+    })
     @DeleteMapping("/media/portfolio/{mediaId}")
-    @PreAuthorize("isAuthenticated()")
+    @PreAuthorize("hasRole('INDEPENDENT_MASTER')")
     @ResponseStatus(HttpStatus.NO_CONTENT)
     public void deletePortfolioPhoto(
             @PathVariable UUID mediaId,

@@ -2,11 +2,14 @@ package com.beautica.master.repository;
 
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
+import jakarta.persistence.QueryHint;
+import org.hibernate.jpa.HibernateHints;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.jpa.repository.QueryHints;
 import org.springframework.data.repository.query.Param;
 
 import java.time.LocalDate;
@@ -581,4 +584,26 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
                    OR EXISTS (SELECT 1 FROM client_reviews cr WHERE cr.author_master_id = m.id))
             """, nativeQuery = true)
     List<UUID> findIdsWithHistoricalReferences(@Param("masterIds") Collection<UUID> masterIds);
+
+    /**
+     * Row-locks a master for the Phase 362 portfolio cap (D6): two concurrent portfolio uploads for the same
+     * master serialise here, so the {@code count -> insert} pair under the lock can never overshoot the cap.
+     *
+     * <p>Same shape as {@code SalonRepository#findByIdForUpdate}: {@code FOR NO KEY UPDATE} (conflicts with
+     * itself, which is all the serialisation needs, but not with the {@code FOR KEY SHARE} that every FK check
+     * on {@code masters} takes — so bookings/appointments referencing this master are never stalled), and a
+     * transaction-scoped 3s {@code lock_timeout} fused into the same round trip ({@code 55P03} ->
+     * {@code CannotAcquireLockException}; the portfolio path translates it to 503 + {@code Retry-After}).
+     *
+     * <p>Selects the id only (audit cycle 1, F4): the cap path needs the lock, never the row, so no
+     * {@code Master} entity enters the persistence context to be dirty-checked at commit.
+     */
+    @QueryHints(@QueryHint(name = HibernateHints.HINT_NATIVE_SPACES, value = "masters"))
+    @Query(value = """
+            SELECT m.id FROM masters m
+            CROSS JOIN (SELECT set_config('lock_timeout', '3s', true)) lock_cfg
+            WHERE m.id = :masterId
+            FOR NO KEY UPDATE OF m
+            """, nativeQuery = true)
+    Optional<UUID> lockIdForUpdate(@Param("masterId") UUID masterId);
 }

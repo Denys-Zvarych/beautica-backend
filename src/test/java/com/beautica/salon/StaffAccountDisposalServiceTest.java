@@ -1,7 +1,7 @@
 package com.beautica.salon;
 
 import com.beautica.media.entity.EntityType;
-import com.beautica.media.repository.UploaderMediaKey;
+import com.beautica.media.repository.MediaFileKey;
 import com.beautica.media.service.AccountBlobPointers;
 import com.beautica.user.UserAvatarPointers;
 import com.beautica.auth.Role;
@@ -39,6 +39,7 @@ import java.util.Set;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.catchThrowable;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyCollection;
 import static org.mockito.ArgumentMatchers.eq;
@@ -195,6 +196,65 @@ class StaffAccountDisposalServiceTest {
     }
 
     @Test
+    @DisplayName("Phase 363 audit H2 — the resolved-masters overload uses the caller's list and never re-runs "
+            + "findAllByUserIdInWithUser, yet still deletes/detaches exactly those rows")
+    void should_useResolvedMasters_withoutRequerying_when_overloadCalled() {
+        UUID actorId = UUID.randomUUID();
+        UUID staffUserId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        Master master = masterWithUser(masterId, staffUserId, "Тест", "Майстер");
+        when(masterRepository.findIdsWithHistoricalReferences(List.of(masterId))).thenReturn(List.of());
+        service = newService();
+
+        service.dispose(actorId, null, List.of(staffUserId), StaffDisposalReason.SELF_DELETE, List.of(master));
+
+        verify(masterRepository, never()).findAllByUserIdInWithUser(anyCollection());
+        verify(masterRepository).delete(master);
+        verify(mediaRepository).deleteAccountMedia(List.of(staffUserId), List.of(masterId));
+        verify(userRepository).deleteAllByIdInBatch(List.of(staffUserId));
+    }
+
+    @Test
+    @DisplayName("Phase 363 security LOW — the resolved-masters overload fails closed when a supplied masters "
+            + "row belongs to an account outside staffUserIds, before any write")
+    void should_throw_when_resolvedMastersContainForeignUser() {
+        UUID actorId = UUID.randomUUID();
+        UUID staffUserId = UUID.randomUUID();
+        UUID foreignUserId = UUID.randomUUID();
+        UUID foreignMasterId = UUID.randomUUID();
+        Master ownMaster = masterWithUser(UUID.randomUUID(), staffUserId, "Тест", "Майстер");
+        Master foreignMaster = masterWithUser(foreignMasterId, foreignUserId, "Чужий", "Майстер");
+        service = newService();
+
+        Throwable caught = catchThrowable(() -> service.dispose(
+                actorId, null, List.of(staffUserId), StaffDisposalReason.SELF_DELETE,
+                List.of(ownMaster, foreignMaster)));
+
+        assertThat(caught)
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining(foreignMasterId.toString())
+                .hasMessageNotContaining("Чужий");
+        verifyNoInteractions(userRepository, inviteTokenRepository, masterRepository,
+                tokensValidAfterCache, userProfileCacheEvictor, mediaRepository, accountBlobPurgeRegistrar);
+        assertThat(foreignMaster.isDetached()).isFalse();
+    }
+
+    @Test
+    @DisplayName("Phase 363 audit H2 — the four-argument overload is unchanged: it resolves the masters rows "
+            + "itself, exactly once")
+    void should_resolveMastersOnce_when_fourArgOverloadCalled() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID staffUserId = UUID.randomUUID();
+        when(masterRepository.findAllByUserIdInWithUser(List.of(staffUserId))).thenReturn(List.of());
+        service = newService();
+
+        service.dispose(actorId, salonId, List.of(staffUserId), StaffDisposalReason.MASTER_REMOVAL);
+
+        verify(masterRepository, times(1)).findAllByUserIdInWithUser(List.of(staffUserId));
+    }
+
+    @Test
     @DisplayName("a masters row WITH a historical reference is DETACHed — name snapshot, "
             + "user_id nulled, is_active=false — never physically deleted")
     void should_detachMasterRow_when_historicalReferenceExists() {
@@ -326,25 +386,29 @@ class StaffAccountDisposalServiceTest {
     }
 
     @Test
-    @DisplayName("H1/S-L2: avatar pointers are row-locked, then media keys read, then ONE purge registered — "
-            + "all BEFORE the users delete")
+    @DisplayName("H1/S-L2: avatar pointers are row-locked, then own media keys read by entity, then ONE purge "
+            + "registered, then the own media rows deleted — all BEFORE the users delete")
     void should_lockPointersThenRegisterPurge_beforeUsersDelete_when_reasonIsNotSelfDelete() {
         UUID salonId = UUID.randomUUID();
         UUID staffUserId = UUID.randomUUID();
-        UploaderMediaKey media = new UploaderMediaKey(staffUserId, "portfolio/x.jpg", EntityType.MASTER, UUID.randomUUID());
+        UUID masterId = UUID.randomUUID();
+        MediaFileKey media = new MediaFileKey(UUID.randomUUID(), "portfolio/x.jpg", EntityType.MASTER, masterId);
         when(userRepository.lockAvatarPointersByIdIn(List.of(staffUserId)))
                 .thenReturn(List.of(avatarPointers(staffUserId, "avatars/" + staffUserId + "/a.jpg", null)));
-        when(mediaRepository.findMediaKeysByUploaderIdIn(List.of(staffUserId))).thenReturn(List.of(media));
-        lenient().when(masterRepository.findAllByUserIdInWithUser(List.of(staffUserId))).thenReturn(List.of());
+        when(masterRepository.findAllByUserIdInWithUser(List.of(staffUserId)))
+                .thenReturn(List.of(masterWithUser(masterId, staffUserId, "Olena", "K")));
+        when(mediaRepository.findAccountMediaKeys(List.of(staffUserId), List.of(masterId))).thenReturn(List.of(media));
+        lenient().when(masterRepository.findIdsWithHistoricalReferences(List.of(masterId))).thenReturn(List.of());
         service = newService();
 
         service.dispose(UUID.randomUUID(), salonId, List.of(staffUserId), StaffDisposalReason.MASTER_REMOVAL);
 
         var order = inOrder(userRepository, mediaRepository, accountBlobPurgeRegistrar);
         order.verify(userRepository).lockAvatarPointersByIdIn(List.of(staffUserId));
-        order.verify(mediaRepository).findMediaKeysByUploaderIdIn(List.of(staffUserId));
+        order.verify(mediaRepository).findAccountMediaKeys(List.of(staffUserId), List.of(masterId));
         order.verify(accountBlobPurgeRegistrar).registerAfterCommit(List.of(new AccountBlobPointers(
                 staffUserId, "avatars/" + staffUserId + "/a.jpg", null, List.of(media))));
+        order.verify(mediaRepository).deleteAccountMedia(List.of(staffUserId), List.of(masterId));
         order.verify(userRepository).deleteAllByIdInBatch(List.of(staffUserId));
     }
 
@@ -354,11 +418,14 @@ class StaffAccountDisposalServiceTest {
         UUID salonId = UUID.randomUUID();
         UUID userA = UUID.randomUUID();
         UUID userB = UUID.randomUUID();
-        UploaderMediaKey mediaB = new UploaderMediaKey(userB, "portfolio/b.jpg", EntityType.MASTER, UUID.randomUUID());
+        UUID masterB = UUID.randomUUID();
+        MediaFileKey mediaB = new MediaFileKey(UUID.randomUUID(), "portfolio/b.jpg", EntityType.MASTER, masterB);
         when(userRepository.lockAvatarPointersByIdIn(List.of(userA, userB))).thenReturn(List.of(
                 avatarPointers(userA, "avatars/" + userA + "/a.jpg", null), avatarPointers(userB, null, null)));
-        when(mediaRepository.findMediaKeysByUploaderIdIn(List.of(userA, userB))).thenReturn(List.of(mediaB));
-        lenient().when(masterRepository.findAllByUserIdInWithUser(List.of(userA, userB))).thenReturn(List.of());
+        when(masterRepository.findAllByUserIdInWithUser(List.of(userA, userB)))
+                .thenReturn(List.of(masterWithUser(masterB, userB, "B", "B")));
+        when(mediaRepository.findAccountMediaKeys(List.of(userA, userB), List.of(masterB))).thenReturn(List.of(mediaB));
+        lenient().when(masterRepository.findIdsWithHistoricalReferences(List.of(masterB))).thenReturn(List.of());
         service = newService();
 
         service.dispose(UUID.randomUUID(), salonId, List.of(userA, userB), StaffDisposalReason.SALON_DELETION);
@@ -369,21 +436,24 @@ class StaffAccountDisposalServiceTest {
     }
 
     @Test
-    @DisplayName("H1: SALON_DELETION leaves the salon's own portfolio rows to the salon sweep (no double purge)")
-    void should_skipSalonOwnMediaRows_when_reasonIsSalonDeletion() {
+    @DisplayName("Phase 363: disposal is entity-keyed — it never reads or deletes by uploader, so an admin "
+            + "(no masters row) only loses their own USER rows, never the salon's photos")
+    void should_keyMediaOnlyOnOwnEntities_when_adminRemoved() {
         UUID salonId = UUID.randomUUID();
-        UUID staffUserId = UUID.randomUUID();
-        UploaderMediaKey salonRow = new UploaderMediaKey(staffUserId, "portfolio/salons/s.jpg", EntityType.SALON, salonId);
-        when(userRepository.lockAvatarPointersByIdIn(List.of(staffUserId)))
-                .thenReturn(List.of(avatarPointers(staffUserId, null, null)));
-        when(mediaRepository.findMediaKeysByUploaderIdIn(List.of(staffUserId))).thenReturn(List.of(salonRow));
-        lenient().when(masterRepository.findAllByUserIdInWithUser(List.of(staffUserId))).thenReturn(List.of());
+        UUID adminUserId = UUID.randomUUID();
+        when(userRepository.lockAvatarPointersByIdIn(List.of(adminUserId)))
+                .thenReturn(List.of(avatarPointers(adminUserId, null, null)));
+        when(masterRepository.findAllByUserIdInWithUser(List.of(adminUserId))).thenReturn(List.of());
+        when(mediaRepository.findAccountMediaKeys(List.of(adminUserId), List.of())).thenReturn(List.of());
         service = newService();
 
-        service.dispose(UUID.randomUUID(), salonId, List.of(staffUserId), StaffDisposalReason.SALON_DELETION);
+        service.dispose(UUID.randomUUID(), salonId, List.of(adminUserId), StaffDisposalReason.ADMIN_REMOVAL);
 
+        verify(mediaRepository).findAccountMediaKeys(List.of(adminUserId), List.of());
+        verify(mediaRepository).deleteAccountMedia(List.of(adminUserId), List.of());
+        verifyNoMoreInteractions(mediaRepository);
         verify(accountBlobPurgeRegistrar).registerAfterCommit(
-                List.of(new AccountBlobPointers(staffUserId, null, null, List.of())));
+                List.of(new AccountBlobPointers(adminUserId, null, null, List.of())));
     }
 
     private static UserAvatarPointers avatarPointers(UUID id, String key, String url) {
@@ -395,7 +465,8 @@ class StaffAccountDisposalServiceTest {
     }
 
     @Test
-    @DisplayName("H1: SELF_DELETE never registers a purge here — the self-delete service owns its own sweep")
+    @DisplayName("H1: SELF_DELETE never registers a purge here — the self-delete service owns its own sweep — "
+            + "but still deletes the account's own media rows (Phase 363 D4: no cascade does it any more)")
     void should_notRegisterBlobPurge_when_reasonIsSelfDelete() {
         UUID staffUserId = UUID.randomUUID();
         lenient().when(masterRepository.findAllByUserIdInWithUser(List.of(staffUserId))).thenReturn(List.of());
@@ -404,7 +475,8 @@ class StaffAccountDisposalServiceTest {
         service.dispose(staffUserId, UUID.randomUUID(), List.of(staffUserId), StaffDisposalReason.SELF_DELETE);
 
         verifyNoInteractions(accountBlobPurgeRegistrar);
-        verifyNoInteractions(mediaRepository);
+        verify(mediaRepository).deleteAccountMedia(List.of(staffUserId), List.of());
+        verifyNoMoreInteractions(mediaRepository);
     }
 
     @Test

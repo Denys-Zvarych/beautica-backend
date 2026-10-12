@@ -14,6 +14,7 @@ public final class ServiceUnavailableMessages {
     public static final String SERVICE_SETUP_BUSY = "Service setup is busy for this master, please retry";
     public static final String SUPPORT_NOT_CONFIGURED = "Support channel is not configured";
     public static final String OTP_SEND_FAILED = "Could not send the verification code";
+    public static final String PORTFOLIO_BUSY = "Portfolio is busy, please retry";
 
     /** Returned for any 503 whose message is not on the allow-list. */
     public static final String GENERIC = "Service temporarily unavailable";
@@ -22,7 +23,8 @@ public final class ServiceUnavailableMessages {
             MEDIA_STORAGE_NOT_CONFIGURED,
             SERVICE_SETUP_BUSY,
             SUPPORT_NOT_CONFIGURED,
-            OTP_SEND_FAILED);
+            OTP_SEND_FAILED,
+            PORTFOLIO_BUSY);
 
     private ServiceUnavailableMessages() {
     }

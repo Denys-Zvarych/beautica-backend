@@ -162,11 +162,11 @@ public class SalonService {
     // ServiceRepository/FavoriteRepository back the two pure-DB steps that run INSIDE the same
     // deletion transaction as deleteSalonStaff (deactivateAllByOwner, deleteAllByTargetTypeAndTargetId
     // — no network, so they roll back with everything else on failure). MediaRepository is read
-    // directly (not through MediaService) so the salon's media_files rows can be captured BEFORE
-    // deleteSalonStaff runs — a staff-uploaded salon photo's row carries ON DELETE CASCADE on
-    // media_files.uploader_id and would otherwise vanish the moment that method hard-deletes the
-    // uploader's users row, orphaning the R2 blob with no row left to name it (a gap the phase doc
-    // itself did not cover — see deactivateSalon's javadoc). MediaService owns the actual R2 sweep
+    // directly (not through MediaService) so the salon's media_files rows are captured inside the
+    // deletion transaction. Salon deletion is the ONLY remover of SALON rows (Phase 363 D5):
+    // media_files.uploader_id is audit-only since V193 (ON DELETE SET NULL), so staff removal no
+    // longer touches them and the explicit (SALON, salonId) pre-read below is the sole sweep input.
+    // MediaService owns the actual R2 sweep
     // (D3 REUSE-FIRST — the shared sweepBlobs body) and runs strictly AFTER commit (D8):
     // its txRead/txWrite are PROPAGATION_REQUIRES_NEW TransactionTemplates, so calling it from
     // inside deactivateSalon's own @Transactional would join that transaction and hold a DB
@@ -1438,13 +1438,9 @@ public class SalonService {
      * The salon row itself is only deactivated, never deleted: {@code reviews.salon_id} is
      * {@code NOT NULL … NO ACTION} (V41:3) and the 2026-09-04 reversal named <i>staff</i>.
      *
-     * <p><b>GAP the Phase 268 doc did not cover, closed here.</b> Phase 295's
-     * {@link #deleteSalonStaff(UUID, UUID)} hard-deletes staff {@code users} rows, and
-     * {@code media_files.uploader_id} carries {@code ON DELETE CASCADE} — so a staff-uploaded
-     * salon photo's ROW would vanish before any later entity-keyed read could see it, permanently
-     * orphaning its R2 blob. The fix: this method reads the salon's {@code media_files} rows
-     * (see the local variable block below {@code salon.setActive(false)}) BEFORE
-     * {@link #deleteSalonStaff(UUID, UUID)} runs, and threads that pre-read list all the way into
+     * <p><b>The only remover of SALON portfolio rows (Phase 363 D5).</b> This method reads the
+     * salon's {@code media_files} rows by {@code (SALON, salonId)} (see the local variable block
+     * below {@code salon.setActive(false)}) and threads that pre-read list all the way into
      * {@link #purgeSalonMediaAfterCommit(UUID, SalonImagePointer, SalonImagePointer, List)}.
      *
      * @throws NotFoundException             if {@code ownerId} does not resolve to a user, or if
@@ -1500,11 +1496,9 @@ public class SalonService {
         salon.setActive(false);
 
         // Phase 268 — capture the salon's image URLs and pre-read its media_files rows NOW, while
-        // `salon` is still managed and every uploader's `users` row is still whole. Both are needed
-        // by the R2 sweep this method registers after commit (purgeSalonMediaAfterCommit), and both
-        // MUST be captured before deleteSalonStaff below: a staff-uploaded salon photo's row carries
-        // ON DELETE CASCADE on media_files.uploader_id, so reading it after that hard-delete would
-        // silently lose the row — and with it the only pointer left to reconcile its R2 blob against.
+        // `salon` is still managed. Both are needed by the R2 sweep this method registers after commit
+        // (purgeSalonMediaAfterCommit), which deletes exactly these (SALON, salonId) rows and their blobs —
+        // the only path that removes salon photos (Phase 363 D5; staff disposal never touches SALON rows).
         // Phase 343 D8: the logo/cover pointers are read from the FOR UPDATE-locked row (lockImagePointers),
         // never from the unlocked `salon` snapshot above — a logo/cover upload that committed after that load
         // would otherwise have its new blob orphaned. The lock is then held until this deletion commits, so a

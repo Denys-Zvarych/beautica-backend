@@ -4,6 +4,7 @@ import com.beautica.auth.JwtAuthenticationFilter;
 import com.beautica.auth.JwtTokenProvider;
 import com.beautica.auth.Role;
 import com.beautica.common.exception.ForbiddenException;
+import com.beautica.common.exception.NotFoundException;
 import com.beautica.config.WebMvcTestSupport;
 import com.beautica.media.dto.AvatarResponse;
 import com.beautica.media.dto.MediaFileResponse;
@@ -12,6 +13,8 @@ import com.beautica.media.service.MediaService;
 import jakarta.servlet.http.HttpServletResponse;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -60,8 +63,10 @@ import static org.springframework.security.test.web.servlet.request.SecurityMock
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.multipart;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
 
 /**
  * {@code @WebMvcTest} slice for {@link MediaController}.
@@ -210,27 +215,59 @@ class MediaControllerTest {
         verify(mediaService, never()).uploadPortfolioPhoto(any(), any(), any());
     }
 
-    @Test
-    @DisplayName("POST /media/portfolio — 201 when SALON_OWNER uploads a valid portfolio photo")
-    void should_return201_when_salonOwnerUploadsPortfolio() throws Exception {
-        var userId = UUID.randomUUID();
-        var mediaId = UUID.randomUUID();
-        var entityId = UUID.randomUUID();
-        var stub = new MediaFileResponse(
-                mediaId, EntityType.SALON, entityId,
-                com.beautica.media.entity.MediaType.PORTFOLIO,
-                "https://cdn.example/portfolio.jpg", Instant.now());
-        when(mediaService.uploadPortfolioPhoto(eq(userId), eq(Role.SALON_OWNER), any()))
-                .thenReturn(stub);
-
-        log.debug("Act: POST {} as SALON_OWNER user={} with valid JPEG", PORTFOLIO_URL, userId);
+    @ParameterizedTest(name = "POST /media/portfolio — 403 for {0} (Phase 362 D4: INDEPENDENT_MASTER only)")
+    @EnumSource(value = Role.class, names = {"SALON_OWNER", "SALON_ADMIN", "SALON_MASTER"})
+    void should_return403_when_nonIndependentMasterUploadsPortfolio(Role role) throws Exception {
         mockMvc.perform(multipart(PORTFOLIO_URL)
                         .file(validJpegPart())
-                        .with(authenticatedAs(userId, Role.SALON_OWNER))
+                        .with(authenticatedAs(UUID.randomUUID(), role))
                         .with(csrf()))
-                .andExpect(status().isCreated())
-                .andExpect(jsonPath("$.success").value(true))
-                .andExpect(jsonPath("$.data.id").value(mediaId.toString()));
+                .andExpect(status().isForbidden());
+
+        verify(mediaService, never()).uploadPortfolioPhoto(any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("POST /media/portfolio — the 30-photo cap maps to 409 with data.code PORTFOLIO_LIMIT_REACHED")
+    void should_return409_when_masterPortfolioCapReached() throws Exception {
+        var actorId = UUID.randomUUID();
+        when(mediaService.uploadPortfolioPhoto(eq(actorId), eq(Role.INDEPENDENT_MASTER), any()))
+                .thenThrow(new com.beautica.common.exception.PortfolioLimitReachedException());
+
+        mockMvc.perform(multipart(PORTFOLIO_URL)
+                        .file(validJpegPart())
+                        .with(authenticatedAs(actorId, Role.INDEPENDENT_MASTER))
+                        .with(csrf()))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.data.code").value("PORTFOLIO_LIMIT_REACHED"));
+    }
+
+    @Test
+    @DisplayName("POST /media/portfolio — portfolio lock contention maps to 503 + Retry-After, never 409")
+    void should_return503WithRetryAfter_when_masterPortfolioBusy() throws Exception {
+        var actorId = UUID.randomUUID();
+        when(mediaService.uploadPortfolioPhoto(eq(actorId), eq(Role.INDEPENDENT_MASTER), any()))
+                .thenThrow(new com.beautica.common.exception.PortfolioBusyException());
+
+        mockMvc.perform(multipart(PORTFOLIO_URL)
+                        .file(validJpegPart())
+                        .with(authenticatedAs(actorId, Role.INDEPENDENT_MASTER))
+                        .with(csrf()))
+                .andExpect(status().isServiceUnavailable())
+                .andExpect(header().exists("Retry-After"));
+    }
+
+    @Test
+    @DisplayName("POST /media/portfolio — consumes multipart/form-data only; a JSON body is 415")
+    void should_return415_when_masterPortfolioUploadIsNotMultipart() throws Exception {
+        mockMvc.perform(post(PORTFOLIO_URL)
+                        .contentType(org.springframework.http.MediaType.APPLICATION_JSON)
+                        .content("{}")
+                        .with(authenticatedAs(UUID.randomUUID(), Role.INDEPENDENT_MASTER))
+                        .with(csrf()))
+                .andExpect(status().isUnsupportedMediaType());
+
+        verify(mediaService, never()).uploadPortfolioPhoto(any(), any(), any());
     }
 
     // ── DELETE /api/v1/media/avatar ───────────────────────────────────────────
@@ -252,14 +289,14 @@ class MediaControllerTest {
     // ── DELETE /api/v1/media/portfolio/{mediaId} ─────────────────────────────
 
     @Test
-    @DisplayName("DELETE /media/portfolio/{id} — 204 when the uploader deletes their own portfolio photo")
+    @DisplayName("DELETE /media/portfolio/{id} — 204 when an INDEPENDENT_MASTER deletes a photo of their own portfolio")
     void should_return204_when_portfolioPhotoDeleted() throws Exception {
         var userId = UUID.randomUUID();
         var mediaId = UUID.randomUUID();
 
-        log.debug("Act: DELETE {}/{} as uploader user={}", PORTFOLIO_URL, mediaId, userId);
+        log.debug("Act: DELETE {}/{} as master user={}", PORTFOLIO_URL, mediaId, userId);
         mockMvc.perform(delete(PORTFOLIO_URL + "/" + mediaId)
-                        .with(authenticatedAs(userId, Role.SALON_OWNER))
+                        .with(authenticatedAs(userId, Role.INDEPENDENT_MASTER))
                         .with(csrf()))
                 .andExpect(status().isNoContent());
 
@@ -267,19 +304,31 @@ class MediaControllerTest {
     }
 
     @Test
-    @DisplayName("DELETE /media/portfolio/{id} — 403 when a different user attempts the delete")
-    void should_return403_when_nonUploaderDeletesPortfolioPhoto() throws Exception {
+    @DisplayName("DELETE /media/portfolio/{id} — 404 when the photo belongs to another master's portfolio "
+            + "(H3: uniform 404, no existence oracle)")
+    void should_return404_when_nonOwningMasterDeletesPortfolioPhoto() throws Exception {
         var attackerId = UUID.randomUUID();
         var mediaId = UUID.randomUUID();
-        doThrow(new ForbiddenException("Not allowed to delete this media"))
+        doThrow(new NotFoundException("Media not found: " + mediaId))
                 .when(mediaService).deletePortfolioPhoto(eq(attackerId), eq(mediaId));
 
-        log.debug("Act: DELETE {}/{} as non-uploader user={} — service must throw ForbiddenException → 403",
+        log.debug("Act: DELETE {}/{} as non-owning master user={} — service must throw NotFoundException → 404",
                 PORTFOLIO_URL, mediaId, attackerId);
         mockMvc.perform(delete(PORTFOLIO_URL + "/" + mediaId)
-                        .with(authenticatedAs(attackerId, Role.SALON_OWNER))
+                        .with(authenticatedAs(attackerId, Role.INDEPENDENT_MASTER))
+                        .with(csrf()))
+                .andExpect(status().isNotFound());
+    }
+
+    @ParameterizedTest(name = "DELETE /media/portfolio/:id — 403 for {0} (role gate, service never reached)")
+    @EnumSource(value = Role.class, names = {"SALON_OWNER", "SALON_ADMIN", "SALON_MASTER", "CLIENT"})
+    void should_return403_when_nonIndependentMasterDeletesViaMediaPortfolio(Role role) throws Exception {
+        mockMvc.perform(delete(PORTFOLIO_URL + "/" + UUID.randomUUID())
+                        .with(authenticatedAs(UUID.randomUUID(), role))
                         .with(csrf()))
                 .andExpect(status().isForbidden());
+
+        verify(mediaService, never()).deletePortfolioPhoto(any(), any());
     }
 
     // ── GET /api/v1/salons/{salonId}/portfolio — public ──────────────────────

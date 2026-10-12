@@ -62,7 +62,10 @@ class MediaIntegrationTest extends AbstractMediaIntegrationTest {
 
     private static final Logger log = LoggerFactory.getLogger(MediaIntegrationTest.class);
     private static final String AVATAR_URL = "/api/v1/media/avatar";
-    private static final String PORTFOLIO_URL = "/api/v1/media/portfolio";
+    /** Phase 362: salon portfolio writes are salon-scoped ({@code /media/portfolio} is INDEPENDENT_MASTER only). */
+    private static String salonPortfolioUrl(UUID salonId) {
+        return "/api/v1/salons/" + salonId + "/portfolio";
+    }
 
     @Autowired
     private TestRestTemplate restTemplate;
@@ -195,7 +198,7 @@ class MediaIntegrationTest extends AbstractMediaIntegrationTest {
     // ── #18 — portfolio uploads visible via public GET listing ───────────────
 
     @Test
-    @DisplayName("POST /media/portfolio x3 then GET /salons/{id}/portfolio — listing returns 3 items")
+    @DisplayName("POST /salons/{id}/portfolio x3 then GET /salons/{id}/portfolio — listing returns 3 items")
     void should_returnPortfolioList_when_salonOwnerUploadsPhotos() throws Exception {
         // Arrange
         String ownerEmail = "media-it-port-" + System.nanoTime() + "@beautica.test";
@@ -206,7 +209,7 @@ class MediaIntegrationTest extends AbstractMediaIntegrationTest {
         // Act — upload 3 photos
         for (int i = 0; i < 3; i++) {
             ResponseEntity<String> resp = restTemplate.exchange(
-                    PORTFOLIO_URL, HttpMethod.POST,
+                    salonPortfolioUrl(salonId), HttpMethod.POST,
                     new HttpEntity<>(jpegMultipartBody(), bearerMultipartHeaders(ownerToken)),
                     String.class);
             assertThat(resp.getStatusCode())
@@ -266,7 +269,7 @@ class MediaIntegrationTest extends AbstractMediaIntegrationTest {
         // hits mediaRepo.save() which is on the same spied bean, and the upload's own
         // eviction touches the cache; we want a clean slate before the two GETs.
         ResponseEntity<String> upload = restTemplate.exchange(
-                PORTFOLIO_URL, HttpMethod.POST,
+                salonPortfolioUrl(salonId), HttpMethod.POST,
                 new HttpEntity<>(jpegMultipartBody(), bearerMultipartHeaders(ownerToken)),
                 String.class);
         assertThat(upload.getStatusCode()).isEqualTo(HttpStatus.CREATED);
@@ -314,7 +317,7 @@ class MediaIntegrationTest extends AbstractMediaIntegrationTest {
 
         // Act — upload a photo (must evict the cache entry post-commit)
         ResponseEntity<String> upload = restTemplate.exchange(
-                PORTFOLIO_URL, HttpMethod.POST,
+                salonPortfolioUrl(salonId), HttpMethod.POST,
                 new HttpEntity<>(jpegMultipartBody(), bearerMultipartHeaders(ownerToken)),
                 String.class);
         assertThat(upload.getStatusCode()).isEqualTo(HttpStatus.CREATED);
@@ -334,19 +337,20 @@ class MediaIntegrationTest extends AbstractMediaIntegrationTest {
                 .hasSize(1);
     }
 
-    // ── Phase 343 audit — multipart size boundary on the avatar + portfolio routes ──────────
+    // ── Phase 343 audit — multipart size boundary on the avatar + (salon) portfolio routes ──────────
     // max-request-size (6MB) sits above max-file-size (5MB) so the multipart envelope no longer
     // turns an exactly-5 MB image into a 413; the per-file cap still rejects 5 MB + 1 byte.
 
     @ParameterizedTest(name = "{0} with an exactly-5 MB JPEG → {1}")
-    @CsvSource({AVATAR_URL + ", 200", PORTFOLIO_URL + ", 201"})
+    @CsvSource({"avatar, 200", "salon-portfolio, 201"})
     @DisplayName("boundary: an exactly-5 MB JPEG passes the multipart layer and the service cap")
-    void should_acceptUpload_when_fileIsExactlyFiveMegabytes(String url, int expectedStatus) throws Exception {
+    void should_acceptUpload_when_fileIsExactlyFiveMegabytes(String route, int expectedStatus) throws Exception {
         // Arrange
-        String token = salonOwnerToken("exact-5mb");
+        OwnerFixture owner = salonOwnerFixture("exact-5mb");
+        String token = owner.token();
 
         // Act
-        ResponseEntity<String> resp = restTemplate.exchange(url, HttpMethod.POST,
+        ResponseEntity<String> resp = restTemplate.exchange(uploadUrl(route, owner.salonId()), HttpMethod.POST,
                 new HttpEntity<>(jpegMultipartBodyOfSize(FIVE_MB), bearerMultipartHeaders(token)), String.class);
 
         // Assert
@@ -355,14 +359,15 @@ class MediaIntegrationTest extends AbstractMediaIntegrationTest {
     }
 
     @ParameterizedTest(name = "{0} with a 5 MB + 1 byte JPEG → 413")
-    @ValueSource(strings = {AVATAR_URL, PORTFOLIO_URL})
+    @ValueSource(strings = {"avatar", "salon-portfolio"})
     @DisplayName("boundary: a 5 MB + 1 byte JPEG is rejected with 413 at the multipart layer, no R2 upload")
-    void should_return413_when_fileIsFiveMegabytesPlusOneByte(String url) throws Exception {
+    void should_return413_when_fileIsFiveMegabytesPlusOneByte(String route) throws Exception {
         // Arrange
-        String token = salonOwnerToken("over-5mb");
+        OwnerFixture owner = salonOwnerFixture("over-5mb");
+        String token = owner.token();
 
         // Act
-        ResponseEntity<String> resp = restTemplate.exchange(url, HttpMethod.POST,
+        ResponseEntity<String> resp = restTemplate.exchange(uploadUrl(route, owner.salonId()), HttpMethod.POST,
                 new HttpEntity<>(jpegMultipartBodyOfSize(FIVE_MB + 1), bearerMultipartHeaders(token)), String.class);
 
         // Assert
@@ -370,10 +375,16 @@ class MediaIntegrationTest extends AbstractMediaIntegrationTest {
         verify(r2StorageService, never()).uploadFile(anyString(), any(), anyLong(), anyString());
     }
 
-    private String salonOwnerToken(String tag) throws Exception {
+    private record OwnerFixture(String token, UUID salonId) {}
+
+    private OwnerFixture salonOwnerFixture(String tag) throws Exception {
         String email = "media-it-" + tag + "-" + System.nanoTime() + "@beautica.test";
         UUID ownerId = insertSalonOwner(email);
-        insertSalon(ownerId, "Boundary Salon " + tag);
-        return loginAndGetToken(email);
+        UUID salonId = insertSalon(ownerId, "Boundary Salon " + tag);
+        return new OwnerFixture(loginAndGetToken(email), salonId);
+    }
+
+    private static String uploadUrl(String route, UUID salonId) {
+        return "avatar".equals(route) ? AVATAR_URL : salonPortfolioUrl(salonId);
     }
 }

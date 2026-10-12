@@ -8,7 +8,7 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
-import com.beautica.media.repository.UploaderMediaKey;
+import com.beautica.media.repository.MediaFileKey;
 import com.beautica.media.repository.MediaRepository;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.salon.service.StaffAccountDisposalService;
@@ -143,21 +143,29 @@ public class StaffAccountSelfDeletionService {
                     "This account is also referenced as a client and cannot be deleted");
         }
 
-        // Step 4 — pre-read external-storage pointers BEFORE anything cascades them away.
-        // Scalar projection (P-L1) — no MediaFile entities loaded into the persistence context.
-        List<UploaderMediaKey> mediaRows = mediaRepository.findMediaKeysByUploaderIdIn(List.of(userId));
         UUID salonId = user.getSalonId();
 
-        // Step 5 — resolve the caller's OWN masters row, if any. SALON_ADMIN has none (D3 — no
-        // calendar of their own); SALON_MASTER/INDEPENDENT_MASTER always have exactly one live,
-        // ATTACHED row while the account itself is still live (the only path that detaches a
-        // masters row also hard-deletes the account in the SAME statement — see Master#detach's
-        // javadoc), so absence here for either of those two roles is unreachable defensively.
+        // Step 5 — resolve the caller's OWN masters rows with the SAME query the disposal deletes by
+        // (StaffAccountDisposalService: findAllByUserIdInWithUser), for EVERY role (Phase 363 audit G5). The
+        // blob purge set and the delete set therefore come from one predicate: were a SALON_ADMIN ever to own
+        // a masters row, its MASTER portfolio blobs are still pre-read here instead of orphaned in R2.
+        // SALON_ADMIN normally has none (D3 — no calendar of their own); SALON_MASTER/INDEPENDENT_MASTER
+        // always have exactly one live, ATTACHED row while the account itself is still live (the only path
+        // that detaches a masters row also hard-deletes the account in the SAME statement — see
+        // Master#detach's javadoc), so absence here for either of those two roles is refused defensively.
+        List<Master> ownMasters = masterRepository.findAllByUserIdInWithUser(List.of(userId));
+        List<UUID> ownMasterIds = ownMasters.stream().map(Master::getId).toList();
         Master master = null;
         if (user.getRole() == Role.SALON_MASTER || user.getRole() == Role.INDEPENDENT_MASTER) {
-            master = masterRepository.findByUserId(userId)
+            master = ownMasters.stream().findFirst()
                     .orElseThrow(() -> new ForbiddenException("Access denied"));
         }
+
+        // Step 4 (moved after step 5, Phase 363) — pre-read the account's OWN media pointers BEFORE the
+        // disposal deletes them: its USER rows and its masters' MASTER portfolio, entity-keyed. Never a SALON
+        // row — an admin's/master's uploads to the salon portfolio belong to the salon and survive this.
+        // Scalar projection (P-L1) — no MediaFile entities loaded into the persistence context.
+        List<MediaFileKey> mediaRows = mediaRepository.findAccountMediaKeys(List.of(userId), ownMasterIds);
 
         // Step 5b — Phase 342 D6: an independent master's own service catalogue keeps uploaded photos in R2
         // (service_definitions has no FK to the master, so nothing cascades). Row-lock the catalogue (id order)
@@ -225,7 +233,10 @@ public class StaffAccountSelfDeletionService {
         // masters detach-or-delete branch, the invite-token cleanup (skipped for salonId == null —
         // an INDEPENDENT_MASTER was never invited), the users row delete, and the after-commit
         // tokensValidAfter/user-profile cache evictions for this one user.
-        staffAccountDisposalService.dispose(userId, salonId, List.of(userId), StaffDisposalReason.SELF_DELETE);
+        // Phase 363 audit H2: hands over the masters rows step 5 already resolved with the SAME
+        // findAllByUserIdInWithUser predicate, so the disposal does not run that query a second time.
+        staffAccountDisposalService.dispose(
+                userId, salonId, List.of(userId), StaffDisposalReason.SELF_DELETE, ownMasters);
 
         // Step 8 — denylist the caller's OWN access token, exactly as AuthService#logout and
         // ClientAccountDeletionService#deleteOwnAccount do. Refresh-token cleanup needs no

@@ -2,7 +2,7 @@ package com.beautica.user;
 
 import com.beautica.auth.Role;
 import com.beautica.media.entity.EntityType;
-import com.beautica.media.repository.UploaderMediaKey;
+import com.beautica.media.repository.MediaFileKey;
 import com.beautica.media.service.AccountBlobPointers;
 import com.beautica.media.service.MediaService;
 import org.junit.jupiter.api.AfterEach;
@@ -78,7 +78,7 @@ class AccountBlobPurgeRegistrarTest {
         UUID salonId = UUID.randomUUID();
         String mediaKey = "portfolio/salons/" + salonId + "/m.jpg";
         AccountBlobPointers account = new AccountBlobPointers(userId, "avatars/" + userId + "/a.jpg", null,
-                List.of(new UploaderMediaKey(userId, mediaKey, EntityType.SALON, salonId)));
+                List.of(new MediaFileKey(UUID.randomUUID(), mediaKey, EntityType.SALON, salonId)));
         ch.qos.logback.classic.Logger logger = (ch.qos.logback.classic.Logger)
                 org.slf4j.LoggerFactory.getLogger(AccountBlobPurgeRegistrar.class);
         var appender = new ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent>();
@@ -148,7 +148,7 @@ class AccountBlobPurgeRegistrarTest {
     }
 
     @Test
-    @DisplayName("P-L3: the User/UploaderMediaKey overload captures only scalar pointers (raw, unresolved) — no entity")
+    @DisplayName("P-L3: the User/MediaFileKey overload captures only scalar pointers (raw, unresolved) — no entity")
     void should_captureScalarPointers_when_registeredFromUserAndRows() {
         TransactionSynchronizationManager.initSynchronization();
         UUID userId = UUID.randomUUID();
@@ -157,7 +157,7 @@ class AccountBlobPurgeRegistrarTest {
         ReflectionTestUtils.setField(user, "id", userId);
         user.setAvatarR2Key("avatars/" + userId + "/a.jpg");
         user.setAvatarUrl("https://cdn/avatars/" + userId + "/a.jpg");
-        UploaderMediaKey row = new UploaderMediaKey(userId, "portfolio/salons/" + salonId + "/m.jpg",
+        MediaFileKey row = new MediaFileKey(UUID.randomUUID(), "portfolio/salons/" + salonId + "/m.jpg",
                 EntityType.SALON, salonId);
 
         registrar.registerAfterCommit(user, List.of(row));
@@ -165,8 +165,7 @@ class AccountBlobPurgeRegistrarTest {
 
         verify(mediaService).purgeUserBlobsAfterCommit(List.of(new AccountBlobPointers(userId,
                 "avatars/" + userId + "/a.jpg", "https://cdn/avatars/" + userId + "/a.jpg",
-                List.of(new UploaderMediaKey(userId, "portfolio/salons/" + salonId + "/m.jpg",
-                        EntityType.SALON, salonId)))));
+                List.of(row))));
     }
 
     @Test

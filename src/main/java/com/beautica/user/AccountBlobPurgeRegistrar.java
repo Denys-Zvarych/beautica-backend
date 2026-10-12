@@ -1,6 +1,6 @@
 package com.beautica.user;
 
-import com.beautica.media.repository.UploaderMediaKey;
+import com.beautica.media.repository.MediaFileKey;
 import com.beautica.media.service.AccountBlobPointers;
 import com.beautica.media.service.MediaService;
 import lombok.RequiredArgsConstructor;
@@ -41,11 +41,11 @@ public class AccountBlobPurgeRegistrar {
 
     /**
      * Single-account form for the self-delete flows: wraps the loaded user's avatar pointers + the pre-read
-     * scalar media keys (P-L1 — {@link com.beautica.media.repository.MediaRepository#findMediaKeysByUploaderIdIn}
+     * scalar media keys (P-L1 — {@link com.beautica.media.repository.MediaRepository#findAccountMediaKeys}
      * projection, never full entities) into an entity-free {@link AccountBlobPointers} snapshot NOW (P-L3 — the
      * closure never retains a {@link User}) and registers it.
      */
-    public void registerAfterCommit(User user, List<UploaderMediaKey> media) {
+    public void registerAfterCommit(User user, List<MediaFileKey> media) {
         registerAfterCommit(List.of(
                 new AccountBlobPointers(user.getId(), user.getAvatarR2Key(), user.getAvatarUrl(), media)));
     }

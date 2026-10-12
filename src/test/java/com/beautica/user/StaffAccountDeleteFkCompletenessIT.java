@@ -35,7 +35,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * detach-vs-delete branch is exercised, not the FK), {@code bookings.created_by_user_id} (V137→V157
  * SET NULL, a walk-in this master rang up), {@code appointments.created_by_user_id} (V139→V157 SET
  * NULL, same walk-in's header), {@code refresh_tokens.user_id} (V1 CASCADE), {@code
- * device_tokens.user_id} (V29 CASCADE), {@code media_files.uploader_id} (V37 CASCADE), {@code
+ * device_tokens.user_id} (V29 CASCADE), {@code media_files.uploader_id} (V193 SET NULL — the account's own USER rows are deleted explicitly, Phase 363), {@code
  * password_reset_tickets.user_id} (V55→V107 rename, CASCADE), {@code
  * platform_categories.requested_by_user_id} (V65 SET NULL), {@code
  * service_type_suggestion.requested_by_user_id} (V76 SET NULL).
@@ -185,6 +185,12 @@ class StaffAccountDeleteFkCompletenessIT extends AbstractIntegrationTest {
         assertThat(jdbcTemplate.queryForObject(
                 "SELECT created_by_user_id FROM appointments WHERE id = ?", UUID.class, appointmentId))
                 .isNull();
+
+        // Phase 363: uploader_id is SET NULL since V193, so the account's own USER media row is deleted
+        // explicitly by entity — no orphan row survives the account.
+        assertThat(csd.count(
+                "SELECT COUNT(*) FROM media_files WHERE entity_type = 'USER' AND entity_id = ?", masterUserId))
+                .isZero();
     }
 
     private String emailOf(UUID userId) {
