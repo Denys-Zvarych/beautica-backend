@@ -22,7 +22,8 @@ import org.springframework.context.annotation.Configuration;
         OutboxReclaimPolicyConfig.class,
         ClosureReminderProperties.class,
         InAppNotificationRetentionProperties.class,
-        InAppNotificationCleanupProperties.class
+        InAppNotificationCleanupProperties.class,
+        DeploymentProperties.class
 })
 public class AppConfigProperties {
 }

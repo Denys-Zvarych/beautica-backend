@@ -1,2 +1,3 @@
 org.springframework.boot.env.EnvironmentPostProcessor=\
-  com.beautica.config.DatabaseUrlNormalizerPostProcessor
+  com.beautica.config.DatabaseUrlNormalizerPostProcessor,\
+  com.beautica.config.EnvironmentFingerprintGuard
