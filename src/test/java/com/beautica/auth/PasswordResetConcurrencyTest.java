@@ -1,5 +1,6 @@
 package com.beautica.auth;
 
+import com.beautica.TestPostgresImage;
 import com.beautica.support.TestHttpClients;
 import com.beautica.auth.dto.ForgotPasswordRequest;
 import com.beautica.auth.dto.RegisterRequest;
@@ -64,7 +65,7 @@ class PasswordResetConcurrencyTest {
     private static final Logger log = LoggerFactory.getLogger(PasswordResetConcurrencyTest.class);
 
     private static final PostgreSQLContainer<?> POSTGRES =
-            new PostgreSQLContainer<>("postgres:16-alpine");
+            new PostgreSQLContainer<>(TestPostgresImage.IMAGE);
 
     static {
         POSTGRES.start();

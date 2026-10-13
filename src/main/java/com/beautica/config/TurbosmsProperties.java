@@ -2,6 +2,8 @@ package com.beautica.config;
 
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
+import java.time.Duration;
+
 /**
  * Typed config for the Turbosms SMS provider (Phase 13.1).
  *
@@ -30,6 +32,28 @@ public class TurbosmsProperties {
      * WireMock stub.
      */
     private String baseUrl = "https://api.turbosms.ua/message/send.json";
+
+    /** TCP connect timeout (validated positive by {@link TurbosmsService}'s constructor; class is not @Validated); bounds an unroutable Turbosms host. Default 3s. */
+    private Duration connectTimeout = Duration.ofSeconds(3);
+
+    /** Response (read) timeout; bounds a hung Turbosms endpoint. Default 5s. */
+    private Duration readTimeout = Duration.ofSeconds(5);
+
+    public Duration getConnectTimeout() {
+        return connectTimeout;
+    }
+
+    public void setConnectTimeout(Duration connectTimeout) {
+        this.connectTimeout = connectTimeout;
+    }
+
+    public Duration getReadTimeout() {
+        return readTimeout;
+    }
+
+    public void setReadTimeout(Duration readTimeout) {
+        this.readTimeout = readTimeout;
+    }
 
     public String getToken() {
         return token;

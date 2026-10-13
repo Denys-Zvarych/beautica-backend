@@ -1143,8 +1143,8 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * {@code SET LOCAL lock_timeout = '3s'} (transaction-scoped; resets automatically at
      * commit/rollback and never leaks onto the next borrower of the pooled connection) — AND
      * acquires the salt-{@code 1} advisory lock in the SAME statement. Folding the two into one
-     * round trip removes a network hop from every booking write (perf finding; measurable on
-     * Neon's serverless proxy, which is a real network hop per statement, not a local call).
+     * round trip removes a network hop from every booking write (perf finding; a network
+     * round trip per statement, not a local call).
      *
      * <p>Postgres does NOT formally guarantee subexpression evaluation order (docs §4.2.14 leaves
      * it undefined), but the executor's {@code ExecProject} evaluates target-list entries in
@@ -1162,7 +1162,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * commits (the classic check-then-act race). Without the timeout, a single authenticated
      * CLIENT firing N concurrent requests would deterministically serialize all of them on the
      * identical advisory lock — parking N-1 Hikari connections for up to the full
-     * connection-timeout and starving the pool (Neon free-tier {@code maximum-pool-size: 10})
+     * connection-timeout and starving the pool ({@code maximum-pool-size: 10})
      * for every other tenant (security fix, booking advisory-lock DoS audit).
      *
      * <p>Uses salt {@code 1} (vs. salt {@code 0} for {@link #acquireAdvisoryLock(UUID)}) so the

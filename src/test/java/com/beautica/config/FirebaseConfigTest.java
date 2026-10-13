@@ -216,4 +216,47 @@ class FirebaseConfigTest {
                 + "\"token_uri\":\"https://oauth2.googleapis.com/token\"}";
         return Base64.getEncoder().encodeToString(json.getBytes(java.nio.charset.StandardCharsets.UTF_8));
     }
+
+    @Test
+    @DisplayName("buildOptions → default connect 5000 ms / read 10000 ms")
+    void should_useDefaultTimeouts_when_buildingOptions() {
+        FirebaseConfig config = newConfig(true, "x");
+
+        com.google.firebase.FirebaseOptions options = config.buildOptions(stubCredentials());
+
+        assertThat(options.getConnectTimeout()).isEqualTo(5000);
+        assertThat(options.getReadTimeout()).isEqualTo(10000);
+    }
+
+    @Test
+    @DisplayName("buildOptions → configured timeouts are honoured")
+    void should_honourConfiguredTimeouts_when_buildingOptions() {
+        FirebaseConfig config = newConfig(true, "x");
+        ReflectionTestUtils.setField(config, "connectTimeout", "1234ms");
+        ReflectionTestUtils.setField(config, "readTimeout", "7s");
+
+        com.google.firebase.FirebaseOptions options = config.buildOptions(stubCredentials());
+
+        assertThat(options.getConnectTimeout()).isEqualTo(1234);
+        assertThat(options.getReadTimeout()).isEqualTo(7000);
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"0", "0ms", "-1s"})
+    @DisplayName("buildOptions → rejects zero/negative connect and read timeouts")
+    void should_rejectNonPositiveTimeouts_when_buildingOptions(String value) {
+        FirebaseConfig connect = newConfig(true, "x");
+        ReflectionTestUtils.setField(connect, "connectTimeout", value);
+        FirebaseConfig read = newConfig(true, "x");
+        ReflectionTestUtils.setField(read, "readTimeout", value);
+
+        assertThatThrownBy(() -> connect.buildOptions(stubCredentials()))
+                .isInstanceOf(IllegalStateException.class).hasMessageContaining("app.firebase.connect-timeout");
+        assertThatThrownBy(() -> read.buildOptions(stubCredentials()))
+                .isInstanceOf(IllegalStateException.class).hasMessageContaining("app.firebase.read-timeout");
+    }
+
+    private static GoogleCredentials stubCredentials() {
+        return GoogleCredentials.create(new com.google.auth.oauth2.AccessToken("t", null));
+    }
 }

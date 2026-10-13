@@ -1,5 +1,6 @@
 package com.beautica.service.migration;
 
+import com.beautica.TestPostgresImage;
 import org.flywaydb.core.Flyway;
 import org.flywaydb.core.api.MigrationVersion;
 import org.junit.jupiter.api.BeforeAll;
@@ -70,7 +71,7 @@ class V165FailFastGuardIT {
 
     @BeforeAll
     static void startContainer() {
-        postgres = new PostgreSQLContainer<>("postgres:16-alpine");
+        postgres = new PostgreSQLContainer<>(TestPostgresImage.IMAGE);
         postgres.start();
     }
 

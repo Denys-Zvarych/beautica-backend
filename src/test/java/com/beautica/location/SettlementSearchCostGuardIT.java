@@ -171,7 +171,7 @@ class SettlementSearchCostGuardIT extends AbstractIntegrationTest {
 
     /**
      * The absolute floor under the derived budget, in work units: the budget measured on
-     * 2026-09-23 against the real V170/V171/V175 taxonomy on postgres:16-alpine — worst benign
+     * 2026-09-23 against the real V170/V171/V175 taxonomy on PG 16 (measured before the PG 18 bump) — worst benign
      * «іванівка» 5 102 rechecked x 8 characters = 40 816, x {@link #MAX_WORK_RATIO}. Below this the
      * bound stops being a statement about what the endpoint can be made to cost and becomes a
      * statement about how many {@code -івка} settlements survive the current exclusion refresh. See

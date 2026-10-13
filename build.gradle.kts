@@ -25,6 +25,11 @@ repositories {
     mavenCentral()
 }
 
+// Override Boot 3.4.5's managed Flyway 10.20.1 (supports PostgreSQL <= 17; we pin PG 18 everywhere,
+// so every boot logged "PostgreSQL 18.x is newer than this version of Flyway"). 11.20.3 is the
+// newest 11.x on Maven Central; Boot dependency management is kept.
+extra["flyway.version"] = "11.20.3"
+
 // Override Spring Boot BOM's Testcontainers 1.19.8 with 1.20.4.
 // Reason: docker-java 3.3.6 (TC 1.19.8) negotiates Docker API version 1.32,
 // which Docker Engine 25+ rejects (minimum supported is 1.40).

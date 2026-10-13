@@ -1,5 +1,6 @@
 package com.beautica.migration;
 
+import com.beautica.support.IndexCapabilityProbe;
 import com.beautica.AbstractIntegrationTest;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -203,11 +204,11 @@ class V168SalonPartitionCoveringIndexMigrationTest extends AbstractIntegrationTe
                         + "the COUNT reads the salon's whole physical footprint again — exactly the "
                         + "pathology V168 removed. Plan:%n%s", plan)
                 .contains("Index Only Scan using " + SALON_PARTITION_INDEX);
-        assertThat(plan)
+        assertThat(IndexCapabilityProbe.indexCondLines(plan))
                 .as("salon_id must be a SEEK BOUND, not a residual filter over the whole index — "
                         + "the leading key position is what makes the scan proportional to the "
                         + "salon rather than to the table. Plan:%n%s", plan)
-                .contains("Index Cond: (salon_id =");
+                .anyMatch(line -> line.contains("salon_id = "));
     }
 
     @Test
@@ -228,12 +229,11 @@ class V168SalonPartitionCoveringIndexMigrationTest extends AbstractIntegrationTe
                         + "Index Scan — one random heap fetch per matched row, 20x worse per row "
                         + "than the salon-wide shape it exists to narrow. Plan:%n%s", plan)
                 .contains("Index Only Scan using " + SALON_MASTER_PARTITION_INDEX);
-        assertThat(plan)
+        assertThat(IndexCapabilityProbe.indexCondLines(plan))
                 .as("master_id sits between the salon_id equality and the starts_at sort key, so "
                         + "BOTH must be seek bounds. If master_id fell into a residual Filter the "
                         + "chip would scan every booking the salon ever took. Plan:%n%s", plan)
-                .contains("Index Cond: ((salon_id =")
-                .contains("AND (master_id =");
+                .anyMatch(line -> line.contains("salon_id = ") && line.contains("AND master_id = "));
     }
 
     @Test

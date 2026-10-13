@@ -7,7 +7,11 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.TransactionDefinition;
+import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -55,33 +59,61 @@ public class PhoneOtpService {
     private final OtpSmsSender otpSmsSender;
     private final SecureRandom secureRandom;
     private final Clock clock;
+    private final TransactionTemplate requiresNewTx;
 
     public PhoneOtpService(PhoneOtpRepository phoneOtpRepository,
                            PhoneOtpAttemptRecorder attemptRecorder,
                            GuestTokenProvider guestTokenProvider,
                            OtpSmsSender otpSmsSender,
-                           Clock clock) {
+                           Clock clock,
+                           PlatformTransactionManager transactionManager) {
         this.phoneOtpRepository = phoneOtpRepository;
         this.attemptRecorder = attemptRecorder;
         this.guestTokenProvider = guestTokenProvider;
         this.otpSmsSender = otpSmsSender;
         this.secureRandom = new SecureRandom();
         this.clock = clock;
+        this.requiresNewTx = new TransactionTemplate(transactionManager);
+        this.requiresNewTx.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
     }
 
     /**
-     * Validates the phone, enforces the per-phone rate limit, expires any prior unused
-     * code, persists a fresh hashed code, and dispatches it by SMS.
+     * Validates the phone, enforces the per-phone rate limit and persists a fresh hashed code (own
+     * short transaction, committed), dispatches it by SMS <b>outside any transaction</b>, and only
+     * once delivered invalidates the phone's older unused codes.
+     *
+     * <p>{@code NOT_SUPPORTED} suspends any caller-supplied transaction (through the Spring proxy —
+     * the controller injects this bean, so there is no self-invocation): the provider call can block
+     * for up to connect + read timeout (~8 s); inside a transaction that holds a Hikari connection
+     * for the whole wait, so a handful of concurrent sends during a Turbosms brown-out would
+     * exhaust the pool and stall the whole API.
      *
      * @throws BusinessException 400 on a malformed phone, 429 when the per-phone window
      *                           cap is exceeded, 503 when the provider could not be reached
      *                           (see {@link #dispatchCode})
      */
-    @Transactional
+    @Transactional(propagation = Propagation.NOT_SUPPORTED)
     public void sendOtp(String phone) {
         if (!E164_UA.matcher(phone).matches()) {
             throw new BusinessException(HttpStatus.BAD_REQUEST, "Invalid phone format");
         }
+
+        String code = generateCode();
+        Long otpId = requiresNewTx.execute(status -> issueOtpRow(phone, code));
+
+        dispatchCode(phone, code, otpId);
+        invalidateOlderCodesQuietly(phone, otpId);
+        log.info("OTP sent to {}", maskPhone(phone));
+    }
+
+    /**
+     * Tx 1: per-phone advisory lock, rate-limit check, persist ONLY the new hashed row. Runs in
+     * REQUIRES_NEW. The previous code is deliberately left valid until delivery succeeds, so a
+     * provider outage cannot be used to kill a victim's live code. The lock serialises the
+     * count-then-insert per phone so concurrent sends cannot all pass the cap.
+     */
+    private Long issueOtpRow(String phone, String code) {
+        phoneOtpRepository.lockPhoneForSend(phone);
 
         Instant now = clock.instant();
         int recentSends = phoneOtpRepository.countByPhoneAndCreatedAtAfter(
@@ -90,47 +122,77 @@ public class PhoneOtpService {
             throw new BusinessException(HttpStatus.TOO_MANY_REQUESTS, "OTP limit exceeded");
         }
 
-        // Invalidate any still-active code so only the new one is redeemable.
-        phoneOtpRepository.markAllUnusedAsUsed(phone);
-
-        String code = generateCode();
-        String codeHash = sha256Hex(code);
-        phoneOtpRepository.save(PhoneOtp.issue(phone, codeHash, now.plus(OTP_TTL)));
-
-        dispatchCode(phone, code);
-        log.info("OTP sent to {}", maskPhone(phone));
+        PhoneOtp otp = PhoneOtp.issue(phone, sha256Hex(code), now.plus(OTP_TTL));
+        phoneOtpRepository.save(otp);
+        return otp.getId();
     }
 
     /**
      * Hands the code to the auth-channel sender, translating any provider failure into a clean
-     * <b>503</b> that rolls this transaction — and therefore the freshly persisted OTP row — back.
+     * <b>503</b> and compensating by marking the freshly committed OTP row used (Tx 2). The
+     * previous code stays valid (it was never invalidated): {@code verifyOtp} picks the newest
+     * UNUSED row.
      *
      * <h4>Why NOT the booking paths' swallow-and-warn</h4>
      * Every booking sender catches, logs and carries on, because the booking is already committed
      * and a provider outage must not turn a successful create into a failed request. The OTP is the
      * exact inverse: the row is worthless to a guest who never receives the code, and answering 200
      * would recreate — from a different cause — the very silent-failure defect the
-     * {@link OtpSmsSender} carve-out exists to close. So the failure is surfaced, and the rollback
-     * is a feature: no orphan hash, and the per-phone window budget (which counts rows) is not burnt
-     * by an attempt that delivered nothing, so the guest may retry immediately.
+     * {@link OtpSmsSender} carve-out exists to close. So the failure is surfaced, and the row is
+     * burnt ({@code used = true}, never deleted): it can never be redeemed, and it STILL counts
+     * toward the per-phone window cap (the count query ignores {@code used}) — a provider timeout
+     * may have delivered the SMS anyway, so failed attempts must not allow more than the cap of
+     * SMS per window to a victim.
      *
-     * <h4>What is not done</h4>
-     * The send is NOT moved after commit. An after-commit send cannot report failure to the caller
-     * at all — the response is already written — which is the 200-and-nothing-happened shape again.
-     * The residual risk of sending before commit (code delivered, then the commit itself fails) is
-     * strictly smaller and unchanged from this method's original ordering.
+     * <h4>Ordering</h4>
+     * The row is committed BEFORE the send so no DB connection is held while the provider is slow
+     * (pool exhaustion). The send is still synchronous, so a failure is reported to the caller as a
+     * 503. If the compensating UPDATE itself fails, the 503 is still returned; the unsent row stays
+     * UNUSED until its TTL (then the expiry cleanup job removes it). While it lives, {@code verifyOtp} (newest unused row wins)
+     * would test codes against that undelivered row instead of the older delivered one — an
+     * availability blip bounded by the TTL, never a security hole.
      *
      * <p>Only the exception CLASS is logged, never the message (may echo the provider URL), never
      * the code and never the unmasked phone (Anti-Bug §I). The 503 body is generic for the same
      * reason.
      */
-    private void dispatchCode(String phone, String code) {
+    private void dispatchCode(String phone, String code, Long otpId) {
         try {
             otpSmsSender.send(phone, "Beautica: " + code + " — код підтвердження");
         } catch (RuntimeException e) {
             log.warn("OTP send failed for {}: {}", maskPhone(phone), e.getClass().getSimpleName());
+            burnUndeliveredRowQuietly(otpId);
             throw new BusinessException(
                     HttpStatus.SERVICE_UNAVAILABLE, ServiceUnavailableMessages.OTP_SEND_FAILED);
+        }
+    }
+
+    /** Tx 2 (compensation): marks the undelivered OTP row used; never masks the original 503. */
+    private void burnUndeliveredRowQuietly(Long otpId) {
+        if (otpId == null) {
+            return;
+        }
+        try {
+            requiresNewTx.executeWithoutResult(status -> phoneOtpRepository.markAsUsedById(otpId));
+        } catch (RuntimeException e) {
+            log.warn("OTP compensation update failed: {}", e.getClass().getSimpleName());
+        }
+    }
+
+    /**
+     * Tx 3 (post-delivery): one UPDATE marking every OLDER unused code for the phone as used (id below the
+     * new row's), so the newest delivered code stays redeemable even when sends overlap. Failure is logged, not surfaced: the SMS is already
+     * out, and {@code verifyOtp} redeems only the newest unused row regardless.
+     */
+    private void invalidateOlderCodesQuietly(String phone, Long newId) {
+        if (newId == null) {
+            return;
+        }
+        try {
+            requiresNewTx.executeWithoutResult(status -> phoneOtpRepository.markOlderAsUsed(phone, newId));
+        } catch (RuntimeException e) {
+            log.warn("OTP older-code invalidation failed for {}: {}",
+                    maskPhone(phone), e.getClass().getSimpleName());
         }
     }
 
@@ -146,7 +208,7 @@ public class PhoneOtpService {
     public String verifyOtp(String phone, String code) {
         Instant now = clock.instant();
         Optional<PhoneOtp> active = phoneOtpRepository
-                .findTopByPhoneAndUsedFalseAndExpiresAtAfterOrderByCreatedAtDesc(phone, now);
+                .findTopByPhoneAndUsedFalseAndExpiresAtAfterOrderByIdDesc(phone, now);
 
         if (active.isEmpty()) {
             throw unauthorized();

@@ -1,5 +1,6 @@
 package com.beautica.notification.sms;
 
+import com.beautica.config.OutboundTimeouts;
 import com.beautica.config.TurbosmsProperties;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpHeaders;
@@ -39,11 +40,6 @@ public class TurbosmsService implements SmsService {
 
     private static final String SUCCESS_STATUS = "OK";
     private static final String FAILURE_STATUS = "FAILED";
-    /** Cap the TCP handshake so an unroutable Turbosms host fails fast (Anti-Bug §H / thread-pool starvation). */
-    private static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(3);
-    /** Cap the response wait so a hung Turbosms endpoint cannot pin the calling thread indefinitely. */
-    private static final Duration READ_TIMEOUT = Duration.ofSeconds(5);
-
     private final RestClient restClient;
     private final String baseUrl;
     private final String token;
@@ -89,10 +85,12 @@ public class TurbosmsService implements SmsService {
         HttpClient httpClient = HttpClient.newBuilder()
                 .version(HttpClient.Version.HTTP_1_1)
                 .followRedirects(HttpClient.Redirect.NEVER)
-                .connectTimeout(CONNECT_TIMEOUT)
+                .connectTimeout(OutboundTimeouts.requirePositive(
+                        "app.sms.turbosms.connect-timeout", properties.getConnectTimeout()))
                 .build();
         JdkClientHttpRequestFactory requestFactory = new JdkClientHttpRequestFactory(httpClient);
-        requestFactory.setReadTimeout(READ_TIMEOUT);
+        requestFactory.setReadTimeout(OutboundTimeouts.requirePositive(
+                "app.sms.turbosms.read-timeout", properties.getReadTimeout()));
         this.restClient = restClientBuilder.requestFactory(requestFactory).build();
         this.baseUrl = properties.getBaseUrl();
         this.token = properties.getToken();

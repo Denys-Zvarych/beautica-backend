@@ -1,5 +1,6 @@
 package com.beautica.service.migration;
 
+import com.beautica.TestPostgresImage;
 import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -83,7 +84,7 @@ class V121MigrationIntegrationTest {
 
     @BeforeAll
     static void migrateToV120_seedCollisions_thenApplyV121() {
-        postgres = new PostgreSQLContainer<>("postgres:16-alpine");
+        postgres = new PostgreSQLContainer<>(TestPostgresImage.IMAGE);
         postgres.start();
 
         dataSource = new DriverManagerDataSource(

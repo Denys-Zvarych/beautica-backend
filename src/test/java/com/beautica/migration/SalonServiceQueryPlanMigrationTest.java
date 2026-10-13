@@ -1,5 +1,6 @@
 package com.beautica.migration;
 
+import com.beautica.support.IndexCapabilityProbe;
 import com.beautica.AbstractIntegrationTest;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -230,11 +231,11 @@ class SalonServiceQueryPlanMigrationTest extends AbstractIntegrationTest {
                         + "again — which is what V169 exists to remove. Measured, an index rebuilt "
                         + "with INCLUDE (status) alone already fails this. Plan:%n%s", plan)
                 .contains("Index Only Scan using " + V169_INDEX);
-        assertThat(plan)
+        assertThat(IndexCapabilityProbe.indexCondLines(plan))
                 .as("salon_id must be a SEEK BOUND. Without the salon scope leading the index the "
                         + "planner falls to V18's bare FK index (%s) and discards the salon to a "
                         + "post-scan filter. Plan:%n%s", V18_FK_INDEX, plan)
-                .contains("Index Cond: (salon_id =");
+                .anyMatch(line -> line.contains("salon_id = "));
     }
 
     @Test

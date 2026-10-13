@@ -424,7 +424,7 @@ class AsyncConfigTest {
      * time": a {@link ThreadPoolExecutor} with a bounded queue grows past its core size only once
      * the queue is FULL, so this pool was effectively single-threaded in every state short of a
      * 1000-task backlog — a platform-wide serialization point for evictions that can each park
-     * 50–200 ms on a {@code sync = true} reader's Neon round-trip. One master's slow eviction
+     * 50–200 ms on a {@code sync = true} reader's DB round-trip. One master's slow eviction
      * therefore delayed every other master's. Raising the core to 2 is the fix; asserting
      * {@code core == max} is what stops it silently regressing to the same trap the
      * {@code smsReminderExecutor} above already fell into once.
@@ -491,7 +491,7 @@ class AsyncConfigTest {
                 assertThat(tripped.await(15, TimeUnit.SECONDS))
                         .as("only %s of %s evictions were running at once — a bounded-queue pool with "
                                         + "core < max stays at core until the queue fills, so the second "
-                                        + "master's sweep waits behind the first master's Neon stall",
+                                        + "master's sweep waits behind the first master's DB stall",
                                 width - tripped.getCount(), width)
                         .isTrue();
             } finally {

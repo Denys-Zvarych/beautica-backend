@@ -87,8 +87,7 @@ import java.util.regex.Pattern;
  *       admission guard in {@link #search(String)} run before the cache (a refused term is never
  *       a key), and the 20-row {@code LIMIT} bounds every value. Deliberately NOT
  *       {@code sync = true}: Caffeine's sync load holds a {@code synchronized} bin lock for the
- *       whole miss (connection checkout + query, seconds on a Neon cold start), which pins a
- *       virtual thread's carrier, and this cache misses on every new prefix. A duplicate
+ *       whole miss (connection checkout plus query), pinning a virtual thread's carrier, and this cache misses on every new prefix. A duplicate
  *       concurrent miss on the same prefix costs one extra ~1 ms indexed query.</li>
  * </ul>
  *

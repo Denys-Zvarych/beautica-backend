@@ -1,5 +1,6 @@
 package com.beautica.migration;
 
+import com.beautica.TestPostgresImage;
 import org.flywaydb.core.Flyway;
 import org.flywaydb.core.api.MigrationVersion;
 import org.junit.jupiter.api.AfterAll;
@@ -67,7 +68,7 @@ class V170OccupiedCityPurgeGuardTest {
 
     @BeforeAll
     static void startContainerMigrateTo169AndLoadSql() throws Exception {
-        postgres = new PostgreSQLContainer<>("postgres:16-alpine");
+        postgres = new PostgreSQLContainer<>(TestPostgresImage.IMAGE);
         postgres.start();
 
         dataSource = new DriverManagerDataSource(

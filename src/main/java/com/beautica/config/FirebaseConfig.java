@@ -11,6 +11,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.DisposableBean;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.convert.DurationStyle;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.core.env.Environment;
@@ -29,6 +30,14 @@ public class FirebaseConfig implements DisposableBean {
 
     @Value("${app.firebase.service-account:}")
     private String serviceAccountJson;
+
+    /** {@code app.firebase.connect-timeout}; field default mirrors yml so a missing key is never 0 (infinite). */
+    @Value("${app.firebase.connect-timeout:5s}")
+    private String connectTimeout = "5s";
+
+    /** {@code app.firebase.read-timeout}; see {@link #connectTimeout}. */
+    @Value("${app.firebase.read-timeout:10s}")
+    private String readTimeout = "10s";
 
     @Value("${FIREBASE_ENABLED:false}")
     private boolean firebaseEnabled;
@@ -102,12 +111,18 @@ public class FirebaseConfig implements DisposableBean {
 
     /** Seam for tests; creates and registers the default {@link FirebaseApp}. */
     FirebaseApp initializeApp(GoogleCredentials credentials) {
-        FirebaseOptions options = FirebaseOptions.builder()
+        return FirebaseApp.initializeApp(buildOptions(credentials));
+    }
+
+    /** Builds the options with the configured timeouts; package-private so tests assert them. */
+    FirebaseOptions buildOptions(GoogleCredentials credentials) {
+        return FirebaseOptions.builder()
                 .setCredentials(credentials)
-                .setConnectTimeout(5000)
-                .setReadTimeout(10000)
+                .setConnectTimeout(OutboundTimeouts.requirePositiveMillis(
+                        "app.firebase.connect-timeout", DurationStyle.detectAndParse(connectTimeout)))
+                .setReadTimeout(OutboundTimeouts.requirePositiveMillis(
+                        "app.firebase.read-timeout", DurationStyle.detectAndParse(readTimeout)))
                 .build();
-        return FirebaseApp.initializeApp(options);
     }
 
     private static FirebaseSender noOpSender() {

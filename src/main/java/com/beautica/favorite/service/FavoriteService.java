@@ -262,7 +262,7 @@ public class FavoriteService {
      *       days per candidate master.</li>
      *   <li><b>What would make it NOT acceptable.</b> Pool pressure showing up in
      *       {@code hikaricp_connections_pending} (Actuator/Micrometer) against the 10-connection
-     *       HikariCP ceiling — the Neon free-tier hard limit, {@code application.yml:13}. That is
+     *       HikariCP ceiling — the pool ceiling set in {@code application.yml}. That is
      *       the trigger to split the read into a gate-then-project shape that releases the
      *       connection across the in-memory walk, not a reason to raise the pool.</li>
      * </ul>

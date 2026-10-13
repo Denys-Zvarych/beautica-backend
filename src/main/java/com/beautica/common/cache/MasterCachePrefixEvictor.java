@@ -25,7 +25,7 @@ import java.util.function.Predicate;
  * a schedule write 5 (~5 500 keys), and a service-definition mutation multiplied that by every performing
  * master (a 50-master salon ≈ 200 000 key comparisons on one request). Worse,
  * {@code asMap().keySet().removeIf} takes the ConcurrentHashMap bin lock, while {@code sync = true}'s
- * {@code computeIfAbsent} HOLDS that same bin lock across its DB round-trips to Neon — so an eviction scan
+ * {@code computeIfAbsent} HOLDS that same bin lock across its DB round-trips to the database — so an eviction scan
  * could stall the booking-create thread for a concurrent reader's DB latency. The scan itself was correct;
  * it simply must not sit on the booking-create critical path.
  *

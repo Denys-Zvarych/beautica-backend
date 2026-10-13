@@ -17,8 +17,8 @@ import javax.sql.DataSource;
  *
  * <p><strong>Why this exists.</strong> Flyway opens a single JDBC connection and
  * holds it for the entire {@code migrate()} run while it applies every migration
- * (including the large {@code V53__seed_locality_taxonomy.sql} seed). Against
- * Neon that single hold easily exceeds the main pool's
+ * (including the large {@code V53__seed_locality_taxonomy.sql} seed). On a
+ * networked prod database that single hold can exceed the main pool's
  * {@code leak-detection-threshold: 10000} (10 s), so HikariCP logs a spurious
  * "Apparent connection leak detected" WARN. The connection is returned correctly
  * — it is a long, legitimate hold, not a leak. Routing Flyway through its own
@@ -28,7 +28,7 @@ import javax.sql.DataSource;
  * <p><strong>Credentials source.</strong> The pool is built from the same
  * {@code spring.datasource.*} properties the primary {@link DataSource} uses
  * (post-normalization by {@link DatabaseUrlNormalizerPostProcessor}). It is bound
- * via a private {@link DataSourceProperties} so prod (Neon via {@code DATABASE_URL}),
+ * via a private {@link DataSourceProperties} so prod (Postgres via {@code DATABASE_URL}),
  * {@code local} (Docker), and any other non-test profile resolve the correct URL,
  * username, and password automatically — nothing is hardcoded.
  *
@@ -44,7 +44,7 @@ public class FlywayDataSourceConfig {
 
     /**
      * Flyway holds its single connection for the whole run; once {@code migrate()}
-     * finishes nothing else uses this pool, so it must not pin an idle Neon
+     * finishes nothing else uses this pool, so it must not pin an idle
      * connection for the app's lifetime. A short idle timeout collapses the pool
      * back to zero connections shortly after migration completes.
      */

@@ -695,7 +695,7 @@ public interface MasterServiceRepository extends JpaRepository<MasterServiceAssi
      * {@code work_mem='64kB'}, which made the planner swap which side of the join it hashes
      * rather than spill to disk. <b>Caveat:</b> the crossover and the cost-model constants above
      * are derived from local Postgres defaults ({@code random_page_cost=4}, {@code work_mem=4MB});
-     * production runs on Railway/Neon and that config has not been verified there, so re-derive
+     * production runs on Railway Postgres and that config has not been verified there, so re-derive
      * before treating 18,100 rows as a production trigger.
      */
     @Query("""

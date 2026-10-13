@@ -17,12 +17,12 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <p><b>What this protects.</b> Roughly 38 methods pair {@code @Cacheable(..., sync = true)} with
  * {@code @Transactional} on the same method. Caffeine's {@code sync = true} loader funnels through
  * {@code ConcurrentHashMap.compute}, so on a popular key one thread loads while every other caller
- * BLOCKS on that bin lock for a full DB round-trip to Neon. What those blocked callers are HOLDING
+ * BLOCKS on that bin lock for a full DB round-trip to the database. What those blocked callers are HOLDING
  * while they wait is decided entirely by advisor order:
  * <ul>
  *   <li>Transaction advisor outer → each waiter entered a transaction before reaching the cache
  *       advisor, so it is sitting on a Hikari connection from a pool of ten
- *       ({@code application.yml}: {@code maximum-pool-size: 10}, a Neon-tier ceiling). One slow
+ *       ({@code application.yml}: {@code maximum-pool-size: 10}, a deliberate ceiling). One slow
  *       query on one hot key can then exhaust the pool for the whole application.</li>
  *   <li>Cache advisor outer → a waiter blocks BEFORE any transaction is opened and holds no
  *       connection at all; a cache HIT likewise returns without ever starting one. The MISS path is
