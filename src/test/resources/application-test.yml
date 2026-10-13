@@ -200,6 +200,10 @@ notification:
       max-batches-per-run: 50
 
 management:
+  endpoint:
+    health:
+      # Test-only: lets BeauticaApplicationTests assert components.db. application.yml stays never.
+      show-details: always
   health:
     mail:
       enabled: false

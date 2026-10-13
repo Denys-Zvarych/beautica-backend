@@ -12,10 +12,10 @@ public interface PhoneOtpRepository extends JpaRepository<PhoneOtp, Long> {
 
     /**
      * The single active (unused, unexpired) OTP for a phone. {@code findTop} guarantees
-     * at most one row even though {@code sendOtp} expires prior unused codes before
-     * issuing a new one — defence-in-depth against a duplicate slipping through a race.
+     * at most one row even though {@code sendOtp} expires prior unused codes after
+     * delivering a new one (the newest unused row always wins in between) — defence-in-depth against a duplicate slipping through a race.
      */
-    Optional<PhoneOtp> findTopByPhoneAndUsedFalseAndExpiresAtAfterOrderByCreatedAtDesc(
+    Optional<PhoneOtp> findTopByPhoneAndUsedFalseAndExpiresAtAfterOrderByIdDesc(
             String phone, Instant now);
 
     /**
@@ -27,12 +27,40 @@ public interface PhoneOtpRepository extends JpaRepository<PhoneOtp, Long> {
     int countByPhoneAndCreatedAtAfter(String phone, Instant since);
 
     /**
-     * Expires every still-active OTP for a phone in one bounded UPDATE, so a newly
-     * issued code is the only redeemable one. Bulk modifying query — no per-row load.
+     * Serialises concurrent sends for one phone: takes a transaction-scoped Postgres advisory lock
+     * keyed on {@code hashtext(phone)}, released automatically at commit/rollback. Must be called
+     * first inside the issuing transaction so the rate-limit count-then-insert cannot interleave
+     * between two requests for the same phone. (Postgres-only; the project runs Postgres in every
+     * profile, including Testcontainers.) The scalar select wrapper exists because
+     * {@code pg_advisory_xact_lock} returns {@code void}, which Hibernate cannot map.
+     */
+    @Query(value = "SELECT 1 FROM (SELECT pg_advisory_xact_lock(hashtext(:phone))) AS l", nativeQuery = true)
+    int lockPhoneForSend(@Param("phone") String phone);
+
+    /**
+     * Invalidates every still-active OTP for a phone OLDER than {@code keepId} (strictly lower id) in
+     * one bounded UPDATE, run only after the new code was actually delivered. Bulk modifying query —
+     * no per-row load.
+     *
+     * <p>{@code id} is a sequence and inserts are serialised per phone by the advisory lock, so a
+     * higher id always means a newer row. Using {@code <} (not {@code <>}) means a send can only ever
+     * invalidate older rows: when two sends overlap (the lock covers only the insert transaction),
+     * the later send's code survives even if the earlier send's invalidation runs last — consistent
+     * with {@code verifyOtp}, where the newest unused row wins.
      */
     @Modifying
-    @Query("UPDATE PhoneOtp o SET o.used = true WHERE o.phone = :phone AND o.used = false")
-    void markAllUnusedAsUsed(@Param("phone") String phone);
+    @Query("UPDATE PhoneOtp o SET o.used = true WHERE o.phone = :phone AND o.used = false AND o.id < :keepId")
+    int markOlderAsUsed(@Param("phone") String phone, @Param("keepId") Long keepId);
+
+    /**
+     * Single-statement UPDATE by id marking an undelivered code as used: it can never be redeemed,
+     * yet the row stays so it keeps counting toward the per-phone window cap (a provider timeout may
+     * have delivered the SMS anyway). The older delivered code stays valid because {@code verifyOtp}
+     * picks the newest UNUSED row.
+     */
+    @Modifying
+    @Query("UPDATE PhoneOtp o SET o.used = true WHERE o.id = :id")
+    int markAsUsedById(@Param("id") Long id);
 
     /**
      * Atomically records one wrong verify attempt against a single OTP row and, in the

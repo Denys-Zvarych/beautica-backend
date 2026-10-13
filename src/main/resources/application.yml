@@ -92,6 +92,7 @@ spring:
           auth: true
           starttls:
             enable: true
+          # pinned by MailTimeoutConfigTest — 0/absent = infinite hang
           connectiontimeout: 5000
           timeout: 10000
           writetimeout: 10000
@@ -244,8 +245,13 @@ app:
     # Endpoint host must end with .r2.cloudflarestorage.com unless this opt-out is true.
     allow-custom-endpoint: ${CLOUDFLARE_R2_ALLOW_CUSTOM_ENDPOINT:false}
     public-url: ${CLOUDFLARE_R2_PUBLIC_URL:}
+    # Outbound HTTP timeouts (Duration). socket-timeout is per-read INACTIVITY, not a total deadline.
+    connection-timeout: 5s
+    socket-timeout: 30s
   firebase:
     service-account: ${FIREBASE_SERVICE_ACCOUNT:}
+    connect-timeout: 5s
+    read-timeout: 10s
   frontend:
     base-url: ${FRONTEND_BASE_URL:http://localhost:3000}
   invite:
@@ -340,6 +346,8 @@ app:
       token: ${TURBOSMS_TOKEN:}
       sender-name: ${TURBOSMS_SENDER_NAME:Beautica}
       base-url: ${TURBOSMS_BASE_URL:https://api.turbosms.ua/message/send.json}
+      connect-timeout: 3s
+      read-timeout: 5s
   json:
     # Global Jackson StreamReadConstraints (see JsonConfig / JsonConstraintsProperties).
     # max-string-length caps a single JSON string token at the PARSE phase so a multi-MB

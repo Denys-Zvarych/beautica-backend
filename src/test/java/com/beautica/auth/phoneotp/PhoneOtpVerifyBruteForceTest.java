@@ -69,12 +69,13 @@ class PhoneOtpVerifyBruteForceTest {
     @Mock private GuestTokenProvider guestTokenProvider;
     @Mock private OtpSmsSender otpSmsSender;
 
+    private final RecordingTransactionManager txManager = new RecordingTransactionManager();
     private PhoneOtpService service;
 
     @BeforeEach
     void setUp() {
         service = new PhoneOtpService(phoneOtpRepository, attemptRecorder, guestTokenProvider,
-                otpSmsSender, Clock.fixed(FIXED_NOW, ZoneOffset.UTC));
+                otpSmsSender, Clock.fixed(FIXED_NOW, ZoneOffset.UTC), txManager);
     }
 
     private static String sha256Hex(String value) throws Exception {
@@ -96,7 +97,7 @@ class PhoneOtpVerifyBruteForceTest {
         AtomicBoolean dbUsed = new AtomicBoolean(false);
 
         when(phoneOtpRepository
-                .findTopByPhoneAndUsedFalseAndExpiresAtAfterOrderByCreatedAtDesc(eq(PHONE), any()))
+                .findTopByPhoneAndUsedFalseAndExpiresAtAfterOrderByIdDesc(eq(PHONE), any()))
                 .thenAnswer(inv -> dbUsed.get() ? Optional.empty() : Optional.of(otp));
         org.mockito.Mockito.doAnswer(inv -> {
                     int cap = inv.getArgument(1);

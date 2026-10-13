@@ -47,12 +47,13 @@ class PhoneOtpServiceTest {
     @Mock private GuestTokenProvider guestTokenProvider;
     @Mock private OtpSmsSender otpSmsSender;
 
+    private final RecordingTransactionManager txManager = new RecordingTransactionManager();
     private PhoneOtpService service;
 
     @BeforeEach
     void setUp() {
         service = new PhoneOtpService(phoneOtpRepository, attemptRecorder, guestTokenProvider,
-                otpSmsSender, Clock.fixed(FIXED_NOW, ZoneOffset.UTC));
+                otpSmsSender, Clock.fixed(FIXED_NOW, ZoneOffset.UTC), txManager);
     }
 
     private static String sha256Hex(String value) throws Exception {
@@ -88,13 +89,78 @@ class PhoneOtpServiceTest {
     }
 
     @Test
-    @DisplayName("should_expirePriorUnusedOtps_when_newSend")
-    void should_expirePriorUnusedOtps_when_newSend() {
+    @DisplayName("should_invalidateOtherCodesExceptTheNewOne_when_sendSucceeds")
+    void should_invalidateOtherCodesExceptTheNewOne_when_sendSucceeds() {
+        when(phoneOtpRepository.countByPhoneAndCreatedAtAfter(eq(PHONE), any())).thenReturn(0);
+        stubSaveAssigningId(42L);
+
+        service.sendOtp(PHONE);
+
+        org.mockito.InOrder order = org.mockito.Mockito.inOrder(phoneOtpRepository, otpSmsSender);
+        order.verify(phoneOtpRepository).save(any());
+        order.verify(otpSmsSender).send(eq(PHONE), anyString());
+        order.verify(phoneOtpRepository).markOlderAsUsed(PHONE, 42L);
+        assertThat(txManager.events).containsExactly("begin", "commit", "begin", "commit");
+    }
+
+    @Test
+    @DisplayName("should_notInvalidateAnyCode_when_sendFails_soPreviousCodeStaysValid")
+    void should_notInvalidateAnyCode_when_sendFails_soPreviousCodeStaysValid() {
+        stubSaveAssigningId(42L);
+        org.mockito.Mockito.doThrow(new com.beautica.notification.sms.SmsDeliveryException("down"))
+                .when(otpSmsSender).send(eq(PHONE), anyString());
+
+        assertThatThrownBy(() -> service.sendOtp(PHONE)).isInstanceOf(BusinessException.class);
+
+        verify(phoneOtpRepository, never()).markOlderAsUsed(anyString(), any());
+    }
+
+    @Test
+    @DisplayName("should_takePhoneAdvisoryLockBeforeCountAndInsert_when_sendOtp")
+    void should_takePhoneAdvisoryLockBeforeCountAndInsert_when_sendOtp() {
         when(phoneOtpRepository.countByPhoneAndCreatedAtAfter(eq(PHONE), any())).thenReturn(0);
 
         service.sendOtp(PHONE);
 
-        verify(phoneOtpRepository).markAllUnusedAsUsed(PHONE);
+        org.mockito.InOrder order = org.mockito.Mockito.inOrder(phoneOtpRepository);
+        order.verify(phoneOtpRepository).lockPhoneForSend(PHONE);
+        order.verify(phoneOtpRepository).countByPhoneAndCreatedAtAfter(eq(PHONE), any());
+        order.verify(phoneOtpRepository).save(any());
+    }
+
+    @Test
+    @DisplayName("should_stillReturn_when_olderCodeInvalidationFailsAfterDelivery")
+    void should_stillReturn_when_olderCodeInvalidationFailsAfterDelivery() {
+        stubSaveAssigningId(42L);
+        org.mockito.Mockito.doThrow(new IllegalStateException("db"))
+                .when(phoneOtpRepository).markOlderAsUsed(PHONE, 42L);
+
+        service.sendOtp(PHONE);
+
+        verify(otpSmsSender).send(eq(PHONE), anyString());
+    }
+
+    @Test
+    @DisplayName("should_stillReturn503_when_markingUndeliveredRowUsedFails")
+    void should_stillReturn503_when_markingUndeliveredRowUsedFails() {
+        stubSaveAssigningId(42L);
+        org.mockito.Mockito.doThrow(new com.beautica.notification.sms.SmsDeliveryException("down"))
+                .when(otpSmsSender).send(eq(PHONE), anyString());
+        org.mockito.Mockito.doThrow(new IllegalStateException("db"))
+                .when(phoneOtpRepository).markAsUsedById(42L);
+
+        assertThatThrownBy(() -> service.sendOtp(PHONE))
+                .isInstanceOf(BusinessException.class)
+                .extracting(ex -> ((BusinessException) ex).getStatus())
+                .isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
+    }
+
+    private void stubSaveAssigningId(long id) {
+        org.mockito.Mockito.doAnswer(inv -> {
+            PhoneOtp row = inv.getArgument(0);
+            org.springframework.test.util.ReflectionTestUtils.setField(row, "id", id);
+            return row;
+        }).when(phoneOtpRepository).save(any());
     }
 
     @Test
@@ -152,24 +218,51 @@ class PhoneOtpServiceTest {
     }
 
     /**
-     * The rollback half of the row above, which is the part that matters operationally: the OTP row
-     * must not survive a failed dispatch. {@code save} is called (the row is written before the
-     * send, so the code is durable if the send succeeds), but the exception propagates out of the
-     * {@code @Transactional} method, so Spring rolls the insert back — the guest keeps their full
-     * per-phone window budget, which {@code countByPhoneAndCreatedAtAfter} derives from those very
-     * rows, and can retry at once.
+     * The compensation half of the row above: the OTP row is committed before the send (no DB
+     * connection held during the provider call), so a failed dispatch marks it used (never deletes) —
+     * it can never be redeemed but still counts toward the per-phone window cap.
      */
     @Test
-    @DisplayName("should_letTheOtpRowRollBack_when_theOtpSmsCannotBeDelivered")
-    void should_letTheOtpRowRollBack_when_theOtpSmsCannotBeDelivered() {
+    @DisplayName("should_markTheOtpRowUsedNotDelete_when_theOtpSmsCannotBeDelivered")
+    void should_markTheOtpRowUsedNotDelete_when_theOtpSmsCannotBeDelivered() {
+        org.mockito.Mockito.doAnswer(inv -> {
+            PhoneOtp row = inv.getArgument(0);
+            org.springframework.test.util.ReflectionTestUtils.setField(row, "id", 42L);
+            return row;
+        }).when(phoneOtpRepository).save(any());
         org.mockito.Mockito.doThrow(new com.beautica.notification.sms.SmsDeliveryException("down"))
                 .when(otpSmsSender).send(eq(PHONE), anyString());
 
         assertThatThrownBy(() -> service.sendOtp(PHONE)).isInstanceOf(BusinessException.class);
 
-        // The row was written, and the throw is what makes it never commit. A caught-and-swallowed
-        // failure here would leave a redeemable code the guest never got AND spend a budget slot.
         verify(phoneOtpRepository).save(any());
+        verify(phoneOtpRepository).markAsUsedById(42L);
+        verify(phoneOtpRepository, never()).delete(any());
+        verify(phoneOtpRepository, never()).deleteById(any());
+        assertThat(txManager.events).containsExactly("begin", "commit", "begin", "commit");
+    }
+
+    @Test
+    @DisplayName("should_callSenderWithNoActiveTransaction_when_sendOtp")
+    void should_callSenderWithNoActiveTransaction_when_sendOtp() {
+        java.util.concurrent.atomic.AtomicBoolean txActiveDuringSend = new java.util.concurrent.atomic.AtomicBoolean(true);
+        java.util.concurrent.atomic.AtomicReference<java.util.List<String>> eventsAtSend =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        org.mockito.Mockito.doAnswer(inv -> {
+            txActiveDuringSend.set(org.springframework.transaction.support.TransactionSynchronizationManager
+                    .isActualTransactionActive());
+            eventsAtSend.set(new java.util.ArrayList<>(txManager.events));
+            return null;
+        }).when(otpSmsSender).send(eq(PHONE), anyString());
+
+        service.sendOtp(PHONE);
+
+        assertThat(txActiveDuringSend.get())
+                .as("no transaction (and so no pooled DB connection) may be open during the SMS call")
+                .isFalse();
+        assertThat(eventsAtSend.get())
+                .as("the OTP row is committed before the send")
+                .containsExactly("begin", "commit");
     }
 
     // ── verifyOtp ──────────────────────────────────────────────────────────────
@@ -180,7 +273,7 @@ class PhoneOtpServiceTest {
         String code = "482913";
         PhoneOtp otp = PhoneOtp.issue(PHONE, sha256Hex(code), FIXED_NOW.plusSeconds(600));
         when(phoneOtpRepository
-                .findTopByPhoneAndUsedFalseAndExpiresAtAfterOrderByCreatedAtDesc(eq(PHONE), any()))
+                .findTopByPhoneAndUsedFalseAndExpiresAtAfterOrderByIdDesc(eq(PHONE), any()))
                 .thenReturn(Optional.of(otp));
         when(guestTokenProvider.generate(PHONE)).thenReturn(GUEST_TOKEN);
 
@@ -195,7 +288,7 @@ class PhoneOtpServiceTest {
     void should_throw401Generic_when_wrongCode() throws Exception {
         PhoneOtp otp = PhoneOtp.issue(PHONE, sha256Hex("482913"), FIXED_NOW.plusSeconds(600));
         when(phoneOtpRepository
-                .findTopByPhoneAndUsedFalseAndExpiresAtAfterOrderByCreatedAtDesc(eq(PHONE), any()))
+                .findTopByPhoneAndUsedFalseAndExpiresAtAfterOrderByIdDesc(eq(PHONE), any()))
                 .thenReturn(Optional.of(otp));
 
         assertThatThrownBy(() -> service.verifyOtp(PHONE, "000000"))
@@ -213,7 +306,7 @@ class PhoneOtpServiceTest {
         // findTop returns empty for both the expired and the nonexistent cases — the
         // service cannot (and must not) distinguish them: a single generic 401.
         when(phoneOtpRepository
-                .findTopByPhoneAndUsedFalseAndExpiresAtAfterOrderByCreatedAtDesc(eq(PHONE), any()))
+                .findTopByPhoneAndUsedFalseAndExpiresAtAfterOrderByIdDesc(eq(PHONE), any()))
                 .thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> service.verifyOtp(PHONE, "482913"))

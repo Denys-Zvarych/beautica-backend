@@ -2,6 +2,7 @@ package com.beautica.config;
 
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.convert.DurationStyle;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -62,8 +63,6 @@ public class S3Config {
      * {@code apiCallTimeout}/{@code apiCallAttemptTimeout} is set on purpose — a total deadline
      * could abort a legitimate slow upload. Package-private so the unit test pins the values.
      */
-    static final Duration R2_SOCKET_TIMEOUT = Duration.ofSeconds(30);
-    static final Duration R2_CONNECTION_TIMEOUT = Duration.ofSeconds(5);
     static final int R2_MAX_CONNECTIONS = 50;
 
     /** Hosts accepted for {@code app.cloudflare-r2.endpoint} unless the opt-out property is set. */
@@ -71,6 +70,14 @@ public class S3Config {
 
     @Value("${app.cloudflare-r2.enabled:false}")
     private boolean r2Enabled;
+
+    /** Socket INACTIVITY timeout (see above); {@code app.cloudflare-r2.socket-timeout}, default 30s. */
+    @Value("${app.cloudflare-r2.socket-timeout:30s}")
+    private String socketTimeout;
+
+    /** TCP connect timeout; {@code app.cloudflare-r2.connection-timeout}, default 5s. */
+    @Value("${app.cloudflare-r2.connection-timeout:5s}")
+    private String connectionTimeout;
 
     /**
      * Logs a single startup warning when the feature is disabled so operators can confirm the
@@ -123,7 +130,13 @@ public class S3Config {
         log.info("R2 enabled: bucket={}, publicHost={}", bucket, hostOf(publicUrl));
 
         return configure(S3Client.builder(), accountId, accessKeyId, secretAccessKey, endpointOverride,
-                allowCustomEndpoint).build();
+                allowCustomEndpoint,
+                // String + DurationStyle (not a Duration field): works without Boot's conversion service.
+                OutboundTimeouts.requirePositive("app.cloudflare-r2.connection-timeout",
+                        DurationStyle.detectAndParse(connectionTimeout)),
+                OutboundTimeouts.requirePositive("app.cloudflare-r2.socket-timeout",
+                        DurationStyle.detectAndParse(socketTimeout)))
+                .build();
     }
 
     /**
@@ -136,18 +149,10 @@ public class S3Config {
             String accountId,
             String accessKeyId,
             String secretAccessKey,
-            String endpointOverride
-    ) {
-        return configure(builder, accountId, accessKeyId, secretAccessKey, endpointOverride, false);
-    }
-
-    static S3ClientBuilder configure(
-            S3ClientBuilder builder,
-            String accountId,
-            String accessKeyId,
-            String secretAccessKey,
             String endpointOverride,
-            boolean allowCustomEndpoint
+            boolean allowCustomEndpoint,
+            Duration connectionTimeout,
+            Duration socketTimeout
     ) {
         URI endpoint = resolveEndpoint(accountId, endpointOverride, allowCustomEndpoint);
         AwsBasicCredentials credentials = AwsBasicCredentials.create(accessKeyId, secretAccessKey);
@@ -163,14 +168,15 @@ public class S3Config {
                 // Explicit Apache HC5 tuning — defaults leave socketTimeout=0 (infinite),
                 // which would pin Tomcat worker threads on a hung R2 socket. See Phase 7.2
                 // perf audit; this closes the tracked LOW.
-                .httpClientBuilder(r2HttpClientBuilder());
+                .httpClientBuilder(r2HttpClientBuilder(connectionTimeout, socketTimeout));
     }
 
     /** Package-private seam so tests can inspect the timeouts and pool size actually configured. */
-    static ApacheHttpClient.Builder r2HttpClientBuilder() {
+    static ApacheHttpClient.Builder r2HttpClientBuilder(Duration connectionTimeout, Duration socketTimeout) {
         return ApacheHttpClient.builder()
-                .socketTimeout(R2_SOCKET_TIMEOUT)
-                .connectionTimeout(R2_CONNECTION_TIMEOUT)
+                .socketTimeout(OutboundTimeouts.requirePositive("app.cloudflare-r2.socket-timeout", socketTimeout))
+                .connectionTimeout(
+                        OutboundTimeouts.requirePositive("app.cloudflare-r2.connection-timeout", connectionTimeout))
                 .maxConnections(R2_MAX_CONNECTIONS);
     }
 
