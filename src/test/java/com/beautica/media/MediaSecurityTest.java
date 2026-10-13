@@ -36,6 +36,8 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.doNothing;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
@@ -44,16 +46,19 @@ import static org.mockito.Mockito.when;
  * <p><b>SEC-1 design note.</b> {@link com.beautica.media.controller.MediaController}
  * intentionally exposes no request-body or path-variable field that lets a caller
  * name a target user/salon/master. {@link com.beautica.media.service.MediaService}
- * resolves the owning entity server-side from the authenticated principal. A
- * meaningful cross-user IDOR vector therefore exists only at the {@code DELETE
- * /media/portfolio/{mediaId}} endpoint (test #14). The upload endpoints are
- * defended by design — tests #11–#13 document that contract:
+ * resolves the owning entity server-side from the authenticated principal.
+ * Phase 362 moved salon portfolio writes to the salon-scoped
+ * {@code /salons/{salonId}/portfolio} routes, which DO name the salon and are
+ * therefore guarded by {@code canManageSalon} + {@code enforceCanManageSalon}
+ * (tests #12–#14 pin that IDOR surface); {@code /media/portfolio} is
+ * INDEPENDENT_MASTER only.
  * <ul>
  *   <li>#11 — a CLIENT can only update its own avatar (no target field exists).</li>
- *   <li>#12 — a SALON_OWNER without an active salon is rejected at the service
- *       layer (no salonId to spoof).</li>
- *   <li>#13 — role-only {@code @PreAuthorize} on {@code POST /media/portfolio}
- *       blocks unrelated roles before the controller body runs.</li>
+ *   <li>#12 — owner A cannot upload to salon B's portfolio; a SALON_OWNER on
+ *       {@code /media/portfolio} is refused (no salon write path remains there).</li>
+ *   <li>#13 — a CLIENT is refused on both portfolio upload routes.</li>
+ *   <li>#14 — owner B cannot delete salon A's photo (403 on salon A's path, 404
+ *       when the row is addressed through salon B's path).</li>
  * </ul>
  *
  * <p>{@link R2StorageService} is mocked: real R2 calls would otherwise fan out
@@ -67,6 +72,10 @@ class MediaSecurityTest extends AbstractMediaIntegrationTest {
     private static final Logger log = LoggerFactory.getLogger(MediaSecurityTest.class);
     private static final String AVATAR_URL = "/api/v1/media/avatar";
     private static final String PORTFOLIO_URL = "/api/v1/media/portfolio";
+
+    private static String salonPortfolioUrl(UUID salonId) {
+        return "/api/v1/salons/" + salonId + "/portfolio";
+    }
 
     /** Multipart part names a caller might try to smuggle a target user through (Phase 344 TC-3). */
     private static final List<String> SMUGGLED_TARGET_FIELDS =
@@ -228,81 +237,113 @@ class MediaSecurityTest extends AbstractMediaIntegrationTest {
         assertAvatarUntouched(adminId, adminUrlBefore);
     }
 
-    // ── #12 — SEC-1 contract: owner A cannot upload portfolio for salon B ────
+    // ── #12 — owner A cannot upload portfolio for salon B ──────────────────────
 
     @Test
-    @DisplayName("POST /media/portfolio — 403 when SALON_OWNER has no active salon (SEC-1 design)")
+    @DisplayName("POST /salons/{B}/portfolio — 403 when owner A targets salon B; no row, no R2 upload")
     void should_return403_when_ownerAUploadsPortfolioForSalonB() throws Exception {
-        // SEC-1: the controller has no salonId in body or path — MediaService
-        // resolves the salon server-side from the authenticated owner. So a
-        // cross-salon IDOR is structurally impossible. The closest negative path
-        // is an owner with no active salon: the service must reject with 403
-        // rather than 500 or silently uploading to some other tenant.
+        String ownerAEmail = "sec-port-owner-a-" + System.nanoTime() + "@beautica.test";
+        UUID ownerAId = insertSalonOwner(ownerAEmail);
+        insertSalon(ownerAId, "Salon A");
+        UUID ownerBId = insertSalonOwner("sec-port-owner-b-" + System.nanoTime() + "@beautica.test");
+        UUID salonBId = insertSalon(ownerBId, "Salon B");
+        String tokenA = loginAndGetToken(ownerAEmail);
+
+        log.debug("Act: POST {} as owner A — must return 403", salonPortfolioUrl(salonBId));
+        ResponseEntity<String> resp = restTemplate.exchange(
+                salonPortfolioUrl(salonBId), HttpMethod.POST,
+                new HttpEntity<>(jpegMultipartBody(), bearerMultipartHeaders(tokenA)),
+                String.class);
+
+        assertThat(resp.getStatusCode())
+                .as("owner A must be denied an upload into salon B's portfolio")
+                .isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(portfolioCount(salonBId)).as("no row lands in salon B").isZero();
+        verify(r2StorageService, never()).uploadFile(anyString(), any(), anyLong(), anyString());
+    }
+
+    @Test
+    @DisplayName("POST /media/portfolio — 403 for a SALON_OWNER with an active salon (Phase 362 D4: master only)")
+    void should_return403_when_salonOwnerUploadsViaMediaPortfolio() throws Exception {
         String ownerEmail = "sec-port-owner-" + System.nanoTime() + "@beautica.test";
-        insertSalonOwner(ownerEmail);
+        UUID ownerId = insertSalonOwner(ownerEmail);
+        UUID salonId = insertSalon(ownerId, "Owner Salon");
         String ownerToken = loginAndGetToken(ownerEmail);
 
-        log.debug("Act: POST {} as SALON_OWNER with no active salon — must return 403", PORTFOLIO_URL);
         ResponseEntity<String> resp = restTemplate.exchange(
                 PORTFOLIO_URL, HttpMethod.POST,
                 new HttpEntity<>(jpegMultipartBody(), bearerMultipartHeaders(ownerToken)),
                 String.class);
 
-        assertThat(resp.getStatusCode())
-                .as("status must be 403 when SALON_OWNER has no salon — service-layer enforcement, not a 500")
-                .isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(portfolioCount(salonId)).as("no salon write path remains on /media/portfolio").isZero();
     }
 
-    // ── #13 — role-only @PreAuthorize blocks unrelated roles on portfolio upload
+    // ── #13 — CLIENT refused on both portfolio upload routes ───────────────────
 
     @Test
-    @DisplayName("POST /media/portfolio — 403 when CLIENT attempts portfolio upload")
+    @DisplayName("POST /media/portfolio and /salons/{id}/portfolio — 403 when CLIENT attempts a portfolio upload")
     void should_return403_when_unrelatedUserUploadsMasterPortfolio() throws Exception {
         String clientEmail = "sec-port-client-" + System.nanoTime() + "@beautica.test";
         insertClient(clientEmail);
         String clientToken = loginAndGetToken(clientEmail);
+        UUID ownerId = insertSalonOwner("sec-port-client-owner-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = insertSalon(ownerId, "Client Target Salon");
 
-        log.debug("Act: POST {} as CLIENT — role guard must reject before controller body runs", PORTFOLIO_URL);
-        ResponseEntity<String> resp = restTemplate.exchange(
-                PORTFOLIO_URL, HttpMethod.POST,
-                new HttpEntity<>(jpegMultipartBody(), bearerMultipartHeaders(clientToken)),
-                String.class);
+        for (String url : List.of(PORTFOLIO_URL, salonPortfolioUrl(salonId))) {
+            log.debug("Act: POST {} as CLIENT — role guard must reject before controller body runs", url);
+            ResponseEntity<String> resp = restTemplate.exchange(
+                    url, HttpMethod.POST,
+                    new HttpEntity<>(jpegMultipartBody(), bearerMultipartHeaders(clientToken)),
+                    String.class);
 
-        assertThat(resp.getStatusCode())
-                .as("CLIENT must be denied portfolio upload (role-only @PreAuthorize)")
-                .isEqualTo(HttpStatus.FORBIDDEN);
+            assertThat(resp.getStatusCode())
+                    .as("CLIENT must be denied portfolio upload on %s", url)
+                    .isEqualTo(HttpStatus.FORBIDDEN);
+        }
+        assertThat(portfolioCount(salonId)).isZero();
     }
 
-    // ── #14 — cross-user delete IDOR ─────────────────────────────────────────
+    // ── #14 — cross-salon delete IDOR ────────────────────────────────────────
 
     @Test
-    @DisplayName("DELETE /media/portfolio/{id} — 403 when user B deletes user A's portfolio photo")
+    @DisplayName("DELETE /salons/{A}/portfolio/{id} — 403 when owner B deletes salon A's portfolio photo")
     void should_return403_when_userBDeletesUserAPortfolioPhoto() throws Exception {
-        // Arrange — user A uploads a portfolio photo (owner A with a salon)
-        String ownerAEmail = "sec-del-a-" + System.nanoTime() + "@beautica.test";
-        UUID ownerAId = insertSalonOwner(ownerAEmail);
+        // Arrange — salon A has a portfolio photo
+        UUID ownerAId = insertSalonOwner("sec-del-a-" + System.nanoTime() + "@beautica.test");
         UUID salonAId = insertSalon(ownerAId, "Salon A");
         UUID mediaAId = insertMediaFile(ownerAId, EntityType.SALON, salonAId);
 
-        // Arrange — user B (different SALON_OWNER) tries to delete that row
+        // Arrange — owner B (a different salon) tries to delete that row
         String ownerBEmail = "sec-del-b-" + System.nanoTime() + "@beautica.test";
-        insertSalonOwner(ownerBEmail);
+        UUID ownerBId = insertSalonOwner(ownerBEmail);
+        UUID salonBId = insertSalon(ownerBId, "Salon B");
         String tokenB = loginAndGetToken(ownerBEmail);
 
-        log.debug("Act: DELETE {}/{} as user B targeting user A's media — must be denied", PORTFOLIO_URL, mediaAId);
-        ResponseEntity<String> resp = restTemplate.exchange(
+        log.debug("Act: DELETE salon A's media as owner B, via salon A's path and via salon B's path");
+        ResponseEntity<String> viaSalonA = restTemplate.exchange(
+                salonPortfolioUrl(salonAId) + "/" + mediaAId, HttpMethod.DELETE,
+                new HttpEntity<>(bearerHeaders(tokenB)), String.class);
+        ResponseEntity<String> viaSalonB = restTemplate.exchange(
+                salonPortfolioUrl(salonBId) + "/" + mediaAId, HttpMethod.DELETE,
+                new HttpEntity<>(bearerHeaders(tokenB)), String.class);
+        ResponseEntity<String> viaMediaPath = restTemplate.exchange(
                 PORTFOLIO_URL + "/" + mediaAId, HttpMethod.DELETE,
-                new HttpEntity<>(bearerHeaders(tokenB)),
-                String.class);
+                new HttpEntity<>(bearerHeaders(tokenB)), String.class);
 
-        assertThat(resp.getStatusCode())
-                .as("user B must not delete user A's media row, mediaId=%s", mediaAId)
+        assertThat(viaSalonA.getStatusCode())
+                .as("owner B cannot manage salon A")
                 .isEqualTo(HttpStatus.FORBIDDEN);
-
+        assertThat(viaSalonB.getStatusCode())
+                .as("salon A's row addressed through salon B's path is not found")
+                .isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(viaMediaPath.getStatusCode())
+                .as("/media/portfolio is INDEPENDENT_MASTER only")
+                .isEqualTo(HttpStatus.FORBIDDEN);
         Integer remaining = jdbcTemplate.queryForObject(
                 "SELECT COUNT(*) FROM media_files WHERE id = ?", Integer.class, mediaAId);
         assertThat(remaining)
-                .as("user A's media row must still exist after the rejected delete")
+                .as("salon A's media row must still exist after the rejected deletes")
                 .isEqualTo(1);
     }
 
@@ -392,6 +433,12 @@ class MediaSecurityTest extends AbstractMediaIntegrationTest {
                 com.beautica.media.entity.MediaType.PORTFOLIO.name(),
                 key, "https://cdn.example/" + key);
         return mediaId;
+    }
+
+    private int portfolioCount(UUID salonId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM media_files WHERE entity_type = 'SALON' AND entity_id = ?",
+                Integer.class, salonId);
     }
 
     private UUID insertSalonAdmin(String email, UUID salonId) {

@@ -3,6 +3,8 @@ package com.beautica.media.controller;
 import com.beautica.auth.JwtAuthenticationFilter;
 import com.beautica.auth.JwtTokenProvider;
 import com.beautica.auth.Role;
+import com.beautica.common.exception.PortfolioBusyException;
+import com.beautica.common.exception.PortfolioLimitReachedException;
 import com.beautica.common.security.AuthorizationService;
 import com.beautica.config.WebMvcTestSupport;
 import com.beautica.media.service.MediaService;
@@ -18,6 +20,7 @@ import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
+import org.springframework.http.MediaType;
 import org.springframework.mock.web.MockMultipartFile;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
@@ -38,16 +41,23 @@ import java.util.UUID;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.lenient;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.authentication;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.multipart;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 
 /**
- * Phase 343 — controller-layer half of the OWNER-only gate, isolated from the service layer ({@link MediaService}
+ * Phase 362 — the portfolio routes ({@code /salons/{salonId}/portfolio}) admit owner OR bound admin through
+ * {@code hasAnyRole('SALON_OWNER','SALON_ADMIN') and canManageSalon}; tests below pin both halves of that gate.
+ *
+ * <p>Phase 343 — controller-layer half of the logo/cover OWNER-only gate, isolated from the service layer ({@link MediaService}
  * is a mock, so nothing behind the controller can refuse). Pins that the gate is {@code hasRole('SALON_OWNER')}
  * AND {@code isOwnerOf}: a {@code SALON_ADMIN} for whom {@code canManageSalon} would be TRUE is still refused, so a
  * copy-paste of the PATCH gate ({@code canManageSalon}) onto these routes goes red here even though the
@@ -56,7 +66,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 @WebMvcTest(SalonMediaController.class)
 @TestPropertySource(properties = "app.frontend.base-url=http://localhost:3000")
 @Import(WebMvcTestSupport.class)
-@DisplayName("SalonMediaController — OWNER-only gate (@WebMvcTest slice, Phase 343)")
+@DisplayName("SalonMediaController — logo/cover OWNER-only + portfolio manager gates (@WebMvcTest slice)")
 class SalonMediaControllerTest {
 
     @TestConfiguration
@@ -182,6 +192,117 @@ class SalonMediaControllerTest {
         mockMvc.perform(delete(url(SalonImageSlot.LOGO))).andExpect(status().isUnauthorized());
 
         verifyNoInteractions(mediaService);
+    }
+
+    // ── portfolio (Phase 362): owner OR bound admin via canManageSalon ─────────────────────────
+
+    @ParameterizedTest(name = "portfolio: {0} with canManageSalon → 201 on POST, 204 on DELETE")
+    @EnumSource(value = Role.class, names = {"SALON_OWNER", "SALON_ADMIN"})
+    void should_allowPortfolioWrites_when_salonManager(Role role) throws Exception {
+        UUID actorId = UUID.randomUUID();
+        UUID mediaId = UUID.randomUUID();
+        when(authz.canManageSalon(any(Authentication.class), eq(salonId))).thenReturn(true);
+
+        mockMvc.perform(multipart(portfolioUrl()).file(jpeg()).with(as(actorId, role)))
+                .andExpect(status().isCreated());
+        mockMvc.perform(delete(portfolioUrl() + "/" + mediaId).with(as(actorId, role)))
+                .andExpect(status().isNoContent());
+
+        verify(mediaService).uploadSalonPortfolioPhoto(eq(actorId), eq(salonId), any());
+        verify(mediaService).deleteSalonPortfolioPhoto(actorId, salonId, mediaId);
+    }
+
+    @ParameterizedTest(name = "portfolio: {0} of ANOTHER salon (canManageSalon false) → 403")
+    @EnumSource(value = Role.class, names = {"SALON_OWNER", "SALON_ADMIN"})
+    void should_return403OnPortfolio_when_managerOfAnotherSalon(Role role) throws Exception {
+        when(authz.canManageSalon(any(Authentication.class), eq(salonId))).thenReturn(false);
+
+        mockMvc.perform(multipart(portfolioUrl()).file(jpeg()).with(as(UUID.randomUUID(), role)))
+                .andExpect(status().isForbidden());
+        mockMvc.perform(delete(portfolioUrl() + "/" + UUID.randomUUID()).with(as(UUID.randomUUID(), role)))
+                .andExpect(status().isForbidden());
+
+        verifyNoInteractions(mediaService);
+    }
+
+    @ParameterizedTest(name = "portfolio role gate: {0} refused even if canManageSalon were true")
+    @EnumSource(value = Role.class, names = {"SALON_MASTER", "INDEPENDENT_MASTER", "CLIENT"})
+    void should_return403OnPortfolio_when_roleIsNotSalonManager(Role role) throws Exception {
+        lenient().when(authz.canManageSalon(any(Authentication.class), eq(salonId))).thenReturn(true);
+
+        mockMvc.perform(multipart(portfolioUrl()).file(jpeg()).with(as(UUID.randomUUID(), role)))
+                .andExpect(status().isForbidden());
+        mockMvc.perform(delete(portfolioUrl() + "/" + UUID.randomUUID()).with(as(UUID.randomUUID(), role)))
+                .andExpect(status().isForbidden());
+
+        verifyNoInteractions(mediaService);
+    }
+
+    @Test
+    @DisplayName("portfolio: the 30-photo cap maps to 409 with data.code PORTFOLIO_LIMIT_REACHED")
+    void should_return409_when_portfolioCapReached() throws Exception {
+        UUID ownerId = UUID.randomUUID();
+        when(authz.canManageSalon(any(Authentication.class), eq(salonId))).thenReturn(true);
+        when(mediaService.uploadSalonPortfolioPhoto(eq(ownerId), eq(salonId), any()))
+                .thenThrow(new PortfolioLimitReachedException());
+
+        mockMvc.perform(multipart(portfolioUrl()).file(jpeg()).with(as(ownerId, Role.SALON_OWNER)))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.data.code").value(PortfolioLimitReachedException.ERROR_CODE));
+    }
+
+    @Test
+    @DisplayName("portfolio: lock contention maps to 503 + Retry-After, never the 409 the client reads as the cap")
+    void should_return503WithRetryAfter_when_portfolioBusy() throws Exception {
+        UUID ownerId = UUID.randomUUID();
+        when(authz.canManageSalon(any(Authentication.class), eq(salonId))).thenReturn(true);
+        when(mediaService.uploadSalonPortfolioPhoto(eq(ownerId), eq(salonId), any()))
+                .thenThrow(new PortfolioBusyException());
+
+        mockMvc.perform(multipart(portfolioUrl()).file(jpeg()).with(as(ownerId, Role.SALON_OWNER)))
+                .andExpect(status().isServiceUnavailable())
+                .andExpect(header().string("Retry-After",
+                        String.valueOf(PortfolioBusyException.RETRY_AFTER_SECONDS)));
+    }
+
+    @Test
+    @DisplayName("portfolio: POST consumes multipart/form-data only — a JSON body is 415")
+    void should_return415_when_portfolioUploadIsNotMultipart() throws Exception {
+        lenient().when(authz.canManageSalon(any(Authentication.class), eq(salonId))).thenReturn(true);
+
+        mockMvc.perform(post(portfolioUrl()).contentType(MediaType.APPLICATION_JSON).content("{}")
+                        .with(as(UUID.randomUUID(), Role.SALON_OWNER)))
+                .andExpect(status().isUnsupportedMediaType());
+
+        verifyNoInteractions(mediaService);
+    }
+
+    @Test
+    @DisplayName("portfolio: anonymous POST/DELETE → 401")
+    void should_return401OnPortfolio_when_anonymous() throws Exception {
+        mockMvc.perform(multipart(portfolioUrl()).file(jpeg())).andExpect(status().isUnauthorized());
+        mockMvc.perform(delete(portfolioUrl() + "/" + UUID.randomUUID())).andExpect(status().isUnauthorized());
+
+        verifyNoInteractions(mediaService);
+    }
+
+    @Test
+    @DisplayName("logo/cover stay OWNER-only: a SALON_ADMIN allowed on the portfolio is still 403 on /media/{slot}")
+    void should_keepLogoOwnerOnly_when_adminCanManagePortfolio() throws Exception {
+        UUID adminId = UUID.randomUUID();
+        when(authz.canManageSalon(any(Authentication.class), eq(salonId))).thenReturn(true);
+        lenient().when(authz.isOwnerOf(any(Authentication.class), eq(salonId))).thenReturn(false);
+
+        mockMvc.perform(multipart(portfolioUrl()).file(jpeg()).with(as(adminId, Role.SALON_ADMIN)))
+                .andExpect(status().isCreated());
+        mockMvc.perform(multipart(url(SalonImageSlot.LOGO)).file(jpeg()).with(as(adminId, Role.SALON_ADMIN)))
+                .andExpect(status().isForbidden());
+
+        verify(mediaService, never()).uploadSalonImage(any(), any(), any(), any());
+    }
+
+    private String portfolioUrl() {
+        return "/api/v1/salons/" + salonId + "/portfolio";
     }
 
     private String url(SalonImageSlot slot) {

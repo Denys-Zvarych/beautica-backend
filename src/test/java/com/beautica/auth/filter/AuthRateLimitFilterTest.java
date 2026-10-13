@@ -357,6 +357,22 @@ class AuthRateLimitFilterTest {
         }
 
         @Test
+        @DisplayName("Phase 362: POST /salons/{id}/portfolio and DELETE /salons/{id}/portfolio/{mediaId} route to mediaUploadBuckets")
+        void should_routeToMediaUploadBuckets_when_salonPortfolioPostOrDelete() throws Exception {
+            when(mediaUploadBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
+            when(bucket.tryConsume(1)).thenReturn(true);
+            String base = "/api/v1/salons/" + java.util.UUID.randomUUID() + "/portfolio";
+
+            doFilter(postRequest(base), new MockHttpServletResponse(), new MockFilterChain());
+            doFilter(deleteRequest(base + "/" + java.util.UUID.randomUUID()),
+                    new MockHttpServletResponse(), new MockFilterChain());
+
+            verify(mediaUploadBuckets, org.mockito.Mockito.times(2)).get(REMOTE_ADDR);
+            verifyNoInteractions(loginBuckets);
+            verifyNoInteractions(slotsBuckets);
+        }
+
+        @Test
         @DisplayName("Phase 343: isSalonImagePath matches exactly /salons/{id}/media/{slot}")
         void should_matchOnlySalonImageShape_when_isSalonImagePathChecked() {
             String id = java.util.UUID.randomUUID().toString();
@@ -368,6 +384,23 @@ class AuthRateLimitFilterTest {
             assertThat(AuthRateLimitFilter.isSalonImagePath("/api/v1/salons/" + id + "/portfolio")).isFalse();
             assertThat(AuthRateLimitFilter.isSalonImagePath("/api/v1/salons//media/logo")).isFalse();
             assertThat(AuthRateLimitFilter.isSalonImagePath(null)).isFalse();
+        }
+
+        @Test
+        @DisplayName("Phase 362: isSalonPortfolioPath matches exactly /salons/{id}/portfolio[/{mediaId}]")
+        void should_matchOnlySalonPortfolioShape_when_isSalonPortfolioPathChecked() {
+            String id = java.util.UUID.randomUUID().toString();
+            String mediaId = java.util.UUID.randomUUID().toString();
+
+            assertThat(AuthRateLimitFilter.isSalonPortfolioPath("/api/v1/salons/" + id + "/portfolio")).isTrue();
+            assertThat(AuthRateLimitFilter.isSalonPortfolioPath("/api/v1/salons/" + id + "/portfolio/" + mediaId))
+                    .isTrue();
+            assertThat(AuthRateLimitFilter.isSalonPortfolioPath("/api/v1/salons/" + id + "/portfolio/")).isFalse();
+            assertThat(AuthRateLimitFilter.isSalonPortfolioPath("/api/v1/salons/" + id + "/portfolio/x/y")).isFalse();
+            assertThat(AuthRateLimitFilter.isSalonPortfolioPath("/api/v1/salons/" + id + "/portfolios")).isFalse();
+            assertThat(AuthRateLimitFilter.isSalonPortfolioPath("/api/v1/salons/" + id + "/media/logo")).isFalse();
+            assertThat(AuthRateLimitFilter.isSalonPortfolioPath("/api/v1/salons//portfolio")).isFalse();
+            assertThat(AuthRateLimitFilter.isSalonPortfolioPath(null)).isFalse();
         }
 
         @Test

@@ -56,16 +56,6 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
     List<Salon> findAllByOwnerIdAndIsActiveTrue(UUID ownerId);
 
     /**
-     * Returns the oldest active salon for the given owner, ordered by {@code created_at ASC}.
-     *
-     * <p>Used by {@code MediaService.resolvePortfolioTarget} to deterministically select
-     * which salon receives a portfolio upload when an owner has more than one active salon.
-     * The {@code findTop} prefix limits the DB result to a single row, avoiding a
-     * non-deterministic {@code salons.get(0)} pick on an unordered list (Perf MEDIUM F6).
-     */
-    Optional<Salon> findTopByOwnerIdAndIsActiveTrueOrderByCreatedAtAsc(UUID ownerId);
-
-    /**
      * Returns the IDs of all active salons owned by the given owner.
      *
      * <p>Used by {@code DashboardService.resolveScope} to collect every salon the SALON_OWNER
@@ -196,8 +186,7 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
      * <p>Ordered by {@code created_at ASC, id ASC} — index-aligned with the partial
      * {@code idx_salons_owner_active_created} ({@code owner_id, created_at WHERE is_active = true},
      * V46) that already serves the {@code owner_id + is_active} predicate, and matching the
-     * existing owner-salon ordering convention of
-     * {@link #findTopByOwnerIdAndIsActiveTrueOrderByCreatedAtAsc}. No new index is needed. The
+     * existing owner-salon {@code created_at ASC} ordering convention. No new index is needed. The
      * trailing {@code id} is a UNIQUE tiebreaker (Perf MEDIUM-2): {@code created_at} alone is not
      * unique — two salons created in the same statement/tick share a timestamp and would come back
      * in an arbitrary, run-to-run-unstable order, which the picker renders as a jumping list. The
@@ -314,6 +303,22 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
             FOR NO KEY UPDATE OF s
             """, nativeQuery = true)
     Optional<Salon> findByIdForUpdate(@Param("salonId") UUID salonId);
+
+    /**
+     * Phase 362 portfolio cap lock (audit cycle 1, F5): the same {@code FOR NO KEY UPDATE OF s} row lock and the
+     * same fused 3s {@code lock_timeout} as {@link #findByIdForUpdate}, but selecting only {@code is_active} —
+     * the portfolio path needs the lock plus the active flag, never a managed {@code Salon} (no dirty check at
+     * commit). Empty for an unknown id. {@code 55P03} surfaces as {@code CannotAcquireLockException}, which the
+     * portfolio path translates to 503 + {@code Retry-After}.
+     */
+    @QueryHints(@QueryHint(name = HibernateHints.HINT_NATIVE_SPACES, value = "salons"))
+    @Query(value = """
+            SELECT s.is_active FROM salons s
+            CROSS JOIN (SELECT set_config('lock_timeout', '3s', true)) lock_cfg
+            WHERE s.id = :salonId
+            FOR NO KEY UPDATE OF s
+            """, nativeQuery = true)
+    Optional<Boolean> lockIsActiveForUpdate(@Param("salonId") UUID salonId);
 
     /** Phase 343 — persists the logo pointers. Caller holds the {@link #findByIdForUpdate} lock. */
     @Modifying

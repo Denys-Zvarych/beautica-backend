@@ -7,7 +7,7 @@ import com.beautica.config.TestSecurityConfig;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.media.entity.EntityType;
 import com.beautica.media.repository.MediaRepository;
-import com.beautica.media.repository.UploaderMediaKey;
+import com.beautica.media.repository.MediaFileKey;
 import com.beautica.media.service.MediaService;
 import com.beautica.media.service.R2StorageService;
 import com.beautica.salon.service.SalonService;
@@ -59,8 +59,10 @@ import static org.mockito.Mockito.reset;
 
 /**
  * H1 — owner-initiated staff removal ({@code removeMaster}, {@code removeAdmin}, salon delete) must purge the
- * removed user's avatar and {@code media_files} blobs from R2 after commit; a control user's blobs must not be
- * touched, and the self-delete path (which registers its own sweep) must not double-purge.
+ * removed user's avatar and OWN {@code media_files} blobs (their master's MASTER portfolio) from R2 after commit;
+ * a control user's blobs must not be touched, and the self-delete path (which registers its own sweep) must not
+ * double-purge. Phase 363: a SALON photo the removed user uploaded belongs to the salon and is NEVER purged by a
+ * user removal — only salon deletion removes it.
  */
 @Import(TestSecurityConfig.class)
 @DisplayName("Staff removal — R2 avatar + media purge (H1)")
@@ -117,29 +119,35 @@ class StaffRemovalBlobPurgeIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("removeMaster purges the removed master's avatar + media keys, never a control user's")
+    @DisplayName("removeMaster purges the removed master's avatar + own portfolio keys, never a salon photo "
+            + "they uploaded, never a control user's")
     void should_purgeRemovedMasterBlobs_when_removeMaster() {
         ClientSelfDeleteTestFixtures.Salon salon = csd.createSalon();
-        Keys removed = seedBlobs(salon.masterUserId(), salon.salonId());
+        Keys removed = seedBlobs(salon.masterUserId(), salon.salonId(), salon.masterId());
         UUID controlId = csd.createSalonAdmin(salon);
-        Keys control = seedBlobs(controlId, salon.salonId());
+        Keys control = seedBlobs(controlId, salon.salonId(), null);
 
         salonService.removeMaster(salon.ownerId(), salon.salonId(), salon.masterId());
 
-        assertThat(purgedKeys(r2)).contains(removed.avatar(), removed.media()).doesNotContain(control.avatar(), control.media());
+        assertThat(purgedKeys(r2)).contains(removed.avatar(), removed.ownPortfolio())
+                .doesNotContain(removed.salonPhoto(), control.avatar(), control.salonPhoto());
+        assertThat(salonPhotoRowExists(removed.salonPhoto())).isTrue();
     }
 
     @Test
-    @DisplayName("removeAdmin purges the removed admin's avatar + media keys, never a control user's")
+    @DisplayName("removeAdmin purges the removed admin's avatar, never a salon photo they uploaded, never a "
+            + "control user's")
     void should_purgeRemovedAdminBlobs_when_removeAdmin() {
         ClientSelfDeleteTestFixtures.Salon salon = csd.createSalon();
         UUID adminId = csd.createSalonAdmin(salon);
-        Keys removed = seedBlobs(adminId, salon.salonId());
-        Keys control = seedBlobs(salon.masterUserId(), salon.salonId());
+        Keys removed = seedBlobs(adminId, salon.salonId(), null);
+        Keys control = seedBlobs(salon.masterUserId(), salon.salonId(), salon.masterId());
 
         salonService.removeAdmin(salon.ownerId(), salon.salonId(), adminId);
 
-        assertThat(purgedKeys(r2)).contains(removed.avatar(), removed.media()).doesNotContain(control.avatar(), control.media());
+        assertThat(purgedKeys(r2)).contains(removed.avatar())
+                .doesNotContain(removed.salonPhoto(), control.avatar(), control.salonPhoto(), control.ownPortfolio());
+        assertThat(salonPhotoRowExists(removed.salonPhoto())).isTrue();
     }
 
     @Test
@@ -148,23 +156,25 @@ class StaffRemovalBlobPurgeIT extends AbstractIntegrationTest {
     void should_purgeAllStaffBlobs_when_salonDeleted() {
         ClientSelfDeleteTestFixtures.Salon salon = csd.createSalon();
         UUID adminId = csd.createSalonAdmin(salon);
-        Keys master = seedBlobs(salon.masterUserId(), salon.salonId());
-        Keys admin = seedBlobs(adminId, salon.salonId());
+        Keys master = seedBlobs(salon.masterUserId(), salon.salonId(), salon.masterId());
+        Keys admin = seedBlobs(adminId, salon.salonId(), null);
         ClientSelfDeleteTestFixtures.Salon other = csd.createSalon();
-        Keys control = seedBlobs(other.masterUserId(), other.salonId());
+        Keys control = seedBlobs(other.masterUserId(), other.salonId(), other.masterId());
 
         salonService.deactivateSalon(salon.ownerId(), salon.salonId());
 
-        assertThat(purgedKeys(r2)).contains(master.avatar(), master.media(), admin.avatar(), admin.media())
-                .doesNotContain(control.avatar(), control.media());
+        assertThat(purgedKeys(r2)).contains(master.avatar(), master.salonPhoto(), master.ownPortfolio(),
+                        admin.avatar(), admin.salonPhoto())
+                .doesNotContain(control.avatar(), control.salonPhoto(), control.ownPortfolio());
     }
 
     @Test
-    @DisplayName("a staff self-delete purges the avatar exactly once — dispose() does not double-register")
+    @DisplayName("a staff self-delete purges the avatar exactly once — dispose() does not double-register — and "
+            + "never the salon photo the admin uploaded")
     void should_purgeAvatarExactlyOnce_when_staffSelfDeletes() throws Exception {
         ClientSelfDeleteTestFixtures.Salon salon = csd.createSalon();
         UUID adminId = csd.createSalonAdmin(salon);
-        Keys keys = seedBlobs(adminId, salon.salonId());
+        Keys keys = seedBlobs(adminId, salon.salonId(), null);
         String token = fixtures.tokenFor(emailOf(adminId));
 
         ResponseEntity<Void> response = restTemplate.exchange("/api/v1/users/me", HttpMethod.DELETE,
@@ -172,7 +182,8 @@ class StaffRemovalBlobPurgeIT extends AbstractIntegrationTest {
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
         assertThat(purgedKeys(r2)).filteredOn(keys.avatar()::equals).hasSize(1);
-        assertThat(purgedKeys(r2)).filteredOn(keys.media()::equals).hasSize(1);
+        assertThat(purgedKeys(r2)).doesNotContain(keys.salonPhoto());
+        assertThat(salonPhotoRowExists(keys.salonPhoto())).isTrue();
     }
 
     /**
@@ -187,7 +198,7 @@ class StaffRemovalBlobPurgeIT extends AbstractIntegrationTest {
     @DisplayName("S-L2: an avatar replace racing removeMaster never orphans the new blob (row-locked pointer read)")
     void should_purgeOrDiscardNewAvatar_when_replaceRacesRemoveMaster() throws Exception {
         ClientSelfDeleteTestFixtures.Salon salon = csd.createSalon();
-        Keys old = seedBlobs(salon.masterUserId(), salon.salonId());
+        Keys old = seedBlobs(salon.masterUserId(), salon.salonId(), salon.masterId());
         when(r2.isEnabled()).thenReturn(true);
         when(r2.buildPublicUrl(anyString())).thenAnswer(inv -> "https://cdn.example/" + inv.getArgument(0));
         List<String> uploaded = new CopyOnWriteArrayList<>();
@@ -201,12 +212,12 @@ class StaffRemovalBlobPurgeIT extends AbstractIntegrationTest {
                 assertThat(resumeDisposal.await(60, TimeUnit.SECONDS)).isTrue();
             }
             // Spied Spring Data proxies cannot callRealMethod(); answer with the same projection via JDBC.
-            return jdbcTemplate.query("SELECT uploader_id, r2_key, entity_type, entity_id FROM media_files "
-                            + "WHERE uploader_id = ?",
-                    (rs, i) -> new UploaderMediaKey(rs.getObject(1, UUID.class), rs.getString(2),
+            return jdbcTemplate.query("SELECT id, r2_key, entity_type, entity_id FROM media_files "
+                            + "WHERE (entity_type = 'USER' AND entity_id = ?) OR (entity_type = 'MASTER' AND entity_id = ?)",
+                    (rs, i) -> new MediaFileKey(rs.getObject(1, UUID.class), rs.getString(2),
                             EntityType.valueOf(rs.getString(3)), rs.getObject(4, UUID.class)),
-                    salon.masterUserId());
-        }).when(mediaRepository).findMediaKeysByUploaderIdIn(anyCollection());
+                    salon.masterUserId(), salon.masterId());
+        }).when(mediaRepository).findAccountMediaKeys(anyCollection(), anyCollection());
         var auth = SecurityContextHolder.getContext().getAuthentication();
         ExecutorService pool = Executors.newFixedThreadPool(2, r -> new Thread(r, "race-pool"));
         Future<?> disposal;
@@ -278,18 +289,37 @@ class StaffRemovalBlobPurgeIT extends AbstractIntegrationTest {
         return new MockMultipartFile("file", "a.jpg", "image/jpeg", bytes);
     }
 
-    private record Keys(String avatar, String media) {}
+    /**
+     * @param salonPhoto   a SALON portfolio row this user uploaded — belongs to the salon (Phase 363)
+     * @param ownPortfolio the user's own MASTER portfolio row, or {@code null} when they have no master
+     */
+    private record Keys(String avatar, String salonPhoto, String ownPortfolio) {}
 
-    private Keys seedBlobs(UUID userId, UUID salonId) {
+    private Keys seedBlobs(UUID userId, UUID salonId, UUID masterId) {
         String avatar = "avatars/" + userId + "/a-" + UUID.randomUUID() + ".jpg";
-        String media = "portfolio/salons/" + salonId + "/m-" + UUID.randomUUID() + ".jpg";
+        String salonPhoto = "portfolio/salons/" + salonId + "/m-" + UUID.randomUUID() + ".jpg";
         jdbcTemplate.update("UPDATE users SET avatar_r2_key = ?, avatar_url = ? WHERE id = ?",
                 avatar, "https://cdn.example/" + avatar, userId);
+        insertPortfolioRow(userId, "SALON", salonId, salonPhoto);
+        String ownPortfolio = null;
+        if (masterId != null) {
+            ownPortfolio = "portfolio/independent/" + masterId + "/m-" + UUID.randomUUID() + ".jpg";
+            insertPortfolioRow(userId, "MASTER", masterId, ownPortfolio);
+        }
+        return new Keys(avatar, salonPhoto, ownPortfolio);
+    }
+
+    private void insertPortfolioRow(UUID uploaderId, String entityType, UUID entityId, String key) {
         jdbcTemplate.update(
                 "INSERT INTO media_files (id, uploader_id, entity_type, entity_id, media_type, r2_key, r2_url, "
-                        + "created_at, updated_at) VALUES (?, ?, 'SALON', ?, 'PORTFOLIO', ?, ?, NOW(), NOW())",
-                UUID.randomUUID(), userId, salonId, media, "https://cdn.example/" + media);
-        return new Keys(avatar, media);
+                        + "created_at, updated_at) VALUES (?, ?, ?, ?, 'PORTFOLIO', ?, ?, NOW(), NOW())",
+                UUID.randomUUID(), uploaderId, entityType, entityId, key, "https://cdn.example/" + key);
+    }
+
+    private boolean salonPhotoRowExists(String key) {
+        Integer n = jdbcTemplate.queryForObject(
+                "SELECT count(*) FROM media_files WHERE r2_key = ? AND entity_type = 'SALON'", Integer.class, key);
+        return n != null && n == 1;
     }
 
     private String emailOf(UUID userId) {

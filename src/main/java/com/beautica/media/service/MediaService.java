@@ -6,9 +6,10 @@ import com.beautica.common.cache.UserProfileCacheEvictor;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
+import com.beautica.common.exception.PortfolioBusyException;
+import com.beautica.common.exception.PortfolioLimitReachedException;
 import com.beautica.common.exception.ServiceUnavailableMessages;
 import com.beautica.common.security.AuthorizationService;
-import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.media.dto.AvatarResponse;
 import com.beautica.media.dto.MediaFileResponse;
@@ -17,9 +18,7 @@ import com.beautica.media.entity.MediaFile;
 import com.beautica.media.entity.MediaType;
 import com.beautica.media.repository.MediaFileKey;
 import com.beautica.media.repository.MediaRepository;
-import com.beautica.media.repository.UploaderMediaKey;
 import com.beautica.salon.dto.SalonResponse;
-import com.beautica.salon.entity.Salon;
 import com.beautica.salon.entity.SalonImagePointer;
 import com.beautica.salon.entity.SalonImageSlot;
 import com.beautica.salon.repository.SalonRepository;
@@ -38,6 +37,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.cache.Cache;
 import org.springframework.cache.CacheManager;
 import org.springframework.cache.annotation.Cacheable;
+import org.springframework.dao.PessimisticLockingFailureException;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -92,9 +92,11 @@ import java.util.function.Supplier;
  * pointed at runs strictly AFTER that row's transaction commits, on {@code blobPurgeExecutor}
  * ({@link AfterCommitBlobPurger}) — a failed or rolled-back write never touches R2 (M1).
  *
- * <p><b>SEC-2 / §O8 — account deletion.</b> The {@code ON DELETE CASCADE} on
- * {@code media_files.uploader_id} has no hook into R2, so every user-deletion flow captures the
- * account's blob pointers BEFORE the delete and registers {@link #purgeUserBlobsAfterCommit}
+ * <p><b>SEC-2 / §O8 — account deletion.</b> Since V193 {@code media_files.uploader_id} is audit-only
+ * ({@code ON DELETE SET NULL}, Phase 363): a user deletion removes only the account's OWN rows (its USER rows and
+ * its master's MASTER portfolio, entity-keyed via {@code MediaRepository#findAccountMediaKeys}/
+ * {@code #deleteAccountMedia}) — never a SALON row, which only salon deletion removes. Every user-deletion
+ * flow pre-reads those pointers BEFORE the delete and registers {@link #purgeUserBlobsAfterCommit}
  * via {@code AccountBlobPurgeRegistrar} (client/staff self-delete, staff disposal).
  *
  * <p><b>Phase 7.7 — portfolio cache.</b> {@link #getPortfolio} is the public
@@ -123,6 +125,9 @@ public class MediaService {
     private static final int HEADER_BYTES = 12;
     private static final int SNIFF_BUFFER_BYTES = 8192;
 
+    /** Phase 362 D5: per-(entity_type, entity_id) portfolio cap — below the 50-row public read page. */
+    public static final int MAX_PORTFOLIO_PHOTOS = 30;
+
     /** Cache name for the public portfolio listing — must match {@code CacheConfig.cacheManager()}. */
     static final String PORTFOLIO_CACHE = "portfolio";
 
@@ -134,7 +139,7 @@ public class MediaService {
 
     /** Phase 343 D4 key root for salon logo/cover blobs: {@code salons/<salonId>/{logo,cover}/...}. */
     private static final String SALON_IMAGE_KEY_ROOT = "salons/";
-    /** Portfolio key roots written by {@link #resolvePortfolioTarget} — the ONLY {@code media_files} writer. */
+    /** Portfolio key roots built by {@link #portfolioKeyPrefix} — used by {@link #storePortfolioPhoto}, the ONLY {@code media_files} writer. */
     private static final String SALON_PORTFOLIO_KEY_ROOT = "portfolio/salons/";
     private static final String MASTER_PORTFOLIO_KEY_ROOT = "portfolio/independent/";
 
@@ -676,72 +681,201 @@ public class MediaService {
 
     // --------------------------------------------------------------- portfolio
 
+    /**
+     * Independent-master portfolio upload ({@code POST /media/portfolio}). Phase 362 D4: INDEPENDENT_MASTER
+     * only — the target is resolved server-side from the principal (SEC-1); salon portfolios go through
+     * {@link #uploadSalonPortfolioPhoto}.
+     */
     public MediaFileResponse uploadPortfolioPhoto(UUID actorId, Role actorRole, MultipartFile file) {
         requireStorageEnabled();
         try (SniffedUpload upload = openAndSniff(file)) {
-            return uploadPortfolioSniffed(actorId, actorRole, file, upload);
+            // SEC-1: never trust a UUID from the request — the master is resolved from the principal.
+            // F2: the unlocked cap fast-fail rides the same read transaction — no R2 PUT at the cap.
+            PortfolioTarget target = txRead(() -> {
+                PortfolioTarget resolved = resolvePortfolioTarget(actorId, actorRole);
+                requireBelowPortfolioCap(mediaRepo.countByEntityTypeAndEntityIdAndMediaType(
+                        EntityType.MASTER, resolved.entityId(), MediaType.PORTFOLIO));
+                return resolved;
+            });
+            return storePortfolioPhoto(actorId, target, file, upload);
         }
     }
 
-    private MediaFileResponse uploadPortfolioSniffed(
-            UUID actorId, Role actorRole, MultipartFile file, SniffedUpload upload) {
-        String detectedMime = upload.mime();
-
-        // Step 1 — read tx: resolve the owning entity from the authenticated principal.
-        // SEC-1: never trust a UUID from the request body — the salon/master is resolved
-        // server-side from the actor's role.
-        PortfolioTarget target = txRead(() -> resolvePortfolioTarget(actorId, actorRole));
-
-        // Step 2 — R2 upload OUTSIDE any transaction.
-        String key = buildKey(target.prefix(), detectedMime);
-        r2.uploadFile(key, upload.stream(), file.getSize(), detectedMime);
-        String publicUrl = r2.buildPublicUrl(key);
-
-        // Step 3 — write tx: insert the row.
-        MediaFile saved = txWrite.execute(status -> {
-            User uploader = userRepo.getReferenceById(actorId);
-            return mediaRepo.save(MediaFile.builder()
-                    .uploader(uploader)
-                    .entityType(target.entityType())
-                    .entityId(target.entityId())
-                    .mediaType(MediaType.PORTFOLIO)
-                    .r2Key(key)
-                    .r2Url(publicUrl)
-                    .build());
-        });
-
-        // Step 4 — Phase 7.7: eviction is post-commit by construction — txWrite.execute()
-        // returns only after the surrounding transaction has committed.
-        evictPortfolioCache(target.entityType(), target.entityId());
-
-        return MediaFileResponse.from(saved);
+    /**
+     * Salon portfolio upload ({@code POST /salons/{salonId}/portfolio}, Phase 362 D1). The controller gate is
+     * {@code canManageSalon} (owner or the salon's bound SALON_ADMIN); {@code enforceCanManageSalon} is its
+     * service-layer twin, run before the storage probe so a forbidden caller never learns whether storage is on.
+     * Then: storage gate (503), single-open sniff (400), read-gate (inactive/unknown salon -> 404, already at
+     * the cap -> 409, one unlocked query), R2 upload outside any transaction, and the locked, capped insert
+     * ({@link #storePortfolioPhoto}).
+     */
+    public MediaFileResponse uploadSalonPortfolioPhoto(UUID actorId, UUID salonId, MultipartFile file) {
+        authz.enforceCanManageSalon(actorId, salonId);
+        requireStorageEnabled();
+        try (SniffedUpload upload = openAndSniff(file)) {
+            requireActiveSalonBelowCap(salonId);
+            PortfolioTarget target = new PortfolioTarget(EntityType.SALON, salonId,
+                    portfolioKeyPrefix(EntityType.SALON, salonId));
+            return storePortfolioPhoto(actorId, target, file, upload);
+        }
     }
 
     /**
-     * Removes one portfolio photo. Same M1 invariant as {@link #deleteAvatar}: the DB row is deleted FIRST, inside
-     * {@code txWrite}, and the blob is purged only AFTER that transaction commits (via
-     * {@link AfterCommitBlobPurger#purgeAfterCommit}, on {@code blobPurgeExecutor}). A failed or rolled-back row
-     * delete therefore never touches R2 — the listing can never point at a deleted object. An R2 failure after
-     * commit is an accepted orphan blob (WARN + counter, key omitted).
+     * The shared upload-then-locked-write body of both portfolio uploads (Phase 362 D6):
+     * <ol>
+     *   <li>R2 upload OUTSIDE any transaction, under a fresh server-generated key;</li>
+     *   <li>{@code txWrite}: row-lock the owning salon/master, count its portfolio, reject at the cap (409),
+     *       insert — see {@link #enforcePortfolioCapLocked}. This locked check is authoritative; the unlocked
+     *       pre-check before the R2 PUT is only a fast-fail;</li>
+     *   <li>on failure of step 2 the new blob is discarded. A cap 409 or inactive 404 raised under the lock
+     *       rolled back before {@code save}, and so does a lock timeout (the lock precedes the insert), so no
+     *       row can reference the blob — it is deleted directly (F3, G4). Anything else (commit or DB error
+     *       after save) is ambiguous, so the blob is deleted only when no committed row is found to reference
+     *       it ({@link #discardBlobUnlessReferenced}). A lock timeout is reported as {@link PortfolioBusyException} (503 + {@code Retry-After}, F6a), never the 409
+     *       the global {@code 55P03} mapping would give — 409 on this path always means the cap;</li>
+     *   <li>post-commit eviction of the entity's {@code portfolio} cache entry (Phase 7.7 / D8).</li>
+     * </ol>
+     */
+    private MediaFileResponse storePortfolioPhoto(
+            UUID actorId, PortfolioTarget target, MultipartFile file, SniffedUpload upload) {
+        String key = buildKey(target.prefix(), upload.mime());
+        r2.uploadFile(key, upload.stream(), file.getSize(), upload.mime());
+        String publicUrl = r2.buildPublicUrl(key);
+
+        MediaFile saved;
+        try {
+            saved = txWrite.execute(status -> insertPortfolioRowLocked(actorId, target, key, publicUrl));
+        } catch (PortfolioLimitReachedException | NotFoundException rolledBackBeforeSave) {
+            discardUnreferencedBlob(key);
+            throw rolledBackBeforeSave;
+        } catch (PessimisticLockingFailureException lockLost) {
+            // G4: the row lock is taken before save, so a lock timeout means no row can reference the blob.
+            discardUnreferencedBlob(key);
+            throw new PortfolioBusyException();
+        } catch (RuntimeException ex) {
+            discardPortfolioBlobUnlessReferenced(target, key);
+            throw ex;
+        }
+
+        // Post-commit by construction — txWrite.execute() returns only after the transaction has committed.
+        evictPortfolioCache(target.entityType(), target.entityId());
+        return MediaFileResponse.from(saved);
+    }
+
+    /** Ambiguous-failure cleanup: the blob goes only when no committed row of the target references it. */
+    private void discardPortfolioBlobUnlessReferenced(PortfolioTarget target, String key) {
+        discardBlobUnlessReferenced(key, "portfolio", () ->
+                mediaRepo.existsByEntityTypeAndEntityIdAndR2Key(target.entityType(), target.entityId(), key)
+                        ? key : null);
+    }
+
+    /** Locked write step of a portfolio upload: runs inside {@code txWrite}. */
+    private MediaFile insertPortfolioRowLocked(UUID actorId, PortfolioTarget target, String key, String publicUrl) {
+        enforcePortfolioCapLocked(target.entityType(), target.entityId());
+        return mediaRepo.save(MediaFile.builder()
+                .uploader(userRepo.getReferenceById(actorId))
+                .entityType(target.entityType())
+                .entityId(target.entityId())
+                .mediaType(MediaType.PORTFOLIO)
+                .r2Key(key)
+                .r2Url(publicUrl)
+                .build());
+    }
+
+    /**
+     * Phase 362 D5/D6 — the single portfolio cap check, shared by the salon and master upload paths. MUST run
+     * inside the write transaction: it first row-locks the owning salon/master ({@code FOR NO KEY UPDATE},
+     * self-conflicting), so two concurrent uploads for the same entity serialise and the second one counts the
+     * first one's committed row. Without the lock both would read {@code MAX - 1} and both insert (the
+     * {@code PortfolioCapConcurrencyIT} mutation target). The salon must still be active under the lock (a
+     * deactivate committed since the read-gate) — 404 otherwise.
      *
-     * <p>Security SEC-N1 (same S-L5 gate as every sweep): the key reaches R2 ONLY when it sits under its own
-     * row's portfolio root — a corrupted / raw-SQL-written {@code r2_key} must never become an arbitrary-object
-     * delete. A mismatch skips R2 (counted WARN, key omitted) but the row is still removed.
+     * @throws PortfolioLimitReachedException when the entity already holds {@link #MAX_PORTFOLIO_PHOTOS} photos
+     */
+    private void enforcePortfolioCapLocked(EntityType entityType, UUID entityId) {
+        lockPortfolioOwner(entityType, entityId);
+        requireBelowPortfolioCap(
+                mediaRepo.countByEntityTypeAndEntityIdAndMediaType(entityType, entityId, MediaType.PORTFOLIO));
+    }
+
+    /** The cap rule, shared by the unlocked fast-fail and the authoritative locked check. */
+    private static void requireBelowPortfolioCap(long count) {
+        if (count >= MAX_PORTFOLIO_PHOTOS) {
+            throw new PortfolioLimitReachedException();
+        }
+    }
+
+    /**
+     * Takes the owning row lock. Scalar projections only (F4/F5): no {@code Salon}/{@code Master} entity enters
+     * the persistence context, so nothing is dirty-checked at commit.
+     */
+    private void lockPortfolioOwner(EntityType entityType, UUID entityId) {
+        boolean locked = switch (entityType) {
+            case SALON -> salonRepo.lockIsActiveForUpdate(entityId).orElse(false);
+            case MASTER -> masterRepo.lockIdForUpdate(entityId).isPresent();
+            case USER -> throw new IllegalStateException("USER has no portfolio");
+        };
+        if (!locked) {
+            throw new NotFoundException(entityType == EntityType.SALON
+                    ? "Salon not found: " + entityId
+                    : "Master not found: " + entityId);
+        }
+    }
+
+    /**
+     * Read-gate before the R2 upload, ONE unlocked query (F2): 404 for an unknown or inactive salon, 409 when
+     * the salon already holds {@link #MAX_PORTFOLIO_PHOTOS} photos — so a full portfolio never costs an R2 PUT
+     * plus a DELETE. Not authoritative: the locked re-check in {@link #enforcePortfolioCapLocked} is.
+     */
+    private void requireActiveSalonBelowCap(UUID salonId) {
+        long count = txRead(() -> mediaRepo.countPortfolioOfActiveSalon(salonId))
+                .orElseThrow(() -> new NotFoundException("Salon not found: " + salonId));
+        requireBelowPortfolioCap(count);
+    }
+
+    /**
+     * Removes one independent-master portfolio photo ({@code DELETE /media/portfolio/{mediaId}}). Phase 362 D4:
+     * MASTER rows only — a SALON row answers 404 (it is managed through
+     * {@link #deleteSalonPortfolioPhoto}). Authorized by the row's OWNING ENTITY ({@code entity_id} = the
+     * actor's own master id), never by who uploaded it. Phase 362 audit cycle 3 (H3, 2026-10-12): ONE query
+     * ({@link MediaRepository#findPortfolioRowOfMasterUser}), and every not-yours case — missing, a SALON row,
+     * another master's row — is the same 404 (formerly 403 for another master's row, an existence oracle).
+     *
+     * <p>Same M1 invariant as {@link #deleteAvatar}: the DB row is deleted FIRST, inside {@code txWrite}, and the
+     * blob is purged only AFTER that transaction commits (via {@link AfterCommitBlobPurger#purgeAfterCommit}, on
+     * {@code blobPurgeExecutor}). A failed or rolled-back row delete never touches R2. Security SEC-N1: the key
+     * reaches R2 only when it sits under its own row's portfolio root.
      */
     public void deletePortfolioPhoto(UUID actorId, UUID mediaId) {
-        DeleteTarget target = txWrite.execute(status -> deletePortfolioRowLocked(actorId, mediaId));
+        DeleteTarget target = txWrite.execute(status -> {
+            MediaFile mf = mediaRepo.findPortfolioRowOfMasterUser(mediaId, actorId)
+                    .orElseThrow(() -> new NotFoundException("Media not found: " + mediaId));
+            return deletePortfolioRow(mf);
+        });
 
         // Phase 7.7: post-commit cache eviction. txWrite.execute() returns only after commit.
         evictPortfolioCache(target.entityType(), target.entityId());
     }
 
-    /** Write step of {@link #deletePortfolioPhoto}: runs inside {@code txWrite}; registers the after-commit purge. */
-    private DeleteTarget deletePortfolioRowLocked(UUID actorId, UUID mediaId) {
-        MediaFile mf = mediaRepo.findById(mediaId)
-                .orElseThrow(() -> new NotFoundException("Media not found: " + mediaId));
-        if (!mf.getUploader().getId().equals(actorId)) {
-            throw new ForbiddenException("Not allowed to delete this media");
-        }
+    /**
+     * Removes one salon portfolio photo ({@code DELETE /salons/{salonId}/portfolio/{mediaId}}, Phase 362 D3).
+     * <b>Locked rule (2026-10-12): salon photos belong to the salon.</b> Authorization is ONLY "can manage this
+     * salon" ({@code enforceCanManageSalon}: owner or bound admin) — the uploader is never compared, so any
+     * manager deletes any photo of that salon. The row must be a PORTFOLIO row of exactly {@code salonId}
+     * (another salon's row addressed through this path -> 404), and the salon must be active (404).
+     */
+    public void deleteSalonPortfolioPhoto(UUID actorId, UUID salonId, UUID mediaId) {
+        authz.enforceCanManageSalon(actorId, salonId);
+        // G3: one query — the row loads only when it is this salon's PORTFOLIO row AND the salon is active.
+        DeleteTarget target = txWrite.execute(status -> deletePortfolioRow(
+                mediaRepo.findPortfolioRowOfActiveSalon(mediaId, salonId)
+                        .orElseThrow(() -> new NotFoundException("Media not found: " + mediaId))));
+
+        evictPortfolioCache(target.entityType(), target.entityId());
+    }
+
+    /** Shared write step of both portfolio deletes: runs inside {@code txWrite}; registers the after-commit purge. */
+    private DeleteTarget deletePortfolioRow(MediaFile mf) {
         DeleteTarget target = new DeleteTarget(mf.getR2Key(), mf.getEntityType(), mf.getEntityId());
         mediaRepo.delete(mf);
         if (isOwnPortfolioKey(target.entityType(), target.entityId(), target.r2Key())) {
@@ -1000,7 +1134,7 @@ public class MediaService {
 
     /**
      * The {@code media_files.r2_key} root a portfolio blob of {@code (entityType, entityId)} must live under —
-     * derived from {@link #resolvePortfolioTarget}, the only writer: {@code portfolio/salons/<salonId>/} for
+     * the roots {@link #storePortfolioPhoto} (the only writer) uploads under: {@code portfolio/salons/<salonId>/} for
      * {@code SALON}, {@code portfolio/independent/<masterId>/} for {@code MASTER}. {@code USER} (and a null
      * type/id) has no portfolio root, so returns {@code null}.
      */
@@ -1035,8 +1169,8 @@ public class MediaService {
     /**
      * Permanently purges the R2 blobs of one or more hard-deleted accounts — called from the single
      * {@code afterCommit} that {@code AccountBlobPurgeRegistrar} registers (client/staff self-delete, and ONE
-     * registration for a whole staff-disposal batch — P-M1). By then the {@code users} rows and their
-     * cascaded {@code media_files} rows are gone, so this is R2-only plus portfolio-cache eviction (never
+     * registration for a whole staff-disposal batch — P-M1). By then the {@code users} rows and the
+     * accounts' own {@code media_files} rows (deleted by entity in that transaction, Phase 363 D4) are gone, so this is R2-only plus portfolio-cache eviction (never
      * {@link #sweepBlobs}, whose {@code mediaRepo.deleteAllByIdInBatch} would target vanished rows).
      *
      * <p>The avatar pointer is RE-VERIFIED here against {@code avatars/<userId>/} (S-L1); the R2 round-trip
@@ -1052,7 +1186,7 @@ public class MediaService {
         int skipped = 0;
         for (AccountBlobPointers account : accounts) {
             addIfPresent(keys, verifiedAccountAvatarKey(account));
-            for (UploaderMediaKey media : account.media()) {
+            for (MediaFileKey media : account.media()) {
                 if (isOwnPortfolioKey(media.entityType(), media.entityId(), media.r2Key())) {
                     keys.add(media.r2Key());
                 } else {
@@ -1104,24 +1238,18 @@ public class MediaService {
         return txRead.execute(status -> work.get());
     }
 
-    /** Resolve which entity a portfolio upload belongs to from the authenticated actor. */
+    /**
+     * Resolve the master a {@code /media/portfolio} upload belongs to from the authenticated actor. Phase 362
+     * D4: INDEPENDENT_MASTER only — the former SALON_OWNER branch (oldest active salon) is gone; salon portfolios
+     * take an explicit salon id via {@link #uploadSalonPortfolioPhoto}.
+     */
     private PortfolioTarget resolvePortfolioTarget(UUID actorId, Role actorRole) {
-        if (actorRole == Role.SALON_OWNER) {
-            // Perf MEDIUM F6: use findTop...OrderByCreatedAtAsc to pick the oldest active salon
-            // deterministically. The former findAllByOwnerIdAndIsActiveTrue + salons.get(0)
-            // had no ORDER BY, so the choice was non-deterministic when an owner has >1 salon.
-            Salon salon = salonRepo.findTopByOwnerIdAndIsActiveTrueOrderByCreatedAtAsc(actorId)
-                    .orElseThrow(() -> new ForbiddenException("No active salon found for owner"));
-            return new PortfolioTarget(EntityType.SALON, salon.getId(),
-                    portfolioKeyPrefix(EntityType.SALON, salon.getId()));
+        if (actorRole != Role.INDEPENDENT_MASTER) {
+            throw new ForbiddenException("Role not allowed to upload portfolio photos");
         }
-        if (actorRole == Role.INDEPENDENT_MASTER) {
-            Master master = masterRepo.findByUserId(actorId)
-                    .orElseThrow(() -> new ForbiddenException("No master profile found for user"));
-            return new PortfolioTarget(EntityType.MASTER, master.getId(),
-                    portfolioKeyPrefix(EntityType.MASTER, master.getId()));
-        }
-        throw new ForbiddenException("Role not allowed to upload portfolio photos");
+        UUID masterId = masterRepo.findIdByUserId(actorId)
+                .orElseThrow(() -> new ForbiddenException("No master profile found for user"));
+        return new PortfolioTarget(EntityType.MASTER, masterId, portfolioKeyPrefix(EntityType.MASTER, masterId));
     }
 
     /** Resolved owning entity for a portfolio upload — value object, no identity. */

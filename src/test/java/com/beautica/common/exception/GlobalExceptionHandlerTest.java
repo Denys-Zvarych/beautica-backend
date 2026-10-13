@@ -513,7 +513,8 @@ class GlobalExceptionHandlerTest {
                 "Media storage is not configured",
                 "Service setup is busy for this master, please retry",
                 "Support channel is not configured",
-                "Could not send the verification code");
+                "Could not send the verification code",
+                "Portfolio is busy, please retry");
     }
 
     @Test
@@ -1178,6 +1179,52 @@ class GlobalExceptionHandlerTest {
         assertThat(warnEvents.get(0).getFormattedMessage())
                 .as("WARN log must carry the affected-staff count for operator triage")
                 .contains("affectedStaffCount=3");
+    }
+
+    // ── portfolio upload (Phase 362 audit cycle 1, F6) ─────────────────────────
+
+    @Test
+    @DisplayName("handlePortfolioLimitReached — 409 with data.code PORTFOLIO_LIMIT_REACHED, success=false")
+    void should_return409WithPortfolioLimitCode_when_portfolioLimitReached() {
+        var ex = new PortfolioLimitReachedException();
+
+        ResponseEntity<ApiResponse<com.beautica.media.dto.PortfolioLimitReachedResponse>> response =
+                handler.handlePortfolioLimitReached(ex);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+        assertThat(response.getBody().success()).isFalse();
+        assertThat(response.getBody().data().code())
+                .isEqualTo(PortfolioLimitReachedException.ERROR_CODE)
+                .isEqualTo("PORTFOLIO_LIMIT_REACHED");
+        assertThat(response.getBody().message())
+                .as("the cap's own copy, not handleBusiness's genericised CONFLICT message")
+                .isEqualTo("Portfolio photo limit reached");
+    }
+
+    @Test
+    @DisplayName("handlePortfolioBusy — 503 + Retry-After, allow-listed message, no data")
+    void should_return503WithRetryAfter_when_portfolioBusy() {
+        var ex = new PortfolioBusyException();
+
+        ResponseEntity<ApiResponse<Void>> response = handler.handlePortfolioBusy(ex);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
+        assertThat(response.getHeaders().getFirst("Retry-After"))
+                .isEqualTo(String.valueOf(PortfolioBusyException.RETRY_AFTER_SECONDS));
+        assertThat(response.getBody().success()).isFalse();
+        assertThat(response.getBody().data()).isNull();
+        assertThat(response.getBody().message()).isEqualTo(ServiceUnavailableMessages.PORTFOLIO_BUSY);
+    }
+
+    @Test
+    @DisplayName("F6a scope: the GLOBAL 55P03 mapping is unchanged — a lock failure outside the portfolio path is "
+            + "still 409")
+    void should_keepGlobalLockTimeoutAt409_when_notPortfolioPath() {
+        var ex = new org.springframework.dao.CannotAcquireLockException("55P03");
+
+        ResponseEntity<ApiResponse<Void>> response = handler.handlePessimisticLockingFailure(ex);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
     }
 
     // ── handleBookingElapsed (track 24.x read-only-after-elapse) ───────────────
