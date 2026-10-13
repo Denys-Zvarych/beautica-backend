@@ -184,4 +184,19 @@ public class IndexCapabilityProbe {
         }
         return plan.toString();
     }
+
+    /**
+     * The {@code Index Cond:} lines of an EXPLAIN text plan with every parenthesis removed. Postgres 18
+     * wraps compound conditions in an extra pair of parentheses ({@code ((a = x) AND (b = y))} where 17
+     * printed {@code (a = x)}), so asserting the literal parenthesised text is a Postgres-version pin,
+     * not a plan-shape pin. Stripping them leaves {@code salon_id = '..'::uuid AND master_id = ..}, which
+     * asserts only that the term is a seek bound inside an Index Cond (and not in a Filter line).
+     */
+    public static List<String> indexCondLines(String plan) {
+        return plan.lines()
+                .map(String::strip)
+                .filter(line -> line.startsWith("Index Cond:"))
+                .map(line -> line.replace("(", "").replace(")", ""))
+                .toList();
+    }
 }
