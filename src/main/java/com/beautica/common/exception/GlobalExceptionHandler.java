@@ -6,6 +6,7 @@ import com.beautica.auth.dto.InviteErrorResponse;
 import com.beautica.booking.dto.BookingElapsedResponse;
 import com.beautica.booking.dto.ClientBookingConflictResponse;
 import com.beautica.common.ApiResponse;
+import com.beautica.media.dto.PortfolioLimitReachedResponse;
 import com.beautica.salon.dto.SalonDeletionBlockedResponse;
 import com.beautica.service.dto.DuplicateServiceResponse;
 import com.beautica.service.dto.ServicePriceShapeMismatchResponse;
@@ -297,6 +298,36 @@ public class GlobalExceptionHandler {
         return ResponseEntity
                 .status(ex.getStatus())
                 .body(new ApiResponse<>(false, new InviteErrorResponse(ex.getCode().name()), clientMessage));
+    }
+
+    /**
+     * Distinct 409 for the portfolio cap (Phase 362 D5, audit cycle 1 F6b): the
+     * {@link PortfolioLimitReachedResponse} body carries {@code PORTFOLIO_LIMIT_REACHED} under
+     * {@code data.code}, which {@link #handleBusiness}'s genericised CONFLICT branch would otherwise drop.
+     */
+    @ExceptionHandler(PortfolioLimitReachedException.class)
+    public ResponseEntity<ApiResponse<PortfolioLimitReachedResponse>> handlePortfolioLimitReached(
+            PortfolioLimitReachedException ex) {
+        log.debug("Portfolio upload rejected: {}", ex.getClass().getSimpleName());
+        return ResponseEntity
+                .status(HttpStatus.CONFLICT)
+                .body(new ApiResponse<>(false,
+                        new PortfolioLimitReachedResponse(PortfolioLimitReachedException.ERROR_CODE),
+                        "Portfolio photo limit reached"));
+    }
+
+    /**
+     * 503 + {@code Retry-After} for a portfolio upload that lost the owning row lock (audit cycle 1 F6a).
+     * Only {@code MediaService}'s portfolio path throws it; the global {@code 55P03 -> 409} mapping in
+     * {@link #handlePessimisticLockingFailure} is unchanged for every other endpoint.
+     */
+    @ExceptionHandler(PortfolioBusyException.class)
+    public ResponseEntity<ApiResponse<Void>> handlePortfolioBusy(PortfolioBusyException ex) {
+        log.debug("Portfolio upload lock contention: {}", ex.getClass().getSimpleName());
+        return ResponseEntity
+                .status(HttpStatus.SERVICE_UNAVAILABLE)
+                .header("Retry-After", String.valueOf(ex.getRetryAfterSeconds()))
+                .body(ApiResponse.error(ServiceUnavailableMessages.PORTFOLIO_BUSY));
     }
 
     @ExceptionHandler(BusinessException.class)

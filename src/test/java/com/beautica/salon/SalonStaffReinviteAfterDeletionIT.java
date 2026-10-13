@@ -381,6 +381,16 @@ class SalonStaffReinviteAfterDeletionIT extends AbstractIntegrationTest {
         assertThat(avgRatingOf(loop.oldMasterId())).isEqualByComparingTo(new BigDecimal("5.00"));
 
         deleteSalon(loop.ownerToken(), loop.salonAId());
+        // Phase 363: the disposed account's own MASTER portfolio leaves with the account (entity-keyed,
+        // detached stub included) — no longer kept alive by who uploaded it.
+        assertThat(count(
+                "SELECT COUNT(*) FROM media_files WHERE entity_type = 'MASTER' AND entity_id = ?",
+                loop.oldMasterId()))
+                .as("Phase 363 — the stub's portfolio was deleted with the account")
+                .isZero();
+        // Re-arm the D3 "no media re-pointed" assertion below: a row ON the stub that a re-pointing
+        // implementation could move (see insertMasterPortfolioMedia's javadoc).
+        insertMasterPortfolioMedia(loop.ownerId(), loop.oldMasterId());
         UUID salonB = fx.insertSalon(loop.ownerId(), "Salon B " + System.nanoTime());
         String rawToken = postInviteAndCaptureToken(
                 loop.ownerToken(), salonB, loop.staffEmail(), Role.SALON_MASTER);
@@ -791,11 +801,11 @@ class SalonStaffReinviteAfterDeletionIT extends AbstractIntegrationTest {
      * was structurally unable to go red. Seeding it arms the assertion now and keeps it armed if a
      * salon-master portfolio path is ever added.
      *
-     * <p><b>Uploader is the OWNER, deliberately.</b> {@code media_files.uploader_id} is
-     * {@code ON DELETE CASCADE} on {@code users} (V37), so a row uploaded by the staff member would
-     * vanish with their account and prove nothing about re-pointing. The owner survives the cascade,
-     * so the row survives on the detached stub — which is the state case 5 asserts against, in the
-     * same shape as its {@code reviews} pair.
+     * <p><b>Re-seeded after the deletion in case 5 (Phase 363).</b> {@code uploader_id} is audit-only
+     * since V193 and the staff disposal now deletes the disposed account's own MASTER portfolio by entity
+     * (detached stub included), so the row seeded by the fixture is gone after the deletion whoever
+     * uploaded it. Case 5 asserts that, then seeds a fresh row on the stub so the "not re-pointed"
+     * assertion stays armed, in the same shape as its {@code reviews} pair.
      *
      * <p>{@code PORTFOLIO} + {@code MASTER} satisfies {@code chk_media_files_media_type_entity_type};
      * the key and URL shapes satisfy {@code chk_media_files_r2_key_shape} and

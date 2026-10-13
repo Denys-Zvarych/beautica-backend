@@ -1,6 +1,5 @@
 package com.beautica.media.service;
 
-import com.beautica.TestConstants;
 import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
@@ -9,7 +8,8 @@ import com.beautica.auth.Role;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
-import com.beautica.master.entity.Master;
+import com.beautica.common.exception.PortfolioBusyException;
+import com.beautica.common.exception.PortfolioLimitReachedException;
 import com.beautica.common.cache.MasterProfileCacheEvictor;
 import com.beautica.common.cache.UserProfileCacheEvictor;
 import com.beautica.master.repository.MasterCacheKeys;
@@ -21,8 +21,6 @@ import com.beautica.media.entity.MediaFile;
 import com.beautica.media.entity.MediaType;
 import com.beautica.media.repository.MediaFileKey;
 import com.beautica.media.repository.MediaRepository;
-import com.beautica.media.repository.UploaderMediaKey;
-import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.search.service.SearchCacheNames;
 import com.beautica.user.User;
@@ -226,7 +224,7 @@ class MediaServiceTest {
     void uploadPortfolioPhoto_whenStorageDisabled_throws503_andDoesNotTouchRows() {
         when(r2.isEnabled()).thenReturn(false);
 
-        assertThatThrownBy(() -> service.uploadPortfolioPhoto(UUID.randomUUID(), Role.SALON_OWNER, jpegFile()))
+        assertThatThrownBy(() -> service.uploadPortfolioPhoto(UUID.randomUUID(), Role.INDEPENDENT_MASTER, jpegFile()))
                 .isInstanceOfSatisfying(BusinessException.class,
                         ex -> assertThat(ex.getStatus()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE));
 
@@ -311,7 +309,7 @@ class MediaServiceTest {
         MultipartFile file = org.mockito.Mockito.spy(
                 new MockMultipartFile("file", "a.svg", "image/svg+xml", "<svg xmlns='x'/>".getBytes()));
 
-        assertThatThrownBy(() -> service.uploadPortfolioPhoto(UUID.randomUUID(), Role.SALON_OWNER, file))
+        assertThatThrownBy(() -> service.uploadPortfolioPhoto(UUID.randomUUID(), Role.INDEPENDENT_MASTER, file))
                 .isInstanceOf(BusinessException.class);
 
         verify(file, times(1)).getInputStream();
@@ -763,51 +761,14 @@ class MediaServiceTest {
         verify(r2, never()).deleteFiles(anyCollection());
     }
 
-    // ----------------------------------------------------------------- portfolio
+    // ----------------------------------------------------------------- portfolio — master (/media/portfolio)
 
     @Test
-    @DisplayName("uploads portfolio photo for salon when SALON_OWNER uploads")
-    void should_uploadPortfolioForSalon_when_salonOwnerUploads() {
-        UUID actorId = UUID.randomUUID();
-        UUID salonId = UUID.randomUUID();
-        Salon salon = Salon.builder()
-                .cityId(TestConstants.DEFAULT_TEST_CITY_ID).id(salonId).isActive(true).build();
-        when(salonRepo.findTopByOwnerIdAndIsActiveTrueOrderByCreatedAtAsc(any(UUID.class)))
-                .thenReturn(Optional.of(salon));
-        when(userRepo.getReferenceById(actorId)).thenReturn(newUser(actorId));
-        when(mediaRepo.save(any(MediaFile.class))).thenAnswer(inv -> {
-            MediaFile mf = inv.getArgument(0);
-            setField(mf, "id", UUID.randomUUID());
-            return mf;
-        });
-        when(r2.buildPublicUrl(anyString())).thenReturn("https://r2/p.jpg");
-
-        MediaFileResponse response = service.uploadPortfolioPhoto(actorId, Role.SALON_OWNER, jpegFile());
-
-        ArgumentCaptor<String> keyCaptor = ArgumentCaptor.forClass(String.class);
-        verify(r2).uploadFile(keyCaptor.capture(), any(), anyLong(), eq("image/jpeg"));
-        assertThat(keyCaptor.getValue())
-                .startsWith("portfolio/salons/" + salonId + "/")
-                .endsWith(".jpg");
-        assertThat(response.entityType()).isEqualTo(EntityType.SALON);
-        assertThat(response.entityId()).isEqualTo(salonId);
-        assertThat(response.mediaType()).isEqualTo(MediaType.PORTFOLIO);
-    }
-
-    @Test
-    @DisplayName("uploads portfolio photo for master when INDEPENDENT_MASTER uploads")
+    @DisplayName("uploads portfolio photo for master when INDEPENDENT_MASTER uploads — lock, cap count, insert")
     void should_uploadPortfolioForMaster_when_independentMasterUploads() {
         UUID actorId = UUID.randomUUID();
         UUID masterId = UUID.randomUUID();
-        Master master = Master.builder().id(masterId).build();
-        when(masterRepo.findByUserId(actorId)).thenReturn(Optional.of(master));
-        when(userRepo.getReferenceById(actorId)).thenReturn(newUser(actorId));
-        when(mediaRepo.save(any(MediaFile.class))).thenAnswer(inv -> {
-            MediaFile mf = inv.getArgument(0);
-            setField(mf, "id", UUID.randomUUID());
-            return mf;
-        });
-        when(r2.buildPublicUrl(anyString())).thenReturn("https://r2/p.jpg");
+        stubMasterUploadHappyPath(actorId, masterId, 0L);
 
         MediaFileResponse response = service.uploadPortfolioPhoto(actorId, Role.INDEPENDENT_MASTER, jpegFile());
 
@@ -818,33 +779,80 @@ class MediaServiceTest {
                 .endsWith(".jpg");
         assertThat(response.entityType()).isEqualTo(EntityType.MASTER);
         assertThat(response.entityId()).isEqualTo(masterId);
+        InOrder order = inOrder(masterRepo, mediaRepo);
+        order.verify(masterRepo).lockIdForUpdate(masterId);
+        order.verify(mediaRepo).countByEntityTypeAndEntityIdAndMediaType(EntityType.MASTER, masterId, MediaType.PORTFOLIO);
+        order.verify(mediaRepo).save(any(MediaFile.class));
     }
 
     @Test
-    @DisplayName("throws ForbiddenException when SALON_OWNER has no active salon on uploadPortfolioPhoto")
-    void should_throwForbidden_when_salonOwnerHasNoActiveSalon() {
-        // Arrange
+    @DisplayName("D5: INDEPENDENT_MASTER reaching the cap under the lock (a racing upload won) → 409, no row, the "
+            + "blob is discarded directly — no reference probe (F3)")
+    void should_throwConflict_andPurgeBlob_when_masterPortfolioAtCap() {
         UUID actorId = UUID.randomUUID();
-        when(salonRepo.findTopByOwnerIdAndIsActiveTrueOrderByCreatedAtAsc(any(UUID.class)))
-                .thenReturn(Optional.empty());
+        UUID masterId = UUID.randomUUID();
+        when(masterRepo.findIdByUserId(actorId)).thenReturn(Optional.of(masterId));
+        when(masterRepo.lockIdForUpdate(masterId)).thenReturn(Optional.of(masterId));
+        when(mediaRepo.countByEntityTypeAndEntityIdAndMediaType(EntityType.MASTER, masterId, MediaType.PORTFOLIO))
+                .thenReturn(MediaService.MAX_PORTFOLIO_PHOTOS - 1L, (long) MediaService.MAX_PORTFOLIO_PHOTOS);
 
-        // Act & Assert
-        assertThatThrownBy(() -> service.uploadPortfolioPhoto(actorId, Role.SALON_OWNER, jpegFile()))
-                .isInstanceOf(ForbiddenException.class);
+        assertThatThrownBy(() -> service.uploadPortfolioPhoto(actorId, Role.INDEPENDENT_MASTER, jpegFile()))
+                .isInstanceOfSatisfying(PortfolioLimitReachedException.class,
+                        ex -> assertThat(ex.getStatus()).isEqualTo(HttpStatus.CONFLICT));
+
+        String uploadedKey = capturedUploadKey();
+        verify(mediaRepo, never()).save(any(MediaFile.class));
+        verify(r2).deleteFile(uploadedKey);
+        verify(mediaRepo, never()).existsByEntityTypeAndEntityIdAndR2Key(any(), any(), anyString());
+        verify(portfolioCache, never()).evictIfPresent(any());
+    }
+
+    @Test
+    @DisplayName("F2: INDEPENDENT_MASTER already at the cap → 409 from the unlocked pre-check, R2 never touched")
+    void should_notTouchR2_when_portfolioAlreadyAtCap() {
+        UUID actorId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        when(masterRepo.findIdByUserId(actorId)).thenReturn(Optional.of(masterId));
+        when(mediaRepo.countByEntityTypeAndEntityIdAndMediaType(EntityType.MASTER, masterId, MediaType.PORTFOLIO))
+                .thenReturn((long) MediaService.MAX_PORTFOLIO_PHOTOS);
+
+        assertThatThrownBy(() -> service.uploadPortfolioPhoto(actorId, Role.INDEPENDENT_MASTER, jpegFile()))
+                .isInstanceOf(PortfolioLimitReachedException.class);
 
         verify(r2, never()).uploadFile(anyString(), any(), anyLong(), anyString());
+        verify(r2, never()).deleteFile(anyString());
+        verify(masterRepo, never()).lockIdForUpdate(any());
+        verify(txWrite, never()).execute(any());
+    }
+
+    @Test
+    @DisplayName("F6a/G4: master portfolio lock timeout (55P03) → PortfolioBusyException (503), the blob is "
+            + "discarded directly — no reference probe (the lock precedes the insert)")
+    void should_throwBusy_andDiscardBlob_when_masterLockTimesOut() {
+        UUID actorId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        when(masterRepo.findIdByUserId(actorId)).thenReturn(Optional.of(masterId));
+        when(mediaRepo.countByEntityTypeAndEntityIdAndMediaType(EntityType.MASTER, masterId, MediaType.PORTFOLIO))
+                .thenReturn(0L);
+        when(r2.buildPublicUrl(anyString())).thenReturn("https://r2/p.jpg");
+        when(masterRepo.lockIdForUpdate(masterId))
+                .thenThrow(new org.springframework.dao.CannotAcquireLockException("55P03"));
+
+        assertThatThrownBy(() -> service.uploadPortfolioPhoto(actorId, Role.INDEPENDENT_MASTER, jpegFile()))
+                .isInstanceOfSatisfying(PortfolioBusyException.class,
+                        ex -> assertThat(ex.getStatus()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE));
+
+        String uploadedKey = capturedUploadKey();
+        verify(r2).deleteFile(uploadedKey);
+        verify(mediaRepo, never()).save(any(MediaFile.class));
+        verify(mediaRepo, never()).existsByEntityTypeAndEntityIdAndR2Key(any(), any(), anyString());
     }
 
     @Test
     @DisplayName("throws ForbiddenException when INDEPENDENT_MASTER has no master profile on uploadPortfolioPhoto")
     void should_throwForbidden_when_independentMasterHasNoProfile() {
-        // Symmetric empty branch to should_throwForbidden_when_salonOwnerHasNoActiveSalon:
-        // resolvePortfolioTarget() looks up the master profile for an INDEPENDENT_MASTER and
-        // throws ForbiddenException("No master profile found for user") when absent. Only the
-        // happy path (Optional.of(master)) was previously stubbed, so this empty branch was
-        // never exercised — a regression that dropped the orElseThrow would have gone unnoticed.
         UUID actorId = UUID.randomUUID();
-        when(masterRepo.findByUserId(any(UUID.class))).thenReturn(Optional.empty());
+        when(masterRepo.findIdByUserId(any(UUID.class))).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> service.uploadPortfolioPhoto(actorId, Role.INDEPENDENT_MASTER, jpegFile()))
                 .isInstanceOf(ForbiddenException.class)
@@ -853,6 +861,16 @@ class MediaServiceTest {
         // The R2 upload runs only AFTER the target resolves — it must never be reached.
         verify(r2, never()).uploadFile(anyString(), any(), anyLong(), anyString());
         verifyNoInteractions(mediaRepo);
+    }
+
+    @Test
+    @DisplayName("D4: /media/portfolio as SALON_OWNER → 403 — no salon write path remains on it")
+    void should_throwForbidden_when_salonOwnerUploadsViaMediaPortfolio() {
+        assertThatThrownBy(() -> service.uploadPortfolioPhoto(UUID.randomUUID(), Role.SALON_OWNER, jpegFile()))
+                .isInstanceOf(ForbiddenException.class);
+
+        verifyNoStorageWrites();
+        verifyNoInteractions(mediaRepo, salonRepo, masterRepo);
     }
 
     @Test
@@ -866,14 +884,14 @@ class MediaServiceTest {
     }
 
     @Test
-    @DisplayName("deletes portfolio photo when uploader requests deletion — row deleted, own key purged after commit")
-    void should_deletePortfolioPhoto_when_uploaderRequests() {
+    @DisplayName("master delete: the row belongs to the actor's own master — deleted even though another user uploaded it")
+    void should_deleteMasterPortfolioPhoto_when_rowBelongsToOwnMasterRegardlessOfUploader() {
         UUID actorId = UUID.randomUUID();
         UUID mediaId = UUID.randomUUID();
         UUID masterId = UUID.randomUUID();
         String ownKey = "portfolio/independent/" + masterId + "/y.jpg";
-        MediaFile row = portfolioRow(mediaId, actorId, EntityType.MASTER, masterId, ownKey);
-        when(mediaRepo.findById(mediaId)).thenReturn(Optional.of(row));
+        MediaFile row = portfolioRow(mediaId, UUID.randomUUID(), EntityType.MASTER, masterId, ownKey);
+        when(mediaRepo.findPortfolioRowOfMasterUser(mediaId, actorId)).thenReturn(Optional.of(row));
 
         service.deletePortfolioPhoto(actorId, mediaId);
 
@@ -883,20 +901,309 @@ class MediaServiceTest {
     }
 
     @Test
-    @DisplayName("SEC-N1: a SALON row's key under its OWN portfolio root reaches R2 — only AFTER the row delete")
-    void should_deleteR2Blob_when_salonPortfolioKeyInsideOwnPrefix() {
+    @DisplayName("H3: master delete loads the row with ONE scoped query — no findById, no master-id lookup")
+    void should_loadRowWithSingleScopedQuery_when_masterDeletesPortfolioPhoto() {
         UUID actorId = UUID.randomUUID();
         UUID mediaId = UUID.randomUUID();
-        UUID salonId = UUID.randomUUID();
-        String ownKey = "portfolio/salons/" + salonId + "/p.jpg";
-        MediaFile row = portfolioRow(mediaId, actorId, EntityType.SALON, salonId, ownKey);
-        when(mediaRepo.findById(mediaId)).thenReturn(Optional.of(row));
+        UUID masterId = UUID.randomUUID();
+        when(mediaRepo.findPortfolioRowOfMasterUser(mediaId, actorId)).thenReturn(Optional.of(portfolioRow(
+                mediaId, actorId, EntityType.MASTER, masterId, "portfolio/independent/" + masterId + "/y.jpg")));
 
         service.deletePortfolioPhoto(actorId, mediaId);
 
+        verify(mediaRepo, times(1)).findPortfolioRowOfMasterUser(mediaId, actorId);
+        verify(mediaRepo, never()).findById(any(UUID.class));
+        verifyNoInteractions(masterRepo);
+    }
+
+    @Test
+    @DisplayName("H3: every not-yours case (another master's row, a SALON row, no master profile, unknown id) → "
+            + "the same 404, nothing deleted — no existence oracle")
+    void should_throwNotFound_when_scopedMasterRowQueryIsEmpty() {
+        UUID actorId = UUID.randomUUID();
+        UUID mediaId = UUID.randomUUID();
+        when(mediaRepo.findPortfolioRowOfMasterUser(mediaId, actorId)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> service.deletePortfolioPhoto(actorId, mediaId))
+                .isInstanceOf(NotFoundException.class)
+                .isNotInstanceOf(ForbiddenException.class);
+
+        verify(mediaRepo, never()).delete(any(MediaFile.class));
+        verifyNoInteractions(masterRepo);
+        verifyNoStorageWrites();
+    }
+
+    // ----------------------------------------------------------------- portfolio — salon (/salons/{id}/portfolio)
+
+    @Test
+    @DisplayName("salon upload happy path: authz twin, read-gate, salon lock → cap count → insert under the salon")
+    void should_uploadSalonPortfolio_when_ownerUploads() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        stubSalonUploadHappyPath(salonId, 0L);
+
+        MediaFileResponse response = service.uploadSalonPortfolioPhoto(actorId, salonId, jpegFile());
+
+        assertThat(capturedUploadKey())
+                .startsWith("portfolio/salons/" + salonId + "/")
+                .endsWith(".jpg");
+        assertThat(response.entityType()).isEqualTo(EntityType.SALON);
+        assertThat(response.entityId()).isEqualTo(salonId);
+        assertThat(response.mediaType()).isEqualTo(MediaType.PORTFOLIO);
+        InOrder order = inOrder(authz, salonRepo, r2, mediaRepo);
+        order.verify(authz).enforceCanManageSalon(actorId, salonId);
+        order.verify(mediaRepo).countPortfolioOfActiveSalon(salonId);
+        order.verify(r2).uploadFile(anyString(), any(), anyLong(), eq("image/jpeg"));
+        order.verify(salonRepo).lockIsActiveForUpdate(salonId);
+        order.verify(mediaRepo).countByEntityTypeAndEntityIdAndMediaType(EntityType.SALON, salonId, MediaType.PORTFOLIO);
+        order.verify(mediaRepo).save(any(MediaFile.class));
+    }
+
+    @Test
+    @DisplayName("salon upload: the bound SALON_ADMIN (not the owner) uploads → OK, the row belongs to the salon")
+    void should_uploadSalonPortfolio_when_boundAdminUploads() {
+        UUID adminId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        stubSalonUploadHappyPath(salonId, 0L);
+
+        MediaFileResponse response = service.uploadSalonPortfolioPhoto(adminId, salonId, jpegFile());
+
+        assertThat(response.entityType()).isEqualTo(EntityType.SALON);
+        assertThat(response.entityId()).isEqualTo(salonId);
+        verify(authz).enforceCanManageSalon(adminId, salonId);
+        verify(salonRepo, never()).findIsActiveByIdAndOwnerId(any(), any());
+    }
+
+    @Test
+    @DisplayName("salon upload: SALON_ADMIN of another salon → 403 before storage, sniff, DB or R2")
+    void should_throwForbidden_when_adminOfOtherSalonUploads() {
+        assertSalonUploadForbidden();
+    }
+
+    @Test
+    @DisplayName("salon upload: SALON_OWNER of another salon → 403 before storage, sniff, DB or R2")
+    void should_throwForbidden_when_ownerOfOtherSalonUploads() {
+        assertSalonUploadForbidden();
+    }
+
+    @Test
+    @DisplayName("salon upload: inactive (or unknown) salon → 404 at the read-gate, nothing uploaded")
+    void should_throwNotFound_when_salonInactiveOnUpload() {
+        UUID salonId = UUID.randomUUID();
+        when(mediaRepo.countPortfolioOfActiveSalon(salonId)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> service.uploadSalonPortfolioPhoto(UUID.randomUUID(), salonId, jpegFile()))
+                .isInstanceOf(NotFoundException.class);
+
+        verifyNoStorageWrites();
+        verify(mediaRepo).countPortfolioOfActiveSalon(salonId);
+        verifyNoMoreInteractions(mediaRepo);
+    }
+
+    @Test
+    @DisplayName("salon upload: salon deactivated between read-gate and lock → 404, the uploaded blob is purged")
+    void should_throwNotFound_andPurgeBlob_when_salonDeactivatedUnderLock() {
+        UUID salonId = UUID.randomUUID();
+        when(mediaRepo.countPortfolioOfActiveSalon(salonId)).thenReturn(Optional.of(0L));
+        when(salonRepo.lockIsActiveForUpdate(salonId)).thenReturn(Optional.of(false));
+
+        assertThatThrownBy(() -> service.uploadSalonPortfolioPhoto(UUID.randomUUID(), salonId, jpegFile()))
+                .isInstanceOf(NotFoundException.class);
+
+        String uploadedKey = capturedUploadKey();
+        verify(r2).deleteFile(uploadedKey);
+        verify(mediaRepo, never()).save(any(MediaFile.class));
+        // F3: rolled back before save — no row can reference the blob, so no probe.
+        verify(mediaRepo, never()).existsByEntityTypeAndEntityIdAndR2Key(any(), any(), anyString());
+    }
+
+    @Test
+    @DisplayName("D5: salon portfolio reaching the cap under the lock (a racing upload won) → 409 "
+            + "PORTFOLIO_LIMIT_REACHED, no row, the blob is discarded directly — no reference probe (F3)")
+    void should_throwConflict_andPurgeBlob_when_salonPortfolioAtCap() {
+        UUID salonId = UUID.randomUUID();
+        when(mediaRepo.countPortfolioOfActiveSalon(salonId))
+                .thenReturn(Optional.of(MediaService.MAX_PORTFOLIO_PHOTOS - 1L));
+        when(salonRepo.lockIsActiveForUpdate(salonId)).thenReturn(Optional.of(true));
+        when(mediaRepo.countByEntityTypeAndEntityIdAndMediaType(EntityType.SALON, salonId, MediaType.PORTFOLIO))
+                .thenReturn((long) MediaService.MAX_PORTFOLIO_PHOTOS);
+
+        assertThatThrownBy(() -> service.uploadSalonPortfolioPhoto(UUID.randomUUID(), salonId, jpegFile()))
+                .isInstanceOfSatisfying(PortfolioLimitReachedException.class,
+                        ex -> assertThat(ex.getStatus()).isEqualTo(HttpStatus.CONFLICT));
+
+        String uploadedKey = capturedUploadKey();
+        verify(mediaRepo, never()).save(any(MediaFile.class));
+        verify(r2).deleteFile(uploadedKey);
+        verify(mediaRepo, never()).existsByEntityTypeAndEntityIdAndR2Key(any(), any(), anyString());
+        verify(portfolioCache, never()).evictIfPresent(any());
+    }
+
+    @Test
+    @DisplayName("F2: salon portfolio already at the cap → 409 from the unlocked pre-check, R2 never touched")
+    void should_notTouchR2_when_salonPortfolioAlreadyAtCap() {
+        UUID salonId = UUID.randomUUID();
+        when(mediaRepo.countPortfolioOfActiveSalon(salonId))
+                .thenReturn(Optional.of((long) MediaService.MAX_PORTFOLIO_PHOTOS));
+
+        assertThatThrownBy(() -> service.uploadSalonPortfolioPhoto(UUID.randomUUID(), salonId, jpegFile()))
+                .isInstanceOf(PortfolioLimitReachedException.class);
+
+        verify(r2, never()).uploadFile(anyString(), any(), anyLong(), anyString());
+        verify(r2, never()).deleteFile(anyString());
+        verify(salonRepo, never()).lockIsActiveForUpdate(any());
+        verify(txWrite, never()).execute(any());
+    }
+
+    @Test
+    @DisplayName("F6a: salon portfolio lock timeout (55P03) → PortfolioBusyException (503), never the global 409; "
+            + "the blob is discarded directly — no reference probe (G4)")
+    void should_throwBusy_andDiscardBlob_when_salonLockTimesOut() {
+        UUID salonId = UUID.randomUUID();
+        when(mediaRepo.countPortfolioOfActiveSalon(salonId)).thenReturn(Optional.of(0L));
+        when(r2.buildPublicUrl(anyString())).thenReturn("https://r2/p.jpg");
+        when(salonRepo.lockIsActiveForUpdate(salonId))
+                .thenThrow(new org.springframework.dao.CannotAcquireLockException("55P03"));
+
+        assertThatThrownBy(() -> service.uploadSalonPortfolioPhoto(UUID.randomUUID(), salonId, jpegFile()))
+                .isInstanceOfSatisfying(PortfolioBusyException.class, ex -> {
+                    assertThat(ex.getStatus()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
+                    assertThat(ex.getRetryAfterSeconds()).isPositive();
+                });
+
+        verify(mediaRepo, never()).existsByEntityTypeAndEntityIdAndR2Key(any(), any(), anyString());
+        String uploadedKey = capturedUploadKey();
+        verify(r2).deleteFile(uploadedKey);
+    }
+
+    @Test
+    @DisplayName("D5 boundary: 29 existing photos → the 30th is accepted")
+    void should_acceptUpload_when_salonPortfolioOneBelowCap() {
+        UUID salonId = UUID.randomUUID();
+        stubSalonUploadHappyPath(salonId, MediaService.MAX_PORTFOLIO_PHOTOS - 1L);
+
+        MediaFileResponse response = service.uploadSalonPortfolioPhoto(UUID.randomUUID(), salonId, jpegFile());
+
+        assertThat(response.entityId()).isEqualTo(salonId);
+        verify(mediaRepo).save(any(MediaFile.class));
+        verify(r2, never()).deleteFile(anyString());
+    }
+
+    @Test
+    @DisplayName("salon upload: a failed insert whose row is found committed keeps the blob (no dangling pointer)")
+    void should_keepBlob_when_insertFailureActuallyCommitted() {
+        UUID salonId = UUID.randomUUID();
+        when(mediaRepo.countPortfolioOfActiveSalon(salonId)).thenReturn(Optional.of(0L));
+        when(salonRepo.lockIsActiveForUpdate(salonId)).thenReturn(Optional.of(true));
+        when(userRepo.getReferenceById(any(UUID.class))).thenAnswer(inv -> newUser(inv.getArgument(0)));
+        when(mediaRepo.save(any(MediaFile.class)))
+                .thenThrow(new org.springframework.dao.QueryTimeoutException("commit ack lost"));
+        when(mediaRepo.existsByEntityTypeAndEntityIdAndR2Key(eq(EntityType.SALON), eq(salonId), anyString()))
+                .thenReturn(true);
+
+        assertThatThrownBy(() -> service.uploadSalonPortfolioPhoto(UUID.randomUUID(), salonId, jpegFile()))
+                .isInstanceOf(org.springframework.dao.QueryTimeoutException.class);
+
+        verify(r2, never()).deleteFile(anyString());
+    }
+
+    @Test
+    @DisplayName("salon upload: storage disabled → 503 after the authz twin, before any DB or R2 access")
+    void should_throw503_when_storageDisabledOnSalonUpload() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        when(r2.isEnabled()).thenReturn(false);
+
+        assertThatThrownBy(() -> service.uploadSalonPortfolioPhoto(actorId, salonId, jpegFile()))
+                .isInstanceOfSatisfying(BusinessException.class,
+                        ex -> assertThat(ex.getStatus()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE));
+
+        verify(authz).enforceCanManageSalon(actorId, salonId);
+        verifyNoInteractions(salonRepo, mediaRepo);
+        verifyNoStorageWrites();
+    }
+
+    @Test
+    @DisplayName("evicts the salon's portfolio cache AFTER the write tx commits when a salon upload succeeds")
+    void should_evictPortfolioCache_when_salonUploadSucceeds() {
+        UUID salonId = UUID.randomUUID();
+        stubSalonUploadHappyPath(salonId, 0L);
+
+        service.uploadSalonPortfolioPhoto(UUID.randomUUID(), salonId, jpegFile());
+
+        // Cache key is a plain String: entityType.name() + '_' + entityId (portfolioCacheKey contract).
+        InOrder order = inOrder(txWrite, cacheManager, portfolioCache);
+        order.verify(txWrite).execute(any());
+        order.verify(cacheManager).getCache("portfolio");
+        order.verify(portfolioCache).evictIfPresent(EntityType.SALON.name() + "_" + salonId);
+    }
+
+    @Test
+    @DisplayName("evicts the master's portfolio cache AFTER the write tx commits when a master upload succeeds")
+    void should_evictPortfolioCache_when_masterUploadSucceeds() {
+        UUID actorId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        stubMasterUploadHappyPath(actorId, masterId, 0L);
+
+        service.uploadPortfolioPhoto(actorId, Role.INDEPENDENT_MASTER, jpegFile());
+
+        InOrder order = inOrder(txWrite, cacheManager, portfolioCache);
+        order.verify(txWrite).execute(any());
+        order.verify(cacheManager).getCache("portfolio");
+        order.verify(portfolioCache).evictIfPresent(EntityType.MASTER.name() + "_" + masterId);
+    }
+
+    @Test
+    @DisplayName("D3: a SALON row uploaded by the owner is deleted by the bound admin — no uploader comparison")
+    void should_deleteSalonPortfolioPhoto_when_adminDeletesOwnersPhoto() {
+        UUID ownerId = UUID.randomUUID();
+        UUID adminId = UUID.randomUUID();
+        UUID mediaId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        String ownKey = "portfolio/salons/" + salonId + "/p.jpg";
+        MediaFile row = portfolioRow(mediaId, ownerId, EntityType.SALON, salonId, ownKey);
+        when(mediaRepo.findPortfolioRowOfActiveSalon(mediaId, salonId)).thenReturn(Optional.of(row));
+
+        service.deleteSalonPortfolioPhoto(adminId, salonId, mediaId);
+
+        verify(authz).enforceCanManageSalon(adminId, salonId);
         InOrder order = inOrder(mediaRepo, r2);
         order.verify(mediaRepo).delete(row);
         order.verify(r2).deleteFiles(List.of(ownKey));
+    }
+
+    @Test
+    @DisplayName("D3/G3: the single active-salon row query finds nothing (another salon's row, a non-portfolio or "
+            + "MASTER row, an inactive salon — filtered in SQL, see MediaRepositoryTest) → 404, nothing deleted, "
+            + "one query only")
+    void should_throwNotFound_when_activeSalonRowQueryIsEmpty() {
+        UUID salonId = UUID.randomUUID();
+        UUID mediaId = UUID.randomUUID();
+        when(mediaRepo.findPortfolioRowOfActiveSalon(mediaId, salonId)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> service.deleteSalonPortfolioPhoto(UUID.randomUUID(), salonId, mediaId))
+                .isInstanceOf(NotFoundException.class)
+                .hasMessage("Media not found: " + mediaId);
+
+        verify(mediaRepo, never()).delete(any(MediaFile.class));
+        verify(mediaRepo, never()).findById(any());
+        verifyNoInteractions(salonRepo);
+        verifyNoStorageWrites();
+        verify(portfolioCache, never()).evictIfPresent(any());
+    }
+
+    @Test
+    @DisplayName("salon delete: caller cannot manage the salon → 403 before any DB access")
+    void should_throwForbidden_when_nonManagerDeletesSalonPhoto() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        doThrow(new ForbiddenException("Access denied")).when(authz).enforceCanManageSalon(actorId, salonId);
+
+        assertThatThrownBy(() -> service.deleteSalonPortfolioPhoto(actorId, salonId, UUID.randomUUID()))
+                .isInstanceOf(ForbiddenException.class);
+
+        verifyNoInteractions(salonRepo, mediaRepo);
+        verifyNoStorageWrites();
     }
 
     @Test
@@ -911,11 +1218,11 @@ class MediaServiceTest {
                 "avatars/" + UUID.randomUUID() + "/a.jpg",
                 "portfolio/salons/" + salonId + "/../../avatars/x/a.jpg");
         for (String foreignKey : foreignKeys) {
-            reset(r2, mediaRepo);
+            reset(r2, mediaRepo, salonRepo);
             MediaFile row = portfolioRow(mediaId, actorId, EntityType.SALON, salonId, foreignKey);
-            when(mediaRepo.findById(mediaId)).thenReturn(Optional.of(row));
+            when(mediaRepo.findPortfolioRowOfActiveSalon(mediaId, salonId)).thenReturn(Optional.of(row));
 
-            service.deletePortfolioPhoto(actorId, mediaId);
+            service.deleteSalonPortfolioPhoto(actorId, salonId, mediaId);
 
             verify(r2, never()).deleteFile(anyString());
             verify(r2, never()).deleteFiles(anyCollection());
@@ -924,18 +1231,18 @@ class MediaServiceTest {
     }
 
     @Test
-    @DisplayName("M1: the row delete fails (rollback) — R2 is never touched")
+    @DisplayName("M1: the row delete fails (rollback) — R2 is never touched, cache not evicted")
     void should_notTouchR2_when_portfolioRowDeleteFails() {
         UUID actorId = UUID.randomUUID();
         UUID mediaId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
         MediaFile row = portfolioRow(mediaId, actorId, EntityType.SALON, salonId,
                 "portfolio/salons/" + salonId + "/p.jpg");
-        when(mediaRepo.findById(mediaId)).thenReturn(Optional.of(row));
+        when(mediaRepo.findPortfolioRowOfActiveSalon(mediaId, salonId)).thenReturn(Optional.of(row));
         doThrow(new org.springframework.dao.DataIntegrityViolationException("forced"))
                 .when(mediaRepo).delete(row);
 
-        assertThatThrownBy(() -> service.deletePortfolioPhoto(actorId, mediaId))
+        assertThatThrownBy(() -> service.deleteSalonPortfolioPhoto(actorId, salonId, mediaId))
                 .isInstanceOf(org.springframework.dao.DataIntegrityViolationException.class);
 
         verify(r2, never()).deleteFile(anyString());
@@ -951,7 +1258,7 @@ class MediaServiceTest {
         UUID salonId = UUID.randomUUID();
         String ownKey = "portfolio/salons/" + salonId + "/p.jpg";
         MediaFile row = portfolioRow(mediaId, actorId, EntityType.SALON, salonId, ownKey);
-        when(mediaRepo.findById(mediaId)).thenReturn(Optional.of(row));
+        when(mediaRepo.findPortfolioRowOfActiveSalon(mediaId, salonId)).thenReturn(Optional.of(row));
         List<Boolean> r2CalledBeforeCommit = new java.util.ArrayList<>();
         doAnswer(inv -> {
             TransactionSynchronizationManager.initSynchronization();
@@ -968,73 +1275,22 @@ class MediaServiceTest {
             }
         }).when(txWrite).execute(any());
 
-        service.deletePortfolioPhoto(actorId, mediaId);
+        service.deleteSalonPortfolioPhoto(actorId, salonId, mediaId);
 
         assertThat(r2CalledBeforeCommit).containsExactly(false);
         verify(r2).deleteFiles(List.of(ownKey));
     }
 
     @Test
-    @DisplayName("throws 403 when a non-uploader tries to delete a portfolio photo")
-    void should_throwForbidden_when_nonUploaderDeletesPortfolioPhoto() {
-        UUID actorId = UUID.randomUUID();
-        UUID uploaderId = UUID.randomUUID();
+    @DisplayName("evicts the salon's portfolio cache AFTER the write tx commits when a salon delete succeeds")
+    void should_evictPortfolioCache_when_salonDeleteSucceeds() {
         UUID mediaId = UUID.randomUUID();
-        MediaFile mf = MediaFile.builder()
-                .id(mediaId)
-                .uploader(newUser(uploaderId))
-                .r2Key("k.jpg")
-                .r2Url("u")
-                .entityType(EntityType.MASTER)
-                .entityId(UUID.randomUUID())
-                .mediaType(MediaType.PORTFOLIO)
-                .build();
-        when(mediaRepo.findById(mediaId)).thenReturn(Optional.of(mf));
-
-        assertThatThrownBy(() -> service.deletePortfolioPhoto(actorId, mediaId))
-                .isInstanceOf(ForbiddenException.class);
-
-        verify(r2, never()).deleteFile(anyString());
-        verify(r2, never()).deleteFiles(anyCollection());
-        verify(mediaRepo, never()).deleteById(any(UUID.class));
-        verify(mediaRepo, never()).delete(any(MediaFile.class));
-    }
-
-    @Test
-    @DisplayName("throws 404 when the portfolio photo is not found")
-    void should_throwNotFound_when_portfolioPhotoNotFound() {
-        UUID mediaId = UUID.randomUUID();
-        when(mediaRepo.findById(mediaId)).thenReturn(Optional.empty());
-
-        assertThatThrownBy(() -> service.deletePortfolioPhoto(UUID.randomUUID(), mediaId))
-                .isInstanceOf(NotFoundException.class);
-
-        verifyNoStorageWrites();
-    }
-
-    // ---------------------------------------------- Phase 7.7 — portfolio cache eviction
-
-    @Test
-    @DisplayName("evicts the portfolio cache AFTER the write tx commits when uploadPortfolioPhoto succeeds")
-    void should_evictPortfolioCache_when_uploadPortfolioPhotoSucceeds() {
-        UUID actorId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
-        Salon salon = Salon.builder()
-                .cityId(TestConstants.DEFAULT_TEST_CITY_ID).id(salonId).isActive(true).build();
-        when(salonRepo.findTopByOwnerIdAndIsActiveTrueOrderByCreatedAtAsc(any(UUID.class)))
-                .thenReturn(Optional.of(salon));
-        when(userRepo.getReferenceById(actorId)).thenReturn(newUser(actorId));
-        when(mediaRepo.save(any(MediaFile.class))).thenAnswer(inv -> {
-            MediaFile mf = inv.getArgument(0);
-            setField(mf, "id", UUID.randomUUID());
-            return mf;
-        });
-        when(r2.buildPublicUrl(anyString())).thenReturn("https://r2/p.jpg");
+        when(mediaRepo.findPortfolioRowOfActiveSalon(mediaId, salonId)).thenReturn(Optional.of(portfolioRow(mediaId, UUID.randomUUID(),
+                EntityType.SALON, salonId, "portfolio/salons/" + salonId + "/p.jpg")));
 
-        service.uploadPortfolioPhoto(actorId, Role.SALON_OWNER, jpegFile());
+        service.deleteSalonPortfolioPhoto(UUID.randomUUID(), salonId, mediaId);
 
-        // Eviction must happen AFTER the write tx — InOrder over (txWrite, cache) proves it.
-        // Cache key is a plain String: entityType.name() + '_' + entityId (portfolioCacheKey contract).
         InOrder order = inOrder(txWrite, cacheManager, portfolioCache);
         order.verify(txWrite).execute(any());
         order.verify(cacheManager).getCache("portfolio");
@@ -1047,25 +1303,62 @@ class MediaServiceTest {
         UUID actorId = UUID.randomUUID();
         UUID mediaId = UUID.randomUUID();
         UUID masterEntityId = UUID.randomUUID();
-        MediaFile mf = MediaFile.builder()
-                .id(mediaId)
-                .uploader(newUser(actorId))
-                .entityType(EntityType.MASTER)
-                .entityId(masterEntityId)
-                .mediaType(MediaType.PORTFOLIO)
-                .r2Key("portfolio/independent/" + masterEntityId + "/y.jpg")
-                .r2Url("https://r2/y.jpg")
-                .build();
-        when(mediaRepo.findById(mediaId)).thenReturn(Optional.of(mf));
+        when(mediaRepo.findPortfolioRowOfMasterUser(mediaId, actorId)).thenReturn(Optional.of(portfolioRow(mediaId,
+                actorId, EntityType.MASTER, masterEntityId, "portfolio/independent/" + masterEntityId + "/y.jpg")));
 
         service.deletePortfolioPhoto(actorId, mediaId);
 
-        // Eviction must happen AFTER the write tx — InOrder over (txWrite, cache) proves it.
         // Cache key is a plain String: entityType.name() + '_' + entityId (portfolioCacheKey contract).
         InOrder order = inOrder(txWrite, cacheManager, portfolioCache);
         order.verify(txWrite).execute(any());
         order.verify(cacheManager).getCache("portfolio");
         order.verify(portfolioCache).evictIfPresent(EntityType.MASTER.name() + "_" + masterEntityId);
+    }
+
+    // ----------------------------------------------------------------- portfolio fixtures
+
+    private void assertSalonUploadForbidden() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        doThrow(new ForbiddenException("Access denied")).when(authz).enforceCanManageSalon(actorId, salonId);
+
+        assertThatThrownBy(() -> service.uploadSalonPortfolioPhoto(actorId, salonId, jpegFile()))
+                .isInstanceOf(ForbiddenException.class);
+
+        verify(r2, never()).isEnabled();
+        verifyNoStorageWrites();
+        verifyNoInteractions(salonRepo, mediaRepo, userRepo);
+    }
+
+    private void stubSalonUploadHappyPath(UUID salonId, long existingCount) {
+        when(mediaRepo.countPortfolioOfActiveSalon(salonId)).thenReturn(Optional.of(existingCount));
+        when(salonRepo.lockIsActiveForUpdate(salonId)).thenReturn(Optional.of(true));
+        stubPortfolioInsert(EntityType.SALON, salonId, existingCount);
+    }
+
+    private void stubMasterUploadHappyPath(UUID actorId, UUID masterId, long existingCount) {
+        when(masterRepo.findIdByUserId(actorId)).thenReturn(Optional.of(masterId));
+        when(masterRepo.lockIdForUpdate(masterId)).thenReturn(Optional.of(masterId));
+        stubPortfolioInsert(EntityType.MASTER, masterId, existingCount);
+    }
+
+    private void stubPortfolioInsert(EntityType entityType, UUID entityId, long existingCount) {
+        when(mediaRepo.countByEntityTypeAndEntityIdAndMediaType(entityType, entityId, MediaType.PORTFOLIO))
+                .thenReturn(existingCount);
+        when(userRepo.getReferenceById(any(UUID.class))).thenAnswer(inv -> newUser(inv.getArgument(0)));
+        when(mediaRepo.save(any(MediaFile.class))).thenAnswer(inv -> {
+            MediaFile mf = inv.getArgument(0);
+            setField(mf, "id", UUID.randomUUID());
+            return mf;
+        });
+        when(r2.buildPublicUrl(anyString())).thenReturn("https://r2/p.jpg");
+    }
+
+    /** The single key the upload sent to R2. */
+    private String capturedUploadKey() {
+        ArgumentCaptor<String> keyCaptor = ArgumentCaptor.forClass(String.class);
+        verify(r2).uploadFile(keyCaptor.capture(), any(), anyLong(), eq("image/jpeg"));
+        return keyCaptor.getValue();
     }
 
     @Test
@@ -1328,7 +1621,7 @@ class MediaServiceTest {
     void should_skipAvatarKey_when_accountAvatarOutsideOwnPrefix() {
         UUID userId = UUID.randomUUID();
         String foreignKey = "avatars/" + UUID.randomUUID() + "/x.jpg";
-        UploaderMediaKey media = new UploaderMediaKey(userId, "portfolio/independent/" + MASTER_ID_FOR_PURGE + "/m.jpg",
+        MediaFileKey media = new MediaFileKey(UUID.randomUUID(), "portfolio/independent/" + MASTER_ID_FOR_PURGE + "/m.jpg",
                 EntityType.MASTER, MASTER_ID_FOR_PURGE);
         listAppender.list.clear();
 
@@ -1349,8 +1642,8 @@ class MediaServiceTest {
         UUID salonId = UUID.randomUUID();
         when(r2.extractKeyFromPublicUrl("https://cdn/avatars/" + b + "/legacy.jpg"))
                 .thenReturn(Optional.of("avatars/" + b + "/legacy.jpg"));
-        UploaderMediaKey ma = new UploaderMediaKey(a, "portfolio/salons/" + salonId + "/a.jpg", EntityType.SALON, salonId);
-        UploaderMediaKey mb = new UploaderMediaKey(b, "portfolio/salons/" + salonId + "/b.jpg", EntityType.SALON, salonId);
+        MediaFileKey ma = new MediaFileKey(UUID.randomUUID(), "portfolio/salons/" + salonId + "/a.jpg", EntityType.SALON, salonId);
+        MediaFileKey mb = new MediaFileKey(UUID.randomUUID(), "portfolio/salons/" + salonId + "/b.jpg", EntityType.SALON, salonId);
 
         service.purgeUserBlobsAfterCommit(List.of(
                 new AccountBlobPointers(a, "avatars/" + a + "/a.jpg", null, List.of(ma)),
@@ -1371,15 +1664,15 @@ class MediaServiceTest {
         UUID salonId = UUID.randomUUID();
         UUID masterId = UUID.randomUUID();
         String own = "portfolio/salons/" + salonId + "/1-own.jpg";
-        List<UploaderMediaKey> media = List.of(
-                new UploaderMediaKey(userId, own, EntityType.SALON, salonId),
-                new UploaderMediaKey(userId, "portfolio/salons/" + UUID.randomUUID() + "/1-foreign.jpg",
+        List<MediaFileKey> media = List.of(
+                new MediaFileKey(UUID.randomUUID(), own, EntityType.SALON, salonId),
+                new MediaFileKey(UUID.randomUUID(), "portfolio/salons/" + UUID.randomUUID() + "/1-foreign.jpg",
                         EntityType.SALON, salonId),
-                new UploaderMediaKey(userId, "portfolio/independent/" + salonId + "/1-kind.jpg",
+                new MediaFileKey(UUID.randomUUID(), "portfolio/independent/" + salonId + "/1-kind.jpg",
                         EntityType.SALON, salonId),
-                new UploaderMediaKey(userId, "portfolio/independent/" + masterId + "/../x/1-trav.jpg",
+                new MediaFileKey(UUID.randomUUID(), "portfolio/independent/" + masterId + "/../x/1-trav.jpg",
                         EntityType.MASTER, masterId),
-                new UploaderMediaKey(userId, "avatars/" + userId + "/1-user.jpg", EntityType.USER, userId));
+                new MediaFileKey(UUID.randomUUID(), "avatars/" + userId + "/1-user.jpg", EntityType.USER, userId));
         listAppender.list.clear();
 
         service.purgeUserBlobsAfterCommit(List.of(new AccountBlobPointers(userId, null, null, media)));
@@ -1416,8 +1709,8 @@ class MediaServiceTest {
         String masterKey = "portfolio/independent/" + masterId + "/1-m.jpg";
 
         service.purgeUserBlobsAfterCommit(List.of(new AccountBlobPointers(userId, null, null, List.of(
-                new UploaderMediaKey(userId, salonKey, EntityType.SALON, salonId),
-                new UploaderMediaKey(userId, masterKey, EntityType.MASTER, masterId)))));
+                new MediaFileKey(UUID.randomUUID(), salonKey, EntityType.SALON, salonId),
+                new MediaFileKey(UUID.randomUUID(), masterKey, EntityType.MASTER, masterId)))));
 
         verify(r2).deleteFiles(List.of(salonKey, masterKey));
     }

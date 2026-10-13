@@ -30,7 +30,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 class MediaStorageDisabledIT extends AbstractMediaIntegrationTest {
 
     private static final String AVATAR_URL = "/api/v1/media/avatar";
-    private static final String PORTFOLIO_URL = "/api/v1/media/portfolio";
+    /** Phase 362: salon portfolio writes are salon-scoped ({@code /media/portfolio} is INDEPENDENT_MASTER only). */
+    private static String salonPortfolioUrl(UUID salonId) {
+        return "/api/v1/salons/" + salonId + "/portfolio";
+    }
     private static final String NOT_CONFIGURED = "Media storage is not configured";
 
     @Autowired
@@ -90,18 +93,18 @@ class MediaStorageDisabledIT extends AbstractMediaIntegrationTest {
     }
 
     @Test
-    @DisplayName("POST /media/portfolio — 503 and no media_files row when SALON_OWNER with a salon uploads and storage is off")
+    @DisplayName("POST /salons/{id}/portfolio — 503 and no media_files row when the SALON_OWNER uploads and storage is off")
     void should_return503AndInsertNoRow_when_portfolioUploadedWithStorageOff() throws Exception {
         // Arrange
         String email = "media-off-port-" + System.nanoTime() + "@beautica.test";
         UUID ownerId = insertSalonOwner(email);
-        insertSalon(ownerId, "Storage Off Salon " + System.nanoTime());
+        UUID salonId = insertSalon(ownerId, "Storage Off Salon " + System.nanoTime());
         String token = loginAndGetToken(email);
         long before = mediaRowCount();
 
         // Act
         ResponseEntity<String> resp = restTemplate.exchange(
-                PORTFOLIO_URL, HttpMethod.POST,
+                salonPortfolioUrl(salonId), HttpMethod.POST,
                 new HttpEntity<>(jpegMultipartBody(), bearerMultipartHeaders(token)),
                 String.class);
 
@@ -112,16 +115,18 @@ class MediaStorageDisabledIT extends AbstractMediaIntegrationTest {
     }
 
     @Test
-    @DisplayName("POST /media/portfolio — 503 (not 403) for an owner without a salon, proving the storage guard runs before the salon lookup")
-    void should_return503BeforeOwnershipCheck_when_storageOffAndOwnerHasNoSalon() throws Exception {
-        // Arrange
-        String email = "media-off-nosalon-" + System.nanoTime() + "@beautica.test";
-        insertSalonOwner(email);
+    @DisplayName("POST /salons/{id}/portfolio — 503 (not 404) for the owner of an INACTIVE salon, proving the storage guard runs before the salon read-gate")
+    void should_return503BeforeSalonReadGate_when_storageOffAndSalonInactive() throws Exception {
+        // Arrange — authz (canManageSalon) runs first by design; the read-gate (inactive → 404) runs after storage.
+        String email = "media-off-inactive-" + System.nanoTime() + "@beautica.test";
+        UUID ownerId = insertSalonOwner(email);
+        UUID salonId = insertSalon(ownerId, "Storage Off Inactive " + System.nanoTime());
+        jdbcTemplate.update("UPDATE salons SET is_active = false WHERE id = ?", salonId);
         String token = loginAndGetToken(email);
 
         // Act
         ResponseEntity<String> resp = restTemplate.exchange(
-                PORTFOLIO_URL, HttpMethod.POST,
+                salonPortfolioUrl(salonId), HttpMethod.POST,
                 new HttpEntity<>(jpegMultipartBody(), bearerMultipartHeaders(token)),
                 String.class);
 

@@ -7,7 +7,7 @@ import com.beautica.master.repository.MasterRepository;
 import com.beautica.master.service.MasterService;
 import com.beautica.media.entity.EntityType;
 import com.beautica.media.repository.MediaRepository;
-import com.beautica.media.repository.UploaderMediaKey;
+import com.beautica.media.repository.MediaFileKey;
 import com.beautica.media.service.AccountBlobPointers;
 import com.beautica.user.AccountBlobPurgeRegistrar;
 import com.beautica.user.UserAvatarPointers;
@@ -136,7 +136,11 @@ public class StaffAccountDisposalService {
      * {@code StaffAccountSelfDeletionService} the caller's own already-authenticated user id.
      *
      * <p>Everything with {@code ON DELETE CASCADE} on {@code users} goes with the row: refresh
-     * tokens, device tokens, password-reset tickets, media rows, favourites.
+     * tokens, device tokens, password-reset tickets, favourites. {@code media_files} is NOT among them since
+     * V193 (Phase 363 — {@code uploader_id} is audit-only, {@code ON DELETE SET NULL}): the accounts' OWN rows
+     * (their USER rows and their masters' MASTER portfolio, detached masters included) are deleted explicitly
+     * by entity just before the users delete; SALON rows are never touched here, whoever uploaded them — only
+     * salon deletion removes a salon's photos.
      * {@code created_by_user_id} on {@code bookings}/{@code appointments} nulls out (phase 294
      * D5), so a walk-in the deleted staff member rang up survives with its attribution cleared.
      *
@@ -145,9 +149,9 @@ public class StaffAccountDisposalService {
      * The phase 291 scrub marker column and its guard are gone with the column (V158).
      *
      * <h3>R2 blobs (avatar + {@code media_files}) — swept after commit (§O-8)</h3>
-     * {@code media_files} cascades on {@code uploader_id} and {@code users.avatar_r2_key} vanishes
-     * with the row, so BEFORE the users delete this method row-locks and pre-reads each disposed user's
-     * avatar pointers and {@code media_files} keys and registers ONE after-commit purge for the batch via
+     * The accounts' own {@code media_files} rows and {@code users.avatar_r2_key} are deleted in this
+     * transaction, so BEFORE that this method row-locks and pre-reads each disposed user's avatar pointers and
+     * own (entity-keyed) {@code media_files} keys and registers ONE after-commit purge for the batch via
      * {@link AccountBlobPurgeRegistrar} (the same registrar the self-delete flows use). A rolled-back
      * disposal fires nothing. {@link StaffDisposalReason#SELF_DELETE} is skipped here: {@code
      * StaffAccountSelfDeletionService} registers its own sweep, and registering twice would double-purge.
@@ -178,6 +182,51 @@ public class StaffAccountDisposalService {
      */
     public void dispose(
             UUID actorId, @Nullable UUID salonId, List<UUID> staffUserIds, StaffDisposalReason reason) {
+        disposeInternal(actorId, salonId, staffUserIds, reason, null);
+    }
+
+    /**
+     * Same disposal as {@link #dispose(UUID, UUID, List, StaffDisposalReason)}, for a caller that has
+     * ALREADY resolved the accounts' masters rows in the current transaction (Phase 363 audit H2 — the
+     * self-delete path reads them for its blob pre-read, and re-running the identical query here was a
+     * wasted round trip). Additive: the four-argument overload is untouched and still resolves them itself.
+     *
+     * <p>Contract: {@code resolvedStaffMasters} MUST be the result of
+     * {@link MasterRepository#findAllByUserIdInWithUser(java.util.Collection)} for exactly
+     * {@code staffUserIds}, read in this same transaction — never an {@code is_active}-scoped or
+     * otherwise filtered list (an omitted ATTACHED masters row would fire ON DELETE SET NULL on the users
+     * delete and violate {@code chk_masters_detachment_coherent}; see the step-1 comment below).
+     *
+     * @param resolvedStaffMasters every masters row owned by {@code staffUserIds}, user graph fetched
+     */
+    public void dispose(
+            UUID actorId, @Nullable UUID salonId, List<UUID> staffUserIds, StaffDisposalReason reason,
+            List<Master> resolvedStaffMasters) {
+        List<Master> masters = List.copyOf(resolvedStaffMasters);
+        requireMastersOwnedBy(masters, staffUserIds);
+        disposeInternal(actorId, salonId, staffUserIds, reason, masters);
+    }
+
+    /**
+     * Fail-closed guard on the caller-supplied list (Phase 363 security LOW): a masters row owned by an
+     * account outside {@code staffUserIds} would otherwise have its MASTER portfolio and its masters row
+     * deleted. In-memory only — the user graph is already fetched by {@code findAllByUserIdInWithUser}.
+     * Runs before any write; the message carries ids only, never PII.
+     */
+    private static void requireMastersOwnedBy(List<Master> masters, List<UUID> staffUserIds) {
+        Set<UUID> allowed = Set.copyOf(staffUserIds);
+        for (Master master : masters) {
+            UUID ownerId = master.getUser() != null ? master.getUser().getId() : null;
+            if (ownerId == null || !allowed.contains(ownerId)) {
+                throw new IllegalStateException(
+                        "Resolved master " + master.getId() + " is not owned by any disposed staff account");
+            }
+        }
+    }
+
+    private void disposeInternal(
+            UUID actorId, @Nullable UUID salonId, List<UUID> staffUserIds, StaffDisposalReason reason,
+            @Nullable List<Master> resolvedStaffMasters) {
         if (staffUserIds.isEmpty()) {
             return;
         }
@@ -215,8 +264,16 @@ public class StaffAccountDisposalService {
             userProfileCacheEvictor.evictAfterCommit(staffUserId);
         }
 
+        // Read here (not just before step 1) because the blob pre-read below keys the MASTER portfolio on
+        // these ids (Phase 363). An unlocked read; nothing below changes which masters rows a user has.
+        // A caller that already resolved them with this exact query passes them in (H2) — one query, not two.
+        List<Master> staffMasters = resolvedStaffMasters != null
+                ? resolvedStaffMasters
+                : masterRepository.findAllByUserIdInWithUser(staffUserIds);
+        List<UUID> staffMasterIds = staffMasters.stream().map(Master::getId).toList();
+
         if (reason != StaffDisposalReason.SELF_DELETE) {
-            registerBlobPurges(salonId, staffUserIds, reason);
+            registerBlobPurges(staffUserIds, staffMasters, staffMasterIds);
         }
 
         // ── step 1 of the binding order: settle every masters row that references a staff
@@ -229,7 +286,6 @@ public class StaffAccountDisposalService {
         Instant now = clock.instant();
         int detached = 0;
         int deleted = 0;
-        List<Master> staffMasters = masterRepository.findAllByUserIdInWithUser(staffUserIds);
 
         // ONE set-based probe for the whole batch, resolved BEFORE the loop (phase 295 audit
         // HIGH-2). The loop below is then a pure in-memory branch and issues no query of its own.
@@ -254,8 +310,7 @@ public class StaffAccountDisposalService {
         // "restore" a correctness rationale here.
         Set<UUID> mastersWithHistory = staffMasters.isEmpty()
                 ? Set.of()
-                : Set.copyOf(masterRepository.findIdsWithHistoricalReferences(
-                        staffMasters.stream().map(Master::getId).toList()));
+                : Set.copyOf(masterRepository.findIdsWithHistoricalReferences(staffMasterIds));
 
         for (Master staffMaster : staffMasters) {
             if (!mastersWithHistory.contains(staffMaster.getId())) {
@@ -282,6 +337,10 @@ public class StaffAccountDisposalService {
         // followed would try to update rows that no longer satisfy the coherence CHECK. flush() on
         // any repository flushes the whole EntityManager, which is exactly what is wanted here.
         masterRepository.flush();
+        // Phase 363 D4: the accounts' own media rows go explicitly — the uploader cascade that used to take
+        // them is gone (V193). Detached masters' portfolios too: the portfolio leaves with the account. Never
+        // a SALON row (entity-keyed, never uploader-keyed).
+        mediaRepository.deleteAccountMedia(staffUserIds, staffMasterIds);
         userRepository.deleteAllByIdInBatch(staffUserIds);
 
         // Audit trail — one line per BATCH, ids and counts only, never an email or any other
@@ -316,7 +375,7 @@ public class StaffAccountDisposalService {
     }
 
     /**
-     * Pre-reads every disposed user's blob pointers BEFORE the users delete cascades them away and registers
+     * Pre-reads every disposed user's blob pointers BEFORE this transaction deletes them and registers
      * ONE after-commit purge for the whole batch (P-M1).
      *
      * <ol>
@@ -324,27 +383,29 @@ public class StaffAccountDisposalService {
      *       avatar replace by a removed member either committed before this read (its new key is read and
      *       purged) or blocks on the row lock until the delete commits and then discards its own new blob.
      *       Scalar projection, no managed entities (P-L2).</li>
-     *   <li>{@code findMediaKeysByUploaderIdIn} — scalar projection, no uploader fetch (P-L1).</li>
+     *   <li>{@code findAccountMediaKeys} — the users' own USER rows and their masters' MASTER portfolio,
+     *       entity-keyed (Phase 363 D3). A SALON row is never read here, so no user removal can purge a salon
+     *       photo, whoever uploaded it. Scalar projection (P-L1).</li>
      * </ol>
      * Only key/id scalars reach the after-commit closure (P-L3).
      */
-    private void registerBlobPurges(
-            @Nullable UUID salonId, List<UUID> staffUserIds, StaffDisposalReason reason) {
+    private void registerBlobPurges(List<UUID> staffUserIds, List<Master> staffMasters, List<UUID> staffMasterIds) {
         List<UserAvatarPointers> avatars = userRepository.lockAvatarPointersByIdIn(staffUserIds);
-        Map<UUID, List<UploaderMediaKey>> mediaByUploader = new HashMap<>();
-        for (UploaderMediaKey media : mediaRepository.findMediaKeysByUploaderIdIn(staffUserIds)) {
-            // A salon deletion already sweeps the salon's own portfolio rows (SalonService pre-reads them and
-            // MediaService#deleteBySalon purges them after commit) — skip them here to avoid a double purge.
-            if (reason == StaffDisposalReason.SALON_DELETION && salonId != null
-                    && media.entityType() == EntityType.SALON && salonId.equals(media.entityId())) {
-                continue;
-            }
-            mediaByUploader.computeIfAbsent(media.uploaderId(), id -> new ArrayList<>()).add(media);
+        Map<UUID, UUID> userIdByMasterId = new HashMap<>();
+        for (Master staffMaster : staffMasters) {
+            userIdByMasterId.put(staffMaster.getId(), staffMaster.getUser().getId());
+        }
+        Map<UUID, List<MediaFileKey>> mediaByUser = new HashMap<>();
+        for (MediaFileKey media : mediaRepository.findAccountMediaKeys(staffUserIds, staffMasterIds)) {
+            UUID ownerUserId = media.entityType() == EntityType.USER
+                    ? media.entityId()
+                    : userIdByMasterId.get(media.entityId());
+            mediaByUser.computeIfAbsent(ownerUserId, id -> new ArrayList<>()).add(media);
         }
         List<AccountBlobPointers> accounts = new ArrayList<>(avatars.size());
         for (UserAvatarPointers avatar : avatars) {
             accounts.add(new AccountBlobPointers(avatar.getId(), avatar.getAvatarR2Key(), avatar.getAvatarUrl(),
-                    mediaByUploader.getOrDefault(avatar.getId(), List.of())));
+                    mediaByUser.getOrDefault(avatar.getId(), List.of())));
         }
         accountBlobPurgeRegistrar.registerAfterCommit(accounts);
     }

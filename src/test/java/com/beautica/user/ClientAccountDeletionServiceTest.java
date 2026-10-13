@@ -15,7 +15,7 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.media.entity.EntityType;
 import com.beautica.media.repository.MediaRepository;
-import com.beautica.media.repository.UploaderMediaKey;
+import com.beautica.media.repository.MediaFileKey;
 import com.beautica.review.repository.ClientReviewRepository;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -139,7 +139,7 @@ class ClientAccountDeletionServiceTest {
         Booking remainingBooking2 = Booking.builder().id(UUID.randomUUID()).client(client).build();
 
         when(userRepository.findByIdForUpdate(clientId)).thenReturn(Optional.of(client));
-        when(mediaRepository.findMediaKeysByUploaderIdIn(List.of(clientId))).thenReturn(List.of());
+        when(mediaRepository.findAccountMediaKeys(List.of(clientId), List.of())).thenReturn(List.of());
         lenient().when(clock.instant()).thenReturn(Instant.EPOCH);
         when(bookingService.findFutureConfirmedBookingCandidatesForClient(clientId)).thenReturn(futureCandidates);
         when(appointmentRepository.findByClientId(clientId))
@@ -211,7 +211,7 @@ class ClientAccountDeletionServiceTest {
                 List.of(candidate(legA, appointmentId), candidate(legB, appointmentId));
 
         when(userRepository.findByIdForUpdate(clientId)).thenReturn(Optional.of(client));
-        when(mediaRepository.findMediaKeysByUploaderIdIn(List.of(clientId))).thenReturn(List.of());
+        when(mediaRepository.findAccountMediaKeys(List.of(clientId), List.of())).thenReturn(List.of());
         lenient().when(clock.instant()).thenReturn(Instant.EPOCH);
         when(bookingService.findFutureConfirmedBookingCandidatesForClient(clientId)).thenReturn(futureCandidates);
         when(appointmentRepository.findByClientId(clientId)).thenReturn(List.of());
@@ -231,7 +231,7 @@ class ClientAccountDeletionServiceTest {
         User client = buildClient(clientId);
 
         when(userRepository.findByIdForUpdate(clientId)).thenReturn(Optional.of(client));
-        when(mediaRepository.findMediaKeysByUploaderIdIn(List.of(clientId))).thenReturn(List.of());
+        when(mediaRepository.findAccountMediaKeys(List.of(clientId), List.of())).thenReturn(List.of());
         lenient().when(clock.instant()).thenReturn(Instant.EPOCH);
         when(bookingService.findFutureConfirmedBookingCandidatesForClient(clientId)).thenReturn(List.of());
         when(appointmentRepository.findByClientId(clientId)).thenReturn(List.of());
@@ -255,7 +255,7 @@ class ClientAccountDeletionServiceTest {
         Appointment appointment2 = Appointment.builder().id(UUID.randomUUID()).client(client).build();
 
         when(userRepository.findByIdForUpdate(clientId)).thenReturn(Optional.of(client));
-        when(mediaRepository.findMediaKeysByUploaderIdIn(List.of(clientId))).thenReturn(List.of());
+        when(mediaRepository.findAccountMediaKeys(List.of(clientId), List.of())).thenReturn(List.of());
         lenient().when(clock.instant()).thenReturn(Instant.EPOCH);
         when(bookingService.findFutureConfirmedBookingCandidatesForClient(clientId)).thenReturn(List.of());
         when(appointmentRepository.findByClientId(clientId))
@@ -281,7 +281,7 @@ class ClientAccountDeletionServiceTest {
                 .toList();
 
         when(userRepository.findByIdForUpdate(clientId)).thenReturn(Optional.of(client));
-        when(mediaRepository.findMediaKeysByUploaderIdIn(List.of(clientId))).thenReturn(List.of());
+        when(mediaRepository.findAccountMediaKeys(List.of(clientId), List.of())).thenReturn(List.of());
         when(bookingService.findFutureConfirmedBookingCandidatesForClient(clientId)).thenReturn(tooMany);
 
         assertThatThrownBy(() -> service.deleteOwnAccount(clientId, "token"))
@@ -311,7 +311,7 @@ class ClientAccountDeletionServiceTest {
         List<UUID> ids = exactlyAtCap.stream().map(SalonClosureBookingCandidate::bookingId).toList();
 
         when(userRepository.findByIdForUpdate(clientId)).thenReturn(Optional.of(client));
-        when(mediaRepository.findMediaKeysByUploaderIdIn(List.of(clientId))).thenReturn(List.of());
+        when(mediaRepository.findAccountMediaKeys(List.of(clientId), List.of())).thenReturn(List.of());
         lenient().when(clock.instant()).thenReturn(Instant.EPOCH);
         when(bookingService.findFutureConfirmedBookingCandidatesForClient(clientId)).thenReturn(exactlyAtCap);
         when(appointmentRepository.findByClientId(clientId)).thenReturn(List.of());
@@ -331,11 +331,11 @@ class ClientAccountDeletionServiceTest {
     void should_delegateBlobPurgeRegistration_when_deletingOwnAccount() {
         UUID clientId = UUID.randomUUID();
         User client = buildClient(clientId);
-        UploaderMediaKey portfolioRow = new UploaderMediaKey(clientId, "portfolio/independent/x/m.jpg",
-                EntityType.MASTER, UUID.randomUUID());
+        MediaFileKey portfolioRow = new MediaFileKey(UUID.randomUUID(), "legacy/user-row.jpg",
+                EntityType.USER, clientId);
 
         when(userRepository.findByIdForUpdate(clientId)).thenReturn(Optional.of(client));
-        when(mediaRepository.findMediaKeysByUploaderIdIn(List.of(clientId))).thenReturn(List.of(portfolioRow));
+        when(mediaRepository.findAccountMediaKeys(List.of(clientId), List.of())).thenReturn(List.of(portfolioRow));
         lenient().when(clock.instant()).thenReturn(Instant.EPOCH);
         when(bookingService.findFutureConfirmedBookingCandidatesForClient(clientId)).thenReturn(List.of());
         when(appointmentRepository.findByClientId(clientId)).thenReturn(List.of());
@@ -349,6 +349,26 @@ class ClientAccountDeletionServiceTest {
         // only pins that the service hands it the correct pre-read pointers, never calling
         // MediaService directly.
         verify(accountBlobPurgeRegistrar).registerAfterCommit(client, List.of(portfolioRow));
+    }
+
+    @Test
+    @DisplayName("Phase 363 D4: deletes the client's own media rows by entity before the users row "
+            + "(the uploader cascade is gone since V193)")
+    void should_deleteOwnMediaRowsByEntity_before_usersDelete() {
+        UUID clientId = UUID.randomUUID();
+        User client = buildClient(clientId);
+        when(userRepository.findByIdForUpdate(clientId)).thenReturn(Optional.of(client));
+        when(mediaRepository.findAccountMediaKeys(List.of(clientId), List.of())).thenReturn(List.of());
+        lenient().when(clock.instant()).thenReturn(Instant.EPOCH);
+        when(bookingService.findFutureConfirmedBookingCandidatesForClient(clientId)).thenReturn(List.of());
+        when(appointmentRepository.findByClientId(clientId)).thenReturn(List.of());
+        when(bookingRepository.findByClientId(clientId)).thenReturn(List.of());
+
+        service.deleteOwnAccount(clientId, null);
+
+        InOrder order = inOrder(mediaRepository, userRepository);
+        order.verify(mediaRepository).deleteAccountMedia(List.of(clientId), List.of());
+        order.verify(userRepository).deleteAllByIdInBatch(List.of(clientId));
     }
 
     @Test

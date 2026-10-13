@@ -48,7 +48,10 @@ import static org.mockito.Mockito.when;
 class R2BlobPurgeEndToEndIT extends AbstractMediaIntegrationTest {
 
     private static final String AVATAR_URL = "/api/v1/media/avatar";
-    private static final String PORTFOLIO_URL = "/api/v1/media/portfolio";
+    /** Phase 362: salon portfolio writes are salon-scoped ({@code /media/portfolio} is INDEPENDENT_MASTER only). */
+    private static String salonPortfolioUrl(UUID salonId) {
+        return "/api/v1/salons/" + salonId + "/portfolio";
+    }
     private static final String CDN = "https://cdn.example/";
 
     @Autowired private TestRestTemplate restTemplate;
@@ -86,10 +89,10 @@ class R2BlobPurgeEndToEndIT extends AbstractMediaIntegrationTest {
     // ── portfolio delete ────────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("DELETE /media/portfolio/{id} — uploaded photo: 204, row gone, exactly its own key deleted in R2")
+    @DisplayName("DELETE /salons/{id}/portfolio/{mediaId} — uploaded photo: 204, row gone, exactly its own key deleted in R2")
     void should_deleteRowAndExactlyItsBlob_when_ownerDeletesUploadedPortfolioPhoto() throws Exception {
         Owner o = owner("pf-own");
-        ResponseEntity<String> up = restTemplate.exchange(PORTFOLIO_URL, HttpMethod.POST,
+        ResponseEntity<String> up = restTemplate.exchange(salonPortfolioUrl(o.salonId()), HttpMethod.POST,
                 new HttpEntity<>(jpegMultipartBody(), bearerMultipartHeaders(o.token())), String.class);
         assertThat(up.getStatusCode()).isEqualTo(HttpStatus.CREATED);
         UUID mediaId = jdbcTemplate.queryForObject(
@@ -98,7 +101,7 @@ class R2BlobPurgeEndToEndIT extends AbstractMediaIntegrationTest {
                 "SELECT r2_key FROM media_files WHERE id = ?", String.class, mediaId);
         clearInvocations(r2);
 
-        ResponseEntity<Void> resp = deletePortfolio(mediaId, o.token());
+        ResponseEntity<Void> resp = deletePortfolio(o.salonId(), mediaId, o.token());
 
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
         assertThat(mediaRowCount(mediaId)).as("media_files row removed").isZero();
@@ -108,14 +111,14 @@ class R2BlobPurgeEndToEndIT extends AbstractMediaIntegrationTest {
     }
 
     @Test
-    @DisplayName("DELETE /media/portfolio/{id} — row whose key sits under ANOTHER salon's prefix: 204, row gone, R2 untouched")
+    @DisplayName("DELETE /salons/{id}/portfolio/{mediaId} — row whose key sits under ANOTHER salon's prefix: 204, row gone, R2 untouched")
     void should_deleteRowButNotTouchR2_when_portfolioKeyHasForeignPrefix() throws Exception {
         Owner o = owner("pf-foreign");
         Owner victim = owner("pf-victim");
         String victimKey = "portfolio/salons/" + victim.salonId() + "/victim.jpg";
         UUID mediaId = insertPortfolioRow(o.ownerId(), o.salonId(), victimKey);
 
-        ResponseEntity<Void> resp = deletePortfolio(mediaId, o.token());
+        ResponseEntity<Void> resp = deletePortfolio(o.salonId(), mediaId, o.token());
 
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
         assertThat(mediaRowCount(mediaId)).as("row still removed even though R2 was skipped").isZero();
@@ -123,20 +126,20 @@ class R2BlobPurgeEndToEndIT extends AbstractMediaIntegrationTest {
     }
 
     @Test
-    @DisplayName("DELETE /media/portfolio/{id} — row whose key is another user's AVATAR: R2 untouched")
+    @DisplayName("DELETE /salons/{id}/portfolio/{mediaId} — row whose key is another user's AVATAR: R2 untouched")
     void should_notDeleteAvatarObject_when_portfolioRowPointsAtAnAvatarKey() throws Exception {
         Owner o = owner("pf-avatar");
         String avatarKey = "avatars/" + UUID.randomUUID() + "/a.jpg";
         UUID mediaId = insertPortfolioRow(o.ownerId(), o.salonId(), avatarKey);
 
-        ResponseEntity<Void> resp = deletePortfolio(mediaId, o.token());
+        ResponseEntity<Void> resp = deletePortfolio(o.salonId(), mediaId, o.token());
 
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
         assertThat(purgedKeys(r2)).isEmpty();
     }
 
     @Test
-    @DisplayName("DELETE /media/portfolio/{id} — R2 delete runs only AFTER the row delete has committed")
+    @DisplayName("DELETE /salons/{id}/portfolio/{mediaId} — R2 delete runs only AFTER the row delete has committed")
     void should_purgeBlobOnlyAfterRowDeleteCommitted_when_portfolioPhotoDeleted() throws Exception {
         Owner o = owner("pf-order");
         String key = "portfolio/salons/" + o.salonId() + "/order.jpg";
@@ -147,7 +150,7 @@ class R2BlobPurgeEndToEndIT extends AbstractMediaIntegrationTest {
             return Set.of();
         }).when(r2).deleteFiles(any());
 
-        ResponseEntity<Void> resp = deletePortfolio(mediaId, o.token());
+        ResponseEntity<Void> resp = deletePortfolio(o.salonId(), mediaId, o.token());
 
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
         assertThat(purgedKeys(r2)).containsExactly(key);
@@ -156,7 +159,7 @@ class R2BlobPurgeEndToEndIT extends AbstractMediaIntegrationTest {
     }
 
     @Test
-    @DisplayName("DELETE /media/portfolio/{id} — row delete fails (rollback): non-2xx, row intact, NOTHING deleted in R2")
+    @DisplayName("DELETE /salons/{id}/portfolio/{mediaId} — row delete fails (rollback): non-2xx, row intact, NOTHING deleted in R2")
     void should_keepRowAndBlob_when_portfolioRowDeleteRollsBack() throws Exception {
         Owner o = owner("pf-rollback");
         String key = "portfolio/salons/" + o.salonId() + "/keep.jpg";
@@ -169,7 +172,7 @@ class R2BlobPurgeEndToEndIT extends AbstractMediaIntegrationTest {
         jdbcTemplate.execute("CREATE TRIGGER trg_fail_media_delete BEFORE DELETE ON media_files "
                 + "FOR EACH ROW EXECUTE FUNCTION fail_media_delete()");
 
-        ResponseEntity<Void> resp = deletePortfolio(mediaId, o.token());
+        ResponseEntity<Void> resp = deletePortfolio(o.salonId(), mediaId, o.token());
 
         assertThat(resp.getStatusCode().is2xxSuccessful()).isFalse();
         assertThat(mediaRowCount(mediaId)).as("rolled-back delete leaves the row").isEqualTo(1);
@@ -325,8 +328,8 @@ class R2BlobPurgeEndToEndIT extends AbstractMediaIntegrationTest {
         return restTemplate.exchange(AVATAR_URL, HttpMethod.DELETE, new HttpEntity<>(bearer(token)), Void.class);
     }
 
-    private ResponseEntity<Void> deletePortfolio(UUID mediaId, String token) {
-        return restTemplate.exchange(PORTFOLIO_URL + "/" + mediaId, HttpMethod.DELETE,
+    private ResponseEntity<Void> deletePortfolio(UUID salonId, UUID mediaId, String token) {
+        return restTemplate.exchange(salonPortfolioUrl(salonId) + "/" + mediaId, HttpMethod.DELETE,
                 new HttpEntity<>(bearer(token)), Void.class);
     }
 

@@ -28,6 +28,7 @@ import java.util.UUID;
     name = "media_files",
     indexes = {
         @Index(name = "idx_media_files_entity", columnList = "entity_type, entity_id"),
+        // Kept for the uploader_id ON DELETE SET NULL action on user deletes (V193); no query reads it.
         @Index(name = "idx_media_files_uploader_media", columnList = "uploader_id, media_type"),
         // ux_media_files_avatar is a PARTIAL unique index (WHERE media_type = 'AVATAR') defined in V39 migration.
         // JPA @Index has no WHERE clause support — `unique=true` here would misrepresent a full unique constraint.
@@ -47,9 +48,14 @@ public class MediaFile extends AuditableEntity {
     @Column(name = "id", updatable = false, nullable = false)
     private UUID id;
 
+    /**
+     * Audit metadata only (Phase 363 D2): who uploaded the file. Written on insert, read by NO decision —
+     * not authorization, not lifecycle. Nullable since V193: the FK is {@code ON DELETE SET NULL}, so the row
+     * outlives its uploader (a salon photo belongs to the salon, not to the admin who uploaded it).
+     */
     @JsonIgnore
-    @ManyToOne(fetch = FetchType.LAZY)
-    @JoinColumn(name = "uploader_id", nullable = false)
+    @ManyToOne(fetch = FetchType.LAZY, optional = true)
+    @JoinColumn(name = "uploader_id")
     private User uploader;
 
     @Enumerated(EnumType.STRING)

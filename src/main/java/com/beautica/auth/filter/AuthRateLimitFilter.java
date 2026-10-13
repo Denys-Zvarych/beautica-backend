@@ -87,6 +87,10 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // class as /api/v1/media/*, so it shares mediaUploadBuckets (see isSalonImagePath).
     private static final String SALON_IMAGE_PATH_PREFIX = "/api/v1/salons/";
     private static final String SALON_IMAGE_SEGMENT = "/media/";
+    // Phase 362 salon portfolio: POST /api/v1/salons/{salonId}/portfolio and
+    // DELETE /api/v1/salons/{salonId}/portfolio/{mediaId}. Same R2 cost class — shares mediaUploadBuckets
+    // (see isSalonPortfolioPath). The public GET on the same path is never matched (POST/DELETE branch only).
+    private static final String SALON_PORTFOLIO_SEGMENT = "/portfolio";
     private static final String PROFILE_UPDATE_PATH = "/api/v1/independent-masters/me/profile";
     private static final String USER_ME_PATH = "/api/v1/users/me";
     private static final String IM_LOCALITY_PATH = "/api/v1/independent-masters/me";
@@ -924,6 +928,30 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     }
 
     /**
+     * True for exactly {@code /api/v1/salons/{salonId}/portfolio} or
+     * {@code /api/v1/salons/{salonId}/portfolio/{mediaId}} — one non-empty {@code {salonId}} segment, the literal
+     * {@code portfolio} segment and at most one further non-empty segment (Phase 362).
+     */
+    static boolean isSalonPortfolioPath(String path) {
+        if (path == null || !path.startsWith(SALON_IMAGE_PATH_PREFIX)) {
+            return false;
+        }
+        String rest = path.substring(SALON_IMAGE_PATH_PREFIX.length());
+        int idEnd = rest.indexOf('/');
+        if (idEnd <= 0) {
+            return false;
+        }
+        String tail = rest.substring(idEnd);
+        if (tail.equals(SALON_PORTFOLIO_SEGMENT)) {
+            return true;
+        }
+        String itemPrefix = SALON_PORTFOLIO_SEGMENT + "/";
+        return tail.startsWith(itemPrefix)
+                && tail.length() > itemPrefix.length()
+                && tail.indexOf('/', itemPrefix.length()) < 0;
+    }
+
+    /**
      * True for exactly {@code /api/v1/salons/{salonId}/media/{slot}} — one non-empty {@code {salonId}} segment,
      * the literal {@code media} segment, one non-empty {@code {slot}} segment and nothing after it (Phase 343).
      */
@@ -988,7 +1016,7 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         // charged to the media bucket rather than serviceWriteBuckets.
         if ((HttpMethod.POST.matches(method) || HttpMethod.DELETE.matches(method))
                 && (path.startsWith(MEDIA_PATH_PREFIX) || isSalonImagePath(path)
-                        || isServicePhotoPath(path))) {
+                        || isSalonPortfolioPath(path) || isServicePhotoPath(path))) {
             applyRateLimit(request, response, filterChain, mediaUploadBuckets, RETRY_AFTER_SECONDS);
             return;
         }

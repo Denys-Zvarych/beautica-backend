@@ -13,6 +13,8 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.test.context.TestPropertySource;
 
+import java.util.List;
+
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
@@ -68,6 +70,69 @@ class MediaOpenApiContractIT extends AbstractIntegrationTest {
         assertThat(content.has(MULTIPART)).as("multipart/form-data present").isTrue();
         assertThat(content.has("application/json")).as("no application/json").isFalse();
         assertThat(content.path(MULTIPART).toString()).contains("binary");
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/salons/{salonId}/portfolio declares multipart/form-data only (Phase 362)")
+    void should_declareMultipartOnly_when_salonPortfolioUpload() {
+        JsonNode content = requestContent("/api/v1/salons/{salonId}/portfolio");
+
+        assertThat(content.has(MULTIPART)).as("multipart/form-data present").isTrue();
+        assertThat(content.has("application/json")).as("no application/json").isFalse();
+        assertThat(content.path(MULTIPART).toString()).contains("binary");
+    }
+
+    @Test
+    @DisplayName("Phase 362: salon portfolio DELETE is documented; /media/portfolio is documented as INDEPENDENT_MASTER only")
+    void should_documentPortfolioContract_when_specGenerated() {
+        JsonNode salonItem = spec.path("paths").path("/api/v1/salons/{salonId}/portfolio/{mediaId}");
+        JsonNode mediaPortfolioPost = spec.path("paths").path("/api/v1/media/portfolio").path("post");
+
+        assertThat(salonItem.has("delete")).as("DELETE /salons/{salonId}/portfolio/{mediaId} present").isTrue();
+        assertThat(spec.path("paths").path("/api/v1/salons/{salonId}/portfolio").path("post")
+                .path("responses").has("409")).as("salon upload documents the 409 cap").isTrue();
+        assertThat(mediaPortfolioPost.path("summary").asText()).contains("INDEPENDENT_MASTER only");
+        assertThat(mediaPortfolioPost.path("responses").has("409")).as("master upload documents the 409 cap").isTrue();
+    }
+
+    @Test
+    @DisplayName("Phase 362 audit F6: both portfolio POSTs document 409 = PORTFOLIO_LIMIT_REACHED and the busy 503 "
+            + "with Retry-After")
+    void should_documentCapCodeAndBusy503_when_specGenerated() {
+        JsonNode salonPost = spec.path("paths").path("/api/v1/salons/{salonId}/portfolio").path("post");
+        JsonNode masterPost = spec.path("paths").path("/api/v1/media/portfolio").path("post");
+
+        for (JsonNode post : List.of(salonPost, masterPost)) {
+            assertThat(post.path("responses").path("409").path("description").asText())
+                    .contains("PORTFOLIO_LIMIT_REACHED");
+            assertThat(post.path("responses").path("503").path("description").asText())
+                    .contains("busy").contains("Retry-After");
+        }
+    }
+
+    @Test
+    @DisplayName("Phase 362: salon portfolio path keeps the public GET beside POST (201) and DELETE (204/403/404); "
+            + "master DELETE documented as INDEPENDENT_MASTER only")
+    void should_documentSalonPortfolioStatusesAndPublicGet_when_specGenerated() {
+        JsonNode collection = spec.path("paths").path("/api/v1/salons/{salonId}/portfolio");
+        JsonNode itemDelete = spec.path("paths").path("/api/v1/salons/{salonId}/portfolio/{mediaId}").path("delete");
+        JsonNode masterDelete = spec.path("paths").path("/api/v1/media/portfolio/{mediaId}").path("delete");
+
+        assertThat(collection.has("get")).as("public GET not shadowed by the new POST").isTrue();
+        assertThat(collection.path("post").path("responses").has("201")).as("POST documents 201").isTrue();
+        assertThat(collection.path("post").path("responses").has("200")).as("POST never documents 200").isFalse();
+        assertThat(itemDelete.path("responses").has("204")).as("DELETE documents 204").isTrue();
+        assertThat(itemDelete.path("responses").has("403")).as("DELETE documents 403").isTrue();
+        assertThat(itemDelete.path("responses").has("404")).as("DELETE documents 404").isTrue();
+        assertThat(masterDelete.path("summary").asText()).contains("INDEPENDENT_MASTER only");
+        // H3 (2026-10-12): another master's photo is a 404, not a 403 — 403 is the role gate only.
+        assertThat(masterDelete.path("responses").path("403").path("description").asText())
+                .as("master DELETE 403 documents the role gate, never another master's photo")
+                .contains("not an INDEPENDENT_MASTER")
+                .doesNotContain("another master");
+        assertThat(masterDelete.path("responses").path("404").path("description").asText())
+                .as("master DELETE 404 covers another master's photo")
+                .contains("another master's photo");
     }
 
     @Test
