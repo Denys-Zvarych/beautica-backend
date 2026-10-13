@@ -228,6 +228,14 @@ springdoc:
     enabled: false
 
 beautica:
+  # Deploy-environment identity (Phase 368). Each profile pins its own value (prod yml: prod,
+  # staging yml: staging, local yml: local); EnvironmentFingerprintGuard cross-checks it against
+  # Railway's injected environment name and the resource names. Default `local` = guard skipped.
+  environment: local
+  sms:
+    # turbosms (default) | capture. capture mails every SMS to a Mailpit inbox instead of the
+    # provider (staging only; the fingerprint guard rejects it in prod).
+    mode: turbosms
   db:
     # PostgreSQL major the app expects (prod Railway postgres-ssl:18, CI and local postgres:18-alpine).
     # DatabaseServerVersionLogger WARNs on mismatch; it never fails boot.

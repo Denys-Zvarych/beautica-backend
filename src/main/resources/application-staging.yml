@@ -1,0 +1,50 @@
+# Staging overlay (Phase 368). Activate as SPRING_PROFILES_ACTIVE=prod,staging — order matters,
+# `staging` last so it wins. Staging inherits prod's Flyway, security, actuator, pool and
+# DATABASE_URL rules on purpose; this file overrides ONLY what makes staging unable to reach a
+# real person. Staging holds fake data and NO Brevo / Turbosms credentials
+# (EnvironmentFingerprintGuard fails boot if either is set).
+beautica:
+  environment: staging
+  sms:
+    # Every SMS (booking + guest OTP) becomes a plain-text mail to sms+<digits>@sms.staging.invalid,
+    # caught by Mailpit. No fixed OTP, no bypass code.
+    mode: capture
+
+spring:
+  mail:
+    # Private-network Mailpit; no auth, no STARTTLS. Brevo relay is never configured here.
+    host: ${STAGING_MAIL_HOST:mailpit.railway.internal}
+    port: 1025
+    username: ""
+    password: ""
+    properties:
+      mail:
+        smtp:
+          auth: false
+          starttls:
+            enable: false
+          # Staging-only: override the base 5s/10s/10s. CapturingSmsSender sends OTPs on the request
+          # thread, so a down Mailpit must not hold it for up to 25s.
+          connectiontimeout: 3000
+          timeout: 3000
+          writetimeout: 3000
+
+app:
+  booking:
+    sms:
+      # Exercise the booking SMS paths; with beautica.sms.mode=capture they land in Mailpit.
+      enabled: true
+  rate-limit:
+    # Same property and value start-backend.sh uses for local seeding, so seed-demo-fleet.sh
+    # can run against staging.
+    # Default 1000 (not the local 100000): staging is network-reachable. Raise it temporarily via
+    # APP_RATE_LIMIT_INVITE_CAPACITY only while running the seed script, then unset it.
+    invite-capacity: ${APP_RATE_LIMIT_INVITE_CAPACITY:1000}
+
+# Fake data only — expose the OpenAPI spec so BEAUTICA_SPEC_URL can point at staging. The Swagger UI
+# stays off (SecurityConfig permits only /api-docs on staging).
+springdoc:
+  api-docs:
+    enabled: true
+  swagger-ui:
+    enabled: false

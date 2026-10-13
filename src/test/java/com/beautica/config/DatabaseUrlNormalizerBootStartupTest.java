@@ -32,7 +32,9 @@ class DatabaseUrlNormalizerBootStartupTest {
         return new SpringApplicationBuilder(EmptyConfig.class)
                 .web(WebApplicationType.NONE)
                 .profiles(profiles)
-                .properties("DATABASE_URL=" + databaseUrl, "spring.main.banner-mode=off");
+                .properties("DATABASE_URL=" + databaseUrl, "spring.main.banner-mode=off",
+                        // EnvironmentFingerprintGuard (Phase 368): prod requires R2 on with the exact prod bucket.
+                        "R2_ENABLED=true", "CLOUDFLARE_R2_BUCKET=beautica-media-prod");
     }
 
     private static List<Throwable> chain(Throwable t) {

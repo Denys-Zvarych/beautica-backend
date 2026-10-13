@@ -1,4 +1,8 @@
 # Production profile — all values injected via environment variables (Railway)
+# Deploy-environment identity (Phase 368); the `staging` overlay (prod,staging) overrides it.
+beautica:
+  environment: prod
+
 spring:
   jpa:
     show-sql: false

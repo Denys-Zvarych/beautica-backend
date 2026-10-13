@@ -66,6 +66,8 @@ public class SecurityConfig {
     @Bean
     public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
         boolean isDevProfile = environment.acceptsProfiles(Profiles.of("local | test"));
+        // Staging keeps /api-docs public (mobile regen fetches the spec) but never swagger-ui.
+        boolean exposeApiDocs = environment.acceptsProfiles(Profiles.of("local | test | staging"));
 
         var authorizeConfig = http
                 .csrf(AbstractHttpConfigurer::disable)
@@ -96,6 +98,8 @@ public class SecurityConfig {
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/auth/invite/validate").permitAll();
                     if (isDevProfile) {
                         auth.requestMatchers("/swagger-ui/**", "/swagger-ui.html").permitAll();
+                    }
+                    if (exposeApiDocs) {
                         auth.requestMatchers("/api-docs/**", "/api-docs").permitAll();
                     }
                     auth.requestMatchers(HttpMethod.GET, "/actuator/health").permitAll();

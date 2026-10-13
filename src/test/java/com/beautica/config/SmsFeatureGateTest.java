@@ -1,8 +1,11 @@
 package com.beautica.config;
 
+import com.beautica.notification.sms.CapturingOtpSmsSender;
+import com.beautica.notification.sms.CapturingSmsService;
 import com.beautica.notification.sms.NoOpSmsService;
 import com.beautica.notification.sms.OtpSmsSender;
 import com.beautica.notification.sms.SmsService;
+import com.beautica.notification.sms.TurbosmsOtpSmsSender;
 import com.beautica.notification.sms.TurbosmsService;
 import com.tngtech.archunit.core.domain.JavaClass;
 import com.tngtech.archunit.core.domain.JavaClasses;
@@ -15,7 +18,9 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.mail.javamail.JavaMailSender;
 import org.springframework.web.client.RestClient;
+import org.mockito.Mockito;
 
 import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.noClasses;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -46,6 +51,11 @@ class SmsFeatureGateTest {
 
     /** The one adapter that implements it, and therefore the one unavoidable exemption. */
     private static final String OTP_SENDER_IMPL_SIMPLE_NAME = "TurbosmsOtpSmsSender";
+
+    /** Phase 368: the staging capture adapter — the second (and last) named implementation exemption. */
+    private static final String OTP_SENDER_CAPTURE_IMPL_SIMPLE_NAME = "CapturingOtpSmsSender";
+
+    private static final String MODE = "beautica.sms.mode";
 
     private final ApplicationContextRunner runner = new ApplicationContextRunner()
             .withUserConfiguration(SmsDependencies.class, SmsConfig.class);
@@ -230,18 +240,57 @@ class SmsFeatureGateTest {
         assertThat(production.stream().map(JavaClass::getSimpleName))
                 .as("the rule below matches by simple name — both must still exist, or an "
                         + "exemption would silently be excluding nothing")
-                .contains(OTP_SENDER_SIMPLE_NAME, OTP_SENDER_IMPL_SIMPLE_NAME);
+                .contains(OTP_SENDER_SIMPLE_NAME, OTP_SENDER_IMPL_SIMPLE_NAME,
+                        OTP_SENDER_CAPTURE_IMPL_SIMPLE_NAME);
 
         noClasses()
                 .that().resideOutsideOfPackage("com.beautica.auth..")
                 .and().doNotHaveFullyQualifiedName(SmsConfig.class.getName())
                 .and().doNotHaveSimpleName(OTP_SENDER_IMPL_SIMPLE_NAME)
+                .and().doNotHaveSimpleName(OTP_SENDER_CAPTURE_IMPL_SIMPLE_NAME)
                 .should().dependOnClassesThat().haveSimpleName(OTP_SENDER_SIMPLE_NAME)
                 .as("only the auth package (plus SmsConfig, which constructs the bean, and "
                         + "TurbosmsOtpSmsSender, which implements it) may reach OtpSmsSender — "
                         + "booking copy sends through SmsService, which is what the "
                         + "app.booking.sms.enabled gate selects")
                 .check(production);
+    }
+
+    @Test
+    @DisplayName("mode absent or turbosms — both OTP and booking beans are the Turbosms ones")
+    void should_registerTurbosmsBeans_when_modeIsAbsentOrTurbosms() {
+        runner.withPropertyValues(FLAG + "=true").run(context -> {
+            assertThat(context).getBean(OtpSmsSender.class).isInstanceOf(TurbosmsOtpSmsSender.class);
+            assertThat(context).getBean(SmsService.class).isInstanceOf(TurbosmsService.class);
+        });
+        runner.withPropertyValues(FLAG + "=true", MODE + "=turbosms").run(context -> {
+            assertThat(context).getBean(OtpSmsSender.class).isInstanceOf(TurbosmsOtpSmsSender.class);
+            assertThat(context).getBean(SmsService.class).isInstanceOf(TurbosmsService.class);
+        });
+    }
+
+    @Test
+    @DisplayName("mode=capture — capturing beans for BOTH booking SMS and OTP; no Turbosms bean at all")
+    void should_registerCapturingBeans_when_modeIsCapture() {
+        runner.withPropertyValues(FLAG + "=true", MODE + "=capture").run(context -> {
+            assertThat(context).hasNotFailed();
+            assertThat(context).getBean(SmsService.class).isInstanceOf(CapturingSmsService.class);
+            assertThat(context).getBean(OtpSmsSender.class).isInstanceOf(CapturingOtpSmsSender.class);
+            assertThat(context).doesNotHaveBean(TurbosmsService.class);
+            assertThat(context).doesNotHaveBean(TurbosmsOtpSmsSender.class);
+            assertThat(context.getBeanNamesForType(SmsService.class)).hasSize(1);
+            assertThat(context.getBeanNamesForType(OtpSmsSender.class)).hasSize(1);
+        });
+    }
+
+    @Test
+    @DisplayName("mode=capture with the booking gate off — booking stays NoOp, the OTP is still captured")
+    void should_keepBookingSmsOff_when_modeIsCaptureAndGateIsFalse() {
+        runner.withPropertyValues(FLAG + "=false", MODE + "=capture").run(context -> {
+            assertThat(context).hasNotFailed();
+            assertThat(context).getBean(SmsService.class).isInstanceOf(NoOpSmsService.class);
+            assertThat(context).getBean(OtpSmsSender.class).isInstanceOf(CapturingOtpSmsSender.class);
+        });
     }
 
     @Test
@@ -299,6 +348,11 @@ class SmsFeatureGateTest {
         @Bean
         RestClient.Builder restClientBuilder() {
             return RestClient.builder();
+        }
+
+        @Bean
+        JavaMailSender javaMailSender() {
+            return Mockito.mock(JavaMailSender.class);
         }
 
         @Bean

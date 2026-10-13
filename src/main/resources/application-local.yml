@@ -1,3 +1,7 @@
+# Deploy-environment identity (Phase 368) — EnvironmentFingerprintGuard skips `local`.
+beautica:
+  environment: local
+
 spring:
   datasource:
     url: jdbc:postgresql://localhost:5432/beautica
