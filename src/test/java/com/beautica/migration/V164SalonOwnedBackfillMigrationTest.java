@@ -1,5 +1,6 @@
 package com.beautica.migration;
 
+import com.beautica.TestPostgresImage;
 import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.AfterAll;
@@ -74,7 +75,7 @@ class V164SalonOwnedBackfillMigrationTest {
 
     @BeforeAll
     static void startContainerMigrateToLatestAndLoadSql() throws IOException {
-        postgres = new PostgreSQLContainer<>("postgres:16-alpine");
+        postgres = new PostgreSQLContainer<>(TestPostgresImage.IMAGE);
         postgres.start();
 
         dataSource = new DriverManagerDataSource(

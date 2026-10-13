@@ -30,7 +30,7 @@ import java.util.regex.Pattern;
  *
  * <p>"Today" is the Europe/Kyiv civil date, BOUND as the {@value #TODAY_PARAM} parameter from the
  * application clock ({@code ScheduleDateMath#today()}) — never read from the database clock. Bare
- * {@code CURRENT_DATE} resolves against the JDBC session zone (UTC on Railway/Neon), and even the
+ * {@code CURRENT_DATE} resolves against the JDBC session zone (UTC on Railway), and even the
  * Kyiv-spelled {@code CURRENT_TIMESTAMP} form reads the DB clock while the strict slot verdict reads
  * the app's {@code kyivClock}: binding the date makes both halves of the bookability contract agree
  * on what "today" is, and lets a fixed {@code Clock} pin it in tests. Every query that splices a

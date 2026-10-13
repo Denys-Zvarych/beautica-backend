@@ -218,7 +218,7 @@ public class AsyncConfig implements AsyncConfigurer {
      *
      * A 12 s listener body additionally tripped Hikari's own {@code leak-detection-threshold: 10000}
      * ("Apparent connection leak detected"). So <b>every millisecond spent in the listener is a
-     * millisecond of pooled-connection hold</b>, against a production pool capped at 10 (Neon).
+     * millisecond of pooled-connection hold</b>, against a production pool capped at 10.
      *
      * <p>That makes a BLOCKING submit loop in the listener a straight re-introduction of the very
      * backend-perf MEDIUM this whole change removed — it merely relocates "N × provider RTT while pinning
@@ -570,7 +570,7 @@ public class AsyncConfig implements AsyncConfigurer {
      * up to ~200 000 key comparisons to a booking-create / schedule-write response and — because
      * {@code removeIf} takes the same ConcurrentHashMap bin lock that {@code sync=true}'s
      * {@code computeIfAbsent} holds across its DB round-trips — occasionally stalling on a concurrent
-     * reader's Neon latency. Moving it here takes it off the critical path entirely; it still runs strictly
+     * reader's DB latency. Moving it here takes it off the critical path entirely; it still runs strictly
      * after commit (callers submit from {@code afterCommit}).
      *
      * <p><b>CallerRunsPolicy, deliberately.</b> The Anti-Bug §H-2 ban on caller-runs targets SMTP /
@@ -584,7 +584,7 @@ public class AsyncConfig implements AsyncConfigurer {
      * did NOT deliver two workers: {@link ThreadPoolExecutor} only grows past the core size once the
      * queue is FULL, so with a 1000-slot queue this pool was single-threaded in every state short of
      * a 1000-task backlog. That made it a single point of serialization for the exact stall the
-     * paragraph above documents — one eviction blocked on a {@code sync = true} reader's Neon
+     * paragraph above documents — one eviction blocked on a {@code sync = true} reader's DB
      * round-trip held up EVERY other master's eviction platform-wide, for ~50-200 ms. Raising the
      * core to 2 is safe rather than merely faster: {@code MasterCachePrefixEvictor} is stateless
      * (its only field is the {@code CacheManager}) and each task is an idempotent "remove every key

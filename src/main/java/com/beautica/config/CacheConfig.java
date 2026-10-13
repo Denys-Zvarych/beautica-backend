@@ -33,12 +33,11 @@ import java.util.concurrent.TimeUnit;
  * {@code SearchService}, {@code DashboardService}, {@code ReviewService}, {@code LocationQueryService},
  * …). Caffeine's {@code sync = true} loader funnels through {@code ConcurrentHashMap.compute}, so on a
  * popular key exactly one thread loads while every other caller BLOCKS on that bin lock for the full
- * DB round-trip to Neon.
+ * DB round-trip to the database.
  *
  * <p>The ordering decides what those blocked callers are holding while they wait. With the transaction
  * advisor outer, each waiter has already entered a transaction before reaching the cache advisor and
- * sits on a Hikari connection out of a pool of ten ({@code application.yml}: {@code maximum-pool-size:
- * 10}, a Neon-tier ceiling) — one slow query on one hot key can then exhaust the pool. With the cache
+ * sits on a Hikari connection out of a pool of ten ({@code max=10}; see {@code application.yml}, a deliberate ceiling) — one slow query on one hot key can then exhaust the pool. With the cache
  * advisor outer, a waiter blocks BEFORE any transaction is opened and holds no connection; a cache HIT
  * likewise returns without ever starting a transaction. The MISS path is unchanged — the cache advisor
  * proceeds into the target, which is still wrapped by the transaction advisor as before.

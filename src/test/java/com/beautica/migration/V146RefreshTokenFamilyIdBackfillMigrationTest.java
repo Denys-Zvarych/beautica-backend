@@ -1,5 +1,6 @@
 package com.beautica.migration;
 
+import com.beautica.TestPostgresImage;
 import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -56,7 +57,7 @@ class V146RefreshTokenFamilyIdBackfillMigrationTest {
 
     @BeforeAll
     static void startContainerAndSeedUnderV145() {
-        postgres = new PostgreSQLContainer<>("postgres:16-alpine");
+        postgres = new PostgreSQLContainer<>(TestPostgresImage.IMAGE);
         postgres.start();
 
         dataSource = new DriverManagerDataSource(

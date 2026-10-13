@@ -1,5 +1,6 @@
 package com.beautica.auth;
 
+import com.beautica.TestPostgresImage;
 import com.beautica.support.TestHttpClients;
 import com.beautica.auth.dto.RegisterRequest;
 import com.beautica.auth.dto.ResendVerificationRequest;
@@ -54,7 +55,7 @@ class VerifyEmailConcurrencyTest {
     private static final Logger log = LoggerFactory.getLogger(VerifyEmailConcurrencyTest.class);
 
     private static final PostgreSQLContainer<?> POSTGRES =
-            new PostgreSQLContainer<>("postgres:16-alpine");
+            new PostgreSQLContainer<>(TestPostgresImage.IMAGE);
 
     static {
         POSTGRES.start();

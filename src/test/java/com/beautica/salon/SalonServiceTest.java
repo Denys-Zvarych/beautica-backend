@@ -65,7 +65,7 @@ class SalonServiceTest {
      * one transaction runs the phase 289 audit, the phase 293 decline cascade, N master
      * detach/delete statements and a bulk {@code DELETE FROM users}, and it is the only method in
      * this service that holds row locks across all of them. Without a bound, a pathological salon
-     * pins a Neon connection indefinitely; with it, the client gets a failure and the destructive
+     * pins a database connection indefinitely; with it, the client gets a failure and the destructive
      * half rolls back whole.
      *
      * <p>Reflection on the annotation rather than a behavioural test on purpose — Spring's

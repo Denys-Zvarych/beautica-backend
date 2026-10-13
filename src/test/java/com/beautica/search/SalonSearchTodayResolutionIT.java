@@ -39,8 +39,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * and the search-membership verdict) resolves the word "today".
  *
  * <h2>History</h2>
- * <p>A bare {@code CURRENT_DATE} once resolved "today" against the JDBC session zone (UTC on Railway
- * and Neon), so for the three hours a night Kyiv runs a day ahead of UTC a master whose template
+ * <p>A bare {@code CURRENT_DATE} once resolved "today" against the JDBC session zone (UTC on Railway), so for the three hours a night Kyiv runs a day ahead of UTC a master whose template
  * expired yesterday-Kyiv kept pricing the salon (PR #125; caught only by a 21:22Z CI run). The fix
  * spelled {@code (CURRENT_TIMESTAMP AT TIME ZONE 'Europe/Kyiv')::date}, and this class then pinned
  * that SQL expression's clock source and swept it. That got the ZONE right but still read the
