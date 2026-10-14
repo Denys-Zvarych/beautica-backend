@@ -1,12 +1,15 @@
 package com.beautica.service.service;
 
 import com.beautica.common.exception.BusinessException;
+import com.beautica.search.service.SearchSuggestionCatalogue;
 import com.beautica.service.dto.CreatePlatformCategoryRequest;
 import com.beautica.service.dto.PlatformCategoryResponse;
 import com.beautica.service.dto.PlatformCategoryUsageResponse;
 import com.beautica.service.entity.PlatformCategory;
 import com.beautica.service.repository.PlatformCategoryRepository;
 import lombok.RequiredArgsConstructor;
+import org.springframework.cache.annotation.CacheEvict;
+import org.springframework.cache.annotation.Caching;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -44,6 +47,12 @@ public class InternalCategoryService {
      *                           (case-insensitive comparison)
      */
     @Transactional
+    @Caching(evict = {
+            @CacheEvict(value = CategoryRequestService.APPROVED_CATEGORIES_CACHE,
+                    key = CategoryRequestService.APPROVED_CATEGORIES_KEY),
+            @CacheEvict(value = PlatformCategoryOrderLookup.CACHE_NAME, key = PlatformCategoryOrderLookup.CACHE_KEY),
+            @CacheEvict(value = SearchSuggestionCatalogue.CACHE_NAME, allEntries = true)
+    })
     public PlatformCategoryResponse create(CreatePlatformCategoryRequest request) {
         if (platformCategoryRepository.existsByNameIgnoreCase(request.name())) {
             throw new BusinessException(HttpStatus.CONFLICT, "Category already exists: " + request.name());

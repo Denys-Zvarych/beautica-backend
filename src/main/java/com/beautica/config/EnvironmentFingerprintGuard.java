@@ -43,6 +43,8 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
     static final String RAILWAY_ENV_VAR = "RAILWAY_ENVIRONMENT_NAME";
     static final String STAGING_BUCKET = "beautica-media-staging";
     static final String PROD_BUCKET = "beautica-media-prod";
+    static final String DEV_INTERNAL_API_KEY = "changeme-dev-only";
+    static final int MIN_INTERNAL_API_KEY_LENGTH = 32;
 
     private static final java.util.regex.Pattern EMAIL_SHAPE =
             java.util.regex.Pattern.compile("^[^@\\s]+@[^@\\s]+\\.[a-z]{2,}$", java.util.regex.Pattern.CASE_INSENSITIVE);
@@ -81,6 +83,7 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
         if (environment != DeployEnvironment.LOCAL) {
             checkR2Bucket(env, environment, violations);
             checkLinkBaseUrls(env, environment, violations);
+            checkInternalApiKey(env, violations);
             if (environment == DeployEnvironment.PROD) {
                 checkProd(env, violations);
             } else {
@@ -200,6 +203,23 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
                     + " must not be a staging or reserved/placeholder host in prod");
         }
         return host;
+    }
+
+    /**
+     * The key guarding {@code /api/v1/internal/**} must be a real secret outside LOCAL: not blank, not the
+     * well-known dev default, and at least {@value #MIN_INTERNAL_API_KEY_LENGTH} chars. Messages name the rule and
+     * property only, never the value.
+     */
+    private static void checkInternalApiKey(Environment env, List<String> violations) {
+        String key = readOrNull(env, "app.internal-api-key");
+        if (isBlank(key)) {
+            violations.add("rule internal-api-key-blank: app.internal-api-key (INTERNAL_API_KEY) must be set");
+        } else if (DEV_INTERNAL_API_KEY.equals(key.strip())) {
+            violations.add("rule internal-api-key-default: app.internal-api-key must not be the dev default");
+        } else if (key.strip().length() < MIN_INTERNAL_API_KEY_LENGTH) {
+            violations.add("rule internal-api-key-length: app.internal-api-key must be at least "
+                    + MIN_INTERNAL_API_KEY_LENGTH + " characters");
+        }
     }
 
     /** An unresolvable placeholder (no default, env var absent) counts as unset. */

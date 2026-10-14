@@ -554,4 +554,27 @@ class CatalogueBrowseGetRateLimitRegressionTest {
         assertThat(last.getStatus()).isEqualTo(429);
         assertThat(lastRequest.getAttribute(AuthRateLimitFilter.CATALOGUE_BROWSE_DEFERRED_IP_KEY_ATTRIBUTE)).isNull();
     }
+
+    @Test
+    @DisplayName("should_return429_when_salonCatalogueServicesHeadFloodedFromOneIp")
+    void should_return429_when_salonCatalogueServicesHeadFloodedFromOneIp() throws Exception {
+        AuthRateLimitFilter filter = filterWithTinyCatalogueBrowseBucket();
+        var head = new MockHttpServletRequest("HEAD", salonServicesPath());
+        head.setRemoteAddr(REMOTE_ADDR);
+
+        MockHttpServletResponse last = null;
+        MockFilterChain lastChain = null;
+        boolean throttled = false;
+        for (int i = 0; i < TEST_CATALOGUE_BROWSE_CAPACITY + 5 && !throttled; i++) {
+            last = new MockHttpServletResponse();
+            lastChain = new MockFilterChain();
+            filter.doFilterInternal(head, last, lastChain);
+            throttled = last.getStatus() == 429;
+        }
+
+        assertThat(throttled)
+                .as("HEAD is routed by Spring to the @GetMapping handler, so it must be throttled like GET")
+                .isTrue();
+        assertThat(lastChain.getRequest()).as("throttled HEAD must not reach the chain").isNull();
+    }
 }

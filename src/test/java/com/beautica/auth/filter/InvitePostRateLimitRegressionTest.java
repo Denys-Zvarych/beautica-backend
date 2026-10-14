@@ -92,7 +92,7 @@ class InvitePostRateLimitRegressionTest {
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(), permissive(), permissive(),
-                inviteBuckets);
+                inviteBuckets, permissive(), permissive());
     }
 
     /** Fires up to {@link #REQUESTS_TO_FIRE} invites; returns how many passed before the first 429. */

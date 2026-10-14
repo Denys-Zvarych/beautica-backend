@@ -352,6 +352,26 @@ public class RateLimitConfig {
 
     private static final Duration CATEGORY_REQUEST_WINDOW = Duration.ofMinutes(60);
 
+    // Per-IP cap for the four token-authenticated admin review POSTs (60-minute window):
+    // /service-categories/requests/{approve,reject} and /service-types/suggestions/{approve,reject}.
+    // They are permitAll (the single-use token IS the credential) and previously fell through
+    // AuthRateLimitFilter unthrottled, so a garbage-token flood hit the DB on every call. One
+    // human admin decides a handful of requests per hour; 20/hr is generous headroom. ONE shared
+    // bucket for all four paths. Configurable so ITs on 127.0.0.1 can raise the cap.
+    @Value("${app.rate-limit.review-decision-capacity:20}")
+    private long reviewDecisionCapacity;
+
+    private static final Duration REVIEW_DECISION_WINDOW = Duration.ofMinutes(60);
+    private static final Duration REVIEW_PAGE_WINDOW = Duration.ofMinutes(60);
+
+    // Per-IP cap for the two token-bearing admin review GET pages (60-minute window):
+    // /service-categories/requests/review/{token} and /service-types/suggestions/review. A garbage
+    // token still hits the DB via loadForReview. A SIBLING of reviewDecisionCapacity (own bucket) so
+    // opening the page and then pressing Approve never exhausts the POST bucket; 60/hr leaves room
+    // for page reloads. Configurable so ITs on 127.0.0.1 can raise the cap.
+    @Value("${app.rate-limit.review-page-capacity:60}")
+    private long reviewPageCapacity;
+
     // Per-IP cap for POST /api/v1/service-types/suggest (60-minute window).
     // Like the category-request path, every successful suggestion emails the admin,
     // so this is an inbox-flood surface — kept low (5/hr) to match that posture.
@@ -964,6 +984,33 @@ public class RateLimitConfig {
                 CATEGORY_REQUEST_WINDOW.plus(EVICTION_GRACE),
                 categoryRequestCapacity,
                 CATEGORY_REQUEST_WINDOW);
+    }
+
+    /**
+     * Per-IP bucket shared by the four admin review-decision POSTs. See
+     * {@link #reviewDecisionCapacity}. {@code expireAfterAccess(65 min)} gives a 5-minute grace
+     * past the window.
+     */
+    @Bean
+    public LoadingCache<String, Bucket> reviewDecisionBuckets() {
+        return bucketCache(
+                DEFAULT_BUCKET_CACHE_SIZE,
+                REVIEW_DECISION_WINDOW.plus(EVICTION_GRACE),
+                reviewDecisionCapacity,
+                REVIEW_DECISION_WINDOW);
+    }
+
+    /**
+     * Per-IP bucket for the two admin review GET pages. See {@link #reviewPageCapacity}; separate
+     * from {@link #reviewDecisionBuckets()}.
+     */
+    @Bean
+    public LoadingCache<String, Bucket> reviewPageBuckets() {
+        return bucketCache(
+                DEFAULT_BUCKET_CACHE_SIZE,
+                REVIEW_PAGE_WINDOW.plus(EVICTION_GRACE),
+                reviewPageCapacity,
+                REVIEW_PAGE_WINDOW);
     }
 
     /**

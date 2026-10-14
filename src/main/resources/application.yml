@@ -448,4 +448,7 @@ app:
     # Generate with: openssl rand -base64 32
     # Empty default forces every profile (incl. test) to provide a value or fail fast at startup.
     payload-key: ${OUTBOX_PAYLOAD_KEY:}
-  internal-api-key: ${INTERNAL_API_KEY:changeme-dev-only}
+  # app.internal-api-key is deliberately NOT defined in the base profile: a base default would
+  # reach prod. It is mapped from INTERNAL_API_KEY in application-prod.yml (staging inherits it;
+  # EnvironmentFingerprintGuard enforces non-blank, non-default, >= 32 chars) and given a dev-only
+  # default in application-local.yml / application-test.yml. Any other profile fails fast on @NotBlank.

@@ -62,6 +62,8 @@ class AuthRateLimitFilterTest {
     @Mock private LoadingCache<String, Bucket> inviteAcceptBuckets;
     @Mock private LoadingCache<String, Bucket> catalogueBrowseBuckets;
     @Mock private LoadingCache<String, Bucket> inviteBuckets;
+    @Mock private LoadingCache<String, Bucket> reviewDecisionBuckets;
+    @Mock private LoadingCache<String, Bucket> reviewPageBuckets;
     @Mock private Bucket                        bucket;
 
     // ── subject ────────────────────────────────────────────────────────────────
@@ -76,7 +78,7 @@ class AuthRateLimitFilterTest {
                 categoryRequestBuckets, suggestServiceTypeBuckets, bulkServiceSetupBuckets,
                 supportContactBuckets, otpSendBuckets, verifyPasswordResetOtpBuckets,
                 changePasswordOtpBuckets, serviceWriteBuckets,
-                inviteValidateBuckets, inviteAcceptBuckets, catalogueBrowseBuckets, inviteBuckets);
+                inviteValidateBuckets, inviteAcceptBuckets, catalogueBrowseBuckets, inviteBuckets, reviewDecisionBuckets, reviewPageBuckets);
     }
 
     // ── helpers ────────────────────────────────────────────────────────────────
@@ -99,7 +101,7 @@ class AuthRateLimitFilterTest {
                 realBuckets(open), realBuckets(open), realBuckets(open), realBuckets(open),
                 realBuckets(open), realBuckets(open), realBuckets(open), realBuckets(open),
                 realBuckets(open), realBuckets(open), realBuckets(open), realBuckets(open),
-                realBuckets(open), realBuckets(open), realBuckets(open));
+                realBuckets(open), realBuckets(open), realBuckets(open), realBuckets(open), realBuckets(open));
     }
 
     private MockHttpServletRequest postRequest(String uri) {
@@ -2283,6 +2285,26 @@ class AuthRateLimitFilterTest {
             assertThat(chain.getRequest())
                     .as("a throttled working-days read must NOT reach the controller")
                     .isNull();
+        }
+
+        @Test
+        @DisplayName("HEAD /slots and /working-days consume the shared slots bucket and 429 when exhausted")
+        void should_return429_when_slotsHeadBucketExhausted() throws Exception {
+            when(slotsBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(DENY);
+
+            for (String suffix : new String[] {"/slots", "/working-days"}) {
+                var request = new MockHttpServletRequest("HEAD",
+                        "/api/v1/masters/" + java.util.UUID.randomUUID() + suffix);
+                request.setRemoteAddr(REMOTE_ADDR);
+                var response = new MockHttpServletResponse();
+                var chain = new MockFilterChain();
+
+                doFilter(request, response, chain);
+
+                assertThat(response.getStatus()).as("HEAD %s", suffix).isEqualTo(429);
+                assertThat(chain.getRequest()).as("throttled HEAD %s must not reach the controller", suffix).isNull();
+            }
         }
 
         @Test
