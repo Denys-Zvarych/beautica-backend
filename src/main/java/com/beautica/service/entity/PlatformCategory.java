@@ -121,6 +121,10 @@ public class PlatformCategory {
     @Column(name = "token_expires_at")
     private OffsetDateTime tokenExpiresAt;
 
+    /** Optional admin reason typed on the reject form (V196, max 300). Never logged. */
+    @Column(name = "decision_reason", length = 300)
+    private String decisionReason;
+
     @Column(name = "created_at", nullable = false, updatable = false)
     private OffsetDateTime createdAt;
 
@@ -181,9 +185,15 @@ public class PlatformCategory {
      * (single-use). Caller guarantees the current status is PENDING.
      */
     public void reject(OffsetDateTime decidedAt) {
+        reject(decidedAt, null);
+    }
+
+    /** Rejects with an optional, already-validated reason (null when none was given). */
+    public void reject(OffsetDateTime decidedAt, String reason) {
         this.status = PlatformCategoryStatus.REJECTED;
         this.active = false;
         this.decidedAt = decidedAt;
+        this.decisionReason = reason;
         clearToken();
     }
 

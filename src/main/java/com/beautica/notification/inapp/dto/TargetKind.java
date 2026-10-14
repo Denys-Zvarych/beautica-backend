@@ -13,6 +13,8 @@ public enum TargetKind {
     BOOKING_REVIEW,
     /** Opens the salon's team/roster screen. */
     SALON_TEAM,
+    /** Phase 372 — opens the service catalogue; carries no ids, the client resolves the screen by role. */
+    SERVICE_CATALOG,
     /** No navigable target — the referenced booking/appointment/salon is gone or no longer
      *  visible to this recipient. */
     NONE

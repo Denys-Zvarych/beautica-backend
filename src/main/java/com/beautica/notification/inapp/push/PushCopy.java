@@ -115,6 +115,11 @@ public final class PushCopy {
             case BOOKING_CANCELLED_MASTER_REMOVED -> "Майстер більше не приймає, запис скасовано";
             case REVIEW_RECEIVED -> "Новий відгук";
             case INVITE_ACCEPTED -> "Новий учасник команди";
+            // Phase 372 — must equal the mobile ARB titles (phase 412 l10n table).
+            case CATEGORY_REQUEST_APPROVED -> "Категорію схвалено";
+            case CATEGORY_REQUEST_REJECTED -> "Категорію відхилено";
+            case SERVICE_TYPE_SUGGESTION_APPROVED -> "Тип послуги схвалено";
+            case SERVICE_TYPE_SUGGESTION_REJECTED -> "Тип послуги відхилено";
         };
     }
 
@@ -129,6 +134,9 @@ public final class PushCopy {
         }
         if (type == InAppNotificationType.INVITE_ACCEPTED) {
             return inviteBody(params);
+        }
+        if (isRequestDecision(type)) {
+            return requestDecisionBody(type, params);
         }
         String counterpart = sanitize(params.counterpartName());
         String service = sanitize(params.serviceName());
@@ -146,6 +154,34 @@ public final class PushCopy {
         String line = counterpart + " — " + serviceLabel + ", " + time;
         String master = sanitize(params.masterName());
         return master == null ? line : line + " · майстер " + master;
+    }
+
+    private static boolean isRequestDecision(InAppNotificationType type) {
+        return switch (type) {
+            case CATEGORY_REQUEST_APPROVED, CATEGORY_REQUEST_REJECTED,
+                 SERVICE_TYPE_SUGGESTION_APPROVED, SERVICE_TYPE_SUGGESTION_REJECTED -> true;
+            default -> false;
+        };
+    }
+
+    /**
+     * Phase 372 — the category / service-type name only (sanitised). The admin's free-text reject
+     * reason is deliberately NOT put on the lock screen; it is shown in the in-app feed.
+     */
+    private static String requestDecisionBody(InAppNotificationType type, NotificationParams params) {
+        String category = sanitize(params.categoryName());
+        String serviceType = sanitize(params.serviceName());
+        return switch (type) {
+            case CATEGORY_REQUEST_APPROVED -> category == null ? GENERIC_BODY
+                    : "Категорія «" + category + "» тепер доступна для ваших послуг";
+            case CATEGORY_REQUEST_REJECTED -> category == null ? GENERIC_BODY
+                    : "Запит на категорію «" + category + "» відхилено";
+            case SERVICE_TYPE_SUGGESTION_APPROVED -> serviceType == null || category == null ? GENERIC_BODY
+                    : "Тип послуги «" + serviceType + "» у категорії «" + category + "» тепер доступний";
+            case SERVICE_TYPE_SUGGESTION_REJECTED -> serviceType == null || category == null ? GENERIC_BODY
+                    : "Пропозицію типу послуги «" + serviceType + "» (" + category + ") відхилено";
+            default -> GENERIC_BODY;
+        };
     }
 
     private static String inviteBody(NotificationParams params) {

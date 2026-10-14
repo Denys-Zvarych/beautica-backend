@@ -4,6 +4,7 @@ import com.beautica.auth.TokenGenerator;
 import com.beautica.config.CacheConfig;
 import com.beautica.config.PublicBaseUrlProperties;
 import com.beautica.notification.EmailService;
+import com.beautica.notification.inapp.service.InAppNotificationService;
 import com.beautica.search.service.SearchSuggestionCatalogue;
 import com.beautica.service.entity.ServiceTypeSuggestion;
 import com.beautica.service.repository.ServiceTypeSuggestionRepository;
@@ -72,6 +73,7 @@ class ServiceTypeSuggestionServiceCacheTest {
     @MockBean ServiceTypeSuggestionRepository suggestionRepository;
     @MockBean TokenGenerator tokenGenerator;
     @MockBean EmailService emailService;
+    @MockBean InAppNotificationService inAppNotificationService;
     @MockBean PublicBaseUrlProperties publicBaseUrlProperties;
     @MockBean ServiceTypePromotionService promotionService;
     @MockBean PlatformTransactionManager transactionManager;
@@ -87,7 +89,7 @@ class ServiceTypeSuggestionServiceCacheTest {
         }
         when(transactionManager.getTransaction(any())).thenReturn(new SimpleTransactionStatus());
         when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
-        when(suggestionRepository.findByTokenHash(TOKEN_HASH)).thenReturn(Optional.of(pending()));
+        when(suggestionRepository.findByTokenHashForUpdate(TOKEN_HASH)).thenReturn(Optional.of(pending()));
     }
 
     private Cache cache(String name) {
@@ -142,7 +144,7 @@ class ServiceTypeSuggestionServiceCacheTest {
     @DisplayName("should_notEvictCatalogue_when_tokenUnknown")
     void should_notEvictCatalogue_when_tokenUnknown() {
         when(tokenGenerator.hash("garbage")).thenReturn("unknownhash");
-        when(suggestionRepository.findByTokenHash("unknownhash")).thenReturn(Optional.empty());
+        when(suggestionRepository.findByTokenHashForUpdate("unknownhash")).thenReturn(Optional.empty());
 
         var outcome = service.approve("garbage");
 
@@ -157,7 +159,7 @@ class ServiceTypeSuggestionServiceCacheTest {
     void should_notEvictCatalogue_when_alreadyDecided() {
         ServiceTypeSuggestion decided = pending();
         decided.approve(OffsetDateTime.ofInstant(NOW, ZoneOffset.UTC));
-        when(suggestionRepository.findByTokenHash(TOKEN_HASH)).thenReturn(Optional.of(decided));
+        when(suggestionRepository.findByTokenHashForUpdate(TOKEN_HASH)).thenReturn(Optional.of(decided));
 
         var outcome = service.approve(RAW_TOKEN);
 
@@ -173,7 +175,7 @@ class ServiceTypeSuggestionServiceCacheTest {
         ServiceTypeSuggestion expired = ServiceTypeSuggestion.ofPending(
                 "HAIR", "Балаяж", "Опис", UUID.randomUUID(), TOKEN_HASH,
                 OffsetDateTime.ofInstant(NOW.minusSeconds(3600), ZoneOffset.UTC));
-        when(suggestionRepository.findByTokenHash(TOKEN_HASH)).thenReturn(Optional.of(expired));
+        when(suggestionRepository.findByTokenHashForUpdate(TOKEN_HASH)).thenReturn(Optional.of(expired));
 
         var outcome = service.approve(RAW_TOKEN);
 

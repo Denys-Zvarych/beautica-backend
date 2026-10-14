@@ -4,6 +4,7 @@ import com.beautica.auth.TokenGenerator;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.config.PublicBaseUrlProperties;
 import com.beautica.notification.EmailService;
+import com.beautica.notification.inapp.service.InAppNotificationService;
 import com.beautica.service.entity.ServiceTypeSuggestion;
 import com.beautica.service.entity.ServiceTypeSuggestionStatus;
 import com.beautica.service.repository.ServiceTypeSuggestionRepository;
@@ -59,6 +60,7 @@ class ServiceTypeSuggestionServiceTest {
     @Mock private EmailService emailService;
     @Mock private PublicBaseUrlProperties publicBaseUrlProperties;
     @Mock private ServiceTypePromotionService promotionService;
+    @Mock private InAppNotificationService inAppNotificationService;
 
     private ServiceTypeSuggestionService service;
 
@@ -67,7 +69,7 @@ class ServiceTypeSuggestionServiceTest {
         Clock fixedClock = Clock.fixed(NOW, ZoneOffset.UTC);
         service = new ServiceTypeSuggestionService(
                 suggestionRepository, tokenGenerator, emailService,
-                publicBaseUrlProperties, promotionService, fixedClock);
+                publicBaseUrlProperties, promotionService, fixedClock, inAppNotificationService);
         ReflectionTestUtils.setField(service, "adminEmail", ADMIN_EMAIL);
     }
 
@@ -153,7 +155,7 @@ class ServiceTypeSuggestionServiceTest {
         ServiceTypeSuggestion pending = pendingSuggestion(
                 OffsetDateTime.ofInstant(NOW.plusSeconds(3600), ZoneOffset.UTC));
         when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
-        when(suggestionRepository.findByTokenHash(TOKEN_HASH)).thenReturn(Optional.of(pending));
+        when(suggestionRepository.findByTokenHashForUpdate(TOKEN_HASH)).thenReturn(Optional.of(pending));
 
         DecisionOutcome outcome = service.approve(RAW_TOKEN);
 
@@ -176,7 +178,7 @@ class ServiceTypeSuggestionServiceTest {
         ServiceTypeSuggestion pending = pendingSuggestion(
                 OffsetDateTime.ofInstant(NOW.plusSeconds(3600), ZoneOffset.UTC));
         when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
-        when(suggestionRepository.findByTokenHash(TOKEN_HASH)).thenReturn(Optional.of(pending));
+        when(suggestionRepository.findByTokenHashForUpdate(TOKEN_HASH)).thenReturn(Optional.of(pending));
 
         service.approve(RAW_TOKEN);
 
@@ -192,7 +194,7 @@ class ServiceTypeSuggestionServiceTest {
         ServiceTypeSuggestion pending = pendingSuggestion(
                 OffsetDateTime.ofInstant(NOW.plusSeconds(3600), ZoneOffset.UTC));
         when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
-        when(suggestionRepository.findByTokenHash(TOKEN_HASH)).thenReturn(Optional.of(pending));
+        when(suggestionRepository.findByTokenHashForUpdate(TOKEN_HASH)).thenReturn(Optional.of(pending));
 
         service.reject(RAW_TOKEN);
 
@@ -205,7 +207,7 @@ class ServiceTypeSuggestionServiceTest {
         ServiceTypeSuggestion pending = pendingSuggestion(
                 OffsetDateTime.ofInstant(NOW.plusSeconds(3600), ZoneOffset.UTC));
         when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
-        when(suggestionRepository.findByTokenHash(TOKEN_HASH)).thenReturn(Optional.of(pending));
+        when(suggestionRepository.findByTokenHashForUpdate(TOKEN_HASH)).thenReturn(Optional.of(pending));
 
         service.approve(RAW_TOKEN);
         // Replay: token cleared, status APPROVED → ALREADY_DECIDED before reaching promote.
@@ -222,7 +224,7 @@ class ServiceTypeSuggestionServiceTest {
         ServiceTypeSuggestion pending = pendingSuggestion(
                 OffsetDateTime.ofInstant(NOW.plusSeconds(3600), ZoneOffset.UTC));
         when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
-        when(suggestionRepository.findByTokenHash(TOKEN_HASH)).thenReturn(Optional.of(pending));
+        when(suggestionRepository.findByTokenHashForUpdate(TOKEN_HASH)).thenReturn(Optional.of(pending));
 
         DecisionOutcome outcome = service.reject(RAW_TOKEN);
 
@@ -238,7 +240,7 @@ class ServiceTypeSuggestionServiceTest {
         ServiceTypeSuggestion expired = pendingSuggestion(
                 OffsetDateTime.ofInstant(NOW.minusSeconds(1), ZoneOffset.UTC));
         when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
-        when(suggestionRepository.findByTokenHash(TOKEN_HASH)).thenReturn(Optional.of(expired));
+        when(suggestionRepository.findByTokenHashForUpdate(TOKEN_HASH)).thenReturn(Optional.of(expired));
 
         DecisionOutcome outcome = service.approve(RAW_TOKEN);
 
@@ -251,7 +253,7 @@ class ServiceTypeSuggestionServiceTest {
     @DisplayName("should_returnAlreadyDecided_when_tokenUnknown")
     void should_returnAlreadyDecided_when_tokenUnknown() {
         when(tokenGenerator.hash(anyString())).thenReturn("nomatch");
-        when(suggestionRepository.findByTokenHash("nomatch")).thenReturn(Optional.empty());
+        when(suggestionRepository.findByTokenHashForUpdate("nomatch")).thenReturn(Optional.empty());
 
         DecisionOutcome outcome = service.approve("some-wrong-token");
 
@@ -266,7 +268,7 @@ class ServiceTypeSuggestionServiceTest {
         ServiceTypeSuggestion pending = pendingSuggestion(
                 OffsetDateTime.ofInstant(NOW.plusSeconds(3600), ZoneOffset.UTC));
         when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
-        when(suggestionRepository.findByTokenHash(TOKEN_HASH)).thenReturn(Optional.of(pending));
+        when(suggestionRepository.findByTokenHashForUpdate(TOKEN_HASH)).thenReturn(Optional.of(pending));
 
         service.approve(RAW_TOKEN);
         // Token cleared on the entity; the stale-hash lookup (test stub) still resolves
@@ -284,7 +286,7 @@ class ServiceTypeSuggestionServiceTest {
         ServiceTypeSuggestion pending = pendingSuggestion(
                 OffsetDateTime.ofInstant(NOW.plusSeconds(3600), ZoneOffset.UTC));
         when(tokenGenerator.hash(RAW_TOKEN)).thenReturn("different-hash");
-        when(suggestionRepository.findByTokenHash("different-hash")).thenReturn(Optional.of(pending));
+        when(suggestionRepository.findByTokenHashForUpdate("different-hash")).thenReturn(Optional.of(pending));
 
         DecisionOutcome outcome = service.approve(RAW_TOKEN);
 
@@ -335,5 +337,75 @@ class ServiceTypeSuggestionServiceTest {
 
         assertThat(view.valid())
                 .as("expired suggestion must render the neutral page").isFalse();
+    }
+
+    // ── phase 372: request-decision notification ──────────────────────────────
+
+    @Test
+    @DisplayName("approve on a PENDING suggestion promotes, THEN notifies exactly once (approved)")
+    void should_notifyOnceApprovedAfterPromote_when_pendingApproved() {
+        ServiceTypeSuggestion pending = pendingSuggestion(
+                OffsetDateTime.ofInstant(NOW.plusSeconds(3600), ZoneOffset.UTC));
+        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
+        when(suggestionRepository.findByTokenHashForUpdate(TOKEN_HASH)).thenReturn(Optional.of(pending));
+
+        service.approve(RAW_TOKEN);
+
+        org.mockito.InOrder order = org.mockito.Mockito.inOrder(promotionService, inAppNotificationService);
+        order.verify(promotionService).promote(pending);
+        order.verify(inAppNotificationService).notifySuggestionDecided(pending, true);
+        org.mockito.Mockito.verifyNoMoreInteractions(inAppNotificationService);
+    }
+
+    @Test
+    @DisplayName("a promotion failure propagates and no notification is written")
+    void should_notNotifyAndPropagate_when_promoteThrows() {
+        ServiceTypeSuggestion pending = pendingSuggestion(
+                OffsetDateTime.ofInstant(NOW.plusSeconds(3600), ZoneOffset.UTC));
+        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
+        when(suggestionRepository.findByTokenHashForUpdate(TOKEN_HASH)).thenReturn(Optional.of(pending));
+        org.mockito.Mockito.doThrow(new IllegalStateException("boom")).when(promotionService).promote(pending);
+
+        assertThatThrownBy(() -> service.approve(RAW_TOKEN)).isInstanceOf(IllegalStateException.class);
+
+        verifyNoInteractions(inAppNotificationService);
+    }
+
+    @Test
+    @DisplayName("reject with a reason on a PENDING suggestion stores the reason and notifies exactly once (rejected)")
+    void should_notifyOnceRejectedAndStoreReason_when_pendingRejectedWithReason() {
+        ServiceTypeSuggestion pending = pendingSuggestion(
+                OffsetDateTime.ofInstant(NOW.plusSeconds(3600), ZoneOffset.UTC));
+        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
+        when(suggestionRepository.findByTokenHashForUpdate(TOKEN_HASH)).thenReturn(Optional.of(pending));
+
+        service.reject(RAW_TOKEN, "не підходить");
+
+        assertThat(pending.getDecisionReason()).isEqualTo("не підходить");
+        verify(inAppNotificationService).notifySuggestionDecided(pending, false);
+    }
+
+    @Test
+    @DisplayName("ALREADY_DECIDED, expired and unknown tokens never notify")
+    void should_notNotify_when_alreadyDecidedExpiredOrUnknownToken() {
+        ServiceTypeSuggestion decided = pendingSuggestion(
+                OffsetDateTime.ofInstant(NOW.plusSeconds(3600), ZoneOffset.UTC));
+        decided.reject(OffsetDateTime.ofInstant(NOW, ZoneOffset.UTC));
+        ServiceTypeSuggestion expired = pendingSuggestion(
+                OffsetDateTime.ofInstant(NOW.minusSeconds(1), ZoneOffset.UTC));
+        when(tokenGenerator.hash("decided")).thenReturn(TOKEN_HASH);
+        when(tokenGenerator.hash("expired")).thenReturn("h-expired");
+        when(tokenGenerator.hash("unknown")).thenReturn("h-unknown");
+        ReflectionTestUtils.setField(decided, "tokenHash", TOKEN_HASH);
+        ReflectionTestUtils.setField(expired, "tokenHash", "h-expired");
+        when(suggestionRepository.findByTokenHashForUpdate(TOKEN_HASH)).thenReturn(Optional.of(decided));
+        when(suggestionRepository.findByTokenHashForUpdate("h-expired")).thenReturn(Optional.of(expired));
+        when(suggestionRepository.findByTokenHashForUpdate("h-unknown")).thenReturn(Optional.empty());
+
+        assertThat(service.approve("decided")).isEqualTo(DecisionOutcome.ALREADY_DECIDED);
+        assertThat(service.reject("expired", "r")).isEqualTo(DecisionOutcome.INVALID_OR_EXPIRED);
+        assertThat(service.reject("unknown", "r")).isEqualTo(DecisionOutcome.ALREADY_DECIDED);
+
+        verifyNoInteractions(inAppNotificationService);
     }
 }

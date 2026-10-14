@@ -33,8 +33,11 @@
       </form>
 
       <form th:action="@{/api/v1/service-categories/requests/reject}" method="post"
-            style="display:inline-block;">
+            style="display:block;margin-top:20px;">
         <input type="hidden" name="token" th:value="${token}"/>
+        <textarea name="reason" maxlength="300" rows="3" placeholder="Причина відхилення (необов'язково)"
+                  style="display:block;width:100%;box-sizing:border-box;margin:0 0 12px;padding:10px;
+                         border:1px solid #D4C5B5;border-radius:10px;font-family:inherit;font-size:14px;"></textarea>
         <button type="submit"
                 style="background:#8A3A2E;color:#F5EDE0;border:0;cursor:pointer;
                        font-size:16px;font-weight:700;padding:14px 30px;border-radius:12px;">

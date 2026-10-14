@@ -4,6 +4,7 @@ import com.beautica.auth.TokenGenerator;
 import com.beautica.config.CacheConfig;
 import com.beautica.config.PublicBaseUrlProperties;
 import com.beautica.notification.EmailService;
+import com.beautica.notification.inapp.service.InAppNotificationService;
 import com.beautica.search.service.SearchSuggestionCatalogue;
 import com.beautica.service.entity.PlatformCategory;
 import com.beautica.service.repository.PlatformCategoryRepository;
@@ -66,6 +67,7 @@ class CategoryRequestServiceCacheTest {
     @MockBean PlatformCategoryRepository platformCategoryRepository;
     @MockBean TokenGenerator tokenGenerator;
     @MockBean EmailService emailService;
+    @MockBean InAppNotificationService inAppNotificationService;
     @MockBean PublicBaseUrlProperties publicBaseUrlProperties;
     @MockBean ServiceTypeSuggestionService serviceTypeSuggestionService;
 
@@ -106,7 +108,7 @@ class CategoryRequestServiceCacheTest {
         when(platformCategoryRepository.findApprovedActive())
                 .thenReturn(List.of(PlatformCategory.ofApproved("MANICURE", "Манікюр")));
         when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
-        when(platformCategoryRepository.findByTokenHash(TOKEN_HASH)).thenReturn(Optional.of(pending()));
+        when(platformCategoryRepository.findByTokenHashForUpdate(TOKEN_HASH)).thenReturn(Optional.of(pending()));
 
         service.listApproved();          // populate cache
         service.approve(RAW_TOKEN);      // must evict
@@ -121,7 +123,7 @@ class CategoryRequestServiceCacheTest {
         when(platformCategoryRepository.findApprovedActive())
                 .thenReturn(List.of(PlatformCategory.ofApproved("MANICURE", "Манікюр")));
         when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
-        when(platformCategoryRepository.findByTokenHash(TOKEN_HASH)).thenReturn(Optional.of(pending()));
+        when(platformCategoryRepository.findByTokenHashForUpdate(TOKEN_HASH)).thenReturn(Optional.of(pending()));
 
         service.listApproved();          // populate cache
         service.reject(RAW_TOKEN);       // changes no cached data — must NOT evict
@@ -167,7 +169,7 @@ class CategoryRequestServiceCacheTest {
         when(platformCategoryRepository.findApprovedActive())
                 .thenReturn(List.of(PlatformCategory.ofApproved("MANICURE", "Манікюр")));
         when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
-        when(platformCategoryRepository.findByTokenHash(TOKEN_HASH)).thenReturn(Optional.of(pending()));
+        when(platformCategoryRepository.findByTokenHashForUpdate(TOKEN_HASH)).thenReturn(Optional.of(pending()));
 
         platformCategoryOrderLookup.getApprovedActive();  // populate cache
         service.approve(RAW_TOKEN);                       // must evict
@@ -182,7 +184,7 @@ class CategoryRequestServiceCacheTest {
         when(platformCategoryRepository.findApprovedActive())
                 .thenReturn(List.of(PlatformCategory.ofApproved("MANICURE", "Манікюр")));
         when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
-        when(platformCategoryRepository.findByTokenHash(TOKEN_HASH)).thenReturn(Optional.of(pending()));
+        when(platformCategoryRepository.findByTokenHashForUpdate(TOKEN_HASH)).thenReturn(Optional.of(pending()));
 
         platformCategoryOrderLookup.getApprovedActive();  // populate cache
         service.reject(RAW_TOKEN);                        // must NOT evict
@@ -197,7 +199,7 @@ class CategoryRequestServiceCacheTest {
     @DisplayName("should_evictSuggestionCatalogue_when_approveCalled")
     void should_evictSuggestionCatalogue_when_approveCalled() {
         when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
-        when(platformCategoryRepository.findByTokenHash(TOKEN_HASH)).thenReturn(Optional.of(pending()));
+        when(platformCategoryRepository.findByTokenHashForUpdate(TOKEN_HASH)).thenReturn(Optional.of(pending()));
         cacheManager.getCache(SearchSuggestionCatalogue.CACHE_NAME).put("k", "stale");
 
         service.approve(RAW_TOKEN);
@@ -209,7 +211,7 @@ class CategoryRequestServiceCacheTest {
     @DisplayName("should_notEvictSuggestionCatalogue_when_rejectCalled")
     void should_notEvictSuggestionCatalogue_when_rejectCalled() {
         when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
-        when(platformCategoryRepository.findByTokenHash(TOKEN_HASH)).thenReturn(Optional.of(pending()));
+        when(platformCategoryRepository.findByTokenHashForUpdate(TOKEN_HASH)).thenReturn(Optional.of(pending()));
         cacheManager.getCache(SearchSuggestionCatalogue.CACHE_NAME).put("k", "stale");
 
         service.reject(RAW_TOKEN);
@@ -235,7 +237,7 @@ class CategoryRequestServiceCacheTest {
     @DisplayName("should_notEvictCatalogue_when_tokenUnknown")
     void should_notEvictCatalogue_when_tokenUnknown() {
         when(tokenGenerator.hash("garbage")).thenReturn("unknownhash");
-        when(platformCategoryRepository.findByTokenHash("unknownhash")).thenReturn(Optional.empty());
+        when(platformCategoryRepository.findByTokenHashForUpdate("unknownhash")).thenReturn(Optional.empty());
         warmAllCaches();
 
         var outcome = service.approve("garbage");
@@ -250,7 +252,7 @@ class CategoryRequestServiceCacheTest {
         when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
         PlatformCategory decided = pending();
         decided.approve(OffsetDateTime.ofInstant(NOW, ZoneOffset.UTC));
-        when(platformCategoryRepository.findByTokenHash(TOKEN_HASH)).thenReturn(Optional.of(decided));
+        when(platformCategoryRepository.findByTokenHashForUpdate(TOKEN_HASH)).thenReturn(Optional.of(decided));
         warmAllCaches();
 
         var outcome = service.approve(RAW_TOKEN);
@@ -267,7 +269,7 @@ class CategoryRequestServiceCacheTest {
                 "NAIL_ART", "Нейл-арт", null, TOKEN_HASH,
                 OffsetDateTime.ofInstant(NOW.minusSeconds(7200), ZoneOffset.UTC),
                 OffsetDateTime.ofInstant(NOW.minusSeconds(3600), ZoneOffset.UTC), null);
-        when(platformCategoryRepository.findByTokenHash(TOKEN_HASH)).thenReturn(Optional.of(expired));
+        when(platformCategoryRepository.findByTokenHashForUpdate(TOKEN_HASH)).thenReturn(Optional.of(expired));
         warmAllCaches();
 
         var outcome = service.approve(RAW_TOKEN);

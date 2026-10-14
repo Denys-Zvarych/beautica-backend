@@ -13,6 +13,10 @@ import com.beautica.notification.inapp.dto.TargetKind;
 import com.beautica.notification.inapp.entity.InAppNotification;
 import com.beautica.notification.inapp.entity.InAppNotificationType;
 import com.beautica.notification.service.BookingVisit;
+import com.beautica.service.entity.PlatformCategory;
+import com.beautica.service.entity.ServiceTypeSuggestion;
+import com.beautica.service.repository.PlatformCategoryRepository;
+import com.beautica.service.repository.ServiceTypeSuggestionRepository;
 import com.beautica.review.repository.ReviewRepository;
 import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
@@ -82,6 +86,8 @@ public class NotificationViewAssembler {
     private final SalonRepository salonRepository;
     private final UserRepository userRepository;
     private final ReviewRepository reviewRepository;
+    private final PlatformCategoryRepository platformCategoryRepository;
+    private final ServiceTypeSuggestionRepository suggestionRepository;
     private final AuthorizationService authorizationService;
     private final Clock clock;
 
@@ -91,7 +97,18 @@ public class NotificationViewAssembler {
      */
     private record Hydrated(
             Map<UUID, Booking> bookingsById, Map<UUID, BookingVisit> visitsByAppointment,
-            Map<UUID, User> subjectsById, Set<UUID> reviewedBookingIds) {
+            Map<UUID, User> subjectsById, Set<UUID> reviewedBookingIds,
+            RequestDecisions requestDecisions) {
+    }
+
+    /**
+     * Phase 372 — the category requests / suggestions the page's request-decision rows point at, plus
+     * category display names by wire name. Empty maps (and no statement) when the page has none.
+     */
+    private record RequestDecisions(
+            Map<Long, PlatformCategory> categoriesById, Map<UUID, ServiceTypeSuggestion> suggestionsById,
+            Map<String, String> categoryDisplayNamesByName) {
+        static final RequestDecisions NONE = new RequestDecisions(Map.of(), Map.of(), Map.of());
     }
 
     /**
@@ -182,7 +199,30 @@ public class NotificationViewAssembler {
                 ? Set.of()
                 : Set.copyOf(reviewRepository.findReviewedBookingIds(List.copyOf(reviewRequestedBookingIds)));
 
-        return new Hydrated(bookingsById, visitsByAppointment, subjectsById, reviewedBookingIds);
+        return new Hydrated(bookingsById, visitsByAppointment, subjectsById, reviewedBookingIds,
+                hydrateRequestDecisions(rows));
+    }
+
+    private RequestDecisions hydrateRequestDecisions(List<InAppNotification> rows) {
+        Set<Long> categoryIds = rows.stream().map(InAppNotification::getCategoryRequestId)
+                .filter(java.util.Objects::nonNull).collect(Collectors.toCollection(LinkedHashSet::new));
+        Set<UUID> suggestionIds = idsOf(rows, InAppNotification::getServiceTypeSuggestionId);
+        if (categoryIds.isEmpty() && suggestionIds.isEmpty()) {
+            return RequestDecisions.NONE;
+        }
+        // PK + UNIQUE(name) lookups, page-bounded; merge not worth the OR-query complexity.
+        Map<UUID, ServiceTypeSuggestion> suggestions = suggestionIds.isEmpty() ? Map.of()
+                : suggestionRepository.findAllById(suggestionIds).stream()
+                        .collect(Collectors.toMap(ServiceTypeSuggestion::getId, Function.identity()));
+        Set<String> categoryNames = suggestions.values().stream()
+                .map(ServiceTypeSuggestion::getCategoryName).collect(Collectors.toSet());
+        Map<String, String> displayNames = categoryNames.isEmpty() ? Map.of()
+                : platformCategoryRepository.findByNameIn(categoryNames).stream()
+                        .collect(Collectors.toMap(PlatformCategory::getName, PlatformCategory::getDisplayName));
+        Map<Long, PlatformCategory> categories = categoryIds.isEmpty() ? Map.of()
+                : platformCategoryRepository.findAllById(categoryIds).stream()
+                        .collect(Collectors.toMap(PlatformCategory::getId, Function.identity()));
+        return new RequestDecisions(categories, suggestions, displayNames);
     }
 
     /**
@@ -247,7 +287,54 @@ public class NotificationViewAssembler {
         if (row.getType() == InAppNotificationType.INVITE_ACCEPTED) {
             return resolveInviteAccepted(row, actorId, actorRole, hydrated.subjectsById(), facts);
         }
+        if (row.getCategoryRequestId() != null || row.getServiceTypeSuggestionId() != null) {
+            return resolveRequestDecision(row, hydrated.requestDecisions());
+        }
         return resolveBookingEvent(row, actorId, actorRole, hydrated, facts, now);
+    }
+
+    // ── phase 372: category-request / service-type-suggestion decisions ─────────────────────────
+
+    /**
+     * The recipient IS the requester (the write path targets nobody else), so no visibility check
+     * applies. If the request row is gone (cannot normally happen — the FK cascades) the item
+     * degrades to a NONE target with null params. {@code decisionReason} is set on {@code *_REJECTED}
+     * only; the target carries no ids.
+     */
+    private NotificationResponse resolveRequestDecision(InAppNotification row, RequestDecisions decisions) {
+        NotificationParams params = row.getCategoryRequestId() != null
+                ? categoryDecisionParams(row, decisions.categoriesById().get(row.getCategoryRequestId()))
+                : suggestionDecisionParams(row, decisions);
+        NotificationTarget target = params == null
+                ? NotificationTarget.none(null)
+                : new NotificationTarget(TargetKind.SERVICE_CATALOG, null, null, null);
+        return new NotificationResponse(
+                row.getId(), row.getType(), row.getCreatedAt(), row.getReadAt() != null, target, params);
+    }
+
+    private static NotificationParams categoryDecisionParams(InAppNotification row, PlatformCategory category) {
+        if (category == null) {
+            return null;
+        }
+        return new NotificationParams(null, null, 0, null, null, null, null, null,
+                category.getDisplayName(), reasonFor(row.getType(), category.getDecisionReason()));
+    }
+
+    private static NotificationParams suggestionDecisionParams(InAppNotification row, RequestDecisions decisions) {
+        ServiceTypeSuggestion suggestion = decisions.suggestionsById().get(row.getServiceTypeSuggestionId());
+        if (suggestion == null) {
+            return null;
+        }
+        String categoryName = decisions.categoryDisplayNamesByName()
+                .getOrDefault(suggestion.getCategoryName(), suggestion.getCategoryName());
+        return new NotificationParams(null, suggestion.getSuggestedName(), 0, null, null, null, null, null,
+                categoryName, reasonFor(row.getType(), suggestion.getDecisionReason()));
+    }
+
+    private static String reasonFor(InAppNotificationType type, String reason) {
+        boolean rejected = type == InAppNotificationType.CATEGORY_REQUEST_REJECTED
+                || type == InAppNotificationType.SERVICE_TYPE_SUGGESTION_REJECTED;
+        return rejected ? reason : null;
     }
 
     // ── booking/visit-keyed events (every type except INVITE_ACCEPTED) ─────────────────────────
@@ -304,6 +391,8 @@ public class NotificationViewAssembler {
                 booking.getStartsAt().toInstant(),
                 salon != null ? salon.getName() : null,
                 performingMasterName(type, master, salon, actorId, actorRole, isSingleMaster(visit)),
+                null,
+                null,
                 null,
                 null);
     }
@@ -440,7 +529,7 @@ public class NotificationViewAssembler {
                 ? subjectsById.get(row.getSubjectUserId()) : null;
         NotificationParams params = subject == null ? null : new NotificationParams(
                 null, null, 0, null, null, null,
-                joinName(subject.getFirstName(), subject.getLastName()), subject.getRole());
+                joinName(subject.getFirstName(), subject.getLastName()), subject.getRole(), null, null);
 
         return new NotificationResponse(
                 row.getId(), row.getType(), row.getCreatedAt(), row.getReadAt() != null, target, params);

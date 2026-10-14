@@ -311,8 +311,10 @@ class InAppNotificationRepositoryIT extends AbstractDataJpaTest {
     // colon case the migration's own comment calls out, and an unknown TYPE prefix).
 
     @ParameterizedTest
-    @EnumSource(InAppNotificationType.class)
-    @DisplayName("in_app_notification_dedup_key_chk (V183) — every one of the 10 TYPE literals accepts "
+    @EnumSource(value = InAppNotificationType.class, mode = EnumSource.Mode.EXCLUDE, names = {
+            "CATEGORY_REQUEST_APPROVED", "CATEGORY_REQUEST_REJECTED",
+            "SERVICE_TYPE_SUGGESTION_APPROVED", "SERVICE_TYPE_SUGGESTION_REJECTED"})
+    @DisplayName("in_app_notification_dedup_key_chk (V183) — every one of the 10 booking-keyed TYPE literals accepts "
             + "the common TYPE:uuid form, not just the 2-3 spot-checked above")
     void should_acceptTypeColonUuid_when_everyEnumType(InAppNotificationType type) {
         // INVITE_ACCEPTED alone needs salon_id OR subject_user_id set — an UNRELATED trigger
@@ -375,6 +377,210 @@ class InAppNotificationRepositoryIT extends AbstractDataJpaTest {
                 """, UUID.randomUUID(), client.getId(), booking.getId(), dedupKey))
                 .as(description + " — dedup_key=" + dedupKey)
                 .isInstanceOf(DataAccessException.class);
+    }
+
+    // ── Phase 372 (V196) — request-decision types ───────────────────────────────────────────
+
+    private long insertCategoryRequest(String name) {
+        return jdbcTemplate.queryForObject("""
+                INSERT INTO platform_categories (name, display_name, active, status, requested_by_user_id)
+                VALUES (?, 'Тест', false, 'PENDING', ?) RETURNING id
+                """, Long.class, name, client.getId());
+    }
+
+    private UUID insertSuggestion() {
+        UUID id = UUID.randomUUID();
+        jdbcTemplate.update("""
+                INSERT INTO service_type_suggestion (id, requested_by_user_id, category_name, suggested_name, status)
+                VALUES (?, ?, 'NAIL_ART_V196', 'Гель', 'PENDING')
+                """, id, client.getId());
+        return id;
+    }
+
+    private int rawInsertDecision(String type, Long categoryRequestId, UUID suggestionId, UUID bookingId,
+                                  String dedupKey) {
+        return jdbcTemplate.update("""
+                INSERT INTO in_app_notification
+                    (id, recipient_user_id, type, booking_id, category_request_id, service_type_suggestion_id, dedup_key)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, UUID.randomUUID(), client.getId(), type, bookingId, categoryRequestId, suggestionId, dedupKey);
+    }
+
+    @Test
+    @DisplayName("V196 — a category-request item with its own FK and the digit dedup key is accepted; a duplicate "
+            + "dedup key is a no-op through the repository insert")
+    void should_acceptCategoryDecisionAndSuppressDuplicate_when_v196() {
+        long categoryId = insertCategoryRequest("V196_CAT_A");
+        String key = "CATEGORY_REQUEST_APPROVED:" + categoryId;
+
+        int first = repository.insertRequestDecision("CATEGORY_REQUEST_APPROVED", client.getId(), categoryId, null, key);
+        int second = repository.insertRequestDecision("CATEGORY_REQUEST_APPROVED", client.getId(), categoryId, null, key);
+
+        assertThat(first).isEqualTo(1);
+        assertThat(second).as("ON CONFLICT DO NOTHING").isZero();
+        assertThat(countRows()).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("V196 — insertRequestDecisionWithPush enqueues one id-only INAPP_PUSH row for a token holder, "
+            + "none for a token-less requester, and none for a conflict-suppressed duplicate")
+    void should_enqueueOnePushRowOnlyForTokenHolder_when_insertRequestDecisionWithPush() {
+        long categoryId = insertCategoryRequest("V196_CAT_G");
+        String key = "CATEGORY_REQUEST_REJECTED:" + categoryId;
+
+        repository.insertRequestDecisionWithPush("CATEGORY_REQUEST_REJECTED", client.getId(), categoryId, null, key);
+        assertThat(countPushRows()).as("token-less requester: feed row yes, push row no").isZero();
+        assertThat(countRows()).isEqualTo(1);
+
+        jdbcTemplate.update("DELETE FROM in_app_notification");
+        giveUserAToken(client.getId(), true);
+        int first = repository.insertRequestDecisionWithPush(
+                "CATEGORY_REQUEST_REJECTED", client.getId(), categoryId, null, key);
+        int duplicate = repository.insertRequestDecisionWithPush(
+                "CATEGORY_REQUEST_REJECTED", client.getId(), categoryId, null, key);
+
+        assertThat(first).isEqualTo(1);
+        assertThat(duplicate).isZero();
+        assertThat(countPushRows()).isEqualTo(1);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT payload FROM notification_outbox WHERE event_type = 'INAPP_PUSH'", String.class)).isNull();
+    }
+
+    @Test
+    @DisplayName("V196 — a suggestion item with its own FK and TYPE:uuid dedup key is accepted")
+    void should_acceptSuggestionDecision_when_v196() {
+        UUID suggestionId = insertSuggestion();
+
+        int inserted = repository.insertRequestDecision("SERVICE_TYPE_SUGGESTION_REJECTED", client.getId(), null,
+                suggestionId, "SERVICE_TYPE_SUGGESTION_REJECTED:" + suggestionId);
+
+        assertThat(inserted).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("V196 shape CHECK — a new type WITHOUT its FK is rejected")
+    void should_rejectNewType_when_itsFkMissing() {
+        long categoryId = insertCategoryRequest("V196_CAT_B");
+
+        assertThatThrownBy(() -> rawInsertDecision("CATEGORY_REQUEST_APPROVED", null, null, null,
+                "CATEGORY_REQUEST_APPROVED:" + categoryId)).isInstanceOf(DataAccessException.class);
+        assertThatThrownBy(() -> rawInsertDecision("SERVICE_TYPE_SUGGESTION_APPROVED", null, null, null,
+                "SERVICE_TYPE_SUGGESTION_APPROVED:" + UUID.randomUUID())).isInstanceOf(DataAccessException.class);
+    }
+
+    @Test
+    @DisplayName("V196 shape CHECK — a new type with the WRONG FK (or an extra booking_id) is rejected")
+    void should_rejectNewType_when_wrongFkOrExtraBooking() {
+        long categoryId = insertCategoryRequest("V196_CAT_C");
+        UUID suggestionId = insertSuggestion();
+
+        assertThatThrownBy(() -> rawInsertDecision("CATEGORY_REQUEST_REJECTED", null, suggestionId, null,
+                "CATEGORY_REQUEST_REJECTED:" + categoryId)).isInstanceOf(DataAccessException.class);
+        assertThatThrownBy(() -> rawInsertDecision("SERVICE_TYPE_SUGGESTION_REJECTED", categoryId, null, null,
+                "SERVICE_TYPE_SUGGESTION_REJECTED:" + suggestionId)).isInstanceOf(DataAccessException.class);
+        assertThatThrownBy(() -> rawInsertDecision("CATEGORY_REQUEST_APPROVED", categoryId, null, booking.getId(),
+                "CATEGORY_REQUEST_APPROVED:" + categoryId)).isInstanceOf(DataAccessException.class);
+    }
+
+    @Test
+    @DisplayName("V196 dedup CHECK — the digit key is accepted ONLY for the CATEGORY_REQUEST_* types")
+    void should_acceptDigitDedupKey_onlyForCategoryRequestTypes() {
+        long categoryId = insertCategoryRequest("V196_CAT_D");
+
+        assertThatThrownBy(() -> jdbcTemplate.update("""
+                INSERT INTO in_app_notification (id, recipient_user_id, type, booking_id, dedup_key)
+                VALUES (?, ?, 'BOOKING_CREATED', ?, 'BOOKING_CREATED:12345')
+                """, UUID.randomUUID(), client.getId(), booking.getId())).isInstanceOf(DataAccessException.class);
+        assertThatThrownBy(() -> rawInsertDecision("CATEGORY_REQUEST_APPROVED", categoryId, null, null,
+                "CATEGORY_REQUEST_APPROVED:" + categoryId + "x")).isInstanceOf(DataAccessException.class);
+        assertThatThrownBy(() -> rawInsertDecision("CATEGORY_REQUEST_APPROVED", categoryId, null, null,
+                "CATEGORY_REQUEST_APPROVED:" + categoryId + ":")).isInstanceOf(DataAccessException.class);
+    }
+
+    @Test
+    @DisplayName("V196 shape CHECK — a booking type carrying category_request_id is rejected")
+    void should_rejectBookingType_when_carryingCategoryRequestId() {
+        long categoryId = insertCategoryRequest("V196_CAT_SHAPE");
+
+        assertThatThrownBy(() -> rawInsertDecision("BOOKING_CREATED", categoryId, null, booking.getId(),
+                "BOOKING_CREATED:" + UUID.randomUUID())).isInstanceOf(DataAccessException.class);
+        assertThatThrownBy(() -> rawInsertDecision("BOOKING_CREATED", null, insertSuggestion(), booking.getId(),
+                "BOOKING_CREATED:" + UUID.randomUUID())).isInstanceOf(DataAccessException.class);
+    }
+
+    @Test
+    @DisplayName("V196 shape CHECK — INVITE_ACCEPTED carrying a request FK is rejected")
+    void should_rejectInviteAccepted_when_carryingRequestFk() {
+        long categoryId = insertCategoryRequest("V196_CAT_INVITE");
+
+        assertThatThrownBy(() -> rawInsertDecision("INVITE_ACCEPTED", categoryId, null, null,
+                "INVITE_ACCEPTED:" + UUID.randomUUID() + ":" + UUID.randomUUID()))
+                .isInstanceOf(DataAccessException.class);
+    }
+
+    @Test
+    @DisplayName("V196 dedup CHECK — category types reject a UUID suffix; suggestion types reject a digit suffix")
+    void should_rejectDedupKey_when_categoryTypeHasUuidSuffix() {
+        long categoryId = insertCategoryRequest("V196_CAT_UUIDKEY");
+        UUID suggestionId = insertSuggestion();
+
+        assertThatThrownBy(() -> rawInsertDecision("CATEGORY_REQUEST_APPROVED", categoryId, null, null,
+                "CATEGORY_REQUEST_APPROVED:" + UUID.randomUUID())).isInstanceOf(DataAccessException.class);
+        assertThatThrownBy(() -> rawInsertDecision("SERVICE_TYPE_SUGGESTION_APPROVED", null, suggestionId, null,
+                "SERVICE_TYPE_SUGGESTION_APPROVED:12345")).isInstanceOf(DataAccessException.class);
+        assertThatThrownBy(() -> rawInsertDecision("SERVICE_TYPE_SUGGESTION_APPROVED", null, suggestionId, null,
+                "SERVICE_TYPE_SUGGESTION_APPROVED:" + suggestionId + ":" + suggestionId))
+                .isInstanceOf(DataAccessException.class);
+    }
+
+    @Test
+    @DisplayName("V196 dedup CHECK — the correct per-type suffix forms are accepted (inverse case)")
+    void should_acceptDedupKey_when_suffixMatchesType() {
+        long categoryId = insertCategoryRequest("V196_CAT_OKKEY");
+        UUID suggestionId = insertSuggestion();
+
+        int cat = rawInsertDecision("CATEGORY_REQUEST_REJECTED", categoryId, null, null,
+                "CATEGORY_REQUEST_REJECTED:" + categoryId);
+        int sug = rawInsertDecision("SERVICE_TYPE_SUGGESTION_REJECTED", null, suggestionId, null,
+                "SERVICE_TYPE_SUGGESTION_REJECTED:" + suggestionId);
+
+        assertThat(cat).isEqualTo(1);
+        assertThat(sug).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("V196 — an existing booking type without booking or appointment is STILL rejected")
+    void should_stillRejectBookingType_when_noBookingOrAppointment() {
+        assertThatThrownBy(() -> rawInsertDecision("BOOKING_CREATED", null, null, null,
+                "BOOKING_CREATED:" + UUID.randomUUID())).isInstanceOf(DataAccessException.class);
+    }
+
+    @Test
+    @DisplayName("V196 — deleting the request cascades its feed item away (shape CHECK stays satisfiable)")
+    void should_cascadeItem_when_requestDeleted() {
+        long categoryId = insertCategoryRequest("V196_CAT_E");
+        repository.insertRequestDecision("CATEGORY_REQUEST_APPROVED", client.getId(), categoryId, null,
+                "CATEGORY_REQUEST_APPROVED:" + categoryId);
+
+        jdbcTemplate.update("DELETE FROM platform_categories WHERE id = ?", categoryId);
+
+        assertThat(countRows()).isZero();
+    }
+
+    @Test
+    @DisplayName("V196 — decision_reason accepts 300 chars and rejects 301 on both request tables")
+    void should_boundDecisionReasonAt300_when_v196() {
+        long categoryId = insertCategoryRequest("V196_CAT_F");
+        UUID suggestionId = insertSuggestion();
+
+        assertThat(jdbcTemplate.update("UPDATE platform_categories SET decision_reason = ? WHERE id = ?",
+                "ж".repeat(300), categoryId)).isEqualTo(1);
+        assertThat(jdbcTemplate.update("UPDATE service_type_suggestion SET decision_reason = ? WHERE id = ?",
+                "ж".repeat(300), suggestionId)).isEqualTo(1);
+        assertThatThrownBy(() -> jdbcTemplate.update("UPDATE platform_categories SET decision_reason = ? WHERE id = ?",
+                "ж".repeat(301), categoryId)).isInstanceOf(DataAccessException.class);
+        assertThatThrownBy(() -> jdbcTemplate.update("UPDATE service_type_suggestion SET decision_reason = ? WHERE id = ?",
+                "ж".repeat(301), suggestionId)).isInstanceOf(DataAccessException.class);
     }
 
     // ── FK cascades ─────────────────────────────────────────────────────────
@@ -473,7 +679,8 @@ class InAppNotificationRepositoryIT extends AbstractDataJpaTest {
     }
 
     @ParameterizedTest
-    @EnumSource(value = InAppNotificationType.class, names = "INVITE_ACCEPTED", mode = EnumSource.Mode.EXCLUDE)
+    @EnumSource(value = InAppNotificationType.class, mode = EnumSource.Mode.EXCLUDE, names = {"INVITE_ACCEPTED",
+            "CATEGORY_REQUEST_APPROVED", "CATEGORY_REQUEST_REJECTED", "SERVICE_TYPE_SUGGESTION_APPROVED", "SERVICE_TYPE_SUGGESTION_REJECTED"})
     @DisplayName("in_app_notification_shape_chk — booking_id alone satisfies every booking/review type")
     void should_acceptWithBookingIdOnly_when_rawInsert(InAppNotificationType type) {
         int inserted = repository.insertIgnoringDuplicate(UUID.randomUUID(), client.getId(), type.name(),
@@ -1175,7 +1382,8 @@ class InAppNotificationRepositoryIT extends AbstractDataJpaTest {
     }
 
     @ParameterizedTest
-    @EnumSource(InAppNotificationType.class)
+    @EnumSource(value = InAppNotificationType.class, mode = EnumSource.Mode.EXCLUDE, names = {
+            "CATEGORY_REQUEST_APPROVED", "CATEGORY_REQUEST_REJECTED", "SERVICE_TYPE_SUGGESTION_APPROVED", "SERVICE_TYPE_SUGGESTION_REJECTED"})
     @DisplayName("insertForRecipientsWithPush writes exactly one INAPP_PUSH row per feed row, for every "
             + "type — aggregate_id is the feed row id, status PENDING, NO payload (ids only)")
     void should_writeOnePushRowPerFeedRow_when_insertForRecipientsWithPush(InAppNotificationType type) {

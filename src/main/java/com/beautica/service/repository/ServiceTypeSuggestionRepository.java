@@ -2,7 +2,9 @@ package com.beautica.service.repository;
 
 import com.beautica.service.entity.ServiceTypeSuggestion;
 import com.beautica.service.entity.ServiceTypeSuggestionStatus;
+import jakarta.persistence.LockModeType;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Lock;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
@@ -21,6 +23,14 @@ public interface ServiceTypeSuggestionRepository extends JpaRepository<ServiceTy
      * Returns at most one row — token_hash is effectively unique while PENDING.
      */
     Optional<ServiceTypeSuggestion> findByTokenHash(String tokenHash);
+
+    /**
+     * Locking variant ({@code FOR UPDATE}) for the decision (write) path only, so concurrent approve/reject
+     * on one token serialize. The read-only review page keeps {@link #findByTokenHash}.
+     */
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("select s from ServiceTypeSuggestion s where s.tokenHash = :tokenHash")
+    Optional<ServiceTypeSuggestion> findByTokenHashForUpdate(@Param("tokenHash") String tokenHash);
 
     /**
      * Dedup guard: returns {@code true} when a PENDING suggestion already exists for

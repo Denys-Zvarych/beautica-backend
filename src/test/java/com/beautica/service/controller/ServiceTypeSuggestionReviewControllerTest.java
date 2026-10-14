@@ -20,7 +20,9 @@ import org.springframework.security.config.http.SessionCreationPolicy;
 import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.test.web.servlet.MockMvc;
 
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -95,7 +97,7 @@ class ServiceTypeSuggestionReviewControllerTest {
 
         // Critical: GET must NOT mutate state — email-scanner pre-fetch must not approve.
         verify(suggestionService, never()).approve(anyString());
-        verify(suggestionService, never()).reject(anyString());
+        verify(suggestionService, never()).reject(anyString(), any());
     }
 
     @Test
@@ -111,7 +113,7 @@ class ServiceTypeSuggestionReviewControllerTest {
                         org.hamcrest.Matchers.containsString("Балаяж"))));
 
         verify(suggestionService, never()).approve(anyString());
-        verify(suggestionService, never()).reject(anyString());
+        verify(suggestionService, never()).reject(anyString(), any());
     }
 
     @Test
@@ -160,13 +162,13 @@ class ServiceTypeSuggestionReviewControllerTest {
                 .andExpect(header().string("Referrer-Policy", "same-origin"));
 
         verify(suggestionService).approve(eq("good-token"));
-        verify(suggestionService, never()).reject(anyString());
+        verify(suggestionService, never()).reject(anyString(), any());
     }
 
     @Test
     @DisplayName("should_invokeRejectAndRenderRejectedPage_when_rejectPosted")
     void should_invokeRejectAndRenderRejectedPage_when_rejectPosted() throws Exception {
-        when(suggestionService.reject("good-token")).thenReturn(DecisionOutcome.REJECTED);
+        when(suggestionService.reject(eq("good-token"), isNull())).thenReturn(DecisionOutcome.REJECTED);
 
         mockMvc.perform(post(REJECT).with(csrf()).param("token", "good-token"))
                 .andExpect(status().isOk())
@@ -174,7 +176,7 @@ class ServiceTypeSuggestionReviewControllerTest {
                         org.hamcrest.Matchers.containsString("no-store")))
                 .andExpect(header().string("Referrer-Policy", "same-origin"));
 
-        verify(suggestionService).reject(eq("good-token"));
+        verify(suggestionService).reject(eq("good-token"), isNull());
         verify(suggestionService, never()).approve(anyString());
     }
 
@@ -223,5 +225,88 @@ class ServiceTypeSuggestionReviewControllerTest {
                 .andExpect(status().isBadRequest());
 
         verify(suggestionService, never()).approve(anyString());
+    }
+
+    // ── phase 372: optional reject reason ──────────────────────────────────────
+
+    @Test
+    @DisplayName("POST reject (suggestion) — the reason reaches the service trimmed")
+    void should_passTrimmedReasonToService_when_rejectPostedWithReason() throws Exception {
+        when(suggestionService.reject(eq("good-token"), eq("не підходить"))).thenReturn(DecisionOutcome.REJECTED);
+
+        mockMvc.perform(post(REJECT).with(csrf()).param("token", "good-token")
+                        .param("reason", "  не підходить \n "))
+                .andExpect(status().isOk())
+                .andExpect(content().string(org.hamcrest.Matchers.containsString("Причина: не підходить")));
+
+        verify(suggestionService).reject("good-token", "не підходить");
+    }
+
+    @Test
+    @DisplayName("POST reject (suggestion) — a blank reason reaches the service as null")
+    void should_passNullReason_when_reasonBlank() throws Exception {
+        when(suggestionService.reject(eq("good-token"), isNull())).thenReturn(DecisionOutcome.REJECTED);
+
+        mockMvc.perform(post(REJECT).with(csrf()).param("token", "good-token").param("reason", "  \t\n "))
+                .andExpect(status().isOk())
+                .andExpect(content().string(org.hamcrest.Matchers.not(org.hamcrest.Matchers.containsString("Причина"))));
+
+        verify(suggestionService).reject("good-token", null);
+    }
+
+    @Test
+    @DisplayName("POST reject (suggestion) — a 301-char reason renders the neutral page and never calls the service")
+    void should_renderNeutralPageAndNotDecide_when_reasonExceeds300() throws Exception {
+        mockMvc.perform(post(REJECT).with(csrf()).param("token", "good-token").param("reason", "ж".repeat(301)))
+                .andExpect(status().isOk())
+                .andExpect(content().string(org.hamcrest.Matchers.containsString("Посилання недоступне")));
+
+        verify(suggestionService, never()).reject(anyString(), any());
+        verify(suggestionService, never()).reject(anyString());
+    }
+
+    @Test
+    @DisplayName("POST reject (suggestion) — a reason of exactly 300 chars is accepted")
+    void should_acceptReasonOfExactly300() throws Exception {
+        String reason = "ж".repeat(300);
+        when(suggestionService.reject(eq("good-token"), eq(reason))).thenReturn(DecisionOutcome.REJECTED);
+
+        mockMvc.perform(post(REJECT).with(csrf()).param("token", "good-token").param("reason", reason))
+                .andExpect(status().isOk());
+
+        verify(suggestionService).reject("good-token", reason);
+    }
+
+    @Test
+    @DisplayName("POST reject (suggestion) — control characters are stripped before the service sees the reason")
+    void should_stripControlCharacters_when_reasonContainsThem() throws Exception {
+        when(suggestionService.reject(eq("good-token"), eq("abcd ef"))).thenReturn(DecisionOutcome.REJECTED);
+
+        mockMvc.perform(post(REJECT).with(csrf()).param("token", "good-token")
+                        .param("reason", "a\u0000b\u0007c\u202Ed\r\nef"))
+                .andExpect(status().isOk());
+
+        verify(suggestionService).reject("good-token", "abcd ef");
+    }
+
+    @Test
+    @DisplayName("POST reject (suggestion) — a <script> reason is HTML-escaped on the result page")
+    void should_htmlEscapeReasonInResultPage_when_reasonContainsMarkup() throws Exception {
+        String markup = "<script>alert(1)</script>";
+        when(suggestionService.reject(eq("good-token"), eq(markup))).thenReturn(DecisionOutcome.REJECTED);
+
+        mockMvc.perform(post(REJECT).with(csrf()).param("token", "good-token").param("reason", markup))
+                .andExpect(status().isOk())
+                .andExpect(content().string(org.hamcrest.Matchers.containsString("&lt;script&gt;alert(1)&lt;/script&gt;")))
+                .andExpect(content().string(org.hamcrest.Matchers.not(org.hamcrest.Matchers.containsString("<script>alert"))));
+    }
+
+    @Test
+    @DisplayName("POST reject (suggestion) — the reason is not echoed when the outcome is not REJECTED")
+    void should_notEchoReason_when_decisionIsNotRejected() throws Exception {
+        when(suggestionService.reject(eq("good-token"), eq("r"))).thenReturn(DecisionOutcome.ALREADY_DECIDED);
+
+        mockMvc.perform(post(REJECT).with(csrf()).param("token", "good-token").param("reason", "r"))
+                .andExpect(content().string(org.hamcrest.Matchers.not(org.hamcrest.Matchers.containsString("Причина"))));
     }
 }

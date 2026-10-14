@@ -21,5 +21,11 @@ public enum InAppNotificationType {
     BOOKING_CANCELLED_SALON_CLOSED,
     BOOKING_CANCELLED_MASTER_REMOVED,
     REVIEW_RECEIVED,
-    INVITE_ACCEPTED
+    INVITE_ACCEPTED,
+    /** Phase 372 — requester-only; linked via {@code category_request_id}. */
+    CATEGORY_REQUEST_APPROVED,
+    CATEGORY_REQUEST_REJECTED,
+    /** Phase 372 — requester-only; linked via {@code service_type_suggestion_id}. */
+    SERVICE_TYPE_SUGGESTION_APPROVED,
+    SERVICE_TYPE_SUGGESTION_REJECTED
 }
