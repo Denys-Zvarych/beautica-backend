@@ -1,6 +1,7 @@
 package com.beautica.config;
 
 import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Pattern;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.validation.annotation.Validated;
 
@@ -18,6 +19,7 @@ import org.springframework.validation.annotation.Validated;
 public class PublicBaseUrlProperties {
 
     @NotBlank
+    @Pattern(regexp = "^https?://[^/?#\\s]+$")
     private String publicBaseUrl;
 
     public String getPublicBaseUrl() {

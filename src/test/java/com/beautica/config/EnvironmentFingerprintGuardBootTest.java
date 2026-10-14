@@ -38,7 +38,8 @@ class EnvironmentFingerprintGuardBootTest {
                 .profiles("prod", "staging")
                 .listeners(recorder)
                 .run("--beautica.sms.mode=turbosms", "--server.port=0", "--spring.main.banner-mode=off",
-                        "--JWT_SECRET=x", "--FRONTEND_BASE_URL=https://x.invalid"));
+                        "--JWT_SECRET=x", "--FRONTEND_BASE_URL=https://x.invalid",
+                        "--PUBLIC_BASE_URL=https://api.staging.beautica.test", "--SUPPORT_EMAIL=support@test.invalid"));
 
         assertThat(thrown).isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("staging-sms-mode").hasMessageContaining("beautica.sms.mode");
@@ -60,7 +61,8 @@ class EnvironmentFingerprintGuardBootTest {
                 .profiles("prod")
                 .listeners(recorder)
                 .run("--beautica.sms.mode=capture", "--server.port=0", "--spring.main.banner-mode=off",
-                        "--JWT_SECRET=x", "--FRONTEND_BASE_URL=https://x.invalid"));
+                        "--JWT_SECRET=x", "--FRONTEND_BASE_URL=https://app.beautica.ua",
+                        "--PUBLIC_BASE_URL=https://api.beautica.ua", "--SUPPORT_EMAIL=help@beautica.ua"));
 
         assertThat(thrown).isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("prod-sms-mode").hasMessageContaining("beautica.sms.mode");
@@ -74,7 +76,8 @@ class EnvironmentFingerprintGuardBootTest {
                 .web(WebApplicationType.SERVLET)
                 .profiles("prod")
                 .run("--RAILWAY_ENVIRONMENT_NAME=staging", "--server.port=0", "--spring.main.banner-mode=off",
-                        "--JWT_SECRET=x", "--FRONTEND_BASE_URL=https://x.invalid"));
+                        "--JWT_SECRET=x", "--FRONTEND_BASE_URL=https://app.beautica.ua",
+                        "--PUBLIC_BASE_URL=https://api.beautica.ua", "--SUPPORT_EMAIL=help@beautica.ua"));
 
         assertThat(thrown).isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("railway-environment-name").hasMessageContaining("RAILWAY_ENVIRONMENT_NAME");

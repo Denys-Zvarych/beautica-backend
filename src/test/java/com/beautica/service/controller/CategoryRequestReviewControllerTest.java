@@ -67,14 +67,14 @@ class CategoryRequestReviewControllerTest {
                 .andExpect(status().isOk())
                 .andExpect(content().string(org.hamcrest.Matchers.containsString("NAIL_ART")))
                 // Token rides in the URL path → no-store stops cache retention,
-                // no-referrer stops the token leaking via a later cross-origin Referer.
+                // same-origin stops the token leaking via a later cross-origin Referer.
                 .andExpect(header().string("Cache-Control",
                         org.hamcrest.Matchers.containsString("no-store")))
                 .andExpect(header().string("Cache-Control",
                         org.hamcrest.Matchers.containsString("no-cache")))
                 .andExpect(header().string("Cache-Control",
                         org.hamcrest.Matchers.containsString("must-revalidate")))
-                .andExpect(header().string("Referrer-Policy", "no-referrer"));
+                .andExpect(header().string("Referrer-Policy", "same-origin"));
 
         // Critical: GET must NOT mutate state.
         verify(categoryRequestService, never()).approve(anyString());
@@ -89,6 +89,7 @@ class CategoryRequestReviewControllerTest {
 
         mockMvc.perform(get("/api/v1/service-categories/requests/review/{token}", "bad-token"))
                 .andExpect(status().isOk())
+                .andExpect(header().string("Referrer-Policy", "same-origin"))
                 .andExpect(content().string(org.hamcrest.Matchers.not(
                         org.hamcrest.Matchers.containsString("NAIL_ART"))));
     }
@@ -114,7 +115,7 @@ class CategoryRequestReviewControllerTest {
                 .andExpect(status().isOk())
                 .andExpect(header().string("Cache-Control",
                         org.hamcrest.Matchers.containsString("no-store")))
-                .andExpect(header().string("Referrer-Policy", "no-referrer"));
+                .andExpect(header().string("Referrer-Policy", "same-origin"));
 
         verify(categoryRequestService).approve(eq("good-token"));
     }
@@ -129,7 +130,7 @@ class CategoryRequestReviewControllerTest {
                 .andExpect(status().isOk())
                 .andExpect(header().string("Cache-Control",
                         org.hamcrest.Matchers.containsString("no-store")))
-                .andExpect(header().string("Referrer-Policy", "no-referrer"));
+                .andExpect(header().string("Referrer-Policy", "same-origin"));
 
         verify(categoryRequestService).reject(eq("good-token"));
     }
@@ -141,6 +142,7 @@ class CategoryRequestReviewControllerTest {
 
         mockMvc.perform(post("/api/v1/service-categories/requests/approve")
                         .with(csrf()).param("token", "stale-token"))
-                .andExpect(status().isOk());
+                .andExpect(status().isOk())
+                .andExpect(header().string("Referrer-Policy", "same-origin"));
     }
 }

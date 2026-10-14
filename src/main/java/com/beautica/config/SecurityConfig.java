@@ -42,11 +42,19 @@ public class SecurityConfig {
 
     private static final Logger log = LoggerFactory.getLogger(SecurityConfig.class);
 
+    /** Same-origin POSTs from the server-rendered admin review pages; see {@link #corsConfigurationSource()}. */
+    private static final List<String> REVIEW_POST_PATHS = List.of(
+            "/api/v1/service-categories/requests/approve",
+            "/api/v1/service-categories/requests/reject",
+            "/api/v1/service-types/suggestions/approve",
+            "/api/v1/service-types/suggestions/reject");
+
     private final JwtAuthenticationFilter jwtAuthenticationFilter;
     private final AuthRateLimitFilter authRateLimitFilter;
     private final BookingRateLimitFilter bookingRateLimitFilter;
     private final InternalApiKeyFilter internalApiKeyFilter;
     private final Environment environment;
+    private final PublicBaseUrlProperties publicBaseUrlProperties;
 
     @Value("${app.frontend.base-url}")
     private String frontendBaseUrl;
@@ -55,7 +63,9 @@ public class SecurityConfig {
                           AuthRateLimitFilter authRateLimitFilter,
                           BookingRateLimitFilter bookingRateLimitFilter,
                           InternalApiKeyFilter internalApiKeyFilter,
-                          Environment environment) {
+                          Environment environment,
+                          PublicBaseUrlProperties publicBaseUrlProperties) {
+        this.publicBaseUrlProperties = publicBaseUrlProperties;
         this.jwtAuthenticationFilter = jwtAuthenticationFilter;
         this.authRateLimitFilter = authRateLimitFilter;
         this.bookingRateLimitFilter = bookingRateLimitFilter;
@@ -291,6 +301,17 @@ public class SecurityConfig {
         config.setAllowCredentials(false);
         config.setMaxAge(3600L);
         UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
+        // Registered BEFORE "/**": UrlBasedCorsConfigurationSource uses the first matching pattern.
+        // The server-rendered admin review pages post to a relative path, so the browser sends
+        // Origin = this API's own public origin. Behind Railway's TLS proxy the app sees http
+        // (forward-headers-strategy is deliberately unset), so CorsUtils treats it as cross-origin.
+        CorsConfiguration reviewPost = new CorsConfiguration();
+        reviewPost.setAllowedOrigins(List.of(publicBaseUrlProperties.getPublicBaseUrl(), frontendBaseUrl));
+        reviewPost.setAllowedMethods(List.of("POST"));
+        reviewPost.setAllowCredentials(false);
+        for (String path : REVIEW_POST_PATHS) {
+            source.registerCorsConfiguration(path, reviewPost);
+        }
         source.registerCorsConfiguration("/**", config);
         return source;
     }
