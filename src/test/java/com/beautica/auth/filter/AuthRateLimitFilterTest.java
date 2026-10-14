@@ -2,6 +2,7 @@ package com.beautica.auth.filter;
 
 import com.github.benmanes.caffeine.cache.LoadingCache;
 import io.github.bucket4j.Bucket;
+import io.github.bucket4j.ConsumptionProbe;
 import jakarta.servlet.ServletException;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -30,6 +31,10 @@ import static org.mockito.Mockito.when;
 class AuthRateLimitFilterTest {
 
     private static final Logger log = LoggerFactory.getLogger(AuthRateLimitFilterTest.class);
+
+    private static final ConsumptionProbe ALLOW = ConsumptionProbe.consumed(1, 0);
+    // Rejected with no usable refill hint: the filter falls back to the per-bucket window constant.
+    private static final ConsumptionProbe DENY = ConsumptionProbe.rejected(0, 0, 0);
 
     private static final String REMOTE_ADDR = "10.0.0.1";
 
@@ -131,7 +136,7 @@ class AuthRateLimitFilterTest {
         void should_passThrough_when_loginBucketHasTokens() throws Exception {
             log.debug("Arrange: loginBuckets returns bucket that allows consumption");
             when(loginBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(true);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(ALLOW);
 
             var request  = postRequest("/api/v1/auth/login");
             var response = new MockHttpServletResponse();
@@ -153,7 +158,7 @@ class AuthRateLimitFilterTest {
         void should_return429_when_loginBucketExhausted() throws Exception {
             log.debug("Arrange: loginBuckets returns bucket that denies consumption");
             when(loginBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(false);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(DENY);
 
             var request  = postRequest("/api/v1/auth/login");
             var response = new MockHttpServletResponse();
@@ -186,7 +191,7 @@ class AuthRateLimitFilterTest {
         void should_passThrough_when_refreshBucketHasTokens() throws Exception {
             log.debug("Arrange: refreshBuckets returns bucket that allows consumption");
             when(refreshBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(true);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(ALLOW);
 
             var request  = postRequest("/api/v1/auth/refresh");
             var response = new MockHttpServletResponse();
@@ -208,7 +213,7 @@ class AuthRateLimitFilterTest {
         void should_return429_when_refreshBucketExhausted() throws Exception {
             log.debug("Arrange: refreshBuckets returns bucket that denies consumption");
             when(refreshBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(false);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(DENY);
 
             var request  = postRequest("/api/v1/auth/refresh");
             var response = new MockHttpServletResponse();
@@ -242,7 +247,7 @@ class AuthRateLimitFilterTest {
         void should_routeToDeviceTokenBuckets_when_postDevicesToken() throws Exception {
             log.debug("Arrange: deviceTokenBuckets returns bucket that allows consumption");
             when(deviceTokenBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(true);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(ALLOW);
 
             var request  = postRequest("/api/v1/devices/token");
             var response = new MockHttpServletResponse();
@@ -266,7 +271,7 @@ class AuthRateLimitFilterTest {
         void should_routeToDeviceTokenBuckets_when_deleteDevicesToken() throws Exception {
             log.debug("Arrange: deviceTokenBuckets returns bucket that allows consumption");
             when(deviceTokenBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(true);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(ALLOW);
 
             var request  = deleteRequest("/api/v1/devices/token");
             var response = new MockHttpServletResponse();
@@ -296,7 +301,7 @@ class AuthRateLimitFilterTest {
         void should_routeToMediaUploadBuckets_when_postMediaAvatar() throws Exception {
             log.debug("Arrange: mediaUploadBuckets returns bucket that allows consumption");
             when(mediaUploadBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(true);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(ALLOW);
 
             var request  = postRequest("/api/v1/media/avatar");
             var response = new MockHttpServletResponse();
@@ -321,7 +326,7 @@ class AuthRateLimitFilterTest {
         void should_routeToMediaUploadBuckets_when_deleteMediaPortfolio() throws Exception {
             log.debug("Arrange: mediaUploadBuckets returns bucket that allows consumption");
             when(mediaUploadBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(true);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(ALLOW);
 
             var request  = deleteRequest("/api/v1/media/portfolio/" + java.util.UUID.randomUUID());
             var response = new MockHttpServletResponse();
@@ -345,7 +350,7 @@ class AuthRateLimitFilterTest {
         @DisplayName("Phase 343: POST and DELETE /api/v1/salons/{id}/media/{slot} route to mediaUploadBuckets")
         void should_routeToMediaUploadBuckets_when_salonImagePostOrDelete() throws Exception {
             when(mediaUploadBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(true);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(ALLOW);
             String path = "/api/v1/salons/" + java.util.UUID.randomUUID() + "/media/cover";
 
             doFilter(postRequest(path), new MockHttpServletResponse(), new MockFilterChain());
@@ -360,7 +365,7 @@ class AuthRateLimitFilterTest {
         @DisplayName("Phase 362: POST /salons/{id}/portfolio and DELETE /salons/{id}/portfolio/{mediaId} route to mediaUploadBuckets")
         void should_routeToMediaUploadBuckets_when_salonPortfolioPostOrDelete() throws Exception {
             when(mediaUploadBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(true);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(ALLOW);
             String base = "/api/v1/salons/" + java.util.UUID.randomUUID() + "/portfolio";
 
             doFilter(postRequest(base), new MockHttpServletResponse(), new MockFilterChain());
@@ -407,7 +412,7 @@ class AuthRateLimitFilterTest {
         @DisplayName("Phase 342: POST /api/v1/services/{id}/photo returns 429 when mediaUploadBuckets is exhausted")
         void should_return429_when_servicePhotoUploadExceedsBucket() throws Exception {
             when(mediaUploadBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(false);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(DENY);
             var response = new MockHttpServletResponse();
             var chain    = new MockFilterChain();
 
@@ -426,7 +431,7 @@ class AuthRateLimitFilterTest {
         @DisplayName("Phase 342: DELETE /api/v1/services/{id}/photo routes to mediaUploadBuckets, not serviceWriteBuckets")
         void should_routeToMediaUploadBuckets_when_deleteServicePhoto() throws Exception {
             when(mediaUploadBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(true);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(ALLOW);
             var chain = new MockFilterChain();
 
             doFilter(deleteRequest("/api/v1/services/" + java.util.UUID.randomUUID() + "/photo"),
@@ -441,7 +446,7 @@ class AuthRateLimitFilterTest {
         @DisplayName("Phase 342: PATCH/DELETE /api/v1/services/{id} stay on serviceWriteBuckets")
         void should_routeToServiceWriteBuckets_when_serviceDefMutateWithoutPhoto() throws Exception {
             when(serviceWriteBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(true);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(ALLOW);
             String path = "/api/v1/services/" + java.util.UUID.randomUUID();
             var patch = new MockHttpServletRequest("PATCH", path);
             patch.setRemoteAddr(REMOTE_ADDR);
@@ -467,7 +472,7 @@ class AuthRateLimitFilterTest {
         @DisplayName("Phase 342: encoded / trailing-slash / matrix / dot-segment spellings cannot bypass the media bucket")
         void should_return429_when_servicePhotoPathVariantExceedsBucket(String template) throws Exception {
             when(mediaUploadBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(false);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(DENY);
             var response = new MockHttpServletResponse();
             var chain    = new MockFilterChain();
 
@@ -575,7 +580,7 @@ class AuthRateLimitFilterTest {
         void should_passThrough_when_registerBucketHasTokens() throws Exception {
             log.debug("Arrange: registerBuckets returns bucket that allows consumption");
             when(registerBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(true);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(ALLOW);
 
             var request  = postRequest("/api/v1/auth/register");
             var response = new MockHttpServletResponse();
@@ -598,7 +603,7 @@ class AuthRateLimitFilterTest {
         void should_return429_when_registerCalledMoreThanCapacity() throws Exception {
             log.debug("Arrange: registerBuckets returns bucket that denies consumption");
             when(registerBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(false);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(DENY);
 
             var request  = postRequest("/api/v1/auth/register");
             var response = new MockHttpServletResponse();
@@ -625,7 +630,7 @@ class AuthRateLimitFilterTest {
         void should_return429_when_independentMasterRegisterCalledMoreThanCapacity() throws Exception {
             log.debug("Arrange: registerBuckets returns bucket that denies consumption for IM path");
             when(registerBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(false);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(DENY);
 
             var request  = postRequest("/api/v1/auth/register/independent-master");
             var response = new MockHttpServletResponse();
@@ -657,7 +662,7 @@ class AuthRateLimitFilterTest {
         void should_useRemoteAddr_when_xForwardedForAbsent() throws Exception {
             log.debug("Arrange: no XFF header — filter must fall back to getRemoteAddr");
             when(loginBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(true);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(ALLOW);
 
             var request  = postRequest("/api/v1/auth/login");
             var response = new MockHttpServletResponse();
@@ -680,12 +685,12 @@ class AuthRateLimitFilterTest {
             // cannot get a fresh bucket because the filter always keys on the rightmost (proxy-set) IP.
             log.debug("Arrange: bucket keyed on rightmost XFF entry {}", CLIENT_IP);
             when(loginBuckets.get(CLIENT_IP)).thenReturn(bucket);
-            when(bucket.tryConsume(1))
-                    .thenReturn(true)
-                    .thenReturn(true)
-                    .thenReturn(true)
-                    .thenReturn(true)
-                    .thenReturn(false);
+            when(bucket.tryConsumeAndReturnRemaining(1))
+                    .thenReturn(ALLOW)
+                    .thenReturn(ALLOW)
+                    .thenReturn(ALLOW)
+                    .thenReturn(ALLOW)
+                    .thenReturn(DENY);
 
             String[] rotatingLeftEntries = {
                 "fake1", "fake2", "fake3", "fake4", "fake5"
@@ -719,7 +724,7 @@ class AuthRateLimitFilterTest {
             log.debug("Arrange: second request uses a different leftmost (spoofed) XFF entry but identical rightmost ({})", CLIENT_IP);
             when(loginBuckets.get(CLIENT_IP)).thenReturn(bucket);
             // First request exhausts the bucket; second request is denied.
-            when(bucket.tryConsume(1)).thenReturn(true).thenReturn(false);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(ALLOW).thenReturn(DENY);
 
             var firstRequest = postRequest("/api/v1/auth/login");
             firstRequest.addHeader("X-Forwarded-For", "spoofed1, " + CLIENT_IP);
@@ -748,7 +753,7 @@ class AuthRateLimitFilterTest {
             log.debug("Arrange: a fresh bucket for a different rightmost XFF IP ({})", DIFFERENT_IP);
             Bucket differentBucket = org.mockito.Mockito.mock(Bucket.class);
             when(loginBuckets.get(DIFFERENT_IP)).thenReturn(differentBucket);
-            when(differentBucket.tryConsume(1)).thenReturn(true);
+            when(differentBucket.tryConsumeAndReturnRemaining(1)).thenReturn(ALLOW);
 
             var request  = postRequest("/api/v1/auth/login");
             request.addHeader("X-Forwarded-For", "1.2.3.4, " + DIFFERENT_IP);
@@ -776,13 +781,13 @@ class AuthRateLimitFilterTest {
             // REMOTE_ADDR is used only when ALL segments are blank.
             log.debug("Arrange: XFF has trailing whitespace-only segment; first non-blank from right is {}", CLIENT_IP);
             when(loginBuckets.get(CLIENT_IP)).thenReturn(bucket);
-            when(bucket.tryConsume(1))
-                    .thenReturn(true)
-                    .thenReturn(true)
-                    .thenReturn(true)
-                    .thenReturn(true)
-                    .thenReturn(true)
-                    .thenReturn(false);
+            when(bucket.tryConsumeAndReturnRemaining(1))
+                    .thenReturn(ALLOW)
+                    .thenReturn(ALLOW)
+                    .thenReturn(ALLOW)
+                    .thenReturn(ALLOW)
+                    .thenReturn(ALLOW)
+                    .thenReturn(DENY);
 
             // Exhaust the bucket using requests with the whitespace-trailing header.
             for (int i = 0; i < 5; i++) {
@@ -814,7 +819,7 @@ class AuthRateLimitFilterTest {
             // A request with a genuinely different remote addr is NOT rate-limited.
             Bucket freshBucket = org.mockito.Mockito.mock(Bucket.class);
             when(loginBuckets.get(DIFFERENT_IP)).thenReturn(freshBucket);
-            when(freshBucket.tryConsume(1)).thenReturn(true);
+            when(freshBucket.tryConsumeAndReturnRemaining(1)).thenReturn(ALLOW);
 
             var differentRequest = new MockHttpServletRequest("POST", "/api/v1/auth/login");
             differentRequest.setRemoteAddr(DIFFERENT_IP);
@@ -836,7 +841,7 @@ class AuthRateLimitFilterTest {
         void should_fallBackToRemoteAddr_when_xffHeaderIsEmpty() throws Exception {
             log.debug("Arrange: XFF header present but value is empty string; must fall back to REMOTE_ADDR ({})", REMOTE_ADDR);
             when(loginBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(true);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(ALLOW);
 
             var request = postRequest("/api/v1/auth/login");
             request.addHeader("X-Forwarded-For", "");
@@ -860,10 +865,10 @@ class AuthRateLimitFilterTest {
         void should_useXffEntry_when_xffContainsSingleEntry() throws Exception {
             log.debug("Arrange: XFF header with single entry {} — no comma", CLIENT_IP);
             when(loginBuckets.get(CLIENT_IP)).thenReturn(bucket);
-            when(bucket.tryConsume(1))
-                    .thenReturn(true)
-                    .thenReturn(true)
-                    .thenReturn(false);
+            when(bucket.tryConsumeAndReturnRemaining(1))
+                    .thenReturn(ALLOW)
+                    .thenReturn(ALLOW)
+                    .thenReturn(DENY);
 
             // Two requests from the same single-entry XFF share the same bucket.
             var first = postRequest("/api/v1/auth/login");
@@ -893,7 +898,7 @@ class AuthRateLimitFilterTest {
             // A different single-entry XFF maps to a different (fresh) bucket.
             Bucket freshBucket = org.mockito.Mockito.mock(Bucket.class);
             when(loginBuckets.get(DIFFERENT_IP)).thenReturn(freshBucket);
-            when(freshBucket.tryConsume(1)).thenReturn(true);
+            when(freshBucket.tryConsumeAndReturnRemaining(1)).thenReturn(ALLOW);
 
             var differentRequest = postRequest("/api/v1/auth/login");
             differentRequest.addHeader("X-Forwarded-For", DIFFERENT_IP);
@@ -915,7 +920,7 @@ class AuthRateLimitFilterTest {
             String realClientIp = "1.2.3.4";
             log.debug("Arrange: XFF = '{}, {}' — rightmost entry is the real client IP", ipv6, realClientIp);
             when(loginBuckets.get(realClientIp)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(true);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(ALLOW);
 
             var request = postRequest("/api/v1/auth/login");
             request.addHeader("X-Forwarded-For", ipv6 + ", " + realClientIp);
@@ -943,7 +948,7 @@ class AuthRateLimitFilterTest {
             log.debug("Arrange: XFF rightmost entry is exactly {} chars — must be used as bucket key, not REMOTE_ADDR",
                     exactly45Chars.length());
             when(loginBuckets.get(exactly45Chars)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(true);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(ALLOW);
 
             var request = postRequest("/api/v1/auth/login");
             request.addHeader("X-Forwarded-For", exactly45Chars);
@@ -971,7 +976,7 @@ class AuthRateLimitFilterTest {
             log.debug("Arrange: XFF rightmost entry is {} chars (> 45 max) — must fall back to REMOTE_ADDR ({})",
                     oversizedIp.length(), REMOTE_ADDR);
             when(loginBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(true);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(ALLOW);
 
             var request = postRequest("/api/v1/auth/login");
             request.addHeader("X-Forwarded-For", oversizedIp);
@@ -1001,8 +1006,8 @@ class AuthRateLimitFilterTest {
             Bucket secondBucket = org.mockito.Mockito.mock(Bucket.class);
             when(loginBuckets.get(firstIp)).thenReturn(firstBucket);
             when(loginBuckets.get(secondIp)).thenReturn(secondBucket);
-            when(firstBucket.tryConsume(1)).thenReturn(true);
-            when(secondBucket.tryConsume(1)).thenReturn(true);
+            when(firstBucket.tryConsumeAndReturnRemaining(1)).thenReturn(ALLOW);
+            when(secondBucket.tryConsumeAndReturnRemaining(1)).thenReturn(ALLOW);
 
             var firstRequest = new MockHttpServletRequest("POST", "/api/v1/auth/login");
             firstRequest.setRemoteAddr(firstIp);
@@ -1034,7 +1039,7 @@ class AuthRateLimitFilterTest {
             // rightmost entry is CLIENT_IP (appended by Railway's proxy)
             log.debug("Arrange: refresh bucket keyed on rightmost XFF entry {} is exhausted", CLIENT_IP);
             when(refreshBuckets.get(CLIENT_IP)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(false);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(DENY);
 
             var request = postRequest("/api/v1/auth/refresh");
             request.addHeader("X-Forwarded-For", "spoofed-ip, " + CLIENT_IP);
@@ -1064,13 +1069,13 @@ class AuthRateLimitFilterTest {
             String realClientIp = "real-client-ip";
             log.debug("Arrange: bucket keyed on rightmost (real) XFF entry {}", realClientIp);
             when(loginBuckets.get(realClientIp)).thenReturn(bucket);
-            when(bucket.tryConsume(1))
-                    .thenReturn(true)
-                    .thenReturn(true)
-                    .thenReturn(true)
-                    .thenReturn(true)
-                    .thenReturn(true)
-                    .thenReturn(false);
+            when(bucket.tryConsumeAndReturnRemaining(1))
+                    .thenReturn(ALLOW)
+                    .thenReturn(ALLOW)
+                    .thenReturn(ALLOW)
+                    .thenReturn(ALLOW)
+                    .thenReturn(ALLOW)
+                    .thenReturn(DENY);
 
             MockHttpServletResponse lastResponse = null;
             MockFilterChain lastChain = null;
@@ -1102,7 +1107,7 @@ class AuthRateLimitFilterTest {
             // getRemoteAddr() as the bucket key.
             log.debug("Arrange: XFF = '  ,   ,  ' — all segments whitespace; filter must fall back to REMOTE_ADDR ({})", REMOTE_ADDR);
             when(loginBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(true);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(ALLOW);
 
             var request = postRequest("/api/v1/auth/login");
             request.addHeader("X-Forwarded-For", "  ,   ,  ");
@@ -1133,7 +1138,7 @@ class AuthRateLimitFilterTest {
         void should_passThrough_when_verifyEmailBucketHasTokens() throws Exception {
             log.debug("Arrange: verifyEmailBuckets returns bucket that allows consumption");
             when(verifyEmailBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(true);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(ALLOW);
 
             var request  = postRequest("/api/v1/auth/verify-email");
             var response = new MockHttpServletResponse();
@@ -1157,7 +1162,7 @@ class AuthRateLimitFilterTest {
         void should_return429_when_verifyEmailBucketExhausted() throws Exception {
             log.debug("Arrange: verifyEmailBuckets returns bucket that denies consumption");
             when(verifyEmailBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(false);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(DENY);
 
             var request  = postRequest("/api/v1/auth/verify-email");
             var response = new MockHttpServletResponse();
@@ -1180,6 +1185,108 @@ class AuthRateLimitFilterTest {
             verifyNoInteractions(registerBuckets);
             verifyNoInteractions(refreshBuckets);
         }
+
+        @Test
+        @DisplayName("Retry-After reflects the real time-to-refill (rounded up), not the 900 s window")
+        void should_sendRealRefillSeconds_when_verifyEmailBucketRefillsSoon() throws Exception {
+            when(verifyEmailBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
+            when(bucket.tryConsumeAndReturnRemaining(1))
+                    .thenReturn(ConsumptionProbe.rejected(0, 20_200_000_000L, 20_200_000_000L));
+            var response = new MockHttpServletResponse();
+
+            doFilter(postRequest("/api/v1/auth/verify-email"), response, new MockFilterChain());
+
+            assertThat(response.getStatus()).isEqualTo(429);
+            assertThat(response.getHeader("Retry-After")).isEqualTo("21");
+        }
+
+        @Test
+        @DisplayName("Retry-After is at least 1 s when the refill is sub-second")
+        void should_sendMinimumOneSecond_when_refillIsSubSecond() throws Exception {
+            when(verifyEmailBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
+            when(bucket.tryConsumeAndReturnRemaining(1))
+                    .thenReturn(ConsumptionProbe.rejected(0, 1_000_000L, 1_000_000L));
+            var response = new MockHttpServletResponse();
+
+            doFilter(postRequest("/api/v1/auth/verify-email"), response, new MockFilterChain());
+
+            assertThat(response.getHeader("Retry-After")).isEqualTo("1");
+        }
+
+        @Test
+        @DisplayName("computeRetryAfterSeconds — Long.MAX_VALUE (never refills) falls back to the window, no overflow")
+        void should_returnFallback_when_nanosIsLongMax() {
+            var probe = ConsumptionProbe.rejected(0, Long.MAX_VALUE, Long.MAX_VALUE);
+
+            assertThat(AuthRateLimitFilter.computeRetryAfterSeconds(probe, 900)).isEqualTo(900);
+        }
+
+        @Test
+        @DisplayName("computeRetryAfterSeconds — an exact whole second is not rounded up")
+        void should_returnExactSeconds_when_nanosOnSecondBoundary() {
+            assertThat(AuthRateLimitFilter.computeRetryAfterSeconds(
+                    ConsumptionProbe.rejected(0, 20_000_000_000L, 20_000_000_000L), 900)).isEqualTo(20);
+        }
+
+        @Test
+        @DisplayName("computeRetryAfterSeconds — one nanosecond past a whole second rounds UP")
+        void should_roundUp_when_nanosOneOverSecondBoundary() {
+            assertThat(AuthRateLimitFilter.computeRetryAfterSeconds(
+                    ConsumptionProbe.rejected(0, 20_000_000_001L, 20_000_000_001L), 900)).isEqualTo(21);
+        }
+
+        @Test
+        @DisplayName("computeRetryAfterSeconds — a huge finite refill is capped at one day")
+        void should_capAtOneDay_when_refillIsHuge() {
+            assertThat(AuthRateLimitFilter.computeRetryAfterSeconds(
+                    ConsumptionProbe.rejected(0, Long.MAX_VALUE - 1, Long.MAX_VALUE - 1), 900)).isEqualTo(86_400);
+        }
+
+        @Test
+        @DisplayName("computeRetryAfterSeconds — cap is raised to the window when the window exceeds one day")
+        void should_capAtFallback_when_fallbackExceedsOneDay() {
+            long hundredThousandSeconds = 100_000L * 1_000_000_000L;
+
+            assertThat(AuthRateLimitFilter.computeRetryAfterSeconds(
+                    ConsumptionProbe.rejected(0, hundredThousandSeconds, hundredThousandSeconds), 172_800))
+                    .as("100 000 s is below a 2-day window cap and must not be clipped to 86 400")
+                    .isEqualTo(100_000);
+        }
+
+        @Test
+        @DisplayName("real 10/15-min bucket: 11th verify-email 880 s into the window gets Retry-After 20, not 900")
+        void should_sendRemainingWindowSeconds_when_realVerifyEmailBucketExhaustedLateInWindow() throws Exception {
+            // Mirrors RateLimitConfig#verifyEmailBuckets (10 tokens, refillIntervally over 15 min) with a
+            // controllable clock, so the probe is Bucket4j's real computation rather than a stub.
+            long[] nowNanos = {0L};
+            io.github.bucket4j.TimeMeter clock = new io.github.bucket4j.TimeMeter() {
+                @Override public long currentTimeNanos() { return nowNanos[0]; }
+                @Override public boolean isWallClockBased() { return false; }
+            };
+            LoadingCache<String, Bucket> verifyEmail = com.github.benmanes.caffeine.cache.Caffeine.newBuilder()
+                    .build(key -> Bucket.builder()
+                            .withCustomTimePrecision(clock)
+                            .addLimit(io.github.bucket4j.BandwidthBuilder.builder()
+                                    .capacity(10)
+                                    .refillIntervally(10, java.time.Duration.ofMinutes(15))
+                                    .build())
+                            .build());
+            when(verifyEmailBuckets.get(REMOTE_ADDR)).thenAnswer(inv -> verifyEmail.get(REMOTE_ADDR));
+            for (int i = 0; i < 10; i++) {
+                var ok = new MockHttpServletResponse();
+                doFilter(postRequest("/api/v1/auth/verify-email"), ok, new MockFilterChain());
+                assertThat(ok.getStatus()).as("request %s within capacity", i + 1).isEqualTo(200);
+            }
+            nowNanos[0] = java.time.Duration.ofSeconds(880).toNanos();
+            var response = new MockHttpServletResponse();
+
+            doFilter(postRequest("/api/v1/auth/verify-email"), response, new MockFilterChain());
+
+            assertThat(response.getStatus()).isEqualTo(429);
+            assertThat(response.getHeader("Retry-After"))
+                    .as("Retry-After must be the 20 s left in the window, not the 900 s constant")
+                    .isEqualTo("20");
+        }
     }
 
     // ==========================================================================
@@ -1192,7 +1299,7 @@ class AuthRateLimitFilterTest {
         void should_allowRequest_when_resendVerificationWithinLimit() throws Exception {
             log.debug("Arrange: resendVerificationBuckets returns bucket that allows consumption");
             when(resendVerificationBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(true);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(ALLOW);
 
             var request  = postRequest("/api/v1/auth/resend-verification");
             var response = new MockHttpServletResponse();
@@ -1219,7 +1326,7 @@ class AuthRateLimitFilterTest {
         void should_return429_when_resendVerificationRateLimitExceeded() throws Exception {
             log.debug("Arrange: resendVerificationBuckets returns bucket that denies consumption");
             when(resendVerificationBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(false);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(DENY);
 
             var request  = postRequest("/api/v1/auth/resend-verification");
             var response = new MockHttpServletResponse();
@@ -1256,7 +1363,7 @@ class AuthRateLimitFilterTest {
         void should_passThrough_when_forgotPasswordBucketHasTokens() throws Exception {
             log.debug("Arrange: forgotPasswordBuckets returns bucket that allows consumption");
             when(forgotPasswordBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(true);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(ALLOW);
 
             var request  = postRequest("/api/v1/auth/forgot-password");
             var response = new MockHttpServletResponse();
@@ -1281,7 +1388,7 @@ class AuthRateLimitFilterTest {
         void should_return429_when_forgotPasswordBucketExhausted() throws Exception {
             log.debug("Arrange: forgotPasswordBuckets returns bucket that denies consumption");
             when(forgotPasswordBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(false);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(DENY);
 
             var request  = postRequest("/api/v1/auth/forgot-password");
             var response = new MockHttpServletResponse();
@@ -1315,7 +1422,7 @@ class AuthRateLimitFilterTest {
         void should_passThrough_when_resetPasswordBucketHasTokens() throws Exception {
             log.debug("Arrange: resetPasswordBuckets returns bucket that allows consumption");
             when(resetPasswordBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(true);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(ALLOW);
 
             var request  = postRequest("/api/v1/auth/reset-password");
             var response = new MockHttpServletResponse();
@@ -1340,7 +1447,7 @@ class AuthRateLimitFilterTest {
         void should_return429_when_resetPasswordBucketExhausted() throws Exception {
             log.debug("Arrange: resetPasswordBuckets returns bucket that denies consumption");
             when(resetPasswordBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(false);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(DENY);
 
             var request  = postRequest("/api/v1/auth/reset-password");
             var response = new MockHttpServletResponse();
@@ -1374,7 +1481,7 @@ class AuthRateLimitFilterTest {
         void should_passThrough_when_verifyPasswordResetOtpBucketHasTokens() throws Exception {
             log.debug("Arrange: verifyPasswordResetOtpBuckets returns bucket that allows consumption");
             when(verifyPasswordResetOtpBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(true);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(ALLOW);
 
             var request  = postRequest("/api/v1/auth/verify-password-reset-otp");
             var response = new MockHttpServletResponse();
@@ -1398,7 +1505,7 @@ class AuthRateLimitFilterTest {
         void should_return429_when_verifyPasswordResetOtpBucketExhausted() throws Exception {
             log.debug("Arrange: verifyPasswordResetOtpBuckets returns bucket that denies consumption");
             when(verifyPasswordResetOtpBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(false);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(DENY);
 
             var request  = postRequest("/api/v1/auth/verify-password-reset-otp");
             var response = new MockHttpServletResponse();
@@ -1432,7 +1539,7 @@ class AuthRateLimitFilterTest {
         void should_passThrough_when_changePasswordOtpBucketHasTokens() throws Exception {
             log.debug("Arrange: changePasswordOtpBuckets returns bucket that allows consumption");
             when(changePasswordOtpBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(true);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(ALLOW);
 
             var request  = postRequest("/api/v1/users/me/change-password/request-otp");
             var response = new MockHttpServletResponse();
@@ -1456,7 +1563,7 @@ class AuthRateLimitFilterTest {
         void should_return429_when_changePasswordOtpBucketExhausted() throws Exception {
             log.debug("Arrange: changePasswordOtpBuckets returns bucket that denies consumption");
             when(changePasswordOtpBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(false);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(DENY);
 
             var request  = postRequest("/api/v1/users/me/change-password/request-otp");
             var response = new MockHttpServletResponse();
@@ -1489,7 +1596,7 @@ class AuthRateLimitFilterTest {
         @DisplayName("X-Content-Type-Options: nosniff is present on 429 login response")
         void should_setXContentTypeOptionsNosniff_when_loginBucketExhausted() throws Exception {
             when(loginBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(false);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(DENY);
 
             var request  = postRequest("/api/v1/auth/login");
             var response = new MockHttpServletResponse();
@@ -1509,7 +1616,7 @@ class AuthRateLimitFilterTest {
         @DisplayName("X-Content-Type-Options: nosniff is present on 429 refresh response")
         void should_setXContentTypeOptionsNosniff_when_refreshBucketExhausted() throws Exception {
             when(refreshBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(false);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(DENY);
 
             var request  = postRequest("/api/v1/auth/refresh");
             var response = new MockHttpServletResponse();
@@ -1529,7 +1636,7 @@ class AuthRateLimitFilterTest {
         @DisplayName("X-Content-Type-Options: nosniff is present on 429 register response")
         void should_setXContentTypeOptionsNosniff_when_registerBucketExhausted() throws Exception {
             when(registerBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(false);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(DENY);
 
             var request  = postRequest("/api/v1/auth/register");
             var response = new MockHttpServletResponse();
@@ -1549,7 +1656,7 @@ class AuthRateLimitFilterTest {
         @DisplayName("X-Content-Type-Options: nosniff is present on 429 verify-email response (15-min window)")
         void should_setXContentTypeOptionsNosniff_when_verifyEmailBucketExhausted() throws Exception {
             when(verifyEmailBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(false);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(DENY);
 
             var request  = postRequest("/api/v1/auth/verify-email");
             var response = new MockHttpServletResponse();
@@ -1569,7 +1676,7 @@ class AuthRateLimitFilterTest {
         @DisplayName("X-Content-Type-Options: nosniff is present on 429 forgot-password response (60-min window)")
         void should_setXContentTypeOptionsNosniff_when_forgotPasswordBucketExhausted() throws Exception {
             when(forgotPasswordBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(false);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(DENY);
 
             var request  = postRequest("/api/v1/auth/forgot-password");
             var response = new MockHttpServletResponse();
@@ -1589,7 +1696,7 @@ class AuthRateLimitFilterTest {
         @DisplayName("X-Content-Type-Options: nosniff is present on 429 media-upload response (DELETE path)")
         void should_setXContentTypeOptionsNosniff_when_mediaUploadBucketExhausted() throws Exception {
             when(mediaUploadBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(false);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(DENY);
 
             var request  = deleteRequest("/api/v1/media/portfolio/" + java.util.UUID.randomUUID());
             var response = new MockHttpServletResponse();
@@ -1609,7 +1716,7 @@ class AuthRateLimitFilterTest {
         @DisplayName("X-Content-Type-Options: nosniff is present on 429 device-token response (DELETE path)")
         void should_setXContentTypeOptionsNosniff_when_deviceTokenBucketExhausted() throws Exception {
             when(deviceTokenBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(false);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(DENY);
 
             var request  = deleteRequest("/api/v1/devices/token");
             var response = new MockHttpServletResponse();
@@ -1629,7 +1736,7 @@ class AuthRateLimitFilterTest {
         @DisplayName("X-Content-Type-Options: nosniff is present on 429 profile-update response (PATCH path)")
         void should_setXContentTypeOptionsNosniff_when_profileUpdateBucketExhausted() throws Exception {
             when(profileUpdateBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(false);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(DENY);
 
             var req = new MockHttpServletRequest("PATCH", "/api/v1/users/me");
             req.setRemoteAddr(REMOTE_ADDR);
@@ -1657,18 +1764,18 @@ class AuthRateLimitFilterTest {
         void should_return429_when_salonMasterExceedsRateLimitOnMastersMeProfile() throws Exception {
             log.debug("Arrange: profileUpdateBuckets returns bucket that allows 10 then denies the 11th");
             when(profileUpdateBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1))
-                    .thenReturn(true)
-                    .thenReturn(true)
-                    .thenReturn(true)
-                    .thenReturn(true)
-                    .thenReturn(true)
-                    .thenReturn(true)
-                    .thenReturn(true)
-                    .thenReturn(true)
-                    .thenReturn(true)
-                    .thenReturn(true)
-                    .thenReturn(false);
+            when(bucket.tryConsumeAndReturnRemaining(1))
+                    .thenReturn(ALLOW)
+                    .thenReturn(ALLOW)
+                    .thenReturn(ALLOW)
+                    .thenReturn(ALLOW)
+                    .thenReturn(ALLOW)
+                    .thenReturn(ALLOW)
+                    .thenReturn(ALLOW)
+                    .thenReturn(ALLOW)
+                    .thenReturn(ALLOW)
+                    .thenReturn(ALLOW)
+                    .thenReturn(DENY);
 
             MockHttpServletResponse lastResponse = null;
             MockFilterChain         lastChain    = null;
@@ -1716,7 +1823,7 @@ class AuthRateLimitFilterTest {
         void should_routeToCategoryRequestBuckets_when_withinLimit() throws Exception {
             log.debug("Arrange: categoryRequestBuckets returns bucket that allows consumption");
             when(categoryRequestBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(true);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(ALLOW);
 
             var request  = postRequest("/api/v1/service-categories/requests");
             var response = new MockHttpServletResponse();
@@ -1744,13 +1851,13 @@ class AuthRateLimitFilterTest {
             // 60-minute category-request window (3600 s).
             log.debug("Arrange: categoryRequestBuckets allows 5 then denies the 6th");
             when(categoryRequestBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1))
-                    .thenReturn(true)
-                    .thenReturn(true)
-                    .thenReturn(true)
-                    .thenReturn(true)
-                    .thenReturn(true)
-                    .thenReturn(false);
+            when(bucket.tryConsumeAndReturnRemaining(1))
+                    .thenReturn(ALLOW)
+                    .thenReturn(ALLOW)
+                    .thenReturn(ALLOW)
+                    .thenReturn(ALLOW)
+                    .thenReturn(ALLOW)
+                    .thenReturn(DENY);
 
             MockHttpServletResponse lastResponse = null;
             MockFilterChain         lastChain    = null;
@@ -1819,7 +1926,7 @@ class AuthRateLimitFilterTest {
         void should_routeToSuggestServiceTypeBuckets_when_withinLimit() throws Exception {
             log.debug("Arrange: suggestServiceTypeBuckets returns a bucket that allows consumption");
             when(suggestServiceTypeBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(true);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(ALLOW);
 
             var request  = postRequest("/api/v1/service-types/suggest");
             var response = new MockHttpServletResponse();
@@ -1847,13 +1954,13 @@ class AuthRateLimitFilterTest {
             // 60-minute suggest-service-type window (3600 s).
             log.debug("Arrange: suggestServiceTypeBuckets allows 5 then denies the 6th");
             when(suggestServiceTypeBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1))
-                    .thenReturn(true)
-                    .thenReturn(true)
-                    .thenReturn(true)
-                    .thenReturn(true)
-                    .thenReturn(true)
-                    .thenReturn(false);
+            when(bucket.tryConsumeAndReturnRemaining(1))
+                    .thenReturn(ALLOW)
+                    .thenReturn(ALLOW)
+                    .thenReturn(ALLOW)
+                    .thenReturn(ALLOW)
+                    .thenReturn(ALLOW)
+                    .thenReturn(DENY);
 
             MockHttpServletResponse lastResponse = null;
             MockFilterChain         lastChain    = null;
@@ -1922,7 +2029,7 @@ class AuthRateLimitFilterTest {
         void should_routeToSupportContactBuckets_when_withinLimit() throws Exception {
             log.debug("Arrange: supportContactBuckets returns a bucket that allows consumption");
             when(supportContactBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(true);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(ALLOW);
 
             var request  = postRequest("/api/v1/support/contact");
             var response = new MockHttpServletResponse();
@@ -1950,13 +2057,13 @@ class AuthRateLimitFilterTest {
             // 60-minute support-contact window (3600 s).
             log.debug("Arrange: supportContactBuckets allows 5 then denies the 6th");
             when(supportContactBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1))
-                    .thenReturn(true)
-                    .thenReturn(true)
-                    .thenReturn(true)
-                    .thenReturn(true)
-                    .thenReturn(true)
-                    .thenReturn(false);
+            when(bucket.tryConsumeAndReturnRemaining(1))
+                    .thenReturn(ALLOW)
+                    .thenReturn(ALLOW)
+                    .thenReturn(ALLOW)
+                    .thenReturn(ALLOW)
+                    .thenReturn(ALLOW)
+                    .thenReturn(DENY);
 
             MockHttpServletResponse lastResponse = null;
             MockFilterChain         lastChain    = null;
@@ -2024,7 +2131,7 @@ class AuthRateLimitFilterTest {
         void should_routeToOtpSendBuckets_when_withinLimit() throws Exception {
             log.debug("Arrange: otpSendBuckets returns a bucket that allows consumption");
             when(otpSendBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(true);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(ALLOW);
 
             var request  = postRequest("/api/v1/book/otp/send");
             var response = new MockHttpServletResponse();
@@ -2051,11 +2158,11 @@ class AuthRateLimitFilterTest {
             // the 15-minute otp-send window (900 s).
             log.debug("Arrange: otpSendBuckets allows 3 then denies the 4th");
             when(otpSendBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1))
-                    .thenReturn(true)
-                    .thenReturn(true)
-                    .thenReturn(true)
-                    .thenReturn(false);
+            when(bucket.tryConsumeAndReturnRemaining(1))
+                    .thenReturn(ALLOW)
+                    .thenReturn(ALLOW)
+                    .thenReturn(ALLOW)
+                    .thenReturn(DENY);
 
             MockHttpServletResponse lastResponse = null;
             MockFilterChain         lastChain    = null;
@@ -2146,7 +2253,7 @@ class AuthRateLimitFilterTest {
         @DisplayName("GET /working-days consumes the shared slots bucket")
         void should_consumeSlotsBucket_when_workingDaysRequested() throws Exception {
             when(slotsBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(true);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(ALLOW);
 
             var request = getRequest("/api/v1/masters/" + java.util.UUID.randomUUID() + "/working-days");
             var response = new MockHttpServletResponse();
@@ -2164,7 +2271,7 @@ class AuthRateLimitFilterTest {
         @DisplayName("GET /working-days returns 429 when the bucket is exhausted")
         void should_return429_when_workingDaysBucketExhausted() throws Exception {
             when(slotsBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(false);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(DENY);
 
             var request = getRequest("/api/v1/masters/" + java.util.UUID.randomUUID() + "/working-days");
             var response = new MockHttpServletResponse();
@@ -2182,7 +2289,7 @@ class AuthRateLimitFilterTest {
         @DisplayName("GET /slots still consumes the same bucket (unchanged)")
         void should_consumeSlotsBucket_when_slotsRequested() throws Exception {
             when(slotsBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(true);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(ALLOW);
 
             var request = getRequest("/api/v1/masters/" + java.util.UUID.randomUUID() + "/slots");
             var response = new MockHttpServletResponse();
@@ -2223,7 +2330,7 @@ class AuthRateLimitFilterTest {
         @DisplayName("GET /working%2ddays is throttled identically to /working-days")
         void should_throttle_when_workingDays_path_is_percent_encoded() throws Exception {
             when(slotsBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(false);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(DENY);
 
             var request = getRequest("/api/v1/masters/" + java.util.UUID.randomUUID() + "/working%2ddays");
             var response = new MockHttpServletResponse();
@@ -2244,7 +2351,7 @@ class AuthRateLimitFilterTest {
         @DisplayName("POST /api/v1/auth/logi%6e hits the login bucket (brute-force limiter cannot be bypassed)")
         void should_throttle_when_login_path_is_percent_encoded() throws Exception {
             when(loginBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(false);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(DENY);
 
             var request = postRequest("/api/v1/auth/logi%6e");
             var response = new MockHttpServletResponse();
@@ -2265,7 +2372,7 @@ class AuthRateLimitFilterTest {
         @DisplayName("POST /api/v1/auth/./login normalizes to the login bucket")
         void should_throttle_when_login_path_has_dot_segment() throws Exception {
             when(loginBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(false);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(DENY);
 
             var request = postRequest("/api/v1/auth/./login");
             var response = new MockHttpServletResponse();
@@ -2286,7 +2393,7 @@ class AuthRateLimitFilterTest {
         @DisplayName("POST /api/v1//auth/login collapses the double slash to the login bucket")
         void should_throttle_when_login_path_has_double_slash() throws Exception {
             when(loginBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(false);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(DENY);
 
             var request = postRequest("/api/v1//auth/login");
             var response = new MockHttpServletResponse();
@@ -2311,7 +2418,7 @@ class AuthRateLimitFilterTest {
             // the availability throttle (raw getRequestURI() would end in ";jsessionid=…", not
             // "/working-days", and would have fallen through unthrottled).
             when(slotsBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
-            when(bucket.tryConsume(1)).thenReturn(false);
+            when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(DENY);
 
             var request = getRequest("/api/v1/masters/" + java.util.UUID.randomUUID()
                     + "/working-days;jsessionid=0123456789ABCDEF");
@@ -2340,8 +2447,8 @@ class AuthRateLimitFilterTest {
             Bucket bucketB = org.mockito.Mockito.mock(Bucket.class);
             when(slotsBuckets.get(ipA)).thenReturn(bucketA);
             when(slotsBuckets.get(ipB)).thenReturn(bucketB);
-            when(bucketA.tryConsume(1)).thenReturn(false); // A exhausted
-            when(bucketB.tryConsume(1)).thenReturn(true);  // B fresh
+            when(bucketA.tryConsumeAndReturnRemaining(1)).thenReturn(DENY); // A exhausted
+            when(bucketB.tryConsumeAndReturnRemaining(1)).thenReturn(ALLOW);  // B fresh
 
             var reqA = new MockHttpServletRequest("GET",
                     "/api/v1/masters/" + java.util.UUID.randomUUID() + "/working-days");

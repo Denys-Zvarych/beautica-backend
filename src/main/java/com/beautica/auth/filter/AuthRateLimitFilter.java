@@ -6,6 +6,7 @@ import com.github.benmanes.caffeine.cache.LoadingCache;
 import io.github.bucket4j.Bandwidth;
 import io.github.bucket4j.BandwidthBuilder;
 import io.github.bucket4j.Bucket;
+import io.github.bucket4j.ConsumptionProbe;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
@@ -1498,11 +1499,26 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                                 long tokens) throws ServletException, IOException {
         Bucket bucket = cache.get(resolveBucketKey(request));
 
-        if (bucket.tryConsume(tokens)) {
+        // Retry-After is the bucket's REAL time-to-refill for the requested tokens (rounded up,
+        // minimum 1 s), not the window length: a bucket that refills in 20 s must not tell the
+        // client to wait the full window. retryAfterSeconds is only a defensive fallback.
+        ConsumptionProbe probe = bucket.tryConsumeAndReturnRemaining(tokens);
+        if (probe.isConsumed()) {
             filterChain.doFilter(request, response);
         } else {
-            writeTooManyRequests(response, retryAfterSeconds);
+            writeTooManyRequests(response, computeRetryAfterSeconds(probe, retryAfterSeconds));
         }
+    }
+
+    static int computeRetryAfterSeconds(ConsumptionProbe probe, int fallbackSeconds) {
+        long nanos = probe.getNanosToWaitForRefill();
+        // Bucket4j reports Long.MAX_VALUE for "never refills"; guard before any arithmetic (overflow).
+        if (nanos <= 0 || nanos == Long.MAX_VALUE) {
+            return fallbackSeconds;
+        }
+        long seconds = nanos / 1_000_000_000L + (nanos % 1_000_000_000L == 0 ? 0 : 1);
+        long cap = Math.max(fallbackSeconds, 86_400L);
+        return (int) Math.min(Math.max(seconds, 1L), cap);
     }
 
     private static void writeTooManyRequests(HttpServletResponse response, int retryAfterSeconds)
