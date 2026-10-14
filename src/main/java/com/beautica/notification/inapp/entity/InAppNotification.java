@@ -46,10 +46,11 @@ import java.util.UUID;
     indexes = {
         @Index(name = "in_app_notification_feed_idx",
                 columnList = "recipient_user_id, created_at DESC, id DESC"),
-        // in_app_notification_unread_idx, _subject_idx, _booking_idx, _appointment_idx and
-        // _salon_idx are all partial indexes (WHERE <col> IS NOT NULL / IS NULL) — JPA @Index
-        // cannot express a partial predicate, so they are documented here but not listed; see
-        // V181__create_in_app_notification.sql for their definitions.
+        // in_app_notification_unread_idx, _subject_idx, _booking_idx, _appointment_idx,
+        // _salon_idx, _category_request_idx and _service_type_suggestion_idx are all partial
+        // indexes (WHERE <col> IS NOT NULL / IS NULL) — JPA @Index cannot express a partial
+        // predicate, so they are documented here but not listed; see V181 / V196 for their
+        // definitions.
         @Index(name = "in_app_notification_created_idx", columnList = "created_at")
     }
 )
@@ -112,6 +113,14 @@ public class InAppNotification {
      */
     @Column(name = "subject_user_id")
     private UUID subjectUserId;
+
+    /** Phase 372 — the category request a CATEGORY_REQUEST_* item is about (V196). */
+    @Column(name = "category_request_id")
+    private Long categoryRequestId;
+
+    /** Phase 372 — the suggestion a SERVICE_TYPE_SUGGESTION_* item is about (V196). */
+    @Column(name = "service_type_suggestion_id")
+    private UUID serviceTypeSuggestionId;
 
     /**
      * Idempotency key, unique per {@code (recipient_user_id, dedup_key)} — enforced by

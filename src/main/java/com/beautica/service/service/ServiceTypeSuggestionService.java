@@ -4,6 +4,7 @@ import com.beautica.auth.TokenGenerator;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.config.PublicBaseUrlProperties;
 import com.beautica.notification.EmailService;
+import com.beautica.notification.inapp.service.InAppNotificationService;
 import com.beautica.search.service.SearchSuggestionCatalogue;
 import com.beautica.service.entity.ServiceTypeSuggestion;
 import com.beautica.service.repository.ServiceTypeSuggestionRepository;
@@ -60,6 +61,7 @@ public class ServiceTypeSuggestionService {
     private final PublicBaseUrlProperties publicBaseUrlProperties;
     private final ServiceTypePromotionService promotionService;
     private final Clock clock;
+    private final InAppNotificationService inAppNotificationService;
 
     @Value("${app.admin-email}")
     private String adminEmail;
@@ -190,7 +192,7 @@ public class ServiceTypeSuggestionService {
             @CacheEvict(value = SearchSuggestionCatalogue.CACHE_NAME, allEntries = true, condition = APPROVED_ONLY)
     })
     public DecisionOutcome approve(String rawToken) {
-        return decide(rawToken, true);
+        return decide(rawToken, true, null);
     }
 
     /**
@@ -199,11 +201,20 @@ public class ServiceTypeSuggestionService {
      */
     @Transactional
     public DecisionOutcome reject(String rawToken) {
-        return decide(rawToken, false);
+        return reject(rawToken, null);
     }
 
-    private DecisionOutcome decide(String rawToken, boolean approve) {
-        Optional<ServiceTypeSuggestion> match = findByTokenConstantTime(rawToken);
+    /**
+     * Rejects with an optional admin reason (already trimmed/sanitised/length-validated by the
+     * controller; null when none). Stored on the suggestion, surfaced via the in-app feed, never logged.
+     */
+    @Transactional
+    public DecisionOutcome reject(String rawToken, String reason) {
+        return decide(rawToken, false, reason);
+    }
+
+    private DecisionOutcome decide(String rawToken, boolean approve, String reason) {
+        Optional<ServiceTypeSuggestion> match = findByTokenConstantTime(rawToken, true);
         if (match.isEmpty()) {
             // Token unknown. The row may already be decided (token nulled) — we
             // cannot distinguish, so return a neutral already-decided outcome.
@@ -225,14 +236,17 @@ public class ServiceTypeSuggestionService {
             // here rolls back the approve() flip (status stays PENDING, token intact) so the
             // admin can retry — no "approved but not created" split-brain.
             promotionService.promote(suggestion);
+            // Same transaction (MANDATORY): a promotion failure above rolls the item back with the approval.
+            inAppNotificationService.notifySuggestionDecided(suggestion, true);
             return DecisionOutcome.APPROVED;
         }
-        suggestion.reject(now);
+        suggestion.reject(now, reason);
+        inAppNotificationService.notifySuggestionDecided(suggestion, false);
         return DecisionOutcome.REJECTED;
     }
 
     private Optional<ServiceTypeSuggestion> findLivePending(String rawToken) {
-        return findByTokenConstantTime(rawToken)
+        return findByTokenConstantTime(rawToken, false)
                 .filter(ServiceTypeSuggestion::isPending)
                 .filter(s -> !isExpired(s));
     }
@@ -244,12 +258,15 @@ public class ServiceTypeSuggestionService {
      * defense-in-depth so the decision branch never depends on a non-constant-time
      * String compare.
      */
-    private Optional<ServiceTypeSuggestion> findByTokenConstantTime(String rawToken) {
+    private Optional<ServiceTypeSuggestion> findByTokenConstantTime(String rawToken, boolean forUpdate) {
         if (rawToken == null || rawToken.isBlank()) {
             return Optional.empty();
         }
         String candidateHash = tokenGenerator.hash(rawToken);
-        return suggestionRepository.findByTokenHash(candidateHash)
+        Optional<ServiceTypeSuggestion> found = forUpdate
+                ? suggestionRepository.findByTokenHashForUpdate(candidateHash)
+                : suggestionRepository.findByTokenHash(candidateHash);
+        return found
                 .filter(s -> s.getTokenHash() != null
                         && MessageDigest.isEqual(
                                 s.getTokenHash().getBytes(StandardCharsets.UTF_8),

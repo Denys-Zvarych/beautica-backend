@@ -5,6 +5,7 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.config.CacheConfig;
 import com.beautica.config.PublicBaseUrlProperties;
 import com.beautica.notification.EmailService;
+import com.beautica.notification.inapp.service.InAppNotificationService;
 import com.beautica.search.service.SearchSuggestionCatalogue;
 import com.beautica.service.dto.ApprovedCategoryResponse;
 import com.beautica.service.dto.CreatePlatformCategoryRequest;
@@ -60,6 +61,7 @@ class InternalCategoryServiceCacheTest {
     @MockBean PlatformCategoryRepository platformCategoryRepository;
     @MockBean TokenGenerator tokenGenerator;
     @MockBean EmailService emailService;
+    @MockBean InAppNotificationService inAppNotificationService;
     @MockBean PublicBaseUrlProperties publicBaseUrlProperties;
     @MockBean ServiceTypeSuggestionService serviceTypeSuggestionService;
 

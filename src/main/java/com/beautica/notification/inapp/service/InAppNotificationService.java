@@ -1,5 +1,7 @@
 package com.beautica.notification.inapp.service;
 
+import com.beautica.service.entity.PlatformCategory;
+import com.beautica.service.entity.ServiceTypeSuggestion;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingSource;
 import com.beautica.master.entity.Master;
@@ -351,6 +353,50 @@ public class InAppNotificationService {
     }
 
     /**
+     * Phase 372 — a platform admin approved or rejected a self-service category request. Notifies the
+     * REQUESTER only (no salon fan-out; requests are platform-wide). Skips when the requester is gone
+     * (legacy row / deleted user) — the decision still commits. Dedup key {@code TYPE:<categoryId>}
+     * makes a replay a no-op even if the caller's own ALREADY_DECIDED guard were bypassed.
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void notifyCategoryRequestDecided(PlatformCategory category, boolean approved) {
+        UUID requesterId = category.getRequestedByUserId();
+        if (requesterId == null) {
+            return;
+        }
+        InAppNotificationType type = approved
+                ? InAppNotificationType.CATEGORY_REQUEST_APPROVED
+                : InAppNotificationType.CATEGORY_REQUEST_REJECTED;
+        writeRequestDecision(type, requesterId, category.getId(), null, dedupKey(type, category.getId()));
+        log.debug("in-app notify type={} categoryRequestId={}", type, category.getId());
+    }
+
+    /** Phase 372 — suggestion counterpart of {@link #notifyCategoryRequestDecided}; key is {@code TYPE:<uuid>}. */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void notifySuggestionDecided(ServiceTypeSuggestion suggestion, boolean approved) {
+        UUID requesterId = suggestion.getRequestedByUserId();
+        if (requesterId == null) {
+            return;
+        }
+        InAppNotificationType type = approved
+                ? InAppNotificationType.SERVICE_TYPE_SUGGESTION_APPROVED
+                : InAppNotificationType.SERVICE_TYPE_SUGGESTION_REJECTED;
+        writeRequestDecision(type, requesterId, null, suggestion.getId(), dedupKey(type, suggestion.getId()));
+        log.debug("in-app notify type={} suggestionId={}", type, suggestion.getId());
+    }
+
+    private void writeRequestDecision(
+            InAppNotificationType type, UUID recipientId, Long categoryRequestId, UUID suggestionId,
+            String dedupKey) {
+        if (pushEnabled) {
+            repository.insertRequestDecisionWithPush(
+                    type.name(), recipientId, categoryRequestId, suggestionId, dedupKey);
+            return;
+        }
+        repository.insertRequestDecision(type.name(), recipientId, categoryRequestId, suggestionId, dedupKey);
+    }
+
+    /**
      * Bulk counterpart of {@link #notifyBookingEvent} for the salon-closure / master-removal /
      * master-self-delete cascades — rows 9/10, client-only. ONE statement regardless of how many
      * visits {@code bookingIds} spans; see {@link InAppNotificationRepository#insertClientOnlyBulk}'s
@@ -446,6 +492,10 @@ public class InAppNotificationService {
 
     private static UUID salonIdOf(Salon salon) {
         return salon != null ? salon.getId() : null;
+    }
+
+    private static String dedupKey(InAppNotificationType type, Long id) {
+        return type.name() + ":" + id;
     }
 
     private static String dedupKey(InAppNotificationType type, UUID id) {

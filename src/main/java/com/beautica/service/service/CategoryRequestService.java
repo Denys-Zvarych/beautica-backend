@@ -4,6 +4,7 @@ import com.beautica.auth.TokenGenerator;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.config.PublicBaseUrlProperties;
 import com.beautica.notification.EmailService;
+import com.beautica.notification.inapp.service.InAppNotificationService;
 import com.beautica.search.service.SearchSuggestionCatalogue;
 import com.beautica.service.dto.ApprovedCategoryResponse;
 import com.beautica.service.dto.CategoryRequestResponse;
@@ -71,6 +72,7 @@ public class CategoryRequestService {
     private final PublicBaseUrlProperties publicBaseUrlProperties;
     private final ServiceTypeSuggestionService serviceTypeSuggestionService;
     private final Clock clock;
+    private final InAppNotificationService inAppNotificationService;
 
     @Value("${app.admin-email}")
     private String adminEmail;
@@ -168,7 +170,7 @@ public class CategoryRequestService {
                     condition = APPROVED_ONLY)
     })
     public DecisionOutcome approve(String rawToken) {
-        return decide(rawToken, true);
+        return decide(rawToken, true, null);
     }
 
     /**
@@ -178,7 +180,17 @@ public class CategoryRequestService {
      */
     @Transactional
     public DecisionOutcome reject(String rawToken) {
-        return decide(rawToken, false);
+        return reject(rawToken, null);
+    }
+
+    /**
+     * Rejects with an optional admin reason (already trimmed/sanitised/length-validated by the
+     * controller; null when none). The reason is stored on the request and surfaced to the requester
+     * through the in-app feed; it is never logged.
+     */
+    @Transactional
+    public DecisionOutcome reject(String rawToken, String reason) {
+        return decide(rawToken, false, reason);
     }
 
     /**
@@ -208,8 +220,8 @@ public class CategoryRequestService {
                 .toList();
     }
 
-    private DecisionOutcome decide(String rawToken, boolean approve) {
-        Optional<PlatformCategory> match = findByTokenConstantTime(rawToken);
+    private DecisionOutcome decide(String rawToken, boolean approve, String reason) {
+        Optional<PlatformCategory> match = findByTokenConstantTime(rawToken, true);
         if (match.isEmpty()) {
             // Token unknown. The row may already be decided (token nulled) — we
             // cannot distinguish, so return a neutral already-decided outcome.
@@ -228,9 +240,13 @@ public class CategoryRequestService {
         if (approve) {
             category.approve(now);
             createInitialServiceSuggestion(category);
+            // Same transaction as the decision (MANDATORY): the feed item commits or rolls back with it.
+            // Only reached on the PENDING transition — ALREADY_DECIDED / INVALID_OR_EXPIRED returned above.
+            inAppNotificationService.notifyCategoryRequestDecided(category, true);
             return DecisionOutcome.APPROVED;
         }
-        category.reject(now);
+        category.reject(now, reason);
+        inAppNotificationService.notifyCategoryRequestDecided(category, false);
         return DecisionOutcome.REJECTED;
     }
 
@@ -270,7 +286,7 @@ public class CategoryRequestService {
     }
 
     private Optional<PlatformCategory> findLivePending(String rawToken) {
-        return findByTokenConstantTime(rawToken)
+        return findByTokenConstantTime(rawToken, false)
                 .filter(PlatformCategory::isPending)
                 .filter(c -> !isExpired(c));
     }
@@ -281,12 +297,15 @@ public class CategoryRequestService {
      * lookup is an equality match; the constant-time re-check is defense-in-depth so
      * the decision branch never depends on a non-constant-time String compare.
      */
-    private Optional<PlatformCategory> findByTokenConstantTime(String rawToken) {
+    private Optional<PlatformCategory> findByTokenConstantTime(String rawToken, boolean forUpdate) {
         if (rawToken == null || rawToken.isBlank()) {
             return Optional.empty();
         }
         String candidateHash = tokenGenerator.hash(rawToken);
-        return platformCategoryRepository.findByTokenHash(candidateHash)
+        Optional<PlatformCategory> found = forUpdate
+                ? platformCategoryRepository.findByTokenHashForUpdate(candidateHash)
+                : platformCategoryRepository.findByTokenHash(candidateHash);
+        return found
                 .filter(c -> c.getTokenHash() != null
                         && MessageDigest.isEqual(
                                 c.getTokenHash().getBytes(StandardCharsets.UTF_8),

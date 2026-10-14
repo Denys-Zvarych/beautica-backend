@@ -438,4 +438,79 @@ class InAppNotificationServiceTest {
         verify(repository, times(1)).insertClientOnlyBulk(any(), any(), any());
         verify(repository, times(1)).insertProviderSetBulk(any(), any(), any());
     }
+
+    // ── Phase 372 — request-decision items (requester only) ──────────────────────────────────
+
+    @Test
+    @DisplayName("category decision writes one row for the requester only, keyed TYPE:<bigint id>, "
+            + "no booking/appointment/salon/subject ids")
+    void should_writeOneCategoryItemForRequester_when_categoryDecided() {
+        UUID requesterId = UUID.randomUUID();
+        com.beautica.service.entity.PlatformCategory category =
+                com.beautica.service.entity.PlatformCategory.ofPendingRequest(
+                        "NAIL_ART", "Нейл-арт", requesterId, "h", null, null, null);
+        org.springframework.test.util.ReflectionTestUtils.setField(category, "id", 77L);
+
+        service.notifyCategoryRequestDecided(category, true);
+        service.notifyCategoryRequestDecided(category, false);
+
+        verify(repository).insertRequestDecision(
+                "CATEGORY_REQUEST_APPROVED", requesterId, 77L, null, "CATEGORY_REQUEST_APPROVED:77");
+        verify(repository).insertRequestDecision(
+                "CATEGORY_REQUEST_REJECTED", requesterId, 77L, null, "CATEGORY_REQUEST_REJECTED:77");
+        verify(repository, never()).insertForRecipients(any(), any(), any(), any(), any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("suggestion decision writes one row for the requester only, keyed TYPE:<uuid>")
+    void should_writeOneSuggestionItemForRequester_when_suggestionDecided() {
+        UUID requesterId = UUID.randomUUID();
+        UUID suggestionId = UUID.randomUUID();
+        com.beautica.service.entity.ServiceTypeSuggestion suggestion =
+                com.beautica.service.entity.ServiceTypeSuggestion.ofPending(
+                        "NAIL_ART", "Гель", null, requesterId, "h", null);
+        org.springframework.test.util.ReflectionTestUtils.setField(suggestion, "id", suggestionId);
+
+        service.notifySuggestionDecided(suggestion, true);
+        service.notifySuggestionDecided(suggestion, false);
+
+        verify(repository).insertRequestDecision("SERVICE_TYPE_SUGGESTION_APPROVED", requesterId, null,
+                suggestionId, "SERVICE_TYPE_SUGGESTION_APPROVED:" + suggestionId);
+        verify(repository).insertRequestDecision("SERVICE_TYPE_SUGGESTION_REJECTED", requesterId, null,
+                suggestionId, "SERVICE_TYPE_SUGGESTION_REJECTED:" + suggestionId);
+    }
+
+    @Test
+    @DisplayName("a null requester (legacy row / deleted user) makes no repository call at all")
+    void should_makeNoRepositoryCall_when_requesterNull() {
+        com.beautica.service.entity.PlatformCategory category =
+                com.beautica.service.entity.PlatformCategory.ofPendingRequest(
+                        "NAIL_ART", "Нейл-арт", null, "h", null, null, null);
+        com.beautica.service.entity.ServiceTypeSuggestion suggestion =
+                com.beautica.service.entity.ServiceTypeSuggestion.ofPending(
+                        "NAIL_ART", "Гель", null, null, "h", null);
+
+        service.notifyCategoryRequestDecided(category, true);
+        service.notifySuggestionDecided(suggestion, false);
+
+        org.mockito.Mockito.verifyNoInteractions(repository);
+    }
+
+    @Test
+    @DisplayName("pushEnabled=true routes a request decision to the push twin and never the plain insert")
+    void should_useWithPushTwin_when_pushEnabledRequestDecision() {
+        service = new InAppNotificationService(
+                repository, salonRepository, new InAppRecipientResolver(userRepository), true);
+        UUID requesterId = UUID.randomUUID();
+        com.beautica.service.entity.PlatformCategory category =
+                com.beautica.service.entity.PlatformCategory.ofPendingRequest(
+                        "NAIL_ART", "Нейл-арт", requesterId, "h", null, null, null);
+        org.springframework.test.util.ReflectionTestUtils.setField(category, "id", 5L);
+
+        service.notifyCategoryRequestDecided(category, false);
+
+        verify(repository).insertRequestDecisionWithPush(
+                "CATEGORY_REQUEST_REJECTED", requesterId, 5L, null, "CATEGORY_REQUEST_REJECTED:5");
+        verify(repository, never()).insertRequestDecision(any(), any(), any(), any(), any());
+    }
 }

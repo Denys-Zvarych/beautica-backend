@@ -100,8 +100,21 @@ public class ServiceTypeSuggestionReviewController {
     public String reject(
             @RequestParam("token") @NotBlank @Size(max = MAX_TOKEN_LENGTH)
             @Pattern(regexp = TOKEN_PATTERN) String token,
+            @RequestParam(value = "reason", required = false) String reason,
             Model model) {
-        return renderDecision(suggestionService.reject(token), model);
+        DecisionReason.Parsed parsed = DecisionReason.parse(reason);
+        if (parsed.tooLong()) {
+            // Over-long reason: no decision is made; same neutral page as any unusable submission.
+            return neutralStatus(model);
+        }
+        String cleaned = parsed.value();
+        DecisionOutcome outcome = suggestionService.reject(token, cleaned);
+        String view = renderDecision(outcome, model);
+        if (outcome == DecisionOutcome.REJECTED && cleaned != null) {
+            // Echoed back to the admin as confirmation; escaped by th:text in the result template.
+            model.addAttribute("reason", cleaned);
+        }
+        return view;
     }
 
     private String renderDecision(DecisionOutcome outcome, Model model) {

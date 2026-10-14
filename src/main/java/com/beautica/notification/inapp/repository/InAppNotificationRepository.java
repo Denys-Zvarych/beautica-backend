@@ -316,6 +316,52 @@ public interface InAppNotificationRepository extends Repository<InAppNotificatio
             @Param("subjectUserId") UUID subjectUserId,
             @Param("dedupKey") String dedupKey);
 
+    /**
+     * Phase 372 — one request-decision item for ONE recipient (the requester). Exactly one of
+     * {@code categoryRequestId} / {@code suggestionId} is non-null, matching the type (enforced by
+     * {@code in_app_notification_shape_chk}). Driven by {@code users} so a stale requester id yields no
+     * row instead of an FK failure. {@code salon_id} / {@code subject_user_id} stay null (D8).
+     */
+    @Modifying
+    @Query(value = """
+            INSERT INTO in_app_notification
+                (id, recipient_user_id, type, category_request_id, service_type_suggestion_id, dedup_key)
+            SELECT gen_random_uuid(), u.id, :type, :categoryRequestId, :suggestionId, :dedupKey
+              FROM users u
+             WHERE u.id = :recipientId
+            ON CONFLICT (recipient_user_id, dedup_key) DO NOTHING
+            """, nativeQuery = true)
+    int insertRequestDecision(
+            @Param("type") String type,
+            @Param("recipientId") UUID recipientId,
+            @Param("categoryRequestId") Long categoryRequestId,
+            @Param("suggestionId") UUID suggestionId,
+            @Param("dedupKey") String dedupKey);
+
+    /** Push twin of {@link #insertRequestDecision}. */
+    @Modifying
+    @Query(value = """
+            WITH ins AS (
+                INSERT INTO in_app_notification
+                    (id, recipient_user_id, type, category_request_id, service_type_suggestion_id, dedup_key)
+                SELECT gen_random_uuid(), u.id, :type, :categoryRequestId, :suggestionId, :dedupKey
+                  FROM users u
+                 WHERE u.id = :recipientId
+                ON CONFLICT (recipient_user_id, dedup_key) DO NOTHING
+                RETURNING id, recipient_user_id
+            )
+            INSERT INTO notification_outbox (event_type, aggregate_id)
+            SELECT 'INAPP_PUSH', ins.id FROM ins
+             WHERE EXISTS (SELECT 1 FROM device_tokens dt
+                            WHERE dt.user_id = ins.recipient_user_id AND dt.is_active)
+            """, nativeQuery = true)
+    int insertRequestDecisionWithPush(
+            @Param("type") String type,
+            @Param("recipientId") UUID recipientId,
+            @Param("categoryRequestId") Long categoryRequestId,
+            @Param("suggestionId") UUID suggestionId,
+            @Param("dedupKey") String dedupKey);
+
     /** Push twin of {@link #insertClientOnlyBulk}. */
     @Modifying
     @Query(value = """
