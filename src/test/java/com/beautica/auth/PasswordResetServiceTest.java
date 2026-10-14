@@ -118,9 +118,8 @@ class PasswordResetServiceTest {
     @Test
     @DisplayName("requestReset — mints and sends OTP for active+verified user")
     void should_mintAndSendOtp_when_userIsActiveAndVerified() {
-        User preRead = activeVerifiedUser();
         User locked = activeVerifiedUser();
-        when(userRepository.findByEmail(TEST_EMAIL)).thenReturn(Optional.of(preRead));
+        when(userRepository.findPasswordResetEligibleByEmail(TEST_EMAIL)).thenReturn(Optional.of(true));
         when(userRepository.findByEmailForUpdate(TEST_EMAIL)).thenReturn(Optional.of(locked));
         when(passwordResetOtpProcessor.isLocked(locked)).thenReturn(false);
         when(tokenGenerator.generateOtp()).thenReturn("123456");
@@ -137,7 +136,7 @@ class PasswordResetServiceTest {
     @Test
     @DisplayName("requestReset — silent no-op when email is unknown (enumeration protection; decoy work still runs)")
     void should_returnSilently_when_emailUnknown() {
-        when(userRepository.findByEmail(TEST_EMAIL)).thenReturn(Optional.empty());
+        when(userRepository.findPasswordResetEligibleByEmail(TEST_EMAIL)).thenReturn(Optional.empty());
         when(tokenGenerator.generateOtp()).thenReturn("000000");
 
         service.requestReset(new ForgotPasswordRequest(TEST_EMAIL));
@@ -145,9 +144,9 @@ class PasswordResetServiceTest {
         // Same decoy-work timing defense as the unverified/inactive cases: performDecoyWork
         // calls the NON-locking findByEmail (never findByEmailForUpdate) as a read-only,
         // discarded-result timing mirror even when the email doesn't exist at all — see
-        // PasswordResetService#performDecoyWork. Called twice: once for the initial pre-read,
-        // once inside the decoy work.
-        verify(userRepository, times(2)).findByEmail(TEST_EMAIL);
+        // PasswordResetService#performDecoyWork. Called once:
+        // inside the decoy work.
+        verify(userRepository).findByEmail(TEST_EMAIL);
         verify(userRepository, never()).findByEmailForUpdate(any());
         verifyNoInteractions(emailNotificationService);
         verify(passwordResetOtpProcessor, never()).isLocked(any());
@@ -156,8 +155,7 @@ class PasswordResetServiceTest {
     @Test
     @DisplayName("requestReset — silent no-op when user's email is unverified (decoy work still runs, timing defense)")
     void should_returnSilently_when_userUnverified() {
-        User user = unverifiedUser();
-        when(userRepository.findByEmail(TEST_EMAIL)).thenReturn(Optional.of(user));
+        when(userRepository.findPasswordResetEligibleByEmail(TEST_EMAIL)).thenReturn(Optional.of(false));
         when(tokenGenerator.generateOtp()).thenReturn("000000");
 
         service.requestReset(new ForgotPasswordRequest(TEST_EMAIL));
@@ -165,8 +163,8 @@ class PasswordResetServiceTest {
         // performDecoyWork deliberately mirrors the eligible path's lock-escalation lookup
         // for timing-attack defense using the NON-locking findByEmail — it's a read-only,
         // discarded-result call, not a real OTP write, so it's expected here (see
-        // PasswordResetService#performDecoyWork). Called twice: pre-read + decoy work.
-        verify(userRepository, times(2)).findByEmail(TEST_EMAIL);
+        // PasswordResetService#performDecoyWork). Called once (the pre-read is a scalar projection).
+        verify(userRepository).findByEmail(TEST_EMAIL);
         verify(userRepository, never()).findByEmailForUpdate(any());
         verifyNoInteractions(emailNotificationService);
     }
@@ -174,22 +172,35 @@ class PasswordResetServiceTest {
     @Test
     @DisplayName("requestReset — silent no-op when user account is inactive (decoy work still runs, timing defense)")
     void should_returnSilently_when_userInactive() {
-        User user = inactiveUser();
-        when(userRepository.findByEmail(TEST_EMAIL)).thenReturn(Optional.of(user));
+        when(userRepository.findPasswordResetEligibleByEmail(TEST_EMAIL)).thenReturn(Optional.of(false));
         when(tokenGenerator.generateOtp()).thenReturn("000000");
 
         service.requestReset(new ForgotPasswordRequest(TEST_EMAIL));
 
         // Same decoy-work timing defense as the unverified case above.
-        verify(userRepository, times(2)).findByEmail(TEST_EMAIL);
+        verify(userRepository).findByEmail(TEST_EMAIL);
         verify(userRepository, never()).findByEmailForUpdate(any());
         verifyNoInteractions(emailNotificationService);
     }
 
     @Test
+    @DisplayName("requestReset — mixed-case, padded email is lower-cased and stripped before the eligibility pre-read")
+    void should_queryNormalisedEmail_when_forgotPasswordEmailHasCaseAndWhitespace() {
+        // Exact-match projection (UserRepositoryEligibilityProjectionTest): without caller
+        // normalisation a real, eligible user typing "User@Example.com " would never get a code.
+        when(userRepository.findPasswordResetEligibleByEmail(TEST_EMAIL)).thenReturn(Optional.of(false));
+        when(tokenGenerator.generateOtp()).thenReturn("000000");
+
+        service.requestReset(new ForgotPasswordRequest(" User@EXAMPLE.com  "));
+
+        verify(userRepository).findPasswordResetEligibleByEmail(TEST_EMAIL);
+        verify(userRepository).findByEmail(TEST_EMAIL);
+    }
+
+    @Test
     @DisplayName("requestReset — performs decoy crypto + DB work on unknown-email no-op (timing defense)")
     void should_performDecoyWork_when_emailUnknown() {
-        when(userRepository.findByEmail(TEST_EMAIL)).thenReturn(Optional.empty());
+        when(userRepository.findPasswordResetEligibleByEmail(TEST_EMAIL)).thenReturn(Optional.empty());
         when(tokenGenerator.generateOtp()).thenReturn("000000");
 
         service.requestReset(new ForgotPasswordRequest(TEST_EMAIL));
@@ -200,7 +211,7 @@ class PasswordResetServiceTest {
         // NON-locking findByEmail, never findByEmailForUpdate (see F1: an ineligible-but-known
         // account must not take a real row lock on the decoy path). Called twice: pre-read +
         // decoy work.
-        verify(userRepository, times(2)).findByEmail(TEST_EMAIL);
+        verify(userRepository).findByEmail(TEST_EMAIL);
         verify(userRepository, never()).findByEmailForUpdate(any());
         verifyNoInteractions(emailNotificationService);
     }
@@ -208,9 +219,8 @@ class PasswordResetServiceTest {
     @Test
     @DisplayName("requestReset — silent no-op when a locked account is (re)requested (anti-brute-force)")
     void should_returnSilently_when_accountLocked() {
-        User preRead = activeVerifiedUser();
-        User locked = activeVerifiedUser();
-        when(userRepository.findByEmail(TEST_EMAIL)).thenReturn(Optional.of(preRead));
+                User locked = activeVerifiedUser();
+        when(userRepository.findPasswordResetEligibleByEmail(TEST_EMAIL)).thenReturn(Optional.of(true));
         when(userRepository.findByEmailForUpdate(TEST_EMAIL)).thenReturn(Optional.of(locked));
         when(passwordResetOtpProcessor.isLocked(locked)).thenReturn(true);
 
@@ -227,12 +237,11 @@ class PasswordResetServiceTest {
             + "cooldown gets a silent no-op, NOT a 429 (anti-enumeration: a 429 here would leak "
             + "account existence via response status alone)")
     void should_return200NotThrottled_when_unauthenticatedCallerRepeatsForgotPasswordWithinCooldown() {
-        User preRead = activeVerifiedUser();
-        User locked = activeVerifiedUser();
+                User locked = activeVerifiedUser();
         // Code was issued 10s ago (otpTtl=15m, so expiresAt = now + 15m - 10s); cooldown 60s
         // means nextAllowed = issuedAt + 60s = (now - 10s) + 60s = now + 50s (still in the future).
         locked.setPasswordResetCodeExpiresAt(FIXED_NOW.plusSeconds(890));
-        when(userRepository.findByEmail(TEST_EMAIL)).thenReturn(Optional.of(preRead));
+        when(userRepository.findPasswordResetEligibleByEmail(TEST_EMAIL)).thenReturn(Optional.of(true));
         when(userRepository.findByEmailForUpdate(TEST_EMAIL)).thenReturn(Optional.of(locked));
         when(passwordResetOtpProcessor.isLocked(locked)).thenReturn(false);
 

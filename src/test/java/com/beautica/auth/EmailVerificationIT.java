@@ -84,6 +84,9 @@ class EmailVerificationIT extends AbstractIntegrationTest {
     @Autowired
     private TokenGenerator tokenGenerator;
 
+    @Autowired
+    private StaleVerificationCleanupJob staleVerificationCleanupJob;
+
 
     // ── Helper: register and capture raw OTP ─────────────────────────────────
 
@@ -575,6 +578,106 @@ class EmailVerificationIT extends AbstractIntegrationTest {
 
         await().during(Duration.ofMillis(500)).atMost(Duration.ofSeconds(1)).untilAsserted(() ->
                 verify(emailNotificationService, never()).sendVerificationEmail(any(), any()));
+    }
+
+    // ── Dead-end regression: resend after the stored code was wiped ───────────
+
+    private ResponseEntity<String> postResend(String email) {
+        return restTemplate.postForEntity(
+                "/api/v1/auth/resend-verification",
+                new ResendVerificationRequest(email),
+                String.class);
+    }
+
+    private String awaitResentCode(String email) {
+        var captor = ArgumentCaptor.forClass(String.class);
+        await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
+                verify(emailNotificationService, times(1))
+                        .sendVerificationEmail(eq(email), captor.capture()));
+        return captor.getValue();
+    }
+
+    private ResponseEntity<String> postVerify(String email, String code) {
+        return restTemplate.postForEntity(
+                "/api/v1/auth/verify-email", new VerifyEmailRequest(email, code), String.class);
+    }
+
+    @Test
+    @DisplayName("should issue a new code and let the user verify when the previous code expired and was wiped")
+    void should_resendAndVerify_when_expiredCodeWasWiped() throws Exception {
+        var email = "expired.then.resend@beautica.test";
+        String oldCode = registerAndCaptureCode(email);
+        jdbcTemplate.update(
+                "UPDATE users SET verification_code_expires_at = ? WHERE email = ?",
+                Timestamp.from(Instant.now().minusSeconds(1)), email);
+
+        // Expired submit wipes the stored code (EmailVerificationProcessor).
+        assertThat(postVerify(email, oldCode).getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(transactionTemplate.execute(s ->
+                userRepository.findByEmail(email).orElseThrow()).getVerificationCodeHash()).isNull();
+
+        ResponseEntity<String> resend = postResend(email);
+
+        assertThat(resend.getStatusCode()).isEqualTo(HttpStatus.OK);
+        String newCode = awaitResentCode(email);
+        assertThat(newCode).matches("[0-9]{6}");
+        assertThat(postVerify(email, newCode).getStatusCode())
+                .as("the freshly issued code must verify the account")
+                .isEqualTo(HttpStatus.OK);
+    }
+
+    @Test
+    @DisplayName("should issue a new code when the stale-verification cleanup job wiped the stored code")
+    void should_resendNewCode_when_cleanupJobWipedCode() throws Exception {
+        var email = "cleanup.then.resend@beautica.test";
+        registerAndCaptureCode(email);
+        // Older than any plausible stale-code-retention so the real sweep picks the row up.
+        jdbcTemplate.update(
+                "UPDATE users SET verification_code_expires_at = ? WHERE email = ?",
+                Timestamp.from(Instant.now().minus(Duration.ofDays(400))), email);
+
+        staleVerificationCleanupJob.sweep();
+
+        assertThat(transactionTemplate.execute(s ->
+                userRepository.findByEmail(email).orElseThrow()).getVerificationCodeHash())
+                .as("cleanup job must have wiped the code").isNull();
+
+        ResponseEntity<String> resend = postResend(email);
+
+        assertThat(resend.getStatusCode()).isEqualTo(HttpStatus.OK);
+        String newCode = awaitResentCode(email);
+        assertThat(postVerify(email, newCode).getStatusCode()).isEqualTo(HttpStatus.OK);
+    }
+
+    @Test
+    @DisplayName("should NOT issue a code when a locked user with a wiped code calls resend")
+    void should_notIssueCode_when_lockedUserResendsWithWipedCode() throws Exception {
+        var email = "locked.wiped.resend@beautica.test";
+        registerAndCaptureCode(email);
+        jdbcTemplate.update(
+                "UPDATE users SET verification_code_hash = NULL, verification_code_expires_at = NULL,"
+                        + " verification_locked_until = ? WHERE email = ?",
+                Timestamp.from(Instant.now().plus(Duration.ofMinutes(10))), email);
+
+        ResponseEntity<String> resend = postResend(email);
+
+        assertThat(resend.getStatusCode()).isEqualTo(HttpStatus.OK);
+        await().during(Duration.ofMillis(500)).atMost(Duration.ofSeconds(1)).untilAsserted(() ->
+                verify(emailNotificationService, never()).sendVerificationEmail(eq(email), any()));
+        assertThat(transactionTemplate.execute(s ->
+                userRepository.findByEmail(email).orElseThrow()).getVerificationCodeHash())
+                .as("a locked user must not get a usable code via resend").isNull();
+    }
+
+    @Test
+    @DisplayName("should return 200 and send no mail when resend is called for an unknown email (wiped-code path)")
+    void should_return200AndNoMail_when_resendUnknownEmailAfterFix() {
+        var email = "never.registered.resend@beautica.test";
+
+        ResponseEntity<String> resend = postResend(email);
+
+        assertThat(resend.getStatusCode()).isEqualTo(HttpStatus.OK);
+        verify(emailNotificationService, never()).sendVerificationEmail(eq(email), any());
     }
 
     // ── Test 13 (QA HIGH) — cumulative lockout survives resend ────────────────

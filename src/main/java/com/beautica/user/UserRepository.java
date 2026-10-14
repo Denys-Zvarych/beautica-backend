@@ -21,6 +21,24 @@ public interface UserRepository extends JpaRepository<User, UUID> {
 
     Optional<User> findByEmail(String email);
 
+    /**
+     * Column-only pre-read for {@code AuthService.resendVerification}: {@code true} when the account is
+     * unverified AND active. Deliberately a scalar projection, NOT an entity load - an entity loaded here
+     * would sit in the persistence context, and the later {@link #findByEmailForUpdate} in the same
+     * transaction would return that stale copy (ignoring a concurrent writer's committed changes) instead of
+     * the freshly locked row, defeating the resend cooldown.
+     */
+    @Query("SELECT (u.emailVerified = false AND u.isActive = true) FROM User u WHERE u.email = :email")
+    Optional<Boolean> findResendVerificationEligibleByEmail(@Param("email") String email);
+
+    /**
+     * Column-only pre-read for {@code PasswordResetService.requestReset}: {@code true} when the account is
+     * verified AND active. Scalar projection for the same stale-entity reason as
+     * {@link #findResendVerificationEligibleByEmail}.
+     */
+    @Query("SELECT (u.emailVerified = true AND u.isActive = true) FROM User u WHERE u.email = :email")
+    Optional<Boolean> findPasswordResetEligibleByEmail(@Param("email") String email);
+
     boolean existsByEmail(String email);
 
     /**
