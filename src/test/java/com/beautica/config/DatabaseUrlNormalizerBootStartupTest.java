@@ -1,5 +1,6 @@
 package com.beautica.config;
 
+import com.beautica.support.TestSecrets;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.WebApplicationType;
@@ -36,7 +37,8 @@ class DatabaseUrlNormalizerBootStartupTest {
                         // EnvironmentFingerprintGuard (Phase 368): prod requires R2 on with the exact prod bucket.
                         "R2_ENABLED=true", "CLOUDFLARE_R2_BUCKET=beautica-media-prod",
                         "CLOUDFLARE_R2_PUBLIC_URL=https://media.beautica.ua", "FRONTEND_BASE_URL=https://app.beautica.ua",
-                        "PUBLIC_BASE_URL=https://api.beautica.ua", "SUPPORT_EMAIL=help@beautica.ua");
+                        "PUBLIC_BASE_URL=https://api.beautica.ua", "SUPPORT_EMAIL=help@beautica.ua",
+                        "INTERNAL_API_KEY=" + TestSecrets.INTERNAL_API_KEY);
     }
 
     private static List<Throwable> chain(Throwable t) {

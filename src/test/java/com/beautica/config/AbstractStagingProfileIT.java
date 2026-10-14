@@ -1,5 +1,6 @@
 package com.beautica.config;
 
+import com.beautica.support.TestSecrets;
 import com.beautica.AbstractIntegrationTest;
 import com.github.tomakehurst.wiremock.WireMockServer;
 import com.github.tomakehurst.wiremock.core.WireMockConfiguration;
@@ -25,6 +26,7 @@ import static com.github.tomakehurst.wiremock.client.WireMock.urlMatching;
 @ActiveProfiles(profiles = {"prod", "staging"}, inheritProfiles = false)
 @TestPropertySource(properties = {
         "JWT_SECRET=staging-it-jwt-secret-min-32-bytes-testonly",
+        "INTERNAL_API_KEY=" + TestSecrets.INTERNAL_API_KEY,
         "APP_OTP_PEPPER=staging-it-otp-pepper-fixed-value-min-32-chars",
         "OUTBOX_PAYLOAD_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
         "FRONTEND_BASE_URL=https://staging.invalid",

@@ -1,5 +1,6 @@
 package com.beautica.config;
 
+import com.beautica.support.TestSecrets;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.mock.env.MockEnvironment;
@@ -12,6 +13,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class EnvironmentFingerprintGuardTest {
 
     private static final String SECRET = "tok-S3cr3t-value-9xQ";
+    private static final String VALID_KEY = TestSecrets.INTERNAL_API_KEY;
 
     private static MockEnvironment stagingEnv() {
         MockEnvironment env = new MockEnvironment()
@@ -22,7 +24,8 @@ class EnvironmentFingerprintGuardTest {
                 .withProperty("app.public-base-url", "https://api.staging.beautica.test")
                 .withProperty("app.frontend.base-url", "https://example.invalid")
                 .withProperty("app.cloudflare-r2.public-url", "https://media.staging.beautica.test")
-                .withProperty("app.support.email", "support@test.invalid");
+                .withProperty("app.support.email", "support@test.invalid")
+                .withProperty("app.internal-api-key", VALID_KEY);
         env.setActiveProfiles("prod", "staging");
         return env;
     }
@@ -36,7 +39,8 @@ class EnvironmentFingerprintGuardTest {
                 .withProperty("app.public-base-url", "https://api.beautica.ua")
                 .withProperty("app.frontend.base-url", "https://app.beautica.ua")
                 .withProperty("app.cloudflare-r2.public-url", "https://media.beautica.ua")
-                .withProperty("app.support.email", "help@beautica.ua");
+                .withProperty("app.support.email", "help@beautica.ua")
+                .withProperty("app.internal-api-key", VALID_KEY);
         env.setActiveProfiles("prod");
         return env;
     }
@@ -174,7 +178,8 @@ class EnvironmentFingerprintGuardTest {
                 .withProperty("spring.mail.host", "mailpit.railway.internal")
                 .withProperty("app.public-base-url", "https://api.staging.beautica.test")
                 .withProperty("app.frontend.base-url", "https://example.invalid")
-                .withProperty("app.support.email", "support@test.invalid");
+                .withProperty("app.support.email", "support@test.invalid")
+                .withProperty("app.internal-api-key", VALID_KEY);
         noRailway.setActiveProfiles("prod", "staging");
 
         assertThatCode(() -> run(noRailway, DeployEnvironment.STAGING, SmsMode.CAPTURE)).doesNotThrowAnyException();
@@ -517,5 +522,62 @@ class EnvironmentFingerprintGuardTest {
         assertThatThrownBy(() -> run(prodEnv().withProperty("app.public-base-url", "https://api.beautica.ua/api"),
                 DeployEnvironment.PROD, SmsMode.TURBOSMS)).hasMessageContaining("public-base-url-path");
         assertStagingPublicUrlRejected("https://api.staging.beautica.test/api", "public-base-url-path");
+    }
+
+    // ---- internal-api-key rule (audit-fix cycle 1) ----
+
+    @Test
+    @DisplayName("prod with a blank internal API key — fails naming the rule and property")
+    void should_fail_when_prodInternalApiKeyBlank() {
+        MockEnvironment env = prodEnv().withProperty("app.internal-api-key", "");
+
+        assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                .hasMessageContaining("internal-api-key-blank").hasMessageContaining("app.internal-api-key");
+    }
+
+    @Test
+    @DisplayName("prod with the dev default internal API key — fails, message carries no value")
+    void should_fail_when_prodInternalApiKeyIsDevDefault() {
+        MockEnvironment env = prodEnv().withProperty("app.internal-api-key", "changeme-dev-only");
+
+        assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                .hasMessageContaining("internal-api-key-default")
+                .message().doesNotContain("changeme-dev-only");
+    }
+
+    @Test
+    @DisplayName("prod with an internal API key under 32 chars — fails, message carries no value")
+    void should_fail_when_prodInternalApiKeyTooShort() {
+        String shortKey = "s".repeat(31);
+        MockEnvironment env = prodEnv().withProperty("app.internal-api-key", shortKey);
+
+        assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                .hasMessageContaining("internal-api-key-length").message().doesNotContain(shortKey);
+    }
+
+    @Test
+    @DisplayName("prod with an unresolvable internal API key placeholder — counts as unset")
+    void should_fail_when_prodInternalApiKeyMissing() {
+        MockEnvironment env = prodEnv().withProperty("app.internal-api-key", "${INTERNAL_API_KEY_UNSET_FOR_TEST}");
+
+        assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                .hasMessageContaining("internal-api-key-blank");
+    }
+
+    @Test
+    @DisplayName("staging with the dev default internal API key — fails")
+    void should_fail_when_stagingInternalApiKeyIsDevDefault() {
+        MockEnvironment env = stagingEnv().withProperty("app.internal-api-key", "changeme-dev-only");
+
+        assertThatThrownBy(() -> run(env, DeployEnvironment.STAGING, SmsMode.CAPTURE))
+                .hasMessageContaining("internal-api-key-default");
+    }
+
+    @Test
+    @DisplayName("prod with exactly 32 chars — passes")
+    void should_pass_when_prodInternalApiKeyIsExactlyMinLength() {
+        MockEnvironment env = prodEnv().withProperty("app.internal-api-key", "k".repeat(32));
+
+        assertThatCode(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS)).doesNotThrowAnyException();
     }
 }

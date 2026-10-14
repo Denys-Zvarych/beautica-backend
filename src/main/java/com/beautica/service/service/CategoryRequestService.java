@@ -4,6 +4,7 @@ import com.beautica.auth.TokenGenerator;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.config.PublicBaseUrlProperties;
 import com.beautica.notification.EmailService;
+import com.beautica.search.service.SearchSuggestionCatalogue;
 import com.beautica.service.dto.ApprovedCategoryResponse;
 import com.beautica.service.dto.CategoryRequestResponse;
 import com.beautica.service.dto.CreateCategoryRequestRequest;
@@ -74,6 +75,9 @@ public class CategoryRequestService {
     @Value("${app.admin-email}")
     private String adminEmail;
 
+    /** SpEL guard: evict only when the decision actually changed state. */
+    private static final String APPROVED_ONLY = "#result.name() == 'APPROVED'";
+
     /**
      * Outcome of a token-bearing review/decision operation. The controller maps it
      * to a neutral HTML page; no variant leaks whether a request existed.
@@ -143,11 +147,25 @@ public class CategoryRequestService {
      * Approves the PENDING request identified by the token: APPROVED + active,
      * token cleared (single-use). Idempotent: a second call returns
      * {@link DecisionOutcome#ALREADY_DECIDED} (or INVALID_OR_EXPIRED) — no 500.
+     *
+     * <p>Evicts only when the outcome is {@code APPROVED}: the endpoint is public, so a garbage or
+     * replayed token must not flush the caches.
+     *
+     * <p>The single eviction mechanism is the conditional {@code @CacheEvict} set below. It runs
+     * POST-commit: the caching advisor is outermost ({@code CacheConfig}, {@code @EnableCaching(order =
+     * HIGHEST_PRECEDENCE)}), so it wraps the {@code @Transactional} advisor and evicts only after the
+     * transaction has committed; a rollback (exception) evicts nothing. A reader that began loading
+     * before the commit can still repopulate a stale snapshot; that in-flight load is bounded only by
+     * the cache TTL.
      */
     @Transactional
     @Caching(evict = {
-            @CacheEvict(value = APPROVED_CATEGORIES_CACHE, key = APPROVED_CATEGORIES_KEY),
-            @CacheEvict(value = PlatformCategoryOrderLookup.CACHE_NAME, key = PlatformCategoryOrderLookup.CACHE_KEY)
+            @CacheEvict(value = APPROVED_CATEGORIES_CACHE, key = APPROVED_CATEGORIES_KEY,
+                    condition = APPROVED_ONLY),
+            @CacheEvict(value = PlatformCategoryOrderLookup.CACHE_NAME, key = PlatformCategoryOrderLookup.CACHE_KEY,
+                    condition = APPROVED_ONLY),
+            @CacheEvict(value = SearchSuggestionCatalogue.CACHE_NAME, allEntries = true,
+                    condition = APPROVED_ONLY)
     })
     public DecisionOutcome approve(String rawToken) {
         return decide(rawToken, true);
@@ -155,13 +173,10 @@ public class CategoryRequestService {
 
     /**
      * Rejects the PENDING request identified by the token: REJECTED, token cleared.
-     * Idempotent (see {@link #approve}).
+     * Idempotent (see {@link #approve}). Evicts nothing: a REJECTED request never appears in any
+     * cached list (they hold APPROVED + active categories only), and a PENDING one does not either.
      */
     @Transactional
-    @Caching(evict = {
-            @CacheEvict(value = APPROVED_CATEGORIES_CACHE, key = APPROVED_CATEGORIES_KEY),
-            @CacheEvict(value = PlatformCategoryOrderLookup.CACHE_NAME, key = PlatformCategoryOrderLookup.CACHE_KEY)
-    })
     public DecisionOutcome reject(String rawToken) {
         return decide(rawToken, false);
     }
@@ -170,17 +185,17 @@ public class CategoryRequestService {
      * Approved + active categories for the authenticated mobile picker.
      *
      * <p>Cached under a single global {@code 'all'} key — the list is platform-wide.
-     * Eviction is the inline {@code @CacheEvict} on {@link #approve} / {@link #reject}
-     * (the only paths that change APPROVED/active membership). Inline (pre-commit)
-     * eviction is acceptable here rather than the afterCommit pattern because both
-     * decision paths are extremely low-frequency admin clicks (one per emailed
-     * approval link) with no realistic concurrent reader racing to repopulate a
-     * stale snapshot between eviction and commit; the 60-minute TTL is the backstop.
+     * Eviction is the {@code @CacheEvict} on {@link #approve} and on
+     * {@link InternalCategoryService#create} (the two paths that change
+     * APPROVED/active membership; reject changes no cached data). That eviction is
+     * post-commit (cache advisor outermost, CacheConfig); an in-flight load that started
+     * before the commit is bounded only by the 60-minute TTL, acceptable for a
+     * low-frequency admin click.
      * {@code submitRequest} only inserts PENDING rows (not in this list) so it needs
      * no eviction.
      *
      * <p>The sibling {@link PlatformCategoryOrderLookup#CACHE_NAME} cache is evicted
-     * alongside this one on {@link #approve}/{@link #reject}: it backs {@code
+     * alongside this one on {@link #approve} and {@link InternalCategoryService#create}: it backs {@code
      * ServiceCatalogService#buildCategoryOrderAndNames} with the same {@code findApprovedActive()}
      * query result, kept as a separate cache/bean because it returns entities for internal
      * ordering rather than the {@link ApprovedCategoryResponse} DTO this method exposes.

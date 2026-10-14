@@ -36,6 +36,9 @@ springdoc:
 # property-resolution time (IllegalArgumentException at startup) instead of silently
 # emitting invite links that point at localhost.
 app:
+  # No dev default (it used to live in the base profile). Empty when INTERNAL_API_KEY is unset, so
+  # EnvironmentFingerprintGuard aborts startup with a clear rule instead of an unresolved-placeholder error.
+  internal-api-key: ${INTERNAL_API_KEY:}
   frontend:
     base-url: ${FRONTEND_BASE_URL}
   # Same fail-closed treatment for the backend's own public origin (admin approval e-mail links).

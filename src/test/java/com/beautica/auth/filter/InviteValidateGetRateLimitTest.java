@@ -77,7 +77,7 @@ class InviteValidateGetRateLimitTest {
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(),
-                tinyInviteValidateCache(), permissive(), permissive(), permissive());
+                tinyInviteValidateCache(), permissive(), permissive(), permissive(), permissive(), permissive());
     }
 
     private static MockHttpServletRequest get(String path, String remoteAddr) {
@@ -201,5 +201,28 @@ class InviteValidateGetRateLimitTest {
                     .as("request %d to an unrelated GET path must be forwarded", i + 1)
                     .isNotNull();
         }
+    }
+
+    @Test
+    @DisplayName("should_return429_when_inviteValidateHeadFloodedFromOneIp")
+    void should_return429_when_inviteValidateHeadFloodedFromOneIp() throws Exception {
+        AuthRateLimitFilter filter = filterWithTinyInviteValidateBucket();
+        var head = new MockHttpServletRequest("HEAD", VALIDATE_PATH);
+        head.setRemoteAddr(REMOTE_ADDR);
+
+        MockHttpServletResponse last = null;
+        MockFilterChain lastChain = null;
+        boolean throttled = false;
+        for (int i = 0; i < TEST_VALIDATE_CAPACITY + 5 && !throttled; i++) {
+            last = new MockHttpServletResponse();
+            lastChain = new MockFilterChain();
+            filter.doFilterInternal(head, last, lastChain);
+            throttled = last.getStatus() == 429;
+        }
+
+        assertThat(throttled)
+                .as("HEAD is routed by Spring to the @GetMapping handler, so it must be throttled like GET")
+                .isTrue();
+        assertThat(lastChain.getRequest()).as("throttled HEAD must not reach the chain").isNull();
     }
 }

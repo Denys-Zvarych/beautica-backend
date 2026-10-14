@@ -1,5 +1,6 @@
 package com.beautica.config;
 
+import com.beautica.support.TestSecrets;
 import com.beautica.TestPostgresImage;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -94,12 +95,12 @@ class DeploymentEnvironmentStampIT {
                     "spring.mail.username=", "spring.mail.password=",
                     // EnvironmentFingerprintGuard link-URL + support-email rules.
                     "app.public-base-url=https://api.staging.beautica.test", "app.frontend.base-url=https://example.invalid",
-                    "app.support.email=support@test.invalid"));
+                    "app.support.email=support@test.invalid", "app.internal-api-key=" + TestSecrets.INTERNAL_API_KEY));
             case PROD -> props.addAll(List.of("beautica.sms.mode=turbosms", "spring.mail.host=smtp-relay.brevo.com",
                     "app.cloudflare-r2.enabled=true", "app.cloudflare-r2.bucket=beautica-media-prod",
                     "app.cloudflare-r2.public-url=https://media.beautica.ua",
                     "app.public-base-url=https://api.beautica.ua", "app.frontend.base-url=https://app.beautica.ua",
-                    "app.support.email=help@beautica.ua"));
+                    "app.support.email=help@beautica.ua", "app.internal-api-key=" + TestSecrets.INTERNAL_API_KEY));
             case LOCAL -> { }
         }
         return new SpringApplicationBuilder(MinimalConfig.class)

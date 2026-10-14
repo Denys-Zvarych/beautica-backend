@@ -4,6 +4,7 @@ import com.beautica.auth.TokenGenerator;
 import com.beautica.config.CacheConfig;
 import com.beautica.config.PublicBaseUrlProperties;
 import com.beautica.notification.EmailService;
+import com.beautica.search.service.SearchSuggestionCatalogue;
 import com.beautica.service.entity.PlatformCategory;
 import com.beautica.service.repository.PlatformCategoryRepository;
 import org.junit.jupiter.api.BeforeEach;
@@ -115,18 +116,18 @@ class CategoryRequestServiceCacheTest {
     }
 
     @Test
-    @DisplayName("should_evictCache_when_rejectCalled")
-    void should_evictCache_when_rejectCalled() {
+    @DisplayName("should_notEvictCache_when_rejectCalled")
+    void should_notEvictCache_when_rejectCalled() {
         when(platformCategoryRepository.findApprovedActive())
                 .thenReturn(List.of(PlatformCategory.ofApproved("MANICURE", "Манікюр")));
         when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
         when(platformCategoryRepository.findByTokenHash(TOKEN_HASH)).thenReturn(Optional.of(pending()));
 
         service.listApproved();          // populate cache
-        service.reject(RAW_TOKEN);       // must evict
-        service.listApproved();          // cache miss → re-query
+        service.reject(RAW_TOKEN);       // changes no cached data — must NOT evict
+        service.listApproved();          // still cached
 
-        verify(platformCategoryRepository, times(2)).findApprovedActive();
+        verify(platformCategoryRepository, times(1)).findApprovedActive();
     }
 
     @Test
@@ -176,17 +177,102 @@ class CategoryRequestServiceCacheTest {
     }
 
     @Test
-    @DisplayName("should_evictPlatformCategoryOrderCache_when_rejectCalled")
-    void should_evictPlatformCategoryOrderCache_when_rejectCalled() {
+    @DisplayName("should_notEvictPlatformCategoryOrderCache_when_rejectCalled")
+    void should_notEvictPlatformCategoryOrderCache_when_rejectCalled() {
         when(platformCategoryRepository.findApprovedActive())
                 .thenReturn(List.of(PlatformCategory.ofApproved("MANICURE", "Манікюр")));
         when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
         when(platformCategoryRepository.findByTokenHash(TOKEN_HASH)).thenReturn(Optional.of(pending()));
 
         platformCategoryOrderLookup.getApprovedActive();  // populate cache
-        service.reject(RAW_TOKEN);                        // must evict
-        platformCategoryOrderLookup.getApprovedActive();  // cache miss → re-query
+        service.reject(RAW_TOKEN);                        // must NOT evict
+        platformCategoryOrderLookup.getApprovedActive();  // still cached
 
-        verify(platformCategoryRepository, times(2)).findApprovedActive();
+        verify(platformCategoryRepository, times(1)).findApprovedActive();
+    }
+
+    // ── searchSuggestionCatalogue cache: category approve/reject change the selectable labels ──
+
+    @Test
+    @DisplayName("should_evictSuggestionCatalogue_when_approveCalled")
+    void should_evictSuggestionCatalogue_when_approveCalled() {
+        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
+        when(platformCategoryRepository.findByTokenHash(TOKEN_HASH)).thenReturn(Optional.of(pending()));
+        cacheManager.getCache(SearchSuggestionCatalogue.CACHE_NAME).put("k", "stale");
+
+        service.approve(RAW_TOKEN);
+
+        assertThat(cacheManager.getCache(SearchSuggestionCatalogue.CACHE_NAME).get("k")).isNull();
+    }
+
+    @Test
+    @DisplayName("should_notEvictSuggestionCatalogue_when_rejectCalled")
+    void should_notEvictSuggestionCatalogue_when_rejectCalled() {
+        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
+        when(platformCategoryRepository.findByTokenHash(TOKEN_HASH)).thenReturn(Optional.of(pending()));
+        cacheManager.getCache(SearchSuggestionCatalogue.CACHE_NAME).put("k", "stale");
+
+        service.reject(RAW_TOKEN);
+
+        assertThat(cacheManager.getCache(SearchSuggestionCatalogue.CACHE_NAME).get("k")).isNotNull();
+    }
+
+    // ── no-op outcomes must not flush the caches (public, unthrottled-by-token endpoint) ──
+
+    private void warmAllCaches() {
+        cacheManager.getCache("approved-categories").put("all", "warm");
+        cacheManager.getCache("platform-category-order").put("all", "warm");
+        cacheManager.getCache(SearchSuggestionCatalogue.CACHE_NAME).put("k", "warm");
+    }
+
+    private void assertAllCachesWarm() {
+        assertThat(cacheManager.getCache("approved-categories").get("all")).isNotNull();
+        assertThat(cacheManager.getCache("platform-category-order").get("all")).isNotNull();
+        assertThat(cacheManager.getCache(SearchSuggestionCatalogue.CACHE_NAME).get("k")).isNotNull();
+    }
+
+    @Test
+    @DisplayName("should_notEvictCatalogue_when_tokenUnknown")
+    void should_notEvictCatalogue_when_tokenUnknown() {
+        when(tokenGenerator.hash("garbage")).thenReturn("unknownhash");
+        when(platformCategoryRepository.findByTokenHash("unknownhash")).thenReturn(Optional.empty());
+        warmAllCaches();
+
+        var outcome = service.approve("garbage");
+
+        assertThat(outcome).isEqualTo(CategoryRequestService.DecisionOutcome.ALREADY_DECIDED);
+        assertAllCachesWarm();
+    }
+
+    @Test
+    @DisplayName("should_notEvictCatalogue_when_alreadyDecided")
+    void should_notEvictCatalogue_when_alreadyDecided() {
+        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
+        PlatformCategory decided = pending();
+        decided.approve(OffsetDateTime.ofInstant(NOW, ZoneOffset.UTC));
+        when(platformCategoryRepository.findByTokenHash(TOKEN_HASH)).thenReturn(Optional.of(decided));
+        warmAllCaches();
+
+        var outcome = service.approve(RAW_TOKEN);
+
+        assertThat(outcome).isEqualTo(CategoryRequestService.DecisionOutcome.ALREADY_DECIDED);
+        assertAllCachesWarm();
+    }
+
+    @Test
+    @DisplayName("should_notEvictCatalogue_when_tokenExpired")
+    void should_notEvictCatalogue_when_tokenExpired() {
+        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
+        PlatformCategory expired = PlatformCategory.ofPendingRequest(
+                "NAIL_ART", "Нейл-арт", null, TOKEN_HASH,
+                OffsetDateTime.ofInstant(NOW.minusSeconds(7200), ZoneOffset.UTC),
+                OffsetDateTime.ofInstant(NOW.minusSeconds(3600), ZoneOffset.UTC), null);
+        when(platformCategoryRepository.findByTokenHash(TOKEN_HASH)).thenReturn(Optional.of(expired));
+        warmAllCaches();
+
+        var outcome = service.approve(RAW_TOKEN);
+
+        assertThat(outcome).isEqualTo(CategoryRequestService.DecisionOutcome.INVALID_OR_EXPIRED);
+        assertAllCachesWarm();
     }
 }

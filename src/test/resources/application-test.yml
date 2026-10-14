@@ -60,6 +60,12 @@ app:
     # assertions build the filter directly against a hand-built single-slot LoadingCache
     # (bypassing this property entirely), so this override does not neuter that coverage.
     notification-feed-capacity: 100000
+    # Same reasoning: ITs drive many approve/reject review POSTs from 127.0.0.1 (one shared per-IP
+    # bucket in production, 20/hr). The 429 behaviour is covered by ReviewPostRateLimitRegressionTest,
+    # which builds the filter by hand.
+    review-decision-capacity: 100000
+    # Sibling GET-page bucket (60/hr in production); 429 covered by ReviewGetRateLimitRegressionTest.
+    review-page-capacity: 100000
     device-token-capacity: 100000
     media-upload-capacity: 100000
     verify-email-capacity: 100000

@@ -1,5 +1,6 @@
 package com.beautica.config;
 
+import com.beautica.support.TestSecrets;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.context.properties.bind.Binder;
@@ -22,7 +23,7 @@ class ProdProfileFingerprintTest {
         return new ApplicationContextRunner()
                 .withInitializer(new ConfigDataApplicationContextInitializer())
                 .withPropertyValues("spring.profiles.active=" + profiles,
-                        "BREVO_SMTP_LOGIN=login", "BREVO_SMTP_KEY=key", "JWT_SECRET=x", "FRONTEND_BASE_URL=https://app.beautica.ua",
+                        "BREVO_SMTP_LOGIN=login", "BREVO_SMTP_KEY=key", "JWT_SECRET=x", "INTERNAL_API_KEY=" + TestSecrets.INTERNAL_API_KEY, "FRONTEND_BASE_URL=https://app.beautica.ua",
                         "PUBLIC_BASE_URL=https://api.beautica.ua", "SUPPORT_EMAIL=help@beautica.ua",
                         "R2_ENABLED=true", "CLOUDFLARE_R2_BUCKET=beautica-media-prod",
                         "CLOUDFLARE_R2_PUBLIC_URL=https://media.beautica.ua");
@@ -49,7 +50,7 @@ class ProdProfileFingerprintTest {
     void should_flipToStaging_when_stagingProfileAdded() {
         new ApplicationContextRunner()
                 .withInitializer(new ConfigDataApplicationContextInitializer())
-                .withPropertyValues("spring.profiles.active=prod,staging", "JWT_SECRET=x", "FRONTEND_BASE_URL=https://x.invalid",
+                .withPropertyValues("spring.profiles.active=prod,staging", "JWT_SECRET=x", "INTERNAL_API_KEY=" + TestSecrets.INTERNAL_API_KEY, "FRONTEND_BASE_URL=https://x.invalid",
                         "PUBLIC_BASE_URL=https://api.staging.beautica.test", "SUPPORT_EMAIL=support@test.invalid")
                 .run(ctx -> {
                     DeploymentProperties props = bind(ctx.getEnvironment());
@@ -72,7 +73,7 @@ class ProdProfileFingerprintTest {
         new ApplicationContextRunner()
                 .withInitializer(new ConfigDataApplicationContextInitializer())
                 .withPropertyValues("spring.profiles.active=prod",
-                        "BREVO_SMTP_LOGIN=login", "BREVO_SMTP_KEY=key", "JWT_SECRET=x", "FRONTEND_BASE_URL=https://app.beautica.ua",
+                        "BREVO_SMTP_LOGIN=login", "BREVO_SMTP_KEY=key", "JWT_SECRET=x", "INTERNAL_API_KEY=" + TestSecrets.INTERNAL_API_KEY, "FRONTEND_BASE_URL=https://app.beautica.ua",
                         "SUPPORT_EMAIL=help@beautica.ua",
                         "R2_ENABLED=true", "CLOUDFLARE_R2_BUCKET=beautica-media-prod",
                         "CLOUDFLARE_R2_PUBLIC_URL=https://media.beautica.ua")
@@ -85,11 +86,12 @@ class ProdProfileFingerprintTest {
     // ---- Railway staging regressions (fix/link-base-url-guard): the committed YAML with an env var missing ----
 
     private static ApplicationContextRunner stagingRunnerWith(String... envVars) {
-        String[] props = new String[envVars.length + 3];
+        String[] props = new String[envVars.length + 4];
         props[0] = "spring.profiles.active=prod,staging";
         props[1] = "JWT_SECRET=x";
         props[2] = "FRONTEND_BASE_URL=https://x.invalid";
-        System.arraycopy(envVars, 0, props, 3, envVars.length);
+        props[3] = "INTERNAL_API_KEY=" + TestSecrets.INTERNAL_API_KEY;
+        System.arraycopy(envVars, 0, props, 4, envVars.length);
         return new ApplicationContextRunner()
                 .withInitializer(new ConfigDataApplicationContextInitializer())
                 .withPropertyValues(props);
@@ -132,7 +134,7 @@ class ProdProfileFingerprintTest {
         new ApplicationContextRunner()
                 .withInitializer(new ConfigDataApplicationContextInitializer())
                 .withPropertyValues("spring.profiles.active=prod",
-                        "BREVO_SMTP_LOGIN=login", "BREVO_SMTP_KEY=key", "JWT_SECRET=x", "FRONTEND_BASE_URL=https://app.beautica.ua",
+                        "BREVO_SMTP_LOGIN=login", "BREVO_SMTP_KEY=key", "JWT_SECRET=x", "INTERNAL_API_KEY=" + TestSecrets.INTERNAL_API_KEY, "FRONTEND_BASE_URL=https://app.beautica.ua",
                         "PUBLIC_BASE_URL=https://api.beautica.ua",
                         "R2_ENABLED=true", "CLOUDFLARE_R2_BUCKET=beautica-media-prod",
                         "CLOUDFLARE_R2_PUBLIC_URL=https://media.beautica.ua")

@@ -1,5 +1,6 @@
 package com.beautica.config;
 
+import com.beautica.support.TestSecrets;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.WebApplicationType;
@@ -38,7 +39,7 @@ class EnvironmentFingerprintGuardBootTest {
                 .profiles("prod", "staging")
                 .listeners(recorder)
                 .run("--beautica.sms.mode=turbosms", "--server.port=0", "--spring.main.banner-mode=off",
-                        "--JWT_SECRET=x", "--FRONTEND_BASE_URL=https://x.invalid",
+                        "--JWT_SECRET=x", "--INTERNAL_API_KEY=" + TestSecrets.INTERNAL_API_KEY, "--FRONTEND_BASE_URL=https://x.invalid",
                         "--PUBLIC_BASE_URL=https://api.staging.beautica.test", "--SUPPORT_EMAIL=support@test.invalid"));
 
         assertThat(thrown).isInstanceOf(IllegalStateException.class)
@@ -61,7 +62,7 @@ class EnvironmentFingerprintGuardBootTest {
                 .profiles("prod")
                 .listeners(recorder)
                 .run("--beautica.sms.mode=capture", "--server.port=0", "--spring.main.banner-mode=off",
-                        "--JWT_SECRET=x", "--FRONTEND_BASE_URL=https://app.beautica.ua",
+                        "--JWT_SECRET=x", "--INTERNAL_API_KEY=" + TestSecrets.INTERNAL_API_KEY, "--FRONTEND_BASE_URL=https://app.beautica.ua",
                         "--PUBLIC_BASE_URL=https://api.beautica.ua", "--SUPPORT_EMAIL=help@beautica.ua"));
 
         assertThat(thrown).isInstanceOf(IllegalStateException.class)
@@ -76,10 +77,53 @@ class EnvironmentFingerprintGuardBootTest {
                 .web(WebApplicationType.SERVLET)
                 .profiles("prod")
                 .run("--RAILWAY_ENVIRONMENT_NAME=staging", "--server.port=0", "--spring.main.banner-mode=off",
-                        "--JWT_SECRET=x", "--FRONTEND_BASE_URL=https://app.beautica.ua",
+                        "--JWT_SECRET=x", "--INTERNAL_API_KEY=" + TestSecrets.INTERNAL_API_KEY, "--FRONTEND_BASE_URL=https://app.beautica.ua",
                         "--PUBLIC_BASE_URL=https://api.beautica.ua", "--SUPPORT_EMAIL=help@beautica.ua"));
 
         assertThat(thrown).isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("railway-environment-name").hasMessageContaining("RAILWAY_ENVIRONMENT_NAME");
+    }
+
+    @Test
+    @DisplayName("prod with the dev default INTERNAL_API_KEY — startup aborts before any context; no value in message")
+    void should_abortBeforeContext_when_prodUsesDevDefaultInternalApiKey() {
+        Throwable thrown = catchThrowable(() -> new SpringApplicationBuilder(EmptyConfig.class)
+                .web(WebApplicationType.SERVLET)
+                .profiles("prod")
+                .run("--INTERNAL_API_KEY=changeme-dev-only", "--server.port=0", "--spring.main.banner-mode=off",
+                        "--JWT_SECRET=x", "--FRONTEND_BASE_URL=https://app.beautica.ua",
+                        "--PUBLIC_BASE_URL=https://api.beautica.ua", "--SUPPORT_EMAIL=help@beautica.ua"));
+
+        assertThat(thrown).isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("internal-api-key-default").hasMessageContaining("app.internal-api-key");
+        assertThat(thrown.getMessage()).doesNotContain("changeme-dev-only");
+    }
+
+    @Test
+    @DisplayName("prod,staging with a short INTERNAL_API_KEY — startup aborts naming the length rule")
+    void should_abortBeforeContext_when_stagingInternalApiKeyTooShort() {
+        Throwable thrown = catchThrowable(() -> new SpringApplicationBuilder(EmptyConfig.class)
+                .web(WebApplicationType.SERVLET)
+                .profiles("prod", "staging")
+                .run("--INTERNAL_API_KEY=short", "--server.port=0", "--spring.main.banner-mode=off",
+                        "--JWT_SECRET=x", "--FRONTEND_BASE_URL=https://x.invalid",
+                        "--PUBLIC_BASE_URL=https://api.staging.beautica.test", "--SUPPORT_EMAIL=support@test.invalid"));
+
+        assertThat(thrown).isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("internal-api-key-length");
+    }
+
+    @Test
+    @DisplayName("prod with INTERNAL_API_KEY unset — startup aborts naming the blank rule")
+    void should_abortBeforeContext_when_prodInternalApiKeyUnset() {
+        Throwable thrown = catchThrowable(() -> new SpringApplicationBuilder(EmptyConfig.class)
+                .web(WebApplicationType.SERVLET)
+                .profiles("prod")
+                .run("--server.port=0", "--spring.main.banner-mode=off",
+                        "--JWT_SECRET=x", "--FRONTEND_BASE_URL=https://app.beautica.ua",
+                        "--PUBLIC_BASE_URL=https://api.beautica.ua", "--SUPPORT_EMAIL=help@beautica.ua"));
+
+        assertThat(thrown).isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("internal-api-key-blank");
     }
 }

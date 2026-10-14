@@ -4,10 +4,13 @@ import com.beautica.auth.TokenGenerator;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.config.PublicBaseUrlProperties;
 import com.beautica.notification.EmailService;
+import com.beautica.search.service.SearchSuggestionCatalogue;
 import com.beautica.service.entity.ServiceTypeSuggestion;
 import com.beautica.service.repository.ServiceTypeSuggestionRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.cache.annotation.CacheEvict;
+import org.springframework.cache.annotation.Caching;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
@@ -60,6 +63,9 @@ public class ServiceTypeSuggestionService {
 
     @Value("${app.admin-email}")
     private String adminEmail;
+
+    /** SpEL guard: evict only when the decision actually changed state. */
+    private static final String APPROVED_ONLY = "#result.name() == 'APPROVED'";
 
     /**
      * Outcome of a token-bearing review/decision operation. The controller maps it
@@ -165,8 +171,24 @@ public class ServiceTypeSuggestionService {
      * promotion failure rolls the whole approval back, so the admin can retry cleanly.
      * Idempotent: a second call returns {@link DecisionOutcome#ALREADY_DECIDED} (or
      * INVALID_OR_EXPIRED) BEFORE reaching the promote call — no 500, no double-create.
+     *
+     * <p>Approval materializes a catalogue row, so it evicts every cache derived from service
+     * types ({@code service-types}, {@code service-type-search}, the search-suggestion
+     * catalogue). Eviction happens ONLY when the outcome is {@code APPROVED} (a real state change):
+     * the endpoint is public (token is the credential; per-IP throttled), so a garbage/replayed token (ALREADY_DECIDED /
+     * INVALID_OR_EXPIRED) must not flush the caches platform-wide. This
+     * conditional {@code @CacheEvict} set is the single eviction mechanism and runs POST-commit: the
+     * caching advisor is outermost ({@code CacheConfig}, {@code @EnableCaching(order =
+     * HIGHEST_PRECEDENCE)}), so it wraps the transaction advisor; a rollback (e.g. {@code promote()}
+     * throwing) evicts nothing. A load already in flight at commit time can still cache a stale
+     * snapshot, bounded only by the TTL. Reject changes no catalogue rows and evicts nothing.
      */
     @Transactional
+    @Caching(evict = {
+            @CacheEvict(value = "service-types", allEntries = true, condition = APPROVED_ONLY),
+            @CacheEvict(value = "service-type-search", allEntries = true, condition = APPROVED_ONLY),
+            @CacheEvict(value = SearchSuggestionCatalogue.CACHE_NAME, allEntries = true, condition = APPROVED_ONLY)
+    })
     public DecisionOutcome approve(String rawToken) {
         return decide(rawToken, true);
     }
