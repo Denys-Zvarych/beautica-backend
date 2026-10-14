@@ -91,9 +91,15 @@ class DeploymentEnvironmentStampIT {
         switch (environment) {
             case STAGING -> props.addAll(List.of("beautica.sms.mode=capture", "spring.mail.host=mailpit.railway.internal",
                     // The base application.yml's Brevo placeholders (staging.yml blanks them in the real profile).
-                    "spring.mail.username=", "spring.mail.password="));
+                    "spring.mail.username=", "spring.mail.password=",
+                    // EnvironmentFingerprintGuard link-URL + support-email rules.
+                    "app.public-base-url=https://api.staging.beautica.test", "app.frontend.base-url=https://example.invalid",
+                    "app.support.email=support@test.invalid"));
             case PROD -> props.addAll(List.of("beautica.sms.mode=turbosms", "spring.mail.host=smtp-relay.brevo.com",
-                    "app.cloudflare-r2.enabled=true", "app.cloudflare-r2.bucket=beautica-media-prod"));
+                    "app.cloudflare-r2.enabled=true", "app.cloudflare-r2.bucket=beautica-media-prod",
+                    "app.cloudflare-r2.public-url=https://media.beautica.ua",
+                    "app.public-base-url=https://api.beautica.ua", "app.frontend.base-url=https://app.beautica.ua",
+                    "app.support.email=help@beautica.ua"));
             case LOCAL -> { }
         }
         return new SpringApplicationBuilder(MinimalConfig.class)

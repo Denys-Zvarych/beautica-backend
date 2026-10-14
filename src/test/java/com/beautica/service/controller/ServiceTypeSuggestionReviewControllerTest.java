@@ -84,14 +84,14 @@ class ServiceTypeSuggestionReviewControllerTest {
                 .andExpect(status().isOk())
                 .andExpect(content().string(org.hamcrest.Matchers.containsString("Балаяж")))
                 // Token rides in the URL query → no-store stops cache retention,
-                // no-referrer stops the token leaking via a later cross-origin Referer.
+                // same-origin stops the token leaking via a later cross-origin Referer.
                 .andExpect(header().string("Cache-Control",
                         org.hamcrest.Matchers.containsString("no-store")))
                 .andExpect(header().string("Cache-Control",
                         org.hamcrest.Matchers.containsString("no-cache")))
                 .andExpect(header().string("Cache-Control",
                         org.hamcrest.Matchers.containsString("must-revalidate")))
-                .andExpect(header().string("Referrer-Policy", "no-referrer"));
+                .andExpect(header().string("Referrer-Policy", "same-origin"));
 
         // Critical: GET must NOT mutate state — email-scanner pre-fetch must not approve.
         verify(suggestionService, never()).approve(anyString());
@@ -106,6 +106,7 @@ class ServiceTypeSuggestionReviewControllerTest {
 
         mockMvc.perform(get(REVIEW).param("token", "bad-token"))
                 .andExpect(status().isOk())
+                .andExpect(header().string("Referrer-Policy", "same-origin"))
                 .andExpect(content().string(org.hamcrest.Matchers.not(
                         org.hamcrest.Matchers.containsString("Балаяж"))));
 
@@ -156,7 +157,7 @@ class ServiceTypeSuggestionReviewControllerTest {
                 .andExpect(status().isOk())
                 .andExpect(header().string("Cache-Control",
                         org.hamcrest.Matchers.containsString("no-store")))
-                .andExpect(header().string("Referrer-Policy", "no-referrer"));
+                .andExpect(header().string("Referrer-Policy", "same-origin"));
 
         verify(suggestionService).approve(eq("good-token"));
         verify(suggestionService, never()).reject(anyString());
@@ -171,7 +172,7 @@ class ServiceTypeSuggestionReviewControllerTest {
                 .andExpect(status().isOk())
                 .andExpect(header().string("Cache-Control",
                         org.hamcrest.Matchers.containsString("no-store")))
-                .andExpect(header().string("Referrer-Policy", "no-referrer"));
+                .andExpect(header().string("Referrer-Policy", "same-origin"));
 
         verify(suggestionService).reject(eq("good-token"));
         verify(suggestionService, never()).approve(anyString());
@@ -183,7 +184,8 @@ class ServiceTypeSuggestionReviewControllerTest {
         when(suggestionService.approve("stale-token")).thenReturn(DecisionOutcome.ALREADY_DECIDED);
 
         mockMvc.perform(post(APPROVE).with(csrf()).param("token", "stale-token"))
-                .andExpect(status().isOk());
+                .andExpect(status().isOk())
+                .andExpect(header().string("Referrer-Policy", "same-origin"));
 
         verify(suggestionService).approve(eq("stale-token"));
     }
@@ -195,6 +197,7 @@ class ServiceTypeSuggestionReviewControllerTest {
 
         mockMvc.perform(post(APPROVE).with(csrf()).param("token", "expired-token"))
                 .andExpect(status().isOk())
+                .andExpect(header().string("Referrer-Policy", "same-origin"))
                 // Neutral page — must not leak any record-specific detail.
                 .andExpect(content().string(org.hamcrest.Matchers.not(
                         org.hamcrest.Matchers.containsString("Балаяж"))));

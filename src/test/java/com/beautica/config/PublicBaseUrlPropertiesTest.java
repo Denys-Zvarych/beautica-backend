@@ -77,4 +77,17 @@ class PublicBaseUrlPropertiesTest {
                 .as("a valid base URL must produce no violations")
                 .isEmpty();
     }
+
+    @Test
+    @DisplayName("rejects a path, query, fragment or trailing slash; accepts bare origins")
+    void should_failBinding_when_publicBaseUrlHasPath() {
+        for (String bad : new String[]{"https://api.beautica.app/api", "https://api.beautica.app?x=1",
+                "https://api.beautica.app#frag", "https://api.beautica.app/", "ftp://api.beautica.app",
+                "https://api.beautica.app/ x"}) {
+            assertThat(validator.validate(withUrl(bad))).as("value=%s", bad).isNotEmpty();
+        }
+        for (String ok : new String[]{"https://api.beautica.app", "http://localhost:8080", "https://api.beautica.test"}) {
+            assertThat(validator.validate(withUrl(ok))).as("value=%s", ok).isEmpty();
+        }
+    }
 }

@@ -8,6 +8,8 @@ import org.springframework.core.env.ConfigurableEnvironment;
 import org.springframework.core.env.Environment;
 import org.springframework.core.env.Profiles;
 
+import java.net.URI;
+import java.net.URISyntaxException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
@@ -42,6 +44,12 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
     static final String STAGING_BUCKET = "beautica-media-staging";
     static final String PROD_BUCKET = "beautica-media-prod";
 
+    private static final java.util.regex.Pattern EMAIL_SHAPE =
+            java.util.regex.Pattern.compile("^[^@\\s]+@[^@\\s]+\\.[a-z]{2,}$", java.util.regex.Pattern.CASE_INSENSITIVE);
+    private static final List<String> RESERVED_TEST_TLDS = List.of(".test", ".example", ".localhost", ".invalid", ".local", ".internal", ".home.arpa");
+
+    private static final List<String> RESERVED_EXAMPLE_DOMAINS = List.of("example.com", "example.net", "example.org");
+
     private static final Profiles PROD = Profiles.of("prod");
     private static final Profiles STAGING = Profiles.of("staging");
 
@@ -72,6 +80,7 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
         checkRailwayName(env, environment, violations);
         if (environment != DeployEnvironment.LOCAL) {
             checkR2Bucket(env, environment, violations);
+            checkLinkBaseUrls(env, environment, violations);
             if (environment == DeployEnvironment.PROD) {
                 checkProd(env, violations);
             } else {
@@ -133,6 +142,114 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
         }
     }
 
+    /**
+     * Link-building URLs must be real, public https origins outside LOCAL (fail closed): a missing value or a
+     * localhost default would otherwise ship e-mail links nobody can open. Messages name the rule and the
+     * property only, never the value.
+     */
+    private static void checkLinkBaseUrls(Environment env, DeployEnvironment environment, List<String> violations) {
+        boolean prod = environment == DeployEnvironment.PROD;
+        String publicHost = checkLinkUrl(env, "app.public-base-url", "public-base-url", true, prod, violations);
+        if (!prod && publicHost != null && !hasStagingLabel(publicHost)) {
+            violations.add("rule staging-public-base-url-name: app.public-base-url host must have a staging DNS label in staging");
+        }
+        checkLinkUrl(env, "app.frontend.base-url", "frontend-base-url", true, prod, violations);
+        if (r2Enabled(env)) {
+            checkLinkUrl(env, "app.cloudflare-r2.public-url", "r2-public-url", false, prod, violations);
+        }
+    }
+
+    /** @return the normalised host when the URL passed the https/host rules, else {@code null} */
+    private static String checkLinkUrl(Environment env, String property, String ruleKey, boolean checkShape,
+                                       boolean prod, List<String> violations) {
+        String raw = readOrNull(env, property);
+        String host = null;
+        URI uri = null;
+        if (!isBlank(raw)) {
+            try {
+                uri = new URI(raw.strip());
+                host = uri.getHost() == null ? null : normaliseHost(uri.getHost());
+            } catch (URISyntaxException e) {
+                uri = null;
+            }
+        }
+        if (uri == null || host == null || host.isEmpty() || !"https".equalsIgnoreCase(uri.getScheme()) || isInternalHost(host)
+                || isIpLiteralOrSingleLabel(host)) {
+            violations.add("rule " + ruleKey + "-https: " + property + " must be https and non-loopback");
+            return null;
+        }
+        // The link builders use the raw value, so surrounding whitespace and userinfo must be rejected outright.
+        if (!raw.equals(raw.strip())) {
+            violations.add("rule " + ruleKey + "-shape: " + property + " must have no surrounding whitespace");
+        }
+        if (uri.getRawUserInfo() != null) {
+            violations.add("rule " + ruleKey + "-userinfo: " + property + " must not contain userinfo");
+        }
+        String trimmed = raw.strip();
+        if (checkShape && (uri.getRawQuery() != null || uri.getRawFragment() != null || trimmed.contains("?")
+                || trimmed.contains("#") || trimmed.endsWith("/"))) {
+            violations.add("rule " + ruleKey + "-shape: " + property
+                    + " must have no query, fragment or trailing slash");
+        }
+        // A CORS origin has no path, so a base URL with one (https://api.x.ua/api) can never match it.
+        if ("public-base-url".equals(ruleKey) && uri.getRawPath() != null && !uri.getRawPath().isEmpty()) {
+            violations.add("rule " + ruleKey + "-path: " + property + " must have no path (origin only)");
+        }
+        if (prod && (host.contains("staging") || isPlaceholderDomain(host))) {
+            violations.add("rule prod-" + ruleKey + "-host: " + property
+                    + " must not be a staging or reserved/placeholder host in prod");
+        }
+        return host;
+    }
+
+    /** An unresolvable placeholder (no default, env var absent) counts as unset. */
+    private static String readOrNull(Environment env, String property) {
+        try {
+            return env.getProperty(property);
+        } catch (IllegalArgumentException e) {
+            return null;
+        }
+    }
+
+    private static String normaliseHost(String host) {
+        String h = host.strip().toLowerCase(Locale.ROOT);
+        return h.endsWith(".") ? h.substring(0, h.length() - 1) : h;
+    }
+
+    /**
+     * IP literals (bracketed IPv6, or any host whose last label is numeric / {@code 0x..}, which covers decimal,
+     * octal, hex and dotted IPv4 forms) and single-label hosts are never a public DNS origin. A real TLD is never
+     * numeric, so this does not reject hex-looking domains such as {@code cafe.de}.
+     */
+    private static boolean isIpLiteralOrSingleLabel(String host) {
+        if (host.startsWith("[") || host.indexOf('.') < 0) {
+            return true;
+        }
+        String last = host.substring(host.lastIndexOf('.') + 1);
+        return last.matches("[0-9]+|0x[0-9a-f]*");
+    }
+
+    /** A whole DNS label equal to {@code staging}, or starting with {@code staging-} / ending with {@code -staging}. */
+    private static boolean hasStagingLabel(String host) {
+        for (String label : host.split("\\.")) {
+            if (label.equals("staging") || label.startsWith("staging-") || label.endsWith("-staging")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Reserved test TLDs and the RFC 2606 example domains, including their subdomains. Input is lower-case. */
+    private static boolean isPlaceholderDomain(String domain) {
+        return RESERVED_TEST_TLDS.stream().anyMatch(domain::endsWith)
+                || RESERVED_EXAMPLE_DOMAINS.stream().anyMatch(d -> domain.equals(d) || domain.endsWith("." + d));
+    }
+
+    private static boolean isInternalHost(String host) {
+        return isLoopback(host) || host.endsWith(".localhost") || host.equals("10.0.2.2")
+                || host.equals("railway.internal") || host.endsWith(".railway.internal");
+    }
+
     private static void checkProd(Environment env, List<String> violations) {
         String host = mailHost(env);
         if (isLoopback(host) || host.startsWith("mailpit")) {
@@ -140,6 +257,10 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
         }
         if (smsModeOf(env) != SmsMode.TURBOSMS) {
             violations.add("rule prod-sms-mode: beautica.sms.mode must be turbosms in prod");
+        }
+        String support = supportEmail(env);
+        if (!isEmailShaped(support) || isPlaceholderDomain(support.substring(support.lastIndexOf('@') + 1))) {
+            violations.add("rule prod-support-email: app.support.email must be a real address (local@domain.tld, not a reserved test domain) in prod");
         }
     }
 
@@ -156,9 +277,23 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
         if (!isBlank(env.getProperty("BREVO_SMTP_KEY")) || !isBlank(env.getProperty("spring.mail.password"))) {
             violations.add("rule staging-brevo-key-blank: BREVO_SMTP_KEY must be blank in staging");
         }
+        String support = supportEmail(env);
+        if (!isEmailShaped(support) || !support.endsWith(".invalid")) {
+            violations.add("rule staging-support-email: app.support.email must be set to a .invalid address in staging");
+        }
         if (smsModeOf(env) != SmsMode.CAPTURE) {
             violations.add("rule staging-sms-mode: beautica.sms.mode must be capture in staging");
         }
+    }
+
+    private static String supportEmail(Environment env) {
+        String v = readOrNull(env, "app.support.email");
+        String e = v == null ? "" : v.strip().toLowerCase(Locale.ROOT);
+        return e.endsWith(".") ? e.substring(0, e.length() - 1) : e;
+    }
+
+    private static boolean isEmailShaped(String email) {
+        return EMAIL_SHAPE.matcher(email).matches();
     }
 
     static String mailHost(Environment env) {

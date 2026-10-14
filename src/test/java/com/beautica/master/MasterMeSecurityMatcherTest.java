@@ -25,6 +25,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.test.mock.mockito.MockBean;
@@ -82,9 +83,12 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 @WebMvcTest(MasterController.class)
 @TestPropertySource(properties = {
         "app.frontend.base-url=http://localhost:3000",
+        // SecurityConfig's scoped review-page CORS entry reads PublicBaseUrlProperties (real binding, not a mock).
+        "app.public-base-url=https://api.beautica.test",
         // Lets SecurityTestFilters below REPLACE WebMvcTestSupport's jwtAuthenticationFilter
         // definition by name — see that class's javadoc for why the exact runtime type matters.
         "spring.main.allow-bean-definition-overriding=true"})
+@EnableConfigurationProperties(com.beautica.config.PublicBaseUrlProperties.class)
 @Import({WebMvcTestSupport.class,
         com.beautica.config.SecurityConfig.class,
         MasterMeSecurityMatcherTest.SecurityTestFilters.class})

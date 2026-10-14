@@ -127,7 +127,7 @@ app:
     token-expiration-hours: 72
     from-email: noreply@beautica.app
   admin-email: admin@beautica.test
-  public-base-url: http://localhost:8080
+  public-base-url: https://api.beautica.test
   security:
     # Test profile only — fixed 32+ char value so the context loads under `test`.
     otp-pepper: test-otp-pepper-fixed-value-min-32-characters

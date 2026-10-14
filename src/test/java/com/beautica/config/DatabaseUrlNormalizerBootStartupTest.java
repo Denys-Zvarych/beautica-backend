@@ -34,7 +34,9 @@ class DatabaseUrlNormalizerBootStartupTest {
                 .profiles(profiles)
                 .properties("DATABASE_URL=" + databaseUrl, "spring.main.banner-mode=off",
                         // EnvironmentFingerprintGuard (Phase 368): prod requires R2 on with the exact prod bucket.
-                        "R2_ENABLED=true", "CLOUDFLARE_R2_BUCKET=beautica-media-prod");
+                        "R2_ENABLED=true", "CLOUDFLARE_R2_BUCKET=beautica-media-prod",
+                        "CLOUDFLARE_R2_PUBLIC_URL=https://media.beautica.ua", "FRONTEND_BASE_URL=https://app.beautica.ua",
+                        "PUBLIC_BASE_URL=https://api.beautica.ua", "SUPPORT_EMAIL=help@beautica.ua");
     }
 
     private static List<Throwable> chain(Throwable t) {

@@ -28,6 +28,8 @@ import static com.github.tomakehurst.wiremock.client.WireMock.urlMatching;
         "APP_OTP_PEPPER=staging-it-otp-pepper-fixed-value-min-32-chars",
         "OUTBOX_PAYLOAD_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
         "FRONTEND_BASE_URL=https://staging.invalid",
+        "PUBLIC_BASE_URL=https://api.staging.beautica.test",
+        "SUPPORT_EMAIL=support@test.invalid",
         // First-deploy authorisation for the DB environment stamp (Phase 368 N2); ignored once stamped.
         "BEAUTICA_DB_STAMP_INIT=staging",
         "app.rate-limit.otp-send-capacity=100000",

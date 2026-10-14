@@ -104,7 +104,7 @@ public class InviteService {
     void validateConfig() {
         if (!SchemeGuard.isAllowedScheme(frontendBaseUrl)) {
             throw new IllegalStateException(
-                    "app.frontend.base-url must use HTTPS scheme for non-localhost origins, got: " + frontendBaseUrl);
+                    "app.frontend.base-url must use HTTPS scheme for non-localhost origins");
         }
     }
 
@@ -421,7 +421,7 @@ public class InviteService {
     private String buildInviteLink(String rawToken) {
         if (!SchemeGuard.isAllowedScheme(frontendBaseUrl)) {
             throw new IllegalStateException(
-                    "app.frontend.base-url must use HTTPS scheme for non-localhost origins, got: " + frontendBaseUrl);
+                    "app.frontend.base-url must use HTTPS scheme for non-localhost origins");
         }
         return frontendBaseUrl + "/invite/accept?token=" + URLEncoder.encode(rawToken, StandardCharsets.UTF_8);
     }

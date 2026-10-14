@@ -51,11 +51,13 @@ public class CategoryRequestReviewController {
     // The single-use token rides in the URL (path on the GET, form param on the POSTs).
     // These headers are the effective control against residual URL exposure: no-store
     // stops any intermediary proxy or browser cache from retaining the token-bearing
-    // response (the path is the default cache key), and no-referrer stops a later
+    // response (the path is the default cache key), and same-origin stops a later
     // cross-origin navigation from leaking the token via the Referer header.
     private static final String CACHE_CONTROL_NO_STORE = "no-store, no-cache, must-revalidate";
     private static final String REFERRER_POLICY_HEADER = "Referrer-Policy";
-    private static final String REFERRER_POLICY_NO_REFERRER = "no-referrer";
+    // same-origin (not no-referrer): a no-referrer page makes browsers send `Origin: null` on its own
+    // form POST, which the scoped CORS entry for these routes (SecurityConfig) must never admit.
+    private static final String REFERRER_POLICY_SAME_ORIGIN = "same-origin";
 
     private final CategoryRequestService categoryRequestService;
 
@@ -67,7 +69,7 @@ public class CategoryRequestReviewController {
     @ModelAttribute
     void applyTokenPageSecurityHeaders(HttpServletResponse response) {
         response.setHeader(HttpHeaders.CACHE_CONTROL, CACHE_CONTROL_NO_STORE);
-        response.setHeader(REFERRER_POLICY_HEADER, REFERRER_POLICY_NO_REFERRER);
+        response.setHeader(REFERRER_POLICY_HEADER, REFERRER_POLICY_SAME_ORIGIN);
     }
 
     @GetMapping("/review/{token}")

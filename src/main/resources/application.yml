@@ -100,9 +100,11 @@ spring:
 server:
   port: 8080
   # forward-headers-strategy is intentionally omitted (defaults to 'none').
-  # Setting it to 'native' would cause Spring's ForwardedHeaderFilter to strip
-  # X-Forwarded-For before AuthRateLimitFilter runs, making IP-based rate limiting
-  # ineffective. The raw XFF header is read directly by AuthRateLimitFilter.
+  # Setting it to 'framework' (ForwardedHeaderFilter) would strip X-Forwarded-For before
+  # AuthRateLimitFilter runs, and 'native' (Tomcat RemoteIpValve) rewrites remoteAddr from it,
+  # either of which makes IP-based rate limiting ineffective. The raw XFF header is read
+  # directly by AuthRateLimitFilter. Consequence: behind the TLS proxy the app sees http, so the
+  # same-origin admin review POSTs get a scoped CORS entry in SecurityConfig.
   compression:
     # Gzip responses at the Tomcat layer. Deliberately set HERE (shared config), not per
     # profile: it is transport-level and profile-independent, and a prod-only value is how

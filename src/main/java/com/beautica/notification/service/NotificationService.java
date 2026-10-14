@@ -407,7 +407,7 @@ public class NotificationService {
     private String buildReviewUrl(String bookingId) {
         if (!SchemeGuard.isAllowedScheme(frontendBaseUrl)) {
             throw new IllegalStateException(
-                    "app.frontend.base-url must use HTTPS scheme for non-localhost origins, got: " + frontendBaseUrl);
+                    "app.frontend.base-url must use HTTPS scheme for non-localhost origins");
         }
         return frontendBaseUrl + "/bookings/" + bookingId + "/review";
     }
@@ -420,7 +420,7 @@ public class NotificationService {
     private String buildBookingUrl(String bookingId) {
         if (!SchemeGuard.isAllowedScheme(frontendBaseUrl)) {
             throw new IllegalStateException(
-                    "app.frontend.base-url must use HTTPS scheme for non-localhost origins, got: " + frontendBaseUrl);
+                    "app.frontend.base-url must use HTTPS scheme for non-localhost origins");
         }
         return frontendBaseUrl + "/bookings/" + bookingId;
     }
