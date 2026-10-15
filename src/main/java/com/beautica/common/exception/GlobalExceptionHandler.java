@@ -588,11 +588,28 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ApiResponse<Void>> handleDataIntegrityViolation(DataIntegrityViolationException ex) {
         // Single static message — distinguishing "duplicate" from "foreign key" in the
         // HTTP body is an enumeration oracle (reveals which constraint fired). The real
-        // cause is logged at DEBUG only, never echoed to the caller (§I/§N).
-        log.debug("Data integrity violation: {}", ex.getMostSpecificCause().getMessage());
+        // cause is logged at DEBUG only, never echoed to the caller (§I/§N). Only the cause's class
+        // and the constraint NAME are logged — never getMessage(): PgJDBC renders the
+        // "Detail: Key (...)=(...)" / "Failing row contains (...)" line into it, i.e. user input (§B8).
+        log.debug("Data integrity violation: cause={}, constraint={}",
+                ex.getMostSpecificCause().getClass().getSimpleName(), violatedConstraintName(ex));
         return ResponseEntity
                 .status(HttpStatus.CONFLICT)
                 .body(ApiResponse.error("Request conflicts with existing data"));
+    }
+
+    /**
+     * The violated constraint's name from Hibernate's structured {@code getConstraintName()} (a
+     * schema identifier, never user data), or {@code "unknown"} when the chain carries none.
+     */
+    private static String violatedConstraintName(DataIntegrityViolationException ex) {
+        for (Throwable cause = ex; cause != null; cause = cause.getCause()) {
+            if (cause instanceof org.hibernate.exception.ConstraintViolationException hce
+                    && hce.getConstraintName() != null) {
+                return hce.getConstraintName();
+            }
+        }
+        return "unknown";
     }
 
     @ExceptionHandler(JwtException.class)

@@ -37,13 +37,18 @@ public interface ServiceTypeSuggestionRepository extends JpaRepository<ServiceTy
      * the same category slug and (case-insensitively) the same suggested name. A
      * previously decided (APPROVED/REJECTED) suggestion does not block a re-suggest.
      *
-     * <p>{@code LOWER(...)} normalization mirrors the partial dedup index in V76.
+     * <p>{@code LOWER(...)} normalization mirrors the partial UNIQUE index
+     * {@code ux_service_type_suggestion_pending_dedup} (V197), which is the real guard against the
+     * check-then-insert race; this check is the fast path that avoids a doomed INSERT.
+     * {@code EXISTS} stops at the first match instead of counting.
      */
     @Query("""
-            SELECT COUNT(s) > 0 FROM ServiceTypeSuggestion s
-             WHERE s.status = com.beautica.service.entity.ServiceTypeSuggestionStatus.PENDING
-               AND s.categoryName = :categoryName
-               AND LOWER(s.suggestedName) = LOWER(:suggestedName)
+            SELECT CASE WHEN EXISTS (
+                SELECT 1 FROM ServiceTypeSuggestion s
+                 WHERE s.status = com.beautica.service.entity.ServiceTypeSuggestionStatus.PENDING
+                   AND s.categoryName = :categoryName
+                   AND LOWER(s.suggestedName) = LOWER(:suggestedName)
+            ) THEN true ELSE false END
             """)
     boolean existsPendingByCategoryNameAndSuggestedNameIgnoreCase(
             @Param("categoryName") String categoryName,

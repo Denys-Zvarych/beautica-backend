@@ -600,21 +600,22 @@ class GlobalExceptionHandlerTest {
     }
 
     @Test
-    @DisplayName("handleDataIntegrityViolation — emits the real cause only at DEBUG, never in the response")
-    void should_logCauseAtDebugOnly_when_dataIntegrityViolationThrown() {
-        // Arrange — the leaky cause must surface in the DEBUG log for ops triage but never
-        // in the client body. This pins the §I/§N split: detail for the server, silence for
-        // the caller.
-        String leakyCause = "insert or update on table \"bookings\" violates foreign key "
-                + "constraint \"fk_bookings_master\"";
+    @DisplayName("handleDataIntegrityViolation — DEBUG log carries cause class + constraint name only, never the PgJDBC detail")
+    void should_logConstraintNameButNotDetail_when_dataIntegrityViolationThrown() {
+        // Arrange — PgJDBC renders the DETAIL line (the caller's own input) into the SQLException
+        // message; Hibernate exposes the constraint NAME structurally. Only the latter may be logged (§B8).
+        String userInput = "victim@example.com";
+        var sqlCause = new java.sql.SQLException("ERROR: insert or update on table \"bookings\" violates foreign key "
+                + "constraint \"fk_bookings_master\"\n  Detail: Key (email)=(" + userInput + ") is not present.");
         var ex = new DataIntegrityViolationException("could not execute statement",
-                new RuntimeException(leakyCause));
+                new org.hibernate.exception.ConstraintViolationException(
+                        "could not execute statement", sqlCause, "fk_bookings_master"));
         listAppender.list.clear();
 
         // Act
         handler.handleDataIntegrityViolation(ex);
 
-        // Assert — exactly one DEBUG event carrying the real cause for server-side triage
+        // Assert — exactly one DEBUG event: constraint name + cause class, no user input
         List<ILoggingEvent> debugEvents = listAppender.list.stream()
                 .filter(e -> e.getLevel() == Level.DEBUG)
                 .toList();
@@ -622,18 +623,35 @@ class GlobalExceptionHandlerTest {
                 .as("handleDataIntegrityViolation must emit exactly one DEBUG log for triage")
                 .hasSize(1);
         assertThat(debugEvents.get(0).getFormattedMessage())
-                .as("DEBUG log must contain the real cause for ops visibility")
-                .contains("fk_bookings_master");
+                .as("DEBUG log names the constraint and the cause class for ops triage")
+                .contains("constraint=fk_bookings_master")
+                .contains("cause=SQLException")
+                .doesNotContain(userInput)
+                .doesNotContain("Detail");
+        boolean nonDebugEvent = listAppender.list.stream().anyMatch(e -> e.getLevel() != Level.DEBUG);
+        assertThat(nonDebugEvent).as("nothing logged above DEBUG").isFalse();
+    }
 
-        // And no event at any level may have leaked the cause anywhere other than DEBUG —
-        // i.e. there is no ERROR/WARN/INFO event carrying it (would imply over-logging).
-        boolean nonDebugLeak = listAppender.list.stream()
-                .filter(e -> e.getLevel() != Level.DEBUG)
-                .map(ILoggingEvent::getFormattedMessage)
-                .anyMatch(m -> m.contains("fk_bookings_master"));
-        assertThat(nonDebugLeak)
-                .as("the cause must appear ONLY at DEBUG, not at any louder level")
-                .isFalse();
+    @Test
+    @DisplayName("handleDataIntegrityViolation — no structured constraint name → logs 'unknown', never the raw message")
+    void should_logUnknownConstraint_when_noHibernateCauseInChain() {
+        // Arrange — a bare cause whose message carries user data and no structured constraint name.
+        String userInput = "Failing row contains (secret-name)";
+        var ex = new DataIntegrityViolationException("could not execute statement",
+                new RuntimeException(userInput));
+        listAppender.list.clear();
+
+        // Act
+        handler.handleDataIntegrityViolation(ex);
+
+        // Assert
+        assertThat(listAppender.list)
+                .singleElement()
+                .extracting(ILoggingEvent::getFormattedMessage)
+                .asString()
+                .contains("constraint=unknown")
+                .contains("cause=RuntimeException")
+                .doesNotContain("secret-name");
     }
 
     @Test

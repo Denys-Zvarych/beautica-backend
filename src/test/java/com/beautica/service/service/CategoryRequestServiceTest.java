@@ -20,9 +20,12 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.hibernate.exception.ConstraintViolationException;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.test.util.ReflectionTestUtils;
 
+import java.sql.SQLException;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.OffsetDateTime;
@@ -150,6 +153,56 @@ class CategoryRequestServiceTest {
 
         verify(platformCategoryRepository, never()).save(any());
         verifyNoInteractions(emailService);
+    }
+
+    @Test
+    @DisplayName("should_throwIdenticalConflict_when_insertLosesRaceOnNameUniqueConstraint")
+    void should_throwIdenticalConflict_when_insertLosesRaceOnNameUniqueConstraint() {
+        CreateCategoryRequestRequest request = new CreateCategoryRequestRequest("nail_art", "Нейл-арт", null);
+        when(platformCategoryRepository.existsByNameIgnoreCaseAndStatusIn(eq("NAIL_ART"), any()))
+                .thenReturn(true, false);
+        when(tokenGenerator.generateToken()).thenReturn(RAW_TOKEN);
+        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
+        when(platformCategoryRepository.save(any()))
+                .thenThrow(integrityViolation(CategoryRequestService.NAME_UNIQUE_CONSTRAINT));
+        BusinessException fromCheck = catchBusiness(request);
+
+        BusinessException fromRace = catchBusiness(request);
+
+        assertThat(fromRace.getStatus()).isEqualTo(HttpStatus.CONFLICT).isEqualTo(fromCheck.getStatus());
+        assertThat(fromRace.getMessage())
+                .isEqualTo("Category already exists or is pending: NAIL_ART")
+                .isEqualTo(fromCheck.getMessage());
+        verifyNoInteractions(emailService);
+    }
+
+    @Test
+    @DisplayName("should_rethrowUnchanged_when_insertViolatesAnotherConstraint")
+    void should_rethrowUnchanged_when_insertViolatesAnotherConstraint() {
+        when(platformCategoryRepository.existsByNameIgnoreCaseAndStatusIn(eq("NAIL_ART"), any()))
+                .thenReturn(false);
+        when(tokenGenerator.generateToken()).thenReturn(RAW_TOKEN);
+        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
+        DataIntegrityViolationException other = integrityViolation("fk_platform_categories_requested_by");
+        when(platformCategoryRepository.save(any())).thenThrow(other);
+
+        assertThatThrownBy(() -> service.submitRequest(
+                new CreateCategoryRequestRequest("NAIL_ART", "Нейл-арт", null), UUID.randomUUID()))
+                .isSameAs(other);
+
+        verifyNoInteractions(emailService);
+    }
+
+    private BusinessException catchBusiness(CreateCategoryRequestRequest request) {
+        Throwable thrown = org.assertj.core.api.Assertions.catchThrowable(
+                () -> service.submitRequest(request, UUID.randomUUID()));
+        assertThat(thrown).isInstanceOf(BusinessException.class);
+        return (BusinessException) thrown;
+    }
+
+    private static DataIntegrityViolationException integrityViolation(String constraintName) {
+        return new DataIntegrityViolationException("could not execute statement",
+                new ConstraintViolationException("duplicate", new SQLException("23505"), constraintName));
     }
 
     @Test
