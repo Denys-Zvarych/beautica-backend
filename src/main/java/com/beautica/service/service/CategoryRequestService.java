@@ -17,6 +17,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.cache.annotation.CacheEvict;
 import org.springframework.cache.annotation.Cacheable;
 import org.springframework.cache.annotation.Caching;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -55,6 +56,9 @@ import java.util.UUID;
 public class CategoryRequestService {
 
     private static final Duration TOKEN_TTL = Duration.ofDays(7);
+    /** V64 {@code UNIQUE(name)} — blocks a second row with the same name in ANY status. */
+    static final String NAME_UNIQUE_CONSTRAINT = "uq_platform_categories_name";
+    static final String DUPLICATE_CATEGORY_MESSAGE_PREFIX = "Category already exists or is pending: ";
     // Token is carried as the trailing PATH SEGMENT (not a query param) so it is not
     // exposed in proxy access logs or leaked via the Referer header of assets loaded
     // on the review page. The base64url token charset (A-Za-z0-9-_) is path-safe.
@@ -110,7 +114,7 @@ public class CategoryRequestService {
         String name = request.name().toUpperCase(Locale.ROOT);
 
         if (platformCategoryRepository.existsByNameIgnoreCaseAndStatusIn(name, BLOCKING_STATUSES)) {
-            throw new BusinessException(HttpStatus.CONFLICT, "Category already exists or is pending: " + name);
+            throw duplicateCategory(name);
         }
 
         String rawToken = tokenGenerator.generateToken();
@@ -120,7 +124,7 @@ public class CategoryRequestService {
         PlatformCategory category = PlatformCategory.ofPendingRequest(
                 name, request.displayName(), requesterId, tokenHash, now, now.plus(TOKEN_TTL),
                 trimToNull(request.initialServiceName()));
-        PlatformCategory saved = platformCategoryRepository.save(category);
+        PlatformCategory saved = insertPending(category);
 
         String reviewUrl = publicBaseUrlProperties.getPublicBaseUrl() + REVIEW_PATH + rawToken;
         emailService.sendCategoryRequestNotification(
@@ -274,6 +278,44 @@ public class CategoryRequestService {
             // approval must stand regardless. The inner REQUIRES_NEW transaction has
             // already rolled back in isolation, so the approval commit is unaffected.
         }
+    }
+
+    /**
+     * Inserts the PENDING row. The exists-check above is check-then-act; two concurrent submits can
+     * both pass it, and {@value #NAME_UNIQUE_CONSTRAINT} (V64) is what actually serialises them. The
+     * id is {@code IDENTITY}, so {@code save} INSERTs immediately — a lost race surfaces HERE, before
+     * the admin email, with no {@code saveAndFlush} needed. The loser is translated to the SAME 409
+     * the exists-check throws; any other integrity violation is rethrown unchanged (generic handler,
+     * anti-enumeration).
+     */
+    private PlatformCategory insertPending(PlatformCategory category) {
+        try {
+            return platformCategoryRepository.save(category);
+        } catch (DataIntegrityViolationException ex) {
+            if (isNameUniqueViolation(ex)) {
+                throw duplicateCategory(category.getName());
+            }
+            throw ex;
+        }
+    }
+
+    /**
+     * Matches only Hibernate's structured {@code getConstraintName()} — never a message substring
+     * (the PgJDBC detail line echoes caller-supplied text). Same rationale as
+     * {@code ServiceCatalogService.isDuplicateServiceViolation}.
+     */
+    private static boolean isNameUniqueViolation(DataIntegrityViolationException ex) {
+        for (Throwable cause = ex; cause != null; cause = cause.getCause()) {
+            if (cause instanceof org.hibernate.exception.ConstraintViolationException hce
+                    && NAME_UNIQUE_CONSTRAINT.equals(hce.getConstraintName())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static BusinessException duplicateCategory(String name) {
+        return new BusinessException(HttpStatus.CONFLICT, DUPLICATE_CATEGORY_MESSAGE_PREFIX + name);
     }
 
     /** Blank or null becomes {@code null}; otherwise the trimmed value. */

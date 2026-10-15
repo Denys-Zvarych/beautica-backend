@@ -12,6 +12,7 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.cache.annotation.CacheEvict;
 import org.springframework.cache.annotation.Caching;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
@@ -53,6 +54,9 @@ import java.util.UUID;
 public class ServiceTypeSuggestionService {
 
     private static final Duration TOKEN_TTL = Duration.ofDays(7);
+    /** V197 partial UNIQUE index enforcing one PENDING row per (category_name, lower(suggested_name)). */
+    static final String PENDING_DEDUP_INDEX = "ux_service_type_suggestion_pending_dedup";
+    private static final String DUPLICATE_PENDING_MESSAGE = "A matching suggestion is already pending review";
     private static final String REVIEW_PATH = "/api/v1/service-types/suggestions/review?token=";
 
     private final ServiceTypeSuggestionRepository suggestionRepository;
@@ -132,8 +136,7 @@ public class ServiceTypeSuggestionService {
 
         if (suggestionRepository.existsPendingByCategoryNameAndSuggestedNameIgnoreCase(
                 categoryName, suggestedName)) {
-            throw new BusinessException(
-                    HttpStatus.CONFLICT, "A matching suggestion is already pending review");
+            throw duplicatePending();
         }
 
         String rawToken = tokenGenerator.generateToken();
@@ -142,7 +145,7 @@ public class ServiceTypeSuggestionService {
 
         ServiceTypeSuggestion suggestion = ServiceTypeSuggestion.ofPending(
                 categoryName, suggestedName, description, requestedByUserId, tokenHash, now.plus(TOKEN_TTL));
-        suggestionRepository.save(suggestion);
+        insertPending(suggestion);
 
         String reviewUrl = publicBaseUrlProperties.getPublicBaseUrl() + REVIEW_PATH + rawToken;
         emailService.sendServiceTypeSuggestionNotification(
@@ -152,6 +155,45 @@ public class ServiceTypeSuggestionService {
                 suggestedName,
                 description,
                 reviewUrl);
+    }
+
+    /**
+     * Inserts the PENDING row and flushes immediately so a lost race on
+     * {@value #PENDING_DEDUP_INDEX} (V197) surfaces HERE — inside the service, before the admin
+     * email — rather than at commit. The exists-check above is check-then-act; two concurrent
+     * submits can both pass it, and the partial UNIQUE index is what actually serialises them
+     * (the second INSERT blocks on the first's uncommitted row, then fails). The loser is
+     * translated to the SAME 409 the exists-check throws, so the client sees identical behaviour.
+     * Any other integrity violation is rethrown unchanged (generic handler, anti-enumeration).
+     */
+    private void insertPending(ServiceTypeSuggestion suggestion) {
+        try {
+            suggestionRepository.saveAndFlush(suggestion);
+        } catch (DataIntegrityViolationException ex) {
+            if (isPendingDedupViolation(ex)) {
+                throw duplicatePending();
+            }
+            throw ex;
+        }
+    }
+
+    /**
+     * Matches only Hibernate's structured {@code getConstraintName()} — never a message substring
+     * (the PgJDBC detail line echoes caller-supplied text). Same rationale as
+     * {@code ServiceCatalogService.isDuplicateServiceViolation}.
+     */
+    private static boolean isPendingDedupViolation(DataIntegrityViolationException ex) {
+        for (Throwable cause = ex; cause != null; cause = cause.getCause()) {
+            if (cause instanceof org.hibernate.exception.ConstraintViolationException hce
+                    && PENDING_DEDUP_INDEX.equals(hce.getConstraintName())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static BusinessException duplicatePending() {
+        return new BusinessException(HttpStatus.CONFLICT, DUPLICATE_PENDING_MESSAGE);
     }
 
     /**

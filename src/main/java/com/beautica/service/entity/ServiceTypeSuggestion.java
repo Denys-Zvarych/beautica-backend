@@ -49,6 +49,10 @@ import java.util.UUID;
                 // V159 (phase 295 audit MEDIUM-6). Same ON DELETE SET NULL RI-trigger rationale as
                 // PlatformCategory's index of the same name shape.
                 @Index(name = "idx_service_type_suggestion_requested_by", columnList = "requested_by_user_id")
+                // NOT mirrored here: V197's partial UNIQUE ux_service_type_suggestion_pending_dedup
+                // ON (category_name, lower(suggested_name)) WHERE status = 'PENDING'. JPA @Index can
+                // express neither an expression column nor a WHERE predicate, and an
+                // @Index(unique = true) on the raw columns would claim a stricter, wrong constraint.
         }
 )
 // @DynamicInsert: created_at is populated by the DB DEFAULT NOW() (see V76). Without

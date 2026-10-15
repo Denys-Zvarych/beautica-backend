@@ -16,8 +16,11 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.hibernate.exception.ConstraintViolationException;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.test.util.ReflectionTestUtils;
 
+import java.sql.SQLException;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.OffsetDateTime;
@@ -89,13 +92,13 @@ class ServiceTypeSuggestionServiceTest {
         when(tokenGenerator.generateToken()).thenReturn(RAW_TOKEN);
         when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
         when(publicBaseUrlProperties.getPublicBaseUrl()).thenReturn("https://api.beautica.app");
-        when(suggestionRepository.save(any(ServiceTypeSuggestion.class)))
+        when(suggestionRepository.saveAndFlush(any(ServiceTypeSuggestion.class)))
                 .thenAnswer(inv -> inv.getArgument(0));
 
         service.submitSuggestion(CATEGORY, SUGGESTED, DESCRIPTION, requester);
 
         ArgumentCaptor<ServiceTypeSuggestion> captor = ArgumentCaptor.forClass(ServiceTypeSuggestion.class);
-        verify(suggestionRepository).save(captor.capture());
+        verify(suggestionRepository).saveAndFlush(captor.capture());
         ServiceTypeSuggestion saved = captor.getValue();
 
         assertThat(saved.getStatus()).isEqualTo(ServiceTypeSuggestionStatus.PENDING);
@@ -125,7 +128,7 @@ class ServiceTypeSuggestionServiceTest {
         when(tokenGenerator.generateToken()).thenReturn(RAW_TOKEN);
         when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
         when(publicBaseUrlProperties.getPublicBaseUrl()).thenReturn("https://x");
-        when(suggestionRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+        when(suggestionRepository.saveAndFlush(any())).thenAnswer(inv -> inv.getArgument(0));
 
         service.submitSuggestion(CATEGORY, SUGGESTED, DESCRIPTION, null);
 
@@ -143,8 +146,48 @@ class ServiceTypeSuggestionServiceTest {
                 .isInstanceOf(BusinessException.class)
                 .extracting("status").hasToString("409 CONFLICT");
 
+        verify(suggestionRepository, never()).saveAndFlush(any());
         verify(suggestionRepository, never()).save(any());
         verifyNoInteractions(emailService, tokenGenerator);
+    }
+
+    @Test
+    @DisplayName("should_throwSameConflict_when_insertLosesRaceOnPendingDedupIndex")
+    void should_throwSameConflict_when_insertLosesRaceOnPendingDedupIndex() {
+        when(suggestionRepository.existsPendingByCategoryNameAndSuggestedNameIgnoreCase(CATEGORY, SUGGESTED))
+                .thenReturn(false);
+        when(tokenGenerator.generateToken()).thenReturn(RAW_TOKEN);
+        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
+        when(suggestionRepository.saveAndFlush(any()))
+                .thenThrow(integrityViolation(ServiceTypeSuggestionService.PENDING_DEDUP_INDEX));
+
+        assertThatThrownBy(() -> service.submitSuggestion(CATEGORY, SUGGESTED, DESCRIPTION, UUID.randomUUID()))
+                .isInstanceOf(BusinessException.class)
+                .hasMessage("A matching suggestion is already pending review")
+                .extracting("status").hasToString("409 CONFLICT");
+
+        verifyNoInteractions(emailService);
+    }
+
+    @Test
+    @DisplayName("should_rethrowUnchanged_when_insertViolatesAnotherConstraint")
+    void should_rethrowUnchanged_when_insertViolatesAnotherConstraint() {
+        when(suggestionRepository.existsPendingByCategoryNameAndSuggestedNameIgnoreCase(CATEGORY, SUGGESTED))
+                .thenReturn(false);
+        when(tokenGenerator.generateToken()).thenReturn(RAW_TOKEN);
+        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
+        DataIntegrityViolationException other = integrityViolation("fk_service_type_suggestion_requested_by");
+        when(suggestionRepository.saveAndFlush(any())).thenThrow(other);
+
+        assertThatThrownBy(() -> service.submitSuggestion(CATEGORY, SUGGESTED, DESCRIPTION, UUID.randomUUID()))
+                .isSameAs(other);
+
+        verifyNoInteractions(emailService);
+    }
+
+    private static DataIntegrityViolationException integrityViolation(String constraintName) {
+        return new DataIntegrityViolationException("could not execute statement",
+                new ConstraintViolationException("duplicate", new SQLException("23505"), constraintName));
     }
 
     // ── approve / reject ───────────────────────────────────────────────────────
@@ -184,6 +227,7 @@ class ServiceTypeSuggestionServiceTest {
 
         verify(promotionService).promote(pending);
         // No save() on approve — the decision mutates the managed entity in place.
+        verify(suggestionRepository, never()).saveAndFlush(any());
         verify(suggestionRepository, never()).save(any());
         assertThat(pending.getStatus()).isEqualTo(ServiceTypeSuggestionStatus.APPROVED);
     }
@@ -311,6 +355,7 @@ class ServiceTypeSuggestionServiceTest {
         assertThat(view.suggestedName()).isEqualTo(SUGGESTED);
         assertThat(view.description()).isEqualTo(DESCRIPTION);
         // Read-only: GET review must never mutate or clear the token.
+        verify(suggestionRepository, never()).saveAndFlush(any());
         verify(suggestionRepository, never()).save(any());
         assertThat(pending.getStatus()).isEqualTo(ServiceTypeSuggestionStatus.PENDING);
         assertThat(pending.getTokenHash()).isNotNull();
