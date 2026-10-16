@@ -176,8 +176,17 @@ jobs:
           #
           # The pathspec is scoped to the three file kinds that carry
           # a Flyway checksum identity, NOT to whole directories:
-          #   "$MIGRATION_PATH/*.sql"        -- SQL scripts
-          #   "$JAVA_MIGRATION_PATH/V*.java" -- Java migrations (V171+)
+          #   "$MIGRATION_PATH/*.sql"        -- SQL scripts, any depth (a
+          #                                     plain git pathspec '*' also
+          #                                     crosses '/', so db/migration/
+          #                                     sub/V9__x.sql is covered; Flyway
+          #                                     scans subfolders)
+          #   ":(glob)$JAVA_MIGRATION_PATH/**/V*.java"
+          #                                  -- Java migrations (V171+), any
+          #                                     depth. NOT "$JAVA_.../V*.java":
+          #                                     that needs the 'V' directly
+          #                                     after the directory and misses
+          #                                     db/migration/sub/V9__x.java.
           #   "$DATA_PATH/*.csv"             -- data resources a Java
           #                                     migration derives its
           #                                     own checksum from
@@ -201,7 +210,7 @@ jobs:
             local base_sha="$1"
             local changed
             changed=$(git diff --name-status --diff-filter=MDRCT "${base_sha}...HEAD" -- \
-              "$MIGRATION_PATH/*.sql" "$JAVA_MIGRATION_PATH/V*.java" "$DATA_PATH/*.csv")
+              "$MIGRATION_PATH/*.sql" ":(glob)$JAVA_MIGRATION_PATH/**/V*.java" "$DATA_PATH/*.csv")
             if [ -z "$changed" ]; then
               return 0
             fi
@@ -213,7 +222,7 @@ jobs:
           # >>> SHARED-BLOCK:immutability:END
 
           CHANGED=$(git diff --name-status --diff-filter=MDRCT "$BASE_SHA...HEAD" -- \
-            "$MIGRATION_PATH/*.sql" "$JAVA_MIGRATION_PATH/V*.java" "$DATA_PATH/*.csv")
+            "$MIGRATION_PATH/*.sql" ":(glob)$JAVA_MIGRATION_PATH/**/V*.java" "$DATA_PATH/*.csv")
 
           if run_gate "$BASE_SHA"; then
             echo "No existing migration files were modified, deleted, or renamed. Check passed."
@@ -227,6 +236,598 @@ jobs:
           echo "Applied/merged migrations are immutable -- never edit or rename V*.sql after it is merged."
           echo "Add a new forward migration with the next version number instead."
           echo "If you did NOT touch the file(s) listed above, rebase your branch onto the base branch to bring your history up to date."
+          exit 1
+
+      # Phase 370 D6: expand/contract gate. Reuses $BASE_SHA from "Resolve base revision" above.
+      - name: Require contract-of header on destructive migrations
+        run: |
+          set -euo pipefail
+
+          MIGRATION_PATH="src/main/resources/db/migration"
+          JAVA_MIGRATION_PATH="src/main/java/db/migration"
+
+          # >>> SHARED-BLOCK:destructive:BEGIN
+          # =========================================================
+          # SHARED DESTRUCTIVE-MIGRATION GATE LOGIC (phase 370 D6) -- keep
+          # this block BYTE-IDENTICAL with the mirror in
+          # `self-test-base-revision-resolution`. The hermetic
+          # `verify-gate-mirror-parity` job diffs the two extracted copies
+          # and fails CI if they drift.
+          # =========================================================
+          #
+          # Expand/contract: Railway rollback redeploys the PREVIOUS image
+          # against the ALREADY-MIGRATED schema, so a migration that breaks
+          # the previous app version (a "contract" step) may only ship after
+          # the release that stopped using the object is live. CI cannot
+          # know what is in prod; the release checklist covers that. CI
+          # enforces that the author states it.
+          #
+          # Scope: migration files ADDED relative to the merge-base only
+          # (--diff-filter=A, same three-dot form as the other gates), so the
+          # existing V1..V198 are exempt. Files are listed under the WHOLE
+          # migration directory and filtered on the BASENAME, never with a
+          # directory-anchored glob: Flyway scans SUBFOLDERS, and the pathspec
+          # `db/migration/V*.sql` does not match `db/migration/sub/V200__x.sql`,
+          # so a destructive migration could hide one directory down.
+          #   * SQL: any added V*.sql at any depth under src/main/resources/db/migration.
+          #   * Repeatable R__*.sql files are REJECTED outright (the repo has none):
+          #     Flyway re-applies them whenever their checksum changes, so they are not
+          #     one-shot contract steps, a header could not express "the earlier expand
+          #     migration", and they would otherwise be a silent hole in this gate.
+          #   * Java: an added V*.java at any depth under src/main/java/db/migration is not
+          #     parsed; it must carry `// contract-of: V<n>` (destructive) or
+          #     `// non-destructive` (author's statement), otherwise the gate fails.
+          #
+          # SQL is read by ONE left-to-right tokenizer (no regex stripping, which
+          # was evadable: `VALUES ('--'); DROP TABLE x;` hid the DROP behind a
+          # fake comment). It understands: '...' with '' escapes,
+          # E'...' with backslash escapes, U&'...' (Unicode-escape strings), "quoted
+          # identifiers" with "" escapes (U&"..." identifiers tokenize the same way, the
+          # U& stays in the code text), $tag$...$tag$ dollar quoting, -- comments and
+          # NESTED /* */ comments. The dollar-tag scan is a linear \G match (a
+          # substr($s,$i) copy per `$` made a 5 MB run of `$` quadratic).
+          # FAIL CLOSED: an unbalanced quote, dollar tag or comment makes the whole
+          # file destructive (reason UNPARSEABLE).
+          #
+          # Each statement (split on top-level ;) is DESTRUCTIVE when its code
+          # (comments dropped, literals blanked) contains:
+          #   DROP <anything>, EXCEPT an allow-list. EVERY DROP <kind> is destructive
+          #       (TABLE, SEQUENCE, TYPE, DOMAIN, VIEW, FUNCTION, TRIGGER, SCHEMA, EXTENSION,
+          #       OWNED BY, FOREIGN TABLE, POLICY, RULE, AGGREGATE, COLUMN, a bare/quoted
+          #       column name, ... and kinds nobody has thought of yet) unless <kind> is:
+          #         inside an ALTER statement: INDEX | CONSTRAINT | DEFAULT | NOT NULL |
+          #                                    EXPRESSION | IDENTITY
+          #         at top level:              INDEX
+          #       INDEX / EXPRESSION / IDENTITY are non-reserved words, so a column can be
+          #       named that. `ALTER TABLE t DROP identity;` (directly followed by `,`,
+          #       `;`, CASCADE or RESTRICT, and NOT preceded by `ALTER [COLUMN] <col>`) is
+          #       a column drop and is flagged; `ALTER COLUMN c DROP IDENTITY` is allowed.
+          #   TRUNCATE
+          #   RENAME (table, column, constraint, index, ...). Index renames are
+          #       deliberately kept destructive (fail closed): add a contract-of
+          #       header if the rename is intentional.
+          #   SET NOT NULL
+          #   ALTER [COLUMN] <col> [SET DATA] TYPE
+          #   ADD [CONSTRAINT <name>] CHECK | UNIQUE | PRIMARY KEY | FOREIGN KEY |
+          #       EXCLUDE, and ADD ... REFERENCES (existing rows / the previous
+          #       app version's writes can violate it)
+          #   CREATE UNIQUE INDEX (same reason)
+          #   SET SCHEMA (the previous app version still addresses the old schema)
+          #   DROP INDEX / DROP CONSTRAINT of a UNIQUE or PRIMARY KEY or EXCLUDE object, or of a
+          #       DYNAMICALLY named one: a rollback runs the previous app against a schema
+          #       without it, and its ON CONFLICT (cols) then fails (e.g. DeviceTokenRepository's
+          #       ON CONFLICT (token) needs ux_device_tokens_token). The object name is read
+          #       after IF EXISTS / CONCURRENTLY, schema prefix ignored, and all comma-listed
+          #       DROP INDEX names are checked. Destructive when the name matches
+          #       ux_ uq_ uk_ pk_ unq_ uniq_ prefixes, _key _pkey _pk _ux _uq _uk _unique _unq
+          #       suffixes, contains unique / excl / overlap, or is one of the 4 historical
+          #       UNIQUE indexes named idx_* (idx_salons_owner_primary,
+          #       idx_masters_user_owner_type, idx_masters_booking_slug,
+          #       idx_bookings_cancel_token); or is dynamic: %I, a quoted identifier, a variable,
+          #       a concatenated name (the literal ends at DROP CONSTRAINT), anything that is not
+          #       a plain word. Only names that positively look non-unique (idx_ ix_ chk_ ck_ fk_
+          #       prefixes, _fkey _fk _idx _ix _chk _check _ck suffixes) pass, so `DROP INDEX
+          #       idx_foo` is allowed and an unknown name fails closed.
+          #       Whitespace runs are collapsed once before the 400-char look-ahead (linear, so
+          #       padding cannot hide a later name). FAIL CLOSED: a comma with no name after it, a
+          #       name touching the window end, or a name followed by anything but whitespace, a
+          #       comma or the end (`idx_x$_key` is NOT read as `idx_x`).
+          #   ADD [CONSTRAINT <name>] NOT NULL <col> (PG18 table-constraint spelling of SET NOT NULL)
+          #   (DEFAULT NULL / DEFAULT (NULL) / DEFAULT NULL::t is NOT a default for the next rule)
+          #   ADD [COLUMN] <col> ... NOT NULL without DEFAULT or GENERATED (existing rows / the
+          #       previous app version's INSERTs violate it; IS NOT NULL inside a CHECK is ignored)
+          #   DETACH PARTITION, NO INHERIT, ENABLE | FORCE ROW LEVEL SECURITY (each changes which rows
+          #       the previous app version's queries see or write)
+          # Deliberately NOT destructive: REVOKE (role grants only; the app connects as the owner role
+          # that runs Flyway), DROP DEFAULT (the standard last step of add-with-default expand
+          # migrations, flagging it would block routine safe work), plain CREATE INDEX / ADD COLUMN.
+          #
+          # LITERALS IN EVERY FILE: a string or dollar body is also scanned in files with no
+          # EXECUTE (a previous migration may have created run_sql(text); dblink_exec runs its
+          # text argument), but ONLY by DDL shape: a ;-separated part of the literal must BE a
+          # full DROP <kind> <names> / TRUNCATE <names> / ALTER <kind> <name> <action> /
+          # CREATE UNIQUE INDEX <name> ON statement, which is then judged by the rules above.
+          # Prose that merely contains the word drop / truncate / rename ("drop off",
+          # "drop table and rename") has no DDL shape and passes. In INSERT / UPDATE / COMMENT ON /
+          # COPY statements only a literal that is ONE whole DDL statement counts (a literal with
+          # several ;-parts such as 'it''s; DROP TABLE x' is data there). Inside a dynamic
+          # context (below) the full rules apply to the literal text instead of the shape rule.
+          # Escape-encoded literals (E'..\..', U&'..') outside INSERT / UPDATE / DELETE / COMMENT /
+          # CREATE / ALTER / COPY / VALUES statements (i.e. as an argument of SELECT / CALL /
+          # PERFORM / DO ...) fail closed in any file. A blanket ban was rejected as too broad
+          # (E'a\nb' seed data is legitimate) and a "calls a non-builtin function" test cannot be
+          # decided statically; no existing migration contains E'..\..' or U&'..' at all.
+          # 
+          # Dynamic SQL: a statement that is a DO block, contains EXECUTE, or is a
+          # CREATE FUNCTION/PROCEDURE has all of its string and dollar-quoted bodies
+          # analysed recursively with the FULL rules (depth-limited; fails closed when
+          # too deep). String pieces of one statement are also analysed concatenated, so
+          # EXECUTE 'DR' || 'OP TABLE x' is caught.
+          # WHOLE-FILE MODE: if EXECUTE appears ANYWHERE in the file, at any nesting
+          # depth (a function that runs EXECUTE q is invoked by a plain
+          # `SELECT run_sql('DROP TABLE users')` or `CALL p('DROP TABLE x')` elsewhere,
+          # and `s := 'DR'; s := s || 'OP TABLE x'; EXECUTE s` splits across
+          # statements), EVERY literal in the file is analysed, at every depth, and so
+          # is the join of all innermost literals in file order.
+          # ESCAPES: in a file with EXECUTE, any E'...' literal that contains a
+          # backslash, or any U&'...' literal, fails closed with "escape-encoded literal
+          # in dynamic-SQL file; add contract-of if intentional". Chosen over decoding
+          # \xHH / \NNN / \uXXXX / U& escapes because a decoder is one more surface to
+          # get wrong (UESCAPE, octal, surrogate pairs, standard_conforming_strings) and
+          # a legitimate migration has no reason to hide SQL behind escapes; the author
+          # can state intent with a contract-of header.
+          # A file that only mentions EXECUTE (GRANT/REVOKE EXECUTE ON FUNCTION) is analysed in the
+          # same wide mode: more literals checked, never fewer.
+          # OBFUSCATION PRIMITIVES (fail closed): code (not data) anywhere in the file, at any depth,
+          # that calls decode( / convert_from( / dblink*, or format( together with EXECUTE or
+          # PERFORM, is destructive ("obfuscation-capable dynamic SQL"). The only way through is a
+          # `-- contract-of: V<n>` header. Chosen over a new `-- dynamic-sql-reviewed` marker
+          # because it adds no parser path and no unvalidated escape hatch: the header is already
+          # checked against a real earlier migration. Historical cost: 4 of the 195 existing
+          # migrations use format() with EXECUTE/PERFORM; new ones need the header too.
+          # HARDENING: EXECUTE of anything but a literal chain (EXECUTE t, EXECUTE format(..)) in any
+          # dynamic body is destructive; EXECUTE FUNCTION/PROCEDURE and GRANT EXECUTE ON are exempt.
+          # REMAINING RESIDUAL (not detectable statically, covered by the release checklist and
+          # review): SQL assembled with primitives other than the four above, e.g. chr(68) ||
+          # 'ROP', string_agg / array_to_string / concat over generated pieces, translate() /
+          # regexp_replace() on a literal, a function body stored by an EARLIER migration that
+          # builds the DDL itself, text read from a table at run time, and a UNIQUE index that is
+          # named like a plain index (idx_foo) and not in the 4-name list above.
+          #
+          # A destructive file must carry one header line anywhere in it:
+          #   -- contract-of: V<n>        (Java: // contract-of: V<n>)
+          # where V<n> is the EXPAND migration that already stopped the
+          # previous app using the object. <n> must be plain digits, strictly
+          # lower than this file's own version, and a V<n>__*.sql|java file must
+          # exist in the HEAD tree (any depth); otherwise the gate fails.
+          #
+          # Prints the destructive reason (first match) or nothing; reads SQL
+          # on stdin. Single-quote is written \x27 inside the perl body so it can live in a
+          # shell single-quoted string.
+          destructive_reason() {
+            perl -0777 -ne '
+              our $ESC = 0;
+              our $WIDE = 0;
+              our $NONLIT = 0;
+
+              sub tokenize {
+                my ($s) = @_;
+                my $n = length $s;
+                my $i = 0;
+                my @stmts;
+                my $code = "";
+                my @bodies;
+                my $stesc = 0;
+                while ($i < $n) {
+                  my $c = substr($s, $i, 1);
+                  my $two = substr($s, $i, 2);
+                  if ($two eq "--") {
+                    my $e = index($s, "\n", $i);
+                    $i = $e < 0 ? $n : $e;
+                    $code .= " ";
+                    next;
+                  }
+                  if ($two eq "/*") {
+                    my $d = 1;
+                    $i += 2;
+                    while ($d > 0) {
+                      return undef if $i >= $n;
+                      my $t = substr($s, $i, 2);
+                      if ($t eq "/*") { $d++; $i += 2 }
+                      elsif ($t eq "*/") { $d--; $i += 2 }
+                      else { $i++ }
+                    }
+                    $code .= " ";
+                    next;
+                  }
+                  if ($c eq "\x27") {
+                    my $esc = ($i > 0 && substr($s, $i - 1, 1) =~ /[eE]/ && ($i < 2 || substr($s, $i - 2, 1) !~ /[\w\$]/));
+                    my $uamp = ($i > 1 && substr($s, $i - 1, 1) eq "&" && substr($s, $i - 2, 1) =~ /[uU]/ && ($i < 3 || substr($s, $i - 3, 1) !~ /[\w\$]/));
+                    $ESC = 1 if $uamp;
+                    $stesc = 1 if $uamp;
+                    my $j = $i + 1;
+                    my $b = "";
+                    while (1) {
+                      return undef if $j >= $n;
+                      my $ch = substr($s, $j, 1);
+                      if ($esc && $ch eq "\\") {
+                        return undef if $j + 1 >= $n;
+                        $b .= substr($s, $j, 2);
+                        $j += 2;
+                        next;
+                      }
+                      if ($ch eq "\x27") {
+                        if (substr($s, $j + 1, 1) eq "\x27") { $b .= "\x27"; $j += 2; next }
+                        last;
+                      }
+                      $b .= $ch;
+                      $j++;
+                    }
+                    $ESC = 1 if $esc && index($b, "\\") >= 0;
+                    $stesc = 1 if $esc && index($b, "\\") >= 0;
+                    push @bodies, $b;
+                    $code .= "\x27\x27";
+                    $i = $j + 1;
+                    next;
+                  }
+                  if ($c eq "\"") {
+                    my $j = $i + 1;
+                    while (1) {
+                      return undef if $j >= $n;
+                      if (substr($s, $j, 1) eq "\"") {
+                        if (substr($s, $j + 1, 1) eq "\"") { $j += 2; next }
+                        last;
+                      }
+                      $j++;
+                    }
+                    $code .= "\"q\"";
+                    $i = $j + 1;
+                    next;
+                  }
+                  if ($c eq "\$" && ($i == 0 || substr($s, $i - 1, 1) !~ /[\w\$]/)) {
+                    pos($s) = $i;
+                    if ($s =~ /\G(\$(?:[A-Za-z_\x80-\xff][\w\x80-\xff]*)?\$)/gc) {
+                      my $tag = $1;
+                      my $from = $i + length $tag;
+                      my $e = index($s, $tag, $from);
+                      return undef if $e < 0;
+                      push @bodies, substr($s, $from, $e - $from);
+                      $code .= " \x27\x27 ";
+                      $i = $e + length $tag;
+                      next;
+                    }
+                  }
+                  if ($c eq ";") {
+                    push @stmts, [$code, [@bodies], $stesc];
+                    $code = "";
+                    @bodies = ();
+                    $stesc = 0;
+                    $i++;
+                    next;
+                  }
+                  $code .= $c;
+                  $i++;
+                }
+                push @stmts, [$code, [@bodies], $stesc] if $code =~ /\S/ || @bodies;
+                return \@stmts;
+              }
+
+              sub code_reason {
+                my ($c) = @_;
+                # Collapse every whitespace run ONCE (linear) so padding cannot push a later
+                # name out of the fixed 400-char look-ahead window in drop_name_reason.
+                $c =~ s/\s+/ /g;
+                my $alter = ($c =~ /ALTER/i) ? 1 : 0;
+                while ($c =~ /\bDROP\b\s*(NOT\s+NULL\b|\w+|"q"|\S?)/gi) {
+                  my $start = $-[0];
+                  my $end = $+[0];
+                  my $k = uc $1;
+                  $k =~ s/\s+/ /g;
+                  my $ok = $alter ? ($k =~ /\A(?:INDEX|CONSTRAINT|DEFAULT|NOT NULL|EXPRESSION|IDENTITY)\z/ ? 1 : 0) : ($k eq "INDEX" ? 1 : 0);
+                  if ($ok && $alter && $k =~ /\A(?:INDEX|EXPRESSION|IDENTITY)\z/) {
+                    my $after = substr($c, $end, 40);
+                    if ($after =~ /\A\s*(?:,|\z|(?:CASCADE|RESTRICT)\b)/i) {
+                      my $before = substr($c, $start > 200 ? $start - 200 : 0, $start > 200 ? 200 : $start);
+                      $ok = 0 unless $before =~ /\bALTER\s+(?:COLUMN\s+)?(?:"q"|\w+)\s*\z/i;
+                    }
+                  }
+                  if ($ok && ($k eq "INDEX" || $k eq "CONSTRAINT")) {
+                    my $nr = drop_name_reason(substr($c, $end, 400), $k, length($c) - $end > 400);
+                    return $nr if $nr;
+                  }
+                  next if $ok;
+                  return "DROP COLUMN" if $k eq "COLUMN" || $k eq "IF" || $k =~ /\A[^A-Z]/;
+                  return "DROP COLUMN" if $alter && $k !~ /\A(?:TABLE|SEQUENCE|TYPE|DOMAIN|VIEW|MATERIALIZED|FUNCTION|PROCEDURE|TRIGGER|SCHEMA|EXTENSION|OWNED|FOREIGN|POLICY|RULE|AGGREGATE|ATTRIBUTE|PUBLICATION|SUBSCRIPTION|COLLATION|CAST|OPERATOR|ROLE|USER|GROUP|EVENT|TABLESPACE|DATABASE|LANGUAGE|STATISTICS|ACCESS|TRANSFORM|CONVERSION|ROUTINE|SERVER|TEXT|LARGE)\z/;
+                  return "DROP $k";
+                }
+                return "TRUNCATE" if $c =~ /\bTRUNCATE\b/i;
+                return "RENAME" if $c =~ /\bRENAME\b/i;
+                return "SET NOT NULL" if $c =~ /\bSET\s+NOT\s+NULL\b/i;
+                return "ADD NOT NULL (table-constraint form)" if $c =~ /\bADD\s+(?:CONSTRAINT\s+\S+\s+)?NOT\s+NULL\b/i;
+                return "ADD COLUMN NOT NULL without DEFAULT/GENERATED" if add_column_not_null($c);
+                return "DETACH PARTITION" if $c =~ /\bDETACH\s+PARTITION\b/i;
+                return "NO INHERIT" if $c =~ /\bNO\s+INHERIT\b/i;
+                return "ENABLE/FORCE ROW LEVEL SECURITY" if $c =~ /\b(?:ENABLE|FORCE)\s+ROW\s+LEVEL\s+SECURITY\b/i;
+                return "ALTER COLUMN TYPE" if $c =~ /\bALTER\s+(?:COLUMN\s+)?(?:"[^"]+"|\w+)\s+(?:SET\s+DATA\s+)?TYPE\b/i;
+                return "ADD CHECK/UNIQUE CONSTRAINT" if $c =~ /\bADD\s+(?:CONSTRAINT\s+\S+\s+)?(?:CHECK|UNIQUE)\b/i;
+                return "CREATE UNIQUE INDEX" if $c =~ /\bCREATE\s+UNIQUE\s+INDEX\b/i;
+                return "ADD " . uc($1) if $c =~ /\bADD\s+(?:CONSTRAINT\s+\S+\s+)?(PRIMARY\s+KEY|FOREIGN\s+KEY|EXCLUDE)\b/i;
+                if ($c =~ /\bADD\b/i) {
+                  pos($c) = $+[0];
+                  return "ADD ... REFERENCES" if $c =~ /\G.*?\bREFERENCES\b/is;
+                }
+                return "SET SCHEMA" if $c =~ /\bSET\s+SCHEMA\b/i;
+                return "";
+              }
+
+              sub unique_or_dynamic_name {
+                my ($n) = @_;
+                return 1 if $n eq "" || $n =~ /\A"q"\z/ || $n !~ /\A\w+\z/;
+                return 1 if $n =~ /\A(?:ux|uq|uk|pk|unq|uniq)_|(?:_key|_pkey|_pk|_ux|_uq|_uk|_unique|_unq)\z|unique|excl|overlap|\Aidx_(?:salons_owner_primary|masters_user_owner_type|masters_booking_slug|bookings_cancel_token)\z/i;
+                return 0 if $n =~ /\A(?:idx|ix|chk|ck|fk)_|(?:_fkey|_fk|_idx|_ix|_chk|_check|_ck)\z/i;
+                return 1;
+              }
+
+              sub drop_name_reason {
+                my ($after, $k, $trunc) = @_;
+                $after =~ s/\A\s*(?:CONCURRENTLY\s+)?(?:IF\s+EXISTS\s+)?//i;
+                return "DROP $k of a dynamic-named object" unless $after =~ /\A\s*\S/;
+                pos($after) = 0;
+                my $comma = 0;
+                while ($after =~ /\G\s*((?:"q"|\w+)(?:\s*\.\s*(?:"q"|\w+))*|\S)/gc) {
+                  $comma = 0;
+                  my $last = $1;
+                  $last =~ s/\A.*\.\s*//s;
+                  return "DROP $k of a unique/primary-key/exclusion/dynamic-named object" if unique_or_dynamic_name($last);
+                  # FAIL CLOSED: a name followed by anything but whitespace, comma or end
+                  # (`idx_x$_key` is read as `idx_x`), or a name touching the look-ahead window end.
+                  my $p = pos($after);
+                  return "DROP $k name not terminated cleanly (unparsed identifier or window end)" if ($p < length($after) && substr($after, $p, 1) !~ /[\s,]/) || ($trunc && $p >= length($after));
+                  last if $k ne "INDEX";
+                  last unless $after =~ /\G\s*,/gc;
+                  $comma = 1;
+                }
+                # FAIL CLOSED: a comma with no name after it (hidden past the window).
+                return "DROP $k list ends after a comma without a name" if $comma;
+                return "";
+              }
+
+              sub add_column_not_null {
+                my ($c) = @_;
+                return 0 unless $c =~ /\bALTER\s+TABLE\b/i;
+                my ($d, $cur, @cl) = (0, "");
+                while ($c =~ /\G([^(),]+|[(),])/gc) {
+                  my $t = $1;
+                  if ($t eq "(") { $d++; $cur .= $t }
+                  elsif ($t eq ")") { $d-- if $d > 0; $cur .= $t }
+                  elsif ($t eq "," && $d == 0) { push @cl, $cur; $cur = "" }
+                  else { $cur .= $t }
+                }
+                push @cl, $cur;
+                for my $cl (@cl) {
+                  next unless $cl =~ /\bADD\s+(?:(COLUMN)\s+)?(?:IF\s+NOT\s+EXISTS\s+)?("q"|\w+)\s+(.*)\z/is;
+                  my ($explicit, $name, $rest) = ($1, $2, $3);
+                  next if !$explicit && uc($name) =~ /\A(?:CONSTRAINT|CHECK|UNIQUE|PRIMARY|FOREIGN|EXCLUDE|NOT)\z/;
+                  $rest =~ s/\bIS\s+NOT\s+NULL\b//ig;
+                  # DEFAULT NULL (also (NULL), NULL::type) is no usable default for NOT NULL.
+                  $rest =~ s/\bDEFAULT\s*(?:\(\s*NULL(?:\s*::\s*\w+)?\s*\)|NULL\b(?:\s*::\s*\w+)?)//ig;
+                  next unless $rest =~ /\bNOT\s+NULL\b/i;
+                  next if $rest =~ /\b(?:DEFAULT|GENERATED)\b/i;
+                  return 1;
+                }
+                return 0;
+              }
+
+              sub ddl_shape_reason {
+                my ($c) = @_;
+                my $id = qr/(?:"q"|[\w.%]+)/;
+                my $nm = qr/$id(?:\s*\([^()]*\))?/;
+                if ($c =~ /\A\s*DROP\s+(?:TABLE|VIEW|MATERIALIZED\s+VIEW|SEQUENCE|TYPE|DOMAIN|FUNCTION|PROCEDURE|SCHEMA|EXTENSION|TRIGGER|POLICY|RULE|AGGREGATE|FOREIGN\s+TABLE|ROLE|USER|DATABASE|OWNED\s+BY|COLUMN|INDEX(?:\s+CONCURRENTLY)?|CONSTRAINT)\b(?:\s+IF\s+EXISTS)?\s+$nm(?:\s*,\s*$nm)*(?:\s+ON\s+$id)?(?:\s+(?:CASCADE|RESTRICT))?\s*\z/i) {
+                  return code_reason($c);
+                }
+                if ($c =~ /\A\s*TRUNCATE\s+(?:TABLE\s+)?(?:ONLY\s+)?$id(?:\s*,\s*$id)*(?:\s+(?:RESTART|CONTINUE)\s+IDENTITY)?(?:\s+(?:CASCADE|RESTRICT))?\s*\z/i) {
+                  return "TRUNCATE";
+                }
+                if ($c =~ /\A\s*ALTER\s+(?:TABLE|INDEX|SEQUENCE|VIEW|MATERIALIZED\s+VIEW|TYPE|DOMAIN|FOREIGN\s+TABLE)\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?$id\s+\S/i) {
+                  return code_reason($c);
+                }
+                if ($c =~ /\A\s*CREATE\s+UNIQUE\s+INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+NOT\s+EXISTS\s+)?$id\s+ON\b/i) {
+                  return "CREATE UNIQUE INDEX";
+                }
+                return "";
+              }
+
+              sub all_code {
+                my ($sql, $depth, $acc) = @_;
+                return if $depth > 6;
+                my $st = tokenize($sql);
+                if (!defined $st) { $$acc .= " $sql "; return }
+                for my $x (@$st) {
+                  $$acc .= " " . $x->[0] . " ";
+                  for my $b (@{$x->[1]}) { all_code($b, $depth + 1, $acc) }
+                }
+              }
+
+              sub has_exec {
+                my ($sql, $depth) = @_;
+                return 1 if $depth > 6;
+                my $st = tokenize($sql);
+                if (!defined $st) {
+                  $ESC = 1 if $sql =~ /\\|U&/i;
+                  return ($sql =~ /\bEXECUTE\b/i) ? 1 : 0;
+                }
+                my $found = 0;
+                for my $x (@$st) {
+                  $found = 1 if $x->[0] =~ /\bEXECUTE\b/i;
+                  for my $b (@{$x->[1]}) {
+                    $found = 1 if has_exec($b, $depth + 1);
+                  }
+                }
+                return $found;
+              }
+
+              sub inner_bodies {
+                my ($b) = @_;
+                my $st = tokenize($b);
+                return () unless defined $st;
+                my @r;
+                for my $x (@$st) { push @r, @{$x->[1]} }
+                return @r;
+              }
+
+              sub leaves {
+                my ($sql, $depth, $out) = @_;
+                return if $depth > 6;
+                my $st = tokenize($sql);
+                return unless defined $st;
+                for my $x (@$st) {
+                  for my $b (@{$x->[1]}) {
+                    my @in = inner_bodies($b);
+                    if (@in) { leaves($b, $depth + 1, $out) } else { push @$out, $b }
+                  }
+                }
+              }
+
+              sub analyze {
+                # mode: 0 = file top level (code), 1 = literal in a non-dynamic context
+                # (only full DDL-shaped statements count), 2 = dynamic-SQL context (full rules).
+                my ($sql, $depth, $mode, $data) = @_;
+                return "NESTING TOO DEEP" if $depth > 6;
+                my $stmts = tokenize($sql);
+                if (!defined $stmts) {
+                  return "UNPARSEABLE (unbalanced quote, dollar tag or comment)" if $depth == 0;
+                  my @parts = split /;/, $sql;
+                  return "" if $mode == 1 && $data && (grep { /\S/ } @parts) > 1;
+                  for my $st (@parts) {
+                    my $r = $mode == 1 ? ddl_shape_reason($st) : code_reason($st);
+                    return $r if $r;
+                  }
+                  return "";
+                }
+                if ($depth == 0) {
+                  $WIDE = has_exec($sql, 0);
+                  return "escape-encoded literal in dynamic-SQL file; add contract-of if intentional" if $WIDE && $ESC;
+                }
+                return "" if $mode == 1 && $data && (grep { $_->[0] =~ /\S/ || @{$_->[1]} } @$stmts) > 1;
+                for my $st (@$stmts) {
+                  my ($code, $bodies, $stesc) = @$st;
+                  my $r = $mode == 1 ? ddl_shape_reason($code) : code_reason($code);
+                  return $r if $r;
+                  # EXECUTE of anything but a literal chain (EXECUTE FUNCTION/PROCEDURE and GRANT EXECUTE ON excepted).
+                  $NONLIT = 1 if $mode != 1 && $code =~ /\bEXECUTE\b/i && $code !~ /\bEXECUTE\s+(?:FUNCTION|PROCEDURE|ON)\b/i && $code !~ /\bEXECUTE\s+\x27\x27(?:\s*\|\|\s*\x27\x27)*\s*(?:USING\b|INTO\b|\z)/i;
+                  return "escape-encoded literal in a non-data statement; add contract-of if intentional" if $stesc && $code !~ /\A\s*(?:INSERT|UPDATE|DELETE|COMMENT|CREATE|ALTER|COPY|VALUES)\b/i;
+                  my $dyn = $WIDE || $code =~ /\A\s*DO\b/i || $code =~ /\bEXECUTE\b/i || $code =~ /\bCREATE\s+(?:OR\s+REPLACE\s+)?(?:FUNCTION|PROCEDURE)\b/i;
+                  my $cdata = $mode == 0 ? (($code =~ /\A\s*(?:INSERT|UPDATE|COMMENT\s+ON|COPY)\b/i) ? 1 : 0) : $data;
+                  my @scan = @$bodies;
+                  push @scan, join("", @$bodies) if @$bodies > 1;
+                  for my $b (@scan) {
+                    $r = analyze($b, $depth + 1, $dyn ? 2 : 1, $cdata);
+                    return $r if $r;
+                  }
+                }
+                if ($depth == 0 && $WIDE) {
+                  my @all;
+                  leaves($sql, 0, \@all);
+                  if (@all > 1) {
+                    my $r = analyze(join("", @all), 1, 2, 0);
+                    return $r if $r;
+                  }
+                }
+                if ($depth == 0) {
+                  my $acc = "";
+                  all_code($sql, 0, \$acc);
+                  if ($acc =~ /\b(?:decode|convert_from)\s*\(/i || $acc =~ /\bdblink/i || ($acc =~ /\bformat\s*\(/i && $acc =~ /\b(?:EXECUTE|PERFORM)\b/i)) {
+                    return "obfuscation-capable dynamic SQL (decode/convert_from/dblink/format with EXECUTE|PERFORM); add contract-of if intentional";
+                  }
+                  return "EXECUTE of a non-literal (variable/parameter/expression) in dynamic SQL; add contract-of if intentional" if $NONLIT;
+                }
+                return "";
+              }
+
+              print analyze($_, 0, 0, 0);
+            '
+          }
+
+          # check_contract_header <file> <reason> <comment-lead-regex>; prints the error, returns 1 on violation.
+          check_contract_header() {
+            local f="$1" reason="$2" lead="$3" header ver own refs
+            header="$(git show "HEAD:$f" | grep -E "^${lead}contract-of:[[:space:]]*V[0-9]+[[:space:]]*\$" | head -n 1 || true)"
+            if [ -z "$header" ]; then
+              echo "ERROR: new migration '$f' is destructive ($reason) but has no contract-of: V<n> header (add one if intentional)."
+              return 1
+            fi
+            ver="$(printf '%s' "$header" | sed -E 's/^.*contract-of:[[:space:]]*V([0-9]+)[[:space:]]*$/\1/')"
+            own="$(basename "$f" | sed -nE 's/^V([0-9]+)([._][0-9]+)*__.*$/\1/p')"
+            if [ -z "$own" ]; then
+              echo "ERROR: cannot parse the version of destructive migration '$f'."
+              return 1
+            fi
+            if [ "$((10#$ver))" -ge "$((10#$own))" ]; then
+              echo "ERROR: '$f' (V$own, $reason): 'contract-of: V$ver' must name an EARLIER migration."
+              return 1
+            fi
+            refs="$(git ls-tree -r --name-only HEAD -- "$MIGRATION_PATH" "$JAVA_MIGRATION_PATH" | sed 's|.*/||' | grep -E "^V0*${ver}__.*\.(sql|java)$" || true)"
+            if [ -z "$refs" ]; then
+              echo "ERROR: '$f' (V$own, $reason): 'contract-of: V$ver' names no existing migration V${ver}__*."
+              return 1
+            fi
+            return 0
+          }
+
+          run_destructive_gate() {
+            local since="$1"
+            local added f base reason violations=0
+            added="$(git diff --name-only --diff-filter=A "${since}...HEAD" -- "$MIGRATION_PATH")"
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              base="${f##*/}"
+              case "$base" in
+                R__*.sql)
+                  echo "ERROR: new repeatable migration '$f' is not allowed (the repo has none): a repeatable file is re-applied on every checksum change, so it cannot be an expand/contract step. Use a versioned V<n>__*.sql migration."
+                  violations=1
+                  continue ;;
+                V*.sql) : ;;
+                *) continue ;;
+              esac
+              reason="$(git show "HEAD:$f" | destructive_reason)"
+              [ -z "$reason" ] && continue
+              check_contract_header "$f" "$reason" '--[[:space:]]*' || violations=1
+            done <<EOF
+          $added
+          EOF
+            added="$(git diff --name-only --diff-filter=A "${since}...HEAD" -- "$JAVA_MIGRATION_PATH")"
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              base="${f##*/}"
+              case "$base" in
+                V*.java) : ;;
+                *) continue ;;
+              esac
+              if git show "HEAD:$f" | grep -qE '^[[:space:]]*//[[:space:]]*non-destructive[[:space:]]*$'; then
+                continue
+              fi
+              check_contract_header "$f" "Java migration is not parsed" '[[:space:]]*//[[:space:]]*' || violations=1
+            done <<EOF
+          $added
+          EOF
+            return "$violations"
+          }
+          # =========================================================
+          # END SHARED DESTRUCTIVE-MIGRATION GATE LOGIC
+          # =========================================================
+          # >>> SHARED-BLOCK:destructive:END
+
+          if run_destructive_gate "$BASE_SHA"; then
+            echo "No destructive new migrations without a valid contract-of header. Check passed."
+            exit 0
+          fi
+
+          echo ""
+          echo "Destructive migrations (DROP/TRUNCATE of tables, columns, views, types, ...; RENAME incl. index renames;"
+          echo "SET NOT NULL; ALTER COLUMN TYPE; ADD CHECK/UNIQUE) are 'contract' steps: they may only ship after the"
+          echo "release that stopped using the object is live in prod."
+          echo "Add '-- contract-of: V<n>' (the EARLIER expand migration) to the file if intentional, and tick the release checklist."
+          echo "Java migrations (not parsed) need '// contract-of: V<n>' or '// non-destructive'."
           exit 1
 
   self-test-immutability-gate:
@@ -271,8 +872,17 @@ jobs:
           #
           # The pathspec is scoped to the three file kinds that carry
           # a Flyway checksum identity, NOT to whole directories:
-          #   "$MIGRATION_PATH/*.sql"        -- SQL scripts
-          #   "$JAVA_MIGRATION_PATH/V*.java" -- Java migrations (V171+)
+          #   "$MIGRATION_PATH/*.sql"        -- SQL scripts, any depth (a
+          #                                     plain git pathspec '*' also
+          #                                     crosses '/', so db/migration/
+          #                                     sub/V9__x.sql is covered; Flyway
+          #                                     scans subfolders)
+          #   ":(glob)$JAVA_MIGRATION_PATH/**/V*.java"
+          #                                  -- Java migrations (V171+), any
+          #                                     depth. NOT "$JAVA_.../V*.java":
+          #                                     that needs the 'V' directly
+          #                                     after the directory and misses
+          #                                     db/migration/sub/V9__x.java.
           #   "$DATA_PATH/*.csv"             -- data resources a Java
           #                                     migration derives its
           #                                     own checksum from
@@ -296,7 +906,7 @@ jobs:
             local base_sha="$1"
             local changed
             changed=$(git diff --name-status --diff-filter=MDRCT "${base_sha}...HEAD" -- \
-              "$MIGRATION_PATH/*.sql" "$JAVA_MIGRATION_PATH/V*.java" "$DATA_PATH/*.csv")
+              "$MIGRATION_PATH/*.sql" ":(glob)$JAVA_MIGRATION_PATH/**/V*.java" "$DATA_PATH/*.csv")
             if [ -z "$changed" ]; then
               return 0
             fi
@@ -515,6 +1125,50 @@ jobs:
           git add -A && git commit -q -m "add V5 AND refresh the CSV in one commit"
           if run_gate "$BASE_SHA"; then fail "new migration must not mask the CSV mutation (exit 1)"; fi
           echo "OK: co-located CSV mutation still caught behind a legitimate add"
+          git reset -q --hard "$BASE_SHA"
+
+          # --- Scenario 15: migrations in SUBFOLDERS are gated too ---
+          # Flyway scans db/migration recursively, so a nested file carries the
+          # same checksum identity. Build a new base that already holds nested
+          # files, then mutate each kind. The Java pathspec used to be
+          # "$JAVA_MIGRATION_PATH/V*.java", which does not match
+          # "$JAVA_MIGRATION_PATH/sub/V7__nested.java".
+          mkdir -p "$MIGRATION_PATH/sub" "$JAVA_MIGRATION_PATH/sub/deep"
+          printf 'CREATE TABLE nested (id int);\n' > "$MIGRATION_PATH/sub/V6__nested.sql"
+          printf 'class V7__nested {}\n' > "$JAVA_MIGRATION_PATH/sub/V7__nested.java"
+          printf 'class V8__deeper {}\n' > "$JAVA_MIGRATION_PATH/sub/deep/V8__deeper.java"
+          printf 'class NestedHelper {}\n' > "$JAVA_MIGRATION_PATH/sub/NestedHelper.java"
+          git add -A && git commit -q -m "base: nested migrations"
+          BASE_SHA="$(git rev-parse HEAD)"
+
+          printf 'CREATE TABLE nested (id int, x int);\n' > "$MIGRATION_PATH/sub/V6__nested.sql"
+          git add -A && git commit -q -m "edit a nested SQL migration"
+          if run_gate "$BASE_SHA"; then fail "modified nested SQL migration should fail (exit 1)"; fi
+          echo "OK: modified nested SQL migration fails"
+          git reset -q --hard "$BASE_SHA"
+
+          printf 'class V7__nested { int x; }\n' > "$JAVA_MIGRATION_PATH/sub/V7__nested.java"
+          git add -A && git commit -q -m "edit a nested Java migration"
+          if run_gate "$BASE_SHA"; then fail "modified nested Java migration should fail (exit 1)"; fi
+          echo "OK: modified nested Java migration fails"
+          git reset -q --hard "$BASE_SHA"
+
+          printf 'class V8__deeper { int x; }\n' > "$JAVA_MIGRATION_PATH/sub/deep/V8__deeper.java"
+          git add -A && git commit -q -m "edit a two-level nested Java migration"
+          if run_gate "$BASE_SHA"; then fail "modified two-level nested Java migration should fail (exit 1)"; fi
+          echo "OK: modified two-level nested Java migration fails"
+          git reset -q --hard "$BASE_SHA"
+
+          git rm -q "$JAVA_MIGRATION_PATH/sub/V7__nested.java"
+          git commit -q -m "delete a nested Java migration"
+          if run_gate "$BASE_SHA"; then fail "deleted nested Java migration should fail (exit 1)"; fi
+          echo "OK: deleted nested Java migration fails"
+          git reset -q --hard "$BASE_SHA"
+
+          printf 'class NestedHelper { int y; }\n' > "$JAVA_MIGRATION_PATH/sub/NestedHelper.java"
+          git add -A && git commit -q -m "edit a nested non-migration helper"
+          run_gate "$BASE_SHA" || fail "nested non-V helper edit must pass (exit 0)"
+          echo "OK: nested non-V*.java helper edit passes"
           git reset -q --hard "$BASE_SHA"
 
           echo "All self-test scenarios passed."
@@ -1097,14 +1751,39 @@ jobs:
           echo "OK: new-highest + modify-existing passes the version gate (orthogonal to immutability)"
           git reset -q --hard "$BASE_SHA"
 
+          # --- Scenario 14: migrations in SUBFOLDERS are version-gated too ---
+          # Flyway scans db/migration recursively. Both the merged-highest scan
+          # (git ls-tree -r) and the added-files scan use the directory pathspec
+          # and parse the BASENAME, so nesting must not hide a bad version.
+          mkdir -p "$MIGRATION_PATH/sub"
+          printf 'CREATE TABLE n1 (id int);\n' > "$MIGRATION_PATH/sub/V5__nested_low.sql"
+          git add -A && git commit -q -m "add nested out-of-order V5"
+          if run_version_gate "$BASE_SHA" >/dev/null; then fail "nested out-of-order version must FAIL the version gate"; fi
+          echo "OK: nested out-of-order version fails"
+          git reset -q --hard "$BASE_SHA"
+
+          mkdir -p "$MIGRATION_PATH/sub"
+          printf 'CREATE TABLE n2 (id int);\n' > "$MIGRATION_PATH/sub/V10__nested_dup.sql"
+          git add -A && git commit -q -m "add nested duplicate V10"
+          if run_version_gate "$BASE_SHA" >/dev/null; then fail "nested duplicate version must FAIL the version gate"; fi
+          echo "OK: nested duplicate version fails"
+          git reset -q --hard "$BASE_SHA"
+
+          mkdir -p "$MIGRATION_PATH/sub"
+          printf 'CREATE TABLE n3 (id int);\n' > "$MIGRATION_PATH/sub/V12__nested_ok.sql"
+          git add -A && git commit -q -m "add nested new-highest V12"
+          run_version_gate "$BASE_SHA" >/dev/null || fail "nested new-highest version must PASS the version gate"
+          echo "OK: nested new-highest version passes"
+          git reset -q --hard "$BASE_SHA"
+
           echo "All version-monotonicity self-test scenarios passed."
 
   self-test-base-revision-resolution:
     name: Self-test Base Revision Resolution
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    permissions:
-      contents: read
+    # Hermetic: no checkout, only throwaway git repos in $TMPDIR, so the token needs no scope at all.
+    permissions: {}
 
     steps:
       - name: Assert the resolver picks the right base per event and fails loud when none resolves
@@ -1204,12 +1883,12 @@ jobs:
           # end-to-end on a real V49 mutation -- the headline
           # regression that crash-looped Railway. Kept behaviourally
           # in sync with the shared block, including the three-arm
-          # pathspec scoping ('*.sql' + 'V*.java' + '*.csv').
+          # pathspec scoping ('*.sql' + '**/V*.java' + '*.csv').
           run_gate() {
             local base_sha="$1"
             local changed
             changed=$(git diff --name-status --diff-filter=MDRCT "${base_sha}...HEAD" -- \
-              "$MIGRATION_PATH/*.sql" "$JAVA_MIGRATION_PATH/V*.java" "$DATA_PATH/*.csv")
+              "$MIGRATION_PATH/*.sql" ":(glob)$JAVA_MIGRATION_PATH/**/V*.java" "$DATA_PATH/*.csv")
             if [ -z "$changed" ]; then
               return 0
             fi
@@ -1310,6 +1989,981 @@ jobs:
 
           echo "All base-revision-resolution self-test scenarios passed."
 
+      # Phase 370 D6 mirror (merged into this job to save a runner; parity of the SHARED block is still
+      # enforced by verify-gate-mirror-parity). Hermetic: builds a throwaway git repo, no checkout.
+      - name: Assert destructive gate fails without / with bad header and passes with valid header / non-destructive
+        run: |
+          set -euo pipefail
+
+          MIGRATION_PATH="src/main/resources/db/migration"
+          JAVA_MIGRATION_PATH="src/main/java/db/migration"
+
+          # >>> SHARED-BLOCK:destructive:BEGIN
+          # =========================================================
+          # SHARED DESTRUCTIVE-MIGRATION GATE LOGIC (phase 370 D6) -- keep
+          # this block BYTE-IDENTICAL with the mirror in
+          # `self-test-base-revision-resolution`. The hermetic
+          # `verify-gate-mirror-parity` job diffs the two extracted copies
+          # and fails CI if they drift.
+          # =========================================================
+          #
+          # Expand/contract: Railway rollback redeploys the PREVIOUS image
+          # against the ALREADY-MIGRATED schema, so a migration that breaks
+          # the previous app version (a "contract" step) may only ship after
+          # the release that stopped using the object is live. CI cannot
+          # know what is in prod; the release checklist covers that. CI
+          # enforces that the author states it.
+          #
+          # Scope: migration files ADDED relative to the merge-base only
+          # (--diff-filter=A, same three-dot form as the other gates), so the
+          # existing V1..V198 are exempt. Files are listed under the WHOLE
+          # migration directory and filtered on the BASENAME, never with a
+          # directory-anchored glob: Flyway scans SUBFOLDERS, and the pathspec
+          # `db/migration/V*.sql` does not match `db/migration/sub/V200__x.sql`,
+          # so a destructive migration could hide one directory down.
+          #   * SQL: any added V*.sql at any depth under src/main/resources/db/migration.
+          #   * Repeatable R__*.sql files are REJECTED outright (the repo has none):
+          #     Flyway re-applies them whenever their checksum changes, so they are not
+          #     one-shot contract steps, a header could not express "the earlier expand
+          #     migration", and they would otherwise be a silent hole in this gate.
+          #   * Java: an added V*.java at any depth under src/main/java/db/migration is not
+          #     parsed; it must carry `// contract-of: V<n>` (destructive) or
+          #     `// non-destructive` (author's statement), otherwise the gate fails.
+          #
+          # SQL is read by ONE left-to-right tokenizer (no regex stripping, which
+          # was evadable: `VALUES ('--'); DROP TABLE x;` hid the DROP behind a
+          # fake comment). It understands: '...' with '' escapes,
+          # E'...' with backslash escapes, U&'...' (Unicode-escape strings), "quoted
+          # identifiers" with "" escapes (U&"..." identifiers tokenize the same way, the
+          # U& stays in the code text), $tag$...$tag$ dollar quoting, -- comments and
+          # NESTED /* */ comments. The dollar-tag scan is a linear \G match (a
+          # substr($s,$i) copy per `$` made a 5 MB run of `$` quadratic).
+          # FAIL CLOSED: an unbalanced quote, dollar tag or comment makes the whole
+          # file destructive (reason UNPARSEABLE).
+          #
+          # Each statement (split on top-level ;) is DESTRUCTIVE when its code
+          # (comments dropped, literals blanked) contains:
+          #   DROP <anything>, EXCEPT an allow-list. EVERY DROP <kind> is destructive
+          #       (TABLE, SEQUENCE, TYPE, DOMAIN, VIEW, FUNCTION, TRIGGER, SCHEMA, EXTENSION,
+          #       OWNED BY, FOREIGN TABLE, POLICY, RULE, AGGREGATE, COLUMN, a bare/quoted
+          #       column name, ... and kinds nobody has thought of yet) unless <kind> is:
+          #         inside an ALTER statement: INDEX | CONSTRAINT | DEFAULT | NOT NULL |
+          #                                    EXPRESSION | IDENTITY
+          #         at top level:              INDEX
+          #       INDEX / EXPRESSION / IDENTITY are non-reserved words, so a column can be
+          #       named that. `ALTER TABLE t DROP identity;` (directly followed by `,`,
+          #       `;`, CASCADE or RESTRICT, and NOT preceded by `ALTER [COLUMN] <col>`) is
+          #       a column drop and is flagged; `ALTER COLUMN c DROP IDENTITY` is allowed.
+          #   TRUNCATE
+          #   RENAME (table, column, constraint, index, ...). Index renames are
+          #       deliberately kept destructive (fail closed): add a contract-of
+          #       header if the rename is intentional.
+          #   SET NOT NULL
+          #   ALTER [COLUMN] <col> [SET DATA] TYPE
+          #   ADD [CONSTRAINT <name>] CHECK | UNIQUE | PRIMARY KEY | FOREIGN KEY |
+          #       EXCLUDE, and ADD ... REFERENCES (existing rows / the previous
+          #       app version's writes can violate it)
+          #   CREATE UNIQUE INDEX (same reason)
+          #   SET SCHEMA (the previous app version still addresses the old schema)
+          #   DROP INDEX / DROP CONSTRAINT of a UNIQUE or PRIMARY KEY or EXCLUDE object, or of a
+          #       DYNAMICALLY named one: a rollback runs the previous app against a schema
+          #       without it, and its ON CONFLICT (cols) then fails (e.g. DeviceTokenRepository's
+          #       ON CONFLICT (token) needs ux_device_tokens_token). The object name is read
+          #       after IF EXISTS / CONCURRENTLY, schema prefix ignored, and all comma-listed
+          #       DROP INDEX names are checked. Destructive when the name matches
+          #       ux_ uq_ uk_ pk_ unq_ uniq_ prefixes, _key _pkey _pk _ux _uq _uk _unique _unq
+          #       suffixes, contains unique / excl / overlap, or is one of the 4 historical
+          #       UNIQUE indexes named idx_* (idx_salons_owner_primary,
+          #       idx_masters_user_owner_type, idx_masters_booking_slug,
+          #       idx_bookings_cancel_token); or is dynamic: %I, a quoted identifier, a variable,
+          #       a concatenated name (the literal ends at DROP CONSTRAINT), anything that is not
+          #       a plain word. Only names that positively look non-unique (idx_ ix_ chk_ ck_ fk_
+          #       prefixes, _fkey _fk _idx _ix _chk _check _ck suffixes) pass, so `DROP INDEX
+          #       idx_foo` is allowed and an unknown name fails closed.
+          #       Whitespace runs are collapsed once before the 400-char look-ahead (linear, so
+          #       padding cannot hide a later name). FAIL CLOSED: a comma with no name after it, a
+          #       name touching the window end, or a name followed by anything but whitespace, a
+          #       comma or the end (`idx_x$_key` is NOT read as `idx_x`).
+          #   ADD [CONSTRAINT <name>] NOT NULL <col> (PG18 table-constraint spelling of SET NOT NULL)
+          #   (DEFAULT NULL / DEFAULT (NULL) / DEFAULT NULL::t is NOT a default for the next rule)
+          #   ADD [COLUMN] <col> ... NOT NULL without DEFAULT or GENERATED (existing rows / the
+          #       previous app version's INSERTs violate it; IS NOT NULL inside a CHECK is ignored)
+          #   DETACH PARTITION, NO INHERIT, ENABLE | FORCE ROW LEVEL SECURITY (each changes which rows
+          #       the previous app version's queries see or write)
+          # Deliberately NOT destructive: REVOKE (role grants only; the app connects as the owner role
+          # that runs Flyway), DROP DEFAULT (the standard last step of add-with-default expand
+          # migrations, flagging it would block routine safe work), plain CREATE INDEX / ADD COLUMN.
+          #
+          # LITERALS IN EVERY FILE: a string or dollar body is also scanned in files with no
+          # EXECUTE (a previous migration may have created run_sql(text); dblink_exec runs its
+          # text argument), but ONLY by DDL shape: a ;-separated part of the literal must BE a
+          # full DROP <kind> <names> / TRUNCATE <names> / ALTER <kind> <name> <action> /
+          # CREATE UNIQUE INDEX <name> ON statement, which is then judged by the rules above.
+          # Prose that merely contains the word drop / truncate / rename ("drop off",
+          # "drop table and rename") has no DDL shape and passes. In INSERT / UPDATE / COMMENT ON /
+          # COPY statements only a literal that is ONE whole DDL statement counts (a literal with
+          # several ;-parts such as 'it''s; DROP TABLE x' is data there). Inside a dynamic
+          # context (below) the full rules apply to the literal text instead of the shape rule.
+          # Escape-encoded literals (E'..\..', U&'..') outside INSERT / UPDATE / DELETE / COMMENT /
+          # CREATE / ALTER / COPY / VALUES statements (i.e. as an argument of SELECT / CALL /
+          # PERFORM / DO ...) fail closed in any file. A blanket ban was rejected as too broad
+          # (E'a\nb' seed data is legitimate) and a "calls a non-builtin function" test cannot be
+          # decided statically; no existing migration contains E'..\..' or U&'..' at all.
+          # 
+          # Dynamic SQL: a statement that is a DO block, contains EXECUTE, or is a
+          # CREATE FUNCTION/PROCEDURE has all of its string and dollar-quoted bodies
+          # analysed recursively with the FULL rules (depth-limited; fails closed when
+          # too deep). String pieces of one statement are also analysed concatenated, so
+          # EXECUTE 'DR' || 'OP TABLE x' is caught.
+          # WHOLE-FILE MODE: if EXECUTE appears ANYWHERE in the file, at any nesting
+          # depth (a function that runs EXECUTE q is invoked by a plain
+          # `SELECT run_sql('DROP TABLE users')` or `CALL p('DROP TABLE x')` elsewhere,
+          # and `s := 'DR'; s := s || 'OP TABLE x'; EXECUTE s` splits across
+          # statements), EVERY literal in the file is analysed, at every depth, and so
+          # is the join of all innermost literals in file order.
+          # ESCAPES: in a file with EXECUTE, any E'...' literal that contains a
+          # backslash, or any U&'...' literal, fails closed with "escape-encoded literal
+          # in dynamic-SQL file; add contract-of if intentional". Chosen over decoding
+          # \xHH / \NNN / \uXXXX / U& escapes because a decoder is one more surface to
+          # get wrong (UESCAPE, octal, surrogate pairs, standard_conforming_strings) and
+          # a legitimate migration has no reason to hide SQL behind escapes; the author
+          # can state intent with a contract-of header.
+          # A file that only mentions EXECUTE (GRANT/REVOKE EXECUTE ON FUNCTION) is analysed in the
+          # same wide mode: more literals checked, never fewer.
+          # OBFUSCATION PRIMITIVES (fail closed): code (not data) anywhere in the file, at any depth,
+          # that calls decode( / convert_from( / dblink*, or format( together with EXECUTE or
+          # PERFORM, is destructive ("obfuscation-capable dynamic SQL"). The only way through is a
+          # `-- contract-of: V<n>` header. Chosen over a new `-- dynamic-sql-reviewed` marker
+          # because it adds no parser path and no unvalidated escape hatch: the header is already
+          # checked against a real earlier migration. Historical cost: 4 of the 195 existing
+          # migrations use format() with EXECUTE/PERFORM; new ones need the header too.
+          # HARDENING: EXECUTE of anything but a literal chain (EXECUTE t, EXECUTE format(..)) in any
+          # dynamic body is destructive; EXECUTE FUNCTION/PROCEDURE and GRANT EXECUTE ON are exempt.
+          # REMAINING RESIDUAL (not detectable statically, covered by the release checklist and
+          # review): SQL assembled with primitives other than the four above, e.g. chr(68) ||
+          # 'ROP', string_agg / array_to_string / concat over generated pieces, translate() /
+          # regexp_replace() on a literal, a function body stored by an EARLIER migration that
+          # builds the DDL itself, text read from a table at run time, and a UNIQUE index that is
+          # named like a plain index (idx_foo) and not in the 4-name list above.
+          #
+          # A destructive file must carry one header line anywhere in it:
+          #   -- contract-of: V<n>        (Java: // contract-of: V<n>)
+          # where V<n> is the EXPAND migration that already stopped the
+          # previous app using the object. <n> must be plain digits, strictly
+          # lower than this file's own version, and a V<n>__*.sql|java file must
+          # exist in the HEAD tree (any depth); otherwise the gate fails.
+          #
+          # Prints the destructive reason (first match) or nothing; reads SQL
+          # on stdin. Single-quote is written \x27 inside the perl body so it can live in a
+          # shell single-quoted string.
+          destructive_reason() {
+            perl -0777 -ne '
+              our $ESC = 0;
+              our $WIDE = 0;
+              our $NONLIT = 0;
+
+              sub tokenize {
+                my ($s) = @_;
+                my $n = length $s;
+                my $i = 0;
+                my @stmts;
+                my $code = "";
+                my @bodies;
+                my $stesc = 0;
+                while ($i < $n) {
+                  my $c = substr($s, $i, 1);
+                  my $two = substr($s, $i, 2);
+                  if ($two eq "--") {
+                    my $e = index($s, "\n", $i);
+                    $i = $e < 0 ? $n : $e;
+                    $code .= " ";
+                    next;
+                  }
+                  if ($two eq "/*") {
+                    my $d = 1;
+                    $i += 2;
+                    while ($d > 0) {
+                      return undef if $i >= $n;
+                      my $t = substr($s, $i, 2);
+                      if ($t eq "/*") { $d++; $i += 2 }
+                      elsif ($t eq "*/") { $d--; $i += 2 }
+                      else { $i++ }
+                    }
+                    $code .= " ";
+                    next;
+                  }
+                  if ($c eq "\x27") {
+                    my $esc = ($i > 0 && substr($s, $i - 1, 1) =~ /[eE]/ && ($i < 2 || substr($s, $i - 2, 1) !~ /[\w\$]/));
+                    my $uamp = ($i > 1 && substr($s, $i - 1, 1) eq "&" && substr($s, $i - 2, 1) =~ /[uU]/ && ($i < 3 || substr($s, $i - 3, 1) !~ /[\w\$]/));
+                    $ESC = 1 if $uamp;
+                    $stesc = 1 if $uamp;
+                    my $j = $i + 1;
+                    my $b = "";
+                    while (1) {
+                      return undef if $j >= $n;
+                      my $ch = substr($s, $j, 1);
+                      if ($esc && $ch eq "\\") {
+                        return undef if $j + 1 >= $n;
+                        $b .= substr($s, $j, 2);
+                        $j += 2;
+                        next;
+                      }
+                      if ($ch eq "\x27") {
+                        if (substr($s, $j + 1, 1) eq "\x27") { $b .= "\x27"; $j += 2; next }
+                        last;
+                      }
+                      $b .= $ch;
+                      $j++;
+                    }
+                    $ESC = 1 if $esc && index($b, "\\") >= 0;
+                    $stesc = 1 if $esc && index($b, "\\") >= 0;
+                    push @bodies, $b;
+                    $code .= "\x27\x27";
+                    $i = $j + 1;
+                    next;
+                  }
+                  if ($c eq "\"") {
+                    my $j = $i + 1;
+                    while (1) {
+                      return undef if $j >= $n;
+                      if (substr($s, $j, 1) eq "\"") {
+                        if (substr($s, $j + 1, 1) eq "\"") { $j += 2; next }
+                        last;
+                      }
+                      $j++;
+                    }
+                    $code .= "\"q\"";
+                    $i = $j + 1;
+                    next;
+                  }
+                  if ($c eq "\$" && ($i == 0 || substr($s, $i - 1, 1) !~ /[\w\$]/)) {
+                    pos($s) = $i;
+                    if ($s =~ /\G(\$(?:[A-Za-z_\x80-\xff][\w\x80-\xff]*)?\$)/gc) {
+                      my $tag = $1;
+                      my $from = $i + length $tag;
+                      my $e = index($s, $tag, $from);
+                      return undef if $e < 0;
+                      push @bodies, substr($s, $from, $e - $from);
+                      $code .= " \x27\x27 ";
+                      $i = $e + length $tag;
+                      next;
+                    }
+                  }
+                  if ($c eq ";") {
+                    push @stmts, [$code, [@bodies], $stesc];
+                    $code = "";
+                    @bodies = ();
+                    $stesc = 0;
+                    $i++;
+                    next;
+                  }
+                  $code .= $c;
+                  $i++;
+                }
+                push @stmts, [$code, [@bodies], $stesc] if $code =~ /\S/ || @bodies;
+                return \@stmts;
+              }
+
+              sub code_reason {
+                my ($c) = @_;
+                # Collapse every whitespace run ONCE (linear) so padding cannot push a later
+                # name out of the fixed 400-char look-ahead window in drop_name_reason.
+                $c =~ s/\s+/ /g;
+                my $alter = ($c =~ /ALTER/i) ? 1 : 0;
+                while ($c =~ /\bDROP\b\s*(NOT\s+NULL\b|\w+|"q"|\S?)/gi) {
+                  my $start = $-[0];
+                  my $end = $+[0];
+                  my $k = uc $1;
+                  $k =~ s/\s+/ /g;
+                  my $ok = $alter ? ($k =~ /\A(?:INDEX|CONSTRAINT|DEFAULT|NOT NULL|EXPRESSION|IDENTITY)\z/ ? 1 : 0) : ($k eq "INDEX" ? 1 : 0);
+                  if ($ok && $alter && $k =~ /\A(?:INDEX|EXPRESSION|IDENTITY)\z/) {
+                    my $after = substr($c, $end, 40);
+                    if ($after =~ /\A\s*(?:,|\z|(?:CASCADE|RESTRICT)\b)/i) {
+                      my $before = substr($c, $start > 200 ? $start - 200 : 0, $start > 200 ? 200 : $start);
+                      $ok = 0 unless $before =~ /\bALTER\s+(?:COLUMN\s+)?(?:"q"|\w+)\s*\z/i;
+                    }
+                  }
+                  if ($ok && ($k eq "INDEX" || $k eq "CONSTRAINT")) {
+                    my $nr = drop_name_reason(substr($c, $end, 400), $k, length($c) - $end > 400);
+                    return $nr if $nr;
+                  }
+                  next if $ok;
+                  return "DROP COLUMN" if $k eq "COLUMN" || $k eq "IF" || $k =~ /\A[^A-Z]/;
+                  return "DROP COLUMN" if $alter && $k !~ /\A(?:TABLE|SEQUENCE|TYPE|DOMAIN|VIEW|MATERIALIZED|FUNCTION|PROCEDURE|TRIGGER|SCHEMA|EXTENSION|OWNED|FOREIGN|POLICY|RULE|AGGREGATE|ATTRIBUTE|PUBLICATION|SUBSCRIPTION|COLLATION|CAST|OPERATOR|ROLE|USER|GROUP|EVENT|TABLESPACE|DATABASE|LANGUAGE|STATISTICS|ACCESS|TRANSFORM|CONVERSION|ROUTINE|SERVER|TEXT|LARGE)\z/;
+                  return "DROP $k";
+                }
+                return "TRUNCATE" if $c =~ /\bTRUNCATE\b/i;
+                return "RENAME" if $c =~ /\bRENAME\b/i;
+                return "SET NOT NULL" if $c =~ /\bSET\s+NOT\s+NULL\b/i;
+                return "ADD NOT NULL (table-constraint form)" if $c =~ /\bADD\s+(?:CONSTRAINT\s+\S+\s+)?NOT\s+NULL\b/i;
+                return "ADD COLUMN NOT NULL without DEFAULT/GENERATED" if add_column_not_null($c);
+                return "DETACH PARTITION" if $c =~ /\bDETACH\s+PARTITION\b/i;
+                return "NO INHERIT" if $c =~ /\bNO\s+INHERIT\b/i;
+                return "ENABLE/FORCE ROW LEVEL SECURITY" if $c =~ /\b(?:ENABLE|FORCE)\s+ROW\s+LEVEL\s+SECURITY\b/i;
+                return "ALTER COLUMN TYPE" if $c =~ /\bALTER\s+(?:COLUMN\s+)?(?:"[^"]+"|\w+)\s+(?:SET\s+DATA\s+)?TYPE\b/i;
+                return "ADD CHECK/UNIQUE CONSTRAINT" if $c =~ /\bADD\s+(?:CONSTRAINT\s+\S+\s+)?(?:CHECK|UNIQUE)\b/i;
+                return "CREATE UNIQUE INDEX" if $c =~ /\bCREATE\s+UNIQUE\s+INDEX\b/i;
+                return "ADD " . uc($1) if $c =~ /\bADD\s+(?:CONSTRAINT\s+\S+\s+)?(PRIMARY\s+KEY|FOREIGN\s+KEY|EXCLUDE)\b/i;
+                if ($c =~ /\bADD\b/i) {
+                  pos($c) = $+[0];
+                  return "ADD ... REFERENCES" if $c =~ /\G.*?\bREFERENCES\b/is;
+                }
+                return "SET SCHEMA" if $c =~ /\bSET\s+SCHEMA\b/i;
+                return "";
+              }
+
+              sub unique_or_dynamic_name {
+                my ($n) = @_;
+                return 1 if $n eq "" || $n =~ /\A"q"\z/ || $n !~ /\A\w+\z/;
+                return 1 if $n =~ /\A(?:ux|uq|uk|pk|unq|uniq)_|(?:_key|_pkey|_pk|_ux|_uq|_uk|_unique|_unq)\z|unique|excl|overlap|\Aidx_(?:salons_owner_primary|masters_user_owner_type|masters_booking_slug|bookings_cancel_token)\z/i;
+                return 0 if $n =~ /\A(?:idx|ix|chk|ck|fk)_|(?:_fkey|_fk|_idx|_ix|_chk|_check|_ck)\z/i;
+                return 1;
+              }
+
+              sub drop_name_reason {
+                my ($after, $k, $trunc) = @_;
+                $after =~ s/\A\s*(?:CONCURRENTLY\s+)?(?:IF\s+EXISTS\s+)?//i;
+                return "DROP $k of a dynamic-named object" unless $after =~ /\A\s*\S/;
+                pos($after) = 0;
+                my $comma = 0;
+                while ($after =~ /\G\s*((?:"q"|\w+)(?:\s*\.\s*(?:"q"|\w+))*|\S)/gc) {
+                  $comma = 0;
+                  my $last = $1;
+                  $last =~ s/\A.*\.\s*//s;
+                  return "DROP $k of a unique/primary-key/exclusion/dynamic-named object" if unique_or_dynamic_name($last);
+                  # FAIL CLOSED: a name followed by anything but whitespace, comma or end
+                  # (`idx_x$_key` is read as `idx_x`), or a name touching the look-ahead window end.
+                  my $p = pos($after);
+                  return "DROP $k name not terminated cleanly (unparsed identifier or window end)" if ($p < length($after) && substr($after, $p, 1) !~ /[\s,]/) || ($trunc && $p >= length($after));
+                  last if $k ne "INDEX";
+                  last unless $after =~ /\G\s*,/gc;
+                  $comma = 1;
+                }
+                # FAIL CLOSED: a comma with no name after it (hidden past the window).
+                return "DROP $k list ends after a comma without a name" if $comma;
+                return "";
+              }
+
+              sub add_column_not_null {
+                my ($c) = @_;
+                return 0 unless $c =~ /\bALTER\s+TABLE\b/i;
+                my ($d, $cur, @cl) = (0, "");
+                while ($c =~ /\G([^(),]+|[(),])/gc) {
+                  my $t = $1;
+                  if ($t eq "(") { $d++; $cur .= $t }
+                  elsif ($t eq ")") { $d-- if $d > 0; $cur .= $t }
+                  elsif ($t eq "," && $d == 0) { push @cl, $cur; $cur = "" }
+                  else { $cur .= $t }
+                }
+                push @cl, $cur;
+                for my $cl (@cl) {
+                  next unless $cl =~ /\bADD\s+(?:(COLUMN)\s+)?(?:IF\s+NOT\s+EXISTS\s+)?("q"|\w+)\s+(.*)\z/is;
+                  my ($explicit, $name, $rest) = ($1, $2, $3);
+                  next if !$explicit && uc($name) =~ /\A(?:CONSTRAINT|CHECK|UNIQUE|PRIMARY|FOREIGN|EXCLUDE|NOT)\z/;
+                  $rest =~ s/\bIS\s+NOT\s+NULL\b//ig;
+                  # DEFAULT NULL (also (NULL), NULL::type) is no usable default for NOT NULL.
+                  $rest =~ s/\bDEFAULT\s*(?:\(\s*NULL(?:\s*::\s*\w+)?\s*\)|NULL\b(?:\s*::\s*\w+)?)//ig;
+                  next unless $rest =~ /\bNOT\s+NULL\b/i;
+                  next if $rest =~ /\b(?:DEFAULT|GENERATED)\b/i;
+                  return 1;
+                }
+                return 0;
+              }
+
+              sub ddl_shape_reason {
+                my ($c) = @_;
+                my $id = qr/(?:"q"|[\w.%]+)/;
+                my $nm = qr/$id(?:\s*\([^()]*\))?/;
+                if ($c =~ /\A\s*DROP\s+(?:TABLE|VIEW|MATERIALIZED\s+VIEW|SEQUENCE|TYPE|DOMAIN|FUNCTION|PROCEDURE|SCHEMA|EXTENSION|TRIGGER|POLICY|RULE|AGGREGATE|FOREIGN\s+TABLE|ROLE|USER|DATABASE|OWNED\s+BY|COLUMN|INDEX(?:\s+CONCURRENTLY)?|CONSTRAINT)\b(?:\s+IF\s+EXISTS)?\s+$nm(?:\s*,\s*$nm)*(?:\s+ON\s+$id)?(?:\s+(?:CASCADE|RESTRICT))?\s*\z/i) {
+                  return code_reason($c);
+                }
+                if ($c =~ /\A\s*TRUNCATE\s+(?:TABLE\s+)?(?:ONLY\s+)?$id(?:\s*,\s*$id)*(?:\s+(?:RESTART|CONTINUE)\s+IDENTITY)?(?:\s+(?:CASCADE|RESTRICT))?\s*\z/i) {
+                  return "TRUNCATE";
+                }
+                if ($c =~ /\A\s*ALTER\s+(?:TABLE|INDEX|SEQUENCE|VIEW|MATERIALIZED\s+VIEW|TYPE|DOMAIN|FOREIGN\s+TABLE)\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?$id\s+\S/i) {
+                  return code_reason($c);
+                }
+                if ($c =~ /\A\s*CREATE\s+UNIQUE\s+INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+NOT\s+EXISTS\s+)?$id\s+ON\b/i) {
+                  return "CREATE UNIQUE INDEX";
+                }
+                return "";
+              }
+
+              sub all_code {
+                my ($sql, $depth, $acc) = @_;
+                return if $depth > 6;
+                my $st = tokenize($sql);
+                if (!defined $st) { $$acc .= " $sql "; return }
+                for my $x (@$st) {
+                  $$acc .= " " . $x->[0] . " ";
+                  for my $b (@{$x->[1]}) { all_code($b, $depth + 1, $acc) }
+                }
+              }
+
+              sub has_exec {
+                my ($sql, $depth) = @_;
+                return 1 if $depth > 6;
+                my $st = tokenize($sql);
+                if (!defined $st) {
+                  $ESC = 1 if $sql =~ /\\|U&/i;
+                  return ($sql =~ /\bEXECUTE\b/i) ? 1 : 0;
+                }
+                my $found = 0;
+                for my $x (@$st) {
+                  $found = 1 if $x->[0] =~ /\bEXECUTE\b/i;
+                  for my $b (@{$x->[1]}) {
+                    $found = 1 if has_exec($b, $depth + 1);
+                  }
+                }
+                return $found;
+              }
+
+              sub inner_bodies {
+                my ($b) = @_;
+                my $st = tokenize($b);
+                return () unless defined $st;
+                my @r;
+                for my $x (@$st) { push @r, @{$x->[1]} }
+                return @r;
+              }
+
+              sub leaves {
+                my ($sql, $depth, $out) = @_;
+                return if $depth > 6;
+                my $st = tokenize($sql);
+                return unless defined $st;
+                for my $x (@$st) {
+                  for my $b (@{$x->[1]}) {
+                    my @in = inner_bodies($b);
+                    if (@in) { leaves($b, $depth + 1, $out) } else { push @$out, $b }
+                  }
+                }
+              }
+
+              sub analyze {
+                # mode: 0 = file top level (code), 1 = literal in a non-dynamic context
+                # (only full DDL-shaped statements count), 2 = dynamic-SQL context (full rules).
+                my ($sql, $depth, $mode, $data) = @_;
+                return "NESTING TOO DEEP" if $depth > 6;
+                my $stmts = tokenize($sql);
+                if (!defined $stmts) {
+                  return "UNPARSEABLE (unbalanced quote, dollar tag or comment)" if $depth == 0;
+                  my @parts = split /;/, $sql;
+                  return "" if $mode == 1 && $data && (grep { /\S/ } @parts) > 1;
+                  for my $st (@parts) {
+                    my $r = $mode == 1 ? ddl_shape_reason($st) : code_reason($st);
+                    return $r if $r;
+                  }
+                  return "";
+                }
+                if ($depth == 0) {
+                  $WIDE = has_exec($sql, 0);
+                  return "escape-encoded literal in dynamic-SQL file; add contract-of if intentional" if $WIDE && $ESC;
+                }
+                return "" if $mode == 1 && $data && (grep { $_->[0] =~ /\S/ || @{$_->[1]} } @$stmts) > 1;
+                for my $st (@$stmts) {
+                  my ($code, $bodies, $stesc) = @$st;
+                  my $r = $mode == 1 ? ddl_shape_reason($code) : code_reason($code);
+                  return $r if $r;
+                  # EXECUTE of anything but a literal chain (EXECUTE FUNCTION/PROCEDURE and GRANT EXECUTE ON excepted).
+                  $NONLIT = 1 if $mode != 1 && $code =~ /\bEXECUTE\b/i && $code !~ /\bEXECUTE\s+(?:FUNCTION|PROCEDURE|ON)\b/i && $code !~ /\bEXECUTE\s+\x27\x27(?:\s*\|\|\s*\x27\x27)*\s*(?:USING\b|INTO\b|\z)/i;
+                  return "escape-encoded literal in a non-data statement; add contract-of if intentional" if $stesc && $code !~ /\A\s*(?:INSERT|UPDATE|DELETE|COMMENT|CREATE|ALTER|COPY|VALUES)\b/i;
+                  my $dyn = $WIDE || $code =~ /\A\s*DO\b/i || $code =~ /\bEXECUTE\b/i || $code =~ /\bCREATE\s+(?:OR\s+REPLACE\s+)?(?:FUNCTION|PROCEDURE)\b/i;
+                  my $cdata = $mode == 0 ? (($code =~ /\A\s*(?:INSERT|UPDATE|COMMENT\s+ON|COPY)\b/i) ? 1 : 0) : $data;
+                  my @scan = @$bodies;
+                  push @scan, join("", @$bodies) if @$bodies > 1;
+                  for my $b (@scan) {
+                    $r = analyze($b, $depth + 1, $dyn ? 2 : 1, $cdata);
+                    return $r if $r;
+                  }
+                }
+                if ($depth == 0 && $WIDE) {
+                  my @all;
+                  leaves($sql, 0, \@all);
+                  if (@all > 1) {
+                    my $r = analyze(join("", @all), 1, 2, 0);
+                    return $r if $r;
+                  }
+                }
+                if ($depth == 0) {
+                  my $acc = "";
+                  all_code($sql, 0, \$acc);
+                  if ($acc =~ /\b(?:decode|convert_from)\s*\(/i || $acc =~ /\bdblink/i || ($acc =~ /\bformat\s*\(/i && $acc =~ /\b(?:EXECUTE|PERFORM)\b/i)) {
+                    return "obfuscation-capable dynamic SQL (decode/convert_from/dblink/format with EXECUTE|PERFORM); add contract-of if intentional";
+                  }
+                  return "EXECUTE of a non-literal (variable/parameter/expression) in dynamic SQL; add contract-of if intentional" if $NONLIT;
+                }
+                return "";
+              }
+
+              print analyze($_, 0, 0, 0);
+            '
+          }
+
+          # check_contract_header <file> <reason> <comment-lead-regex>; prints the error, returns 1 on violation.
+          check_contract_header() {
+            local f="$1" reason="$2" lead="$3" header ver own refs
+            header="$(git show "HEAD:$f" | grep -E "^${lead}contract-of:[[:space:]]*V[0-9]+[[:space:]]*\$" | head -n 1 || true)"
+            if [ -z "$header" ]; then
+              echo "ERROR: new migration '$f' is destructive ($reason) but has no contract-of: V<n> header (add one if intentional)."
+              return 1
+            fi
+            ver="$(printf '%s' "$header" | sed -E 's/^.*contract-of:[[:space:]]*V([0-9]+)[[:space:]]*$/\1/')"
+            own="$(basename "$f" | sed -nE 's/^V([0-9]+)([._][0-9]+)*__.*$/\1/p')"
+            if [ -z "$own" ]; then
+              echo "ERROR: cannot parse the version of destructive migration '$f'."
+              return 1
+            fi
+            if [ "$((10#$ver))" -ge "$((10#$own))" ]; then
+              echo "ERROR: '$f' (V$own, $reason): 'contract-of: V$ver' must name an EARLIER migration."
+              return 1
+            fi
+            refs="$(git ls-tree -r --name-only HEAD -- "$MIGRATION_PATH" "$JAVA_MIGRATION_PATH" | sed 's|.*/||' | grep -E "^V0*${ver}__.*\.(sql|java)$" || true)"
+            if [ -z "$refs" ]; then
+              echo "ERROR: '$f' (V$own, $reason): 'contract-of: V$ver' names no existing migration V${ver}__*."
+              return 1
+            fi
+            return 0
+          }
+
+          run_destructive_gate() {
+            local since="$1"
+            local added f base reason violations=0
+            added="$(git diff --name-only --diff-filter=A "${since}...HEAD" -- "$MIGRATION_PATH")"
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              base="${f##*/}"
+              case "$base" in
+                R__*.sql)
+                  echo "ERROR: new repeatable migration '$f' is not allowed (the repo has none): a repeatable file is re-applied on every checksum change, so it cannot be an expand/contract step. Use a versioned V<n>__*.sql migration."
+                  violations=1
+                  continue ;;
+                V*.sql) : ;;
+                *) continue ;;
+              esac
+              reason="$(git show "HEAD:$f" | destructive_reason)"
+              [ -z "$reason" ] && continue
+              check_contract_header "$f" "$reason" '--[[:space:]]*' || violations=1
+            done <<EOF
+          $added
+          EOF
+            added="$(git diff --name-only --diff-filter=A "${since}...HEAD" -- "$JAVA_MIGRATION_PATH")"
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              base="${f##*/}"
+              case "$base" in
+                V*.java) : ;;
+                *) continue ;;
+              esac
+              if git show "HEAD:$f" | grep -qE '^[[:space:]]*//[[:space:]]*non-destructive[[:space:]]*$'; then
+                continue
+              fi
+              check_contract_header "$f" "Java migration is not parsed" '[[:space:]]*//[[:space:]]*' || violations=1
+            done <<EOF
+          $added
+          EOF
+            return "$violations"
+          }
+          # =========================================================
+          # END SHARED DESTRUCTIVE-MIGRATION GATE LOGIC
+          # =========================================================
+          # >>> SHARED-BLOCK:destructive:END
+
+          WORK="$(mktemp -d)"
+          cd "$WORK"
+          git init -q
+          git config user.email "ci@example.com"
+          git config user.name "CI Self Test"
+
+          mkdir -p "$MIGRATION_PATH"
+          # Pre-existing destructive history is exempt: only ADDED files are scanned.
+          printf 'CREATE TABLE old_t (id int, legacy int);\n' > "$MIGRATION_PATH/V1__existing.sql"
+          printf 'ALTER TABLE old_t DROP COLUMN legacy;\n' > "$MIGRATION_PATH/V2__old_destructive_no_header.sql"
+          printf 'ALTER TABLE old_t ADD COLUMN new_col int;\n' > "$MIGRATION_PATH/V3__expand.sql"
+          git add -A
+          git commit -q -m "base: existing migrations"
+          BASE_SHA="$(git rev-parse HEAD)"
+          git switch -q -c feature
+
+          # Q is a literal single quote, so fixtures with quotes can live in double-quoted shell strings.
+          Q="'"
+          fail() { echo "SELF-TEST FAILED: $1"; exit 1; }
+          reset() { git reset -q --hard "$BASE_SHA"; }
+          add() { mkdir -p "$(dirname "$MIGRATION_PATH/$1")"; printf '%b\n' "$2" > "$MIGRATION_PATH/$1"; git add -A; git commit -q -m "add $1"; }
+          add_java() { mkdir -p "$(dirname "$JAVA_MIGRATION_PATH/$1")"; printf '%b\n' "$2" > "$JAVA_MIGRATION_PATH/$1"; git add -A; git commit -q -m "add $1"; }
+          expect_fail() { if run_destructive_gate "$BASE_SHA" >/dev/null; then fail "$1"; fi; echo "OK: $1 -> rejected"; reset; }
+          expect_pass() { run_destructive_gate "$BASE_SHA" >/dev/null || fail "$1"; echo "OK: $1 -> accepted"; reset; }
+
+          # --- Scenario 1: no new migrations (old destructive V2 is exempt) -> pass ---
+          git commit -q --allow-empty -m "no migration changes"
+          expect_pass "existing destructive migration is not flagged"
+
+          # --- Scenario 2: destructive, no header -> fail ---
+          add V4__drop_legacy.sql 'ALTER TABLE old_t DROP COLUMN legacy;'
+          expect_fail "DROP COLUMN without header"
+
+          # --- Scenario 3: destructive with valid header -> pass ---
+          add V4__drop_legacy.sql '-- contract-of: V3\nALTER TABLE old_t DROP COLUMN legacy;'
+          expect_pass "DROP COLUMN with valid header"
+
+          # --- Scenario 4: header names a non-existent version -> fail ---
+          add V4__drop_legacy.sql '-- contract-of: V99\nALTER TABLE old_t DROP COLUMN legacy;'
+          expect_fail "header naming a non-existent version"
+
+          # --- Scenario 5: header names itself / a later version -> fail ---
+          add V4__drop_legacy.sql '-- contract-of: V4\nALTER TABLE old_t DROP COLUMN legacy;'
+          expect_fail "header naming its own version"
+
+          # --- Scenario 6: non-destructive -> pass ---
+          add V4__add_col.sql 'ALTER TABLE old_t ADD COLUMN other int;\nCREATE INDEX ix_old_t_other ON old_t (other);\nALTER TABLE old_t ALTER COLUMN other DROP NOT NULL;\nALTER TABLE old_t ALTER COLUMN other DROP DEFAULT;\nALTER TABLE old_t DROP CONSTRAINT IF EXISTS some_fk;\nDROP INDEX IF EXISTS ix_x;\nALTER TABLE old_t ALTER COLUMN other DROP IDENTITY;\nALTER TABLE old_t ALTER COLUMN other DROP IDENTITY IF EXISTS;\nALTER TABLE old_t ALTER COLUMN other DROP EXPRESSION;'
+          expect_pass "non-destructive DDL (ADD/CREATE INDEX/DROP NOT NULL/DROP CONSTRAINT/DROP INDEX/ALTER COLUMN DROP IDENTITY|EXPRESSION)"
+
+          # --- Scenario 7: each destructive form is detected ---
+          i=0
+          for stmt in \
+            'DROP TABLE IF EXISTS old_t;' \
+            'ALTER TABLE old_t DROP legacy;' \
+            'alter table old_t drop column if exists legacy;' \
+            'ALTER TABLE old_t RENAME TO new_t;' \
+            'ALTER TABLE old_t RENAME COLUMN legacy TO l2;' \
+            'ALTER INDEX ix_old RENAME TO ix_new;' \
+            'ALTER TABLE old_t ALTER COLUMN legacy SET NOT NULL;' \
+            'ALTER TABLE old_t ALTER COLUMN legacy TYPE bigint;' \
+            'ALTER TABLE old_t ALTER COLUMN legacy SET DATA TYPE bigint;' \
+            'DROP VIEW v_old;' \
+            'DROP MATERIALIZED VIEW mv_old;' \
+            'DROP SEQUENCE seq_old;' \
+            'DROP TYPE type_old;' \
+            'DROP DOMAIN dom_old;' \
+            'DROP FUNCTION fn_old();' \
+            'DROP PROCEDURE proc_old();' \
+            'DROP TRIGGER trg_old ON old_t;' \
+            'DROP SCHEMA sch_old;' \
+            'DROP EXTENSION ext_old;' \
+            'TRUNCATE old_t;' \
+            'truncate table old_t;' \
+            'ALTER TABLE old_t ADD CONSTRAINT ck_x CHECK (legacy > 0);' \
+            'ALTER TABLE old_t ADD CHECK (legacy > 0);' \
+            'ALTER TABLE old_t ADD CONSTRAINT uq_x UNIQUE (legacy);' \
+            'ALTER TABLE old_t ADD UNIQUE (legacy);' \
+            'ALTER TABLE old_t DROP "legacy";' \
+            'ALTER TABLE old_t DROP COLUMN "legacy";' \
+            'DROP OWNED BY some_role;' \
+            'DROP FOREIGN TABLE ft_old;' \
+            'DROP POLICY p_old ON old_t;' \
+            'DROP RULE r_old ON old_t;' \
+            'DROP AGGREGATE agg_old(int);' \
+            'DROP FUTURE_KIND thing_old;' \
+            'CREATE UNIQUE INDEX ux_old ON old_t (legacy);' \
+            'CREATE UNIQUE INDEX CONCURRENTLY ux_old2 ON old_t (legacy);' \
+            'ALTER TABLE old_t ADD PRIMARY KEY (id);' \
+            'ALTER TABLE old_t ADD CONSTRAINT pk_x PRIMARY KEY (id);' \
+            'ALTER TABLE old_t ADD FOREIGN KEY (legacy) REFERENCES other_t (id);' \
+            'ALTER TABLE old_t ADD COLUMN ref_id int REFERENCES other_t (id);' \
+            'ALTER TABLE old_t ADD EXCLUDE USING gist (legacy WITH =);' \
+            'ALTER TABLE old_t SET SCHEMA other_schema;' \
+            'ALTER TABLE old_t DROP identity;' \
+            'ALTER TABLE old_t DROP identity, ADD COLUMN z int;' \
+            'ALTER TABLE old_t DROP expression;' \
+            'ALTER TABLE old_t DROP index;' \
+            'ALTER TABLE old_t DROP IF EXISTS legacy;'; do
+            i=$((i + 1))
+            add "V4__form_$i.sql" "$stmt"
+            expect_fail "destructive form: $stmt"
+          done
+
+          # --- Scenario 8: destructive words in comments / strings are ignored ---
+          add V4__comments.sql "-- we will DROP TABLE later and RENAME stuff\n/* ALTER COLUMN x SET NOT NULL */\n/* nested /* DROP TABLE x */ still a comment: TRUNCATE y */\nINSERT INTO old_t (legacy) VALUES (1); -- DROP COLUMN\nCOMMENT ON TABLE old_t IS ${Q}drop table and rename${Q};\nINSERT INTO old_t (legacy) VALUES (${Q}it${Q}${Q}s; DROP TABLE x${Q});"
+          expect_pass "destructive keywords inside comments, nested comments and string literals"
+
+          # --- Scenario 9: evasions of the old comment/string stripping must be detected ---
+          add V4__ev1.sql "INSERT INTO old_t (legacy) VALUES (${Q}--${Q}); DROP TABLE x;"
+          expect_fail "evasion: VALUES ('--'); DROP TABLE x;"
+          add V4__ev2.sql "SELECT ${Q}/*${Q}; DROP TABLE x; SELECT ${Q}*/${Q};"
+          expect_fail "evasion: SELECT '/*'; DROP TABLE x; SELECT '*/';"
+          add V4__ev3.sql "SELECT E${Q}\\${Q}${Q}; DROP TABLE x;"
+          expect_fail "evasion: SELECT E'\\''; DROP TABLE x;"
+          # The old stripper read E'\'' as E'\' + a string that swallowed the DROP up to the next quote.
+          add V4__ev3b.sql "SELECT E${Q}\\${Q}${Q}; DROP TABLE x; SELECT ${Q}${Q};"
+          expect_fail "evasion: SELECT E'\\''; DROP TABLE x; SELECT '';"
+          # Standard (non-E) string: backslash is literal, so '\' ends the string and the DROP is real code
+          # (guards against applying E-string escapes to every string).
+          add V4__ev4.sql "SELECT ${Q}\\${Q}; DROP TABLE x; SELECT ${Q}${Q};"
+          expect_fail "evasion: standard string with a trailing backslash"
+          add V4__ev5.sql "DO \$\$ BEGIN EXECUTE ${Q}DROP TABLE x${Q}; END \$\$;"
+          expect_fail "DO block with EXECUTE 'DROP TABLE x'"
+          add V4__ev6.sql "DO \$tag\$ BEGIN DROP TABLE x; END \$tag\$;"
+          expect_fail "DO block with direct DDL in a tagged dollar body"
+          add V4__ev7.sql "EXECUTE format(${Q}ALTER TABLE %I DROP COLUMN legacy${Q}, ${Q}old_t${Q});"
+          expect_fail "EXECUTE format('ALTER TABLE %I DROP COLUMN ...')"
+          add V4__ev8.sql "DO \$\$ BEGIN EXECUTE ${Q}DR${Q} || ${Q}OP TABLE x${Q}; END \$\$;"
+          expect_fail "EXECUTE with a DROP split across concatenated literals"
+          add V4__ev9.sql "CREATE FUNCTION f() RETURNS void AS \$\$ BEGIN DROP TABLE x; END \$\$ LANGUAGE plpgsql;\nSELECT f();"
+          expect_fail "DDL hidden in a CREATE FUNCTION body"
+
+          # Whole-file mode: EXECUTE anywhere => every literal in the file is analysed, plus their join.
+          add V4__dyn1.sql "EXECUTE E${Q}\\\\x44ROP TABLE users${Q};"
+          expect_fail "EXECUTE E'\\x44ROP TABLE users' (escape-encoded literal)"
+          add V4__dyn2.sql "EXECUTE U&${Q}\\\\0044ROP TABLE users${Q};"
+          expect_fail "EXECUTE U&'\\0044ROP TABLE users' (escape-encoded literal)"
+          add V4__dyn3.sql "CREATE FUNCTION run_sql(q text) RETURNS void AS \$\$ BEGIN EXECUTE q; END \$\$ LANGUAGE plpgsql;\nSELECT run_sql(${Q}DROP TABLE users${Q});"
+          expect_fail "function with EXECUTE q + SELECT run_sql('DROP TABLE users')"
+          add V4__dyn4.sql "EXECUTE ${Q}SELECT 1${Q};\nCALL p(${Q}DROP TABLE x${Q});"
+          expect_fail "CALL p('DROP TABLE x') in a file with EXECUTE"
+          add V4__dyn5.sql "DO \$\$ DECLARE s text := ${Q}DR${Q}; BEGIN s := s || ${Q}OP TABLE x${Q}; EXECUTE s; END \$\$;"
+          expect_fail "DECLARE s := 'DR'; s := s || 'OP TABLE x'; EXECUTE s;"
+          add V4__dyn6.sql "SELECT 1;\nEXECUTE ${Q}SELECT 1${Q};\nSELECT E${Q}a\\\\nb${Q};"
+          expect_fail "benign E'..\\n' literal in a file with EXECUTE fails closed"
+          add V4__dyn7.sql "ALTER TABLE old_t DROP U&\"leg\\\\0061cy\";"
+          expect_fail "DROP of a U&\"..\" identifier"
+
+          # --- Scenario 10: unbalanced quote / dollar tag / comment fails closed ---
+          add V4__open1.sql "INSERT INTO old_t (legacy) VALUES (${Q}oops);"
+          expect_fail "unbalanced single quote fails closed"
+          add V4__open2.sql "SELECT \$tag\$ never closed;"
+          expect_fail "unbalanced dollar tag fails closed"
+          add V4__open3.sql 'SELECT 1; /* open /* nested */ still open'
+          expect_fail "unbalanced nested comment fails closed"
+          add V4__open4.sql 'SELECT "oops;'
+          expect_fail "unbalanced quoted identifier fails closed"
+
+          # --- Scenario 11: benign DO block with no DDL passes ---
+          add V4__benign_do.sql "DO \$\$ BEGIN RAISE NOTICE ${Q}migrating, nothing to drop table${Q}; END \$\$;"
+          expect_pass "benign DO block (RAISE NOTICE only)"
+          add V4__benign_exec.sql "EXECUTE ${Q}SELECT 1${Q};"
+          expect_pass "benign EXECUTE 'SELECT 1'"
+          add V4__benign_idents.sql "SELECT U&\"d\\\\0061ta\" FROM old_t;\nINSERT INTO old_t (legacy) VALUES (E${Q}a\\\\nb${Q});"
+          expect_pass "U&\"..\" identifier and E'..\\n' literal without EXECUTE"
+
+          # --- Scenario 12: an ADDED repeatable R__*.sql is rejected (the repo has none), at any depth ---
+          add R__views.sql 'DROP VIEW IF EXISTS v_old;'
+          expect_fail "repeatable R__ migration is rejected"
+          add R__benign.sql 'SELECT 1;'
+          expect_fail "even a benign repeatable R__ migration is rejected"
+          add sub/R__nested.sql 'SELECT 1;'
+          expect_fail "nested repeatable R__ migration is rejected"
+
+          # --- Scenario 13: Java migrations need a header ---
+          add_java V4__JavaMigration.java 'package db.migration;\npublic class V4__JavaMigration {}'
+          expect_fail "Java migration without a header"
+          add_java V4__JavaMigration.java '// non-destructive\npackage db.migration;\npublic class V4__JavaMigration {}'
+          expect_pass "Java migration with // non-destructive"
+          add_java V4__JavaMigration.java '// contract-of: V3\npackage db.migration;\npublic class V4__JavaMigration {}'
+          expect_pass "Java migration with a valid // contract-of"
+          add_java V4__JavaMigration.java '// contract-of: V99\npackage db.migration;\npublic class V4__JavaMigration {}'
+          expect_fail "Java migration whose contract-of names a non-existent version"
+          mkdir -p "$JAVA_MIGRATION_PATH"
+          printf 'package db.migration;\npublic class V1__Old {}\n' > "$JAVA_MIGRATION_PATH/V9__Old.java"
+          git add -A
+          git commit -q -m "base: existing java migration"
+          BASE_SHA="$(git rev-parse HEAD)"
+          git commit -q --allow-empty -m "no java changes"
+          expect_pass "existing Java migration without a header is not flagged"
+
+          # --- Scenario 14: migrations in SUBFOLDERS are scanned (Flyway scans recursively) ---
+          # The pathspec "$MIGRATION_PATH/V*.sql" does not match "$MIGRATION_PATH/sub/V200__x.sql".
+          add sub/V200__nested_destructive.sql 'ALTER TABLE old_t DROP COLUMN legacy;'
+          expect_fail "destructive SQL in a subfolder without header"
+          add sub/V200__nested_destructive.sql '-- contract-of: V3\nALTER TABLE old_t DROP COLUMN legacy;'
+          expect_pass "destructive SQL in a subfolder with a valid header"
+          add sub/deeper/V201__nested_deep.sql 'DROP TABLE old_t;'
+          expect_fail "destructive SQL two folders deep without header"
+          add_java sub/V202__NestedJava.java 'package db.migration;\npublic class V202__NestedJava {}'
+          expect_fail "Java migration in a subfolder without a header"
+          add_java sub/V202__NestedJava.java '// non-destructive\npackage db.migration;\npublic class V202__NestedJava {}'
+          expect_pass "Java migration in a subfolder with // non-destructive"
+          add_java sub/Helper.java 'package db.migration;\npublic class Helper {}'
+          expect_pass "non-V*.java helper in a subfolder is out of scope"
+          # contract-of may name a migration that lives in a subfolder.
+          add sub/V50__expand.sql 'ALTER TABLE old_t ADD COLUMN c50 int;'
+          add V60__contract.sql '-- contract-of: V50\nALTER TABLE old_t DROP COLUMN legacy;'
+          expect_pass "contract-of naming a migration in a subfolder"
+
+          # --- Scenario 15 (audit cycle 3): helper that pins WHICH rule fired, not just that something did ---
+          reason_has() {
+            local want="$1" sql="$2" got
+            got="$(printf '%b' "$sql" | destructive_reason)"
+            case "$got" in
+              *"$want"*) echo "OK: reason '$want' <- ${sql%%\\n*}" ;;
+              *) fail "expected reason containing '$want', got '$got' for: $sql" ;;
+            esac
+          }
+
+          # MEDIUM 1: dropping a unique index / PK / unique constraint (or a dynamically named one) breaks the
+          # previous app's ON CONFLICT after a rollback. Plain non-unique index/constraint drops stay allowed.
+          i=0
+          for stmt in \
+            'DROP INDEX ux_device_tokens_token;' \
+            'DROP INDEX IF EXISTS ux_device_tokens_token;' \
+            'DROP INDEX CONCURRENTLY ux_device_tokens_token;' \
+            'DROP INDEX CONCURRENTLY IF EXISTS public.ux_device_tokens_token;' \
+            'DROP INDEX idx_ok, uq_second;' \
+            'DROP INDEX uq_x CASCADE;' \
+            'DROP INDEX uk_x;' \
+            'DROP INDEX idx_bookings_cancel_token;' \
+            'DROP INDEX IF EXISTS "ux_quoted";' \
+            'ALTER TABLE device_tokens DROP CONSTRAINT device_tokens_pkey;' \
+            'ALTER TABLE device_tokens DROP CONSTRAINT IF EXISTS pk_cities;' \
+            'ALTER TABLE old_t DROP CONSTRAINT old_t_legacy_key;' \
+            'ALTER TABLE old_t DROP CONSTRAINT uq_salons_owner_id;' \
+            'ALTER TABLE old_t DROP CONSTRAINT old_t_legacy_unique;' \
+            'ALTER TABLE old_t DROP CONSTRAINT in_app_notification_dedup_uq;' \
+            'ALTER TABLE old_t DROP CONSTRAINT no_overlapping_bookings;' \
+            'ALTER TABLE old_t DROP CONSTRAINT unknown_name_x;' \
+            'ALTER TABLE old_t DROP CONSTRAINT fk_ok, DROP CONSTRAINT uq_y;'; do
+            i=$((i + 1))
+            add "V4__uidx_$i.sql" "$stmt"
+            expect_fail "should_flag_when_uniqueIndexOrConstraintDropped: $stmt"
+          done
+          add V4__uidx_dyn1.sql "DO \$\$ BEGIN EXECUTE format(${Q}ALTER TABLE %I DROP CONSTRAINT %I${Q}, ${Q}t${Q}, ${Q}c${Q}); END \$\$;"
+          expect_fail "should_flag_when_dropConstraintNameIsFormatI"
+          add V4__uidx_dyn2.sql "DO \$\$ DECLARE r record; BEGIN FOR r IN SELECT conname FROM pg_constraint LOOP EXECUTE ${Q}ALTER TABLE t DROP CONSTRAINT ${Q} || r.conname; END LOOP; END \$\$;"
+          expect_fail "should_flag_when_dropConstraintNameIsConcatenatedVariable"
+          add V4__uidx_dyn3.sql "DO \$\$ BEGIN EXECUTE ${Q}DROP INDEX ${Q} || quote_ident(v_name); END \$\$;"
+          expect_fail "should_flag_when_dropIndexNameIsConcatenatedVariable"
+          add V4__uidx_dyn4.sql "DO \$\$ DECLARE cname text; BEGIN ALTER TABLE t DROP CONSTRAINT cname; END \$\$;"
+          expect_fail "should_flag_when_dropConstraintNameIsPlpgsqlVariable"
+          reason_has "unique/primary-key" 'DROP INDEX ux_device_tokens_token;'
+          reason_has "unique/primary-key" 'ALTER TABLE t DROP CONSTRAINT t_pkey;'
+          reason_has "dynamic-named" "DO \$\$ BEGIN EXECUTE format(${Q}ALTER TABLE %I DROP CONSTRAINT %I${Q}, 1, 2); END \$\$;"
+          add V4__uidx_ok.sql 'DROP INDEX idx_foo;\nDROP INDEX IF EXISTS idx_a, ix_b;\nDROP INDEX CONCURRENTLY IF EXISTS public.idx_c;\nALTER TABLE old_t DROP CONSTRAINT IF EXISTS chk_x;\nALTER TABLE old_t DROP CONSTRAINT fk_old_t_other;\nALTER TABLE old_t DROP CONSTRAINT service_definitions_service_type_id_fkey;\nALTER TABLE old_t DROP CONSTRAINT in_app_notification_dedup_key_chk;'
+          expect_pass "should_pass_when_nonUniqueIndexOrConstraintDropped"
+
+          # LOW (re-audit): whitespace padding must not hide a later name from the 400-char look-ahead.
+          # Whitespace runs are collapsed once (linear); a comma with no name after it, or a name that
+          # touches the window end, fails closed.
+          pad500="$(printf '\\n%.0s' $(seq 500))"
+          add V4__pad1.sql "DROP INDEX idx_a,${pad500}ux_device_tokens_token;"
+          expect_fail "should_flag_when_500NewlinesPadTheUniqueNameAfterComma"
+          add V4__pad2.sql "DROP INDEX idx_a,${pad500}idx_b;"
+          expect_pass "should_pass_when_500NewlinesPadANonUniqueNameAfterComma"
+          padnames="$(printf 'idx_p%03d, ' $(seq 1 39))"
+          add V4__pad3.sql "DROP INDEX ${padnames}idx_masters_booking_slug;"
+          expect_fail "should_flag_when_400CharWindowCutsADenylistedNameShort"
+          add V4__pad4.sql "DROP INDEX ${padnames}idx_ok_name;"
+          expect_fail "should_flag_when_namePastTheWindowEndCannotBeFullyRead"
+          add V4__pad5.sql 'DROP INDEX idx_a,'
+          expect_fail "should_flag_when_dropIndexListEndsAfterComma"
+          # INFO (re-audit): `$` is a valid identifier character; the name must not be cut at it.
+          add V4__dollar1.sql "DROP INDEX idx_x\$_key;"
+          expect_fail "should_flag_when_indexNameContainsDollar"
+          add V4__dollar2.sql "ALTER TABLE old_t DROP CONSTRAINT fk_x\$y;"
+          expect_fail "should_flag_when_constraintNameContainsDollar"
+
+          # LOW (re-audit): DEFAULT NULL is not a default for NOT NULL purposes.
+          add V4__addnn6.sql 'ALTER TABLE old_t ADD COLUMN c int DEFAULT NULL NOT NULL;'
+          expect_fail "should_flag_when_addColumnDefaultNullNotNull"
+          add V4__addnn7.sql 'ALTER TABLE old_t ADD COLUMN c int NOT NULL default null::int;'
+          expect_fail "should_flag_when_addColumnNotNullDefaultNullCast"
+          add V4__addnn8.sql 'ALTER TABLE old_t ADD COLUMN c int DEFAULT (NULL) NOT NULL;'
+          expect_fail "should_flag_when_addColumnDefaultParenNullNotNull"
+          add V4__addnn9.sql 'ALTER TABLE old_t ADD COLUMN c int DEFAULT 0 NOT NULL;\nALTER TABLE old_t ADD COLUMN d int DEFAULT NULLIF(1, 1) NOT NULL;'
+          expect_pass "should_pass_when_defaultIsNotLiteralNull"
+
+          # Hardening (re-audit): a function that EXECUTEs a variable/parameter is a "run text" helper.
+          add V4__exnl1.sql "CREATE FUNCTION run_text(t text) RETURNS void AS \$\$ BEGIN EXECUTE t; END \$\$ LANGUAGE plpgsql;"
+          expect_fail "should_flag_when_functionExecutesAParameter"
+          add V4__exnl2.sql "CREATE FUNCTION f() RETURNS void AS \$\$ BEGIN EXECUTE ${Q}SELECT 1${Q}; END \$\$ LANGUAGE plpgsql;"
+          expect_pass "should_pass_when_functionExecutesOnlyALiteral"
+          add V4__exnl3.sql 'CREATE TRIGGER trg BEFORE INSERT ON old_t FOR EACH ROW EXECUTE FUNCTION fn();\nGRANT EXECUTE ON FUNCTION fn() TO PUBLIC;'
+          expect_pass "should_pass_when_executeFunctionTriggerOrGrantExecute"
+
+          # MEDIUM 2: PG18 table-constraint NOT NULL, both spellings.
+          add V4__nn1.sql 'ALTER TABLE old_t ADD CONSTRAINT nn_legacy NOT NULL legacy;'
+          expect_fail "should_flag_when_addNamedNotNullConstraint"
+          add V4__nn2.sql 'ALTER TABLE old_t ADD NOT NULL legacy;'
+          expect_fail "should_flag_when_addUnnamedNotNullConstraint"
+          reason_has "ADD NOT NULL" 'ALTER TABLE old_t ADD CONSTRAINT nn_legacy NOT NULL legacy;'
+
+          # LOW 2: ADD COLUMN ... NOT NULL without DEFAULT / GENERATED fails existing rows or the previous app's INSERTs.
+          add V4__addnn1.sql 'ALTER TABLE old_t ADD COLUMN c int NOT NULL;'
+          expect_fail "should_flag_when_addColumnNotNullWithoutDefault"
+          add V4__addnn2.sql 'ALTER TABLE old_t ADD c int NOT NULL;'
+          expect_fail "should_flag_when_addColumnKeywordOmittedNotNullWithoutDefault"
+          add V4__addnn3.sql 'ALTER TABLE old_t ADD COLUMN a int DEFAULT 1 NOT NULL, ADD COLUMN IF NOT EXISTS b numeric(10,2) NOT NULL;'
+          expect_fail "should_flag_when_secondAddColumnClauseIsNotNullWithoutDefault"
+          add V4__addnn4.sql 'ALTER TABLE old_t ADD COLUMN c int NOT NULL DEFAULT 0;'
+          expect_pass "should_pass_when_addColumnNotNullWithDefault"
+          add V4__addnn5.sql 'ALTER TABLE old_t ADD COLUMN c int DEFAULT 0 NOT NULL;\nALTER TABLE old_t ADD COLUMN d int GENERATED ALWAYS AS (legacy + 1) STORED NOT NULL;\nALTER TABLE old_t ADD COLUMN e int NULL;\nALTER TABLE old_t ADD COLUMN f int;\nALTER TABLE old_t ADD COLUMN g int CHECK (g IS NOT NULL);'
+          expect_pass "should_pass_when_addColumnHasDefaultGeneratedOrIsNullable"
+
+          # INFO: each of these can break the previous app version's queries.
+          i=0
+          for stmt in \
+            'ALTER TABLE old_t DETACH PARTITION old_t_2025;' \
+            'ALTER TABLE old_t DETACH PARTITION old_t_2025 CONCURRENTLY;' \
+            'ALTER TABLE child_t NO INHERIT parent_t;' \
+            'ALTER TABLE old_t ENABLE ROW LEVEL SECURITY;' \
+            'ALTER TABLE old_t FORCE ROW LEVEL SECURITY;'; do
+            i=$((i + 1))
+            add "V4__info_$i.sql" "$stmt"
+            expect_fail "should_flag_when_breakingStructuralForm: $stmt"
+          done
+          # Deliberately NOT destructive: REVOKE (role grants only; the app connects as the owner role that
+          # runs Flyway) and DROP DEFAULT (the standard last step of the add-with-default expand pattern;
+          # flagging it would block routine safe migrations).
+          add V4__info_ok.sql 'REVOKE ALL ON old_t FROM PUBLIC;\nALTER TABLE old_t ALTER COLUMN legacy DROP DEFAULT;\nALTER TABLE old_t DISABLE ROW LEVEL SECURITY;'
+          expect_pass "should_pass_when_revokeOrDropDefaultOrDisableRls"
+
+          # LOW 1: literals are scanned in EVERY file (no EXECUTE needed): a previous migration may have
+          # created run_sql(text) with EXECUTE, and dblink_exec runs its text argument remotely.
+          add V4__lit1.sql "SELECT run_sql(${Q}DROP TABLE users${Q});"
+          expect_fail "should_flag_when_runSqlGetsDropTableWithoutExecuteInFile"
+          add V4__lit2.sql "CALL p(${Q}DROP TABLE x${Q});"
+          expect_fail "should_flag_when_callGetsDropTableLiteral"
+          add V4__lit3.sql "SELECT dblink_exec(${Q}dbname=x${Q}, ${Q}DROP TABLE users${Q});"
+          expect_fail "should_flag_when_dblinkExecGetsDropTable"
+          add V4__lit4.sql "SELECT run_sql(${Q}SELECT 1; DROP TABLE users${Q});"
+          expect_fail "should_flag_when_dropIsSecondStatementInsideLiteral"
+          add V4__lit5.sql "SELECT run_sql(${Q}ALTER TABLE old_t DROP COLUMN legacy${Q});"
+          expect_fail "should_flag_when_alterDropColumnLiteralPassedToFunction"
+          add V4__lit6.sql "SELECT run_sql(${Q}TRUNCATE old_t${Q});"
+          expect_fail "should_flag_when_truncateLiteralPassedToFunction"
+          add V4__lit7.sql "SELECT run_sql(${Q}DR${Q} || ${Q}OP TABLE users${Q});"
+          expect_fail "should_flag_when_dropSplitAcrossLiteralsPassedToFunction"
+          add V4__lit8.sql "SELECT run_sql(E${Q}\\\\x44ROP TABLE users${Q});"
+          expect_fail "should_flag_when_escapeEncodedLiteralPassedToFunctionWithoutExecute"
+          add V4__lit9.sql "SELECT run_sql(U&${Q}\\\\0044ROP TABLE users${Q});"
+          expect_fail "should_flag_when_unicodeEscapeLiteralPassedToFunctionWithoutExecute"
+          reason_has "DROP TABLE" "SELECT run_sql(${Q}DROP TABLE users${Q});"
+          reason_has "escape-encoded literal in a non-data statement" "SELECT run_sql(E${Q}\\\\x44ROP TABLE users${Q});"
+          # Benign data literals (English and Ukrainian prose that merely contains the word "drop") still pass.
+          add V4__lit_ok1.sql "INSERT INTO old_t (legacy) VALUES (${Q}Please drop off the package${Q}), (${Q}drop table and rename${Q}), (${Q}Залиште посилку (drop off) біля дверей${Q});\nUPDATE old_t SET legacy = 1 WHERE ${Q}x${Q} = ${Q}we drop it later${Q};\nCOMMENT ON COLUMN old_t.legacy IS ${Q}ALTER TABLE is not run here; drop off${Q};\nSELECT ${Q}drop off${Q}, ${Q}truncate the story${Q}, ${Q}rename me${Q};"
+          expect_pass "should_pass_when_dataLiteralsMentionDropOffOrTruncateInProse"
+          add V4__lit_ok2.sql "INSERT INTO old_t (legacy) VALUES (${Q}it${Q}${Q}s; DROP TABLE x${Q});\nINSERT INTO old_t (legacy) VALUES (E${Q}a\\\\nb${Q});\nSELECT format(${Q}%s${Q}, 1);"
+          expect_pass "should_pass_when_dataLiteralHasEmbeddedSemicolonOrEscapeInInsert"
+
+          # LOW 3: obfuscation (format('DR%sP TABLE x','O'), convert_from(decode(..,'hex'),..), dblink) cannot be
+          # decoded statically. Fail CLOSED with a contract-of header as the only way through.
+          add V4__obf1.sql "DO \$\$ BEGIN EXECUTE format(${Q}DR%sP TABLE x${Q}, ${Q}O${Q}); END \$\$;"
+          expect_fail "should_flag_when_formatWithExecuteBuildsDrop"
+          add V4__obf2.sql "DO \$\$ BEGIN PERFORM format(${Q}DR%sP TABLE x${Q}, ${Q}O${Q}); END \$\$;"
+          expect_fail "should_flag_when_formatWithPerform"
+          add V4__obf3.sql "SELECT run_sql(convert_from(decode(${Q}44524f50205441424c452075736572730a${Q}, ${Q}hex${Q}), ${Q}UTF8${Q}));"
+          expect_fail "should_flag_when_convertFromDecodeHex"
+          add V4__obf4.sql "SELECT decode(${Q}41${Q}, ${Q}hex${Q});"
+          expect_fail "should_flag_when_decodeCalled"
+          add V4__obf5.sql "SELECT convert_from(${Q}x${Q}::bytea, ${Q}UTF8${Q});"
+          expect_fail "should_flag_when_convertFromCalled"
+          add V4__obf6.sql "SELECT dblink_connect(${Q}dbname=x${Q});"
+          expect_fail "should_flag_when_dblinkCalled"
+          add V4__obf7.sql "SELECT dblink_exec(${Q}dbname=x${Q}, chr(68) || ${Q}ROP TABLE users${Q});"
+          expect_fail "should_flag_when_dblinkExecBuildsDropFromChr"
+          reason_has "obfuscation-capable" "DO \$\$ BEGIN EXECUTE format(${Q}DR%sP TABLE x${Q}, ${Q}O${Q}); END \$\$;"
+          reason_has "obfuscation-capable" "SELECT decode(${Q}41${Q}, ${Q}hex${Q});"
+          reason_has "obfuscation-capable" "SELECT dblink_connect(${Q}dbname=x${Q});"
+          # format() without EXECUTE/PERFORM is plain string formatting and passes.
+          add V4__obf_ok.sql "SELECT format(${Q}%s items${Q}, 3);"
+          expect_pass "should_pass_when_formatWithoutExecuteOrPerform"
+          # The way through is a contract-of header (chosen over a new marker: it needs no extra parser path
+          # and is already validated against a real earlier migration).
+          add V4__obf_hdr.sql "-- contract-of: V3\nDO \$\$ BEGIN EXECUTE format(${Q}ALTER TABLE %I ADD COLUMN c2 int${Q}, ${Q}old_t${Q}); END \$\$;"
+          expect_pass "should_pass_when_obfuscationPrimitiveCarriesContractOf"
+          add V4__obf_hdr_bad.sql "-- contract-of: V99\nSELECT decode(${Q}41${Q}, ${Q}hex${Q});"
+          expect_fail "should_flag_when_obfuscationHeaderNamesMissingVersion"
+
+          echo "All destructive-migration self-test scenarios passed."
+
   verify-gate-mirror-parity:
     name: Verify Gate <-> Mirror Parity
     runs-on: ubuntu-latest
@@ -1386,5 +3040,6 @@ jobs:
           check_pair immutability 2
           check_pair monotonicity 2
           check_pair baserev 3
+          check_pair destructive 2
 
           echo "All SHARED gate<->mirror blocks are byte-identical."

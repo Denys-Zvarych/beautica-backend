@@ -24,6 +24,7 @@ run-name: >-
 # infrastructure. Full runs, and selective runs above 120 classes, are sharded across 3 runners,
 # balanced by class weight (heavy integration tests spread evenly, see TestSharder).
 #
+#   (promotion-source lives in its own pull_request_target workflow, promotion-source.yml: phase 370 D5)
 #   plan           decides mode + non-empty shards. NO project compile: selector = plain javac of JDK-only classes
 #   plan           (also) th:utext email-template guard: the BASE copy of the script, run AFTER selection
 #   gates          compile + `build -x test`; skipped when mode=none
