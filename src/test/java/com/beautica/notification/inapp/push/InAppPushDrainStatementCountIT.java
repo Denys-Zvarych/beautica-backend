@@ -13,13 +13,11 @@ import com.beautica.notification.entity.OutboxEventType;
 import com.beautica.notification.entity.OutboxStatus;
 import com.beautica.notification.service.NotificationOutboxDrainWorker;
 import com.beautica.notification.service.PushNotificationService;
-import com.beautica.service.entity.CatalogCategory;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.OwnerType;
 import com.beautica.service.entity.PriceType;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.entity.ServiceType;
-import com.beautica.service.repository.CatalogCategoryRepository;
 import com.beautica.service.repository.MasterServiceRepository;
 import com.beautica.service.repository.ServiceRepository;
 import com.beautica.service.repository.ServiceTypeRepository;
@@ -39,7 +37,6 @@ import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
-import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -60,8 +57,6 @@ class InAppPushDrainStatementCountIT extends AbstractIntegrationTest {
     private static final int MANY_RECIPIENTS = 50;
     /** feed rows + recipients + tokens + bookings (+visits/subjects/reviews/owners/admins, skipped here) + slack. */
     private static final long FLAT_BOUND = 8;
-    private static final AtomicInteger SORT_ORDER_SEQ = new AtomicInteger(790_000);
-
     /**
      * S4 moved a token-ownership query onto the {@code pushExecutor} thread, per push. Hibernate
      * {@link Statistics} are factory-wide, not per-thread, so with the real executor those queries
@@ -79,8 +74,6 @@ class InAppPushDrainStatementCountIT extends AbstractIntegrationTest {
     private UserRepository userRepository;
     @Autowired
     private MasterRepository masterRepository;
-    @Autowired
-    private CatalogCategoryRepository catalogCategoryRepository;
     @Autowired
     private ServiceTypeRepository serviceTypeRepository;
     @Autowired
@@ -102,11 +95,9 @@ class InAppPushDrainStatementCountIT extends AbstractIntegrationTest {
         Master master = masterRepository.save(Master.builder()
                 .user(masterUser).masterType(MasterType.INDEPENDENT_MASTER)
                 .avgRating(BigDecimal.ZERO).reviewCount(0).isActive(true).build());
-        CatalogCategory category = catalogCategoryRepository.save(CatalogCategory.builder()
-                .nameUk("Нігті").nameEn("Nails").sortOrder(SORT_ORDER_SEQ.getAndIncrement()).build());
-        ServiceType serviceType = serviceTypeRepository.save(ServiceType.builder()
-                .category(category).nameUk("Манікюр").nameEn("Manicure")
-                .slug("push-drain-type-" + UUID.randomUUID()).platformCategoryName("NAIL_SERVICE").build());
+        // Reuse the V75-seeded active type: inserting new active service_types rows leaks across
+        // tests (cleanDb() does not wipe service_types) and breaks seed-count assertions elsewhere.
+        ServiceType serviceType = serviceTypeRepository.findActiveByPlatformCategoryName("NAIL_SERVICE").get(0);
         ServiceDefinition definition = serviceRepository.save(ServiceDefinition.builder()
                 .ownerType(OwnerType.INDEPENDENT_MASTER).ownerId(master.getId()).name("Gel Manicure")
                 .category("MANICURE").baseDurationMinutes(60).priceType(PriceType.FIXED)
