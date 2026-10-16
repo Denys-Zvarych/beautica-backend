@@ -2,6 +2,7 @@ package com.beautica.booking;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import com.beautica.support.ParityRequestId;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.config.TestSecurityConfig;
 import jakarta.persistence.EntityManagerFactory;
@@ -540,7 +541,8 @@ class AppointmentItemCompleteIT extends AbstractIntegrationTest {
     }
 
     private ResponseEntity<String> complete(String token, UUID appointmentId, UUID bookingId) {
-        HttpHeaders headers = fixtures.bearerHeaders(token);
+        // Pinned X-Request-Id so error bodies compared for anti-oracle parity differ in nothing (Phase 371 requestId).
+        HttpHeaders headers = ParityRequestId.on(fixtures.bearerHeaders(token));
         return restTemplate.exchange(
                 APPOINTMENTS_URL + "/" + appointmentId + "/services/" + bookingId + "/complete",
                 HttpMethod.PATCH, new HttpEntity<>(headers), String.class);

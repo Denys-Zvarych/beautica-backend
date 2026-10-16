@@ -87,6 +87,16 @@ record SourceFile(String path, boolean test, String pkg, String simpleName, Stri
         return named || TEST_ANNOTATION.matcher(body).find();
     }
 
+    /** True when the class carries a tag from {@link SelectorRules#SEPARATE_JOB_TAGS}: it runs in its own CI job. */
+    boolean runsInSeparateJob() {
+        for (String tag : SelectorRules.SEPARATE_JOB_TAGS) {
+            if (Pattern.compile("@Tag\\(\\s*\"" + Pattern.quote(tag) + "\"\\s*\\)").matcher(codeWithoutComments()).find()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /** True when the class declares a JUnit {@code @Nested} inner class (Gradle reports those under THIS class, not a subclass). */
     boolean declaresNested() {
         return NESTED.matcher(codeWithoutComments()).find();

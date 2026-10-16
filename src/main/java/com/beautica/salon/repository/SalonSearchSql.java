@@ -426,7 +426,7 @@ public final class SalonSearchSql {
      *       {@code :}{@value MasterBookabilitySql#TODAY_PARAM} from {@code ScheduleDateMath#today()}
      *       (and likewise for the exception arm below) — never bare {@code CURRENT_DATE}, and no
      *       longer the DB clock at all.</b> {@code CURRENT_DATE} resolves against the JDBC session's
-     *       {@code TimeZone} (UTC on Railway and Neon), so between 00:00 and 03:00 Kyiv the session
+     *       {@code TimeZone} (UTC on Railway), so between 00:00 and 03:00 Kyiv the session
      *       date is still <em>yesterday</em> in Kyiv and a master whose template expired
      *       yesterday-Kyiv kept pricing the salon (shipped in PR #125, caught only by a 21:22Z CI
      *       run). The intermediate fix spelled {@code (CURRENT_TIMESTAMP AT TIME ZONE

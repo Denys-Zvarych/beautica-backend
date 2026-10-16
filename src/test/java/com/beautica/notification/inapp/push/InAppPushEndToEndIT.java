@@ -40,6 +40,8 @@ class InAppPushEndToEndIT extends AbstractInAppPushFlowIT {
 
     @Autowired
     private NotificationOutboxDrainWorker drainWorker;
+    @Autowired
+    private com.beautica.service.service.CategoryRequestService categoryRequestService;
 
     @Test
     @DisplayName("client books over HTTP: exactly one INAPP_PUSH outbox row per feed row, aggregate = feed id, "
@@ -259,6 +261,53 @@ class InAppPushEndToEndIT extends AbstractInAppPushFlowIT {
             return dataOf(message);
         } catch (Exception e) {
             throw new IllegalStateException(e);
+        }
+    }
+
+    @Test
+    @DisplayName("phase 372: admin rejects a category request with a reason — exactly one id-only INAPP_PUSH row, "
+            + "the push has the PushCopy title, kind SERVICE_CATALOG and no ids, and the reason is not on the lock screen")
+    void should_enqueueAndSendOnePush_when_categoryRequestRejectedWithReason() throws Exception {
+        String email = "push-372-" + System.nanoTime() + "@beautica.test";
+        UUID requester = fixtures.createUser(email, "INDEPENDENT_MASTER", null);
+        jdbcTemplate.update("INSERT INTO device_tokens (user_id, token, platform) VALUES (?, ?, 'ANDROID')",
+                requester, tokenOf(requester));
+        categoryRequestService.submitRequest(new com.beautica.service.dto.CreateCategoryRequestRequest(
+                "PUSH372_CAT", "Пуш-категорія", null), requester);
+        org.mockito.ArgumentCaptor<String> url = org.mockito.ArgumentCaptor.forClass(String.class);
+        org.mockito.Mockito.verify(emailService).sendCategoryRequestNotification(
+                org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.anyString(),
+                org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.anyString(), url.capture());
+        String token = url.getValue().substring(url.getValue().lastIndexOf('/') + 1);
+        org.springframework.util.MultiValueMap<String, String> form = new org.springframework.util.LinkedMultiValueMap<>();
+        form.add("token", token);
+        form.add("reason", "PRIVATE-REASON-372");
+        org.springframework.http.HttpHeaders headers = new org.springframework.http.HttpHeaders();
+        headers.setContentType(org.springframework.http.MediaType.APPLICATION_FORM_URLENCODED);
+
+        try {
+            ResponseEntity<String> decision = restTemplate.postForEntity(
+                    "/api/v1/service-categories/requests/reject", new HttpEntity<>(form, headers), String.class);
+            assertThat(decision.getStatusCode()).isEqualTo(HttpStatus.OK);
+            assertThat(countOutbox("INAPP_PUSH")).isEqualTo(1);
+            assertThat(jdbcTemplate.queryForObject(
+                    "SELECT aggregate_id FROM notification_outbox WHERE event_type = 'INAPP_PUSH'", UUID.class))
+                    .isEqualTo(feedRowIds().get(0));
+
+            drainWorker.drain();
+
+            Message sent = awaitSends(1).get(0);
+            assertThat(titleOf(sent)).isEqualTo("Категорію відхилено");
+            assertThat(bodyOf(sent)).isEqualTo("Запит на категорію «Пуш-категорія» відхилено");
+            Map<String, String> data = dataOf(sent);
+            assertThat(data).containsEntry("type", "CATEGORY_REQUEST_REJECTED")
+                    .containsEntry("targetKind", "SERVICE_CATALOG");
+            assertThat(data.keySet()).isSubsetOf(ALLOWED_DATA_KEYS);
+            assertThat(data.keySet()).doesNotContain("bookingId", "appointmentId", "salonId");
+            assertThat(titleOf(sent) + bodyOf(sent) + data).doesNotContain("PRIVATE-REASON-372");
+        } finally {
+            jdbcTemplate.update("DELETE FROM in_app_notification");
+            jdbcTemplate.update("DELETE FROM platform_categories WHERE name = 'PUSH372_CAT'");
         }
     }
 }

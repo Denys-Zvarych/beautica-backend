@@ -10,8 +10,11 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import org.slf4j.LoggerFactory;
 import org.springframework.web.client.RestClient;
+
+import java.time.Duration;
 
 import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
 import static com.github.tomakehurst.wiremock.client.WireMock.absent;
@@ -118,6 +121,54 @@ class TurbosmsServiceTest {
                 .isInstanceOf(SmsDeliveryException.class);
 
         wireMock.verify(0, postRequestedFor(urlEqualTo(PATH)));
+    }
+
+    // ── outbound timeouts ───────────────────────────────────────────────────
+
+    @Test
+    @Timeout(5)
+    @DisplayName("should_failWithinReadTimeout_when_turbosmsDelaysResponse")
+    void should_failWithinReadTimeout_when_turbosmsDelaysResponse() {
+        TurbosmsProperties props = new TurbosmsProperties();
+        props.setToken(TOKEN);
+        props.setBaseUrl(wireMock.baseUrl() + PATH);
+        props.setReadTimeout(Duration.ofMillis(300));
+        TurbosmsService shortTimeout = new TurbosmsService(RestClient.builder(), props);
+        wireMock.stubFor(post(urlEqualTo(PATH))
+                .willReturn(aResponse().withStatus(200).withFixedDelay(2000)
+                        .withBody("{\"response_status\":\"OK\"}")));
+
+        long start = System.nanoTime();
+        assertThatThrownBy(() -> shortTimeout.send(PHONE, OTP_TEXT))
+                .isInstanceOf(SmsDeliveryException.class);
+        Duration elapsed = Duration.ofNanos(System.nanoTime() - start);
+
+        assertThat(elapsed).isLessThan(Duration.ofMillis(1500));
+    }
+
+    @Test
+    @DisplayName("should_failFast_when_turbosmsTimeoutIsNullZeroOrNegative")
+    void should_failFast_when_turbosmsTimeoutIsNullZeroOrNegative() {
+        for (Duration bad : new Duration[]{null, Duration.ZERO, Duration.ofSeconds(-1)}) {
+            TurbosmsProperties connect = new TurbosmsProperties();
+            connect.setConnectTimeout(bad);
+            TurbosmsProperties read = new TurbosmsProperties();
+            read.setReadTimeout(bad);
+
+            assertThatThrownBy(() -> new TurbosmsService(RestClient.builder(), connect))
+                    .isInstanceOf(IllegalStateException.class).hasMessageContaining("connect-timeout");
+            assertThatThrownBy(() -> new TurbosmsService(RestClient.builder(), read))
+                    .isInstanceOf(IllegalStateException.class).hasMessageContaining("read-timeout");
+        }
+    }
+
+    @Test
+    @DisplayName("should_defaultToThreeAndFiveSeconds_when_propertiesUnset")
+    void should_defaultToThreeAndFiveSeconds_when_propertiesUnset() {
+        TurbosmsProperties props = new TurbosmsProperties();
+
+        assertThat(props.getConnectTimeout()).isEqualTo(Duration.ofSeconds(3));
+        assertThat(props.getReadTimeout()).isEqualTo(Duration.ofSeconds(5));
     }
 
     // ── logging discipline (security-critical) ──────────────────────────────

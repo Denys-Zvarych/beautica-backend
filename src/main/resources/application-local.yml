@@ -1,6 +1,15 @@
+# Deploy-environment identity (Phase 368) — EnvironmentFingerprintGuard skips `local`.
+beautica:
+  environment: local
+
+# Phase 371: local never reports to Sentry, even with SENTRY_DSN exported. Forcing SENTRY_ENABLED=true with a
+# non-loopback DSN fails boot (EnvironmentFingerprintGuard, rule sentry-local).
+sentry:
+  enabled: false
+
 spring:
   datasource:
-    url: jdbc:postgresql://localhost:5432/beautica
+    url: jdbc:postgresql://localhost:5432/beautica?logServerErrorDetail=false
     username: beautica
     password: beautica
     driver-class-name: org.postgresql.Driver
@@ -61,6 +70,8 @@ app:
     token-expiration-hours: 48
     from-email: noreply@beautica.app
   admin-email: ${ADMIN_EMAIL:dev-admin@localhost}
+  # Dev-only default; never valid under prod/staging (EnvironmentFingerprintGuard rejects it).
+  internal-api-key: ${INTERNAL_API_KEY:changeme-dev-only}
   public-base-url: ${PUBLIC_BASE_URL:http://localhost:8080}
   security:
     # Local dev only — never use in prod. Generate prod value: openssl rand -base64 32.

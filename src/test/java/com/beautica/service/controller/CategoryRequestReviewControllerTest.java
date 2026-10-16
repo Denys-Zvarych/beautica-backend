@@ -20,7 +20,9 @@ import org.springframework.security.config.http.SessionCreationPolicy;
 import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.test.web.servlet.MockMvc;
 
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -67,18 +69,18 @@ class CategoryRequestReviewControllerTest {
                 .andExpect(status().isOk())
                 .andExpect(content().string(org.hamcrest.Matchers.containsString("NAIL_ART")))
                 // Token rides in the URL path → no-store stops cache retention,
-                // no-referrer stops the token leaking via a later cross-origin Referer.
+                // same-origin stops the token leaking via a later cross-origin Referer.
                 .andExpect(header().string("Cache-Control",
                         org.hamcrest.Matchers.containsString("no-store")))
                 .andExpect(header().string("Cache-Control",
                         org.hamcrest.Matchers.containsString("no-cache")))
                 .andExpect(header().string("Cache-Control",
                         org.hamcrest.Matchers.containsString("must-revalidate")))
-                .andExpect(header().string("Referrer-Policy", "no-referrer"));
+                .andExpect(header().string("Referrer-Policy", "same-origin"));
 
         // Critical: GET must NOT mutate state.
         verify(categoryRequestService, never()).approve(anyString());
-        verify(categoryRequestService, never()).reject(anyString());
+        verify(categoryRequestService, never()).reject(anyString(), any());
     }
 
     @Test
@@ -89,6 +91,7 @@ class CategoryRequestReviewControllerTest {
 
         mockMvc.perform(get("/api/v1/service-categories/requests/review/{token}", "bad-token"))
                 .andExpect(status().isOk())
+                .andExpect(header().string("Referrer-Policy", "same-origin"))
                 .andExpect(content().string(org.hamcrest.Matchers.not(
                         org.hamcrest.Matchers.containsString("NAIL_ART"))));
     }
@@ -114,7 +117,7 @@ class CategoryRequestReviewControllerTest {
                 .andExpect(status().isOk())
                 .andExpect(header().string("Cache-Control",
                         org.hamcrest.Matchers.containsString("no-store")))
-                .andExpect(header().string("Referrer-Policy", "no-referrer"));
+                .andExpect(header().string("Referrer-Policy", "same-origin"));
 
         verify(categoryRequestService).approve(eq("good-token"));
     }
@@ -122,16 +125,16 @@ class CategoryRequestReviewControllerTest {
     @Test
     @DisplayName("should_renderRejectedPage_when_rejectPosted")
     void should_renderRejectedPage_when_rejectPosted() throws Exception {
-        when(categoryRequestService.reject("good-token")).thenReturn(DecisionOutcome.REJECTED);
+        when(categoryRequestService.reject(eq("good-token"), isNull())).thenReturn(DecisionOutcome.REJECTED);
 
         mockMvc.perform(post("/api/v1/service-categories/requests/reject")
                         .with(csrf()).param("token", "good-token"))
                 .andExpect(status().isOk())
                 .andExpect(header().string("Cache-Control",
                         org.hamcrest.Matchers.containsString("no-store")))
-                .andExpect(header().string("Referrer-Policy", "no-referrer"));
+                .andExpect(header().string("Referrer-Policy", "same-origin"));
 
-        verify(categoryRequestService).reject(eq("good-token"));
+        verify(categoryRequestService).reject(eq("good-token"), isNull());
     }
 
     @Test
@@ -141,6 +144,90 @@ class CategoryRequestReviewControllerTest {
 
         mockMvc.perform(post("/api/v1/service-categories/requests/approve")
                         .with(csrf()).param("token", "stale-token"))
+                .andExpect(status().isOk())
+                .andExpect(header().string("Referrer-Policy", "same-origin"));
+    }
+
+    // ── phase 372: optional reject reason ──────────────────────────────────────
+
+    @Test
+    @DisplayName("POST reject (category) — the reason reaches the service trimmed")
+    void should_passTrimmedReasonToService_when_rejectPostedWithReason() throws Exception {
+        when(categoryRequestService.reject(eq("good-token"), eq("не підходить"))).thenReturn(DecisionOutcome.REJECTED);
+
+        mockMvc.perform(post("/api/v1/service-categories/requests/reject").with(csrf()).param("token", "good-token")
+                        .param("reason", "  не підходить \n "))
+                .andExpect(status().isOk())
+                .andExpect(content().string(org.hamcrest.Matchers.containsString("Причина: не підходить")));
+
+        verify(categoryRequestService).reject("good-token", "не підходить");
+    }
+
+    @Test
+    @DisplayName("POST reject (category) — a blank reason reaches the service as null")
+    void should_passNullReason_when_reasonBlank() throws Exception {
+        when(categoryRequestService.reject(eq("good-token"), isNull())).thenReturn(DecisionOutcome.REJECTED);
+
+        mockMvc.perform(post("/api/v1/service-categories/requests/reject").with(csrf()).param("token", "good-token").param("reason", "  \t\n "))
+                .andExpect(status().isOk())
+                .andExpect(content().string(org.hamcrest.Matchers.not(org.hamcrest.Matchers.containsString("Причина"))));
+
+        verify(categoryRequestService).reject("good-token", null);
+    }
+
+    @Test
+    @DisplayName("POST reject (category) — a 301-char reason renders the neutral page and never calls the service")
+    void should_renderNeutralPageAndNotDecide_when_reasonExceeds300() throws Exception {
+        mockMvc.perform(post("/api/v1/service-categories/requests/reject").with(csrf()).param("token", "good-token").param("reason", "ж".repeat(301)))
+                .andExpect(status().isOk())
+                .andExpect(content().string(org.hamcrest.Matchers.containsString("Посилання недоступне")));
+
+        verify(categoryRequestService, never()).reject(anyString(), any());
+        verify(categoryRequestService, never()).reject(anyString());
+    }
+
+    @Test
+    @DisplayName("POST reject (category) — a reason of exactly 300 chars is accepted")
+    void should_acceptReasonOfExactly300() throws Exception {
+        String reason = "ж".repeat(300);
+        when(categoryRequestService.reject(eq("good-token"), eq(reason))).thenReturn(DecisionOutcome.REJECTED);
+
+        mockMvc.perform(post("/api/v1/service-categories/requests/reject").with(csrf()).param("token", "good-token").param("reason", reason))
                 .andExpect(status().isOk());
+
+        verify(categoryRequestService).reject("good-token", reason);
+    }
+
+    @Test
+    @DisplayName("POST reject (category) — control characters are stripped before the service sees the reason")
+    void should_stripControlCharacters_when_reasonContainsThem() throws Exception {
+        when(categoryRequestService.reject(eq("good-token"), eq("abcd ef"))).thenReturn(DecisionOutcome.REJECTED);
+
+        mockMvc.perform(post("/api/v1/service-categories/requests/reject").with(csrf()).param("token", "good-token")
+                        .param("reason", "a\u0000b\u0007c\u202Ed\r\nef"))
+                .andExpect(status().isOk());
+
+        verify(categoryRequestService).reject("good-token", "abcd ef");
+    }
+
+    @Test
+    @DisplayName("POST reject (category) — a <script> reason is HTML-escaped on the result page")
+    void should_htmlEscapeReasonInResultPage_when_reasonContainsMarkup() throws Exception {
+        String markup = "<script>alert(1)</script>";
+        when(categoryRequestService.reject(eq("good-token"), eq(markup))).thenReturn(DecisionOutcome.REJECTED);
+
+        mockMvc.perform(post("/api/v1/service-categories/requests/reject").with(csrf()).param("token", "good-token").param("reason", markup))
+                .andExpect(status().isOk())
+                .andExpect(content().string(org.hamcrest.Matchers.containsString("&lt;script&gt;alert(1)&lt;/script&gt;")))
+                .andExpect(content().string(org.hamcrest.Matchers.not(org.hamcrest.Matchers.containsString("<script>alert"))));
+    }
+
+    @Test
+    @DisplayName("POST reject (category) — the reason is not echoed when the outcome is not REJECTED")
+    void should_notEchoReason_when_decisionIsNotRejected() throws Exception {
+        when(categoryRequestService.reject(eq("good-token"), eq("r"))).thenReturn(DecisionOutcome.ALREADY_DECIDED);
+
+        mockMvc.perform(post("/api/v1/service-categories/requests/reject").with(csrf()).param("token", "good-token").param("reason", "r"))
+                .andExpect(content().string(org.hamcrest.Matchers.not(org.hamcrest.Matchers.containsString("Причина"))));
     }
 }

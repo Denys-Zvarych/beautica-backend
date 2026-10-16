@@ -732,9 +732,9 @@ class LocalityTaxonomySeedMigrationTest extends AbstractIntegrationTest {
          * (FK resolved by business key — the deterministic/idempotent form the
          * V53 header mandates), all inside ONE Flyway migration transaction
          * (one begin/commit round-trip, not 455 transactions) over ≤356-row
-         * reference tables. Testcontainers spins a cold {@code postgres:16}
+         * reference tables. Testcontainers spins a cold PostgreSQL container
          * with no warm cache — a fair, if anything pessimistic, proxy for a
-         * cold Neon start (Neon's compute resumes warm). Flyway records the
+         * cold start of a remote database. Flyway records the
          * applied duration in {@code execution_time} (milliseconds); a generous
          * 10s ceiling is a coarse regression tripwire that a pathological
          * rewrite (e.g. a per-row correlated cross join, or accidental

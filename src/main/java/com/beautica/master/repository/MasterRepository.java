@@ -539,8 +539,8 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
      * {@code hibernate.jdbc.batch_size} and {@code order_updates} inert for that loop) and
      * dirty-checked the entire persistence context, which at that point still holds everything the
      * phase 293 decline cascade loaded. Cost was O(N x |persistence context|). Measured on a warm
-     * local socket, 50 masters: 75.2 ms looped vs 6.2 ms set-based; on Railway&rarr;Neon at 2 ms
-     * RTT the loop adds ~100 round trips where this adds 2. The caller now runs a pure in-memory
+     * local socket, 50 masters: 75.2 ms looped vs 6.2 ms set-based; at an
+     * illustrative 2 ms RTT the loop adds ~100 round trips where this adds 2. The caller now runs a pure in-memory
      * branch over the returned id set, and {@code masterRepository.flush()} before the account
      * delete becomes the ONLY flush — which is what finally lets the detach UPDATEs and the master
      * DELETEs batch.

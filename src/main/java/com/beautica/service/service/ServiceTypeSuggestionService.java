@@ -4,10 +4,15 @@ import com.beautica.auth.TokenGenerator;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.config.PublicBaseUrlProperties;
 import com.beautica.notification.EmailService;
+import com.beautica.notification.inapp.service.InAppNotificationService;
+import com.beautica.search.service.SearchSuggestionCatalogue;
 import com.beautica.service.entity.ServiceTypeSuggestion;
 import com.beautica.service.repository.ServiceTypeSuggestionRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.cache.annotation.CacheEvict;
+import org.springframework.cache.annotation.Caching;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
@@ -49,6 +54,9 @@ import java.util.UUID;
 public class ServiceTypeSuggestionService {
 
     private static final Duration TOKEN_TTL = Duration.ofDays(7);
+    /** V197 partial UNIQUE index enforcing one PENDING row per (category_name, lower(suggested_name)). */
+    static final String PENDING_DEDUP_INDEX = "ux_service_type_suggestion_pending_dedup";
+    private static final String DUPLICATE_PENDING_MESSAGE = "A matching suggestion is already pending review";
     private static final String REVIEW_PATH = "/api/v1/service-types/suggestions/review?token=";
 
     private final ServiceTypeSuggestionRepository suggestionRepository;
@@ -57,9 +65,13 @@ public class ServiceTypeSuggestionService {
     private final PublicBaseUrlProperties publicBaseUrlProperties;
     private final ServiceTypePromotionService promotionService;
     private final Clock clock;
+    private final InAppNotificationService inAppNotificationService;
 
     @Value("${app.admin-email}")
     private String adminEmail;
+
+    /** SpEL guard: evict only when the decision actually changed state. */
+    private static final String APPROVED_ONLY = "#result.name() == 'APPROVED'";
 
     /**
      * Outcome of a token-bearing review/decision operation. The controller maps it
@@ -124,8 +136,7 @@ public class ServiceTypeSuggestionService {
 
         if (suggestionRepository.existsPendingByCategoryNameAndSuggestedNameIgnoreCase(
                 categoryName, suggestedName)) {
-            throw new BusinessException(
-                    HttpStatus.CONFLICT, "A matching suggestion is already pending review");
+            throw duplicatePending();
         }
 
         String rawToken = tokenGenerator.generateToken();
@@ -134,7 +145,7 @@ public class ServiceTypeSuggestionService {
 
         ServiceTypeSuggestion suggestion = ServiceTypeSuggestion.ofPending(
                 categoryName, suggestedName, description, requestedByUserId, tokenHash, now.plus(TOKEN_TTL));
-        suggestionRepository.save(suggestion);
+        insertPending(suggestion);
 
         String reviewUrl = publicBaseUrlProperties.getPublicBaseUrl() + REVIEW_PATH + rawToken;
         emailService.sendServiceTypeSuggestionNotification(
@@ -144,6 +155,45 @@ public class ServiceTypeSuggestionService {
                 suggestedName,
                 description,
                 reviewUrl);
+    }
+
+    /**
+     * Inserts the PENDING row and flushes immediately so a lost race on
+     * {@value #PENDING_DEDUP_INDEX} (V197) surfaces HERE — inside the service, before the admin
+     * email — rather than at commit. The exists-check above is check-then-act; two concurrent
+     * submits can both pass it, and the partial UNIQUE index is what actually serialises them
+     * (the second INSERT blocks on the first's uncommitted row, then fails). The loser is
+     * translated to the SAME 409 the exists-check throws, so the client sees identical behaviour.
+     * Any other integrity violation is rethrown unchanged (generic handler, anti-enumeration).
+     */
+    private void insertPending(ServiceTypeSuggestion suggestion) {
+        try {
+            suggestionRepository.saveAndFlush(suggestion);
+        } catch (DataIntegrityViolationException ex) {
+            if (isPendingDedupViolation(ex)) {
+                throw duplicatePending();
+            }
+            throw ex;
+        }
+    }
+
+    /**
+     * Matches only Hibernate's structured {@code getConstraintName()} — never a message substring
+     * (the PgJDBC detail line echoes caller-supplied text). Same rationale as
+     * {@code ServiceCatalogService.isDuplicateServiceViolation}.
+     */
+    private static boolean isPendingDedupViolation(DataIntegrityViolationException ex) {
+        for (Throwable cause = ex; cause != null; cause = cause.getCause()) {
+            if (cause instanceof org.hibernate.exception.ConstraintViolationException hce
+                    && PENDING_DEDUP_INDEX.equals(hce.getConstraintName())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static BusinessException duplicatePending() {
+        return new BusinessException(HttpStatus.CONFLICT, DUPLICATE_PENDING_MESSAGE);
     }
 
     /**
@@ -165,10 +215,26 @@ public class ServiceTypeSuggestionService {
      * promotion failure rolls the whole approval back, so the admin can retry cleanly.
      * Idempotent: a second call returns {@link DecisionOutcome#ALREADY_DECIDED} (or
      * INVALID_OR_EXPIRED) BEFORE reaching the promote call — no 500, no double-create.
+     *
+     * <p>Approval materializes a catalogue row, so it evicts every cache derived from service
+     * types ({@code service-types}, {@code service-type-search}, the search-suggestion
+     * catalogue). Eviction happens ONLY when the outcome is {@code APPROVED} (a real state change):
+     * the endpoint is public (token is the credential; per-IP throttled), so a garbage/replayed token (ALREADY_DECIDED /
+     * INVALID_OR_EXPIRED) must not flush the caches platform-wide. This
+     * conditional {@code @CacheEvict} set is the single eviction mechanism and runs POST-commit: the
+     * caching advisor is outermost ({@code CacheConfig}, {@code @EnableCaching(order =
+     * HIGHEST_PRECEDENCE)}), so it wraps the transaction advisor; a rollback (e.g. {@code promote()}
+     * throwing) evicts nothing. A load already in flight at commit time can still cache a stale
+     * snapshot, bounded only by the TTL. Reject changes no catalogue rows and evicts nothing.
      */
     @Transactional
+    @Caching(evict = {
+            @CacheEvict(value = "service-types", allEntries = true, condition = APPROVED_ONLY),
+            @CacheEvict(value = "service-type-search", allEntries = true, condition = APPROVED_ONLY),
+            @CacheEvict(value = SearchSuggestionCatalogue.CACHE_NAME, allEntries = true, condition = APPROVED_ONLY)
+    })
     public DecisionOutcome approve(String rawToken) {
-        return decide(rawToken, true);
+        return decide(rawToken, true, null);
     }
 
     /**
@@ -177,11 +243,20 @@ public class ServiceTypeSuggestionService {
      */
     @Transactional
     public DecisionOutcome reject(String rawToken) {
-        return decide(rawToken, false);
+        return reject(rawToken, null);
     }
 
-    private DecisionOutcome decide(String rawToken, boolean approve) {
-        Optional<ServiceTypeSuggestion> match = findByTokenConstantTime(rawToken);
+    /**
+     * Rejects with an optional admin reason (already trimmed/sanitised/length-validated by the
+     * controller; null when none). Stored on the suggestion, surfaced via the in-app feed, never logged.
+     */
+    @Transactional
+    public DecisionOutcome reject(String rawToken, String reason) {
+        return decide(rawToken, false, reason);
+    }
+
+    private DecisionOutcome decide(String rawToken, boolean approve, String reason) {
+        Optional<ServiceTypeSuggestion> match = findByTokenConstantTime(rawToken, true);
         if (match.isEmpty()) {
             // Token unknown. The row may already be decided (token nulled) — we
             // cannot distinguish, so return a neutral already-decided outcome.
@@ -203,14 +278,17 @@ public class ServiceTypeSuggestionService {
             // here rolls back the approve() flip (status stays PENDING, token intact) so the
             // admin can retry — no "approved but not created" split-brain.
             promotionService.promote(suggestion);
+            // Same transaction (MANDATORY): a promotion failure above rolls the item back with the approval.
+            inAppNotificationService.notifySuggestionDecided(suggestion, true);
             return DecisionOutcome.APPROVED;
         }
-        suggestion.reject(now);
+        suggestion.reject(now, reason);
+        inAppNotificationService.notifySuggestionDecided(suggestion, false);
         return DecisionOutcome.REJECTED;
     }
 
     private Optional<ServiceTypeSuggestion> findLivePending(String rawToken) {
-        return findByTokenConstantTime(rawToken)
+        return findByTokenConstantTime(rawToken, false)
                 .filter(ServiceTypeSuggestion::isPending)
                 .filter(s -> !isExpired(s));
     }
@@ -222,12 +300,15 @@ public class ServiceTypeSuggestionService {
      * defense-in-depth so the decision branch never depends on a non-constant-time
      * String compare.
      */
-    private Optional<ServiceTypeSuggestion> findByTokenConstantTime(String rawToken) {
+    private Optional<ServiceTypeSuggestion> findByTokenConstantTime(String rawToken, boolean forUpdate) {
         if (rawToken == null || rawToken.isBlank()) {
             return Optional.empty();
         }
         String candidateHash = tokenGenerator.hash(rawToken);
-        return suggestionRepository.findByTokenHash(candidateHash)
+        Optional<ServiceTypeSuggestion> found = forUpdate
+                ? suggestionRepository.findByTokenHashForUpdate(candidateHash)
+                : suggestionRepository.findByTokenHash(candidateHash);
+        return found
                 .filter(s -> s.getTokenHash() != null
                         && MessageDigest.isEqual(
                                 s.getTokenHash().getBytes(StandardCharsets.UTF_8),

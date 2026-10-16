@@ -183,15 +183,36 @@ class ServiceTypeSuggestionWorkflowIntegrationTest extends AbstractIntegrationTe
     }
 
     @Test
-    @DisplayName("V76 created the table with the expected indexes (token-hash + dedup)")
+    @DisplayName("V76/V197/V198: token-hash index + unique pending dedup present, V76 non-unique dedup dropped")
     void should_haveCreatedTableWithIndexes_when_migrationApplied() {
         List<String> indexes = jdbcTemplate.queryForList(
                 "SELECT indexname FROM pg_indexes WHERE tablename = 'service_type_suggestion'",
                 String.class);
 
         assertThat(indexes)
-                .as("V76 partial indexes backing the token lookup and the dedup guard")
+                .as("V76 token-lookup index + V197 partial UNIQUE dedup index; V198 dropped V76's non-unique one")
                 .contains("idx_service_type_suggestion_token_hash",
-                        "idx_service_type_suggestion_dedup");
+                        "ux_service_type_suggestion_pending_dedup")
+                .doesNotContain("idx_service_type_suggestion_dedup");
+    }
+
+    @Test
+    @DisplayName("V197 index is UNIQUE + partial on PENDING; V198 applied successfully and dropped the old index")
+    void should_haveUniquePartialIndexAndAppliedV198_when_migrationsApplied() {
+        String indexDef = jdbcTemplate.queryForObject(
+                "SELECT indexdef FROM pg_indexes WHERE indexname = 'ux_service_type_suggestion_pending_dedup'",
+                String.class);
+        Integer oldIndexCount = jdbcTemplate.queryForObject(
+                "SELECT count(*) FROM pg_class WHERE relname = 'idx_service_type_suggestion_dedup'",
+                Integer.class);
+        Boolean v198Success = jdbcTemplate.queryForObject(
+                "SELECT success FROM flyway_schema_history WHERE version = '198'", Boolean.class);
+
+        assertThat(indexDef)
+                .startsWith("CREATE UNIQUE INDEX")
+                .contains("lower((suggested_name)::text)")
+                .contains("WHERE ((status)::text = 'PENDING'::text)");
+        assertThat(oldIndexCount).as("V198 transactional DROP INDEX removed the V76 index").isZero();
+        assertThat(v198Success).as("V198 recorded as successfully applied").isTrue();
     }
 }

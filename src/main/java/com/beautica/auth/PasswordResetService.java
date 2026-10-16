@@ -115,9 +115,11 @@ public class PasswordResetService {
     public void requestReset(ForgotPasswordRequest request) {
         String email = request.email().toLowerCase(Locale.ROOT).strip();
 
-        // Non-locking pre-read — unknown / inactive / unverified take NO row lock.
-        var preReadOpt = userRepository.findByEmail(email);
-        if (preReadOpt.isEmpty() || !preReadOpt.get().isActive() || !preReadOpt.get().isEmailVerified()) {
+        // Non-locking, column-only pre-read — unknown / inactive / unverified take NO row lock. A scalar
+        // projection (not an entity) on purpose: an entity loaded here would be returned again by
+        // findByEmailForUpdate from the persistence context, hiding a concurrent request's committed
+        // password-reset code and skipping the cooldown.
+        if (!userRepository.findPasswordResetEligibleByEmail(email).orElse(false)) {
             performDecoyWork(email);
             return;
         }

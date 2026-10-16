@@ -73,3 +73,24 @@ f263068a29b1767c6497391917c4ed9c0d97dffb:src/main/resources/application-local.ym
 # are in source; the actual key material is never hardcoded or exposed.
 e318c1acca039d57e3506f858037d0de30ae7782:src/test/java/com/beautica/config/FirebaseLocalProfileContextTest.java:private-key:50
 e318c1acca039d57e3506f858037d0de30ae7782:src/test/java/com/beautica/config/FirebaseConfigTest.java:private-key:210
+
+# Phase 364 (reviewed 2026-10-13): the PEM header/footer strings wrap an RSA
+# key generated at test runtime by KeyPairGenerator for a throwaway Firebase
+# service-account JSON. No key material is committed.
+f6b6062a6fb02e3c52c1562b00abf7c16b3591ae:src/test/java/com/beautica/config/OutboundTimeoutsBindingTest.java:private-key:54
+
+# Phase 365 (reviewed 2026-10-13): hand-typed dummy DB password in a
+# test that boots an empty Spring context. No database is contacted, and the
+# value is used only to check that it never appears in startup error text.
+# (Literal deliberately not reproduced here.)
+56d7979253bf7a08bab70e368a42d66814ea8d4b:src/test/java/com/beautica/config/DatabaseUrlNormalizerBootStartupTest.java:generic-api-key:25
+
+# --- Squash-release duplicates (added 2026-10-16) --------------------------
+# The same reviewed fixtures as the entries above (same file, rule and line),
+# re-reported under main's squash-merge commits f7d5cf62 / 02c2a6e7. They entered
+# the scanned range when main was merged into dev (-s ours, PR #153). No new
+# content: generated-key PEM header literals and a fixture DB URL.
+f7d5cf62c55b7a08ba8d71679777365aeec1a047:src/test/java/com/beautica/config/DatabaseUrlNormalizerBootStartupTest.java:generic-api-key:25
+f7d5cf62c55b7a08ba8d71679777365aeec1a047:src/test/java/com/beautica/config/OutboundTimeoutsBindingTest.java:private-key:54
+02c2a6e724ca6cd9950d1153f7c017fe5e265960:src/test/java/com/beautica/config/FirebaseLocalProfileContextTest.java:private-key:50
+02c2a6e724ca6cd9950d1153f7c017fe5e265960:src/test/java/com/beautica/config/FirebaseConfigTest.java:private-key:210

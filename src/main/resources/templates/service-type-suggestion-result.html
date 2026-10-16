@@ -12,6 +12,9 @@
           th:text="${heading}">Готово</h1>
       <p style="color:#3D2B1A;font-size:15px;line-height:1.7;margin:0;"
          th:text="${message}">Дію виконано.</p>
+      <p th:if="${reason != null}"
+         style="color:#3D2B1A;font-size:14px;line-height:1.6;margin:12px 0 0;"
+         th:text="${'Причина: ' + reason}">Причина</p>
     </div>
   </div>
 </body>

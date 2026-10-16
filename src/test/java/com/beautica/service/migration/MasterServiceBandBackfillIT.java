@@ -1,5 +1,6 @@
 package com.beautica.service.migration;
 
+import com.beautica.TestPostgresImage;
 import org.flywaydb.core.Flyway;
 import org.flywaydb.core.api.MigrationVersion;
 import org.junit.jupiter.api.AfterAll;
@@ -56,7 +57,7 @@ class MasterServiceBandBackfillIT {
 
     @BeforeAll
     static void migrateToV164SeedLegacyRowsThenMigrateToHead() {
-        postgres = new PostgreSQLContainer<>("postgres:16-alpine");
+        postgres = new PostgreSQLContainer<>(TestPostgresImage.IMAGE);
         postgres.start();
         dataSource = new DriverManagerDataSource(
                 postgres.getJdbcUrl(), postgres.getUsername(), postgres.getPassword());

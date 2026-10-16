@@ -1,15 +1,26 @@
 package com.beautica.config;
 
+import com.beautica.notification.sms.CapturingOtpSmsSender;
+import com.beautica.notification.sms.CapturingSmsSender;
+import com.beautica.notification.sms.CapturingSmsService;
 import com.beautica.notification.sms.NoOpSmsService;
 import com.beautica.notification.sms.OtpSmsSender;
 import com.beautica.notification.sms.SmsService;
 import com.beautica.notification.sms.TurbosmsOtpSmsSender;
 import com.beautica.notification.sms.TurbosmsService;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.mail.javamail.JavaMailSender;
 import org.springframework.web.client.RestClient;
+
+import java.lang.annotation.Documented;
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
+import java.lang.annotation.Target;
 
 /**
  * Selects the {@link SmsService} implementation from the single money gate
@@ -60,10 +71,42 @@ import org.springframework.web.client.RestClient;
  * {@code SmsFeatureGateTest}; an earlier version of this Javadoc claimed only the exact lowercase
  * literals were understood, which would have let an operator enable spend believing they had not.
  * {@code application.yml} declares the literal default for exactly this reason.
+ *
+ * <h2>Second axis: {@code beautica.sms.mode} (Phase 368)</h2>
+ * The money gate above decides <em>whether</em> booking SMS is sent; {@code beautica.sms.mode}
+ * ({@link SmsMode}) decides <em>where</em> it goes. {@code turbosms} (default, also when absent) keeps
+ * every bean above exactly as before. {@code capture} (staging only — {@code EnvironmentFingerprintGuard}
+ * rejects it elsewhere) swaps the transport for {@link CapturingSmsSender}, which mails the text to a
+ * Mailpit inbox. Resolution matrix, booking {@link SmsService}:
+ * <table>
+ *   <caption>SmsService resolution</caption>
+ *   <tr><th>enabled</th><th>mode</th><th>bean</th></tr>
+ *   <tr><td>false / absent</td><td>any</td><td>{@link NoOpSmsService}</td></tr>
+ *   <tr><td>true</td><td>turbosms / absent</td><td>{@link TurbosmsService}</td></tr>
+ *   <tr><td>true</td><td>capture</td><td>{@link CapturingSmsService}</td></tr>
+ * </table>
+ * and the (ungated) {@link OtpSmsSender}: {@code turbosms} → {@link TurbosmsOtpSmsSender}, {@code capture}
+ * → {@link CapturingOtpSmsSender}. Exactly one bean of each type in every cell.
  */
 @Slf4j
 @Configuration
 public class SmsConfig {
+
+    /** Active only for {@code beautica.sms.mode=turbosms}, or when the property is absent. */
+    @Target(ElementType.METHOD)
+    @Retention(RetentionPolicy.RUNTIME)
+    @Documented
+    @ConditionalOnProperty(prefix = "beautica.sms", name = "mode", havingValue = "turbosms", matchIfMissing = true)
+    @interface OnTurbosmsMode {
+    }
+
+    /** Active only for {@code beautica.sms.mode=capture}. */
+    @Target(ElementType.METHOD)
+    @Retention(RetentionPolicy.RUNTIME)
+    @Documented
+    @ConditionalOnProperty(prefix = "beautica.sms", name = "mode", havingValue = "capture")
+    @interface OnCaptureMode {
+    }
 
     /**
      * The real Turbosms adapter — registered only when the gate is explicitly on.
@@ -79,12 +122,38 @@ public class SmsConfig {
      * @param properties        Turbosms endpoint, sender name and Bearer token
      */
     @Bean
+    @OnTurbosmsMode
     @ConditionalOnProperty(prefix = "app.booking.sms", name = "enabled", havingValue = "true")
     public SmsService turbosmsService(RestClient.Builder restClientBuilder,
                                       TurbosmsProperties properties) {
         log.info("Booking SMS is ENABLED (app.booking.sms.enabled=true) — "
                 + "registering TurbosmsService; outbound messages will be billed");
         return new TurbosmsService(restClientBuilder, properties);
+    }
+
+    /**
+     * Staging booking SMS: gate on AND {@code beautica.sms.mode=capture} — the text is mailed to
+     * Mailpit, never to Turbosms. See the class Javadoc matrix.
+     */
+    @Bean
+    @OnCaptureMode
+    @ConditionalOnProperty(prefix = "app.booking.sms", name = "enabled", havingValue = "true")
+    public SmsService capturingSmsService(CapturingSmsSender capturingSmsSender) {
+        log.warn("Booking SMS is ENABLED in CAPTURE mode (beautica.sms.mode=capture) — "
+                + "messages are mailed to the capture inbox, nothing reaches Turbosms");
+        return new CapturingSmsService(capturingSmsSender);
+    }
+
+    /**
+     * The shared capture transport. Not an {@link SmsService}/{@link OtpSmsSender}, so it cannot disturb
+     * either exactly-one invariant. {@code JavaMailSender} is Boot's auto-configured bean (Mailpit in staging).
+     */
+    @Bean
+    @OnCaptureMode
+    public CapturingSmsSender capturingSmsSender(
+            JavaMailSender mailSender,
+            @Value("${app.invite.from-email:noreply@beautica.app}") String fromAddress) {
+        return new CapturingSmsSender(mailSender, fromAddress);
     }
 
     /**
@@ -119,8 +188,20 @@ public class SmsConfig {
      * exactly-one-{@link SmsService} invariant the two methods above rely on.
      */
     @Bean
+    @OnTurbosmsMode
     public OtpSmsSender otpSmsSender(RestClient.Builder restClientBuilder,
                                      TurbosmsProperties properties) {
         return new TurbosmsOtpSmsSender(new TurbosmsService(restClientBuilder, properties));
+    }
+
+    /**
+     * The auth-channel sender in {@code capture} mode: same unconditional-on-the-money-gate carve-out as
+     * {@link #otpSmsSender}, but the OTP SMS is mailed to Mailpit. Distinct method name; exactly one
+     * OtpSmsSender bean exists per mode; {@code PhoneOtpService} is unchanged.
+     */
+    @Bean
+    @OnCaptureMode
+    public OtpSmsSender capturingOtpSmsSender(CapturingSmsSender capturingSmsSender) {
+        return new CapturingOtpSmsSender(capturingSmsSender);
     }
 }

@@ -49,6 +49,10 @@ import java.util.UUID;
                 // V159 (phase 295 audit MEDIUM-6). Same ON DELETE SET NULL RI-trigger rationale as
                 // PlatformCategory's index of the same name shape.
                 @Index(name = "idx_service_type_suggestion_requested_by", columnList = "requested_by_user_id")
+                // NOT mirrored here: V197's partial UNIQUE ux_service_type_suggestion_pending_dedup
+                // ON (category_name, lower(suggested_name)) WHERE status = 'PENDING'. JPA @Index can
+                // express neither an expression column nor a WHERE predicate, and an
+                // @Index(unique = true) on the raw columns would claim a stricter, wrong constraint.
         }
 )
 // @DynamicInsert: created_at is populated by the DB DEFAULT NOW() (see V76). Without
@@ -92,6 +96,10 @@ public class ServiceTypeSuggestion {
 
     @Column(name = "decided_at")
     private OffsetDateTime decidedAt;
+
+    /** Optional admin reason typed on the reject form (V196, max 300). Never logged. */
+    @Column(name = "decision_reason", length = 300)
+    private String decisionReason;
 
     @Column(name = "created_at", nullable = false, updatable = false)
     private OffsetDateTime createdAt;
@@ -149,8 +157,14 @@ public class ServiceTypeSuggestion {
      * Caller guarantees the current status is PENDING.
      */
     public void reject(OffsetDateTime decidedAt) {
+        reject(decidedAt, null);
+    }
+
+    /** Rejects with an optional, already-validated reason (null when none was given). */
+    public void reject(OffsetDateTime decidedAt, String reason) {
         this.status = ServiceTypeSuggestionStatus.REJECTED;
         this.decidedAt = decidedAt;
+        this.decisionReason = reason;
         clearToken();
     }
 

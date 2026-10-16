@@ -51,11 +51,13 @@ public class ServiceTypeSuggestionReviewController {
     // The single-use token rides in the URL (query param on every route here). These
     // headers are the effective control against residual URL exposure: no-store stops
     // any intermediary proxy or browser cache from retaining the token-bearing response,
-    // and no-referrer stops a later cross-origin navigation from leaking the token via
+    // and same-origin stops a later cross-origin navigation from leaking the token via
     // the Referer header.
     private static final String CACHE_CONTROL_NO_STORE = "no-store, no-cache, must-revalidate";
     private static final String REFERRER_POLICY_HEADER = "Referrer-Policy";
-    private static final String REFERRER_POLICY_NO_REFERRER = "no-referrer";
+    // same-origin (not no-referrer): a no-referrer page makes browsers send `Origin: null` on its own
+    // form POST, which the scoped CORS entry for these routes (SecurityConfig) must never admit.
+    private static final String REFERRER_POLICY_SAME_ORIGIN = "same-origin";
 
     private final ServiceTypeSuggestionService suggestionService;
 
@@ -67,7 +69,7 @@ public class ServiceTypeSuggestionReviewController {
     @ModelAttribute
     void applyTokenPageSecurityHeaders(HttpServletResponse response) {
         response.setHeader(HttpHeaders.CACHE_CONTROL, CACHE_CONTROL_NO_STORE);
-        response.setHeader(REFERRER_POLICY_HEADER, REFERRER_POLICY_NO_REFERRER);
+        response.setHeader(REFERRER_POLICY_HEADER, REFERRER_POLICY_SAME_ORIGIN);
     }
 
     @GetMapping("/review")
@@ -98,8 +100,21 @@ public class ServiceTypeSuggestionReviewController {
     public String reject(
             @RequestParam("token") @NotBlank @Size(max = MAX_TOKEN_LENGTH)
             @Pattern(regexp = TOKEN_PATTERN) String token,
+            @RequestParam(value = "reason", required = false) String reason,
             Model model) {
-        return renderDecision(suggestionService.reject(token), model);
+        DecisionReason.Parsed parsed = DecisionReason.parse(reason);
+        if (parsed.tooLong()) {
+            // Over-long reason: no decision is made; same neutral page as any unusable submission.
+            return neutralStatus(model);
+        }
+        String cleaned = parsed.value();
+        DecisionOutcome outcome = suggestionService.reject(token, cleaned);
+        String view = renderDecision(outcome, model);
+        if (outcome == DecisionOutcome.REJECTED && cleaned != null) {
+            // Echoed back to the admin as confirmation; escaped by th:text in the result template.
+            model.addAttribute("reason", cleaned);
+        }
+        return view;
     }
 
     private String renderDecision(DecisionOutcome outcome, Model model) {

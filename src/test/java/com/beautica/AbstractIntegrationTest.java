@@ -107,6 +107,8 @@ public abstract class AbstractIntegrationTest {
         // kept here with the other side tables so a fresh DB is left for the next test.
         jdbcTemplate.execute("DELETE FROM phone_otps");
         jdbcTemplate.execute("DELETE FROM users");
+        // Phase 368 (V195): singleton environment stamp; no FK. Only staging/prod boots write it.
+        jdbcTemplate.execute("DELETE FROM deployment_environment");
 
         cacheManager.getCacheNames().forEach(name -> {
             var cache = cacheManager.getCache(name);
@@ -224,7 +226,7 @@ public abstract class AbstractIntegrationTest {
     }
 
     private static final PostgreSQLContainer<?> POSTGRES =
-            new PostgreSQLContainer<>("postgres:16-alpine")
+            new PostgreSQLContainer<>(TestPostgresImage.IMAGE)
                     // Every cached Spring context holds its own Hikari pool; the default
                     // max_connections=100 is exhausted on CI ("too many clients already").
                     .withCommand("postgres", "-c", "max_connections=300");

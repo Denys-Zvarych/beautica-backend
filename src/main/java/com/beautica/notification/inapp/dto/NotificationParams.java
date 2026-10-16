@@ -36,6 +36,12 @@ import java.time.Instant;
  * @param subjectName      {@code INVITE_ACCEPTED} only — the new teammate's display name.
  * @param subjectRole      {@code INVITE_ACCEPTED} only — {@code SALON_ADMIN} or
  *                          {@code SALON_MASTER}.
+ * @param categoryName     phase 372, {@code CATEGORY_REQUEST_*} and {@code SERVICE_TYPE_SUGGESTION_*}
+ *                         only — the category's display name. Null otherwise.
+ * @param decisionReason   phase 372, {@code *_REJECTED} only — the optional reason the platform admin
+ *                         typed. Null on every approve, on a reject without a reason, and on every
+ *                         other type. For suggestion items {@code serviceName} carries the suggested
+ *                         service-type name.
  */
 public record NotificationParams(
         @Schema(types = {"string", "null"}, nullable = true) String counterpartName,
@@ -45,6 +51,16 @@ public record NotificationParams(
         @Schema(types = {"string", "null"}, nullable = true) String salonName,
         @Schema(types = {"string", "null"}, nullable = true) String masterName,
         @Schema(types = {"string", "null"}, nullable = true) String subjectName,
-        @Schema(types = {"string", "null"}, nullable = true) Role subjectRole
+        @Schema(types = {"string", "null"}, nullable = true) Role subjectRole,
+        @Schema(types = {"string", "null"}, nullable = true) String categoryName,
+        @Schema(types = {"string", "null"}, nullable = true) String decisionReason
 ) {
+
+    /** Pre-phase-372 shape: every booking/invite item, with no request-decision fields. */
+    public NotificationParams(
+            String counterpartName, String serviceName, int serviceCount, Instant startsAt,
+            String salonName, String masterName, String subjectName, Role subjectRole) {
+        this(counterpartName, serviceName, serviceCount, startsAt, salonName, masterName,
+                subjectName, subjectRole, null, null);
+    }
 }

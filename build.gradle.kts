@@ -25,6 +25,11 @@ repositories {
     mavenCentral()
 }
 
+// Override Boot 3.4.5's managed Flyway 10.20.1 (supports PostgreSQL <= 17; we pin PG 18 everywhere,
+// so every boot logged "PostgreSQL 18.x is newer than this version of Flyway"). 11.20.3 is the
+// newest 11.x on Maven Central; Boot dependency management is kept.
+extra["flyway.version"] = "11.20.3"
+
 // Override Spring Boot BOM's Testcontainers 1.19.8 with 1.20.4.
 // Reason: docker-java 3.3.6 (TC 1.19.8) negotiates Docker API version 1.32,
 // which Docker Engine 25+ rejects (minimum supported is 1.40).
@@ -82,6 +87,10 @@ dependencies {
 
     // Observability
     implementation("org.springframework.boot:spring-boot-starter-actuator")
+    // Phase 371: Sentry error reporting (EU region). No Sentry Gradle plugin: source-context upload would
+    // need an auth token in Railway's build, and JVM stack traces are unobfuscated.
+    implementation("io.sentry:sentry-spring-boot-starter-jakarta:8.60.0")
+    implementation("io.sentry:sentry-logback:8.60.0")
 
     // Dev tooling — local-only automatic restart on recompile.
     // 'developmentOnly' is excluded from the repackaged bootJar by the Spring Boot
@@ -125,7 +134,12 @@ tasks.named<Jar>("jar") {
 }
 
 tasks.withType<Test> {
-    useJUnitPlatform()
+    // Phase 366: DbBackupRoundTripIT builds the ops/db-backup image and pulls three more, so it is tagged
+    // `db-backup-image`, kept out of every default/sharded run, and run alone by its own CI job with
+    // `-PdbBackupIt`. The selector drops the same tag from its lists (SelectorRules.SEPARATE_JOB_TAGS).
+    useJUnitPlatform {
+        if (project.hasProperty("dbBackupIt")) includeTags("db-backup-image") else excludeTags("db-backup-image")
+    }
     // Docker Engine 25+ requires minimum API version 1.40.
     // Testcontainers 1.20.x ships a shaded docker-java that hardcodes VERSION_1_32 in
     // DockerClientProviderStrategy.getDockerClient() unless "api.version" is set in the

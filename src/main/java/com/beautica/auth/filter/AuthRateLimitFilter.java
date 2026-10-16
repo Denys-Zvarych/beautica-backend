@@ -6,6 +6,7 @@ import com.github.benmanes.caffeine.cache.LoadingCache;
 import io.github.bucket4j.Bandwidth;
 import io.github.bucket4j.BandwidthBuilder;
 import io.github.bucket4j.Bucket;
+import io.github.bucket4j.ConsumptionProbe;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
@@ -242,6 +243,23 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     }
 
     private static final int RETRY_AFTER_SECONDS = 60;
+    // review-decision bucket window is 60 minutes — Retry-After reflects the window.
+    private static final int REVIEW_DECISION_RETRY_AFTER_SECONDS = 3600;
+    // The four token-authenticated, permitAll admin review POSTs (SecurityConfig#REVIEW_POST_PATHS).
+    // A garbage token is a cheap no-op but still hits the DB, so they share ONE per-IP bucket
+    // (reviewDecisionBuckets); capacity: RateLimitConfig#reviewDecisionCapacity.
+    private static final java.util.Set<String> REVIEW_DECISION_PATHS = java.util.Set.of(
+            "/api/v1/service-categories/requests/approve",
+            "/api/v1/service-categories/requests/reject",
+            "/api/v1/service-types/suggestions/approve",
+            "/api/v1/service-types/suggestions/reject");
+    // The two token-bearing admin review GET pages (CategoryRequestReviewController, token as trailing
+    // path segment; ServiceTypeSuggestionReviewController, exact path + ?token=). A garbage token
+    // still hits the DB via loadForReview. Charged to a SIBLING per-IP bucket (reviewPageBuckets) so
+    // opening the page plus Approve never exhausts the POST bucket. Window is 60 minutes.
+    private static final int REVIEW_PAGE_RETRY_AFTER_SECONDS = 3600;
+    private static final String CATEGORY_REVIEW_PAGE_PATH_PREFIX = "/api/v1/service-categories/requests/review/";
+    private static final String SUGGESTION_REVIEW_PAGE_PATH = "/api/v1/service-types/suggestions/review";
     // category-request bucket window is 60 minutes — Retry-After reflects the window.
     private static final int CATEGORY_REQUEST_RETRY_AFTER_SECONDS = 3600;
     // suggest-service-type bucket window is 60 minutes — Retry-After reflects the window.
@@ -676,6 +694,14 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // realistic bulk-reshuffle usage and CI test isolation).
     private final LoadingCache<String, Bucket> rotateStaffBuckets;
 
+    // Per-IP bucket shared by the four admin review-decision POSTs. Injected from
+    // RateLimitConfig#reviewDecisionBuckets (app.rate-limit.review-decision-capacity).
+    private final LoadingCache<String, Bucket> reviewDecisionBuckets;
+
+    // Sibling per-IP bucket for the two admin review GET pages. Injected from
+    // RateLimitConfig#reviewPageBuckets (app.rate-limit.review-page-capacity).
+    private final LoadingCache<String, Bucket> reviewPageBuckets;
+
     public AuthRateLimitFilter(
             @Qualifier("registerBuckets") LoadingCache<String, Bucket> registerBuckets,
             @Qualifier("loginBuckets") LoadingCache<String, Bucket> loginBuckets,
@@ -699,7 +725,9 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             @Qualifier("inviteValidateBuckets") LoadingCache<String, Bucket> inviteValidateBuckets,
             @Qualifier("inviteAcceptBuckets") LoadingCache<String, Bucket> inviteAcceptBuckets,
             @Qualifier("catalogueBrowseBuckets") LoadingCache<String, Bucket> catalogueBrowseBuckets,
-            @Qualifier("inviteBuckets") LoadingCache<String, Bucket> inviteBuckets) {
+            @Qualifier("inviteBuckets") LoadingCache<String, Bucket> inviteBuckets,
+            @Qualifier("reviewDecisionBuckets") LoadingCache<String, Bucket> reviewDecisionBuckets,
+            @Qualifier("reviewPageBuckets") LoadingCache<String, Bucket> reviewPageBuckets) {
         this.registerBuckets = registerBuckets;
         this.loginBuckets = loginBuckets;
         this.refreshBuckets = refreshBuckets;
@@ -723,6 +751,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         this.inviteAcceptBuckets = inviteAcceptBuckets;
         this.catalogueBrowseBuckets = catalogueBrowseBuckets;
         this.inviteBuckets = inviteBuckets;
+        this.reviewDecisionBuckets = reviewDecisionBuckets;
+        this.reviewPageBuckets = reviewPageBuckets;
         this.otpVerifyBuckets = Caffeine.newBuilder()
                 .maximumSize(100_000)
                 .expireAfterAccess(OTP_VERIFY_WINDOW.plusMinutes(5))
@@ -1026,7 +1056,7 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         // client booking calendar's reads and share slotsBuckets (default 60 / 60 s per IP; a user
         // paging months + tapping days makes a handful of requests per minute, nowhere near the cap).
         // See MASTER_AVAILABILITY_PATH_PREFIX for why /working-days must be throttled.
-        if (HttpMethod.GET.matches(method)
+        if (isGetOrHead(method)
                 && path.startsWith(MASTER_AVAILABILITY_PATH_PREFIX)
                 && (path.endsWith(SLOTS_PATH_SUFFIX) || path.endsWith(WORKING_DAYS_PATH_SUFFIX))) {
             applyRateLimit(request, response, filterChain, slotsBuckets, RETRY_AFTER_SECONDS);
@@ -1044,7 +1074,7 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         // SlotCalculationService oracle at zero auth cost. Cap: 60 / 60 s per IP, deliberately the same
         // budget as slotsBuckets (see GUEST_AVAILABILITY_CAPACITY for the sizing and for why it does not
         // throttle a guest tapping through dates).
-        if (HttpMethod.GET.matches(method)
+        if (isGetOrHead(method)
                 && path.startsWith(GUEST_BOOKING_PATH_PREFIX)
                 && path.endsWith(GUEST_AVAILABILITY_PATH_SUFFIX)) {
             applyRateLimit(request, response, filterChain, guestAvailabilityBuckets, RETRY_AFTER_SECONDS);
@@ -1060,7 +1090,7 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         // why it is a separate budget from searchBuckets.
         // FALSIFY: move this branch after the SEARCH_PATH_PREFIX branch below and
         // SearchSuggestionsGetRateLimitRegressionTest's carve-out test must go red.
-        if (HttpMethod.GET.matches(method)
+        if (isGetOrHead(method)
                 && path.equals(SEARCH_SUGGESTIONS_PATH)) {
             applyRateLimit(request, response, filterChain, searchSuggestionBuckets, RETRY_AFTER_SECONDS);
             return;
@@ -1075,7 +1105,7 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         // by design. GET /api/v1/search/suggestions is deliberately carved OUT of this prefix by
         // the branch above: it is typing traffic, not a result-page read, and must not compete
         // with it for the same 240-token budget (Phase 331).
-        if (HttpMethod.GET.matches(method)
+        if (isGetOrHead(method)
                 && path.startsWith(SEARCH_PATH_PREFIX)) {
             applyRateLimit(request, response, filterChain, searchBuckets, RETRY_AFTER_SECONDS,
                     searchTokenCost(request));
@@ -1088,7 +1118,7 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         // input, so request volume reaches the database instead of a static cache. Cap:
         // 240 / 60 s per IP, one token per request (see SETTLEMENT_SEARCH_CAPACITY for why it
         // matches /search/**'s cap and why it is nevertheless a SEPARATE bucket).
-        if (HttpMethod.GET.matches(method)
+        if (isGetOrHead(method)
                 && path.equals(SETTLEMENT_SEARCH_PATH)) {
             applyRateLimit(request, response, filterChain, settlementSearchBuckets,
                     RETRY_AFTER_SECONDS);
@@ -1141,7 +1171,7 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         // per-IP bucket (key handed over via CATALOGUE_BROWSE_DEFERRED_IP_KEY_ATTRIBUTE) when it
         // did not — so a forged bearer cannot be used to skip throttling. Anonymous callers are
         // charged here exactly as before.
-        if (HttpMethod.GET.matches(method)
+        if (isGetOrHead(method)
                 && (isSalonCatalogueServicesPath(path)
                         || (path.startsWith(MASTER_AVAILABILITY_PATH_PREFIX)
                                 && path.endsWith(MASTER_SERVICES_PATH_SUFFIX))
@@ -1295,8 +1325,22 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         // with NO throttle at all (backlog LOW finding). This does NOT widen the bypass itself —
         // every other GET in the app still falls through unmatched, exactly as before; this rule
         // can only ever match the one literal path. See INVITE_VALIDATE_CAPACITY for sizing.
-        if (HttpMethod.GET.matches(method) && INVITE_VALIDATE_PATH.equals(path)) {
+        if (isGetOrHead(method) && INVITE_VALIDATE_PATH.equals(path)) {
             applyRateLimit(request, response, filterChain, inviteValidateBuckets, RETRY_AFTER_SECONDS);
+            return;
+        }
+
+        // Admin review-page rate-limit: GET /api/v1/service-categories/requests/review/{token} and
+        // GET /api/v1/service-types/suggestions/review — both permitAll, token-in-URL, and both hit the
+        // DB on a garbage token (loadForReview). Matched on the normalised path (encoded variants
+        // collapse), checked before the unconditional non-POST bypass below, and charged to the
+        // sibling reviewPageBuckets so it never drains the POST reviewDecisionBuckets.
+        // HEAD is routed by Spring to the @GetMapping handler, so it must be throttled identically.
+        if (isGetOrHead(method)
+                && (path.startsWith(CATEGORY_REVIEW_PAGE_PATH_PREFIX)
+                    || SUGGESTION_REVIEW_PAGE_PATH.equals(path))) {
+            applyRateLimit(request, response, filterChain, reviewPageBuckets,
+                    REVIEW_PAGE_RETRY_AFTER_SECONDS);
             return;
         }
 
@@ -1339,6 +1383,9 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             retryAfterSeconds = INVITE_ACCEPT_RETRY_AFTER_SECONDS;
         } else if (LOGOUT_PATH.equals(path)) {
             cache = logoutBuckets;
+        } else if (REVIEW_DECISION_PATHS.contains(path)) {
+            cache = reviewDecisionBuckets;
+            retryAfterSeconds = REVIEW_DECISION_RETRY_AFTER_SECONDS;
         } else if (CATEGORY_REQUEST_PATH.equals(path)) {
             cache = categoryRequestBuckets;
             retryAfterSeconds = CATEGORY_REQUEST_RETRY_AFTER_SECONDS;
@@ -1449,6 +1496,11 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         return isUuidPathVariable(segment);
     }
 
+    /** Spring routes HEAD to @GetMapping handlers, so HEAD must be throttled exactly like GET. */
+    private static boolean isGetOrHead(String method) {
+        return HttpMethod.GET.matches(method) || HttpMethod.HEAD.matches(method);
+    }
+
     private static boolean isUuidPathVariable(String segment) {
         if (!StringUtils.hasText(segment)) {
             return false;
@@ -1498,11 +1550,26 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                                 long tokens) throws ServletException, IOException {
         Bucket bucket = cache.get(resolveBucketKey(request));
 
-        if (bucket.tryConsume(tokens)) {
+        // Retry-After is the bucket's REAL time-to-refill for the requested tokens (rounded up,
+        // minimum 1 s), not the window length: a bucket that refills in 20 s must not tell the
+        // client to wait the full window. retryAfterSeconds is only a defensive fallback.
+        ConsumptionProbe probe = bucket.tryConsumeAndReturnRemaining(tokens);
+        if (probe.isConsumed()) {
             filterChain.doFilter(request, response);
         } else {
-            writeTooManyRequests(response, retryAfterSeconds);
+            writeTooManyRequests(response, computeRetryAfterSeconds(probe, retryAfterSeconds));
         }
+    }
+
+    static int computeRetryAfterSeconds(ConsumptionProbe probe, int fallbackSeconds) {
+        long nanos = probe.getNanosToWaitForRefill();
+        // Bucket4j reports Long.MAX_VALUE for "never refills"; guard before any arithmetic (overflow).
+        if (nanos <= 0 || nanos == Long.MAX_VALUE) {
+            return fallbackSeconds;
+        }
+        long seconds = nanos / 1_000_000_000L + (nanos % 1_000_000_000L == 0 ? 0 : 1);
+        long cap = Math.max(fallbackSeconds, 86_400L);
+        return (int) Math.min(Math.max(seconds, 1L), cap);
     }
 
     private static void writeTooManyRequests(HttpServletResponse response, int retryAfterSeconds)

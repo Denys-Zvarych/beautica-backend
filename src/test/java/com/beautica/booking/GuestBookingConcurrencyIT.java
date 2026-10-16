@@ -1,5 +1,6 @@
 package com.beautica.booking;
 
+import com.beautica.TestPostgresImage;
 import com.beautica.support.TestHttpClients;
 import com.beautica.auth.phoneotp.GuestTokenProvider;
 import com.beautica.booking.repository.BookingRepository;
@@ -54,7 +55,7 @@ class GuestBookingConcurrencyIT {
     private static final int THREAD_COUNT = 2;
 
     private static final PostgreSQLContainer<?> POSTGRES =
-            new PostgreSQLContainer<>("postgres:16-alpine");
+            new PostgreSQLContainer<>(TestPostgresImage.IMAGE);
 
     static {
         POSTGRES.start();

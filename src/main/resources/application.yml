@@ -10,7 +10,7 @@ spring:
       max-lifetime: 1200000
       idle-timeout: 300000
       minimum-idle: 2              # Low startup footprint on Railway 512MB; pool grows on demand
-      maximum-pool-size: 10        # Neon free tier hard ceiling — do not raise without a plan upgrade
+      maximum-pool-size: 10        # App container (512MB, -Xmx256m); Flyway pool 2 + headroom; max_connections default 100, confirm in M7. No pooler: if a transaction-mode pooler is ever added, revisit server-side prepares (prepareThreshold).
       connection-timeout: 20000    # Fail faster under pool saturation; 30s was masking exhaustion (was 30000)
       leak-detection-threshold: 10000  # Alert on connections held > 10 s — indicates a blocking or long-running query
       # Server-side ceiling on EVERY application statement — the backstop this pool never had.
@@ -92,6 +92,7 @@ spring:
           auth: true
           starttls:
             enable: true
+          # pinned by MailTimeoutConfigTest — 0/absent = infinite hang
           connectiontimeout: 5000
           timeout: 10000
           writetimeout: 10000
@@ -99,9 +100,11 @@ spring:
 server:
   port: 8080
   # forward-headers-strategy is intentionally omitted (defaults to 'none').
-  # Setting it to 'native' would cause Spring's ForwardedHeaderFilter to strip
-  # X-Forwarded-For before AuthRateLimitFilter runs, making IP-based rate limiting
-  # ineffective. The raw XFF header is read directly by AuthRateLimitFilter.
+  # Setting it to 'framework' (ForwardedHeaderFilter) would strip X-Forwarded-For before
+  # AuthRateLimitFilter runs, and 'native' (Tomcat RemoteIpValve) rewrites remoteAddr from it,
+  # either of which makes IP-based rate limiting ineffective. The raw XFF header is read
+  # directly by AuthRateLimitFilter. Consequence: behind the TLS proxy the app sees http, so the
+  # same-origin admin review POSTs get a scoped CORS entry in SecurityConfig.
   compression:
     # Gzip responses at the Tomcat layer. Deliberately set HERE (shared config), not per
     # profile: it is transport-level and profile-independent, and a prod-only value is how
@@ -226,6 +229,47 @@ springdoc:
     path: /swagger-ui.html
     enabled: false
 
+beautica:
+  # Deploy-environment identity (Phase 368). Each profile pins its own value (prod yml: prod,
+  # staging yml: staging, local yml: local); EnvironmentFingerprintGuard cross-checks it against
+  # Railway's injected environment name and the resource names. Default `local` = guard skipped.
+  environment: local
+  sms:
+    # turbosms (default) | capture. capture mails every SMS to a Mailpit inbox instead of the
+    # provider (staging only; the fingerprint guard rejects it in prod).
+    mode: turbosms
+  db:
+    # PostgreSQL major the app expects (prod Railway postgres-ssl:18, CI and local postgres:18-alpine).
+    # DatabaseServerVersionLogger WARNs on mismatch; it never fails boot.
+    expected-major: 18
+
+# Phase 371 (D3): Sentry error reporting, EU region. OFF here (base, local, test); application-prod.yml
+# (so also prod,staging) turns it on and binds sentry.dsn. No sentry.dsn here on purpose: without it the
+# Sentry auto-configuration (and the scrubber/options beans) never load in local or test. SENTRY_DSN comes
+# only from the environment — blank = SDK disabled, app boots normally. Events come from the logback appender (ERROR only); 4xx business exceptions are
+# not ERROR-logged. PII is stripped by common/observability/SentryPiiScrubber; in-app package and ignored
+# exception types live in SentryOptionsConfig (no setter on SentryOptions, so not YAML-bindable).
+# EnvironmentFingerprintGuard enforces the sentry-* rules; never set SENTRY_ENVIRONMENT / SENTRY_ENABLED.
+sentry:
+  enabled: false
+  # Lower-case deployment token; the guard rejects any other value (e.g. a stray SENTRY_ENVIRONMENT).
+  environment: ${beautica.environment}
+  # Railway injects the commit SHA for GitHub deploys.
+  release: beautica-backend@${RAILWAY_GIT_COMMIT_SHA:unknown}
+  send-default-pii: false
+  max-request-body-size: none
+  sample-rate: 1.0
+  # Root-scope breadcrumbs are dropped by the scrubber outside a request; 30 bounds the per-request copy.
+  max-breadcrumbs: 30
+  # Never trace health checks (UptimeRobot polls every 5 min; Railway probes too).
+  ignored-transactions:
+    - ".*/actuator(/.*)?"
+  logs:
+    enabled: false
+  logging:
+    minimum-event-level: error
+    minimum-breadcrumb-level: info
+
 app:
   jwt:
     secret: ${JWT_SECRET}
@@ -244,8 +288,13 @@ app:
     # Endpoint host must end with .r2.cloudflarestorage.com unless this opt-out is true.
     allow-custom-endpoint: ${CLOUDFLARE_R2_ALLOW_CUSTOM_ENDPOINT:false}
     public-url: ${CLOUDFLARE_R2_PUBLIC_URL:}
+    # Outbound HTTP timeouts (Duration). socket-timeout is per-read INACTIVITY, not a total deadline.
+    connection-timeout: 5s
+    socket-timeout: 30s
   firebase:
     service-account: ${FIREBASE_SERVICE_ACCOUNT:}
+    connect-timeout: 5s
+    read-timeout: 10s
   frontend:
     base-url: ${FRONTEND_BASE_URL:http://localhost:3000}
   invite:
@@ -340,6 +389,8 @@ app:
       token: ${TURBOSMS_TOKEN:}
       sender-name: ${TURBOSMS_SENDER_NAME:Beautica}
       base-url: ${TURBOSMS_BASE_URL:https://api.turbosms.ua/message/send.json}
+      connect-timeout: 3s
+      read-timeout: 5s
   json:
     # Global Jackson StreamReadConstraints (see JsonConfig / JsonConstraintsProperties).
     # max-string-length caps a single JSON string token at the PARSE phase so a multi-MB
@@ -424,4 +475,7 @@ app:
     # Generate with: openssl rand -base64 32
     # Empty default forces every profile (incl. test) to provide a value or fail fast at startup.
     payload-key: ${OUTBOX_PAYLOAD_KEY:}
-  internal-api-key: ${INTERNAL_API_KEY:changeme-dev-only}
+  # app.internal-api-key is deliberately NOT defined in the base profile: a base default would
+  # reach prod. It is mapped from INTERNAL_API_KEY in application-prod.yml (staging inherits it;
+  # EnvironmentFingerprintGuard enforces non-blank, non-default, >= 32 chars) and given a dev-only
+  # default in application-local.yml / application-test.yml. Any other profile fails fast on @NotBlank.

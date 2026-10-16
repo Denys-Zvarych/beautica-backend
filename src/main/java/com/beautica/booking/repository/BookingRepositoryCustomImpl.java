@@ -337,7 +337,7 @@ class BookingRepositoryCustomImpl implements BookingRepositoryCustom {
      *
      * <p>This runs on every FULL page (the short-circuit above only spares short ones), so a busy
      * salon refreshing «Записи» was burning ~2800 shared buffers per request against a 10-connection
-     * Neon pool. The change is {@code COUNT} semantics-preserving in both directions: neither
+     * pool. The change is {@code COUNT} semantics-preserving in both directions: neither
      * {@code count(b.id)} nor {@code count(1)} can skip a row, because {@code bookings.id} is the
      * NOT NULL primary key and {@code COUNT(expr)} only skips NULLs. It applies to every
      * {@link #findIdPage} caller — {@code GET /bookings/me}, {@code GET /bookings/salon/&#123;id&#125;}

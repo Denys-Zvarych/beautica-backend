@@ -2,6 +2,7 @@ package com.beautica.booking;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import com.beautica.support.ParityRequestId;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.booking.dto.BookingElapsedResponse;
 import com.beautica.common.ApiResponse;
@@ -521,7 +522,8 @@ class BookingAppointmentChildTransitionGuardIT extends AbstractIntegrationTest {
     }
 
     private ResponseEntity<String> patch(String token, UUID bookingId, String action, String body) {
-        HttpHeaders headers = fixtures.bearerHeaders(token);
+        // Pinned X-Request-Id so error bodies compared for anti-oracle parity differ in nothing (Phase 371 requestId).
+        HttpHeaders headers = ParityRequestId.on(fixtures.bearerHeaders(token));
         headers.setContentType(MediaType.APPLICATION_JSON);
         HttpEntity<String> entity = body == null ? new HttpEntity<>(headers) : new HttpEntity<>(body, headers);
         return restTemplate.exchange(

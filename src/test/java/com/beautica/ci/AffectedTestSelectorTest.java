@@ -287,6 +287,24 @@ class AffectedTestSelectorTest {
         assertThat(result.mode()).isEqualTo(Selection.Mode.NONE);
     }
 
+    @Test
+    void should_selectNone_when_onlyOpsDbBackupChanges() {
+        Selection result = select(bookingTree(), "M\tops/db-backup/backup.sh\nM\tops/db-backup/Dockerfile\nA\tops/db-backup/railway.json\n");
+
+        assertThat(result.mode()).isEqualTo(Selection.Mode.NONE);
+    }
+
+    @Test
+    void should_neverListTest_when_itCarriesASeparateJobTag() {
+        SourceTreeFixture tree = bookingTree()
+            .test("com.beautica.ops.TaggedImageIT", List.of(), "@Tag(\"db-backup-image\")", "")
+            .test("com.beautica.ops.UntaggedOpsIT");
+
+        List<String> all = new AffectedTestSelector(tree.graph(), p -> Optional.empty()).allTestClasses();
+
+        assertThat(all).contains("com.beautica.ops.UntaggedOpsIT").doesNotContain("com.beautica.ops.TaggedImageIT");
+    }
+
     @ParameterizedTest
     @ValueSource(strings = {"foo/bar.txt", "Dockerfile", "scripts/forbid_th_utext_in_email.sh", "src/main/java/com/beautica/x/notes.txt"})
     void should_selectFull_when_pathIsUnknown(String path) {

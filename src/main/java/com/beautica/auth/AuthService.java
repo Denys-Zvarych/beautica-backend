@@ -363,10 +363,10 @@ public class AuthService {
      * Resends a verification OTP to the given email address, subject to a 60-second
      * per-account cooldown.
      *
-     * <p>Lock minimisation: a non-locking {@link UserRepository#findByEmail} read
+     * <p>Lock minimisation: a non-locking column-only {@link UserRepository#findResendVerificationEligibleByEmail} read
      * runs first. Unknown-email and already-verified branches take NO row lock
      * (they short-circuit). The {@code PESSIMISTIC_WRITE} lock is escalated only
-     * on the real write path (user exists, unverified, code present).
+     * on the real write path (user exists, unverified; a stored code is NOT required - an expired/wiped code must be re-issuable).
      *
      * <p>Anti-enumeration: unknown emails, already-verified accounts and locked
      * accounts all return the same success-shaped {@link RegistrationResponse}
@@ -381,11 +381,11 @@ public class AuthService {
     public RegistrationResponse resendVerification(ResendVerificationRequest request) {
         String email = request.email().toLowerCase(Locale.ROOT).strip();
 
-        // Non-locking pre-read — unknown / verified take NO row lock.
-        var preReadOpt = userRepository.findByEmail(email);
-        if (preReadOpt.isEmpty()
-                || preReadOpt.get().isEmailVerified()
-                || preReadOpt.get().getVerificationCodeHash() == null) {
+        // Non-locking, column-only pre-read — unknown / verified / inactive take NO row lock. A scalar
+        // projection (not an entity) on purpose: an entity loaded here would be returned again by
+        // findByEmailForUpdate from the persistence context, hiding a concurrent resend's committed
+        // verificationCodeExpiresAt and skipping the cooldown (two mails).
+        if (!userRepository.findResendVerificationEligibleByEmail(email).orElse(false)) {
             return RegistrationResponse.of(email);
         }
 
@@ -393,7 +393,7 @@ public class AuthService {
         // TOCTOU window between the cooldown read and the OTP write).
         var user = userRepository.findByEmailForUpdate(email)
                 .orElse(null);
-        if (user == null || user.isEmailVerified() || user.getVerificationCodeHash() == null) {
+        if (user == null || user.isEmailVerified() || !user.isActive()) {
             return RegistrationResponse.of(email);
         }
 
@@ -403,7 +403,10 @@ public class AuthService {
             return RegistrationResponse.of(email);
         }
 
-        // Throttle check: derive issuedAt from expiresAt - OTP_TTL.
+        // Throttle check: derive issuedAt from expiresAt - OTP_TTL. A user with NO stored code
+        // (wiped by an expired-code verify attempt or the stale-cleanup job) has no issuedAt and
+        // is NOT throttled: they must be able to get a fresh code, or they are stuck forever
+        // (re-register returns 409). The lock check above still applies to them.
         if (user.getVerificationCodeExpiresAt() != null) {
             Instant issuedAt = user.getVerificationCodeExpiresAt().minus(OTP_TTL);
             Instant nextAllowed = issuedAt.plus(verificationPolicyConfig.resendCooldown());

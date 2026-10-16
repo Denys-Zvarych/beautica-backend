@@ -1,4 +1,15 @@
 # Production profile — all values injected via environment variables (Railway)
+# Deploy-environment identity (Phase 368); the `staging` overlay (prod,staging) overrides it.
+beautica:
+  environment: prod
+
+# Phase 371 (D3): on in prod and staging (prod,staging inherits). A blank SENTRY_DSN keeps the SDK disabled
+# and the banner shows sentry=off. Traces: prod 5% (staging overrides to 20%); no profiling.
+sentry:
+  enabled: true
+  dsn: ${SENTRY_DSN:}
+  traces-sample-rate: 0.05
+
 spring:
   jpa:
     show-sql: false
@@ -17,6 +28,8 @@ logging:
   level:
     root: INFO
     com.beautica: INFO
+    # Hibernate logs sqlException.getMessage() (pgjdbc Detail: row values) with no throwable; PII must not reach logs.
+    org.hibernate.engine.jdbc.spi.SqlExceptionHelper: "OFF"
 
 # Explicitly disable OpenAPI / Swagger in production — base config sets these false,
 # but repeating here prevents a sibling profile from accidentally re-enabling them.
@@ -32,6 +45,12 @@ springdoc:
 # property-resolution time (IllegalArgumentException at startup) instead of silently
 # emitting invite links that point at localhost.
 app:
+  # No dev default (it used to live in the base profile). Empty when INTERNAL_API_KEY is unset, so
+  # EnvironmentFingerprintGuard aborts startup with a clear rule instead of an unresolved-placeholder error.
+  internal-api-key: ${INTERNAL_API_KEY:}
   frontend:
     base-url: ${FRONTEND_BASE_URL}
-
+  # Same fail-closed treatment for the backend's own public origin (admin approval e-mail links).
+  # Base config defaults it to http://localhost:8080; omit the default here so a missing PUBLIC_BASE_URL
+  # fails at property resolution, and EnvironmentFingerprintGuard rejects loopback/non-https values.
+  public-base-url: ${PUBLIC_BASE_URL}

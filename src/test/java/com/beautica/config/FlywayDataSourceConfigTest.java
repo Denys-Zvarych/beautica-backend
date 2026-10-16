@@ -106,7 +106,7 @@ class FlywayDataSourceConfigTest {
                     .as("poolName identifies these connections in logs as Flyway's, not the main pool's")
                     .isEqualTo("flyway-pool");
             assertThat(pool.getIdleTimeout())
-                    .as("idleTimeout keeps the pool from pinning an idle Neon connection for the app lifetime")
+                    .as("idleTimeout keeps the pool from pinning an idle database connection for the app lifetime")
                     .isEqualTo(10_000L);
             assertThat(pool.getMaxLifetime())
                     .as("maxLifetime caps how long the single connection may live")

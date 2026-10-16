@@ -63,6 +63,15 @@ public class ServiceTestFixtures {
         return body.data().accessToken();
     }
 
+    /**
+     * A logged-in SALON_OWNER with one salon, returned as the owner's user id — the shape the category-request
+     * and service-type-suggestion flows need for their {@code requested_by_user_id} FK.
+     */
+    public UUID createSalonOwnerWithSalonAndGetUserId(String email) throws Exception {
+        UUID salonId = createSalon(createSalonOwnerAndGetToken(email), "Requester Salon");
+        return jdbcTemplate.queryForObject("SELECT owner_id FROM salons WHERE id = ?", UUID.class, salonId);
+    }
+
     public UUID createSalon(String ownerToken, String name) throws Exception {
         // Vinnytsia has no urban districts in the official KATOTTH classifier, so
         // no districtId is required — only cityId is mandatory for provider locality.

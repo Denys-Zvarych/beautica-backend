@@ -4,6 +4,8 @@ import com.beautica.auth.TokenGenerator;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.config.PublicBaseUrlProperties;
 import com.beautica.notification.EmailService;
+import com.beautica.notification.inapp.service.InAppNotificationService;
+import com.beautica.search.service.SearchSuggestionCatalogue;
 import com.beautica.service.dto.ApprovedCategoryResponse;
 import com.beautica.service.dto.CategoryRequestResponse;
 import com.beautica.service.dto.CreateCategoryRequestRequest;
@@ -15,6 +17,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.cache.annotation.CacheEvict;
 import org.springframework.cache.annotation.Cacheable;
 import org.springframework.cache.annotation.Caching;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -53,6 +56,9 @@ import java.util.UUID;
 public class CategoryRequestService {
 
     private static final Duration TOKEN_TTL = Duration.ofDays(7);
+    /** V64 {@code UNIQUE(name)} — blocks a second row with the same name in ANY status. */
+    static final String NAME_UNIQUE_CONSTRAINT = "uq_platform_categories_name";
+    static final String DUPLICATE_CATEGORY_MESSAGE_PREFIX = "Category already exists or is pending: ";
     // Token is carried as the trailing PATH SEGMENT (not a query param) so it is not
     // exposed in proxy access logs or leaked via the Referer header of assets loaded
     // on the review page. The base64url token charset (A-Za-z0-9-_) is path-safe.
@@ -70,9 +76,13 @@ public class CategoryRequestService {
     private final PublicBaseUrlProperties publicBaseUrlProperties;
     private final ServiceTypeSuggestionService serviceTypeSuggestionService;
     private final Clock clock;
+    private final InAppNotificationService inAppNotificationService;
 
     @Value("${app.admin-email}")
     private String adminEmail;
+
+    /** SpEL guard: evict only when the decision actually changed state. */
+    private static final String APPROVED_ONLY = "#result.name() == 'APPROVED'";
 
     /**
      * Outcome of a token-bearing review/decision operation. The controller maps it
@@ -104,7 +114,7 @@ public class CategoryRequestService {
         String name = request.name().toUpperCase(Locale.ROOT);
 
         if (platformCategoryRepository.existsByNameIgnoreCaseAndStatusIn(name, BLOCKING_STATUSES)) {
-            throw new BusinessException(HttpStatus.CONFLICT, "Category already exists or is pending: " + name);
+            throw duplicateCategory(name);
         }
 
         String rawToken = tokenGenerator.generateToken();
@@ -114,7 +124,7 @@ public class CategoryRequestService {
         PlatformCategory category = PlatformCategory.ofPendingRequest(
                 name, request.displayName(), requesterId, tokenHash, now, now.plus(TOKEN_TTL),
                 trimToNull(request.initialServiceName()));
-        PlatformCategory saved = platformCategoryRepository.save(category);
+        PlatformCategory saved = insertPending(category);
 
         String reviewUrl = publicBaseUrlProperties.getPublicBaseUrl() + REVIEW_PATH + rawToken;
         emailService.sendCategoryRequestNotification(
@@ -143,44 +153,65 @@ public class CategoryRequestService {
      * Approves the PENDING request identified by the token: APPROVED + active,
      * token cleared (single-use). Idempotent: a second call returns
      * {@link DecisionOutcome#ALREADY_DECIDED} (or INVALID_OR_EXPIRED) — no 500.
+     *
+     * <p>Evicts only when the outcome is {@code APPROVED}: the endpoint is public, so a garbage or
+     * replayed token must not flush the caches.
+     *
+     * <p>The single eviction mechanism is the conditional {@code @CacheEvict} set below. It runs
+     * POST-commit: the caching advisor is outermost ({@code CacheConfig}, {@code @EnableCaching(order =
+     * HIGHEST_PRECEDENCE)}), so it wraps the {@code @Transactional} advisor and evicts only after the
+     * transaction has committed; a rollback (exception) evicts nothing. A reader that began loading
+     * before the commit can still repopulate a stale snapshot; that in-flight load is bounded only by
+     * the cache TTL.
      */
     @Transactional
     @Caching(evict = {
-            @CacheEvict(value = APPROVED_CATEGORIES_CACHE, key = APPROVED_CATEGORIES_KEY),
-            @CacheEvict(value = PlatformCategoryOrderLookup.CACHE_NAME, key = PlatformCategoryOrderLookup.CACHE_KEY)
+            @CacheEvict(value = APPROVED_CATEGORIES_CACHE, key = APPROVED_CATEGORIES_KEY,
+                    condition = APPROVED_ONLY),
+            @CacheEvict(value = PlatformCategoryOrderLookup.CACHE_NAME, key = PlatformCategoryOrderLookup.CACHE_KEY,
+                    condition = APPROVED_ONLY),
+            @CacheEvict(value = SearchSuggestionCatalogue.CACHE_NAME, allEntries = true,
+                    condition = APPROVED_ONLY)
     })
     public DecisionOutcome approve(String rawToken) {
-        return decide(rawToken, true);
+        return decide(rawToken, true, null);
     }
 
     /**
      * Rejects the PENDING request identified by the token: REJECTED, token cleared.
-     * Idempotent (see {@link #approve}).
+     * Idempotent (see {@link #approve}). Evicts nothing: a REJECTED request never appears in any
+     * cached list (they hold APPROVED + active categories only), and a PENDING one does not either.
      */
     @Transactional
-    @Caching(evict = {
-            @CacheEvict(value = APPROVED_CATEGORIES_CACHE, key = APPROVED_CATEGORIES_KEY),
-            @CacheEvict(value = PlatformCategoryOrderLookup.CACHE_NAME, key = PlatformCategoryOrderLookup.CACHE_KEY)
-    })
     public DecisionOutcome reject(String rawToken) {
-        return decide(rawToken, false);
+        return reject(rawToken, null);
+    }
+
+    /**
+     * Rejects with an optional admin reason (already trimmed/sanitised/length-validated by the
+     * controller; null when none). The reason is stored on the request and surfaced to the requester
+     * through the in-app feed; it is never logged.
+     */
+    @Transactional
+    public DecisionOutcome reject(String rawToken, String reason) {
+        return decide(rawToken, false, reason);
     }
 
     /**
      * Approved + active categories for the authenticated mobile picker.
      *
      * <p>Cached under a single global {@code 'all'} key — the list is platform-wide.
-     * Eviction is the inline {@code @CacheEvict} on {@link #approve} / {@link #reject}
-     * (the only paths that change APPROVED/active membership). Inline (pre-commit)
-     * eviction is acceptable here rather than the afterCommit pattern because both
-     * decision paths are extremely low-frequency admin clicks (one per emailed
-     * approval link) with no realistic concurrent reader racing to repopulate a
-     * stale snapshot between eviction and commit; the 60-minute TTL is the backstop.
+     * Eviction is the {@code @CacheEvict} on {@link #approve} and on
+     * {@link InternalCategoryService#create} (the two paths that change
+     * APPROVED/active membership; reject changes no cached data). That eviction is
+     * post-commit (cache advisor outermost, CacheConfig); an in-flight load that started
+     * before the commit is bounded only by the 60-minute TTL, acceptable for a
+     * low-frequency admin click.
      * {@code submitRequest} only inserts PENDING rows (not in this list) so it needs
      * no eviction.
      *
      * <p>The sibling {@link PlatformCategoryOrderLookup#CACHE_NAME} cache is evicted
-     * alongside this one on {@link #approve}/{@link #reject}: it backs {@code
+     * alongside this one on {@link #approve} and {@link InternalCategoryService#create}: it backs {@code
      * ServiceCatalogService#buildCategoryOrderAndNames} with the same {@code findApprovedActive()}
      * query result, kept as a separate cache/bean because it returns entities for internal
      * ordering rather than the {@link ApprovedCategoryResponse} DTO this method exposes.
@@ -193,8 +224,8 @@ public class CategoryRequestService {
                 .toList();
     }
 
-    private DecisionOutcome decide(String rawToken, boolean approve) {
-        Optional<PlatformCategory> match = findByTokenConstantTime(rawToken);
+    private DecisionOutcome decide(String rawToken, boolean approve, String reason) {
+        Optional<PlatformCategory> match = findByTokenConstantTime(rawToken, true);
         if (match.isEmpty()) {
             // Token unknown. The row may already be decided (token nulled) — we
             // cannot distinguish, so return a neutral already-decided outcome.
@@ -213,9 +244,13 @@ public class CategoryRequestService {
         if (approve) {
             category.approve(now);
             createInitialServiceSuggestion(category);
+            // Same transaction as the decision (MANDATORY): the feed item commits or rolls back with it.
+            // Only reached on the PENDING transition — ALREADY_DECIDED / INVALID_OR_EXPIRED returned above.
+            inAppNotificationService.notifyCategoryRequestDecided(category, true);
             return DecisionOutcome.APPROVED;
         }
-        category.reject(now);
+        category.reject(now, reason);
+        inAppNotificationService.notifyCategoryRequestDecided(category, false);
         return DecisionOutcome.REJECTED;
     }
 
@@ -245,6 +280,44 @@ public class CategoryRequestService {
         }
     }
 
+    /**
+     * Inserts the PENDING row. The exists-check above is check-then-act; two concurrent submits can
+     * both pass it, and {@value #NAME_UNIQUE_CONSTRAINT} (V64) is what actually serialises them. The
+     * id is {@code IDENTITY}, so {@code save} INSERTs immediately — a lost race surfaces HERE, before
+     * the admin email, with no {@code saveAndFlush} needed. The loser is translated to the SAME 409
+     * the exists-check throws; any other integrity violation is rethrown unchanged (generic handler,
+     * anti-enumeration).
+     */
+    private PlatformCategory insertPending(PlatformCategory category) {
+        try {
+            return platformCategoryRepository.save(category);
+        } catch (DataIntegrityViolationException ex) {
+            if (isNameUniqueViolation(ex)) {
+                throw duplicateCategory(category.getName());
+            }
+            throw ex;
+        }
+    }
+
+    /**
+     * Matches only Hibernate's structured {@code getConstraintName()} — never a message substring
+     * (the PgJDBC detail line echoes caller-supplied text). Same rationale as
+     * {@code ServiceCatalogService.isDuplicateServiceViolation}.
+     */
+    private static boolean isNameUniqueViolation(DataIntegrityViolationException ex) {
+        for (Throwable cause = ex; cause != null; cause = cause.getCause()) {
+            if (cause instanceof org.hibernate.exception.ConstraintViolationException hce
+                    && NAME_UNIQUE_CONSTRAINT.equals(hce.getConstraintName())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static BusinessException duplicateCategory(String name) {
+        return new BusinessException(HttpStatus.CONFLICT, DUPLICATE_CATEGORY_MESSAGE_PREFIX + name);
+    }
+
     /** Blank or null becomes {@code null}; otherwise the trimmed value. */
     private static String trimToNull(String value) {
         if (value == null) {
@@ -255,7 +328,7 @@ public class CategoryRequestService {
     }
 
     private Optional<PlatformCategory> findLivePending(String rawToken) {
-        return findByTokenConstantTime(rawToken)
+        return findByTokenConstantTime(rawToken, false)
                 .filter(PlatformCategory::isPending)
                 .filter(c -> !isExpired(c));
     }
@@ -266,12 +339,15 @@ public class CategoryRequestService {
      * lookup is an equality match; the constant-time re-check is defense-in-depth so
      * the decision branch never depends on a non-constant-time String compare.
      */
-    private Optional<PlatformCategory> findByTokenConstantTime(String rawToken) {
+    private Optional<PlatformCategory> findByTokenConstantTime(String rawToken, boolean forUpdate) {
         if (rawToken == null || rawToken.isBlank()) {
             return Optional.empty();
         }
         String candidateHash = tokenGenerator.hash(rawToken);
-        return platformCategoryRepository.findByTokenHash(candidateHash)
+        Optional<PlatformCategory> found = forUpdate
+                ? platformCategoryRepository.findByTokenHashForUpdate(candidateHash)
+                : platformCategoryRepository.findByTokenHash(candidateHash);
+        return found
                 .filter(c -> c.getTokenHash() != null
                         && MessageDigest.isEqual(
                                 c.getTokenHash().getBytes(StandardCharsets.UTF_8),

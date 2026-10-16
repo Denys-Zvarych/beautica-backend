@@ -59,8 +59,11 @@ public class InternalApiKeyFilter extends OncePerRequestFilter {
 
         String suppliedKey = request.getHeader(HEADER_NAME);
 
-        if (suppliedKey == null || !constantTimeEquals(suppliedKey,
-                internalApiKeyProperties.getInternalApiKey())) {
+        String configuredKey = internalApiKeyProperties.getInternalApiKey();
+
+        // Fail closed: an unset/blank configured key must never match an empty or missing header.
+        if (suppliedKey == null || configuredKey == null || configuredKey.isBlank()
+                || !constantTimeEquals(suppliedKey, configuredKey)) {
             response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
             response.setContentType(MediaType.APPLICATION_JSON_VALUE);
             objectMapper.writeValue(response.getWriter(), ApiResponse.error("Unauthorized"));

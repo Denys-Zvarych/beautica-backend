@@ -10,7 +10,9 @@ import org.springframework.validation.annotation.Validated;
  *
  * <p>Binding prefix: {@code app.internal-api-key}.
  * Source: {@code ${INTERNAL_API_KEY}} — supply via Railway environment variable.
- * Local default ({@code changeme-dev-only}) is acceptable for non-prod environments.
+ * The dev default ({@code changeme-dev-only}) lives only in {@code application-local.yml} /
+ * {@code application-test.yml}; prod/staging map it in {@code application-prod.yml} and
+ * {@code EnvironmentFingerprintGuard} rejects blank, default or &lt; 32-char values.
  */
 @Validated
 @ConfigurationProperties(prefix = "app")

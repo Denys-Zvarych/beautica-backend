@@ -114,6 +114,16 @@ class S3ConfigTest {
 
     // ── Phase 341 — checksum policy, endpoint override, message text ──────────
 
+    private static S3ClientBuilder configure(S3ClientBuilder b, String acct, String key, String secret, String endpoint) {
+        return configure(b, acct, key, secret, endpoint, false);
+    }
+
+    private static S3ClientBuilder configure(S3ClientBuilder b, String acct, String key, String secret,
+                                             String endpoint, boolean allowCustom) {
+        return S3Config.configure(b, acct, key, secret, endpoint, allowCustom,
+                java.time.Duration.ofSeconds(5), java.time.Duration.ofSeconds(30));
+    }
+
     private static S3ClientBuilder recordingBuilder() {
         return mock(S3ClientBuilder.class, Mockito.RETURNS_SELF);
     }
@@ -123,7 +133,7 @@ class S3ConfigTest {
     void should_setWhenRequiredChecksums_when_configuringBuilder() {
         S3ClientBuilder builder = recordingBuilder();
 
-        S3Config.configure(builder, "acct", "key", "secret", "");
+        configure(builder, "acct", "key", "secret", "");
 
         verify(builder).requestChecksumCalculation(RequestChecksumCalculation.WHEN_REQUIRED);
         verify(builder).responseChecksumValidation(ResponseChecksumValidation.WHEN_REQUIRED);
@@ -134,7 +144,7 @@ class S3ConfigTest {
     void should_useTemplateEndpoint_when_overrideBlank() {
         S3ClientBuilder builder = recordingBuilder();
 
-        S3Config.configure(builder, "acct123", "key", "secret", "  ");
+        configure(builder, "acct123", "key", "secret", "  ");
 
         verify(builder).endpointOverride(URI.create("https://acct123.r2.cloudflarestorage.com"));
     }
@@ -144,7 +154,7 @@ class S3ConfigTest {
     void should_useOverrideEndpoint_when_overrideSet() {
         S3ClientBuilder builder = recordingBuilder();
 
-        S3Config.configure(builder, "acct123", "key", "secret",
+        configure(builder, "acct123", "key", "secret",
                 "https://acct123.eu.r2.cloudflarestorage.com");
 
         verify(builder).endpointOverride(URI.create("https://acct123.eu.r2.cloudflarestorage.com"));
@@ -153,7 +163,7 @@ class S3ConfigTest {
     @Test
     @DisplayName("rejects a non-https endpoint override with IllegalStateException")
     void should_throwIllegalState_when_overrideNotHttps() {
-        assertThatThrownBy(() -> S3Config.configure(recordingBuilder(), "acct", "key", "secret",
+        assertThatThrownBy(() -> configure(recordingBuilder(), "acct", "key", "secret",
                 "http://localhost:9000"))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("app.cloudflare-r2.endpoint");
@@ -185,10 +195,10 @@ class S3ConfigTest {
     @Test
     @DisplayName("rejects a bare https:// endpoint with a clear IllegalStateException (not a raw IAE)")
     void should_throwIllegalStateWithHostMessage_when_overrideHasNoHost() {
-        assertThatThrownBy(() -> S3Config.configure(recordingBuilder(), "acct", "key", "secret", "https://"))
+        assertThatThrownBy(() -> configure(recordingBuilder(), "acct", "key", "secret", "https://"))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("with a host");
-        assertThatThrownBy(() -> S3Config.configure(recordingBuilder(), "acct", "key", "secret", "https:///path"))
+        assertThatThrownBy(() -> configure(recordingBuilder(), "acct", "key", "secret", "https:///path"))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("must include a host");
     }
@@ -196,7 +206,7 @@ class S3ConfigTest {
     @Test
     @DisplayName("rejects an unparsable endpoint with IllegalStateException")
     void should_throwIllegalState_when_overrideNotAUri() {
-        assertThatThrownBy(() -> S3Config.configure(recordingBuilder(), "acct", "key", "secret",
+        assertThatThrownBy(() -> configure(recordingBuilder(), "acct", "key", "secret",
                 "https://bad host/x"))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("app.cloudflare-r2.endpoint");
@@ -205,7 +215,7 @@ class S3ConfigTest {
     @Test
     @DisplayName("rejects a non-R2 https host by default")
     void should_throwIllegalState_when_hostNotR2AndOptOutOff() {
-        assertThatThrownBy(() -> S3Config.configure(recordingBuilder(), "acct", "key", "secret",
+        assertThatThrownBy(() -> configure(recordingBuilder(), "acct", "key", "secret",
                 "https://evil.example.com"))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining(".r2.cloudflarestorage.com");
@@ -214,7 +224,7 @@ class S3ConfigTest {
     @Test
     @DisplayName("rejects a look-alike host that merely contains the R2 suffix mid-name")
     void should_throwIllegalState_when_hostOnlyContainsR2Suffix() {
-        assertThatThrownBy(() -> S3Config.configure(recordingBuilder(), "acct", "key", "secret",
+        assertThatThrownBy(() -> configure(recordingBuilder(), "acct", "key", "secret",
                 "https://acct.r2.cloudflarestorage.com.evil.example"))
                 .isInstanceOf(IllegalStateException.class);
     }
@@ -224,7 +234,7 @@ class S3ConfigTest {
     void should_acceptCustomHost_when_optOutEnabled() {
         S3ClientBuilder builder = recordingBuilder();
 
-        S3Config.configure(builder, "acct", "key", "secret", "https://minio.internal.example", true);
+        configure(builder, "acct", "key", "secret", "https://minio.internal.example", true);
 
         verify(builder).endpointOverride(URI.create("https://minio.internal.example"));
     }
@@ -232,10 +242,10 @@ class S3ConfigTest {
     @Test
     @DisplayName("still requires a host and https when allow-custom-endpoint is true")
     void should_stillRejectBareHttps_when_optOutEnabled() {
-        assertThatThrownBy(() -> S3Config.configure(recordingBuilder(), "acct", "key", "secret",
+        assertThatThrownBy(() -> configure(recordingBuilder(), "acct", "key", "secret",
                 "https://", true))
                 .isInstanceOf(IllegalStateException.class);
-        assertThatThrownBy(() -> S3Config.configure(recordingBuilder(), "acct", "key", "secret",
+        assertThatThrownBy(() -> configure(recordingBuilder(), "acct", "key", "secret",
                 "http://minio.internal.example", true))
                 .isInstanceOf(IllegalStateException.class);
     }
@@ -247,7 +257,7 @@ class S3ConfigTest {
     void should_installApacheHttpClientBuilder_when_configuringBuilder() {
         S3ClientBuilder builder = recordingBuilder();
 
-        S3Config.configure(builder, "acct", "key", "secret", "");
+        configure(builder, "acct", "key", "secret", "");
 
         org.mockito.ArgumentCaptor<software.amazon.awssdk.http.SdkHttpClient.Builder<?>> http =
                 org.mockito.ArgumentCaptor.forClass(software.amazon.awssdk.http.SdkHttpClient.Builder.class);
@@ -260,7 +270,7 @@ class S3ConfigTest {
     void should_setPinnedTimeoutsExplicitly_when_usingR2HttpClientBuilder() throws Exception {
         // Read the builder's EXPLICIT options (before SDK defaults are merged): the SDK default READ_TIMEOUT
         // is also 30s, so asserting on a defaults-resolved client would stay green if the call were deleted.
-        Object apacheBuilder = S3Config.r2HttpClientBuilder();
+        Object apacheBuilder = S3Config.r2HttpClientBuilder(java.time.Duration.ofSeconds(5), java.time.Duration.ofSeconds(30));
         java.lang.reflect.Field f = apacheBuilder.getClass().getDeclaredField("standardOptions");
         f.setAccessible(true);
         software.amazon.awssdk.utils.AttributeMap options =
@@ -272,5 +282,53 @@ class S3ConfigTest {
                 .isEqualTo(java.time.Duration.ofSeconds(5));
         assertThat(options.get(software.amazon.awssdk.http.SdkHttpConfigurationOption.MAX_CONNECTIONS))
                 .isEqualTo(50);
+    }
+
+    @Test
+    @DisplayName("applies the Durations it is given, not fixed constants")
+    void should_applyGivenDurations_when_buildingHttpClient() throws Exception {
+        Object apacheBuilder = S3Config.r2HttpClientBuilder(
+                java.time.Duration.ofMillis(111), java.time.Duration.ofMillis(222));
+        java.lang.reflect.Field f = apacheBuilder.getClass().getDeclaredField("standardOptions");
+        f.setAccessible(true);
+        software.amazon.awssdk.utils.AttributeMap options =
+                ((software.amazon.awssdk.utils.AttributeMap.Builder) f.get(apacheBuilder)).build();
+
+        assertThat(options.get(software.amazon.awssdk.http.SdkHttpConfigurationOption.READ_TIMEOUT))
+                .isEqualTo(java.time.Duration.ofMillis(222));
+        assertThat(options.get(software.amazon.awssdk.http.SdkHttpConfigurationOption.CONNECTION_TIMEOUT))
+                .isEqualTo(java.time.Duration.ofMillis(111));
+    }
+
+    @Test
+    @DisplayName("field defaults/yml defaults are 5s connect and 30s socket")
+    void should_defaultToFiveAndThirtySeconds_when_valuesUnbound() throws Exception {
+        java.util.Properties yml = loadApplicationYml();
+
+        assertThat(yml.getProperty("app.cloudflare-r2.connection-timeout")).isEqualTo("5s");
+        assertThat(yml.getProperty("app.cloudflare-r2.socket-timeout")).isEqualTo("30s");
+    }
+
+    @Test
+    @DisplayName("rejects zero or negative R2 timeouts with IllegalStateException (0 = infinite)")
+    void should_rejectNonPositiveDurations_when_configuring() {
+        java.time.Duration ok = java.time.Duration.ofSeconds(5);
+        for (java.time.Duration bad : new java.time.Duration[]{java.time.Duration.ZERO, java.time.Duration.ofSeconds(-1)}) {
+            assertThatThrownBy(() -> S3Config.configure(recordingBuilder(), "acct", "key", "secret", "",
+                    false, bad, ok))
+                    .isInstanceOf(IllegalStateException.class).hasMessageContaining("connection-timeout");
+            assertThatThrownBy(() -> S3Config.configure(recordingBuilder(), "acct", "key", "secret", "",
+                    false, ok, bad))
+                    .isInstanceOf(IllegalStateException.class).hasMessageContaining("socket-timeout");
+            assertThatThrownBy(() -> S3Config.r2HttpClientBuilder(bad, ok))
+                    .isInstanceOf(IllegalStateException.class);
+        }
+    }
+
+    private static java.util.Properties loadApplicationYml() {
+        org.springframework.beans.factory.config.YamlPropertiesFactoryBean y =
+                new org.springframework.beans.factory.config.YamlPropertiesFactoryBean();
+        y.setResources(new org.springframework.core.io.ClassPathResource("application.yml"));
+        return y.getObject();
     }
 }

@@ -72,7 +72,7 @@ class SearchGetRateLimitRegressionTest {
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(),
-                permissive(), permissive(), permissive(), permissive(), permissive(), permissive(), permissive());
+                permissive(), permissive(), permissive(), permissive(), permissive(), permissive(), permissive(), permissive(), permissive());
     }
 
     private MockHttpServletRequest getSearch(String path) {
@@ -338,5 +338,28 @@ class SearchGetRateLimitRegressionTest {
         assertThat(chain.getRequest())
                 .as("a non-search GET must be forwarded down the filter chain")
                 .isNotNull();
+    }
+
+    @Test
+    @DisplayName("should_return429_when_searchHeadExceedsPerIpCap")
+    void should_return429_when_searchHeadExceedsPerIpCap() throws Exception {
+        AuthRateLimitFilter filter = realFilter();
+        var head = new MockHttpServletRequest("HEAD", MASTERS_PATH);
+        head.setRemoteAddr(REMOTE_ADDR);
+
+        MockHttpServletResponse last = null;
+        MockFilterChain lastChain = null;
+        boolean throttled = false;
+        for (int i = 0; i < REQUESTS_TO_FIRE && !throttled; i++) {
+            last = new MockHttpServletResponse();
+            lastChain = new MockFilterChain();
+            filter.doFilterInternal(head, last, lastChain);
+            throttled = last.getStatus() == 429;
+        }
+
+        assertThat(throttled)
+                .as("HEAD is routed by Spring to the @GetMapping handler, so it must be throttled like GET")
+                .isTrue();
+        assertThat(lastChain.getRequest()).as("throttled HEAD must not reach the chain").isNull();
     }
 }

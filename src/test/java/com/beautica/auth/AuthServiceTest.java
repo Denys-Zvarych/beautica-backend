@@ -887,7 +887,7 @@ class AuthServiceTest {
         user.setVerificationCodeHash("oldhash");
         user.setVerificationCodeExpiresAt(issuedAt.plus(OTP_TTL));
         // Non-locking pre-read first; lock escalated only on the real write path.
-        when(userRepository.findByEmail(TEST_EMAIL)).thenReturn(Optional.of(user));
+        when(userRepository.findResendVerificationEligibleByEmail(TEST_EMAIL)).thenReturn(Optional.of(true));
         when(userRepository.findByEmailForUpdate(TEST_EMAIL)).thenReturn(Optional.of(user));
         when(tokenGenerator.generateOtp()).thenReturn("654321");
         when(tokenGenerator.hashOtp("654321")).thenReturn("newhash");
@@ -911,7 +911,7 @@ class AuthServiceTest {
         User user = buildUnverifiedUser();
         user.setVerificationCodeHash("somehash");
         user.setVerificationCodeExpiresAt(issuedAt.plus(OTP_TTL));
-        when(userRepository.findByEmail(TEST_EMAIL)).thenReturn(Optional.of(user));
+        when(userRepository.findResendVerificationEligibleByEmail(TEST_EMAIL)).thenReturn(Optional.of(true));
         when(userRepository.findByEmailForUpdate(TEST_EMAIL)).thenReturn(Optional.of(user));
 
         // Exact retry-after contract (the value flows into the Retry-After header):
@@ -932,7 +932,7 @@ class AuthServiceTest {
     void should_returnGenericResponse_when_emailUnknown() {
         // Unknown email short-circuits on the non-locking pre-read — the
         // PESSIMISTIC_WRITE lock is never acquired (blocker #6).
-        when(userRepository.findByEmail(TEST_EMAIL)).thenReturn(Optional.empty());
+        when(userRepository.findResendVerificationEligibleByEmail(TEST_EMAIL)).thenReturn(Optional.empty());
 
         RegistrationResponse resp = authService.resendVerification(new ResendVerificationRequest(TEST_EMAIL));
 
@@ -947,7 +947,7 @@ class AuthServiceTest {
         User user = buildUnverifiedUser();
         user.setEmailVerified(true);
         user.setVerificationCodeHash("somehash");
-        when(userRepository.findByEmail(TEST_EMAIL)).thenReturn(Optional.of(user));
+        when(userRepository.findResendVerificationEligibleByEmail(TEST_EMAIL)).thenReturn(Optional.of(false));
 
         RegistrationResponse resp = authService.resendVerification(new ResendVerificationRequest(TEST_EMAIL));
 
@@ -965,7 +965,7 @@ class AuthServiceTest {
         user.setVerificationCodeExpiresAt(issuedAt.plus(OTP_TTL));
         user.setVerificationAttempts((short) 3);
         user.setVerificationFailedTotal((short) 4);
-        when(userRepository.findByEmail(TEST_EMAIL)).thenReturn(Optional.of(user));
+        when(userRepository.findResendVerificationEligibleByEmail(TEST_EMAIL)).thenReturn(Optional.of(true));
         when(userRepository.findByEmailForUpdate(TEST_EMAIL)).thenReturn(Optional.of(user));
         when(tokenGenerator.generateOtp()).thenReturn("999999");
         when(tokenGenerator.hashOtp("999999")).thenReturn("hash999");
@@ -982,18 +982,81 @@ class AuthServiceTest {
     }
 
     @Test
-    @DisplayName("resendVerification — returns generic response and takes NO lock when no pending code exists (nothing to resend)")
-    void should_returnGenericResponse_when_noPendingCode() {
+    @DisplayName("resendVerification — issues a NEW code when the stored code was wiped (expired verify / cleanup job)")
+    void should_issueNewCode_when_noPendingCode() {
+        // Previously asserted a no-op (generic 200, no mail, no lock) for this state. That asserted
+        // the dead-end bug: an expired-code verify or the stale cleanup job wipes the code, after
+        // which the user could neither resend nor re-register (409) and could never verify.
         User user = buildUnverifiedUser();
         user.setVerificationCodeHash(null);
         user.setVerificationCodeExpiresAt(null);
-        when(userRepository.findByEmail(TEST_EMAIL)).thenReturn(Optional.of(user));
+        when(userRepository.findResendVerificationEligibleByEmail(TEST_EMAIL)).thenReturn(Optional.of(true));
+        when(userRepository.findByEmailForUpdate(TEST_EMAIL)).thenReturn(Optional.of(user));
+        when(tokenGenerator.generateOtp()).thenReturn("654321");
+        when(tokenGenerator.hashOtp("654321")).thenReturn("newhash");
 
         RegistrationResponse resp = authService.resendVerification(new ResendVerificationRequest(TEST_EMAIL));
 
         assertThat(resp.email()).isEqualTo(TEST_EMAIL);
-        // No pending verification → wire-identical generic response, no lock.
+        assertThat(user.getVerificationCodeHash()).isEqualTo("newhash");
+        assertThat(user.getVerificationCodeExpiresAt()).isEqualTo(FIXED_NOW.plus(OTP_TTL));
+        verify(userRepository).findByEmailForUpdate(TEST_EMAIL);
+    }
+
+    @Test
+    @DisplayName("resendVerification — generic response and no mail for an inactive user (post-lock guard)")
+    void should_returnGenericResponse_when_userInactive() {
+        User user = buildUnverifiedUser();
+        user.setActive(false);
+        when(userRepository.findResendVerificationEligibleByEmail(TEST_EMAIL)).thenReturn(Optional.of(true));
+        when(userRepository.findByEmailForUpdate(TEST_EMAIL)).thenReturn(Optional.of(user));
+
+        RegistrationResponse resp = authService.resendVerification(new ResendVerificationRequest(TEST_EMAIL));
+
+        assertThat(resp.email()).isEqualTo(TEST_EMAIL);
+        verify(tokenGenerator, never()).generateOtp();
+        verify(emailNotificationService, never()).sendVerificationEmail(any(), any());
+    }
+
+    @Test
+    @DisplayName("resendVerification — inactive user short-circuits on the pre-read without taking the row lock")
+    void should_takeNoLock_when_preReadSaysIneligibleInactive() {
+        when(userRepository.findResendVerificationEligibleByEmail(TEST_EMAIL)).thenReturn(Optional.of(false));
+
+        authService.resendVerification(new ResendVerificationRequest(TEST_EMAIL));
+
         verify(userRepository, never()).findByEmailForUpdate(anyString());
+        verify(emailNotificationService, never()).sendVerificationEmail(any(), any());
+    }
+
+    @Test
+    @DisplayName("resendVerification — mixed-case, padded email is lower-cased and stripped before the eligibility pre-read")
+    void should_queryNormalisedEmail_when_resendEmailHasCaseAndWhitespace() {
+        // The projection is an exact-match JPQL query (UserRepositoryEligibilityProjectionTest),
+        // so the service must normalise or a "Test@Example.com " resend silently no-ops.
+        when(userRepository.findResendVerificationEligibleByEmail(TEST_EMAIL)).thenReturn(Optional.of(false));
+
+        RegistrationResponse resp = authService.resendVerification(
+                new ResendVerificationRequest("  Test@EXAMPLE.com "));
+
+        assertThat(resp.email()).isEqualTo(TEST_EMAIL);
+        verify(userRepository).findResendVerificationEligibleByEmail(TEST_EMAIL);
+    }
+
+    @Test
+    @DisplayName("resendVerification — locked user with a wiped code gets no new code")
+    void should_notIssueCode_when_lockedAndNoPendingCode() {
+        User user = buildUnverifiedUser();
+        user.setVerificationCodeHash(null);
+        user.setVerificationCodeExpiresAt(null);
+        when(userRepository.findResendVerificationEligibleByEmail(TEST_EMAIL)).thenReturn(Optional.of(true));
+        when(userRepository.findByEmailForUpdate(TEST_EMAIL)).thenReturn(Optional.of(user));
+        when(emailVerificationProcessor.isLocked(user)).thenReturn(true);
+
+        authService.resendVerification(new ResendVerificationRequest(TEST_EMAIL));
+
+        assertThat(user.getVerificationCodeHash()).isNull();
+        verify(tokenGenerator, never()).generateOtp();
         verify(emailNotificationService, never()).sendVerificationEmail(any(), any());
     }
 
@@ -1003,7 +1066,7 @@ class AuthServiceTest {
         User user = buildUnverifiedUser();
         user.setVerificationCodeHash("oldhash");
         user.setVerificationCodeExpiresAt(FIXED_NOW.minusSeconds(61).plus(OTP_TTL));
-        when(userRepository.findByEmail(TEST_EMAIL)).thenReturn(Optional.of(user));
+        when(userRepository.findResendVerificationEligibleByEmail(TEST_EMAIL)).thenReturn(Optional.of(true));
         when(userRepository.findByEmailForUpdate(TEST_EMAIL)).thenReturn(Optional.of(user));
         when(emailVerificationProcessor.isLocked(user)).thenReturn(true);
 

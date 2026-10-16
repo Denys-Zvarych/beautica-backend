@@ -1,5 +1,6 @@
 package com.beautica.booking;
 
+import com.beautica.TestPostgresImage;
 import com.beautica.support.LocalityTestLookup;
 import com.beautica.support.TestHttpClients;
 import com.beautica.auth.dto.AuthResponse;
@@ -67,7 +68,7 @@ class BookingConcurrencyTest {
 
     // Dedicated container so this class does not share context with @MockBean-free tests
     private static final PostgreSQLContainer<?> POSTGRES =
-            new PostgreSQLContainer<>("postgres:16-alpine");
+            new PostgreSQLContainer<>(TestPostgresImage.IMAGE);
 
     static {
         POSTGRES.start();

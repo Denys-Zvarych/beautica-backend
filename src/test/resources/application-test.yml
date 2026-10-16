@@ -60,6 +60,12 @@ app:
     # assertions build the filter directly against a hand-built single-slot LoadingCache
     # (bypassing this property entirely), so this override does not neuter that coverage.
     notification-feed-capacity: 100000
+    # Same reasoning: ITs drive many approve/reject review POSTs from 127.0.0.1 (one shared per-IP
+    # bucket in production, 20/hr). The 429 behaviour is covered by ReviewPostRateLimitRegressionTest,
+    # which builds the filter by hand.
+    review-decision-capacity: 100000
+    # Sibling GET-page bucket (60/hr in production); 429 covered by ReviewGetRateLimitRegressionTest.
+    review-page-capacity: 100000
     device-token-capacity: 100000
     media-upload-capacity: 100000
     verify-email-capacity: 100000
@@ -127,7 +133,7 @@ app:
     token-expiration-hours: 72
     from-email: noreply@beautica.app
   admin-email: admin@beautica.test
-  public-base-url: http://localhost:8080
+  public-base-url: https://api.beautica.test
   security:
     # Test profile only — fixed 32+ char value so the context loads under `test`.
     otp-pepper: test-otp-pepper-fixed-value-min-32-characters
@@ -199,7 +205,15 @@ notification:
       batch-size: 1000
       max-batches-per-run: 50
 
+# Phase 371: tests never send anything off-machine. SentryCaptureIT re-enables it against a loopback WireMock DSN.
+sentry:
+  enabled: false
+
 management:
+  endpoint:
+    health:
+      # Test-only: lets BeauticaApplicationTests assert components.db. application.yml stays never.
+      show-details: always
   health:
     mail:
       enabled: false

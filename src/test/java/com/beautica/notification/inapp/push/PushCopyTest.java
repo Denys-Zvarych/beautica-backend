@@ -296,6 +296,54 @@ class PushCopyTest {
         assertThat(java.util.Arrays.stream(NotificationParams.class.getRecordComponents())
                 .map(java.lang.reflect.RecordComponent::getName))
                 .containsExactly("counterpartName", "serviceName", "serviceCount", "startsAt",
-                        "salonName", "masterName", "subjectName", "subjectRole");
+                        "salonName", "masterName", "subjectName", "subjectRole",
+                        // phase 372: a category name and the admin's reject reason (free text, never on a lock screen)
+                        "categoryName", "decisionReason");
+    }
+
+    @Test
+    @DisplayName("request-decision titles equal the mobile ARB titles (phase 412 l10n table)")
+    void should_matchMobileTitles_when_requestDecisionTypes() {
+        assertThat(PushCopy.title(InAppNotificationType.CATEGORY_REQUEST_APPROVED, false))
+                .isEqualTo("Категорію схвалено");
+        assertThat(PushCopy.title(InAppNotificationType.CATEGORY_REQUEST_REJECTED, false))
+                .isEqualTo("Категорію відхилено");
+        assertThat(PushCopy.title(InAppNotificationType.SERVICE_TYPE_SUGGESTION_APPROVED, false))
+                .isEqualTo("Тип послуги схвалено");
+        assertThat(PushCopy.title(InAppNotificationType.SERVICE_TYPE_SUGGESTION_REJECTED, false))
+                .isEqualTo("Тип послуги відхилено");
+    }
+
+    @Test
+    @DisplayName("request-decision bodies name the category / service type and never carry the reject reason")
+    void should_nameCategoryAndType_and_omitReason_when_requestDecisionBody() {
+        NotificationParams category = new NotificationParams(
+                null, null, 0, null, null, null, null, null, "Нейл-арт", "SECRET-REASON");
+        NotificationParams suggestion = new NotificationParams(
+                null, "Гель-лак", 0, null, null, null, null, null, "Нейл-арт", "SECRET-REASON");
+
+        assertThat(PushCopy.body(InAppNotificationType.CATEGORY_REQUEST_APPROVED, false, category))
+                .isEqualTo("Категорія «Нейл-арт» тепер доступна для ваших послуг");
+        assertThat(PushCopy.body(InAppNotificationType.CATEGORY_REQUEST_REJECTED, false, category))
+                .isEqualTo("Запит на категорію «Нейл-арт» відхилено");
+        assertThat(PushCopy.body(InAppNotificationType.SERVICE_TYPE_SUGGESTION_APPROVED, false, suggestion))
+                .isEqualTo("Тип послуги «Гель-лак» у категорії «Нейл-арт» тепер доступний");
+        assertThat(PushCopy.body(InAppNotificationType.SERVICE_TYPE_SUGGESTION_REJECTED, false, suggestion))
+                .isEqualTo("Пропозицію типу послуги «Гель-лак» (Нейл-арт) відхилено")
+                .doesNotContain("SECRET-REASON");
+    }
+
+    @Test
+    @DisplayName("request-decision body falls back to the generic text when params or the name are missing")
+    void should_fallBackToGeneric_when_requestDecisionParamsMissing() {
+        NotificationParams noName = new NotificationParams(
+                null, null, 0, null, null, null, null, null, null, null);
+
+        assertThat(PushCopy.body(InAppNotificationType.CATEGORY_REQUEST_APPROVED, false, null))
+                .isEqualTo(PushCopy.GENERIC_BODY);
+        assertThat(PushCopy.body(InAppNotificationType.CATEGORY_REQUEST_REJECTED, false, noName))
+                .isEqualTo(PushCopy.GENERIC_BODY);
+        assertThat(PushCopy.body(InAppNotificationType.SERVICE_TYPE_SUGGESTION_APPROVED, false, noName))
+                .isEqualTo(PushCopy.GENERIC_BODY);
     }
 }

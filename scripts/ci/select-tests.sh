@@ -84,14 +84,11 @@ fresh_out() {
 }
 
 ensure_selector() {
-  local srcs=() f
-  for f in "$SELECTOR_SRC"/*.java; do
-    case "$f" in *Test.java | */SourceTreeFixture.java) continue ;; esac
-    srcs+=("$f")
-  done
+  # Compile only AffectedTestSelector's dependency closure (-sourcepath + -implicit:class): sibling
+  # classes in this dir that need a classpath (e.g. SnakeYAML) must not be compiled by bare javac.
   rm -rf "$SELECTOR_CLASSES"
   mkdir -p "$SELECTOR_CLASSES"
-  javac -proc:none -d "$SELECTOR_CLASSES" "${srcs[@]}"
+  javac -proc:none -implicit:class -sourcepath "$ROOT/src/test/java" -d "$SELECTOR_CLASSES" "$SELECTOR_SRC/AffectedTestSelector.java"
 }
 
 selector() {

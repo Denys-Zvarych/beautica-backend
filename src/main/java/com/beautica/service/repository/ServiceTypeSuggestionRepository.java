@@ -2,7 +2,9 @@ package com.beautica.service.repository;
 
 import com.beautica.service.entity.ServiceTypeSuggestion;
 import com.beautica.service.entity.ServiceTypeSuggestionStatus;
+import jakarta.persistence.LockModeType;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Lock;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
@@ -23,17 +25,30 @@ public interface ServiceTypeSuggestionRepository extends JpaRepository<ServiceTy
     Optional<ServiceTypeSuggestion> findByTokenHash(String tokenHash);
 
     /**
+     * Locking variant ({@code FOR UPDATE}) for the decision (write) path only, so concurrent approve/reject
+     * on one token serialize. The read-only review page keeps {@link #findByTokenHash}.
+     */
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("select s from ServiceTypeSuggestion s where s.tokenHash = :tokenHash")
+    Optional<ServiceTypeSuggestion> findByTokenHashForUpdate(@Param("tokenHash") String tokenHash);
+
+    /**
      * Dedup guard: returns {@code true} when a PENDING suggestion already exists for
      * the same category slug and (case-insensitively) the same suggested name. A
      * previously decided (APPROVED/REJECTED) suggestion does not block a re-suggest.
      *
-     * <p>{@code LOWER(...)} normalization mirrors the partial dedup index in V76.
+     * <p>{@code LOWER(...)} normalization mirrors the partial UNIQUE index
+     * {@code ux_service_type_suggestion_pending_dedup} (V197), which is the real guard against the
+     * check-then-insert race; this check is the fast path that avoids a doomed INSERT.
+     * {@code EXISTS} stops at the first match instead of counting.
      */
     @Query("""
-            SELECT COUNT(s) > 0 FROM ServiceTypeSuggestion s
-             WHERE s.status = com.beautica.service.entity.ServiceTypeSuggestionStatus.PENDING
-               AND s.categoryName = :categoryName
-               AND LOWER(s.suggestedName) = LOWER(:suggestedName)
+            SELECT CASE WHEN EXISTS (
+                SELECT 1 FROM ServiceTypeSuggestion s
+                 WHERE s.status = com.beautica.service.entity.ServiceTypeSuggestionStatus.PENDING
+                   AND s.categoryName = :categoryName
+                   AND LOWER(s.suggestedName) = LOWER(:suggestedName)
+            ) THEN true ELSE false END
             """)
     boolean existsPendingByCategoryNameAndSuggestedNameIgnoreCase(
             @Param("categoryName") String categoryName,
