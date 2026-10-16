@@ -3,6 +3,7 @@ package com.beautica.service;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.common.ApiResponse;
 import com.beautica.config.TestSecurityConfig;
+import com.beautica.support.ParityRequestId;
 import com.beautica.service.dto.AssignServiceToMasterRequest;
 import com.beautica.service.dto.BulkCreateServicesRequest;
 import com.beautica.service.dto.BulkServiceItemRequest;
@@ -408,9 +409,11 @@ class SingleAssignContractParityIT extends AbstractIntegrationTest {
 
     private ResponseEntity<String> assignSingle(String token, UUID salonId, UUID masterId, UUID serviceDefId) {
         var request = new AssignServiceToMasterRequest(serviceDefId, null, null, null, null);
+        // Pinned X-Request-Id: the parity cases compare error envelopes whole, and every error body
+        // carries a per-request requestId (Phase 371) unless the caller supplies it.
         return restTemplate.exchange(
                 "/api/v1/salons/" + salonId + "/masters/" + masterId + "/services", HttpMethod.POST,
-                new HttpEntity<>(request, fixtures.bearerHeaders(token)), String.class);
+                new HttpEntity<>(request, ParityRequestId.on(fixtures.bearerHeaders(token))), String.class);
     }
 
     private ResponseEntity<String> unassign(String token, UUID salonId, UUID masterId, UUID serviceDefId) {
@@ -429,7 +432,7 @@ class SingleAssignContractParityIT extends AbstractIntegrationTest {
             String token, UUID salonId, UUID masterId, BulkCreateServicesRequest request) {
         return restTemplate.exchange(
                 "/api/v1/salons/" + salonId + "/masters/" + masterId + "/services/bulk", HttpMethod.POST,
-                new HttpEntity<>(request, fixtures.bearerHeaders(token)), String.class);
+                new HttpEntity<>(request, ParityRequestId.on(fixtures.bearerHeaders(token))), String.class);
     }
 
     /** Bulk-creates exactly ONE FIXED-price service for {@code masterId} and returns the definition id. */

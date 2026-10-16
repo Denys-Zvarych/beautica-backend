@@ -1,5 +1,6 @@
 package com.beautica.master;
 
+import com.beautica.support.ParityRequestId;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.auth.JwtTokenProvider;
 import com.beautica.auth.Role;
@@ -73,7 +74,9 @@ class MasterWorkingDaysServiceModeIT extends AbstractIntegrationTest {
         HttpHeaders h = new HttpHeaders();
         h.setBearerAuth(jwtTokenProvider.generateAccessToken(a.userId(), a.email(), a.role()));
         h.setContentType(MediaType.APPLICATION_JSON);
-        return h;
+        // Pinned X-Request-Id: the 404-parity case compares error bodies whole, and each error body
+        // carries a per-request requestId (Phase 371) unless the caller supplies it.
+        return ParityRequestId.on(h);
     }
 
     private ResponseEntity<String> get(String path, Actor actor) {

@@ -3,6 +3,7 @@ package com.beautica.service;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.common.ApiResponse;
 import com.beautica.config.TestSecurityConfig;
+import com.beautica.support.ParityRequestId;
 import com.beautica.service.dto.AssignServiceToMasterRequest;
 import com.beautica.service.dto.BulkCreateServicesRequest;
 import com.beautica.service.dto.BulkServiceItemRequest;
@@ -557,9 +558,11 @@ class SalonMasterServicesReadIT extends AbstractIntegrationTest {
     }
 
     private ResponseEntity<String> getSalonMasterServices(String token, UUID salonId, UUID masterId) {
+        // Pinned X-Request-Id: the parity cases below compare two error bodies byte-for-byte, and
+        // every error body carries a per-request requestId (Phase 371) unless the caller supplies it.
         return restTemplate.exchange(
                 "/api/v1/salons/" + salonId + "/masters/" + masterId + "/services", HttpMethod.GET,
-                new HttpEntity<>(fixtures.bearerHeaders(token)), String.class);
+                new HttpEntity<>(ParityRequestId.on(fixtures.bearerHeaders(token))), String.class);
     }
 
     private List<MasterServiceResponse> readServiceList(ResponseEntity<String> resp) throws Exception {
