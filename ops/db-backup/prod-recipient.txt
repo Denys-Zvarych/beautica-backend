@@ -1,0 +1,5 @@
+# Pinned prod age recipient (public key, age1...). REQUIRED for the prod bucket: with no key below, backup.sh
+# refuses every prod run (fail closed) before any network call.
+# Runbook E3: after generating the prod key, commit its `age1...` PUBLIC line here (one line, below), BEFORE the first run (E6).
+# When the bucket is the prod bucket, BACKUP_AGE_RECIPIENT must equal it.
+# The key goes in on STDIN; for the prod key this is `bw get notes '<item>' | ... --identity -`, never a file.

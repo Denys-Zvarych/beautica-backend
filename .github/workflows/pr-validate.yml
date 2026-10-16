@@ -122,6 +122,8 @@ jobs:
       trusted-sha: ${{ steps.select.outputs.trusted_sha }}
       # 'true' when the th:utext guard ran in this job from a trusted (base) copy; otherwise gates runs it.
       forbid-in-plan: ${{ steps.select.outputs.forbid_in_plan }}
+      # 'true' when the db-backup jobs must run: PRs touching ops/db-backup/**, and every nightly run (phase 366).
+      db-backup: ${{ steps.select.outputs.db_backup }}
     steps:
       # A pull_request checkout is the merge commit (parents: base tip, PR head). Depth 2 is exactly
       # enough to diff it against its base parent; other events need only the tip.
@@ -145,6 +147,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           FULL_CI_LABEL: ${{ github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'full-ci') }}
           HEAD_COMMIT: ${{ github.sha }}
+          RUN_REASON: ${{ inputs.reason }}
         run: |
           set -euo pipefail
           # Selector outputs live OUTSIDE the PR tree (a committed build/ci* symlink must not redirect a write).
@@ -201,6 +204,19 @@ jobs:
             # BASE_SHA..HEAD is exactly what the test jobs check out and run (the merge commit).
             BASE_SHA="$base_sha" HEAD_SHA="$(git rev-parse HEAD)" "$trusted/scripts/ci/select-tests.sh"
           fi
+          # Phase 366: ops/db-backup has its own jobs (shellcheck + DbBackupRoundTripIT). They run on a PR only when
+          # that directory or the IT's package (src/test/java/com/beautica/ops/) changed (plain git diff, like `infra`
+          # above) and always on the nightly dispatch. `ops/**`
+          # is a NO_TEST path for the selector, so it never forces a backend run, and the IT's tag keeps it out of the shards.
+          db_backup=false
+          if [[ "$EVENT_NAME" == "workflow_dispatch" && "$RUN_REASON" == "nightly" ]]; then
+            db_backup=true
+          elif [[ "$EVENT_NAME" == "pull_request" ]]; then
+            ops_changed=$(git -c core.quotepath=false diff -z --no-renames --name-only "$base_sha" HEAD \
+              | grep -zE '^(ops/db-backup/|src/test/java/com/beautica/ops/)' | tr '\0' '\n' || true)
+            if [[ -n "$ops_changed" ]]; then db_backup=true; fi
+          fi
+          echo "db_backup=$db_backup" >> "$GITHUB_OUTPUT"
           # selection.env is KEY=VALUE per line (REASON is single-line); publish as lower-case outputs.
           while IFS='=' read -r key value; do
             echo "${key,,}=$value" >> "$GITHUB_OUTPUT"
@@ -360,6 +376,88 @@ jobs:
             exit 1
           fi
 
+  # Phase 366: the nightly DB backup image (ops/db-backup). Runs only when plan says so (a PR touching
+  # ops/db-backup/**, or the nightly dispatch). Never part of the backend shards: DbBackupRoundTripIT is tagged
+  # `db-backup-image`, which build.gradle.kts excludes from the default test task and the selector drops from its lists.
+  db-backup-shellcheck:
+    name: db-backup shellcheck
+    needs: plan
+    if: needs.plan.outputs.db-backup == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: shellcheck ops/db-backup/*.sh
+        run: |
+          set -euo pipefail
+          shellcheck --version
+          shellcheck ops/db-backup/*.sh
+
+      # Supply-chain pin: the base image must be referenced by digest and every apk package by exact version
+      # (bump procedure: ops/db-backup/README.md; the gate itself is ops/db-backup/check-pins.sh).
+      - name: Dockerfile base image is digest-pinned and every apk package is version-pinned
+        run: |
+          set -euo pipefail
+          if ! ops/db-backup/check-pins.sh ops/db-backup/Dockerfile; then
+            echo "::error file=ops/db-backup/Dockerfile::FROM needs @sha256:<digest> and every apk package needs =<version>"
+            exit 1
+          fi
+
+  db-backup-it:
+    name: db-backup image IT
+    needs: plan
+    if: needs.plan.outputs.db-backup == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Java 21
+        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4.8.0
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@748248ddd2a24f49513d8f472f81c3a07d4d50e1 # v4.4.4
+        with:
+          cache-read-only: ${{ github.ref != 'refs/heads/dev' && github.ref != 'refs/heads/main' }}
+
+      - name: Run DbBackupRoundTripIT
+        env:
+          JWT_SECRET: ${{ env.CI_DUMMY_JWT_SECRET }}
+          RUN_REASON: ${{ inputs.reason }}
+        run: |
+          set -euo pipefail
+          args=(test -PdbBackupIt --tests com.beautica.ops.DbBackupRoundTripIT -PtestLogLevel=INFO -PtestRootLogLevel=INFO)
+          # Nightly is the safety net: re-execute instead of replaying a cached result.
+          if [[ "$RUN_REASON" == "nightly" ]]; then args+=(--rerun); fi
+          ./gradlew "${args[@]}"
+
+      # Gradle reports a green run when every test was skipped; the IT must actually have executed.
+      - name: Verify the IT executed
+        run: |
+          set -euo pipefail
+          report=build/test-results/test/TEST-com.beautica.ops.DbBackupRoundTripIT.xml
+          grep -qE 'tests="[1-9][0-9]*"' "$report"
+          if grep -qE 'tests="([0-9]+)" skipped="\1"' "$report"; then echo "::error::every DbBackupRoundTripIT test was skipped"; exit 1; fi
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: test-results-db-backup
+          path: build/test-results/test/*.xml
+          retention-days: 7
+          if-no-files-found: ignore
+
   test:
     name: Test (shard ${{ matrix.shard }})
     needs: plan
@@ -508,7 +606,7 @@ jobs:
 
   ci-gate:
     name: CI Gate
-    needs: [plan, gates, selector-self-test, test, verify]
+    needs: [plan, gates, selector-self-test, test, verify, db-backup-shellcheck, db-backup-it]
     if: always()
     runs-on: ubuntu-latest
     # Normally seconds; an irrelevant-label event waits for the real run it mirrors.
@@ -607,6 +705,12 @@ jobs:
           if [[ "$ci_changed" == "true" ]]; then
             require_success selector-self-test
             [[ "$mode" == "full" ]] || { echo "::error::CI infrastructure changed but mode=$mode"; fail=1; }
+          fi
+
+          # Phase 366: when plan asked for the db-backup jobs they must have passed (never silently skipped).
+          if [[ "$(jq -r '.plan.outputs["db-backup"] // ""' <<<"$NEEDS")" == "true" ]]; then
+            require_success db-backup-shellcheck
+            require_success db-backup-it
           fi
 
           for job in $(jq -r 'keys[]' <<<"$NEEDS"); do
