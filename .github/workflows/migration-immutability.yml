@@ -238,8 +238,91 @@ jobs:
           echo "If you did NOT touch the file(s) listed above, rebase your branch onto the base branch to bring your history up to date."
           exit 1
 
+      # Release-PR exemption (see the SHARED scope block). Decides ONLY the destructive step below.
+      - name: Decide destructive-gate scope
+        id: scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          REPO: ${{ github.repository }}
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+
+          # >>> SHARED-BLOCK:scope:BEGIN
+          # =========================================================
+          # SHARED DESTRUCTIVE-GATE SCOPE DECISION -- keep this block
+          # BYTE-IDENTICAL with the mirror in
+          # `self-test-base-revision-resolution`. The
+          # `verify-gate-mirror-parity` job diffs the two copies.
+          # =========================================================
+          #
+          # Prints exactly one word: `skip-release-pr`, `skip-release-merge` or `gate`.
+          # Only the destructive (expand/contract) step consults it; the
+          # immutability and monotonicity gates ALWAYS run.
+          #
+          # Why a release is exempt: its range holds only migrations that
+          # already passed this gate in their PR into dev, and merged
+          # migrations are immutable, so a failure there is unfixable.
+          #
+          # pull_request: skip ONLY for base main + head branch dev + head repo
+          #   == this repo (a fork's dev must not count). Every PR into dev,
+          #   hotfix/* into main, and anything else is gated.
+          # push to main: BASE_SHA is github.event.before = the OLD main tip, so
+          #   after a release MERGE COMMIT the range old-main...HEAD is the whole
+          #   release and would fail the same way. Skip ONLY when HEAD is a
+          #   two-parent merge whose second parent is already an ancestor of
+          #   origin/dev (everything merged came through dev, hence was gated).
+          #   A hotfix merge (second parent not in dev), a squash/rebase merge
+          #   (one parent), an octopus merge, a direct push, or a missing
+          #   origin/dev all stay gated (fail closed).
+          # Reads EVENT_NAME / BASE_REF / HEAD_REF / HEAD_REPO / REPO / REF from the environment.
+          destructive_gate_scope() {
+            local p2
+            if [ "${EVENT_NAME:-}" = "pull_request" ]; then
+              if [ "${BASE_REF:-}" = "main" ] && [ "${HEAD_REF:-}" = "dev" ] \
+                 && [ -n "${REPO:-}" ] && [ "${HEAD_REPO:-}" = "${REPO}" ]; then
+                echo "skip-release-pr"
+                return 0
+              fi
+              echo "gate"
+              return 0
+            fi
+            if [ "${EVENT_NAME:-}" = "push" ] && [ "${REF:-}" = "refs/heads/main" ]; then
+              if p2="$(git rev-parse --verify --quiet "HEAD^2^{commit}")" \
+                 && ! git rev-parse --verify --quiet "HEAD^3" >/dev/null \
+                 && git rev-parse --verify --quiet "origin/dev^{commit}" >/dev/null \
+                 && git merge-base --is-ancestor "$p2" origin/dev; then
+                echo "skip-release-merge"
+                return 0
+              fi
+            fi
+            echo "gate"
+            return 0
+          }
+          # =========================================================
+          # END SHARED DESTRUCTIVE-GATE SCOPE DECISION
+          # =========================================================
+          # >>> SHARED-BLOCK:scope:END
+
+          decision="$(destructive_gate_scope)"
+          case "$decision" in
+            skip-release-pr)
+              echo "SKIPPING destructive-migration gate: release PR dev -> main from this repo (every migration in range already passed this gate in its PR into dev)."
+              echo "skip=true" >> "$GITHUB_OUTPUT" ;;
+            skip-release-merge)
+              echo "SKIPPING destructive-migration gate: push to main is a merge commit whose second parent is already in origin/dev (release merge; its migrations were gated in their PRs into dev)."
+              echo "skip=true" >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "Destructive-migration gate applies (event=$EVENT_NAME, base=${BASE_REF:-n/a}, head=${HEAD_REF:-n/a})."
+              echo "skip=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+
       # Phase 370 D6: expand/contract gate. Reuses $BASE_SHA from "Resolve base revision" above.
       - name: Require contract-of header on destructive migrations
+        if: steps.scope.outputs.skip != 'true'
         run: |
           set -euo pipefail
 
@@ -2964,6 +3047,121 @@ jobs:
 
           echo "All destructive-migration self-test scenarios passed."
 
+      # Release-PR exemption mirror: hermetic, throwaway repos, decision matrix of the SHARED scope block.
+      - name: Assert the destructive-gate scope skips only same-repo dev to main and dev-sourced main merges
+        run: |
+          set -euo pipefail
+
+          # >>> SHARED-BLOCK:scope:BEGIN
+          # =========================================================
+          # SHARED DESTRUCTIVE-GATE SCOPE DECISION -- keep this block
+          # BYTE-IDENTICAL with the mirror in
+          # `self-test-base-revision-resolution`. The
+          # `verify-gate-mirror-parity` job diffs the two copies.
+          # =========================================================
+          #
+          # Prints exactly one word: `skip-release-pr`, `skip-release-merge` or `gate`.
+          # Only the destructive (expand/contract) step consults it; the
+          # immutability and monotonicity gates ALWAYS run.
+          #
+          # Why a release is exempt: its range holds only migrations that
+          # already passed this gate in their PR into dev, and merged
+          # migrations are immutable, so a failure there is unfixable.
+          #
+          # pull_request: skip ONLY for base main + head branch dev + head repo
+          #   == this repo (a fork's dev must not count). Every PR into dev,
+          #   hotfix/* into main, and anything else is gated.
+          # push to main: BASE_SHA is github.event.before = the OLD main tip, so
+          #   after a release MERGE COMMIT the range old-main...HEAD is the whole
+          #   release and would fail the same way. Skip ONLY when HEAD is a
+          #   two-parent merge whose second parent is already an ancestor of
+          #   origin/dev (everything merged came through dev, hence was gated).
+          #   A hotfix merge (second parent not in dev), a squash/rebase merge
+          #   (one parent), an octopus merge, a direct push, or a missing
+          #   origin/dev all stay gated (fail closed).
+          # Reads EVENT_NAME / BASE_REF / HEAD_REF / HEAD_REPO / REPO / REF from the environment.
+          destructive_gate_scope() {
+            local p2
+            if [ "${EVENT_NAME:-}" = "pull_request" ]; then
+              if [ "${BASE_REF:-}" = "main" ] && [ "${HEAD_REF:-}" = "dev" ] \
+                 && [ -n "${REPO:-}" ] && [ "${HEAD_REPO:-}" = "${REPO}" ]; then
+                echo "skip-release-pr"
+                return 0
+              fi
+              echo "gate"
+              return 0
+            fi
+            if [ "${EVENT_NAME:-}" = "push" ] && [ "${REF:-}" = "refs/heads/main" ]; then
+              if p2="$(git rev-parse --verify --quiet "HEAD^2^{commit}")" \
+                 && ! git rev-parse --verify --quiet "HEAD^3" >/dev/null \
+                 && git rev-parse --verify --quiet "origin/dev^{commit}" >/dev/null \
+                 && git merge-base --is-ancestor "$p2" origin/dev; then
+                echo "skip-release-merge"
+                return 0
+              fi
+            fi
+            echo "gate"
+            return 0
+          }
+          # =========================================================
+          # END SHARED DESTRUCTIVE-GATE SCOPE DECISION
+          # =========================================================
+          # >>> SHARED-BLOCK:scope:END
+
+          fail() { echo "FAIL: $*"; exit 1; }
+
+          W="$(mktemp -d)"
+          cd "$W"
+          git init -q -b main .
+          git config user.email t@t
+          git config user.name t
+          git config commit.gpgsign false
+          git commit -q --allow-empty -m base
+          git checkout -q -b dev
+          git commit -q --allow-empty -m dev-1
+          git update-ref refs/remotes/origin/dev dev
+          git checkout -q main
+          git checkout -q -b hotfix
+          git commit -q --allow-empty -m hotfix-1
+          git checkout -q main
+
+          expect() {
+            local name="$1" want="$2" got
+            got="$(destructive_gate_scope)"
+            [ "$got" = "$want" ] || fail "$name: got '$got', want '$want'"
+            echo "OK: $name -> $want"
+          }
+
+          R="o/r"
+          # --- pull_request matrix ---
+          EVENT_NAME=pull_request BASE_REF=main HEAD_REF=dev HEAD_REPO="$R" REPO="$R" REF="" expect "should_skip_when_sameRepoDevToMain" skip-release-pr
+          EVENT_NAME=pull_request BASE_REF=main HEAD_REF=dev HEAD_REPO="fork/r" REPO="$R" REF="" expect "should_gate_when_forkDevToMain" gate
+          EVENT_NAME=pull_request BASE_REF=main HEAD_REF=hotfix/x HEAD_REPO="$R" REPO="$R" REF="" expect "should_gate_when_hotfixToMain" gate
+          EVENT_NAME=pull_request BASE_REF=dev HEAD_REF=feat/x HEAD_REPO="$R" REPO="$R" REF="" expect "should_gate_when_featToDev" gate
+          EVENT_NAME=pull_request BASE_REF=dev HEAD_REF=dev HEAD_REPO="$R" REPO="$R" REF="" expect "should_gate_when_devToDev" gate
+          EVENT_NAME=pull_request BASE_REF=main HEAD_REF=feat/x HEAD_REPO="$R" REPO="$R" REF="" expect "should_gate_when_featToMain" gate
+          EVENT_NAME=pull_request BASE_REF=main HEAD_REF=dev HEAD_REPO="" REPO="$R" REF="" expect "should_gate_when_headRepoEmpty" gate
+          EVENT_NAME=pull_request BASE_REF=main HEAD_REF=dev HEAD_REPO="" REPO="" REF="" expect "should_gate_when_bothReposEmpty" gate
+
+          # --- push to main ---
+          # Release: merge commit, second parent = dev tip (in origin/dev).
+          git checkout -q main
+          git merge -q --no-ff -m release dev
+          EVENT_NAME=push BASE_REF="" HEAD_REF="" HEAD_REPO="" REPO="$R" REF=refs/heads/main expect "should_skip_when_releaseMergeCommitOnMain" skip-release-merge
+          EVENT_NAME=push BASE_REF="" HEAD_REF="" HEAD_REPO="" REPO="$R" REF=refs/heads/dev expect "should_gate_when_pushToDev" gate
+          # Hotfix: merge commit whose second parent is NOT in origin/dev.
+          git merge -q --no-ff -m hotfix-merge hotfix
+          EVENT_NAME=push BASE_REF="" HEAD_REF="" HEAD_REPO="" REPO="$R" REF=refs/heads/main expect "should_gate_when_hotfixMergeOnMain" gate
+          # Direct commit / squash-style (one parent).
+          git commit -q --allow-empty -m direct
+          EVENT_NAME=push BASE_REF="" HEAD_REF="" HEAD_REPO="" REPO="$R" REF=refs/heads/main expect "should_gate_when_directCommitOnMain" gate
+          # Missing origin/dev fails closed.
+          git checkout -q --detach main~2
+          git update-ref -d refs/remotes/origin/dev
+          EVENT_NAME=push BASE_REF="" HEAD_REF="" HEAD_REPO="" REPO="$R" REF=refs/heads/main expect "should_gate_when_originDevMissing" gate
+
+          echo "All destructive-gate scope self-test scenarios passed."
+
   verify-gate-mirror-parity:
     name: Verify Gate <-> Mirror Parity
     runs-on: ubuntu-latest
@@ -3041,5 +3239,6 @@ jobs:
           check_pair monotonicity 2
           check_pair baserev 3
           check_pair destructive 2
+          check_pair scope 2
 
           echo "All SHARED gate<->mirror blocks are byte-identical."
