@@ -11,7 +11,7 @@ import java.util.Locale;
 /**
  * One-line wiring banner (Phase 368, D5). Pure logging: the fail-closed checks live in
  * {@link EnvironmentFingerprintGuard} (pre-context) and {@link DeploymentEnvironmentStamp} (DB).
- * Logs resource kinds only, never hostnames or credentials.
+ * Logs resource kinds only, never hostnames or credentials ({@code sentry=on|off}, never the DSN — Phase 371).
  */
 @Slf4j
 @Component
@@ -27,8 +27,9 @@ public class EnvironmentBannerRunner implements ApplicationRunner {
 
     @Override
     public void run(ApplicationArguments args) {
-        log.info("beautica_environment={} mail={} sms={} r2_bucket={}",
+        log.info("beautica_environment={} mail={} sms={} r2_bucket={} sentry={}",
                 properties.environment().token(), EnvironmentFingerprintGuard.mailKind(env),
-                properties.sms().mode().name().toLowerCase(Locale.ROOT), EnvironmentFingerprintGuard.r2Bucket(env));
+                properties.sms().mode().name().toLowerCase(Locale.ROOT), EnvironmentFingerprintGuard.r2Bucket(env),
+                EnvironmentFingerprintGuard.sentryState(env));
     }
 }

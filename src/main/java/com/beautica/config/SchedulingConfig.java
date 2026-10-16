@@ -43,8 +43,17 @@ public class SchedulingConfig {
         scheduler.setThreadNamePrefix("sched-");
         scheduler.setWaitForTasksToCompleteOnShutdown(true);
         scheduler.setAwaitTerminationSeconds(20);
-        scheduler.setErrorHandler(t ->
-                log.error("Scheduled task error [{}]: {}", t.getClass().getSimpleName(), t.getMessage()));
+        scheduler.setErrorHandler(SchedulingConfig::logScheduledTaskError);
         return scheduler;
+    }
+
+    /**
+     * Phase 371 (audit-fix cycle 1, finding 3): the throwable is passed AS the throwable, never its message as a
+     * parameter. A message parameter bypasses the Sentry scrubber's persistence branch, so a Postgres
+     * {@code Detail: Key (x)=(value)} would have reached Sentry verbatim; as a throwable the event's exception
+     * value is replaced by the class name. Level and leading wording are unchanged.
+     */
+    static void logScheduledTaskError(Throwable t) {
+        log.error("Scheduled task error [{}]", t.getClass().getSimpleName(), t);
     }
 }

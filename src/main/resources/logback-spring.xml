@@ -1,11 +1,18 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <configuration>
 
+    <!-- Phase 371 (audit-fix cycle 1, finding 7): %msg escaped for the prod JSON line (quotes, backslashes,
+         control characters), so a message can neither break the line nor forge a field. -->
+    <conversionRule conversionWord="jsonMsg" class="com.beautica.common.logging.JsonEscapedMessageConverter"/>
+    <!-- Audit-fix cycle 2, finding 5: the stack trace becomes an escaped, PII-redacted "exception" member of the
+         same JSON line (absent when there is no throwable); %nopex stops logback appending the raw trace. -->
+    <conversionRule conversionWord="jsonEx" class="com.beautica.common.logging.JsonThrowableConverter"/>
+
     <springProfile name="prod">
-        <!-- JSON structured logs for Railway log drain -->
+        <!-- JSON structured logs for Railway log drain; requestId = X-Request-Id (Phase 371, D5) -->
         <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
             <encoder class="ch.qos.logback.classic.encoder.PatternLayoutEncoder">
-                <pattern>{"time":"%d{yyyy-MM-dd'T'HH:mm:ss.SSSZ}","level":"%level","logger":"%logger{36}","msg":"%msg"}%n</pattern>
+                <pattern>{"time":"%d{yyyy-MM-dd'T'HH:mm:ss.SSSZ}","level":"%level","logger":"%logger{36}","requestId":"%X{requestId:-}","msg":"%jsonMsg"%jsonEx}%nopex%n</pattern>
             </encoder>
         </appender>
         <root level="INFO">
@@ -17,7 +24,7 @@
         <!-- Suppress Hibernate SQL and HikariCP noise in test output -->
         <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
             <encoder>
-                <pattern>%d{HH:mm:ss.SSS} %-5level %logger{36} - %msg%n</pattern>
+                <pattern>%d{HH:mm:ss.SSS} %-5level [%X{requestId:-}] %logger{36} - %msg%n</pattern>
             </encoder>
         </appender>
         <root level="INFO">
@@ -29,7 +36,7 @@
         <!-- Human-readable logs for local dev -->
         <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
             <encoder>
-                <pattern>%d{HH:mm:ss.SSS} %highlight(%-5level) %cyan(%logger{36}) - %msg%n</pattern>
+                <pattern>%d{HH:mm:ss.SSS} %highlight(%-5level) [%X{requestId:-}] %cyan(%logger{36}) - %msg%n</pattern>
             </encoder>
         </appender>
         <root level="DEBUG">

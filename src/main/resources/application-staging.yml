@@ -10,6 +10,10 @@ beautica:
     # caught by Mailpit. No fixed OTP, no bypass code.
     mode: capture
 
+# Phase 371 (D3): staging traces at 20% (prod 5%); enabled/DSN rules are inherited from application-prod.yml.
+sentry:
+  traces-sample-rate: 0.2
+
 spring:
   mail:
     # Private-network Mailpit; no auth, no STARTTLS. Brevo relay is never configured here.

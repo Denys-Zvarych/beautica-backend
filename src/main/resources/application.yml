@@ -243,6 +243,33 @@ beautica:
     # DatabaseServerVersionLogger WARNs on mismatch; it never fails boot.
     expected-major: 18
 
+# Phase 371 (D3): Sentry error reporting, EU region. OFF here (base, local, test); application-prod.yml
+# (so also prod,staging) turns it on and binds sentry.dsn. No sentry.dsn here on purpose: without it the
+# Sentry auto-configuration (and the scrubber/options beans) never load in local or test. SENTRY_DSN comes
+# only from the environment — blank = SDK disabled, app boots normally. Events come from the logback appender (ERROR only); 4xx business exceptions are
+# not ERROR-logged. PII is stripped by common/observability/SentryPiiScrubber; in-app package and ignored
+# exception types live in SentryOptionsConfig (no setter on SentryOptions, so not YAML-bindable).
+# EnvironmentFingerprintGuard enforces the sentry-* rules; never set SENTRY_ENVIRONMENT / SENTRY_ENABLED.
+sentry:
+  enabled: false
+  # Lower-case deployment token; the guard rejects any other value (e.g. a stray SENTRY_ENVIRONMENT).
+  environment: ${beautica.environment}
+  # Railway injects the commit SHA for GitHub deploys.
+  release: beautica-backend@${RAILWAY_GIT_COMMIT_SHA:unknown}
+  send-default-pii: false
+  max-request-body-size: none
+  sample-rate: 1.0
+  # Root-scope breadcrumbs are dropped by the scrubber outside a request; 30 bounds the per-request copy.
+  max-breadcrumbs: 30
+  # Never trace health checks (UptimeRobot polls every 5 min; Railway probes too).
+  ignored-transactions:
+    - ".*/actuator(/.*)?"
+  logs:
+    enabled: false
+  logging:
+    minimum-event-level: error
+    minimum-breadcrumb-level: info
+
 app:
   jwt:
     secret: ${JWT_SECRET}

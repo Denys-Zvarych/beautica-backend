@@ -62,4 +62,36 @@ class EnvironmentBannerRunnerTest {
         assertThat(output.getOut()).contains("beautica_environment=prod")
                 .doesNotContain("secret-host.example").doesNotContain("hunter2-secret").doesNotContain("tok-secret");
     }
+
+    @Test
+    @DisplayName("Phase 371 — sentry=on when enabled with a DSN; the DSN itself is never printed")
+    void should_logSentryOn_when_enabledWithDsn(CapturedOutput output) {
+        MockEnvironment env = new MockEnvironment()
+                .withProperty("sentry.enabled", "true")
+                .withProperty("sentry.dsn", "https://dsn-key-secret@o42.ingest.de.sentry.io/45");
+
+        new EnvironmentBannerRunner(env, props(DeployEnvironment.STAGING, SmsMode.CAPTURE))
+                .run(new DefaultApplicationArguments());
+
+        assertThat(output.getOut()).contains("sentry=on")
+                .doesNotContain("dsn-key-secret").doesNotContain("sentry.io");
+    }
+
+    @Test
+    @DisplayName("Phase 371 — sentry=off when the DSN is blank or Sentry is disabled")
+    void should_logSentryOff_when_dsnBlankOrDisabled(CapturedOutput output) {
+        MockEnvironment blankDsn = new MockEnvironment()
+                .withProperty("sentry.enabled", "true").withProperty("sentry.dsn", "");
+        MockEnvironment disabled = new MockEnvironment()
+                .withProperty("sentry.enabled", "false")
+                .withProperty("sentry.dsn", "https://dsn-key-secret@o42.ingest.de.sentry.io/45");
+
+        new EnvironmentBannerRunner(blankDsn, props(DeployEnvironment.STAGING, SmsMode.CAPTURE))
+                .run(new DefaultApplicationArguments());
+        new EnvironmentBannerRunner(disabled, props(DeployEnvironment.LOCAL, SmsMode.TURBOSMS))
+                .run(new DefaultApplicationArguments());
+
+        assertThat(output.getOut()).contains("beautica_environment=staging").contains("sentry=off")
+                .doesNotContain("sentry=on").doesNotContain("dsn-key-secret");
+    }
 }

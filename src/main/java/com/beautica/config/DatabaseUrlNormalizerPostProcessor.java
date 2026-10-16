@@ -106,6 +106,8 @@ public class DatabaseUrlNormalizerPostProcessor implements EnvironmentPostProces
     private static final Set<String> LOOPBACK_HOSTS = Set.of("localhost", "127.0.0.1", "::1", "[::1]");
     private static final String SSLMODE_PARAM = "sslmode";
     private static final String DEFAULT_SSLMODE = "sslmode=require";
+    private static final String SERVER_ERROR_DETAIL_PARAM = "logServerErrorDetail";
+    private static final String SERVER_ERROR_DETAIL_OFF = SERVER_ERROR_DETAIL_PARAM + "=false";
     private static final Set<String> WEAK_SSLMODES = Set.of("disable", "allow", "prefer");
     private static final Set<String> STRONG_SSLMODES = Set.of("require", "verify-ca", "verify-full");
     private static final Set<String> HOST_OVERRIDE_PARAMS = Set.of("host", "pghost", "hostaddr", "pghostaddr");
@@ -180,7 +182,8 @@ public class DatabaseUrlNormalizerPostProcessor implements EnvironmentPostProces
             String filtered = withDefaultSslMode(filterQuery(query, prod), host);
             enforceProdSslFloor(filtered, prod);
             warnOnInsecureTransport(filtered, host, prod);
-            if (!filtered.isEmpty()) jdbcUrl.append('?').append(filtered);
+            filtered = withServerErrorDetailOff(filtered, prod);
+            jdbcUrl.append('?').append(filtered);
 
             Map<String, Object> props = new HashMap<>();
             props.put("spring.datasource.url", jdbcUrl.toString());
@@ -240,6 +243,37 @@ public class DatabaseUrlNormalizerPostProcessor implements EnvironmentPostProces
         ProdTransportViolationException(String message) {
             super(message);
         }
+    }
+
+    /**
+     * Outside prod: appends {@code logServerErrorDetail=false} unless the URL already names that key (an explicit
+     * value wins, like {@code sslmode}). In prod the value is FORCED off (cycle 4, L-NEW-1): every existing
+     * {@code logServerErrorDetail} param (key matched case-insensitively and percent-decoded) is dropped and
+     * {@code =false} appended, so an operator cannot re-enable row values in log stack traces. Overriding rather
+     * than refusing: the setting is a log-hygiene default, not a transport guarantee like {@link #enforceProdSslFloor}.
+     * pgjdbc otherwise copies the server's {@code Detail:} line ({@code Failing row contains (...)}, {@code Key
+     * (x)=(value)}) into {@code PSQLException#getMessage()}, which Hibernate's {@code SqlExceptionHelper} logs: row
+     * values (names, booking notes) must never reach logs or Sentry. The structured constraint name
+     * ({@code ServerErrorMessage#getConstraint}) is unaffected.
+     */
+    private static String withServerErrorDetailOff(String query, boolean prod) {
+        String base = query == null ? "" : query;
+        if (prod) {
+            java.util.List<String> kept = new java.util.ArrayList<>();
+            for (String param : base.split("&")) {
+                if (param.isEmpty()) continue;
+                if (SERVER_ERROR_DETAIL_PARAM.equalsIgnoreCase(fullyDecode(rawKey(param)))) continue;
+                kept.add(param);
+            }
+            kept.add(SERVER_ERROR_DETAIL_OFF);
+            return String.join("&", kept);
+        }
+        if (!base.isEmpty()) {
+            for (String param : base.split("&")) {
+                if (SERVER_ERROR_DETAIL_PARAM.equals(rawKey(param))) return base;
+            }
+        }
+        return base.isEmpty() ? SERVER_ERROR_DETAIL_OFF : base + "&" + SERVER_ERROR_DETAIL_OFF;
     }
 
     private static String withDefaultSslMode(String query, String host) {

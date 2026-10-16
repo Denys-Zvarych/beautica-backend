@@ -3,6 +3,13 @@
 beautica:
   environment: prod
 
+# Phase 371 (D3): on in prod and staging (prod,staging inherits). A blank SENTRY_DSN keeps the SDK disabled
+# and the banner shows sentry=off. Traces: prod 5% (staging overrides to 20%); no profiling.
+sentry:
+  enabled: true
+  dsn: ${SENTRY_DSN:}
+  traces-sample-rate: 0.05
+
 spring:
   jpa:
     show-sql: false
@@ -21,6 +28,8 @@ logging:
   level:
     root: INFO
     com.beautica: INFO
+    # Hibernate logs sqlException.getMessage() (pgjdbc Detail: row values) with no throwable; PII must not reach logs.
+    org.hibernate.engine.jdbc.spi.SqlExceptionHelper: "OFF"
 
 # Explicitly disable OpenAPI / Swagger in production — base config sets these false,
 # but repeating here prevents a sibling profile from accidentally re-enabling them.

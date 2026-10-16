@@ -1,6 +1,8 @@
 package com.beautica.common;
 
+import com.beautica.common.web.RequestIdFilter;
 import com.fasterxml.jackson.annotation.JsonInclude;
+import org.slf4j.MDC;
 
 import java.util.Map;
 
@@ -17,6 +19,10 @@ import java.util.Map;
  *                mobile client reads this top-level {@code errors} key in
  *                {@code ErrorMapperInterceptor._extractFieldErrors} to surface
  *                inline field errors on the edit screen.
+ * @param requestId the request's {@code X-Request-Id} (Phase 371, D5). Filled on error envelopes
+ *                  ({@code success == false}) from the logging MDC set by {@link RequestIdFilter};
+ *                  {@code null} — and therefore omitted from the JSON — on success envelopes and
+ *                  outside a request. Additive field: no existing key changes.
  */
 public record ApiResponse<T>(
         boolean success,
@@ -28,11 +34,19 @@ public record ApiResponse<T>(
         // entirely from the JSON unless a validation handler populates it, so no
         // non-validation response gains a spurious "errors": null key.
         @JsonInclude(JsonInclude.Include.NON_NULL)
-        Map<String, String> errors
+        Map<String, String> errors,
+
+        @JsonInclude(JsonInclude.Include.NON_NULL)
+        String requestId
 ) {
 
     public ApiResponse(boolean success, T data, String message) {
         this(success, data, message, null);
+    }
+
+    /** Every error envelope (including direct {@code new ApiResponse<>(false, …)} callers) carries the request ID. */
+    public ApiResponse(boolean success, T data, String message, Map<String, String> errors) {
+        this(success, data, message, errors, success ? null : MDC.get(RequestIdFilter.MDC_KEY));
     }
 
     public static <T> ApiResponse<T> ok(T data) {

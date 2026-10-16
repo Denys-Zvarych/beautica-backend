@@ -205,6 +205,10 @@ notification:
       batch-size: 1000
       max-batches-per-run: 50
 
+# Phase 371: tests never send anything off-machine. SentryCaptureIT re-enables it against a loopback WireMock DSN.
+sentry:
+  enabled: false
+
 management:
   endpoint:
     health:
