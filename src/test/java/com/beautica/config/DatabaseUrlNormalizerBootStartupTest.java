@@ -111,7 +111,7 @@ class DatabaseUrlNormalizerBootStartupTest {
             var env = ctx.getEnvironment();
 
             assertThat(env.getProperty("spring.datasource.url"))
-                    .isEqualTo("jdbc:postgresql://postgres.railway.internal:5432/railway?sslmode=require");
+                    .isEqualTo("jdbc:postgresql://postgres.railway.internal:5432/railway?sslmode=require&logServerErrorDetail=false");
             assertThat(env.getProperty("spring.datasource.username")).isEqualTo("postgres");
             assertThat(env.getProperty("spring.datasource.password")).isEqualTo(PASSWORD);
         }
@@ -124,7 +124,7 @@ class DatabaseUrlNormalizerBootStartupTest {
                 "postgresql://postgres:" + PASSWORD + "@shuttle.proxy.rlwy.net:41234/railway").run()) {
 
             assertThat(ctx.getEnvironment().getProperty("spring.datasource.url"))
-                    .isEqualTo("jdbc:postgresql://shuttle.proxy.rlwy.net:41234/railway?sslmode=require");
+                    .isEqualTo("jdbc:postgresql://shuttle.proxy.rlwy.net:41234/railway?sslmode=require&logServerErrorDetail=false");
         }
     }
 
@@ -134,7 +134,7 @@ class DatabaseUrlNormalizerBootStartupTest {
         try (ConfigurableApplicationContext ctx = app("postgresql://u:p@localhost:5432/beautica").run()) {
 
             assertThat(ctx.getEnvironment().getProperty("spring.datasource.url"))
-                    .isEqualTo("jdbc:postgresql://localhost:5432/beautica");
+                    .isEqualTo("jdbc:postgresql://localhost:5432/beautica?logServerErrorDetail=false");
         }
     }
 }

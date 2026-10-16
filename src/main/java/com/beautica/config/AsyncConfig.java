@@ -1,12 +1,15 @@
 package com.beautica.config;
 
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.RejectedExecutionHandler;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import io.sentry.spring.jakarta.SentryTaskDecorator;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
 import org.springframework.aop.interceptor.AsyncUncaughtExceptionHandler;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.context.annotation.Bean;
@@ -106,6 +109,55 @@ public class AsyncConfig implements AsyncConfigurer {
     }
 
     /**
+     * Phase 371 (D5): copies the submitting thread's logging MDC (the {@code requestId}) onto the pool thread
+     * for the task's duration, then restores the worker's previous MDC, so an async log line carries the
+     * request ID of the request that queued it. Not applied to {@code blobPurgeExecutor}: its shutdown loss
+     * report inspects the raw queued {@code BlobPurgeTask}s, which a decorator would wrap.
+     */
+    static TaskDecorator mdcPropagatingDecorator() {
+        return runnable -> {
+            Map<String, String> submitted = MDC.getCopyOfContextMap();
+            return () -> {
+                Map<String, String> previous = MDC.getCopyOfContextMap();
+                setMdc(submitted);
+                try {
+                    runnable.run();
+                } finally {
+                    setMdc(previous);
+                }
+            };
+        };
+    }
+
+    private static void setMdc(Map<String, String> context) {
+        if (context == null) {
+            MDC.clear();
+        } else {
+            MDC.setContextMap(context);
+        }
+    }
+
+    /**
+     * {@link #mdcPropagatingDecorator()} plus a per-task Sentry scope ({@link SentryTaskDecorator}, audit-fix
+     * cycle 1, finding 4): the task runs in a scope forked from the submitter's at decoration time and the
+     * previous scope is restored afterwards, so tags/breadcrumbs written by a pooled task never land in the
+     * shared root scope or a later request. A no-op when Sentry is disabled. Applied innermost so the MDC
+     * restore still runs last, including when {@code CallerRunsPolicy} runs the task on the caller thread.
+     */
+    static TaskDecorator taskContextDecorator() {
+        TaskDecorator mdc = mdcPropagatingDecorator();
+        TaskDecorator sentryScope = new SentryTaskDecorator();
+        return runnable -> mdc.decorate(sentryScope.decorate(runnable));
+    }
+
+    /** {@link #classLoaderPropagatingDecorator()} plus {@link #taskContextDecorator()}. */
+    private static TaskDecorator contextPropagatingDecorator() {
+        TaskDecorator classLoader = classLoaderPropagatingDecorator();
+        TaskDecorator taskContext = taskContextDecorator();
+        return runnable -> taskContext.decorate(classLoader.decorate(runnable));
+    }
+
+    /**
      * Inner pool of {@link #emailExecutor(ThreadPoolTaskExecutor)}. Registered as its OWN bean so Spring
      * manages its lifecycle: with {@code waitForTasksToCompleteOnShutdown=true} a
      * {@link ThreadPoolTaskExecutor} bean drains its queue (within {@code awaitTerminationSeconds}) in its
@@ -125,7 +177,7 @@ public class AsyncConfig implements AsyncConfigurer {
         executor.setRejectedExecutionHandler(new ThreadPoolExecutor.AbortPolicy());
         executor.setWaitForTasksToCompleteOnShutdown(true);
         executor.setAwaitTerminationSeconds(EMAIL_SHUTDOWN_GRACE_SECONDS);
-        executor.setTaskDecorator(classLoaderPropagatingDecorator());
+        executor.setTaskDecorator(contextPropagatingDecorator());
         executor.initialize();
         return executor;
     }
@@ -151,7 +203,7 @@ public class AsyncConfig implements AsyncConfigurer {
         executor.setRejectedExecutionHandler(new ThreadPoolExecutor.AbortPolicy());
         executor.setWaitForTasksToCompleteOnShutdown(true);
         executor.setAwaitTerminationSeconds(SUPPORT_EMAIL_SHUTDOWN_GRACE_SECONDS);
-        executor.setTaskDecorator(classLoaderPropagatingDecorator());
+        executor.setTaskDecorator(contextPropagatingDecorator());
         executor.initialize();
         return executor;
     }
@@ -184,7 +236,7 @@ public class AsyncConfig implements AsyncConfigurer {
         executor.setRejectedExecutionHandler(new ThreadPoolExecutor.AbortPolicy());
         executor.setWaitForTasksToCompleteOnShutdown(true);
         executor.setAwaitTerminationSeconds(PUSH_SHUTDOWN_GRACE_SECONDS);
-        executor.setTaskDecorator(classLoaderPropagatingDecorator());
+        executor.setTaskDecorator(contextPropagatingDecorator());
         executor.initialize();
         return executor;
     }
@@ -389,6 +441,7 @@ public class AsyncConfig implements AsyncConfigurer {
         executor.setQueueCapacity(200);
         executor.setThreadNamePrefix("sms-send-");
         executor.setRejectedExecutionHandler(new ThreadPoolExecutor.AbortPolicy());
+        executor.setTaskDecorator(taskContextDecorator());
         // Drain on shutdown: a queued confirmation still has a real client waiting for it, and the
         // grace is short because the queue is small and the sends are independent.
         executor.setWaitForTasksToCompleteOnShutdown(true);
@@ -609,6 +662,7 @@ public class AsyncConfig implements AsyncConfigurer {
         executor.setQueueCapacity(1000);
         executor.setThreadNamePrefix("cache-evict-");
         executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+        executor.setTaskDecorator(taskContextDecorator());
         // Drain the queue on shutdown: a dropped eviction outlives the JVM only as a stale entry in a
         // cache that dies with it, but an in-flight one must not be interrupted mid-scan.
         executor.setWaitForTasksToCompleteOnShutdown(true);

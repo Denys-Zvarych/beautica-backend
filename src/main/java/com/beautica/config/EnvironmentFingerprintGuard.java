@@ -45,6 +45,7 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
     static final String PROD_BUCKET = "beautica-media-prod";
     static final String DEV_INTERNAL_API_KEY = "changeme-dev-only";
     static final int MIN_INTERNAL_API_KEY_LENGTH = 32;
+    static final String SENTRY_EU_HOST_SUFFIX = ".de.sentry.io";
 
     private static final java.util.regex.Pattern EMAIL_SHAPE =
             java.util.regex.Pattern.compile("^[^@\\s]+@[^@\\s]+\\.[a-z]{2,}$", java.util.regex.Pattern.CASE_INSENSITIVE);
@@ -74,10 +75,13 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
         boolean prodProfile = env.acceptsProfiles(PROD);
         boolean stagingProfile = env.acceptsProfiles(STAGING);
         boolean onRailway = !isBlank(env.getProperty(RAILWAY_ENV_VAR));
+        List<String> violations = new ArrayList<>();
+        // Sentry rules run for every environment, including a genuinely local one (Phase 371, D6).
+        checkSentry(env, environment, violations);
         if (environment == DeployEnvironment.LOCAL && !prodProfile && !stagingProfile && !onRailway) {
+            failOnViolations(environment, violations);
             return;
         }
-        List<String> violations = new ArrayList<>();
         checkProfiles(environment, prodProfile, stagingProfile, violations);
         checkRailwayName(env, environment, violations);
         if (environment != DeployEnvironment.LOCAL) {
@@ -90,10 +94,81 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
                 checkStaging(env, violations);
             }
         }
+        failOnViolations(environment, violations);
+    }
+
+    private static void failOnViolations(DeployEnvironment environment, List<String> violations) {
         if (!violations.isEmpty()) {
             throw new IllegalStateException("Environment fingerprint mismatch (beautica.environment="
                     + environment.token() + "): " + String.join("; ", violations));
         }
+    }
+
+    /**
+     * Phase 371 (D6). Messages name the rule and property only — never the DSN (it carries the client key).
+     * <ul>
+     *   <li>{@code sentry-local}: LOCAL (incl. test) may enable Sentry only with a loopback DSN (WireMock ITs).</li>
+     *   <li>{@code sentry-region}: a staging/prod DSN must point at the EU ingest ({@value #SENTRY_EU_HOST_SUFFIX}).</li>
+     *   <li>{@code sentry-debug} / {@code sentry-send-default-pii}: outside LOCAL both must be unset or false
+ *       ({@code SENTRY_DEBUG=true} prints the DSN; default PII would attach IPs and user data).</li>
+ *   <li>{@code sentry-environment}: when enabled, {@code sentry.environment} must equal the lower-case
+     *       {@code beautica.environment} token (blocks a stray {@code SENTRY_ENVIRONMENT}).</li>
+     * </ul>
+     * A blank DSN is allowed everywhere (SDK disabled, banner {@code sentry=off}) — see the phase-371 report for
+     * why {@code sentry-dsn-required} is not enforced in prod.
+     */
+    private static void checkSentry(Environment env, DeployEnvironment environment, List<String> violations) {
+        boolean enabled = sentryEnabledFlag(env);
+        String dsn = readOrNull(env, "sentry.dsn");
+        if (!isBlank(dsn)) {
+            String host = dsnHost(dsn);
+            if (environment == DeployEnvironment.LOCAL) {
+                if (enabled && (host == null || !isLoopback(host))) {
+                    violations.add("rule sentry-local: sentry.enabled must be false in local unless sentry.dsn is loopback");
+                }
+            } else if (host == null || !host.endsWith(SENTRY_EU_HOST_SUFFIX)) {
+                violations.add("rule sentry-region: sentry.dsn host must end with " + SENTRY_EU_HOST_SUFFIX
+                        + " in " + environment.token());
+            }
+        }
+        if (environment != DeployEnvironment.LOCAL) {
+            // SENTRY_DEBUG=true makes the SDK print its options, DSN included, to stdout.
+            if (!isUnsetOrFalse(readOrNull(env, "sentry.debug"))) {
+                violations.add("rule sentry-debug: sentry.debug must be false in " + environment.token());
+            }
+            if (!isUnsetOrFalse(readOrNull(env, "sentry.send-default-pii"))) {
+                violations.add("rule sentry-send-default-pii: sentry.send-default-pii must be false in "
+                        + environment.token());
+            }
+        }
+        if (enabled && !environment.token().equals(readOrNull(env, "sentry.environment"))) {
+            violations.add("rule sentry-environment: sentry.environment must equal beautica.environment");
+        }
+    }
+
+    /** Unset = the SDK default (false). Anything but a literal false (true, garbage) fails closed. */
+    private static boolean isUnsetOrFalse(String raw) {
+        return isBlank(raw) || "false".equalsIgnoreCase(raw.strip());
+    }
+
+    private static boolean sentryEnabledFlag(Environment env) {
+        String raw = readOrNull(env, "sentry.enabled");
+        return raw != null && Boolean.parseBoolean(raw.strip());
+    }
+
+    /** @return the normalised DSN host, or {@code null} when the DSN does not parse or has no host */
+    private static String dsnHost(String dsn) {
+        try {
+            String host = new URI(dsn.strip()).getHost();
+            return host == null || host.isBlank() ? null : normaliseHost(host);
+        } catch (URISyntaxException e) {
+            return null;
+        }
+    }
+
+    /** {@code on} only when Sentry is enabled and a DSN is set — the SDK is a no-op otherwise. Never the DSN. */
+    static String sentryState(Environment env) {
+        return sentryEnabledFlag(env) && !isBlank(readOrNull(env, "sentry.dsn")) ? "on" : "off";
     }
 
     static DeployEnvironment environmentOf(Environment env) {

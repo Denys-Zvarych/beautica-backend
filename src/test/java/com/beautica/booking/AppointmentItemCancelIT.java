@@ -2,6 +2,7 @@ package com.beautica.booking;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import com.beautica.support.ParityRequestId;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.config.TestSecurityConfig;
 import java.time.OffsetDateTime;
@@ -410,7 +411,8 @@ class AppointmentItemCancelIT extends AbstractIntegrationTest {
     }
 
     private ResponseEntity<String> cancel(String token, UUID appointmentId, UUID bookingId, String body) {
-        HttpHeaders headers = fixtures.bearerHeaders(token);
+        // Pinned X-Request-Id so error bodies compared for anti-oracle parity differ in nothing (Phase 371 requestId).
+        HttpHeaders headers = ParityRequestId.on(fixtures.bearerHeaders(token));
         return restTemplate.exchange(
                 APPOINTMENTS_URL + "/" + appointmentId + "/services/" + bookingId + "/cancel",
                 HttpMethod.PATCH, new HttpEntity<>(body, headers), String.class);

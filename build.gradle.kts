@@ -87,6 +87,10 @@ dependencies {
 
     // Observability
     implementation("org.springframework.boot:spring-boot-starter-actuator")
+    // Phase 371: Sentry error reporting (EU region). No Sentry Gradle plugin: source-context upload would
+    // need an auth token in Railway's build, and JVM stack traces are unobfuscated.
+    implementation("io.sentry:sentry-spring-boot-starter-jakarta:8.60.0")
+    implementation("io.sentry:sentry-logback:8.60.0")
 
     // Dev tooling — local-only automatic restart on recompile.
     // 'developmentOnly' is excluded from the repackaged bootJar by the Spring Boot

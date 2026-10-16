@@ -1,5 +1,9 @@
 package com.beautica.auth;
 
+import org.springframework.http.HttpEntity;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
+import com.beautica.support.ParityRequestId;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.EmailNotVerifiedResponse;
@@ -834,13 +838,16 @@ class EmailVerificationIT extends AbstractIntegrationTest {
         var realEmail = "byteident.real@beautica.test";
         registerAndCaptureCode(realEmail);
 
-        ResponseEntity<String> unknown = restTemplate.postForEntity(
-                "/api/v1/auth/verify-email",
-                new VerifyEmailRequest("byteident.ghost@beautica.test", "424242"),
+        // Same X-Request-Id on both calls: every error body carries a per-request requestId
+        // (Phase 371), so the byte comparison below must differ in nothing else.
+        HttpHeaders parityHeaders = ParityRequestId.on(new HttpHeaders());
+        ResponseEntity<String> unknown = restTemplate.exchange(
+                "/api/v1/auth/verify-email", HttpMethod.POST,
+                new HttpEntity<>(new VerifyEmailRequest("byteident.ghost@beautica.test", "424242"), parityHeaders),
                 String.class);
-        ResponseEntity<String> wrongCode = restTemplate.postForEntity(
-                "/api/v1/auth/verify-email",
-                new VerifyEmailRequest(realEmail, "424242"),
+        ResponseEntity<String> wrongCode = restTemplate.exchange(
+                "/api/v1/auth/verify-email", HttpMethod.POST,
+                new HttpEntity<>(new VerifyEmailRequest(realEmail, "424242"), parityHeaders),
                 String.class);
 
         assertThat(unknown.getStatusCode())

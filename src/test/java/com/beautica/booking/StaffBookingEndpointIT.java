@@ -1,5 +1,6 @@
 package com.beautica.booking;
 
+import com.beautica.support.ParityRequestId;
 import com.beautica.config.TestSecurityConfig;
 import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.notification.sms.SmsService;
@@ -843,9 +844,12 @@ class StaffBookingEndpointIT extends AbstractStaffBookingIT {
     /** Overload for targets other than the default salon master, whose own service id differs. */
     private ResponseEntity<String> create(
             UUID masterId, UUID masterServiceId, String token, OffsetDateTime startsAt) {
+        // Pinned X-Request-Id: the denial-parity case compares 403 bodies whole, and each error body
+        // carries a per-request requestId (Phase 371) unless the caller supplies it.
         return restTemplate.exchange(
                 url(masterId), org.springframework.http.HttpMethod.POST,
-                new HttpEntity<>(body(startsAt, masterServiceId), bearerHeaders(token)), String.class);
+                new HttpEntity<>(body(startsAt, masterServiceId), ParityRequestId.on(bearerHeaders(token))),
+                String.class);
     }
 
     private String body(OffsetDateTime startsAt) {

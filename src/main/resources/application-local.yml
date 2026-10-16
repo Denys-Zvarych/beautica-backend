@@ -2,9 +2,14 @@
 beautica:
   environment: local
 
+# Phase 371: local never reports to Sentry, even with SENTRY_DSN exported. Forcing SENTRY_ENABLED=true with a
+# non-loopback DSN fails boot (EnvironmentFingerprintGuard, rule sentry-local).
+sentry:
+  enabled: false
+
 spring:
   datasource:
-    url: jdbc:postgresql://localhost:5432/beautica
+    url: jdbc:postgresql://localhost:5432/beautica?logServerErrorDetail=false
     username: beautica
     password: beautica
     driver-class-name: org.postgresql.Driver

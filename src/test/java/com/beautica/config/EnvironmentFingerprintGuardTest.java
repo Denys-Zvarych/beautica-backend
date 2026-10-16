@@ -580,4 +580,171 @@ class EnvironmentFingerprintGuardTest {
 
         assertThatCode(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS)).doesNotThrowAnyException();
     }
+
+    // ---- Phase 371, D6: Sentry rules ----------------------------------------------------------------
+
+    private static final String EU_DSN = "https://0123456789abcdef@o42.ingest.de.sentry.io/4500000000000001";
+    private static final String US_DSN = "https://0123456789abcdef@o42.ingest.us.sentry.io/4500000000000001";
+
+    private static MockEnvironment localEnv() {
+        return new MockEnvironment();
+    }
+
+    @Test
+    @DisplayName("sentry-local: LOCAL with sentry.enabled=true and a real DSN — fails, DSN not in message")
+    void should_fail_when_localEnablesSentryWithRealDsn() {
+        MockEnvironment env = localEnv().withProperty("sentry.enabled", "true").withProperty("sentry.dsn", EU_DSN)
+                .withProperty("sentry.environment", "local");
+
+        assertThatThrownBy(() -> run(env, DeployEnvironment.LOCAL, SmsMode.TURBOSMS))
+                .hasMessageContaining("rule sentry-local").hasMessageContaining("sentry.enabled")
+                .message().doesNotContain("0123456789abcdef").doesNotContain("sentry.io");
+    }
+
+    @Test
+    @DisplayName("sentry-local: LOCAL with a real DSN but sentry.enabled=false (A3 default) — passes")
+    void should_pass_when_localHasRealDsnButSentryDisabled() {
+        MockEnvironment env = localEnv().withProperty("sentry.enabled", "false").withProperty("sentry.dsn", EU_DSN);
+
+        assertThatCode(() -> run(env, DeployEnvironment.LOCAL, SmsMode.TURBOSMS)).doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("sentry-local: LOCAL (test ITs) enabled with a loopback WireMock DSN — passes")
+    void should_pass_when_localEnablesSentryWithLoopbackDsn() {
+        MockEnvironment env = localEnv().withProperty("sentry.enabled", "true")
+                .withProperty("sentry.dsn", "http://k@localhost:34567/1").withProperty("sentry.environment", "local");
+
+        assertThatCode(() -> run(env, DeployEnvironment.LOCAL, SmsMode.TURBOSMS)).doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("sentry-local: LOCAL enabled with an unparseable DSN — fails closed")
+    void should_fail_when_localEnablesSentryWithUnparseableDsn() {
+        MockEnvironment env = localEnv().withProperty("sentry.enabled", "true")
+                .withProperty("sentry.dsn", "not a dsn").withProperty("sentry.environment", "local");
+
+        assertThatThrownBy(() -> run(env, DeployEnvironment.LOCAL, SmsMode.TURBOSMS))
+                .hasMessageContaining("rule sentry-local").message().doesNotContain("not a dsn");
+    }
+
+    @Test
+    @DisplayName("sentry-environment: enabled with sentry.environment != beautica.environment — fails")
+    void should_fail_when_sentryEnvironmentDiffers() {
+        MockEnvironment env = prodEnv().withProperty("sentry.enabled", "true").withProperty("sentry.dsn", EU_DSN)
+                .withProperty("sentry.environment", "staging");
+
+        assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                .hasMessageContaining("rule sentry-environment").hasMessageContaining("sentry.environment")
+                .message().doesNotContain("0123456789abcdef");
+    }
+
+    @Test
+    @DisplayName("sentry-environment: enabled with matching lower-case token — passes (prod and staging)")
+    void should_pass_when_sentryEnvironmentMatches() {
+        MockEnvironment prod = prodEnv().withProperty("sentry.enabled", "true").withProperty("sentry.dsn", EU_DSN)
+                .withProperty("sentry.environment", "prod");
+        MockEnvironment staging = stagingEnv().withProperty("sentry.enabled", "true")
+                .withProperty("sentry.dsn", EU_DSN).withProperty("sentry.environment", "staging");
+
+        assertThatCode(() -> run(prod, DeployEnvironment.PROD, SmsMode.TURBOSMS)).doesNotThrowAnyException();
+        assertThatCode(() -> run(staging, DeployEnvironment.STAGING, SmsMode.CAPTURE)).doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("sentry-environment: LOCAL enabled with a stray SENTRY_ENVIRONMENT value — fails")
+    void should_fail_when_localSentryEnvironmentOverridden() {
+        MockEnvironment env = localEnv().withProperty("sentry.enabled", "true")
+                .withProperty("sentry.dsn", "http://k@127.0.0.1:34567/1").withProperty("sentry.environment", "prod");
+
+        assertThatThrownBy(() -> run(env, DeployEnvironment.LOCAL, SmsMode.TURBOSMS))
+                .hasMessageContaining("rule sentry-environment");
+    }
+
+    @Test
+    @DisplayName("sentry-region: prod and staging DSN on the US ingest — fails, DSN not in message")
+    void should_fail_when_dsnIsNotEuRegion() {
+        MockEnvironment prod = prodEnv().withProperty("sentry.enabled", "true").withProperty("sentry.dsn", US_DSN)
+                .withProperty("sentry.environment", "prod");
+        MockEnvironment staging = stagingEnv().withProperty("sentry.enabled", "true")
+                .withProperty("sentry.dsn", US_DSN).withProperty("sentry.environment", "staging");
+
+        assertThatThrownBy(() -> run(prod, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                .hasMessageContaining("rule sentry-region").hasMessageContaining("sentry.dsn")
+                .message().doesNotContain("0123456789abcdef").doesNotContain("o42");
+        assertThatThrownBy(() -> run(staging, DeployEnvironment.STAGING, SmsMode.CAPTURE))
+                .hasMessageContaining("rule sentry-region");
+    }
+
+    @Test
+    @DisplayName("sentry-region: a look-alike host (de.sentry.io.evil.test) — fails")
+    void should_fail_when_dsnHostOnlyContainsEuSuffix() {
+        MockEnvironment env = prodEnv().withProperty("sentry.enabled", "true")
+                .withProperty("sentry.dsn", "https://k@o1.ingest.de.sentry.io.evil.test/1")
+                .withProperty("sentry.environment", "prod");
+
+        assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                .hasMessageContaining("rule sentry-region");
+    }
+
+    @Test
+    @DisplayName("blank SENTRY_DSN — staging and prod still boot (Sentry off; user hard rule overrides D6 sentry-dsn-required)")
+    void should_pass_when_dsnBlankInStagingAndProd() {
+        MockEnvironment prod = prodEnv().withProperty("sentry.enabled", "true").withProperty("sentry.dsn", "")
+                .withProperty("sentry.environment", "prod");
+        MockEnvironment staging = stagingEnv().withProperty("sentry.enabled", "true").withProperty("sentry.dsn", "")
+                .withProperty("sentry.environment", "staging");
+
+        assertThatCode(() -> run(prod, DeployEnvironment.PROD, SmsMode.TURBOSMS)).doesNotThrowAnyException();
+        assertThatCode(() -> run(staging, DeployEnvironment.STAGING, SmsMode.CAPTURE)).doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("sentryState: on only with enabled + DSN; never returns the DSN")
+    void should_reportSentryState_when_banner() {
+        assertThat(EnvironmentFingerprintGuard.sentryState(new MockEnvironment()
+                .withProperty("sentry.enabled", "true").withProperty("sentry.dsn", EU_DSN))).isEqualTo("on");
+        assertThat(EnvironmentFingerprintGuard.sentryState(new MockEnvironment()
+                .withProperty("sentry.enabled", "true").withProperty("sentry.dsn", " "))).isEqualTo("off");
+        assertThat(EnvironmentFingerprintGuard.sentryState(new MockEnvironment()
+                .withProperty("sentry.enabled", "false").withProperty("sentry.dsn", EU_DSN))).isEqualTo("off");
+    }
+
+    @Test
+    @DisplayName("sentry-debug: SENTRY_DEBUG=true in prod or staging — fails naming the rule, never the DSN")
+    void should_fail_when_sentryDebugOutsideLocal() {
+        MockEnvironment prod = prodEnv().withProperty("sentry.enabled", "true").withProperty("sentry.dsn", EU_DSN)
+                .withProperty("sentry.environment", "prod").withProperty("sentry.debug", "true");
+        MockEnvironment staging = stagingEnv().withProperty("sentry.debug", "TRUE");
+
+        assertThatThrownBy(() -> run(prod, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                .hasMessageContaining("rule sentry-debug").hasMessageContaining("sentry.debug")
+                .message().doesNotContain("0123456789abcdef").doesNotContain("o42");
+        assertThatThrownBy(() -> run(staging, DeployEnvironment.STAGING, SmsMode.CAPTURE))
+                .hasMessageContaining("rule sentry-debug");
+    }
+
+    @Test
+    @DisplayName("sentry-send-default-pii: true (or garbage) in prod/staging — fails")
+    void should_fail_when_sendDefaultPiiOutsideLocal() {
+        MockEnvironment prod = prodEnv().withProperty("sentry.send-default-pii", "true");
+        MockEnvironment staging = stagingEnv().withProperty("sentry.send-default-pii", "yes");
+
+        assertThatThrownBy(() -> run(prod, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                .hasMessageContaining("rule sentry-send-default-pii").hasMessageContaining("sentry.send-default-pii");
+        assertThatThrownBy(() -> run(staging, DeployEnvironment.STAGING, SmsMode.CAPTURE))
+                .hasMessageContaining("rule sentry-send-default-pii");
+    }
+
+    @Test
+    @DisplayName("sentry.debug / send-default-pii explicitly false in prod — passes; true in LOCAL — not this rule's concern")
+    void should_pass_when_debugAndPiiFalseOrLocal() {
+        MockEnvironment prod = prodEnv().withProperty("sentry.debug", "false")
+                .withProperty("sentry.send-default-pii", "false");
+        MockEnvironment local = localEnv().withProperty("sentry.debug", "true")
+                .withProperty("sentry.send-default-pii", "true");
+
+        assertThatCode(() -> run(prod, DeployEnvironment.PROD, SmsMode.TURBOSMS)).doesNotThrowAnyException();
+        assertThatCode(() -> run(local, DeployEnvironment.LOCAL, SmsMode.TURBOSMS)).doesNotThrowAnyException();
+    }
 }

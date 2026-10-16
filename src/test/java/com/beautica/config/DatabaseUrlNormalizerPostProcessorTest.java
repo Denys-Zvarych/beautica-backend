@@ -59,7 +59,7 @@ class DatabaseUrlNormalizerPostProcessorTest {
 
             assertThat(env.getProperty("spring.datasource.url"))
                     .as("JDBC url: scheme rewritten, credentials stripped, sslmode kept")
-                    .isEqualTo("jdbc:postgresql://db-host.example.com/beautica?sslmode=require");
+                    .isEqualTo("jdbc:postgresql://db-host.example.com/beautica?sslmode=require&logServerErrorDetail=false");
             assertThat(env.getProperty("spring.datasource.username"))
                     .isEqualTo("app_user");
             assertThat(env.getProperty("spring.datasource.password"))
@@ -75,7 +75,7 @@ class DatabaseUrlNormalizerPostProcessorTest {
             processor.postProcessEnvironment(env, null);
 
             assertThat(env.getProperty("spring.datasource.url"))
-                    .isEqualTo("jdbc:postgresql://db.internal:6543/beautica?sslmode=require");
+                    .isEqualTo("jdbc:postgresql://db.internal:6543/beautica?sslmode=require&logServerErrorDetail=false");
         }
 
         @Test
@@ -87,7 +87,7 @@ class DatabaseUrlNormalizerPostProcessorTest {
             processor.postProcessEnvironment(env, null);
 
             assertThat(env.getProperty("spring.datasource.url"))
-                    .isEqualTo("jdbc:postgresql://host.example.com/beautica?sslmode=require");
+                    .isEqualTo("jdbc:postgresql://host.example.com/beautica?sslmode=require&logServerErrorDetail=false");
             assertThat(env.getProperty("spring.datasource.username")).isEqualTo("user");
             assertThat(env.getProperty("spring.datasource.password")).isEqualTo("pass");
         }
@@ -108,7 +108,7 @@ class DatabaseUrlNormalizerPostProcessorTest {
 
             assertThat(env.getProperty("spring.datasource.url"))
                     .as("only the JDBC-understood sslmode survives the filter")
-                    .isEqualTo("jdbc:postgresql://host/beautica?sslmode=require");
+                    .isEqualTo("jdbc:postgresql://host/beautica?sslmode=require&logServerErrorDetail=false");
         }
 
         @Test
@@ -120,7 +120,7 @@ class DatabaseUrlNormalizerPostProcessorTest {
             processor.postProcessEnvironment(env, null);
 
             assertThat(env.getProperty("spring.datasource.url"))
-                    .isEqualTo("jdbc:postgresql://localhost/beautica");
+                    .isEqualTo("jdbc:postgresql://localhost/beautica?logServerErrorDetail=false");
         }
 
         @Test
@@ -132,7 +132,7 @@ class DatabaseUrlNormalizerPostProcessorTest {
             processor.postProcessEnvironment(env, null);
 
             assertThat(env.getProperty("spring.datasource.url"))
-                    .isEqualTo("jdbc:postgresql://localhost/beautica");
+                    .isEqualTo("jdbc:postgresql://localhost/beautica?logServerErrorDetail=false");
         }
     }
 
@@ -151,7 +151,7 @@ class DatabaseUrlNormalizerPostProcessorTest {
             assertThat(env.getProperty("spring.datasource.username")).isEqualTo("lonely_user");
             assertThat(env.getProperty("spring.datasource.password")).isNull();
             assertThat(env.getProperty("spring.datasource.url"))
-                    .isEqualTo("jdbc:postgresql://localhost/beautica");
+                    .isEqualTo("jdbc:postgresql://localhost/beautica?logServerErrorDetail=false");
         }
 
         @Test
@@ -163,7 +163,7 @@ class DatabaseUrlNormalizerPostProcessorTest {
             processor.postProcessEnvironment(env, null);
 
             assertThat(env.getProperty("spring.datasource.url"))
-                    .isEqualTo("jdbc:postgresql://host/beautica?sslmode=require");
+                    .isEqualTo("jdbc:postgresql://host/beautica?sslmode=require&logServerErrorDetail=false");
             assertThat(env.getProperty("spring.datasource.username")).isNull();
             assertThat(env.getProperty("spring.datasource.password")).isNull();
         }
@@ -231,7 +231,7 @@ class DatabaseUrlNormalizerPostProcessorTest {
             processor.postProcessEnvironment(env, null);
 
             assertThat(env.getProperty("spring.datasource.url"))
-                    .isEqualTo("jdbc:postgresql://postgres.railway.internal:5432/railway?sslmode=require");
+                    .isEqualTo("jdbc:postgresql://postgres.railway.internal:5432/railway?sslmode=require&logServerErrorDetail=false");
             assertThat(env.getProperty("spring.datasource.username")).isEqualTo("postgres");
             assertThat(env.getProperty("spring.datasource.password")).isEqualTo("AbC123xyz");
         }
@@ -245,7 +245,7 @@ class DatabaseUrlNormalizerPostProcessorTest {
             processor.postProcessEnvironment(env, null);
 
             assertThat(env.getProperty("spring.datasource.url"))
-                    .isEqualTo("jdbc:postgresql://shuttle.proxy.rlwy.net:41234/railway?sslmode=require");
+                    .isEqualTo("jdbc:postgresql://shuttle.proxy.rlwy.net:41234/railway?sslmode=require&logServerErrorDetail=false");
         }
 
         @Test
@@ -256,7 +256,7 @@ class DatabaseUrlNormalizerPostProcessorTest {
             processor.postProcessEnvironment(env, null);
 
             assertThat(env.getProperty("spring.datasource.url"))
-                    .isEqualTo("jdbc:postgresql://db.example.com/beautica?sslmode=disable");
+                    .isEqualTo("jdbc:postgresql://db.example.com/beautica?sslmode=disable&logServerErrorDetail=false");
         }
 
         @Test
@@ -267,7 +267,7 @@ class DatabaseUrlNormalizerPostProcessorTest {
             processor.postProcessEnvironment(env, null);
 
             assertThat(env.getProperty("spring.datasource.url"))
-                    .isEqualTo("jdbc:postgresql://db.example.com/beautica?sslmode=verify-full");
+                    .isEqualTo("jdbc:postgresql://db.example.com/beautica?sslmode=verify-full&logServerErrorDetail=false");
         }
 
         @ParameterizedTest
@@ -279,7 +279,7 @@ class DatabaseUrlNormalizerPostProcessorTest {
             processor.postProcessEnvironment(env, null);
 
             assertThat(env.getProperty("spring.datasource.url"))
-                    .isEqualTo("jdbc:postgresql://" + host + ":5432/beautica");
+                    .isEqualTo("jdbc:postgresql://" + host + ":5432/beautica?logServerErrorDetail=false");
         }
 
         @Test
@@ -300,7 +300,7 @@ class DatabaseUrlNormalizerPostProcessorTest {
             processor.postProcessEnvironment(env, null);
 
             assertThat(env.getProperty("spring.datasource.url"))
-                    .isEqualTo("jdbc:postgresql://db.example.com/beautica?connectTimeout=10&sslmode=require");
+                    .isEqualTo("jdbc:postgresql://db.example.com/beautica?connectTimeout=10&sslmode=require&logServerErrorDetail=false");
         }
 
         @Test
@@ -311,7 +311,7 @@ class DatabaseUrlNormalizerPostProcessorTest {
             processor.postProcessEnvironment(env, null);
 
             assertThat(env.getProperty("spring.datasource.url"))
-                    .isEqualTo("jdbc:postgresql://db.example.com/beautica?sslmode=require");
+                    .isEqualTo("jdbc:postgresql://db.example.com/beautica?sslmode=require&logServerErrorDetail=false");
         }
 
         @Test
@@ -342,7 +342,7 @@ class DatabaseUrlNormalizerPostProcessorTest {
             logs.switchOverAll();
 
             assertThat(env.getProperty("spring.datasource.url"))
-                    .isEqualTo("jdbc:postgresql://secret-host.example.com/beautica?sslmode=" + mode);
+                    .isEqualTo("jdbc:postgresql://secret-host.example.com/beautica?sslmode=" + mode + "&logServerErrorDetail=false");
             assertThat(output.getAll())
                     .contains("DATABASE_URL sslmode=" + mode.toLowerCase() + " on a non-loopback host")
                     .doesNotContain("Sup3rS3cret")
@@ -430,7 +430,7 @@ class DatabaseUrlNormalizerPostProcessorTest {
             processor.postProcessEnvironment(env, null);
 
             assertThat(env.getProperty("spring.datasource.url"))
-                    .isEqualTo("jdbc:postgresql://postgres.railway.internal:5432/railway?sslmode=require");
+                    .isEqualTo("jdbc:postgresql://postgres.railway.internal:5432/railway?sslmode=require&logServerErrorDetail=false");
         }
 
         @ParameterizedTest
@@ -517,7 +517,7 @@ class DatabaseUrlNormalizerPostProcessorTest {
             processor.postProcessEnvironment(env, null);
 
             assertThat(env.getProperty("spring.datasource.url"))
-                    .isEqualTo("jdbc:postgresql://localhost.:5432/beautica");
+                    .isEqualTo("jdbc:postgresql://localhost.:5432/beautica?logServerErrorDetail=false");
         }
 
         @ParameterizedTest
@@ -577,7 +577,7 @@ class DatabaseUrlNormalizerPostProcessorTest {
             logs.switchOverAll();
 
             assertThat(env.getProperty("spring.datasource.url"))
-                    .isEqualTo("jdbc:postgresql://db.example.com/beautica?application_name=x&sslmode=require");
+                    .isEqualTo("jdbc:postgresql://db.example.com/beautica?application_name=x&sslmode=require&logServerErrorDetail=false");
             assertThat(output.getAll())
                     .contains("host-override query parameter dropped")
                     .doesNotContain("evil");
@@ -604,7 +604,7 @@ class DatabaseUrlNormalizerPostProcessorTest {
             processor.postProcessEnvironment(env, null);
 
             assertThat(env.getProperty("spring.datasource.url"))
-                    .isEqualTo("jdbc:postgresql://db.example.com/beautica?sslmode=require");
+                    .isEqualTo("jdbc:postgresql://db.example.com/beautica?sslmode=require&logServerErrorDetail=false");
         }
 
         @ParameterizedTest
@@ -631,7 +631,7 @@ class DatabaseUrlNormalizerPostProcessorTest {
             processor.postProcessEnvironment(env, null);
 
             assertThat(env.getProperty("spring.datasource.url"))
-                    .isEqualTo("jdbc:postgresql://postgres.railway.internal:5432/" + dbName + "?sslmode=require");
+                    .isEqualTo("jdbc:postgresql://postgres.railway.internal:5432/" + dbName + "?sslmode=require&logServerErrorDetail=false");
         }
 
         @ParameterizedTest
@@ -656,7 +656,7 @@ class DatabaseUrlNormalizerPostProcessorTest {
             logs.switchOverAll();
 
             assertThat(env.getProperty("spring.datasource.url"))
-                    .isEqualTo("jdbc:postgresql://db.example.com/beautica?sslmode=%2564isable");
+                    .isEqualTo("jdbc:postgresql://db.example.com/beautica?sslmode=%2564isable&logServerErrorDetail=false");
             assertThat(output.getAll()).contains("sslmode=disable on a non-loopback host");
         }
 
@@ -669,7 +669,7 @@ class DatabaseUrlNormalizerPostProcessorTest {
             processor.postProcessEnvironment(env, null);
 
             assertThat(env.getProperty("spring.datasource.url"))
-                    .isEqualTo("jdbc:postgresql://db.example.com/beautica?ApplicationName=a%26host%3Devil&sslmode=require");
+                    .isEqualTo("jdbc:postgresql://db.example.com/beautica?ApplicationName=a%26host%3Devil&sslmode=require&logServerErrorDetail=false");
         }
 
         @Test
@@ -704,7 +704,7 @@ class DatabaseUrlNormalizerPostProcessorTest {
             processor.postProcessEnvironment(env, null);
 
             assertThat(env.getProperty("spring.datasource.url"))
-                    .isEqualTo("jdbc:postgresql://postgres.railway.internal:5432/railway?sslmode=require");
+                    .isEqualTo("jdbc:postgresql://postgres.railway.internal:5432/railway?sslmode=require&logServerErrorDetail=false");
         }
 
         @Test
@@ -716,7 +716,7 @@ class DatabaseUrlNormalizerPostProcessorTest {
             processor.postProcessEnvironment(env, null);
 
             assertThat(env.getProperty("spring.datasource.url"))
-                    .isEqualTo("jdbc:postgresql://postgres.railway.internal:5432?sslmode=require");
+                    .isEqualTo("jdbc:postgresql://postgres.railway.internal:5432?sslmode=require&logServerErrorDetail=false");
         }
 
         @Test
@@ -768,7 +768,7 @@ class DatabaseUrlNormalizerPostProcessorTest {
             logs.switchOverAll();
 
             assertThat(env.getProperty("spring.datasource.url"))
-                    .isEqualTo("jdbc:postgresql://db.example.com/beautica?sslmode=require");
+                    .isEqualTo("jdbc:postgresql://db.example.com/beautica?sslmode=require&logServerErrorDetail=false");
             assertThat(output.getAll())
                     .contains("DATABASE_URL encoded or case-variant sslmode parameter dropped")
                     .doesNotContain("Sup3rS3cret");
@@ -793,7 +793,7 @@ class DatabaseUrlNormalizerPostProcessorTest {
             logs.switchOverAll();
 
             assertThat(env.getProperty("spring.datasource.url"))
-                    .isEqualTo("jdbc:postgresql://db.example.com/beautica?sslmode=disable");
+                    .isEqualTo("jdbc:postgresql://db.example.com/beautica?sslmode=disable&logServerErrorDetail=false");
             assertThat(output.getAll())
                     .contains("DATABASE_URL carries more than one sslmode parameter; the last one is used")
                     .contains("DATABASE_URL sslmode=disable on a non-loopback host")
@@ -820,7 +820,7 @@ class DatabaseUrlNormalizerPostProcessorTest {
             processor.postProcessEnvironment(env, null);
 
             assertThat(env.getProperty("spring.datasource.url"))
-                    .isEqualTo("jdbc:postgresql://postgres.railway.internal:5432/railway?sslmode=" + mode);
+                    .isEqualTo("jdbc:postgresql://postgres.railway.internal:5432/railway?sslmode=" + mode + "&logServerErrorDetail=false");
         }
 
         @Test
@@ -831,7 +831,74 @@ class DatabaseUrlNormalizerPostProcessorTest {
             processor.postProcessEnvironment(env, null);
 
             assertThat(env.getProperty("spring.datasource.url"))
-                    .isEqualTo("jdbc:postgresql://postgres.railway.internal:5432/railway?application_name=x&sslmode=require");
+                    .isEqualTo("jdbc:postgresql://postgres.railway.internal:5432/railway?application_name=x&sslmode=require&logServerErrorDetail=false");
+        }
+    }
+
+    @Nested
+    @DisplayName("logServerErrorDetail=false — Postgres row details never reach logs (phase 371 M1)")
+    class ServerErrorDetailOff {
+
+        @Test
+        @DisplayName("param appended to a remote URL, sslmode and other existing params kept")
+        void should_appendLogServerErrorDetailFalse_when_existingParamsPresent() {
+            StandardEnvironment env = environmentWith(
+                    "postgresql://u:p@db.example.com/beautica?connectTimeout=10&sslmode=require");
+
+            processor.postProcessEnvironment(env, null);
+
+            assertThat(env.getProperty("spring.datasource.url")).isEqualTo(
+                    "jdbc:postgresql://db.example.com/beautica?connectTimeout=10&sslmode=require&logServerErrorDetail=false");
+        }
+
+        @Test
+        @DisplayName("loopback URL without a query still gets the param")
+        void should_appendLogServerErrorDetailFalse_when_loopbackAndNoQuery() {
+            StandardEnvironment env = environmentWith("postgresql://u:p@localhost:5432/beautica");
+
+            processor.postProcessEnvironment(env, null);
+
+            assertThat(env.getProperty("spring.datasource.url"))
+                    .isEqualTo("jdbc:postgresql://localhost:5432/beautica?logServerErrorDetail=false");
+        }
+
+        @Test
+        @DisplayName("an explicit logServerErrorDetail in the URL wins and is not duplicated")
+        void should_keepExplicitValue_when_logServerErrorDetailAlreadyPresent() {
+            StandardEnvironment env = environmentWith(
+                    "postgresql://u:p@db.example.com/beautica?logServerErrorDetail=true&sslmode=require");
+
+            processor.postProcessEnvironment(env, null);
+
+            assertThat(env.getProperty("spring.datasource.url")).isEqualTo(
+                    "jdbc:postgresql://db.example.com/beautica?logServerErrorDetail=true&sslmode=require");
+        }
+
+        @Test
+        @DisplayName("non-prod: explicit logServerErrorDetail=true stays (explicit wins outside prod)")
+        void should_keepExplicitTrue_when_nonProdUrlSetsTrue() {
+            StandardEnvironment env = environmentWith(
+                    "postgresql://u:p@localhost/beautica?logServerErrorDetail=true");
+
+            processor.postProcessEnvironment(env, null);
+
+            assertThat(env.getProperty("spring.datasource.url"))
+                    .isEqualTo("jdbc:postgresql://localhost/beautica?logServerErrorDetail=true");
+        }
+
+        @ParameterizedTest
+        @ValueSource(strings = {"logServerErrorDetail=true", "LOGSERVERERRORDETAIL=true",
+                "%6CogServerErrorDetail=true", "logServerErrorDetail=true&logServerErrorDetail=true"})
+        @DisplayName("prod: any logServerErrorDetail variant is dropped and false is forced")
+        void should_forceServerErrorDetailOff_when_prodUrlSetsTrue(String param) {
+            StandardEnvironment env = environmentWith(
+                    "postgresql://u:p@postgres.railway.internal:5432/railway?sslmode=require&" + param);
+            env.setActiveProfiles("prod");
+
+            processor.postProcessEnvironment(env, null);
+
+            assertThat(env.getProperty("spring.datasource.url")).isEqualTo(
+                    "jdbc:postgresql://postgres.railway.internal:5432/railway?sslmode=require&logServerErrorDetail=false");
         }
     }
 }
