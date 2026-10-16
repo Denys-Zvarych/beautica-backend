@@ -15,7 +15,7 @@ name: Promotion Source
 #   * `permissions: {}` (no token scopes at all);
 #   * NO checkout, no `uses:` step, no PR code or artifact is ever fetched or run;
 #   * every author-controlled value (branch names, PR title, head repo) reaches the shell ONLY through
-#     `env:`, never through ${{ }} interpolation inside `run:`.
+#     `env:`, never through expression interpolation inside `run:`.
 #
 # Rule:
 #   base main -> head must be `dev` (release) or `hotfix/*` (hotfix), from THIS repo (a fork branch named
@@ -24,7 +24,7 @@ name: Promotion Source
 #   any other base is rejected (the `branches` filter below means it never runs for one).
 #
 # REQUIRED GITHUB SETTINGS (repo admin; cannot be set from code):
-#   * The job name embeds the PR's base branch: `Promotion source (${{ github.event.pull_request.base.ref }})`.
+#   * The job name embeds the PR's base branch: `Promotion source (<base.ref expression>)`, spelled out on the `name:` line of the job below.
 #     The `branches` filter below limits base.ref to main or dev, so exactly two check names can exist:
 #       - the `dev` ruleset   MUST require `Promotion source (dev)`
 #       - the `main` ruleset  MUST require `Promotion source (main)`

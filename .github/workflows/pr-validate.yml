@@ -342,7 +342,7 @@ jobs:
 
       - name: verify-selected-ran.sh accepts classes that ran
         run: |
-          printf '%s\n' com.beautica.ci.AffectedTestSelectorTest com.beautica.ci.TestShardingTest > "$RUNNER_TEMP/real.txt"
+          printf '%s\n' com.beautica.ci.AffectedTestSelectorTest com.beautica.ci.TestShardingTest com.beautica.ci.CiInfraCoverageTest > "$RUNNER_TEMP/real.txt"
           ./scripts/ci/verify-selected-ran.sh "$RUNNER_TEMP/real.txt"
 
       - name: verify-selected-ran.sh rejects a class that did not run
