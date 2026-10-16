@@ -94,3 +94,5 @@ f7d5cf62c55b7a08ba8d71679777365aeec1a047:src/test/java/com/beautica/config/Datab
 f7d5cf62c55b7a08ba8d71679777365aeec1a047:src/test/java/com/beautica/config/OutboundTimeoutsBindingTest.java:private-key:54
 02c2a6e724ca6cd9950d1153f7c017fe5e265960:src/test/java/com/beautica/config/FirebaseLocalProfileContextTest.java:private-key:50
 02c2a6e724ca6cd9950d1153f7c017fe5e265960:src/test/java/com/beautica/config/FirebaseConfigTest.java:private-key:210
+35e8d9d53bcd2b82c7103b15286faafa42521368:src/test/java/com/beautica/config/FirebaseLocalProfileContextTest.java:private-key:50
+35e8d9d53bcd2b82c7103b15286faafa42521368:src/test/java/com/beautica/config/FirebaseConfigTest.java:private-key:210

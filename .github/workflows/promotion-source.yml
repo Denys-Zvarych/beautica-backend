@@ -7,8 +7,8 @@ name: Promotion Source
 #      retargeted to main/dev was never re-checked. This workflow listens to `edited` (base-branch and
 #      title changes both fire it).
 #   2. Self-editing. A `pull_request` run executes the PR's OWN copy of the workflow, so a PR could simply
-#      weaken its own guard. `pull_request_target` runs the workflow file from the BASE branch, so the PR
-#      cannot change the rule applied to it.
+#      weaken its own guard. `pull_request_target` runs the workflow file from the repo's DEFAULT branch
+#      (`main`; GitHub change of 2025-12-08), so no PR into dev or main can change the rule applied to it.
 #
 # SAFETY CONTRACT (enforced by CiInfraCoverageTest.should_keepPullRequestTargetConfined_when_workflowsRead):
 #   * this is the ONLY workflow allowed to use `pull_request_target`;
@@ -34,17 +34,10 @@ name: Promotion Source
 #     does not satisfy main's required `Promotion source (main)`; a retarget fires `edited`, which creates a
 #     fresh run under the new name. It is deliberately NOT a need of `CI Gate`: it is a separate required
 #     check so that a retarget re-evaluates it independently of the pr-validate run.
-#   * BOOTSTRAP: `pull_request_target` reads the workflow from the base branch, so this file only starts
-#     running for PRs into a branch AFTER it exists on that branch. Marking a check required on `dev`
-#     before this file is on `dev` (or on `main` before it is on `main`) would block every PR forever,
-#     because the check never reports. Order:
-#       1. Merge this file to `dev`, then require `Promotion source (dev)` on the dev ruleset.
-#       2. BEFORE the first release, put the file on `main` without waiting for a full release: merge a small
-#          PR from `hotfix/promotion-guard-bootstrap` into `main` that adds ONLY
-#          `.github/workflows/promotion-source.yml` (a hotfix/* head is an allowed source for main, and this
-#          PR is itself unguarded because the file is not on main yet), and sync it back to dev with a
-#          `sync:` PR. Only then require `Promotion source (main)` on the main ruleset.
-#     Until step 2 is done the first release PR into main is unguarded by this workflow.
+#   * SOURCE OF THIS FILE: GitHub runs `pull_request_target` from the DEFAULT branch (`main`), never from
+#     the PR's base branch (changelog 2025-11-07, effective 2025-12-08). The copy on `dev` takes effect
+#     only after the next release `dev -> main`. Bootstrapped by the first releases (backend #155,
+#     mobile #94, 2026-10-16); only after a check name has reported on a PR may it be made required.
 #   * CODEOWNERS owns .github/** so a PR cannot change this file without the owner (a merged change is what
 #     takes effect, never the PR's copy).
 
