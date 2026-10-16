@@ -184,6 +184,62 @@ class CiInfraCoverageTest {
         }
     }
 
+    /**
+     * `pull_request_target` runs with the base branch's workflow and (by default) a privileged token, so it is
+     * confined to exactly one workflow, the promotion-source guard, and only while that file has no checkout,
+     * no `uses:` step and `permissions: {}`.
+     */
+    @Test
+    void should_confinePullRequestTargetToPromotionGuard_when_workflowsRead() throws IOException {
+        Path allowed = Path.of(".github/workflows/promotion-source.yml");
+        List<Path> workflows;
+        try (var stream = Files.list(Path.of(".github/workflows"))) {
+            workflows = stream.filter(p -> p.getFileName().toString().endsWith(".yml")).sorted().toList();
+        }
+        assertThat(workflows).as("the guard workflow must exist").contains(allowed);
+
+        for (Path workflow : workflows) {
+            boolean usesTarget = Files.readAllLines(workflow).stream()
+                .anyMatch(l -> !l.stripLeading().startsWith("#") && l.contains("pull_request_target"));
+            if (!workflow.equals(allowed)) {
+                assertThat(usesTarget).as("%s must not use pull_request_target", workflow).isFalse();
+            }
+        }
+
+        List<String> lines = Files.readAllLines(allowed);
+        List<String> code = lines.stream().filter(l -> !l.stripLeading().startsWith("#")).toList();
+        assertThat(code).as("guard triggers on pull_request_target").anyMatch(l -> l.startsWith("  pull_request_target:"));
+        assertThat(code).as("retargets and title edits must re-run the guard")
+            .anyMatch(l -> l.contains("types:") && l.contains("edited"));
+        assertThat(code).as("no checkout / action step: PR code must never be fetched")
+            .noneMatch(l -> l.contains("uses:") || l.contains("checkout"));
+        assertThat(code).as("workflow-level permissions are empty").contains("permissions: {}");
+        assertThat(code.stream().filter(l -> l.strip().equals("permissions: {}")).count())
+            .as("job-level permissions are empty too").isGreaterThanOrEqualTo(2);
+        boolean inRun = false;
+        int runIndent = 0;
+        for (String l : code) {
+            int indent = l.length() - l.stripLeading().length();
+            if (inRun && !l.isBlank() && indent <= runIndent) {
+                inRun = false;
+            }
+            if (inRun) {
+                assertThat(l).as("author-controlled values must reach the shell via env:, never ${{ }} in run:")
+                    .doesNotContain("${{");
+            }
+            if (l.strip().equals("run: |")) {
+                inRun = true;
+                runIndent = indent;
+            }
+        }
+        // The job name embeds the base branch: a re-run replays the ORIGINAL event, so a green run created
+        // while the PR targeted dev reports "Promotion source (dev)" and can never satisfy main's
+        // required "Promotion source (main)" after a retarget. Exactly this templated name, nothing looser.
+        assertThat(code).as("required check name is templated on the base branch")
+            .contains("    name: Promotion source (${{ github.event.pull_request.base.ref }})");
+        assertThat(code).as("no other job-name form").noneMatch(l -> l.equals("    name: Promotion source"));
+    }
+
     /** Every checkout step in EVERY workflow must drop the GITHUB_TOKEN from .git/config. */
     @Test
     void should_notPersistCredentials_when_anyCheckoutStep() throws IOException {
