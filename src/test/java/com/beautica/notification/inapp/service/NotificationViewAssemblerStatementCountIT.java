@@ -17,13 +17,11 @@ import com.beautica.notification.inapp.entity.InAppNotificationType;
 import com.beautica.notification.inapp.repository.InAppNotificationRepository;
 import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
-import com.beautica.service.entity.CatalogCategory;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.OwnerType;
 import com.beautica.service.entity.PriceType;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.entity.ServiceType;
-import com.beautica.service.repository.CatalogCategoryRepository;
 import com.beautica.service.repository.MasterServiceRepository;
 import com.beautica.service.repository.ServiceRepository;
 import com.beautica.service.repository.ServiceTypeRepository;
@@ -44,7 +42,6 @@ import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -70,8 +67,6 @@ class NotificationViewAssemblerStatementCountIT extends AbstractIntegrationTest 
     @Autowired
     private MasterRepository masterRepository;
     @Autowired
-    private CatalogCategoryRepository catalogCategoryRepository;
-    @Autowired
     private ServiceTypeRepository serviceTypeRepository;
     @Autowired
     private ServiceRepository serviceRepository;
@@ -85,8 +80,6 @@ class NotificationViewAssemblerStatementCountIT extends AbstractIntegrationTest 
     private SalonRepository salonRepository;
     @Autowired
     private EntityManagerFactory emf;
-
-    private static final AtomicInteger SORT_ORDER_SEQ = new AtomicInteger(700_000);
 
     private User client;
     private Master master;
@@ -105,18 +98,9 @@ class NotificationViewAssemblerStatementCountIT extends AbstractIntegrationTest 
                 .isActive(true)
                 .build());
 
-        CatalogCategory category = catalogCategoryRepository.save(CatalogCategory.builder()
-                .nameUk("Нігті")
-                .nameEn("Nails")
-                .sortOrder(SORT_ORDER_SEQ.getAndIncrement())
-                .build());
-        ServiceType serviceType = serviceTypeRepository.save(ServiceType.builder()
-                .category(category)
-                .nameUk("Манікюр")
-                .nameEn("Manicure")
-                .slug("stmt-count-type-" + UUID.randomUUID())
-                .platformCategoryName("NAIL_SERVICE")
-                .build());
+        // Reuse the V75-seeded active type: inserting new active service_types rows leaks across
+        // tests (cleanDb() does not wipe service_types) and breaks seed-count assertions elsewhere.
+        ServiceType serviceType = serviceTypeRepository.findActiveByPlatformCategoryName("NAIL_SERVICE").get(0);
         ServiceDefinition serviceDefinition = serviceRepository.save(ServiceDefinition.builder()
                 .ownerType(OwnerType.INDEPENDENT_MASTER)
                 .ownerId(master.getId())
@@ -221,18 +205,9 @@ class NotificationViewAssemblerStatementCountIT extends AbstractIntegrationTest 
                 .reviewCount(0)
                 .isActive(true)
                 .build());
-        CatalogCategory category = catalogCategoryRepository.save(CatalogCategory.builder()
-                .nameUk("Брови")
-                .nameEn("Brows")
-                .sortOrder(SORT_ORDER_SEQ.getAndIncrement())
-                .build());
-        ServiceType serviceType = serviceTypeRepository.save(ServiceType.builder()
-                .category(category)
-                .nameUk("Корекція брів")
-                .nameEn("Brow shaping")
-                .slug("stmt-count-salon-type-" + UUID.randomUUID())
-                .platformCategoryName("BROWS")
-                .build());
+        // Reuse the V75-seeded active type: inserting new active service_types rows leaks across
+        // tests (cleanDb() does not wipe service_types) and breaks seed-count assertions elsewhere.
+        ServiceType serviceType = serviceTypeRepository.findActiveByPlatformCategoryName("BROWS").get(0);
         ServiceDefinition serviceDefinition = serviceRepository.save(ServiceDefinition.builder()
                 .ownerType(OwnerType.SALON)
                 .ownerId(salon.getId())

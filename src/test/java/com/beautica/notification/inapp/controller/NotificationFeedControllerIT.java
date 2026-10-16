@@ -14,13 +14,11 @@ import com.beautica.master.repository.MasterRepository;
 import com.beautica.notification.inapp.entity.InAppNotificationType;
 import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
-import com.beautica.service.entity.CatalogCategory;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.OwnerType;
 import com.beautica.service.entity.PriceType;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.entity.ServiceType;
-import com.beautica.service.repository.CatalogCategoryRepository;
 import com.beautica.service.repository.MasterServiceRepository;
 import com.beautica.service.repository.ServiceRepository;
 import com.beautica.service.repository.ServiceTypeRepository;
@@ -49,7 +47,6 @@ import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.time.temporal.ChronoUnit;
 import java.util.UUID;
-import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -61,8 +58,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 class NotificationFeedControllerIT extends AbstractIntegrationTest {
 
     private static final String TEST_PASSWORD = "Str0ngP@ss1!";
-    private static final AtomicInteger SORT_ORDER_SEQ = new AtomicInteger(710_000);
-
     @Autowired
     private TestRestTemplate restTemplate;
     @Autowired
@@ -75,8 +70,6 @@ class NotificationFeedControllerIT extends AbstractIntegrationTest {
     private MasterRepository masterRepository;
     @Autowired
     private SalonRepository salonRepository;
-    @Autowired
-    private CatalogCategoryRepository catalogCategoryRepository;
     @Autowired
     private ServiceTypeRepository serviceTypeRepository;
     @Autowired
@@ -105,18 +98,9 @@ class NotificationFeedControllerIT extends AbstractIntegrationTest {
                 .isActive(true)
                 .build());
 
-        CatalogCategory category = catalogCategoryRepository.save(CatalogCategory.builder()
-                .nameUk("Нігті")
-                .nameEn("Nails")
-                .sortOrder(SORT_ORDER_SEQ.getAndIncrement())
-                .build());
-        ServiceType serviceType = serviceTypeRepository.save(ServiceType.builder()
-                .category(category)
-                .nameUk("Манікюр")
-                .nameEn("Manicure")
-                .slug("feed-it-type-" + UUID.randomUUID())
-                .platformCategoryName("NAIL_SERVICE")
-                .build());
+        // Reuse the V75-seeded active type: inserting new active service_types rows leaks across
+        // tests (cleanDb() does not wipe service_types) and breaks seed-count assertions elsewhere.
+        ServiceType serviceType = serviceTypeRepository.findActiveByPlatformCategoryName("NAIL_SERVICE").get(0);
         ServiceDefinition serviceDefinition = serviceRepository.save(ServiceDefinition.builder()
                 .ownerType(OwnerType.INDEPENDENT_MASTER)
                 .ownerId(master.getId())

@@ -134,7 +134,12 @@ tasks.named<Jar>("jar") {
 }
 
 tasks.withType<Test> {
-    useJUnitPlatform()
+    // Phase 366: DbBackupRoundTripIT builds the ops/db-backup image and pulls three more, so it is tagged
+    // `db-backup-image`, kept out of every default/sharded run, and run alone by its own CI job with
+    // `-PdbBackupIt`. The selector drops the same tag from its lists (SelectorRules.SEPARATE_JOB_TAGS).
+    useJUnitPlatform {
+        if (project.hasProperty("dbBackupIt")) includeTags("db-backup-image") else excludeTags("db-backup-image")
+    }
     // Docker Engine 25+ requires minimum API version 1.40.
     // Testcontainers 1.20.x ships a shaded docker-java that hardcodes VERSION_1_32 in
     // DockerClientProviderStrategy.getDockerClient() unless "api.version" is set in the

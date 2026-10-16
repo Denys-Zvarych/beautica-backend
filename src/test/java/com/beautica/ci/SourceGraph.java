@@ -156,7 +156,7 @@ final class SourceGraph {
     private void link() {
         Map<String, Pattern> mentions = new HashMap<>();
         for (SourceFile f : files.values()) {
-            if (f.isConcreteTestClass()) {
+            if (f.isConcreteTestClass() && !f.runsInSeparateJob()) {
                 testClassPaths.add(f.path());
             }
             mentions.put(f.path(), Pattern.compile("\\b(?:" + String.join("|", f.declaredTypeNames()) + ")\\b"));

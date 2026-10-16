@@ -45,6 +45,18 @@ final class SelectorRules {
         "**/*.md",
         ".gitignore",
         ".gitleaks*",
+        // Phase 366: ops/db-backup is built and tested by its own CI job (DbBackupRoundTripIT +
+        // shellcheck, see pr-validate.yml), never by the backend test shards.
+        "ops/**",
+    };
+
+    /**
+     * JUnit {@code @Tag}s whose test classes run in a dedicated CI job, never in the selector's lists or
+     * shards (they build Docker images, which would slow and destabilise every shard). build.gradle.kts
+     * excludes the same tags from the default {@code test} task.
+     */
+    static final String[] SEPARATE_JOB_TAGS = {
+        "db-backup-image",
     };
 
     /** Spring-wired-without-import markers (D4): a changed main file containing one forces full. */
