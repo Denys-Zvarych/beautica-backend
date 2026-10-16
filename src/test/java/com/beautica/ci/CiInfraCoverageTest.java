@@ -3,13 +3,18 @@ package com.beautica.ci;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.MethodSource;
 
 /**
  * Keeps three hand-maintained lists in step: {@link SelectorRules#ALWAYS_FULL_GLOB_SOURCES}, the
@@ -22,6 +27,12 @@ class CiInfraCoverageTest {
 
     private static final Path CODEOWNERS = Path.of(".github/CODEOWNERS");
     private static final Path WORKFLOW = Path.of(".github/workflows/pr-validate.yml");
+
+    /**
+     * SHA-256 of the raw bytes of .github/workflows/promotion-source.yml. Update in the SAME PR as any edit to
+     * that file (`sha256sum .github/workflows/promotion-source.yml`).
+     */
+    static final String PROMOTION_SOURCE_SHA256 = "8fea5c98ff4aaf95a99e3780327662e6025d0c9999a1369bdfaa84d66f860eec";
 
     /** Application source: always-full for the selector, but it cannot change how tests execute. */
     private static boolean isMainSource(String glob) {
@@ -186,58 +197,15 @@ class CiInfraCoverageTest {
 
     /**
      * `pull_request_target` runs with the base branch's workflow and (by default) a privileged token, so it is
-     * confined to exactly one workflow, the promotion-source guard, and only while that file has no checkout,
-     * no `uses:` step and `permissions: {}`.
+     * confined to exactly one workflow, the promotion-source guard, pinned by SHA-256 and structurally minimal.
+     * The checker lives in {@link PullRequestTargetGuardChecker}; its mutation cases are in
+     * {@link PullRequestTargetGuardCases}. The pin is always enforced here.
      */
     @Test
-    void should_confinePullRequestTargetToPromotionGuard_when_workflowsRead() throws IOException {
-        Path allowed = Path.of(".github/workflows/promotion-source.yml");
-        List<Path> workflows;
-        try (var stream = Files.list(Path.of(".github/workflows"))) {
-            workflows = stream.filter(p -> p.getFileName().toString().endsWith(".yml")).sorted().toList();
-        }
-        assertThat(workflows).as("the guard workflow must exist").contains(allowed);
+    void should_confinePullRequestTargetToPromotionGuard_when_workflowsRead() {
+        List<String> violations = PullRequestTargetGuardChecker.check(Path.of(".github/workflows"), true);
 
-        for (Path workflow : workflows) {
-            boolean usesTarget = Files.readAllLines(workflow).stream()
-                .anyMatch(l -> !l.stripLeading().startsWith("#") && l.contains("pull_request_target"));
-            if (!workflow.equals(allowed)) {
-                assertThat(usesTarget).as("%s must not use pull_request_target", workflow).isFalse();
-            }
-        }
-
-        List<String> lines = Files.readAllLines(allowed);
-        List<String> code = lines.stream().filter(l -> !l.stripLeading().startsWith("#")).toList();
-        assertThat(code).as("guard triggers on pull_request_target").anyMatch(l -> l.startsWith("  pull_request_target:"));
-        assertThat(code).as("retargets and title edits must re-run the guard")
-            .anyMatch(l -> l.contains("types:") && l.contains("edited"));
-        assertThat(code).as("no checkout / action step: PR code must never be fetched")
-            .noneMatch(l -> l.contains("uses:") || l.contains("checkout"));
-        assertThat(code).as("workflow-level permissions are empty").contains("permissions: {}");
-        assertThat(code.stream().filter(l -> l.strip().equals("permissions: {}")).count())
-            .as("job-level permissions are empty too").isGreaterThanOrEqualTo(2);
-        boolean inRun = false;
-        int runIndent = 0;
-        for (String l : code) {
-            int indent = l.length() - l.stripLeading().length();
-            if (inRun && !l.isBlank() && indent <= runIndent) {
-                inRun = false;
-            }
-            if (inRun) {
-                assertThat(l).as("author-controlled values must reach the shell via env:, never ${{ }} in run:")
-                    .doesNotContain("${{");
-            }
-            if (l.strip().equals("run: |")) {
-                inRun = true;
-                runIndent = indent;
-            }
-        }
-        // The job name embeds the base branch: a re-run replays the ORIGINAL event, so a green run created
-        // while the PR targeted dev reports "Promotion source (dev)" and can never satisfy main's
-        // required "Promotion source (main)" after a retarget. Exactly this templated name, nothing looser.
-        assertThat(code).as("required check name is templated on the base branch")
-            .contains("    name: Promotion source (${{ github.event.pull_request.base.ref }})");
-        assertThat(code).as("no other job-name form").noneMatch(l -> l.equals("    name: Promotion source"));
+        assertThat(violations).as("pull_request_target confinement violations").isEmpty();
     }
 
     /** Every checkout step in EVERY workflow must drop the GITHUB_TOKEN from .git/config. */
@@ -279,5 +247,110 @@ class CiInfraCoverageTest {
             }
         }
         assertThat(total).as("checkout steps found (guards against a vacuous scan)").isGreaterThanOrEqualTo(9);
+    }
+
+    // ---- pull_request_target guard: mutation cases (port of the mobile guard's --self-test) -------------------
+
+    private static final Path PROMOTION_SOURCE = Path.of(".github/workflows/promotion-source.yml");
+
+    static java.util.stream.Stream<PullRequestTargetGuardCases.Case> guardCases() {
+        return PullRequestTargetGuardCases.negativeCaseStream();
+    }
+
+    private static Path write(Path dir, String name, String text) throws IOException {
+        return Files.write(dir.resolve(name), text.getBytes(StandardCharsets.UTF_8));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("guardCases")
+    void should_rejectWorkflows_when_guardMutationApplied(PullRequestTargetGuardCases.Case c, @TempDir Path dir)
+        throws IOException {
+        String guard = c.guard().apply(Files.readString(PROMOTION_SOURCE, StandardCharsets.UTF_8));
+        if (!c.name().equals("missing")) {
+            write(dir, "promotion-source.yml", guard);
+        }
+        for (var f : c.files().entrySet()) {
+            write(dir, f.getKey(), f.getValue());
+        }
+
+        List<String> violations = PullRequestTargetGuardChecker.check(dir, c.pinned());
+
+        assertThat(violations).as("case %s must be rejected", c.name())
+            .anyMatch(v -> v.contains(c.needle()));
+    }
+
+    @Test
+    void should_acceptWorkflows_when_cleanCopyChecked(@TempDir Path dir) throws IOException {
+        Files.copy(PROMOTION_SOURCE, dir.resolve("promotion-source.yml"));
+        write(dir, "other.yml", PullRequestTargetGuardCases.DEFAULT_OTHER);
+
+        assertThat(PullRequestTargetGuardChecker.check(dir, true)).as("pinned").isEmpty();
+        assertThat(PullRequestTargetGuardChecker.check(dir, false)).as("structural only").isEmpty();
+    }
+
+    @Test
+    void should_acceptWorkflows_when_otherFileOnlyMentionsTargetInComment(@TempDir Path dir) throws IOException {
+        Files.copy(PROMOTION_SOURCE, dir.resolve("promotion-source.yml"));
+        write(dir, "other.yml", PullRequestTargetGuardCases.DEFAULT_OTHER + "# pull_request_target in a comment\n");
+
+        assertThat(PullRequestTargetGuardChecker.check(dir, false)).isEmpty();
+    }
+
+    @Test
+    void should_acceptWorkflows_when_otherFileUsesBenignListTrigger(@TempDir Path dir) throws IOException {
+        Files.copy(PROMOTION_SOURCE, dir.resolve("promotion-source.yml"));
+        write(dir, "other.yml", "on: [push, pull_request]\n");
+
+        assertThat(PullRequestTargetGuardChecker.check(dir, false)).isEmpty();
+    }
+
+    @Test
+    void should_ignoreNonWorkflowFiles_when_extensionIsNotYaml(@TempDir Path dir) throws IOException {
+        Files.copy(PROMOTION_SOURCE, dir.resolve("promotion-source.yml"));
+        write(dir, "notes.txt", "on: pull_request_target\n");
+        write(dir, "other.yml.bak", "on: pull_request_target\n");
+        Files.createDirectory(dir.resolve("sub"));
+        write(dir.resolve("sub"), "nested.yml", "on: pull_request_target\n");
+
+        assertThat(PullRequestTargetGuardChecker.check(dir, false)).isEmpty();
+    }
+
+    @Test
+    void should_failPin_when_guardChanged(@TempDir Path dir) throws IOException {
+        write(dir, "promotion-source.yml", Files.readString(PROMOTION_SOURCE, StandardCharsets.UTF_8).replace("timeout-minutes: 5", "timeout-minutes: 6"));
+
+        assertThat(PullRequestTargetGuardChecker.check(dir, true)).anyMatch(v -> v.contains("update the pinned hash"));
+    }
+
+    @Test
+    void should_splitRawLines_when_unicodeLineBreaksPresent() {
+        assertThat(PullRequestTargetGuardChecker.splitRawLines("a\r\nb\nc\rd\u0085e\u2028f\u2029g\n"))
+            .containsExactly("a", "b", "c", "d", "e", "f", "g");
+    }
+
+    @Test
+    void should_rejectSymlinkedOtherWorkflow_when_otherYmlIsLink(@TempDir Path dir) throws IOException {
+        Files.copy(PROMOTION_SOURCE, dir.resolve("promotion-source.yml"));
+        write(dir, "real.txt", "on: push\n");
+        symlinkOrSkip(dir.resolve("other.yml"), Path.of("real.txt"));
+
+        assertThat(PullRequestTargetGuardChecker.check(dir, false)).anyMatch(v -> v.contains("other.yml: is a symlink"));
+    }
+
+    @Test
+    void should_rejectSymlinkedGuard_when_promotionSourceIsLink(@TempDir Path dir) throws IOException {
+        Files.copy(PROMOTION_SOURCE, dir.resolve("real.txt"));
+        write(dir, "other.yml", PullRequestTargetGuardCases.DEFAULT_OTHER);
+        symlinkOrSkip(dir.resolve("promotion-source.yml"), Path.of("real.txt"));
+
+        assertThat(PullRequestTargetGuardChecker.check(dir, false)).anyMatch(v -> v.contains("promotion-source.yml: is a symlink"));
+    }
+
+    private static void symlinkOrSkip(Path link, Path target) {
+        try {
+            Files.createSymbolicLink(link, target);
+        } catch (IOException | UnsupportedOperationException e) {
+            Assumptions.abort("symlinks unsupported here");
+        }
     }
 }
