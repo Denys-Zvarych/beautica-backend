@@ -11,6 +11,7 @@ import java.util.Random;
 import java.util.Set;
 import java.util.function.Function;
 import java.util.function.ToIntFunction;
+import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 class TestShardingTest {
@@ -35,6 +36,7 @@ class TestShardingTest {
     }
 
     @Test
+    @DisplayName("should cover every class exactly once when split into shards")
     void should_coverEveryClassExactlyOnce_when_splitIntoShards() {
         List<String> suite = realisticSuite();
 
@@ -46,6 +48,7 @@ class TestShardingTest {
     }
 
     @Test
+    @DisplayName("should keep shards pairwise disjoint when split")
     void should_keepShardsPairwiseDisjoint_when_split() {
         List<List<String>> shards = TestSharder.split(realisticSuite(), BY_NAME, 3);
 
@@ -54,6 +57,7 @@ class TestShardingTest {
     }
 
     @Test
+    @DisplayName("should give same split when input order differs")
     void should_giveSameSplit_when_inputOrderDiffers() {
         List<String> suite = realisticSuite();
         List<String> shuffled = new ArrayList<>(suite);
@@ -63,6 +67,7 @@ class TestShardingTest {
     }
 
     @Test
+    @DisplayName("should balance weight within one heaviest class when split realistic suite")
     void should_balanceWeightWithinOneHeaviestClass_when_splitRealisticSuite() {
         List<List<String>> shards = TestSharder.split(realisticSuite(), BY_NAME, 3);
 
@@ -72,6 +77,7 @@ class TestShardingTest {
     }
 
     @Test
+    @DisplayName("should spread heavy classes evenly when they cluster in one package")
     void should_spreadHeavyClassesEvenly_when_theyClusterInOnePackage() {
         List<String> suite = new ArrayList<>();
         for (int i = 0; i < 9; i++) {
@@ -87,6 +93,7 @@ class TestShardingTest {
     }
 
     @Test
+    @DisplayName("should assign heaviest first to lightest shard when split small suite")
     void should_assignHeaviestFirstToLightestShard_when_splitSmallSuite() {
         ToIntFunction<String> weigher = fqn -> switch (fqn) {
             case "a.A" -> 7;
@@ -103,6 +110,7 @@ class TestShardingTest {
     }
 
     @Test
+    @DisplayName("should return whole list in one shard when single shard")
     void should_returnWholeListInOneShard_when_singleShard() {
         List<String> suite = realisticSuite();
 
@@ -110,16 +118,19 @@ class TestShardingTest {
     }
 
     @Test
+    @DisplayName("should return empty shards when list is empty")
     void should_returnEmptyShards_when_listIsEmpty() {
         assertThat(TestSharder.split(List.of(), BY_NAME, 3)).containsExactly(List.of(), List.of(), List.of());
     }
 
     @Test
+    @DisplayName("should drop duplicates when input repeats aclass")
     void should_dropDuplicates_when_inputRepeatsAClass() {
         assertThat(TestSharder.split(List.of("a.ATest", "a.ATest"), BY_NAME, 2)).containsExactly(List.of("a.ATest"), List.of());
     }
 
     @Test
+    @DisplayName("should reject non positive shard count when split")
     void should_rejectNonPositiveShardCount_when_split() {
         assertThatThrownBy(() -> TestSharder.split(List.of("a.BTest"), BY_NAME, 0)).isInstanceOf(IllegalArgumentException.class);
     }
@@ -131,6 +142,7 @@ class TestShardingTest {
     }
 
     @Test
+    @DisplayName("should keep nested family in one shard when subclasses share ancestor")
     void should_keepNestedFamilyInOneShard_when_subclassesShareAncestor() {
         List<String> suite = new ArrayList<>(List.of("com.beautica.nest.LegacyShapeIT", "com.beautica.nest.VisitShapeIT"));
         for (int i = 0; i < 9; i++) {
@@ -147,6 +159,7 @@ class TestShardingTest {
     }
 
     @Test
+    @DisplayName("should split family when no ancestor information is given")
     void should_splitFamily_when_noAncestorInformationIsGiven() {
         List<String> suite = List.of("com.beautica.nest.LegacyShapeIT", "com.beautica.nest.VisitShapeIT");
 
@@ -156,6 +169,7 @@ class TestShardingTest {
     }
 
     @Test
+    @DisplayName("should merge families when classes share only one of two ancestors")
     void should_mergeFamilies_when_classesShareOnlyOneOfTwoAncestors() {
         List<String> suite = List.of("a.XIT", "a.YIT", "a.ZIT", "a.WIT");
         Function<String, List<String>> ancestors = fqn -> switch (fqn) {

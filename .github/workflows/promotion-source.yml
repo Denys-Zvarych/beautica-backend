@@ -10,7 +10,7 @@ name: Promotion Source
 #      weaken its own guard. `pull_request_target` runs the workflow file from the repo's DEFAULT branch
 #      (`main`; GitHub change of 2025-12-08), so no PR into dev or main can change the rule applied to it.
 #
-# SAFETY CONTRACT (enforced by CiInfraCoverageTest.should_keepPullRequestTargetConfined_when_workflowsRead):
+# SAFETY CONTRACT (enforced by CiInfraCoverageTest.should_confinePullRequestTargetToPromotionGuard_when_workflowsRead):
 #   * this is the ONLY workflow allowed to use `pull_request_target`;
 #   * `permissions: {}` (no token scopes at all);
 #   * NO checkout, no `uses:` step, no PR code or artifact is ever fetched or run;
