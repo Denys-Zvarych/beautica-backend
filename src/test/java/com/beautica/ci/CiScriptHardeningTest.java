@@ -9,6 +9,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
+import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -61,6 +62,7 @@ class CiScriptHardeningTest {
     }
 
     @Test
+    @DisplayName("should not write through symlink when changes path is symlink")
     void should_notWriteThroughSymlink_when_changesPathIsSymlink() throws Exception {
         Path repo = gitRepo();
         Path victim = tmp.resolve("victim.sh");
@@ -81,6 +83,7 @@ class CiScriptHardeningTest {
     }
 
     @Test
+    @DisplayName("should not write through symlink when old changes file is symlink and out dir is regular")
     void should_notWriteThroughSymlink_when_oldChangesFileIsSymlinkAndOutDirIsRegular() throws Exception {
         Path repo = gitRepo();
         String head = "HEAD";
@@ -100,7 +103,8 @@ class CiScriptHardeningTest {
         assertThat(Files.exists(out.resolve("changes.txt"))).isTrue();
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(name = "{0}")
+    @DisplayName("should fail closed when pr commits path under build")
     @ValueSource(strings = {"build/ci.changes.txt", "build/ci/selection.env", "build/ci-selector/X.class", "build/anything"})
     void should_failClosed_when_prCommitsPathUnderBuild(String committed) throws Exception {
         Path repo = gitRepo();
@@ -118,6 +122,7 @@ class CiScriptHardeningTest {
     }
 
     @Test
+    @DisplayName("should fail closed when build is committed symlink")
     void should_failClosed_when_buildIsCommittedSymlink() throws Exception {
         Path repo = gitRepo();
         Files.createSymbolicLink(repo.resolve("build"), tmp);
@@ -130,6 +135,7 @@ class CiScriptHardeningTest {
     }
 
     @Test
+    @DisplayName("should fail closed when git ls files errors")
     void should_failClosed_when_gitLsFilesErrors() throws Exception {
         Path repo = gitRepo();
         Path shims = Files.createDirectories(tmp.resolve("shims"));
@@ -147,6 +153,7 @@ class CiScriptHardeningTest {
     }
 
     @Test
+    @DisplayName("should refuse symlinked out dir when run locally")
     void should_refuseSymlinkedOutDir_when_runLocally() throws Exception {
         Path repo = gitRepo();
         Path realOut = Files.createDirectories(tmp.resolve("real-out"));
@@ -165,6 +172,7 @@ class CiScriptHardeningTest {
     }
 
     @Test
+    @DisplayName("should exit one when in ci without out dir or runner temp")
     void should_exitOne_when_inCiWithoutOutDirOrRunnerTemp() throws Exception {
         Path repo = gitRepo();
 
@@ -177,6 +185,7 @@ class CiScriptHardeningTest {
     }
 
     @Test
+    @DisplayName("should fail closed when ci out dir is inside the tree")
     void should_failClosed_when_ciOutDirIsInsideTheTree() throws Exception {
         Path repo = gitRepo();
 
@@ -195,6 +204,7 @@ class CiScriptHardeningTest {
     }
 
     @Test
+    @DisplayName("should fail forbid guard when template is symlink with th utext")
     void should_failForbidGuard_when_templateIsSymlinkWithThUtext() throws Exception {
         Path root = forbidTree();
         Path outside = tmp.resolve("evil.html");
@@ -208,6 +218,7 @@ class CiScriptHardeningTest {
     }
 
     @Test
+    @DisplayName("should fail forbid guard when th utext in plain template")
     void should_failForbidGuard_when_thUtextInPlainTemplate() throws Exception {
         Path root = forbidTree();
         Files.writeString(root.resolve("src/main/resources/templates/email/a.html"), "<p th:utext=\"${x}\"></p>\n");
@@ -218,6 +229,7 @@ class CiScriptHardeningTest {
     }
 
     @Test
+    @DisplayName("should pass forbid guard when templates are clean regular files")
     void should_passForbidGuard_when_templatesAreCleanRegularFiles() throws Exception {
         Path root = forbidTree();
         Files.writeString(root.resolve("src/main/resources/templates/email/a.html"), "<p th:text=\"${x}\"></p>\n");
@@ -251,6 +263,7 @@ class CiScriptHardeningTest {
     }
 
     @Test
+    @DisplayName("should pass verify when base declared nested reported and alias listed")
     void should_passVerify_when_baseDeclaredNestedReportedAndAliasListed() throws Exception {
         Path results = nestedResults(0);
         Path dir = selection(LEGACY + "\t" + BASE + "\n");
@@ -261,6 +274,7 @@ class CiScriptHardeningTest {
     }
 
     @Test
+    @DisplayName("should fail verify when base declared nested reported but no alias")
     void should_failVerify_when_baseDeclaredNestedReportedButNoAlias() throws Exception {
         Path results = nestedResults(0);
         Path dir = selection(null);
@@ -272,6 +286,7 @@ class CiScriptHardeningTest {
     }
 
     @Test
+    @DisplayName("should fail verify when alias listed but base reports all skipped")
     void should_failVerify_when_aliasListedButBaseReportsAllSkipped() throws Exception {
         Path results = nestedResults(3);
         Path dir = selection(LEGACY + "\t" + BASE + "\n");
@@ -282,6 +297,7 @@ class CiScriptHardeningTest {
     }
 
     @Test
+    @DisplayName("should honour explicit alias argument when passed as third parameter")
     void should_honourExplicitAliasArgument_when_passedAsThirdParameter() throws Exception {
         Path results = nestedResults(0);
         Path dir = selection(null);

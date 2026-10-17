@@ -11,6 +11,7 @@ import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import org.junit.jupiter.api.Assumptions;
+import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -32,7 +33,7 @@ class CiInfraCoverageTest {
      * SHA-256 of the raw bytes of .github/workflows/promotion-source.yml. Update in the SAME PR as any edit to
      * that file (`sha256sum .github/workflows/promotion-source.yml`).
      */
-    static final String PROMOTION_SOURCE_SHA256 = "a1a480ec3a169cfe00167bc52e56fd416d65d1ef742760d8153341e037a4f805";
+    static final String PROMOTION_SOURCE_SHA256 = "6919ea775a6bbc7b23b72559fbd859e8712faadb26376c91dac46f9d8a614889";
 
     /** Application source: always-full for the selector, but it cannot change how tests execute. */
     private static boolean isMainSource(String glob) {
@@ -97,6 +98,7 @@ class CiInfraCoverageTest {
     }
 
     @Test
+    @DisplayName("should own every test affecting always full glob when codeowners read")
     void should_ownEveryTestAffectingAlwaysFullGlob_when_codeownersRead() throws IOException {
         List<Pattern> owners = codeownersPatterns();
 
@@ -113,6 +115,7 @@ class CiInfraCoverageTest {
     }
 
     @Test
+    @DisplayName("should own gitleaks config when codeowners read")
     void should_ownGitleaksConfig_when_codeownersRead() throws IOException {
         List<Pattern> owners = codeownersPatterns();
 
@@ -123,6 +126,7 @@ class CiInfraCoverageTest {
     }
 
     @Test
+    @DisplayName("should match every test affecting always full glob when shell infra guard applied")
     void should_matchEveryTestAffectingAlwaysFullGlob_when_shellInfraGuardApplied() throws IOException {
         Pattern infra = shellInfraRegex();
 
@@ -139,20 +143,22 @@ class CiInfraCoverageTest {
     }
 
     @Test
+    @DisplayName("should force ci changed when gradle wrapper properties edited")
     void should_forceCiChanged_when_gradleWrapperPropertiesEdited() throws IOException {
         Pattern infra = shellInfraRegex();
 
-        assertThat(infra.matcher("gradle/wrapper/gradle-wrapper.properties").find()).isTrue();
-        assertThat(infra.matcher("gradle.properties").find()).isTrue();
-        assertThat(infra.matcher("settings.gradle.kts").find()).isTrue();
-        assertThat(infra.matcher("gradlew").find()).isTrue();
-        assertThat(infra.matcher("src/test/resources/application-test.yml").find()).isTrue();
-        assertThat(infra.matcher("src/test/java/com/beautica/booking/AbstractIntegrationTest.java").find()).isTrue();
-        assertThat(infra.matcher("src/test/java/com/beautica/support/Fixtures.java").find()).isTrue();
-        assertThat(infra.matcher("Dockerfile").find()).isTrue();
+        assertThat(infra.matcher("gradle/wrapper/gradle-wrapper.properties").find()).as("shell infra regex must match wrapper properties").isTrue();
+        assertThat(infra.matcher("gradle.properties").find()).as("shell infra regex must match gradle.properties").isTrue();
+        assertThat(infra.matcher("settings.gradle.kts").find()).as("shell infra regex must match settings.gradle.kts").isTrue();
+        assertThat(infra.matcher("gradlew").find()).as("shell infra regex must match gradlew").isTrue();
+        assertThat(infra.matcher("src/test/resources/application-test.yml").find()).as("shell infra regex must match test application config").isTrue();
+        assertThat(infra.matcher("src/test/java/com/beautica/booking/AbstractIntegrationTest.java").find()).as("shell infra regex must match abstract integration test base").isTrue();
+        assertThat(infra.matcher("src/test/java/com/beautica/support/Fixtures.java").find()).as("shell infra regex must match shared test support fixtures").isTrue();
+        assertThat(infra.matcher("Dockerfile").find()).as("shell infra regex must match Dockerfile").isTrue();
     }
 
     @Test
+    @DisplayName("should not force ci changed when ordinary main or test source edited")
     void should_notForceCiChanged_when_ordinaryMainOrTestSourceEdited() throws IOException {
         Pattern infra = shellInfraRegex();
 
@@ -163,6 +169,7 @@ class CiInfraCoverageTest {
 
     /** The th:utext guard script is run from the base tree by `plan`; editing it must force full + self-test and need the owner. */
     @Test
+    @DisplayName("should guard forbid utext script when infra regex and codeowners read")
     void should_guardForbidUtextScript_when_infraRegexAndCodeownersRead() throws IOException {
         String script = "scripts/forbid_th_utext_in_email.sh";
 
@@ -173,6 +180,7 @@ class CiInfraCoverageTest {
     }
 
     @Test
+    @DisplayName("should run forbid utext guard only from trusted copy when workflow read")
     void should_runForbidUtextGuardOnlyFromTrustedCopy_when_workflowRead() throws IOException {
         String wf = Files.readString(WORKFLOW);
 
@@ -185,6 +193,7 @@ class CiInfraCoverageTest {
     }
 
     @Test
+    @DisplayName("should cover sample paths when sampled against always full globs")
     void should_coverSamplePaths_when_sampledAgainstAlwaysFullGlobs() {
         for (String glob : testAffectingGlobs()) {
             for (String sample : samples(glob)) {
@@ -202,6 +211,7 @@ class CiInfraCoverageTest {
      * {@link PullRequestTargetGuardCases}. The pin is always enforced here.
      */
     @Test
+    @DisplayName("should confine pull request target to promotion guard when workflows read")
     void should_confinePullRequestTargetToPromotionGuard_when_workflowsRead() {
         List<String> violations = PullRequestTargetGuardChecker.check(Path.of(".github/workflows"), true);
 
@@ -210,6 +220,7 @@ class CiInfraCoverageTest {
 
     /** Every checkout step in EVERY workflow must drop the GITHUB_TOKEN from .git/config. */
     @Test
+    @DisplayName("should not persist credentials when any checkout step")
     void should_notPersistCredentials_when_anyCheckoutStep() throws IOException {
         int total = 0;
         List<Path> workflows;
@@ -262,6 +273,7 @@ class CiInfraCoverageTest {
     }
 
     @ParameterizedTest(name = "{0}")
+    @DisplayName("should reject workflows when guard mutation applied")
     @MethodSource("guardCases")
     void should_rejectWorkflows_when_guardMutationApplied(PullRequestTargetGuardCases.Case c, @TempDir Path dir)
         throws IOException {
@@ -280,6 +292,7 @@ class CiInfraCoverageTest {
     }
 
     @Test
+    @DisplayName("should accept workflows when clean copy checked")
     void should_acceptWorkflows_when_cleanCopyChecked(@TempDir Path dir) throws IOException {
         Files.copy(PROMOTION_SOURCE, dir.resolve("promotion-source.yml"));
         write(dir, "other.yml", PullRequestTargetGuardCases.DEFAULT_OTHER);
@@ -289,6 +302,7 @@ class CiInfraCoverageTest {
     }
 
     @Test
+    @DisplayName("should accept workflows when other file only mentions target in comment")
     void should_acceptWorkflows_when_otherFileOnlyMentionsTargetInComment(@TempDir Path dir) throws IOException {
         Files.copy(PROMOTION_SOURCE, dir.resolve("promotion-source.yml"));
         write(dir, "other.yml", PullRequestTargetGuardCases.DEFAULT_OTHER + "# pull_request_target in a comment\n");
@@ -297,6 +311,7 @@ class CiInfraCoverageTest {
     }
 
     @Test
+    @DisplayName("should accept workflows when other file uses benign list trigger")
     void should_acceptWorkflows_when_otherFileUsesBenignListTrigger(@TempDir Path dir) throws IOException {
         Files.copy(PROMOTION_SOURCE, dir.resolve("promotion-source.yml"));
         write(dir, "other.yml", "on: [push, pull_request]\n");
@@ -305,6 +320,7 @@ class CiInfraCoverageTest {
     }
 
     @Test
+    @DisplayName("should ignore non workflow files when extension is not yaml")
     void should_ignoreNonWorkflowFiles_when_extensionIsNotYaml(@TempDir Path dir) throws IOException {
         Files.copy(PROMOTION_SOURCE, dir.resolve("promotion-source.yml"));
         write(dir, "notes.txt", "on: pull_request_target\n");
@@ -316,19 +332,39 @@ class CiInfraCoverageTest {
     }
 
     @Test
+    @DisplayName("should fail pin when guard changed")
     void should_failPin_when_guardChanged(@TempDir Path dir) throws IOException {
         write(dir, "promotion-source.yml", Files.readString(PROMOTION_SOURCE, StandardCharsets.UTF_8).replace("timeout-minutes: 5", "timeout-minutes: 6"));
 
         assertThat(PullRequestTargetGuardChecker.check(dir, true)).anyMatch(v -> v.contains("update the pinned hash"));
     }
 
+    /**
+     * The SHA-256 pin covers raw bytes, so git must never rewrite the guard's line endings (autocrlf, a later
+     * {@code * text=auto}). Dropping the {@code -text} attribute would make the pin checkout-dependent.
+     */
     @Test
+    @org.junit.jupiter.api.DisplayName("promotion-source.yml is pinned -text in .gitattributes and committed with LF-only bytes")
+    void should_pinGuardBytes_when_gitattributesAndGuardRead() throws IOException {
+        List<String> attributes = Files.readAllLines(Path.of(".gitattributes")).stream()
+            .map(String::strip).filter(l -> !l.isEmpty() && !l.startsWith("#")).toList();
+        byte[] guard = Files.readAllBytes(PROMOTION_SOURCE);
+
+        assertThat(attributes).as(".gitattributes must keep git from normalizing the pinned guard")
+            .anyMatch(l -> l.matches("/\\.github/workflows/promotion-source\\.yml\\s+(-text|binary)(\\s.*)?"));
+        assertThat(new String(guard, StandardCharsets.UTF_8)).as("guard bytes must contain no CR")
+            .doesNotContain("\r");
+    }
+
+    @Test
+    @DisplayName("should split raw lines when unicode line breaks present")
     void should_splitRawLines_when_unicodeLineBreaksPresent() {
         assertThat(PullRequestTargetGuardChecker.splitRawLines("a\r\nb\nc\rd\u0085e\u2028f\u2029g\n"))
             .containsExactly("a", "b", "c", "d", "e", "f", "g");
     }
 
     @Test
+    @DisplayName("should reject symlinked other workflow when other yml is link")
     void should_rejectSymlinkedOtherWorkflow_when_otherYmlIsLink(@TempDir Path dir) throws IOException {
         Files.copy(PROMOTION_SOURCE, dir.resolve("promotion-source.yml"));
         write(dir, "real.txt", "on: push\n");
@@ -338,6 +374,7 @@ class CiInfraCoverageTest {
     }
 
     @Test
+    @DisplayName("should reject symlinked guard when promotion source is link")
     void should_rejectSymlinkedGuard_when_promotionSourceIsLink(@TempDir Path dir) throws IOException {
         Files.copy(PROMOTION_SOURCE, dir.resolve("real.txt"));
         write(dir, "other.yml", PullRequestTargetGuardCases.DEFAULT_OTHER);
