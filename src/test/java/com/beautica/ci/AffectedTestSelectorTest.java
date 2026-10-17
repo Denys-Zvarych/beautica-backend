@@ -12,6 +12,7 @@ import java.util.List;
 import java.util.Optional;
 import java.util.function.Function;
 import java.util.stream.Stream;
+import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -50,6 +51,7 @@ class AffectedTestSelectorTest {
     }
 
     @Test
+    @DisplayName("should select dependent tests only when booking service changes")
     void should_selectDependentTestsOnly_when_bookingServiceChanges() {
         Selection result = select(bookingTree(), modified(BOOKING_SERVICE));
 
@@ -62,6 +64,7 @@ class AffectedTestSelectorTest {
     }
 
     @Test
+    @DisplayName("should select same package test without import when it mentions the changed class")
     void should_selectSamePackageTestWithoutImport_when_itMentionsTheChangedClass() {
         SourceTreeFixture tree = new SourceTreeFixture()
             .main("com.beautica.x.Foo")
@@ -76,6 +79,7 @@ class AffectedTestSelectorTest {
     }
 
     @Test
+    @DisplayName("should not select same package test when it never names the changed class")
     void should_notSelectSamePackageTest_when_itNeverNamesTheChangedClass() {
         SourceTreeFixture tree = new SourceTreeFixture()
             .main("com.beautica.x.Foo")
@@ -87,7 +91,8 @@ class AffectedTestSelectorTest {
         assertThat(result.tests()).isEmpty();
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(name = "{0}")
+    @DisplayName("should select full when always full path changes")
     @ValueSource(strings = {
         "build.gradle.kts",
         "settings.gradle.kts",
@@ -137,6 +142,7 @@ class AffectedTestSelectorTest {
     }
 
     @ParameterizedTest(name = "{0}")
+    @DisplayName("should select full when changed main file holds spring wired marker")
     @MethodSource("contentRuleCases")
     void should_selectFull_when_changedMainFileHoldsSpringWiredMarker(String rule, String declaration) {
         SourceTreeFixture tree = bookingTree();
@@ -151,6 +157,7 @@ class AffectedTestSelectorTest {
     }
 
     @Test
+    @DisplayName("should have content rule case when a content rule exists")
     void should_haveContentRuleCase_when_aContentRuleExists() {
         List<String> covered = contentRuleCases().map(a -> (String) a.get()[0]).toList();
 
@@ -158,6 +165,7 @@ class AffectedTestSelectorTest {
     }
 
     @Test
+    @DisplayName("should not select full when changed main file holds plain service")
     void should_notSelectFull_when_changedMainFileHoldsPlainService() {
         SourceTreeFixture tree = bookingTree();
         tree.files().put(SourceTreeFixture.mainPath("com.beautica.booking.service.Plain"),
@@ -169,6 +177,7 @@ class AffectedTestSelectorTest {
     }
 
     @Test
+    @DisplayName("should not select full when marker appears only in comments")
     void should_notSelectFull_when_markerAppearsOnlyInComments() {
         SourceTreeFixture tree = bookingTree();
         tree.files().put(SourceTreeFixture.mainPath("com.beautica.booking.domain.Rule"),
@@ -181,6 +190,7 @@ class AffectedTestSelectorTest {
     }
 
     @Test
+    @DisplayName("should treat marker after a comment like bare marker when file has leading comment")
     void should_treatMarkerAfterACommentLikeBareMarker_when_fileHasLeadingComment() {
         String job = "com.beautica.booking.domain.Job";
         String declaration = "public class Job {\n    @Scheduled(cron = \"0 0 * * * *\")\n    void run() { }\n}\n";
@@ -196,6 +206,7 @@ class AffectedTestSelectorTest {
     }
 
     @Test
+    @DisplayName("should select controller slice when controller gains new dependency")
     void should_selectControllerSlice_when_controllerGainsNewDependency() {
         SourceTreeFixture tree = new SourceTreeFixture()
             .main("com.beautica.notification.NotificationService")
@@ -210,6 +221,7 @@ class AffectedTestSelectorTest {
     }
 
     @Test
+    @DisplayName("should select slice by annotation target when test never imports the controller")
     void should_selectSliceByAnnotationTarget_when_testNeverImportsTheController() {
         SourceTreeFixture tree = new SourceTreeFixture()
             .main(BOOKING_CONTROLLER)
@@ -222,6 +234,7 @@ class AffectedTestSelectorTest {
     }
 
     @Test
+    @DisplayName("should select bare web mvc slice when any controller changes")
     void should_selectBareWebMvcSlice_when_anyControllerChanges() {
         SourceTreeFixture tree = new SourceTreeFixture()
             .main("com.beautica.booking.controller.BookingController")
@@ -236,6 +249,7 @@ class AffectedTestSelectorTest {
     }
 
     @Test
+    @DisplayName("should select full when abstract test base changes")
     void should_selectFull_when_abstractTestBaseChanges() {
         Selection result = select(bookingTree(), "M\tsrc/test/java/com/beautica/booking/AbstractFooIT.java\n");
 
@@ -243,6 +257,7 @@ class AffectedTestSelectorTest {
     }
 
     @Test
+    @DisplayName("should never emit abstract classes when subclass is affected")
     void should_neverEmitAbstractClasses_when_subclassIsAffected() {
         SourceTreeFixture tree = new SourceTreeFixture()
             .main("com.beautica.x.Foo")
@@ -258,6 +273,7 @@ class AffectedTestSelectorTest {
     }
 
     @Test
+    @DisplayName("should select changed test class when only atest file changes")
     void should_selectChangedTestClass_when_onlyATestFileChanges() {
         SourceTreeFixture tree = bookingTree();
 
@@ -267,6 +283,7 @@ class AffectedTestSelectorTest {
     }
 
     @Test
+    @DisplayName("should select importers when shared fixture changes")
     void should_selectImporters_when_sharedFixtureChanges() {
         SourceTreeFixture tree = new SourceTreeFixture()
             .test("com.beautica.x.XFixtures", List.of(), "", "")
@@ -281,6 +298,7 @@ class AffectedTestSelectorTest {
     }
 
     @Test
+    @DisplayName("should select none when only docs change")
     void should_selectNone_when_onlyDocsChange() {
         Selection result = select(bookingTree(), "M\tdocs/x.md\nA\tREADME.md\nM\t.gitignore\nM\t.gitleaks.toml\nM\tdocs/a/b.txt\n");
 
@@ -288,6 +306,7 @@ class AffectedTestSelectorTest {
     }
 
     @Test
+    @DisplayName("should select none when only ops db backup changes")
     void should_selectNone_when_onlyOpsDbBackupChanges() {
         Selection result = select(bookingTree(), "M\tops/db-backup/backup.sh\nM\tops/db-backup/Dockerfile\nA\tops/db-backup/railway.json\n");
 
@@ -295,6 +314,7 @@ class AffectedTestSelectorTest {
     }
 
     @Test
+    @DisplayName("should never list test when it carries a separate job tag")
     void should_neverListTest_when_itCarriesASeparateJobTag() {
         SourceTreeFixture tree = bookingTree()
             .test("com.beautica.ops.TaggedImageIT", List.of(), "@Tag(\"db-backup-image\")", "")
@@ -305,7 +325,8 @@ class AffectedTestSelectorTest {
         assertThat(all).contains("com.beautica.ops.UntaggedOpsIT").doesNotContain("com.beautica.ops.TaggedImageIT");
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(name = "{0}")
+    @DisplayName("should select full when path is unknown")
     @ValueSource(strings = {"foo/bar.txt", "Dockerfile", "scripts/forbid_th_utext_in_email.sh", "src/main/java/com/beautica/x/notes.txt"})
     void should_selectFull_when_pathIsUnknown(String path) {
         Selection result = select(bookingTree(), "M\t" + path + "\n");
@@ -315,6 +336,7 @@ class AffectedTestSelectorTest {
     }
 
     @Test
+    @DisplayName("should select full when selection exceeds forty percent")
     void should_selectFull_when_selectionExceedsFortyPercent() {
         SourceTreeFixture tree = tenTestsWhereFirstNDependOnFoo(5);
 
@@ -324,6 +346,7 @@ class AffectedTestSelectorTest {
     }
 
     @Test
+    @DisplayName("should stay stay selective when selection is exactly forty percent")
     void should_stayStaySelective_when_selectionIsExactlyFortyPercent() {
         SourceTreeFixture tree = tenTestsWhereFirstNDependOnFoo(4);
 
@@ -344,6 +367,7 @@ class AffectedTestSelectorTest {
     }
 
     @Test
+    @DisplayName("should seed whole package when main file is deleted")
     void should_seedWholePackage_when_mainFileIsDeleted() {
         SourceTreeFixture tree = new SourceTreeFixture()
             .test("com.beautica.gone.NeighbourTest")
@@ -357,6 +381,7 @@ class AffectedTestSelectorTest {
     }
 
     @Test
+    @DisplayName("should seed old and new package when file is renamed")
     void should_seedOldAndNewPackage_when_fileIsRenamed() {
         SourceTreeFixture tree = new SourceTreeFixture()
             .main("com.beautica.newpkg.Moved")
@@ -374,6 +399,7 @@ class AffectedTestSelectorTest {
     }
 
     @Test
+    @DisplayName("should treat deleted file like live file when it held spring wired marker")
     void should_treatDeletedFileLikeLiveFile_when_itHeldSpringWiredMarker() {
         String body = "package com.beautica.booking;\nclass Job { @Scheduled void run() { } }";
         String path = SourceTreeFixture.mainPath("com.beautica.booking.Job");
@@ -386,6 +412,7 @@ class AffectedTestSelectorTest {
     }
 
     @Test
+    @DisplayName("should not select full when deleted main file mentions marker only in comments")
     void should_notSelectFull_when_deletedMainFileMentionsMarkerOnlyInComments() {
         SourceTreeFixture tree = bookingTree();
 
@@ -396,6 +423,7 @@ class AffectedTestSelectorTest {
     }
 
     @Test
+    @DisplayName("should select full when deleted main file content is unavailable")
     void should_selectFull_when_deletedMainFileContentIsUnavailable() {
         Selection result = select(bookingTree(), "D\t" + SourceTreeFixture.mainPath("com.beautica.booking.Job") + "\n");
 
@@ -404,6 +432,7 @@ class AffectedTestSelectorTest {
     }
 
     @Test
+    @DisplayName("should resolve wildcard static and nested imports when building graph")
     void should_resolveWildcardStaticAndNestedImports_when_buildingGraph() {
         SourceTreeFixture tree = new SourceTreeFixture()
             .main("com.beautica.util.Strings")
@@ -421,6 +450,7 @@ class AffectedTestSelectorTest {
     }
 
     @Test
+    @DisplayName("should stop at two hops when dependency chain is longer")
     void should_stopAtTwoHops_when_dependencyChainIsLonger() {
         SourceTreeFixture tree = new SourceTreeFixture()
             .main("com.beautica.a.A")
@@ -436,7 +466,8 @@ class AffectedTestSelectorTest {
         assertThat(result.tests()).containsExactlyInAnyOrder("com.beautica.t1.OneHopTest", "com.beautica.t2.TwoHopTest");
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(name = "{0}")
+    @DisplayName("should select black box context test of same feature when feature source changes")
     @ValueSource(strings = {"@SpringBootTest", "@DataJpaTest", "@AutoConfigureMockMvc"})
     void should_selectBlackBoxContextTestOfSameFeature_when_featureSourceChanges(String annotation) {
         SourceTreeFixture tree = new SourceTreeFixture()
@@ -452,6 +483,7 @@ class AffectedTestSelectorTest {
     }
 
     @Test
+    @DisplayName("should select integration subclass of abstract base when feature source changes")
     void should_selectIntegrationSubclassOfAbstractBase_when_featureSourceChanges() {
         SourceTreeFixture tree = new SourceTreeFixture()
             .main("com.beautica.review.service.ReviewService")
@@ -466,6 +498,7 @@ class AffectedTestSelectorTest {
     }
 
     @Test
+    @DisplayName("should select empty list when changed source is reached by no test")
     void should_selectEmptyList_when_changedSourceIsReachedByNoTest() {
         SourceTreeFixture tree = new SourceTreeFixture().main("com.beautica.lonely.Lonely").pad(5);
 
@@ -476,6 +509,7 @@ class AffectedTestSelectorTest {
     }
 
     @Test
+    @DisplayName("should count nested only and annotated classes as tests when enumerating all")
     void should_countNestedOnlyAndAnnotatedClassesAsTests_when_enumeratingAll() {
         SourceTreeFixture tree = new SourceTreeFixture()
             .test("com.beautica.x.LooksLikeHelperFixtures")
@@ -488,6 +522,7 @@ class AffectedTestSelectorTest {
     }
 
     @Test
+    @DisplayName("should not count helper as test when it only mentions annotation inside astring")
     void should_notCountHelperAsTest_when_itOnlyMentionsAnnotationInsideAString() {
         SourceTreeFixture tree = new SourceTreeFixture();
         tree.files().put(SourceTreeFixture.testPath("com.beautica.x.CodeGenerator"),
@@ -499,6 +534,7 @@ class AffectedTestSelectorTest {
     }
 
     @Test
+    @DisplayName("should parse rename as deleted old plus live new when reading name status")
     void should_parseRenameAsDeletedOldPlusLiveNew_when_readingNameStatus() {
         List<ChangedPath> changes = ChangedPath.parseNameStatus("R087\told/A.java\tnew/A.java\nM\tb.txt\nD\tc.txt\n\n");
 
@@ -508,6 +544,7 @@ class AffectedTestSelectorTest {
     }
 
     @Test
+    @DisplayName("should scan real files and emit selection when run through cli")
     void should_scanRealFilesAndEmitSelection_when_runThroughCli(@TempDir Path root) throws IOException {
         write(root, "src/main/java/com/beautica/x/Foo.java", "package com.beautica.x;\npublic class Foo { }\n");
         write(root, "src/test/java/com/beautica/x/FooTest.java",
@@ -526,6 +563,7 @@ class AffectedTestSelectorTest {
     }
 
     @Test
+    @DisplayName("should write only requested shard when cli gets all and shard")
     void should_writeOnlyRequestedShard_when_cliGetsAllAndShard(@TempDir Path root) throws IOException {
         for (int i = 0; i < 6; i++) {
             write(root, "src/test/java/com/beautica/p" + i + "/P" + i + "Test.java",
@@ -539,6 +577,7 @@ class AffectedTestSelectorTest {
     }
 
     @Test
+    @DisplayName("should weigh heavy above slice above light when classifying tests")
     void should_weighHeavyAboveSliceAboveLight_when_classifyingTests() {
         SourceTreeFixture tree = new SourceTreeFixture()
             .test("com.beautica.x.PlainTest")
@@ -559,6 +598,7 @@ class AffectedTestSelectorTest {
     }
 
     @Test
+    @DisplayName("should balance by weight and drop excluded prefix when cli writes shards")
     void should_balanceByWeightAndDropExcludedPrefix_when_cliWritesShards(@TempDir Path root) throws IOException {
         for (int i = 0; i < 4; i++) {
             write(root, "src/test/java/com/beautica/s" + i + "/S" + i + "IT.java",
@@ -579,6 +619,7 @@ class AffectedTestSelectorTest {
     }
 
     @Test
+    @DisplayName("should reject out of range shard when cli gets bad shard")
     void should_rejectOutOfRangeShard_when_cliGetsBadShard() {
         assertThatThrownBy(() -> runCli("--root", ".", "--all", "--shard", "3/3"))
             .isInstanceOf(IllegalArgumentException.class);
@@ -601,6 +642,7 @@ class AffectedTestSelectorTest {
     }
 
     @Test
+    @DisplayName("should emit alias to nested declaring base when subclass has no direct tests")
     void should_emitAliasToNestedDeclaringBase_when_subclassHasNoDirectTests() {
         AffectedTestSelector selector = new AffectedTestSelector(nestedFamilyTree().graph(), p -> Optional.empty());
 
@@ -613,6 +655,7 @@ class AffectedTestSelectorTest {
     }
 
     @Test
+    @DisplayName("should emit alias through intermediate abstract class when imported base is two levels up")
     void should_emitAliasThroughIntermediateAbstractClass_when_importedBaseIsTwoLevelsUp() {
         SourceTreeFixture tree = nestedFamilyTree();
         tree.files().put(SourceTreeFixture.testPath("com.beautica.other.DeepIT"),
@@ -624,6 +667,7 @@ class AffectedTestSelectorTest {
     }
 
     @Test
+    @DisplayName("should write alias sidecar and keep family in one shard when cli gets out dir")
     void should_writeAliasSidecarAndKeepFamilyInOneShard_when_cliGetsOutDir(@TempDir Path root) throws IOException {
         nestedFamilyTree().files().forEach((path, body) -> {
             try {
@@ -646,6 +690,7 @@ class AffectedTestSelectorTest {
     }
 
     @Test
+    @DisplayName("should write empty alias file when no class inherits nested")
     void should_writeEmptyAliasFile_when_noClassInheritsNested(@TempDir Path root) throws IOException {
         write(root, SourceTreeFixture.testPath("com.beautica.a.ATest"), "package com.beautica.a;\nclass ATest { @Test void t() { } }\n");
         Path outDir = root.resolve("out");

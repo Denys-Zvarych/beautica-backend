@@ -543,7 +543,7 @@ class MasterSelfDeleteCreateRaceConcurrencyIT extends AbstractIntegrationTest {
         long before = deadlockCount();
         race.run();
         try {
-            await().during(Duration.ofSeconds(3)).atMost(Duration.ofSeconds(6))
+            await().during(Duration.ofSeconds(3)).atMost(Duration.ofSeconds(10))
                     .pollInterval(Duration.ofMillis(100)).until(() -> deadlockCount() == before);
         } catch (ConditionTimeoutException moved) {
             // the counter moved — the delta assertion below reports the failure

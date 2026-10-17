@@ -23,7 +23,18 @@ public interface NotificationOutboxRepository extends JpaRepository<Notification
     /**
      * Atomically claims up to {@code limit} rows whose {@code status} is {@code PENDING} and
      * flips them to {@link OutboxStatus#PROCESSING} in the SAME statement, ordered by
-     * {@code created_at} ascending (oldest-first fairness).
+     * {@code created_at} ascending (oldest-first fairness WITHIN each class).
+     *
+     * <p><b>Push priority (phase 367 audit 3).</b> {@code INAPP_PUSH} rows are claimed first, e-mail
+     * and other rows fill the remaining slots. Deferred e-mail rows (breaker open / Brevo outage)
+     * keep their original {@code created_at}, so under plain oldest-first a backlog of
+     * {@code >= limit} e-mails would starve every new push row for as long as e-mail keeps failing.
+     * Two separate {@code FOR UPDATE SKIP LOCKED} CTEs (rather than {@code ORDER BY
+     * (event_type = 'INAPP_PUSH') DESC, created_at}) keep each branch on the partial index
+     * {@code idx_outbox_pending (created_at) WHERE status = 'PENDING'} (V32): a computed sort key
+     * would defeat the index and sort every PENDING row on each 5 s tick. Push rows are tiny and
+     * fast (no SMTP), so they cannot starve e-mail in turn: the other branch still gets
+     * {@code limit - pushRowsClaimed} slots, and a full batch of pushes drains in one tick.
      *
      * <p><strong>Why the status flip must be atomic with the claim (MEDIUM concurrency fix).</strong>
      * The previous version of this query was a plain {@code SELECT ... FOR UPDATE SKIP LOCKED} that
@@ -59,7 +70,7 @@ public interface NotificationOutboxRepository extends JpaRepository<Notification
      * then only joins the already-fixed, already-locked id set, so it can never touch more than
      * {@code limit} rows regardless of concurrent activity.
      *
-     * <p>The outer {@code SELECT ... ORDER BY created_at ASC} re-sorts the result, because
+     * <p>The outer {@code SELECT ... ORDER BY (event_type = 'INAPP_PUSH') DESC, created_at ASC} re-sorts (push first, so a hung e-mail provider cannot delay push) the result, because
      * PostgreSQL does not guarantee that an {@code UPDATE ... RETURNING} preserves the order of the
      * driving CTE.
      *
@@ -95,13 +106,28 @@ public interface NotificationOutboxRepository extends JpaRepository<Notification
      */
     @Transactional(propagation = Propagation.MANDATORY)
     @Query(value = """
-        WITH candidates AS MATERIALIZED (
+        WITH push_candidates AS MATERIALIZED (
             SELECT id
               FROM notification_outbox
              WHERE status = 'PENDING'
+               AND event_type = 'INAPP_PUSH'
              ORDER BY created_at ASC
              LIMIT :limit
                FOR UPDATE SKIP LOCKED
+        ),
+        other_candidates AS MATERIALIZED (
+            SELECT id
+              FROM notification_outbox
+             WHERE status = 'PENDING'
+               AND event_type <> 'INAPP_PUSH'
+             ORDER BY created_at ASC
+             LIMIT GREATEST(:limit - (SELECT count(*) FROM push_candidates), 0)
+               FOR UPDATE SKIP LOCKED
+        ),
+        candidates AS (
+            SELECT id FROM push_candidates
+            UNION ALL
+            SELECT id FROM other_candidates
         ),
         claimed AS (
             UPDATE notification_outbox n
@@ -111,7 +137,7 @@ public interface NotificationOutboxRepository extends JpaRepository<Notification
              WHERE n.id = c.id
             RETURNING n.*
         )
-        SELECT * FROM claimed ORDER BY created_at ASC
+        SELECT * FROM claimed ORDER BY (event_type = 'INAPP_PUSH') DESC, created_at ASC
         """, nativeQuery = true)
     List<NotificationOutboxEntry> claimPendingBatch(@Param("limit") @Min(1) @Max(500) int limit);
 

@@ -100,7 +100,10 @@ class DeploymentEnvironmentStampIT {
                     "app.cloudflare-r2.enabled=true", "app.cloudflare-r2.bucket=beautica-media-prod",
                     "app.cloudflare-r2.public-url=https://media.beautica.ua",
                     "app.public-base-url=https://api.beautica.ua", "app.frontend.base-url=https://app.beautica.ua",
-                    "app.support.email=help@beautica.ua", "app.internal-api-key=" + TestSecrets.INTERNAL_API_KEY));
+                    "app.support.email=help@beautica.ua", "app.internal-api-key=" + TestSecrets.INTERNAL_API_KEY,
+                    // Phase 367 prod required-env rules.
+                    "sentry.dsn=https://0123456789abcdef@o42.ingest.de.sentry.io/4500000000000001",
+                    "TURBOSMS_TOKEN=turbosms-fixture-token", "ADMIN_EMAIL=admin@beautica.ua"));
             case LOCAL -> { }
         }
         return new SpringApplicationBuilder(MinimalConfig.class)

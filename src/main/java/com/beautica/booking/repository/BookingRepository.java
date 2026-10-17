@@ -1980,22 +1980,46 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     int cancelItemsByAppointmentId(@Param("appointmentId") UUID appointmentId);
 
     /**
-     * Marks every item of the given guest visits as reminded (BE-7). Called by
-     * {@code BookingReminderJob} after it sends ONE reminder per visit: this flips ALL of a visit's
-     * item rows — including any tail item whose own {@code starts_at} falls outside the sweep's 2h
-     * reminder window (a visit can span up to 10h) — so no later sweep can re-remind the visit's tail.
-     * Bounded to the visits actually reminded in one sweep.
+     * Atomically CLAIMS the given legacy single guest bookings for their reminder: flips
+     * {@code reminder_sent} to {@code true} only where it is still {@code false} and RETURNS the ids
+     * this call actually flipped. {@code BookingReminderJob} sends a reminder only for the returned ids.
      *
-     * @return the number of item rows updated
+     * <p>Why not "select, then flag by dirty check": during a Railway rolling deploy two instances
+     * overlap and both run the hourly sweep. Both SELECTs saw the same unflagged rows, so both sent
+     * the SMS — a guest's only channel, read as platform spam. Under READ COMMITTED the second
+     * {@code UPDATE} blocks on the first's row lock, re-evaluates {@code reminder_sent = false} against
+     * the committed row and matches nothing, so exactly one instance wins each row. Chosen over
+     * {@code PESSIMISTIC_WRITE + SKIP LOCKED}: it needs no extra round-trip, no lock held while the
+     * reminder is rendered, and a loser simply gets an empty result.
+     *
+     * <p>Native (not HQL) because HQL has no {@code RETURNING}. Not {@code @Modifying}: the statement
+     * yields a result set.
      */
-    @Modifying
-    @Query("""
-            UPDATE Booking b
-               SET b.reminderSent = true
-             WHERE b.appointment.id IN :appointmentIds
-               AND b.reminderSent = false
-            """)
-    int markVisitRemindersSentByAppointmentIds(@Param("appointmentIds") Collection<UUID> appointmentIds);
+    @Query(value = """
+            UPDATE bookings
+               SET reminder_sent = TRUE
+             WHERE id IN (:ids)
+               AND reminder_sent = FALSE
+            RETURNING id
+            """, nativeQuery = true)
+    List<UUID> claimRemindersByIds(@Param("ids") Collection<UUID> ids);
+
+    /**
+     * Visit counterpart of {@link #claimRemindersByIds} (BE-7): atomically flips EVERY unflagged item of
+     * the given guest visits, including any tail item whose own {@code starts_at} falls outside the
+     * sweep's 2h window (a visit can span up to 10h), so no later sweep can re-remind the tail, and
+     * RETURNS the {@code appointment_id} of every flipped item row (one entry per item). A visit is
+     * reminded only when its id is returned; the whole visit is flipped by one statement, so a competing
+     * instance gets all of it or none.
+     */
+    @Query(value = """
+            UPDATE bookings
+               SET reminder_sent = TRUE
+             WHERE appointment_id IN (:appointmentIds)
+               AND reminder_sent = FALSE
+            RETURNING appointment_id
+            """, nativeQuery = true)
+    List<UUID> claimVisitRemindersByAppointmentIds(@Param("appointmentIds") Collection<UUID> appointmentIds);
 
     // ── Guest-cancel by link (Phase 13.4) ─────────────────────────────────────
     /**

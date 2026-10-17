@@ -19,17 +19,29 @@ public class EnvironmentBannerRunner implements ApplicationRunner {
 
     private final Environment env;
     private final DeploymentProperties properties;
+    private final BrevoConnectionProbe brevoProbe;
 
-    public EnvironmentBannerRunner(Environment env, DeploymentProperties properties) {
+    public EnvironmentBannerRunner(Environment env, DeploymentProperties properties, BrevoConnectionProbe brevoProbe) {
         this.env = env;
         this.properties = properties;
+        this.brevoProbe = brevoProbe;
     }
 
     @Override
     public void run(ApplicationArguments args) {
-        log.info("beautica_environment={} mail={} sms={} r2_bucket={} sentry={}",
-                properties.environment().token(), EnvironmentFingerprintGuard.mailKind(env),
+        String mail = EnvironmentFingerprintGuard.mailKind(env);
+        // Phase 367 D9: prod with a missing/PENDING Brevo login or key is visibly degraded.
+        if (properties.environment() == DeployEnvironment.PROD && "brevo".equals(mail)
+                && EnvironmentFingerprintGuard.brevoPending(env)) {
+            mail = "brevo-pending";
+        } else if (properties.environment() == DeployEnvironment.PROD && "brevo".equals(mail)
+                && brevoProbe.isUnreachable()) {
+            // Credentials are set but the relay refused/did not answer (wrong key, outage). WARN only.
+            mail = "brevo-unreachable";
+        }
+        log.info("beautica_environment={} mail={} sms={} r2_bucket={} sentry={} push={}",
+                properties.environment().token(), mail,
                 properties.sms().mode().name().toLowerCase(Locale.ROOT), EnvironmentFingerprintGuard.r2Bucket(env),
-                EnvironmentFingerprintGuard.sentryState(env));
+                EnvironmentFingerprintGuard.sentryState(env), EnvironmentFingerprintGuard.pushState(env));
     }
 }

@@ -423,11 +423,15 @@ public class EmailNotificationService {
             addLogoInline(helper);
             mailSender.send(helper.getMimeMessage());
         } catch (MessagingException | MailException ex) {
-            // Deliberate swallow: delivery failures must not crash the outbox drain loop.
             // 'to' is PII — never log it. Log template + exception type only.
             log.error("Failed to send email [template={}]: {}", template, ex.getClass().getSimpleName());
+            // Propagate (no cause, no message echo): the outbox drain worker must take its
+            // failedAttempt -> retry -> DEAD path instead of recording SENT for an undelivered mail.
+            throw new EmailDeliveryException(template, true);
         } catch (Exception ex) {
             log.error("Unexpected error sending email [template={}]: {}", template, ex.getClass().getSimpleName());
+            // Permanent/local (e.g. template render): fails the row, but is not evidence the relay is down.
+            throw new EmailDeliveryException(template, false);
         }
     }
 

@@ -38,7 +38,10 @@ class DatabaseUrlNormalizerBootStartupTest {
                         "R2_ENABLED=true", "CLOUDFLARE_R2_BUCKET=beautica-media-prod",
                         "CLOUDFLARE_R2_PUBLIC_URL=https://media.beautica.ua", "FRONTEND_BASE_URL=https://app.beautica.ua",
                         "PUBLIC_BASE_URL=https://api.beautica.ua", "SUPPORT_EMAIL=help@beautica.ua",
-                        "INTERNAL_API_KEY=" + TestSecrets.INTERNAL_API_KEY);
+                        "INTERNAL_API_KEY=" + TestSecrets.INTERNAL_API_KEY,
+                        // Phase 367 prod required-env rules.
+                        "SENTRY_DSN=https://0123456789abcdef@o42.ingest.de.sentry.io/4500000000000001",
+                        "TURBOSMS_TOKEN=turbosms-fixture-token", "ADMIN_EMAIL=admin@beautica.ua");
     }
 
     private static List<Throwable> chain(Throwable t) {

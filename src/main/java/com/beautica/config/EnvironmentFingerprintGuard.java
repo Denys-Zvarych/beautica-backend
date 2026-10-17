@@ -1,8 +1,11 @@
 package com.beautica.config;
 
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.context.properties.bind.Binder;
 import org.springframework.boot.env.EnvironmentPostProcessor;
+import org.springframework.boot.logging.DeferredLogFactory;
 import org.springframework.core.Ordered;
 import org.springframework.core.env.ConfigurableEnvironment;
 import org.springframework.core.env.Environment;
@@ -56,9 +59,28 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
     private static final Profiles PROD = Profiles.of("prod");
     private static final Profiles STAGING = Profiles.of("staging");
 
+    /** Placeholder an operator sets for {@code BREVO_SMTP_LOGIN}/{@code BREVO_SMTP_KEY} until Brevo exists (Phase 367 D9). */
+    static final String BREVO_PENDING = "PENDING";
+
+    /** Conservative floor for {@code TURBOSMS_TOKEN}; the provider documents no length (see {@link #isPlaceholderSecret}). */
+    static final int MIN_SMS_TOKEN_LENGTH = 16;
+    private static final List<String> SECRET_PLACEHOLDERS = List.of("pending", "changeme", "todo", "xxx", "tbd");
+
+    private final Log log;
+
+    /**
+     * The ONLY public constructor, so Spring Boot's factory loader can only choose the
+     * {@link DeferredLogFactory} path: warnings are buffered until the logging system is initialised.
+     * (A second public no-arg constructor made the choice ambiguous and could silently log to a
+     * not-yet-configured system.) Tests use the package-private {@link #verify(Environment, Log)}.
+     */
+    public EnvironmentFingerprintGuard(DeferredLogFactory logFactory) {
+        this.log = logFactory.getLog(EnvironmentFingerprintGuard.class);
+    }
+
     @Override
     public void postProcessEnvironment(ConfigurableEnvironment environment, SpringApplication application) {
-        verify(environment);
+        verify(environment, log);
     }
 
     /** Last, so config data (and the DB-URL normaliser registered before it) has already run. */
@@ -71,6 +93,10 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
      * @throws IllegalStateException when any rule is violated; the message lists every violated rule
      */
     public static void verify(Environment env) {
+        verify(env, LogFactory.getLog(EnvironmentFingerprintGuard.class));
+    }
+
+    static void verify(Environment env, Log log) {
         DeployEnvironment environment = environmentOf(env);
         boolean prodProfile = env.acceptsProfiles(PROD);
         boolean stagingProfile = env.acceptsProfiles(STAGING);
@@ -90,6 +116,7 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
             checkInternalApiKey(env, violations);
             if (environment == DeployEnvironment.PROD) {
                 checkProd(env, violations);
+                warnBrevoUnconfigured(env, log);
             } else {
                 checkStaging(env, violations);
             }
@@ -113,14 +140,18 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
  *       ({@code SENTRY_DEBUG=true} prints the DSN; default PII would attach IPs and user data).</li>
  *   <li>{@code sentry-environment}: when enabled, {@code sentry.environment} must equal the lower-case
      *       {@code beautica.environment} token (blocks a stray {@code SENTRY_ENVIRONMENT}).</li>
+     *   <li>{@code sentry-dsn-required} (Phase 367 D5): a blank DSN is a violation in PROD only.</li>
      * </ul>
-     * A blank DSN is allowed everywhere (SDK disabled, banner {@code sentry=off}) — see the phase-371 report for
-     * why {@code sentry-dsn-required} is not enforced in prod.
+     * A blank DSN is allowed in LOCAL and STAGING (SDK disabled, banner {@code sentry=off}).
      */
     private static void checkSentry(Environment env, DeployEnvironment environment, List<String> violations) {
         boolean enabled = sentryEnabledFlag(env);
         String dsn = readOrNull(env, "sentry.dsn");
-        if (!isBlank(dsn)) {
+        if (isBlank(dsn)) {
+            if (environment == DeployEnvironment.PROD) {
+                violations.add("rule sentry-dsn-required: sentry.dsn (SENTRY_DSN) must be set in prod");
+            }
+        } else {
             String host = dsnHost(dsn);
             if (environment == DeployEnvironment.LOCAL) {
                 if (enabled && (host == null || !isLoopback(host))) {
@@ -356,6 +387,84 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
         String support = supportEmail(env);
         if (!isEmailShaped(support) || isPlaceholderDomain(support.substring(support.lastIndexOf('@') + 1))) {
             violations.add("rule prod-support-email: app.support.email must be a real address (local@domain.tld, not a reserved test domain) in prod");
+        }
+        // Phase 367 D5: without these the app boots "healthy" but guest OTP 503s / admin mail goes to the yml default.
+        String smsToken = firstNonBlank(readOrNull(env, "TURBOSMS_TOKEN"), readOrNull(env, "app.sms.turbosms.token"));
+        if (isBlank(smsToken)) {
+            violations.add("rule prod-turbosms-token-blank: TURBOSMS_TOKEN (app.sms.turbosms.token) must be set in prod");
+        } else if (isPlaceholderSecret(smsToken)) {
+            violations.add("rule prod-turbosms-token-placeholder: TURBOSMS_TOKEN (app.sms.turbosms.token) must be a real "
+                    + "token (at least " + MIN_SMS_TOKEN_LENGTH + " characters, not a placeholder) in prod");
+        }
+        // The raw env var, not app.admin-email: that property carries the silent yml default.
+        String adminEmail = readOrNull(env, "ADMIN_EMAIL");
+        if (isBlank(adminEmail) || !isEmailShaped(adminEmail.strip())) {
+            violations.add("rule prod-admin-email-unset: ADMIN_EMAIL must be explicitly set to an e-mail address in prod");
+        } else if (isPlaceholderDomain(domainOf(adminEmail))) {
+            violations.add("rule prod-admin-email-placeholder: ADMIN_EMAIL must not use a reserved test/example domain in prod");
+        }
+        // The EFFECTIVE recipient: APP_ADMIN_EMAIL (relaxed binding of app.admin-email) overrides ADMIN_EMAIL.
+        String effective = readOrNull(env, "app.admin-email");
+        if (!isBlank(effective) && !effective.strip().equalsIgnoreCase(adminEmail == null ? "" : adminEmail.strip())
+                && (!isEmailShaped(effective.strip()) || isPlaceholderDomain(domainOf(effective)))) {
+            violations.add("rule prod-admin-email-effective: app.admin-email (APP_ADMIN_EMAIL override) must be a real "
+                    + "address (not a reserved test/example domain) in prod");
+        }
+    }
+
+    /** Lower-cased domain of an e-mail address, trailing dot removed. */
+    private static String domainOf(String email) {
+        String e = email.strip().toLowerCase(Locale.ROOT);
+        String domain = e.substring(e.lastIndexOf('@') + 1);
+        return domain.endsWith(".") ? domain.substring(0, domain.length() - 1) : domain;
+    }
+
+    private static String firstNonBlank(String a, String b) {
+        return isBlank(a) ? b : a;
+    }
+
+    /**
+     * Too short to be a real provider token, or an obvious operator placeholder. TurboSMS does not document a
+     * token length (its API page only calls it the HTTP API key from the cabinet), so the floor is deliberately
+     * conservative: real keys are long random strings, never a short word.
+     */
+    private static boolean isPlaceholderSecret(String value) {
+        String v = value.strip().toLowerCase(Locale.ROOT);
+        return v.length() < MIN_SMS_TOKEN_LENGTH || SECRET_PLACEHOLDERS.contains(v);
+    }
+
+    /**
+     * Phase 367 D9: prod may boot before Brevo exists ({@code BREVO_SMTP_LOGIN}/{@code BREVO_SMTP_KEY} set to
+     * {@value #BREVO_PENDING}); the degraded mail state is logged, never fatal. Names the rule only, no values.
+     */
+    private static void warnBrevoUnconfigured(Environment env, Log log) {
+        if (brevoPending(env)) {
+            log.warn("rule prod-brevo-unconfigured: spring.mail.username/password (BREVO_SMTP_LOGIN/BREVO_SMTP_KEY) "
+                    + "are blank or PENDING; outbound e-mail is not delivered until Brevo is configured");
+        }
+    }
+
+    /** {@code true} when the mail login or key is blank or the {@value #BREVO_PENDING} placeholder (case-insensitive). */
+    static boolean brevoPending(Environment env) {
+        return isBrevoPlaceholder(readOrNull(env, "spring.mail.username"))
+                || isBrevoPlaceholder(readOrNull(env, "spring.mail.password"));
+    }
+
+    private static boolean isBrevoPlaceholder(String value) {
+        return isBlank(value) || BREVO_PENDING.equalsIgnoreCase(value.strip());
+    }
+
+    /**
+     * {@code on} when push is switched on, else {@code off}. Resolves {@code FIREBASE_ENABLED} exactly as its
+     * consumers do ({@code FirebaseConfig}/{@code InAppNotificationService}: {@code @Value("${FIREBASE_ENABLED:false}")}
+     * through the Environment's boolean conversion, which also accepts {@code 1}/{@code yes}/{@code on}), not a
+     * stricter {@code Boolean.parseBoolean} that would print {@code off} while push is actually on.
+     */
+    static String pushState(Environment env) {
+        try {
+            return Boolean.TRUE.equals(env.getProperty("FIREBASE_ENABLED", Boolean.class, false)) ? "on" : "off";
+        } catch (IllegalArgumentException e) {
+            return "off"; // unconvertible: the consumers fail boot on it, the banner must not throw
         }
     }
 
