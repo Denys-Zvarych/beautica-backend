@@ -88,7 +88,7 @@ class NotificationOutboxRepositoryTest extends AbstractDataJpaTest {
      * the JDBC insert is committed by the test framework's per-test rollback mechanism.
      */
     @Test
-    @DisplayName("should_throwIllegalTransactionStateException_when_claimCalledWithoutTransaction")
+    @DisplayName("claiming a batch outside a transaction is rejected with IllegalTransactionStateException")
     @Transactional(propagation = Propagation.NOT_SUPPORTED)
     void should_throwIllegalTransactionStateException_when_claimCalledWithoutTransaction() {
         // Arrange — seed one PENDING row via raw JDBC (no JPA/Hibernate involvement needed;
@@ -101,6 +101,58 @@ class NotificationOutboxRepositoryTest extends AbstractDataJpaTest {
         // Act + Assert — must throw because no active transaction is present.
         assertThatThrownBy(() -> repo.claimPendingBatch(5))
                 .isInstanceOf(IllegalTransactionStateException.class);
+    }
+
+    // ── Push priority (phase 367 audit 3, finding 1) ───────────────────────────
+
+    @Test
+    @DisplayName("e-mail backlog larger than the batch — push rows are still claimed (no starvation behind deferred e-mail)")
+    void should_dispatchPushRows_when_emailBacklogExceedsBatchAndBreakerOpen() {
+        // Arrange — 60 older e-mail rows (a backlog > the 50-row batch), then 1 newer push row.
+        Instant t0 = Instant.parse("2026-01-01T10:00:00Z");
+        for (int i = 0; i < 60; i++) {
+            insertOutboxRow(UUID.randomUUID(), OutboxEventType.NEW_BOOKING, "PENDING", t0.plusSeconds(i));
+        }
+        UUID pushId = UUID.randomUUID();
+        insertOutboxRow(pushId, OutboxEventType.INAPP_PUSH, "PENDING", t0.plusSeconds(100));
+
+        // Act — tick 1: the claim must include the push row despite 60 older e-mails ahead of it.
+        List<NotificationOutboxEntry> tick1 = repo.claimPendingBatch(50);
+        // The worker defers the e-mails back to PENDING (breaker open) and marks the push SENT.
+        jdbcTemplate.update("UPDATE notification_outbox SET status = 'PENDING' "
+                + "WHERE status = 'PROCESSING' AND event_type <> 'INAPP_PUSH'");
+        jdbcTemplate.update("UPDATE notification_outbox SET status = 'SENT' WHERE id = ?", pushId);
+        List<NotificationOutboxEntry> tick2 = repo.claimPendingBatch(50);
+
+        // Assert
+        assertThat(tick1).hasSize(50);
+        assertThat(tick1).extracting(NotificationOutboxEntry::getId).contains(pushId);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT status FROM notification_outbox WHERE id = ?", String.class, pushId)).isEqualTo("SENT");
+        assertThat(tick2).hasSize(50).extracting(NotificationOutboxEntry::getId).doesNotContain(pushId);
+    }
+
+    @Test
+    @DisplayName("push and e-mail rows pending — push rows claimed first, then e-mail oldest-first")
+    void should_claimPushRowsFirstThenOldestEmails_when_pushAndEmailRowsPending() {
+        // Arrange — 3 old e-mails, 2 newer push rows; limit 4 -> both pushes + the 2 oldest e-mails.
+        Instant t0 = Instant.parse("2026-01-01T10:00:00Z");
+        UUID e1 = UUID.randomUUID();
+        UUID e2 = UUID.randomUUID();
+        UUID e3 = UUID.randomUUID();
+        UUID p1 = UUID.randomUUID();
+        UUID p2 = UUID.randomUUID();
+        insertOutboxRow(e1, OutboxEventType.NEW_BOOKING, "PENDING", t0);
+        insertOutboxRow(e2, OutboxEventType.STATUS_CHANGED, "PENDING", t0.plusSeconds(1));
+        insertOutboxRow(e3, OutboxEventType.STATUS_CHANGED, "PENDING", t0.plusSeconds(2));
+        insertOutboxRow(p1, OutboxEventType.INAPP_PUSH, "PENDING", t0.plusSeconds(10));
+        insertOutboxRow(p2, OutboxEventType.INAPP_PUSH, "PENDING", t0.plusSeconds(11));
+
+        // Act
+        List<NotificationOutboxEntry> claimed = repo.claimPendingBatch(4);
+
+        // Assert — the set is push-first-claimed; the returned order is push first, then oldest e-mails
+        assertThat(claimed).extracting(NotificationOutboxEntry::getId).containsExactly(p1, p2, e1, e2);
     }
 
     // ── MEDIUM-2 ──────────────────────────────────────────────────────────────
@@ -121,7 +173,7 @@ class NotificationOutboxRepositoryTest extends AbstractDataJpaTest {
      * an artefact of Hibernate echoing back the RETURNING clause.
      */
     @Test
-    @DisplayName("should_returnOnlyPendingRows_inCreatedAtAscOrder_when_mixedStatusRowsExist")
+    @DisplayName("claiming returns only PENDING rows, oldest first, when other statuses exist")
     void should_returnOnlyPendingRows_inCreatedAtAscOrder_when_mixedStatusRowsExist() {
         // Arrange — explicit timestamps guarantee strict ordering.
         Instant t0 = Instant.parse("2026-01-01T10:00:00Z");
@@ -173,7 +225,7 @@ class NotificationOutboxRepositoryTest extends AbstractDataJpaTest {
      * when the number of eligible PENDING rows exceeds the caller-supplied limit.
      */
     @Test
-    @DisplayName("should_respectLimit_when_pendingRowsExceedLimit")
+    @DisplayName("claiming never returns more rows than the requested limit")
     void should_respectLimit_when_pendingRowsExceedLimit() {
         // Arrange — 5 PENDING rows, limit = 2.
         Instant base = Instant.parse("2026-02-01T08:00:00Z");
@@ -237,7 +289,7 @@ class NotificationOutboxRepositoryTest extends AbstractDataJpaTest {
      * and round-trips through the {@code @Enumerated(STRING)} mapping unchanged.
      */
     @Test
-    @DisplayName("should_persistReviewRequestedEntry_when_eventTypeIsReviewRequested")
+    @DisplayName("a REVIEW_REQUESTED outbox entry is saved and read back")
     void should_persistReviewRequestedEntry_when_eventTypeIsReviewRequested() {
         // Arrange
         UUID bookingId = UUID.randomUUID();
@@ -264,7 +316,7 @@ class NotificationOutboxRepositoryTest extends AbstractDataJpaTest {
      * must fail with a data-integrity violation.
      */
     @Test
-    @DisplayName("should_rejectBogusEventType_when_insertViolatesChkOutboxEvent")
+    @DisplayName("inserting an unknown event type is rejected by the database check constraint")
     void should_rejectBogusEventType_when_insertViolatesChkOutboxEvent() {
         assertThatThrownBy(() -> jdbcTemplate.update(
                 "INSERT INTO notification_outbox (id, event_type, aggregate_id, status, attempts) "
@@ -280,7 +332,7 @@ class NotificationOutboxRepositoryTest extends AbstractDataJpaTest {
      * caller omits those fields.
      */
     @Test
-    @DisplayName("should_persistEntry_with_defaultStatusAndAttempts")
+    @DisplayName("a new entry defaults to PENDING status with zero attempts")
     void should_persistEntry_with_defaultStatusAndAttempts() {
         // Arrange — only mandatory field set; rely on @Builder.Default for the rest.
         NotificationOutboxEntry entry = NotificationOutboxEntry.builder()
@@ -307,7 +359,7 @@ class NotificationOutboxRepositoryTest extends AbstractDataJpaTest {
      * when the outbox contains rows in multiple states.
      */
     @Test
-    @DisplayName("should_countByStatus_when_mixedStatusRowsExist")
+    @DisplayName("rows are counted per status when several statuses exist")
     void should_countByStatus_when_mixedStatusRowsExist() {
         // Arrange — 2 PENDING + 1 SENT + 1 DEAD.
         Instant base = Instant.parse("2026-03-01T09:00:00Z");
@@ -348,7 +400,7 @@ class NotificationOutboxRepositoryTest extends AbstractDataJpaTest {
      */
     @Test
     @Transactional(propagation = Propagation.NOT_SUPPORTED)
-    @DisplayName("should_deleteSentAndDeadRowsOlderThanCutoff_andPreservePendingRows")
+    @DisplayName("purge deletes old SENT and DEAD rows but keeps PENDING rows")
     void should_deleteSentAndDeadRowsOlderThanCutoff_andPreservePendingRows() {
         // Arrange
         Instant cutoff = Instant.now().minus(java.time.Duration.ofDays(30));
@@ -410,7 +462,7 @@ class NotificationOutboxRepositoryTest extends AbstractDataJpaTest {
      */
     @Test
     @Transactional(propagation = Propagation.NOT_SUPPORTED)
-    @DisplayName("should_resetToPending_when_staleProcessingRowIsBelowMaxAttempts")
+    @DisplayName("a stale PROCESSING row under the attempt limit goes back to PENDING")
     void should_resetToPending_when_staleProcessingRowIsBelowMaxAttempts() {
         // Arrange — a PROCESSING row with attempts=0, "updated" long before staleBefore.
         Instant now = Instant.now();
@@ -441,7 +493,7 @@ class NotificationOutboxRepositoryTest extends AbstractDataJpaTest {
      */
     @Test
     @Transactional(propagation = Propagation.NOT_SUPPORTED)
-    @DisplayName("should_setToDead_when_reclaimWouldReachMaxAttempts")
+    @DisplayName("a stale PROCESSING row that would hit the attempt limit is marked DEAD")
     void should_setToDead_when_reclaimWouldReachMaxAttempts() {
         // Arrange — attempts=2, so the reclaimed 3rd attempt hits maxAttempts(3) exactly.
         Instant now = Instant.now();
@@ -470,7 +522,7 @@ class NotificationOutboxRepositoryTest extends AbstractDataJpaTest {
      */
     @Test
     @Transactional(propagation = Propagation.NOT_SUPPORTED)
-    @DisplayName("should_notReclaim_when_processingRowIsNewerThanStaleBefore")
+    @DisplayName("a recently claimed PROCESSING row is left alone")
     void should_notReclaim_when_processingRowIsNewerThanStaleBefore() {
         // Arrange — updated_at is AFTER staleBefore (recently claimed, still in flight).
         Instant now = Instant.now();
@@ -499,7 +551,7 @@ class NotificationOutboxRepositoryTest extends AbstractDataJpaTest {
      */
     @Test
     @Transactional(propagation = Propagation.NOT_SUPPORTED)
-    @DisplayName("should_notReclaim_when_rowStatusIsNotProcessing")
+    @DisplayName("stale reclaim ignores rows that are not PROCESSING")
     void should_notReclaim_when_rowStatusIsNotProcessing() {
         // Arrange — an old PENDING row (e.g. legitimately still waiting for its next drain tick).
         Instant now = Instant.now();
@@ -536,7 +588,7 @@ class NotificationOutboxRepositoryTest extends AbstractDataJpaTest {
      * row count — must be completely untouched.
      */
     @Test
-    @DisplayName("should_deleteOnlyMatchingRows_when_deleteByAggregateIdInCalledWithSubset")
+    @DisplayName("deleting by aggregate ids removes only the matching rows")
     void should_deleteOnlyMatchingRows_when_deleteByAggregateIdInCalledWithSubset() {
         // Arrange
         UUID toDelete1 = UUID.randomUUID();
@@ -586,7 +638,7 @@ class NotificationOutboxRepositoryTest extends AbstractDataJpaTest {
      * with an empty collection must be a safe no-op, not an error, for any other caller.
      */
     @Test
-    @DisplayName("should_deleteNothing_when_calledWithEmptyCollection")
+    @DisplayName("deleting by an empty id collection removes nothing")
     void should_deleteNothing_when_calledWithEmptyCollection() {
         // Arrange
         UUID survivor = UUID.randomUUID();

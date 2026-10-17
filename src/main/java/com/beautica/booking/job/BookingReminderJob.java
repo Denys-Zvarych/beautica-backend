@@ -19,9 +19,11 @@ import java.time.OffsetDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 
 /**
@@ -98,6 +100,25 @@ public class BookingReminderJob {
             }
         }
 
+        // CLAIM before rendering/sending (instance-overlap guard): the conditional UPDATE ... RETURNING flips
+        // reminder_sent only where it is still false, so when two instances run this sweep during a rolling
+        // deploy, exactly one wins each row and the loser reminds nobody. Only claimed bookings/visits are
+        // reminded below. The flag is committed with this transaction, i.e. before the after-commit dispatch
+        // (at-most-once, see GuestReminderDispatcher) — unchanged.
+        if (!singles.isEmpty()) {
+            Set<UUID> claimed = new HashSet<>(bookingRepository.claimRemindersByIds(
+                    singles.stream().map(Booking::getId).toList()));
+            singles.removeIf(booking -> !claimed.contains(booking.getId()));
+        }
+        if (!visits.isEmpty()) {
+            // The claim also flips EVERY item of each visit — including any tail item whose own startsAt sits
+            // beyond this sweep's [from, to] window (a visit can span up to 10h, far past the 2h window) —
+            // so a later sweep can never re-remind the visit's tail. One statement, no extra load.
+            Set<UUID> claimedVisits = new HashSet<>(
+                    bookingRepository.claimVisitRemindersByAppointmentIds(visits.keySet()));
+            visits.keySet().removeIf(appointmentId -> !claimedVisits.contains(appointmentId));
+        }
+
         // Render every message HERE, while the Hibernate session is still open, and collect them —
         // buildReminderSms walks two lazy association chains (masterService → serviceDefinition, master →
         // user), so it cannot run in the after-commit dispatcher. Only Strings cross the boundary.
@@ -105,22 +126,16 @@ public class BookingReminderJob {
 
         for (Booking booking : singles) {
             collectReminder(reminders, booking);
-            booking.setReminderSent(true);
         }
-        // No saveAll: these rows were loaded by findGuestBookingsForReminder INSIDE this transaction, so
-        // they are managed and Hibernate's dirty check flushes reminderSent at commit regardless. The
-        // explicit saveAll only added a merge pass over entities already in the persistence context.
+        // No setReminderSent(true) / saveAll: the native claim above (claimRemindersByIds) already
+        // persisted reminder_sent = TRUE for exactly these rows, as the visit claim does for visits. The
+        // in-memory flag is left stale on purpose (nothing later in this transaction reads it), which keeps
+        // Hibernate's dirty check from issuing a redundant UPDATE per row at commit.
 
         for (List<Booking> items : visits.values()) {
             // Remind on the earliest item; the SMS renders that item's service/time as the visit summary.
             items.sort(Comparator.comparing(Booking::getStartsAt));
             collectReminder(reminders, items.get(0));
-        }
-        if (!visits.isEmpty()) {
-            // Mark EVERY item of each reminded visit — including any tail item whose own startsAt sits
-            // beyond this sweep's [from, to] window (a visit can span up to 10h, far past the 2h window)
-            // so a later sweep can never re-remind the visit's tail. One bulk UPDATE, no extra load.
-            bookingRepository.markVisitRemindersSentByAppointmentIds(visits.keySet());
         }
 
         // Hand the batch to GuestReminderDispatcher, which fires only once THIS transaction commits and

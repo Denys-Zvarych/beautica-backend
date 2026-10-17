@@ -36,6 +36,7 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -61,6 +62,12 @@ class BookingReminderJobTest {
         logAppender.start();
         jobLogger = (Logger) LoggerFactory.getLogger(BookingReminderJob.class);
         jobLogger.addAppender(logAppender);
+        // Default: this instance WINS every claim (echoes back what it asked for). Tests of the lost-race
+        // path re-stub these. Booking ids are null in these POJO fixtures, which the echo preserves.
+        lenient().when(bookingRepository.claimRemindersByIds(any()))
+                .thenAnswer(inv -> new ArrayList<>((java.util.Collection<UUID>) inv.getArgument(0)));
+        lenient().when(bookingRepository.claimVisitRemindersByAppointmentIds(any()))
+                .thenAnswer(inv -> new ArrayList<>((java.util.Collection<UUID>) inv.getArgument(0)));
     }
 
     @AfterEach
@@ -70,7 +77,8 @@ class BookingReminderJobTest {
     }
 
     @Test
-    @DisplayName("should publish one reminder per due booking and mark reminderSent=true")
+    @DisplayName("should publish one reminder per due booking and claim them via the native UPDATE, "
+            + "without a redundant entity write")
     void should_publishRemindersAndMark_when_bookingsDue() {
         Booking b1 = guestBooking("+380501111111");
         Booking b2 = guestBooking("+380502222222");
@@ -81,8 +89,11 @@ class BookingReminderJobTest {
         assertThat(publishedEvent().reminders())
                 .extracting(GuestRemindersDueEvent.GuestReminderSms::phoneE164)
                 .containsExactly("+380501111111", "+380502222222");
-        assertThat(b1.isReminderSent()).isTrue();
-        assertThat(b2.isReminderSent()).isTrue();
+        verify(bookingRepository).claimRemindersByIds(org.mockito.ArgumentMatchers.argThat(ids -> ids.size() == 2));
+        // The native claim persists reminder_sent; the entity flag is deliberately NOT touched, so
+        // Hibernate's dirty check issues no second UPDATE per row at commit.
+        assertThat(b1.isReminderSent()).isFalse();
+        assertThat(b2.isReminderSent()).isFalse();
     }
 
     /**
@@ -168,16 +179,36 @@ class BookingReminderJobTest {
      * between commit and dispatch re-sends the whole batch on the next tick.
      */
     @Test
-    @DisplayName("reminderSent must already be true when the batch is handed off, so a lost dispatch never duplicates")
+    @DisplayName("the claim must precede the hand-off, so a lost dispatch never duplicates")
     void should_markReminderSentBeforePublishing_when_bookingsDue() {
         Booking due = guestBooking("+380501111111");
         when(bookingRepository.findGuestBookingsForReminder(any(), any())).thenReturn(List.of(due));
-        List<Boolean> flagAtPublish = new ArrayList<>();
-        doAnswer(inv -> flagAtPublish.add(due.isReminderSent())).when(events).publishEvent(any(Object.class));
+        List<String> order = new ArrayList<>();
+        doAnswer(inv -> {
+            order.add("claim");
+            return new ArrayList<>((java.util.Collection<UUID>) inv.getArgument(0));
+        }).when(bookingRepository).claimRemindersByIds(any());
+        doAnswer(inv -> order.add("publish")).when(events).publishEvent(any(Object.class));
 
         job.sendReminders();
 
-        assertThat(flagAtPublish).containsExactly(true);
+        assertThat(order).containsExactly("claim", "publish");
+    }
+
+    @Test
+    @DisplayName("should remind nobody and flag nothing when another instance already claimed the rows")
+    void should_remindNobody_when_anotherInstanceWonTheClaim() {
+        Booking single = guestBooking("+380501111111");
+        Booking visitItem = guestBooking("+380502222222");
+        visitItem.setAppointment(Appointment.builder().id(UUID.randomUUID()).build());
+        when(bookingRepository.findGuestBookingsForReminder(any(), any())).thenReturn(List.of(single, visitItem));
+        org.mockito.Mockito.doReturn(List.of()).when(bookingRepository).claimRemindersByIds(any());
+        org.mockito.Mockito.doReturn(List.of()).when(bookingRepository).claimVisitRemindersByAppointmentIds(any());
+
+        job.sendReminders();
+
+        verifyNoInteractions(events);
+        assertThat(single.isReminderSent()).as("the losing instance must not touch the flag").isFalse();
     }
 
     @Test

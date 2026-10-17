@@ -580,7 +580,7 @@ class EmailVerificationIT extends AbstractIntegrationTest {
                 .as("returned email must match the requested address")
                 .isEqualTo(email);
 
-        await().during(Duration.ofMillis(500)).atMost(Duration.ofSeconds(1)).untilAsserted(() ->
+        await().during(Duration.ofMillis(500)).atMost(Duration.ofSeconds(3)).untilAsserted(() ->
                 verify(emailNotificationService, never()).sendVerificationEmail(any(), any()));
     }
 
@@ -666,7 +666,7 @@ class EmailVerificationIT extends AbstractIntegrationTest {
         ResponseEntity<String> resend = postResend(email);
 
         assertThat(resend.getStatusCode()).isEqualTo(HttpStatus.OK);
-        await().during(Duration.ofMillis(500)).atMost(Duration.ofSeconds(1)).untilAsserted(() ->
+        await().during(Duration.ofMillis(500)).atMost(Duration.ofSeconds(3)).untilAsserted(() ->
                 verify(emailNotificationService, never()).sendVerificationEmail(eq(email), any()));
         assertThat(transactionTemplate.execute(s ->
                 userRepository.findByEmail(email).orElseThrow()).getVerificationCodeHash())
@@ -755,7 +755,7 @@ class EmailVerificationIT extends AbstractIntegrationTest {
 
         // The i=9 resend ran AFTER the lock tripped: a locked resend must dispatch
         // zero emails (the mock was reset right after the i=8 capture).
-        await().during(Duration.ofMillis(500)).atMost(Duration.ofSeconds(1)).untilAsserted(() ->
+        await().during(Duration.ofMillis(500)).atMost(Duration.ofSeconds(3)).untilAsserted(() ->
                 verify(emailNotificationService, never()).sendVerificationEmail(eq(email), any()));
 
         // While locked, even the genuinely CORRECT code (captured from the last

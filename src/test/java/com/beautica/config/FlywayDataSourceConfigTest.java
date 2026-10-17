@@ -98,6 +98,15 @@ class FlywayDataSourceConfigTest {
     }
 
     @Test
+    @DisplayName("non-test profile — every Flyway connection starts with lock_timeout = 10s")
+    void should_setLockTimeoutOnConnectionInit_when_flywayPoolBuilt() {
+        nonTestProfile().run(context -> {
+            HikariDataSource pool = (HikariDataSource) context.getBean("flywayDataSource");
+            assertThat(pool.getConnectionInitSql()).isEqualTo("SET lock_timeout = '10s'");
+        });
+    }
+
+    @Test
     @DisplayName("non-test profile — pool is named 'flyway-pool' and short-lived (10s idle / 60s max-lifetime)")
     void should_nameAndTimeOutFlywayPool_when_flywayPoolBuilt() {
         nonTestProfile().run(context -> {

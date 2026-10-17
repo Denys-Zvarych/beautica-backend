@@ -11,6 +11,10 @@ sentry:
   traces-sample-rate: 0.05
 
 spring:
+  # Phase 367 D3: pair with railway.json drainingSeconds (= this + sum of executor graces + margin; RailwayConfigTest).
+  lifecycle:
+    timeout-per-shutdown-phase: 20s
+
   jpa:
     show-sql: false
 
@@ -19,6 +23,7 @@ spring:
 
 server:
   port: ${PORT:8080}
+  shutdown: graceful
   error:
     include-stacktrace: never
     include-message: never

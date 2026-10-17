@@ -36,13 +36,16 @@ public class SchedulingConfig {
      */
     private static final int SCHEDULER_POOL_SIZE = 4;
 
+    /** Counted in the Railway {@code drainingSeconds} budget (Phase 367 D3, enforced by {@code RailwayConfigTest}). */
+    static final int SCHEDULER_SHUTDOWN_GRACE_SECONDS = 20;
+
     @Bean
     public TaskScheduler taskScheduler() {
         ThreadPoolTaskScheduler scheduler = new ThreadPoolTaskScheduler();
         scheduler.setPoolSize(SCHEDULER_POOL_SIZE);
         scheduler.setThreadNamePrefix("sched-");
         scheduler.setWaitForTasksToCompleteOnShutdown(true);
-        scheduler.setAwaitTerminationSeconds(20);
+        scheduler.setAwaitTerminationSeconds(SCHEDULER_SHUTDOWN_GRACE_SECONDS);
         scheduler.setErrorHandler(SchedulingConfig::logScheduledTaskError);
         return scheduler;
     }

@@ -11,6 +11,7 @@ import com.beautica.notification.repository.NotificationOutboxRepository;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.micrometer.core.instrument.MeterRegistry;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -53,6 +54,27 @@ public class NotificationOutboxDrainWorker {
      * agree on when an entry is dead-lettered.
      */
     static final int MAX_ATTEMPTS = 3;
+
+    /**
+     * Per-batch e-mail circuit breaker: after this many CONSECUTIVE {@link EmailDeliveryException}s
+     * within one {@link #dispatchAll} call, the batch's remaining non-{@code INAPP_PUSH} rows are put
+     * back to {@code PENDING} with their attempts untouched instead of being dispatched. Without it,
+     * a Brevo outage (hanging connections, or fast rejects) walks every queued e-mail through
+     * {@link #MAX_ATTEMPTS} on consecutive 5 s ticks, starving fresh booking e-mails and push rows
+     * and dead-lettering the lot within minutes. There is deliberately no {@code next_attempt_at}
+     * column: the deferred rows are simply retried on the next tick, where the first of them is the
+     * probe that decides whether the breaker trips again.
+     *
+     * <p>Only transient relay failures ({@link EmailDeliveryException#isTransientSmtp()}) count; a
+     * permanent local error (template render) fails its row but neither counts nor resets the streak.
+     * Push rows are never deferred, and {@code claimPendingBatch} claims {@code INAPP_PUSH} rows
+     * before e-mail rows, so a deferred e-mail backlog cannot starve them out of the batch.
+     */
+    static final int EMAIL_BREAKER_THRESHOLD = 3;
+
+    /** Micrometer counter names — untagged on purpose (no addresses / entry ids in metric dimensions). */
+    static final String METRIC_BREAKER_TRIPS = "notification.outbox.breaker.trips";
+    static final String METRIC_DEAD = "notification.outbox.dead";
     private static final int MAX_ERROR_LENGTH = 500;
 
     /**
@@ -92,6 +114,7 @@ public class NotificationOutboxDrainWorker {
     private final ObjectMapper objectMapper;
     private final OutboxPayloadCipher cipher;
     private final InAppPushDispatcher inAppPushDispatcher;
+    private final MeterRegistry meterRegistry;
 
     /**
      * Self-proxy reference so that {@link #drain()} (and {@link #persistResults(List)}, for
@@ -126,6 +149,13 @@ public class NotificationOutboxDrainWorker {
      * status updates collected in phase 2, ONE independent {@code REQUIRES_NEW} transaction per
      * entry, so one entry's persistence failure cannot roll back its batch-mates' already-decided
      * outcomes.
+     *
+     * <p><b>Delivery semantics: at-least-once.</b> An SMTP call that times out is ambiguous — the relay
+     * may have accepted the message even though the client saw a failure — and such a row is retried,
+     * so one e-mail can be delivered up to {@link #MAX_ATTEMPTS} times. A stranded {@code PROCESSING}
+     * row reclaimed by {@link NotificationOutboxReclaimJob} can likewise be dispatched again. Invites
+     * are re-sent from the same stored (sealed) URL, so a duplicate carries the same invite token.
+     * See {@link EmailDeliveryException}.
      *
      * <p>Worst-case phase 2 duration: {@code BATCH_SIZE × per-entry dispatch worst-case}. Each
      * {@code dispatch()} call makes ONE of two chains: (a) the common case — email (SMTP:
@@ -253,8 +283,24 @@ public class NotificationOutboxDrainWorker {
         }
 
         List<EntryResult> results = new ArrayList<>(batch.size());
+        int consecutiveEmailFailures = 0;
+        boolean emailBreakerTripped = false;
+        boolean pushSaturated = false;
+        int deferredEmailRows = 0;
         for (int i = 0; i < batch.size(); i++) {
             NotificationOutboxEntry entry = batch.get(i);
+            boolean isPush = entry.getEventType() == OutboxEventType.INAPP_PUSH;
+            if (emailBreakerTripped && !isPush) {
+                // Breaker open: not a delivery failure, so no attempt is counted.
+                results.add(new EntryResult(entry, OutboxStatus.PENDING, entry.getAttempts(), entry.getLastError()));
+                deferredEmailRows++;
+                continue;
+            }
+            if (pushSaturated && isPush) {
+                // Push executor full: backpressure, not a failure — no attempt counted.
+                results.add(new EntryResult(entry, OutboxStatus.PENDING, entry.getAttempts(), entry.getLastError()));
+                continue;
+            }
             if (pushPrepareError != null && entry.getEventType() == OutboxEventType.INAPP_PUSH) {
                 results.add(failedAttempt(entry, pushPrepareError));
                 continue;
@@ -262,6 +308,9 @@ public class NotificationOutboxDrainWorker {
             try {
                 dispatch(entry, bookingCache, visitSiblings, pushPlans);
                 results.add(new EntryResult(entry, OutboxStatus.SENT, entry.getAttempts(), null));
+                if (!isPush) {
+                    consecutiveEmailFailures = 0;
+                }
             } catch (RejectedExecutionException e) {
                 // Spring's TaskRejectedException (what @Async actually throws) extends it.
                 // NOTE: this catch is not push-specific — a RejectedExecutionException from ANY
@@ -274,7 +323,16 @@ public class NotificationOutboxDrainWorker {
                 // burst, so this entry and every not-yet-dispatched one go back to PENDING with their
                 // attempts untouched, and the rest of the batch is NOT dispatched — the next tick
                 // retries them once the executor has drained.
-                log.warn("Push executor saturated at outbox entry [{}] — re-queueing {} entries without "
+                if (isPush) {
+                    // Push rows are claimed first; a full push executor must not stall the e-mail rows
+                    // behind them. Defer only the push rows (this one and the later ones) and keep going.
+                    log.warn("Push executor saturated at outbox entry [{}] — deferring remaining push entries "
+                            + "without counting an attempt: {}", entry.getId(), e.getClass().getSimpleName());
+                    pushSaturated = true;
+                    results.add(new EntryResult(entry, OutboxStatus.PENDING, entry.getAttempts(), entry.getLastError()));
+                    continue;
+                }
+                log.warn("Executor saturated at outbox entry [{}] — re-queueing {} entries without "
                         + "counting an attempt: {}", entry.getId(), batch.size() - i, e.getClass().getSimpleName());
                 requeueRemaining(batch, i, results);
                 break;
@@ -285,7 +343,20 @@ public class NotificationOutboxDrainWorker {
                 results.add(new EntryResult(entry, status, next, error));
                 log.warn("Outbox dispatch failed [{}] attempt {}/{}: {}",
                         entry.getId(), next, MAX_ATTEMPTS, e.getClass().getSimpleName());
+                if (e instanceof EmailDeliveryException ede && ede.isTransientSmtp()
+                        && ++consecutiveEmailFailures >= EMAIL_BREAKER_THRESHOLD) {
+                    emailBreakerTripped = true;
+                }
             }
+        }
+        results.stream().filter(r -> r.status() == OutboxStatus.DEAD).forEach(r ->
+                meterRegistry.counter(METRIC_DEAD).increment());
+        if (emailBreakerTripped) {
+            meterRegistry.counter(METRIC_BREAKER_TRIPS).increment();
+            // Counts only — never addresses or entry payloads.
+            log.warn("Outbox e-mail circuit breaker tripped after {} consecutive delivery failures; "
+                    + "{} remaining e-mail rows of this batch re-queued without counting an attempt",
+                    EMAIL_BREAKER_THRESHOLD, deferredEmailRows);
         }
         return results;
     }
@@ -301,7 +372,7 @@ public class NotificationOutboxDrainWorker {
     /** Marks {@code batch[from..]} PENDING with attempts unchanged — see the rejection catch above. */
     private static void requeueRemaining(List<NotificationOutboxEntry> batch, int from, List<EntryResult> results) {
         for (NotificationOutboxEntry entry : batch.subList(from, batch.size())) {
-            results.add(new EntryResult(entry, OutboxStatus.PENDING, entry.getAttempts(), null));
+            results.add(new EntryResult(entry, OutboxStatus.PENDING, entry.getAttempts(), entry.getLastError()));
         }
     }
 

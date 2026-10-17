@@ -7,12 +7,27 @@ import com.beautica.notification.sms.SmsService;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.config.BeanPostProcessor;
+import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.test.mock.mockito.MockBean;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Import;
+import org.springframework.context.event.EventListener;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
+import com.beautica.booking.event.GuestRemindersDueEvent;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Proxy;
 import java.time.Clock;
 import java.time.OffsetDateTime;
+import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -22,13 +37,15 @@ import static org.assertj.core.api.Assertions.assertThat;
  *
  * <p>The claim being tested is that the rows are MANAGED — they are loaded by
  * {@code findGuestBookingsForReminder} inside the job's own {@code @Transactional} method, so Hibernate's
- * dirty check flushes {@code reminderSent = true} at commit and the {@code saveAll} was a redundant merge
- * pass over entities already in the persistence context.
+ * dirty check once flushed {@code reminderSent = true} at commit. Since phase 367 audit cycle 2 neither the
+ * {@code saveAll} nor the in-memory {@code setReminderSent(true)} remains: the native
+ * {@code claimRemindersByIds} UPDATE ... RETURNING is the SOLE writer of the column, so no redundant
+ * dirty UPDATE follows it.
  *
  * <p>That claim is the one change in this PR with real regression potential, and the unit test that
  * accompanies it ({@code should_notCallSaveAll_when_bookingsDue}) cannot detect a failure: it drives the
  * job with a MOCK repository, so there is no persistence context, no flush and no commit — the flag is
- * asserted on a detached POJO. If dirty checking did not in fact persist the column, every hourly sweep
+ * asserted on a detached POJO. If the claim did not in fact persist the column, every hourly sweep
  * would re-select the same bookings and the guest would receive the same reminder every hour until their
  * appointment. Only a real transaction against a real database can tell the two apart, so this test reads
  * the column back with {@link org.springframework.jdbc.core.JdbcTemplate} — outside the job's persistence
@@ -38,8 +55,13 @@ import static org.assertj.core.api.Assertions.assertThat;
  * call. Nothing is asserted about it: delivery is asynchronous by design, so a call-count assertion there
  * would only be a timing race (Anti-Bug §M).
  */
-@DisplayName("Guest reminder sweep — reminderSent persists by dirty checking, with no explicit save")
+@DisplayName("Guest reminder sweep — reminderSent persists via the native claim, with no entity write")
+@Import(GuestReminderSweepPersistenceIT.OverlapProbeConfig.class)
 class GuestReminderSweepPersistenceIT extends AbstractIntegrationTest {
+
+    /** When non-null, every {@code findGuestBookingsForReminder} caller parks here AFTER its select. */
+    private static volatile CyclicBarrier afterSelectBarrier;
+    private static final List<GuestRemindersDueEvent> PUBLISHED = new CopyOnWriteArrayList<>();
 
     private static final String TEST_PASSWORD = "Str0ngP@ss1!";
     private static final String GUEST_PHONE = "+380501234567";
@@ -71,7 +93,7 @@ class GuestReminderSweepPersistenceIT extends AbstractIntegrationTest {
         bookingReminderJob.sendReminders();
 
         assertThat(reminderSent(bookingId))
-                .as("reminderSent was never flushed — with saveAll removed, dirty checking is the ONLY "
+                .as("reminderSent was never flushed — with the entity write removed, the native claim is the ONLY "
                         + "thing that persists this column, and a guest whose flag never lands is "
                         + "re-reminded by every subsequent hourly sweep")
                 .isTrue();
@@ -99,6 +121,34 @@ class GuestReminderSweepPersistenceIT extends AbstractIntegrationTest {
                 .as("the sweep re-selects an already-reminded booking — every hourly tick would send the "
                         + "guest the same reminder again")
                 .isEmpty();
+    }
+
+    /**
+     * Rolling-deploy overlap: two instances run the hourly sweep at once. The barrier parks both AFTER
+     * their SELECT (so both hold the same unflagged rows, the exact pre-fix race) and releases them
+     * together into the claim. Exactly one reminder per booking must be published.
+     */
+    @Test
+    @DisplayName("two concurrent sweeps must publish exactly one reminder per booking")
+    void should_dispatchExactlyOncePerBooking_when_twoSweepsOverlap() throws Exception {
+        seedGuestBookingDueForReminder();
+        seedGuestBookingDueForReminder();
+        PUBLISHED.clear();
+        afterSelectBarrier = new CyclicBarrier(2);
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        try {
+            Future<?> a = pool.submit(bookingReminderJob::sendReminders);
+            Future<?> b = pool.submit(bookingReminderJob::sendReminders);
+            a.get(30, TimeUnit.SECONDS);
+            b.get(30, TimeUnit.SECONDS);
+        } finally {
+            afterSelectBarrier = null;
+            pool.shutdownNow();
+        }
+
+        assertThat(PUBLISHED.stream().mapToInt(e -> e.reminders().size()).sum())
+                .as("both instances selected the same rows; without the atomic claim each would remind them")
+                .isEqualTo(2);
     }
 
     // ── fixture ─────────────────────────────────────────────────────────────────
@@ -151,5 +201,41 @@ class GuestReminderSweepPersistenceIT extends AbstractIntegrationTest {
     private boolean reminderSent(UUID bookingId) {
         return Boolean.TRUE.equals(jdbcTemplate.queryForObject(
                 "SELECT reminder_sent FROM bookings WHERE id = ?", Boolean.class, bookingId));
+    }
+
+    /** Wraps the real {@link BookingRepository} so a test can hold two sweeps between SELECT and claim. */
+    @TestConfiguration
+    static class OverlapProbeConfig {
+
+        @Bean
+        static BeanPostProcessor reminderSelectBarrierPostProcessor() {
+            return new BeanPostProcessor() {
+                @Override
+                public Object postProcessAfterInitialization(Object bean, String beanName) {
+                    if (!(bean instanceof BookingRepository)) {
+                        return bean;
+                    }
+                    return Proxy.newProxyInstance(bean.getClass().getClassLoader(),
+                            new Class<?>[]{BookingRepository.class}, (proxy, method, args) -> {
+                                Object result;
+                                try {
+                                    result = method.invoke(bean, args);
+                                } catch (InvocationTargetException e) {
+                                    throw e.getCause();
+                                }
+                                CyclicBarrier barrier = afterSelectBarrier;
+                                if (barrier != null && method.getName().equals("findGuestBookingsForReminder")) {
+                                    barrier.await(20, TimeUnit.SECONDS);
+                                }
+                                return result;
+                            });
+                }
+            };
+        }
+
+        @EventListener
+        void record(GuestRemindersDueEvent event) {
+            PUBLISHED.add(event);
+        }
     }
 }
