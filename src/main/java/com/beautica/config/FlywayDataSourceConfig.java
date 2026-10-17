@@ -81,6 +81,12 @@ public class FlywayDataSourceConfig {
         cfg.setIdleTimeout(FLYWAY_IDLE_TIMEOUT_MS);
         cfg.setMaxLifetime(FLYWAY_MAX_LIFETIME_MS);
         cfg.setPoolName("flyway-pool");
+        // Bound every lock WAIT a migration statement can queue behind (e.g. an overlapping old instance
+        // holding a row/table lock during a Railway rolling deploy) so boot fails fast instead of hanging
+        // until the healthcheck timeout. per-migration SET LOCAL lock_timeout (V120 uses 30s, the
+        // rest 5s: V138/V150/V169/V173/V197) still override this within their own transaction.
+        // Flyway's own schema-history lock is pg_try_advisory_lock (non-blocking retry), unaffected.
+        cfg.setConnectionInitSql("SET lock_timeout = '10s'");
         return new HikariDataSource(cfg);
     }
 }

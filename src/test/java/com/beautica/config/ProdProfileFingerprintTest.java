@@ -23,6 +23,7 @@ class ProdProfileFingerprintTest {
         return new ApplicationContextRunner()
                 .withInitializer(new ConfigDataApplicationContextInitializer())
                 .withPropertyValues("spring.profiles.active=" + profiles,
+                        "SENTRY_DSN=https://0123456789abcdef@o42.ingest.de.sentry.io/4500000000000001", "TURBOSMS_TOKEN=turbosms-fixture-token", "ADMIN_EMAIL=admin@beautica.ua",
                         "BREVO_SMTP_LOGIN=login", "BREVO_SMTP_KEY=key", "JWT_SECRET=x", "INTERNAL_API_KEY=" + TestSecrets.INTERNAL_API_KEY, "FRONTEND_BASE_URL=https://app.beautica.ua",
                         "PUBLIC_BASE_URL=https://api.beautica.ua", "SUPPORT_EMAIL=help@beautica.ua",
                         "R2_ENABLED=true", "CLOUDFLARE_R2_BUCKET=beautica-media-prod",
@@ -73,6 +74,7 @@ class ProdProfileFingerprintTest {
         new ApplicationContextRunner()
                 .withInitializer(new ConfigDataApplicationContextInitializer())
                 .withPropertyValues("spring.profiles.active=prod",
+                        "SENTRY_DSN=https://0123456789abcdef@o42.ingest.de.sentry.io/4500000000000001", "TURBOSMS_TOKEN=turbosms-fixture-token", "ADMIN_EMAIL=admin@beautica.ua",
                         "BREVO_SMTP_LOGIN=login", "BREVO_SMTP_KEY=key", "JWT_SECRET=x", "INTERNAL_API_KEY=" + TestSecrets.INTERNAL_API_KEY, "FRONTEND_BASE_URL=https://app.beautica.ua",
                         "SUPPORT_EMAIL=help@beautica.ua",
                         "R2_ENABLED=true", "CLOUDFLARE_R2_BUCKET=beautica-media-prod",
@@ -134,6 +136,7 @@ class ProdProfileFingerprintTest {
         new ApplicationContextRunner()
                 .withInitializer(new ConfigDataApplicationContextInitializer())
                 .withPropertyValues("spring.profiles.active=prod",
+                        "SENTRY_DSN=https://0123456789abcdef@o42.ingest.de.sentry.io/4500000000000001", "TURBOSMS_TOKEN=turbosms-fixture-token", "ADMIN_EMAIL=admin@beautica.ua",
                         "BREVO_SMTP_LOGIN=login", "BREVO_SMTP_KEY=key", "JWT_SECRET=x", "INTERNAL_API_KEY=" + TestSecrets.INTERNAL_API_KEY, "FRONTEND_BASE_URL=https://app.beautica.ua",
                         "PUBLIC_BASE_URL=https://api.beautica.ua",
                         "R2_ENABLED=true", "CLOUDFLARE_R2_BUCKET=beautica-media-prod",
@@ -142,5 +145,60 @@ class ProdProfileFingerprintTest {
                         .isInstanceOf(IllegalStateException.class)
                         .hasMessageContaining("prod-support-email")
                         .hasMessageContaining("app.support.email"));
+    }
+
+    // ---- Phase 367 D5: each new required variable, removed alone from a passing prod set, fails boot on its own rule ----
+
+    private static final java.util.Map<String, String> PROD_REQUIRED = java.util.Map.of(
+            "SENTRY_DSN", "https://0123456789abcdef@o42.ingest.de.sentry.io/4500000000000001",
+            "TURBOSMS_TOKEN", "turbosms-fixture-token",
+            "ADMIN_EMAIL", "admin@beautica.ua");
+
+    private static ApplicationContextRunner prodRunnerWithout(String missing) {
+        java.util.List<String> props = new java.util.ArrayList<>(java.util.List.of("spring.profiles.active=prod",
+                "BREVO_SMTP_LOGIN=login", "BREVO_SMTP_KEY=key", "JWT_SECRET=x",
+                "INTERNAL_API_KEY=" + TestSecrets.INTERNAL_API_KEY, "FRONTEND_BASE_URL=https://app.beautica.ua",
+                "PUBLIC_BASE_URL=https://api.beautica.ua", "SUPPORT_EMAIL=help@beautica.ua", "R2_ENABLED=true",
+                "CLOUDFLARE_R2_BUCKET=beautica-media-prod", "CLOUDFLARE_R2_PUBLIC_URL=https://media.beautica.ua"));
+        PROD_REQUIRED.forEach((k, v) -> {
+            if (!k.equals(missing)) {
+                props.add(k + "=" + v);
+            }
+        });
+        return new ApplicationContextRunner().withInitializer(new ConfigDataApplicationContextInitializer())
+                .withPropertyValues(props.toArray(String[]::new));
+    }
+
+    @Test
+    @DisplayName("prod with all three new required variables — guard passes (control for the falsification cases)")
+    void should_passGuard_when_prodHasSentryTurbosmsAndAdminEmail() {
+        prodRunnerWithout("").run(ctx -> assertThatCode(() -> EnvironmentFingerprintGuard.verify(ctx.getEnvironment()))
+                .doesNotThrowAnyException());
+    }
+
+    @Test
+    @DisplayName("prod without SENTRY_DSN — guard fails on sentry-dsn-required, DSN-free message")
+    void should_failGuard_when_prodSentryDsnMissing() {
+        prodRunnerWithout("SENTRY_DSN").run(ctx -> assertThatThrownBy(
+                        () -> EnvironmentFingerprintGuard.verify(ctx.getEnvironment()))
+                .hasMessageContaining("rule sentry-dsn-required").message().doesNotContain("sentry.io"));
+    }
+
+    @Test
+    @DisplayName("prod without TURBOSMS_TOKEN — guard fails on prod-turbosms-token-blank")
+    void should_failGuard_when_prodTurbosmsTokenMissing() {
+        prodRunnerWithout("TURBOSMS_TOKEN").run(ctx -> assertThatThrownBy(
+                        () -> EnvironmentFingerprintGuard.verify(ctx.getEnvironment()))
+                .hasMessageContaining("rule prod-turbosms-token-blank"));
+    }
+
+    @Test
+    @DisplayName("prod without ADMIN_EMAIL (yml default admin@beautica.app would apply) — guard fails on prod-admin-email-unset")
+    void should_failGuard_when_prodAdminEmailMissing() {
+        prodRunnerWithout("ADMIN_EMAIL").run(ctx -> {
+            assertThat(ctx.getEnvironment().getProperty("app.admin-email")).isEqualTo("admin@beautica.app");
+            assertThatThrownBy(() -> EnvironmentFingerprintGuard.verify(ctx.getEnvironment()))
+                    .hasMessageContaining("rule prod-admin-email-unset");
+        });
     }
 }

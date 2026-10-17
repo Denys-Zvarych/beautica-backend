@@ -3,12 +3,18 @@ package com.beautica.config;
 import com.beautica.support.TestSecrets;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.springframework.boot.test.system.CapturedOutput;
+import org.springframework.boot.test.system.OutputCaptureExtension;
 import org.springframework.mock.env.MockEnvironment;
+
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+@ExtendWith(OutputCaptureExtension.class)
 @DisplayName("EnvironmentFingerprintGuard — Phase 368 D2 / audit cycle 1")
 class EnvironmentFingerprintGuardTest {
 
@@ -31,6 +37,10 @@ class EnvironmentFingerprintGuardTest {
     }
 
     private static MockEnvironment prodEnv() {
+        return prodEnvWithoutAdminEmail().withProperty("ADMIN_EMAIL", "admin@beautica.ua");
+    }
+
+    private static MockEnvironment prodEnvWithoutAdminEmail() {
         MockEnvironment env = new MockEnvironment()
                 .withProperty("RAILWAY_ENVIRONMENT_NAME", "production")
                 .withProperty("app.cloudflare-r2.enabled", "true")
@@ -40,7 +50,11 @@ class EnvironmentFingerprintGuardTest {
                 .withProperty("app.frontend.base-url", "https://app.beautica.ua")
                 .withProperty("app.cloudflare-r2.public-url", "https://media.beautica.ua")
                 .withProperty("app.support.email", "help@beautica.ua")
-                .withProperty("app.internal-api-key", VALID_KEY);
+                .withProperty("app.internal-api-key", VALID_KEY)
+                .withProperty("sentry.dsn", EU_DSN)
+                .withProperty("TURBOSMS_TOKEN", "turbosms-fixture-token")
+                .withProperty("spring.mail.username", "brevo-login")
+                .withProperty("spring.mail.password", "brevo-key");
         env.setActiveProfiles("prod");
         return env;
     }
@@ -688,15 +702,97 @@ class EnvironmentFingerprintGuardTest {
     }
 
     @Test
-    @DisplayName("blank SENTRY_DSN — staging and prod still boot (Sentry off; user hard rule overrides D6 sentry-dsn-required)")
-    void should_pass_when_dsnBlankInStagingAndProd() {
+    @DisplayName("sentry-dsn-required: PROD with a blank DSN — fails naming the rule")
+    void should_fail_when_prodDsnBlank() {
         MockEnvironment prod = prodEnv().withProperty("sentry.enabled", "true").withProperty("sentry.dsn", "")
                 .withProperty("sentry.environment", "prod");
+
+        assertThatThrownBy(() -> run(prod, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                .hasMessageContaining("rule sentry-dsn-required").hasMessageContaining("sentry.dsn");
+    }
+
+    @Test
+    @DisplayName("blank SENTRY_DSN — staging still boots (Sentry off)")
+    void should_pass_when_dsnBlankInStaging() {
         MockEnvironment staging = stagingEnv().withProperty("sentry.enabled", "true").withProperty("sentry.dsn", "")
                 .withProperty("sentry.environment", "staging");
 
-        assertThatCode(() -> run(prod, DeployEnvironment.PROD, SmsMode.TURBOSMS)).doesNotThrowAnyException();
         assertThatCode(() -> run(staging, DeployEnvironment.STAGING, SmsMode.CAPTURE)).doesNotThrowAnyException();
+    }
+
+    // ---- Phase 367 D5/D9: prod required-env rules ----------------------------------------------------------
+
+    @Test
+    @DisplayName("prod-turbosms-token-blank: PROD without TURBOSMS_TOKEN — fails naming the rule")
+    void should_fail_when_prodTurbosmsTokenBlank() {
+        MockEnvironment env = prodEnv().withProperty("TURBOSMS_TOKEN", " ");
+
+        assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                .hasMessageContaining("rule prod-turbosms-token-blank").hasMessageContaining("TURBOSMS_TOKEN");
+    }
+
+    @Test
+    @DisplayName("prod-turbosms-token-blank: the token never appears; a token set via app.sms.turbosms.token passes")
+    void should_acceptTokenViaProperty_when_prodTurbosms() {
+        MockEnvironment viaProperty = prodEnv().withProperty("TURBOSMS_TOKEN", "")
+                .withProperty("app.sms.turbosms.token", SECRET);
+
+        assertThatCode(() -> run(viaProperty, DeployEnvironment.PROD, SmsMode.TURBOSMS)).doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("prod-admin-email-unset: ADMIN_EMAIL absent (only the yml default would apply) — fails")
+    void should_fail_when_prodAdminEmailUnset() {
+        MockEnvironment unset = prodEnvWithoutAdminEmail().withProperty("app.admin-email", "admin@beautica.app");
+
+        assertThatThrownBy(() -> run(unset, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                .hasMessageContaining("rule prod-admin-email-unset").hasMessageContaining("ADMIN_EMAIL");
+    }
+
+    @Test
+    @DisplayName("prod-admin-email-unset: ADMIN_EMAIL not email-shaped — fails, value not echoed")
+    void should_fail_when_prodAdminEmailMalformed() {
+        MockEnvironment env = prodEnv().withProperty("ADMIN_EMAIL", "not-an-email-" + SECRET);
+
+        assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                .hasMessageContaining("rule prod-admin-email-unset").message().doesNotContain(SECRET);
+    }
+
+    @Test
+    @DisplayName("prod-brevo-unconfigured: PENDING (any case) or blank login/key — boots, exactly one WARN, no values")
+    void should_warnOnce_when_prodBrevoPendingOrBlank(CapturedOutput output) {
+        for (MockEnvironment env : List.of(
+                prodEnv().withProperty("spring.mail.username", "PENDING").withProperty("spring.mail.password", "PENDING"),
+                prodEnv().withProperty("spring.mail.username", "pending"),
+                prodEnv().withProperty("spring.mail.password", " "))) {
+            assertThatCode(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS)).doesNotThrowAnyException();
+        }
+
+        assertThat(brevoWarnLines(output)).hasSize(3);
+        assertThat(output.getAll()).doesNotContain("brevo-login").doesNotContain("brevo-key");
+    }
+
+    @Test
+    @DisplayName("prod-brevo-unconfigured: real credentials — no WARN")
+    void should_notWarn_when_prodBrevoConfigured(CapturedOutput output) {
+        run(prodEnv(), DeployEnvironment.PROD, SmsMode.TURBOSMS);
+
+        assertThat(brevoWarnLines(output)).isEmpty();
+    }
+
+    @Test
+    @DisplayName("staging ignores every new PROD rule (no DSN, no admin e-mail, no Brevo creds) — passes, no WARN")
+    void should_ignoreProdRules_when_staging(CapturedOutput output) {
+        MockEnvironment staging = stagingEnv().withProperty("sentry.dsn", "");
+
+        assertThatCode(() -> run(staging, DeployEnvironment.STAGING, SmsMode.CAPTURE)).doesNotThrowAnyException();
+        assertThat(brevoWarnLines(output)).isEmpty();
+    }
+
+    /** WARN log lines only: the test-name logger line itself mentions the rule. */
+    private static List<String> brevoWarnLines(CapturedOutput output) {
+        return output.getAll().lines()
+                .filter(l -> l.contains(" WARN ") && l.contains("rule prod-brevo-unconfigured")).toList();
     }
 
     @Test
@@ -746,5 +842,64 @@ class EnvironmentFingerprintGuardTest {
 
         assertThatCode(() -> run(prod, DeployEnvironment.PROD, SmsMode.TURBOSMS)).doesNotThrowAnyException();
         assertThatCode(() -> run(local, DeployEnvironment.LOCAL, SmsMode.TURBOSMS)).doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("prod-turbosms-token-placeholder: PENDING/changeme/todo/xxx (any case) or a short token — fails, value not echoed")
+    void should_fail_when_prodTurbosmsTokenIsPlaceholderOrShort() {
+        for (String bad : List.of("PENDING", "ChangeMe", "todo", "XXX", "x", "short-token")) {
+            MockEnvironment env = prodEnv().withProperty("TURBOSMS_TOKEN", bad);
+
+            assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                    .hasMessageContaining("rule prod-turbosms-token-placeholder")
+                    .message().doesNotContain("=" + bad);
+        }
+    }
+
+    @Test
+    @DisplayName("prod-admin-email: a reserved/example ADMIN_EMAIL, or an APP_ADMIN_EMAIL override to one, fails")
+    void should_fail_when_prodAdminEmailIsPlaceholderOrOverriddenToOne() {
+        MockEnvironment raw = prodEnv().withProperty("ADMIN_EMAIL", "admin@example.com");
+        MockEnvironment overridden = prodEnv().withProperty("app.admin-email", "ops@mail.example.org");
+        MockEnvironment overriddenMalformed = prodEnv().withProperty("app.admin-email", "not-an-email");
+
+        assertThatThrownBy(() -> run(raw, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                .hasMessageContaining("rule prod-admin-email-placeholder");
+        assertThatThrownBy(() -> run(overridden, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                .hasMessageContaining("rule prod-admin-email-effective");
+        assertThatThrownBy(() -> run(overriddenMalformed, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                .hasMessageContaining("rule prod-admin-email-effective");
+    }
+
+    @Test
+    @DisplayName("prod-admin-email: a real override different from ADMIN_EMAIL passes")
+    void should_pass_when_prodAdminEmailOverriddenToRealAddress() {
+        MockEnvironment env = prodEnv().withProperty("app.admin-email", "ops@beautica.ua");
+
+        assertThatCode(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS)).doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("spring.factories instantiation of the guard takes the DeferredLogFactory constructor (deferred-log path)")
+    void should_useDeferredLogPath_when_instantiatedBySpringFactoriesLoader() {
+        org.springframework.boot.logging.DeferredLogFactory factory = org.mockito.Mockito.mock(
+                org.springframework.boot.logging.DeferredLogFactory.class);
+        org.apache.commons.logging.Log deferred = org.mockito.Mockito.mock(org.apache.commons.logging.Log.class);
+        org.mockito.Mockito.when(factory.getLog(EnvironmentFingerprintGuard.class)).thenReturn(deferred);
+        org.springframework.core.io.support.SpringFactoriesLoader loader =
+                org.springframework.core.io.support.SpringFactoriesLoader.forDefaultResourceLocation(
+                        getClass().getClassLoader());
+
+        List<org.springframework.boot.env.EnvironmentPostProcessor> processors = loader.load(
+                org.springframework.boot.env.EnvironmentPostProcessor.class,
+                org.springframework.core.io.support.SpringFactoriesLoader.ArgumentResolver.of(
+                        org.springframework.boot.logging.DeferredLogFactory.class, factory));
+
+        EnvironmentFingerprintGuard guard = processors.stream()
+                .filter(EnvironmentFingerprintGuard.class::isInstance)
+                .map(EnvironmentFingerprintGuard.class::cast).findFirst().orElseThrow();
+        assertThat(org.springframework.test.util.ReflectionTestUtils.getField(guard, "log")).isSameAs(deferred);
+        assertThat(EnvironmentFingerprintGuard.class.getConstructors()).hasSize(1);
+        org.mockito.Mockito.verify(factory).getLog(EnvironmentFingerprintGuard.class);
     }
 }

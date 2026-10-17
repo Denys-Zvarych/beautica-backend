@@ -33,6 +33,7 @@ import java.util.Properties;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
@@ -676,21 +677,37 @@ class EmailNotificationServiceTest {
     // -------------------------------------------------------------------------
 
     @Test
-    @DisplayName("should not throw when mailSender.send throws MailSendException")
-    void should_notThrow_when_mailSenderThrowsMailException() {
+    @DisplayName("should throw EmailDeliveryException (no PII in message) when mailSender.send throws MailSendException")
+    void should_throwEmailDeliveryException_when_mailSenderThrowsMailException() {
         MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
         when(mailSender.createMimeMessage()).thenReturn(realMessage);
         when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>invite</html>");
         doThrow(new MailSendException("SMTP unavailable")).when(mailSender).send(any(MimeMessage.class));
 
-        assertThatCode(() ->
+        assertThatThrownBy(() ->
                 service.sendInviteEmail("fail@example.com", "https://beautica.app/invite/x", "Salon")
-        ).doesNotThrowAnyException();
+        ).isInstanceOf(EmailDeliveryException.class)
+                .hasMessageContaining("email/invite-master")
+                .hasMessageNotContaining("fail@example.com")
+                .hasNoCause()
+                .satisfies(ex -> assertThat(((EmailDeliveryException) ex).isTransientSmtp()).isTrue());
     }
 
     @Test
-    @DisplayName("should not throw when MimeMessageHelper setup causes MessagingException")
-    void should_notThrow_when_messagingExceptionThrown() throws MessagingException {
+    @DisplayName("should throw a NON-transient EmailDeliveryException when the template engine fails to render")
+    void should_throwNonTransientEmailDeliveryException_when_templateRenderFails() {
+        when(templateEngine.process(anyString(), any(IContext.class)))
+                .thenThrow(new org.thymeleaf.exceptions.TemplateProcessingException("bad template"));
+
+        assertThatThrownBy(() ->
+                service.sendInviteEmail("fail@example.com", "https://beautica.app/invite/x", "Salon")
+        ).isInstanceOf(EmailDeliveryException.class)
+                .satisfies(ex -> assertThat(((EmailDeliveryException) ex).isTransientSmtp()).isFalse());
+    }
+
+    @Test
+    @DisplayName("should throw EmailDeliveryException when MimeMessageHelper setup causes MessagingException")
+    void should_throwEmailDeliveryException_when_messagingExceptionThrown() throws MessagingException {
         // Inject a real MessagingException via a mock MimeMessage whose setSubject throws.
         // MimeMessageHelper.setSubject delegates to MimeMessage.setSubject, which is declared
         // to throw MessagingException — exercising the genuine catch (MessagingException | MailException)
@@ -701,9 +718,12 @@ class EmailNotificationServiceTest {
         when(mailSender.createMimeMessage()).thenReturn(mockMessage);
         when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>invite</html>");
 
-        assertThatCode(() ->
+        assertThatThrownBy(() ->
                 service.sendInviteEmail("fail@example.com", "https://beautica.app/invite/x", "Salon")
-        ).doesNotThrowAnyException();
+        ).isInstanceOf(EmailDeliveryException.class)
+                .hasMessageContaining("email/invite-master")
+                .hasMessageNotContaining("fail@example.com")
+                .hasNoCause();
     }
 
     // -------------------------------------------------------------------------
