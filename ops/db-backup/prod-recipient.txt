@@ -3,3 +3,4 @@
 # Runbook E3: after generating the prod key, commit its `age1...` PUBLIC line here (one line, below), BEFORE the first run (E6).
 # When the bucket is the prod bucket, BACKUP_AGE_RECIPIENT must equal it.
 # The key goes in on STDIN; for the prod key this is `bw get notes '<item>' | ... --identity -`, never a file.
+age17dnlgy9x69vlvtfdzcdv9llxhfneuwjhwwkcejssqctt7365ss9qwx628u
