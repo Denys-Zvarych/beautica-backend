@@ -1,5 +1,22 @@
 -- Phase 373 — Guest PII retention (website gap BG-2).
 --
+-- contract-of: V162
+--
+-- Expand/contract justification (phase 370 D6 gate — flagged for DROP + ADD CHECK of
+-- chk_bookings_guest_fields / chk_appointment_guest_fields and the two new *_anonymised_scope CHECKs):
+-- safe against the release running before this one (rollback = previous image on this schema).
+--   * For every row with guest_pii_anonymised_at IS NULL, each new guest-fields CHECK is EXACTLY the
+--     V162 CHECK (the live LINK / walk-in disjuncts are V162's clauses + "marker IS NULL"; the APP,
+--     STAFF-registered and DETACHED arms are byte-for-byte). The previous app does not map
+--     guest_pii_anonymised_at at all, so every row it INSERTs has the marker NULL (column default),
+--     and its UPDATEs (Booking @DynamicUpdate; Appointment full-column but over mapped columns only)
+--     never touch the marker. Its writes are therefore accepted iff V162 accepted them.
+--   * Existing rows all have the marker NULL when this runs, so the CHECKs validate exactly as V162's.
+--   * *_anonymised_scope (marker NULL OR client_id NULL) is vacuously true for marker-NULL rows.
+--   * The only writes newly rejected are those putting PII back onto a row THIS release anonymised —
+--     intended, and the previous app has no path that writes guest name/surname/phone or client notes
+--     onto an existing guest row.
+--
 -- Guest (LINK) and walk-in (STAFF, client_id NULL) rows carry a non-user's name, surname, phone and
 -- free-text notes. GuestPiiAnonymisationService overwrites them 12 months after bookings.ends_at
 -- (GuestPiiRetentionJob) or on request (POST /api/v1/internal/guest-pii/erase):
