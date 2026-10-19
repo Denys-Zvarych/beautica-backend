@@ -28,7 +28,11 @@ public record BrevoEmailRequest(
     public record Address(String email, String name) {
     }
 
-    /** One attachment: file name (its extension must be on Brevo's allow-list) and base64 content. */
-    public record Attachment(String name, String content) {
+    /**
+     * One attachment: file name (its extension must be on Brevo's allow-list) and the raw bytes. Jackson writes a
+     * {@code byte[]} as standard base64 straight into the output stream, so no encoded {@code String} copy of a
+     * multi-MB attachment is ever held in memory. Equality is irrelevant here (never compared or hashed).
+     */
+    public record Attachment(String name, byte[] content) {
     }
 }

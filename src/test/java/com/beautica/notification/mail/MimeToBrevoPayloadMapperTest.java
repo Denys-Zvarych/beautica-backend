@@ -107,9 +107,22 @@ class MimeToBrevoPayloadMapperTest {
 
         assertThat(request.attachment()).singleElement().satisfies(a -> {
             assertThat(a.name()).isEqualTo("attachment-1.pdf");
-            assertThat(Base64.getDecoder().decode(a.content())).isEqualTo(bytes);
+            assertThat(a.content()).isEqualTo(bytes);
         });
         assertThat(request.htmlContent()).isEqualTo("<p>body</p>");
+    }
+
+    @Test
+    @DisplayName("wire JSON — byte[] content serialises to the same standard base64 string as before (no line breaks)")
+    void should_serialiseAttachmentAsStandardBase64_when_writtenAsJson() throws Exception {
+        byte[] bytes = new byte[4000];
+        new java.util.Random(374).nextBytes(bytes);
+        BrevoEmailRequest.Attachment attachment = new BrevoEmailRequest.Attachment("attachment-1.pdf", bytes);
+
+        String json = new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(attachment);
+
+        assertThat(json).isEqualTo("{\"name\":\"attachment-1.pdf\",\"content\":\""
+                + Base64.getEncoder().encodeToString(bytes) + "\"}");
     }
 
     @Test

@@ -303,18 +303,25 @@ app:
     token-expiration-hours: 48
     from-email: noreply@beautica.app
   # Phase 374 — outbound mail transport. smtp (spring.mail.*, local/test/staging) | brevo-api (prod, HTTPS
-  # api.brevo.com:443). Profile-driven; there is no env override. Exactly one JavaMailSender bean exists.
+  # api.brevo.com:443). Set by the profile yml; no dedicated env var is documented, but like any property it CAN be
+  # overridden (e.g. APP_MAIL_TRANSPORT) — the fingerprint guard therefore pins it: prod must resolve brevo-api
+  # (prod-mail-transport), staging must resolve smtp (staging-mail-transport). Exactly one JavaMailSender bean exists.
   mail:
     transport: smtp
     # Blank = inline CID logo (SMTP output unchanged). Prod sets the hosted logo: the Brevo API cannot carry CID parts.
     logo-url: ""
     brevo-api:
+      # Prod guard: base-url must be exactly https://api.brevo.com (prod-brevo-api-base-url); overridable elsewhere
+      # only so tests can point at WireMock.
       base-url: https://api.brevo.com
       # Transactional-email + Account-read scoped key (xkeysib-…). Never logged. Required in prod (guard rule
       # prod-brevo-api-key-missing); must be blank in staging (staging-brevo-key-blank).
       api-key: ${BREVO_API_KEY:}
       connect-timeout: 3s
+      # Read timeout = upload + Brevo processing + response. 10s for plain sends (a few KB of HTML); sends that
+      # carry attachments (support contact, up to 5 MB, ~6.7 MB base64) get the longer budget below.
       read-timeout: 10s
+      send-with-attachments-read-timeout: 30s
       sender-name: Beautica
   booking:
     # Phase 13.3 — guest booking. How many days ahead the public availability

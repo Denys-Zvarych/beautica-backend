@@ -22,18 +22,23 @@ public final class BrevoRestClients {
     }
 
     /**
-     * @param builder        Boot's prototype builder (observability), cloned so the caller's instance is untouched
-     * @param connectProperty config key named in the failure message when {@code connect} is not positive
-     * @param readProperty    config key named in the failure message when {@code read} is not positive
+     * One JDK client per caller (sender: long-lived; probe: closed after its single call). Connect timeout validated.
      */
-    public static RestClient build(RestClient.Builder builder, String baseUrl,
-                                   String connectProperty, Duration connect,
-                                   String readProperty, Duration read) {
-        HttpClient httpClient = HttpClient.newBuilder()
+    public static HttpClient httpClient(String connectProperty, Duration connect) {
+        return HttpClient.newBuilder()
                 .version(HttpClient.Version.HTTP_1_1)
                 .followRedirects(HttpClient.Redirect.NEVER)
                 .connectTimeout(OutboundTimeouts.requirePositive(connectProperty, connect))
                 .build();
+    }
+
+    /**
+     * @param builder      Boot's prototype builder (observability), cloned so the caller's instance is untouched
+     * @param httpClient   from {@link #httpClient}; several RestClients may share one (same pool, different budgets)
+     * @param readProperty config key named in the failure message when {@code read} is not positive
+     */
+    public static RestClient build(RestClient.Builder builder, String baseUrl, HttpClient httpClient,
+                                   String readProperty, Duration read) {
         JdkClientHttpRequestFactory requestFactory = new JdkClientHttpRequestFactory(httpClient);
         requestFactory.setReadTimeout(OutboundTimeouts.requirePositive(readProperty, read));
         return builder.clone().baseUrl(baseUrl).requestFactory(requestFactory).build();

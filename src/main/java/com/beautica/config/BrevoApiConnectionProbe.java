@@ -11,6 +11,7 @@ import org.springframework.http.MediaType;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestClient;
 
+import java.net.http.HttpClient;
 import java.time.Duration;
 
 /**
@@ -34,13 +35,12 @@ public class BrevoApiConnectionProbe {
     public enum Result { OK, REJECTED, UNREACHABLE }
 
     private final BrevoApiProperties properties;
-    private final RestClient restClient;
+    private final ObjectProvider<RestClient.Builder> builder;
     private Result cached;
 
     public BrevoApiConnectionProbe(BrevoApiProperties properties, ObjectProvider<RestClient.Builder> builder) {
         this.properties = properties;
-        this.restClient = BrevoRestClients.build(builder.getIfAvailable(RestClient::builder), properties.baseUrl(),
-                "brevo-api probe connect-timeout", PROBE_TIMEOUT, "brevo-api probe read-timeout", PROBE_TIMEOUT);
+        this.builder = builder;
     }
 
     /** @return the probe outcome; the HTTP call is made at most once per application lifetime */
@@ -56,7 +56,11 @@ public class BrevoApiConnectionProbe {
             log.warn("rule prod-brevo-api-auth-failed: BREVO_API_KEY is not configured");
             return Result.REJECTED;
         }
-        try {
+        // One-shot: the HTTP client lives only for this call and is closed afterwards (no idle pool/selector
+        // thread kept for the application lifetime).
+        try (HttpClient httpClient = BrevoRestClients.httpClient("brevo-api probe connect-timeout", PROBE_TIMEOUT)) {
+            RestClient restClient = BrevoRestClients.build(builder.getIfAvailable(RestClient::builder),
+                    properties.baseUrl(), httpClient, "brevo-api probe read-timeout", PROBE_TIMEOUT);
             HttpStatusCode status = restClient.get()
                     .uri(ACCOUNT_PATH)
                     .header(API_KEY_HEADER, properties.apiKey())

@@ -54,7 +54,12 @@ class EnvironmentFingerprintGuardTest {
                 .withProperty("sentry.dsn", EU_DSN)
                 .withProperty("TURBOSMS_TOKEN", "turbosms-fixture-token")
                 .withProperty("spring.mail.username", "brevo-login")
-                .withProperty("spring.mail.password", "brevo-key");
+                .withProperty("spring.mail.password", "brevo-key")
+                // Phase 374: prod must resolve the Brevo HTTPS API transport with its key and hosted logo.
+                .withProperty("app.mail.transport", "brevo-api")
+                .withProperty("app.mail.brevo-api.api-key", "xkeysib-guard-fixture")
+                .withProperty("app.mail.brevo-api.base-url", "https://api.brevo.com")
+                .withProperty("app.mail.logo-url", "https://beautica.app/email/logo.png");
         env.setActiveProfiles("prod");
         return env;
     }
@@ -759,13 +764,15 @@ class EnvironmentFingerprintGuardTest {
     }
 
     @Test
-    @DisplayName("prod-brevo-unconfigured: PENDING (any case) or blank login/key — boots, exactly one WARN, no values")
+    @DisplayName("prod-brevo-unconfigured: on the (now forbidden) smtp transport, PENDING/blank creds still WARN once each, no values")
     void should_warnOnce_when_prodBrevoPendingOrBlank(CapturedOutput output) {
         for (MockEnvironment env : List.of(
                 prodEnv().withProperty("spring.mail.username", "PENDING").withProperty("spring.mail.password", "PENDING"),
                 prodEnv().withProperty("spring.mail.username", "pending"),
                 prodEnv().withProperty("spring.mail.password", " "))) {
-            assertThatCode(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS)).doesNotThrowAnyException();
+            env.setProperty("app.mail.transport", "smtp");
+            assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                    .hasMessageContaining("rule prod-mail-transport");
         }
 
         assertThat(brevoWarnLines(output)).hasSize(3);
@@ -804,6 +811,10 @@ class EnvironmentFingerprintGuardTest {
         env.setProperty("spring.mail.password", "");
         if (apiKey != null) {
             env.setProperty("app.mail.brevo-api.api-key", apiKey);
+        } else {
+            ((java.util.Map<?, ?>) env.getPropertySources().get(
+                    org.springframework.mock.env.MockPropertySource.MOCK_PROPERTIES_PROPERTY_SOURCE_NAME).getSource())
+                    .remove("app.mail.brevo-api.api-key");
         }
         return env;
     }
@@ -830,14 +841,52 @@ class EnvironmentFingerprintGuardTest {
     }
 
     @Test
-    @DisplayName("Phase 374 — prod + smtp transport keeps the old rules: no key rule, PENDING creds still WARN")
-    void should_keepSmtpRules_when_prodTransportSmtp(CapturedOutput output) {
+    @DisplayName("Phase 374 audit — prod-mail-transport: prod on smtp fails (SMTP cannot leave Railway); no key rule")
+    void should_failProdBoot_when_mailTransportIsSmtp(CapturedOutput output) {
         MockEnvironment env = prodEnv().withProperty("app.mail.transport", "smtp")
                 .withProperty("spring.mail.password", "PENDING");
 
-        assertThatCode(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS)).doesNotThrowAnyException();
-
+        assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                .hasMessageContaining("rule prod-mail-transport: app.mail.transport must be brevo-api in prod")
+                .message().doesNotContain("prod-brevo-api-key-missing");
         assertThat(brevoWarnLines(output)).hasSize(1);
+    }
+
+    @Test
+    @DisplayName("Phase 374 audit — prod-brevo-api-base-url: any origin other than exactly https://api.brevo.com fails, no value echoed")
+    void should_failProdBoot_when_brevoApiBaseUrlNotBrevoHttps() {
+        for (String url : List.of("http://api.brevo.com", "https://api.brevo.com.evil-zq.example",
+                "https://api.brevo.com/", "http://127.0.0.1:8089")) {
+            MockEnvironment env = prodEnv().withProperty("app.mail.brevo-api.base-url", url);
+
+            assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                    .hasMessageContaining("rule prod-brevo-api-base-url")
+                    .message().doesNotContain("evil-zq").doesNotContain("127.0.0.1");
+        }
+    }
+
+    @Test
+    @DisplayName("Phase 374 audit — prod-brevo-api-base-url: an unset base-url resolves to the Brevo default and passes")
+    void should_pass_when_prodBrevoApiBaseUrlUnset() {
+        MockEnvironment clean = prodEnv();
+        ((java.util.Map<?, ?>) clean.getPropertySources().get(
+                org.springframework.mock.env.MockPropertySource.MOCK_PROPERTIES_PROPERTY_SOURCE_NAME).getSource())
+                .remove("app.mail.brevo-api.base-url");
+        assertThat(clean.getProperty("app.mail.brevo-api.base-url")).as("precondition: base-url unset").isNull();
+
+        assertThatCode(() -> run(clean, DeployEnvironment.PROD, SmsMode.TURBOSMS)).doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("Phase 374 audit — prod-mail-logo-url: the logo must be served from https://beautica.app/ in prod")
+    void should_failProdBoot_when_logoUrlHostNotBeautica() {
+        for (String url : List.of("https://cdn.example.com/logo.png", "https://beautica.app.evil.example/logo.png",
+                "http://beautica.app/email/logo.png", "")) {
+            MockEnvironment env = prodEnv().withProperty("app.mail.logo-url", url);
+
+            assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                    .hasMessageContaining("rule prod-mail-logo-url");
+        }
     }
 
     @Test

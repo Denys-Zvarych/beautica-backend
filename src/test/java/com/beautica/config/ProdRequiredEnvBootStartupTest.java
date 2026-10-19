@@ -204,18 +204,32 @@ class ProdRequiredEnvBootStartupTest {
     }
 
     @Test
-    @DisplayName("prod-brevo-unconfigured — on the SMTP transport, creds = PENDING still boot (D9) and the deferred WARN is flushed exactly once")
-    void should_bootWithOneWarn_when_prodBrevoCredentialsPending(CapturedOutput output) {
+    @DisplayName("Phase 374 audit — prod-mail-transport: an app.mail.transport=smtp override aborts the prod boot")
+    void should_failProdBoot_when_mailTransportIsSmtp() {
         Map<String, String> vars = passingProdVars();
         vars.put("BREVO_SMTP_LOGIN", "PENDING");
         vars.put("BREVO_SMTP_KEY", "PENDING");
 
-        try (ConfigurableApplicationContext ctx = prodApp(vars).run("--app.mail.transport=smtp")) {
-            assertThat(ctx.isActive()).as("Brevo PENDING must not block a prod boot").isTrue();
-        }
+        String message = guardMessageOfFailedBoot(vars, "--app.mail.transport=smtp");
 
-        assertThat(occurrences(output.getAll(), "rule prod-brevo-unconfigured"))
-                .as("exactly one WARN, flushed from the DeferredLog after logging init; output=%s", output.getAll())
-                .isEqualTo(1);
+        assertThat(message).contains("rule prod-mail-transport").doesNotContain("prod-brevo-api-key-missing");
+    }
+
+    @Test
+    @DisplayName("Phase 374 audit — prod-brevo-api-base-url: a base-url override away from https://api.brevo.com aborts the boot")
+    void should_failProdBoot_when_brevoApiBaseUrlNotBrevoHttps() {
+        String message = guardMessageOfFailedBoot(passingProdVars(),
+                "--app.mail.brevo-api.base-url=https://brevo-zq374.example.net");
+
+        assertThat(message).contains("rule prod-brevo-api-base-url").doesNotContain("brevo-zq374");
+    }
+
+    @Test
+    @DisplayName("Phase 374 audit — prod-mail-logo-url: a logo-url outside https://beautica.app/ aborts the boot")
+    void should_failProdBoot_when_logoUrlHostNotBeautica() {
+        String message = guardMessageOfFailedBoot(passingProdVars(),
+                "--app.mail.logo-url=https://cdn.example.org/logo.png");
+
+        assertThat(message).contains("rule prod-mail-logo-url");
     }
 }

@@ -47,7 +47,7 @@ class BrevoApiConnectionProbeTest {
 
     private BrevoApiConnectionProbe probe(String key) {
         BrevoApiProperties props = new BrevoApiProperties(wireMock.baseUrl(), key, Duration.ofSeconds(3),
-                Duration.ofSeconds(10), "Beautica");
+                Duration.ofSeconds(10), "Beautica", java.time.Duration.ofSeconds(30));
         return new BrevoApiConnectionProbe(props,
                 new StaticListableBeanFactory().getBeanProvider(RestClient.Builder.class));
     }
@@ -113,7 +113,7 @@ class BrevoApiConnectionProbeTest {
     @DisplayName("a bare CancellationException (JDK read-timeout cancellation) → UNREACHABLE, never REJECTED")
     void should_returnUnreachable_when_cancellationException(CapturedOutput output) {
         BrevoApiProperties props = new BrevoApiProperties(wireMock.baseUrl(), API_KEY, Duration.ofSeconds(3),
-                Duration.ofSeconds(10), "Beautica");
+                Duration.ofSeconds(10), "Beautica", java.time.Duration.ofSeconds(30));
         StaticListableBeanFactory factory = new StaticListableBeanFactory();
         factory.addBean("builder", RestClient.builder().requestInterceptor((req, body, exec) -> {
             throw new java.util.concurrent.CancellationException("cancelled");

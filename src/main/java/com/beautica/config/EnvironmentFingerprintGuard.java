@@ -65,6 +65,11 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
 
     /** Effective Brevo HTTPS API key (Phase 374); the yml resolves it from {@code BREVO_API_KEY}. */
     static final String BREVO_API_KEY_PROPERTY = "app.mail.brevo-api.api-key";
+    static final String BREVO_API_BASE_URL_PROPERTY = "app.mail.brevo-api.base-url";
+    static final String BREVO_API_ORIGIN = "https://api.brevo.com";
+    static final String LOGO_URL_PROPERTY = "app.mail.logo-url";
+    /** Prod e-mail logo must be served from our own site (same domain as the sender). */
+    static final String PROD_LOGO_URL_PREFIX = "https://beautica.app/";
 
     /** Conservative floor for {@code TURBOSMS_TOKEN}; the provider documents no length (see {@link #isPlaceholderSecret}). */
     static final int MIN_SMS_TOKEN_LENGTH = 16;
@@ -121,8 +126,11 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
             if (environment == DeployEnvironment.PROD) {
                 checkProd(env, violations);
                 if (brevoApiTransport(env)) {
-                    checkBrevoApiKey(env, violations);
+                    checkBrevoApi(env, violations);
                 } else {
+                    // Phase 374: SMTP cannot leave Railway, so prod on smtp is a violation; the legacy WARN still
+                    // prints so an operator sees both facts in one boot log.
+                    violations.add("rule prod-mail-transport: app.mail.transport must be brevo-api in prod");
                     warnBrevoUnconfigured(env, log);
                 }
             } else {
@@ -456,10 +464,22 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
      * Phase 374 D8: with {@code app.mail.transport=brevo-api} a blank or {@value #BREVO_PENDING} {@code BREVO_API_KEY}
      * fails the prod boot (replaces the {@code prod-brevo-unconfigured} WARN for this transport). Names the env var only.
      */
-    private static void checkBrevoApiKey(Environment env, List<String> violations) {
+    private static void checkBrevoApi(Environment env, List<String> violations) {
         if (brevoApiKeyPending(env)) {
             violations.add("rule prod-brevo-api-key-missing: BREVO_API_KEY (app.mail.brevo-api.api-key) must be set "
                     + "in prod when app.mail.transport is brevo-api");
+        }
+        // The key is sent to this origin on every request: only the real Brevo API may receive it in prod. The
+        // override exists for WireMock outside prod. Unset resolves to the binding default (the Brevo origin).
+        String baseUrl = readOrNull(env, BREVO_API_BASE_URL_PROPERTY);
+        if (baseUrl != null && !BREVO_API_ORIGIN.equals(baseUrl)) {
+            violations.add("rule prod-brevo-api-base-url: " + BREVO_API_BASE_URL_PROPERTY + " must be exactly "
+                    + BREVO_API_ORIGIN + " in prod");
+        }
+        String logoUrl = readOrNull(env, LOGO_URL_PROPERTY);
+        if (logoUrl == null || !logoUrl.startsWith(PROD_LOGO_URL_PREFIX)) {
+            violations.add("rule prod-mail-logo-url: " + LOGO_URL_PROPERTY + " must start with "
+                    + PROD_LOGO_URL_PREFIX + " in prod");
         }
     }
 

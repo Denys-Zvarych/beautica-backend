@@ -16,7 +16,6 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.UnsupportedEncodingException;
 import java.util.ArrayList;
-import java.util.Base64;
 import java.util.Collections;
 import java.util.Enumeration;
 import java.util.LinkedHashMap;
@@ -31,7 +30,8 @@ import java.util.Map;
  *   <li>{@code text/html} → {@code htmlContent}; {@code text/plain} → {@code textContent}. A text-only message also
  *       gets an HTML-escaped {@code htmlContent} ({@code <br>} per line): Brevo requires {@code htmlContent} when no
  *       {@code templateId} is sent (verified 2026-10-19).</li>
- *   <li>{@code Content-Disposition: attachment} parts → {@code attachment[{name, content(base64)}]}.</li>
+ *   <li>{@code Content-Disposition: attachment} parts → {@code attachment[{name, content}]} (bytes; Jackson
+ *       writes them as base64).</li>
  *   <li>{@code Reply-To} only when the header is present ({@link MimeMessage#getReplyTo()} falls back to From).</li>
  *   <li>Custom {@code X-*} headers → {@code headers}; standard headers are not allowed by Brevo.</li>
  * </ul>
@@ -112,7 +112,7 @@ public final class MimeToBrevoPayloadMapper {
         try (InputStream in = part.getInputStream()) {
             return new BrevoEmailRequest.Attachment(
                     stripLineBreaks(MimeUtility.decodeText(rawName)),
-                    Base64.getEncoder().encodeToString(in.readAllBytes()));
+                    in.readAllBytes());
         }
     }
 

@@ -64,7 +64,7 @@ class BrevoApiMailSenderTest {
 
     private BrevoApiMailSender newSender(String baseUrl, Duration readTimeout) {
         BrevoApiProperties props = new BrevoApiProperties(baseUrl, API_KEY, Duration.ofSeconds(1), readTimeout,
-                "Beautica");
+                "Beautica", java.time.Duration.ofSeconds(30));
         return new BrevoApiMailSender(RestClient.builder(), props, registry);
     }
 
@@ -232,6 +232,32 @@ class BrevoApiMailSenderTest {
     }
 
     @Test
+    @Timeout(15)
+    @DisplayName("attachment sends use send-with-attachments-read-timeout; plain sends keep the short read timeout")
+    void should_useLongerReadTimeout_when_sendCarriesAttachments() throws Exception {
+        BrevoApiMailSender split = new BrevoApiMailSender(RestClient.builder(), new BrevoApiProperties(
+                wireMock.baseUrl(), API_KEY, Duration.ofSeconds(1), Duration.ofMillis(300), "Beautica",
+                Duration.ofSeconds(5)), registry);
+        wireMock.stubFor(post(urlEqualTo(PATH)).willReturn(aResponse().withStatus(201)
+                .withHeader("Content-Type", "application/json").withBody("{\"messageId\":\"m\"}")
+                .withFixedDelay(1000)));
+        MimeMessage attached = split.createMimeMessage();
+        MimeMessageHelper helper = new MimeMessageHelper(attached, true, "UTF-8");
+        helper.setFrom("noreply@beautica.app");
+        helper.setTo(RECIPIENT);
+        helper.setSubject("support");
+        helper.setText("<p>x</p>", true);
+        helper.addAttachment("attachment-1.pdf",
+                new org.springframework.core.io.ByteArrayResource("%PDF-1.4".getBytes()), "application/pdf");
+
+        assertThatThrownBy(() -> split.send(message())).as("plain send: 300 ms budget < 1 s delay")
+                .isInstanceOf(BrevoTransientMailException.class);
+        split.send(attached);
+
+        assertThat(count("success")).as("attachment send: 5 s budget > 1 s delay").isEqualTo(1);
+    }
+
+    @Test
     @Timeout(10)
     @DisplayName("connection refused (server stopped) → Transient")
     void should_throwTransient_when_connectionRefused() throws Exception {
@@ -250,7 +276,7 @@ class BrevoApiMailSenderTest {
             throw new java.util.concurrent.CancellationException("read timeout cancelled the response future");
         });
         BrevoApiMailSender cancelled = new BrevoApiMailSender(cancelling, new BrevoApiProperties(wireMock.baseUrl(),
-                API_KEY, Duration.ofSeconds(1), Duration.ofSeconds(1), "Beautica"), registry);
+                API_KEY, Duration.ofSeconds(1), Duration.ofSeconds(1), "Beautica", java.time.Duration.ofSeconds(30)), registry);
 
         assertThatThrownBy(() -> cancelled.send(message())).isInstanceOf(BrevoTransientMailException.class)
                 .hasMessage("Brevo API I/O failure CancellationException");
@@ -274,7 +300,7 @@ class BrevoApiMailSenderTest {
             throw new IllegalStateException("local bug");
         });
         BrevoApiMailSender broken = new BrevoApiMailSender(failing, new BrevoApiProperties(wireMock.baseUrl(),
-                API_KEY, Duration.ofSeconds(1), Duration.ofSeconds(1), "Beautica"), registry);
+                API_KEY, Duration.ofSeconds(1), Duration.ofSeconds(1), "Beautica", java.time.Duration.ofSeconds(30)), registry);
 
         assertThatThrownBy(() -> broken.send(message())).isInstanceOf(BrevoPermanentMailException.class);
     }
@@ -332,7 +358,7 @@ class BrevoApiMailSenderTest {
     @DisplayName("BrevoApiProperties.toString masks the api key")
     void should_maskApiKey_when_propertiesPrinted() {
         BrevoApiProperties props = new BrevoApiProperties("https://api.brevo.com", API_KEY, Duration.ofSeconds(3),
-                Duration.ofSeconds(10), "Beautica");
+                Duration.ofSeconds(10), "Beautica", java.time.Duration.ofSeconds(30));
 
         assertThat(props.toString()).doesNotContain(API_KEY).contains("apiKey=***");
     }

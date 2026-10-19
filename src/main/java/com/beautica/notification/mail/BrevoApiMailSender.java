@@ -50,6 +50,8 @@ public class BrevoApiMailSender implements JavaMailSender {
     private static final ObjectMapper ERROR_READER = new ObjectMapper();
 
     private final RestClient restClient;
+    /** Same HTTP client, longer read budget: the JDK read timeout includes uploading the attachments. */
+    private final RestClient attachmentRestClient;
     private final BrevoApiProperties properties;
     private final Session session = Session.getInstance(new Properties());
     private final Counter success;
@@ -59,9 +61,12 @@ public class BrevoApiMailSender implements JavaMailSender {
     public BrevoApiMailSender(RestClient.Builder restClientBuilder, BrevoApiProperties properties,
                               MeterRegistry meterRegistry) {
         this.properties = properties;
-        this.restClient = BrevoRestClients.build(restClientBuilder, properties.baseUrl(),
-                "app.mail.brevo-api.connect-timeout", properties.connectTimeout(),
+        java.net.http.HttpClient httpClient = BrevoRestClients.httpClient(
+                "app.mail.brevo-api.connect-timeout", properties.connectTimeout());
+        this.restClient = BrevoRestClients.build(restClientBuilder, properties.baseUrl(), httpClient,
                 "app.mail.brevo-api.read-timeout", properties.readTimeout());
+        this.attachmentRestClient = BrevoRestClients.build(restClientBuilder, properties.baseUrl(), httpClient,
+                "app.mail.brevo-api.send-with-attachments-read-timeout", properties.sendWithAttachmentsReadTimeout());
         this.success = counter(meterRegistry, "success");
         this.transientFailure = counter(meterRegistry, "transient");
         this.permanentFailure = counter(meterRegistry, "permanent");
@@ -132,8 +137,13 @@ public class BrevoApiMailSender implements JavaMailSender {
         }
     }
 
+    /** Plain sends keep the 10 s budget; only a send carrying attachments gets the longer one. */
+    RestClient clientFor(BrevoEmailRequest request) {
+        return request.attachment() == null || request.attachment().isEmpty() ? restClient : attachmentRestClient;
+    }
+
     private SendResponse post(BrevoEmailRequest request) {
-        return restClient.post()
+        return clientFor(request).post()
                 .uri(SEND_PATH)
                 .header(API_KEY_HEADER, properties.apiKey())
                 .contentType(MediaType.APPLICATION_JSON)

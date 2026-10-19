@@ -19,6 +19,9 @@ import java.time.Duration;
  * @param connectTimeout TCP connect timeout, validated positive
  * @param readTimeout    response timeout, validated positive
  * @param senderName     display name used when the MIME {@code From} carries none (Brevo caps names at 70)
+ * @param sendWithAttachmentsReadTimeout response timeout for sends carrying attachments, validated positive. The JDK
+ *                       client's read timeout runs from request start, so it includes the upload: a 5 MB support
+ *                       attachment (~6.7 MB base64) needs more than the 10 s plain-send budget on a slow uplink
  */
 @Validated
 @ConfigurationProperties(prefix = "app.mail.brevo-api")
@@ -27,12 +30,15 @@ public record BrevoApiProperties(
         @DefaultValue("") String apiKey,
         @DefaultValue("3s") Duration connectTimeout,
         @DefaultValue("10s") Duration readTimeout,
-        @NotBlank @Size(max = 70) @DefaultValue("Beautica") String senderName
+        @NotBlank @Size(max = 70) @DefaultValue("Beautica") String senderName,
+        @DefaultValue("30s") Duration sendWithAttachmentsReadTimeout
 ) {
 
     public BrevoApiProperties {
         OutboundTimeouts.requirePositive("app.mail.brevo-api.connect-timeout", connectTimeout);
         OutboundTimeouts.requirePositive("app.mail.brevo-api.read-timeout", readTimeout);
+        OutboundTimeouts.requirePositive("app.mail.brevo-api.send-with-attachments-read-timeout",
+                sendWithAttachmentsReadTimeout);
     }
 
     /** @return {@code true} when a key is configured (blank means the transport cannot authenticate) */
@@ -45,6 +51,7 @@ public record BrevoApiProperties(
     public String toString() {
         return "BrevoApiProperties[baseUrl=" + baseUrl + ", apiKey=" + (hasApiKey() ? "***" : "<blank>")
                 + ", connectTimeout=" + connectTimeout + ", readTimeout=" + readTimeout
-                + ", senderName=" + senderName + "]";
+                + ", senderName=" + senderName
+                + ", sendWithAttachmentsReadTimeout=" + sendWithAttachmentsReadTimeout + "]";
     }
 }

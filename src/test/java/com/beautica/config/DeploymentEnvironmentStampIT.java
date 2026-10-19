@@ -103,7 +103,10 @@ class DeploymentEnvironmentStampIT {
                     "app.support.email=help@beautica.ua", "app.internal-api-key=" + TestSecrets.INTERNAL_API_KEY,
                     // Phase 367 prod required-env rules.
                     "sentry.dsn=https://0123456789abcdef@o42.ingest.de.sentry.io/4500000000000001",
-                    "TURBOSMS_TOKEN=turbosms-fixture-token", "ADMIN_EMAIL=admin@beautica.ua"));
+                    "TURBOSMS_TOKEN=turbosms-fixture-token", "ADMIN_EMAIL=admin@beautica.ua",
+                    // Phase 374: prod must resolve the Brevo HTTPS API transport (prod-mail-transport et al.).
+                    "app.mail.transport=brevo-api", "app.mail.brevo-api.api-key=xkeysib-fixture-api-key",
+                    "app.mail.logo-url=https://beautica.app/email/logo.png"));
             case LOCAL -> { }
         }
         return new SpringApplicationBuilder(MinimalConfig.class)
