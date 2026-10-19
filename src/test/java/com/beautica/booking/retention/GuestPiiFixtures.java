@@ -140,15 +140,29 @@ final class GuestPiiFixtures {
         return ids;
     }
 
-    /** Inserts {@code count} CANCELLED child-less LINK visit headers (EXPLAIN volume only). */
-    void bulkLinkAppointments(int count) {
-        List<Object[]> args = new ArrayList<>(count);
-        for (int i = 0; i < count; i++) {
-            args.add(new Object[]{UUID.randomUUID()});
-        }
-        jdbc.batchUpdate("INSERT INTO appointments (id, status, booking_source, guest_name, guest_phone, "
-                + "created_at, updated_at) VALUES (?, 'CANCELLED', 'LINK', 'Олена', '+380501234567', NOW(), NOW())",
-                args);
+    /**
+     * Set-based EXPLAIN volume: {@code headers} CANCELLED LINK visit headers, then {@code items}
+     * COMPLETED LINK bookings (same shape as {@link #bulkCompletedLink}) each linked to its own
+     * header, ending one hour apart before {@code latestEnd}. Two statements instead of per-row
+     * batches keeps seeding well inside the statement timeout on CI.
+     */
+    List<UUID> bulkLinkedVisits(Provider p, int headers, int items, OffsetDateTime latestEnd) {
+        jdbc.update("INSERT INTO appointments (id, status, booking_source, guest_name, guest_phone, "
+                + "created_at, updated_at) "
+                + "SELECT gen_random_uuid(), 'CANCELLED', 'LINK', 'Олена', ?, NOW(), NOW() "
+                + "FROM generate_series(1, ?)", PHONE, headers);
+        Timestamp end = Timestamp.from(latestEnd.toInstant());
+        return jdbc.queryForList("INSERT INTO bookings (id, master_id, master_service_id, status, starts_at, "
+                        + "ends_at, price_at_booking, duration_minutes_at_booking, buffer_minutes_at_booking, "
+                        + "booking_source, guest_name, guest_phone, reminder_sent, appointment_id, "
+                        + "created_at, updated_at) "
+                        + "SELECT gen_random_uuid(), ?, ?, 'COMPLETED', "
+                        + "?::timestamptz - make_interval(hours => h.i) - interval '60 minutes', "
+                        + "?::timestamptz - make_interval(hours => h.i), 350.00, 60, 0, 'LINK', 'Олена', ?, "
+                        + "false, h.id, NOW(), NOW() "
+                        + "FROM (SELECT id, (row_number() OVER ())::int - 1 AS i FROM appointments LIMIT ?) h "
+                        + "RETURNING id",
+                UUID.class, p.masterId(), p.masterServiceId(), end, end, PHONE, items);
     }
 
     Map<String, Object> booking(UUID id) {

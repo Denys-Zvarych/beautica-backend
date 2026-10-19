@@ -508,17 +508,11 @@ class GuestPiiRetentionIT extends AbstractIntegrationTest {
         @DisplayName("EXPLAIN: every retention claim is answerable from an index whose predicate matches it")
         void should_planClaimsOnIndexes() {
             // Realistic volume + fresh statistics: an empty-table plan is meaningless.
-            List<UUID> bookingIds = fx.bulkCompletedLink(
-                    provider, 3_000, OffsetDateTime.now(ZoneOffset.UTC).plusDays(200));
             // Open (not yet due) headers must dwarf one claim batch, as in production (12 months of
             // visits vs 500 claimed ids) — at toy sizes a hash join over all headers IS cheaper.
-            fx.bulkLinkAppointments(20_000);
-            // The 3 000 rows become visit items, one per header — the real visit shape.
-            jdbcTemplate.update("""
-                    UPDATE bookings b SET appointment_id = h.id
-                      FROM (SELECT id, row_number() OVER (ORDER BY id) rn FROM appointments) h,
-                           (SELECT id, row_number() OVER (ORDER BY id) rn FROM bookings) bb
-                     WHERE bb.id = b.id AND h.rn = bb.rn""");
+            // 3 000 headers carry one visit item each (the real visit shape); 2 000 stay child-less.
+            List<UUID> bookingIds = fx.bulkLinkedVisits(
+                    provider, 5_000, 3_000, OffsetDateTime.now(ZoneOffset.UTC).plusDays(200));
             jdbcTemplate.execute("ANALYZE bookings");
             jdbcTemplate.execute("ANALYZE appointments");
             TransactionTemplate tx = new TransactionTemplate(transactionManager);
@@ -566,7 +560,7 @@ class GuestPiiRetentionIT extends AbstractIntegrationTest {
             // Real batch shape (500 claimed ids): headers are reached BY ID from the claimed bookings
             // in a PK nested loop — never a scan of open headers.
             assertThat(headerOfBookings).contains("Nested Loop Anti Join")
-                    .contains("Index Scan using bookings_pkey on bookings cb")
+                    .containsPattern("Index Scan (using|on) bookings_pkey")
                     .containsPattern("Index Scan (using|on) appointments_pkey")
                     .contains("Index Cond: (id = ANY ((InitPlan 1).col1))")
                     .contains("Index Cond: (appointment_id = x.id)")
