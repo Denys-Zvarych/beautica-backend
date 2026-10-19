@@ -217,7 +217,17 @@ import java.util.UUID;
                 // partial index (V137): "bookings created by staff member X" + the ON DELETE RI lookup for
                 // created_by_user_id. JPA cannot encode WHERE created_by_user_id IS NOT NULL — the predicate
                 // lives in V137 only; documentation, not enforcement.
-                @Index(name = "idx_bookings_created_by", columnList = "created_by_user_id")
+                @Index(name = "idx_bookings_created_by", columnList = "created_by_user_id"),
+                // partial indexes (V199, phase 373): guest-PII retention job (due rows by ends_at) and
+                // the internal erase-by-phone path. Predicate WHERE client_id IS NULL AND
+                // guest_pii_anonymised_at IS NULL AND client_detached_at IS NULL lives in V199 only;
+                // documentation, not enforcement.
+                @Index(name = "idx_bookings_guest_pii_due", columnList = "ends_at"),
+                @Index(name = "idx_bookings_guest_phone_open", columnList = "guest_phone"),
+                // partial index (V199, phase 373 audit-fix cycle 2): ended-visit header sweep. Predicate
+                // WHERE appointment_id IS NOT NULL AND guest_pii_anonymised_at IS NOT NULL lives in
+                // V199 only; documentation, not enforcement.
+                @Index(name = "idx_bookings_guest_pii_anonymised_visit", columnList = "guest_pii_anonymised_at")
         }
 )
 // Root-cause fix (G1, cycle-7 audit 2026-08-03) for the entity-staleness/terminal-state-
@@ -399,6 +409,15 @@ public class Booking extends AuditableEntity {
         return clientDetachedAt != null;
     }
 
+    // ── Guest-PII anonymisation marker (V199, phase 373) ──────────────────────
+    //
+    // Set ONLY by GuestPiiAnonymisationService's native UPDATEs (retention job / internal erase),
+    // never through this entity — hence read-only. NULL <=> the guest columns still hold the
+    // original guest/walk-in PII.
+    @Nullable
+    @Column(name = "guest_pii_anonymised_at", insertable = false, updatable = false)
+    private Instant guestPiiAnonymisedAt;
+
     /**
      * Snapshots the sentinel display name and severs the client link — the ONLY writer of
      * {@link #clientDetachedAt}. Mirrors {@code Master#detach} (:228-235): the sentinel, the
@@ -408,7 +427,13 @@ public class Booking extends AuditableEntity {
      *
      * <p>{@code guestPhone} is deliberately left untouched: every row this method is ever called
      * on is currently ATTACHED ({@code client} non-null), and every attached arm of the CHECK
-     * already requires {@code guest_phone IS NULL} — there is no PII in this column to scrub.
+     * already requires {@code guest_phone IS NULL} on such a row.
+     *
+     * <p>Guest (LINK) and walk-in (STAFF, no client) rows are a different case: their guest
+     * columns DO hold a non-user's PII. Those are anonymised by {@code GuestPiiRetentionJob}
+     * 12 months after {@code ends_at}, and on request by the internal erase endpoint
+     * ({@code POST /api/v1/internal/guest-pii/erase}) — see {@link #guestPiiAnonymisedAt} and
+     * {@code GuestPiiAnonymisationService} (phase 373).
      *
      * @param label the fixed Ukrainian sentinel («Видалений клієнт») — always the same literal,
      *              never user-supplied, so (unlike {@code Master.detach}'s blank-name fallback)

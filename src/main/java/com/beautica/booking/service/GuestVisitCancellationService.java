@@ -18,6 +18,7 @@ import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.service.service.SalonCatalogCacheEvictor;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
@@ -132,13 +133,43 @@ public class GuestVisitCancellationService {
                             .formatted(smsProperties.getCancelWindowHours()));
         }
 
-        // Atomic one-time consume of the header token: only the winner of any concurrent race updates 1
-        // row and cancels the items + fires the side-effects; a replay / lost race updates 0 rows → 404.
-        int updated = appointmentRepository.consumeCancelToken(token);
-        if (updated == 0) {
+        if (!cancelValidated(first.getAppointment().getId(), token, items, true)) {
             throw new NotFoundException("Cancel token not found");
         }
-        UUID appointmentId = first.getAppointment().getId();
+        return true;
+    }
+
+    /**
+     * Cancels one already-validated guest/walk-in visit (header + every {@code CONFIRMED} item) and
+     * fires the provider notifications — everything {@link #cancel(UUID)} does after its token lookup
+     * and 2-hour check (phase 373 D12 seam, extracted without behaviour change). Also called by the
+     * internal guest-PII erase, which bypasses the 2-hour window and passes {@code sendGuestSms =
+     * false}.
+     *
+     * <p>A header with a cancel token is consumed via {@link AppointmentRepository#consumeCancelToken};
+     * a tokenless STAFF walk-in header via {@link AppointmentRepository#cancelGuestVisitById}. On 0
+     * matched rows (a concurrent cancel already won) nothing else runs.
+     *
+     * @param appointment  the visit header
+     * @param items        the visit's graph-fetched items in visit order (non-empty)
+     * @param sendGuestSms whether the after-commit guest SMS is sent; cache eviction runs either way
+     * @return {@code true} when this call cancelled the visit, {@code false} on a lost race
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public boolean cancelGuestVisit(Appointment appointment, List<Booking> items, boolean sendGuestSms) {
+        return cancelValidated(appointment.getId(), appointment.getCancelToken(), items, sendGuestSms);
+    }
+
+    private boolean cancelValidated(UUID appointmentId, UUID token, List<Booking> items, boolean sendGuestSms) {
+        Booking first = items.get(0);
+        // Atomic one-time consume of the header token: only the winner of any concurrent race updates 1
+        // row and cancels the items + fires the side-effects; a replay / lost race updates 0 rows → 404.
+        int updated = token != null
+                ? appointmentRepository.consumeCancelToken(token)
+                : appointmentRepository.cancelGuestVisitById(appointmentId);
+        if (updated == 0) {
+            return false;
+        }
         bookingRepository.cancelItemsByAppointmentId(appointmentId);
 
         // ONE master notification for the whole visit (referencing the first item — never one per
@@ -150,7 +181,7 @@ public class GuestVisitCancellationService {
         inAppNotificationService.notifyVisitEvent(
                 InAppNotificationType.BOOKING_CANCELLED_BY_CLIENT, appointmentId, first, null);
 
-        registerAfterCommit(items);
+        registerAfterCommit(items, sendGuestSms);
         return true;
     }
 
@@ -183,13 +214,14 @@ public class GuestVisitCancellationService {
      * start and end day, in the rare event a service spans midnight); the per-master free-slot verdict
      * and the salon catalogue are each evicted once.
      */
-    private void registerAfterCommit(List<Booking> items) {
+    private void registerAfterCommit(List<Booking> items, boolean sendGuestSms) {
         Booking first = items.get(0);
         Master master = first.getMaster();
         UUID masterId = master.getId();
         UUID salonId = first.getSalon() != null ? first.getSalon().getId() : null;
-        String phone = first.getGuestPhone();
-        String smsText = buildCancellationSms(first);
+        // Phase 373: an erase request captures neither the phone nor the text for after-commit use.
+        String phone = sendGuestSms ? first.getGuestPhone() : null;
+        String smsText = sendGuestSms ? buildCancellationSms(first) : null;
 
         Runnable task = () -> {
             // EVICTION FIRST, DISPATCH SECOND — see BookingCancellationService#registerAfterCommitSms
@@ -201,8 +233,10 @@ public class GuestVisitCancellationService {
             if (salonId != null) {
                 salonCatalogCacheEvictor.evict(salonId);
             }
-            bookingSmsDispatcher.dispatch(
-                    BookingSmsDispatcher.Kind.GUEST_VISIT_CANCELLATION, phone, smsText);
+            if (sendGuestSms) {
+                bookingSmsDispatcher.dispatch(
+                        BookingSmsDispatcher.Kind.GUEST_VISIT_CANCELLATION, phone, smsText);
+            }
         };
         if (TransactionSynchronizationManager.isSynchronizationActive()) {
             TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {

@@ -18,6 +18,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import com.beautica.notification.inapp.entity.InAppNotificationType;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
@@ -228,6 +229,49 @@ class BookingCancellationServiceTest {
                 .containsOnlyOnce("18:00");
     }
 
+    // ── cancelGuestBooking seam (phase 373 D12) ──────────────────────────────
+
+    @Test
+    @DisplayName("cancelGuestBooking(sendGuestSms=false) should consume, notify the provider and evict, but send NO guest SMS")
+    void should_notifyProviderWithoutGuestSms_when_seamCalledWithSmsSuppressed() {
+        Booking booking = booking(NOW.plusMinutes(30), BookingStatus.CONFIRMED);
+        when(bookingRepository.consumeCancelToken(TOKEN)).thenReturn(1);
+
+        boolean cancelled = service.cancelGuestBooking(booking, false);
+
+        assertThat(cancelled).isTrue();
+        verify(outboxService).enqueueClientCancelled(BOOKING_ID);
+        verify(inAppNotificationService).notifyBookingEvent(
+                InAppNotificationType.BOOKING_CANCELLED_BY_CLIENT, booking, null);
+        verify(slotCalculationService).evictMasterAvailabilityCaches(booking.getMaster().getId());
+        verifyNoInteractions(smsService);
+    }
+
+    @Test
+    @DisplayName("cancelGuestBooking should cancel a tokenless STAFF walk-in by id, never via the token consume")
+    void should_cancelById_when_bookingHasNoCancelToken() {
+        Booking booking = booking(NOW.plusHours(5), BookingStatus.CONFIRMED, "Манікюр", null);
+        when(bookingRepository.cancelGuestRowById(BOOKING_ID)).thenReturn(1);
+
+        boolean cancelled = service.cancelGuestBooking(booking, false);
+
+        assertThat(cancelled).isTrue();
+        verify(bookingRepository, never()).consumeCancelToken(org.mockito.ArgumentMatchers.any());
+        verify(outboxService).enqueueClientCancelled(BOOKING_ID);
+    }
+
+    @Test
+    @DisplayName("cancelGuestBooking should return false and fire NO side-effects when a concurrent cancel already won")
+    void should_returnFalseWithoutSideEffects_when_cancelByIdMatchesNoRow() {
+        Booking booking = booking(NOW.plusHours(5), BookingStatus.CONFIRMED, "Манікюр", null);
+        when(bookingRepository.cancelGuestRowById(BOOKING_ID)).thenReturn(0);
+
+        boolean cancelled = service.cancelGuestBooking(booking, true);
+
+        assertThat(cancelled).isFalse();
+        verifyNoInteractions(outboxService, inAppNotificationService, smsService, slotCalculationService);
+    }
+
     // ── helpers ────────────────────────────────────────────────────────────────
 
     private Booking booking(OffsetDateTime startsAt, BookingStatus status) {
@@ -235,6 +279,10 @@ class BookingCancellationServiceTest {
     }
 
     private Booking booking(OffsetDateTime startsAt, BookingStatus status, String serviceName) {
+        return booking(startsAt, status, serviceName, TOKEN);
+    }
+
+    private Booking booking(OffsetDateTime startsAt, BookingStatus status, String serviceName, UUID cancelToken) {
         User user = new User("m@beautica.test", "x", com.beautica.auth.Role.SALON_MASTER,
                 "Марія", "Левченко", null);
         Master master = Master.builder().id(UUID.randomUUID()).user(user).isActive(true).build();
@@ -260,7 +308,7 @@ class BookingCancellationServiceTest {
                 .priceAtBooking(new BigDecimal("350.00"))
                 .durationMinutesAtBooking(60)
                 .guestPhone(GUEST_PHONE)
-                .cancelToken(TOKEN)
+                .cancelToken(cancelToken)
                 .build();
     }
 }
