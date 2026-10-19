@@ -104,8 +104,8 @@ class SupportServiceTest {
         b[9] = 0x45; // E
         b[10] = 0x42; // B
         b[11] = 0x50; // P
-        // VP8 chunk fourCC 'VP8 ' (lossy) at 12..15 — required since the WebP sniffer
-        // now asserts a real VP8 chunk (a bare RIFF+WEBP container is rejected).
+        // A real lossy WebP header ('VP8 ' chunk at 12..15). WebP is NOT allow-listed since
+        // Phase 374 (Brevo API attachment allow-list) — used to prove rejection.
         b[12] = 0x56; // V
         b[13] = 0x50; // P
         b[14] = 0x38; // 8
@@ -239,7 +239,6 @@ class SupportServiceTest {
             List<MultipartFile> files = List.of(
                     filePart("photo.jpg", "image/jpeg", jpegBytes()),
                     filePart("shot.png", "image/png", pngBytes()),
-                    filePart("pic.webp", "image/webp", webpBytes()),
                     filePart("doc.pdf", "application/pdf", pdfBytes()));
 
             supportService.contact(senderUserId, SENDER_EMAIL, request, files);
@@ -250,7 +249,6 @@ class SupportServiceTest {
                     .containsExactly(
                             org.assertj.core.groups.Tuple.tuple("photo.jpg", "image/jpeg"),
                             org.assertj.core.groups.Tuple.tuple("shot.png", "image/png"),
-                            org.assertj.core.groups.Tuple.tuple("pic.webp", "image/webp"),
                             org.assertj.core.groups.Tuple.tuple("doc.pdf", "application/pdf"));
             assertThat(sent.get(0).bytes()).isEqualTo(jpegBytes());
         }
@@ -330,7 +328,36 @@ class SupportServiceTest {
         }
 
         @Test
-        @DisplayName("contact — detects WebP only when WEBP marker present at offset 8 (not bare RIFF)")
+        @DisplayName("Phase 374 — a genuine WebP (RIFF+WEBP+VP8) is now rejected 400 with the generic type message; nothing is e-mailed")
+        void should_throw400_when_validWebpAttachment() {
+            stubConfiguredInbox();
+            List<MultipartFile> files = List.of(filePart("pic.webp", "image/webp", webpBytes()));
+
+            assertThatThrownBy(() ->
+                    supportService.contact(senderUserId, SENDER_EMAIL, request, files))
+                    .isInstanceOf(BusinessException.class)
+                    .hasMessageContaining("Unsupported attachment type")
+                    .hasMessageContaining("JPEG, PNG, and PDF")
+                    .extracting(ex -> ((BusinessException) ex).getStatus())
+                    .isEqualTo(HttpStatus.BAD_REQUEST);
+            org.mockito.Mockito.verifyNoInteractions(emailService);
+        }
+
+        @Test
+        @DisplayName("contact — a genuine WebP renamed .jpg with an image/jpeg header is still rejected (content-sniffed)")
+        void should_throw400_when_webpDisguisedAsJpeg() {
+            stubConfiguredInbox();
+            List<MultipartFile> files = List.of(filePart("photo.jpg", "image/jpeg", webpBytes()));
+
+            assertThatThrownBy(() ->
+                    supportService.contact(senderUserId, SENDER_EMAIL, request, files))
+                    .isInstanceOf(BusinessException.class)
+                    .extracting(ex -> ((BusinessException) ex).getStatus())
+                    .isEqualTo(HttpStatus.BAD_REQUEST);
+        }
+
+        @Test
+        @DisplayName("contact — a RIFF/WAVE file is rejected (not allow-listed)")
         void should_throw400_when_riffButNotWebp() {
             stubConfiguredInbox();
 
