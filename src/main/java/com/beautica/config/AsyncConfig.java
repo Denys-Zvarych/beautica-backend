@@ -34,8 +34,9 @@ import org.springframework.security.task.DelegatingSecurityContextTaskExecutor;
  *
  * <p><b>The deploy platform's SIGTERM→SIGKILL window must be at least this worst case.</b> A shorter
  * window kills the JVM mid-drain, losing the non-recoverable work below AND the abandonment report. On
- * Railway this is {@code deploy.drainingSeconds} in {@code railway.json} (&ge; this sum + the scheduler grace +
- * 2 lifecycle phases + margin; pinned by {@code RailwayConfigTest}). The push pool must drain before {@code FirebaseConfig} is destroyed
+ * Railway this is {@code deploy.drainingSeconds} in {@code railway.json} (&ge; this sum + the 30 s scheduler grace
+ * ({@code SchedulingConfig}) + 2 lifecycle phases + margin = 185 + 30 + 2&times;20 + 20 = 275 &rarr; 280; pinned by
+ * {@code RailwayConfigTest}). The push pool must drain before {@code FirebaseConfig} is destroyed
  * ({@code @DependsOn}, see {@code AsyncConfigShutdownOrderingTest}).
  *
  * <pre>
