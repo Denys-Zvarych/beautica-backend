@@ -1,6 +1,15 @@
 package com.beautica.notification;
 
 import com.beautica.AbstractIntegrationTest;
+import com.beautica.auth.Role;
+import com.beautica.booking.entity.Booking;
+import com.beautica.notification.service.BookingVisit;
+import com.beautica.master.entity.Master;
+import com.beautica.service.entity.MasterServiceAssignment;
+import com.beautica.service.entity.ServiceDefinition;
+import com.beautica.user.User;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.beautica.notification.mail.BrevoApiMailSender;
 import com.beautica.notification.mail.MailTransportProperties;
 import com.beautica.notification.service.EmailNotificationService;
@@ -14,6 +23,9 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.system.CapturedOutput;
 import org.springframework.boot.test.system.OutputCaptureExtension;
@@ -25,10 +37,14 @@ import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.thymeleaf.spring6.SpringTemplateEngine;
 
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.function.Consumer;
+import java.util.stream.Stream;
 
 import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
 import static com.github.tomakehurst.wiremock.client.WireMock.post;
@@ -38,6 +54,8 @@ import static com.github.tomakehurst.wiremock.core.WireMockConfiguration.options
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 /**
  * Phase 374 — the outbox over the Brevo HTTPS API transport, end to end on real Postgres: the context runs with
@@ -83,6 +101,9 @@ class BrevoApiOutboxIT extends AbstractIntegrationTest {
     private PlatformTransactionManager txManager;
     @Autowired
     private MeterRegistry meterRegistry;
+
+    private static final ObjectMapper JSON = new ObjectMapper();
+    private static final String LOGO_URL = "https://beautica.app/email/logo.png";
 
     @BeforeEach
     void wireRealEmailServiceOnTheApiTransport() {
@@ -204,5 +225,96 @@ class BrevoApiOutboxIT extends AbstractIntegrationTest {
                     .contains("\"name\":\"attachment-1.pdf\"")
                     .contains(Base64.getEncoder().encodeToString(pdf));
         });
+    }
+
+    @Test
+    @DisplayName("401 unauthorized ×3 — a revoked/IP-blocked key trips the breaker; rows stay PENDING, none DEAD (D5)")
+    void should_tripBreakerWithoutDeadLetter_when_brevoRejectsTheKey() {
+        stub(401, "{\"code\":\"unauthorized\",\"message\":\"Key not found\"}");
+        List<UUID> attempted = List.of(enqueueInvite("a-zq374@beautica.test", 40),
+                enqueueInvite("b-zq374@beautica.test", 30), enqueueInvite("c-zq374@beautica.test", 20));
+        UUID youngest = enqueueInvite("d-zq374@beautica.test", 10);
+        double tripsBefore = counter(BREAKER_METRIC);
+        double deadBefore = counter(DEAD_METRIC);
+
+        drainWorker.drain();
+
+        assertThat(attempted).allSatisfy(r -> {
+            assertThat(row(r).get("status")).isEqualTo("PENDING");
+            assertThat(row(r).get("attempts")).isEqualTo(1);
+            assertThat((String) row(r).get("last_error")).as("Brevo message never persisted")
+                    .doesNotContain("Key not found").doesNotContain("zq374");
+        });
+        assertThat(row(youngest).get("attempts")).as("breaker deferral is not an attempt").isEqualTo(0);
+        assertThat(counter(BREAKER_METRIC) - tripsBefore).as("auth failure is a system outage").isEqualTo(1.0);
+        assertThat(counter(DEAD_METRIC) - deadBefore).as("a bad key must not mass-DEAD the outbox").isZero();
+        BREVO.verify(3, postRequestedFor(urlEqualTo(PATH)));
+    }
+
+    static Stream<Arguments> logoBearingMails() {
+        return Stream.of(
+                Arguments.of("password-reset OTP", "Код для скидання паролю Beautica",
+                        (Consumer<EmailNotificationService>) s -> s.sendPasswordResetOtpEmail(
+                                new User("otp-zq374@beautica.test", "hash", Role.CLIENT, "Olena", "Test", null),
+                                "374905")),
+                Arguments.of("email verification OTP", "Код підтвердження Beautica",
+                        (Consumer<EmailNotificationService>) s -> s.sendVerificationEmail(
+                                "otp-zq374@beautica.test", "374905")),
+                Arguments.of("new booking (provider)", "Нове бронювання",
+                        (Consumer<EmailNotificationService>) s -> s.sendNewBookingEmail(
+                                "otp-zq374@beautica.test", BookingVisit.single(booking()))),
+                Arguments.of("booking confirmed (client)", "Бронювання підтверджено",
+                        (Consumer<EmailNotificationService>) s -> s.sendBookingConfirmedEmail(
+                                "otp-zq374@beautica.test", BookingVisit.single(booking()))));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("logoBearingMails")
+    @DisplayName("AC2 — OTP and booking mails go out as ONE API request: sender noreply@beautica.app/Beautica, "
+            + "hosted logo in htmlContent, no CID part, no recipient or OTP in logs")
+    void should_sendLogoBearingMailOverApi_when_hostedLogoConfigured(
+            String label, String subject, Consumer<EmailNotificationService> sendCall, CapturedOutput output)
+            throws Exception {
+        stub(201, "{\"messageId\":\"m\"}");
+        EmailNotificationService realEmail =
+                new EmailNotificationService(mailSender, templateEngine, "noreply@beautica.app", mailProperties);
+
+        sendCall.accept(realEmail);
+
+        assertThat(BREVO.getAllServeEvents()).as("%s: a CID part would be rejected before any request", label)
+                .singleElement().satisfies(e -> {
+                    JsonNode json = JSON.readTree(e.getRequest().getBodyAsString());
+                    assertThat(json.at("/sender/email").asText()).isEqualTo("noreply@beautica.app");
+                    assertThat(json.at("/sender/name").asText()).isEqualTo("Beautica");
+                    assertThat(json.at("/to/0/email").asText()).isEqualTo("otp-zq374@beautica.test");
+                    assertThat(json.get("to")).hasSize(1);
+                    assertThat(json.has("replyTo")).as("no reply-to outside support contact").isFalse();
+                    assertThat(json.at("/subject").asText()).isEqualTo(subject);
+                    assertThat(json.has("attachment")).isFalse();
+                    assertThat(json.at("/htmlContent").asText())
+                            .contains("src=\"" + LOGO_URL + "\"").doesNotContain("cid:");
+                });
+        assertThat(output.getAll()).doesNotContain("otp-zq374").doesNotContain("374905")
+                .doesNotContain("xkeysib-it-secret-key");
+    }
+
+    /** Minimal booking graph for the visit templates; a real {@link Master} so the display-name branch runs. */
+    private static Booking booking() {
+        User client = mock(User.class);
+        when(client.getFirstName()).thenReturn("Olena");
+        when(client.getLastName()).thenReturn("Client");
+        User masterUser = mock(User.class);
+        when(masterUser.getFirstName()).thenReturn("Iryna");
+        when(masterUser.getLastName()).thenReturn("Master");
+        ServiceDefinition definition = mock(ServiceDefinition.class);
+        when(definition.getName()).thenReturn("Манікюр");
+        MasterServiceAssignment assignment = mock(MasterServiceAssignment.class);
+        when(assignment.getServiceDefinition()).thenReturn(definition);
+        Booking booking = mock(Booking.class);
+        when(booking.getClient()).thenReturn(client);
+        when(booking.getMaster()).thenReturn(Master.builder().user(masterUser).build());
+        when(booking.getMasterService()).thenReturn(assignment);
+        when(booking.getStartsAt()).thenReturn(OffsetDateTime.of(2026, 11, 3, 10, 0, 0, 0, ZoneOffset.UTC));
+        return booking;
     }
 }
