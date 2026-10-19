@@ -77,7 +77,10 @@ import java.util.UUID;
                 // annotation is documentation, not enforcement — V139 remains the source of truth.
                 // Mirrored here because an index present in the migration but absent from the entity
                 // is exactly the drift a reader of this class cannot see.
-                @Index(name = "idx_appointments_created_by", columnList = "created_by_user_id")
+                @Index(name = "idx_appointments_created_by", columnList = "created_by_user_id"),
+                // partial index (V199, phase 373): internal erase-by-phone path. Predicate lives in
+                // V199 only; documentation, not enforcement.
+                @Index(name = "idx_appointments_guest_phone_open", columnList = "guest_phone")
         }
 )
 @Getter
@@ -190,6 +193,11 @@ public class Appointment extends AuditableEntity {
     public boolean isClientDetached() {
         return clientDetachedAt != null;
     }
+
+    // Mirror of Booking.guestPiiAnonymisedAt (V199, phase 373) — written only by native UPDATEs.
+    @Nullable
+    @Column(name = "guest_pii_anonymised_at", insertable = false, updatable = false)
+    private Instant guestPiiAnonymisedAt;
 
     /**
      * Header twin of {@link Booking#detachClient(String, Instant)} — see that method's javadoc

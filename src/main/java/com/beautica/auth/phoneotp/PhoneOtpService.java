@@ -238,6 +238,18 @@ public class PhoneOtpService {
         return String.format("%06d", secureRandom.nextInt(CODE_BOUND_EXCLUSIVE));
     }
 
+    /**
+     * Phase 373 D9 — deletes every OTP row of an already-normalised E.164 phone as part of the
+     * internal guest-PII erase. {@code MANDATORY}: only ever runs inside the caller's erase
+     * transaction, so the OTP delete commits or rolls back together with the booking wipe.
+     *
+     * @return number of OTP rows deleted
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public int deleteAllForPhone(String e164Phone) {
+        return phoneOtpRepository.deleteByPhone(e164Phone);
+    }
+
     private static String sha256Hex(String value) {
         try {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");

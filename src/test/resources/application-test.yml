@@ -157,6 +157,9 @@ app:
     # Test profile only — Base64 of 32 zero bytes; integration tests don't exercise real ciphertext content.
     payload-key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
   internal-api-key: test-internal-api-key
+  guest-pii-retention:
+    # Phase 373 — no job bean in tests; ITs drive GuestPiiAnonymisationService directly.
+    enabled: false
 
 notification:
   outbox:

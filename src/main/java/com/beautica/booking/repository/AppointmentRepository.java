@@ -1,6 +1,7 @@
 package com.beautica.booking.repository;
 
 import com.beautica.booking.entity.Appointment;
+import java.time.OffsetDateTime;
 import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
@@ -410,4 +411,109 @@ public interface AppointmentRepository extends JpaRepository<Appointment, UUID> 
             @Param("target") String target,
             @Param("reason") String reason,
             @Param("note") String note);
+
+    // ── Guest-PII retention / erase (phase 373) ───────────────────────────────
+    /**
+     * Retention-job claim + anonymisation of visit headers (phase 373 D3/D6): a guest/walk-in header
+     * is due once NO child booking remains un-anonymised. Children anonymise by their own
+     * {@code ends_at} via {@code BookingRepository#anonymiseDueGuestBookings}, which the job runs
+     * first. Same {@code FOR UPDATE SKIP LOCKED} claim shape and field treatment.
+     */
+    @Modifying
+    @Query(value = """
+            UPDATE appointments a
+               SET guest_name = :sentinel,
+                   guest_surname = NULL,
+                   guest_phone = NULL,
+                   client_comment = NULL,
+                   client_cancellation_note = NULL,
+                   cancel_token = NULL,
+                   guest_pii_anonymised_at = now(),
+                   updated_at = now()
+             WHERE a.id IN (
+                   SELECT x.id FROM appointments x
+                    WHERE x.client_id IS NULL
+                      AND x.guest_pii_anonymised_at IS NULL
+                      AND x.client_detached_at IS NULL
+                      AND x.booking_source IN ('LINK', 'STAFF')
+                      AND NOT EXISTS (
+                          SELECT 1 FROM bookings b
+                           WHERE b.appointment_id = x.id
+                             AND b.guest_pii_anonymised_at IS NULL)
+                    ORDER BY x.id
+                    LIMIT :batchSize
+                    FOR UPDATE SKIP LOCKED)
+            RETURNING a.id
+            """, nativeQuery = true)
+    List<UUID> anonymiseDueGuestAppointments(
+            @Param("sentinel") String sentinel,
+            @Param("batchSize") int batchSize);
+
+    /**
+     * Internal erase path (phase 373 D9): anonymises every not-yet-anonymised guest/walk-in visit
+     * header of one E.164 phone, ignoring age.
+     */
+    @Modifying
+    @Query(value = """
+            UPDATE appointments
+               SET guest_name = :sentinel,
+                   guest_surname = NULL,
+                   guest_phone = NULL,
+                   client_comment = NULL,
+                   client_cancellation_note = NULL,
+                   cancel_token = NULL,
+                   guest_pii_anonymised_at = now(),
+                   updated_at = now()
+             WHERE guest_phone = :phone
+               AND client_id IS NULL
+               AND guest_pii_anonymised_at IS NULL
+               AND client_detached_at IS NULL
+               AND booking_source IN ('LINK', 'STAFF')
+            RETURNING id
+            """, nativeQuery = true)
+    List<UUID> anonymiseGuestAppointmentsByPhone(
+            @Param("phone") String phone,
+            @Param("sentinel") String sentinel);
+
+    /**
+     * Locks (id order) the phone's upcoming guest/walk-in visit headers: header {@code CONFIRMED} and
+     * at least one {@code CONFIRMED} item not yet ended (phase 373 D12 step 2). See
+     * {@code BookingRepository#lockUpcomingGuestSingleBookingIdsByPhone} for the race rationale.
+     */
+    @Query(value = """
+            SELECT a.id FROM appointments a
+             WHERE a.guest_phone = :phone
+               AND a.client_id IS NULL
+               AND a.guest_pii_anonymised_at IS NULL
+               AND a.client_detached_at IS NULL
+               AND a.booking_source IN ('LINK', 'STAFF')
+               AND a.status = 'CONFIRMED'
+               AND EXISTS (
+                   SELECT 1 FROM bookings b
+                    WHERE b.appointment_id = a.id
+                      AND b.status = 'CONFIRMED'
+                      AND b.ends_at > :now)
+             ORDER BY a.id
+             FOR UPDATE OF a
+            """, nativeQuery = true)
+    List<UUID> lockUpcomingGuestVisitIdsByPhone(
+            @Param("phone") String phone,
+            @Param("now") OffsetDateTime now);
+
+    /**
+     * Tokenless counterpart of {@link #consumeCancelToken} for a STAFF walk-in visit header (phase 373
+     * D12): same status flip and reason, guarded on {@code CONFIRMED} and account-less. Returns 0 when
+     * a concurrent cancel already won.
+     */
+    @Modifying
+    @Query(value = """
+            UPDATE appointments
+               SET status = 'CANCELLED',
+                   cancellation_reason = 'CLIENT_CANCELLED',
+                   cancel_token = NULL
+             WHERE id = :id
+               AND status = 'CONFIRMED'
+               AND client_id IS NULL
+            """, nativeQuery = true)
+    int cancelGuestVisitById(@Param("id") UUID id);
 }

@@ -165,6 +165,13 @@ public class BookingReminderJob {
      * problem that would fail identically on the next sweep, so retrying it hourly would only re-log.
      */
     private void collectReminder(List<GuestReminderSms> reminders, Booking booking) {
+        // Phase 373 defensive guard: an anonymised guest row has guest_phone NULL. The sweep's
+        // window (upcoming CONFIRMED) cannot reach one — retention needs ends_at > 12 months ago and
+        // the erase cancels upcoming rows before wiping — but a null must never reach the SMS sender.
+        if (booking.getGuestPhone() == null) {
+            log.warn("Guest reminder skipped: booking {} has no guestPhone", booking.getId());
+            return;
+        }
         try {
             reminders.add(new GuestReminderSms(booking.getGuestPhone(), buildReminderSms(booking)));
         } catch (RuntimeException e) {

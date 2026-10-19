@@ -1,6 +1,7 @@
 package com.beautica.config;
 
 import com.beautica.booking.closure.ClosureReminderProperties;
+import com.beautica.booking.retention.GuestPiiRetentionProperties;
 import com.beautica.notification.crypto.OutboxCipherProperties;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Configuration;
@@ -23,7 +24,8 @@ import org.springframework.context.annotation.Configuration;
         ClosureReminderProperties.class,
         InAppNotificationRetentionProperties.class,
         InAppNotificationCleanupProperties.class,
-        DeploymentProperties.class
+        DeploymentProperties.class,
+        GuestPiiRetentionProperties.class
 })
 public class AppConfigProperties {
 }

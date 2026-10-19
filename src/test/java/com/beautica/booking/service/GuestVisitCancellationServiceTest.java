@@ -268,6 +268,54 @@ class GuestVisitCancellationServiceTest {
         }
     }
 
+    @Nested
+    @DisplayName("cancelGuestVisit seam (phase 373 D12)")
+    class EraseSeam {
+
+        @Test
+        @DisplayName("sendGuestSms=false consumes, cancels the items, notifies once and evicts — but sends NO guest SMS")
+        void should_notifyProviderWithoutGuestSms_when_smsSuppressed() {
+            Appointment header = appointment(BookingStatus.CONFIRMED);
+            List<Booking> items = List.of(item(NOW.plusMinutes(30), "Манікюр"));
+            when(appointmentRepository.consumeCancelToken(TOKEN)).thenReturn(1);
+
+            boolean cancelled = service.cancelGuestVisit(header, items, false);
+
+            assertThat(cancelled).isTrue();
+            verify(bookingRepository).cancelItemsByAppointmentId(APPOINTMENT_ID);
+            verify(outboxService).enqueueClientCancelled(BOOKING_ID);
+            verify(slotCalculationService).evictMasterAvailabilityCaches(items.get(0).getMaster().getId());
+            verifyNoInteractions(smsService);
+        }
+
+        @Test
+        @DisplayName("a tokenless STAFF header is cancelled by id, never via the token consume")
+        void should_cancelById_when_headerHasNoCancelToken() {
+            Appointment header = Appointment.builder()
+                    .id(APPOINTMENT_ID).status(BookingStatus.CONFIRMED).guestPhone(GUEST_PHONE).build();
+            when(appointmentRepository.cancelGuestVisitById(APPOINTMENT_ID)).thenReturn(1);
+
+            boolean cancelled = service.cancelGuestVisit(header, List.of(item(CANCELLABLE_START, "Манікюр")), false);
+
+            assertThat(cancelled).isTrue();
+            verify(appointmentRepository, never()).consumeCancelToken(any());
+            verify(bookingRepository).cancelItemsByAppointmentId(APPOINTMENT_ID);
+        }
+
+        @Test
+        @DisplayName("returns false and fires NO side-effects when a concurrent cancel already won")
+        void should_returnFalse_when_headerUpdateMatchesNoRow() {
+            when(appointmentRepository.consumeCancelToken(TOKEN)).thenReturn(0);
+
+            boolean cancelled = service.cancelGuestVisit(
+                    appointment(BookingStatus.CONFIRMED), List.of(item(CANCELLABLE_START, "Манікюр")), true);
+
+            assertThat(cancelled).isFalse();
+            verify(bookingRepository, never()).cancelItemsByAppointmentId(any());
+            verifyNoInteractions(outboxService, smsService, slotCalculationService);
+        }
+    }
+
     // ── helpers ────────────────────────────────────────────────────────────────
 
     /** Stubs a CONFIRMED header whose single item starts at {@code startsAt}. */

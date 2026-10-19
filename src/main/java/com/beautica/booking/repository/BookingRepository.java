@@ -2076,4 +2076,114 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
                AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
             """)
     int consumeCancelToken(@Param("cancelToken") UUID cancelToken);
+
+    // ── Guest-PII retention / erase (phase 373) ───────────────────────────────
+    /**
+     * Retention-job claim AND anonymisation in one statement (phase 373 D6): overwrites the guest
+     * PII of up to {@code batchSize} due guest/walk-in rows and returns their ids. Mirrors the
+     * claim shape of {@link #claimRemindersByIds} — no read-then-write. {@code FOR UPDATE SKIP
+     * LOCKED} lets two instances split a backlog without blocking or double-claiming; the
+     * {@code guest_pii_anonymised_at IS NULL} predicate makes a rerun a no-op.
+     *
+     * <p>Scope: {@code client_id IS NULL}, source LINK/STAFF, never a detached ex-client row
+     * ({@code client_detached_at IS NOT NULL} — that row belonged to a registered user and was
+     * already handled by {@code ClientAccountDeletionService}). {@code provider_comment} is kept.
+     *
+     * @param cutoff   rows whose {@code ends_at} is strictly before this instant are due
+     * @param sentinel the fixed replacement name ({@code GuestPii.ANONYMISED_NAME})
+     */
+    @Modifying
+    @Query(value = """
+            UPDATE bookings b
+               SET guest_name = :sentinel,
+                   guest_surname = NULL,
+                   guest_phone = NULL,
+                   client_comment = NULL,
+                   client_cancellation_note = NULL,
+                   cancel_token = NULL,
+                   guest_pii_anonymised_at = now(),
+                   updated_at = now()
+             WHERE b.id IN (
+                   SELECT x.id FROM bookings x
+                    WHERE x.client_id IS NULL
+                      AND x.guest_pii_anonymised_at IS NULL
+                      AND x.client_detached_at IS NULL
+                      AND x.booking_source IN ('LINK', 'STAFF')
+                      AND x.ends_at < :cutoff
+                    ORDER BY x.ends_at
+                    LIMIT :batchSize
+                    FOR UPDATE SKIP LOCKED)
+            RETURNING b.id
+            """, nativeQuery = true)
+    List<UUID> anonymiseDueGuestBookings(
+            @Param("cutoff") OffsetDateTime cutoff,
+            @Param("sentinel") String sentinel,
+            @Param("batchSize") int batchSize);
+
+    /**
+     * Internal erase path (phase 373 D9): anonymises EVERY not-yet-anonymised guest/walk-in row of
+     * one E.164 phone, ignoring the retention cutoff. Same field treatment and scope as
+     * {@link #anonymiseDueGuestBookings}. Per-phone row counts are tiny, so no batching.
+     */
+    @Modifying
+    @Query(value = """
+            UPDATE bookings
+               SET guest_name = :sentinel,
+                   guest_surname = NULL,
+                   guest_phone = NULL,
+                   client_comment = NULL,
+                   client_cancellation_note = NULL,
+                   cancel_token = NULL,
+                   guest_pii_anonymised_at = now(),
+                   updated_at = now()
+             WHERE guest_phone = :phone
+               AND client_id IS NULL
+               AND guest_pii_anonymised_at IS NULL
+               AND client_detached_at IS NULL
+               AND booking_source IN ('LINK', 'STAFF')
+            RETURNING id
+            """, nativeQuery = true)
+    List<UUID> anonymiseGuestBookingsByPhone(
+            @Param("phone") String phone,
+            @Param("sentinel") String sentinel);
+
+    /**
+     * Locks (row-level {@code FOR UPDATE}, id order) the phone's upcoming single guest/walk-in
+     * bookings — {@code CONFIRMED} and not yet ended, so an in-progress visit counts — and returns
+     * their ids (phase 373 D12 step 2). Visit items are excluded: they are cancelled through their
+     * header. The lock serialises the erase against a concurrent token cancel: whichever commits
+     * first wins, and the other matches 0 rows on its conditional UPDATE.
+     */
+    @Query(value = """
+            SELECT id FROM bookings
+             WHERE guest_phone = :phone
+               AND client_id IS NULL
+               AND guest_pii_anonymised_at IS NULL
+               AND client_detached_at IS NULL
+               AND booking_source IN ('LINK', 'STAFF')
+               AND appointment_id IS NULL
+               AND status = 'CONFIRMED'
+               AND ends_at > :now
+             ORDER BY id
+             FOR UPDATE
+            """, nativeQuery = true)
+    List<UUID> lockUpcomingGuestSingleBookingIdsByPhone(
+            @Param("phone") String phone,
+            @Param("now") OffsetDateTime now);
+
+    /**
+     * Tokenless counterpart of {@link #consumeCancelToken} for a STAFF walk-in row (phase 373 D12):
+     * the same status flip, guarded on {@code CONFIRMED} and on the row being account-less. Returns 0
+     * when a concurrent cancel already won, so the caller skips the side-effects.
+     */
+    @Modifying
+    @Query("""
+            UPDATE Booking b
+               SET b.status = com.beautica.booking.enums.BookingStatus.CANCELLED,
+                   b.cancelToken = null
+             WHERE b.id = :id
+               AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
+               AND b.client IS NULL
+            """)
+    int cancelGuestRowById(@Param("id") UUID id);
 }
