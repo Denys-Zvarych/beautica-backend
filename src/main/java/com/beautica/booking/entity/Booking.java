@@ -220,7 +220,8 @@ import java.util.UUID;
                 @Index(name = "idx_bookings_created_by", columnList = "created_by_user_id"),
                 // partial indexes (V199, phase 373): guest-PII retention job (due rows by ends_at) and
                 // the internal erase-by-phone path. Predicate WHERE client_id IS NULL AND
-                // guest_pii_anonymised_at IS NULL lives in V199 only; documentation, not enforcement.
+                // guest_pii_anonymised_at IS NULL AND client_detached_at IS NULL lives in V199 only;
+                // documentation, not enforcement.
                 @Index(name = "idx_bookings_guest_pii_due", columnList = "ends_at"),
                 @Index(name = "idx_bookings_guest_phone_open", columnList = "guest_phone")
         }

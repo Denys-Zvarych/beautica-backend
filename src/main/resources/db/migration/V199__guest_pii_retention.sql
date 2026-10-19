@@ -8,13 +8,21 @@
 --
 -- The live CHECKs (V162 arms, validated by V163) require guest_name AND guest_phone on a LINK row and
 -- also a non-blank guest_surname on a STAFF walk-in row, so an anonymised row would satisfy no arm.
--- Each guest arm gains ONE disjunct for the anonymised shape; every other arm and clause is copied
--- byte-for-byte from V162. The anonymised disjunct is deliberately tight (name present, everything
--- else NULL) so a half-wiped row stays unwritable — the same "one UPDATE" discipline as V162's
--- DETACHED arm.
+-- Each guest arm (LINK, STAFF walk-in) is split on guest_pii_anonymised_at:
+--   * anonymised (marker set): sentinel name present; surname, phone, cancel_token, client_comment
+--     and client_cancellation_note all NULL. Tight on purpose: a half-wiped row is unwritable, and a
+--     later UPDATE can never put PII back onto a row marked anonymised (it would match neither
+--     disjunct) — the marker is one-way at the DB level.
+--   * live (marker NULL): the V162 clauses, byte-for-byte, plus "guest_pii_anonymised_at IS NULL".
+-- The APP, STAFF-registered-client and DETACHED arms are V162 byte-for-byte.
 --
--- Precedent for NOT VALID + VALIDATE: V139 -> V140, V162 -> V163. Both run here (in one file) because
--- the tables are small pre-launch; VALIDATE takes only SHARE UPDATE EXCLUSIVE.
+-- Locking: Flyway runs this file in ONE transaction. The ADD COLUMN / DROP CONSTRAINT / ADD
+-- CONSTRAINT statements take ACCESS EXCLUSIVE on bookings and appointments, and that lock is held
+-- until COMMIT — through the CHECK validation scan and the (non-concurrent) CREATE INDEX builds
+-- below. Readers and writers of both tables block for the whole migration. Acceptable because the
+-- tables are small at this stage; lock_timeout bounds the wait to ACQUIRE the lock (the migration
+-- fails fast instead of queueing behind a long transaction). The constraints are added validated
+-- (no NOT VALID + VALIDATE split): inside one transaction that split buys no lock reduction.
 SET LOCAL lock_timeout = '3s';
 SET LOCAL statement_timeout = '5min';
 
@@ -40,8 +48,11 @@ ALTER TABLE bookings
                     AND guest_name IS NOT NULL AND btrim(guest_name) <> ''
                     AND guest_surname IS NULL
                     AND guest_phone IS NULL
-                    AND cancel_token IS NULL)
-             OR (guest_name IS NOT NULL
+                    AND cancel_token IS NULL
+                    AND client_comment IS NULL
+                    AND client_cancellation_note IS NULL)
+             OR (guest_pii_anonymised_at IS NULL
+                    AND guest_name IS NOT NULL
                     AND guest_phone IS NOT NULL
                     AND (cancel_token IS NOT NULL
                          OR status IN ('CANCELLED', 'COMPLETED', 'NOT_COMPLETED', 'DECLINED')))
@@ -65,8 +76,11 @@ ALTER TABLE bookings
                     AND guest_pii_anonymised_at IS NOT NULL
                     AND guest_name IS NOT NULL AND btrim(guest_name) <> ''
                     AND guest_surname IS NULL
-                    AND guest_phone IS NULL)
+                    AND guest_phone IS NULL
+                    AND client_comment IS NULL
+                    AND client_cancellation_note IS NULL)
              OR (client_id IS NULL
+                    AND guest_pii_anonymised_at IS NULL
                     AND guest_name    IS NOT NULL AND btrim(guest_name)    <> ''
                     AND guest_surname IS NOT NULL AND btrim(guest_surname) <> ''
                     AND guest_phone IS NOT NULL)
@@ -77,13 +91,13 @@ ALTER TABLE bookings
             AND guest_surname IS NULL
             AND guest_phone IS NULL
             AND cancel_token IS NULL)
-    ) NOT VALID;
-ALTER TABLE bookings VALIDATE CONSTRAINT chk_bookings_guest_fields;
+    );
 
 COMMENT ON CONSTRAINT chk_bookings_guest_fields ON bookings IS
-    'Phase 373 widens V162 with an ANONYMISED disjunct inside the LINK arm and the STAFF walk-in '
-    'branch (guest_pii_anonymised_at set, sentinel name, surname/phone/token NULL). All other '
-    'clauses are V162 byte-for-byte; see V162 for the DETACHED arm rationale.';
+    'Phase 373 splits the LINK arm and the STAFF walk-in branch of V162 on guest_pii_anonymised_at: '
+    'ANONYMISED (marker set, sentinel name, surname/phone/token/client notes NULL) or LIVE (marker '
+    'NULL + the V162 clauses). PII can never be written back onto an anonymised row. APP, '
+    'STAFF-registered and DETACHED arms are V162 byte-for-byte.';
 
 -- A registered client's row is never anonymised (only client_id NULL rows are in scope).
 ALTER TABLE bookings
@@ -103,8 +117,11 @@ ALTER TABLE appointments
                     AND guest_name IS NOT NULL AND btrim(guest_name) <> ''
                     AND guest_surname IS NULL
                     AND guest_phone IS NULL
-                    AND cancel_token IS NULL)
-             OR (guest_name IS NOT NULL
+                    AND cancel_token IS NULL
+                    AND client_comment IS NULL
+                    AND client_cancellation_note IS NULL)
+             OR (guest_pii_anonymised_at IS NULL
+                    AND guest_name IS NOT NULL
                     AND guest_phone IS NOT NULL
                     AND (cancel_token IS NOT NULL
                          OR status IN ('CANCELLED', 'COMPLETED', 'NOT_COMPLETED', 'DECLINED')))
@@ -128,8 +145,11 @@ ALTER TABLE appointments
                     AND guest_pii_anonymised_at IS NOT NULL
                     AND guest_name IS NOT NULL AND btrim(guest_name) <> ''
                     AND guest_surname IS NULL
-                    AND guest_phone IS NULL)
+                    AND guest_phone IS NULL
+                    AND client_comment IS NULL
+                    AND client_cancellation_note IS NULL)
              OR (client_id IS NULL
+                    AND guest_pii_anonymised_at IS NULL
                     AND guest_name    IS NOT NULL AND btrim(guest_name)    <> ''
                     AND guest_surname IS NOT NULL AND btrim(guest_surname) <> ''
                     AND guest_phone IS NOT NULL)
@@ -140,8 +160,7 @@ ALTER TABLE appointments
             AND guest_surname IS NULL
             AND guest_phone IS NULL
             AND cancel_token IS NULL)
-    ) NOT VALID;
-ALTER TABLE appointments VALIDATE CONSTRAINT chk_appointment_guest_fields;
+    );
 
 COMMENT ON CONSTRAINT chk_appointment_guest_fields ON appointments IS
     'Phase 373 widens V162 with the same ANONYMISED disjunct as chk_bookings_guest_fields. Header '
@@ -153,13 +172,22 @@ ALTER TABLE appointments
     );
 
 -- ── indexes ─────────────────────────────────────────────────────────────────────────────────────
--- Retention job: due rows ordered by ends_at (mirrors the job's WHERE + ORDER BY).
+-- Every predicate mirrors the queries' fixed filter (client_id IS NULL AND guest_pii_anonymised_at
+-- IS NULL AND client_detached_at IS NULL) so detached ex-client rows never sit in these indexes.
+
+-- Retention job: due booking rows ordered by ends_at (mirrors the claim's WHERE + ORDER BY).
 CREATE INDEX idx_bookings_guest_pii_due ON bookings (ends_at)
-    WHERE client_id IS NULL AND guest_pii_anonymised_at IS NULL;
+    WHERE client_id IS NULL AND guest_pii_anonymised_at IS NULL AND client_detached_at IS NULL;
+
+-- Retention job leftover sweep for visit headers (child-less headers + headers whose last child was
+-- anonymised by a concurrent instance): due by the header's own created_at. Headers of claimed
+-- bookings are reached through bookings' PK + idx_bookings_appointment instead.
+CREATE INDEX idx_appointments_guest_pii_due ON appointments (created_at)
+    WHERE client_id IS NULL AND guest_pii_anonymised_at IS NULL AND client_detached_at IS NULL;
 
 -- Manual erase by phone. V138's idx_bookings_staff_walkin_phone covers STAFF only; LINK had none.
 CREATE INDEX idx_bookings_guest_phone_open ON bookings (guest_phone)
-    WHERE client_id IS NULL AND guest_pii_anonymised_at IS NULL;
+    WHERE client_id IS NULL AND guest_pii_anonymised_at IS NULL AND client_detached_at IS NULL;
 
 CREATE INDEX idx_appointments_guest_phone_open ON appointments (guest_phone)
-    WHERE client_id IS NULL AND guest_pii_anonymised_at IS NULL;
+    WHERE client_id IS NULL AND guest_pii_anonymised_at IS NULL AND client_detached_at IS NULL;

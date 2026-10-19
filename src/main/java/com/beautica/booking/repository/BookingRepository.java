@@ -768,6 +768,26 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     List<Booking> findByAppointmentIdWithGraph(@Param("appointmentId") UUID appointmentId);
 
     /**
+     * Multi-header form of {@link #findByAppointmentIdWithGraph} with the SAME graph (phase 373
+     * audit-fix cycle 1): the internal guest-PII erase cancels every upcoming visit of one phone and
+     * needs each visit's items fully loaded for the guest-cancel seam's notifications — one statement
+     * instead of one per visit. Distinct from {@link #findByAppointmentIdsWithGraph}, whose graph is
+     * deliberately narrowed to sibling reads and must not be widened. Bounded by the caller: the
+     * upcoming visits of a single phone.
+     */
+    @Query("""
+            SELECT b FROM Booking b
+            JOIN FETCH b.master m
+            LEFT JOIN FETCH m.user
+            LEFT JOIN FETCH b.salon
+            JOIN FETCH b.masterService ms
+            JOIN FETCH ms.serviceDefinition
+            WHERE b.appointment.id IN :appointmentIds
+            ORDER BY b.appointment.id ASC, b.startsAt ASC
+            """)
+    List<Booking> findByAppointmentIdInWithFullGraph(@Param("appointmentIds") Collection<UUID> appointmentIds);
+
+    /**
      * The chained booking rows of SEVERAL visits at once — the notification-drain counterpart of
      * {@link #findByAppointmentIdWithGraph}, which resolves ONE visit.
      *
@@ -2173,17 +2193,20 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
 
     /**
      * Tokenless counterpart of {@link #consumeCancelToken} for a STAFF walk-in row (phase 373 D12):
-     * the same status flip, guarded on {@code CONFIRMED} and on the row being account-less. Returns 0
-     * when a concurrent cancel already won, so the caller skips the side-effects.
+     * the same status flip, guarded on {@code CONFIRMED} and on the row being account-less, and
+     * stamps {@code updated_at} (D12). Returns 0 when a concurrent cancel already won, so the caller
+     * skips the side-effects. Native so {@code updated_at} is set by the database clock, like every
+     * other phase-373 statement.
      */
     @Modifying
-    @Query("""
-            UPDATE Booking b
-               SET b.status = com.beautica.booking.enums.BookingStatus.CANCELLED,
-                   b.cancelToken = null
-             WHERE b.id = :id
-               AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
-               AND b.client IS NULL
-            """)
+    @Query(value = """
+            UPDATE bookings
+               SET status = 'CANCELLED',
+                   cancel_token = NULL,
+                   updated_at = now()
+             WHERE id = :id
+               AND status = 'CONFIRMED'
+               AND client_id IS NULL
+            """, nativeQuery = true)
     int cancelGuestRowById(@Param("id") UUID id);
 }

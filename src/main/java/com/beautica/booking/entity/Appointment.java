@@ -24,6 +24,7 @@ import lombok.Builder;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
+import org.hibernate.annotations.DynamicUpdate;
 import org.springframework.lang.Nullable;
 
 import java.time.Instant;
@@ -78,11 +79,21 @@ import java.util.UUID;
                 // Mirrored here because an index present in the migration but absent from the entity
                 // is exactly the drift a reader of this class cannot see.
                 @Index(name = "idx_appointments_created_by", columnList = "created_by_user_id"),
-                // partial index (V199, phase 373): internal erase-by-phone path. Predicate lives in
-                // V199 only; documentation, not enforcement.
+                // partial indexes (V199, phase 373): retention-job leftover header sweep (by
+                // created_at) and the internal erase-by-phone path. Predicate WHERE client_id IS NULL
+                // AND guest_pii_anonymised_at IS NULL AND client_detached_at IS NULL lives in V199
+                // only; documentation, not enforcement.
+                @Index(name = "idx_appointments_guest_pii_due", columnList = "created_at"),
                 @Index(name = "idx_appointments_guest_phone_open", columnList = "guest_phone")
         }
 )
+// Phase 373 (audit-fix cycle 1): mirror Booking's @DynamicUpdate. Without it a managed header
+// loaded BEFORE a guest-PII erase/retention UPDATE and flushed AFTER it (any dirty field, e.g. a
+// status change) would rewrite every mapped column from its stale snapshot — guest_name /
+// guest_surname / guest_phone / client notes / cancel_token included — putting the wiped PII back
+// (V199's CHECK now rejects that write, so it would surface as a failed flush instead). With
+// @DynamicUpdate only the actually-dirty columns are written.
+@DynamicUpdate
 @Getter
 @NoArgsConstructor
 @AllArgsConstructor

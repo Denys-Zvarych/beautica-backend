@@ -10,6 +10,7 @@ import com.beautica.booking.service.GuestVisitCancellationService;
 import com.beautica.common.util.UkrainianPhoneNormalizer;
 import io.micrometer.core.instrument.MeterRegistry;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.lang.Nullable;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.TransactionDefinition;
@@ -20,24 +21,31 @@ import java.time.Clock;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
-import java.util.function.Supplier;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 
 /**
  * Irreversible anonymisation of guest (LINK) and walk-in (STAFF, no client account) PII — phase 373.
  *
  * <p><b>Retention ({@link #anonymiseDue}).</b> Rows whose {@code ends_at} is before the cutoff are
  * claimed AND anonymised by one native UPDATE per batch ({@code FOR UPDATE SKIP LOCKED}), each batch
- * in its own {@code REQUIRES_NEW} transaction so a mid-run failure keeps earlier batches. Bookings
- * first, then visit headers (a header is due once none of its items is left un-anonymised).
+ * in its own {@code REQUIRES_NEW} transaction so a mid-run failure keeps earlier batches. In the same
+ * batch transaction the headers of the just-claimed bookings are anonymised once none of their items
+ * is left un-anonymised (reached by id, never by scanning open headers). A bounded leftover sweep
+ * then catches headers missed in a cross-instance race and child-less headers, due by their own
+ * {@code created_at}.
  *
  * <p><b>Erase ({@link #eraseByPhone}).</b> One transaction, in this order (D12): normalise the phone,
  * lock the phone's upcoming guest visits and single bookings, cancel them through the existing guest
  * cancellation seams (provider outbox + in-app rows, no guest SMS), anonymise every guest row of the
  * phone regardless of age, delete its OTP rows. A rollback leaves neither a cancellation nor a wipe.
  *
- * <p>Logs carry counts and the cutoff only — never a phone, a name or a row id (§I).
+ * <p>Logs carry counts, the cutoff and the support ticket reference only — never a phone, a name or
+ * a row id (§I).
  */
 @Slf4j
 @Service
@@ -88,24 +96,53 @@ public class GuestPiiAnonymisationService {
     GuestPiiAnonymisationResult anonymiseDue(Instant cutoff, int batchSize, int maxBatches) {
         long startedAt = clock.millis();
         OffsetDateTime utcCutoff = cutoff.atOffset(ZoneOffset.UTC);
-        int bookings = drain(() -> bookingRepository.anonymiseDueGuestBookings(
-                utcCutoff, GuestPii.ANONYMISED_NAME, batchSize), batchSize, maxBatches);
-        int visits = drain(() -> appointmentRepository.anonymiseDueGuestAppointments(
-                GuestPii.ANONYMISED_NAME, batchSize), batchSize, maxBatches);
+        int bookings = 0;
+        int visits = 0;
+        for (int batch = 0; batch < maxBatches; batch++) {
+            int[] claimed = batchTx.execute(status -> claimBookingBatch(utcCutoff, batchSize));
+            bookings += claimed[0];
+            visits += claimed[1];
+            if (claimed[0] < batchSize) {
+                break;
+            }
+        }
+        for (int batch = 0; batch < maxBatches; batch++) {
+            List<UUID> swept = batchTx.execute(status -> appointmentRepository
+                    .anonymiseLeftoverGuestAppointments(utcCutoff, GuestPii.ANONYMISED_NAME, batchSize));
+            int count = swept == null ? 0 : swept.size();
+            visits += count;
+            if (count < batchSize) {
+                break;
+            }
+        }
         record("job", bookings, visits);
         log.info("Guest PII retention: anonymised {} bookings, {} visits in {} ms (cutoff {})",
                 bookings, visits, clock.millis() - startedAt, cutoff);
         return GuestPiiAnonymisationResult.ofRetention(bookings, visits);
     }
 
+    /** One booking batch + the headers it completes; {@code [bookings, headers]}. */
+    private int[] claimBookingBatch(OffsetDateTime utcCutoff, int batchSize) {
+        List<UUID> bookingIds = bookingRepository.anonymiseDueGuestBookings(
+                utcCutoff, GuestPii.ANONYMISED_NAME, batchSize);
+        if (bookingIds.isEmpty()) {
+            return new int[]{0, 0};
+        }
+        int headers = appointmentRepository
+                .anonymiseGuestAppointmentsOfBookings(bookingIds, GuestPii.ANONYMISED_NAME).size();
+        return new int[]{bookingIds.size(), headers};
+    }
+
     /**
      * Erases one phone's guest PII on request (internal endpoint). Never refuses: upcoming rows are
      * cancelled first (provider notified exactly like a guest cancel), then everything is wiped.
      *
-     * @param rawPhone any Ukrainian phone format; invalid → 400 that never echoes the input
+     * @param rawPhone  any Ukrainian phone format; invalid → 400 that never echoes the input
+     * @param ticketRef optional support ticket reference (already validated {@code [A-Za-z0-9-]{1,32}}),
+     *                  logged with the counts so every erase is attributable; {@code null} → "none"
      */
     @Transactional
-    public GuestPiiAnonymisationResult eraseByPhone(String rawPhone) {
+    public GuestPiiAnonymisationResult eraseByPhone(String rawPhone, @Nullable String ticketRef) {
         long startedAt = clock.millis();
         String phone = UkrainianPhoneNormalizer.toE164(rawPhone);
         OffsetDateTime now = OffsetDateTime.now(clock);
@@ -123,19 +160,29 @@ public class GuestPiiAnonymisationService {
         int otpRowsDeleted = phoneOtpService.deleteAllForPhone(phone);
 
         record("manual", bookingsAnonymised, visitsAnonymised);
-        log.info("Guest PII erase: cancelled {} bookings, {} visits; anonymised {} bookings, {} visits; "
-                        + "deleted {} OTP rows in {} ms",
-                bookingsCancelled, visitsCancelled, bookingsAnonymised, visitsAnonymised,
-                otpRowsDeleted, clock.millis() - startedAt);
+        log.info("Guest PII erase (ticket {}): cancelled {} bookings, {} visits; anonymised {} bookings, "
+                        + "{} visits; deleted {} OTP rows in {} ms",
+                ticketRef == null ? "none" : ticketRef, bookingsCancelled, visitsCancelled,
+                bookingsAnonymised, visitsAnonymised, otpRowsDeleted, clock.millis() - startedAt);
         return new GuestPiiAnonymisationResult(
                 bookingsCancelled, visitsCancelled, bookingsAnonymised, visitsAnonymised, otpRowsDeleted);
     }
 
+    /** Two statements for any number of visits: headers by id, items by one graph query. */
     private int cancelVisits(List<UUID> appointmentIds) {
+        if (appointmentIds.isEmpty()) {
+            return 0;
+        }
+        Map<UUID, Appointment> headers = appointmentRepository.findAllById(appointmentIds).stream()
+                .collect(Collectors.toMap(Appointment::getId, Function.identity()));
+        Map<UUID, List<Booking>> itemsByVisit = bookingRepository
+                .findByAppointmentIdInWithFullGraph(appointmentIds).stream()
+                .collect(Collectors.groupingBy(b -> b.getAppointment().getId(),
+                        LinkedHashMap::new, Collectors.toList()));
         int cancelled = 0;
         for (UUID appointmentId : appointmentIds) {
-            Appointment appointment = appointmentRepository.findById(appointmentId).orElse(null);
-            List<Booking> items = bookingRepository.findByAppointmentIdWithGraph(appointmentId);
+            Appointment appointment = headers.get(appointmentId);
+            List<Booking> items = itemsByVisit.getOrDefault(appointmentId, List.of());
             if (appointment != null && !items.isEmpty()
                     && guestVisitCancellationService.cancelGuestVisit(appointment, items, false)) {
                 cancelled++;
@@ -155,19 +202,6 @@ public class GuestPiiAnonymisationService {
             }
         }
         return cancelled;
-    }
-
-    private int drain(Supplier<List<UUID>> claimBatch, int batchSize, int maxBatches) {
-        int total = 0;
-        for (int batch = 0; batch < maxBatches; batch++) {
-            List<UUID> claimed = batchTx.execute(status -> claimBatch.get());
-            int count = claimed == null ? 0 : claimed.size();
-            total += count;
-            if (count < batchSize) {
-                break;
-            }
-        }
-        return total;
     }
 
     private void record(String trigger, int bookings, int visits) {

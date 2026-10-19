@@ -28,7 +28,7 @@ public class InternalGuestPiiController {
     public ResponseEntity<ApiResponse<GuestPiiEraseResponse>> erase(
             @Valid @RequestBody GuestPiiEraseRequest request) {
         GuestPiiEraseResponse response =
-                GuestPiiEraseResponse.from(anonymisationService.eraseByPhone(request.phone()));
+                GuestPiiEraseResponse.from(anonymisationService.eraseByPhone(request.phone(), request.ticketRef()));
         return ResponseEntity.ok(ApiResponse.ok(response));
     }
 }

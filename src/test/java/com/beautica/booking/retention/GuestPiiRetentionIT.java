@@ -3,7 +3,10 @@ package com.beautica.booking.retention;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.auth.JwtTokenProvider;
 import com.beautica.auth.Role;
+import com.beautica.booking.entity.Appointment;
 import com.beautica.booking.entity.Booking;
+import com.beautica.booking.enums.BookingStatus;
+import com.beautica.booking.repository.AppointmentRepository;
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.notification.inapp.dto.NotificationResponse;
 import com.beautica.notification.inapp.entity.InAppNotification;
@@ -80,6 +83,7 @@ class GuestPiiRetentionIT extends AbstractIntegrationTest {
 
     @Autowired private GuestPiiAnonymisationService service;
     @Autowired private PlatformTransactionManager transactionManager;
+    @Autowired private AppointmentRepository appointmentRepository;
     @Autowired private InAppNotificationRepository inAppNotificationRepository;
     @Autowired private NotificationViewAssembler viewAssembler;
     @Autowired private NotificationOutboxDrainWorker drainWorker;
@@ -327,6 +331,206 @@ class GuestPiiRetentionIT extends AbstractIntegrationTest {
         }
     }
 
+    // ── audit-fix cycle 1 ───────────────────────────────────────────────────────
+
+    @Nested
+    @DisplayName("hardening (audit-fix cycle 1)")
+    class Hardening {
+
+        @Test
+        @DisplayName("PII can never be written back onto a row marked anonymised — bookings LINK, walk-in, visit header")
+        void should_rejectPiiRestore_when_rowMarkedAnonymised() {
+            UUID link = fx.link(provider, "COMPLETED", beforeCutoff(1), PHONE, null);
+            UUID walkIn = fx.staffWalkIn(provider, "COMPLETED", beforeCutoff(2), PHONE);
+            UUID header = fx.appointment("LINK", "COMPLETED", PHONE, null, null);
+            fx.visitItem(provider, header, "LINK", "COMPLETED", beforeCutoff(3), PHONE);
+            service.anonymiseDue(cutoff);
+            assertAnonymised(fx.appointmentRow(header));
+
+            for (Object[] target : List.of(
+                    new Object[]{"bookings", link, "chk_bookings_guest_fields"},
+                    new Object[]{"bookings", walkIn, "chk_bookings_guest_fields"},
+                    new Object[]{"appointments", header, "chk_appointment_guest_fields"})) {
+                String table = (String) target[0];
+                UUID id = (UUID) target[1];
+                String constraint = (String) target[2];
+                assertThatThrownBy(() -> jdbcTemplate.update(
+                        "UPDATE " + table + " SET guest_phone = ? WHERE id = ?", PHONE, id))
+                        .as(table + ": phone restore").isInstanceOf(DataIntegrityViolationException.class)
+                        .hasMessageContaining(constraint);
+                assertThatThrownBy(() -> jdbcTemplate.update(
+                        "UPDATE " + table + " SET client_comment = 'Мій номер 0501234567' WHERE id = ?", id))
+                        .as(table + ": note restore").isInstanceOf(DataIntegrityViolationException.class)
+                        .hasMessageContaining(constraint);
+                assertThatThrownBy(() -> jdbcTemplate.update(
+                        "UPDATE " + table + " SET guest_name = ?, guest_surname = ?, guest_phone = ? WHERE id = ?",
+                        GUEST_NAME, GUEST_SURNAME, PHONE, id))
+                        .as(table + ": full live-shape restore").isInstanceOf(DataIntegrityViolationException.class)
+                        .hasMessageContaining(constraint);
+            }
+        }
+
+        @Test
+        @DisplayName("a header entity loaded before the erase and flushed after it cannot write the PII back")
+        void should_notRestorePii_when_staleHeaderFlushedAfterErase() {
+            UUID header = fx.appointment("LINK", "COMPLETED", PHONE, null, null);
+            fx.visitItem(provider, header, "LINK", "COMPLETED",
+                    OffsetDateTime.now(ZoneOffset.UTC).minusDays(3), PHONE);
+            TransactionTemplate outer = new TransactionTemplate(transactionManager);
+            TransactionTemplate inner = new TransactionTemplate(transactionManager);
+            inner.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+
+            outer.executeWithoutResult(status -> {
+                Appointment stale = appointmentRepository.findById(header).orElseThrow();
+                assertThat(stale.getGuestPhone()).isEqualTo(PHONE);
+                inner.execute(s -> service.eraseByPhone(PHONE, null));
+                stale.setStatus(BookingStatus.CANCELLED);
+                appointmentRepository.flush();
+            });
+
+            Map<String, Object> row = fx.appointmentRow(header);
+            assertThat(row.get("status")).isEqualTo("CANCELLED");
+            assertAnonymised(row);
+        }
+
+        @Test
+        @DisplayName("a child-less header is anonymised only once its own created_at is past the cutoff")
+        void should_anonymiseChildlessHeader_onlyWhenDueByItsOwnAge() {
+            UUID fresh = fx.appointment("LINK", "CANCELLED", PHONE, null, null);
+            UUID old = fx.appointment("LINK", "CANCELLED", PHONE, null, null);
+            jdbcTemplate.update("UPDATE appointments SET created_at = ? WHERE id = ?", beforeCutoff(1), old);
+
+            GuestPiiAnonymisationResult result = service.anonymiseDue(cutoff);
+
+            assertThat(result.visitsAnonymised()).isEqualTo(1);
+            assertThat(fx.appointmentRow(fresh).get("guest_phone")).isEqualTo(PHONE);
+            assertThat(fx.appointmentRow(fresh).get("guest_pii_anonymised_at")).isNull();
+            assertAnonymised(fx.appointmentRow(old));
+        }
+
+        @Test
+        @DisplayName("the leftover sweep anonymises a due header whose children were all anonymised elsewhere")
+        void should_sweepLeftoverHeader_when_childrenAlreadyAnonymised() {
+            UUID header = fx.appointment("LINK", "COMPLETED", PHONE, null, null);
+            UUID item = fx.visitItem(provider, header, "LINK", "COMPLETED", beforeCutoff(2), PHONE);
+            jdbcTemplate.update("UPDATE appointments SET created_at = ? WHERE id = ?", beforeCutoff(5), header);
+            // Simulates the cross-instance race: the child was claimed, its header was not.
+            jdbcTemplate.update("UPDATE bookings SET guest_name = ?, guest_surname = NULL, guest_phone = NULL, "
+                    + "client_comment = NULL, client_cancellation_note = NULL, cancel_token = NULL, "
+                    + "guest_pii_anonymised_at = now() WHERE id = ?", SENTINEL, item);
+
+            GuestPiiAnonymisationResult result = service.anonymiseDue(cutoff);
+
+            assertThat(result.bookingsAnonymised()).isZero();
+            assertThat(result.visitsAnonymised()).isEqualTo(1);
+            assertAnonymised(fx.appointmentRow(header));
+        }
+
+        @Test
+        @DisplayName("the tokenless cancel-by-id statements stamp updated_at (D12)")
+        void should_stampUpdatedAt_when_cancelledById() {
+            OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
+            UUID walkIn = fx.staffWalkIn(provider, "CONFIRMED", now.plusDays(3), PHONE);
+            UUID header = fx.appointment("STAFF", "CONFIRMED", PHONE, null, provider.ownerUserId());
+            fx.visitItem(provider, header, "STAFF", "CONFIRMED", now.plusDays(4), PHONE);
+            jdbcTemplate.update("UPDATE bookings SET updated_at = now() - interval '1 day' WHERE id = ?", walkIn);
+            jdbcTemplate.update("UPDATE appointments SET updated_at = now() - interval '1 day' WHERE id = ?", header);
+            Object bookingBefore = fx.booking(walkIn).get("updated_at");
+            Object headerBefore = fx.appointmentRow(header).get("updated_at");
+            TransactionTemplate tx = new TransactionTemplate(transactionManager);
+
+            int bookingRows = tx.execute(s -> bookingRepository.cancelGuestRowById(walkIn));
+            int headerRows = tx.execute(s -> appointmentRepository.cancelGuestVisitById(header));
+
+            assertThat(bookingRows).isEqualTo(1);
+            assertThat(headerRows).isEqualTo(1);
+            assertThat(fx.booking(walkIn).get("status")).isEqualTo("CANCELLED");
+            assertThat((java.sql.Timestamp) fx.booking(walkIn).get("updated_at"))
+                    .isAfter((java.sql.Timestamp) bookingBefore);
+            assertThat((java.sql.Timestamp) fx.appointmentRow(header).get("updated_at"))
+                    .isAfter((java.sql.Timestamp) headerBefore);
+        }
+
+        @Test
+        @DisplayName("erase cancels several upcoming visits of one phone (batch-loaded headers + items)")
+        void should_cancelEveryUpcomingVisit_when_phoneHasSeveral() {
+            OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
+            UUID v1 = fx.appointment("LINK", "CONFIRMED", PHONE, UUID.randomUUID(), null);
+            fx.visitItem(provider, v1, "LINK", "CONFIRMED", now.plusDays(3).plusHours(1), PHONE);
+            fx.visitItem(provider, v1, "LINK", "CONFIRMED", now.plusDays(3).plusHours(2), PHONE);
+            UUID v2 = fx.appointment("LINK", "CONFIRMED", PHONE, UUID.randomUUID(), null);
+            fx.visitItem(provider, v2, "LINK", "CONFIRMED", now.plusDays(6).plusHours(1), PHONE);
+
+            GuestPiiAnonymisationResult result = service.eraseByPhone(PHONE, null);
+
+            assertThat(result.visitsCancelled()).isEqualTo(2);
+            assertThat(fx.appointmentRow(v1).get("status")).isEqualTo("CANCELLED");
+            assertThat(fx.appointmentRow(v2).get("status")).isEqualTo("CANCELLED");
+            assertThat(fx.count("SELECT COUNT(*) FROM bookings WHERE appointment_id IN (?, ?) AND status = 'CANCELLED'",
+                    v1, v2)).isEqualTo(3);
+            assertThat(fx.count("SELECT COUNT(*) FROM notification_outbox WHERE event_type = 'CLIENT_CANCELLED'"))
+                    .isEqualTo(2);
+        }
+
+        @Test
+        @DisplayName("EXPLAIN: every retention claim is answerable from an index whose predicate matches it")
+        void should_planClaimsOnIndexes() {
+            // Realistic volume + fresh statistics: an empty-table plan is meaningless.
+            fx.bulkCompletedLink(provider, 3_000, OffsetDateTime.now(ZoneOffset.UTC).plusDays(200));
+            fx.bulkLinkAppointments(2_000);
+            jdbcTemplate.execute("ANALYZE bookings");
+            jdbcTemplate.execute("ANALYZE appointments");
+            TransactionTemplate tx = new TransactionTemplate(transactionManager);
+
+            String bookingClaim = explain(tx, """
+                    SELECT x.id FROM bookings x
+                     WHERE x.client_id IS NULL AND x.guest_pii_anonymised_at IS NULL
+                       AND x.client_detached_at IS NULL AND x.booking_source IN ('LINK', 'STAFF')
+                       AND x.ends_at < now()
+                     ORDER BY x.ends_at LIMIT 500 FOR UPDATE SKIP LOCKED""");
+            String headerOfBookings = explain(tx, """
+                    SELECT x.id FROM appointments x
+                     WHERE x.id IN (SELECT cb.appointment_id FROM bookings cb
+                                     WHERE cb.id IN ('00000000-0000-0000-0000-000000000001'::uuid,
+                                                     '00000000-0000-0000-0000-000000000002'::uuid)
+                                       AND cb.appointment_id IS NOT NULL)
+                       AND x.client_id IS NULL AND x.guest_pii_anonymised_at IS NULL
+                       AND x.client_detached_at IS NULL AND x.booking_source IN ('LINK', 'STAFF')
+                       AND NOT EXISTS (SELECT 1 FROM bookings b WHERE b.appointment_id = x.id
+                                          AND b.guest_pii_anonymised_at IS NULL)
+                     FOR UPDATE SKIP LOCKED""");
+            String leftoverSweep = explain(tx, """
+                    SELECT x.id FROM appointments x
+                     WHERE x.client_id IS NULL AND x.guest_pii_anonymised_at IS NULL
+                       AND x.client_detached_at IS NULL AND x.created_at < now()
+                       AND x.booking_source IN ('LINK', 'STAFF')
+                       AND NOT EXISTS (SELECT 1 FROM bookings b WHERE b.appointment_id = x.id
+                                          AND b.guest_pii_anonymised_at IS NULL)
+                     ORDER BY x.created_at LIMIT 500 FOR UPDATE SKIP LOCKED""");
+            String erasePhone = explain(tx, """
+                    SELECT id FROM bookings WHERE guest_phone = '+380501234567' AND client_id IS NULL
+                       AND guest_pii_anonymised_at IS NULL AND client_detached_at IS NULL""");
+
+            assertThat(bookingClaim).contains("idx_bookings_guest_pii_due");
+            // Headers are reached BY ID from the claimed bookings — never a scan of open headers.
+            assertThat(headerOfBookings).contains("appointments_pkey on appointments x")
+                    .contains("Index Cond: (id = cb.appointment_id)")
+                    .doesNotContain("Seq Scan on appointments")
+                    .doesNotContain("idx_appointments_guest_phone_open")
+                    .doesNotContain("idx_appointments_guest_pii_due");
+            assertThat(leftoverSweep).contains("idx_appointments_guest_pii_due");
+            assertThat(erasePhone).contains("idx_bookings_guest_phone_open");
+        }
+
+        /** Plan with seq scans priced out, so the assertion pins index APPLICABILITY, not table size. */
+        private String explain(TransactionTemplate tx, String sql) {
+            return tx.execute(s -> {
+                jdbcTemplate.execute("SET LOCAL enable_seqscan = off");
+                return String.join("\n", jdbcTemplate.queryForList("EXPLAIN " + sql, String.class));
+            });
+        }
+    }
+
     // ── cancel link + provider view after anonymisation ────────────────────────
 
     @Nested
@@ -436,7 +640,7 @@ class GuestPiiRetentionIT extends AbstractIntegrationTest {
             UUID otherPhoneRow = fx.link(provider, "COMPLETED", beforeCutoff(500), OTHER_PHONE, null);
             Map<String, Object> otherBefore = fx.booking(otherPhoneRow);
 
-            GuestPiiAnonymisationResult result = service.eraseByPhone(PHONE_LOCAL);
+            GuestPiiAnonymisationResult result = service.eraseByPhone(PHONE_LOCAL, null);
 
             assertThat(result.bookingsCancelled()).isEqualTo(3);
             assertThat(result.visitsCancelled()).isEqualTo(1);
@@ -476,7 +680,7 @@ class GuestPiiRetentionIT extends AbstractIntegrationTest {
         void should_renderSentinel_when_notificationsDrainAfterWipe() {
             UUID single = fx.link(provider, "CONFIRMED",
                     OffsetDateTime.now(ZoneOffset.UTC).plusDays(3), PHONE, UUID.randomUUID());
-            service.eraseByPhone(PHONE);
+            service.eraseByPhone(PHONE, null);
 
             drainWorker.drain();
 
@@ -510,7 +714,7 @@ class GuestPiiRetentionIT extends AbstractIntegrationTest {
             doThrow(new IllegalStateException("simulated wipe failure"))
                     .when(bookingRepository).anonymiseGuestBookingsByPhone(any(), any());
 
-            assertThatThrownBy(() -> service.eraseByPhone(PHONE)).isInstanceOf(IllegalStateException.class);
+            assertThatThrownBy(() -> service.eraseByPhone(PHONE, null)).isInstanceOf(IllegalStateException.class);
 
             Map<String, Object> row = fx.booking(single);
             assertThat(row.get("status")).isEqualTo("CONFIRMED");
@@ -531,7 +735,7 @@ class GuestPiiRetentionIT extends AbstractIntegrationTest {
             try {
                 Future<?> erase = pool.submit(() -> {
                     start.await();
-                    return service.eraseByPhone(PHONE);
+                    return service.eraseByPhone(PHONE, null);
                 });
                 Future<ResponseEntity<String>> cancel = pool.submit(() -> {
                     start.await();
@@ -557,10 +761,10 @@ class GuestPiiRetentionIT extends AbstractIntegrationTest {
         @DisplayName("unknown phone and a repeat call both return zeros")
         void should_returnZeros_when_nothingLeftToErase() {
             fx.link(provider, "COMPLETED", beforeCutoff(1), PHONE, null);
-            service.eraseByPhone(PHONE);
+            service.eraseByPhone(PHONE, null);
 
-            GuestPiiAnonymisationResult repeat = service.eraseByPhone(PHONE);
-            GuestPiiAnonymisationResult unknown = service.eraseByPhone("+380931234567");
+            GuestPiiAnonymisationResult repeat = service.eraseByPhone(PHONE, null);
+            GuestPiiAnonymisationResult unknown = service.eraseByPhone("+380931234567", null);
 
             assertThat(repeat).isEqualTo(new GuestPiiAnonymisationResult(0, 0, 0, 0, 0));
             assertThat(unknown).isEqualTo(new GuestPiiAnonymisationResult(0, 0, 0, 0, 0));
@@ -574,11 +778,11 @@ class GuestPiiRetentionIT extends AbstractIntegrationTest {
         fx.link(provider, "CONFIRMED", OffsetDateTime.now(ZoneOffset.UTC).plusDays(3), PHONE, UUID.randomUUID());
 
         service.anonymiseDue(cutoff);
-        service.eraseByPhone(PHONE_LOCAL);
+        service.eraseByPhone(PHONE_LOCAL, null);
 
         assertThat(output.getAll())
                 .contains("Guest PII retention: anonymised")
-                .contains("Guest PII erase:")
+                .contains("Guest PII erase (ticket none):")
                 .doesNotContain("501234567")
                 .doesNotContain(GUEST_NAME)
                 .doesNotContain(GUEST_SURNAME);

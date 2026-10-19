@@ -140,6 +140,17 @@ final class GuestPiiFixtures {
         return ids;
     }
 
+    /** Inserts {@code count} CANCELLED child-less LINK visit headers (EXPLAIN volume only). */
+    void bulkLinkAppointments(int count) {
+        List<Object[]> args = new ArrayList<>(count);
+        for (int i = 0; i < count; i++) {
+            args.add(new Object[]{UUID.randomUUID()});
+        }
+        jdbc.batchUpdate("INSERT INTO appointments (id, status, booking_source, guest_name, guest_phone, "
+                + "created_at, updated_at) VALUES (?, 'CANCELLED', 'LINK', 'Олена', '+380501234567', NOW(), NOW())",
+                args);
+    }
+
     Map<String, Object> booking(UUID id) {
         return jdbc.queryForMap("SELECT * FROM bookings WHERE id = ?", id);
     }

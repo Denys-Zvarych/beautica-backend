@@ -7,7 +7,12 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.system.CapturedOutput;
+import org.springframework.boot.test.system.OutputCaptureExtension;
 import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
@@ -28,6 +33,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * {@code InternalApiKeyFilterBlankKeyTest}), validation, and the end-to-end effect.
  */
 @DisplayName("InternalGuestPiiController — POST /api/v1/internal/guest-pii/erase")
+@ExtendWith(OutputCaptureExtension.class)
 class InternalGuestPiiControllerIT extends AbstractIntegrationTest {
 
     private static final String URL = "/api/v1/internal/guest-pii/erase";
@@ -92,6 +98,33 @@ class InternalGuestPiiControllerIT extends AbstractIntegrationTest {
         ResponseEntity<String> response = post("{\"phone\":\"  \"}", withKey(KEY));
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+
+    @Test
+    @DisplayName("200 with a valid ticketRef, which is logged with the counts and never the phone")
+    void should_logTicketRef_when_valid(CapturedOutput output) {
+        ResponseEntity<String> response = post(
+                "{\"phone\":\"0931234567\",\"ticketRef\":\"SUP-2026-0042\"}", withKey(KEY));
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(output.getAll())
+                .contains("Guest PII erase (ticket SUP-2026-0042):")
+                .doesNotContain("931234567");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"bad ref", "SUP_1", "", "0123456789012345678901234567890123", "x\nINFO forged"})
+    @DisplayName("400 for an invalid ticketRef, never echoing it")
+    void should_return400_when_ticketRefInvalid(String ticketRef) throws Exception {
+        String body = objectMapper.writeValueAsString(
+                java.util.Map.of("phone", "0931234567", "ticketRef", ticketRef));
+
+        ResponseEntity<String> response = post(body, withKey(KEY));
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        if (!ticketRef.isEmpty()) {
+            assertThat(response.getBody()).doesNotContain(ticketRef);
+        }
     }
 
     @Test
