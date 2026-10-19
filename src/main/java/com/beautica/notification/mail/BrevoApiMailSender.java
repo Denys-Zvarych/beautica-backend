@@ -15,7 +15,6 @@ import org.springframework.mail.MailParseException;
 import org.springframework.mail.SimpleMailMessage;
 import org.springframework.mail.javamail.JavaMailSender;
 import org.springframework.mail.javamail.MimeMailMessage;
-import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestClient;
 
 import java.io.IOException;
@@ -118,11 +117,14 @@ public class BrevoApiMailSender implements JavaMailSender {
             transientFailure.increment();
             log.warn("Brevo API send failed transiently: {}", e.getMessage());
             throw e;
-        } catch (ResourceAccessException e) {
-            transientFailure.increment();
-            log.warn("Brevo API send failed transiently: I/O {}", rootCauseName(e));
-            throw new BrevoTransientMailException("Brevo API I/O failure " + rootCauseName(e));
         } catch (RuntimeException e) {
+            if (BrevoRestClients.isTransportFailure(e)) {
+                // Network / timeout, however the JDK client surfaces it (ResourceAccessException, or a bare
+                // CancellationException when the read timeout cancels the response future) — provider-side.
+                transientFailure.increment();
+                log.warn("Brevo API send failed transiently: I/O {}", rootCauseName(e));
+                throw new BrevoTransientMailException("Brevo API I/O failure " + rootCauseName(e));
+            }
             // Serialization / unexpected client error — local, not evidence the provider is down.
             permanentFailure.increment();
             log.warn("Brevo API send failed permanently: {}", e.getClass().getSimpleName());

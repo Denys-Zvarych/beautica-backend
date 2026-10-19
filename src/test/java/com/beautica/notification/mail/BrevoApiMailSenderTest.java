@@ -244,6 +244,42 @@ class BrevoApiMailSenderTest {
     }
 
     @Test
+    @DisplayName("a bare CancellationException (JDK client read-timeout cancellation) → Transient, deterministic")
+    void should_throwTransient_when_cancellationException() throws Exception {
+        RestClient.Builder cancelling = RestClient.builder().requestInterceptor((req, body, exec) -> {
+            throw new java.util.concurrent.CancellationException("read timeout cancelled the response future");
+        });
+        BrevoApiMailSender cancelled = new BrevoApiMailSender(cancelling, new BrevoApiProperties(wireMock.baseUrl(),
+                API_KEY, Duration.ofSeconds(1), Duration.ofSeconds(1), "Beautica"), registry);
+
+        assertThatThrownBy(() -> cancelled.send(message())).isInstanceOf(BrevoTransientMailException.class)
+                .hasMessage("Brevo API I/O failure CancellationException");
+        assertThat(count("transient")).isEqualTo(1);
+        assertThat(count("permanent")).isZero();
+    }
+
+    @Test
+    @DisplayName("IOException / HttpTimeoutException wrapped anywhere in the cause chain → Transient")
+    void should_classifyTransportFailure_when_ioInCauseChain() {
+        assertThat(BrevoRestClients.isTransportFailure(new IllegalStateException("x",
+                new RuntimeException(new java.net.http.HttpTimeoutException("t"))))).isTrue();
+        assertThat(BrevoRestClients.isTransportFailure(new java.util.concurrent.CancellationException())).isTrue();
+        assertThat(BrevoRestClients.isTransportFailure(new IllegalArgumentException("serialization"))).isFalse();
+    }
+
+    @Test
+    @DisplayName("a non-transport client failure (e.g. local serialization) stays Permanent")
+    void should_throwPermanent_when_nonTransportClientFailure() throws Exception {
+        RestClient.Builder failing = RestClient.builder().requestInterceptor((req, body, exec) -> {
+            throw new IllegalStateException("local bug");
+        });
+        BrevoApiMailSender broken = new BrevoApiMailSender(failing, new BrevoApiProperties(wireMock.baseUrl(),
+                API_KEY, Duration.ofSeconds(1), Duration.ofSeconds(1), "Beautica"), registry);
+
+        assertThatThrownBy(() -> broken.send(message())).isInstanceOf(BrevoPermanentMailException.class);
+    }
+
+    @Test
     @DisplayName("connection reset mid-response → Transient")
     void should_throwTransient_when_connectionReset() throws Exception {
         wireMock.stubFor(post(urlEqualTo(PATH)).willReturn(aResponse().withFault(Fault.CONNECTION_RESET_BY_PEER)));

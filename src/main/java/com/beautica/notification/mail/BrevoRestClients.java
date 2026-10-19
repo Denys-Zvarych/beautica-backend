@@ -2,10 +2,13 @@ package com.beautica.notification.mail;
 
 import com.beautica.config.OutboundTimeouts;
 import org.springframework.http.client.JdkClientHttpRequestFactory;
+import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestClient;
 
+import java.io.IOException;
 import java.net.http.HttpClient;
 import java.time.Duration;
+import java.util.concurrent.CancellationException;
 
 /**
  * Builds the Brevo {@link RestClient}s (sender and boot probe) with the same transport rules as
@@ -34,5 +37,21 @@ public final class BrevoRestClients {
         JdkClientHttpRequestFactory requestFactory = new JdkClientHttpRequestFactory(httpClient);
         requestFactory.setReadTimeout(OutboundTimeouts.requirePositive(readProperty, read));
         return builder.clone().baseUrl(baseUrl).requestFactory(requestFactory).build();
+    }
+
+    /**
+     * {@code true} when {@code failure} is a network/timeout failure anywhere in its cause chain:
+     * {@link ResourceAccessException}, any {@link IOException} (incl. {@code HttpTimeoutException},
+     * {@code ConnectException}), or {@link CancellationException} — {@link JdkClientHttpRequestFactory} enforces
+     * its read timeout by cancelling the response future, which can surface unwrapped.
+     */
+    public static boolean isTransportFailure(Throwable failure) {
+        for (Throwable t = failure; t != null; t = t.getCause() == t ? null : t.getCause()) {
+            if (t instanceof ResourceAccessException || t instanceof IOException
+                    || t instanceof CancellationException) {
+                return true;
+            }
+        }
+        return false;
     }
 }

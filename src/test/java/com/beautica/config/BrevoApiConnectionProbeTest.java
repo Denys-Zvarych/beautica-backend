@@ -110,6 +110,23 @@ class BrevoApiConnectionProbeTest {
     }
 
     @Test
+    @DisplayName("a bare CancellationException (JDK read-timeout cancellation) → UNREACHABLE, never REJECTED")
+    void should_returnUnreachable_when_cancellationException(CapturedOutput output) {
+        BrevoApiProperties props = new BrevoApiProperties(wireMock.baseUrl(), API_KEY, Duration.ofSeconds(3),
+                Duration.ofSeconds(10), "Beautica");
+        StaticListableBeanFactory factory = new StaticListableBeanFactory();
+        factory.addBean("builder", RestClient.builder().requestInterceptor((req, body, exec) -> {
+            throw new java.util.concurrent.CancellationException("cancelled");
+        }));
+
+        BrevoApiConnectionProbe.Result result =
+                new BrevoApiConnectionProbe(props, factory.getBeanProvider(RestClient.Builder.class)).result();
+
+        assertThat(result).isEqualTo(BrevoApiConnectionProbe.Result.UNREACHABLE);
+        assertThat(output.getAll()).contains("rule prod-brevo-api-unreachable").contains("CancellationException");
+    }
+
+    @Test
     @DisplayName("the result is cached — a second call makes no extra request (100 req/h limit on /v3/account)")
     void should_cacheResult_when_calledTwice() {
         stub(200);

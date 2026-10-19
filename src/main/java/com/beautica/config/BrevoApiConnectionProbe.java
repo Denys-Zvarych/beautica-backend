@@ -9,7 +9,6 @@ import org.springframework.context.annotation.Conditional;
 import org.springframework.http.HttpStatusCode;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Component;
-import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestClient;
 
 import java.time.Duration;
@@ -64,11 +63,14 @@ public class BrevoApiConnectionProbe {
                     .accept(MediaType.APPLICATION_JSON)
                     .exchange((req, res) -> res.getStatusCode(), true);
             return classify(status);
-        } catch (ResourceAccessException e) {
-            log.warn("rule prod-brevo-api-unreachable: the Brevo API did not answer: {}", rootCauseName(e));
-            return Result.UNREACHABLE;
         } catch (RuntimeException e) {
-            log.warn("rule prod-brevo-api-unreachable: the Brevo API probe failed: {}", e.getClass().getSimpleName());
+            // Network/timeout (incl. a bare CancellationException from the JDK client's read timeout) and any
+            // other client failure are both UNREACHABLE — never REJECTED, which is reserved for an HTTP answer.
+            if (BrevoRestClients.isTransportFailure(e)) {
+                log.warn("rule prod-brevo-api-unreachable: the Brevo API did not answer: {}", rootCauseName(e));
+            } else {
+                log.warn("rule prod-brevo-api-unreachable: the Brevo API probe failed: {}", e.getClass().getSimpleName());
+            }
             return Result.UNREACHABLE;
         }
     }
