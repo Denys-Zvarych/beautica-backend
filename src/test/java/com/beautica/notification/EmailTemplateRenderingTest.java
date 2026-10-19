@@ -579,4 +579,88 @@ class EmailTemplateRenderingTest {
         assertThat(html).doesNotContain("SENTINEL-CLIENT-CANCELLATION-NOTE");
         assertThat(html).doesNotContain("SENTINEL-PROVIDER-COMMENT");
     }
+
+    // ---------------------------------------------------------------- Phase 374 D4: logo src byte-identity
+
+    /** Exactly the one-attribute edit Phase 374 made to every logo-bearing template. */
+    private static final String NEW_LOGO_ATTR = "<img th:src=\"${logoSrc} ?: 'cid:beauticaLogo'\"";
+    private static final String HEAD_LOGO_ATTR = "<img src=\"cid:beauticaLogo\"";
+    private static final List<String> LOGO_TEMPLATES = List.of("booking-cancelled-provider", "booking-confirmed",
+            "booking-declined", "booking-rescheduled-client", "booking-rescheduled-provider", "closure-reminder",
+            "invite-master", "invite", "master-removed", "new-booking", "reset-password-otp", "review-request",
+            "salon-closed", "verify-email");
+
+    private static String source(String template) throws java.io.IOException {
+        return new org.springframework.core.io.ClassPathResource("templates/email/" + template + ".html")
+                .getContentAsString(java.nio.charset.StandardCharsets.UTF_8);
+    }
+
+    private static SpringTemplateEngine stringEngine() {
+        var resolver = new org.thymeleaf.templateresolver.StringTemplateResolver();
+        resolver.setTemplateMode(org.thymeleaf.templatemode.TemplateMode.HTML);
+        resolver.setCacheable(false);
+        var engine = new SpringTemplateEngine();
+        engine.setTemplateResolver(resolver);
+        return engine;
+    }
+
+    /** Variables every logo template reads, so the comparison renders real rows rather than empty shells. */
+    private static Context richContext() {
+        var ctx = new Context();
+        ctx.setVariable("masterName", "Оксана");
+        ctx.setVariable("clientName", "Іван Петренко");
+        ctx.setVariable("serviceName", "Стрижка");
+        ctx.setVariable("serviceNames", List.of("Стрижка", "Укладка"));
+        ctx.setVariable("serviceLabel", "Послуги");
+        ctx.setVariable("startsAt", "10:00, 20 травня 2026");
+        ctx.setVariable("oldStartsAt", "09:00, 19 травня 2026");
+        ctx.setVariable("newStartsAt", "10:00, 20 травня 2026");
+        ctx.setVariable("visitDuration", "1 год (до 11:00)");
+        ctx.setVariable("salonName", "Aurora");
+        ctx.setVariable("inviteUrl", "https://beautica.app/invite/t");
+        ctx.setVariable("reviewUrl", "https://beautica.app/review/t");
+        ctx.setVariable("bookingUrl", "https://beautica.app/bookings/t");
+        ctx.setVariable("code", "123456");
+        ctx.setVariable("comment", "коментар");
+        return ctx;
+    }
+
+    @Test
+    @DisplayName("Phase 374 D4 — every logo template is exactly HEAD plus the one logo-attribute edit")
+    void should_differFromHeadOnlyByLogoAttribute_when_templatesLoaded() throws Exception {
+        for (String template : LOGO_TEMPLATES) {
+            String current = source(template);
+
+            assertThat(countOccurrences(current, NEW_LOGO_ATTR)).as(template).isEqualTo(1);
+            assertThat(current).as(template).doesNotContain("cid:beauticaLogo\"");
+        }
+    }
+
+    @Test
+    @DisplayName("Phase 374 D4 — SMTP render (logoSrc = cid:beauticaLogo, or unset) is BYTE-IDENTICAL to the HEAD template")
+    void should_renderByteIdenticalToHead_when_logoSrcIsCidOrUnset() throws Exception {
+        SpringTemplateEngine engine = stringEngine();
+        for (String template : LOGO_TEMPLATES) {
+            String current = source(template);
+            String head = current.replace(NEW_LOGO_ATTR, HEAD_LOGO_ATTR);
+            Context withCid = richContext();
+            withCid.setVariable("logoSrc", "cid:beauticaLogo");
+
+            String expected = engine.process(head, richContext());
+
+            assertThat(engine.process(current, withCid)).as(template).isEqualTo(expected);
+            assertThat(engine.process(current, richContext())).as(template + " (logoSrc unset)").isEqualTo(expected);
+        }
+    }
+
+    @Test
+    @DisplayName("Phase 374 D4 — the real classpath engine renders src=\"cid:beauticaLogo\" by default and the URL when set")
+    void should_renderLogoSrc_when_processedByRealEngine() {
+        Context hosted = richContext();
+        hosted.setVariable("logoSrc", "https://beautica.app/email/logo.png");
+
+        assertThat(templateEngine.process("email/verify-email", richContext())).contains("<img src=\"cid:beauticaLogo\"");
+        assertThat(templateEngine.process("email/verify-email", hosted))
+                .contains("<img src=\"https://beautica.app/email/logo.png\"").doesNotContain("cid:");
+    }
 }

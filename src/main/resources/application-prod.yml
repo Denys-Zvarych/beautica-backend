@@ -50,6 +50,11 @@ springdoc:
 # property-resolution time (IllegalArgumentException at startup) instead of silently
 # emitting invite links that point at localhost.
 app:
+  # Phase 374: Railway Hobby blocks SMTP egress; mail leaves over the Brevo HTTPS API. The `staging` overlay
+  # sets transport back to smtp (Mailpit). The logo is served by beautica-website (same domain as the sender).
+  mail:
+    transport: brevo-api
+    logo-url: https://beautica.app/email/logo.png
   # No dev default (it used to live in the base profile). Empty when INTERNAL_API_KEY is unset, so
   # EnvironmentFingerprintGuard aborts startup with a clear rule instead of an unresolved-placeholder error.
   internal-api-key: ${INTERNAL_API_KEY:}

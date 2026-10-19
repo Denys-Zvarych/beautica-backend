@@ -23,6 +23,9 @@ spring:
       '[mail.smtp.writetimeout]': 1000
 
 app:
+  # Phase 374: explicit — the test profile always uses the SMTP transport unless a test opts into brevo-api.
+  mail:
+    transport: smtp
   rate-limit:
     register-capacity: 100000
     login-capacity: 100000

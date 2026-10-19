@@ -4,7 +4,7 @@
   "deploy": {
     "healthcheckPath": "/actuator/health",
     "healthcheckTimeout": 300,
-    "drainingSeconds": 250,
+    "drainingSeconds": 280,
     "overlapSeconds": 30,
     "restartPolicyType": "ON_FAILURE",
     "restartPolicyMaxRetries": 5

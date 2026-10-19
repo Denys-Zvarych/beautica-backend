@@ -46,7 +46,7 @@ public class SupportController {
                     taken from the JWT, never from the request body.
 
                     Constraints: up to 5 attachments, each ≤ 5 MB, total ≤ 5 MB; allowed types
-                    JPEG, PNG, WebP, PDF (validated by content, not the declared header).""",
+                    JPEG, PNG, PDF (validated by content, not the declared header).""",
             requestBody = @RequestBody(content = @Content(
                     mediaType = MediaType.MULTIPART_FORM_DATA_VALUE,
                     schema = @Schema(implementation = ContactSupportForm.class)))

@@ -34,6 +34,11 @@ spring:
           writetimeout: 3000
 
 app:
+  # Phase 374: staging stays on SMTP (Mailpit) — overrides prod's brevo-api, and keeps the inline CID logo.
+  # The fingerprint guard fails the boot on transport != smtp (staging-mail-transport) or a set BREVO_API_KEY.
+  mail:
+    transport: smtp
+    logo-url: ""
   booking:
     sms:
       # Exercise the booking SMS paths; with beautica.sms.mode=capture they land in Mailpit.

@@ -24,7 +24,8 @@ class ProdProfileFingerprintTest {
                 .withInitializer(new ConfigDataApplicationContextInitializer())
                 .withPropertyValues("spring.profiles.active=" + profiles,
                         "SENTRY_DSN=https://0123456789abcdef@o42.ingest.de.sentry.io/4500000000000001", "TURBOSMS_TOKEN=turbosms-fixture-token", "ADMIN_EMAIL=admin@beautica.ua",
-                        "BREVO_SMTP_LOGIN=login", "BREVO_SMTP_KEY=key", "JWT_SECRET=x", "INTERNAL_API_KEY=" + TestSecrets.INTERNAL_API_KEY, "FRONTEND_BASE_URL=https://app.beautica.ua",
+                        "BREVO_API_KEY=xkeysib-fixture-api-key",
+                        "JWT_SECRET=x", "INTERNAL_API_KEY=" + TestSecrets.INTERNAL_API_KEY, "FRONTEND_BASE_URL=https://app.beautica.ua",
                         "PUBLIC_BASE_URL=https://api.beautica.ua", "SUPPORT_EMAIL=help@beautica.ua",
                         "R2_ENABLED=true", "CLOUDFLARE_R2_BUCKET=beautica-media-prod",
                         "CLOUDFLARE_R2_PUBLIC_URL=https://media.beautica.ua");
@@ -60,6 +61,9 @@ class ProdProfileFingerprintTest {
                     assertThat(props.sms().mode()).isEqualTo(SmsMode.CAPTURE);
                     assertThat(ctx.getEnvironment().getProperty("spring.mail.host")).doesNotContain("brevo");
                     assertThat(ctx.getEnvironment().getProperty("app.booking.sms.enabled")).isEqualTo("true");
+                    // Phase 374: staging overrides prod's brevo-api transport and hosted logo back to SMTP + CID.
+                    assertThat(ctx.getEnvironment().getProperty("app.mail.transport")).isEqualTo("smtp");
+                    assertThat(ctx.getEnvironment().getProperty("app.mail.logo-url")).isEmpty();
                     assertThatCode(() -> EnvironmentFingerprintGuard.verify(ctx.getEnvironment())).doesNotThrowAnyException();
                     assertThat(ctx.getEnvironment().getProperty("app.rate-limit.invite-capacity")).isEqualTo("1000");
                     assertThat(ctx.getEnvironment().getProperty("spring.mail.properties.mail.smtp.timeout")).isEqualTo("3000");
@@ -75,7 +79,8 @@ class ProdProfileFingerprintTest {
                 .withInitializer(new ConfigDataApplicationContextInitializer())
                 .withPropertyValues("spring.profiles.active=prod",
                         "SENTRY_DSN=https://0123456789abcdef@o42.ingest.de.sentry.io/4500000000000001", "TURBOSMS_TOKEN=turbosms-fixture-token", "ADMIN_EMAIL=admin@beautica.ua",
-                        "BREVO_SMTP_LOGIN=login", "BREVO_SMTP_KEY=key", "JWT_SECRET=x", "INTERNAL_API_KEY=" + TestSecrets.INTERNAL_API_KEY, "FRONTEND_BASE_URL=https://app.beautica.ua",
+                        "BREVO_API_KEY=xkeysib-fixture-api-key",
+                        "JWT_SECRET=x", "INTERNAL_API_KEY=" + TestSecrets.INTERNAL_API_KEY, "FRONTEND_BASE_URL=https://app.beautica.ua",
                         "SUPPORT_EMAIL=help@beautica.ua",
                         "R2_ENABLED=true", "CLOUDFLARE_R2_BUCKET=beautica-media-prod",
                         "CLOUDFLARE_R2_PUBLIC_URL=https://media.beautica.ua")
@@ -137,7 +142,8 @@ class ProdProfileFingerprintTest {
                 .withInitializer(new ConfigDataApplicationContextInitializer())
                 .withPropertyValues("spring.profiles.active=prod",
                         "SENTRY_DSN=https://0123456789abcdef@o42.ingest.de.sentry.io/4500000000000001", "TURBOSMS_TOKEN=turbosms-fixture-token", "ADMIN_EMAIL=admin@beautica.ua",
-                        "BREVO_SMTP_LOGIN=login", "BREVO_SMTP_KEY=key", "JWT_SECRET=x", "INTERNAL_API_KEY=" + TestSecrets.INTERNAL_API_KEY, "FRONTEND_BASE_URL=https://app.beautica.ua",
+                        "BREVO_API_KEY=xkeysib-fixture-api-key",
+                        "JWT_SECRET=x", "INTERNAL_API_KEY=" + TestSecrets.INTERNAL_API_KEY, "FRONTEND_BASE_URL=https://app.beautica.ua",
                         "PUBLIC_BASE_URL=https://api.beautica.ua",
                         "R2_ENABLED=true", "CLOUDFLARE_R2_BUCKET=beautica-media-prod",
                         "CLOUDFLARE_R2_PUBLIC_URL=https://media.beautica.ua")
@@ -152,11 +158,12 @@ class ProdProfileFingerprintTest {
     private static final java.util.Map<String, String> PROD_REQUIRED = java.util.Map.of(
             "SENTRY_DSN", "https://0123456789abcdef@o42.ingest.de.sentry.io/4500000000000001",
             "TURBOSMS_TOKEN", "turbosms-fixture-token",
-            "ADMIN_EMAIL", "admin@beautica.ua");
+            "ADMIN_EMAIL", "admin@beautica.ua",
+            "BREVO_API_KEY", "xkeysib-fixture-api-key");
 
     private static ApplicationContextRunner prodRunnerWithout(String missing) {
         java.util.List<String> props = new java.util.ArrayList<>(java.util.List.of("spring.profiles.active=prod",
-                "BREVO_SMTP_LOGIN=login", "BREVO_SMTP_KEY=key", "JWT_SECRET=x",
+                "JWT_SECRET=x",
                 "INTERNAL_API_KEY=" + TestSecrets.INTERNAL_API_KEY, "FRONTEND_BASE_URL=https://app.beautica.ua",
                 "PUBLIC_BASE_URL=https://api.beautica.ua", "SUPPORT_EMAIL=help@beautica.ua", "R2_ENABLED=true",
                 "CLOUDFLARE_R2_BUCKET=beautica-media-prod", "CLOUDFLARE_R2_PUBLIC_URL=https://media.beautica.ua"));
@@ -199,6 +206,26 @@ class ProdProfileFingerprintTest {
             assertThat(ctx.getEnvironment().getProperty("app.admin-email")).isEqualTo("admin@beautica.app");
             assertThatThrownBy(() -> EnvironmentFingerprintGuard.verify(ctx.getEnvironment()))
                     .hasMessageContaining("rule prod-admin-email-unset");
+        });
+    }
+
+    @Test
+    @DisplayName("Phase 374 D8 — prod without BREVO_API_KEY — guard fails on prod-brevo-api-key-missing")
+    void should_failGuard_when_prodBrevoApiKeyMissing() {
+        prodRunnerWithout("BREVO_API_KEY").run(ctx -> assertThatThrownBy(
+                        () -> EnvironmentFingerprintGuard.verify(ctx.getEnvironment()))
+                .hasMessageContaining("rule prod-brevo-api-key-missing"));
+    }
+
+    @Test
+    @DisplayName("Phase 374 D2/D4/D6 — prod resolves transport=brevo-api + hosted logo, and needs no BREVO_SMTP_* at all")
+    void should_resolveBrevoApiTransport_when_prodProfile() {
+        prodRunnerWithout("").run(ctx -> {
+            assertThat(ctx.getEnvironment().getProperty("app.mail.transport")).isEqualTo("brevo-api");
+            assertThat(ctx.getEnvironment().getProperty("app.mail.logo-url"))
+                    .isEqualTo("https://beautica.app/email/logo.png");
+            assertThat(ctx.getEnvironment().getProperty("spring.mail.username")).isEmpty();
+            assertThat(ctx.getEnvironment().getProperty("spring.mail.password")).isEmpty();
         });
     }
 }

@@ -76,4 +76,17 @@ class BrevoConnectionProbeTest {
     void should_skip_when_noJavaMailSenderImplBean() {
         assertThat(probeWith(null).isUnreachable()).isFalse();
     }
+
+    @Test
+    @DisplayName("Phase 374 — the SMTP probe bean is absent on the brevo-api transport, present on smtp")
+    void should_beAbsent_when_transportBrevoApi() {
+        org.springframework.boot.test.context.runner.ApplicationContextRunner runner =
+                new org.springframework.boot.test.context.runner.ApplicationContextRunner()
+                        .withUserConfiguration(BrevoConnectionProbe.class);
+
+        runner.withPropertyValues("app.mail.transport=brevo-api")
+                .run(ctx -> assertThat(ctx).doesNotHaveBean(BrevoConnectionProbe.class));
+        runner.withPropertyValues("app.mail.transport=smtp")
+                .run(ctx -> assertThat(ctx).hasSingleBean(BrevoConnectionProbe.class));
+    }
 }

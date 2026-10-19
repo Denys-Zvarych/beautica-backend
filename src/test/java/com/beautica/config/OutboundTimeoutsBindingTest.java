@@ -162,4 +162,35 @@ class OutboundTimeoutsBindingTest {
                         .isInstanceOf(IllegalStateException.class)
                         .hasMessageContaining("app.firebase.connect-timeout"));
     }
+
+    // ---- Phase 374: Brevo HTTPS API transport timeouts ----
+
+    @Configuration
+    @Import(com.beautica.notification.mail.MailTransportConfig.class)
+    static class BrevoApiWiring {
+    }
+
+    @Test
+    @DisplayName("should_bindBrevoApiThreeAndTenSeconds_when_productionYmlLoaded")
+    void should_bindBrevoApiThreeAndTenSeconds_when_productionYmlLoaded() {
+        prodYml().withUserConfiguration(BrevoApiWiring.class).run(ctx -> {
+            var props = ctx.getBean(com.beautica.notification.mail.BrevoApiProperties.class);
+
+            assertThat(props.connectTimeout()).isEqualTo(Duration.ofSeconds(3));
+            assertThat(props.readTimeout()).isEqualTo(Duration.ofSeconds(10));
+        });
+    }
+
+    @Test
+    @DisplayName("should_failStartup_when_brevoApiReadOrConnectTimeoutIsZero")
+    void should_failStartup_when_brevoApiReadOrConnectTimeoutIsZero() {
+        for (String key : java.util.List.of("read-timeout", "connect-timeout")) {
+            new ApplicationContextRunner()
+                    .withUserConfiguration(BrevoApiWiring.class)
+                    .withPropertyValues("app.mail.brevo-api." + key + "=0s")
+                    .run(ctx -> assertThat(ctx).hasFailed().getFailure().rootCause()
+                            .isInstanceOf(IllegalStateException.class)
+                            .hasMessageContaining("app.mail.brevo-api." + key));
+        }
+    }
 }

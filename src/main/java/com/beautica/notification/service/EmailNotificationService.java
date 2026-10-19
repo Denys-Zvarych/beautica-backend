@@ -3,10 +3,13 @@ package com.beautica.notification.service;
 import com.beautica.booking.entity.Booking;
 import com.beautica.common.util.SchemeGuard;
 import com.beautica.master.entity.Master;
+import com.beautica.notification.mail.BrevoPermanentMailException;
+import com.beautica.notification.mail.MailTransportProperties;
 import com.beautica.user.User;
 import jakarta.mail.MessagingException;
 import jakarta.mail.internet.MimeMessage;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.ByteArrayResource;
 import org.springframework.core.io.ClassPathResource;
@@ -42,6 +45,9 @@ public class EmailNotificationService {
     private static final DateTimeFormatter TIME_FMT = DateTimeFormatter.ofPattern("HH:mm");
     private static final int MINUTES_PER_HOUR = 60;
     private static final String LOGO_CID = "beauticaLogo";
+    /** Template variable for the header logo {@code src} (Phase 374, D4). */
+    static final String LOGO_SRC_VARIABLE = "logoSrc";
+    private static final String LOGO_CID_SRC = "cid:" + LOGO_CID;
 
     /**
      * Logo bytes are read from the classpath exactly once at class load. A {@link ClassPathResource}
@@ -89,16 +95,42 @@ public class EmailNotificationService {
     private final JavaMailSender mailSender;
     private final SpringTemplateEngine templateEngine;
     private final String fromAddress;
+    /** {@code null} = inline CID logo (SMTP, unchanged); otherwise the hosted https logo URL (Brevo API, D4). */
+    private final String hostedLogoUrl;
 
-    // Explicit constructor — @RequiredArgsConstructor cannot bind @Value defaults.
+    /** Inline CID logo — the pre-Phase-374 behaviour, kept for direct construction in tests. */
     public EmailNotificationService(
             JavaMailSender mailSender,
             SpringTemplateEngine templateEngine,
-            @Value("${app.invite.from-email:noreply@beautica.app}") String fromAddress
+            String fromAddress
+    ) {
+        this(mailSender, templateEngine, fromAddress, null);
+    }
+
+    // Explicit constructor — @RequiredArgsConstructor cannot bind @Value defaults.
+    @Autowired
+    public EmailNotificationService(
+            JavaMailSender mailSender,
+            SpringTemplateEngine templateEngine,
+            @Value("${app.invite.from-email:noreply@beautica.app}") String fromAddress,
+            MailTransportProperties mailProperties
     ) {
         this.mailSender = mailSender;
         this.templateEngine = templateEngine;
         this.fromAddress = fromAddress;
+        this.hostedLogoUrl = mailProperties != null && mailProperties.hostedLogo() ? mailProperties.logoUrl() : null;
+    }
+
+    /** {@code src} of the header logo: the hosted URL when configured, else {@code cid:beauticaLogo}. */
+    private String logoSrc() {
+        return hostedLogoUrl != null ? hostedLogoUrl : LOGO_CID_SRC;
+    }
+
+    /** Inline CID part only when no hosted logo is configured (the Brevo API cannot carry CID parts). */
+    private void addLogo(MimeMessageHelper helper) throws MessagingException {
+        if (hostedLogoUrl == null) {
+            addLogoInline(helper);
+        }
     }
 
     public void sendInviteEmail(String to, String inviteUrl, String salonName) {
@@ -327,10 +359,11 @@ public class EmailNotificationService {
 
             var ctx = new Context();
             ctx.setVariable("code", rawOtp);
+            ctx.setVariable(LOGO_SRC_VARIABLE, logoSrc());
             String html = templateEngine.process("email/reset-password-otp", ctx);
             helper.setText(html, true);
 
-            addLogoInline(helper);
+            addLogo(helper);
 
             mailSender.send(helper.getMimeMessage());
         } catch (MessagingException | MailException e) {
@@ -349,11 +382,12 @@ public class EmailNotificationService {
             // Render template — code is ONLY passed as a context variable, never logged
             var ctx = new Context();
             ctx.setVariable("code", rawOtp);
+            ctx.setVariable(LOGO_SRC_VARIABLE, logoSrc());
             String html = templateEngine.process("email/verify-email", ctx);
             helper.setText(html, true);
 
-            // Embed logo as CID inline attachment
-            addLogoInline(helper);
+            // Embed logo as CID inline attachment (or reference the hosted logo, Phase 374 D4)
+            addLogo(helper);
 
             mailSender.send(helper.getMimeMessage());
         } catch (MessagingException | MailException e) {
@@ -416,12 +450,18 @@ public class EmailNotificationService {
 
     private void send(String to, String subject, String template, Context ctx) {
         try {
+            ctx.setVariable(LOGO_SRC_VARIABLE, logoSrc());
             String html = templateEngine.process(template, ctx);
             MimeMessageHelper helper = buildMimeHelper(to, true);
             helper.setSubject(subject);
             helper.setText(html, true);
-            addLogoInline(helper);
+            addLogo(helper);
             mailSender.send(helper.getMimeMessage());
+        } catch (BrevoPermanentMailException ex) {
+            // Phase 374 D5: the Brevo API rejected THIS message (bad parameter, unconvertible MIME). Not evidence
+            // the provider is down, so it must not feed the e-mail breaker. Never thrown on the SMTP path.
+            log.error("Failed to send email [template={}]: {}", template, ex.getClass().getSimpleName());
+            throw new EmailDeliveryException(template, false);
         } catch (MessagingException | MailException ex) {
             // 'to' is PII — never log it. Log template + exception type only.
             log.error("Failed to send email [template={}]: {}", template, ex.getClass().getSimpleName());

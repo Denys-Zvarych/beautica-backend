@@ -71,6 +71,21 @@ class StagingProfileContextIT extends AbstractStagingProfileIT {
         assertThat(environment.getProperty("spring.mail.host")).isEqualTo("mailpit.railway.internal");
     }
 
+    @Autowired
+    private org.springframework.context.ApplicationContext context;
+
+    @Test
+    @DisplayName("Phase 374 — staging overrides prod's brevo-api: SMTP transport, inline logo, SMTP probe only")
+    void should_resolveSmtpTransport_when_prodAndStagingProfilesActive() {
+        var mail = context.getBean(com.beautica.notification.mail.MailTransportProperties.class);
+
+        assertThat(mail.transport()).isEqualTo(com.beautica.notification.mail.MailTransportKind.SMTP);
+        assertThat(mail.hostedLogo()).isFalse();
+        assertThat(context.getBeansOfType(com.beautica.notification.mail.BrevoApiMailSender.class)).isEmpty();
+        assertThat(context.getBeansOfType(BrevoApiConnectionProbe.class)).isEmpty();
+        assertThat(context.getBeansOfType(BrevoConnectionProbe.class)).hasSize(1);
+    }
+
     @Test
     @DisplayName("guest OTP request — one mail to sms+380…@sms.staging.invalid carrying the code; Turbosms untouched")
     void should_mailOtpToCaptureInbox_when_guestRequestsOtp() throws Exception {
