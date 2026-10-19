@@ -18,6 +18,7 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
@@ -26,6 +27,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.function.Function;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
 /**
@@ -35,8 +37,9 @@ import java.util.stream.Collectors;
  * claimed AND anonymised by one native UPDATE per batch ({@code FOR UPDATE SKIP LOCKED}), each batch
  * in its own {@code REQUIRES_NEW} transaction so a mid-run failure keeps earlier batches. In the same
  * batch transaction the headers of the just-claimed bookings are anonymised once none of their items
- * is left un-anonymised (reached by id, never by scanning open headers). A bounded leftover sweep
- * then catches headers missed in a cross-instance race and child-less headers, due by their own
+ * is left un-anonymised (reached by id, never by scanning open headers). Two bounded sweeps follow:
+ * headers whose children all ended before the cutoff and are anonymised but which a cross-instance
+ * race skipped (driven from recently anonymised items), and child-less headers, due by their own
  * {@code created_at}.
  *
  * <p><b>Erase ({@link #eraseByPhone}).</b> One transaction, in this order (D12): normalise the phone,
@@ -52,6 +55,13 @@ import java.util.stream.Collectors;
 public class GuestPiiAnonymisationService {
 
     static final String METRIC = "guest.pii.anonymised";
+
+    /**
+     * How far back the ended-visit sweep looks for recently anonymised visit items. The race it
+     * repairs (two instances each claiming one child of the same header) lives within one nightly
+     * run, so 30 days tolerates a long job outage with a wide margin.
+     */
+    static final Duration LEFTOVER_LOOKBACK = Duration.ofDays(30);
 
     private final BookingRepository bookingRepository;
     private final AppointmentRepository appointmentRepository;
@@ -106,19 +116,29 @@ public class GuestPiiAnonymisationService {
                 break;
             }
         }
-        for (int batch = 0; batch < maxBatches; batch++) {
-            List<UUID> swept = batchTx.execute(status -> appointmentRepository
-                    .anonymiseLeftoverGuestAppointments(utcCutoff, GuestPii.ANONYMISED_NAME, batchSize));
-            int count = swept == null ? 0 : swept.size();
-            visits += count;
-            if (count < batchSize) {
-                break;
-            }
-        }
+        OffsetDateTime recentSince = OffsetDateTime.now(clock).minus(LEFTOVER_LOOKBACK);
+        visits += sweep(() -> appointmentRepository.anonymiseEndedGuestAppointments(
+                utcCutoff, recentSince, GuestPii.ANONYMISED_NAME, batchSize), batchSize, maxBatches);
+        visits += sweep(() -> appointmentRepository.anonymiseLeftoverGuestAppointments(
+                utcCutoff, GuestPii.ANONYMISED_NAME, batchSize), batchSize, maxBatches);
         record("job", bookings, visits);
         log.info("Guest PII retention: anonymised {} bookings, {} visits in {} ms (cutoff {})",
                 bookings, visits, clock.millis() - startedAt, cutoff);
         return GuestPiiAnonymisationResult.ofRetention(bookings, visits);
+    }
+
+    /** Batched leftover-header sweep, each batch in its own transaction; returns the total. */
+    private int sweep(Supplier<List<UUID>> claimBatch, int batchSize, int maxBatches) {
+        int total = 0;
+        for (int batch = 0; batch < maxBatches; batch++) {
+            List<UUID> swept = batchTx.execute(status -> claimBatch.get());
+            int count = swept == null ? 0 : swept.size();
+            total += count;
+            if (count < batchSize) {
+                break;
+            }
+        }
+        return total;
     }
 
     /** One booking batch + the headers it completes; {@code [bookings, headers]}. */
@@ -138,7 +158,7 @@ public class GuestPiiAnonymisationService {
      * cancelled first (provider notified exactly like a guest cancel), then everything is wiped.
      *
      * @param rawPhone  any Ukrainian phone format; invalid → 400 that never echoes the input
-     * @param ticketRef optional support ticket reference (already validated {@code [A-Za-z0-9-]{1,32}}),
+     * @param ticketRef optional support ticket reference (already validated {@code [A-Za-z]{2,10}-[0-9]{1,20}}),
      *                  logged with the counts so every erase is attributable; {@code null} → "none"
      */
     @Transactional

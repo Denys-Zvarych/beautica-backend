@@ -10,15 +10,16 @@ import jakarta.validation.constraints.Size;
  *
  * @param phone     the guest's phone, any Ukrainian format
  * @param ticketRef optional support ticket reference (privacy@ thread / helpdesk id), logged with
- *                  the erase counts for accountability. Restricted to {@code [A-Za-z0-9-]{1,32}} so
- *                  it can never smuggle PII, whitespace or log-forging control characters into the
- *                  log line; {@code null} is allowed.
+ *                  the erase counts for accountability. Shape {@code PREFIX-NUMBER}
+ *                  ({@code [A-Za-z]{2,10}-[0-9]{1,20}}, e.g. {@code SUP-1042}): the mandatory letter
+ *                  prefix means it can never be a phone number, and it can never smuggle whitespace or
+ *                  log-forging control characters into the log line; {@code null} is allowed.
  */
 public record GuestPiiEraseRequest(
         @NotBlank @Size(max = 32)
         String phone,
 
-        @Pattern(regexp = "[A-Za-z0-9-]{1,32}")
+        @Pattern(regexp = "[A-Za-z]{2,10}-[0-9]{1,20}")
         String ticketRef
 ) {
 }

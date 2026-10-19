@@ -417,8 +417,12 @@ public interface AppointmentRepository extends JpaRepository<Appointment, UUID> 
      * Retention-job header claim, step 1 (phase 373 D3/D6, audit-fix cycle 1): anonymises the visit
      * headers of the booking rows the SAME batch transaction just anonymised
      * ({@code BookingRepository#anonymiseDueGuestBookings}), once NO child of the header is left
-     * un-anonymised. Reached through the bookings PK and {@code idx_bookings_appointment} — never a
-     * scan of every open header. Same field treatment and {@code FOR UPDATE SKIP LOCKED} claim shape.
+     * un-anonymised. Same field treatment and {@code FOR UPDATE SKIP LOCKED} claim shape.
+     *
+     * <p>{@code = ANY (ARRAY(subquery))} on purpose (audit-fix cycle 2): the ARRAY subquery is an
+     * InitPlan evaluated once over {@code bookings_pkey}, and its result becomes an
+     * {@code Index Cond} on {@code appointments_pkey}. A plain {@code IN (subquery)} let the planner
+     * pick a merge semi join that walks the whole open-header index in id order.
      *
      * <p>A header whose last two children were claimed by two concurrent instances can be missed by
      * both (each still sees the other's child as un-anonymised); {@link #anonymiseLeftoverGuestAppointments}
@@ -439,10 +443,10 @@ public interface AppointmentRepository extends JpaRepository<Appointment, UUID> 
                    updated_at = now()
              WHERE a.id IN (
                    SELECT x.id FROM appointments x
-                    WHERE x.id IN (
+                    WHERE x.id = ANY (ARRAY(
                           SELECT cb.appointment_id FROM bookings cb
                            WHERE cb.id IN (:bookingIds)
-                             AND cb.appointment_id IS NOT NULL)
+                             AND cb.appointment_id IS NOT NULL))
                       AND x.client_id IS NULL
                       AND x.guest_pii_anonymised_at IS NULL
                       AND x.client_detached_at IS NULL
@@ -459,11 +463,55 @@ public interface AppointmentRepository extends JpaRepository<Appointment, UUID> 
             @Param("sentinel") String sentinel);
 
     /**
-     * Retention-job header claim, step 2 — the bounded leftover sweep (phase 373, audit-fix cycle 1).
-     * Catches (a) a header missed by step 1 in a cross-instance race and (b) a child-less (orphan)
-     * header. A header is due here by its OWN age: {@code created_at < cutoff} — a header is created
-     * no later than its children's {@code ends_at}, so every header whose children are all due is
-     * also due here, while a fresh child-less header is NOT anonymised early. Rides the partial
+     * Retention-job header claim, step 2 — ended-visit sweep (phase 373 audit-fix cycle 2). A header
+     * is due once it HAS children, NONE of them ends at or after the cutoff, and all of them are
+     * anonymised — independent of the header's own {@code created_at}, so a late-recorded past visit
+     * is not kept beyond {@code ends_at} + 12 months when step 1 missed its header in a race.
+     * Candidates are driven from items anonymised since {@code recentSince} through the partial index
+     * {@code idx_bookings_guest_pii_anonymised_visit} — never a scan of every open header.
+     */
+    @Modifying
+    @Query(value = """
+            UPDATE appointments a
+               SET guest_name = :sentinel,
+                   guest_surname = NULL,
+                   guest_phone = NULL,
+                   client_comment = NULL,
+                   client_cancellation_note = NULL,
+                   cancel_token = NULL,
+                   guest_pii_anonymised_at = now(),
+                   updated_at = now()
+             WHERE a.id IN (
+                   SELECT x.id FROM appointments x
+                    WHERE x.id IN (
+                          SELECT r.appointment_id FROM bookings r
+                           WHERE r.appointment_id IS NOT NULL
+                             AND r.guest_pii_anonymised_at IS NOT NULL
+                             AND r.guest_pii_anonymised_at >= :recentSince)
+                      AND x.client_id IS NULL
+                      AND x.guest_pii_anonymised_at IS NULL
+                      AND x.client_detached_at IS NULL
+                      AND x.booking_source IN ('LINK', 'STAFF')
+                      AND NOT EXISTS (
+                          SELECT 1 FROM bookings b
+                           WHERE b.appointment_id = x.id
+                             AND (b.ends_at >= :cutoff OR b.guest_pii_anonymised_at IS NULL))
+                    ORDER BY x.id
+                    LIMIT :batchSize
+                    FOR UPDATE SKIP LOCKED)
+            RETURNING a.id
+            """, nativeQuery = true)
+    List<UUID> anonymiseEndedGuestAppointments(
+            @Param("cutoff") OffsetDateTime cutoff,
+            @Param("recentSince") OffsetDateTime recentSince,
+            @Param("sentinel") String sentinel,
+            @Param("batchSize") int batchSize);
+
+    /**
+     * Retention-job header claim, step 3 — the bounded leftover sweep (phase 373, audit-fix cycle 1).
+     * Catches a child-less (orphan) header — due by its OWN age, {@code created_at < cutoff}, so a
+     * fresh child-less header is NOT anonymised early — and, as a backstop, any old header whose
+     * children are all anonymised but which steps 1 and 2 missed. Rides the partial
      * index {@code idx_appointments_guest_pii_due (created_at)}, whose predicate matches this WHERE.
      */
     @Modifying

@@ -185,6 +185,11 @@ CREATE INDEX idx_bookings_guest_pii_due ON bookings (ends_at)
 CREATE INDEX idx_appointments_guest_pii_due ON appointments (created_at)
     WHERE client_id IS NULL AND guest_pii_anonymised_at IS NULL AND client_detached_at IS NULL;
 
+-- Retention job ended-visit sweep: headers reached from recently anonymised visit items (a header
+-- whose children were claimed by two racing instances). Predicate matches that subselect.
+CREATE INDEX idx_bookings_guest_pii_anonymised_visit ON bookings (guest_pii_anonymised_at)
+    WHERE appointment_id IS NOT NULL AND guest_pii_anonymised_at IS NOT NULL;
+
 -- Manual erase by phone. V138's idx_bookings_staff_walkin_phone covers STAFF only; LINK had none.
 CREATE INDEX idx_bookings_guest_phone_open ON bookings (guest_phone)
     WHERE client_id IS NULL AND guest_pii_anonymised_at IS NULL AND client_detached_at IS NULL;

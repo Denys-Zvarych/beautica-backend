@@ -340,11 +340,14 @@ class GuestPiiRetentionIT extends AbstractIntegrationTest {
         @Test
         @DisplayName("PII can never be written back onto a row marked anonymised — bookings LINK, walk-in, visit header")
         void should_rejectPiiRestore_when_rowMarkedAnonymised() {
-            UUID link = fx.link(provider, "COMPLETED", beforeCutoff(1), PHONE, null);
-            UUID walkIn = fx.staffWalkIn(provider, "COMPLETED", beforeCutoff(2), PHONE);
-            UUID header = fx.appointment("LINK", "COMPLETED", PHONE, null, null);
-            fx.visitItem(provider, header, "LINK", "COMPLETED", beforeCutoff(3), PHONE);
+            // CANCELLED rows: a client_cancellation_note write-back is then rejected ONLY by the guest
+            // CHECK, not also by the note-requires-CANCELLED status CHECK.
+            UUID link = fx.link(provider, "CANCELLED", beforeCutoff(1), PHONE, null);
+            UUID walkIn = fx.staffWalkIn(provider, "CANCELLED", beforeCutoff(2), PHONE);
+            UUID header = fx.appointment("LINK", "CANCELLED", PHONE, null, null);
+            fx.visitItem(provider, header, "LINK", "CANCELLED", beforeCutoff(3), PHONE);
             service.anonymiseDue(cutoff);
+            assertAnonymised(fx.booking(link));
             assertAnonymised(fx.appointmentRow(header));
 
             for (Object[] target : List.of(
@@ -361,6 +364,10 @@ class GuestPiiRetentionIT extends AbstractIntegrationTest {
                 assertThatThrownBy(() -> jdbcTemplate.update(
                         "UPDATE " + table + " SET client_comment = 'Мій номер 0501234567' WHERE id = ?", id))
                         .as(table + ": note restore").isInstanceOf(DataIntegrityViolationException.class)
+                        .hasMessageContaining(constraint);
+                assertThatThrownBy(() -> jdbcTemplate.update(
+                        "UPDATE " + table + " SET client_cancellation_note = 'Не встигаю, Олена' WHERE id = ?", id))
+                        .as(table + ": cancellation-note restore").isInstanceOf(DataIntegrityViolationException.class)
                         .hasMessageContaining(constraint);
                 assertThatThrownBy(() -> jdbcTemplate.update(
                         "UPDATE " + table + " SET guest_name = ?, guest_surname = ?, guest_phone = ? WHERE id = ?",
@@ -427,6 +434,31 @@ class GuestPiiRetentionIT extends AbstractIntegrationTest {
         }
 
         @Test
+        @DisplayName("a late-recorded past visit's header is due by its children's ends_at, not its own created_at")
+        void should_anonymiseHeader_when_allChildrenEndedBeforeCutoff_evenIfHeaderIsFresh() {
+            UUID header = fx.appointment("STAFF", "COMPLETED", PHONE, null, provider.ownerUserId());
+            UUID item = fx.visitItem(provider, header, "STAFF", "COMPLETED", beforeCutoff(48), PHONE);
+            UUID liveHeader = fx.appointment("STAFF", "COMPLETED", PHONE, null, provider.ownerUserId());
+            UUID liveOld = fx.visitItem(provider, liveHeader, "STAFF", "COMPLETED", beforeCutoff(50), PHONE);
+            fx.visitItem(provider, liveHeader, "STAFF", "COMPLETED",
+                    cutoff.atOffset(ZoneOffset.UTC).plusHours(3), PHONE);
+            // Simulates the cross-instance race: the children were claimed, their headers were not
+            // (header created_at = now, so the created_at sweep alone would keep it for 12 more months).
+            for (UUID child : List.of(item, liveOld)) {
+                jdbcTemplate.update("UPDATE bookings SET guest_name = ?, guest_surname = NULL, guest_phone = NULL, "
+                        + "client_comment = NULL, client_cancellation_note = NULL, cancel_token = NULL, "
+                        + "guest_pii_anonymised_at = now() WHERE id = ?", SENTINEL, child);
+            }
+
+            GuestPiiAnonymisationResult result = service.anonymiseDue(cutoff);
+
+            assertThat(result.visitsAnonymised()).isEqualTo(1);
+            assertAnonymised(fx.appointmentRow(header));
+            assertThat(fx.appointmentRow(liveHeader).get("guest_phone"))
+                    .as("a header with a child ending after the cutoff stays").isEqualTo(PHONE);
+        }
+
+        @Test
         @DisplayName("the tokenless cancel-by-id statements stamp updated_at (D12)")
         void should_stampUpdatedAt_when_cancelledById() {
             OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
@@ -476,8 +508,17 @@ class GuestPiiRetentionIT extends AbstractIntegrationTest {
         @DisplayName("EXPLAIN: every retention claim is answerable from an index whose predicate matches it")
         void should_planClaimsOnIndexes() {
             // Realistic volume + fresh statistics: an empty-table plan is meaningless.
-            fx.bulkCompletedLink(provider, 3_000, OffsetDateTime.now(ZoneOffset.UTC).plusDays(200));
-            fx.bulkLinkAppointments(2_000);
+            List<UUID> bookingIds = fx.bulkCompletedLink(
+                    provider, 3_000, OffsetDateTime.now(ZoneOffset.UTC).plusDays(200));
+            // Open (not yet due) headers must dwarf one claim batch, as in production (12 months of
+            // visits vs 500 claimed ids) — at toy sizes a hash join over all headers IS cheaper.
+            fx.bulkLinkAppointments(20_000);
+            // The 3 000 rows become visit items, one per header — the real visit shape.
+            jdbcTemplate.update("""
+                    UPDATE bookings b SET appointment_id = h.id
+                      FROM (SELECT id, row_number() OVER (ORDER BY id) rn FROM appointments) h,
+                           (SELECT id, row_number() OVER (ORDER BY id) rn FROM bookings) bb
+                     WHERE bb.id = b.id AND h.rn = bb.rn""");
             jdbcTemplate.execute("ANALYZE bookings");
             jdbcTemplate.execute("ANALYZE appointments");
             TransactionTemplate tx = new TransactionTemplate(transactionManager);
@@ -490,15 +531,25 @@ class GuestPiiRetentionIT extends AbstractIntegrationTest {
                      ORDER BY x.ends_at LIMIT 500 FOR UPDATE SKIP LOCKED""");
             String headerOfBookings = explain(tx, """
                     SELECT x.id FROM appointments x
-                     WHERE x.id IN (SELECT cb.appointment_id FROM bookings cb
-                                     WHERE cb.id IN ('00000000-0000-0000-0000-000000000001'::uuid,
-                                                     '00000000-0000-0000-0000-000000000002'::uuid)
-                                       AND cb.appointment_id IS NOT NULL)
+                     WHERE x.id = ANY (ARRAY(SELECT cb.appointment_id FROM bookings cb
+                                     WHERE cb.id IN (%s)
+                                       AND cb.appointment_id IS NOT NULL))
                        AND x.client_id IS NULL AND x.guest_pii_anonymised_at IS NULL
                        AND x.client_detached_at IS NULL AND x.booking_source IN ('LINK', 'STAFF')
                        AND NOT EXISTS (SELECT 1 FROM bookings b WHERE b.appointment_id = x.id
                                           AND b.guest_pii_anonymised_at IS NULL)
-                     FOR UPDATE SKIP LOCKED""");
+                     FOR UPDATE SKIP LOCKED""".formatted(uuidList(bookingIds.subList(0, 500))));
+            String endedVisitSweep = explain(tx, """
+                    SELECT x.id FROM appointments x
+                     WHERE x.id IN (SELECT r.appointment_id FROM bookings r
+                                     WHERE r.appointment_id IS NOT NULL
+                                       AND r.guest_pii_anonymised_at IS NOT NULL
+                                       AND r.guest_pii_anonymised_at >= now() - interval '30 days')
+                       AND x.client_id IS NULL AND x.guest_pii_anonymised_at IS NULL
+                       AND x.client_detached_at IS NULL AND x.booking_source IN ('LINK', 'STAFF')
+                       AND NOT EXISTS (SELECT 1 FROM bookings b WHERE b.appointment_id = x.id
+                                          AND (b.ends_at >= now() OR b.guest_pii_anonymised_at IS NULL))
+                     ORDER BY x.id LIMIT 500 FOR UPDATE SKIP LOCKED""");
             String leftoverSweep = explain(tx, """
                     SELECT x.id FROM appointments x
                      WHERE x.client_id IS NULL AND x.guest_pii_anonymised_at IS NULL
@@ -512,14 +563,24 @@ class GuestPiiRetentionIT extends AbstractIntegrationTest {
                        AND guest_pii_anonymised_at IS NULL AND client_detached_at IS NULL""");
 
             assertThat(bookingClaim).contains("idx_bookings_guest_pii_due");
-            // Headers are reached BY ID from the claimed bookings — never a scan of open headers.
-            assertThat(headerOfBookings).contains("appointments_pkey on appointments x")
-                    .contains("Index Cond: (id = cb.appointment_id)")
+            // Real batch shape (500 claimed ids): headers are reached BY ID from the claimed bookings
+            // in a PK nested loop — never a scan of open headers.
+            assertThat(headerOfBookings).contains("Nested Loop Anti Join")
+                    .contains("Index Scan using bookings_pkey on bookings cb")
+                    .containsPattern("Index Scan (using|on) appointments_pkey")
+                    .contains("Index Cond: (id = ANY ((InitPlan 1).col1))")
+                    .contains("Index Cond: (appointment_id = x.id)")
                     .doesNotContain("Seq Scan on appointments")
                     .doesNotContain("idx_appointments_guest_phone_open")
                     .doesNotContain("idx_appointments_guest_pii_due");
             assertThat(leftoverSweep).contains("idx_appointments_guest_pii_due");
+            assertThat(endedVisitSweep).contains("idx_bookings_guest_pii_anonymised_visit")
+                    .doesNotContain("Seq Scan on appointments");
             assertThat(erasePhone).contains("idx_bookings_guest_phone_open");
+        }
+
+        private String uuidList(List<UUID> ids) {
+            return ids.stream().map(id -> "'" + id + "'::uuid").collect(java.util.stream.Collectors.joining(", "));
         }
 
         /** Plan with seq scans priced out, so the assertion pins index APPLICABILITY, not table size. */

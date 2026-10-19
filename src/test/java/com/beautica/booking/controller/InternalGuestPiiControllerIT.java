@@ -104,16 +104,17 @@ class InternalGuestPiiControllerIT extends AbstractIntegrationTest {
     @DisplayName("200 with a valid ticketRef, which is logged with the counts and never the phone")
     void should_logTicketRef_when_valid(CapturedOutput output) {
         ResponseEntity<String> response = post(
-                "{\"phone\":\"0931234567\",\"ticketRef\":\"SUP-2026-0042\"}", withKey(KEY));
+                "{\"phone\":\"0931234567\",\"ticketRef\":\"SUP-20260042\"}", withKey(KEY));
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(output.getAll())
-                .contains("Guest PII erase (ticket SUP-2026-0042):")
+                .contains("Guest PII erase (ticket SUP-20260042):")
                 .doesNotContain("931234567");
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"bad ref", "SUP_1", "", "0123456789012345678901234567890123", "x\nINFO forged"})
+    @ValueSource(strings = {"bad ref", "SUP_1", "SUP-2026-0042", "S-1", "", "ABCDEFGHIJK-1",
+            "SUP-123456789012345678901", "x\nINFO forged", "SUP-1\nINFO forged"})
     @DisplayName("400 for an invalid ticketRef, never echoing it")
     void should_return400_when_ticketRefInvalid(String ticketRef) throws Exception {
         String body = objectMapper.writeValueAsString(
@@ -125,6 +126,19 @@ class InternalGuestPiiControllerIT extends AbstractIntegrationTest {
         if (!ticketRef.isEmpty()) {
             assertThat(response.getBody()).doesNotContain(ticketRef);
         }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"0501234567", "380501234567", "+380501234567", "050-1234567"})
+    @DisplayName("400 when the ticketRef is a phone number (digits only / phone-shaped), never echoing it")
+    void should_return400_when_ticketRefIsDigitsOnly(String ticketRef) throws Exception {
+        String body = objectMapper.writeValueAsString(
+                java.util.Map.of("phone", "0931234567", "ticketRef", ticketRef));
+
+        ResponseEntity<String> response = post(body, withKey(KEY));
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(response.getBody()).doesNotContain("501234567");
     }
 
     @Test

@@ -223,7 +223,11 @@ import java.util.UUID;
                 // guest_pii_anonymised_at IS NULL AND client_detached_at IS NULL lives in V199 only;
                 // documentation, not enforcement.
                 @Index(name = "idx_bookings_guest_pii_due", columnList = "ends_at"),
-                @Index(name = "idx_bookings_guest_phone_open", columnList = "guest_phone")
+                @Index(name = "idx_bookings_guest_phone_open", columnList = "guest_phone"),
+                // partial index (V199, phase 373 audit-fix cycle 2): ended-visit header sweep. Predicate
+                // WHERE appointment_id IS NOT NULL AND guest_pii_anonymised_at IS NOT NULL lives in
+                // V199 only; documentation, not enforcement.
+                @Index(name = "idx_bookings_guest_pii_anonymised_visit", columnList = "guest_pii_anonymised_at")
         }
 )
 // Root-cause fix (G1, cycle-7 audit 2026-08-03) for the entity-staleness/terminal-state-
