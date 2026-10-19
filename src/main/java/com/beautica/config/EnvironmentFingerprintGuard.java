@@ -1,5 +1,6 @@
 package com.beautica.config;
 
+import com.beautica.notification.mail.MailTransportKind;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.springframework.boot.SpringApplication;
@@ -62,6 +63,9 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
     /** Placeholder an operator sets for {@code BREVO_SMTP_LOGIN}/{@code BREVO_SMTP_KEY} until Brevo exists (Phase 367 D9). */
     static final String BREVO_PENDING = "PENDING";
 
+    /** Effective Brevo HTTPS API key (Phase 374); the yml resolves it from {@code BREVO_API_KEY}. */
+    static final String BREVO_API_KEY_PROPERTY = "app.mail.brevo-api.api-key";
+
     /** Conservative floor for {@code TURBOSMS_TOKEN}; the provider documents no length (see {@link #isPlaceholderSecret}). */
     static final int MIN_SMS_TOKEN_LENGTH = 16;
     private static final List<String> SECRET_PLACEHOLDERS = List.of("pending", "changeme", "todo", "xxx", "tbd");
@@ -116,7 +120,11 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
             checkInternalApiKey(env, violations);
             if (environment == DeployEnvironment.PROD) {
                 checkProd(env, violations);
-                warnBrevoUnconfigured(env, log);
+                if (brevoApiTransport(env)) {
+                    checkBrevoApiKey(env, violations);
+                } else {
+                    warnBrevoUnconfigured(env, log);
+                }
             } else {
                 checkStaging(env, violations);
             }
@@ -444,6 +452,27 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
         }
     }
 
+    /**
+     * Phase 374 D8: with {@code app.mail.transport=brevo-api} a blank or {@value #BREVO_PENDING} {@code BREVO_API_KEY}
+     * fails the prod boot (replaces the {@code prod-brevo-unconfigured} WARN for this transport). Names the env var only.
+     */
+    private static void checkBrevoApiKey(Environment env, List<String> violations) {
+        if (brevoApiKeyPending(env)) {
+            violations.add("rule prod-brevo-api-key-missing: BREVO_API_KEY (app.mail.brevo-api.api-key) must be set "
+                    + "in prod when app.mail.transport is brevo-api");
+        }
+    }
+
+    /** {@code true} when the effective Brevo API key is blank or the {@value #BREVO_PENDING} placeholder. */
+    static boolean brevoApiKeyPending(Environment env) {
+        return isBrevoPlaceholder(readOrNull(env, BREVO_API_KEY_PROPERTY));
+    }
+
+    /** Phase 374 D2: the transport, resolved by the same rule as the bean condition. */
+    static boolean brevoApiTransport(Environment env) {
+        return MailTransportKind.of(env) == MailTransportKind.BREVO_API;
+    }
+
     /** {@code true} when the mail login or key is blank or the {@value #BREVO_PENDING} placeholder (case-insensitive). */
     static boolean brevoPending(Environment env) {
         return isBrevoPlaceholder(readOrNull(env, "spring.mail.username"))
@@ -469,6 +498,9 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
     }
 
     private static void checkStaging(Environment env, List<String> violations) {
+        if (brevoApiTransport(env)) {
+            violations.add("rule staging-mail-transport: app.mail.transport must be smtp in staging");
+        }
         String host = mailHost(env);
         boolean captureHost = isCaptureHost(host);
         if (!captureHost) {
@@ -480,6 +512,9 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
         }
         if (!isBlank(env.getProperty("BREVO_SMTP_KEY")) || !isBlank(env.getProperty("spring.mail.password"))) {
             violations.add("rule staging-brevo-key-blank: BREVO_SMTP_KEY must be blank in staging");
+        }
+        if (!isBlank(readOrNull(env, "BREVO_API_KEY")) || !isBlank(readOrNull(env, BREVO_API_KEY_PROPERTY))) {
+            violations.add("rule staging-brevo-key-blank: BREVO_API_KEY must be blank in staging");
         }
         String support = supportEmail(env);
         if (!isEmailShaped(support) || !support.endsWith(".invalid")) {
@@ -506,6 +541,9 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
     }
 
     static String mailKind(Environment env) {
+        if (brevoApiTransport(env)) {
+            return "brevo-api";
+        }
         String host = mailHost(env);
         if (host.contains("brevo")) {
             return "brevo";

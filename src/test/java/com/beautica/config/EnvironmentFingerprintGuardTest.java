@@ -795,6 +795,92 @@ class EnvironmentFingerprintGuardTest {
                 .filter(l -> l.contains(" WARN ") && l.contains("rule prod-brevo-unconfigured")).toList();
     }
 
+    // ---------------------------------------------------------------- Phase 374 (Brevo HTTPS API transport)
+
+    /** Prod on the API transport with no SMTP credentials at all (the Railway prod shape after cutover). */
+    private static MockEnvironment prodApiEnv(String apiKey) {
+        MockEnvironment env = prodEnv().withProperty("app.mail.transport", "brevo-api");
+        env.setProperty("spring.mail.username", "");
+        env.setProperty("spring.mail.password", "");
+        if (apiKey != null) {
+            env.setProperty("app.mail.brevo-api.api-key", apiKey);
+        }
+        return env;
+    }
+
+    @Test
+    @DisplayName("Phase 374 D8 — prod + brevo-api + blank/missing/PENDING key — fails prod-brevo-api-key-missing, names the env var only")
+    void should_fail_when_prodBrevoApiKeyBlankOrPending() {
+        for (MockEnvironment env : List.of(prodApiEnv(null), prodApiEnv(" "), prodApiEnv("PENDING"), prodApiEnv("pending"))) {
+            assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("rule prod-brevo-api-key-missing")
+                    .hasMessageContaining("BREVO_API_KEY");
+        }
+    }
+
+    @Test
+    @DisplayName("Phase 374 — prod + brevo-api + real key and NO SMTP credentials — passes, no prod-brevo-unconfigured WARN")
+    void should_pass_when_prodBrevoApiKeySetWithoutSmtpCredentials(CapturedOutput output) {
+        assertThatCode(() -> run(prodApiEnv("xkeysib-" + SECRET), DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                .doesNotThrowAnyException();
+
+        assertThat(brevoWarnLines(output)).isEmpty();
+        assertThat(output.getAll()).doesNotContain(SECRET);
+    }
+
+    @Test
+    @DisplayName("Phase 374 — prod + smtp transport keeps the old rules: no key rule, PENDING creds still WARN")
+    void should_keepSmtpRules_when_prodTransportSmtp(CapturedOutput output) {
+        MockEnvironment env = prodEnv().withProperty("app.mail.transport", "smtp")
+                .withProperty("spring.mail.password", "PENDING");
+
+        assertThatCode(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS)).doesNotThrowAnyException();
+
+        assertThat(brevoWarnLines(output)).hasSize(1);
+    }
+
+    @Test
+    @DisplayName("Phase 374 — staging + brevo-api transport — fails staging-mail-transport")
+    void should_fail_when_stagingTransportIsBrevoApi() {
+        MockEnvironment env = stagingEnv().withProperty("app.mail.transport", "brevo-api");
+
+        assertThatThrownBy(() -> run(env, DeployEnvironment.STAGING, SmsMode.CAPTURE))
+                .hasMessageContaining("rule staging-mail-transport");
+    }
+
+    @Test
+    @DisplayName("Phase 374 — staging with BREVO_API_KEY (env or property) — fails staging-brevo-key-blank, no value")
+    void should_fail_when_stagingHasBrevoApiKey() {
+        for (MockEnvironment env : List.of(stagingEnv().withProperty("BREVO_API_KEY", SECRET),
+                stagingEnv().withProperty("app.mail.brevo-api.api-key", SECRET))) {
+            assertThatThrownBy(() -> run(env, DeployEnvironment.STAGING, SmsMode.CAPTURE))
+                    .hasMessageContaining("rule staging-brevo-key-blank: BREVO_API_KEY must be blank in staging")
+                    .message().doesNotContain(SECRET);
+        }
+    }
+
+    @Test
+    @DisplayName("Phase 374 — mailKind is brevo-api for the API transport (checked before the host), else unchanged")
+    void should_reportBrevoApiMailKind_when_transportBrevoApi() {
+        MockEnvironment api = new MockEnvironment().withProperty("spring.mail.host", "mailpit")
+                .withProperty("app.mail.transport", "brevo-api");
+        MockEnvironment smtp = new MockEnvironment().withProperty("spring.mail.host", "smtp-relay.brevo.com")
+                .withProperty("app.mail.transport", "smtp");
+
+        assertThat(EnvironmentFingerprintGuard.mailKind(api)).isEqualTo("brevo-api");
+        assertThat(EnvironmentFingerprintGuard.mailKind(smtp)).isEqualTo("brevo");
+    }
+
+    @Test
+    @DisplayName("Phase 374 — an unknown app.mail.transport value fails the guard instead of silently meaning smtp")
+    void should_fail_when_transportValueUnknown() {
+        MockEnvironment env = prodEnv().withProperty("app.mail.transport", "bogus");
+
+        assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                .isInstanceOf(org.springframework.boot.context.properties.bind.BindException.class);
+    }
+
     @Test
     @DisplayName("sentryState: on only with enabled + DSN; never returns the DSN")
     void should_reportSentryState_when_banner() {
