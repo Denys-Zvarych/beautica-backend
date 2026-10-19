@@ -91,4 +91,11 @@ public interface PhoneOtpRepository extends JpaRepository<PhoneOtp, Long> {
     @Modifying
     @Query("DELETE FROM PhoneOtp o WHERE o.expiresAt < :cutoff")
     int deleteByExpiresAtBefore(@Param("cutoff") Instant cutoff);
+
+    /**
+     * Phase 373 D9 — hard-deletes every OTP row of one E.164 phone (internal guest-PII erase).
+     */
+    @Modifying
+    @Query("DELETE FROM PhoneOtp o WHERE o.phone = :phone")
+    int deleteByPhone(@Param("phone") String phone);
 }

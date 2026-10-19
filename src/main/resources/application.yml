@@ -470,6 +470,17 @@ app:
     # flood guard (see RateLimitConfig#inviteCapacity). Local seeding raises it via
     # scripts/start-backend.sh (APP_RATE_LIMIT_INVITE_CAPACITY); prod keeps 15.
     invite-capacity: 15
+  # Phase 373 — guest/walk-in PII retention. GuestPiiRetentionJob anonymises guest_name/surname/
+  # phone, guest notes and cancel_token of client-less LINK/STAFF bookings + visit headers this many
+  # calendar months after ends_at. retention-months is validated >= 12 (privacy policy promise).
+  # No env var: defaults are the production values.
+  guest-pii-retention:
+    enabled: true
+    # Staggered from the 03:00 / 03:17 / 03:42 / 03:57 UTC cleanup cluster.
+    cron: "0 27 3 * * *"
+    retention-months: 12
+    batch-size: 500
+    max-batches-per-run: 200
   outbox:
     # Base64-encoded 32-byte (AES-256) symmetric key for OutboxPayloadCipher.
     # Generate with: openssl rand -base64 32

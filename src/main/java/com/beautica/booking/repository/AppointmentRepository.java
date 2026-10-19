@@ -1,6 +1,7 @@
 package com.beautica.booking.repository;
 
 import com.beautica.booking.entity.Appointment;
+import java.time.OffsetDateTime;
 import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
@@ -410,4 +411,207 @@ public interface AppointmentRepository extends JpaRepository<Appointment, UUID> 
             @Param("target") String target,
             @Param("reason") String reason,
             @Param("note") String note);
+
+    // ── Guest-PII retention / erase (phase 373) ───────────────────────────────
+    /**
+     * Retention-job header claim, step 1 (phase 373 D3/D6, audit-fix cycle 1): anonymises the visit
+     * headers of the booking rows the SAME batch transaction just anonymised
+     * ({@code BookingRepository#anonymiseDueGuestBookings}), once NO child of the header is left
+     * un-anonymised. Same field treatment and {@code FOR UPDATE SKIP LOCKED} claim shape.
+     *
+     * <p>{@code = ANY (ARRAY(subquery))} on purpose (audit-fix cycle 2): the ARRAY subquery is an
+     * InitPlan evaluated once over {@code bookings_pkey}, and its result becomes an
+     * {@code Index Cond} on {@code appointments_pkey}. A plain {@code IN (subquery)} let the planner
+     * pick a merge semi join that walks the whole open-header index in id order.
+     *
+     * <p>A header whose last two children were claimed by two concurrent instances can be missed by
+     * both (each still sees the other's child as un-anonymised); {@link #anonymiseLeftoverGuestAppointments}
+     * picks it up.
+     *
+     * @param bookingIds the booking ids returned by this batch's booking claim (non-empty, ≤ batch size)
+     */
+    @Modifying
+    @Query(value = """
+            UPDATE appointments a
+               SET guest_name = :sentinel,
+                   guest_surname = NULL,
+                   guest_phone = NULL,
+                   client_comment = NULL,
+                   client_cancellation_note = NULL,
+                   cancel_token = NULL,
+                   guest_pii_anonymised_at = now(),
+                   updated_at = now()
+             WHERE a.id IN (
+                   SELECT x.id FROM appointments x
+                    WHERE x.id = ANY (ARRAY(
+                          SELECT cb.appointment_id FROM bookings cb
+                           WHERE cb.id IN (:bookingIds)
+                             AND cb.appointment_id IS NOT NULL))
+                      AND x.client_id IS NULL
+                      AND x.guest_pii_anonymised_at IS NULL
+                      AND x.client_detached_at IS NULL
+                      AND x.booking_source IN ('LINK', 'STAFF')
+                      AND NOT EXISTS (
+                          SELECT 1 FROM bookings b
+                           WHERE b.appointment_id = x.id
+                             AND b.guest_pii_anonymised_at IS NULL)
+                    FOR UPDATE SKIP LOCKED)
+            RETURNING a.id
+            """, nativeQuery = true)
+    List<UUID> anonymiseGuestAppointmentsOfBookings(
+            @Param("bookingIds") Collection<UUID> bookingIds,
+            @Param("sentinel") String sentinel);
+
+    /**
+     * Retention-job header claim, step 2 — ended-visit sweep (phase 373 audit-fix cycle 2). A header
+     * is due once it HAS children, NONE of them ends at or after the cutoff, and all of them are
+     * anonymised — independent of the header's own {@code created_at}, so a late-recorded past visit
+     * is not kept beyond {@code ends_at} + 12 months when step 1 missed its header in a race.
+     * Candidates are driven from items anonymised since {@code recentSince} through the partial index
+     * {@code idx_bookings_guest_pii_anonymised_visit} — never a scan of every open header.
+     */
+    @Modifying
+    @Query(value = """
+            UPDATE appointments a
+               SET guest_name = :sentinel,
+                   guest_surname = NULL,
+                   guest_phone = NULL,
+                   client_comment = NULL,
+                   client_cancellation_note = NULL,
+                   cancel_token = NULL,
+                   guest_pii_anonymised_at = now(),
+                   updated_at = now()
+             WHERE a.id IN (
+                   SELECT x.id FROM appointments x
+                    WHERE x.id IN (
+                          SELECT r.appointment_id FROM bookings r
+                           WHERE r.appointment_id IS NOT NULL
+                             AND r.guest_pii_anonymised_at IS NOT NULL
+                             AND r.guest_pii_anonymised_at >= :recentSince)
+                      AND x.client_id IS NULL
+                      AND x.guest_pii_anonymised_at IS NULL
+                      AND x.client_detached_at IS NULL
+                      AND x.booking_source IN ('LINK', 'STAFF')
+                      AND NOT EXISTS (
+                          SELECT 1 FROM bookings b
+                           WHERE b.appointment_id = x.id
+                             AND (b.ends_at >= :cutoff OR b.guest_pii_anonymised_at IS NULL))
+                    ORDER BY x.id
+                    LIMIT :batchSize
+                    FOR UPDATE SKIP LOCKED)
+            RETURNING a.id
+            """, nativeQuery = true)
+    List<UUID> anonymiseEndedGuestAppointments(
+            @Param("cutoff") OffsetDateTime cutoff,
+            @Param("recentSince") OffsetDateTime recentSince,
+            @Param("sentinel") String sentinel,
+            @Param("batchSize") int batchSize);
+
+    /**
+     * Retention-job header claim, step 3 — the bounded leftover sweep (phase 373, audit-fix cycle 1).
+     * Catches a child-less (orphan) header — due by its OWN age, {@code created_at < cutoff}, so a
+     * fresh child-less header is NOT anonymised early — and, as a backstop, any old header whose
+     * children are all anonymised but which steps 1 and 2 missed. Rides the partial
+     * index {@code idx_appointments_guest_pii_due (created_at)}, whose predicate matches this WHERE.
+     */
+    @Modifying
+    @Query(value = """
+            UPDATE appointments a
+               SET guest_name = :sentinel,
+                   guest_surname = NULL,
+                   guest_phone = NULL,
+                   client_comment = NULL,
+                   client_cancellation_note = NULL,
+                   cancel_token = NULL,
+                   guest_pii_anonymised_at = now(),
+                   updated_at = now()
+             WHERE a.id IN (
+                   SELECT x.id FROM appointments x
+                    WHERE x.client_id IS NULL
+                      AND x.guest_pii_anonymised_at IS NULL
+                      AND x.client_detached_at IS NULL
+                      AND x.created_at < :cutoff
+                      AND x.booking_source IN ('LINK', 'STAFF')
+                      AND NOT EXISTS (
+                          SELECT 1 FROM bookings b
+                           WHERE b.appointment_id = x.id
+                             AND b.guest_pii_anonymised_at IS NULL)
+                    ORDER BY x.created_at
+                    LIMIT :batchSize
+                    FOR UPDATE SKIP LOCKED)
+            RETURNING a.id
+            """, nativeQuery = true)
+    List<UUID> anonymiseLeftoverGuestAppointments(
+            @Param("cutoff") OffsetDateTime cutoff,
+            @Param("sentinel") String sentinel,
+            @Param("batchSize") int batchSize);
+
+    /**
+     * Internal erase path (phase 373 D9): anonymises every not-yet-anonymised guest/walk-in visit
+     * header of one E.164 phone, ignoring age.
+     */
+    @Modifying
+    @Query(value = """
+            UPDATE appointments
+               SET guest_name = :sentinel,
+                   guest_surname = NULL,
+                   guest_phone = NULL,
+                   client_comment = NULL,
+                   client_cancellation_note = NULL,
+                   cancel_token = NULL,
+                   guest_pii_anonymised_at = now(),
+                   updated_at = now()
+             WHERE guest_phone = :phone
+               AND client_id IS NULL
+               AND guest_pii_anonymised_at IS NULL
+               AND client_detached_at IS NULL
+               AND booking_source IN ('LINK', 'STAFF')
+            RETURNING id
+            """, nativeQuery = true)
+    List<UUID> anonymiseGuestAppointmentsByPhone(
+            @Param("phone") String phone,
+            @Param("sentinel") String sentinel);
+
+    /**
+     * Locks (id order) the phone's upcoming guest/walk-in visit headers: header {@code CONFIRMED} and
+     * at least one {@code CONFIRMED} item not yet ended (phase 373 D12 step 2). See
+     * {@code BookingRepository#lockUpcomingGuestSingleBookingIdsByPhone} for the race rationale.
+     */
+    @Query(value = """
+            SELECT a.id FROM appointments a
+             WHERE a.guest_phone = :phone
+               AND a.client_id IS NULL
+               AND a.guest_pii_anonymised_at IS NULL
+               AND a.client_detached_at IS NULL
+               AND a.booking_source IN ('LINK', 'STAFF')
+               AND a.status = 'CONFIRMED'
+               AND EXISTS (
+                   SELECT 1 FROM bookings b
+                    WHERE b.appointment_id = a.id
+                      AND b.status = 'CONFIRMED'
+                      AND b.ends_at > :now)
+             ORDER BY a.id
+             FOR UPDATE OF a
+            """, nativeQuery = true)
+    List<UUID> lockUpcomingGuestVisitIdsByPhone(
+            @Param("phone") String phone,
+            @Param("now") OffsetDateTime now);
+
+    /**
+     * Tokenless counterpart of {@link #consumeCancelToken} for a STAFF walk-in visit header (phase 373
+     * D12): same status flip and reason, guarded on {@code CONFIRMED} and account-less, and stamps
+     * {@code updated_at} (D12). Returns 0 when a concurrent cancel already won.
+     */
+    @Modifying
+    @Query(value = """
+            UPDATE appointments
+               SET status = 'CANCELLED',
+                   cancellation_reason = 'CLIENT_CANCELLED',
+                   cancel_token = NULL,
+                   updated_at = now()
+             WHERE id = :id
+               AND status = 'CONFIRMED'
+               AND client_id IS NULL
+            """, nativeQuery = true)
+    int cancelGuestVisitById(@Param("id") UUID id);
 }

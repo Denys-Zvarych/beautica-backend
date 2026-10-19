@@ -16,6 +16,7 @@ import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.service.service.SalonCatalogCacheEvictor;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
@@ -126,11 +127,43 @@ public class BookingCancellationService {
                             .formatted(smsProperties.getCancelWindowHours()));
         }
 
-        // Atomic one-time consume: only the winner of any concurrent race updates 1 row.
-        int updated = bookingRepository.consumeCancelToken(token);
-        if (updated == 0) {
+        if (!cancelValidated(booking, token, true)) {
             // Lost the race or already consumed between load and update — no side-effects.
             throw new NotFoundException("Cancel token not found");
+        }
+    }
+
+    /**
+     * Cancels one already-validated guest/walk-in single booking and fires the provider
+     * notifications — everything {@link #cancel(UUID)} does after its token lookup and 2-hour
+     * check (phase 373 D12 seam, extracted without behaviour change). Also called by the internal
+     * guest-PII erase, which bypasses the 2-hour window on purpose and passes
+     * {@code sendGuestSms = false}.
+     *
+     * <p>A row with a cancel token is consumed via {@link BookingRepository#consumeCancelToken};
+     * a tokenless STAFF walk-in row via {@link BookingRepository#cancelGuestRowById}. Both are
+     * conditional UPDATEs: when 0 rows match (a concurrent cancel already won) nothing else runs.
+     *
+     * <p>Must run inside the caller's transaction ({@code MANDATORY}) — the outbox row is written
+     * in it.
+     *
+     * @param booking      the graph-loaded {@code CONFIRMED} booking
+     * @param sendGuestSms whether the after-commit guest cancellation SMS is sent; cache eviction
+     *                     runs after commit either way
+     * @return {@code true} when this call cancelled the booking, {@code false} on a lost race
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public boolean cancelGuestBooking(Booking booking, boolean sendGuestSms) {
+        return cancelValidated(booking, booking.getCancelToken(), sendGuestSms);
+    }
+
+    private boolean cancelValidated(Booking booking, UUID token, boolean sendGuestSms) {
+        // Atomic one-time consume: only the winner of any concurrent race updates 1 row.
+        int updated = token != null
+                ? bookingRepository.consumeCancelToken(token)
+                : bookingRepository.cancelGuestRowById(booking.getId());
+        if (updated == 0) {
+            return false;
         }
 
         // Master notification: outbox row written INSIDE this transaction (MANDATORY
@@ -138,14 +171,15 @@ public class BookingCancellationService {
         // existing CLIENT_CANCELLED event — the same one the authenticated cancel path uses.
         outboxService.enqueueClientCancelled(booking.getId());
         // Phase 333, matrix row 2 — provider set; no actor (guest, no user account). `booking` is
-        // the same full-graph instance loadCancellableOrThrow loaded above — never reloaded
+        // the same full-graph instance the caller loaded — never reloaded
         // (audit-fix cycle 1, finding 1).
         inAppNotificationService.notifyBookingEvent(
                 InAppNotificationType.BOOKING_CANCELLED_BY_CLIENT, booking, null);
 
         // Guest cancellation SMS dispatched only after commit — a rolled-back cancel
         // sends nothing.
-        registerAfterCommitSms(booking);
+        registerAfterCommitSms(booking, sendGuestSms);
+        return true;
     }
 
     // ── internals ──────────────────────────────────────────────────────────────
@@ -177,9 +211,11 @@ public class BookingCancellationService {
                 windowClosesAt);
     }
 
-    private void registerAfterCommitSms(Booking booking) {
-        String phone = booking.getGuestPhone();
-        String smsText = buildCancellationSms(booking);
+    private void registerAfterCommitSms(Booking booking, boolean sendGuestSms) {
+        // Phase 373: when the guest asked to be erased, neither the phone nor the text is captured
+        // for after-commit use — the eviction below still runs.
+        String phone = sendGuestSms ? booking.getGuestPhone() : null;
+        String smsText = sendGuestSms ? buildCancellationSms(booking) : null;
         UUID masterId = booking.getMaster().getId();
         UUID salonId = booking.getSalon() != null ? booking.getSalon().getId() : null;
         Runnable task = () -> {
@@ -198,8 +234,10 @@ public class BookingCancellationService {
             if (salonId != null) {
                 salonCatalogCacheEvictor.evict(salonId);
             }
-            bookingSmsDispatcher.dispatch(
-                    BookingSmsDispatcher.Kind.GUEST_CANCELLATION, phone, smsText);
+            if (sendGuestSms) {
+                bookingSmsDispatcher.dispatch(
+                        BookingSmsDispatcher.Kind.GUEST_CANCELLATION, phone, smsText);
+            }
         };
         if (TransactionSynchronizationManager.isSynchronizationActive()) {
             TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
