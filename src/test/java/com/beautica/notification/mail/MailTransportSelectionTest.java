@@ -95,4 +95,31 @@ class MailTransportSelectionTest {
                 .run(ctx -> assertThat(ctx).hasFailed().getFailure().rootCause()
                         .hasMessageContaining("app.mail.logo-url"));
     }
+
+    @Test
+    @DisplayName("audit — Boot's RestClient customizers (e.g. Sentry's interceptor, which buffers bodies) are NOT applied to the Brevo client")
+    void should_ignoreRestClientCustomizers_when_buildingBrevoApiSender() {
+        new ApplicationContextRunner()
+                .withConfiguration(AutoConfigurations.of(MailSenderAutoConfiguration.class,
+                        org.springframework.boot.autoconfigure.web.client.RestClientAutoConfiguration.class))
+                .withUserConfiguration(Wiring.class)
+                .withBean(org.springframework.boot.web.client.RestClientCustomizer.class,
+                        () -> builder -> builder.requestInterceptor((req, body, exec) -> {
+                            throw new IllegalStateException("customizer interceptor ran");
+                        }))
+                .withPropertyValues("app.mail.transport=brevo-api", "app.mail.brevo-api.api-key=xkeysib-x",
+                        "app.mail.logo-url=https://beautica.app/email/logo.png",
+                        "app.mail.brevo-api.base-url=http://127.0.0.1:1", "app.mail.brevo-api.connect-timeout=500ms")
+                .run(ctx -> {
+                    org.springframework.mail.SimpleMailMessage mail = new org.springframework.mail.SimpleMailMessage();
+                    mail.setFrom("noreply@beautica.app");
+                    mail.setTo("x@example.com");
+                    mail.setSubject("s");
+                    mail.setText("t");
+
+                    org.assertj.core.api.Assertions.assertThatThrownBy(() -> ctx.getBean(JavaMailSender.class).send(mail))
+                            .as("connection refused (transient) proves the request reached the network, not the interceptor")
+                            .isInstanceOf(BrevoTransientMailException.class);
+                });
+    }
 }

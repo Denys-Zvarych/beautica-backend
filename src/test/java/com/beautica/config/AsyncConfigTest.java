@@ -877,6 +877,25 @@ class AsyncConfigTest {
             assertThat(AsyncConfig.BLOB_PURGE_SHUTDOWN_GRACE_SECONDS).isEqualTo(10);
         }
 
+        @Test
+        @DisplayName("Phase 374 — supportEmailTaskPool grace covers one attachment-bearing Brevo API send "
+                + "(connect + send-with-attachments read timeout, from the production yml)")
+        void should_coverAttachmentSendBudget_when_supportEmailGraceCompared() {
+            new org.springframework.boot.test.context.runner.ApplicationContextRunner()
+                    .withInitializer(new org.springframework.boot.test.context.ConfigDataApplicationContextInitializer())
+                    .withUserConfiguration(com.beautica.notification.mail.MailTransportConfig.class)
+                    .run(ctx -> {
+                        var brevo = ctx.getBean(com.beautica.notification.mail.BrevoApiProperties.class);
+                        long sendBudget = brevo.connectTimeout().plus(brevo.sendWithAttachmentsReadTimeout())
+                                .toSeconds();
+
+                        assertThat(AsyncConfig.SUPPORT_EMAIL_SHUTDOWN_GRACE_SECONDS)
+                                .as("a shorter grace cuts an in-flight support mail at shutdown (no outbox -> lost)")
+                                .isGreaterThan((int) sendBudget)
+                                .isEqualTo(35);
+                    });
+        }
+
         @AfterEach
         void shutdownBean() {
             bean.getThreadPoolExecutor().shutdownNow();

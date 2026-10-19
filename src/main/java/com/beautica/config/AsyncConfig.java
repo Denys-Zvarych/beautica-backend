@@ -27,15 +27,15 @@ import org.springframework.security.task.DelegatingSecurityContextTaskExecutor;
 /**
  * Async executors and their shutdown budget.
  *
- * <h4>Shutdown budget — sequential worst case ~170 s</h4>
+ * <h4>Shutdown budget — sequential worst case ~185 s</h4>
  * <p>Each pool drains in its own {@code destroy()}, and Spring runs those calls SEQUENTIALLY, so the
  * worst case is the SUM of every {@code awaitTerminationSeconds} (an idle pool returns at once; the sum
- * is reached only when every pool is still busy): 30+20+20+20+30+30+10+10 = 170 s.
+ * is reached only when every pool is still busy): 30+20+35+20+30+30+10+10 = 185 s.
  *
  * <p><b>The deploy platform's SIGTERM→SIGKILL window must be at least this worst case.</b> A shorter
  * window kills the JVM mid-drain, losing the non-recoverable work below AND the abandonment report. On
- * Railway set {@code RAILWAY_DEPLOYMENT_DRAINING_SECONDS} (&ge; 170) accordingly; the repo carries no such
- * configuration. The push pool must drain before {@code FirebaseConfig} is destroyed
+ * Railway this is {@code deploy.drainingSeconds} in {@code railway.json} (&ge; this sum + the scheduler grace +
+ * 2 lifecycle phases + margin; pinned by {@code RailwayConfigTest}). The push pool must drain before {@code FirebaseConfig} is destroyed
  * ({@code @DependsOn}, see {@code AsyncConfigShutdownOrderingTest}).
  *
  * <pre>
@@ -45,7 +45,9 @@ import org.springframework.security.task.DelegatingSecurityContextTaskExecutor;
  *                                    but nothing is lost from the feed. Drains BEFORE FirebaseConfig.destroy().
  * emailTaskPool                20 s  auth/password-reset OTP mails (user re-requests) and ops admin
  *                                    notifications (fire-and-forget). NOT outbox-backed -> cut = lost.
- * supportEmailTaskPool         20 s  Help/Contact mails. NOT outbox-backed -> cut = lost (user can resend).
+ * supportEmailTaskPool         35 s  Help/Contact mails. NOT outbox-backed -> cut = lost (user can resend).
+ *                                    &ge; one in-flight Brevo API send WITH attachments (connect 3 s + the
+ *                                    30 s send-with-attachments read budget, Phase 374) + margin.
  * smsSendExecutor              20 s  walk-in booking confirmation SMS. NOT recoverable (mildest loss).
  * smsReminderDispatchExecutor  30 s  one hand-off task per hourly batch; cut = whole batch un-fanned-out.
  *                                    NOT recoverable (reminderSent already committed); reported at ERROR.
@@ -55,7 +57,7 @@ import org.springframework.security.task.DelegatingSecurityContextTaskExecutor;
  * blobPurgeExecutor            10 s  after-commit R2 deletes of already-dereferenced blobs; cut = accepted
  *                                    orphan blob (never a dangling pointer), same policy as a failed delete;
  *                                    reported at WARN with task + key counts.
- * total (sequential worst)    170 s
+ * total (sequential worst)    185 s
  * </pre>
  * Outbox-driven work (invite/booking email, push fan-out) is re-queued by the outbox drain worker on the
  * next boot unless the hand-off was already accepted (push: see
@@ -68,7 +70,8 @@ public class AsyncConfig implements AsyncConfigurer {
     private static final Logger log = LoggerFactory.getLogger(AsyncConfig.class);
 
     static final int EMAIL_SHUTDOWN_GRACE_SECONDS = 20;
-    static final int SUPPORT_EMAIL_SHUTDOWN_GRACE_SECONDS = 20;
+    /** Phase 374: covers one attachment-bearing Brevo API send (connect 3 s + read 30 s) plus margin. */
+    static final int SUPPORT_EMAIL_SHUTDOWN_GRACE_SECONDS = 35;
     static final int PUSH_SHUTDOWN_GRACE_SECONDS = 30;
     static final int SMS_SEND_SHUTDOWN_GRACE_SECONDS = 20;
     static final int CACHE_EVICTION_SHUTDOWN_GRACE_SECONDS = 10;

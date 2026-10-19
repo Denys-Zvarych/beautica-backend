@@ -47,8 +47,7 @@ class EnvironmentBannerRunnerTest {
         StubApiProbe(Result result) {
             super(new com.beautica.notification.mail.BrevoApiProperties("http://127.0.0.1:9", "",
                     java.time.Duration.ofSeconds(1), java.time.Duration.ofSeconds(1), "Beautica", java.time.Duration.ofSeconds(30)),
-                    new org.springframework.beans.factory.support.StaticListableBeanFactory()
-                            .getBeanProvider(org.springframework.web.client.RestClient.Builder.class));
+                    org.springframework.web.client.RestClient.builder());
             this.result = result;
         }
 

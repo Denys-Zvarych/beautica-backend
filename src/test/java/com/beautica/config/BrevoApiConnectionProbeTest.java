@@ -8,7 +8,6 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.extension.ExtendWith;
-import org.springframework.beans.factory.support.StaticListableBeanFactory;
 import org.springframework.boot.test.system.CapturedOutput;
 import org.springframework.boot.test.system.OutputCaptureExtension;
 import org.springframework.web.client.RestClient;
@@ -48,8 +47,7 @@ class BrevoApiConnectionProbeTest {
     private BrevoApiConnectionProbe probe(String key) {
         BrevoApiProperties props = new BrevoApiProperties(wireMock.baseUrl(), key, Duration.ofSeconds(3),
                 Duration.ofSeconds(10), "Beautica", java.time.Duration.ofSeconds(30));
-        return new BrevoApiConnectionProbe(props,
-                new StaticListableBeanFactory().getBeanProvider(RestClient.Builder.class));
+        return new BrevoApiConnectionProbe(props, RestClient.builder());
     }
 
     private void stub(int status) {
@@ -114,13 +112,11 @@ class BrevoApiConnectionProbeTest {
     void should_returnUnreachable_when_cancellationException(CapturedOutput output) {
         BrevoApiProperties props = new BrevoApiProperties(wireMock.baseUrl(), API_KEY, Duration.ofSeconds(3),
                 Duration.ofSeconds(10), "Beautica", java.time.Duration.ofSeconds(30));
-        StaticListableBeanFactory factory = new StaticListableBeanFactory();
-        factory.addBean("builder", RestClient.builder().requestInterceptor((req, body, exec) -> {
+        RestClient.Builder cancelling = RestClient.builder().requestInterceptor((req, body, exec) -> {
             throw new java.util.concurrent.CancellationException("cancelled");
-        }));
+        });
 
-        BrevoApiConnectionProbe.Result result =
-                new BrevoApiConnectionProbe(props, factory.getBeanProvider(RestClient.Builder.class)).result();
+        BrevoApiConnectionProbe.Result result = new BrevoApiConnectionProbe(props, cancelling).result();
 
         assertThat(result).isEqualTo(BrevoApiConnectionProbe.Result.UNREACHABLE);
         assertThat(output.getAll()).contains("rule prod-brevo-api-unreachable").contains("CancellationException");

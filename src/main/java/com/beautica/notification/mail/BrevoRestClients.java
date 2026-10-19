@@ -1,6 +1,8 @@
 package com.beautica.notification.mail;
 
 import com.beautica.config.OutboundTimeouts;
+import io.micrometer.observation.ObservationRegistry;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.http.client.JdkClientHttpRequestFactory;
 import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestClient;
@@ -22,6 +24,20 @@ public final class BrevoRestClients {
     }
 
     /**
+     * A builder WITHOUT Boot's {@code RestClientCustomizer}s, carrying only the observation registry (HTTP client
+     * metrics). Deliberate (Phase 374 audit): in prod Sentry's {@code SentrySpanRestClientCustomizer} adds a
+     * {@code ClientHttpRequestInterceptor} to Boot's shared builder, and ANY interceptor switches RestClient to
+     * {@code InterceptingClientHttpRequest}, which buffers the whole request body in memory — a 5 MB support
+     * attachment (~6.7 MB base64) would be held a second time. It would also forward {@code sentry-trace}/{@code
+     * baggage} headers to a third party. Jackson uses Spring's default converters (no app-specific mapper is needed
+     * for these DTOs).
+     */
+    public static RestClient.Builder cleanBuilder(ObjectProvider<ObservationRegistry> observationRegistry) {
+        return RestClient.builder()
+                .observationRegistry(observationRegistry.getIfAvailable(() -> ObservationRegistry.NOOP));
+    }
+
+    /**
      * One JDK client per caller (sender: long-lived; probe: closed after its single call). Connect timeout validated.
      */
     public static HttpClient httpClient(String connectProperty, Duration connect) {
@@ -33,7 +49,7 @@ public final class BrevoRestClients {
     }
 
     /**
-     * @param builder      Boot's prototype builder (observability), cloned so the caller's instance is untouched
+     * @param builder      normally {@link #cleanBuilder}; cloned so the caller's instance is untouched
      * @param httpClient   from {@link #httpClient}; several RestClients may share one (same pool, different budgets)
      * @param readProperty config key named in the failure message when {@code read} is not positive
      */

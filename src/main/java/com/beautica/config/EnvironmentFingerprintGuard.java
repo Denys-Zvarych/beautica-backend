@@ -344,6 +344,20 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
         }
     }
 
+    /**
+     * The value the {@code @ConfigurationProperties} bean will actually bind (Phase 374 audit): {@link Binder} applies
+     * relaxed binding, so an env-var spelling such as {@code APP_MAIL_BREVOAPI_BASEURL} — which
+     * {@link Environment#getProperty} does not map back to {@code app.mail.brevo-api.base-url} — is seen here too.
+     * An unbound value or an unresolvable placeholder counts as unset.
+     */
+    private static String boundOrNull(Environment env, String property) {
+        try {
+            return Binder.get(env).bind(property, String.class).orElse(null);
+        } catch (org.springframework.boot.context.properties.bind.BindException e) {
+            return null;
+        }
+    }
+
     /** An unresolvable placeholder (no default, env var absent) counts as unset. */
     private static String readOrNull(Environment env, String property) {
         try {
@@ -471,12 +485,12 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
         }
         // The key is sent to this origin on every request: only the real Brevo API may receive it in prod. The
         // override exists for WireMock outside prod. Unset resolves to the binding default (the Brevo origin).
-        String baseUrl = readOrNull(env, BREVO_API_BASE_URL_PROPERTY);
+        String baseUrl = boundOrNull(env, BREVO_API_BASE_URL_PROPERTY);
         if (baseUrl != null && !BREVO_API_ORIGIN.equals(baseUrl)) {
             violations.add("rule prod-brevo-api-base-url: " + BREVO_API_BASE_URL_PROPERTY + " must be exactly "
                     + BREVO_API_ORIGIN + " in prod");
         }
-        String logoUrl = readOrNull(env, LOGO_URL_PROPERTY);
+        String logoUrl = boundOrNull(env, LOGO_URL_PROPERTY);
         if (logoUrl == null || !logoUrl.startsWith(PROD_LOGO_URL_PREFIX)) {
             violations.add("rule prod-mail-logo-url: " + LOGO_URL_PROPERTY + " must start with "
                     + PROD_LOGO_URL_PREFIX + " in prod");
@@ -485,7 +499,7 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
 
     /** {@code true} when the effective Brevo API key is blank or the {@value #BREVO_PENDING} placeholder. */
     static boolean brevoApiKeyPending(Environment env) {
-        return isBrevoPlaceholder(readOrNull(env, BREVO_API_KEY_PROPERTY));
+        return isBrevoPlaceholder(boundOrNull(env, BREVO_API_KEY_PROPERTY));
     }
 
     /** Phase 374 D2: the transport, resolved by the same rule as the bean condition. */

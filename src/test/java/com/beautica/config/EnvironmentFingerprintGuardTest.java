@@ -866,6 +866,28 @@ class EnvironmentFingerprintGuardTest {
     }
 
     @Test
+    @DisplayName("Phase 374 audit — prod-brevo-api-base-url: a relaxed env-var spelling (APP_MAIL_BREVOAPI_BASEURL) "
+            + "that getProperty would miss is still caught, because the guard reads what the bean binds")
+    void should_failProdBoot_when_baseUrlOverriddenViaEnvVarSpelling() {
+        MockEnvironment env = prodEnv();
+        ((java.util.Map<?, ?>) env.getPropertySources().get(
+                org.springframework.mock.env.MockPropertySource.MOCK_PROPERTIES_PROPERTY_SOURCE_NAME).getSource())
+                .remove("app.mail.brevo-api.base-url");
+        env.getPropertySources().addFirst(new org.springframework.core.env.SystemEnvironmentPropertySource(
+                org.springframework.core.env.StandardEnvironment.SYSTEM_ENVIRONMENT_PROPERTY_SOURCE_NAME,
+                java.util.Map.of("APP_MAIL_BREVOAPI_BASEURL", "https://brevo-zq374.example.net")));
+        assertThat(env.getProperty("app.mail.brevo-api.base-url"))
+                .as("precondition: plain getProperty does not see this spelling").isNull();
+        assertThat(org.springframework.boot.context.properties.bind.Binder.get(env)
+                .bind("app.mail.brevo-api.base-url", String.class).orElse(null))
+                .as("precondition: the binder (what BrevoApiProperties gets) does").isEqualTo("https://brevo-zq374.example.net");
+
+        assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                .hasMessageContaining("rule prod-brevo-api-base-url")
+                .message().doesNotContain("brevo-zq374");
+    }
+
+    @Test
     @DisplayName("Phase 374 audit — prod-brevo-api-base-url: an unset base-url resolves to the Brevo default and passes")
     void should_pass_when_prodBrevoApiBaseUrlUnset() {
         MockEnvironment clean = prodEnv();

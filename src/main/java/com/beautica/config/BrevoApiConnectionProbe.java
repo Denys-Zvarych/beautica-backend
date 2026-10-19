@@ -3,7 +3,9 @@ package com.beautica.config;
 import com.beautica.notification.mail.BrevoApiProperties;
 import com.beautica.notification.mail.BrevoRestClients;
 import com.beautica.notification.mail.MailTransportCondition;
+import io.micrometer.observation.ObservationRegistry;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.context.annotation.Conditional;
 import org.springframework.http.HttpStatusCode;
@@ -35,10 +37,17 @@ public class BrevoApiConnectionProbe {
     public enum Result { OK, REJECTED, UNREACHABLE }
 
     private final BrevoApiProperties properties;
-    private final ObjectProvider<RestClient.Builder> builder;
+    private final RestClient.Builder builder;
     private Result cached;
 
-    public BrevoApiConnectionProbe(BrevoApiProperties properties, ObjectProvider<RestClient.Builder> builder) {
+    /** Uses a customizer-free builder (no Sentry interceptor / trace headers to a third party), see BrevoRestClients. */
+    @Autowired
+    public BrevoApiConnectionProbe(BrevoApiProperties properties, ObjectProvider<ObservationRegistry> observationRegistry) {
+        this(properties, BrevoRestClients.cleanBuilder(observationRegistry));
+    }
+
+    /** Test seam: an explicit builder (e.g. with a failure-injecting interceptor). */
+    BrevoApiConnectionProbe(BrevoApiProperties properties, RestClient.Builder builder) {
         this.properties = properties;
         this.builder = builder;
     }
@@ -59,7 +68,7 @@ public class BrevoApiConnectionProbe {
         // One-shot: the HTTP client lives only for this call and is closed afterwards (no idle pool/selector
         // thread kept for the application lifetime).
         try (HttpClient httpClient = BrevoRestClients.httpClient("brevo-api probe connect-timeout", PROBE_TIMEOUT)) {
-            RestClient restClient = BrevoRestClients.build(builder.getIfAvailable(RestClient::builder),
+            RestClient restClient = BrevoRestClients.build(builder,
                     properties.baseUrl(), httpClient, "brevo-api probe read-timeout", PROBE_TIMEOUT);
             HttpStatusCode status = restClient.get()
                     .uri(ACCOUNT_PATH)

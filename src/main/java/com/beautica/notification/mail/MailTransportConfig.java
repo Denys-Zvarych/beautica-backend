@@ -1,13 +1,13 @@
 package com.beautica.notification.mail;
 
 import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.observation.ObservationRegistry;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Conditional;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.mail.javamail.JavaMailSender;
-import org.springframework.web.client.RestClient;
 
 /**
  * Mail transport selection (Phase 374, D2). Exactly one {@link JavaMailSender} exists:
@@ -30,14 +30,13 @@ public class MailTransportConfig {
 
     @Bean
     @Conditional(MailTransportCondition.OnBrevoApi.class)
-    public JavaMailSender brevoApiMailSender(ObjectProvider<RestClient.Builder> restClientBuilder,
+    public JavaMailSender brevoApiMailSender(ObjectProvider<ObservationRegistry> observationRegistry,
                                              BrevoApiProperties properties, MailTransportProperties mailProperties,
                                              MeterRegistry meterRegistry) {
         if (!mailProperties.hostedLogo()) {
             throw new IllegalStateException(
                     "app.mail.logo-url must be an https URL when app.mail.transport is brevo-api (no inline CID parts)");
         }
-        return new BrevoApiMailSender(restClientBuilder.getIfAvailable(RestClient::builder), properties,
-                meterRegistry);
+        return new BrevoApiMailSender(BrevoRestClients.cleanBuilder(observationRegistry), properties, meterRegistry);
     }
 }
