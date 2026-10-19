@@ -694,6 +694,84 @@ class EmailNotificationServiceTest {
     }
 
     @Test
+    @DisplayName("Phase 374 D5 — BrevoPermanentMailException → NON-transient EmailDeliveryException (not counted by the breaker)")
+    void should_throwNonTransient_when_brevoPermanentFailure() {
+        when(mailSender.createMimeMessage()).thenReturn(new MimeMessage(Session.getInstance(new Properties())));
+        when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>invite</html>");
+        doThrow(new com.beautica.notification.mail.BrevoPermanentMailException("Brevo API HTTP 400 code=invalid_parameter"))
+                .when(mailSender).send(any(MimeMessage.class));
+
+        assertThatThrownBy(() ->
+                service.sendInviteEmail("fail@example.com", "https://beautica.app/invite/x", "Salon")
+        ).isInstanceOf(EmailDeliveryException.class)
+                .hasNoCause()
+                .hasMessageNotContaining("fail@example.com")
+                .satisfies(ex -> assertThat(((EmailDeliveryException) ex).isTransientSmtp()).isFalse());
+    }
+
+    @Test
+    @DisplayName("Phase 374 D5 — BrevoTransientMailException → transient EmailDeliveryException (feeds the breaker)")
+    void should_throwTransient_when_brevoTransientFailure() {
+        when(mailSender.createMimeMessage()).thenReturn(new MimeMessage(Session.getInstance(new Properties())));
+        when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>invite</html>");
+        doThrow(new com.beautica.notification.mail.BrevoTransientMailException("Brevo API HTTP 503 code=none"))
+                .when(mailSender).send(any(MimeMessage.class));
+
+        assertThatThrownBy(() ->
+                service.sendInviteEmail("fail@example.com", "https://beautica.app/invite/x", "Salon")
+        ).isInstanceOf(EmailDeliveryException.class)
+                .satisfies(ex -> assertThat(((EmailDeliveryException) ex).isTransientSmtp()).isTrue());
+    }
+
+    @Test
+    @DisplayName("Phase 374 D4 — logo-url set → logoSrc is the URL and NO inline part is attached (all three send paths)")
+    void should_useHostedLogoWithoutInlinePart_when_logoUrlSet() throws Exception {
+        String logoUrl = "https://beautica.app/email/logo.png";
+        EmailNotificationService hosted = new EmailNotificationService(mailSender, templateEngine, FROM_ADDRESS,
+                new com.beautica.notification.mail.MailTransportProperties(
+                        com.beautica.notification.mail.MailTransportKind.BREVO_API, logoUrl));
+        List<MimeMessage> sent = new java.util.ArrayList<>();
+        when(mailSender.createMimeMessage())
+                .thenAnswer(inv -> new MimeMessage(Session.getInstance(new Properties())));
+        ArgumentCaptor<IContext> ctx = ArgumentCaptor.forClass(IContext.class);
+        when(templateEngine.process(anyString(), ctx.capture())).thenReturn("<html>x</html>");
+        org.mockito.Mockito.doAnswer(inv -> sent.add(inv.getArgument(0))).when(mailSender).send(any(MimeMessage.class));
+        User user = mock(User.class);
+        when(user.getEmail()).thenReturn("u@example.com");
+
+        hosted.sendInviteEmail("m@example.com", "https://beautica.app/invite/t", "Salon");
+        hosted.sendPasswordResetOtpEmail(user, "123456");
+        hosted.sendVerificationEmail("v@example.com", "654321");
+
+        assertThat(ctx.getAllValues()).hasSize(3)
+                .allSatisfy(c -> assertThat(c.getVariable("logoSrc")).isEqualTo(logoUrl));
+        assertThat(sent).hasSize(3);
+        for (MimeMessage m : sent) {
+            m.saveChanges();
+            java.io.ByteArrayOutputStream raw = new java.io.ByteArrayOutputStream();
+            m.writeTo(raw);
+            assertThat(raw.toString()).doesNotContainIgnoringCase("Content-ID");
+        }
+    }
+
+    @Test
+    @DisplayName("Phase 374 D4 — default (no logo-url) → logoSrc is cid:beauticaLogo, inline part still attached")
+    void should_keepCidLogo_when_logoUrlBlank() throws Exception {
+        MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
+        when(mailSender.createMimeMessage()).thenReturn(realMessage);
+        ArgumentCaptor<IContext> ctx = ArgumentCaptor.forClass(IContext.class);
+        when(templateEngine.process(anyString(), ctx.capture())).thenReturn("<html>x</html>");
+
+        service.sendInviteEmail("m@example.com", "https://beautica.app/invite/t", "Salon");
+
+        assertThat(ctx.getValue().getVariable("logoSrc")).isEqualTo("cid:beauticaLogo");
+        realMessage.saveChanges();
+        java.io.ByteArrayOutputStream raw = new java.io.ByteArrayOutputStream();
+        realMessage.writeTo(raw);
+        assertThat(raw.toString()).contains("Content-ID: <beauticaLogo>");
+    }
+
+    @Test
     @DisplayName("should throw a NON-transient EmailDeliveryException when the template engine fails to render")
     void should_throwNonTransientEmailDeliveryException_when_templateRenderFails() {
         when(templateEngine.process(anyString(), any(IContext.class)))

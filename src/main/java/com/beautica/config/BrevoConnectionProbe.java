@@ -1,8 +1,10 @@
 package com.beautica.config;
 
+import com.beautica.notification.mail.MailTransportCondition;
 import jakarta.mail.MessagingException;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.context.annotation.Conditional;
 import org.springframework.mail.MailSender;
 import org.springframework.mail.javamail.JavaMailSenderImpl;
 import org.springframework.stereotype.Component;
@@ -25,9 +27,13 @@ import java.util.concurrent.TimeoutException;
  * logs its own outcome when it finishes. Never fatal: a Brevo outage must not take the API down.
  *
  * <p>Logs the exception class only — SMTP error text can echo the login.
+ *
+ * <p>SMTP transport only (Phase 374): with {@code app.mail.transport=brevo-api} this bean does not exist and
+ * {@link BrevoApiConnectionProbe} takes over.
  */
 @Slf4j
 @Component
+@Conditional(MailTransportCondition.OnSmtp.class)
 public class BrevoConnectionProbe {
 
     static final Duration WAIT = Duration.ofSeconds(3);

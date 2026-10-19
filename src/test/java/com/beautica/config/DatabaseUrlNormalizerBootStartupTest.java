@@ -41,7 +41,9 @@ class DatabaseUrlNormalizerBootStartupTest {
                         "INTERNAL_API_KEY=" + TestSecrets.INTERNAL_API_KEY,
                         // Phase 367 prod required-env rules.
                         "SENTRY_DSN=https://0123456789abcdef@o42.ingest.de.sentry.io/4500000000000001",
-                        "TURBOSMS_TOKEN=turbosms-fixture-token", "ADMIN_EMAIL=admin@beautica.ua");
+                        "TURBOSMS_TOKEN=turbosms-fixture-token", "ADMIN_EMAIL=admin@beautica.ua",
+                        // Phase 374 D8: prod sends over the Brevo HTTPS API and requires its key.
+                        "BREVO_API_KEY=xkeysib-fixture-api-key");
     }
 
     private static List<Throwable> chain(Throwable t) {

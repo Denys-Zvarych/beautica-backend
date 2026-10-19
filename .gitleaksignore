@@ -96,3 +96,4 @@ f7d5cf62c55b7a08ba8d71679777365aeec1a047:src/test/java/com/beautica/config/Outbo
 02c2a6e724ca6cd9950d1153f7c017fe5e265960:src/test/java/com/beautica/config/FirebaseConfigTest.java:private-key:210
 35e8d9d53bcd2b82c7103b15286faafa42521368:src/test/java/com/beautica/config/FirebaseLocalProfileContextTest.java:private-key:50
 35e8d9d53bcd2b82c7103b15286faafa42521368:src/test/java/com/beautica/config/FirebaseConfigTest.java:private-key:210
+1f0700c606b87a8feca9626b1e8c71575280d5d1:src/test/java/com/beautica/config/ProdRequiredEnvBootStartupTest.java:generic-api-key:198

@@ -36,8 +36,13 @@ public class SchedulingConfig {
      */
     private static final int SCHEDULER_POOL_SIZE = 4;
 
-    /** Counted in the Railway {@code drainingSeconds} budget (Phase 367 D3, enforced by {@code RailwayConfigTest}). */
-    static final int SCHEDULER_SHUTDOWN_GRACE_SECONDS = 20;
+    /**
+     * Counted in the Railway {@code drainingSeconds} budget (Phase 367 D3, enforced by {@code RailwayConfigTest}).
+     * 30 s (Phase 374): must exceed one in-flight outbox entry on the prod transport — Brevo API email (connect 3 s +
+     * read 10 s) + push (connect 5 s + read 10 s) ≈ 28 s. A shorter grace cuts that entry mid-dispatch; it is then
+     * reclaimed and re-sent on the next boot (a possible duplicate e-mail).
+     */
+    static final int SCHEDULER_SHUTDOWN_GRACE_SECONDS = 30;
 
     @Bean
     public TaskScheduler taskScheduler() {

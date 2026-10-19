@@ -158,15 +158,19 @@ public class NotificationOutboxDrainWorker {
      * See {@link EmailDeliveryException}.
      *
      * <p>Worst-case phase 2 duration: {@code BATCH_SIZE × per-entry dispatch worst-case}. Each
-     * {@code dispatch()} call makes ONE of two chains: (a) the common case — email (SMTP:
-     * connect 5s + read 10s + write 10s ≈ 25s, {@code application.yml} mail.smtp.*) followed by
-     * push ({@code FirebaseConfig}: connect 5s + read 10s ≈ 15s) — ≈ 40s; or (b) a guest-DECLINED
+     * {@code dispatch()} call makes ONE of two chains: (a) the common case — email followed by
+     * push ({@code FirebaseConfig}: connect 5s + read 10s ≈ 15s). The email leg depends on the
+     * transport (Phase 374): prod uses the Brevo HTTPS API ({@code app.mail.brevo-api}: connect 3s +
+     * read 10s ≈ 13s — outbox mails never carry attachments, so the 30s attachment budget does not
+     * apply), giving ≈ 28s per entry; local/staging use SMTP (connect 5s + read 10s + write 10s ≈ 25s,
+     * {@code mail.smtp.*}), giving ≈ 40s. Or (b) a guest-DECLINED
      * entry (Phase 25.7), which sends SMS INSTEAD of email/push ({@code TurbosmsService}: connect
      * 3s + read 5s ≈ 8s) — a third blocking-I/O call type on this same serial loop, but strictly
      * cheaper than chain (a), so it does not raise the batch-level bound. At
-     * {@code BATCH_SIZE = 50}: 50 × 40s = 2000s worst case — but zero DB connections are held
-     * during that time. {@link NotificationOutboxReclaimJob}'s stale-claim threshold (production
-     * default 60 min) is set with a comfortable margin over this ~33 min figure.
+     * {@code BATCH_SIZE = 50}: prod 50 × 28s = 1400s (~23 min), SMTP 50 × 40s = 2000s (~33 min) worst
+     * case — but zero DB connections are held during that time. {@link NotificationOutboxReclaimJob}'s
+     * stale-claim threshold (production default 60 min) is set with a comfortable margin over the larger
+     * ~33 min figure.
      *
      * <p><b>Test-isolation note (QA, track 25.x booking-enrichment audit, 2026-07-14).</b> The
      * period is property-driven ({@code notification.outbox.drain.fixed-delay-ms}, default

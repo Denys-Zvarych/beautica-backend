@@ -46,9 +46,8 @@ public class SupportService {
     /** Max bytes summed across all attachments (5 MB). */
     static final long MAX_TOTAL_BYTES = 5L * 1024L * 1024L;
     /**
-     * Minimum bytes needed to sniff a magic-byte signature. 16 bytes is required so the
-     * WebP VP8 chunk fourCC at offset 12..15 can be asserted (a bare RIFF+WEBP container
-     * header is only 12 bytes — see {@link #detectContentType(byte[])}).
+     * Minimum bytes needed to sniff a magic-byte signature. Kept at 16 (it dates from the
+     * WebP VP8 fourCC check) so the "too small or corrupt" boundary is unchanged.
      */
     private static final int MIN_SNIFF_BYTES = 16;
 
@@ -184,6 +183,10 @@ public class SupportService {
      * client-declared {@code Content-Type} — a spoofed header cannot smuggle an
      * executable or HTML payload past this check.
      *
+     * <p>WebP was removed (Phase 374): prod mail goes through the Brevo transactional API, whose
+     * attachment extension allow-list has jpg/jpeg/png/pdf but not webp — a WebP attachment would be
+     * rejected by Brevo after the 202 and the support message silently lost.
+     *
      * @throws BusinessException 400 when the content is not an allow-listed type
      */
     private String detectContentType(byte[] b) {
@@ -198,44 +201,18 @@ public class SupportService {
         if ((b[0] & 0xFF) == 0x89 && b[1] == 0x50 && b[2] == 0x4E && b[3] == 0x47) {
             return "image/png";
         }
-        // WebP: 'RIFF' (0..3) + 'WEBP' (8..11) + a valid VP8 chunk fourCC (12..15).
-        // The RIFF+WEBP container alone is NOT sufficient — a non-image RIFF (.wav/.avi)
-        // renamed could otherwise sniff as image/webp. Require the chunk fourCC at 12..15
-        // to be one of the three real WebP variants: 'VP8 ' (lossy), 'VP8L' (lossless),
-        // 'VP8X' (extended).
-        if (b[0] == 0x52 && b[1] == 0x49 && b[2] == 0x46 && b[3] == 0x46
-                && b[8] == 0x57 && b[9] == 0x45 && b[10] == 0x42 && b[11] == 0x50
-                && isWebpVp8Chunk(b)) {
-            return "image/webp";
-        }
         // PDF: '%PDF'
         if (b[0] == 0x25 && b[1] == 0x50 && b[2] == 0x44 && b[3] == 0x46) {
             return "application/pdf";
         }
         throw new BusinessException(
                 HttpStatus.BAD_REQUEST,
-                "Unsupported attachment type — JPEG, PNG, WebP, and PDF are accepted");
-    }
-
-    /**
-     * Asserts the WebP VP8 chunk fourCC at bytes 12..15 is one of {@code "VP8 "},
-     * {@code "VP8L"}, {@code "VP8X"}. Caller guarantees {@code b.length >= 16}.
-     */
-    private static boolean isWebpVp8Chunk(byte[] b) {
-        // All three start with 'V','P','8' (0x56 0x50 0x38); the 4th byte differs.
-        if (b[12] != 0x56 || b[13] != 0x50 || b[14] != 0x38) {
-            return false;
-        }
-        int fourth = b[15] & 0xFF;
-        return fourth == 0x20  // ' ' → "VP8 " (lossy)
-                || fourth == 0x4C  // 'L' → "VP8L" (lossless)
-                || fourth == 0x58; // 'X' → "VP8X" (extended)
+                "Unsupported attachment type — JPEG, PNG, and PDF are accepted");
     }
 
     private static final Map<String, String> TYPE_TO_EXT = Map.of(
             "image/jpeg", ".jpg",
             "image/png", ".png",
-            "image/webp", ".webp",
             "application/pdf", ".pdf");
 
     /**

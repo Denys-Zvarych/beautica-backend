@@ -47,4 +47,24 @@ class SchedulingConfigTest {
         assertThat(event.getThrowableProxy().getClassName())
                 .isEqualTo(DataIntegrityViolationException.class.getName());
     }
+
+    @Test
+    @DisplayName("Phase 374 — scheduler grace exceeds one prod outbox entry (Brevo API email + FCM push, from the production yml)")
+    void should_coverOneProdOutboxEntry_when_schedulerGraceCompared() {
+        new org.springframework.boot.test.context.runner.ApplicationContextRunner()
+                .withInitializer(new org.springframework.boot.test.context.ConfigDataApplicationContextInitializer())
+                .withUserConfiguration(com.beautica.notification.mail.MailTransportConfig.class)
+                .run(ctx -> {
+                    var brevo = ctx.getBean(com.beautica.notification.mail.BrevoApiProperties.class);
+                    var binder = org.springframework.boot.context.properties.bind.Binder.get(ctx.getEnvironment());
+                    java.time.Duration push = binder.bind("app.firebase.connect-timeout", java.time.Duration.class).get()
+                            .plus(binder.bind("app.firebase.read-timeout", java.time.Duration.class).get());
+                    long entryWorstCase = brevo.connectTimeout().plus(brevo.readTimeout()).plus(push).toSeconds();
+
+                    assertThat(SchedulingConfig.SCHEDULER_SHUTDOWN_GRACE_SECONDS)
+                            .as("a shorter grace cuts an in-flight outbox entry; it is re-sent on next boot (duplicate)")
+                            .isGreaterThan((int) entryWorstCase)
+                            .isEqualTo(30);
+                });
+    }
 }

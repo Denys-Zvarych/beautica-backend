@@ -50,8 +50,8 @@ class ProdRequiredEnvBootStartupTest {
         vars.put("PUBLIC_BASE_URL", "https://api.beautica.ua");
         vars.put("SUPPORT_EMAIL", "help@beautica.ua");
         vars.put("INTERNAL_API_KEY", TestSecrets.INTERNAL_API_KEY);
-        vars.put("BREVO_SMTP_LOGIN", "brevo-login-fixture");
-        vars.put("BREVO_SMTP_KEY", "brevo-key-fixture");
+        // Phase 374 D6: prod sends over the Brevo HTTPS API; BREVO_SMTP_* are no longer set in prod.
+        vars.put("BREVO_API_KEY", "xkeysib-fixture-api-key");
         vars.put("SENTRY_DSN", SENTRY_DSN);
         vars.put("TURBOSMS_TOKEN", "turbosms-fixture-token");
         vars.put("ADMIN_EMAIL", "admin@beautica.ua");
@@ -99,7 +99,7 @@ class ProdRequiredEnvBootStartupTest {
     }
 
     @Test
-    @DisplayName("control — the full prod variable set boots with real Brevo creds and logs no prod-brevo-unconfigured WARN")
+    @DisplayName("control — the full prod variable set boots with a Brevo API key, no SMTP creds, and no prod-brevo-unconfigured WARN")
     void should_boot_when_everyRequiredProdVariableIsReal(CapturedOutput output) {
         try (ConfigurableApplicationContext ctx = prodApp(passingProdVars()).run()) {
             assertThat(ctx.isActive()).as("prod context must be up").isTrue();
@@ -172,18 +172,64 @@ class ProdRequiredEnvBootStartupTest {
     }
 
     @Test
-    @DisplayName("prod-brevo-unconfigured — BREVO creds = PENDING still boot (D9) and the deferred WARN is flushed exactly once")
-    void should_bootWithOneWarn_when_prodBrevoCredentialsPending(CapturedOutput output) {
+    @DisplayName("Phase 374 — leftover BREVO_SMTP_* = PENDING are irrelevant on the API transport: boots, no SMTP WARN")
+    void should_bootWithoutSmtpWarn_when_prodSmtpCredentialsPendingOnApiTransport(CapturedOutput output) {
         Map<String, String> vars = passingProdVars();
         vars.put("BREVO_SMTP_LOGIN", "PENDING");
         vars.put("BREVO_SMTP_KEY", "PENDING");
 
         try (ConfigurableApplicationContext ctx = prodApp(vars).run()) {
-            assertThat(ctx.isActive()).as("Brevo PENDING must not block a prod boot").isTrue();
+            assertThat(ctx.isActive()).isTrue();
         }
 
-        assertThat(occurrences(output.getAll(), "rule prod-brevo-unconfigured"))
-                .as("exactly one WARN, flushed from the DeferredLog after logging init; output=%s", output.getAll())
-                .isEqualTo(1);
+        assertThat(output.getAll()).doesNotContain("rule prod-brevo-unconfigured");
+    }
+
+    @Test
+    @DisplayName("Phase 374 D8 — prod-brevo-api-key-missing: prod boot without BREVO_API_KEY aborts")
+    void should_abortBoot_when_prodBrevoApiKeyMissing() {
+        Map<String, String> vars = passingProdVars();
+        vars.remove("BREVO_API_KEY");
+
+        assertThat(guardMessageOfFailedBoot(vars)).contains("rule prod-brevo-api-key-missing").contains("BREVO_API_KEY");
+    }
+
+    @Test
+    @DisplayName("Phase 374 D8 — prod-brevo-api-key-missing: BREVO_API_KEY=PENDING aborts the boot (was a WARN for SMTP)")
+    void should_abortBoot_when_prodBrevoApiKeyPending() {
+        Map<String, String> vars = passingProdVars();
+        vars.put("BREVO_API_KEY", "PENDING");
+
+        assertThat(guardMessageOfFailedBoot(vars)).contains("rule prod-brevo-api-key-missing");
+    }
+
+    @Test
+    @DisplayName("Phase 374 audit — prod-mail-transport: an app.mail.transport=smtp override aborts the prod boot")
+    void should_failProdBoot_when_mailTransportIsSmtp() {
+        Map<String, String> vars = passingProdVars();
+        vars.put("BREVO_SMTP_LOGIN", "PENDING");
+        vars.put("BREVO_SMTP_KEY", "PENDING");
+
+        String message = guardMessageOfFailedBoot(vars, "--app.mail.transport=smtp");
+
+        assertThat(message).contains("rule prod-mail-transport").doesNotContain("prod-brevo-api-key-missing");
+    }
+
+    @Test
+    @DisplayName("Phase 374 audit — prod-brevo-api-base-url: a base-url override away from https://api.brevo.com aborts the boot")
+    void should_failProdBoot_when_brevoApiBaseUrlNotBrevoHttps() {
+        String message = guardMessageOfFailedBoot(passingProdVars(),
+                "--app.mail.brevo-api.base-url=https://brevo-zq374.example.net");
+
+        assertThat(message).contains("rule prod-brevo-api-base-url").doesNotContain("brevo-zq374");
+    }
+
+    @Test
+    @DisplayName("Phase 374 audit — prod-mail-logo-url: a logo-url outside https://beautica.app/ aborts the boot")
+    void should_failProdBoot_when_logoUrlHostNotBeautica() {
+        String message = guardMessageOfFailedBoot(passingProdVars(),
+                "--app.mail.logo-url=https://cdn.example.org/logo.png");
+
+        assertThat(message).contains("rule prod-mail-logo-url");
     }
 }
