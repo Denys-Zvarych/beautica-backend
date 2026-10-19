@@ -5,6 +5,8 @@ import com.beautica.auth.JwtTokenProvider;
 import com.beautica.auth.Role;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -39,7 +41,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * This class closes the provider-facing gaps it leaves: the STAFF walk-in shape through detail AND
  * the history list, the multi-service visit detail (its header carries the guest's free-text
  * {@code client_comment}, seeded here with the phone in it), the feed endpoint for an erased visit,
- * and the real-context binding of {@link GuestPiiRetentionProperties} via {@code AppConfigProperties}.
+ * the real-context binding of {@link GuestPiiRetentionProperties} via {@code AppConfigProperties},
+ * and the D8 {@code guest.pii.anonymised} counter (entity x trigger tags) on the real registry.
  */
 @DisplayName("Guest PII retention — provider-facing API after anonymisation / erase")
 class GuestPiiProviderViewIT extends AbstractIntegrationTest {
@@ -53,6 +56,7 @@ class GuestPiiProviderViewIT extends AbstractIntegrationTest {
     @Autowired private ObjectMapper objectMapper;
     @Autowired private GuestPiiRetentionProperties properties;
     @Autowired private ApplicationContext context;
+    @Autowired private MeterRegistry meterRegistry;
 
     private GuestPiiFixtures fx;
     private GuestPiiFixtures.Provider provider;
@@ -145,6 +149,35 @@ class GuestPiiProviderViewIT extends AbstractIntegrationTest {
         assertThat(context.getBeanNamesForType(GuestPiiRetentionJob.class)).isEmpty();
     }
 
+    @Test
+    @DisplayName("D8: guest.pii.anonymised counts bookings and visits per trigger (job vs manual) on the real registry")
+    void should_incrementCounterPerEntityAndTrigger_when_jobAndEraseRun() throws Exception {
+        OffsetDateTime due = cutoff.atOffset(ZoneOffset.UTC).minusHours(5);
+        fx.link(provider, "COMPLETED", due, PHONE, null);
+        fx.staffWalkIn(provider, "COMPLETED", due.minusHours(2), PHONE);
+        UUID visit = fx.appointment("LINK", "COMPLETED", PHONE, null, null);
+        fx.visitItem(provider, visit, "LINK", "COMPLETED", due.minusHours(4), PHONE);
+        double bookingJob = count("booking", "job");
+        double visitJob = count("appointment", "job");
+        double bookingManual = count("booking", "manual");
+        double visitManual = count("appointment", "manual");
+
+        GuestPiiAnonymisationResult job = service.anonymiseDue(cutoff);
+
+        assertThat(job.bookingsAnonymised()).isEqualTo(3);
+        assertThat(job.visitsAnonymised()).isEqualTo(1);
+        assertThat(count("booking", "job") - bookingJob).isEqualTo(3.0);
+        assertThat(count("appointment", "job") - visitJob).isEqualTo(1.0);
+        assertThat(count("booking", "manual")).as("job run never counts as manual").isEqualTo(bookingManual);
+
+        fx.link(provider, "CONFIRMED", OffsetDateTime.now(ZoneOffset.UTC).plusDays(2), PHONE, UUID.randomUUID());
+        assertThat(eraseThroughEndpoint(PHONE_LOCAL).getStatusCode()).isEqualTo(HttpStatus.OK);
+
+        assertThat(count("booking", "manual") - bookingManual).isEqualTo(1.0);
+        assertThat(count("appointment", "manual")).isEqualTo(visitManual);
+        assertThat(count("booking", "job") - bookingJob).as("erase never counts as job").isEqualTo(3.0);
+    }
+
     // ── helpers ────────────────────────────────────────────────────────────────
 
     private JsonNode history() throws Exception {
@@ -168,6 +201,12 @@ class GuestPiiProviderViewIT extends AbstractIntegrationTest {
         String body = objectMapper.writeValueAsString(Map.of("phone", phone));
         return restTemplate.postForEntity("/api/v1/internal/guest-pii/erase",
                 new HttpEntity<>(body, headers), String.class);
+    }
+
+    private double count(String entity, String trigger) {
+        Counter counter = meterRegistry.find(GuestPiiAnonymisationService.METRIC)
+                .tags("entity", entity, "trigger", trigger).counter();
+        return counter == null ? 0.0 : counter.count();
     }
 
     private static void assertNoPii(String body) {
