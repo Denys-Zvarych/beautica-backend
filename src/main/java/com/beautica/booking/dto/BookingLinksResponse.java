@@ -15,7 +15,7 @@ public record BookingLinksResponse(
         boolean shareEnabled,
 
         @Schema(requiredMode = Schema.RequiredMode.REQUIRED,
-                description = "MASTER link first, then SALON links by salon name")
+                description = "INDEPENDENT_MASTER: its MASTER link; SALON_OWNER/SALON_ADMIN: SALON links by salon name")
         List<BookingLinkResponse> links
 ) {
 

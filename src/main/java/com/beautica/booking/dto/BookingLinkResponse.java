@@ -7,8 +7,11 @@ import java.util.UUID;
 /**
  * Phase 375 — one shareable public booking link of the caller. Authenticated, caller-scoped
  * response: it carries only the caller's own slug and (for SALON links) their own salon id.
+ * MASTER links go to {@code INDEPENDENT_MASTER} only; SALON links to {@code SALON_OWNER} (one per active
+ * owned salon, never a MASTER link — 2026-10-20) and {@code SALON_ADMIN} (its bound salon).
  */
-@Schema(description = "A ready-to-share public booking link owned by the caller")
+@Schema(description = "A ready-to-share public booking link owned by the caller. MASTER: INDEPENDENT_MASTER "
+        + "only. SALON: SALON_OWNER (one per active owned salon, no MASTER link) and SALON_ADMIN (bound salon)")
 public record BookingLinkResponse(
         @Schema(requiredMode = Schema.RequiredMode.REQUIRED)
         BookingLinkKind kind,

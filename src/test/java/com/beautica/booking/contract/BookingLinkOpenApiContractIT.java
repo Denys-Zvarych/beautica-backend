@@ -77,6 +77,13 @@ class BookingLinkOpenApiContractIT extends AbstractIntegrationTest {
         assertThat(description)
                 .as("mobile 413/414 read the role matrix from this text, actual=%s", description)
                 .contains("SALON_OWNER", "SALON_ADMIN", "SALON link", "https://beautica.app/book/s/{slug}");
+        assertThat(description)
+                .as("2026-10-20: owner gets SALON links only, actual=%s", description)
+                .contains("SALON_OWNER gets ONLY SALON links", "no personal MASTER link")
+                .doesNotContain("SALON_OWNER get their own MASTER link", "INDEPENDENT_MASTER and SALON_OWNER");
+        assertThat(spec.path("components").path("schemas").path("BookingLinkResponse").path("description").asText())
+                .as("record-level schema doc")
+                .contains("MASTER: INDEPENDENT_MASTER only", "no MASTER link");
         assertThat(tagDescription).as("tag, actual=%s", tagDescription).contains("beautica.app/book/s/{slug}");
         assertThat(get.path("responses").has("409")).as("lock-timeout 409 documented").isTrue();
         assertThat(spec.path("components").path("schemas").path("BookingLinkResponse")

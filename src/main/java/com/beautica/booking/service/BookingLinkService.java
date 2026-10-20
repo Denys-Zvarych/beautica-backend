@@ -27,10 +27,11 @@ import java.util.UUID;
 /**
  * Phase 375 — the caller's shareable public booking links ({@code GET /api/v1/booking-links/mine}).
  *
- * <p><b>Who gets what (375 D2 + 376 D6).</b> {@code INDEPENDENT_MASTER} and {@code SALON_OWNER} (the
- * owner is always a master) get their own MASTER link; {@code SALON_OWNER} additionally gets one SALON
- * link per ACTIVE owned salon, {@code SALON_ADMIN} the SALON link of the salon it is bound to;
- * {@code SALON_MASTER} gets none (booked through their salon). {@code CLIENT} is refused by the
+ * <p><b>Who gets what (375 D2 + 376 D6, amended 2026-10-20).</b> {@code INDEPENDENT_MASTER} gets its own
+ * MASTER link; {@code SALON_OWNER} gets ONLY one SALON link per ACTIVE owned salon — the same link the
+ * salon's admin shares — and NO personal MASTER link (product rule 2026-10-20: the owner's own master
+ * row is neither read nor slug-issued on this call); {@code SALON_ADMIN} gets the SALON link of the
+ * salon it is bound to; {@code SALON_MASTER} gets none (booked through their salon). {@code CLIENT} is refused by the
  * controller's {@code @PreAuthorize} — the single role gate. This service only allow-lists who OWNS a
  * link ({@link #ownsMasterLink}, {@link #salonLinkRows}), so any other role gets no link and touches no
  * data. An inactive master row or an inactive salon yields no link (376 D8 — its page would 404).
@@ -95,8 +96,12 @@ public class BookingLinkService {
         return new BookingLinksResponse(true, links);
     }
 
+    /**
+     * Only the independent master owns a personal MASTER link here. The salon owner is a master too, but
+     * shares its salon(s) instead (product rule 2026-10-20) — so its master row is never read on this call.
+     */
     private static boolean ownsMasterLink(Role role) {
-        return role == Role.INDEPENDENT_MASTER || role == Role.SALON_OWNER;
+        return role == Role.INDEPENDENT_MASTER;
     }
 
     /** The caller's own active master row as a MASTER link; empty when there is no active row. */

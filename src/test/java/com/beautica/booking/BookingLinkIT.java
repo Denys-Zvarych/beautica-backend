@@ -73,8 +73,8 @@ import static org.mockito.Mockito.verify;
  * cannot move them. The former SessionFactory-wide Hibernate {@code Statistics} assertions were a
  * timing-dependent flake.
  *
- * <p>Phase 376 adds SALON links: owner → one per ACTIVE owned salon, admin → its bound salon, salon
- * master → none. Salon fixtures are legacy rows too ({@code salons.booking_slug NULL}, V200's state
+ * <p>Phase 376 adds SALON links: owner → one per ACTIVE owned salon (and, since 2026-10-20, NO MASTER
+ * link), admin → its bound salon, salon master → none. Salon fixtures are legacy rows too ({@code salons.booking_slug NULL}, V200's state
  * for pre-existing salons).
  */
 @Import(ThreadJdbcFootprint.Config.class)
@@ -208,27 +208,42 @@ class BookingLinkIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("salon owner → own MASTER link (owner is always a master) first, then its SALON link (376)")
-    void should_returnMasterThenSalonLink_when_salonOwner() throws Exception {
+    @DisplayName("salon owner → ONLY its SALON link, no personal MASTER link, owner's master slug never issued (2026-10-20)")
+    void should_returnSalonLinkOnly_when_salonOwner() throws Exception {
         UUID salonId = BookableMasterSeeder.insertSalon(jdbcTemplate, "Ostap Salon");
         UUID ownerMasterId = insertOwnerMaster(salonId);
 
         JsonNode data = mine(masterToken(ownerMasterId, Role.SALON_OWNER));
 
         JsonNode links = data.path("links");
-        assertThat(kinds(links)).containsExactly("MASTER", "SALON");
-        assertThat(links.get(0).path("slug").asText()).isEqualTo(slugOf(ownerMasterId));
-        assertThat(links.get(0).path("displayName").asText()).isEqualTo("Ostap Owner");
+        assertThat(kinds(links)).containsExactly("SALON");
+        assertThat(slugOf(ownerMasterId)).as("the owner's master slug is not issued on this call").isNull();
         String salonSlug = salonSlugOf(salonId);
         assertThat(salonSlug).matches(SLUG_CHECK).startsWith("ostap-salon-");
-        assertThat(links.get(1).path("slug").asText()).isEqualTo(salonSlug);
-        assertThat(links.get(1).path("url").asText()).isEqualTo("https://beautica.app/book/s/" + salonSlug);
-        assertThat(links.get(1).path("displayName").asText()).isEqualTo("Ostap Salon");
-        assertThat(links.get(1).path("salonId").asText()).isEqualTo(salonId.toString());
+        assertThat(links.get(0).path("slug").asText()).isEqualTo(salonSlug);
+        assertThat(links.get(0).path("url").asText()).isEqualTo("https://beautica.app/book/s/" + salonSlug);
+        assertThat(links.get(0).path("displayName").asText()).isEqualTo("Ostap Salon");
+        assertThat(links.get(0).path("salonId").asText()).isEqualTo(salonId.toString());
     }
 
     @Test
-    @DisplayName("owner with 2 active salons → MASTER + one SALON link per salon, ordered by salon name, each slug issued")
+    @DisplayName("owner and its admin get the SAME salon link (2026-10-20); owner's stored master slug is never surfaced")
+    void should_returnSameSalonLinkAsAdmin_when_salonOwner() throws Exception {
+        UUID salonId = BookableMasterSeeder.insertSalon(jdbcTemplate, "Spilnyi Salon");
+        UUID ownerMasterId = insertOwnerMaster(salonId);
+        jdbcTemplate.update("UPDATE masters SET booking_slug = 'owner-own-ab12' WHERE id = ?", ownerMasterId);
+        UUID adminUserId = insertUser(Role.SALON_ADMIN, salonId);
+
+        JsonNode ownerLinks = mine(masterToken(ownerMasterId, Role.SALON_OWNER)).path("links");
+        JsonNode adminLinks = mine(tokenFor(adminUserId, Role.SALON_ADMIN)).path("links");
+
+        assertThat(ownerLinks).isEqualTo(adminLinks);
+        assertThat(kinds(ownerLinks)).containsExactly("SALON");
+        assertThat(ownerLinks.toString()).doesNotContain("owner-own-ab12");
+    }
+
+    @Test
+    @DisplayName("owner with 2 active salons → one SALON link per salon (no MASTER), ordered by salon name, each slug issued")
     void should_returnOneSalonLinkPerActiveSalon_when_ownerHasTwoSalons() throws Exception {
         UUID zetaSalon = BookableMasterSeeder.insertSalon(jdbcTemplate, "Zeta Studio");
         UUID ownerMasterId = insertOwnerMaster(zetaSalon);
@@ -236,11 +251,11 @@ class BookingLinkIT extends AbstractIntegrationTest {
 
         JsonNode links = mine(masterToken(ownerMasterId, Role.SALON_OWNER)).path("links");
 
-        assertThat(kinds(links)).containsExactly("MASTER", "SALON", "SALON");
-        assertThat(links.get(1).path("salonId").asText()).isEqualTo(alfaSalon.toString());
-        assertThat(links.get(1).path("slug").asText()).isEqualTo(salonSlugOf(alfaSalon)).startsWith("alfa-studio-");
-        assertThat(links.get(2).path("salonId").asText()).isEqualTo(zetaSalon.toString());
-        assertThat(links.get(2).path("slug").asText()).isEqualTo(salonSlugOf(zetaSalon)).startsWith("zeta-studio-");
+        assertThat(kinds(links)).containsExactly("SALON", "SALON");
+        assertThat(links.get(0).path("salonId").asText()).isEqualTo(alfaSalon.toString());
+        assertThat(links.get(0).path("slug").asText()).isEqualTo(salonSlugOf(alfaSalon)).startsWith("alfa-studio-");
+        assertThat(links.get(1).path("salonId").asText()).isEqualTo(zetaSalon.toString());
+        assertThat(links.get(1).path("slug").asText()).isEqualTo(salonSlugOf(zetaSalon)).startsWith("zeta-studio-");
     }
 
     @Test
@@ -426,15 +441,16 @@ class BookingLinkIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("salon owner with a salon service and schedule → bookable=true")
-    void should_markOwnerBookable_when_ownerHasSalonServiceAndSchedule() throws Exception {
+    @DisplayName("salon owner whose own master row has a salon service and schedule → its SALON link is bookable=true")
+    void should_markOwnerSalonBookable_when_ownerHasSalonServiceAndSchedule() throws Exception {
         UUID salonId = BookableMasterSeeder.insertSalon(jdbcTemplate, "Bookable Salon");
         UUID ownerMasterId = insertOwnerMaster(salonId);
         BookableMasterSeeder.makeBookable(jdbcTemplate, salonId, ownerMasterId);
 
-        boolean bookable = mine(masterToken(ownerMasterId, Role.SALON_OWNER)).path("links").get(0).path("bookable").asBoolean();
+        JsonNode link = mine(masterToken(ownerMasterId, Role.SALON_OWNER)).path("links").get(0);
 
-        assertThat(bookable).isTrue();
+        assertThat(link.path("kind").asText()).isEqualTo("SALON");
+        assertThat(link.path("bookable").asBoolean()).isTrue();
     }
 
     // ── kill-switch (D6) ─────────────────────────────────────────────────────────────────────
@@ -455,8 +471,8 @@ class BookingLinkIT extends AbstractIntegrationTest {
     // ── closed salon / pre-issued slug (QA 2026-10-20) ──────────────────────────────────────
 
     @Test
-    @DisplayName("salon owner whose salon is closed → link still returned (slug permanent) but bookable=false, page 404s")
-    void should_returnLinkMarkedNotBookable_when_ownersSalonClosed() throws Exception {
+    @DisplayName("salon owner whose only salon is closed → links: [] (no MASTER fallback), neither slug issued")
+    void should_returnNoLinks_when_ownersOnlySalonClosed() throws Exception {
         UUID salonId = BookableMasterSeeder.insertSalon(jdbcTemplate, "Zakryta Salon");
         UUID ownerMasterId = insertOwnerMaster(salonId);
         BookableMasterSeeder.makeBookable(jdbcTemplate, salonId, ownerMasterId);
@@ -464,15 +480,9 @@ class BookingLinkIT extends AbstractIntegrationTest {
 
         JsonNode links = mine(masterToken(ownerMasterId, Role.SALON_OWNER)).path("links");
 
-        assertThat(links).as("closed salon must not drop the owner's link, links=%s", links).hasSize(1);
-        JsonNode link = links.get(0);
-        assertThat(link.path("bookable").asBoolean())
-                .as("a closed salon fails MasterBookability even with service + schedule").isFalse();
-        assertThat(link.path("slug").asText()).isEqualTo(slugOf(ownerMasterId));
-        assertThat(restTemplate.getForEntity("/api/v1/book/" + link.path("slug").asText() + "/info", String.class)
-                .getStatusCode())
-                .as("the public page agrees: a closed salon's master slug does not resolve")
-                .isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(links).as("closed salon yields no SALON link and the owner has no MASTER link").isEmpty();
+        assertThat(slugOf(ownerMasterId)).isNull();
+        assertThat(salonSlugOf(salonId)).isNull();
     }
 
     @Test
@@ -597,8 +607,8 @@ class BookingLinkIT extends AbstractIntegrationTest {
 
         JsonNode links = mine(masterToken(ownerMasterId, Role.SALON_OWNER)).path("links");
 
-        assertThat(kinds(links)).containsExactly("MASTER", "SALON");
-        assertThat(links.get(1).path("salonId").asText()).isEqualTo(openSalon.toString());
+        assertThat(kinds(links)).containsExactly("SALON");
+        assertThat(links.get(0).path("salonId").asText()).isEqualTo(openSalon.toString());
         assertThat(salonSlugOf(closedSalon)).isNull();
     }
 
@@ -660,10 +670,11 @@ class BookingLinkIT extends AbstractIntegrationTest {
 
         JsonNode links = mine(masterToken(ownerMasterId, Role.SALON_OWNER)).path("links");
 
-        assertThat(links.get(1).path("salonId").asText()).isEqualTo(bookableSalon.toString());
-        assertThat(links.get(1).path("bookable").asBoolean()).isTrue();
-        assertThat(links.get(2).path("salonId").asText()).isEqualTo(emptySalon.toString());
-        assertThat(links.get(2).path("bookable").asBoolean()).isFalse();
+        assertThat(kinds(links)).containsExactly("SALON", "SALON");
+        assertThat(links.get(0).path("salonId").asText()).isEqualTo(bookableSalon.toString());
+        assertThat(links.get(0).path("bookable").asBoolean()).isTrue();
+        assertThat(links.get(1).path("salonId").asText()).isEqualTo(emptySalon.toString());
+        assertThat(links.get(1).path("bookable").asBoolean()).isFalse();
     }
 
     @ParameterizedTest
@@ -715,8 +726,8 @@ class BookingLinkIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("owner, 2 legacy salons + legacy master → exactly 2 short issue transactions (master + ONE salon batch), no outer one")
-    void should_openMasterAndOneSalonBatchTransaction_when_ownerFirstCall() {
+    @DisplayName("owner, 2 legacy salons + legacy master → exactly 1 short issue transaction (ONE salon batch); master slug NOT issued (2026-10-20)")
+    void should_openOnlyOneSalonBatchTransaction_when_ownerFirstCall() {
         UUID salonA = BookableMasterSeeder.insertSalon(jdbcTemplate, "Legacy A");
         UUID ownerMasterId = insertOwnerMaster(salonA);
         UUID salonB = insertSiblingSalon(ownerOf(salonA), "Legacy B");
@@ -724,10 +735,10 @@ class BookingLinkIT extends AbstractIntegrationTest {
 
         Footprint footprint = ThreadJdbcFootprint.footprintOf(() -> bookingLinkService.getMyLinks(userId, Role.SALON_OWNER));
 
-        assertThat(slugOf(ownerMasterId)).isNotNull();
+        assertThat(slugOf(ownerMasterId)).as("owner gets no MASTER link → no lazy master-slug write").isNull();
         assertThat(salonSlugOf(salonA)).isNotNull();
         assertThat(salonSlugOf(salonB)).isNotNull();
-        assertThat(footprint.transactions()).as("%s", footprint).isEqualTo(2);
+        assertThat(footprint.transactions()).as("%s", footprint).isEqualTo(1);
     }
 
     /** Owner whose master slug is already stored, with {@code legacySalons} slug-less active salons. */
@@ -766,7 +777,7 @@ class BookingLinkIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("owner steady state, 2 salons → no transaction, 4 reads: master, master bookability, salons (ONE), salon bookability (ONE batch)")
+    @DisplayName("owner steady state, 3 salons → no transaction, 2 reads: salons (ONE) + salon bookability (ONE batch); no master read (2026-10-20)")
     void should_readSalonsAndBookabilityOnceEach_when_ownerSteadyStateWithTwoSalons() {
         UUID salonA = BookableMasterSeeder.insertSalon(jdbcTemplate, "Stalyi A");
         UUID ownerMasterId = insertOwnerMaster(salonA);
@@ -779,12 +790,13 @@ class BookingLinkIT extends AbstractIntegrationTest {
                 () -> bookingLinkService.getMyLinks(userId, Role.SALON_OWNER));
 
         Footprint footprint = steady.footprint();
-        assertThat(steady.result().links()).hasSize(4);
+        assertThat(steady.result().links()).extracting(BookingLinkResponse::kind)
+                .containsOnly(com.beautica.booking.dto.BookingLinkKind.SALON).hasSize(3);
         assertThat(footprint.transactions()).as("%s", footprint).isZero();
         assertThat(footprint.statements())
-                .as("constant in the number of salons (3 salons here) — %s", footprint)
-                .isEqualTo(4);
-        assertThat(footprint.connections()).as("%s", footprint).isLessThanOrEqualTo(4);
+                .as("constant in the number of salons (3 salons here), no master/master-bookability read — %s", footprint)
+                .isEqualTo(2);
+        assertThat(footprint.connections()).as("%s", footprint).isLessThanOrEqualTo(2);
     }
 
     @Test
@@ -816,9 +828,9 @@ class BookingLinkIT extends AbstractIntegrationTest {
         JsonNode links = mine(tokenFor(ownerUserId, Role.SALON_OWNER)).path("links");
 
         assertThat(created).as("D4: issued at creation").matches(SLUG_CHECK).startsWith("novyi-salon-");
-        assertThat(kinds(links)).containsExactly("MASTER", "SALON");
-        assertThat(links.get(1).path("slug").asText()).isEqualTo(created);
-        assertThat(links.get(1).path("url").asText()).isEqualTo("https://beautica.app/book/s/" + created);
+        assertThat(kinds(links)).containsExactly("SALON");
+        assertThat(links.get(0).path("slug").asText()).isEqualTo(created);
+        assertThat(links.get(0).path("url").asText()).isEqualTo("https://beautica.app/book/s/" + created);
         assertThat(salonSlugOf(salonId)).isEqualTo(created);
         verify(salonRepository, never()).lockSalonIdsWithoutBookingSlug(anyCollection());
     }
@@ -845,8 +857,8 @@ class BookingLinkIT extends AbstractIntegrationTest {
 
         JsonNode links = mine(masterToken(ownerMasterId, Role.SALON_OWNER)).path("links");
 
-        assertThat(kinds(links)).containsExactly("MASTER", "SALON");
-        assertThat(links.get(1).path("salonId").asText()).isEqualTo(ownSalon.toString());
+        assertThat(kinds(links)).containsExactly("SALON");
+        assertThat(links.get(0).path("salonId").asText()).isEqualTo(ownSalon.toString());
         assertThat(salonSlugOf(foreignSalon)).isNull();
     }
 
@@ -912,8 +924,8 @@ class BookingLinkIT extends AbstractIntegrationTest {
 
         assertThat(response.getStatusCode()).as("body=%s", response.getBody()).isEqualTo(HttpStatus.OK);
         JsonNode links = objectMapper.readTree(response.getBody()).path("data").path("links");
-        assertThat(kinds(links)).containsExactly("MASTER", "SALON");
-        assertThat(links.get(1).path("salonId").asText()).isEqualTo(keptSalon.toString());
-        assertThat(links.get(1).path("slug").asText()).isEqualTo(salonSlugOf(keptSalon));
+        assertThat(kinds(links)).containsExactly("SALON");
+        assertThat(links.get(0).path("salonId").asText()).isEqualTo(keptSalon.toString());
+        assertThat(links.get(0).path("slug").asText()).isEqualTo(salonSlugOf(keptSalon));
     }
 }

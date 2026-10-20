@@ -113,8 +113,8 @@ class BookingLinkControllerTest {
     }
 
     @ParameterizedTest
-    @EnumSource(value = Role.class, names = {"INDEPENDENT_MASTER", "SALON_OWNER"})
-    @DisplayName("GET /booking-links/mine as master-owning role → 200 with full MASTER link shape")
+    @EnumSource(value = Role.class, names = {"INDEPENDENT_MASTER"})
+    @DisplayName("GET /booking-links/mine as INDEPENDENT_MASTER (the only MASTER-link role since 2026-10-20) → 200 with full MASTER link shape")
     void should_return200WithMasterLink_when_masterRole(Role role) throws Exception {
         when(bookingLinkService.getMyLinks(CALLER_ID, role)).thenReturn(new BookingLinksResponse(true, List.of(
                 new BookingLinkResponse(BookingLinkKind.MASTER, "olena-koval-x7k2",
@@ -130,6 +130,29 @@ class BookingLinkControllerTest {
                 .andExpect(jsonPath("$.data.links[0].url").value("https://beautica.app/book/olena-koval-x7k2"))
                 .andExpect(jsonPath("$.data.links[0].displayName").value("Олена Коваль"))
                 .andExpect(jsonPath("$.data.links[0].salonId").isEmpty())
+                .andExpect(jsonPath("$.data.links[0].bookable").value(true));
+
+        verify(bookingLinkService).getMyLinks(eq(CALLER_ID), eq(role));
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = Role.class, names = {"SALON_OWNER", "SALON_ADMIN"})
+    @DisplayName("GET /booking-links/mine as SALON_OWNER / SALON_ADMIN → 200 with the SALON link shape only (owner: no MASTER link, 2026-10-20)")
+    void should_return200WithSalonLinkOnly_when_salonRole(Role role) throws Exception {
+        UUID salonId = UUID.fromString("aaaaaaaa-0000-0000-0000-000000000001");
+        when(bookingLinkService.getMyLinks(CALLER_ID, role)).thenReturn(new BookingLinksResponse(true, List.of(
+                new BookingLinkResponse(BookingLinkKind.SALON, "alfa-aa11",
+                        "https://beautica.app/book/s/alfa-aa11", "Alfa", salonId, true))));
+
+        mockMvc.perform(get(URL).with(as(role)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.shareEnabled").value(true))
+                .andExpect(jsonPath("$.data.links.length()").value(1))
+                .andExpect(jsonPath("$.data.links[0].kind").value("SALON"))
+                .andExpect(jsonPath("$.data.links[0].slug").value("alfa-aa11"))
+                .andExpect(jsonPath("$.data.links[0].url").value("https://beautica.app/book/s/alfa-aa11"))
+                .andExpect(jsonPath("$.data.links[0].displayName").value("Alfa"))
+                .andExpect(jsonPath("$.data.links[0].salonId").value(salonId.toString()))
                 .andExpect(jsonPath("$.data.links[0].bookable").value(true));
 
         verify(bookingLinkService).getMyLinks(eq(CALLER_ID), eq(role));

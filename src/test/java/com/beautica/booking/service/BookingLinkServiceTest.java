@@ -45,6 +45,7 @@ import static org.mockito.Mockito.when;
 /**
  * Phase 375 — {@link BookingLinkService}: role matrix (D2), kill-switch (D6), URL (D5), bookable (D7/D8).
  * Phase 376 — SALON links: owner (every active salon), admin (bound salon), batched bookability, lazy issue.
+ * 2026-10-20 — SALON_OWNER gets SALON links only: no MASTER link, master row never read, master slug never issued.
  */
 @ExtendWith(MockitoExtension.class)
 @MockitoSettings(strictness = Strictness.LENIENT)
@@ -103,15 +104,18 @@ class BookingLinkServiceTest {
     }
 
     @Test
-    @DisplayName("salon owner with no active salon → own MASTER link only, salonId null")
-    void should_returnOwnMasterLink_when_salonOwner() {
+    @DisplayName("salon owner with no active salon → no links; own master row never read, master slug never issued (2026-10-20)")
+    void should_returnNoLinksAndNeverReadMaster_when_salonOwnerHasNoActiveSalon() {
         Salon salon = Salon.builder().id(UUID.randomUUID()).isActive(true).build();
         givenMaster(master(salon, MasterType.SALON_OWNER), true);
+        when(salonRepository.findBookingLinkRowsByOwnerId(USER_ID)).thenReturn(List.of());
 
         BookingLinksResponse response = service.getMyLinks(USER_ID, Role.SALON_OWNER);
 
-        assertThat(response.links()).extracting(BookingLinkResponse::kind).containsExactly(BookingLinkKind.MASTER);
-        assertThat(response.links().get(0).salonId()).isNull();
+        assertThat(response.shareEnabled()).isTrue();
+        assertThat(response.links()).isEmpty();
+        verifyNoInteractions(masterRepository, bookingSlugService);
+        verify(salonRepository, never()).findBookableSalonIds(anyCollection(), any());
     }
 
     @Test
@@ -236,12 +240,13 @@ class BookingLinkServiceTest {
     }
 
     @Test
-    @DisplayName("closed salon → bookable=false without running the search predicate query")
+    @DisplayName("MASTER link whose master row carries a closed salon → bookable=false without running the search predicate query")
     void should_markNotBookableWithoutQuery_when_salonClosed() {
+        // Shared MasterBookability rule; since 2026-10-20 only INDEPENDENT_MASTER reaches the MASTER-link path.
         Salon closed = Salon.builder().id(UUID.randomUUID()).isActive(false).build();
-        givenMaster(master(closed, MasterType.SALON_OWNER), true);
+        givenMaster(master(closed, MasterType.INDEPENDENT_MASTER), true);
 
-        BookingLinksResponse response = service.getMyLinks(USER_ID, Role.SALON_OWNER);
+        BookingLinksResponse response = service.getMyLinks(USER_ID, Role.INDEPENDENT_MASTER);
 
         assertThat(response.links().get(0).bookable()).isFalse();
         verify(masterRepository, never()).findSearchBookability(anyCollection(), any());
@@ -274,8 +279,8 @@ class BookingLinkServiceTest {
     }
 
     @Test
-    @DisplayName("owner with 2 salons → MASTER first, then one SALON link per salon; ONE salon read + ONE batched bookability read")
-    void should_returnMasterThenOneSalonLinkPerSalon_when_ownerHasTwoSalons() {
+    @DisplayName("owner with 2 salons → one SALON link per salon, NO MASTER link; ONE salon read + ONE batched bookability read")
+    void should_returnOnlySalonLinks_when_ownerHasTwoSalons() {
         givenMaster(master(null, MasterType.SALON_OWNER), true);
         when(salonRepository.findBookingLinkRowsByOwnerId(USER_ID)).thenReturn(List.of(
                 salonRow(SALON_A, "Alfa", "alfa-aa11"), salonRow(SALON_B, "Beta", "beta-bb22")));
@@ -284,8 +289,6 @@ class BookingLinkServiceTest {
         BookingLinksResponse response = service.getMyLinks(USER_ID, Role.SALON_OWNER);
 
         assertThat(response.links()).containsExactly(
-                new BookingLinkResponse(BookingLinkKind.MASTER, SLUG, "https://beautica.app/book/" + SLUG,
-                        "Олена Коваль", null, true),
                 new BookingLinkResponse(BookingLinkKind.SALON, "alfa-aa11", "https://beautica.app/book/s/alfa-aa11",
                         "Alfa", SALON_A, false),
                 new BookingLinkResponse(BookingLinkKind.SALON, "beta-bb22", "https://beautica.app/book/s/beta-bb22",
@@ -293,6 +296,8 @@ class BookingLinkServiceTest {
         verify(salonRepository, times(1)).findBookingLinkRowsByOwnerId(USER_ID);
         verify(salonRepository, times(1)).findBookableSalonIds(anyCollection(), any());
         verify(bookingSlugService, never()).issueMissingSalonSlugs(anyList());
+        verifyNoInteractions(masterRepository);
+        verify(bookingSlugService, never()).getOrIssueSlugRaceSafe(any());
     }
 
     @Test
@@ -379,7 +384,6 @@ class BookingLinkServiceTest {
     @Test
     @DisplayName("owner, 3 salons of which 2 legacy → ONE batched issue call with exactly the 2 legacy rows; stored slug kept (376 audit)")
     void should_issueAllLegacySalonSlugsInOneCall_when_ownerHasSeveralLegacySalons() {
-        givenMaster(master(Salon.builder().id(SALON_A).isActive(true).build(), MasterType.SALON_OWNER), true);
         SalonBookingLinkRow stored = salonRow(SALON_A, "Alfa", "alfa-aa11");
         UUID salonC = UUID.randomUUID();
         SalonBookingLinkRow legacyB = salonRow(SALON_B, "Beta", null);
@@ -392,7 +396,7 @@ class BookingLinkServiceTest {
         BookingLinksResponse response = service.getMyLinks(USER_ID, Role.SALON_OWNER);
 
         assertThat(response.links()).extracting(BookingLinkResponse::slug)
-                .containsExactly(SLUG, "alfa-aa11", "beta-bb22", "gama-cc33");
+                .containsExactly("alfa-aa11", "beta-bb22", "gama-cc33");
         verify(bookingSlugService, times(1)).issueMissingSalonSlugs(anyList());
     }
 
