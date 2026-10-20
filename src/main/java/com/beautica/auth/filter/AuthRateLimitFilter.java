@@ -1761,6 +1761,9 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
      * Bucket key for a forwarded visitor IP literal, or {@code null} when the value is not one. IPv4 (and
      * IPv4-mapped IPv6, which parses to IPv4) keys on the canonical address; any other IPv6 address keys on
      * its /64 prefix ({@code 2001:db8:0:0:0:0:0:0/64}), so rotating the low 64 bits never mints a new bucket.
+     * An IPv6 address whose /64 prefix is all zeros (IPv4-compatible {@code ::1.2.3.4}, loopback, ...) keys
+     * on the full canonical /128 address instead, so such values never collapse into one shared
+     * {@code 0:0:0:0:0:0:0:0/64} bucket.
      */
     static String visitorIpBucketKey(String value) {
         InetAddress address = parseIpLiteral(value);
@@ -1771,6 +1774,9 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             return address.getHostAddress();
         }
         byte[] bytes = address.getAddress();
+        if (isZeroPrefix(bytes)) {
+            return address.getHostAddress();
+        }
         Arrays.fill(bytes, IPV6_BUCKET_PREFIX_BYTES, bytes.length, (byte) 0);
         try {
             return InetAddress.getByAddress(bytes).getHostAddress() + IPV6_BUCKET_SUFFIX;
@@ -1779,13 +1785,14 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         }
     }
 
-    /**
-     * The canonical text form of an IPv4/IPv6 LITERAL, or {@code null} when the value is not one;
-     * canonicalising stops two spellings of one IPv6 address from splitting a bucket.
-     */
-    static String canonicalIpLiteral(String value) {
-        InetAddress address = parseIpLiteral(value);
-        return address == null ? null : address.getHostAddress();
+    /** True when the first {@value #IPV6_BUCKET_PREFIX_BYTES} bytes (the /64 prefix) are all zero. */
+    private static boolean isZeroPrefix(byte[] bytes) {
+        for (int i = 0; i < IPV6_BUCKET_PREFIX_BYTES; i++) {
+            if (bytes[i] != 0) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**

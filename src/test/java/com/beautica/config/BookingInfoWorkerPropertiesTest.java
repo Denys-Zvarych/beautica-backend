@@ -84,6 +84,49 @@ class BookingInfoWorkerPropertiesTest {
                 .run(ctx -> assertThat(ctx).hasNotFailed());
     }
 
+    @Test
+    @DisplayName("32-char key with a trailing newline → bound stripped, boots, feature on")
+    void should_bindStrippedKey_when_workerKeyHasTrailingNewline() {
+        var props = new BookingInfoWorkerProperties();
+
+        props.setWorkerKey(KEY_32 + "\n");
+
+        assertThat(props.getWorkerKey()).isEqualTo(KEY_32);
+        assertThat(props.isEnabled()).isTrue();
+        assertThat(props.isWorkerKeyLongEnough()).isTrue();
+    }
+
+    @Test
+    @DisplayName("whitespace-only key → blank after strip, feature off and valid")
+    void should_beOff_when_workerKeyBlankAfterStrip() {
+        var props = new BookingInfoWorkerProperties();
+
+        props.setWorkerKey(" \t\n ");
+
+        assertThat(props.getWorkerKey()).isEmpty();
+        assertThat(props.isEnabled()).isFalse();
+        assertThat(props.isWorkerKeyLongEnough()).isTrue();
+    }
+
+    @Test
+    @DisplayName("null key → blank, feature off")
+    void should_beOff_when_workerKeyNull() {
+        var props = new BookingInfoWorkerProperties();
+
+        props.setWorkerKey(null);
+
+        assertThat(props.isEnabled()).isFalse();
+    }
+
+    @Test
+    @DisplayName("bound whitespace-only key → boots, feature off")
+    void should_boot_when_workerKeyWhitespaceOnly() {
+        runner("app.booking-info.worker-key=\t").run(ctx -> {
+            assertThat(ctx).hasNotFailed();
+            assertThat(ctx.getBean(BookingInfoWorkerProperties.class).isEnabled()).isFalse();
+        });
+    }
+
     private static String rootCauseChainText(Throwable failure) {
         StringBuilder text = new StringBuilder();
         for (Throwable t = failure; t != null; t = t.getCause()) {

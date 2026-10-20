@@ -17,6 +17,7 @@ import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.mock.web.MockHttpServletResponse;
 
 import java.time.Duration;
+import java.util.List;
 import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -70,8 +71,13 @@ class GuestInfoGetRateLimitTest {
 
     /** The Spring constructor with the website-Worker key configured (feature on). */
     private AuthRateLimitFilter workerAwareFilter() {
+        return workerAwareFilter(WORKER_KEY);
+    }
+
+    /** The Spring constructor with {@code configuredKey} bound as the website-Worker key. */
+    private AuthRateLimitFilter workerAwareFilter(String configuredKey) {
         var props = new BookingInfoWorkerProperties();
-        props.setWorkerKey(WORKER_KEY);
+        props.setWorkerKey(configuredKey);
         return new AuthRateLimitFilter(
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(),
@@ -365,6 +371,18 @@ class GuestInfoGetRateLimitTest {
     }
 
     @Test
+    @DisplayName("Configured key with a trailing newline (secret-store artefact) is stripped once: the trimmed header matches")
+    void should_keyOnVisitorIp_when_configuredKeyHasTrailingNewline() throws Exception {
+        AuthRateLimitFilter filter = workerAwareFilter(WORKER_KEY + "\n");
+        exhaustViaWorker(filter, WORKER_KEY, VISITOR_A);
+
+        MockHttpServletResponse otherVisitor = fireOnce(filter, workerGet(SALON_INFO_PATH, WORKER_KEY, VISITOR_B));
+
+        assertThat(otherVisitor.getStatus()).as("matching uses the stripped key, so visitors keep separate buckets")
+                .isNotEqualTo(429);
+    }
+
+    @Test
     @DisplayName("The Worker key applies to the info reads only: availability stays egress-IP keyed")
     void should_keepEgressIpKey_when_workerKeySentToAvailability() throws Exception {
         AuthRateLimitFilter filter = workerAwareFilter();
@@ -381,10 +399,36 @@ class GuestInfoGetRateLimitTest {
     @Test
     @DisplayName("Two spellings of one IPv6 visitor address share one bucket")
     void should_canonicaliseIpv6_when_keyingOnForwardedClientIp() {
-        assertThat(AuthRateLimitFilter.canonicalIpLiteral("2001:db8:0:0:0:0:0:1"))
-                .isEqualTo(AuthRateLimitFilter.canonicalIpLiteral("2001:DB8::1"))
+        assertThat(AuthRateLimitFilter.visitorIpBucketKey("2001:db8:0:0:0:0:0:1"))
+                .isEqualTo(AuthRateLimitFilter.visitorIpBucketKey("2001:DB8::1"))
                 .isNotNull();
-        assertThat(AuthRateLimitFilter.canonicalIpLiteral("198.51.100.10")).isEqualTo("198.51.100.10");
+        assertThat(AuthRateLimitFilter.visitorIpBucketKey("::1.2.3.4"))
+                .isEqualTo(AuthRateLimitFilter.visitorIpBucketKey("0:0:0:0:0:0:102:304"))
+                .isNotNull();
+        assertThat(AuthRateLimitFilter.visitorIpBucketKey("198.51.100.10")).isEqualTo("198.51.100.10");
+    }
+
+    @Test
+    @DisplayName("Visitor bucket key: an all-zero /64 prefix (IPv4-compatible IPv6) keys on the full /128, not a shared ::/64")
+    void should_keyOnFullAddress_when_ipv6Slash64PrefixIsAllZeros() {
+        String compatA = AuthRateLimitFilter.visitorIpBucketKey("::1.2.3.4");
+        String compatB = AuthRateLimitFilter.visitorIpBucketKey("::5.6.7.8");
+
+        assertThat(compatA).isEqualTo("0:0:0:0:0:0:102:304");
+        assertThat(compatB).isEqualTo("0:0:0:0:0:0:506:708");
+        assertThat(AuthRateLimitFilter.visitorIpBucketKey("::1")).isEqualTo("0:0:0:0:0:0:0:1");
+        assertThat(List.of(compatA, compatB)).doesNotContain("0:0:0:0:0:0:0:0/64");
+    }
+
+    @Test
+    @DisplayName("Two IPv4-compatible IPv6 visitors keep separate info buckets")
+    void should_keepSeparateBuckets_when_ipv6ZeroPrefixDifferentAddresses() throws Exception {
+        AuthRateLimitFilter filter = workerAwareFilter();
+        exhaustViaWorker(filter, WORKER_KEY, "::1.2.3.4");
+
+        MockHttpServletResponse otherVisitor = fireOnce(filter, workerGet(SALON_INFO_PATH, WORKER_KEY, "::5.6.7.8"));
+
+        assertThat(otherVisitor.getStatus()).as("a different zero-prefix address is not throttled").isNotEqualTo(429);
     }
 
     @Test

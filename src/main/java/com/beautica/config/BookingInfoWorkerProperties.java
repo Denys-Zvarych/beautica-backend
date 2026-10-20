@@ -17,8 +17,9 @@ import org.springframework.validation.annotation.Validated;
  * <p>Blank (the default) turns the feature off: the header is ignored and every caller is keyed exactly as
  * before. The value is a secret — never log it.
  *
- * <p>Validated at boot: a non-blank key shorter than {@value #MIN_WORKER_KEY_LENGTH} characters (ignoring
- * surrounding whitespace) fails startup. The check is an {@link AssertTrue} on a derived boolean, never a
+ * <p>The bound value is stripped of surrounding whitespace once, in the setter, so validation and matching
+ * see the same key. Validated at boot: a non-blank key shorter than {@value #MIN_WORKER_KEY_LENGTH}
+ * characters fails startup. The check is an {@link AssertTrue} on a derived boolean, never a
  * constraint on the field itself, so the bind-failure report names {@code workerKeyLongEnough=false} and
  * can never echo the secret. Generate it with {@code openssl rand -base64 32}.
  */
@@ -34,8 +35,12 @@ public class BookingInfoWorkerProperties {
         return workerKey;
     }
 
+    /**
+     * Binds the key STRIPPED of surrounding whitespace (e.g. a trailing newline from a secret store), so the
+     * boot length check and the request-time match use the same value; {@code null} binds as blank (off).
+     */
     public void setWorkerKey(String workerKey) {
-        this.workerKey = workerKey;
+        this.workerKey = workerKey == null ? "" : workerKey.strip();
     }
 
     /**
@@ -45,11 +50,11 @@ public class BookingInfoWorkerProperties {
     @AssertTrue(message = "app.booking-info.worker-key (BOOKING_INFO_WORKER_KEY) must be blank or at least "
             + MIN_WORKER_KEY_LENGTH + " characters; generate it with: openssl rand -base64 32")
     public boolean isWorkerKeyLongEnough() {
-        return !isEnabled() || workerKey.strip().length() >= MIN_WORKER_KEY_LENGTH;
+        return !isEnabled() || workerKey.length() >= MIN_WORKER_KEY_LENGTH;
     }
 
     /** {@code true} when a non-blank worker key is configured. */
     public boolean isEnabled() {
-        return workerKey != null && !workerKey.isBlank();
+        return !workerKey.isEmpty();
     }
 }

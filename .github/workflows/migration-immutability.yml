@@ -898,10 +898,30 @@ jobs:
               }'
           }
 
+          # gh_escape_data <s>: GitHub workflow-command message escaping (% CR LF), so an author-written
+          # reason can never break out of its annotation line and inject a second command.
+          gh_escape_data() {
+            local s="$1"
+            s="${s//\%/%25}"
+            s="${s//$'\r'/%0D}"
+            s="${s//$'\n'/%0A}"
+            printf '%s' "$s"
+          }
+
+          # gh_escape_prop <s>: workflow-command PROPERTY escaping (data rules plus : and ,).
+          gh_escape_prop() {
+            local s
+            s="$(gh_escape_data "$1")"
+            s="${s//:/%3A}"
+            s="${s//,/%2C}"
+            printf '%s' "$s"
+          }
+
           # nd_warn <file> <reason>: surfaces an accepted opt-out as a PR annotation + job summary line.
           nd_warn() {
-            local f="$1" msg
-            msg="non-destructive opt-out: $(printf '%s' "$2" | sed -e 's/%/%25/g')"
+            local f msg
+            f="$(gh_escape_prop "$1")"
+            msg="non-destructive opt-out: $(gh_escape_data "$2")"
             echo "::warning file=$f::$msg"
             if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
               echo "::warning file=$f::$msg" >> "$GITHUB_STEP_SUMMARY"
@@ -2723,10 +2743,30 @@ jobs:
               }'
           }
 
+          # gh_escape_data <s>: GitHub workflow-command message escaping (% CR LF), so an author-written
+          # reason can never break out of its annotation line and inject a second command.
+          gh_escape_data() {
+            local s="$1"
+            s="${s//\%/%25}"
+            s="${s//$'\r'/%0D}"
+            s="${s//$'\n'/%0A}"
+            printf '%s' "$s"
+          }
+
+          # gh_escape_prop <s>: workflow-command PROPERTY escaping (data rules plus : and ,).
+          gh_escape_prop() {
+            local s
+            s="$(gh_escape_data "$1")"
+            s="${s//:/%3A}"
+            s="${s//,/%2C}"
+            printf '%s' "$s"
+          }
+
           # nd_warn <file> <reason>: surfaces an accepted opt-out as a PR annotation + job summary line.
           nd_warn() {
-            local f="$1" msg
-            msg="non-destructive opt-out: $(printf '%s' "$2" | sed -e 's/%/%25/g')"
+            local f msg
+            f="$(gh_escape_prop "$1")"
+            msg="non-destructive opt-out: $(gh_escape_data "$2")"
             echo "::warning file=$f::$msg"
             if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
               echo "::warning file=$f::$msg" >> "$GITHUB_STEP_SUMMARY"
@@ -2859,6 +2899,20 @@ jobs:
           expect_warn "SQL marker + reason + ADD CHECK + CREATE UNIQUE INDEX" V4__slug.sql "CHECK + UNIQUE target a column added NULL in this file."
           add V4__slug.sql '  --   non-destructive  \n  -- Reason: 100% new column.\nALTER TABLE old_t ADD COLUMN slug varchar(60);\nALTER TABLE old_t ADD CONSTRAINT uq_slug UNIQUE (slug);\nALTER TABLE old_t ADD UNIQUE (slug);\nALTER TABLE old_t ADD CHECK (slug <> \x27\x27);'
           expect_warn "SQL marker + reason + ADD UNIQUE / ADD CHECK (% escaped in the annotation)" V4__slug.sql "Reason: 100%25 new column."
+          # Workflow-command injection: a CR in the reason must not split the annotation into a second
+          # `::error::` command; the output is exactly one ::warning line with the CR escaped as %0D.
+          add V4__slug.sql '-- non-destructive\n-- evil\r::error::x\nALTER TABLE old_t ADD COLUMN slug varchar(60);\nALTER TABLE old_t ADD CONSTRAINT uq_slug UNIQUE (slug);'
+          iout="$(GITHUB_STEP_SUMMARY="" run_destructive_gate "$BASE_SHA")" || fail "SQL marker + CR-injection reason"
+          [ "$(printf '%s\n' "$iout" | grep -c '::warning')" -eq 1 ] || fail "CR-injection reason: not exactly one ::warning line"
+          printf '%s' "$iout" | tr -d '\n' | grep -q $'\r' && fail "CR-injection reason: raw CR reached the log"
+          printf '%s\n' "$iout" | grep -q '^::error' && fail "CR-injection reason: injected ::error command"
+          printf '%s\n' "$iout" | grep -qF "::warning file=$MIGRATION_PATH/V4__slug.sql::non-destructive opt-out: evil%0D::error::x" || fail "CR-injection reason: CR not escaped as %0D"
+          echo "OK: CR in a reason is escaped (%0D), one annotation, no injected command"
+          reset
+          # Property escaping: `:` and `,` in the file= value are escaped, the message keeps them.
+          [ "$(gh_escape_prop 'a:b,c%d')" = 'a%3Ab%2Cc%25d' ] || fail "gh_escape_prop does not escape : , %"
+          [ "$(gh_escape_data $'a:b,c%d\r\ne')" = 'a:b,c%25d%0D%0Ae' ] || fail "gh_escape_data does not escape % CR LF"
+          echo "OK: workflow-command data/property escaping"
           add V4__slug.sql '-- non-destructive\nCREATE UNIQUE INDEX ux_old_t_slug ON old_t (slug);'
           expect_fail "SQL marker without a reason line"
           add V4__slug.sql '-- non-destructive\n--\nCREATE UNIQUE INDEX ux_old_t_slug ON old_t (slug);'
