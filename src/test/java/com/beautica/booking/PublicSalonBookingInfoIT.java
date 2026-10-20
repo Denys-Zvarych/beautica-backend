@@ -45,6 +45,7 @@ import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -77,10 +78,13 @@ class PublicSalonBookingInfoIT extends AbstractIntegrationTest {
     @Autowired private TransactionTemplate transactionTemplate;
 
     private ServiceTestFixtures fixtures;
+    private String clientIp;
 
     @BeforeEach
     void setUp() {
         fixtures = new ServiceTestFixtures(restTemplate, jdbcTemplate, objectMapper, passwordEncoder);
+        ThreadLocalRandom random = ThreadLocalRandom.current();
+        clientIp = "10." + random.nextInt(1, 255) + "." + random.nextInt(1, 255) + "." + random.nextInt(1, 255);
     }
 
     // ── fixtures ─────────────────────────────────────────────────────────────────────────────
@@ -124,8 +128,15 @@ class PublicSalonBookingInfoIT extends AbstractIntegrationTest {
         return jdbcTemplate.queryForObject("SELECT user_id FROM masters WHERE id = ?", UUID.class, masterId);
     }
 
+    /**
+     * Anonymous GET from this test's own client IP. The {@code /book/**}{@code /info} bucket is a hard-coded
+     * 60/min per IP shared by every IT on the cached context (all of which call from 127.0.0.1); this class
+     * alone spends ~30 of it, so without its own IP a suite run could 429 here or in a sibling IT.
+     */
     private ResponseEntity<String> anonymousGet(String path) {
-        return restTemplate.exchange(path, HttpMethod.GET, new HttpEntity<>(new HttpHeaders()), String.class);
+        HttpHeaders headers = new HttpHeaders();
+        headers.set("X-Forwarded-For", clientIp);
+        return restTemplate.exchange(path, HttpMethod.GET, new HttpEntity<>(headers), String.class);
     }
 
     private JsonNode page(String slug) throws Exception {
