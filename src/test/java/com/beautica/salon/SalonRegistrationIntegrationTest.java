@@ -145,6 +145,28 @@ class SalonRegistrationIntegrationTest extends AbstractIntegrationTest {
                 .isEqualTo(1);
     }
 
+    // ── Phase 376 — every created salon (first AND later) gets its own slug ────
+
+    @Test
+    @DisplayName("Phase 376 D4 — first and second salon of one owner each get a distinct name-based booking slug at creation")
+    void should_issueDistinctBookingSlugs_when_ownerCreatesTwoSalons() {
+        UUID ownerId = persistOwner("owner-slugs@beautica.test");
+        UUID cityId = majorCityIdByName("Вінниця");
+        var first = salonService.createSalon(ownerId, new CreateSalonRequest(
+                "Velvet Studio", null, "Kyiv", null, null, null, null, cityId, null, VALID_STREET, VALID_BUILDING_NO, null));
+        var second = salonService.createSalon(ownerId, new CreateSalonRequest(
+                "Velvet Studio", null, "Lviv", null, null, null, null, cityId, null, VALID_STREET, VALID_BUILDING_NO, null));
+
+        String firstSlug = jdbcTemplate.queryForObject(
+                "SELECT booking_slug FROM salons WHERE id = ?", String.class, first.id());
+        String secondSlug = jdbcTemplate.queryForObject(
+                "SELECT booking_slug FROM salons WHERE id = ?", String.class, second.id());
+
+        assertThat(firstSlug).as("first salon").matches("^velvet-studio-[a-z0-9]{4}$");
+        assertThat(secondSlug).as("second (non-primary) salon, same name").matches("^velvet-studio-[a-z0-9]{4}$");
+        assertThat(secondSlug).as("same name, still globally unique").isNotEqualTo(firstSlug);
+    }
+
     // ── Phase 265 — the derived flag reads the auto-created row ────────────────
 
     @Test

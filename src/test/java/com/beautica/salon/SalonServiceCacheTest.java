@@ -127,6 +127,9 @@ class SalonServiceCacheTest {
     // (listSalonInvites/cancelInvite) and Clock (§G — no bare Instant.now()). This slice does
     // not exercise those paths, so a mock/fixed-clock bean satisfies the wiring only.
     @MockBean com.beautica.user.InviteTokenRepository inviteTokenRepository;
+    // Phase 376: SalonService constructor-depends on BookingSlugService (createSalon issues the new
+    // salon's booking slug). WITHOUT this bean the context fails to load, taking every test red.
+    @MockBean com.beautica.booking.service.BookingSlugService bookingSlugService;
     // SalonService constructor-depends on UserProfileCacheEvictor: createSalon (owner locality
     // sync + auto-created owner-master row), removeAdmin and rotateAdmin all write a `users` row
     // and must stale the user-profile cache. This slice asserts the ownerSalons/salon-detail

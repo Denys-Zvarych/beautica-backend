@@ -19,7 +19,8 @@ public record BookingLinkResponse(
 
         @Schema(requiredMode = Schema.RequiredMode.REQUIRED,
                 example = "https://beautica.app/book/olena-koval-x7k2",
-                description = "Absolute https URL, no UTM (the app appends UTM per share action)")
+                description = "Absolute https URL, no UTM (the app appends UTM per share action): "
+                        + "MASTER https://beautica.app/book/{slug}, SALON https://beautica.app/book/s/{slug}")
         String url,
 
         @Schema(requiredMode = Schema.RequiredMode.REQUIRED, example = "Олена Коваль",
@@ -31,7 +32,8 @@ public record BookingLinkResponse(
         UUID salonId,
 
         @Schema(requiredMode = Schema.RequiredMode.REQUIRED,
-                description = "false = clients see the page but cannot book yet (no active service or no schedule)")
+                description = "false = clients see the page but cannot book yet (MASTER: no active service or no "
+                        + "schedule; SALON: no bookable master)")
         boolean bookable
 ) {
 }

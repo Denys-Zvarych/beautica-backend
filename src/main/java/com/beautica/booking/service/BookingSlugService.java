@@ -6,6 +6,8 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
+import com.beautica.salon.repository.SalonRepository;
+import com.beautica.salon.repository.SalonRepository.SalonBookingLinkRow;
 import com.beautica.service.repository.MasterServiceRepository;
 import com.beautica.user.User;
 import lombok.RequiredArgsConstructor;
@@ -13,13 +15,21 @@ import org.springframework.cache.annotation.Cacheable;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.security.SecureRandom;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
+import java.util.function.Predicate;
 
 /**
  * Generates, persists, and resolves the public per-master booking slug behind
@@ -38,6 +48,11 @@ import java.util.UUID;
  * {@code ^[a-z0-9][a-z0-9\-]*[a-z0-9]$} and is {@code <= 60} chars. Global
  * uniqueness is enforced by a bounded retry loop against
  * {@link MasterRepository#existsByBookingSlug}.
+ *
+ * <p><b>Salons (phase 376).</b> The same generator issues salon slugs
+ * ({@code beautica.app/book/s/{slug}}) from the salon name, probed against
+ * {@link SalonRepository#existsByBookingSlug} — a separate namespace, so a salon slug may
+ * equal a master slug. Master generation is byte-identical to before the refactor.
  */
 @Service
 @RequiredArgsConstructor
@@ -49,6 +64,8 @@ public class BookingSlugService {
     /** Reserve room for the "-XXXX" random suffix so the whole slug fits in 60 chars. */
     private static final int MAX_BASE_LENGTH = MAX_SLUG_LENGTH - (RANDOM_SUFFIX_LENGTH + 1);
     private static final String FALLBACK_BASE = "master";
+    /** Phase 376 — base used when a salon name transliterates to fewer than 2 slug chars. */
+    private static final String SALON_FALLBACK_BASE = "salon";
     private static final char[] SLUG_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789".toCharArray();
     /** Public master menu is tiny; cap the unbounded list read defensively (Anti-Bug §E-3). */
     private static final int MAX_SERVICES = 100;
@@ -67,6 +84,7 @@ public class BookingSlugService {
 
     private final MasterRepository masterRepository;
     private final MasterServiceRepository masterServiceRepository;
+    private final SalonRepository salonRepository;
     private final SecureRandom random = new SecureRandom();
 
     /**
@@ -132,15 +150,135 @@ public class BookingSlugService {
      * colliding is effectively impossible in practice.
      */
     public String generateSlug(String firstName, String lastName) {
-        String base = buildBase(firstName, lastName);
+        return generateSlug(composeName(firstName, lastName), FALLBACK_BASE, masterRepository::existsByBookingSlug);
+    }
+
+    /**
+     * Phase 376 — a globally-unique SALON slug from the salon name: the same generator as masters
+     * ({@link #generateSlug(String, String, Predicate)}), probed against the salon namespace (D2/D3).
+     * Used directly by {@code SalonService#createSalon}, which writes it with the INSERT.
+     *
+     * <p><b>Collision-proof INSERT (376 audit).</b> Each candidate's advisory lock
+     * ({@link SalonRepository#lockBookingSlugCandidates}) is taken BEFORE its existence probe and held to
+     * the caller's commit, so no other salon-slug writer can pick the same value in between — the INSERT
+     * cannot hit {@code idx_salons_booking_slug}. A candidate already stored is replaced by a fresh one (the
+     * generator's bounded retry). Must therefore run inside the writer's transaction; outside one the lock
+     * would be released at once — hence {@code MANDATORY} (376 audit cycle 2): a caller without a
+     * transaction fails with {@code IllegalTransactionStateException} instead of silently racing.
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public String generateSalonSlug(String salonName) {
+        return generateSlug(salonName, SALON_FALLBACK_BASE, this::isSalonSlugTakenUnderLock);
+    }
+
+    private boolean isSalonSlugTakenUnderLock(String candidate) {
+        salonRepository.lockBookingSlugCandidates(new String[] {candidate});
+        return salonRepository.existsByBookingSlug(candidate);
+    }
+
+    /**
+     * Phase 376 (audit perf LOW) — race-safe lazy issue for ALL of a caller's legacy
+     * ({@code booking_slug NULL}) salons on {@code GET /booking-links/mine}, in ONE short transaction and
+     * a constant number of statements (row lock, candidate lock, probe, one batched {@code UPDATE}) instead
+     * of one transaction per salon.
+     *
+     * <p>The rows still lacking a slug are locked in id order ({@link SalonRepository#lockSalonIdsWithoutBookingSlug});
+     * a salon a concurrent call issued meanwhile drops out there and its committed slug is re-read, so
+     * every caller observes the one permanent slug (D4/D5). Candidates are locked before they are probed
+     * (see {@link #generateSalonSlug}), so the {@code UPDATE} cannot hit {@code idx_salons_booking_slug}
+     * either; should it ever, the violation marks this transaction rollback-only and the caller's single
+     * retry ({@code BookingLinkService#issueMissingSalonSlugs}) runs in a fresh one — so callers must NOT
+     * wrap this in an outer transaction.
+     *
+     * <p>A salon deleted after the caller's read (376 audit cycle 2) is neither locked nor re-read, so it is
+     * simply absent from the result — the caller omits its link rather than failing the whole request.
+     *
+     * @param salons the caller's active salons it read with a {@code null} slug (id + name, no re-read)
+     * @return salon id → its permanent slug, for every given salon that still exists
+     */
+    @Transactional
+    public Map<UUID, String> issueMissingSalonSlugs(List<SalonBookingLinkRow> salons) {
+        List<UUID> salonIds = salons.stream().map(SalonBookingLinkRow::getId).toList();
+        Set<UUID> stillMissing = new HashSet<>(salonRepository.lockSalonIdsWithoutBookingSlug(salonIds));
+        Map<UUID, String> slugs = allocateSalonSlugs(salons.stream()
+                .filter(salon -> stillMissing.contains(salon.getId()))
+                .toList());
+        if (!slugs.isEmpty()) {
+            UUID[] issuedIds = slugs.keySet().toArray(UUID[]::new);
+            salonRepository.assignBookingSlugsIfAbsent(
+                    issuedIds, Arrays.stream(issuedIds).map(slugs::get).toArray(String[]::new));
+        }
+        putCommittedSalonSlugs(salonIds.stream().filter(salonId -> !slugs.containsKey(salonId)).toList(), slugs);
+        return slugs;
+    }
+
+    /** Re-reads the concurrently issued slugs in ONE statement; a salon gone meanwhile stays absent. */
+    private void putCommittedSalonSlugs(List<UUID> losers, Map<UUID, String> slugs) {
+        if (losers.isEmpty()) {
+            return;
+        }
+        salonRepository.findBookingSlugsByIds(losers.toArray(UUID[]::new))
+                .forEach(row -> slugs.put(row.getId(), row.getBookingSlug()));
+    }
+
+    /**
+     * Batched twin of {@link #generateSlug(String, String, Predicate)}: the same base and random suffix,
+     * the same {@value #MAX_GENERATION_ATTEMPTS}-round bound, but each round locks (sorted, one statement)
+     * and probes (one statement) all pending candidates at once. A candidate already stored, or drawn twice
+     * within the batch, is redrawn next round.
+     */
+    private Map<UUID, String> allocateSalonSlugs(List<SalonBookingLinkRow> salons) {
+        Map<UUID, String> bases = new LinkedHashMap<>();
+        salons.forEach(salon -> bases.put(salon.getId(), buildBase(salon.getName(), SALON_FALLBACK_BASE)));
+        Map<UUID, String> allocated = new HashMap<>();
+        List<UUID> pending = List.copyOf(bases.keySet());
+        for (int round = 0; round < MAX_GENERATION_ATTEMPTS && !pending.isEmpty(); round++) {
+            pending = allocateRound(pending, bases, allocated);
+        }
+        if (!pending.isEmpty()) {
+            throw slugExhausted();
+        }
+        return allocated;
+    }
+
+    /** One lock + probe round; returns the salons whose candidate was taken (to redraw). */
+    private List<UUID> allocateRound(List<UUID> pending, Map<UUID, String> bases, Map<UUID, String> allocated) {
+        Map<UUID, String> candidates = new LinkedHashMap<>();
+        pending.forEach(salonId -> candidates.put(salonId, bases.get(salonId) + "-" + randomSuffix()));
+        List<String> sorted = candidates.values().stream().distinct().sorted().toList();
+        salonRepository.lockBookingSlugCandidates(sorted.toArray(String[]::new));
+        Set<String> claimed = new HashSet<>(salonRepository.findExistingBookingSlugs(sorted));
+        claimed.addAll(allocated.values());
+        List<UUID> redraw = new ArrayList<>();
+        candidates.forEach((salonId, candidate) -> {
+            if (claimed.add(candidate)) {
+                allocated.put(salonId, candidate);
+            } else {
+                redraw.add(salonId);
+            }
+        });
+        return redraw;
+    }
+
+    /**
+     * The one slug generator (phase 376 D3) shared by masters and salons: transliterates and normalises
+     * {@code displayBase} (falling back to {@code fallbackBase} below 2 chars), then appends
+     * {@code '-'} + 4 random {@code [a-z0-9]} chars, retrying up to {@value #MAX_GENERATION_ATTEMPTS}
+     * times while {@code exists} reports a collision in the target namespace.
+     */
+    private String generateSlug(String displayBase, String fallbackBase, Predicate<String> exists) {
+        String base = buildBase(displayBase, fallbackBase);
         for (int attempt = 0; attempt < MAX_GENERATION_ATTEMPTS; attempt++) {
             String candidate = base + "-" + randomSuffix();
-            if (!masterRepository.existsByBookingSlug(candidate)) {
+            if (!exists.test(candidate)) {
                 return candidate;
             }
         }
-        throw new BusinessException(
-                HttpStatus.CONFLICT, "Could not allocate a unique booking slug");
+        throw slugExhausted();
+    }
+
+    private static BusinessException slugExhausted() {
+        return new BusinessException(HttpStatus.CONFLICT, "Could not allocate a unique booking slug");
     }
 
     /**
@@ -169,11 +307,11 @@ public class BookingSlugService {
                 services);
     }
 
-    private String buildBase(String firstName, String lastName) {
-        String raw = composeName(firstName, lastName);
+    private String buildBase(String displayBase, String fallbackBase) {
+        String raw = displayBase == null ? "" : displayBase.trim();
         String base = normalize(transliterate(raw));
         if (base.length() < 2) {
-            base = FALLBACK_BASE;
+            base = fallbackBase;
         }
         return truncateBase(base);
     }

@@ -187,6 +187,9 @@ public class SalonService {
     // Owns every native cache scan (CacheKeyScanOwnershipTest) — the logo-change search-page
     // eviction delegates its by-value scan here.
     private final com.beautica.common.cache.MasterCachePrefixEvictor cachePrefixEvictor;
+    // Phase 376 — the shared name-based slug generator (masters + salons); a new salon's permanent
+    // public booking slug is generated here and written with the INSERT.
+    private final com.beautica.booking.service.BookingSlugService bookingSlugService;
 
     /**
      * Hard ceiling on rows returned by {@link #listSalonInvites}.
@@ -333,6 +336,17 @@ public class SalonService {
                 .instagramUrl(normalizeInstagram(request.instagramUrl()))
                 .isActive(true)
                 .isPrimary(isFirstSalon)
+                // Phase 376 D4: issued at creation, in the same INSERT (no follow-up UPDATE); legacy
+                // NULL rows are issued by BookingSlugService#issueMissingSalonSlugs. Never changes.
+                // 376 audit — the probe-then-INSERT cannot collide: generateSalonSlug takes the
+                // candidate's advisory lock (held to THIS transaction's commit) before probing, the same
+                // lock every salon-slug writer takes. Prevention, not catch-and-retry: a unique violation
+                // aborts the whole Postgres transaction (no JPA savepoints — nestedTransactionAllowed is
+                // off and would not restore the persistence context anyway), and the INSERT may only
+                // flush at commit, outside any in-method catch. Other violations are untouched.
+                // Its fused set_config('lock_timeout', '3s', true) is transaction-local, so from here
+                // on the 3 s lock_timeout also bounds every later lock wait in this createSalon transaction.
+                .bookingSlug(bookingSlugService.generateSalonSlug(request.name()))
                 .build();
         salon.applySettlementDisplayNames(settlementNames);
 

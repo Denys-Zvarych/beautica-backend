@@ -11,6 +11,8 @@ import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.jpa.repository.QueryHints;
 import org.springframework.data.repository.query.Param;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.util.Collection;
 import java.util.List;
@@ -672,4 +674,159 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
             @Param("offset") long offset,
             @Param(com.beautica.master.repository.MasterBookabilitySql.TODAY_PARAM) java.time.LocalDate today
     );
+
+    // ── Phase 376 — salon booking slug (beautica.app/book/s/{slug}) ─────────────────────────────
+
+    /** Generator uniqueness probe for salon slugs (separate namespace from masters, D2). */
+    boolean existsByBookingSlug(String bookingSlug);
+
+    /**
+     * Resolves a public salon slug to its ACTIVE salon (phase 377 public page). An inactive salon's
+     * slug resolves to nothing, so its page 404s (D8).
+     */
+    Optional<Salon> findByBookingSlugAndIsActiveTrue(String bookingSlug);
+
+    /**
+     * Phase 376 audit — serialises every salon-slug WRITER on the candidate value: a transaction-scoped
+     * advisory lock per candidate ({@code pg_advisory_xact_lock}, seed {@value #BOOKING_SLUG_LOCK_SEED}),
+     * taken in sorted order (deadlock-free between batches) and released only at COMMIT/ROLLBACK. Both
+     * writers — {@code SalonService#createSalon} (one candidate, inside its own transaction) and the
+     * batched lazy issue {@code BookingSlugService#issueMissingSalonSlugs} — take it BEFORE the existence
+     * probe, so a probe that reports a candidate free stays true until the writer commits: two writers can
+     * never both pick the same slug, and the {@code idx_salons_booking_slug} INSERT/UPDATE cannot collide.
+     * The probe must be a SEPARATE statement issued after this one (READ COMMITTED: a statement's snapshot
+     * is taken at its start, so a probe folded into the lock statement would miss a row committed while
+     * waiting for the lock). Native: {@code pg_advisory_xact_lock} returns {@code void}, hence the count.
+     *
+     * <p><b>3s {@code lock_timeout}, fused into the same round trip</b> (376 audit cycle 2) — the
+     * target-list shape of {@code BookingRepository#acquireAdvisoryLockWithTimeout}: {@code set_config}
+     * sits BEFORE {@code pg_advisory_xact_lock} in the target list, so it is evaluated first (pinned by
+     * {@code AdvisoryLockFusionOrderIT}); both are volatile, so they run after the {@code ORDER BY}
+     * and the locks are still taken in sorted order. A wait beyond it fails with {@code 55P03} →
+     * {@code CannotAcquireLockException} → 409 via {@code GlobalExceptionHandler#handlePessimisticLockingFailure}.
+     *
+     * <p>{@code MANDATORY}: an advisory xact lock taken outside a transaction is released at once, so a
+     * caller without one would get no serialisation at all — fail loudly instead.
+     *
+     * <p>Array parameters (not collections): Hibernate expands a collection inside {@code ARRAY[...]} to a
+     * row constructor {@code (?,?)}, which Postgres cannot cast to an array.
+     *
+     * @return the number of locks taken (= distinct candidates)
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    @QueryHints(@QueryHint(name = HibernateHints.HINT_NATIVE_SPACES, value = "salons"))
+    @Query(value = "SELECT count(*) FROM (SELECT set_config('lock_timeout', '3s', true), "
+            + "pg_advisory_xact_lock(hashtextextended(c, " + BOOKING_SLUG_LOCK_SEED + ")) "
+            + "FROM unnest(CAST(:slugs AS text[])) AS c ORDER BY c) AS l",
+            nativeQuery = true)
+    long lockBookingSlugCandidates(@Param("slugs") String[] slugs);
+
+    /** Advisory-lock seed of the salon booking-slug namespace (0–3 are taken by booking/service locks). */
+    int BOOKING_SLUG_LOCK_SEED = 4;
+
+    /** Batched generator probe: which of {@code slugs} are already stored on some salon. */
+    @Query("SELECT s.bookingSlug FROM Salon s WHERE s.bookingSlug IN :slugs")
+    List<String> findExistingBookingSlugs(@Param("slugs") Collection<String> slugs);
+
+    /**
+     * Phase 376 audit — locks the caller's still-slugless salons (in id order so two concurrent batches over
+     * overlapping salons cannot deadlock) and returns their ids. A salon a concurrent call issued meanwhile
+     * is excluded (re-checked on the committed row version) and its slug is re-read via
+     * {@link #findBookingSlugsByIds}.
+     *
+     * <p><b>{@code FOR NO KEY UPDATE}, not {@code FOR UPDATE}</b> (376 audit cycle 2) — the convention of
+     * {@link #findByIdForUpdate}: {@code booking_slug} is no key column ({@code idx_salons_booking_slug} is a
+     * partial unique index, which FK lock strength ignores), so FK inserts referencing the salon are never
+     * blocked, while two issuers still serialise ({@code NO KEY UPDATE} conflicts with itself).
+     *
+     * <p><b>3s {@code lock_timeout}, fused</b> — the same {@code CROSS JOIN (SELECT set_config(...))
+     * lock_cfg} join-source shape as {@link #findByIdForUpdate}; {@code 55P03} → 409. {@code MANDATORY}: a
+     * row lock outside a transaction is released at once.
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    @QueryHints(@QueryHint(name = HibernateHints.HINT_NATIVE_SPACES, value = "salons"))
+    @Query(value = """
+            SELECT s.id FROM salons s
+            CROSS JOIN (SELECT set_config('lock_timeout', '3s', true)) lock_cfg
+            WHERE s.id IN (:salonIds) AND s.booking_slug IS NULL
+            ORDER BY s.id
+            FOR NO KEY UPDATE OF s
+            """, nativeQuery = true)
+    List<UUID> lockSalonIdsWithoutBookingSlug(@Param("salonIds") Collection<UUID> salonIds);
+
+    /**
+     * Phase 376 audit — writes every allocated slug in ONE statement ({@code salonIds[i]} gets
+     * {@code slugs[i]}), still only where the row has none ({@code booking_slug IS NULL}, belt and braces
+     * behind {@link #lockSalonIdsWithoutBookingSlug}). Native, because {@code Salon.bookingSlug} is
+     * {@code updatable = false}.
+     *
+     * @return the number of rows written
+     */
+    @Modifying
+    @QueryHints(@QueryHint(name = HibernateHints.HINT_NATIVE_SPACES, value = "salons"))
+    @Query(value = "UPDATE salons s SET booking_slug = v.slug "
+            + "FROM unnest(CAST(:salonIds AS uuid[]), CAST(:slugs AS text[])) AS v(id, slug) "
+            + "WHERE s.id = v.id AND s.booking_slug IS NULL",
+            nativeQuery = true)
+    int assignBookingSlugsIfAbsent(@Param("salonIds") UUID[] salonIds, @Param("slugs") String[] slugs);
+
+    /**
+     * The CURRENT committed slugs of {@code salonIds} (concurrent issuers' winners), read straight from the
+     * table in ONE statement (376 audit cycle 2). A salon that no longer exists, or still has no slug, is
+     * simply absent from the result.
+     */
+    @QueryHints(@QueryHint(name = HibernateHints.HINT_NATIVE_SPACES, value = "salons"))
+    @Query(value = """
+            SELECT id AS "id", booking_slug AS "bookingSlug" FROM salons
+            WHERE id = ANY(CAST(:salonIds AS uuid[])) AND booking_slug IS NOT NULL
+            """, nativeQuery = true)
+    List<SalonSlugRow> findBookingSlugsByIds(@Param("salonIds") UUID[] salonIds);
+
+    /** Row of {@link #findBookingSlugsByIds}. */
+    interface SalonSlugRow {
+        UUID getId();
+
+        String getBookingSlug();
+    }
+
+    /** Row of the caller-scoped booking-link reads below — no entity, no association to initialise. */
+    interface SalonBookingLinkRow {
+        UUID getId();
+
+        String getName();
+
+        String getBookingSlug();
+    }
+
+    /**
+     * Every ACTIVE salon the owner owns, in ONE statement, ordered by name (the link-list order).
+     * Bounded by {@code SalonService.MAX_ACTIVE_SALONS_PER_OWNER}; backed by the V46 partial index
+     * {@code idx_salons_owner_active_created}.
+     */
+    @Query("SELECT s.id AS id, s.name AS name, s.bookingSlug AS bookingSlug FROM Salon s "
+            + "WHERE s.owner.id = :ownerId AND s.isActive = true ORDER BY s.name, s.id")
+    List<SalonBookingLinkRow> findBookingLinkRowsByOwnerId(@Param("ownerId") UUID ownerId);
+
+    /**
+     * The ACTIVE salon a {@code SALON_ADMIN} is bound to ({@code users.salon_id}, the same assignment
+     * {@code AuthorizationService#adminBelongsToSalon} reads), in ONE statement. The role predicate
+     * runs against the stored row, so a stale token role cannot borrow another user's salon binding.
+     */
+    @Query("SELECT s.id AS id, s.name AS name, s.bookingSlug AS bookingSlug FROM Salon s "
+            + "WHERE s.isActive = true AND s.id IN "
+            + "(SELECT u.salonId FROM User u WHERE u.id = :userId AND u.role = com.beautica.auth.Role.SALON_ADMIN)")
+    List<SalonBookingLinkRow> findBookingLinkRowsByAdminUserId(@Param("userId") UUID userId);
+
+    /**
+     * The subset of {@code salonIds} that is bookable, in ONE statement — the salon analogue of
+     * {@code MasterRepository#findSearchBookability}. Reads the single shared rule
+     * {@link com.beautica.master.repository.MasterBookabilitySql#BOOKABLE_SALON_S} (active salon with
+     * ≥1 active bookable master) that discovery search and favourites list salons by.
+     */
+    @Query(value = "SELECT s.id FROM salons s WHERE s.id IN (:salonIds) AND s.is_active = true AND"
+            + com.beautica.master.repository.MasterBookabilitySql.BOOKABLE_SALON_S,
+            nativeQuery = true)
+    List<UUID> findBookableSalonIds(
+            @Param("salonIds") Collection<UUID> salonIds,
+            @Param(com.beautica.master.repository.MasterBookabilitySql.TODAY_PARAM) java.time.LocalDate today);
 }

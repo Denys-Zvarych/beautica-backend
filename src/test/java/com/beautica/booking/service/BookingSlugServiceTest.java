@@ -5,6 +5,8 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
+import com.beautica.salon.repository.SalonRepository;
+import com.beautica.salon.repository.SalonRepository.SalonBookingLinkRow;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.repository.MasterServiceRepository;
@@ -12,19 +14,27 @@ import com.beautica.user.User;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
 import java.math.BigDecimal;
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyCollection;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.atLeastOnce;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -43,6 +53,9 @@ class BookingSlugServiceTest {
 
     @Mock
     private MasterServiceRepository masterServiceRepository;
+
+    @Mock
+    private SalonRepository salonRepository;
 
     @InjectMocks
     private BookingSlugService service;
@@ -227,6 +240,219 @@ class BookingSlugServiceTest {
         assertThatThrownBy(() -> service.getOrIssueSlugRaceSafe(master))
                 .isInstanceOf(NotFoundException.class)
                 .hasMessage("Master not found");
+    }
+
+    // ── phase 376 — salon slugs (shared generator, salon namespace) ────────
+
+    @Test
+    @DisplayName("salon «Beauty Lab Київ» → beauty-lab-kyiv-xxxx, probed against the SALON namespace only")
+    void should_transliterateSalonNameAndProbeSalonNamespace_when_generatingSalonSlug() {
+        when(salonRepository.existsByBookingSlug(anyString())).thenReturn(false);
+
+        String slug = service.generateSalonSlug("Beauty Lab Київ");
+
+        assertThat(slug).matches("^beauty-lab-kyiv-[a-z0-9]{4}$");
+        verify(salonRepository).existsByBookingSlug(slug);
+        verify(masterRepository, never()).existsByBookingSlug(anyString());
+    }
+
+    @Test
+    @DisplayName("salon name with no slug-able chars → 'salon' fallback base")
+    void should_useSalonFallbackBase_when_salonNameHasNoSlugChars() {
+        when(salonRepository.existsByBookingSlug(anyString())).thenReturn(false);
+
+        String slug = service.generateSalonSlug("✦ ✦");
+
+        assertThat(slug).matches("^salon-[a-z0-9]{4}$");
+    }
+
+    @Test
+    @DisplayName("salon slug collides on every attempt → CONFLICT after exactly 5 probes")
+    void should_throwConflict_when_salonSlugAttemptsExhausted() {
+        when(salonRepository.existsByBookingSlug(anyString())).thenReturn(true);
+
+        assertThatThrownBy(() -> service.generateSalonSlug("Beauty Lab"))
+                .isInstanceOf(BusinessException.class)
+                .hasMessage("Could not allocate a unique booking slug")
+                .extracting(e -> ((BusinessException) e).getStatus())
+                .isEqualTo(org.springframework.http.HttpStatus.CONFLICT);
+        verify(salonRepository, times(5)).existsByBookingSlug(anyString());
+    }
+
+    @Test
+    @DisplayName("createSalon path: each candidate's advisory lock is taken BEFORE its probe; a taken one is redrawn under a fresh lock (376 audit)")
+    void should_lockCandidateBeforeProbingAndRedraw_when_salonCandidateTaken() {
+        when(salonRepository.existsByBookingSlug(anyString())).thenReturn(true, false);
+
+        String slug = service.generateSalonSlug("Beauty Lab");
+
+        ArgumentCaptor<String> probed = ArgumentCaptor.forClass(String.class);
+        verify(salonRepository, times(2)).existsByBookingSlug(probed.capture());
+        String taken = probed.getAllValues().get(0);
+        InOrder order = inOrder(salonRepository);
+        order.verify(salonRepository).lockBookingSlugCandidates(new String[] {taken});
+        order.verify(salonRepository).existsByBookingSlug(taken);
+        order.verify(salonRepository).lockBookingSlugCandidates(new String[] {slug});
+        order.verify(salonRepository).existsByBookingSlug(slug);
+        assertThat(slug).isEqualTo(probed.getAllValues().get(1)).startsWith("beauty-lab-");
+    }
+
+    private static SalonRepository.SalonSlugRow slugRow(UUID id, String slug) {
+        return new SalonRepository.SalonSlugRow() {
+            @Override public UUID getId() { return id; }
+            @Override public String getBookingSlug() { return slug; }
+        };
+    }
+
+    private static SalonBookingLinkRow salonRow(UUID id, String name) {
+        return new SalonBookingLinkRow() {
+            @Override public UUID getId() { return id; }
+            @Override public String getName() { return name; }
+            @Override public String getBookingSlug() { return null; }
+        };
+    }
+
+    @Test
+    @DisplayName("batched salon issue → rows locked, candidates locked then probed ONCE, ONE UPDATE for all, no re-read")
+    void should_issueAllSalonSlugsWithOneLockProbeAndUpdate_when_salonsStillMissing() {
+        UUID a = UUID.randomUUID();
+        UUID b = UUID.randomUUID();
+        UUID c = UUID.randomUUID();
+        when(salonRepository.lockSalonIdsWithoutBookingSlug(List.of(a, b, c))).thenReturn(List.of(a, b, c));
+        when(salonRepository.findExistingBookingSlugs(anyCollection())).thenReturn(List.of());
+
+        Map<UUID, String> slugs = service.issueMissingSalonSlugs(
+                List.of(salonRow(a, "Alfa"), salonRow(b, "Beta Київ"), salonRow(c, "Alfa")));
+
+        assertThat(slugs.get(a)).matches("^alfa-[a-z0-9]{4}$");
+        assertThat(slugs.get(b)).matches("^beta-kyiv-[a-z0-9]{4}$");
+        assertThat(slugs.get(c)).matches("^alfa-[a-z0-9]{4}$").isNotEqualTo(slugs.get(a));
+        InOrder order = inOrder(salonRepository);
+        order.verify(salonRepository).lockSalonIdsWithoutBookingSlug(List.of(a, b, c));
+        order.verify(salonRepository, atLeastOnce()).lockBookingSlugCandidates(any());
+        order.verify(salonRepository, atLeastOnce()).findExistingBookingSlugs(anyCollection());
+        ArgumentCaptor<UUID[]> ids = ArgumentCaptor.captor();
+        ArgumentCaptor<String[]> written = ArgumentCaptor.captor();
+        order.verify(salonRepository).assignBookingSlugsIfAbsent(ids.capture(), written.capture());
+        assertThat(ids.getValue()).containsExactlyInAnyOrder(a, b, c);
+        for (int i = 0; i < ids.getValue().length; i++) {
+            assertThat(written.getValue()[i]).isEqualTo(slugs.get(ids.getValue()[i]));
+        }
+        verify(salonRepository, never()).findBookingSlugsByIds(any());
+        verify(salonRepository, never()).existsByBookingSlug(anyString());
+    }
+
+    @Test
+    @DisplayName("batched salon issue → candidates locked in sorted order, before the probe")
+    void should_lockCandidatesSorted_when_issuingBatch() {
+        UUID a = UUID.randomUUID();
+        UUID b = UUID.randomUUID();
+        when(salonRepository.lockSalonIdsWithoutBookingSlug(List.of(a, b))).thenReturn(List.of(a, b));
+        when(salonRepository.findExistingBookingSlugs(anyCollection())).thenReturn(List.of());
+
+        service.issueMissingSalonSlugs(List.of(salonRow(a, "Zeta"), salonRow(b, "Alfa")));
+
+        ArgumentCaptor<String[]> locked = ArgumentCaptor.captor();
+        verify(salonRepository).lockBookingSlugCandidates(locked.capture());
+        assertThat(locked.getValue()).hasSize(2).isSorted();
+    }
+
+    @Test
+    @DisplayName("batched salon issue, a candidate already stored → only that salon redrawn in a second lock+probe round")
+    void should_redrawOnlyTakenCandidate_when_batchCandidateAlreadyStored() {
+        UUID a = UUID.randomUUID();
+        UUID b = UUID.randomUUID();
+        when(salonRepository.lockSalonIdsWithoutBookingSlug(List.of(a, b))).thenReturn(List.of(a, b));
+        List<Collection<String>> probes = new ArrayList<>();
+        when(salonRepository.findExistingBookingSlugs(anyCollection())).thenAnswer(inv -> {
+            Collection<String> candidates = inv.getArgument(0);
+            probes.add(List.copyOf(candidates));
+            // First round: Alfa's candidate is taken; every later round is free.
+            return probes.size() == 1
+                    ? candidates.stream().filter(slug -> slug.startsWith("alfa-")).toList()
+                    : List.of();
+        });
+
+        Map<UUID, String> slugs = service.issueMissingSalonSlugs(List.of(salonRow(a, "Alfa"), salonRow(b, "Beta")));
+
+        assertThat(probes).hasSize(2);
+        assertThat(probes.get(1)).containsExactly(slugs.get(a));
+        assertThat(probes.get(0)).doesNotContain(slugs.get(a)).contains(slugs.get(b));
+        verify(salonRepository, times(2)).lockBookingSlugCandidates(any());
+    }
+
+    @Test
+    @DisplayName("batched salon issue, every round collides → CONFLICT after 5 rounds, nothing written")
+    void should_throwConflictAndWriteNothing_when_batchAttemptsExhausted() {
+        UUID a = UUID.randomUUID();
+        when(salonRepository.lockSalonIdsWithoutBookingSlug(List.of(a))).thenReturn(List.of(a));
+        when(salonRepository.findExistingBookingSlugs(anyCollection()))
+                .thenAnswer(inv -> List.copyOf((Collection<String>) inv.getArgument(0)));
+
+        assertThatThrownBy(() -> service.issueMissingSalonSlugs(List.of(salonRow(a, "Alfa"))))
+                .isInstanceOf(BusinessException.class)
+                .hasMessage("Could not allocate a unique booking slug");
+        verify(salonRepository, times(5)).findExistingBookingSlugs(anyCollection());
+        verify(salonRepository, never()).assignBookingSlugsIfAbsent(any(), any());
+    }
+
+    @Test
+    @DisplayName("batched salon issue, a concurrent call issued one salon first → that salon's stored slug re-read, only the other written")
+    void should_reReadConcurrentlyIssuedSlug_when_rowNoLongerMissingAtLock() {
+        UUID a = UUID.randomUUID();
+        UUID b = UUID.randomUUID();
+        when(salonRepository.lockSalonIdsWithoutBookingSlug(List.of(a, b))).thenReturn(List.of(b));
+        when(salonRepository.findExistingBookingSlugs(anyCollection())).thenReturn(List.of());
+        when(salonRepository.findBookingSlugsByIds(new UUID[] {a})).thenReturn(List.of(slugRow(a, "alfa-win1")));
+
+        Map<UUID, String> slugs = service.issueMissingSalonSlugs(List.of(salonRow(a, "Alfa"), salonRow(b, "Beta")));
+
+        assertThat(slugs.get(a)).isEqualTo("alfa-win1");
+        assertThat(slugs.get(b)).matches("^beta-[a-z0-9]{4}$");
+        verify(salonRepository).assignBookingSlugsIfAbsent(new UUID[] {b}, new String[] {slugs.get(b)});
+    }
+
+    @Test
+    @DisplayName("batched salon issue, every row issued concurrently → no candidate lock, probe or UPDATE, ONE batched re-read")
+    void should_onlyReRead_when_noRowMissingAtLock() {
+        UUID a = UUID.randomUUID();
+        UUID b = UUID.randomUUID();
+        when(salonRepository.lockSalonIdsWithoutBookingSlug(List.of(a, b))).thenReturn(List.of());
+        when(salonRepository.findBookingSlugsByIds(new UUID[] {a, b}))
+                .thenReturn(List.of(slugRow(a, "alfa-win1"), slugRow(b, "beta-win2")));
+
+        Map<UUID, String> slugs = service.issueMissingSalonSlugs(List.of(salonRow(a, "Alfa"), salonRow(b, "Beta")));
+
+        assertThat(slugs).containsOnly(Map.entry(a, "alfa-win1"), Map.entry(b, "beta-win2"));
+        verify(salonRepository, times(1)).findBookingSlugsByIds(any());
+        verify(salonRepository, never()).lockBookingSlugCandidates(any());
+        verify(salonRepository, never()).findExistingBookingSlugs(anyCollection());
+        verify(salonRepository, never()).assignBookingSlugsIfAbsent(any(), any());
+    }
+
+    @Test
+    @DisplayName("376 audit cycle 2: batched salon issue, a salon deleted before the lock → omitted from the result, no 404")
+    void should_omitSalon_when_salonRowGoneOnReRead() {
+        UUID a = UUID.randomUUID();
+        UUID b = UUID.randomUUID();
+        when(salonRepository.lockSalonIdsWithoutBookingSlug(List.of(a, b))).thenReturn(List.of(b));
+        when(salonRepository.findExistingBookingSlugs(anyCollection())).thenReturn(List.of());
+        when(salonRepository.findBookingSlugsByIds(new UUID[] {a})).thenReturn(List.of());
+
+        Map<UUID, String> slugs = service.issueMissingSalonSlugs(List.of(salonRow(a, "Alfa"), salonRow(b, "Beta")));
+
+        assertThat(slugs).containsOnlyKeys(b);
+        assertThat(slugs.get(b)).matches("^beta-[a-z0-9]{4}$");
+    }
+
+    @Test
+    @DisplayName("master generation never probes the salon namespace (D2 — per-table uniqueness)")
+    void should_notProbeSalonNamespace_when_generatingMasterSlug() {
+        when(masterRepository.existsByBookingSlug(anyString())).thenReturn(false);
+
+        service.generateSlug("Олена", "Коваль");
+
+        verify(salonRepository, never()).existsByBookingSlug(anyString());
     }
 
     // ── findBySlug ──────────────────────────────────────────────────────────

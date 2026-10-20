@@ -60,4 +60,27 @@ class BookingLinkOpenApiContractIT extends AbstractIntegrationTest {
         assertThat(texts(link.path("properties").path("kind").path("enum")))
                 .containsExactlyInAnyOrder("MASTER", "SALON");
     }
+
+    @Test
+    @DisplayName("phase 376: /booking-links/mine operation documents SALON links for owner/admin, the /book/s/{slug} URL and the 409 lock timeout")
+    void should_documentSalonLinks_when_specRendered() throws Exception {
+        JsonNode spec = spec();
+        JsonNode get = spec.path("paths").path("/api/v1/booking-links/mine").path("get");
+        String description = get.path("description").asText();
+        String tagDescription = "";
+        for (JsonNode tag : spec.path("tags")) {
+            if ("Booking links".equals(tag.path("name").asText())) {
+                tagDescription = tag.path("description").asText();
+            }
+        }
+
+        assertThat(description)
+                .as("mobile 413/414 read the role matrix from this text, actual=%s", description)
+                .contains("SALON_OWNER", "SALON_ADMIN", "SALON link", "https://beautica.app/book/s/{slug}");
+        assertThat(tagDescription).as("tag, actual=%s", tagDescription).contains("beautica.app/book/s/{slug}");
+        assertThat(get.path("responses").has("409")).as("lock-timeout 409 documented").isTrue();
+        assertThat(spec.path("components").path("schemas").path("BookingLinkResponse")
+                .path("properties").path("url").path("description").asText())
+                .contains("/book/s/{slug}");
+    }
 }

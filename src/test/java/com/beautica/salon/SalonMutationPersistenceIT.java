@@ -2,9 +2,11 @@ package com.beautica.salon;
 
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.auth.Role;
+import com.beautica.booking.service.BookingSlugService;
 import com.beautica.config.TestSecurityConfig;
 import com.beautica.salon.dto.CreateSalonRequest;
 import com.beautica.salon.dto.UpdateSalonRequest;
+import com.beautica.salon.repository.SalonRepository;
 import com.beautica.salon.service.SalonService;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
@@ -13,10 +15,17 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Import;
 import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.transaction.IllegalTransactionStateException;
+import org.springframework.transaction.support.TransactionTemplate;
 
+import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Real-persistence guard for the {@code SalonService} redundant-save removal.
@@ -61,6 +70,15 @@ class SalonMutationPersistenceIT extends AbstractIntegrationTest {
 
     @Autowired
     private PasswordEncoder passwordEncoder;
+
+    @Autowired
+    private SalonRepository salonRepository;
+
+    @Autowired
+    private TransactionTemplate transactionTemplate;
+
+    @Autowired
+    private BookingSlugService bookingSlugService;
 
     // ── deactivateSalon ────────────────────────────────────────────────────────
 
@@ -113,6 +131,99 @@ class SalonMutationPersistenceIT extends AbstractIntegrationTest {
                 .isEqualTo("New Name");
     }
 
+    // ── phase 376 — booking slug issued at creation, permanent ─────────────────
+
+    @Test
+    @DisplayName("createSalon writes a booking slug from the salon name in the committed row (376 D4)")
+    void should_persistNameBasedBookingSlug_when_salonCreated() {
+        UUID ownerId = persistOwner("slug-create-owner@beautica.test");
+
+        UUID salonId = salonService.createSalon(ownerId, createRequest("Beauty Lab Київ")).id();
+
+        assertThat(readSlug(salonId)).matches("^beauty-lab-kyiv-[a-z0-9]{4}$");
+    }
+
+    @Test
+    @DisplayName("updateSalon rename never changes the booking slug (376 D5)")
+    void should_keepBookingSlug_when_salonRenamed() {
+        UUID ownerId = persistOwner("slug-rename-owner@beautica.test");
+        UUID salonId = salonService.createSalon(ownerId, createRequest("Persha Nazva")).id();
+        String issued = readSlug(salonId);
+
+        salonService.updateSalon(ownerId, salonId, updateRequest("Druha Nazva"));
+
+        assertThat(readName(salonId)).isEqualTo("Druha Nazva");
+        assertThat(readSlug(salonId)).isEqualTo(issued).startsWith("persha-nazva-");
+    }
+
+    @Test
+    @DisplayName("an entity loaded BEFORE a lazy slug issue flushes without writing NULL back over the slug (updatable=false)")
+    void should_keepConcurrentlyIssuedSlug_when_staleSalonSnapshotFlushes() {
+        UUID ownerId = persistOwner("slug-stale-owner@beautica.test");
+        UUID salonId = salonService.createSalon(ownerId, createRequest("Stale Snapshot")).id();
+        jdbcTemplate.update("UPDATE salons SET booking_slug = NULL WHERE id = ?", salonId);
+
+        transactionTemplate.executeWithoutResult(status -> {
+            var stale = salonRepository.findById(salonId).orElseThrow();
+            // The race-safe issue commits on another connection while this snapshot still holds NULL.
+            jdbcTemplate.update("UPDATE salons SET booking_slug = 'issued-meanwhile-ab12' WHERE id = ?", salonId);
+            stale.setName("Renamed While Stale");
+        });
+
+        assertThat(readName(salonId)).isEqualTo("Renamed While Stale");
+        assertThat(readSlug(salonId)).isEqualTo("issued-meanwhile-ab12");
+    }
+
+    @Test
+    @DisplayName("376 audit: createSalon holds its slug's advisory lock until commit, so no other salon-slug writer can pick it meanwhile")
+    void should_holdSlugLockUntilCommit_when_salonCreated() throws Exception {
+        UUID ownerId = persistOwner("slug-lock-owner@beautica.test");
+        ExecutorService other = Executors.newSingleThreadExecutor();
+        try {
+            String slug = transactionTemplate.execute(status -> {
+                UUID salonId = salonService.createSalon(ownerId, createRequest("Zamok Salon")).id();
+                String issued = salonRepository.findById(salonId).orElseThrow().getBookingSlug();
+                assertThat(tryLockOnOtherConnection(other, issued))
+                        .as("a concurrent writer must wait for %s until createSalon commits", issued)
+                        .isFalse();
+                return issued;
+            });
+
+            assertThat(slug).startsWith("zamok-salon-");
+            assertThat(tryLockOnOtherConnection(other, slug)).as("released at commit").isTrue();
+        } finally {
+            other.shutdownNow();
+        }
+    }
+
+    @Test
+    @DisplayName("376 audit: generateSalonSlug outside a transaction throws — its advisory lock would be released at once")
+    void should_throw_when_generateSalonSlugCalledOutsideTransaction() {
+        assertThatThrownBy(() -> bookingSlugService.generateSalonSlug("Bez Tranzaktsii"))
+                .isInstanceOf(IllegalTransactionStateException.class);
+    }
+
+    @Test
+    @DisplayName("376 audit: the salon-slug candidate and row locks outside a transaction throw (MANDATORY)")
+    void should_throw_when_slugLocksTakenOutsideTransaction() {
+        assertThatThrownBy(() -> salonRepository.lockBookingSlugCandidates(new String[] {"bez-tranzaktsii-ab12"}))
+                .isInstanceOf(IllegalTransactionStateException.class);
+        assertThatThrownBy(() -> salonRepository.lockSalonIdsWithoutBookingSlug(List.of(UUID.randomUUID())))
+                .isInstanceOf(IllegalTransactionStateException.class);
+    }
+
+    private Boolean tryLockOnOtherConnection(ExecutorService other, String slug) {
+        try {
+            return other.submit(() -> new TransactionTemplate(transactionTemplate.getTransactionManager())
+                    .execute(status -> jdbcTemplate.queryForObject(
+                            "SELECT pg_try_advisory_xact_lock(hashtextextended(?, ?))",
+                            Boolean.class, slug, SalonRepository.BOOKING_SLUG_LOCK_SEED)))
+                    .get(30, TimeUnit.SECONDS);
+        } catch (Exception e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
     // ── helpers ───────────────────────────────────────────────────────────────
 
     private UUID persistOwner(String email) {
@@ -144,6 +255,11 @@ class SalonMutationPersistenceIT extends AbstractIntegrationTest {
     private Boolean readIsActive(UUID salonId) {
         return jdbcTemplate.queryForObject(
                 "SELECT is_active FROM salons WHERE id = ?", Boolean.class, salonId);
+    }
+
+    private String readSlug(UUID salonId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT booking_slug FROM salons WHERE id = ?", String.class, salonId);
     }
 
     private String readName(UUID salonId) {

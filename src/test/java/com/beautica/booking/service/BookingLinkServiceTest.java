@@ -10,6 +10,8 @@ import com.beautica.master.entity.MasterType;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.master.service.ScheduleDateMath;
 import com.beautica.salon.entity.Salon;
+import com.beautica.salon.repository.SalonRepository;
+import com.beautica.salon.repository.SalonRepository.SalonBookingLinkRow;
 import com.beautica.user.User;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -25,12 +27,14 @@ import org.springframework.dao.DataIntegrityViolationException;
 
 import java.time.LocalDate;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyCollection;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -38,7 +42,10 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
-/** Phase 375 — {@link BookingLinkService}: role matrix (D2), kill-switch (D6), URL (D5), bookable (D7/D8). */
+/**
+ * Phase 375 — {@link BookingLinkService}: role matrix (D2), kill-switch (D6), URL (D5), bookable (D7/D8).
+ * Phase 376 — SALON links: owner (every active salon), admin (bound salon), batched bookability, lazy issue.
+ */
 @ExtendWith(MockitoExtension.class)
 @MockitoSettings(strictness = Strictness.LENIENT)
 @DisplayName("BookingLinkService")
@@ -52,6 +59,7 @@ class BookingLinkServiceTest {
     @Mock private MasterRepository masterRepository;
     @Mock private BookingSlugService bookingSlugService;
     @Mock private ScheduleDateMath scheduleDateMath;
+    @Mock private SalonRepository salonRepository;
 
     private BookingLinksProperties properties;
     private BookingLinkService service;
@@ -61,7 +69,8 @@ class BookingLinkServiceTest {
         properties = new BookingLinksProperties();
         properties.setShareEnabled(true);
         properties.setWebBaseUrl("https://beautica.app");
-        service = new BookingLinkService(masterRepository, bookingSlugService, scheduleDateMath, properties);
+        service = new BookingLinkService(masterRepository, bookingSlugService, scheduleDateMath, properties,
+                salonRepository);
         when(scheduleDateMath.today()).thenReturn(TODAY);
     }
 
@@ -94,7 +103,7 @@ class BookingLinkServiceTest {
     }
 
     @Test
-    @DisplayName("salon owner → own MASTER link only, salonId null")
+    @DisplayName("salon owner with no active salon → own MASTER link only, salonId null")
     void should_returnOwnMasterLink_when_salonOwner() {
         Salon salon = Salon.builder().id(UUID.randomUUID()).isActive(true).build();
         givenMaster(master(salon, MasterType.SALON_OWNER), true);
@@ -105,15 +114,14 @@ class BookingLinkServiceTest {
         assertThat(response.links().get(0).salonId()).isNull();
     }
 
-    @ParameterizedTest
-    @EnumSource(value = Role.class, names = {"SALON_ADMIN", "SALON_MASTER"})
-    @DisplayName("SALON_ADMIN / SALON_MASTER → no links, repository and slug service never touched")
-    void should_returnNoLinksAndIssueNoSlug_when_roleHasNoMasterLink(Role role) {
-        BookingLinksResponse response = service.getMyLinks(USER_ID, role);
+    @Test
+    @DisplayName("SALON_MASTER → no links, no repository and slug service ever touched (376 D6)")
+    void should_returnNoLinksAndIssueNoSlug_when_salonMaster() {
+        BookingLinksResponse response = service.getMyLinks(USER_ID, Role.SALON_MASTER);
 
         assertThat(response.shareEnabled()).isTrue();
         assertThat(response.links()).isEmpty();
-        verifyNoInteractions(masterRepository, bookingSlugService);
+        verifyNoInteractions(masterRepository, bookingSlugService, salonRepository);
     }
 
     /**
@@ -127,7 +135,7 @@ class BookingLinkServiceTest {
         BookingLinksResponse response = service.getMyLinks(USER_ID, Role.CLIENT);
 
         assertThat(response.links()).isEmpty();
-        verifyNoInteractions(masterRepository, bookingSlugService);
+        verifyNoInteractions(masterRepository, bookingSlugService, salonRepository);
     }
 
     @ParameterizedTest
@@ -144,7 +152,7 @@ class BookingLinkServiceTest {
         verify(bookingSlugService, never()).getOrIssueSlugRaceSafe(any());
         verify(bookingSlugService, never()).getOrCreateSlug(any());
         verify(masterRepository, never()).findActiveByUserIdWithUserAndSalon(any());
-        verifyNoInteractions(masterRepository, bookingSlugService);
+        verifyNoInteractions(masterRepository, bookingSlugService, salonRepository);
     }
 
     // ── 375 audit F3 — one retry, in a fresh transaction, on a unique-index collision ─────────
@@ -250,5 +258,167 @@ class BookingLinkServiceTest {
         BookingLinksResponse response = service.getMyLinks(USER_ID, Role.INDEPENDENT_MASTER);
 
         assertThat(response.links()).extracting(BookingLinkResponse::displayName).containsExactly("Олена");
+    }
+
+    // ── phase 376 — SALON links ─────────────────────────────────────────────────────────────
+
+    private static final UUID SALON_A = UUID.fromString("aaaaaaaa-0000-0000-0000-000000000001");
+    private static final UUID SALON_B = UUID.fromString("bbbbbbbb-0000-0000-0000-000000000002");
+
+    private static SalonBookingLinkRow salonRow(UUID id, String name, String slug) {
+        return new SalonBookingLinkRow() {
+            @Override public UUID getId() { return id; }
+            @Override public String getName() { return name; }
+            @Override public String getBookingSlug() { return slug; }
+        };
+    }
+
+    @Test
+    @DisplayName("owner with 2 salons → MASTER first, then one SALON link per salon; ONE salon read + ONE batched bookability read")
+    void should_returnMasterThenOneSalonLinkPerSalon_when_ownerHasTwoSalons() {
+        givenMaster(master(null, MasterType.SALON_OWNER), true);
+        when(salonRepository.findBookingLinkRowsByOwnerId(USER_ID)).thenReturn(List.of(
+                salonRow(SALON_A, "Alfa", "alfa-aa11"), salonRow(SALON_B, "Beta", "beta-bb22")));
+        when(salonRepository.findBookableSalonIds(List.of(SALON_A, SALON_B), TODAY)).thenReturn(List.of(SALON_B));
+
+        BookingLinksResponse response = service.getMyLinks(USER_ID, Role.SALON_OWNER);
+
+        assertThat(response.links()).containsExactly(
+                new BookingLinkResponse(BookingLinkKind.MASTER, SLUG, "https://beautica.app/book/" + SLUG,
+                        "Олена Коваль", null, true),
+                new BookingLinkResponse(BookingLinkKind.SALON, "alfa-aa11", "https://beautica.app/book/s/alfa-aa11",
+                        "Alfa", SALON_A, false),
+                new BookingLinkResponse(BookingLinkKind.SALON, "beta-bb22", "https://beautica.app/book/s/beta-bb22",
+                        "Beta", SALON_B, true));
+        verify(salonRepository, times(1)).findBookingLinkRowsByOwnerId(USER_ID);
+        verify(salonRepository, times(1)).findBookableSalonIds(anyCollection(), any());
+        verify(bookingSlugService, never()).issueMissingSalonSlugs(anyList());
+    }
+
+    @Test
+    @DisplayName("SALON_ADMIN → only its bound salon's SALON link; no master read")
+    void should_returnBoundSalonLinkOnly_when_salonAdmin() {
+        when(salonRepository.findBookingLinkRowsByAdminUserId(USER_ID))
+                .thenReturn(List.of(salonRow(SALON_A, "Alfa", "alfa-aa11")));
+        when(salonRepository.findBookableSalonIds(List.of(SALON_A), TODAY)).thenReturn(List.of(SALON_A));
+
+        BookingLinksResponse response = service.getMyLinks(USER_ID, Role.SALON_ADMIN);
+
+        assertThat(response.links()).containsExactly(new BookingLinkResponse(BookingLinkKind.SALON, "alfa-aa11",
+                "https://beautica.app/book/s/alfa-aa11", "Alfa", SALON_A, true));
+        verifyNoInteractions(masterRepository);
+        verify(salonRepository, never()).findBookingLinkRowsByOwnerId(any());
+    }
+
+    @Test
+    @DisplayName("SALON_ADMIN with no active bound salon → no links, bookability query skipped")
+    void should_returnNoLinksAndSkipBookability_when_adminHasNoActiveSalon() {
+        when(salonRepository.findBookingLinkRowsByAdminUserId(USER_ID)).thenReturn(List.of());
+
+        BookingLinksResponse response = service.getMyLinks(USER_ID, Role.SALON_ADMIN);
+
+        assertThat(response.links()).isEmpty();
+        verify(salonRepository, never()).findBookableSalonIds(anyCollection(), any());
+    }
+
+    @Test
+    @DisplayName("INDEPENDENT_MASTER → never reads salons")
+    void should_neverReadSalons_when_independentMaster() {
+        givenMaster(master(null, MasterType.INDEPENDENT_MASTER), true);
+
+        service.getMyLinks(USER_ID, Role.INDEPENDENT_MASTER);
+
+        verifyNoInteractions(salonRepository);
+    }
+
+    @Test
+    @DisplayName("legacy salon (NULL slug) → issued via the batched race-safe salon issue with the loaded row")
+    void should_issueSalonSlug_when_salonSlugNull() {
+        SalonBookingLinkRow legacy = salonRow(SALON_A, "Beauty Lab Київ", null);
+        when(salonRepository.findBookingLinkRowsByAdminUserId(USER_ID)).thenReturn(List.of(legacy));
+        when(bookingSlugService.issueMissingSalonSlugs(List.of(legacy)))
+                .thenReturn(Map.of(SALON_A, "beauty-lab-kyiv-ab12"));
+
+        BookingLinksResponse response = service.getMyLinks(USER_ID, Role.SALON_ADMIN);
+
+        assertThat(response.links()).extracting(BookingLinkResponse::slug, BookingLinkResponse::url)
+                .containsExactly(org.assertj.core.groups.Tuple.tuple(
+                        "beauty-lab-kyiv-ab12", "https://beautica.app/book/s/beauty-lab-kyiv-ab12"));
+    }
+
+    @Test
+    @DisplayName("legacy salon issue hits the unique index → one retry in a fresh call")
+    void should_retryOnce_when_salonIssueHitsUniqueIndex() {
+        when(salonRepository.findBookingLinkRowsByAdminUserId(USER_ID))
+                .thenReturn(List.of(salonRow(SALON_A, "Alfa", null)));
+        when(bookingSlugService.issueMissingSalonSlugs(anyList()))
+                .thenThrow(new DataIntegrityViolationException("idx_salons_booking_slug"))
+                .thenReturn(Map.of(SALON_A, "alfa-cc33"));
+
+        BookingLinksResponse response = service.getMyLinks(USER_ID, Role.SALON_ADMIN);
+
+        assertThat(response.links()).extracting(BookingLinkResponse::slug).containsExactly("alfa-cc33");
+        verify(bookingSlugService, times(2)).issueMissingSalonSlugs(anyList());
+    }
+
+    @Test
+    @DisplayName("legacy salon retry also collides → second violation propagates")
+    void should_propagate_when_salonRetryAlsoCollides() {
+        when(salonRepository.findBookingLinkRowsByAdminUserId(USER_ID))
+                .thenReturn(List.of(salonRow(SALON_A, "Alfa", null)));
+        when(bookingSlugService.issueMissingSalonSlugs(anyList()))
+                .thenThrow(new DataIntegrityViolationException("first"))
+                .thenThrow(new DataIntegrityViolationException("second"));
+
+        assertThatThrownBy(() -> service.getMyLinks(USER_ID, Role.SALON_ADMIN))
+                .isInstanceOf(DataIntegrityViolationException.class)
+                .hasMessage("second");
+        verify(bookingSlugService, times(2)).issueMissingSalonSlugs(anyList());
+    }
+
+    @Test
+    @DisplayName("owner, 3 salons of which 2 legacy → ONE batched issue call with exactly the 2 legacy rows; stored slug kept (376 audit)")
+    void should_issueAllLegacySalonSlugsInOneCall_when_ownerHasSeveralLegacySalons() {
+        givenMaster(master(Salon.builder().id(SALON_A).isActive(true).build(), MasterType.SALON_OWNER), true);
+        SalonBookingLinkRow stored = salonRow(SALON_A, "Alfa", "alfa-aa11");
+        UUID salonC = UUID.randomUUID();
+        SalonBookingLinkRow legacyB = salonRow(SALON_B, "Beta", null);
+        SalonBookingLinkRow legacyC = salonRow(salonC, "Gama", null);
+        when(salonRepository.findBookingLinkRowsByOwnerId(USER_ID)).thenReturn(List.of(stored, legacyB, legacyC));
+        when(salonRepository.findBookableSalonIds(anyCollection(), any())).thenReturn(List.of());
+        when(bookingSlugService.issueMissingSalonSlugs(List.of(legacyB, legacyC)))
+                .thenReturn(Map.of(SALON_B, "beta-bb22", salonC, "gama-cc33"));
+
+        BookingLinksResponse response = service.getMyLinks(USER_ID, Role.SALON_OWNER);
+
+        assertThat(response.links()).extracting(BookingLinkResponse::slug)
+                .containsExactly(SLUG, "alfa-aa11", "beta-bb22", "gama-cc33");
+        verify(bookingSlugService, times(1)).issueMissingSalonSlugs(anyList());
+    }
+
+    @Test
+    @DisplayName("376 audit cycle 2: a legacy salon deleted before the issue (absent from the issued map) → its link omitted, the rest returned")
+    void should_omitSalonLink_when_salonDeletedBeforeSlugIssue() {
+        SalonBookingLinkRow stored = salonRow(SALON_A, "Alfa", "alfa-aa11");
+        SalonBookingLinkRow deleted = salonRow(SALON_B, "Beta", null);
+        when(salonRepository.findBookingLinkRowsByAdminUserId(USER_ID)).thenReturn(List.of(stored, deleted));
+        when(salonRepository.findBookableSalonIds(anyCollection(), any())).thenReturn(List.of());
+        when(bookingSlugService.issueMissingSalonSlugs(List.of(deleted))).thenReturn(Map.of());
+
+        BookingLinksResponse response = service.getMyLinks(USER_ID, Role.SALON_ADMIN);
+
+        assertThat(response.links()).extracting(BookingLinkResponse::salonId).containsExactly(SALON_A);
+    }
+
+    @Test
+    @DisplayName("salon URL uses the configured web-base-url and the /book/s/ namespace")
+    void should_buildSalonUrlFromConfiguredBase_when_baseUrlOverridden() {
+        properties.setWebBaseUrl("https://staging.beautica.app");
+        when(salonRepository.findBookingLinkRowsByAdminUserId(USER_ID))
+                .thenReturn(List.of(salonRow(SALON_A, "Alfa", "alfa-aa11")));
+
+        BookingLinksResponse response = service.getMyLinks(USER_ID, Role.SALON_ADMIN);
+
+        assertThat(response.links().get(0).url()).isEqualTo("https://staging.beautica.app/book/s/alfa-aa11");
     }
 }
