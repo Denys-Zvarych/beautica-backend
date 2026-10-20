@@ -43,6 +43,10 @@ app:
     sms:
       # Exercise the booking SMS paths; with beautica.sms.mode=capture they land in Mailpit.
       enabled: true
+  booking-links:
+    # Phase 375 (D6) — sharing on in staging (prod default is false). Railway's
+    # BOOKING_LINKS_SHARE_ENABLED can still override it.
+    share-enabled: ${BOOKING_LINKS_SHARE_ENABLED:true}
   rate-limit:
     # Same property and value start-backend.sh uses for local seeding, so seed-demo-fleet.sh
     # can run against staging.

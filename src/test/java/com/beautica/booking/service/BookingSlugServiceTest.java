@@ -173,6 +173,62 @@ class BookingSlugServiceTest {
                 .isInstanceOf(NotFoundException.class);
     }
 
+    // ── getOrIssueSlugRaceSafe — phase 375 lazy issue on /booking-links/mine ──
+
+    @Test
+    @DisplayName("race-safe issue, slug already present → returned, no UPDATE")
+    void should_returnExistingSlugWithoutWriting_when_raceSafeIssueAndSlugPresent() {
+        Master master = masterWithSlug("anna-existing-ab12");
+
+        String slug = service.getOrIssueSlugRaceSafe(master);
+
+        assertThat(slug).isEqualTo("anna-existing-ab12");
+        verify(masterRepository, never()).assignBookingSlugIfAbsent(any(), anyString());
+    }
+
+    @Test
+    @DisplayName("race-safe issue, conditional UPDATE wins → generated slug returned, no re-read")
+    void should_returnGeneratedSlug_when_conditionalUpdateWins() {
+        Master master = masterWithUser("Олена", "Коваль", null);
+        setId(master, UUID.randomUUID());
+        when(masterRepository.existsByBookingSlug(anyString())).thenReturn(false);
+        when(masterRepository.assignBookingSlugIfAbsent(any(), anyString())).thenReturn(1);
+
+        String slug = service.getOrIssueSlugRaceSafe(master);
+
+        assertThat(slug).matches("^olena-koval-[a-z0-9]{4}$");
+        verify(masterRepository).assignBookingSlugIfAbsent(master.getId(), slug);
+        verify(masterRepository, never()).findBookingSlugById(any());
+    }
+
+    @Test
+    @DisplayName("race-safe issue, concurrent call won → stored slug re-read and returned")
+    void should_reReadAndReturnStoredSlug_when_concurrentCallIssuedFirst() {
+        Master master = masterWithUser("Олена", "Коваль", null);
+        setId(master, UUID.randomUUID());
+        when(masterRepository.existsByBookingSlug(anyString())).thenReturn(false);
+        when(masterRepository.assignBookingSlugIfAbsent(any(), anyString())).thenReturn(0);
+        when(masterRepository.findBookingSlugById(master.getId())).thenReturn(Optional.of("olena-koval-win1"));
+
+        String slug = service.getOrIssueSlugRaceSafe(master);
+
+        assertThat(slug).isEqualTo("olena-koval-win1");
+    }
+
+    @Test
+    @DisplayName("race-safe issue, UPDATE matched nothing and row gone → NotFoundException")
+    void should_throwNotFound_when_raceSafeReReadFindsNoRow() {
+        Master master = masterWithUser("Олена", "Коваль", null);
+        setId(master, UUID.randomUUID());
+        when(masterRepository.existsByBookingSlug(anyString())).thenReturn(false);
+        when(masterRepository.assignBookingSlugIfAbsent(any(), anyString())).thenReturn(0);
+        when(masterRepository.findBookingSlugById(master.getId())).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> service.getOrIssueSlugRaceSafe(master))
+                .isInstanceOf(NotFoundException.class)
+                .hasMessage("Master not found");
+    }
+
     // ── findBySlug ──────────────────────────────────────────────────────────
 
     @Test

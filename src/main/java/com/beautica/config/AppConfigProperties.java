@@ -25,7 +25,8 @@ import org.springframework.context.annotation.Configuration;
         InAppNotificationRetentionProperties.class,
         InAppNotificationCleanupProperties.class,
         DeploymentProperties.class,
-        GuestPiiRetentionProperties.class
+        GuestPiiRetentionProperties.class,
+        BookingLinksProperties.class
 })
 public class AppConfigProperties {
 }

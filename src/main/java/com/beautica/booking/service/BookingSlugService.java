@@ -17,6 +17,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.security.SecureRandom;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
 
@@ -91,6 +92,39 @@ public class BookingSlugService {
     }
 
     /**
+     * Phase 375 — race-safe sibling of {@link #getOrCreateSlug} for the lazy issue on
+     * {@code GET /booking-links/mine}, where two devices of one legacy ({@code booking_slug NULL})
+     * master can call concurrently. Returns the existing slug, or generates a candidate and writes it
+     * with a conditional {@code UPDATE ... WHERE booking_slug IS NULL}; when that matches no row a
+     * concurrent call won, and the committed slug is re-read and returned — so every caller observes
+     * the one permanent slug (D4).
+     *
+     * <p>{@link #getOrCreateSlug} is deliberately left as is: its callers are the master-creation
+     * paths, where the row is brand new and cannot be raced.
+     *
+     * <p><b>Transaction scope (375 audit F1/F2).</b> This short transaction holds only the
+     * candidate's existence check, the conditional {@code UPDATE} and — on a lost race — the re-read,
+     * so the row lock the {@code UPDATE} takes is released at this method's commit. Callers must NOT
+     * wrap it in an outer transaction: a unique-index violation on the {@code UPDATE} marks the
+     * transaction rollback-only, and the caller's single retry with a fresh candidate
+     * ({@code BookingLinkService#issueSlug}) is only sound because it starts a new transaction.
+     *
+     * @param master an active, user-attached master with {@code user} fetched (may be detached)
+     */
+    @Transactional
+    public String getOrIssueSlugRaceSafe(Master master) {
+        if (master.getBookingSlug() != null) {
+            return master.getBookingSlug();
+        }
+        String candidate = generateSlug(master.displayFirstName(), master.displayLastName());
+        if (masterRepository.assignBookingSlugIfAbsent(master.getId(), candidate) == 1) {
+            return candidate;
+        }
+        return masterRepository.findBookingSlugById(master.getId())
+                .orElseThrow(() -> new NotFoundException("Master not found"));
+    }
+
+    /**
      * Builds a globally-unique slug from the given name. Transliterates, normalises,
      * then appends {@code '-'} + 4 random {@code [a-z0-9]} chars; retries up to
      * {@value #MAX_GENERATION_ATTEMPTS} times on a uniqueness collision before failing.
@@ -144,7 +178,8 @@ public class BookingSlugService {
         return truncateBase(base);
     }
 
-    private static String composeName(String firstName, String lastName) {
+    /** "first last", trimmed, null-safe — also the booking-link display name (phase 375). */
+    static String composeName(String firstName, String lastName) {
         String first = firstName == null ? "" : firstName.trim();
         String last = lastName == null ? "" : lastName.trim();
         return (first + " " + last).trim();
@@ -152,7 +187,7 @@ public class BookingSlugService {
 
     private String transliterate(String input) {
         StringBuilder sb = new StringBuilder(input.length() * 2);
-        for (char c : input.toLowerCase().toCharArray()) {
+        for (char c : input.toLowerCase(Locale.ROOT).toCharArray()) {
             String mapped = UK_TO_LATIN.get(c);
             sb.append(mapped != null ? mapped : c);
         }
@@ -161,7 +196,7 @@ public class BookingSlugService {
 
     /** Lowercase, strip to {@code [a-z0-9-]}, collapse and trim hyphens. */
     private String normalize(String input) {
-        String ascii = input.toLowerCase()
+        String ascii = input.toLowerCase(Locale.ROOT)
                 .replaceAll("[^a-z0-9]+", "-")
                 .replaceAll("-{2,}", "-");
         int start = 0;

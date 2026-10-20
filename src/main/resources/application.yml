@@ -395,6 +395,15 @@ app:
       # Constraint that travels with the copy wherever it lives: it must carry NO {cancelUrl} — a
       # STAFF booking has cancel_token = NULL by the V137 CHECK, so there is no link to build and
       # the placeholder would render literally in a real client's message.
+  booking-links:
+    # Phase 375 (D6) — kill-switch for GET /api/v1/booking-links/mine. false = the app hides sharing,
+    # the endpoint returns {shareEnabled:false, links:[]} and issues NO slug. Stays false in prod until
+    # website 008 + 009 render beautica.app/book/{slug} on prod; then set BOOKING_LINKS_SHARE_ENABLED=true
+    # on Railway (no release). local / staging / test turn it on in their own profile files.
+    share-enabled: ${BOOKING_LINKS_SHARE_ENABLED:false}
+    # Phase 375 (D5) — public website origin of the share URL ({web-base-url}/book/{slug}).
+    # https, bare origin, no trailing slash — validated at boot (BookingLinksProperties).
+    web-base-url: https://beautica.app
   admin-email: ${ADMIN_EMAIL:admin@beautica.app}
   support:
     # Fixed destination inbox for the Help / Contact-us feature

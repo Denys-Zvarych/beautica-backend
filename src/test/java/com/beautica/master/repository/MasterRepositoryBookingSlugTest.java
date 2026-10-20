@@ -114,6 +114,32 @@ class MasterRepositoryBookingSlugTest extends AbstractDataJpaTest {
                 .isPresent();
     }
 
+    // ── phase 375 — race-safe lazy issue: conditional UPDATE + native re-read ─────────────
+
+    @Test
+    @DisplayName("assignBookingSlugIfAbsent writes the slug once; a second candidate matches 0 rows and never overwrites")
+    void should_writeOnceAndNeverOverwrite_when_assignBookingSlugIfAbsentCalledTwice() {
+        Master master = persistIndependentMaster(null);
+
+        int first = masterRepository.assignBookingSlugIfAbsent(master.getId(), "first-wins-ab12");
+        int second = masterRepository.assignBookingSlugIfAbsent(master.getId(), "second-loses-cd34");
+
+        assertThat(first).as("legacy NULL row must accept the first candidate").isEqualTo(1);
+        assertThat(second).as("IS NULL guard must reject a later candidate").isZero();
+        assertThat(masterRepository.findBookingSlugById(master.getId()))
+                .as("a link already handed out must never be silently replaced")
+                .contains("first-wins-ab12");
+    }
+
+    @Test
+    @DisplayName("findBookingSlugById → empty for an unknown id, null-slug row reads as empty")
+    void should_returnEmpty_when_findBookingSlugByIdUnknownOrNull() {
+        Master legacy = persistIndependentMaster(null);
+
+        assertThat(masterRepository.findBookingSlugById(UUID.randomUUID())).isEmpty();
+        assertThat(masterRepository.findBookingSlugById(legacy.getId())).isEmpty();
+    }
+
     // ── fixtures ─────────────────────────────────────────────────────────────────────
 
     private Master persistSalonMaster(String slug, boolean masterActive, boolean salonActive) {
@@ -142,7 +168,7 @@ class MasterRepositoryBookingSlugTest extends AbstractDataJpaTest {
         return master;
     }
 
-    private void persistIndependentMaster(String slug) {
+    private Master persistIndependentMaster(String slug) {
         User user = persistUser(Role.INDEPENDENT_MASTER);
         Master master = Master.builder()
                 .user(user)
@@ -155,6 +181,7 @@ class MasterRepositoryBookingSlugTest extends AbstractDataJpaTest {
         em.persist(master);
         em.flush();
         em.clear();
+        return master;
     }
 
     /** Real (cheap-cost) BCrypt rather than a literal hash string — Anti-Bug §M5. */

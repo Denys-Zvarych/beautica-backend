@@ -448,6 +448,33 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
     boolean existsByBookingSlug(String bookingSlug);
 
     /**
+     * Phase 375 — race-safe lazy slug issue: writes {@code slug} ONLY while the row still has no slug.
+     * Two concurrent first calls generate DIFFERENT candidates, so the unique index never fires;
+     * without the {@code IS NULL} guard the later commit would silently overwrite the earlier slug
+     * (a link already handed out would die). Under READ COMMITTED the second UPDATE blocks on the
+     * row lock, re-evaluates the predicate after the first commits and matches 0 rows; the caller
+     * then re-reads the winner via {@link #findBookingSlugById}.
+     *
+     * <p>No {@code clearAutomatically}: the caller keeps using its already-loaded entity (name,
+     * salon). That entity's in-memory slug stays {@code null}, which is harmless — it is unchanged
+     * from its snapshot, so dirty-checking never writes the column back.
+     *
+     * @return 1 when this call issued the slug, 0 when another transaction already had
+     */
+    @Modifying
+    @Query(value = "UPDATE masters SET booking_slug = :slug WHERE id = :masterId AND booking_slug IS NULL",
+            nativeQuery = true)
+    int assignBookingSlugIfAbsent(@Param("masterId") UUID masterId, @Param("slug") String slug);
+
+    /**
+     * Phase 375 — the master's CURRENT committed booking slug, read straight from the table (a native
+     * scalar, so the persistence context's possibly-stale entity is bypassed). Pairs with
+     * {@link #assignBookingSlugIfAbsent}.
+     */
+    @Query(value = "SELECT booking_slug FROM masters WHERE id = :masterId", nativeQuery = true)
+    Optional<String> findBookingSlugById(@Param("masterId") UUID masterId);
+
+    /**
      * Resolves a public booking slug to its master, JOIN FETCH-ing the {@code user}
      * association so the caller can read {@code firstName}/{@code lastName}/
      * {@code avatarUrl}/{@code bio} (which live on {@link com.beautica.user.User},

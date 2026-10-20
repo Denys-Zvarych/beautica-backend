@@ -137,6 +137,9 @@ app:
     from-email: noreply@beautica.app
   admin-email: admin@beautica.test
   public-base-url: https://api.beautica.test
+  booking-links:
+    # Phase 375 (D6) — on in tests; BookingLinkIT overrides it per test to cover the off state.
+    share-enabled: true
   security:
     # Test profile only — fixed 32+ char value so the context loads under `test`.
     otp-pepper: test-otp-pepper-fixed-value-min-32-characters

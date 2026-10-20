@@ -104,6 +104,10 @@ app:
       # logged instead of billed. Hardcoded false with NO env placeholder — unlike the base
       # profile, local must not be flippable by a stray shell export.
       enabled: false
+  booking-links:
+    # Phase 375 (D6) — sharing on locally (prod default is false); export
+    # BOOKING_LINKS_SHARE_ENABLED=false to exercise the switched-off state.
+    share-enabled: ${BOOKING_LINKS_SHARE_ENABLED:true}
 
 springdoc:
   api-docs:
