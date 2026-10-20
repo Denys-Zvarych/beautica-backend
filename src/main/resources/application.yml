@@ -224,6 +224,9 @@ logging:
     org.flywaydb: INFO
 
 springdoc:
+  # Internal ops endpoints (InternalApiKeyFilter-guarded) never belong in the public spec the
+  # mobile client is generated from. Guarded by InternalEndpointsOpenApiContractIT.
+  paths-to-exclude: /api/v1/internal/**
   api-docs:
     path: /api-docs
     enabled: false
