@@ -359,14 +359,20 @@ jobs:
           #     migration", and they would otherwise be a silent hole in this gate.
           #   * Java: an added V*.java at any depth under src/main/java/db/migration is not
           #     parsed; it must carry `// contract-of: V<n>` (destructive) or
-          #     `// non-destructive` (author's statement), otherwise the gate fails.
-          #   * SQL `-- non-destructive` marker: same semantics as the Java one. A line that is
-          #     EXACTLY `-- non-destructive` (surrounding whitespace only, nothing after it) is the
-          #     author's statement that a parser hit is a false positive, e.g. an ADD CHECK / CREATE
-          #     UNIQUE INDEX on a column the SAME file adds NULL, which no existing row or
-          #     previous-app write can violate. The file is then not judged. Put the reason on the
-          #     next comment line; review owns it. It replaces abusing `-- contract-of: V<n>` as an
-          #     escape hatch for such files.
+          #     `// non-destructive` (author's statement, reason rules below), otherwise the gate fails.
+          #   * SQL `-- non-destructive` marker: a line that is EXACTLY `-- non-destructive`
+          #     (surrounding whitespace only, nothing after it) is the author's statement that an
+          #     ADD CHECK / ADD UNIQUE / CREATE UNIQUE INDEX hit is a false positive, e.g. on a column
+          #     the SAME file adds NULL, which no existing row or previous-app write can violate.
+          #     It is NOT a whole-file skip: the file is still judged with ONLY those two classes
+          #     (ADD [CONSTRAINT x] CHECK|UNIQUE, CREATE UNIQUE INDEX) suppressed, so DROP, RENAME
+          #     (incl. index renames), ALTER COLUMN TYPE, SET NOT NULL, TRUNCATE, ADD PRIMARY/FOREIGN
+          #     KEY and every other class still need a contract-of header.
+          #   * REASON REQUIRED (SQL and Java): the line DIRECTLY after a marker must be a comment
+          #     (`-- <reason>` / `// <reason>`) with at least one letter or digit; a marker without
+          #     one fails the gate. Every accepted marker emits `::warning file=<f>::non-destructive
+          #     opt-out: <reason>` and appends the same line to $GITHUB_STEP_SUMMARY, so the opt-out
+          #     is visible on the PR; review (CODEOWNERS on db/migration) owns the judgement.
           #
           # SQL is read by ONE left-to-right tokenizer (no regex stripping, which
           # was evadable: `VALUES ('--'); DROP TABLE x;` hid the DROP behind a
@@ -495,11 +501,15 @@ jobs:
           # Prints the destructive reason (first match) or nothing; reads SQL
           # on stdin. Single-quote is written \x27 inside the perl body so it can live in a
           # shell single-quoted string.
+          # Optional $1 = 1: the file has a valid non-destructive marker (see above).
           destructive_reason() {
-            perl -0777 -ne '
+            DESTRUCTIVE_ND_ALLOW="${1:-0}" perl -0777 -ne '
               our $ESC = 0;
               our $WIDE = 0;
               our $NONLIT = 0;
+              # 1 = the file carries a valid non-destructive marker: ADD CHECK/UNIQUE and CREATE
+              # UNIQUE INDEX are not destructive; every other class still is.
+              our $ND = (($ENV{DESTRUCTIVE_ND_ALLOW} // "") eq "1") ? 1 : 0;
 
               sub tokenize {
                 my ($s) = @_;
@@ -640,8 +650,8 @@ jobs:
                 return "NO INHERIT" if $c =~ /\bNO\s+INHERIT\b/i;
                 return "ENABLE/FORCE ROW LEVEL SECURITY" if $c =~ /\b(?:ENABLE|FORCE)\s+ROW\s+LEVEL\s+SECURITY\b/i;
                 return "ALTER COLUMN TYPE" if $c =~ /\bALTER\s+(?:COLUMN\s+)?(?:"[^"]+"|\w+)\s+(?:SET\s+DATA\s+)?TYPE\b/i;
-                return "ADD CHECK/UNIQUE CONSTRAINT" if $c =~ /\bADD\s+(?:CONSTRAINT\s+\S+\s+)?(?:CHECK|UNIQUE)\b/i;
-                return "CREATE UNIQUE INDEX" if $c =~ /\bCREATE\s+UNIQUE\s+INDEX\b/i;
+                return "ADD CHECK/UNIQUE CONSTRAINT" if !$ND && $c =~ /\bADD\s+(?:CONSTRAINT\s+\S+\s+)?(?:CHECK|UNIQUE)\b/i;
+                return "CREATE UNIQUE INDEX" if !$ND && $c =~ /\bCREATE\s+UNIQUE\s+INDEX\b/i;
                 return "ADD " . uc($1) if $c =~ /\bADD\s+(?:CONSTRAINT\s+\S+\s+)?(PRIMARY\s+KEY|FOREIGN\s+KEY|EXCLUDE)\b/i;
                 if ($c =~ /\bADD\b/i) {
                   pos($c) = $+[0];
@@ -723,7 +733,7 @@ jobs:
                   return code_reason($c);
                 }
                 if ($c =~ /\A\s*CREATE\s+UNIQUE\s+INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+NOT\s+EXISTS\s+)?$id\s+ON\b/i) {
-                  return "CREATE UNIQUE INDEX";
+                  return $ND ? "" : "CREATE UNIQUE INDEX";
                 }
                 return "";
               }
@@ -865,9 +875,42 @@ jobs:
             return 0
           }
 
+          # nd_marker <file> <comment-lead-regex>: prints `absent`, `noreason` or `ok:<reason>` for
+          # the FIRST exact non-destructive marker line. awk reads to EOF (no early exit) so the
+          # `git show` side of the pipe never gets SIGPIPE under pipefail.
+          nd_marker() {
+            git show "HEAD:$1" | awk -v lead="$2" '
+              state == 1 {
+                line = $0
+                if (line ~ ("^" lead)) {
+                  sub("^" lead, "", line)
+                  sub(/[[:space:]]+$/, "", line)
+                  if (line ~ /[[:alnum:]]/ && line !~ /^non-destructive$/) { res = "ok:" line } else { res = "noreason" }
+                } else { res = "noreason" }
+                state = 2
+                next
+              }
+              state == 0 && $0 ~ ("^" lead "non-destructive[[:space:]]*$") { state = 1; next }
+              END {
+                if (state == 0) print "absent"
+                else if (state == 1) print "noreason"
+                else print res
+              }'
+          }
+
+          # nd_warn <file> <reason>: surfaces an accepted opt-out as a PR annotation + job summary line.
+          nd_warn() {
+            local f="$1" msg
+            msg="non-destructive opt-out: $(printf '%s' "$2" | sed -e 's/%/%25/g')"
+            echo "::warning file=$f::$msg"
+            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+              echo "::warning file=$f::$msg" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          }
+
           run_destructive_gate() {
             local since="$1"
-            local added f base reason violations=0
+            local added f base reason nd violations=0
             added="$(git diff --name-only --diff-filter=A "${since}...HEAD" -- "$MIGRATION_PATH")"
             while IFS= read -r f; do
               [ -z "$f" ] && continue
@@ -880,10 +923,19 @@ jobs:
                 V*.sql) : ;;
                 *) continue ;;
               esac
-              if git show "HEAD:$f" | grep -qE '^[[:space:]]*--[[:space:]]*non-destructive[[:space:]]*$'; then
-                continue
-              fi
-              reason="$(git show "HEAD:$f" | destructive_reason)"
+              nd="$(nd_marker "$f" '[[:space:]]*--[[:space:]]*')"
+              case "$nd" in
+                noreason)
+                  echo "ERROR: '$f' has a '-- non-destructive' marker but the line directly after it is not a '-- <reason>' comment."
+                  violations=1
+                  continue ;;
+                ok:*)
+                  nd_warn "$f" "${nd#ok:}"
+                  reason="$(git show "HEAD:$f" | destructive_reason 1)"
+                  [ -n "$reason" ] && reason="$reason; the non-destructive marker covers only ADD CHECK/UNIQUE and CREATE UNIQUE INDEX" ;;
+                *)
+                  reason="$(git show "HEAD:$f" | destructive_reason)" ;;
+              esac
               [ -z "$reason" ] && continue
               check_contract_header "$f" "$reason" '--[[:space:]]*' || violations=1
             done <<EOF
@@ -897,9 +949,16 @@ jobs:
                 V*.java) : ;;
                 *) continue ;;
               esac
-              if git show "HEAD:$f" | grep -qE '^[[:space:]]*//[[:space:]]*non-destructive[[:space:]]*$'; then
-                continue
-              fi
+              nd="$(nd_marker "$f" '[[:space:]]*//[[:space:]]*')"
+              case "$nd" in
+                noreason)
+                  echo "ERROR: '$f' has a '// non-destructive' marker but the line directly after it is not a '// <reason>' comment."
+                  violations=1
+                  continue ;;
+                ok:*)
+                  nd_warn "$f" "${nd#ok:}"
+                  continue ;;
+              esac
               check_contract_header "$f" "Java migration is not parsed" '[[:space:]]*//[[:space:]]*' || violations=1
             done <<EOF
           $added
@@ -921,9 +980,10 @@ jobs:
           echo "SET NOT NULL; ALTER COLUMN TYPE; ADD CHECK/UNIQUE) are 'contract' steps: they may only ship after the"
           echo "release that stopped using the object is live in prod."
           echo "Add '-- contract-of: V<n>' (the EARLIER expand migration) to the file if intentional, and tick the release checklist."
-          echo "If the hit is a false positive (e.g. ADD CHECK / CREATE UNIQUE INDEX on a column added NULL in the same file),"
-          echo "add a line that is exactly '-- non-destructive' with the reason on the next comment line instead."
-          echo "Java migrations (not parsed) need '// contract-of: V<n>' or '// non-destructive'."
+          echo "If an ADD CHECK / ADD UNIQUE / CREATE UNIQUE INDEX hit is a false positive (e.g. on a column added NULL in the"
+          echo "same file), add a line that is exactly '-- non-destructive' followed DIRECTLY by a '-- <reason>' line instead."
+          echo "The marker suppresses only those classes; DROP/RENAME/TYPE/SET NOT NULL/TRUNCATE still need contract-of."
+          echo "Java migrations (not parsed) need '// contract-of: V<n>' or '// non-destructive' + a '// <reason>' line."
           exit 1
 
   self-test-immutability-gate:
@@ -2124,14 +2184,20 @@ jobs:
           #     migration", and they would otherwise be a silent hole in this gate.
           #   * Java: an added V*.java at any depth under src/main/java/db/migration is not
           #     parsed; it must carry `// contract-of: V<n>` (destructive) or
-          #     `// non-destructive` (author's statement), otherwise the gate fails.
-          #   * SQL `-- non-destructive` marker: same semantics as the Java one. A line that is
-          #     EXACTLY `-- non-destructive` (surrounding whitespace only, nothing after it) is the
-          #     author's statement that a parser hit is a false positive, e.g. an ADD CHECK / CREATE
-          #     UNIQUE INDEX on a column the SAME file adds NULL, which no existing row or
-          #     previous-app write can violate. The file is then not judged. Put the reason on the
-          #     next comment line; review owns it. It replaces abusing `-- contract-of: V<n>` as an
-          #     escape hatch for such files.
+          #     `// non-destructive` (author's statement, reason rules below), otherwise the gate fails.
+          #   * SQL `-- non-destructive` marker: a line that is EXACTLY `-- non-destructive`
+          #     (surrounding whitespace only, nothing after it) is the author's statement that an
+          #     ADD CHECK / ADD UNIQUE / CREATE UNIQUE INDEX hit is a false positive, e.g. on a column
+          #     the SAME file adds NULL, which no existing row or previous-app write can violate.
+          #     It is NOT a whole-file skip: the file is still judged with ONLY those two classes
+          #     (ADD [CONSTRAINT x] CHECK|UNIQUE, CREATE UNIQUE INDEX) suppressed, so DROP, RENAME
+          #     (incl. index renames), ALTER COLUMN TYPE, SET NOT NULL, TRUNCATE, ADD PRIMARY/FOREIGN
+          #     KEY and every other class still need a contract-of header.
+          #   * REASON REQUIRED (SQL and Java): the line DIRECTLY after a marker must be a comment
+          #     (`-- <reason>` / `// <reason>`) with at least one letter or digit; a marker without
+          #     one fails the gate. Every accepted marker emits `::warning file=<f>::non-destructive
+          #     opt-out: <reason>` and appends the same line to $GITHUB_STEP_SUMMARY, so the opt-out
+          #     is visible on the PR; review (CODEOWNERS on db/migration) owns the judgement.
           #
           # SQL is read by ONE left-to-right tokenizer (no regex stripping, which
           # was evadable: `VALUES ('--'); DROP TABLE x;` hid the DROP behind a
@@ -2260,11 +2326,15 @@ jobs:
           # Prints the destructive reason (first match) or nothing; reads SQL
           # on stdin. Single-quote is written \x27 inside the perl body so it can live in a
           # shell single-quoted string.
+          # Optional $1 = 1: the file has a valid non-destructive marker (see above).
           destructive_reason() {
-            perl -0777 -ne '
+            DESTRUCTIVE_ND_ALLOW="${1:-0}" perl -0777 -ne '
               our $ESC = 0;
               our $WIDE = 0;
               our $NONLIT = 0;
+              # 1 = the file carries a valid non-destructive marker: ADD CHECK/UNIQUE and CREATE
+              # UNIQUE INDEX are not destructive; every other class still is.
+              our $ND = (($ENV{DESTRUCTIVE_ND_ALLOW} // "") eq "1") ? 1 : 0;
 
               sub tokenize {
                 my ($s) = @_;
@@ -2405,8 +2475,8 @@ jobs:
                 return "NO INHERIT" if $c =~ /\bNO\s+INHERIT\b/i;
                 return "ENABLE/FORCE ROW LEVEL SECURITY" if $c =~ /\b(?:ENABLE|FORCE)\s+ROW\s+LEVEL\s+SECURITY\b/i;
                 return "ALTER COLUMN TYPE" if $c =~ /\bALTER\s+(?:COLUMN\s+)?(?:"[^"]+"|\w+)\s+(?:SET\s+DATA\s+)?TYPE\b/i;
-                return "ADD CHECK/UNIQUE CONSTRAINT" if $c =~ /\bADD\s+(?:CONSTRAINT\s+\S+\s+)?(?:CHECK|UNIQUE)\b/i;
-                return "CREATE UNIQUE INDEX" if $c =~ /\bCREATE\s+UNIQUE\s+INDEX\b/i;
+                return "ADD CHECK/UNIQUE CONSTRAINT" if !$ND && $c =~ /\bADD\s+(?:CONSTRAINT\s+\S+\s+)?(?:CHECK|UNIQUE)\b/i;
+                return "CREATE UNIQUE INDEX" if !$ND && $c =~ /\bCREATE\s+UNIQUE\s+INDEX\b/i;
                 return "ADD " . uc($1) if $c =~ /\bADD\s+(?:CONSTRAINT\s+\S+\s+)?(PRIMARY\s+KEY|FOREIGN\s+KEY|EXCLUDE)\b/i;
                 if ($c =~ /\bADD\b/i) {
                   pos($c) = $+[0];
@@ -2488,7 +2558,7 @@ jobs:
                   return code_reason($c);
                 }
                 if ($c =~ /\A\s*CREATE\s+UNIQUE\s+INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+NOT\s+EXISTS\s+)?$id\s+ON\b/i) {
-                  return "CREATE UNIQUE INDEX";
+                  return $ND ? "" : "CREATE UNIQUE INDEX";
                 }
                 return "";
               }
@@ -2630,9 +2700,42 @@ jobs:
             return 0
           }
 
+          # nd_marker <file> <comment-lead-regex>: prints `absent`, `noreason` or `ok:<reason>` for
+          # the FIRST exact non-destructive marker line. awk reads to EOF (no early exit) so the
+          # `git show` side of the pipe never gets SIGPIPE under pipefail.
+          nd_marker() {
+            git show "HEAD:$1" | awk -v lead="$2" '
+              state == 1 {
+                line = $0
+                if (line ~ ("^" lead)) {
+                  sub("^" lead, "", line)
+                  sub(/[[:space:]]+$/, "", line)
+                  if (line ~ /[[:alnum:]]/ && line !~ /^non-destructive$/) { res = "ok:" line } else { res = "noreason" }
+                } else { res = "noreason" }
+                state = 2
+                next
+              }
+              state == 0 && $0 ~ ("^" lead "non-destructive[[:space:]]*$") { state = 1; next }
+              END {
+                if (state == 0) print "absent"
+                else if (state == 1) print "noreason"
+                else print res
+              }'
+          }
+
+          # nd_warn <file> <reason>: surfaces an accepted opt-out as a PR annotation + job summary line.
+          nd_warn() {
+            local f="$1" msg
+            msg="non-destructive opt-out: $(printf '%s' "$2" | sed -e 's/%/%25/g')"
+            echo "::warning file=$f::$msg"
+            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+              echo "::warning file=$f::$msg" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          }
+
           run_destructive_gate() {
             local since="$1"
-            local added f base reason violations=0
+            local added f base reason nd violations=0
             added="$(git diff --name-only --diff-filter=A "${since}...HEAD" -- "$MIGRATION_PATH")"
             while IFS= read -r f; do
               [ -z "$f" ] && continue
@@ -2645,10 +2748,19 @@ jobs:
                 V*.sql) : ;;
                 *) continue ;;
               esac
-              if git show "HEAD:$f" | grep -qE '^[[:space:]]*--[[:space:]]*non-destructive[[:space:]]*$'; then
-                continue
-              fi
-              reason="$(git show "HEAD:$f" | destructive_reason)"
+              nd="$(nd_marker "$f" '[[:space:]]*--[[:space:]]*')"
+              case "$nd" in
+                noreason)
+                  echo "ERROR: '$f' has a '-- non-destructive' marker but the line directly after it is not a '-- <reason>' comment."
+                  violations=1
+                  continue ;;
+                ok:*)
+                  nd_warn "$f" "${nd#ok:}"
+                  reason="$(git show "HEAD:$f" | destructive_reason 1)"
+                  [ -n "$reason" ] && reason="$reason; the non-destructive marker covers only ADD CHECK/UNIQUE and CREATE UNIQUE INDEX" ;;
+                *)
+                  reason="$(git show "HEAD:$f" | destructive_reason)" ;;
+              esac
               [ -z "$reason" ] && continue
               check_contract_header "$f" "$reason" '--[[:space:]]*' || violations=1
             done <<EOF
@@ -2662,9 +2774,16 @@ jobs:
                 V*.java) : ;;
                 *) continue ;;
               esac
-              if git show "HEAD:$f" | grep -qE '^[[:space:]]*//[[:space:]]*non-destructive[[:space:]]*$'; then
-                continue
-              fi
+              nd="$(nd_marker "$f" '[[:space:]]*//[[:space:]]*')"
+              case "$nd" in
+                noreason)
+                  echo "ERROR: '$f' has a '// non-destructive' marker but the line directly after it is not a '// <reason>' comment."
+                  violations=1
+                  continue ;;
+                ok:*)
+                  nd_warn "$f" "${nd#ok:}"
+                  continue ;;
+              esac
               check_contract_header "$f" "Java migration is not parsed" '[[:space:]]*//[[:space:]]*' || violations=1
             done <<EOF
           $added
@@ -2725,9 +2844,49 @@ jobs:
           add V4__add_col.sql 'ALTER TABLE old_t ADD COLUMN other int;\nCREATE INDEX ix_old_t_other ON old_t (other);\nALTER TABLE old_t ALTER COLUMN other DROP NOT NULL;\nALTER TABLE old_t ALTER COLUMN other DROP DEFAULT;\nALTER TABLE old_t DROP CONSTRAINT IF EXISTS some_fk;\nDROP INDEX IF EXISTS ix_x;\nALTER TABLE old_t ALTER COLUMN other DROP IDENTITY;\nALTER TABLE old_t ALTER COLUMN other DROP IDENTITY IF EXISTS;\nALTER TABLE old_t ALTER COLUMN other DROP EXPRESSION;'
           expect_pass "non-destructive DDL (ADD/CREATE INDEX/DROP NOT NULL/DROP CONSTRAINT/DROP INDEX/ALTER COLUMN DROP IDENTITY|EXPRESSION)"
 
-          # --- Scenario 6b: SQL `-- non-destructive` marker (same semantics as the Java one) ---
+          # --- Scenario 6b: SQL `-- non-destructive` marker: suppresses ONLY ADD CHECK/UNIQUE + CREATE UNIQUE INDEX ---
+          # expect_warn: passes AND the opt-out is surfaced as ::warning + a $GITHUB_STEP_SUMMARY line.
+          expect_warn() {
+            local out summ
+            summ="$(mktemp)"
+            out="$(GITHUB_STEP_SUMMARY="$summ" run_destructive_gate "$BASE_SHA")" || fail "$1"
+            printf '%s\n' "$out" | grep -qF "::warning file=$MIGRATION_PATH/$2::non-destructive opt-out: $3" || fail "$1 (no ::warning annotation)"
+            grep -qF "::warning file=$MIGRATION_PATH/$2::non-destructive opt-out: $3" "$summ" || fail "$1 (no step-summary line)"
+            echo "OK: $1 -> accepted with warning"
+            reset
+          }
           add V4__slug.sql '-- non-destructive\n-- CHECK + UNIQUE target a column added NULL in this file.\nALTER TABLE old_t ADD COLUMN slug varchar(60);\nALTER TABLE old_t ADD CONSTRAINT ck_slug CHECK (slug IS NULL OR length(slug) > 2);\nCREATE UNIQUE INDEX ux_old_t_slug ON old_t (slug) WHERE slug IS NOT NULL;'
-          expect_pass "SQL ADD CHECK + CREATE UNIQUE INDEX with a -- non-destructive marker line"
+          expect_warn "SQL marker + reason + ADD CHECK + CREATE UNIQUE INDEX" V4__slug.sql "CHECK + UNIQUE target a column added NULL in this file."
+          add V4__slug.sql '  --   non-destructive  \n  -- Reason: 100% new column.\nALTER TABLE old_t ADD COLUMN slug varchar(60);\nALTER TABLE old_t ADD CONSTRAINT uq_slug UNIQUE (slug);\nALTER TABLE old_t ADD UNIQUE (slug);\nALTER TABLE old_t ADD CHECK (slug <> \x27\x27);'
+          expect_warn "SQL marker + reason + ADD UNIQUE / ADD CHECK (% escaped in the annotation)" V4__slug.sql "Reason: 100%25 new column."
+          add V4__slug.sql '-- non-destructive\nCREATE UNIQUE INDEX ux_old_t_slug ON old_t (slug);'
+          expect_fail "SQL marker without a reason line"
+          add V4__slug.sql '-- non-destructive\n--\nCREATE UNIQUE INDEX ux_old_t_slug ON old_t (slug);'
+          expect_fail "SQL marker followed by an empty comment"
+          add V4__slug.sql '-- non-destructive\n-- ---\nCREATE UNIQUE INDEX ux_old_t_slug ON old_t (slug);'
+          expect_fail "SQL marker followed by a punctuation-only comment"
+          add V4__slug.sql '-- non-destructive\n-- non-destructive\nCREATE UNIQUE INDEX ux_old_t_slug ON old_t (slug);'
+          expect_fail "SQL marker followed by a second marker as its reason"
+          add V4__slug.sql '-- non-destructive\n\n-- reason after a blank line\nCREATE UNIQUE INDEX ux_old_t_slug ON old_t (slug);'
+          expect_fail "SQL marker whose reason is not on the directly following line"
+          add V4__slug.sql 'CREATE UNIQUE INDEX ux_old_t_slug ON old_t (slug);\n-- non-destructive'
+          expect_fail "SQL marker as the last line (no reason)"
+          for stmt in \
+            'DROP TABLE old_t;' \
+            'ALTER TABLE old_t DROP COLUMN legacy;' \
+            'ALTER TABLE old_t RENAME COLUMN legacy TO l2;' \
+            'ALTER INDEX ix_old RENAME TO ix_new;' \
+            'ALTER TABLE old_t ALTER COLUMN legacy TYPE bigint;' \
+            'ALTER TABLE old_t ALTER COLUMN legacy SET NOT NULL;' \
+            'TRUNCATE old_t;' \
+            'ALTER TABLE old_t ADD PRIMARY KEY (id);' \
+            'ALTER TABLE old_t ADD CONSTRAINT fk_x FOREIGN KEY (legacy) REFERENCES old_t (id);' \
+            'ALTER TABLE old_t ADD COLUMN c int NOT NULL;'; do
+            add V4__nd_destructive.sql "-- non-destructive\n-- CHECK only, honest.\nALTER TABLE old_t ADD CONSTRAINT ck_l CHECK (legacy > 0);\n$stmt"
+            expect_fail "SQL marker + reason does not cover: $stmt"
+          done
+          add V4__nd_destructive.sql '-- non-destructive\n-- CHECK targets a new column.\n-- contract-of: V3\nALTER TABLE old_t ADD CONSTRAINT ck_l CHECK (legacy > 0);\nALTER TABLE old_t DROP COLUMN legacy;'
+          expect_pass "SQL marker + reason + DROP COLUMN with a valid contract-of"
           add V4__slug.sql 'ALTER TABLE old_t ADD COLUMN slug varchar(60);\nCREATE UNIQUE INDEX ux_old_t_slug ON old_t (slug) WHERE slug IS NOT NULL;'
           expect_fail "SQL CREATE UNIQUE INDEX without marker or header"
           add V4__slug.sql '-- non-destructive because reasons\nCREATE UNIQUE INDEX ux_old_t_slug ON old_t (slug);'
@@ -2866,7 +3025,14 @@ jobs:
           add_java V4__JavaMigration.java 'package db.migration;\npublic class V4__JavaMigration {}'
           expect_fail "Java migration without a header"
           add_java V4__JavaMigration.java '// non-destructive\npackage db.migration;\npublic class V4__JavaMigration {}'
-          expect_pass "Java migration with // non-destructive"
+          expect_fail "Java migration with // non-destructive but no reason line"
+          add_java V4__JavaMigration.java '// non-destructive\n//\npackage db.migration;\npublic class V4__JavaMigration {}'
+          expect_fail "Java migration with // non-destructive followed by an empty comment"
+          add_java V4__JavaMigration.java '// non-destructive\n// Backfills a nullable column only.\npackage db.migration;\npublic class V4__JavaMigration {}'
+          jout="$(GITHUB_STEP_SUMMARY="" run_destructive_gate "$BASE_SHA")" || fail "Java migration with // non-destructive + reason"
+          printf '%s\n' "$jout" | grep -qF "::warning file=$JAVA_MIGRATION_PATH/V4__JavaMigration.java::non-destructive opt-out: Backfills a nullable column only." || fail "Java opt-out emits no ::warning"
+          echo "OK: Java migration with // non-destructive + reason -> accepted with warning"
+          reset
           add_java V4__JavaMigration.java '// contract-of: V3\npackage db.migration;\npublic class V4__JavaMigration {}'
           expect_pass "Java migration with a valid // contract-of"
           add_java V4__JavaMigration.java '// contract-of: V99\npackage db.migration;\npublic class V4__JavaMigration {}'
@@ -2889,8 +3055,8 @@ jobs:
           expect_fail "destructive SQL two folders deep without header"
           add_java sub/V202__NestedJava.java 'package db.migration;\npublic class V202__NestedJava {}'
           expect_fail "Java migration in a subfolder without a header"
-          add_java sub/V202__NestedJava.java '// non-destructive\npackage db.migration;\npublic class V202__NestedJava {}'
-          expect_pass "Java migration in a subfolder with // non-destructive"
+          add_java sub/V202__NestedJava.java '// non-destructive\n// Nested helper, no schema change.\npackage db.migration;\npublic class V202__NestedJava {}'
+          expect_pass "Java migration in a subfolder with // non-destructive + reason"
           add_java sub/Helper.java 'package db.migration;\npublic class Helper {}'
           expect_pass "non-V*.java helper in a subfolder is out of scope"
           # contract-of may name a migration that lives in a subfolder.

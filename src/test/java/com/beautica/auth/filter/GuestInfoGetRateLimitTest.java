@@ -310,7 +310,8 @@ class GuestInfoGetRateLimitTest {
 
     @ParameterizedTest(name = "CF-Connecting-IP=\"{0}\"")
     @ValueSource(strings = {"", "  ", "not-an-ip", "999.1.1.1", "1.2.3", "example.com", "1.2.3.4, 5.6.7.8",
-            "::1::2::3", "fe80::1%eth0", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1"})
+            "::1::2::3", "fe80::1%eth0", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1",
+            ".:", "..::1", ".1:2"})
     @DisplayName("Valid Worker secret but malformed CF-Connecting-IP → falls back to the egress-IP key")
     void should_fallBackToEgressIpKey_when_cfConnectingIpMalformed(String malformed) throws Exception {
         AuthRateLimitFilter filter = workerAwareFilter();
@@ -384,5 +385,40 @@ class GuestInfoGetRateLimitTest {
                 .isEqualTo(AuthRateLimitFilter.canonicalIpLiteral("2001:DB8::1"))
                 .isNotNull();
         assertThat(AuthRateLimitFilter.canonicalIpLiteral("198.51.100.10")).isEqualTo("198.51.100.10");
+    }
+
+    @Test
+    @DisplayName("Two IPv6 visitors in one /64 share one info bucket: rotating the interface ID mints nothing")
+    void should_shareBucket_when_ipv6SameSlash64() throws Exception {
+        AuthRateLimitFilter filter = workerAwareFilter();
+        exhaustViaWorker(filter, WORKER_KEY, "2001:db8:1:2::a");
+
+        MockHttpServletResponse sameSlash64 =
+                fireOnce(filter, workerGet(SALON_INFO_PATH, WORKER_KEY, "2001:db8:1:2:ffff:eeee:dddd:cccc"));
+
+        assertThat(sameSlash64.getStatus()).as("an address in the exhausted /64 is throttled").isEqualTo(429);
+    }
+
+    @Test
+    @DisplayName("IPv6 visitors in different /64s keep separate info buckets")
+    void should_keepSeparateBuckets_when_ipv6DifferentSlash64() throws Exception {
+        AuthRateLimitFilter filter = workerAwareFilter();
+        exhaustViaWorker(filter, WORKER_KEY, "2001:db8:1:2::a");
+
+        MockHttpServletResponse otherSlash64 =
+                fireOnce(filter, workerGet(SALON_INFO_PATH, WORKER_KEY, "2001:db8:1:3::a"));
+
+        assertThat(otherSlash64.getStatus()).as("a neighbouring /64 is not throttled").isNotEqualTo(429);
+    }
+
+    @Test
+    @DisplayName("Visitor bucket key: IPv6 → /64 prefix; IPv4 and IPv4-mapped IPv6 → the plain IPv4 address")
+    void should_keyIpv6OnSlash64AndIpv4Unchanged_when_derivingVisitorBucketKey() {
+        assertThat(AuthRateLimitFilter.visitorIpBucketKey("2001:DB8:1:2:a:b:c:d"))
+                .isEqualTo(AuthRateLimitFilter.visitorIpBucketKey("2001:db8:1:2::1"))
+                .isEqualTo("2001:db8:1:2:0:0:0:0/64");
+        assertThat(AuthRateLimitFilter.visitorIpBucketKey("198.51.100.10")).isEqualTo("198.51.100.10");
+        assertThat(AuthRateLimitFilter.visitorIpBucketKey("::ffff:198.51.100.10")).isEqualTo("198.51.100.10");
+        assertThat(AuthRateLimitFilter.visitorIpBucketKey(".1:2")).isNull();
     }
 }

@@ -22,10 +22,12 @@ import org.springframework.web.filter.OncePerRequestFilter;
 import org.springframework.web.util.UrlPathHelper;
 
 import java.io.IOException;
+import java.net.Inet6Address;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.Arrays;
 import java.util.UUID;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -362,7 +364,13 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     private static final int MAX_IP_LITERAL_LENGTH = 45;
     private static final Pattern IPV4_LITERAL = Pattern.compile(
             "^((25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)\\.){3}(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)$");
-    private static final Pattern IPV6_LITERAL_CHARS = Pattern.compile("^[0-9A-Fa-f:.]+$");
+    // First char hex or ':' — InetAddress.getByName only takes its literal-parsing path for such a value
+    // (a leading '.' would fall through to a DNS lookup); the ':' requirement below makes it IPv6-only.
+    private static final Pattern IPV6_LITERAL_CHARS = Pattern.compile("^[0-9A-Fa-f:][0-9A-Fa-f:.]*$");
+    // IPv6 visitors are keyed on their /64: one subscriber is routinely handed a whole /64, so a per-/128
+    // key would let a single host mint 2^64 fresh buckets by rotating its interface identifier.
+    private static final int IPV6_BUCKET_PREFIX_BYTES = 8;
+    private static final String IPV6_BUCKET_SUFFIX = "/64";
     // Per-IP cap for GET /api/v1/search/** (240 / 60 s). These permitAll() discovery reads
     // expose authed-only street addresses for independent masters, so the throttle bounds the
     // RATE at which a single source can page through every district/city and the DB work each
@@ -1745,16 +1753,49 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         if (supplied == null || !ConstantTimeSecrets.matches(supplied, bookingInfoWorkerKey)) {
             return resolveBucketKey(request);
         }
-        String visitorIp = canonicalIpLiteral(request.getHeader(CF_CONNECTING_IP_HEADER));
-        return visitorIp != null ? visitorIp : resolveBucketKey(request);
+        String visitorKey = visitorIpBucketKey(request.getHeader(CF_CONNECTING_IP_HEADER));
+        return visitorKey != null ? visitorKey : resolveBucketKey(request);
     }
 
     /**
-     * The canonical text form of an IPv4/IPv6 LITERAL, or {@code null} when the value is not one. The
-     * character/shape pre-checks guarantee {@link InetAddress#getByName} parses a literal and never
-     * performs a DNS lookup; canonicalising stops two spellings of one IPv6 address from splitting a bucket.
+     * Bucket key for a forwarded visitor IP literal, or {@code null} when the value is not one. IPv4 (and
+     * IPv4-mapped IPv6, which parses to IPv4) keys on the canonical address; any other IPv6 address keys on
+     * its /64 prefix ({@code 2001:db8:0:0:0:0:0:0/64}), so rotating the low 64 bits never mints a new bucket.
+     */
+    static String visitorIpBucketKey(String value) {
+        InetAddress address = parseIpLiteral(value);
+        if (address == null) {
+            return null;
+        }
+        if (!(address instanceof Inet6Address)) {
+            return address.getHostAddress();
+        }
+        byte[] bytes = address.getAddress();
+        Arrays.fill(bytes, IPV6_BUCKET_PREFIX_BYTES, bytes.length, (byte) 0);
+        try {
+            return InetAddress.getByAddress(bytes).getHostAddress() + IPV6_BUCKET_SUFFIX;
+        } catch (UnknownHostException e) {
+            return null;
+        }
+    }
+
+    /**
+     * The canonical text form of an IPv4/IPv6 LITERAL, or {@code null} when the value is not one;
+     * canonicalising stops two spellings of one IPv6 address from splitting a bucket.
      */
     static String canonicalIpLiteral(String value) {
+        InetAddress address = parseIpLiteral(value);
+        return address == null ? null : address.getHostAddress();
+    }
+
+    /**
+     * Parses an IPv4/IPv6 LITERAL, or returns {@code null}. No DNS lookup is possible: a value reaches
+     * {@link InetAddress#getByName} only when it is a strict dotted-quad, or contains a ':' and starts with a
+     * hex digit or ':' — exactly the values the JDK parses as a literal (an IPv6 that fails to parse throws
+     * {@link UnknownHostException} instead of resolving). A leading '.' or any other character is rejected
+     * up front.
+     */
+    private static InetAddress parseIpLiteral(String value) {
         if (value == null) {
             return null;
         }
@@ -1768,7 +1809,7 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             return null;
         }
         try {
-            return InetAddress.getByName(candidate).getHostAddress();
+            return InetAddress.getByName(candidate);
         } catch (UnknownHostException e) {
             return null;
         }
