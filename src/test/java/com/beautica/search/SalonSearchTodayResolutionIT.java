@@ -208,8 +208,9 @@ class SalonSearchTodayResolutionIT {
 
         assertThat(splicing)
                 .as("6 static salon searches + 4 favourites lists + the search-membership verdict "
-                        + "+ the public salon roster gate")
-                .hasSize(12);
+                        + "+ the public salon roster gate + phase 376 booking-links salon bookability batch "
+                        + "+ phase 377 public salon booking-page master roster")
+                .hasSize(14);
         assertThat(failures).isEmpty();
     }
 
