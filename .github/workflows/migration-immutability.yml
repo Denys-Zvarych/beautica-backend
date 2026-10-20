@@ -360,6 +360,13 @@ jobs:
           #   * Java: an added V*.java at any depth under src/main/java/db/migration is not
           #     parsed; it must carry `// contract-of: V<n>` (destructive) or
           #     `// non-destructive` (author's statement), otherwise the gate fails.
+          #   * SQL `-- non-destructive` marker: same semantics as the Java one. A line that is
+          #     EXACTLY `-- non-destructive` (surrounding whitespace only, nothing after it) is the
+          #     author's statement that a parser hit is a false positive, e.g. an ADD CHECK / CREATE
+          #     UNIQUE INDEX on a column the SAME file adds NULL, which no existing row or
+          #     previous-app write can violate. The file is then not judged. Put the reason on the
+          #     next comment line; review owns it. It replaces abusing `-- contract-of: V<n>` as an
+          #     escape hatch for such files.
           #
           # SQL is read by ONE left-to-right tokenizer (no regex stripping, which
           # was evadable: `VALUES ('--'); DROP TABLE x;` hid the DROP behind a
@@ -479,6 +486,7 @@ jobs:
           #
           # A destructive file must carry one header line anywhere in it:
           #   -- contract-of: V<n>        (Java: // contract-of: V<n>)
+          # or, for a parser false positive, the `-- non-destructive` marker line (see above).
           # where V<n> is the EXPAND migration that already stopped the
           # previous app using the object. <n> must be plain digits, strictly
           # lower than this file's own version, and a V<n>__*.sql|java file must
@@ -872,6 +880,9 @@ jobs:
                 V*.sql) : ;;
                 *) continue ;;
               esac
+              if git show "HEAD:$f" | grep -qE '^[[:space:]]*--[[:space:]]*non-destructive[[:space:]]*$'; then
+                continue
+              fi
               reason="$(git show "HEAD:$f" | destructive_reason)"
               [ -z "$reason" ] && continue
               check_contract_header "$f" "$reason" '--[[:space:]]*' || violations=1
@@ -910,6 +921,8 @@ jobs:
           echo "SET NOT NULL; ALTER COLUMN TYPE; ADD CHECK/UNIQUE) are 'contract' steps: they may only ship after the"
           echo "release that stopped using the object is live in prod."
           echo "Add '-- contract-of: V<n>' (the EARLIER expand migration) to the file if intentional, and tick the release checklist."
+          echo "If the hit is a false positive (e.g. ADD CHECK / CREATE UNIQUE INDEX on a column added NULL in the same file),"
+          echo "add a line that is exactly '-- non-destructive' with the reason on the next comment line instead."
           echo "Java migrations (not parsed) need '// contract-of: V<n>' or '// non-destructive'."
           exit 1
 
@@ -2112,6 +2125,13 @@ jobs:
           #   * Java: an added V*.java at any depth under src/main/java/db/migration is not
           #     parsed; it must carry `// contract-of: V<n>` (destructive) or
           #     `// non-destructive` (author's statement), otherwise the gate fails.
+          #   * SQL `-- non-destructive` marker: same semantics as the Java one. A line that is
+          #     EXACTLY `-- non-destructive` (surrounding whitespace only, nothing after it) is the
+          #     author's statement that a parser hit is a false positive, e.g. an ADD CHECK / CREATE
+          #     UNIQUE INDEX on a column the SAME file adds NULL, which no existing row or
+          #     previous-app write can violate. The file is then not judged. Put the reason on the
+          #     next comment line; review owns it. It replaces abusing `-- contract-of: V<n>` as an
+          #     escape hatch for such files.
           #
           # SQL is read by ONE left-to-right tokenizer (no regex stripping, which
           # was evadable: `VALUES ('--'); DROP TABLE x;` hid the DROP behind a
@@ -2231,6 +2251,7 @@ jobs:
           #
           # A destructive file must carry one header line anywhere in it:
           #   -- contract-of: V<n>        (Java: // contract-of: V<n>)
+          # or, for a parser false positive, the `-- non-destructive` marker line (see above).
           # where V<n> is the EXPAND migration that already stopped the
           # previous app using the object. <n> must be plain digits, strictly
           # lower than this file's own version, and a V<n>__*.sql|java file must
@@ -2624,6 +2645,9 @@ jobs:
                 V*.sql) : ;;
                 *) continue ;;
               esac
+              if git show "HEAD:$f" | grep -qE '^[[:space:]]*--[[:space:]]*non-destructive[[:space:]]*$'; then
+                continue
+              fi
               reason="$(git show "HEAD:$f" | destructive_reason)"
               [ -z "$reason" ] && continue
               check_contract_header "$f" "$reason" '--[[:space:]]*' || violations=1
@@ -2700,6 +2724,18 @@ jobs:
           # --- Scenario 6: non-destructive -> pass ---
           add V4__add_col.sql 'ALTER TABLE old_t ADD COLUMN other int;\nCREATE INDEX ix_old_t_other ON old_t (other);\nALTER TABLE old_t ALTER COLUMN other DROP NOT NULL;\nALTER TABLE old_t ALTER COLUMN other DROP DEFAULT;\nALTER TABLE old_t DROP CONSTRAINT IF EXISTS some_fk;\nDROP INDEX IF EXISTS ix_x;\nALTER TABLE old_t ALTER COLUMN other DROP IDENTITY;\nALTER TABLE old_t ALTER COLUMN other DROP IDENTITY IF EXISTS;\nALTER TABLE old_t ALTER COLUMN other DROP EXPRESSION;'
           expect_pass "non-destructive DDL (ADD/CREATE INDEX/DROP NOT NULL/DROP CONSTRAINT/DROP INDEX/ALTER COLUMN DROP IDENTITY|EXPRESSION)"
+
+          # --- Scenario 6b: SQL `-- non-destructive` marker (same semantics as the Java one) ---
+          add V4__slug.sql '-- non-destructive\n-- CHECK + UNIQUE target a column added NULL in this file.\nALTER TABLE old_t ADD COLUMN slug varchar(60);\nALTER TABLE old_t ADD CONSTRAINT ck_slug CHECK (slug IS NULL OR length(slug) > 2);\nCREATE UNIQUE INDEX ux_old_t_slug ON old_t (slug) WHERE slug IS NOT NULL;'
+          expect_pass "SQL ADD CHECK + CREATE UNIQUE INDEX with a -- non-destructive marker line"
+          add V4__slug.sql 'ALTER TABLE old_t ADD COLUMN slug varchar(60);\nCREATE UNIQUE INDEX ux_old_t_slug ON old_t (slug) WHERE slug IS NOT NULL;'
+          expect_fail "SQL CREATE UNIQUE INDEX without marker or header"
+          add V4__slug.sql '-- non-destructive because reasons\nCREATE UNIQUE INDEX ux_old_t_slug ON old_t (slug);'
+          expect_fail "SQL marker with trailing text is not the marker"
+          add V4__slug.sql '-- this file is non-destructive\nCREATE UNIQUE INDEX ux_old_t_slug ON old_t (slug);'
+          expect_fail "SQL marker not at the start of the comment is not the marker"
+          add V4__slug.sql '// non-destructive\nCREATE UNIQUE INDEX ux_old_t_slug ON old_t (slug);'
+          expect_fail "Java-style // marker does not count in an SQL file"
 
           # --- Scenario 7: each destructive form is detected ---
           i=0
