@@ -94,6 +94,13 @@ public class CacheConfig {
     public static final long CLIENT_PASSPORT_TTL_MINUTES = 10;
 
     /**
+     * TTL of {@code salon-booking-slug-info} (perf audit L2): the upper bound on a salon page lagging a
+     * committed write when the after-commit value scan races an in-flight {@code sync=true} load (see
+     * {@code SalonBookingInfoCacheEvictor}). Public so {@code PublicSalonBookingInfoIT} asserts the LIVE cache.
+     */
+    public static final long SALON_BOOKING_SLUG_INFO_TTL_SECONDS = 30;
+
+    /**
      * Per-cache TTL configuration using individual Caffeine caches.
      *
      * Cache inventory:
@@ -718,14 +725,16 @@ public class CacheConfig {
                         .expireAfterWrite(60, TimeUnit.SECONDS)
                         .build());
         // Phase 377 — the salon twin behind GET /api/v1/book/s/{slug}/info, keyed on the salon slug
-        // (SalonBookingSlugService#findBySlug, sync=true — §F-7). Same 60-sec TTL and size as
-        // booking-slug-info. Unlike it, the TTL is only a backstop: SalonBookingInfoCacheEvictor drops
-        // the entry after commit (by salonId / listed master slug — a bounded value scan, never clear())
-        // on salon edits/deactivation and on every write that moves the salon's bookable-master list.
+        // (SalonBookingSlugService#findBySlug, sync=true — §F-7). Same size as booking-slug-info.
+        // SalonBookingInfoCacheEvictor drops the entry after commit (by salonId / listed master slug — a
+        // bounded value scan, never clear()) on salon edits/deactivation and on every write that moves the
+        // salon's bookable-master list. TTL 30 s (perf audit L2), half booking-slug-info's: a value scan
+        // cannot see a sync=true load still IN FLIGHT (no value yet), so a load that read pre-commit state
+        // can land after the scan; the TTL is the bound on that stale window.
         manager.registerCustomCache(SalonBookingInfoCacheEvictor.CACHE,
                 Caffeine.newBuilder()
                         .maximumSize(500)
-                        .expireAfterWrite(60, TimeUnit.SECONDS)
+                        .expireAfterWrite(SALON_BOOKING_SLUG_INFO_TTL_SECONDS, TimeUnit.SECONDS)
                         .build());
         // Phase 23.x (perf/security #2) — public salon service catalogue behind
         // GET /api/v1/salons/{salonId}/services, keyed on salonId. permitAll + uncached previously ran

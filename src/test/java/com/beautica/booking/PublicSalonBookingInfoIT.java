@@ -8,6 +8,7 @@ import com.beautica.booking.enums.CancellationReason;
 import com.beautica.booking.service.SalonBookingSlugService;
 import com.beautica.common.TimeZones;
 import com.beautica.common.cache.SalonBookingInfoCacheEvictor;
+import com.beautica.config.CacheConfig;
 import com.beautica.master.dto.ScheduleOverrideRequest;
 import com.beautica.master.dto.WorkIntervalDto;
 import com.beautica.master.entity.ScheduleExceptionKind;
@@ -27,6 +28,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.cache.Cache;
 import org.springframework.cache.CacheManager;
+import org.springframework.cache.caffeine.CaffeineCache;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
@@ -43,6 +45,7 @@ import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -523,5 +526,21 @@ class PublicSalonBookingInfoIT extends AbstractIntegrationTest {
         assertThat(pageCache().get(salon.slug()).get())
                 .as("a cancel must not evict salon-booking-slug-info either").isSameAs(cachedBefore);
         assertThat(names(page(salon.slug()).path("masters"))).containsExactly("Realna Maisterka");
+    }
+
+    @Test
+    @DisplayName("salon-booking-slug-info expires after 30 s — the bound on a page lagging a write the value scan missed")
+    void should_expireAfterThirtySeconds_when_salonPageCacheIsLive() {
+        Cache springCache = pageCache();
+
+        com.github.benmanes.caffeine.cache.Cache<Object, Object> nativeCache =
+                ((CaffeineCache) springCache).getNativeCache();
+
+        assertThat(nativeCache.policy().expireAfterWrite())
+                .isPresent()
+                .get()
+                .extracting(p -> p.getExpiresAfter(TimeUnit.SECONDS))
+                .isEqualTo(CacheConfig.SALON_BOOKING_SLUG_INFO_TTL_SECONDS)
+                .isEqualTo(30L);
     }
 }

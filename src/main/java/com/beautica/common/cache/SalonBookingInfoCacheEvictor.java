@@ -26,6 +26,12 @@ import java.util.function.Predicate;
  * {@link #evictSalonAfterCommit} registers itself; {@link #evictSalon} / {@link #evictByMasterSlug} are for
  * callers already inside an {@code afterCommit} hook. The scan runs on {@code cacheEvictionExecutor}
  * (inline under the {@code test} profile), off the committing request thread.
+ *
+ * <p><b>Staleness bound.</b> A value scan only sees COMPLETED entries. A {@code sync=true} load that started
+ * before the write committed (and so read the old state) has no value in the map while the scan runs, and
+ * lands afterwards — the scan cannot evict it. That entry is stale until the cache TTL expires, so the
+ * {@code expireAfterWrite} of {@value #CACHE} in {@code CacheConfig} (30 s) is the upper bound on how long a
+ * salon page can lag a committed write. Keep the TTL short if this cache's registration changes.
  */
 @Component
 public class SalonBookingInfoCacheEvictor {
