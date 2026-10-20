@@ -1,5 +1,6 @@
 package com.beautica.auth.filter;
 
+import com.beautica.config.BookingInfoWorkerProperties;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.github.benmanes.caffeine.cache.LoadingCache;
 import io.github.bucket4j.Bandwidth;
@@ -60,6 +61,52 @@ class GuestInfoGetRateLimitTest {
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive());
+    }
+
+    private static final String WORKER_KEY = "test-worker-secret-0123456789abcdef";
+    private static final String WORKER_EGRESS_ADDR = "203.0.113.7";
+    private static final String VISITOR_A = "198.51.100.10";
+    private static final String VISITOR_B = "198.51.100.11";
+
+    /** The Spring constructor with the website-Worker key configured (feature on). */
+    private AuthRateLimitFilter workerAwareFilter() {
+        var props = new BookingInfoWorkerProperties();
+        props.setWorkerKey(WORKER_KEY);
+        return new AuthRateLimitFilter(
+                permissive(), permissive(), permissive(), permissive(),
+                permissive(), permissive(), permissive(), permissive(),
+                permissive(), permissive(), permissive(), permissive(),
+                permissive(), permissive(), permissive(), permissive(),
+                permissive(), permissive(), permissive(), permissive(), permissive(), permissive(),
+                permissive(), permissive(), permissive(), props);
+    }
+
+    /** A Worker-shaped request: Worker egress IP as the socket peer, optional key + visitor headers. */
+    private static MockHttpServletRequest workerGet(String path, String workerKey, String cfConnectingIp) {
+        var req = get(path, WORKER_EGRESS_ADDR);
+        if (workerKey != null) {
+            req.addHeader("X-Beautica-Worker-Key", workerKey);
+        }
+        if (cfConnectingIp != null) {
+            req.addHeader("CF-Connecting-IP", cfConnectingIp);
+        }
+        return req;
+    }
+
+    /** Fires {@link #REQUESTS_TO_FIRE} Worker-shaped requests (all from the Worker egress IP). */
+    private static void exhaustViaWorker(AuthRateLimitFilter filter, String workerKey, String cfConnectingIp)
+            throws Exception {
+        for (int i = 0; i < REQUESTS_TO_FIRE; i++) {
+            filter.doFilterInternal(workerGet(SALON_INFO_PATH, workerKey, cfConnectingIp),
+                    new MockHttpServletResponse(), new MockFilterChain());
+        }
+    }
+
+    private static MockHttpServletResponse fireOnce(AuthRateLimitFilter filter, MockHttpServletRequest req)
+            throws Exception {
+        var response = new MockHttpServletResponse();
+        filter.doFilterInternal(req, response, new MockFilterChain());
+        return response;
     }
 
     private static MockHttpServletRequest get(String path, String remoteAddr) {
@@ -219,5 +266,123 @@ class GuestInfoGetRateLimitTest {
 
         assertThat(response.getStatus()).as("%s %s after the canonical budget is spent", method, path)
                 .isEqualTo(429);
+    }
+
+    @Test
+    @DisplayName("Worker secret present → the info bucket keys on CF-Connecting-IP, so one visitor's flood leaves another visitor (same egress IP) untouched")
+    void should_keyOnForwardedClientIp_when_workerSecretPresent() throws Exception {
+        AuthRateLimitFilter filter = workerAwareFilter();
+        exhaustViaWorker(filter, WORKER_KEY, VISITOR_A);
+
+        MockHttpServletResponse visitorA = fireOnce(filter, workerGet(SALON_INFO_PATH, WORKER_KEY, VISITOR_A));
+        MockHttpServletResponse visitorB = fireOnce(filter, workerGet(MASTER_INFO_PATH, WORKER_KEY, VISITOR_B));
+
+        assertThat(visitorA.getStatus()).as("the flooding visitor is throttled on its own bucket").isEqualTo(429);
+        assertThat(visitorB.getStatus()).as("another visitor behind the same Worker egress IP is not")
+                .isNotEqualTo(429);
+    }
+
+    @Test
+    @DisplayName("No Worker secret → requests from one egress IP share one bucket and 429 past the cap, whatever CF-Connecting-IP says")
+    void should_429_when_noSecret_and_sameEgressIpExceedsCap() throws Exception {
+        AuthRateLimitFilter filter = workerAwareFilter();
+        exhaustViaWorker(filter, null, VISITOR_A);
+
+        MockHttpServletResponse otherVisitor = fireOnce(filter, workerGet(SALON_INFO_PATH, null, VISITOR_B));
+
+        assertThat(otherVisitor.getStatus()).isEqualTo(429);
+    }
+
+    @Test
+    @DisplayName("Wrong Worker secret → treated exactly like no secret (egress-IP keyed)")
+    void should_keyOnEgressIp_when_workerSecretIsWrong() throws Exception {
+        AuthRateLimitFilter filter = workerAwareFilter();
+        exhaustViaWorker(filter, WORKER_KEY + "x", VISITOR_A);
+
+        MockHttpServletResponse otherVisitor = fireOnce(filter, workerGet(SALON_INFO_PATH, "wrong", VISITOR_B));
+        MockHttpServletResponse plainEgress = fireOnce(filter, workerGet(SALON_INFO_PATH, null, null));
+
+        assertThat(otherVisitor.getStatus()).as("a forged CF-Connecting-IP must not mint a fresh bucket")
+                .isEqualTo(429);
+        assertThat(plainEgress.getStatus()).as("the wrong-key flood was charged to the egress IP bucket")
+                .isEqualTo(429);
+    }
+
+    @ParameterizedTest(name = "CF-Connecting-IP=\"{0}\"")
+    @ValueSource(strings = {"", "  ", "not-an-ip", "999.1.1.1", "1.2.3", "example.com", "1.2.3.4, 5.6.7.8",
+            "::1::2::3", "fe80::1%eth0", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1"})
+    @DisplayName("Valid Worker secret but malformed CF-Connecting-IP → falls back to the egress-IP key")
+    void should_fallBackToEgressIpKey_when_cfConnectingIpMalformed(String malformed) throws Exception {
+        AuthRateLimitFilter filter = workerAwareFilter();
+        exhaustViaWorker(filter, null, null);
+
+        MockHttpServletResponse response = fireOnce(filter, workerGet(SALON_INFO_PATH, WORKER_KEY, malformed));
+
+        assertThat(response.getStatus()).as("malformed CF-Connecting-IP must land on the exhausted egress bucket")
+                .isEqualTo(429);
+    }
+
+    @Test
+    @DisplayName("Valid Worker secret but no CF-Connecting-IP header → falls back to the egress-IP key")
+    void should_fallBackToEgressIpKey_when_cfConnectingIpMissing() throws Exception {
+        AuthRateLimitFilter filter = workerAwareFilter();
+        exhaustViaWorker(filter, null, null);
+
+        MockHttpServletResponse response = fireOnce(filter, workerGet(SALON_INFO_PATH, WORKER_KEY, null));
+
+        assertThat(response.getStatus()).isEqualTo(429);
+    }
+
+    @Test
+    @DisplayName("Feature off (public constructor, no key configured) → the Worker header is ignored")
+    void should_ignoreWorkerHeader_when_featureOff() throws Exception {
+        AuthRateLimitFilter filter = realFilter();
+        exhaustViaWorker(filter, WORKER_KEY, VISITOR_A);
+
+        MockHttpServletResponse otherVisitor = fireOnce(filter, workerGet(SALON_INFO_PATH, WORKER_KEY, VISITOR_B));
+
+        assertThat(otherVisitor.getStatus()).isEqualTo(429);
+    }
+
+    @Test
+    @DisplayName("Blank configured key → feature off: a blank header can never match")
+    void should_ignoreWorkerHeader_when_configuredKeyBlank() throws Exception {
+        var props = new BookingInfoWorkerProperties();
+        props.setWorkerKey("   ");
+        AuthRateLimitFilter filter = new AuthRateLimitFilter(
+                permissive(), permissive(), permissive(), permissive(),
+                permissive(), permissive(), permissive(), permissive(),
+                permissive(), permissive(), permissive(), permissive(),
+                permissive(), permissive(), permissive(), permissive(),
+                permissive(), permissive(), permissive(), permissive(), permissive(), permissive(),
+                permissive(), permissive(), permissive(), props);
+        exhaustViaWorker(filter, "   ", VISITOR_A);
+
+        MockHttpServletResponse otherVisitor = fireOnce(filter, workerGet(SALON_INFO_PATH, "   ", VISITOR_B));
+
+        assertThat(otherVisitor.getStatus()).isEqualTo(429);
+    }
+
+    @Test
+    @DisplayName("The Worker key applies to the info reads only: availability stays egress-IP keyed")
+    void should_keepEgressIpKey_when_workerKeySentToAvailability() throws Exception {
+        AuthRateLimitFilter filter = workerAwareFilter();
+        for (int i = 0; i < REQUESTS_TO_FIRE; i++) {
+            filter.doFilterInternal(workerGet(AVAILABILITY_PATH, WORKER_KEY, VISITOR_A),
+                    new MockHttpServletResponse(), new MockFilterChain());
+        }
+
+        MockHttpServletResponse otherVisitor = fireOnce(filter, workerGet(AVAILABILITY_PATH, WORKER_KEY, VISITOR_B));
+
+        assertThat(otherVisitor.getStatus()).isEqualTo(429);
+    }
+
+    @Test
+    @DisplayName("Two spellings of one IPv6 visitor address share one bucket")
+    void should_canonicaliseIpv6_when_keyingOnForwardedClientIp() {
+        assertThat(AuthRateLimitFilter.canonicalIpLiteral("2001:db8:0:0:0:0:0:1"))
+                .isEqualTo(AuthRateLimitFilter.canonicalIpLiteral("2001:DB8::1"))
+                .isNotNull();
+        assertThat(AuthRateLimitFilter.canonicalIpLiteral("198.51.100.10")).isEqualTo("198.51.100.10");
     }
 }

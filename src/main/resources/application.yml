@@ -407,6 +407,11 @@ app:
     # Phase 375 (D5) — public website origin of the share URL ({web-base-url}/book/{slug}).
     # https, bare origin, no trailing slash — validated at boot (BookingLinksProperties).
     web-base-url: https://beautica.app
+  booking-info:
+    # Optional shared secret of the website's SSR Worker (website 008). A /book/**/info request carrying a
+    # matching X-Beautica-Worker-Key header is rate-limited per CF-Connecting-IP (the visitor) instead of
+    # per egress IP (BookingInfoWorkerProperties). Blank = feature off. Secret: never log it.
+    worker-key: ${BOOKING_INFO_WORKER_KEY:}
   admin-email: ${ADMIN_EMAIL:admin@beautica.app}
   support:
     # Fixed destination inbox for the Help / Contact-us feature

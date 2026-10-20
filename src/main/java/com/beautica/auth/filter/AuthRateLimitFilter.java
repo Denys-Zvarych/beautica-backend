@@ -1,6 +1,8 @@
 package com.beautica.auth.filter;
 
 import com.beautica.common.security.BearerTokenExtractor;
+import com.beautica.common.security.ConstantTimeSecrets;
+import com.beautica.config.BookingInfoWorkerProperties;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.github.benmanes.caffeine.cache.LoadingCache;
 import io.github.bucket4j.Bandwidth;
@@ -11,6 +13,7 @@ import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.http.HttpMethod;
 import org.springframework.stereotype.Component;
@@ -19,6 +22,8 @@ import org.springframework.web.filter.OncePerRequestFilter;
 import org.springframework.web.util.UrlPathHelper;
 
 import java.io.IOException;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.UUID;
@@ -346,6 +351,18 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // guestAvailabilityBuckets so the public constructor stays unchanged.
     private static final long GUEST_INFO_CAPACITY = 60;
     private static final Duration GUEST_INFO_WINDOW = Duration.ofMinutes(1);
+    // Entry cap for guestInfoBuckets (perf audit L1). Lower than the 100_000 the other per-IP caches use:
+    // the bucket is a read-flood guard with a 6-minute idle expiry, so 20_000 concurrently-active sources
+    // is ample, and a Worker-keyed (CF-Connecting-IP) bucket set must not grow the heap unboundedly.
+    private static final long GUEST_INFO_MAX_ENTRIES = 20_000;
+    // Website SSR Worker identification on the info reads (see BookingInfoWorkerProperties). The Worker
+    // calls from one egress IP; with a matching secret its forwarded visitor IP keys the bucket instead.
+    private static final String WORKER_KEY_HEADER = "X-Beautica-Worker-Key";
+    private static final String CF_CONNECTING_IP_HEADER = "CF-Connecting-IP";
+    private static final int MAX_IP_LITERAL_LENGTH = 45;
+    private static final Pattern IPV4_LITERAL = Pattern.compile(
+            "^((25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)\\.){3}(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)$");
+    private static final Pattern IPV6_LITERAL_CHARS = Pattern.compile("^[0-9A-Fa-f:.]+$");
     // Per-IP cap for GET /api/v1/search/** (240 / 60 s). These permitAll() discovery reads
     // expose authed-only street addresses for independent masters, so the throttle bounds the
     // RATE at which a single source can page through every district/city and the DB work each
@@ -720,6 +737,15 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // RateLimitConfig#reviewPageBuckets (app.rate-limit.review-page-capacity).
     private final LoadingCache<String, Bucket> reviewPageBuckets;
 
+    // Configured website-Worker secret for the info reads, or null when the feature is off (blank config).
+    // A secret: never logged.
+    private final String bookingInfoWorkerKey;
+
+    /**
+     * Feature-off constructor: identical to the Spring constructor with no website-Worker key configured.
+     * The only PUBLIC constructor, so the slice/regression tests that build this filter directly (and the
+     * qualifier-indexed {@code AuthRateLimitFilterTestFactory}, which requires exactly one) stay unchanged.
+     */
     public AuthRateLimitFilter(
             @Qualifier("registerBuckets") LoadingCache<String, Bucket> registerBuckets,
             @Qualifier("loginBuckets") LoadingCache<String, Bucket> loginBuckets,
@@ -746,6 +772,63 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             @Qualifier("inviteBuckets") LoadingCache<String, Bucket> inviteBuckets,
             @Qualifier("reviewDecisionBuckets") LoadingCache<String, Bucket> reviewDecisionBuckets,
             @Qualifier("reviewPageBuckets") LoadingCache<String, Bucket> reviewPageBuckets) {
+        this(registerBuckets,
+                loginBuckets,
+                refreshBuckets,
+                verifyEmailBuckets,
+                slotsBuckets,
+                deviceTokenBuckets,
+                mediaUploadBuckets,
+                profileUpdateBuckets,
+                resendVerificationBuckets,
+                forgotPasswordBuckets,
+                resetPasswordBuckets,
+                categoryRequestBuckets,
+                suggestServiceTypeBuckets,
+                bulkServiceSetupBuckets,
+                supportContactBuckets,
+                otpSendBuckets,
+                verifyPasswordResetOtpBuckets,
+                changePasswordOtpBuckets,
+                serviceWriteBuckets,
+                inviteValidateBuckets,
+                inviteAcceptBuckets,
+                catalogueBrowseBuckets,
+                inviteBuckets,
+                reviewDecisionBuckets,
+                reviewPageBuckets,
+                new BookingInfoWorkerProperties());
+    }
+
+    /** Spring constructor: as the public one, plus the optional website-Worker key (feature off when blank). */
+    @Autowired
+    AuthRateLimitFilter(
+            @Qualifier("registerBuckets") LoadingCache<String, Bucket> registerBuckets,
+            @Qualifier("loginBuckets") LoadingCache<String, Bucket> loginBuckets,
+            @Qualifier("refreshBuckets") LoadingCache<String, Bucket> refreshBuckets,
+            @Qualifier("verifyEmailBuckets") LoadingCache<String, Bucket> verifyEmailBuckets,
+            @Qualifier("slotsBuckets") LoadingCache<String, Bucket> slotsBuckets,
+            @Qualifier("deviceTokenBuckets") LoadingCache<String, Bucket> deviceTokenBuckets,
+            @Qualifier("mediaUploadBuckets") LoadingCache<String, Bucket> mediaUploadBuckets,
+            @Qualifier("profileUpdateBuckets") LoadingCache<String, Bucket> profileUpdateBuckets,
+            @Qualifier("resendVerificationBuckets") LoadingCache<String, Bucket> resendVerificationBuckets,
+            @Qualifier("forgotPasswordBuckets") LoadingCache<String, Bucket> forgotPasswordBuckets,
+            @Qualifier("resetPasswordBuckets") LoadingCache<String, Bucket> resetPasswordBuckets,
+            @Qualifier("categoryRequestBuckets") LoadingCache<String, Bucket> categoryRequestBuckets,
+            @Qualifier("suggestServiceTypeBuckets") LoadingCache<String, Bucket> suggestServiceTypeBuckets,
+            @Qualifier("bulkServiceSetupBuckets") LoadingCache<String, Bucket> bulkServiceSetupBuckets,
+            @Qualifier("supportContactBuckets") LoadingCache<String, Bucket> supportContactBuckets,
+            @Qualifier("otpSendBuckets") LoadingCache<String, Bucket> otpSendBuckets,
+            @Qualifier("verifyPasswordResetOtpBuckets") LoadingCache<String, Bucket> verifyPasswordResetOtpBuckets,
+            @Qualifier("changePasswordOtpBuckets") LoadingCache<String, Bucket> changePasswordOtpBuckets,
+            @Qualifier("serviceWriteBuckets") LoadingCache<String, Bucket> serviceWriteBuckets,
+            @Qualifier("inviteValidateBuckets") LoadingCache<String, Bucket> inviteValidateBuckets,
+            @Qualifier("inviteAcceptBuckets") LoadingCache<String, Bucket> inviteAcceptBuckets,
+            @Qualifier("catalogueBrowseBuckets") LoadingCache<String, Bucket> catalogueBrowseBuckets,
+            @Qualifier("inviteBuckets") LoadingCache<String, Bucket> inviteBuckets,
+            @Qualifier("reviewDecisionBuckets") LoadingCache<String, Bucket> reviewDecisionBuckets,
+            @Qualifier("reviewPageBuckets") LoadingCache<String, Bucket> reviewPageBuckets,
+            BookingInfoWorkerProperties bookingInfoWorker) {
         this.registerBuckets = registerBuckets;
         this.loginBuckets = loginBuckets;
         this.refreshBuckets = refreshBuckets;
@@ -771,6 +854,7 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         this.inviteBuckets = inviteBuckets;
         this.reviewDecisionBuckets = reviewDecisionBuckets;
         this.reviewPageBuckets = reviewPageBuckets;
+        this.bookingInfoWorkerKey = bookingInfoWorker.isEnabled() ? bookingInfoWorker.getWorkerKey() : null;
         this.otpVerifyBuckets = Caffeine.newBuilder()
                 .maximumSize(100_000)
                 .expireAfterAccess(OTP_VERIFY_WINDOW.plusMinutes(5))
@@ -796,7 +880,7 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                         .addLimit(guestAvailabilityBandwidth())
                         .build());
         this.guestInfoBuckets = Caffeine.newBuilder()
-                .maximumSize(100_000)
+                .maximumSize(GUEST_INFO_MAX_ENTRIES)
                 .expireAfterAccess(GUEST_INFO_WINDOW.plusMinutes(5))
                 .build(key -> Bucket.builder()
                         .addLimit(guestInfoBandwidth())
@@ -1119,7 +1203,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         if (isGetOrHead(method)
                 && path.startsWith(GUEST_BOOKING_PATH_PREFIX)
                 && path.endsWith(GUEST_INFO_PATH_SUFFIX)) {
-            applyRateLimit(request, response, filterChain, guestInfoBuckets, RETRY_AFTER_SECONDS);
+            applyRateLimit(request, response, filterChain, guestInfoBuckets, RETRY_AFTER_SECONDS, 1L,
+                    resolveGuestInfoBucketKey(request));
             return;
         }
 
@@ -1590,7 +1675,17 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                                 LoadingCache<String, Bucket> cache,
                                 int retryAfterSeconds,
                                 long tokens) throws ServletException, IOException {
-        Bucket bucket = cache.get(resolveBucketKey(request));
+        applyRateLimit(request, response, filterChain, cache, retryAfterSeconds, tokens, resolveBucketKey(request));
+    }
+
+    private void applyRateLimit(HttpServletRequest request,
+                                HttpServletResponse response,
+                                FilterChain filterChain,
+                                LoadingCache<String, Bucket> cache,
+                                int retryAfterSeconds,
+                                long tokens,
+                                String bucketKey) throws ServletException, IOException {
+        Bucket bucket = cache.get(bucketKey);
 
         // Retry-After is the bucket's REAL time-to-refill for the requested tokens (rounded up,
         // minimum 1 s), not the window length: a bucket that refills in 20 s must not tell the
@@ -1633,6 +1728,50 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     private String resolveBucketKey(HttpServletRequest request) {
         String ip = resolveClientIp(request);
         return ip.length() > 45 ? request.getRemoteAddr() : ip;
+    }
+
+    /**
+     * Bucket key for the booking-page info reads. With the website-Worker feature on, a request carrying a
+     * matching {@value #WORKER_KEY_HEADER} (constant-time compare) is keyed on the visitor IP in
+     * {@value #CF_CONNECTING_IP_HEADER}, so the Worker's single egress IP does not pool every visitor into one
+     * bucket. Anything else — feature off, no header, wrong key, missing or non-IP-literal
+     * CF-Connecting-IP — falls back to {@link #resolveBucketKey} exactly as before.
+     */
+    private String resolveGuestInfoBucketKey(HttpServletRequest request) {
+        if (bookingInfoWorkerKey == null) {
+            return resolveBucketKey(request);
+        }
+        String supplied = request.getHeader(WORKER_KEY_HEADER);
+        if (supplied == null || !ConstantTimeSecrets.matches(supplied, bookingInfoWorkerKey)) {
+            return resolveBucketKey(request);
+        }
+        String visitorIp = canonicalIpLiteral(request.getHeader(CF_CONNECTING_IP_HEADER));
+        return visitorIp != null ? visitorIp : resolveBucketKey(request);
+    }
+
+    /**
+     * The canonical text form of an IPv4/IPv6 LITERAL, or {@code null} when the value is not one. The
+     * character/shape pre-checks guarantee {@link InetAddress#getByName} parses a literal and never
+     * performs a DNS lookup; canonicalising stops two spellings of one IPv6 address from splitting a bucket.
+     */
+    static String canonicalIpLiteral(String value) {
+        if (value == null) {
+            return null;
+        }
+        String candidate = value.trim();
+        if (candidate.isEmpty() || candidate.length() > MAX_IP_LITERAL_LENGTH) {
+            return null;
+        }
+        boolean ipv4 = IPV4_LITERAL.matcher(candidate).matches();
+        boolean ipv6 = !ipv4 && candidate.indexOf(':') >= 0 && IPV6_LITERAL_CHARS.matcher(candidate).matches();
+        if (!ipv4 && !ipv6) {
+            return null;
+        }
+        try {
+            return InetAddress.getByName(candidate).getHostAddress();
+        } catch (UnknownHostException e) {
+            return null;
+        }
     }
 
     private String resolveClientIp(HttpServletRequest request) {
