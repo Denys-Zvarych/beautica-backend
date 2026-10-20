@@ -9,6 +9,9 @@ import org.springframework.boot.context.properties.EnableConfigurationProperties
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.context.annotation.Configuration;
 
+import java.util.Arrays;
+import java.util.Base64;
+
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
@@ -21,6 +24,8 @@ class BookingInfoWorkerPropertiesTest {
 
     private static final String KEY_31 = "k".repeat(31);
     private static final String KEY_32 = "k".repeat(32);
+    /** Shape of an {@code openssl rand -base64 32} value (44 chars), built at runtime — no secret-looking literal. */
+    private static final String KEY_BASE64_32_BYTES = base64Of32Bytes();
 
     @Configuration
     @EnableConfigurationProperties(BookingInfoWorkerProperties.class)
@@ -80,7 +85,7 @@ class BookingInfoWorkerPropertiesTest {
     @Test
     @DisplayName("a 44-char openssl rand -base64 32 value → boots")
     void should_boot_when_workerKeyIsBase64Of32Bytes() {
-        runner("app.booking-info.worker-key=q7Lm1yq0b2Q9cJ4p8e3uVt6WkRZsXo5nHdA1fGiB0mE=")
+        runner("app.booking-info.worker-key=" + KEY_BASE64_32_BYTES)
                 .run(ctx -> assertThat(ctx).hasNotFailed());
     }
 
@@ -125,6 +130,12 @@ class BookingInfoWorkerPropertiesTest {
             assertThat(ctx).hasNotFailed();
             assertThat(ctx.getBean(BookingInfoWorkerProperties.class).isEnabled()).isFalse();
         });
+    }
+
+    private static String base64Of32Bytes() {
+        byte[] bytes = new byte[32];
+        Arrays.fill(bytes, (byte) 0x5A);
+        return Base64.getEncoder().encodeToString(bytes);
     }
 
     private static String rootCauseChainText(Throwable failure) {

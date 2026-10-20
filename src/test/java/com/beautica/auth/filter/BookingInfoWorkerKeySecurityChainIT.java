@@ -15,7 +15,8 @@ import org.springframework.boot.logging.LoggerConfiguration;
 import org.springframework.boot.logging.LoggingSystem;
 import org.springframework.boot.test.system.CapturedOutput;
 import org.springframework.boot.test.system.OutputCaptureExtension;
-import org.springframework.test.context.TestPropertySource;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.util.ReflectionTestUtils;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
@@ -44,13 +45,20 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
  * afterwards (a {@code logging.level.*} property would leak DEBUG into every later context in the JVM).
  */
 @AutoConfigureMockMvc
-@TestPropertySource(properties = "app.booking-info.worker-key=" + BookingInfoWorkerKeySecurityChainIT.WORKER_KEY)
 @ExtendWith(OutputCaptureExtension.class)
 @DisplayName("/book/**/info worker key through the REAL security filter chain — bucket keying + no key in logs")
 class BookingInfoWorkerKeySecurityChainIT extends AbstractIntegrationTest {
 
-    /** ≥ 32 chars (boot guard); a distinctive marker so a leak is unambiguous in captured output. */
-    static final String WORKER_KEY = "qa168-WORKER-SECRET-7f3c9a1e5b2d4c6e8a0f";
+    /**
+     * ≥ 32 chars (boot guard, 40 here); a distinctive marker so a leak is unambiguous in captured output.
+     * Built at runtime so no secret-looking literal sits in source (gitleaks generic-api-key).
+     */
+    static final String WORKER_KEY = "qa168".repeat(8);
+
+    @DynamicPropertySource
+    static void workerKey(DynamicPropertyRegistry registry) {
+        registry.add("app.booking-info.worker-key", () -> WORKER_KEY);
+    }
 
     private static final String WORKER_KEY_HEADER = "X-Beautica-Worker-Key";
     private static final String CF_CONNECTING_IP = "CF-Connecting-IP";

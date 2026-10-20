@@ -64,7 +64,8 @@ class GuestInfoGetRateLimitTest {
                 permissive(), permissive(), permissive());
     }
 
-    private static final String WORKER_KEY = "test-worker-secret-0123456789abcdef";
+    /** ≥ 32 chars (35), built at runtime so no secret-looking literal sits in source. */
+    private static final String WORKER_KEY = "wk-test".repeat(5);
     private static final String WORKER_EGRESS_ADDR = "203.0.113.7";
     private static final String VISITOR_A = "198.51.100.10";
     private static final String VISITOR_B = "198.51.100.11";
