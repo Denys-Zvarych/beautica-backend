@@ -2,6 +2,7 @@ package com.beautica.config;
 
 import com.beautica.booking.service.BookingMasterService;
 import com.beautica.client.service.ClientPassportService;
+import com.beautica.common.cache.SalonBookingInfoCacheEvictor;
 import com.beautica.common.cache.UserProfileCacheEvictor;
 import com.beautica.location.SettlementDisplayNameResolver;
 import com.beautica.location.service.SettlementSearchService;
@@ -712,6 +713,16 @@ public class CacheConfig {
         // entry would render a broken image, not just an old one. sync=true on the @Cacheable annotation
         // collapses the thundering herd when a popular slug expires (Anti-Bug §F-7).
         manager.registerCustomCache("booking-slug-info",
+                Caffeine.newBuilder()
+                        .maximumSize(500)
+                        .expireAfterWrite(60, TimeUnit.SECONDS)
+                        .build());
+        // Phase 377 — the salon twin behind GET /api/v1/book/s/{slug}/info, keyed on the salon slug
+        // (SalonBookingSlugService#findBySlug, sync=true — §F-7). Same 60-sec TTL and size as
+        // booking-slug-info. Unlike it, the TTL is only a backstop: SalonBookingInfoCacheEvictor drops
+        // the entry after commit (by salonId / listed master slug — a bounded value scan, never clear())
+        // on salon edits/deactivation and on every write that moves the salon's bookable-master list.
+        manager.registerCustomCache(SalonBookingInfoCacheEvictor.CACHE,
                 Caffeine.newBuilder()
                         .maximumSize(500)
                         .expireAfterWrite(60, TimeUnit.SECONDS)

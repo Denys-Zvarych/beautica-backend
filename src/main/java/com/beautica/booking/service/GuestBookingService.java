@@ -399,7 +399,7 @@ public class GuestBookingService {
             slotCalculationService.evictMasterAvailabilityCaches(master.getId());
             // A flipped verdict can add/remove a service from the salon catalogue (perf/security #2).
             if (salonId != null) {
-                salonCatalogCacheEvictor.evict(salonId);
+                salonCatalogCacheEvictor.evictCatalogOnly(salonId);
             }
             bookingSmsDispatcher.dispatch(
                     BookingSmsDispatcher.Kind.GUEST_CONFIRMATION, guestPhone, smsText);
@@ -424,7 +424,7 @@ public class GuestBookingService {
             // load-bearing and must not be swapped back.
             slotCalculationService.evictMasterAvailabilityCaches(master.getId());
             if (salonId != null) {
-                salonCatalogCacheEvictor.evict(salonId);
+                salonCatalogCacheEvictor.evictCatalogOnly(salonId);
             }
             bookingSmsDispatcher.dispatch(
                     BookingSmsDispatcher.Kind.GUEST_CONFIRMATION, guestPhone, smsText);

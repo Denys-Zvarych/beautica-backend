@@ -959,7 +959,7 @@ class BookingServiceTest {
         bookingService.declineBookingForBatch(actorId, bookingId, req);
 
         verifyNoInteractions(slotCalculationService);
-        verify(salonCatalogCacheEvictor, never()).evict(any());
+        verify(salonCatalogCacheEvictor, never()).evictCatalogOnly(any());
     }
 
     @Test
@@ -1078,7 +1078,7 @@ class BookingServiceTest {
         // The master WAS in the candidate scan (findConfirmedFutureBySalonId), even though its
         // one and only candidate booking never actually transitioned — eviction still runs for it.
         verify(slotCalculationService).evictMasterAvailabilityCaches(masterId);
-        verify(salonCatalogCacheEvictor).evict(salonId);
+        verify(salonCatalogCacheEvictor).evictCatalogOnly(salonId);
     }
 
     @Test

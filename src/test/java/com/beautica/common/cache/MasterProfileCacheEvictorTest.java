@@ -35,6 +35,7 @@ class MasterProfileCacheEvictorTest {
     private Cache slugInfo;
     private Cache searchBrowse;
     private Cache searchQuery;
+    private SalonBookingInfoCacheEvictor salonPages;
     private MasterProfileCacheEvictor evictor;
 
     @BeforeEach
@@ -46,7 +47,8 @@ class MasterProfileCacheEvictorTest {
         slugInfo = stub(MasterProfileCacheEvictor.BOOKING_SLUG_INFO_CACHE);
         searchBrowse = stub(SearchCacheNames.MASTERS_BROWSE);
         searchQuery = stub(SearchCacheNames.MASTERS_QUERY);
-        evictor = new MasterProfileCacheEvictor(cacheManager);
+        salonPages = mock(SalonBookingInfoCacheEvictor.class);
+        evictor = new MasterProfileCacheEvictor(cacheManager, salonPages);
     }
 
     @AfterEach
@@ -112,6 +114,19 @@ class MasterProfileCacheEvictorTest {
         TransactionSynchronizationManager.getSynchronizations().forEach(TransactionSynchronization::afterCommit);
         verify(detail).evict(masterId);
         verify(slugInfo).evict(slug);
+        verify(salonPages).evictByMasterSlug(slug);
+    }
+
+    @Test
+    @DisplayName("phase 377: the master's salon booking pages are evicted by its slug, only after commit")
+    void should_evictSalonBookingPagesByMasterSlug_when_afterCommitRuns() {
+        TransactionSynchronizationManager.initSynchronization();
+
+        evictor.evictAfterCommit(userId, masterId, slug, Role.SALON_MASTER);
+
+        verify(salonPages, never()).evictByMasterSlug(any());
+        TransactionSynchronizationManager.getSynchronizations().forEach(TransactionSynchronization::afterCommit);
+        verify(salonPages).evictByMasterSlug(slug);
     }
 
     @Test

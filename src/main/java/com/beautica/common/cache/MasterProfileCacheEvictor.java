@@ -28,6 +28,9 @@ import java.util.UUID;
  *       master and per-key eviction is impossible. Same rule {@code UserService} applies to a
  *       master's search-visible profile fields. Writers here are rare, user-initiated profile
  *       edits, not booking traffic, so the clear cannot become a hot-path herd.</li>
+ *   <li>{@code salon-booking-slug-info} (phase 377) — every public salon booking page that lists this
+ *       master (matched by its {@code bookingSlug}; {@link SalonBookingInfoCacheEvictor}), since that page
+ *       renders the master's avatar and a replaced avatar's blob is purged.</li>
  * </ul>
  *
  * <p><b>Ordering.</b> {@code afterCommit}, never inline (Anti-Bug §F-2): an inline evict lets a
@@ -43,9 +46,12 @@ public class MasterProfileCacheEvictor {
     public static final String BOOKING_SLUG_INFO_CACHE = "booking-slug-info";
 
     private final CacheManager cacheManager;
+    private final SalonBookingInfoCacheEvictor salonBookingInfoCacheEvictor;
 
-    public MasterProfileCacheEvictor(CacheManager cacheManager) {
+    public MasterProfileCacheEvictor(
+            CacheManager cacheManager, SalonBookingInfoCacheEvictor salonBookingInfoCacheEvictor) {
         this.cacheManager = cacheManager;
+        this.salonBookingInfoCacheEvictor = salonBookingInfoCacheEvictor;
     }
 
     /**
@@ -81,6 +87,7 @@ public class MasterProfileCacheEvictor {
         evictKey(MASTER_BY_USER_CACHE, userId);
         evictKey(MASTER_DETAIL_CACHE, masterId);
         evictKey(BOOKING_SLUG_INFO_CACHE, bookingSlug);
+        salonBookingInfoCacheEvictor.evictByMasterSlug(bookingSlug);
         if (clearSearch) {
             clearSearchCaches();
         }

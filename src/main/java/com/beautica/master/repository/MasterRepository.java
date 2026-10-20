@@ -176,6 +176,44 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
             @Param("masterIds") Collection<UUID> masterIds,
             @Param(MasterBookabilitySql.TODAY_PARAM) LocalDate today);
 
+    /**
+     * Phase 377 — {@code salonId}'s bookable masters for the public salon booking page
+     * ({@code GET /book/s/{slug}/info}) in ONE statement: the same structural predicate as
+     * {@link #findBookableIdsBySalonId} ({@link MasterBookabilitySql#BOOKABLE_MASTER_M} on an active
+     * master), joined to the live {@code users} row for the display columns — never one query per master.
+     * An active master always has a user (a detached row is {@code is_active = false}). Ordered like the
+     * public roster ({@code avg_rating DESC}, id tiebreak); capped by {@code limit} (one salon's headcount).
+     * Slug-less (legacy, pre-V86) masters are EXCLUDED ({@code booking_slug IS NOT NULL}, phase 377 audit):
+     * the anonymous read path never writes, so such a master is omitted from the page until its slug is
+     * issued via {@code GET /booking-links/mine} (phase 375); every master created since 13.1 has one.
+     */
+    @Query(value = "SELECT m.id AS id, m.booking_slug AS bookingSlug, u.first_name AS firstName, "
+            + "u.last_name AS lastName, u.avatar_url AS avatarUrl, u.professional_title AS professionalTitle "
+            + "FROM masters m JOIN users u ON u.id = m.user_id "
+            + "WHERE m.salon_id = :salonId AND m.is_active = true AND m.booking_slug IS NOT NULL AND "
+            + MasterBookabilitySql.BOOKABLE_MASTER_M
+            + " ORDER BY m.avg_rating DESC NULLS LAST, m.id LIMIT :limit",
+            nativeQuery = true)
+    List<SalonBookingPageMasterRow> findBookingPageMastersBySalonId(
+            @Param("salonId") UUID salonId,
+            @Param(MasterBookabilitySql.TODAY_PARAM) LocalDate today,
+            @Param("limit") int limit);
+
+    /** Row of {@link #findBookingPageMastersBySalonId}. */
+    interface SalonBookingPageMasterRow {
+        UUID getId();
+
+        String getBookingSlug();
+
+        String getFirstName();
+
+        String getLastName();
+
+        String getAvatarUrl();
+
+        String getProfessionalTitle();
+    }
+
     /** Row of {@link #findSearchBookability}. */
     interface SearchBookabilityRow {
         UUID getMasterId();

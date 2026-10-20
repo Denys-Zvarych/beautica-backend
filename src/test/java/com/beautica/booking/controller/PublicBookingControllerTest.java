@@ -7,10 +7,13 @@ import com.beautica.booking.dto.BookingSlugInfoResponse;
 import com.beautica.booking.dto.CancelTokenInfoResponse;
 import com.beautica.booking.dto.GuestBookingRequest;
 import com.beautica.booking.dto.GuestBookingResponse;
+import com.beautica.booking.dto.SalonBookingSlugInfoResponse;
+import com.beautica.booking.dto.SalonBookingSlugMasterItem;
 import com.beautica.booking.dto.ServiceSummaryDto;
 import com.beautica.booking.service.BookingCancellationService;
 import com.beautica.booking.service.BookingSlugService;
 import com.beautica.booking.service.GuestBookingService;
+import com.beautica.booking.service.SalonBookingSlugService;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.NotFoundException;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -101,6 +104,9 @@ class PublicBookingControllerTest {
 
     @MockBean
     private JwtTokenProvider jwtTokenProvider;
+
+    @MockBean
+    private SalonBookingSlugService salonBookingSlugService;
 
     @Test
     @DisplayName("GET /book/{slug}/info — 200 with master + services and NO Authorization header")
@@ -352,5 +358,79 @@ class PublicBookingControllerTest {
                 .andExpect(status().isBadRequest());
 
         verifyNoInteractions(bookingCancellationService);
+    }
+
+    // ── Phase 377: public salon booking page ──────────────────────────────────
+
+    private static SalonBookingSlugInfoResponse salonPage(UUID salonId) {
+        return new SalonBookingSlugInfoResponse(
+                salonId, "Студія Краса", "Вінниця", "https://cdn.example/logo.jpg", null,
+                new BigDecimal("4.80"), 12, true,
+                List.of(new SalonBookingSlugMasterItem("anna-bila-aa11", "Anna Bila", null, "Стиліст")));
+    }
+
+    @Test
+    @DisplayName("GET /book/s/{slug}/info — 200 with salon + bookable masters and NO Authorization header")
+    void should_return200WithSalonAndMasters_when_salonSlugExists() throws Exception {
+        UUID salonId = UUID.randomUUID();
+        when(salonBookingSlugService.findBySlug("studiia-krasa-ab12")).thenReturn(salonPage(salonId));
+
+        mockMvc.perform(get("/api/v1/book/s/studiia-krasa-ab12/info").accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.salonId").value(salonId.toString()))
+                .andExpect(jsonPath("$.name").value("Студія Краса"))
+                .andExpect(jsonPath("$.city").value("Вінниця"))
+                .andExpect(jsonPath("$.avgRating").value(4.80))
+                .andExpect(jsonPath("$.reviewCount").value(12))
+                .andExpect(jsonPath("$.bookable").value(true))
+                .andExpect(jsonPath("$.masters.length()").value(1))
+                .andExpect(jsonPath("$.masters[0].masterSlug").value("anna-bila-aa11"))
+                .andExpect(jsonPath("$.masters[0].professionalTitle").value("Стиліст"))
+                .andExpect(jsonPath("$.ownerId").doesNotExist())
+                .andExpect(jsonPath("$.phone").doesNotExist())
+                .andExpect(jsonPath("$.masters[0].masterId").doesNotExist())
+                .andExpect(jsonPath("$.masters[0].userId").doesNotExist());
+        verifyNoInteractions(bookingSlugService);
+    }
+
+    @Test
+    @DisplayName("GET /book/s/{slug}/info — 404 when the salon slug is unknown / inactive")
+    void should_return404_when_salonSlugUnknown() throws Exception {
+        when(salonBookingSlugService.findBySlug("no-such-salon"))
+                .thenThrow(new NotFoundException("Booking page not found"));
+
+        mockMvc.perform(get("/api/v1/book/s/no-such-salon/info").accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isNotFound());
+    }
+
+    @Test
+    @DisplayName("GET /book/s/{slug}/info — 400 when the slug violates the charset pattern (no lookup)")
+    void should_return400_when_salonSlugMalformed() throws Exception {
+        mockMvc.perform(get("/api/v1/book/s/Bad_Slug!/info").accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest());
+
+        verifyNoInteractions(salonBookingSlugService);
+    }
+
+    @Test
+    @DisplayName("GET /book/s/info — routes to the MASTER handler with slug 's' (1 char) → 400, salon handler untouched")
+    void should_notRouteToSalonHandler_when_pathIsBookSInfo() throws Exception {
+        mockMvc.perform(get("/api/v1/book/s/info").accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest());
+
+        verifyNoInteractions(salonBookingSlugService);
+        verifyNoInteractions(bookingSlugService);
+    }
+
+    @Test
+    @DisplayName("GET /book/{slug}/info for a master slug never reaches the salon handler")
+    void should_routeMasterSlugToMasterHandler_when_notUnderS() throws Exception {
+        when(bookingSlugService.findBySlug("ivan-petrenko-ab12"))
+                .thenReturn(new BookingSlugInfoResponse("Ivan Petrenko", null, null, List.of()));
+
+        mockMvc.perform(get("/api/v1/book/ivan-petrenko-ab12/info").accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk());
+
+        verifyNoInteractions(salonBookingSlugService);
     }
 }

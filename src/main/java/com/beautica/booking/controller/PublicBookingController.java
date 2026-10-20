@@ -5,9 +5,11 @@ import com.beautica.booking.dto.BookingSlugInfoResponse;
 import com.beautica.booking.dto.CancelTokenInfoResponse;
 import com.beautica.booking.dto.GuestBookingRequest;
 import com.beautica.booking.dto.GuestBookingResponse;
+import com.beautica.booking.dto.SalonBookingSlugInfoResponse;
 import com.beautica.booking.service.BookingCancellationService;
 import com.beautica.booking.service.BookingSlugService;
 import com.beautica.booking.service.GuestBookingService;
+import com.beautica.booking.service.SalonBookingSlugService;
 import com.beautica.booking.service.SlotCalculationService;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotEmpty;
@@ -54,6 +56,7 @@ public class PublicBookingController {
     private final BookingSlugService bookingSlugService;
     private final GuestBookingService guestBookingService;
     private final BookingCancellationService bookingCancellationService;
+    private final SalonBookingSlugService salonBookingSlugService;
 
     /**
      * Public booking-page info for {@code slug}. 404 when the slug is unknown.
@@ -68,6 +71,25 @@ public class PublicBookingController {
             @Pattern(regexp = "^[a-z0-9][a-z0-9\\-]*[a-z0-9]$")
             String slug) {
         return ResponseEntity.ok(bookingSlugService.findBySlug(slug));
+    }
+
+    /**
+     * Public SALON booking-page info for {@code slug} (phase 377, {@code beautica.app/book/s/{slug}}):
+     * salon data plus its bookable masters, each with the master slug the {@code /{slug}/*} routes take.
+     * 404 when the slug is unknown or the salon inactive; 200 with {@code bookable=false} when no master
+     * is bookable yet. Same slug validation as {@link #info}.
+     *
+     * <p>The literal {@code s} segment cannot shadow a master slug: master slugs are at least 2 chars
+     * (validated above, and generated as {@code base-xxxx}), and Spring ranks this literal-prefixed
+     * pattern above {@code /{slug}/info}, so {@code /book/s/info} still reaches {@link #info} and is a 400.
+     */
+    @GetMapping("/s/{slug}/info")
+    public ResponseEntity<SalonBookingSlugInfoResponse> salonInfo(
+            @PathVariable
+            @Size(min = 2, max = 60)
+            @Pattern(regexp = "^[a-z0-9][a-z0-9\\-]*[a-z0-9]$")
+            String slug) {
+        return ResponseEntity.ok(salonBookingSlugService.findBySlug(slug));
     }
 
     /**

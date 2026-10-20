@@ -4116,7 +4116,7 @@ public class BookingService {
             // A flipped bookability verdict can add/remove a service from the salon catalogue
             // (perf/security #2). Null salon (independent master) owns no catalogue entry.
             if (salonId != null) {
-                salonCatalogCacheEvictor.evict(salonId);
+                salonCatalogCacheEvictor.evictCatalogOnly(salonId);
             }
         };
         if (TransactionSynchronizationManager.isSynchronizationActive()) {

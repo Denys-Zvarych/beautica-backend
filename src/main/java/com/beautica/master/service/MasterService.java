@@ -869,6 +869,11 @@ public class MasterService {
                     if (byUser != null) {
                         byUser.evict(rotatedMasterUserId);
                     }
+                    // Phase 377 — the master leaves the source salon's bookable list (its services
+                    // are owned by the source salon), so both salons' bookability-derived caches
+                    // (salon-service-catalog + the public salon booking page) are evicted.
+                    salonCatalogCacheEvictor.evict(currentSalonId);
+                    salonCatalogCacheEvictor.evict(destinationSalonId);
                 }
             });
         }

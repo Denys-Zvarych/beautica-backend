@@ -681,10 +681,33 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
     boolean existsByBookingSlug(String bookingSlug);
 
     /**
-     * Resolves a public salon slug to its ACTIVE salon (phase 377 public page). An inactive salon's
-     * slug resolves to nothing, so its page 404s (D8).
+     * Resolves a public salon slug to its ACTIVE salon's public-page columns (phase 377,
+     * {@code GET /book/s/{slug}/info}) in ONE statement — a projection, never the {@code Salon} entity
+     * (376 audit: the page needs seven columns, and the entity drags owner proxy + every column). An
+     * inactive salon's slug resolves to nothing, so its page 404s (D2). Backed by the unique partial
+     * index {@code idx_salons_booking_slug} (V200).
      */
-    Optional<Salon> findByBookingSlugAndIsActiveTrue(String bookingSlug);
+    @Query("SELECT s.id AS id, s.name AS name, s.city AS city, s.avatarUrl AS avatarUrl, "
+            + "s.coverImageUrl AS coverImageUrl, s.avgRating AS avgRating, s.reviewCount AS reviewCount "
+            + "FROM Salon s WHERE s.bookingSlug = :slug AND s.isActive = true")
+    Optional<SalonBookingPageRow> findBookingPageRowBySlug(@Param("slug") String slug);
+
+    /** Row of {@link #findBookingPageRowBySlug} — the public salon booking page's salon columns. */
+    interface SalonBookingPageRow {
+        UUID getId();
+
+        String getName();
+
+        String getCity();
+
+        String getAvatarUrl();
+
+        String getCoverImageUrl();
+
+        java.math.BigDecimal getAvgRating();
+
+        int getReviewCount();
+    }
 
     /**
      * Phase 376 audit — serialises every salon-slug WRITER on the candidate value: a transaction-scoped

@@ -566,7 +566,7 @@ class MediaServiceTest {
         }).when(throwingPurger).purgeAfterCommit(anyCollection(), anyString());
         MediaService withThrowingPurge = new MediaService(r2, mediaRepo, userRepo, salonRepo, masterRepo, fixedClock,
                 txRead, txWrite, cacheManager, serviceRepo, serviceCatalogService, authz, servicePhotoBlobPurger,
-                throwingPurger, new UserProfileCacheEvictor(cacheManager), new MasterProfileCacheEvictor(cacheManager));
+                throwingPurger, new UserProfileCacheEvictor(cacheManager), new MasterProfileCacheEvictor(cacheManager, mock(com.beautica.common.cache.SalonBookingInfoCacheEvictor.class)));
 
         assertThatThrownBy(() -> withThrowingPurge.deleteAvatar(userId))
                 .isInstanceOf(IllegalStateException.class);
@@ -630,7 +630,7 @@ class MediaServiceTest {
                 txRead, txWrite, cacheManager, serviceRepo, serviceCatalogService, authz, servicePhotoBlobPurger,
                 new AfterCommitBlobPurger(r2, new SyncTaskExecutor(),
                         new io.micrometer.core.instrument.simple.SimpleMeterRegistry()),
-                new UserProfileCacheEvictor(cacheManager), new MasterProfileCacheEvictor(cacheManager));
+                new UserProfileCacheEvictor(cacheManager), new MasterProfileCacheEvictor(cacheManager, mock(com.beautica.common.cache.SalonBookingInfoCacheEvictor.class)));
 
         withRealEvictors.uploadAvatar(userId, jpegFile());
 

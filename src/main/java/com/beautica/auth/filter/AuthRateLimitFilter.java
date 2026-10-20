@@ -186,6 +186,10 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // because a legitimate guest issues MANY availability GETs per single booking POST — sharing one
     // 5/15min bucket would make browsing dates impossible. See GUEST_AVAILABILITY_CAPACITY.
     private static final String GUEST_AVAILABILITY_PATH_SUFFIX = "/availability";
+    // Guest page-info READS (phase 377 audit): GET /api/v1/book/{slug}/info (master page) and
+    // GET /api/v1/book/s/{slug}/info (salon page) — the same prefix + a distinct suffix. Their own
+    // bucket (guestInfoBuckets), see GUEST_INFO_CAPACITY.
+    private static final String GUEST_INFO_PATH_SUFFIX = "/info";
     // Guest cancel-by-link POST carries the {token} variable as a single path segment, so it
     // is matched by prefix only: /api/v1/book/cancel/{token}. The prefix /api/v1/book/cancel/
     // does not collide with the guest-booking POST (which ends in /booking) nor with the OTP
@@ -331,6 +335,17 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // by several slice/regression tests — stays unchanged, mirroring guestBookingBuckets/cancelPostBuckets.
     private static final long GUEST_AVAILABILITY_CAPACITY = 60;
     private static final Duration GUEST_AVAILABILITY_WINDOW = Duration.ofMinutes(1);
+    // Per-IP cap for the two public booking-page info reads, GET /api/v1/book/{slug}/info and
+    // GET /api/v1/book/s/{slug}/info (60 / 60 s) — phase 377 audit (MEDIUM): both are permitAll() and were
+    // unthrottled, so a caller sweeping distinct slugs forced a cache miss (salon page: two statements
+    // incl. the bookable-master batch) per request. Same size as catalogueBrowseCapacity, but a DEDICATED
+    // bucket: sharing catalogueBrowseBuckets would let guest page loads drain the anonymous catalogue /
+    // public-profile budget (and vice versa) — a behaviour change for those existing routes; sharing
+    // guestAvailabilityBuckets would do the same to the date-browsing budget. A page open costs one token,
+    // so 60/min is far above human use even behind carrier-grade NAT. Built internally like
+    // guestAvailabilityBuckets so the public constructor stays unchanged.
+    private static final long GUEST_INFO_CAPACITY = 60;
+    private static final Duration GUEST_INFO_WINDOW = Duration.ofMinutes(1);
     // Per-IP cap for GET /api/v1/search/** (240 / 60 s). These permitAll() discovery reads
     // expose authed-only street addresses for independent masters, so the throttle bounds the
     // RATE at which a single source can page through every district/city and the DB work each
@@ -623,6 +638,9 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // internally rather than injected so the public 19-arg constructor stays stable for the
     // slice/regression tests that construct this filter directly.
     private final LoadingCache<String, Bucket> guestAvailabilityBuckets;
+    // Per-IP bucket for GET /api/v1/book/{slug}/info + GET /api/v1/book/s/{slug}/info (phase 377 audit),
+    // see GUEST_INFO_CAPACITY. Built internally, like guestAvailabilityBuckets.
+    private final LoadingCache<String, Bucket> guestInfoBuckets;
     // Per-IP bucket for GET /api/v1/search/** — the SEC-fix scraping guard for the permitAll()
     // discovery reads (which now surface authed-only independent-master street addresses).
     // Built internally rather than injected so the public 16-arg constructor stays stable for
@@ -777,6 +795,12 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                 .build(key -> Bucket.builder()
                         .addLimit(guestAvailabilityBandwidth())
                         .build());
+        this.guestInfoBuckets = Caffeine.newBuilder()
+                .maximumSize(100_000)
+                .expireAfterAccess(GUEST_INFO_WINDOW.plusMinutes(5))
+                .build(key -> Bucket.builder()
+                        .addLimit(guestInfoBandwidth())
+                        .build());
         this.searchBuckets = Caffeine.newBuilder()
                 .maximumSize(100_000)
                 .expireAfterAccess(SEARCH_WINDOW.plusMinutes(5))
@@ -846,6 +870,13 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         return BandwidthBuilder.builder()
                 .capacity(GUEST_AVAILABILITY_CAPACITY)
                 .refillIntervally(GUEST_AVAILABILITY_CAPACITY, GUEST_AVAILABILITY_WINDOW)
+                .build();
+    }
+
+    private static Bandwidth guestInfoBandwidth() {
+        return BandwidthBuilder.builder()
+                .capacity(GUEST_INFO_CAPACITY)
+                .refillIntervally(GUEST_INFO_CAPACITY, GUEST_INFO_WINDOW)
                 .build();
     }
 
@@ -1078,6 +1109,17 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                 && path.startsWith(GUEST_BOOKING_PATH_PREFIX)
                 && path.endsWith(GUEST_AVAILABILITY_PATH_SUFFIX)) {
             applyRateLimit(request, response, filterChain, guestAvailabilityBuckets, RETRY_AFTER_SECONDS);
+            return;
+        }
+
+        // Guest page-info read rate-limit (phase 377 audit): GET /api/v1/book/{slug}/info (master page)
+        // and GET /api/v1/book/s/{slug}/info (salon page) — prefix + suffix, exactly like the
+        // availability branch above; the /info suffix matches no other route under /book. Cap: 60 / 60 s
+        // per IP on a dedicated bucket (see GUEST_INFO_CAPACITY for why not catalogueBrowseBuckets).
+        if (isGetOrHead(method)
+                && path.startsWith(GUEST_BOOKING_PATH_PREFIX)
+                && path.endsWith(GUEST_INFO_PATH_SUFFIX)) {
+            applyRateLimit(request, response, filterChain, guestInfoBuckets, RETRY_AFTER_SECONDS);
             return;
         }
 

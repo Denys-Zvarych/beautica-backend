@@ -269,7 +269,7 @@ class StaffBookingServiceTest {
             create(command(guest(RAW_PHONE)));
 
             verify(slotCalculationService).evictMasterAvailabilityCaches(masterId);
-            verify(salonCatalogCacheEvictor).evict(salonId);
+            verify(salonCatalogCacheEvictor).evictCatalogOnly(salonId);
         }
     }
 
@@ -1156,7 +1156,7 @@ class StaffBookingServiceTest {
             create(threeServiceCommand());
 
             verify(slotCalculationService, org.mockito.Mockito.times(1)).evictMasterAvailabilityCaches(masterId);
-            verify(salonCatalogCacheEvictor, org.mockito.Mockito.times(1)).evict(salonId);
+            verify(salonCatalogCacheEvictor, org.mockito.Mockito.times(1)).evictCatalogOnly(salonId);
         }
 
         /**

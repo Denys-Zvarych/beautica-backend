@@ -201,6 +201,9 @@ class SalonServiceTest {
     @Mock
     private com.beautica.booking.service.BookingSlugService bookingSlugService;
 
+    // Phase 377: salon-detail evictions also evict the public salon booking page after commit.
+    @Mock private com.beautica.common.cache.SalonBookingInfoCacheEvictor salonBookingInfoCacheEvictor;
+
     @InjectMocks
     private SalonService salonService;
 

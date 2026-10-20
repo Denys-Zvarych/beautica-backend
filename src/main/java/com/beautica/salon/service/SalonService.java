@@ -190,6 +190,9 @@ public class SalonService {
     // Phase 376 — the shared name-based slug generator (masters + salons); a new salon's permanent
     // public booking slug is generated here and written with the INSERT.
     private final com.beautica.booking.service.BookingSlugService bookingSlugService;
+    // Phase 377 — the public salon booking page (GET /book/s/{slug}/info) renders the salon's name, city,
+    // logo, cover and active state; every write that evicts salon-detail evicts it too, after commit.
+    private final com.beautica.common.cache.SalonBookingInfoCacheEvictor salonBookingInfoCacheEvictor;
 
     /**
      * Hard ceiling on rows returned by {@link #listSalonInvites}.
@@ -626,6 +629,9 @@ public class SalonService {
                 if (cache != null) {
                     cache.evict(salonId);
                 }
+                // Phase 377 — same writers (update, logo/cover, deactivation) change the public salon
+                // booking page; already inside afterCommit, so the direct evict is correctly ordered.
+                salonBookingInfoCacheEvictor.evictSalon(salonId);
             }
         });
     }

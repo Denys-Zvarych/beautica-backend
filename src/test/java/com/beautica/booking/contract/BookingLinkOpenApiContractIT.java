@@ -83,4 +83,28 @@ class BookingLinkOpenApiContractIT extends AbstractIntegrationTest {
                 .path("properties").path("url").path("description").asText())
                 .contains("/book/s/{slug}");
     }
+
+    @Test
+    @DisplayName("phase 377: /api-docs exposes GET /book/s/{slug}/info with the salon page schema and no private fields")
+    void should_exposeSalonBookingPage_when_specRendered() throws Exception {
+        JsonNode spec = spec();
+        JsonNode schemas = spec.path("components").path("schemas");
+
+        assertThat(spec.path("paths").path("/api/v1/book/s/{slug}/info").has("get")).isTrue();
+        JsonNode page = schemas.path("SalonBookingSlugInfoResponse");
+        List<String> pageFields = new ArrayList<>();
+        page.path("properties").fieldNames().forEachRemaining(pageFields::add);
+        assertThat(pageFields).containsExactlyInAnyOrder(
+                "salonId", "name", "city", "avatarUrl", "coverImageUrl", "avgRating", "reviewCount",
+                "bookable", "masters");
+        assertThat(texts(page.path("required")))
+                .containsExactlyInAnyOrder("salonId", "name", "reviewCount", "bookable", "masters");
+        assertThat(texts(page.path("properties").path("avgRating").path("type")))
+                .containsExactlyInAnyOrder("number", "null");
+        JsonNode master = schemas.path("SalonBookingSlugMasterItem");
+        List<String> masterFields = new ArrayList<>();
+        master.path("properties").fieldNames().forEachRemaining(masterFields::add);
+        assertThat(masterFields).containsExactlyInAnyOrder("masterSlug", "name", "avatarUrl", "professionalTitle");
+        assertThat(texts(master.path("required"))).containsExactlyInAnyOrder("masterSlug", "name");
+    }
 }

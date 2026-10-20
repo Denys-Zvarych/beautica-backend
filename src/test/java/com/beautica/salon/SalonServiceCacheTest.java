@@ -49,6 +49,7 @@ import static org.mockito.Mockito.when;
         // MasterCachePrefixEvictor is the REAL bean (needs only CacheConfig's CacheManager), so
         // SalonService's logo search-page eviction runs against the real caches under test.
         classes = {SalonService.class, CacheConfig.class, MasterCachePrefixEvictor.class,
+                com.beautica.common.cache.SalonBookingInfoCacheEvictor.class,
                 SalonServiceCacheTest.TxConfig.class},
         webEnvironment = SpringBootTest.WebEnvironment.NONE
 )

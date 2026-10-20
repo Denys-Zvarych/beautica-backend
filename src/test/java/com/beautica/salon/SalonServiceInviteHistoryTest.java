@@ -193,7 +193,9 @@ class SalonServiceInviteHistoryTest {
                 bookingService, serviceRepository, favoriteRepository, mediaRepository,
                 mediaService, servicePhotoBlobPurger, transactionManager, staffAccountDisposalService,
                 afterCommitBlobPurger, new com.beautica.common.cache.MasterCachePrefixEvictor(cacheManager),
-                bookingSlugService);
+                bookingSlugService,
+                new com.beautica.common.cache.SalonBookingInfoCacheEvictor(
+                        new com.beautica.common.cache.MasterCachePrefixEvictor(cacheManager)));
     }
 
     // ── the derivation ladder ─────────────────────────────────────────────────

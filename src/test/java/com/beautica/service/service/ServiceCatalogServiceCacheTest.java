@@ -58,6 +58,7 @@ import static org.mockito.Mockito.when;
         classes = {ServiceCatalogService.class, ServiceTypeLookup.class, ServiceTypeSearchService.class,
                 CatalogCategoryLookup.class, PlatformCategoryOrderLookup.class, SalonCatalogCacheEvictor.class,
                 CacheConfig.class, com.beautica.common.cache.MasterCachePrefixEvictor.class,
+                com.beautica.common.cache.SalonBookingInfoCacheEvictor.class,
                 com.beautica.config.ClockConfig.class},
         webEnvironment = SpringBootTest.WebEnvironment.NONE
 )
