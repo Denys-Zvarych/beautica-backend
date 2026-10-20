@@ -62,6 +62,11 @@ public final class HeldDbLock implements AutoCloseable {
         return new HeldDbLock(dataSource, "SELECT id FROM salons WHERE id = ? FOR NO KEY UPDATE", salonId);
     }
 
+    /** Holds a {@code FOR NO KEY UPDATE} row lock on the master (blocks its conditional slug {@code UPDATE}). */
+    public static HeldDbLock masterRow(DataSource dataSource, UUID masterId) throws Exception {
+        return new HeldDbLock(dataSource, "SELECT id FROM masters WHERE id = ? FOR NO KEY UPDATE", masterId);
+    }
+
     @Override
     public void close() throws Exception {
         release.countDown();

@@ -731,6 +731,13 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
      * <p>{@code MANDATORY}: an advisory xact lock taken outside a transaction is released at once, so a
      * caller without one would get no serialisation at all — fail loudly instead.
      *
+     * <p><b>The 3s {@code lock_timeout} outlives this statement</b> (376 security audit, INFO — accepted):
+     * {@code set_config(..., true)} is transaction-local, so it stays in force for the REST of the caller's
+     * transaction. In {@code SalonService#createSalon} (via {@code BookingSlugService#generateSalonSlug})
+     * every later lock wait in that transaction is bounded to 3s too and fails fast with 409 instead of
+     * queueing. Accepted: the perf audit confirmed only already-held locks follow there, so no
+     * legitimate wait is cut short. Re-check this if a new lock is added after slug generation.
+     *
      * <p>Array parameters (not collections): Hibernate expands a collection inside {@code ARRAY[...]} to a
      * row constructor {@code (?,?)}, which Postgres cannot cast to an array.
      *
@@ -765,6 +772,10 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
      * <p><b>3s {@code lock_timeout}, fused</b> — the same {@code CROSS JOIN (SELECT set_config(...))
      * lock_cfg} join-source shape as {@link #findByIdForUpdate}; {@code 55P03} → 409. {@code MANDATORY}: a
      * row lock outside a transaction is released at once.
+     *
+     * <p>Like {@link #lockBookingSlugCandidates}, the transaction-local 3s {@code lock_timeout} stays in force
+     * for the rest of the caller's transaction ({@code BookingSlugService#issueMissingSalonSlugs}), bounding
+     * its later lock waits too — accepted (376 security audit, INFO): only already-held locks follow.
      */
     @Transactional(propagation = Propagation.MANDATORY)
     @QueryHints(@QueryHint(name = HibernateHints.HINT_NATIVE_SPACES, value = "salons"))

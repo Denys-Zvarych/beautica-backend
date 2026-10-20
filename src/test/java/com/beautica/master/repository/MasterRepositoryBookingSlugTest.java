@@ -10,6 +10,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.orm.jpa.TestEntityManager;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 
 import java.math.BigDecimal;
@@ -44,6 +45,9 @@ class MasterRepositoryBookingSlugTest extends AbstractDataJpaTest {
 
     @Autowired
     private TestEntityManager em;
+
+    @Autowired
+    private JdbcTemplate jdbcTemplate;
 
     @Test
     @DisplayName("resolves the master when the employing salon is ACTIVE")
@@ -129,6 +133,20 @@ class MasterRepositoryBookingSlugTest extends AbstractDataJpaTest {
         assertThat(masterRepository.findBookingSlugById(master.getId()))
                 .as("a link already handed out must never be silently replaced")
                 .contains("first-wins-ab12");
+    }
+
+    @Test
+    @DisplayName("assignBookingSlugIfAbsent fuses a transaction-local 3s lock_timeout into the UPDATE (perf L3)")
+    void should_setTransactionLocalLockTimeout_when_assignBookingSlugIfAbsentRuns() {
+        Master master = persistIndependentMaster(null);
+        jdbcTemplate.execute("SET LOCAL lock_timeout = '0'");
+
+        int written = masterRepository.assignBookingSlugIfAbsent(master.getId(), "fused-timeout-ab12");
+
+        assertThat(written).isEqualTo(1);
+        assertThat(jdbcTemplate.queryForObject("SELECT current_setting('lock_timeout')", String.class))
+                .as("the conditional UPDATE must bound its row-lock wait like the salon twin")
+                .isEqualTo("3s");
     }
 
     @Test

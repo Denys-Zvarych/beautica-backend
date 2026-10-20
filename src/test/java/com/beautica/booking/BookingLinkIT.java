@@ -880,6 +880,21 @@ class BookingLinkIT extends AbstractIntegrationTest {
     }
 
     @Test
+    @DisplayName("perf L3: another transaction holds the legacy master's row lock past the 3s lock_timeout → 409, not a hang; slug not issued")
+    void should_return409_when_masterRowLockHeldBeyondTimeout() throws Exception {
+        UUID masterId = BookableMasterSeeder.insertIndependentMaster(jdbcTemplate, "Zablokovana");
+        String token = masterToken(masterId, Role.INDEPENDENT_MASTER);
+
+        ResponseEntity<String> response;
+        try (HeldDbLock ignored = HeldDbLock.masterRow(dataSource, masterId)) {
+            response = rawMine(token);
+        }
+
+        assertThat(response.getStatusCode()).as("body=%s", response.getBody()).isEqualTo(HttpStatus.CONFLICT);
+        assertThat(slugOf(masterId)).isNull();
+    }
+
+    @Test
     @DisplayName("376 audit: another writer holds the drawn slug candidate's advisory lock past the 3s lock_timeout → 409, not a hang; slug not issued")
     void should_return409_when_slugCandidateLockHeldBeyondTimeout() throws Exception {
         UUID salonId = BookableMasterSeeder.insertSalon(jdbcTemplate, "Zainiatyi Kandydat");

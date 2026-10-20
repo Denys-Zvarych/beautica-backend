@@ -497,11 +497,25 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
      * salon). That entity's in-memory slug stays {@code null}, which is harmless — it is unchanged
      * from its snapshot, so dirty-checking never writes the column back.
      *
+     * <p><b>3s {@code lock_timeout}, fused</b> (perf audit L3) — the {@code FROM (SELECT set_config(...))}
+     * join-source shape of {@code AppointmentRepository#consumeCancelToken} (an {@code UPDATE} has no target
+     * list to carry it): Postgres evaluates the 1-row source, and so sets the transaction-local GUC, before
+     * the implicit row lock on the matching master row, so a concurrent holder bounds this wait to 3s like
+     * the salon twin {@code SalonRepository#lockSalonIdsWithoutBookingSlug}. A longer wait fails with
+     * {@code 55P03} → {@code CannotAcquireLockException} → 409 via
+     * {@code GlobalExceptionHandler#handlePessimisticLockingFailure}. The GUC stays in force for the rest of
+     * the caller's transaction ({@code BookingSlugService#getOrIssueSlugRaceSafe}), which only re-reads.
+     *
      * @return 1 when this call issued the slug, 0 when another transaction already had
      */
     @Modifying
-    @Query(value = "UPDATE masters SET booking_slug = :slug WHERE id = :masterId AND booking_slug IS NULL",
-            nativeQuery = true)
+    @Query(value = """
+            UPDATE masters
+               SET booking_slug = :slug
+              FROM (SELECT set_config('lock_timeout', '3s', true)) AS lock_cfg
+             WHERE masters.id = :masterId
+               AND masters.booking_slug IS NULL
+            """, nativeQuery = true)
     int assignBookingSlugIfAbsent(@Param("masterId") UUID masterId, @Param("slug") String slug);
 
     /**
