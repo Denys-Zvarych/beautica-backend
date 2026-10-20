@@ -1,6 +1,5 @@
--- contract-of: V86
--- Not a real contract: the CHECK + UNIQUE index target a column added NULL in this same file, so no
--- existing row or previous-app write can violate them; the header is the gate's only SQL escape hatch.
+-- non-destructive
+-- Reason: the CHECK + UNIQUE index target a column added NULL in this same file — no existing row or previous-app write can violate them.
 -- Phase 376 — public per-salon booking slug behind beautica.app/book/s/{slug}.
 --
 -- Mirrors V86 (masters.booking_slug) exactly. Additive only: a nullable column, a format CHECK
@@ -14,6 +13,13 @@
 --
 -- Uniqueness is per table (D2): a salon slug may equal a master slug — separate URL
 -- namespaces (/book/{slug} vs /book/s/{slug}).
+--
+-- Locking (as V199): Flyway runs this file in ONE transaction; the ALTERs take ACCESS EXCLUSIVE on
+-- salons until COMMIT. lock_timeout bounds the wait to ACQUIRE it (fail fast instead of queueing
+-- behind a long transaction); statement_timeout bounds the CHECK scan and the index build.
+SET LOCAL lock_timeout = '3s';
+SET LOCAL statement_timeout = '5min';
+
 ALTER TABLE salons ADD COLUMN booking_slug VARCHAR(60);
 
 -- Format CHECK (Anti-Bug §O-2): exactly the charset the generator emits, so a future code bug
