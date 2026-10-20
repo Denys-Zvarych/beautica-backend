@@ -1,3 +1,6 @@
+-- contract-of: V86
+-- Not a real contract: the CHECK + UNIQUE index target a column added NULL in this same file, so no
+-- existing row or previous-app write can violate them; the header is the gate's only SQL escape hatch.
 -- Phase 376 — public per-salon booking slug behind beautica.app/book/s/{slug}.
 --
 -- Mirrors V86 (masters.booking_slug) exactly. Additive only: a nullable column, a format CHECK
