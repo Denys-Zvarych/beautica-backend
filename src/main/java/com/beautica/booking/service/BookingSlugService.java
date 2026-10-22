@@ -396,7 +396,15 @@ public class BookingSlugService {
         return PageRequest.of(pageable.getPageNumber(), Math.min(pageable.getPageSize(), MAX_REVIEWS_PAGE_SIZE));
     }
 
-    /** {@code true} when the window starts at or after the persisted review count (so it holds nothing). */
+    /**
+     * {@code true} when the window starts at or after the persisted review count (so it holds nothing).
+     *
+     * <p><b>Depends on</b> {@code masters.review_count} / {@code salons.review_count} being up to date when the
+     * review POST returns: they are written by the SYNCHRONOUS {@code ReviewEventListener} (AFTER_COMMIT, calling
+     * {@code RatingRecalculationService} in REQUIRES_NEW on the same thread). A lagging counter would show a master's
+     * first review as an empty page. Pinned by {@code ReviewCounterSynchronyGuardTest} (no {@code @Async}, AFTER_COMMIT,
+     * REQUIRES_NEW) and {@code ReviewCounterVisibilityIT} (counters visible when the 201 arrives).
+     */
     static boolean isBeyondLastPage(Pageable pageable, int reviewCount) {
         return (long) pageable.getPageNumber() * pageable.getPageSize() >= reviewCount;
     }
