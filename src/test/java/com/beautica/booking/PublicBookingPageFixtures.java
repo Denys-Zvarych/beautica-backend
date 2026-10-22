@@ -104,6 +104,13 @@ final class PublicBookingPageFixtures {
         return new SalonPage(token, salonId, slug);
     }
 
+    /** A second salon of the SAME owner (needed to rotate a master between salons). */
+    SalonPage additionalSalon(SalonPage first, String name) throws Exception {
+        UUID salonId = fixtures.createSalon(first.ownerToken(), name);
+        String slug = jdbc.queryForObject("SELECT booking_slug FROM salons WHERE id = ?", String.class, salonId);
+        return new SalonPage(first.ownerToken(), salonId, slug);
+    }
+
     /** A salon master with a stored slug — the steady state for every master created since phase 13.1. */
     UUID salonMaster(UUID salonId, String firstName, String lastName) {
         UUID masterId = legacySalonMaster(salonId, firstName, lastName);

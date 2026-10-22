@@ -402,6 +402,26 @@ class PublicBookingInfoHttpContractIT extends AbstractIntegrationTest {
         assertThat(get(masterPath(master.slug()), null).getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
     }
 
+    @Test
+    @DisplayName("eviction: master rotated to another salon (PATCH /masters/{id}/salon) -> the cached page shows the new salon")
+    void should_showNewSalon_when_masterRotatedAfterPageCached() throws Exception {
+        PublicBookingPageFixtures.SalonPage from = pages.salon("Rotate From");
+        PublicBookingPageFixtures.SalonPage to = pages.additionalSalon(from, "Rotate To");
+        UUID masterId = pages.salonMaster(from.salonId(), "Марія", "Тестова");
+        String slug = pages.masterSlugOf(masterId);
+        ResponseEntity<String> before = get(masterPath(slug), null);
+        assertThat(json(before).path("salon").path("name").asText()).isEqualTo("Rotate From");
+
+        ResponseEntity<String> rotate = restTemplate.exchange("/api/v1/masters/" + masterId + "/salon",
+                HttpMethod.PATCH, new HttpEntity<>("{\"destinationSalonId\":\"" + to.salonId() + "\"}",
+                        bearerJson(from.ownerToken())), String.class);
+        assertThat(rotate.getStatusCode().is2xxSuccessful()).as(rotate.getBody()).isTrue();
+
+        ResponseEntity<String> fresh = assertChangedSince(masterPath(slug), before.getHeaders().getETag());
+        assertThat(json(fresh).path("salon").path("name").asText()).isEqualTo("Rotate To");
+        assertThat(json(fresh).path("salon").path("bookingSlug").asText()).isEqualTo(to.slug());
+    }
+
     // ── If-None-Match: * (RFC 9110 §13.1.2) ──────────────────────────────────────────────────
 
     @Test
@@ -410,14 +430,20 @@ class PublicBookingInfoHttpContractIT extends AbstractIntegrationTest {
         IndependentMaster master = pages.independentMaster(true);
         PublicBookingPageFixtures.SalonPage salon = pages.salon("Wildcard Salon");
 
+        String masterEtag = get(masterPath(master.slug()), null).getHeaders().getETag();
+        String salonEtag = get(salonPath(salon.slug()), null).getHeaders().getETag();
+
         ResponseEntity<String> masterReply = get(masterPath(master.slug()), "*");
         ResponseEntity<String> salonReply = get(salonPath(salon.slug()), " * ");
 
         assertThat(masterReply.getStatusCode()).isEqualTo(HttpStatus.NOT_MODIFIED);
         assertThat(masterReply.getBody()).isNullOrEmpty();
         assertThat(masterReply.getHeaders().getCacheControl()).isEqualTo(EXPECTED_CACHE_CONTROL);
+        assertThat(masterReply.getHeaders().getETag()).as("a 304 always carries the validator of the 200")
+                .isNotNull().isEqualTo(masterEtag);
         assertThat(salonReply.getStatusCode()).isEqualTo(HttpStatus.NOT_MODIFIED);
         assertThat(salonReply.getBody()).isNullOrEmpty();
+        assertThat(salonReply.getHeaders().getETag()).isNotNull().isEqualTo(salonEtag);
     }
 
     @Test

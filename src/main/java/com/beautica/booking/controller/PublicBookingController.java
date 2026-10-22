@@ -67,19 +67,6 @@ public class PublicBookingController {
     private static final CacheControl INFO_CACHE_CONTROL =
             CacheControl.maxAge(Duration.ZERO).sMaxAge(Duration.ofSeconds(30)).cachePublic();
 
-    /**
-     * RFC 9110 §13.1.2: {@code If-None-Match: *} is satisfied by ANY current representation, so for an
-     * existing page a GET must answer 304. Spring's ETag filter only compares concrete validators, so this is
-     * decided here, AFTER the lookup (an unknown or inactive slug has already thrown 404).
-     */
-    private static boolean matchesAnyRepresentation(String ifNoneMatch) {
-        return ifNoneMatch != null && "*".equals(ifNoneMatch.strip());
-    }
-
-    private static <T> ResponseEntity<T> notModified() {
-        return ResponseEntity.status(HttpStatus.NOT_MODIFIED).cacheControl(INFO_CACHE_CONTROL).build();
-    }
-
     private final BookingSlugService bookingSlugService;
     private final GuestBookingService guestBookingService;
     private final BookingCancellationService bookingCancellationService;
@@ -96,12 +83,8 @@ public class PublicBookingController {
             @PathVariable
             @Size(min = 2, max = 60)
             @Pattern(regexp = "^[a-z0-9][a-z0-9\\-]*[a-z0-9]$")
-            String slug,
-            @RequestHeader(value = HttpHeaders.IF_NONE_MATCH, required = false) String ifNoneMatch) {
-        BookingSlugInfoResponse info = bookingSlugService.findBySlug(slug);
-        return matchesAnyRepresentation(ifNoneMatch)
-                ? notModified()
-                : ResponseEntity.ok().cacheControl(INFO_CACHE_CONTROL).body(info);
+            String slug) {
+        return ResponseEntity.ok().cacheControl(INFO_CACHE_CONTROL).body(bookingSlugService.findBySlug(slug));
     }
 
     /**
@@ -119,12 +102,8 @@ public class PublicBookingController {
             @PathVariable
             @Size(min = 2, max = 60)
             @Pattern(regexp = "^[a-z0-9][a-z0-9\\-]*[a-z0-9]$")
-            String slug,
-            @RequestHeader(value = HttpHeaders.IF_NONE_MATCH, required = false) String ifNoneMatch) {
-        SalonBookingSlugInfoResponse info = salonBookingSlugService.findBySlug(slug);
-        return matchesAnyRepresentation(ifNoneMatch)
-                ? notModified()
-                : ResponseEntity.ok().cacheControl(INFO_CACHE_CONTROL).body(info);
+            String slug) {
+        return ResponseEntity.ok().cacheControl(INFO_CACHE_CONTROL).body(salonBookingSlugService.findBySlug(slug));
     }
 
     /**
