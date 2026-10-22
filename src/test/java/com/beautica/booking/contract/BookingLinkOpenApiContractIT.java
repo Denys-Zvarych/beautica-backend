@@ -130,11 +130,12 @@ class BookingLinkOpenApiContractIT extends AbstractIntegrationTest {
         assertThat(fields).containsExactlyInAnyOrder(
                 "masterName", "avatarUrl", "bio", "services", "masterId", "masterType", "professionalTitle", "city",
                 "region", "salon", "avgRating", "reviewCount", "categories", "portfolio", "latestReviews",
-                "bookable", "updatedAt");
+                "bookable", "updatedAt", "ratingDistribution", "street", "buildingNo", "locationNote");
         assertThat(texts(page.path("required"))).containsExactlyInAnyOrder(
                 "masterName", "services", "masterId", "masterType", "reviewCount", "categories", "portfolio",
-                "latestReviews", "bookable", "updatedAt");
-        for (String nullable : List.of("avatarUrl", "bio", "professionalTitle", "city", "region", "avgRating")) {
+                "latestReviews", "bookable", "updatedAt", "ratingDistribution");
+        for (String nullable : List.of("avatarUrl", "bio", "professionalTitle", "city", "region", "avgRating",
+                "street", "buildingNo", "locationNote")) {
             assertThat(texts(page.path("properties").path(nullable).path("type")))
                     .as(nullable).contains("null");
         }
@@ -142,6 +143,13 @@ class BookingLinkOpenApiContractIT extends AbstractIntegrationTest {
         assertThat(texts(salonRef.path("required"))).containsExactlyInAnyOrder("name");
         assertThat(texts(salonRef.path("properties").path("bookingSlug").path("type")))
                 .containsExactlyInAnyOrder("string", "null");
-        assertThat(texts(schemas.path("CategoryRef").path("required"))).containsExactlyInAnyOrder("id", "name");
+        assertThat(texts(schemas.path("CategoryRef").path("required"))).containsExactlyInAnyOrder("id", "name", "key");
+        assertThat(schemas.path("ServiceSummaryDto").path("properties").has("category")).isTrue();
+        assertThat(spec().path("paths").path("/api/v1/book/{slug}/reviews").has("get"))
+                .as("phase 383 reviews route in the spec").isTrue();
+        JsonNode reviewsParams = spec().path("paths").path("/api/v1/book/{slug}/reviews").path("get").path("parameters");
+        List<String> paramNames = new ArrayList<>();
+        reviewsParams.forEach(p -> paramNames.add(p.path("name").asText()));
+        assertThat(paramNames).contains("slug", "sort");
     }
 }

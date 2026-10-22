@@ -60,9 +60,11 @@ final class PublicBookingPageFixtures {
         UUID userId = UUID.randomUUID();
         jdbc.update(
                 "INSERT INTO users (id, email, password_hash, role, first_name, last_name, phone_number, bio, "
-                        + "instagram, professional_title, city, region, avatar_url, is_active, email_verified) "
+                        + "instagram, professional_title, city, region, avatar_url, street, building_no, location_note, "
+                        + "is_active, email_verified) "
                         + "VALUES (?, ?, ?, 'INDEPENDENT_MASTER', 'Олена', 'Коваль', ?, 'Манікюр 8 років', ?, "
-                        + "'Майстер манікюру', 'Львів', 'Львівська область', 'https://cdn.example/a.webp', true, true)",
+                        + "'Майстер манікюру', 'Львів', 'Львівська область', 'https://cdn.example/a.webp', "
+                        + "'вул. Хрещатик', '22', '2 поверх', true, true)",
                 userId, email, passwordEncoder.encode(PASSWORD), SEEDED_PHONE, SEEDED_INSTAGRAM);
         UUID masterId = UUID.randomUUID();
         String slug = "olena-k-" + masterId.toString().substring(0, 8);
@@ -74,6 +76,9 @@ final class PublicBookingPageFixtures {
         UUID defId = null;
         if (bookable) {
             defId = BookableMasterSeeder.assignNewIndependentService(jdbc, masterId);
+            // The seeder leaves service_definitions.category NULL; real services carry the platform category key.
+            jdbc.update("UPDATE service_definitions SET category = "
+                    + "(SELECT platform_category_name FROM service_types WHERE id = service_type_id) WHERE id = ?", defId);
             BookableMasterSeeder.seedUsableSchedule(jdbc, masterId);
         }
         return new IndependentMaster(userId, masterId, slug, email, defId);
@@ -94,6 +99,25 @@ final class PublicBookingPageFixtures {
                         + "VALUES (?, ?, ?, 'CLIENT', 'Ірина', 'Кравчук', true, true)",
                 id, "pg-c-" + id + "@beautica.test", passwordEncoder.encode(PASSWORD));
         return id;
+    }
+
+    /** One COMPLETED booking plus its review, {@code minutesAgo} old; a fresh booking per review (UNIQUE). */
+    void insertReview(IndependentMaster master, UUID clientId, int rating, int minutesAgo) {
+        UUID masterServiceId = jdbc.queryForObject(
+                "SELECT id FROM master_services WHERE master_id = ? LIMIT 1", UUID.class, master.masterId());
+        UUID bookingId = UUID.randomUUID();
+        jdbc.update(
+                "INSERT INTO bookings (id, client_id, master_id, master_service_id, salon_id, status, "
+                        + "starts_at, ends_at, price_at_booking, duration_minutes_at_booking, "
+                        + "buffer_minutes_at_booking, booking_source, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, ?, NULL, 'COMPLETED', NOW() - interval '2 hours', "
+                        + "NOW() - interval '1 hour', 500.00, 60, 0, 'APP', NOW(), NOW())",
+                bookingId, clientId, master.masterId(), masterServiceId);
+        jdbc.update(
+                "INSERT INTO reviews (id, booking_id, client_id, master_id, salon_id, rating, comment, "
+                        + "created_at, updated_at) VALUES (?, ?, ?, ?, NULL, ?, ?, "
+                        + "NOW() - make_interval(mins => ?), NOW())",
+                UUID.randomUUID(), bookingId, clientId, master.masterId(), rating, "review-" + minutesAgo, minutesAgo);
     }
 
     /** A salon created through {@code POST /salons} (slug issued at creation, phase 376). */

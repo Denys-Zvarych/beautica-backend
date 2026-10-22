@@ -188,6 +188,55 @@ class GuestInfoGetRateLimitTest {
         assertThat(response.getStatus()).isEqualTo(429);
     }
 
+    // ── phase 383/384: the /reviews routes draw from the SAME page-info bucket ─────────────────
+
+    private static final String MASTER_REVIEWS_PATH = "/api/v1/book/marija-l-cd34/reviews";
+    private static final String SALON_REVIEWS_PATH = "/api/v1/book/s/salon-krasa-ab12/reviews";
+
+    @ParameterizedTest(name = "{0}")
+    @ValueSource(strings = {MASTER_REVIEWS_PATH, SALON_REVIEWS_PATH})
+    @DisplayName("GET reviews read past the 60/60 s per-IP budget → 429 + Retry-After, chain not reached")
+    void should_return429_when_bookReviewsExceedsPerIpBudget(String path) throws Exception {
+        AuthRateLimitFilter filter = realFilter();
+        MockFilterChain[] chain = new MockFilterChain[1];
+
+        MockHttpServletResponse throttled = floodUntilThrottled(filter, path, chain);
+
+        assertThat(throttled.getStatus()).as("%s must be IP-throttled", path).isEqualTo(429);
+        assertThat(throttled.getHeader("Retry-After")).isNotNull();
+        assertThat(chain[0].getRequest()).isNull();
+    }
+
+    @Test
+    @DisplayName("info and reviews reads from one IP draw from ONE shared budget (the 61st request, in either order, is 429)")
+    void should_shareOneBudget_when_infoAndReviewsReadFromOneIp() throws Exception {
+        AuthRateLimitFilter filter = realFilter();
+        for (int i = 0; i < 30; i++) {
+            fireOnce(filter, get(MASTER_INFO_PATH, REMOTE_ADDR));
+            fireOnce(filter, get(MASTER_REVIEWS_PATH, REMOTE_ADDR));
+        }
+
+        MockHttpServletResponse sixtyFirst = fireOnce(filter, get(SALON_REVIEWS_PATH, REMOTE_ADDR));
+
+        assertThat(sixtyFirst.getStatus()).isEqualTo(429);
+    }
+
+    @Test
+    @DisplayName("reviews read with a valid worker key + CF-Connecting-IP is keyed on the forwarded visitor IP")
+    void should_chargeVisitorBucket_when_reviewsReadCarriesValidWorkerKey() throws Exception {
+        AuthRateLimitFilter filter = workerAwareFilter();
+        for (int i = 0; i < REQUESTS_TO_FIRE; i++) {
+            fireOnce(filter, workerGet(MASTER_REVIEWS_PATH, WORKER_KEY, VISITOR_A));
+        }
+
+        MockHttpServletResponse exhaustedVisitor = fireOnce(filter, workerGet(MASTER_REVIEWS_PATH, WORKER_KEY, VISITOR_A));
+        MockHttpServletResponse otherVisitor = fireOnce(filter, workerGet(MASTER_REVIEWS_PATH, WORKER_KEY, VISITOR_B));
+
+        assertThat(exhaustedVisitor.getStatus()).isEqualTo(429);
+        assertThat(otherVisitor.getStatus()).as("a different visitor behind the same Worker egress is untouched")
+                .isNotEqualTo(429);
+    }
+
     @Test
     @DisplayName("an exhausted IP does not throttle a different IP")
     void should_throttlePerIp_when_oneSourceIsAlreadyExhausted() throws Exception {

@@ -19,11 +19,15 @@ import com.beautica.review.service.ReviewService;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.salon.repository.SalonRepository.SalonBookingLinkRow;
 import com.beautica.service.repository.MasterServiceRepository;
+import com.beautica.master.entity.MasterType;
 import com.beautica.salon.entity.Salon;
+import com.beautica.service.entity.CatalogCategory;
 import com.beautica.user.User;
 import lombok.RequiredArgsConstructor;
 import org.springframework.cache.annotation.Cacheable;
+import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Pageable;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
@@ -318,6 +322,7 @@ public class BookingSlugService {
                 .map(ServiceSummaryDto::from)
                 .toList();
 
+        boolean discloses = MasterType.disclosesOwnAddress(master.getMasterType());
         return new BookingSlugInfoResponse(
                 composeName(user.getFirstName(), user.getLastName()),
                 user.getAvatarUrl(),
@@ -336,7 +341,34 @@ public class BookingSlugService {
                 portfolio(master.getId()),
                 latestReviews(master.getId()),
                 Boolean.TRUE.equals(masterRepository.isBookableById(master.getId(), scheduleDateMath.today())),
-                latest(master.getUpdatedAt(), user.getUpdatedAt()));
+                latest(master.getUpdatedAt(), user.getUpdatedAt()),
+                // Phase 383 D5: the method behind GET /masters/{id}/reviews/summary (zero-filled 5..1).
+                reviewService.getMasterReviewSummary(master.getId()).ratingDistribution(),
+                // Phase 383 D4: the app's public-profile address rule (MasterDetailResponse#fromPublic) — the same
+                // MasterType#disclosesOwnAddress predicate; a salon master discloses none of the three.
+                discloses ? user.getStreet() : null,
+                discloses ? user.getBuildingNo() : null,
+                discloses ? user.getLocationNote() : null);
+    }
+
+    /** Phase 383 D6 — page-size ceiling of the public {@code /reviews} routes (a larger request is clamped). */
+    public static final int MAX_REVIEWS_PAGE_SIZE = 20;
+
+    /**
+     * Phase 383 D6 — one page of a master's public reviews, addressed by the booking slug. Slug resolution is
+     * {@code /info}'s (unknown / inactive master or salon → 404); the page itself is the method behind
+     * {@code GET /masters/{id}/reviews} (same sort enum, same {@link ReviewResponse}, same
+     * {@code reviews-by-master} cache — so the existing review-created eviction already covers it), with the
+     * requested size clamped to {@value #MAX_REVIEWS_PAGE_SIZE}. A master that is not {@code bookable} still
+     * returns its reviews, as {@code /info} renders them.
+     */
+    @Transactional(readOnly = true)
+    public Page<ReviewResponse> reviewsForSlug(String slug, SalonReviewSort sort, Pageable pageable) {
+        UUID masterId = masterRepository.findActiveIdByBookingSlug(slug)
+                .orElseThrow(() -> new NotFoundException("Booking page not found"));
+        Pageable clamped = PageRequest.of(pageable.getPageNumber(),
+                Math.min(pageable.getPageSize(), MAX_REVIEWS_PAGE_SIZE));
+        return reviewService.getReviewsForMaster(masterId, sort, clamped);
     }
 
     private static BookingSlugSalonRef salonRef(Salon salon) {
@@ -345,7 +377,10 @@ public class BookingSlugService {
 
     private List<CategoryRef> categories(UUID masterId) {
         return masterServiceRepository.findActiveCategoriesByMasterId(masterId).stream()
-                .map(category -> new CategoryRef(category.getId(), category.getNameUk()))
+                .map(row -> {
+                    CatalogCategory category = (CatalogCategory) row[0];
+                    return new CategoryRef(category.getId(), category.getNameUk(), (String) row[1]);
+                })
                 .toList();
     }
 

@@ -9,6 +9,9 @@ public record CategoryRef(
         @Schema(requiredMode = Schema.RequiredMode.REQUIRED, format = "uuid")
         UUID id,
         @Schema(requiredMode = Schema.RequiredMode.REQUIRED)
-        String name
+        String name,
+        @Schema(requiredMode = Schema.RequiredMode.REQUIRED,
+                description = "Category key shared with ServiceSummaryDto.category (phase 383).")
+        String key
 ) {
 }

@@ -488,6 +488,7 @@ class BookingSlugServiceTest {
         when(mediaService.getLatestPortfolio(any(com.beautica.media.entity.EntityType.class), any(), anyInt()))
                 .thenReturn(List.of());
         when(reviewService.getReviewsForMaster(any(), any(), any(PageRequest.class))).thenReturn(Page.empty());
+        when(reviewService.getMasterReviewSummary(any())).thenReturn(summary(distribution(0, 0, 0, 0, 0)));
 
         BookingSlugInfoResponse info = service.findBySlug("marija-l-cd34");
 
@@ -515,6 +516,8 @@ class BookingSlugServiceTest {
                 .thenReturn(List.of(assignment("Манікюр", 60, new BigDecimal("350.00"))));
         org.mockito.Mockito.lenient().when(masterServiceRepository.findActiveCategoriesByMasterId(masterId)).thenReturn(List.of());
         when(scheduleDateMath.today()).thenReturn(TODAY);
+        org.mockito.Mockito.lenient().when(reviewService.getMasterReviewSummary(masterId))
+                .thenReturn(summary(distribution(0, 0, 0, 0, 0)));
         org.mockito.Mockito.lenient().when(mediaService.getLatestPortfolio(eq(com.beautica.media.entity.EntityType.MASTER), eq(masterId), anyInt()))
                 .thenReturn(List.of());
         when(reviewService.getReviewsForMaster(eq(masterId), eq(SalonReviewSort.NEWEST), any(PageRequest.class)))
@@ -531,7 +534,8 @@ class BookingSlugServiceTest {
         var category = org.mockito.Mockito.mock(com.beautica.service.entity.CatalogCategory.class);
         when(category.getId()).thenReturn(categoryId);
         when(category.getNameUk()).thenReturn("Манікюр");
-        when(masterServiceRepository.findActiveCategoriesByMasterId(masterId)).thenReturn(List.of(category));
+        when(masterServiceRepository.findActiveCategoriesByMasterId(masterId))
+                .thenReturn(java.util.Collections.singletonList(new Object[] {category, "NAILS"}));
         var photo = new com.beautica.media.dto.MediaFileResponse(UUID.randomUUID(),
                 com.beautica.media.entity.EntityType.MASTER, masterId,
                 com.beautica.media.entity.MediaType.PORTFOLIO, "https://media.beautica.app/p.webp", null);
@@ -548,7 +552,7 @@ class BookingSlugServiceTest {
         assertThat(info.region()).isEqualTo("Львівська область");
         assertThat(info.avgRating()).isEqualByComparingTo("4.80");
         assertThat(info.reviewCount()).isEqualTo(37);
-        assertThat(info.categories()).containsExactly(new CategoryRef(categoryId, "Манікюр"));
+        assertThat(info.categories()).containsExactly(new CategoryRef(categoryId, "Манікюр", "NAILS"));
         assertThat(info.portfolio()).containsExactly(photo);
         assertThat(info.bookable()).isTrue();
         assertThat(info.salon()).isNull();
@@ -593,6 +597,102 @@ class BookingSlugServiceTest {
         BookingSlugInfoResponse info = service.findBySlug("olena-k-ab12");
 
         assertThat(info.bookable()).isFalse();
+    }
+
+    // ── phase 383: app parity ────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("should_setCategoryOnEveryService_when_infoBuilt")
+    void should_setCategoryOnEveryService_when_infoBuilt() {
+        UUID masterId = UUID.randomUUID();
+        enrichedMaster(masterId);
+        when(masterServiceRepository.findByMasterIdAndIsActiveTrueWithGraph(any(), any())).thenReturn(List.of(
+                assignment("Манікюр", 60, new BigDecimal("350.00"), "NAILS"),
+                assignment("Стрижка", 45, new BigDecimal("200.00"), "HAIR")));
+
+        BookingSlugInfoResponse info = service.findBySlug("olena-k-ab12");
+
+        assertThat(info.services()).extracting("category").containsExactly("NAILS", "HAIR");
+    }
+
+    @Test
+    @DisplayName("should_returnZeroFilledDistribution_when_noReviews")
+    void should_returnZeroFilledDistribution_when_noReviews() {
+        UUID masterId = UUID.randomUUID();
+        Master master = enrichedMaster(masterId);
+        master.setReviewCount(0);
+
+        BookingSlugInfoResponse info = service.findBySlug("olena-k-ab12");
+
+        assertThat(info.ratingDistribution()).containsExactlyElementsOf(distribution(0, 0, 0, 0, 0));
+    }
+
+    @Test
+    @DisplayName("should_delegateDistributionToReviewSummary_when_infoBuilt")
+    void should_delegateDistributionToReviewSummary_when_infoBuilt() {
+        UUID masterId = UUID.randomUUID();
+        enrichedMaster(masterId);
+        when(reviewService.getMasterReviewSummary(masterId)).thenReturn(summary(distribution(12, 3, 0, 0, 1)));
+
+        BookingSlugInfoResponse info = service.findBySlug("olena-k-ab12");
+
+        assertThat(info.ratingDistribution()).containsExactlyElementsOf(distribution(12, 3, 0, 0, 1));
+    }
+
+    @Test
+    @DisplayName("should_exposeAddress_when_independentMaster")
+    void should_exposeAddress_when_independentMaster() {
+        UUID masterId = UUID.randomUUID();
+        Master master = enrichedMaster(masterId);
+        master.getUser().setStreet("вул. Хрещатик");
+        master.getUser().setBuildingNo("22");
+        master.getUser().setLocationNote("2 поверх");
+
+        BookingSlugInfoResponse info = service.findBySlug("olena-k-ab12");
+
+        assertThat(info.street()).isEqualTo("вул. Хрещатик");
+        assertThat(info.buildingNo()).isEqualTo("22");
+        assertThat(info.locationNote()).isEqualTo("2 поверх");
+    }
+
+    @Test
+    @DisplayName("should_nullAddress_when_salonMaster")
+    void should_nullAddress_when_salonMaster() {
+        UUID masterId = UUID.randomUUID();
+        Master master = enrichedMaster(masterId);
+        master.setMasterType(com.beautica.master.entity.MasterType.SALON_MASTER);
+        master.getUser().setStreet("вул. Хрещатик");
+        master.getUser().setBuildingNo("22");
+        master.getUser().setLocationNote("2 поверх");
+
+        BookingSlugInfoResponse info = service.findBySlug("olena-k-ab12");
+
+        assertThat(info.street()).isNull();
+        assertThat(info.buildingNo()).isNull();
+        assertThat(info.locationNote()).isNull();
+    }
+
+    @Test
+    @DisplayName("should_clampPageSizeTo20AndDelegate_when_reviewsRequested")
+    void should_clampPageSizeTo20AndDelegate_when_reviewsRequested() {
+        UUID masterId = UUID.randomUUID();
+        when(masterRepository.findActiveIdByBookingSlug("olena-k-ab12")).thenReturn(Optional.of(masterId));
+        when(reviewService.getReviewsForMaster(eq(masterId), eq(SalonReviewSort.HIGHEST), any(PageRequest.class)))
+                .thenReturn(Page.empty());
+
+        service.reviewsForSlug("olena-k-ab12", SalonReviewSort.HIGHEST, PageRequest.of(2, 500));
+
+        verify(reviewService).getReviewsForMaster(masterId, SalonReviewSort.HIGHEST, PageRequest.of(2, 20));
+    }
+
+    @Test
+    @DisplayName("should_throwNotFound_when_reviewsSlugUnknownOrInactive")
+    void should_throwNotFound_when_reviewsSlugUnknownOrInactive() {
+        when(masterRepository.findActiveIdByBookingSlug("nope")).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> service.reviewsForSlug("nope", SalonReviewSort.NEWEST, PageRequest.of(0, 20)))
+                .isInstanceOf(NotFoundException.class);
+        verify(reviewService, org.mockito.Mockito.never()).getReviewsForMaster(any(), any(), any());
     }
 
     @Test
@@ -670,8 +770,25 @@ class BookingSlugServiceTest {
         m.setId(id);
     }
 
+    private static List<com.beautica.common.RatingBucket> distribution(long five, long four, long three, long two,
+                                                                      long one) {
+        return List.of(new com.beautica.common.RatingBucket(5, five), new com.beautica.common.RatingBucket(4, four),
+                new com.beautica.common.RatingBucket(3, three), new com.beautica.common.RatingBucket(2, two),
+                new com.beautica.common.RatingBucket(1, one));
+    }
+
+    private static com.beautica.review.dto.MasterReviewSummaryResponse summary(
+            List<com.beautica.common.RatingBucket> distribution) {
+        return new com.beautica.review.dto.MasterReviewSummaryResponse(null, 0, distribution);
+    }
+
     private static MasterServiceAssignment assignment(String name, int duration, BigDecimal price) {
+        return assignment(name, duration, price, null);
+    }
+
+    private static MasterServiceAssignment assignment(String name, int duration, BigDecimal price, String category) {
         ServiceDefinition def = ServiceDefinition.builder()
+                .category(category)
                 .name(name)
                 .baseDurationMinutes(duration)
                 .basePrice(price)

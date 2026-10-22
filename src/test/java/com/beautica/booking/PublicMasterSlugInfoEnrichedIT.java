@@ -70,7 +70,7 @@ class PublicMasterSlugInfoEnrichedIT extends AbstractIntegrationTest {
     private static final Set<String> ROOT_KEYS = Set.of(
             "masterName", "avatarUrl", "bio", "services", "masterId", "masterType", "professionalTitle", "city",
             "region", "salon", "avgRating", "reviewCount", "categories", "portfolio", "latestReviews", "bookable",
-            "updatedAt");
+            "updatedAt", "ratingDistribution", "street", "buildingNo", "locationNote");
 
     @Autowired private TestRestTemplate restTemplate;
     @Autowired private ObjectMapper objectMapper;
@@ -101,25 +101,6 @@ class PublicMasterSlugInfoEnrichedIT extends AbstractIntegrationTest {
     }
 
     // ── fixtures ─────────────────────────────────────────────────────────────────────────────
-
-    /** One COMPLETED booking plus its review, {@code minutesAgo} old; a fresh booking per review (UNIQUE). */
-    private void insertReview(IndependentMaster master, UUID clientId, int rating, int minutesAgo) {
-        UUID masterServiceId = jdbcTemplate.queryForObject(
-                "SELECT id FROM master_services WHERE master_id = ? LIMIT 1", UUID.class, master.masterId());
-        UUID bookingId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO bookings (id, client_id, master_id, master_service_id, salon_id, status, "
-                        + "starts_at, ends_at, price_at_booking, duration_minutes_at_booking, "
-                        + "buffer_minutes_at_booking, booking_source, created_at, updated_at) "
-                        + "VALUES (?, ?, ?, ?, NULL, 'COMPLETED', NOW() - interval '2 hours', "
-                        + "NOW() - interval '1 hour', 500.00, 60, 0, 'APP', NOW(), NOW())",
-                bookingId, clientId, master.masterId(), masterServiceId);
-        jdbcTemplate.update(
-                "INSERT INTO reviews (id, booking_id, client_id, master_id, salon_id, rating, comment, "
-                        + "created_at, updated_at) VALUES (?, ?, ?, ?, NULL, ?, ?, "
-                        + "NOW() - make_interval(mins => ?), NOW())",
-                UUID.randomUUID(), bookingId, clientId, master.masterId(), rating, "review-" + minutesAgo, minutesAgo);
-    }
 
     private void insertPortfolioPhoto(IndependentMaster master, int minutesAgo) {
         UUID id = UUID.randomUUID();
@@ -175,8 +156,8 @@ class PublicMasterSlugInfoEnrichedIT extends AbstractIntegrationTest {
     void should_returnFullPayload_when_masterHasEverything() throws Exception {
         IndependentMaster master = pages.independentMaster(true);
         UUID client = pages.insertClient();
-        insertReview(master, client, 5, 10);
-        insertReview(master, client, 4, 20);
+        pages.insertReview(master, client, 5, 10);
+        pages.insertReview(master, client, 4, 20);
         jdbcTemplate.update("UPDATE masters SET review_count = 2, avg_rating = 4.50 WHERE id = ?", master.masterId());
         insertPortfolioPhoto(master, 5);
         insertPortfolioPhoto(master, 6);
@@ -207,7 +188,7 @@ class PublicMasterSlugInfoEnrichedIT extends AbstractIntegrationTest {
     void should_exposeOnlyAllowListedKeys_when_pageRendered() throws Exception {
         IndependentMaster master = pages.independentMaster(true);
         UUID client = pages.insertClient();
-        insertReview(master, client, 5, 10);
+        pages.insertReview(master, client, 5, 10);
         insertPortfolioPhoto(master, 5);
         jdbcTemplate.update("UPDATE masters SET review_count = 1, avg_rating = 5.00 WHERE id = ?", master.masterId());
 
@@ -216,8 +197,9 @@ class PublicMasterSlugInfoEnrichedIT extends AbstractIntegrationTest {
 
         assertThat(keys(body)).isEqualTo(ROOT_KEYS);
         assertThat(keys(body.path("services").get(0)))
-                .isEqualTo(Set.of("id", "name", "durationMinutes", "priceFrom"));
-        assertThat(keys(body.path("categories").get(0))).isEqualTo(Set.of("id", "name"));
+                .isEqualTo(Set.of("id", "name", "durationMinutes", "priceFrom", "category"));
+        assertThat(keys(body.path("categories").get(0))).isEqualTo(Set.of("id", "name", "key"));
+        assertThat(keys(body.path("ratingDistribution").get(0))).isEqualTo(Set.of("rating", "count"));
         assertThat(keys(body.path("portfolio").get(0)))
                 .isEqualTo(Set.of("id", "entityType", "entityId", "mediaType", "url", "createdAt"));
         assertThat(keys(body.path("latestReviews").get(0)))
@@ -225,7 +207,7 @@ class PublicMasterSlugInfoEnrichedIT extends AbstractIntegrationTest {
                         "createdAt"));
         List<String> allKeys = new ArrayList<>();
         collectKeys(body, allKeys);
-        assertThat(allKeys).noneMatch(k -> k.toLowerCase().matches(".*(street|instagram|email|phone|building).*"));
+        assertThat(allKeys).noneMatch(k -> k.toLowerCase().matches(".*(instagram|email|phone).*"));
         assertThat(response.getBody()).doesNotContain(SEEDED_PHONE, SEEDED_INSTAGRAM, master.email());
     }
 
@@ -286,7 +268,7 @@ class PublicMasterSlugInfoEnrichedIT extends AbstractIntegrationTest {
         IndependentMaster master = pages.independentMaster(true);
         UUID client = pages.insertClient();
         for (int i = 1; i <= 7; i++) {
-            insertReview(master, client, 5, i * 10);
+            pages.insertReview(master, client, 5, i * 10);
         }
         for (int i = 1; i <= 13; i++) {
             insertPortfolioPhoto(master, i);
@@ -299,6 +281,92 @@ class PublicMasterSlugInfoEnrichedIT extends AbstractIntegrationTest {
         body.path("latestReviews").forEach(r -> comments.add(r.path("comment").asText()));
         assertThat(comments).containsExactly("review-10", "review-20", "review-30", "review-40", "review-50");
         assertThat(body.path("portfolio")).hasSize(12);
+    }
+
+    // ── phase 383: app parity ────────────────────────────────────────────────────────────────
+
+    private JsonNode appMasterProfile(UUID masterId) throws Exception {
+        ResponseEntity<String> response = restTemplate.exchange("/api/v1/masters/" + masterId, HttpMethod.GET,
+                new HttpEntity<>(new HttpHeaders()), String.class);
+        assertThat(response.getStatusCode()).as("body=%s", response.getBody()).isEqualTo(HttpStatus.OK);
+        return objectMapper.readTree(response.getBody()).path("data");
+    }
+
+    @Test
+    @DisplayName("address parity: an independent master's street/buildingNo/locationNote equal GET /masters/{id}")
+    void should_matchAppProfileAddress_when_independentMaster() throws Exception {
+        IndependentMaster master = pages.independentMaster(true);
+
+        JsonNode info = page(master.slug());
+        JsonNode app = appMasterProfile(master.masterId());
+
+        assertThat(info.path("street").asText()).isEqualTo("вул. Хрещатик").isEqualTo(app.path("street").asText());
+        assertThat(info.path("buildingNo").asText()).isEqualTo("22").isEqualTo(app.path("buildingNo").asText());
+        assertThat(info.path("locationNote").asText()).isEqualTo("2 поверх").isEqualTo(app.path("locationNote").asText());
+    }
+
+    @Test
+    @DisplayName("address parity: a salon master discloses none of the three, exactly as GET /masters/{id}")
+    void should_nullAddressLikeAppProfile_when_salonMaster() throws Exception {
+        PublicBookingPageFixtures.SalonPage salon = pages.salon("Address Parity Salon");
+        UUID masterId = pages.salonMaster(salon.salonId(), "Марія", "Тестова");
+        jdbcTemplate.update("UPDATE users SET street = 'вул. Таємна', building_no = '9', location_note = 'прихована' "
+                + "WHERE id = (SELECT user_id FROM masters WHERE id = ?)", masterId);
+
+        JsonNode info = page(pages.masterSlugOf(masterId));
+        JsonNode app = appMasterProfile(masterId);
+
+        for (String field : List.of("street", "buildingNo", "locationNote")) {
+            assertThat(info.path(field).isNull()).as("info.%s", field).isTrue();
+            assertThat(app.path(field).isNull()).as("app.%s", field).isTrue();
+        }
+    }
+
+    @Test
+    @DisplayName("every service carries its category key and categories[].key joins to it")
+    void should_joinServiceCategoryToCategoryKey_when_pageRendered() throws Exception {
+        IndependentMaster master = pages.independentMaster(true);
+
+        JsonNode body = page(master.slug());
+
+        String serviceCategory = body.path("services").get(0).path("category").asText();
+        assertThat(serviceCategory).isNotBlank();
+        assertThat(body.path("categories").get(0).path("key").asText()).isEqualTo(serviceCategory);
+    }
+
+    @Test
+    @DisplayName("ratingDistribution is zero-filled 5..1 for a master without reviews, and equals the app summary")
+    void should_returnZeroFilledDistributionEqualToAppSummary_when_noReviews() throws Exception {
+        IndependentMaster master = pages.independentMaster(true);
+
+        JsonNode distribution = page(master.slug()).path("ratingDistribution");
+        ResponseEntity<String> summary = restTemplate.exchange("/api/v1/masters/" + master.masterId()
+                + "/reviews/summary", HttpMethod.GET, new HttpEntity<>(new HttpHeaders()), String.class);
+
+        assertThat(distribution).hasSize(5);
+        for (int i = 0; i < 5; i++) {
+            assertThat(distribution.get(i).path("rating").asInt()).isEqualTo(5 - i);
+            assertThat(distribution.get(i).path("count").asLong()).isZero();
+        }
+        assertThat(objectMapper.readTree(summary.getBody()).path("data").path("ratingDistribution"))
+                .isEqualTo(distribution);
+    }
+
+    @Test
+    @DisplayName("eviction: a new review shows up in ratingDistribution on the next read")
+    void should_reflectReviewInDistribution_when_reviewCreatedEventCommits() throws Exception {
+        IndependentMaster master = pages.independentMaster(true);
+        UUID client = pages.insertClient();
+        assertThat(page(master.slug()).path("ratingDistribution").get(0).path("count").asLong()).isZero();
+        evictSlugCacheEntry(master.slug());
+
+        pages.insertReview(master, client, 5, 1);
+        transactionTemplate.executeWithoutResult(status -> eventPublisher.publishEvent(
+                new ReviewCreatedEvent(master.masterId(), master.userId(), null, client)));
+
+        JsonNode distribution = page(master.slug()).path("ratingDistribution");
+        assertThat(distribution.get(0).path("rating").asInt()).isEqualTo(5);
+        assertThat(distribution.get(0).path("count").asLong()).isEqualTo(1);
     }
 
     // ── shared `portfolio` cache must not be poisoned (audit #1) ─────────────────────────────
@@ -350,7 +418,7 @@ class PublicMasterSlugInfoEnrichedIT extends AbstractIntegrationTest {
         assertThat(page(master.slug()).path("reviewCount").asInt()).isZero();
         evictSlugCacheEntry(master.slug());
 
-        insertReview(master, client, 5, 1);
+        pages.insertReview(master, client, 5, 1);
         transactionTemplate.executeWithoutResult(status -> eventPublisher.publishEvent(
                 new ReviewCreatedEvent(master.masterId(), master.userId(), null, client)));
 
@@ -444,11 +512,11 @@ class PublicMasterSlugInfoEnrichedIT extends AbstractIntegrationTest {
     // ── statement budget ──────────────────────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("a cache miss costs at most 7 statements (D9)")
+    @DisplayName("a cache miss costs at most 8 statements (D9: 7 in phase 380 + the rating-distribution GROUP BY of phase 383)")
     void should_useAtMostSevenStatements_when_cacheMiss() {
         IndependentMaster master = pages.independentMaster(true);
         UUID client = pages.insertClient();
-        insertReview(master, client, 5, 10);
+        pages.insertReview(master, client, 5, 10);
         insertPortfolioPhoto(master, 5);
         Statistics statistics = HibernateStatistics.enabledOn(emf);
         long before = statistics.getPrepareStatementCount();
@@ -458,7 +526,7 @@ class PublicMasterSlugInfoEnrichedIT extends AbstractIntegrationTest {
         long statements = statistics.getPrepareStatementCount() - before;
         assertThat(info.latestReviews()).hasSize(1);
         assertThat(info.portfolio()).hasSize(1);
-        assertThat(statements).as("statements on a cache miss").isBetween(1L, 7L);
+        assertThat(statements).as("statements on a cache miss").isBetween(1L, 8L);
     }
 
     // ── helpers ───────────────────────────────────────────────────────────────────────────────

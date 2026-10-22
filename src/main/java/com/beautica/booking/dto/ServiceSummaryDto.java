@@ -3,6 +3,8 @@ package com.beautica.booking.dto;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.ServiceDefinition;
 
+import io.swagger.v3.oas.annotations.media.Schema;
+
 import java.math.BigDecimal;
 import java.util.UUID;
 
@@ -21,7 +23,11 @@ public record ServiceSummaryDto(
         UUID id,
         String name,
         int durationMinutes,
-        BigDecimal priceFrom
+        BigDecimal priceFrom,
+        @Schema(types = {"string", "null"}, nullable = true,
+                description = "The service's category key — the same value as ServiceDefinitionResponse.category "
+                        + "and CategoryRef.key; the website groups services by it (phase 383).")
+        String category
 ) {
 
     public static ServiceSummaryDto from(MasterServiceAssignment assignment) {
@@ -32,6 +38,6 @@ public record ServiceSummaryDto(
         BigDecimal price = assignment.getPriceOverride() != null
                 ? assignment.getPriceOverride()
                 : def.getBasePrice();
-        return new ServiceSummaryDto(assignment.getId(), def.getName(), duration, price);
+        return new ServiceSummaryDto(assignment.getId(), def.getName(), duration, price, def.getCategory());
     }
 }

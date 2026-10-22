@@ -50,6 +50,7 @@ import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
@@ -115,7 +116,7 @@ class PublicBookingControllerTest {
                 "Марія Левченко",
                 "https://cdn.example/a.jpg",
                 "Манікюр та педикюр",
-                List.of(new ServiceSummaryDto(UUID.randomUUID(), "Манікюр", 60, new BigDecimal("350.00"))));
+                List.of(new ServiceSummaryDto(UUID.randomUUID(), "Манікюр", 60, new BigDecimal("350.00"), "NAILS")));
         when(bookingSlugService.findBySlug("marija-l-cd34")).thenReturn(response);
 
         mockMvc.perform(get("/api/v1/book/marija-l-cd34/info").accept(MediaType.APPLICATION_JSON))
@@ -133,7 +134,7 @@ class PublicBookingControllerTest {
     void should_notLeakInternalIds_when_slugExists() throws Exception {
         var response = masterPage(
                 "Ivan Petrenko", null, null,
-                List.of(new ServiceSummaryDto(UUID.randomUUID(), "Стрижка", 45, new BigDecimal("200.00"))));
+                List.of(new ServiceSummaryDto(UUID.randomUUID(), "Стрижка", 45, new BigDecimal("200.00"), "HAIR")));
         when(bookingSlugService.findBySlug("ivan-petrenko-ab12")).thenReturn(response);
 
         mockMvc.perform(get("/api/v1/book/ivan-petrenko-ab12/info").accept(MediaType.APPLICATION_JSON))
@@ -365,7 +366,49 @@ class PublicBookingControllerTest {
         return new BookingSlugInfoResponse(
                 name, avatarUrl, bio, services, UUID.randomUUID(),
                 com.beautica.master.entity.MasterType.INDEPENDENT_MASTER, null, null, null, null, null, 0,
-                List.of(), List.of(), List.of(), true, java.time.Instant.parse("2026-10-18T09:12:44Z"));
+                List.of(), List.of(), List.of(), true, java.time.Instant.parse("2026-10-18T09:12:44Z"),
+                List.of(), null, null, null);
+    }
+
+    // ── Phase 383: GET /book/{slug}/reviews ────────────────────────────────────
+
+    @Test
+    @DisplayName("GET /book/{slug}/reviews — 200 PageResponse with the info Cache-Control, sort and size passed through")
+    void should_return200WithPage_when_reviewsRequested() throws Exception {
+        var review = new com.beautica.review.dto.ReviewResponse(UUID.randomUUID(), UUID.randomUUID(), "Олена К.",
+                "Манікюр", 5, "Дуже акуратно", java.time.OffsetDateTime.parse("2026-10-12T15:20:00Z"));
+        when(bookingSlugService.reviewsForSlug(eq("marija-l-cd34"),
+                eq(com.beautica.review.dto.SalonReviewSort.HIGHEST), any(org.springframework.data.domain.Pageable.class)))
+                .thenReturn(new org.springframework.data.domain.PageImpl<>(List.of(review),
+                        org.springframework.data.domain.PageRequest.of(0, 20), 1));
+
+        mockMvc.perform(get("/api/v1/book/marija-l-cd34/reviews?sort=HIGHEST&page=0&size=20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(header().string("Cache-Control", "max-age=0, public, s-maxage=30"))
+                .andExpect(jsonPath("$.data[0].clientDisplayName").value("Олена К."))
+                .andExpect(jsonPath("$.totalElements").value(1));
+    }
+
+    @Test
+    @DisplayName("GET /book/{slug}/reviews — unknown sort is 400, malformed slug is 400, neither reaches the service")
+    void should_return400_when_reviewsSortOrSlugInvalid() throws Exception {
+        mockMvc.perform(get("/api/v1/book/marija-l-cd34/reviews?sort=BOGUS").accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest());
+        mockMvc.perform(get("/api/v1/book/BAD_SLUG/reviews").accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest());
+
+        verifyNoInteractions(bookingSlugService);
+    }
+
+    @Test
+    @DisplayName("GET /book/{slug}/reviews — unknown slug is 404")
+    void should_return404_when_reviewsSlugUnknown() throws Exception {
+        when(bookingSlugService.reviewsForSlug(eq("nope-zz99"), any(), any()))
+                .thenThrow(new NotFoundException("Booking page not found"));
+
+        mockMvc.perform(get("/api/v1/book/nope-zz99/reviews").accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isNotFound());
     }
 
     // ── Phase 377: public salon booking page ──────────────────────────────────

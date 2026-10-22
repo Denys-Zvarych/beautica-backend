@@ -6,6 +6,12 @@ import com.beautica.booking.dto.CancelTokenInfoResponse;
 import com.beautica.booking.dto.GuestBookingRequest;
 import com.beautica.booking.dto.GuestBookingResponse;
 import com.beautica.booking.dto.SalonBookingSlugInfoResponse;
+import com.beautica.common.PageResponse;
+import com.beautica.review.dto.ReviewResponse;
+import com.beautica.review.dto.SalonReviewSort;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.web.PageableDefault;
 import com.beautica.booking.service.BookingCancellationService;
 import com.beautica.booking.service.BookingSlugService;
 import com.beautica.booking.service.GuestBookingService;
@@ -85,6 +91,24 @@ public class PublicBookingController {
             @Pattern(regexp = "^[a-z0-9][a-z0-9\\-]*[a-z0-9]$")
             String slug) {
         return ResponseEntity.ok().cacheControl(INFO_CACHE_CONTROL).body(bookingSlugService.findBySlug(slug));
+    }
+
+    /**
+     * Phase 383 D6 — a sortable page of the master's public reviews, for the website's review sheet. Same slug
+     * rules, cache headers and per-IP bucket as {@link #info}; {@code size} is clamped to 20, an unknown
+     * {@code sort} is a 400 through the enum binding.
+     */
+    @GetMapping("/{slug}/reviews")
+    public ResponseEntity<PageResponse<ReviewResponse>> reviews(
+            @PathVariable
+            @Size(min = 2, max = 60)
+            @Pattern(regexp = "^[a-z0-9][a-z0-9\\-]*[a-z0-9]$")
+            String slug,
+            @RequestParam(required = false, defaultValue = "NEWEST") SalonReviewSort sort,
+            @PageableDefault(size = BookingSlugService.MAX_REVIEWS_PAGE_SIZE) Pageable pageable) {
+        Page<ReviewResponse> page = bookingSlugService.reviewsForSlug(slug, sort, pageable);
+        return ResponseEntity.ok().cacheControl(INFO_CACHE_CONTROL).body(PageResponse.of(
+                page.getContent(), page.getNumber(), page.getSize(), page.getTotalElements(), page.getTotalPages()));
     }
 
     /**

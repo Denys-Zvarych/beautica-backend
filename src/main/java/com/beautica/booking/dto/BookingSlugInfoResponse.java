@@ -1,5 +1,6 @@
 package com.beautica.booking.dto;
 
+import com.beautica.common.RatingBucket;
 import com.beautica.master.entity.MasterType;
 import com.beautica.media.dto.MediaFileResponse;
 import com.beautica.review.dto.ReviewResponse;
@@ -58,6 +59,18 @@ public record BookingSlugInfoResponse(
         boolean bookable,
         @Schema(requiredMode = Schema.RequiredMode.REQUIRED,
                 description = "Profile last edited; display/JSON-LD only, never a cache validator.")
-        Instant updatedAt
+        Instant updatedAt,
+        @Schema(requiredMode = Schema.RequiredMode.REQUIRED,
+                description = "Zero-filled 5..1 histogram, the same as GET /masters/{id}/reviews/summary (phase 383).")
+        List<RatingBucket> ratingDistribution,
+        @Schema(types = {"string", "null"}, nullable = true,
+                description = "Non-null only for INDEPENDENT_MASTER (the app's public-profile address rule).")
+        String street,
+        @Schema(types = {"string", "null"}, nullable = true,
+                description = "Non-null only for INDEPENDENT_MASTER.")
+        String buildingNo,
+        @Schema(types = {"string", "null"}, nullable = true,
+                description = "Non-null only for INDEPENDENT_MASTER.")
+        String locationNote
 ) {
 }

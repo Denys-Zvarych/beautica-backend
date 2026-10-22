@@ -33,6 +33,8 @@ class BookingInfoEtagFilterConfigTest {
     void should_filterOnlyGetInfoRoutes_when_pathMatches() {
         assertThat(BookingInfoEtagFilterConfig.isInfoRequest(request("GET", "/api/v1/book/olena-k-ab12/info"))).isTrue();
         assertThat(BookingInfoEtagFilterConfig.isInfoRequest(request("GET", "/api/v1/book/s/studio-a1b2/info"))).isTrue();
+        assertThat(BookingInfoEtagFilterConfig.isInfoRequest(request("GET", "/api/v1/book/olena-k-ab12/reviews"))).isTrue();
+        assertThat(BookingInfoEtagFilterConfig.isInfoRequest(request("GET", "/api/v1/book/s/studio-a1b2/reviews"))).isTrue();
     }
 
     @Test

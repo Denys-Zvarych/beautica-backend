@@ -35,7 +35,9 @@ public class BookingInfoEtagFilterConfig {
 
     static final List<String> INFO_PATTERNS = List.of(
             "/api/v1/book/{slug}/info",
-            "/api/v1/book/s/{slug}/info");
+            "/api/v1/book/s/{slug}/info",
+            "/api/v1/book/{slug}/reviews",
+            "/api/v1/book/s/{slug}/reviews");
 
     private static final AntPathMatcher MATCHER = new AntPathMatcher();
 

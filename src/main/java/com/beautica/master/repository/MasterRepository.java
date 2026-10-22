@@ -591,6 +591,21 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
             """)
     Optional<Master> findByBookingSlugWithUser(@Param("slug") String slug);
 
+    /**
+     * Phase 383 — the id of the ACTIVE master (in an active salon, or none) behind a public booking slug: the
+     * exact visibility rule of {@link #findByBookingSlugWithUser}, as ONE scalar statement. Backs
+     * {@code GET /book/{slug}/reviews}, which needs the id only and must not hydrate the user/salon graph on
+     * every (uncached) request.
+     */
+    @Query("""
+            SELECT m.id FROM Master m
+            LEFT JOIN m.salon s
+            WHERE m.bookingSlug = :slug
+              AND m.isActive = true
+              AND (s IS NULL OR s.isActive = true)
+            """)
+    Optional<UUID> findActiveIdByBookingSlug(@Param("slug") String slug);
+
     // ── phase 295 — salon-deletion staff HARD-DELETE cascade ────────────────────────────────────
 
     /**

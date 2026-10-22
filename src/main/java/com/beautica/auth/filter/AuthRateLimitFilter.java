@@ -197,6 +197,9 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // GET /api/v1/book/s/{slug}/info (salon page) — the same prefix + a distinct suffix. Their own
     // bucket (guestInfoBuckets), see GUEST_INFO_CAPACITY.
     private static final String GUEST_INFO_PATH_SUFFIX = "/info";
+    // Phase 383/384: GET /book/{slug}/reviews and /book/s/{slug}/reviews share the page-info bucket — one
+    // per-IP (worker-key aware) budget for everything an SSR page render of a booking page reads.
+    private static final String GUEST_REVIEWS_PATH_SUFFIX = "/reviews";
     // Guest cancel-by-link POST carries the {token} variable as a single path segment, so it
     // is matched by prefix only: /api/v1/book/cancel/{token}. The prefix /api/v1/book/cancel/
     // does not collide with the guest-booking POST (which ends in /booking) nor with the OTP
@@ -1210,7 +1213,7 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         // per IP on a dedicated bucket (see GUEST_INFO_CAPACITY for why not catalogueBrowseBuckets).
         if (isGetOrHead(method)
                 && path.startsWith(GUEST_BOOKING_PATH_PREFIX)
-                && path.endsWith(GUEST_INFO_PATH_SUFFIX)) {
+                && (path.endsWith(GUEST_INFO_PATH_SUFFIX) || path.endsWith(GUEST_REVIEWS_PATH_SUFFIX))) {
             applyRateLimit(request, response, filterChain, guestInfoBuckets, RETRY_AFTER_SECONDS, 1L,
                     resolveGuestInfoBucketKey(request));
             return;
