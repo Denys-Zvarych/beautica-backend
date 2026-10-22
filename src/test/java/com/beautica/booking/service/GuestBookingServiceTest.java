@@ -109,6 +109,23 @@ class GuestBookingServiceTest {
     }
 
     @Test
+    @DisplayName("should stamp the single booking with the injected clock's instant and the request's policy version (phase 381)")
+    void should_persistConsentFromClockAndRequest_when_singleServiceBooked() {
+        OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
+        stubHappyPath(startsAt);
+        when(bookingRepository.saveAll(any())).thenAnswer(inv -> inv.getArgument(0));
+
+        service.createGuestBooking("Bearer guest.jwt.token", SLUG,
+                new GuestBookingRequest(serviceId, null, startsAt, "Олена", "Коваль", true, "2026-10-20.2"));
+
+        ArgumentCaptor<List<Booking>> savedCaptor = ArgumentCaptor.forClass(List.class);
+        verify(bookingRepository).saveAll(savedCaptor.capture());
+        Booking saved = savedCaptor.getValue().get(0);
+        assertThat(saved.getGuestPrivacyAcceptedAt()).isEqualTo(java.time.Instant.parse("2026-06-01T10:00:00Z"));
+        assertThat(saved.getGuestPrivacyPolicyVersion()).isEqualTo("2026-10-20.2");
+    }
+
+    @Test
     @DisplayName("should persist a CONFIRMED LINK booking, send Ukrainian SMS with cancelUrl, and notify master")
     void should_createConfirmedGuestBooking_when_slotIsFree() {
         OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
@@ -117,7 +134,7 @@ class GuestBookingServiceTest {
 
         GuestBookingResponse response = service.createGuestBooking(
                 "Bearer guest.jwt.token", SLUG,
-                new GuestBookingRequest(serviceId, startsAt, "Олена", "Коваль"));
+                new GuestBookingRequest(serviceId, null, startsAt, "Олена", "Коваль", true, "2026-10-20"));
 
         // Phase 22.12: BookingSlotLockGuard#saveOrConflict(repo, Booking) now delegates to the
         // list overload (saveAll + flush) so the constraint-violation → 409 mapping cannot drift
@@ -170,7 +187,7 @@ class GuestBookingServiceTest {
         when(bookingRepository.saveAll(any())).thenAnswer(inv -> inv.getArgument(0));
 
         service.createGuestBooking("Bearer guest.jwt.token", SLUG,
-                new GuestBookingRequest(serviceId, startsAt, "Олена", "Коваль"));
+                new GuestBookingRequest(serviceId, null, startsAt, "Олена", "Коваль", true, "2026-10-20"));
 
         InOrder inOrder = org.mockito.Mockito.inOrder(slotCalculationService, smsService);
         inOrder.verify(slotCalculationService).evictMasterAvailabilityCaches(masterId);
@@ -194,7 +211,7 @@ class GuestBookingServiceTest {
         stubSlotAvailable(startsAt);
 
         assertThatThrownBy(() -> service.createGuestBooking(
-                "Bearer t", SLUG, new GuestBookingRequest(serviceId, startsAt, "Олена", "Коваль")))
+                "Bearer t", SLUG, new GuestBookingRequest(serviceId, null, startsAt, "Олена", "Коваль", true, "2026-10-20")))
                 .isInstanceOf(BusinessException.class)
                 .extracting("status").isEqualTo(org.springframework.http.HttpStatus.CONFLICT);
 
@@ -217,7 +234,7 @@ class GuestBookingServiceTest {
                 .thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> service.createGuestBooking(
-                "Bearer t", SLUG, new GuestBookingRequest(serviceId, startsAt, "Олена", "Коваль")))
+                "Bearer t", SLUG, new GuestBookingRequest(serviceId, null, startsAt, "Олена", "Коваль", true, "2026-10-20")))
                 .isInstanceOf(NotFoundException.class);
 
         // Neither the fused (with-timeout) nor the plain master-lock query ran — persistBooking
@@ -256,7 +273,7 @@ class GuestBookingServiceTest {
                 .thenReturn(Optional.of(masterService()));
 
         assertThatThrownBy(() -> service.createGuestBooking(
-                "Bearer t", SLUG, new GuestBookingRequest(serviceId, tooSoon, "Олена", "Коваль")))
+                "Bearer t", SLUG, new GuestBookingRequest(serviceId, null, tooSoon, "Олена", "Коваль", true, "2026-10-20")))
                 .as("guest startsAt below the 15-min lead time must be a 400 (parity with "
                         + "BookingService.validateStartsAt)")
                 .isInstanceOf(BusinessException.class)
@@ -280,7 +297,7 @@ class GuestBookingServiceTest {
                 .thenReturn(Optional.of(masterService()));
 
         assertThatThrownBy(() -> service.createGuestBooking(
-                "Bearer t", SLUG, new GuestBookingRequest(serviceId, tooFar, "Олена", "Коваль")))
+                "Bearer t", SLUG, new GuestBookingRequest(serviceId, null, tooFar, "Олена", "Коваль", true, "2026-10-20")))
                 .as("guest startsAt beyond the availability window must be a 400 (parity with "
                         + "BookingService.validateStartsAt / availabilityMaxDays)")
                 .isInstanceOf(BusinessException.class)
@@ -298,7 +315,7 @@ class GuestBookingServiceTest {
 
         assertThatThrownBy(() -> service.createGuestBooking(
                 "Bearer expired", SLUG,
-                new GuestBookingRequest(serviceId, OffsetDateTime.parse("2026-06-10T12:00:00+03:00"), "A", "B")))
+                new GuestBookingRequest(serviceId, null, OffsetDateTime.parse("2026-06-10T12:00:00+03:00"), "A", "B", true, "2026-10-20")))
                 .isInstanceOf(JwtException.class);
 
         verifyNoInteractions(masterRepository, masterServiceRepository, bookingRepository);
@@ -309,7 +326,7 @@ class GuestBookingServiceTest {
     void should_throwJwt_when_noAuthHeader() {
         assertThatThrownBy(() -> service.createGuestBooking(
                 null, SLUG,
-                new GuestBookingRequest(serviceId, OffsetDateTime.parse("2026-06-10T12:00:00+03:00"), "A", "B")))
+                new GuestBookingRequest(serviceId, null, OffsetDateTime.parse("2026-06-10T12:00:00+03:00"), "A", "B", true, "2026-10-20")))
                 .isInstanceOf(JwtException.class);
 
         verifyNoInteractions(guestTokenProvider, masterRepository, bookingRepository);
@@ -344,8 +361,7 @@ class GuestBookingServiceTest {
 
         GuestBookingResponse response = service.createGuestBooking(
                 "Bearer guest.jwt.token", SLUG,
-                new GuestBookingRequest(null, List.of(serviceId, secondServiceId, thirdServiceId),
-                        startsAt, "Олена", "Коваль"));
+                new GuestBookingRequest(null, List.of(serviceId, secondServiceId, thirdServiceId), startsAt, "Олена", "Коваль", true, "2026-10-20"));
 
         ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
         verify(smsService).send(eq(GUEST_PHONE), textCaptor.capture());
@@ -358,6 +374,38 @@ class GuestBookingServiceTest {
         // Exactly ONE SMS and ONE outbox row for the whole visit — cardinality is unchanged.
         verify(smsService).send(anyString(), anyString());
         verify(outboxService).enqueueNewBooking(any());
+    }
+
+    @Test
+    @DisplayName("should stamp the visit header and every child with ONE identical consent (phase 381)")
+    void should_persistIdenticalConsentOnHeaderAndChildren_when_visitBooked() {
+        OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
+        UUID secondServiceId = UUID.randomUUID();
+        when(guestTokenProvider.validate(anyString())).thenReturn(GUEST_PHONE);
+        when(masterRepository.findByBookingSlugWithUser(SLUG)).thenReturn(Optional.of(master()));
+        when(masterServiceRepository.findByMasterIdAndIdInWithGraph(masterId, Set.of(serviceId, secondServiceId)))
+                .thenReturn(List.of(masterService(), masterService(secondServiceId, "Педикюр")));
+        when(bookingRepository.acquireAdvisoryLockWithTimeout(masterId)).thenReturn(1);
+        when(bookingRepository.findPostLockBookabilityAndOverlap(eq(masterId), any(), any()))
+                .thenReturn(Optional.of(new TestPostLockSlotCheck(true, false)));
+        when(bookingRepository.saveAll(any())).thenAnswer(inv -> inv.getArgument(0));
+        stubVisitSlotAvailable(startsAt, List.of(serviceId, secondServiceId));
+
+        service.createGuestBooking("Bearer guest.jwt.token", SLUG,
+                new GuestBookingRequest(null, List.of(serviceId, secondServiceId), startsAt, "Олена", "Коваль",
+                        true, "2026-10-20"));
+
+        ArgumentCaptor<List<Booking>> savedCaptor = ArgumentCaptor.forClass(List.class);
+        verify(bookingRepository).saveAll(savedCaptor.capture());
+        List<Booking> children = savedCaptor.getValue();
+        java.time.Instant expected = java.time.Instant.parse("2026-06-01T10:00:00Z");
+        assertThat(children).hasSize(2).allSatisfy(child -> {
+            assertThat(child.getGuestPrivacyAcceptedAt()).isEqualTo(expected);
+            assertThat(child.getGuestPrivacyPolicyVersion()).isEqualTo("2026-10-20");
+        });
+        var header = children.get(0).getAppointment();
+        assertThat(header.getGuestPrivacyAcceptedAt()).isEqualTo(expected);
+        assertThat(header.getGuestPrivacyPolicyVersion()).isEqualTo("2026-10-20");
     }
 
     @Test
@@ -379,7 +427,7 @@ class GuestBookingServiceTest {
 
         GuestBookingResponse response = service.createGuestBooking(
                 "Bearer guest.jwt.token", SLUG,
-                new GuestBookingRequest(null, List.of(serviceId), startsAt, "Олена", "Коваль"));
+                new GuestBookingRequest(null, List.of(serviceId), startsAt, "Олена", "Коваль", true, "2026-10-20"));
 
         ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
         verify(smsService).send(eq(GUEST_PHONE), textCaptor.capture());
@@ -458,7 +506,7 @@ class GuestBookingServiceTest {
 
         GuestBookingResponse response = service.createGuestBooking(
                 "Bearer guest.jwt.token", SLUG,
-                new GuestBookingRequest(serviceId, startsAt, "Олена", "Коваль"));
+                new GuestBookingRequest(serviceId, null, startsAt, "Олена", "Коваль", true, "2026-10-20"));
 
         ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
         verify(smsService).send(eq(GUEST_PHONE), textCaptor.capture());

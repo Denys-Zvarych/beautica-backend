@@ -110,7 +110,7 @@ class GuestBookingLifecycleContractIT extends AbstractIntegrationTest {
                 .plusDays(3).withHour(15).withMinute(0).withSecond(0).withNano(0);
         String guestToken = guestTokenProvider.generate("+380509998877");
         String createBody = """
-                {"serviceId":"%s","startsAt":"%s","name":"Оксана","surname":"Мельник"}
+                {"serviceId":"%s","startsAt":"%s","name":"Оксана","surname":"Мельник","privacyAccepted":true,"privacyPolicyVersion":"2026-10-20"}
                 """.formatted(masterServiceId, startsAt.toOffsetDateTime());
 
         ResponseEntity<String> createResp = restTemplate.exchange(

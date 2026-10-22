@@ -1,5 +1,6 @@
 package com.beautica.booking.entity;
 
+import com.beautica.booking.domain.GuestConsent;
 import com.beautica.booking.enums.BookingSource;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.enums.CancellationReason;
@@ -210,6 +211,16 @@ public class Appointment extends AuditableEntity {
     @Column(name = "guest_pii_anonymised_at", insertable = false, updatable = false)
     private Instant guestPiiAnonymisedAt;
 
+    // Mirror of Booking.guestPrivacyAcceptedAt / guestPrivacyPolicyVersion (V202, phase 381): the header
+    // and every child booking of a guest visit carry identical values. Not PII — kept by anonymisation.
+    @Nullable
+    @Column(name = "guest_privacy_accepted_at", updatable = false)
+    private Instant guestPrivacyAcceptedAt;
+
+    @Nullable
+    @Column(name = "guest_privacy_policy_version", length = 32, updatable = false)
+    private String guestPrivacyPolicyVersion;
+
     /**
      * Header twin of {@link Booking#detachClient(String, Instant)} — see that method's javadoc
      * for the full rationale (one state change, {@code guestPhone} left untouched).
@@ -241,13 +252,16 @@ public class Appointment extends AuditableEntity {
      * @param guestSurname guest surname (optional — column is nullable)
      * @param guestPhone   E.164 phone copied from the guest JWT {@code sub} (required)
      * @param cancelToken  the visit-level one-time cancel token (required)
+     * @param consent      the guest's privacy consent (phase 381), identical to its child bookings';
+     *                     {@code null} only for fixtures that model a pre-V202 visit
      */
     public static Appointment guestAppointment(
             Salon salon,
             String guestName,
             String guestSurname,
             String guestPhone,
-            UUID cancelToken) {
+            UUID cancelToken,
+            GuestConsent consent) {
         if (guestName == null || guestName.isBlank()) {
             throw new IllegalArgumentException("guestName must not be blank for a LINK appointment");
         }
@@ -266,6 +280,8 @@ public class Appointment extends AuditableEntity {
                 .guestSurname(guestSurname)
                 .guestPhone(guestPhone)
                 .cancelToken(cancelToken)
+                .guestPrivacyAcceptedAt(consent == null ? null : consent.acceptedAt())
+                .guestPrivacyPolicyVersion(consent == null ? null : consent.policyVersion())
                 .build();
     }
 

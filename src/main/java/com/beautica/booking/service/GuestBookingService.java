@@ -2,6 +2,7 @@ package com.beautica.booking.service;
 
 import com.beautica.booking.dto.AvailableSlotResponse;
 import com.beautica.booking.dto.BookingPriceRange;
+import com.beautica.booking.domain.GuestConsent;
 import com.beautica.booking.dto.GuestBookingRequest;
 import com.beautica.booking.dto.GuestBookingResponse;
 import com.beautica.booking.entity.Appointment;
@@ -285,15 +286,17 @@ public class GuestBookingService {
                 bookingRepository, master.getId(), firstStart, lastEnd);
 
         UUID cancelToken = UUID.randomUUID();
+        // ONE consent instance for the header and every child: identical values by construction.
+        GuestConsent consent = consentOf(req);
         Appointment appointment = Appointment.guestAppointment(
-                master.getSalon(), req.name(), req.surname(), guestPhone, cancelToken);
+                master.getSalon(), req.name(), req.surname(), guestPhone, cancelToken, consent);
 
         List<Booking> children = new ArrayList<>(items.size());
         for (VisitPlanner.PlannedItem item : items) {
             Booking child = Booking.guestBooking(
                     master, item.masterService(), master.getSalon(),
                     item.startsAt(), item.endsAt(), item.price(), item.priceMax(),
-                    item.duration(), item.buffer(), req.name(), req.surname(), guestPhone);
+                    item.duration(), item.buffer(), req.name(), req.surname(), guestPhone, consent);
             child.setAppointment(appointment);
             children.add(child);
         }
@@ -372,8 +375,17 @@ public class GuestBookingService {
         Booking booking = Booking.guestBooking(
                 master, msa, master.getSalon(), startsAt, endsAt,
                 price, BookingPriceRange.resolveCeiling(msa),
-                duration, buffer, req.name(), req.surname(), guestPhone);
+                duration, buffer, req.name(), req.surname(), guestPhone, consentOf(req));
         return BookingSlotLockGuard.saveOrConflict(bookingRepository, booking);
+    }
+
+    /**
+     * Phase 381 — the guest's privacy consent for the row(s) being created: the policy version the
+     * boundary validated ({@code @AssertTrue privacyAccepted} + format-checked version) stamped with the
+     * SERVER clock, never a client-supplied time. The values are persisted only — never logged.
+     */
+    private GuestConsent consentOf(GuestBookingRequest req) {
+        return new GuestConsent(kyivClock.instant(), req.privacyPolicyVersion());
     }
 
     private void registerAfterCommit(Master master, MasterServiceAssignment msa,

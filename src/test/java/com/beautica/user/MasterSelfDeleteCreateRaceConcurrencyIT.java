@@ -839,7 +839,8 @@ class MasterSelfDeleteCreateRaceConcurrencyIT extends AbstractIntegrationTest {
                     "serviceId", masterServiceId.toString(),
                     "startsAt", startsAt.toOffsetDateTime().toString(),
                     "name", "Олена",
-                    "surname", "Коваль"));
+                    "surname", "Коваль",
+                    "privacyAccepted", true, "privacyPolicyVersion", "2026-10-20"));
             HttpHeaders headers = new HttpHeaders();
             headers.setBearerAuth(guestToken);
             headers.setContentType(MediaType.APPLICATION_JSON);

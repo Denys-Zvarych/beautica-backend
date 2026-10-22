@@ -8,6 +8,8 @@ import com.beautica.config.WebMvcTestSupport;
 import jakarta.servlet.http.HttpServletResponse;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
 import org.springframework.boot.test.context.TestConfiguration;
@@ -77,7 +79,7 @@ class PhoneOtpControllerTest {
     void should_return200_when_sendValidPhone() throws Exception {
         mockMvc.perform(post("/api/v1/book/otp/send")
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"phone\":\"" + VALID_PHONE + "\"}"))
+                        .content("{\"phone\":\"" + VALID_PHONE + "\",\"privacyAccepted\":true,\"privacyPolicyVersion\":\"2026-10-20\"}"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.success").value(true));
     }
@@ -88,6 +90,24 @@ class PhoneOtpControllerTest {
         mockMvc.perform(post("/api/v1/book/otp/send")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"phone\":\"12345\"}"))
+                .andExpect(status().isBadRequest());
+
+        verifyNoInteractions(phoneOtpService);
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @ValueSource(strings = {
+            "{\"phone\":\"+380671234567\"}",
+            "{\"phone\":\"+380671234567\",\"privacyAccepted\":false,\"privacyPolicyVersion\":\"2026-10-20\"}",
+            "{\"phone\":\"+380671234567\",\"privacyAccepted\":true}",
+            "{\"phone\":\"+380671234567\",\"privacyAccepted\":true,\"privacyPolicyVersion\":\"v1\"}",
+            "{\"phone\":\"+380671234567\",\"privacyAccepted\":true,\"privacyPolicyVersion\":\"2026-10-20; DROP\"}"
+    })
+    @DisplayName("POST /book/otp/send — 400 and no SMS when consent is missing, false or the version is malformed (Phase 381)")
+    void should_return400AndNotSend_when_consentMissingOrInvalid(String body) throws Exception {
+        mockMvc.perform(post("/api/v1/book/otp/send")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
                 .andExpect(status().isBadRequest());
 
         verifyNoInteractions(phoneOtpService);

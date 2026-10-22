@@ -205,7 +205,7 @@ class PublicBookingControllerTest {
     void should_return201_when_guestBookingCreated() throws Exception {
         UUID svc = UUID.randomUUID();
         UUID bookingId = UUID.randomUUID();
-        var req = new GuestBookingRequest(svc, OffsetDateTime.parse("2099-06-10T12:00:00+03:00"), "Олена", "Коваль");
+        var req = new GuestBookingRequest(svc, null, OffsetDateTime.parse("2099-06-10T12:00:00+03:00"), "Олена", "Коваль", true, "2026-10-20");
         var resp = new GuestBookingResponse(bookingId, req.startsAt(), "Марія Левченко", "Манікюр", 60,
                 "https://app.beautica.test/book/cancel/" + UUID.randomUUID());
         when(guestBookingService.createGuestBooking(eq("Bearer guest.token"), eq("marija-l-cd34"), any()))
@@ -225,7 +225,7 @@ class PublicBookingControllerTest {
     @DisplayName("POST /book/{slug}/booking — 401 when guest token is expired/invalid")
     void should_return401_when_tokenInvalid() throws Exception {
         UUID svc = UUID.randomUUID();
-        var req = new GuestBookingRequest(svc, OffsetDateTime.parse("2099-06-10T12:00:00+03:00"), "A", "B");
+        var req = new GuestBookingRequest(svc, null, OffsetDateTime.parse("2099-06-10T12:00:00+03:00"), "A", "B", true, "2026-10-20");
         when(guestBookingService.createGuestBooking(anyString(), anyString(), any()))
                 .thenThrow(new io.jsonwebtoken.ExpiredJwtException(null, null, "expired"));
 
@@ -241,7 +241,7 @@ class PublicBookingControllerTest {
     void should_return400_when_nameBlank() throws Exception {
         UUID svc = UUID.randomUUID();
         String body = """
-                {"serviceId":"%s","startsAt":"2099-06-10T12:00:00+03:00","name":"","surname":"Коваль"}
+                {"serviceId":"%s","startsAt":"2099-06-10T12:00:00+03:00","name":"","surname":"Коваль","privacyAccepted":true,"privacyPolicyVersion":"2026-10-20"}
                 """.formatted(svc);
 
         mockMvc.perform(post("/api/v1/book/marija-l-cd34/booking")

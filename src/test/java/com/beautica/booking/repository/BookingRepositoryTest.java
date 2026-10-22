@@ -862,7 +862,7 @@ class BookingRepositoryTest extends AbstractDataJpaTest {
         // Due, not yet reminded → MUST be returned.
         Booking due = Booking.guestBooking(
                 master, masterService, null, dueStart, dueEnd,
-                new BigDecimal("450.00"), null, 60, 0, "Олена", "Коваль", "+380501234567");
+                new BigDecimal("450.00"), null, 60, 0, "Олена", "Коваль", "+380501234567", null);
         em.persist(due);
 
         // Later same-day slot, already reminded → MUST be excluded by the query.
@@ -870,7 +870,7 @@ class BookingRepositoryTest extends AbstractDataJpaTest {
                 master, masterService, null,
                 OffsetDateTime.of(2026, 6, 2, 14, 0, 0, 0, ZoneOffset.UTC),
                 OffsetDateTime.of(2026, 6, 2, 15, 0, 0, 0, ZoneOffset.UTC),
-                new BigDecimal("450.00"), null, 60, 0, "Ірина", "Левко", "+380507654321");
+                new BigDecimal("450.00"), null, 60, 0, "Ірина", "Левко", "+380507654321", null);
         alreadyReminded.setReminderSent(true);
         em.persist(alreadyReminded);
         em.flush();

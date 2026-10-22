@@ -94,7 +94,7 @@ class StagingProfileContextIT extends AbstractStagingProfileIT {
         headers.setContentType(MediaType.APPLICATION_JSON);
 
         ResponseEntity<String> response = restTemplate.postForEntity("/api/v1/book/otp/send",
-                new HttpEntity<>("{\"phone\":\"+380671234567\"}", headers), String.class);
+                new HttpEntity<>("{\"phone\":\"+380671234567\",\"privacyAccepted\":true,\"privacyPolicyVersion\":\"2026-10-20\"}", headers), String.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
         ArgumentCaptor<MimeMessage> sent = ArgumentCaptor.forClass(MimeMessage.class);
@@ -116,7 +116,7 @@ class StagingProfileContextIT extends AbstractStagingProfileIT {
         headers.setContentType(MediaType.APPLICATION_JSON);
 
         ResponseEntity<String> response = restTemplate.postForEntity("/api/v1/book/otp/send",
-                new HttpEntity<>("{\"phone\":\"+380671234568\"}", headers), String.class);
+                new HttpEntity<>("{\"phone\":\"+380671234568\",\"privacyAccepted\":true,\"privacyPolicyVersion\":\"2026-10-20\"}", headers), String.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
         assertThat(turbosmsStub().getAllServeEvents()).isEmpty();

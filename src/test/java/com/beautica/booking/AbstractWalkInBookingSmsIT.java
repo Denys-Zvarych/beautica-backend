@@ -320,7 +320,7 @@ abstract class AbstractWalkInBookingSmsIT extends AbstractStaffBookingIT {
      */
     protected ResponseEntity<String> createGuestBooking(OffsetDateTime startsAt) {
         String body = """
-                {"serviceId":"%s","startsAt":"%s","name":"%s","surname":"%s"}
+                {"serviceId":"%s","startsAt":"%s","name":"%s","surname":"%s","privacyAccepted":true,"privacyPolicyVersion":"2026-10-20"}
                 """.formatted(salon.masterServiceId(), startsAt, GUEST_NAME, GUEST_SURNAME);
         HttpHeaders headers = new HttpHeaders();
         headers.setBearerAuth(guestTokenProvider.generate(LINK_PHONE));
@@ -333,7 +333,7 @@ abstract class AbstractWalkInBookingSmsIT extends AbstractStaffBookingIT {
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
         return restTemplate.exchange("/api/v1/book/otp/send", HttpMethod.POST,
-                new HttpEntity<>("{\"phone\":\"" + phone + "\"}", headers), String.class);
+                new HttpEntity<>("{\"phone\":\"" + phone + "\",\"privacyAccepted\":true,\"privacyPolicyVersion\":\"2026-10-20\"}", headers), String.class);
     }
 
     // ── the 24h reminder sweep ────────────────────────────────────────────────────

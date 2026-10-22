@@ -1,6 +1,7 @@
 package com.beautica.booking.dto;
 
 import com.beautica.booking.service.SlotCalculationService;
+import jakarta.validation.constraints.AssertTrue;
 import jakarta.validation.constraints.Future;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
@@ -62,14 +63,30 @@ public record GuestBookingRequest(
         @NotBlank
         @Size(max = 100)
         @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "Surname must not contain control characters")
-        String surname
+        String surname,
+
+        // Phase 381 — privacy consent, required on every guest booking. Persisted (with a server
+        // timestamp) on the booking/visit rows; see GuestConsent. false or missing -> 400.
+        @NotNull(message = "Privacy policy must be accepted")
+        @AssertTrue(message = "Privacy policy must be accepted")
+        Boolean privacyAccepted,
+
+        // The policy's effective date as published on /privacy (e.g. 2026-10-20, optional .N revision).
+        // Format check only: the website owns the policy text, a new policy deploy must never break bookings.
+        @NotBlank
+        @Size(max = 32)
+        @Pattern(regexp = "^\\d{4}-\\d{2}-\\d{2}(\\.\\d{1,3})?$",
+                message = "Privacy policy version must look like 2026-10-20")
+        String privacyPolicyVersion
 ) {
 
     /**
      * Legacy 4-arg factory for a single-service guest booking ({@code serviceId} only, no
-     * {@code masterServiceIds}) — preserves the pre-BE-7 call-site and JSON shape.
+     * {@code masterServiceIds}) — preserves the pre-BE-7 call-site. Since phase 381 it carries NO consent
+     * ({@code null}/{@code null}), so a request built this way fails {@code @Valid} over HTTP exactly as a
+     * client that omits the fields would.
      */
     public GuestBookingRequest(UUID serviceId, OffsetDateTime startsAt, String name, String surname) {
-        this(serviceId, null, startsAt, name, surname);
+        this(serviceId, null, startsAt, name, surname, null, null);
     }
 }

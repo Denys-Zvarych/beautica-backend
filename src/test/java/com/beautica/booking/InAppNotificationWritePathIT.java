@@ -558,7 +558,8 @@ class InAppNotificationWritePathIT extends AbstractIntegrationTest {
                 "serviceId", rig.masterServiceId().toString(),
                 "startsAt", tomorrowAtNoon().toOffsetDateTime().toString(),
                 "name", "Оксана",
-                "surname", "Гончар"));
+                "surname", "Гончар",
+                "privacyAccepted", true, "privacyPolicyVersion", "2026-10-20"));
 
         ResponseEntity<String> resp = restTemplate.exchange(
                 "/api/v1/book/" + slug + "/booking", HttpMethod.POST,
@@ -599,7 +600,8 @@ class InAppNotificationWritePathIT extends AbstractIntegrationTest {
                 "serviceId", guestMasterServiceId.toString(),
                 "startsAt", tomorrowAtNoon().toOffsetDateTime().toString(),
                 "name", "Ірина",
-                "surname", "Бондар"));
+                "surname", "Бондар",
+                "privacyAccepted", true, "privacyPolicyVersion", "2026-10-20"));
         ResponseEntity<String> guestResp = restTemplate.exchange(
                 "/api/v1/book/" + guestSlug + "/booking", HttpMethod.POST,
                 new HttpEntity<>(guestBody, headers(guestToken)), String.class);

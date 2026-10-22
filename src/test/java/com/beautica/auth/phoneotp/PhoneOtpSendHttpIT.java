@@ -69,7 +69,7 @@ class PhoneOtpSendHttpIT extends AbstractIntegrationTest {
     }
 
     private ResponseEntity<String> send(String phone) {
-        return restTemplate.postForEntity("/api/v1/book/otp/send", json("{\"phone\":\"" + phone + "\"}"), String.class);
+        return restTemplate.postForEntity("/api/v1/book/otp/send", json("{\"phone\":\"" + phone + "\",\"privacyAccepted\":true,\"privacyPolicyVersion\":\"2026-10-20\"}"), String.class);
     }
 
     private ResponseEntity<String> verify(String phone, String code) {

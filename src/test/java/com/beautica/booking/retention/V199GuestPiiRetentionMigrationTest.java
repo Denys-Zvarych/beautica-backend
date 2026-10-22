@@ -120,11 +120,16 @@ class V199GuestPiiRetentionMigrationTest {
         BOOKINGS.forEach((shape, id) -> {
             Map<String, Object> after = new HashMap<>(jdbc.queryForMap("SELECT * FROM bookings WHERE id = ?", id));
             assertThat(after.remove("guest_pii_anonymised_at")).as("marker of %s", shape).isNull();
+            // V202 (phase 381) adds the NULL consent pair to the head schema this test migrates to.
+            assertThat(after.remove("guest_privacy_accepted_at")).as("consent of %s", shape).isNull();
+            assertThat(after.remove("guest_privacy_policy_version")).as("consent version of %s", shape).isNull();
             assertThat(after).as("booking shape: %s", shape).isEqualTo(BOOKINGS_BEFORE.get(id));
         });
         VISITS.forEach((shape, id) -> {
             Map<String, Object> after = new HashMap<>(jdbc.queryForMap("SELECT * FROM appointments WHERE id = ?", id));
             assertThat(after.remove("guest_pii_anonymised_at")).as("marker of %s", shape).isNull();
+            assertThat(after.remove("guest_privacy_accepted_at")).as("consent of %s", shape).isNull();
+            assertThat(after.remove("guest_privacy_policy_version")).as("consent version of %s", shape).isNull();
             assertThat(after).as("visit shape: %s", shape).isEqualTo(VISITS_BEFORE.get(id));
         });
     }

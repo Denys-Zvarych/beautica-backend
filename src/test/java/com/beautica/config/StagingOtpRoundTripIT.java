@@ -73,7 +73,7 @@ class StagingOtpRoundTripIT extends AbstractStagingProfileIT {
     @DisplayName("code read from the capture mail verifies via /book/otp/verify and returns a guest token")
     void should_issueGuestToken_when_capturedOtpIsSubmitted() throws Exception {
         String phone = randomPhone();
-        assertThat(post("/api/v1/book/otp/send", "{\"phone\":\"" + phone + "\"}").getStatusCode())
+        assertThat(post("/api/v1/book/otp/send", "{\"phone\":\"" + phone + "\",\"privacyAccepted\":true,\"privacyPolicyVersion\":\"2026-10-20\"}").getStatusCode())
                 .isEqualTo(HttpStatus.OK);
         MimeMessage mail = sentMessage();
         Matcher code = CODE.matcher(mail.getContent().toString());
@@ -91,7 +91,7 @@ class StagingOtpRoundTripIT extends AbstractStagingProfileIT {
     @DisplayName("a wrong (well-formed) code is rejected with 401 — no staging bypass code exists")
     void should_return401_when_wrongCodeSubmittedToStaging() throws Exception {
         String phone = randomPhone();
-        post("/api/v1/book/otp/send", "{\"phone\":\"" + phone + "\"}");
+        post("/api/v1/book/otp/send", "{\"phone\":\"" + phone + "\",\"privacyAccepted\":true,\"privacyPolicyVersion\":\"2026-10-20\"}");
         String real = CODE.matcher(sentMessage().getContent().toString()).results().findFirst().orElseThrow().group(1);
         String wrong = real.equals("123456") ? "654321" : "123456";
 

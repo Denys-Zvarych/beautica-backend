@@ -50,11 +50,11 @@ class GuestBookingRequestControlCharValidationTest {
     }
 
     private static GuestBookingRequest withName(String name) {
-        return new GuestBookingRequest(UUID.randomUUID(), FUTURE, name, "Коваль");
+        return new GuestBookingRequest(UUID.randomUUID(), null, FUTURE, name, "Коваль", true, "2026-10-20");
     }
 
     private static GuestBookingRequest withSurname(String surname) {
-        return new GuestBookingRequest(UUID.randomUUID(), FUTURE, "Олена", surname);
+        return new GuestBookingRequest(UUID.randomUUID(), null, FUTURE, "Олена", surname, true, "2026-10-20");
     }
 
     private static boolean hasFieldViolation(Set<ConstraintViolation<GuestBookingRequest>> violations,
@@ -68,7 +68,7 @@ class GuestBookingRequestControlCharValidationTest {
     @Test
     @DisplayName("accepts a clean Cyrillic name with hyphen and apostrophe")
     void should_accept_when_nameIsCleanCyrillic() {
-        var req = new GuestBookingRequest(UUID.randomUUID(), FUTURE, "Марія-Анна", "О'Коваль");
+        var req = new GuestBookingRequest(UUID.randomUUID(), null, FUTURE, "Марія-Анна", "О'Коваль", true, "2026-10-20");
 
         assertThat(validator.validate(req))
                 .as("a clean Cyrillic name with hyphen/apostrophe must be accepted")
@@ -152,8 +152,10 @@ class GuestBookingRequestControlCharValidationTest {
 
         assertThat(componentNames)
                 .as("phone must NOT be a request-body field; it comes from the guest JWT sub claim")
-                // masterServiceIds added in BE-7 (multi-service guest visit); phone still absent.
-                .containsExactlyInAnyOrder("serviceId", "masterServiceIds", "startsAt", "name", "surname")
+                // masterServiceIds added in BE-7 (multi-service guest visit); privacy consent in phase 381;
+                // phone still absent.
+                .containsExactlyInAnyOrder("serviceId", "masterServiceIds", "startsAt", "name", "surname",
+                        "privacyAccepted", "privacyPolicyVersion")
                 .noneMatch(n -> n.toLowerCase().contains("phone")
                         || n.toLowerCase().contains("msisdn")
                         || n.toLowerCase().equals("tel"));

@@ -1141,7 +1141,7 @@ class InAppNotificationRepositoryIT extends AbstractDataJpaTest {
                 booking.getMaster(), booking.getMasterService(), booking.getSalon(),
                 guestStart, guestStart.plusHours(1),
                 new BigDecimal("450.00"), null, 60, 0,
-                "Оксана", "Гончар", "+380501234567");
+                "Оксана", "Гончар", "+380501234567", null);
         em.persist(guestBooking);
 
         OffsetDateTime walkInStart = OffsetDateTime.of(2026, 6, 3, 11, 0, 0, 0, ZoneOffset.UTC);

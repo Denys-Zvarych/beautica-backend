@@ -82,7 +82,7 @@ class GuestBookingNewBookingDrainIT extends AbstractIntegrationTest {
                 .plusDays(3).withHour(14).withMinute(0).withSecond(0).withNano(0);
         String token = guestTokenProvider.generate("+380501112233");
         String body = """
-                {"serviceId":"%s","startsAt":"%s","name":"Олена","surname":"Коваль"}
+                {"serviceId":"%s","startsAt":"%s","name":"Олена","surname":"Коваль","privacyAccepted":true,"privacyPolicyVersion":"2026-10-20"}
                 """.formatted(masterServiceId, startsAt.toOffsetDateTime());
 
         ResponseEntity<String> createResp = restTemplate.exchange(
