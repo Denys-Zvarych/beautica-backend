@@ -1,6 +1,12 @@
 # Deploy-environment identity (Phase 368) — EnvironmentFingerprintGuard skips `local`.
 beautica:
   environment: local
+  sms:
+    # Local only: every SMS (guest-booking phone OTP included) is mailed to Mailpit
+    # (http://localhost:8025, subject «[SMS] Beautica: NNNNNN — ...») instead of the provider, so no
+    # env var is needed. Prod/staging/test keep their own value; the fingerprint guard still rejects
+    # capture in prod. The OTP sender is ungated, so app.booking.sms.enabled below can stay false.
+    mode: capture
 
 # Phase 371: local never reports to Sentry, even with SENTRY_DSN exported. Forcing SENTRY_ENABLED=true with a
 # non-loopback DSN fails boot (EnvironmentFingerprintGuard, rule sentry-local).
@@ -100,8 +106,8 @@ app:
   booking:
     sms:
       # Phase 22.7 — restated here, not inherited, so a developer reading only the local profile
-      # can see that no SMS leaves this machine: SmsConfig wires NoOpSmsService and every send is
-      # logged instead of billed. Hardcoded false with NO env placeholder — unlike the base
+      # can see that no SMS leaves this machine: SmsConfig wires NoOpSmsService and every booking SMS is
+      # logged instead of billed (the OTP goes to Mailpit via beautica.sms.mode=capture above). Hardcoded false with NO env placeholder — unlike the base
       # profile, local must not be flippable by a stray shell export.
       enabled: false
   booking-links:
