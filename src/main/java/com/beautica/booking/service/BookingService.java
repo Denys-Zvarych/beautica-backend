@@ -238,7 +238,12 @@ public class BookingService {
         // is decided explicitly by ROLE: INDEPENDENT_MASTER, SALON_OWNER, SALON_ADMIN. A SALON_MASTER never sees it
         // (even as the performing master), nor does a CLIENT; the owning-client probe is kept as a second, independent
         // guard. The wither re-checks booking.getClient() == null, so a registered user's phone has no path in.
-        return authz.isGuestPhoneAudience() && !authz.isOwningClientViewer(actorUserId, booking)
+        // Evaluated ONLY for a guest booking (client_id IS NULL, an in-memory FK read, no proxy load): the role read
+        // touches the SecurityContext, which a registered-client booking never needs (direct non-HTTP service calls
+        // carry none) and which adds no statement. The owning-client probe stays as a second, independent guard (free for a
+        // guest booking: null client short-circuits before any role read).
+        return booking.getClient() == null && authz.isGuestPhoneAudience()
+                && !authz.isOwningClientViewer(actorUserId, booking)
                 ? detail.withProviderVisibleGuestPhone(booking)
                 : detail;
     }

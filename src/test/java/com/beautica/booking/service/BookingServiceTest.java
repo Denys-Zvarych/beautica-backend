@@ -4868,12 +4868,12 @@ class BookingServiceTest {
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
         UUID providerActorId = UUID.randomUUID();
-        when(authz.isGuestPhoneAudience()).thenReturn(true);
 
         assertThat(bookingService.getBooking(providerActorId, bookingId).guestPhone()).isNull();
-
-        when(authz.isOwningClientViewer(clientId, booking)).thenReturn(true);
         assertThat(bookingService.getBooking(clientId, bookingId).guestPhone()).isNull();
+
+        // A registered-client booking never even reads the role: no SecurityContext dependency, no extra work.
+        verify(authz, never()).isGuestPhoneAudience();
     }
 
     @Test
