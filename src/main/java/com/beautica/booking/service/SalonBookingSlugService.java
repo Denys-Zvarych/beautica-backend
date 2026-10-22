@@ -68,7 +68,16 @@ public class SalonBookingSlugService {
                 salon.getReviewCount() == 0 ? null : salon.getAvgRating(),
                 salon.getReviewCount(),
                 !masters.isEmpty(),
-                masters);
+                masters,
+                salon.getRegion(),
+                // Same fallback rule as PublicSalonResponse: blank street -> the legacy address.
+                isBlank(salon.getStreet()) ? salon.getAddress() : salon.getStreet(),
+                salon.getBuildingNo(),
+                salon.getUpdatedAt());
+    }
+
+    private static boolean isBlank(String value) {
+        return value == null || value.isBlank();
     }
 
     private SalonBookingSlugMasterItem toItem(SalonBookingPageMasterRow master) {

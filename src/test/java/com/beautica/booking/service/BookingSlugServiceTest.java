@@ -1,6 +1,12 @@
 package com.beautica.booking.service;
 
 import com.beautica.booking.dto.BookingSlugInfoResponse;
+import com.beautica.booking.dto.BookingSlugSalonRef;
+import com.beautica.booking.dto.CategoryRef;
+import com.beautica.review.dto.SalonReviewSort;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageImpl;
+import org.springframework.data.domain.PageRequest;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.master.entity.Master;
@@ -33,6 +39,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyCollection;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.never;
@@ -56,6 +63,15 @@ class BookingSlugServiceTest {
 
     @Mock
     private SalonRepository salonRepository;
+
+    @Mock
+    private com.beautica.media.service.MediaService mediaService;
+
+    @Mock
+    private com.beautica.review.service.ReviewService reviewService;
+
+    @Mock
+    private com.beautica.master.service.ScheduleDateMath scheduleDateMath;
 
     @InjectMocks
     private BookingSlugService service;
@@ -467,6 +483,10 @@ class BookingSlugServiceTest {
                 .thenReturn(Optional.of(master));
         when(masterServiceRepository.findByMasterIdAndIsActiveTrueWithGraph(any(), any()))
                 .thenReturn(List.of(assignment("Манікюр", 60, new BigDecimal("350.00"))));
+        when(scheduleDateMath.today()).thenReturn(TODAY);
+        when(mediaService.getPortfolio(any(com.beautica.media.entity.EntityType.class), any(), any(PageRequest.class)))
+                .thenReturn(Page.empty());
+        when(reviewService.getReviewsForMaster(any(), any(), any(PageRequest.class))).thenReturn(Page.empty());
 
         BookingSlugInfoResponse info = service.findBySlug("marija-l-cd34");
 
@@ -474,6 +494,146 @@ class BookingSlugServiceTest {
         assertThat(info.services()).hasSize(1);
         assertThat(info.services().get(0).name()).isEqualTo("Манікюр");
         assertThat(info.services().get(0).priceFrom()).isEqualByComparingTo("350.00");
+    }
+
+    // ── findBySlug — phase 380 enrichment ───────────────────────────────────
+
+    private static final java.time.LocalDate TODAY = java.time.LocalDate.of(2026, 10, 20);
+
+    private Master enrichedMaster(UUID masterId) {
+        Master master = masterWithUser("Олена", "Коваль", "olena-k-ab12");
+        setId(master, masterId);
+        master.setMasterType(com.beautica.master.entity.MasterType.INDEPENDENT_MASTER);
+        master.setReviewCount(37);
+        master.setAvgRating(new BigDecimal("4.80"));
+        master.getUser().setProfessionalTitle("Майстер манікюру");
+        master.getUser().setCity("Львів");
+        master.getUser().setRegion("Львівська область");
+        when(masterRepository.findByBookingSlugWithUser("olena-k-ab12")).thenReturn(Optional.of(master));
+        when(masterServiceRepository.findByMasterIdAndIsActiveTrueWithGraph(any(), any()))
+                .thenReturn(List.of(assignment("Манікюр", 60, new BigDecimal("350.00"))));
+        org.mockito.Mockito.lenient().when(masterServiceRepository.findActiveCategoriesByMasterId(masterId)).thenReturn(List.of());
+        when(scheduleDateMath.today()).thenReturn(TODAY);
+        org.mockito.Mockito.lenient().when(mediaService.getPortfolio(eq(com.beautica.media.entity.EntityType.MASTER), eq(masterId), any(PageRequest.class)))
+                .thenReturn(Page.empty());
+        when(reviewService.getReviewsForMaster(eq(masterId), eq(SalonReviewSort.NEWEST), any(PageRequest.class)))
+                .thenReturn(Page.empty());
+        return master;
+    }
+
+    @Test
+    @DisplayName("should_mapEveryEnrichedField_when_slugExists")
+    void should_mapEveryEnrichedField_when_slugExists() {
+        UUID masterId = UUID.randomUUID();
+        UUID categoryId = UUID.randomUUID();
+        enrichedMaster(masterId);
+        var category = org.mockito.Mockito.mock(com.beautica.service.entity.CatalogCategory.class);
+        when(category.getId()).thenReturn(categoryId);
+        when(category.getNameUk()).thenReturn("Манікюр");
+        when(masterServiceRepository.findActiveCategoriesByMasterId(masterId)).thenReturn(List.of(category));
+        var photo = new com.beautica.media.dto.MediaFileResponse(UUID.randomUUID(),
+                com.beautica.media.entity.EntityType.MASTER, masterId,
+                com.beautica.media.entity.MediaType.PORTFOLIO, "https://media.beautica.app/p.webp", null);
+        when(mediaService.getPortfolio(eq(com.beautica.media.entity.EntityType.MASTER), eq(masterId), any(PageRequest.class)))
+                .thenReturn(new PageImpl<>(List.of(photo)));
+        when(masterRepository.isBookableById(masterId, TODAY)).thenReturn(true);
+
+        BookingSlugInfoResponse info = service.findBySlug("olena-k-ab12");
+
+        assertThat(info.masterId()).isEqualTo(masterId);
+        assertThat(info.masterType()).isEqualTo(com.beautica.master.entity.MasterType.INDEPENDENT_MASTER);
+        assertThat(info.professionalTitle()).isEqualTo("Майстер манікюру");
+        assertThat(info.city()).isEqualTo("Львів");
+        assertThat(info.region()).isEqualTo("Львівська область");
+        assertThat(info.avgRating()).isEqualByComparingTo("4.80");
+        assertThat(info.reviewCount()).isEqualTo(37);
+        assertThat(info.categories()).containsExactly(new CategoryRef(categoryId, "Манікюр"));
+        assertThat(info.portfolio()).containsExactly(photo);
+        assertThat(info.bookable()).isTrue();
+        assertThat(info.salon()).isNull();
+    }
+
+    @Test
+    @DisplayName("should_returnNullAvgRating_when_reviewCountIsZero")
+    void should_returnNullAvgRating_when_reviewCountIsZero() {
+        UUID masterId = UUID.randomUUID();
+        Master master = enrichedMaster(masterId);
+        master.setReviewCount(0);
+        master.setAvgRating(BigDecimal.ZERO);
+
+        BookingSlugInfoResponse info = service.findBySlug("olena-k-ab12");
+
+        assertThat(info.avgRating()).isNull();
+        assertThat(info.reviewCount()).isZero();
+    }
+
+    @Test
+    @DisplayName("should_returnSalonRef_when_masterBelongsToSalon")
+    void should_returnSalonRef_when_masterBelongsToSalon() {
+        UUID masterId = UUID.randomUUID();
+        Master master = enrichedMaster(masterId);
+        var salon = new com.beautica.salon.entity.Salon();
+        salon.setName("Studio Velvet");
+        org.springframework.test.util.ReflectionTestUtils.setField(salon, "bookingSlug", "studio-velvet-a1b2");
+        master.setSalon(salon);
+
+        BookingSlugInfoResponse info = service.findBySlug("olena-k-ab12");
+
+        assertThat(info.salon()).isEqualTo(new BookingSlugSalonRef("Studio Velvet", "studio-velvet-a1b2"));
+    }
+
+    @Test
+    @DisplayName("should_reportNotBookable_when_repositorySaysNotBookable")
+    void should_reportNotBookable_when_repositorySaysNotBookable() {
+        UUID masterId = UUID.randomUUID();
+        enrichedMaster(masterId);
+        when(masterRepository.isBookableById(masterId, TODAY)).thenReturn(false);
+
+        BookingSlugInfoResponse info = service.findBySlug("olena-k-ab12");
+
+        assertThat(info.bookable()).isFalse();
+    }
+
+    @Test
+    @DisplayName("should_returnEmptyListsNotNull_when_nothingToShow")
+    void should_returnEmptyListsNotNull_when_nothingToShow() {
+        UUID masterId = UUID.randomUUID();
+        enrichedMaster(masterId);
+        when(masterServiceRepository.findByMasterIdAndIsActiveTrueWithGraph(any(), any())).thenReturn(List.of());
+
+        BookingSlugInfoResponse info = service.findBySlug("olena-k-ab12");
+
+        assertThat(info.services()).isEmpty();
+        assertThat(info.categories()).isEmpty();
+        assertThat(info.portfolio()).isEmpty();
+        assertThat(info.latestReviews()).isEmpty();
+    }
+
+    @Test
+    @DisplayName("should_requestPortfolio12AndNewest5Reviews_when_slugExists")
+    void should_requestPortfolio12AndNewest5Reviews_when_slugExists() {
+        UUID masterId = UUID.randomUUID();
+        enrichedMaster(masterId);
+
+        service.findBySlug("olena-k-ab12");
+
+        verify(mediaService).getPortfolio(com.beautica.media.entity.EntityType.MASTER, masterId, PageRequest.of(0, 12));
+        verify(reviewService).getReviewsForMaster(masterId, SalonReviewSort.NEWEST, PageRequest.of(0, 5));
+    }
+
+    @Test
+    @DisplayName("should_returnLatestOfMasterAndUserUpdatedAt_when_bothPresent")
+    void should_returnLatestOfMasterAndUserUpdatedAt_when_bothPresent() {
+        UUID masterId = UUID.randomUUID();
+        Master master = enrichedMaster(masterId);
+        java.time.Instant older = java.time.Instant.parse("2026-10-01T00:00:00Z");
+        java.time.Instant newer = java.time.Instant.parse("2026-10-18T09:12:44Z");
+        org.springframework.test.util.ReflectionTestUtils.setField(master, "updatedAt", older);
+        org.springframework.test.util.ReflectionTestUtils.setField(master.getUser(), "updatedAt", newer);
+
+        BookingSlugInfoResponse info = service.findBySlug("olena-k-ab12");
+
+        assertThat(info.updatedAt()).isEqualTo(newer);
     }
 
     @Test

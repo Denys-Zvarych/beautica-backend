@@ -36,6 +36,7 @@ class MasterProfileCacheEvictorTest {
     private Cache searchBrowse;
     private Cache searchQuery;
     private SalonBookingInfoCacheEvictor salonPages;
+    private com.beautica.master.repository.MasterRepository masterRepository;
     private MasterProfileCacheEvictor evictor;
 
     @BeforeEach
@@ -48,7 +49,8 @@ class MasterProfileCacheEvictorTest {
         searchBrowse = stub(SearchCacheNames.MASTERS_BROWSE);
         searchQuery = stub(SearchCacheNames.MASTERS_QUERY);
         salonPages = mock(SalonBookingInfoCacheEvictor.class);
-        evictor = new MasterProfileCacheEvictor(cacheManager, salonPages);
+        masterRepository = mock(com.beautica.master.repository.MasterRepository.class);
+        evictor = new MasterProfileCacheEvictor(cacheManager, salonPages, masterRepository);
     }
 
     @AfterEach
@@ -137,6 +139,56 @@ class MasterProfileCacheEvictorTest {
 
         verify(slugInfo, never()).evict(any());
         verify(detail).evict(masterId);
+    }
+
+    @Test
+    @DisplayName("phase 380: evictBookingSlugInfoAfterCommit evicts only the master's slug key after commit, never clear()")
+    void should_evictOnlySlugKeyAfterCommit_when_bookingSlugInfoEvicted() {
+        when(masterRepository.findBookingSlugById(masterId)).thenReturn(java.util.Optional.of(slug));
+        TransactionSynchronizationManager.initSynchronization();
+
+        evictor.evictBookingSlugInfoAfterCommit(masterId);
+
+        verify(slugInfo, never()).evict(any());
+        TransactionSynchronizationManager.getSynchronizations()
+                .forEach(sync -> sync.afterCompletion(TransactionSynchronization.STATUS_COMMITTED));
+        verify(slugInfo).evict(slug);
+        verify(slugInfo, never()).clear();
+        verify(detail, never()).evict(any());
+    }
+
+    @Test
+    @DisplayName("phase 380: a rolled-back transaction evicts nothing")
+    void should_notEvict_when_transactionRolledBack() {
+        when(masterRepository.findBookingSlugById(masterId)).thenReturn(java.util.Optional.of(slug));
+        TransactionSynchronizationManager.initSynchronization();
+
+        evictor.evictBookingSlugInfoAfterCommit(masterId);
+        TransactionSynchronizationManager.getSynchronizations()
+                .forEach(sync -> sync.afterCompletion(TransactionSynchronization.STATUS_ROLLED_BACK));
+
+        verify(slugInfo, never()).evict(any());
+    }
+
+    @Test
+    @DisplayName("phase 380: master without a slug is a no-op")
+    void should_doNothing_when_masterHasNoSlug() {
+        when(masterRepository.findBookingSlugById(masterId)).thenReturn(java.util.Optional.empty());
+
+        evictor.evictBookingSlugInfoAfterCommit(masterId);
+
+        verify(slugInfo, never()).evict(any());
+        verify(slugInfo, never()).clear();
+    }
+
+    @Test
+    @DisplayName("phase 380: outside a transaction the slug key is evicted immediately")
+    void should_evictImmediately_when_noTransaction() {
+        when(masterRepository.findBookingSlugById(masterId)).thenReturn(java.util.Optional.of(slug));
+
+        evictor.evictBookingSlugInfoAfterCommit(masterId);
+
+        verify(slugInfo).evict(slug);
     }
 
     private Cache stub(String name) {

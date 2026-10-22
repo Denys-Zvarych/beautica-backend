@@ -1,14 +1,25 @@
 package com.beautica.booking.service;
 
 import com.beautica.booking.dto.BookingSlugInfoResponse;
+import com.beautica.booking.dto.BookingSlugSalonRef;
+import com.beautica.booking.dto.CategoryRef;
 import com.beautica.booking.dto.ServiceSummaryDto;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
+import com.beautica.master.service.ScheduleDateMath;
+import com.beautica.media.dto.MediaFileResponse;
+import com.beautica.media.entity.EntityType;
+import com.beautica.media.service.MediaService;
+import com.beautica.review.dto.ReviewResponse;
+import com.beautica.review.dto.SalonReviewSort;
+
+import com.beautica.review.service.ReviewService;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.salon.repository.SalonRepository.SalonBookingLinkRow;
 import com.beautica.service.repository.MasterServiceRepository;
+import com.beautica.salon.entity.Salon;
 import com.beautica.user.User;
 import lombok.RequiredArgsConstructor;
 import org.springframework.cache.annotation.Cacheable;
@@ -19,6 +30,7 @@ import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.security.SecureRandom;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -69,6 +81,9 @@ public class BookingSlugService {
     private static final char[] SLUG_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789".toCharArray();
     /** Public master menu is tiny; cap the unbounded list read defensively (Anti-Bug §E-3). */
     private static final int MAX_SERVICES = 100;
+    /** Phase 380 D2 — portfolio photos / newest reviews carried on the public master page. */
+    static final int PORTFOLIO_LIMIT = 12;
+    static final int LATEST_REVIEWS_LIMIT = 5;
 
     /** KMU-2010 Ukrainian → Latin transliteration (matches the project SlugGenerator map). */
     private static final Map<Character, String> UK_TO_LATIN = Map.ofEntries(
@@ -85,6 +100,9 @@ public class BookingSlugService {
     private final MasterRepository masterRepository;
     private final MasterServiceRepository masterServiceRepository;
     private final SalonRepository salonRepository;
+    private final MediaService mediaService;
+    private final ReviewService reviewService;
+    private final ScheduleDateMath scheduleDateMath;
     private final SecureRandom random = new SecureRandom();
 
     /**
@@ -304,7 +322,49 @@ public class BookingSlugService {
                 composeName(user.getFirstName(), user.getLastName()),
                 user.getAvatarUrl(),
                 user.getBio(),
-                services);
+                services,
+                master.getId(),
+                master.getMasterType(),
+                user.getProfessionalTitle(),
+                user.getCity(),
+                user.getRegion(),
+                salonRef(master.getSalon()),
+                // Same rule as MasterDetailResponse: no reviews -> null, never the stored 0.00.
+                master.getReviewCount() == 0 ? null : master.getAvgRating(),
+                master.getReviewCount(),
+                categories(master.getId()),
+                portfolio(master.getId()),
+                latestReviews(master.getId()),
+                Boolean.TRUE.equals(masterRepository.isBookableById(master.getId(), scheduleDateMath.today())),
+                latest(master.getUpdatedAt(), user.getUpdatedAt()));
+    }
+
+    private static BookingSlugSalonRef salonRef(Salon salon) {
+        return salon == null ? null : new BookingSlugSalonRef(salon.getName(), salon.getBookingSlug());
+    }
+
+    private List<CategoryRef> categories(UUID masterId) {
+        return masterServiceRepository.findActiveCategoriesByMasterId(masterId).stream()
+                .map(category -> new CategoryRef(category.getId(), category.getNameUk()))
+                .toList();
+    }
+
+    private List<MediaFileResponse> portfolio(UUID masterId) {
+        return mediaService.getPortfolio(EntityType.MASTER, masterId, PageRequest.of(0, PORTFOLIO_LIMIT))
+                .getContent();
+    }
+
+    private List<ReviewResponse> latestReviews(UUID masterId) {
+        return reviewService.getReviewsForMaster(
+                masterId, SalonReviewSort.NEWEST, PageRequest.of(0, LATEST_REVIEWS_LIMIT)).getContent();
+    }
+
+    /** {@code GREATEST(a, b)} of the two audit timestamps (phase 380 D2 {@code updatedAt}). */
+    private static Instant latest(Instant first, Instant second) {
+        if (first == null || second == null) {
+            return first != null ? first : second;
+        }
+        return first.isAfter(second) ? first : second;
     }
 
     private String buildBase(String displayBase, String fallbackBase) {

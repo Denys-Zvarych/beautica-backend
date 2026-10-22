@@ -1,6 +1,7 @@
 package com.beautica.common.cache;
 
 import com.beautica.auth.Role;
+import com.beautica.master.repository.MasterRepository;
 import com.beautica.search.service.SearchCacheNames;
 import org.springframework.cache.Cache;
 import org.springframework.cache.CacheManager;
@@ -48,10 +49,49 @@ public class MasterProfileCacheEvictor {
     private final CacheManager cacheManager;
     private final SalonBookingInfoCacheEvictor salonBookingInfoCacheEvictor;
 
+    private final MasterRepository masterRepository;
+
     public MasterProfileCacheEvictor(
-            CacheManager cacheManager, SalonBookingInfoCacheEvictor salonBookingInfoCacheEvictor) {
+            CacheManager cacheManager,
+            SalonBookingInfoCacheEvictor salonBookingInfoCacheEvictor,
+            MasterRepository masterRepository) {
         this.cacheManager = cacheManager;
         this.salonBookingInfoCacheEvictor = salonBookingInfoCacheEvictor;
+        this.masterRepository = masterRepository;
+    }
+
+    /**
+     * Phase 380 D6 — evicts the ONE {@code booking-slug-info} entry of {@code masterId} after commit
+     * (immediately outside a transaction), for writers whose data rides in that payload besides the
+     * profile: reviews, portfolio photos, services and the weekly schedule. The slug is resolved with
+     * {@link MasterRepository#findBookingSlugById} at call time (inside the writer's transaction, a
+     * single scalar read); a master without a slug, or a {@code null} id, is a no-op. Never
+     * {@code clear()}s the cache.
+     */
+    public void evictBookingSlugInfoAfterCommit(UUID masterId) {
+        if (masterId == null) {
+            return;
+        }
+        String slug = masterRepository.findBookingSlugById(masterId).orElse(null);
+        if (slug == null) {
+            return;
+        }
+        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            evictKey(BOOKING_SLUG_INFO_CACHE, slug);
+            return;
+        }
+        // afterCompletion + STATUS_COMMITTED == "after commit, never on rollback", but unlike a bare
+        // afterCommit it still fires when the caller itself runs inside an outer transaction's
+        // afterCommit phase (ReviewEventListener), and Spring contains a throwing afterCompletion
+        // instead of turning a committed write's response into a 500.
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCompletion(int status) {
+                if (status == STATUS_COMMITTED) {
+                    evictKey(BOOKING_SLUG_INFO_CACHE, slug);
+                }
+            }
+        });
     }
 
     /**

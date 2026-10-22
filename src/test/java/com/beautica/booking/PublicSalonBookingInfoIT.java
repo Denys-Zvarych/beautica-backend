@@ -299,7 +299,7 @@ class PublicSalonBookingInfoIT extends AbstractIntegrationTest {
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(fieldNames(page)).containsExactlyInAnyOrder(
                 "salonId", "name", "city", "avatarUrl", "coverImageUrl", "avgRating", "reviewCount",
-                "bookable", "masters");
+                "bookable", "masters", "region", "street", "buildingNo", "updatedAt");
         assertThat(fieldNames(page.path("masters").get(0)))
                 .containsExactlyInAnyOrder("masterSlug", "name", "avatarUrl", "professionalTitle");
         assertThat(response.getBody())
@@ -553,5 +553,60 @@ class PublicSalonBookingInfoIT extends AbstractIntegrationTest {
                 .extracting(p -> p.getExpiresAfter(TimeUnit.SECONDS))
                 .isEqualTo(CacheConfig.SALON_BOOKING_SLUG_INFO_TTL_SECONDS)
                 .isEqualTo(30L);
+    }
+
+    // ── phase 380: address fields + HTTP caching ─────────────────────────────────────────────
+
+    @Test
+    @DisplayName("phase 380 D7: region, street, buildingNo, updatedAt are appended and the old fields keep their values")
+    void should_appendAddressFields_when_salonHasStructuredAddress() throws Exception {
+        OwnedSalon salon = ownedSalon("Address Salon");
+        jdbcTemplate.update("UPDATE salons SET region = 'Київська область', street = 'вул. Хрещатик', "
+                + "building_no = '12' WHERE id = ?", salon.salonId());
+
+        JsonNode page = page(salon.slug());
+
+        assertThat(page.path("region").asText()).isEqualTo("Київська область");
+        assertThat(page.path("street").asText()).isEqualTo("вул. Хрещатик");
+        assertThat(page.path("buildingNo").asText()).isEqualTo("12");
+        assertThat(page.path("updatedAt").asText()).isNotBlank();
+        assertThat(page.path("name").asText()).isEqualTo("Address Salon");
+        assertThat(fieldNames(page)).containsExactlyInAnyOrder("salonId", "name", "city", "avatarUrl",
+                "coverImageUrl", "avgRating", "reviewCount", "bookable", "masters", "region", "street",
+                "buildingNo", "updatedAt");
+    }
+
+    @Test
+    @DisplayName("phase 380 D7: blank street falls back to the legacy address")
+    void should_fallBackToLegacyAddress_when_streetBlank() throws Exception {
+        OwnedSalon salon = ownedSalon("Legacy Address Salon");
+        jdbcTemplate.update("UPDATE salons SET street = NULL, address = 'вул. Стара, 5' WHERE id = ?",
+                salon.salonId());
+
+        JsonNode page = page(salon.slug());
+
+        assertThat(page.path("street").asText()).isEqualTo("вул. Стара, 5");
+    }
+
+    @Test
+    @DisplayName("phase 380 D5: salon /info sends Cache-Control public max-age=60 + weak ETag, 304 on match, no public header on 404")
+    void should_sendCacheHeadersAndAnswer304_when_ifNoneMatchMatches() throws Exception {
+        OwnedSalon salon = ownedSalon("Etag Salon");
+
+        ResponseEntity<String> first = anonymousGet("/api/v1/book/s/" + salon.slug() + "/info");
+        HttpHeaders conditional = new HttpHeaders();
+        conditional.set("X-Forwarded-For", clientIp);
+        conditional.setIfNoneMatch(first.getHeaders().getETag());
+        ResponseEntity<String> replay = restTemplate.exchange("/api/v1/book/s/" + salon.slug() + "/info",
+                HttpMethod.GET, new HttpEntity<>(conditional), String.class);
+        ResponseEntity<String> missing = anonymousGet("/api/v1/book/s/no-such-salon-zz99/info");
+
+        assertThat(first.getHeaders().getCacheControl()).contains("public").contains("max-age=60");
+        assertThat(first.getHeaders().getETag()).startsWith("W/\"");
+        assertThat(replay.getStatusCode()).isEqualTo(HttpStatus.NOT_MODIFIED);
+        assertThat(replay.getBody()).isNullOrEmpty();
+        assertThat(missing.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+        String missingCacheControl = missing.getHeaders().getCacheControl();
+        assertThat(missingCacheControl == null || !missingCacheControl.contains("public")).isTrue();
     }
 }

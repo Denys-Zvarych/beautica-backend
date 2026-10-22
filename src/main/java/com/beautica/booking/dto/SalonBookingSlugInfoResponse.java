@@ -3,6 +3,7 @@ package com.beautica.booking.dto;
 import io.swagger.v3.oas.annotations.media.Schema;
 
 import java.math.BigDecimal;
+import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
 
@@ -35,6 +36,17 @@ public record SalonBookingSlugInfoResponse(
                 description = "false when no master of the salon is bookable yet; masters is then empty.")
         boolean bookable,
         @Schema(requiredMode = Schema.RequiredMode.REQUIRED)
-        List<SalonBookingSlugMasterItem> masters
+        List<SalonBookingSlugMasterItem> masters,
+        @Schema(types = {"string", "null"}, nullable = true,
+                description = "Settlement region label (salons.region).")
+        String region,
+        @Schema(types = {"string", "null"}, nullable = true,
+                description = "Street; falls back to the legacy free-text address when street is blank.")
+        String street,
+        @Schema(types = {"string", "null"}, nullable = true)
+        String buildingNo,
+        @Schema(requiredMode = Schema.RequiredMode.REQUIRED,
+                description = "Salon last edited; display/JSON-LD only, never a cache validator.")
+        Instant updatedAt
 ) {
 }

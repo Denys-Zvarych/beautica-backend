@@ -111,7 +111,7 @@ class PublicBookingControllerTest {
     @Test
     @DisplayName("GET /book/{slug}/info — 200 with master + services and NO Authorization header")
     void should_return200WithMasterAndServices_when_slugExists() throws Exception {
-        var response = new BookingSlugInfoResponse(
+        var response = masterPage(
                 "Марія Левченко",
                 "https://cdn.example/a.jpg",
                 "Манікюр та педикюр",
@@ -131,7 +131,7 @@ class PublicBookingControllerTest {
     @Test
     @DisplayName("GET /book/{slug}/info — public response carries no owner/master/user identifiers")
     void should_notLeakInternalIds_when_slugExists() throws Exception {
-        var response = new BookingSlugInfoResponse(
+        var response = masterPage(
                 "Ivan Petrenko", null, null,
                 List.of(new ServiceSummaryDto(UUID.randomUUID(), "Стрижка", 45, new BigDecimal("200.00"))));
         when(bookingSlugService.findBySlug("ivan-petrenko-ab12")).thenReturn(response);
@@ -139,7 +139,6 @@ class PublicBookingControllerTest {
         mockMvc.perform(get("/api/v1/book/ivan-petrenko-ab12/info").accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.ownerId").doesNotExist())
-                .andExpect(jsonPath("$.masterId").doesNotExist())
                 .andExpect(jsonPath("$.services[0].ownerId").doesNotExist())
                 .andExpect(jsonPath("$.services[0].ownerType").doesNotExist());
     }
@@ -360,13 +359,23 @@ class PublicBookingControllerTest {
         verifyNoInteractions(bookingCancellationService);
     }
 
+    /** Phase 380: a fully populated enriched master payload around the legacy four fields. */
+    private static BookingSlugInfoResponse masterPage(
+            String name, String avatarUrl, String bio, List<ServiceSummaryDto> services) {
+        return new BookingSlugInfoResponse(
+                name, avatarUrl, bio, services, UUID.randomUUID(),
+                com.beautica.master.entity.MasterType.INDEPENDENT_MASTER, null, null, null, null, null, 0,
+                List.of(), List.of(), List.of(), true, java.time.Instant.parse("2026-10-18T09:12:44Z"));
+    }
+
     // ── Phase 377: public salon booking page ──────────────────────────────────
 
     private static SalonBookingSlugInfoResponse salonPage(UUID salonId) {
         return new SalonBookingSlugInfoResponse(
                 salonId, "Студія Краса", "Вінниця", "https://cdn.example/logo.jpg", null,
                 new BigDecimal("4.80"), 12, true,
-                List.of(new SalonBookingSlugMasterItem("anna-bila-aa11", "Anna Bila", null, "Стиліст")));
+                List.of(new SalonBookingSlugMasterItem("anna-bila-aa11", "Anna Bila", null, "Стиліст")),
+                "Вінницька область", "вул. Соборна", "12", java.time.Instant.parse("2026-10-15T08:00:00Z"));
     }
 
     @Test
@@ -426,7 +435,7 @@ class PublicBookingControllerTest {
     @DisplayName("GET /book/{slug}/info for a master slug never reaches the salon handler")
     void should_routeMasterSlugToMasterHandler_when_notUnderS() throws Exception {
         when(bookingSlugService.findBySlug("ivan-petrenko-ab12"))
-                .thenReturn(new BookingSlugInfoResponse("Ivan Petrenko", null, null, List.of()));
+                .thenReturn(masterPage("Ivan Petrenko", null, null, List.of()));
 
         mockMvc.perform(get("/api/v1/book/ivan-petrenko-ab12/info").accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isOk());

@@ -18,6 +18,7 @@ import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Size;
 import lombok.RequiredArgsConstructor;
 import org.springframework.format.annotation.DateTimeFormat;
+import org.springframework.http.CacheControl;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -31,6 +32,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.time.Duration;
 import java.time.LocalDate;
 import java.util.List;
 import java.util.UUID;
@@ -53,6 +55,14 @@ import java.util.UUID;
 @Validated
 public class PublicBookingController {
 
+    /**
+     * Phase 380 D5 — both {@code /info} routes are shared-cacheable for 60 s. Set through
+     * {@code ResponseEntity} so Spring Security's default {@code no-cache} header writer stays off for
+     * these 2xx responses; 404s keep its {@code no-store}. The weak ETag comes from
+     * {@code BookingInfoEtagFilterConfig}.
+     */
+    private static final CacheControl INFO_CACHE_CONTROL = CacheControl.maxAge(Duration.ofSeconds(60)).cachePublic();
+
     private final BookingSlugService bookingSlugService;
     private final GuestBookingService guestBookingService;
     private final BookingCancellationService bookingCancellationService;
@@ -70,7 +80,7 @@ public class PublicBookingController {
             @Size(min = 2, max = 60)
             @Pattern(regexp = "^[a-z0-9][a-z0-9\\-]*[a-z0-9]$")
             String slug) {
-        return ResponseEntity.ok(bookingSlugService.findBySlug(slug));
+        return ResponseEntity.ok().cacheControl(INFO_CACHE_CONTROL).body(bookingSlugService.findBySlug(slug));
     }
 
     /**
@@ -89,7 +99,7 @@ public class PublicBookingController {
             @Size(min = 2, max = 60)
             @Pattern(regexp = "^[a-z0-9][a-z0-9\\-]*[a-z0-9]$")
             String slug) {
-        return ResponseEntity.ok(salonBookingSlugService.findBySlug(slug));
+        return ResponseEntity.ok().cacheControl(INFO_CACHE_CONTROL).body(salonBookingSlugService.findBySlug(slug));
     }
 
     /**

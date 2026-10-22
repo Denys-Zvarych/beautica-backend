@@ -91,6 +91,7 @@ class ServiceCatalogServiceCatalogTest {
     @Mock private com.beautica.common.security.AuthorizationService authz;
     @Mock private com.beautica.booking.service.SlotCalculationService slotCalculationService;
     @Mock private SalonCatalogCacheEvictor salonCatalogCacheEvictor;
+    @Mock private com.beautica.common.cache.MasterProfileCacheEvictor masterProfileCacheEvictor;
     @Mock private ServicePhotoBlobPurger servicePhotoBlobPurger;
     @Mock private com.beautica.booking.repository.BookingRepository bookingRepository;
 
@@ -122,6 +123,7 @@ class ServiceCatalogServiceCatalogTest {
                 authz,
                 slotCalculationService,
                 salonCatalogCacheEvictor,
+                masterProfileCacheEvictor,
                 searchVisibilityGuard,
                 servicePhotoBlobPurger,
                 bookingRepository,

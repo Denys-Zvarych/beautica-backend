@@ -57,6 +57,9 @@ class ReviewEventListenerTest {
     @Mock
     private CacheManager cacheManager;
 
+    @Mock
+    private com.beautica.common.cache.MasterProfileCacheEvictor masterProfileCacheEvictor;
+
     @InjectMocks
     private ReviewEventListener reviewEventListener;
 
@@ -246,6 +249,7 @@ class ReviewEventListenerTest {
 
         @MockBean RatingRecalculationService ratingRecalculationService;
         @MockBean ApplicationEventPublisher  eventPublisher;
+        @MockBean com.beautica.common.cache.MasterProfileCacheEvictor masterProfileCacheEvictor;
 
         @Autowired ReviewEventListener reviewEventListener;
         @Autowired CacheManager        cacheManager;

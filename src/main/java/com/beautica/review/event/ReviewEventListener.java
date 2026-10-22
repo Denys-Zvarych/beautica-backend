@@ -2,6 +2,7 @@ package com.beautica.review.event;
 
 import com.beautica.review.service.RatingRecalculationService;
 import com.github.benmanes.caffeine.cache.Cache;
+import com.beautica.common.cache.MasterProfileCacheEvictor;
 import lombok.RequiredArgsConstructor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -22,6 +23,7 @@ public class ReviewEventListener {
 
     private final RatingRecalculationService ratingRecalculationService;
     private final CacheManager cacheManager;
+    private final MasterProfileCacheEvictor masterProfileCacheEvictor;
 
     /** Public profile of one master, keyed by masterId — see MasterService#getMasterDetail. */
     private static final String MASTER_DETAIL_CACHE = "master-detail";
@@ -91,6 +93,8 @@ public class ReviewEventListener {
             log.error("recalculateMasterRating failed for master={} — {}",
                       event.masterId(), ex.getClass().getSimpleName());
         }
+        // Phase 380 D6: the public master booking page carries rating, count and the newest reviews.
+        masterProfileCacheEvictor.evictBookingSlugInfoAfterCommit(event.masterId());
         evictAfterCompletion(() -> {
             evictMasterReviewPages(event.masterId());
             // Phase 240 audit (Finding 1). Previously skipped deliberately, on the ground

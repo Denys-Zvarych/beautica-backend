@@ -977,6 +977,10 @@ public class MediaService {
         if (cache != null) {
             cache.evictIfPresent(portfolioCacheKey(entityType, entityId));
         }
+        if (entityType == EntityType.MASTER) {
+            // Phase 380 D6: the public master booking page carries the first 12 portfolio photos.
+            masterProfileCacheEvictor.evictBookingSlugInfoAfterCommit(entityId);
+        }
     }
 
     // ---------------------------------------------------------- salon sweeper

@@ -43,7 +43,7 @@ class SalonBookingSlugServiceTest {
 
     private final UUID salonId = UUID.randomUUID();
 
-    private void salonRow(int reviewCount, BigDecimal avgRating) {
+    private SalonBookingPageRow salonRow(int reviewCount, BigDecimal avgRating) {
         when(scheduleDateMath.today()).thenReturn(TODAY);
         SalonBookingPageRow row = mock(SalonBookingPageRow.class);
         when(row.getId()).thenReturn(salonId);
@@ -56,6 +56,7 @@ class SalonBookingSlugServiceTest {
             when(row.getAvgRating()).thenReturn(avgRating);
         }
         when(salonRepository.findBookingPageRowBySlug(SLUG)).thenReturn(Optional.of(row));
+        return row;
     }
 
     private static SalonBookingPageMasterRow masterRow(String slug, String first, String last) {
@@ -96,6 +97,39 @@ class SalonBookingSlugServiceTest {
         assertThat(page.coverImageUrl()).isEqualTo("https://cdn.beautica.test/cover.jpg");
         assertThat(page.avgRating()).isNull();
         assertThat(page.reviewCount()).isZero();
+    }
+
+    @Test
+    @DisplayName("phase 380 D7: region, street, buildingNo and updatedAt are appended from the salon row")
+    void should_appendAddressAndUpdatedAt_when_streetPresent() {
+        SalonBookingPageRow row = salonRow(0, null);
+        when(row.getRegion()).thenReturn("Київська область");
+        when(row.getStreet()).thenReturn("вул. Хрещатик");
+        when(row.getBuildingNo()).thenReturn("12");
+        when(row.getUpdatedAt()).thenReturn(java.time.Instant.parse("2026-10-15T08:00:00Z"));
+        when(masterRepository.findBookingPageMastersBySalonId(salonId, TODAY, SalonBookingSlugService.MAX_MASTERS))
+                .thenReturn(List.of());
+
+        SalonBookingSlugInfoResponse page = service.findBySlug(SLUG);
+
+        assertThat(page.region()).isEqualTo("Київська область");
+        assertThat(page.street()).isEqualTo("вул. Хрещатик");
+        assertThat(page.buildingNo()).isEqualTo("12");
+        assertThat(page.updatedAt()).isEqualTo(java.time.Instant.parse("2026-10-15T08:00:00Z"));
+    }
+
+    @Test
+    @DisplayName("phase 380 D7: blank street falls back to the legacy address")
+    void should_fallBackToLegacyAddress_when_streetBlank() {
+        SalonBookingPageRow row = salonRow(0, null);
+        when(row.getStreet()).thenReturn("  ");
+        when(row.getAddress()).thenReturn("вул. Старої Адреси, 5");
+        when(masterRepository.findBookingPageMastersBySalonId(salonId, TODAY, SalonBookingSlugService.MAX_MASTERS))
+                .thenReturn(List.of());
+
+        SalonBookingSlugInfoResponse page = service.findBySlug(SLUG);
+
+        assertThat(page.street()).isEqualTo("вул. Старої Адреси, 5");
     }
 
     @Test

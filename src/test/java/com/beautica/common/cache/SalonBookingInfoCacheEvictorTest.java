@@ -50,7 +50,8 @@ class SalonBookingInfoCacheEvictorTest {
 
     private static SalonBookingSlugInfoResponse page(UUID salonId, String masterSlug) {
         return new SalonBookingSlugInfoResponse(salonId, "Salon", "Вінниця", null, null, null, 0, true,
-                List.of(new SalonBookingSlugMasterItem(masterSlug, "Name", null, null)));
+                List.of(new SalonBookingSlugMasterItem(masterSlug, "Name", null, null)),
+                null, null, null, java.time.Instant.EPOCH);
     }
 
     @Test

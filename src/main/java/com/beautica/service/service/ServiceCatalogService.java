@@ -110,6 +110,8 @@ public class ServiceCatalogService {
     private final com.beautica.common.security.AuthorizationService authz;
     private final com.beautica.booking.service.SlotCalculationService slotCalculationService;
     private final SalonCatalogCacheEvictor salonCatalogCacheEvictor;
+    // Phase 380 D6: the public master booking page lists services and `bookable`.
+    private final com.beautica.common.cache.MasterProfileCacheEvictor masterProfileCacheEvictor;
     // Clears discovery search only when an assignment write flips a master's search membership
     // (audit 2026-10-05, finding 1) — never on band, photo or definition-content edits.
     private final MasterSearchVisibilityGuard searchVisibilityGuard;
@@ -1971,6 +1973,7 @@ public class ServiceCatalogService {
      * {@link MasterSearchVisibilityGuard}, which clears only on an actual verdict flip.
      */
     private void evictMasterServicesCache(List<UUID> masterIds) {
+        masterIds.forEach(masterProfileCacheEvictor::evictBookingSlugInfoAfterCommit);
         if (TransactionSynchronizationManager.isSynchronizationActive()) {
             TransactionSynchronizationManager.registerSynchronization(
                     new TransactionSynchronization() {

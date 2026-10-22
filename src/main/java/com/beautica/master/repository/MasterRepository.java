@@ -527,6 +527,19 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
     Optional<String> findBookingSlugById(@Param("masterId") UUID masterId);
 
     /**
+     * Phase 380 D2 — the public booking page's {@code bookable} verdict for ONE master: active AND the
+     * shared structural predicate ({@link MasterBookabilitySql#BOOKABLE_MASTER_M}: ≥1 active
+     * correctly-owned service and a schedule within the 180-day horizon). One statement; {@code today}
+     * is the Europe/Kyiv civil date from the app clock, never the DB clock.
+     */
+    @Query(value = "SELECT (m.is_active = true AND " + MasterBookabilitySql.BOOKABLE_MASTER_M
+            + ") FROM masters m WHERE m.id = :masterId",
+            nativeQuery = true)
+    Boolean isBookableById(
+            @Param("masterId") UUID masterId,
+            @Param(MasterBookabilitySql.TODAY_PARAM) LocalDate today);
+
+    /**
      * Resolves a public booking slug to its master, JOIN FETCH-ing the {@code user}
      * association so the caller can read {@code firstName}/{@code lastName}/
      * {@code avatarUrl}/{@code bio} (which live on {@link com.beautica.user.User},

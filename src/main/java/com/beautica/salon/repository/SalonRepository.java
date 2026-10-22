@@ -688,7 +688,9 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
      * index {@code idx_salons_booking_slug} (V200).
      */
     @Query("SELECT s.id AS id, s.name AS name, s.city AS city, s.avatarUrl AS avatarUrl, "
-            + "s.coverImageUrl AS coverImageUrl, s.avgRating AS avgRating, s.reviewCount AS reviewCount "
+            + "s.coverImageUrl AS coverImageUrl, s.avgRating AS avgRating, s.reviewCount AS reviewCount, "
+            + "s.region AS region, s.street AS street, s.buildingNo AS buildingNo, s.address AS address, "
+            + "s.updatedAt AS updatedAt "
             + "FROM Salon s WHERE s.bookingSlug = :slug AND s.isActive = true")
     Optional<SalonBookingPageRow> findBookingPageRowBySlug(@Param("slug") String slug);
 
@@ -707,6 +709,17 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
         java.math.BigDecimal getAvgRating();
 
         int getReviewCount();
+
+        String getRegion();
+
+        String getStreet();
+
+        String getBuildingNo();
+
+        /** Legacy free-text address; only used as the {@code street} fallback (phase 380 D7). */
+        String getAddress();
+
+        java.time.Instant getUpdatedAt();
     }
 
     /**

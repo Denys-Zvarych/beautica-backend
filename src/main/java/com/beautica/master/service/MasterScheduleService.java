@@ -119,6 +119,8 @@ public class MasterScheduleService {
     private final AuthorizationService authz;
     private final ScheduleMapper scheduleMapper;
     private final MasterCachePrefixEvictor cacheEvictor;
+    // Phase 380 D6: the public master booking page carries `bookable`, which schedule writes flip.
+    private final com.beautica.common.cache.MasterProfileCacheEvictor masterProfileCacheEvictor;
     private final SalonCatalogCacheEvictor salonCatalogCacheEvictor;
     private final MasterSearchVisibilityGuard searchVisibilityGuard;
 
@@ -1194,6 +1196,7 @@ public class MasterScheduleService {
         }
         UUID masterId = master.getId();
         UUID salonId = master.getSalon() != null ? master.getSalon().getId() : null;
+        masterProfileCacheEvictor.evictBookingSlugInfoAfterCommit(masterId);
         TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
             @Override
             public void afterCommit() {
