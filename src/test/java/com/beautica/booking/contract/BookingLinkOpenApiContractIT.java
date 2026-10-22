@@ -166,4 +166,18 @@ class BookingLinkOpenApiContractIT extends AbstractIntegrationTest {
         assertThat(request.path("properties").path("clientComment").path("maxLength").asInt()).isEqualTo(1000);
         assertThat(texts(request.path("required"))).doesNotContain("clientComment");
     }
+
+    @Test
+    @DisplayName("phase 386: BookingDetailResponse.guestPhone is a nullable string whose description states the rule")
+    void should_exposeNullableGuestPhone_when_specRendered() throws Exception {
+        JsonNode guestPhone = spec().path("components").path("schemas").path("BookingDetailResponse")
+                .path("properties").path("guestPhone");
+
+        assertThat(guestPhone.isMissingNode()).isFalse();
+        assertThat(texts(guestPhone.path("type"))).containsExactlyInAnyOrder("string", "null");
+        assertThat(guestPhone.path("description").asText())
+                .contains("GUEST").contains("DETAIL").contains("registered");
+        assertThat(texts(spec().path("components").path("schemas").path("BookingDetailResponse").path("required")))
+                .doesNotContain("guestPhone");
+    }
 }

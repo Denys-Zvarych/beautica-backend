@@ -232,8 +232,15 @@ public class BookingService {
                 && canReview(booking.getStatus(), booking.getEndsAt(), now,
                         reviewByClient.isPresent(), hasClient);
         boolean providerCanReviewClient = computeProviderCanReviewClient(actorUserId, booking, now);
-        return enrichSingle(booking, canReview, providerCanReviewClient, now,
+        BookingDetailResponse detail = enrichSingle(booking, canReview, providerCanReviewClient, now,
                 reviewByClient.map(BookingService::toClientAuthoredReview).orElse(null));
+        // Phase 386 D1/D2 (audience per the 2026-10-22 user rule) - the guest's phone, on THIS read only. The audience
+        // is decided explicitly by ROLE: INDEPENDENT_MASTER, SALON_OWNER, SALON_ADMIN. A SALON_MASTER never sees it
+        // (even as the performing master), nor does a CLIENT; the owning-client probe is kept as a second, independent
+        // guard. The wither re-checks booking.getClient() == null, so a registered user's phone has no path in.
+        return authz.isGuestPhoneAudience() && !authz.isOwningClientViewer(actorUserId, booking)
+                ? detail.withProviderVisibleGuestPhone(booking)
+                : detail;
     }
 
     /**
@@ -599,7 +606,10 @@ public class BookingService {
                 // path's guest semantics.
                 p.clientReviewCount() == null ? null
                         : BookingDetailResponse.masterAvgRatingOrNull(p.clientReviewCount(), p.clientAvgRating()),
-                p.clientReviewCount());
+                p.clientReviewCount(),
+                // Phase 386: a CLIENT-scoped projection (JOIN b.client) can never be a guest booking, and a
+                // registered client's phone is never provider-visible — null, always.
+                null);
     }
 
     /**
