@@ -39,11 +39,29 @@ class SalonBookingSlugServiceTest {
     @Mock private SalonRepository salonRepository;
     @Mock private MasterRepository masterRepository;
     @Mock private ScheduleDateMath scheduleDateMath;
+    @Mock private com.beautica.media.service.MediaService mediaService;
+    @Mock private com.beautica.service.service.ServiceCatalogService serviceCatalogService;
+    @Mock private com.beautica.review.service.ReviewService reviewService;
     @InjectMocks private SalonBookingSlugService service;
+
+    /** Phase 384: the four tab blocks default to "nothing to show" (lenient: not every test reads them). */
+    private void emptyTabs() {
+        org.mockito.Mockito.lenient().when(mediaService.getLatestPortfolio(any(), any(), anyInt())).thenReturn(List.of());
+        org.mockito.Mockito.lenient().when(serviceCatalogService.getSalonServiceCatalog(any()))
+                .thenReturn(new com.beautica.service.dto.SalonServiceCatalogResponse(List.of()));
+        org.mockito.Mockito.lenient().when(reviewService.getSalonReviewSummary(any()))
+                .thenReturn(new com.beautica.review.dto.SalonReviewSummaryResponse(null, 0, List.of(
+                        new com.beautica.common.RatingBucket(5, 0), new com.beautica.common.RatingBucket(4, 0),
+                        new com.beautica.common.RatingBucket(3, 0), new com.beautica.common.RatingBucket(2, 0),
+                        new com.beautica.common.RatingBucket(1, 0))));
+        org.mockito.Mockito.lenient().when(reviewService.getSalonReviews(any(), any(), any()))
+                .thenReturn(org.springframework.data.domain.Page.empty());
+    }
 
     private final UUID salonId = UUID.randomUUID();
 
     private SalonBookingPageRow salonRow(int reviewCount, BigDecimal avgRating) {
+        emptyTabs();
         when(scheduleDateMath.today()).thenReturn(TODAY);
         SalonBookingPageRow row = mock(SalonBookingPageRow.class);
         when(row.getId()).thenReturn(salonId);
@@ -162,5 +180,58 @@ class SalonBookingSlugServiceTest {
         assertThat(page.masters()).extracting("masterSlug").containsExactly("anna-b-aa11");
         verify(masterRepository, never()).findByIdWithUserAndSalon(any());
         verify(masterRepository, never()).save(any());
+    }
+
+    // ── phase 384: tab blocks by delegation ──────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("should_returnEmptyListsNotNull_when_salonHasNoPortfolioReviewsOrServices")
+    void should_returnEmptyListsNotNull_when_salonHasNoPortfolioReviewsOrServices() {
+        salonRow(0, null);
+        when(masterRepository.findBookingPageMastersBySalonId(salonId, TODAY, SalonBookingSlugService.MAX_MASTERS))
+                .thenReturn(List.of());
+
+        SalonBookingSlugInfoResponse page = service.findBySlug(SLUG);
+
+        assertThat(page.portfolio()).isNotNull().isEmpty();
+        assertThat(page.serviceCategories()).isNotNull().isEmpty();
+        assertThat(page.latestReviews()).isNotNull().isEmpty();
+        assertThat(page.ratingDistribution()).hasSize(5);
+    }
+
+    @Test
+    @DisplayName("should_useSharedCapsAndNewestSort_when_tabsLoaded")
+    void should_useSharedCapsAndNewestSort_when_tabsLoaded() {
+        salonRow(0, null);
+        when(masterRepository.findBookingPageMastersBySalonId(salonId, TODAY, SalonBookingSlugService.MAX_MASTERS))
+                .thenReturn(List.of());
+
+        service.findBySlug(SLUG);
+
+        verify(mediaService).getLatestPortfolio(com.beautica.media.entity.EntityType.SALON, salonId,
+                BookingSlugService.PORTFOLIO_LIMIT);
+        verify(reviewService).getSalonReviews(salonId, com.beautica.review.dto.SalonReviewSort.NEWEST,
+                org.springframework.data.domain.PageRequest.of(0, BookingSlugService.LATEST_REVIEWS_LIMIT));
+        assertThat(BookingSlugService.PORTFOLIO_LIMIT).as("shared with the master page (380)").isEqualTo(12);
+        assertThat(BookingSlugService.LATEST_REVIEWS_LIMIT).isEqualTo(5);
+    }
+
+    @Test
+    @DisplayName("should_returnTheDelegatedPayloadsUnchanged_and_aboutFromTheRow")
+    void should_returnTheDelegatedPayloadsUnchanged_and_aboutFromTheRow() {
+        SalonBookingPageRow row = salonRow(0, null);
+        when(row.getDescription()).thenReturn("Студія краси");
+        when(row.getLocationNote()).thenReturn("Другий вхід");
+        var group = new com.beautica.service.dto.SalonServiceCategoryGroup("NAILS", "Нігті", 0, List.of());
+        when(serviceCatalogService.getSalonServiceCatalog(salonId))
+                .thenReturn(new com.beautica.service.dto.SalonServiceCatalogResponse(List.of(group)));
+        when(masterRepository.findBookingPageMastersBySalonId(salonId, TODAY, SalonBookingSlugService.MAX_MASTERS))
+                .thenReturn(List.of());
+
+        SalonBookingSlugInfoResponse page = service.findBySlug(SLUG);
+
+        assertThat(page.description()).isEqualTo("Студія краси");
+        assertThat(page.locationNote()).isEqualTo("Другий вхід");
+        assertThat(page.serviceCategories()).containsExactly(group);
     }
 }

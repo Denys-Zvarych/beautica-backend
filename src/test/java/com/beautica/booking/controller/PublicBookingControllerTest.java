@@ -411,6 +411,36 @@ class PublicBookingControllerTest {
                 .andExpect(status().isNotFound());
     }
 
+    @Test
+    @DisplayName("GET /book/s/{slug}/reviews — 200 PageResponse<SalonReviewResponse> with the info Cache-Control")
+    void should_return200WithSalonReviewPage_when_salonReviewsRequested() throws Exception {
+        var review = new com.beautica.review.dto.SalonReviewResponse(UUID.randomUUID(), UUID.randomUUID(), "Anna",
+                "Bila", "Олена К.", "Манікюр", 5, "Дуже акуратно",
+                java.time.OffsetDateTime.parse("2026-10-12T15:20:00Z"));
+        when(bookingSlugService.salonReviewsForSlug(eq("studiia-krasa-ab12"),
+                eq(com.beautica.review.dto.SalonReviewSort.OLDEST), any(org.springframework.data.domain.Pageable.class)))
+                .thenReturn(new org.springframework.data.domain.PageImpl<>(List.of(review),
+                        org.springframework.data.domain.PageRequest.of(0, 20), 1));
+
+        mockMvc.perform(get("/api/v1/book/s/studiia-krasa-ab12/reviews?sort=OLDEST").accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(header().string("Cache-Control", "max-age=0, public, s-maxage=30"))
+                .andExpect(jsonPath("$.data[0].masterFirstName").value("Anna"))
+                .andExpect(jsonPath("$.data[0].clientDisplayName").value("Олена К."));
+    }
+
+    @Test
+    @DisplayName("GET /book/s/{slug}/reviews — bad sort / malformed slug are 400 without a service call; unknown slug is 404")
+    void should_return400Or404_when_salonReviewsInputInvalid() throws Exception {
+        mockMvc.perform(get("/api/v1/book/s/studiia-krasa-ab12/reviews?sort=NOPE")).andExpect(status().isBadRequest());
+        mockMvc.perform(get("/api/v1/book/s/BAD_SLUG/reviews")).andExpect(status().isBadRequest());
+        verifyNoInteractions(bookingSlugService);
+        when(bookingSlugService.salonReviewsForSlug(eq("nope-zz99"), any(), any()))
+                .thenThrow(new NotFoundException("Booking page not found"));
+
+        mockMvc.perform(get("/api/v1/book/s/nope-zz99/reviews")).andExpect(status().isNotFound());
+    }
+
     // ── Phase 377: public salon booking page ──────────────────────────────────
 
     private static SalonBookingSlugInfoResponse salonPage(UUID salonId) {
@@ -418,7 +448,8 @@ class PublicBookingControllerTest {
                 salonId, "Студія Краса", "Вінниця", "https://cdn.example/logo.jpg", null,
                 new BigDecimal("4.80"), 12, true,
                 List.of(new SalonBookingSlugMasterItem("anna-bila-aa11", "Anna Bila", null, "Стиліст")),
-                "Вінницька область", "вул. Соборна", "12", java.time.Instant.parse("2026-10-15T08:00:00Z"));
+                "Вінницька область", "вул. Соборна", "12", java.time.Instant.parse("2026-10-15T08:00:00Z"),
+                null, null, List.of(), List.of(), List.of(), List.of());
     }
 
     @Test

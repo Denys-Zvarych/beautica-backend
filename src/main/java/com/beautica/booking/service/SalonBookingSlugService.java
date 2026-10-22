@@ -9,7 +9,14 @@ import com.beautica.master.repository.MasterRepository.SalonBookingPageMasterRow
 import com.beautica.master.service.ScheduleDateMath;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.salon.repository.SalonRepository.SalonBookingPageRow;
+import com.beautica.media.entity.EntityType;
+import com.beautica.media.service.MediaService;
+import com.beautica.review.dto.SalonReviewSort;
+import com.beautica.review.service.ReviewService;
+import com.beautica.service.service.ServiceCatalogService;
 import lombok.RequiredArgsConstructor;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.cache.annotation.Cacheable;
 import org.springframework.stereotype.Service;
 
@@ -40,6 +47,10 @@ public class SalonBookingSlugService {
     private final SalonRepository salonRepository;
     private final MasterRepository masterRepository;
     private final ScheduleDateMath scheduleDateMath;
+    // Phase 384 D2: each tab block delegates to the service method behind the app's public salon endpoint.
+    private final MediaService mediaService;
+    private final ServiceCatalogService serviceCatalogService;
+    private final ReviewService reviewService;
 
     /**
      * The public salon page for {@code slug}. Unknown slug or inactive salon → {@link NotFoundException}
@@ -50,6 +61,7 @@ public class SalonBookingSlugService {
      * commit by {@link SalonBookingInfoCacheEvictor}, 60-second TTL backstop ({@code CacheConfig}).
      */
     @Cacheable(cacheNames = SalonBookingInfoCacheEvictor.CACHE, key = "#slug", sync = true)
+    @Transactional(readOnly = true)
     public SalonBookingSlugInfoResponse findBySlug(String slug) {
         SalonBookingPageRow salon = salonRepository.findBookingPageRowBySlug(slug)
                 .orElseThrow(() -> new NotFoundException("Booking page not found"));
@@ -73,7 +85,17 @@ public class SalonBookingSlugService {
                 // Same fallback rule as PublicSalonResponse: blank street -> the legacy address.
                 isBlank(salon.getStreet()) ? salon.getAddress() : salon.getStreet(),
                 salon.getBuildingNo(),
-                salon.getUpdatedAt());
+                salon.getUpdatedAt(),
+                salon.getDescription(),
+                salon.getLocationNote(),
+                // GET /salons/{id}/portfolio's order (createdAt DESC) and the master page's cap — uncached read,
+                // the shared `portfolio` cache entry ignores page size (see MediaService#getLatestPortfolio).
+                mediaService.getLatestPortfolio(EntityType.SALON, salon.getId(), BookingSlugService.PORTFOLIO_LIMIT),
+                // GET /salons/{id}/services: bookable-only grouping, counts and display names as the app gets them.
+                serviceCatalogService.getSalonServiceCatalog(salon.getId()).categories(),
+                reviewService.getSalonReviewSummary(salon.getId()).ratingDistribution(),
+                reviewService.getSalonReviews(salon.getId(), SalonReviewSort.NEWEST,
+                        PageRequest.of(0, BookingSlugService.LATEST_REVIEWS_LIMIT)).getContent());
     }
 
     private static boolean isBlank(String value) {

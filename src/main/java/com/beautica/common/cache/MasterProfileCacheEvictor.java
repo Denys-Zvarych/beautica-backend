@@ -98,6 +98,22 @@ public class MasterProfileCacheEvictor {
         registerSlugEviction(List.of(slug));
     }
 
+    /**
+     * Phase 384 D5 — drops the public SALON booking page ({@code salon-booking-slug-info}) of {@code salonId} after
+     * commit (immediately outside a transaction): the page now carries the salon's portfolio and reviews header,
+     * so salon photo uploads/deletes call this. Delegates to {@link SalonBookingInfoCacheEvictor} — the one salon
+     * page evictor (profile edits and catalogue changes already reach it through SalonService and
+     * SalonCatalogCacheEvictor).
+     */
+    public void evictSalonBookingPageAfterCommit(UUID salonId) {
+        salonBookingInfoCacheEvictor.evictSalonAfterCommit(salonId);
+    }
+
+    /** Immediate form of {@link #evictSalonBookingPageAfterCommit}, for callers already past the commit. */
+    public void evictSalonBookingPage(UUID salonId) {
+        salonBookingInfoCacheEvictor.evictSalon(salonId);
+    }
+
     private void registerSlugEviction(Collection<String> slugs) {
         if (slugs.isEmpty()) {
             return;

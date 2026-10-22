@@ -120,6 +120,30 @@ final class PublicBookingPageFixtures {
                 UUID.randomUUID(), bookingId, clientId, master.masterId(), rating, "review-" + minutesAgo, minutesAgo);
     }
 
+    /** One COMPLETED booking plus its SALON review for {@code masterId} (who must have a master_services row). */
+    void insertSalonReview(UUID salonId, UUID masterId, UUID clientId, int rating, int minutesAgo) {
+        UUID masterServiceId = jdbc.queryForObject(
+                "SELECT id FROM master_services WHERE master_id = ? LIMIT 1", UUID.class, masterId);
+        UUID bookingId = UUID.randomUUID();
+        jdbc.update(
+                "INSERT INTO bookings (id, client_id, master_id, master_service_id, salon_id, status, "
+                        + "starts_at, ends_at, price_at_booking, duration_minutes_at_booking, "
+                        + "buffer_minutes_at_booking, booking_source, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, ?, ?, 'COMPLETED', NOW() - interval '2 hours', "
+                        + "NOW() - interval '1 hour', 500.00, 60, 0, 'APP', NOW(), NOW())",
+                bookingId, clientId, masterId, masterServiceId, salonId);
+        jdbc.update(
+                "INSERT INTO reviews (id, booking_id, client_id, master_id, salon_id, rating, comment, "
+                        + "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, NOW() - make_interval(mins => ?), NOW())",
+                UUID.randomUUID(), bookingId, clientId, masterId, salonId, rating, "review-" + minutesAgo, minutesAgo);
+    }
+
+    /** Gives the salon definition behind a seeded assignment its category key (the seeder leaves it NULL). */
+    void categorise(UUID serviceDefId) {
+        jdbc.update("UPDATE service_definitions SET category = "
+                + "(SELECT platform_category_name FROM service_types WHERE id = service_type_id) WHERE id = ?", serviceDefId);
+    }
+
     /** A salon created through {@code POST /salons} (slug issued at creation, phase 376). */
     SalonPage salon(String name) throws Exception {
         String token = fixtures.createSalonOwnerAndGetToken("owner-pg-" + UUID.randomUUID() + "@beautica.test");

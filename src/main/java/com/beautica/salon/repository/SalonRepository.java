@@ -690,7 +690,7 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
     @Query("SELECT s.id AS id, s.name AS name, s.city AS city, s.avatarUrl AS avatarUrl, "
             + "s.coverImageUrl AS coverImageUrl, s.avgRating AS avgRating, s.reviewCount AS reviewCount, "
             + "s.region AS region, s.street AS street, s.buildingNo AS buildingNo, s.address AS address, "
-            + "s.updatedAt AS updatedAt "
+            + "s.updatedAt AS updatedAt, s.description AS description, s.locationNote AS locationNote "
             + "FROM Salon s WHERE s.bookingSlug = :slug AND s.isActive = true")
     Optional<SalonBookingPageRow> findBookingPageRowBySlug(@Param("slug") String slug);
 
@@ -720,7 +720,21 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
         String getAddress();
 
         java.time.Instant getUpdatedAt();
+
+        /** Phase 384 — the "about" text, exactly as {@code PublicSalonResponse.description}. */
+        String getDescription();
+
+        /** Phase 384 — as {@code PublicSalonResponse.locationNote}. */
+        String getLocationNote();
     }
+
+    /**
+     * Phase 384 — the id of the ACTIVE salon behind a public salon slug: the visibility rule of
+     * {@link #findBookingPageRowBySlug} as one scalar statement, for {@code GET /book/s/{slug}/reviews}, which
+     * needs the id only.
+     */
+    @Query("SELECT s.id FROM Salon s WHERE s.bookingSlug = :slug AND s.isActive = true")
+    Optional<UUID> findActiveIdByBookingSlug(@Param("slug") String slug);
 
     /**
      * Phase 376 audit — serialises every salon-slug WRITER on the candidate value: a transaction-scoped

@@ -152,6 +152,9 @@ public class ReviewEventListener {
                 // Without this evict the salon profile keeps the pre-review average for
                 // the cache's 5-minute TTL.
                 evictKey(SALON_DETAIL_CACHE, event.salonId());
+                // Phase 384 D5: the public salon booking page carries the rating distribution and the newest
+                // reviews. Same callback, after evictSalonReviewPages above, so no stale page is re-read.
+                masterProfileCacheEvictor.evictSalonBookingPage(event.salonId());
             });
         }
     }

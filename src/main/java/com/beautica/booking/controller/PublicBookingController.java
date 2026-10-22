@@ -8,6 +8,7 @@ import com.beautica.booking.dto.GuestBookingResponse;
 import com.beautica.booking.dto.SalonBookingSlugInfoResponse;
 import com.beautica.common.PageResponse;
 import com.beautica.review.dto.ReviewResponse;
+import com.beautica.review.dto.SalonReviewResponse;
 import com.beautica.review.dto.SalonReviewSort;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
@@ -107,6 +108,23 @@ public class PublicBookingController {
             @RequestParam(required = false, defaultValue = "NEWEST") SalonReviewSort sort,
             @PageableDefault(size = BookingSlugService.MAX_REVIEWS_PAGE_SIZE) Pageable pageable) {
         Page<ReviewResponse> page = bookingSlugService.reviewsForSlug(slug, sort, pageable);
+        return ResponseEntity.ok().cacheControl(INFO_CACHE_CONTROL).body(PageResponse.of(
+                page.getContent(), page.getNumber(), page.getSize(), page.getTotalElements(), page.getTotalPages()));
+    }
+
+    /**
+     * Phase 384 D4 — the salon counterpart of {@link #reviews}: {@code PageResponse<SalonReviewResponse>} (the master
+     * name stays, as in the app), same clamp, headers, bucket and error matrix.
+     */
+    @GetMapping("/s/{slug}/reviews")
+    public ResponseEntity<PageResponse<SalonReviewResponse>> salonReviews(
+            @PathVariable
+            @Size(min = 2, max = 60)
+            @Pattern(regexp = "^[a-z0-9][a-z0-9\\-]*[a-z0-9]$")
+            String slug,
+            @RequestParam(required = false, defaultValue = "NEWEST") SalonReviewSort sort,
+            @PageableDefault(size = BookingSlugService.MAX_REVIEWS_PAGE_SIZE) Pageable pageable) {
+        Page<SalonReviewResponse> page = bookingSlugService.salonReviewsForSlug(slug, sort, pageable);
         return ResponseEntity.ok().cacheControl(INFO_CACHE_CONTROL).body(PageResponse.of(
                 page.getContent(), page.getNumber(), page.getSize(), page.getTotalElements(), page.getTotalPages()));
     }

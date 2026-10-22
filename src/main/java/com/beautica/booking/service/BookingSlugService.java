@@ -13,6 +13,7 @@ import com.beautica.media.dto.MediaFileResponse;
 import com.beautica.media.entity.EntityType;
 import com.beautica.media.service.MediaService;
 import com.beautica.review.dto.ReviewResponse;
+import com.beautica.review.dto.SalonReviewResponse;
 import com.beautica.review.dto.SalonReviewSort;
 
 import com.beautica.review.service.ReviewService;
@@ -369,6 +370,21 @@ public class BookingSlugService {
         Pageable clamped = PageRequest.of(pageable.getPageNumber(),
                 Math.min(pageable.getPageSize(), MAX_REVIEWS_PAGE_SIZE));
         return reviewService.getReviewsForMaster(masterId, sort, clamped);
+    }
+
+    /**
+     * Phase 384 D4 — one page of a salon's public reviews, addressed by the salon booking slug: slug resolution is
+     * the salon page's (unknown / inactive salon → 404), the page is the method behind
+     * {@code GET /salons/{id}/reviews} ({@code SalonReviewResponse}, same sort enum, same {@code reviews-by-salon}
+     * cache and eviction), with the size clamped like {@link #reviewsForSlug}.
+     */
+    @Transactional(readOnly = true)
+    public Page<SalonReviewResponse> salonReviewsForSlug(String slug, SalonReviewSort sort, Pageable pageable) {
+        UUID salonId = salonRepository.findActiveIdByBookingSlug(slug)
+                .orElseThrow(() -> new NotFoundException("Booking page not found"));
+        Pageable clamped = PageRequest.of(pageable.getPageNumber(),
+                Math.min(pageable.getPageSize(), MAX_REVIEWS_PAGE_SIZE));
+        return reviewService.getSalonReviews(salonId, sort, clamped);
     }
 
     private static BookingSlugSalonRef salonRef(Salon salon) {

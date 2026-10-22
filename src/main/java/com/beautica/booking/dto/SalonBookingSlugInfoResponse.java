@@ -1,5 +1,9 @@
 package com.beautica.booking.dto;
 
+import com.beautica.common.RatingBucket;
+import com.beautica.media.dto.MediaFileResponse;
+import com.beautica.review.dto.SalonReviewResponse;
+import com.beautica.service.dto.SalonServiceCategoryGroup;
 import io.swagger.v3.oas.annotations.media.Schema;
 
 import java.math.BigDecimal;
@@ -47,6 +51,22 @@ public record SalonBookingSlugInfoResponse(
         String buildingNo,
         @Schema(requiredMode = Schema.RequiredMode.REQUIRED,
                 description = "Salon last edited; display/JSON-LD only, never a cache validator.")
-        Instant updatedAt
+        Instant updatedAt,
+        @Schema(types = {"string", "null"}, nullable = true, description = "As PublicSalonResponse.description.")
+        String description,
+        @Schema(types = {"string", "null"}, nullable = true, description = "As PublicSalonResponse.locationNote.")
+        String locationNote,
+        @Schema(requiredMode = Schema.RequiredMode.REQUIRED,
+                description = "Newest photos first, capped like the master page (12); the payload of GET /salons/{id}/portfolio.")
+        List<MediaFileResponse> portfolio,
+        @Schema(requiredMode = Schema.RequiredMode.REQUIRED,
+                description = "Bookable services grouped by category — GET /salons/{id}/services, unchanged.")
+        List<SalonServiceCategoryGroup> serviceCategories,
+        @Schema(requiredMode = Schema.RequiredMode.REQUIRED,
+                description = "Zero-filled 5..1 histogram — GET /salons/{id}/reviews/summary.")
+        List<RatingBucket> ratingDistribution,
+        @Schema(requiredMode = Schema.RequiredMode.REQUIRED,
+                description = "The newest 5 reviews — the SalonReviewResponse rows of GET /salons/{id}/reviews.")
+        List<SalonReviewResponse> latestReviews
 ) {
 }

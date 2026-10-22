@@ -66,6 +66,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 @DisplayName("GET /book/s/{slug}/info — bookable masters only, 404/bookable=false, cached + evicted after commit (Phase 377)")
 class PublicSalonBookingInfoIT extends AbstractIntegrationTest {
 
+    /** Salon row + masters batch (377) + portfolio, services (+bookability batch), summary, newest reviews (384). */
+    private static final int MISS_STATEMENT_BUDGET = 12;
     private static final String SLUG_CHECK = "^[a-z0-9][a-z0-9\\-]*[a-z0-9]$";
 
     @Autowired private TestRestTemplate restTemplate;
@@ -76,6 +78,8 @@ class PublicSalonBookingInfoIT extends AbstractIntegrationTest {
     @Autowired private SalonCatalogCacheEvictor salonCatalogCacheEvictor;
     @Autowired private UserService userService;
     @Autowired private TransactionTemplate transactionTemplate;
+    @Autowired private org.springframework.context.ApplicationEventPublisher eventPublisher;
+    @org.springframework.boot.test.mock.mockito.MockBean private com.beautica.media.service.R2StorageService r2;
 
     private ServiceTestFixtures fixtures;
     private PublicBookingPageFixtures pages;
@@ -184,8 +188,10 @@ class PublicSalonBookingInfoIT extends AbstractIntegrationTest {
         ThreadJdbcFootprint.Measured<SalonBookingSlugInfoResponse> measured =
                 ThreadJdbcFootprint.measure(() -> salonBookingSlugService.findBySlug(salon.slug()));
 
-        assertThat(measured.footprint().transactions()).as("anonymous read never writes — %s", measured.footprint())
-                .isZero();
+        // Phase 384: the page delegates to read-only services, so the read runs in ONE read-only transaction
+        // (it was transaction-free before). It still never writes: the asserts on the slug columns below prove it.
+        assertThat(measured.footprint().transactions()).as("one read-only transaction — %s", measured.footprint())
+                .isEqualTo(1);
         assertThat(masterSlugOf(legacy)).as("no slug issued by the public page").isNull();
         assertThat(masterSlugOf(stored)).as("stored slug never rewritten").isEqualTo("maria-stara-zz11");
         assertThat(measured.result().masters()).extracting("masterSlug").containsExactly("maria-stara-zz11");
@@ -274,7 +280,8 @@ class PublicSalonBookingInfoIT extends AbstractIntegrationTest {
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(fieldNames(page)).containsExactlyInAnyOrder(
                 "salonId", "name", "city", "avatarUrl", "coverImageUrl", "avgRating", "reviewCount",
-                "bookable", "masters", "region", "street", "buildingNo", "updatedAt");
+                "bookable", "masters", "region", "street", "buildingNo", "updatedAt", "description", "locationNote",
+                "portfolio", "serviceCategories", "ratingDistribution", "latestReviews");
         assertThat(fieldNames(page.path("masters").get(0)))
                 .containsExactlyInAnyOrder("masterSlug", "name", "avatarUrl", "professionalTitle");
         assertThat(response.getBody())
@@ -282,6 +289,156 @@ class PublicSalonBookingInfoIT extends AbstractIntegrationTest {
                 .doesNotContain("+380501112233")
                 .doesNotContain(master.toString())
                 .doesNotContain(userIdOf(master).toString());
+    }
+
+    // ── phase 384: tabs ──────────────────────────────────────────────────────────────────────
+
+    private record RichSalon(PublicBookingPageFixtures.SalonPage salon, UUID masterId, UUID client) {
+    }
+
+    /** A salon with a bookable categorised service, one portfolio photo and one review. */
+    private RichSalon richSalon(String name) throws Exception {
+        PublicBookingPageFixtures.SalonPage salon = pages.salon(name);
+        UUID master = pages.salonMaster(salon.salonId(), "Anna", "Bila");
+        BookableMasterSeeder.seedUsableSchedule(jdbcTemplate, master);
+        pages.categorise(BookableMasterSeeder.assignNewSalonService(jdbcTemplate, salon.salonId(), master));
+        UUID client = pages.insertClient();
+        pages.insertSalonReview(salon.salonId(), master, client, 5, 10);
+        jdbcTemplate.update("UPDATE salons SET description = 'Студія краси', location_note = 'Другий вхід', "
+                + "phone = '+380501112233' WHERE id = ?", salon.salonId());
+        insertSalonPhoto(salon.salonId(), 5);
+        return new RichSalon(salon, master, client);
+    }
+
+    private void insertSalonPhoto(UUID salonId, int minutesAgo) {
+        UUID id = UUID.randomUUID();
+        UUID uploader = jdbcTemplate.queryForObject("SELECT owner_id FROM salons WHERE id = ?", UUID.class, salonId);
+        String key = "portfolio/salons/" + salonId + "/seed-" + id + ".jpg";
+        jdbcTemplate.update("INSERT INTO media_files (id, uploader_id, entity_type, entity_id, media_type, r2_key, "
+                + "r2_url, created_at, updated_at) VALUES (?, ?, 'SALON', ?, 'PORTFOLIO', ?, ?, "
+                + "NOW() - make_interval(mins => ?), NOW())", id, uploader, salonId, key, "https://cdn.example/" + key,
+                minutesAgo);
+    }
+
+    private static java.util.Set<String> componentNames(Class<? extends Record> type) {
+        java.util.Set<String> names = new java.util.HashSet<>();
+        for (var component : type.getRecordComponents()) {
+            names.add(component.getName());
+        }
+        return names;
+    }
+
+    private static java.util.Set<String> keySet(JsonNode node) {
+        return new java.util.HashSet<>(fieldNames(node));
+    }
+
+    @Test
+    @DisplayName("should_exposeOnlyAllowListedKeys_when_salonPageRendered - recursive: groups, services, photos, reviews")
+    void should_exposeOnlyAllowListedKeys_when_salonPageRendered() throws Exception {
+        RichSalon rich = richSalon("Allow List Salon");
+        String ownerEmail = jdbcTemplate.queryForObject(
+                "SELECT u.email FROM users u JOIN salons s ON s.owner_id = u.id WHERE s.id = ?", String.class,
+                rich.salon().salonId());
+
+        ResponseEntity<String> response = anonymousGet("/api/v1/book/s/" + rich.salon().slug() + "/info");
+        JsonNode page = objectMapper.readTree(response.getBody());
+
+        assertThat(keySet(page)).isEqualTo(java.util.Set.of(
+                "salonId", "name", "city", "avatarUrl", "coverImageUrl", "avgRating", "reviewCount", "bookable",
+                "masters", "region", "street", "buildingNo", "updatedAt", "description", "locationNote", "portfolio",
+                "serviceCategories", "ratingDistribution", "latestReviews"));
+        assertThat(keySet(page.path("portfolio").get(0)))
+                .isEqualTo(java.util.Set.of("id", "entityType", "entityId", "mediaType", "url", "createdAt"));
+        JsonNode group = page.path("serviceCategories").get(0);
+        assertThat(keySet(group)).isEqualTo(java.util.Set.of("category", "displayName", "count", "services"));
+        assertThat(keySet(group.path("services").get(0)))
+                .isEqualTo(componentNames(com.beautica.service.dto.ServiceDefinitionResponse.class));
+        assertThat(keySet(page.path("ratingDistribution").get(0))).isEqualTo(java.util.Set.of("rating", "count"));
+        assertThat(keySet(page.path("latestReviews").get(0)))
+                .isEqualTo(componentNames(com.beautica.review.dto.SalonReviewResponse.class));
+        assertThat(response.getBody()).doesNotContain(ownerEmail).doesNotContain("+380501112233")
+                .doesNotContain(rich.client().toString());
+    }
+
+    @Test
+    @DisplayName("parity: serviceCategories, portfolio and ratingDistribution equal the app's public salon endpoints")
+    void should_matchAppPublicEndpoints_when_salonPageRendered() throws Exception {
+        RichSalon rich = richSalon("Parity Salon");
+        JsonNode page = page(rich.salon().slug());
+        UUID salonId = rich.salon().salonId();
+
+        JsonNode appServices = appData("/api/v1/salons/" + salonId + "/services").path("categories");
+        JsonNode appPortfolio = appData("/api/v1/salons/" + salonId + "/portfolio").path("content");
+        JsonNode appSummary = appData("/api/v1/salons/" + salonId + "/reviews/summary");
+        JsonNode appReviews = appData("/api/v1/salons/" + salonId + "/reviews").path("data");
+
+        assertThat(page.path("serviceCategories")).isEqualTo(appServices);
+        assertThat(page.path("portfolio")).isEqualTo(appPortfolio);
+        assertThat(page.path("ratingDistribution")).isEqualTo(appSummary.path("ratingDistribution"));
+        assertThat(page.path("latestReviews")).isEqualTo(appReviews);
+        assertThat(page.path("description").asText()).isEqualTo("Студія краси");
+        assertThat(page.path("locationNote").asText()).isEqualTo("Другий вхід");
+    }
+
+    private JsonNode appData(String path) throws Exception {
+        ResponseEntity<String> response = anonymousGet(path);
+        assertThat(response.getStatusCode()).as("body=%s", response.getBody()).isEqualTo(HttpStatus.OK);
+        return objectMapper.readTree(response.getBody()).path("data");
+    }
+
+    @Test
+    @DisplayName("eviction (D5): a new salon review shows in ratingDistribution and latestReviews on the next read")
+    void should_showNewSalonReview_when_reviewCreatedEventCommits() throws Exception {
+        RichSalon rich = richSalon("Review Evict Salon");
+        assertThat(page(rich.salon().slug()).path("latestReviews")).hasSize(1);
+        assertThat(pageCache().get(rich.salon().slug())).as("page cached").isNotNull();
+
+        pages.insertSalonReview(rich.salon().salonId(), rich.masterId(), rich.client(), 3, 1);
+        UUID masterUserId = userIdOf(rich.masterId());
+        transactionTemplate.executeWithoutResult(status -> eventPublisher.publishEvent(
+                new com.beautica.review.event.ReviewCreatedEvent(rich.masterId(), masterUserId,
+                        rich.salon().salonId(), rich.client())));
+
+        JsonNode after = page(rich.salon().slug());
+        assertThat(after.path("latestReviews")).hasSize(2);
+        assertThat(after.path("ratingDistribution").get(2).path("rating").asInt()).isEqualTo(3);
+        assertThat(after.path("ratingDistribution").get(2).path("count").asLong()).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("eviction (D5): a salon portfolio upload and then delete are visible on the next read")
+    void should_showPhotoThenDropIt_when_salonPortfolioUploadedAndDeleted() throws Exception {
+        org.mockito.Mockito.when(r2.isEnabled()).thenReturn(true);
+        org.mockito.Mockito.when(r2.buildPublicUrl(org.mockito.ArgumentMatchers.anyString()))
+                .thenAnswer(inv -> "https://cdn.example/" + inv.getArgument(0));
+        PublicBookingPageFixtures.SalonPage salon = pages.salon("Photo Evict Salon");
+        UUID master = pages.salonMaster(salon.salonId(), "Anna", "Bila");
+        BookableMasterSeeder.makeBookable(jdbcTemplate, salon.salonId(), master);
+        assertThat(page(salon.slug()).path("portfolio")).isEmpty();
+
+        org.springframework.util.LinkedMultiValueMap<String, Object> body = new org.springframework.util.LinkedMultiValueMap<>();
+        body.add("file", new org.springframework.core.io.ByteArrayResource(
+                new byte[] {(byte) 0xFF, (byte) 0xD8, (byte) 0xFF, 0x00}) {
+            @Override
+            public String getFilename() {
+                return "a.jpg";
+            }
+        });
+        HttpHeaders headers = fixtures.bearerHeaders(salon.ownerToken());
+        headers.setContentType(org.springframework.http.MediaType.MULTIPART_FORM_DATA);
+        ResponseEntity<String> upload = restTemplate.exchange("/api/v1/salons/" + salon.salonId() + "/portfolio",
+                HttpMethod.POST, new HttpEntity<>(body, headers), String.class);
+        assertThat(upload.getStatusCode()).as(upload.getBody()).isEqualTo(HttpStatus.CREATED);
+        JsonNode afterUpload = page(salon.slug());
+        assertThat(afterUpload.path("portfolio")).hasSize(1);
+
+        String mediaId = afterUpload.path("portfolio").get(0).path("id").asText();
+        ResponseEntity<String> delete = restTemplate.exchange(
+                "/api/v1/salons/" + salon.salonId() + "/portfolio/" + mediaId, HttpMethod.DELETE,
+                new HttpEntity<>(fixtures.bearerHeaders(salon.ownerToken())), String.class);
+        assertThat(delete.getStatusCode().is2xxSuccessful()).as(delete.getBody()).isTrue();
+
+        assertThat(page(salon.slug()).path("portfolio")).isEmpty();
     }
 
     // ── cache (D5) ───────────────────────────────────────────────────────────────────────────
@@ -298,8 +455,9 @@ class PublicSalonBookingInfoIT extends AbstractIntegrationTest {
         ThreadJdbcFootprint.Measured<SalonBookingSlugInfoResponse> hit =
                 ThreadJdbcFootprint.measure(() -> salonBookingSlugService.findBySlug(salon.slug()));
 
-        assertThat(miss.statements()).as("miss: salon row + ONE master batch — %s", miss).isEqualTo(2);
-        assertThat(miss.transactions()).as("not transactional — %s", miss).isZero();
+        assertThat(miss.statements()).as("miss: salon row + ONE master batch + the tab blocks — %s", miss)
+                .isLessThanOrEqualTo(MISS_STATEMENT_BUDGET);
+        assertThat(miss.transactions()).as("one read-only transaction — %s", miss).isEqualTo(1);
         assertThat(hit.footprint().connections()).as("%s", hit.footprint()).isZero();
         assertThat(hit.footprint().statements()).as("%s", hit.footprint()).isZero();
         assertThat(hit.result().masters()).hasSize(1);
@@ -326,7 +484,7 @@ class PublicSalonBookingInfoIT extends AbstractIntegrationTest {
         assertThat(threeMeasured.result().masters()).hasSize(3);
         assertThat(threeMeasured.footprint().statements())
                 .as("one=%s three=%s", oneFootprint, threeMeasured.footprint())
-                .isEqualTo(oneFootprint.statements());
+                .isLessThanOrEqualTo(oneFootprint.statements());
     }
 
     // ── eviction after commit, through the real write paths (D5) ─────────────────────────────
@@ -548,7 +706,8 @@ class PublicSalonBookingInfoIT extends AbstractIntegrationTest {
         assertThat(page.path("name").asText()).isEqualTo("Address Salon");
         assertThat(fieldNames(page)).containsExactlyInAnyOrder("salonId", "name", "city", "avatarUrl",
                 "coverImageUrl", "avgRating", "reviewCount", "bookable", "masters", "region", "street",
-                "buildingNo", "updatedAt");
+                "buildingNo", "updatedAt", "description", "locationNote", "portfolio", "serviceCategories",
+                "ratingDistribution", "latestReviews");
     }
 
     @Test

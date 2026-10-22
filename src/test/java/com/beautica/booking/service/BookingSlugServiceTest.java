@@ -686,6 +686,29 @@ class BookingSlugServiceTest {
     }
 
     @Test
+    @DisplayName("should_clampPageSizeTo20AndDelegate_when_salonReviewsRequested")
+    void should_clampPageSizeTo20AndDelegate_when_salonReviewsRequested() {
+        UUID salonId = UUID.randomUUID();
+        when(salonRepository.findActiveIdByBookingSlug("studio-a1b2")).thenReturn(Optional.of(salonId));
+        when(reviewService.getSalonReviews(eq(salonId), eq(SalonReviewSort.LOWEST), any(PageRequest.class)))
+                .thenReturn(Page.empty());
+
+        service.salonReviewsForSlug("studio-a1b2", SalonReviewSort.LOWEST, PageRequest.of(1, 999));
+
+        verify(reviewService).getSalonReviews(salonId, SalonReviewSort.LOWEST, PageRequest.of(1, 20));
+    }
+
+    @Test
+    @DisplayName("should_throwNotFound_when_salonReviewsSlugUnknownOrInactive")
+    void should_throwNotFound_when_salonReviewsSlugUnknownOrInactive() {
+        when(salonRepository.findActiveIdByBookingSlug("nope")).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> service.salonReviewsForSlug("nope", SalonReviewSort.NEWEST, PageRequest.of(0, 20)))
+                .isInstanceOf(NotFoundException.class);
+        verify(reviewService, org.mockito.Mockito.never()).getSalonReviews(any(), any(), any());
+    }
+
+    @Test
     @DisplayName("should_throwNotFound_when_reviewsSlugUnknownOrInactive")
     void should_throwNotFound_when_reviewsSlugUnknownOrInactive() {
         when(masterRepository.findActiveIdByBookingSlug("nope")).thenReturn(Optional.empty());

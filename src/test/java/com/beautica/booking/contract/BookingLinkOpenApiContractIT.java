@@ -103,10 +103,12 @@ class BookingLinkOpenApiContractIT extends AbstractIntegrationTest {
         page.path("properties").fieldNames().forEachRemaining(pageFields::add);
         assertThat(pageFields).containsExactlyInAnyOrder(
                 "salonId", "name", "city", "avatarUrl", "coverImageUrl", "avgRating", "reviewCount",
-                "bookable", "masters", "region", "street", "buildingNo", "updatedAt");
+                "bookable", "masters", "region", "street", "buildingNo", "updatedAt", "description", "locationNote",
+                "portfolio", "serviceCategories", "ratingDistribution", "latestReviews");
         assertThat(texts(page.path("required")))
-                .containsExactlyInAnyOrder("salonId", "name", "reviewCount", "bookable", "masters", "updatedAt");
-        for (String nullable : List.of("region", "street", "buildingNo")) {
+                .containsExactlyInAnyOrder("salonId", "name", "reviewCount", "bookable", "masters", "updatedAt",
+                        "portfolio", "serviceCategories", "ratingDistribution", "latestReviews");
+        for (String nullable : List.of("region", "street", "buildingNo", "description", "locationNote")) {
             assertThat(texts(page.path("properties").path(nullable).path("type")))
                     .as(nullable).containsExactlyInAnyOrder("string", "null");
         }
@@ -151,5 +153,7 @@ class BookingLinkOpenApiContractIT extends AbstractIntegrationTest {
         List<String> paramNames = new ArrayList<>();
         reviewsParams.forEach(p -> paramNames.add(p.path("name").asText()));
         assertThat(paramNames).contains("slug", "sort");
+        JsonNode salonReviews = spec().path("paths").path("/api/v1/book/s/{slug}/reviews").path("get");
+        assertThat(salonReviews.isMissingNode()).as("phase 384 salon reviews route in the spec").isFalse();
     }
 }
