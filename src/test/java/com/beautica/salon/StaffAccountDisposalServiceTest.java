@@ -94,6 +94,9 @@ class StaffAccountDisposalServiceTest {
     @Mock
     private com.beautica.user.AccountBlobPurgeRegistrar accountBlobPurgeRegistrar;
 
+    @Mock
+    private com.beautica.common.cache.MasterProfileCacheEvictor masterProfileCacheEvictor;
+
     private StaffAccountDisposalService service;
 
     /** Bound to dispose()'s own logger: the audit line's wording is part of its contract. */
@@ -116,7 +119,8 @@ class StaffAccountDisposalServiceTest {
     private StaffAccountDisposalService newService() {
         return new StaffAccountDisposalService(
                 userRepository, inviteTokenRepository, masterRepository, clock,
-                tokensValidAfterCache, userProfileCacheEvictor, mediaRepository, accountBlobPurgeRegistrar);
+                tokensValidAfterCache, userProfileCacheEvictor, mediaRepository, accountBlobPurgeRegistrar,
+                masterProfileCacheEvictor);
     }
 
     private static Master masterWithUser(UUID masterId, UUID userId, String firstName, String lastName) {
@@ -173,6 +177,27 @@ class StaffAccountDisposalServiceTest {
         // caller still reaches the flush + hard-delete below, exactly as a salon-scoped caller would.
         verify(masterRepository).flush();
         verify(userRepository).deleteAllByIdInBatch(List.of(staffUserId));
+    }
+
+    @Test
+    @DisplayName("phase 380 audit: every disposed master's public booking page is evicted by its already-loaded slug "
+            + "(a slug-less legacy master passes null, which the evictor ignores)")
+    void should_evictBookingSlugInfo_when_mastersDisposed() {
+        UUID staffUserId = UUID.randomUUID();
+        UUID otherUserId = UUID.randomUUID();
+        Master withSlug = masterWithUser(UUID.randomUUID(), staffUserId, "Тест", "Майстер");
+        withSlug.setBookingSlug("test-maister-ab12");
+        Master legacy = masterWithUser(UUID.randomUUID(), otherUserId, "Стара", "Майстриня");
+        when(masterRepository.findAllByUserIdInWithUser(List.of(staffUserId, otherUserId)))
+                .thenReturn(List.of(withSlug, legacy));
+        when(masterRepository.findIdsWithHistoricalReferences(any())).thenReturn(List.of());
+        service = newService();
+
+        service.dispose(UUID.randomUUID(), UUID.randomUUID(), List.of(staffUserId, otherUserId),
+                StaffDisposalReason.SALON_DELETION);
+
+        verify(masterProfileCacheEvictor).evictBookingSlugInfoBySlugAfterCommit("test-maister-ab12");
+        verify(masterProfileCacheEvictor).evictBookingSlugInfoBySlugAfterCommit(null);
     }
 
     @Test

@@ -90,6 +90,9 @@ public class MasterService {
     // inline cacheManager.getCache("user-profile") so the cross-aggregate writer set stays
     // enumerable from one file; see UserProfileCacheEvictor's javadoc.
     private final com.beautica.common.cache.UserProfileCacheEvictor userProfileCacheEvictor;
+    // Phase 380 audit: the public master booking page (booking-slug-info) 404s for an inactive master /
+    // inactive salon and renders the salon ref, so every deactivate / rotate path must drop that entry.
+    private final com.beautica.common.cache.MasterProfileCacheEvictor masterProfileCacheEvictor;
     // Mobile Phase 111: a salon's rating is now the equal-weighted mean of its ACTIVE masters'
     // salon-scoped ratings (ReviewRepository#recalculateSalonRating), so it is a function of the
     // staff set and must be recomputed whenever this class changes that set — with no review
@@ -672,6 +675,10 @@ public class MasterService {
         master.setActive(false);
         // Hibernate dirty-checking flushes the mutation on commit; no explicit save() needed.
         evictMasterCalendarAfterCommit(masterId);
+        // The ONE funnel for DELETE /masters/{id}, salon-staff removal and the salon-deletion cascade
+        // (deactivateMasters): findByBookingSlugWithUser filters on masters.is_active, so a cached
+        // GET /book/{slug}/info must not outlive the deactivation. Slug already on the loaded row: no lookup.
+        masterProfileCacheEvictor.evictBookingSlugInfoBySlugAfterCommit(master.getBookingSlug());
 
         // Deactivation flips is_active FALSE — a sole-performer's SALON service must vanish from
         // the booking master-list and the salon catalogue immediately, not after the 60s TTL.
@@ -878,6 +885,8 @@ public class MasterService {
             });
         }
         evictMasterCalendarAfterCommit(masterId);
+        // The rotated master's public page renders its salon ref (name + bookingSlug).
+        masterProfileCacheEvictor.evictBookingSlugInfoBySlugAfterCommit(master.getBookingSlug());
 
         // Audit trail (LOW-fix): no dedicated audit-log subsystem exists in this codebase yet —
         // a structured INFO log line is the established minimal pattern for sensitive mutations.

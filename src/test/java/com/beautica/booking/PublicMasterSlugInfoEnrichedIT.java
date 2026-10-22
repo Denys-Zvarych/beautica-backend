@@ -1,6 +1,7 @@
 package com.beautica.booking;
 
 import com.beautica.AbstractIntegrationTest;
+import com.beautica.booking.PublicBookingPageFixtures.IndependentMaster;
 import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.LoginRequest;
 import com.beautica.booking.dto.BookingSlugInfoResponse;
@@ -45,6 +46,8 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
 
+import static com.beautica.booking.PublicBookingPageFixtures.SEEDED_INSTAGRAM;
+import static com.beautica.booking.PublicBookingPageFixtures.SEEDED_PHONE;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
@@ -63,9 +66,6 @@ import static org.mockito.Mockito.when;
 @DisplayName("GET /book/{slug}/info — enriched master page (Phase 380)")
 class PublicMasterSlugInfoEnrichedIT extends AbstractIntegrationTest {
 
-    private static final String PASSWORD = "Str0ngP@ss1!";
-    private static final String SEEDED_PHONE = "+380671119999";
-    private static final String SEEDED_INSTAGRAM = "secret_insta_handle";
 
     private static final Set<String> ROOT_KEYS = Set.of(
             "masterName", "avatarUrl", "bio", "services", "masterId", "masterType", "professionalTitle", "city",
@@ -82,12 +82,12 @@ class PublicMasterSlugInfoEnrichedIT extends AbstractIntegrationTest {
     @Autowired private EntityManagerFactory emf;
     @MockBean private R2StorageService r2;
 
-    private ServiceTestFixtures fixtures;
+    private PublicBookingPageFixtures pages;
     private String clientIp;
 
     @BeforeEach
     void setUp() {
-        fixtures = new ServiceTestFixtures(restTemplate, jdbcTemplate, objectMapper, passwordEncoder);
+        pages = new PublicBookingPageFixtures(jdbcTemplate, restTemplate, objectMapper, passwordEncoder);
         ThreadLocalRandom random = ThreadLocalRandom.current();
         // The /info bucket is 60/min per IP and shared by every IT on the cached context: own IP per test.
         clientIp = "10." + random.nextInt(1, 255) + "." + random.nextInt(1, 255) + "." + random.nextInt(1, 255);
@@ -102,53 +102,8 @@ class PublicMasterSlugInfoEnrichedIT extends AbstractIntegrationTest {
 
     // ── fixtures ─────────────────────────────────────────────────────────────────────────────
 
-    private record Master(UUID userId, UUID masterId, String slug, String email) {
-    }
-
-    private Master independentMaster() {
-        String email = "m380-" + UUID.randomUUID() + "@beautica.test";
-        UUID userId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO users (id, email, password_hash, role, first_name, last_name, phone_number, bio, "
-                        + "instagram, professional_title, city, region, avatar_url, is_active, email_verified) "
-                        + "VALUES (?, ?, ?, 'INDEPENDENT_MASTER', 'Олена', 'Коваль', ?, 'Манікюр 8 років', ?, "
-                        + "'Майстер манікюру', 'Львів', 'Львівська область', 'https://cdn.example/a.webp', true, true)",
-                userId, email, passwordEncoder.encode(PASSWORD), SEEDED_PHONE, SEEDED_INSTAGRAM);
-        UUID masterId = UUID.randomUUID();
-        String slug = "olena-k-" + masterId.toString().substring(0, 4);
-        jdbcTemplate.update(
-                "INSERT INTO masters (id, user_id, salon_id, master_type, avg_rating, review_count, is_active, "
-                        + "booking_slug, created_at, updated_at) "
-                        + "VALUES (?, ?, NULL, 'INDEPENDENT_MASTER', 0, 0, true, ?, NOW(), NOW())",
-                masterId, userId, slug);
-        return new Master(userId, masterId, slug, email);
-    }
-
-    private Master bookableMaster() {
-        Master master = independentMaster();
-        BookableMasterSeeder.makeIndependentBookable(jdbcTemplate, master.masterId());
-        return master;
-    }
-
-    private String tokenOf(Master master) throws Exception {
-        ResponseEntity<String> resp = restTemplate.postForEntity(
-                "/api/v1/auth/login", new LoginRequest(master.email(), PASSWORD), String.class);
-        assertThat(resp.getStatusCode()).as("login body=%s", resp.getBody()).isEqualTo(HttpStatus.OK);
-        return objectMapper.readValue(resp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {})
-                .data().accessToken();
-    }
-
-    private UUID insertClient() {
-        UUID id = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO users (id, email, password_hash, role, first_name, last_name, is_active, email_verified) "
-                        + "VALUES (?, ?, ?, 'CLIENT', 'Ірина', 'Кравчук', true, true)",
-                id, "c380-" + id + "@beautica.test", passwordEncoder.encode(PASSWORD));
-        return id;
-    }
-
     /** One COMPLETED booking plus its review, {@code minutesAgo} old; a fresh booking per review (UNIQUE). */
-    private void insertReview(Master master, UUID clientId, int rating, int minutesAgo) {
+    private void insertReview(IndependentMaster master, UUID clientId, int rating, int minutesAgo) {
         UUID masterServiceId = jdbcTemplate.queryForObject(
                 "SELECT id FROM master_services WHERE master_id = ? LIMIT 1", UUID.class, master.masterId());
         UUID bookingId = UUID.randomUUID();
@@ -166,7 +121,7 @@ class PublicMasterSlugInfoEnrichedIT extends AbstractIntegrationTest {
                 UUID.randomUUID(), bookingId, clientId, master.masterId(), rating, "review-" + minutesAgo, minutesAgo);
     }
 
-    private void insertPortfolioPhoto(Master master, int minutesAgo) {
+    private void insertPortfolioPhoto(IndependentMaster master, int minutesAgo) {
         UUID id = UUID.randomUUID();
         String key = "portfolio/independent/" + master.masterId() + "/seed-" + id + ".jpg";
         jdbcTemplate.update(
@@ -218,8 +173,8 @@ class PublicMasterSlugInfoEnrichedIT extends AbstractIntegrationTest {
     @Test
     @DisplayName("full payload for an independent master with services, schedule, 2 reviews, 2 portfolio photos")
     void should_returnFullPayload_when_masterHasEverything() throws Exception {
-        Master master = bookableMaster();
-        UUID client = insertClient();
+        IndependentMaster master = pages.independentMaster(true);
+        UUID client = pages.insertClient();
         insertReview(master, client, 5, 10);
         insertReview(master, client, 4, 20);
         jdbcTemplate.update("UPDATE masters SET review_count = 2, avg_rating = 4.50 WHERE id = ?", master.masterId());
@@ -250,8 +205,8 @@ class PublicMasterSlugInfoEnrichedIT extends AbstractIntegrationTest {
     @Test
     @DisplayName("exact key-set allow-list at every level; no phone/email/instagram/street anywhere in the body")
     void should_exposeOnlyAllowListedKeys_when_pageRendered() throws Exception {
-        Master master = bookableMaster();
-        UUID client = insertClient();
+        IndependentMaster master = pages.independentMaster(true);
+        UUID client = pages.insertClient();
         insertReview(master, client, 5, 10);
         insertPortfolioPhoto(master, 5);
         jdbcTemplate.update("UPDATE masters SET review_count = 1, avg_rating = 5.00 WHERE id = ?", master.masterId());
@@ -277,15 +232,12 @@ class PublicMasterSlugInfoEnrichedIT extends AbstractIntegrationTest {
     @Test
     @DisplayName("salon master -> salon.name + salon.bookingSlug; masterType SALON_MASTER")
     void should_returnSalonRef_when_masterBelongsToSalon() throws Exception {
-        String ownerToken = fixtures.createSalonOwnerAndGetToken("owner-380-" + UUID.randomUUID() + "@beautica.test");
-        UUID salonId = fixtures.createSalon(ownerToken, "Studio Velvet");
-        UUID masterId = fixtures.createSalonMaster(salonId);
-        jdbcTemplate.update("UPDATE masters SET booking_slug = ? WHERE id = ?",
-                "sm-" + masterId.toString().substring(0, 8), masterId);
-        BookableMasterSeeder.makeBookable(jdbcTemplate, salonId, masterId);
-        String salonSlug = jdbcTemplate.queryForObject("SELECT booking_slug FROM salons WHERE id = ?", String.class, salonId);
+        PublicBookingPageFixtures.SalonPage salon = pages.salon("Studio Velvet");
+        UUID masterId = pages.salonMaster(salon.salonId(), "Марія", "Тестова");
+        BookableMasterSeeder.makeBookable(jdbcTemplate, salon.salonId(), masterId);
+        String salonSlug = salon.slug();
 
-        JsonNode body = page("sm-" + masterId.toString().substring(0, 8));
+        JsonNode body = page(pages.masterSlugOf(masterId));
 
         assertThat(body.path("masterType").asText()).isEqualTo("SALON_MASTER");
         assertThat(keys(body.path("salon"))).isEqualTo(Set.of("name", "bookingSlug"));
@@ -299,7 +251,7 @@ class PublicMasterSlugInfoEnrichedIT extends AbstractIntegrationTest {
     @Test
     @DisplayName("bookable matrix: no services -> false; services without schedule -> false; both -> true")
     void should_flipBookable_when_servicesAndScheduleArePresent() throws Exception {
-        Master master = independentMaster();
+        IndependentMaster master = pages.independentMaster(false);
         assertThat(page(master.slug()).path("bookable").asBoolean()).as("no services").isFalse();
 
         cacheManager.getCache("booking-slug-info").clear();
@@ -314,18 +266,16 @@ class PublicMasterSlugInfoEnrichedIT extends AbstractIntegrationTest {
     @Test
     @DisplayName("inactive master -> 404; master of an inactive salon -> 404; unbookable active master -> 200")
     void should_return404_when_masterOrSalonInactive() throws Exception {
-        Master inactive = bookableMaster();
+        IndependentMaster inactive = pages.independentMaster(true);
         jdbcTemplate.update("UPDATE masters SET is_active = false WHERE id = ?", inactive.masterId());
-        String ownerToken = fixtures.createSalonOwnerAndGetToken("owner-380b-" + UUID.randomUUID() + "@beautica.test");
-        UUID salonId = fixtures.createSalon(ownerToken, "Closed Studio");
-        UUID salonMaster = fixtures.createSalonMaster(salonId);
-        String salonMasterSlug = "cs-" + salonMaster.toString().substring(0, 8);
-        jdbcTemplate.update("UPDATE masters SET booking_slug = ? WHERE id = ?", salonMasterSlug, salonMaster);
-        jdbcTemplate.update("UPDATE salons SET is_active = false WHERE id = ?", salonId);
+        PublicBookingPageFixtures.SalonPage closed = pages.salon("Closed Studio");
+        UUID salonMaster = pages.salonMaster(closed.salonId(), "Марія", "Тестова");
+        String salonMasterSlug = pages.masterSlugOf(salonMaster);
+        jdbcTemplate.update("UPDATE salons SET is_active = false WHERE id = ?", closed.salonId());
 
         assertThat(get(inactive.slug(), new HttpHeaders()).getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
         assertThat(get(salonMasterSlug, new HttpHeaders()).getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
-        assertThat(get(independentMaster().slug(), new HttpHeaders()).getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(get(pages.independentMaster(false).slug(), new HttpHeaders()).getStatusCode()).isEqualTo(HttpStatus.OK);
     }
 
     // ── caps ──────────────────────────────────────────────────────────────────────────────────
@@ -333,8 +283,8 @@ class PublicMasterSlugInfoEnrichedIT extends AbstractIntegrationTest {
     @Test
     @DisplayName("latestReviews capped at 5 newest first; portfolio capped at 12")
     void should_capReviewsAtFiveAndPortfolioAtTwelve_when_manyExist() throws Exception {
-        Master master = bookableMaster();
-        UUID client = insertClient();
+        IndependentMaster master = pages.independentMaster(true);
+        UUID client = pages.insertClient();
         for (int i = 1; i <= 7; i++) {
             insertReview(master, client, 5, i * 10);
         }
@@ -353,7 +303,7 @@ class PublicMasterSlugInfoEnrichedIT extends AbstractIntegrationTest {
 
     // ── shared `portfolio` cache must not be poisoned (audit #1) ─────────────────────────────
 
-    private JsonNode publicPortfolio(Master master) throws Exception {
+    private JsonNode publicPortfolio(IndependentMaster master) throws Exception {
         ResponseEntity<String> response = restTemplate.exchange("/api/v1/masters/" + master.masterId() + "/portfolio",
                 HttpMethod.GET, new HttpEntity<>(new HttpHeaders()), String.class);
         assertThat(response.getStatusCode()).as("body=%s", response.getBody()).isEqualTo(HttpStatus.OK);
@@ -363,7 +313,7 @@ class PublicMasterSlugInfoEnrichedIT extends AbstractIntegrationTest {
     @Test
     @DisplayName("should_returnAllPhotos_when_infoCalledBeforePortfolio")
     void should_returnAllPhotos_when_infoCalledBeforePortfolio() throws Exception {
-        Master master = bookableMaster();
+        IndependentMaster master = pages.independentMaster(true);
         for (int i = 1; i <= 14; i++) {
             insertPortfolioPhoto(master, i);
         }
@@ -378,7 +328,7 @@ class PublicMasterSlugInfoEnrichedIT extends AbstractIntegrationTest {
     @Test
     @DisplayName("should_capInfoPortfolioAt12_when_portfolioEndpointWarmedFirst")
     void should_capInfoPortfolioAt12_when_portfolioEndpointWarmedFirst() throws Exception {
-        Master master = bookableMaster();
+        IndependentMaster master = pages.independentMaster(true);
         for (int i = 1; i <= 14; i++) {
             insertPortfolioPhoto(master, i);
         }
@@ -395,8 +345,8 @@ class PublicMasterSlugInfoEnrichedIT extends AbstractIntegrationTest {
     @Test
     @DisplayName("eviction: a new review is visible on the next read (rating, count, latestReviews)")
     void should_showNewReview_when_reviewCreatedEventCommits() throws Exception {
-        Master master = bookableMaster();
-        UUID client = insertClient();
+        IndependentMaster master = pages.independentMaster(true);
+        UUID client = pages.insertClient();
         assertThat(page(master.slug()).path("reviewCount").asInt()).isZero();
         evictSlugCacheEntry(master.slug());
 
@@ -412,8 +362,8 @@ class PublicMasterSlugInfoEnrichedIT extends AbstractIntegrationTest {
     @Test
     @DisplayName("eviction: a portfolio upload is visible on the next read")
     void should_showNewPhoto_when_portfolioUploaded() throws Exception {
-        Master master = bookableMaster();
-        String token = tokenOf(master);
+        IndependentMaster master = pages.independentMaster(true);
+        String token = pages.tokenOf(master);
         assertThat(page(master.slug()).path("portfolio")).isEmpty();
         evictSlugCacheEntry(master.slug());
 
@@ -427,10 +377,10 @@ class PublicMasterSlugInfoEnrichedIT extends AbstractIntegrationTest {
     @Test
     @DisplayName("eviction: deactivating the service flips bookable on the next read")
     void should_flipBookable_when_serviceDeactivated() throws Exception {
-        Master master = independentMaster();
+        IndependentMaster master = pages.independentMaster(false);
         UUID definitionId = BookableMasterSeeder.assignNewIndependentService(jdbcTemplate, master.masterId());
         BookableMasterSeeder.seedUsableSchedule(jdbcTemplate, master.masterId());
-        String token = tokenOf(master);
+        String token = pages.tokenOf(master);
         assertThat(page(master.slug()).path("bookable").asBoolean()).isTrue();
         evictSlugCacheEntry(master.slug());
 
@@ -446,8 +396,8 @@ class PublicMasterSlugInfoEnrichedIT extends AbstractIntegrationTest {
     @Test
     @DisplayName("eviction: clearing the schedule flips bookable on the next read")
     void should_flipBookable_when_scheduleCleared() throws Exception {
-        Master master = bookableMaster();
-        String token = tokenOf(master);
+        IndependentMaster master = pages.independentMaster(true);
+        String token = pages.tokenOf(master);
         UUID scheduleId = jdbcTemplate.queryForObject(
                 "SELECT id FROM weekly_schedules WHERE master_id = ? LIMIT 1", UUID.class, master.masterId());
         assertThat(page(master.slug()).path("bookable").asBoolean()).isTrue();
@@ -466,7 +416,7 @@ class PublicMasterSlugInfoEnrichedIT extends AbstractIntegrationTest {
     @Test
     @DisplayName("Cache-Control public, max-age=0, s-maxage=30 + weak ETag; If-None-Match replay -> 304 with empty body")
     void should_answer304_when_ifNoneMatchMatches() throws Exception {
-        Master master = bookableMaster();
+        IndependentMaster master = pages.independentMaster(true);
 
         ResponseEntity<String> first = get(master.slug(), new HttpHeaders());
         String etag = first.getHeaders().getETag();
@@ -496,8 +446,8 @@ class PublicMasterSlugInfoEnrichedIT extends AbstractIntegrationTest {
     @Test
     @DisplayName("a cache miss costs at most 7 statements (D9)")
     void should_useAtMostSevenStatements_when_cacheMiss() {
-        Master master = bookableMaster();
-        UUID client = insertClient();
+        IndependentMaster master = pages.independentMaster(true);
+        UUID client = pages.insertClient();
         insertReview(master, client, 5, 10);
         insertPortfolioPhoto(master, 5);
         Statistics statistics = HibernateStatistics.enabledOn(emf);

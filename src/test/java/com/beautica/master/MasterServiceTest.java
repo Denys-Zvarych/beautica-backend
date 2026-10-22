@@ -106,6 +106,7 @@ class MasterServiceTest {
     // different question, and one a mock can never answer: it is proven against the live @Cacheable
     // proxies in CachePrefixEvictionKeyShapeTest.
     @Mock private com.beautica.common.cache.MasterCachePrefixEvictor cachePrefixEvictor;
+    @Mock private com.beautica.common.cache.MasterProfileCacheEvictor masterProfileCacheEvictor;
 
     // Mobile Phase 111: MasterService publishes a SalonStaffChangedEvent from every staff-set
     // mutation so the salon's derived rating is recomputed. @InjectMocks must carry this or the
@@ -602,6 +603,7 @@ class MasterServiceTest {
         Master master = Master.builder()
                 .masterType(MasterType.INDEPENDENT_MASTER)
                 .isActive(true)
+                .bookingSlug("olena-k-ab12")
                 .build();
         ReflectionTestUtils.setField(master, "id", masterId);
         ReflectionTestUtils.setField(master, "user", user);
@@ -637,6 +639,8 @@ class MasterServiceTest {
         verify(masterDetailCache).evict(masterId);
         // The master-by-user cache must also have been evicted for the user.
         verify(masterByUserCache).evict(userId);
+        // Phase 380 audit F1: the deactivated master's public booking page must go too (slug already on the row).
+        verify(masterProfileCacheEvictor).evictBookingSlugInfoBySlugAfterCommit("olena-k-ab12");
     }
 
     // ── bookability-cache eviction guard (deactivate/reactivate flips is_active) ──

@@ -78,43 +78,18 @@ class PublicSalonBookingInfoIT extends AbstractIntegrationTest {
     @Autowired private TransactionTemplate transactionTemplate;
 
     private ServiceTestFixtures fixtures;
+    private PublicBookingPageFixtures pages;
     private String clientIp;
 
     @BeforeEach
     void setUp() {
         fixtures = new ServiceTestFixtures(restTemplate, jdbcTemplate, objectMapper, passwordEncoder);
+        pages = new PublicBookingPageFixtures(jdbcTemplate, restTemplate, objectMapper, passwordEncoder);
         ThreadLocalRandom random = ThreadLocalRandom.current();
         clientIp = "10." + random.nextInt(1, 255) + "." + random.nextInt(1, 255) + "." + random.nextInt(1, 255);
     }
 
     // ── fixtures ─────────────────────────────────────────────────────────────────────────────
-
-    private record OwnedSalon(String ownerToken, UUID salonId, String slug) {
-    }
-
-    private OwnedSalon ownedSalon(String name) throws Exception {
-        String token = fixtures.createSalonOwnerAndGetToken("owner-377-" + UUID.randomUUID() + "@beautica.test");
-        UUID salonId = fixtures.createSalon(token, name);
-        return new OwnedSalon(token, salonId, salonSlugOf(salonId));
-    }
-
-    /** A salon master with a stored slug — the steady state for every master created since phase 13.1. */
-    private UUID namedSalonMaster(UUID salonId, String firstName, String lastName) {
-        UUID masterId = legacySalonMaster(salonId, firstName, lastName);
-        jdbcTemplate.update("UPDATE masters SET booking_slug = ? WHERE id = ?",
-                "m-" + masterId.toString().substring(0, 8) + "-s377", masterId);
-        return masterId;
-    }
-
-    /** A pre-V86 LEGACY salon master: {@code booking_slug NULL}. */
-    private UUID legacySalonMaster(UUID salonId, String firstName, String lastName) {
-        UUID masterId = fixtures.createSalonMaster(salonId);
-        jdbcTemplate.update(
-                "UPDATE users SET first_name = ?, last_name = ?, professional_title = 'Стиліст', "
-                        + "avatar_url = 'https://cdn.beautica.test/a.jpg' WHERE id = ?",
-                firstName, lastName, userIdOf(masterId));
-        return masterId;
-    }
 
     private String salonSlugOf(UUID salonId) {
         return jdbcTemplate.queryForObject("SELECT booking_slug FROM salons WHERE id = ?", String.class, salonId);
@@ -171,14 +146,14 @@ class PublicSalonBookingInfoIT extends AbstractIntegrationTest {
     @Test
     @DisplayName("2 bookable + 1 service-only + 1 inactive bookable master → only the 2 bookable listed, bookable=true, salon fields")
     void should_listOnlyBookableMasters_when_salonHasMixedMasters() throws Exception {
-        OwnedSalon salon = ownedSalon("Mix Salon");
-        UUID anna = namedSalonMaster(salon.salonId(), "Anna", "Bila");
+        PublicBookingPageFixtures.SalonPage salon = pages.salon("Mix Salon");
+        UUID anna = pages.salonMaster(salon.salonId(), "Anna", "Bila");
         BookableMasterSeeder.makeBookable(jdbcTemplate, salon.salonId(), anna);
-        UUID olha = namedSalonMaster(salon.salonId(), "Olha", "Chorna");
+        UUID olha = pages.salonMaster(salon.salonId(), "Olha", "Chorna");
         BookableMasterSeeder.makeBookable(jdbcTemplate, salon.salonId(), olha);
-        UUID serviceOnly = namedSalonMaster(salon.salonId(), "Bez", "Hrafika");
+        UUID serviceOnly = pages.salonMaster(salon.salonId(), "Bez", "Hrafika");
         BookableMasterSeeder.assignNewSalonService(jdbcTemplate, salon.salonId(), serviceOnly);
-        UUID inactive = namedSalonMaster(salon.salonId(), "Ne", "Aktyvna");
+        UUID inactive = pages.salonMaster(salon.salonId(), "Ne", "Aktyvna");
         BookableMasterSeeder.makeBookable(jdbcTemplate, salon.salonId(), inactive);
         jdbcTemplate.update("UPDATE masters SET is_active = false WHERE id = ?", inactive);
 
@@ -199,10 +174,10 @@ class PublicSalonBookingInfoIT extends AbstractIntegrationTest {
     @Test
     @DisplayName("legacy master (booking_slug NULL) is omitted, never issued a slug, and the GET does zero writes / transactions")
     void should_omitLegacyMasterWithoutWriting_when_masterHasNoSlug() throws Exception {
-        OwnedSalon salon = ownedSalon("Slug Salon");
-        UUID legacy = legacySalonMaster(salon.salonId(), "Iryna", "Lehasi");
+        PublicBookingPageFixtures.SalonPage salon = pages.salon("Slug Salon");
+        UUID legacy = pages.legacySalonMaster(salon.salonId(), "Iryna", "Lehasi");
         BookableMasterSeeder.makeBookable(jdbcTemplate, salon.salonId(), legacy);
-        UUID stored = namedSalonMaster(salon.salonId(), "Maria", "Stara");
+        UUID stored = pages.salonMaster(salon.salonId(), "Maria", "Stara");
         BookableMasterSeeder.makeBookable(jdbcTemplate, salon.salonId(), stored);
         jdbcTemplate.update("UPDATE masters SET booking_slug = 'maria-stara-zz11' WHERE id = ?", stored);
 
@@ -221,8 +196,8 @@ class PublicSalonBookingInfoIT extends AbstractIntegrationTest {
     @Test
     @DisplayName("only slug-less bookable masters → 200, bookable=false (omission never 404s the page)")
     void should_returnNotBookable_when_onlyLegacyMastersAreBookable() throws Exception {
-        OwnedSalon salon = ownedSalon("Legacy Only Salon");
-        UUID legacy = legacySalonMaster(salon.salonId(), "Tilky", "Lehasi");
+        PublicBookingPageFixtures.SalonPage salon = pages.salon("Legacy Only Salon");
+        UUID legacy = pages.legacySalonMaster(salon.salonId(), "Tilky", "Lehasi");
         BookableMasterSeeder.makeBookable(jdbcTemplate, salon.salonId(), legacy);
 
         JsonNode page = page(salon.slug());
@@ -235,8 +210,8 @@ class PublicSalonBookingInfoIT extends AbstractIntegrationTest {
     @Test
     @DisplayName("active salon with no bookable master → 200, bookable=false, masters: [] (not 404)")
     void should_returnNotBookable_when_noMasterBookable() throws Exception {
-        OwnedSalon salon = ownedSalon("Empty Salon");
-        UUID master = namedSalonMaster(salon.salonId(), "Tilky", "Posluha");
+        PublicBookingPageFixtures.SalonPage salon = pages.salon("Empty Salon");
+        UUID master = pages.salonMaster(salon.salonId(), "Tilky", "Posluha");
         BookableMasterSeeder.assignNewSalonService(jdbcTemplate, salon.salonId(), master);
 
         JsonNode page = page(salon.slug());
@@ -252,7 +227,7 @@ class PublicSalonBookingInfoIT extends AbstractIntegrationTest {
     @Test
     @DisplayName("inactive salon → 404")
     void should_return404_when_salonInactive() throws Exception {
-        OwnedSalon salon = ownedSalon("Closed Salon");
+        PublicBookingPageFixtures.SalonPage salon = pages.salon("Closed Salon");
         jdbcTemplate.update("UPDATE salons SET is_active = false WHERE id = ?", salon.salonId());
 
         ResponseEntity<String> response = anonymousGet("/api/v1/book/s/" + salon.slug() + "/info");
@@ -285,9 +260,9 @@ class PublicSalonBookingInfoIT extends AbstractIntegrationTest {
     @Test
     @DisplayName("anonymous 200 carries exactly the D7 fields — no owner id/email/phone, no master/user ids")
     void should_exposeOnlyPublicFields_when_anonymous() throws Exception {
-        OwnedSalon salon = ownedSalon("Public Salon");
+        PublicBookingPageFixtures.SalonPage salon = pages.salon("Public Salon");
         jdbcTemplate.update("UPDATE salons SET phone = '+380501112233' WHERE id = ?", salon.salonId());
-        UUID master = namedSalonMaster(salon.salonId(), "Publichna", "Maisterka");
+        UUID master = pages.salonMaster(salon.salonId(), "Publichna", "Maisterka");
         BookableMasterSeeder.makeBookable(jdbcTemplate, salon.salonId(), master);
         String ownerEmail = jdbcTemplate.queryForObject(
                 "SELECT u.email FROM users u JOIN salons s ON s.owner_id = u.id WHERE s.id = ?",
@@ -314,8 +289,8 @@ class PublicSalonBookingInfoIT extends AbstractIntegrationTest {
     @Test
     @DisplayName("second lookup of a slug is a cache hit: zero connections and statements (the probe sees the miss's work)")
     void should_touchNoDatabase_when_slugCached() throws Exception {
-        OwnedSalon salon = ownedSalon("Cached Salon");
-        UUID master = namedSalonMaster(salon.salonId(), "Keshova", "Maisterka");
+        PublicBookingPageFixtures.SalonPage salon = pages.salon("Cached Salon");
+        UUID master = pages.salonMaster(salon.salonId(), "Keshova", "Maisterka");
         BookableMasterSeeder.makeBookable(jdbcTemplate, salon.salonId(), master);
         jdbcTemplate.update("UPDATE masters SET booking_slug = 'keshova-m-c4c4' WHERE id = ?", master);
 
@@ -333,13 +308,13 @@ class PublicSalonBookingInfoIT extends AbstractIntegrationTest {
     @Test
     @DisplayName("statements on a miss are constant in the number of bookable masters (one batch, never per master)")
     void should_useConstantStatements_when_salonHasManyBookableMasters() throws Exception {
-        OwnedSalon one = ownedSalon("One Master Salon");
-        UUID solo = namedSalonMaster(one.salonId(), "Odna", "Maisterka");
+        PublicBookingPageFixtures.SalonPage one = pages.salon("One Master Salon");
+        UUID solo = pages.salonMaster(one.salonId(), "Odna", "Maisterka");
         BookableMasterSeeder.makeBookable(jdbcTemplate, one.salonId(), solo);
         jdbcTemplate.update("UPDATE masters SET booking_slug = 'odna-m-o1o1' WHERE id = ?", solo);
-        OwnedSalon three = ownedSalon("Three Master Salon");
+        PublicBookingPageFixtures.SalonPage three = pages.salon("Three Master Salon");
         for (int i = 0; i < 3; i++) {
-            UUID master = namedSalonMaster(three.salonId(), "Tr" + i, "Maisterka");
+            UUID master = pages.salonMaster(three.salonId(), "Tr" + i, "Maisterka");
             BookableMasterSeeder.makeBookable(jdbcTemplate, three.salonId(), master);
             jdbcTemplate.update("UPDATE masters SET booking_slug = ? WHERE id = ?", "tr" + i + "-m-t3t3", master);
         }
@@ -359,8 +334,8 @@ class PublicSalonBookingInfoIT extends AbstractIntegrationTest {
     @Test
     @DisplayName("salon master gains working hours (owner PUT override) → cached bookable=false page evicted, master now listed")
     void should_listMaster_when_masterGainsSchedule() throws Exception {
-        OwnedSalon salon = ownedSalon("Schedule Salon");
-        UUID master = namedSalonMaster(salon.salonId(), "Novyi", "Hrafik");
+        PublicBookingPageFixtures.SalonPage salon = pages.salon("Schedule Salon");
+        UUID master = pages.salonMaster(salon.salonId(), "Novyi", "Hrafik");
         BookableMasterSeeder.assignNewSalonService(jdbcTemplate, salon.salonId(), master);
         assertThat(page(salon.slug()).path("bookable").asBoolean()).isFalse();
         assertThat(pageCache().get(salon.slug())).as("arrange: the page is cached").isNotNull();
@@ -383,8 +358,8 @@ class PublicSalonBookingInfoIT extends AbstractIntegrationTest {
     @Test
     @DisplayName("owner unassigns the master's only service → page evicted, master gone, bookable=false")
     void should_dropMaster_when_serviceUnassigned() throws Exception {
-        OwnedSalon salon = ownedSalon("Unassign Salon");
-        UUID master = namedSalonMaster(salon.salonId(), "Bez", "Posluhy");
+        PublicBookingPageFixtures.SalonPage salon = pages.salon("Unassign Salon");
+        UUID master = pages.salonMaster(salon.salonId(), "Bez", "Posluhy");
         BookableMasterSeeder.seedUsableSchedule(jdbcTemplate, master);
         UUID defId = BookableMasterSeeder.assignNewSalonService(jdbcTemplate, salon.salonId(), master);
         assertThat(names(page(salon.slug()).path("masters"))).containsExactly("Bez Posluhy");
@@ -403,10 +378,10 @@ class PublicSalonBookingInfoIT extends AbstractIntegrationTest {
     @Test
     @DisplayName("owner deactivates a bookable master → page evicted, master gone")
     void should_dropMaster_when_masterDeactivated() throws Exception {
-        OwnedSalon salon = ownedSalon("Deactivate Master Salon");
-        UUID staying = namedSalonMaster(salon.salonId(), "Zalyshaietsia", "Tut");
+        PublicBookingPageFixtures.SalonPage salon = pages.salon("Deactivate Master Salon");
+        UUID staying = pages.salonMaster(salon.salonId(), "Zalyshaietsia", "Tut");
         BookableMasterSeeder.makeBookable(jdbcTemplate, salon.salonId(), staying);
-        UUID leaving = namedSalonMaster(salon.salonId(), "Ide", "Het");
+        UUID leaving = pages.salonMaster(salon.salonId(), "Ide", "Het");
         BookableMasterSeeder.makeBookable(jdbcTemplate, salon.salonId(), leaving);
         assertThat(names(page(salon.slug()).path("masters"))).hasSize(2);
 
@@ -421,7 +396,7 @@ class PublicSalonBookingInfoIT extends AbstractIntegrationTest {
     @Test
     @DisplayName("owner renames the salon → page evicted, new name served")
     void should_serveNewName_when_salonRenamed() throws Exception {
-        OwnedSalon salon = ownedSalon("Stara Nazva");
+        PublicBookingPageFixtures.SalonPage salon = pages.salon("Stara Nazva");
         assertThat(page(salon.slug()).path("name").asText()).isEqualTo("Stara Nazva");
 
         ResponseEntity<String> patch = restTemplate.exchange("/api/v1/salons/" + salon.salonId(), HttpMethod.PATCH,
@@ -438,8 +413,8 @@ class PublicSalonBookingInfoIT extends AbstractIntegrationTest {
     @Test
     @DisplayName("owner deactivates (deletes) the salon → cached page evicted, slug now 404")
     void should_return404_when_salonDeactivatedAfterCaching() throws Exception {
-        OwnedSalon salon = ownedSalon("Zakryiemo Salon");
-        UUID master = namedSalonMaster(salon.salonId(), "Ostannia", "Zmina");
+        PublicBookingPageFixtures.SalonPage salon = pages.salon("Zakryiemo Salon");
+        UUID master = pages.salonMaster(salon.salonId(), "Ostannia", "Zmina");
         BookableMasterSeeder.makeBookable(jdbcTemplate, salon.salonId(), master);
         assertThat(page(salon.slug()).path("bookable").asBoolean()).isTrue();
 
@@ -455,8 +430,8 @@ class PublicSalonBookingInfoIT extends AbstractIntegrationTest {
     @Test
     @DisplayName("master renames itself → both its own page and the salon page evicted after commit, new name served")
     void should_serveNewName_when_masterRenamed() throws Exception {
-        OwnedSalon salon = ownedSalon("Rename Master Salon");
-        UUID master = namedSalonMaster(salon.salonId(), "Stare", "Imia");
+        PublicBookingPageFixtures.SalonPage salon = pages.salon("Rename Master Salon");
+        UUID master = pages.salonMaster(salon.salonId(), "Stare", "Imia");
         BookableMasterSeeder.makeBookable(jdbcTemplate, salon.salonId(), master);
         String masterSlug = masterSlugOf(master);
         assertThat(names(page(salon.slug()).path("masters"))).containsExactly("Stare Imia");
@@ -478,8 +453,8 @@ class PublicSalonBookingInfoIT extends AbstractIntegrationTest {
     @Test
     @DisplayName("booking writers' catalogue-only evict leaves the salon page cached; bookability writers' full evict drops it")
     void should_keepSalonPageCached_when_bookingWriteEvictsCatalog() throws Exception {
-        OwnedSalon salon = ownedSalon("Booking Write Salon");
-        UUID master = namedSalonMaster(salon.salonId(), "Zaniata", "Maisterka");
+        PublicBookingPageFixtures.SalonPage salon = pages.salon("Booking Write Salon");
+        UUID master = pages.salonMaster(salon.salonId(), "Zaniata", "Maisterka");
         BookableMasterSeeder.makeBookable(jdbcTemplate, salon.salonId(), master);
         page(salon.slug());
         assertThat(pageCache().get(salon.slug())).as("arrange: the page is cached").isNotNull();
@@ -496,8 +471,8 @@ class PublicSalonBookingInfoIT extends AbstractIntegrationTest {
     @DisplayName("real client booking create + cancel over HTTP → salon page stays cached (same entry), "
             + "while the catalogue entry IS evicted after commit (the hook ran)")
     void should_keepSalonPageCached_when_clientBooksAndCancelsOverHttp() throws Exception {
-        OwnedSalon salon = ownedSalon("Real Booking Salon");
-        UUID master = namedSalonMaster(salon.salonId(), "Realna", "Maisterka");
+        PublicBookingPageFixtures.SalonPage salon = pages.salon("Real Booking Salon");
+        UUID master = pages.salonMaster(salon.salonId(), "Realna", "Maisterka");
         BookableMasterSeeder.makeBookable(jdbcTemplate, salon.salonId(), master);
         UUID assignmentId = jdbcTemplate.queryForObject(
                 "SELECT id FROM master_services WHERE master_id = ? AND is_active = true", UUID.class, master);
@@ -560,7 +535,7 @@ class PublicSalonBookingInfoIT extends AbstractIntegrationTest {
     @Test
     @DisplayName("phase 380 D7: region, street, buildingNo, updatedAt are appended and the old fields keep their values")
     void should_appendAddressFields_when_salonHasStructuredAddress() throws Exception {
-        OwnedSalon salon = ownedSalon("Address Salon");
+        PublicBookingPageFixtures.SalonPage salon = pages.salon("Address Salon");
         jdbcTemplate.update("UPDATE salons SET region = 'Київська область', street = 'вул. Хрещатик', "
                 + "building_no = '12' WHERE id = ?", salon.salonId());
 
@@ -579,7 +554,7 @@ class PublicSalonBookingInfoIT extends AbstractIntegrationTest {
     @Test
     @DisplayName("phase 380 D7: blank street falls back to the legacy address")
     void should_fallBackToLegacyAddress_when_streetBlank() throws Exception {
-        OwnedSalon salon = ownedSalon("Legacy Address Salon");
+        PublicBookingPageFixtures.SalonPage salon = pages.salon("Legacy Address Salon");
         jdbcTemplate.update("UPDATE salons SET street = NULL, address = 'вул. Стара, 5' WHERE id = ?",
                 salon.salonId());
 
@@ -591,7 +566,7 @@ class PublicSalonBookingInfoIT extends AbstractIntegrationTest {
     @Test
     @DisplayName("phase 380 D5: salon /info sends Cache-Control public, max-age=0, s-maxage=30 + weak ETag, 304 on match, no public header on 404")
     void should_sendCacheHeadersAndAnswer304_when_ifNoneMatchMatches() throws Exception {
-        OwnedSalon salon = ownedSalon("Etag Salon");
+        PublicBookingPageFixtures.SalonPage salon = pages.salon("Etag Salon");
 
         ResponseEntity<String> first = anonymousGet("/api/v1/book/s/" + salon.slug() + "/info");
         HttpHeaders conditional = new HttpHeaders();
