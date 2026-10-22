@@ -9,6 +9,8 @@ import org.springframework.stereotype.Component;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
+import java.util.Collection;
+import java.util.List;
 import java.util.UUID;
 
 /**
@@ -63,21 +65,45 @@ public class MasterProfileCacheEvictor {
     /**
      * Phase 380 D6 — evicts the ONE {@code booking-slug-info} entry of {@code masterId} after commit
      * (immediately outside a transaction), for writers whose data rides in that payload besides the
-     * profile: reviews, portfolio photos, services and the weekly schedule. The slug is resolved with
-     * {@link MasterRepository#findBookingSlugById} at call time (inside the writer's transaction, a
-     * single scalar read); a master without a slug, or a {@code null} id, is a no-op. Never
-     * {@code clear()}s the cache.
+     * profile: reviews and portfolio photos. The slug is resolved with {@link MasterRepository#findBookingSlugById}
+     * at call time; a master without a slug, or a {@code null} id, is a no-op. Callers that already hold the
+     * slug use {@link #evictBookingSlugInfoBySlugAfterCommit} and skip that read. Never {@code clear()}s the cache.
      */
     public void evictBookingSlugInfoAfterCommit(UUID masterId) {
         if (masterId == null) {
             return;
         }
-        String slug = masterRepository.findBookingSlugById(masterId).orElse(null);
+        evictBookingSlugInfoBySlugAfterCommit(masterRepository.findBookingSlugById(masterId).orElse(null));
+    }
+
+    /**
+     * Batched twin for writers that touch several masters (a service-definition change): ONE slug lookup for
+     * the whole set instead of one per master. Empty or {@code null} input is a no-op.
+     */
+    public void evictBookingSlugInfoAfterCommit(Collection<UUID> masterIds) {
+        if (masterIds == null || masterIds.isEmpty()) {
+            return;
+        }
+        registerSlugEviction(masterRepository.findBookingSlugsByIdIn(masterIds));
+    }
+
+    /**
+     * Phase 380 audit — the no-lookup form: evicts the {@code booking-slug-info} entry of an already-known
+     * {@code slug} after commit. A {@code null} slug (legacy master, no page exists) is a no-op.
+     */
+    public void evictBookingSlugInfoBySlugAfterCommit(String slug) {
         if (slug == null) {
             return;
         }
+        registerSlugEviction(List.of(slug));
+    }
+
+    private void registerSlugEviction(Collection<String> slugs) {
+        if (slugs.isEmpty()) {
+            return;
+        }
         if (!TransactionSynchronizationManager.isSynchronizationActive()) {
-            evictKey(BOOKING_SLUG_INFO_CACHE, slug);
+            slugs.forEach(slug -> evictKey(BOOKING_SLUG_INFO_CACHE, slug));
             return;
         }
         // afterCompletion + STATUS_COMMITTED == "after commit, never on rollback", but unlike a bare
@@ -88,7 +114,7 @@ public class MasterProfileCacheEvictor {
             @Override
             public void afterCompletion(int status) {
                 if (status == STATUS_COMMITTED) {
-                    evictKey(BOOKING_SLUG_INFO_CACHE, slug);
+                    slugs.forEach(slug -> evictKey(BOOKING_SLUG_INFO_CACHE, slug));
                 }
             }
         });

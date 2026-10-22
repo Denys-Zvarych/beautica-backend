@@ -57,7 +57,7 @@ class GuestPrivacyConsentIT extends AbstractIntegrationTest {
 
     private static final ZoneId KYIV = ZoneId.of("Europe/Kyiv");
     private static final String PASSWORD = "Str0ngP@ss1!";
-    private static final String VERSION = "2031-02-03.7";
+    private static final String VERSION = "2025-02-03.7";
     private static final String GUEST_PHONE = "+380509998877";
 
     @Autowired private TestRestTemplate restTemplate;

@@ -350,8 +350,8 @@ public class BookingSlugService {
     }
 
     private List<MediaFileResponse> portfolio(UUID masterId) {
-        return mediaService.getPortfolio(EntityType.MASTER, masterId, PageRequest.of(0, PORTFOLIO_LIMIT))
-                .getContent();
+        // Uncached on purpose: the shared `portfolio` cache entry ignores page size (see MediaService).
+        return mediaService.getLatestPortfolio(EntityType.MASTER, masterId, PORTFOLIO_LIMIT);
     }
 
     private List<ReviewResponse> latestReviews(UUID masterId) {

@@ -76,6 +76,9 @@ class PhoneOtpControllerTest {
     @MockBean
     private com.beautica.auth.turnstile.TurnstileVerifier turnstileVerifier;
 
+    @MockBean
+    private com.beautica.auth.filter.VisitorIpResolver visitorIpResolver;
+
     private static final String VALID_PHONE = "+380671234567";
 
     @Test
@@ -102,6 +105,7 @@ class PhoneOtpControllerTest {
     @Test
     @DisplayName("POST /book/otp/send — Turnstile gets the body token and the resolved IP BEFORE the SMS (phase 382)")
     void should_verifyTurnstileBeforeSendingOtp_when_sendValid() throws Exception {
+        when(visitorIpResolver.resolve(org.mockito.ArgumentMatchers.any())).thenReturn("203.0.113.7");
         mockMvc.perform(post("/api/v1/book/otp/send")
                         .contentType(MediaType.APPLICATION_JSON)
                         .header("X-Forwarded-For", "203.0.113.7")

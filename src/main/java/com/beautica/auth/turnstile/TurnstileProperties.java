@@ -18,6 +18,10 @@ import java.util.List;
  * verifier without a secret, so a misconfigured environment fails at boot instead of silently rejecting (or,
  * worse, skipping) every verification.
  *
+ * <p><b>Latency budget.</b> connect 2s + read 2s: a siteverify call that cannot answer fails closed (503)
+ * after at most ~4s, so a Cloudflare outage can hold a request thread for no longer than that. There is no
+ * retry (a replayed token is {@code timeout-or-duplicate}).
+ *
  * <p>The secret is never logged and never part of an exception message; its setter strips surrounding
  * whitespace (a pasted trailing newline would otherwise make every siteverify call fail).
  */
@@ -29,7 +33,7 @@ public class TurnstileProperties {
     private String secretKey = "";
     private String siteverifyUrl = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
     private Duration connectTimeout = Duration.ofSeconds(2);
-    private Duration readTimeout = Duration.ofSeconds(3);
+    private Duration readTimeout = Duration.ofSeconds(2);
     private List<String> expectedHostnames = new ArrayList<>();
     private String expectedAction = "";
 

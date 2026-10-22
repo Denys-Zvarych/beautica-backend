@@ -589,7 +589,7 @@ class PublicSalonBookingInfoIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("phase 380 D5: salon /info sends Cache-Control public max-age=60 + weak ETag, 304 on match, no public header on 404")
+    @DisplayName("phase 380 D5: salon /info sends Cache-Control public, max-age=0, s-maxage=30 + weak ETag, 304 on match, no public header on 404")
     void should_sendCacheHeadersAndAnswer304_when_ifNoneMatchMatches() throws Exception {
         OwnedSalon salon = ownedSalon("Etag Salon");
 
@@ -601,7 +601,8 @@ class PublicSalonBookingInfoIT extends AbstractIntegrationTest {
                 HttpMethod.GET, new HttpEntity<>(conditional), String.class);
         ResponseEntity<String> missing = anonymousGet("/api/v1/book/s/no-such-salon-zz99/info");
 
-        assertThat(first.getHeaders().getCacheControl()).contains("public").contains("max-age=60");
+        assertThat(first.getHeaders().getCacheControl())
+                .contains("public").contains("max-age=0").contains("s-maxage=30");
         assertThat(first.getHeaders().getETag()).startsWith("W/\"");
         assertThat(replay.getStatusCode()).isEqualTo(HttpStatus.NOT_MODIFIED);
         assertThat(replay.getBody()).isNullOrEmpty();

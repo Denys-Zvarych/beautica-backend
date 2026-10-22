@@ -422,7 +422,8 @@ app:
     secret-key: ${TURNSTILE_SECRET_KEY:}
     siteverify-url: https://challenges.cloudflare.com/turnstile/v0/siteverify
     connect-timeout: 2s
-    read-timeout: 3s
+    # connect 2s + read 2s = at most ~4s per request before failing closed (503); no retry.
+    read-timeout: 2s
     # Hostname / action checks apply only when non-empty (prod). Cloudflare's test keys return a dummy
     # hostname/action, so staging leaves both empty.
     expected-hostnames: []

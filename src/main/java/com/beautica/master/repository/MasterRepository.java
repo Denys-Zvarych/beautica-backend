@@ -527,6 +527,15 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
     Optional<String> findBookingSlugById(@Param("masterId") UUID masterId);
 
     /**
+     * Phase 380 audit — the committed booking slugs of {@code masterIds} in ONE statement (masters without a
+     * slug are simply absent). Backs the batched {@code booking-slug-info} eviction of a service-definition
+     * change, which can touch many masters.
+     */
+    @Query(value = "SELECT booking_slug FROM masters WHERE id IN (:masterIds) AND booking_slug IS NOT NULL",
+            nativeQuery = true)
+    List<String> findBookingSlugsByIdIn(@Param("masterIds") Collection<UUID> masterIds);
+
+    /**
      * Phase 380 D2 — the public booking page's {@code bookable} verdict for ONE master: active AND the
      * shared structural predicate ({@link MasterBookabilitySql#BOOKABLE_MASTER_M}: ≥1 active
      * correctly-owned service and a schedule within the 180-day horizon). One statement; {@code today}

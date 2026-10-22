@@ -1802,7 +1802,7 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
      * {@link UnknownHostException} instead of resolving). A leading '.' or any other character is rejected
      * up front.
      */
-    private static InetAddress parseIpLiteral(String value) {
+    static InetAddress parseIpLiteral(String value) {
         if (value == null) {
             return null;
         }

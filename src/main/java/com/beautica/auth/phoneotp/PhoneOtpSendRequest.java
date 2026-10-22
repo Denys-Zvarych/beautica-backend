@@ -5,6 +5,7 @@ import jakarta.validation.constraints.AssertTrue;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Pattern;
+import com.beautica.common.validation.PolicyVersionDate;
 import jakarta.validation.constraints.Size;
 
 /**
@@ -33,6 +34,7 @@ public record PhoneOtpSendRequest(
         @Size(max = 32)
         @Pattern(regexp = "^\\d{4}-\\d{2}-\\d{2}(\\.\\d{1,3})?$",
                 message = "Privacy policy version must look like 2026-10-20")
+        @PolicyVersionDate
         String privacyPolicyVersion,
 
         // Phase 382 — Cloudflare Turnstile widget token. Deliberately NOT @NotBlank: where Turnstile is off

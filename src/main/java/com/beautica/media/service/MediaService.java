@@ -962,6 +962,23 @@ public class MediaService {
     }
 
     /**
+     * The newest {@code limit} photos of one entity, read straight from the database and NEVER cached.
+     *
+     * <p>Exists for {@code GET /book/{slug}/info} (phase 380), which embeds the first 12 photos. It must not
+     * go through the cached {@link #getPortfolio(EntityType, UUID, PageRequest)}: that entry's key ignores
+     * the page size, so whichever caller filled it first would dictate the page for the other (a 12-photo
+     * page served to {@code /masters/{id}/portfolio}, or 50 photos embedded in the info payload). The info
+     * payload is itself cached under {@code booking-slug-info}, so this read costs one statement per miss.
+     * Same {@code createdAt DESC} order as the public portfolio endpoint.
+     */
+    @Transactional(readOnly = true)
+    public List<MediaFileResponse> getLatestPortfolio(EntityType entityType, UUID entityId, int limit) {
+        return mediaRepo.findByEntityTypeAndEntityId(entityType, entityId, PageRequest.of(0, limit, PORTFOLIO_SORT))
+                .map(MediaFileResponse::from)
+                .getContent();
+    }
+
+    /**
      * Narrow eviction of a single {@code portfolio} cache entry. Called from the
      * write paths AFTER {@link TransactionTemplate#execute} has returned (and the
      * transaction has therefore committed), so a parallel reader cannot repopulate

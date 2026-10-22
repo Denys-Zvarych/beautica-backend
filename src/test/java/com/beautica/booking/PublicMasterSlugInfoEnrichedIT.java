@@ -351,6 +351,45 @@ class PublicMasterSlugInfoEnrichedIT extends AbstractIntegrationTest {
         assertThat(body.path("portfolio")).hasSize(12);
     }
 
+    // ── shared `portfolio` cache must not be poisoned (audit #1) ─────────────────────────────
+
+    private JsonNode publicPortfolio(Master master) throws Exception {
+        ResponseEntity<String> response = restTemplate.exchange("/api/v1/masters/" + master.masterId() + "/portfolio",
+                HttpMethod.GET, new HttpEntity<>(new HttpHeaders()), String.class);
+        assertThat(response.getStatusCode()).as("body=%s", response.getBody()).isEqualTo(HttpStatus.OK);
+        return objectMapper.readTree(response.getBody()).path("data").path("content");
+    }
+
+    @Test
+    @DisplayName("should_returnAllPhotos_when_infoCalledBeforePortfolio")
+    void should_returnAllPhotos_when_infoCalledBeforePortfolio() throws Exception {
+        Master master = bookableMaster();
+        for (int i = 1; i <= 14; i++) {
+            insertPortfolioPhoto(master, i);
+        }
+
+        JsonNode info = page(master.slug());
+        JsonNode portfolio = publicPortfolio(master);
+
+        assertThat(info.path("portfolio")).hasSize(12);
+        assertThat(portfolio).as("/masters/{id}/portfolio must not be served the info page's 12-photo slice").hasSize(14);
+    }
+
+    @Test
+    @DisplayName("should_capInfoPortfolioAt12_when_portfolioEndpointWarmedFirst")
+    void should_capInfoPortfolioAt12_when_portfolioEndpointWarmedFirst() throws Exception {
+        Master master = bookableMaster();
+        for (int i = 1; i <= 14; i++) {
+            insertPortfolioPhoto(master, i);
+        }
+
+        JsonNode portfolio = publicPortfolio(master);
+        JsonNode info = page(master.slug());
+
+        assertThat(portfolio).hasSize(14);
+        assertThat(info.path("portfolio")).as("info must stay capped at 12 even with the 50-photo page cached").hasSize(12);
+    }
+
     // ── eviction (read -> write -> read within the TTL) ───────────────────────────────────────
 
     @Test
@@ -425,7 +464,7 @@ class PublicMasterSlugInfoEnrichedIT extends AbstractIntegrationTest {
     // ── HTTP caching ──────────────────────────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("Cache-Control public max-age=60 + weak ETag; If-None-Match replay -> 304 with empty body")
+    @DisplayName("Cache-Control public, max-age=0, s-maxage=30 + weak ETag; If-None-Match replay -> 304 with empty body")
     void should_answer304_when_ifNoneMatchMatches() throws Exception {
         Master master = bookableMaster();
 
@@ -435,7 +474,8 @@ class PublicMasterSlugInfoEnrichedIT extends AbstractIntegrationTest {
         conditional.setIfNoneMatch(etag);
         ResponseEntity<String> replay = get(master.slug(), conditional);
 
-        assertThat(first.getHeaders().getCacheControl()).contains("public").contains("max-age=60");
+        assertThat(first.getHeaders().getCacheControl())
+                .contains("public").contains("max-age=0").contains("s-maxage=30");
         assertThat(etag).startsWith("W/\"");
         assertThat(replay.getStatusCode()).isEqualTo(HttpStatus.NOT_MODIFIED);
         assertThat(replay.getBody()).isNullOrEmpty();

@@ -38,6 +38,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyCollection;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.atLeastOnce;
@@ -484,8 +485,8 @@ class BookingSlugServiceTest {
         when(masterServiceRepository.findByMasterIdAndIsActiveTrueWithGraph(any(), any()))
                 .thenReturn(List.of(assignment("Манікюр", 60, new BigDecimal("350.00"))));
         when(scheduleDateMath.today()).thenReturn(TODAY);
-        when(mediaService.getPortfolio(any(com.beautica.media.entity.EntityType.class), any(), any(PageRequest.class)))
-                .thenReturn(Page.empty());
+        when(mediaService.getLatestPortfolio(any(com.beautica.media.entity.EntityType.class), any(), anyInt()))
+                .thenReturn(List.of());
         when(reviewService.getReviewsForMaster(any(), any(), any(PageRequest.class))).thenReturn(Page.empty());
 
         BookingSlugInfoResponse info = service.findBySlug("marija-l-cd34");
@@ -514,8 +515,8 @@ class BookingSlugServiceTest {
                 .thenReturn(List.of(assignment("Манікюр", 60, new BigDecimal("350.00"))));
         org.mockito.Mockito.lenient().when(masterServiceRepository.findActiveCategoriesByMasterId(masterId)).thenReturn(List.of());
         when(scheduleDateMath.today()).thenReturn(TODAY);
-        org.mockito.Mockito.lenient().when(mediaService.getPortfolio(eq(com.beautica.media.entity.EntityType.MASTER), eq(masterId), any(PageRequest.class)))
-                .thenReturn(Page.empty());
+        org.mockito.Mockito.lenient().when(mediaService.getLatestPortfolio(eq(com.beautica.media.entity.EntityType.MASTER), eq(masterId), anyInt()))
+                .thenReturn(List.of());
         when(reviewService.getReviewsForMaster(eq(masterId), eq(SalonReviewSort.NEWEST), any(PageRequest.class)))
                 .thenReturn(Page.empty());
         return master;
@@ -534,8 +535,8 @@ class BookingSlugServiceTest {
         var photo = new com.beautica.media.dto.MediaFileResponse(UUID.randomUUID(),
                 com.beautica.media.entity.EntityType.MASTER, masterId,
                 com.beautica.media.entity.MediaType.PORTFOLIO, "https://media.beautica.app/p.webp", null);
-        when(mediaService.getPortfolio(eq(com.beautica.media.entity.EntityType.MASTER), eq(masterId), any(PageRequest.class)))
-                .thenReturn(new PageImpl<>(List.of(photo)));
+        when(mediaService.getLatestPortfolio(eq(com.beautica.media.entity.EntityType.MASTER), eq(masterId), anyInt()))
+                .thenReturn(List.of(photo));
         when(masterRepository.isBookableById(masterId, TODAY)).thenReturn(true);
 
         BookingSlugInfoResponse info = service.findBySlug("olena-k-ab12");
@@ -617,7 +618,8 @@ class BookingSlugServiceTest {
 
         service.findBySlug("olena-k-ab12");
 
-        verify(mediaService).getPortfolio(com.beautica.media.entity.EntityType.MASTER, masterId, PageRequest.of(0, 12));
+        verify(mediaService).getLatestPortfolio(com.beautica.media.entity.EntityType.MASTER, masterId, 12);
+        verify(mediaService, org.mockito.Mockito.never()).getPortfolio(any(), any(), any(PageRequest.class));
         verify(reviewService).getReviewsForMaster(masterId, SalonReviewSort.NEWEST, PageRequest.of(0, 5));
     }
 

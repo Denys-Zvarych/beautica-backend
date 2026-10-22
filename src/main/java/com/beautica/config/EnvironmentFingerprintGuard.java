@@ -451,9 +451,18 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
     private static final java.util.regex.Pattern TURNSTILE_TEST_SECRET =
             java.util.regex.Pattern.compile("^[123]x0{31}AA$");
 
+    private static final String TURNSTILE_SITEVERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
+
     private static void checkProdTurnstile(Environment env, List<String> violations) {
         if (!Boolean.parseBoolean(boundOrNull(env, "app.turnstile.enabled"))) {
             violations.add("rule prod-turnstile-disabled: app.turnstile.enabled must be true in prod");
+        }
+        // Phase 382 audit: a redirected siteverify URL would send the real secret and every visitor token to a
+        // third party (or to a stub that always says success). Prod must call exactly Cloudflare.
+        String siteverifyUrl = boundOrNull(env, "app.turnstile.siteverify-url");
+        if (siteverifyUrl == null || !TURNSTILE_SITEVERIFY_URL.equals(siteverifyUrl.strip())) {
+            violations.add("rule prod-turnstile-siteverify-url: app.turnstile.siteverify-url must be exactly "
+                    + TURNSTILE_SITEVERIFY_URL + " in prod");
         }
         String secret = boundOrNull(env, "app.turnstile.secret-key");
         if (isBlank(secret)) {

@@ -22,6 +22,7 @@ class EnvironmentFingerprintGuardTest {
     private static final String VALID_KEY = TestSecrets.INTERNAL_API_KEY;
     /** Cloudflare's published always-pass TEST secret. */
     private static final String TURNSTILE_TEST_SECRET = "1x0000000000000000000000000000000AA";
+    private static final String TURNSTILE_SITEVERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
     /** Shape of a real secret (never a real one): 35 chars, not a test key. */
     private static final String TURNSTILE_REAL_SECRET = "0x4AAAAAAAfixtureNotARealSecretZZ9";
 
@@ -69,7 +70,8 @@ class EnvironmentFingerprintGuardTest {
                 .withProperty("app.mail.logo-url", "https://beautica.app/email/logo.png")
                 // Phase 382: prod must run Turnstile with a real (non-test) secret.
                 .withProperty("app.turnstile.enabled", "true")
-                .withProperty("app.turnstile.secret-key", TURNSTILE_REAL_SECRET);
+                .withProperty("app.turnstile.secret-key", TURNSTILE_REAL_SECRET)
+                .withProperty("app.turnstile.siteverify-url", TURNSTILE_SITEVERIFY_URL);
         env.setActiveProfiles("prod");
         return env;
     }
@@ -1129,5 +1131,26 @@ class EnvironmentFingerprintGuardTest {
 
             assertThatCode(() -> run(env, DeployEnvironment.STAGING, SmsMode.CAPTURE)).doesNotThrowAnyException();
         }
+    }
+
+    @Test
+    @DisplayName("prod with a redirected or non-Cloudflare siteverify URL fails naming prod-turnstile-siteverify-url")
+    void should_fail_when_prodSiteverifyUrlIsNotCloudflare() {
+        for (String url : new String[] {"https://evil.example/turnstile/v0/siteverify",
+                "http://challenges.cloudflare.com/turnstile/v0/siteverify",
+                "https://challenges.cloudflare.com/turnstile/v0/siteverify/", "http://localhost:8089/siteverify", ""}) {
+            MockEnvironment env = prodEnv().withProperty("app.turnstile.siteverify-url", url);
+
+            assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                    .as("url=%s", url)
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("prod-turnstile-siteverify-url");
+        }
+    }
+
+    @Test
+    @DisplayName("prod with the exact Cloudflare siteverify URL passes the URL rule")
+    void should_pass_when_prodSiteverifyUrlIsCloudflare() {
+        assertThatCode(() -> run(prodEnv(), DeployEnvironment.PROD, SmsMode.TURBOSMS)).doesNotThrowAnyException();
     }
 }

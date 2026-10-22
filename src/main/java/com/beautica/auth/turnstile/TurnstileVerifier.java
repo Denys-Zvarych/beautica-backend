@@ -28,7 +28,7 @@ import java.util.Set;
  *
  * <p><b>HTTP client</b> follows {@code TurbosmsService}: JDK client pinned to HTTP/1.1, redirects never
  * followed, explicit connect/read timeouts, no retry (a replayed token is {@code timeout-or-duplicate}).
- * <b>Secrets:</b> neither the secret nor the token is logged or put in an exception message; a rejection
+ * Timeouts are connect 2s + read 2s (a request waits at most ~4s before failing closed). <b>Secrets:</b> neither the secret nor the token is logged or put in an exception message; a rejection
  * logs Cloudflare's {@code error-codes} only.
  */
 @Slf4j

@@ -1973,7 +1973,7 @@ public class ServiceCatalogService {
      * {@link MasterSearchVisibilityGuard}, which clears only on an actual verdict flip.
      */
     private void evictMasterServicesCache(List<UUID> masterIds) {
-        masterIds.forEach(masterProfileCacheEvictor::evictBookingSlugInfoAfterCommit);
+        masterProfileCacheEvictor.evictBookingSlugInfoAfterCommit(masterIds);
         if (TransactionSynchronizationManager.isSynchronizationActive()) {
             TransactionSynchronizationManager.registerSynchronization(
                     new TransactionSynchronization() {

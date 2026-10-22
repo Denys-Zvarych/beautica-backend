@@ -301,4 +301,12 @@ class ProdProfileFingerprintTest {
                         .hasMessageContaining("rule staging-turnstile-secret-not-test-key")
                         .message().doesNotContain(TURNSTILE_REAL_SECRET));
     }
+
+    @Test
+    @DisplayName("Phase 382 audit — an env override of the siteverify URL fails prod boot on prod-turnstile-siteverify-url")
+    void should_failGuard_when_prodSiteverifyUrlOverridden() {
+        prodRunnerWithout("").withPropertyValues("app.turnstile.siteverify-url=https://evil.example/siteverify")
+                .run(ctx -> assertThatThrownBy(() -> EnvironmentFingerprintGuard.verify(ctx.getEnvironment()))
+                        .hasMessageContaining("rule prod-turnstile-siteverify-url"));
+    }
 }

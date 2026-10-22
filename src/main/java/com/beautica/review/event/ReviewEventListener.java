@@ -93,8 +93,6 @@ public class ReviewEventListener {
             log.error("recalculateMasterRating failed for master={} — {}",
                       event.masterId(), ex.getClass().getSimpleName());
         }
-        // Phase 380 D6: the public master booking page carries rating, count and the newest reviews.
-        masterProfileCacheEvictor.evictBookingSlugInfoAfterCommit(event.masterId());
         evictAfterCompletion(() -> {
             evictMasterReviewPages(event.masterId());
             // Phase 240 audit (Finding 1). Previously skipped deliberately, on the ground
@@ -127,6 +125,11 @@ public class ReviewEventListener {
             // MasterService#rotateMasterSalon evict this same cache.
             evictKey(MASTER_DETAIL_BY_USER_CACHE, event.masterUserId());
         });
+        // Phase 380 D6: the public master booking page carries rating, count and the newest reviews. Registered
+        // AFTER the callback above so it runs after evictMasterReviewPages (synchronizations fire in
+        // registration order): a reader that repopulates booking-slug-info in between can no longer re-read
+        // the stale reviews-by-master page.
+        masterProfileCacheEvictor.evictBookingSlugInfoAfterCommit(event.masterId());
 
         // Symmetric salon branch (Phase 13.6): only runs when the reviewed booking
         // belonged to a salon-affiliated master. Same fire-and-log-don't-fail contract —

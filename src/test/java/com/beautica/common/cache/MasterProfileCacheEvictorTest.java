@@ -191,6 +191,45 @@ class MasterProfileCacheEvictorTest {
         verify(slugInfo).evict(slug);
     }
 
+    @Test
+    @DisplayName("phase 380 audit: a set of masters costs ONE slug lookup and evicts each slug key after commit")
+    void should_resolveAllSlugsInOneQuery_when_batchEvicted() {
+        UUID other = UUID.randomUUID();
+        when(masterRepository.findBookingSlugsByIdIn(java.util.List.of(masterId, other)))
+                .thenReturn(java.util.List.of(slug, "other-slug-zz99"));
+        TransactionSynchronizationManager.initSynchronization();
+
+        evictor.evictBookingSlugInfoAfterCommit(java.util.List.of(masterId, other));
+
+        verify(slugInfo, never()).evict(any());
+        TransactionSynchronizationManager.getSynchronizations()
+                .forEach(sync -> sync.afterCompletion(TransactionSynchronization.STATUS_COMMITTED));
+        verify(slugInfo).evict(slug);
+        verify(slugInfo).evict("other-slug-zz99");
+        verify(masterRepository).findBookingSlugsByIdIn(java.util.List.of(masterId, other));
+        verify(masterRepository, never()).findBookingSlugById(any());
+    }
+
+    @Test
+    @DisplayName("phase 380 audit: empty or null batch is a no-op without a query")
+    void should_doNothing_when_batchEmptyOrNull() {
+        evictor.evictBookingSlugInfoAfterCommit((java.util.Collection<UUID>) null);
+        evictor.evictBookingSlugInfoAfterCommit(java.util.List.<UUID>of());
+
+        org.mockito.Mockito.verifyNoInteractions(masterRepository);
+        verify(slugInfo, never()).evict(any());
+    }
+
+    @Test
+    @DisplayName("phase 380 audit: an already-known slug is evicted with NO repository access; null slug is a no-op")
+    void should_notQueryRepository_when_slugAlreadyKnown() {
+        evictor.evictBookingSlugInfoBySlugAfterCommit(slug);
+        evictor.evictBookingSlugInfoBySlugAfterCommit(null);
+
+        verify(slugInfo).evict(slug);
+        org.mockito.Mockito.verifyNoInteractions(masterRepository);
+    }
+
     private Cache stub(String name) {
         Cache cache = mock(Cache.class);
         when(cacheManager.getCache(name)).thenReturn(cache);

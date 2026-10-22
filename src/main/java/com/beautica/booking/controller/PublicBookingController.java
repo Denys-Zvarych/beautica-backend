@@ -56,12 +56,16 @@ import java.util.UUID;
 public class PublicBookingController {
 
     /**
-     * Phase 380 D5 — both {@code /info} routes are shared-cacheable for 60 s. Set through
+     * Phase 380 D5 (audit-tightened) — {@code public, max-age=0, s-maxage=30}: a browser always revalidates
+     * (cheap 304 via the ETag), a shared cache/CDN may serve for 30 s. On top of the 60 s server cache the
+     * worst-case staleness is therefore bounded to ~30 s at the edge and none in the browser, so a
+     * cache-evicted write (review, service, schedule) is not hidden for minutes. Set through
      * {@code ResponseEntity} so Spring Security's default {@code no-cache} header writer stays off for
      * these 2xx responses; 404s keep its {@code no-store}. The weak ETag comes from
      * {@code BookingInfoEtagFilterConfig}.
      */
-    private static final CacheControl INFO_CACHE_CONTROL = CacheControl.maxAge(Duration.ofSeconds(60)).cachePublic();
+    private static final CacheControl INFO_CACHE_CONTROL =
+            CacheControl.maxAge(Duration.ZERO).sMaxAge(Duration.ofSeconds(30)).cachePublic();
 
     private final BookingSlugService bookingSlugService;
     private final GuestBookingService guestBookingService;

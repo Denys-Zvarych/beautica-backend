@@ -93,4 +93,13 @@ class TurnstilePropertiesTest {
         assertThat(violations).hasSize(1);
         assertThat(violations.iterator().next().getMessage()).contains("TURNSTILE_SECRET_KEY");
     }
+
+    @Test
+    @DisplayName("should_defaultToTwoSecondConnectAndReadTimeouts_when_nothingConfigured")
+    void should_defaultToTwoSecondConnectAndReadTimeouts_when_nothingConfigured() {
+        TurnstileProperties props = new TurnstileProperties();
+
+        assertThat(props.getConnectTimeout()).isEqualTo(java.time.Duration.ofSeconds(2));
+        assertThat(props.getReadTimeout()).isEqualTo(java.time.Duration.ofSeconds(2));
+    }
 }

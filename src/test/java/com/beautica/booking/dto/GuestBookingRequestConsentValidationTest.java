@@ -92,6 +92,26 @@ class GuestBookingRequestConsentValidationTest {
         assertThat(validator.validate(otp(true, version))).isEmpty();
     }
 
+    @ParameterizedTest(name = "version [{0}] is rejected")
+    @ValueSource(strings = {"9999-99-99", "2026-13-01", "2026-02-30", "2999-01-01"})
+    @DisplayName("should_reject_when_dateIsImpossibleOrFarFuture")
+    void should_reject_when_dateIsImpossibleOrFarFuture(String version) {
+        assertThat(violates(validator.validate(booking(true, version)), "privacyPolicyVersion")).isTrue();
+        assertThat(violates(validator.validate(otp(true, version)), "privacyPolicyVersion")).isTrue();
+    }
+
+    @Test
+    @DisplayName("should_rejectTomorrowAndAcceptToday_when_kyivDateIsTheReference")
+    void should_rejectTomorrowAndAcceptToday_when_kyivDateIsTheReference() {
+        java.time.LocalDate today = java.time.LocalDate.now(com.beautica.common.TimeZones.KYIV);
+        String tomorrow = today.plusDays(1).toString();
+
+        assertThat(violates(validator.validate(booking(true, tomorrow)), "privacyPolicyVersion")).isTrue();
+        assertThat(violates(validator.validate(otp(true, tomorrow + ".1")), "privacyPolicyVersion")).isTrue();
+        assertThat(validator.validate(booking(true, today.toString()))).isEmpty();
+        assertThat(validator.validate(otp(true, today.minusDays(1) + ".2"))).isEmpty();
+    }
+
     @Test
     @DisplayName("should_failValidation_when_legacyFourArgConstructorUsed")
     void should_failValidation_when_legacyFourArgConstructorUsed() {

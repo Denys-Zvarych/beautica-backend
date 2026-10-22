@@ -1196,7 +1196,8 @@ public class MasterScheduleService {
         }
         UUID masterId = master.getId();
         UUID salonId = master.getSalon() != null ? master.getSalon().getId() : null;
-        masterProfileCacheEvictor.evictBookingSlugInfoAfterCommit(masterId);
+        // The slug is already on the loaded master: no lookup query.
+        masterProfileCacheEvictor.evictBookingSlugInfoBySlugAfterCommit(master.getBookingSlug());
         TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
             @Override
             public void afterCommit() {
