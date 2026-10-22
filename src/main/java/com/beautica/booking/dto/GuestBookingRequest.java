@@ -79,8 +79,35 @@ public record GuestBookingRequest(
         @Pattern(regexp = "^\\d{4}-\\d{2}-\\d{2}(\\.\\d{1,3})?$",
                 message = "Privacy policy version must look like 2026-10-20")
         @PolicyVersionDate
-        String privacyPolicyVersion
+        String privacyPolicyVersion,
+
+        // Phase 385 — optional «Коментар для майстра». EXACTLY the constraints of CreateBookingRequest#clientComment
+        // (same 1000 cap, same control-character ban that still allows line breaks and tabs); blank is normalised
+        // to null by the service via BookingComments#normalize, as on the app path. Never logged: see toString().
+        @Size(max = 1000, message = "Comment must be at most 1000 characters")
+        @Pattern(regexp = "^[^\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F\\x7F]*$",
+                message = "Comment must not contain control characters other than line breaks and tabs")
+        String clientComment
 ) {
+
+    /**
+     * The pre-phase-385 shape (no note) — what an old client sends. Keeps every existing call site and the JSON
+     * contract valid: {@code clientComment} is simply absent.
+     */
+    public GuestBookingRequest(UUID serviceId, List<UUID> masterServiceIds, OffsetDateTime startsAt, String name,
+                               String surname, Boolean privacyAccepted, String privacyPolicyVersion) {
+        this(serviceId, masterServiceIds, startsAt, name, surname, privacyAccepted, privacyPolicyVersion, null);
+    }
+
+    /**
+     * Phase 385 D3 — the free-text note (and the guest's identity, which is likewise PII) must never reach a
+     * log line: the default record {@code toString} would print every component, including {@code clientComment}.
+     */
+    @Override
+    public String toString() {
+        return "GuestBookingRequest[serviceId=" + serviceId + ", masterServiceIds=" + masterServiceIds
+                + ", startsAt=" + startsAt + ", privacyAccepted=" + privacyAccepted + "]";
+    }
 
     /**
      * Legacy 4-arg factory for a single-service guest booking ({@code serviceId} only, no
@@ -89,6 +116,6 @@ public record GuestBookingRequest(
      * client that omits the fields would.
      */
     public GuestBookingRequest(UUID serviceId, OffsetDateTime startsAt, String name, String surname) {
-        this(serviceId, null, startsAt, name, surname, null, null);
+        this(serviceId, null, startsAt, name, surname, null, null, null);
     }
 }

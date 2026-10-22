@@ -112,6 +112,40 @@ class GuestBookingRequestConsentValidationTest {
         assertThat(validator.validate(otp(true, today.minusDays(1) + ".2"))).isEmpty();
     }
 
+    // ── phase 385: clientComment — the SAME constraints as POST /bookings ─────────────────────────
+
+    private static GuestBookingRequest withComment(String comment) {
+        return new GuestBookingRequest(UUID.randomUUID(), null, FUTURE, "Олена", "Коваль", true, "2026-10-20", comment);
+    }
+
+    @Test
+    @DisplayName("should_acceptComment_when_nullBlankLineBreaksTabsOrExactly1000Chars")
+    void should_acceptComment_when_nullBlankLineBreaksTabsOrExactly1000Chars() {
+        for (String ok : new String[] {null, "", "   ", "Буду з дитиною", "рядок 1\nрядок 2\r\n\tкінець", "я".repeat(1000)}) {
+            assertThat(validator.validate(withComment(ok))).as("[%s]", ok).isEmpty();
+        }
+    }
+
+    @Test
+    @DisplayName("should_rejectComment_when_over1000CharsOrControlCharacters")
+    void should_rejectComment_when_over1000CharsOrControlCharacters() {
+        for (String bad : new String[] {"я".repeat(1001), "до\u0000бре", "до\u0007бре", "до\u001Fбре", "до\u007Fбре"}) {
+            assertThat(violates(validator.validate(withComment(bad)), "clientComment")).as("[%s]", bad.length()).isTrue();
+        }
+    }
+
+    @Test
+    @DisplayName("should_matchTheAppRequestConstraints_when_commentValidated")
+    void should_matchTheAppRequestConstraints_when_commentValidated() throws Exception {
+        var guestAnn = GuestBookingRequest.class.getDeclaredField("clientComment");
+        var appAnn = com.beautica.booking.dto.CreateBookingRequest.class.getDeclaredField("clientComment");
+
+        assertThat(guestAnn.getAnnotation(jakarta.validation.constraints.Size.class).max())
+                .isEqualTo(appAnn.getAnnotation(jakarta.validation.constraints.Size.class).max());
+        assertThat(guestAnn.getAnnotation(jakarta.validation.constraints.Pattern.class).regexp())
+                .isEqualTo(appAnn.getAnnotation(jakarta.validation.constraints.Pattern.class).regexp());
+    }
+
     @Test
     @DisplayName("should_failValidation_when_legacyFourArgConstructorUsed")
     void should_failValidation_when_legacyFourArgConstructorUsed() {

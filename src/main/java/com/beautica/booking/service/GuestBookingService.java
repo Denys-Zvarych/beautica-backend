@@ -289,7 +289,8 @@ public class GuestBookingService {
         // ONE consent instance for the header and every child: identical values by construction.
         GuestConsent consent = consentOf(req);
         Appointment appointment = Appointment.guestAppointment(
-                master.getSalon(), req.name(), req.surname(), guestPhone, cancelToken, consent);
+                master.getSalon(), req.name(), req.surname(), guestPhone, cancelToken, consent,
+                BookingComments.normalize(req.clientComment()));
 
         List<Booking> children = new ArrayList<>(items.size());
         for (VisitPlanner.PlannedItem item : items) {
@@ -375,7 +376,8 @@ public class GuestBookingService {
         Booking booking = Booking.guestBooking(
                 master, msa, master.getSalon(), startsAt, endsAt,
                 price, BookingPriceRange.resolveCeiling(msa),
-                duration, buffer, req.name(), req.surname(), guestPhone, consentOf(req));
+                duration, buffer, req.name(), req.surname(), guestPhone, consentOf(req),
+                BookingComments.normalize(req.clientComment()));
         return BookingSlotLockGuard.saveOrConflict(bookingRepository, booking);
     }
 

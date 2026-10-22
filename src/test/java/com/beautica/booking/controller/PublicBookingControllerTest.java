@@ -370,6 +370,24 @@ class PublicBookingControllerTest {
                 List.of(), null, null, null);
     }
 
+    // ── Phase 385: guest booking comment ──────────────────────────────────────
+
+    @Test
+    @DisplayName("POST /book/{slug}/booking — a clientComment over 1000 chars or with control characters is 400, never reaches the service")
+    void should_return400_when_clientCommentTooLongOrHasControlCharacters() throws Exception {
+        UUID svc = UUID.randomUUID();
+        for (String bad : new String[] {"а".repeat(1001), "до\\u0000бре"}) {
+            String body = "{\"serviceId\":\"" + svc + "\",\"startsAt\":\"2099-06-10T12:00:00+03:00\","
+                    + "\"name\":\"Олена\",\"surname\":\"Коваль\",\"privacyAccepted\":true,"
+                    + "\"privacyPolicyVersion\":\"2026-10-20\",\"clientComment\":\"" + bad + "\"}";
+            mockMvc.perform(post("/api/v1/book/marija-l-cd34/booking")
+                            .header("Authorization", "Bearer guest.jwt.token")
+                            .contentType(MediaType.APPLICATION_JSON).content(body))
+                    .andExpect(status().isBadRequest());
+        }
+        verify(guestBookingService, org.mockito.Mockito.never()).createGuestBooking(any(), any(), any());
+    }
+
     // ── Phase 383: GET /book/{slug}/reviews ────────────────────────────────────
 
     @Test

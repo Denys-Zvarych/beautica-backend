@@ -262,6 +262,22 @@ public class Appointment extends AuditableEntity {
             String guestPhone,
             UUID cancelToken,
             GuestConsent consent) {
+        return guestAppointment(salon, guestName, guestSurname, guestPhone, cancelToken, consent, null);
+    }
+
+    /**
+     * Phase 385 — {@link #guestAppointment} with the guest's optional note for the WHOLE visit, stored on the header
+     * ({@code appointments.client_comment}) exactly where the app's multi-service {@code POST /appointments} stores
+     * it; the chained child bookings carry none. The caller normalises it; {@code null} = no note.
+     */
+    public static Appointment guestAppointment(
+            Salon salon,
+            String guestName,
+            String guestSurname,
+            String guestPhone,
+            UUID cancelToken,
+            GuestConsent consent,
+            String clientComment) {
         if (guestName == null || guestName.isBlank()) {
             throw new IllegalArgumentException("guestName must not be blank for a LINK appointment");
         }
@@ -282,6 +298,7 @@ public class Appointment extends AuditableEntity {
                 .cancelToken(cancelToken)
                 .guestPrivacyAcceptedAt(consent == null ? null : consent.acceptedAt())
                 .guestPrivacyPolicyVersion(consent == null ? null : consent.policyVersion())
+                .clientComment(clientComment)
                 .build();
     }
 

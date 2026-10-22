@@ -376,6 +376,85 @@ class GuestBookingServiceTest {
         verify(outboxService).enqueueNewBooking(any());
     }
 
+    // ── phase 385: «Коментар для майстра» ─────────────────────────────────────────────────────
+
+    private GuestBookingRequest withComment(String comment) {
+        OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
+        return new GuestBookingRequest(serviceId, null, startsAt, "Олена", "Коваль", true, "2026-10-20", comment);
+    }
+
+    private Booking createSingleAndCapture(GuestBookingRequest request) {
+        stubHappyPath(request.startsAt());
+        when(bookingRepository.saveAll(any())).thenAnswer(inv -> inv.getArgument(0));
+        service.createGuestBooking("Bearer guest.jwt.token", SLUG, request);
+        ArgumentCaptor<List<Booking>> savedCaptor = ArgumentCaptor.forClass(List.class);
+        verify(bookingRepository).saveAll(savedCaptor.capture());
+        return savedCaptor.getValue().get(0);
+    }
+
+    @Test
+    @DisplayName("should_persistClientComment_when_provided")
+    void should_persistClientComment_when_provided() {
+        Booking saved = createSingleAndCapture(withComment("Буду з дитиною"));
+
+        assertThat(saved.getClientComment()).isEqualTo("Буду з дитиною");
+    }
+
+    @Test
+    @DisplayName("should_storeNull_when_commentBlank")
+    void should_storeNull_when_commentBlank() {
+        assertThat(createSingleAndCapture(withComment("   \n\t ")).getClientComment()).isNull();
+    }
+
+    @Test
+    @DisplayName("should_normaliseLikeTheAppPath_when_commentHasInvisibleCharacters")
+    void should_normaliseLikeTheAppPath_when_commentHasInvisibleCharacters() {
+        Booking saved = createSingleAndCapture(withComment("  Буду\u200B з дитиною  "));
+
+        assertThat(saved.getClientComment()).isEqualTo(BookingComments.normalize("  Буду\u200B з дитиною  "))
+                .doesNotContain("\u200B");
+    }
+
+    @Test
+    @DisplayName("should_storeNull_when_commentOmitted_byteIdenticalToToday")
+    void should_storeNull_when_commentOmitted_byteIdenticalToToday() {
+        assertThat(createSingleAndCapture(withComment(null)).getClientComment()).isNull();
+    }
+
+    @Test
+    @DisplayName("multi-service visit: the note lands on the appointment HEADER (where the app path puts it), not on the children")
+    void should_storeNoteOnHeaderOnly_when_visitBooked() {
+        OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
+        UUID secondServiceId = UUID.randomUUID();
+        when(guestTokenProvider.validate(anyString())).thenReturn(GUEST_PHONE);
+        when(masterRepository.findByBookingSlugWithUser(SLUG)).thenReturn(Optional.of(master()));
+        when(masterServiceRepository.findByMasterIdAndIdInWithGraph(masterId, Set.of(serviceId, secondServiceId)))
+                .thenReturn(List.of(masterService(), masterService(secondServiceId, "Педикюр")));
+        when(bookingRepository.acquireAdvisoryLockWithTimeout(masterId)).thenReturn(1);
+        when(bookingRepository.findPostLockBookabilityAndOverlap(eq(masterId), any(), any()))
+                .thenReturn(Optional.of(new TestPostLockSlotCheck(true, false)));
+        when(bookingRepository.saveAll(any())).thenAnswer(inv -> inv.getArgument(0));
+        stubVisitSlotAvailable(startsAt, List.of(serviceId, secondServiceId));
+
+        service.createGuestBooking("Bearer guest.jwt.token", SLUG,
+                new GuestBookingRequest(null, List.of(serviceId, secondServiceId), startsAt, "Олена", "Коваль",
+                        true, "2026-10-20", "Буду з дитиною"));
+
+        ArgumentCaptor<List<Booking>> savedCaptor = ArgumentCaptor.forClass(List.class);
+        verify(bookingRepository).saveAll(savedCaptor.capture());
+        List<Booking> children = savedCaptor.getValue();
+        assertThat(children.get(0).getAppointment().getClientComment()).isEqualTo("Буду з дитиною");
+        assertThat(children).allSatisfy(child -> assertThat(child.getClientComment()).isNull());
+    }
+
+    @Test
+    @DisplayName("the request's toString never prints the note or the guest identity")
+    void should_notPrintNoteOrIdentity_when_requestToString() {
+        String text = withComment("секретна примітка").toString();
+
+        assertThat(text).doesNotContain("секретна примітка").doesNotContain("Олена").doesNotContain("Коваль");
+    }
+
     @Test
     @DisplayName("should stamp the visit header and every child with ONE identical consent (phase 381)")
     void should_persistIdenticalConsentOnHeaderAndChildren_when_visitBooked() {

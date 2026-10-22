@@ -155,7 +155,7 @@ class GuestBookingRequestControlCharValidationTest {
                 // masterServiceIds added in BE-7 (multi-service guest visit); privacy consent in phase 381;
                 // phone still absent.
                 .containsExactlyInAnyOrder("serviceId", "masterServiceIds", "startsAt", "name", "surname",
-                        "privacyAccepted", "privacyPolicyVersion")
+                        "privacyAccepted", "privacyPolicyVersion", "clientComment")
                 .noneMatch(n -> n.toLowerCase().contains("phone")
                         || n.toLowerCase().contains("msisdn")
                         || n.toLowerCase().equals("tel"));

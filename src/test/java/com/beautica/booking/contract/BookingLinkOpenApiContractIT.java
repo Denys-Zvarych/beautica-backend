@@ -156,4 +156,14 @@ class BookingLinkOpenApiContractIT extends AbstractIntegrationTest {
         JsonNode salonReviews = spec().path("paths").path("/api/v1/book/s/{slug}/reviews").path("get");
         assertThat(salonReviews.isMissingNode()).as("phase 384 salon reviews route in the spec").isFalse();
     }
+
+    @Test
+    @DisplayName("phase 385: the guest booking request documents the optional clientComment (maxLength 1000, not required)")
+    void should_exposeOptionalClientComment_when_specRendered() throws Exception {
+        JsonNode request = spec().path("components").path("schemas").path("GuestBookingRequest");
+
+        assertThat(request.path("properties").has("clientComment")).isTrue();
+        assertThat(request.path("properties").path("clientComment").path("maxLength").asInt()).isEqualTo(1000);
+        assertThat(texts(request.path("required"))).doesNotContain("clientComment");
+    }
 }

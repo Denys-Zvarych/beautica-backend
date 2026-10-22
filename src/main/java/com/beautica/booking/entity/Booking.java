@@ -558,6 +558,30 @@ public class Booking extends AuditableEntity {
             String guestSurname,
             String guestPhone,
             GuestConsent consent) {
+        return guestBooking(master, masterService, salon, startsAt, endsAt, priceAtBooking, priceMaxAtBooking,
+                durationMinutesAtBooking, bufferMinutesAtBooking, guestName, guestSurname, guestPhone, consent, null);
+    }
+
+    /**
+     * Phase 385 — {@link #guestBooking} with the guest's optional booking-creation note, stored exactly where an app
+     * booking stores {@code clientComment} ({@code bookings.client_comment}). The caller normalises it
+     * ({@code BookingComments#normalize}); {@code null} = no note.
+     */
+    public static Booking guestBooking(
+            Master master,
+            MasterServiceAssignment masterService,
+            Salon salon,
+            OffsetDateTime startsAt,
+            OffsetDateTime endsAt,
+            BigDecimal priceAtBooking,
+            BigDecimal priceMaxAtBooking,
+            int durationMinutesAtBooking,
+            int bufferMinutesAtBooking,
+            String guestName,
+            String guestSurname,
+            String guestPhone,
+            GuestConsent consent,
+            String clientComment) {
         if (guestName == null || guestName.isBlank()) {
             throw new IllegalArgumentException("guestName must not be blank for a LINK booking");
         }
@@ -585,6 +609,7 @@ public class Booking extends AuditableEntity {
                 .reminderSent(false)
                 .guestPrivacyAcceptedAt(consent == null ? null : consent.acceptedAt())
                 .guestPrivacyPolicyVersion(consent == null ? null : consent.policyVersion())
+                .clientComment(clientComment)
                 .build();
     }
 
