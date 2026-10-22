@@ -50,10 +50,14 @@ public class SalonCatalogCacheEvictor {
     }
 
     @Transactional(propagation = Propagation.NOT_SUPPORTED)
-    @CacheEvict(value = "salon-service-catalog", key = "#salonId", condition = "#salonId != null")
+    // beforeInvocation = true (phase 384 audit): the CATALOGUE entry must be gone BEFORE the booking page is
+    // evicted. With the default (after the body) the page went first, and a reader arriving in between rebuilt the
+    // page from the STALE cached catalogue (the page embeds getSalonServiceCatalog) and re-cached it for its TTL.
+    @CacheEvict(value = "salon-service-catalog", key = "#salonId", condition = "#salonId != null",
+            beforeInvocation = true)
     public void evict(UUID salonId) {
-        // @CacheEvict performs the catalogue eviction. A null salonId is skipped by the condition
-        // (independent masters own no salon catalogue entry) and is a no-op for the booking page too.
+        // @CacheEvict (before this body) performs the catalogue eviction. A null salonId is skipped by the
+        // condition (independent masters own no salon catalogue entry) and is a no-op for the booking page too.
         salonBookingInfoCacheEvictor.evictSalon(salonId);
     }
 

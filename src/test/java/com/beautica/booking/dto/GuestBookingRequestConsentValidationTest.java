@@ -147,6 +147,15 @@ class GuestBookingRequestConsentValidationTest {
     }
 
     @Test
+    @DisplayName("PhoneOtpSendRequest.toString never prints the phone or the Turnstile token (phase 382 audit)")
+    void should_redactPhoneAndTurnstileToken_when_otpRequestToString() {
+        String text = new PhoneOtpSendRequest(VALID_PHONE, true, "2026-10-20", "0.secret-turnstile-token").toString();
+
+        assertThat(text).doesNotContain(VALID_PHONE).doesNotContain("671234567")
+                .doesNotContain("secret-turnstile-token").contains("privacyAccepted=true");
+    }
+
+    @Test
     @DisplayName("should_failValidation_when_legacyFourArgConstructorUsed")
     void should_failValidation_when_legacyFourArgConstructorUsed() {
         var legacy = new GuestBookingRequest(UUID.randomUUID(), FUTURE, "Олена", "Коваль");

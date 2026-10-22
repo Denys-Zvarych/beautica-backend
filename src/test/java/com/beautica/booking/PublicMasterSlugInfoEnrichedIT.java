@@ -512,21 +512,30 @@ class PublicMasterSlugInfoEnrichedIT extends AbstractIntegrationTest {
     // ── statement budget ──────────────────────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("a cache miss costs at most 8 statements (D9: 7 in phase 380 + the rating-distribution GROUP BY of phase 383)")
-    void should_useAtMostSevenStatements_when_cacheMiss() {
+    @DisplayName("a cache miss of a BUSY master (13 photos, 6 reviews, every inner cache cold) costs at most 8 statements")
+    void should_useAtMostEightStatements_when_busyMasterCacheMiss() {
         IndependentMaster master = pages.independentMaster(true);
         UUID client = pages.insertClient();
-        pages.insertReview(master, client, 5, 10);
-        insertPortfolioPhoto(master, 5);
+        for (int i = 1; i <= 6; i++) {
+            pages.insertReview(master, client, 5, i * 10);
+        }
+        jdbcTemplate.update("UPDATE masters SET review_count = 6, avg_rating = 5.00 WHERE id = ?", master.masterId());
+        for (int i = 1; i <= 13; i++) {
+            insertPortfolioPhoto(master, i);
+        }
+        for (String cache : List.of("booking-slug-info", "portfolio", "reviews-by-master")) {
+            cacheManager.getCache(cache).clear();
+        }
         Statistics statistics = HibernateStatistics.enabledOn(emf);
         long before = statistics.getPrepareStatementCount();
 
         BookingSlugInfoResponse info = bookingSlugService.findBySlug(master.slug());
 
         long statements = statistics.getPrepareStatementCount() - before;
-        assertThat(info.latestReviews()).hasSize(1);
-        assertThat(info.portfolio()).hasSize(1);
-        assertThat(statements).as("statements on a cache miss").isBetween(1L, 8L);
+        assertThat(info.latestReviews()).as("capped at 5").hasSize(5);
+        assertThat(info.portfolio()).as("capped at 12").hasSize(12);
+        assertThat(statements).as("statements on a busy cache miss (was ~10 with the paged portfolio + reviews)")
+                .isBetween(1L, 8L);
     }
 
     // ── helpers ───────────────────────────────────────────────────────────────────────────────

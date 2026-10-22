@@ -193,4 +193,42 @@ class PublicMasterSlugReviewsIT extends AbstractIntegrationTest {
         headers.set("X-Forwarded-For", clientIp);
         return headers;
     }
+
+    // ── phase 383/384 audit L1: bounded cache keys on the public reviews route ────────────────
+
+    private static boolean hasKeyContaining(org.springframework.cache.Cache cache, String fragment) {
+        @SuppressWarnings("unchecked")
+        java.util.Map<Object, Object> entries =
+                ((com.github.benmanes.caffeine.cache.Cache<Object, Object>) cache.getNativeCache()).asMap();
+        return entries.keySet().stream().anyMatch(key -> String.valueOf(key).contains(fragment));
+    }
+
+    @Test
+    @DisplayName("should_notCacheEmptyDeepPage_when_pageBeyondLastPage - 200 with the real total, and NO new cache key")
+    void should_notCacheEmptyDeepPage_when_pageBeyondLastPage() throws Exception {
+        var slug = masterWithThreeReviews().slug();
+        var cache = cacheManager.getCache("reviews-by-master");
+
+        JsonNode deep = data(get("?page=7&size=20", slug, null));
+        data(get("?page=0&size=20", slug, null));
+
+        assertThat(deep.path("data")).isEmpty();
+        assertThat(deep.path("totalElements").asLong()).isEqualTo(3);
+        assertThat(hasKeyContaining(cache, ":page:7:")).as("deep empty page must not be cached").isFalse();
+        assertThat(hasKeyContaining(cache, ":page:0:")).as("non-vacuity: a real page IS cached").isTrue();
+    }
+
+    @Test
+    @DisplayName("should_reject400_when_pageAboveTheCap - page 10 is allowed (empty), page 11 is a 400 that creates no cache key")
+    void should_reject400_when_pageAboveTheCap() throws Exception {
+        var slug = masterWithThreeReviews().slug();
+        var cache = cacheManager.getCache("reviews-by-master");
+
+        ResponseEntity<String> atCap = get("?page=10", slug, null);
+        ResponseEntity<String> overCap = get("?page=11", slug, null);
+
+        assertThat(atCap.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(overCap.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(hasKeyContaining(cache, ":page:11:")).isFalse();
+    }
 }

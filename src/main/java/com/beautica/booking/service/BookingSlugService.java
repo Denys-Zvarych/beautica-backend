@@ -4,6 +4,7 @@ import com.beautica.booking.dto.BookingSlugInfoResponse;
 import com.beautica.booking.dto.BookingSlugSalonRef;
 import com.beautica.booking.dto.CategoryRef;
 import com.beautica.booking.dto.ServiceSummaryDto;
+import com.beautica.common.ReviewTarget;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.master.entity.Master;
@@ -27,6 +28,7 @@ import com.beautica.user.User;
 import lombok.RequiredArgsConstructor;
 import org.springframework.cache.annotation.Cacheable;
 import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
 import org.springframework.http.HttpStatus;
@@ -310,6 +312,9 @@ public class BookingSlugService {
      * {@link NotFoundException} (→ 404) when the slug is unknown or the master is
      * inactive.
      */
+    // L2 (phase 383 audit, accepted): the composite miss runs inside ONE read-only transaction (one connection, a
+    // consistent snapshot across the ~7 reads). Every call inside it is a database read or an in-JVM cache lookup -
+    // no HTTP, SMS or other external call may be added here, or it would hold that connection for its duration.
     @Cacheable(cacheNames = "booking-slug-info", key = "#slug", sync = true)
     @Transactional(readOnly = true)
     public BookingSlugInfoResponse findBySlug(String slug) {
@@ -365,11 +370,35 @@ public class BookingSlugService {
      */
     @Transactional(readOnly = true)
     public Page<ReviewResponse> reviewsForSlug(String slug, SalonReviewSort sort, Pageable pageable) {
-        UUID masterId = masterRepository.findActiveIdByBookingSlug(slug)
+        Pageable clamped = clampPublicReviewsPage(pageable);
+        ReviewTarget target = masterRepository.findActiveReviewTargetByBookingSlug(slug)
                 .orElseThrow(() -> new NotFoundException("Booking page not found"));
-        Pageable clamped = PageRequest.of(pageable.getPageNumber(),
-                Math.min(pageable.getPageSize(), MAX_REVIEWS_PAGE_SIZE));
-        return reviewService.getReviewsForMaster(masterId, sort, clamped);
+        if (isBeyondLastPage(clamped, target.getReviewCount())) {
+            // Never reaches the cached method: an empty deep page must not mint a cache entry (key churn).
+            return new PageImpl<>(List.of(), clamped, target.getReviewCount());
+        }
+        return reviewService.getReviewsForMaster(target.getId(), sort, clamped);
+    }
+
+    /** Page ceiling of the public {@code /reviews} routes (0-based): deeper is a 400, not a cache key. */
+    public static final int MAX_PUBLIC_REVIEWS_PAGE = 10;
+
+    /**
+     * Phase 383/384 audit - validates and clamps the public reviews window: a page above
+     * {@value #MAX_PUBLIC_REVIEWS_PAGE} is rejected (400), the size is clamped to {@value #MAX_REVIEWS_PAGE_SIZE}.
+     * Together with {@link #isBeyondLastPage} this bounds the {@code reviews-by-*} cache keys one anonymous caller
+     * can mint to {@code sorts x pages x sizes} that actually hold data.
+     */
+    static Pageable clampPublicReviewsPage(Pageable pageable) {
+        if (pageable.getPageNumber() > MAX_PUBLIC_REVIEWS_PAGE) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST, "Page number must not exceed " + MAX_PUBLIC_REVIEWS_PAGE);
+        }
+        return PageRequest.of(pageable.getPageNumber(), Math.min(pageable.getPageSize(), MAX_REVIEWS_PAGE_SIZE));
+    }
+
+    /** {@code true} when the window starts at or after the persisted review count (so it holds nothing). */
+    static boolean isBeyondLastPage(Pageable pageable, int reviewCount) {
+        return (long) pageable.getPageNumber() * pageable.getPageSize() >= reviewCount;
     }
 
     /**
@@ -380,11 +409,13 @@ public class BookingSlugService {
      */
     @Transactional(readOnly = true)
     public Page<SalonReviewResponse> salonReviewsForSlug(String slug, SalonReviewSort sort, Pageable pageable) {
-        UUID salonId = salonRepository.findActiveIdByBookingSlug(slug)
+        Pageable clamped = clampPublicReviewsPage(pageable);
+        ReviewTarget target = salonRepository.findActiveReviewTargetByBookingSlug(slug)
                 .orElseThrow(() -> new NotFoundException("Booking page not found"));
-        Pageable clamped = PageRequest.of(pageable.getPageNumber(),
-                Math.min(pageable.getPageSize(), MAX_REVIEWS_PAGE_SIZE));
-        return reviewService.getSalonReviews(salonId, sort, clamped);
+        if (isBeyondLastPage(clamped, target.getReviewCount())) {
+            return new PageImpl<>(List.of(), clamped, target.getReviewCount());
+        }
+        return reviewService.getSalonReviews(target.getId(), sort, clamped);
     }
 
     private static BookingSlugSalonRef salonRef(Salon salon) {
@@ -406,8 +437,8 @@ public class BookingSlugService {
     }
 
     private List<ReviewResponse> latestReviews(UUID masterId) {
-        return reviewService.getReviewsForMaster(
-                masterId, SalonReviewSort.NEWEST, PageRequest.of(0, LATEST_REVIEWS_LIMIT)).getContent();
+        // One uncached statement, no COUNT (the paged getReviewsForMaster costs ids + count + hydrate).
+        return reviewService.getLatestReviewsForMaster(masterId, LATEST_REVIEWS_LIMIT);
     }
 
     /** {@code GREATEST(a, b)} of the two audit timestamps (phase 380 D2 {@code updatedAt}). */

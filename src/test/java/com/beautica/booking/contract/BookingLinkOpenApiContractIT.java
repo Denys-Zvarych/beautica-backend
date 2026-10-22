@@ -117,8 +117,11 @@ class BookingLinkOpenApiContractIT extends AbstractIntegrationTest {
         JsonNode master = schemas.path("SalonBookingSlugMasterItem");
         List<String> masterFields = new ArrayList<>();
         master.path("properties").fieldNames().forEachRemaining(masterFields::add);
-        assertThat(masterFields).containsExactlyInAnyOrder("masterSlug", "name", "avatarUrl", "professionalTitle");
-        assertThat(texts(master.path("required"))).containsExactlyInAnyOrder("masterSlug", "name");
+        assertThat(masterFields).containsExactlyInAnyOrder("masterSlug", "name", "avatarUrl", "professionalTitle",
+                "avgRating", "reviewCount");
+        assertThat(texts(master.path("required"))).containsExactlyInAnyOrder("masterSlug", "name", "reviewCount");
+        assertThat(texts(master.path("properties").path("avgRating").path("type")))
+                .containsExactlyInAnyOrder("number", "null");
     }
 
     @Test

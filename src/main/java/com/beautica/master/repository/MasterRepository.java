@@ -188,7 +188,8 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
      * issued via {@code GET /booking-links/mine} (phase 375); every master created since 13.1 has one.
      */
     @Query(value = "SELECT m.id AS id, m.booking_slug AS bookingSlug, u.first_name AS firstName, "
-            + "u.last_name AS lastName, u.avatar_url AS avatarUrl, u.professional_title AS professionalTitle "
+            + "u.last_name AS lastName, u.avatar_url AS avatarUrl, u.professional_title AS professionalTitle, "
+            + "m.avg_rating AS avgRating, m.review_count AS reviewCount "
             + "FROM masters m JOIN users u ON u.id = m.user_id "
             + "WHERE m.salon_id = :salonId AND m.is_active = true AND m.booking_slug IS NOT NULL AND "
             + MasterBookabilitySql.BOOKABLE_MASTER_M
@@ -212,6 +213,11 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
         String getAvatarUrl();
 
         String getProfessionalTitle();
+
+        /** Phase 384 audit - the persisted rating pair the salon master card shows (no extra statement). */
+        java.math.BigDecimal getAvgRating();
+
+        int getReviewCount();
     }
 
     /** Row of {@link #findSearchBookability}. */
@@ -598,13 +604,13 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
      * every (uncached) request.
      */
     @Query("""
-            SELECT m.id FROM Master m
+            SELECT m.id AS id, m.reviewCount AS reviewCount FROM Master m
             LEFT JOIN m.salon s
             WHERE m.bookingSlug = :slug
               AND m.isActive = true
               AND (s IS NULL OR s.isActive = true)
             """)
-    Optional<UUID> findActiveIdByBookingSlug(@Param("slug") String slug);
+    Optional<com.beautica.common.ReviewTarget> findActiveReviewTargetByBookingSlug(@Param("slug") String slug);
 
     // ── phase 295 — salon-deletion staff HARD-DELETE cascade ────────────────────────────────────
 

@@ -45,4 +45,15 @@ public record PhoneOtpSendRequest(
                 maxLength = 2048)
         @Size(max = 2048)
         String turnstileToken
-) {}
+) {
+
+    /**
+     * Phase 382 audit: the generated record {@code toString} would print the phone and the Turnstile token. Neither
+     * belongs in a log line; only the consent flag and version (non-sensitive) are shown.
+     */
+    @Override
+    public String toString() {
+        return "PhoneOtpSendRequest[privacyAccepted=" + privacyAccepted + ", privacyPolicyVersion="
+                + privacyPolicyVersion + "]";
+    }
+}

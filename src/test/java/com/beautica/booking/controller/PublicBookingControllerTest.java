@@ -465,7 +465,7 @@ class PublicBookingControllerTest {
         return new SalonBookingSlugInfoResponse(
                 salonId, "Студія Краса", "Вінниця", "https://cdn.example/logo.jpg", null,
                 new BigDecimal("4.80"), 12, true,
-                List.of(new SalonBookingSlugMasterItem("anna-bila-aa11", "Anna Bila", null, "Стиліст")),
+                List.of(new SalonBookingSlugMasterItem("anna-bila-aa11", "Anna Bila", null, "Стиліст", new BigDecimal("4.90"), 7)),
                 "Вінницька область", "вул. Соборна", "12", java.time.Instant.parse("2026-10-15T08:00:00Z"),
                 null, null, List.of(), List.of(), List.of(), List.of());
     }

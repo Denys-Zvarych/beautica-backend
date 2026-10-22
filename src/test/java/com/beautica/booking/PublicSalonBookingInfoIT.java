@@ -66,8 +66,13 @@ import static org.assertj.core.api.Assertions.assertThat;
 @DisplayName("GET /book/s/{slug}/info — bookable masters only, 404/bookable=false, cached + evicted after commit (Phase 377)")
 class PublicSalonBookingInfoIT extends AbstractIntegrationTest {
 
-    /** Salon row + masters batch (377) + portfolio, services (+bookability batch), summary, newest reviews (384). */
-    private static final int MISS_STATEMENT_BUDGET = 12;
+    /**
+     * Worst case (every inner cache cold): salon row + masters batch + portfolio + rating GROUP BY + newest reviews
+     * = 5 statements of the page itself, plus the 6 of {@code getSalonServiceCatalog} (reused unchanged, REUSE-FIRST;
+     * it is cached under salon-service-catalog, so the warm figure is {@link #WARM_CATALOGUE_STATEMENT_BUDGET}).
+     */
+    private static final int MISS_STATEMENT_BUDGET = 11;
+    private static final int WARM_CATALOGUE_STATEMENT_BUDGET = 5;
     private static final String SLUG_CHECK = "^[a-z0-9][a-z0-9\\-]*[a-z0-9]$";
 
     @Autowired private TestRestTemplate restTemplate;
@@ -283,7 +288,8 @@ class PublicSalonBookingInfoIT extends AbstractIntegrationTest {
                 "bookable", "masters", "region", "street", "buildingNo", "updatedAt", "description", "locationNote",
                 "portfolio", "serviceCategories", "ratingDistribution", "latestReviews");
         assertThat(fieldNames(page.path("masters").get(0)))
-                .containsExactlyInAnyOrder("masterSlug", "name", "avatarUrl", "professionalTitle");
+                .containsExactlyInAnyOrder("masterSlug", "name", "avatarUrl", "professionalTitle", "avgRating",
+                        "reviewCount");
         assertThat(response.getBody())
                 .doesNotContain(ownerEmail)
                 .doesNotContain("+380501112233")
@@ -304,6 +310,7 @@ class PublicSalonBookingInfoIT extends AbstractIntegrationTest {
         pages.categorise(BookableMasterSeeder.assignNewSalonService(jdbcTemplate, salon.salonId(), master));
         UUID client = pages.insertClient();
         pages.insertSalonReview(salon.salonId(), master, client, 5, 10);
+        jdbcTemplate.update("UPDATE masters SET review_count = 1, avg_rating = 5.00 WHERE id = ?", master);
         jdbcTemplate.update("UPDATE salons SET description = 'Студія краси', location_note = 'Другий вхід', "
                 + "phone = '+380501112233' WHERE id = ?", salon.salonId());
         insertSalonPhoto(salon.salonId(), 5);
@@ -347,6 +354,8 @@ class PublicSalonBookingInfoIT extends AbstractIntegrationTest {
                 "salonId", "name", "city", "avatarUrl", "coverImageUrl", "avgRating", "reviewCount", "bookable",
                 "masters", "region", "street", "buildingNo", "updatedAt", "description", "locationNote", "portfolio",
                 "serviceCategories", "ratingDistribution", "latestReviews"));
+        assertThat(keySet(page.path("masters").get(0))).isEqualTo(java.util.Set.of(
+                "masterSlug", "name", "avatarUrl", "professionalTitle", "avgRating", "reviewCount"));
         assertThat(keySet(page.path("portfolio").get(0)))
                 .isEqualTo(java.util.Set.of("id", "entityType", "entityId", "mediaType", "url", "createdAt"));
         JsonNode group = page.path("serviceCategories").get(0);
@@ -376,6 +385,13 @@ class PublicSalonBookingInfoIT extends AbstractIntegrationTest {
         assertThat(page.path("portfolio")).isEqualTo(appPortfolio);
         assertThat(page.path("ratingDistribution")).isEqualTo(appSummary.path("ratingDistribution"));
         assertThat(page.path("latestReviews")).isEqualTo(appReviews);
+        JsonNode appMasters = appData("/api/v1/salons/" + salonId + "/masters").path("data");
+        assertThat(appMasters).isNotEmpty();
+        JsonNode appMaster = appMasters.get(0);
+        JsonNode pageMaster = page.path("masters").get(0);
+        assertThat(pageMaster.path("reviewCount").asInt()).isEqualTo(appMaster.path("reviewCount").asInt()).isEqualTo(1);
+        assertThat(pageMaster.path("avgRating").decimalValue())
+                .isEqualByComparingTo(appMaster.path("avgRating").decimalValue());
         assertThat(page.path("description").asText()).isEqualTo("Студія краси");
         assertThat(page.path("locationNote").asText()).isEqualTo("Другий вхід");
     }
@@ -439,6 +455,45 @@ class PublicSalonBookingInfoIT extends AbstractIntegrationTest {
         assertThat(delete.getStatusCode().is2xxSuccessful()).as(delete.getBody()).isTrue();
 
         assertThat(page(salon.slug()).path("portfolio")).isEmpty();
+    }
+
+    @Test
+    @DisplayName("worst case: a BUSY salon (13 photos, 6 reviews, services, 3 masters) with every inner cache cold stays within the miss budget")
+    void should_stayWithinMissBudget_when_busySalonAllCachesCold() throws Exception {
+        PublicBookingPageFixtures.SalonPage salon = pages.salon("Busy Salon");
+        UUID client = pages.insertClient();
+        UUID first = null;
+        for (int i = 0; i < 3; i++) {
+            UUID master = pages.salonMaster(salon.salonId(), "Busy" + i, "Maisterka");
+            BookableMasterSeeder.seedUsableSchedule(jdbcTemplate, master);
+            pages.categorise(BookableMasterSeeder.assignNewSalonService(jdbcTemplate, salon.salonId(), master));
+            first = first == null ? master : first;
+        }
+        for (int i = 1; i <= 6; i++) {
+            pages.insertSalonReview(salon.salonId(), first, client, 5, i * 10);
+        }
+        jdbcTemplate.update("UPDATE salons SET review_count = 6, avg_rating = 5.00 WHERE id = ?", salon.salonId());
+        for (int i = 1; i <= 13; i++) {
+            insertSalonPhoto(salon.salonId(), i);
+        }
+        for (String cache : List.of("salon-booking-slug-info", "salon-service-catalog", "portfolio", "reviews-by-salon")) {
+            cacheManager.getCache(cache).clear();
+        }
+
+        ThreadJdbcFootprint.Measured<SalonBookingSlugInfoResponse> measured =
+                ThreadJdbcFootprint.measure(() -> salonBookingSlugService.findBySlug(salon.slug()));
+
+        assertThat(measured.result().latestReviews()).hasSize(5);
+        assertThat(measured.result().portfolio()).hasSize(12);
+        assertThat(measured.result().masters()).hasSize(3);
+        assertThat(measured.footprint().statements()).as("busy cold miss: %s", measured.footprint())
+                .isLessThanOrEqualTo(MISS_STATEMENT_BUDGET);
+
+        cacheManager.getCache("salon-booking-slug-info").clear();
+        ThreadJdbcFootprint.Measured<SalonBookingSlugInfoResponse> warmCatalogue =
+                ThreadJdbcFootprint.measure(() -> salonBookingSlugService.findBySlug(salon.slug()));
+        assertThat(warmCatalogue.footprint().statements()).as("page-only cost: %s", warmCatalogue.footprint())
+                .isLessThanOrEqualTo(WARM_CATALOGUE_STATEMENT_BUDGET);
     }
 
     // ── cache (D5) ───────────────────────────────────────────────────────────────────────────

@@ -60,6 +60,8 @@ public class SalonBookingSlugService {
      * <p>Cached per slug with {@code sync = true} (a {@code permitAll} read, Anti-Bug §F-7); evicted after
      * commit by {@link SalonBookingInfoCacheEvictor}, 60-second TTL backstop ({@code CacheConfig}).
      */
+    // L2 (phase 384 audit, accepted): one read-only transaction for the whole miss; database reads and in-JVM cache
+    // lookups only - no external call may be added inside it.
     @Cacheable(cacheNames = SalonBookingInfoCacheEvictor.CACHE, key = "#slug", sync = true)
     @Transactional(readOnly = true)
     public SalonBookingSlugInfoResponse findBySlug(String slug) {
@@ -93,9 +95,11 @@ public class SalonBookingSlugService {
                 mediaService.getLatestPortfolio(EntityType.SALON, salon.getId(), BookingSlugService.PORTFOLIO_LIMIT),
                 // GET /salons/{id}/services: bookable-only grouping, counts and display names as the app gets them.
                 serviceCatalogService.getSalonServiceCatalog(salon.getId()).categories(),
-                reviewService.getSalonReviewSummary(salon.getId()).ratingDistribution(),
-                reviewService.getSalonReviews(salon.getId(), SalonReviewSort.NEWEST,
-                        PageRequest.of(0, BookingSlugService.LATEST_REVIEWS_LIMIT)).getContent());
+                // The row already holds avgRating/reviewCount: the overload skips the salon findById.
+                reviewService.getSalonReviewSummary(salon.getId(), salon.getAvgRating(), salon.getReviewCount())
+                        .ratingDistribution(),
+                // One uncached statement, no COUNT (the paged getSalonReviews costs ids + count + hydrate).
+                reviewService.getLatestReviewsForSalon(salon.getId(), BookingSlugService.LATEST_REVIEWS_LIMIT));
     }
 
     private static boolean isBlank(String value) {
@@ -107,6 +111,10 @@ public class SalonBookingSlugService {
                 master.getBookingSlug(),
                 BookingSlugService.composeName(master.getFirstName(), master.getLastName()),
                 master.getAvatarUrl(),
-                master.getProfessionalTitle());
+                master.getProfessionalTitle(),
+                // The app's salon master card rule (MasterSummaryResponse): no reviews -> null, never the stored 0.00.
+                com.beautica.booking.dto.BookingDetailResponse.masterAvgRatingOrNull(
+                        master.getReviewCount(), master.getAvgRating()),
+                master.getReviewCount());
     }
 }

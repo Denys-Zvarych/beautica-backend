@@ -733,8 +733,8 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
      * {@link #findBookingPageRowBySlug} as one scalar statement, for {@code GET /book/s/{slug}/reviews}, which
      * needs the id only.
      */
-    @Query("SELECT s.id FROM Salon s WHERE s.bookingSlug = :slug AND s.isActive = true")
-    Optional<UUID> findActiveIdByBookingSlug(@Param("slug") String slug);
+    @Query("SELECT s.id AS id, s.reviewCount AS reviewCount FROM Salon s WHERE s.bookingSlug = :slug AND s.isActive = true")
+    Optional<com.beautica.common.ReviewTarget> findActiveReviewTargetByBookingSlug(@Param("slug") String slug);
 
     /**
      * Phase 376 audit — serialises every salon-slug WRITER on the candidate value: a transaction-scoped

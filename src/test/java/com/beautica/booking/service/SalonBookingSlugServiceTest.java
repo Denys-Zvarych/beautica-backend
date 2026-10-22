@@ -49,13 +49,12 @@ class SalonBookingSlugServiceTest {
         org.mockito.Mockito.lenient().when(mediaService.getLatestPortfolio(any(), any(), anyInt())).thenReturn(List.of());
         org.mockito.Mockito.lenient().when(serviceCatalogService.getSalonServiceCatalog(any()))
                 .thenReturn(new com.beautica.service.dto.SalonServiceCatalogResponse(List.of()));
-        org.mockito.Mockito.lenient().when(reviewService.getSalonReviewSummary(any()))
+        org.mockito.Mockito.lenient().when(reviewService.getSalonReviewSummary(any(), any(), org.mockito.ArgumentMatchers.anyInt()))
                 .thenReturn(new com.beautica.review.dto.SalonReviewSummaryResponse(null, 0, List.of(
                         new com.beautica.common.RatingBucket(5, 0), new com.beautica.common.RatingBucket(4, 0),
                         new com.beautica.common.RatingBucket(3, 0), new com.beautica.common.RatingBucket(2, 0),
                         new com.beautica.common.RatingBucket(1, 0))));
-        org.mockito.Mockito.lenient().when(reviewService.getSalonReviews(any(), any(), any()))
-                .thenReturn(org.springframework.data.domain.Page.empty());
+        org.mockito.Mockito.lenient().when(reviewService.getLatestReviewsForSalon(any(), anyInt())).thenReturn(List.of());
     }
 
     private final UUID salonId = UUID.randomUUID();
@@ -84,6 +83,7 @@ class SalonBookingSlugServiceTest {
         when(row.getLastName()).thenReturn(last);
         when(row.getAvatarUrl()).thenReturn(null);
         when(row.getProfessionalTitle()).thenReturn("Майстер");
+        org.mockito.Mockito.lenient().when(row.getReviewCount()).thenReturn(0);
         return row;
     }
 
@@ -210,8 +210,8 @@ class SalonBookingSlugServiceTest {
 
         verify(mediaService).getLatestPortfolio(com.beautica.media.entity.EntityType.SALON, salonId,
                 BookingSlugService.PORTFOLIO_LIMIT);
-        verify(reviewService).getSalonReviews(salonId, com.beautica.review.dto.SalonReviewSort.NEWEST,
-                org.springframework.data.domain.PageRequest.of(0, BookingSlugService.LATEST_REVIEWS_LIMIT));
+        verify(reviewService).getLatestReviewsForSalon(salonId, BookingSlugService.LATEST_REVIEWS_LIMIT);
+        verify(reviewService, never()).getSalonReviews(any(), any(), any());
         assertThat(BookingSlugService.PORTFOLIO_LIMIT).as("shared with the master page (380)").isEqualTo(12);
         assertThat(BookingSlugService.LATEST_REVIEWS_LIMIT).isEqualTo(5);
     }
@@ -233,5 +233,24 @@ class SalonBookingSlugServiceTest {
         assertThat(page.description()).isEqualTo("Студія краси");
         assertThat(page.locationNote()).isEqualTo("Другий вхід");
         assertThat(page.serviceCategories()).containsExactly(group);
+    }
+
+    @Test
+    @DisplayName("masters carry the app's rating pair: avgRating + reviewCount, avgRating null while the master has no reviews")
+    void should_carryRatingPair_when_mastersListed() {
+        salonRow(0, null);
+        SalonBookingPageMasterRow rated = masterRow("anna-b-aa11", "Anna", "Bila");
+        when(rated.getReviewCount()).thenReturn(12);
+        when(rated.getAvgRating()).thenReturn(new BigDecimal("4.75"));
+        SalonBookingPageMasterRow unrated = masterRow("olha-ch-bb22", "Olha", "Chorna");
+        org.mockito.Mockito.lenient().when(unrated.getAvgRating()).thenReturn(new BigDecimal("0.00"));
+        when(masterRepository.findBookingPageMastersBySalonId(salonId, TODAY, SalonBookingSlugService.MAX_MASTERS))
+                .thenReturn(List.of(rated, unrated));
+
+        SalonBookingSlugInfoResponse page = service.findBySlug(SLUG);
+
+        assertThat(page.masters()).extracting("reviewCount").containsExactly(12, 0);
+        assertThat(page.masters().get(0).avgRating()).isEqualByComparingTo("4.75");
+        assertThat(page.masters().get(1).avgRating()).as("stored 0.00 never reaches the wire").isNull();
     }
 }

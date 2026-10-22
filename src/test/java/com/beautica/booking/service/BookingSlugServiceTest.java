@@ -487,7 +487,7 @@ class BookingSlugServiceTest {
         when(scheduleDateMath.today()).thenReturn(TODAY);
         when(mediaService.getLatestPortfolio(any(com.beautica.media.entity.EntityType.class), any(), anyInt()))
                 .thenReturn(List.of());
-        when(reviewService.getReviewsForMaster(any(), any(), any(PageRequest.class))).thenReturn(Page.empty());
+        when(reviewService.getLatestReviewsForMaster(any(), anyInt())).thenReturn(List.of());
         when(reviewService.getMasterReviewSummary(any())).thenReturn(summary(distribution(0, 0, 0, 0, 0)));
 
         BookingSlugInfoResponse info = service.findBySlug("marija-l-cd34");
@@ -520,8 +520,8 @@ class BookingSlugServiceTest {
                 .thenReturn(summary(distribution(0, 0, 0, 0, 0)));
         org.mockito.Mockito.lenient().when(mediaService.getLatestPortfolio(eq(com.beautica.media.entity.EntityType.MASTER), eq(masterId), anyInt()))
                 .thenReturn(List.of());
-        when(reviewService.getReviewsForMaster(eq(masterId), eq(SalonReviewSort.NEWEST), any(PageRequest.class)))
-                .thenReturn(Page.empty());
+        org.mockito.Mockito.lenient().when(reviewService.getLatestReviewsForMaster(eq(masterId), anyInt()))
+                .thenReturn(List.of());
         return master;
     }
 
@@ -676,7 +676,7 @@ class BookingSlugServiceTest {
     @DisplayName("should_clampPageSizeTo20AndDelegate_when_reviewsRequested")
     void should_clampPageSizeTo20AndDelegate_when_reviewsRequested() {
         UUID masterId = UUID.randomUUID();
-        when(masterRepository.findActiveIdByBookingSlug("olena-k-ab12")).thenReturn(Optional.of(masterId));
+        when(masterRepository.findActiveReviewTargetByBookingSlug("olena-k-ab12")).thenReturn(Optional.of(target(masterId, 500)));
         when(reviewService.getReviewsForMaster(eq(masterId), eq(SalonReviewSort.HIGHEST), any(PageRequest.class)))
                 .thenReturn(Page.empty());
 
@@ -689,7 +689,7 @@ class BookingSlugServiceTest {
     @DisplayName("should_clampPageSizeTo20AndDelegate_when_salonReviewsRequested")
     void should_clampPageSizeTo20AndDelegate_when_salonReviewsRequested() {
         UUID salonId = UUID.randomUUID();
-        when(salonRepository.findActiveIdByBookingSlug("studio-a1b2")).thenReturn(Optional.of(salonId));
+        when(salonRepository.findActiveReviewTargetByBookingSlug("studio-a1b2")).thenReturn(Optional.of(target(salonId, 500)));
         when(reviewService.getSalonReviews(eq(salonId), eq(SalonReviewSort.LOWEST), any(PageRequest.class)))
                 .thenReturn(Page.empty());
 
@@ -701,7 +701,7 @@ class BookingSlugServiceTest {
     @Test
     @DisplayName("should_throwNotFound_when_salonReviewsSlugUnknownOrInactive")
     void should_throwNotFound_when_salonReviewsSlugUnknownOrInactive() {
-        when(salonRepository.findActiveIdByBookingSlug("nope")).thenReturn(Optional.empty());
+        when(salonRepository.findActiveReviewTargetByBookingSlug("nope")).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> service.salonReviewsForSlug("nope", SalonReviewSort.NEWEST, PageRequest.of(0, 20)))
                 .isInstanceOf(NotFoundException.class);
@@ -709,9 +709,56 @@ class BookingSlugServiceTest {
     }
 
     @Test
+    @DisplayName("should_reject400_when_publicReviewsPageAboveCap - master and salon, before any lookup")
+    void should_reject400_when_publicReviewsPageAboveCap() {
+        assertThatThrownBy(() -> service.reviewsForSlug("olena-k-ab12", SalonReviewSort.NEWEST,
+                PageRequest.of(BookingSlugService.MAX_PUBLIC_REVIEWS_PAGE + 1, 20)))
+                .isInstanceOf(BusinessException.class);
+        assertThatThrownBy(() -> service.salonReviewsForSlug("studio-a1b2", SalonReviewSort.NEWEST,
+                PageRequest.of(BookingSlugService.MAX_PUBLIC_REVIEWS_PAGE + 1, 20)))
+                .isInstanceOf(BusinessException.class);
+        org.mockito.Mockito.verifyNoInteractions(masterRepository, salonRepository, reviewService);
+    }
+
+    @Test
+    @DisplayName("should_notCacheEmptyDeepPage_when_pageBeyondLastPage - the cached review method is never reached")
+    void should_notCacheEmptyDeepPage_when_pageBeyondLastPage() {
+        UUID masterId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        when(masterRepository.findActiveReviewTargetByBookingSlug("olena-k-ab12"))
+                .thenReturn(Optional.of(target(masterId, 25)));
+        when(salonRepository.findActiveReviewTargetByBookingSlug("studio-a1b2"))
+                .thenReturn(Optional.of(target(salonId, 25)));
+
+        var master = service.reviewsForSlug("olena-k-ab12", SalonReviewSort.NEWEST, PageRequest.of(2, 20));
+        var salon = service.salonReviewsForSlug("studio-a1b2", SalonReviewSort.NEWEST, PageRequest.of(5, 20));
+
+        assertThat(master.getContent()).isEmpty();
+        assertThat(master.getTotalElements()).isEqualTo(25);
+        assertThat(salon.getContent()).isEmpty();
+        assertThat(salon.getTotalElements()).isEqualTo(25);
+        verify(reviewService, org.mockito.Mockito.never()).getReviewsForMaster(any(), any(), any());
+        verify(reviewService, org.mockito.Mockito.never()).getSalonReviews(any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("the last page that still holds data (offset < reviewCount) is served through the review service")
+    void should_delegate_when_pageStartsBeforeReviewCount() {
+        UUID masterId = UUID.randomUUID();
+        when(masterRepository.findActiveReviewTargetByBookingSlug("olena-k-ab12"))
+                .thenReturn(Optional.of(target(masterId, 25)));
+        when(reviewService.getReviewsForMaster(eq(masterId), eq(SalonReviewSort.NEWEST), any(PageRequest.class)))
+                .thenReturn(Page.empty());
+
+        service.reviewsForSlug("olena-k-ab12", SalonReviewSort.NEWEST, PageRequest.of(1, 20));
+
+        verify(reviewService).getReviewsForMaster(masterId, SalonReviewSort.NEWEST, PageRequest.of(1, 20));
+    }
+
+    @Test
     @DisplayName("should_throwNotFound_when_reviewsSlugUnknownOrInactive")
     void should_throwNotFound_when_reviewsSlugUnknownOrInactive() {
-        when(masterRepository.findActiveIdByBookingSlug("nope")).thenReturn(Optional.empty());
+        when(masterRepository.findActiveReviewTargetByBookingSlug("nope")).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> service.reviewsForSlug("nope", SalonReviewSort.NEWEST, PageRequest.of(0, 20)))
                 .isInstanceOf(NotFoundException.class);
@@ -743,7 +790,8 @@ class BookingSlugServiceTest {
 
         verify(mediaService).getLatestPortfolio(com.beautica.media.entity.EntityType.MASTER, masterId, 12);
         verify(mediaService, org.mockito.Mockito.never()).getPortfolio(any(), any(), any(PageRequest.class));
-        verify(reviewService).getReviewsForMaster(masterId, SalonReviewSort.NEWEST, PageRequest.of(0, 5));
+        verify(reviewService).getLatestReviewsForMaster(masterId, 5);
+        verify(reviewService, org.mockito.Mockito.never()).getReviewsForMaster(any(), any(), any());
     }
 
     @Test
@@ -791,6 +839,13 @@ class BookingSlugServiceTest {
 
     private static void setId(Master m, UUID id) {
         m.setId(id);
+    }
+
+    private static com.beautica.common.ReviewTarget target(UUID id, int reviewCount) {
+        return new com.beautica.common.ReviewTarget() {
+            @Override public UUID getId() { return id; }
+            @Override public int getReviewCount() { return reviewCount; }
+        };
     }
 
     private static List<com.beautica.common.RatingBucket> distribution(long five, long four, long three, long two,

@@ -293,7 +293,21 @@ public class ReviewService {
     public SalonReviewSummaryResponse getSalonReviewSummary(UUID salonId) {
         Salon salon = salonRepository.findById(salonId)
                 .orElseThrow(() -> new NotFoundException("Salon not found: " + salonId));
+        return salonReviewSummary(salonId, salon.getAvgRating(), salon.getReviewCount());
+    }
 
+    /**
+     * Phase 384 audit - {@link #getSalonReviewSummary} for a caller that ALREADY holds the salon's persisted
+     * {@code avgRating}/{@code reviewCount} (the public salon page's projection row): the same summary built from
+     * those values plus the one GROUP BY, without the primary-key {@code findById} the id-only form spends. Identical
+     * output to the id form for the same row (the zero-review normalisation is shared, not copied).
+     */
+    @Transactional(readOnly = true)
+    public SalonReviewSummaryResponse getSalonReviewSummary(UUID salonId, BigDecimal avgRating, int reviewCount) {
+        return salonReviewSummary(salonId, avgRating, reviewCount);
+    }
+
+    private SalonReviewSummaryResponse salonReviewSummary(UUID salonId, BigDecimal storedAvgRating, int reviewCount) {
         List<RatingCountProjection> rows = reviewRepository.countBySalonIdGroupByRating(salonId);
         Map<Integer, Long> countsByRating = rows.stream()
                 .collect(Collectors.toMap(RatingCountProjection::getRating, RatingCountProjection::getCount));
@@ -306,9 +320,30 @@ public class ReviewService {
                 .map(rating -> new RatingBucket(rating, countsByRating.getOrDefault(rating, 0L)))
                 .toList();
 
-        BigDecimal avgRating = salon.getReviewCount() == 0 ? null : salon.getAvgRating();
+        BigDecimal avgRating = reviewCount == 0 ? null : storedAvgRating;
 
-        return new SalonReviewSummaryResponse(avgRating, salon.getReviewCount(), distribution);
+        return new SalonReviewSummaryResponse(avgRating, reviewCount, distribution);
+    }
+
+    /**
+     * Phase 383/384 audit - the newest {@code limit} reviews of a master for the public booking page, uncached, in ONE
+     * statement and with no page count. Same order (newest first) and same {@link ReviewResponse} as
+     * {@code getReviewsForMaster(NEWEST, 0, limit)}; it bypasses the paged {@code reviews-by-master} cache because the
+     * page itself is cached under {@code booking-slug-info} (and evicted with it on a new review).
+     */
+    @Transactional(readOnly = true)
+    public List<ReviewResponse> getLatestReviewsForMaster(UUID masterId, int limit) {
+        return reviewRepository.findLatestWithGraphByMasterId(masterId, PageRequest.of(0, limit)).stream()
+                .map(ReviewResponse::from)
+                .toList();
+    }
+
+    /** Salon twin of {@link #getLatestReviewsForMaster}: {@link SalonReviewResponse} rows, newest first, one statement. */
+    @Transactional(readOnly = true)
+    public List<SalonReviewResponse> getLatestReviewsForSalon(UUID salonId, int limit) {
+        return reviewRepository.findLatestWithGraphBySalonId(salonId, PageRequest.of(0, limit)).stream()
+                .map(SalonReviewResponse::from)
+                .toList();
     }
 
     /**

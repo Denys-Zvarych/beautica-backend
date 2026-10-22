@@ -973,9 +973,11 @@ public class MediaService {
      */
     @Transactional(readOnly = true)
     public List<MediaFileResponse> getLatestPortfolio(EntityType entityType, UUID entityId, int limit) {
-        return mediaRepo.findByEntityTypeAndEntityId(entityType, entityId, PageRequest.of(0, limit, PORTFOLIO_SORT))
+        // List window, not a Page: no COUNT statement when the portfolio is as large as the cap.
+        return mediaRepo.findWindowByEntityTypeAndEntityId(entityType, entityId, PageRequest.of(0, limit, PORTFOLIO_SORT))
+                .stream()
                 .map(MediaFileResponse::from)
-                .getContent();
+                .toList();
     }
 
     /**

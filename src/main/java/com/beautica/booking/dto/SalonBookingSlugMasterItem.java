@@ -19,6 +19,12 @@ public record SalonBookingSlugMasterItem(
         @Schema(types = {"string", "null"}, nullable = true)
         String avatarUrl,
         @Schema(types = {"string", "null"}, nullable = true)
-        String professionalTitle
+        String professionalTitle,
+        @Schema(types = {"number", "null"}, nullable = true,
+                description = "The master's rating as the app's salon master card shows it; null while the master has "
+                        + "no reviews (never a fabricated 0).")
+        java.math.BigDecimal avgRating,
+        @Schema(requiredMode = Schema.RequiredMode.REQUIRED)
+        int reviewCount
 ) {
 }

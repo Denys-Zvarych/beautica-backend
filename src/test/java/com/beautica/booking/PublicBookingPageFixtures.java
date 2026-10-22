@@ -118,6 +118,11 @@ final class PublicBookingPageFixtures {
                         + "created_at, updated_at) VALUES (?, ?, ?, ?, NULL, ?, ?, "
                         + "NOW() - make_interval(mins => ?), NOW())",
                 UUID.randomUUID(), bookingId, clientId, master.masterId(), rating, "review-" + minutesAgo, minutesAgo);
+        // What the production recalculation (RatingRecalculationService) maintains after a review: the persisted
+        // counter the public /reviews route uses to recognise a page beyond the last one.
+        jdbc.update("UPDATE masters SET review_count = (SELECT COUNT(*) FROM reviews WHERE master_id = ?), "
+                + "avg_rating = COALESCE((SELECT ROUND(AVG(rating), 2) FROM reviews WHERE master_id = ?), 0) "
+                + "WHERE id = ?", master.masterId(), master.masterId(), master.masterId());
     }
 
     /** One COMPLETED booking plus its SALON review for {@code masterId} (who must have a master_services row). */
@@ -136,6 +141,10 @@ final class PublicBookingPageFixtures {
                 "INSERT INTO reviews (id, booking_id, client_id, master_id, salon_id, rating, comment, "
                         + "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, NOW() - make_interval(mins => ?), NOW())",
                 UUID.randomUUID(), bookingId, clientId, masterId, salonId, rating, "review-" + minutesAgo, minutesAgo);
+        // As above, for the salon's persisted counter.
+        jdbc.update("UPDATE salons SET review_count = (SELECT COUNT(*) FROM reviews WHERE salon_id = ?), "
+                + "avg_rating = COALESCE((SELECT ROUND(AVG(rating), 2) FROM reviews WHERE salon_id = ?), 0) "
+                + "WHERE id = ?", salonId, salonId, salonId);
     }
 
     /** Gives the salon definition behind a seeded assignment its category key (the seeder leaves it NULL). */
