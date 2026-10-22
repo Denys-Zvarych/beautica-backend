@@ -1,5 +1,6 @@
 package com.beautica.config;
 
+import com.beautica.auth.turnstile.TurnstileProperties;
 import com.beautica.booking.closure.ClosureReminderProperties;
 import com.beautica.booking.retention.GuestPiiRetentionProperties;
 import com.beautica.notification.crypto.OutboxCipherProperties;
@@ -27,7 +28,8 @@ import org.springframework.context.annotation.Configuration;
         DeploymentProperties.class,
         GuestPiiRetentionProperties.class,
         BookingLinksProperties.class,
-        BookingInfoWorkerProperties.class
+        BookingInfoWorkerProperties.class,
+        TurnstileProperties.class
 })
 public class AppConfigProperties {
 }

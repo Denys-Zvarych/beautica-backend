@@ -330,6 +330,18 @@ public class GlobalExceptionHandler {
                 .body(ApiResponse.error(ServiceUnavailableMessages.PORTFOLIO_BUSY));
     }
 
+    /**
+     * 400 for a rejected Turnstile verification (phase 382 D3): the fixed "Verification failed" text,
+     * which {@link #handleBusiness}'s genericised BAD_REQUEST branch ("Invalid request") would replace.
+     * The most specific handler wins, so declaration order relative to {@link #handleBusiness} is irrelevant.
+     */
+    @ExceptionHandler(TurnstileRejectedException.class)
+    public ResponseEntity<ApiResponse<Void>> handleTurnstileRejected(TurnstileRejectedException ex) {
+        return ResponseEntity
+                .status(HttpStatus.BAD_REQUEST)
+                .body(ApiResponse.error(TurnstileRejectedException.CLIENT_MESSAGE));
+    }
+
     @ExceptionHandler(BusinessException.class)
     public ResponseEntity<ApiResponse<Void>> handleBusiness(BusinessException ex) {
         log.debug("Business exception: {}", ex.getMessage());

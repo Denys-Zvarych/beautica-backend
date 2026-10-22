@@ -23,6 +23,9 @@ spring:
       '[mail.smtp.writetimeout]': 1000
 
 app:
+  # Phase 382: explicit — the test profile never calls Cloudflare; ITs that exercise the verifier opt in.
+  turnstile:
+    enabled: false
   # Phase 374: explicit — the test profile always uses the SMTP transport unless a test opts into brevo-api.
   mail:
     transport: smtp

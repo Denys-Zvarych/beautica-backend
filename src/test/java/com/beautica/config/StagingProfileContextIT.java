@@ -94,7 +94,7 @@ class StagingProfileContextIT extends AbstractStagingProfileIT {
         headers.setContentType(MediaType.APPLICATION_JSON);
 
         ResponseEntity<String> response = restTemplate.postForEntity("/api/v1/book/otp/send",
-                new HttpEntity<>("{\"phone\":\"+380671234567\",\"privacyAccepted\":true,\"privacyPolicyVersion\":\"2026-10-20\"}", headers), String.class);
+                new HttpEntity<>("{\"phone\":\"+380671234567\",\"privacyAccepted\":true,\"privacyPolicyVersion\":\"2026-10-20\",\"turnstileToken\":\"XXXX.DUMMY.TOKEN.XXXX\"}", headers), String.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
         ArgumentCaptor<MimeMessage> sent = ArgumentCaptor.forClass(MimeMessage.class);
@@ -104,6 +104,14 @@ class StagingProfileContextIT extends AbstractStagingProfileIT {
         Matcher code = CODE.matcher(sent.getValue().getContent().toString());
         assertThat(code.find()).as("six-digit OTP in the mail body").isTrue();
         assertThat(turbosmsStub().getAllServeEvents()).as("no call reached the Turbosms stub").isEmpty();
+        // Phase 382: staging runs the real siteverify round trip with Cloudflare's always-pass TEST secret
+        // and the widget's dummy token.
+        turnstileStub().verify(com.github.tomakehurst.wiremock.client.WireMock
+                .postRequestedFor(com.github.tomakehurst.wiremock.client.WireMock.urlEqualTo("/turnstile/v0/siteverify"))
+                .withRequestBody(com.github.tomakehurst.wiremock.client.WireMock
+                        .containing("secret=1x0000000000000000000000000000000AA"))
+                .withRequestBody(com.github.tomakehurst.wiremock.client.WireMock
+                        .containing("response=XXXX.DUMMY.TOKEN.XXXX")));
     }
 
     @Test
@@ -116,7 +124,7 @@ class StagingProfileContextIT extends AbstractStagingProfileIT {
         headers.setContentType(MediaType.APPLICATION_JSON);
 
         ResponseEntity<String> response = restTemplate.postForEntity("/api/v1/book/otp/send",
-                new HttpEntity<>("{\"phone\":\"+380671234568\",\"privacyAccepted\":true,\"privacyPolicyVersion\":\"2026-10-20\"}", headers), String.class);
+                new HttpEntity<>("{\"phone\":\"+380671234568\",\"privacyAccepted\":true,\"privacyPolicyVersion\":\"2026-10-20\",\"turnstileToken\":\"XXXX.DUMMY.TOKEN.XXXX\"}", headers), String.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
         assertThat(turbosmsStub().getAllServeEvents()).isEmpty();

@@ -55,6 +55,15 @@ app:
   mail:
     transport: brevo-api
     logo-url: https://beautica.app/email/logo.png
+  # Phase 382 — Turnstile ON in prod; the real TURNSTILE_SECRET_KEY comes from Railway. `enabled` is pinned
+  # here and re-checked at boot (EnvironmentFingerprintGuard: prod-turnstile-disabled), so an env override
+  # cannot silently switch the SMS-pumping guard off.
+  turnstile:
+    enabled: true
+    expected-hostnames:
+      - beautica.app
+      - www.beautica.app
+    expected-action: otp_send
   # No dev default (it used to live in the base profile). Empty when INTERNAL_API_KEY is unset, so
   # EnvironmentFingerprintGuard aborts startup with a clear rule instead of an unresolved-placeholder error.
   internal-api-key: ${INTERNAL_API_KEY:}

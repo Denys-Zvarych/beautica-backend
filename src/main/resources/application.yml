@@ -412,6 +412,21 @@ app:
     # matching X-Beautica-Worker-Key header is rate-limited per CF-Connecting-IP (the visitor) instead of
     # per egress IP (BookingInfoWorkerProperties). Blank = feature off. Secret: never log it.
     worker-key: ${BOOKING_INFO_WORKER_KEY:}
+  turnstile:
+    # Phase 382 — Cloudflare Turnstile on POST /api/v1/book/otp/send (SMS-pumping protection). OFF here
+    # (local, test, default): the verifier is a no-op and the token is ignored. application-prod.yml and
+    # application-staging.yml switch it on; EnvironmentFingerprintGuard refuses a prod boot with it off.
+    # `enabled` is deliberately NOT an env var. The secret is: TURNSTILE_SECRET_KEY (Railway only, never
+    # committed, never logged).
+    enabled: false
+    secret-key: ${TURNSTILE_SECRET_KEY:}
+    siteverify-url: https://challenges.cloudflare.com/turnstile/v0/siteverify
+    connect-timeout: 2s
+    read-timeout: 3s
+    # Hostname / action checks apply only when non-empty (prod). Cloudflare's test keys return a dummy
+    # hostname/action, so staging leaves both empty.
+    expected-hostnames: []
+    expected-action: ""
   admin-email: ${ADMIN_EMAIL:admin@beautica.app}
   support:
     # Fixed destination inbox for the Help / Contact-us feature

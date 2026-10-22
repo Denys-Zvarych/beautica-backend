@@ -1823,17 +1823,6 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     }
 
     private String resolveClientIp(HttpServletRequest request) {
-        String xfwd = request.getHeader("X-Forwarded-For");
-        if (xfwd != null && !xfwd.isBlank()) {
-            String[] parts = xfwd.split(",");
-            // Rightmost entry is appended by Railway's trusted proxy — cannot be spoofed.
-            for (int i = parts.length - 1; i >= 0; i--) {
-                String part = parts[i].trim();
-                if (!part.isEmpty()) {
-                    return part.length() > 45 ? request.getRemoteAddr() : part;
-                }
-            }
-        }
-        return request.getRemoteAddr();
+        return ClientIpResolver.resolve(request);
     }
 }

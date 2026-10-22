@@ -19,12 +19,15 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 @DisplayName("prod vs prod,staging — environment identity from the real application-*.yml (Phase 368)")
 class ProdProfileFingerprintTest {
 
+    /** Shape of a real Turnstile secret (never a real one): not a Cloudflare test key. */
+    private static final String TURNSTILE_REAL_SECRET = "0x4AAAAAAAfixtureNotARealSecretZZ9";
+
     private static ApplicationContextRunner runner(String profiles) {
         return new ApplicationContextRunner()
                 .withInitializer(new ConfigDataApplicationContextInitializer())
                 .withPropertyValues("spring.profiles.active=" + profiles,
                         "SENTRY_DSN=https://0123456789abcdef@o42.ingest.de.sentry.io/4500000000000001", "TURBOSMS_TOKEN=turbosms-fixture-token", "ADMIN_EMAIL=admin@beautica.ua",
-                        "BREVO_API_KEY=xkeysib-fixture-api-key",
+                        "BREVO_API_KEY=xkeysib-fixture-api-key", "TURNSTILE_SECRET_KEY=" + TURNSTILE_REAL_SECRET,
                         "JWT_SECRET=x", "INTERNAL_API_KEY=" + TestSecrets.INTERNAL_API_KEY, "FRONTEND_BASE_URL=https://app.beautica.ua",
                         "PUBLIC_BASE_URL=https://api.beautica.ua", "SUPPORT_EMAIL=help@beautica.ua",
                         "R2_ENABLED=true", "CLOUDFLARE_R2_BUCKET=beautica-media-prod",
@@ -159,7 +162,8 @@ class ProdProfileFingerprintTest {
             "SENTRY_DSN", "https://0123456789abcdef@o42.ingest.de.sentry.io/4500000000000001",
             "TURBOSMS_TOKEN", "turbosms-fixture-token",
             "ADMIN_EMAIL", "admin@beautica.ua",
-            "BREVO_API_KEY", "xkeysib-fixture-api-key");
+            "BREVO_API_KEY", "xkeysib-fixture-api-key",
+            "TURNSTILE_SECRET_KEY", TURNSTILE_REAL_SECRET);
 
     private static ApplicationContextRunner prodRunnerWithout(String missing) {
         java.util.List<String> props = new java.util.ArrayList<>(java.util.List.of("spring.profiles.active=prod",
@@ -227,5 +231,74 @@ class ProdProfileFingerprintTest {
             assertThat(ctx.getEnvironment().getProperty("spring.mail.username")).isEmpty();
             assertThat(ctx.getEnvironment().getProperty("spring.mail.password")).isEmpty();
         });
+    }
+
+    // ---- Phase 382 D7: Turnstile rules against the real application-prod.yml / application-staging.yml ----
+
+    @Test
+    @DisplayName("Phase 382 — prod resolves Turnstile ON with the beautica.app hostnames and the otp_send action")
+    void should_resolveTurnstileOn_when_prodProfile() {
+        prodRunnerWithout("").run(ctx -> {
+            var env = ctx.getEnvironment();
+            assertThat(env.getProperty("app.turnstile.enabled")).isEqualTo("true");
+            assertThat(env.getProperty("app.turnstile.expected-hostnames[0]")).isEqualTo("beautica.app");
+            assertThat(env.getProperty("app.turnstile.expected-hostnames[1]")).isEqualTo("www.beautica.app");
+            assertThat(env.getProperty("app.turnstile.expected-action")).isEqualTo("otp_send");
+        });
+    }
+
+    @Test
+    @DisplayName("Phase 382 — prod without TURNSTILE_SECRET_KEY fails boot on prod-turnstile-secret-blank")
+    void should_failGuard_when_prodTurnstileSecretMissing() {
+        prodRunnerWithout("TURNSTILE_SECRET_KEY").run(ctx -> assertThatThrownBy(
+                        () -> EnvironmentFingerprintGuard.verify(ctx.getEnvironment()))
+                .hasMessageContaining("rule prod-turnstile-secret-blank"));
+    }
+
+    @Test
+    @DisplayName("Phase 382 — prod with a Cloudflare TEST secret fails boot on prod-turnstile-secret-test-key, value never printed")
+    void should_failGuard_when_prodTurnstileSecretIsTestKey() {
+        String testKey = "1x0000000000000000000000000000000AA";
+        prodRunnerWithout("TURNSTILE_SECRET_KEY").withPropertyValues("TURNSTILE_SECRET_KEY=" + testKey)
+                .run(ctx -> assertThatThrownBy(() -> EnvironmentFingerprintGuard.verify(ctx.getEnvironment()))
+                        .hasMessageContaining("rule prod-turnstile-secret-test-key")
+                        .message().doesNotContain(testKey));
+    }
+
+    @Test
+    @DisplayName("Phase 382 — an env override cannot switch Turnstile off in prod: prod-turnstile-disabled")
+    void should_failGuard_when_prodTurnstileDisabledByEnvOverride() {
+        prodRunnerWithout("").withPropertyValues("app.turnstile.enabled=false").run(ctx -> assertThatThrownBy(
+                        () -> EnvironmentFingerprintGuard.verify(ctx.getEnvironment()))
+                .hasMessageContaining("rule prod-turnstile-disabled"));
+    }
+
+    @Test
+    @DisplayName("Phase 382 — staging resolves Turnstile ON with Cloudflare's always-pass test secret by default")
+    void should_resolveTestSecretDefault_when_stagingProfile() {
+        new ApplicationContextRunner()
+                .withInitializer(new ConfigDataApplicationContextInitializer())
+                .withPropertyValues("spring.profiles.active=prod,staging")
+                .run(ctx -> {
+                    var env = ctx.getEnvironment();
+                    assertThat(env.getProperty("app.turnstile.enabled")).isEqualTo("true");
+                    assertThat(env.getProperty("app.turnstile.secret-key"))
+                            .isEqualTo("1x0000000000000000000000000000000AA");
+                    assertThat(env.getProperty("app.turnstile.expected-action")).isEmpty();
+                });
+    }
+
+    @Test
+    @DisplayName("Phase 382 — staging with a REAL TURNSTILE_SECRET_KEY fails boot on staging-turnstile-secret-not-test-key")
+    void should_failGuard_when_stagingTurnstileSecretIsReal() {
+        new ApplicationContextRunner()
+                .withInitializer(new ConfigDataApplicationContextInitializer())
+                .withPropertyValues("spring.profiles.active=prod,staging", "JWT_SECRET=x",
+                        "INTERNAL_API_KEY=" + TestSecrets.INTERNAL_API_KEY, "FRONTEND_BASE_URL=https://x.invalid",
+                        "PUBLIC_BASE_URL=https://api.staging.beautica.test", "SUPPORT_EMAIL=support@test.invalid",
+                        "TURNSTILE_SECRET_KEY=" + TURNSTILE_REAL_SECRET)
+                .run(ctx -> assertThatThrownBy(() -> EnvironmentFingerprintGuard.verify(ctx.getEnvironment()))
+                        .hasMessageContaining("rule staging-turnstile-secret-not-test-key")
+                        .message().doesNotContain(TURNSTILE_REAL_SECRET));
     }
 }

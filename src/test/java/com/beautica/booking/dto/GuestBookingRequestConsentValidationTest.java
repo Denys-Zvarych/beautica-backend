@@ -48,7 +48,7 @@ class GuestBookingRequestConsentValidationTest {
     }
 
     private static PhoneOtpSendRequest otp(Boolean accepted, String version) {
-        return new PhoneOtpSendRequest(VALID_PHONE, accepted, version);
+        return new PhoneOtpSendRequest(VALID_PHONE, accepted, version, null);
     }
 
     private static <T> boolean violates(Set<ConstraintViolation<T>> violations, String field) {

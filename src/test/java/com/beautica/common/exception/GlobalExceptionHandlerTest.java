@@ -471,6 +471,26 @@ class GlobalExceptionHandlerTest {
     }
 
     @Test
+    @DisplayName("Should return 400 'Verification failed' (not the generic 'Invalid request') when Turnstile rejects (phase 382)")
+    void should_return400_withVerificationFailed_when_turnstileRejected() {
+        ResponseEntity<ApiResponse<Void>> response = handler.handleTurnstileRejected(new TurnstileRejectedException());
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(response.getBody().success()).isFalse();
+        assertThat(response.getBody().message()).isEqualTo("Verification failed");
+    }
+
+    @Test
+    @DisplayName("Should echo the allow-listed Turnstile-unavailable 503 message (phase 382)")
+    void should_return503_withAllowListedMessage_when_turnstileUnavailable() {
+        var response = handler.handleBusiness(new BusinessException(
+                HttpStatus.SERVICE_UNAVAILABLE, ServiceUnavailableMessages.TURNSTILE_UNAVAILABLE));
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
+        assertThat(response.getBody().message()).isEqualTo(ServiceUnavailableMessages.TURNSTILE_UNAVAILABLE);
+    }
+
+    @Test
     @DisplayName("Should return 422 and SURFACE the user-facing message when UNPROCESSABLE_ENTITY BusinessException")
     void should_return422_with_message_when_unprocessableEntityBusinessException() {
         // Arrange — 422 carries deliberate, user-facing domain copy (Phase 13.4 cancel
@@ -514,7 +534,8 @@ class GlobalExceptionHandlerTest {
                 "Service setup is busy for this master, please retry",
                 "Support channel is not configured",
                 "Could not send the verification code",
-                "Portfolio is busy, please retry");
+                "Portfolio is busy, please retry",
+                "Verification is temporarily unavailable, please retry");
     }
 
     @Test
