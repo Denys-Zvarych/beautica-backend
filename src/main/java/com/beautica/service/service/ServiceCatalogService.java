@@ -259,7 +259,7 @@ public class ServiceCatalogService {
 
         // Evict after commit so a parallel reader cannot repopulate the cache with
         // the pre-insert DB snapshot between eviction and commit (anti-bug §F).
-        evictMasterServicesCache(master);
+        evictMasterServicesCache(masterId, master.getBookingSlug());
         // A new assignment can make a previously-unbookable SALON service appear in the catalogue
         // (perf/security #2): evict this salon's catalogue.
         evictSalonCatalogAfterCommit(salonId);
@@ -385,7 +385,7 @@ public class ServiceCatalogService {
                 floorBefore, floorAfter, durationBefore, durationAfter);
 
         // D11 — always: the band or duration may have changed what these caches serve.
-        evictMasterServicesCache(master);
+        evictMasterServicesCache(masterId, master.getBookingSlug());
         evictSalonCatalogAfterCommit(salonId);
         // D11 — conditional: duration feeds slot maths, a band-only change does not.
         if (!Objects.equals(durationBefore, durationAfter)) {
@@ -510,7 +510,7 @@ public class ServiceCatalogService {
         // critical path. evictBookableFutureSlotsCache's off-thread sweep
         // (SlotCalculationService#evictMasterAvailabilityCaches, BOOKING_WRITE_CACHES) already
         // covers "available-slots" as a superset, so the synchronous call was pure duplicate work.
-        evictMasterServicesCache(master);
+        evictMasterServicesCache(masterId, master.getBookingSlug());
         evictBookableFutureSlotsCache(List.of(masterId));
         evictSalonCatalogAfterCommit(salonId);
 
@@ -611,7 +611,7 @@ public class ServiceCatalogService {
 
         // Evict only this master's cache entry after commit — replacing allEntries=true
         // to avoid cold-miss DB round-trips for all other masters (anti-bug §F).
-        evictMasterServicesCache(master);
+        evictMasterServicesCache(master.getId(), master.getBookingSlug());
 
         return MasterServiceResponse.from(savedAssignment);
     }
@@ -863,7 +863,7 @@ public class ServiceCatalogService {
         // (PERF-M2) and evict the master's services cache after commit (anti-bug §F).
         masterRepository.refreshMinEffectivePrice(master.getId());
         searchVisibilityGuard.clearSearchCachesIfFlipped(searchBefore);
-        evictMasterServicesCache(master);
+        evictMasterServicesCache(master.getId(), master.getBookingSlug());
         // Phase 304 D1: a SALON-branch batch persists SALON-owned definitions/assignments, which
         // can change what GET /salons/{salonId}/services returns — evict that salon's catalogue
         // after commit (REUSE-FIRST: the existing helper, called from one more place). The
@@ -1977,13 +1977,13 @@ public class ServiceCatalogService {
      * {@link MasterSearchVisibilityGuard}, which clears only on an actual verdict flip.
      */
     /**
-     * Single-master form for writers that already hold the {@link Master}: drops its {@code masterServices} /
+     * Single-master form for writers that already hold the master's slug: drops its {@code masterServices} /
      * bookable entries AND its public booking page (phase 380) — the slug is on the loaded row, so the page
      * eviction costs NO extra query (the band-editor / bulk-create query budgets stay unchanged).
      */
-    private void evictMasterServicesCache(Master master) {
-        evictMasterServicesCache(List.of(master.getId()));
-        masterProfileCacheEvictor.evictBookingSlugInfoBySlugAfterCommit(master.getBookingSlug());
+    private void evictMasterServicesCache(UUID masterId, String bookingSlug) {
+        evictMasterServicesCache(List.of(masterId));
+        masterProfileCacheEvictor.evictBookingSlugInfoBySlugAfterCommit(bookingSlug);
     }
 
     private void evictMasterServicesCache(List<UUID> masterIds) {
