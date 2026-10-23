@@ -34,10 +34,14 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 
 @Service
 public class SlotCalculationService {
@@ -205,14 +209,14 @@ public class SlotCalculationService {
      * ceiling the single-service path enforces (via {@link #validatedTotalDuration}); an over-long chain
      * fails with the same {@link BusinessException}, never a silent truncation.
      *
-     * <p><b>Not cached — deliberately.</b> For {@code N=1} the controller routes to the cached single-arg
-     * overload above (identical legacy key), so single-element requests key identically to the legacy
-     * value. The {@code N&gt;1} path is intentionally left uncached: the booking-write eviction hook
-     * ({@code BookingService}/{@code GuestBookingService}/{@code BookingCancellationService}) evicts
-     * {@code available-slots} only per single-UUID key, so a list-keyed entry would go stale after a
-     * single-service booking write on any chained service. Caching the ordered-list key is deferred to
-     * BE-3, where the write path gains multi-key (master-prefix) eviction — until then a never-evicted
-     * key is not introduced.
+     * <p><b>Not cached.</b> For {@code N=1} the controller routes to the cached single-arg overload above
+     * (identical legacy key). The {@code N&gt;1} slot list stays uncached; its original reason (booking
+     * writes evicted {@code available-slots} only per single-UUID key) is OBSOLETE — every booking and
+     * schedule write now sweeps {@code available-slots} by master prefix
+     * ({@link #evictMasterAvailabilityCaches}), which would cover a {@code {#masterId, #date, #ids}} key too.
+     * It is simply not needed yet: this route is per-date (one day's walk per call), unlike the calendar
+     * projection {@link #getBookableWorkingDays(UUID, LocalDate, LocalDate, List)}, which IS cached
+     * (phase 387 audit) because each miss walks a whole window.
      */
     @Transactional(readOnly = true)
     public List<AvailableSlotResponse> getAvailableSlots(
@@ -705,11 +709,35 @@ public class SlotCalculationService {
      * single-service {@link #getBookableWorkingDays(UUID, LocalDate, LocalDate, UUID)} — a date is bookable
      * iff the master's schedule leaves a free range fitting the SUM of the ordered services' effective
      * durations (D4 buffer policy, see {@link #getAvailableSlots(UUID, LocalDate, List)}), so the calendar
-     * day-gate agrees with the multi-service slot list. Not cached for the same reason the multi-service
-     * slot list is not (see that method) — the controller routes {@code N=1} to the cached single-arg
-     * overload above.
+     * day-gate agrees with the multi-service slot list. Callers route {@code N=1} to the single-arg overload
+     * above.
+     *
+     * <p><b>Cached (phase 387 audit, perf MEDIUM)</b> — {@code master-bookable-days}, key
+     * {@code {#masterId, #from, #to, #masterServiceIds}}, {@code sync = true}: the public
+     * {@code GET /book/{slug}/bookable-days} serves it to unauthenticated callers, and every miss walks up
+     * to 61 dates. The reason it used to stay uncached (the multi-service SLOT list's note, "booking writes
+     * evict only per single-UUID key") no longer holds: since the by-master sweep every booking write
+     * ({@link #evictMasterAvailabilityCaches}) and every schedule write
+     * ({@code MasterScheduleService#SCHEDULE_WRITE_CACHES}) drops EVERY {@code master-bookable-days} key
+     * whose first element is the masterId ({@code MasterCachePrefixEvictor} matches
+     * {@code keyParts.get(0)}), whatever follows it. {@code masterId} is first here for exactly that
+     * reason. The ordered id list is part of the key (a {@link List} equals by elements in order), so it
+     * can never collide with the single-service key, whose 4th element is a bare {@link UUID}. Key space
+     * is bounded by the 2 000-entry cache cap; the public route also confines {@code from}/{@code to} to the
+     * guest window and is per-IP throttled with a span-weighted charge.
+     *
+     * <p>The key holds a PRIVATE unmodifiable copy of {@code masterServiceIds} (phase 387 audit cycle 2,
+     * perf INFO), never the caller's list: a stored key that aliased a mutable caller list could change its
+     * {@code equals}/{@code hashCode} after insertion and become unreachable (or match the wrong request).
+     * {@code ArrayList}+{@code unmodifiableList} rather than {@code List.copyOf} so a null element is
+     * tolerated exactly as before (no new NPE at key generation); equality is still element-wise in order,
+     * so hits/misses are unchanged.
      */
     @Transactional(readOnly = true)
+    @Cacheable(value = BOOKABLE_DAYS_CACHE,
+            key = "{#masterId, #from, #to, #masterServiceIds == null ? null"
+                    + " : T(java.util.Collections).unmodifiableList(new java.util.ArrayList(#masterServiceIds))}",
+            sync = true)
     public List<MasterWorkingDayResponse> getBookableWorkingDays(
             UUID masterId, LocalDate from, LocalDate to, List<UUID> masterServiceIds) {
         assertServiceIds(masterServiceIds);
@@ -1017,18 +1045,36 @@ public class SlotCalculationService {
     }
 
     /**
-     * Resolves each {@code masterServiceId} in order via {@link #loadBookableAssignment}, preserving the
-     * caller-supplied ordering (the D4 buffer policy chains the services in that order). Every id is
-     * validated with the same unknown/foreign/inactive → 404 semantics as the single-service path, so a
-     * chain containing one bad id fails identically to a single bad id. The list is small (bounded by
-     * {@link #assertServiceIds}), so the per-id lookups are acceptable.
+     * Resolves each {@code masterServiceId}, preserving the caller-supplied ordering (the D4 buffer policy
+     * chains the services in that order) and duplicates (a locked-legal input: the same service booked
+     * twice). Every id is validated with the same unknown/foreign/inactive → 404 semantics as the
+     * single-service path, so a chain containing one bad id fails identically to a single bad id.
+     *
+     * <p><b>Query shape (phase 387 audit, perf MEDIUM).</b> {@code N=1} keeps the single-row
+     * {@link #loadBookableAssignment}. {@code N>1} issues ONE {@code findByMasterIdAndIdInWithGraph} over
+     * the DISTINCT ids (same master scoping, same fetch graph) instead of one statement per id, then maps
+     * the rows back in request order — the same technique as {@code VisitPlanner#resolveAssignments}. Any
+     * id the batch does not return as an ACTIVE row of this master (unknown, foreign, inactive, or a
+     * {@code null} element) → the same {@code masterService not found} 404 as before. Bounded by
+     * {@link #assertServiceIds} on every public entry point.
      */
     private List<MasterServiceAssignment> loadBookableAssignments(UUID masterId, List<UUID> masterServiceIds) {
-        List<MasterServiceAssignment> assignments = new ArrayList<>(masterServiceIds.size());
-        for (UUID masterServiceId : masterServiceIds) {
-            assignments.add(loadBookableAssignment(masterId, masterServiceId));
+        if (masterServiceIds.size() == 1) {
+            return List.of(loadBookableAssignment(masterId, masterServiceIds.get(0)));
         }
-        return assignments;
+        Set<UUID> distinctIds = new LinkedHashSet<>(masterServiceIds);
+        if (distinctIds.remove(null)) {
+            throw new NotFoundException("masterService not found");
+        }
+        Map<UUID, MasterServiceAssignment> byId = masterServiceRepository
+                .findByMasterIdAndIdInWithGraph(masterId, distinctIds)
+                .stream()
+                .filter(MasterServiceAssignment::isActive)
+                .collect(Collectors.toMap(MasterServiceAssignment::getId, Function.identity()));
+        if (byId.size() != distinctIds.size()) {
+            throw new NotFoundException("masterService not found");
+        }
+        return masterServiceIds.stream().map(byId::get).toList();
     }
 
     /**

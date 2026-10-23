@@ -16,6 +16,7 @@ import com.beautica.common.util.Placeholders;
 import com.beautica.common.util.UkrainianPlurals;
 import com.beautica.auth.phoneotp.GuestTokenProvider;
 import com.beautica.config.BookingSmsProperties;
+import com.beautica.master.dto.MasterWorkingDayResponse;
 import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.notification.inapp.entity.InAppNotificationType;
@@ -120,8 +121,8 @@ public class GuestBookingService {
      */
     @Transactional(readOnly = true)
     public List<AvailableSlotResponse> availableSlots(String slug, LocalDate date, UUID serviceId) {
-        Master master = resolveMasterForDate(slug, date);
-        return slotCalculationService.getAvailableSlots(master.getId(), date, serviceId);
+        UUID masterId = resolveMasterIdForDate(slug, date);
+        return slotCalculationService.getAvailableSlots(masterId, date, serviceId);
     }
 
     /**
@@ -133,8 +134,8 @@ public class GuestBookingService {
      */
     @Transactional(readOnly = true)
     public List<AvailableSlotResponse> availableSlots(String slug, LocalDate date, List<UUID> serviceIds) {
-        Master master = resolveMasterForDate(slug, date);
-        return slotCalculationService.getAvailableSlots(master.getId(), date, serviceIds);
+        UUID masterId = resolveMasterIdForDate(slug, date);
+        return slotCalculationService.getAvailableSlots(masterId, date, serviceIds);
     }
 
     /**
@@ -144,19 +145,63 @@ public class GuestBookingService {
      * @throws NotFoundException when the slug is unknown / master inactive (→ 404)
      * @throws BusinessException with 400 when the date is in the past or too far ahead
      */
-    private Master resolveMasterForDate(String slug, LocalDate date) {
+    private UUID resolveMasterIdForDate(String slug, LocalDate date) {
+        assertWithinGuestWindow(date, LocalDate.now(kyivClock));
+        return resolveBookableMasterId(slug);
+    }
+
+    /**
+     * Phase 387 — per-date bookable flags for the public booking page's calendar
+     * ({@code GET /api/v1/book/{slug}/bookable-days}), so the website greys out dates without free time
+     * exactly as the app calendar does. Pure delegation to the app's own day-gate
+     * ({@link SlotCalculationService#getBookableWorkingDays}) — no second day calculation — so a date is
+     * {@code working = true} iff {@link #availableSlots} would return a non-empty list for it.
+     *
+     * <p>Guards, all BEFORE the slug lookup (a malformed range never costs a DB hit): both ends must sit in
+     * the same guest window {@link #availableSlots} enforces per date ({@code [today, today +
+     * availabilityMaxDays]}, Kyiv), and {@code from <= to}. That also bounds the cache key space of the
+     * reused {@code master-bookable-days} cache to that window; the core's own 63-date span cap still
+     * applies on top. Unknown slug / inactive master or salon, and an unknown, foreign or inactive
+     * service, are the same indistinguishable 404s as {@link #availableSlots}.
+     *
+     * <p>N=1 goes to the cached single-service overload, N>1 to the multi-service one (summed duration) —
+     * the same routing {@code MasterController#getWorkingDays} uses, done here on another bean so the
+     * {@code @Cacheable} proxy stays effective.
+     */
+    @Transactional(readOnly = true)
+    public List<MasterWorkingDayResponse> bookableDays(
+            String slug, LocalDate from, LocalDate to, List<UUID> serviceIds) {
         LocalDate today = LocalDate.now(kyivClock);
+        assertWithinGuestWindow(from, today);
+        assertWithinGuestWindow(to, today);
+        if (from.isAfter(to)) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST, "from must not be after to");
+        }
+        UUID masterId = resolveBookableMasterId(slug);
+        return serviceIds.size() == 1
+                ? slotCalculationService.getBookableWorkingDays(masterId, from, to, serviceIds.get(0))
+                : slotCalculationService.getBookableWorkingDays(masterId, from, to, serviceIds);
+    }
+
+    /** The guest date window shared by {@link #availableSlots} and {@link #bookableDays} (400 outside it). */
+    private void assertWithinGuestWindow(LocalDate date, LocalDate today) {
         if (date.isBefore(today)) {
             throw new BusinessException(HttpStatus.BAD_REQUEST, "date is in the past");
         }
         if (date.isAfter(today.plusDays(smsProperties.getAvailabilityMaxDays()))) {
             throw new BusinessException(HttpStatus.BAD_REQUEST, "date too far ahead");
         }
-        // No .filter(Master::isActive) here: findByBookingSlugWithUser's own JPQL already carries
-        // `AND m.isActive = true AND (s IS NULL OR s.isActive = true)` — the full MasterBookability
-        // rule — so the Optional is either empty or holds a bookable master. The filter was a
-        // strictly weaker duplicate of half that predicate. Guarded by MasterRepositoryBookingSlugTest.
-        return masterRepository.findByBookingSlugWithUser(slug)
+    }
+
+    /**
+     * Slug → bookable master id for the two guest slot reads (phase 387 audit, perf LOW): one scalar
+     * statement instead of hydrating Master + User + Salon just to read the id. The visibility rule — active
+     * master, salon active or none, attached user — lives in the finder's JPQL, a mirror of
+     * {@code findByBookingSlugWithUser} (the SOLE enforcement point, see that finder); nothing is
+     * re-checked here. Guarded by MasterRepositoryBookingSlugTest (real query).
+     */
+    private UUID resolveBookableMasterId(String slug) {
+        return masterRepository.findBookableIdByBookingSlug(slug)
                 .orElseThrow(() -> new NotFoundException("Booking page not found"));
     }
 
@@ -182,7 +227,7 @@ public class GuestBookingService {
         // kyivClock and the injected clock share an Instant, so the zone is irrelevant here.
         BookingStartsAtValidator.validate(req.startsAt(), kyivClock);
 
-        // See resolveMasterForDate: the liveness + salon-active rule lives in the finder's JPQL,
+        // See resolveBookableMasterId: the liveness + salon-active rule lives in the finder's JPQL,
         // so no redundant .filter(Master::isActive) is applied on top of it.
         Master master = masterRepository.findByBookingSlugWithUser(slug)
                 .orElseThrow(() -> new NotFoundException("Booking page not found"));

@@ -126,10 +126,16 @@ public class CacheConfig {
      *                         bookability verdict (Phase 23.x, SlotCalculationService#hasBookableFutureSlot)
      *                         gating both the booking master-list and the salon catalogue — 60 sec TTL,
      *                         max 500; evicted by master prefix on every schedule AND booking write
-     *   master-bookable-days — availability-aware per-date bookability projection per
-     *                         master/from/to/masterService (SlotCalculationService#getBookableWorkingDays,
-     *                         backs GET /masters/{masterId}/working-days?serviceId=…) — 60 sec TTL,
-     *                         max 2000; evicted by master prefix on every schedule AND booking write
+     *   master-bookable-days — availability-aware per-date bookability projection, two key variants
+     *                         sharing one cache: {masterId,from,to,masterServiceId} (single-service
+     *                         overload) and {masterId,from,to,List&lt;UUID&gt;} (multi-service visit overload,
+     *                         phase 387 — an unmodifiable copy of the ordered id list, never the caller's
+     *                         list; a List never equals a bare UUID, so the variants cannot collide)
+     *                         (SlotCalculationService#getBookableWorkingDays, backs
+     *                         GET /masters/{masterId}/working-days?serviceId=… AND the public
+     *                         GET /book/{slug}/bookable-days) — 60 sec TTL, max 2000, sync=true on the
+     *                         multi-service variant; evicted by master prefix on every schedule AND
+     *                         booking write (masterId is the first key element in both variants)
      *   master-by-user      — stable userId→Master entity mapping; TTL-only eviction — 10 min TTL, max 500 entries
      *   master-detail         — masterId→MasterDetailResponse DTO for public GET /masters/{masterId} — 5 min TTL, max 1000 entries
      *   master-detail-by-user — userId→Optional&lt;MasterDetailResponse&gt; for GET /masters/me — 10 min

@@ -624,4 +624,98 @@ class GuestBookingServiceTest {
                 .isActive(true)
                 .build();
     }
+
+    // ── Phase 387: public bookable-days ──────────────────────────────────────────────────────
+
+    private static final java.time.LocalDate TODAY = java.time.LocalDate.of(2026, 6, 1);
+
+    @Test
+    @DisplayName("bookableDays — one serviceId routes to the CACHED single-service day-gate with the slug's master")
+    void should_delegateToCachedSingleServiceDayGate_when_oneServiceId() {
+        var days = List.of(new com.beautica.master.dto.MasterWorkingDayResponse(TODAY.plusDays(1), true));
+        when(masterRepository.findBookableIdByBookingSlug(SLUG)).thenReturn(Optional.of(masterId));
+        when(slotCalculationService.getBookableWorkingDays(masterId, TODAY, TODAY.plusDays(6), serviceId))
+                .thenReturn(days);
+
+        var result = service.bookableDays(SLUG, TODAY, TODAY.plusDays(6), List.of(serviceId));
+
+        assertThat(result).isSameAs(days);
+        verify(slotCalculationService, never()).getBookableWorkingDays(any(), any(), any(), anyList());
+    }
+
+    @Test
+    @DisplayName("bookableDays — several serviceIds route to the multi-service (summed-duration) day-gate in order")
+    void should_delegateToMultiServiceDayGate_when_severalServiceIds() {
+        UUID second = UUID.randomUUID();
+        var days = List.of(new com.beautica.master.dto.MasterWorkingDayResponse(TODAY, false));
+        when(masterRepository.findBookableIdByBookingSlug(SLUG)).thenReturn(Optional.of(masterId));
+        when(slotCalculationService.getBookableWorkingDays(masterId, TODAY, TODAY, List.of(serviceId, second)))
+                .thenReturn(days);
+
+        var result = service.bookableDays(SLUG, TODAY, TODAY, List.of(serviceId, second));
+
+        assertThat(result).isSameAs(days);
+        verify(slotCalculationService, never()).getBookableWorkingDays(any(), any(), any(), any(UUID.class));
+    }
+
+    @Test
+    @DisplayName("bookableDays — from in the past, to past the guest window, or from > to → 400 before any DB read")
+    void should_throw400BeforeLookup_when_rangeOutsideGuestWindowOrInverted() {
+        var maxDay = TODAY.plusDays(new BookingSmsProperties().getAvailabilityMaxDays());
+
+        assertThatThrownBy(() -> service.bookableDays(SLUG, TODAY.minusDays(1), TODAY, List.of(serviceId)))
+                .isInstanceOf(BusinessException.class).hasMessage("date is in the past");
+        assertThatThrownBy(() -> service.bookableDays(SLUG, TODAY, maxDay.plusDays(1), List.of(serviceId)))
+                .isInstanceOf(BusinessException.class).hasMessage("date too far ahead");
+        assertThatThrownBy(() -> service.bookableDays(SLUG, TODAY.plusDays(3), TODAY.plusDays(2), List.of(serviceId)))
+                .isInstanceOf(BusinessException.class).hasMessage("from must not be after to");
+        verifyNoInteractions(masterRepository, slotCalculationService);
+    }
+
+    @Test
+    @DisplayName("bookableDays — the last day of the guest window is accepted (boundary is inclusive)")
+    void should_accept_when_toIsLastDayOfGuestWindow() {
+        var maxDay = TODAY.plusDays(new BookingSmsProperties().getAvailabilityMaxDays());
+        when(masterRepository.findBookableIdByBookingSlug(SLUG)).thenReturn(Optional.of(masterId));
+        when(slotCalculationService.getBookableWorkingDays(masterId, maxDay, maxDay, serviceId)).thenReturn(List.of());
+
+        var result = service.bookableDays(SLUG, maxDay, maxDay, List.of(serviceId));
+
+        assertThat(result).isEmpty();
+    }
+
+    @Test
+    @DisplayName("bookableDays — unknown / unbookable slug → 404 and the day-gate never runs")
+    void should_throw404_when_bookableDaysSlugUnknown() {
+        when(masterRepository.findBookableIdByBookingSlug(SLUG)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> service.bookableDays(SLUG, TODAY, TODAY.plusDays(1), List.of(serviceId)))
+                .isInstanceOf(NotFoundException.class);
+
+        verifyNoInteractions(slotCalculationService);
+    }
+
+    @Test
+    @DisplayName("availableSlots — resolves the slug with the scalar id finder, never hydrating Master + User (phase 387 audit)")
+    void should_resolveMasterIdOnly_when_availableSlotsRequested() {
+        var slots = List.<com.beautica.booking.dto.AvailableSlotResponse>of();
+        when(masterRepository.findBookableIdByBookingSlug(SLUG)).thenReturn(Optional.of(masterId));
+        when(slotCalculationService.getAvailableSlots(masterId, TODAY, serviceId)).thenReturn(slots);
+
+        var result = service.availableSlots(SLUG, TODAY, serviceId);
+
+        assertThat(result).isSameAs(slots);
+        verify(masterRepository, never()).findByBookingSlugWithUser(any());
+    }
+
+    @Test
+    @DisplayName("availableSlots (multi-service) — unknown / unbookable slug → 404 via the id finder, slot walk never runs")
+    void should_throw404_when_multiServiceAvailabilitySlugUnknown() {
+        when(masterRepository.findBookableIdByBookingSlug(SLUG)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> service.availableSlots(SLUG, TODAY, List.of(serviceId, UUID.randomUUID())))
+                .isInstanceOf(NotFoundException.class);
+
+        verifyNoInteractions(slotCalculationService);
+    }
 }

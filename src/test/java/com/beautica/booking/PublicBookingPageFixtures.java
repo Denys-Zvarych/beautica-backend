@@ -8,12 +8,18 @@ import com.beautica.support.BookableMasterSeeder;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.boot.test.web.client.TestRestTemplate;
+import org.springframework.http.HttpEntity;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
+import java.time.LocalDate;
+import java.time.LocalTime;
 import java.util.UUID;
+import java.util.concurrent.ThreadLocalRandom;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -189,5 +195,31 @@ final class PublicBookingPageFixtures {
 
     String masterSlugOf(UUID masterId) {
         return jdbc.queryForObject("SELECT booking_slug FROM masters WHERE id = ?", String.class, masterId);
+    }
+
+    /** Assigns a NEW independent service to {@code masterId}; returns its {@code master_services.id}. */
+    UUID assignService(UUID masterId) {
+        UUID defId = BookableMasterSeeder.assignNewIndependentService(jdbc, masterId);
+        return jdbc.queryForObject("SELECT id FROM master_services WHERE service_def_id = ?", UUID.class, defId);
+    }
+
+    /** One working interval on {@code day}'s ISO weekday in the given weekly template. */
+    void addInterval(UUID scheduleId, LocalDate day, LocalTime start, LocalTime end) {
+        jdbc.update(
+                "INSERT INTO working_intervals (id, schedule_id, day_of_week, start_time, end_time) VALUES (?, ?, ?, ?, ?)",
+                UUID.randomUUID(), scheduleId, day.getDayOfWeek().getValue(), start, end);
+    }
+
+    /** No Authorization header (permitAll route) from source IP {@code ip} via {@code X-Forwarded-For}. */
+    ResponseEntity<String> anonymousGet(String url, String ip) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.set("X-Forwarded-For", ip);
+        return restTemplate.exchange(url, HttpMethod.GET, new HttpEntity<>(headers), String.class);
+    }
+
+    /** A random private source IP, so the shared per-IP guest buckets never leak budget across tests. */
+    static String randomIp() {
+        ThreadLocalRandom r = ThreadLocalRandom.current();
+        return "10." + r.nextInt(1, 255) + "." + r.nextInt(1, 255) + "." + r.nextInt(1, 255);
     }
 }

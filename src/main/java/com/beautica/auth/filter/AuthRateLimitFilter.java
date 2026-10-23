@@ -27,7 +27,12 @@ import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
+import java.time.temporal.ChronoUnit;
 import java.util.Arrays;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -193,6 +198,11 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // because a legitimate guest issues MANY availability GETs per single booking POST — sharing one
     // 5/15min bucket would make browsing dates impossible. See GUEST_AVAILABILITY_CAPACITY.
     private static final String GUEST_AVAILABILITY_PATH_SUFFIX = "/availability";
+    // Phase 387: GET /api/v1/book/{slug}/bookable-days — the public calendar day-gate. Shares the
+    // availability bucket, exactly as the authenticated twin /masters/{id}/working-days shares slotsBuckets
+    // with /slots: both answer from the same SlotCalculationService oracle, and one budget per guest page
+    // keeps a rotating-window probe bounded by the same 60/min as rotating dates.
+    private static final String GUEST_BOOKABLE_DAYS_PATH_SUFFIX = "/bookable-days";
     // Guest page-info READS (phase 377 audit): GET /api/v1/book/{slug}/info (master page) and
     // GET /api/v1/book/s/{slug}/info (salon page) — the same prefix + a distinct suffix. Their own
     // bucket (guestInfoBuckets), see GUEST_INFO_CAPACITY.
@@ -411,6 +421,18 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     private static final long SEARCH_TOKENS_FIRST_PAGE = 1;
     private static final long SEARCH_TOKENS_DEEP_PAGE = 2;
     private static final String SEARCH_PAGE_PARAM = "page";
+    // Token cost of GET /api/v1/book/{slug}/bookable-days (phase 387 audit) — see bookableDaysTokenCost().
+    // Base 1, +1 per FULL 14-day block of the inclusive [from, to] span, +1 per extra
+    // serviceId. The span is clamped to BOOKABLE_DAYS_MAX_CHARGED_SPAN (the core's own 63-date cap) and the
+    // service count to BOOKABLE_DAYS_MAX_CHARGED_SERVICES (MAX_SERVICES_PER_VISIT), so the dearest request
+    // costs 1 + 63/14 + 9 = 14 tokens — always < GUEST_AVAILABILITY_CAPACITY, never an unpayable 429.
+    private static final long BOOKABLE_DAYS_TOKENS_BASE = 1;
+    private static final long BOOKABLE_DAYS_SPAN_BLOCK_DAYS = 14;
+    private static final long BOOKABLE_DAYS_MAX_CHARGED_SPAN = 63;
+    private static final int BOOKABLE_DAYS_MAX_CHARGED_SERVICES = 10;
+    private static final String BOOKABLE_DAYS_FROM_PARAM = "from";
+    private static final String BOOKABLE_DAYS_TO_PARAM = "to";
+    private static final String BOOKABLE_DAYS_SERVICE_PARAM = "serviceId";
     // Per-IP cap for GET /api/v1/settlements (240 / 60 s) — the Phase 326 settlement
     // autocomplete. permitAll, because the «Населений пункт» field is reached during
     // registration before a token exists (phase-326 D7).
@@ -1193,17 +1215,30 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         // prefix + suffix (the {slug} is one path segment), checked before the POST-only guard so this
         // GET is covered. The /availability suffix cannot collide with the sibling public reads under
         // /book: /{slug}/info, /cancel/{token} (GET cancel-info) and the OTP/booking/cancel POSTs all
-        // end in something else, so ONLY the availability GET consumes this bucket.
+        // end in something else, so ONLY the availability GET and its calendar twin
+        // GET /{slug}/bookable-days (phase 387, see GUEST_BOOKABLE_DAYS_PATH_SUFFIX) consume this bucket.
         //
         // Until this branch the endpoint fell through to the unmatched-GET path with no throttle at all —
         // the LINK counterpart of the slots branch immediately above, driving the same
         // SlotCalculationService oracle at zero auth cost. Cap: 60 / 60 s per IP, deliberately the same
         // budget as slotsBuckets (see GUEST_AVAILABILITY_CAPACITY for the sizing and for why it does not
         // throttle a guest tapping through dates).
+        //
+        // Phase 387 audit (security MEDIUM): the two routes share the bucket but NOT the price. One
+        // /availability call walks ONE date; one /bookable-days call walks up to the whole guest window
+        // (61 dates) — so /bookable-days is charged span- and service-weighted tokens, see
+        // bookableDaysTokenCost(). Same 60-token capacity for both: the accounting changes, not the cap.
         if (isGetOrHead(method)
                 && path.startsWith(GUEST_BOOKING_PATH_PREFIX)
                 && path.endsWith(GUEST_AVAILABILITY_PATH_SUFFIX)) {
             applyRateLimit(request, response, filterChain, guestAvailabilityBuckets, RETRY_AFTER_SECONDS);
+            return;
+        }
+        if (isGetOrHead(method)
+                && path.startsWith(GUEST_BOOKING_PATH_PREFIX)
+                && path.endsWith(GUEST_BOOKABLE_DAYS_PATH_SUFFIX)) {
+            applyRateLimit(request, response, filterChain, guestAvailabilityBuckets, RETRY_AFTER_SECONDS,
+                    bookableDaysTokenCost(request));
             return;
         }
 
@@ -1611,6 +1646,92 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             // Unparsable page — the request will 400 in validation; charge the base cost.
             return SEARCH_TOKENS_FIRST_PAGE;
         }
+    }
+
+    /**
+     * Token cost of one {@code GET /api/v1/book/{slug}/bookable-days} (phase 387 audit, security MEDIUM):
+     * {@code 1 + spanDays / 14 + (serviceCount - 1)}. The route shares {@code guestAvailabilityBuckets}
+     * with {@code /availability}, where one call walks ONE date; a flat 1-token charge let a caller buy up
+     * to 61 dates of slot computation per token. Weighting mirrors {@link #searchTokenCost}: the capacity
+     * stays 60/min, the accounting is what changes.
+     *
+     * <p>Real-guest budget: a 7-day week view costs 1 (60/min), a 31-day single-service month view costs
+     * {@code 1 + 31/14 = 3} (20 month views/min), a full 61-day window with one service costs 5 (12/min).
+     * The website fetches one month per page turn, so 20/min is far above human paging.
+     *
+     * <p>Defensive like {@link #searchTokenCost}: GET-only, so {@code getParameter} cannot consume a body.
+     * A missing or inverted range charges the base cost — the controller and service 400 it anyway, and
+     * the 400 never reaches the slot oracle; a present-but-unparsable date fails CLOSED at the max span
+     * (see {@link #bookableDaysSpan}). The span is clamped to
+     * {@link #BOOKABLE_DAYS_MAX_CHARGED_SPAN} and the service count to
+     * {@link #BOOKABLE_DAYS_MAX_CHARGED_SERVICES}, so an out-of-range request is never priced above the
+     * bucket's capacity (an unpayable charge would turn its clean 400 into a 429). The service count
+     * counts comma-separated values too, because Spring binds {@code ?serviceId=a,b} to a 2-element list.
+     */
+    static long bookableDaysTokenCost(HttpServletRequest request) {
+        return BOOKABLE_DAYS_TOKENS_BASE
+                + bookableDaysSpan(request) / BOOKABLE_DAYS_SPAN_BLOCK_DAYS
+                + (bookableDaysServiceCount(request) - 1);
+    }
+
+    /**
+     * Inclusive {@code [from, to]} day count, clamped to {@code [0, MAX]}.
+     *
+     * <p>Parses with {@link DateTimeFormatter#ISO_DATE} — the SAME formatter the controller's
+     * {@code @DateTimeFormat(iso = ISO.DATE)} binder uses — so an offset-suffixed date
+     * ({@code 2026-11-01Z}, {@code 2026-11-01+02:00}) that the binder accepts is charged its real span
+     * (phase 387 audit cycle 2: an {@code ISO_LOCAL_DATE} parse rejected it, charged 1 token, while the
+     * binder still computed the full window). FAIL CLOSED: a {@code from}/{@code to} that is present but
+     * unparsable here charges {@link #BOOKABLE_DAYS_MAX_CHARGED_SPAN}, so any future parser drift between
+     * filter and binder over-charges rather than under-charges. Absent params charge 0 (the controller 400s
+     * on {@code @NotNull}); an inverted range clamps to 0 (the service 400s it).
+     */
+    private static long bookableDaysSpan(HttpServletRequest request) {
+        String from = request.getParameter(BOOKABLE_DAYS_FROM_PARAM);
+        String to = request.getParameter(BOOKABLE_DAYS_TO_PARAM);
+        Optional<LocalDate> fromDate = parseBookableDaysDate(from);
+        Optional<LocalDate> toDate = parseBookableDaysDate(to);
+        if ((from != null && fromDate.isEmpty()) || (to != null && toDate.isEmpty())) {
+            return BOOKABLE_DAYS_MAX_CHARGED_SPAN;
+        }
+        if (fromDate.isEmpty() || toDate.isEmpty()) {
+            return 0;
+        }
+        long span = ChronoUnit.DAYS.between(fromDate.get(), toDate.get()) + 1;
+        return Math.max(0, Math.min(span, BOOKABLE_DAYS_MAX_CHARGED_SPAN));
+    }
+
+    /**
+     * {@code ISO_DATE} parse of the RAW query value; empty when absent or unparsable. Deliberately NOT trimmed:
+     * the Spring binder does not trim either, so a padded date ({@code " 2026-11-01"}) is unparsable on both
+     * sides — the controller 400s it and the filter charges the fail-closed max span (phase 387 audit cycle 3).
+     */
+    private static Optional<LocalDate> parseBookableDaysDate(String raw) {
+        if (raw == null) {
+            return Optional.empty();
+        }
+        try {
+            return Optional.of(LocalDate.parse(raw, DateTimeFormatter.ISO_DATE));
+        } catch (DateTimeParseException ex) {
+            return Optional.empty();
+        }
+    }
+
+    /** Number of {@code serviceId} values (repeated and/or comma-separated), clamped to {@code [1, MAX]}. */
+    private static int bookableDaysServiceCount(HttpServletRequest request) {
+        String[] values = request.getParameterValues(BOOKABLE_DAYS_SERVICE_PARAM);
+        if (values == null) {
+            return 1;
+        }
+        int count = 0;
+        for (String value : values) {
+            for (String part : value.split(",", -1)) {
+                if (!part.isBlank() && ++count >= BOOKABLE_DAYS_MAX_CHARGED_SERVICES) {
+                    return BOOKABLE_DAYS_MAX_CHARGED_SERVICES;
+                }
+            }
+        }
+        return Math.max(count, 1);
     }
 
     /**

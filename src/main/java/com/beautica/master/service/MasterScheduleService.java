@@ -95,8 +95,10 @@ public class MasterScheduleService {
      *   <li>{@code master-working-days} — {@code {masterId, from, to}} (schedule-shape mode)</li>
      *   <li>{@code master-usable-schedule} — {@code {masterId, from, to}} ({@link #hasUsableSchedule})</li>
      *   <li>{@code master-service-bookable} — {@code {masterId, masterServiceId, from, to}}</li>
-     *   <li>{@code master-bookable-days} — {@code {masterId, from, to, masterServiceId}} (the
-     *       availability-aware mode of the working-days endpoint)</li>
+     *   <li>{@code master-bookable-days} — {@code {masterId, from, to, masterServiceId}} (single-service)
+     *       or {@code {masterId, from, to, List<UUID>}} (multi-service visit, phase 387) — the
+     *       availability-aware mode of the working-days endpoint AND the public
+     *       {@code GET /book/{slug}/bookable-days} calendar day-gate; masterId is first in both variants</li>
      * </ul>
      * A schedule change can flip the verdict of ANY of them for ANY of the master's services, so the write
      * path evicts the whole set; the window/date portion of those keys cannot be evicted selectively.

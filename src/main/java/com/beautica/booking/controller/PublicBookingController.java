@@ -7,6 +7,7 @@ import com.beautica.booking.dto.GuestBookingRequest;
 import com.beautica.booking.dto.GuestBookingResponse;
 import com.beautica.booking.dto.SalonBookingSlugInfoResponse;
 import com.beautica.common.PageResponse;
+import com.beautica.master.dto.MasterWorkingDayResponse;
 import com.beautica.review.dto.ReviewResponse;
 import com.beautica.review.dto.SalonReviewResponse;
 import com.beautica.review.dto.SalonReviewSort;
@@ -174,6 +175,36 @@ public class PublicBookingController {
                 ? guestBookingService.availableSlots(slug, date, serviceId.get(0))
                 : guestBookingService.availableSlots(slug, date, serviceId);
         return ResponseEntity.ok(slots);
+    }
+
+    /**
+     * Phase 387 — per-date bookability over {@code [from, to]} for the public booking page's calendar, so
+     * the website greys out dates with no free time exactly like the app calendar
+     * ({@code GET /masters/{id}/working-days?serviceId=…}, same {@code SlotCalculationService} core).
+     * {@code serviceId} has the {@link #availability} semantics (repeatable; N&gt;1 = one back-to-back visit,
+     * summed duration). A date is {@code working = true} iff {@link #availability} returns ≥1 slot for it.
+     *
+     * <p>Salon links need no twin route: {@code /book/s/{slug}/info} lists each master's {@code masterSlug}
+     * and the guest flow — {@link #availability} included — runs on that master slug.
+     *
+     * <p>Same headers, per-IP bucket and error matrix as {@link #availability}: {@code from}/{@code to}
+     * outside {@code [today, today + availabilityMaxDays]} (Kyiv) or {@code from > to} → 400; unknown slug,
+     * inactive master/salon, or unknown/foreign/inactive service → indistinguishable 404.
+     */
+    @GetMapping("/{slug}/bookable-days")
+    public ResponseEntity<List<MasterWorkingDayResponse>> bookableDays(
+            @PathVariable
+            @Size(min = 2, max = 60)
+            @Pattern(regexp = "^[a-z0-9][a-z0-9\\-]*[a-z0-9]$")
+            String slug,
+            @RequestParam @NotNull @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate from,
+            @RequestParam @NotNull @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate to,
+            @RequestParam("serviceId")
+            @NotEmpty(message = "at least one serviceId is required")
+            @Size(max = SlotCalculationService.MAX_SERVICES_PER_VISIT,
+                    message = "at most 10 services can be booked in a single visit")
+            List<UUID> serviceId) {
+        return ResponseEntity.ok(guestBookingService.bookableDays(slug, from, to, serviceId));
     }
 
     /**

@@ -45,6 +45,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.function.BiFunction;
 import java.util.stream.Stream;
@@ -1424,10 +1425,8 @@ class SlotCalculationServiceTest {
         // Service A: 60 + 10 buffer = 70. Service B: 45 + 15 buffer = 60. D4 total = 130.
         MasterServiceAssignment a = assignment(masterId, serviceA, 60, 10);
         MasterServiceAssignment b = assignment(masterId, serviceB, 45, 15);
-        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, serviceA))
-                .thenReturn(Optional.of(a));
-        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, serviceB))
-                .thenReturn(Optional.of(b));
+        when(masterServiceRepository.findByMasterIdAndIdInWithGraph(masterId, Set.of(serviceA, serviceB)))
+                .thenReturn(List.of(b, a));
         when(masterScheduleService.resolveEffectiveDay(masterId, date))
                 .thenReturn(templateDay(date, LocalTime.of(9, 0), LocalTime.of(18, 0)));
         when(bookingRepository.findActiveTimeRangesByMasterInRange(any(), any(), any()))
@@ -1453,10 +1452,8 @@ class SlotCalculationServiceTest {
 
         MasterServiceAssignment a = assignment(masterId, serviceA, 60, 0);
         MasterServiceAssignment b = assignment(masterId, serviceB, 90, 0);
-        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, serviceA))
-                .thenReturn(Optional.of(a));
-        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, serviceB))
-                .thenReturn(Optional.of(b));
+        when(masterServiceRepository.findByMasterIdAndIdInWithGraph(masterId, Set.of(serviceA, serviceB)))
+                .thenReturn(List.of(b, a));
         when(masterScheduleService.resolveEffectiveRange(masterId, date, date))
                 .thenReturn(List.of(templateDay(date, LocalTime.of(9, 0), LocalTime.of(18, 0))));
         when(bookingRepository.findActiveTimeRangesByMasterInRange(eq(masterId), any(), any()))
@@ -1481,10 +1478,8 @@ class SlotCalculationServiceTest {
         LocalDate date = LocalDate.of(2026, 5, 8);
 
         // 400 + 0 = 400 each; summed = 800 > 600. Neither alone would exceed the cap.
-        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, serviceA))
-                .thenReturn(Optional.of(assignment(masterId, serviceA, 400, 0)));
-        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, serviceB))
-                .thenReturn(Optional.of(assignment(masterId, serviceB, 400, 0)));
+        when(masterServiceRepository.findByMasterIdAndIdInWithGraph(masterId, Set.of(serviceA, serviceB)))
+                .thenReturn(List.of(assignment(masterId, serviceA, 400, 0), assignment(masterId, serviceB, 400, 0)));
 
         assertThatThrownBy(() ->
                 slotCalculationService.getAvailableSlots(masterId, date, List.of(serviceA, serviceB)))
@@ -1503,16 +1498,75 @@ class SlotCalculationServiceTest {
         UUID serviceB = UUID.randomUUID();
         LocalDate date = LocalDate.of(2026, 5, 8);
 
-        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, serviceA))
-                .thenReturn(Optional.of(assignment(masterId, serviceA, 60, 0)));
-        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, serviceB))
-                .thenReturn(Optional.empty());
+        // The batch returns only A — B is unknown/foreign, so the shortfall must 404.
+        when(masterServiceRepository.findByMasterIdAndIdInWithGraph(masterId, Set.of(serviceA, serviceB)))
+                .thenReturn(List.of(assignment(masterId, serviceA, 60, 0)));
 
         assertThatThrownBy(() ->
                 slotCalculationService.getAvailableSlots(masterId, date, List.of(serviceA, serviceB)))
                 .isInstanceOf(NotFoundException.class);
 
         verifyNoInteractions(masterScheduleService);
+    }
+
+    @Test
+    @DisplayName("multi-service assignments: ONE batch query over distinct ids, mapped back in order with duplicates (phase 387 audit)")
+    void should_batchLoadAndPreserveOrderAndDuplicates_when_chainRepeatsAService() {
+        UUID masterId = UUID.randomUUID();
+        UUID serviceA = UUID.randomUUID();
+        UUID serviceB = UUID.randomUUID();
+        LocalDate date = LocalDate.of(2026, 5, 8);
+        // A = 60 + 10 = 70, B = 45 + 15 = 60; chain [A, B, A] = 200 — the duplicate must count twice.
+        when(masterServiceRepository.findByMasterIdAndIdInWithGraph(masterId, Set.of(serviceA, serviceB)))
+                .thenReturn(List.of(assignment(masterId, serviceB, 45, 15), assignment(masterId, serviceA, 60, 10)));
+        when(masterScheduleService.resolveEffectiveRange(masterId, date, date))
+                .thenReturn(List.of(templateDay(date, LocalTime.of(9, 0), LocalTime.of(18, 0))));
+        when(bookingRepository.findActiveTimeRangesByMasterInRange(eq(masterId), any(), any()))
+                .thenReturn(List.of());
+        when(timeSlotCalculator.hasAvailableSlot(any(), any(), any(), any(), any(), any(), any()))
+                .thenReturn(true);
+
+        slotCalculationService.getBookableWorkingDays(masterId, date, date, List.of(serviceA, serviceB, serviceA));
+
+        ArgumentCaptor<Duration> durationCaptor = ArgumentCaptor.forClass(Duration.class);
+        verify(timeSlotCalculator).hasAvailableSlot(
+                any(), any(), any(), durationCaptor.capture(), any(), any(), any());
+        assertThat(durationCaptor.getValue()).isEqualTo(Duration.ofMinutes(200));
+        verify(masterServiceRepository).findByMasterIdAndIdInWithGraph(masterId, Set.of(serviceA, serviceB));
+        verify(masterServiceRepository, never()).findByMasterIdAndIdWithGraph(any(), any());
+    }
+
+    @Test
+    @DisplayName("multi-service assignments: an INACTIVE chained service returned by the batch → the same 404 (phase 387 audit)")
+    void should_throwNotFound_when_chainedServiceIsInactiveInBatch() {
+        UUID masterId = UUID.randomUUID();
+        UUID serviceA = UUID.randomUUID();
+        UUID serviceB = UUID.randomUUID();
+        LocalDate date = LocalDate.of(2026, 5, 8);
+        MasterServiceAssignment inactive = mock(MasterServiceAssignment.class);
+        when(inactive.isActive()).thenReturn(false);
+        when(masterServiceRepository.findByMasterIdAndIdInWithGraph(masterId, Set.of(serviceA, serviceB)))
+                .thenReturn(List.of(assignment(masterId, serviceA, 60, 0), inactive));
+
+        assertThatThrownBy(() ->
+                slotCalculationService.getBookableWorkingDays(masterId, date, date, List.of(serviceA, serviceB)))
+                .isInstanceOf(NotFoundException.class)
+                .hasMessage("masterService not found");
+
+        verifyNoInteractions(masterScheduleService);
+    }
+
+    @Test
+    @DisplayName("multi-service assignments: a null element → 404 before any query (phase 387 audit)")
+    void should_throwNotFound_when_chainContainsNullId() {
+        UUID masterId = UUID.randomUUID();
+        LocalDate date = LocalDate.of(2026, 5, 8);
+        List<UUID> withNull = java.util.Arrays.asList(UUID.randomUUID(), null);
+
+        assertThatThrownBy(() -> slotCalculationService.getAvailableSlots(masterId, date, withNull))
+                .isInstanceOf(NotFoundException.class);
+
+        verifyNoInteractions(masterServiceRepository, masterScheduleService);
     }
 
     @Test

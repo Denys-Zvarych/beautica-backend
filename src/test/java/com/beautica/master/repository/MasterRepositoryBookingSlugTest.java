@@ -118,6 +118,38 @@ class MasterRepositoryBookingSlugTest extends AbstractDataJpaTest {
                 .isPresent();
     }
 
+    // ── phase 387 audit — findBookableIdByBookingSlug mirrors findByBookingSlugWithUser ───────
+
+    @Test
+    @DisplayName("findBookableIdByBookingSlug resolves the id when the salon is active and when there is no salon")
+    void should_resolveId_when_bookableIdFinderSeesBookableMaster() {
+        Master salonMaster = persistSalonMaster("id-active-ab12", true, true);
+        Master solo = persistIndependentMaster("id-solo-cd34");
+
+        Optional<UUID> salonFound = masterRepository.findBookableIdByBookingSlug("id-active-ab12");
+        Optional<UUID> soloFound = masterRepository.findBookableIdByBookingSlug("id-solo-cd34");
+
+        assertThat(salonFound).contains(salonMaster.getId());
+        assertThat(soloFound)
+                .as("LEFT salon join: an INDEPENDENT_MASTER must still resolve")
+                .contains(solo.getId());
+    }
+
+    @Test
+    @DisplayName("findBookableIdByBookingSlug is empty for a closed salon, an inactive master and an unknown slug")
+    void should_returnEmpty_when_bookableIdFinderSeesUnbookableMaster() {
+        persistSalonMaster("id-closed-ef56", true, false);
+        persistSalonMaster("id-inactive-ab78", false, true);
+
+        Optional<UUID> closedSalon = masterRepository.findBookableIdByBookingSlug("id-closed-ef56");
+        Optional<UUID> inactiveMaster = masterRepository.findBookableIdByBookingSlug("id-inactive-ab78");
+        Optional<UUID> unknown = masterRepository.findBookableIdByBookingSlug("id-unknown-cd90");
+
+        assertThat(closedSalon).as("salon-active term must match findByBookingSlugWithUser").isEmpty();
+        assertThat(inactiveMaster).as("master-active term must match findByBookingSlugWithUser").isEmpty();
+        assertThat(unknown).isEmpty();
+    }
+
     // ── phase 375 — race-safe lazy issue: conditional UPDATE + native re-read ─────────────
 
     @Test

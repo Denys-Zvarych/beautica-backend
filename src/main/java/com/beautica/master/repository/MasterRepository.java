@@ -598,6 +598,28 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
     Optional<Master> findByBookingSlugWithUser(@Param("slug") String slug);
 
     /**
+     * Phase 387 audit (perf LOW) — the id of the master {@link #findByBookingSlugWithUser} would return, as ONE
+     * scalar column: no {@code Master}/{@code User}/{@code Salon} hydration. Backs the guest slot reads
+     * ({@code GET /book/{slug}/availability} and {@code /bookable-days}), which need the id only.
+     *
+     * <p><b>Predicate is a byte-for-byte mirror of {@link #findByBookingSlugWithUser}</b>, including the
+     * INNER {@code JOIN m.user}: that finder's {@code JOIN FETCH m.user} is an inner join, so a DETACHED master
+     * ({@code user_id IS NULL}, phase 294) never resolves — kept here so the two can never disagree, even
+     * though detach also deactivates. The salon join stays {@code LEFT} (an independent master has no salon).
+     * Deliberately NOT {@link #findActiveReviewTargetByBookingSlug}, which omits the user join. Pinned by
+     * {@code MasterRepositoryBookingSlugTest} (real query: active / no-salon / closed salon / inactive master).
+     */
+    @Query("""
+            SELECT m.id FROM Master m
+            JOIN m.user
+            LEFT JOIN m.salon s
+            WHERE m.bookingSlug = :slug
+              AND m.isActive = true
+              AND (s IS NULL OR s.isActive = true)
+            """)
+    Optional<UUID> findBookableIdByBookingSlug(@Param("slug") String slug);
+
+    /**
      * Phase 383 — the id of the ACTIVE master (in an active salon, or none) behind a public booking slug: the
      * exact visibility rule of {@link #findByBookingSlugWithUser}, as ONE scalar statement. Backs
      * {@code GET /book/{slug}/reviews}, which needs the id only and must not hydrate the user/salon graph on

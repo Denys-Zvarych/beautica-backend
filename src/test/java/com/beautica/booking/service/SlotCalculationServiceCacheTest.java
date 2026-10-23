@@ -31,6 +31,9 @@ import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.reset;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -282,5 +285,98 @@ class SlotCalculationServiceCacheTest {
 
         verify(masterServiceRepository, times(2))
                 .findByMasterIdAndIdWithGraph(masterId, masterServiceId);
+    }
+
+    // ── phase 387 audit (perf MEDIUM) — multi-service bookable-days overload is cached ──────────
+
+    private com.beautica.service.entity.MasterServiceAssignment activeAssignment(UUID masterServiceId) {
+        var sd = com.beautica.service.entity.ServiceDefinition.builder()
+                .id(UUID.randomUUID())
+                .baseDurationMinutes(60)
+                .bufferMinutesAfter(0)
+                .isActive(true)
+                .build();
+        return com.beautica.service.entity.MasterServiceAssignment.builder()
+                .id(masterServiceId)
+                .serviceDefinition(sd)
+                .master(Master.builder().isActive(true).build())
+                .isActive(true)
+                .build();
+    }
+
+    private void stubCacheableMultiServiceDays(UUID masterId, UUID serviceA, UUID serviceB, LocalDate date) {
+        when(masterServiceRepository.findByMasterIdAndIdInWithGraph(eq(masterId), any()))
+                .thenReturn(List.of(activeAssignment(serviceA), activeAssignment(serviceB)));
+        when(masterScheduleService.resolveEffectiveRange(masterId, date, date))
+                .thenReturn(List.of(new EffectiveDayResponse(date, EffectiveDaySource.NO_SCHEDULE, List.of())));
+    }
+
+    @Test
+    @DisplayName("multi-service getBookableWorkingDays — second identical call is a cache hit (phase 387 audit)")
+    void should_hitCache_when_multiServiceBookableDaysCalledTwice() {
+        UUID masterId = UUID.randomUUID();
+        UUID serviceA = UUID.randomUUID();
+        UUID serviceB = UUID.randomUUID();
+        LocalDate date = LocalDate.now(clock).plusDays(7);
+        stubCacheableMultiServiceDays(masterId, serviceA, serviceB, date);
+
+        var first = slotCalculationService.getBookableWorkingDays(masterId, date, date, List.of(serviceA, serviceB));
+        var second = slotCalculationService.getBookableWorkingDays(masterId, date, date, List.of(serviceA, serviceB));
+
+        assertThat(second).isEqualTo(first);
+        verify(masterServiceRepository, times(1)).findByMasterIdAndIdInWithGraph(eq(masterId), any());
+        verify(masterScheduleService, times(1)).resolveEffectiveRange(masterId, date, date);
+    }
+
+    @Test
+    @DisplayName("multi-service getBookableWorkingDays — a booking write's by-master eviction drops the entry (phase 387 audit)")
+    void should_recompute_when_bookingWriteEvictsMultiServiceBookableDays() {
+        UUID masterId = UUID.randomUUID();
+        UUID serviceA = UUID.randomUUID();
+        UUID serviceB = UUID.randomUUID();
+        LocalDate date = LocalDate.now(clock).plusDays(7);
+        stubCacheableMultiServiceDays(masterId, serviceA, serviceB, date);
+        slotCalculationService.getBookableWorkingDays(masterId, date, date, List.of(serviceA, serviceB));
+
+        // The exact hook every booking write runs afterCommit (BookingService, GuestBookingService, ...).
+        slotCalculationService.evictMasterAvailabilityCaches(masterId);
+        slotCalculationService.getBookableWorkingDays(masterId, date, date, List.of(serviceA, serviceB));
+
+        verify(masterServiceRepository, times(2)).findByMasterIdAndIdInWithGraph(eq(masterId), any());
+    }
+
+    @Test
+    @DisplayName("multi-service getBookableWorkingDays — ORDER is part of the key, and another master's eviction keeps it (phase 387 audit)")
+    void should_keyOnOrderedIdsAndSurviveOtherMastersEviction_when_multiServiceBookableDaysCached() {
+        UUID masterId = UUID.randomUUID();
+        UUID serviceA = UUID.randomUUID();
+        UUID serviceB = UUID.randomUUID();
+        LocalDate date = LocalDate.now(clock).plusDays(7);
+        stubCacheableMultiServiceDays(masterId, serviceA, serviceB, date);
+        slotCalculationService.getBookableWorkingDays(masterId, date, date, List.of(serviceA, serviceB));
+
+        slotCalculationService.evictMasterAvailabilityCaches(UUID.randomUUID());
+        slotCalculationService.getBookableWorkingDays(masterId, date, date, List.of(serviceA, serviceB));
+        slotCalculationService.getBookableWorkingDays(masterId, date, date, List.of(serviceB, serviceA));
+
+        verify(masterServiceRepository, times(2)).findByMasterIdAndIdInWithGraph(eq(masterId), any());
+    }
+
+    @Test
+    @DisplayName("multi-service getBookableWorkingDays — the key is a private copy, so mutating the caller's list after the call keeps the entry reachable (phase 387 audit cycle 2)")
+    void should_hitCache_when_callerMutatesServiceIdListAfterCaching() {
+        UUID masterId = UUID.randomUUID();
+        UUID serviceA = UUID.randomUUID();
+        UUID serviceB = UUID.randomUUID();
+        LocalDate date = LocalDate.now(clock).plusDays(7);
+        stubCacheableMultiServiceDays(masterId, serviceA, serviceB, date);
+        List<UUID> callerList = new java.util.ArrayList<>(List.of(serviceA, serviceB));
+        slotCalculationService.getBookableWorkingDays(masterId, date, date, callerList);
+
+        callerList.set(0, serviceB);
+        callerList.set(1, serviceA);
+        slotCalculationService.getBookableWorkingDays(masterId, date, date, List.of(serviceA, serviceB));
+
+        verify(masterServiceRepository, times(1)).findByMasterIdAndIdInWithGraph(eq(masterId), any());
     }
 }

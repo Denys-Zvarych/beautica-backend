@@ -43,6 +43,7 @@ import java.util.List;
 import java.util.UUID;
 
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.verify;
@@ -197,6 +198,96 @@ class PublicBookingControllerTest {
                         .param("serviceId", svc.toString())
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isBadRequest());
+    }
+
+    // ── Phase 387: bookable-days (public calendar day-gate) ───────────────────
+
+    @Test
+    @DisplayName("GET /book/{slug}/bookable-days — 200 with [{date, working}] only, NO auth required")
+    void should_return200WithDayFlags_when_bookableDaysRequested() throws Exception {
+        UUID svc = UUID.randomUUID();
+        when(guestBookingService.bookableDays("marija-l-cd34", java.time.LocalDate.parse("2026-06-10"),
+                java.time.LocalDate.parse("2026-06-11"), List.of(svc)))
+                .thenReturn(List.of(
+                        new com.beautica.master.dto.MasterWorkingDayResponse(java.time.LocalDate.parse("2026-06-10"), true),
+                        new com.beautica.master.dto.MasterWorkingDayResponse(java.time.LocalDate.parse("2026-06-11"), false)));
+
+        mockMvc.perform(get("/api/v1/book/marija-l-cd34/bookable-days")
+                        .param("from", "2026-06-10")
+                        .param("to", "2026-06-11")
+                        .param("serviceId", svc.toString())
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.length()").value(2))
+                .andExpect(jsonPath("$[0].date").value("2026-06-10"))
+                .andExpect(jsonPath("$[0].working").value(true))
+                .andExpect(jsonPath("$[1].date").value("2026-06-11"))
+                .andExpect(jsonPath("$[1].working").value(false))
+                .andExpect(jsonPath("$[0].length()").value(2));
+    }
+
+    @Test
+    @DisplayName("GET /book/{slug}/bookable-days — repeated serviceId binds to the ordered list (multi-service visit)")
+    void should_passOrderedServiceIds_when_serviceIdRepeated() throws Exception {
+        UUID a = UUID.randomUUID();
+        UUID b = UUID.randomUUID();
+        when(guestBookingService.bookableDays(anyString(), any(), any(), anyList())).thenReturn(List.of());
+
+        mockMvc.perform(get("/api/v1/book/marija-l-cd34/bookable-days")
+                        .param("from", "2026-06-10")
+                        .param("to", "2026-06-10")
+                        .param("serviceId", a.toString(), b.toString()))
+                .andExpect(status().isOk());
+
+        verify(guestBookingService).bookableDays(eq("marija-l-cd34"), any(), any(), eq(List.of(a, b)));
+    }
+
+    @Test
+    @DisplayName("GET /book/{slug}/bookable-days — 400 on missing/malformed from/to, missing or >10 serviceId, bad slug; no service call")
+    void should_return400WithoutServiceCall_when_bookableDaysParamsInvalid() throws Exception {
+        String svc = UUID.randomUUID().toString();
+        String[] eleven = new String[11];
+        for (int i = 0; i < eleven.length; i++) {
+            eleven[i] = UUID.randomUUID().toString();
+        }
+
+        mockMvc.perform(get("/api/v1/book/marija-l-cd34/bookable-days").param("to", "2026-06-10").param("serviceId", svc))
+                .andExpect(status().isBadRequest());
+        mockMvc.perform(get("/api/v1/book/marija-l-cd34/bookable-days").param("from", "2026-06-10").param("serviceId", svc))
+                .andExpect(status().isBadRequest());
+        mockMvc.perform(get("/api/v1/book/marija-l-cd34/bookable-days")
+                        .param("from", "10.06.2026").param("to", "2026-06-10").param("serviceId", svc))
+                .andExpect(status().isBadRequest());
+        mockMvc.perform(get("/api/v1/book/marija-l-cd34/bookable-days").param("from", "2026-06-10").param("to", "2026-06-10"))
+                .andExpect(status().isBadRequest());
+        mockMvc.perform(get("/api/v1/book/marija-l-cd34/bookable-days")
+                        .param("from", "2026-06-10").param("to", "2026-06-10").param("serviceId", "not-a-uuid"))
+                .andExpect(status().isBadRequest());
+        mockMvc.perform(get("/api/v1/book/marija-l-cd34/bookable-days")
+                        .param("from", "2026-06-10").param("to", "2026-06-10").param("serviceId", eleven))
+                .andExpect(status().isBadRequest());
+        mockMvc.perform(get("/api/v1/book/Bad_Slug!/bookable-days")
+                        .param("from", "2026-06-10").param("to", "2026-06-10").param("serviceId", svc))
+                .andExpect(status().isBadRequest());
+
+        verifyNoInteractions(guestBookingService);
+    }
+
+    @Test
+    @DisplayName("GET /book/{slug}/bookable-days — service 400 (range outside the guest window) and 404 (unknown slug/service) pass through")
+    void should_return400Or404_when_serviceRejectsBookableDays() throws Exception {
+        UUID svc = UUID.randomUUID();
+        when(guestBookingService.bookableDays(eq("marija-l-cd34"), any(), any(), anyList()))
+                .thenThrow(new BusinessException(org.springframework.http.HttpStatus.BAD_REQUEST, "date is in the past"));
+        when(guestBookingService.bookableDays(eq("no-such-slug"), any(), any(), anyList()))
+                .thenThrow(new NotFoundException("Booking page not found"));
+
+        mockMvc.perform(get("/api/v1/book/marija-l-cd34/bookable-days")
+                        .param("from", "2020-01-01").param("to", "2020-01-02").param("serviceId", svc.toString()))
+                .andExpect(status().isBadRequest());
+        mockMvc.perform(get("/api/v1/book/no-such-slug/bookable-days")
+                        .param("from", "2026-06-10").param("to", "2026-06-10").param("serviceId", svc.toString()))
+                .andExpect(status().isNotFound());
     }
 
     // ── Phase 13.3: guest booking creation ────────────────────────────────────
