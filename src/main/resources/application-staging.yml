@@ -9,6 +9,11 @@ beautica:
     # Every SMS (booking + guest OTP) becomes a plain-text mail to sms+<digits>@sms.staging.invalid,
     # caught by Mailpit. No fixed OTP, no bypass code.
     mode: capture
+    # Phase 389 — overrides prod's beautica.app so a staging code is never bound to the prod site.
+    # Blank by default (no domain line). Set OTP_SMS_DOMAIN to the staging website host once it has a
+    # short (<= 18 chars) custom host, e.g. stg.beautica.app; the workers.dev preview host is longer
+    # and fails boot validation.
+    otp-domain: ${OTP_SMS_DOMAIN:}
 
 # Phase 371 (D3): staging traces at 20% (prod 5%); enabled/DSN rules are inherited from application-prod.yml.
 sentry:

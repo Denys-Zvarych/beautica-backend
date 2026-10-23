@@ -243,6 +243,11 @@ beautica:
     # turbosms (default) | capture. capture mails every SMS to a Mailpit inbox instead of the
     # provider (staging only; the fingerprint guard rejects it in prod).
     mode: turbosms
+    # Phase 389 — bare website host for the guest OTP SMS's last line `@host #code` (WebOTP on Chrome
+    # Android, domain-bound autofill on iOS Safari). Blank (local/test) = no domain line. prod pins
+    # beautica.app; staging reads OTP_SMS_DOMAIN. Validated at boot: lower-case bare host (no scheme,
+    # port or path), at most 18 chars so the SMS stays one UCS-2 segment even with CRLF (OtpDomainRules).
+    otp-domain: ""
   db:
     # PostgreSQL major the app expects (prod Railway postgres-ssl:18, CI and local postgres:18-alpine).
     # DatabaseServerVersionLogger WARNs on mismatch; it never fails boot.

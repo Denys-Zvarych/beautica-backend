@@ -2,6 +2,12 @@
 # Deploy-environment identity (Phase 368); the `staging` overlay (prod,staging) overrides it.
 beautica:
   environment: prod
+  sms:
+    # Phase 389 — guest OTP SMS ends with `@beautica.app #code` (one-tap autofill only on beautica.app).
+    # Set here, not via a dedicated ${...} placeholder; the staging overlay overrides it. Spring relaxed
+    # binding still lets a BEAUTICA_SMS_OTPDOMAIN env var override it — never set that on prod (boot
+    # validation only checks the host's shape, not that it is beautica.app).
+    otp-domain: beautica.app
 
 # Phase 371 (D3): on in prod and staging (prod,staging inherits). A blank SENTRY_DSN keeps the SDK disabled
 # and the banner shows sentry=off. Traces: prod 5% (staging overrides to 20%); no profiling.

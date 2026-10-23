@@ -1,7 +1,11 @@
 package com.beautica.auth.phoneotp;
 
 import com.beautica.common.exception.BusinessException;
+import com.beautica.config.DeployEnvironment;
+import com.beautica.config.DeploymentProperties;
+import com.beautica.config.SmsMode;
 import com.beautica.notification.sms.OtpSmsSender;
+import org.assertj.core.api.ThrowableAssert.ThrowingCallable;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -18,6 +22,8 @@ import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.HexFormat;
 import java.util.Optional;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -41,6 +47,7 @@ class PhoneOtpServiceTest {
     private static final String PHONE = "+380671234567";
     private static final Instant FIXED_NOW = Instant.parse("2026-06-17T10:00:00Z");
     private static final String GUEST_TOKEN = "guest.jwt.token";
+    private static final String OTP_DOMAIN = "beautica.app";
 
     @Mock private PhoneOtpRepository phoneOtpRepository;
     @Mock private PhoneOtpAttemptRecorder attemptRecorder;
@@ -53,7 +60,9 @@ class PhoneOtpServiceTest {
     @BeforeEach
     void setUp() {
         service = new PhoneOtpService(phoneOtpRepository, attemptRecorder, guestTokenProvider,
-                otpSmsSender, Clock.fixed(FIXED_NOW, ZoneOffset.UTC), txManager);
+                otpSmsSender, Clock.fixed(FIXED_NOW, ZoneOffset.UTC), txManager,
+                new DeploymentProperties(DeployEnvironment.LOCAL,
+                        new DeploymentProperties.Sms(SmsMode.TURBOSMS, OTP_DOMAIN)));
     }
 
     private static String sha256Hex(String value) throws Exception {
@@ -74,7 +83,7 @@ class PhoneOtpServiceTest {
         // once — this single derivation is the load-bearing one used for every assertion.
         ArgumentCaptor<String> smsText = ArgumentCaptor.forClass(String.class);
         verify(otpSmsSender).send(eq(PHONE), smsText.capture());
-        String code = smsText.getValue().replaceAll(".*?(\\d{6}).*", "$1");
+        String code = smsText.getValue().replaceAll("(?s).*?(\\d{6}).*", "$1");
 
         ArgumentCaptor<PhoneOtp> saved = ArgumentCaptor.forClass(PhoneOtp.class);
         verify(phoneOtpRepository).save(saved.capture());
@@ -86,6 +95,57 @@ class PhoneOtpServiceTest {
                 .doesNotContain(code)
                 .hasSize(64);
         assertThat(otp.getExpiresAt()).isEqualTo(FIXED_NOW.plus(java.time.Duration.ofMinutes(10)));
+    }
+
+    @Test
+    @DisplayName("sendOtp with a domain — exact template, same code in both lines, hash matches it")
+    void should_sendDomainBoundTemplateWithSameCodeInBothLines_when_otpDomainConfigured() throws Exception {
+        when(phoneOtpRepository.countByPhoneAndCreatedAtAfter(eq(PHONE), any())).thenReturn(0);
+
+        service.sendOtp(PHONE);
+
+        ArgumentCaptor<String> smsText = ArgumentCaptor.forClass(String.class);
+        verify(otpSmsSender).send(eq(PHONE), smsText.capture());
+        Matcher m = Pattern
+                .compile("Код Beautica: (\\d{6})\\. Нікому не кажіть\\.\n\n@beautica\\.app #(\\d{6})")
+                .matcher(smsText.getValue());
+        assertThat(m.matches()).as("exact Phase 389 template, got: %s", smsText.getValue()).isTrue();
+        assertThat(m.group(2)).as("the origin-bound line carries the same code").isEqualTo(m.group(1));
+        ArgumentCaptor<PhoneOtp> saved = ArgumentCaptor.forClass(PhoneOtp.class);
+        verify(phoneOtpRepository).save(saved.capture());
+        assertThat(saved.getValue().getCodeHash()).isEqualTo(sha256Hex(m.group(1)));
+    }
+
+    @Test
+    @DisplayName("sendOtp with a blank domain — first line only")
+    void should_sendFirstLineOnly_when_otpDomainBlank() {
+        PhoneOtpService noDomain = new PhoneOtpService(phoneOtpRepository, attemptRecorder,
+                guestTokenProvider, otpSmsSender, Clock.fixed(FIXED_NOW, ZoneOffset.UTC), txManager,
+                new DeploymentProperties(DeployEnvironment.LOCAL,
+                        new DeploymentProperties.Sms(SmsMode.TURBOSMS, "")));
+        when(phoneOtpRepository.countByPhoneAndCreatedAtAfter(eq(PHONE), any())).thenReturn(0);
+
+        noDomain.sendOtp(PHONE);
+
+        ArgumentCaptor<String> smsText = ArgumentCaptor.forClass(String.class);
+        verify(otpSmsSender).send(eq(PHONE), smsText.capture());
+        assertThat(smsText.getValue()).matches("Код Beautica: \\d{6}\\. Нікому не кажіть\\.");
+    }
+
+    @Test
+    @DisplayName("invalid domain fails service construction (boot), not each send")
+    void should_failConstruction_when_otpDomainInvalid() {
+        DeploymentProperties badDomain = new DeploymentProperties(DeployEnvironment.LOCAL,
+                new DeploymentProperties.Sms(SmsMode.TURBOSMS, "https://beautica.app"));
+
+        ThrowingCallable construct = () -> new PhoneOtpService(
+                phoneOtpRepository, attemptRecorder, guestTokenProvider, otpSmsSender,
+                Clock.fixed(FIXED_NOW, ZoneOffset.UTC), txManager, badDomain);
+
+        assertThatThrownBy(construct)
+                .as("the host is validated once, at construction, not per send")
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("bare host");
     }
 
     @Test
@@ -332,7 +392,7 @@ class PhoneOtpServiceTest {
 
         ArgumentCaptor<String> smsText = ArgumentCaptor.forClass(String.class);
         verify(otpSmsSender).send(eq(PHONE), smsText.capture());
-        String code = smsText.getValue().replaceAll(".*?(\\d{6}).*", "$1");
+        String code = smsText.getValue().replaceAll("(?s).*?(\\d{6}).*", "$1");
         String logged = appender.list.stream()
                 .map(ch.qos.logback.classic.spi.ILoggingEvent::getFormattedMessage)
                 .reduce("", (a, b) -> a + "\n" + b);

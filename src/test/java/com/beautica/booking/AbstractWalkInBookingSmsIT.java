@@ -248,7 +248,7 @@ abstract class AbstractWalkInBookingSmsIT extends AbstractStaffBookingIT {
                 .noneMatch(line -> line.contains(SERVICE_NAME))
                 .noneMatch(line -> line.contains("Запис підтверджено"))
                 .noneMatch(line -> line.contains("Нагадуємо"))
-                .noneMatch(line -> line.contains("код підтвердження"));
+                .noneMatch(line -> line.contains("Нікому не кажіть"));
     }
 
     /**

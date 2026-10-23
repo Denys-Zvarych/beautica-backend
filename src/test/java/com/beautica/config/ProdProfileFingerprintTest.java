@@ -46,6 +46,8 @@ class ProdProfileFingerprintTest {
 
             assertThat(props.environment()).isEqualTo(DeployEnvironment.PROD);
             assertThat(props.sms().mode()).isEqualTo(SmsMode.TURBOSMS);
+            // Phase 389: the guest OTP SMS is bound to the prod website host.
+            assertThat(props.sms().otpDomainHost()).contains("beautica.app");
             assertThatCode(() -> EnvironmentFingerprintGuard.verify(ctx.getEnvironment())).doesNotThrowAnyException();
         });
     }
@@ -62,6 +64,8 @@ class ProdProfileFingerprintTest {
 
                     assertThat(props.environment()).isEqualTo(DeployEnvironment.STAGING);
                     assertThat(props.sms().mode()).isEqualTo(SmsMode.CAPTURE);
+                    // Phase 389: staging overrides prod's beautica.app — blank unless OTP_SMS_DOMAIN is set.
+                    assertThat(props.sms().otpDomainHost()).isEmpty();
                     assertThat(ctx.getEnvironment().getProperty("spring.mail.host")).doesNotContain("brevo");
                     assertThat(ctx.getEnvironment().getProperty("app.booking.sms.enabled")).isEqualTo("true");
                     // Phase 374: staging overrides prod's brevo-api transport and hosted logo back to SMTP + CID.
