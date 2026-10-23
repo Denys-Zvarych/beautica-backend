@@ -800,6 +800,10 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
      * lock_cfg} join-source shape as {@link #findByIdForUpdate}; {@code 55P03} → 409. {@code MANDATORY}: a
      * row lock outside a transaction is released at once.
      *
+     * <p>Phase 378 D4: a REVOKED salon ({@code booking_link_revoked_at} set) is never locked, so the share path
+     * never re-issues its slug; only an explicit regenerate clears the flag. A salon revoked concurrently drops
+     * out on the committed row version and is simply absent from the caller's result.
+     *
      * <p>Like {@link #lockBookingSlugCandidates}, the transaction-local 3s {@code lock_timeout} stays in force
      * for the rest of the caller's transaction ({@code BookingSlugService#issueMissingSalonSlugs}), bounding
      * its later lock waits too — accepted (376 security audit, INFO): only already-held locks follow.
@@ -809,7 +813,7 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
     @Query(value = """
             SELECT s.id FROM salons s
             CROSS JOIN (SELECT set_config('lock_timeout', '3s', true)) lock_cfg
-            WHERE s.id IN (:salonIds) AND s.booking_slug IS NULL
+            WHERE s.id IN (:salonIds) AND s.booking_slug IS NULL AND s.booking_link_revoked_at IS NULL
             ORDER BY s.id
             FOR NO KEY UPDATE OF s
             """, nativeQuery = true)
@@ -827,7 +831,7 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
     @QueryHints(@QueryHint(name = HibernateHints.HINT_NATIVE_SPACES, value = "salons"))
     @Query(value = "UPDATE salons s SET booking_slug = v.slug "
             + "FROM unnest(CAST(:salonIds AS uuid[]), CAST(:slugs AS text[])) AS v(id, slug) "
-            + "WHERE s.id = v.id AND s.booking_slug IS NULL",
+            + "WHERE s.id = v.id AND s.booking_slug IS NULL AND s.booking_link_revoked_at IS NULL",
             nativeQuery = true)
     int assignBookingSlugsIfAbsent(@Param("salonIds") UUID[] salonIds, @Param("slugs") String[] slugs);
 
@@ -850,33 +854,110 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
         String getBookingSlug();
     }
 
-    /** Row of the caller-scoped booking-link reads below — no entity, no association to initialise. */
+    /**
+     * Row of the caller-scoped booking-link reads below — no entity, no association to initialise.
+     * {@code revoked} (phase 378 D4/D15) reads the unmapped {@code booking_link_revoked_at}, hence native SQL.
+     */
     interface SalonBookingLinkRow {
         UUID getId();
 
         String getName();
 
         String getBookingSlug();
+
+        Boolean getRevoked();
+
+        default boolean revoked() {
+            return Boolean.TRUE.equals(getRevoked());
+        }
     }
 
     /**
      * Every ACTIVE salon the owner owns, in ONE statement, ordered by name (the link-list order).
      * Bounded by {@code SalonService.MAX_ACTIVE_SALONS_PER_OWNER}; backed by the V46 partial index
-     * {@code idx_salons_owner_active_created}.
+     * {@code idx_salons_owner_active_created}. Native since phase 378 (the revoke flag is unmapped).
      */
-    @Query("SELECT s.id AS id, s.name AS name, s.bookingSlug AS bookingSlug FROM Salon s "
-            + "WHERE s.owner.id = :ownerId AND s.isActive = true ORDER BY s.name, s.id")
+    @Query(value = """
+            SELECT s.id AS "id", s.name AS "name", s.booking_slug AS "bookingSlug",
+                   (s.booking_link_revoked_at IS NOT NULL) AS "revoked"
+              FROM salons s
+             WHERE s.owner_id = :ownerId AND s.is_active = true
+             ORDER BY s.name, s.id
+            """, nativeQuery = true)
     List<SalonBookingLinkRow> findBookingLinkRowsByOwnerId(@Param("ownerId") UUID ownerId);
 
     /**
      * The ACTIVE salon a {@code SALON_ADMIN} is bound to ({@code users.salon_id}, the same assignment
      * {@code AuthorizationService#adminBelongsToSalon} reads), in ONE statement. The role predicate
      * runs against the stored row, so a stale token role cannot borrow another user's salon binding.
+     * Native since phase 378 (the revoke flag is unmapped).
      */
-    @Query("SELECT s.id AS id, s.name AS name, s.bookingSlug AS bookingSlug FROM Salon s "
-            + "WHERE s.isActive = true AND s.id IN "
-            + "(SELECT u.salonId FROM User u WHERE u.id = :userId AND u.role = com.beautica.auth.Role.SALON_ADMIN)")
+    @Query(value = """
+            SELECT s.id AS "id", s.name AS "name", s.booking_slug AS "bookingSlug",
+                   (s.booking_link_revoked_at IS NOT NULL) AS "revoked"
+              FROM salons s
+             WHERE s.is_active = true
+               AND s.id IN (SELECT u.salon_id FROM users u WHERE u.id = :userId AND u.role = 'SALON_ADMIN')
+            """, nativeQuery = true)
     List<SalonBookingLinkRow> findBookingLinkRowsByAdminUserId(@Param("userId") UUID userId);
+
+    /**
+     * Phase 378 — the one salon a regenerate / revoke acts on: name, owner, activity, live slug and revoke
+     * flag in ONE statement (any activity, so the service can answer 404 for an inactive salon only AFTER
+     * the membership check — a foreign salon is always 403, never an existence oracle).
+     */
+    @Query(value = """
+            SELECT s.id AS "id", s.name AS "name", s.owner_id AS "ownerId", s.is_active AS "active",
+                   s.booking_slug AS "bookingSlug", (s.booking_link_revoked_at IS NOT NULL) AS "revoked"
+              FROM salons s WHERE s.id = :salonId
+            """, nativeQuery = true)
+    Optional<SalonBookingLinkStateRow> findBookingLinkStateById(@Param("salonId") UUID salonId);
+
+    /** Row of {@link #findBookingLinkStateById}. */
+    interface SalonBookingLinkStateRow extends SalonBookingLinkRow {
+        UUID getOwnerId();
+
+        Boolean getActive();
+    }
+
+    /**
+     * Phase 378 D7/D11a — salon regenerate: compare-and-swap twin of
+     * {@code MasterRepository#replaceBookingSlug} ({@code expected} is {@code ""} for "no slug", never
+     * {@code null}). Clears the revoke flag. Fused 3s {@code lock_timeout} (same shape as the master twin).
+     *
+     * @return 1 on success, 0 when the stored slug no longer equals {@code expected} (→ 409)
+     */
+    @Modifying
+    @QueryHints(@QueryHint(name = HibernateHints.HINT_NATIVE_SPACES, value = "salons"))
+    @Query(value = """
+            UPDATE salons
+               SET booking_slug = :newSlug,
+                   booking_link_revoked_at = NULL
+              FROM (SELECT set_config('lock_timeout', '3s', true)) AS lock_cfg
+             WHERE salons.id = :salonId
+               AND COALESCE(salons.booking_slug, '') = :expected
+            """, nativeQuery = true)
+    int replaceBookingSlug(
+            @Param("salonId") UUID salonId, @Param("expected") String expected, @Param("newSlug") String newSlug);
+
+    /**
+     * Phase 378 D7/D11a — salon revoke: clears the slug and stamps the revoke flag (kept when already set).
+     *
+     * @return 1 on success, 0 when the stored slug no longer equals {@code expected} (→ 409)
+     */
+    @Modifying
+    @QueryHints(@QueryHint(name = HibernateHints.HINT_NATIVE_SPACES, value = "salons"))
+    @Query(value = """
+            UPDATE salons
+               SET booking_slug = NULL,
+                   booking_link_revoked_at = COALESCE(salons.booking_link_revoked_at, :revokedAt)
+              FROM (SELECT set_config('lock_timeout', '3s', true)) AS lock_cfg
+             WHERE salons.id = :salonId
+               AND COALESCE(salons.booking_slug, '') = :expected
+            """, nativeQuery = true)
+    int revokeBookingSlug(
+            @Param("salonId") UUID salonId, @Param("expected") String expected,
+            @Param("revokedAt") java.time.Instant revokedAt);
 
     /**
      * The subset of {@code salonIds} that is bookable, in ONE statement — the salon analogue of

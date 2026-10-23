@@ -2,6 +2,8 @@ package com.beautica.common.cache;
 
 import com.beautica.booking.dto.SalonBookingSlugInfoResponse;
 import com.beautica.booking.dto.SalonBookingSlugMasterItem;
+import org.springframework.cache.Cache;
+import org.springframework.cache.CacheManager;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
@@ -32,6 +34,12 @@ import java.util.function.Predicate;
  * lands afterwards — the scan cannot evict it. That entry is stale until the cache TTL expires, so the
  * {@code expireAfterWrite} of {@value #CACHE} in {@code CacheConfig} (30 s) is the upper bound on how long a
  * salon page can lag a committed write. Keep the TTL short if this cache's registration changes.
+ *
+ * <p><b>Per-key form (378 audit security LOW).</b> When the writer KNOWS the slug whose page changed — a
+ * regenerate / revoke retiring it — {@link #evictSlugAfterCommit} evicts that key directly. Unlike the value
+ * scan, a per-key evict on the Caffeine-backed cache also removes a {@code sync=true} load in flight on that
+ * key (the removal waits for the load and drops its result), so a retired salon slug never keeps serving its
+ * page for the TTL.
  */
 @Component
 public class SalonBookingInfoCacheEvictor {
@@ -40,9 +48,11 @@ public class SalonBookingInfoCacheEvictor {
     private static final List<String> CACHES = List.of(CACHE);
 
     private final MasterCachePrefixEvictor cachePrefixEvictor;
+    private final CacheManager cacheManager;
 
-    public SalonBookingInfoCacheEvictor(MasterCachePrefixEvictor cachePrefixEvictor) {
+    public SalonBookingInfoCacheEvictor(MasterCachePrefixEvictor cachePrefixEvictor, CacheManager cacheManager) {
         this.cachePrefixEvictor = cachePrefixEvictor;
+        this.cacheManager = cacheManager;
     }
 
     /** Evicts the salon's page now. Call from an {@code afterCommit} hook; {@code null} is a no-op. */
@@ -65,6 +75,31 @@ public class SalonBookingInfoCacheEvictor {
             @Override
             public void afterCommit() {
                 evictSalon(salonId);
+            }
+        });
+    }
+
+    /** Evicts the page cached under {@code slug} now. Call from an {@code afterCommit} hook; {@code null} is a no-op. */
+    public void evictSlug(String slug) {
+        Cache cache = slug == null ? null : cacheManager.getCache(CACHE);
+        if (cache != null) {
+            cache.evict(slug);
+        }
+    }
+
+    /** Registers {@link #evictSlug} after the current transaction commits (immediately outside one). */
+    public void evictSlugAfterCommit(String slug) {
+        if (slug == null) {
+            return;
+        }
+        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            evictSlug(slug);
+            return;
+        }
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                evictSlug(slug);
             }
         });
     }

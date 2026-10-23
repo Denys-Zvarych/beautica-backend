@@ -230,6 +230,18 @@ class MasterProfileCacheEvictorTest {
         org.mockito.Mockito.verifyNoInteractions(masterRepository);
     }
 
+    @Test
+    @DisplayName("378 audit perf LOW-2: known slugs batch-evicted with NO repository access; null/empty is a no-op")
+    void should_evictEachKnownSlugWithoutQuery_when_slugBatchGiven() {
+        evictor.evictBookingSlugInfoBySlugsAfterCommit(java.util.List.of(slug, "other-slug-zz99"));
+        evictor.evictBookingSlugInfoBySlugsAfterCommit(null);
+        evictor.evictBookingSlugInfoBySlugsAfterCommit(java.util.List.of());
+
+        verify(slugInfo).evict(slug);
+        verify(slugInfo).evict("other-slug-zz99");
+        org.mockito.Mockito.verifyNoInteractions(masterRepository);
+    }
+
     private Cache stub(String name) {
         Cache cache = mock(Cache.class);
         when(cacheManager.getCache(name)).thenReturn(cache);

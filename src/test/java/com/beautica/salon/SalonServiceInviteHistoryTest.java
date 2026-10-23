@@ -195,7 +195,7 @@ class SalonServiceInviteHistoryTest {
                 afterCommitBlobPurger, new com.beautica.common.cache.MasterCachePrefixEvictor(cacheManager),
                 bookingSlugService,
                 new com.beautica.common.cache.SalonBookingInfoCacheEvictor(
-                        new com.beautica.common.cache.MasterCachePrefixEvictor(cacheManager)));
+                        new com.beautica.common.cache.MasterCachePrefixEvictor(cacheManager), cacheManager));
     }
 
     // ── the derivation ladder ─────────────────────────────────────────────────

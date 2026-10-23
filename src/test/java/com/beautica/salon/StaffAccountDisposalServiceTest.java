@@ -186,7 +186,7 @@ class StaffAccountDisposalServiceTest {
         UUID staffUserId = UUID.randomUUID();
         UUID otherUserId = UUID.randomUUID();
         Master withSlug = masterWithUser(UUID.randomUUID(), staffUserId, "Тест", "Майстер");
-        withSlug.setBookingSlug("test-maister-ab12");
+        ReflectionTestUtils.setField(withSlug, "bookingSlug", "test-maister-ab12");   // no setter since phase 378 D12
         Master legacy = masterWithUser(UUID.randomUUID(), otherUserId, "Стара", "Майстриня");
         when(masterRepository.findAllByUserIdInWithUser(List.of(staffUserId, otherUserId)))
                 .thenReturn(List.of(withSlug, legacy));

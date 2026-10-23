@@ -9,6 +9,7 @@ import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.master.service.ScheduleDateMath;
+import com.beautica.booking.dto.BookingLinkStatus;
 import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.salon.repository.SalonRepository.SalonBookingLinkRow;
@@ -82,7 +83,7 @@ class BookingLinkServiceTest {
 
     private void givenMaster(Master master, boolean searchBookable) {
         when(masterRepository.findActiveByUserIdWithUserAndSalon(USER_ID)).thenReturn(Optional.of(master));
-        when(bookingSlugService.getOrIssueSlugRaceSafe(master)).thenReturn(SLUG);
+        when(bookingSlugService.getOrIssueSlugRaceSafe(master)).thenReturn(Optional.of(SLUG));
         MasterRepository.SearchBookabilityRow row = new MasterRepository.SearchBookabilityRow() {
             @Override public UUID getMasterId() { return MASTER_ID; }
             @Override public UUID getSalonId() { return null; }
@@ -168,7 +169,7 @@ class BookingLinkServiceTest {
         givenMaster(master, true);
         when(bookingSlugService.getOrIssueSlugRaceSafe(master))
                 .thenThrow(new DataIntegrityViolationException("ux_masters_booking_slug"))
-                .thenReturn(SLUG);
+                .thenReturn(Optional.of(SLUG));
 
         BookingLinksResponse response = service.getMyLinks(USER_ID, Role.INDEPENDENT_MASTER);
 
@@ -275,6 +276,17 @@ class BookingLinkServiceTest {
             @Override public UUID getId() { return id; }
             @Override public String getName() { return name; }
             @Override public String getBookingSlug() { return slug; }
+            @Override public Boolean getRevoked() { return false; }
+        };
+    }
+
+    /** Phase 378 — a salon whose owner revoked the link: no slug, revoke flag set. */
+    private static SalonBookingLinkRow revokedSalonRow(UUID id, String name) {
+        return new SalonBookingLinkRow() {
+            @Override public UUID getId() { return id; }
+            @Override public String getName() { return name; }
+            @Override public String getBookingSlug() { return null; }
+            @Override public Boolean getRevoked() { return true; }
         };
     }
 
@@ -424,5 +436,62 @@ class BookingLinkServiceTest {
         BookingLinksResponse response = service.getMyLinks(USER_ID, Role.SALON_ADMIN);
 
         assertThat(response.links().get(0).url()).isEqualTo("https://staging.beautica.app/book/s/alfa-aa11");
+    }
+
+    // ── phase 378 — REVOKED links (D4/D15) ──────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("phase 378 D15: revoked master link → status REVOKED, slug/url null, not bookable, no bookability read")
+    void should_returnRevokedMasterLink_when_issueReportsRevoked() {
+        Master master = master(null, MasterType.INDEPENDENT_MASTER);
+        when(masterRepository.findActiveByUserIdWithUserAndSalon(USER_ID)).thenReturn(Optional.of(master));
+        when(bookingSlugService.getOrIssueSlugRaceSafe(master)).thenReturn(Optional.empty());
+
+        BookingLinksResponse response = service.getMyLinks(USER_ID, Role.INDEPENDENT_MASTER);
+
+        assertThat(response.links()).singleElement().satisfies(link -> {
+            assertThat(link.kind()).isEqualTo(BookingLinkKind.MASTER);
+            assertThat(link.status()).isEqualTo(BookingLinkStatus.REVOKED);
+            assertThat(link.slug()).isNull();
+            assertThat(link.url()).isNull();
+            assertThat(link.displayName()).isEqualTo("Олена Коваль");
+            assertThat(link.bookable()).isFalse();
+        });
+        verify(masterRepository, never()).findSearchBookability(any(), any());
+    }
+
+    @Test
+    @DisplayName("378 audit perf LOW-1: revoked flag came with the master read → REVOKED without the issue transaction")
+    void should_answerRevokedWithoutIssueTransaction_when_readCarriesRevokedFlag() {
+        User user = new User("m@beautica.test", "hash", Role.INDEPENDENT_MASTER, "Олена", "Коваль", null);
+        Master master = Master.builder().id(MASTER_ID).user(user).masterType(MasterType.INDEPENDENT_MASTER)
+                .isActive(true).bookingLinkRevoked(true).build();
+        when(masterRepository.findActiveByUserIdWithUserAndSalon(USER_ID)).thenReturn(Optional.of(master));
+
+        BookingLinksResponse response = service.getMyLinks(USER_ID, Role.INDEPENDENT_MASTER);
+
+        assertThat(response.links()).singleElement()
+                .satisfies(link -> assertThat(link.status()).isEqualTo(BookingLinkStatus.REVOKED));
+        verifyNoInteractions(bookingSlugService);
+        verify(masterRepository, never()).findSearchBookability(any(), any());
+    }
+
+    @Test
+    @DisplayName("phase 378 D4/D15: a revoked salon is listed REVOKED in name order and never handed to the lazy issue")
+    void should_listRevokedSalonWithoutIssuing_when_salonRevoked() {
+        SalonBookingLinkRow revoked = revokedSalonRow(SALON_A, "Alfa");
+        SalonBookingLinkRow active = salonRow(SALON_B, "Beta", "beta-bb22");
+        when(salonRepository.findBookingLinkRowsByOwnerId(USER_ID)).thenReturn(List.of(revoked, active));
+        when(salonRepository.findBookableSalonIds(anyCollection(), any())).thenReturn(List.of(SALON_A, SALON_B));
+
+        BookingLinksResponse response = service.getMyLinks(USER_ID, Role.SALON_OWNER);
+
+        assertThat(response.links()).extracting(BookingLinkResponse::status, BookingLinkResponse::slug,
+                        BookingLinkResponse::url, BookingLinkResponse::salonId, BookingLinkResponse::bookable)
+                .containsExactly(
+                        org.assertj.core.groups.Tuple.tuple(BookingLinkStatus.REVOKED, null, null, SALON_A, false),
+                        org.assertj.core.groups.Tuple.tuple(BookingLinkStatus.ACTIVE, "beta-bb22",
+                                "https://beautica.app/book/s/beta-bb22", SALON_B, true));
+        verify(bookingSlugService, never()).issueMissingSalonSlugs(anyList());
     }
 }

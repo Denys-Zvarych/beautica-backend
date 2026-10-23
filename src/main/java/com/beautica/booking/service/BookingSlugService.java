@@ -1,6 +1,8 @@
 package com.beautica.booking.service;
 
+import com.beautica.booking.dto.BookingLinkKind;
 import com.beautica.booking.dto.BookingSlugInfoResponse;
+import com.beautica.booking.repository.RetiredBookingSlugRepository;
 import com.beautica.booking.dto.BookingSlugSalonRef;
 import com.beautica.booking.dto.CategoryRef;
 import com.beautica.booking.dto.ServiceSummaryDto;
@@ -9,6 +11,7 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
+import com.beautica.master.repository.MasterRepository.BookingLinkState;
 import com.beautica.master.service.ScheduleDateMath;
 import com.beautica.media.dto.MediaFileResponse;
 import com.beautica.media.entity.EntityType;
@@ -36,7 +39,6 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.security.SecureRandom;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -46,6 +48,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.function.Predicate;
@@ -63,7 +66,7 @@ import java.util.function.Predicate;
  *
  * <p><b>Slug format.</b> KMU-2010 Ukrainian-to-Latin transliteration of the
  * master's "first last" name, lowercased, hyphenated, then {@code '-'} + 4
- * {@link SecureRandom} {@code [a-z0-9]} chars. Matches the DB CHECK
+ * {@code SecureRandom} {@code [a-z0-9]} chars ({@link SlugSuffixSource}). Matches the DB CHECK
  * {@code ^[a-z0-9][a-z0-9\-]*[a-z0-9]$} and is {@code <= 60} chars. Global
  * uniqueness is enforced by a bounded retry loop against
  * {@link MasterRepository#existsByBookingSlug}.
@@ -85,7 +88,6 @@ public class BookingSlugService {
     private static final String FALLBACK_BASE = "master";
     /** Phase 376 — base used when a salon name transliterates to fewer than 2 slug chars. */
     private static final String SALON_FALLBACK_BASE = "salon";
-    private static final char[] SLUG_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789".toCharArray();
     /** Public master menu is tiny; cap the unbounded list read defensively (Anti-Bug §E-3). */
     private static final int MAX_SERVICES = 100;
     /** Phase 380 D2 — portfolio photos / newest reviews carried on the public master page. */
@@ -110,7 +112,10 @@ public class BookingSlugService {
     private final MediaService mediaService;
     private final ReviewService reviewService;
     private final ScheduleDateMath scheduleDateMath;
-    private final SecureRandom random = new SecureRandom();
+    /** Phase 378 — the retired-slug tombstones; both generators treat a tombstoned slug as taken (D2). */
+    private final RetiredBookingSlugRepository retiredBookingSlugRepository;
+    /** Phase 378 test seam — the random suffix (production: {@link SecureRandomSlugSuffixSource}). */
+    private final SlugSuffixSource slugSuffixSource;
 
     /**
      * Returns the master's existing booking slug, or lazily generates, persists,
@@ -128,9 +133,17 @@ public class BookingSlugService {
             return master.getBookingSlug();
         }
         String slug = generateSlug(master.getUser().getFirstName(), master.getUser().getLastName());
-        // No explicit save(): master is managed (findById, same transaction), so the slug
-        // assignment is flushed by dirty-checking on commit.
-        master.setBookingSlug(slug);
+        // Phase 378 D12: Master.bookingSlug is updatable = false, so the slug is written by the native
+        // conditional UPDATE, which also clears a revoke flag (D5 — the platform needs this master's
+        // slug, e.g. for its salon page). Flush first: the caller has just save()d this row and its
+        // INSERT may still be queued. The managed instance mirrors the written value so the creating
+        // transaction reads the slug as before.
+        masterRepository.flush();
+        if (masterRepository.assignBookingSlugIfAbsent(masterId, slug) == 0) {
+            return masterRepository.findBookingSlugById(masterId)
+                    .orElseThrow(() -> new NotFoundException("Master not found"));
+        }
+        master.mirrorIssuedBookingSlug(slug);
         return slug;
     }
 
@@ -152,18 +165,35 @@ public class BookingSlugService {
      * transaction rollback-only, and the caller's single retry with a fresh candidate
      * ({@code BookingLinkService#issueSlug}) is only sound because it starts a new transaction.
      *
+     * <p><b>Revoked links (phase 378 D4).</b> A master whose link is revoked gets no slug here: the
+     * committed state is read first (one statement, only for a slug-less master) and a revoked link
+     * returns empty with no write; the conditional {@code UPDATE} additionally requires
+     * {@code booking_link_revoked_at IS NULL}, so a revoke committed in between also yields empty.
+     *
      * @param master an active, user-attached master with {@code user} fetched (may be detached)
+     * @return the one permanent slug, or empty when the link is revoked
      */
     @Transactional
-    public String getOrIssueSlugRaceSafe(Master master) {
+    public Optional<String> getOrIssueSlugRaceSafe(Master master) {
         if (master.getBookingSlug() != null) {
-            return master.getBookingSlug();
+            return Optional.of(master.getBookingSlug());
+        }
+        BookingLinkState before = linkState(master.getId());
+        if (before.getBookingSlug() != null) {
+            return Optional.of(before.getBookingSlug());   // issued by a concurrent call since the read
+        }
+        if (before.revoked()) {
+            return Optional.empty();
         }
         String candidate = generateSlug(master.displayFirstName(), master.displayLastName());
-        if (masterRepository.assignBookingSlugIfAbsent(master.getId(), candidate) == 1) {
-            return candidate;
+        if (masterRepository.assignShareSlugIfAbsentAndNotRevoked(master.getId(), candidate) == 1) {
+            return Optional.of(candidate);
         }
-        return masterRepository.findBookingSlugById(master.getId())
+        return Optional.ofNullable(linkState(master.getId()).getBookingSlug());
+    }
+
+    private BookingLinkState linkState(UUID masterId) {
+        return masterRepository.findBookingLinkStateById(masterId)
                 .orElseThrow(() -> new NotFoundException("Master not found"));
     }
 
@@ -175,7 +205,59 @@ public class BookingSlugService {
      * colliding is effectively impossible in practice.
      */
     public String generateSlug(String firstName, String lastName) {
-        return generateSlug(composeName(firstName, lastName), FALLBACK_BASE, masterRepository::existsByBookingSlug);
+        return generateSlug(composeName(firstName, lastName), FALLBACK_BASE, this::isMasterSlugTaken);
+    }
+
+    /**
+     * Phase 378 — a master slug for a REGENERATE (D11c): the same generator, but each candidate's advisory
+     * lock ({@link SalonRepository#lockBookingSlugCandidates}, the one slug-text lock) is taken before its
+     * probe and held to the caller's commit, so two regenerates never pick the same value. {@code MANDATORY}
+     * for the reason given on {@link #generateSalonSlug}.
+     *
+     * <p>378 audit perf INFO-4: a candidate equal to {@code heldSlug} (the slug the caller already locked
+     * and is retiring) is NOT locked a second time — it is live, so its probe reports it taken and it is
+     * redrawn anyway. A genuine cross-transaction lock-order deadlock is mapped to 409 by the caller.
+     *
+     * @param heldSlug the slug text the caller already holds the advisory lock on, or {@code null}
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public String generateMasterSlugUnderLock(String firstName, String lastName, String heldSlug) {
+        return generateSlug(composeName(firstName, lastName), FALLBACK_BASE, candidate -> {
+            lockCandidateUnlessHeld(candidate, heldSlug);
+            return isMasterSlugTaken(candidate);
+        });
+    }
+
+    private void lockCandidateUnlessHeld(String candidate, String heldSlug) {
+        if (!candidate.equals(heldSlug)) {
+            salonRepository.lockBookingSlugCandidates(new String[] {candidate});
+        }
+    }
+
+    /** Phase 378 audit (V205) — tombstones are keyed by hash; the probe hashes via {@link RetiredSlugHasher}. */
+    private boolean isRetired(BookingLinkKind kind, String candidate) {
+        return retiredBookingSlugRepository.existsByKindAndSlugHash(kind, RetiredSlugHasher.hash(kind, candidate));
+    }
+
+    /** Batched twin of {@link #isRetired}: which of {@code candidates} are retired in {@code kind}'s namespace. */
+    private List<String> retiredAmong(BookingLinkKind kind, List<String> candidates) {
+        Map<String, String> slugByHash = new LinkedHashMap<>();
+        candidates.forEach(candidate -> slugByHash.put(RetiredSlugHasher.hash(kind, candidate), candidate));
+        return retiredBookingSlugRepository.findRetiredSlugHashes(kind, List.copyOf(slugByHash.keySet())).stream()
+                .map(slugByHash::get)
+                .toList();
+    }
+
+    /**
+     * Phase 378 D2 — a master candidate is taken when a master holds it OR it was retired as a MASTER slug.
+     * The live probe runs FIRST, as its own statement: the retiring transaction writes the slug change and
+     * the tombstone in one commit, so a live probe that ran before that commit still sees the slug, and one
+     * that ran after it is followed by a tombstone probe that sees the tombstone — a retired slug is never
+     * observed both free and un-tombstoned, with or without the advisory lock.
+     */
+    private boolean isMasterSlugTaken(String candidate) {
+        return masterRepository.existsByBookingSlug(candidate)
+                || isRetired(BookingLinkKind.MASTER, candidate);
     }
 
     /**
@@ -193,12 +275,23 @@ public class BookingSlugService {
      */
     @Transactional(propagation = Propagation.MANDATORY)
     public String generateSalonSlug(String salonName) {
-        return generateSlug(salonName, SALON_FALLBACK_BASE, this::isSalonSlugTakenUnderLock);
+        return generateSalonSlug(salonName, null);
     }
 
-    private boolean isSalonSlugTakenUnderLock(String candidate) {
-        salonRepository.lockBookingSlugCandidates(new String[] {candidate});
-        return salonRepository.existsByBookingSlug(candidate);
+    /**
+     * Phase 378 — the SALON regenerate form of {@link #generateSalonSlug(String)}: a candidate equal to
+     * {@code heldSlug} (already locked by the caller) is not locked again (378 audit perf INFO-4).
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public String generateSalonSlug(String salonName, String heldSlug) {
+        return generateSlug(salonName, SALON_FALLBACK_BASE, candidate -> isSalonSlugTakenUnderLock(candidate, heldSlug));
+    }
+
+    private boolean isSalonSlugTakenUnderLock(String candidate, String heldSlug) {
+        lockCandidateUnlessHeld(candidate, heldSlug);
+        // Phase 378 D2/D3: live salon slug first, then a SALON tombstone (order as isMasterSlugTaken).
+        return salonRepository.existsByBookingSlug(candidate)
+                || isRetired(BookingLinkKind.SALON, candidate);
     }
 
     /**
@@ -269,10 +362,12 @@ public class BookingSlugService {
     /** One lock + probe round; returns the salons whose candidate was taken (to redraw). */
     private List<UUID> allocateRound(List<UUID> pending, Map<UUID, String> bases, Map<UUID, String> allocated) {
         Map<UUID, String> candidates = new LinkedHashMap<>();
-        pending.forEach(salonId -> candidates.put(salonId, bases.get(salonId) + "-" + randomSuffix()));
+        pending.forEach(salonId -> candidates.put(salonId, bases.get(salonId) + "-" + slugSuffixSource.nextSuffix()));
         List<String> sorted = candidates.values().stream().distinct().sorted().toList();
         salonRepository.lockBookingSlugCandidates(sorted.toArray(String[]::new));
         Set<String> claimed = new HashSet<>(salonRepository.findExistingBookingSlugs(sorted));
+        // Phase 378 D2/D3: a retired SALON slug is taken too (probed after the live slugs, as above).
+        claimed.addAll(retiredAmong(BookingLinkKind.SALON, sorted));
         claimed.addAll(allocated.values());
         List<UUID> redraw = new ArrayList<>();
         candidates.forEach((salonId, candidate) -> {
@@ -294,7 +389,7 @@ public class BookingSlugService {
     private String generateSlug(String displayBase, String fallbackBase, Predicate<String> exists) {
         String base = buildBase(displayBase, fallbackBase);
         for (int attempt = 0; attempt < MAX_GENERATION_ATTEMPTS; attempt++) {
-            String candidate = base + "-" + randomSuffix();
+            String candidate = base + "-" + slugSuffixSource.nextSuffix();
             if (!exists.test(candidate)) {
                 return candidate;
             }
@@ -508,13 +603,5 @@ public class BookingSlugService {
             cut = cut.substring(0, cut.length() - 1);
         }
         return cut;
-    }
-
-    private String randomSuffix() {
-        StringBuilder sb = new StringBuilder(RANDOM_SUFFIX_LENGTH);
-        for (int i = 0; i < RANDOM_SUFFIX_LENGTH; i++) {
-            sb.append(SLUG_ALPHABET[random.nextInt(SLUG_ALPHABET.length)]);
-        }
-        return sb.toString();
     }
 }

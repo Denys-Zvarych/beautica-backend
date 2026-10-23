@@ -12,6 +12,7 @@ import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.jpa.repository.QueryHints;
 import org.springframework.data.repository.query.Param;
 
+import java.time.Instant;
 import java.time.LocalDate;
 import java.util.Collection;
 import java.util.List;
@@ -268,6 +269,18 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
     List<UUID> findIdsBySalonIdAndIsActiveTrue(@Param("salonId") UUID salonId);
 
     /**
+     * Phase 378 audit (perf LOW-2) — the {@code booking-slug-info} cache keys of the salon's active members in
+     * ONE statement (instead of ids, then slugs). A member without a slug has no public page, so it is
+     * skipped. Bounded by the salon's roster. Unscoped (Anti-Bug §E-4): the caller
+     * ({@code BookingLinkRetirementWriter}) has already authorized the salon.
+     */
+    @Query(value = """
+            SELECT booking_slug FROM masters
+             WHERE salon_id = :salonId AND is_active AND booking_slug IS NOT NULL
+            """, nativeQuery = true)
+    List<String> findActiveMemberBookingSlugsBySalonId(@Param("salonId") UUID salonId);
+
+    /**
      * Cache keys of EVERY master row affiliated with {@code salonId} — active or not, since
      * {@code GET /masters/{masterId}} carries no {@code isActive} predicate and may hold an
      * inactive master's entry. Id-only constructor projection; the {@code LEFT JOIN} keeps a
@@ -514,6 +527,28 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
      *
      * @return 1 when this call issued the slug, 0 when another transaction already had
      */
+    // Phase 378 D5 — the INTERNAL issue path (BookingSlugService#getOrCreateSlug, master creation):
+    // ignores and clears a revoke flag, so a master the platform itself needs a slug for (a salon
+    // page lists only masters with a slug) always gets one. The share path uses
+    // assignShareSlugIfAbsentAndNotRevoked instead, which never resurrects a revoked link.
+    @Modifying
+    @Query(value = """
+            UPDATE masters
+               SET booking_slug = :slug,
+                   booking_link_revoked_at = NULL
+              FROM (SELECT set_config('lock_timeout', '3s', true)) AS lock_cfg
+             WHERE masters.id = :masterId
+               AND masters.booking_slug IS NULL
+            """, nativeQuery = true)
+    int assignBookingSlugIfAbsent(@Param("masterId") UUID masterId, @Param("slug") String slug);
+
+    /**
+     * Phase 378 D4 — the SHARE-path lazy issue ({@code GET /booking-links/mine}): the
+     * {@link #assignBookingSlugIfAbsent} statement plus {@code booking_link_revoked_at IS NULL}, so a
+     * revoked link is never silently re-issued (only an explicit regenerate clears the flag). 0 rows →
+     * a concurrent call issued first OR the link is revoked; the caller re-reads
+     * {@link #findBookingLinkStateById} to tell which. Same fused 3s {@code lock_timeout}.
+     */
     @Modifying
     @Query(value = """
             UPDATE masters
@@ -521,8 +556,70 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
               FROM (SELECT set_config('lock_timeout', '3s', true)) AS lock_cfg
              WHERE masters.id = :masterId
                AND masters.booking_slug IS NULL
+               AND masters.booking_link_revoked_at IS NULL
             """, nativeQuery = true)
-    int assignBookingSlugIfAbsent(@Param("masterId") UUID masterId, @Param("slug") String slug);
+    int assignShareSlugIfAbsentAndNotRevoked(@Param("masterId") UUID masterId, @Param("slug") String slug);
+
+    /**
+     * Phase 378 D7/D11a — regenerate: optimistic compare-and-swap of the master's slug. Writes
+     * {@code newSlug} and clears the revoke flag ONLY while the stored slug still equals the caller's
+     * {@code expected} value; {@code expected} is {@code ""} for "no slug" (a revoked or legacy link) —
+     * never {@code null}, so the bind is always typed and {@code COALESCE(booking_slug, '')} matches it
+     * (a real slug is never empty: V86 CHECK). Same fused 3s {@code lock_timeout} as the lazy issue.
+     *
+     * @return 1 on success, 0 when the stored slug no longer equals {@code expected} (→ 409)
+     */
+    @Modifying
+    @Query(value = """
+            UPDATE masters
+               SET booking_slug = :newSlug,
+                   booking_link_revoked_at = NULL
+              FROM (SELECT set_config('lock_timeout', '3s', true)) AS lock_cfg
+             WHERE masters.id = :masterId
+               AND COALESCE(masters.booking_slug, '') = :expected
+            """, nativeQuery = true)
+    int replaceBookingSlug(
+            @Param("masterId") UUID masterId, @Param("expected") String expected, @Param("newSlug") String newSlug);
+
+    /**
+     * Phase 378 D7/D11a — revoke: the compare-and-swap twin of {@link #replaceBookingSlug} that clears the
+     * slug and stamps the revoke flag (kept, not moved, when already set). {@code expected} as there.
+     *
+     * @return 1 on success, 0 when the stored slug no longer equals {@code expected} (→ 409)
+     */
+    @Modifying
+    @Query(value = """
+            UPDATE masters
+               SET booking_slug = NULL,
+                   booking_link_revoked_at = COALESCE(masters.booking_link_revoked_at, :revokedAt)
+              FROM (SELECT set_config('lock_timeout', '3s', true)) AS lock_cfg
+             WHERE masters.id = :masterId
+               AND COALESCE(masters.booking_slug, '') = :expected
+            """, nativeQuery = true)
+    int revokeBookingSlug(
+            @Param("masterId") UUID masterId, @Param("expected") String expected,
+            @Param("revokedAt") Instant revokedAt);
+
+    /**
+     * Phase 378 — the master's committed link state straight from the table (native, so a stale entity
+     * is bypassed and the unmapped {@code booking_link_revoked_at} is reachable). Empty when no row.
+     */
+    @Query(value = """
+            SELECT booking_slug AS "bookingSlug", (booking_link_revoked_at IS NOT NULL) AS "revoked"
+              FROM masters WHERE id = :masterId
+            """, nativeQuery = true)
+    Optional<BookingLinkState> findBookingLinkStateById(@Param("masterId") UUID masterId);
+
+    /** Row of {@link #findBookingLinkStateById}: the live slug (or {@code null}) and the revoke flag. */
+    interface BookingLinkState {
+        String getBookingSlug();
+
+        Boolean getRevoked();
+
+        default boolean revoked() {
+            return Boolean.TRUE.equals(getRevoked());
+        }
+    }
 
     /**
      * Phase 375 — the master's CURRENT committed booking slug, read straight from the table (a native

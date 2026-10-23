@@ -313,6 +313,13 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
      */
     private static final int SELF_DELETE_RETRY_AFTER_SECONDS = 3600;
 
+    /** Phase 378 D10 — the booking-link mutation routes and their shared bucket's 1-hour Retry-After. */
+    private static final String BOOKING_LINKS_MASTER_PATH = "/api/v1/booking-links/master";
+    private static final String BOOKING_LINKS_MASTER_REGENERATE_PATH = BOOKING_LINKS_MASTER_PATH + "/regenerate";
+    private static final String BOOKING_LINKS_SALONS_PREFIX = "/api/v1/booking-links/salons/";
+    private static final String REGENERATE_SEGMENT = "regenerate";
+    private static final int BOOKING_LINK_MUTATION_RETRY_AFTER_SECONDS = 3600;
+
     private final LoadingCache<String, Bucket> bookingWriteBuckets;
     private final LoadingCache<String, Bucket> bookingDeclineBuckets;
     private final LoadingCache<String, Bucket> scheduleOverrideWriteBuckets;
@@ -324,6 +331,7 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
     private final LoadingCache<String, Bucket> catalogueBrowsePrincipalBuckets;
     private final LoadingCache<String, Bucket> catalogueBrowseBuckets;
     private final LoadingCache<String, Bucket> catalogueBrowseAuthenticatedIpBuckets;
+    private final LoadingCache<String, Bucket> bookingLinkMutationBuckets;
     private final ObjectMapper objectMapper;
 
     public BookingRateLimitFilter(
@@ -338,6 +346,7 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
             LoadingCache<String, Bucket> catalogueBrowsePrincipalBuckets,
             LoadingCache<String, Bucket> catalogueBrowseBuckets,
             LoadingCache<String, Bucket> catalogueBrowseAuthenticatedIpBuckets,
+            LoadingCache<String, Bucket> bookingLinkMutationBuckets,
             ObjectMapper objectMapper) {
         this.bookingWriteBuckets = bookingWriteBuckets;
         this.bookingDeclineBuckets = bookingDeclineBuckets;
@@ -350,6 +359,7 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
         this.catalogueBrowsePrincipalBuckets = catalogueBrowsePrincipalBuckets;
         this.catalogueBrowseBuckets = catalogueBrowseBuckets;
         this.catalogueBrowseAuthenticatedIpBuckets = catalogueBrowseAuthenticatedIpBuckets;
+        this.bookingLinkMutationBuckets = bookingLinkMutationBuckets;
         this.objectMapper = objectMapper;
     }
 
@@ -488,6 +498,10 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
         // See USERS_ME_PATH's javadoc for why this unrelated route lives in the booking filter.
         if (HttpMethod.DELETE.matches(method) && USERS_ME_PATH.equals(path)) {
             return new BucketRoute(selfDeleteBuckets, SELF_DELETE_RETRY_AFTER_SECONDS);
+        }
+        // Phase 378 D10 — the four booking-link mutations share ONE per-user budget.
+        if (isBookingLinkMutation(method, path)) {
+            return new BucketRoute(bookingLinkMutationBuckets, BOOKING_LINK_MUTATION_RETRY_AFTER_SECONDS);
         }
         // GET /api/v1/salons/{salonId}/masters/{masterId}/services — the authenticated management
         // read (cycle-2 audit, B8). See SALON_MASTER_SERVICES_PREFIX for why a GET is throttled
@@ -664,6 +678,31 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
      */
     private static boolean isNotificationsPath(String path) {
         return NOTIFICATIONS_PATH.equals(path) || path.startsWith(NOTIFICATIONS_PATH_PREFIX);
+    }
+
+    /**
+     * Phase 378 — exactly {@code POST .../master/regenerate}, {@code DELETE .../master},
+     * {@code POST .../salons/{salonId}/regenerate} and {@code DELETE .../salons/{salonId}}, matched on the
+     * decoded + normalised path and bounded by segment count (a deeper sub-route stays unbucketed and
+     * visible rather than silently inheriting this budget). {@code GET /booking-links/mine} never matches.
+     */
+    private static boolean isBookingLinkMutation(String method, String path) {
+        boolean post = HttpMethod.POST.matches(method);
+        boolean delete = HttpMethod.DELETE.matches(method);
+        if (BOOKING_LINKS_MASTER_REGENERATE_PATH.equals(path)) {
+            return post;
+        }
+        if (BOOKING_LINKS_MASTER_PATH.equals(path)) {
+            return delete;
+        }
+        if (!path.startsWith(BOOKING_LINKS_SALONS_PREFIX)) {
+            return false;
+        }
+        String[] segments = path.substring(BOOKING_LINKS_SALONS_PREFIX.length()).split("/", -1);
+        if (segments.length == 1) {
+            return delete && !segments[0].isEmpty();
+        }
+        return post && segments.length == 2 && !segments[0].isEmpty() && REGENERATE_SEGMENT.equals(segments[1]);
     }
 
     /** Pairs the bucket cache a request must consume from with its bucket-specific Retry-After. */

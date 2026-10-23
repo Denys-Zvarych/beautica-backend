@@ -1,6 +1,8 @@
 package com.beautica.booking.service;
 
+import com.beautica.booking.dto.BookingLinkKind;
 import com.beautica.booking.dto.BookingSlugInfoResponse;
+import com.beautica.booking.repository.RetiredBookingSlugRepository;
 import com.beautica.booking.dto.BookingSlugSalonRef;
 import com.beautica.booking.dto.CategoryRef;
 import com.beautica.review.dto.SalonReviewSort;
@@ -24,6 +26,7 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
+import org.mockito.Spy;
 import org.mockito.junit.jupiter.MockitoExtension;
 
 import java.math.BigDecimal;
@@ -42,6 +45,7 @@ import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.atLeastOnce;
+import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -73,6 +77,13 @@ class BookingSlugServiceTest {
 
     @Mock
     private com.beautica.master.service.ScheduleDateMath scheduleDateMath;
+
+    @Mock
+    private RetiredBookingSlugRepository retiredBookingSlugRepository;
+
+    /** Real random suffixes by default; stubbed (doReturn) where a test forces a specific candidate. */
+    @Spy
+    private SlugSuffixSource slugSuffixSource = new SecureRandomSlugSuffixSource();
 
     @InjectMocks
     private BookingSlugService service;
@@ -184,13 +195,34 @@ class BookingSlugServiceTest {
         when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
         when(masterRepository.existsByBookingSlug(anyString())).thenReturn(false);
 
+        when(masterRepository.assignBookingSlugIfAbsent(eq(masterId), anyString())).thenReturn(1);
+
         String slug = service.getOrCreateSlug(masterId);
 
-        // master is loaded via findById (managed in-transaction), so the slug is flushed
-        // by Hibernate dirty-checking on commit — no explicit save() call.
+        // Phase 378 D12: written by the native conditional UPDATE (which also clears a revoke flag, D5)
+        // after a flush of the just-saved row; the managed instance mirrors it. No save(), no setter.
         assertThat(slug).matches("^olena-koval-[a-z0-9]{4}$");
+        InOrder order = inOrder(masterRepository);
+        order.verify(masterRepository).flush();
+        order.verify(masterRepository).assignBookingSlugIfAbsent(masterId, slug);
         assertThat(master.getBookingSlug()).isEqualTo(slug);
         verify(masterRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("phase 378: getOrCreateSlug loses the conditional UPDATE → the committed slug is re-read, entity untouched")
+    void should_reReadCommittedSlug_when_internalIssueUpdateMatchesNothing() {
+        UUID masterId = UUID.randomUUID();
+        Master master = masterWithUser("Олена", "Коваль", null);
+        when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.existsByBookingSlug(anyString())).thenReturn(false);
+        when(masterRepository.assignBookingSlugIfAbsent(eq(masterId), anyString())).thenReturn(0);
+        when(masterRepository.findBookingSlugById(masterId)).thenReturn(Optional.of("olena-koval-win1"));
+
+        String slug = service.getOrCreateSlug(masterId);
+
+        assertThat(slug).isEqualTo("olena-koval-win1");
+        assertThat(master.getBookingSlug()).isNull();
     }
 
     @Test
@@ -206,14 +238,15 @@ class BookingSlugServiceTest {
     // ── getOrIssueSlugRaceSafe — phase 375 lazy issue on /booking-links/mine ──
 
     @Test
-    @DisplayName("race-safe issue, slug already present → returned, no UPDATE")
+    @DisplayName("race-safe issue, slug already present → returned, no read, no UPDATE")
     void should_returnExistingSlugWithoutWriting_when_raceSafeIssueAndSlugPresent() {
         Master master = masterWithSlug("anna-existing-ab12");
 
-        String slug = service.getOrIssueSlugRaceSafe(master);
+        Optional<String> slug = service.getOrIssueSlugRaceSafe(master);
 
-        assertThat(slug).isEqualTo("anna-existing-ab12");
-        verify(masterRepository, never()).assignBookingSlugIfAbsent(any(), anyString());
+        assertThat(slug).contains("anna-existing-ab12");
+        verify(masterRepository, never()).findBookingLinkStateById(any());
+        verify(masterRepository, never()).assignShareSlugIfAbsentAndNotRevoked(any(), anyString());
     }
 
     @Test
@@ -221,14 +254,16 @@ class BookingSlugServiceTest {
     void should_returnGeneratedSlug_when_conditionalUpdateWins() {
         Master master = masterWithUser("Олена", "Коваль", null);
         setId(master, UUID.randomUUID());
+        when(masterRepository.findBookingLinkStateById(master.getId())).thenReturn(Optional.of(linkState(null, false)));
         when(masterRepository.existsByBookingSlug(anyString())).thenReturn(false);
-        when(masterRepository.assignBookingSlugIfAbsent(any(), anyString())).thenReturn(1);
+        when(masterRepository.assignShareSlugIfAbsentAndNotRevoked(any(), anyString())).thenReturn(1);
 
-        String slug = service.getOrIssueSlugRaceSafe(master);
+        Optional<String> slug = service.getOrIssueSlugRaceSafe(master);
 
-        assertThat(slug).matches("^olena-koval-[a-z0-9]{4}$");
-        verify(masterRepository).assignBookingSlugIfAbsent(master.getId(), slug);
-        verify(masterRepository, never()).findBookingSlugById(any());
+        assertThat(slug).hasValueSatisfying(s -> assertThat(s).matches("^olena-koval-[a-z0-9]{4}$"));
+        verify(masterRepository).assignShareSlugIfAbsentAndNotRevoked(master.getId(), slug.orElseThrow());
+        verify(masterRepository, times(1)).findBookingLinkStateById(any());
+        verify(masterRepository, never()).assignBookingSlugIfAbsent(any(), anyString());
     }
 
     @Test
@@ -236,27 +271,255 @@ class BookingSlugServiceTest {
     void should_reReadAndReturnStoredSlug_when_concurrentCallIssuedFirst() {
         Master master = masterWithUser("Олена", "Коваль", null);
         setId(master, UUID.randomUUID());
+        when(masterRepository.findBookingLinkStateById(master.getId()))
+                .thenReturn(Optional.of(linkState(null, false)), Optional.of(linkState("olena-koval-win1", false)));
         when(masterRepository.existsByBookingSlug(anyString())).thenReturn(false);
-        when(masterRepository.assignBookingSlugIfAbsent(any(), anyString())).thenReturn(0);
-        when(masterRepository.findBookingSlugById(master.getId())).thenReturn(Optional.of("olena-koval-win1"));
+        when(masterRepository.assignShareSlugIfAbsentAndNotRevoked(any(), anyString())).thenReturn(0);
 
-        String slug = service.getOrIssueSlugRaceSafe(master);
+        Optional<String> slug = service.getOrIssueSlugRaceSafe(master);
 
-        assertThat(slug).isEqualTo("olena-koval-win1");
+        assertThat(slug).contains("olena-koval-win1");
     }
 
     @Test
-    @DisplayName("race-safe issue, UPDATE matched nothing and row gone → NotFoundException")
+    @DisplayName("race-safe issue, slug issued concurrently BEFORE the state read → returned with no generation, no UPDATE")
+    void should_returnCommittedSlug_when_stateReadFindsSlug() {
+        Master master = masterWithUser("Олена", "Коваль", null);
+        setId(master, UUID.randomUUID());
+        when(masterRepository.findBookingLinkStateById(master.getId()))
+                .thenReturn(Optional.of(linkState("olena-koval-win1", false)));
+
+        Optional<String> slug = service.getOrIssueSlugRaceSafe(master);
+
+        assertThat(slug).contains("olena-koval-win1");
+        verify(masterRepository, never()).existsByBookingSlug(anyString());
+        verify(masterRepository, never()).assignShareSlugIfAbsentAndNotRevoked(any(), anyString());
+    }
+
+    @Test
+    @DisplayName("phase 378 D4: race-safe issue on a REVOKED link → empty, no generation, no write")
+    void should_returnEmptyWithoutWriting_when_linkRevoked() {
+        Master master = masterWithUser("Олена", "Коваль", null);
+        setId(master, UUID.randomUUID());
+        when(masterRepository.findBookingLinkStateById(master.getId())).thenReturn(Optional.of(linkState(null, true)));
+
+        Optional<String> slug = service.getOrIssueSlugRaceSafe(master);
+
+        assertThat(slug).isEmpty();
+        verify(masterRepository, never()).existsByBookingSlug(anyString());
+        verify(masterRepository, never()).assignShareSlugIfAbsentAndNotRevoked(any(), anyString());
+    }
+
+    @Test
+    @DisplayName("phase 378 D4: revoke committed between the state read and the UPDATE → UPDATE matches nothing, empty")
+    void should_returnEmpty_when_revokedBetweenReadAndUpdate() {
+        Master master = masterWithUser("Олена", "Коваль", null);
+        setId(master, UUID.randomUUID());
+        when(masterRepository.findBookingLinkStateById(master.getId()))
+                .thenReturn(Optional.of(linkState(null, false)), Optional.of(linkState(null, true)));
+        when(masterRepository.existsByBookingSlug(anyString())).thenReturn(false);
+        when(masterRepository.assignShareSlugIfAbsentAndNotRevoked(any(), anyString())).thenReturn(0);
+
+        Optional<String> slug = service.getOrIssueSlugRaceSafe(master);
+
+        assertThat(slug).isEmpty();
+    }
+
+    @Test
+    @DisplayName("race-safe issue, row gone → NotFoundException")
     void should_throwNotFound_when_raceSafeReReadFindsNoRow() {
         Master master = masterWithUser("Олена", "Коваль", null);
         setId(master, UUID.randomUUID());
-        when(masterRepository.existsByBookingSlug(anyString())).thenReturn(false);
-        when(masterRepository.assignBookingSlugIfAbsent(any(), anyString())).thenReturn(0);
-        when(masterRepository.findBookingSlugById(master.getId())).thenReturn(Optional.empty());
+        when(masterRepository.findBookingLinkStateById(master.getId())).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> service.getOrIssueSlugRaceSafe(master))
                 .isInstanceOf(NotFoundException.class)
                 .hasMessage("Master not found");
+    }
+
+    // ── phase 378 — retired-slug tombstones in both generators (D2/D3) ──────
+
+    @Test
+    @DisplayName("phase 378 D2: a tombstoned MASTER candidate is skipped; the next attempt is used")
+    void should_skipTombstonedMasterCandidate_when_generatingMasterSlug() {
+        doReturn("aaaa", "bbbb").when(slugSuffixSource).nextSuffix();
+        when(masterRepository.existsByBookingSlug(anyString())).thenReturn(false);
+        when(retiredBookingSlugRepository.existsByKindAndSlugHash(BookingLinkKind.MASTER, masterHash("olena-koval-aaaa"))).thenReturn(true);
+        when(retiredBookingSlugRepository.existsByKindAndSlugHash(BookingLinkKind.MASTER, masterHash("olena-koval-bbbb"))).thenReturn(false);
+
+        String slug = service.generateSlug("Олена", "Коваль");
+
+        assertThat(slug).isEqualTo("olena-koval-bbbb");
+    }
+
+    @Test
+    @DisplayName("phase 378 D2: the live probe runs BEFORE the tombstone probe (the race-free order)")
+    void should_probeLiveBeforeTombstone_when_generatingMasterSlug() {
+        doReturn("aaaa").when(slugSuffixSource).nextSuffix();
+        when(masterRepository.existsByBookingSlug("olena-koval-aaaa")).thenReturn(false);
+
+        service.generateSlug("Олена", "Коваль");
+
+        InOrder order = inOrder(masterRepository, retiredBookingSlugRepository);
+        order.verify(masterRepository).existsByBookingSlug("olena-koval-aaaa");
+        order.verify(retiredBookingSlugRepository).existsByKindAndSlugHash(BookingLinkKind.MASTER, masterHash("olena-koval-aaaa"));
+    }
+
+    @Test
+    @DisplayName("phase 378: all 5 MASTER candidates tombstoned → CONFLICT")
+    void should_throwConflict_when_everyMasterCandidateTombstoned() {
+        when(masterRepository.existsByBookingSlug(anyString())).thenReturn(false);
+        when(retiredBookingSlugRepository.existsByKindAndSlugHash(eq(BookingLinkKind.MASTER), anyString())).thenReturn(true);
+
+        assertThatThrownBy(() -> service.generateSlug("Олена", "Коваль"))
+                .isInstanceOf(BusinessException.class)
+                .hasMessage("Could not allocate a unique booking slug");
+        verify(retiredBookingSlugRepository, times(5)).existsByKindAndSlugHash(eq(BookingLinkKind.MASTER), anyString());
+    }
+
+    @Test
+    @DisplayName("phase 378 D3: a MASTER tombstone does not block an equal SALON slug (probe is SALON-kind only)")
+    void should_probeOnlySalonTombstones_when_generatingSalonSlug() {
+        doReturn("aaaa").when(slugSuffixSource).nextSuffix();
+        when(salonRepository.existsByBookingSlug("alfa-aaaa")).thenReturn(false);
+        when(retiredBookingSlugRepository.existsByKindAndSlugHash(BookingLinkKind.SALON, salonHash("alfa-aaaa"))).thenReturn(false);
+
+        String slug = service.generateSalonSlug("Alfa");
+
+        assertThat(slug).isEqualTo("alfa-aaaa");
+        verify(retiredBookingSlugRepository, never()).existsByKindAndSlugHash(eq(BookingLinkKind.MASTER), anyString());
+    }
+
+    @Test
+    @DisplayName("phase 378 D2: a tombstoned SALON candidate is skipped by the createSalon / regenerate generator")
+    void should_skipTombstonedSalonCandidate_when_generatingSalonSlug() {
+        doReturn("aaaa", "bbbb").when(slugSuffixSource).nextSuffix();
+        when(salonRepository.existsByBookingSlug(anyString())).thenReturn(false);
+        when(retiredBookingSlugRepository.existsByKindAndSlugHash(BookingLinkKind.SALON, salonHash("alfa-aaaa"))).thenReturn(true);
+        when(retiredBookingSlugRepository.existsByKindAndSlugHash(BookingLinkKind.SALON, salonHash("alfa-bbbb"))).thenReturn(false);
+
+        String slug = service.generateSalonSlug("Alfa");
+
+        assertThat(slug).isEqualTo("alfa-bbbb");
+    }
+
+    @Test
+    @DisplayName("phase 378 D2: a tombstoned SALON candidate is redrawn in the batched lazy issue")
+    void should_redrawTombstonedSalonCandidate_when_issuingBatch() {
+        UUID salonId = UUID.randomUUID();
+        doReturn("aaaa", "bbbb").when(slugSuffixSource).nextSuffix();
+        when(salonRepository.lockSalonIdsWithoutBookingSlug(anyCollection())).thenReturn(List.of(salonId));
+        when(salonRepository.findExistingBookingSlugs(anyCollection())).thenReturn(List.of());
+        when(retiredBookingSlugRepository.findRetiredSlugHashes(BookingLinkKind.SALON, List.of(salonHash("alfa-aaaa"))))
+                .thenReturn(List.of(salonHash("alfa-aaaa")));
+        when(retiredBookingSlugRepository.findRetiredSlugHashes(BookingLinkKind.SALON, List.of(salonHash("alfa-bbbb"))))
+                .thenReturn(List.of());
+
+        Map<UUID, String> slugs = service.issueMissingSalonSlugs(List.of(salonRow(salonId, "Alfa")));
+
+        assertThat(slugs).containsEntry(salonId, "alfa-bbbb");
+        verify(salonRepository).assignBookingSlugsIfAbsent(new UUID[] {salonId}, new String[] {"alfa-bbbb"});
+    }
+
+    @Test
+    @DisplayName("phase 378 D11c: regenerate generator locks each master candidate BEFORE probing it")
+    void should_lockCandidateBeforeProbing_when_generatingMasterSlugUnderLock() {
+        doReturn("aaaa").when(slugSuffixSource).nextSuffix();
+        when(masterRepository.existsByBookingSlug("olena-koval-aaaa")).thenReturn(false);
+
+        String slug = service.generateMasterSlugUnderLock("Олена", "Коваль", null);
+
+        assertThat(slug).isEqualTo("olena-koval-aaaa");
+        InOrder order = inOrder(salonRepository, masterRepository, retiredBookingSlugRepository);
+        order.verify(salonRepository).lockBookingSlugCandidates(new String[] {"olena-koval-aaaa"});
+        order.verify(masterRepository).existsByBookingSlug("olena-koval-aaaa");
+        order.verify(retiredBookingSlugRepository).existsByKindAndSlugHash(BookingLinkKind.MASTER, masterHash("olena-koval-aaaa"));
+    }
+
+    // ── 378 audit — hash-only tombstone probes (V205) + held-slug lock skip (perf INFO-4) ──────
+
+    /** Pinned independently (python hashlib) — also the preimage V205's SQL backfill computes. */
+    private static final String MASTER_HASH_OLENA_AAAA =
+            "301fa704cea692fb6d61181c3b8a49a578ebac65c741ec23591c8f256870f72e";
+
+    private static String masterHash(String slug) {
+        return RetiredSlugHasher.hash(BookingLinkKind.MASTER, slug);
+    }
+
+    private static String salonHash(String slug) {
+        return RetiredSlugHasher.hash(BookingLinkKind.SALON, slug);
+    }
+
+    @Test
+    @DisplayName("378 audit: the tombstone probe sends SHA-256(kind:slug) hex — never the slug itself")
+    void should_probeTombstoneByHash_when_generatingMasterSlug() {
+        doReturn("aaaa").when(slugSuffixSource).nextSuffix();
+        when(masterRepository.existsByBookingSlug("olena-koval-aaaa")).thenReturn(false);
+        ArgumentCaptor<String> probed = ArgumentCaptor.forClass(String.class);
+
+        service.generateSlug("Олена", "Коваль");
+
+        verify(retiredBookingSlugRepository).existsByKindAndSlugHash(eq(BookingLinkKind.MASTER), probed.capture());
+        assertThat(probed.getValue())
+                .isEqualTo(MASTER_HASH_OLENA_AAAA)
+                .doesNotContain("olena");
+    }
+
+    @Test
+    @DisplayName("378 audit: the batched salon probe sends hashes and maps the retired ones back to candidates")
+    void should_probeTombstonesByHash_when_issuingSalonBatch() {
+        UUID salonId = UUID.randomUUID();
+        doReturn("aaaa", "bbbb").when(slugSuffixSource).nextSuffix();
+        when(salonRepository.lockSalonIdsWithoutBookingSlug(anyCollection())).thenReturn(List.of(salonId));
+        when(salonRepository.findExistingBookingSlugs(anyCollection())).thenReturn(List.of());
+        when(retiredBookingSlugRepository.findRetiredSlugHashes(eq(BookingLinkKind.SALON), anyCollection()))
+                .thenReturn(List.of(salonHash("alfa-aaaa")), List.of());
+
+        service.issueMissingSalonSlugs(List.of(salonRow(salonId, "Alfa")));
+
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<Collection<String>> probed = ArgumentCaptor.forClass(Collection.class);
+        verify(retiredBookingSlugRepository, times(2)).findRetiredSlugHashes(eq(BookingLinkKind.SALON), probed.capture());
+        assertThat(probed.getAllValues()).containsExactly(
+                List.of(salonHash("alfa-aaaa")), List.of(salonHash("alfa-bbbb")));
+    }
+
+    @Test
+    @DisplayName("378 audit: kind is part of the hash preimage (D3 namespaces) and the output is 64 lower-hex chars")
+    void should_hashPerKind_when_sameSlugInBothNamespaces() {
+        String master = masterHash("olena-koval-aaaa");
+        String salon = salonHash("olena-koval-aaaa");
+
+        assertThat(master).isEqualTo(MASTER_HASH_OLENA_AAAA).matches("^[0-9a-f]{64}$");
+        assertThat(salon).isEqualTo("09ea730bcc5614be7900cb5c3d64c2ddaef15d17fb9b860eefeafac7570733ff");
+    }
+
+    @Test
+    @DisplayName("378 audit INFO-4: a master candidate equal to the held (current) slug is not locked again")
+    void should_skipLockingCandidate_when_candidateEqualsHeldSlug() {
+        doReturn("aaaa", "bbbb").when(slugSuffixSource).nextSuffix();
+        when(masterRepository.existsByBookingSlug("olena-koval-aaaa")).thenReturn(true);
+        when(masterRepository.existsByBookingSlug("olena-koval-bbbb")).thenReturn(false);
+
+        String slug = service.generateMasterSlugUnderLock("Олена", "Коваль", "olena-koval-aaaa");
+
+        assertThat(slug).isEqualTo("olena-koval-bbbb");
+        verify(salonRepository, never()).lockBookingSlugCandidates(new String[] {"olena-koval-aaaa"});
+        verify(salonRepository).lockBookingSlugCandidates(new String[] {"olena-koval-bbbb"});
+    }
+
+    @Test
+    @DisplayName("378 audit INFO-4: a salon candidate equal to the held (current) slug is not locked again")
+    void should_skipLockingSalonCandidate_when_candidateEqualsHeldSlug() {
+        doReturn("aaaa", "bbbb").when(slugSuffixSource).nextSuffix();
+        when(salonRepository.existsByBookingSlug("alfa-aaaa")).thenReturn(true);
+        when(salonRepository.existsByBookingSlug("alfa-bbbb")).thenReturn(false);
+
+        String slug = service.generateSalonSlug("Alfa", "alfa-aaaa");
+
+        assertThat(slug).isEqualTo("alfa-bbbb");
+        verify(salonRepository, never()).lockBookingSlugCandidates(new String[] {"alfa-aaaa"});
+        verify(salonRepository).lockBookingSlugCandidates(new String[] {"alfa-bbbb"});
     }
 
     // ── phase 376 — salon slugs (shared generator, salon namespace) ────────
@@ -326,6 +589,14 @@ class BookingSlugServiceTest {
             @Override public UUID getId() { return id; }
             @Override public String getName() { return name; }
             @Override public String getBookingSlug() { return null; }
+            @Override public Boolean getRevoked() { return false; }
+        };
+    }
+
+    private static MasterRepository.BookingLinkState linkState(String slug, boolean revoked) {
+        return new MasterRepository.BookingLinkState() {
+            @Override public String getBookingSlug() { return slug; }
+            @Override public Boolean getRevoked() { return revoked; }
         };
     }
 
@@ -821,9 +1092,7 @@ class BookingSlugServiceTest {
     // ── fixtures ──────────────────────────────────────────────────────────────
 
     private static Master masterWithSlug(String slug) {
-        Master m = new Master();
-        m.setBookingSlug(slug);
-        return m;
+        return Master.builder().bookingSlug(slug).build();
     }
 
     private static Master masterWithUser(String first, String last, String slug) {
@@ -831,10 +1100,7 @@ class BookingSlugServiceTest {
                 com.beautica.auth.Role.INDEPENDENT_MASTER, first, last, "+380671234567");
         user.setAvatarUrl("https://cdn.example/a.jpg");
         user.setBio("bio");
-        Master m = new Master();
-        m.setUser(user);
-        m.setBookingSlug(slug);
-        return m;
+        return Master.builder().user(user).bookingSlug(slug).build();
     }
 
     private static void setId(Master m, UUID id) {

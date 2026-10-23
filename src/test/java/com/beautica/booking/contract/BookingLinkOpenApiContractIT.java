@@ -54,7 +54,7 @@ class BookingLinkOpenApiContractIT extends AbstractIntegrationTest {
                 .containsExactlyInAnyOrder("shareEnabled", "links");
         JsonNode link = schemas.path("BookingLinkResponse");
         assertThat(texts(link.path("required")))
-                .containsExactlyInAnyOrder("kind", "slug", "url", "displayName", "bookable");
+                .containsExactlyInAnyOrder("kind", "status", "slug", "url", "displayName", "bookable");
         assertThat(texts(link.path("properties").path("salonId").path("type")))
                 .containsExactlyInAnyOrder("string", "null");
         assertThat(texts(link.path("properties").path("kind").path("enum")))
@@ -182,5 +182,36 @@ class BookingLinkOpenApiContractIT extends AbstractIntegrationTest {
                 .contains("GUEST").contains("DETAIL").contains("registered");
         assertThat(texts(spec().path("components").path("schemas").path("BookingDetailResponse").path("required")))
                 .doesNotContain("guestPhone");
+    }
+
+    @Test
+    @DisplayName("phase 378: four regenerate/revoke operations, status enum, nullable slug/url, nullable currentSlug body, 409/429 documented")
+    void should_exposeRegenerateRevokeOperations_when_specRendered() throws Exception {
+        JsonNode spec = spec();
+        JsonNode paths = spec.path("paths");
+        JsonNode schemas = spec.path("components").path("schemas");
+
+        assertThat(paths.path("/api/v1/booking-links/master/regenerate").has("post")).isTrue();
+        assertThat(paths.path("/api/v1/booking-links/master").has("delete")).isTrue();
+        assertThat(paths.path("/api/v1/booking-links/salons/{salonId}/regenerate").has("post")).isTrue();
+        assertThat(paths.path("/api/v1/booking-links/salons/{salonId}").has("delete")).isTrue();
+        JsonNode regenerate = paths.path("/api/v1/booking-links/master/regenerate").path("post");
+        assertThat(texts(fieldNames(regenerate.path("responses"))))
+                .contains("200", "400", "401", "403", "404", "409", "429");
+        JsonNode link = schemas.path("BookingLinkResponse");
+        assertThat(texts(link.path("properties").path("status").path("enum"))).containsExactlyInAnyOrder("ACTIVE", "REVOKED");
+        for (String nullable : List.of("slug", "url")) {
+            assertThat(texts(link.path("properties").path(nullable).path("type")))
+                    .as(nullable).containsExactlyInAnyOrder("string", "null");
+        }
+        JsonNode request = schemas.path("BookingLinkMutationRequest");
+        assertThat(texts(request.path("properties").path("currentSlug").path("type"))).contains("null");
+        assertThat(texts(request.path("required"))).doesNotContain("currentSlug");
+    }
+
+    private static JsonNode fieldNames(JsonNode node) {
+        com.fasterxml.jackson.databind.node.ArrayNode names = new ObjectMapper().createArrayNode();
+        node.fieldNames().forEachRemaining(names::add);
+        return names;
     }
 }

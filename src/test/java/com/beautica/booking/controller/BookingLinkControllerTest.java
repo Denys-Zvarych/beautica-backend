@@ -6,6 +6,8 @@ import com.beautica.auth.Role;
 import com.beautica.booking.dto.BookingLinkKind;
 import com.beautica.booking.dto.BookingLinkResponse;
 import com.beautica.booking.dto.BookingLinksResponse;
+import com.beautica.booking.dto.BookingLinkStatus;
+import com.beautica.booking.service.BookingLinkRetirementService;
 import com.beautica.booking.service.BookingLinkService;
 import com.beautica.config.WebMvcTestSupport;
 import jakarta.servlet.http.HttpServletResponse;
@@ -41,7 +43,9 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.authentication;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
@@ -82,11 +86,14 @@ class BookingLinkControllerTest {
     private BookingLinkService bookingLinkService;
 
     @MockBean
+    private BookingLinkRetirementService bookingLinkRetirementService;
+
+    @MockBean
     private JwtTokenProvider jwtTokenProvider;
 
     @BeforeEach
     void resetMocks() {
-        Mockito.reset(bookingLinkService);
+        Mockito.reset(bookingLinkService, bookingLinkRetirementService);
     }
 
     private static RequestPostProcessor as(Role role) {
@@ -180,5 +187,145 @@ class BookingLinkControllerTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.data.shareEnabled").value(false))
                 .andExpect(jsonPath("$.data.links").isEmpty());
+    }
+
+    // ── phase 378 — regenerate / revoke ──────────────────────────────────────────────────────
+
+    private static final UUID SALON_ID = UUID.fromString("aaaaaaaa-0000-0000-0000-000000000001");
+    private static final String BODY = "{\"currentSlug\":\"olena-koval-x7k2\"}";
+    private static final String MASTER_REGENERATE = "/api/v1/booking-links/master/regenerate";
+    private static final String MASTER_REVOKE = "/api/v1/booking-links/master";
+    private static final String SALON_REGENERATE = "/api/v1/booking-links/salons/" + SALON_ID + "/regenerate";
+    private static final String SALON_REVOKE = "/api/v1/booking-links/salons/" + SALON_ID;
+
+    private static org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder json(
+            org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder builder, String body) {
+        return builder.contentType(org.springframework.http.MediaType.APPLICATION_JSON).content(body);
+    }
+
+    @Test
+    @DisplayName("378: POST /master/regenerate as INDEPENDENT_MASTER → 200 with the new ACTIVE link; caller id + currentSlug passed")
+    void should_return200WithNewLink_when_independentMasterRegenerates() throws Exception {
+        when(bookingLinkRetirementService.regenerateMaster(CALLER_ID, "olena-koval-x7k2")).thenReturn(
+                new BookingLinkResponse(BookingLinkKind.MASTER, "olena-koval-p3qd",
+                        "https://beautica.app/book/olena-koval-p3qd", "Олена Коваль", null, true));
+
+        mockMvc.perform(json(post(MASTER_REGENERATE), BODY).with(as(Role.INDEPENDENT_MASTER)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.kind").value("MASTER"))
+                .andExpect(jsonPath("$.data.status").value("ACTIVE"))
+                .andExpect(jsonPath("$.data.slug").value("olena-koval-p3qd"))
+                .andExpect(jsonPath("$.data.url").value("https://beautica.app/book/olena-koval-p3qd"))
+                .andExpect(jsonPath("$.data.bookable").value(true));
+    }
+
+    @Test
+    @DisplayName("378: DELETE /master as INDEPENDENT_MASTER with currentSlug null → 200 REVOKED, slug/url null")
+    void should_return200Revoked_when_independentMasterRevokes() throws Exception {
+        when(bookingLinkRetirementService.revokeMaster(CALLER_ID, null))
+                .thenReturn(BookingLinkResponse.revoked(BookingLinkKind.MASTER, "Олена Коваль", null));
+
+        mockMvc.perform(json(delete(MASTER_REVOKE), "{\"currentSlug\":null}").with(as(Role.INDEPENDENT_MASTER)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.status").value(BookingLinkStatus.REVOKED.name()))
+                .andExpect(jsonPath("$.data.slug").isEmpty())
+                .andExpect(jsonPath("$.data.url").isEmpty())
+                .andExpect(jsonPath("$.data.bookable").value(false));
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = Role.class, names = {"SALON_OWNER", "SALON_ADMIN"})
+    @DisplayName("378: salon regenerate + revoke as SALON_OWNER / SALON_ADMIN → 200; role + salon id passed to the service")
+    void should_return200_when_salonRoleMutatesSalonLink(Role role) throws Exception {
+        when(bookingLinkRetirementService.regenerateSalon(CALLER_ID, role, SALON_ID, "olena-koval-x7k2")).thenReturn(
+                new BookingLinkResponse(BookingLinkKind.SALON, "alfa-p3qd", "https://beautica.app/book/s/alfa-p3qd",
+                        "Alfa", SALON_ID, false));
+        when(bookingLinkRetirementService.revokeSalon(CALLER_ID, role, SALON_ID, "olena-koval-x7k2"))
+                .thenReturn(BookingLinkResponse.revoked(BookingLinkKind.SALON, "Alfa", SALON_ID));
+
+        mockMvc.perform(json(post(SALON_REGENERATE), BODY).with(as(role)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.salonId").value(SALON_ID.toString()))
+                .andExpect(jsonPath("$.data.slug").value("alfa-p3qd"));
+        mockMvc.perform(json(delete(SALON_REVOKE), BODY).with(as(role)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.status").value("REVOKED"));
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = Role.class, names = {"SALON_OWNER", "SALON_ADMIN", "SALON_MASTER", "CLIENT"})
+    @DisplayName("378: MASTER routes for every non-INDEPENDENT_MASTER role (owner has no personal link) → 403, service never called")
+    void should_return403_when_nonIndependentMasterHitsMasterRoutes(Role role) throws Exception {
+        mockMvc.perform(json(post(MASTER_REGENERATE), BODY).with(as(role))).andExpect(status().isForbidden());
+        mockMvc.perform(json(delete(MASTER_REVOKE), BODY).with(as(role))).andExpect(status().isForbidden());
+
+        Mockito.verifyNoInteractions(bookingLinkRetirementService);
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = Role.class, names = {"INDEPENDENT_MASTER", "SALON_MASTER", "CLIENT"})
+    @DisplayName("378: SALON routes for INDEPENDENT_MASTER / SALON_MASTER / CLIENT → 403, service never called")
+    void should_return403_when_nonSalonManagerHitsSalonRoutes(Role role) throws Exception {
+        mockMvc.perform(json(post(SALON_REGENERATE), BODY).with(as(role))).andExpect(status().isForbidden());
+        mockMvc.perform(json(delete(SALON_REVOKE), BODY).with(as(role))).andExpect(status().isForbidden());
+
+        Mockito.verifyNoInteractions(bookingLinkRetirementService);
+    }
+
+    @Test
+    @DisplayName("378: all four routes anonymous → 401")
+    void should_return401_when_anonymousMutation() throws Exception {
+        mockMvc.perform(json(post(MASTER_REGENERATE), BODY)).andExpect(status().isUnauthorized());
+        mockMvc.perform(json(delete(MASTER_REVOKE), BODY)).andExpect(status().isUnauthorized());
+        mockMvc.perform(json(post(SALON_REGENERATE), BODY)).andExpect(status().isUnauthorized());
+        mockMvc.perform(json(delete(SALON_REVOKE), BODY)).andExpect(status().isUnauthorized());
+
+        Mockito.verifyNoInteractions(bookingLinkRetirementService);
+    }
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {
+            "{\"currentSlug\":\" olena-koval-x7k2\"}", "{\"currentSlug\":\"Olena-Koval\"}",
+            "{\"currentSlug\":\"../etc\"}", "{\"currentSlug\":\"-a\"}",
+            "{\"currentSlug\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}"})
+    @DisplayName("378: malformed currentSlug (space, uppercase, path chars, leading hyphen, 61 chars) → 400, service never called")
+    void should_return400_when_currentSlugMalformed(String body) throws Exception {
+        mockMvc.perform(json(post(MASTER_REGENERATE), body).with(as(Role.INDEPENDENT_MASTER)))
+                .andExpect(status().isBadRequest());
+        mockMvc.perform(json(delete(SALON_REVOKE), body).with(as(Role.SALON_OWNER)))
+                .andExpect(status().isBadRequest());
+
+        Mockito.verifyNoInteractions(bookingLinkRetirementService);
+    }
+
+    @Test
+    @DisplayName("QA 378: currentSlug of exactly 60 chars (the column length, @Size max) → accepted and passed to the service")
+    void should_acceptCurrentSlug_when_exactlySixtyChars() throws Exception {
+        String sixty = "a".repeat(60);
+        when(bookingLinkRetirementService.revokeMaster(CALLER_ID, sixty))
+                .thenReturn(BookingLinkResponse.revoked(BookingLinkKind.MASTER, "Олена Коваль", null));
+
+        mockMvc.perform(json(delete(MASTER_REVOKE), "{\"currentSlug\":\"" + sixty + "\"}").with(as(Role.INDEPENDENT_MASTER)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.status").value("REVOKED"));
+
+        Mockito.verify(bookingLinkRetirementService).revokeMaster(CALLER_ID, sixty);
+    }
+
+    @Test
+    @DisplayName("378: missing body → 400")
+    void should_return400_when_bodyMissing() throws Exception {
+        mockMvc.perform(post(MASTER_REGENERATE).with(as(Role.INDEPENDENT_MASTER))).andExpect(status().isBadRequest());
+
+        Mockito.verifyNoInteractions(bookingLinkRetirementService);
+    }
+
+    @Test
+    @DisplayName("378: non-UUID salon id → 400, service never called")
+    void should_return400_when_salonIdNotUuid() throws Exception {
+        mockMvc.perform(json(post("/api/v1/booking-links/salons/not-a-uuid/regenerate"), BODY).with(as(Role.SALON_OWNER)))
+                .andExpect(status().isBadRequest());
+
+        Mockito.verifyNoInteractions(bookingLinkRetirementService);
     }
 }

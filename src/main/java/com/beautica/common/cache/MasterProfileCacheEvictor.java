@@ -99,6 +99,17 @@ public class MasterProfileCacheEvictor {
     }
 
     /**
+     * Phase 378 audit (perf LOW-2) — batched no-lookup form: evicts the {@code booking-slug-info} entries of
+     * already-known {@code slugs} after commit. {@code null} or empty is a no-op.
+     */
+    public void evictBookingSlugInfoBySlugsAfterCommit(Collection<String> slugs) {
+        if (slugs == null || slugs.isEmpty()) {
+            return;
+        }
+        registerSlugEviction(List.copyOf(slugs));
+    }
+
+    /**
      * Phase 384 D5 — drops the public SALON booking page ({@code salon-booking-slug-info}) of {@code salonId} after
      * commit (immediately outside a transaction): the page now carries the salon's portfolio and reviews header,
      * so salon photo uploads/deletes call this. Delegates to {@link SalonBookingInfoCacheEvictor} — the one salon

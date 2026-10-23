@@ -58,7 +58,11 @@ import java.util.UUID;
  *
  * <p><b>Lazy slug (D3/D4).</b> A legacy master whose {@code booking_slug} is still {@code NULL} gets
  * one here, via {@link BookingSlugService#getOrIssueSlugRaceSafe} (the existing generator, guarded
- * against two concurrent first calls). Once issued it never changes.
+ * against two concurrent first calls). Once issued it never changes on rename; it changes only by an
+ * explicit regenerate / revoke ({@link BookingLinkRetirementService}, phase 378).
+ *
+ * <p><b>Revoked links (phase 378 D4/D15).</b> A master or salon whose owner revoked the link is listed
+ * with {@code status = REVOKED} and no slug — and is never silently re-issued here.
  *
  * <p><b>{@code bookable} (D7/D8).</b> The conjunction of the two existing rules, never a new copy:
  * {@link MasterBookability#isBookable} (active master, open salon — what {@code /book/{slug}} pages
@@ -110,14 +114,20 @@ public class BookingLinkService {
     }
 
     private BookingLinkResponse toMasterLink(Master master) {
-        String slug = issueSlug(master);
-        return new BookingLinkResponse(
-                BookingLinkKind.MASTER,
-                slug,
-                urlFor(slug),
-                BookingSlugService.composeName(master.displayFirstName(), master.displayLastName()),
-                null,
-                isBookable(master));
+        return masterLinkWith(master, issueSlug(master).orElse(null));
+    }
+
+    /**
+     * The MASTER link of {@code master} carrying {@code slug} — ACTIVE, or REVOKED when {@code slug} is
+     * {@code null} (phase 378 D15: no url, never bookable, no bookability read). Shared with
+     * {@link BookingLinkRetirementService} so a mutation answers in exactly the {@code /mine} shape.
+     */
+    BookingLinkResponse masterLinkWith(Master master, String slug) {
+        String displayName = BookingSlugService.composeName(master.displayFirstName(), master.displayLastName());
+        if (slug == null) {
+            return BookingLinkResponse.revoked(BookingLinkKind.MASTER, displayName, null);
+        }
+        return new BookingLinkResponse(BookingLinkKind.MASTER, slug, urlFor(slug), displayName, null, isBookable(master));
     }
 
     /**
@@ -127,10 +137,15 @@ public class BookingLinkService {
      * outside any transaction, so the retry is a fresh transaction with a fresh candidate (the detached
      * {@code master} still carries {@code booking_slug = null}). A second violation propagates.
      */
-    private String issueSlug(Master master) {
+    private Optional<String> issueSlug(Master master) {
         if (master.getBookingSlug() != null) {
             // Steady state: the slug came with the read — no transaction, no connection checkout.
-            return master.getBookingSlug();
+            return Optional.of(master.getBookingSlug());
+        }
+        if (master.isBookingLinkRevoked()) {
+            // Phase 378 audit (perf LOW-1): a revoked link came with the read — answer REVOKED without the
+            // issue transaction and its state re-read (that path would return empty for it too, D4).
+            return Optional.empty();
         }
         try {
             return bookingSlugService.getOrIssueSlugRaceSafe(master);
@@ -165,16 +180,25 @@ public class BookingLinkService {
                 salons.stream().map(SalonBookingLinkRow::getId).toList(), scheduleDateMath.today()));
         Map<UUID, String> slugs = salonSlugs(salons);
         // 376 audit cycle 2: a salon deleted between the read above and the lazy issue has no slug — its
-        // link is omitted instead of failing the whole response with 404.
+        // link is omitted instead of failing the whole response with 404. Phase 378 D15: a REVOKED salon
+        // keeps its place in the (name-ordered) list, with no slug.
         return salons.stream()
-                .filter(salon -> slugs.containsKey(salon.getId()))
-                .map(salon -> toSalonLink(salon, slugs.get(salon.getId()), bookable.contains(salon.getId())))
+                .filter(salon -> salon.revoked() || slugs.containsKey(salon.getId()))
+                .map(salon -> salon.revoked()
+                        ? BookingLinkResponse.revoked(BookingLinkKind.SALON, salon.getName(), salon.getId())
+                        : salonLinkWith(salon.getId(), salon.getName(), slugs.get(salon.getId()),
+                                bookable.contains(salon.getId())))
                 .toList();
     }
 
-    private BookingLinkResponse toSalonLink(SalonBookingLinkRow salon, String slug, boolean bookable) {
-        return new BookingLinkResponse(
-                BookingLinkKind.SALON, slug, salonUrlFor(slug), salon.getName(), salon.getId(), bookable);
+    /** An ACTIVE SALON link — shared with {@link BookingLinkRetirementService}. */
+    BookingLinkResponse salonLinkWith(UUID salonId, String name, String slug, boolean bookable) {
+        return new BookingLinkResponse(BookingLinkKind.SALON, slug, salonUrlFor(slug), name, salonId, bookable);
+    }
+
+    /** {@code bookable} of ONE salon — the same single shared predicate as the {@code /mine} batch read. */
+    boolean isSalonBookable(UUID salonId) {
+        return !salonRepository.findBookableSalonIds(List.of(salonId), scheduleDateMath.today()).isEmpty();
     }
 
     /** Stored slugs as read (steady state: nothing further); the legacy ones issued together. */
@@ -184,7 +208,8 @@ public class BookingLinkService {
         for (SalonBookingLinkRow salon : salons) {
             if (salon.getBookingSlug() != null) {
                 slugs.put(salon.getId(), salon.getBookingSlug());
-            } else {
+            } else if (!salon.revoked()) {
+                // Phase 378 D4: a revoked salon is never re-issued on the share path.
                 missing.add(salon);
             }
         }
@@ -211,7 +236,7 @@ public class BookingLinkService {
         return bookingLinksProperties.getWebBaseUrl() + SALON_BOOK_PATH + slug;
     }
 
-    private boolean isBookable(Master master) {
+    boolean isBookable(Master master) {
         return MasterBookability.isBookable(master)
                 && masterRepository.findSearchBookability(List.of(master.getId()), scheduleDateMath.today())
                         .stream()

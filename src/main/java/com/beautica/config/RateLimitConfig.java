@@ -645,6 +645,19 @@ public class RateLimitConfig {
 
     private static final Duration SELF_DELETE_WINDOW = Duration.ofMinutes(60);
 
+    /**
+     * Phase 378 D10 — per-USER cap shared by the four booking-link mutations
+     * ({@code POST /api/v1/booking-links/master/regenerate}, {@code DELETE /api/v1/booking-links/master},
+     * {@code POST /api/v1/booking-links/salons/{salonId}/regenerate},
+     * {@code DELETE /api/v1/booking-links/salons/{salonId}}), consumed by {@link BookingRateLimitFilter}.
+     * Each successful regenerate burns a slug forever (tombstone) — the cap bounds tombstone flooding and
+     * slug-space burn; legitimate use is a few times a year. Configurable so tests can pin it.
+     */
+    @Value("${app.rate-limit.booking-link-mutation-capacity:10}")
+    private long bookingLinkMutationCapacity;
+
+    private static final Duration BOOKING_LINK_MUTATION_WINDOW = Duration.ofHours(1);
+
     // Per-user cap for PUT /api/v1/masters/{masterId}/overrides/{date} (the schedule-override
     // write). Own bucket, deliberately NOT shared with bookingDeclineBuckets above (2026-07-26
     // product decision reversal, D6 — see that field's javadoc for why the two used to be one
@@ -1223,6 +1236,20 @@ public class RateLimitConfig {
     }
 
     /**
+     * Per-user bucket (see {@link #bookingLinkMutationCapacity} field javadoc) for the four phase-378
+     * booking-link mutations, consumed by {@link BookingRateLimitFilter}'s flat one-token-per-request entry
+     * charge. {@code expireAfterAccess} gives a 5-minute grace past the 1-hour window.
+     */
+    @Bean
+    public LoadingCache<String, Bucket> bookingLinkMutationBuckets() {
+        return bucketCache(
+                DEFAULT_BUCKET_CACHE_SIZE,
+                BOOKING_LINK_MUTATION_WINDOW.plus(EVICTION_GRACE),
+                bookingLinkMutationCapacity,
+                BOOKING_LINK_MUTATION_WINDOW);
+    }
+
+    /**
      * Per-user bucket (see {@link #scheduleOverrideWriteCapacity} field javadoc) for
      * {@code PUT /api/v1/masters/{masterId}/overrides/{date}}, consumed by
      * {@link com.beautica.booking.filter.BookingRateLimitFilter}'s flat one-token-per-request entry
@@ -1285,7 +1312,8 @@ public class RateLimitConfig {
                 bookingWriteBuckets(), bookingDeclineBuckets(), scheduleOverrideWriteBuckets(),
                 staffBookingSmsBuckets(), selfDeleteBuckets(), salonMasterServicesReadBuckets(),
                 salonBoardReadBuckets(), notificationFeedBuckets(), catalogueBrowsePrincipalBuckets(),
-                catalogueBrowseBuckets(), catalogueBrowseAuthenticatedIpBuckets(), objectMapper);
+                catalogueBrowseBuckets(), catalogueBrowseAuthenticatedIpBuckets(), bookingLinkMutationBuckets(),
+                objectMapper);
     }
 
     /**
