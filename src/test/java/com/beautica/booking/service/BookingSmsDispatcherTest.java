@@ -4,6 +4,7 @@ import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
+import com.beautica.notification.sms.SmsBackpressureException;
 import com.beautica.notification.sms.SmsDeliveryException;
 import com.beautica.notification.sms.SmsService;
 import org.junit.jupiter.api.AfterEach;
@@ -16,13 +17,17 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.core.task.SyncTaskExecutor;
 import org.springframework.core.task.TaskExecutor;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
@@ -60,6 +65,8 @@ class BookingSmsDispatcherTest {
 
     private static final BookingSmsDispatcher.Kind KIND =
             BookingSmsDispatcher.Kind.WALK_IN_CONFIRMATION;
+    private static final BookingSmsDispatcher.Kind GUEST_KIND =
+            BookingSmsDispatcher.Kind.GUEST_PROVIDER_CANCELLATION;
     private static final String PHONE = "+380501234567";
     private static final String TEXT = "Beautica: Запис підтверджено!";
 
@@ -160,6 +167,131 @@ class BookingSmsDispatcherTest {
                 .as("the drop line must carry no recipient and no rendered body (Anti-Bug §I)")
                 .noneMatch(event -> event.getFormattedMessage().contains(PHONE)
                         || event.getFormattedMessage().contains(TEXT));
+    }
+
+    @Test
+    @DisplayName("should_rethrowTheRejection_when_dispatchOrThrowAndExecutorSaturated")
+    void should_rethrowTheRejection_when_dispatchOrThrowAndExecutorSaturated() {
+        TaskExecutor saturated = task -> {
+            throw new RejectedExecutionException("smsSendExecutor is full");
+        };
+        BookingSmsDispatcher dispatcher = new BookingSmsDispatcher(smsService, saturated);
+
+        // The outbox drain needs the rejection to re-queue the row; swallowing it would mark it SENT.
+        assertThatThrownBy(() -> dispatcher.dispatchOrThrow(GUEST_KIND, PHONE, TEXT))
+                .isInstanceOf(SmsBackpressureException.class)
+                .hasCauseInstanceOf(RejectedExecutionException.class);
+
+        verifyNoInteractions(smsService);
+        assertThat(appender.list)
+                .anySatisfy(event -> assertThat(event.getFormattedMessage())
+                        .contains("event=booking_sms_deferred")
+                        .contains("kind=guest_provider_cancellation"))
+                .noneMatch(event -> event.getFormattedMessage().contains(PHONE)
+                        || event.getFormattedMessage().contains(TEXT));
+    }
+
+    @Test
+    @DisplayName("should_submitAndSwallowProviderFailure_when_dispatchOrThrowAccepted")
+    void should_submitAndSwallowProviderFailure_when_dispatchOrThrowAccepted() {
+        doThrow(new SmsDeliveryException("provider down")).when(smsService).send(anyString(), anyString());
+        RecordingExecutor executor = new RecordingExecutor();
+        BookingSmsDispatcher dispatcher = new BookingSmsDispatcher(smsService, executor);
+
+        dispatcher.dispatchOrThrow(GUEST_KIND, PHONE, TEXT);
+
+        assertThat(executor.submitted).hasSize(1);
+        verifyNoInteractions(smsService);
+        assertThatCode(() -> executor.submitted.get(0).run()).doesNotThrowAnyException();
+        verify(smsService).send(eq(PHONE), eq(TEXT));
+    }
+
+    // ── Phase 390 perf LOW-2: request-path reserve on the shared queue ────────
+
+    @Test
+    @DisplayName("should_refuseOutboxSms_when_freeQueueSlotsBelowRequestPathReserve")
+    void should_refuseOutboxSms_when_freeQueueSlotsBelowRequestPathReserve() throws Exception {
+        CountDownLatch release = new CountDownLatch(1);
+        ThreadPoolTaskExecutor pool = blockedPool(release, BookingSmsDispatcher.OUTBOX_QUEUE_RESERVE - 1);
+        try {
+            BookingSmsDispatcher dispatcher = new BookingSmsDispatcher(smsService, pool);
+
+            assertThatThrownBy(() -> dispatcher.dispatchOrThrow(GUEST_KIND, PHONE, TEXT))
+                    .isInstanceOf(SmsBackpressureException.class);
+
+            assertThat(pool.getThreadPoolExecutor().getQueue()).as("nothing queued into the reserve").isEmpty();
+            assertThat(appender.list).anySatisfy(event -> assertThat(event.getFormattedMessage())
+                    .contains("event=booking_sms_deferred").contains("reason=request_path_reserve"));
+        } finally {
+            release.countDown();
+            pool.shutdown();
+        }
+        verifyNoInteractions(smsService);
+    }
+
+    @Test
+    @DisplayName("should_acceptOutboxSms_when_freeQueueSlotsEqualTheReserve")
+    void should_acceptOutboxSms_when_freeQueueSlotsEqualTheReserve() throws Exception {
+        CountDownLatch release = new CountDownLatch(1);
+        ThreadPoolTaskExecutor pool = blockedPool(release, BookingSmsDispatcher.OUTBOX_QUEUE_RESERVE);
+        try {
+            BookingSmsDispatcher dispatcher = new BookingSmsDispatcher(smsService, pool);
+
+            dispatcher.dispatchOrThrow(GUEST_KIND, PHONE, TEXT);
+
+            assertThat(pool.getThreadPoolExecutor().getQueue()).hasSize(1);
+        } finally {
+            release.countDown();
+            pool.shutdown();
+        }
+        verify(smsService).send(eq(PHONE), eq(TEXT));
+    }
+
+    @Test
+    @DisplayName("should_useFullQueueCapacity_when_requestPathDispatchInsideTheReserve")
+    void should_useFullQueueCapacity_when_requestPathDispatchInsideTheReserve() throws Exception {
+        CountDownLatch release = new CountDownLatch(1);
+        // One free slot left: deep inside the reserve, still above zero.
+        ThreadPoolTaskExecutor pool = blockedPool(release, 1);
+        try {
+            BookingSmsDispatcher dispatcher = new BookingSmsDispatcher(smsService, pool);
+
+            dispatcher.dispatch(KIND, PHONE, TEXT);
+
+            assertThat(pool.getThreadPoolExecutor().getQueue().remainingCapacity()).isZero();
+            assertThat(appender.list).noneMatch(event -> event.getFormattedMessage().contains("booking_sms_dropped"));
+        } finally {
+            release.countDown();
+            pool.shutdown();
+        }
+        verify(smsService).send(eq(PHONE), eq(TEXT));
+    }
+
+    /**
+     * A single-thread pool whose worker is parked on {@code release} and whose queue has exactly
+     * {@code freeSlots} remaining slots. The worker takes the blocker directly (a fresh core thread
+     * never queues its first task), so the queue starts empty and its capacity IS the free-slot count.
+     * Shut down with wait-for-tasks, so every queued send has run by the time {@code shutdown()} returns.
+     */
+    private static ThreadPoolTaskExecutor blockedPool(CountDownLatch release, int freeSlots) throws Exception {
+        ThreadPoolTaskExecutor pool = new ThreadPoolTaskExecutor();
+        pool.setCorePoolSize(1);
+        pool.setMaxPoolSize(1);
+        pool.setQueueCapacity(freeSlots);
+        pool.setWaitForTasksToCompleteOnShutdown(true);
+        pool.setAwaitTerminationSeconds(10);
+        pool.initialize();
+        CountDownLatch started = new CountDownLatch(1);
+        pool.execute(() -> {
+            started.countDown();
+            try {
+                release.await(10, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        assertThat(started.await(10, TimeUnit.SECONDS)).isTrue();
+        return pool;
     }
 
     /** Captures submitted tasks instead of running them, so "submitted" and "ran" stay separable. */

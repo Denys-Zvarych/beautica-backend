@@ -29,7 +29,10 @@ import java.util.UUID;
  * {@link OutboxStatus}. This pattern guarantees at-least-once delivery without
  * two-phase commit between the application DB and the notification transport.
  *
- * <p>Schema defined in {@code V32__create_notification_outbox.sql}.
+ * <p>Schema defined in {@code V32__create_notification_outbox.sql}. Column {@code not_before} (V203,
+ * phase 390 D11) is deliberately NOT mapped here: it is written only by
+ * {@code NotificationOutboxRepository#deferPendingRow} (database clock) and read only by
+ * {@code claimPendingBatch}, so an entity save can never overwrite or clear it.
  */
 @Entity
 @Table(

@@ -1,10 +1,12 @@
 package com.beautica.booking.service;
 
+import com.beautica.notification.sms.SmsBackpressureException;
 import com.beautica.notification.sms.SmsService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.core.task.TaskExecutor;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import org.springframework.stereotype.Component;
 
 import java.util.concurrent.RejectedExecutionException;
@@ -14,7 +16,7 @@ import java.util.concurrent.RejectedExecutionException;
  * widened from the walk-in path alone, backend-perf LOW, 2026-08-19).
  *
  * <h2>The problem</h2>
- * All four senders register the send as an after-commit callback, and an after-commit callback runs
+ * The four request-path senders register the send as an after-commit callback, and an after-commit callback runs
  * on the <b>committing thread</b> — here, the servlet thread, before the response is written and
  * while it still holds its pooled Hikari connection (Spring releases that at
  * {@code afterCompletion}, one phase later; see {@code AsyncConfig#smsReminderDispatchExecutor} for
@@ -60,7 +62,7 @@ public class BookingSmsDispatcher {
 
     /**
      * Which message was queued. Present only so the drop line and the failure line name the lost
-     * message: four senders share one pool, and {@code event=booking_sms_dropped} on its own tells an
+     * message: five senders share one pool, and {@code event=booking_sms_dropped} on its own tells an
      * operator that something was lost but not what. Never rendered into the SMS, never a routing
      * decision — every kind takes the identical path.
      */
@@ -69,7 +71,14 @@ public class BookingSmsDispatcher {
         WALK_IN_CONFIRMATION("walk_in_confirmation"),
         GUEST_CONFIRMATION("guest_confirmation"),
         GUEST_CANCELLATION("guest_cancellation"),
-        GUEST_VISIT_CANCELLATION("guest_visit_cancellation");
+        GUEST_VISIT_CANCELLATION("guest_visit_cancellation"),
+        /**
+         * Phase 390 — the provider side cancelled a guest's booking or visit (decline, salon
+         * closure, master removal). Queued from {@code NotificationService} on the outbox drain
+         * thread, which is already after commit; routed here so a Turbosms stall never holds the
+         * drain batch, and so the drop/failure lines name it like every other booking SMS.
+         */
+        GUEST_PROVIDER_CANCELLATION("guest_provider_cancellation");
 
         private final String token;
 
@@ -82,6 +91,14 @@ public class BookingSmsDispatcher {
             return token;
         }
     }
+
+    /**
+     * Queue slots of {@code smsSendExecutor} that {@link #dispatchOrThrow} never consumes (phase 390,
+     * backend-perf LOW-2): one outbox drain tick can submit up to 50 SMS ({@code BATCH_SIZE}), so a
+     * reserve equal to one full batch keeps a burst of retryable outbox SMS from filling the 200-slot
+     * queue and dropping request-path confirmations, which are never retried.
+     */
+    static final int OUTBOX_QUEUE_RESERVE = 50;
 
     private final SmsService smsService;
     private final TaskExecutor smsSendExecutor;
@@ -114,6 +131,57 @@ public class BookingSmsDispatcher {
             log.error("event=booking_sms_dropped kind={} reason=executor_saturated — smsSendExecutor "
                     + "refused the message; the booking write is committed and unaffected", kind.token());
         }
+    }
+
+    /**
+     * Queues one booking SMS from a caller that can RETRY — the notification outbox drain (phase
+     * 390, {@link Kind#GUEST_PROVIDER_CANCELLATION}). Differs from {@link #dispatch} in two ways:
+     * <ul>
+     *   <li>A saturated {@code smsSendExecutor} is NOT swallowed: an {@link SmsBackpressureException}
+     *       propagates so {@code NotificationOutboxDrainWorker} re-queues the row as {@code PENDING}
+     *       without counting an attempt. Swallowing it here would let the drain mark the row
+     *       {@code SENT} and lose the SMS for good.</li>
+     *   <li>It never takes the last {@link #OUTBOX_QUEUE_RESERVE} queue slots. Those belong to the
+     *       request-path senders, whose SMS is dropped (never retried) on rejection; the outbox SMS
+     *       is retried next tick, so it is the one that yields.</li>
+     * </ul>
+     * A send failure on the pool thread is still swallowed and logged (the hand-off succeeded; that
+     * row is done).
+     *
+     * <p>Never call this from an {@code afterCommit} callback — Spring would surface the rejection
+     * as a failed write that has in fact committed. Request-path callers use {@link #dispatch}.
+     *
+     * @throws SmsBackpressureException when the pool refuses the task or its free queue slots are
+     *                                  below {@link #OUTBOX_QUEUE_RESERVE}
+     */
+    public void dispatchOrThrow(Kind kind, String phoneE164, String text) {
+        if (remainingQueueCapacity() < OUTBOX_QUEUE_RESERVE) {
+            // Kind only — no recipient, no rendered body (Anti-Bug §I).
+            log.warn("event=booking_sms_deferred kind={} reason=request_path_reserve — the caller re-queues "
+                    + "the message", kind.token());
+            throw new SmsBackpressureException("smsSendExecutor headroom reserved for request-path SMS");
+        }
+        try {
+            smsSendExecutor.execute(() -> sendSafely(kind, phoneE164, text));
+        } catch (RejectedExecutionException e) {
+            log.warn("event=booking_sms_deferred kind={} reason=executor_saturated — the caller re-queues "
+                    + "the message", kind.token());
+            throw new SmsBackpressureException("smsSendExecutor saturated", e);
+        }
+    }
+
+    /**
+     * Free queue slots of the production pool; {@link Integer#MAX_VALUE} for any other executor (the
+     * test profile's {@code SyncTaskExecutor} has no queue, so the reserve can never bind there).
+     * A check-then-act read: two concurrent outbox submissions may both pass at exactly the
+     * boundary, so the reserve is a soft floor — one drain thread submits serially, which keeps the
+     * overshoot at zero in practice and at a handful of slots in the worst case.
+     */
+    private int remainingQueueCapacity() {
+        if (smsSendExecutor instanceof ThreadPoolTaskExecutor pool) {
+            return pool.getThreadPoolExecutor().getQueue().remainingCapacity();
+        }
+        return Integer.MAX_VALUE;
     }
 
     /**

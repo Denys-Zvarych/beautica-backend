@@ -281,6 +281,147 @@ class NotificationOutboxDrainWorkerTest {
         assertThat(outboxEntry.getLastError()).isNull();
     }
 
+    @Test
+    @DisplayName("Phase 390: a guest provider-cancellation SMS refused by a saturated smsSendExecutor re-queues "
+            + "the row as PENDING without counting an attempt (the SMS is retried, never marked SENT and lost)")
+    void should_requeueEntry_when_guestProviderCancellationSmsRejected() {
+        UUID bookingId = UUID.randomUUID();
+        NotificationOutboxEntry outboxEntry = entry(OutboxEventType.STATUS_CHANGED, 1, null, bookingId);
+        Booking booking = mock(Booking.class);
+        when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
+        when(booking.getId()).thenReturn(bookingId);
+        when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(booking));
+        // What BookingSmsDispatcher#dispatchOrThrow propagates through NotificationService.
+        doThrow(new com.beautica.notification.sms.SmsBackpressureException("smsSendExecutor saturated"))
+                .when(notificationService).notifyBookingStatusChanged(BookingVisit.single(booking));
+
+        worker.drain();
+
+        assertThat(outboxEntry.getStatus()).isEqualTo(OutboxStatus.PENDING);
+        assertThat(outboxEntry.getAttempts()).as("backpressure, not a failed attempt").isEqualTo(1);
+        assertThat(outboxEntry.getLastError()).isNull();
+    }
+
+    @Test
+    @DisplayName("Phase 390 (perf LOW-1): SMS backpressure defers only the SMS rows — e-mail rows behind it are "
+            + "still sent, and a later SMS row is deferred WITHOUT being resubmitted to the SMS pool")
+    void should_dispatchEmailRows_andDeferLaterSmsRows_when_smsBackpressure() throws Exception {
+        NotificationOutboxDrainWorker w = workerWithRealMapper();
+        UUID declinedId = UUID.randomUUID();
+        UUID closedId = UUID.randomUUID();
+        NotificationOutboxEntry declinedSms = entry(OutboxEventType.STATUS_CHANGED, 1, null, declinedId);
+        NotificationOutboxEntry email1 = inviteEntry();
+        NotificationOutboxEntry closedSms = entry(OutboxEventType.SALON_CLOSED, 2, null, closedId);
+        NotificationOutboxEntry email2 = inviteEntry();
+        Booking declined = mock(Booking.class);
+        Booking closed = mock(Booking.class);
+        when(declined.getId()).thenReturn(declinedId);
+        when(closed.getId()).thenReturn(closedId);
+
+        when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(declinedSms, email1, closedSms, email2));
+        when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(declined, closed));
+        when(cipher.open("v1:STUB")).thenReturn("https://app.beautica.ua/invite/accept?token=ABC");
+        doThrow(new com.beautica.notification.sms.SmsBackpressureException("smsSendExecutor saturated"))
+                .when(notificationService).notifyBookingStatusChanged(BookingVisit.single(declined));
+        when(notificationService.routesToLinkGuestSms(OutboxEventType.SALON_CLOSED, closed)).thenReturn(true);
+
+        w.drain();
+
+        assertThat(declinedSms.getStatus()).isEqualTo(OutboxStatus.PENDING);
+        assertThat(declinedSms.getAttempts()).as("backpressure, not a failed attempt").isEqualTo(1);
+        assertThat(closedSms.getStatus()).isEqualTo(OutboxStatus.PENDING);
+        assertThat(closedSms.getAttempts()).as("deferred, not attempted").isEqualTo(2);
+        assertThat(email1.getStatus()).isEqualTo(OutboxStatus.SENT);
+        assertThat(email2.getStatus()).isEqualTo(OutboxStatus.SENT);
+        verify(notificationService, times(2)).sendInviteEmail(any(), any(), any());
+        verify(notificationService, never()).notifySalonClosed(any());
+    }
+
+    @Test
+    @DisplayName("Phase 390: after SMS backpressure, a later row of an SMS-capable type that does NOT route to "
+            + "an SMS (registered client) is still dispatched")
+    void should_dispatchNonSmsRowOfSmsCapableType_when_smsBackpressure() {
+        UUID declinedId = UUID.randomUUID();
+        UUID clientRowId = UUID.randomUUID();
+        NotificationOutboxEntry declinedSms = entry(OutboxEventType.STATUS_CHANGED, 0, null, declinedId);
+        NotificationOutboxEntry clientRow = entry(OutboxEventType.MASTER_REMOVED, 0, null, clientRowId);
+        Booking declined = mock(Booking.class);
+        Booking clientBooking = mock(Booking.class);
+        when(declined.getId()).thenReturn(declinedId);
+        when(clientBooking.getId()).thenReturn(clientRowId);
+
+        when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(declinedSms, clientRow));
+        when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(declined, clientBooking));
+        doThrow(new com.beautica.notification.sms.SmsBackpressureException("smsSendExecutor saturated"))
+                .when(notificationService).notifyBookingStatusChanged(BookingVisit.single(declined));
+        when(notificationService.routesToLinkGuestSms(OutboxEventType.MASTER_REMOVED, clientBooking)).thenReturn(false);
+
+        worker.drain();
+
+        assertThat(declinedSms.getStatus()).isEqualTo(OutboxStatus.PENDING);
+        assertThat(clientRow.getStatus()).isEqualTo(OutboxStatus.SENT);
+        verify(notificationService).notifyMasterRemoved(BookingVisit.single(clientBooking));
+    }
+
+    @Test
+    @DisplayName("Phase 390 D11: SMS-backpressure-deferred rows get their claim eligibility pushed out "
+            + "(not_before), the e-mail rows of the same batch do not")
+    void should_deferClaimEligibilityOfSmsRowsOnly_when_smsBackpressure() throws Exception {
+        // Arrange
+        NotificationOutboxDrainWorker w = workerWithRealMapper();
+        UUID declinedId = UUID.randomUUID();
+        UUID closedId = UUID.randomUUID();
+        NotificationOutboxEntry declinedSms = entry(OutboxEventType.STATUS_CHANGED, 1, null, declinedId);
+        NotificationOutboxEntry email = inviteEntry();
+        NotificationOutboxEntry closedSms = entry(OutboxEventType.SALON_CLOSED, 2, null, closedId);
+        declinedSms.setId(UUID.randomUUID());
+        email.setId(UUID.randomUUID());
+        closedSms.setId(UUID.randomUUID());
+        Booking declined = mock(Booking.class);
+        Booking closed = mock(Booking.class);
+        when(declined.getId()).thenReturn(declinedId);
+        when(closed.getId()).thenReturn(closedId);
+        when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(declinedSms, email, closedSms));
+        when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(declined, closed));
+        when(cipher.open("v1:STUB")).thenReturn("https://app.beautica.ua/invite/accept?token=ABC");
+        doThrow(new com.beautica.notification.sms.SmsBackpressureException("smsSendExecutor saturated"))
+                .when(notificationService).notifyBookingStatusChanged(BookingVisit.single(declined));
+        when(notificationService.routesToLinkGuestSms(OutboxEventType.SALON_CLOSED, closed)).thenReturn(true);
+
+        // Act
+        w.drain();
+
+        // Assert — the throwing row AND the later skipped SMS row are deferred; nothing else is
+        verify(outboxRepository).deferPendingRow(declinedSms.getId(),
+                NotificationOutboxDrainWorker.SMS_BACKPRESSURE_DEFER_SECONDS);
+        verify(outboxRepository).deferPendingRow(closedSms.getId(),
+                NotificationOutboxDrainWorker.SMS_BACKPRESSURE_DEFER_SECONDS);
+        verify(outboxRepository, never()).deferPendingRow(eq(email.getId()), org.mockito.ArgumentMatchers.anyInt());
+        assertThat(declinedSms.getAttempts()).as("deferral counts no attempt").isEqualTo(1);
+        assertThat(closedSms.getAttempts()).as("deferral counts no attempt").isEqualTo(2);
+    }
+
+    @Test
+    @DisplayName("Phase 390 D11: push-saturation deferral keeps its next-tick retry — no not_before is set")
+    void should_notDeferClaimEligibility_when_pushExecutorSaturated() {
+        // Arrange
+        UUID feedRowId = UUID.randomUUID();
+        NotificationOutboxEntry outboxEntry = entry(OutboxEventType.INAPP_PUSH, 1, null, feedRowId);
+        InAppPushDispatcher.PushPlan plan = plan();
+        when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
+        when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of());
+        when(inAppPushDispatcher.prepare(any())).thenReturn(Map.of(feedRowId, plan));
+        doThrow(new java.util.concurrent.RejectedExecutionException("saturated"))
+                .when(inAppPushDispatcher).dispatch(plan);
+
+        // Act
+        worker.drain();
+
+        // Assert
+        assertThat(outboxEntry.getStatus()).isEqualTo(OutboxStatus.PENDING);
+        verify(outboxRepository, never()).deferPendingRow(any(), org.mockito.ArgumentMatchers.anyInt());
+    }
+
     // ── Per-batch e-mail circuit breaker ──────────────────────────────────────
 
     private NotificationOutboxDrainWorker workerWithRealMapper() {

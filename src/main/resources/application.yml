@@ -343,7 +343,8 @@ app:
       # Phase 22.7 — THE single "are we spending SMS money" switch. Read by SmsConfig, which uses
       # it to choose the SmsService bean itself (NoOpSmsService when false, TurbosmsService when
       # true), so it gates EVERY outbound booking SMS at once: walk-in confirmation, guest
-      # confirmation, 24h reminder, cancellation, provider decline. No call site branches on it.
+      # confirmation, 24h reminder, cancellation, provider decline / salon closure / master removal
+      # (phase 390). No call site branches on it.
       #
       # NOT gated by this flag: the guest phone-OTP (POST /api/v1/book/otp/send). An OTP is an auth
       # credential, not booking spend, so PhoneOtpService injects OtpSmsSender — an unconditional
@@ -377,20 +378,9 @@ app:
         Beautica: Ваш запис скасовано.
         {serviceName} у {masterName}
         {date} о {time}
-      # Phase 25.7 — sent to a GUEST (LINK) booking's phone when the provider declines. A guest
-      # has no account for email/push, so this SMS is the only channel that tells them at all.
-      # Deliberately does NOT include the reason clause — see decline-reason below — the
-      # provider's note is optional (Phase 25.9) and this template must stand alone, coherently,
-      # without one.
-      decline: |-
-        Beautica: На жаль, ваш запис скасовано.
-        {serviceName} у {masterName}
-        {date} о {time}
-      # Phase 25.9 — appended to `decline` above ONLY when the provider actually left a note, so
-      # an optional/absent note never leaves a dangling "Причина: " label with nothing after it.
-      # {comment} is the provider's decline note, truncated to ~120 chars before substitution.
-      # Double-quoted (not a block scalar) so the leading "\n\n" separator is unambiguous.
-      decline-reason: "\n\nПричина: {comment}"
+      # Phase 390 — the guest provider-cancellation SMS (decline, salon closure, master removal) is
+      # fixed copy in GuestProviderCancellationSmsText, not a template here (no provider text in it;
+      # its length is pinned by tests). Do not re-add `decline:` / `decline-reason:` — nothing reads them.
       # Phase 22.7 — the walk-in confirmation (POST /api/v1/masters/{masterId}/bookings) is the ONE
       # template with no key here, deliberately (QA MEDIUM, 2026-08-18). Its text lives in exactly
       # one place: BookingSmsProperties.Sms#walkInConfirmation. A yml copy identical to that default

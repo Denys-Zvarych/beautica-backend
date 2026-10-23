@@ -117,6 +117,16 @@ abstract class AbstractWalkInBookingSmsIT extends AbstractStaffBookingIT {
     protected static final String TURBOSMS_PATH = "/message/send.json";
     private static final String TURBOSMS_TOKEN = "wiremock-turbosms-token";
 
+    /**
+     * Phase 390 test isolation. {@code AuthRateLimitFilter} keys the {@code permitAll} guest buckets
+     * (booking POST: 5 / 15 min, a hard-coded capacity no property raises) on
+     * {@code ClientIpResolver} — the rightmost {@code X-Forwarded-For} entry, else the socket address.
+     * Every subclass sharing one cached context (e.g. {@code GuestProviderCancellationSmsIT} +
+     * {@link WalkInBookingSmsEnabledIT}) shares one filter instance, so without a fresh source IP per
+     * request the 6th guest booking across those classes is a 429 that depends on class order.
+     */
+    private static final String FORWARDED_FOR_HEADER = "X-Forwarded-For";
+
     protected static final DateTimeFormatter DATE_FMT = DateTimeFormatter.ofPattern("dd.MM.yyyy");
 
     /**
@@ -322,16 +332,28 @@ abstract class AbstractWalkInBookingSmsIT extends AbstractStaffBookingIT {
         String body = """
                 {"serviceId":"%s","startsAt":"%s","name":"%s","surname":"%s","privacyAccepted":true,"privacyPolicyVersion":"2026-10-20"}
                 """.formatted(salon.masterServiceId(), startsAt, GUEST_NAME, GUEST_SURNAME);
+        return restTemplate.exchange("/api/v1/book/" + salon.bookingSlug() + "/booking",
+                HttpMethod.POST, new HttpEntity<>(body, guestBookingHeaders()), String.class);
+    }
+
+    /**
+     * Headers for a guest (LINK) booking POST: a genuine guest JWT for {@link #LINK_PHONE} and a
+     * fresh source IP, so the per-IP guest-booking bucket never carries budget across tests or
+     * across the subclasses that share this context (see {@link #FORWARDED_FOR_HEADER}). Every
+     * guest-booking POST in this hierarchy must go through here.
+     */
+    protected HttpHeaders guestBookingHeaders() {
         HttpHeaders headers = new HttpHeaders();
         headers.setBearerAuth(guestTokenProvider.generate(LINK_PHONE));
         headers.setContentType(MediaType.APPLICATION_JSON);
-        return restTemplate.exchange("/api/v1/book/" + salon.bookingSlug() + "/booking",
-                HttpMethod.POST, new HttpEntity<>(body, headers), String.class);
+        headers.set(FORWARDED_FOR_HEADER, PublicBookingPageFixtures.randomIp());
+        return headers;
     }
 
     protected ResponseEntity<String> sendOtp(String phone) {
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
+        headers.set(FORWARDED_FOR_HEADER, PublicBookingPageFixtures.randomIp());
         return restTemplate.exchange("/api/v1/book/otp/send", HttpMethod.POST,
                 new HttpEntity<>("{\"phone\":\"" + phone + "\",\"privacyAccepted\":true,\"privacyPolicyVersion\":\"2026-10-20\"}", headers), String.class);
     }

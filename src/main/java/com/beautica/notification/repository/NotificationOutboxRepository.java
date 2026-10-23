@@ -36,6 +36,15 @@ public interface NotificationOutboxRepository extends JpaRepository<Notification
      * fast (no SMTP), so they cannot starve e-mail in turn: the other branch still gets
      * {@code limit - pushRowsClaimed} slots, and a full batch of pushes drains in one tick.
      *
+     * <p><b>SMS-backpressure deferral (phase 390 D11).</b> The non-push branch skips rows whose
+     * {@code not_before} (V203) is still in the future. Only {@link #deferPendingRow} sets it — on a
+     * row the worker put back to {@code PENDING} because the SMS executor pushed back — so a burst of
+     * {@code >= limit} deferred SMS rows (which keep their {@code created_at}) no longer occupies the
+     * head of every batch and starves newer e-mail rows. {@code NULL} (every other row) is eligible
+     * immediately, exactly as before. The predicate is a row filter on the same
+     * {@code idx_outbox_pending} walk, not a new sort key, so the branch stays index-ordered. Push
+     * rows are never deferred this way, so the push branch is unchanged.
+     *
      * <p><strong>Why the status flip must be atomic with the claim (MEDIUM concurrency fix).</strong>
      * The previous version of this query was a plain {@code SELECT ... FOR UPDATE SKIP LOCKED} that
      * never changed {@code status}. The row lock it took is released the instant the caller's short
@@ -120,6 +129,7 @@ public interface NotificationOutboxRepository extends JpaRepository<Notification
               FROM notification_outbox
              WHERE status = 'PENDING'
                AND event_type <> 'INAPP_PUSH'
+               AND (not_before IS NULL OR not_before <= now())
              ORDER BY created_at ASC
              LIMIT GREATEST(:limit - (SELECT count(*) FROM push_candidates), 0)
                FOR UPDATE SKIP LOCKED
@@ -140,6 +150,29 @@ public interface NotificationOutboxRepository extends JpaRepository<Notification
         SELECT * FROM claimed ORDER BY (event_type = 'INAPP_PUSH') DESC, created_at ASC
         """, nativeQuery = true)
     List<NotificationOutboxEntry> claimPendingBatch(@Param("limit") @Min(1) @Max(500) int limit);
+
+    /**
+     * Pushes one row's claim eligibility {@code deferSeconds} into the future (database clock, the
+     * same {@code now()} {@link #claimPendingBatch} compares against — no app/DB clock skew), so the
+     * next claims pick newer rows first (phase 390 D11). Touches only {@code not_before}: status,
+     * attempts and {@code last_error} are written by the caller's entity save in the SAME
+     * transaction, so the deferral is atomic with the row going back to {@code PENDING}.
+     *
+     * <p>{@code MANDATORY}: it must ride the per-entry {@code REQUIRES_NEW} transaction of
+     * {@code NotificationOutboxDrainWorker#persistOne}, never commit on its own.
+     *
+     * @param id           the outbox row to defer
+     * @param deferSeconds seconds from now before the row is claimable again ({@code [1, 300]})
+     * @return number of rows updated (1, or 0 if the row no longer exists)
+     */
+    @Modifying
+    @Transactional(propagation = Propagation.MANDATORY)
+    @Query(value = """
+        UPDATE notification_outbox
+           SET not_before = now() + make_interval(secs => :deferSeconds)
+         WHERE id = :id
+        """, nativeQuery = true)
+    int deferPendingRow(@Param("id") UUID id, @Param("deferSeconds") @Min(1) @Max(300) int deferSeconds);
 
     /**
      * Rescues rows stranded in {@link OutboxStatus#PROCESSING} by an instance that claimed them

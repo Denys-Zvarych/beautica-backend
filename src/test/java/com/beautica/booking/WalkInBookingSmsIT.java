@@ -1,9 +1,13 @@
 package com.beautica.booking;
 
+import com.beautica.notification.service.NotificationOutboxDrainWorker;
 import com.beautica.notification.sms.NoOpSmsService;
 import com.beautica.notification.sms.SmsService;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.HttpEntity;
+import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 
@@ -25,6 +29,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 @DisplayName("WalkInBookingSmsIT — app.booking.sms.enabled at its committed default (false)")
 class WalkInBookingSmsIT extends AbstractWalkInBookingSmsIT {
+
+    @Autowired
+    private NotificationOutboxDrainWorker drainWorker;
 
     @Test
     @DisplayName("default profile — the injected SmsService is the no-op, and it is the only one")
@@ -181,6 +188,24 @@ class WalkInBookingSmsIT extends AbstractWalkInBookingSmsIT {
         assertThat(onlyBooking().get("reminder_sent"))
                 .as("the sweep ran and flagged the row — the suppression is at the sender, not upstream")
                 .isEqualTo(true);
+        assertNoPiiInLogs(LINK_PHONE, LINK_SUBSCRIBER_DIGITS);
+    }
+
+    /** Phase 390 — the guest provider-cancellation SMS is on the same gate; with it off, nothing is sent. */
+    @Test
+    @DisplayName("gate off — a provider decline of a guest (LINK) booking makes ZERO Turbosms requests")
+    void should_makeZeroTurbosmsRequests_when_aGuestBookingIsDeclinedWithTheGateOff() {
+        assertThat(createGuestBooking(tomorrowAtNoon()).getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        UUID bookingId = (UUID) onlyBooking().get("id");
+
+        ResponseEntity<Void> resp = restTemplate.exchange("/api/v1/bookings/" + bookingId + "/decline",
+                HttpMethod.PATCH, new HttpEntity<>("{\"cancellationReason\":\"PROVIDER_UNAVAILABLE\"}",
+                        bearerHeaders(tokenFor(salon.ownerEmail()))), Void.class);
+        drainWorker.drain();
+
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(onlyBooking().get("status")).isEqualTo("DECLINED");
+        TURBOSMS.verify(0, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
         assertNoPiiInLogs(LINK_PHONE, LINK_SUBSCRIBER_DIGITS);
     }
 }
