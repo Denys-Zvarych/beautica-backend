@@ -12,6 +12,7 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.cache.caffeine.CaffeineCacheManager;
+import org.springframework.cache.concurrent.ConcurrentMapCacheManager;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -177,6 +178,34 @@ class RetiredBookingSlugGuardTest {
         assertThat(statsCache.stats().loadCount()).isZero();
         assertThat(statsCache.stats().loadFailureCount()).isZero();
         assertThat(statsCache.asMap()).containsOnlyKeys(BookingLinkKind.MASTER.name() + ':' + MASTER_HASH);
+    }
+
+    @Test
+    @DisplayName("fail-fast — a known-retired cache that is not Caffeine is rejected at construction")
+    void should_throwIllegalState_when_knownRetiredCacheIsNotCaffeine() {
+        ConcurrentMapCacheManager nonCaffeine = new ConcurrentMapCacheManager(RetiredBookingSlugGuard.KNOWN_RETIRED_CACHE);
+
+        assertThatThrownBy(() -> new RetiredBookingSlugGuard(retiredBookingSlugRepository, nonCaffeine))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining(RetiredBookingSlugGuard.KNOWN_RETIRED_CACHE);
+    }
+
+    @Test
+    @DisplayName("Spring Cache API parity — a confirmed tombstone is stored in Caffeine as a raw Boolean.TRUE")
+    void should_storeRawBooleanTrueInNativeCache_when_tombstoneConfirmed() {
+        Cache<Object, Object> nativeCache = Caffeine.newBuilder().maximumSize(100).build();
+        CaffeineCacheManager cacheManager = new CaffeineCacheManager();
+        cacheManager.setCacheNames(List.of());
+        cacheManager.registerCustomCache(RetiredBookingSlugGuard.KNOWN_RETIRED_CACHE, nativeCache);
+        RetiredBookingSlugGuard nativeGuard = new RetiredBookingSlugGuard(retiredBookingSlugRepository, cacheManager);
+        when(retiredBookingSlugRepository.existsByKindAndSlugHash(BookingLinkKind.MASTER, MASTER_HASH))
+                .thenReturn(true);
+
+        assertThatThrownBy(() -> nativeGuard.throwGoneIfRetired(BookingLinkKind.MASTER, SLUG))
+                .isInstanceOf(GoneException.class);
+
+        assertThat(nativeCache.getIfPresent(BookingLinkKind.MASTER.name() + ':' + MASTER_HASH))
+                .isSameAs(Boolean.TRUE);
     }
 
     private int repositoryProbeCount() {

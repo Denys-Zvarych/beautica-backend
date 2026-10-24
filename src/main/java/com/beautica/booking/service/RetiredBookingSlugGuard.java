@@ -3,7 +3,7 @@ package com.beautica.booking.service;
 import com.beautica.booking.dto.BookingLinkKind;
 import com.beautica.booking.repository.RetiredBookingSlugRepository;
 import com.beautica.common.exception.GoneException;
-import com.github.benmanes.caffeine.cache.Cache;
+import org.springframework.cache.Cache;
 import org.springframework.cache.CacheManager;
 import org.springframework.cache.caffeine.CaffeineCache;
 import org.springframework.stereotype.Component;
@@ -28,6 +28,12 @@ import org.springframework.stereotype.Component;
  * for every unknown-slug 404. Trade-off: no single-flight on a cold retired key — a concurrent burst may run
  * a few duplicate primary-key lookups before the first {@code put}; after it, none. With no loader there is
  * also no {@code null}-returning load, so the cache's recorded load/load-failure stats stay at zero.
+ *
+ * <p><b>Spring {@link Cache} API, not the native handle.</b> Lookups go through {@link Cache#get(Object)} and
+ * {@link Cache#put(Object, Object)}; on a loader-less {@link CaffeineCache} these delegate straight to Caffeine's
+ * {@code getIfPresent} / {@code put}, so the semantics above are unchanged. Not unwrapping
+ * {@code getNativeCache()} keeps native cache access confined to {@code MasterCachePrefixEvictor}
+ * ({@code CacheKeyScanOwnershipTest}).
  */
 @Component
 public class RetiredBookingSlugGuard {
@@ -38,7 +44,7 @@ public class RetiredBookingSlugGuard {
     private static final char KEY_SEPARATOR = ':';
 
     private final RetiredBookingSlugRepository retiredBookingSlugRepository;
-    private final Cache<Object, Object> knownRetired;
+    private final Cache knownRetired;
 
     public RetiredBookingSlugGuard(RetiredBookingSlugRepository retiredBookingSlugRepository,
                                    CacheManager cacheManager) {
@@ -50,7 +56,7 @@ public class RetiredBookingSlugGuard {
     public void throwGoneIfRetired(BookingLinkKind kind, String slug) {
         String slugHash = RetiredSlugHasher.hash(kind, slug);
         String cacheKey = kind.name() + KEY_SEPARATOR + slugHash;
-        if (knownRetired.getIfPresent(cacheKey) != null) {
+        if (knownRetired.get(cacheKey) != null) {
             throw GoneException.bookingLinkRetired();
         }
         if (retiredBookingSlugRepository.existsByKindAndSlugHash(kind, slugHash)) {
@@ -59,10 +65,10 @@ public class RetiredBookingSlugGuard {
         }
     }
 
-    private static Cache<Object, Object> resolveKnownRetiredCache(CacheManager cacheManager) {
+    private static Cache resolveKnownRetiredCache(CacheManager cacheManager) {
         if (!(cacheManager.getCache(KNOWN_RETIRED_CACHE) instanceof CaffeineCache caffeineCache)) {
             throw new IllegalStateException("Cache '" + KNOWN_RETIRED_CACHE + "' must be a registered Caffeine cache");
         }
-        return caffeineCache.getNativeCache();
+        return caffeineCache;
     }
 }
