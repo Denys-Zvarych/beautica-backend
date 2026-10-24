@@ -104,10 +104,10 @@ class BookingLinkOpenApiContractIT extends AbstractIntegrationTest {
         assertThat(pageFields).containsExactlyInAnyOrder(
                 "salonId", "name", "city", "avatarUrl", "coverImageUrl", "avgRating", "reviewCount",
                 "bookable", "masters", "region", "street", "buildingNo", "updatedAt", "description", "locationNote",
-                "portfolio", "serviceCategories", "ratingDistribution", "latestReviews");
+                "portfolio", "serviceCategories", "ratingDistribution", "latestReviews", "serviceCoverage");
         assertThat(texts(page.path("required")))
                 .containsExactlyInAnyOrder("salonId", "name", "reviewCount", "bookable", "masters", "updatedAt",
-                        "portfolio", "serviceCategories", "ratingDistribution", "latestReviews");
+                        "portfolio", "serviceCategories", "ratingDistribution", "latestReviews", "serviceCoverage");
         for (String nullable : List.of("region", "street", "buildingNo", "description", "locationNote")) {
             assertThat(texts(page.path("properties").path(nullable).path("type")))
                     .as(nullable).containsExactlyInAnyOrder("string", "null");
@@ -118,8 +118,18 @@ class BookingLinkOpenApiContractIT extends AbstractIntegrationTest {
         List<String> masterFields = new ArrayList<>();
         master.path("properties").fieldNames().forEachRemaining(masterFields::add);
         assertThat(masterFields).containsExactlyInAnyOrder("masterSlug", "name", "avatarUrl", "professionalTitle",
-                "avgRating", "reviewCount");
-        assertThat(texts(master.path("required"))).containsExactlyInAnyOrder("masterSlug", "name", "reviewCount");
+                "avgRating", "reviewCount", "masterId");
+        // Phase 391 D3: masterSlug is nullable (slug-less masters are listed); masterId is the required key.
+        assertThat(texts(master.path("required"))).containsExactlyInAnyOrder("masterId", "name", "reviewCount");
+        assertThat(texts(master.path("properties").path("masterSlug").path("type")))
+                .containsExactlyInAnyOrder("string", "null");
+        JsonNode coverage = schemas.path("SalonServiceCoverage");
+        assertThat(texts(coverage.path("required"))).containsExactlyInAnyOrder("serviceId", "masters");
+        JsonNode ref = schemas.path("SalonServiceMasterRef");
+        List<String> refFields = new ArrayList<>();
+        ref.path("properties").fieldNames().forEachRemaining(refFields::add);
+        assertThat(refFields).containsExactlyInAnyOrder("masterId", "masterServiceId");
+        assertThat(texts(ref.path("required"))).containsExactlyInAnyOrder("masterId", "masterServiceId");
         assertThat(texts(master.path("properties").path("avgRating").path("type")))
                 .containsExactlyInAnyOrder("number", "null");
     }

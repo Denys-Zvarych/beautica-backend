@@ -119,11 +119,11 @@ abstract class AbstractWalkInBookingSmsIT extends AbstractStaffBookingIT {
 
     /**
      * Phase 390 test isolation. {@code AuthRateLimitFilter} keys the {@code permitAll} guest buckets
-     * (booking POST: 5 / 15 min, a hard-coded capacity no property raises) on
+     * (booking POST: 10 / 15 min since the phase 393 audit, a hard-coded capacity no property raises) on
      * {@code ClientIpResolver} — the rightmost {@code X-Forwarded-For} entry, else the socket address.
      * Every subclass sharing one cached context (e.g. {@code GuestProviderCancellationSmsIT} +
      * {@link WalkInBookingSmsEnabledIT}) shares one filter instance, so without a fresh source IP per
-     * request the 6th guest booking across those classes is a 429 that depends on class order.
+     * request the 11th guest booking across those classes is a 429 that depends on class order.
      */
     private static final String FORWARDED_FOR_HEADER = "X-Forwarded-For";
 

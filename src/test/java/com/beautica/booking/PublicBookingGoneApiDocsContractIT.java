@@ -39,7 +39,10 @@ class PublicBookingGoneApiDocsContractIT extends AbstractIntegrationTest {
             "get,  /api/v1/book/{slug}/bookable-days",
             "post, /api/v1/book/{slug}/booking",
             "get,  /api/v1/book/s/{slug}/info",
-            "get,  /api/v1/book/s/{slug}/reviews"
+            "get,  /api/v1/book/s/{slug}/reviews",
+            "get,  /api/v1/book/s/{slug}/masters/{masterId}/availability",
+            "get,  /api/v1/book/s/{slug}/masters/{masterId}/bookable-days",
+            "post, /api/v1/book/s/{slug}/masters/{masterId}/booking"
     })
     @DisplayName("each slug-keyed route publishes a 410 response mentioning BOOKING_LINK_RETIRED")
     void should_document410_when_routeIsSlugKeyed(String method, String path) throws Exception {

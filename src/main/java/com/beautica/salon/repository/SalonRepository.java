@@ -681,6 +681,14 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
     boolean existsByBookingSlug(String bookingSlug);
 
     /**
+     * Phase 392 — the miss-path probe of the salon-scoped guest routes: is {@code bookingSlug} the live slug of
+     * an ACTIVE salon? Lets {@code SalonGuestMasterResolver} tell "salon gone" (→ 410 / 404) apart from
+     * "salon live, master not in it" (→ 404) without hydrating the salon. Runs only after the master lookup
+     * missed.
+     */
+    boolean existsByBookingSlugAndIsActiveTrue(String bookingSlug);
+
+    /**
      * Resolves a public salon slug to its ACTIVE salon's public-page columns (phase 377,
      * {@code GET /book/s/{slug}/info}) in ONE statement — a projection, never the {@code Salon} entity
      * (376 audit: the page needs seven columns, and the entity drags owner proxy + every column). An

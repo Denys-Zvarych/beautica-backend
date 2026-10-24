@@ -735,6 +735,21 @@ class ServiceCatalogServiceCacheTest {
     }
 
     @Test
+    @DisplayName("phase 391 audit: second getSalonCatalogSnapshot for the same salon is a cache hit; the evictor drops it")
+    void should_serveSnapshotFromCacheUntilEvicted_when_calledTwiceForSameSalon() {
+        UUID salonId = UUID.randomUUID();
+        when(masterServiceRepository.findBookableAssignmentsBySalon(salonId)).thenReturn(List.of());
+
+        serviceCatalogService.getSalonCatalogSnapshot(salonId);
+        serviceCatalogService.getSalonCatalogSnapshot(salonId);
+        verify(masterServiceRepository, times(1)).findBookableAssignmentsBySalon(salonId);
+        salonCatalogCacheEvictor.evictCatalogOnly(salonId);
+        serviceCatalogService.getSalonCatalogSnapshot(salonId);
+
+        verify(masterServiceRepository, times(2)).findBookableAssignmentsBySalon(salonId);
+    }
+
+    @Test
     @DisplayName("deactivateServiceDefinition evicts ONLY the owning salon's catalogue entry — that salon recomputes, a sibling salon stays cached (correct salonId source via findSalonOwnerId)")
     void should_evictOnlyOwningSalonCatalog_when_serviceDefinitionDeactivated() {
         UUID salonA = UUID.randomUUID();

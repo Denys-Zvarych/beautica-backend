@@ -56,6 +56,8 @@ class GuestBookingServiceTest {
 
     private static final String SLUG = "marija-l-cd34";
     private static final String GUEST_PHONE = "+380501234567";
+    private static final GuestTokenProvider.GuestTokenClaims GUEST_CLAIMS =
+            new GuestTokenProvider.GuestTokenClaims(GUEST_PHONE, "guest-jti-1");
     private static final String FRONTEND = "https://app.beautica.test";
 
     @Mock private GuestTokenProvider guestTokenProvider;
@@ -69,6 +71,8 @@ class GuestBookingServiceTest {
     @Mock private com.beautica.service.service.SalonCatalogCacheEvictor salonCatalogCacheEvictor;
     @Mock private InAppNotificationService inAppNotificationService;
     @Mock private RetiredBookingSlugGuard retiredBookingSlugGuard;
+    @Mock private SalonGuestMasterResolver salonGuestMasterResolver;
+    @Mock private GuestTokenBookingCap guestTokenBookingCap;
 
     private GuestBookingService service;
 
@@ -83,7 +87,7 @@ class GuestBookingServiceTest {
                 new BookingSmsProperties(), salonCatalogCacheEvictor,
                 new VisitPlanner(masterServiceRepository), FRONTEND,
                 java.time.Clock.fixed(OffsetDateTime.parse("2026-06-01T10:00:00Z").toInstant(), ZoneOffset.UTC),
-                inAppNotificationService, retiredBookingSlugGuard);
+                inAppNotificationService, retiredBookingSlugGuard, salonGuestMasterResolver, guestTokenBookingCap);
 
         // Phase 337 fix: BookingSlotLockGuard.lockMasterAndAssertFree now re-checks bookability
         // AFTER the advisory lock (PostLockSlotGuard, closing the self-delete-race CRITICAL), fused
@@ -199,7 +203,7 @@ class GuestBookingServiceTest {
     @DisplayName("should throw 409 when the requested slot is already taken")
     void should_throw409_when_slotTaken() {
         OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
-        when(guestTokenProvider.validate(anyString())).thenReturn(GUEST_PHONE);
+        when(guestTokenProvider.validateClaims(anyString())).thenReturn(GUEST_CLAIMS);
         when(masterRepository.findByBookingSlugWithUser(SLUG)).thenReturn(Optional.of(master()));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, serviceId))
                 .thenReturn(Optional.of(masterService()));
@@ -228,7 +232,7 @@ class GuestBookingServiceTest {
     @DisplayName("should throw 404 when the service does not belong to the resolved master")
     void should_throw404_when_serviceNotOwnedByMaster() {
         OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
-        when(guestTokenProvider.validate(anyString())).thenReturn(GUEST_PHONE);
+        when(guestTokenProvider.validateClaims(anyString())).thenReturn(GUEST_CLAIMS);
         when(masterRepository.findByBookingSlugWithUser(SLUG)).thenReturn(Optional.of(master()));
         // empty = the WHERE ms.master.id = :masterId AND ms.id = :id matched nothing
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, serviceId))
@@ -268,7 +272,7 @@ class GuestBookingServiceTest {
         OffsetDateTime tooSoon = OffsetDateTime.parse("2026-06-01T10:05:00Z");
         // lenient: the fix may validate startsAt before OR after the master/service lookup;
         // either ordering is acceptable, so these stubs must not be required.
-        lenient().when(guestTokenProvider.validate(anyString())).thenReturn(GUEST_PHONE);
+        lenient().when(guestTokenProvider.validateClaims(anyString())).thenReturn(GUEST_CLAIMS);
         lenient().when(masterRepository.findByBookingSlugWithUser(SLUG)).thenReturn(Optional.of(master()));
         lenient().when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, serviceId))
                 .thenReturn(Optional.of(masterService()));
@@ -292,7 +296,7 @@ class GuestBookingServiceTest {
         // 180-day cap and the 60-day availabilityMaxDays the public endpoint serves.
         OffsetDateTime tooFar = OffsetDateTime.parse("2026-06-01T10:00:00Z").plusDays(400);
         // lenient: the fix may validate startsAt before OR after the master/service lookup.
-        lenient().when(guestTokenProvider.validate(anyString())).thenReturn(GUEST_PHONE);
+        lenient().when(guestTokenProvider.validateClaims(anyString())).thenReturn(GUEST_CLAIMS);
         lenient().when(masterRepository.findByBookingSlugWithUser(SLUG)).thenReturn(Optional.of(master()));
         lenient().when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, serviceId))
                 .thenReturn(Optional.of(masterService()));
@@ -311,7 +315,7 @@ class GuestBookingServiceTest {
     @Test
     @DisplayName("should propagate JwtException (→401) when the guest token is expired/invalid")
     void should_throwJwt_when_tokenExpired() {
-        when(guestTokenProvider.validate(anyString()))
+        when(guestTokenProvider.validateClaims(anyString()))
                 .thenThrow(new io.jsonwebtoken.ExpiredJwtException(null, null, "expired"));
 
         assertThatThrownBy(() -> service.createGuestBooking(
@@ -342,7 +346,7 @@ class GuestBookingServiceTest {
         OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
         UUID secondServiceId = UUID.randomUUID();
         UUID thirdServiceId = UUID.randomUUID();
-        when(guestTokenProvider.validate(anyString())).thenReturn(GUEST_PHONE);
+        when(guestTokenProvider.validateClaims(anyString())).thenReturn(GUEST_CLAIMS);
         when(masterRepository.findByBookingSlugWithUser(SLUG)).thenReturn(Optional.of(master()));
         // The visit path resolves the whole chain through VisitPlanner, which batch-loads the
         // DISTINCT id set in ONE round-trip (perf LOW, 2026-08-22) rather than one SELECT per id.
@@ -427,7 +431,7 @@ class GuestBookingServiceTest {
     void should_storeNoteOnHeaderOnly_when_visitBooked() {
         OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
         UUID secondServiceId = UUID.randomUUID();
-        when(guestTokenProvider.validate(anyString())).thenReturn(GUEST_PHONE);
+        when(guestTokenProvider.validateClaims(anyString())).thenReturn(GUEST_CLAIMS);
         when(masterRepository.findByBookingSlugWithUser(SLUG)).thenReturn(Optional.of(master()));
         when(masterServiceRepository.findByMasterIdAndIdInWithGraph(masterId, Set.of(serviceId, secondServiceId)))
                 .thenReturn(List.of(masterService(), masterService(secondServiceId, "Педикюр")));
@@ -461,7 +465,7 @@ class GuestBookingServiceTest {
     void should_persistIdenticalConsentOnHeaderAndChildren_when_visitBooked() {
         OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
         UUID secondServiceId = UUID.randomUUID();
-        when(guestTokenProvider.validate(anyString())).thenReturn(GUEST_PHONE);
+        when(guestTokenProvider.validateClaims(anyString())).thenReturn(GUEST_CLAIMS);
         when(masterRepository.findByBookingSlugWithUser(SLUG)).thenReturn(Optional.of(master()));
         when(masterServiceRepository.findByMasterIdAndIdInWithGraph(masterId, Set.of(serviceId, secondServiceId)))
                 .thenReturn(List.of(masterService(), masterService(secondServiceId, "Педикюр")));
@@ -493,7 +497,7 @@ class GuestBookingServiceTest {
             + "masterServiceIds visit is booked")
     void should_sendBareServiceName_when_guestVisitCarriesASingleService() {
         OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
-        when(guestTokenProvider.validate(anyString())).thenReturn(GUEST_PHONE);
+        when(guestTokenProvider.validateClaims(anyString())).thenReturn(GUEST_CLAIMS);
         when(masterRepository.findByBookingSlugWithUser(SLUG)).thenReturn(Optional.of(master()));
         // Single-element masterServiceIds still goes through the planner's BATCH finder — N = 1 is
         // not special-cased there either.
@@ -525,7 +529,7 @@ class GuestBookingServiceTest {
     // ── helpers ──────────────────────────────────────────────────────────────
 
     private void stubHappyPath(OffsetDateTime startsAt) {
-        when(guestTokenProvider.validate(anyString())).thenReturn(GUEST_PHONE);
+        when(guestTokenProvider.validateClaims(anyString())).thenReturn(GUEST_CLAIMS);
         when(masterRepository.findByBookingSlugWithUser(SLUG)).thenReturn(Optional.of(master()));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, serviceId))
                 .thenReturn(Optional.of(masterService()));
@@ -574,7 +578,7 @@ class GuestBookingServiceTest {
         // cancellation link expanded a second time, in a position the provider chose, inside a
         // message the guest reads as platform copy.
         OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
-        when(guestTokenProvider.validate(anyString())).thenReturn(GUEST_PHONE);
+        when(guestTokenProvider.validateClaims(anyString())).thenReturn(GUEST_CLAIMS);
         when(masterRepository.findByBookingSlugWithUser(SLUG)).thenReturn(Optional.of(master()));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, serviceId))
                 .thenReturn(Optional.of(masterService(serviceId, "Манікюр {cancelUrl} {date}")));
@@ -742,7 +746,7 @@ class GuestBookingServiceTest {
     @DisplayName("phase 379: booking miss + MASTER tombstone → GoneException, nothing saved or sent")
     void should_throwGoneAndPersistNothing_when_bookingSlugRetired() {
         OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
-        when(guestTokenProvider.validate(anyString())).thenReturn(GUEST_PHONE);
+        when(guestTokenProvider.validateClaims(anyString())).thenReturn(GUEST_CLAIMS);
         when(masterRepository.findByBookingSlugWithUser(SLUG)).thenReturn(Optional.empty());
         org.mockito.Mockito.doThrow(com.beautica.common.exception.GoneException.bookingLinkRetired())
                 .when(retiredBookingSlugGuard).throwGoneIfRetired(com.beautica.booking.dto.BookingLinkKind.MASTER, SLUG);
@@ -758,12 +762,178 @@ class GuestBookingServiceTest {
     @DisplayName("phase 379: booking miss without tombstone → unchanged 404")
     void should_throwNotFound_when_bookingSlugUnknownAndNotRetired() {
         OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
-        when(guestTokenProvider.validate(anyString())).thenReturn(GUEST_PHONE);
+        when(guestTokenProvider.validateClaims(anyString())).thenReturn(GUEST_CLAIMS);
         when(masterRepository.findByBookingSlugWithUser(SLUG)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> service.createGuestBooking("Bearer t", SLUG,
                 new GuestBookingRequest(serviceId, null, startsAt, "Олена", "Коваль", true, "2026-10-20")))
                 .isInstanceOf(NotFoundException.class);
         verify(retiredBookingSlugGuard).throwGoneIfRetired(com.beautica.booking.dto.BookingLinkKind.MASTER, SLUG);
+    }
+
+    // ── phases 392/393 — salon-scoped guest routes ───────────────────────────────────────────
+
+    private static final String SALON_SLUG = "studiia-krasa-ab12";
+
+    @Test
+    @DisplayName("phase 392: salonAvailableSlots — N=1 → cached single-service slots of the RESOLVED master; "
+            + "N>1 → summed-visit overload; the master-slug finders are never touched")
+    void should_routeLikeMasterRoute_when_salonAvailabilityRequested() {
+        UUID second = UUID.randomUUID();
+        var single = List.<com.beautica.booking.dto.AvailableSlotResponse>of();
+        var multi = List.<com.beautica.booking.dto.AvailableSlotResponse>of();
+        when(salonGuestMasterResolver.resolveBookableMasterId(SALON_SLUG, masterId)).thenReturn(masterId);
+        when(slotCalculationService.getAvailableSlots(masterId, TODAY, serviceId)).thenReturn(single);
+        when(slotCalculationService.getAvailableSlots(masterId, TODAY, List.of(serviceId, second))).thenReturn(multi);
+
+        var one = service.salonAvailableSlots(SALON_SLUG, masterId, TODAY, List.of(serviceId));
+        var two = service.salonAvailableSlots(SALON_SLUG, masterId, TODAY, List.of(serviceId, second));
+
+        assertThat(one).isSameAs(single);
+        assertThat(two).isSameAs(multi);
+        verifyNoInteractions(masterRepository, retiredBookingSlugGuard);
+    }
+
+    @Test
+    @DisplayName("phase 392: salonAvailableSlots — date outside the guest window → 400 before the master is resolved")
+    void should_throw400BeforeResolving_when_salonAvailabilityDateOutsideWindow() {
+        assertThatThrownBy(() -> service.salonAvailableSlots(SALON_SLUG, masterId, TODAY.minusDays(1), List.of(serviceId)))
+                .isInstanceOf(BusinessException.class).hasMessage("date is in the past");
+        verifyNoInteractions(salonGuestMasterResolver, slotCalculationService);
+    }
+
+    @Test
+    @DisplayName("phase 392: salonAvailableSlots — resolver 404 (foreign master) propagates, slot walk never runs")
+    void should_propagate404_when_salonMasterNotResolvable() {
+        when(salonGuestMasterResolver.resolveBookableMasterId(SALON_SLUG, masterId))
+                .thenThrow(new NotFoundException("Booking page not found"));
+
+        assertThatThrownBy(() -> service.salonAvailableSlots(SALON_SLUG, masterId, TODAY, List.of(serviceId)))
+                .isInstanceOf(NotFoundException.class);
+        verifyNoInteractions(slotCalculationService);
+    }
+
+    @Test
+    @DisplayName("phase 392: salonBookableDays — same guards (inverted / past → 400, no resolve) and same day-gate routing")
+    void should_guardAndRoute_when_salonBookableDaysRequested() {
+        var days = List.of(new com.beautica.master.dto.MasterWorkingDayResponse(TODAY, true));
+        when(salonGuestMasterResolver.resolveBookableMasterId(SALON_SLUG, masterId)).thenReturn(masterId);
+        when(slotCalculationService.getBookableWorkingDays(masterId, TODAY, TODAY.plusDays(6), serviceId))
+                .thenReturn(days);
+
+        assertThatThrownBy(() -> service.salonBookableDays(SALON_SLUG, masterId, TODAY.plusDays(3), TODAY.plusDays(2),
+                List.of(serviceId))).isInstanceOf(BusinessException.class).hasMessage("from must not be after to");
+        assertThatThrownBy(() -> service.salonBookableDays(SALON_SLUG, masterId, TODAY.minusDays(1), TODAY,
+                List.of(serviceId))).isInstanceOf(BusinessException.class);
+        var result = service.salonBookableDays(SALON_SLUG, masterId, TODAY, TODAY.plusDays(6), List.of(serviceId));
+
+        assertThat(result).isSameAs(days);
+        verify(salonGuestMasterResolver, org.mockito.Mockito.times(1)).resolveBookableMasterId(SALON_SLUG, masterId);
+        verifyNoInteractions(masterRepository);
+    }
+
+    @Test
+    @DisplayName("phase 393: createSalonGuestBooking — books the RESOLVED salon master through the shared create "
+            + "body (CONFIRMED LINK row, SMS with cancel link), never the master-slug finder")
+    void should_createConfirmedBooking_when_salonRouteResolvesMaster() {
+        OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
+        when(guestTokenProvider.validateClaims(anyString())).thenReturn(GUEST_CLAIMS);
+        when(salonGuestMasterResolver.resolveBookableMaster(SALON_SLUG, masterId)).thenReturn(master());
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, serviceId))
+                .thenReturn(Optional.of(masterService()));
+        when(bookingRepository.acquireAdvisoryLockWithTimeout(masterId)).thenReturn(1);
+        stubSlotAvailable(startsAt);
+        when(bookingRepository.saveAll(any())).thenAnswer(inv -> inv.getArgument(0));
+
+        GuestBookingResponse response = service.createSalonGuestBooking("Bearer guest.jwt", SALON_SLUG, masterId,
+                new GuestBookingRequest(serviceId, null, startsAt, "Олена", "Коваль", true, "2026-10-20"));
+
+        ArgumentCaptor<List<Booking>> saved = ArgumentCaptor.forClass(List.class);
+        verify(bookingRepository).saveAll(saved.capture());
+        assertThat(saved.getValue().get(0).getBookingSource()).isEqualTo(BookingSource.LINK);
+        assertThat(saved.getValue().get(0).getGuestPhone()).isEqualTo(GUEST_PHONE);
+        assertThat(response.cancelUrl()).startsWith(FRONTEND + "/book/cancel/");
+        verify(smsService).send(eq(GUEST_PHONE), org.mockito.ArgumentMatchers.contains(response.cancelUrl()));
+        verify(masterRepository, never()).findByBookingSlugWithUser(any());
+    }
+
+    @Test
+    @DisplayName("phase 393: createSalonGuestBooking — missing/invalid guest token → JwtException BEFORE the master "
+            + "is resolved (401 never leaks master existence)")
+    void should_rejectTokenBeforeResolving_when_salonBookingTokenMissing() {
+        OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
+
+        assertThatThrownBy(() -> service.createSalonGuestBooking(null, SALON_SLUG, masterId,
+                new GuestBookingRequest(serviceId, null, startsAt, "Олена", "Коваль", true, "2026-10-20")))
+                .isInstanceOf(io.jsonwebtoken.JwtException.class);
+        verifyNoInteractions(salonGuestMasterResolver, bookingRepository);
+    }
+
+    @Test
+    @DisplayName("phase 393: createSalonGuestBooking — resolver 410/404 propagates, nothing persisted or notified")
+    void should_persistNothing_when_salonMasterNotResolvable() {
+        OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
+        when(guestTokenProvider.validateClaims(anyString())).thenReturn(GUEST_CLAIMS);
+        when(salonGuestMasterResolver.resolveBookableMaster(SALON_SLUG, masterId))
+                .thenThrow(com.beautica.common.exception.GoneException.bookingLinkRetired());
+
+        assertThatThrownBy(() -> service.createSalonGuestBooking("Bearer t", SALON_SLUG, masterId,
+                new GuestBookingRequest(serviceId, null, startsAt, "Олена", "Коваль", true, "2026-10-20")))
+                .isInstanceOf(com.beautica.common.exception.GoneException.class);
+        verify(bookingRepository, never()).saveAll(any());
+        verifyNoInteractions(outboxService, smsService);
+    }
+
+    // ── phase 393 audit: per-guest-token booking cap ────────────────────────────────────────────
+
+    @Test
+    @DisplayName("phase 393 audit: both create routes reserve the per-token cap with the VERIFIED token claims")
+    void should_reservePerTokenCap_when_eitherRouteCreates() {
+        OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
+        when(guestTokenProvider.validateClaims(anyString())).thenReturn(GUEST_CLAIMS);
+        when(salonGuestMasterResolver.resolveBookableMaster(SALON_SLUG, masterId))
+                .thenThrow(new com.beautica.common.exception.NotFoundException("Booking page not found"));
+        when(masterRepository.findByBookingSlugWithUser(SLUG))
+                .thenThrow(new com.beautica.common.exception.NotFoundException("Booking page not found"));
+        GuestBookingRequest req = new GuestBookingRequest(serviceId, null, startsAt, "Олена", "Коваль", true, "2026-10-20");
+
+        assertThatThrownBy(() -> service.createSalonGuestBooking("Bearer t", SALON_SLUG, masterId, req))
+                .isInstanceOf(com.beautica.common.exception.NotFoundException.class);
+        assertThatThrownBy(() -> service.createGuestBooking("Bearer t", SLUG, req))
+                .isInstanceOf(com.beautica.common.exception.NotFoundException.class);
+
+        verify(guestTokenBookingCap, org.mockito.Mockito.times(2)).reserve(GUEST_CLAIMS);
+    }
+
+    @Test
+    @DisplayName("phase 393 audit: cap exhausted → 429 on BOTH routes before any master lookup, write, SMS")
+    void should_throw429AndTouchNothing_when_perTokenCapExhausted() {
+        OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
+        when(guestTokenProvider.validateClaims(anyString())).thenReturn(GUEST_CLAIMS);
+        org.mockito.Mockito.doThrow(new BusinessException(org.springframework.http.HttpStatus.TOO_MANY_REQUESTS, "cap"))
+                .when(guestTokenBookingCap).reserve(GUEST_CLAIMS);
+        GuestBookingRequest req = new GuestBookingRequest(serviceId, null, startsAt, "Олена", "Коваль", true, "2026-10-20");
+
+        assertThatThrownBy(() -> service.createSalonGuestBooking("Bearer t", SALON_SLUG, masterId, req))
+                .isInstanceOf(BusinessException.class)
+                .extracting("status").isEqualTo(org.springframework.http.HttpStatus.TOO_MANY_REQUESTS);
+        assertThatThrownBy(() -> service.createGuestBooking("Bearer t", SLUG, req))
+                .isInstanceOf(BusinessException.class)
+                .extracting("status").isEqualTo(org.springframework.http.HttpStatus.TOO_MANY_REQUESTS);
+
+        verifyNoInteractions(salonGuestMasterResolver, masterRepository, bookingRepository, outboxService, smsService);
+    }
+
+    @Test
+    @DisplayName("phase 393 audit: an invalid token is rejected (401) before the cap is touched")
+    void should_notTouchCap_when_tokenInvalid() {
+        when(guestTokenProvider.validateClaims(anyString()))
+                .thenThrow(new io.jsonwebtoken.MalformedJwtException("bad"));
+
+        assertThatThrownBy(() -> service.createGuestBooking("Bearer bad", SLUG, new GuestBookingRequest(
+                serviceId, null, OffsetDateTime.parse("2026-06-10T12:00:00+03:00"), "A", "B", true, "2026-10-20")))
+                .isInstanceOf(io.jsonwebtoken.JwtException.class);
+
+        verifyNoInteractions(guestTokenBookingCap);
     }
 }

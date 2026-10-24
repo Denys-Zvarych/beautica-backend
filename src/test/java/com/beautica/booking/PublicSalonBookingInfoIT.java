@@ -68,8 +68,11 @@ class PublicSalonBookingInfoIT extends AbstractIntegrationTest {
 
     /**
      * Worst case (every inner cache cold): salon row + masters batch + portfolio + rating GROUP BY + newest reviews
-     * = 5 statements of the page itself, plus the 6 of {@code getSalonServiceCatalog} (reused unchanged, REUSE-FIRST;
-     * it is cached under salon-service-catalog, so the warm figure is {@link #WARM_CATALOGUE_STATEMENT_BUDGET}).
+     * = 5 statements of the page itself, plus the 6 of {@code ServiceCatalogService#getSalonCatalogSnapshot} — the
+     * app catalogue's own builder, which since the phase 391 audit (perf MEDIUM-1) also yields serviceCoverage from
+     * the SAME candidate load + batch, so the gate never runs twice (it was 15 = 5 + 6 + a second 4-statement
+     * coverage batch). Cached under salon-catalog-snapshot, so the warm figure is
+     * {@link #WARM_CATALOGUE_STATEMENT_BUDGET}.
      */
     private static final int MISS_STATEMENT_BUDGET = 11;
     private static final int WARM_CATALOGUE_STATEMENT_BUDGET = 5;
@@ -181,8 +184,9 @@ class PublicSalonBookingInfoIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("legacy master (booking_slug NULL) is omitted, never issued a slug, and the GET does zero writes / transactions")
-    void should_omitLegacyMasterWithoutWriting_when_masterHasNoSlug() throws Exception {
+    @DisplayName("phase 391 D3: slug-less master is LISTED with masterSlug null (bookable by id through the salon), "
+            + "never issued a slug, and the GET does zero writes")
+    void should_listSlugLessMasterWithoutWriting_when_masterHasNoSlug() throws Exception {
         PublicBookingPageFixtures.SalonPage salon = pages.salon("Slug Salon");
         UUID legacy = pages.legacySalonMaster(salon.salonId(), "Iryna", "Lehasi");
         BookableMasterSeeder.makeBookable(jdbcTemplate, salon.salonId(), legacy);
@@ -199,22 +203,29 @@ class PublicSalonBookingInfoIT extends AbstractIntegrationTest {
                 .isEqualTo(1);
         assertThat(masterSlugOf(legacy)).as("no slug issued by the public page").isNull();
         assertThat(masterSlugOf(stored)).as("stored slug never rewritten").isEqualTo("maria-stara-zz11");
-        assertThat(measured.result().masters()).extracting("masterSlug").containsExactly("maria-stara-zz11");
+        assertThat(measured.result().masters()).extracting("masterId").containsExactlyInAnyOrder(legacy, stored);
+        assertThat(measured.result().masters()).filteredOn(m -> m.masterId().equals(legacy))
+                .extracting("masterSlug").containsExactly((Object) null);
+        assertThat(measured.result().masters()).filteredOn(m -> m.masterId().equals(stored))
+                .extracting("masterSlug").containsExactly("maria-stara-zz11");
         assertThat(anonymousGet("/api/v1/book/maria-stara-zz11/info").getStatusCode())
                 .as("the listed masterSlug opens the master booking flow").isEqualTo(HttpStatus.OK);
     }
 
     @Test
-    @DisplayName("only slug-less bookable masters → 200, bookable=false (omission never 404s the page)")
-    void should_returnNotBookable_when_onlyLegacyMastersAreBookable() throws Exception {
+    @DisplayName("phase 391 D3: only slug-less bookable masters → 200, bookable=true, listed with masterSlug null "
+            + "(reversal of the 377 audit omission — the salon routes book by master id)")
+    void should_returnBookable_when_onlySlugLessMastersAreBookable() throws Exception {
         PublicBookingPageFixtures.SalonPage salon = pages.salon("Legacy Only Salon");
         UUID legacy = pages.legacySalonMaster(salon.salonId(), "Tilky", "Lehasi");
         BookableMasterSeeder.makeBookable(jdbcTemplate, salon.salonId(), legacy);
 
         JsonNode page = page(salon.slug());
 
-        assertThat(page.path("bookable").asBoolean()).isFalse();
-        assertThat(page.path("masters")).isEmpty();
+        assertThat(page.path("bookable").asBoolean()).isTrue();
+        assertThat(page.path("masters")).hasSize(1);
+        assertThat(page.path("masters").get(0).path("masterId").asText()).isEqualTo(legacy.toString());
+        assertThat(page.path("masters").get(0).path("masterSlug").isNull()).isTrue();
         assertThat(masterSlugOf(legacy)).isNull();
     }
 
@@ -269,7 +280,8 @@ class PublicSalonBookingInfoIT extends AbstractIntegrationTest {
     // ── public surface (§I) ──────────────────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("anonymous 200 carries exactly the D7 fields — no owner id/email/phone, no master/user ids")
+    @DisplayName("anonymous 200 carries exactly the D7 fields (+ phase 391 masterId / serviceCoverage) — no owner "
+            + "id/email/phone, no user ids")
     void should_exposeOnlyPublicFields_when_anonymous() throws Exception {
         PublicBookingPageFixtures.SalonPage salon = pages.salon("Public Salon");
         jdbcTemplate.update("UPDATE salons SET phone = '+380501112233' WHERE id = ?", salon.salonId());
@@ -286,15 +298,120 @@ class PublicSalonBookingInfoIT extends AbstractIntegrationTest {
         assertThat(fieldNames(page)).containsExactlyInAnyOrder(
                 "salonId", "name", "city", "avatarUrl", "coverImageUrl", "avgRating", "reviewCount",
                 "bookable", "masters", "region", "street", "buildingNo", "updatedAt", "description", "locationNote",
-                "portfolio", "serviceCategories", "ratingDistribution", "latestReviews");
+                "portfolio", "serviceCategories", "ratingDistribution", "latestReviews", "serviceCoverage");
         assertThat(fieldNames(page.path("masters").get(0)))
                 .containsExactlyInAnyOrder("masterSlug", "name", "avatarUrl", "professionalTitle", "avgRating",
-                        "reviewCount");
+                        "reviewCount", "masterId");
+        assertThat(page.path("masters").get(0).path("masterId").asText()).isEqualTo(master.toString());
         assertThat(response.getBody())
                 .doesNotContain(ownerEmail)
                 .doesNotContain("+380501112233")
-                .doesNotContain(master.toString())
                 .doesNotContain(userIdOf(master).toString());
+    }
+
+    // ── phase 391: serviceCoverage ───────────────────────────────────────────────────────────
+
+    /** Assigns {@code masterId} to the EXISTING definition {@code defId}; returns the new assignment id. */
+    private UUID assignExisting(UUID masterId, UUID defId) {
+        UUID id = UUID.randomUUID();
+        jdbcTemplate.update("INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, "
+                + "updated_at) VALUES (?, ?, ?, true, NOW(), NOW())", id, masterId, defId);
+        return id;
+    }
+
+    private UUID assignmentOf(UUID masterId, UUID defId) {
+        return jdbcTemplate.queryForObject("SELECT id FROM master_services WHERE master_id = ? AND service_def_id = ?",
+                UUID.class, masterId, defId);
+    }
+
+    private static List<String> coverageMasterIds(JsonNode coverage, UUID serviceId) {
+        List<String> ids = new ArrayList<>();
+        coverage.forEach(entry -> {
+            if (entry.path("serviceId").asText().equals(serviceId.toString())) {
+                entry.path("masters").forEach(ref -> ids.add(ref.path("masterId").asText()));
+            }
+        });
+        return ids;
+    }
+
+    @Test
+    @DisplayName("phase 391: serviceCoverage — per catalogue service, exactly its bookable performers (roster order) "
+            + "with their own assignment ids; a schedule-less or inactive performer is never listed")
+    void should_mapServicesToBookablePerformers_when_salonHasSharedAndExclusiveServices() throws Exception {
+        PublicBookingPageFixtures.SalonPage salon = pages.salon("Coverage Salon");
+        UUID anna = pages.salonMaster(salon.salonId(), "Anna", "Bila");
+        UUID olha = pages.legacySalonMaster(salon.salonId(), "Olha", "Chorna");
+        UUID noSchedule = pages.salonMaster(salon.salonId(), "Bez", "Hrafika");
+        UUID inactive = pages.salonMaster(salon.salonId(), "Ne", "Aktyvna");
+        BookableMasterSeeder.seedUsableSchedule(jdbcTemplate, anna);
+        BookableMasterSeeder.seedUsableSchedule(jdbcTemplate, olha);
+        BookableMasterSeeder.seedUsableSchedule(jdbcTemplate, inactive);
+        UUID shared = BookableMasterSeeder.assignNewSalonService(jdbcTemplate, salon.salonId(), anna);
+        UUID annaOnly = BookableMasterSeeder.assignNewSalonService(jdbcTemplate, salon.salonId(), anna);
+        pages.categorise(shared);
+        pages.categorise(annaOnly);
+        UUID olhaShared = assignExisting(olha, shared);
+        assignExisting(noSchedule, shared);
+        assignExisting(inactive, shared);
+        jdbcTemplate.update("UPDATE masters SET is_active = false WHERE id = ?", inactive);
+        jdbcTemplate.update("UPDATE masters SET avg_rating = 4.90, review_count = 3 WHERE id = ?", olha);
+
+        JsonNode page = page(salon.slug());
+        JsonNode coverage = page.path("serviceCoverage");
+
+        List<String> serviceOrder = new ArrayList<>();
+        page.path("serviceCategories").forEach(g -> g.path("services").forEach(sd -> serviceOrder.add(sd.path("id").asText())));
+        List<String> coverageOrder = new ArrayList<>();
+        coverage.forEach(entry -> coverageOrder.add(entry.path("serviceId").asText()));
+        assertThat(coverageOrder).as("one entry per catalogue service, same order").isEqualTo(serviceOrder)
+                .containsExactlyInAnyOrder(shared.toString(), annaOnly.toString());
+        assertThat(coverageMasterIds(coverage, shared)).as("roster order: rating DESC")
+                .containsExactly(olha.toString(), anna.toString());
+        assertThat(coverageMasterIds(coverage, annaOnly)).containsExactly(anna.toString());
+        List<String> rosterIds = new ArrayList<>();
+        page.path("masters").forEach(m -> rosterIds.add(m.path("masterId").asText()));
+        assertThat(rosterIds).containsExactly(olha.toString(), anna.toString());
+        coverage.forEach(entry -> entry.path("masters").forEach(ref -> {
+            UUID master = UUID.fromString(ref.path("masterId").asText());
+            UUID def = UUID.fromString(entry.path("serviceId").asText());
+            assertThat(ref.path("masterServiceId").asText()).isEqualTo(assignmentOf(master, def).toString());
+        }));
+        assertThat(coverage.toString()).contains(olhaShared.toString())
+                .doesNotContain(noSchedule.toString()).doesNotContain(inactive.toString());
+        assertThat(page.toString()).doesNotContain(userIdOf(anna).toString()).doesNotContain(userIdOf(olha).toString())
+                .doesNotContain(PublicBookingPageFixtures.SEEDED_PHONE);
+    }
+
+    @Test
+    @DisplayName("phase 391: coverage agrees with the app's GET /salons/{id}/services/{defId}/masters for every service")
+    void should_matchAppMasterSelection_when_coverageComparedPerService() throws Exception {
+        PublicBookingPageFixtures.SalonPage salon = pages.salon("Coverage Parity Salon");
+        UUID anna = pages.salonMaster(salon.salonId(), "Anna", "Bila");
+        UUID olha = pages.salonMaster(salon.salonId(), "Olha", "Chorna");
+        BookableMasterSeeder.seedUsableSchedule(jdbcTemplate, anna);
+        BookableMasterSeeder.seedUsableSchedule(jdbcTemplate, olha);
+        UUID s1 = BookableMasterSeeder.assignNewSalonService(jdbcTemplate, salon.salonId(), anna);
+        UUID s2 = BookableMasterSeeder.assignNewSalonService(jdbcTemplate, salon.salonId(), olha);
+        assignExisting(olha, s1);
+        pages.categorise(s1);
+        pages.categorise(s2);
+
+        JsonNode coverage = page(salon.slug()).path("serviceCoverage");
+
+        for (UUID def : List.of(s1, s2)) {
+            JsonNode app = objectMapper.readTree(anonymousGet("/api/v1/salons/" + salon.salonId() + "/services/" + def
+                    + "/masters").getBody()).path("data");
+            java.util.Set<String> appPairs = new java.util.HashSet<>();
+            app.forEach(m -> appPairs.add(m.path("masterId").asText() + "/" + m.path("masterServiceId").asText()));
+            java.util.Set<String> pagePairs = new java.util.HashSet<>();
+            coverage.forEach(entry -> {
+                if (entry.path("serviceId").asText().equals(def.toString())) {
+                    entry.path("masters").forEach(ref -> pagePairs.add(
+                            ref.path("masterId").asText() + "/" + ref.path("masterServiceId").asText()));
+                }
+            });
+            assertThat(pagePairs).as("service %s", def).isNotEmpty().isEqualTo(appPairs);
+        }
     }
 
     // ── phase 384: tabs ──────────────────────────────────────────────────────────────────────
@@ -353,9 +470,12 @@ class PublicSalonBookingInfoIT extends AbstractIntegrationTest {
         assertThat(keySet(page)).isEqualTo(java.util.Set.of(
                 "salonId", "name", "city", "avatarUrl", "coverImageUrl", "avgRating", "reviewCount", "bookable",
                 "masters", "region", "street", "buildingNo", "updatedAt", "description", "locationNote", "portfolio",
-                "serviceCategories", "ratingDistribution", "latestReviews"));
+                "serviceCategories", "ratingDistribution", "latestReviews", "serviceCoverage"));
         assertThat(keySet(page.path("masters").get(0))).isEqualTo(java.util.Set.of(
-                "masterSlug", "name", "avatarUrl", "professionalTitle", "avgRating", "reviewCount"));
+                "masterSlug", "name", "avatarUrl", "professionalTitle", "avgRating", "reviewCount", "masterId"));
+        assertThat(keySet(page.path("serviceCoverage").get(0))).isEqualTo(java.util.Set.of("serviceId", "masters"));
+        assertThat(keySet(page.path("serviceCoverage").get(0).path("masters").get(0)))
+                .isEqualTo(java.util.Set.of("masterId", "masterServiceId"));
         assertThat(keySet(page.path("portfolio").get(0)))
                 .isEqualTo(java.util.Set.of("id", "entityType", "entityId", "mediaType", "url", "createdAt"));
         JsonNode group = page.path("serviceCategories").get(0);
@@ -476,7 +596,8 @@ class PublicSalonBookingInfoIT extends AbstractIntegrationTest {
         for (int i = 1; i <= 13; i++) {
             insertSalonPhoto(salon.salonId(), i);
         }
-        for (String cache : List.of("salon-booking-slug-info", "salon-service-catalog", "portfolio", "reviews-by-salon")) {
+        for (String cache : List.of("salon-booking-slug-info", "salon-service-catalog", "salon-catalog-snapshot",
+                "portfolio", "reviews-by-salon")) {
             cacheManager.getCache(cache).clear();
         }
 
@@ -762,7 +883,7 @@ class PublicSalonBookingInfoIT extends AbstractIntegrationTest {
         assertThat(fieldNames(page)).containsExactlyInAnyOrder("salonId", "name", "city", "avatarUrl",
                 "coverImageUrl", "avgRating", "reviewCount", "bookable", "masters", "region", "street",
                 "buildingNo", "updatedAt", "description", "locationNote", "portfolio", "serviceCategories",
-                "ratingDistribution", "latestReviews");
+                "ratingDistribution", "latestReviews", "serviceCoverage");
     }
 
     @Test

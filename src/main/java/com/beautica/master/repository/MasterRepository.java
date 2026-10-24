@@ -184,15 +184,17 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
      * master), joined to the live {@code users} row for the display columns — never one query per master.
      * An active master always has a user (a detached row is {@code is_active = false}). Ordered like the
      * public roster ({@code avg_rating DESC}, id tiebreak); capped by {@code limit} (one salon's headcount).
-     * Slug-less (legacy, pre-V86) masters are EXCLUDED ({@code booking_slug IS NOT NULL}, phase 377 audit):
-     * the anonymous read path never writes, so such a master is omitted from the page until its slug is
-     * issued via {@code GET /booking-links/mine} (phase 375); every master created since 13.1 has one.
+     * Phase 391 D3: slug-less masters (legacy pre-V86 rows, or a revoked personal link, phase 378) are LISTED,
+     * with a {@code null} slug — the salon flow books them by master id
+     * ({@code /book/s/{slug}/masters/{masterId}/*}), so the phase 377 audit's {@code booking_slug IS NOT NULL}
+     * omission (which existed only because the page had no other way to book such a master) is gone. The
+     * anonymous read path still never writes a slug.
      */
     @Query(value = "SELECT m.id AS id, m.booking_slug AS bookingSlug, u.first_name AS firstName, "
             + "u.last_name AS lastName, u.avatar_url AS avatarUrl, u.professional_title AS professionalTitle, "
             + "m.avg_rating AS avgRating, m.review_count AS reviewCount "
             + "FROM masters m JOIN users u ON u.id = m.user_id "
-            + "WHERE m.salon_id = :salonId AND m.is_active = true AND m.booking_slug IS NOT NULL AND "
+            + "WHERE m.salon_id = :salonId AND m.is_active = true AND "
             + MasterBookabilitySql.BOOKABLE_MASTER_M
             + " ORDER BY m.avg_rating DESC NULLS LAST, m.id LIMIT :limit",
             nativeQuery = true)
@@ -730,6 +732,49 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
               AND (s IS NULL OR s.isActive = true)
             """)
     Optional<com.beautica.common.ReviewTarget> findActiveReviewTargetByBookingSlug(@Param("slug") String slug);
+
+    /**
+     * Phase 393 — the salon-scoped twin of {@link #findByBookingSlugWithUser} for the public SALON guest
+     * booking ({@code POST /book/s/{slug}/masters/{masterId}/booking}): master {@code masterId} with its user
+     * and salon, but only when it is ACTIVE, attached to a user, and works in the ACTIVE salon whose public
+     * booking slug is {@code salonSlug}. Keyed by the salon slug + master id, never by a master booking slug
+     * (locked rule: salon masters have no personal share link).
+     *
+     * <p><b>The SOLE enforcement point of the salon-path visibility rule</b>, like the master-slug finder: a
+     * master of another salon, a deactivated master, a closed salon or an unknown slug all resolve to empty,
+     * and the caller answers one indistinguishable 404 (or 410 for a retired salon slug). INNER joins on both
+     * {@code user} (a detached master never resolves) and {@code salon} (an independent master has no salon
+     * page). To-one fetches on a single-row PK lookup: columns, never rows. Pinned by
+     * {@code MasterRepositorySalonSlugTest} (real query).
+     */
+    @Query("""
+            SELECT m FROM Master m
+            JOIN FETCH m.user
+            JOIN FETCH m.salon s
+            WHERE m.id = :masterId
+              AND s.bookingSlug = :salonSlug
+              AND s.isActive = true
+              AND m.isActive = true
+            """)
+    Optional<Master> findBookableBySalonSlugWithUser(
+            @Param("masterId") UUID masterId, @Param("salonSlug") String salonSlug);
+
+    /**
+     * Phase 392 — the id {@link #findBookableBySalonSlugWithUser} would return, as ONE scalar column (no
+     * Master/User/Salon hydration), for the salon-scoped guest slot reads
+     * ({@code GET /book/s/{slug}/masters/{masterId}/availability} and {@code /bookable-days}). Predicate is a
+     * byte-for-byte mirror of that finder, including the INNER {@code JOIN m.user}.
+     */
+    @Query("""
+            SELECT m.id FROM Master m
+            JOIN m.user
+            JOIN m.salon s
+            WHERE m.id = :masterId
+              AND s.bookingSlug = :salonSlug
+              AND s.isActive = true
+              AND m.isActive = true
+            """)
+    Optional<UUID> findBookableIdBySalonSlug(@Param("masterId") UUID masterId, @Param("salonSlug") String salonSlug);
 
     // ── phase 295 — salon-deletion staff HARD-DELETE cascade ────────────────────────────────────
 

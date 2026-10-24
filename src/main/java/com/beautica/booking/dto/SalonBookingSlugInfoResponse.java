@@ -16,7 +16,8 @@ import java.util.UUID;
  *
  * <p>Anti-Bug §I-2: a {@code permitAll} response. {@code salonId} is the salon's PUBLIC identifier (the
  * same one {@code GET /salons/{salonId}} is keyed by, D7); no owner id, owner/admin contact data or
- * internal flag appears. {@code masters} lists only bookable masters (locked client-visibility rule);
+ * internal flag appears; master ids (phase 391) are public identifiers already served by
+ * {@code GET /salons/{id}/masters}. {@code masters} lists only bookable masters (locked client-visibility rule);
  * {@code bookable} is {@code false} exactly when that list is empty (D3).
  */
 public record SalonBookingSlugInfoResponse(
@@ -67,6 +68,11 @@ public record SalonBookingSlugInfoResponse(
         List<RatingBucket> ratingDistribution,
         @Schema(requiredMode = Schema.RequiredMode.REQUIRED,
                 description = "The newest 5 reviews — the SalonReviewResponse rows of GET /salons/{id}/reviews.")
-        List<SalonReviewResponse> latestReviews
+        List<SalonReviewResponse> latestReviews,
+        @Schema(requiredMode = Schema.RequiredMode.REQUIRED,
+                description = "Phase 391 — per service of serviceCategories (same order): the bookable masters who "
+                        + "perform it, as {masterId, masterServiceId}; masters follow the roster order and are "
+                        + "always roster members. Drives the salon wizard's master step.")
+        List<SalonServiceCoverage> serviceCoverage
 ) {
 }

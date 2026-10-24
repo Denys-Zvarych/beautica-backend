@@ -48,8 +48,8 @@ class SalonBookingSlugServiceTest {
     /** Phase 384: the four tab blocks default to "nothing to show" (lenient: not every test reads them). */
     private void emptyTabs() {
         org.mockito.Mockito.lenient().when(mediaService.getLatestPortfolio(any(), any(), anyInt())).thenReturn(List.of());
-        org.mockito.Mockito.lenient().when(serviceCatalogService.getSalonServiceCatalog(any()))
-                .thenReturn(new com.beautica.service.dto.SalonServiceCatalogResponse(List.of()));
+        org.mockito.Mockito.lenient().when(serviceCatalogService.getSalonCatalogSnapshot(any()))
+                .thenReturn(com.beautica.service.dto.SalonCatalogSnapshot.EMPTY);
         org.mockito.Mockito.lenient().when(reviewService.getSalonReviewSummary(any(), any(), org.mockito.ArgumentMatchers.anyInt()))
                 .thenReturn(new com.beautica.review.dto.SalonReviewSummaryResponse(null, 0, List.of(
                         new com.beautica.common.RatingBucket(5, 0), new com.beautica.common.RatingBucket(4, 0),
@@ -237,8 +237,8 @@ class SalonBookingSlugServiceTest {
         when(row.getDescription()).thenReturn("Студія краси");
         when(row.getLocationNote()).thenReturn("Другий вхід");
         var group = new com.beautica.service.dto.SalonServiceCategoryGroup("NAILS", "Нігті", 0, List.of());
-        when(serviceCatalogService.getSalonServiceCatalog(salonId))
-                .thenReturn(new com.beautica.service.dto.SalonServiceCatalogResponse(List.of(group)));
+        when(serviceCatalogService.getSalonCatalogSnapshot(salonId)).thenReturn(new com.beautica.service.dto.SalonCatalogSnapshot(
+                new com.beautica.service.dto.SalonServiceCatalogResponse(List.of(group)), java.util.Map.of()));
         when(masterRepository.findBookingPageMastersBySalonId(salonId, TODAY, SalonBookingSlugService.MAX_MASTERS))
                 .thenReturn(List.of());
 
@@ -266,5 +266,74 @@ class SalonBookingSlugServiceTest {
         assertThat(page.masters()).extracting("reviewCount").containsExactly(12, 0);
         assertThat(page.masters().get(0).avgRating()).isEqualByComparingTo("4.75");
         assertThat(page.masters().get(1).avgRating()).as("stored 0.00 never reaches the wire").isNull();
+    }
+
+    // ── phase 391: serviceCoverage ───────────────────────────────────────────────────────────
+
+    private static com.beautica.service.dto.ServiceDefinitionResponse serviceWithId(UUID id) {
+        var sd = mock(com.beautica.service.dto.ServiceDefinitionResponse.class);
+        when(sd.id()).thenReturn(id);
+        return sd;
+    }
+
+    @Test
+    @DisplayName("phase 391: serviceCoverage — one entry per catalogue service in order; performers in ROSTER order; "
+            + "a non-roster performer dropped; a service without a performer gets []; roster carries masterId")
+    void should_buildCoverageInCatalogueAndRosterOrder_when_catalogueAndPerformersPresent() {
+        salonRow(0, null);
+        UUID first = UUID.randomUUID();
+        UUID second = UUID.randomUUID();
+        UUID outsideRoster = UUID.randomUUID();
+        SalonBookingPageMasterRow firstRow = masterRow("first-m-aa11", "Anna", "Bila");
+        when(firstRow.getId()).thenReturn(first);
+        SalonBookingPageMasterRow secondRow = masterRow(null, "Olha", "Chorna");
+        when(secondRow.getId()).thenReturn(second);
+        when(masterRepository.findBookingPageMastersBySalonId(salonId, TODAY, SalonBookingSlugService.MAX_MASTERS))
+                .thenReturn(List.of(firstRow, secondRow));
+        UUID s1 = UUID.randomUUID();
+        UUID s2 = UUID.randomUUID();
+        UUID s3 = UUID.randomUUID();
+        var sd1 = serviceWithId(s1);
+        var sd2 = serviceWithId(s2);
+        var sd3 = serviceWithId(s3);
+        var catalogue = new com.beautica.service.dto.SalonServiceCatalogResponse(List.of(
+                new com.beautica.service.dto.SalonServiceCategoryGroup("NAILS", "Нігті", 2, List.of(sd1, sd2)),
+                new com.beautica.service.dto.SalonServiceCategoryGroup("HAIR", "Волосся", 1, List.of(sd3))));
+        UUID a1 = UUID.randomUUID();
+        UUID b1 = UUID.randomUUID();
+        UUID a2 = UUID.randomUUID();
+        when(serviceCatalogService.getSalonCatalogSnapshot(salonId)).thenReturn(
+                new com.beautica.service.dto.SalonCatalogSnapshot(catalogue, java.util.Map.of(
+                s1, List.of(new com.beautica.booking.dto.SalonServiceMasterRef(second, b1),
+                        new com.beautica.booking.dto.SalonServiceMasterRef(outsideRoster, UUID.randomUUID()),
+                        new com.beautica.booking.dto.SalonServiceMasterRef(first, a1)),
+                s2, List.of(new com.beautica.booking.dto.SalonServiceMasterRef(first, a2)))));
+
+        SalonBookingSlugInfoResponse page = service.findBySlug(SLUG);
+
+        assertThat(page.masters()).extracting("masterId").containsExactly(first, second);
+        assertThat(page.masters().get(1).masterSlug()).as("slug-less master listed with null slug").isNull();
+        assertThat(page.serviceCoverage()).extracting("serviceId").containsExactly(s1, s2, s3);
+        assertThat(page.serviceCoverage().get(0).masters()).containsExactly(
+                new com.beautica.booking.dto.SalonServiceMasterRef(first, a1),
+                new com.beautica.booking.dto.SalonServiceMasterRef(second, b1));
+        assertThat(page.serviceCoverage().get(1).masters())
+                .containsExactly(new com.beautica.booking.dto.SalonServiceMasterRef(first, a2));
+        assertThat(page.serviceCoverage().get(2).masters()).isEmpty();
+    }
+
+    @Test
+    @DisplayName("phase 391 audit: catalogue and coverage come from ONE snapshot call — the app catalogue read "
+            + "(a second batch on a cold miss) is never made; empty catalogue → empty coverage")
+    void should_readOneSnapshotOnly_when_catalogueEmpty() {
+        salonRow(0, null);
+        when(masterRepository.findBookingPageMastersBySalonId(salonId, TODAY, SalonBookingSlugService.MAX_MASTERS))
+                .thenReturn(List.of());
+
+        SalonBookingSlugInfoResponse page = service.findBySlug(SLUG);
+
+        assertThat(page.serviceCoverage()).isEmpty();
+        org.mockito.Mockito.verify(serviceCatalogService).getSalonCatalogSnapshot(salonId);
+        org.mockito.Mockito.verifyNoMoreInteractions(serviceCatalogService);
     }
 }

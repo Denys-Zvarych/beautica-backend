@@ -69,4 +69,35 @@ class SalonCatalogCacheEvictorOrderingTest {
         assertThat(cacheManager.getCache("salon-service-catalog").get(salonId)).isNull();
         org.mockito.Mockito.verifyNoInteractions(salonBookingInfoCacheEvictor);
     }
+
+    @Test
+    @DisplayName("phase 391 audit: both evict methods drop salon-catalog-snapshot together with the catalogue")
+    void should_evictSnapshotWithCatalogue_when_eitherEvictCalled() {
+        Cache snapshot = cacheManager.getCache(ServiceCatalogService.SALON_CATALOG_SNAPSHOT_CACHE);
+        snapshot.put(salonId, "stale-snapshot");
+
+        evictor.evictCatalogOnly(salonId);
+        Object afterCatalogOnly = snapshot.get(salonId);
+        snapshot.put(salonId, "stale-snapshot");
+        evictor.evict(salonId);
+
+        assertThat(afterCatalogOnly).isNull();
+        assertThat(snapshot.get(salonId)).isNull();
+    }
+
+    @Test
+    @DisplayName("phase 391 audit: the page embeds the snapshot, so it too is gone BEFORE the page is evicted")
+    void should_haveEvictedSnapshot_when_salonPageIsEvicted() {
+        Cache snapshot = cacheManager.getCache(ServiceCatalogService.SALON_CATALOG_SNAPSHOT_CACHE);
+        snapshot.put(salonId, "stale-snapshot");
+        AtomicReference<Object> snapshotWhenPageEvicted = new AtomicReference<>("not-called");
+        doAnswer(invocation -> {
+            snapshotWhenPageEvicted.set(snapshot.get(salonId));
+            return null;
+        }).when(salonBookingInfoCacheEvictor).evictSalon(any());
+
+        evictor.evict(salonId);
+
+        assertThat(snapshotWhenPageEvicted.get()).isNull();
+    }
 }

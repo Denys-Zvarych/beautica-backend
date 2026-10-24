@@ -416,4 +416,52 @@ class GuestAvailabilityGetRateLimitTest {
         assertThat(leadingPad).isEqualTo(5);
         assertThat(trailingPad).isEqualTo(5);
     }
+
+    // ── phase 392 — salon-scoped twins share the guest availability bucket at the same price ────────
+
+    private static final String SALON_MASTER_PREFIX =
+            "/api/v1/book/s/studiia-krasa-ab12/masters/2f7a1c3e-1b2d-4c5e-8f90-123456789abc";
+
+    @Test
+    @DisplayName("phase 392: salon /availability is throttled by the guest availability bucket (429 on flood)")
+    void should_return429_when_salonAvailabilityFloodedFromOneIp() throws Exception {
+        AuthRateLimitFilter filter = realFilter();
+
+        int allowed = allowedBeforeThrottle(filter, get(SALON_MASTER_PREFIX + "/availability", REMOTE_ADDR));
+
+        assertThat(allowed).as("same 60-token budget as the master route").isEqualTo(60);
+    }
+
+    @Test
+    @DisplayName("phase 392: salon /bookable-days pays the span-weighted price — a 61-day window costs 5 → 12 calls")
+    void should_chargeSpanWeightedTokens_when_salonBookableDaysWideWindow() throws Exception {
+        AuthRateLimitFilter filter = realFilter();
+        var request = get(SALON_MASTER_PREFIX + "/bookable-days", REMOTE_ADDR);
+        request.addParameter("from", FROM);
+        request.addParameter("to", "2026-12-31");
+        request.addParameter("serviceId", UUID.randomUUID().toString());
+
+        assertThat(allowedBeforeThrottle(filter, request)).isEqualTo(12);
+    }
+
+    @Test
+    @DisplayName("phase 392: master-route and salon-route reads share ONE budget per IP")
+    void should_shareOneBudget_when_masterRouteExhaustedThenSalonRouteRead() throws Exception {
+        AuthRateLimitFilter filter = realFilter();
+        for (int i = 0; i < REQUESTS_TO_FIRE; i++) {
+            filter.doFilterInternal(get(AVAILABILITY_PATH, REMOTE_ADDR),
+                    new MockHttpServletResponse(), new MockFilterChain());
+        }
+        var salonDays = new MockHttpServletResponse();
+        var salonSlots = new MockHttpServletResponse();
+        var otherIp = new MockHttpServletResponse();
+
+        filter.doFilterInternal(get(SALON_MASTER_PREFIX + "/bookable-days", REMOTE_ADDR), salonDays, new MockFilterChain());
+        filter.doFilterInternal(get(SALON_MASTER_PREFIX + "/availability", REMOTE_ADDR), salonSlots, new MockFilterChain());
+        filter.doFilterInternal(get(SALON_MASTER_PREFIX + "/availability", OTHER_ADDR), otherIp, new MockFilterChain());
+
+        assertThat(salonDays.getStatus()).isEqualTo(429);
+        assertThat(salonSlots.getStatus()).isEqualTo(429);
+        assertThat(otherIp.getStatus()).isNotEqualTo(429);
+    }
 }

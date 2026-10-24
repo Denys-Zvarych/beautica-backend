@@ -82,7 +82,7 @@ public class PublicBookingController {
      * Phase 379 D3/D6 — OpenAPI text of the 410 every slug-keyed route can answer. Body:
      * {@code {"success":false,"data":{"code":"BOOKING_LINK_RETIRED"},"message":"Booking link is no longer valid"}}.
      */
-    private static final String GONE_DESCRIPTION = "Retired booking link (regenerated, revoked or deleted): "
+    static final String GONE_DESCRIPTION = "Retired booking link (regenerated, revoked or deleted): "
             + "data.code = BOOKING_LINK_RETIRED. An unknown slug stays 404, a malformed one 400.";
 
     private final BookingSlugService bookingSlugService;
@@ -214,8 +214,8 @@ public class PublicBookingController {
      * {@code serviceId} has the {@link #availability} semantics (repeatable; N&gt;1 = one back-to-back visit,
      * summed duration). A date is {@code working = true} iff {@link #availability} returns ≥1 slot for it.
      *
-     * <p>Salon links need no twin route: {@code /book/s/{slug}/info} lists each master's {@code masterSlug}
-     * and the guest flow — {@link #availability} included — runs on that master slug.
+     * <p>Salon links have a twin since phase 392: {@code GET /book/s/{slug}/masters/{masterId}/bookable-days}
+     * ({@code PublicSalonBookingController}), keyed by master id because salon masters have no personal link.
      *
      * <p>Same headers, per-IP bucket and error matrix as {@link #availability}: {@code from}/{@code to}
      * outside {@code [today, today + availabilityMaxDays]} (Kyiv) or {@code from > to} → 400; unknown slug,

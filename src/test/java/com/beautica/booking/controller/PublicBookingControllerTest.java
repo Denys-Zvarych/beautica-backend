@@ -552,13 +552,20 @@ class PublicBookingControllerTest {
 
     // ── Phase 377: public salon booking page ──────────────────────────────────
 
+    private static final UUID SALON_PAGE_MASTER_ID = UUID.fromString("11111111-2222-3333-4444-555555555555");
+    private static final UUID SALON_PAGE_SERVICE_ID = UUID.fromString("66666666-7777-8888-9999-000000000000");
+    private static final UUID SALON_PAGE_MSA_ID = UUID.fromString("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+
     private static SalonBookingSlugInfoResponse salonPage(UUID salonId) {
         return new SalonBookingSlugInfoResponse(
                 salonId, "Студія Краса", "Вінниця", "https://cdn.example/logo.jpg", null,
                 new BigDecimal("4.80"), 12, true,
-                List.of(new SalonBookingSlugMasterItem("anna-bila-aa11", "Anna Bila", null, "Стиліст", new BigDecimal("4.90"), 7)),
+                List.of(new SalonBookingSlugMasterItem("anna-bila-aa11", "Anna Bila", null, "Стиліст", new BigDecimal("4.90"), 7,
+                        SALON_PAGE_MASTER_ID)),
                 "Вінницька область", "вул. Соборна", "12", java.time.Instant.parse("2026-10-15T08:00:00Z"),
-                null, null, List.of(), List.of(), List.of(), List.of());
+                null, null, List.of(), List.of(), List.of(), List.of(),
+                List.of(new com.beautica.booking.dto.SalonServiceCoverage(SALON_PAGE_SERVICE_ID, List.of(
+                        new com.beautica.booking.dto.SalonServiceMasterRef(SALON_PAGE_MASTER_ID, SALON_PAGE_MSA_ID)))));
     }
 
     @Test
@@ -580,7 +587,11 @@ class PublicBookingControllerTest {
                 .andExpect(jsonPath("$.masters[0].professionalTitle").value("Стиліст"))
                 .andExpect(jsonPath("$.ownerId").doesNotExist())
                 .andExpect(jsonPath("$.phone").doesNotExist())
-                .andExpect(jsonPath("$.masters[0].masterId").doesNotExist())
+                // Phase 391: the master id is now part of the public contract (salon guest routes key on it).
+                .andExpect(jsonPath("$.masters[0].masterId").value(SALON_PAGE_MASTER_ID.toString()))
+                .andExpect(jsonPath("$.serviceCoverage[0].serviceId").value(SALON_PAGE_SERVICE_ID.toString()))
+                .andExpect(jsonPath("$.serviceCoverage[0].masters[0].masterId").value(SALON_PAGE_MASTER_ID.toString()))
+                .andExpect(jsonPath("$.serviceCoverage[0].masters[0].masterServiceId").value(SALON_PAGE_MSA_ID.toString()))
                 .andExpect(jsonPath("$.masters[0].userId").doesNotExist());
         verifyNoInteractions(bookingSlugService);
     }

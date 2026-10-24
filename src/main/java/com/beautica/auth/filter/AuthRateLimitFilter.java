@@ -190,13 +190,18 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // (same technique as BULK_SALON_SERVICES / SLOTS): /api/v1/book/{slug}/booking. The suffix
     // /booking does not collide with the OTP paths (/send, /verify) nor with the public GET
     // availability read, so only the booking POST consumes this bucket.
+    //
+    // Phases 392/393: the SALON twins /api/v1/book/s/{slug}/masters/{masterId}/{availability,bookable-days,booking}
+    // share the same prefix and suffixes, so they deliberately land in the SAME buckets at the SAME price
+    // (incl. bookableDaysTokenCost) — no separate budget a caller could add on top of the master routes.
+    // Pinned by GuestAvailabilityGetRateLimitTest / AuthRateLimitFilterTest salon-route cases.
     private static final String GUEST_BOOKING_PATH_PREFIX = "/api/v1/book/";
     private static final String GUEST_BOOKING_PATH_SUFFIX = "/booking";
     // Guest availability READ: GET /api/v1/book/{slug}/availability — the public booking page's slot
     // list, matched by the same prefix + a distinct suffix. It is deliberately NOT part of
     // guestBookingBuckets (that bucket's own comment says "only the booking POST consumes this bucket"),
     // because a legitimate guest issues MANY availability GETs per single booking POST — sharing one
-    // 5/15min bucket would make browsing dates impossible. See GUEST_AVAILABILITY_CAPACITY.
+    // 10/15min bucket would make browsing dates impossible. See GUEST_AVAILABILITY_CAPACITY.
     private static final String GUEST_AVAILABILITY_PATH_SUFFIX = "/availability";
     // Phase 387: GET /api/v1/book/{slug}/bookable-days — the public calendar day-gate. Shares the
     // availability bucket, exactly as the authenticated twin /masters/{id}/working-days shares slotsBuckets
@@ -313,13 +318,19 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // unchanged.
     private static final long OTP_VERIFY_CAPACITY = 10;
     private static final Duration OTP_VERIFY_WINDOW = Duration.ofMinutes(15);
-    // Per-IP cap for POST /api/v1/book/{slug}/booking (5 / 15 min). The endpoint is
+    // Per-IP cap for POST /api/v1/book/{slug}/booking AND its salon twin
+    // /api/v1/book/s/{slug}/masters/{masterId}/booking (10 / 15 min, shared bucket). The endpoint is
     // permitAll() — the guest JWT is validated inside GuestBookingService, not the Spring
     // filter chain — so without this an attacker holding (or replaying) one valid guest token
     // could pour unlimited CONFIRMED bookings + billable confirmation SMS at a master. Built
     // internally (not an injected @Qualifier bean) so the public 16-arg constructor stays stable
     // for the slice/regression tests that construct this filter directly.
-    private static final long GUEST_BOOKING_CAPACITY = 5;
+    //
+    // Phase 393 audit: raised from 5 to 10. A salon visit is ONE POST PER MASTER, so 5 blocked a legitimate
+    // visit split across >5 masters from one IP. 10 = one maximum-size visit (10 services, one master each). The
+    // per-IP bucket is no longer the only replay bound: GuestTokenBookingCap caps every guest token at 10
+    // committed bookings regardless of source IP, so IP rotation no longer multiplies one token's reach.
+    private static final long GUEST_BOOKING_CAPACITY = 10;
     private static final Duration GUEST_BOOKING_WINDOW = Duration.ofMinutes(15);
     // Per-IP cap for POST /api/v1/book/cancel/{token} (10 / 15 min). The endpoint is
     // permitAll() — the guest holds only the one-time cancel token, validated inside the
@@ -1454,7 +1465,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         // prefix + suffix (the {slug} is one path segment). Placed before the exact-path POST
         // branch below. The /booking suffix does not match the OTP exact paths (/send, /verify),
         // and the GET availability read is excluded by the POST-method guard, so only the
-        // booking POST consumes this bucket. Cap: 5 / 15 min per IP.
+        // booking POST consumes this bucket. Cap: 10 / 15 min per IP (phase 393 audit — one max-size salon
+        // visit; see GUEST_BOOKING_CAPACITY).
         if (HttpMethod.POST.matches(method)
                 && path.startsWith(GUEST_BOOKING_PATH_PREFIX)
                 && path.endsWith(GUEST_BOOKING_PATH_SUFFIX)) {

@@ -777,6 +777,54 @@ class ServiceCatalogServiceCatalogTest {
      * the pricing/grouping reshape downstream of the gate, not the gate itself (that is the
      * Testcontainers {@code SalonCatalogueBatchLoadIT}'s job).
      */
+    // ── getSalonCatalogSnapshot — phase 391 audit (perf MEDIUM-1): catalogue + coverage from ONE batch ──
+
+    @Test
+    @DisplayName("phase 391 audit: snapshot = the app's catalogue + per-service (masterId, masterServiceId) "
+            + "from ONE candidate load and ONE batch gate; gated-out rows absent")
+    void should_buildCatalogueAndCoverageFromOneBatch_when_snapshotRequested() {
+        UUID salonId = UUID.randomUUID();
+        UUID annaId = UUID.randomUUID();
+        UUID olhaId = UUID.randomUUID();
+        Master anna = master(annaId);
+        Master olha = master(olhaId);
+        ServiceDefinition shared = serviceDefinition("MANICURE", PriceType.FIXED, "700.00", null);
+        ServiceDefinition annaOnly = serviceDefinition("PEDICURE", PriceType.FIXED, "900.00", null);
+        MasterServiceAssignment annaShared = assignment(anna, shared, null, null, null);
+        MasterServiceAssignment annaExclusive = assignment(anna, annaOnly, null, null, null);
+        MasterServiceAssignment olhaShared = assignment(olha, shared, null, null, null);
+        MasterServiceAssignment olhaGatedOut = assignment(olha, annaOnly, null, null, null);
+        stubBookable(salonId, List.of(annaShared, annaExclusive, olhaShared, olhaGatedOut),
+                Map.of(annaId, List.of(annaShared, annaExclusive), olhaId, List.of(olhaShared)));
+
+        com.beautica.service.dto.SalonCatalogSnapshot snapshot = service.getSalonCatalogSnapshot(salonId);
+
+        assertThat(snapshot.catalog()).isEqualTo(service.getSalonServiceCatalog(salonId));
+        assertThat(snapshot.coverage()).containsOnlyKeys(shared.getId(), annaOnly.getId());
+        assertThat(snapshot.coverage().get(shared.getId())).containsExactlyInAnyOrder(
+                new com.beautica.booking.dto.SalonServiceMasterRef(annaId, annaShared.getId()),
+                new com.beautica.booking.dto.SalonServiceMasterRef(olhaId, olhaShared.getId()));
+        assertThat(snapshot.coverage().get(annaOnly.getId())).containsExactly(
+                new com.beautica.booking.dto.SalonServiceMasterRef(annaId, annaExclusive.getId()));
+        org.mockito.Mockito.verify(masterServiceRepository, org.mockito.Mockito.times(2))
+                .findBookableAssignmentsBySalon(salonId);
+        org.mockito.Mockito.verify(slotCalculationService, org.mockito.Mockito.times(2))
+                .filterBookableAssignmentsBatch(any());
+    }
+
+    @Test
+    @DisplayName("phase 391 audit: no catalogue candidates → EMPTY snapshot, the batch gate never runs")
+    void should_returnEmptySnapshotWithoutBatch_when_salonHasNoCandidates() {
+        UUID salonId = UUID.randomUUID();
+        when(masterServiceRepository.findBookableAssignmentsBySalon(salonId)).thenReturn(List.of());
+
+        com.beautica.service.dto.SalonCatalogSnapshot snapshot = service.getSalonCatalogSnapshot(salonId);
+
+        assertThat(snapshot.catalog().categories()).isEmpty();
+        assertThat(snapshot.coverage()).isEmpty();
+        org.mockito.Mockito.verifyNoInteractions(slotCalculationService);
+    }
+
     private void stubBookable(UUID salonId, List<MasterServiceAssignment> candidates,
             Map<UUID, List<MasterServiceAssignment>> byMaster) {
         when(platformCategoryOrderLookup.getApprovedActive()).thenReturn(List.of());

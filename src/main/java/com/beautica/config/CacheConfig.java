@@ -772,6 +772,15 @@ public class CacheConfig {
                 Caffeine.newBuilder()
                         .maximumSize(500)
                         .expireAfterWrite(60, TimeUnit.SECONDS));
+        // Phase 391 (+ audit perf MEDIUM-1) — the salon catalogue's twin for the public salon booking page: the
+        // catalogue AND service → bookable (masterId, masterServiceId) coverage from ONE batch
+        // (ServiceCatalogService#getSalonCatalogSnapshot), keyed on salonId. Same size/TTL as salon-service-catalog
+        // and evicted by the SAME SalonCatalogCacheEvictor calls, so it is never staler than the app's catalogue;
+        // sync=true on the @Cacheable (§F-7).
+        registerMetered(manager, meterRegistry, com.beautica.service.service.ServiceCatalogService.SALON_CATALOG_SNAPSHOT_CACHE,
+                Caffeine.newBuilder()
+                        .maximumSize(500)
+                        .expireAfterWrite(60, TimeUnit.SECONDS));
         // Strict per-master verdict (BookingMasterService#getBookableAssignmentIds) behind the public
         // GET /masters/{id}/services client filter — keyed
         // [masterId] (one-element list), so the existing by-master afterCommit sweeps

@@ -268,6 +268,9 @@ public class SecurityConfig {
                     // tightly to POST /api/v1/book/*/booking (single path segment for the slug,
                     // then literal /booking) so no other authenticated POST under /book is opened.
                     auth.requestMatchers(HttpMethod.POST, "/api/v1/book/*/booking").permitAll();
+                    // Phase 393 — the salon twin: POST /api/v1/book/s/{salonSlug}/masters/{masterId}/booking.
+                    // Same guest-JWT-in-service model; exact segment shape, so nothing else under /book/s opens.
+                    auth.requestMatchers(HttpMethod.POST, "/api/v1/book/s/*/masters/*/booking").permitAll();
                     // Phase 13.4 — Guest Booking Cancellation by Link. The cancel link in
                     // the confirmation SMS is opened by an unauthenticated guest holding no
                     // JWT; the one-time cancel_token in the path is the credential. GET is

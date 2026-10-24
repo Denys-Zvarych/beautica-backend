@@ -1,5 +1,6 @@
 package com.beautica.service.service;
 
+import com.beautica.booking.dto.SalonServiceMasterRef;
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ServiceUnavailableMessages;
@@ -18,6 +19,7 @@ import com.beautica.service.dto.CatalogCategoryResponse;
 import com.beautica.service.dto.CreateServiceDefinitionRequest;
 import com.beautica.service.dto.MasterServiceBand;
 import com.beautica.service.dto.MasterServiceResponse;
+import com.beautica.service.dto.SalonCatalogSnapshot;
 import com.beautica.service.dto.SalonServiceCatalogResponse;
 import com.beautica.service.dto.SalonServiceCategoryGroup;
 import com.beautica.service.dto.ServiceDefinitionResponse;
@@ -77,6 +79,12 @@ import java.util.stream.Collectors;
 @Slf4j
 @RequiredArgsConstructor
 public class ServiceCatalogService {
+
+    /**
+     * Phase 391 audit — cache backing {@link #getSalonCatalogSnapshot}, keyed {@code salonId}; registered in
+     * {@code CacheConfig} and evicted together with {@code salon-service-catalog} by {@link SalonCatalogCacheEvictor}.
+     */
+    public static final String SALON_CATALOG_SNAPSHOT_CACHE = "salon-catalog-snapshot";
 
     /**
      * Name of the partial unique index added in V121 that enforces one ACTIVE service per
@@ -1640,18 +1648,59 @@ public class ServiceCatalogService {
     @Transactional(readOnly = true)
     @Cacheable(value = "salon-service-catalog", key = "#salonId", sync = true)
     public SalonServiceCatalogResponse getSalonServiceCatalog(UUID salonId) {
+        return buildSalonCatalogSnapshot(salonId).catalog();
+    }
+
+    /**
+     * Phase 391 audit (perf MEDIUM-1) — {@link #getSalonServiceCatalog}'s catalogue PLUS, per catalogue service,
+     * its bookable performers as {@code (masterId, masterServiceId)}, both from ONE candidate load and ONE
+     * {@code filterBookableAssignmentsBatch} run. For the public salon booking page ({@code GET /book/s/{slug}/info}),
+     * whose {@code serviceCoverage} previously re-ran the candidate query and the batch gate a second time.
+     *
+     * <p><b>Same verdict as the app.</b> {@code catalog} is built by the very code path behind
+     * {@link #getSalonServiceCatalog} (same private builder), and {@code coverage} is the per-definition grouping of
+     * the same bookable assignments that price each catalogue row — the batched form of the app's per-service
+     * {@code BookingMasterService#getBookableMasters} verdict (pinned by {@code SalonCatalogueBatchLoadIT}'s
+     * batch-vs-singleton differential and {@code PublicSalonBookingInfoIT}'s per-service parity case).
+     *
+     * <p><b>Cached</b> in {@value #SALON_CATALOG_SNAPSHOT_CACHE} keyed {@code salonId} ({@code sync = true}, §F-7),
+     * evicted by every {@link SalonCatalogCacheEvictor} call together with {@code salon-service-catalog}, so the two
+     * caches share one freshness bound. A separate entry from {@code salon-service-catalog} (no self-invocation
+     * through the proxy): a cold app read and a cold booking-page read each cost one batch, never two.
+     */
+    @Transactional(readOnly = true)
+    @Cacheable(value = SALON_CATALOG_SNAPSHOT_CACHE, key = "#salonId", sync = true)
+    public SalonCatalogSnapshot getSalonCatalogSnapshot(UUID salonId) {
+        return buildSalonCatalogSnapshot(salonId);
+    }
+
+    /** The shared, uncached body of {@link #getSalonServiceCatalog} and {@link #getSalonCatalogSnapshot}. */
+    private SalonCatalogSnapshot buildSalonCatalogSnapshot(UUID salonId) {
         List<MasterServiceAssignment> candidates =
                 masterServiceRepository.findBookableAssignmentsBySalon(salonId);
-
         if (candidates.isEmpty()) {
-            return new SalonServiceCatalogResponse(List.of());
+            return SalonCatalogSnapshot.EMPTY;
         }
-
         Map<UUID, List<MasterServiceAssignment>> bookableByDefinition = bookableDefinitions(candidates);
         if (bookableByDefinition.isEmpty()) {
-            return new SalonServiceCatalogResponse(List.of());
+            return SalonCatalogSnapshot.EMPTY;
         }
+        return new SalonCatalogSnapshot(toSalonCatalog(bookableByDefinition), coverageOf(bookableByDefinition));
+    }
 
+    /** Definition id → its bookable {@code (masterId, masterServiceId)} pairs — pure in-memory, zero statements. */
+    private static Map<UUID, List<SalonServiceMasterRef>> coverageOf(
+            Map<UUID, List<MasterServiceAssignment>> bookableByDefinition) {
+        Map<UUID, List<SalonServiceMasterRef>> coverage = new LinkedHashMap<>();
+        bookableByDefinition.forEach((definitionId, assignments) -> coverage.put(definitionId, assignments.stream()
+                .map(msa -> new SalonServiceMasterRef(msa.getMaster().getId(), msa.getId()))
+                .toList()));
+        return coverage;
+    }
+
+    /** Groups, orders and prices the bookable definitions — the unchanged pre-391-audit catalogue body. */
+    private SalonServiceCatalogResponse toSalonCatalog(
+            Map<UUID, List<MasterServiceAssignment>> bookableByDefinition) {
         CategoryOrderAndNames orderAndNames = buildCategoryOrderAndNames();
         Map<String, Integer> categoryOrder = orderAndNames.order();
         Map<String, String> categoryDisplayNames = orderAndNames.displayNames();

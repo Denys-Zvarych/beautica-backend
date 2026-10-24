@@ -3,6 +3,8 @@ package com.beautica.booking.service;
 import com.beautica.booking.dto.BookingLinkKind;
 import com.beautica.booking.dto.SalonBookingSlugInfoResponse;
 import com.beautica.booking.dto.SalonBookingSlugMasterItem;
+import com.beautica.booking.dto.SalonServiceCoverage;
+import com.beautica.booking.dto.SalonServiceMasterRef;
 import com.beautica.common.cache.SalonBookingInfoCacheEvictor;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.master.repository.MasterRepository;
@@ -14,6 +16,9 @@ import com.beautica.media.entity.EntityType;
 import com.beautica.media.service.MediaService;
 import com.beautica.review.dto.SalonReviewSort;
 import com.beautica.review.service.ReviewService;
+import com.beautica.service.dto.SalonCatalogSnapshot;
+import com.beautica.service.dto.SalonServiceCategoryGroup;
+import com.beautica.service.dto.ServiceDefinitionResponse;
 import com.beautica.service.service.ServiceCatalogService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.domain.PageRequest;
@@ -21,7 +26,11 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.cache.annotation.Cacheable;
 import org.springframework.stereotype.Service;
 
+import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.UUID;
 
 /**
  * Resolves a public SALON booking slug ({@code beautica.app/book/s/{slug}}) to the website's salon page
@@ -32,11 +41,16 @@ import java.util.List;
  * master of the salon in one batch ({@code MasterBookabilitySql.BOOKABLE_MASTER_M}, the predicate the
  * public roster and discovery search use) — never a query per master.
  *
- * <p><b>Read-only, never writes</b> (phase 377 audit): slug-less (legacy, pre-V86) masters are excluded by
- * the batch query rather than issued a slug here, so an anonymous GET performs no transaction and no
- * {@code UPDATE}. Such a master gets its slug via {@code GET /booking-links/mine} (phase 375); every
- * master created since phase 13.1 carries one from creation. Only the salon lookup can 404 the page — a
- * master deactivated between the two statements is simply absent from the batch.
+ * <p><b>Read-only, never writes</b> (phase 377 audit): no slug is ever issued here. Since phase 391 a slug-less
+ * master (legacy pre-V86 row, or a revoked personal link) is LISTED with {@code masterSlug = null} — the salon
+ * flow books by master id — instead of being omitted. Only the salon lookup can 404 the page — a master
+ * deactivated between the statements is simply absent from the batch.
+ *
+ * <p><b>Phase 391 — {@code serviceCoverage}.</b> Per catalogue service, the bookable masters who perform it,
+ * restricted to the roster and in roster order, so every id the website gets resolves to a roster card. Both the
+ * catalogue tab and the coverage come from ONE {@link ServiceCatalogService#getSalonCatalogSnapshot} (phase 391
+ * audit): one candidate load and one free-slot batch — the batched form of the app's per-service master verdict
+ * ({@code GET /salons/{id}/services/{defId}/masters}) — instead of running the gate twice on a cold miss.
  */
 @Service
 @RequiredArgsConstructor
@@ -75,6 +89,10 @@ public class SalonBookingSlugService {
                 .stream()
                 .map(this::toItem)
                 .toList();
+        // ONE snapshot for both the catalogue tab and serviceCoverage (phase 391 audit, perf MEDIUM-1): the same
+        // candidate load and free-slot batch, so a cold miss runs the gate once and the two can never disagree.
+        SalonCatalogSnapshot catalogue = serviceCatalogService.getSalonCatalogSnapshot(salon.getId());
+        List<SalonServiceCategoryGroup> serviceCategories = catalogue.catalog().categories();
         return new SalonBookingSlugInfoResponse(
                 salon.getId(),
                 salon.getName(),
@@ -96,13 +114,39 @@ public class SalonBookingSlugService {
                 // GET /salons/{id}/portfolio's order (createdAt DESC) and the master page's cap — uncached read,
                 // the shared `portfolio` cache entry ignores page size (see MediaService#getLatestPortfolio).
                 mediaService.getLatestPortfolio(EntityType.SALON, salon.getId(), BookingSlugService.PORTFOLIO_LIMIT),
-                // GET /salons/{id}/services: bookable-only grouping, counts and display names as the app gets them.
-                serviceCatalogService.getSalonServiceCatalog(salon.getId()).categories(),
+                // GET /salons/{id}/services' catalogue (same builder): bookable-only grouping, counts, display names.
+                serviceCategories,
                 // The row already holds avgRating/reviewCount: the overload skips the salon findById.
                 reviewService.getSalonReviewSummary(salon.getId(), salon.getAvgRating(), salon.getReviewCount())
                         .ratingDistribution(),
                 // One uncached statement, no COUNT (the paged getSalonReviews costs ids + count + hydrate).
-                reviewService.getLatestReviewsForSalon(salon.getId(), BookingSlugService.LATEST_REVIEWS_LIMIT));
+                reviewService.getLatestReviewsForSalon(salon.getId(), BookingSlugService.LATEST_REVIEWS_LIMIT),
+                serviceCoverage(serviceCategories, catalogue.coverage(), masters));
+    }
+
+    /**
+     * One {@link SalonServiceCoverage} per catalogue service, in catalogue order. Masters outside the roster
+     * (e.g. beyond {@link #MAX_MASTERS}) are dropped so every id maps to a roster card; the rest keep roster order.
+     */
+    private static List<SalonServiceCoverage> serviceCoverage(List<SalonServiceCategoryGroup> categories,
+            Map<UUID, List<SalonServiceMasterRef>> byService, List<SalonBookingSlugMasterItem> roster) {
+        if (categories.isEmpty() || roster.isEmpty()) {
+            return categories.stream().flatMap(c -> c.services().stream())
+                    .map(sd -> new SalonServiceCoverage(sd.id(), List.of())).toList();
+        }
+        Map<UUID, Integer> rosterOrder = new HashMap<>();
+        for (int i = 0; i < roster.size(); i++) {
+            rosterOrder.put(roster.get(i).masterId(), i);
+        }
+        return categories.stream()
+                .flatMap(category -> category.services().stream())
+                .map(ServiceDefinitionResponse::id)
+                .map(serviceId -> new SalonServiceCoverage(serviceId, byService.getOrDefault(serviceId, List.of())
+                        .stream()
+                        .filter(ref -> rosterOrder.containsKey(ref.masterId()))
+                        .sorted(Comparator.comparingInt(ref -> rosterOrder.get(ref.masterId())))
+                        .toList()))
+                .toList();
     }
 
     /**
@@ -128,6 +172,7 @@ public class SalonBookingSlugService {
                 // The app's salon master card rule (MasterSummaryResponse): no reviews -> null, never the stored 0.00.
                 com.beautica.booking.dto.BookingDetailResponse.masterAvgRatingOrNull(
                         master.getReviewCount(), master.getAvgRating()),
-                master.getReviewCount());
+                master.getReviewCount(),
+                master.getId());
     }
 }
