@@ -186,7 +186,7 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
         ZonedDateTime startsAt = ZonedDateTime.now(TimeZones.KYIV)
                 .plusDays(3).withHour(15).withMinute(0).withSecond(0).withNano(0);
         String body = """
-                {"serviceId":"%s","startsAt":"%s","name":"Оксана","surname":"Мельник"}
+                {"serviceId":"%s","startsAt":"%s","name":"Оксана","surname":"Мельник","privacyAccepted":true,"privacyPolicyVersion":"2026-10-20"}
                 """.formatted(serviceId, startsAt.toOffsetDateTime());
         HttpHeaders guestHeaders = new HttpHeaders();
         guestHeaders.setContentType(MediaType.APPLICATION_JSON);

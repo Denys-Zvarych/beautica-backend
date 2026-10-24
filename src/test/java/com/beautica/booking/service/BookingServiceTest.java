@@ -959,7 +959,7 @@ class BookingServiceTest {
         bookingService.declineBookingForBatch(actorId, bookingId, req);
 
         verifyNoInteractions(slotCalculationService);
-        verify(salonCatalogCacheEvictor, never()).evict(any());
+        verify(salonCatalogCacheEvictor, never()).evictCatalogOnly(any());
     }
 
     @Test
@@ -1078,7 +1078,7 @@ class BookingServiceTest {
         // The master WAS in the candidate scan (findConfirmedFutureBySalonId), even though its
         // one and only candidate booking never actually transitioned — eviction still runs for it.
         verify(slotCalculationService).evictMasterAvailabilityCaches(masterId);
-        verify(salonCatalogCacheEvictor).evict(salonId);
+        verify(salonCatalogCacheEvictor).evictCatalogOnly(salonId);
     }
 
     @Test
@@ -4813,6 +4813,78 @@ class BookingServiceTest {
         assertThat(result.clientLastName()).isEqualTo("Мельник");
         verify(authz).enforceCanViewBooking(providerActorId, guestBooking);
         verify(reviewRepository, never()).existsByBookingId(any());
+    }
+
+    // ── getBooking — phase 386: guest phone is provider-visible, on the detail read only ───────
+
+    private static final String GUEST_PHONE = "+380671234567";
+
+    private Booking guestBookingWithPhone(String phone) {
+        Booking guestBooking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        setField(guestBooking, "client", null);
+        setField(guestBooking, "guestName", "Оксана");
+        setField(guestBooking, "guestPhone", phone);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(guestBooking));
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
+        return guestBooking;
+    }
+
+    @Test
+    @DisplayName("should_returnGuestPhone_when_providerViewsGuestBookingDetail")
+    void should_returnGuestPhone_when_providerViewsGuestBookingDetail() {
+        UUID providerActorId = UUID.randomUUID();
+        guestBookingWithPhone(GUEST_PHONE);
+        when(authz.isGuestPhoneAudience()).thenReturn(true); // INDEPENDENT_MASTER / SALON_OWNER / SALON_ADMIN
+
+        BookingDetailResponse result = bookingService.getBooking(providerActorId, bookingId);
+
+        assertThat(result.guestPhone()).isEqualTo(GUEST_PHONE);
+        verify(authz).enforceCanViewBooking(eq(providerActorId), any());
+    }
+
+    @Test
+    @DisplayName("should_returnNullGuestPhone_when_viewerIsNotInTheRoleAudience - a SALON_MASTER (even the performing one) or a client")
+    void should_returnNullGuestPhone_when_viewerIsNotInTheRoleAudience() {
+        guestBookingWithPhone(GUEST_PHONE);
+        when(authz.isGuestPhoneAudience()).thenReturn(false);
+
+        assertThat(bookingService.getBooking(UUID.randomUUID(), bookingId).guestPhone()).isNull();
+    }
+
+    @Test
+    @DisplayName("should_returnNullGuestPhone_when_guestBookingHasNoPhone")
+    void should_returnNullGuestPhone_when_guestBookingHasNoPhone() {
+        guestBookingWithPhone(null);
+        when(authz.isGuestPhoneAudience()).thenReturn(true);
+
+        assertThat(bookingService.getBooking(UUID.randomUUID(), bookingId).guestPhone()).isNull();
+    }
+
+    @Test
+    @DisplayName("HARD RULE: should_returnNullGuestPhone_when_bookingHasRegisteredClient - for the provider AND for the client")
+    void should_returnNullGuestPhone_when_bookingHasRegisteredClient() {
+        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        setField(booking, "guestPhone", GUEST_PHONE); // even a stray value on a registered booking never surfaces
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
+        UUID providerActorId = UUID.randomUUID();
+
+        assertThat(bookingService.getBooking(providerActorId, bookingId).guestPhone()).isNull();
+        assertThat(bookingService.getBooking(clientId, bookingId).guestPhone()).isNull();
+
+        // A registered-client booking never even reads the role: no SecurityContext dependency, no extra work.
+        verify(authz, never()).isGuestPhoneAudience();
+    }
+
+    @Test
+    @DisplayName("should_returnNullGuestPhone_when_viewerIsTheOwningClient - the audience gate is independent of client_id")
+    void should_returnNullGuestPhone_when_viewerIsTheOwningClient() {
+        Booking guestBooking = guestBookingWithPhone(GUEST_PHONE);
+        UUID viewer = UUID.randomUUID();
+        when(authz.isGuestPhoneAudience()).thenReturn(true);
+        when(authz.isOwningClientViewer(viewer, guestBooking)).thenReturn(true);
+
+        assertThat(bookingService.getBooking(viewer, bookingId).guestPhone()).isNull();
     }
 
     @Test

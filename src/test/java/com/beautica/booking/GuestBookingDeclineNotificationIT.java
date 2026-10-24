@@ -11,6 +11,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.boot.test.web.client.TestRestTemplate;
@@ -26,9 +27,7 @@ import org.springframework.security.crypto.password.PasswordEncoder;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
-import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
@@ -63,9 +62,16 @@ class GuestBookingDeclineNotificationIT extends AbstractIntegrationTest {
     @MockBean
     private SmsService smsService;
 
+    /**
+     * Phase 390 rewrote the copy: the SMS is now the fixed provider-cancellation text — no service
+     * name, no provider note (the stale "carries the service and note" name described phase 25.7).
+     * The send is observed with a plain {@code verify}, not {@code timeout(...)}: under the test
+     * profile {@code smsSendExecutor} is a {@code SyncTaskExecutor}, so the send has already happened
+     * when {@code drain()} returns, and polling would only hide a regression to an async hand-off.
+     */
     @Test
-    @DisplayName("declining a guest (LINK) booking sends exactly one SMS carrying the service, "
-            + "time, and the (possibly truncated) provider note")
+    @DisplayName("declining a guest (LINK) booking sends exactly one SMS with the fixed phase 390 copy "
+            + "— no provider note, no service name")
     void should_sendExactlyOneSms_when_guestBookingDeclined() {
         Salon salon = createSalon("guest-decline-sms-owner-" + System.nanoTime() + "@beautica.test");
         UUID bookingId = insertConfirmedGuestSalonBooking(salon);
@@ -76,7 +82,13 @@ class GuestBookingDeclineNotificationIT extends AbstractIntegrationTest {
 
         drainWorker.drain();
 
-        verify(smsService, timeout(5_000).times(1)).send(eq(GUEST_PHONE), anyString());
+        ArgumentCaptor<String> text = ArgumentCaptor.forClass(String.class);
+        verify(smsService, times(1)).send(eq(GUEST_PHONE), text.capture());
+        assertThat(text.getValue())
+                .startsWith("Beautica: Ваш запис ")
+                .endsWith(" скасовано.")
+                .doesNotContain("захворів")
+                .doesNotContain("Test Service");
     }
 
     @Test

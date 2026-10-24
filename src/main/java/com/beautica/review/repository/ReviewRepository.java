@@ -435,4 +435,36 @@ public interface ReviewRepository extends JpaRepository<Review, UUID> {
             WHERE r.id IN :ids
             """)
     List<Review> findByIdsWithGraphForSalonReviews(@Param("ids") List<UUID> ids);
+
+    /**
+     * Phase 383/384 audit - the newest reviews of a master, graph included, in ONE statement and with NO count: the
+     * to-one fetch joins make a LIMIT safe (no collection fetch), so the ID-then-hydrate pair and the page COUNT of
+     * {@code getReviewsForMaster} collapse to a single query. Same {@code createdAt DESC} order as the NEWEST sort and
+     * the same graph as {@link #findByIdsWithGraph} (client is a LEFT join for a self-deleted author).
+     */
+    @Query("""
+            SELECT r FROM Review r
+            LEFT JOIN FETCH r.client
+            JOIN FETCH r.master
+            JOIN FETCH r.booking b
+            JOIN FETCH b.masterService ms
+            JOIN FETCH ms.serviceDefinition
+            WHERE r.master.id = :masterId
+            ORDER BY r.createdAt DESC
+            """)
+    List<Review> findLatestWithGraphByMasterId(@Param("masterId") UUID masterId, Pageable pageable);
+
+    /** Salon twin of {@link #findLatestWithGraphByMasterId}, with the graph {@code SalonReviewResponse} needs. */
+    @Query("""
+            SELECT r FROM Review r
+            LEFT JOIN FETCH r.client
+            JOIN FETCH r.master m
+            LEFT JOIN FETCH m.user
+            JOIN FETCH r.booking b
+            JOIN FETCH b.masterService ms
+            JOIN FETCH ms.serviceDefinition
+            WHERE r.salon.id = :salonId
+            ORDER BY r.createdAt DESC
+            """)
+    List<Review> findLatestWithGraphBySalonId(@Param("salonId") UUID salonId, Pageable pageable);
 }

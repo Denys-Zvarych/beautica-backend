@@ -2,6 +2,8 @@ package com.beautica.user;
 
 import com.beautica.auth.Role;
 import com.beautica.common.RatingBucket;
+import com.beautica.common.cache.MasterProfileCacheEvictor;
+import com.beautica.common.cache.SalonBookingInfoCacheEvictor;
 import com.beautica.common.cache.UserProfileCacheEvictor;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
@@ -12,6 +14,7 @@ import com.beautica.location.SettlementDisplayNames;
 import com.beautica.master.dto.MasterProfileUpdateRequest;
 import com.beautica.master.dto.MasterPublicProfileResponse;
 import com.beautica.master.entity.MasterType;
+import com.beautica.master.repository.MasterCacheKeys;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.search.service.SearchCacheNames;
 import com.beautica.location.repository.CityDistrictRepository;
@@ -60,6 +63,7 @@ public class UserService {
     private final CacheManager cacheManager;
     private final ClientReviewRepository clientReviewRepository;
     private final MasterRepository masterRepository;
+    private final SalonBookingInfoCacheEvictor salonBookingInfoCacheEvictor;
 
     public UserService(UserRepository userRepository,
                        LocalityWriteValidator localityWriteValidator,
@@ -68,7 +72,8 @@ public class UserService {
                        LocationQueryService locationQueryService,
                        CacheManager cacheManager,
                        ClientReviewRepository clientReviewRepository,
-                       MasterRepository masterRepository) {
+                       MasterRepository masterRepository,
+                       SalonBookingInfoCacheEvictor salonBookingInfoCacheEvictor) {
         this.userRepository = userRepository;
         this.localityWriteValidator = localityWriteValidator;
         this.settlementDisplayNameResolver = settlementDisplayNameResolver;
@@ -77,6 +82,7 @@ public class UserService {
         this.cacheManager = cacheManager;
         this.clientReviewRepository = clientReviewRepository;
         this.masterRepository = masterRepository;
+        this.salonBookingInfoCacheEvictor = salonBookingInfoCacheEvictor;
     }
 
     /**
@@ -360,15 +366,16 @@ public class UserService {
     }
 
     /**
-     * The {@code master-detail} cache key for {@code userId}'s master row, or {@code null} when the
-     * role can never own one ({@code CLIENT}, {@code SALON_ADMIN}) — those skip the lookup, so the
-     * hot CLIENT profile write stays at its current query count.
+     * The cache keys ({@code master-detail} by id, {@code booking-slug-info} by slug) of {@code userId}'s
+     * master row, or {@code null} when the role can never own one ({@code CLIENT}, {@code SALON_ADMIN}) —
+     * those skip the lookup, so the hot CLIENT profile write stays at its current query count. One
+     * id-only projection, same statement count as the former id lookup.
      */
-    private UUID resolveMasterIdForEviction(UUID userId, Role role) {
+    private MasterCacheKeys resolveMasterKeysForEviction(UUID userId, Role role) {
         if (!role.canOwnMasterRow()) {
             return null;
         }
-        return masterRepository.findIdByUserId(userId).orElse(null);
+        return masterRepository.findCacheKeysByUserId(userId).orElse(null);
     }
 
     /**
@@ -384,6 +391,9 @@ public class UserService {
      *       keyed by the user's master id (only when a master row exists)</li>
      *   <li>{@code master-by-user} — entity cache used by calendar and slot endpoints</li>
      *   <li>{@code user-profile} — DTO cache for {@code GET /users/me} (audit-fix cycle 2)</li>
+     *   <li>{@code booking-slug-info} + {@code salon-booking-slug-info} — the public master / salon
+     *       booking pages that render this master's name and title (phase 377 audit; only when the
+     *       master row has a slug)</li>
      *   <li>{@code search:masters} — discovery cache; cleared only when the writing user
      *       is an {@code INDEPENDENT_MASTER}, since locality or profile changes affect
      *       search results. Salon-bound roles route discovery through the salon record.</li>
@@ -402,7 +412,9 @@ public class UserService {
             return;
         }
         // Resolved INSIDE the transaction (an id-only indexed lookup), used after commit.
-        UUID masterId = resolveMasterIdForEviction(userId, role);
+        MasterCacheKeys masterKeys = resolveMasterKeysForEviction(userId, role);
+        UUID masterId = masterKeys == null ? null : masterKeys.masterId();
+        String bookingSlug = masterKeys == null ? null : masterKeys.bookingSlug();
         TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
             @Override
             public void afterCommit() {
@@ -417,6 +429,17 @@ public class UserService {
                 Cache publicDetail = cacheManager.getCache(MASTER_DETAIL_CACHE);
                 if (publicDetail != null && masterId != null) {
                     publicDetail.evict(masterId);
+                }
+                // Phase 377 audit: the public booking pages render the master's name + professional
+                // title — the master's own page (booking-slug-info, keyed by slug) and every salon page
+                // listing it (salon-booking-slug-info, matched by masterSlug). Without these evicts a
+                // rename served the old name for the pages' TTL.
+                if (bookingSlug != null) {
+                    Cache bookingInfo = cacheManager.getCache(MasterProfileCacheEvictor.BOOKING_SLUG_INFO_CACHE);
+                    if (bookingInfo != null) {
+                        bookingInfo.evict(bookingSlug);
+                    }
+                    salonBookingInfoCacheEvictor.evictByMasterSlug(bookingSlug);
                 }
                 Cache byUser = cacheManager.getCache("master-by-user");
                 if (byUser != null) {

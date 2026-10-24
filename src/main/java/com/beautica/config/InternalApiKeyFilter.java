@@ -1,6 +1,7 @@
 package com.beautica.config;
 
 import com.beautica.common.ApiResponse;
+import com.beautica.common.security.ConstantTimeSecrets;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
@@ -12,9 +13,7 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.filter.OncePerRequestFilter;
 
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 
 /**
  * Servlet filter that guards all {@code /api/v1/internal/**} endpoints with a
@@ -23,7 +22,7 @@ import java.security.NoSuchAlgorithmException;
  * <h2>Authentication mechanism</h2>
  * The filter compares the supplied header value against
  * {@link InternalApiKeyProperties#getInternalApiKey()} using
- * {@link MessageDigest#isEqual(byte[], byte[])} — a constant-time comparison
+ * {@link ConstantTimeSecrets#matches} (SHA-256 + {@link MessageDigest#isEqual}) — a constant-time comparison
  * that prevents timing-oracle attacks (anti-bug §B analogue for API keys).
  *
  * <h2>Scope</h2>
@@ -63,7 +62,7 @@ public class InternalApiKeyFilter extends OncePerRequestFilter {
 
         // Fail closed: an unset/blank configured key must never match an empty or missing header.
         if (suppliedKey == null || configuredKey == null || configuredKey.isBlank()
-                || !constantTimeEquals(suppliedKey, configuredKey)) {
+                || !ConstantTimeSecrets.matches(suppliedKey, configuredKey)) {
             response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
             response.setContentType(MediaType.APPLICATION_JSON_VALUE);
             objectMapper.writeValue(response.getWriter(), ApiResponse.error("Unauthorized"));
@@ -71,25 +70,5 @@ public class InternalApiKeyFilter extends OncePerRequestFilter {
         }
 
         filterChain.doFilter(request, response);
-    }
-
-    /**
-     * Constant-time comparison to prevent timing-oracle attacks.
-     *
-     * <p>Both strings are hashed to equal-length byte arrays with SHA-256 before
-     * comparison so that {@link MessageDigest#isEqual} cannot leak length
-     * information via short-circuit returns.
-     */
-    private static boolean constantTimeEquals(String a, String b) {
-        try {
-            MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            byte[] hashA = digest.digest(a.getBytes(StandardCharsets.UTF_8));
-            digest.reset();
-            byte[] hashB = digest.digest(b.getBytes(StandardCharsets.UTF_8));
-            return MessageDigest.isEqual(hashA, hashB);
-        } catch (NoSuchAlgorithmException e) {
-            // SHA-256 is guaranteed present by the JVM spec; this branch is unreachable.
-            throw new IllegalStateException("SHA-256 not available", e);
-        }
     }
 }

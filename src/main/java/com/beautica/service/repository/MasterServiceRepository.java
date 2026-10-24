@@ -1,5 +1,6 @@
 package com.beautica.service.repository;
 
+import com.beautica.service.entity.CatalogCategory;
 import com.beautica.service.entity.MasterServiceAssignment;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
@@ -756,4 +757,23 @@ public interface MasterServiceRepository extends JpaRepository<MasterServiceAssi
               AND sd.category IS NOT NULL
             """)
     List<Object[]> findDistinctOfferedCategoriesBySalonIds(@Param("salonIds") Collection<UUID> salonIds);
+
+    /**
+     * Phase 380 D2 — the distinct catalogue categories of a master's ACTIVE services (the same active
+     * assignment + active definition filter as the services list on the public booking page), ordered
+     * for display ({@code sortOrder}, then {@code nameUk}). Each row is {@code [CatalogCategory, platformCategoryName]}:
+     * the platform category name is the key {@code ServiceDefinition.category} carries (phase 383), so the page's
+     * {@code categories[].key} joins to {@code services[].category}. One statement; bounded by the category count.
+     */
+    @Query("""
+            SELECT DISTINCT c, st.platformCategoryName FROM MasterServiceAssignment a
+            JOIN a.serviceDefinition sd
+            JOIN sd.serviceType st
+            JOIN st.category c
+            WHERE a.master.id = :masterId
+              AND a.isActive = true
+              AND sd.isActive = true
+            ORDER BY c.sortOrder, c.nameUk, st.platformCategoryName
+            """)
+    List<Object[]> findActiveCategoriesByMasterId(@Param("masterId") UUID masterId);
 }

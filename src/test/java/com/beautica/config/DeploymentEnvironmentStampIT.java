@@ -95,7 +95,9 @@ class DeploymentEnvironmentStampIT {
                     "spring.mail.username=", "spring.mail.password=",
                     // EnvironmentFingerprintGuard link-URL + support-email rules.
                     "app.public-base-url=https://api.staging.beautica.test", "app.frontend.base-url=https://example.invalid",
-                    "app.support.email=support@test.invalid", "app.internal-api-key=" + TestSecrets.INTERNAL_API_KEY));
+                    "app.support.email=support@test.invalid", "app.internal-api-key=" + TestSecrets.INTERNAL_API_KEY,
+                    // Phase 382 D7: the staging overlay runs Turnstile with Cloudflare's always-pass TEST secret.
+                    "app.turnstile.enabled=true", "app.turnstile.secret-key=1x0000000000000000000000000000000AA"));
             case PROD -> props.addAll(List.of("beautica.sms.mode=turbosms", "spring.mail.host=smtp-relay.brevo.com",
                     "app.cloudflare-r2.enabled=true", "app.cloudflare-r2.bucket=beautica-media-prod",
                     "app.cloudflare-r2.public-url=https://media.beautica.ua",
@@ -104,6 +106,9 @@ class DeploymentEnvironmentStampIT {
                     // Phase 367 prod required-env rules.
                     "sentry.dsn=https://0123456789abcdef@o42.ingest.de.sentry.io/4500000000000001",
                     "TURBOSMS_TOKEN=turbosms-fixture-token", "ADMIN_EMAIL=admin@beautica.ua",
+                    // Phase 382 D7: prod Turnstile ON, real-shaped (non-test) secret, Cloudflare's siteverify URL.
+                    "app.turnstile.enabled=true", "app.turnstile.secret-key=0x4AAAAAAAfixtureNotARealSecretZZ9",
+                    "app.turnstile.siteverify-url=https://challenges.cloudflare.com/turnstile/v0/siteverify",
                     // Phase 374: prod must resolve the Brevo HTTPS API transport (prod-mail-transport et al.).
                     "app.mail.transport=brevo-api", "app.mail.brevo-api.api-key=xkeysib-fixture-api-key",
                     "app.mail.logo-url=https://beautica.app/email/logo.png"));

@@ -8,6 +8,8 @@ import com.beautica.config.WebMvcTestSupport;
 import jakarta.servlet.http.HttpServletResponse;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
 import org.springframework.boot.test.context.TestConfiguration;
@@ -70,6 +72,13 @@ class PhoneOtpControllerTest {
     @MockBean
     private JwtTokenProvider jwtTokenProvider;
 
+    // Phase 382: the controller's new collaborator — a slice without it fails to start.
+    @MockBean
+    private com.beautica.auth.turnstile.TurnstileVerifier turnstileVerifier;
+
+    @MockBean
+    private com.beautica.auth.filter.VisitorIpResolver visitorIpResolver;
+
     private static final String VALID_PHONE = "+380671234567";
 
     @Test
@@ -77,7 +86,7 @@ class PhoneOtpControllerTest {
     void should_return200_when_sendValidPhone() throws Exception {
         mockMvc.perform(post("/api/v1/book/otp/send")
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"phone\":\"" + VALID_PHONE + "\"}"))
+                        .content("{\"phone\":\"" + VALID_PHONE + "\",\"privacyAccepted\":true,\"privacyPolicyVersion\":\"2026-10-20\"}"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.success").value(true));
     }
@@ -88,6 +97,88 @@ class PhoneOtpControllerTest {
         mockMvc.perform(post("/api/v1/book/otp/send")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"phone\":\"12345\"}"))
+                .andExpect(status().isBadRequest());
+
+        verifyNoInteractions(phoneOtpService);
+    }
+
+    @Test
+    @DisplayName("POST /book/otp/send — Turnstile gets the body token and the resolved IP BEFORE the SMS (phase 382)")
+    void should_verifyTurnstileBeforeSendingOtp_when_sendValid() throws Exception {
+        when(visitorIpResolver.resolve(org.mockito.ArgumentMatchers.any())).thenReturn("203.0.113.7");
+        mockMvc.perform(post("/api/v1/book/otp/send")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .header("X-Forwarded-For", "203.0.113.7")
+                        .content("{\"phone\":\"" + VALID_PHONE + "\",\"privacyAccepted\":true,"
+                                + "\"privacyPolicyVersion\":\"2026-10-20\",\"turnstileToken\":\"tok-1\"}"))
+                .andExpect(status().isOk());
+
+        org.mockito.InOrder order = org.mockito.Mockito.inOrder(turnstileVerifier, phoneOtpService);
+        order.verify(turnstileVerifier).verify("tok-1", "203.0.113.7");
+        order.verify(phoneOtpService).sendOtp(VALID_PHONE);
+    }
+
+    @Test
+    @DisplayName("POST /book/otp/send — a Turnstile rejection answers 400 'Verification failed' and sendOtp is never called")
+    void should_return400AndNeverSend_when_turnstileRejects() throws Exception {
+        org.mockito.Mockito.doThrow(new com.beautica.common.exception.TurnstileRejectedException())
+                .when(turnstileVerifier).verify(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any());
+
+        mockMvc.perform(post("/api/v1/book/otp/send")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"phone\":\"" + VALID_PHONE + "\",\"privacyAccepted\":true,"
+                                + "\"privacyPolicyVersion\":\"2026-10-20\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.message").value("Verification failed"));
+
+        verifyNoInteractions(phoneOtpService);
+    }
+
+    @Test
+    @DisplayName("POST /book/otp/send — Turnstile unavailable answers 503 with the allow-listed message and sendOtp is never called")
+    void should_return503AndNeverSend_when_turnstileUnavailable() throws Exception {
+        org.mockito.Mockito.doThrow(new com.beautica.common.exception.BusinessException(
+                        org.springframework.http.HttpStatus.SERVICE_UNAVAILABLE,
+                        com.beautica.common.exception.ServiceUnavailableMessages.TURNSTILE_UNAVAILABLE))
+                .when(turnstileVerifier).verify(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any());
+
+        mockMvc.perform(post("/api/v1/book/otp/send")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"phone\":\"" + VALID_PHONE + "\",\"privacyAccepted\":true,"
+                                + "\"privacyPolicyVersion\":\"2026-10-20\"}"))
+                .andExpect(status().isServiceUnavailable())
+                .andExpect(jsonPath("$.message")
+                        .value(com.beautica.common.exception.ServiceUnavailableMessages.TURNSTILE_UNAVAILABLE));
+
+        verifyNoInteractions(phoneOtpService);
+    }
+
+    @Test
+    @DisplayName("POST /book/otp/send — an oversized turnstileToken is a 400 before the verifier is reached")
+    void should_return400_when_turnstileTokenLongerThan2048() throws Exception {
+        mockMvc.perform(post("/api/v1/book/otp/send")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"phone\":\"" + VALID_PHONE + "\",\"privacyAccepted\":true,"
+                                + "\"privacyPolicyVersion\":\"2026-10-20\",\"turnstileToken\":\""
+                                + "a".repeat(2049) + "\"}"))
+                .andExpect(status().isBadRequest());
+
+        verifyNoInteractions(turnstileVerifier, phoneOtpService);
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @ValueSource(strings = {
+            "{\"phone\":\"+380671234567\"}",
+            "{\"phone\":\"+380671234567\",\"privacyAccepted\":false,\"privacyPolicyVersion\":\"2026-10-20\"}",
+            "{\"phone\":\"+380671234567\",\"privacyAccepted\":true}",
+            "{\"phone\":\"+380671234567\",\"privacyAccepted\":true,\"privacyPolicyVersion\":\"v1\"}",
+            "{\"phone\":\"+380671234567\",\"privacyAccepted\":true,\"privacyPolicyVersion\":\"2026-10-20; DROP\"}"
+    })
+    @DisplayName("POST /book/otp/send — 400 and no SMS when consent is missing, false or the version is malformed (Phase 381)")
+    void should_return400AndNotSend_when_consentMissingOrInvalid(String body) throws Exception {
+        mockMvc.perform(post("/api/v1/book/otp/send")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
                 .andExpect(status().isBadRequest());
 
         verifyNoInteractions(phoneOtpService);

@@ -1115,7 +1115,7 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
 
         String guestToken = guestTokenProvider.generate("+380509998877");
         String body = "{\"serviceId\":\"" + masterBServiceId + "\",\"startsAt\":\""
-                + slot.toOffsetDateTime() + "\",\"name\":\"Гість\",\"surname\":\"Тестовий\"}";
+                + slot.toOffsetDateTime() + "\",\"name\":\"Гість\",\"surname\":\"Тестовий\",\"privacyAccepted\":true,\"privacyPolicyVersion\":\"2026-10-20\"}";
 
         HttpHeaders guestHeaders = new HttpHeaders();
         guestHeaders.setBearerAuth(guestToken);

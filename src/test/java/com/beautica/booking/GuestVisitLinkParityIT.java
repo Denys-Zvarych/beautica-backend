@@ -311,7 +311,7 @@ class GuestVisitLinkParityIT extends AbstractIntegrationTest {
                 .plusDays(4).withHour(9).withMinute(0).withSecond(0).withNano(0);
 
         String body = """
-                {"serviceId":"%s","startsAt":"%s","name":"Ірина","surname":"Шевчук"}
+                {"serviceId":"%s","startsAt":"%s","name":"Ірина","surname":"Шевчук","privacyAccepted":true,"privacyPolicyVersion":"2026-10-20"}
                 """.formatted(svc, startsAt.toOffsetDateTime());
         ResponseEntity<String> createResp = restTemplate.exchange(
                 "/api/v1/book/" + slug + "/booking", HttpMethod.POST,
@@ -390,7 +390,7 @@ class GuestVisitLinkParityIT extends AbstractIntegrationTest {
         ZonedDateTime startsAt = ZonedDateTime.now(KYIV)
                 .plusDays(3).withHour(10).withMinute(0).withSecond(0).withNano(0);
         String body = """
-                {"startsAt":"%s","name":"Оксана","surname":"Мельник"}
+                {"startsAt":"%s","name":"Оксана","surname":"Мельник","privacyAccepted":true,"privacyPolicyVersion":"2026-10-20"}
                 """.formatted(startsAt.toOffsetDateTime());
 
         ResponseEntity<String> resp = restTemplate.exchange(
@@ -417,7 +417,7 @@ class GuestVisitLinkParityIT extends AbstractIntegrationTest {
         ZonedDateTime startsAt = ZonedDateTime.now(KYIV)
                 .plusDays(3).withHour(16).withMinute(0).withSecond(0).withNano(0);
         String body = """
-                {"serviceId":"%s","masterServiceIds":["%s","%s"],"startsAt":"%s","name":"Оксана","surname":"Мельник"}
+                {"serviceId":"%s","masterServiceIds":["%s","%s"],"startsAt":"%s","name":"Оксана","surname":"Мельник","privacyAccepted":true,"privacyPolicyVersion":"2026-10-20"}
                 """.formatted(svcLone, svc1, svc2, startsAt.toOffsetDateTime());
 
         ResponseEntity<String> resp = restTemplate.exchange(
@@ -452,7 +452,7 @@ class GuestVisitLinkParityIT extends AbstractIntegrationTest {
                 .plusDays(3).withHour(11).withMinute(0).withSecond(0).withNano(0);
         // Embedded NUL in the name — an SMS/log-injection surface the @Pattern rejects.
         String body = """
-                {"masterServiceIds":["%s","%s"],"startsAt":"%s","name":"Окса\\u0000на","surname":"Мельник"}
+                {"masterServiceIds":["%s","%s"],"startsAt":"%s","name":"Окса\\u0000на","surname":"Мельник","privacyAccepted":true,"privacyPolicyVersion":"2026-10-20"}
                 """.formatted(svc1, svc2, startsAt.toOffsetDateTime());
 
         ResponseEntity<String> resp = restTemplate.exchange(
@@ -537,7 +537,7 @@ class GuestVisitLinkParityIT extends AbstractIntegrationTest {
 
         String ids = "\"" + svc1 + "\",\"" + svc2 + "\"";
         String body = """
-                {"masterServiceIds":[%s],"startsAt":"%s","name":"Оксана","surname":"Мельник"}
+                {"masterServiceIds":[%s],"startsAt":"%s","name":"Оксана","surname":"Мельник","privacyAccepted":true,"privacyPolicyVersion":"2026-10-20"}
                 """.formatted(ids, startsAt.toOffsetDateTime());
         ResponseEntity<String> resp = restTemplate.exchange(
                 "/api/v1/book/" + slug + "/booking", HttpMethod.POST,
@@ -667,7 +667,7 @@ class GuestVisitLinkParityIT extends AbstractIntegrationTest {
         String ids = serviceIds.stream().map(id -> "\"" + id + "\"")
                 .collect(java.util.stream.Collectors.joining(","));
         String body = """
-                {"masterServiceIds":[%s],"startsAt":"%s","name":"Оксана","surname":"Мельник"}
+                {"masterServiceIds":[%s],"startsAt":"%s","name":"Оксана","surname":"Мельник","privacyAccepted":true,"privacyPolicyVersion":"2026-10-20"}
                 """.formatted(ids, startsAt.toOffsetDateTime());
         ResponseEntity<String> resp = restTemplate.exchange(
                 "/api/v1/book/" + slug + "/booking", HttpMethod.POST,

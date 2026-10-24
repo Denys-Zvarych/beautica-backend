@@ -224,6 +224,9 @@ logging:
     org.flywaydb: INFO
 
 springdoc:
+  # Internal ops endpoints (InternalApiKeyFilter-guarded) never belong in the public spec the
+  # mobile client is generated from. Guarded by InternalEndpointsOpenApiContractIT.
+  paths-to-exclude: /api/v1/internal/**
   api-docs:
     path: /api-docs
     enabled: false
@@ -240,6 +243,11 @@ beautica:
     # turbosms (default) | capture. capture mails every SMS to a Mailpit inbox instead of the
     # provider (staging only; the fingerprint guard rejects it in prod).
     mode: turbosms
+    # Phase 389 — bare website host for the guest OTP SMS's last line `@host #code` (WebOTP on Chrome
+    # Android, domain-bound autofill on iOS Safari). Blank (local/test) = no domain line. prod pins
+    # beautica.app; staging reads OTP_SMS_DOMAIN. Validated at boot: lower-case bare host (no scheme,
+    # port or path), at most 18 chars so the SMS stays one UCS-2 segment even with CRLF (OtpDomainRules).
+    otp-domain: ""
   db:
     # PostgreSQL major the app expects (prod Railway postgres-ssl:18, CI and local postgres:18-alpine).
     # DatabaseServerVersionLogger WARNs on mismatch; it never fails boot.
@@ -335,7 +343,8 @@ app:
       # Phase 22.7 — THE single "are we spending SMS money" switch. Read by SmsConfig, which uses
       # it to choose the SmsService bean itself (NoOpSmsService when false, TurbosmsService when
       # true), so it gates EVERY outbound booking SMS at once: walk-in confirmation, guest
-      # confirmation, 24h reminder, cancellation, provider decline. No call site branches on it.
+      # confirmation, 24h reminder, cancellation, provider decline / salon closure / master removal
+      # (phase 390). No call site branches on it.
       #
       # NOT gated by this flag: the guest phone-OTP (POST /api/v1/book/otp/send). An OTP is an auth
       # credential, not booking spend, so PhoneOtpService injects OtpSmsSender — an unconditional
@@ -369,20 +378,9 @@ app:
         Beautica: Ваш запис скасовано.
         {serviceName} у {masterName}
         {date} о {time}
-      # Phase 25.7 — sent to a GUEST (LINK) booking's phone when the provider declines. A guest
-      # has no account for email/push, so this SMS is the only channel that tells them at all.
-      # Deliberately does NOT include the reason clause — see decline-reason below — the
-      # provider's note is optional (Phase 25.9) and this template must stand alone, coherently,
-      # without one.
-      decline: |-
-        Beautica: На жаль, ваш запис скасовано.
-        {serviceName} у {masterName}
-        {date} о {time}
-      # Phase 25.9 — appended to `decline` above ONLY when the provider actually left a note, so
-      # an optional/absent note never leaves a dangling "Причина: " label with nothing after it.
-      # {comment} is the provider's decline note, truncated to ~120 chars before substitution.
-      # Double-quoted (not a block scalar) so the leading "\n\n" separator is unambiguous.
-      decline-reason: "\n\nПричина: {comment}"
+      # Phase 390 — the guest provider-cancellation SMS (decline, salon closure, master removal) is
+      # fixed copy in GuestProviderCancellationSmsText, not a template here (no provider text in it;
+      # its length is pinned by tests). Do not re-add `decline:` / `decline-reason:` — nothing reads them.
       # Phase 22.7 — the walk-in confirmation (POST /api/v1/masters/{masterId}/bookings) is the ONE
       # template with no key here, deliberately (QA MEDIUM, 2026-08-18). Its text lives in exactly
       # one place: BookingSmsProperties.Sms#walkInConfirmation. A yml copy identical to that default
@@ -395,6 +393,36 @@ app:
       # Constraint that travels with the copy wherever it lives: it must carry NO {cancelUrl} — a
       # STAFF booking has cancel_token = NULL by the V137 CHECK, so there is no link to build and
       # the placeholder would render literally in a real client's message.
+  booking-links:
+    # Phase 375 (D6) — kill-switch for GET /api/v1/booking-links/mine. false = the app hides sharing,
+    # the endpoint returns {shareEnabled:false, links:[]} and issues NO slug. Stays false in prod until
+    # website 008 + 009 render beautica.app/book/{slug} on prod; then set BOOKING_LINKS_SHARE_ENABLED=true
+    # on Railway (no release). local / staging / test turn it on in their own profile files.
+    share-enabled: ${BOOKING_LINKS_SHARE_ENABLED:false}
+    # Phase 375 (D5) — public website origin of the share URL ({web-base-url}/book/{slug}).
+    # https, bare origin, no trailing slash — validated at boot (BookingLinksProperties).
+    web-base-url: https://beautica.app
+  booking-info:
+    # Optional shared secret of the website's SSR Worker (website 008). A /book/**/info request carrying a
+    # matching X-Beautica-Worker-Key header is rate-limited per CF-Connecting-IP (the visitor) instead of
+    # per egress IP (BookingInfoWorkerProperties). Blank = feature off. Secret: never log it.
+    worker-key: ${BOOKING_INFO_WORKER_KEY:}
+  turnstile:
+    # Phase 382 — Cloudflare Turnstile on POST /api/v1/book/otp/send (SMS-pumping protection). OFF here
+    # (local, test, default): the verifier is a no-op and the token is ignored. application-prod.yml and
+    # application-staging.yml switch it on; EnvironmentFingerprintGuard refuses a prod boot with it off.
+    # `enabled` is deliberately NOT an env var. The secret is: TURNSTILE_SECRET_KEY (Railway only, never
+    # committed, never logged).
+    enabled: false
+    secret-key: ${TURNSTILE_SECRET_KEY:}
+    siteverify-url: https://challenges.cloudflare.com/turnstile/v0/siteverify
+    connect-timeout: 2s
+    # connect 2s + read 2s = at most ~4s per request before failing closed (503); no retry.
+    read-timeout: 2s
+    # Hostname / action checks apply only when non-empty (prod). Cloudflare's test keys return a dummy
+    # hostname/action, so staging leaves both empty.
+    expected-hostnames: []
+    expected-action: ""
   admin-email: ${ADMIN_EMAIL:admin@beautica.app}
   support:
     # Fixed destination inbox for the Help / Contact-us feature

@@ -7,10 +7,13 @@ import com.beautica.booking.dto.BookingSlugInfoResponse;
 import com.beautica.booking.dto.CancelTokenInfoResponse;
 import com.beautica.booking.dto.GuestBookingRequest;
 import com.beautica.booking.dto.GuestBookingResponse;
+import com.beautica.booking.dto.SalonBookingSlugInfoResponse;
+import com.beautica.booking.dto.SalonBookingSlugMasterItem;
 import com.beautica.booking.dto.ServiceSummaryDto;
 import com.beautica.booking.service.BookingCancellationService;
 import com.beautica.booking.service.BookingSlugService;
 import com.beautica.booking.service.GuestBookingService;
+import com.beautica.booking.service.SalonBookingSlugService;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.NotFoundException;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -40,6 +43,7 @@ import java.util.List;
 import java.util.UUID;
 
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.verify;
@@ -47,6 +51,7 @@ import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
@@ -102,14 +107,17 @@ class PublicBookingControllerTest {
     @MockBean
     private JwtTokenProvider jwtTokenProvider;
 
+    @MockBean
+    private SalonBookingSlugService salonBookingSlugService;
+
     @Test
     @DisplayName("GET /book/{slug}/info — 200 with master + services and NO Authorization header")
     void should_return200WithMasterAndServices_when_slugExists() throws Exception {
-        var response = new BookingSlugInfoResponse(
+        var response = masterPage(
                 "Марія Левченко",
                 "https://cdn.example/a.jpg",
                 "Манікюр та педикюр",
-                List.of(new ServiceSummaryDto(UUID.randomUUID(), "Манікюр", 60, new BigDecimal("350.00"))));
+                List.of(new ServiceSummaryDto(UUID.randomUUID(), "Манікюр", 60, new BigDecimal("350.00"), "NAILS")));
         when(bookingSlugService.findBySlug("marija-l-cd34")).thenReturn(response);
 
         mockMvc.perform(get("/api/v1/book/marija-l-cd34/info").accept(MediaType.APPLICATION_JSON))
@@ -125,15 +133,14 @@ class PublicBookingControllerTest {
     @Test
     @DisplayName("GET /book/{slug}/info — public response carries no owner/master/user identifiers")
     void should_notLeakInternalIds_when_slugExists() throws Exception {
-        var response = new BookingSlugInfoResponse(
+        var response = masterPage(
                 "Ivan Petrenko", null, null,
-                List.of(new ServiceSummaryDto(UUID.randomUUID(), "Стрижка", 45, new BigDecimal("200.00"))));
+                List.of(new ServiceSummaryDto(UUID.randomUUID(), "Стрижка", 45, new BigDecimal("200.00"), "HAIR")));
         when(bookingSlugService.findBySlug("ivan-petrenko-ab12")).thenReturn(response);
 
         mockMvc.perform(get("/api/v1/book/ivan-petrenko-ab12/info").accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.ownerId").doesNotExist())
-                .andExpect(jsonPath("$.masterId").doesNotExist())
                 .andExpect(jsonPath("$.services[0].ownerId").doesNotExist())
                 .andExpect(jsonPath("$.services[0].ownerType").doesNotExist());
     }
@@ -193,6 +200,96 @@ class PublicBookingControllerTest {
                 .andExpect(status().isBadRequest());
     }
 
+    // ── Phase 387: bookable-days (public calendar day-gate) ───────────────────
+
+    @Test
+    @DisplayName("GET /book/{slug}/bookable-days — 200 with [{date, working}] only, NO auth required")
+    void should_return200WithDayFlags_when_bookableDaysRequested() throws Exception {
+        UUID svc = UUID.randomUUID();
+        when(guestBookingService.bookableDays("marija-l-cd34", java.time.LocalDate.parse("2026-06-10"),
+                java.time.LocalDate.parse("2026-06-11"), List.of(svc)))
+                .thenReturn(List.of(
+                        new com.beautica.master.dto.MasterWorkingDayResponse(java.time.LocalDate.parse("2026-06-10"), true),
+                        new com.beautica.master.dto.MasterWorkingDayResponse(java.time.LocalDate.parse("2026-06-11"), false)));
+
+        mockMvc.perform(get("/api/v1/book/marija-l-cd34/bookable-days")
+                        .param("from", "2026-06-10")
+                        .param("to", "2026-06-11")
+                        .param("serviceId", svc.toString())
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.length()").value(2))
+                .andExpect(jsonPath("$[0].date").value("2026-06-10"))
+                .andExpect(jsonPath("$[0].working").value(true))
+                .andExpect(jsonPath("$[1].date").value("2026-06-11"))
+                .andExpect(jsonPath("$[1].working").value(false))
+                .andExpect(jsonPath("$[0].length()").value(2));
+    }
+
+    @Test
+    @DisplayName("GET /book/{slug}/bookable-days — repeated serviceId binds to the ordered list (multi-service visit)")
+    void should_passOrderedServiceIds_when_serviceIdRepeated() throws Exception {
+        UUID a = UUID.randomUUID();
+        UUID b = UUID.randomUUID();
+        when(guestBookingService.bookableDays(anyString(), any(), any(), anyList())).thenReturn(List.of());
+
+        mockMvc.perform(get("/api/v1/book/marija-l-cd34/bookable-days")
+                        .param("from", "2026-06-10")
+                        .param("to", "2026-06-10")
+                        .param("serviceId", a.toString(), b.toString()))
+                .andExpect(status().isOk());
+
+        verify(guestBookingService).bookableDays(eq("marija-l-cd34"), any(), any(), eq(List.of(a, b)));
+    }
+
+    @Test
+    @DisplayName("GET /book/{slug}/bookable-days — 400 on missing/malformed from/to, missing or >10 serviceId, bad slug; no service call")
+    void should_return400WithoutServiceCall_when_bookableDaysParamsInvalid() throws Exception {
+        String svc = UUID.randomUUID().toString();
+        String[] eleven = new String[11];
+        for (int i = 0; i < eleven.length; i++) {
+            eleven[i] = UUID.randomUUID().toString();
+        }
+
+        mockMvc.perform(get("/api/v1/book/marija-l-cd34/bookable-days").param("to", "2026-06-10").param("serviceId", svc))
+                .andExpect(status().isBadRequest());
+        mockMvc.perform(get("/api/v1/book/marija-l-cd34/bookable-days").param("from", "2026-06-10").param("serviceId", svc))
+                .andExpect(status().isBadRequest());
+        mockMvc.perform(get("/api/v1/book/marija-l-cd34/bookable-days")
+                        .param("from", "10.06.2026").param("to", "2026-06-10").param("serviceId", svc))
+                .andExpect(status().isBadRequest());
+        mockMvc.perform(get("/api/v1/book/marija-l-cd34/bookable-days").param("from", "2026-06-10").param("to", "2026-06-10"))
+                .andExpect(status().isBadRequest());
+        mockMvc.perform(get("/api/v1/book/marija-l-cd34/bookable-days")
+                        .param("from", "2026-06-10").param("to", "2026-06-10").param("serviceId", "not-a-uuid"))
+                .andExpect(status().isBadRequest());
+        mockMvc.perform(get("/api/v1/book/marija-l-cd34/bookable-days")
+                        .param("from", "2026-06-10").param("to", "2026-06-10").param("serviceId", eleven))
+                .andExpect(status().isBadRequest());
+        mockMvc.perform(get("/api/v1/book/Bad_Slug!/bookable-days")
+                        .param("from", "2026-06-10").param("to", "2026-06-10").param("serviceId", svc))
+                .andExpect(status().isBadRequest());
+
+        verifyNoInteractions(guestBookingService);
+    }
+
+    @Test
+    @DisplayName("GET /book/{slug}/bookable-days — service 400 (range outside the guest window) and 404 (unknown slug/service) pass through")
+    void should_return400Or404_when_serviceRejectsBookableDays() throws Exception {
+        UUID svc = UUID.randomUUID();
+        when(guestBookingService.bookableDays(eq("marija-l-cd34"), any(), any(), anyList()))
+                .thenThrow(new BusinessException(org.springframework.http.HttpStatus.BAD_REQUEST, "date is in the past"));
+        when(guestBookingService.bookableDays(eq("no-such-slug"), any(), any(), anyList()))
+                .thenThrow(new NotFoundException("Booking page not found"));
+
+        mockMvc.perform(get("/api/v1/book/marija-l-cd34/bookable-days")
+                        .param("from", "2020-01-01").param("to", "2020-01-02").param("serviceId", svc.toString()))
+                .andExpect(status().isBadRequest());
+        mockMvc.perform(get("/api/v1/book/no-such-slug/bookable-days")
+                        .param("from", "2026-06-10").param("to", "2026-06-10").param("serviceId", svc.toString()))
+                .andExpect(status().isNotFound());
+    }
+
     // ── Phase 13.3: guest booking creation ────────────────────────────────────
 
     @Test
@@ -200,7 +297,7 @@ class PublicBookingControllerTest {
     void should_return201_when_guestBookingCreated() throws Exception {
         UUID svc = UUID.randomUUID();
         UUID bookingId = UUID.randomUUID();
-        var req = new GuestBookingRequest(svc, OffsetDateTime.parse("2099-06-10T12:00:00+03:00"), "Олена", "Коваль");
+        var req = new GuestBookingRequest(svc, null, OffsetDateTime.parse("2099-06-10T12:00:00+03:00"), "Олена", "Коваль", true, "2026-10-20");
         var resp = new GuestBookingResponse(bookingId, req.startsAt(), "Марія Левченко", "Манікюр", 60,
                 "https://app.beautica.test/book/cancel/" + UUID.randomUUID());
         when(guestBookingService.createGuestBooking(eq("Bearer guest.token"), eq("marija-l-cd34"), any()))
@@ -220,7 +317,7 @@ class PublicBookingControllerTest {
     @DisplayName("POST /book/{slug}/booking — 401 when guest token is expired/invalid")
     void should_return401_when_tokenInvalid() throws Exception {
         UUID svc = UUID.randomUUID();
-        var req = new GuestBookingRequest(svc, OffsetDateTime.parse("2099-06-10T12:00:00+03:00"), "A", "B");
+        var req = new GuestBookingRequest(svc, null, OffsetDateTime.parse("2099-06-10T12:00:00+03:00"), "A", "B", true, "2026-10-20");
         when(guestBookingService.createGuestBooking(anyString(), anyString(), any()))
                 .thenThrow(new io.jsonwebtoken.ExpiredJwtException(null, null, "expired"));
 
@@ -236,7 +333,7 @@ class PublicBookingControllerTest {
     void should_return400_when_nameBlank() throws Exception {
         UUID svc = UUID.randomUUID();
         String body = """
-                {"serviceId":"%s","startsAt":"2099-06-10T12:00:00+03:00","name":"","surname":"Коваль"}
+                {"serviceId":"%s","startsAt":"2099-06-10T12:00:00+03:00","name":"","surname":"Коваль","privacyAccepted":true,"privacyPolicyVersion":"2026-10-20"}
                 """.formatted(svc);
 
         mockMvc.perform(post("/api/v1/book/marija-l-cd34/booking")
@@ -352,5 +449,191 @@ class PublicBookingControllerTest {
                 .andExpect(status().isBadRequest());
 
         verifyNoInteractions(bookingCancellationService);
+    }
+
+    /** Phase 380: a fully populated enriched master payload around the legacy four fields. */
+    private static BookingSlugInfoResponse masterPage(
+            String name, String avatarUrl, String bio, List<ServiceSummaryDto> services) {
+        return new BookingSlugInfoResponse(
+                name, avatarUrl, bio, services, UUID.randomUUID(),
+                com.beautica.master.entity.MasterType.INDEPENDENT_MASTER, null, null, null, null, null, 0,
+                List.of(), List.of(), List.of(), true, java.time.Instant.parse("2026-10-18T09:12:44Z"),
+                List.of(), null, null, null);
+    }
+
+    // ── Phase 385: guest booking comment ──────────────────────────────────────
+
+    @Test
+    @DisplayName("POST /book/{slug}/booking — a clientComment over 1000 chars or with control characters is 400, never reaches the service")
+    void should_return400_when_clientCommentTooLongOrHasControlCharacters() throws Exception {
+        UUID svc = UUID.randomUUID();
+        for (String bad : new String[] {"а".repeat(1001), "до\\u0000бре"}) {
+            String body = "{\"serviceId\":\"" + svc + "\",\"startsAt\":\"2099-06-10T12:00:00+03:00\","
+                    + "\"name\":\"Олена\",\"surname\":\"Коваль\",\"privacyAccepted\":true,"
+                    + "\"privacyPolicyVersion\":\"2026-10-20\",\"clientComment\":\"" + bad + "\"}";
+            mockMvc.perform(post("/api/v1/book/marija-l-cd34/booking")
+                            .header("Authorization", "Bearer guest.jwt.token")
+                            .contentType(MediaType.APPLICATION_JSON).content(body))
+                    .andExpect(status().isBadRequest());
+        }
+        verify(guestBookingService, org.mockito.Mockito.never()).createGuestBooking(any(), any(), any());
+    }
+
+    // ── Phase 383: GET /book/{slug}/reviews ────────────────────────────────────
+
+    @Test
+    @DisplayName("GET /book/{slug}/reviews — 200 PageResponse with the info Cache-Control, sort and size passed through")
+    void should_return200WithPage_when_reviewsRequested() throws Exception {
+        var review = new com.beautica.review.dto.ReviewResponse(UUID.randomUUID(), UUID.randomUUID(), "Олена К.",
+                "Манікюр", 5, "Дуже акуратно", java.time.OffsetDateTime.parse("2026-10-12T15:20:00Z"));
+        when(bookingSlugService.reviewsForSlug(eq("marija-l-cd34"),
+                eq(com.beautica.review.dto.SalonReviewSort.HIGHEST), any(org.springframework.data.domain.Pageable.class)))
+                .thenReturn(new org.springframework.data.domain.PageImpl<>(List.of(review),
+                        org.springframework.data.domain.PageRequest.of(0, 20), 1));
+
+        mockMvc.perform(get("/api/v1/book/marija-l-cd34/reviews?sort=HIGHEST&page=0&size=20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(header().string("Cache-Control", "max-age=0, public, s-maxage=30"))
+                .andExpect(jsonPath("$.data[0].clientDisplayName").value("Олена К."))
+                .andExpect(jsonPath("$.totalElements").value(1));
+    }
+
+    @Test
+    @DisplayName("GET /book/{slug}/reviews — unknown sort is 400, malformed slug is 400, neither reaches the service")
+    void should_return400_when_reviewsSortOrSlugInvalid() throws Exception {
+        mockMvc.perform(get("/api/v1/book/marija-l-cd34/reviews?sort=BOGUS").accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest());
+        mockMvc.perform(get("/api/v1/book/BAD_SLUG/reviews").accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest());
+
+        verifyNoInteractions(bookingSlugService);
+    }
+
+    @Test
+    @DisplayName("GET /book/{slug}/reviews — unknown slug is 404")
+    void should_return404_when_reviewsSlugUnknown() throws Exception {
+        when(bookingSlugService.reviewsForSlug(eq("nope-zz99"), any(), any()))
+                .thenThrow(new NotFoundException("Booking page not found"));
+
+        mockMvc.perform(get("/api/v1/book/nope-zz99/reviews").accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isNotFound());
+    }
+
+    @Test
+    @DisplayName("GET /book/s/{slug}/reviews — 200 PageResponse<SalonReviewResponse> with the info Cache-Control")
+    void should_return200WithSalonReviewPage_when_salonReviewsRequested() throws Exception {
+        var review = new com.beautica.review.dto.SalonReviewResponse(UUID.randomUUID(), UUID.randomUUID(), "Anna",
+                "Bila", "Олена К.", "Манікюр", 5, "Дуже акуратно",
+                java.time.OffsetDateTime.parse("2026-10-12T15:20:00Z"));
+        when(bookingSlugService.salonReviewsForSlug(eq("studiia-krasa-ab12"),
+                eq(com.beautica.review.dto.SalonReviewSort.OLDEST), any(org.springframework.data.domain.Pageable.class)))
+                .thenReturn(new org.springframework.data.domain.PageImpl<>(List.of(review),
+                        org.springframework.data.domain.PageRequest.of(0, 20), 1));
+
+        mockMvc.perform(get("/api/v1/book/s/studiia-krasa-ab12/reviews?sort=OLDEST").accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(header().string("Cache-Control", "max-age=0, public, s-maxage=30"))
+                .andExpect(jsonPath("$.data[0].masterFirstName").value("Anna"))
+                .andExpect(jsonPath("$.data[0].clientDisplayName").value("Олена К."));
+    }
+
+    @Test
+    @DisplayName("GET /book/s/{slug}/reviews — bad sort / malformed slug are 400 without a service call; unknown slug is 404")
+    void should_return400Or404_when_salonReviewsInputInvalid() throws Exception {
+        mockMvc.perform(get("/api/v1/book/s/studiia-krasa-ab12/reviews?sort=NOPE")).andExpect(status().isBadRequest());
+        mockMvc.perform(get("/api/v1/book/s/BAD_SLUG/reviews")).andExpect(status().isBadRequest());
+        verifyNoInteractions(bookingSlugService);
+        when(bookingSlugService.salonReviewsForSlug(eq("nope-zz99"), any(), any()))
+                .thenThrow(new NotFoundException("Booking page not found"));
+
+        mockMvc.perform(get("/api/v1/book/s/nope-zz99/reviews")).andExpect(status().isNotFound());
+    }
+
+    // ── Phase 377: public salon booking page ──────────────────────────────────
+
+    private static final UUID SALON_PAGE_MASTER_ID = UUID.fromString("11111111-2222-3333-4444-555555555555");
+    private static final UUID SALON_PAGE_SERVICE_ID = UUID.fromString("66666666-7777-8888-9999-000000000000");
+    private static final UUID SALON_PAGE_MSA_ID = UUID.fromString("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+
+    private static SalonBookingSlugInfoResponse salonPage(UUID salonId) {
+        return new SalonBookingSlugInfoResponse(
+                salonId, "Студія Краса", "Вінниця", "https://cdn.example/logo.jpg", null,
+                new BigDecimal("4.80"), 12, true,
+                List.of(new SalonBookingSlugMasterItem("anna-bila-aa11", "Anna Bila", null, "Стиліст", new BigDecimal("4.90"), 7,
+                        SALON_PAGE_MASTER_ID)),
+                "Вінницька область", "вул. Соборна", "12", java.time.Instant.parse("2026-10-15T08:00:00Z"),
+                null, null, List.of(), List.of(), List.of(), List.of(),
+                List.of(new com.beautica.booking.dto.SalonServiceCoverage(SALON_PAGE_SERVICE_ID, List.of(
+                        new com.beautica.booking.dto.SalonServiceMasterRef(SALON_PAGE_MASTER_ID, SALON_PAGE_MSA_ID)))));
+    }
+
+    @Test
+    @DisplayName("GET /book/s/{slug}/info — 200 with salon + bookable masters and NO Authorization header")
+    void should_return200WithSalonAndMasters_when_salonSlugExists() throws Exception {
+        UUID salonId = UUID.randomUUID();
+        when(salonBookingSlugService.findBySlug("studiia-krasa-ab12")).thenReturn(salonPage(salonId));
+
+        mockMvc.perform(get("/api/v1/book/s/studiia-krasa-ab12/info").accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.salonId").value(salonId.toString()))
+                .andExpect(jsonPath("$.name").value("Студія Краса"))
+                .andExpect(jsonPath("$.city").value("Вінниця"))
+                .andExpect(jsonPath("$.avgRating").value(4.80))
+                .andExpect(jsonPath("$.reviewCount").value(12))
+                .andExpect(jsonPath("$.bookable").value(true))
+                .andExpect(jsonPath("$.masters.length()").value(1))
+                .andExpect(jsonPath("$.masters[0].masterSlug").value("anna-bila-aa11"))
+                .andExpect(jsonPath("$.masters[0].professionalTitle").value("Стиліст"))
+                .andExpect(jsonPath("$.ownerId").doesNotExist())
+                .andExpect(jsonPath("$.phone").doesNotExist())
+                // Phase 391: the master id is now part of the public contract (salon guest routes key on it).
+                .andExpect(jsonPath("$.masters[0].masterId").value(SALON_PAGE_MASTER_ID.toString()))
+                .andExpect(jsonPath("$.serviceCoverage[0].serviceId").value(SALON_PAGE_SERVICE_ID.toString()))
+                .andExpect(jsonPath("$.serviceCoverage[0].masters[0].masterId").value(SALON_PAGE_MASTER_ID.toString()))
+                .andExpect(jsonPath("$.serviceCoverage[0].masters[0].masterServiceId").value(SALON_PAGE_MSA_ID.toString()))
+                .andExpect(jsonPath("$.masters[0].userId").doesNotExist());
+        verifyNoInteractions(bookingSlugService);
+    }
+
+    @Test
+    @DisplayName("GET /book/s/{slug}/info — 404 when the salon slug is unknown / inactive")
+    void should_return404_when_salonSlugUnknown() throws Exception {
+        when(salonBookingSlugService.findBySlug("no-such-salon"))
+                .thenThrow(new NotFoundException("Booking page not found"));
+
+        mockMvc.perform(get("/api/v1/book/s/no-such-salon/info").accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isNotFound());
+    }
+
+    @Test
+    @DisplayName("GET /book/s/{slug}/info — 400 when the slug violates the charset pattern (no lookup)")
+    void should_return400_when_salonSlugMalformed() throws Exception {
+        mockMvc.perform(get("/api/v1/book/s/Bad_Slug!/info").accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest());
+
+        verifyNoInteractions(salonBookingSlugService);
+    }
+
+    @Test
+    @DisplayName("GET /book/s/info — routes to the MASTER handler with slug 's' (1 char) → 400, salon handler untouched")
+    void should_notRouteToSalonHandler_when_pathIsBookSInfo() throws Exception {
+        mockMvc.perform(get("/api/v1/book/s/info").accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest());
+
+        verifyNoInteractions(salonBookingSlugService);
+        verifyNoInteractions(bookingSlugService);
+    }
+
+    @Test
+    @DisplayName("GET /book/{slug}/info for a master slug never reaches the salon handler")
+    void should_routeMasterSlugToMasterHandler_when_notUnderS() throws Exception {
+        when(bookingSlugService.findBySlug("ivan-petrenko-ab12"))
+                .thenReturn(masterPage("Ivan Petrenko", null, null, List.of()));
+
+        mockMvc.perform(get("/api/v1/book/ivan-petrenko-ab12/info").accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk());
+
+        verifyNoInteractions(salonBookingSlugService);
     }
 }

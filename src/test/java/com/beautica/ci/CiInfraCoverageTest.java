@@ -167,6 +167,22 @@ class CiInfraCoverageTest {
         assertThat(infra.matcher("docs/backend-phases/backlog.md").find()).isFalse();
     }
 
+    /** The destructive-migration gate's opt-out markers are author statements; both SQL and Java migrations need the owner. */
+    @Test
+    @DisplayName("should own sql and java migrations when codeowners read")
+    void should_ownSqlAndJavaMigrations_when_codeownersRead() throws IOException {
+        List<Pattern> owners = codeownersPatterns();
+
+        for (String file : List.of(
+                "src/main/resources/db/migration/V999__x.sql",
+                "src/main/resources/db/migration/sub/V999__x.sql",
+                "src/main/java/db/migration/V999__X.java",
+                "src/main/java/db/migration/sub/V999__X.java")) {
+            assertThat(owners.stream().anyMatch(p -> p.matcher(file).matches()))
+                .as("CODEOWNERS must own migration %s", file).isTrue();
+        }
+    }
+
     /** The th:utext guard script is run from the base tree by `plan`; editing it must force full + self-test and need the owner. */
     @Test
     @DisplayName("should guard forbid utext script when infra regex and codeowners read")

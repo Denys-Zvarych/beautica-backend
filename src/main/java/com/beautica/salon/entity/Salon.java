@@ -20,6 +20,7 @@ import lombok.Builder;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
+import org.springframework.lang.Nullable;
 
 import java.math.BigDecimal;
 import java.util.UUID;
@@ -38,7 +39,10 @@ import java.util.UUID;
                 @Index(name = "idx_salons_owner_primary", columnList = "owner_id"),
                 // V57: non-partial — backs existsByOwnerId(UUID) which must find any salon
                 // regardless of is_active or is_primary state.
-                @Index(name = "idx_salons_owner_id", columnList = "owner_id")
+                @Index(name = "idx_salons_owner_id", columnList = "owner_id"),
+                // V200: partial unique (WHERE booking_slug IS NOT NULL) — same reasoning as
+                // idx_salons_owner_primary: omit unique=true, JPA @Index cannot express WHERE.
+                @Index(name = "idx_salons_booking_slug", columnList = "booking_slug")
         }
 )
 @Getter
@@ -169,6 +173,25 @@ public class Salon extends AuditableEntity {
     // and the JVM already defaults a primitive boolean to false — which is the intent here.
     @Column(name = "is_primary", nullable = false)
     private boolean isPrimary;
+
+    /**
+     * Phase 376 — public booking-page slug behind {@code beautica.app/book/s/{slug}}. Globally unique
+     * across salons (partial unique index {@code idx_salons_booking_slug}, V200); may coincide with a
+     * master slug (separate URL namespace). Set at creation via the builder
+     * ({@code SalonService#createSalon}); legacy {@code NULL} rows get theirs lazily from
+     * {@code BookingSlugService#issueMissingSalonSlugs}. Permanent once issued (D5).
+     *
+     * <p>{@code updatable = false} and no setter, for the same lost-update reason as the image
+     * pointers above: the only post-insert writer is the race-safe native
+     * {@code SalonRepository#assignBookingSlugsIfAbsent}; a concurrent {@code PATCH /salons/{id}}
+     * holding a pre-issue snapshot would otherwise write {@code NULL} back over an issued slug —
+     * killing a link already handed out. A rename therefore never touches it.
+     */
+    // V200: partial unique index owns the constraint — omit unique=true (see @Table comment).
+    @Nullable
+    @Setter(AccessLevel.NONE)
+    @Column(name = "booking_slug", length = 60, updatable = false)
+    private String bookingSlug;
 
     /**
      * Denormalises a settlement's labels into the legacy {@code city}/{@code region} columns

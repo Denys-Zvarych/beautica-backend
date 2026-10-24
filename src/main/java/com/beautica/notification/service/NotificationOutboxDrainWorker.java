@@ -8,6 +8,7 @@ import com.beautica.notification.entity.OutboxEventType;
 import com.beautica.notification.entity.OutboxStatus;
 import com.beautica.notification.inapp.push.InAppPushDispatcher;
 import com.beautica.notification.repository.NotificationOutboxRepository;
+import com.beautica.notification.sms.SmsBackpressureException;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -62,8 +63,9 @@ public class NotificationOutboxDrainWorker {
      * a Brevo outage (hanging connections, or fast rejects) walks every queued e-mail through
      * {@link #MAX_ATTEMPTS} on consecutive 5 s ticks, starving fresh booking e-mails and push rows
      * and dead-lettering the lot within minutes. There is deliberately no {@code next_attempt_at}
-     * column: the deferred rows are simply retried on the next tick, where the first of them is the
-     * probe that decides whether the breaker trips again.
+     * gate for these rows (V203 {@code not_before} is only for SMS backpressure, see
+     * {@link #SMS_BACKPRESSURE_DEFER_SECONDS}): the deferred rows are simply retried on the next
+     * tick, where the first of them is the probe that decides whether the breaker trips again.
      *
      * <p>Only transient relay failures ({@link EmailDeliveryException#isTransientSmtp()}) count; a
      * permanent local error (template render) fails its row but neither counts nor resets the streak.
@@ -71,6 +73,16 @@ public class NotificationOutboxDrainWorker {
      * before e-mail rows, so a deferred e-mail backlog cannot starve them out of the batch.
      */
     static final int EMAIL_BREAKER_THRESHOLD = 3;
+
+    /**
+     * Seconds an SMS-backpressure-deferred row stays unclaimable (phase 390 D11, V203
+     * {@code not_before}). A deferred row keeps its {@code created_at}, so without this a burst of
+     * {@code >= BATCH_SIZE} deferred SMS rows would head every oldest-first batch while the SMS pool
+     * stays saturated and starve newer e-mail rows. Three 5 s ticks: long enough for newer rows to be
+     * claimed past them, short enough that the SMS still goes out promptly once the pool drains.
+     * Only SMS deferral uses it — the e-mail breaker and push saturation keep their next-tick retry.
+     */
+    static final int SMS_BACKPRESSURE_DEFER_SECONDS = 15;
 
     /** Micrometer counter names — untagged on purpose (no addresses / entry ids in metric dimensions). */
     static final String METRIC_BREAKER_TRIPS = "notification.outbox.breaker.trips";
@@ -164,9 +176,9 @@ public class NotificationOutboxDrainWorker {
      * read 10s ≈ 13s — outbox mails never carry attachments, so the 30s attachment budget does not
      * apply), giving ≈ 28s per entry; local/staging use SMTP (connect 5s + read 10s + write 10s ≈ 25s,
      * {@code mail.smtp.*}), giving ≈ 40s. Or (b) a guest-DECLINED
-     * entry (Phase 25.7), which sends SMS INSTEAD of email/push ({@code TurbosmsService}: connect
-     * 3s + read 5s ≈ 8s) — a third blocking-I/O call type on this same serial loop, but strictly
-     * cheaper than chain (a), so it does not raise the batch-level bound. At
+     * entry (Phase 25.7), which sends SMS INSTEAD of email/push — since phase 390 only a hand-off to
+     * {@code smsSendExecutor} (no provider I/O on this loop), so it does not raise the batch-level
+     * bound. At
      * {@code BATCH_SIZE = 50}: prod 50 × 28s = 1400s (~23 min), SMTP 50 × 40s = 2000s (~33 min) worst
      * case — but zero DB connections are held during that time. {@link NotificationOutboxReclaimJob}'s
      * stale-claim threshold (production default 60 min) is set with a comfortable margin over the larger
@@ -290,6 +302,7 @@ public class NotificationOutboxDrainWorker {
         int consecutiveEmailFailures = 0;
         boolean emailBreakerTripped = false;
         boolean pushSaturated = false;
+        boolean smsSaturated = false;
         int deferredEmailRows = 0;
         for (int i = 0; i < batch.size(); i++) {
             NotificationOutboxEntry entry = batch.get(i);
@@ -309,12 +322,24 @@ public class NotificationOutboxDrainWorker {
                 results.add(failedAttempt(entry, pushPrepareError));
                 continue;
             }
+            if (smsSaturated && isSmsRow(entry, bookingCache)) {
+                // SMS pool already pushed back this tick: defer without resubmitting — no attempt counted.
+                results.add(EntryResult.smsDeferred(entry));
+                continue;
+            }
             try {
                 dispatch(entry, bookingCache, visitSiblings, pushPlans);
                 results.add(new EntryResult(entry, OutboxStatus.SENT, entry.getAttempts(), null));
                 if (!isPush) {
                     consecutiveEmailFailures = 0;
                 }
+            } catch (SmsBackpressureException e) {
+                // Phase 390 (perf LOW-1): same shape as the push branch below — an SMS pushback must not
+                // stall the e-mail rows behind it. Defer this row and the batch's later SMS rows only.
+                log.warn("SMS executor backpressure at outbox entry [{}] — deferring remaining SMS entries "
+                        + "without counting an attempt: {}", entry.getId(), e.getClass().getSimpleName());
+                smsSaturated = true;
+                results.add(EntryResult.smsDeferred(entry));
             } catch (RejectedExecutionException e) {
                 // Spring's TaskRejectedException (what @Async actually throws) extends it.
                 // NOTE: this catch is not push-specific — a RejectedExecutionException from ANY
@@ -371,6 +396,17 @@ public class NotificationOutboxDrainWorker {
         OutboxStatus status = next >= MAX_ATTEMPTS ? OutboxStatus.DEAD : OutboxStatus.PENDING;
         log.warn("Outbox dispatch failed [{}] attempt {}/{}: {}", entry.getId(), next, MAX_ATTEMPTS, error);
         return new EntryResult(entry, status, next, error);
+    }
+
+    /**
+     * Whether this row's dispatch would hand an SMS to the SMS pool — decided by
+     * {@link NotificationService#routesToLinkGuestSms}, the owner of that routing, on the pre-loaded
+     * lead booking (no DB read). Rows whose aggregate is not a cached booking (INVITE, INAPP_PUSH, a
+     * missing booking) are never SMS rows.
+     */
+    private boolean isSmsRow(NotificationOutboxEntry entry, Map<UUID, Booking> bookingCache) {
+        Booking lead = bookingCache.get(entry.getAggregateId());
+        return lead != null && notificationService.routesToLinkGuestSms(entry.getEventType(), lead);
     }
 
     /** Marks {@code batch[from..]} PENDING with attempts unchanged — see the rejection catch above. */
@@ -436,10 +472,30 @@ public class NotificationOutboxDrainWorker {
         entry.setAttempts(result.attempts());
         entry.setLastError(result.lastError());
         outboxRepository.saveAndFlush(entry);
+        if (result.deferClaim()) {
+            // Same REQUIRES_NEW tx as the PENDING write above: the row is never PENDING-and-undeferred.
+            outboxRepository.deferPendingRow(entry.getId(), SMS_BACKPRESSURE_DEFER_SECONDS);
+        }
     }
 
-    /** Lightweight value object carrying dispatch outcome for one outbox entry. */
-    private record EntryResult(NotificationOutboxEntry entry, OutboxStatus status, int attempts, String lastError) {}
+    /**
+     * Lightweight value object carrying dispatch outcome for one outbox entry. {@code deferClaim}
+     * marks an SMS-backpressure deferral whose claim eligibility {@link #persistOne} pushes
+     * {@link #SMS_BACKPRESSURE_DEFER_SECONDS} into the future (phase 390 D11); {@code false} for
+     * every other outcome, which therefore persists exactly as before.
+     */
+    private record EntryResult(NotificationOutboxEntry entry, OutboxStatus status, int attempts, String lastError,
+                               boolean deferClaim) {
+
+        EntryResult(NotificationOutboxEntry entry, OutboxStatus status, int attempts, String lastError) {
+            this(entry, status, attempts, lastError, false);
+        }
+
+        /** Back to PENDING, attempts and last error untouched, claimable again only after the defer window. */
+        static EntryResult smsDeferred(NotificationOutboxEntry entry) {
+            return new EntryResult(entry, OutboxStatus.PENDING, entry.getAttempts(), entry.getLastError(), true);
+        }
+    }
 
     private static final Duration OUTBOX_RETENTION = Duration.ofDays(30);
 

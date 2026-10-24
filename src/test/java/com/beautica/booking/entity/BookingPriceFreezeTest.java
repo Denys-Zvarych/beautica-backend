@@ -42,7 +42,7 @@ class BookingPriceFreezeTest {
                 STARTS_AT, STARTS_AT.plusMinutes(60),
                 floor, ceiling,
                 60, 0,
-                "Оксана", "Мельник", "+380509998877");
+                "Оксана", "Мельник", "+380509998877", null);
     }
 
     @Test

@@ -962,6 +962,25 @@ public class MediaService {
     }
 
     /**
+     * The newest {@code limit} photos of one entity, read straight from the database and NEVER cached.
+     *
+     * <p>Exists for {@code GET /book/{slug}/info} (phase 380), which embeds the first 12 photos. It must not
+     * go through the cached {@link #getPortfolio(EntityType, UUID, PageRequest)}: that entry's key ignores
+     * the page size, so whichever caller filled it first would dictate the page for the other (a 12-photo
+     * page served to {@code /masters/{id}/portfolio}, or 50 photos embedded in the info payload). The info
+     * payload is itself cached under {@code booking-slug-info}, so this read costs one statement per miss.
+     * Same {@code createdAt DESC} order as the public portfolio endpoint.
+     */
+    @Transactional(readOnly = true)
+    public List<MediaFileResponse> getLatestPortfolio(EntityType entityType, UUID entityId, int limit) {
+        // List window, not a Page: no COUNT statement when the portfolio is as large as the cap.
+        return mediaRepo.findWindowByEntityTypeAndEntityId(entityType, entityId, PageRequest.of(0, limit, PORTFOLIO_SORT))
+                .stream()
+                .map(MediaFileResponse::from)
+                .toList();
+    }
+
+    /**
      * Narrow eviction of a single {@code portfolio} cache entry. Called from the
      * write paths AFTER {@link TransactionTemplate#execute} has returned (and the
      * transaction has therefore committed), so a parallel reader cannot repopulate
@@ -976,6 +995,14 @@ public class MediaService {
         Cache cache = cacheManager.getCache(PORTFOLIO_CACHE);
         if (cache != null) {
             cache.evictIfPresent(portfolioCacheKey(entityType, entityId));
+        }
+        if (entityType == EntityType.SALON) {
+            // Phase 384 D5: the public salon booking page carries the salon portfolio.
+            masterProfileCacheEvictor.evictSalonBookingPageAfterCommit(entityId);
+        }
+        if (entityType == EntityType.MASTER) {
+            // Phase 380 D6: the public master booking page carries the first 12 portfolio photos.
+            masterProfileCacheEvictor.evictBookingSlugInfoAfterCommit(entityId);
         }
     }
 

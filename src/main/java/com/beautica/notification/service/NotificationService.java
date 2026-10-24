@@ -3,13 +3,9 @@ package com.beautica.notification.service;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingSource;
 import com.beautica.booking.enums.BookingStatus;
-import com.beautica.common.TimeZones;
-import com.beautica.common.util.Placeholders;
+import com.beautica.booking.service.BookingSmsDispatcher;
 import com.beautica.common.util.SchemeGuard;
-import com.beautica.common.util.UkrainianPlurals;
-import com.beautica.config.BookingSmsProperties;
-import com.beautica.master.entity.Master;
-import com.beautica.notification.sms.SmsService;
+import com.beautica.notification.entity.OutboxEventType;
 import com.beautica.user.User;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.lang.Nullable;
@@ -17,9 +13,6 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.time.OffsetDateTime;
-import java.time.format.DateTimeFormatter;
-import java.util.Map;
-import java.util.regex.Pattern;
 
 /**
  * Thin notification-side facade that dispatches email and (guest-only) SMS notifications. Push is
@@ -31,7 +24,8 @@ import java.util.regex.Pattern;
  * runs after the originating transaction has committed (Phase 3 of the drain: {@code
  * @Transactional(propagation = NOT_SUPPORTED)}), so SMS dispatch here needs no additional
  * afterCommit synchronization of its own (unlike {@code BookingCancellationService}, which fires
- * its guest SMS from inside the original request's transaction). URL composition (and the HTTPS
+ * its guest SMS from inside the original request's transaction). The guest SMS is handed to
+ * {@link BookingSmsDispatcher} (phase 390), so a provider stall never holds the drain batch. URL composition (and the HTTPS
  * scheme guard) for invite links lives in {@code InviteService.buildInviteLink}, not in this
  * class.
  */
@@ -39,60 +33,21 @@ import java.util.regex.Pattern;
 @Service
 public class NotificationService {
 
-    /** Cyrillic SMS segments are ~70 chars; 120 keeps a decline note to two segments. */
-    private static final int SMS_COMMENT_MAX_LENGTH = 120;
-    private static final DateTimeFormatter SMS_DATE_FMT = DateTimeFormatter.ofPattern("dd.MM.yyyy");
-    private static final DateTimeFormatter SMS_TIME_FMT = DateTimeFormatter.ofPattern("HH:mm");
-
-    /**
-     * Splits a provider note into whitespace-delimited tokens for the link-neutralization pass
-     * in {@link #stripUrlsForSms}. Deliberately not "preserve original whitespace" — a removed
-     * token's surrounding gap, and any run of tabs/newlines in the note, both collapse to a
-     * single rejoining space (see {@link #stripUrlsForSms}).
-     */
-    private static final Pattern TOKEN_DELIMITER = Pattern.compile("\\s+");
-
-    /**
-     * One of the four "link-shaped" tests in {@link #isLinkShapedToken}: a {@code .} immediately
-     * followed by 2+ ASCII letters, anywhere in the token. This replaces a maintained TLD
-     * allowlist (the prior implementation's MEDIUM finding — {@code .xyz}/{@code .top}/
-     * {@code .click} etc. are real, cheap, ICANN-delegated TLDs an attacker can register to
-     * bypass any fixed list). Any dot-plus-letters shape is treated as a domain label, full
-     * stop — there is nothing left to bypass.
-     *
-     * <p>It cannot fire on Cyrillic prose: the note is Ukrainian free text and this character
-     * class is ASCII-only, so a sentence-ending {@code .} followed by a Cyrillic word never
-     * matches. It also spares a single-letter Latin abbreviation run like {@code "a.s.a.p."} —
-     * each {@code .} there is followed by exactly one letter before the next {@code .}, never
-     * two. And it spares a decimal/time value like {@code "15.30"} — the class is letters only,
-     * not digits. All three claims are exercised as explicit test cases in
-     * {@code NotificationServiceTest}, not asserted here without having run them.
-     */
-    private static final Pattern DOMAIN_DOT_LETTERS = Pattern.compile("\\.[A-Za-z]{2,}");
-
-    /**
-     * The other content-shape test in {@link #isLinkShapedToken}: a bare IPv4 literal
-     * ({@code d.d.d.d}), with or without a trailing path — Android's {@code Linkify.WEB_URLS}
-     * auto-links a bare IP exactly like a hostname, and {@link #DOMAIN_DOT_LETTERS} alone does
-     * not catch it (digits, not letters, follow each dot).
-     */
-    private static final Pattern BARE_IPV4 = Pattern.compile("\\d{1,3}(?:\\.\\d{1,3}){3}");
-
     private final EmailNotificationService emailService;
-    private final SmsService smsService;
-    private final BookingSmsProperties smsProperties;
+    private final BookingSmsDispatcher bookingSmsDispatcher;
+    private final GuestProviderCancellationSmsText guestCancellationSmsText;
     private final String frontendBaseUrl;
 
     // Explicit constructor — @RequiredArgsConstructor cannot bind the @Value frontend base URL.
     public NotificationService(
             EmailNotificationService emailService,
-            SmsService smsService,
-            BookingSmsProperties smsProperties,
+            BookingSmsDispatcher bookingSmsDispatcher,
+            GuestProviderCancellationSmsText guestCancellationSmsText,
             @Value("${app.frontend.base-url}") String frontendBaseUrl
     ) {
         this.emailService = emailService;
-        this.smsService = smsService;
-        this.smsProperties = smsProperties;
+        this.bookingSmsDispatcher = bookingSmsDispatcher;
+        this.guestCancellationSmsText = guestCancellationSmsText;
         this.frontendBaseUrl = frontendBaseUrl;
     }
 
@@ -114,17 +69,6 @@ public class NotificationService {
             return;
         }
         emailService.sendNewBookingEmail(masterUser.getEmail(), visit);
-    }
-
-    /**
-     * What the guest SMS says was booked: the service NAME for a single-service booking, or a
-     * numeral phrase — «3 послуги», «5 послуг» — for a multi-service visit. A visit's full service
-     * list is not named: up to ten names would blow the SMS segment budget.
-     */
-    private static String bookedSubject(BookingVisit visit) {
-        return visit.isMultiService()
-                ? UkrainianPlurals.servicesPhrase(visit.size())
-                : safe(visit.leadServiceName());
     }
 
     /**
@@ -168,8 +112,9 @@ public class NotificationService {
         // (mirrors the notifyReviewRequested guard).
         //
         // Phase 25.7: DECLINED is the one status a guest must still learn about — a declined
-        // guest was previously told NOTHING. Sends an SMS carrying the provider's note instead
-        // of the email/push a registered client gets. Every OTHER status (CONFIRMED/COMPLETED/
+        // guest was previously told NOTHING. Sends an SMS instead of the email/push a registered
+        // client gets. Phase 390: the SMS is the fixed GuestProviderCancellationSmsText copy — it
+        // no longer carries the provider's note, service or master name (no provider free text). Every OTHER status (CONFIRMED/COMPLETED/
         // NOT_COMPLETED) stays the pre-25.7 clean no-op — do not widen this branch to a new
         // status without a dedicated guest-booking test (track 24.x fixed seven separate
         // client==null null-derefs in exactly this area).
@@ -199,7 +144,8 @@ public class NotificationService {
         if (booking.getClient() == null) {
             if (booking.getStatus() == BookingStatus.DECLINED
                     && booking.getBookingSource() == BookingSource.LINK) {
-                sendLinkGuestDeclineSms(booking);
+                sendLinkGuestProviderCancellationSms(booking, "DECLINED",
+                        guestCancellationSmsText.forDecline(booking, declinedStart(visit)));
             } else {
                 log.debug("Skipping STATUS_CHANGED notification for account-less guest booking {}", booking.getId());
             }
@@ -313,15 +259,15 @@ public class NotificationService {
      *
      * <p>Takes a {@link BookingVisit}, not a bare {@code Booking}, because exactly ONE
      * {@code SALON_CLOSED} outbox row is enqueued per VISIT (D12) — {@code visit} may therefore
-     * describe several declined services at once, and the copy names all of them via
-     * {@link #bookedSubject(BookingVisit)}, never just the representative.
+     * describe several declined services at once; the email names all of them, and the guest SMS
+     * (one per visit) names the visit start only.
      *
      * <p><b>Per-audience delivery (D8).</b> A registered client (an account exists —
      * {@code booking.getClient() != null}) always has an email on file (schema-guaranteed,
      * {@code users.email NOT NULL}) — email + push. A guest ({@code LINK}) visit has no account
      * and no email; its {@code guestPhone} is OTP-verified, so it gets an SMS instead
-     * ({@link #sendSalonClosedGuestSms(BookingVisit)}, mirroring
-     * {@link #sendLinkGuestDeclineSms(Booking)}). A STAFF walk-in's phone was typed by an
+     * (phase 390 — the fixed {@link GuestProviderCancellationSmsText#forSalonClosed} copy via
+     * {@link #sendLinkGuestProviderCancellationSms}). A STAFF walk-in's phone was typed by an
      * employee, not proven by the recipient (Phase 22.1) — it is NOT an eligible SMS destination
      * and is left a silent no-op, same gate as {@link #notifyBookingStatusChanged(BookingVisit)}.
      *
@@ -334,7 +280,8 @@ public class NotificationService {
         Booking booking = visit.lead();
         if (booking.getClient() == null) {
             if (booking.getBookingSource() == BookingSource.LINK) {
-                sendSalonClosedGuestSms(visit);
+                sendLinkGuestProviderCancellationSms(booking, "SALON_CLOSED",
+                        guestCancellationSmsText.forSalonClosed(visit.startsAt()));
             } else {
                 log.debug("Skipping SALON_CLOSED notification for account-less non-LINK booking {}",
                         booking.getId());
@@ -353,20 +300,23 @@ public class NotificationService {
      *
      * <p>Same per-visit / per-audience shape as {@link #notifySalonClosed(BookingVisit)}: takes a
      * {@link BookingVisit} (one {@code MASTER_REMOVED} row is enqueued per VISIT, D12), a
-     * registered client gets email + push, a guest ({@code LINK}) visit gets SMS via {@link
-     * #sendMasterRemovedGuestSms(BookingVisit)}, and a STAFF walk-in's unverified phone is left a
+     * registered client gets email + push, a guest ({@code LINK}) visit gets the phase 390 SMS
+     * ({@link GuestProviderCancellationSmsText#forMasterRemoved}, rebook link to the salon page
+     * only), and a STAFF walk-in's unverified phone is left a
      * silent no-op — identical gate to the salon-closure path.
      *
-     * <p>Copy states the master is no longer working at this salon and the appointment was
+     * <p>The email states the master is no longer working at this salon and the appointment was
      * cancelled — it must never imply the salon closed and must never name a replacement master
-     * (no reassignment machinery exists). No booking note is ever read here (same D10 posture as
+     * (no reassignment machinery exists). The guest SMS says only that the appointment was
+     * cancelled, which is true for both cascades. No booking note is ever read here (same D10 posture as
      * {@link #notifySalonClosed(BookingVisit)} — {@link BookingVisit} exposes no note accessor).
      */
     public void notifyMasterRemoved(BookingVisit visit) {
         Booking booking = visit.lead();
         if (booking.getClient() == null) {
             if (booking.getBookingSource() == BookingSource.LINK) {
-                sendMasterRemovedGuestSms(visit);
+                sendLinkGuestProviderCancellationSms(booking, "MASTER_REMOVED",
+                        guestCancellationSmsText.forMasterRemoved(booking, visit.startsAt()));
             } else {
                 log.debug("Skipping MASTER_REMOVED notification for account-less non-LINK booking {}",
                         booking.getId());
@@ -426,217 +376,63 @@ public class NotificationService {
     }
 
     /**
-     * Dispatches the decline SMS for a {@code LINK} guest booking (Phase 25.7). Failures are
-     * swallowed after logging the exception class only — never the phone or message text
-     * (Anti-Bug §I) — mirroring {@code BookingCancellationService.sendCancellationSms}: the booking
-     * is already committed as DECLINED, so an SMS-provider failure must not fail outbox dispatch.
+     * Phase 390 — queues the provider-cancellation SMS for a {@code LINK} guest. One call per outbox
+     * row, and every caller's row is per VISIT (whole-visit decline, salon closure, master removal)
+     * or per declined service line, so a guest gets one SMS per provider action. The text comes
+     * from {@link GuestProviderCancellationSmsText} and carries no provider-authored content.
      *
      * <p>Named for {@code LINK} rather than "guest" deliberately (Phase 22.1): a STAFF walk-in is
      * also account-less, but its phone was typed by an employee about a third party rather than
-     * proven by the recipient's own OTP, so it is NOT an eligible destination. Only the LINK branch
-     * of {@link #notifyBookingStatusChanged(BookingVisit)} may call this — do not re-generalise
-     * this method to "any booking with a guestPhone".
-     */
-    private void sendLinkGuestDeclineSms(Booking booking) {
-        String phone = booking.getGuestPhone();
-        if (phone == null || phone.isBlank()) {
-            log.warn("Guest DECLINED booking {} has no guestPhone — skipping decline SMS", booking.getId());
-            return;
-        }
-        String text = buildGuestDeclineSms(booking);
-        try {
-            smsService.send(phone, text);
-        } catch (RuntimeException e) {
-            log.warn("Guest decline SMS failed: {}", e.getClass().getSimpleName());
-        }
-    }
-
-    /**
-     * Phase 25.9: the provider's decline note is optional (for all roles). {@code decline} and
-     * {@code declineReason} are two separate config templates — see {@link BookingSmsProperties}
-     * — precisely so a null/blank note never leaves a dangling "Причина: " label with nothing
-     * after it: the reason clause is only substituted and appended when a non-blank, truncated
-     * comment actually survives {@link #stripUrlsForSms}/{@link #truncateForSms}.
-     */
-    private String buildGuestDeclineSms(Booking booking) {
-        OffsetDateTime kyiv = booking.getStartsAt().atZoneSameInstant(TimeZones.KYIV).toOffsetDateTime();
-        // Placeholders.format, not chained String.replace: a provider-controlled service name
-        // containing a literal "{date}" would otherwise be expanded by the NEXT replace in the
-        // chain, letting the name steer the layout of a message the guest reads as platform copy.
-        String base = Placeholders.format(smsProperties.getSms().getDecline(), Map.of(
-                "serviceName", safe(booking.getMasterService().getServiceDefinition().getName()),
-                "masterName", masterName(booking.getMaster()),
-                "date", SMS_DATE_FMT.format(kyiv),
-                "time", SMS_TIME_FMT.format(kyiv)));
-        String comment = truncateForSms(stripUrlsForSms(booking.getProviderComment()));
-        if (comment.isBlank()) {
-            return base;
-        }
-        return base + Placeholders.format(
-                smsProperties.getSms().getDeclineReason(), Map.of("comment", comment));
-    }
-
-    /**
-     * Dispatches the salon-closure SMS for a {@code LINK} guest visit (Phase 269/293). Mirrors
-     * {@link #sendLinkGuestDeclineSms(Booking)} exactly — same guard, same swallow-and-log-class-
-     * only failure handling (Anti-Bug §I: never log the phone or message text) — the one
-     * difference being the text names the whole VISIT via {@link #bookedSubject(BookingVisit)}
-     * rather than one booking's service, and carries no provider note (D10: {@link BookingVisit}
-     * exposes no note accessor to read in the first place).
+     * proven by the recipient's own OTP, so it is NOT an eligible destination. Only the LINK
+     * branches above may call this — do not re-generalise it to "any booking with a guestPhone".
      *
-     * <p>Only the LINK branch of {@link #notifySalonClosed(BookingVisit)} may call this — same
-     * "not the STAFF walk-in" restriction {@link #sendLinkGuestDeclineSms(Booking)} documents.
+     * <p>{@link BookingSmsDispatcher} owns the send-failure swallow-and-log (kind + exception class only, never
+     * the phone or the text — Anti-Bug §I) and the {@code app.booking.sms.enabled} gate (it holds
+     * the gated {@code SmsService} bean). This runs on the outbox drain thread, which only ever sees
+     * committed rows, so a rolled-back cancellation can never reach it.
      */
-    private void sendSalonClosedGuestSms(BookingVisit visit) {
-        Booking lead = visit.lead();
+    private void sendLinkGuestProviderCancellationSms(Booking lead, String eventType, String text) {
         String phone = lead.getGuestPhone();
         if (phone == null || phone.isBlank()) {
-            log.warn("Guest SALON_CLOSED visit (lead booking {}) has no guestPhone — skipping SMS",
-                    lead.getId());
+            log.warn("Guest {} (booking {}) has no guestPhone — skipping SMS", eventType, lead.getId());
             return;
         }
-        String text = buildSalonClosedSms(visit);
-        try {
-            smsService.send(phone, text);
-        } catch (RuntimeException e) {
-            log.warn("Salon-closed guest SMS failed: {}", e.getClass().getSimpleName());
-        }
+        // dispatchOrThrow, never dispatch: this runs on the outbox drain, which can retry. A
+        // saturated smsSendExecutor must reach the drain's backpressure branch (row back to PENDING,
+        // no attempt counted) instead of being swallowed and the row marked SENT with the SMS lost.
+        // Safe to retry because the SMS is the ONLY side effect of every LINK-guest branch.
+        bookingSmsDispatcher.dispatchOrThrow(BookingSmsDispatcher.Kind.GUEST_PROVIDER_CANCELLATION, phone, text);
     }
 
     /**
-     * Renders the salon-closure SMS body. Never reads any booking note — {@link BookingVisit}
-     * exposes no accessor for one (D10) — so there is no reason/comment clause to append, unlike
-     * {@link #buildGuestDeclineSms(Booking)}.
-     */
-    private String buildSalonClosedSms(BookingVisit visit) {
-        OffsetDateTime kyiv = visit.startsAt().atZoneSameInstant(TimeZones.KYIV).toOffsetDateTime();
-        return Placeholders.format(smsProperties.getSms().getSalonClosed(), Map.of(
-                "subject", bookedSubject(visit),
-                "date", SMS_DATE_FMT.format(kyiv),
-                "time", SMS_TIME_FMT.format(kyiv)));
-    }
-
-    /**
-     * Dispatches the master-removal SMS for a {@code LINK} guest visit (Phase 298). Mirrors
-     * {@link #sendSalonClosedGuestSms(BookingVisit)} exactly — same guard, same swallow-and-log-
-     * class-only failure handling (Anti-Bug §I: never log the phone or message text), same
-     * no-note posture (D10) — only the copy template differs.
+     * Whether dispatching an outbox row of {@code type} for {@code lead} would hand an SMS to
+     * {@link BookingSmsDispatcher#dispatchOrThrow} — i.e. whether it reaches
+     * {@link #sendLinkGuestProviderCancellationSms} through the {@code STATUS_CHANGED}/DECLINED,
+     * {@code SALON_CLOSED} or {@code MASTER_REMOVED} LINK-guest branch, with a phone to send to.
      *
-     * <p>Only the LINK branch of {@link #notifyMasterRemoved(BookingVisit)} may call this — same
-     * "not the STAFF walk-in" restriction {@link #sendLinkGuestDeclineSms(Booking)} documents.
+     * <p>Read-only, no side effects. Lets {@code NotificationOutboxDrainWorker} defer the batch's
+     * remaining SMS rows once the SMS pool has pushed back, without submitting each one to be refused.
+     * Must mirror those three branches exactly; parity is pinned in {@code NotificationServiceTest}.
      */
-    private void sendMasterRemovedGuestSms(BookingVisit visit) {
-        Booking lead = visit.lead();
-        String phone = lead.getGuestPhone();
-        if (phone == null || phone.isBlank()) {
-            log.warn("Guest MASTER_REMOVED visit (lead booking {}) has no guestPhone — skipping SMS",
-                    lead.getId());
-            return;
+    public boolean routesToLinkGuestSms(OutboxEventType type, Booking lead) {
+        if (lead.getClient() != null || lead.getBookingSource() != BookingSource.LINK
+                || lead.getGuestPhone() == null || lead.getGuestPhone().isBlank()) {
+            return false;
         }
-        String text = buildMasterRemovedSms(visit);
-        try {
-            smsService.send(phone, text);
-        } catch (RuntimeException e) {
-            log.warn("Master-removed guest SMS failed: {}", e.getClass().getSimpleName());
-        }
+        return switch (type) {
+            case STATUS_CHANGED -> lead.getStatus() == BookingStatus.DECLINED;
+            case SALON_CLOSED, MASTER_REMOVED -> true;
+            default -> false;
+        };
     }
 
     /**
-     * Renders the master-removal SMS body. Never reads any booking note — {@link BookingVisit}
-     * exposes no accessor for one (D10) — mirrors {@link #buildSalonClosedSms(BookingVisit)}
-     * exactly, with a copy template that names the master leaving, not the salon closing.
+     * The appointment time the guest is told was cancelled: the whole visit's start for a
+     * whole-visit decline, otherwise the declined line's own start (siblings of a per-item decline
+     * stay booked, so naming the visit start could point at a service that is still on).
      */
-    private String buildMasterRemovedSms(BookingVisit visit) {
-        OffsetDateTime kyiv = visit.startsAt().atZoneSameInstant(TimeZones.KYIV).toOffsetDateTime();
-        return Placeholders.format(smsProperties.getSms().getMasterRemoved(), Map.of(
-                "subject", bookedSubject(visit),
-                "date", SMS_DATE_FMT.format(kyiv),
-                "time", SMS_TIME_FMT.format(kyiv)));
-    }
-
-    /**
-     * Neutralizes link-shaped content in a provider note — SMS rendering path ONLY. The
-     * persisted {@code provider_comment} column is never touched by this method (it takes and
-     * returns a local {@code String}), and the decline EMAIL path never calls it at all — see
-     * {@code NotificationServiceTest.should_notStripUrl_when_appBookingDeclinedEmailRendered},
-     * which pins that structurally ({@code verify(booking, never()).getProviderComment()} on
-     * that path).
-     *
-     * <p>This is token neutralization, not URL recognition — two prior regex-based attempts to
-     * recognize "is this a URL" were each defeated by a real bypass (an allowlisted-TLD gap,
-     * then a trailing-period edge case that made a possessive quantifier over-consume and never
-     * backtrack). Trying to enumerate every shape a URL can take is an arms race that keeps
-     * losing to the next shape. Instead: split the note into whitespace-delimited tokens and
-     * drop, whole, any token that COULD plausibly be auto-linkified by iOS Data Detectors or
-     * Android {@code Linkify} — see {@link #isLinkShapedToken}. The asymmetry is intentional and
-     * accepted: over-stripping mangles one SMS; under-stripping delivers a phishing link, under
-     * the Beautica brand name, to a real OTP-verified phone number.
-     *
-     * <p>Surviving tokens are rejoined with a single space — see {@link #TOKEN_DELIMITER} — so
-     * any whitespace run in the original note (including the gap a dropped token leaves behind)
-     * collapses to one space rather than reading with an odd gap.
-     *
-     * <p>This is one linear pass over whitespace-delimited tokens; neither {@link
-     * #DOMAIN_DOT_LETTERS} nor {@link #BARE_IPV4} has a nested or backtracking quantifier, so
-     * there is no ReDoS shape here — see
-     * {@code NotificationServiceTest.should_stripAdversarialNote_withinBoundedTime} for a timed
-     * regression guard on a 1000-char adversarial input (the DTO/DB ceiling on this field).
-     */
-    private static String stripUrlsForSms(String comment) {
-        if (comment == null) {
-            return null;
-        }
-        StringBuilder result = new StringBuilder(comment.length());
-        for (String token : TOKEN_DELIMITER.split(comment.strip())) {
-            if (token.isEmpty() || isLinkShapedToken(token)) {
-                continue;
-            }
-            if (result.length() > 0) {
-                result.append(' ');
-            }
-            result.append(token);
-        }
-        return result.toString();
-    }
-
-    /**
-     * A token is link-shaped — and therefore dropped whole by {@link #stripUrlsForSms} — if it:
-     * contains a scheme delimiter ({@code ://}, which also catches an obfuscated scheme like
-     * {@code hxxp://} — obfuscation does not change what a linkifier or a human eye reconstructs
-     * it as); contains {@code @} (dropping the WHOLE token here, not just a domain half, is what
-     * fixes the prior "dangling {@code admin@}" LOW — legitimate contact info in a note gets
-     * fully removed rather than mangled into a fragment); matches {@link #DOMAIN_DOT_LETTERS}
-     * (a dot-plus-letters domain-label shape, no TLD allowlist); or matches {@link #BARE_IPV4}
-     * (a bare IPv4 literal, with or without a path).
-     */
-    private static boolean isLinkShapedToken(String token) {
-        return token.contains("://")
-                || token.contains("@")
-                || DOMAIN_DOT_LETTERS.matcher(token).find()
-                || BARE_IPV4.matcher(token).find();
-    }
-
-    /**
-     * SMS-length guard for the decline note — see {@link #SMS_COMMENT_MAX_LENGTH}.
-     *
-     * <p>Backs the cut index off by one further when the character immediately before it is the
-     * high half of a surrogate pair (e.g. an emoji) — otherwise a naive UTF-16-code-unit cut can
-     * split the pair, leaving an unpaired high surrogate as the last character of the guest's
-     * only notification about their booking (LOW finding — encoding corruption / possible
-     * provider-side SMS rejection).
-     */
-    private static String truncateForSms(String comment) {
-        if (comment == null || comment.isBlank()) {
-            return "";
-        }
-        if (comment.length() <= SMS_COMMENT_MAX_LENGTH) {
-            return comment;
-        }
-        int cut = SMS_COMMENT_MAX_LENGTH - 1;
-        if (cut > 0 && Character.isHighSurrogate(comment.charAt(cut - 1))) {
-            cut--;
-        }
-        return comment.substring(0, cut) + "…";
+    private static OffsetDateTime declinedStart(BookingVisit visit) {
+        return isWholeVisitDecline(visit) ? visit.startsAt() : visit.lead().getStartsAt();
     }
 
     /**
@@ -662,21 +458,5 @@ public class NotificationService {
                     notificationType, booking.getId(), booking.getMaster().getId());
         }
         return masterUser;
-    }
-
-    // V157 / phase 294 D3: displayFirstName()/displayLastName(), never getUser().getFirstName().
-    // A detached master (staff account hard-deleted, historical stub kept) has no user row, so the
-    // old two-line walk NPEs; the accessors fall back to the name snapshot taken at detach time.
-    // Still null-safe on either half — users.first_name / users.last_name are both nullable.
-    private static String masterName(Master master) {
-        String firstName = master.displayFirstName();
-        String lastName = master.displayLastName();
-        String first = firstName == null ? "" : firstName.trim();
-        String last = lastName == null ? "" : lastName.trim();
-        return (first + " " + last).trim();
-    }
-
-    private static String safe(String value) {
-        return value == null ? "" : value;
     }
 }

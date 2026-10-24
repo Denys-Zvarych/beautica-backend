@@ -58,6 +58,7 @@ import static org.mockito.Mockito.when;
         classes = {ServiceCatalogService.class, ServiceTypeLookup.class, ServiceTypeSearchService.class,
                 CatalogCategoryLookup.class, PlatformCategoryOrderLookup.class, SalonCatalogCacheEvictor.class,
                 CacheConfig.class, com.beautica.common.cache.MasterCachePrefixEvictor.class,
+                com.beautica.common.cache.SalonBookingInfoCacheEvictor.class,
                 com.beautica.config.ClockConfig.class},
         webEnvironment = SpringBootTest.WebEnvironment.NONE
 )
@@ -109,6 +110,8 @@ class ServiceCatalogServiceCacheTest {
     // Audit 2026-10-05 (finding 1): assignment writes bracket their mutation with this guard; its
     // own behaviour is covered by MasterSearchVisibilityGuardTest, so it is inert here.
     @MockBean com.beautica.master.service.MasterSearchVisibilityGuard searchVisibilityGuard;
+    // Phase 380 D6: slug-info eviction collaborator; its own behaviour is covered by MasterProfileCacheEvictorTest.
+    @MockBean com.beautica.common.cache.MasterProfileCacheEvictor masterProfileCacheEvictor;
     // Phase 23.x (perf/security #2): ServiceCatalogService evicts the salon-service-catalog cache via
     // this collaborator on every definition mutation. It is a REAL bean here (on the @SpringBootTest
     // classes list) so its @CacheEvict fires through the AOP proxy — the salon-catalogue eviction tests
@@ -729,6 +732,21 @@ class ServiceCatalogServiceCacheTest {
         serviceCatalogService.getSalonServiceCatalog(salonId);
 
         verify(masterServiceRepository, times(1)).findBookableAssignmentsBySalon(salonId);
+    }
+
+    @Test
+    @DisplayName("phase 391 audit: second getSalonCatalogSnapshot for the same salon is a cache hit; the evictor drops it")
+    void should_serveSnapshotFromCacheUntilEvicted_when_calledTwiceForSameSalon() {
+        UUID salonId = UUID.randomUUID();
+        when(masterServiceRepository.findBookableAssignmentsBySalon(salonId)).thenReturn(List.of());
+
+        serviceCatalogService.getSalonCatalogSnapshot(salonId);
+        serviceCatalogService.getSalonCatalogSnapshot(salonId);
+        verify(masterServiceRepository, times(1)).findBookableAssignmentsBySalon(salonId);
+        salonCatalogCacheEvictor.evictCatalogOnly(salonId);
+        serviceCatalogService.getSalonCatalogSnapshot(salonId);
+
+        verify(masterServiceRepository, times(2)).findBookableAssignmentsBySalon(salonId);
     }
 
     @Test
