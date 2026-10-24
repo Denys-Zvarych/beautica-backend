@@ -1,6 +1,7 @@
 package com.beautica.config;
 
 import com.beautica.booking.service.BookingMasterService;
+import com.beautica.booking.service.RetiredBookingSlugGuard;
 import com.beautica.client.service.ClientPassportService;
 import com.beautica.common.cache.SalonBookingInfoCacheEvictor;
 import com.beautica.common.cache.UserProfileCacheEvictor;
@@ -194,6 +195,10 @@ public class CacheConfig {
      *   localityTaxonomyFacts  — fused city-exists/has-districts/district-child resolution
      *                            per (cityId,districtId) write-validation pair — 24 h TTL,
      *                            max 600 entries (an admission FENCE, not a capacity estimate)
+     *   retired-booking-slugs  — Phase 379 audit (perf F1): KNOWN-RETIRED tombstone keys
+     *                            (RetiredBookingSlugGuard) — 24 h TTL, max 10 000 entries;
+     *                            positives only (a 404 slug may later be issued); no eviction path
+     *                            (tombstones are append-only and never re-issued)
      *
      * <p>Note on {@code search:*}: short TTL is preferred over explicit
      * {@code @CacheEvict} on master/salon write paths because discovery results
@@ -681,6 +686,18 @@ public class CacheConfig {
                 Caffeine.newBuilder()
                         .maximumSize(2_000)
                         .expireAfterWrite(24, TimeUnit.HOURS));
+        // Phase 379 audit (perf LOW F1/F2) — known-retired booking-link tombstones, consulted by
+        // RetiredBookingSlugGuard on the public slug MISS path so repeated hits on a dead link cost
+        // no DB query. POSITIVES ONLY: the guard has no loader — it calls put only on a confirmed
+        // tombstone and never stores negatives — a 404 slug may later be issued, so a negative must
+        // never be pinned.
+        // A positive never goes stale: retired_booking_slugs is append-only and a retired slug is
+        // never re-issued (378 D3), hence no eviction path and a long TTL. Value is Boolean.TRUE,
+        // key is "<kind>:<slug_hash>" (~70 chars) — 10 000 entries is well under 2 MB.
+        registerMetered(manager, meterRegistry, RetiredBookingSlugGuard.KNOWN_RETIRED_CACHE,
+                Caffeine.newBuilder()
+                        .maximumSize(10_000)
+                        .expireAfterWrite(24, TimeUnit.HOURS));
         // Phase 346 — shared cityId -> (city name, oblast name) labels
         // (SettlementDisplayNameResolver#resolve) denormalised into users/salons city/region on
         // every cityId write. Sibling of cityOblastId above: static Flyway-seed data, 24h TTL, no
@@ -785,6 +802,7 @@ public class CacheConfig {
         // no-op rather than a loud failure — while @Cacheable on the read side failed loudly. Fail
         // at context refresh instead.
         assertCustomRegistration(manager, UserProfileCacheEvictor.USER_PROFILE_CACHE);
+        assertCustomRegistration(manager, RetiredBookingSlugGuard.KNOWN_RETIRED_CACHE);
         return manager;
     }
 

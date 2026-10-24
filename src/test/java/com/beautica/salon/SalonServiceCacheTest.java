@@ -131,6 +131,8 @@ class SalonServiceCacheTest {
     // Phase 376: SalonService constructor-depends on BookingSlugService (createSalon issues the new
     // salon's booking slug). WITHOUT this bean the context fails to load, taking every test red.
     @MockBean com.beautica.booking.service.BookingSlugService bookingSlugService;
+    // Phase 379 D7 — deactivateSalon tombstones the salon slug.
+    @MockBean com.beautica.booking.service.DeletedBookingSlugTombstoner deletedBookingSlugTombstoner;
     // SalonService constructor-depends on UserProfileCacheEvictor: createSalon (owner locality
     // sync + auto-created owner-master row), removeAdmin and rotateAdmin all write a `users` row
     // and must stale the user-profile cache. This slice asserts the ownerSalons/salon-detail

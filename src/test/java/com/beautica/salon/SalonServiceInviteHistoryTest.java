@@ -178,6 +178,8 @@ class SalonServiceInviteHistoryTest {
 
     // Phase 376 — createSalon's slug generator; not exercised by the invite-history paths.
     @Mock private com.beautica.booking.service.BookingSlugService bookingSlugService;
+    // Phase 379 D7 — deactivateSalon's slug tombstone; not exercised by the invite-history paths.
+    @Mock private com.beautica.booking.service.DeletedBookingSlugTombstoner deletedBookingSlugTombstoner;
     private SalonService salonService;
 
     @BeforeEach
@@ -195,7 +197,8 @@ class SalonServiceInviteHistoryTest {
                 afterCommitBlobPurger, new com.beautica.common.cache.MasterCachePrefixEvictor(cacheManager),
                 bookingSlugService,
                 new com.beautica.common.cache.SalonBookingInfoCacheEvictor(
-                        new com.beautica.common.cache.MasterCachePrefixEvictor(cacheManager), cacheManager));
+                        new com.beautica.common.cache.MasterCachePrefixEvictor(cacheManager), cacheManager),
+                deletedBookingSlugTombstoner);
     }
 
     // ── the derivation ladder ─────────────────────────────────────────────────

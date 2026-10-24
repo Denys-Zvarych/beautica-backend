@@ -471,13 +471,13 @@ class BookingLinkRetirementIT extends AbstractIntegrationTest {
 
         assertThat(cache.get("kalyna-kalyna-ab12")).isNull();
         assertThat(restTemplate.getForEntity("/api/v1/book/kalyna-kalyna-ab12/info", String.class).getStatusCode())
-                .isEqualTo(HttpStatus.NOT_FOUND);
+                .isEqualTo(HttpStatus.GONE);
         assertThat(restTemplate.getForEntity("/api/v1/book/" + link.path("slug").asText() + "/info", String.class)
                 .getStatusCode()).isEqualTo(HttpStatus.OK);
     }
 
     @Test
-    @DisplayName("D13: salon page cached under the old slug → evicted after salon regenerate; the old page 404s")
+    @DisplayName("D13: salon page cached under the old slug → evicted after salon regenerate; the old page 410s (phase 379)")
     void should_evictOldSalonPage_when_salonRegenerateCommits() throws Exception {
         UUID salonId = salonWithSlug("Alfa", "alfa-ab12");
         assertThat(restTemplate.getForEntity("/api/v1/book/s/alfa-ab12/info", String.class).getStatusCode())
@@ -490,7 +490,7 @@ class BookingLinkRetirementIT extends AbstractIntegrationTest {
 
         assertThat(cache.get("alfa-ab12")).isNull();
         assertThat(restTemplate.getForEntity("/api/v1/book/s/alfa-ab12/info", String.class).getStatusCode())
-                .isEqualTo(HttpStatus.NOT_FOUND);
+                .isEqualTo(HttpStatus.GONE);
         assertThat(restTemplate.getForEntity("/api/v1/book/s/" + link.path("slug").asText() + "/info", String.class)
                 .getStatusCode()).isEqualTo(HttpStatus.OK);
     }
@@ -508,7 +508,7 @@ class BookingLinkRetirementIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("QA 378: owner with TWO salons regenerates both → both old public salon pages 404, both new ones serve, /mine lists both new ACTIVE slugs")
+    @DisplayName("QA 378: owner with TWO salons regenerates both → both old public salon pages 410 (phase 379), both new ones serve, /mine lists both new ACTIVE slugs")
     void should_serveOnlyNewSalonPages_when_ownerRegeneratesBothSalons() throws Exception {
         UUID alfa = salonWithSlug("Alfa", "alfa-ab12");
         UUID ownerId = ownerOf(alfa);
@@ -520,8 +520,8 @@ class BookingLinkRetirementIT extends AbstractIntegrationTest {
         String alfaNew = okData(call(HttpMethod.POST, salonRegenerate(alfa), token, "alfa-ab12")).path("slug").asText();
         String betaNew = okData(call(HttpMethod.POST, salonRegenerate(beta), token, "beta-cd34")).path("slug").asText();
 
-        assertThat(salonPage("alfa-ab12")).as("old alfa page").isEqualTo(HttpStatus.NOT_FOUND);
-        assertThat(salonPage("beta-cd34")).as("old beta page").isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(salonPage("alfa-ab12")).as("old alfa page").isEqualTo(HttpStatus.GONE);
+        assertThat(salonPage("beta-cd34")).as("old beta page").isEqualTo(HttpStatus.GONE);
         assertThat(salonPage(alfaNew)).as("new alfa page %s", alfaNew).isEqualTo(HttpStatus.OK);
         assertThat(salonPage(betaNew)).as("new beta page %s", betaNew).isEqualTo(HttpStatus.OK);
         JsonNode links = mine(token);
@@ -555,7 +555,7 @@ class BookingLinkRetirementIT extends AbstractIntegrationTest {
         String alfaNew = own.path("slug").asText();
         assertThat(own.path("salonId").asText()).isEqualTo(alfa.toString());
         assertThat(salonSlug(alfa)).isEqualTo(alfaNew);
-        assertThat(salonPage("alfa-ab12")).as("old own page").isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(salonPage("alfa-ab12")).as("old own page").isEqualTo(HttpStatus.GONE);
         assertThat(salonPage(alfaNew)).as("new own page").isEqualTo(HttpStatus.OK);
         assertThat(tombstoneCount()).isEqualTo(1);
     }
@@ -573,7 +573,7 @@ class BookingLinkRetirementIT extends AbstractIntegrationTest {
         assertThat(revoked.path("status").asText()).isEqualTo("REVOKED");
         assertThat(revoked.path("slug").isNull()).isTrue();
         assertThat(revoked.path("url").isNull()).isTrue();
-        assertThat(salonPage("alfa-ab12")).as("revoked page").isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(salonPage("alfa-ab12")).as("revoked page").isEqualTo(HttpStatus.GONE);
         for (int i = 0; i < 2; i++) {
             for (String token : List.of(ownerToken, adminToken)) {
                 JsonNode links = mine(token);
@@ -589,7 +589,7 @@ class BookingLinkRetirementIT extends AbstractIntegrationTest {
         assertThat(again.path("status").asText()).isEqualTo("REVOKED");
         assertThat(tombstoneCount()).isEqualTo(1);
         assertThat(tombstone("SALON", "alfa-ab12").get("reason")).isEqualTo("REVOKED");
-        assertThat(salonPage("alfa-ab12")).as("still gone").isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(salonPage("alfa-ab12")).as("still gone").isEqualTo(HttpStatus.GONE);
     }
 
     @Test
@@ -607,7 +607,7 @@ class BookingLinkRetirementIT extends AbstractIntegrationTest {
         assertThat(salonRevoked(salonId)).isFalse();
         assertThat(salonSlug(salonId)).isEqualTo(fresh);
         assertThat(salonPage(fresh)).as("new page").isEqualTo(HttpStatus.OK);
-        assertThat(salonPage("alfa-ab12")).as("revoked slug").isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(salonPage("alfa-ab12")).as("revoked slug").isEqualTo(HttpStatus.GONE);
         JsonNode mine = mine(ownerToken).get(0);
         assertThat(mine.path("status").asText()).isEqualTo("ACTIVE");
         assertThat(mine.path("slug").asText()).isEqualTo(fresh);
@@ -625,9 +625,9 @@ class BookingLinkRetirementIT extends AbstractIntegrationTest {
         HttpStatus afterRevoke = masterPage("kalyna-kalyna-ab12");
         String fresh = okData(call(HttpMethod.POST, MASTER_REGENERATE, token, null)).path("slug").asText();
 
-        assertThat(afterRevoke).as("revoked page").isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(afterRevoke).as("revoked page").isEqualTo(HttpStatus.GONE);
         assertThat(masterPage(fresh)).as("new page %s", fresh).isEqualTo(HttpStatus.OK);
-        assertThat(masterPage("kalyna-kalyna-ab12")).as("revoked slug after regenerate").isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(masterPage("kalyna-kalyna-ab12")).as("revoked slug after regenerate").isEqualTo(HttpStatus.GONE);
         assertThat(mine(token).get(0).path("slug").asText()).isEqualTo(fresh);
     }
 

@@ -193,6 +193,8 @@ public class SalonService {
     // Phase 377 — the public salon booking page (GET /book/s/{slug}/info) renders the salon's name, city,
     // logo, cover and active state; every write that evicts salon-detail evicts it too, after commit.
     private final com.beautica.common.cache.SalonBookingInfoCacheEvictor salonBookingInfoCacheEvictor;
+    /** Phase 379 D7 — a deleted salon's link answers 410 (tombstone DELETED). */
+    private final com.beautica.booking.service.DeletedBookingSlugTombstoner deletedBookingSlugTombstoner;
 
     /**
      * Hard ceiling on rows returned by {@link #listSalonInvites}.
@@ -1514,6 +1516,10 @@ public class SalonService {
         // save() was a redundant no-op write (PERF-LOW). The findByIdAndOwnerId load is retained:
         // it enforces existence + ownership scoping and cannot be dropped.
         salon.setActive(false);
+        // Phase 379 D7 — deletion is final (no reactivation path), so the salon's shared link answers 410
+        // «Посилання більше не дійсне» instead of 404. Same transaction; the page cache is evicted after
+        // commit below (evictSalonDetailCacheAfterCommit → SalonBookingInfoCacheEvictor#evictSalon).
+        deletedBookingSlugTombstoner.tombstoneSalon(salon.getId(), salon.getBookingSlug());
 
         // Phase 268 — capture the salon's image URLs and pre-read its media_files rows NOW, while
         // `salon` is still managed. Both are needed by the R2 sweep this method registers after commit

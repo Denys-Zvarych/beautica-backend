@@ -1,5 +1,6 @@
 package com.beautica.booking.service;
 
+import com.beautica.booking.dto.BookingLinkKind;
 import com.beautica.booking.dto.SalonBookingSlugInfoResponse;
 import com.beautica.booking.dto.SalonBookingSlugMasterItem;
 import com.beautica.common.cache.SalonBookingInfoCacheEvictor;
@@ -51,6 +52,8 @@ public class SalonBookingSlugService {
     private final MediaService mediaService;
     private final ServiceCatalogService serviceCatalogService;
     private final ReviewService reviewService;
+    /** Phase 379 — 410 for a retired salon slug on the miss path. */
+    private final RetiredBookingSlugGuard retiredBookingSlugGuard;
 
     /**
      * The public salon page for {@code slug}. Unknown slug or inactive salon → {@link NotFoundException}
@@ -66,7 +69,7 @@ public class SalonBookingSlugService {
     @Transactional(readOnly = true)
     public SalonBookingSlugInfoResponse findBySlug(String slug) {
         SalonBookingPageRow salon = salonRepository.findBookingPageRowBySlug(slug)
-                .orElseThrow(() -> new NotFoundException("Booking page not found"));
+                .orElseThrow(() -> bookingPageNotFound(slug));
         List<SalonBookingSlugMasterItem> masters = masterRepository
                 .findBookingPageMastersBySalonId(salon.getId(), scheduleDateMath.today(), MAX_MASTERS)
                 .stream()
@@ -100,6 +103,16 @@ public class SalonBookingSlugService {
                         .ratingDistribution(),
                 // One uncached statement, no COUNT (the paged getSalonReviews costs ids + count + hydrate).
                 reviewService.getLatestReviewsForSalon(salon.getId(), BookingSlugService.LATEST_REVIEWS_LIMIT));
+    }
+
+    /**
+     * Phase 379 D2 — the public-slug miss: 410 when the slug is a retired {@code kind} link
+     * ({@link RetiredBookingSlugGuard}), otherwise the unchanged 404. Only ever reached after the live
+     * resolver missed, so a valid link pays no extra query.
+     */
+    private NotFoundException bookingPageNotFound(String slug) {
+        retiredBookingSlugGuard.throwGoneIfRetired(BookingLinkKind.SALON, slug);
+        return new NotFoundException("Booking page not found");
     }
 
     private static boolean isBlank(String value) {

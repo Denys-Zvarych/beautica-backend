@@ -97,6 +97,9 @@ class StaffAccountDisposalServiceTest {
     @Mock
     private com.beautica.common.cache.MasterProfileCacheEvictor masterProfileCacheEvictor;
 
+    @Mock
+    private com.beautica.booking.service.DeletedBookingSlugTombstoner deletedBookingSlugTombstoner;
+
     private StaffAccountDisposalService service;
 
     /** Bound to dispose()'s own logger: the audit line's wording is part of its contract. */
@@ -120,7 +123,7 @@ class StaffAccountDisposalServiceTest {
         return new StaffAccountDisposalService(
                 userRepository, inviteTokenRepository, masterRepository, clock,
                 tokensValidAfterCache, userProfileCacheEvictor, mediaRepository, accountBlobPurgeRegistrar,
-                masterProfileCacheEvictor);
+                masterProfileCacheEvictor, deletedBookingSlugTombstoner);
     }
 
     private static Master masterWithUser(UUID masterId, UUID userId, String firstName, String lastName) {
@@ -198,6 +201,25 @@ class StaffAccountDisposalServiceTest {
 
         verify(masterProfileCacheEvictor).evictBookingSlugInfoBySlugAfterCommit("test-maister-ab12");
         verify(masterProfileCacheEvictor).evictBookingSlugInfoBySlugAfterCommit(null);
+    }
+
+    @Test
+    @DisplayName("phase 379 D7: every disposed master is handed to the slug tombstoner BEFORE the masters rows are "
+            + "deleted (the insert needs the master_id FK target)")
+    void should_tombstoneDisposedMasterSlugsBeforeDelete_when_mastersDisposed() {
+        UUID staffUserId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        Master master = masterWithUser(masterId, staffUserId, "Тест", "Майстер");
+        ReflectionTestUtils.setField(master, "bookingSlug", "test-maister-ab12");
+        when(masterRepository.findAllByUserIdInWithUser(List.of(staffUserId))).thenReturn(List.of(master));
+        when(masterRepository.findIdsWithHistoricalReferences(List.of(masterId))).thenReturn(List.of());
+        service = newService();
+
+        service.dispose(UUID.randomUUID(), UUID.randomUUID(), List.of(staffUserId), StaffDisposalReason.SALON_DELETION);
+
+        var order = org.mockito.Mockito.inOrder(deletedBookingSlugTombstoner, masterRepository);
+        order.verify(deletedBookingSlugTombstoner).tombstoneMasters(List.of(master));
+        order.verify(masterRepository).delete(master);
     }
 
     @Test

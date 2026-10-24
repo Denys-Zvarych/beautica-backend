@@ -42,6 +42,7 @@ class SalonBookingSlugServiceTest {
     @Mock private com.beautica.media.service.MediaService mediaService;
     @Mock private com.beautica.service.service.ServiceCatalogService serviceCatalogService;
     @Mock private com.beautica.review.service.ReviewService reviewService;
+    @Mock private RetiredBookingSlugGuard retiredBookingSlugGuard;
     @InjectMocks private SalonBookingSlugService service;
 
     /** Phase 384: the four tab blocks default to "nothing to show" (lenient: not every test reads them). */
@@ -96,6 +97,19 @@ class SalonBookingSlugServiceTest {
                 .isInstanceOf(NotFoundException.class)
                 .hasMessage("Booking page not found");
 
+        verify(masterRepository, never()).findBookingPageMastersBySalonId(any(), any(), anyInt());
+        verify(retiredBookingSlugGuard).throwGoneIfRetired(com.beautica.booking.dto.BookingLinkKind.SALON, SLUG);
+    }
+
+    @Test
+    @DisplayName("phase 379: miss + SALON tombstone → GoneException (410), no master query")
+    void should_throwGone_when_salonSlugRetired() {
+        when(salonRepository.findBookingPageRowBySlug(SLUG)).thenReturn(Optional.empty());
+        org.mockito.Mockito.doThrow(com.beautica.common.exception.GoneException.bookingLinkRetired())
+                .when(retiredBookingSlugGuard).throwGoneIfRetired(com.beautica.booking.dto.BookingLinkKind.SALON, SLUG);
+
+        assertThatThrownBy(() -> service.findBySlug(SLUG))
+                .isInstanceOf(com.beautica.common.exception.GoneException.class);
         verify(masterRepository, never()).findBookingPageMastersBySalonId(any(), any(), anyInt());
     }
 

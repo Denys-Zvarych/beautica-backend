@@ -173,6 +173,51 @@ class GlobalExceptionHandlerTest {
     }
 
     @Test
+    @DisplayName("Phase 379 — GoneException → 410, data.code BOOKING_LINK_RETIRED, constant message, no slug")
+    void should_return410WithStableCode_when_goneExceptionThrown() {
+        // Arrange
+        var ex = GoneException.bookingLinkRetired();
+
+        // Act
+        ResponseEntity<ApiResponse<GoneErrorResponse>> response = handler.handleGone(ex);
+
+        // Assert
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.GONE);
+        assertThat(response.getBody().success()).isFalse();
+        assertThat(response.getBody().data()).isEqualTo(new GoneErrorResponse("BOOKING_LINK_RETIRED"));
+        assertThat(response.getBody().message()).isEqualTo("Booking link is no longer valid");
+        assertThat(response.getBody().errors()).isNull();
+    }
+
+    @Test
+    @DisplayName("Phase 379 audit (perf F1) — 410 is immutable → Cache-Control public, max-age=0, s-maxage=3600")
+    void should_setEdgeCacheableCacheControl_when_goneExceptionThrown() {
+        // Arrange
+        var ex = GoneException.bookingLinkRetired();
+
+        // Act
+        ResponseEntity<ApiResponse<GoneErrorResponse>> response = handler.handleGone(ex);
+
+        // Assert
+        assertThat(response.getHeaders().getCacheControl()).isEqualTo("max-age=0, public, s-maxage=3600");
+    }
+
+    @Test
+    @DisplayName("Phase 379 D9 — the 404 body is untouched by the 410 handler: data null, generic message")
+    void should_keep404BodyUnchanged_when_goneHandlerAdded() {
+        // Arrange
+        var ex = new NotFoundException("Booking page not found");
+
+        // Act
+        ResponseEntity<ApiResponse<Void>> response = handler.handleNotFound(ex);
+
+        // Assert
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(response.getBody().data()).isNull();
+        assertThat(response.getBody().message()).isEqualTo("Resource not found");
+    }
+
+    @Test
     @DisplayName("Should return 404 with generic message when NotFoundException is thrown")
     void should_return404_when_notFoundExceptionThrown() {
         // Arrange — internal message "Master not found" must NOT be echoed in the response

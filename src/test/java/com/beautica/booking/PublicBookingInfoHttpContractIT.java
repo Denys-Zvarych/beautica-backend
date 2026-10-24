@@ -347,8 +347,8 @@ class PublicBookingInfoHttpContractIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("eviction: salon deleted (DELETE /salons/{id}) -> the cached salon page AND its master's cached page turn 404")
-    void should_return404OnBothPages_when_salonDeletedAfterPagesCached() throws Exception {
+    @DisplayName("eviction: salon deleted (DELETE /salons/{id}) -> the cached salon page AND its master's cached page turn 410 Gone (phase 379 D7 tombstones)")
+    void should_return410OnBothPages_when_salonDeletedAfterPagesCached() throws Exception {
         PublicBookingPageFixtures.SalonPage salon = pages.salon("Deleted Salon");
         UUID masterId = pages.salonMaster(salon.salonId(), "Марія", "Тестова");
         BookableMasterSeeder.makeBookable(jdbcTemplate, salon.salonId(), masterId);
@@ -360,14 +360,14 @@ class PublicBookingInfoHttpContractIT extends AbstractIntegrationTest {
                 new HttpEntity<>(bearerJson(salon.ownerToken())), String.class);
         assertThat(delete.getStatusCode().is2xxSuccessful()).as(delete.getBody()).isTrue();
 
-        assertThat(get(salonPath(salon.slug()), null).getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
-        assertThat(get(masterPath(masterSlug), null).getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(get(salonPath(salon.slug()), null).getStatusCode()).isEqualTo(HttpStatus.GONE);
+        assertThat(get(masterPath(masterSlug), null).getStatusCode()).isEqualTo(HttpStatus.GONE);
     }
 
     @Test
-    @DisplayName("eviction: master removed from the salon (DELETE /salons/{id}/masters/{id}) -> its cached page turns 404 "
+    @DisplayName("eviction: master removed from the salon (DELETE /salons/{id}/masters/{id}) -> its cached page turns 410 Gone (phase 379 D7) "
             + "and the cached salon page stops listing it")
-    void should_return404AndDelistMaster_when_masterRemovedFromSalonAfterPagesCached() throws Exception {
+    void should_return410AndDelistMaster_when_masterRemovedFromSalonAfterPagesCached() throws Exception {
         PublicBookingPageFixtures.SalonPage salon = pages.salon("Removal Salon");
         UUID leaving = pages.salonMaster(salon.salonId(), "Ide", "Het");
         BookableMasterSeeder.makeBookable(jdbcTemplate, salon.salonId(), leaving);
@@ -382,15 +382,15 @@ class PublicBookingInfoHttpContractIT extends AbstractIntegrationTest {
                 new HttpEntity<>(bearerJson(salon.ownerToken())), String.class);
         assertThat(remove.getStatusCode().is2xxSuccessful()).as(remove.getBody()).isTrue();
 
-        assertThat(get(masterPath(leavingSlug), null).getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(get(masterPath(leavingSlug), null).getStatusCode()).isEqualTo(HttpStatus.GONE);
         JsonNode masters = json(get(salonPath(salon.slug()), null)).path("masters");
         assertThat(masters).hasSize(1);
         assertThat(masters.get(0).path("masterSlug").asText()).isEqualTo(pages.masterSlugOf(staying));
     }
 
     @Test
-    @DisplayName("eviction: independent master deletes their own account (DELETE /users/me) -> the cached page turns 404")
-    void should_return404_when_independentMasterSelfDeletedAfterPageCached() throws Exception {
+    @DisplayName("eviction: independent master deletes their own account (DELETE /users/me) -> the cached page turns 410 Gone (phase 379 D7)")
+    void should_return410_when_independentMasterSelfDeletedAfterPageCached() throws Exception {
         IndependentMaster master = pages.independentMaster(true);
         String token = pages.tokenOf(master);
         assertThat(get(masterPath(master.slug()), null).getStatusCode()).isEqualTo(HttpStatus.OK);
@@ -399,7 +399,7 @@ class PublicBookingInfoHttpContractIT extends AbstractIntegrationTest {
                 new HttpEntity<>(bearerJson(token)), String.class);
         assertThat(delete.getStatusCode().is2xxSuccessful()).as(delete.getBody()).isTrue();
 
-        assertThat(get(masterPath(master.slug()), null).getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(get(masterPath(master.slug()), null).getStatusCode()).isEqualTo(HttpStatus.GONE);
     }
 
     @Test

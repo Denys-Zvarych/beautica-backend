@@ -204,6 +204,9 @@ class SalonServiceTest {
     // Phase 377: salon-detail evictions also evict the public salon booking page after commit.
     @Mock private com.beautica.common.cache.SalonBookingInfoCacheEvictor salonBookingInfoCacheEvictor;
 
+    // Phase 379 D7 — deactivateSalon tombstones the salon slug; @InjectMocks would pass null.
+    @Mock private com.beautica.booking.service.DeletedBookingSlugTombstoner deletedBookingSlugTombstoner;
+
     @InjectMocks
     private SalonService salonService;
 

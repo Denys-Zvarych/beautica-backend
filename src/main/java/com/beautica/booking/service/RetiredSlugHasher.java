@@ -37,10 +37,14 @@ public final class RetiredSlugHasher {
         Objects.requireNonNull(kind, "kind");
         Objects.requireNonNull(slug, "slug");
         byte[] preimage = (kind.name() + SEPARATOR + slug).getBytes(StandardCharsets.UTF_8);
-        return HEX.formatHex(sha256().digest(preimage));
+        return HEX.formatHex(newSha256().digest(preimage));
     }
 
-    private static MessageDigest sha256() {
+    /**
+     * A fresh digest per call (379 audit cycle 2, perf INFO-2): {@link MessageDigest} is not thread-safe, and
+     * a {@code ThreadLocal} cache is useless under virtual threads (one new thread per request).
+     */
+    private static MessageDigest newSha256() {
         try {
             return MessageDigest.getInstance(ALGORITHM);
         } catch (NoSuchAlgorithmException e) {

@@ -624,7 +624,7 @@ class PublicSalonBookingInfoIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("owner deactivates (deletes) the salon → cached page evicted, slug now 404")
+    @DisplayName("owner deactivates (deletes) the salon → cached page evicted, slug now 410 Gone (phase 379 D7)")
     void should_return404_when_salonDeactivatedAfterCaching() throws Exception {
         PublicBookingPageFixtures.SalonPage salon = pages.salon("Zakryiemo Salon");
         UUID master = pages.salonMaster(salon.salonId(), "Ostannia", "Zmina");
@@ -637,7 +637,7 @@ class PublicSalonBookingInfoIT extends AbstractIntegrationTest {
 
         assertThat(pageCache().get(salon.slug())).isNull();
         assertThat(anonymousGet("/api/v1/book/s/" + salon.slug() + "/info").getStatusCode())
-                .isEqualTo(HttpStatus.NOT_FOUND);
+                .isEqualTo(HttpStatus.GONE);
     }
 
     @Test

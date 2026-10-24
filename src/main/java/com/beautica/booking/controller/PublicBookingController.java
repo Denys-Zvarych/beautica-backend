@@ -24,6 +24,9 @@ import jakarta.validation.constraints.NotEmpty;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Size;
+import io.swagger.v3.oas.annotations.media.Content;
+import io.swagger.v3.oas.annotations.responses.ApiResponse;
+import io.swagger.v3.oas.annotations.responses.ApiResponses;
 import lombok.RequiredArgsConstructor;
 import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.http.CacheControl;
@@ -75,6 +78,13 @@ public class PublicBookingController {
     private static final CacheControl INFO_CACHE_CONTROL =
             CacheControl.maxAge(Duration.ZERO).sMaxAge(Duration.ofSeconds(30)).cachePublic();
 
+    /**
+     * Phase 379 D3/D6 — OpenAPI text of the 410 every slug-keyed route can answer. Body:
+     * {@code {"success":false,"data":{"code":"BOOKING_LINK_RETIRED"},"message":"Booking link is no longer valid"}}.
+     */
+    private static final String GONE_DESCRIPTION = "Retired booking link (regenerated, revoked or deleted): "
+            + "data.code = BOOKING_LINK_RETIRED. An unknown slug stays 404, a malformed one 400.";
+
     private final BookingSlugService bookingSlugService;
     private final GuestBookingService guestBookingService;
     private final BookingCancellationService bookingCancellationService;
@@ -86,6 +96,10 @@ public class PublicBookingController {
      * <p>Anti-Bug §A: the {@code slug} is constrained at the boundary to the exact
      * generator charset so a malformed/oversized value is a clean 400, not a DB hit.
      */
+    @ApiResponses({
+            @ApiResponse(responseCode = "200", description = "Booking page"),
+            @ApiResponse(responseCode = "410", description = GONE_DESCRIPTION, content = @Content())
+    })
     @GetMapping("/{slug}/info")
     public ResponseEntity<BookingSlugInfoResponse> info(
             @PathVariable
@@ -100,6 +114,10 @@ public class PublicBookingController {
      * rules, cache headers and per-IP bucket as {@link #info}; {@code size} is clamped to 20, an unknown
      * {@code sort} is a 400 through the enum binding.
      */
+    @ApiResponses({
+            @ApiResponse(responseCode = "200", description = "A page of the master's reviews"),
+            @ApiResponse(responseCode = "410", description = GONE_DESCRIPTION, content = @Content())
+    })
     @GetMapping("/{slug}/reviews")
     public ResponseEntity<PageResponse<ReviewResponse>> reviews(
             @PathVariable
@@ -117,6 +135,10 @@ public class PublicBookingController {
      * Phase 384 D4 — the salon counterpart of {@link #reviews}: {@code PageResponse<SalonReviewResponse>} (the master
      * name stays, as in the app), same clamp, headers, bucket and error matrix.
      */
+    @ApiResponses({
+            @ApiResponse(responseCode = "200", description = "A page of the salon's reviews"),
+            @ApiResponse(responseCode = "410", description = GONE_DESCRIPTION, content = @Content())
+    })
     @GetMapping("/s/{slug}/reviews")
     public ResponseEntity<PageResponse<SalonReviewResponse>> salonReviews(
             @PathVariable
@@ -140,6 +162,10 @@ public class PublicBookingController {
      * (validated above, and generated as {@code base-xxxx}), and Spring ranks this literal-prefixed
      * pattern above {@code /{slug}/info}, so {@code /book/s/info} still reaches {@link #info} and is a 400.
      */
+    @ApiResponses({
+            @ApiResponse(responseCode = "200", description = "Salon booking page"),
+            @ApiResponse(responseCode = "410", description = GONE_DESCRIPTION, content = @Content())
+    })
     @GetMapping("/s/{slug}/info")
     public ResponseEntity<SalonBookingSlugInfoResponse> salonInfo(
             @PathVariable
@@ -157,6 +183,10 @@ public class PublicBookingController {
      * binds to a 1-element list and returns the exact legacy single-service (cached) result. No auth
      * required. Past / over-window dates are rejected as 400 in the service.
      */
+    @ApiResponses({
+            @ApiResponse(responseCode = "200", description = "Available slots"),
+            @ApiResponse(responseCode = "410", description = GONE_DESCRIPTION, content = @Content())
+    })
     @GetMapping("/{slug}/availability")
     public ResponseEntity<List<AvailableSlotResponse>> availability(
             @PathVariable
@@ -191,6 +221,10 @@ public class PublicBookingController {
      * outside {@code [today, today + availabilityMaxDays]} (Kyiv) or {@code from > to} → 400; unknown slug,
      * inactive master/salon, or unknown/foreign/inactive service → indistinguishable 404.
      */
+    @ApiResponses({
+            @ApiResponse(responseCode = "200", description = "Per-date bookability"),
+            @ApiResponse(responseCode = "410", description = GONE_DESCRIPTION, content = @Content())
+    })
     @GetMapping("/{slug}/bookable-days")
     public ResponseEntity<List<MasterWorkingDayResponse>> bookableDays(
             @PathVariable
@@ -212,6 +246,10 @@ public class PublicBookingController {
      * from the {@code Authorization} header and validated by the service; an absent,
      * expired, or non-GUEST token results in 401. Slot conflicts return 409.
      */
+    @ApiResponses({
+            @ApiResponse(responseCode = "201", description = "Guest booking created"),
+            @ApiResponse(responseCode = "410", description = GONE_DESCRIPTION, content = @Content())
+    })
     @PostMapping("/{slug}/booking")
     public ResponseEntity<GuestBookingResponse> book(
             @PathVariable

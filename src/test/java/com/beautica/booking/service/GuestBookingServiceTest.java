@@ -68,6 +68,7 @@ class GuestBookingServiceTest {
     @Mock private SmsService smsService;
     @Mock private com.beautica.service.service.SalonCatalogCacheEvictor salonCatalogCacheEvictor;
     @Mock private InAppNotificationService inAppNotificationService;
+    @Mock private RetiredBookingSlugGuard retiredBookingSlugGuard;
 
     private GuestBookingService service;
 
@@ -82,7 +83,7 @@ class GuestBookingServiceTest {
                 new BookingSmsProperties(), salonCatalogCacheEvictor,
                 new VisitPlanner(masterServiceRepository), FRONTEND,
                 java.time.Clock.fixed(OffsetDateTime.parse("2026-06-01T10:00:00Z").toInstant(), ZoneOffset.UTC),
-                inAppNotificationService);
+                inAppNotificationService, retiredBookingSlugGuard);
 
         // Phase 337 fix: BookingSlotLockGuard.lockMasterAndAssertFree now re-checks bookability
         // AFTER the advisory lock (PostLockSlotGuard, closing the self-delete-race CRITICAL), fused
@@ -640,6 +641,8 @@ class GuestBookingServiceTest {
         var result = service.bookableDays(SLUG, TODAY, TODAY.plusDays(6), List.of(serviceId));
 
         assertThat(result).isSameAs(days);
+        // Phase 379 D2 — a live slug never probes the tombstones.
+        verifyNoInteractions(retiredBookingSlugGuard);
         verify(slotCalculationService, never()).getBookableWorkingDays(any(), any(), any(), anyList());
     }
 
@@ -717,5 +720,50 @@ class GuestBookingServiceTest {
                 .isInstanceOf(NotFoundException.class);
 
         verifyNoInteractions(slotCalculationService);
+    }
+
+    // ── phase 379 — retired slug → 410 on the miss path ────────────────────
+
+    @Test
+    @DisplayName("phase 379: availability / bookable-days miss + MASTER tombstone → GoneException, no slot work")
+    void should_throwGone_when_slotReadSlugRetired() {
+        when(masterRepository.findBookableIdByBookingSlug(SLUG)).thenReturn(Optional.empty());
+        org.mockito.Mockito.doThrow(com.beautica.common.exception.GoneException.bookingLinkRetired())
+                .when(retiredBookingSlugGuard).throwGoneIfRetired(com.beautica.booking.dto.BookingLinkKind.MASTER, SLUG);
+
+        assertThatThrownBy(() -> service.availableSlots(SLUG, TODAY.plusDays(1), serviceId))
+                .isInstanceOf(com.beautica.common.exception.GoneException.class);
+        assertThatThrownBy(() -> service.bookableDays(SLUG, TODAY, TODAY.plusDays(2), List.of(serviceId)))
+                .isInstanceOf(com.beautica.common.exception.GoneException.class);
+        verifyNoInteractions(slotCalculationService);
+    }
+
+    @Test
+    @DisplayName("phase 379: booking miss + MASTER tombstone → GoneException, nothing saved or sent")
+    void should_throwGoneAndPersistNothing_when_bookingSlugRetired() {
+        OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
+        when(guestTokenProvider.validate(anyString())).thenReturn(GUEST_PHONE);
+        when(masterRepository.findByBookingSlugWithUser(SLUG)).thenReturn(Optional.empty());
+        org.mockito.Mockito.doThrow(com.beautica.common.exception.GoneException.bookingLinkRetired())
+                .when(retiredBookingSlugGuard).throwGoneIfRetired(com.beautica.booking.dto.BookingLinkKind.MASTER, SLUG);
+
+        assertThatThrownBy(() -> service.createGuestBooking("Bearer t", SLUG,
+                new GuestBookingRequest(serviceId, null, startsAt, "Олена", "Коваль", true, "2026-10-20")))
+                .isInstanceOf(com.beautica.common.exception.GoneException.class);
+        verify(bookingRepository, never()).saveAll(any());
+        verifyNoInteractions(outboxService);
+    }
+
+    @Test
+    @DisplayName("phase 379: booking miss without tombstone → unchanged 404")
+    void should_throwNotFound_when_bookingSlugUnknownAndNotRetired() {
+        OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
+        when(guestTokenProvider.validate(anyString())).thenReturn(GUEST_PHONE);
+        when(masterRepository.findByBookingSlugWithUser(SLUG)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> service.createGuestBooking("Bearer t", SLUG,
+                new GuestBookingRequest(serviceId, null, startsAt, "Олена", "Коваль", true, "2026-10-20")))
+                .isInstanceOf(NotFoundException.class);
+        verify(retiredBookingSlugGuard).throwGoneIfRetired(com.beautica.booking.dto.BookingLinkKind.MASTER, SLUG);
     }
 }

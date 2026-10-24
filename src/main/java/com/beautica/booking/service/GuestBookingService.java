@@ -1,6 +1,7 @@
 package com.beautica.booking.service;
 
 import com.beautica.booking.dto.AvailableSlotResponse;
+import com.beautica.booking.dto.BookingLinkKind;
 import com.beautica.booking.dto.BookingPriceRange;
 import com.beautica.booking.domain.GuestConsent;
 import com.beautica.booking.dto.GuestBookingRequest;
@@ -78,6 +79,8 @@ public class GuestBookingService {
     // Phase 333 — see InAppNotificationService's class javadoc for why this is a separate seam from
     // outboxService, never called from it.
     private final InAppNotificationService inAppNotificationService;
+    /** Phase 379 — 410 for a retired master slug on the miss path (availability, bookable-days, booking). */
+    private final RetiredBookingSlugGuard retiredBookingSlugGuard;
 
     public GuestBookingService(
             GuestTokenProvider guestTokenProvider,
@@ -93,7 +96,8 @@ public class GuestBookingService {
             VisitPlanner visitPlanner,
             @Value("${app.frontend.base-url}") String frontendBaseUrl,
             Clock clock,
-            InAppNotificationService inAppNotificationService) {
+            InAppNotificationService inAppNotificationService,
+            RetiredBookingSlugGuard retiredBookingSlugGuard) {
         this.guestTokenProvider = guestTokenProvider;
         this.masterRepository = masterRepository;
         this.masterServiceRepository = masterServiceRepository;
@@ -108,6 +112,7 @@ public class GuestBookingService {
         this.frontendBaseUrl = frontendBaseUrl;
         this.kyivClock = clock.withZone(TimeZones.KYIV);
         this.inAppNotificationService = inAppNotificationService;
+        this.retiredBookingSlugGuard = retiredBookingSlugGuard;
     }
 
     /**
@@ -202,7 +207,17 @@ public class GuestBookingService {
      */
     private UUID resolveBookableMasterId(String slug) {
         return masterRepository.findBookableIdByBookingSlug(slug)
-                .orElseThrow(() -> new NotFoundException("Booking page not found"));
+                .orElseThrow(() -> bookingPageNotFound(slug));
+    }
+
+    /**
+     * Phase 379 D2 — the public-slug miss: 410 when the slug is a retired {@code kind} link
+     * ({@link RetiredBookingSlugGuard}), otherwise the unchanged 404. Only ever reached after the live
+     * resolver missed, so a valid link pays no extra query.
+     */
+    private NotFoundException bookingPageNotFound(String slug) {
+        retiredBookingSlugGuard.throwGoneIfRetired(BookingLinkKind.MASTER, slug);
+        return new NotFoundException("Booking page not found");
     }
 
     /**
@@ -230,7 +245,7 @@ public class GuestBookingService {
         // See resolveBookableMasterId: the liveness + salon-active rule lives in the finder's JPQL,
         // so no redundant .filter(Master::isActive) is applied on top of it.
         Master master = masterRepository.findByBookingSlugWithUser(slug)
-                .orElseThrow(() -> new NotFoundException("Booking page not found"));
+                .orElseThrow(() -> bookingPageNotFound(slug));
 
         // BE-7: a masterServiceIds list (even a single element) is a multi-service VISIT — ONE Appointment
         // header + N chained CONFIRMED bookings sharing one cancel token and one reminder. A legacy

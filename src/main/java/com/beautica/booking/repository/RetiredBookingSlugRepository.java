@@ -6,7 +6,10 @@ import com.beautica.booking.entity.RetiredBookingSlugId;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.jpa.repository.QueryHints;
 import org.springframework.data.repository.query.Param;
+import org.hibernate.jpa.HibernateHints;
+import jakarta.persistence.QueryHint;
 
 import java.time.Instant;
 import java.util.Collection;
@@ -59,5 +62,39 @@ public interface RetiredBookingSlugRepository extends JpaRepository<RetiredBooki
             @Param("salonId") UUID salonId,
             @Param("retiredBy") UUID retiredBy,
             @Param("reason") String reason,
+            @Param("retiredAt") Instant retiredAt);
+
+    /**
+     * Phase 379 D7 — {@code DELETED} tombstones for masters rows being deleted / detached, one statement for
+     * the batch ({@code slugHashes[i]} belongs to {@code masterIds[i]}). Arrays, not collections (see
+     * {@code SalonRepository#lockBookingSlugCandidates}); ids as text, cast in SQL. {@code ON CONFLICT DO
+     * NOTHING}: a deletion is never aborted by an already-retired slug. The native query space is declared
+     * so Hibernate does not flush the whole session first (the disposal batches its masters writes into one
+     * later flush).
+     */
+    @Modifying
+    @QueryHints(@QueryHint(name = HibernateHints.HINT_NATIVE_SPACES, value = "retired_booking_slugs"))
+    @Query(value = """
+            INSERT INTO retired_booking_slugs (kind, slug_hash, master_id, reason, retired_at)
+            SELECT 'MASTER', t.slug_hash, CAST(t.master_id AS uuid), 'DELETED', :retiredAt
+              FROM unnest(CAST(:slugHashes AS text[]), CAST(:masterIds AS text[])) AS t(slug_hash, master_id)
+            ON CONFLICT (kind, slug_hash) DO NOTHING
+            """, nativeQuery = true)
+    int insertDeletedMasterTombstones(
+            @Param("slugHashes") String[] slugHashes,
+            @Param("masterIds") String[] masterIds,
+            @Param("retiredAt") Instant retiredAt);
+
+    /** Phase 379 D7 — the SALON twin of {@link #insertDeletedMasterTombstones}, for one salon. */
+    @Modifying
+    @QueryHints(@QueryHint(name = HibernateHints.HINT_NATIVE_SPACES, value = "retired_booking_slugs"))
+    @Query(value = """
+            INSERT INTO retired_booking_slugs (kind, slug_hash, salon_id, reason, retired_at)
+            VALUES ('SALON', :slugHash, :salonId, 'DELETED', :retiredAt)
+            ON CONFLICT (kind, slug_hash) DO NOTHING
+            """, nativeQuery = true)
+    int insertDeletedSalonTombstone(
+            @Param("slugHash") String slugHash,
+            @Param("salonId") UUID salonId,
             @Param("retiredAt") Instant retiredAt);
 }

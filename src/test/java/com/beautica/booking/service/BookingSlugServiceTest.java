@@ -85,6 +85,9 @@ class BookingSlugServiceTest {
     @Spy
     private SlugSuffixSource slugSuffixSource = new SecureRandomSlugSuffixSource();
 
+    @Mock
+    private RetiredBookingSlugGuard retiredBookingSlugGuard;
+
     @InjectMocks
     private BookingSlugService service;
 
@@ -767,6 +770,8 @@ class BookingSlugServiceTest {
         assertThat(info.services()).hasSize(1);
         assertThat(info.services().get(0).name()).isEqualTo("Манікюр");
         assertThat(info.services().get(0).priceFrom()).isEqualByComparingTo("350.00");
+        // Phase 379 D2 — a live slug never probes the tombstones (hot path unchanged).
+        org.mockito.Mockito.verifyNoInteractions(retiredBookingSlugGuard);
     }
 
     // ── findBySlug — phase 380 enrichment ───────────────────────────────────
@@ -1142,5 +1147,44 @@ class BookingSlugServiceTest {
                 .serviceDefinition(def)
                 .isActive(true)
                 .build();
+    }
+
+    // ── phase 379 — retired slug → 410 on the miss path ────────────────────
+
+    @Test
+    @DisplayName("phase 379: info miss + MASTER tombstone → GoneException (410)")
+    void should_throwGone_when_infoSlugRetired() {
+        when(masterRepository.findByBookingSlugWithUser("old-slug-ab12")).thenReturn(Optional.empty());
+        org.mockito.Mockito.doThrow(com.beautica.common.exception.GoneException.bookingLinkRetired())
+                .when(retiredBookingSlugGuard).throwGoneIfRetired(BookingLinkKind.MASTER, "old-slug-ab12");
+
+        assertThatThrownBy(() -> service.findBySlug("old-slug-ab12"))
+                .isInstanceOf(com.beautica.common.exception.GoneException.class);
+    }
+
+    @Test
+    @DisplayName("phase 379: info miss without tombstone → unchanged 404, guard probed as MASTER")
+    void should_throwNotFound_when_infoSlugUnknownAndNotRetired() {
+        when(masterRepository.findByBookingSlugWithUser("nobody-zz99")).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> service.findBySlug("nobody-zz99"))
+                .isInstanceOf(NotFoundException.class)
+                .hasMessage("Booking page not found");
+        verify(retiredBookingSlugGuard).throwGoneIfRetired(BookingLinkKind.MASTER, "nobody-zz99");
+    }
+
+    @Test
+    @DisplayName("phase 379: master reviews miss probes MASTER, salon reviews miss probes SALON")
+    void should_probeMatchingKind_when_reviewsSlugMisses() {
+        when(masterRepository.findActiveReviewTargetByBookingSlug("gone-m-ab12")).thenReturn(Optional.empty());
+        when(salonRepository.findActiveReviewTargetByBookingSlug("gone-s-ab12")).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> service.reviewsForSlug("gone-m-ab12", SalonReviewSort.NEWEST, PageRequest.of(0, 20)))
+                .isInstanceOf(NotFoundException.class);
+        assertThatThrownBy(() -> service.salonReviewsForSlug("gone-s-ab12", SalonReviewSort.NEWEST, PageRequest.of(0, 20)))
+                .isInstanceOf(NotFoundException.class);
+
+        verify(retiredBookingSlugGuard).throwGoneIfRetired(BookingLinkKind.MASTER, "gone-m-ab12");
+        verify(retiredBookingSlugGuard).throwGoneIfRetired(BookingLinkKind.SALON, "gone-s-ab12");
     }
 }

@@ -116,6 +116,8 @@ public class BookingSlugService {
     private final RetiredBookingSlugRepository retiredBookingSlugRepository;
     /** Phase 378 test seam — the random suffix (production: {@link SecureRandomSlugSuffixSource}). */
     private final SlugSuffixSource slugSuffixSource;
+    /** Phase 379 — 410 for a retired slug on the public miss path. */
+    private final RetiredBookingSlugGuard retiredBookingSlugGuard;
 
     /**
      * Returns the master's existing booking slug, or lazily generates, persists,
@@ -414,7 +416,7 @@ public class BookingSlugService {
     @Transactional(readOnly = true)
     public BookingSlugInfoResponse findBySlug(String slug) {
         Master master = masterRepository.findByBookingSlugWithUser(slug)
-                .orElseThrow(() -> new NotFoundException("Booking page not found"));
+                .orElseThrow(() -> bookingPageNotFound(BookingLinkKind.MASTER, slug));
 
         User user = master.getUser();
         List<ServiceSummaryDto> services = masterServiceRepository
@@ -467,7 +469,7 @@ public class BookingSlugService {
     public Page<ReviewResponse> reviewsForSlug(String slug, SalonReviewSort sort, Pageable pageable) {
         Pageable clamped = clampPublicReviewsPage(pageable);
         ReviewTarget target = masterRepository.findActiveReviewTargetByBookingSlug(slug)
-                .orElseThrow(() -> new NotFoundException("Booking page not found"));
+                .orElseThrow(() -> bookingPageNotFound(BookingLinkKind.MASTER, slug));
         if (isBeyondLastPage(clamped, target.getReviewCount())) {
             // Never reaches the cached method: an empty deep page must not mint a cache entry (key churn).
             return new PageImpl<>(List.of(), clamped, target.getReviewCount());
@@ -514,11 +516,21 @@ public class BookingSlugService {
     public Page<SalonReviewResponse> salonReviewsForSlug(String slug, SalonReviewSort sort, Pageable pageable) {
         Pageable clamped = clampPublicReviewsPage(pageable);
         ReviewTarget target = salonRepository.findActiveReviewTargetByBookingSlug(slug)
-                .orElseThrow(() -> new NotFoundException("Booking page not found"));
+                .orElseThrow(() -> bookingPageNotFound(BookingLinkKind.SALON, slug));
         if (isBeyondLastPage(clamped, target.getReviewCount())) {
             return new PageImpl<>(List.of(), clamped, target.getReviewCount());
         }
         return reviewService.getSalonReviews(target.getId(), sort, clamped);
+    }
+
+    /**
+     * Phase 379 D2 — the public-slug miss: 410 when the slug is a retired {@code kind} link
+     * ({@link RetiredBookingSlugGuard}), otherwise the unchanged 404. Only ever reached after the live
+     * resolver missed, so a valid link pays no extra query.
+     */
+    private NotFoundException bookingPageNotFound(BookingLinkKind kind, String slug) {
+        retiredBookingSlugGuard.throwGoneIfRetired(kind, slug);
+        return new NotFoundException("Booking page not found");
     }
 
     private static BookingSlugSalonRef salonRef(Salon salon) {
