@@ -88,6 +88,17 @@ public class MasterCachePrefixEvictor {
     }
 
     /**
+     * Off-thread variant of {@link #evictByValueNow} (phase 377), for value scans fired from a
+     * request-serving {@code afterCommit} hook — same executor and same reasoning as
+     * {@link #evictByMasterPrefix}: the scan takes the map's bin locks, which a {@code sync = true}
+     * loader holds across its DB round-trips. Must be called from an {@code afterCommit} hook.
+     */
+    @Async("cacheEvictionExecutor")
+    public void evictByValue(Predicate<Object> valueMatch, Iterable<String> cacheNames) {
+        evictByValueNow(valueMatch, cacheNames);
+    }
+
+    /**
      * Evicts every entry of each named cache whose VALUE satisfies {@code valueMatch}, on the calling
      * thread. For caches whose keys cannot identify the entity (e.g. salon search pages keyed by filter
      * tuple, where a salon is found only by scanning each cached page's rows). Lives here so native

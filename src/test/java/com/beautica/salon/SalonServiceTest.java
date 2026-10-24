@@ -196,6 +196,17 @@ class SalonServiceTest {
     @Mock
     private com.beautica.salon.service.StaffAccountDisposalService staffAccountDisposalService;
 
+    // Phase 376: createSalon generates the new salon's booking slug via BookingSlugService.
+    // @InjectMocks passes null for an UNDECLARED collaborator, so createSalon would NPE.
+    @Mock
+    private com.beautica.booking.service.BookingSlugService bookingSlugService;
+
+    // Phase 377: salon-detail evictions also evict the public salon booking page after commit.
+    @Mock private com.beautica.common.cache.SalonBookingInfoCacheEvictor salonBookingInfoCacheEvictor;
+
+    // Phase 379 D7 — deactivateSalon tombstones the salon slug; @InjectMocks would pass null.
+    @Mock private com.beautica.booking.service.DeletedBookingSlugTombstoner deletedBookingSlugTombstoner;
+
     @InjectMocks
     private SalonService salonService;
 
@@ -423,6 +434,48 @@ class SalonServiceTest {
         assertThat(captor.getValue().getInstagramUrl())
                 .as("a full instagram.com URL has no leading @ to strip and must be stored unchanged")
                 .isEqualTo("https://instagram.com/some.handle");
+    }
+
+    // ── createSalon — Phase 376 booking slug issued at creation (D4) ──
+
+    @Test
+    @DisplayName("createSalon — writes the slug generated from the REQUEST name into the saved salon (376 D4)")
+    void should_persistGeneratedBookingSlug_when_createSalon() {
+        UUID ownerId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        var request = new CreateSalonRequest(
+                "Beauty Lab Київ", null, null, null, null, null, null,
+                null, null, null, null, null
+        );
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
+        when(salonRepository.existsByOwnerId(ownerId)).thenReturn(true);
+        when(bookingSlugService.generateSalonSlug("Beauty Lab Київ")).thenReturn("beauty-lab-kyiv-x7k2");
+        when(salonRepository.save(any(Salon.class)))
+                .thenReturn(buildSalon(UUID.randomUUID(), owner, "Beauty Lab Київ"));
+
+        salonService.createSalon(ownerId, request);
+
+        ArgumentCaptor<Salon> captor = ArgumentCaptor.forClass(Salon.class);
+        verify(salonRepository).save(captor.capture());
+        assertThat(captor.getValue().getBookingSlug())
+                .as("the slug must ride in the INSERT itself, no follow-up UPDATE")
+                .isEqualTo("beauty-lab-kyiv-x7k2");
+        verify(bookingSlugService).generateSalonSlug("Beauty Lab Київ");
+    }
+
+    @Test
+    @DisplayName("createSalon by a non-owner — refused before any slug is generated (no advisory lock taken)")
+    void should_notGenerateBookingSlug_when_userIsNotSalonOwner() {
+        UUID userId = UUID.randomUUID();
+        User client = buildUser(userId, "client@beautica.com", Role.CLIENT);
+        var request = new CreateSalonRequest("My Salon", null, null, null, null, null, null, null, null, null, null, null);
+        when(userRepository.findByIdForUpdate(userId)).thenReturn(Optional.of(client));
+
+        assertThatThrownBy(() -> salonService.createSalon(userId, request))
+                .isInstanceOf(ForbiddenException.class)
+                .hasMessageContaining("Only SALON_OWNER may create a salon");
+
+        verifyNoInteractions(bookingSlugService);
     }
 
     @Test

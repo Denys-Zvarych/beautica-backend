@@ -101,6 +101,11 @@ class SalonServicePrimaryTest {
     @Mock
     private com.beautica.salon.service.StaffAccountDisposalService staffAccountDisposalService;
 
+    // Phase 376: createSalon generates the new salon's booking slug via BookingSlugService.
+    // @InjectMocks passes null for an UNDECLARED collaborator, so createSalon would NPE.
+    @Mock
+    private com.beautica.booking.service.BookingSlugService bookingSlugService;
+
     @InjectMocks
     private SalonService salonService;
 

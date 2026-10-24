@@ -4,9 +4,11 @@ import jakarta.persistence.EntityManager;
 import jakarta.persistence.PersistenceContext;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.transaction.annotation.Transactional;
 
 import com.beautica.AbstractIntegrationTest;
+import com.beautica.salon.repository.SalonRepository;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -14,11 +16,11 @@ import static org.assertj.core.api.Assertions.assertThat;
  * QA-authored regression guard (security LOW, cycle-2 audit, 2026-08-22) — pins the ONE Postgres
  * executor property that every fused {@code lock_timeout} ceiling in this codebase silently rests on.
  *
- * <p><b>What breaks if this class goes RED.</b> Seven lock statements fuse
+ * <p><b>What breaks if this class goes RED.</b> Thirteen lock statements fuse
  * {@code set_config('lock_timeout', '3s', true)} into the SAME statement as the lock they are meant
  * to bound, so the GUC is set and the lock is taken in a single round trip. Each one depends on the
  * {@code set_config} expression being evaluated BEFORE the sibling expression that blocks. If that
- * evaluation order ever stopped holding, all seven ceilings would go inert at once — the timeout
+ * evaluation order ever stopped holding, all thirteen ceilings would go inert at once — the timeout
  * would be applied only AFTER the wait it was supposed to bound, i.e. never — and every lock wait
  * would revert to Postgres' {@code lock_timeout} default of {@code 0} (wait forever). That is the
  * exact advisory-lock DoS the fused ceilings were added to close: a flood of contending requests
@@ -27,37 +29,44 @@ import static org.assertj.core.api.Assertions.assertThat;
  * Nothing else in the suite would notice: no existing test asserts a lock wait is bounded, so the
  * regression would ship fully green.
  *
- * <p><b>The call sites this guards</b> (grep {@code set_config} in {@code src/main} before adding
- * an eighth):
+ * <p><b>The call sites this guards</b> (by method name — line numbers rot; grep {@code set_config}
+ * in {@code src/main} before adding a fourteenth, and add it to the matching list below).
+ *
+ * <p><i>Target-list shape (8)</i> — {@code set_config} beside the blocking expression in a SELECT
+ * target list; pinned by {@link #should_applyLockTimeoutBeforeSiblingTargetListEntry()}:
  * <ul>
- *   <li>{@code BookingRepository#acquireClientAdvisoryLockWithTimeout} — BookingRepository.java:1048
- *       (salt 1, per-client)</li>
- *   <li>{@code BookingRepository#acquireWalkInPhoneLock} — BookingRepository.java:1341
- *       (salt 3, per-phone walk-in SMS budget)</li>
- *   <li>{@code BookingRepository#acquireAdvisoryLockWithTimeout} — BookingRepository.java:1378
- *       (salt 0, per-master)</li>
- *   <li>{@code MasterServiceRepository#acquireBulkSetupLockWithTimeout} —
- *       MasterServiceRepository.java:310 (salt 2, bulk service setup)</li>
- *   <li>{@code AppointmentRepository#lockHeaderIfConfirmed} — AppointmentRepository.java:145
- *       (header row lock, {@code FOR UPDATE})</li>
- *   <li>{@code AppointmentRepository#lockHeaderRegardlessOfStatus} — AppointmentRepository.java:192
- *       (header row lock, {@code FOR UPDATE})</li>
- *   <li>{@code AppointmentRepository#consumeCancelToken} — AppointmentRepository.java:78
- *       (implicit {@code UPDATE} row lock)</li>
- *   <li>{@code SalonRepository#findByIdForUpdate} (Phase 343 salon logo/cover, audit cycle 1) —
- *       {@code CROSS JOIN (SELECT set_config(...)) lock_cfg} beside a {@code FOR NO KEY UPDATE OF s} scan: the
- *       join-source shape, covered by the second test (its locking step sits ABOVE the join); end-to-end
- *       ceiling pinned by {@code SalonImageIT#should_return409AndDiscardBlob_when_salonLockHeldPastLockTimeout}</li>
+ *   <li>{@code BookingRepository#acquireClientAdvisoryLockWithTimeout} (salt 1, per-client)</li>
+ *   <li>{@code BookingRepository#acquireWalkInPhoneLock} (salt 3, per-phone walk-in SMS budget)</li>
+ *   <li>{@code BookingRepository#acquireAdvisoryLockWithTimeout} (salt 0, per-master)</li>
+ *   <li>{@code MasterServiceRepository#acquireBulkSetupLockWithTimeout} (salt 2, bulk service setup)</li>
+ *   <li>{@code AppointmentRepository#lockHeaderIfConfirmed} (header row lock, {@code FOR UPDATE})</li>
+ *   <li>{@code AppointmentRepository#lockHeaderRegardlessOfStatus} (header row lock, {@code FOR UPDATE})</li>
+ *   <li>{@code AppointmentRepository#lockHeadersIfConfirmedBulk} (header row locks, {@code FOR UPDATE})</li>
+ *   <li>{@code SalonRepository#lockBookingSlugCandidates} (Phase 376, salt 4, salon slug candidates) — the
+ *       same shape wrapped in {@code SELECT count(*) FROM (... ORDER BY c)}; that exact wrapper is pinned
+ *       separately by {@link #should_applyLockTimeoutBeforeFirstLock_when_countOrderByWrapperShape()} and
+ *       {@link #should_applyLockTimeoutAndTakeEveryLock_when_lockBookingSlugCandidatesRuns()}; end-to-end
+ *       ceiling pinned by {@code BookingLinkIT} / {@code SalonCreateCapConcurrencyIT}
+ *       {@code #should_return409_when_slugCandidateLockHeldBeyondTimeout}</li>
  * </ul>
  *
- * <p><b>Two distinct fusion shapes, one test each.</b> Six of the seven put {@code set_config} in a
- * SELECT target list beside the blocking expression ({@code pg_advisory_xact_lock(...)}, or the
- * {@code id} column of a {@code FOR UPDATE} scan) — {@link
- * #should_applyLockTimeoutBeforeSiblingTargetListEntry()} pins that. The seventh is an
- * {@code UPDATE}, which has no target-list slot, so it smuggles the GUC in through a one-row
- * {@code FROM (SELECT set_config(...)) AS lock_cfg} join source — {@link
- * #should_applyLockTimeoutBeforeOuterQueryWhenFusedAsJoinSource()} pins that separate property, so
- * a change affecting only one shape cannot hide behind the other.
+ * <p><i>Join-source shape (5)</i> — the GUC smuggled in through a one-row
+ * {@code (SELECT set_config(...)) lock_cfg} join source; pinned by
+ * {@link #should_applyLockTimeoutBeforeOuterQueryWhenFusedAsJoinSource()}:
+ * <ul>
+ *   <li>{@code AppointmentRepository#consumeCancelToken} (implicit {@code UPDATE} row lock)</li>
+ *   <li>{@code SalonRepository#findByIdForUpdate} (Phase 343 salon logo/cover, {@code FOR NO KEY UPDATE OF s});
+ *       end-to-end ceiling pinned by
+ *       {@code SalonImageIT#should_return409AndDiscardBlob_when_salonLockHeldPastLockTimeout}</li>
+ *   <li>{@code SalonRepository#lockIsActiveForUpdate}</li>
+ *   <li>{@code MasterRepository#lockIdForUpdate}</li>
+ *   <li>{@code SalonRepository#lockSalonIdsWithoutBookingSlug} (Phase 376) — end-to-end ceiling pinned by
+ *       {@code BookingLinkIT#should_return409_when_salonRowLockHeldBeyondTimeout}</li>
+ * </ul>
+ *
+ * <p><b>Two distinct fusion shapes, one test each</b>, so a change affecting only one shape cannot
+ * hide behind the other: a {@code UPDATE} has no target-list slot, and a {@code FOR [NO KEY] UPDATE}
+ * scan locks ABOVE the join, which is why the join-source shape exists at all.
  *
  * <p><b>Why these assertions are sound rather than accidental.</b> {@code current_setting} is
  * {@code STABLE}, so it is NOT constant-folded at plan time and must actually execute in the
@@ -72,12 +81,15 @@ import static org.assertj.core.api.Assertions.assertThat;
  * {@code 0}. Without it, a pooled {@code connection-init-sql} or a global default drifting in would
  * make the assertion pass for the wrong reason.
  */
-@DisplayName("Fused lock_timeout — evaluation-order guard for all seven set_config lock statements")
+@DisplayName("Fused lock_timeout — evaluation-order guard for all thirteen set_config lock statements")
 @Transactional
 class AdvisoryLockFusionOrderIT extends AbstractIntegrationTest {
 
     @PersistenceContext
     private EntityManager em;
+
+    @Autowired
+    private SalonRepository salonRepository;
 
     @Test
     @DisplayName("set_config in a SELECT target list is applied before the sibling entry beside it")
@@ -97,10 +109,9 @@ class AdvisoryLockFusionOrderIT extends AbstractIntegrationTest {
         assertThat(row[1])
                 .as("the SECOND target-list entry must observe the FIRST entry's GUC write. '0' here "
                         + "means Postgres no longer evaluates sibling target-list entries "
-                        + "left-to-right, so all six target-list-fused lock ceilings "
-                        + "(BookingRepository:1048/1341/1378, MasterServiceRepository:310, "
-                        + "AppointmentRepository:145/192) now set lock_timeout AFTER the lock they "
-                        + "bound — every lock wait is unbounded again. actual=%s", row[1])
+                        + "left-to-right, so all eight target-list-fused lock ceilings (see the "
+                        + "class Javadoc list) now set lock_timeout AFTER the lock they bound — "
+                        + "every lock wait is unbounded again. actual=%s", row[1])
                 .isEqualTo("3s");
     }
 
@@ -116,11 +127,70 @@ class AdvisoryLockFusionOrderIT extends AbstractIntegrationTest {
 
         assertThat(observed)
                 .as("the outer query must observe the join source's GUC write. '0' here means "
-                        + "AppointmentRepository#consumeCancelToken (AppointmentRepository.java:78) "
-                        + "takes its implicit UPDATE row lock with lock_timeout still disabled — a "
-                        + "guest cancel-link click contending with a provider transition parks a "
-                        + "Hikari connection indefinitely. actual=%s", observed)
+                        + "the five join-source-fused ceilings (e.g. "
+                        + "AppointmentRepository#consumeCancelToken, "
+                        + "SalonRepository#lockSalonIdsWithoutBookingSlug) take their row locks with "
+                        + "lock_timeout still disabled — a contending request parks a Hikari "
+                        + "connection indefinitely. actual=%s", observed)
                 .isEqualTo("3s");
+    }
+
+    /**
+     * Phase 376 INFO — {@code SalonRepository#lockBookingSlugCandidates} wraps the target-list shape in
+     * {@code SELECT count(*) FROM (... FROM unnest(...) AS c ORDER BY c) AS l}. Two things could differ
+     * from the bare shape: the outer {@code count(*)} references NEITHER column (subquery-output
+     * pruning), and the {@code ORDER BY} adds a Sort node beneath the projection. This runs that exact
+     * wrapper with the lock replaced by an observer of the GUC (in the lock's slot), and asserts the
+     * FIRST row in lock order — i.e. the first lock — already sees {@code 3s}.
+     *
+     * <p>The observer MUST be volatile, like {@code pg_advisory_xact_lock}: with an {@code ORDER BY},
+     * the planner ({@code make_sort_input_target}) evaluates non-volatile target entries BELOW the Sort
+     * and postpones only volatile ones above it. A bare {@code current_setting} (STABLE) would therefore
+     * run before {@code set_config} and read {@code '0'} (observed while authoring this test); the
+     * {@code random()} guard makes it volatile so it is postponed exactly as the real lock is.
+     */
+    @Test
+    @DisplayName("count(*) + ORDER BY wrapper (lockBookingSlugCandidates shape): set_config applied before the FIRST lock")
+    void should_applyLockTimeoutBeforeFirstLock_when_countOrderByWrapperShape() {
+        assertLockTimeoutDefaultIsDisabled();
+
+        Object[] row = (Object[]) em.createNativeQuery("""
+                SELECT count(*), (array_agg(l.b))[1], bool_and(l.b = '3s')
+                  FROM (SELECT set_config('lock_timeout', '3s', true),
+                               CASE WHEN random() >= 0 THEN current_setting('lock_timeout') END AS b
+                          FROM unnest(CAST(ARRAY['zz-cand-ab12', 'aa-cand-ab12', 'mm-cand-ab12'] AS text[])) AS c
+                         ORDER BY c) AS l
+                """).getSingleResult();
+
+        assertThat(((Number) row[0]).longValue()).as("one row per candidate").isEqualTo(3L);
+        assertThat(row[1])
+                .as("the first candidate's lock slot must observe 3s. '0' means the count(*)/ORDER BY "
+                        + "wrapper evaluates the lock before set_config — lockBookingSlugCandidates "
+                        + "would wait forever on its first contended candidate. actual=%s", row[1])
+                .isEqualTo("3s");
+        assertThat(row[2]).as("every candidate's lock slot observes 3s, actual=%s", row[2]).isEqualTo(true);
+    }
+
+    /**
+     * Phase 376 INFO — the production statement itself: under the {@code count(*)} wrapper neither
+     * volatile entry is pruned, so {@code set_config} runs (GUC is {@code 3s} afterwards) and every
+     * distinct candidate's advisory lock is held by THIS transaction.
+     */
+    @Test
+    @DisplayName("lockBookingSlugCandidates: set_config not pruned by count(*), one advisory lock held per candidate")
+    void should_applyLockTimeoutAndTakeEveryLock_when_lockBookingSlugCandidatesRuns() {
+        assertLockTimeoutDefaultIsDisabled();
+
+        long locked = salonRepository.lockBookingSlugCandidates(new String[] {"zz-fusion-ab12", "aa-fusion-ab12"});
+
+        Object timeout = em.createNativeQuery("SELECT current_setting('lock_timeout')").getSingleResult();
+        Object held = em.createNativeQuery("""
+                SELECT count(*) FROM pg_locks
+                 WHERE locktype = 'advisory' AND pid = pg_backend_pid() AND granted
+                """).getSingleResult();
+        assertThat(locked).as("count(*) = distinct candidates").isEqualTo(2L);
+        assertThat(timeout).as("set_config survived the count(*) wrapper, actual=%s", timeout).isEqualTo("3s");
+        assertThat(((Number) held).longValue()).as("both candidate locks held to commit").isEqualTo(2L);
     }
 
     /**

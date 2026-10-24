@@ -158,7 +158,9 @@ class BookingControllerTest {
                 // pinned by the booking ITs, not by a controller-slice stub.
                 null,
                 // clientAvgRating / clientReviewCount (two-sided ratings additive) — literal stub
-                new BigDecimal("4.50"), 7
+                new BigDecimal("4.50"), 7,
+                // guestPhone (phase 386 additive) — null: a registered client's booking
+                null
         );
     }
 

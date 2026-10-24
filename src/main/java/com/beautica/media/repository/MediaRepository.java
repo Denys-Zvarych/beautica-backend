@@ -36,6 +36,18 @@ public interface MediaRepository extends JpaRepository<MediaFile, UUID> {
     Page<MediaFile> findByEntityTypeAndEntityId(EntityType entityType, UUID entityId, Pageable pageable);
 
     /**
+     * The first rows of an entity's media in the given {@code pageable}'s window as a plain {@link List}: no total
+     * count (a {@link Page} return would add a COUNT statement whenever the window is full). Backs
+     * {@code MediaService#getLatestPortfolio}. The sort comes from the caller's {@code pageable}.
+     */
+    @org.springframework.data.jpa.repository.Query(
+            "SELECT m FROM MediaFile m WHERE m.entityType = :entityType AND m.entityId = :entityId")
+    List<MediaFile> findWindowByEntityTypeAndEntityId(
+            @org.springframework.data.repository.query.Param("entityType") EntityType entityType,
+            @org.springframework.data.repository.query.Param("entityId") UUID entityId,
+            Pageable pageable);
+
+    /**
      * Phase 363 D3/D4 — scalar pointers of every {@code media_files} row an account deletion must remove: the
      * accounts' own {@code (USER, userId)} rows and the {@code (MASTER, masterId)} portfolio of the masters rows
      * behind them. Keyed ONLY on the owning entity, never on {@code uploader_id} (audit metadata since V193) —

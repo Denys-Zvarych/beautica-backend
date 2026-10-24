@@ -7,9 +7,11 @@ import ch.qos.logback.core.read.ListAppender;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingSource;
 import com.beautica.booking.enums.BookingStatus;
-import com.beautica.config.BookingSmsProperties;
+import com.beautica.booking.service.BookingSmsDispatcher;
+import com.beautica.config.BookingLinksProperties;
 import com.beautica.master.entity.Master;
-import com.beautica.notification.sms.SmsService;
+import com.beautica.master.entity.MasterType;
+import com.beautica.notification.entity.OutboxEventType;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.user.User;
@@ -17,21 +19,23 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.slf4j.LoggerFactory;
 
-import java.time.Duration;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 import java.util.UUID;
+import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatCode;
-import static org.junit.jupiter.api.Assertions.assertTimeout;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
@@ -53,14 +57,21 @@ class NotificationServiceTest {
     @Mock
     private EmailNotificationService emailService;
     @Mock
-    private SmsService smsService;
+    private BookingSmsDispatcher bookingSmsDispatcher;
 
     private NotificationService service;
 
+    private static final String GUEST_PHONE = "+380501234567";
+    private static final BookingSmsDispatcher.Kind KIND = BookingSmsDispatcher.Kind.GUEST_PROVIDER_CANCELLATION;
+    /** Kyiv 10:00 on 01.08.2026 — the start every guest mock below carries. */
+    private static final String BODY_0108 = "Beautica: Ваш запис 01.08.2026 о 10:00 скасовано.";
+
     @BeforeEach
     void setUp() {
+        BookingLinksProperties links = new BookingLinksProperties();
+        links.setShareEnabled(true);
         service = new NotificationService(
-                emailService, smsService, new BookingSmsProperties(), FRONTEND_BASE_URL);
+                emailService, bookingSmsDispatcher, new GuestProviderCancellationSmsText(links), FRONTEND_BASE_URL);
     }
 
     // -------------------------------------------------------------------------
@@ -143,396 +154,96 @@ class NotificationServiceTest {
     }
 
     // -------------------------------------------------------------------------
-    // notifyBookingStatusChanged — DECLINED, guest (LINK / null-client) booking (Phase 25.7)
+    // notifyBookingStatusChanged — DECLINED, guest (LINK / null-client) booking (Phase 25.7 / 390)
     // -------------------------------------------------------------------------
 
     @Test
-    @DisplayName("Phase 25.7: a declined GUEST booking sends exactly one SMS with the provider's note "
+    @DisplayName("Phase 390: a declined GUEST booking queues exactly one provider-cancellation SMS "
             + "(no email/push — a guest has no account)")
-    void should_sendExactlyOneSms_when_guestBookingDeclined() {
+    void should_dispatchExactlyOneSms_when_guestBookingDeclined() {
         Booking booking = buildGuestBookingMockForDecline("Майстер зачинений сьогодні через хворобу");
 
         service.notifyBookingStatusChanged(BookingVisit.single(booking));
 
-        verify(smsService, org.mockito.Mockito.times(1)).send(eq("+380501234567"), anyString());
+        verify(bookingSmsDispatcher, org.mockito.Mockito.times(1)).dispatchOrThrow(eq(KIND), eq(GUEST_PHONE), anyString());
         verify(emailService, never()).sendBookingDeclinedEmail(anyString(), any());
     }
 
     @Test
-    @DisplayName("Phase 25.7: the guest decline SMS carries the service, master, and the provider's note")
-    void should_includeServiceMasterAndNote_when_guestBookingDeclinedSmsBuilt() {
-        Booking booking = buildGuestBookingMockForDecline("Майстер захворів");
-        ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
-
-        service.notifyBookingStatusChanged(BookingVisit.single(booking));
-
-        verify(smsService).send(anyString(), textCaptor.capture());
-        assertThat(textCaptor.getValue())
-                .contains("Тест послуга")
-                .contains("Тест Майстер")
-                .contains("Майстер захворів");
-    }
-
-    @Test
-    @DisplayName("a provider-chosen service name containing a template placeholder is emitted "
-            + "LITERALLY in the guest decline SMS — it must not be expanded into a second, fabricated "
-            + "date/time line")
-    void should_notExpandAPlaceholderInsideAServiceName_when_theGuestDeclineSmsIsBuilt() {
-        // The call-site twin of GuestBookingServiceTest's confirmation-SMS case. buildGuestDeclineSms
-        // substituted {serviceName} BEFORE {date}/{time} with chained String.replace, so each later
-        // replace re-scanned the name it had just written in. A service named "Манікюр {date} о {time}"
-        // therefore rendered a SECOND, provider-positioned date/time line inside copy the guest reads
-        // as platform text — and the guest decline SMS is the ONLY channel a guest has (no account for
-        // email/push), so there is nothing to cross-check it against.
-        Booking booking = buildGuestBookingMockForDecline(null, "Манікюр {date} о {time}");
-        ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
-
-        service.notifyBookingStatusChanged(BookingVisit.single(booking));
-
-        verify(smsService).send(anyString(), textCaptor.capture());
-        String sms = textCaptor.getValue();
-        assertThat(sms)
-                .as("the literal braces from the DATA must survive as text, never be expanded. sms=%s", sms)
-                .contains("Манікюр {date} о {time}");
-        assertThat(countOccurrences(sms, "01.08.2026"))
-                .as("the real date appears exactly once, where the TEMPLATE puts it. sms=%s", sms)
-                .isEqualTo(1);
-        assertThat(countOccurrences(sms, "10:00"))
-                .as("the real time appears exactly once — a provider must not be able to fabricate a "
-                        + "second appointment time. sms=%s", sms)
-                .isEqualTo(1);
-    }
-
-    @Test
-    @DisplayName("Phase 25.7: the guest decline SMS truncates a long provider note to 120 characters")
-    void should_truncateNote_when_guestBookingDeclinedSmsNoteExceeds120Chars() {
-        Booking booking = buildGuestBookingMockForDecline("А".repeat(500));
-        ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
-
-        service.notifyBookingStatusChanged(BookingVisit.single(booking));
-
-        verify(smsService).send(anyString(), textCaptor.capture());
-        String noteSegment = textCaptor.getValue().substring(textCaptor.getValue().indexOf("Причина: "));
-        assertThat(noteSegment.length()).isLessThanOrEqualTo(120 + "Причина: ".length());
-        assertThat(noteSegment).endsWith("…");
-    }
-
-    @Test
-    @DisplayName("Phase 25.9: a null provider note produces a coherent guest decline SMS — no "
-            + "dangling \"Причина: \" label with nothing after it (the note is now optional for all roles)")
-    void should_omitReasonLine_when_guestBookingDeclinedWithNullProviderComment() {
+    @DisplayName("Phase 390: a saturated smsSendExecutor propagates out of the guest decline so the outbox "
+            + "drain re-queues the row instead of marking it SENT")
+    void should_propagateRejection_when_guestDeclineSmsExecutorSaturated() {
         Booking booking = buildGuestBookingMockForDecline(null);
-        ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
+        doThrow(new java.util.concurrent.RejectedExecutionException("saturated"))
+                .when(bookingSmsDispatcher).dispatchOrThrow(eq(KIND), eq(GUEST_PHONE), anyString());
 
-        service.notifyBookingStatusChanged(BookingVisit.single(booking));
+        assertThatThrownBy(() -> service.notifyBookingStatusChanged(BookingVisit.single(booking)))
+                .isInstanceOf(java.util.concurrent.RejectedExecutionException.class);
 
-        verify(smsService).send(eq("+380501234567"), textCaptor.capture());
-        String text = textCaptor.getValue();
-        assertThat(text)
-                .as("a null note must never leave a dangling reason label, found=%s", text)
-                .doesNotContain("Причина")
-                .contains("Тест послуга")
-                .contains("Тест Майстер")
-                .doesNotEndWith(" ")
-                .doesNotEndWith("\n");
+        verify(bookingSmsDispatcher, never()).dispatch(any(), any(), any());
     }
 
     @Test
-    @DisplayName("Phase 25.9: a blank (whitespace-only) provider note is treated the same as null — "
-            + "no dangling reason label")
-    void should_omitReasonLine_when_guestBookingDeclinedWithBlankProviderComment() {
-        Booking booking = buildGuestBookingMockForDecline("   ");
-        ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
+    @DisplayName("Phase 390: the guest decline SMS is the fixed copy + the master's rebook link — no "
+            + "provider note, service name or master name")
+    void should_renderFixedCopyWithoutProviderText_when_guestBookingDeclined() {
+        Booking booking = buildGuestBookingMockForDecline("Майстер захворів https://evil.example");
 
         service.notifyBookingStatusChanged(BookingVisit.single(booking));
 
-        verify(smsService).send(eq("+380501234567"), textCaptor.capture());
-        assertThat(textCaptor.getValue())
-                .as("a whitespace-only note must not produce a reason label")
-                .doesNotContain("Причина");
-    }
-
-    @Test
-    @DisplayName("SEC MEDIUM: the guest decline SMS strips a URL from the provider's note — "
-            + "a Beautica-branded SMS to a real OTP-verified phone must not carry a link")
-    void should_stripUrlFromGuestDeclineSms_whenProviderCommentContainsLink() {
-        Booking booking = buildGuestBookingMockForDecline(
-                "Master is sick, see https://evil.example.com/phish?x=1 for a refund and www.another-evil.test/y too");
-        ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
-
-        service.notifyBookingStatusChanged(BookingVisit.single(booking));
-
-        verify(smsService).send(anyString(), textCaptor.capture());
-        String text = textCaptor.getValue();
-        assertThat(text)
-                .as("no scheme-URL, www-host, or bare-domain-with-path may reach the SMS body, found=%s", text)
-                .doesNotContain("http")
-                .doesNotContain("www.")
-                .doesNotContain("evil.example.com")
-                .doesNotContain("another-evil.test");
-        assertThat(text)
-                .as("the non-URL parts of the provider's note must still reach the SMS")
-                .contains("Master is sick")
-                .contains("for a refund");
-    }
-
-    @Test
-    @DisplayName("SEC MEDIUM (residual): the guest decline SMS strips a BARE domain with no scheme "
-            + "and no path — iOS/Android auto-linkify word.tld even without http(s):// or a trailing path")
-    void should_stripBareDomainWithoutPath_whenProviderCommentContainsLookalikeDomain() {
-        Booking booking = buildGuestBookingMockForDecline("перевірте beautica-verify.com для деталей");
-        ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
-
-        service.notifyBookingStatusChanged(BookingVisit.single(booking));
-
-        verify(smsService).send(anyString(), textCaptor.capture());
-        String text = textCaptor.getValue();
-        assertThat(text)
-                .as("bare domain-with-no-path must not reach the SMS body, found=%s", text)
-                .doesNotContain("beautica-verify.com");
-        assertThat(text)
-                .as("the non-URL parts of the provider's note must still reach the SMS")
-                .contains("перевірте")
-                .contains("для деталей");
-    }
-
-    @Test
-    @DisplayName("SEC MEDIUM (residual): normal Ukrainian prose with a sentence-ending period followed "
-            + "by another word must survive the bare-domain strip UNCHANGED (false-positive guard)")
-    void should_leaveOrdinaryUkrainianProseUnchanged_whenNoteHasSentenceEndingPeriod() {
-        Booking booking = buildGuestBookingMockForDecline("Вибачте. Захворіла.");
-        ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
-
-        service.notifyBookingStatusChanged(BookingVisit.single(booking));
-
-        verify(smsService).send(anyString(), textCaptor.capture());
-        assertThat(textCaptor.getValue())
-                .as("ordinary Cyrillic prose must not be mistaken for a domain")
-                .contains("Вибачте. Захворіла.");
-    }
-
-    @Test
-    @DisplayName("SEC HIGH regression: a domain immediately followed by a sentence-ending period "
-            + "(no space before the period) must still be stripped — a URL is a common place for "
-            + "a Ukrainian sentence to end, and the prior possessive-quantifier regex failed to "
-            + "backtrack far enough to match the TLD in exactly this shape")
-    void should_stripDomainFollowedByTrailingPeriod_whenNoteEndsMidSentence() {
-        Booking booking = buildGuestBookingMockForDecline("Уточнення тут: beautica-verify.com. Дякуємо.");
-        ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
-
-        service.notifyBookingStatusChanged(BookingVisit.single(booking));
-
-        verify(smsService).send(anyString(), textCaptor.capture());
-        String text = textCaptor.getValue();
-        assertThat(text)
-                .as("a domain immediately followed by a trailing period must still be stripped, found=%s", text)
-                .doesNotContain("beautica-verify.com");
-        assertThat(text)
-                .contains("Уточнення тут:")
-                .contains("Дякуємо.");
-    }
-
-    @Test
-    @DisplayName("SEC MEDIUM regression: non-allowlisted, cheaply-registerable TLDs (.xyz/.top/.click) "
-            + "are stripped exactly like .com — the token-neutralization approach has no TLD list to "
-            + "bypass in the first place")
-    void should_stripNonAllowlistedTld_whenProviderNoteContainsCheapPhishingDomain() {
-        Booking booking = buildGuestBookingMockForDecline(
-                "see evil-phish.xyz or evil-phish.top or evil-phish.click for details");
-        ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
-
-        service.notifyBookingStatusChanged(BookingVisit.single(booking));
-
-        verify(smsService).send(anyString(), textCaptor.capture());
-        String text = textCaptor.getValue();
-        assertThat(text)
-                .as("non-allowlisted TLDs must be stripped exactly like .com, found=%s", text)
-                .doesNotContain("evil-phish.xyz")
-                .doesNotContain("evil-phish.top")
-                .doesNotContain("evil-phish.click");
-        assertThat(text).contains("for details");
-    }
-
-    @Test
-    @DisplayName("every plausible URL shape (scheme, www-host, bare domain+path, domain:port, "
-            + "uppercase domain, multi-label subdomain, obfuscated scheme) is stripped")
-    void should_stripEveryPlausibleUrlShape_whenProviderNoteContainsThem() {
-        Booking booking = buildGuestBookingMockForDecline(
-                "http://evil.com/x https://evil.com www.evil.com evil.com/path evil.com:8080 "
-                        + "EVIL.COM sub.evil.co.uk hxxp://evil.com/path see you soon");
-        ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
-
-        service.notifyBookingStatusChanged(BookingVisit.single(booking));
-
-        verify(smsService).send(anyString(), textCaptor.capture());
-        String text = textCaptor.getValue();
-        assertThat(text)
-                .as("no URL-shaped token in any form may reach the SMS body, found=%s", text)
-                .doesNotContainIgnoringCase("evil.com")
-                .doesNotContainIgnoringCase("sub.evil.co.uk")
-                .doesNotContain("http")
-                .doesNotContain("www.")
-                .doesNotContain("hxxp");
-        assertThat(text).contains("see you soon");
-    }
-
-    @Test
-    @DisplayName("LOW regression: an email-shaped token (e.g. an @-address) is dropped WHOLE — not "
-            + "just the domain half, avoiding a dangling '@' fragment in the SMS for a provider who "
-            + "put legitimate contact info in their note")
-    void should_dropEmailShapedTokenWhole_whenProviderNoteContainsAtSign() {
-        Booking booking = buildGuestBookingMockForDecline("contact x@evil.com for a refund please");
-        ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
-
-        service.notifyBookingStatusChanged(BookingVisit.single(booking));
-
-        verify(smsService).send(anyString(), textCaptor.capture());
-        String text = textCaptor.getValue();
-        assertThat(text)
-                .as("the @-token must be dropped whole, no dangling '@' or partial fragment, found=%s", text)
-                .doesNotContain("@")
-                .doesNotContain("evil.com");
-        assertThat(text).contains("contact").contains("for a refund please");
-    }
-
-    @Test
-    @DisplayName("LOW regression: a bare IPv4 literal (with or without a path) is stripped — Android "
-            + "Linkify auto-links a bare IP exactly like a hostname")
-    void should_stripBareIpv4Literal_whenProviderNoteContainsRawIpAddress() {
-        Booking booking = buildGuestBookingMockForDecline("visit 1.2.3.4/login or just 1.2.3.4 for info");
-        ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
-
-        service.notifyBookingStatusChanged(BookingVisit.single(booking));
-
-        verify(smsService).send(anyString(), textCaptor.capture());
-        String text = textCaptor.getValue();
-        assertThat(text)
-                .as("bare IPv4, with or without a path, must be stripped, found=%s", text)
-                .doesNotContain("1.2.3.4");
-        assertThat(text).contains("visit").contains("for info");
-    }
-
-    @Test
-    @DisplayName("false-positive guard: English short sentences ending in a period, each followed by "
-            + "another word, must survive unchanged (not mistaken for a domain)")
-    void should_leaveEnglishProseUnchanged_whenNoteHasShortSentencesEndingInPeriod() {
-        Booking booking = buildGuestBookingMockForDecline("Sorry. Ill today. Let's reschedule.");
-        ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
-
-        service.notifyBookingStatusChanged(BookingVisit.single(booking));
-
-        verify(smsService).send(anyString(), textCaptor.capture());
-        assertThat(textCaptor.getValue())
-                .as("ordinary English prose must not be mistaken for a domain")
-                .contains("Sorry. Ill today. Let's reschedule.");
-    }
-
-    @Test
-    @DisplayName("false-positive guard: a decimal/time value (digits, not letters, after the dot) "
-            + "must survive unchanged")
-    void should_leaveDecimalTimeUnchanged_whenNoteContainsDigitsAfterDot() {
-        Booking booking = buildGuestBookingMockForDecline("Прийду о 15.30");
-        ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
-
-        service.notifyBookingStatusChanged(BookingVisit.single(booking));
-
-        verify(smsService).send(anyString(), textCaptor.capture());
-        assertThat(textCaptor.getValue())
-                .as("a decimal/time value must not be mistaken for a domain (digits, not letters, follow the dot)")
-                .contains("Прийду о 15.30");
-    }
-
-    @Test
-    @DisplayName("false-positive guard: ordinary multi-sentence Ukrainian prose with normal "
-            + "punctuation survives entirely unchanged")
-    void should_leaveOrdinaryMultiSentenceUkrainianProseUnchanged_whenNoteHasNoLinkShapedTokens() {
-        String note = "Доброго дня. Нажаль не зможу прийти сьогодні. Перенесемо запис на інший день, "
-                + "будь ласка. Дякую за розуміння.";
-        Booking booking = buildGuestBookingMockForDecline(note);
-        ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
-
-        service.notifyBookingStatusChanged(BookingVisit.single(booking));
-
-        verify(smsService).send(anyString(), textCaptor.capture());
-        assertThat(textCaptor.getValue())
-                .as("ordinary multi-sentence Ukrainian prose must reach the SMS byte-for-byte")
-                .contains(note);
-    }
-
-    @Test
-    @DisplayName("PERF INFO: stripping a 1000-char adversarial note (the DTO/DB length ceiling on "
-            + "provider_comment) completes in well under 50ms — regression guard against ever "
-            + "reintroducing a backtracking-regex ReDoS shape into this path")
-    void should_stripAdversarialNote_withinBoundedTime() {
-        String adversarial = "a.".repeat(500); // 1000 chars, no valid trailing TLD/structure anywhere
-        Booking booking = buildGuestBookingMockForDecline(adversarial);
-
-        assertTimeout(Duration.ofMillis(50), () -> service.notifyBookingStatusChanged(BookingVisit.single(booking)));
-
-        verify(smsService).send(anyString(), anyString());
-    }
-
-    @Test
-    @DisplayName("SEC MEDIUM: the URL strip is an SMS-rendering-path-only transform — the decline "
-            + "EMAIL path never reads (and therefore never mutates) the provider's note")
-    void should_notStripUrl_when_appBookingDeclinedEmailRendered() {
-        // Email/app rendering is NOT the smishing channel (booking-declined.html renders the note
-        // with Thymeleaf th:text — inert plain text, no clickable link) so the note must reach it
-        // unmodified. NotificationService proves this structurally: on the registered-client
-        // DECLINED path it hands the SAME Booking to EmailNotificationService and never touches
-        // getProviderComment() itself, so no transform of any kind — URL-strip included — can be
-        // applied on the way to the email. If someone ever moved stripUrlsForSms() out of
-        // buildGuestDeclineSms and onto a shared path, this test goes red.
-        UUID clientUserId = UUID.randomUUID();
-        Booking booking = buildBookingMock(UUID.randomUUID(), clientUserId, BookingStatus.DECLINED);
-
-        service.notifyBookingStatusChanged(BookingVisit.single(booking));
-
-        verify(emailService).sendBookingDeclinedEmail(anyString(), eq(booking));
+        assertThat(dispatchedText())
+                .isEqualTo(BODY_0108 + " Записатися знову: beautica.app/book/test-master")
+                .doesNotContain("Майстер захворів")
+                .doesNotContain("evil")
+                .doesNotContain("Тест послуга")
+                .doesNotContain("Тест Майстер");
         verify(booking, never()).getProviderComment();
     }
 
     @Test
-    @DisplayName("LOW: truncating a long guest decline note never splits a surrogate pair at the cut boundary")
-    void should_truncateForSms_withoutSplittingSurrogatePair() {
-        // 118 filler chars (indices 0..117) + a 2-char emoji surrogate pair at indices 118-119
-        // (exactly straddling the pre-fix cut point: SMS_COMMENT_MAX_LENGTH - 1 = 119) + more
-        // filler so the total length exceeds 120 and truncation actually triggers.
-        String prefix = "a".repeat(118);
-        String emoji = "😀"; // 😀 — a real UTF-16 surrogate pair
-        String longComment = prefix + emoji + "bcdef";
-        Booking booking = buildGuestBookingMockForDecline(longComment);
-        ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
+    @DisplayName("Phase 390: a provider-chosen service name can no longer reach the guest SMS at all")
+    void should_notRenderServiceName_when_serviceNameCarriesAPlaceholder() {
+        Booking booking = buildGuestBookingMockForDecline(null, "Манікюр {date} о {time}");
 
         service.notifyBookingStatusChanged(BookingVisit.single(booking));
 
-        verify(smsService).send(anyString(), textCaptor.capture());
-        String noteSegment = textCaptor.getValue().substring(textCaptor.getValue().indexOf("Причина: ") + "Причина: ".length());
-        assertThat(noteSegment)
-                .as("the emoji must be dropped whole (not split) — the high surrogate at index 118 "
-                        + "must never survive as an unpaired trailing code unit")
-                .isEqualTo(prefix + "…");
-        assertThat(Character.isHighSurrogate(noteSegment.charAt(noteSegment.length() - 2)))
-                .as("no unpaired high surrogate immediately before the ellipsis")
-                .isFalse();
+        String sms = dispatchedText();
+        assertThat(sms).doesNotContain("Манікюр");
+        assertThat(countOccurrences(sms, "01.08.2026")).isEqualTo(1);
+        assertThat(countOccurrences(sms, "10:00")).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("Phase 390: a WHOLE-VISIT decline queues ONE SMS naming the visit start")
+    void should_dispatchOneSmsAtVisitStart_when_wholeGuestVisitDeclined() {
+        Booking lead = buildGuestBookingMockForDecline(null);
+        BookingVisit visit = wholeVisitDecline(lead, 3);
+
+        service.notifyBookingStatusChanged(visit);
+
+        // visitOf re-stubs the lead to 2026-06-15T10:00Z = 13:00 Kyiv (EEST).
+        assertThat(dispatchedText()).startsWith("Beautica: Ваш запис 15.06.2026 о 13:00 скасовано.");
+        verifyNoMoreInteractions(bookingSmsDispatcher);
+    }
+
+    @Test
+    @DisplayName("Phase 390: a PER-ITEM decline names that line's own start, not the visit start")
+    void should_nameDeclinedLineStart_when_oneGuestVisitItemDeclined() {
+        Booking declined = buildGuestBookingMockForDecline(null);
+        Booking earlierSibling = mock(Booking.class);
+        lenient().when(earlierSibling.getId()).thenReturn(UUID.randomUUID());
+        lenient().when(earlierSibling.getStartsAt()).thenReturn(OffsetDateTime.parse("2026-08-01T09:00:00+03:00"));
+        BookingVisit perItem = BookingVisit.of(declined, List.of(earlierSibling, declined));
+
+        service.notifyBookingStatusChanged(perItem);
+
+        assertThat(dispatchedText()).startsWith(BODY_0108);
     }
 
     /**
      * Phase 22.1 (security MEDIUM): the guest-SMS branch must key on {@code BookingSource.LINK},
-     * not on {@code client == null}.
-     *
-     * <p>A LINK guest owns their phone — the number is proven by the OTP they answered before the
-     * booking existed. A STAFF walk-in's phone is <em>typed in by a salon employee</em> about a
-     * third party and is verified by nothing. Both shapes have a null client, so a
-     * {@code client == null} guard treats them identically and turns every staff-entered digit
-     * string into an SMS destination the platform will send to on a provider's say-so: a typo
-     * texts a stranger, and a deliberately-entered number makes the platform an on-demand SMS
-     * relay addressed to anyone, with no consent step anywhere in the flow.
-     *
-     * <p>This is the narrowest possible statement of the fix — a STAFF decline sends nothing at
-     * all — and it is deliberately asserted with {@code verifyNoInteractions} rather than
-     * {@code never().send(...)}, so a future "just a short courtesy SMS" addition cannot slip
-     * past by using a different {@code SmsService} method.
+     * not on {@code client == null}. A STAFF walk-in's phone is typed in by a salon employee about a
+     * third party and verified by nothing, so it is never an SMS destination.
      */
     @Test
     @DisplayName("a declined STAFF walk-in booking sends NO SMS — the phone was typed by staff, "
@@ -542,23 +253,19 @@ class NotificationServiceTest {
 
         service.notifyBookingStatusChanged(BookingVisit.single(booking));
 
-        verifyNoInteractions(smsService);
+        verifyNoInteractions(bookingSmsDispatcher);
         verify(emailService, never()).sendBookingDeclinedEmail(anyString(), any());
     }
 
-    /**
-     * The positive half of the pair: the LINK path this gate must NOT break. Together these two
-     * pin the gate as "SMS iff LINK" — either one alone is satisfied by a gate that is simply
-     * always-off or always-on.
-     */
     @Test
-    @DisplayName("a declined LINK guest booking still sends its SMS once the source gate is in place")
-    void should_stillSendDeclineSms_when_linkGuestBookingDeclined() {
-        Booking booking = buildGuestBookingMockForDecline("Майстер захворів");
+    @DisplayName("a declined LINK guest with no guestPhone queues nothing and does not throw")
+    void should_skipSms_when_guestPhoneBlank() {
+        Booking booking = buildGuestBookingMockForDecline(null);
+        when(booking.getGuestPhone()).thenReturn("  ");
 
         service.notifyBookingStatusChanged(BookingVisit.single(booking));
 
-        verify(smsService).send(eq("+380501234567"), anyString());
+        verifyNoInteractions(bookingSmsDispatcher);
     }
 
     @Test
@@ -569,13 +276,25 @@ class NotificationServiceTest {
 
         service.notifyBookingStatusChanged(BookingVisit.single(booking));
 
-        verify(smsService, never()).send(anyString(), anyString());
+        verifyNoInteractions(bookingSmsDispatcher);
     }
 
     @Test
-    @DisplayName("Phase 25.7: a guest booking CONFIRMED/COMPLETED/NOT_COMPLETED status stays a clean "
-            + "no-op — no SMS, no email, no push, no NPE (regression guard for the track 24.x "
-            + "guest null-deref fixes this branch sits next to)")
+    @DisplayName("the decline EMAIL path never reads the provider's note itself — the email service "
+            + "receives the booking untouched")
+    void should_notReadProviderComment_when_appBookingDeclinedEmailRendered() {
+        UUID clientUserId = UUID.randomUUID();
+        Booking booking = buildBookingMock(UUID.randomUUID(), clientUserId, BookingStatus.DECLINED);
+
+        service.notifyBookingStatusChanged(BookingVisit.single(booking));
+
+        verify(emailService).sendBookingDeclinedEmail(anyString(), eq(booking));
+        verify(booking, never()).getProviderComment();
+    }
+
+    @Test
+    @DisplayName("a guest booking CONFIRMED/COMPLETED/NOT_COMPLETED status stays a clean no-op — no "
+            + "SMS, no email (NOT_COMPLETED is not a provider cancellation)")
     void should_noOp_when_guestBookingStatusIsNotDeclined() {
         for (BookingStatus status : new BookingStatus[] {
                 BookingStatus.CONFIRMED, BookingStatus.COMPLETED, BookingStatus.NOT_COMPLETED
@@ -585,7 +304,7 @@ class NotificationServiceTest {
 
             service.notifyBookingStatusChanged(BookingVisit.single(booking));
 
-            verify(smsService, never()).send(anyString(), anyString());
+            verifyNoInteractions(bookingSmsDispatcher);
             verify(emailService, never()).sendBookingDeclinedEmail(anyString(), any());
             verify(emailService, never()).sendBookingConfirmedEmail(anyString(), any());
         }
@@ -704,7 +423,7 @@ class NotificationServiceTest {
         assertThat(urlCaptor.getValue()).startsWith("https://");
         // Never routed to the client-facing review email.
         verify(emailService, never()).sendReviewRequestEmail(anyString(), any(), anyString());
-        verifyNoMoreInteractions(smsService);
+        verifyNoInteractions(bookingSmsDispatcher);
     }
 
     @Test
@@ -735,20 +454,19 @@ class NotificationServiceTest {
         service.notifySalonClosed(visit);
 
         verify(emailService).sendSalonClosedEmail(eq("client@example.com"), eq(visit));
-        verifyNoInteractions(smsService);
+        verifyNoInteractions(bookingSmsDispatcher);
     }
 
     @Test
-    @DisplayName("notifySalonClosed sends SMS to the OTP-verified guestPhone for a LINK guest visit, "
-            + "and never touches the email/push channels a guest has no account for")
-    void should_sendSms_when_notifySalonClosedForGuestVisit() {
+    @DisplayName("Phase 390: notifySalonClosed queues the fixed provider-cancellation SMS (no rebook "
+            + "link — the salon is gone) and never touches email for a LINK guest visit")
+    void should_dispatchBodyOnlySms_when_notifySalonClosedForGuestVisit() {
         Booking booking = buildGuestBookingMockForSalonClosed(
                 "Тест послуга", OffsetDateTime.parse("2026-08-01T10:00:00+03:00"));
-        BookingVisit visit = BookingVisit.single(booking);
 
-        service.notifySalonClosed(visit);
+        service.notifySalonClosed(BookingVisit.single(booking));
 
-        verify(smsService).send(eq("+380501234567"), anyString());
+        assertThat(dispatchedText()).isEqualTo(BODY_0108);
         verifyNoInteractions(emailService);
     }
 
@@ -761,54 +479,35 @@ class NotificationServiceTest {
 
         service.notifySalonClosed(visit);
 
-        verifyNoInteractions(smsService);
+        verifyNoInteractions(bookingSmsDispatcher);
         verifyNoInteractions(emailService);
     }
 
     @Test
-    @DisplayName("notifySalonClosed's guest SMS names EVERY declined service of a multi-service visit")
-    void should_nameSmsForWholeVisit_when_notifySalonClosedForMultiServiceGuestVisit() {
+    @DisplayName("Phase 390: a multi-service guest visit closed by the salon gets ONE SMS at the visit "
+            + "start and no service names")
+    void should_dispatchOneSmsAtVisitStart_when_notifySalonClosedForMultiServiceGuestVisit() {
         Booking lead = buildGuestBookingMockForSalonClosed(
                 "Тест послуга", OffsetDateTime.parse("2026-08-01T10:00:00+03:00"));
         BookingVisit visit = visitOf(lead, 3);
-        ArgumentCaptor<String> smsCaptor = ArgumentCaptor.forClass(String.class);
 
         service.notifySalonClosed(visit);
 
-        verify(smsService).send(eq("+380501234567"), smsCaptor.capture());
-        assertThat(smsCaptor.getValue()).contains("3 послуги");
+        assertThat(dispatchedText()).isEqualTo("Beautica: Ваш запис 15.06.2026 о 13:00 скасовано.");
+        verifyNoMoreInteractions(bookingSmsDispatcher);
     }
 
     @Test
-    @DisplayName("notifySalonClosed swallows an SMS gateway failure (D11) — the salon deletion this "
-            + "notification is dispatched from a queue AFTER must never see this exception")
-    void should_swallowException_when_salonClosedSmsGatewayThrows() {
+    @DisplayName("the guest phone never appears in a NotificationService log line on the SMS path")
+    void should_notLogRawPhone_when_salonClosedSmsQueued() {
         Booking booking = buildGuestBookingMockForSalonClosed(
                 "Тест послуга", OffsetDateTime.parse("2026-08-01T10:00:00+03:00"));
-        doThrow(new RuntimeException("gateway down")).when(smsService).send(anyString(), anyString());
-
-        assertThatCode(() -> service.notifySalonClosed(BookingVisit.single(booking)))
-                .doesNotThrowAnyException();
-    }
-
-    @Test
-    @DisplayName("notifySalonClosed — QA-authored (Phase 293 audit, case 16): the raw OTP-verified "
-            + "guest_phone is never logged when the SMS gateway throws — only the exception's class "
-            + "name reaches the log line (Anti-Bug §I / PhoneMask discipline; log-capture pattern "
-            + "mirrored from TurbosmsServiceTest, which pins the SAME discipline at the actual "
-            + "gateway boundary — this test pins it at NotificationService's own catch block, one "
-            + "layer up, which has no PhoneMask call at all today because it never references the "
-            + "phone variable in its log message; a future edit that adds it back must trip this)")
-    void should_notLogRawPhone_when_salonClosedSmsFails() {
-        Booking booking = buildGuestBookingMockForSalonClosed(
-                "Тест послуга", OffsetDateTime.parse("2026-08-01T10:00:00+03:00"));
-        doThrow(new RuntimeException("gateway down")).when(smsService).send(anyString(), anyString());
 
         Logger serviceLogger = (Logger) LoggerFactory.getLogger(NotificationService.class);
         ListAppender<ILoggingEvent> logAppender = new ListAppender<>();
         logAppender.start();
         serviceLogger.addAppender(logAppender);
-        serviceLogger.setLevel(Level.WARN);
+        serviceLogger.setLevel(Level.DEBUG);
         try {
             service.notifySalonClosed(BookingVisit.single(booking));
         } finally {
@@ -820,8 +519,8 @@ class NotificationServiceTest {
             allLogs.append(event.getFormattedMessage()).append('\n');
         }
         assertThat(allLogs.toString())
-                .as("guest_phone must never appear in a log line emitted on SMS failure")
-                .doesNotContain("+380501234567");
+                .doesNotContain(GUEST_PHONE)
+                .doesNotContain("скасовано");
     }
 
     // -------------------------------------------------------------------------
@@ -839,60 +538,43 @@ class NotificationServiceTest {
         service.notifyMasterRemoved(visit);
 
         verify(emailService).sendMasterRemovedEmail(eq("client@example.com"), eq(visit));
-        verifyNoInteractions(smsService);
+        verifyNoInteractions(bookingSmsDispatcher);
     }
 
     @Test
-    @DisplayName("notifyMasterRemoved sends SMS to the OTP-verified guestPhone for a LINK guest "
-            + "visit, and never touches the email/push channels a guest has no account for")
-    void should_sendSms_when_notifyMasterRemovedForGuestVisit() {
+    @DisplayName("Phase 390: notifyMasterRemoved queues the fixed SMS with the SALON's rebook link — "
+            + "never the removed master's own page — and never touches email")
+    void should_dispatchSalonRebookLink_when_notifyMasterRemovedForGuestVisit() {
         Booking booking = buildGuestBookingMockForSalonClosed(
                 "Тест послуга", OffsetDateTime.parse("2026-08-01T10:00:00+03:00"));
-        BookingVisit visit = BookingVisit.single(booking);
+        lenient().when(booking.getMaster()).thenReturn(
+                // INDEPENDENT_MASTER so the master link WOULD be eligible on a decline — proving the
+                // master-removal path ignores it by design, not by the salon-master type gate.
+                Master.builder().masterType(MasterType.INDEPENDENT_MASTER)
+                        .isActive(true).bookingSlug("test-master").build());
+        lenient().when(booking.getSalon()).thenReturn(
+                com.beautica.salon.entity.Salon.builder().isActive(true).bookingSlug("test-salon").build());
 
-        service.notifyMasterRemoved(visit);
+        service.notifyMasterRemoved(BookingVisit.single(booking));
 
-        verify(smsService).send(eq("+380501234567"), anyString());
+        assertThat(dispatchedText())
+                .isEqualTo(BODY_0108 + " Записатися знову: beautica.app/book/s/test-salon")
+                .doesNotContain("test-master")
+                .doesNotContain("Тест послуга");
         verifyNoInteractions(emailService);
     }
 
     @Test
-    @DisplayName("notifyMasterRemoved's guest SMS copy is rendered from BookingSmsProperties' own "
-            + "masterRemoved template — never the salonClosed one — and never claims the salon "
-            + "closed (QA-authored, Phase 298 audit: the pre-existing test above asserts only "
-            + "anyString(), which is satisfied even if buildMasterRemovedSms is mistakenly wired "
-            + "to smsProperties.getSms().getSalonClosed() and sends a FALSE 'your salon closed' "
-            + "SMS to a paying guest — falsified by mutating that one property getter, which left "
-            + "every other test in this class green)")
-    void should_renderMasterRemovedSmsTemplate_notSalonClosed_when_notifyMasterRemovedForGuestVisit() {
-        Booking booking = buildGuestBookingMockForSalonClosed(
-                "Тест послуга", OffsetDateTime.parse("2026-08-01T10:00:00+03:00"));
-        BookingVisit visit = BookingVisit.single(booking);
-        ArgumentCaptor<String> smsCaptor = ArgumentCaptor.forClass(String.class);
-
-        service.notifyMasterRemoved(visit);
-
-        verify(smsService).send(eq("+380501234567"), smsCaptor.capture());
-        assertThat(smsCaptor.getValue())
-                .as("must render the masterRemoved SMS template, naming the master leaving")
-                .contains("майстер більше не працює")
-                .contains("Тест послуга")
-                .doesNotContainIgnoringCase("салон закри");
-    }
-
-    @Test
-    @DisplayName("notifyMasterRemoved's guest SMS names EVERY declined service of a multi-service "
-            + "visit (D12), same convention as notifySalonClosed's identical pin")
-    void should_nameSmsForWholeVisit_when_notifyMasterRemovedForMultiServiceGuestVisit() {
+    @DisplayName("Phase 390: a multi-service guest visit whose master was removed gets ONE SMS")
+    void should_dispatchOneSms_when_notifyMasterRemovedForMultiServiceGuestVisit() {
         Booking lead = buildGuestBookingMockForSalonClosed(
                 "Тест послуга", OffsetDateTime.parse("2026-08-01T10:00:00+03:00"));
         BookingVisit visit = visitOf(lead, 3);
-        ArgumentCaptor<String> smsCaptor = ArgumentCaptor.forClass(String.class);
 
         service.notifyMasterRemoved(visit);
 
-        verify(smsService).send(eq("+380501234567"), smsCaptor.capture());
-        assertThat(smsCaptor.getValue()).contains("3 послуги");
+        assertThat(dispatchedText()).isEqualTo("Beautica: Ваш запис 15.06.2026 о 13:00 скасовано.");
+        verifyNoMoreInteractions(bookingSmsDispatcher);
     }
 
     @Test
@@ -904,7 +586,7 @@ class NotificationServiceTest {
 
         service.notifyMasterRemoved(visit);
 
-        verifyNoInteractions(smsService);
+        verifyNoInteractions(bookingSmsDispatcher);
         verifyNoInteractions(emailService);
     }
 
@@ -918,19 +600,6 @@ class NotificationServiceTest {
         service.notifyMasterRemoved(visit);
 
         verify(emailService).sendMasterRemovedEmail(anyString(), eq(visit));
-    }
-
-    @Test
-    @DisplayName("notifyMasterRemoved swallows an SMS gateway failure (D11 posture, carried over "
-            + "from notifySalonClosed) — the master-removal cascade this is dispatched from a queue "
-            + "AFTER must never see this exception")
-    void should_swallowException_when_masterRemovedSmsGatewayThrows() {
-        Booking booking = buildGuestBookingMockForSalonClosed(
-                "Тест послуга", OffsetDateTime.parse("2026-08-01T10:00:00+03:00"));
-        doThrow(new RuntimeException("gateway down")).when(smsService).send(anyString(), anyString());
-
-        assertThatCode(() -> service.notifyMasterRemoved(BookingVisit.single(booking)))
-                .doesNotThrowAnyException();
     }
 
     // -------------------------------------------------------------------------
@@ -1151,17 +820,16 @@ class NotificationServiceTest {
         // LINK case keeps describing a genuine LINK booking rather than "some null-client row".
         lenient().when(booking.getBookingSource()).thenReturn(BookingSource.LINK);
         when(booking.getStatus()).thenReturn(BookingStatus.DECLINED);
-        when(booking.getGuestPhone()).thenReturn("+380501234567");
-        when(booking.getStartsAt()).thenReturn(OffsetDateTime.parse("2026-08-01T10:00:00+03:00"));
-        when(booking.getProviderComment()).thenReturn(providerComment);
+        lenient().when(booking.getGuestPhone()).thenReturn("+380501234567");
+        lenient().when(booking.getStartsAt()).thenReturn(OffsetDateTime.parse("2026-08-01T10:00:00+03:00"));
+        lenient().when(booking.getProviderComment()).thenReturn(providerComment);
 
         User masterUser = mock(User.class);
         lenient().when(masterUser.getFirstName()).thenReturn("Тест");
         lenient().when(masterUser.getLastName()).thenReturn("Майстер");
-        // A REAL Master, not a mock (phase 294): the notification paths read the provider name
-        // through Master#displayFirstName()/#displayLastName(), whose attached-vs-detached branch
-        // only executes on a real instance.
-        Master master = Master.builder().user(masterUser).build();
+        // A REAL Master, not a mock: phase 390 reads its isActive flag and booking slug.
+        Master master = Master.builder().user(masterUser).masterType(MasterType.INDEPENDENT_MASTER)
+                .isActive(true).bookingSlug("test-master").build();
         lenient().when(booking.getMaster()).thenReturn(master);
 
         ServiceDefinition sd = mock(ServiceDefinition.class);
@@ -1236,6 +904,134 @@ class NotificationServiceTest {
         lenient().when(msa.getServiceDefinition()).thenReturn(sd);
         lenient().when(booking.getMasterService()).thenReturn(msa);
 
+        return booking;
+    }
+
+    /** The one text queued for the guest — fails if anything other than exactly one dispatch happened. */
+    private String dispatchedText() {
+        ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
+        verify(bookingSmsDispatcher).dispatchOrThrow(eq(KIND), eq(GUEST_PHONE), textCaptor.capture());
+        return textCaptor.getValue();
+    }
+
+    // -------------------------------------------------------------------------
+    // routesToLinkGuestSms — parity with the three LINK-guest SMS branches (phase 390, perf LOW-1)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Every source × client × status × phone shape, for each of the three SMS-capable event types. Every
+     * {@link BookingStatus} (not just DECLINED/CONFIRMED): a future widening of the STATUS_CHANGED guest
+     * branch to a second status must break this parity row, not slip past it.
+     */
+    static Stream<Arguments> smsRouteMatrix() {
+        List<Arguments> rows = new ArrayList<>();
+        for (OutboxEventType type : List.of(
+                OutboxEventType.STATUS_CHANGED,
+                OutboxEventType.SALON_CLOSED,
+                OutboxEventType.MASTER_REMOVED)) {
+            for (BookingSource source : BookingSource.values()) {
+                for (boolean hasClient : new boolean[] {false, true}) {
+                    for (BookingStatus status : BookingStatus.values()) {
+                        for (String phone : java.util.Arrays.asList(GUEST_PHONE, " ", null)) {
+                            rows.add(Arguments.of(
+                                    type, source, hasClient, status, phone));
+                        }
+                    }
+                }
+            }
+        }
+        return rows.stream();
+    }
+
+    @ParameterizedTest(name = "{0} source={1} client={2} status={3} phone=[{4}]")
+    @MethodSource("smsRouteMatrix")
+    @DisplayName("routesToLinkGuestSms is true exactly when dispatching that row hands an SMS to dispatchOrThrow")
+    void should_matchActualSmsDispatch_when_routesToLinkGuestSmsAsked(
+            OutboxEventType type, BookingSource source, boolean hasClient,
+            BookingStatus status, String phone) {
+        User client = mock(User.class);
+        lenient().when(client.getEmail()).thenReturn("client@example.com");
+        Booking booking = lenientRouteBooking(source, hasClient ? client : null, status, phone);
+        BookingVisit visit = BookingVisit.single(booking);
+
+        boolean predicted = service.routesToLinkGuestSms(type, booking);
+        switch (type) {
+            case STATUS_CHANGED -> service.notifyBookingStatusChanged(visit);
+            case SALON_CLOSED -> service.notifySalonClosed(visit);
+            case MASTER_REMOVED -> service.notifyMasterRemoved(visit);
+            default -> throw new IllegalArgumentException(type.name());
+        }
+
+        verify(bookingSmsDispatcher, org.mockito.Mockito.times(predicted ? 1 : 0))
+                .dispatchOrThrow(any(), any(), any());
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = OutboxEventType.class,
+            names = {"STATUS_CHANGED", "SALON_CLOSED", "MASTER_REMOVED"},
+            mode = EnumSource.Mode.EXCLUDE)
+    @DisplayName("routesToLinkGuestSms is false for every event type that never sends a guest SMS, even on a "
+            + "declined LINK guest booking")
+    void should_returnFalse_when_eventTypeHasNoGuestSmsBranch(OutboxEventType type) {
+        Booking booking = lenientRouteBooking(BookingSource.LINK, null, BookingStatus.DECLINED, GUEST_PHONE);
+
+        boolean routed = service.routesToLinkGuestSms(type, booking);
+
+        assertThat(routed).isFalse();
+    }
+
+    /**
+     * Phase 390 QA (perf INFO-2): the other half of the parity claim. {@code routesToLinkGuestSms} is
+     * false for every non-SMS event type (above) — this proves the matching notify path, exactly as
+     * {@code NotificationOutboxDrainWorker#dispatch} routes that type, really never hands an SMS to the
+     * dispatcher, on the most SMS-shaped booking there is (declined LINK guest with a phone). Without it
+     * a future SMS branch on, say, CLIENT_CANCELLED would be sent from the drain while the predicate
+     * still says "not an SMS row", and the backpressure deferral would silently skip it.
+     * INAPP_PUSH is excluded: the drain hands it to {@code InAppPushDispatcher}, never to this class.
+     */
+    @ParameterizedTest(name = "{0}")
+    @EnumSource(value = OutboxEventType.class,
+            names = {"STATUS_CHANGED", "SALON_CLOSED", "MASTER_REMOVED", "INAPP_PUSH"},
+            mode = EnumSource.Mode.EXCLUDE)
+    @DisplayName("every non-SMS event type's notify path never reaches the SMS dispatcher, even for a declined "
+            + "LINK guest booking with a phone")
+    void should_neverCallSmsDispatcher_when_nonSmsEventTypeNotifyPathRuns(
+            OutboxEventType type) {
+        Booking booking = lenientRouteBooking(BookingSource.LINK, null, BookingStatus.DECLINED, GUEST_PHONE);
+        User masterUser = mock(User.class);
+        lenient().when(masterUser.getEmail()).thenReturn("master@example.com");
+        lenient().when(booking.getMaster()).thenReturn(Master.builder().user(masterUser).build());
+
+        switch (type) {
+            case NEW_BOOKING -> service.notifyNewBooking(BookingVisit.single(booking));
+            case CLIENT_CANCELLED -> service.notifyClientCancelled(booking);
+            case BOOKING_RESCHEDULED -> {
+                service.notifyBookingRescheduled(booking);
+                service.notifyBookingRescheduledClient(booking);
+            }
+            case REVIEW_REQUESTED -> service.notifyReviewRequested(booking);
+            case CLOSURE_REMINDER -> service.notifyClosureReminder(booking);
+            case INVITE -> service.sendInviteEmail("invitee@example.com", "https://app.beautica.ua/i", "Salon");
+            default -> throw new IllegalArgumentException("unmapped event type " + type.name());
+        }
+
+        assertThat(service.routesToLinkGuestSms(type, booking)).isFalse();
+        verifyNoInteractions(bookingSmsDispatcher);
+    }
+
+    /**
+     * All-lenient booking for the route-parity rows: each row reads a different subset of these
+     * (the predicate short-circuits, the notify paths branch), so strict stubs would fail on the rows
+     * that legitimately skip one. No master/salon — the SMS text then simply carries no rebook link.
+     */
+    private static Booking lenientRouteBooking(BookingSource source, User client, BookingStatus status, String phone) {
+        Booking booking = mock(Booking.class);
+        lenient().when(booking.getId()).thenReturn(UUID.randomUUID());
+        lenient().when(booking.getBookingSource()).thenReturn(source);
+        lenient().when(booking.getClient()).thenReturn(client);
+        lenient().when(booking.getStatus()).thenReturn(status);
+        lenient().when(booking.getGuestPhone()).thenReturn(phone);
+        lenient().when(booking.getStartsAt()).thenReturn(OffsetDateTime.parse("2026-08-01T10:00:00+03:00"));
         return booking;
     }
 

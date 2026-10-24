@@ -2,6 +2,7 @@ package com.beautica.auth.phoneotp;
 
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ServiceUnavailableMessages;
+import com.beautica.config.DeploymentProperties;
 import com.beautica.notification.sms.OtpSmsSender;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -60,13 +61,17 @@ public class PhoneOtpService {
     private final SecureRandom secureRandom;
     private final Clock clock;
     private final TransactionTemplate requiresNewTx;
+    /** Phase 389 — SMS template with the {@code beautica.sms.otp-domain} suffix pre-built (host validated once). */
+    private final OtpSmsText otpSmsText;
 
     public PhoneOtpService(PhoneOtpRepository phoneOtpRepository,
                            PhoneOtpAttemptRecorder attemptRecorder,
                            GuestTokenProvider guestTokenProvider,
                            OtpSmsSender otpSmsSender,
                            Clock clock,
-                           PlatformTransactionManager transactionManager) {
+                           PlatformTransactionManager transactionManager,
+                           DeploymentProperties deploymentProperties) {
+        this.otpSmsText = OtpSmsText.forDomain(deploymentProperties.sms().otpDomainHost());
         this.phoneOtpRepository = phoneOtpRepository;
         this.attemptRecorder = attemptRecorder;
         this.guestTokenProvider = guestTokenProvider;
@@ -152,13 +157,16 @@ public class PhoneOtpService {
      * would test codes against that undelivered row instead of the older delivered one — an
      * availability blip bounded by the TTL, never a security hole.
      *
+     * <p>The text is {@link OtpSmsText} (Phase 389: fixed template, origin-bound last line when
+     * {@code beautica.sms.otp-domain} is set) and is never logged.
+     *
      * <p>Only the exception CLASS is logged, never the message (may echo the provider URL), never
      * the code and never the unmasked phone (Anti-Bug §I). The 503 body is generic for the same
      * reason.
      */
     private void dispatchCode(String phone, String code, Long otpId) {
         try {
-            otpSmsSender.send(phone, "Beautica: " + code + " — код підтвердження");
+            otpSmsSender.send(phone, otpSmsText.render(code));
         } catch (RuntimeException e) {
             log.warn("OTP send failed for {}: {}", maskPhone(phone), e.getClass().getSimpleName());
             burnUndeliveredRowQuietly(otpId);

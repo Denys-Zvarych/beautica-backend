@@ -108,7 +108,7 @@ public class BookingSmsProperties {
          *
          * <p>Kept separate from {@link #confirmation} rather than reusing it with an empty
          * {@code cancelUrl}: that would leave a dangling «Скасувати: » label with nothing after it,
-         * the exact defect {@link #declineReason} exists to avoid on the decline path.
+         * the dangling-label defect the old decline-reason split existed to avoid.
          *
          * <h4>This literal is the SINGLE source of the copy (QA MEDIUM, 2026-08-18)</h4>
          * It shipped duplicated: an identical block scalar at {@code app.booking.sms.
@@ -178,90 +178,9 @@ public class BookingSmsProperties {
             this.cancellation = cancellation;
         }
 
-        /**
-         * Provider-decline template for a GUEST (LINK) booking (Phase 25.7). A guest has no
-         * account for email/push (V89 {@code chk_bookings_guest_fields}), so this SMS is the
-         * ONLY channel that tells them their booking was declined. Placeholders:
-         * {@code {serviceName}}, {@code {masterName}}, {@code {date}}, {@code {time}}. Does NOT
-         * carry the reason clause — see {@link #declineReason} — the provider's note is optional
-         * (Phase 25.9) and this base template must stand alone, coherently, without it.
-         */
-        private String decline =
-                "Beautica: На жаль, ваш запис скасовано.\n"
-                        + "{serviceName} у {masterName}\n"
-                        + "{date} о {time}";
-
-        /**
-         * Reason clause APPENDED to {@link #decline} only when the provider actually left a note
-         * (Phase 25.9 — {@code comment} became optional on {@code /decline}/{@code /not-complete},
-         * reversing Phase 25.2's "required" decision from earlier the same day). Kept as its own
-         * template, not baked into {@link #decline}, so a null/blank note never leaves a dangling
-         * "Причина: " label with nothing after it — {@code NotificationService} only substitutes
-         * and appends this fragment when a non-blank, truncated comment exists. Placeholder:
-         * {@code {comment}} — the provider's decline note, truncated to ~120 chars by
-         * {@code NotificationService} before substitution (Cyrillic SMS segments are ~70 chars;
-         * 120 chars keeps this to two segments).
-         */
-        private String declineReason = "\n\nПричина: {comment}";
-
-        public String getDecline() {
-            return decline;
-        }
-
-        public void setDecline(String decline) {
-            this.decline = decline;
-        }
-
-        public String getDeclineReason() {
-            return declineReason;
-        }
-
-        public void setDeclineReason(String declineReason) {
-            this.declineReason = declineReason;
-        }
-
-        /**
-         * Salon-closure template for a GUEST (LINK) visit (Phase 269/293). Like {@link #decline},
-         * this is the ONLY channel that reaches a guest — they have no account for email/push.
-         * Placeholders: {@code {subject}} (the service name for a single-service visit, or the
-         * «N послуг(и)» numeral phrase for a multi-service one — resolved in Java by
-         * {@code NotificationService#bookedSubject}, never here), {@code {date}}, {@code {time}}.
-         * Carries no reason clause and no client name — the SALON closed, there is no provider
-         * note to attach (D10: {@code BookingVisit} exposes no note accessor at all).
-         */
-        private String salonClosed =
-                "Beautica: На жаль, салон закрився і більше не приймає записи.\n"
-                        + "Ваше бронювання на {subject}\n"
-                        + "{date} о {time} скасовано.";
-
-        public String getSalonClosed() {
-            return salonClosed;
-        }
-
-        public void setSalonClosed(String salonClosed) {
-            this.salonClosed = salonClosed;
-        }
-
-        /**
-         * Master-removal template for a GUEST (LINK) visit (Phase 298). Like {@link #salonClosed},
-         * this is the ONLY channel that reaches a guest — they have no account for email/push.
-         * Placeholders: {@code {subject}} (resolved in Java by {@code
-         * NotificationService#bookedSubject}, never here), {@code {date}}, {@code {time}}.
-         * Deliberately NOT a reuse of {@link #salonClosed}'s copy — the salon did not close, only
-         * the master left it. Carries no reason clause and no client name — there is no provider
-         * note to attach (D10: {@code BookingVisit} exposes no note accessor at all).
-         */
-        private String masterRemoved =
-                "Beautica: На жаль, майстер більше не працює в цьому салоні.\n"
-                        + "Ваше бронювання на {subject}\n"
-                        + "{date} о {time} скасовано.";
-
-        public String getMasterRemoved() {
-            return masterRemoved;
-        }
-
-        public void setMasterRemoved(String masterRemoved) {
-            this.masterRemoved = masterRemoved;
-        }
+        // Phase 390: the guest provider-cancellation SMS (decline, salon closure, master removal)
+        // is fixed copy in notification/service/GuestProviderCancellationSmsText, not a template
+        // here — it carries no provider text and its length is pinned by tests. The former
+        // decline / declineReason / salonClosed / masterRemoved templates were removed with it.
     }
 }

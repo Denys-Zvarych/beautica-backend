@@ -11,6 +11,8 @@ import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.jpa.repository.QueryHints;
 import org.springframework.data.repository.query.Param;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.util.Collection;
 import java.util.List;
@@ -672,4 +674,309 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
             @Param("offset") long offset,
             @Param(com.beautica.master.repository.MasterBookabilitySql.TODAY_PARAM) java.time.LocalDate today
     );
+
+    // ── Phase 376 — salon booking slug (beautica.app/book/s/{slug}) ─────────────────────────────
+
+    /** Generator uniqueness probe for salon slugs (separate namespace from masters, D2). */
+    boolean existsByBookingSlug(String bookingSlug);
+
+    /**
+     * Phase 392 — the miss-path probe of the salon-scoped guest routes: is {@code bookingSlug} the live slug of
+     * an ACTIVE salon? Lets {@code SalonGuestMasterResolver} tell "salon gone" (→ 410 / 404) apart from
+     * "salon live, master not in it" (→ 404) without hydrating the salon. Runs only after the master lookup
+     * missed.
+     */
+    boolean existsByBookingSlugAndIsActiveTrue(String bookingSlug);
+
+    /**
+     * Resolves a public salon slug to its ACTIVE salon's public-page columns (phase 377,
+     * {@code GET /book/s/{slug}/info}) in ONE statement — a projection, never the {@code Salon} entity
+     * (376 audit: the page needs seven columns, and the entity drags owner proxy + every column). An
+     * inactive salon's slug resolves to nothing, so its page 404s (D2). Backed by the unique partial
+     * index {@code idx_salons_booking_slug} (V200).
+     */
+    @Query("SELECT s.id AS id, s.name AS name, s.city AS city, s.avatarUrl AS avatarUrl, "
+            + "s.coverImageUrl AS coverImageUrl, s.avgRating AS avgRating, s.reviewCount AS reviewCount, "
+            + "s.region AS region, s.street AS street, s.buildingNo AS buildingNo, s.address AS address, "
+            + "s.updatedAt AS updatedAt, s.description AS description, s.locationNote AS locationNote "
+            + "FROM Salon s WHERE s.bookingSlug = :slug AND s.isActive = true")
+    Optional<SalonBookingPageRow> findBookingPageRowBySlug(@Param("slug") String slug);
+
+    /** Row of {@link #findBookingPageRowBySlug} — the public salon booking page's salon columns. */
+    interface SalonBookingPageRow {
+        UUID getId();
+
+        String getName();
+
+        String getCity();
+
+        String getAvatarUrl();
+
+        String getCoverImageUrl();
+
+        java.math.BigDecimal getAvgRating();
+
+        int getReviewCount();
+
+        String getRegion();
+
+        String getStreet();
+
+        String getBuildingNo();
+
+        /** Legacy free-text address; only used as the {@code street} fallback (phase 380 D7). */
+        String getAddress();
+
+        java.time.Instant getUpdatedAt();
+
+        /** Phase 384 — the "about" text, exactly as {@code PublicSalonResponse.description}. */
+        String getDescription();
+
+        /** Phase 384 — as {@code PublicSalonResponse.locationNote}. */
+        String getLocationNote();
+    }
+
+    /**
+     * Phase 384 — the id of the ACTIVE salon behind a public salon slug: the visibility rule of
+     * {@link #findBookingPageRowBySlug} as one scalar statement, for {@code GET /book/s/{slug}/reviews}, which
+     * needs the id only.
+     */
+    @Query("SELECT s.id AS id, s.reviewCount AS reviewCount FROM Salon s WHERE s.bookingSlug = :slug AND s.isActive = true")
+    Optional<com.beautica.common.ReviewTarget> findActiveReviewTargetByBookingSlug(@Param("slug") String slug);
+
+    /**
+     * Phase 376 audit — serialises every salon-slug WRITER on the candidate value: a transaction-scoped
+     * advisory lock per candidate ({@code pg_advisory_xact_lock}, seed {@value #BOOKING_SLUG_LOCK_SEED}),
+     * taken in sorted order (deadlock-free between batches) and released only at COMMIT/ROLLBACK. Both
+     * writers — {@code SalonService#createSalon} (one candidate, inside its own transaction) and the
+     * batched lazy issue {@code BookingSlugService#issueMissingSalonSlugs} — take it BEFORE the existence
+     * probe, so a probe that reports a candidate free stays true until the writer commits: two writers can
+     * never both pick the same slug, and the {@code idx_salons_booking_slug} INSERT/UPDATE cannot collide.
+     * The probe must be a SEPARATE statement issued after this one (READ COMMITTED: a statement's snapshot
+     * is taken at its start, so a probe folded into the lock statement would miss a row committed while
+     * waiting for the lock). Native: {@code pg_advisory_xact_lock} returns {@code void}, hence the count.
+     *
+     * <p><b>3s {@code lock_timeout}, fused into the same round trip</b> (376 audit cycle 2) — the
+     * target-list shape of {@code BookingRepository#acquireAdvisoryLockWithTimeout}: {@code set_config}
+     * sits BEFORE {@code pg_advisory_xact_lock} in the target list, so it is evaluated first (pinned by
+     * {@code AdvisoryLockFusionOrderIT}); both are volatile, so they run after the {@code ORDER BY}
+     * and the locks are still taken in sorted order. A wait beyond it fails with {@code 55P03} →
+     * {@code CannotAcquireLockException} → 409 via {@code GlobalExceptionHandler#handlePessimisticLockingFailure}.
+     *
+     * <p>{@code MANDATORY}: an advisory xact lock taken outside a transaction is released at once, so a
+     * caller without one would get no serialisation at all — fail loudly instead.
+     *
+     * <p><b>The 3s {@code lock_timeout} outlives this statement</b> (376 security audit, INFO — accepted):
+     * {@code set_config(..., true)} is transaction-local, so it stays in force for the REST of the caller's
+     * transaction. In {@code SalonService#createSalon} (via {@code BookingSlugService#generateSalonSlug})
+     * every later lock wait in that transaction is bounded to 3s too and fails fast with 409 instead of
+     * queueing. Accepted: the perf audit confirmed only already-held locks follow there, so no
+     * legitimate wait is cut short. Re-check this if a new lock is added after slug generation.
+     *
+     * <p>Array parameters (not collections): Hibernate expands a collection inside {@code ARRAY[...]} to a
+     * row constructor {@code (?,?)}, which Postgres cannot cast to an array.
+     *
+     * @return the number of locks taken (= distinct candidates)
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    @QueryHints(@QueryHint(name = HibernateHints.HINT_NATIVE_SPACES, value = "salons"))
+    @Query(value = "SELECT count(*) FROM (SELECT set_config('lock_timeout', '3s', true), "
+            + "pg_advisory_xact_lock(hashtextextended(c, " + BOOKING_SLUG_LOCK_SEED + ")) "
+            + "FROM unnest(CAST(:slugs AS text[])) AS c ORDER BY c) AS l",
+            nativeQuery = true)
+    long lockBookingSlugCandidates(@Param("slugs") String[] slugs);
+
+    /** Advisory-lock seed of the salon booking-slug namespace (0–3 are taken by booking/service locks). */
+    int BOOKING_SLUG_LOCK_SEED = 4;
+
+    /** Batched generator probe: which of {@code slugs} are already stored on some salon. */
+    @Query("SELECT s.bookingSlug FROM Salon s WHERE s.bookingSlug IN :slugs")
+    List<String> findExistingBookingSlugs(@Param("slugs") Collection<String> slugs);
+
+    /**
+     * Phase 376 audit — locks the caller's still-slugless salons (in id order so two concurrent batches over
+     * overlapping salons cannot deadlock) and returns their ids. A salon a concurrent call issued meanwhile
+     * is excluded (re-checked on the committed row version) and its slug is re-read via
+     * {@link #findBookingSlugsByIds}.
+     *
+     * <p><b>{@code FOR NO KEY UPDATE}, not {@code FOR UPDATE}</b> (376 audit cycle 2) — the convention of
+     * {@link #findByIdForUpdate}: {@code booking_slug} is no key column ({@code idx_salons_booking_slug} is a
+     * partial unique index, which FK lock strength ignores), so FK inserts referencing the salon are never
+     * blocked, while two issuers still serialise ({@code NO KEY UPDATE} conflicts with itself).
+     *
+     * <p><b>3s {@code lock_timeout}, fused</b> — the same {@code CROSS JOIN (SELECT set_config(...))
+     * lock_cfg} join-source shape as {@link #findByIdForUpdate}; {@code 55P03} → 409. {@code MANDATORY}: a
+     * row lock outside a transaction is released at once.
+     *
+     * <p>Phase 378 D4: a REVOKED salon ({@code booking_link_revoked_at} set) is never locked, so the share path
+     * never re-issues its slug; only an explicit regenerate clears the flag. A salon revoked concurrently drops
+     * out on the committed row version and is simply absent from the caller's result.
+     *
+     * <p>Like {@link #lockBookingSlugCandidates}, the transaction-local 3s {@code lock_timeout} stays in force
+     * for the rest of the caller's transaction ({@code BookingSlugService#issueMissingSalonSlugs}), bounding
+     * its later lock waits too — accepted (376 security audit, INFO): only already-held locks follow.
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    @QueryHints(@QueryHint(name = HibernateHints.HINT_NATIVE_SPACES, value = "salons"))
+    @Query(value = """
+            SELECT s.id FROM salons s
+            CROSS JOIN (SELECT set_config('lock_timeout', '3s', true)) lock_cfg
+            WHERE s.id IN (:salonIds) AND s.booking_slug IS NULL AND s.booking_link_revoked_at IS NULL
+            ORDER BY s.id
+            FOR NO KEY UPDATE OF s
+            """, nativeQuery = true)
+    List<UUID> lockSalonIdsWithoutBookingSlug(@Param("salonIds") Collection<UUID> salonIds);
+
+    /**
+     * Phase 376 audit — writes every allocated slug in ONE statement ({@code salonIds[i]} gets
+     * {@code slugs[i]}), still only where the row has none ({@code booking_slug IS NULL}, belt and braces
+     * behind {@link #lockSalonIdsWithoutBookingSlug}). Native, because {@code Salon.bookingSlug} is
+     * {@code updatable = false}.
+     *
+     * @return the number of rows written
+     */
+    @Modifying
+    @QueryHints(@QueryHint(name = HibernateHints.HINT_NATIVE_SPACES, value = "salons"))
+    @Query(value = "UPDATE salons s SET booking_slug = v.slug "
+            + "FROM unnest(CAST(:salonIds AS uuid[]), CAST(:slugs AS text[])) AS v(id, slug) "
+            + "WHERE s.id = v.id AND s.booking_slug IS NULL AND s.booking_link_revoked_at IS NULL",
+            nativeQuery = true)
+    int assignBookingSlugsIfAbsent(@Param("salonIds") UUID[] salonIds, @Param("slugs") String[] slugs);
+
+    /**
+     * The CURRENT committed slugs of {@code salonIds} (concurrent issuers' winners), read straight from the
+     * table in ONE statement (376 audit cycle 2). A salon that no longer exists, or still has no slug, is
+     * simply absent from the result.
+     */
+    @QueryHints(@QueryHint(name = HibernateHints.HINT_NATIVE_SPACES, value = "salons"))
+    @Query(value = """
+            SELECT id AS "id", booking_slug AS "bookingSlug" FROM salons
+            WHERE id = ANY(CAST(:salonIds AS uuid[])) AND booking_slug IS NOT NULL
+            """, nativeQuery = true)
+    List<SalonSlugRow> findBookingSlugsByIds(@Param("salonIds") UUID[] salonIds);
+
+    /** Row of {@link #findBookingSlugsByIds}. */
+    interface SalonSlugRow {
+        UUID getId();
+
+        String getBookingSlug();
+    }
+
+    /**
+     * Row of the caller-scoped booking-link reads below — no entity, no association to initialise.
+     * {@code revoked} (phase 378 D4/D15) reads the unmapped {@code booking_link_revoked_at}, hence native SQL.
+     */
+    interface SalonBookingLinkRow {
+        UUID getId();
+
+        String getName();
+
+        String getBookingSlug();
+
+        Boolean getRevoked();
+
+        default boolean revoked() {
+            return Boolean.TRUE.equals(getRevoked());
+        }
+    }
+
+    /**
+     * Every ACTIVE salon the owner owns, in ONE statement, ordered by name (the link-list order).
+     * Bounded by {@code SalonService.MAX_ACTIVE_SALONS_PER_OWNER}; backed by the V46 partial index
+     * {@code idx_salons_owner_active_created}. Native since phase 378 (the revoke flag is unmapped).
+     */
+    @Query(value = """
+            SELECT s.id AS "id", s.name AS "name", s.booking_slug AS "bookingSlug",
+                   (s.booking_link_revoked_at IS NOT NULL) AS "revoked"
+              FROM salons s
+             WHERE s.owner_id = :ownerId AND s.is_active = true
+             ORDER BY s.name, s.id
+            """, nativeQuery = true)
+    List<SalonBookingLinkRow> findBookingLinkRowsByOwnerId(@Param("ownerId") UUID ownerId);
+
+    /**
+     * The ACTIVE salon a {@code SALON_ADMIN} is bound to ({@code users.salon_id}, the same assignment
+     * {@code AuthorizationService#adminBelongsToSalon} reads), in ONE statement. The role predicate
+     * runs against the stored row, so a stale token role cannot borrow another user's salon binding.
+     * Native since phase 378 (the revoke flag is unmapped).
+     */
+    @Query(value = """
+            SELECT s.id AS "id", s.name AS "name", s.booking_slug AS "bookingSlug",
+                   (s.booking_link_revoked_at IS NOT NULL) AS "revoked"
+              FROM salons s
+             WHERE s.is_active = true
+               AND s.id IN (SELECT u.salon_id FROM users u WHERE u.id = :userId AND u.role = 'SALON_ADMIN')
+            """, nativeQuery = true)
+    List<SalonBookingLinkRow> findBookingLinkRowsByAdminUserId(@Param("userId") UUID userId);
+
+    /**
+     * Phase 378 — the one salon a regenerate / revoke acts on: name, owner, activity, live slug and revoke
+     * flag in ONE statement (any activity, so the service can answer 404 for an inactive salon only AFTER
+     * the membership check — a foreign salon is always 403, never an existence oracle).
+     */
+    @Query(value = """
+            SELECT s.id AS "id", s.name AS "name", s.owner_id AS "ownerId", s.is_active AS "active",
+                   s.booking_slug AS "bookingSlug", (s.booking_link_revoked_at IS NOT NULL) AS "revoked"
+              FROM salons s WHERE s.id = :salonId
+            """, nativeQuery = true)
+    Optional<SalonBookingLinkStateRow> findBookingLinkStateById(@Param("salonId") UUID salonId);
+
+    /** Row of {@link #findBookingLinkStateById}. */
+    interface SalonBookingLinkStateRow extends SalonBookingLinkRow {
+        UUID getOwnerId();
+
+        Boolean getActive();
+    }
+
+    /**
+     * Phase 378 D7/D11a — salon regenerate: compare-and-swap twin of
+     * {@code MasterRepository#replaceBookingSlug} ({@code expected} is {@code ""} for "no slug", never
+     * {@code null}). Clears the revoke flag. Fused 3s {@code lock_timeout} (same shape as the master twin).
+     *
+     * @return 1 on success, 0 when the stored slug no longer equals {@code expected} (→ 409)
+     */
+    @Modifying
+    @QueryHints(@QueryHint(name = HibernateHints.HINT_NATIVE_SPACES, value = "salons"))
+    @Query(value = """
+            UPDATE salons
+               SET booking_slug = :newSlug,
+                   booking_link_revoked_at = NULL
+              FROM (SELECT set_config('lock_timeout', '3s', true)) AS lock_cfg
+             WHERE salons.id = :salonId
+               AND COALESCE(salons.booking_slug, '') = :expected
+            """, nativeQuery = true)
+    int replaceBookingSlug(
+            @Param("salonId") UUID salonId, @Param("expected") String expected, @Param("newSlug") String newSlug);
+
+    /**
+     * Phase 378 D7/D11a — salon revoke: clears the slug and stamps the revoke flag (kept when already set).
+     *
+     * @return 1 on success, 0 when the stored slug no longer equals {@code expected} (→ 409)
+     */
+    @Modifying
+    @QueryHints(@QueryHint(name = HibernateHints.HINT_NATIVE_SPACES, value = "salons"))
+    @Query(value = """
+            UPDATE salons
+               SET booking_slug = NULL,
+                   booking_link_revoked_at = COALESCE(salons.booking_link_revoked_at, :revokedAt)
+              FROM (SELECT set_config('lock_timeout', '3s', true)) AS lock_cfg
+             WHERE salons.id = :salonId
+               AND COALESCE(salons.booking_slug, '') = :expected
+            """, nativeQuery = true)
+    int revokeBookingSlug(
+            @Param("salonId") UUID salonId, @Param("expected") String expected,
+            @Param("revokedAt") java.time.Instant revokedAt);
+
+    /**
+     * The subset of {@code salonIds} that is bookable, in ONE statement — the salon analogue of
+     * {@code MasterRepository#findSearchBookability}. Reads the single shared rule
+     * {@link com.beautica.master.repository.MasterBookabilitySql#BOOKABLE_SALON_S} (active salon with
+     * ≥1 active bookable master) that discovery search and favourites list salons by.
+     */
+    @Query(value = "SELECT s.id FROM salons s WHERE s.id IN (:salonIds) AND s.is_active = true AND"
+            + com.beautica.master.repository.MasterBookabilitySql.BOOKABLE_SALON_S,
+            nativeQuery = true)
+    List<UUID> findBookableSalonIds(
+            @Param("salonIds") Collection<UUID> salonIds,
+            @Param(com.beautica.master.repository.MasterBookabilitySql.TODAY_PARAM) java.time.LocalDate today);
 }

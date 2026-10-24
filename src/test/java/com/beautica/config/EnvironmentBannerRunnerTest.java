@@ -84,7 +84,7 @@ class EnvironmentBannerRunnerTest {
     }
 
     private static DeploymentProperties props(DeployEnvironment env, SmsMode mode) {
-        return new DeploymentProperties(env, new DeploymentProperties.Sms(mode));
+        return new DeploymentProperties(env, new DeploymentProperties.Sms(mode, null));
     }
 
     @Test

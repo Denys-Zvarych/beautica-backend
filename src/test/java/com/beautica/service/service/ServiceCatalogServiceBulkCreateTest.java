@@ -122,6 +122,7 @@ class ServiceCatalogServiceBulkCreateTest {
     // this collaborator (evictSalonCatalogAfterCommit -> salonCatalogCacheEvictor.evict). Mocked
     // (rather than left null) so that call is a no-op default-Mockito-stub instead of an NPE.
     @Mock private SalonCatalogCacheEvictor salonCatalogCacheEvictor;
+    @Mock private com.beautica.common.cache.MasterProfileCacheEvictor masterProfileCacheEvictor;
 
     @Mock
     private com.beautica.master.service.MasterSearchVisibilityGuard searchVisibilityGuard;

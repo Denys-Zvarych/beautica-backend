@@ -124,7 +124,7 @@ class GuestBookingPostRateLimitRegressionTest {
         //
         // Since 2026-08-11 this GET has a bucket of its OWN (guestAvailabilityBuckets, 60/60s — see
         // GuestAvailabilityGetRateLimitTest); this assertion is unchanged and still means what it always
-        // did: ONE read must not be charged to the 5/15min BOOKING budget. One request is two orders of
+        // did: ONE read must not be charged to the 10/15min BOOKING budget. One request is two orders of
         // magnitude inside the availability cap, so it passes on that bucket too.
         var get = new MockHttpServletRequest("GET", "/api/v1/book/marija-l-cd34/availability");
         get.setRemoteAddr(REMOTE_ADDR);
@@ -139,5 +139,58 @@ class GuestBookingPostRateLimitRegressionTest {
         assertThat(chain.getRequest())
                 .as("GET availability must be forwarded down the filter chain")
                 .isNotNull();
+    }
+
+    // ── phases 392/393 — salon-scoped twins share the master routes' buckets ────────────────────
+
+    private static final String SALON_BOOKING_PATH =
+            "/api/v1/book/s/studiia-krasa-ab12/masters/2f7a1c3e-1b2d-4c5e-8f90-123456789abc/booking";
+
+    @Test
+    @DisplayName("phase 393: salon POST /book/s/{slug}/masters/{id}/booking draws the SAME 10/15min guest-booking "
+            + "bucket — 10 master-route POSTs leave the salon POST 429 (no second budget for a split visit)")
+    void should_shareGuestBookingBucket_when_salonBookingPostAfterMasterPosts() throws Exception {
+        AuthRateLimitFilter filter = realFilter();
+        int allowed = 0;
+        for (int i = 0; i < REQUESTS_TO_FIRE; i++) {
+            var response = new MockHttpServletResponse();
+            filter.doFilterInternal(postBooking(), response, new MockFilterChain());
+            if (response.getStatus() == 429) {
+                break;
+            }
+            allowed++;
+        }
+        var salonPost = new MockHttpServletRequest("POST", SALON_BOOKING_PATH);
+        salonPost.setRemoteAddr(REMOTE_ADDR);
+        var response = new MockHttpServletResponse();
+        var chain = new MockFilterChain();
+
+        filter.doFilterInternal(salonPost, response, chain);
+
+        assertThat(allowed).as("non-vacuous: the master route is capped at 10 (phase 393 audit)").isEqualTo(10);
+        assertThat(response.getStatus()).isEqualTo(429);
+        assertThat(response.getHeader("Retry-After")).isEqualTo("900");
+        assertThat(chain.getRequest()).isNull();
+    }
+
+    @Test
+    @DisplayName("phase 393 audit: salon booking POST alone is capped at 10 per IP per 15 min — one max-size visit "
+            + "(10 masters) fits, the 11th is 429")
+    void should_capSalonBookingPost_when_floodedFromOneIp() throws Exception {
+        AuthRateLimitFilter filter = realFilter();
+        int allowed = 0;
+
+        for (int i = 0; i < REQUESTS_TO_FIRE; i++) {
+            var req = new MockHttpServletRequest("POST", SALON_BOOKING_PATH);
+            req.setRemoteAddr(REMOTE_ADDR);
+            var response = new MockHttpServletResponse();
+            filter.doFilterInternal(req, response, new MockFilterChain());
+            if (response.getStatus() == 429) {
+                break;
+            }
+            allowed++;
+        }
+
+        assertThat(allowed).isEqualTo(10);
     }
 }

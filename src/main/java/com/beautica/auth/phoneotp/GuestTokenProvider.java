@@ -12,11 +12,15 @@ import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Duration;
 import java.util.Date;
+import java.util.UUID;
 
 /**
  * Mints and validates short-lived <b>guest JWTs</b> for the phone-OTP booking flow
- * (Phase 13.2). A guest token authorises a single guest-booking creation
- * (Phase 13.3 consumes the {@code sub} phone claim) and expires in 30 minutes.
+ * (Phase 13.2). A guest token is a <b>multi-use bearer within its 30-minute lifetime</b>: one OTP verification
+ * lets the guest create several bookings (Phase 13.3 consumes the {@code sub} phone claim) — e.g. a salon visit
+ * split across masters is one POST per master (phase 393). It is NOT single-use; reuse is bounded by the TTL, the
+ * per-IP guest-booking bucket ({@code AuthRateLimitFilter}) and the per-token booking cap keyed by the token's
+ * {@code jti} ({@code GuestTokenBookingCap}, max 10 bookings per token — phase 393 audit).
  *
  * <p>Reuses the existing {@code app.jwt.secret} (no new env var) and mirrors
  * {@link com.beautica.auth.JwtTokenProvider}: HMAC-SHA256 pinned explicitly, a single
@@ -62,6 +66,8 @@ public class GuestTokenProvider {
         var expiry = Date.from(clock.instant().plus(GUEST_TOKEN_TTL));
 
         return Jwts.builder()
+                // Random jti (phase 393 audit): the key of the per-token booking cap. Opaque, carries no data.
+                .id(UUID.randomUUID().toString())
                 .subject(phone)
                 .claim(CLAIM_TYPE, TYPE_GUEST)
                 .issuedAt(now)
@@ -80,10 +86,33 @@ public class GuestTokenProvider {
      *                                      user token, or one with no/absent type claim)
      */
     public String validate(String token) {
+        return validateClaims(token).phone();
+    }
+
+    /**
+     * {@link #validate(String)} plus the token's {@code jti} — same verification, same exceptions.
+     *
+     * @return the verified phone and the token id ({@code null} only for a token minted before the jti was added)
+     */
+    public GuestTokenClaims validateClaims(String token) {
         Claims claims = jwtParser.parseSignedClaims(token).getPayload();
         if (!TYPE_GUEST.equals(claims.get(CLAIM_TYPE, String.class))) {
             throw new io.jsonwebtoken.MalformedJwtException("Not a guest token");
         }
-        return claims.getSubject();
+        return new GuestTokenClaims(claims.getSubject(), claims.getId());
+    }
+
+    /** The lifetime every guest token is minted with — also the per-token booking cap's entry TTL. */
+    public static Duration lifetime() {
+        return GUEST_TOKEN_TTL;
+    }
+
+    /**
+     * A verified guest token's identity.
+     *
+     * @param phone   the OTP-verified E.164 phone ({@code sub}) — PII, never log it
+     * @param tokenId the {@code jti}; {@code null} for a legacy token minted without one
+     */
+    public record GuestTokenClaims(String phone, String tokenId) {
     }
 }

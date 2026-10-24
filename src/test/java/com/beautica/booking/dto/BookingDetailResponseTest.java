@@ -713,4 +713,89 @@ class BookingDetailResponseTest {
                         + "not a generic one")
                 .isNull();
     }
+
+    // ── phase 386: provider-visible guest phone ───────────────────────────────────────────────
+
+    private static final String GUEST_PHONE = "+380671234567";
+    private static final String ACCOUNT_PHONE = "+380991112233";
+
+    @Test
+    @DisplayName("from() never sets guestPhone - even for a guest booking that has one (list/feed/create/reschedule rows)")
+    void should_leaveGuestPhoneNull_when_builtByTheSharedFactory() {
+        when(booking.getClient()).thenReturn(null);
+        lenient().when(booking.getGuestPhone()).thenReturn(GUEST_PHONE);
+
+        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW, null);
+
+        assertThat(response.guestPhone()).isNull();
+    }
+
+    @Test
+    @DisplayName("withProviderVisibleGuestPhone sets the booking's guestPhone for a guest booking (client_id NULL)")
+    void should_setGuestPhone_when_guestBookingHasOne() {
+        when(booking.getClient()).thenReturn(null);
+        when(booking.getGuestPhone()).thenReturn(GUEST_PHONE);
+        var base = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW, null);
+
+        var detail = base.withProviderVisibleGuestPhone(booking);
+
+        assertThat(detail.guestPhone()).isEqualTo(GUEST_PHONE);
+    }
+
+    @Test
+    @DisplayName("HARD RULE: a registered client's booking stays null even if a guest phone value is somehow on the row, "
+            + "and the account's phone number never appears anywhere in the serialized response")
+    void should_keepGuestPhoneNull_when_bookingHasRegisteredClient() throws Exception {
+        when(clientUser.getPhoneNumber()).thenReturn(ACCOUNT_PHONE);
+        lenient().when(booking.getGuestPhone()).thenReturn(GUEST_PHONE);
+        var base = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW, null);
+
+        var detail = base.withProviderVisibleGuestPhone(booking);
+
+        assertThat(detail.guestPhone()).isNull();
+        String json = new com.fasterxml.jackson.databind.ObjectMapper().findAndRegisterModules()
+                .writeValueAsString(detail);
+        assertThat(json).doesNotContain(ACCOUNT_PHONE.substring(4)).doesNotContain(GUEST_PHONE.substring(4));
+    }
+
+    @Test
+    @DisplayName("a guest booking without a phone (anonymised/erased, or never set) keeps guestPhone null")
+    void should_keepGuestPhoneNull_when_guestPhoneAbsent() {
+        when(booking.getClient()).thenReturn(null);
+        when(booking.getGuestPhone()).thenReturn(null);
+        var base = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW, null);
+
+        assertThat(base.withProviderVisibleGuestPhone(booking).guestPhone()).isNull();
+    }
+
+    @Test
+    @DisplayName("the wither changes ONLY guestPhone - every other component is carried over unchanged")
+    void should_carryEveryOtherComponentOver_when_guestPhoneAttached() throws Exception {
+        when(booking.getClient()).thenReturn(null);
+        when(booking.getGuestName()).thenReturn("Оксана");
+        when(booking.getGuestPhone()).thenReturn(GUEST_PHONE);
+        var base = BookingDetailResponse.from(booking, true, true, "Київ", "Шевченківський", NOW, null);
+
+        var detail = base.withProviderVisibleGuestPhone(booking);
+
+        for (var component : BookingDetailResponse.class.getRecordComponents()) {
+            Object expected = component.getName().equals("guestPhone") ? GUEST_PHONE
+                    : component.getAccessor().invoke(base);
+            assertThat(component.getAccessor().invoke(detail)).as(component.getName()).isEqualTo(expected);
+        }
+    }
+
+    @Test
+    @DisplayName("toString never prints the phone (nor the notes): masked, with identity and status only")
+    void should_redactGuestPhone_when_toStringCalled() {
+        when(booking.getClient()).thenReturn(null);
+        when(booking.getGuestPhone()).thenReturn(GUEST_PHONE);
+        var detail = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW, null)
+                .withProviderVisibleGuestPhone(booking);
+
+        String text = detail.toString();
+
+        assertThat(text).doesNotContain(GUEST_PHONE).doesNotContain("671234567")
+                .doesNotContain("great service").contains("+380***").contains(bookingId.toString());
+    }
 }

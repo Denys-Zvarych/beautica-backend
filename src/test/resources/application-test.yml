@@ -23,6 +23,9 @@ spring:
       '[mail.smtp.writetimeout]': 1000
 
 app:
+  # Phase 382: explicit — the test profile never calls Cloudflare; ITs that exercise the verifier opt in.
+  turnstile:
+    enabled: false
   # Phase 374: explicit — the test profile always uses the SMTP transport unless a test opts into brevo-api.
   mail:
     transport: smtp
@@ -137,6 +140,9 @@ app:
     from-email: noreply@beautica.app
   admin-email: admin@beautica.test
   public-base-url: https://api.beautica.test
+  booking-links:
+    # Phase 375 (D6) — on in tests; BookingLinkIT overrides it per test to cover the off state.
+    share-enabled: true
   security:
     # Test profile only — fixed 32+ char value so the context loads under `test`.
     otp-pepper: test-otp-pepper-fixed-value-min-32-characters

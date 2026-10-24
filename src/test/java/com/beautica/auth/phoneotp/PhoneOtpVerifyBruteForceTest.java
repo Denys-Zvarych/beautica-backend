@@ -1,6 +1,9 @@
 package com.beautica.auth.phoneotp;
 
 import com.beautica.common.exception.BusinessException;
+import com.beautica.config.DeployEnvironment;
+import com.beautica.config.DeploymentProperties;
+import com.beautica.config.SmsMode;
 import com.beautica.notification.sms.OtpSmsSender;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -39,17 +42,15 @@ import static org.mockito.Mockito.when;
  * active code after a small number of wrong tries (N ≈ 5), so a subsequent <i>correct</i>
  * code is still rejected — the brute-force window collapses from 10 000 attempts to N.
  *
- * <p><b>This test encodes the not-yet-applied fix and is EXPECTED-RED until backend-dev
- * lands the attempt counter</b> (the current {@link PhoneOtpService#verifyOtp} never
- * invalidates on a wrong code, so the final correct attempt currently succeeds). The
- * fix loop's verifier run is what turns this green.
+ * <p>Regression net for the attempt counter now in {@link PhoneOtpService#verifyOtp}: if it
+ * ever stops invalidating on wrong codes, the final correct attempt succeeds and this goes red.
  *
  * <p>The exact invalidation threshold is asserted loosely (≤ a documented MAX) so a
  * reasonable choice of N (3..5) by the implementer does not force a test edit; only the
  * security <i>contract</i> is pinned: after the cap, the correct code no longer works.
  */
 @ExtendWith(MockitoExtension.class)
-@DisplayName("PhoneOtpService — verify brute-force cap (CRITICAL-fix regression, expected-red until fix lands)")
+@DisplayName("PhoneOtpService — verify brute-force cap invalidates the code after N wrong tries (CRITICAL-fix regression)")
 class PhoneOtpVerifyBruteForceTest {
 
     private static final String PHONE = "+380671234567";
@@ -75,7 +76,9 @@ class PhoneOtpVerifyBruteForceTest {
     @BeforeEach
     void setUp() {
         service = new PhoneOtpService(phoneOtpRepository, attemptRecorder, guestTokenProvider,
-                otpSmsSender, Clock.fixed(FIXED_NOW, ZoneOffset.UTC), txManager);
+                otpSmsSender, Clock.fixed(FIXED_NOW, ZoneOffset.UTC), txManager,
+                new DeploymentProperties(DeployEnvironment.LOCAL,
+                        new DeploymentProperties.Sms(SmsMode.TURBOSMS, null)));
     }
 
     private static String sha256Hex(String value) throws Exception {

@@ -339,7 +339,7 @@ class SalonAdminBookingViewIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("guest (no client) salon booking: 200 for the admin, guest name shown, no client id, no phone leaked")
+    @DisplayName("guest (no client) salon booking: 200 for the admin, guest name shown, no client id, phone shown (phase 386)")
     void should_return200WithGuestFieldsOnly_when_adminViewsGuestBooking() throws Exception {
         var salon = fx.createSalon("sabv-g-owner-" + System.nanoTime() + "@beautica.test");
         String adminEmail = "sabv-g-admin-" + System.nanoTime() + "@beautica.test";
@@ -364,7 +364,8 @@ class SalonAdminBookingViewIT extends AbstractIntegrationTest {
         assertThat(data.path("clientFirstName").asText()).isEqualTo("Guesta");
         assertThat(data.path("clientLastName").asText()).isEqualTo("Visitor");
         assertThat(data.path("providerCanReviewClient").asBoolean()).as("guest is not rateable").isFalse();
-        assertThat(resp.getBody()).doesNotContain("+380501234567");
+        // Phase 386 (user rule 2026-10-22): the assigned admin is in the guest-phone audience.
+        assertThat(data.path("guestPhone").asText()).isEqualTo("+380501234567");
     }
 
     // ── helpers ──────────────────────────────────────────────────────────────────

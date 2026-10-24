@@ -232,7 +232,7 @@ public class BookingCancellationService {
             slotCalculationService.evictMasterAvailabilityCaches(masterId);
             // Un-hiding a service also changes the salon catalogue (perf/security #2).
             if (salonId != null) {
-                salonCatalogCacheEvictor.evict(salonId);
+                salonCatalogCacheEvictor.evictCatalogOnly(salonId);
             }
             if (sendGuestSms) {
                 bookingSmsDispatcher.dispatch(

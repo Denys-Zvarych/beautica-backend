@@ -102,9 +102,38 @@ diagnose_port_5432() {
 # Tear down THIS project's own stack FIRST. The common cause of a busy port 5432
 # is a leftover `beautica-postgres` container from a previous run — `down -v`
 # releases its published port. We must do this before blaming system PostgreSQL.
+PGDATA_VOLUME="${COMPOSE_PROJECT}_beautica-pgdata"
+
+fail_fresh() {
+  {
+    echo ""
+    echo "ERROR: $1"
+    echo "The local database was NOT reset. Containers referencing volume '$PGDATA_VOLUME':"
+    docker ps -a --filter "volume=$PGDATA_VOLUME" \
+      --format '  {{.ID}} {{.Names}} ({{.Image}}) {{.Status}} project={{.Label "com.docker.compose.project"}}' || true
+    echo "Remove them (docker rm -f <id>) and re-run this script."
+  } >&2
+  exit 1
+}
+
+# A "fresh" start that silently keeps the old volume boots on the OLD database (seen 2026-10-19
+# and 2026-10-21: flyway_schema_history kept V199/V200 → checksum mismatch). So every critical
+# step below shows its stderr, and the wipe is VERIFIED rather than assumed.
 echo "Removing containers AND volumes (fresh database)..."
 remove_foreign_name_conflicts
-docker compose -f "$COMPOSE_FILE" down -v 2>/dev/null || true
+if ! docker compose -f "$COMPOSE_FILE" down -v --remove-orphans; then
+  echo "  WARNING: 'docker compose down -v' failed — removing the data volume explicitly." >&2
+fi
+
+# Belt and braces: remove the data volume by its resolved name, whatever `down -v` did.
+if docker volume inspect "$PGDATA_VOLUME" >/dev/null 2>&1; then
+  echo "  Volume '$PGDATA_VOLUME' survived 'down -v' — removing it explicitly."
+  docker volume rm "$PGDATA_VOLUME" || fail_fresh "could not remove volume '$PGDATA_VOLUME'."
+fi
+if docker volume inspect "$PGDATA_VOLUME" >/dev/null 2>&1; then
+  fail_fresh "volume '$PGDATA_VOLUME' still exists after removal."
+fi
+echo "  Volume '$PGDATA_VOLUME' removed."
 
 echo "Checking host port 5432..."
 if port_5432_in_use; then
@@ -148,9 +177,24 @@ echo "Starting Beautica local stack..."
 docker compose -f "$COMPOSE_FILE" up -d
 
 echo "Waiting for Postgres to be healthy..."
-until docker inspect beautica-postgres --format '{{.State.Health.Status}}' 2>/dev/null | grep -q "healthy"; do
+# Exact match: `grep -q healthy` would also accept "unhealthy". Capped so a broken container fails
+# loudly instead of looping forever.
+health=""
+for _ in $(seq 1 60); do
+  health="$(docker inspect beautica-postgres --format '{{.State.Health.Status}}' 2>/dev/null || true)"
+  [ "$health" = "healthy" ] && break
   sleep 2
 done
+[ "$health" = "healthy" ] || fail_fresh "beautica-postgres did not become healthy within 120 s (last status: '${health:-<none>}')."
+
+# Verify the database really is empty. A surviving flyway_schema_history means the old data came back.
+leftover="$(docker exec beautica-postgres psql -U beautica -d beautica -tAc \
+  "SELECT count(*) FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog','information_schema')")" \
+  || fail_fresh "could not query the new database to verify it is empty."
+if [ "$leftover" != "0" ]; then
+  fail_fresh "the database is NOT empty after the reset ($leftover table(s); flyway_schema_history present: $(docker exec beautica-postgres psql -U beautica -d beautica -tAc "SELECT to_regclass('public.flyway_schema_history') IS NOT NULL" || echo '?'))."
+fi
+echo "  Verified: volume '$PGDATA_VOLUME' created $(docker volume inspect "$PGDATA_VOLUME" --format '{{.CreatedAt}}'), database has 0 tables."
 
 echo ""
 echo "Done. Database is empty — Flyway will run all migrations on next app start."

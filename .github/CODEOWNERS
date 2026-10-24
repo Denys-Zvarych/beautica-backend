@@ -21,3 +21,9 @@
 /src/test/java/com/beautica/**/support/**     @Denys-Zvarych
 /src/test/java/com/beautica/**/*Support.java  @Denys-Zvarych
 /src/test/java/com/beautica/**/Test*Config*.java @Denys-Zvarych
+
+# Flyway migrations: the destructive-migration gate's `-- non-destructive` opt-out is an author's
+# statement, so every new/changed migration needs the owner's review (phase 370 D6 hardening).
+/src/main/resources/db/migration/**          @Denys-Zvarych
+# Java migrations are not parsed by the gate (header-only), so they need the same review.
+/src/main/java/db/migration/**               @Denys-Zvarych

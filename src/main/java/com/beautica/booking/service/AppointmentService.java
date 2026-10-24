@@ -505,7 +505,7 @@ public class AppointmentService {
         Runnable task = () -> {
             slotCalculationService.evictMasterAvailabilityCaches(masterId);
             if (salonId != null) {
-                salonCatalogCacheEvictor.evict(salonId);
+                salonCatalogCacheEvictor.evictCatalogOnly(salonId);
             }
         };
         if (TransactionSynchronizationManager.isSynchronizationActive()) {

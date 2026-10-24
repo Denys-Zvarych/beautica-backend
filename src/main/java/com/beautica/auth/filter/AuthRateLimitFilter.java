@@ -1,6 +1,8 @@
 package com.beautica.auth.filter;
 
 import com.beautica.common.security.BearerTokenExtractor;
+import com.beautica.common.security.ConstantTimeSecrets;
+import com.beautica.config.BookingInfoWorkerProperties;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.github.benmanes.caffeine.cache.LoadingCache;
 import io.github.bucket4j.Bandwidth;
@@ -11,6 +13,7 @@ import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.http.HttpMethod;
 import org.springframework.stereotype.Component;
@@ -19,8 +22,17 @@ import org.springframework.web.filter.OncePerRequestFilter;
 import org.springframework.web.util.UrlPathHelper;
 
 import java.io.IOException;
+import java.net.Inet6Address;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
+import java.time.temporal.ChronoUnit;
+import java.util.Arrays;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -178,14 +190,31 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // (same technique as BULK_SALON_SERVICES / SLOTS): /api/v1/book/{slug}/booking. The suffix
     // /booking does not collide with the OTP paths (/send, /verify) nor with the public GET
     // availability read, so only the booking POST consumes this bucket.
+    //
+    // Phases 392/393: the SALON twins /api/v1/book/s/{slug}/masters/{masterId}/{availability,bookable-days,booking}
+    // share the same prefix and suffixes, so they deliberately land in the SAME buckets at the SAME price
+    // (incl. bookableDaysTokenCost) — no separate budget a caller could add on top of the master routes.
+    // Pinned by GuestAvailabilityGetRateLimitTest / AuthRateLimitFilterTest salon-route cases.
     private static final String GUEST_BOOKING_PATH_PREFIX = "/api/v1/book/";
     private static final String GUEST_BOOKING_PATH_SUFFIX = "/booking";
     // Guest availability READ: GET /api/v1/book/{slug}/availability — the public booking page's slot
     // list, matched by the same prefix + a distinct suffix. It is deliberately NOT part of
     // guestBookingBuckets (that bucket's own comment says "only the booking POST consumes this bucket"),
     // because a legitimate guest issues MANY availability GETs per single booking POST — sharing one
-    // 5/15min bucket would make browsing dates impossible. See GUEST_AVAILABILITY_CAPACITY.
+    // 10/15min bucket would make browsing dates impossible. See GUEST_AVAILABILITY_CAPACITY.
     private static final String GUEST_AVAILABILITY_PATH_SUFFIX = "/availability";
+    // Phase 387: GET /api/v1/book/{slug}/bookable-days — the public calendar day-gate. Shares the
+    // availability bucket, exactly as the authenticated twin /masters/{id}/working-days shares slotsBuckets
+    // with /slots: both answer from the same SlotCalculationService oracle, and one budget per guest page
+    // keeps a rotating-window probe bounded by the same 60/min as rotating dates.
+    private static final String GUEST_BOOKABLE_DAYS_PATH_SUFFIX = "/bookable-days";
+    // Guest page-info READS (phase 377 audit): GET /api/v1/book/{slug}/info (master page) and
+    // GET /api/v1/book/s/{slug}/info (salon page) — the same prefix + a distinct suffix. Their own
+    // bucket (guestInfoBuckets), see GUEST_INFO_CAPACITY.
+    private static final String GUEST_INFO_PATH_SUFFIX = "/info";
+    // Phase 383/384: GET /book/{slug}/reviews and /book/s/{slug}/reviews share the page-info bucket — one
+    // per-IP (worker-key aware) budget for everything an SSR page render of a booking page reads.
+    private static final String GUEST_REVIEWS_PATH_SUFFIX = "/reviews";
     // Guest cancel-by-link POST carries the {token} variable as a single path segment, so it
     // is matched by prefix only: /api/v1/book/cancel/{token}. The prefix /api/v1/book/cancel/
     // does not collide with the guest-booking POST (which ends in /booking) nor with the OTP
@@ -289,13 +318,19 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // unchanged.
     private static final long OTP_VERIFY_CAPACITY = 10;
     private static final Duration OTP_VERIFY_WINDOW = Duration.ofMinutes(15);
-    // Per-IP cap for POST /api/v1/book/{slug}/booking (5 / 15 min). The endpoint is
+    // Per-IP cap for POST /api/v1/book/{slug}/booking AND its salon twin
+    // /api/v1/book/s/{slug}/masters/{masterId}/booking (10 / 15 min, shared bucket). The endpoint is
     // permitAll() — the guest JWT is validated inside GuestBookingService, not the Spring
     // filter chain — so without this an attacker holding (or replaying) one valid guest token
     // could pour unlimited CONFIRMED bookings + billable confirmation SMS at a master. Built
     // internally (not an injected @Qualifier bean) so the public 16-arg constructor stays stable
     // for the slice/regression tests that construct this filter directly.
-    private static final long GUEST_BOOKING_CAPACITY = 5;
+    //
+    // Phase 393 audit: raised from 5 to 10. A salon visit is ONE POST PER MASTER, so 5 blocked a legitimate
+    // visit split across >5 masters from one IP. 10 = one maximum-size visit (10 services, one master each). The
+    // per-IP bucket is no longer the only replay bound: GuestTokenBookingCap caps every guest token at 10
+    // committed bookings regardless of source IP, so IP rotation no longer multiplies one token's reach.
+    private static final long GUEST_BOOKING_CAPACITY = 10;
     private static final Duration GUEST_BOOKING_WINDOW = Duration.ofMinutes(15);
     // Per-IP cap for POST /api/v1/book/cancel/{token} (10 / 15 min). The endpoint is
     // permitAll() — the guest holds only the one-time cancel token, validated inside the
@@ -331,6 +366,35 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // by several slice/regression tests — stays unchanged, mirroring guestBookingBuckets/cancelPostBuckets.
     private static final long GUEST_AVAILABILITY_CAPACITY = 60;
     private static final Duration GUEST_AVAILABILITY_WINDOW = Duration.ofMinutes(1);
+    // Per-IP cap for the two public booking-page info reads, GET /api/v1/book/{slug}/info and
+    // GET /api/v1/book/s/{slug}/info (60 / 60 s) — phase 377 audit (MEDIUM): both are permitAll() and were
+    // unthrottled, so a caller sweeping distinct slugs forced a cache miss (salon page: two statements
+    // incl. the bookable-master batch) per request. Same size as catalogueBrowseCapacity, but a DEDICATED
+    // bucket: sharing catalogueBrowseBuckets would let guest page loads drain the anonymous catalogue /
+    // public-profile budget (and vice versa) — a behaviour change for those existing routes; sharing
+    // guestAvailabilityBuckets would do the same to the date-browsing budget. A page open costs one token,
+    // so 60/min is far above human use even behind carrier-grade NAT. Built internally like
+    // guestAvailabilityBuckets so the public constructor stays unchanged.
+    private static final long GUEST_INFO_CAPACITY = 60;
+    private static final Duration GUEST_INFO_WINDOW = Duration.ofMinutes(1);
+    // Entry cap for guestInfoBuckets (perf audit L1). Lower than the 100_000 the other per-IP caches use:
+    // the bucket is a read-flood guard with a 6-minute idle expiry, so 20_000 concurrently-active sources
+    // is ample, and a Worker-keyed (CF-Connecting-IP) bucket set must not grow the heap unboundedly.
+    private static final long GUEST_INFO_MAX_ENTRIES = 20_000;
+    // Website SSR Worker identification on the info reads (see BookingInfoWorkerProperties). The Worker
+    // calls from one egress IP; with a matching secret its forwarded visitor IP keys the bucket instead.
+    private static final String WORKER_KEY_HEADER = "X-Beautica-Worker-Key";
+    private static final String CF_CONNECTING_IP_HEADER = "CF-Connecting-IP";
+    private static final int MAX_IP_LITERAL_LENGTH = 45;
+    private static final Pattern IPV4_LITERAL = Pattern.compile(
+            "^((25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)\\.){3}(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)$");
+    // First char hex or ':' — InetAddress.getByName only takes its literal-parsing path for such a value
+    // (a leading '.' would fall through to a DNS lookup); the ':' requirement below makes it IPv6-only.
+    private static final Pattern IPV6_LITERAL_CHARS = Pattern.compile("^[0-9A-Fa-f:][0-9A-Fa-f:.]*$");
+    // IPv6 visitors are keyed on their /64: one subscriber is routinely handed a whole /64, so a per-/128
+    // key would let a single host mint 2^64 fresh buckets by rotating its interface identifier.
+    private static final int IPV6_BUCKET_PREFIX_BYTES = 8;
+    private static final String IPV6_BUCKET_SUFFIX = "/64";
     // Per-IP cap for GET /api/v1/search/** (240 / 60 s). These permitAll() discovery reads
     // expose authed-only street addresses for independent masters, so the throttle bounds the
     // RATE at which a single source can page through every district/city and the DB work each
@@ -368,6 +432,18 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     private static final long SEARCH_TOKENS_FIRST_PAGE = 1;
     private static final long SEARCH_TOKENS_DEEP_PAGE = 2;
     private static final String SEARCH_PAGE_PARAM = "page";
+    // Token cost of GET /api/v1/book/{slug}/bookable-days (phase 387 audit) — see bookableDaysTokenCost().
+    // Base 1, +1 per FULL 14-day block of the inclusive [from, to] span, +1 per extra
+    // serviceId. The span is clamped to BOOKABLE_DAYS_MAX_CHARGED_SPAN (the core's own 63-date cap) and the
+    // service count to BOOKABLE_DAYS_MAX_CHARGED_SERVICES (MAX_SERVICES_PER_VISIT), so the dearest request
+    // costs 1 + 63/14 + 9 = 14 tokens — always < GUEST_AVAILABILITY_CAPACITY, never an unpayable 429.
+    private static final long BOOKABLE_DAYS_TOKENS_BASE = 1;
+    private static final long BOOKABLE_DAYS_SPAN_BLOCK_DAYS = 14;
+    private static final long BOOKABLE_DAYS_MAX_CHARGED_SPAN = 63;
+    private static final int BOOKABLE_DAYS_MAX_CHARGED_SERVICES = 10;
+    private static final String BOOKABLE_DAYS_FROM_PARAM = "from";
+    private static final String BOOKABLE_DAYS_TO_PARAM = "to";
+    private static final String BOOKABLE_DAYS_SERVICE_PARAM = "serviceId";
     // Per-IP cap for GET /api/v1/settlements (240 / 60 s) — the Phase 326 settlement
     // autocomplete. permitAll, because the «Населений пункт» field is reached during
     // registration before a token exists (phase-326 D7).
@@ -623,6 +699,9 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // internally rather than injected so the public 19-arg constructor stays stable for the
     // slice/regression tests that construct this filter directly.
     private final LoadingCache<String, Bucket> guestAvailabilityBuckets;
+    // Per-IP bucket for GET /api/v1/book/{slug}/info + GET /api/v1/book/s/{slug}/info (phase 377 audit),
+    // see GUEST_INFO_CAPACITY. Built internally, like guestAvailabilityBuckets.
+    private final LoadingCache<String, Bucket> guestInfoBuckets;
     // Per-IP bucket for GET /api/v1/search/** — the SEC-fix scraping guard for the permitAll()
     // discovery reads (which now surface authed-only independent-master street addresses).
     // Built internally rather than injected so the public 16-arg constructor stays stable for
@@ -702,6 +781,15 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // RateLimitConfig#reviewPageBuckets (app.rate-limit.review-page-capacity).
     private final LoadingCache<String, Bucket> reviewPageBuckets;
 
+    // Configured website-Worker secret for the info reads, or null when the feature is off (blank config).
+    // A secret: never logged.
+    private final String bookingInfoWorkerKey;
+
+    /**
+     * Feature-off constructor: identical to the Spring constructor with no website-Worker key configured.
+     * The only PUBLIC constructor, so the slice/regression tests that build this filter directly (and the
+     * qualifier-indexed {@code AuthRateLimitFilterTestFactory}, which requires exactly one) stay unchanged.
+     */
     public AuthRateLimitFilter(
             @Qualifier("registerBuckets") LoadingCache<String, Bucket> registerBuckets,
             @Qualifier("loginBuckets") LoadingCache<String, Bucket> loginBuckets,
@@ -728,6 +816,63 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             @Qualifier("inviteBuckets") LoadingCache<String, Bucket> inviteBuckets,
             @Qualifier("reviewDecisionBuckets") LoadingCache<String, Bucket> reviewDecisionBuckets,
             @Qualifier("reviewPageBuckets") LoadingCache<String, Bucket> reviewPageBuckets) {
+        this(registerBuckets,
+                loginBuckets,
+                refreshBuckets,
+                verifyEmailBuckets,
+                slotsBuckets,
+                deviceTokenBuckets,
+                mediaUploadBuckets,
+                profileUpdateBuckets,
+                resendVerificationBuckets,
+                forgotPasswordBuckets,
+                resetPasswordBuckets,
+                categoryRequestBuckets,
+                suggestServiceTypeBuckets,
+                bulkServiceSetupBuckets,
+                supportContactBuckets,
+                otpSendBuckets,
+                verifyPasswordResetOtpBuckets,
+                changePasswordOtpBuckets,
+                serviceWriteBuckets,
+                inviteValidateBuckets,
+                inviteAcceptBuckets,
+                catalogueBrowseBuckets,
+                inviteBuckets,
+                reviewDecisionBuckets,
+                reviewPageBuckets,
+                new BookingInfoWorkerProperties());
+    }
+
+    /** Spring constructor: as the public one, plus the optional website-Worker key (feature off when blank). */
+    @Autowired
+    AuthRateLimitFilter(
+            @Qualifier("registerBuckets") LoadingCache<String, Bucket> registerBuckets,
+            @Qualifier("loginBuckets") LoadingCache<String, Bucket> loginBuckets,
+            @Qualifier("refreshBuckets") LoadingCache<String, Bucket> refreshBuckets,
+            @Qualifier("verifyEmailBuckets") LoadingCache<String, Bucket> verifyEmailBuckets,
+            @Qualifier("slotsBuckets") LoadingCache<String, Bucket> slotsBuckets,
+            @Qualifier("deviceTokenBuckets") LoadingCache<String, Bucket> deviceTokenBuckets,
+            @Qualifier("mediaUploadBuckets") LoadingCache<String, Bucket> mediaUploadBuckets,
+            @Qualifier("profileUpdateBuckets") LoadingCache<String, Bucket> profileUpdateBuckets,
+            @Qualifier("resendVerificationBuckets") LoadingCache<String, Bucket> resendVerificationBuckets,
+            @Qualifier("forgotPasswordBuckets") LoadingCache<String, Bucket> forgotPasswordBuckets,
+            @Qualifier("resetPasswordBuckets") LoadingCache<String, Bucket> resetPasswordBuckets,
+            @Qualifier("categoryRequestBuckets") LoadingCache<String, Bucket> categoryRequestBuckets,
+            @Qualifier("suggestServiceTypeBuckets") LoadingCache<String, Bucket> suggestServiceTypeBuckets,
+            @Qualifier("bulkServiceSetupBuckets") LoadingCache<String, Bucket> bulkServiceSetupBuckets,
+            @Qualifier("supportContactBuckets") LoadingCache<String, Bucket> supportContactBuckets,
+            @Qualifier("otpSendBuckets") LoadingCache<String, Bucket> otpSendBuckets,
+            @Qualifier("verifyPasswordResetOtpBuckets") LoadingCache<String, Bucket> verifyPasswordResetOtpBuckets,
+            @Qualifier("changePasswordOtpBuckets") LoadingCache<String, Bucket> changePasswordOtpBuckets,
+            @Qualifier("serviceWriteBuckets") LoadingCache<String, Bucket> serviceWriteBuckets,
+            @Qualifier("inviteValidateBuckets") LoadingCache<String, Bucket> inviteValidateBuckets,
+            @Qualifier("inviteAcceptBuckets") LoadingCache<String, Bucket> inviteAcceptBuckets,
+            @Qualifier("catalogueBrowseBuckets") LoadingCache<String, Bucket> catalogueBrowseBuckets,
+            @Qualifier("inviteBuckets") LoadingCache<String, Bucket> inviteBuckets,
+            @Qualifier("reviewDecisionBuckets") LoadingCache<String, Bucket> reviewDecisionBuckets,
+            @Qualifier("reviewPageBuckets") LoadingCache<String, Bucket> reviewPageBuckets,
+            BookingInfoWorkerProperties bookingInfoWorker) {
         this.registerBuckets = registerBuckets;
         this.loginBuckets = loginBuckets;
         this.refreshBuckets = refreshBuckets;
@@ -753,6 +898,7 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         this.inviteBuckets = inviteBuckets;
         this.reviewDecisionBuckets = reviewDecisionBuckets;
         this.reviewPageBuckets = reviewPageBuckets;
+        this.bookingInfoWorkerKey = bookingInfoWorker.isEnabled() ? bookingInfoWorker.getWorkerKey() : null;
         this.otpVerifyBuckets = Caffeine.newBuilder()
                 .maximumSize(100_000)
                 .expireAfterAccess(OTP_VERIFY_WINDOW.plusMinutes(5))
@@ -776,6 +922,12 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                 .expireAfterAccess(GUEST_AVAILABILITY_WINDOW.plusMinutes(5))
                 .build(key -> Bucket.builder()
                         .addLimit(guestAvailabilityBandwidth())
+                        .build());
+        this.guestInfoBuckets = Caffeine.newBuilder()
+                .maximumSize(GUEST_INFO_MAX_ENTRIES)
+                .expireAfterAccess(GUEST_INFO_WINDOW.plusMinutes(5))
+                .build(key -> Bucket.builder()
+                        .addLimit(guestInfoBandwidth())
                         .build());
         this.searchBuckets = Caffeine.newBuilder()
                 .maximumSize(100_000)
@@ -846,6 +998,13 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         return BandwidthBuilder.builder()
                 .capacity(GUEST_AVAILABILITY_CAPACITY)
                 .refillIntervally(GUEST_AVAILABILITY_CAPACITY, GUEST_AVAILABILITY_WINDOW)
+                .build();
+    }
+
+    private static Bandwidth guestInfoBandwidth() {
+        return BandwidthBuilder.builder()
+                .capacity(GUEST_INFO_CAPACITY)
+                .refillIntervally(GUEST_INFO_CAPACITY, GUEST_INFO_WINDOW)
                 .build();
     }
 
@@ -1067,17 +1226,42 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         // prefix + suffix (the {slug} is one path segment), checked before the POST-only guard so this
         // GET is covered. The /availability suffix cannot collide with the sibling public reads under
         // /book: /{slug}/info, /cancel/{token} (GET cancel-info) and the OTP/booking/cancel POSTs all
-        // end in something else, so ONLY the availability GET consumes this bucket.
+        // end in something else, so ONLY the availability GET and its calendar twin
+        // GET /{slug}/bookable-days (phase 387, see GUEST_BOOKABLE_DAYS_PATH_SUFFIX) consume this bucket.
         //
         // Until this branch the endpoint fell through to the unmatched-GET path with no throttle at all —
         // the LINK counterpart of the slots branch immediately above, driving the same
         // SlotCalculationService oracle at zero auth cost. Cap: 60 / 60 s per IP, deliberately the same
         // budget as slotsBuckets (see GUEST_AVAILABILITY_CAPACITY for the sizing and for why it does not
         // throttle a guest tapping through dates).
+        //
+        // Phase 387 audit (security MEDIUM): the two routes share the bucket but NOT the price. One
+        // /availability call walks ONE date; one /bookable-days call walks up to the whole guest window
+        // (61 dates) — so /bookable-days is charged span- and service-weighted tokens, see
+        // bookableDaysTokenCost(). Same 60-token capacity for both: the accounting changes, not the cap.
         if (isGetOrHead(method)
                 && path.startsWith(GUEST_BOOKING_PATH_PREFIX)
                 && path.endsWith(GUEST_AVAILABILITY_PATH_SUFFIX)) {
             applyRateLimit(request, response, filterChain, guestAvailabilityBuckets, RETRY_AFTER_SECONDS);
+            return;
+        }
+        if (isGetOrHead(method)
+                && path.startsWith(GUEST_BOOKING_PATH_PREFIX)
+                && path.endsWith(GUEST_BOOKABLE_DAYS_PATH_SUFFIX)) {
+            applyRateLimit(request, response, filterChain, guestAvailabilityBuckets, RETRY_AFTER_SECONDS,
+                    bookableDaysTokenCost(request));
+            return;
+        }
+
+        // Guest page-info read rate-limit (phase 377 audit): GET /api/v1/book/{slug}/info (master page)
+        // and GET /api/v1/book/s/{slug}/info (salon page) — prefix + suffix, exactly like the
+        // availability branch above; the /info suffix matches no other route under /book. Cap: 60 / 60 s
+        // per IP on a dedicated bucket (see GUEST_INFO_CAPACITY for why not catalogueBrowseBuckets).
+        if (isGetOrHead(method)
+                && path.startsWith(GUEST_BOOKING_PATH_PREFIX)
+                && (path.endsWith(GUEST_INFO_PATH_SUFFIX) || path.endsWith(GUEST_REVIEWS_PATH_SUFFIX))) {
+            applyRateLimit(request, response, filterChain, guestInfoBuckets, RETRY_AFTER_SECONDS, 1L,
+                    resolveGuestInfoBucketKey(request));
             return;
         }
 
@@ -1281,7 +1465,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         // prefix + suffix (the {slug} is one path segment). Placed before the exact-path POST
         // branch below. The /booking suffix does not match the OTP exact paths (/send, /verify),
         // and the GET availability read is excluded by the POST-method guard, so only the
-        // booking POST consumes this bucket. Cap: 5 / 15 min per IP.
+        // booking POST consumes this bucket. Cap: 10 / 15 min per IP (phase 393 audit — one max-size salon
+        // visit; see GUEST_BOOKING_CAPACITY).
         if (HttpMethod.POST.matches(method)
                 && path.startsWith(GUEST_BOOKING_PATH_PREFIX)
                 && path.endsWith(GUEST_BOOKING_PATH_SUFFIX)) {
@@ -1476,6 +1661,92 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     }
 
     /**
+     * Token cost of one {@code GET /api/v1/book/{slug}/bookable-days} (phase 387 audit, security MEDIUM):
+     * {@code 1 + spanDays / 14 + (serviceCount - 1)}. The route shares {@code guestAvailabilityBuckets}
+     * with {@code /availability}, where one call walks ONE date; a flat 1-token charge let a caller buy up
+     * to 61 dates of slot computation per token. Weighting mirrors {@link #searchTokenCost}: the capacity
+     * stays 60/min, the accounting is what changes.
+     *
+     * <p>Real-guest budget: a 7-day week view costs 1 (60/min), a 31-day single-service month view costs
+     * {@code 1 + 31/14 = 3} (20 month views/min), a full 61-day window with one service costs 5 (12/min).
+     * The website fetches one month per page turn, so 20/min is far above human paging.
+     *
+     * <p>Defensive like {@link #searchTokenCost}: GET-only, so {@code getParameter} cannot consume a body.
+     * A missing or inverted range charges the base cost — the controller and service 400 it anyway, and
+     * the 400 never reaches the slot oracle; a present-but-unparsable date fails CLOSED at the max span
+     * (see {@link #bookableDaysSpan}). The span is clamped to
+     * {@link #BOOKABLE_DAYS_MAX_CHARGED_SPAN} and the service count to
+     * {@link #BOOKABLE_DAYS_MAX_CHARGED_SERVICES}, so an out-of-range request is never priced above the
+     * bucket's capacity (an unpayable charge would turn its clean 400 into a 429). The service count
+     * counts comma-separated values too, because Spring binds {@code ?serviceId=a,b} to a 2-element list.
+     */
+    static long bookableDaysTokenCost(HttpServletRequest request) {
+        return BOOKABLE_DAYS_TOKENS_BASE
+                + bookableDaysSpan(request) / BOOKABLE_DAYS_SPAN_BLOCK_DAYS
+                + (bookableDaysServiceCount(request) - 1);
+    }
+
+    /**
+     * Inclusive {@code [from, to]} day count, clamped to {@code [0, MAX]}.
+     *
+     * <p>Parses with {@link DateTimeFormatter#ISO_DATE} — the SAME formatter the controller's
+     * {@code @DateTimeFormat(iso = ISO.DATE)} binder uses — so an offset-suffixed date
+     * ({@code 2026-11-01Z}, {@code 2026-11-01+02:00}) that the binder accepts is charged its real span
+     * (phase 387 audit cycle 2: an {@code ISO_LOCAL_DATE} parse rejected it, charged 1 token, while the
+     * binder still computed the full window). FAIL CLOSED: a {@code from}/{@code to} that is present but
+     * unparsable here charges {@link #BOOKABLE_DAYS_MAX_CHARGED_SPAN}, so any future parser drift between
+     * filter and binder over-charges rather than under-charges. Absent params charge 0 (the controller 400s
+     * on {@code @NotNull}); an inverted range clamps to 0 (the service 400s it).
+     */
+    private static long bookableDaysSpan(HttpServletRequest request) {
+        String from = request.getParameter(BOOKABLE_DAYS_FROM_PARAM);
+        String to = request.getParameter(BOOKABLE_DAYS_TO_PARAM);
+        Optional<LocalDate> fromDate = parseBookableDaysDate(from);
+        Optional<LocalDate> toDate = parseBookableDaysDate(to);
+        if ((from != null && fromDate.isEmpty()) || (to != null && toDate.isEmpty())) {
+            return BOOKABLE_DAYS_MAX_CHARGED_SPAN;
+        }
+        if (fromDate.isEmpty() || toDate.isEmpty()) {
+            return 0;
+        }
+        long span = ChronoUnit.DAYS.between(fromDate.get(), toDate.get()) + 1;
+        return Math.max(0, Math.min(span, BOOKABLE_DAYS_MAX_CHARGED_SPAN));
+    }
+
+    /**
+     * {@code ISO_DATE} parse of the RAW query value; empty when absent or unparsable. Deliberately NOT trimmed:
+     * the Spring binder does not trim either, so a padded date ({@code " 2026-11-01"}) is unparsable on both
+     * sides — the controller 400s it and the filter charges the fail-closed max span (phase 387 audit cycle 3).
+     */
+    private static Optional<LocalDate> parseBookableDaysDate(String raw) {
+        if (raw == null) {
+            return Optional.empty();
+        }
+        try {
+            return Optional.of(LocalDate.parse(raw, DateTimeFormatter.ISO_DATE));
+        } catch (DateTimeParseException ex) {
+            return Optional.empty();
+        }
+    }
+
+    /** Number of {@code serviceId} values (repeated and/or comma-separated), clamped to {@code [1, MAX]}. */
+    private static int bookableDaysServiceCount(HttpServletRequest request) {
+        String[] values = request.getParameterValues(BOOKABLE_DAYS_SERVICE_PARAM);
+        if (values == null) {
+            return 1;
+        }
+        int count = 0;
+        for (String value : values) {
+            for (String part : value.split(",", -1)) {
+                if (!part.isBlank() && ++count >= BOOKABLE_DAYS_MAX_CHARGED_SERVICES) {
+                    return BOOKABLE_DAYS_MAX_CHARGED_SERVICES;
+                }
+            }
+        }
+        return Math.max(count, 1);
+    }
+
+    /**
      * True for the four public profile reads ({@link #PUBLIC_PROFILE_READ_PATH}) when — and only
      * when — the {@code {id}} segment would bind to a {@code UUID} path variable in Spring MVC.
      *
@@ -1548,7 +1819,17 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                                 LoadingCache<String, Bucket> cache,
                                 int retryAfterSeconds,
                                 long tokens) throws ServletException, IOException {
-        Bucket bucket = cache.get(resolveBucketKey(request));
+        applyRateLimit(request, response, filterChain, cache, retryAfterSeconds, tokens, resolveBucketKey(request));
+    }
+
+    private void applyRateLimit(HttpServletRequest request,
+                                HttpServletResponse response,
+                                FilterChain filterChain,
+                                LoadingCache<String, Bucket> cache,
+                                int retryAfterSeconds,
+                                long tokens,
+                                String bucketKey) throws ServletException, IOException {
+        Bucket bucket = cache.get(bucketKey);
 
         // Retry-After is the bucket's REAL time-to-refill for the requested tokens (rounded up,
         // minimum 1 s), not the window length: a bucket that refills in 20 s must not tell the
@@ -1593,18 +1874,91 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         return ip.length() > 45 ? request.getRemoteAddr() : ip;
     }
 
-    private String resolveClientIp(HttpServletRequest request) {
-        String xfwd = request.getHeader("X-Forwarded-For");
-        if (xfwd != null && !xfwd.isBlank()) {
-            String[] parts = xfwd.split(",");
-            // Rightmost entry is appended by Railway's trusted proxy — cannot be spoofed.
-            for (int i = parts.length - 1; i >= 0; i--) {
-                String part = parts[i].trim();
-                if (!part.isEmpty()) {
-                    return part.length() > 45 ? request.getRemoteAddr() : part;
-                }
+    /**
+     * Bucket key for the booking-page info reads. With the website-Worker feature on, a request carrying a
+     * matching {@value #WORKER_KEY_HEADER} (constant-time compare) is keyed on the visitor IP in
+     * {@value #CF_CONNECTING_IP_HEADER}, so the Worker's single egress IP does not pool every visitor into one
+     * bucket. Anything else — feature off, no header, wrong key, missing or non-IP-literal
+     * CF-Connecting-IP — falls back to {@link #resolveBucketKey} exactly as before.
+     */
+    private String resolveGuestInfoBucketKey(HttpServletRequest request) {
+        if (bookingInfoWorkerKey == null) {
+            return resolveBucketKey(request);
+        }
+        String supplied = request.getHeader(WORKER_KEY_HEADER);
+        if (supplied == null || !ConstantTimeSecrets.matches(supplied, bookingInfoWorkerKey)) {
+            return resolveBucketKey(request);
+        }
+        String visitorKey = visitorIpBucketKey(request.getHeader(CF_CONNECTING_IP_HEADER));
+        return visitorKey != null ? visitorKey : resolveBucketKey(request);
+    }
+
+    /**
+     * Bucket key for a forwarded visitor IP literal, or {@code null} when the value is not one. IPv4 (and
+     * IPv4-mapped IPv6, which parses to IPv4) keys on the canonical address; any other IPv6 address keys on
+     * its /64 prefix ({@code 2001:db8:0:0:0:0:0:0/64}), so rotating the low 64 bits never mints a new bucket.
+     * An IPv6 address whose /64 prefix is all zeros (IPv4-compatible {@code ::1.2.3.4}, loopback, ...) keys
+     * on the full canonical /128 address instead, so such values never collapse into one shared
+     * {@code 0:0:0:0:0:0:0:0/64} bucket.
+     */
+    static String visitorIpBucketKey(String value) {
+        InetAddress address = parseIpLiteral(value);
+        if (address == null) {
+            return null;
+        }
+        if (!(address instanceof Inet6Address)) {
+            return address.getHostAddress();
+        }
+        byte[] bytes = address.getAddress();
+        if (isZeroPrefix(bytes)) {
+            return address.getHostAddress();
+        }
+        Arrays.fill(bytes, IPV6_BUCKET_PREFIX_BYTES, bytes.length, (byte) 0);
+        try {
+            return InetAddress.getByAddress(bytes).getHostAddress() + IPV6_BUCKET_SUFFIX;
+        } catch (UnknownHostException e) {
+            return null;
+        }
+    }
+
+    /** True when the first {@value #IPV6_BUCKET_PREFIX_BYTES} bytes (the /64 prefix) are all zero. */
+    private static boolean isZeroPrefix(byte[] bytes) {
+        for (int i = 0; i < IPV6_BUCKET_PREFIX_BYTES; i++) {
+            if (bytes[i] != 0) {
+                return false;
             }
         }
-        return request.getRemoteAddr();
+        return true;
+    }
+
+    /**
+     * Parses an IPv4/IPv6 LITERAL, or returns {@code null}. No DNS lookup is possible: a value reaches
+     * {@link InetAddress#getByName} only when it is a strict dotted-quad, or contains a ':' and starts with a
+     * hex digit or ':' — exactly the values the JDK parses as a literal (an IPv6 that fails to parse throws
+     * {@link UnknownHostException} instead of resolving). A leading '.' or any other character is rejected
+     * up front.
+     */
+    static InetAddress parseIpLiteral(String value) {
+        if (value == null) {
+            return null;
+        }
+        String candidate = value.trim();
+        if (candidate.isEmpty() || candidate.length() > MAX_IP_LITERAL_LENGTH) {
+            return null;
+        }
+        boolean ipv4 = IPV4_LITERAL.matcher(candidate).matches();
+        boolean ipv6 = !ipv4 && candidate.indexOf(':') >= 0 && IPV6_LITERAL_CHARS.matcher(candidate).matches();
+        if (!ipv4 && !ipv6) {
+            return null;
+        }
+        try {
+            return InetAddress.getByName(candidate);
+        } catch (UnknownHostException e) {
+            return null;
+        }
+    }
+
+    private String resolveClientIp(HttpServletRequest request) {
+        return ClientIpResolver.resolve(request);
     }
 }

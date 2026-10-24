@@ -56,6 +56,10 @@ public class StaffAccountDisposalService {
     private final UserProfileCacheEvictor userProfileCacheEvictor;
     private final MediaRepository mediaRepository;
     private final AccountBlobPurgeRegistrar accountBlobPurgeRegistrar;
+    // Phase 380 audit: a deleted/detached master's cached public page (booking-slug-info) must not outlive it.
+    private final com.beautica.common.cache.MasterProfileCacheEvictor masterProfileCacheEvictor;
+    /** Phase 379 D7 — every disposed master's live slug is tombstoned (DELETED) in this transaction. */
+    private final com.beautica.booking.service.DeletedBookingSlugTombstoner deletedBookingSlugTombstoner;
 
     /**
      * HARD-DELETES the given {@code staffUserIds}' accounts, and the {@code masters} rows behind
@@ -270,7 +274,16 @@ public class StaffAccountDisposalService {
         List<Master> staffMasters = resolvedStaffMasters != null
                 ? resolvedStaffMasters
                 : masterRepository.findAllByUserIdInWithUser(staffUserIds);
+        // Every disposed master loses its public booking page (delete / detach => findByBookingSlugWithUser
+        // finds nothing). Slugs are on the already-loaded rows: no extra query; after-commit, never on rollback.
+        staffMasters.forEach(master ->
+                masterProfileCacheEvictor.evictBookingSlugInfoBySlugAfterCommit(master.getBookingSlug()));
         List<UUID> staffMasterIds = staffMasters.stream().map(Master::getId).toList();
+        // Phase 379 D7 — the disposed masters' links answer 410 and their slugs are never re-issued (a deleted
+        // row frees its slug). Inserted while every row still exists (master_id FK); hash-only, ON CONFLICT DO
+        // NOTHING. Its native query space is declared, so it does not flush the session (the single flush below
+        // stays the one that batches the masters writes).
+        deletedBookingSlugTombstoner.tombstoneMasters(staffMasters);
 
         if (reason != StaffDisposalReason.SELF_DELETE) {
             registerBlobPurges(staffUserIds, staffMasters, staffMasterIds);

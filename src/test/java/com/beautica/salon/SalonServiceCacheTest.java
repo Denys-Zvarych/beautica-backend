@@ -49,6 +49,7 @@ import static org.mockito.Mockito.when;
         // MasterCachePrefixEvictor is the REAL bean (needs only CacheConfig's CacheManager), so
         // SalonService's logo search-page eviction runs against the real caches under test.
         classes = {SalonService.class, CacheConfig.class, MasterCachePrefixEvictor.class,
+                com.beautica.common.cache.SalonBookingInfoCacheEvictor.class,
                 SalonServiceCacheTest.TxConfig.class},
         webEnvironment = SpringBootTest.WebEnvironment.NONE
 )
@@ -127,6 +128,11 @@ class SalonServiceCacheTest {
     // (listSalonInvites/cancelInvite) and Clock (§G — no bare Instant.now()). This slice does
     // not exercise those paths, so a mock/fixed-clock bean satisfies the wiring only.
     @MockBean com.beautica.user.InviteTokenRepository inviteTokenRepository;
+    // Phase 376: SalonService constructor-depends on BookingSlugService (createSalon issues the new
+    // salon's booking slug). WITHOUT this bean the context fails to load, taking every test red.
+    @MockBean com.beautica.booking.service.BookingSlugService bookingSlugService;
+    // Phase 379 D7 — deactivateSalon tombstones the salon slug.
+    @MockBean com.beautica.booking.service.DeletedBookingSlugTombstoner deletedBookingSlugTombstoner;
     // SalonService constructor-depends on UserProfileCacheEvictor: createSalon (owner locality
     // sync + auto-created owner-master row), removeAdmin and rotateAdmin all write a `users` row
     // and must stale the user-profile cache. This slice asserts the ownerSalons/salon-detail

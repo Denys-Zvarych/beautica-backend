@@ -231,7 +231,7 @@ public class GuestVisitCancellationService {
             // this master performs on those dates — swept by master prefix, not per (date, service).
             slotCalculationService.evictMasterAvailabilityCaches(masterId);
             if (salonId != null) {
-                salonCatalogCacheEvictor.evict(salonId);
+                salonCatalogCacheEvictor.evictCatalogOnly(salonId);
             }
             if (sendGuestSms) {
                 bookingSmsDispatcher.dispatch(

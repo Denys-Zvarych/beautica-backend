@@ -12,6 +12,7 @@ import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.jpa.repository.QueryHints;
 import org.springframework.data.repository.query.Param;
 
+import java.time.Instant;
 import java.time.LocalDate;
 import java.util.Collection;
 import java.util.List;
@@ -176,6 +177,52 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
             @Param("masterIds") Collection<UUID> masterIds,
             @Param(MasterBookabilitySql.TODAY_PARAM) LocalDate today);
 
+    /**
+     * Phase 377 — {@code salonId}'s bookable masters for the public salon booking page
+     * ({@code GET /book/s/{slug}/info}) in ONE statement: the same structural predicate as
+     * {@link #findBookableIdsBySalonId} ({@link MasterBookabilitySql#BOOKABLE_MASTER_M} on an active
+     * master), joined to the live {@code users} row for the display columns — never one query per master.
+     * An active master always has a user (a detached row is {@code is_active = false}). Ordered like the
+     * public roster ({@code avg_rating DESC}, id tiebreak); capped by {@code limit} (one salon's headcount).
+     * Phase 391 D3: slug-less masters (legacy pre-V86 rows, or a revoked personal link, phase 378) are LISTED,
+     * with a {@code null} slug — the salon flow books them by master id
+     * ({@code /book/s/{slug}/masters/{masterId}/*}), so the phase 377 audit's {@code booking_slug IS NOT NULL}
+     * omission (which existed only because the page had no other way to book such a master) is gone. The
+     * anonymous read path still never writes a slug.
+     */
+    @Query(value = "SELECT m.id AS id, m.booking_slug AS bookingSlug, u.first_name AS firstName, "
+            + "u.last_name AS lastName, u.avatar_url AS avatarUrl, u.professional_title AS professionalTitle, "
+            + "m.avg_rating AS avgRating, m.review_count AS reviewCount "
+            + "FROM masters m JOIN users u ON u.id = m.user_id "
+            + "WHERE m.salon_id = :salonId AND m.is_active = true AND "
+            + MasterBookabilitySql.BOOKABLE_MASTER_M
+            + " ORDER BY m.avg_rating DESC NULLS LAST, m.id LIMIT :limit",
+            nativeQuery = true)
+    List<SalonBookingPageMasterRow> findBookingPageMastersBySalonId(
+            @Param("salonId") UUID salonId,
+            @Param(MasterBookabilitySql.TODAY_PARAM) LocalDate today,
+            @Param("limit") int limit);
+
+    /** Row of {@link #findBookingPageMastersBySalonId}. */
+    interface SalonBookingPageMasterRow {
+        UUID getId();
+
+        String getBookingSlug();
+
+        String getFirstName();
+
+        String getLastName();
+
+        String getAvatarUrl();
+
+        String getProfessionalTitle();
+
+        /** Phase 384 audit - the persisted rating pair the salon master card shows (no extra statement). */
+        java.math.BigDecimal getAvgRating();
+
+        int getReviewCount();
+    }
+
     /** Row of {@link #findSearchBookability}. */
     interface SearchBookabilityRow {
         UUID getMasterId();
@@ -222,6 +269,18 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
      */
     @Query("SELECT m.id FROM Master m WHERE m.salon.id = :salonId AND m.isActive = true")
     List<UUID> findIdsBySalonIdAndIsActiveTrue(@Param("salonId") UUID salonId);
+
+    /**
+     * Phase 378 audit (perf LOW-2) — the {@code booking-slug-info} cache keys of the salon's active members in
+     * ONE statement (instead of ids, then slugs). A member without a slug has no public page, so it is
+     * skipped. Bounded by the salon's roster. Unscoped (Anti-Bug §E-4): the caller
+     * ({@code BookingLinkRetirementWriter}) has already authorized the salon.
+     */
+    @Query(value = """
+            SELECT booking_slug FROM masters
+             WHERE salon_id = :salonId AND is_active AND booking_slug IS NOT NULL
+            """, nativeQuery = true)
+    List<String> findActiveMemberBookingSlugsBySalonId(@Param("salonId") UUID salonId);
 
     /**
      * Cache keys of EVERY master row affiliated with {@code salonId} — active or not, since
@@ -448,6 +507,153 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
     boolean existsByBookingSlug(String bookingSlug);
 
     /**
+     * Phase 375 — race-safe lazy slug issue: writes {@code slug} ONLY while the row still has no slug.
+     * Two concurrent first calls generate DIFFERENT candidates, so the unique index never fires;
+     * without the {@code IS NULL} guard the later commit would silently overwrite the earlier slug
+     * (a link already handed out would die). Under READ COMMITTED the second UPDATE blocks on the
+     * row lock, re-evaluates the predicate after the first commits and matches 0 rows; the caller
+     * then re-reads the winner via {@link #findBookingSlugById}.
+     *
+     * <p>No {@code clearAutomatically}: the caller keeps using its already-loaded entity (name,
+     * salon). That entity's in-memory slug stays {@code null}, which is harmless — it is unchanged
+     * from its snapshot, so dirty-checking never writes the column back.
+     *
+     * <p><b>3s {@code lock_timeout}, fused</b> (perf audit L3) — the {@code FROM (SELECT set_config(...))}
+     * join-source shape of {@code AppointmentRepository#consumeCancelToken} (an {@code UPDATE} has no target
+     * list to carry it): Postgres evaluates the 1-row source, and so sets the transaction-local GUC, before
+     * the implicit row lock on the matching master row, so a concurrent holder bounds this wait to 3s like
+     * the salon twin {@code SalonRepository#lockSalonIdsWithoutBookingSlug}. A longer wait fails with
+     * {@code 55P03} → {@code CannotAcquireLockException} → 409 via
+     * {@code GlobalExceptionHandler#handlePessimisticLockingFailure}. The GUC stays in force for the rest of
+     * the caller's transaction ({@code BookingSlugService#getOrIssueSlugRaceSafe}), which only re-reads.
+     *
+     * @return 1 when this call issued the slug, 0 when another transaction already had
+     */
+    // Phase 378 D5 — the INTERNAL issue path (BookingSlugService#getOrCreateSlug, master creation):
+    // ignores and clears a revoke flag, so a master the platform itself needs a slug for (a salon
+    // page lists only masters with a slug) always gets one. The share path uses
+    // assignShareSlugIfAbsentAndNotRevoked instead, which never resurrects a revoked link.
+    @Modifying
+    @Query(value = """
+            UPDATE masters
+               SET booking_slug = :slug,
+                   booking_link_revoked_at = NULL
+              FROM (SELECT set_config('lock_timeout', '3s', true)) AS lock_cfg
+             WHERE masters.id = :masterId
+               AND masters.booking_slug IS NULL
+            """, nativeQuery = true)
+    int assignBookingSlugIfAbsent(@Param("masterId") UUID masterId, @Param("slug") String slug);
+
+    /**
+     * Phase 378 D4 — the SHARE-path lazy issue ({@code GET /booking-links/mine}): the
+     * {@link #assignBookingSlugIfAbsent} statement plus {@code booking_link_revoked_at IS NULL}, so a
+     * revoked link is never silently re-issued (only an explicit regenerate clears the flag). 0 rows →
+     * a concurrent call issued first OR the link is revoked; the caller re-reads
+     * {@link #findBookingLinkStateById} to tell which. Same fused 3s {@code lock_timeout}.
+     */
+    @Modifying
+    @Query(value = """
+            UPDATE masters
+               SET booking_slug = :slug
+              FROM (SELECT set_config('lock_timeout', '3s', true)) AS lock_cfg
+             WHERE masters.id = :masterId
+               AND masters.booking_slug IS NULL
+               AND masters.booking_link_revoked_at IS NULL
+            """, nativeQuery = true)
+    int assignShareSlugIfAbsentAndNotRevoked(@Param("masterId") UUID masterId, @Param("slug") String slug);
+
+    /**
+     * Phase 378 D7/D11a — regenerate: optimistic compare-and-swap of the master's slug. Writes
+     * {@code newSlug} and clears the revoke flag ONLY while the stored slug still equals the caller's
+     * {@code expected} value; {@code expected} is {@code ""} for "no slug" (a revoked or legacy link) —
+     * never {@code null}, so the bind is always typed and {@code COALESCE(booking_slug, '')} matches it
+     * (a real slug is never empty: V86 CHECK). Same fused 3s {@code lock_timeout} as the lazy issue.
+     *
+     * @return 1 on success, 0 when the stored slug no longer equals {@code expected} (→ 409)
+     */
+    @Modifying
+    @Query(value = """
+            UPDATE masters
+               SET booking_slug = :newSlug,
+                   booking_link_revoked_at = NULL
+              FROM (SELECT set_config('lock_timeout', '3s', true)) AS lock_cfg
+             WHERE masters.id = :masterId
+               AND COALESCE(masters.booking_slug, '') = :expected
+            """, nativeQuery = true)
+    int replaceBookingSlug(
+            @Param("masterId") UUID masterId, @Param("expected") String expected, @Param("newSlug") String newSlug);
+
+    /**
+     * Phase 378 D7/D11a — revoke: the compare-and-swap twin of {@link #replaceBookingSlug} that clears the
+     * slug and stamps the revoke flag (kept, not moved, when already set). {@code expected} as there.
+     *
+     * @return 1 on success, 0 when the stored slug no longer equals {@code expected} (→ 409)
+     */
+    @Modifying
+    @Query(value = """
+            UPDATE masters
+               SET booking_slug = NULL,
+                   booking_link_revoked_at = COALESCE(masters.booking_link_revoked_at, :revokedAt)
+              FROM (SELECT set_config('lock_timeout', '3s', true)) AS lock_cfg
+             WHERE masters.id = :masterId
+               AND COALESCE(masters.booking_slug, '') = :expected
+            """, nativeQuery = true)
+    int revokeBookingSlug(
+            @Param("masterId") UUID masterId, @Param("expected") String expected,
+            @Param("revokedAt") Instant revokedAt);
+
+    /**
+     * Phase 378 — the master's committed link state straight from the table (native, so a stale entity
+     * is bypassed and the unmapped {@code booking_link_revoked_at} is reachable). Empty when no row.
+     */
+    @Query(value = """
+            SELECT booking_slug AS "bookingSlug", (booking_link_revoked_at IS NOT NULL) AS "revoked"
+              FROM masters WHERE id = :masterId
+            """, nativeQuery = true)
+    Optional<BookingLinkState> findBookingLinkStateById(@Param("masterId") UUID masterId);
+
+    /** Row of {@link #findBookingLinkStateById}: the live slug (or {@code null}) and the revoke flag. */
+    interface BookingLinkState {
+        String getBookingSlug();
+
+        Boolean getRevoked();
+
+        default boolean revoked() {
+            return Boolean.TRUE.equals(getRevoked());
+        }
+    }
+
+    /**
+     * Phase 375 — the master's CURRENT committed booking slug, read straight from the table (a native
+     * scalar, so the persistence context's possibly-stale entity is bypassed). Pairs with
+     * {@link #assignBookingSlugIfAbsent}.
+     */
+    @Query(value = "SELECT booking_slug FROM masters WHERE id = :masterId", nativeQuery = true)
+    Optional<String> findBookingSlugById(@Param("masterId") UUID masterId);
+
+    /**
+     * Phase 380 audit — the committed booking slugs of {@code masterIds} in ONE statement (masters without a
+     * slug are simply absent). Backs the batched {@code booking-slug-info} eviction of a service-definition
+     * change, which can touch many masters.
+     */
+    @Query(value = "SELECT booking_slug FROM masters WHERE id IN (:masterIds) AND booking_slug IS NOT NULL",
+            nativeQuery = true)
+    List<String> findBookingSlugsByIdIn(@Param("masterIds") Collection<UUID> masterIds);
+
+    /**
+     * Phase 380 D2 — the public booking page's {@code bookable} verdict for ONE master: active AND the
+     * shared structural predicate ({@link MasterBookabilitySql#BOOKABLE_MASTER_M}: ≥1 active
+     * correctly-owned service and a schedule within the 180-day horizon). One statement; {@code today}
+     * is the Europe/Kyiv civil date from the app clock, never the DB clock.
+     */
+    @Query(value = "SELECT (m.is_active = true AND " + MasterBookabilitySql.BOOKABLE_MASTER_M
+            + ") FROM masters m WHERE m.id = :masterId",
+            nativeQuery = true)
+    Boolean isBookableById(
+            @Param("masterId") UUID masterId,
+            @Param(MasterBookabilitySql.TODAY_PARAM) LocalDate today);
+
+    /**
      * Resolves a public booking slug to its master, JOIN FETCH-ing the {@code user}
      * association so the caller can read {@code firstName}/{@code lastName}/
      * {@code avatarUrl}/{@code bio} (which live on {@link com.beautica.user.User},
@@ -489,6 +695,86 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
               AND (s IS NULL OR s.isActive = true)
             """)
     Optional<Master> findByBookingSlugWithUser(@Param("slug") String slug);
+
+    /**
+     * Phase 387 audit (perf LOW) — the id of the master {@link #findByBookingSlugWithUser} would return, as ONE
+     * scalar column: no {@code Master}/{@code User}/{@code Salon} hydration. Backs the guest slot reads
+     * ({@code GET /book/{slug}/availability} and {@code /bookable-days}), which need the id only.
+     *
+     * <p><b>Predicate is a byte-for-byte mirror of {@link #findByBookingSlugWithUser}</b>, including the
+     * INNER {@code JOIN m.user}: that finder's {@code JOIN FETCH m.user} is an inner join, so a DETACHED master
+     * ({@code user_id IS NULL}, phase 294) never resolves — kept here so the two can never disagree, even
+     * though detach also deactivates. The salon join stays {@code LEFT} (an independent master has no salon).
+     * Deliberately NOT {@link #findActiveReviewTargetByBookingSlug}, which omits the user join. Pinned by
+     * {@code MasterRepositoryBookingSlugTest} (real query: active / no-salon / closed salon / inactive master).
+     */
+    @Query("""
+            SELECT m.id FROM Master m
+            JOIN m.user
+            LEFT JOIN m.salon s
+            WHERE m.bookingSlug = :slug
+              AND m.isActive = true
+              AND (s IS NULL OR s.isActive = true)
+            """)
+    Optional<UUID> findBookableIdByBookingSlug(@Param("slug") String slug);
+
+    /**
+     * Phase 383 — the id of the ACTIVE master (in an active salon, or none) behind a public booking slug: the
+     * exact visibility rule of {@link #findByBookingSlugWithUser}, as ONE scalar statement. Backs
+     * {@code GET /book/{slug}/reviews}, which needs the id only and must not hydrate the user/salon graph on
+     * every (uncached) request.
+     */
+    @Query("""
+            SELECT m.id AS id, m.reviewCount AS reviewCount FROM Master m
+            LEFT JOIN m.salon s
+            WHERE m.bookingSlug = :slug
+              AND m.isActive = true
+              AND (s IS NULL OR s.isActive = true)
+            """)
+    Optional<com.beautica.common.ReviewTarget> findActiveReviewTargetByBookingSlug(@Param("slug") String slug);
+
+    /**
+     * Phase 393 — the salon-scoped twin of {@link #findByBookingSlugWithUser} for the public SALON guest
+     * booking ({@code POST /book/s/{slug}/masters/{masterId}/booking}): master {@code masterId} with its user
+     * and salon, but only when it is ACTIVE, attached to a user, and works in the ACTIVE salon whose public
+     * booking slug is {@code salonSlug}. Keyed by the salon slug + master id, never by a master booking slug
+     * (locked rule: salon masters have no personal share link).
+     *
+     * <p><b>The SOLE enforcement point of the salon-path visibility rule</b>, like the master-slug finder: a
+     * master of another salon, a deactivated master, a closed salon or an unknown slug all resolve to empty,
+     * and the caller answers one indistinguishable 404 (or 410 for a retired salon slug). INNER joins on both
+     * {@code user} (a detached master never resolves) and {@code salon} (an independent master has no salon
+     * page). To-one fetches on a single-row PK lookup: columns, never rows. Pinned by
+     * {@code MasterRepositorySalonSlugTest} (real query).
+     */
+    @Query("""
+            SELECT m FROM Master m
+            JOIN FETCH m.user
+            JOIN FETCH m.salon s
+            WHERE m.id = :masterId
+              AND s.bookingSlug = :salonSlug
+              AND s.isActive = true
+              AND m.isActive = true
+            """)
+    Optional<Master> findBookableBySalonSlugWithUser(
+            @Param("masterId") UUID masterId, @Param("salonSlug") String salonSlug);
+
+    /**
+     * Phase 392 — the id {@link #findBookableBySalonSlugWithUser} would return, as ONE scalar column (no
+     * Master/User/Salon hydration), for the salon-scoped guest slot reads
+     * ({@code GET /book/s/{slug}/masters/{masterId}/availability} and {@code /bookable-days}). Predicate is a
+     * byte-for-byte mirror of that finder, including the INNER {@code JOIN m.user}.
+     */
+    @Query("""
+            SELECT m.id FROM Master m
+            JOIN m.user
+            JOIN m.salon s
+            WHERE m.id = :masterId
+              AND s.bookingSlug = :salonSlug
+              AND s.isActive = true
+              AND m.isActive = true
+            """)
+    Optional<UUID> findBookableIdBySalonSlug(@Param("masterId") UUID masterId, @Param("salonSlug") String salonSlug);
 
     // ── phase 295 — salon-deletion staff HARD-DELETE cascade ────────────────────────────────────
 

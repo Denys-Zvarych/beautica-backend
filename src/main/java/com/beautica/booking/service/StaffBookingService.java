@@ -537,7 +537,7 @@ public class StaffBookingService {
         BookingAfterCommit.run(() -> {
             slotCalculationService.evictMasterAvailabilityCaches(masterId);
             if (salonId != null) {
-                salonCatalogCacheEvictor.evict(salonId);
+                salonCatalogCacheEvictor.evictCatalogOnly(salonId);
             }
         });
     }

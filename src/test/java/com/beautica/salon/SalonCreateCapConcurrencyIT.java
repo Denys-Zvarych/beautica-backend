@@ -3,7 +3,10 @@ package com.beautica.salon;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.config.TestSecurityConfig;
 import com.beautica.salon.dto.CreateSalonRequest;
+import com.beautica.salon.repository.SalonRepository;
 import com.beautica.salon.service.SalonService;
+import com.beautica.support.HeldDbLock;
+import com.beautica.support.RepositorySpies;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -19,15 +22,21 @@ import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
+import org.springframework.transaction.support.TransactionTemplate;
+
+import javax.sql.DataSource;
 
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
 
@@ -86,6 +95,16 @@ class SalonCreateCapConcurrencyIT extends AbstractIntegrationTest {
 
     @SpyBean
     private SalonService salonService;
+
+    /** Pass-through spy (reset after each test); stubbed only by the slug-lock timeout test. */
+    @MockitoSpyBean
+    private SalonRepository salonRepository;
+
+    @Autowired
+    private DataSource dataSource;
+
+    @Autowired
+    private TransactionTemplate transactionTemplate;
 
     private SalonItFixtures fixtures;
 
@@ -193,6 +212,35 @@ class SalonCreateCapConcurrencyIT extends AbstractIntegrationTest {
                         + "the pre-fix code committed BOTH rows and landed on %s",
                         SalonService.MAX_ACTIVE_SALONS_PER_OWNER + 1)
                 .isEqualTo(SalonService.MAX_ACTIVE_SALONS_PER_OWNER);
+    }
+
+    @Test
+    @DisplayName("376 audit: another writer holds the drawn slug candidate's advisory lock past the 3s "
+            + "lock_timeout → 409, not a hang; no salon written")
+    void should_return409_when_slugCandidateLockHeldBeyondTimeout() throws Exception {
+        UUID ownerId = fixtures.insertUser(
+                "owner-slug-lock-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
+        String ownerToken = fixtures.loginAndGetToken(fixtures.emailOf(ownerId));
+        List<HeldDbLock> holders = new CopyOnWriteArrayList<>();
+        // The candidate is random: take its lock on another connection just before the real lock call.
+        // Stubbed inside a transaction: the lock method is MANDATORY and the stubbing call passes its interceptor.
+        transactionTemplate.executeWithoutResult(status -> doAnswer(invocation -> {
+            holders.add(HeldDbLock.salonSlugCandidates(dataSource, invocation.getArgument(0)));
+            return RepositorySpies.passThrough(salonRepository, invocation);
+        }).when(salonRepository).lockBookingSlugCandidates(any()));
+
+        ResponseEntity<String> response;
+        try {
+            response = post(ownerToken, "Zainiatyi Kandydat");
+        } finally {
+            for (HeldDbLock holder : holders) {
+                holder.close();
+            }
+        }
+
+        assertThat(holders).as("the candidate lock was contended").isNotEmpty();
+        assertThat(response.getStatusCode()).as("body=%s", response.getBody()).isEqualTo(HttpStatus.CONFLICT);
+        assertThat(activeSalonCount(ownerId)).isZero();
     }
 
     // ── helpers ────────────────────────────────────────────────────────────────

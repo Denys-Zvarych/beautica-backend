@@ -57,6 +57,9 @@ class ReviewEventListenerTest {
     @Mock
     private CacheManager cacheManager;
 
+    @Mock
+    private com.beautica.common.cache.MasterProfileCacheEvictor masterProfileCacheEvictor;
+
     @InjectMocks
     private ReviewEventListener reviewEventListener;
 
@@ -129,6 +132,40 @@ class ReviewEventListenerTest {
         assertThat(listAppender.list)
                 .as("no ERROR log must be emitted on success path")
                 .noneMatch(e -> e.getLevel() == Level.ERROR);
+    }
+
+    // ── phase 380 audit: booking-slug-info is evicted AFTER the review pages ───────────────────
+
+    @Test
+    @DisplayName("should_evictSlugInfoAfterReviewPages_when_reviewCreated")
+    void should_evictSlugInfoAfterReviewPages_when_reviewCreated() {
+        UUID masterId = UUID.randomUUID();
+        com.github.benmanes.caffeine.cache.Cache<Object, Object> reviewPages =
+                com.github.benmanes.caffeine.cache.Caffeine.newBuilder().build();
+        reviewPages.put("master:" + masterId + ":sort:NEWEST:page:0:size:5", "stale-reviews");
+        org.springframework.cache.Cache springCache = org.mockito.Mockito.mock(org.springframework.cache.Cache.class);
+        org.mockito.Mockito.when(springCache.getNativeCache()).thenReturn(reviewPages);
+        org.mockito.Mockito.when(cacheManager.getCache("reviews-by-master")).thenReturn(springCache);
+        java.util.concurrent.atomic.AtomicReference<Boolean> pagesGoneWhenSlugEvicted =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        org.mockito.Mockito.doAnswer(inv -> {
+            TransactionSynchronizationManager.registerSynchronization(
+                    new org.springframework.transaction.support.TransactionSynchronization() {
+                        @Override
+                        public void afterCompletion(int status) {
+                            pagesGoneWhenSlugEvicted.set(reviewPages.asMap().isEmpty());
+                        }
+                    });
+            return null;
+        }).when(masterProfileCacheEvictor).evictBookingSlugInfoAfterCommit(masterId);
+
+        reviewEventListener.onReviewCreated(new ReviewCreatedEvent(masterId, UUID.randomUUID(), null, null));
+        TransactionSynchronizationManager.getSynchronizations().forEach(sync ->
+                sync.afterCompletion(org.springframework.transaction.support.TransactionSynchronization.STATUS_COMMITTED));
+
+        assertThat(pagesGoneWhenSlugEvicted.get())
+                .as("the slug-info eviction must run after the reviews-by-master pages are gone")
+                .isTrue();
     }
 
     // ── onReviewCreated — salon rating recalculation (Phase 13.6) ──────────────
@@ -246,6 +283,7 @@ class ReviewEventListenerTest {
 
         @MockBean RatingRecalculationService ratingRecalculationService;
         @MockBean ApplicationEventPublisher  eventPublisher;
+        @MockBean com.beautica.common.cache.MasterProfileCacheEvictor masterProfileCacheEvictor;
 
         @Autowired ReviewEventListener reviewEventListener;
         @Autowired CacheManager        cacheManager;

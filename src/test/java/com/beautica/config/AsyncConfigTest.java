@@ -226,6 +226,124 @@ class AsyncConfigTest {
         }
     }
 
+    /**
+     * Phase 390 (perf LOW): {@code smsSendExecutor} now also carries the guest provider-cancellation
+     * SMS, whose outbox row is SENT once queued — an SMS abandoned at shutdown is never retried, so the
+     * pool reports how many it dropped. Counts only; a clean drain is silent.
+     */
+    @Nested
+    @DisplayName("smsSendExecutor — shutdown abandonment reporting")
+    class SmsSendShutdownLossReporting {
+
+        private static final int TEST_GRACE_SECONDS = 1;
+
+        private ListAppender<ILoggingEvent> logAppender;
+        private ch.qos.logback.classic.Logger configLogger;
+
+        @BeforeEach
+        void attachAppender() {
+            logAppender = new ListAppender<>();
+            logAppender.start();
+            configLogger = (ch.qos.logback.classic.Logger) LoggerFactory.getLogger(AsyncConfig.class);
+            configLogger.addAppender(logAppender);
+        }
+
+        @AfterEach
+        void detachAppender() {
+            configLogger.detachAppender(logAppender);
+            logAppender.stop();
+        }
+
+        @Test
+        @DisplayName("the production smsSendExecutor bean is the loss-reporting executor")
+        void should_buildSmsSendExecutorAsReportingExecutor_when_configured() {
+            assertThat(asyncConfig.smsSendExecutor())
+                    .isInstanceOf(AsyncConfig.SmsSendLossReportingTaskExecutor.class);
+        }
+
+        @Test
+        @DisplayName("an expired grace reports the abandoned SMS count at ERROR, counts only")
+        void should_reportAbandonedSmsCount_when_theShutdownGraceExpires() throws Exception {
+            AsyncConfig.SmsSendLossReportingTaskExecutor executor = reportingExecutor();
+            CountDownLatch running = new CountDownLatch(1);
+            CountDownLatch release = new CountDownLatch(1);
+            try {
+                executor.execute(() -> {
+                    running.countDown();
+                    try {
+                        release.await(30, TimeUnit.SECONDS);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                });
+                assertThat(running.await(5, TimeUnit.SECONDS))
+                        .as("fixture: the single worker never picked up the gated task")
+                        .isTrue();
+                for (int i = 0; i < 3; i++) {
+                    executor.execute(smsBearingTask());
+                }
+
+                executor.shutdown();
+            } finally {
+                release.countDown();
+                executor.getThreadPoolExecutor().shutdownNow();
+            }
+
+            List<ILoggingEvent> errors = logAppender.list.stream()
+                    .filter(e -> e.getLevel() == Level.ERROR)
+                    .toList();
+            assertThat(errors).as("exactly one abandonment report").hasSize(1);
+            assertThat(errors.get(0).getFormattedMessage())
+                    .contains(AsyncConfig.SmsSendLossReportingTaskExecutor.LOSS_EVENT)
+                    .contains("executor=smsSendExecutor")
+                    .contains("queuedTasksAbandoned=3")
+                    .contains("inFlightTasksKilled=1")
+                    .contains("graceSeconds=" + TEST_GRACE_SECONDS)
+                    .doesNotContain("+380501234567")
+                    .doesNotContain("скасовано");
+        }
+
+        @Test
+        @DisplayName("a shutdown that drains every SMS logs no abandonment report")
+        void should_logNothing_when_shutdownDrainsEverySms() {
+            AsyncConfig.SmsSendLossReportingTaskExecutor executor = reportingExecutor();
+            try {
+                executor.execute(() -> { });
+            } finally {
+                executor.shutdown();
+            }
+
+            assertThat(logAppender.list)
+                    .noneSatisfy(e -> assertThat(e.getFormattedMessage())
+                            .contains(AsyncConfig.SmsSendLossReportingTaskExecutor.LOSS_EVENT));
+        }
+
+        private AsyncConfig.SmsSendLossReportingTaskExecutor reportingExecutor() {
+            AsyncConfig.SmsSendLossReportingTaskExecutor executor =
+                    new AsyncConfig.SmsSendLossReportingTaskExecutor(TEST_GRACE_SECONDS);
+            executor.setCorePoolSize(1);
+            executor.setMaxPoolSize(1);
+            executor.setQueueCapacity(50);
+            executor.setThreadNamePrefix("sms-send-");
+            executor.initialize();
+            return executor;
+        }
+
+        private static Runnable smsBearingTask() {
+            return new Runnable() {
+                @Override
+                public void run() {
+                    // never reached — abandoned at shutdown
+                }
+
+                @Override
+                public String toString() {
+                    return "+380501234567 Beautica: Ваш запис скасовано.";
+                }
+            };
+        }
+    }
+
     @Nested
     @DisplayName("smsReminderExecutor bean")
     class SmsReminderExecutor {

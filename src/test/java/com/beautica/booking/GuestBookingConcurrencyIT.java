@@ -104,7 +104,7 @@ class GuestBookingConcurrencyIT {
         ZonedDateTime startsAt = ZonedDateTime.now(KYIV)
                 .plusDays(3).withHour(14).withMinute(0).withSecond(0).withNano(0);
         String body = """
-                {"serviceId":"%s","startsAt":"%s","name":"Олена","surname":"Коваль"}
+                {"serviceId":"%s","startsAt":"%s","name":"Олена","surname":"Коваль","privacyAccepted":true,"privacyPolicyVersion":"2026-10-20"}
                 """.formatted(masterServiceId, startsAt.toOffsetDateTime());
 
         String url = "/api/v1/book/" + slug + "/booking";

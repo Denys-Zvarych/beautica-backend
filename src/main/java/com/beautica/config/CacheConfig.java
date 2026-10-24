@@ -1,7 +1,9 @@
 package com.beautica.config;
 
 import com.beautica.booking.service.BookingMasterService;
+import com.beautica.booking.service.RetiredBookingSlugGuard;
 import com.beautica.client.service.ClientPassportService;
+import com.beautica.common.cache.SalonBookingInfoCacheEvictor;
 import com.beautica.common.cache.UserProfileCacheEvictor;
 import com.beautica.location.SettlementDisplayNameResolver;
 import com.beautica.location.service.SettlementSearchService;
@@ -93,6 +95,13 @@ public class CacheConfig {
     public static final long CLIENT_PASSPORT_TTL_MINUTES = 10;
 
     /**
+     * TTL of {@code salon-booking-slug-info} (perf audit L2): the upper bound on a salon page lagging a
+     * committed write when the after-commit value scan races an in-flight {@code sync=true} load (see
+     * {@code SalonBookingInfoCacheEvictor}). Public so {@code PublicSalonBookingInfoIT} asserts the LIVE cache.
+     */
+    public static final long SALON_BOOKING_SLUG_INFO_TTL_SECONDS = 30;
+
+    /**
      * Per-cache TTL configuration using individual Caffeine caches.
      *
      * Cache inventory:
@@ -118,10 +127,16 @@ public class CacheConfig {
      *                         bookability verdict (Phase 23.x, SlotCalculationService#hasBookableFutureSlot)
      *                         gating both the booking master-list and the salon catalogue — 60 sec TTL,
      *                         max 500; evicted by master prefix on every schedule AND booking write
-     *   master-bookable-days — availability-aware per-date bookability projection per
-     *                         master/from/to/masterService (SlotCalculationService#getBookableWorkingDays,
-     *                         backs GET /masters/{masterId}/working-days?serviceId=…) — 60 sec TTL,
-     *                         max 2000; evicted by master prefix on every schedule AND booking write
+     *   master-bookable-days — availability-aware per-date bookability projection, two key variants
+     *                         sharing one cache: {masterId,from,to,masterServiceId} (single-service
+     *                         overload) and {masterId,from,to,List&lt;UUID&gt;} (multi-service visit overload,
+     *                         phase 387 — an unmodifiable copy of the ordered id list, never the caller's
+     *                         list; a List never equals a bare UUID, so the variants cannot collide)
+     *                         (SlotCalculationService#getBookableWorkingDays, backs
+     *                         GET /masters/{masterId}/working-days?serviceId=… AND the public
+     *                         GET /book/{slug}/bookable-days) — 60 sec TTL, max 2000, sync=true on the
+     *                         multi-service variant; evicted by master prefix on every schedule AND
+     *                         booking write (masterId is the first key element in both variants)
      *   master-by-user      — stable userId→Master entity mapping; TTL-only eviction — 10 min TTL, max 500 entries
      *   master-detail         — masterId→MasterDetailResponse DTO for public GET /masters/{masterId} — 5 min TTL, max 1000 entries
      *   master-detail-by-user — userId→Optional&lt;MasterDetailResponse&gt; for GET /masters/me — 10 min
@@ -180,6 +195,10 @@ public class CacheConfig {
      *   localityTaxonomyFacts  — fused city-exists/has-districts/district-child resolution
      *                            per (cityId,districtId) write-validation pair — 24 h TTL,
      *                            max 600 entries (an admission FENCE, not a capacity estimate)
+     *   retired-booking-slugs  — Phase 379 audit (perf F1): KNOWN-RETIRED tombstone keys
+     *                            (RetiredBookingSlugGuard) — 24 h TTL, max 10 000 entries;
+     *                            positives only (a 404 slug may later be issued); no eviction path
+     *                            (tombstones are append-only and never re-issued)
      *
      * <p>Note on {@code search:*}: short TTL is preferred over explicit
      * {@code @CacheEvict} on master/salon write paths because discovery results
@@ -667,6 +686,18 @@ public class CacheConfig {
                 Caffeine.newBuilder()
                         .maximumSize(2_000)
                         .expireAfterWrite(24, TimeUnit.HOURS));
+        // Phase 379 audit (perf LOW F1/F2) — known-retired booking-link tombstones, consulted by
+        // RetiredBookingSlugGuard on the public slug MISS path so repeated hits on a dead link cost
+        // no DB query. POSITIVES ONLY: the guard has no loader — it calls put only on a confirmed
+        // tombstone and never stores negatives — a 404 slug may later be issued, so a negative must
+        // never be pinned.
+        // A positive never goes stale: retired_booking_slugs is append-only and a retired slug is
+        // never re-issued (378 D3), hence no eviction path and a long TTL. Value is Boolean.TRUE,
+        // key is "<kind>:<slug_hash>" (~70 chars) — 10 000 entries is well under 2 MB.
+        registerMetered(manager, meterRegistry, RetiredBookingSlugGuard.KNOWN_RETIRED_CACHE,
+                Caffeine.newBuilder()
+                        .maximumSize(10_000)
+                        .expireAfterWrite(24, TimeUnit.HOURS));
         // Phase 346 — shared cityId -> (city name, oblast name) labels
         // (SettlementDisplayNameResolver#resolve) denormalised into users/salons city/region on
         // every cityId write. Sibling of cityOblastId above: static Flyway-seed data, 24h TTL, no
@@ -716,6 +747,18 @@ public class CacheConfig {
                         .maximumSize(500)
                         .expireAfterWrite(60, TimeUnit.SECONDS)
                         .build());
+        // Phase 377 — the salon twin behind GET /api/v1/book/s/{slug}/info, keyed on the salon slug
+        // (SalonBookingSlugService#findBySlug, sync=true — §F-7). Same size as booking-slug-info.
+        // SalonBookingInfoCacheEvictor drops the entry after commit (by salonId / listed master slug — a
+        // bounded value scan, never clear()) on salon edits/deactivation and on every write that moves the
+        // salon's bookable-master list. TTL 30 s (perf audit L2), half booking-slug-info's: a value scan
+        // cannot see a sync=true load still IN FLIGHT (no value yet), so a load that read pre-commit state
+        // can land after the scan; the TTL is the bound on that stale window.
+        manager.registerCustomCache(SalonBookingInfoCacheEvictor.CACHE,
+                Caffeine.newBuilder()
+                        .maximumSize(500)
+                        .expireAfterWrite(SALON_BOOKING_SLUG_INFO_TTL_SECONDS, TimeUnit.SECONDS)
+                        .build());
         // Phase 23.x (perf/security #2) — public salon service catalogue behind
         // GET /api/v1/salons/{salonId}/services, keyed on salonId. permitAll + uncached previously ran
         // an O(distinct masters) free-slot compute per hit (schedule resolve + booking load per master),
@@ -726,6 +769,15 @@ public class CacheConfig {
         // or a service-definition mutation, flips the bookable-service set, so the 60-sec TTL is a backstop
         // not the primary invalidation. 500 entries cover the most-browsed salons at current scale.
         registerMetered(manager, meterRegistry, "salon-service-catalog",
+                Caffeine.newBuilder()
+                        .maximumSize(500)
+                        .expireAfterWrite(60, TimeUnit.SECONDS));
+        // Phase 391 (+ audit perf MEDIUM-1) — the salon catalogue's twin for the public salon booking page: the
+        // catalogue AND service → bookable (masterId, masterServiceId) coverage from ONE batch
+        // (ServiceCatalogService#getSalonCatalogSnapshot), keyed on salonId. Same size/TTL as salon-service-catalog
+        // and evicted by the SAME SalonCatalogCacheEvictor calls, so it is never staler than the app's catalogue;
+        // sync=true on the @Cacheable (§F-7).
+        registerMetered(manager, meterRegistry, com.beautica.service.service.ServiceCatalogService.SALON_CATALOG_SNAPSHOT_CACHE,
                 Caffeine.newBuilder()
                         .maximumSize(500)
                         .expireAfterWrite(60, TimeUnit.SECONDS));
@@ -759,6 +811,7 @@ public class CacheConfig {
         // no-op rather than a loud failure — while @Cacheable on the read side failed loudly. Fail
         // at context refresh instead.
         assertCustomRegistration(manager, UserProfileCacheEvictor.USER_PROFILE_CACHE);
+        assertCustomRegistration(manager, RetiredBookingSlugGuard.KNOWN_RETIRED_CACHE);
         return manager;
     }
 

@@ -139,6 +139,7 @@ class CachePrefixEvictionKeyShapeTest {
     @MockBean BookingSlugService bookingSlugService;
     @MockBean AuthorizationService authorizationService;
     @MockBean SalonCatalogCacheEvictor salonCatalogCacheEvictor;
+    @MockBean com.beautica.common.cache.MasterProfileCacheEvictor masterProfileCacheEvictor;
 
     // SlotCalculationService collaborators
     @MockBean MasterServiceRepository masterServiceRepository;

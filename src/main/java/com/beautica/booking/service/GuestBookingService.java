@@ -1,7 +1,9 @@
 package com.beautica.booking.service;
 
 import com.beautica.booking.dto.AvailableSlotResponse;
+import com.beautica.booking.dto.BookingLinkKind;
 import com.beautica.booking.dto.BookingPriceRange;
+import com.beautica.booking.domain.GuestConsent;
 import com.beautica.booking.dto.GuestBookingRequest;
 import com.beautica.booking.dto.GuestBookingResponse;
 import com.beautica.booking.entity.Appointment;
@@ -15,6 +17,7 @@ import com.beautica.common.util.Placeholders;
 import com.beautica.common.util.UkrainianPlurals;
 import com.beautica.auth.phoneotp.GuestTokenProvider;
 import com.beautica.config.BookingSmsProperties;
+import com.beautica.master.dto.MasterWorkingDayResponse;
 import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.notification.inapp.entity.InAppNotificationType;
@@ -40,6 +43,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.function.Supplier;
 
 /**
  * Creates auto-confirmed guest (LINK) bookings from the public booking link
@@ -76,6 +80,12 @@ public class GuestBookingService {
     // Phase 333 — see InAppNotificationService's class javadoc for why this is a separate seam from
     // outboxService, never called from it.
     private final InAppNotificationService inAppNotificationService;
+    /** Phase 379 — 410 for a retired master slug on the miss path (availability, bookable-days, booking). */
+    private final RetiredBookingSlugGuard retiredBookingSlugGuard;
+    /** Phases 392/393 — {@code (salonSlug, masterId)} → bookable master for the salon-scoped guest routes. */
+    private final SalonGuestMasterResolver salonGuestMasterResolver;
+    /** Phase 393 audit — max 10 bookings per guest token (jti), shared by both create routes. */
+    private final GuestTokenBookingCap guestTokenBookingCap;
 
     public GuestBookingService(
             GuestTokenProvider guestTokenProvider,
@@ -91,7 +101,10 @@ public class GuestBookingService {
             VisitPlanner visitPlanner,
             @Value("${app.frontend.base-url}") String frontendBaseUrl,
             Clock clock,
-            InAppNotificationService inAppNotificationService) {
+            InAppNotificationService inAppNotificationService,
+            RetiredBookingSlugGuard retiredBookingSlugGuard,
+            SalonGuestMasterResolver salonGuestMasterResolver,
+            GuestTokenBookingCap guestTokenBookingCap) {
         this.guestTokenProvider = guestTokenProvider;
         this.masterRepository = masterRepository;
         this.masterServiceRepository = masterServiceRepository;
@@ -106,6 +119,9 @@ public class GuestBookingService {
         this.frontendBaseUrl = frontendBaseUrl;
         this.kyivClock = clock.withZone(TimeZones.KYIV);
         this.inAppNotificationService = inAppNotificationService;
+        this.retiredBookingSlugGuard = retiredBookingSlugGuard;
+        this.salonGuestMasterResolver = salonGuestMasterResolver;
+        this.guestTokenBookingCap = guestTokenBookingCap;
     }
 
     /**
@@ -119,8 +135,8 @@ public class GuestBookingService {
      */
     @Transactional(readOnly = true)
     public List<AvailableSlotResponse> availableSlots(String slug, LocalDate date, UUID serviceId) {
-        Master master = resolveMasterForDate(slug, date);
-        return slotCalculationService.getAvailableSlots(master.getId(), date, serviceId);
+        UUID masterId = resolveMasterIdForDate(slug, date);
+        return slotCalculationService.getAvailableSlots(masterId, date, serviceId);
     }
 
     /**
@@ -132,8 +148,25 @@ public class GuestBookingService {
      */
     @Transactional(readOnly = true)
     public List<AvailableSlotResponse> availableSlots(String slug, LocalDate date, List<UUID> serviceIds) {
-        Master master = resolveMasterForDate(slug, date);
-        return slotCalculationService.getAvailableSlots(master.getId(), date, serviceIds);
+        UUID masterId = resolveMasterIdForDate(slug, date);
+        return slotCalculationService.getAvailableSlots(masterId, date, serviceIds);
+    }
+
+    /**
+     * Phase 392 — the salon-scoped twin of the two {@code availableSlots} overloads
+     * ({@code GET /book/s/{slug}/masters/{masterId}/availability}): same guest window checked first, same slot
+     * core and the same N=1 → cached single-service / N&gt;1 → summed-visit routing; only the master resolution
+     * differs ({@link SalonGuestMasterResolver}: the master must be active in the active salon behind
+     * {@code salonSlug}). A service the master does not perform is the core's own 404.
+     */
+    @Transactional(readOnly = true)
+    public List<AvailableSlotResponse> salonAvailableSlots(
+            String salonSlug, UUID masterId, LocalDate date, List<UUID> serviceIds) {
+        assertWithinGuestWindow(date, LocalDate.now(kyivClock));
+        UUID resolvedId = salonGuestMasterResolver.resolveBookableMasterId(salonSlug, masterId);
+        return serviceIds.size() == 1
+                ? slotCalculationService.getAvailableSlots(resolvedId, date, serviceIds.get(0))
+                : slotCalculationService.getAvailableSlots(resolvedId, date, serviceIds);
     }
 
     /**
@@ -143,20 +176,92 @@ public class GuestBookingService {
      * @throws NotFoundException when the slug is unknown / master inactive (→ 404)
      * @throws BusinessException with 400 when the date is in the past or too far ahead
      */
-    private Master resolveMasterForDate(String slug, LocalDate date) {
+    private UUID resolveMasterIdForDate(String slug, LocalDate date) {
+        assertWithinGuestWindow(date, LocalDate.now(kyivClock));
+        return resolveBookableMasterId(slug);
+    }
+
+    /**
+     * Phase 387 — per-date bookable flags for the public booking page's calendar
+     * ({@code GET /api/v1/book/{slug}/bookable-days}), so the website greys out dates without free time
+     * exactly as the app calendar does. Pure delegation to the app's own day-gate
+     * ({@link SlotCalculationService#getBookableWorkingDays}) — no second day calculation — so a date is
+     * {@code working = true} iff {@link #availableSlots} would return a non-empty list for it.
+     *
+     * <p>Guards, all BEFORE the slug lookup (a malformed range never costs a DB hit): both ends must sit in
+     * the same guest window {@link #availableSlots} enforces per date ({@code [today, today +
+     * availabilityMaxDays]}, Kyiv), and {@code from <= to}. That also bounds the cache key space of the
+     * reused {@code master-bookable-days} cache to that window; the core's own 63-date span cap still
+     * applies on top. Unknown slug / inactive master or salon, and an unknown, foreign or inactive
+     * service, are the same indistinguishable 404s as {@link #availableSlots}.
+     *
+     * <p>N=1 goes to the cached single-service overload, N>1 to the multi-service one (summed duration) —
+     * the same routing {@code MasterController#getWorkingDays} uses, done here on another bean so the
+     * {@code @Cacheable} proxy stays effective.
+     */
+    @Transactional(readOnly = true)
+    public List<MasterWorkingDayResponse> bookableDays(
+            String slug, LocalDate from, LocalDate to, List<UUID> serviceIds) {
+        return bookableDaysOf(() -> resolveBookableMasterId(slug), from, to, serviceIds);
+    }
+
+    /**
+     * Phase 392 — the salon-scoped twin of {@link #bookableDays}
+     * ({@code GET /book/s/{slug}/masters/{masterId}/bookable-days}): identical guards (window + {@code from <= to},
+     * before any DB read) and day-gate; the master resolves through {@link SalonGuestMasterResolver}.
+     */
+    @Transactional(readOnly = true)
+    public List<MasterWorkingDayResponse> salonBookableDays(
+            String salonSlug, UUID masterId, LocalDate from, LocalDate to, List<UUID> serviceIds) {
+        return bookableDaysOf(
+                () -> salonGuestMasterResolver.resolveBookableMasterId(salonSlug, masterId), from, to, serviceIds);
+    }
+
+    /** The shared body of both bookable-days routes; {@code masterIdResolver} runs only after the guards. */
+    private List<MasterWorkingDayResponse> bookableDaysOf(
+            Supplier<UUID> masterIdResolver, LocalDate from, LocalDate to, List<UUID> serviceIds) {
         LocalDate today = LocalDate.now(kyivClock);
+        assertWithinGuestWindow(from, today);
+        assertWithinGuestWindow(to, today);
+        if (from.isAfter(to)) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST, "from must not be after to");
+        }
+        UUID masterId = masterIdResolver.get();
+        return serviceIds.size() == 1
+                ? slotCalculationService.getBookableWorkingDays(masterId, from, to, serviceIds.get(0))
+                : slotCalculationService.getBookableWorkingDays(masterId, from, to, serviceIds);
+    }
+
+    /** The guest date window shared by {@link #availableSlots} and {@link #bookableDays} (400 outside it). */
+    private void assertWithinGuestWindow(LocalDate date, LocalDate today) {
         if (date.isBefore(today)) {
             throw new BusinessException(HttpStatus.BAD_REQUEST, "date is in the past");
         }
         if (date.isAfter(today.plusDays(smsProperties.getAvailabilityMaxDays()))) {
             throw new BusinessException(HttpStatus.BAD_REQUEST, "date too far ahead");
         }
-        // No .filter(Master::isActive) here: findByBookingSlugWithUser's own JPQL already carries
-        // `AND m.isActive = true AND (s IS NULL OR s.isActive = true)` — the full MasterBookability
-        // rule — so the Optional is either empty or holds a bookable master. The filter was a
-        // strictly weaker duplicate of half that predicate. Guarded by MasterRepositoryBookingSlugTest.
-        return masterRepository.findByBookingSlugWithUser(slug)
-                .orElseThrow(() -> new NotFoundException("Booking page not found"));
+    }
+
+    /**
+     * Slug → bookable master id for the two guest slot reads (phase 387 audit, perf LOW): one scalar
+     * statement instead of hydrating Master + User + Salon just to read the id. The visibility rule — active
+     * master, salon active or none, attached user — lives in the finder's JPQL, a mirror of
+     * {@code findByBookingSlugWithUser} (the SOLE enforcement point, see that finder); nothing is
+     * re-checked here. Guarded by MasterRepositoryBookingSlugTest (real query).
+     */
+    private UUID resolveBookableMasterId(String slug) {
+        return masterRepository.findBookableIdByBookingSlug(slug)
+                .orElseThrow(() -> bookingPageNotFound(slug));
+    }
+
+    /**
+     * Phase 379 D2 — the public-slug miss: 410 when the slug is a retired {@code kind} link
+     * ({@link RetiredBookingSlugGuard}), otherwise the unchanged 404. Only ever reached after the live
+     * resolver missed, so a valid link pays no extra query.
+     */
+    private NotFoundException bookingPageNotFound(String slug) {
+        retiredBookingSlugGuard.throwGoneIfRetired(BookingLinkKind.MASTER, slug);
+        return new NotFoundException("Booking page not found");
     }
 
     /**
@@ -173,7 +278,45 @@ public class GuestBookingService {
      */
     @Transactional
     public GuestBookingResponse createGuestBooking(String bearerToken, String slug, GuestBookingRequest req) {
-        String guestPhone = extractGuestPhone(bearerToken);
+        // See resolveBookableMasterId: the liveness + salon-active rule lives in the finder's JPQL,
+        // so no redundant .filter(Master::isActive) is applied on top of it.
+        return createFor(bearerToken, () -> masterRepository.findByBookingSlugWithUser(slug)
+                .orElseThrow(() -> bookingPageNotFound(slug)), req);
+    }
+
+    /**
+     * Phase 393 — the salon-scoped twin of {@link #createGuestBooking}
+     * ({@code POST /book/s/{slug}/masters/{masterId}/booking}): the SAME body, guest token, lead-time/horizon,
+     * consent, comment, schedule-fit gate, advisory lock, notifications and after-commit SMS + eviction — only the
+     * master resolves through {@link SalonGuestMasterResolver} (active master of the active salon behind
+     * {@code salonSlug}, no master booking slug involved).
+     *
+     * <p><b>One call per master.</b> A salon visit split across N masters is N calls, each its own transaction,
+     * its own appointment / booking, cancel token, confirmation SMS and response. The website sends them
+     * sequentially with the ONE guest token its single OTP verification returned: the guest token is a 30-minute
+     * bearer, not single-use (it never was — see {@code GuestTokenProvider}), so reuse across the N calls needs
+     * no new scope. It stays bounded by that TTL, the per-IP guest-booking bucket (10 / 15 min,
+     * {@code AuthRateLimitFilter}) and — independent of the caller's IP — the per-token cap of 10 committed
+     * bookings ({@link GuestTokenBookingCap}, phase 393 audit), all consumed by every call, master or salon route.
+     */
+    @Transactional
+    public GuestBookingResponse createSalonGuestBooking(
+            String bearerToken, String salonSlug, UUID masterId, GuestBookingRequest req) {
+        return createFor(bearerToken,
+                () -> salonGuestMasterResolver.resolveBookableMaster(salonSlug, masterId), req);
+    }
+
+    /**
+     * The shared create body of both guest routes. Order is load-bearing: token (401) → per-token booking cap
+     * (429, phase 393 audit — reserved here, released if this transaction rolls back) → start-time window (400) →
+     * master resolution (404/410) → service / slot checks. {@code masterResolver} runs inside this transaction, so
+     * the returned master stays managed.
+     */
+    private GuestBookingResponse createFor(
+            String bearerToken, Supplier<Master> masterResolver, GuestBookingRequest req) {
+        GuestTokenProvider.GuestTokenClaims guest = extractGuestClaims(bearerToken);
+        guestTokenBookingCap.reserve(guest);
+        String guestPhone = guest.phone();
 
         // MEDIUM-fix (Phase 13.3): enforce the SAME lead-time floor + max-window cap as the
         // authenticated BookingService path. The DTO's @Future alone permitted a CONFIRMED
@@ -181,10 +324,7 @@ public class GuestBookingService {
         // kyivClock and the injected clock share an Instant, so the zone is irrelevant here.
         BookingStartsAtValidator.validate(req.startsAt(), kyivClock);
 
-        // See resolveMasterForDate: the liveness + salon-active rule lives in the finder's JPQL,
-        // so no redundant .filter(Master::isActive) is applied on top of it.
-        Master master = masterRepository.findByBookingSlugWithUser(slug)
-                .orElseThrow(() -> new NotFoundException("Booking page not found"));
+        Master master = masterResolver.get();
 
         // BE-7: a masterServiceIds list (even a single element) is a multi-service VISIT — ONE Appointment
         // header + N chained CONFIRMED bookings sharing one cancel token and one reminder. A legacy
@@ -285,15 +425,18 @@ public class GuestBookingService {
                 bookingRepository, master.getId(), firstStart, lastEnd);
 
         UUID cancelToken = UUID.randomUUID();
+        // ONE consent instance for the header and every child: identical values by construction.
+        GuestConsent consent = consentOf(req);
         Appointment appointment = Appointment.guestAppointment(
-                master.getSalon(), req.name(), req.surname(), guestPhone, cancelToken);
+                master.getSalon(), req.name(), req.surname(), guestPhone, cancelToken, consent,
+                BookingComments.normalize(req.clientComment()));
 
         List<Booking> children = new ArrayList<>(items.size());
         for (VisitPlanner.PlannedItem item : items) {
             Booking child = Booking.guestBooking(
                     master, item.masterService(), master.getSalon(),
                     item.startsAt(), item.endsAt(), item.price(), item.priceMax(),
-                    item.duration(), item.buffer(), req.name(), req.surname(), guestPhone);
+                    item.duration(), item.buffer(), req.name(), req.surname(), guestPhone, consent);
             child.setAppointment(appointment);
             children.add(child);
         }
@@ -322,12 +465,12 @@ public class GuestBookingService {
         return buildVisitResponse(master, appointment, saved.get(0), items, cancelUrl);
     }
 
-    private String extractGuestPhone(String bearerToken) {
+    private GuestTokenProvider.GuestTokenClaims extractGuestClaims(String bearerToken) {
         if (bearerToken == null || bearerToken.isBlank()) {
             throw new io.jsonwebtoken.security.SignatureException("Missing guest token");
         }
         String token = bearerToken.startsWith("Bearer ") ? bearerToken.substring(7).trim() : bearerToken.trim();
-        return guestTokenProvider.validate(token);
+        return guestTokenProvider.validateClaims(token);
     }
 
     /**
@@ -372,8 +515,18 @@ public class GuestBookingService {
         Booking booking = Booking.guestBooking(
                 master, msa, master.getSalon(), startsAt, endsAt,
                 price, BookingPriceRange.resolveCeiling(msa),
-                duration, buffer, req.name(), req.surname(), guestPhone);
+                duration, buffer, req.name(), req.surname(), guestPhone, consentOf(req),
+                BookingComments.normalize(req.clientComment()));
         return BookingSlotLockGuard.saveOrConflict(bookingRepository, booking);
+    }
+
+    /**
+     * Phase 381 — the guest's privacy consent for the row(s) being created: the policy version the
+     * boundary validated ({@code @AssertTrue privacyAccepted} + format-checked version) stamped with the
+     * SERVER clock, never a client-supplied time. The values are persisted only — never logged.
+     */
+    private GuestConsent consentOf(GuestBookingRequest req) {
+        return new GuestConsent(kyivClock.instant(), req.privacyPolicyVersion());
     }
 
     private void registerAfterCommit(Master master, MasterServiceAssignment msa,
@@ -399,7 +552,7 @@ public class GuestBookingService {
             slotCalculationService.evictMasterAvailabilityCaches(master.getId());
             // A flipped verdict can add/remove a service from the salon catalogue (perf/security #2).
             if (salonId != null) {
-                salonCatalogCacheEvictor.evict(salonId);
+                salonCatalogCacheEvictor.evictCatalogOnly(salonId);
             }
             bookingSmsDispatcher.dispatch(
                     BookingSmsDispatcher.Kind.GUEST_CONFIRMATION, guestPhone, smsText);
@@ -424,7 +577,7 @@ public class GuestBookingService {
             // load-bearing and must not be swapped back.
             slotCalculationService.evictMasterAvailabilityCaches(master.getId());
             if (salonId != null) {
-                salonCatalogCacheEvictor.evict(salonId);
+                salonCatalogCacheEvictor.evictCatalogOnly(salonId);
             }
             bookingSmsDispatcher.dispatch(
                     BookingSmsDispatcher.Kind.GUEST_CONFIRMATION, guestPhone, smsText);

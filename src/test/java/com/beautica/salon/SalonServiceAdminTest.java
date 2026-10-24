@@ -104,6 +104,9 @@ class SalonServiceAdminTest {
     @Mock
     private com.beautica.salon.service.StaffAccountDisposalService staffAccountDisposalService;
 
+    // Phase 379 D7 — deactivateSalon tombstones the salon slug; @InjectMocks would pass null.
+    @Mock private com.beautica.booking.service.DeletedBookingSlugTombstoner deletedBookingSlugTombstoner;
+
     @InjectMocks
     private SalonService salonService;
 

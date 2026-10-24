@@ -142,6 +142,45 @@ class GuestPiiProviderViewIT extends AbstractIntegrationTest {
     }
 
     @Test
+    @DisplayName("phase 386 D4: the provider detail shows the guest phone BEFORE anonymisation and guestPhone is null AFTER the retention job")
+    void should_nullGuestPhoneOnProviderDetail_when_guestBookingAnonymisedByJob() throws Exception {
+        UUID link = fx.link(provider, "COMPLETED", cutoff.atOffset(ZoneOffset.UTC).minusHours(3), PHONE, null);
+        UUID walkIn = fx.staffWalkIn(provider, "COMPLETED", cutoff.atOffset(ZoneOffset.UTC).minusHours(6), PHONE);
+
+        for (UUID id : new UUID[] {link, walkIn}) {
+            JsonNode before = objectMapper.readTree(get("/api/v1/bookings/" + id).getBody()).path("data");
+            assertThat(before.path("guestPhone").asText()).as("before anonymisation").isEqualTo(PHONE);
+        }
+
+        service.anonymiseDue(cutoff);
+
+        for (UUID id : new UUID[] {link, walkIn}) {
+            ResponseEntity<String> after = get("/api/v1/bookings/" + id);
+            assertThat(after.getStatusCode()).isEqualTo(HttpStatus.OK);
+            assertThat(objectMapper.readTree(after.getBody()).path("data").path("guestPhone").isNull())
+                    .as("after anonymisation, body=%s", after.getBody()).isTrue();
+            assertNoPii(after.getBody());
+        }
+    }
+
+    @Test
+    @DisplayName("phase 386 D4: after the internal ERASE endpoint the provider detail's guestPhone is null and the digits are gone from the body")
+    void should_nullGuestPhoneOnProviderDetail_when_guestBookingErasedThroughEndpoint() throws Exception {
+        UUID upcoming = fx.link(provider, "CONFIRMED", OffsetDateTime.now(ZoneOffset.UTC).plusDays(3), PHONE,
+                UUID.randomUUID());
+        assertThat(objectMapper.readTree(get("/api/v1/bookings/" + upcoming).getBody()).path("data")
+                .path("guestPhone").asText()).isEqualTo(PHONE);
+
+        assertThat(eraseThroughEndpoint(PHONE_LOCAL).getStatusCode()).isEqualTo(HttpStatus.OK);
+
+        ResponseEntity<String> after = get("/api/v1/bookings/" + upcoming);
+        assertThat(after.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(objectMapper.readTree(after.getBody()).path("data").path("guestPhone").isNull())
+                .as("body=%s", after.getBody()).isTrue();
+        assertNoPii(after.getBody());
+    }
+
+    @Test
     @DisplayName("the running context binds app.guest-pii-retention through AppConfigProperties and, in the test profile, has no job bean")
     void should_bindRetentionProperties_and_omitJob_when_testProfile() {
         assertThat(properties)

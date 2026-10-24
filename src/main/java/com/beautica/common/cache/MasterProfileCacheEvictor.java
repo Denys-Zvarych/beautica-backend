@@ -1,6 +1,7 @@
 package com.beautica.common.cache;
 
 import com.beautica.auth.Role;
+import com.beautica.master.repository.MasterRepository;
 import com.beautica.search.service.SearchCacheNames;
 import org.springframework.cache.Cache;
 import org.springframework.cache.CacheManager;
@@ -8,6 +9,8 @@ import org.springframework.stereotype.Component;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
+import java.util.Collection;
+import java.util.List;
 import java.util.UUID;
 
 /**
@@ -28,6 +31,9 @@ import java.util.UUID;
  *       master and per-key eviction is impossible. Same rule {@code UserService} applies to a
  *       master's search-visible profile fields. Writers here are rare, user-initiated profile
  *       edits, not booking traffic, so the clear cannot become a hot-path herd.</li>
+ *   <li>{@code salon-booking-slug-info} (phase 377) — every public salon booking page that lists this
+ *       master (matched by its {@code bookingSlug}; {@link SalonBookingInfoCacheEvictor}), since that page
+ *       renders the master's avatar and a replaced avatar's blob is purged.</li>
  * </ul>
  *
  * <p><b>Ordering.</b> {@code afterCommit}, never inline (Anti-Bug §F-2): an inline evict lets a
@@ -43,9 +49,102 @@ public class MasterProfileCacheEvictor {
     public static final String BOOKING_SLUG_INFO_CACHE = "booking-slug-info";
 
     private final CacheManager cacheManager;
+    private final SalonBookingInfoCacheEvictor salonBookingInfoCacheEvictor;
 
-    public MasterProfileCacheEvictor(CacheManager cacheManager) {
+    private final MasterRepository masterRepository;
+
+    public MasterProfileCacheEvictor(
+            CacheManager cacheManager,
+            SalonBookingInfoCacheEvictor salonBookingInfoCacheEvictor,
+            MasterRepository masterRepository) {
         this.cacheManager = cacheManager;
+        this.salonBookingInfoCacheEvictor = salonBookingInfoCacheEvictor;
+        this.masterRepository = masterRepository;
+    }
+
+    /**
+     * Phase 380 D6 — evicts the ONE {@code booking-slug-info} entry of {@code masterId} after commit
+     * (immediately outside a transaction), for writers whose data rides in that payload besides the
+     * profile: reviews and portfolio photos. The slug is resolved with {@link MasterRepository#findBookingSlugById}
+     * at call time; a master without a slug, or a {@code null} id, is a no-op. Callers that already hold the
+     * slug use {@link #evictBookingSlugInfoBySlugAfterCommit} and skip that read. Never {@code clear()}s the cache.
+     */
+    public void evictBookingSlugInfoAfterCommit(UUID masterId) {
+        if (masterId == null) {
+            return;
+        }
+        evictBookingSlugInfoBySlugAfterCommit(masterRepository.findBookingSlugById(masterId).orElse(null));
+    }
+
+    /**
+     * Batched twin for writers that touch several masters (a service-definition change): ONE slug lookup for
+     * the whole set instead of one per master. Empty or {@code null} input is a no-op.
+     */
+    public void evictBookingSlugInfoAfterCommit(Collection<UUID> masterIds) {
+        if (masterIds == null || masterIds.isEmpty()) {
+            return;
+        }
+        registerSlugEviction(masterRepository.findBookingSlugsByIdIn(masterIds));
+    }
+
+    /**
+     * Phase 380 audit — the no-lookup form: evicts the {@code booking-slug-info} entry of an already-known
+     * {@code slug} after commit. A {@code null} slug (legacy master, no page exists) is a no-op.
+     */
+    public void evictBookingSlugInfoBySlugAfterCommit(String slug) {
+        if (slug == null) {
+            return;
+        }
+        registerSlugEviction(List.of(slug));
+    }
+
+    /**
+     * Phase 378 audit (perf LOW-2) — batched no-lookup form: evicts the {@code booking-slug-info} entries of
+     * already-known {@code slugs} after commit. {@code null} or empty is a no-op.
+     */
+    public void evictBookingSlugInfoBySlugsAfterCommit(Collection<String> slugs) {
+        if (slugs == null || slugs.isEmpty()) {
+            return;
+        }
+        registerSlugEviction(List.copyOf(slugs));
+    }
+
+    /**
+     * Phase 384 D5 — drops the public SALON booking page ({@code salon-booking-slug-info}) of {@code salonId} after
+     * commit (immediately outside a transaction): the page now carries the salon's portfolio and reviews header,
+     * so salon photo uploads/deletes call this. Delegates to {@link SalonBookingInfoCacheEvictor} — the one salon
+     * page evictor (profile edits and catalogue changes already reach it through SalonService and
+     * SalonCatalogCacheEvictor).
+     */
+    public void evictSalonBookingPageAfterCommit(UUID salonId) {
+        salonBookingInfoCacheEvictor.evictSalonAfterCommit(salonId);
+    }
+
+    /** Immediate form of {@link #evictSalonBookingPageAfterCommit}, for callers already past the commit. */
+    public void evictSalonBookingPage(UUID salonId) {
+        salonBookingInfoCacheEvictor.evictSalon(salonId);
+    }
+
+    private void registerSlugEviction(Collection<String> slugs) {
+        if (slugs.isEmpty()) {
+            return;
+        }
+        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            slugs.forEach(slug -> evictKey(BOOKING_SLUG_INFO_CACHE, slug));
+            return;
+        }
+        // afterCompletion + STATUS_COMMITTED == "after commit, never on rollback", but unlike a bare
+        // afterCommit it still fires when the caller itself runs inside an outer transaction's
+        // afterCommit phase (ReviewEventListener), and Spring contains a throwing afterCompletion
+        // instead of turning a committed write's response into a 500.
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCompletion(int status) {
+                if (status == STATUS_COMMITTED) {
+                    slugs.forEach(slug -> evictKey(BOOKING_SLUG_INFO_CACHE, slug));
+                }
+            }
+        });
     }
 
     /**
@@ -81,6 +180,7 @@ public class MasterProfileCacheEvictor {
         evictKey(MASTER_BY_USER_CACHE, userId);
         evictKey(MASTER_DETAIL_CACHE, masterId);
         evictKey(BOOKING_SLUG_INFO_CACHE, bookingSlug);
+        salonBookingInfoCacheEvictor.evictByMasterSlug(bookingSlug);
         if (clearSearch) {
             clearSearchCaches();
         }

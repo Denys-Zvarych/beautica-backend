@@ -10,6 +10,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.orm.jpa.TestEntityManager;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 
 import java.math.BigDecimal;
@@ -44,6 +45,9 @@ class MasterRepositoryBookingSlugTest extends AbstractDataJpaTest {
 
     @Autowired
     private TestEntityManager em;
+
+    @Autowired
+    private JdbcTemplate jdbcTemplate;
 
     @Test
     @DisplayName("resolves the master when the employing salon is ACTIVE")
@@ -114,6 +118,78 @@ class MasterRepositoryBookingSlugTest extends AbstractDataJpaTest {
                 .isPresent();
     }
 
+    // ── phase 387 audit — findBookableIdByBookingSlug mirrors findByBookingSlugWithUser ───────
+
+    @Test
+    @DisplayName("findBookableIdByBookingSlug resolves the id when the salon is active and when there is no salon")
+    void should_resolveId_when_bookableIdFinderSeesBookableMaster() {
+        Master salonMaster = persistSalonMaster("id-active-ab12", true, true);
+        Master solo = persistIndependentMaster("id-solo-cd34");
+
+        Optional<UUID> salonFound = masterRepository.findBookableIdByBookingSlug("id-active-ab12");
+        Optional<UUID> soloFound = masterRepository.findBookableIdByBookingSlug("id-solo-cd34");
+
+        assertThat(salonFound).contains(salonMaster.getId());
+        assertThat(soloFound)
+                .as("LEFT salon join: an INDEPENDENT_MASTER must still resolve")
+                .contains(solo.getId());
+    }
+
+    @Test
+    @DisplayName("findBookableIdByBookingSlug is empty for a closed salon, an inactive master and an unknown slug")
+    void should_returnEmpty_when_bookableIdFinderSeesUnbookableMaster() {
+        persistSalonMaster("id-closed-ef56", true, false);
+        persistSalonMaster("id-inactive-ab78", false, true);
+
+        Optional<UUID> closedSalon = masterRepository.findBookableIdByBookingSlug("id-closed-ef56");
+        Optional<UUID> inactiveMaster = masterRepository.findBookableIdByBookingSlug("id-inactive-ab78");
+        Optional<UUID> unknown = masterRepository.findBookableIdByBookingSlug("id-unknown-cd90");
+
+        assertThat(closedSalon).as("salon-active term must match findByBookingSlugWithUser").isEmpty();
+        assertThat(inactiveMaster).as("master-active term must match findByBookingSlugWithUser").isEmpty();
+        assertThat(unknown).isEmpty();
+    }
+
+    // ── phase 375 — race-safe lazy issue: conditional UPDATE + native re-read ─────────────
+
+    @Test
+    @DisplayName("assignBookingSlugIfAbsent writes the slug once; a second candidate matches 0 rows and never overwrites")
+    void should_writeOnceAndNeverOverwrite_when_assignBookingSlugIfAbsentCalledTwice() {
+        Master master = persistIndependentMaster(null);
+
+        int first = masterRepository.assignBookingSlugIfAbsent(master.getId(), "first-wins-ab12");
+        int second = masterRepository.assignBookingSlugIfAbsent(master.getId(), "second-loses-cd34");
+
+        assertThat(first).as("legacy NULL row must accept the first candidate").isEqualTo(1);
+        assertThat(second).as("IS NULL guard must reject a later candidate").isZero();
+        assertThat(masterRepository.findBookingSlugById(master.getId()))
+                .as("a link already handed out must never be silently replaced")
+                .contains("first-wins-ab12");
+    }
+
+    @Test
+    @DisplayName("assignBookingSlugIfAbsent fuses a transaction-local 3s lock_timeout into the UPDATE (perf L3)")
+    void should_setTransactionLocalLockTimeout_when_assignBookingSlugIfAbsentRuns() {
+        Master master = persistIndependentMaster(null);
+        jdbcTemplate.execute("SET LOCAL lock_timeout = '0'");
+
+        int written = masterRepository.assignBookingSlugIfAbsent(master.getId(), "fused-timeout-ab12");
+
+        assertThat(written).isEqualTo(1);
+        assertThat(jdbcTemplate.queryForObject("SELECT current_setting('lock_timeout')", String.class))
+                .as("the conditional UPDATE must bound its row-lock wait like the salon twin")
+                .isEqualTo("3s");
+    }
+
+    @Test
+    @DisplayName("findBookingSlugById → empty for an unknown id, null-slug row reads as empty")
+    void should_returnEmpty_when_findBookingSlugByIdUnknownOrNull() {
+        Master legacy = persistIndependentMaster(null);
+
+        assertThat(masterRepository.findBookingSlugById(UUID.randomUUID())).isEmpty();
+        assertThat(masterRepository.findBookingSlugById(legacy.getId())).isEmpty();
+    }
+
     // ── fixtures ─────────────────────────────────────────────────────────────────────
 
     private Master persistSalonMaster(String slug, boolean masterActive, boolean salonActive) {
@@ -142,7 +218,7 @@ class MasterRepositoryBookingSlugTest extends AbstractDataJpaTest {
         return master;
     }
 
-    private void persistIndependentMaster(String slug) {
+    private Master persistIndependentMaster(String slug) {
         User user = persistUser(Role.INDEPENDENT_MASTER);
         Master master = Master.builder()
                 .user(user)
@@ -155,6 +231,7 @@ class MasterRepositoryBookingSlugTest extends AbstractDataJpaTest {
         em.persist(master);
         em.flush();
         em.clear();
+        return master;
     }
 
     /** Real (cheap-cost) BCrypt rather than a literal hash string — Anti-Bug §M5. */

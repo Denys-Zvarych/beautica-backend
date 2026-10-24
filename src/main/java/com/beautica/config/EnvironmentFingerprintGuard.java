@@ -433,12 +433,42 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
         } else if (isPlaceholderDomain(domainOf(adminEmail))) {
             violations.add("rule prod-admin-email-placeholder: ADMIN_EMAIL must not use a reserved test/example domain in prod");
         }
+        checkProdTurnstile(env, violations);
         // The EFFECTIVE recipient: APP_ADMIN_EMAIL (relaxed binding of app.admin-email) overrides ADMIN_EMAIL.
         String effective = readOrNull(env, "app.admin-email");
         if (!isBlank(effective) && !effective.strip().equalsIgnoreCase(adminEmail == null ? "" : adminEmail.strip())
                 && (!isEmailShaped(effective.strip()) || isPlaceholderDomain(domainOf(effective)))) {
             violations.add("rule prod-admin-email-effective: app.admin-email (APP_ADMIN_EMAIL override) must be a real "
                     + "address (not a reserved test/example domain) in prod");
+        }
+    }
+
+    /**
+     * Phase 382 D7. Cloudflare's published always-pass / always-fail / forced-interaction TEST secrets
+     * ({@code 1x}/{@code 2x}/{@code 3x} + 31 zeros + {@code AA}, 35 chars). The phase doc spells the
+     * quantifier {@code {33}}, which does not match its own staging default; {@code {31}} is the real shape.
+     */
+    private static final java.util.regex.Pattern TURNSTILE_TEST_SECRET =
+            java.util.regex.Pattern.compile("^[123]x0{31}AA$");
+
+    private static final String TURNSTILE_SITEVERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
+
+    private static void checkProdTurnstile(Environment env, List<String> violations) {
+        if (!Boolean.parseBoolean(boundOrNull(env, "app.turnstile.enabled"))) {
+            violations.add("rule prod-turnstile-disabled: app.turnstile.enabled must be true in prod");
+        }
+        // Phase 382 audit: a redirected siteverify URL would send the real secret and every visitor token to a
+        // third party (or to a stub that always says success). Prod must call exactly Cloudflare.
+        String siteverifyUrl = boundOrNull(env, "app.turnstile.siteverify-url");
+        if (siteverifyUrl == null || !TURNSTILE_SITEVERIFY_URL.equals(siteverifyUrl.strip())) {
+            violations.add("rule prod-turnstile-siteverify-url: app.turnstile.siteverify-url must be exactly "
+                    + TURNSTILE_SITEVERIFY_URL + " in prod");
+        }
+        String secret = boundOrNull(env, "app.turnstile.secret-key");
+        if (isBlank(secret)) {
+            violations.add("rule prod-turnstile-secret-blank: TURNSTILE_SECRET_KEY (app.turnstile.secret-key) must be set in prod");
+        } else if (TURNSTILE_TEST_SECRET.matcher(secret.strip()).matches()) {
+            violations.add("rule prod-turnstile-secret-test-key: TURNSTILE_SECRET_KEY must not be a Cloudflare test secret in prod");
         }
     }
 
@@ -556,6 +586,12 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
         }
         if (smsModeOf(env) != SmsMode.CAPTURE) {
             violations.add("rule staging-sms-mode: beautica.sms.mode must be capture in staging");
+        }
+        // Phase 382 D7: a REAL secret on staging is a leak risk and would reject the test widget's dummy token.
+        String turnstileSecret = boundOrNull(env, "app.turnstile.secret-key");
+        if (isBlank(turnstileSecret) || !TURNSTILE_TEST_SECRET.matcher(turnstileSecret.strip()).matches()) {
+            violations.add("rule staging-turnstile-secret-not-test-key: TURNSTILE_SECRET_KEY must be a Cloudflare "
+                    + "test secret (or unset, for the default) in staging");
         }
     }
 

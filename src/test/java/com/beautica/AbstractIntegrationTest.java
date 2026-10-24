@@ -93,6 +93,8 @@ public abstract class AbstractIntegrationTest {
         jdbcTemplate.execute("DELETE FROM schedule_exception_times");
         jdbcTemplate.execute("DELETE FROM weekly_schedules");
         jdbcTemplate.execute("DELETE FROM schedule_exceptions");
+        // Phase 378 — tombstones reference masters / salons / users (ON DELETE SET NULL): delete first.
+        jdbcTemplate.execute("DELETE FROM retired_booking_slugs");
         jdbcTemplate.execute("DELETE FROM masters");
         jdbcTemplate.execute("DELETE FROM invite_tokens");
         jdbcTemplate.execute("DELETE FROM salons");

@@ -127,6 +127,9 @@ class ServiceCatalogServiceTest {
     private SalonCatalogCacheEvictor salonCatalogCacheEvictor;
 
     @Mock
+    private com.beautica.common.cache.MasterProfileCacheEvictor masterProfileCacheEvictor;
+
+    @Mock
     private com.beautica.master.service.MasterSearchVisibilityGuard searchVisibilityGuard;
 
     // Phase 307 D4 — unassignServiceFromMaster's per-assignment future-CONFIRMED-booking guard.

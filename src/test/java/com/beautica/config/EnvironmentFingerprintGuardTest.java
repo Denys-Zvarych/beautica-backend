@@ -20,6 +20,11 @@ class EnvironmentFingerprintGuardTest {
 
     private static final String SECRET = "tok-S3cr3t-value-9xQ";
     private static final String VALID_KEY = TestSecrets.INTERNAL_API_KEY;
+    /** Cloudflare's published always-pass TEST secret. */
+    private static final String TURNSTILE_TEST_SECRET = "1x0000000000000000000000000000000AA";
+    private static final String TURNSTILE_SITEVERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
+    /** Shape of a real secret (never a real one): 35 chars, not a test key. */
+    private static final String TURNSTILE_REAL_SECRET = "0x4AAAAAAAfixtureNotARealSecretZZ9";
 
     private static MockEnvironment stagingEnv() {
         MockEnvironment env = new MockEnvironment()
@@ -31,7 +36,10 @@ class EnvironmentFingerprintGuardTest {
                 .withProperty("app.frontend.base-url", "https://example.invalid")
                 .withProperty("app.cloudflare-r2.public-url", "https://media.staging.beautica.test")
                 .withProperty("app.support.email", "support@test.invalid")
-                .withProperty("app.internal-api-key", VALID_KEY);
+                .withProperty("app.internal-api-key", VALID_KEY)
+                // Phase 382: the staging overlay turns Turnstile on with Cloudflare's always-pass test secret.
+                .withProperty("app.turnstile.enabled", "true")
+                .withProperty("app.turnstile.secret-key", TURNSTILE_TEST_SECRET);
         env.setActiveProfiles("prod", "staging");
         return env;
     }
@@ -59,7 +67,11 @@ class EnvironmentFingerprintGuardTest {
                 .withProperty("app.mail.transport", "brevo-api")
                 .withProperty("app.mail.brevo-api.api-key", "xkeysib-guard-fixture")
                 .withProperty("app.mail.brevo-api.base-url", "https://api.brevo.com")
-                .withProperty("app.mail.logo-url", "https://beautica.app/email/logo.png");
+                .withProperty("app.mail.logo-url", "https://beautica.app/email/logo.png")
+                // Phase 382: prod must run Turnstile with a real (non-test) secret.
+                .withProperty("app.turnstile.enabled", "true")
+                .withProperty("app.turnstile.secret-key", TURNSTILE_REAL_SECRET)
+                .withProperty("app.turnstile.siteverify-url", TURNSTILE_SITEVERIFY_URL);
         env.setActiveProfiles("prod");
         return env;
     }
@@ -198,7 +210,9 @@ class EnvironmentFingerprintGuardTest {
                 .withProperty("app.public-base-url", "https://api.staging.beautica.test")
                 .withProperty("app.frontend.base-url", "https://example.invalid")
                 .withProperty("app.support.email", "support@test.invalid")
-                .withProperty("app.internal-api-key", VALID_KEY);
+                .withProperty("app.internal-api-key", VALID_KEY)
+                .withProperty("app.turnstile.enabled", "true")
+                .withProperty("app.turnstile.secret-key", TURNSTILE_TEST_SECRET);
         noRailway.setActiveProfiles("prod", "staging");
 
         assertThatCode(() -> run(noRailway, DeployEnvironment.STAGING, SmsMode.CAPTURE)).doesNotThrowAnyException();
@@ -1058,5 +1072,85 @@ class EnvironmentFingerprintGuardTest {
         assertThat(org.springframework.test.util.ReflectionTestUtils.getField(guard, "log")).isSameAs(deferred);
         assertThat(EnvironmentFingerprintGuard.class.getConstructors()).hasSize(1);
         org.mockito.Mockito.verify(factory).getLog(EnvironmentFingerprintGuard.class);
+    }
+
+    // ── Phase 382 D7 — Turnstile rules ───────────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("prod with Turnstile disabled fails naming prod-turnstile-disabled, not the secret")
+    void should_fail_when_prodTurnstileDisabled() {
+        MockEnvironment env = prodEnv().withProperty("app.turnstile.enabled", "false");
+
+        assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("prod-turnstile-disabled")
+                .hasMessageNotContaining(TURNSTILE_REAL_SECRET);
+    }
+
+    @Test
+    @DisplayName("prod with a blank Turnstile secret fails naming prod-turnstile-secret-blank")
+    void should_fail_when_prodTurnstileSecretBlank() {
+        MockEnvironment env = prodEnv().withProperty("app.turnstile.secret-key", "  ");
+
+        assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("prod-turnstile-secret-blank");
+    }
+
+    @Test
+    @DisplayName("prod with any Cloudflare test secret (1x/2x/3x) fails naming prod-turnstile-secret-test-key, never the value")
+    void should_fail_when_prodTurnstileSecretIsTestKey() {
+        for (String testKey : new String[] {"1x0000000000000000000000000000000AA",
+                "2x0000000000000000000000000000000AA", "3x0000000000000000000000000000000AA"}) {
+            MockEnvironment env = prodEnv().withProperty("app.turnstile.secret-key", testKey);
+
+            assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("prod-turnstile-secret-test-key")
+                    .hasMessageNotContaining(testKey);
+        }
+    }
+
+    @Test
+    @DisplayName("staging with a REAL Turnstile secret fails naming staging-turnstile-secret-not-test-key, never the value")
+    void should_fail_when_stagingTurnstileSecretIsReal() {
+        MockEnvironment env = stagingEnv().withProperty("app.turnstile.secret-key", TURNSTILE_REAL_SECRET);
+
+        assertThatThrownBy(() -> run(env, DeployEnvironment.STAGING, SmsMode.CAPTURE))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("staging-turnstile-secret-not-test-key")
+                .hasMessageNotContaining(TURNSTILE_REAL_SECRET);
+    }
+
+    @Test
+    @DisplayName("staging accepts each of the three Cloudflare test secrets")
+    void should_pass_when_stagingTurnstileSecretIsAnyTestKey() {
+        for (String testKey : new String[] {"1x0000000000000000000000000000000AA",
+                "2x0000000000000000000000000000000AA", "3x0000000000000000000000000000000AA"}) {
+            MockEnvironment env = stagingEnv().withProperty("app.turnstile.secret-key", testKey);
+
+            assertThatCode(() -> run(env, DeployEnvironment.STAGING, SmsMode.CAPTURE)).doesNotThrowAnyException();
+        }
+    }
+
+    @Test
+    @DisplayName("prod with a redirected or non-Cloudflare siteverify URL fails naming prod-turnstile-siteverify-url")
+    void should_fail_when_prodSiteverifyUrlIsNotCloudflare() {
+        for (String url : new String[] {"https://evil.example/turnstile/v0/siteverify",
+                "http://challenges.cloudflare.com/turnstile/v0/siteverify",
+                "https://challenges.cloudflare.com/turnstile/v0/siteverify/", "http://localhost:8089/siteverify", ""}) {
+            MockEnvironment env = prodEnv().withProperty("app.turnstile.siteverify-url", url);
+
+            assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                    .as("url=%s", url)
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("prod-turnstile-siteverify-url");
+        }
+    }
+
+    @Test
+    @DisplayName("prod with the exact Cloudflare siteverify URL passes the URL rule")
+    void should_pass_when_prodSiteverifyUrlIsCloudflare() {
+        assertThatCode(() -> run(prodEnv(), DeployEnvironment.PROD, SmsMode.TURBOSMS)).doesNotThrowAnyException();
     }
 }
