@@ -187,6 +187,14 @@ public class SalonService {
     // Owns every native cache scan (CacheKeyScanOwnershipTest) — the logo-change search-page
     // eviction delegates its by-value scan here.
     private final com.beautica.common.cache.MasterCachePrefixEvictor cachePrefixEvictor;
+    // Phase 376 — the shared name-based slug generator (masters + salons); a new salon's permanent
+    // public booking slug is generated here and written with the INSERT.
+    private final com.beautica.booking.service.BookingSlugService bookingSlugService;
+    // Phase 377 — the public salon booking page (GET /book/s/{slug}/info) renders the salon's name, city,
+    // logo, cover and active state; every write that evicts salon-detail evicts it too, after commit.
+    private final com.beautica.common.cache.SalonBookingInfoCacheEvictor salonBookingInfoCacheEvictor;
+    /** Phase 379 D7 — a deleted salon's link answers 410 (tombstone DELETED). */
+    private final com.beautica.booking.service.DeletedBookingSlugTombstoner deletedBookingSlugTombstoner;
 
     /**
      * Hard ceiling on rows returned by {@link #listSalonInvites}.
@@ -333,6 +341,17 @@ public class SalonService {
                 .instagramUrl(normalizeInstagram(request.instagramUrl()))
                 .isActive(true)
                 .isPrimary(isFirstSalon)
+                // Phase 376 D4: issued at creation, in the same INSERT (no follow-up UPDATE); legacy
+                // NULL rows are issued by BookingSlugService#issueMissingSalonSlugs. Never changes.
+                // 376 audit — the probe-then-INSERT cannot collide: generateSalonSlug takes the
+                // candidate's advisory lock (held to THIS transaction's commit) before probing, the same
+                // lock every salon-slug writer takes. Prevention, not catch-and-retry: a unique violation
+                // aborts the whole Postgres transaction (no JPA savepoints — nestedTransactionAllowed is
+                // off and would not restore the persistence context anyway), and the INSERT may only
+                // flush at commit, outside any in-method catch. Other violations are untouched.
+                // Its fused set_config('lock_timeout', '3s', true) is transaction-local, so from here
+                // on the 3 s lock_timeout also bounds every later lock wait in this createSalon transaction.
+                .bookingSlug(bookingSlugService.generateSalonSlug(request.name()))
                 .build();
         salon.applySettlementDisplayNames(settlementNames);
 
@@ -612,6 +631,9 @@ public class SalonService {
                 if (cache != null) {
                     cache.evict(salonId);
                 }
+                // Phase 377 — same writers (update, logo/cover, deactivation) change the public salon
+                // booking page; already inside afterCommit, so the direct evict is correctly ordered.
+                salonBookingInfoCacheEvictor.evictSalon(salonId);
             }
         });
     }
@@ -1494,6 +1516,10 @@ public class SalonService {
         // save() was a redundant no-op write (PERF-LOW). The findByIdAndOwnerId load is retained:
         // it enforces existence + ownership scoping and cannot be dropped.
         salon.setActive(false);
+        // Phase 379 D7 — deletion is final (no reactivation path), so the salon's shared link answers 410
+        // «Посилання більше не дійсне» instead of 404. Same transaction; the page cache is evicted after
+        // commit below (evictSalonDetailCacheAfterCommit → SalonBookingInfoCacheEvictor#evictSalon).
+        deletedBookingSlugTombstoner.tombstoneSalon(salon.getId(), salon.getBookingSlug());
 
         // Phase 268 — capture the salon's image URLs and pre-read its media_files rows NOW, while
         // `salon` is still managed. Both are needed by the R2 sweep this method registers after commit

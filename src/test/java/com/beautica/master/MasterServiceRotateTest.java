@@ -78,6 +78,7 @@ class MasterServiceRotateTest {
     // evictor, so @InjectMocks must have one or the replayed synchronization NPEs. Mock is correct at
     // this tier — key-shape correctness is proven in CachePrefixEvictionKeyShapeTest.
     @Mock private com.beautica.common.cache.MasterCachePrefixEvictor cachePrefixEvictor;
+    @Mock private com.beautica.common.cache.MasterProfileCacheEvictor masterProfileCacheEvictor;
 
     // Mobile Phase 111: MasterService publishes a SalonStaffChangedEvent from every staff-set
     // mutation so the salon's derived rating is recomputed. @InjectMocks must carry this or the
@@ -89,6 +90,10 @@ class MasterServiceRotateTest {
     // (deactivateMaster, createMasterForOwner). @InjectMocks passes null for an UNDECLARED
     // collaborator silently — declared so no path here NPEs on a null evictor.
     @Mock private com.beautica.common.cache.UserProfileCacheEvictor userProfileCacheEvictor;
+
+    // Phase 377: rotation's afterCommit evicts both salons' bookability-derived caches through the
+    // salon-catalogue evictor — declared so the replayed synchronization does not NPE on a null one.
+    @Mock private com.beautica.service.service.SalonCatalogCacheEvictor salonCatalogCacheEvictor;
 
     @InjectMocks
     private MasterService masterService;
@@ -112,6 +117,7 @@ class MasterServiceRotateTest {
                 .id(masterId)
                 .masterType(MasterType.SALON_MASTER)
                 .isActive(true)
+                .bookingSlug("rotated-master-cd34")
                 .build();
         ReflectionTestUtils.setField(master, "user", user);
         ReflectionTestUtils.setField(master, "salon", sourceSalon);
@@ -153,6 +159,11 @@ class MasterServiceRotateTest {
         // MEDIUM fix: master-by-user must be evicted on every write path that mutates this row,
         // mirroring deactivateMaster/createMasterForOwner.
         verify(masterByUserCache).evict(masterUserId);
+        // Phase 377: both salons' bookable lists moved — catalogue + public salon booking page.
+        verify(salonCatalogCacheEvictor).evict(sourceSalonId);
+        verify(salonCatalogCacheEvictor).evict(destSalonId);
+        // Phase 380 audit F1: the master's own public page renders its salon ref, so it is evicted too.
+        verify(masterProfileCacheEvictor).evictBookingSlugInfoBySlugAfterCommit("rotated-master-cd34");
         // Mobile Phase 111 — a rotation changes TWO staff sets, so it must publish TWICE: the
         // source salon loses this master's scores, the destination gains them. Verifying only
         // one would let a half-wired rotation (the classic bug shape here) pass.

@@ -19,6 +19,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.dao.CannotAcquireLockException;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.dao.PessimisticLockingFailureException;
+import org.springframework.http.CacheControl;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
@@ -40,6 +41,7 @@ import org.springframework.web.multipart.support.MissingServletRequestPartExcept
 import org.springframework.web.servlet.NoHandlerFoundException;
 import org.springframework.web.servlet.resource.NoResourceFoundException;
 
+import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.UUID;
@@ -93,6 +95,15 @@ import java.util.stream.Collectors;
 public class GlobalExceptionHandler {
 
     private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
+
+    /**
+     * Phase 379 audit (perf LOW F1) — a retired booking link is never re-issued, so its 410 is immutable:
+     * {@code public, max-age=0, s-maxage=3600} lets a shared cache/CDN absorb repeated dead-link hits for an
+     * hour while a browser still revalidates. Same shape as {@code PublicBookingController#INFO_CACHE_CONTROL}.
+     * Set on the {@code ResponseEntity} so Spring Security's default {@code no-cache} header writer stays off.
+     */
+    static final CacheControl GONE_CACHE_CONTROL =
+            CacheControl.maxAge(Duration.ZERO).sMaxAge(Duration.ofHours(1)).cachePublic();
 
     @ExceptionHandler(VerificationException.class)
     public ResponseEntity<ApiResponse<VerificationErrorResponse>> handleVerification(VerificationException ex) {
@@ -330,6 +341,18 @@ public class GlobalExceptionHandler {
                 .body(ApiResponse.error(ServiceUnavailableMessages.PORTFOLIO_BUSY));
     }
 
+    /**
+     * 400 for a rejected Turnstile verification (phase 382 D3): the fixed "Verification failed" text,
+     * which {@link #handleBusiness}'s genericised BAD_REQUEST branch ("Invalid request") would replace.
+     * The most specific handler wins, so declaration order relative to {@link #handleBusiness} is irrelevant.
+     */
+    @ExceptionHandler(TurnstileRejectedException.class)
+    public ResponseEntity<ApiResponse<Void>> handleTurnstileRejected(TurnstileRejectedException ex) {
+        return ResponseEntity
+                .status(HttpStatus.BAD_REQUEST)
+                .body(ApiResponse.error(TurnstileRejectedException.CLIENT_MESSAGE));
+    }
+
     @ExceptionHandler(BusinessException.class)
     public ResponseEntity<ApiResponse<Void>> handleBusiness(BusinessException ex) {
         log.debug("Business exception: {}", ex.getMessage());
@@ -383,6 +406,21 @@ public class GlobalExceptionHandler {
         return ResponseEntity
                 .status(HttpStatus.NOT_FOUND)
                 .body(ApiResponse.error("Resource not found"));
+    }
+
+    /**
+     * Phase 379 D6 — {@code 410 Gone} for a retired public resource (a regenerated / revoked / deleted
+     * booking link). Body: {@code data.code} = {@link GoneException#getCode()} plus the exception's constant
+     * client message; nothing request-derived is echoed (same no-echo policy as {@link #handleNotFound}).
+     * A separate exception type, so the 404 body above is untouched (D9).
+     */
+    @ExceptionHandler(GoneException.class)
+    public ResponseEntity<ApiResponse<GoneErrorResponse>> handleGone(GoneException ex) {
+        log.debug("Gone [{}]", ex.getCode());
+        return ResponseEntity
+                .status(HttpStatus.GONE)
+                .cacheControl(GONE_CACHE_CONTROL)
+                .body(new ApiResponse<>(false, new GoneErrorResponse(ex.getCode()), ex.getMessage()));
     }
 
     @ExceptionHandler(ForbiddenException.class)

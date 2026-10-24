@@ -800,6 +800,30 @@ class ReviewServiceTest {
     }
 
     @Test
+    @DisplayName("getSalonReviewSummary(id, avg, count) equals the id form for the same row and never reads the salon (phase 384 audit)")
+    void should_matchIdForm_and_skipFindById_when_summaryBuiltFromHeldRatings() {
+        UUID salonId = UUID.randomUUID();
+        Salon salon = mock(Salon.class);
+        when(salon.getReviewCount()).thenReturn(3);
+        when(salon.getAvgRating()).thenReturn(new BigDecimal("4.33"));
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+        com.beautica.review.repository.RatingCountProjection five =
+                mock(com.beautica.review.repository.RatingCountProjection.class);
+        when(five.getRating()).thenReturn(5);
+        when(five.getCount()).thenReturn(3L);
+        when(reviewRepository.countBySalonIdGroupByRating(salonId)).thenReturn(List.of(five));
+        var viaId = reviewService.getSalonReviewSummary(salonId);
+        org.mockito.Mockito.clearInvocations(salonRepository);
+
+        var viaRow = reviewService.getSalonReviewSummary(salonId, new BigDecimal("4.33"), 3);
+
+        assertThat(viaRow).isEqualTo(viaId);
+        org.mockito.Mockito.verifyNoInteractions(salonRepository);
+        assertThat(reviewService.getSalonReviewSummary(salonId, new BigDecimal("0.00"), 0).avgRating())
+                .as("zero reviews -> null, never the stored 0.00").isNull();
+    }
+
+    @Test
     @DisplayName("getSalonReviewSummary — avgRating is null when reviewCount is 0")
     void should_returnNullAvgRating_when_salonReviewCountIsZero() {
         UUID salonId = UUID.randomUUID();

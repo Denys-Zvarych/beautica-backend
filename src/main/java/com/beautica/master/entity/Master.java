@@ -22,6 +22,7 @@ import lombok.Builder;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
+import org.hibernate.annotations.Formula;
 import org.springframework.lang.Nullable;
 
 import java.math.BigDecimal;
@@ -116,9 +117,29 @@ public class Master extends AuditableEntity {
     // owns the constraint — legacy NULL rows must stay non-unique. unique=true here would
     // generate a FULL unique constraint under ddl-auto, which is wrong (and drifts under
     // ddl-auto=validate) — omit unique=true. JPA @Index cannot express partial WHERE.
+    //
+    // Phase 378 D12 — updatable = false + no setter (exactly like Salon.bookingSlug): every post-insert
+    // writer is a native conditional UPDATE in MasterRepository (lazy issue, regenerate, revoke). A
+    // stale Master snapshot flushed after a regenerate must never write a retired slug back. The
+    // builder still sets it at INSERT (test fixtures). booking_link_revoked_at has no writable @Column
+    // mapping — its authoritative read is MasterRepository#findBookingLinkStateById. It IS read, via the
+    // read-only @Formula `bookingLinkRevoked` below, which only lets the share path skip work. (This
+    // supersedes V204's "NOT mapped" comment; V204 is applied and immutable, so it cannot be edited.)
     @Nullable
-    @Column(name = "booking_slug", length = 60)
+    @Setter(AccessLevel.NONE)
+    @Column(name = "booking_slug", length = 60, updatable = false)
     private String bookingSlug;
+
+    /**
+     * Phase 378 audit (perf LOW-1) — read-only snapshot of {@code booking_link_revoked_at IS NOT NULL}, taken
+     * with the row by the same SELECT (a {@code @Formula}: never inserted, never updated, no write path). It
+     * lets {@code GET /booking-links/mine} answer a revoked master without opening the issue transaction. It is
+     * a hint only: every writer still decides on the committed state (the conditional UPDATEs re-check the
+     * column). The builder default ({@code false}) is what a fresh fixture row has in the DB.
+     */
+    @Formula("(booking_link_revoked_at IS NOT NULL)")
+    @Setter(AccessLevel.NONE)
+    private boolean bookingLinkRevoked;
 
     // ── detachment snapshot (V157, phase 294 D2) ────────────────────────────────────────────────
     //
@@ -147,6 +168,17 @@ public class Master extends AuditableEntity {
     @Setter(AccessLevel.NONE)
     @Column(name = "detached_at")
     private Instant detachedAt;
+
+    /**
+     * Phase 378 D12 — copies a slug that {@code BookingSlugService#getOrCreateSlug} has ALREADY written
+     * through the native conditional UPDATE onto this managed instance, so the rest of the creating
+     * transaction (and the entity it returns) reads the slug exactly as it did when the slug was set
+     * through a setter. Never a write path: the column is {@code updatable = false}, so dirty-checking
+     * cannot flush this value.
+     */
+    public void mirrorIssuedBookingSlug(String issuedSlug) {
+        this.bookingSlug = issuedSlug;
+    }
 
     /**
      * The provider's first name for display, from whichever of the two states this row is in —

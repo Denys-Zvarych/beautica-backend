@@ -67,7 +67,7 @@ class PhoneOtpIntegrationTest extends AbstractIntegrationTest {
     @DisplayName("POST /book/otp/send — reachable without auth; row persisted as SHA-256, not plaintext")
     void should_persistHashedOtp_when_sendWithoutAuth() throws Exception {
         ResponseEntity<String> response = restTemplate.postForEntity(
-                "/api/v1/book/otp/send", json("{\"phone\":\"" + PHONE + "\"}"), String.class);
+                "/api/v1/book/otp/send", json("{\"phone\":\"" + PHONE + "\",\"privacyAccepted\":true,\"privacyPolicyVersion\":\"2026-10-20\"}"), String.class);
 
         assertThat(response.getStatusCode())
                 .as("endpoint must be reachable with no Authorization header")
@@ -90,7 +90,7 @@ class PhoneOtpIntegrationTest extends AbstractIntegrationTest {
     @DisplayName("full flow: send then verify returns a guest token without auth")
     void should_returnGuestToken_when_verifyAfterSend() throws Exception {
         restTemplate.postForEntity(
-                "/api/v1/book/otp/send", json("{\"phone\":\"" + PHONE + "\"}"), String.class);
+                "/api/v1/book/otp/send", json("{\"phone\":\"" + PHONE + "\",\"privacyAccepted\":true,\"privacyPolicyVersion\":\"2026-10-20\"}"), String.class);
 
         ArgumentCaptor<String> smsText = ArgumentCaptor.forClass(String.class);
         verify(otpSmsSender).send(eq(PHONE), smsText.capture());

@@ -232,8 +232,20 @@ public class BookingService {
                 && canReview(booking.getStatus(), booking.getEndsAt(), now,
                         reviewByClient.isPresent(), hasClient);
         boolean providerCanReviewClient = computeProviderCanReviewClient(actorUserId, booking, now);
-        return enrichSingle(booking, canReview, providerCanReviewClient, now,
+        BookingDetailResponse detail = enrichSingle(booking, canReview, providerCanReviewClient, now,
                 reviewByClient.map(BookingService::toClientAuthoredReview).orElse(null));
+        // Phase 386 D1/D2 (audience per the 2026-10-22 user rule) - the guest's phone, on THIS read only. The audience
+        // is decided explicitly by ROLE: INDEPENDENT_MASTER, SALON_OWNER, SALON_ADMIN. A SALON_MASTER never sees it
+        // (even as the performing master), nor does a CLIENT; the owning-client probe is kept as a second, independent
+        // guard. The wither re-checks booking.getClient() == null, so a registered user's phone has no path in.
+        // Evaluated ONLY for a guest booking (client_id IS NULL, an in-memory FK read, no proxy load): the role read
+        // touches the SecurityContext, which a registered-client booking never needs (direct non-HTTP service calls
+        // carry none) and which adds no statement. The owning-client probe stays as a second, independent guard (free for a
+        // guest booking: null client short-circuits before any role read).
+        return booking.getClient() == null && authz.isGuestPhoneAudience()
+                && !authz.isOwningClientViewer(actorUserId, booking)
+                ? detail.withProviderVisibleGuestPhone(booking)
+                : detail;
     }
 
     /**
@@ -599,7 +611,10 @@ public class BookingService {
                 // path's guest semantics.
                 p.clientReviewCount() == null ? null
                         : BookingDetailResponse.masterAvgRatingOrNull(p.clientReviewCount(), p.clientAvgRating()),
-                p.clientReviewCount());
+                p.clientReviewCount(),
+                // Phase 386: a CLIENT-scoped projection (JOIN b.client) can never be a guest booking, and a
+                // registered client's phone is never provider-visible — null, always.
+                null);
     }
 
     /**
@@ -4116,7 +4131,7 @@ public class BookingService {
             // A flipped bookability verdict can add/remove a service from the salon catalogue
             // (perf/security #2). Null salon (independent master) owns no catalogue entry.
             if (salonId != null) {
-                salonCatalogCacheEvictor.evict(salonId);
+                salonCatalogCacheEvictor.evictCatalogOnly(salonId);
             }
         };
         if (TransactionSynchronizationManager.isSynchronizationActive()) {

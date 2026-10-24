@@ -1,5 +1,6 @@
 package com.beautica.booking.entity;
 
+import com.beautica.booking.domain.GuestConsent;
 import com.beautica.booking.enums.BookingSource;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.enums.CancellationReason;
@@ -418,6 +419,20 @@ public class Booking extends AuditableEntity {
     @Column(name = "guest_pii_anonymised_at", insertable = false, updatable = false)
     private Instant guestPiiAnonymisedAt;
 
+    // ── Guest privacy consent (V202, phase 381) ────────────────────────────────
+    // WHEN a LINK guest accepted WHICH privacy-policy version. Written once by guestBooking(...) from
+    // the server clock; NULL for STAFF/APP rows and for LINK rows that predate V202. NOT personal data,
+    // so the phase 373 anonymisation / erase deliberately leave both columns intact (they prove the
+    // lawful basis after the PII is gone). The DB pair CHECK ck_bookings_guest_privacy_pair keeps the two
+    // NULL or NOT NULL together. Never logged, never in the outbox payload, never in a response DTO.
+    @Nullable
+    @Column(name = "guest_privacy_accepted_at", updatable = false)
+    private Instant guestPrivacyAcceptedAt;
+
+    @Nullable
+    @Column(name = "guest_privacy_policy_version", length = 32, updatable = false)
+    private String guestPrivacyPolicyVersion;
+
     /**
      * Snapshots the sentinel display name and severs the client link — the ONLY writer of
      * {@link #clientDetachedAt}. Mirrors {@code Master#detach} (:228-235): the sentinel, the
@@ -526,6 +541,8 @@ public class Booking extends AuditableEntity {
      * @param guestPhone        E.164 phone copied from the guest JWT {@code sub} (required)
      * @param priceMaxAtBooking frozen RANGE ceiling, or {@code null} for a single price
      *                          (see {@link #priceMaxAtBooking})
+     * @param consent           the guest's privacy consent (phase 381, persisted on the row); {@code null}
+     *                          only for fixtures that model a pre-V202 LINK row
      */
     public static Booking guestBooking(
             Master master,
@@ -539,7 +556,32 @@ public class Booking extends AuditableEntity {
             int bufferMinutesAtBooking,
             String guestName,
             String guestSurname,
-            String guestPhone) {
+            String guestPhone,
+            GuestConsent consent) {
+        return guestBooking(master, masterService, salon, startsAt, endsAt, priceAtBooking, priceMaxAtBooking,
+                durationMinutesAtBooking, bufferMinutesAtBooking, guestName, guestSurname, guestPhone, consent, null);
+    }
+
+    /**
+     * Phase 385 — {@link #guestBooking} with the guest's optional booking-creation note, stored exactly where an app
+     * booking stores {@code clientComment} ({@code bookings.client_comment}). The caller normalises it
+     * ({@code BookingComments#normalize}); {@code null} = no note.
+     */
+    public static Booking guestBooking(
+            Master master,
+            MasterServiceAssignment masterService,
+            Salon salon,
+            OffsetDateTime startsAt,
+            OffsetDateTime endsAt,
+            BigDecimal priceAtBooking,
+            BigDecimal priceMaxAtBooking,
+            int durationMinutesAtBooking,
+            int bufferMinutesAtBooking,
+            String guestName,
+            String guestSurname,
+            String guestPhone,
+            GuestConsent consent,
+            String clientComment) {
         if (guestName == null || guestName.isBlank()) {
             throw new IllegalArgumentException("guestName must not be blank for a LINK booking");
         }
@@ -565,6 +607,9 @@ public class Booking extends AuditableEntity {
                 .guestPhone(guestPhone)
                 .cancelToken(UUID.randomUUID())
                 .reminderSent(false)
+                .guestPrivacyAcceptedAt(consent == null ? null : consent.acceptedAt())
+                .guestPrivacyPolicyVersion(consent == null ? null : consent.policyVersion())
+                .clientComment(clientComment)
                 .build();
     }
 

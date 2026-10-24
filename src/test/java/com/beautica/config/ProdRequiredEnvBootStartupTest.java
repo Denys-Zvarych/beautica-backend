@@ -55,6 +55,8 @@ class ProdRequiredEnvBootStartupTest {
         vars.put("SENTRY_DSN", SENTRY_DSN);
         vars.put("TURBOSMS_TOKEN", "turbosms-fixture-token");
         vars.put("ADMIN_EMAIL", "admin@beautica.ua");
+        // Phase 382 D7: prod requires a REAL (non-Cloudflare-test) Turnstile secret.
+        vars.put("TURNSTILE_SECRET_KEY", "0x4AAAAAAAfixtureNotARealSecretZZ9");
         return vars;
     }
 
@@ -125,6 +127,25 @@ class ProdRequiredEnvBootStartupTest {
         vars.remove("TURBOSMS_TOKEN");
 
         assertThat(guardMessageOfFailedBoot(vars)).contains("rule prod-turbosms-token-blank");
+    }
+
+    @Test
+    @DisplayName("prod-turnstile-secret-blank — prod boot without TURNSTILE_SECRET_KEY aborts")
+    void should_abortBoot_when_prodTurnstileSecretMissing() {
+        Map<String, String> vars = passingProdVars();
+        vars.remove("TURNSTILE_SECRET_KEY");
+
+        assertThat(guardMessageOfFailedBoot(vars)).contains("rule prod-turnstile-secret-blank");
+    }
+
+    @Test
+    @DisplayName("prod-turnstile-secret-test-key — prod boot with a Cloudflare test secret aborts, value not echoed")
+    void should_abortBoot_when_prodTurnstileSecretIsCloudflareTestKey() {
+        Map<String, String> vars = passingProdVars();
+        vars.put("TURNSTILE_SECRET_KEY", "1x0000000000000000000000000000000AA");
+
+        assertThat(guardMessageOfFailedBoot(vars)).contains("rule prod-turnstile-secret-test-key")
+                .doesNotContain("1x0000000000000000000000000000000AA");
     }
 
     @Test

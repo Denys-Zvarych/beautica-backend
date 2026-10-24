@@ -42,6 +42,14 @@ import static com.github.tomakehurst.wiremock.client.WireMock.urlMatching;
 public abstract class AbstractStagingProfileIT extends AbstractIntegrationTest {
 
     private static WireMockServer turbosmsStub;
+    // Phase 382: staging runs the REAL siteverify round trip (default test secret); the endpoint is a stub so
+    // no test reaches Cloudflare. A SEPARATE server from the Turbosms stub: the OTP tests assert that stub
+    // received nothing at all.
+    //
+    // Started ONCE per JVM and never stopped: the Spring context is cached across the subclasses and its
+    // app.turnstile.siteverify-url is bound to this port at first creation, so a per-class stub would be
+    // dead (connection refused -> 503) for every later class that reuses the context.
+    private static final WireMockServer turnstileStub = startTurnstileStub();
 
     @BeforeAll
     static void startTurbosmsStub() {
@@ -55,9 +63,26 @@ public abstract class AbstractStagingProfileIT extends AbstractIntegrationTest {
         turbosmsStub.stop();
     }
 
+    private static WireMockServer startTurnstileStub() {
+        WireMockServer stub = new WireMockServer(WireMockConfiguration.options().dynamicPort());
+        stub.start();
+        stub.stubFor(com.github.tomakehurst.wiremock.client.WireMock.post(
+                        com.github.tomakehurst.wiremock.client.WireMock.urlEqualTo("/turnstile/v0/siteverify"))
+                .willReturn(aResponse().withStatus(200).withHeader("Content-Type", "application/json")
+                        .withBody("{\"success\":true,\"error-codes\":[],\"hostname\":\"example.com\","
+                                + "\"action\":\"test\"}")));
+        return stub;
+    }
+
     @DynamicPropertySource
     static void turbosmsBaseUrl(DynamicPropertyRegistry registry) {
         registry.add("app.sms.turbosms.base-url", () -> "http://localhost:" + turbosmsStub.port() + "/message/send.json");
+        registry.add("app.turnstile.siteverify-url",
+                () -> "http://localhost:" + turnstileStub.port() + "/turnstile/v0/siteverify");
+    }
+
+    protected static WireMockServer turnstileStub() {
+        return turnstileStub;
     }
 
     protected static WireMockServer turbosmsStub() {

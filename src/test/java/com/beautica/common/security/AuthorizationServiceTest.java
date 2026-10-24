@@ -4180,4 +4180,26 @@ class AuthorizationServiceTest {
         verifyNoInteractions(salonRepository);
     }
 
+
+    // ── phase 386: guest-phone audience, decided by ROLE ─────────────────────────────────────
+
+    @org.junit.jupiter.params.ParameterizedTest(name = "{0} -> {1}")
+    @org.junit.jupiter.params.provider.CsvSource({
+            "ROLE_INDEPENDENT_MASTER,true", "ROLE_SALON_OWNER,true", "ROLE_SALON_ADMIN,true",
+            "ROLE_SALON_MASTER,false", "ROLE_CLIENT,false"})
+    @org.junit.jupiter.api.DisplayName("isGuestPhoneAudience is true for INDEPENDENT_MASTER/SALON_OWNER/SALON_ADMIN only - never SALON_MASTER or CLIENT")
+    void should_decideGuestPhoneAudienceByRole(String authority, boolean expected) {
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(UUID.randomUUID(), authority));
+
+        assertThat(authorizationService.isGuestPhoneAudience()).isEqualTo(expected);
+    }
+
+    @org.junit.jupiter.api.Test
+    @org.junit.jupiter.api.DisplayName("isGuestPhoneAudience fails CLOSED (403) with no authentication at all")
+    void should_failClosed_when_noAuthenticationForGuestPhoneAudience() {
+        SecurityContextHolder.clearContext();
+
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> authorizationService.isGuestPhoneAudience())
+                .isInstanceOf(com.beautica.common.exception.ForbiddenException.class);
+    }
 }

@@ -44,6 +44,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.verify;
 
 /**
@@ -63,6 +64,12 @@ import static org.mockito.Mockito.verify;
 class PasswordResetConcurrencyTest {
 
     private static final Logger log = LoggerFactory.getLogger(PasswordResetConcurrencyTest.class);
+
+    /**
+     * The reset-OTP email is dispatched on {@code emailExecutor} from an {@code afterCommit} hook, so
+     * it can land after the HTTP response returns — a bare {@code verify} races it (CI flake).
+     */
+    private static final long EMAIL_DISPATCH_TIMEOUT_MS = 5_000L;
 
     private static final PostgreSQLContainer<?> POSTGRES =
             new PostgreSQLContainer<>(TestPostgresImage.IMAGE);
@@ -113,7 +120,7 @@ class PasswordResetConcurrencyTest {
         ArgumentCaptor<String> otpCaptor = ArgumentCaptor.forClass(String.class);
         restTemplate.postForEntity("/api/v1/auth/forgot-password",
                 new ForgotPasswordRequest(email), String.class);
-        verify(emailNotificationService).sendPasswordResetOtpEmail(any(User.class), otpCaptor.capture());
+        verify(emailNotificationService, timeout(EMAIL_DISPATCH_TIMEOUT_MS)).sendPasswordResetOtpEmail(any(User.class), otpCaptor.capture());
         String rawOtp = otpCaptor.getValue();
 
         // verify-password-reset-otp → the minted resetTicket.

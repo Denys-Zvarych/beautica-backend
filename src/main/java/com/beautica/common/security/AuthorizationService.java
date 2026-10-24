@@ -1878,6 +1878,26 @@ public class AuthorizationService {
     }
 
     /**
+     * Phase 386 (user rule, 2026-10-22) - the audience for a GUEST booking's phone, decided EXPLICITLY by the acting
+     * role of the current authentication, never by "passed {@link #enforceCanViewBooking}":
+     * <ul>
+     *   <li>{@code INDEPENDENT_MASTER} - yes (they are the performing master of their own link's bookings);</li>
+     *   <li>{@code SALON_OWNER} and {@code SALON_ADMIN} - yes (the assigned, active admin is established by the view
+     *       gate the caller has already passed);</li>
+     *   <li>{@code SALON_MASTER} - NEVER, even as the performing master of that very booking;</li>
+     *   <li>{@code CLIENT} and anything else - never.</li>
+     * </ul>
+     * Only the role half of the decision lives here; the data half (a registered user's phone is never read) lives in
+     * {@code BookingDetailResponse#withProviderVisibleGuestPhone}.
+     */
+    public boolean isGuestPhoneAudience() {
+        Role actorRole = roleFromCurrentAuthentication();
+        return actorRole == Role.INDEPENDENT_MASTER
+                || actorRole == Role.SALON_OWNER
+                || actorRole == Role.SALON_ADMIN;
+    }
+
+    /**
      * Viewer classification: {@code true} iff the actor is the booking's OWN registered client,
      * reading it as a {@code CLIENT}. This is the exact probe {@link #enforceCanViewBooking}
      * hoisted to its first branch — extracted, not duplicated, so the two can never drift.

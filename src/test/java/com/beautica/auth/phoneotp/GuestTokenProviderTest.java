@@ -122,4 +122,35 @@ class GuestTokenProviderTest {
         assertThatThrownBy(() -> laterProvider.validate(token))
                 .isInstanceOf(JwtException.class);
     }
+
+    @Test
+    @DisplayName("phase 393 audit: every minted token carries its own random jti, surfaced by validateClaims")
+    void should_exposeDistinctTokenIds_when_twoTokensMintedForSamePhone() {
+        GuestTokenProvider provider = providerAt(FIXED_NOW);
+
+        GuestTokenProvider.GuestTokenClaims first = provider.validateClaims(provider.generate(PHONE));
+        GuestTokenProvider.GuestTokenClaims second = provider.validateClaims(provider.generate(PHONE));
+
+        assertThat(first.phone()).isEqualTo(PHONE);
+        assertThat(first.tokenId()).isNotBlank().isNotEqualTo(second.tokenId());
+    }
+
+    @Test
+    @DisplayName("phase 393 audit: a legacy guest token minted without a jti still validates, tokenId null")
+    void should_returnNullTokenId_when_legacyTokenHasNoJti() {
+        GuestTokenProvider provider = providerAt(FIXED_NOW);
+        SecretKey key = Keys.hmacShaKeyFor(SECRET.getBytes(StandardCharsets.UTF_8));
+        String legacy = Jwts.builder()
+                .subject(PHONE)
+                .claim(GuestTokenProvider.CLAIM_TYPE, GuestTokenProvider.TYPE_GUEST)
+                .issuedAt(Date.from(FIXED_NOW))
+                .expiration(Date.from(FIXED_NOW.plus(Duration.ofMinutes(30))))
+                .signWith(key, Jwts.SIG.HS256)
+                .compact();
+
+        GuestTokenProvider.GuestTokenClaims claims = provider.validateClaims(legacy);
+
+        assertThat(claims.phone()).isEqualTo(PHONE);
+        assertThat(claims.tokenId()).isNull();
+    }
 }

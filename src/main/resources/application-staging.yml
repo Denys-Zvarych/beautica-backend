@@ -9,6 +9,11 @@ beautica:
     # Every SMS (booking + guest OTP) becomes a plain-text mail to sms+<digits>@sms.staging.invalid,
     # caught by Mailpit. No fixed OTP, no bypass code.
     mode: capture
+    # Phase 389 — overrides prod's beautica.app so a staging code is never bound to the prod site.
+    # Blank by default (no domain line). Set OTP_SMS_DOMAIN to the staging website host once it has a
+    # short (<= 18 chars) custom host, e.g. stg.beautica.app; the workers.dev preview host is longer
+    # and fails boot validation.
+    otp-domain: ${OTP_SMS_DOMAIN:}
 
 # Phase 371 (D3): staging traces at 20% (prod 5%); enabled/DSN rules are inherited from application-prod.yml.
 sentry:
@@ -34,6 +39,15 @@ spring:
           writetimeout: 3000
 
 app:
+  # Phase 382 — staging runs the REAL siteverify round trip with Cloudflare's always-pass TEST secret as the
+  # default (the staging website must use the matching test site key 1x00000000000000000000AA and the dummy
+  # token XXXX.DUMMY.TOKEN.XXXX). Hostname/action checks stay off: test keys return dummy values. The guard
+  # (staging-turnstile-secret-not-test-key) refuses a REAL secret here — it would leak and block the dummy token.
+  turnstile:
+    enabled: true
+    secret-key: ${TURNSTILE_SECRET_KEY:1x0000000000000000000000000000000AA}
+    expected-hostnames: []
+    expected-action: ""
   # Phase 374: staging stays on SMTP (Mailpit) — overrides prod's brevo-api, and keeps the inline CID logo.
   # The fingerprint guard fails the boot on transport != smtp (staging-mail-transport) or a set BREVO_API_KEY.
   mail:
@@ -43,6 +57,10 @@ app:
     sms:
       # Exercise the booking SMS paths; with beautica.sms.mode=capture they land in Mailpit.
       enabled: true
+  booking-links:
+    # Phase 375 (D6) — sharing on in staging (prod default is false). Railway's
+    # BOOKING_LINKS_SHARE_ENABLED can still override it.
+    share-enabled: ${BOOKING_LINKS_SHARE_ENABLED:true}
   rate-limit:
     # Same property and value start-backend.sh uses for local seeding, so seed-demo-fleet.sh
     # can run against staging.

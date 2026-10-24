@@ -173,6 +173,51 @@ class GlobalExceptionHandlerTest {
     }
 
     @Test
+    @DisplayName("Phase 379 — GoneException → 410, data.code BOOKING_LINK_RETIRED, constant message, no slug")
+    void should_return410WithStableCode_when_goneExceptionThrown() {
+        // Arrange
+        var ex = GoneException.bookingLinkRetired();
+
+        // Act
+        ResponseEntity<ApiResponse<GoneErrorResponse>> response = handler.handleGone(ex);
+
+        // Assert
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.GONE);
+        assertThat(response.getBody().success()).isFalse();
+        assertThat(response.getBody().data()).isEqualTo(new GoneErrorResponse("BOOKING_LINK_RETIRED"));
+        assertThat(response.getBody().message()).isEqualTo("Booking link is no longer valid");
+        assertThat(response.getBody().errors()).isNull();
+    }
+
+    @Test
+    @DisplayName("Phase 379 audit (perf F1) — 410 is immutable → Cache-Control public, max-age=0, s-maxage=3600")
+    void should_setEdgeCacheableCacheControl_when_goneExceptionThrown() {
+        // Arrange
+        var ex = GoneException.bookingLinkRetired();
+
+        // Act
+        ResponseEntity<ApiResponse<GoneErrorResponse>> response = handler.handleGone(ex);
+
+        // Assert
+        assertThat(response.getHeaders().getCacheControl()).isEqualTo("max-age=0, public, s-maxage=3600");
+    }
+
+    @Test
+    @DisplayName("Phase 379 D9 — the 404 body is untouched by the 410 handler: data null, generic message")
+    void should_keep404BodyUnchanged_when_goneHandlerAdded() {
+        // Arrange
+        var ex = new NotFoundException("Booking page not found");
+
+        // Act
+        ResponseEntity<ApiResponse<Void>> response = handler.handleNotFound(ex);
+
+        // Assert
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(response.getBody().data()).isNull();
+        assertThat(response.getBody().message()).isEqualTo("Resource not found");
+    }
+
+    @Test
     @DisplayName("Should return 404 with generic message when NotFoundException is thrown")
     void should_return404_when_notFoundExceptionThrown() {
         // Arrange — internal message "Master not found" must NOT be echoed in the response
@@ -471,6 +516,26 @@ class GlobalExceptionHandlerTest {
     }
 
     @Test
+    @DisplayName("Should return 400 'Verification failed' (not the generic 'Invalid request') when Turnstile rejects (phase 382)")
+    void should_return400_withVerificationFailed_when_turnstileRejected() {
+        ResponseEntity<ApiResponse<Void>> response = handler.handleTurnstileRejected(new TurnstileRejectedException());
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(response.getBody().success()).isFalse();
+        assertThat(response.getBody().message()).isEqualTo("Verification failed");
+    }
+
+    @Test
+    @DisplayName("Should echo the allow-listed Turnstile-unavailable 503 message (phase 382)")
+    void should_return503_withAllowListedMessage_when_turnstileUnavailable() {
+        var response = handler.handleBusiness(new BusinessException(
+                HttpStatus.SERVICE_UNAVAILABLE, ServiceUnavailableMessages.TURNSTILE_UNAVAILABLE));
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
+        assertThat(response.getBody().message()).isEqualTo(ServiceUnavailableMessages.TURNSTILE_UNAVAILABLE);
+    }
+
+    @Test
     @DisplayName("Should return 422 and SURFACE the user-facing message when UNPROCESSABLE_ENTITY BusinessException")
     void should_return422_with_message_when_unprocessableEntityBusinessException() {
         // Arrange — 422 carries deliberate, user-facing domain copy (Phase 13.4 cancel
@@ -514,7 +579,8 @@ class GlobalExceptionHandlerTest {
                 "Service setup is busy for this master, please retry",
                 "Support channel is not configured",
                 "Could not send the verification code",
-                "Portfolio is busy, please retry");
+                "Portfolio is busy, please retry",
+                "Verification is temporarily unavailable, please retry");
     }
 
     @Test

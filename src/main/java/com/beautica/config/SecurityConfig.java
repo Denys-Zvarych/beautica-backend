@@ -249,6 +249,10 @@ public class SecurityConfig {
                     // before anyRequest().authenticated() below. CSRF is already disabled
                     // on /api/** and the response carries no owner identifiers (§I-2).
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/book/**").permitAll();
+                    // Phase 379 D3 — HEAD is routed to the same @GetMapping handlers (and already throttled
+                    // exactly like GET by AuthRateLimitFilter), so it gets the same anonymous access: a
+                    // crawler's HEAD on a retired link must see the 410, not a 401. No body, no new surface.
+                    auth.requestMatchers(HttpMethod.HEAD, "/api/v1/book/**").permitAll();
                     // Phase 13.2 — Phone OTP & Guest Token. Unauthenticated clients on the
                     // public booking page request and verify an SMS code before they hold any
                     // JWT, so POST /api/v1/book/otp/{send,verify} must be permitAll. Scoped
@@ -264,6 +268,9 @@ public class SecurityConfig {
                     // tightly to POST /api/v1/book/*/booking (single path segment for the slug,
                     // then literal /booking) so no other authenticated POST under /book is opened.
                     auth.requestMatchers(HttpMethod.POST, "/api/v1/book/*/booking").permitAll();
+                    // Phase 393 — the salon twin: POST /api/v1/book/s/{salonSlug}/masters/{masterId}/booking.
+                    // Same guest-JWT-in-service model; exact segment shape, so nothing else under /book/s opens.
+                    auth.requestMatchers(HttpMethod.POST, "/api/v1/book/s/*/masters/*/booking").permitAll();
                     // Phase 13.4 — Guest Booking Cancellation by Link. The cancel link in
                     // the confirmation SMS is opened by an unauthenticated guest holding no
                     // JWT; the one-time cancel_token in the path is the credential. GET is

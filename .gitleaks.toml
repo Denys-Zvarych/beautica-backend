@@ -80,6 +80,18 @@ regexes = [
   # restated here. See Trap 3.
   '''ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789\+/''',
 
+  # ── Cloudflare Turnstile TEST keys (phase 382) ─────────────────────────
+  # Cloudflare publishes always-pass (1x), always-fail (2x) and forced-interaction (3x) TEST secrets and
+  # site keys: 1x/2x/3x + zeros + AA (https://developers.cloudflare.com/turnstile/troubleshooting/testing/).
+  # application-staging.yml defaults to the always-pass secret on purpose and the guard tests name all
+  # three. They are public constants, not credentials.
+  '''[123]x0{20,40}AA''',
+  # The widget's published dummy response token for those test keys.
+  '''XXXX\.DUMMY\.TOKEN\.XXXX''',
+  # Fake "real-shaped" Turnstile secrets used only as test fixtures (never a Cloudflare value): the
+  # fingerprint-guard tests need a non-test-key lookalike, WireMock tests need a secret to assert is never logged.
+  '''0x4AAAAAAA[A-Za-z0-9_-]*(fixture|test-secret|it-secret)[A-Za-z0-9_-]*''',
+
   # ── Retired local-dev values, still present in `dev` history ───────────
   # All three lived in application-local.yml, loaded ONLY under the `local`
   # Spring profile against localhost Docker Postgres. Production (Railway)

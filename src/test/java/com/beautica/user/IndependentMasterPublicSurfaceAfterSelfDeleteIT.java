@@ -212,10 +212,13 @@ class IndependentMasterPublicSurfaceAfterSelfDeleteIT extends AbstractIntegratio
 
         ResponseEntity<String> after = restTemplate.getForEntity("/api/v1/book/" + slug + "/info", String.class);
 
+        // Phase 379 D7: the live finder still refuses the detached row (a 200 here would be the R8 bug); the
+        // miss then finds the DELETED tombstone the self-delete wrote, so the old link answers 410, not 404.
         assertThat(after.getStatusCode())
                 .as("R8 — findByBookingSlugWithUser's is_active=true predicate AND its INNER JOIN "
-                        + "m.user must both refuse a detached row; either alone would already do it")
-                .isEqualTo(HttpStatus.NOT_FOUND);
+                        + "m.user must both refuse a detached row; either alone would already do it. "
+                        + "Phase 379: the refused slug is tombstoned, so 410 Gone")
+                .isEqualTo(HttpStatus.GONE);
     }
 
     private boolean searchResultContainsMasterId(UUID masterId) throws Exception {

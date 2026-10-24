@@ -117,6 +117,20 @@ class BookingNoteVisibilityIT extends AbstractIntegrationTest {
         assertThat(data.get("providerComment").asText()).isEqualTo("Майстер захворів");
     }
 
+    @Test
+    @DisplayName("phase 385: a guest (LINK) booking's «Коментар для майстра» is visible to the provider on the booking "
+            + "detail, exactly like an app clientComment (notes are mutually visible)")
+    void should_returnGuestClientComment_when_providerViewsGuestBooking() {
+        Fixture fx = seedSalonBooking();
+        UUID bookingId = insertGuestBookingWithStatus(fx, "CONFIRMED", null);
+        jdbcTemplate.update("UPDATE bookings SET client_comment = ? WHERE id = ?", "Буду з дитиною", bookingId);
+
+        JsonNode data = getBookingData(bookingId, tokenFor(fx.ownerEmail));
+
+        assertThat(data.get("clientComment").asText()).isEqualTo("Буду з дитиною");
+        assertThat(data.get("clientId").isNull()).isTrue();
+    }
+
     @ParameterizedTest(name = "guest booking status={0}")
     @ValueSource(strings = {"CONFIRMED", "COMPLETED", "CANCELLED"})
     @DisplayName("QA-authored: provider GET /bookings/{id} on a guest (null-client) booking never "

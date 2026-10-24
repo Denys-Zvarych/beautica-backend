@@ -1,6 +1,9 @@
 package com.beautica.auth.phoneotp;
 
+import com.beautica.auth.filter.VisitorIpResolver;
+import com.beautica.auth.turnstile.TurnstileVerifier;
 import com.beautica.common.ApiResponse;
+import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -24,9 +27,18 @@ import org.springframework.web.bind.annotation.RestController;
 public class PhoneOtpController {
 
     private final PhoneOtpService phoneOtpService;
+    private final TurnstileVerifier turnstileVerifier;
+    private final VisitorIpResolver visitorIpResolver;
 
+    /**
+     * Order on the request (phase 382 D1): per-IP filter bucket -> {@code @Valid} DTO -> Turnstile -> per-phone
+     * limit -> OTP row -> SMS. A rejected Turnstile token therefore creates no {@code phone_otps} row and sends
+     * no SMS. The visitor IP handed to Cloudflare is the one the per-IP bucket charged, or the Worker-forwarded visitor IP when the request carries the
+     * website Worker key ({@link VisitorIpResolver}).
+     */
     @PostMapping("/send")
-    public ApiResponse<Void> send(@Valid @RequestBody PhoneOtpSendRequest request) {
+    public ApiResponse<Void> send(@Valid @RequestBody PhoneOtpSendRequest request, HttpServletRequest httpRequest) {
+        turnstileVerifier.verify(request.turnstileToken(), visitorIpResolver.resolve(httpRequest));
         phoneOtpService.sendOtp(request.phone());
         return ApiResponse.ok(null);
     }

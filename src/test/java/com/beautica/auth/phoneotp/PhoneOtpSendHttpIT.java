@@ -37,12 +37,18 @@ import static org.mockito.Mockito.doThrow;
  * outside the transaction: a failing provider yields 503 and leaves the previous code redeemable
  * through {@code /verify}; the per-phone cap answers 429 at the HTTP layer, failed sends included.
  * The per-IP bucket is raised so the per-PHONE cap is what is under test.
+ *
+ * <p>Phase 389: {@code beautica.sms.otp-domain} is set so the captured SMS text must end with the
+ * origin-bound {@code @host #code} line.
  */
-@TestPropertySource(properties = "app.rate-limit.otp-send-capacity=100000")
+@TestPropertySource(properties = {
+        "app.rate-limit.otp-send-capacity=100000",
+        "beautica.sms.otp-domain=" + PhoneOtpSendHttpIT.OTP_DOMAIN})
 @Import(TestSecurityConfig.class)
 @DisplayName("POST /book/otp/send — failure and cap behaviour over HTTP (Phase 364)")
 class PhoneOtpSendHttpIT extends AbstractIntegrationTest {
 
+    static final String OTP_DOMAIN = "beautica.app";
     private static final String OLD_CODE = "424242";
 
     @Autowired
@@ -69,7 +75,7 @@ class PhoneOtpSendHttpIT extends AbstractIntegrationTest {
     }
 
     private ResponseEntity<String> send(String phone) {
-        return restTemplate.postForEntity("/api/v1/book/otp/send", json("{\"phone\":\"" + phone + "\"}"), String.class);
+        return restTemplate.postForEntity("/api/v1/book/otp/send", json("{\"phone\":\"" + phone + "\",\"privacyAccepted\":true,\"privacyPolicyVersion\":\"2026-10-20\"}"), String.class);
     }
 
     private ResponseEntity<String> verify(String phone, String code) {
@@ -113,11 +119,35 @@ class PhoneOtpSendHttpIT extends AbstractIntegrationTest {
         send(phone);
 
         Mockito.verify(otpSmsSender).send(eq(phone), text.capture());
-        String undeliveredCode = text.getValue().replaceAll(".*?(\\d{6}).*", "$1");
+        String undeliveredCode = text.getValue().replaceAll("(?s).*?(\\d{6}).*", "$1");
         ResponseEntity<String> verifyResponse = verify(phone, undeliveredCode);
         assertThat(verifyResponse.getStatusCode())
                 .as("a burnt row must never be redeemable, body=%s", verifyResponse.getBody())
                 .isEqualTo(HttpStatus.UNAUTHORIZED);
+    }
+
+    @Test
+    @DisplayName("otp-domain set — SMS ends with `@beautica.app #code` and that code verifies")
+    void should_sendTextEndingWithDomainBoundLine_when_otpDomainConfigured() {
+        String phone = "+380501000005";
+        ArgumentCaptor<String> text = ArgumentCaptor.forClass(String.class);
+
+        ResponseEntity<String> response = send(phone);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        Mockito.verify(otpSmsSender).send(eq(phone), text.capture());
+        String sms = text.getValue();
+        String code = sms.replaceAll("(?s).*?(\\d{6}).*", "$1");
+        assertThat(sms)
+                .startsWith("Код Beautica: " + code + ". Нікому не кажіть.")
+                .endsWith("\n\n@" + OTP_DOMAIN + " #" + code);
+        assertThat(sms.lines().reduce((first, second) -> second).orElseThrow())
+                .as("the origin-bound line must be the final line (WebOTP / Apple domain-bound codes)")
+                .isEqualTo("@" + OTP_DOMAIN + " #" + code);
+        assertThat(sms.length()).as("one UCS-2 segment").isLessThanOrEqualTo(70);
+        assertThat(verify(phone, code).getStatusCode())
+                .as("the code in the SMS is the one that verifies")
+                .isEqualTo(HttpStatus.OK);
     }
 
     @Test

@@ -97,3 +97,11 @@ f7d5cf62c55b7a08ba8d71679777365aeec1a047:src/test/java/com/beautica/config/Outbo
 35e8d9d53bcd2b82c7103b15286faafa42521368:src/test/java/com/beautica/config/FirebaseLocalProfileContextTest.java:private-key:50
 35e8d9d53bcd2b82c7103b15286faafa42521368:src/test/java/com/beautica/config/FirebaseConfigTest.java:private-key:210
 1f0700c606b87a8feca9626b1e8c71575280d5d1:src/test/java/com/beautica/config/ProdRequiredEnvBootStartupTest.java:generic-api-key:198
+
+# --- PR #168 (reviewed 2026-10-20) -----------------------------------------
+# BookingInfoWorkerPropertiesTest: a hand-typed 44-char dummy shaped like an
+# `openssl rand -base64 32` value, used only to prove the worker-key boot guard
+# accepts that length. Never a real Worker key. The literal was replaced by a
+# runtime-built Base64 of fixed bytes in the next commit; this pins only the
+# historical finding. (Value deliberately not reproduced here.)
+7440b2fbc3e6cc1871bc1d9a82c946b2f68cf0b3:src/test/java/com/beautica/config/BookingInfoWorkerPropertiesTest.java:generic-api-key:83

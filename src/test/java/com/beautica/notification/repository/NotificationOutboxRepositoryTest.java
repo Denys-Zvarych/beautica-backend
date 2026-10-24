@@ -155,6 +155,64 @@ class NotificationOutboxRepositoryTest extends AbstractDataJpaTest {
         assertThat(claimed).extracting(NotificationOutboxEntry::getId).containsExactly(p1, p2, e1, e2);
     }
 
+    // ── SMS-backpressure deferral (phase 390 D11) ─────────────────────────────
+
+    @Test
+    @DisplayName("Phase 390 D11: >= batch-size SMS-deferred rows at the head no longer starve newer e-mail rows")
+    void should_claimNewerEmailRows_when_batchSizeDeferredSmsRowsAtHead() {
+        // Arrange — 60 older rows (> the 50-row batch) deferred by SMS backpressure, then 3 newer e-mails.
+        Instant t0 = Instant.parse("2026-01-01T10:00:00Z");
+        for (int i = 0; i < 60; i++) {
+            UUID smsId = UUID.randomUUID();
+            insertOutboxRow(smsId, OutboxEventType.STATUS_CHANGED, "PENDING", t0.plusSeconds(i));
+            repo.deferPendingRow(smsId, 15);
+        }
+        List<UUID> emailIds = List.of(UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID());
+        for (int i = 0; i < emailIds.size(); i++) {
+            insertOutboxRow(emailIds.get(i), OutboxEventType.NEW_BOOKING, "PENDING", t0.plusSeconds(100 + i));
+        }
+
+        // Act
+        List<NotificationOutboxEntry> claimed = repo.claimPendingBatch(50);
+
+        // Assert — only the newer e-mails; the deferred rows stay PENDING with attempts untouched
+        assertThat(claimed).extracting(NotificationOutboxEntry::getId).containsExactlyElementsOf(emailIds);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT count(*) FROM notification_outbox WHERE status = 'PENDING' AND attempts = 0 "
+                        + "AND not_before > now()", Long.class)).isEqualTo(60L);
+    }
+
+    @Test
+    @DisplayName("Phase 390 D11: a deferred row is claimed oldest-first again once its not_before has passed")
+    void should_claimDeferredRowOldestFirst_when_notBeforeHasPassed() {
+        // Arrange — a deferred row whose window has elapsed, a newer undeferred row, a still-deferred row.
+        Instant t0 = Instant.parse("2026-01-01T10:00:00Z");
+        UUID elapsed = UUID.randomUUID();
+        UUID fresh = UUID.randomUUID();
+        UUID stillDeferred = UUID.randomUUID();
+        insertOutboxRow(stillDeferred, OutboxEventType.STATUS_CHANGED, "PENDING", t0.minusSeconds(10));
+        insertOutboxRow(elapsed, OutboxEventType.STATUS_CHANGED, "PENDING", t0);
+        insertOutboxRow(fresh, OutboxEventType.NEW_BOOKING, "PENDING", t0.plusSeconds(1));
+        repo.deferPendingRow(stillDeferred, 15);
+        jdbcTemplate.update("UPDATE notification_outbox SET not_before = now() - interval '1 second' WHERE id = ?",
+                elapsed);
+
+        // Act
+        List<NotificationOutboxEntry> claimed = repo.claimPendingBatch(50);
+
+        // Assert
+        assertThat(claimed).extracting(NotificationOutboxEntry::getId).containsExactly(elapsed, fresh);
+    }
+
+    @Test
+    @DisplayName("Phase 390 D11: deferPendingRow outside a transaction is rejected (must ride persistOne's tx)")
+    @Transactional(propagation = Propagation.NOT_SUPPORTED)
+    void should_throwIllegalTransactionStateException_when_deferCalledWithoutTransaction() {
+        // Act + Assert
+        assertThatThrownBy(() -> repo.deferPendingRow(UUID.randomUUID(), 15))
+                .isInstanceOf(IllegalTransactionStateException.class);
+    }
+
     // ── MEDIUM-2 ──────────────────────────────────────────────────────────────
 
     /**

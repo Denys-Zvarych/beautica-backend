@@ -72,6 +72,9 @@ class UserServiceTest {
     @Mock
     private MasterRepository masterRepository;
 
+    @Mock
+    private com.beautica.common.cache.SalonBookingInfoCacheEvictor salonBookingInfoCacheEvictor;
+
     private UserService userService;
 
     @BeforeEach
@@ -79,7 +82,8 @@ class UserServiceTest {
         userService = new UserService(
                 userRepository, localityWriteValidator,
                 new com.beautica.location.SettlementDisplayNameResolver(cityRepository), cityDistrictRepository,
-                locationQueryService, cacheManager, clientReviewRepository, masterRepository);
+                locationQueryService, cacheManager, clientReviewRepository, masterRepository,
+                salonBookingInfoCacheEvictor);
     }
 
     @Test

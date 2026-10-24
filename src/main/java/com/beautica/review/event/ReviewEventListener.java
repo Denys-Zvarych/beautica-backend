@@ -2,6 +2,7 @@ package com.beautica.review.event;
 
 import com.beautica.review.service.RatingRecalculationService;
 import com.github.benmanes.caffeine.cache.Cache;
+import com.beautica.common.cache.MasterProfileCacheEvictor;
 import lombok.RequiredArgsConstructor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -22,6 +23,7 @@ public class ReviewEventListener {
 
     private final RatingRecalculationService ratingRecalculationService;
     private final CacheManager cacheManager;
+    private final MasterProfileCacheEvictor masterProfileCacheEvictor;
 
     /** Public profile of one master, keyed by masterId — see MasterService#getMasterDetail. */
     private static final String MASTER_DETAIL_CACHE = "master-detail";
@@ -123,6 +125,11 @@ public class ReviewEventListener {
             // MasterService#rotateMasterSalon evict this same cache.
             evictKey(MASTER_DETAIL_BY_USER_CACHE, event.masterUserId());
         });
+        // Phase 380 D6: the public master booking page carries rating, count and the newest reviews. Registered
+        // AFTER the callback above so it runs after evictMasterReviewPages (synchronizations fire in
+        // registration order): a reader that repopulates booking-slug-info in between can no longer re-read
+        // the stale reviews-by-master page.
+        masterProfileCacheEvictor.evictBookingSlugInfoAfterCommit(event.masterId());
 
         // Symmetric salon branch (Phase 13.6): only runs when the reviewed booking
         // belonged to a salon-affiliated master. Same fire-and-log-don't-fail contract —
@@ -145,6 +152,9 @@ public class ReviewEventListener {
                 // Without this evict the salon profile keeps the pre-review average for
                 // the cache's 5-minute TTL.
                 evictKey(SALON_DETAIL_CACHE, event.salonId());
+                // Phase 384 D5: the public salon booking page carries the rating distribution and the newest
+                // reviews. Same callback, after evictSalonReviewPages above, so no stale page is re-read.
+                masterProfileCacheEvictor.evictSalonBookingPage(event.salonId());
             });
         }
     }

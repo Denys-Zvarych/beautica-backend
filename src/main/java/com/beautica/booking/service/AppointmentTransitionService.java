@@ -1841,7 +1841,7 @@ public class AppointmentTransitionService {
         Runnable task = () -> {
             slotCalculationService.evictMasterAvailabilityCaches(masterId);
             if (salonId != null) {
-                salonCatalogCacheEvictor.evict(salonId);
+                salonCatalogCacheEvictor.evictCatalogOnly(salonId);
             }
             cachePrefixEvictor.evictByKeyPrefixNow(masterId, "master-calendar");
         };
@@ -1949,7 +1949,7 @@ public class AppointmentTransitionService {
         Runnable task = () -> {
             slotCalculationService.evictMasterAvailabilityCaches(masterId);
             if (salonId != null) {
-                salonCatalogCacheEvictor.evict(salonId);
+                salonCatalogCacheEvictor.evictCatalogOnly(salonId);
             }
             cachePrefixEvictor.evictByKeyPrefixNow(masterId, "master-calendar");
             if (revenueActorId != null) {

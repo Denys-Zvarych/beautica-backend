@@ -91,6 +91,9 @@ class ServiceCatalogServicePricingTest {
     private SalonCatalogCacheEvictor salonCatalogCacheEvictor;
 
     @Mock
+    private com.beautica.common.cache.MasterProfileCacheEvictor masterProfileCacheEvictor;
+
+    @Mock
     private com.beautica.master.service.MasterSearchVisibilityGuard searchVisibilityGuard;
 
     @Mock

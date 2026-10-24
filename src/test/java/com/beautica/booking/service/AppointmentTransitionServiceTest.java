@@ -669,7 +669,7 @@ class AppointmentTransitionServiceTest {
                 actorId, appointmentId, java.util.List.of(bookingId), null, false);
 
         verifyNoMoreInteractions(slotCalculationService);
-        verify(salonCatalogCacheEvictor, never()).evict(any());
+        verify(salonCatalogCacheEvictor, never()).evictCatalogOnly(any());
         verify(cachePrefixEvictor, never()).evictByKeyPrefixNow(any(), any());
     }
 

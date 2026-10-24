@@ -49,7 +49,10 @@ import org.springframework.security.task.DelegatingSecurityContextTaskExecutor;
  * supportEmailTaskPool         35 s  Help/Contact mails. NOT outbox-backed -> cut = lost (user can resend).
  *                                    &ge; one in-flight Brevo API send WITH attachments (connect 3 s + the
  *                                    30 s send-with-attachments read budget, Phase 374) + margin.
- * smsSendExecutor              20 s  walk-in booking confirmation SMS. NOT recoverable (mildest loss).
+ * smsSendExecutor              20 s  request-path booking SMS (walk-in / guest confirmation + guest
+ *                                    cancellation) AND, since phase 390, guest provider-cancellation SMS
+ *                                    handed off by the outbox drain, whose row is ALREADY SENT. NOT
+ *                                    recoverable for either; reported at ERROR with counts.
  * smsReminderDispatchExecutor  30 s  one hand-off task per hourly batch; cut = whole batch un-fanned-out.
  *                                    NOT recoverable (reminderSent already committed); reported at ERROR.
  * smsReminderExecutor          30 s  guest 24h reminder SMS. NOT recoverable (reminderSent already
@@ -425,6 +428,11 @@ public class AsyncConfig implements AsyncConfigurer {
      * sustained outage fills the queue and subsequent sends are dropped-and-logged in bounded time
      * instead of each paying a full timeout on a request thread.
      *
+     * <p><b>Shared with the outbox drain (phase 390).</b> Guest provider-cancellation SMS are submitted
+     * from the drain via {@code BookingSmsDispatcher#dispatchOrThrow}, which never takes the last
+     * {@code BookingSmsDispatcher.OUTBOX_QUEUE_RESERVE} (50) slots — those stay free for the
+     * request-path SMS above, which are dropped on rejection, while the outbox row is retried.
+     *
      * <p>No {@link DelegatingSecurityContextTaskExecutor} wrapper: the task takes a phone and a
      * fully-rendered body, nothing principal-derived.
      *
@@ -437,7 +445,9 @@ public class AsyncConfig implements AsyncConfigurer {
     @Bean(name = "smsSendExecutor")
     @Profile("!test")
     public TaskExecutor smsSendExecutor() {
-        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        // Loss-reporting subclass (phase 390 perf LOW): the drain below can abandon queued SMS; without it
+        // they vanish behind Spring's count-less timeout warning. Configuration is otherwise unchanged.
+        ThreadPoolTaskExecutor executor = new SmsSendLossReportingTaskExecutor(SMS_SEND_SHUTDOWN_GRACE_SECONDS);
         executor.setCorePoolSize(4);
         executor.setMaxPoolSize(4);
         executor.setAllowCoreThreadTimeOut(true);
@@ -577,6 +587,53 @@ public class AsyncConfig implements AsyncConfigurer {
                             + "queued tasks are already committed as reminderSent and no later sweep "
                             + "re-selects them; in-flight tasks were cut mid-request, delivery unknown",
                     LOSS_EVENT, beanName, queuedTasksAbandoned, inFlightTasksKilled, graceSeconds);
+        }
+    }
+
+    /**
+     * {@link ThreadPoolTaskExecutor} for {@link #smsSendExecutor()} that reports, at ERROR, the booking SMS
+     * its shutdown grace ABANDONED (phase 390, perf LOW) — the same {@link #shutdown()} hook, for the same
+     * reason, as {@link ReminderLossReportingTaskExecutor}. Since phase 390 this pool also carries the
+     * guest provider-cancellation SMS, whose outbox row is already {@code SENT} once the hand-off was
+     * accepted, so an abandoned task is a message no one will ever retry. Silent on a clean drain.
+     * Counts only — the queued tasks hold a phone and a rendered body and are never rendered (Anti-Bug §I).
+     * Behaviour is otherwise identical to a plain {@link ThreadPoolTaskExecutor}.
+     */
+    static final class SmsSendLossReportingTaskExecutor extends ThreadPoolTaskExecutor {
+
+        /** Stable, machine-greppable alert token. Changing it silently disables downstream alerting. */
+        static final String LOSS_EVENT = "event=booking_sms_lost_on_shutdown";
+
+        private final int graceSeconds;
+
+        SmsSendLossReportingTaskExecutor(int graceSeconds) {
+            this.graceSeconds = graceSeconds;
+            setWaitForTasksToCompleteOnShutdown(true);
+            setAwaitTerminationSeconds(graceSeconds);
+        }
+
+        @Override
+        public void shutdown() {
+            super.shutdown();
+            reportAbandonedWork();
+        }
+
+        void reportAbandonedWork() {
+            int queuedTasksAbandoned;
+            int inFlightTasksKilled;
+            try {
+                ThreadPoolExecutor pool = getThreadPoolExecutor();
+                queuedTasksAbandoned = pool.getQueue().size();
+                inFlightTasksKilled = pool.getActiveCount();
+            } catch (IllegalStateException e) {
+                return; // Never initialized — it cannot have been carrying work.
+            }
+            if (queuedTasksAbandoned == 0 && inFlightTasksKilled == 0) {
+                return;
+            }
+            log.error("{} executor=smsSendExecutor queuedTasksAbandoned={} inFlightTasksKilled={} graceSeconds={} "
+                            + "— queued booking SMS will never be sent; in-flight sends were cut, delivery unknown",
+                    LOSS_EVENT, queuedTasksAbandoned, inFlightTasksKilled, graceSeconds);
         }
     }
 
