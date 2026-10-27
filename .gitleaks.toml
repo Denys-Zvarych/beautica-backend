@@ -74,6 +74,11 @@ regexes = [
   # Matched as a family so a new brow-shaping-N fixture does not re-break CI.
   '''brow-shaping-[A-Za-z0-9_-]+''',
 
+  # BookingLinkRetirementIT: booking-link SLUG fixture (`<name>-<name>-<4 chars>`, the
+  # public /book/{slug} path segment, not a credential). Flagged because the call site reads
+  # `token, "ostap-owner-ab12"` and the slug clears the entropy bar. Exact literal only.
+  '''ostap-owner-ab12''',
+
   # JwtConfigTest: the literal base64 ALPHABET, used to build a 64-byte
   # "realistic secret" for a length assertion. Suppressed by the upstream
   # default allowlist, which the block above replaces -- so it must be

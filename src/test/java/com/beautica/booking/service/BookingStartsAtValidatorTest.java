@@ -8,9 +8,12 @@ import org.junit.jupiter.api.Test;
 import org.springframework.http.HttpStatus;
 
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.OffsetDateTime;
+import java.time.ZoneId;
 import java.time.ZoneOffset;
+import java.time.ZonedDateTime;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
@@ -144,6 +147,63 @@ class BookingStartsAtValidatorTest {
             assertThatThrownBy(() -> BookingStartsAtValidator.validate(justBelow, CLOCK, CLIENT))
                     .isInstanceOf(BusinessException.class)
                     .hasMessageContaining(String.valueOf(BookingWindow.MIN_MINUTES_AHEAD));
+        }
+    }
+
+    // ── the horizon across a Kyiv DST transition (nightly time bomb, 2026-10-27) ─────
+
+    /**
+     * The horizon is ELAPSED time ({@code Duration.between(now, startsAt).toDays()}), not Kyiv civil
+     * days. {@code BookingServiceTest} once built its "181 days ahead" fixtures with
+     * {@code ZonedDateTime.now(clock).plusDays(181)} over an {@code Instant.now()}-based clock: from
+     * 2026-10-25 (after the fall-back) that span crosses only the 2027-03-28 spring-forward, is
+     * 180 d 23 h long, and slipped under the horizon — the nightly went red with no code change.
+     * These pins fix the clock in that window so the trap is reproduced deterministically and any
+     * future fixture written in civil days is told why it is wrong.
+     */
+    @Nested
+    @DisplayName("MAX_DAYS_AHEAD horizon across a Kyiv DST transition — elapsed time, not civil days")
+    class HorizonAcrossDst {
+
+        private static final ZoneId KYIV = ZoneId.of("Europe/Kyiv");
+        /** After the 2026-10-25 fall-back: +181 civil days crosses ONLY the 2027-03-28 spring-forward. */
+        private static final Clock KYIV_WINTER_CLOCK =
+                Clock.fixed(Instant.parse("2026-10-27T10:00:00Z"), KYIV);
+
+        @Test
+        @DisplayName("rejects exactly MAX_DAYS_AHEAD + 1 days of elapsed time with 400")
+        void should_rejectElapsedDaysBeyondHorizon_when_spanCrossesSpringForward() {
+            OffsetDateTime beyond = OffsetDateTime.ofInstant(KYIV_WINTER_CLOCK.instant()
+                    .plus(Duration.ofDays(BookingWindow.MAX_DAYS_AHEAD + 1L)), KYIV);
+
+            assertThatThrownBy(() -> BookingStartsAtValidator.validate(beyond, KYIV_WINTER_CLOCK, CLIENT))
+                    .isInstanceOf(BusinessException.class)
+                    .extracting(ex -> ((BusinessException) ex).getStatus())
+                    .isEqualTo(HttpStatus.BAD_REQUEST);
+        }
+
+        @Test
+        @DisplayName("accepts exactly MAX_DAYS_AHEAD days of elapsed time (inclusive upper bound)")
+        void should_acceptElapsedDaysAtHorizon_when_spanCrossesSpringForward() {
+            OffsetDateTime atHorizon = OffsetDateTime.ofInstant(KYIV_WINTER_CLOCK.instant()
+                    .plus(Duration.ofDays(BookingWindow.MAX_DAYS_AHEAD)), KYIV);
+
+            assertThatCode(() -> BookingStartsAtValidator.validate(atHorizon, KYIV_WINTER_CLOCK, CLIENT))
+                    .doesNotThrowAnyException();
+        }
+
+        @Test
+        @DisplayName("fixture trap: MAX_DAYS_AHEAD + 1 Kyiv CIVIL days is one hour short of that many "
+                + "elapsed days here — never build a horizon fixture with ZonedDateTime.plusDays")
+        void should_beOneHourShort_when_civilDaysCrossSpringForward() {
+            ZonedDateTime now = ZonedDateTime.now(KYIV_WINTER_CLOCK);
+
+            Duration civilSpan = Duration.between(now, now.plusDays(BookingWindow.MAX_DAYS_AHEAD + 1L));
+
+            assertThat(civilSpan)
+                    .as("181 civil days across one spring-forward = 181 d − 1 h; toDays() truncates "
+                            + "that to 180, which the horizon guard ACCEPTS")
+                    .isEqualTo(Duration.ofDays(BookingWindow.MAX_DAYS_AHEAD + 1L).minusHours(1));
         }
     }
 
