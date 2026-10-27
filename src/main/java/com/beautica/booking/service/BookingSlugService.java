@@ -541,7 +541,9 @@ public class BookingSlugService {
         return masterServiceRepository.findActiveCategoriesByMasterId(masterId).stream()
                 .map(row -> {
                     CatalogCategory category = (CatalogCategory) row[0];
-                    return new CategoryRef(category.getId(), category.getNameUk(), (String) row[1]);
+                    // The specific platform category label («Ламінування вій»), not the shared parent («Вії»).
+                    String name = row[2] != null ? (String) row[2] : category.getNameUk();
+                    return new CategoryRef(category.getId(), name, (String) row[1]);
                 })
                 .toList();
     }
