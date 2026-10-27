@@ -20,6 +20,7 @@ import com.beautica.booking.repository.BookingRepository;
 import com.beautica.booking.repository.SalonClosureBookingCandidate;
 import com.beautica.booking.repository.TestPostLockSlotCheck;
 import com.beautica.common.exception.BookingElapsedException;
+import com.beautica.common.BookingWindow;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ClientBookingConflictException;
 import com.beautica.common.exception.ForbiddenException;
@@ -63,6 +64,7 @@ import org.springframework.cache.Cache;
 import java.math.BigDecimal;
 import org.springframework.data.domain.PageImpl;
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
@@ -284,6 +286,22 @@ class BookingServiceTest {
         setField(b, "id", id);
         ReflectionTestUtils.setField(b, "createdAt", Instant.now());
         return b;
+    }
+
+    /**
+     * A start exactly {@code MAX_DAYS_AHEAD + 1} days of ELAPSED time past the pinned {@link #clock}.
+     *
+     * <p>Nightly time bomb fixed 2026-10-27: these fixtures were {@code ZonedDateTime.now(clock)
+     * .plusDays(181)} — 181 Kyiv CIVIL days. {@code BookingStartsAtValidator} measures the horizon as
+     * {@code Duration.between(now, startsAt).toDays()}, i.e. elapsed time truncated to whole days. A
+     * 181-civil-day span crossing exactly one spring-forward (e.g. from 2026-10-25, after the
+     * fall-back, through 2027-03-28) is only 180 d 23 h → {@code toDays() == 180} → the horizon guard
+     * lets it through and the test hit the next guard (409 / client lookup) instead of the 400.
+     * Duration arithmetic is DST-independent, so this fixture rejects on every day of the year.
+     */
+    private OffsetDateTime beyondHorizon() {
+        return OffsetDateTime.ofInstant(
+                clock.instant().plus(Duration.ofDays(BookingWindow.MAX_DAYS_AHEAD + 1L)), KYIV);
     }
 
     /** Booking whose {@code startsAt} has already elapsed relative to the pinned {@link #clock} — for {@code completeBooking} happy-path fixtures (Phase 27.1). */
@@ -726,7 +744,7 @@ class BookingServiceTest {
         CreateBookingRequest farFutureRequest = new CreateBookingRequest(
                 masterId,
                 masterServiceId,
-                ZonedDateTime.now(clock).plusDays(181),
+                beyondHorizon().atZoneSameInstant(KYIV),
                 null,
                 null,
                 false
@@ -2201,7 +2219,7 @@ class BookingServiceTest {
     void should_throw400_when_rescheduleNewTimeMoreThan180DaysAhead() {
         Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
         RescheduleBookingRequest req = new RescheduleBookingRequest(
-                ZonedDateTime.now(clock).plusDays(181).toOffsetDateTime(), false);
+                beyondHorizon(), false);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
 
         assertThatThrownBy(() -> bookingService.rescheduleBooking(clientId, bookingId, req))
