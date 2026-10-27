@@ -113,10 +113,18 @@ The `Dockerfile` pins the base image by digest and the apk packages by exact ver
 ```bash
 docker pull postgres:18-alpine
 docker image inspect postgres:18-alpine --format '{{index .RepoDigests 0}}'          # new FROM ...@sha256:<digest>
-docker run --rm --entrypoint apk postgres:18-alpine policy age curl coreutils tini    # versions that Alpine release serves
+ops/db-backup/resolve-pins.sh ops/db-backup/Dockerfile                                 # versions the pinned base's Alpine release serves NOW
 ```
 
+`resolve-pins.sh` runs `apk update && apk policy <pkgs>` inside the Dockerfile's pinned base (a bare `apk policy` without
+`apk update` has no index and shows nothing) and exits 1 naming every pin that the repo no longer serves.
+
 Edit `FROM` and the four `apk add pkg=version` pins together, rebuild, and run `DbBackupRoundTripIT`.
+
+**Why the build breaks with no change here:** Alpine keeps only the latest revision of each package per release branch.
+When a security fix lands (e.g. curl `8.22.0-r0` -> `8.23.0-r0`, October 2026) the old revision is deleted and
+`apk add curl=8.22.0-r0` exits 1, which the nightly `DbBackupRoundTripIT` reports. Run `resolve-pins.sh`, bump the
+package pin it names (the base digest only needs a bump when the Alpine release itself changes), rebuild, re-run the IT.
 
 ## Enable at closed-test start
 

@@ -4,12 +4,14 @@
 # Supply chain: the base is pinned by digest (Alpine 3.24.2) and so are the apk packages, which must be
 # the versions that Alpine release serves. To bump (see README "Bumping the pins"): pull the tag, copy the
 # new digest from `docker image inspect --format '{{index .RepoDigests 0}}'`, then read the matching
-# versions with `docker run --rm --entrypoint apk <image> policy age curl coreutils tini`.
+# versions with `./resolve-pins.sh` (runs `apk update && apk policy ...` in the pinned base; without `apk update`
+# the image has no package index and `apk policy` shows nothing useful). Alpine DROPS a superseded revision from its
+# repo when a security fix lands (curl 8.22.0-r0 -> 8.23.0-r0, 2026-10), so the build breaks with no change here.
 # CI (pr-validate.yml, db-backup shellcheck job, ops/db-backup/check-pins.sh) fails if the FROM line loses its
 # @sha256: pin or any apk package loses its =version.
 FROM postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
 
-RUN apk add --no-cache age=1.3.2-r1 curl=8.22.0-r0 coreutils=9.11-r0 tini=0.19.0-r3 \
+RUN apk add --no-cache age=1.3.2-r1 curl=8.23.0-r0 coreutils=9.11-r0 tini=0.19.0-r3 \
  && addgroup -S backup \
  && adduser -S -G backup -H -h /nonexistent backup
 
