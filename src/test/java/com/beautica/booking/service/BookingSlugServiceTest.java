@@ -811,7 +811,7 @@ class BookingSlugServiceTest {
         when(category.getId()).thenReturn(categoryId);
         when(category.getNameUk()).thenReturn("Манікюр");
         when(masterServiceRepository.findActiveCategoriesByMasterId(masterId))
-                .thenReturn(java.util.Collections.singletonList(new Object[] {category, "NAILS"}));
+                .thenReturn(java.util.Collections.singletonList(new Object[] {category, "NAILS", null}));
         var photo = new com.beautica.media.dto.MediaFileResponse(UUID.randomUUID(),
                 com.beautica.media.entity.EntityType.MASTER, masterId,
                 com.beautica.media.entity.MediaType.PORTFOLIO, "https://media.beautica.app/p.webp", null);
@@ -832,6 +832,43 @@ class BookingSlugServiceTest {
         assertThat(info.portfolio()).containsExactly(photo);
         assertThat(info.bookable()).isTrue();
         assertThat(info.salon()).isNull();
+    }
+
+    @Test
+    @DisplayName("two platform keys under one parent category -> each entry carries its own platform display name")
+    void should_usePlatformDisplayNames_when_twoKeysShareOneParentCategory() {
+        UUID masterId = UUID.randomUUID();
+        UUID lashesId = UUID.randomUUID();
+        enrichedMaster(masterId);
+        var lashes = org.mockito.Mockito.mock(com.beautica.service.entity.CatalogCategory.class);
+        when(lashes.getId()).thenReturn(lashesId);
+        org.mockito.Mockito.lenient().when(lashes.getNameUk()).thenReturn("Вії");
+        when(masterServiceRepository.findActiveCategoriesByMasterId(masterId)).thenReturn(List.of(
+                new Object[] {lashes, "LASH_EXTENSIONS", "Нарощення вій"},
+                new Object[] {lashes, "LASH_LAMINATION", "Ламінування вій"}));
+
+        BookingSlugInfoResponse info = service.findBySlug("olena-k-ab12");
+
+        assertThat(info.categories()).containsExactly(
+                new CategoryRef(lashesId, "Нарощення вій", "LASH_EXTENSIONS"),
+                new CategoryRef(lashesId, "Ламінування вій", "LASH_LAMINATION"));
+    }
+
+    @Test
+    @DisplayName("null platform display name (orphaned key) -> falls back to the parent catalogue nameUk")
+    void should_fallBackToCatalogNameUk_when_platformDisplayNameIsNull() {
+        UUID masterId = UUID.randomUUID();
+        UUID lashesId = UUID.randomUUID();
+        enrichedMaster(masterId);
+        var lashes = org.mockito.Mockito.mock(com.beautica.service.entity.CatalogCategory.class);
+        when(lashes.getId()).thenReturn(lashesId);
+        when(lashes.getNameUk()).thenReturn("Вії");
+        when(masterServiceRepository.findActiveCategoriesByMasterId(masterId))
+                .thenReturn(java.util.Collections.singletonList(new Object[] {lashes, "LASH_ORPHAN", null}));
+
+        BookingSlugInfoResponse info = service.findBySlug("olena-k-ab12");
+
+        assertThat(info.categories()).containsExactly(new CategoryRef(lashesId, "Вії", "LASH_ORPHAN"));
     }
 
     @Test

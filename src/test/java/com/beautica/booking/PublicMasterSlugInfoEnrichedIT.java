@@ -335,6 +335,66 @@ class PublicMasterSlugInfoEnrichedIT extends AbstractIntegrationTest {
     }
 
     @Test
+    @DisplayName("two lash services under one parent «Вії» -> categories carry the specific platform names and keys")
+    void should_returnPlatformDisplayNames_when_twoServicesShareParentCategory() throws Exception {
+        IndependentMaster master = pages.independentMaster(false);
+        assignServiceOfPlatformCategory(master.masterId(), "LASH_LAMINATION");
+        assignServiceOfPlatformCategory(master.masterId(), "LASH_EXTENSIONS");
+
+        JsonNode categories = page(master.slug()).path("categories");
+
+        // Pairs, in query order (parent sortOrder, nameUk, then key): a name swapped onto the wrong key fails here.
+        List<String> keyNamePairs = new ArrayList<>();
+        Set<String> parentIds = new HashSet<>();
+        categories.forEach(c -> {
+            keyNamePairs.add(c.path("key").asText() + "=" + c.path("name").asText());
+            parentIds.add(c.path("id").asText());
+        });
+        assertThat(keyNamePairs)
+                .as("each key carries its own platform display name, ordered by key under one parent")
+                .containsExactly("LASH_EXTENSIONS=Нарощення вій", "LASH_LAMINATION=Ламінування вій");
+        assertThat(parentIds).as("both entries keep the shared parent catalogue id, actual=%s", parentIds).hasSize(1);
+    }
+
+    @Test
+    @DisplayName("two services of the same lash key -> one category entry (the display-name join keeps DISTINCT intact)")
+    void should_returnOneCategoryEntry_when_twoServicesShareOnePlatformKey() throws Exception {
+        IndependentMaster master = pages.independentMaster(false);
+        // Two DIFFERENT active service types of one key (one active definition per owner + type is unique).
+        assignServiceOfPlatformCategory(master.masterId(), "LASH_EXTENSIONS", 0);
+        assignServiceOfPlatformCategory(master.masterId(), "LASH_EXTENSIONS", 1);
+
+        JsonNode categories = page(master.slug()).path("categories");
+
+        assertThat(categories).as("categories=%s", categories).hasSize(1);
+        assertThat(categories.get(0).path("key").asText()).isEqualTo("LASH_EXTENSIONS");
+        assertThat(categories.get(0).path("name").asText()).isEqualTo("Нарощення вій");
+    }
+
+    /** Assigns {@code masterId} an active independent definition on an active service type of {@code platformCategory}. */
+    private void assignServiceOfPlatformCategory(UUID masterId, String platformCategory) {
+        assignServiceOfPlatformCategory(masterId, platformCategory, 0);
+    }
+
+    /** As above, on the {@code typeOffset}-th active service type of the key (by {@code name_uk}, id). */
+    private void assignServiceOfPlatformCategory(UUID masterId, String platformCategory, int typeOffset) {
+        UUID serviceTypeId = jdbcTemplate.queryForObject(
+                "SELECT id FROM service_types WHERE platform_category_name = ? AND is_active = TRUE "
+                        + "ORDER BY name_uk, id LIMIT 1 OFFSET ?", UUID.class, platformCategory, typeOffset);
+        UUID defId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO service_definitions (id, owner_type, owner_id, name, service_type_id, "
+                        + "base_duration_minutes, price_type, base_price, buffer_minutes_after, "
+                        + "is_active, created_at, updated_at) "
+                        + "VALUES (?, 'INDEPENDENT_MASTER', ?, ?, ?, 60, 'FIXED', 500.00, 0, true, NOW(), NOW())",
+                defId, masterId, "Lash " + platformCategory + " " + typeOffset, serviceTypeId);
+        jdbcTemplate.update(
+                "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, true, NOW(), NOW())",
+                UUID.randomUUID(), masterId, defId);
+    }
+
+    @Test
     @DisplayName("ratingDistribution is zero-filled 5..1 for a master without reviews, and equals the app summary")
     void should_returnZeroFilledDistributionEqualToAppSummary_when_noReviews() throws Exception {
         IndependentMaster master = pages.independentMaster(true);
