@@ -761,15 +761,20 @@ public interface MasterServiceRepository extends JpaRepository<MasterServiceAssi
     /**
      * Phase 380 D2 — the distinct catalogue categories of a master's ACTIVE services (the same active
      * assignment + active definition filter as the services list on the public booking page), ordered
-     * for display ({@code sortOrder}, then {@code nameUk}). Each row is {@code [CatalogCategory, platformCategoryName]}:
-     * the platform category name is the key {@code ServiceDefinition.category} carries (phase 383), so the page's
-     * {@code categories[].key} joins to {@code services[].category}. One statement; bounded by the category count.
+     * for display ({@code sortOrder}, then {@code nameUk}). Each row is
+     * {@code [CatalogCategory, platformCategoryName, platformCategoryDisplayName]}: the platform category name is
+     * the key {@code ServiceDefinition.category} carries (phase 383), so the page's {@code categories[].key} joins
+     * to {@code services[].category}; the display name («Ламінування вій») is the specific label — several platform
+     * categories share one parent catalogue category («Вії»). {@code platform_categories.name} is UNIQUE, so the
+     * LEFT JOIN adds at most one value per (category, key) row and leaves DISTINCT unchanged; it is null only for
+     * an orphaned key. One statement; bounded by the category count.
      */
     @Query("""
-            SELECT DISTINCT c, st.platformCategoryName FROM MasterServiceAssignment a
+            SELECT DISTINCT c, st.platformCategoryName, pc.displayName FROM MasterServiceAssignment a
             JOIN a.serviceDefinition sd
             JOIN sd.serviceType st
             JOIN st.category c
+            LEFT JOIN PlatformCategory pc ON pc.name = st.platformCategoryName
             WHERE a.master.id = :masterId
               AND a.isActive = true
               AND sd.isActive = true

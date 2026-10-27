@@ -335,6 +335,43 @@ class PublicMasterSlugInfoEnrichedIT extends AbstractIntegrationTest {
     }
 
     @Test
+    @DisplayName("two lash services under one parent «Вії» -> categories carry the specific platform names and keys")
+    void should_returnPlatformDisplayNames_when_twoServicesShareParentCategory() throws Exception {
+        IndependentMaster master = pages.independentMaster(false);
+        assignServiceOfPlatformCategory(master.masterId(), "LASH_LAMINATION");
+        assignServiceOfPlatformCategory(master.masterId(), "LASH_EXTENSIONS");
+
+        JsonNode categories = page(master.slug()).path("categories");
+
+        List<String> names = new ArrayList<>();
+        Set<String> categoryKeys = new HashSet<>();
+        categories.forEach(c -> {
+            names.add(c.path("name").asText());
+            categoryKeys.add(c.path("key").asText());
+        });
+        assertThat(names).containsExactlyInAnyOrder("Ламінування вій", "Нарощення вій");
+        assertThat(categoryKeys).containsExactlyInAnyOrder("LASH_LAMINATION", "LASH_EXTENSIONS");
+    }
+
+    /** Assigns {@code masterId} an active independent definition on an active service type of {@code platformCategory}. */
+    private void assignServiceOfPlatformCategory(UUID masterId, String platformCategory) {
+        UUID serviceTypeId = jdbcTemplate.queryForObject(
+                "SELECT id FROM service_types WHERE platform_category_name = ? AND is_active = TRUE "
+                        + "ORDER BY name_uk LIMIT 1", UUID.class, platformCategory);
+        UUID defId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO service_definitions (id, owner_type, owner_id, name, service_type_id, "
+                        + "base_duration_minutes, price_type, base_price, buffer_minutes_after, "
+                        + "is_active, created_at, updated_at) "
+                        + "VALUES (?, 'INDEPENDENT_MASTER', ?, ?, ?, 60, 'FIXED', 500.00, 0, true, NOW(), NOW())",
+                defId, masterId, "Lash " + platformCategory, serviceTypeId);
+        jdbcTemplate.update(
+                "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, true, NOW(), NOW())",
+                UUID.randomUUID(), masterId, defId);
+    }
+
+    @Test
     @DisplayName("ratingDistribution is zero-filled 5..1 for a master without reviews, and equals the app summary")
     void should_returnZeroFilledDistributionEqualToAppSummary_when_noReviews() throws Exception {
         IndependentMaster master = pages.independentMaster(true);
