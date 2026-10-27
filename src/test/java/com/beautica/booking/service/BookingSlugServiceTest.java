@@ -835,7 +835,7 @@ class BookingSlugServiceTest {
     }
 
     @Test
-    @DisplayName("should_usePlatformDisplayNames_when_twoKeysShareOneParentCategory")
+    @DisplayName("two platform keys under one parent category -> each entry carries its own platform display name")
     void should_usePlatformDisplayNames_when_twoKeysShareOneParentCategory() {
         UUID masterId = UUID.randomUUID();
         UUID lashesId = UUID.randomUUID();
@@ -855,7 +855,7 @@ class BookingSlugServiceTest {
     }
 
     @Test
-    @DisplayName("should_fallBackToCatalogNameUk_when_platformDisplayNameIsNull")
+    @DisplayName("null platform display name (orphaned key) -> falls back to the parent catalogue nameUk")
     void should_fallBackToCatalogNameUk_when_platformDisplayNameIsNull() {
         UUID masterId = UUID.randomUUID();
         UUID lashesId = UUID.randomUUID();
