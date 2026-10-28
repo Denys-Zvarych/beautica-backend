@@ -2,6 +2,7 @@ package com.beautica.review.dto;
 
 import com.beautica.master.entity.Master;
 import com.beautica.review.entity.Review;
+import io.swagger.v3.oas.annotations.media.Schema;
 
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
@@ -40,7 +41,10 @@ public record SalonReviewResponse(
         String serviceName,
         Integer rating,
         String comment,
-        OffsetDateTime createdAt
+        OffsetDateTime createdAt,
+        @Schema(description = "True when the authenticated caller wrote this review (the app hides «Поскаржитися» "
+                + "on it); always false for an anonymous caller and on booking-link (slug) pages.")
+        boolean authoredByViewer
 ) {
 
     /**
@@ -70,6 +74,9 @@ public record SalonReviewResponse(
     // Client-name masking logic mirrors ReviewResponse.from exactly — same
     // "FirstName L." / "FirstName" / "L." / "Anonymous" rules. review.client CAN be null since
     // Phase 300 (a self-deleted author) — guarded below, same as ReviewResponse.from.
+    //
+    // Viewer-neutral (authoredByViewer = false): this shape is cached under reviews-by-salon, so the
+    // per-viewer flag is stamped afterwards by ReviewViewerService (phase 395).
     public static SalonReviewResponse from(Review review) {
         String displayName;
         if (review.getClient() == null) {
@@ -107,7 +114,15 @@ public record SalonReviewResponse(
                 review.getBooking().getMasterService().getServiceDefinition().getName(),
                 review.getRating().intValue(),
                 review.getComment(),
-                review.getCreatedAt().atOffset(ZoneOffset.UTC)
+                review.getCreatedAt().atOffset(ZoneOffset.UTC),
+                false
         );
+    }
+
+    /** A copy with {@code authoredByViewer} set — never mutate a cached instance. */
+    public SalonReviewResponse withAuthoredByViewer(boolean authored) {
+        return authored == authoredByViewer ? this
+                : new SalonReviewResponse(id, masterId, masterFirstName, masterLastName, clientDisplayName,
+                        serviceName, rating, comment, createdAt, authored);
     }
 }

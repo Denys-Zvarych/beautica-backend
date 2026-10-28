@@ -35,7 +35,7 @@ import org.springframework.security.task.DelegatingSecurityContextTaskExecutor;
  * <p><b>The deploy platform's SIGTERM→SIGKILL window must be at least this worst case.</b> A shorter
  * window kills the JVM mid-drain, losing the non-recoverable work below AND the abandonment report. On
  * Railway this is {@code deploy.drainingSeconds} in {@code railway.json} (&ge; this sum + the 30 s scheduler grace
- * ({@code SchedulingConfig}) + 2 lifecycle phases + margin = 185 + 30 + 2&times;20 + 20 = 275 &rarr; 280; pinned by
+ * ({@code SchedulingConfig}) + 2 lifecycle phases + margin = 190 + 30 + 2&times;20 + 20 = 280; pinned by
  * {@code RailwayConfigTest}). The push pool must drain before {@code FirebaseConfig} is destroyed
  * ({@code @DependsOn}, see {@code AsyncConfigShutdownOrderingTest}).
  *
@@ -49,6 +49,9 @@ import org.springframework.security.task.DelegatingSecurityContextTaskExecutor;
  * supportEmailTaskPool         35 s  Help/Contact mails. NOT outbox-backed -> cut = lost (user can resend).
  *                                    &ge; one in-flight Brevo API send WITH attachments (connect 3 s + the
  *                                    30 s send-with-attachments read budget, Phase 374) + margin.
+ * reportEmailTaskPool           5 s  phase-395 "content reported" nudges, ids only, no attachments. NOT
+ *                                    outbox-backed -> cut = lost nudge; the content_reports row is the
+ *                                    authoritative worklist, so nothing is lost from moderation.
  * smsSendExecutor              20 s  request-path booking SMS (walk-in / guest confirmation + guest
  *                                    cancellation) AND, since phase 390, guest provider-cancellation SMS
  *                                    handed off by the outbox drain, whose row is ALREADY SENT. NOT
@@ -61,7 +64,7 @@ import org.springframework.security.task.DelegatingSecurityContextTaskExecutor;
  * blobPurgeExecutor            10 s  after-commit R2 deletes of already-dereferenced blobs; cut = accepted
  *                                    orphan blob (never a dangling pointer), same policy as a failed delete;
  *                                    reported at WARN with task + key counts.
- * total (sequential worst)    185 s
+ * total (sequential worst)    190 s
  * </pre>
  * Outbox-driven work (invite/booking email, push fan-out) is re-queued by the outbox drain worker on the
  * next boot unless the hand-off was already accepted (push: see
@@ -76,6 +79,9 @@ public class AsyncConfig implements AsyncConfigurer {
     static final int EMAIL_SHUTDOWN_GRACE_SECONDS = 20;
     /** Phase 374: covers one attachment-bearing Brevo API send (connect 3 s + read 30 s) plus margin. */
     static final int SUPPORT_EMAIL_SHUTDOWN_GRACE_SECONDS = 35;
+    /** Phase 395: one in-flight ids-only report nudge; the DB row is authoritative, so a cut send is accepted. */
+    static final int REPORT_EMAIL_SHUTDOWN_GRACE_SECONDS = 5;
+    static final int REPORT_EMAIL_QUEUE_CAPACITY = 50;
     static final int PUSH_SHUTDOWN_GRACE_SECONDS = 30;
     static final int SMS_SEND_SHUTDOWN_GRACE_SECONDS = 20;
     static final int CACHE_EVICTION_SHUTDOWN_GRACE_SECONDS = 10;
@@ -224,6 +230,33 @@ public class AsyncConfig implements AsyncConfigurer {
     public TaskExecutor supportEmailExecutor(
             @Qualifier("supportEmailTaskPool") ThreadPoolTaskExecutor supportEmailTaskPool) {
         return new DelegatingSecurityContextTaskExecutor(supportEmailTaskPool);
+    }
+
+    /** Inner pool of {@link #reportEmailExecutor(ThreadPoolTaskExecutor)} — see {@link #emailTaskPool()}. */
+    @Bean(name = "reportEmailTaskPool", defaultCandidate = false)
+    public ThreadPoolTaskExecutor reportEmailTaskPool() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(1);
+        executor.setMaxPoolSize(1);
+        executor.setQueueCapacity(REPORT_EMAIL_QUEUE_CAPACITY);
+        executor.setThreadNamePrefix("report-email-");
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.AbortPolicy());
+        executor.setWaitForTasksToCompleteOnShutdown(true);
+        executor.setAwaitTerminationSeconds(REPORT_EMAIL_SHUTDOWN_GRACE_SECONDS);
+        executor.setTaskDecorator(contextPropagatingDecorator());
+        executor.initialize();
+        return executor;
+    }
+
+    // Phase 395 — dedicated pool for "content reported" support nudges, isolated from supportEmailExecutor
+    // so a report burst (20/user/day across many users) cannot queue ahead of, or reject, a user's
+    // Help/Contact-us mail. Single thread, bounded queue, AbortPolicy: on saturation the listener logs
+    // one WARN and drops the nudge — the content_reports row is the authoritative worklist. Same
+    // SecurityContext + classloader propagation rationale as emailExecutor.
+    @Bean(name = "reportEmailExecutor")
+    public TaskExecutor reportEmailExecutor(
+            @Qualifier("reportEmailTaskPool") ThreadPoolTaskExecutor reportEmailTaskPool) {
+        return new DelegatingSecurityContextTaskExecutor(reportEmailTaskPool);
     }
 
     /**

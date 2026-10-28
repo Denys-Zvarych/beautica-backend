@@ -1734,4 +1734,21 @@ class GlobalExceptionHandlerTest {
     private enum SelfRegistrationRoleStub {
         CLIENT, INDEPENDENT_MASTER
     }
+
+    @Test
+    @DisplayName("ContentReportRateLimitedException → 429 with Retry-After and a generic message (phase 395 D6)")
+    void should_return429WithRetryAfter_when_contentReportRateLimited() {
+        ContentReportRateLimitedException ex = new ContentReportRateLimitedException(86_400);
+
+        ResponseEntity<ApiResponse<Void>> response = handler.handleContentReportRateLimited(ex);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.TOO_MANY_REQUESTS);
+        assertThat(response.getHeaders().getFirst(HttpHeaders.RETRY_AFTER)).isEqualTo("86400");
+        assertThat(response.getBody()).isNotNull();
+        assertThat(response.getBody().success()).isFalse();
+        assertThat(response.getBody().message())
+                .isEqualTo("Too many reports — please try again later")
+                .doesNotContain("20")
+                .doesNotContain("86400");
+    }
 }

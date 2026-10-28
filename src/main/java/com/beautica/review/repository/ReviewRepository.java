@@ -9,8 +9,10 @@ import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 
 public interface ReviewRepository extends JpaRepository<Review, UUID> {
@@ -50,9 +52,17 @@ public interface ReviewRepository extends JpaRepository<Review, UUID> {
      * Do NOT widen it to carry the author's name or the service name — see
      * {@link BookingReviewView}'s javadoc.
      */
+    /**
+     * Phase 395 — of the given review ids (one page, at most {@code max-page-size}), those written by
+     * {@code clientId}. Backs the per-viewer {@code authoredByViewer} flag on the cached public review lists;
+     * primary-key lookups only, no association is loaded.
+     */
+    @Query("SELECT r.id FROM Review r WHERE r.client.id = :clientId AND r.id IN :ids")
+    Set<UUID> findIdsByClientIdAndIdIn(@Param("clientId") UUID clientId, @Param("ids") Collection<UUID> ids);
+
     @Query("""
             SELECT new com.beautica.review.repository.BookingReviewView(
-                r.rating, r.comment)
+                r.id, r.rating, r.comment)
             FROM Review r
             WHERE r.booking.id = :bookingId
             """)

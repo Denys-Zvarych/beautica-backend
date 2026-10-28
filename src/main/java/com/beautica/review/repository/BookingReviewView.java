@@ -1,5 +1,7 @@
 package com.beautica.review.repository;
 
+import java.util.UUID;
+
 /**
  * Scalar projection of ONE client&rarr;provider {@link com.beautica.review.entity.Review}, keyed by
  * the booking it hangs off (Phase 317). Backs {@code BookingDetailResponse#reviewByClient}.
@@ -23,10 +25,16 @@ package com.beautica.review.repository;
  * UNIQUE FK, so the {@link java.util.Optional} the query returns already carries "at most one row
  * per booking" without restating the key in the payload.
  *
+ * <p>{@code id} (phase 395) is the review's own id, so the provider can report it ({@code POST /reports},
+ * {@code targetType = REVIEW}). Already public through {@code GET /masters/&#123;id&#125;/reviews}; it is NOT the
+ * booking id the paragraph above keeps out.
+ *
+ * @param id      the review's id
  * @param rating  the client's 1-5 star rating
  * @param comment the client's free text, or {@code null}
  */
 public record BookingReviewView(
+        UUID id,
         Short rating,
         String comment
 ) {}

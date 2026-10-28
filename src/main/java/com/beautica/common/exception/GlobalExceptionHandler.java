@@ -399,6 +399,18 @@ public class GlobalExceptionHandler {
                 .body(ApiResponse.error("Too many bookings declined recently — please wait before retrying"));
     }
 
+    /**
+     * 429 for the phase-395 per-user content-report budget — see {@link ContentReportRateLimitedException}. Generic
+     * message, no budget figures echoed (same posture as {@link #handleResendThrottled}).
+     */
+    @ExceptionHandler(ContentReportRateLimitedException.class)
+    public ResponseEntity<ApiResponse<Void>> handleContentReportRateLimited(ContentReportRateLimitedException ex) {
+        return ResponseEntity
+                .status(HttpStatus.TOO_MANY_REQUESTS)
+                .header("Retry-After", String.valueOf(ex.getRetryAfterSeconds()))
+                .body(ApiResponse.error("Too many reports — please try again later"));
+    }
+
     @ExceptionHandler(NotFoundException.class)
     public ResponseEntity<ApiResponse<Void>> handleNotFound(NotFoundException ex) {
         // Return a generic message — do not echo ex.getMessage() which may reveal internal

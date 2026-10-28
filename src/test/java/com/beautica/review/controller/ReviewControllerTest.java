@@ -11,7 +11,9 @@ import com.beautica.common.PageResponse;
 import com.beautica.review.dto.CreateReviewRequest;
 import com.beautica.review.dto.MyReviewResponse;
 import com.beautica.review.dto.ReviewResponse;
+import com.beautica.review.repository.ReviewRepository;
 import com.beautica.review.service.ReviewService;
+import com.beautica.review.service.ReviewViewerService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.servlet.http.HttpServletResponse;
 import org.junit.jupiter.api.DisplayName;
@@ -28,6 +30,7 @@ import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
 import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageImpl;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
@@ -49,6 +52,7 @@ import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -67,7 +71,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 
 @WebMvcTest(ReviewController.class)
 @TestPropertySource(properties = "app.frontend.base-url=http://localhost:3000")
-@Import(WebMvcTestSupport.class)
+@Import({WebMvcTestSupport.class, ReviewViewerService.class})
 @DisplayName("ReviewController — @WebMvcTest slice")
 class ReviewControllerTest {
 
@@ -103,6 +107,8 @@ class ReviewControllerTest {
     @Autowired private MockMvc mockMvc;
     @Autowired private ObjectMapper objectMapper;
     @MockBean private ReviewService reviewService;
+    /** Backs the real {@link ReviewViewerService} (phase 395 authoredByViewer). */
+    @MockBean private ReviewRepository reviewRepository;
     @MockBean(name = "authz") private AuthorizationService authorizationService;
     @MockBean private JwtTokenProvider jwtTokenProvider;
 
@@ -123,7 +129,8 @@ class ReviewControllerTest {
                 "Manicure",
                 5,
                 "Great service",
-                OffsetDateTime.now(ZoneOffset.UTC)
+                OffsetDateTime.now(ZoneOffset.UTC),
+                false
         );
     }
 
@@ -399,6 +406,53 @@ class ReviewControllerTest {
                         .param("page", "2147483647")
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    @DisplayName("GET /masters/{masterId}/reviews — authenticated viewer: authoredByViewer true only on own review")
+    void should_flagOwnReview_when_authenticatedViewerListsMasterReviews() throws Exception {
+        var viewerId = UUID.randomUUID();
+        ReviewResponse own = stubReviewResponse();
+        ReviewResponse other = stubReviewResponse();
+        when(reviewService.getReviewsForMaster(any(), any(), any()))
+                .thenReturn(new PageImpl<>(List.of(own, other)));
+        when(reviewRepository.findIdsByClientIdAndIdIn(eq(viewerId), any())).thenReturn(Set.of(own.id()));
+
+        mockMvc.perform(get(MASTERS_REVIEWS_URL, UUID.randomUUID())
+                        .with(authenticatedAs(viewerId, "client@test.com", Role.CLIENT))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.data[0].authoredByViewer").value(true))
+                .andExpect(jsonPath("$.data.data[1].authoredByViewer").value(false));
+    }
+
+    @Test
+    @DisplayName("GET /masters/{masterId}/reviews — anonymous: authoredByViewer false, no authorship query")
+    void should_notFlagAndNotQuery_when_anonymousListsMasterReviews() throws Exception {
+        when(reviewService.getReviewsForMaster(any(), any(), any()))
+                .thenReturn(new PageImpl<>(List.of(stubReviewResponse())));
+
+        mockMvc.perform(get(MASTERS_REVIEWS_URL, UUID.randomUUID())
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.data[0].authoredByViewer").value(false));
+
+        verifyNoInteractions(reviewRepository);
+    }
+
+    @Test
+    @DisplayName("GET /reviews/{reviewId} — the author sees authoredByViewer true")
+    void should_flagOwnReview_when_authorGetsReviewById() throws Exception {
+        var viewerId = UUID.randomUUID();
+        ReviewResponse review = stubReviewResponse();
+        when(reviewService.getReview(review.id())).thenReturn(review);
+        when(reviewRepository.findIdsByClientIdAndIdIn(eq(viewerId), any())).thenReturn(Set.of(review.id()));
+
+        mockMvc.perform(get(REVIEWS_URL + "/{reviewId}", review.id())
+                        .with(authenticatedAs(viewerId, "client@test.com", Role.CLIENT))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.authoredByViewer").value(true));
     }
 
     // ── GET /reviews/me (Phase 19.4) ──────────────────────────────────────────

@@ -271,6 +271,18 @@ public class RateLimitConfig {
     // evaluate FIRST: caching the per-master bookability verdict at {masterId, duration, from, to}.
     // ══════════════════════════════════════════════════════════════════════════════════════════
 
+    /**
+     * Per-AUTHENTICATED-USER cap (24-hour window) on NEW content reports, {@code POST /api/v1/reports} (phase 395
+     * D6: 20 per 24 h). Consumed directly by {@code ContentReportService} rather than by a servlet filter: an
+     * idempotent repeat of an existing report (D4) must answer 200 without spending a token, and only the service
+     * knows whether the report already exists. Every new report e-mails the support inbox, so this is also the
+     * inbox-flood bound for the endpoint. Configurable so tests can lower or raise it.
+     */
+    @Value("${app.rate-limit.content-report-capacity:20}")
+    private long contentReportCapacity;
+
+    private static final Duration CONTENT_REPORT_WINDOW = Duration.ofHours(24);
+
     @Value("${app.rate-limit.device-token-capacity:30}")
     private long deviceTokenCapacity;
 
@@ -846,6 +858,20 @@ public class RateLimitConfig {
     public LoadingCache<String, Bucket> notificationFeedBuckets() {
         return bucketCache(
                 DEFAULT_BUCKET_CACHE_SIZE, STANDARD_EVICTION, notificationFeedCapacity, ONE_MINUTE);
+    }
+
+    /**
+     * Per-user bucket (see {@link #contentReportCapacity}) consumed by {@code ContentReportService} (bound by
+     * field name {@code contentReportBuckets}). {@code expireAfterAccess} gives the usual 5-minute grace past the
+     * 24-hour window.
+     */
+    @Bean
+    public LoadingCache<String, Bucket> contentReportBuckets() {
+        return bucketCache(
+                DEFAULT_BUCKET_CACHE_SIZE,
+                CONTENT_REPORT_WINDOW.plus(EVICTION_GRACE),
+                contentReportCapacity,
+                CONTENT_REPORT_WINDOW);
     }
 
     @Bean

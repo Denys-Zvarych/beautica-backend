@@ -61,6 +61,9 @@ public abstract class AbstractIntegrationTest {
         // Phase 332 (V181): in_app_notification FKs users/bookings/appointments/salons (booking_id
         // and appointment_id ON DELETE CASCADE, salon_id ON DELETE SET NULL) — delete first, before
         // any of those parents, so cleanup does not rely on CASCADE (§O-7).
+        // Phase 395 (V207): content_reports.reporter_user_id FK -> users(id) ON DELETE CASCADE; no FK points
+        // at it. Deleted explicitly before users so cleanup does not rely on CASCADE (§O-7).
+        jdbcTemplate.execute("DELETE FROM content_reports");
         jdbcTemplate.execute("DELETE FROM in_app_notification");
         jdbcTemplate.execute("DELETE FROM notification_outbox");
         // favorites FK → users ON DELETE CASCADE, but §O-7 forbids relying on CASCADE

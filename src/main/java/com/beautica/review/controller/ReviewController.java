@@ -11,6 +11,7 @@ import com.beautica.review.dto.SalonReviewResponse;
 import com.beautica.review.dto.SalonReviewSort;
 import com.beautica.review.dto.SalonReviewSummaryResponse;
 import com.beautica.review.service.ReviewService;
+import com.beautica.review.service.ReviewViewerService;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.domain.Page;
@@ -37,6 +38,7 @@ import java.util.UUID;
 public class ReviewController {
 
     private final ReviewService reviewService;
+    private final ReviewViewerService reviewViewerService;
 
     @PreAuthorize("hasRole('CLIENT')")
     @PostMapping("/reviews")
@@ -50,7 +52,8 @@ public class ReviewController {
     /**
      * Sortable, paginated received-reviews list for a master's public profile.
      *
-     * <p><strong>Public endpoint — no authentication required.</strong> {@code sort} defaults
+     * <p><strong>Public endpoint — no authentication required.</strong> An optional bearer token only
+     * sets each row's {@code authoredByViewer} (phase 395). {@code sort} defaults
      * to {@code NEWEST} when omitted (Phase 8.11), preserving the pre-8.11 newest-first
      * behaviour. Reuses the salon {@link SalonReviewSort} enum verbatim — the four wire values
      * are identical, so mobile maps one enum for both endpoints.
@@ -59,8 +62,10 @@ public class ReviewController {
     public ApiResponse<PageResponse<ReviewResponse>> getReviewsByMaster(
             @PathVariable UUID masterId,
             @RequestParam(required = false, defaultValue = "NEWEST") SalonReviewSort sort,
-            @PageableDefault(size = 20) Pageable pageable) {
-        Page<ReviewResponse> page = reviewService.getReviewsForMaster(masterId, sort, pageable);
+            @PageableDefault(size = 20) Pageable pageable,
+            Authentication auth) {
+        Page<ReviewResponse> page = reviewViewerService.getReviewsForMaster(
+                masterId, sort, pageable, AuthenticationUtils.userIdOrNull(auth));
         return ApiResponse.ok(PageResponse.of(
                 page.getContent(),
                 page.getNumber(),
@@ -94,8 +99,8 @@ public class ReviewController {
     }
 
     @GetMapping("/reviews/{reviewId}")
-    public ApiResponse<ReviewResponse> getReview(@PathVariable UUID reviewId) {
-        return ApiResponse.ok(reviewService.getReview(reviewId));
+    public ApiResponse<ReviewResponse> getReview(@PathVariable UUID reviewId, Authentication auth) {
+        return ApiResponse.ok(reviewViewerService.getReview(reviewId, AuthenticationUtils.userIdOrNull(auth)));
     }
 
     /**
@@ -114,15 +119,18 @@ public class ReviewController {
      * Sortable, paginated review list for a salon's public profile.
      *
      * <p><strong>Public endpoint — no authentication required.</strong> Same no-auth
-     * rationale as {@link #getSalonReviewSummary}. {@code sort} defaults to {@code NEWEST}
+     * rationale as {@link #getSalonReviewSummary}; an optional bearer token only sets each row's
+     * {@code authoredByViewer} (phase 395). {@code sort} defaults to {@code NEWEST}
      * when omitted.
      */
     @GetMapping("/salons/{salonId}/reviews")
     public ApiResponse<PageResponse<SalonReviewResponse>> getSalonReviews(
             @PathVariable UUID salonId,
             @RequestParam(required = false, defaultValue = "NEWEST") SalonReviewSort sort,
-            @PageableDefault(size = 20) Pageable pageable) {
-        Page<SalonReviewResponse> page = reviewService.getSalonReviews(salonId, sort, pageable);
+            @PageableDefault(size = 20) Pageable pageable,
+            Authentication auth) {
+        Page<SalonReviewResponse> page = reviewViewerService.getSalonReviews(
+                salonId, sort, pageable, AuthenticationUtils.userIdOrNull(auth));
         return ApiResponse.ok(PageResponse.of(
                 page.getContent(),
                 page.getNumber(),

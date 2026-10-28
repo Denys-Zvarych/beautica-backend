@@ -258,7 +258,7 @@ public class BookingService {
      * {@code GET /masters/&#123;id&#125;/reviews}.
      */
     private static ClientAuthoredReviewResponse toClientAuthoredReview(BookingReviewView view) {
-        return new ClientAuthoredReviewResponse(view.rating().intValue(), view.comment());
+        return new ClientAuthoredReviewResponse(view.id(), view.rating().intValue(), view.comment());
     }
 
     /**

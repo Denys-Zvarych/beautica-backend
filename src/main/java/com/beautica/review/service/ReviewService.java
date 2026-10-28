@@ -153,7 +153,8 @@ public class ReviewService {
         // loaded, managed entity (item 8 of the audit-fix cycle 1 backlog) — never reloaded
         // (audit-fix cycle 1, finding 1).
         inAppNotificationService.notifyReviewReceived(saved.getId(), booking, clientId);
-        return ReviewResponse.from(saved);
+        // The caller just wrote it (phase 395 authoredByViewer).
+        return ReviewResponse.from(saved).withAuthoredByViewer(true);
     }
 
     private static final int MAX_PAGE_NUMBER = 10_000;

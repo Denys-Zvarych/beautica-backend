@@ -1,6 +1,7 @@
 package com.beautica.review.dto;
 
 import com.beautica.review.entity.Review;
+import io.swagger.v3.oas.annotations.media.Schema;
 
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
@@ -14,7 +15,11 @@ public record ReviewResponse(
         String serviceName,
         Integer rating,
         String comment,
-        OffsetDateTime createdAt
+        OffsetDateTime createdAt,
+
+        @Schema(description = "True when the authenticated caller wrote this review (the app hides «Поскаржитися» "
+                + "on it); always false for an anonymous caller and on booking-link (slug) pages.")
+        boolean authoredByViewer
 
 ) {
 
@@ -37,6 +42,11 @@ public record ReviewResponse(
     // (unique FK, Review entity) and Booking.masterService is NOT NULL, so the chain below never
     // needs a null guard — same contract SalonReviewResponse.from relies on. review.client CAN be
     // null since Phase 300 (a self-deleted author) — guarded below.
+    /**
+     * Viewer-neutral mapping: {@code authoredByViewer = false}. This is the shape that is CACHED
+     * ({@code reviews-by-master}, {@code review-detail}), so it must never carry a per-viewer value;
+     * {@code ReviewViewerService} stamps the flag per request on the way out (phase 395).
+     */
     public static ReviewResponse from(Review review) {
         String displayName;
         if (review.getClient() == null) {
@@ -61,7 +71,14 @@ public record ReviewResponse(
                 review.getBooking().getMasterService().getServiceDefinition().getName(),
                 review.getRating().intValue(),
                 review.getComment(),
-                review.getCreatedAt().atOffset(ZoneOffset.UTC)
+                review.getCreatedAt().atOffset(ZoneOffset.UTC),
+                false
         );
+    }
+
+    /** A copy with {@code authoredByViewer} set — never mutate a cached instance. */
+    public ReviewResponse withAuthoredByViewer(boolean authored) {
+        return authored == authoredByViewer ? this
+                : new ReviewResponse(id, masterId, clientDisplayName, serviceName, rating, comment, createdAt, authored);
     }
 }

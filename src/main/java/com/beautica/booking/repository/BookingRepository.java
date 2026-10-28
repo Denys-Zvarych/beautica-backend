@@ -2210,4 +2210,43 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
                AND client_id IS NULL
             """, nativeQuery = true)
     int cancelGuestRowById(@Param("id") UUID id);
+
+    /**
+     * Phase 395 D2 — does {@code actorUserId} see this registered client through at least one booking, as the
+     * performing master or as the owner of the booking's salon? Backs the {@code CLIENT_PROFILE} /
+     * {@code CLIENT_REVIEW} reportability check ({@code ReportTargetVisibilityResolver}). Mirrors the master and
+     * owner arms of {@code AuthorizationService#isViewAuthorized}: a {@code SALON_MASTER} needs the master row
+     * still active ({@code requireActiveMaster = true}), every other role does not. The assigned
+     * {@code SALON_ADMIN} arm is {@link #existsByClientIdAndSalonId}. Bounded by one client's bookings via
+     * {@code idx_bookings_client_starts_at}.
+     *
+     * <p>Native {@code SELECT EXISTS} (pattern of {@code SalonRepository#existsByIdAndOwnerId}) so Postgres stops at
+     * the first matching booking instead of counting them all. Same predicate as the former JPQL count: the
+     * {@code users} join was only ever read for its id, which is {@code masters.user_id} itself, and the salon
+     * owner's id is {@code salons.owner_id}.
+     */
+    @Query(value = """
+            SELECT EXISTS (
+                SELECT 1
+                  FROM bookings b
+                  JOIN masters m ON m.id = b.master_id
+                  LEFT JOIN salons s ON s.id = b.salon_id
+                 WHERE b.client_id = :clientId
+                   AND ((m.user_id = :actorUserId AND (m.is_active = true OR :requireActiveMaster = false))
+                        OR s.owner_id = :actorUserId))
+            """, nativeQuery = true)
+    boolean existsClientBookingVisibleToProvider(
+            @Param("clientId") UUID clientId,
+            @Param("actorUserId") UUID actorUserId,
+            @Param("requireActiveMaster") boolean requireActiveMaster);
+
+    /**
+     * Phase 395 D2 — the assigned {@code SALON_ADMIN} arm of {@link #existsClientBookingVisibleToProvider}:
+     * a booking of this client at the admin's salon. Native {@code SELECT EXISTS}: stops at the first row.
+     */
+    @Query(value = """
+            SELECT EXISTS (
+                SELECT 1 FROM bookings b WHERE b.client_id = :clientId AND b.salon_id = :salonId)
+            """, nativeQuery = true)
+    boolean existsByClientIdAndSalonId(@Param("clientId") UUID clientId, @Param("salonId") UUID salonId);
 }

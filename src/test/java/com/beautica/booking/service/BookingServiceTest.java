@@ -139,6 +139,7 @@ class BookingServiceTest {
     private BookingService bookingService;
 
     private static final ZoneId KYIV = ZoneId.of("Europe/Kyiv");
+    private static final UUID REVIEW_BY_CLIENT_ID = UUID.fromString("00000000-0000-0000-0000-0000000003a5");
 
     private UUID clientId;
     private UUID masterId;
@@ -4939,7 +4940,7 @@ class BookingServiceTest {
             // statement count and the short-circuit in front of it are unchanged.
             when(reviewRepository.findViewByBookingId(bookingId)).thenReturn(
                     reviewExists
-                            ? Optional.of(new com.beautica.review.repository.BookingReviewView((short) 5, "Гарно"))
+                            ? Optional.of(new com.beautica.review.repository.BookingReviewView(REVIEW_BY_CLIENT_ID, (short) 5, "Гарно"))
                             : Optional.empty());
         }
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
@@ -4968,6 +4969,13 @@ class BookingServiceTest {
     @DisplayName("canReview is true for a COMPLETED booking with no existing review")
     void should_returnCanReviewTrue_when_bookingCompletedAndNoReview() {
         assertThat(getBookingWith(BookingStatus.COMPLETED, false).canReview()).isTrue();
+    }
+
+    @Test
+    @DisplayName("phase 395 — reviewByClient carries the review id (report target)")
+    void should_exposeReviewId_when_bookingCompletedAndReviewExists() {
+        assertThat(getBookingWith(BookingStatus.COMPLETED, true).reviewByClient().id())
+                .isEqualTo(REVIEW_BY_CLIENT_ID);
     }
 
     @Test

@@ -16,6 +16,7 @@ import org.thymeleaf.spring6.SpringTemplateEngine;
 
 import java.util.List;
 import java.util.Locale;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 
 /**
@@ -225,6 +226,49 @@ public class EmailService {
             // audit identity already logged at accept time) so the drop is observable.
             log.error("Failed to send support contact email to {} from user {}: {}",
                     toEmail, senderUserId, ex.getClass().getSimpleName());
+            return CompletableFuture.failedFuture(ex);
+        }
+    }
+
+    /**
+     * Phase 395 D7 — tells the support inbox that a piece of UGC was reported. Carries IDS ONLY: report id,
+     * target type/id, reason and reporter id. The reported text and the reporter's comment stay in
+     * {@code content_reports} (PII stays in the DB) — this method cannot receive them by signature.
+     * Runs on its own {@code reportEmailExecutor} (not the Help/Contact-us {@code supportEmailExecutor}, so a
+     * report burst cannot starve user support mail). Lossy by design: the DB row is authoritative, so a
+     * dropped send loses only the nudge, never the report. A saturated pool rejects the hand-off with
+     * {@code TaskRejectedException}, which {@code ContentReportEmailListener} catches.
+     */
+    @Async("reportEmailExecutor")
+    public CompletableFuture<Void> sendContentReportEmail(
+            String toEmail,
+            UUID reportId,
+            String targetType,
+            UUID targetId,
+            String reason,
+            UUID reporterUserId) {
+        try {
+            Context ctx = new Context(Locale.of("uk"));
+            ctx.setVariable("reportId", reportId.toString());
+            ctx.setVariable("targetType", targetType);
+            ctx.setVariable("targetId", targetId.toString());
+            ctx.setVariable("reason", reason);
+            ctx.setVariable("reporterUserId", reporterUserId.toString());
+
+            String html = templateEngine.process("email/content-report", ctx);
+
+            MimeMessage message = mailSender.createMimeMessage();
+            MimeMessageHelper helper = new MimeMessageHelper(message, "UTF-8");
+            helper.setFrom(fromEmail);
+            helper.setTo(toEmail);
+            helper.setSubject("[Beautica Report] " + targetType + " — " + reason);
+            helper.setText(html, true);
+
+            mailSender.send(message);
+            return CompletableFuture.completedFuture(null);
+        } catch (Exception ex) {
+            log.error("Failed to send content report email for report {}: {}",
+                    reportId, ex.getClass().getSimpleName());
             return CompletableFuture.failedFuture(ex);
         }
     }
