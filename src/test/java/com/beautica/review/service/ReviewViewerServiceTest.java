@@ -3,6 +3,7 @@ package com.beautica.review.service;
 import com.beautica.review.dto.ReviewResponse;
 import com.beautica.review.dto.SalonReviewResponse;
 import com.beautica.review.dto.SalonReviewSort;
+import com.beautica.review.entity.ReviewSource;
 import com.beautica.review.repository.ReviewRepository;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -132,11 +133,12 @@ class ReviewViewerServiceTest {
     }
 
     private static ReviewResponse review() {
-        return new ReviewResponse(UUID.randomUUID(), MASTER_ID, "Олена К.", "Манікюр", 5, "Чудово", CREATED, false);
+        return new ReviewResponse(UUID.randomUUID(), MASTER_ID, "Олена К.", "Манікюр", 5, "Чудово", CREATED, false,
+                ReviewSource.APP);
     }
 
     private static SalonReviewResponse salonReview() {
         return new SalonReviewResponse(UUID.randomUUID(), MASTER_ID, "Ірина", "Т.", "Олена К.", "Манікюр", 4,
-                "Добре", CREATED, false);
+                "Добре", CREATED, false, ReviewSource.APP);
     }
 }

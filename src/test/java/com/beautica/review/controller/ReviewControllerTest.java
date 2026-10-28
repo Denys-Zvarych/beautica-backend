@@ -11,6 +11,7 @@ import com.beautica.common.PageResponse;
 import com.beautica.review.dto.CreateReviewRequest;
 import com.beautica.review.dto.MyReviewResponse;
 import com.beautica.review.dto.ReviewResponse;
+import com.beautica.review.entity.ReviewSource;
 import com.beautica.review.repository.ReviewRepository;
 import com.beautica.review.service.ReviewService;
 import com.beautica.review.service.ReviewViewerService;
@@ -130,7 +131,8 @@ class ReviewControllerTest {
                 5,
                 "Great service",
                 OffsetDateTime.now(ZoneOffset.UTC),
-                false
+                false,
+                ReviewSource.APP
         );
     }
 

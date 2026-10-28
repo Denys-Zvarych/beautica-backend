@@ -67,6 +67,11 @@ public abstract class AbstractIntegrationTest {
         // Phase 397 (V210): client_blocks FKs masters/salons/users (CASCADE) and users (SET NULL); no FK points at
         // it. Deleted explicitly before every parent so cleanup does not rely on the FK actions (§O-7).
         jdbcTemplate.execute("DELETE FROM client_blocks");
+        // Phase 399 (V213): review_invites.appointment_id FK -> appointments(id) ON DELETE CASCADE; no FK points at
+        // it. Deleted explicitly before appointments so cleanup does not rely on CASCADE (§O-7). sms_opt_outs has no
+        // FK either way (a phone hash only) and would otherwise leak opt-outs between tests.
+        jdbcTemplate.execute("DELETE FROM review_invites");
+        jdbcTemplate.execute("DELETE FROM sms_opt_outs");
         jdbcTemplate.execute("DELETE FROM in_app_notification");
         jdbcTemplate.execute("DELETE FROM notification_outbox");
         // favorites FK → users ON DELETE CASCADE, but §O-7 forbids relying on CASCADE

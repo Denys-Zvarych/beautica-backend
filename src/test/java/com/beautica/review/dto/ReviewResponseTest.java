@@ -168,6 +168,57 @@ class ReviewResponseTest {
     }
 
     @Test
+    @DisplayName("uses firstName only when lastName is empty or blank (no charAt(0) crash)")
+    void should_useFirstNameOnly_when_lastNameIsBlank() {
+        var emptyLastName = reviewByClient("Іван", "");
+        var blankLastName = reviewByClient("Іван", "   ");
+
+        var emptyResponse = ReviewResponse.from(emptyLastName);
+        var blankResponse = ReviewResponse.from(blankLastName);
+
+        assertThat(emptyResponse.clientDisplayName()).isEqualTo("Іван");
+        assertThat(blankResponse.clientDisplayName()).isEqualTo("Іван");
+    }
+
+    @Test
+    @DisplayName("falls back to 'Anonymous' when firstName is null and lastName is blank")
+    void should_useAnonymous_when_firstNameNullAndLastNameBlank() {
+        var review = reviewByClient(null, " ");
+
+        var response = ReviewResponse.from(review);
+
+        assertThat(response.clientDisplayName()).isEqualTo("Anonymous");
+    }
+
+    @Test
+    @DisplayName("a non-BMP first surname character is masked as one whole code point, never a lone surrogate")
+    void should_keepWholeCodePointInitial_when_lastNameStartsWithNonBmpCharacter() {
+        var emojiLastName = reviewByClient("Іван", "😀Франко");
+        var gothicLastName = reviewByClient(null, "𐌰𐌱");
+
+        var emojiResponse = ReviewResponse.from(emojiLastName);
+        var gothicResponse = ReviewResponse.from(gothicLastName);
+
+        assertThat(emojiResponse.clientDisplayName()).isEqualTo("Іван 😀.");
+        assertThat(gothicResponse.clientDisplayName()).isEqualTo("𐌰.");
+    }
+
+    private static Review reviewByClient(String firstName, String lastName) {
+        var client = mock(User.class);
+        when(client.getFirstName()).thenReturn(firstName);
+        when(client.getLastName()).thenReturn(lastName);
+        var review = mock(Review.class);
+        when(review.getId()).thenReturn(UUID.randomUUID());
+        when(review.getClient()).thenReturn(client);
+        when(review.getMaster()).thenReturn(mock(Master.class));
+        var booking = mockBookingWithServiceName("Manicure");
+        when(review.getBooking()).thenReturn(booking);
+        when(review.getRating()).thenReturn((short) 5);
+        when(review.getCreatedAt()).thenReturn(CREATED_AT);
+        return review;
+    }
+
+    @Test
     @DisplayName("uses last initial with dot when firstName is null (privacy masking)")
     void should_useLastNameOnly_when_firstNameIsNull() {
         var client = mock(User.class);

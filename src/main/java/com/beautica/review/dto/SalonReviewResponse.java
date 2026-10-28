@@ -2,6 +2,7 @@ package com.beautica.review.dto;
 
 import com.beautica.master.entity.Master;
 import com.beautica.review.entity.Review;
+import com.beautica.review.entity.ReviewSource;
 import io.swagger.v3.oas.annotations.media.Schema;
 
 import java.time.OffsetDateTime;
@@ -44,7 +45,10 @@ public record SalonReviewResponse(
         OffsetDateTime createdAt,
         @Schema(description = "True when the authenticated caller wrote this review (the app hides «Поскаржитися» "
                 + "on it); always false for an anonymous caller and on booking-link (slug) pages.")
-        boolean authoredByViewer
+        boolean authoredByViewer,
+        @Schema(description = "Who wrote the review (phase 399): APP = a client account in the app; GUEST_LINK = a "
+                + "booking-link guest through an SMS invite, clientDisplayName is then the guest's «Ім'я П.» snapshot.")
+        ReviewSource source
 ) {
 
     /**
@@ -71,29 +75,14 @@ public record SalonReviewResponse(
      */
     public static final String DETACHED_CLIENT_LABEL = "Видалений клієнт";
 
-    // Client-name masking logic mirrors ReviewResponse.from exactly — same
-    // "FirstName L." / "FirstName" / "L." / "Anonymous" rules. review.client CAN be null since
-    // Phase 300 (a self-deleted author) — guarded below, same as ReviewResponse.from.
+    // Author name: the shared ReviewAuthorLabel rule, same as ReviewResponse.from — "FirstName L." /
+    // "FirstName" / "L." / "Anonymous" for an APP account, DETACHED_CLIENT_LABEL for a self-deleted
+    // author (Phase 300), the guestDisplayName snapshot for a GUEST_LINK review (phase 399).
     //
     // Viewer-neutral (authoredByViewer = false): this shape is cached under reviews-by-salon, so the
     // per-viewer flag is stamped afterwards by ReviewViewerService (phase 395).
     public static SalonReviewResponse from(Review review) {
-        String displayName;
-        if (review.getClient() == null) {
-            displayName = DETACHED_CLIENT_LABEL;
-        } else {
-            String firstName = review.getClient().getFirstName();
-            String lastName = review.getClient().getLastName();
-            if (firstName == null && lastName == null) {
-                displayName = "Anonymous";
-            } else if (firstName != null && lastName != null) {
-                displayName = firstName + " " + lastName.charAt(0) + ".";
-            } else if (firstName != null) {
-                displayName = firstName;
-            } else {
-                displayName = lastName.charAt(0) + ".";
-            }
-        }
+        String displayName = ReviewAuthorLabel.of(review);
         // V157 / phase 294 — a detached master (staff account hard-deleted) is rendered under the
         // neutral DETACHED_MASTER_LABEL, NOT through displayFirstName()/displayLastName(). This
         // endpoint is permitAll() and cached; publishing the snapshot here would keep the erased
@@ -115,7 +104,8 @@ public record SalonReviewResponse(
                 review.getRating().intValue(),
                 review.getComment(),
                 review.getCreatedAt().atOffset(ZoneOffset.UTC),
-                false
+                false,
+                review.getSource()
         );
     }
 
@@ -123,6 +113,6 @@ public record SalonReviewResponse(
     public SalonReviewResponse withAuthoredByViewer(boolean authored) {
         return authored == authoredByViewer ? this
                 : new SalonReviewResponse(id, masterId, masterFirstName, masterLastName, clientDisplayName,
-                        serviceName, rating, comment, createdAt, authored);
+                        serviceName, rating, comment, createdAt, authored, source);
     }
 }

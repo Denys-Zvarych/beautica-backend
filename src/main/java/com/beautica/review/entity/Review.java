@@ -17,6 +17,8 @@ import jakarta.persistence.Index;
 import jakarta.persistence.JoinColumn;
 import jakarta.persistence.ManyToOne;
 import jakarta.persistence.OneToOne;
+import jakarta.persistence.PrePersist;
+import jakarta.persistence.PreUpdate;
 import jakarta.persistence.Table;
 import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.Min;
@@ -60,6 +62,9 @@ import java.util.UUID;
 @Builder
 public class Review extends AuditableEntity {
 
+    /** Mirrors {@code reviews.guest_display_name VARCHAR(64)} (V212). */
+    public static final int GUEST_DISPLAY_NAME_MAX_LENGTH = 64;
+
     @Id
     @GeneratedValue(strategy = GenerationType.UUID)
     private UUID id;
@@ -68,9 +73,27 @@ public class Review extends AuditableEntity {
     @JoinColumn(name = "booking_id", nullable = false, unique = true)
     private Booking booking;
 
+    /**
+     * The authoring CLIENT account. {@code null} on a {@link ReviewSource#GUEST_LINK} review (phase 399) and on an
+     * {@link ReviewSource#APP} review whose author self-deleted (phase 300 D3, V162 FK ON DELETE SET NULL).
+     */
     @ManyToOne(fetch = FetchType.LAZY)
-    @JoinColumn(name = "client_id", nullable = false)
+    @JoinColumn(name = "client_id")
     private User client;
+
+    /** Phase 399 D1 (V212). Set at creation, never changed. */
+    @Builder.Default
+    @Enumerated(EnumType.STRING)
+    @Column(name = "source", nullable = false, length = 16, updatable = false)
+    private ReviewSource source = ReviewSource.APP;
+
+    /**
+     * Phase 399 D1 (V212): the guest's «Ім'я П.» snapshot, rendered as the author name of a
+     * {@link ReviewSource#GUEST_LINK} review. Always {@code null} on {@link ReviewSource#APP} rows
+     * ({@code chk_reviews_source_author}).
+     */
+    @Column(name = "guest_display_name", length = GUEST_DISPLAY_NAME_MAX_LENGTH)
+    private String guestDisplayName;
 
     @ManyToOne(fetch = FetchType.LAZY)
     @JoinColumn(name = "master_id", nullable = false)
@@ -105,6 +128,44 @@ public class Review extends AuditableEntity {
      */
     @Column(name = "auto_hidden_at")
     private Instant autoHiddenAt;
+
+    /**
+     * Phase 399 — a review written by a LINK guest through an SMS invite: no account ({@code client} stays
+     * {@code null}), {@link ReviewSource#GUEST_LINK}, author shown as the «Ім'я П.» snapshot that
+     * {@link GuestDisplayName} builds from the booking's raw guest fields (first word of the name, cut to 60 code
+     * points, digits / phone-like characters stripped, + first letter of the surname; «Гість» when nothing usable is
+     * left). The DB CHECKs {@code chk_reviews_source_author} / {@code chk_reviews_guest_display_name_no_digits} enforce
+     * the same shape. Never throws on any guest name / surname — phase 401 passes {@code booking.getGuestName()} /
+     * {@code getGuestSurname()} as stored (up to 100 chars each, {@code GuestClientDto}).
+     */
+    public static Review guestLinkReview(
+            Booking booking, short rating, String comment, String guestName, String guestSurname) {
+        String guestDisplayName = GuestDisplayName.of(guestName, guestSurname);
+        return Review.builder()
+                .booking(booking)
+                .master(booking.getMaster())
+                .salon(booking.getSalon())
+                .rating(rating)
+                .comment(comment)
+                .source(ReviewSource.GUEST_LINK)
+                .guestDisplayName(guestDisplayName)
+                .build();
+    }
+
+    /**
+     * Phase 399 audit — the public {@code @Builder} can set any {@link #guestDisplayName}; this lifecycle guard keeps a
+     * {@link ReviewSource#GUEST_LINK} row to a label {@link GuestDisplayName} could have built (one name word, an
+     * optional «X.» initial, no digit), so a builder-written full surname or phone fragment never reaches the cached
+     * public review endpoints. Rows built by {@link #guestLinkReview} always pass. The message never echoes the label
+     * (guest PII).
+     */
+    @PrePersist
+    @PreUpdate
+    void enforceGuestDisplayNameShape() {
+        if (source == ReviewSource.GUEST_LINK && !GuestDisplayName.isCanonical(guestDisplayName)) {
+            throw new IllegalStateException("GUEST_LINK review display name is not a normalised guest label");
+        }
+    }
 
     /**
      * Moves this review to {@code target}. {@link ModerationStatus#REMOVED} is terminal: a late RESTORE / DISMISS

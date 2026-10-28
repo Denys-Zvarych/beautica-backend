@@ -485,7 +485,8 @@ class PublicBookingControllerTest {
     @DisplayName("GET /book/{slug}/reviews — 200 PageResponse with the info Cache-Control, sort and size passed through")
     void should_return200WithPage_when_reviewsRequested() throws Exception {
         var review = new com.beautica.review.dto.ReviewResponse(UUID.randomUUID(), UUID.randomUUID(), "Олена К.",
-                "Манікюр", 5, "Дуже акуратно", java.time.OffsetDateTime.parse("2026-10-12T15:20:00Z"), false);
+                "Манікюр", 5, "Дуже акуратно", java.time.OffsetDateTime.parse("2026-10-12T15:20:00Z"), false,
+                com.beautica.review.entity.ReviewSource.APP);
         when(bookingSlugService.reviewsForSlug(eq("marija-l-cd34"),
                 eq(com.beautica.review.dto.SalonReviewSort.HIGHEST), any(org.springframework.data.domain.Pageable.class)))
                 .thenReturn(new org.springframework.data.domain.PageImpl<>(List.of(review),
@@ -525,7 +526,8 @@ class PublicBookingControllerTest {
     void should_return200WithSalonReviewPage_when_salonReviewsRequested() throws Exception {
         var review = new com.beautica.review.dto.SalonReviewResponse(UUID.randomUUID(), UUID.randomUUID(), "Anna",
                 "Bila", "Олена К.", "Манікюр", 5, "Дуже акуратно",
-                java.time.OffsetDateTime.parse("2026-10-12T15:20:00Z"), false);
+                java.time.OffsetDateTime.parse("2026-10-12T15:20:00Z"), false,
+                com.beautica.review.entity.ReviewSource.APP);
         when(bookingSlugService.salonReviewsForSlug(eq("studiia-krasa-ab12"),
                 eq(com.beautica.review.dto.SalonReviewSort.OLDEST), any(org.springframework.data.domain.Pageable.class)))
                 .thenReturn(new org.springframework.data.domain.PageImpl<>(List.of(review),
