@@ -33,6 +33,8 @@ abstract class AbstractModerationIT extends AbstractIntegrationTest {
 
     static final String TEST_PASSWORD = "Str0ngP@ss1!";
     static final String REPORTS_URL = "/api/v1/reports";
+    /** Phase 397 client blocks. */
+    static final String BLOCKS_URL = "/api/v1/blocks";
     static final String INTERNAL_KEY_HEADER = "X-Internal-Key";
     /** {@code app.internal-api-key} in application-test.yml. */
     static final String INTERNAL_KEY = "test-internal-api-key";
@@ -57,6 +59,22 @@ abstract class AbstractModerationIT extends AbstractIntegrationTest {
         headers.setBearerAuth(token);
         headers.setContentType(MediaType.APPLICATION_JSON);
         return restTemplate.exchange(REPORTS_URL, HttpMethod.POST, new HttpEntity<>(body, headers), String.class);
+    }
+
+    /** Phase 397 — {@code POST /blocks {bookingId}} as the token's user. */
+    protected ResponseEntity<String> postBlock(String token, UUID bookingId) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.setBearerAuth(token);
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        String body = objectMapper.createObjectNode().put("bookingId", bookingId.toString()).toString();
+        return restTemplate.exchange(BLOCKS_URL, HttpMethod.POST, new HttpEntity<>(body, headers), String.class);
+    }
+
+    /** A body-less authenticated call (GET / DELETE). */
+    protected ResponseEntity<String> exchange(HttpMethod method, String path, String token) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.setBearerAuth(token);
+        return restTemplate.exchange(path, method, new HttpEntity<>(headers), String.class);
     }
 
     protected ResponseEntity<String> reportReview(String reporterEmail, UUID reviewId) throws Exception {
@@ -141,6 +159,15 @@ abstract class AbstractModerationIT extends AbstractIntegrationTest {
         return jdbcTemplate.queryForObject(
                 "SELECT id FROM content_reports WHERE reporter_user_id = ? AND target_id = ?",
                 UUID.class, reporterId, targetId);
+    }
+
+    protected boolean blockExists(UUID id) {
+        return Boolean.TRUE.equals(jdbcTemplate.queryForObject(
+                "SELECT EXISTS (SELECT 1 FROM client_blocks WHERE id = ?)", Boolean.class, id));
+    }
+
+    protected int countBlocks() {
+        return jdbcTemplate.queryForObject("SELECT COUNT(*) FROM client_blocks", Integer.class);
     }
 
     // ── seeding fixtures ─────────────────────────────────────────────────────────
@@ -241,6 +268,25 @@ abstract class AbstractModerationIT extends AbstractIntegrationTest {
                         + "VALUES (?, ?, ?, true, NOW(), NOW())",
                 masterServiceId, salon.masterId(), serviceDefId);
         return masterServiceId;
+    }
+
+    /**
+     * Phase 397 — a LINK guest or STAFF walk-in booking (no account, guest «Марія Шевченко» with {@code phone}, E.164)
+     * on the salon's master, reusing its seeded service.
+     */
+    protected UUID insertGuestBooking(SalonFixture salon, String source, String phone) {
+        UUID seed = insertBooking(createUser(unique("seed"), "CLIENT", null), salon, "COMPLETED");
+        UUID masterServiceId = jdbcTemplate.queryForObject(
+                "SELECT master_service_id FROM bookings WHERE id = ?", UUID.class, seed);
+        UUID bookingId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO bookings (id, client_id, master_id, master_service_id, salon_id, status, "
+                        + "starts_at, ends_at, price_at_booking, duration_minutes_at_booking, buffer_minutes_at_booking, "
+                        + "booking_source, guest_name, guest_surname, guest_phone, created_at, updated_at) "
+                        + "VALUES (?, NULL, ?, ?, ?, 'COMPLETED', NOW() - interval '4 hours', "
+                        + "NOW() - interval '3 hours', 500.00, 60, 0, ?, 'Марія', 'Шевченко', ?, NOW(), NOW())",
+                bookingId, salon.masterId(), masterServiceId, salon.salonId(), source, phone);
+        return bookingId;
     }
 
     protected UUID insertReview(UUID clientId, SalonFixture salon, String comment) {

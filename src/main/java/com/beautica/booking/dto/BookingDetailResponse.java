@@ -507,8 +507,39 @@ public record BookingDetailResponse(
                         + "anonymised/erased. NULL on every list/feed row, on the create and reschedule "
                         + "responses, for a client viewer, and ALWAYS for a booking made by a registered "
                         + "account: a registered user's phone is never exposed to any provider.")
-        String guestPhone
+        String guestPhone,
+        // Phase 397 (mobile 425 inputs). Appended LAST like every field above. Populated ONLY by withClientBlockState,
+        // which GET /bookings/{id} calls for a blocker-role viewer; every other construction site passes false/null/false.
+        @Schema(description = "True when the booking's client is blocked in the VIEWER's block scope (independent "
+                + "master: own; salon owner/admin: the salon). Detail read only; false on every list row, on "
+                + "create/reschedule responses and for client / salon-master viewers.")
+        boolean clientBlocked,
+        @Schema(types = {"string", "null"}, nullable = true, format = "uuid",
+                description = "Id of that block, for DELETE /blocks/{blockId}. Null when clientBlocked is false.")
+        UUID clientBlockId,
+        @Schema(description = "True when the viewer may block this booking's client (POST /blocks would not "
+                + "answer 400/403/404): a provider viewer in scope, and a registered client or a link guest with a "
+                + "verified phone. False for a STAFF walk-in, an erased guest, list rows and non-provider viewers.")
+        boolean clientBlockable
 ) {
+
+    /**
+     * Phase 397 — the ONLY place the three block components are populated (detail read, blocker-role viewer).
+     *
+     * @param blockable the viewer may block this client
+     * @param blockId   the viewer-scope block id, or null when not blocked
+     */
+    public BookingDetailResponse withClientBlockState(boolean blockable, UUID blockId) {
+        return new BookingDetailResponse(
+                id, clientId, masterId, masterServiceId, serviceName, status, startsAt, endsAt, priceAtBooking,
+                priceMaxAtBooking, durationMinutesAtBooking, createdAt, clientFirstName, clientLastName,
+                masterFirstName, masterLastName, masterProfessionalTitle, clientComment, providerComment,
+                clientCancellationNote, masterAvatarUrl, masterType, salonName, cityLabel,
+                districtLabel, street, buildingNo, locationNote, categoryName, canReview, providerCanReviewClient,
+                appointmentId, clientAvatarUrl, awaitingClosure, masterAvgRating, masterReviewCount, salonId,
+                categoryKey, reviewByClient, clientAvgRating, clientReviewCount, guestPhone,
+                blockId != null, blockId, blockable);
+    }
 
     /**
      * Phase 386 HARD RULE — the ONLY place {@code guestPhone} is ever populated, and it is null by construction for
@@ -533,7 +564,8 @@ public record BookingDetailResponse(
                 clientCancellationNote, masterAvatarUrl, masterType, salonName, cityLabel,
                 districtLabel, street, buildingNo, locationNote, categoryName, canReview, providerCanReviewClient,
                 appointmentId, clientAvatarUrl, awaitingClosure, masterAvgRating, masterReviewCount, salonId,
-                categoryKey, reviewByClient, clientAvgRating, clientReviewCount, phone);
+                categoryKey, reviewByClient, clientAvgRating, clientReviewCount, phone,
+                clientBlocked, clientBlockId, clientBlockable);
     }
 
     /**
@@ -752,7 +784,11 @@ public record BookingDetailResponse(
                 client != null ? client.getReviewCount() : null,
                 // Phase 386: null here ALWAYS — the provider-visible guest phone is attached afterwards, and only by
                 // the detail read (withProviderVisibleGuestPhone), never by a factory list callers share.
-                null
+                null,
+                // Phase 397: block state is attached afterwards by the detail read only (withClientBlockState).
+                false,
+                null,
+                false
         );
     }
 }

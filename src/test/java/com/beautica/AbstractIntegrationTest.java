@@ -64,6 +64,9 @@ public abstract class AbstractIntegrationTest {
         // Phase 395 (V207) / 396 (V208): content_reports.reporter_user_id FK -> users(id) ON DELETE SET NULL; no FK
         // points at it. Deleted explicitly before users so cleanup does not rely on the FK action (§O-7).
         jdbcTemplate.execute("DELETE FROM content_reports");
+        // Phase 397 (V210): client_blocks FKs masters/salons/users (CASCADE) and users (SET NULL); no FK points at
+        // it. Deleted explicitly before every parent so cleanup does not rely on the FK actions (§O-7).
+        jdbcTemplate.execute("DELETE FROM client_blocks");
         jdbcTemplate.execute("DELETE FROM in_app_notification");
         jdbcTemplate.execute("DELETE FROM notification_outbox");
         // favorites FK → users ON DELETE CASCADE, but §O-7 forbids relying on CASCADE

@@ -461,6 +461,10 @@ app:
     # JWT_SECRET. Generate: openssl rand -base64 32. Empty default forces every
     # profile to supply a value or fail fast at startup (>= 32 chars required).
     otp-pepper: ${APP_OTP_PEPPER:}
+    # Phase 397 D3 — keyed HMAC-SHA256 pepper for the stable phone hash (client blocks, phase-399 SMS
+    # opt-outs). Dedicated, NOT APP_OTP_PEPPER: it can never rotate without orphaning every stored hash.
+    # Generate: openssl rand -base64 32. Empty default forces every profile to supply one (>= 32 chars).
+    phone-hash-pepper: ${PHONE_HASH_PEPPER:}
   verification:
     # Resend-surviving cumulative brute-force bound: after this many lifetime
     # failed verifies (NOT reset by resend) the account is locked for

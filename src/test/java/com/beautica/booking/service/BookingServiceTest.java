@@ -154,6 +154,9 @@ class BookingServiceTest {
     @Mock
     private org.springframework.context.ApplicationEventPublisher eventPublisher;
 
+    @Mock
+    private com.beautica.moderation.service.ClientBlockService clientBlockService;
+
     @BeforeEach
     void setUp() {
         clock = Clock.fixed(Instant.now(), KYIV);
@@ -180,8 +183,12 @@ class BookingServiceTest {
                 appointmentTransitionService,
                 appointmentRepository,
                 eventPublisher,
-                inAppNotificationService
+                inAppNotificationService,
+                clientBlockService
         );
+        // Phase 397: provider-role detail reads ask for the block state; default to "not blockable".
+        lenient().when(clientBlockService.blockStateFor(any(), any(), any()))
+                .thenReturn(com.beautica.moderation.dto.ClientBlockState.NOT_BLOCKABLE);
 
         clientId = UUID.randomUUID();
         masterId = UUID.randomUUID();

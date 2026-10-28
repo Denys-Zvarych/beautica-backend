@@ -13,6 +13,7 @@ import org.springframework.context.annotation.Configuration;
         JwtConfig.class,
         OutboxCipherProperties.class,
         OtpPepperConfig.class,
+        PhoneHashPepperConfig.class,
         VerificationPolicyConfig.class,
         PasswordResetPolicyConfig.class,
         PasswordResetOtpPolicyConfig.class,

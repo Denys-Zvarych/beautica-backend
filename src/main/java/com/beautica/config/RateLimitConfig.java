@@ -283,6 +283,19 @@ public class RateLimitConfig {
 
     private static final Duration CONTENT_REPORT_WINDOW = Duration.ofHours(24);
 
+    /**
+     * Phase 397 audit-fix — per-AUTHENTICATED-USER cap (1-hour window) shared by {@code POST /api/v1/blocks} and
+     * {@code DELETE /api/v1/blocks/{blockId}}. Consumed by {@code ClientBlockService} (bound by field name
+     * {@code clientBlockWriteBuckets}) after the role gate, one token per call, repeats included: it bounds
+     * booking-id probing through the 404 path and block/unblock churn. Legitimate use is a handful a month.
+     * Configurable so tests can pin it.
+     */
+    @Value("${app.rate-limit.client-block-write-capacity:30}")
+    private long clientBlockWriteCapacity;
+
+    /** Window of {@link #clientBlockWriteCapacity}; {@code ClientBlockService} answers 429 with this Retry-After. */
+    public static final Duration CLIENT_BLOCK_WRITE_WINDOW = Duration.ofHours(1);
+
     @Value("${app.rate-limit.device-token-capacity:30}")
     private long deviceTokenCapacity;
 
@@ -872,6 +885,19 @@ public class RateLimitConfig {
                 CONTENT_REPORT_WINDOW.plus(EVICTION_GRACE),
                 contentReportCapacity,
                 CONTENT_REPORT_WINDOW);
+    }
+
+    /**
+     * Per-user bucket (see {@link #clientBlockWriteCapacity}) consumed by {@code ClientBlockService}.
+     * {@code expireAfterAccess} gives the usual 5-minute grace past the 1-hour window.
+     */
+    @Bean
+    public LoadingCache<String, Bucket> clientBlockWriteBuckets() {
+        return bucketCache(
+                DEFAULT_BUCKET_CACHE_SIZE,
+                CLIENT_BLOCK_WRITE_WINDOW.plus(EVICTION_GRACE),
+                clientBlockWriteCapacity,
+                CLIENT_BLOCK_WRITE_WINDOW);
     }
 
     @Bean

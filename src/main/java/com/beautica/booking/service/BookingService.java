@@ -37,6 +37,9 @@ import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.security.AuthenticationUtils;
 import com.beautica.common.security.AuthorizationService;
 import com.beautica.master.entity.Master;
+import com.beautica.moderation.dto.ClientBlockState;
+import com.beautica.moderation.service.ClientBlockScopeResolver;
+import com.beautica.moderation.service.ClientBlockService;
 import com.beautica.master.entity.MasterType;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.salon.entity.Salon;
@@ -62,6 +65,7 @@ import org.springframework.data.domain.Sort;
 import org.springframework.data.jpa.domain.Specification;
 import org.springframework.http.HttpStatus;
 import org.springframework.security.core.Authentication;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
@@ -126,6 +130,8 @@ public class BookingService {
     // why it is never called FROM NotificationOutboxService). MANDATORY propagation: every call site
     // below is already inside this class's own @Transactional method.
     private final InAppNotificationService inAppNotificationService;
+    // Phase 397 — the provider booking detail's clientBlocked / clientBlockId / clientBlockable.
+    private final ClientBlockService clientBlockService;
 
     /**
      * Creates a booking (or replays an idempotent one) and returns the <b>enriched</b> detail view.
@@ -245,10 +251,39 @@ public class BookingService {
         // touches the SecurityContext, which a registered-client booking never needs (direct non-HTTP service calls
         // carry none) and which adds no statement. The owning-client probe stays as a second, independent guard (free for a
         // guest booking: null client short-circuits before any role read).
-        return booking.getClient() == null && authz.isGuestPhoneAudience()
+        BookingDetailResponse withPhone = booking.getClient() == null && authz.isGuestPhoneAudience()
                 && !authz.isOwningClientViewer(actorUserId, booking)
                 ? detail.withProviderVisibleGuestPhone(booking)
                 : detail;
+        return withClientBlockState(actorUserId, booking, withPhone);
+    }
+
+    /**
+     * Phase 397 (mobile 425) — the viewer's block state on the detail read. Only a blocker-role viewer
+     * (INDEPENDENT_MASTER / SALON_OWNER / SALON_ADMIN) pays the one block lookup; any other viewer, or a direct
+     * service call with no SecurityContext, keeps the false/null/false defaults with no statement.
+     */
+    private BookingDetailResponse withClientBlockState(UUID actorUserId, Booking booking,
+                                                       BookingDetailResponse detail) {
+        Role role = currentRoleOrNull();
+        if (!ClientBlockScopeResolver.isBlockerRole(role)) {
+            return detail;
+        }
+        ClientBlockState state = clientBlockService.blockStateFor(actorUserId, role, booking);
+        return state.blockable() ? detail.withClientBlockState(true, state.blockId()) : detail;
+    }
+
+    @Nullable
+    private static Role currentRoleOrNull() {
+        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+        if (auth == null) {
+            return null;
+        }
+        try {
+            return AuthenticationUtils.role(auth);
+        } catch (ForbiddenException e) {
+            return null;
+        }
     }
 
     /**
@@ -617,7 +652,11 @@ public class BookingService {
                 p.clientReviewCount(),
                 // Phase 386: a CLIENT-scoped projection (JOIN b.client) can never be a guest booking, and a
                 // registered client's phone is never provider-visible — null, always.
-                null);
+                null,
+                // Phase 397: a CLIENT viewer can never block — block state is false/null/false on this path.
+                false,
+                null,
+                false);
     }
 
     /**

@@ -146,6 +146,8 @@ app:
   security:
     # Test profile only — fixed 32+ char value so the context loads under `test`.
     otp-pepper: test-otp-pepper-fixed-value-min-32-characters
+    # Phase 397 — test profile only.
+    phone-hash-pepper: test-phone-hash-pepper-fixed-value-min-32-chars
   verification:
     cumulative-failure-threshold: 10
     lockout-duration: 15m

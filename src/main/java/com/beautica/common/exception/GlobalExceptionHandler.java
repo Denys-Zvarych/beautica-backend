@@ -411,6 +411,18 @@ public class GlobalExceptionHandler {
                 .body(ApiResponse.error("Too many reports — please try again later"));
     }
 
+    /**
+     * 429 for the phase-397 per-user block/unblock budget — see {@link ClientBlockRateLimitedException}. The same
+     * generic body {@code BookingRateLimitFilter} writes for its per-user buckets; no budget figures echoed.
+     */
+    @ExceptionHandler(ClientBlockRateLimitedException.class)
+    public ResponseEntity<ApiResponse<Void>> handleClientBlockRateLimited(ClientBlockRateLimitedException ex) {
+        return ResponseEntity
+                .status(HttpStatus.TOO_MANY_REQUESTS)
+                .header("Retry-After", String.valueOf(ex.getRetryAfterSeconds()))
+                .body(ApiResponse.error("Too many requests — please slow down"));
+    }
+
     @ExceptionHandler(NotFoundException.class)
     public ResponseEntity<ApiResponse<Void>> handleNotFound(NotFoundException ex) {
         // Return a generic message — do not echo ex.getMessage() which may reveal internal

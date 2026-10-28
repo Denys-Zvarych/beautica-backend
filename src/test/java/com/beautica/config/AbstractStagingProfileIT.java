@@ -28,6 +28,7 @@ import static com.github.tomakehurst.wiremock.client.WireMock.urlMatching;
         "JWT_SECRET=staging-it-jwt-secret-min-32-bytes-testonly",
         "INTERNAL_API_KEY=" + TestSecrets.INTERNAL_API_KEY,
         "APP_OTP_PEPPER=staging-it-otp-pepper-fixed-value-min-32-chars",
+        "PHONE_HASH_PEPPER=staging-it-phone-hash-pepper-fixed-value-min-32",
         "OUTBOX_PAYLOAD_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
         "FRONTEND_BASE_URL=https://staging.invalid",
         "PUBLIC_BASE_URL=https://api.staging.beautica.test",

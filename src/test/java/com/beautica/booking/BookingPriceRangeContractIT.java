@@ -2396,6 +2396,110 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
     }
 
     /**
+     * Phase 397 (perf audit) — the cost of the viewer's block state on {@code GET /bookings/{id}}, through the full
+     * HTTP stack with real login tokens, on the production-normal ALIGNED shape of
+     * {@link #should_hydrateExactlyOneSalon_when_bookingSalonMatchesTheMastersLiveSalon} and a REGISTERED client.
+     *
+     * <ul>
+     *   <li>SALON_OWNER (a blocker role, booking in scope) pays exactly ONE more statement than the pinned
+     *       {@link #OWNER_DETAIL_STATEMENTS_ALIGNED}: the {@code LIMIT 1} CLIENT-row id probe
+     *       ({@code ClientBlockRepository#findIdByBlockedUser}). The scope itself is free (owner id and
+     *       {@code isActive} read off the fetched salon).</li>
+     *   <li>CLIENT pays nothing: the role gate in {@code BookingService#withClientBlockState} returns before any
+     *       statement, so the HTTP read costs the same as the direct service read of the same booking (which needs a
+     *       CLIENT SecurityContext to pass the view check), and runs no ClientBlock query at all.</li>
+     * </ul>
+     * The direct service reads are the baselines (owner: no SecurityContext ⇒ no blocker role ⇒ no probe);
+     * {@code DiscoveryLocationResolver} is uncached, so read order cannot shift a label query between them. Each
+     * token is first used on {@code GET /blocks} so the JWT filter's {@code tokensValidAfter} cache is warm and the
+     * measured request carries no auth statement. Besides the counts, Hibernate's executed-query list must name
+     * the block probe exactly once for the owner and never for the client — a count alone could hide a swap.
+     */
+    @Test
+    @DisplayName("GET /bookings/{id} block state: SALON_OWNER = pinned aligned count + 1 (one LIMIT 1 probe), "
+            + "CLIENT = +0 — real tokens over HTTP")
+    void should_costOneProbeForOwnerAndNoneForClient_when_readingRegisteredClientBookingDetail() throws Exception {
+        String ownerEmail = "bprc-block-owner-" + System.nanoTime() + "@beautica.test";
+        var salon = fixtures.createSalon(ownerEmail);
+        UUID ownerId = jdbcTemplate.queryForObject(
+                "SELECT owner_id FROM salons WHERE id = ?", UUID.class, salon.salonId());
+        String clientEmail = "bprc-block-client-" + System.nanoTime() + "@beautica.test";
+        UUID clientId = fixtures.createUser(clientEmail, "CLIENT", null);
+        UUID serviceId = createRangeService("SALON", salon.salonId(), salon.masterId(),
+                new BigDecimal("300.00"), new BigDecimal("500.00"), null);
+        stampSalonLocality(salon.salonId());
+        UUID bookingId = insertBooking(clientId, salon.masterId(), serviceId, ANCHOR,
+                new BigDecimal("300.00"), new BigDecimal("500.00"), "CONFIRMED", salon.salonId());
+        String ownerToken = fixtures.tokenFor(ownerEmail);
+        String clientToken = fixtures.tokenFor(clientEmail);
+        warmTokenCache(ownerToken);
+        warmTokenCache(clientToken);
+
+        Statistics statistics = statistics();
+        statistics.clear();
+        bookingService.getBooking(ownerId, bookingId);
+        long ownerBaseline = statistics.getPrepareStatementCount();
+
+        statistics.clear();
+        JsonNode ownerView = getDetail(ownerToken, bookingId);
+        long ownerHttp = statistics.getPrepareStatementCount();
+        long ownerProbes = blockProbes(statistics);
+
+        SecurityContextHolder.getContext().setAuthentication(authFor(Role.CLIENT));
+        long clientBaseline;
+        try {
+            statistics.clear();
+            bookingService.getBooking(clientId, bookingId);
+            clientBaseline = statistics.getPrepareStatementCount();
+        } finally {
+            SecurityContextHolder.clearContext();
+        }
+
+        statistics.clear();
+        JsonNode clientView = getDetail(clientToken, bookingId);
+        long clientHttp = statistics.getPrepareStatementCount();
+        long clientProbes = blockProbes(statistics);
+
+        assertThat(ownerBaseline)
+                .as("premise — the context-free owner read is the pinned aligned detail cost")
+                .isEqualTo(OWNER_DETAIL_STATEMENTS_ALIGNED);
+        assertThat(ownerView.path("clientBlockable").asBoolean())
+                .as("premise — the owner IS in block scope, so the probe genuinely runs")
+                .isTrue();
+        assertThat(ownerHttp)
+                .as("SALON_OWNER detail = pinned %s + %s block probe", OWNER_DETAIL_STATEMENTS_ALIGNED,
+                        CLIENT_BLOCK_PROBE_STATEMENTS)
+                .isEqualTo(OWNER_DETAIL_STATEMENTS_ALIGNED + CLIENT_BLOCK_PROBE_STATEMENTS);
+        assertThat(ownerProbes).as("exactly one ClientBlock query for the owner").isEqualTo(1L);
+        assertThat(clientView.path("clientBlockable").asBoolean()).isFalse();
+        assertThat(clientHttp)
+                .as("CLIENT detail pays no block statement: HTTP read (%s) = direct service read (%s)",
+                        clientHttp, clientBaseline)
+                .isEqualTo(clientBaseline);
+        assertThat(clientProbes).as("no ClientBlock query for a CLIENT viewer").isZero();
+    }
+
+    /** The phase-397 detail block probe is one {@code LIMIT 1} id read. */
+    private static final long CLIENT_BLOCK_PROBE_STATEMENTS = 1L;
+
+    /** First authenticated request for a token: fills the JWT filter's tokensValidAfter cache (any role). */
+    private void warmTokenCache(String token) {
+        restTemplate.exchange("/api/v1/blocks", HttpMethod.GET,
+                new HttpEntity<>(fixtures.bearerHeaders(token)), String.class);
+    }
+
+    /** Executions of any HQL over {@code ClientBlock} since the last {@link Statistics#clear()}. */
+    private static long blockProbes(Statistics statistics) {
+        long count = 0;
+        for (String hql : statistics.getQueries()) {
+            if (hql.contains("ClientBlock")) {
+                count += statistics.getQueryStatistics(hql).getExecutionCount();
+            }
+        }
+        return count;
+    }
+
+    /**
      * Points the master's {@code users} row at a real {@code city_districts} row and its parent
      * city (both columns carry FKs — V54:53 / V54 {@code fk_users_city_id} — so invented UUIDs
      * would be rejected), making {@code discoveryCityId}/{@code discoveryDistrictId} non-null for

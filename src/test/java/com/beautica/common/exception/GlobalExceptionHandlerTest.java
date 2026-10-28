@@ -1751,4 +1751,21 @@ class GlobalExceptionHandlerTest {
                 .doesNotContain("20")
                 .doesNotContain("86400");
     }
+
+    @Test
+    @DisplayName("ClientBlockRateLimitedException → standard 429 with Retry-After, no budget figures (phase 397)")
+    void should_return429WithRetryAfter_when_clientBlockRateLimited() {
+        ClientBlockRateLimitedException ex = new ClientBlockRateLimitedException(3_600);
+
+        ResponseEntity<ApiResponse<Void>> response = handler.handleClientBlockRateLimited(ex);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.TOO_MANY_REQUESTS);
+        assertThat(response.getHeaders().getFirst(HttpHeaders.RETRY_AFTER)).isEqualTo("3600");
+        assertThat(response.getBody()).isNotNull();
+        assertThat(response.getBody().success()).isFalse();
+        assertThat(response.getBody().message())
+                .isEqualTo("Too many requests — please slow down")
+                .doesNotContain("30")
+                .doesNotContain("3600");
+    }
 }
