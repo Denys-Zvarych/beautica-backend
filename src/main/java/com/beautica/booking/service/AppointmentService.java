@@ -19,6 +19,7 @@ import com.beautica.location.DiscoveryLocationResolver;
 import com.beautica.location.DiscoveryLocationResolver.DiscoveryLabels;
 import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
+import com.beautica.moderation.service.BookingBlockGuard;
 import com.beautica.notification.inapp.entity.InAppNotificationType;
 import com.beautica.notification.inapp.service.InAppNotificationService;
 import com.beautica.notification.service.NotificationOutboxService;
@@ -94,6 +95,8 @@ public class AppointmentService {
     // Phase 333 — see InAppNotificationService's class javadoc for why this is a separate seam from
     // outboxService, never called from it.
     private final InAppNotificationService inAppNotificationService;
+    // Phase 398 — refuses a create when the provider blocked this client account (BOOKING_UNAVAILABLE).
+    private final BookingBlockGuard bookingBlockGuard;
 
     /**
      * Creates a multi-service visit, or replays the idempotent one, and returns the enriched detail.
@@ -305,6 +308,12 @@ public class AppointmentService {
                 return existing.get();
             }
         }
+
+        // Phase 398 D1 — provider block gate (same rule as BookingService#doCreateBooking). AFTER the replay
+        // re-check above, so a retry of a visit that is still active replays instead of being refused (a new block
+        // DECLINES the client's future visits, so in practice only one that already started can still replay);
+        // BEFORE the master lock, so a refused create never contends for it. Order pinned by AppointmentServiceTest.
+        bookingBlockGuard.requireClientMayBook(master, clientId);
 
         // Client-conflict check over the WHOLE visit span, BEFORE the master lock is taken — same
         // precedence and rationale as the single-service create path.

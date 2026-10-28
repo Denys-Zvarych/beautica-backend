@@ -23,7 +23,11 @@ public record BlockResponse(
         @Schema(types = {"string", "null"}, nullable = true, example = "+380 •• ••• 12 34",
                 description = "Masked guest phone, last four digits only. GUEST rows only; null for CLIENT.")
         String maskedPhone,
-        Instant createdAt
+        Instant createdAt,
+        @Schema(description = "Future visits this request cancelled (phase 398): a standalone booking counts 1, a "
+                + "multi-service visit counts 1. Set on a 201 that created the block; 0 on a repeat (200) and on "
+                + "every GET /blocks row.")
+        int cancelledBookings
 ) {
 
     static final String MASK_PREFIX = "+380 •• ••• ";
@@ -34,10 +38,15 @@ public record BlockResponse(
             String liveName = BlockDisplayNames.shortName(row.userFirstName(), row.userLastName());
             return new BlockResponse(row.id(), BlockKind.CLIENT,
                     liveName != null ? liveName : row.displayName(),
-                    row.userAvatarUrl(), null, row.createdAt());
+                    row.userAvatarUrl(), null, row.createdAt(), 0);
         }
         return new BlockResponse(row.id(), BlockKind.GUEST, row.displayName(), null,
-                maskPhone(row.phoneLast4()), row.createdAt());
+                maskPhone(row.phoneLast4()), row.createdAt(), 0);
+    }
+
+    /** This row with the cancelled-bookings count of the request that created it. */
+    public BlockResponse withCancelledBookings(int count) {
+        return new BlockResponse(id, kind, displayName, avatarUrl, maskedPhone, createdAt, count);
     }
 
     /** «+380 •• ••• 12 34» from the last four digits; null when unknown. */

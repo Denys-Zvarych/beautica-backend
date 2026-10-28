@@ -9,6 +9,7 @@ import com.beautica.common.exception.NotFoundException;
 import com.beautica.config.WebMvcTestSupport;
 import com.beautica.moderation.dto.BlockKind;
 import com.beautica.moderation.dto.BlockResponse;
+import com.beautica.moderation.service.ClientBlockFacade;
 import com.beautica.moderation.service.ClientBlockService;
 import com.beautica.moderation.service.ClientBlockService.CreateBlockResult;
 import jakarta.servlet.http.HttpServletResponse;
@@ -100,12 +101,15 @@ class BlockControllerTest {
     private ClientBlockService clientBlockService;
 
     @MockBean
+    private ClientBlockFacade clientBlockFacade;
+
+    @MockBean
     private JwtTokenProvider jwtTokenProvider;
 
     @ParameterizedTest(name = "{0}")
     @EnumSource(value = Role.class, names = {"INDEPENDENT_MASTER", "SALON_OWNER", "SALON_ADMIN"})
     void should_return201_when_providerBlocks(Role role) throws Exception {
-        when(clientBlockService.block(USER_ID, role, BOOKING_ID)).thenReturn(new CreateBlockResult(guest(), true));
+        when(clientBlockFacade.block(USER_ID, role, BOOKING_ID)).thenReturn(new CreateBlockResult(guest().withCancelledBookings(2), true));
 
         mockMvc.perform(post(URL).with(as(role)).contentType(MediaType.APPLICATION_JSON).content(body(BOOKING_ID)))
                 .andExpect(status().isCreated())
@@ -114,18 +118,20 @@ class BlockControllerTest {
                 .andExpect(jsonPath("$.data.displayName").value("Марія Ш."))
                 .andExpect(jsonPath("$.data.maskedPhone").value("+380 •• ••• 12 34"))
                 .andExpect(jsonPath("$.data.avatarUrl").doesNotExist())
-                .andExpect(jsonPath("$.data.createdAt").value("2026-10-28T10:15:30Z"));
+                .andExpect(jsonPath("$.data.createdAt").value("2026-10-28T10:15:30Z"))
+                .andExpect(jsonPath("$.data.cancelledBookings").value(2));
     }
 
     @Test
     void should_return200_when_alreadyBlocked() throws Exception {
-        when(clientBlockService.block(USER_ID, Role.SALON_OWNER, BOOKING_ID))
+        when(clientBlockFacade.block(USER_ID, Role.SALON_OWNER, BOOKING_ID))
                 .thenReturn(new CreateBlockResult(guest(), false));
 
         mockMvc.perform(post(URL).with(as(Role.SALON_OWNER)).contentType(MediaType.APPLICATION_JSON)
                         .content(body(BOOKING_ID)))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.data.id").value(BLOCK_ID.toString()));
+                .andExpect(jsonPath("$.data.id").value(BLOCK_ID.toString()))
+                .andExpect(jsonPath("$.data.cancelledBookings").value(0));
     }
 
     @ParameterizedTest(name = "{0}")
@@ -136,7 +142,7 @@ class BlockControllerTest {
         mockMvc.perform(get(URL).with(as(role))).andExpect(status().isForbidden());
         mockMvc.perform(delete(URL + "/" + BLOCK_ID).with(as(role))).andExpect(status().isForbidden());
 
-        verifyNoInteractions(clientBlockService);
+        verifyNoInteractions(clientBlockService, clientBlockFacade);
     }
 
     @Test
@@ -152,12 +158,12 @@ class BlockControllerTest {
                         .content(json))
                 .andExpect(status().isBadRequest());
 
-        verifyNoInteractions(clientBlockService);
+        verifyNoInteractions(clientBlockService, clientBlockFacade);
     }
 
     @Test
     void should_return400_when_staffWalkIn() throws Exception {
-        when(clientBlockService.block(any(), any(), any()))
+        when(clientBlockFacade.block(any(), any(), any()))
                 .thenThrow(new BusinessException(HttpStatus.BAD_REQUEST, "This client cannot be blocked"));
 
         mockMvc.perform(post(URL).with(as(Role.SALON_ADMIN)).contentType(MediaType.APPLICATION_JSON)
@@ -167,7 +173,7 @@ class BlockControllerTest {
 
     @Test
     void should_return404_when_bookingOutOfScope() throws Exception {
-        when(clientBlockService.block(any(), any(), any())).thenThrow(new NotFoundException("Booking not found"));
+        when(clientBlockFacade.block(any(), any(), any())).thenThrow(new NotFoundException("Booking not found"));
 
         mockMvc.perform(post(URL).with(as(Role.INDEPENDENT_MASTER)).contentType(MediaType.APPLICATION_JSON)
                         .content(body(BOOKING_ID)))
@@ -176,7 +182,7 @@ class BlockControllerTest {
 
     @Test
     void should_return429WithRetryAfter_when_blockBudgetExhausted() throws Exception {
-        when(clientBlockService.block(any(), any(), any())).thenThrow(new ClientBlockRateLimitedException(3600));
+        when(clientBlockFacade.block(any(), any(), any())).thenThrow(new ClientBlockRateLimitedException(3600));
 
         mockMvc.perform(post(URL).with(as(Role.SALON_OWNER)).contentType(MediaType.APPLICATION_JSON)
                         .content(body(BOOKING_ID)))
@@ -199,7 +205,7 @@ class BlockControllerTest {
     @Test
     void should_listBlocksWithoutPhoneOrHash_when_provider() throws Exception {
         BlockResponse client = new BlockResponse(UUID.randomUUID(), BlockKind.CLIENT, "Олена К.",
-                "https://pub.example.r2.dev/a.jpg", null, CREATED_AT);
+                "https://pub.example.r2.dev/a.jpg", null, CREATED_AT, 0);
         when(clientBlockService.list(USER_ID, Role.SALON_ADMIN)).thenReturn(List.of(client, guest()));
 
         mockMvc.perform(get(URL).with(as(Role.SALON_ADMIN)))
@@ -223,7 +229,7 @@ class BlockControllerTest {
 
     private static BlockResponse guest() {
         return new BlockResponse(BLOCK_ID, BlockKind.GUEST, "Марія Ш.", null, BlockResponse.maskPhone("1234"),
-                CREATED_AT);
+                CREATED_AT, 0);
     }
 
     private static RequestPostProcessor as(Role role) {

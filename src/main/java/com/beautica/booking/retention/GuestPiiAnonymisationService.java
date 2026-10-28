@@ -8,6 +8,7 @@ import com.beautica.booking.repository.BookingRepository;
 import com.beautica.booking.service.BookingCancellationService;
 import com.beautica.booking.service.GuestVisitCancellationService;
 import com.beautica.common.util.UkrainianPhoneNormalizer;
+import com.beautica.moderation.service.ClientBlockService;
 import io.micrometer.core.instrument.MeterRegistry;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.lang.Nullable;
@@ -45,7 +46,8 @@ import java.util.stream.Collectors;
  * <p><b>Erase ({@link #eraseByPhone}).</b> One transaction, in this order (D12): normalise the phone,
  * lock the phone's upcoming guest visits and single bookings, cancel them through the existing guest
  * cancellation seams (provider outbox + in-app rows, no guest SMS), anonymise every guest row of the
- * phone regardless of age, delete its OTP rows. A rollback leaves neither a cancellation nor a wipe.
+ * phone regardless of age, delete its OTP rows, rename its GUEST client blocks to the anonymised name (phase 398
+ * D7 — hash and last 4 stay, so the block stays enforced). A rollback leaves neither a cancellation nor a wipe.
  *
  * <p>Logs carry counts, the cutoff and the support ticket reference only — never a phone, a name or
  * a row id (§I).
@@ -68,6 +70,7 @@ public class GuestPiiAnonymisationService {
     private final BookingCancellationService bookingCancellationService;
     private final GuestVisitCancellationService guestVisitCancellationService;
     private final PhoneOtpService phoneOtpService;
+    private final ClientBlockService clientBlockService;
     private final GuestPiiRetentionProperties properties;
     private final MeterRegistry meterRegistry;
     private final Clock clock;
@@ -79,6 +82,7 @@ public class GuestPiiAnonymisationService {
             BookingCancellationService bookingCancellationService,
             GuestVisitCancellationService guestVisitCancellationService,
             PhoneOtpService phoneOtpService,
+            ClientBlockService clientBlockService,
             GuestPiiRetentionProperties properties,
             MeterRegistry meterRegistry,
             Clock clock,
@@ -88,6 +92,7 @@ public class GuestPiiAnonymisationService {
         this.bookingCancellationService = bookingCancellationService;
         this.guestVisitCancellationService = guestVisitCancellationService;
         this.phoneOtpService = phoneOtpService;
+        this.clientBlockService = clientBlockService;
         this.properties = properties;
         this.meterRegistry = meterRegistry;
         this.clock = clock;
@@ -178,12 +183,15 @@ public class GuestPiiAnonymisationService {
         int visitsAnonymised = appointmentRepository
                 .anonymiseGuestAppointmentsByPhone(phone, GuestPii.ANONYMISED_NAME).size();
         int otpRowsDeleted = phoneOtpService.deleteAllForPhone(phone);
+        // Phase 398 D7 — the phone's GUEST blocks lose their name snapshot but keep hash + last 4: an active
+        // safety record, so the block keeps refusing this phone. anonymiseDue never touches blocks.
+        int blocksAnonymised = clientBlockService.anonymiseGuestBlocks(phone, GuestPii.ANONYMISED_NAME);
 
         record("manual", bookingsAnonymised, visitsAnonymised);
         log.info("Guest PII erase (ticket {}): cancelled {} bookings, {} visits; anonymised {} bookings, "
-                        + "{} visits; deleted {} OTP rows in {} ms",
+                        + "{} visits, {} blocks; deleted {} OTP rows in {} ms",
                 ticketRef == null ? "none" : ticketRef, bookingsCancelled, visitsCancelled,
-                bookingsAnonymised, visitsAnonymised, otpRowsDeleted, clock.millis() - startedAt);
+                bookingsAnonymised, visitsAnonymised, blocksAnonymised, otpRowsDeleted, clock.millis() - startedAt);
         return new GuestPiiAnonymisationResult(
                 bookingsCancelled, visitsCancelled, bookingsAnonymised, visitsAnonymised, otpRowsDeleted);
     }

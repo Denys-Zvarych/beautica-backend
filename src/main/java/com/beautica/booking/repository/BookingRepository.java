@@ -1701,6 +1701,113 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     List<SalonClosureBookingCandidate> findConfirmedFutureByClientId(
             @Param("clientId") UUID clientId, @Param("now") OffsetDateTime now);
 
+    // ── Client-block booking cascade (Phase 398 user decision 2026-10-28) ─────────────────────
+
+    /**
+     * Phase 398 — the future {@code CONFIRMED} bookings of ONE registered client with ONE independent master: the
+     * candidate scan of a new master-scope CLIENT block ({@code BookingService#declineFutureConfirmedForBlockedClient}).
+     * Same scope-agnostic {@link SalonClosureBookingCandidate} shape as its siblings; bounded by the master's
+     * own future calendar for one client. Served by {@code idx_bookings_client_slot_overlap} ({@code client_id,
+     * starts_at, ends_at}, partial on {@code CONFIRMED AND client_id IS NOT NULL}) — one client's future
+     * {@code CONFIRMED} rows are a handful, so {@code master_id} is a cheap residual filter; the master-leading
+     * {@code idx_bookings_master_slot_overlap} would scan the master's whole future calendar instead.
+     */
+    @Query("""
+            SELECT new com.beautica.booking.repository.SalonClosureBookingCandidate(
+                b.id,
+                b.appointment.id,
+                b.master.id,
+                b.startsAt
+            )
+            FROM Booking b
+            WHERE b.master.id = :masterId
+              AND b.client.id = :clientId
+              AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
+              AND b.startsAt > :now
+            """)
+    List<SalonClosureBookingCandidate> findConfirmedFutureByMasterIdAndClientId(
+            @Param("masterId") UUID masterId, @Param("clientId") UUID clientId, @Param("now") OffsetDateTime now);
+
+    /**
+     * Salon-scope twin of {@link #findConfirmedFutureByMasterIdAndClientId} — every master of the salon (the
+     * booking's own {@code salon_id} snapshot, which is the scope a salon block is written under). Served by the
+     * same {@code client_id}-leading partial index as its master twin ({@code idx_bookings_client_slot_overlap});
+     * {@code salon_id} is the residual filter.
+     */
+    @Query("""
+            SELECT new com.beautica.booking.repository.SalonClosureBookingCandidate(
+                b.id,
+                b.appointment.id,
+                b.master.id,
+                b.startsAt
+            )
+            FROM Booking b
+            WHERE b.salon.id = :salonId
+              AND b.client.id = :clientId
+              AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
+              AND b.startsAt > :now
+            """)
+    List<SalonClosureBookingCandidate> findConfirmedFutureBySalonIdAndClientId(
+            @Param("salonId") UUID salonId, @Param("clientId") UUID clientId, @Param("now") OffsetDateTime now);
+
+    /**
+     * Phase 398 — the future {@code CONFIRMED} LINK guest bookings of ONE OTP-verified phone with ONE independent
+     * master (new master-scope GUEST block). Matched by the canonical E.164 string the OTP gate pins
+     * ({@code PhoneOtpService} accepts only {@code +380XXXXXXXXX}), which is the exact pre-image of the block's
+     * {@code phone_hash}. LINK rows only — a STAFF walk-in's phone was typed by staff, never verified (D8).
+     *
+     * <p>The {@code guestPiiAnonymisedAt IS NULL AND clientDetachedAt IS NULL} conjuncts change no result — they
+     * only let the planner pick {@code idx_bookings_guest_phone_open} (V199, partial on exactly that predicate).
+     * {@code chk_bookings_guest_fields} (V206) makes them redundant for every LINK row: the LINK arm requires
+     * {@code client_detached_at IS NULL}, and a non-null {@code guest_phone} (implied by the equality match) is
+     * only allowed in the {@code guest_pii_anonymised_at IS NULL} sub-arm.
+     */
+    @Query("""
+            SELECT new com.beautica.booking.repository.SalonClosureBookingCandidate(
+                b.id,
+                b.appointment.id,
+                b.master.id,
+                b.startsAt
+            )
+            FROM Booking b
+            WHERE b.master.id = :masterId
+              AND b.client IS NULL
+              AND b.bookingSource = com.beautica.booking.enums.BookingSource.LINK
+              AND b.guestPhone = :guestPhone
+              AND b.guestPiiAnonymisedAt IS NULL
+              AND b.clientDetachedAt IS NULL
+              AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
+              AND b.startsAt > :now
+            """)
+    List<SalonClosureBookingCandidate> findConfirmedFutureLinkGuestByMasterIdAndPhone(
+            @Param("masterId") UUID masterId, @Param("guestPhone") String guestPhone,
+            @Param("now") OffsetDateTime now);
+
+    /**
+     * Salon-scope twin of {@link #findConfirmedFutureLinkGuestByMasterIdAndPhone} — same predicate, same
+     * {@code idx_bookings_guest_phone_open} access path.
+     */
+    @Query("""
+            SELECT new com.beautica.booking.repository.SalonClosureBookingCandidate(
+                b.id,
+                b.appointment.id,
+                b.master.id,
+                b.startsAt
+            )
+            FROM Booking b
+            WHERE b.salon.id = :salonId
+              AND b.client IS NULL
+              AND b.bookingSource = com.beautica.booking.enums.BookingSource.LINK
+              AND b.guestPhone = :guestPhone
+              AND b.guestPiiAnonymisedAt IS NULL
+              AND b.clientDetachedAt IS NULL
+              AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
+              AND b.startsAt > :now
+            """)
+    List<SalonClosureBookingCandidate> findConfirmedFutureLinkGuestBySalonIdAndPhone(
+            @Param("salonId") UUID salonId, @Param("guestPhone") String guestPhone,
+            @Param("now") OffsetDateTime now);
+
     /**
      * Every booking row still attached to {@code clientId} — the CLIENT account self-deletion
      * detach loop ({@code ClientAccountDeletionService}). Called AFTER the future-{@code

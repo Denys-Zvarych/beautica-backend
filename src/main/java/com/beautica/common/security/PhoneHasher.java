@@ -38,18 +38,29 @@ public class PhoneHasher {
     /**
      * A hashed phone and its last four digits (for the masked display, D4). The raw number is not kept.
      *
-     * @param hash  32-byte HMAC-SHA256 digest
-     * @param last4 the last four digits of the E.164 form
+     * <p>A final class with a private constructor, not a record (398 security LOW): a record's canonical
+     * constructor is always public, so any caller could mint a {@code HashedPhone} around a raw or foreign digest.
+     * Only {@link PhoneHasher#hash} / {@link PhoneHasher#tryHash} can create one, which is what makes the typed
+     * {@code ClientBlockService#isGuestPhoneBlocked(BlockScope, HashedPhone)} parameter meaningful.
      */
-    public record HashedPhone(byte[] hash, String last4) {
+    public static final class HashedPhone {
 
-        public HashedPhone {
-            hash = hash.clone();
+        private final byte[] hash;
+        private final String last4;
+
+        private HashedPhone(byte[] hash, String last4) {
+            this.hash = hash.clone();
+            this.last4 = last4;
         }
 
-        @Override
+        /** 32-byte HMAC-SHA256 digest (defensive copy). */
         public byte[] hash() {
             return hash.clone();
+        }
+
+        /** The last four digits of the E.164 form. */
+        public String last4() {
+            return last4;
         }
 
         @Override

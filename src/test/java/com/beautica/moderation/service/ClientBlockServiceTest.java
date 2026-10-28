@@ -478,19 +478,82 @@ class ClientBlockServiceTest {
 
     @Test
     void should_probeGuestRowsOnly_when_isGuestPhoneBlocked() {
-        byte[] hash = phoneHasher.hash("+380501234567").hash();
-        when(clientBlockRepository.findIdByGuestPhone(null, salonId, hash)).thenReturn(Optional.of(UUID.randomUUID()));
+        PhoneHasher.HashedPhone phone = phoneHasher.hash("+380501234567");
+        when(clientBlockRepository.findIdByGuestPhone(null, salonId, phone.hash()))
+                .thenReturn(Optional.of(UUID.randomUUID()));
 
-        assertThat(service.isGuestPhoneBlocked(BlockScope.salon(salonId), hash)).isTrue();
+        assertThat(service.isGuestPhoneBlocked(BlockScope.salon(salonId), phone)).isTrue();
         verify(clientBlockRepository, never()).findIdByBlockedUser(any(), any(), any());
     }
 
     @Test
     void should_returnFalse_when_noGuestRowForPhone() {
-        assertThat(service.isGuestPhoneBlocked(BlockScope.master(masterId), new byte[32])).isFalse();
+        assertThat(service.isGuestPhoneBlocked(BlockScope.master(masterId), phoneHasher.hash("+380501234567")))
+                .isFalse();
+    }
+
+    // ── phase-398 D7: guest PII erase ────────────────────────────────────────
+
+    @Test
+    void should_renameGuestBlocksByPhoneHash_when_anonymiseGuestBlocks() {
+        byte[] hash = phoneHasher.hash("+380501234567").hash();
+        when(clientBlockRepository.renameGuestBlocksByPhone(hash, "Гість")).thenReturn(2);
+
+        int renamed = service.anonymiseGuestBlocks("0501234567", "Гість");
+
+        assertThat(renamed).isEqualTo(2);
+    }
+
+    @Test
+    void should_renameNothing_when_phoneDoesNotNormalise() {
+        int renamed = service.anonymiseGuestBlocks("not-a-phone", "Гість");
+
+        assertThat(renamed).isZero();
+        verify(clientBlockRepository, never()).renameGuestBlocksByPhone(any(), any());
     }
 
     // ── fixtures ─────────────────────────────────────────────────────────────
+
+    // ── phase 398 — the identity a NEW block hands to the cancel cascade ─────────
+
+    @Test
+    void should_returnClientNewBlockInMasterScope_when_clientBlockCreated() {
+        given(appBooking(independentMaster(actorId), null));
+
+        ClientBlockService.CreateBlockResult result = service.block(actorId, Role.INDEPENDENT_MASTER, bookingId);
+
+        assertThat(result.newBlock()).isNotNull();
+        assertThat(result.newBlock().scope()).isEqualTo(BlockScope.master(masterId));
+        assertThat(result.newBlock().clientId()).isEqualTo(clientId);
+        assertThat(result.newBlock().guestPhone()).isNull();
+    }
+
+    @Test
+    void should_returnCanonicalGuestPhone_when_guestBlockCreatedInSalonScope() {
+        Booking booking = guestBooking(salonMaster(), "050 123 45 67");
+        Salon salon = salon(actorId);
+        when(booking.getSalon()).thenReturn(salon);
+        given(booking);
+
+        ClientBlockService.CreateBlockResult result = service.block(actorId, Role.SALON_OWNER, bookingId);
+
+        assertThat(result.newBlock()).isNotNull();
+        assertThat(result.newBlock().scope()).isEqualTo(BlockScope.salon(salonId));
+        assertThat(result.newBlock().guestPhone()).isEqualTo("+380501234567");
+        assertThat(result.newBlock().clientId()).isNull();
+        assertThat(result.newBlock().toString()).doesNotContain("380501234567");
+    }
+
+    @Test
+    void should_returnNoNewBlock_when_repeatBlock() {
+        given(appBooking(independentMaster(actorId), null));
+        when(clientBlockRepository.findIdByBlockedUser(masterId, null, clientId))
+                .thenReturn(Optional.of(UUID.randomUUID()));
+
+        ClientBlockService.CreateBlockResult result = service.block(actorId, Role.INDEPENDENT_MASTER, bookingId);
+
+        assertThat(result.newBlock()).isNull();
+    }
 
     private void given(Booking booking) {
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));

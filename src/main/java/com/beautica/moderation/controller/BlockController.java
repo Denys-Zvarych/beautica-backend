@@ -4,6 +4,7 @@ import com.beautica.common.ApiResponse;
 import com.beautica.common.security.AuthenticationUtils;
 import com.beautica.moderation.dto.BlockResponse;
 import com.beautica.moderation.dto.CreateBlockRequest;
+import com.beautica.moderation.service.ClientBlockFacade;
 import com.beautica.moderation.service.ClientBlockService;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.responses.ApiResponses;
@@ -26,8 +27,8 @@ import java.util.UUID;
 
 /**
  * Phase 397 — a provider blocks a client. Role gate here (CLIENT / SALON_MASTER → 403); booking scope, target
- * derivation, idempotency and the per-user POST/DELETE rate limit (429) live in {@link ClientBlockService}.
- * Enforcement is phase 398.
+ * derivation, idempotency and the per-user POST/DELETE rate limit (429) live in {@link ClientBlockService}; a new
+ * block's future-booking cancellation (phase 398) in {@link ClientBlockFacade}.
  */
 @RestController
 @RequestMapping("/api/v1/blocks")
@@ -37,14 +38,17 @@ public class BlockController {
     private static final String BLOCKER_ROLES = "hasAnyRole('INDEPENDENT_MASTER','SALON_OWNER','SALON_ADMIN')";
 
     private final ClientBlockService clientBlockService;
+    private final ClientBlockFacade clientBlockFacade;
 
     @Operation(summary = "Block the client of a booking",
             description = """
                     Blocks the client of a booking in the caller's scope: an independent master blocks for \
                     themselves, a salon owner/admin for the whole salon. A registered client is blocked by account \
-                    only, a link guest by the phone verified at booking time; the two are never linked. Silent \
-                    (the client is not notified) and idempotent: an existing block of the same client in the same \
-                    scope returns 200. Shares a per-user budget with DELETE (429 with Retry-After).""")
+                    only, a link guest by the phone verified at booking time; the two are never linked. A new block \
+                    also cancels (DECLINED) every future confirmed booking of that client in the scope; the client \
+                    gets only the ordinary provider-cancel notice, never a block notice. cancelledBookings carries \
+                    the count of cancelled visits (a multi-service visit counts once). Idempotent: an existing \
+                    block of the same client in the same scope returns 200 and cancels nothing. Shares a per-user budget with DELETE (429 with Retry-After).""")
     @ApiResponses({
             @io.swagger.v3.oas.annotations.responses.ApiResponse(responseCode = "201", description = "Block created"),
             @io.swagger.v3.oas.annotations.responses.ApiResponse(responseCode = "200", description = "Already blocked"),
@@ -62,7 +66,7 @@ public class BlockController {
     public ResponseEntity<ApiResponse<BlockResponse>> block(
             @Valid @RequestBody CreateBlockRequest request,
             Authentication authentication) {
-        ClientBlockService.CreateBlockResult result = clientBlockService.block(
+        ClientBlockService.CreateBlockResult result = clientBlockFacade.block(
                 AuthenticationUtils.userId(authentication), AuthenticationUtils.role(authentication),
                 request.bookingId());
         HttpStatus status = result.created() ? HttpStatus.CREATED : HttpStatus.OK;

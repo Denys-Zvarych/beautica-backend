@@ -447,6 +447,22 @@ public class GlobalExceptionHandler {
                 .body(new ApiResponse<>(false, new GoneErrorResponse(ex.getCode()), ex.getMessage()));
     }
 
+    /**
+     * Phase 398 D3 — {@code 409} for a booking create the provider's client block refuses. Body:
+     * {@code data.code} = {@link BookingUnavailableException#BOOKING_UNAVAILABLE} plus the exception's constant,
+     * neutral message; identical for the app and LINK guest paths. A separate exception type (not a
+     * {@link BusinessException}), so every existing 409 body is untouched. Never cached: unlike a retired link,
+     * an unblock makes the same request succeed.
+     */
+    @ExceptionHandler(BookingUnavailableException.class)
+    public ResponseEntity<ApiResponse<BookingUnavailableResponse>> handleBookingUnavailable(
+            BookingUnavailableException ex) {
+        log.debug("Booking unavailable [{}]", ex.getCode());
+        return ResponseEntity
+                .status(HttpStatus.CONFLICT)
+                .body(new ApiResponse<>(false, new BookingUnavailableResponse(ex.getCode()), ex.getMessage()));
+    }
+
     @ExceptionHandler(ForbiddenException.class)
     public ResponseEntity<ApiResponse<Void>> handleForbidden(ForbiddenException ex) {
         // Log the exception type only — never ex.getMessage() which may carry internal UUIDs

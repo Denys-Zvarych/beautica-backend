@@ -10,6 +10,7 @@ import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.security.PhoneHasher;
 import com.beautica.common.security.PhoneHasher.HashedPhone;
+import com.beautica.common.util.UkrainianPhoneNormalizer;
 import com.beautica.config.RateLimitConfig;
 import com.beautica.moderation.dto.BlockDisplayNames;
 import com.beautica.moderation.dto.BlockResponse;
@@ -39,7 +40,8 @@ import java.util.UUID;
 /**
  * Phase 397 — a provider blocks a client (registered account or LINK guest). Storage, list, unblock and the
  * {@link #isClientBlocked} / {@link #isGuestPhoneBlocked} probes phase 398 enforces with. The blocked party is never
- * notified (D5).
+ * notified of the block itself (D5); the future bookings a NEW block cancels ({@link ClientBlockFacade}, phase 398
+ * user decision 2026-10-28) reach them only as the ordinary neutral provider-decline notice.
  *
  * <p>Target derivation, always from a booking in the caller's scope — ONE identity per type (user decision
  * 2026-10-28, supersedes D2/D5 phone part):
@@ -77,8 +79,36 @@ public class ClientBlockService {
 
     private final Clock clock;
 
-    /** Outcome of {@link #block}: the row and whether this call created it (201) or found it (200). */
-    public record CreateBlockResult(BlockResponse block, boolean created) {}
+    /**
+     * Outcome of {@link #block}: the row and whether this call created it (201) or found it (200). {@code newBlock}
+     * is set only when {@code created} — the identity {@link ClientBlockFacade} cancels future bookings for.
+     */
+    public record CreateBlockResult(BlockResponse block, boolean created, @Nullable NewBlock newBlock) {
+
+        public CreateBlockResult(BlockResponse block, boolean created) {
+            this(block, created, null);
+        }
+    }
+
+    /**
+     * Phase 398 (user decision 2026-10-28) — the scope and the per-type identity of a block THIS call created:
+     * exactly one of {@code clientId} (CLIENT row) / {@code guestPhone} (GUEST row, canonical E.164 — the pre-image
+     * of the stored {@code phone_hash}). Never serialised, never logged.
+     */
+    public record NewBlock(BlockScope scope, @Nullable UUID clientId, @Nullable String guestPhone) {
+
+        public NewBlock {
+            Objects.requireNonNull(scope);
+            if ((clientId == null) == (guestPhone == null)) {
+                throw new IllegalArgumentException("Exactly one of clientId / guestPhone must be set");
+            }
+        }
+
+        @Override
+        public String toString() {
+            return "NewBlock[scope=" + scope + ", kind=" + (clientId != null ? "CLIENT" : "GUEST") + "]";
+        }
+    }
 
     /** The identity a booking resolves to: exactly one of {@code userId} (CLIENT) / {@code phone} (GUEST). */
     record BlockTarget(@Nullable UUID userId, @Nullable HashedPhone phone, String displayName) {
@@ -133,7 +163,7 @@ public class ClientBlockService {
             return new CreateBlockResult(BlockResponse.from(loadRow(winner)), false);
         }
         log.info("Client block {} created from booking {}", id, bookingId);
-        return new CreateBlockResult(BlockResponse.from(loadRow(id)), true);
+        return new CreateBlockResult(BlockResponse.from(loadRow(id)), true, newBlockOf(scope, target, booking));
     }
 
     /** One statement for the rows (constructor projection, no {@code User} hydrated) whatever their count. */
@@ -194,10 +224,29 @@ public class ClientBlockService {
         return clientBlockRepository.findIdByBlockedUser(scope.masterId(), scope.salonId(), userId).isPresent();
     }
 
-    /** Phase 398 (guest create) — is this OTP-verified phone hash blocked in this scope. GUEST rows only. */
+    /**
+     * Phase 398 (guest create) — is this OTP-verified phone blocked in this scope. GUEST rows only. Typed
+     * {@link HashedPhone} (397 re-audit): it is a final class whose only constructor is private to
+     * {@link PhoneHasher} (398 security LOW — it used to be a record, whose canonical constructor is public), so
+     * only {@link PhoneHasher#hash} / {@link PhoneHasher#tryHash} can mint one and a raw or foreign digest cannot be
+     * passed by mistake.
+     */
     @Transactional(readOnly = true)
-    public boolean isGuestPhoneBlocked(BlockScope scope, byte[] phoneHash) {
-        return clientBlockRepository.findIdByGuestPhone(scope.masterId(), scope.salonId(), phoneHash).isPresent();
+    public boolean isGuestPhoneBlocked(BlockScope scope, HashedPhone phone) {
+        return clientBlockRepository.findIdByGuestPhone(scope.masterId(), scope.salonId(), phone.hash()).isPresent();
+    }
+
+    /**
+     * Phase 398 D7 — guest PII erase by phone: every GUEST block of this phone keeps its hash + last 4 (the block
+     * stays effective) and gets {@code anonymisedName} as its display name. Joins the caller's erase transaction.
+     *
+     * @return rows renamed (0 for a phone that does not normalise — such a phone was never blockable)
+     */
+    @Transactional
+    public int anonymiseGuestBlocks(String rawPhone, String anonymisedName) {
+        return phoneHasher.tryHash(rawPhone)
+                .map(phone -> clientBlockRepository.renameGuestBlocksByPhone(phone.hash(), anonymisedName))
+                .orElse(0);
     }
 
     private Optional<BlockTarget> targetOf(Booking booking) {
@@ -212,6 +261,13 @@ public class ClientBlockService {
         return phoneHasher.tryHash(booking.getGuestPhone())
                 .map(phone -> BlockTarget.guest(phone,
                         BlockDisplayNames.snapshot(booking.getGuestName(), booking.getGuestSurname())));
+    }
+
+    /** A GUEST target's phone already normalised in {@link #targetOf} (tryHash), so toE164 cannot throw here. */
+    private static NewBlock newBlockOf(BlockScope scope, BlockTarget target, Booking booking) {
+        return target.userId() != null
+                ? new NewBlock(scope, target.userId(), null)
+                : new NewBlock(scope, null, UkrainianPhoneNormalizer.toE164(booking.getGuestPhone()));
     }
 
     /** The per-type key: CLIENT target → CLIENT rows by user id; GUEST target → GUEST rows by phone hash. */

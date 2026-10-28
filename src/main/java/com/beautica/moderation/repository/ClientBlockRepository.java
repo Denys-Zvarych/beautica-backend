@@ -117,6 +117,17 @@ public interface ClientBlockRepository extends JpaRepository<ClientBlock, UUID> 
     List<ClientBlockListRow> findListRowsBySalonScope(
             @Param("salonIds") Collection<UUID> salonIds, Pageable pageable);
 
+    /**
+     * Phase 398 D7 — guest PII erase: GUEST rows of this phone hash (every scope) get the anonymised display name;
+     * hash + last 4 stay, so the block keeps refusing. Served by {@code idx_client_blocks_phone_hash}.
+     */
+    @Modifying
+    @Query("""
+            UPDATE ClientBlock cb SET cb.displayName = :displayName
+             WHERE cb.blockedUserId IS NULL AND cb.phoneHash = :phoneHash
+            """)
+    int renameGuestBlocksByPhone(@Param("phoneHash") byte[] phoneHash, @Param("displayName") String displayName);
+
     @Modifying
     @Query("DELETE FROM ClientBlock cb WHERE cb.id = :id AND cb.blockerMasterId = :masterId")
     int deleteInMasterScope(@Param("id") UUID id, @Param("masterId") UUID masterId);
