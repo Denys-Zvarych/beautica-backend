@@ -37,6 +37,8 @@ public class ReviewEventListener {
     private static final String SALON_DETAIL_CACHE = "salon-detail";
     private static final String REVIEWS_BY_MASTER_CACHE = "reviews-by-master";
     private static final String REVIEWS_BY_SALON_CACHE = "reviews-by-salon";
+    /** {@code GET /reviews/{id}}, keyed by reviewId — see ReviewService#getReview (phase 396: no longer immutable). */
+    private static final String REVIEW_DETAIL_CACHE = "review-detail";
 
     // Runs after the outer transaction (review INSERT) commits.
     // REQUIRES_NEW opens a separate transaction for the rating UPDATE so that a
@@ -87,14 +89,36 @@ public class ReviewEventListener {
     // (unit tests invoke the bean directly), where it degrades to an immediate evict.
     @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
     public void onReviewCreated(ReviewCreatedEvent event) {
+        recalculateAndEvict(event.masterId(), event.masterUserId(), event.salonId());
+    }
+
+    /**
+     * Phase 396 D3 — a review was hidden, restored or removed. The VISIBLE-only aggregates and every cached public
+     * view of it move exactly as on a new review (same recalculation, same evictions, same ordering), plus the
+     * per-review {@code review-detail} entry, which {@code GET /reviews/{id}} must stop (or resume) serving.
+     *
+     * <p><b>Synchronous on purpose</b> (audit-fix, perf LOW). On an auto-hide this runs on the reporter's
+     * {@code POST /reports} thread after commit, exactly like {@link #onReviewCreated} on the review POST: two
+     * single-row aggregate UPDATEs (master, salon) over index-backed scans plus per-key evictions. It is bounded —
+     * at most {@code app.moderation.auto-hide-cap} (1) auto-hide per provider per 24 h — and moving it to an
+     * executor would let a reader see the hidden review counted in the rating for an unbounded queue delay and
+     * would split the recalc/evict ordering the comments above depend on. Revisit only if the cap is raised.
+     */
+    @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
+    public void onReviewModerationChanged(ReviewModerationChangedEvent event) {
+        recalculateAndEvict(event.masterId(), event.masterUserId(), event.salonId());
+        evictAfterCompletion(() -> evictKey(REVIEW_DETAIL_CACHE, event.reviewId()));
+    }
+
+    private void recalculateAndEvict(UUID masterId, UUID masterUserId, UUID salonId) {
         try {
-            ratingRecalculationService.recalculateMasterRating(event.masterId());
+            ratingRecalculationService.recalculateMasterRating(masterId);
         } catch (Exception ex) {
             log.error("recalculateMasterRating failed for master={} — {}",
-                      event.masterId(), ex.getClass().getSimpleName());
+                      masterId, ex.getClass().getSimpleName());
         }
         evictAfterCompletion(() -> {
-            evictMasterReviewPages(event.masterId());
+            evictMasterReviewPages(masterId);
             // Phase 240 audit (Finding 1). Previously skipped deliberately, on the ground
             // that the 5-minute TTL was "an accepted staleness bound". That ground no
             // longer holds: BookingDetailResponse.masterAvgRating now serves the master's
@@ -109,7 +133,7 @@ public class ReviewEventListener {
             //
             // Per-key, never allEntries: one master's review must not flush every other
             // master's cached profile.
-            evictKey(MASTER_DETAIL_CACHE, event.masterId());
+            evictKey(MASTER_DETAIL_CACHE, masterId);
             // Phase 240 RE-audit (Finding 1). The userId-keyed twin of master-detail, backing
             // the master's own GET /masters/me. Previously skipped on the ground that the event
             // "does not carry a userId" — that blocker was removed rather than accepted: the
@@ -123,27 +147,27 @@ public class ReviewEventListener {
             // @Cacheable(value = "master-detail-by-user", key = "#userId"), i.e. the userId
             // itself, NOT a composite and NOT a string. Matches how UserService and
             // MasterService#rotateMasterSalon evict this same cache.
-            evictKey(MASTER_DETAIL_BY_USER_CACHE, event.masterUserId());
+            evictKey(MASTER_DETAIL_BY_USER_CACHE, masterUserId);
         });
         // Phase 380 D6: the public master booking page carries rating, count and the newest reviews. Registered
         // AFTER the callback above so it runs after evictMasterReviewPages (synchronizations fire in
         // registration order): a reader that repopulates booking-slug-info in between can no longer re-read
         // the stale reviews-by-master page.
-        masterProfileCacheEvictor.evictBookingSlugInfoAfterCommit(event.masterId());
+        masterProfileCacheEvictor.evictBookingSlugInfoAfterCommit(masterId);
 
         // Symmetric salon branch (Phase 13.6): only runs when the reviewed booking
         // belonged to a salon-affiliated master. Same fire-and-log-don't-fail contract —
         // a salon-recalc failure must never roll back the already-committed review, and it runs in
         // its own REQUIRES_NEW transaction, separate from the master recalc above.
-        if (event.salonId() != null) {
+        if (salonId != null) {
             try {
-                ratingRecalculationService.recalculateSalonRating(event.salonId());
+                ratingRecalculationService.recalculateSalonRating(salonId);
             } catch (Exception ex) {
                 log.error("recalculateSalonRating failed for salon={} — {}",
-                          event.salonId(), ex.getClass().getSimpleName());
+                          salonId, ex.getClass().getSimpleName());
             }
             evictAfterCompletion(() -> {
-                evictSalonReviewPages(event.salonId());
+                evictSalonReviewPages(salonId);
                 // Mirrors the master branch: recalculateSalonRating updates
                 // salons.avg_rating / review_count, and "salon-detail" caches the
                 // PublicSalonResponse DTO those columns feed (SalonService#getPublicSalon —
@@ -151,10 +175,10 @@ public class ReviewEventListener {
                 // now-uncached SalonService#getSalonEntity, see its Javadoc).
                 // Without this evict the salon profile keeps the pre-review average for
                 // the cache's 5-minute TTL.
-                evictKey(SALON_DETAIL_CACHE, event.salonId());
+                evictKey(SALON_DETAIL_CACHE, salonId);
                 // Phase 384 D5: the public salon booking page carries the rating distribution and the newest
                 // reviews. Same callback, after evictSalonReviewPages above, so no stale page is re-read.
-                masterProfileCacheEvictor.evictSalonBookingPage(event.salonId());
+                masterProfileCacheEvictor.evictSalonBookingPage(salonId);
             });
         }
     }

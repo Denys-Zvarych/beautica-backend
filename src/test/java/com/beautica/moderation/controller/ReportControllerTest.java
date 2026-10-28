@@ -189,7 +189,8 @@ class ReportControllerTest {
 
     @ParameterizedTest(name = "comment with {0} → 400")
     @ValueSource(strings = {"\\u0000", "\\u0007", "\\u001b", "\\r", "\\t", "\\u007f", "\\u0085",
-            "\\u202a", "\\u202e", "\\u2066", "\\u2069"})
+            "\\u202a", "\\u202e", "\\u2066", "\\u2069",
+            "\\u200e", "\\u200f", "\\u061c", "\\u2028", "\\u2029"})
     @DisplayName("comment with a control or bidi-override character → 400")
     void should_return400_when_commentHasControlOrBidiChar(String jsonEscape) throws Exception {
         assertBadRequest(body("REVIEW", TARGET_ID.toString(), "OTHER", "before" + jsonEscape + "after"));

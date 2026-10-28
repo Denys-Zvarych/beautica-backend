@@ -39,13 +39,23 @@ public class ContentReportEmailListener {
             return;
         }
         try {
-            emailService.sendContentReportEmail(
-                    supportEmail,
-                    event.reportId(),
-                    event.targetType().name(),
-                    event.targetId(),
-                    event.reason().name(),
-                    event.reporterUserId());
+            if (event.burst()) {
+                emailService.sendContentReportBurstEmail(
+                        supportEmail,
+                        event.reportId(),
+                        event.targetType().name(),
+                        event.targetId(),
+                        event.reason().name(),
+                        event.reporterUserId());
+            } else {
+                emailService.sendContentReportEmail(
+                        supportEmail,
+                        event.reportId(),
+                        event.targetType().name(),
+                        event.targetId(),
+                        event.reason().name(),
+                        event.reporterUserId());
+            }
         } catch (TaskRejectedException ex) {
             log.warn("Content report {} stored; support e-mail dropped — reportEmailExecutor saturated",
                     event.reportId());

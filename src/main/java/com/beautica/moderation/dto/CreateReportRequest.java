@@ -17,6 +17,9 @@ import java.util.UUID;
  * <p>{@code comment} rejects control characters other than {@code \n} (C0, DEL, C1) and the bidirectional
  * embedding/override/isolate characters U+202A–U+202E and U+2066–U+2069 (400): the text is shown verbatim to a
  * moderator in phase 396, where a bidi override could disguise what the reporter wrote ("Trojan Source").
+ * Phase 396 also rejects the implicit direction marks LRM/RLM/ALM (U+200E, U+200F, U+061C) and the line/paragraph
+ * separators U+2028/U+2029, now that the moderator queue renders the text. The same pattern guards support's
+ * resolve note.
  */
 public record CreateReportRequest(
         @NotNull
@@ -36,7 +39,8 @@ public record CreateReportRequest(
     public static final int MAX_COMMENT_LENGTH = 500;
     public static final int MIN_OTHER_COMMENT_LENGTH = 5;
 
-    /** Any text without control characters (except {@code \n}) and without bidi embeddings/overrides/isolates. */
+    /** Any text without control characters (except {@code \n}), bidi controls/marks, or U+2028/U+2029. */
     public static final String COMMENT_PATTERN =
-            "^[^\\x00-\\x09\\x0B-\\x1F\\x7F-\\x9F\\x{202A}-\\x{202E}\\x{2066}-\\x{2069}]*$";
+            "^[^\\x00-\\x09\\x0B-\\x1F\\x7F-\\x9F"
+                    + "\\x{061C}\\x{200E}\\x{200F}\\x{2028}\\x{2029}\\x{202A}-\\x{202E}\\x{2066}-\\x{2069}]*$";
 }

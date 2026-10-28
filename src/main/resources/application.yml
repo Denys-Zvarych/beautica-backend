@@ -532,6 +532,27 @@ app:
     retention-months: 12
     batch-size: 500
     max-batches-per-run: 200
+  # Phase 396 — UGC moderation. No env var: defaults are the production values.
+  moderation:
+    # D2 (locked 2026-10-28): distinct eligible reporters (CLIENT with a COMPLETED booking at the provider) that
+    # auto-hide a review.
+    auto-hide-threshold: 3
+    # Burst guard: this many OPEN review reports on one provider within burst-window hold those reports (no
+    # auto-hide from them until support resolves) and flag the support e-mail as a burst.
+    burst-threshold: 5
+    burst-window: 10m
+    # Audit-fix D16: at most this many auto-hides per provider (master or salon) per auto-hide-cap-window. A further
+    # threshold hit holds that review's reports for support and sends a [BURST] e-mail instead of hiding.
+    auto-hide-cap: 1
+    auto-hide-cap-window: 24h
+    retention:
+      # D7 ContentReportRetentionJob: gone-target sweep + purge of reports whose target is gone > 1 year.
+      enabled: true
+      # Staggered from the 03:00 / 03:17 / 03:27 / 03:42 / 03:57 UTC cleanup cluster.
+      cron: "0 37 3 * * *"
+      # Same batching as guest-pii-retention: rows per statement, batch budget per statement kind per run.
+      batch-size: 500
+      max-batches-per-run: 200
   outbox:
     # Base64-encoded 32-byte (AES-256) symmetric key for OutboxPayloadCipher.
     # Generate with: openssl rand -base64 32

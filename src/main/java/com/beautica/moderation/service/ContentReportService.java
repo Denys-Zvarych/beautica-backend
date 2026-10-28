@@ -9,6 +9,7 @@ import com.beautica.moderation.dto.ReportResponse;
 import com.beautica.moderation.entity.ContentReport;
 import com.beautica.moderation.entity.ReportReason;
 import com.beautica.moderation.entity.ReportStatus;
+import com.beautica.moderation.entity.ReportTargetType;
 import com.beautica.moderation.event.ContentReportCreatedEvent;
 import com.beautica.moderation.repository.ContentReportRepository;
 import com.github.benmanes.caffeine.cache.LoadingCache;
@@ -45,6 +46,8 @@ import java.util.UUID;
  *       {@link ContentReportCreatedEvent} (support e-mail after commit, D7). A concurrent twin that lost the
  *       race reads the winner's row and answers 200. The 201 body is built from the values just written
  *       (id, {@code OPEN}, the clock instant truncated to Postgres' microsecond precision) — no re-read.</li>
+ *   <li>phase 396: a NEW {@code REVIEW} report runs {@link ReviewAutoHideService#onReviewReported} in the same
+ *       transaction (burst guard + auto-hide threshold); a burst flags the support e-mail.</li>
  * </ol>
  * The reporter's comment is stored trimmed (blank becomes {@code null}) and is never logged.
  */
@@ -59,6 +62,7 @@ public class ContentReportService {
 
     private final ContentReportRepository contentReportRepository;
     private final ReportTargetVisibilityResolver visibilityResolver;
+    private final ReviewAutoHideService reviewAutoHideService;
     private final ApplicationEventPublisher eventPublisher;
 
     /** Per-user D6 budget; bound by bean name ({@code RateLimitConfig#contentReportBuckets}). */
@@ -116,8 +120,10 @@ public class ContentReportService {
                     .orElseThrow(() -> new IllegalStateException("Conflicting content report not visible"));
             return new CreateReportResult(ReportResponse.from(winner), false);
         }
+        boolean burst = request.targetType() == ReportTargetType.REVIEW
+                && reviewAutoHideService.onReviewReported(request.targetId());
         eventPublisher.publishEvent(new ContentReportCreatedEvent(
-                id, request.targetType(), request.targetId(), request.reason(), reporterId));
+                id, request.targetType(), request.targetId(), request.reason(), reporterId, burst));
         log.info("Content report {} created on {} by user {}", id, request.targetType(), reporterId);
         return new CreateReportResult(new ReportResponse(id, ReportStatus.OPEN, createdAt), true);
     }

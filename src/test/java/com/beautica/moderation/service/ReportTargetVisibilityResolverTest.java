@@ -11,6 +11,7 @@ import com.beautica.media.repository.MediaRepository;
 import com.beautica.moderation.entity.ReportTargetType;
 import com.beautica.moderation.service.ReportTargetVisibilityResolver.ReportTarget;
 import com.beautica.review.entity.ClientReview;
+import com.beautica.review.entity.ModerationStatus;
 import com.beautica.review.entity.Review;
 import com.beautica.review.repository.ClientReviewRepository;
 import com.beautica.review.repository.ReviewRepository;
@@ -86,6 +87,19 @@ class ReportTargetVisibilityResolverTest {
         @DisplayName("missing (deleted) review → empty (404)")
         void should_beEmpty_when_reviewMissing() {
             when(reviewRepository.findById(TARGET_ID)).thenReturn(Optional.empty());
+
+            Optional<ReportTarget> result = resolve(ReportTargetType.REVIEW, Role.CLIENT);
+
+            assertThat(result).isEmpty();
+        }
+
+        @ParameterizedTest(name = "{0}")
+        @EnumSource(value = ModerationStatus.class, names = "VISIBLE", mode = EnumSource.Mode.EXCLUDE)
+        @DisplayName("phase 396: a hidden or removed review → empty (same 404 as missing, no longer reportable)")
+        void should_beEmpty_when_reviewNotVisible(ModerationStatus status) {
+            Review review = reviewBy(OTHER_USER_ID);
+            review.moderate(status);
+            when(reviewRepository.findById(TARGET_ID)).thenReturn(Optional.of(review));
 
             Optional<ReportTarget> result = resolve(ReportTargetType.REVIEW, Role.CLIENT);
 
@@ -186,6 +200,21 @@ class ReportTargetVisibilityResolverTest {
     @Nested
     @DisplayName("CLIENT_REVIEW — only through a shared booking with the reviewed client")
     class ClientReviewTarget {
+
+        @ParameterizedTest(name = "{0}")
+        @EnumSource(value = ModerationStatus.class, names = "VISIBLE", mode = EnumSource.Mode.EXCLUDE)
+        @DisplayName("phase 396: a hidden or removed client review → empty, before any booking lookup")
+        void should_beEmpty_when_clientReviewNotVisible(ModerationStatus status) {
+            ClientReview review = clientReview(OTHER_USER_ID, UUID.randomUUID());
+            review.moderate(status);
+            when(clientReviewRepository.findById(TARGET_ID)).thenReturn(Optional.of(review));
+
+            Optional<ReportTarget> result = resolve(ReportTargetType.CLIENT_REVIEW, Role.SALON_OWNER);
+
+            assertThat(result).isEmpty();
+            verifyNoInteractions(bookingRepository);
+        }
+
 
         @Test
         @DisplayName("provider with a booking with the reviewed client → visible")

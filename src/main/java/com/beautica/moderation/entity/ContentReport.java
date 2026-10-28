@@ -12,6 +12,7 @@ import lombok.AccessLevel;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
 
+import java.time.Instant;
 import java.util.UUID;
 
 /**
@@ -24,8 +25,14 @@ import java.util.UUID;
  * double submit collapses onto one row without an aborted transaction. The entity is therefore read-only
  * here: no setters, no public constructor.
  *
- * <p><b>Not mapped yet.</b> {@code resolution} and {@code resolved_at} exist in V207 for phase 396, which
- * maps them together with the resolve actions.
+ * <p><b>Resolution (phase 396).</b> {@code status}, {@code resolution}, {@code resolved_at}, {@code target_gone_at},
+ * {@code burst_hold} and {@code resolution_note} are written only by bulk statements in
+ * {@code ContentReportRepository} (resolve all OPEN reports on a target, the burst hold, the D7 retention sweep), so
+ * the entity stays read-only.
+ *
+ * <p><b>Reporter (V208).</b> {@code reporter_user_id} is {@code ON DELETE SET NULL}: a deleted reporter's reports
+ * survive (D7 retention) with a {@code null} reporter, which never counts toward auto-hide. V209's trigger clears
+ * {@code comment} in the same row write, so an orphaned report keeps no reporter text.
  *
  * <p>{@code comment} is the reporter's free text: it never goes into the support e-mail or a log line.
  */
@@ -33,9 +40,10 @@ import java.util.UUID;
 @Table(
         name = "content_reports",
         indexes = {
-                @Index(name = "ux_content_reports_reporter_target",
-                        columnList = "reporter_user_id, target_type, target_id", unique = true),
-                @Index(name = "idx_content_reports_status_created", columnList = "status, created_at"),
+                // ux_content_reports_reporter_target (WHERE reporter_user_id IS NOT NULL), idx_content_reports_open_created
+                // (WHERE status = 'OPEN') and idx_content_reports_target_gone (WHERE target_gone_at IS NOT NULL) are
+                // partial indexes (V208), as is idx_content_reports_resolved_at (resolved_at DESC, id DESC WHERE
+                // status = 'RESOLVED', V209) — not expressible in JPA @Index.
                 @Index(name = "idx_content_reports_target", columnList = "target_type, target_id")
         }
 )
@@ -47,7 +55,8 @@ public class ContentReport extends AuditableEntity {
     @Column(name = "id", nullable = false, updatable = false)
     private UUID id;
 
-    @Column(name = "reporter_user_id", nullable = false, updatable = false)
+    /** {@code null} once the reporter's account was deleted (V208 {@code ON DELETE SET NULL}). */
+    @Column(name = "reporter_user_id", updatable = false)
     private UUID reporterUserId;
 
     @Enumerated(EnumType.STRING)
@@ -67,4 +76,23 @@ public class ContentReport extends AuditableEntity {
     @Enumerated(EnumType.STRING)
     @Column(name = "status", nullable = false, length = 16)
     private ReportStatus status;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "resolution", length = 16)
+    private ReportResolution resolution;
+
+    @Column(name = "resolved_at")
+    private Instant resolvedAt;
+
+    /** D7: when the target was found gone (or removed); the row is purged one year later. */
+    @Column(name = "target_gone_at")
+    private Instant targetGoneAt;
+
+    /** Burst guard: held reports never count toward auto-hide; support resolves them. */
+    @Column(name = "burst_hold", nullable = false)
+    private boolean burstHold;
+
+    /** Support's free-text note on resolve. Never logged. */
+    @Column(name = "resolution_note", length = 500)
+    private String resolutionNote;
 }

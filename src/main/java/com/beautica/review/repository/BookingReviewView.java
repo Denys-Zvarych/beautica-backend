@@ -30,8 +30,8 @@ import java.util.UUID;
  * booking id the paragraph above keeps out.
  *
  * @param id      the review's id
- * @param rating  the client's 1-5 star rating
- * @param comment the client's free text, or {@code null}
+ * @param rating  the client's 1-5 star rating; {@code null} when the review is not VISIBLE (phase 396 moderation)
+ * @param comment the client's free text, or {@code null} (always {@code null} when the review is not VISIBLE)
  */
 public record BookingReviewView(
         UUID id,

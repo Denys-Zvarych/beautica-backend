@@ -60,7 +60,8 @@ class ContentReportEmailTest {
 
     private static final String TEMPLATE = "templates/email/content-report.html";
     private static final Set<String> ALLOWED_TEMPLATE_VARIABLES =
-            Set.of("reportId", "targetType", "targetId", "reason", "reporterUserId");
+            // "burst" (phase 396) is a boolean flag, not UGC.
+            Set.of("reportId", "targetType", "targetId", "reason", "reporterUserId", "burst");
 
     @Mock
     private JavaMailSender mailSender;
@@ -92,7 +93,7 @@ class ContentReportEmailTest {
                 emailService);
 
         listener.onContentReportCreated(new ContentReportCreatedEvent(
-                reportId, ReportTargetType.REVIEW, targetId, ReportReason.HARASSMENT, reporterId));
+                reportId, ReportTargetType.REVIEW, targetId, ReportReason.HARASSMENT, reporterId, false));
 
         verify(mailSender).send(message);
         String html = message.getContent().toString();
@@ -103,7 +104,26 @@ class ContentReportEmailTest {
     }
 
     @Test
-    @DisplayName("the template binds only the five id/enum variables — no slot for review text or comment")
+    @DisplayName("phase 396: a burst event → [BURST] subject + burst banner; a normal event carries neither")
+    void should_flagBurst_when_eventIsBurst() throws Exception {
+        MimeMessage normal = new MimeMessage(Session.getInstance(new Properties()));
+        when(mailSender.createMimeMessage()).thenReturn(message, normal);
+        ContentReportEmailListener listener = new ContentReportEmailListener(supportInbox("support@beautica.test"),
+                emailService);
+
+        listener.onContentReportCreated(new ContentReportCreatedEvent(
+                UUID.randomUUID(), ReportTargetType.REVIEW, UUID.randomUUID(), ReportReason.SPAM, UUID.randomUUID(), true));
+        listener.onContentReportCreated(new ContentReportCreatedEvent(
+                UUID.randomUUID(), ReportTargetType.REVIEW, UUID.randomUUID(), ReportReason.SPAM, UUID.randomUUID(), false));
+
+        assertThat(message.getSubject()).isEqualTo("[BURST] [Beautica Report] REVIEW — SPAM");
+        assertThat(message.getContent().toString()).contains("Сплеск скарг");
+        assertThat(normal.getSubject()).isEqualTo("[Beautica Report] REVIEW — SPAM");
+        assertThat(normal.getContent().toString()).doesNotContain("Сплеск скарг");
+    }
+
+    @Test
+    @DisplayName("the template binds only the id/enum variables + the burst flag — no slot for review text or comment")
     void should_bindOnlyIdVariables_when_templateParsed() throws Exception {
         String template;
         try (InputStream in = getClass().getClassLoader().getResourceAsStream(TEMPLATE)) {
@@ -140,7 +160,7 @@ class ContentReportEmailTest {
         ContentReportEmailListener listener = new ContentReportEmailListener(supportInbox(""), email);
 
         listener.onContentReportCreated(new ContentReportCreatedEvent(UUID.randomUUID(),
-                ReportTargetType.SALON_PROFILE, UUID.randomUUID(), ReportReason.SPAM, UUID.randomUUID()));
+                ReportTargetType.SALON_PROFILE, UUID.randomUUID(), ReportReason.SPAM, UUID.randomUUID(), false));
 
         verifyNoInteractions(email);
         verify(mailSender, never()).send(any(MimeMessage.class));
@@ -162,7 +182,7 @@ class ContentReportEmailTest {
 
         try {
             assertThatCode(() -> listener.onContentReportCreated(new ContentReportCreatedEvent(reportId,
-                    ReportTargetType.REVIEW, UUID.randomUUID(), ReportReason.SPAM, UUID.randomUUID())))
+                    ReportTargetType.REVIEW, UUID.randomUUID(), ReportReason.SPAM, UUID.randomUUID(), false)))
                     .doesNotThrowAnyException();
         } finally {
             listenerLogger.detachAppender(appender);

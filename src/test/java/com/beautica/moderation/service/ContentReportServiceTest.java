@@ -66,6 +66,9 @@ class ContentReportServiceTest {
     private ReportTargetVisibilityResolver resolver;
 
     @Mock
+    private ReviewAutoHideService autoHide;
+
+    @Mock
     private ApplicationEventPublisher eventPublisher;
 
     private LoadingCache<String, Bucket> buckets;
@@ -75,7 +78,7 @@ class ContentReportServiceTest {
     @BeforeEach
     void setUp() {
         buckets = bucketsWithCapacity(20);
-        service = new ContentReportService(repository, resolver, eventPublisher, buckets, CLOCK);
+        service = new ContentReportService(repository, resolver, autoHide, eventPublisher, buckets, CLOCK);
     }
 
     // ── each target type: visible → created, invisible → 404 ─────────────────────
@@ -103,6 +106,62 @@ class ContentReportServiceTest {
         assertThat(event.getValue().targetType()).isEqualTo(type);
         assertThat(event.getValue().targetId()).isEqualTo(TARGET_ID);
         assertThat(event.getValue().reporterUserId()).isEqualTo(REPORTER_ID);
+    }
+
+    // ── phase 396: auto-hide hook + burst flag ──────────────────────────────────
+
+    @ParameterizedTest(name = "burst={0}")
+    @ValueSource(booleans = {false, true})
+    @DisplayName("new REVIEW report → auto-hide hook runs once; its burst answer is carried on the event")
+    void should_runAutoHideHook_and_carryBurstFlag_when_newReviewReport(boolean burst) {
+        CreateReportRequest request = new CreateReportRequest(ReportTargetType.REVIEW, TARGET_ID, ReportReason.SPAM, null);
+        stubNoExisting(ReportTargetType.REVIEW);
+        when(resolver.resolve(ReportTargetType.REVIEW, TARGET_ID, REPORTER_ID, Role.CLIENT))
+                .thenReturn(Optional.of(new ReportTargetVisibilityResolver.ReportTarget(false)));
+        when(repository.insertIgnoringDuplicate(any(), any(), anyString(), any(), anyString(), any(), any()))
+                .thenReturn(1);
+        when(autoHide.onReviewReported(TARGET_ID)).thenReturn(burst);
+
+        service.createReport(REPORTER_ID, Role.CLIENT, request);
+
+        verify(autoHide).onReviewReported(TARGET_ID);
+        ArgumentCaptor<ContentReportCreatedEvent> event = ArgumentCaptor.forClass(ContentReportCreatedEvent.class);
+        verify(eventPublisher).publishEvent(event.capture());
+        assertThat(event.getValue().burst()).isEqualTo(burst);
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @EnumSource(value = ReportTargetType.class, names = "REVIEW", mode = EnumSource.Mode.EXCLUDE)
+    @DisplayName("new non-REVIEW report → no auto-hide hook, event not a burst")
+    void should_skipAutoHideHook_when_targetNotReview(ReportTargetType type) {
+        CreateReportRequest request = new CreateReportRequest(type, TARGET_ID, ReportReason.SPAM, null);
+        stubNoExisting(type);
+        when(resolver.resolve(type, TARGET_ID, REPORTER_ID, Role.CLIENT))
+                .thenReturn(Optional.of(new ReportTargetVisibilityResolver.ReportTarget(false)));
+        when(repository.insertIgnoringDuplicate(any(), any(), anyString(), any(), anyString(), any(), any()))
+                .thenReturn(1);
+
+        service.createReport(REPORTER_ID, Role.CLIENT, request);
+
+        verifyNoInteractions(autoHide);
+        ArgumentCaptor<ContentReportCreatedEvent> event = ArgumentCaptor.forClass(ContentReportCreatedEvent.class);
+        verify(eventPublisher).publishEvent(event.capture());
+        assertThat(event.getValue().burst()).isFalse();
+    }
+
+    @Test
+    @DisplayName("idempotent repeat of a REVIEW report → no auto-hide hook (the report is not new)")
+    void should_skipAutoHideHook_when_reviewReportRepeated() {
+        ContentReport existing = BeanUtils.instantiateClass(ContentReport.class);
+        ReflectionTestUtils.setField(existing, "id", UUID.randomUUID());
+        ReflectionTestUtils.setField(existing, "status", ReportStatus.OPEN);
+        when(repository.findByReporterUserIdAndTargetTypeAndTargetId(REPORTER_ID, ReportTargetType.REVIEW, TARGET_ID))
+                .thenReturn(Optional.of(existing));
+
+        service.createReport(REPORTER_ID, Role.CLIENT,
+                new CreateReportRequest(ReportTargetType.REVIEW, TARGET_ID, ReportReason.SPAM, null));
+
+        verifyNoInteractions(autoHide, eventPublisher);
     }
 
     @ParameterizedTest(name = "{0}")
@@ -248,7 +307,7 @@ class ContentReportServiceTest {
     @Test
     @DisplayName("budget exhausted → 429 with a 24 h Retry-After, before any visibility lookup")
     void should_throwRateLimited_when_budgetExhausted() {
-        service = new ContentReportService(repository, resolver, eventPublisher, bucketsWithCapacity(0), CLOCK);
+        service = new ContentReportService(repository, resolver, autoHide, eventPublisher, bucketsWithCapacity(0), CLOCK);
         CreateReportRequest request =
                 new CreateReportRequest(ReportTargetType.REVIEW, TARGET_ID, ReportReason.SPAM, null);
         stubNoExisting(ReportTargetType.REVIEW);

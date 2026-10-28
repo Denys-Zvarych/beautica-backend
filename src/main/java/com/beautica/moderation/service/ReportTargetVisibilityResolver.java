@@ -10,6 +10,7 @@ import com.beautica.media.entity.MediaType;
 import com.beautica.media.repository.MediaRepository;
 import com.beautica.moderation.entity.ReportTargetType;
 import com.beautica.review.entity.ClientReview;
+import com.beautica.review.entity.ModerationStatus;
 import com.beautica.review.repository.ClientReviewRepository;
 import com.beautica.review.repository.ReviewRepository;
 import com.beautica.salon.entity.Salon;
@@ -31,7 +32,10 @@ import java.util.UUID;
  * <p>A target is reportable only when the reporter can read it today through an existing endpoint, mirroring
  * that endpoint's own gate (one method per {@link ReportTargetType}):
  * <ul>
- *   <li>{@code REVIEW} — {@code GET /reviews/{id}} is public: any existing review.</li>
+ *   <li>{@code REVIEW} — {@code GET /reviews/{id}} is public: any {@code VISIBLE} review. Phase 396: a hidden
+ *       ({@code HIDDEN_PENDING}) or {@code REMOVED} review is the same 404 as a missing one, exactly as
+ *       {@code GET /reviews/{id}} answers — it is no longer reportable (no existence oracle, no reopened case).
+ *       The same rule applies to {@code CLIENT_REVIEW}.</li>
  *   <li>{@code PORTFOLIO_PHOTO} — {@code GET /masters|salons/{id}/portfolio} is public: any {@code PORTFOLIO}
  *       media row ({@code AVATAR} rows are reported through the profile they belong to).</li>
  *   <li>{@code MASTER_PROFILE} — {@code GET /masters/{id}}: any master that is not detached.</li>
@@ -87,11 +91,13 @@ public class ReportTargetVisibilityResolver {
 
     private Optional<ReportTarget> resolveReview(UUID reviewId, UUID reporterId) {
         return reviewRepository.findById(reviewId)
+                .filter(review -> review.getModerationStatus() == ModerationStatus.VISIBLE)
                 .map(review -> new ReportTarget(isUser(review.getClient(), reporterId)));
     }
 
     private Optional<ReportTarget> resolveClientReview(UUID clientReviewId, UUID reporterId, Role reporterRole) {
-        Optional<ClientReview> found = clientReviewRepository.findById(clientReviewId);
+        Optional<ClientReview> found = clientReviewRepository.findById(clientReviewId)
+                .filter(review -> review.getModerationStatus() == ModerationStatus.VISIBLE);
         if (found.isEmpty()) {
             return Optional.empty();
         }

@@ -232,8 +232,11 @@ public class BookingService {
                 && canReview(booking.getStatus(), booking.getEndsAt(), now,
                         reviewByClient.isPresent(), hasClient);
         boolean providerCanReviewClient = computeProviderCanReviewClient(actorUserId, booking, now);
+        // Phase 396: a hidden / removed review comes back with a null body (it still blocks canReview above) and is
+        // omitted from the response rather than rendered as an empty review.
         BookingDetailResponse detail = enrichSingle(booking, canReview, providerCanReviewClient, now,
-                reviewByClient.map(BookingService::toClientAuthoredReview).orElse(null));
+                reviewByClient.filter(view -> view.rating() != null)
+                        .map(BookingService::toClientAuthoredReview).orElse(null));
         // Phase 386 D1/D2 (audience per the 2026-10-22 user rule) - the guest's phone, on THIS read only. The audience
         // is decided explicitly by ROLE: INDEPENDENT_MASTER, SALON_OWNER, SALON_ADMIN. A SALON_MASTER never sees it
         // (even as the performing master), nor does a CLIENT; the owning-client probe is kept as a second, independent

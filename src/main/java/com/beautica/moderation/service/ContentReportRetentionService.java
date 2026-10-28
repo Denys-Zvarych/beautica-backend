@@ -1,0 +1,97 @@
+package com.beautica.moderation.service;
+
+import com.beautica.moderation.config.ModerationProperties;
+import com.beautica.moderation.repository.ContentReportRepository;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.TransactionDefinition;
+import org.springframework.transaction.support.TransactionTemplate;
+
+import java.time.Instant;
+import java.time.ZoneOffset;
+import java.time.temporal.ChronoUnit;
+import java.util.List;
+import java.util.function.BiFunction;
+import java.util.function.IntUnaryOperator;
+
+/**
+ * Phase 396 D7 (locked 2026-10-28) — report retention: a report is kept while its target exists, plus one year.
+ * <ol>
+ *   <li>Every report whose target no longer exists gets {@code target_gone_at = now}; the OPEN ones are closed as
+ *       {@code TARGET_GONE}. One anti-join statement per target type ({@code ContentReportRepository#markGone*}), a
+ *       {@code REMOVED} review / client review counting as gone (D21).</li>
+ *   <li>Reports with {@code target_gone_at} more than one calendar year (UTC) before {@code now} are deleted.</li>
+ * </ol>
+ * Every statement is batched ({@code app.moderation.retention.batch-size} rows, at most {@code max-batches-per-run}
+ * batches per statement kind), each batch in its own {@code REQUIRES_NEW} transaction — the guest-PII retention
+ * pattern: a failure keeps the earlier batches, and no single statement holds row locks over the whole table.
+ * Reports on a live target are never purged, whatever their age. {@code now} is a parameter (the job passes the
+ * injected {@code Clock}'s instant) so tests pin it.
+ */
+@Service
+public class ContentReportRetentionService {
+
+    private static final Logger log = LoggerFactory.getLogger(ContentReportRetentionService.class);
+
+    /** D7: one year after the target is gone. */
+    static final int RETENTION_YEARS = 1;
+
+    private final ContentReportRepository contentReportRepository;
+    private final ModerationProperties.Retention retention;
+    private final TransactionTemplate batchTx;
+
+    /** Outcome of one sweep. */
+    public record SweepResult(int markedGone, int purged) {}
+
+    public ContentReportRetentionService(ContentReportRepository contentReportRepository,
+                                         ModerationProperties properties,
+                                         PlatformTransactionManager transactionManager) {
+        this.contentReportRepository = contentReportRepository;
+        this.retention = properties.retention();
+        this.batchTx = new TransactionTemplate(transactionManager);
+        this.batchTx.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+    }
+
+    public SweepResult sweep(Instant now) {
+        Instant stamp = now.truncatedTo(ChronoUnit.MICROS);
+        int markedGone = 0;
+        for (BiFunction<Instant, Integer, Integer> markGone : markGoneStatements()) {
+            markedGone += inBatches(batch -> markGone.apply(stamp, batch));
+        }
+        Instant cutoff = cutoff(stamp);
+        int purged = inBatches(batch -> contentReportRepository.deleteGoneBefore(cutoff, batch));
+        log.info("Content report retention: {} reports marked target-gone, {} purged", markedGone, purged);
+        return new SweepResult(markedGone, purged);
+    }
+
+    private List<BiFunction<Instant, Integer, Integer>> markGoneStatements() {
+        return List.of(
+                contentReportRepository::markGoneReviewTargets,
+                contentReportRepository::markGoneClientReviewTargets,
+                contentReportRepository::markGonePortfolioPhotoTargets,
+                contentReportRepository::markGoneMasterProfileTargets,
+                contentReportRepository::markGoneSalonProfileTargets,
+                contentReportRepository::markGoneClientProfileTargets);
+    }
+
+    /** Runs one batched statement until a batch comes back short or the per-run budget is spent; returns the total. */
+    private int inBatches(IntUnaryOperator statement) {
+        int batchSize = retention.batchSize();
+        int total = 0;
+        for (int batch = 0; batch < retention.maxBatchesPerRun(); batch++) {
+            Integer affected = batchTx.execute(status -> statement.applyAsInt(batchSize));
+            int count = affected == null ? 0 : affected;
+            total += count;
+            if (count < batchSize) {
+                break;
+            }
+        }
+        return total;
+    }
+
+    static Instant cutoff(Instant now) {
+        return now.atOffset(ZoneOffset.UTC).minusYears(RETENTION_YEARS).toInstant();
+    }
+}

@@ -233,8 +233,16 @@ public class ReviewService {
         );
     }
 
-    // Reviews are immutable after creation — no @CacheEvict path needed.
-    @Cacheable(value = "review-detail", key = "#reviewId")
+    // Phase 396: a review's content is immutable, but its moderation_status is not. Only VISIBLE reviews load here
+    // (a hidden/removed one is the same 404 as an unknown id), and every moderation transition evicts this key
+    // after commit (ReviewEventListener#onReviewModerationChanged). A 404 is never cached (exception).
+    //
+    // sync = true closes the load/evict race (audit-fix D22): without it a reader that loaded the row just BEFORE a
+    // hide committed could put its VISIBLE copy AFTER the listener's evict, pinning a hidden review for the full TTL.
+    // With sync the load runs inside Caffeine's per-key compute, and Caffeine's invalidate of a key whose compute is
+    // in flight blocks until that compute finishes and then removes the result — so the evict always lands after
+    // any in-flight load. It also coalesces concurrent misses on a hot public key (§F-7).
+    @Cacheable(value = "review-detail", key = "#reviewId", sync = true)
     @Transactional(readOnly = true)
     public ReviewResponse getReview(UUID reviewId) {
         Review review = reviewRepository.findByIdWithAssociations(reviewId)

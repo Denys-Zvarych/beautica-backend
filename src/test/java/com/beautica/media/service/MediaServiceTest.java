@@ -901,6 +901,35 @@ class MediaServiceTest {
     }
 
     @Test
+    @DisplayName("phase 396: moderation delete of a SALON portfolio row → row deleted, own-root blob purged, true")
+    void should_deleteRowAndBlob_when_moderationDeletesPortfolioPhoto() {
+        UUID mediaId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        String ownKey = "portfolio/salons/" + salonId + "/z.jpg";
+        MediaFile row = portfolioRow(mediaId, UUID.randomUUID(), EntityType.SALON, salonId, ownKey);
+        when(mediaRepo.findById(mediaId)).thenReturn(Optional.of(row));
+
+        boolean deleted = service.deletePortfolioPhotoForModeration(mediaId);
+
+        assertThat(deleted).isTrue();
+        verify(mediaRepo).delete(row);
+        verify(r2).deleteFiles(List.of(ownKey));
+    }
+
+    @Test
+    @DisplayName("phase 396: moderation delete of a missing row → false, nothing deleted")
+    void should_returnFalse_when_moderationDeleteFindsNoPortfolioRow() {
+        UUID mediaId = UUID.randomUUID();
+        when(mediaRepo.findById(mediaId)).thenReturn(Optional.empty());
+
+        boolean deleted = service.deletePortfolioPhotoForModeration(mediaId);
+
+        assertThat(deleted).isFalse();
+        verify(mediaRepo, never()).delete(any(MediaFile.class));
+        verifyNoStorageWrites();
+    }
+
+    @Test
     @DisplayName("H3: master delete loads the row with ONE scoped query — no findById, no master-id lookup")
     void should_loadRowWithSingleScopedQuery_when_masterDeletesPortfolioPhoto() {
         UUID actorId = UUID.randomUUID();

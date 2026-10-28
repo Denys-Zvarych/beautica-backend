@@ -9,6 +9,7 @@ import com.beautica.review.service.RatingRecalculationService;
 import com.beautica.review.service.ReviewService;
 import com.beautica.booking.repository.BookingRepository;
 import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -23,21 +24,26 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.cache.CacheManager;
+import org.springframework.cache.caffeine.CaffeineCache;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.transaction.UnexpectedRollbackException;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionSynchronizationUtils;
 
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatNoException;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 @DisplayName("ReviewEventListener — unit")
 @ExtendWith(MockitoExtension.class)
@@ -134,6 +140,33 @@ class ReviewEventListenerTest {
                 .noneMatch(e -> e.getLevel() == Level.ERROR);
     }
 
+    // ── phase 396: moderation transition — same recalculation, plus the review-detail key ─────
+
+    @Test
+    @DisplayName("should_recalculateBothRatings_and_evictOnlyThatReviewDetail_when_moderationChanged")
+    void should_recalculateBothRatings_and_evictOnlyThatReviewDetail_when_moderationChanged() {
+        UUID reviewId = UUID.randomUUID();
+        UUID otherReviewId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        Map<String, org.springframework.cache.Cache> caches = new HashMap<>();
+        when(cacheManager.getCache(anyString())).thenAnswer(inv ->
+                caches.computeIfAbsent(inv.getArgument(0), name -> new CaffeineCache(
+                        name, Caffeine.newBuilder().build())));
+        cacheManager.getCache("review-detail").put(reviewId, "cached");
+        cacheManager.getCache("review-detail").put(otherReviewId, "other");
+
+        reviewEventListener.onReviewModerationChanged(
+                new ReviewModerationChangedEvent(reviewId, masterId, UUID.randomUUID(), salonId));
+        TransactionSynchronizationUtils.invokeAfterCompletion(
+                TransactionSynchronizationManager.getSynchronizations(), TransactionSynchronization.STATUS_COMMITTED);
+
+        verify(ratingRecalculationService).recalculateMasterRating(masterId);
+        verify(ratingRecalculationService).recalculateSalonRating(salonId);
+        assertThat(caches.get("review-detail").get(reviewId)).as("moderated review evicted").isNull();
+        assertThat(caches.get("review-detail").get(otherReviewId)).as("other reviews untouched").isNotNull();
+    }
+
     // ── phase 380 audit: booking-slug-info is evicted AFTER the review pages ───────────────────
 
     @Test
@@ -141,7 +174,7 @@ class ReviewEventListenerTest {
     void should_evictSlugInfoAfterReviewPages_when_reviewCreated() {
         UUID masterId = UUID.randomUUID();
         com.github.benmanes.caffeine.cache.Cache<Object, Object> reviewPages =
-                com.github.benmanes.caffeine.cache.Caffeine.newBuilder().build();
+                Caffeine.newBuilder().build();
         reviewPages.put("master:" + masterId + ":sort:NEWEST:page:0:size:5", "stale-reviews");
         org.springframework.cache.Cache springCache = org.mockito.Mockito.mock(org.springframework.cache.Cache.class);
         org.mockito.Mockito.when(springCache.getNativeCache()).thenReturn(reviewPages);

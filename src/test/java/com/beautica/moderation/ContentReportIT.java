@@ -1,23 +1,15 @@
 package com.beautica.moderation;
 
-import com.beautica.AbstractIntegrationTest;
 import com.beautica.auth.Role;
-import com.beautica.auth.dto.AuthResponse;
-import com.beautica.auth.dto.LoginRequest;
-import com.beautica.common.ApiResponse;
 import com.beautica.config.TestSecurityConfig;
 import com.beautica.moderation.dto.CreateReportRequest;
 import com.beautica.moderation.entity.ReportReason;
 import com.beautica.moderation.entity.ReportTargetType;
 import com.beautica.moderation.service.ContentReportService;
-import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
@@ -25,12 +17,12 @@ import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
-import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.test.context.TestPropertySource;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
@@ -59,21 +51,9 @@ import static org.mockito.Mockito.verify;
 @Import(TestSecurityConfig.class)
 @TestPropertySource(properties = "app.support.email=" + ContentReportIT.SUPPORT_EMAIL)
 @DisplayName("POST /api/v1/reports — content report intake (phase 395)")
-class ContentReportIT extends AbstractIntegrationTest {
+class ContentReportIT extends AbstractModerationIT {
 
     static final String SUPPORT_EMAIL = "moderation@beautica.test";
-
-    private static final String URL = "/api/v1/reports";
-    private static final String TEST_PASSWORD = "Str0ngP@ss1!";
-
-    @Autowired
-    private TestRestTemplate restTemplate;
-
-    @Autowired
-    private ObjectMapper objectMapper;
-
-    @Autowired
-    private PasswordEncoder passwordEncoder;
 
     @Autowired
     private ContentReportService contentReportService;
@@ -92,8 +72,8 @@ class ContentReportIT extends AbstractIntegrationTest {
         String token = tokenFor(reporterEmail);
         String body = reportBody("REVIEW", reviewId, "OFFENSIVE", "SECRET-COMMENT-TEXT");
 
-        ResponseEntity<String> first = post(token, body);
-        ResponseEntity<String> repeat = post(token, body);
+        ResponseEntity<String> first = postReport(token, body);
+        ResponseEntity<String> repeat = postReport(token, body);
 
         assertThat(first.getStatusCode()).as("first report — body: %s", first.getBody()).isEqualTo(HttpStatus.CREATED);
         assertThat(repeat.getStatusCode()).as("repeat — body: %s", repeat.getBody()).isEqualTo(HttpStatus.OK);
@@ -129,7 +109,7 @@ class ContentReportIT extends AbstractIntegrationTest {
             for (int i = 0; i < threads; i++) {
                 futures.add(pool.submit(() -> {
                     start.await();
-                    return post(token, body);
+                    return postReport(token, body);
                 }));
             }
             start.countDown();
@@ -159,8 +139,8 @@ class ContentReportIT extends AbstractIntegrationTest {
         UUID strangerClientId = createUser(unique("stranger"), "CLIENT", null);
         String ownerToken = tokenFor(salon.ownerEmail());
 
-        ResponseEntity<String> invisible = post(ownerToken, reportBody("CLIENT_PROFILE", strangerClientId, "SPAM", null));
-        ResponseEntity<String> missing = post(ownerToken, reportBody("CLIENT_PROFILE", UUID.randomUUID(), "SPAM", null));
+        ResponseEntity<String> invisible = postReport(ownerToken, reportBody("CLIENT_PROFILE", strangerClientId, "SPAM", null));
+        ResponseEntity<String> missing = postReport(ownerToken, reportBody("CLIENT_PROFILE", UUID.randomUUID(), "SPAM", null));
 
         assertThat(invisible.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
         assertThat(missing.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
@@ -181,8 +161,8 @@ class ContentReportIT extends AbstractIntegrationTest {
         IndependentMaster otherProvider = createIndependentMaster(otherProviderEmail);
         insertIndependentBooking(clientId, otherProvider.masterId());
 
-        ResponseEntity<String> profile = post(masterToken, reportBody("CLIENT_PROFILE", clientId, "HARASSMENT", null));
-        ResponseEntity<String> clientReview = post(tokenFor(otherProviderEmail),
+        ResponseEntity<String> profile = postReport(masterToken, reportBody("CLIENT_PROFILE", clientId, "HARASSMENT", null));
+        ResponseEntity<String> clientReview = postReport(tokenFor(otherProviderEmail),
                 reportBody("CLIENT_REVIEW", clientReviewId, "FALSE_INFO", null));
 
         assertThat(profile.getStatusCode()).as("body: %s", profile.getBody()).isEqualTo(HttpStatus.CREATED);
@@ -199,9 +179,9 @@ class ContentReportIT extends AbstractIntegrationTest {
         String adminEmail = unique("admin");
         createUser(adminEmail, "SALON_ADMIN", salon.salonId());
 
-        ResponseEntity<String> byOwner = post(tokenFor(salon.ownerEmail()),
+        ResponseEntity<String> byOwner = postReport(tokenFor(salon.ownerEmail()),
                 reportBody("CLIENT_REVIEW", clientReviewId, "FALSE_INFO", null));
-        ResponseEntity<String> byAdmin = post(tokenFor(adminEmail),
+        ResponseEntity<String> byAdmin = postReport(tokenFor(adminEmail),
                 reportBody("CLIENT_REVIEW", clientReviewId, "FALSE_INFO", null));
 
         assertThat(byOwner.getStatusCode()).as("body: %s", byOwner.getBody()).isEqualTo(HttpStatus.BAD_REQUEST);
@@ -219,8 +199,8 @@ class ContentReportIT extends AbstractIntegrationTest {
         createUser(clientEmail, "CLIENT", null);
         String token = tokenFor(clientEmail);
 
-        ResponseEntity<String> profile = post(token, reportBody("MASTER_PROFILE", salon.masterId(), "FALSE_INFO", null));
-        ResponseEntity<String> photo = post(token, reportBody("PORTFOLIO_PHOTO", photoId, "SEXUAL_CONTENT", null));
+        ResponseEntity<String> profile = postReport(token, reportBody("MASTER_PROFILE", salon.masterId(), "FALSE_INFO", null));
+        ResponseEntity<String> photo = postReport(token, reportBody("PORTFOLIO_PHOTO", photoId, "SEXUAL_CONTENT", null));
 
         assertThat(profile.getStatusCode()).as("body: %s", profile.getBody()).isEqualTo(HttpStatus.CREATED);
         assertThat(photo.getStatusCode()).as("body: %s", photo.getBody()).isEqualTo(HttpStatus.CREATED);
@@ -234,7 +214,7 @@ class ContentReportIT extends AbstractIntegrationTest {
         UUID clientId = createUser(clientEmail, "CLIENT", null);
         UUID reviewId = insertReview(clientId, salon, "Мій відгук");
 
-        ResponseEntity<String> resp = post(tokenFor(clientEmail), reportBody("REVIEW", reviewId, "SPAM", null));
+        ResponseEntity<String> resp = postReport(tokenFor(clientEmail), reportBody("REVIEW", reviewId, "SPAM", null));
 
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
         assertThat(countReports(clientId)).isZero();
@@ -248,7 +228,7 @@ class ContentReportIT extends AbstractIntegrationTest {
         String clientEmail = unique("other");
         UUID clientId = createUser(clientEmail, "CLIENT", null);
 
-        ResponseEntity<String> resp = post(tokenFor(clientEmail), reportBody("SALON_PROFILE", salon.salonId(), "OTHER", " "));
+        ResponseEntity<String> resp = postReport(tokenFor(clientEmail), reportBody("SALON_PROFILE", salon.salonId(), "OTHER", " "));
 
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
         assertThat(countReports(clientId)).isZero();
@@ -260,7 +240,7 @@ class ContentReportIT extends AbstractIntegrationTest {
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
 
-        ResponseEntity<String> resp = restTemplate.exchange(URL, HttpMethod.POST,
+        ResponseEntity<String> resp = restTemplate.exchange(REPORTS_URL, HttpMethod.POST,
                 new HttpEntity<>(reportBody("SALON_PROFILE", UUID.randomUUID(), "SPAM", null), headers), String.class);
 
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
@@ -284,7 +264,7 @@ class ContentReportIT extends AbstractIntegrationTest {
 
         List<Integer> statuses = new ArrayList<>();
         for (String token : reporterTokens) {
-            statuses.add(post(token, reportBody("REVIEW", reviewId, "OFFENSIVE", null)).getStatusCode().value());
+            statuses.add(postReport(token, reportBody("REVIEW", reviewId, "OFFENSIVE", null)).getStatusCode().value());
         }
 
         assertThat(statuses).as("INDEPENDENT_MASTER, SALON_ADMIN, SALON_MASTER, SALON_OWNER")
@@ -306,11 +286,11 @@ class ContentReportIT extends AbstractIntegrationTest {
         String indepEmail = unique("indep");
         createIndependentMaster(indepEmail);
 
-        ResponseEntity<String> byClient = post(tokenFor(clientEmail),
+        ResponseEntity<String> byClient = postReport(tokenFor(clientEmail),
                 reportBody("PORTFOLIO_PHOTO", photoId, "SEXUAL_CONTENT", null));
-        ResponseEntity<String> bySalonMaster = post(tokenFor(salon.masterEmail()),
+        ResponseEntity<String> bySalonMaster = postReport(tokenFor(salon.masterEmail()),
                 reportBody("PORTFOLIO_PHOTO", photoId, "OFFENSIVE", null));
-        ResponseEntity<String> byIndep = post(tokenFor(indepEmail),
+        ResponseEntity<String> byIndep = postReport(tokenFor(indepEmail),
                 reportBody("PORTFOLIO_PHOTO", photoId, "SPAM", null));
 
         assertThat(byClient.getStatusCode()).as("CLIENT — body: %s", byClient.getBody()).isEqualTo(HttpStatus.CREATED);
@@ -330,9 +310,9 @@ class ContentReportIT extends AbstractIntegrationTest {
         String adminEmail = unique("admin");
         createUser(adminEmail, "SALON_ADMIN", salon.salonId());
 
-        ResponseEntity<String> byOwner = post(tokenFor(salon.ownerEmail()),
+        ResponseEntity<String> byOwner = postReport(tokenFor(salon.ownerEmail()),
                 reportBody("PORTFOLIO_PHOTO", photoId, "SPAM", null));
-        ResponseEntity<String> byAdmin = post(tokenFor(adminEmail),
+        ResponseEntity<String> byAdmin = postReport(tokenFor(adminEmail),
                 reportBody("PORTFOLIO_PHOTO", photoId, "SPAM", null));
 
         assertThat(byOwner.getStatusCode()).as("owner — body: %s", byOwner.getBody()).isEqualTo(HttpStatus.BAD_REQUEST);
@@ -354,11 +334,11 @@ class ContentReportIT extends AbstractIntegrationTest {
         createUser(adminEmail, "SALON_ADMIN", salon.salonId());
         String body = reportBody("SALON_PROFILE", salon.salonId(), "FALSE_INFO", null);
 
-        ResponseEntity<String> byOwnMaster = post(tokenFor(salon.masterEmail()), body);
-        ResponseEntity<String> byIndep = post(tokenFor(indepEmail), body);
-        ResponseEntity<String> byOtherOwner = post(tokenFor(otherSalon.ownerEmail()), body);
-        ResponseEntity<String> byOwner = post(tokenFor(salon.ownerEmail()), body);
-        ResponseEntity<String> byAdmin = post(tokenFor(adminEmail), body);
+        ResponseEntity<String> byOwnMaster = postReport(tokenFor(salon.masterEmail()), body);
+        ResponseEntity<String> byIndep = postReport(tokenFor(indepEmail), body);
+        ResponseEntity<String> byOtherOwner = postReport(tokenFor(otherSalon.ownerEmail()), body);
+        ResponseEntity<String> byOwner = postReport(tokenFor(salon.ownerEmail()), body);
+        ResponseEntity<String> byAdmin = postReport(tokenFor(adminEmail), body);
 
         assertThat(byOwnMaster.getStatusCode()).as("salon's SALON_MASTER").isEqualTo(HttpStatus.CREATED);
         assertThat(byIndep.getStatusCode()).as("INDEPENDENT_MASTER").isEqualTo(HttpStatus.CREATED);
@@ -377,8 +357,8 @@ class ContentReportIT extends AbstractIntegrationTest {
         createUser(clientEmail, "CLIENT", null);
         String token = tokenFor(clientEmail);
 
-        ResponseEntity<String> inactive = post(token, reportBody("SALON_PROFILE", salon.salonId(), "SPAM", null));
-        ResponseEntity<String> missing = post(token, reportBody("SALON_PROFILE", UUID.randomUUID(), "SPAM", null));
+        ResponseEntity<String> inactive = postReport(token, reportBody("SALON_PROFILE", salon.salonId(), "SPAM", null));
+        ResponseEntity<String> missing = postReport(token, reportBody("SALON_PROFILE", UUID.randomUUID(), "SPAM", null));
 
         assertThat(inactive.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
         assertThat(withoutRequestId(inactive)).isEqualTo(withoutRequestId(missing));
@@ -393,9 +373,9 @@ class ContentReportIT extends AbstractIntegrationTest {
         String indepEmail = unique("indep");
         UUID indepMasterId = createIndependentMaster(indepEmail).masterId();
 
-        ResponseEntity<String> byColleague = post(tokenFor(salon.masterEmail()),
+        ResponseEntity<String> byColleague = postReport(tokenFor(salon.masterEmail()),
                 reportBody("MASTER_PROFILE", indepMasterId, "FALSE_INFO", null));
-        ResponseEntity<String> bySelf = post(tokenFor(indepEmail),
+        ResponseEntity<String> bySelf = postReport(tokenFor(indepEmail),
                 reportBody("MASTER_PROFILE", indepMasterId, "FALSE_INFO", null));
 
         assertThat(byColleague.getStatusCode()).as("body: %s", byColleague.getBody()).isEqualTo(HttpStatus.CREATED);
@@ -415,8 +395,8 @@ class ContentReportIT extends AbstractIntegrationTest {
         createUser(clientEmail, "CLIENT", null);
         String token = tokenFor(clientEmail);
 
-        ResponseEntity<String> detached = post(token, reportBody("MASTER_PROFILE", salon.masterId(), "SPAM", null));
-        ResponseEntity<String> missing = post(token, reportBody("MASTER_PROFILE", UUID.randomUUID(), "SPAM", null));
+        ResponseEntity<String> detached = postReport(token, reportBody("MASTER_PROFILE", salon.masterId(), "SPAM", null));
+        ResponseEntity<String> missing = postReport(token, reportBody("MASTER_PROFILE", UUID.randomUUID(), "SPAM", null));
 
         assertThat(detached.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
         assertThat(withoutRequestId(detached)).isEqualTo(withoutRequestId(missing));
@@ -436,9 +416,9 @@ class ContentReportIT extends AbstractIntegrationTest {
         String adminEmail = unique("admin");
         createUser(adminEmail, "SALON_ADMIN", salon.salonId());
 
-        ResponseEntity<String> byIndep = post(tokenFor(indepEmail),
+        ResponseEntity<String> byIndep = postReport(tokenFor(indepEmail),
                 reportBody("CLIENT_PROFILE", otherClientId, "HARASSMENT", null));
-        ResponseEntity<String> byAdmin = post(tokenFor(adminEmail),
+        ResponseEntity<String> byAdmin = postReport(tokenFor(adminEmail),
                 reportBody("CLIENT_PROFILE", clientId, "HARASSMENT", null));
 
         assertThat(byIndep.getStatusCode()).as("indep — body: %s", byIndep.getBody()).isEqualTo(HttpStatus.CREATED);
@@ -461,13 +441,13 @@ class ContentReportIT extends AbstractIntegrationTest {
         String otherClientEmail = unique("client2");
         createUser(otherClientEmail, "CLIENT", null);
         String body = reportBody("CLIENT_PROFILE", clientId, "SPAM", null);
-        ResponseEntity<String> missing = post(tokenFor(indepEmail),
+        ResponseEntity<String> missing = postReport(tokenFor(indepEmail),
                 reportBody("CLIENT_PROFILE", UUID.randomUUID(), "SPAM", null));
 
-        ResponseEntity<String> byForeignAdmin = post(tokenFor(foreignAdminEmail), body);
-        ResponseEntity<String> byIndep = post(tokenFor(indepEmail), body);
-        ResponseEntity<String> byOtherClient = post(tokenFor(otherClientEmail), body);
-        ResponseEntity<String> bySelf = post(tokenFor(clientEmail), body);
+        ResponseEntity<String> byForeignAdmin = postReport(tokenFor(foreignAdminEmail), body);
+        ResponseEntity<String> byIndep = postReport(tokenFor(indepEmail), body);
+        ResponseEntity<String> byOtherClient = postReport(tokenFor(otherClientEmail), body);
+        ResponseEntity<String> bySelf = postReport(tokenFor(clientEmail), body);
 
         assertThat(withoutRequestId(byForeignAdmin)).as("another salon's admin").isEqualTo(withoutRequestId(missing));
         assertThat(withoutRequestId(byIndep)).as("INDEPENDENT_MASTER, no booking").isEqualTo(withoutRequestId(missing));
@@ -496,10 +476,10 @@ class ContentReportIT extends AbstractIntegrationTest {
                 UUID.randomUUID(), colleagueUserId, salon.salonId());
         String body = reportBody("CLIENT_REVIEW", clientReviewId, "FALSE_INFO", null);
 
-        ResponseEntity<String> byIndep = post(tokenFor(indepEmail), body);
-        ResponseEntity<String> bySubject = post(tokenFor(clientEmail), body);
-        ResponseEntity<String> byColleague = post(tokenFor(colleagueEmail), body);
-        ResponseEntity<String> byAuthor = post(tokenFor(salon.masterEmail()), body);
+        ResponseEntity<String> byIndep = postReport(tokenFor(indepEmail), body);
+        ResponseEntity<String> bySubject = postReport(tokenFor(clientEmail), body);
+        ResponseEntity<String> byColleague = postReport(tokenFor(colleagueEmail), body);
+        ResponseEntity<String> byAuthor = postReport(tokenFor(salon.masterEmail()), body);
 
         assertThat(byIndep.getStatusCode()).as("indep — body: %s", byIndep.getBody()).isEqualTo(HttpStatus.CREATED);
         assertThat(bySubject.getStatusCode()).as("reviewed client").isEqualTo(HttpStatus.NOT_FOUND);
@@ -525,12 +505,12 @@ class ContentReportIT extends AbstractIntegrationTest {
             salonIds.add(insertSalon(ownerId));
         }
         for (int i = 0; i < 20; i++) {
-            post(floodToken, reportBody("SALON_PROFILE", salonIds.get(i), "SPAM", null));
+            postReport(floodToken, reportBody("SALON_PROFILE", salonIds.get(i), "SPAM", null));
         }
 
-        ResponseEntity<String> over = post(floodToken, reportBody("SALON_PROFILE", salonIds.get(20), "SPAM", null));
-        ResponseEntity<String> repeat = post(floodToken, reportBody("SALON_PROFILE", salonIds.get(0), "SPAM", null));
-        ResponseEntity<String> bystander = post(tokenFor(bystanderEmail),
+        ResponseEntity<String> over = postReport(floodToken, reportBody("SALON_PROFILE", salonIds.get(20), "SPAM", null));
+        ResponseEntity<String> repeat = postReport(floodToken, reportBody("SALON_PROFILE", salonIds.get(0), "SPAM", null));
+        ResponseEntity<String> bystander = postReport(tokenFor(bystanderEmail),
                 reportBody("SALON_PROFILE", salonIds.get(20), "SPAM", null));
 
         assertThat(over.getStatusCode()).isEqualTo(HttpStatus.TOO_MANY_REQUESTS);
@@ -566,7 +546,7 @@ class ContentReportIT extends AbstractIntegrationTest {
             return null;
         }).when(emailService).sendContentReportEmail(anyString(), any(), anyString(), any(), anyString(), any());
 
-        ResponseEntity<String> resp = post(tokenFor(clientEmail), reportBody("SALON_PROFILE", salon.salonId(), "SPAM", null));
+        ResponseEntity<String> resp = postReport(tokenFor(clientEmail), reportBody("SALON_PROFILE", salon.salonId(), "SPAM", null));
 
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.CREATED);
         assertThat(committedRowsAtSend.get())
@@ -593,193 +573,258 @@ class ContentReportIT extends AbstractIntegrationTest {
         verify(emailService, never()).sendContentReportEmail(anyString(), any(), anyString(), any(), anyString(), any());
     }
 
-    // ── HTTP helpers ─────────────────────────────────────────────────────────────
+    // ── phase 396: auto-hide (D2), hidden-review 404 (395 audit input 5), reporter SET NULL (input 1) ──
 
-    private ResponseEntity<String> post(String token, String body) {
-        HttpHeaders headers = new HttpHeaders();
-        headers.setBearerAuth(token);
-        headers.setContentType(MediaType.APPLICATION_JSON);
-        return restTemplate.exchange(URL, HttpMethod.POST, new HttpEntity<>(body, headers), String.class);
+    @Test
+    @DisplayName("3 distinct eligible CLIENT reporters (COMPLETED booking at the salon) → review HIDDEN_PENDING")
+    void should_autoHideReview_when_threeEligibleClientsReport() throws Exception {
+        SalonFixture salon = createSalon();
+        UUID reviewId = insertReview(createUser(unique("author"), "CLIENT", null), salon, "Погано");
+        List<EligibleClient> reporters = List.of(eligibleClient(salon), eligibleClient(salon), eligibleClient(salon));
+
+        reportReview(reporters.get(0).email(), reviewId);
+        reportReview(reporters.get(1).email(), reviewId);
+        String afterTwo = moderationStatus(reviewId);
+        ResponseEntity<String> third = reportReview(reporters.get(2).email(), reviewId);
+
+        assertThat(third.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        assertThat(afterTwo).as("2 < threshold 3").isEqualTo("VISIBLE");
+        assertThat(moderationStatus(reviewId)).isEqualTo("HIDDEN_PENDING");
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM content_reports WHERE target_id = ? AND status = 'OPEN'", Integer.class, reviewId))
+                .as("auto-hide leaves the reports OPEN for support").isEqualTo(3);
     }
 
-    private String tokenFor(String email) throws Exception {
-        ResponseEntity<String> resp = restTemplate.postForEntity(
-                "/api/v1/auth/login", new LoginRequest(email, TEST_PASSWORD), String.class);
-        assertThat(resp.getStatusCode()).as("login must succeed for %s", email).isEqualTo(HttpStatus.OK);
-        return objectMapper.readValue(resp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {})
-                .data().accessToken();
-    }
+    @Test
+    @DisplayName("staff of the provider, other providers, a client without a booking and a client whose booking is not "
+            + "COMPLETED never count: 2 eligible + 5 ineligible reporters → review stays VISIBLE")
+    void should_notAutoHide_when_onlyTwoReportersEligible() throws Exception {
+        SalonFixture salon = createSalon();
+        UUID reviewId = insertReview(createUser(unique("author"), "CLIENT", null), salon, "Погано");
+        String adminEmail = unique("admin");
+        createUser(adminEmail, "SALON_ADMIN", salon.salonId());
+        String strangerEmail = unique("stranger");
+        createUser(strangerEmail, "CLIENT", null);
+        String upcomingEmail = unique("upcoming");
+        insertBooking(createUser(upcomingEmail, "CLIENT", null), salon, "CONFIRMED");
+        String indepEmail = unique("indep");
+        createIndependentMaster(indepEmail);
+        List<String> ineligible = List.of(salon.masterEmail(), adminEmail, strangerEmail, upcomingEmail, indepEmail);
 
-    private JsonNode data(ResponseEntity<String> resp) {
-        try {
-            return objectMapper.readTree(resp.getBody()).path("data");
-        } catch (Exception e) {
-            throw new IllegalStateException(e);
+        reportReview(eligibleClient(salon).email(), reviewId);
+        reportReview(eligibleClient(salon).email(), reviewId);
+        List<Integer> statuses = new ArrayList<>();
+        for (String email : ineligible) {
+            statuses.add(reportReview(email, reviewId).getStatusCode().value());
         }
+
+        assertThat(statuses).as("every ineligible report is still accepted").containsOnly(201);
+        assertThat(countReportsOnTarget("REVIEW", reviewId)).isEqualTo(7);
+        assertThat(moderationStatus(reviewId)).isEqualTo("VISIBLE");
     }
 
-    private JsonNode withoutRequestId(ResponseEntity<String> resp) throws Exception {
-        ObjectNode node = (ObjectNode) objectMapper.readTree(resp.getBody());
-        node.remove("requestId");
-        return node;
-    }
-
-    private String reportBody(String targetType, UUID targetId, String reason, String comment) {
-        ObjectNode node = objectMapper.createObjectNode()
-                .put("targetType", targetType)
-                .put("targetId", targetId.toString())
-                .put("reason", reason);
-        if (comment != null) {
-            node.put("comment", comment);
+    @Test
+    @DisplayName("a hidden review: GET /reviews/{id} and POST /reports both answer 404 byte-identical to an unknown id")
+    void should_return404IdenticalToUnknown_when_reviewHidden() throws Exception {
+        SalonFixture salon = createSalon();
+        UUID reviewId = insertReview(createUser(unique("author"), "CLIENT", null), salon, "Погано");
+        UUID unknownId = UUID.randomUUID();
+        ResponseEntity<String> visible = getAnonymous("/api/v1/reviews/" + reviewId);
+        for (int i = 0; i < 3; i++) {
+            reportReview(eligibleClient(salon).email(), reviewId);
         }
-        return node.toString();
+        String latecomer = eligibleClient(salon).email();
+
+        ResponseEntity<String> hiddenGet = getAnonymous("/api/v1/reviews/" + reviewId);
+        ResponseEntity<String> unknownGet = getAnonymous("/api/v1/reviews/" + unknownId);
+        ResponseEntity<String> hiddenReport = reportReview(latecomer, reviewId);
+        ResponseEntity<String> unknownReport = reportReview(latecomer, unknownId);
+
+        assertThat(visible.getStatusCode()).as("precondition: served (and cached) while visible").isEqualTo(HttpStatus.OK);
+        assertThat(moderationStatus(reviewId)).isEqualTo("HIDDEN_PENDING");
+        assertThat(hiddenGet.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(withoutRequestId(hiddenGet)).isEqualTo(withoutRequestId(unknownGet));
+        assertThat(hiddenReport.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(withoutRequestId(hiddenReport)).isEqualTo(withoutRequestId(unknownReport));
+        assertThat(countReportsOnTarget("REVIEW", reviewId)).isEqualTo(3);
     }
 
-    private int countReports(UUID reporterId) {
-        return jdbcTemplate.queryForObject(
-                "SELECT COUNT(*) FROM content_reports WHERE reporter_user_id = ?", Integer.class, reporterId);
+    @Test
+    @DisplayName("burst guard: the 5th OPEN report on one provider's reviews within 10 min holds all 5, sends a "
+            + "[BURST] e-mail, and held reports never hide a review")
+    void should_holdReportsAndFlagEmail_when_burstOnProvider() throws Exception {
+        SalonFixture salon = createSalon();
+        List<UUID> reviewIds = new ArrayList<>();
+        for (int i = 0; i < 4; i++) {
+            reviewIds.add(insertReview(createUser(unique("author"), "CLIENT", null), salon, "Відгук " + i));
+        }
+        UUID target = reviewIds.get(0);
+        for (UUID reviewId : reviewIds) {
+            reportReview(eligibleClient(salon).email(), reviewId);
+        }
+        verify(emailService, never()).sendContentReportBurstEmail(anyString(), any(), anyString(), any(), anyString(), any());
+
+        reportReview(eligibleClient(salon).email(), target);
+        reportReview(eligibleClient(salon).email(), target);
+
+        verify(emailService, times(2)).sendContentReportBurstEmail(
+                eq(SUPPORT_EMAIL), any(), eq("REVIEW"), eq(target), eq("OFFENSIVE"), any());
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM content_reports WHERE burst_hold AND status = 'OPEN'", Integer.class))
+                .isEqualTo(6);
+        assertThat(moderationStatus(target)).as("3 eligible reporters, all held").isEqualTo("VISIBLE");
     }
 
-    private static String unique(String prefix) {
-        return "report-" + prefix + "-" + UUID.randomUUID() + "@beautica.test";
+    @Test
+    @DisplayName("a deleted reporter's report survives with a null reporter (ON DELETE SET NULL, V208)")
+    void should_keepReportWithNullReporter_when_reporterDeleted() throws Exception {
+        SalonFixture salon = createSalon();
+        String reporterEmail = unique("leaver");
+        UUID reporterId = createUser(reporterEmail, "CLIENT", null);
+        postReport(tokenFor(reporterEmail), reportBody("SALON_PROFILE", salon.salonId(), "SPAM", null));
+
+        jdbcTemplate.update("DELETE FROM refresh_tokens WHERE user_id = ?", reporterId);
+        jdbcTemplate.update("DELETE FROM users WHERE id = ?", reporterId);
+
+        assertThat(countReportsOnTarget("SALON_PROFILE", salon.salonId())).isEqualTo(1);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM content_reports WHERE target_id = ? AND reporter_user_id IS NULL",
+                Integer.class, salon.salonId())).isEqualTo(1);
     }
 
-    // ── seeding fixtures (local by house convention — mirrors ClientReviewIT) ───────
+    @Test
+    @DisplayName("independent master (no salon): 3 clients with a COMPLETED booking with the master hide the review")
+    void should_autoHideIndependentMasterReview_when_threeEligibleClientsReport() throws Exception {
+        UUID masterId = createIndependentMaster(unique("indep")).masterId();
+        UUID reviewId = insertIndependentReview(createUser(unique("author"), "CLIENT", null), masterId);
+        List<String> reporters = new ArrayList<>();
+        for (int i = 0; i < 3; i++) {
+            String email = unique("eligible");
+            insertIndependentBooking(createUser(email, "CLIENT", null), masterId);
+            reporters.add(email);
+        }
 
-    private record SalonFixture(UUID salonId, String ownerEmail, UUID masterId, String masterEmail) {}
+        reportReview(reporters.get(0), reviewId);
+        reportReview(reporters.get(1), reviewId);
+        String afterTwo = moderationStatus(reviewId);
+        reportReview(reporters.get(2), reviewId);
 
-    private SalonFixture createSalon() {
-        String ownerEmail = unique("owner");
-        UUID ownerId = createUser(ownerEmail, "SALON_OWNER", null);
-        UUID salonId = insertSalon(ownerId);
-        String masterEmail = unique("master");
-        UUID masterUserId = createUser(masterEmail, "SALON_MASTER", salonId);
-        UUID masterId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO masters (id, user_id, salon_id, master_type, is_active, created_at, updated_at) "
-                        + "VALUES (?, ?, ?, 'SALON_MASTER', true, NOW(), NOW())",
-                masterId, masterUserId, salonId);
-        return new SalonFixture(salonId, ownerEmail, masterId, masterEmail);
+        assertThat(afterTwo).isEqualTo("VISIBLE");
+        assertThat(moderationStatus(reviewId)).isEqualTo("HIDDEN_PENDING");
     }
 
-    private UUID insertSalon(UUID ownerId) {
-        UUID salonId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at, city_id) "
-                        + "VALUES (?, ?, ?, true, NOW(), NOW(), ?)",
-                salonId, ownerId, "Salon-" + salonId, testCityId());
-        return salonId;
+    // ── phase 396 audit-fix: eligibility predates the review (D19), cap (D16), staff flood (D19), orphan text (D18) ──
+
+    @Test
+    @DisplayName("a CLIENT whose account was registered after the review was written never counts: 2 eligible + 1 "
+            + "late account (with a COMPLETED booking) → review stays VISIBLE")
+    void should_notCount_when_reporterRegisteredAfterReview() throws Exception {
+        SalonFixture salon = createSalon();
+        UUID reviewId = insertReview(createUser(unique("author"), "CLIENT", null), salon, "Погано");
+        EligibleClient late = eligibleClient(salon);
+        registerAfter(late.userId(), reviewId);
+
+        reportReview(eligibleClient(salon).email(), reviewId);
+        reportReview(eligibleClient(salon).email(), reviewId);
+        ResponseEntity<String> lateReport = reportReview(late.email(), reviewId);
+
+        assertThat(lateReport.getStatusCode()).as("the report itself is accepted").isEqualTo(HttpStatus.CREATED);
+        assertThat(countReportsOnTarget("REVIEW", reviewId)).isEqualTo(3);
+        assertThat(moderationStatus(reviewId)).isEqualTo("VISIBLE");
     }
 
-    private UUID createUser(String email, String role, UUID salonId) {
-        UUID id = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO users (id, email, password_hash, role, salon_id, is_active, email_verified) "
-                        + "VALUES (?, ?, ?, ?, ?, true, true)",
-                id, email, passwordEncoder.encode(TEST_PASSWORD), role, salonId);
-        return id;
+    @Test
+    @DisplayName("a CLIENT whose only COMPLETED booking with the provider ended after the review was written never "
+            + "counts → review stays VISIBLE")
+    void should_notCount_when_reporterBookingEndedAfterReview() throws Exception {
+        SalonFixture salon = createSalon();
+        UUID reviewId = insertReview(createUser(unique("author"), "CLIENT", null), salon, "Погано");
+        String laterClientEmail = unique("later-visit");
+        UUID laterClientId = createUser(laterClientEmail, "CLIENT", null);
+        UUID laterBookingId = insertCompletedBooking(laterClientId, salon);
+        jdbcTemplate.update("UPDATE bookings SET starts_at = r.created_at + interval '1 hour', "
+                + "ends_at = r.created_at + interval '2 hours' FROM reviews r WHERE r.id = ? AND bookings.id = ?",
+                reviewId, laterBookingId);
+
+        reportReview(eligibleClient(salon).email(), reviewId);
+        reportReview(eligibleClient(salon).email(), reviewId);
+        reportReview(laterClientEmail, reviewId);
+
+        assertThat(countReportsOnTarget("REVIEW", reviewId)).isEqualTo(3);
+        assertThat(moderationStatus(reviewId)).isEqualTo("VISIBLE");
     }
 
-    private UUID insertCompletedBooking(UUID clientId, SalonFixture salon) {
-        UUID serviceDefId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO service_definitions (id, owner_type, owner_id, name, service_type_id, "
-                        + "base_duration_minutes, base_price, buffer_minutes_after, is_active, created_at, updated_at) "
-                        + "VALUES (?, 'SALON', ?, 'Test Service', ?, 60, 500.00, 0, true, NOW(), NOW())",
-                serviceDefId, salon.salonId(), resolveUnusedServiceTypeId("SALON", salon.salonId()));
-        UUID masterServiceId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) "
-                        + "VALUES (?, ?, ?, true, NOW(), NOW())",
-                masterServiceId, salon.masterId(), serviceDefId);
-        UUID bookingId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO bookings (id, client_id, master_id, master_service_id, salon_id, status, "
-                        + "starts_at, ends_at, price_at_booking, duration_minutes_at_booking, buffer_minutes_at_booking, "
-                        + "booking_source, created_at, updated_at) "
-                        + "VALUES (?, ?, ?, ?, ?, 'COMPLETED', NOW() - interval '2 hours', NOW() - interval '1 hour', "
-                        + "500.00, 60, 0, 'APP', NOW(), NOW())",
-                bookingId, clientId, salon.masterId(), masterServiceId, salon.salonId());
-        return bookingId;
+    @Test
+    @DisplayName("auto-hide cap: a provider's 2nd threshold hit within 24 h does not hide — that review's reports "
+            + "are held for support and the e-mail is [BURST]")
+    void should_holdSecondAutoHide_when_providerHidCapReachedIn24h() throws Exception {
+        SalonFixture salon = createSalon();
+        UUID first = insertReview(createUser(unique("author"), "CLIENT", null), salon, "Перший");
+        UUID second = insertReview(createUser(unique("author"), "CLIENT", null), salon, "Другий");
+        for (int i = 0; i < 3; i++) {
+            reportReview(eligibleClient(salon).email(), first);
+        }
+        // Out of the 10-min burst window, so only the cap (24 h) can stop the second hide.
+        jdbcTemplate.update("UPDATE content_reports SET created_at = NOW() - interval '20 minutes' WHERE target_id = ?",
+                first);
+
+        for (int i = 0; i < 3; i++) {
+            reportReview(eligibleClient(salon).email(), second);
+        }
+
+        assertThat(moderationStatus(first)).isEqualTo("HIDDEN_PENDING");
+        assertThat(jdbcTemplate.queryForObject("SELECT auto_hidden_at IS NOT NULL FROM reviews WHERE id = ?",
+                Boolean.class, first)).isTrue();
+        assertThat(moderationStatus(second)).as("cap of 1 per provider per 24 h").isEqualTo("VISIBLE");
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM content_reports WHERE target_id = ? AND burst_hold AND status = 'OPEN'",
+                Integer.class, second)).isEqualTo(3);
+        verify(emailService, times(1)).sendContentReportBurstEmail(
+                eq(SUPPORT_EMAIL), any(), eq("REVIEW"), eq(second), eq("OFFENSIVE"), any());
     }
 
-    private UUID insertReview(UUID clientId, SalonFixture salon, String comment) {
-        UUID bookingId = insertCompletedBooking(clientId, salon);
-        UUID reviewId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO reviews (id, booking_id, client_id, master_id, salon_id, rating, comment, "
-                        + "created_at, updated_at) VALUES (?, ?, ?, ?, ?, 1, ?, NOW(), NOW())",
-                reviewId, bookingId, clientId, salon.masterId(), salon.salonId(), comment);
-        return reviewId;
+    @Test
+    @DisplayName("staff flood: the provider's own master/admin/owner file 6 reports in 10 min → no burst, nothing "
+            + "held; 3 real clients still auto-hide the review")
+    void should_notHoldClientReports_when_staffFloodsProviderReviews() throws Exception {
+        SalonFixture salon = createSalon();
+        UUID target = insertReview(createUser(unique("author"), "CLIENT", null), salon, "Правда");
+        UUID other = insertReview(createUser(unique("author"), "CLIENT", null), salon, "Теж правда");
+        String adminEmail = unique("admin");
+        createUser(adminEmail, "SALON_ADMIN", salon.salonId());
+        List<Integer> staffStatuses = new ArrayList<>();
+        for (String staff : List.of(salon.masterEmail(), adminEmail, salon.ownerEmail())) {
+            staffStatuses.add(reportReview(staff, target).getStatusCode().value());
+            staffStatuses.add(reportReview(staff, other).getStatusCode().value());
+        }
+
+        for (int i = 0; i < 3; i++) {
+            reportReview(eligibleClient(salon).email(), target);
+        }
+
+        assertThat(staffStatuses).as("staff reports are accepted, just never counted").containsOnly(201);
+        assertThat(jdbcTemplate.queryForObject("SELECT COUNT(*) FROM content_reports WHERE burst_hold", Integer.class))
+                .isZero();
+        verify(emailService, never()).sendContentReportBurstEmail(anyString(), any(), anyString(), any(), anyString(),
+                any());
+        assertThat(moderationStatus(target)).isEqualTo("HIDDEN_PENDING");
     }
 
-    private UUID insertClientReview(UUID bookingId, UUID clientId, SalonFixture salon) {
-        UUID id = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO client_reviews (id, booking_id, subject_client_id, author_master_id, salon_id, rating, "
-                        + "comment, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 2, 'Запізнився', NOW(), NOW())",
-                id, bookingId, clientId, salon.masterId(), salon.salonId());
-        return id;
-    }
+    @Test
+    @DisplayName("reporter account deleted → the report survives without the reporter's text (OTHER keeps its reason)")
+    void should_clearComment_when_reporterDeleted() throws Exception {
+        SalonFixture salon = createSalon();
+        String reporterEmail = unique("leaver");
+        UUID reporterId = createUser(reporterEmail, "CLIENT", null);
+        postReport(tokenFor(reporterEmail), reportBody("SALON_PROFILE", salon.salonId(), "OTHER", "Фейкові фото салону"));
 
-    private UUID insertMasterPortfolioPhoto(UUID masterId) {
-        UUID id = UUID.randomUUID();
-        String r2Key = "portfolio/master/" + masterId + "/" + id + ".jpg";
-        jdbcTemplate.update(
-                "INSERT INTO media_files (id, uploader_id, entity_type, entity_id, media_type, r2_key, r2_url, "
-                        + "created_at, updated_at) VALUES (?, NULL, 'MASTER', ?, 'PORTFOLIO', ?, ?, NOW(), NOW())",
-                id, masterId, r2Key, "https://pub.example.r2.dev/" + r2Key);
-        return id;
-    }
+        jdbcTemplate.update("DELETE FROM refresh_tokens WHERE user_id = ?", reporterId);
+        jdbcTemplate.update("DELETE FROM users WHERE id = ?", reporterId);
 
-    private int countReportsOnTarget(String targetType, UUID targetId) {
-        return jdbcTemplate.queryForObject(
-                "SELECT COUNT(*) FROM content_reports WHERE target_type = ? AND target_id = ?",
-                Integer.class, targetType, targetId);
-    }
-
-    private record IndependentMaster(UUID userId, UUID masterId) {}
-
-    private IndependentMaster createIndependentMaster(String email) {
-        UUID userId = createUser(email, "INDEPENDENT_MASTER", null);
-        UUID masterId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO masters (id, user_id, master_type, is_active, created_at, updated_at) "
-                        + "VALUES (?, ?, 'INDEPENDENT_MASTER', true, NOW(), NOW())",
-                masterId, userId);
-        return new IndependentMaster(userId, masterId);
-    }
-
-    private UUID insertIndependentBooking(UUID clientId, UUID masterId) {
-        UUID serviceDefId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO service_definitions (id, owner_type, owner_id, name, service_type_id, "
-                        + "base_duration_minutes, base_price, buffer_minutes_after, is_active, created_at, updated_at) "
-                        + "VALUES (?, 'INDEPENDENT_MASTER', ?, 'Indep Service', ?, 60, 500.00, 0, true, NOW(), NOW())",
-                serviceDefId, masterId, resolveUnusedServiceTypeId("INDEPENDENT_MASTER", masterId));
-        UUID masterServiceId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) "
-                        + "VALUES (?, ?, ?, true, NOW(), NOW())",
-                masterServiceId, masterId, serviceDefId);
-        UUID bookingId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO bookings (id, client_id, master_id, master_service_id, salon_id, status, "
-                        + "starts_at, ends_at, price_at_booking, duration_minutes_at_booking, buffer_minutes_at_booking, "
-                        + "booking_source, created_at, updated_at) "
-                        + "VALUES (?, ?, ?, ?, NULL, 'COMPLETED', NOW() - interval '5 hours', NOW() - interval '4 hours', "
-                        + "500.00, 60, 0, 'APP', NOW(), NOW())",
-                bookingId, clientId, masterId, masterServiceId);
-        return bookingId;
-    }
-
-    private UUID insertSalonPortfolioPhoto(UUID salonId) {
-        UUID id = UUID.randomUUID();
-        String r2Key = "portfolio/salon/" + salonId + "/" + id + ".jpg";
-        jdbcTemplate.update(
-                "INSERT INTO media_files (id, uploader_id, entity_type, entity_id, media_type, r2_key, r2_url, "
-                        + "created_at, updated_at) VALUES (?, NULL, 'SALON', ?, 'PORTFOLIO', ?, ?, NOW(), NOW())",
-                id, salonId, r2Key, "https://pub.example.r2.dev/" + r2Key);
-        return id;
+        Map<String, Object> row = jdbcTemplate.queryForMap(
+                "SELECT reporter_user_id, reason, comment FROM content_reports WHERE target_id = ?", salon.salonId());
+        assertThat(row.get("reporter_user_id")).isNull();
+        assertThat(row.get("reason")).isEqualTo("OTHER");
+        assertThat(row.get("comment")).isNull();
     }
 }

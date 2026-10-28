@@ -247,6 +247,33 @@ public class EmailService {
             UUID targetId,
             String reason,
             UUID reporterUserId) {
+        return sendContentReport(toEmail, reportId, targetType, targetId, reason, reporterUserId, false);
+    }
+
+    /**
+     * Phase 396 burst guard — the same ids-only report e-mail, flagged as part of a report burst on one provider
+     * (subject prefix {@code [BURST]} and a banner): the reports of that wave are held from auto-hide until support
+     * resolves them. Same executor, same lossy contract as {@link #sendContentReportEmail}.
+     */
+    @Async("reportEmailExecutor")
+    public CompletableFuture<Void> sendContentReportBurstEmail(
+            String toEmail,
+            UUID reportId,
+            String targetType,
+            UUID targetId,
+            String reason,
+            UUID reporterUserId) {
+        return sendContentReport(toEmail, reportId, targetType, targetId, reason, reporterUserId, true);
+    }
+
+    private CompletableFuture<Void> sendContentReport(
+            String toEmail,
+            UUID reportId,
+            String targetType,
+            UUID targetId,
+            String reason,
+            UUID reporterUserId,
+            boolean burst) {
         try {
             Context ctx = new Context(Locale.of("uk"));
             ctx.setVariable("reportId", reportId.toString());
@@ -254,6 +281,7 @@ public class EmailService {
             ctx.setVariable("targetId", targetId.toString());
             ctx.setVariable("reason", reason);
             ctx.setVariable("reporterUserId", reporterUserId.toString());
+            ctx.setVariable("burst", burst);
 
             String html = templateEngine.process("email/content-report", ctx);
 
@@ -261,7 +289,7 @@ public class EmailService {
             MimeMessageHelper helper = new MimeMessageHelper(message, "UTF-8");
             helper.setFrom(fromEmail);
             helper.setTo(toEmail);
-            helper.setSubject("[Beautica Report] " + targetType + " — " + reason);
+            helper.setSubject((burst ? "[BURST] " : "") + "[Beautica Report] " + targetType + " — " + reason);
             helper.setText(html, true);
 
             mailSender.send(message);

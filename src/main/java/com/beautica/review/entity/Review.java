@@ -7,6 +7,8 @@ import com.beautica.salon.entity.Salon;
 import com.beautica.user.User;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
+import jakarta.persistence.EnumType;
+import jakarta.persistence.Enumerated;
 import jakarta.persistence.FetchType;
 import jakarta.persistence.GeneratedValue;
 import jakarta.persistence.GenerationType;
@@ -25,6 +27,7 @@ import lombok.Builder;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
 
+import java.time.Instant;
 import java.util.UUID;
 
 @Entity
@@ -45,7 +48,9 @@ import java.util.UUID;
                 // nested per-master aggregate mobile Phase 111 introduced
                 // (ReviewRepository#recalculateSalonRating and #countBySalonIdGroupByRating): it supplies
                 // the GROUP BY master_id order and makes the scan index-only, removing the Sort node and
-                // all heap fetches. Documented here so ddl-auto=validate drift on this table stays
+                // all heap fetches. idx_reviews_auto_hidden_at (V209, WHERE auto_hidden_at IS NOT NULL) is partial
+                // too: it backs the phase-396 per-provider auto-hide cap count.
+                // Documented here so ddl-auto=validate drift on this table stays
                 // explained rather than looking like an unmirrored index.
         }
 )
@@ -84,4 +89,48 @@ public class Review extends AuditableEntity {
     @Size(max = 2000)
     @Column(length = 2000)
     private String comment;
+
+    /**
+     * Phase 396 D1. Public reads and rating aggregates include only {@link ModerationStatus#VISIBLE}. Changed only
+     * through {@link #moderate}, by {@code ReviewModerationService}.
+     */
+    @Builder.Default
+    @Enumerated(EnumType.STRING)
+    @Column(name = "moderation_status", nullable = false, length = 16)
+    private ModerationStatus moderationStatus = ModerationStatus.VISIBLE;
+
+    /**
+     * Phase 396 (V209): when an auto-hide last moved this review to {@link ModerationStatus#HIDDEN_PENDING}. Never
+     * cleared by a restore — it records the transition, which the per-provider auto-hide cap counts.
+     */
+    @Column(name = "auto_hidden_at")
+    private Instant autoHiddenAt;
+
+    /**
+     * Moves this review to {@code target}. {@link ModerationStatus#REMOVED} is terminal: a late RESTORE / DISMISS
+     * (e.g. on a report that raced the takedown) never brings removed content back.
+     *
+     * @return {@code true} when the status changed (the caller then publishes a recalculation event)
+     */
+    public boolean moderate(ModerationStatus target) {
+        if (moderationStatus == target || moderationStatus == ModerationStatus.REMOVED) {
+            return false;
+        }
+        moderationStatus = target;
+        return true;
+    }
+
+    /**
+     * The auto-hide transition: {@link #moderate} to {@link ModerationStatus#HIDDEN_PENDING}, stamping
+     * {@link #autoHiddenAt} when it changed.
+     *
+     * @return {@code true} when the status changed
+     */
+    public boolean autoHide(Instant now) {
+        if (!moderate(ModerationStatus.HIDDEN_PENDING)) {
+            return false;
+        }
+        autoHiddenAt = now;
+        return true;
+    }
 }

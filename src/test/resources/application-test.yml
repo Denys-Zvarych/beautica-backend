@@ -169,6 +169,10 @@ app:
   guest-pii-retention:
     # Phase 373 — no job bean in tests; ITs drive GuestPiiAnonymisationService directly.
     enabled: false
+  moderation:
+    retention:
+      # Phase 396 — no job bean in tests; ITs drive ContentReportRetentionService directly.
+      enabled: false
 
 notification:
   outbox:

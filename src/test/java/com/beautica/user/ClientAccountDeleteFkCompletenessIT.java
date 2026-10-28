@@ -36,7 +36,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * CASCADE), {@code refresh_tokens.user_id} (V1 CASCADE), {@code device_tokens.user_id} (V29
  * CASCADE), {@code media_files.uploader_id} (V193 SET NULL — the account's own USER rows are deleted explicitly, Phase 363), {@code password_reset_tickets.user_id}
  * (V55→V107 rename, CASCADE), {@code platform_categories.requested_by_user_id} (V65 SET NULL),
- * {@code service_type_suggestion.requested_by_user_id} (V76 SET NULL).
+ * {@code service_type_suggestion.requested_by_user_id} (V76 SET NULL), {@code content_reports.reporter_user_id}
+ * (V207 CASCADE → V208 SET NULL, phase 396).
  *
  * <p><b>Deliberately NOT covered here</b> — three more {@code users}-referencing FKs exist
  * ({@code masters.user_id} V4/V157, {@code salons.owner_id} V3, {@code bookings
@@ -127,6 +128,11 @@ class ClientAccountDeleteFkCompletenessIT extends AbstractIntegrationTest {
         UUID suggestionId = csd.insertServiceTypeSuggestion(clientId);
         insertedSuggestionId = suggestionId;
 
+        // content_reports.reporter_user_id (V207 CASCADE → V208 SET NULL, phase 396 D7 retention)
+        UUID reportId = UUID.randomUUID();
+        jdbcTemplate.update("INSERT INTO content_reports (id, reporter_user_id, target_type, target_id, reason, comment) "
+                + "VALUES (?, ?, 'SALON_PROFILE', ?, 'OTHER', 'Підозрілий профіль')", reportId, clientId, salon.salonId());
+
         // Fixture check — every row genuinely exists and genuinely names this client BEFORE the
         // delete, so a vacuous 204 (nothing was actually inserted) cannot pass this test.
         assertThat(csd.count("SELECT COUNT(*) FROM bookings WHERE client_id = ?", clientId)).isEqualTo(1);
@@ -144,6 +150,8 @@ class ClientAccountDeleteFkCompletenessIT extends AbstractIntegrationTest {
                 .isEqualTo(1);
         assertThat(csd.count("SELECT COUNT(*) FROM service_type_suggestion WHERE requested_by_user_id = ?",
                 clientId)).isEqualTo(1);
+        assertThat(csd.count("SELECT COUNT(*) FROM content_reports WHERE reporter_user_id = ?", clientId))
+                .isEqualTo(1);
 
         ResponseEntity<String> response = restTemplate.exchange(
                 "/api/v1/users/me", HttpMethod.DELETE,
@@ -168,6 +176,14 @@ class ClientAccountDeleteFkCompletenessIT extends AbstractIntegrationTest {
         assertThat(jdbcTemplate.queryForObject(
                 "SELECT requested_by_user_id FROM service_type_suggestion WHERE id = ?", UUID.class, suggestionId))
                 .isNull();
+
+        // Phase 396 D7: the client's report outlives the account (kept while the target exists + 1 year), with
+        // the reporter reference cleared — it no longer counts toward auto-hide.
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT reporter_user_id FROM content_reports WHERE id = ?", UUID.class, reportId)).isNull();
+        // V209 trigger: the reporter's free text goes with the account, on the real DELETE /users/me path.
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT comment FROM content_reports WHERE id = ?", String.class, reportId)).isNull();
 
         // client_reviews (provider -> client) are DELETED outright (D3), never detached.
         assertThat(csd.count("SELECT COUNT(*) FROM client_reviews WHERE subject_client_id = ?", clientId))
