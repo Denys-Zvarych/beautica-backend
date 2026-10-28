@@ -54,7 +54,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * {@code (SELECT set_config(...)) lock_cfg} join source; pinned by
  * {@link #should_applyLockTimeoutBeforeOuterQueryWhenFusedAsJoinSource()}:
  * <ul>
- *   <li>{@code AppointmentRepository#consumeCancelToken} (implicit {@code UPDATE} row lock)</li>
+ *   <li>{@code AppointmentRepository#consumeCancelTokenHash} (implicit {@code UPDATE} row lock)</li>
  *   <li>{@code SalonRepository#findByIdForUpdate} (Phase 343 salon logo/cover, {@code FOR NO KEY UPDATE OF s});
  *       end-to-end ceiling pinned by
  *       {@code SalonImageIT#should_return409AndDiscardBlob_when_salonLockHeldPastLockTimeout}</li>
@@ -128,7 +128,7 @@ class AdvisoryLockFusionOrderIT extends AbstractIntegrationTest {
         assertThat(observed)
                 .as("the outer query must observe the join source's GUC write. '0' here means "
                         + "the five join-source-fused ceilings (e.g. "
-                        + "AppointmentRepository#consumeCancelToken, "
+                        + "AppointmentRepository#consumeCancelTokenHash, "
                         + "SalonRepository#lockSalonIdsWithoutBookingSlug) take their row locks with "
                         + "lock_timeout still disabled — a contending request parks a Hikari "
                         + "connection indefinitely. actual=%s", observed)

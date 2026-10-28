@@ -1,5 +1,6 @@
 package com.beautica.booking.service;
 
+import com.beautica.booking.domain.CancelTokenHasher;
 import com.beautica.booking.dto.CancelTokenInfoResponse;
 import com.beautica.booking.entity.Appointment;
 import com.beautica.booking.entity.Booking;
@@ -44,7 +45,7 @@ import java.util.UUID;
  * transparently serves both shapes.
  *
  * <p><b>One-time consume / concurrency</b> mirrors the single path: the header status-flip + token-null
- * is a single conditional UPDATE ({@link AppointmentRepository#consumeCancelToken(UUID)}) guarded on the
+ * is a single conditional UPDATE ({@link AppointmentRepository#consumeCancelTokenHash}) guarded on the
  * token still being present and {@code CONFIRMED}. Exactly one racer updates 1 header row and proceeds
  * to cancel the items ({@link BookingRepository#cancelItemsByAppointmentId(UUID)}), notify the master
  * once, and — after commit — send ONE cancellation SMS and evict availability caches; every other racer
@@ -133,7 +134,7 @@ public class GuestVisitCancellationService {
                             .formatted(smsProperties.getCancelWindowHours()));
         }
 
-        if (!cancelValidated(first.getAppointment().getId(), token, items, true)) {
+        if (!cancelValidated(first.getAppointment().getId(), CancelTokenHasher.hash(token), items, true)) {
             throw new NotFoundException("Cancel token not found");
         }
         return true;
@@ -146,7 +147,7 @@ public class GuestVisitCancellationService {
      * internal guest-PII erase, which bypasses the 2-hour window and passes {@code sendGuestSms =
      * false}.
      *
-     * <p>A header with a cancel token is consumed via {@link AppointmentRepository#consumeCancelToken};
+     * <p>A header with a cancel token is consumed via {@link AppointmentRepository#consumeCancelTokenHash};
      * a tokenless STAFF walk-in header via {@link AppointmentRepository#cancelGuestVisitById}. On 0
      * matched rows (a concurrent cancel already won) nothing else runs.
      *
@@ -157,15 +158,15 @@ public class GuestVisitCancellationService {
      */
     @Transactional(propagation = Propagation.MANDATORY)
     public boolean cancelGuestVisit(Appointment appointment, List<Booking> items, boolean sendGuestSms) {
-        return cancelValidated(appointment.getId(), appointment.getCancelToken(), items, sendGuestSms);
+        return cancelValidated(appointment.getId(), appointment.getCancelTokenHash(), items, sendGuestSms);
     }
 
-    private boolean cancelValidated(UUID appointmentId, UUID token, List<Booking> items, boolean sendGuestSms) {
+    private boolean cancelValidated(UUID appointmentId, String tokenHash, List<Booking> items, boolean sendGuestSms) {
         Booking first = items.get(0);
         // Atomic one-time consume of the header token: only the winner of any concurrent race updates 1
         // row and cancels the items + fires the side-effects; a replay / lost race updates 0 rows → 404.
-        int updated = token != null
-                ? appointmentRepository.consumeCancelToken(token)
+        int updated = tokenHash != null
+                ? appointmentRepository.consumeCancelTokenHash(tokenHash)
                 : appointmentRepository.cancelGuestVisitById(appointmentId);
         if (updated == 0) {
             return false;
@@ -194,7 +195,9 @@ public class GuestVisitCancellationService {
      * unknown token (no state oracle), matching the single path.
      */
     private List<Booking> loadLiveVisitItems(UUID token) {
-        Appointment appointment = appointmentRepository.findByCancelToken(token).orElse(null);
+        // V206: only the token's hash is stored — the lookup hashes the incoming token.
+        Appointment appointment = appointmentRepository.findByCancelTokenHash(CancelTokenHasher.hash(token))
+                .orElse(null);
         if (appointment == null || appointment.getStatus() != BookingStatus.CONFIRMED) {
             return List.of();
         }

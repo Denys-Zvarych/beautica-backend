@@ -57,20 +57,21 @@ public interface AppointmentRepository extends JpaRepository<Appointment, UUID> 
 
     // ── Guest (LINK) visit cancel by link (BE-7) ──────────────────────────────
     /**
-     * Resolves a guest (LINK) visit by its one-time {@code cancel_token} for the public cancel page —
-     * the visit-level analogue of {@code BookingRepository#findByCancelTokenWithGraph}. Rides the V124
-     * partial-unique index {@code ux_appointments_cancel_token} (UNIQUE over non-NULL rows only). A
-     * consumed token is {@code NULL} (nulled by {@link #consumeCancelToken}), so a replayed link returns
+     * Resolves a guest (LINK) visit by the hash of its one-time cancel token ({@code cancel_token_hash},
+     * see {@code CancelTokenHasher}) for the public cancel page — the visit-level analogue of
+     * {@code BookingRepository#findByCancelTokenHashWithGraph}. Rides the V206 partial-unique index
+     * {@code ux_appointments_cancel_token_hash} (UNIQUE over non-NULL rows only). A consumed token's
+     * hash is {@code NULL} (nulled by {@link #consumeCancelTokenHash}), so a replayed link returns
      * empty. Header only — the caller reads the chained items via
      * {@code BookingRepository#findByAppointmentIdWithGraph} for the master/service labels + eviction.
      */
-    @Query("SELECT a FROM Appointment a WHERE a.cancelToken = :cancelToken")
-    Optional<Appointment> findByCancelToken(@Param("cancelToken") UUID cancelToken);
+    @Query("SELECT a FROM Appointment a WHERE a.cancelTokenHash = :cancelTokenHash")
+    Optional<Appointment> findByCancelTokenHash(@Param("cancelTokenHash") String cancelTokenHash);
 
     /**
      * Atomically consumes a visit's cancel token: flips a still-{@code CONFIRMED} guest visit HEADER to
-     * {@code CANCELLED}, stamps {@code CLIENT_CANCELLED}, and nulls the token, in a single conditional
-     * UPDATE. Mirrors {@code BookingRepository#consumeCancelToken} lifted to the aggregate header: of N
+     * {@code CANCELLED}, stamps {@code CLIENT_CANCELLED}, and nulls the token hash, in a single conditional
+     * UPDATE. Mirrors {@code BookingRepository#consumeCancelTokenHash} lifted to the aggregate header: of N
      * concurrent {@code POST /cancel/{token}} requests, exactly ONE affects 1 row (the winner cancels
      * the visit's items + fires the side-effects); every other affects 0 → mapped to 404. The child
      * {@code bookings} rows are cancelled separately by {@code BookingRepository#cancelItemsByAppointmentId}.
@@ -97,12 +98,12 @@ public interface AppointmentRepository extends JpaRepository<Appointment, UUID> 
             UPDATE appointments
                SET status = 'CANCELLED',
                    cancellation_reason = 'CLIENT_CANCELLED',
-                   cancel_token = NULL
+                   cancel_token_hash = NULL
               FROM (SELECT set_config('lock_timeout', '3s', true)) AS lock_cfg
-             WHERE appointments.cancel_token = :cancelToken
+             WHERE appointments.cancel_token_hash = :cancelTokenHash
                AND appointments.status = 'CONFIRMED'
             """, nativeQuery = true)
-    int consumeCancelToken(@Param("cancelToken") UUID cancelToken);
+    int consumeCancelTokenHash(@Param("cancelTokenHash") String cancelTokenHash);
 
     // ── Pre-lock existence/ownership check (cycle-3 audit finding 1) ─────────────────────────────
     /**
@@ -221,7 +222,7 @@ public interface AppointmentRepository extends JpaRepository<Appointment, UUID> 
 
     /**
      * Collapses the visit HEADER to a terminal state in ONE conditional {@code UPDATE} — the
-     * per-item counterpart of {@link #consumeCancelToken}, applied to BOTH callers that recompute the
+     * per-item counterpart of {@link #consumeCancelTokenHash}, applied to BOTH callers that recompute the
      * header after a single chained item transitions (provider per-service decline AND the track
      * 27.x client per-leg cancel): {@code AppointmentTransitionService
      * #collapseHeaderAfterItemTransition} (both the internal provider-decline caller and the
@@ -258,7 +259,7 @@ public interface AppointmentRepository extends JpaRepository<Appointment, UUID> 
      * per-row {@code EvalPlanQual} recheck on a blocked {@code UPDATE} re-fetches only the
      * TARGET row itself — it does not reliably refresh an unrelated table's subquery baked into the
      * same statement's {@code WHERE}/{@code SET}, which is exactly why folding the check into one
-     * statement without a preceding lock is insufficient here, unlike {@link #consumeCancelToken}'s
+     * statement without a preceding lock is insufficient here, unlike {@link #consumeCancelTokenHash}'s
      * single self-contained-row condition, which needs no separate lock.)
      *
      * <p><b>Also removes the over-fetch</b> the old code paid on every call: it no longer loads the
@@ -438,7 +439,7 @@ public interface AppointmentRepository extends JpaRepository<Appointment, UUID> 
                    guest_phone = NULL,
                    client_comment = NULL,
                    client_cancellation_note = NULL,
-                   cancel_token = NULL,
+                   cancel_token_hash = NULL,
                    guest_pii_anonymised_at = now(),
                    updated_at = now()
              WHERE a.id IN (
@@ -478,7 +479,7 @@ public interface AppointmentRepository extends JpaRepository<Appointment, UUID> 
                    guest_phone = NULL,
                    client_comment = NULL,
                    client_cancellation_note = NULL,
-                   cancel_token = NULL,
+                   cancel_token_hash = NULL,
                    guest_pii_anonymised_at = now(),
                    updated_at = now()
              WHERE a.id IN (
@@ -522,7 +523,7 @@ public interface AppointmentRepository extends JpaRepository<Appointment, UUID> 
                    guest_phone = NULL,
                    client_comment = NULL,
                    client_cancellation_note = NULL,
-                   cancel_token = NULL,
+                   cancel_token_hash = NULL,
                    guest_pii_anonymised_at = now(),
                    updated_at = now()
              WHERE a.id IN (
@@ -558,7 +559,7 @@ public interface AppointmentRepository extends JpaRepository<Appointment, UUID> 
                    guest_phone = NULL,
                    client_comment = NULL,
                    client_cancellation_note = NULL,
-                   cancel_token = NULL,
+                   cancel_token_hash = NULL,
                    guest_pii_anonymised_at = now(),
                    updated_at = now()
              WHERE guest_phone = :phone
@@ -598,7 +599,7 @@ public interface AppointmentRepository extends JpaRepository<Appointment, UUID> 
             @Param("now") OffsetDateTime now);
 
     /**
-     * Tokenless counterpart of {@link #consumeCancelToken} for a STAFF walk-in visit header (phase 373
+     * Tokenless counterpart of {@link #consumeCancelTokenHash} for a STAFF walk-in visit header (phase 373
      * D12): same status flip and reason, guarded on {@code CONFIRMED} and account-less, and stamps
      * {@code updated_at} (D12). Returns 0 when a concurrent cancel already won.
      */
@@ -607,7 +608,7 @@ public interface AppointmentRepository extends JpaRepository<Appointment, UUID> 
             UPDATE appointments
                SET status = 'CANCELLED',
                    cancellation_reason = 'CLIENT_CANCELLED',
-                   cancel_token = NULL,
+                   cancel_token_hash = NULL,
                    updated_at = now()
              WHERE id = :id
                AND status = 'CONFIRMED'

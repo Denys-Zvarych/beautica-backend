@@ -115,6 +115,7 @@ class GuestPiiRetentionIT extends AbstractIntegrationTest {
         assertThat(row.get("guest_phone")).isNull();
         assertThat(row.get("client_comment")).isNull();
         assertThat(row.get("client_cancellation_note")).isNull();
+        assertThat(row.get("cancel_token_hash")).as("V206: the anonymiser clears the token hash").isNull();
         assertThat(row.get("cancel_token")).isNull();
         assertThat(row.get("guest_pii_anonymised_at")).isNotNull();
     }
@@ -774,7 +775,7 @@ class GuestPiiRetentionIT extends AbstractIntegrationTest {
             Map<String, Object> row = fx.booking(single);
             assertThat(row.get("status")).isEqualTo("CONFIRMED");
             assertThat(row.get("guest_phone")).isEqualTo(PHONE);
-            assertThat(row.get("cancel_token")).isNotNull();
+            assertThat(row.get("cancel_token_hash")).isNotNull();
             assertThat(fx.count("SELECT COUNT(*) FROM notification_outbox")).isZero();
             assertThat(fx.count("SELECT COUNT(*) FROM in_app_notification")).isZero();
         }

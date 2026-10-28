@@ -335,7 +335,7 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // Per-IP cap for POST /api/v1/book/cancel/{token} (10 / 15 min). The endpoint is
     // permitAll() — the guest holds only the one-time cancel token, validated inside the
     // booking service, not the Spring filter chain — so without this a single source IP can
-    // pour cancel attempts: each accepted POST runs a findByCancelTokenWithGraph JOIN-FETCH +
+    // pour cancel attempts: each accepted POST runs a findByCancelTokenHashWithGraph JOIN-FETCH +
     // conditional UPDATE, and a successful cancel dispatches a billable SMS. The token is
     // 122-bit (not brute-forceable), so the cap is generous enough for a legitimate guest
     // retrying their own cancel. Built internally (not an injected @Qualifier bean) so the
@@ -343,6 +343,14 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // this filter directly.
     private static final long CANCEL_POST_CAPACITY = 10;
     private static final Duration CANCEL_POST_WINDOW = Duration.ofMinutes(15);
+    // Per-IP cap for GET /api/v1/book/cancel/{token} (10 / 60 s) — the cancel PAGE's info read
+    // (review-trust phase 1). Until this cap the read fell through the unconditional non-POST bypass
+    // with no throttle at all, so one IP could replay token lookups at line rate (each a SHA-256 +
+    // index probe + graph load). The page makes one read per open, so 10 / min never touches a guest
+    // reloading their own link. Separate from cancelPostBuckets so reads never spend the POST budget.
+    // Internal (not an injected @Qualifier bean) for the same constructor-stability reason as above.
+    private static final long CANCEL_INFO_CAPACITY = 10;
+    private static final Duration CANCEL_INFO_WINDOW = Duration.ofSeconds(60);
     // Per-IP cap for GET /api/v1/book/{slug}/availability (60 / 60 s) — the LOW-fix flood guard for the
     // last unthrottled permitAll() surface under /book. Deliberately the SAME budget as slotsBuckets
     // (the authenticated twin, GET /masters/{id}/slots + /working-days, default 60/60s): the two answer
@@ -694,6 +702,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // rather than injected so the public 16-arg constructor stays stable for the slice/regression
     // tests that construct this filter directly.
     private final LoadingCache<String, Bucket> cancelPostBuckets;
+    // Per-IP bucket for GET/HEAD /api/v1/book/cancel/{token} — see CANCEL_INFO_CAPACITY.
+    private final LoadingCache<String, Bucket> cancelInfoBuckets;
     // Per-IP bucket for GET /api/v1/book/{slug}/availability — the LOW-fix flood guard for the public
     // booking page's slot read, the one permitAll() surface under /book that had no bucket at all. Built
     // internally rather than injected so the public 19-arg constructor stays stable for the
@@ -917,6 +927,12 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                 .build(key -> Bucket.builder()
                         .addLimit(cancelPostBandwidth())
                         .build());
+        this.cancelInfoBuckets = Caffeine.newBuilder()
+                .maximumSize(100_000)
+                .expireAfterAccess(CANCEL_INFO_WINDOW.plusMinutes(5))
+                .build(key -> Bucket.builder()
+                        .addLimit(cancelInfoBandwidth())
+                        .build());
         this.guestAvailabilityBuckets = Caffeine.newBuilder()
                 .maximumSize(100_000)
                 .expireAfterAccess(GUEST_AVAILABILITY_WINDOW.plusMinutes(5))
@@ -991,6 +1007,13 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         return BandwidthBuilder.builder()
                 .capacity(CANCEL_POST_CAPACITY)
                 .refillIntervally(CANCEL_POST_CAPACITY, CANCEL_POST_WINDOW)
+                .build();
+    }
+
+    private static Bandwidth cancelInfoBandwidth() {
+        return BandwidthBuilder.builder()
+                .capacity(CANCEL_INFO_CAPACITY)
+                .refillIntervally(CANCEL_INFO_CAPACITY, CANCEL_INFO_WINDOW)
                 .build();
     }
 
@@ -1458,6 +1481,16 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                 && path.startsWith(CANCEL_POST_PATH_PREFIX)) {
             applyRateLimit(request, response, filterChain, cancelPostBuckets,
                     CANCEL_POST_RETRY_AFTER_SECONDS);
+            return;
+        }
+
+        // Cancel-info read rate-limit: GET/HEAD /api/v1/book/cancel/{token} — the same prefix as the
+        // POST branch above, split by method onto its own bucket (cancelInfoBuckets, 10 / 60 s per IP).
+        // Checked before the unconditional non-POST bypass below, which it previously fell through.
+        // HEAD is routed by Spring to the @GetMapping handler, so it is throttled identically.
+        if (isGetOrHead(method)
+                && path.startsWith(CANCEL_POST_PATH_PREFIX)) {
+            applyRateLimit(request, response, filterChain, cancelInfoBuckets, RETRY_AFTER_SECONDS);
             return;
         }
 

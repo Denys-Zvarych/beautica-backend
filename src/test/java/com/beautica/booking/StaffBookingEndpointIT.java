@@ -108,7 +108,7 @@ class StaffBookingEndpointIT extends AbstractStaffBookingIT {
             assertThat(row.get("created_by_user_id")).isEqualTo(salon.ownerId());
             assertThat(row.get("salon_id")).isEqualTo(salon.salonId());
             assertThat(row.get("client_id")).isNull();
-            assertThat(row.get("cancel_token")).isNull();
+            assertThat(row.get("cancel_token_hash")).isNull();
             assertThat(row.get("guest_name")).isEqualTo("Марія");
             assertThat(row.get("guest_surname")).isEqualTo("Левченко");
             assertThat(row.get("guest_phone"))

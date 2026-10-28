@@ -119,7 +119,7 @@ public interface InAppNotificationRepository extends Repository<InAppNotificatio
      * {@code read_at} defaults to {@code NULL}.
      *
      * <p>Native, not JPQL: {@code type} is bound as its {@link Enum#name()} string against the
-     * plain {@code VARCHAR} column, matching {@code AppointmentRepository#consumeCancelToken}'s
+     * plain {@code VARCHAR} column, matching {@code AppointmentRepository#consumeCancelTokenHash}'s
      * convention for the same reason — there is no {@code @Enumerated} metadata to consult outside
      * an entity attribute path in a native query.
      *

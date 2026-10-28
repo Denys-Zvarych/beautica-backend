@@ -519,7 +519,7 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
      * from its snapshot, so dirty-checking never writes the column back.
      *
      * <p><b>3s {@code lock_timeout}, fused</b> (perf audit L3) — the {@code FROM (SELECT set_config(...))}
-     * join-source shape of {@code AppointmentRepository#consumeCancelToken} (an {@code UPDATE} has no target
+     * join-source shape of {@code AppointmentRepository#consumeCancelTokenHash} (an {@code UPDATE} has no target
      * list to carry it): Postgres evaluates the 1-row source, and so sets the transaction-local GUC, before
      * the implicit row lock on the matching master row, so a concurrent holder bounds this wait to 3s like
      * the salon twin {@code SalonRepository#lockSalonIdsWithoutBookingSlug}. A longer wait fails with

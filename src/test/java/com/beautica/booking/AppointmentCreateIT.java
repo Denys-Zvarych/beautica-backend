@@ -288,14 +288,14 @@ class AppointmentCreateIT extends AbstractIntegrationTest {
         // client_id is the caller (the DTO has NO client field — it cannot be spoofed); guest fields
         // are NULL, i.e. this row takes the APP branch of the V126 chk_appointment_guest_fields CHECK.
         Map<String, Object> appt = jdbcTemplate.queryForMap(
-                "SELECT client_id, guest_name, guest_phone, guest_surname, cancel_token, booking_source "
+                "SELECT client_id, guest_name, guest_phone, guest_surname, cancel_token_hash, booking_source "
                         + "FROM appointments WHERE id = ?", appointmentId);
         assertThat(appt.get("client_id")).isEqualTo(clientUserId);
         assertThat(appt.get("booking_source")).isEqualTo("APP");
         assertThat(appt.get("guest_name")).isNull();
         assertThat(appt.get("guest_phone")).isNull();
         assertThat(appt.get("guest_surname")).isNull();
-        assertThat(appt.get("cancel_token")).isNull();
+        assertThat(appt.get("cancel_token_hash")).isNull();
     }
 
     @Test

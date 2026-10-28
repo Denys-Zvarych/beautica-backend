@@ -1981,7 +1981,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * Cancels every still-{@code CONFIRMED} child booking of a guest visit in ONE conditional UPDATE:
      * flips each to {@code CANCELLED}, stamps {@code CLIENT_CANCELLED}, and nulls its per-item cancel
      * token (V91 permits a NULL token on a terminal LINK row). Called by
-     * {@code GuestVisitCancellationService} right after {@code AppointmentRepository#consumeCancelToken}
+     * {@code GuestVisitCancellationService} right after {@code AppointmentRepository#consumeCancelTokenHash}
      * wins the header race, so the header and all N items reach {@code CANCELLED} atomically in the same
      * transaction — freeing every item's slot (the {@code no_overlapping_bookings} EXCLUDE predicate is
      * {@code status = 'CONFIRMED'} only). Rides the partial index {@code idx_bookings_appointment}.
@@ -1993,7 +1993,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             UPDATE Booking b
                SET b.status = com.beautica.booking.enums.BookingStatus.CANCELLED,
                    b.cancellationReason = com.beautica.booking.enums.CancellationReason.CLIENT_CANCELLED,
-                   b.cancelToken = null
+                   b.cancelTokenHash = null
              WHERE b.appointment.id = :appointmentId
                AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
             """)
@@ -2043,19 +2043,20 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
 
     // ── Guest-cancel by link (Phase 13.4) ─────────────────────────────────────
     /**
-     * Resolves a guest (LINK) booking by its one-time {@code cancel_token} for the
-     * public cancel page. The lookup hits the V90 partial-unique index
-     * {@code idx_bookings_cancel_token} (UNIQUE over non-NULL rows only).
+     * Resolves a guest (LINK) booking by the hash of its one-time cancel token
+     * ({@code cancel_token_hash}, see {@code CancelTokenHasher}) for the public cancel page. The lookup
+     * hits the V206 partial-unique index {@code ux_bookings_cancel_token_hash} (UNIQUE over non-NULL
+     * rows only).
      *
      * <p>The master + service graph is JOIN-FETCHed so the cancel-info page can render
      * {@code masterName}/{@code serviceName} without a lazy load (Anti-Bug §E-2).
      *
-     * <p>A consumed token is {@code NULL} (set by {@link #consumeCancelToken}), so a
+     * <p>A consumed token's hash is {@code NULL} (set by {@link #consumeCancelTokenHash}), so a
      * replayed link returns empty → 404 (no info leak about token state).
      *
      * <p><b>BE-7 (guest visits).</b> The {@code b.appointment IS NULL} guard confines this legacy
      * single-booking path to true standalone guest bookings. A multi-service visit's child item
-     * carries its own per-item {@code cancel_token} (mandated by the V91 {@code chk_bookings_guest_fields}
+     * carries its own per-item {@code cancel_token_hash} (mandated by the V206 {@code chk_bookings_guest_fields}
      * CHECK) but MUST only be cancellable as a whole visit via the header token
      * ({@code GuestVisitCancellationService}). Were a per-item token accepted here it would cancel one
      * item and desync the {@code Appointment} header + siblings. Excluding {@code appointment_id IS NOT
@@ -2068,20 +2069,20 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             LEFT JOIN FETCH m.user
             JOIN FETCH b.masterService ms
             JOIN FETCH ms.serviceDefinition
-            WHERE b.cancelToken = :cancelToken
+            WHERE b.cancelTokenHash = :cancelTokenHash
               AND b.appointment IS NULL
             """)
-    Optional<Booking> findByCancelTokenWithGraph(@Param("cancelToken") UUID cancelToken);
+    Optional<Booking> findByCancelTokenHashWithGraph(@Param("cancelTokenHash") String cancelTokenHash);
 
     /**
      * Atomically consumes a cancel token: flips a still-{@code CONFIRMED} guest booking
-     * to {@code CANCELLED} and nulls the token, in a single conditional UPDATE.
+     * to {@code CANCELLED} and nulls the token hash, in a single conditional UPDATE.
      *
-     * <p><b>One-time / race-safe.</b> The {@code WHERE cancel_token = :token AND status =
-     * CONFIRMED} predicate guarantees that of N concurrent {@code POST /cancel/{token}}
+     * <p><b>One-time / race-safe.</b> The {@code WHERE cancel_token_hash = :cancelTokenHash AND
+     * status = CONFIRMED} predicate guarantees that of N concurrent {@code POST /cancel/{token}}
      * requests, exactly ONE UPDATE affects 1 row; every other affects 0. Only the winner
      * fires the cancellation SMS + master notification, so the side-effects run exactly
-     * once. A replayed POST (token already NULL) updates 0 rows → the service maps it to
+     * once. A replayed POST (hash already NULL) updates 0 rows → the service maps it to
      * 404. This mirrors the atomic check-and-set used by the Phase 13.2 OTP recorder and
      * avoids the check-then-act double-cancel race a load→mutate→save flow would leave open.
      *
@@ -2091,11 +2092,11 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     @Query("""
             UPDATE Booking b
                SET b.status = com.beautica.booking.enums.BookingStatus.CANCELLED,
-                   b.cancelToken = null
-             WHERE b.cancelToken = :cancelToken
+                   b.cancelTokenHash = null
+             WHERE b.cancelTokenHash = :cancelTokenHash
                AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
             """)
-    int consumeCancelToken(@Param("cancelToken") UUID cancelToken);
+    int consumeCancelTokenHash(@Param("cancelTokenHash") String cancelTokenHash);
 
     // ── Guest-PII retention / erase (phase 373) ───────────────────────────────
     /**
@@ -2120,7 +2121,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
                    guest_phone = NULL,
                    client_comment = NULL,
                    client_cancellation_note = NULL,
-                   cancel_token = NULL,
+                   cancel_token_hash = NULL,
                    guest_pii_anonymised_at = now(),
                    updated_at = now()
              WHERE b.id IN (
@@ -2153,7 +2154,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
                    guest_phone = NULL,
                    client_comment = NULL,
                    client_cancellation_note = NULL,
-                   cancel_token = NULL,
+                   cancel_token_hash = NULL,
                    guest_pii_anonymised_at = now(),
                    updated_at = now()
              WHERE guest_phone = :phone
@@ -2192,7 +2193,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             @Param("now") OffsetDateTime now);
 
     /**
-     * Tokenless counterpart of {@link #consumeCancelToken} for a STAFF walk-in row (phase 373 D12):
+     * Tokenless counterpart of {@link #consumeCancelTokenHash} for a STAFF walk-in row (phase 373 D12):
      * the same status flip, guarded on {@code CONFIRMED} and on the row being account-less, and
      * stamps {@code updated_at} (D12). Returns 0 when a concurrent cancel already won, so the caller
      * skips the side-effects. Native so {@code updated_at} is set by the database clock, like every
@@ -2202,7 +2203,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     @Query(value = """
             UPDATE bookings
                SET status = 'CANCELLED',
-                   cancel_token = NULL,
+                   cancel_token_hash = NULL,
                    updated_at = now()
              WHERE id = :id
                AND status = 'CONFIRMED'

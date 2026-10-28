@@ -1,5 +1,6 @@
 package com.beautica.booking.service;
 
+import com.beautica.booking.domain.CancelTokenHasher;
 import com.beautica.auth.phoneotp.GuestTokenProvider;
 import com.beautica.booking.dto.GuestBookingRequest;
 import com.beautica.booking.dto.GuestBookingResponse;
@@ -153,6 +154,10 @@ class GuestBookingServiceTest {
         assertThat(saved.getGuestPhone()).isEqualTo(GUEST_PHONE);
         assertThat(saved.getCancelToken()).isNotNull();
         assertThat(response.cancelUrl()).startsWith(FRONTEND + "/book/cancel/");
+        // V206: the persisted column is the SHA-256 of the raw token the guest's link carries.
+        UUID linkToken = UUID.fromString(response.cancelUrl().substring((FRONTEND + "/book/cancel/").length()));
+        assertThat(linkToken).isEqualTo(saved.getCancelToken());
+        assertThat(saved.getCancelTokenHash()).isEqualTo(CancelTokenHasher.hash(linkToken));
 
         verify(outboxService).enqueueNewBooking(any());
         ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);

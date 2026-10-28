@@ -1,5 +1,6 @@
 package com.beautica.booking.service;
 
+import com.beautica.booking.domain.CancelTokenHasher;
 import com.beautica.booking.entity.Appointment;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingStatus;
@@ -62,6 +63,8 @@ import static org.mockito.Mockito.when;
 class GuestVisitCancellationServiceTest {
 
     private static final UUID TOKEN = UUID.randomUUID();
+    /** V206: repositories are keyed by the token's SHA-256 hash, never the raw token. */
+    private static final String TOKEN_HASH = CancelTokenHasher.hash(TOKEN);
     private static final UUID APPOINTMENT_ID = UUID.randomUUID();
     private static final UUID BOOKING_ID = UUID.randomUUID();
     private static final String GUEST_PHONE = "+380501234567";
@@ -139,7 +142,7 @@ class GuestVisitCancellationServiceTest {
             // The other half of the boundary: proves the 422 tests above fail for the WINDOW and not
             // because the fixture is uncancellable for some unrelated reason.
             liveVisitStartingAt(NOW.plusHours(2).plusMinutes(1));
-            when(appointmentRepository.consumeCancelToken(TOKEN)).thenReturn(1);
+            when(appointmentRepository.consumeCancelTokenHash(TOKEN_HASH)).thenReturn(1);
 
             assertThat(service.cancel(TOKEN)).isTrue();
 
@@ -154,13 +157,13 @@ class GuestVisitCancellationServiceTest {
 
         @Test
         @DisplayName("throws 404 and fires NO side-effect when the conditional consume updates 0 rows (replay / lost race)")
-        void should_throw404_when_consumeCancelTokenReturnsZero() {
-            // consumeCancelToken is the single-use gate: its WHERE guards on the token still being
+        void should_throw404_when_consumeCancelTokenHashReturnsZero() {
+            // consumeCancelTokenHash is the single-use gate: its WHERE guards on the token still being
             // present AND the header still CONFIRMED. A replayed link, or the loser of a concurrent
             // double-click, updates 0 rows and must abort BEFORE the items are cancelled — otherwise a
             // second caller re-cancels an already-cancelled visit and re-sends the guest an SMS.
             liveVisitStartingAt(CANCELLABLE_START);
-            when(appointmentRepository.consumeCancelToken(TOKEN)).thenReturn(0);
+            when(appointmentRepository.consumeCancelTokenHash(TOKEN_HASH)).thenReturn(0);
 
             assertThatThrownBy(() -> service.cancel(TOKEN))
                     .isInstanceOf(NotFoundException.class)
@@ -174,11 +177,11 @@ class GuestVisitCancellationServiceTest {
         @DisplayName("consumes the token exactly once on the happy path, then cancels the items and notifies")
         void should_consumeTokenOnce_when_visitIsCancellable() {
             liveVisitStartingAt(CANCELLABLE_START);
-            when(appointmentRepository.consumeCancelToken(TOKEN)).thenReturn(1);
+            when(appointmentRepository.consumeCancelTokenHash(TOKEN_HASH)).thenReturn(1);
 
             assertThat(service.cancel(TOKEN)).isTrue();
 
-            verify(appointmentRepository).consumeCancelToken(TOKEN);
+            verify(appointmentRepository).consumeCancelTokenHash(TOKEN_HASH);
             verify(bookingRepository).cancelItemsByAppointmentId(APPOINTMENT_ID);
             verify(outboxService).enqueueClientCancelled(BOOKING_ID);
             verify(smsService).send(eq(GUEST_PHONE), any());
@@ -192,14 +195,14 @@ class GuestVisitCancellationServiceTest {
         @Test
         @DisplayName("returns false without touching anything when the token matches no appointment header")
         void should_returnFalse_when_tokenIsNotAVisitHeader() {
-            when(appointmentRepository.findByCancelToken(TOKEN)).thenReturn(Optional.empty());
+            when(appointmentRepository.findByCancelTokenHash(TOKEN_HASH)).thenReturn(Optional.empty());
 
             assertThat(service.cancel(TOKEN))
                     .as("an unknown token is not this service's business — the caller falls through "
                             + "to the legacy single-booking path")
                     .isFalse();
 
-            verify(appointmentRepository, never()).consumeCancelToken(any());
+            verify(appointmentRepository, never()).consumeCancelTokenHash(any());
             verifyNoInteractions(
                     bookingRepository, outboxService, smsService, slotCalculationService, salonCatalogCacheEvictor);
         }
@@ -210,13 +213,13 @@ class GuestVisitCancellationServiceTest {
             // No state oracle: an already-cancelled visit must produce the SAME observable outcome as a
             // token that never existed. If this branch ever threw 422/409 instead, the public endpoint
             // would confirm to an unauthenticated caller that a given token WAS a real appointment.
-            when(appointmentRepository.findByCancelToken(TOKEN))
+            when(appointmentRepository.findByCancelTokenHash(TOKEN_HASH))
                     .thenReturn(Optional.of(appointment(BookingStatus.CANCELLED)));
 
             assertThat(service.cancel(TOKEN)).isFalse();
 
             verify(bookingRepository, never()).findByAppointmentIdWithGraph(any());
-            verify(appointmentRepository, never()).consumeCancelToken(any());
+            verify(appointmentRepository, never()).consumeCancelTokenHash(any());
             verifyNoInteractions(outboxService, smsService, slotCalculationService, salonCatalogCacheEvictor);
         }
 
@@ -224,13 +227,13 @@ class GuestVisitCancellationServiceTest {
         @DisplayName("returns false rather than blowing up when a CONFIRMED header has no items (defensive)")
         void should_returnFalse_when_confirmedHeaderHasNoItems() {
             // items.get(0) on an empty list would surface as a 500 on a permitAll endpoint.
-            when(appointmentRepository.findByCancelToken(TOKEN))
+            when(appointmentRepository.findByCancelTokenHash(TOKEN_HASH))
                     .thenReturn(Optional.of(appointment(BookingStatus.CONFIRMED)));
             when(bookingRepository.findByAppointmentIdWithGraph(APPOINTMENT_ID)).thenReturn(List.of());
 
             assertThat(service.cancel(TOKEN)).isFalse();
 
-            verify(appointmentRepository, never()).consumeCancelToken(any());
+            verify(appointmentRepository, never()).consumeCancelTokenHash(any());
             verifyNoInteractions(outboxService, smsService, slotCalculationService, salonCatalogCacheEvictor);
         }
     }
@@ -247,11 +250,11 @@ class GuestVisitCancellationServiceTest {
             // service name is provider-controlled free text, so a provider naming a service
             // "Манікюр {date} о {time}" rendered a SECOND, provider-positioned date/time line inside
             // copy the guest reads as platform text — and SMS is the only channel a guest has.
-            when(appointmentRepository.findByCancelToken(TOKEN))
+            when(appointmentRepository.findByCancelTokenHash(TOKEN_HASH))
                     .thenReturn(Optional.of(appointment(BookingStatus.CONFIRMED)));
             when(bookingRepository.findByAppointmentIdWithGraph(APPOINTMENT_ID))
                     .thenReturn(List.of(item(CANCELLABLE_START, "Манікюр {date} о {time}")));
-            when(appointmentRepository.consumeCancelToken(TOKEN)).thenReturn(1);
+            when(appointmentRepository.consumeCancelTokenHash(TOKEN_HASH)).thenReturn(1);
             ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
 
             service.cancel(TOKEN);
@@ -277,7 +280,7 @@ class GuestVisitCancellationServiceTest {
         void should_notifyProviderWithoutGuestSms_when_smsSuppressed() {
             Appointment header = appointment(BookingStatus.CONFIRMED);
             List<Booking> items = List.of(item(NOW.plusMinutes(30), "Манікюр"));
-            when(appointmentRepository.consumeCancelToken(TOKEN)).thenReturn(1);
+            when(appointmentRepository.consumeCancelTokenHash(TOKEN_HASH)).thenReturn(1);
 
             boolean cancelled = service.cancelGuestVisit(header, items, false);
 
@@ -298,14 +301,14 @@ class GuestVisitCancellationServiceTest {
             boolean cancelled = service.cancelGuestVisit(header, List.of(item(CANCELLABLE_START, "Манікюр")), false);
 
             assertThat(cancelled).isTrue();
-            verify(appointmentRepository, never()).consumeCancelToken(any());
+            verify(appointmentRepository, never()).consumeCancelTokenHash(any());
             verify(bookingRepository).cancelItemsByAppointmentId(APPOINTMENT_ID);
         }
 
         @Test
         @DisplayName("returns false and fires NO side-effects when a concurrent cancel already won")
         void should_returnFalse_when_headerUpdateMatchesNoRow() {
-            when(appointmentRepository.consumeCancelToken(TOKEN)).thenReturn(0);
+            when(appointmentRepository.consumeCancelTokenHash(TOKEN_HASH)).thenReturn(0);
 
             boolean cancelled = service.cancelGuestVisit(
                     appointment(BookingStatus.CONFIRMED), List.of(item(CANCELLABLE_START, "Манікюр")), true);
@@ -320,7 +323,7 @@ class GuestVisitCancellationServiceTest {
 
     /** Stubs a CONFIRMED header whose single item starts at {@code startsAt}. */
     private void liveVisitStartingAt(OffsetDateTime startsAt) {
-        when(appointmentRepository.findByCancelToken(TOKEN))
+        when(appointmentRepository.findByCancelTokenHash(TOKEN_HASH))
                 .thenReturn(Optional.of(appointment(BookingStatus.CONFIRMED)));
         when(bookingRepository.findByAppointmentIdWithGraph(APPOINTMENT_ID))
                 .thenReturn(List.of(item(startsAt, "Манікюр")));
@@ -328,7 +331,7 @@ class GuestVisitCancellationServiceTest {
 
     /** Q6 — a rejected cancel must leave the visit and every downstream side-effect untouched. */
     private void assertNothingWasCancelled() {
-        verify(appointmentRepository, never()).consumeCancelToken(any());
+        verify(appointmentRepository, never()).consumeCancelTokenHash(any());
         verify(bookingRepository, never()).cancelItemsByAppointmentId(any());
         verifyNoInteractions(outboxService, smsService, slotCalculationService, salonCatalogCacheEvictor);
     }

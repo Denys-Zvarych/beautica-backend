@@ -37,7 +37,7 @@ class AppointmentStaffFactoryTest {
         assertThat(appointment.getStatus()).isEqualTo(BookingStatus.CONFIRMED);
         assertThat(appointment.getBookingSource()).isEqualTo(BookingSource.STAFF);
         assertThat(appointment.getClient()).isNull();
-        assertThat(appointment.getCancelToken()).isNull();
+        assertThat(appointment.getCancelTokenHash()).isNull();
         assertThat(appointment.getGuestName()).isEqualTo("Олена");
         assertThat(appointment.getGuestSurname()).isEqualTo("Коваль");
         assertThat(appointment.getGuestPhone()).isEqualTo("+380501234567");

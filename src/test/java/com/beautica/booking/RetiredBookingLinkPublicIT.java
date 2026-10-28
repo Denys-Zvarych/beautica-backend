@@ -346,8 +346,9 @@ class RetiredBookingLinkPublicIT extends AbstractIntegrationTest {
         UUID svc = masterServiceOf(master.serviceDefId());
         ResponseEntity<String> created = guestBook(master.slug(), svc, today.plusDays(2), LocalTime.of(11, 0));
         assertThat(created.getStatusCode()).as(created.getBody()).isEqualTo(HttpStatus.CREATED);
-        UUID cancelToken = jdbcTemplate.queryForObject(
-                "SELECT cancel_token FROM bookings WHERE master_id = ?", UUID.class, master.masterId());
+        // V206: the DB holds only the token's hash — the raw token is the one handed to the guest.
+        String cancelToken = objectMapper.readTree(created.getBody()).path("cancelUrl").asText()
+                .replaceAll(".*/book/cancel/", "");
 
         regenerateMaster(master);
 
