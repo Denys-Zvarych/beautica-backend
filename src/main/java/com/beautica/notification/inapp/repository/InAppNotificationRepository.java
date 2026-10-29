@@ -449,18 +449,31 @@ public interface InAppNotificationRepository extends Repository<InAppNotificatio
      * the same rows and deadlocking on the DELETE; a skipped (locked) row is simply picked up by the next
      * batch/run. It does not change which index drives the subquery.
      *
-     * @return the number of rows actually deleted (may be less than {@code limit})
+     * <p><b>Why the locking select is a {@code MATERIALIZED} CTE, not an {@code IN}-sublink.</b> The
+     * earlier form {@code DELETE ... WHERE id IN (SELECT id ... LIMIT :limit FOR UPDATE SKIP LOCKED)}
+     * could delete MORE than {@code limit} rows: when the planner picks a nested-loop semi-join with
+     * the sublink on the inner side, the {@code LockRows} subquery is re-scanned per outer row, and on
+     * each re-scan it skips the tuples this same {@code DELETE} has already removed (self-modified, so
+     * "locked") and returns the next ones past the {@code LIMIT}. Reproduced on PostgreSQL 18 with 20
+     * eligible rows: {@code LIMIT 5} deleted 12. A batch that returns {@code != limit} also ends the
+     * {@code InAppNotificationCleanupJob} loop early, so the per-run budget accounting broke too (the
+     * plan flip is statistics-driven, which is why it surfaced only in one CI shard ordering). The
+     * {@code MATERIALIZED} CTE evaluates {@code LIMIT}/{@code FOR UPDATE SKIP LOCKED} exactly once —
+     * the same fix and rationale as {@code NotificationOutboxRepository#claimPendingBatch} and
+     * {@code ReviewInviteRepository#purgeTerminalBefore}.
+     *
+     * @return the number of rows actually deleted (never more than {@code limit}; may be less)
      */
     @Modifying
     @Query(value = """
-            DELETE FROM in_app_notification
-             WHERE id IN (
-                 SELECT id FROM in_app_notification
-                  WHERE created_at < :cutoff
-                  ORDER BY created_at, id
-                  LIMIT :limit
-                  FOR UPDATE SKIP LOCKED
-             )
+            WITH doomed AS MATERIALIZED (
+                SELECT id FROM in_app_notification
+                 WHERE created_at < :cutoff
+                 ORDER BY created_at, id
+                 LIMIT :limit
+                 FOR UPDATE SKIP LOCKED
+            )
+            DELETE FROM in_app_notification n USING doomed WHERE n.id = doomed.id
             """, nativeQuery = true)
     int deleteCreatedBefore(@Param("cutoff") Instant cutoff, @Param("limit") int limit);
 }

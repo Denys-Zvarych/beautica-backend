@@ -32,8 +32,8 @@ import static org.assertj.core.api.Assertions.fail;
  * Phase 335 QA follow-up — two concurrent {@link InAppNotificationCleanupJob#sweep()} calls racing
  * the SAME backlog.
  *
- * <p>{@code deleteCreatedBefore} is a bounded {@code DELETE ... WHERE id IN (SELECT ... LIMIT :limit
- * FOR UPDATE SKIP LOCKED)} (Phase 336): two overlapping sweeps each lock a DISJOINT batch, and a row
+ * <p>{@code deleteCreatedBefore} is a bounded {@code WITH doomed AS MATERIALIZED (SELECT ... LIMIT :limit
+ * FOR UPDATE SKIP LOCKED) DELETE ... USING doomed} (Phase 336): two overlapping sweeps each lock a DISJOINT batch, and a row
  * locked by anything else (e.g. an in-flight mark-read UPDATE) is skipped this run and picked up by
  * the next — never an exception, never a double delete, never a young row touched. This class drives
  * two REAL, overlapping {@code sweep()} calls against a shared backlog, and a sweep against a row

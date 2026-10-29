@@ -892,6 +892,41 @@ class InAppNotificationRepositoryIT extends AbstractDataJpaTest {
                 .contains("in_app_notification_created_idx");
     }
 
+    /**
+     * Regression (PR #174 CI, shard 2) — {@code deleteCreatedBefore} must never delete more than
+     * {@code limit} rows, whatever plan PostgreSQL picks. The former {@code DELETE ... WHERE id IN
+     * (SELECT ... LIMIT :limit FOR UPDATE SKIP LOCKED)} form, under a nested-loop semi-join that
+     * re-scans the locking sublink per outer row, skipped the tuples it had already deleted and
+     * returned the next ones: {@code LIMIT 5} over 20 eligible rows deleted 12. The planner settings
+     * below force exactly that plan shape (it surfaced in CI only through statistics drift); with the
+     * {@code MATERIALIZED} CTE the {@code LIMIT} is evaluated once and the count is exact.
+     */
+    @Test
+    @DisplayName("deleteCreatedBefore deletes exactly `limit` rows even when the planner picks a "
+            + "re-scanning nested-loop semi-join (no over-delete past LIMIT)")
+    void should_deleteExactlyLimitRows_when_plannerForcesRescanningNestedLoop() {
+        Instant old = Instant.parse("2020-01-01T00:00:00Z");
+        Instant cutoff = Instant.parse("2021-01-01T00:00:00Z");
+        for (int i = 0; i < 20; i++) {
+            insertWithCreatedAt(client.getId(), old);
+        }
+        // Transaction-local (the @DataJpaTest transaction): the plan shape that re-scanned the old
+        // IN-sublink. Reverts at the test's rollback.
+        for (String knob : List.of("enable_hashagg", "enable_hashjoin", "enable_mergejoin",
+                "enable_material", "enable_sort", "enable_incremental_sort")) {
+            jdbcTemplate.execute("SET LOCAL " + knob + " = off");
+        }
+
+        int deleted = repository.deleteCreatedBefore(cutoff, 5);
+
+        assertThat(deleted).as("one batch must delete exactly `limit` rows, never more").isEqualTo(5);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT count(*) FROM in_app_notification WHERE created_at < ?", Long.class,
+                java.sql.Timestamp.from(cutoff)))
+                .as("15 of the 20 eligible rows must remain after one LIMIT-5 batch")
+                .isEqualTo(15L);
+    }
+
     // ── type/dedup-regex/enum drift guard (audit-fix cycle 2, finding 2) ───────────────────────
 
     @Test
