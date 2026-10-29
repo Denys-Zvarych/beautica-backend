@@ -12,6 +12,7 @@ import com.beautica.moderation.entity.ReportStatus;
 import com.beautica.moderation.entity.ReportTargetType;
 import com.beautica.moderation.repository.ContentReportRepository;
 import com.beautica.moderation.repository.ModerationActionTokenRepository;
+import com.beautica.notification.inapp.service.InAppNotificationService;
 import com.beautica.review.entity.ModerationStatus;
 import com.beautica.review.service.ReviewModerationService;
 import com.beautica.review.service.ReviewModerationService.LockedReview;
@@ -25,7 +26,9 @@ import org.springframework.transaction.annotation.Transactional;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.LinkedHashSet;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 
 /**
@@ -47,6 +50,9 @@ import java.util.UUID;
  *
  * <p>Phase 414 D11: this is the ONE resolve path (curl and the e-mail buttons alike), and every successful resolve
  * revokes all live e-mail action links of the target in the same transaction, so no older e-mail can act again.
+ *
+ * <p>Phase 415: the same transaction writes the in-app outcome rows for the reporters and, on a content REMOVE, the
+ * author ({@link InAppNotificationService#notifyModerationOutcome}); a rolled-back resolve (409) writes none.
  */
 @Service
 @RequiredArgsConstructor
@@ -54,12 +60,16 @@ public class ModerationService {
 
     private static final Logger log = LoggerFactory.getLogger(ModerationService.class);
     private static final String REPORT_ALREADY_RESOLVED = "Report already resolved";
+    /** Same 8-char target id prefix as the phase-414 link log (security INFO: no full ids in logs). */
+    private static final int TARGET_ID_LOG_PREFIX = 8;
 
     private final ContentReportRepository contentReportRepository;
     private final ModerationActionTokenRepository actionTokenRepository;
     private final ReviewModerationService reviewModerationService;
     private final ProviderModerationLock providerLock;
     private final MediaService mediaService;
+    private final ModerationAuthorResolver authorResolver;
+    private final InAppNotificationService inAppNotificationService;
     private final Clock clock;
 
     @Transactional
@@ -73,6 +83,9 @@ public class ModerationService {
         UUID targetId = report.getTargetId();
         ModerationAction action = request.action();
         requireApplicable(type, action);
+        // Lock-free reads first (audit-fix cycle 1, PERF 4): the author ids are scalars, read before applyToTarget
+        // takes the review row lock / provider lock.
+        Set<UUID> authorIds = authorIdsOf(type, targetId, action);
 
         boolean targetExists = applyToTarget(type, targetId, action);
         ReportResolution resolution = targetExists ? resolutionOf(type, action) : ReportResolution.TARGET_GONE;
@@ -88,8 +101,9 @@ public class ModerationService {
             contentReportRepository.markTargetGone(type, targetId, now);
         }
         actionTokenRepository.revokeAllForTarget(type, targetId, now);
+        notifyOutcome(type, targetId, resolution, reportId, authorIds, now);
         log.info("Moderation: {} reports on {} {} resolved as {} (action {})",
-                resolved, type, targetId, resolution, action);
+                resolved, type, targetId.toString().substring(0, TARGET_ID_LOG_PREFIX), resolution, action);
         return new ResolveReportResponse(type, targetId, resolution, resolved);
     }
 
@@ -105,6 +119,20 @@ public class ModerationService {
     @Transactional(readOnly = true)
     public long countOpenReports(ReportTargetType type, UUID targetId) {
         return contentReportRepository.countByTargetTypeAndTargetIdAndStatus(type, targetId, ReportStatus.OPEN);
+    }
+
+    /** Phase 415: the author is looked up only when there will be removed content to tell them about. */
+    private Set<UUID> authorIdsOf(ReportTargetType type, UUID targetId, ModerationAction action) {
+        return action == ModerationAction.REMOVE ? authorResolver.resolve(type, targetId) : Set.of();
+    }
+
+    /** Phase 415 D8: feed rows for the reporters (and the author) in this transaction — curl and e-mail alike. */
+    private void notifyOutcome(ReportTargetType type, UUID targetId, ReportResolution resolution, UUID reportId,
+                               Set<UUID> authorIds, Instant resolvedAt) {
+        Set<UUID> reporterIds = new LinkedHashSet<>(
+                contentReportRepository.findReporterIdsResolvedAt(type, targetId, resolvedAt));
+        inAppNotificationService.notifyModerationOutcome(
+                new ModerationOutcome(type, resolution, reportId, reporterIds, authorIds));
     }
 
     private static void requireApplicable(ReportTargetType type, ModerationAction action) {

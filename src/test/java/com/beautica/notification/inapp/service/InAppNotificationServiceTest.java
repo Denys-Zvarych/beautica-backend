@@ -5,6 +5,9 @@ import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingSource;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
+import com.beautica.moderation.entity.ReportResolution;
+import com.beautica.moderation.entity.ReportTargetType;
+import com.beautica.moderation.service.ModerationOutcome;
 import com.beautica.notification.inapp.entity.InAppNotificationType;
 import com.beautica.notification.inapp.repository.InAppNotificationRepository;
 import com.beautica.salon.entity.Salon;
@@ -15,6 +18,7 @@ import java.time.Instant;
 import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -512,5 +516,107 @@ class InAppNotificationServiceTest {
         verify(repository).insertRequestDecisionWithPush(
                 "CATEGORY_REQUEST_REJECTED", requesterId, 5L, null, "CATEGORY_REQUEST_REJECTED:5");
         verify(repository, never()).insertRequestDecision(any(), any(), any(), any(), any());
+    }
+
+    // ── Phase 415 — moderation outcomes ──────────────────────────────────────────────────────────
+
+    @org.junit.jupiter.params.ParameterizedTest(name = "{0} {1} -> {2}")
+    @org.junit.jupiter.params.provider.CsvSource({
+            "REVIEW, REMOVED, REPORT_CONTENT_REMOVED",
+            "CLIENT_REVIEW, REMOVED, REPORT_CONTENT_REMOVED",
+            "PORTFOLIO_PHOTO, REMOVED, REPORT_CONTENT_REMOVED",
+            "REVIEW, RESTORED, REPORT_NO_VIOLATION",
+            "REVIEW, DISMISSED, REPORT_NO_VIOLATION",
+            "PORTFOLIO_PHOTO, DISMISSED, REPORT_NO_VIOLATION",
+            "REVIEW, TARGET_GONE, REPORT_REVIEWED",
+            "PORTFOLIO_PHOTO, TARGET_GONE, REPORT_REVIEWED",
+            "MASTER_PROFILE, ACTIONED, REPORT_REVIEWED",
+            "SALON_PROFILE, ACTIONED, REPORT_REVIEWED",
+            "CLIENT_PROFILE, ACTIONED, REPORT_REVIEWED",
+            "CLIENT_PROFILE, DISMISSED, REPORT_NO_VIOLATION"
+    })
+    @DisplayName("D1/D4/D5 — reporter type per target and resolution")
+    void should_mapReporterType_when_resolved(ReportTargetType target, ReportResolution resolution,
+                                              InAppNotificationType expected) {
+        UUID reporter = UUID.randomUUID();
+        UUID batch = UUID.randomUUID();
+
+        service.notifyModerationOutcome(new ModerationOutcome(target, resolution, batch, Set.of(reporter), null));
+
+        verify(repository).insertModerationOutcome(
+                eq(expected.name()), ids(reporter), eq(target.name()), eq(expected.name() + ":" + batch));
+        verify(repository, times(1)).insertModerationOutcome(any(), any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("REMOVE on content — reporters and the author each get one statement; the author type is CONTENT_REMOVED")
+    void should_notifyAuthor_when_contentRemoved() {
+        UUID reporter = UUID.randomUUID();
+        UUID author = UUID.randomUUID();
+        UUID batch = UUID.randomUUID();
+
+        service.notifyModerationOutcome(new ModerationOutcome(ReportTargetType.REVIEW, ReportResolution.REMOVED,
+                batch, Set.of(reporter), Set.of(author)));
+
+        verify(repository).insertModerationOutcome(eq("REPORT_CONTENT_REMOVED"), ids(reporter), eq("REVIEW"),
+                eq("REPORT_CONTENT_REMOVED:" + batch));
+        verify(repository).insertModerationOutcome(eq("CONTENT_REMOVED"), ids(author), eq("REVIEW"),
+                eq("CONTENT_REMOVED:" + batch));
+    }
+
+    @Test
+    @DisplayName("audit-fix PERF 2 — pre-resolved author ids (salon owner + admin) are written as-is in one statement; "
+            + "no Salon / User entity is loaded while the caller's moderation locks are held")
+    void should_writePreResolvedAuthorIds_without_loadingEntities() {
+        UUID adminId = UUID.randomUUID();
+        UUID batch = UUID.randomUUID();
+
+        service.notifyModerationOutcome(new ModerationOutcome(ReportTargetType.PORTFOLIO_PHOTO,
+                ReportResolution.REMOVED, batch, Set.of(), Set.of(ownerId, adminId)));
+
+        verify(repository).insertModerationOutcome(eq("CONTENT_REMOVED"), ids(ownerId, adminId),
+                eq("PORTFOLIO_PHOTO"), eq("CONTENT_REMOVED:" + batch));
+        verify(repository, times(1)).insertModerationOutcome(any(), any(), any(), any());
+        org.mockito.Mockito.verifyNoInteractions(salonRepository, userRepository);
+    }
+
+    @Test
+    @DisplayName("D6 — an author who also reported their own content gets the reporter row only")
+    void should_skipAuthorRow_when_authorIsReporter() {
+        UUID author = UUID.randomUUID();
+
+        service.notifyModerationOutcome(new ModerationOutcome(ReportTargetType.REVIEW, ReportResolution.REMOVED,
+                UUID.randomUUID(), Set.of(author), Set.of(author)));
+
+        verify(repository).insertModerationOutcome(eq("REPORT_CONTENT_REMOVED"), ids(author), any(), any());
+        verify(repository, never()).insertModerationOutcome(eq("CONTENT_REMOVED"), any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("D4 — DISMISS never notifies the author, even when one is passed")
+    void should_notNotifyAuthor_when_dismissed() {
+        service.notifyModerationOutcome(new ModerationOutcome(ReportTargetType.REVIEW, ReportResolution.DISMISSED,
+                UUID.randomUUID(), Set.of(), Set.of(UUID.randomUUID())));
+
+        verify(repository, never()).insertModerationOutcome(any(), any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("pushEnabled=true routes moderation outcomes to the push twin")
+    void should_usePushTwin_when_pushEnabledModerationOutcome() {
+        service = new InAppNotificationService(
+                repository, salonRepository, new InAppRecipientResolver(userRepository), true);
+
+        service.notifyModerationOutcome(new ModerationOutcome(ReportTargetType.SALON_PROFILE,
+                ReportResolution.ACTIONED, UUID.randomUUID(), Set.of(UUID.randomUUID()), null));
+
+        verify(repository).insertModerationOutcomeWithPush(eq("REPORT_REVIEWED"), any(), eq("SALON_PROFILE"), any());
+        verify(repository, never()).insertModerationOutcome(any(), any(), any(), any());
+    }
+
+    /** Matches the recipient-id array bound to {@code = ANY(CAST(:recipientIds AS uuid[]))}, order-insensitive. */
+    private static UUID[] ids(UUID... expected) {
+        return org.mockito.ArgumentMatchers.argThat(actual -> actual != null
+                && actual.length == expected.length && Set.of(actual).equals(Set.of(expected)));
     }
 }

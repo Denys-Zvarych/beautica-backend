@@ -298,7 +298,27 @@ class PushCopyTest {
                 .containsExactly("counterpartName", "serviceName", "serviceCount", "startsAt",
                         "salonName", "masterName", "subjectName", "subjectRole",
                         // phase 372: a category name and the admin's reject reason (free text, never on a lock screen)
-                        "categoryName", "decisionReason");
+                        "categoryName", "decisionReason",
+                        // phase 415: an enum (content kind of a moderation outcome), never free text
+                        "contentKind");
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest(name = "{0} / {1}")
+    @org.junit.jupiter.params.provider.CsvSource(delimiter = '|', value = {
+            "REPORT_CONTENT_REMOVED | REVIEW          | Дякуємо! Ми переглянули вашу скаргу, і вміст видалено.",
+            "REPORT_NO_VIOLATION    | PORTFOLIO_PHOTO | Ми переглянули вашу скаргу і не знайшли порушень правил.",
+            "REPORT_REVIEWED        | PROFILE         | Дякуємо! Ми переглянули вашу скаргу.",
+            "CONTENT_REMOVED        | REVIEW          | Ваш відгук видалено через порушення правил спільноти.",
+            "CONTENT_REMOVED        | CLIENT_REVIEW   | Ваш відгук про клієнта видалено через порушення правил спільноти.",
+            "CONTENT_REMOVED        | PORTFOLIO_PHOTO | Ваше фото видалено через порушення правил спільноти."
+    })
+    @DisplayName("phase 415: moderation outcome bodies are the locked feed texts per content kind")
+    void should_useLockedCopy_when_moderationOutcome(InAppNotificationType type,
+                                                     com.beautica.notification.inapp.dto.ModeratedContentKind kind,
+                                                     String expected) {
+        String body = PushCopy.body(type, true, NotificationParams.moderationOutcome(kind));
+
+        assertThat(body).isEqualTo(expected);
     }
 
     @Test

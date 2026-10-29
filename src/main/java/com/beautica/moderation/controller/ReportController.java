@@ -2,8 +2,10 @@ package com.beautica.moderation.controller;
 
 import com.beautica.common.ApiResponse;
 import com.beautica.common.security.AuthenticationUtils;
+import com.beautica.common.web.PerViewerResponses;
 import com.beautica.moderation.dto.CreateReportRequest;
 import com.beautica.moderation.dto.ReportResponse;
+import com.beautica.moderation.dto.ReportedTargetResponse;
 import com.beautica.moderation.service.ContentReportService;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.responses.ApiResponses;
@@ -13,14 +15,18 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.Authentication;
+import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.util.List;
+
 /**
  * Phase 395 — in-app UGC reporting (Google Play UGC policy). Every role may report (D8); the business rules
  * (visibility, self-report, idempotency, rate limit) live in {@link ContentReportService}.
+ * {@code GET /mine} (phase 415 add-on) lists every target the caller has reported.
  */
 @RestController
 @RequestMapping("/api/v1/reports")
@@ -55,5 +61,23 @@ public class ReportController {
                 AuthenticationUtils.userId(authentication), AuthenticationUtils.role(authentication), request);
         HttpStatus status = result.created() ? HttpStatus.CREATED : HttpStatus.OK;
         return ResponseEntity.status(status).body(ApiResponse.ok(result.report()));
+    }
+
+    @Operation(
+            summary = "My reported targets",
+            description = """
+                    Every target the caller has reported, OPEN or RESOLVED (newest first, at most 1000), so the app \
+                    can hide the report action for them. One report per user and target is permanent, so a resolved \
+                    report stays listed. The body is per caller: it is sent with Cache-Control: no-store and \
+                    Vary: Authorization.""")
+    @ApiResponses({
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(responseCode = "200", description = "Reported targets"),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(responseCode = "401", description = "Not authenticated")
+    })
+    @GetMapping("/mine")
+    @PreAuthorize("hasAnyRole('CLIENT','SALON_OWNER','SALON_ADMIN','SALON_MASTER','INDEPENDENT_MASTER')")
+    public ResponseEntity<ApiResponse<List<ReportedTargetResponse>>> myReports(Authentication authentication) {
+        return PerViewerResponses.ok(ApiResponse.ok(
+                contentReportService.findMyReportTargets(AuthenticationUtils.userId(authentication))));
     }
 }

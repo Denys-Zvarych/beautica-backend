@@ -155,4 +155,22 @@ public interface MediaRepository extends JpaRepository<MediaFile, UUID> {
      * {@code r2_key}.
      */
     boolean existsByEntityTypeAndEntityIdAndR2Key(EntityType entityType, UUID entityId, String r2Key);
+
+    /** Phase 415 — who answers for a portfolio photo: the salon it belongs to, or the master's account. */
+    interface PortfolioOwnerRef {
+        UUID getSalonId();
+
+        UUID getMasterUserId();
+    }
+
+    /** Phase 415 — scalar owner lookup of a PORTFOLIO row (nothing enters the persistence context). */
+    @Query(value = """
+            SELECT CASE WHEN mf.entity_type = 'SALON' THEN mf.entity_id END AS salonId,
+                   m.user_id AS masterUserId
+              FROM media_files mf
+              LEFT JOIN masters m ON mf.entity_type = 'MASTER' AND m.id = mf.entity_id
+             WHERE mf.id = :mediaId
+               AND mf.media_type = 'PORTFOLIO'
+            """, nativeQuery = true)
+    Optional<PortfolioOwnerRef> findPortfolioOwnerRefById(@Param("mediaId") UUID mediaId);
 }

@@ -43,7 +43,9 @@ import java.util.UUID;
                 // ux_content_reports_reporter_target (WHERE reporter_user_id IS NOT NULL), idx_content_reports_open_created
                 // (WHERE status = 'OPEN') and idx_content_reports_target_gone (WHERE target_gone_at IS NOT NULL) are
                 // partial indexes (V208), as is idx_content_reports_resolved_at (resolved_at DESC, id DESC WHERE
-                // status = 'RESOLVED', V209) — not expressible in JPA @Index.
+                // status = 'RESOLVED', V209) and idx_content_reports_reporter_created ((reporter_user_id, created_at DESC,
+                // id DESC) INCLUDE (target_type, target_id) WHERE reporter_user_id IS NOT NULL, V220) — not expressible
+                // in JPA @Index.
                 @Index(name = "idx_content_reports_target", columnList = "target_type, target_id")
         }
 )

@@ -9,6 +9,7 @@ import com.beautica.common.exception.NotFoundException;
 import com.beautica.config.WebMvcTestSupport;
 import com.beautica.moderation.dto.CreateReportRequest;
 import com.beautica.moderation.dto.ReportResponse;
+import com.beautica.moderation.dto.ReportedTargetResponse;
 import com.beautica.moderation.entity.ReportReason;
 import com.beautica.moderation.entity.ReportStatus;
 import com.beautica.moderation.entity.ReportTargetType;
@@ -50,6 +51,7 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.authentication;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
@@ -284,6 +286,45 @@ class ReportControllerTest {
 
     private static CreateReportResult result(boolean created) {
         return new CreateReportResult(new ReportResponse(REPORT_ID, ReportStatus.OPEN, CREATED_AT), created);
+    }
+
+    // ── GET /reports/mine (phase 415 add-on) ───────────────────────────────────
+
+    @ParameterizedTest(name = "{0}")
+    @EnumSource(Role.class)
+    @DisplayName("GET /mine → 200 for every role, the caller's targets from the principal, no-store + Vary")
+    void should_returnOwnTargets_when_mine(Role role) throws Exception {
+        when(contentReportService.findMyReportTargets(USER_ID))
+                .thenReturn(List.of(new ReportedTargetResponse(ReportTargetType.REVIEW, TARGET_ID)));
+
+        mockMvc.perform(get(URL + "/mine").with(authenticatedAs(role)))
+                .andExpect(status().isOk())
+                .andExpect(header().string("Cache-Control", containsString("no-store")))
+                .andExpect(header().string("Vary", containsString("Authorization")))
+                .andExpect(jsonPath("$.data[0].targetType").value("REVIEW"))
+                .andExpect(jsonPath("$.data[0].targetId").value(TARGET_ID.toString()))
+                .andExpect(jsonPath("$.data[0].reason").doesNotExist());
+
+        verify(contentReportService).findMyReportTargets(USER_ID);
+    }
+
+    @Test
+    @DisplayName("GET /mine → 200 with an empty list when the caller has no report")
+    void should_returnEmptyList_when_noReports() throws Exception {
+        when(contentReportService.findMyReportTargets(USER_ID)).thenReturn(List.of());
+
+        mockMvc.perform(get(URL + "/mine").with(authenticatedAs(Role.CLIENT)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data").isEmpty());
+    }
+
+    @Test
+    @DisplayName("GET /mine without authentication → 401, service never called")
+    void should_return401_when_mineUnauthenticated() throws Exception {
+        mockMvc.perform(get(URL + "/mine"))
+                .andExpect(status().isUnauthorized());
+
+        verifyNoInteractions(contentReportService);
     }
 
     private static RequestPostProcessor authenticatedAs(Role role) {

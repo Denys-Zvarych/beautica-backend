@@ -146,4 +146,20 @@ public interface ClientReviewRepository extends JpaRepository<ClientReview, UUID
     @Modifying
     @Query("DELETE FROM ClientReview cr WHERE cr.subjectClient.id = :subjectClientId")
     void deleteBySubjectClientId(@Param("subjectClientId") UUID subjectClientId);
+
+    /** Phase 415 — who answers for a client review: the author master's account and, for a salon review, the salon. */
+    interface ClientReviewAuthorRef {
+        UUID getMasterUserId();
+
+        UUID getSalonId();
+    }
+
+    /** Phase 415 — scalar author lookup (nothing enters the persistence context). */
+    @Query(value = """
+            SELECT m.user_id AS masterUserId, cr.salon_id AS salonId
+              FROM client_reviews cr
+              JOIN masters m ON m.id = cr.author_master_id
+             WHERE cr.id = :clientReviewId
+            """, nativeQuery = true)
+    Optional<ClientReviewAuthorRef> findAuthorRefById(@Param("clientReviewId") UUID clientReviewId);
 }

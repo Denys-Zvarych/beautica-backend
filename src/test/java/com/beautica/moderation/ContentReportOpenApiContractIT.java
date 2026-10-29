@@ -57,6 +57,21 @@ class ContentReportOpenApiContractIT extends AbstractIntegrationTest {
                 .containsExactlyInAnyOrder("id", "status", "createdAt");
     }
 
+    @Test
+    @DisplayName("phase 415 add-on: GET /api/v1/reports/mine is documented with ReportedTargetResponse {targetType, targetId}")
+    void should_exposeMyReportsEndpoint_when_specRendered() throws Exception {
+        JsonNode spec = objectMapper.readTree(restTemplate.getForEntity("/api-docs", String.class).getBody());
+
+        JsonNode get = spec.path("paths").path("/api/v1/reports/mine").path("get");
+
+        assertThat(get.isMissingNode()).as("GET /api/v1/reports/mine must be in the spec").isFalse();
+        assertThat(fieldNames(get.path("responses"))).contains("200", "401");
+        JsonNode item = spec.path("components").path("schemas").path("ReportedTargetResponse");
+        assertThat(fieldNames(item.path("properties"))).containsExactlyInAnyOrder("targetType", "targetId");
+        assertThat(textValues(item.path("properties").path("targetType").path("enum"))).containsExactlyInAnyOrder(
+                "REVIEW", "CLIENT_REVIEW", "PORTFOLIO_PHOTO", "MASTER_PROFILE", "SALON_PROFILE", "CLIENT_PROFILE");
+    }
+
     private static List<String> fieldNames(JsonNode node) {
         List<String> names = new ArrayList<>();
         node.fieldNames().forEachRemaining(names::add);

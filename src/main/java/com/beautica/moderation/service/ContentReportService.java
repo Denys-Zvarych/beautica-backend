@@ -6,6 +6,7 @@ import com.beautica.common.exception.ContentReportRateLimitedException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.moderation.dto.CreateReportRequest;
 import com.beautica.moderation.dto.ReportResponse;
+import com.beautica.moderation.dto.ReportedTargetResponse;
 import com.beautica.moderation.entity.ContentReport;
 import com.beautica.moderation.entity.ReportReason;
 import com.beautica.moderation.entity.ReportStatus;
@@ -18,6 +19,7 @@ import lombok.RequiredArgsConstructor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -26,6 +28,7 @@ import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -59,6 +62,9 @@ public class ContentReportService {
 
     /** {@code Retry-After} for D6 — the 24-hour window of {@code RateLimitConfig#contentReportBuckets}. */
     static final long RATE_LIMIT_RETRY_AFTER_SECONDS = Duration.ofHours(24).toSeconds();
+
+    /** Upper bound of {@code GET /reports/mine}. */
+    static final int MY_REPORTS_LIMIT = 1000;
 
     private final ContentReportRepository contentReportRepository;
     private final ReportTargetVisibilityResolver visibilityResolver;
@@ -126,6 +132,16 @@ public class ContentReportService {
                 id, request.targetType(), request.targetId(), request.reason(), reporterId, burst, comment));
         log.info("Content report {} created on {} by user {}", id, request.targetType(), reporterId);
         return new CreateReportResult(new ReportResponse(id, ReportStatus.OPEN, createdAt), true);
+    }
+
+    /**
+     * Every target the caller has reported, OPEN or RESOLVED, newest first, at most {@link #MY_REPORTS_LIMIT}. A report
+     * is permanent per (reporter, target) — a repeat answers the existing report (D4) — so a resolved report stays
+     * listed and the app keeps the report action hidden. One indexed query.
+     */
+    @Transactional(readOnly = true)
+    public List<ReportedTargetResponse> findMyReportTargets(UUID reporterId) {
+        return contentReportRepository.findTargetsByReporter(reporterId, PageRequest.of(0, MY_REPORTS_LIMIT));
     }
 
     private static String normalizeComment(String comment) {

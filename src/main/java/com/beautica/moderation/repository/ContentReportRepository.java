@@ -1,5 +1,6 @@
 package com.beautica.moderation.repository;
 
+import com.beautica.moderation.dto.ReportedTargetResponse;
 import com.beautica.moderation.entity.ContentReport;
 import com.beautica.moderation.entity.ReportResolution;
 import com.beautica.moderation.entity.ReportStatus;
@@ -366,4 +367,40 @@ public interface ContentReportRepository extends JpaRepository<ContentReport, UU
             DELETE FROM content_reports cr USING due WHERE cr.id = due.id
             """, nativeQuery = true)
     int deleteGoneBefore(@Param("cutoff") Instant cutoff, @Param("batchSize") int batchSize);
+
+    // ── Outcome notifications (phase 415) / own reports (phase 415 add-on) ──────────────────
+
+    /**
+     * Phase 415 D6 — distinct reporters of the reports ONE resolve call just closed: the call stamps every report it
+     * closes with the same microsecond {@code resolved_at}, so earlier resolutions of the same target never match.
+     * Deleted reporters ({@code null}) are excluded. Served by {@code idx_content_reports_target}.
+     */
+    @Query("""
+            SELECT DISTINCT cr.reporterUserId FROM ContentReport cr
+             WHERE cr.targetType = :targetType
+               AND cr.targetId = :targetId
+               AND cr.status = com.beautica.moderation.entity.ReportStatus.RESOLVED
+               AND cr.resolvedAt = :resolvedAt
+               AND cr.reporterUserId IS NOT NULL
+            """)
+    List<UUID> findReporterIdsResolvedAt(
+            @Param("targetType") ReportTargetType targetType,
+            @Param("targetId") UUID targetId,
+            @Param("resolvedAt") Instant resolvedAt);
+
+    /**
+     * Every report the caller ever filed, OPEN and RESOLVED, newest first, bounded by {@code pageable}
+     * ({@code GET /reports/mine}). One report per (reporter, target) is permanent (V208 unique index), so a resolved
+     * report still blocks a repeat and must stay listed. Served by {@code idx_content_reports_reporter_created}
+     * (V220: same key order as the ORDER BY, INCLUDE target_type/target_id), so the LIMIT stops an ordered index scan
+     * with no per-call sort.
+     */
+    @Query("""
+            SELECT new com.beautica.moderation.dto.ReportedTargetResponse(cr.targetType, cr.targetId)
+              FROM ContentReport cr
+             WHERE cr.reporterUserId = :reporterId
+             ORDER BY cr.createdAt DESC, cr.id DESC
+            """)
+    List<ReportedTargetResponse> findTargetsByReporter(
+            @Param("reporterId") UUID reporterId, Pageable pageable);
 }

@@ -5,6 +5,7 @@ import com.beautica.service.entity.ServiceTypeSuggestion;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingSource;
 import com.beautica.master.entity.Master;
+import com.beautica.moderation.service.ModerationOutcome;
 import com.beautica.notification.inapp.entity.InAppNotificationType;
 import com.beautica.notification.inapp.repository.InAppNotificationRepository;
 import com.beautica.salon.entity.Salon;
@@ -383,6 +384,46 @@ public class InAppNotificationService {
                 : InAppNotificationType.SERVICE_TYPE_SUGGESTION_REJECTED;
         writeRequestDecision(type, requesterId, null, suggestion.getId(), dedupKey(type, suggestion.getId()));
         log.debug("in-app notify type={} suggestionId={}", type, suggestion.getId());
+    }
+
+    /**
+     * Phase 415 D6 / D8 — the feed rows for one {@code ModerationService#resolve} call, in its transaction (a rolled
+     * back resolve writes nothing). Reporters get the outcome type; the author of removed content gets
+     * {@code CONTENT_REMOVED}, unless they are also a reporter (no double row). The author ids (a salon's owner + active
+     * admins for salon content) arrive pre-resolved as scalars, so nothing is loaded here while the caller's
+     * moderation locks are held. Guests have no account and so never appear here. One statement per recipient group.
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void notifyModerationOutcome(ModerationOutcome outcome) {
+        InAppNotificationType reporterType =
+                ModerationOutcomeTypes.reporterType(outcome.targetType(), outcome.resolution());
+        Set<UUID> reporters = outcome.reporterIds();
+        writeModerationOutcome(reporterType, reporters, outcome);
+
+        Set<UUID> authors = Set.of();
+        if (ModerationOutcomeTypes.notifiesAuthor(outcome.targetType(), outcome.resolution())) {
+            authors = new LinkedHashSet<>(outcome.authorIds());
+            authors.removeAll(reporters);
+            writeModerationOutcome(InAppNotificationType.CONTENT_REMOVED, authors, outcome);
+        }
+        // D11: types and counts only — never a user id, comment or content.
+        log.info("in-app moderation outcome targetType={} resolution={} reporterType={} reporters={} authors={}",
+                outcome.targetType(), outcome.resolution(), reporterType, reporters.size(), authors.size());
+    }
+
+    private void writeModerationOutcome(
+            InAppNotificationType type, Set<UUID> recipients, ModerationOutcome outcome) {
+        if (recipients.isEmpty()) {
+            return;
+        }
+        String targetType = outcome.targetType().name();
+        String dedupKey = dedupKey(type, outcome.batchReportId());
+        UUID[] recipientIds = recipients.toArray(UUID[]::new);
+        if (pushEnabled) {
+            repository.insertModerationOutcomeWithPush(type.name(), recipientIds, targetType, dedupKey);
+            return;
+        }
+        repository.insertModerationOutcome(type.name(), recipientIds, targetType, dedupKey);
     }
 
     private void writeRequestDecision(

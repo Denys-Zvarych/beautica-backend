@@ -313,7 +313,9 @@ class InAppNotificationRepositoryIT extends AbstractDataJpaTest {
     @ParameterizedTest
     @EnumSource(value = InAppNotificationType.class, mode = EnumSource.Mode.EXCLUDE, names = {
             "CATEGORY_REQUEST_APPROVED", "CATEGORY_REQUEST_REJECTED",
-            "SERVICE_TYPE_SUGGESTION_APPROVED", "SERVICE_TYPE_SUGGESTION_REJECTED"})
+            "SERVICE_TYPE_SUGGESTION_APPROVED", "SERVICE_TYPE_SUGGESTION_REJECTED",
+            // phase 415: moderation outcomes carry no booking — covered by their own shape/push tests
+            "REPORT_CONTENT_REMOVED", "REPORT_NO_VIOLATION", "REPORT_REVIEWED", "CONTENT_REMOVED"})
     @DisplayName("in_app_notification_dedup_key_chk (V183) — every one of the 10 booking-keyed TYPE literals accepts "
             + "the common TYPE:uuid form, not just the 2-3 spot-checked above")
     void should_acceptTypeColonUuid_when_everyEnumType(InAppNotificationType type) {
@@ -680,7 +682,9 @@ class InAppNotificationRepositoryIT extends AbstractDataJpaTest {
 
     @ParameterizedTest
     @EnumSource(value = InAppNotificationType.class, mode = EnumSource.Mode.EXCLUDE, names = {"INVITE_ACCEPTED",
-            "CATEGORY_REQUEST_APPROVED", "CATEGORY_REQUEST_REJECTED", "SERVICE_TYPE_SUGGESTION_APPROVED", "SERVICE_TYPE_SUGGESTION_REJECTED"})
+            "CATEGORY_REQUEST_APPROVED", "CATEGORY_REQUEST_REJECTED", "SERVICE_TYPE_SUGGESTION_APPROVED", "SERVICE_TYPE_SUGGESTION_REJECTED",
+            // phase 415: moderation outcomes carry no booking — covered by their own shape/push tests
+            "REPORT_CONTENT_REMOVED", "REPORT_NO_VIOLATION", "REPORT_REVIEWED", "CONTENT_REMOVED"})
     @DisplayName("in_app_notification_shape_chk — booking_id alone satisfies every booking/review type")
     void should_acceptWithBookingIdOnly_when_rawInsert(InAppNotificationType type) {
         int inserted = repository.insertIgnoringDuplicate(UUID.randomUUID(), client.getId(), type.name(),
@@ -1418,7 +1422,9 @@ class InAppNotificationRepositoryIT extends AbstractDataJpaTest {
 
     @ParameterizedTest
     @EnumSource(value = InAppNotificationType.class, mode = EnumSource.Mode.EXCLUDE, names = {
-            "CATEGORY_REQUEST_APPROVED", "CATEGORY_REQUEST_REJECTED", "SERVICE_TYPE_SUGGESTION_APPROVED", "SERVICE_TYPE_SUGGESTION_REJECTED"})
+            "CATEGORY_REQUEST_APPROVED", "CATEGORY_REQUEST_REJECTED", "SERVICE_TYPE_SUGGESTION_APPROVED", "SERVICE_TYPE_SUGGESTION_REJECTED",
+            // phase 415: moderation outcomes carry no booking — covered by their own shape/push tests
+            "REPORT_CONTENT_REMOVED", "REPORT_NO_VIOLATION", "REPORT_REVIEWED", "CONTENT_REMOVED"})
     @DisplayName("insertForRecipientsWithPush writes exactly one INAPP_PUSH row per feed row, for every "
             + "type — aggregate_id is the feed row id, status PENDING, NO payload (ids only)")
     void should_writeOnePushRowPerFeedRow_when_insertForRecipientsWithPush(InAppNotificationType type) {
@@ -1443,6 +1449,41 @@ class InAppNotificationRepositoryIT extends AbstractDataJpaTest {
             assertThat(((Number) r.get("attempts")).intValue()).isZero();
             assertThat(r.get("payload")).as("ids only — nothing rendered or personal in the outbox").isNull();
         });
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = InAppNotificationType.class, names = {
+            "REPORT_CONTENT_REMOVED", "REPORT_NO_VIOLATION", "REPORT_REVIEWED", "CONTENT_REMOVED"})
+    @DisplayName("phase 415: insertModerationOutcomeWithPush writes one feed row + one INAPP_PUSH row per recipient; "
+            + "a replay of the same dedup key writes nothing")
+    void should_writeOnePushRowPerFeedRow_when_insertModerationOutcomeWithPush(InAppNotificationType type) {
+        giveEveryUserAToken();
+        String dedup = type.name() + ":" + UUID.randomUUID();
+
+        int written = repository.insertModerationOutcomeWithPush(
+                type.name(), new UUID[] {client.getId(), teammate.getId()}, "PORTFOLIO_PHOTO", dedup);
+        int replay = repository.insertModerationOutcomeWithPush(
+                type.name(), new UUID[] {client.getId(), teammate.getId()}, "PORTFOLIO_PHOTO", dedup);
+
+        assertThat(written).isEqualTo(2);
+        assertThat(replay).isZero();
+        assertThat(countRows()).isEqualTo(2);
+        assertThat(countPushRows()).isEqualTo(2);
+        assertThat(jdbcTemplate.queryForList("SELECT moderated_target_type FROM in_app_notification", String.class))
+                .containsOnly("PORTFOLIO_PHOTO");
+    }
+
+    @Test
+    @DisplayName("phase 415: insertModerationOutcome skips a deactivated recipient")
+    void should_skipInactiveRecipient_when_insertModerationOutcome() {
+        jdbcTemplate.update("UPDATE users SET is_active = false WHERE id = ?", teammate.getId());
+
+        int written = repository.insertModerationOutcome("REPORT_REVIEWED",
+                new UUID[] {client.getId(), teammate.getId()}, "SALON_PROFILE", "REPORT_REVIEWED:" + UUID.randomUUID());
+
+        assertThat(written).isEqualTo(1);
+        assertThat(jdbcTemplate.queryForList("SELECT recipient_user_id FROM in_app_notification", UUID.class))
+                .containsExactly(client.getId());
     }
 
     @Test

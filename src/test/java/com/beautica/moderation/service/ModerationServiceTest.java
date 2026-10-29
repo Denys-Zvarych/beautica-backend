@@ -12,6 +12,7 @@ import com.beautica.moderation.entity.ReportStatus;
 import com.beautica.moderation.entity.ReportTargetType;
 import com.beautica.moderation.repository.ContentReportRepository;
 import com.beautica.moderation.repository.ModerationActionTokenRepository;
+import com.beautica.notification.inapp.service.InAppNotificationService;
 import com.beautica.review.entity.ModerationStatus;
 import com.beautica.review.service.ReviewModerationService;
 import com.beautica.review.service.ReviewModerationService.LockedReview;
@@ -21,6 +22,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
+import org.mockito.InOrder;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.beans.BeanUtils;
@@ -30,13 +32,16 @@ import org.springframework.test.util.ReflectionTestUtils;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
@@ -65,12 +70,18 @@ class ModerationServiceTest {
     @Mock
     private ModerationActionTokenRepository actionTokenRepository;
 
+    @Mock
+    private ModerationAuthorResolver authorResolver;
+
+    @Mock
+    private InAppNotificationService inAppNotificationService;
+
     private ModerationService service;
 
     @BeforeEach
     void setUp() {
         service = new ModerationService(repository, actionTokenRepository, reviewModerationService, providerLock,
-                mediaService, Clock.fixed(NOW, ZoneOffset.UTC));
+                mediaService, authorResolver, inAppNotificationService, Clock.fixed(NOW, ZoneOffset.UTC));
     }
 
     @Test
@@ -308,6 +319,84 @@ class ModerationServiceTest {
         long count = service.countOpenReports(ReportTargetType.REVIEW, TARGET_ID);
 
         assertThat(count).isEqualTo(4L);
+    }
+
+    // ── phase 415: in-app outcome notifications ──────────────────────────────────────────────
+
+    @Test
+    @DisplayName("phase 415: REMOVE resolves the author BEFORE the action and hands reporters + author to the feed")
+    void should_notifyReportersAndAuthor_when_removeOnPhoto() {
+        stubReport(ReportTargetType.PORTFOLIO_PHOTO, ReportStatus.OPEN);
+        Set<UUID> author = Set.of(UUID.randomUUID(), UUID.randomUUID());
+        when(authorResolver.resolve(ReportTargetType.PORTFOLIO_PHOTO, TARGET_ID)).thenReturn(new java.util.LinkedHashSet<>(author));
+        when(mediaService.deletePortfolioPhotoForModeration(TARGET_ID)).thenReturn(true);
+        stubResolved(2);
+        UUID reporterA = UUID.randomUUID();
+        UUID reporterB = UUID.randomUUID();
+        when(repository.findReporterIdsResolvedAt(ReportTargetType.PORTFOLIO_PHOTO, TARGET_ID, NOW))
+                .thenReturn(List.of(reporterA, reporterB));
+
+        service.resolve(REPORT_ID, new ResolveReportRequest(ModerationAction.REMOVE, null));
+
+        InOrder order = inOrder(authorResolver, mediaService, inAppNotificationService);
+        order.verify(authorResolver).resolve(ReportTargetType.PORTFOLIO_PHOTO, TARGET_ID);
+        order.verify(mediaService).deletePortfolioPhotoForModeration(TARGET_ID);
+        order.verify(inAppNotificationService).notifyModerationOutcome(new ModerationOutcome(
+                ReportTargetType.PORTFOLIO_PHOTO, ReportResolution.REMOVED, REPORT_ID,
+                Set.of(reporterA, reporterB), author));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @EnumSource(value = ModerationAction.class, names = {"RESTORE", "DISMISS"})
+    @DisplayName("phase 415: RESTORE / DISMISS never looks up an author; the outcome carries none")
+    void should_notResolveAuthor_when_notRemove(ModerationAction action) {
+        stubReport(ReportTargetType.REVIEW, ReportStatus.OPEN);
+        stubLockedReview();
+        stubResolved(1);
+        UUID reporter = UUID.randomUUID();
+        when(repository.findReporterIdsResolvedAt(ReportTargetType.REVIEW, TARGET_ID, NOW))
+                .thenReturn(List.of(reporter));
+        ReportResolution expected = action == ModerationAction.RESTORE
+                ? ReportResolution.RESTORED : ReportResolution.DISMISSED;
+
+        service.resolve(REPORT_ID, new ResolveReportRequest(action, null));
+
+        verifyNoInteractions(authorResolver);
+        verify(inAppNotificationService).notifyModerationOutcome(new ModerationOutcome(
+                ReportTargetType.REVIEW, expected, REPORT_ID, Set.of(reporter), Set.of()));
+    }
+
+    @Test
+    @DisplayName("audit-fix PERF 2/4: on a review REMOVE the author ids are read BEFORE the review row lock and the "
+            + "provider lock, and handed to the feed unchanged")
+    void should_resolveAuthorIdsBeforeLocks_when_removeOnReview() {
+        stubReport(ReportTargetType.REVIEW, ReportStatus.OPEN);
+        UUID author = UUID.randomUUID();
+        when(authorResolver.resolve(ReportTargetType.REVIEW, TARGET_ID))
+                .thenReturn(new java.util.LinkedHashSet<>(Set.of(author)));
+        LockedReview locked = stubLockedReview();
+        stubResolved(1);
+
+        service.resolve(REPORT_ID, new ResolveReportRequest(ModerationAction.REMOVE, null));
+
+        InOrder order = inOrder(authorResolver, reviewModerationService, providerLock, inAppNotificationService);
+        order.verify(authorResolver).resolve(ReportTargetType.REVIEW, TARGET_ID);
+        order.verify(reviewModerationService).lockReview(TARGET_ID);
+        order.verify(providerLock).lock(locked);
+        order.verify(inAppNotificationService).notifyModerationOutcome(new ModerationOutcome(
+                ReportTargetType.REVIEW, ReportResolution.REMOVED, REPORT_ID, Set.of(), Set.of(author)));
+    }
+
+    @Test
+    @DisplayName("phase 415: a 409 resolve (nothing left to close) notifies nobody")
+    void should_notNotify_when_conflict() {
+        stubReport(ReportTargetType.SALON_PROFILE, ReportStatus.OPEN);
+        stubResolved(0);
+
+        assertThatThrownBy(() -> service.resolve(REPORT_ID, new ResolveReportRequest(ModerationAction.REMOVE, null)))
+                .isInstanceOf(BusinessException.class);
+
+        verifyNoInteractions(inAppNotificationService);
     }
 
     private LockedReview stubLockedReview() {

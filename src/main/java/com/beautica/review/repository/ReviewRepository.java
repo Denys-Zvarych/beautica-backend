@@ -572,4 +572,11 @@ public interface ReviewRepository extends JpaRepository<Review, UUID> {
             """, nativeQuery = true)
     int anonymiseGuestDisplayNames(
             @Param("reviewIds") Collection<UUID> reviewIds, @Param("sentinel") String sentinel);
+
+    /**
+     * Phase 415 — the review's author account (scalar, nothing enters the persistence context); empty for a guest
+     * review or a detached client.
+     */
+    @Query("SELECT r.client.id FROM Review r WHERE r.id = :reviewId")
+    Optional<UUID> findClientIdById(@Param("reviewId") UUID reviewId);
 }

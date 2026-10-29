@@ -44,7 +44,8 @@ class RequestDecisionOpenApiContractIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("NotificationResponse.type lists the 4 new decision types and keeps the 10 existing ones")
+    @DisplayName("NotificationResponse.type lists the 4 decision types, the 4 phase-415 moderation types and the 10 "
+            + "existing ones")
     void should_listFourNewTypes_and_keepTheTenExisting() throws Exception {
         List<String> types = texts(schemas().path("NotificationResponse").path("properties").path("type").path("enum"));
 
@@ -53,8 +54,9 @@ class RequestDecisionOpenApiContractIT extends AbstractIntegrationTest {
                 "BOOKING_RESCHEDULED", "REVIEW_REQUESTED", "BOOKING_CANCELLED_SALON_CLOSED",
                 "BOOKING_CANCELLED_MASTER_REMOVED", "REVIEW_RECEIVED", "INVITE_ACCEPTED",
                 "CATEGORY_REQUEST_APPROVED", "CATEGORY_REQUEST_REJECTED",
-                "SERVICE_TYPE_SUGGESTION_APPROVED", "SERVICE_TYPE_SUGGESTION_REJECTED")
-                .hasSize(14);
+                "SERVICE_TYPE_SUGGESTION_APPROVED", "SERVICE_TYPE_SUGGESTION_REJECTED",
+                "REPORT_CONTENT_REMOVED", "REPORT_NO_VIOLATION", "REPORT_REVIEWED", "CONTENT_REMOVED")
+                .hasSize(18);
     }
 
     @Test
@@ -84,5 +86,18 @@ class RequestDecisionOpenApiContractIT extends AbstractIntegrationTest {
         assertThat(schemas().path("NotificationParams").path("required"))
                 .as("the new fields must not be required").extracting(JsonNode::asText)
                 .doesNotContain("categoryName", "decisionReason");
+    }
+
+    @Test
+    @DisplayName("phase 415: NotificationParams.contentKind is a nullable, non-required enum of the 4 content kinds")
+    void should_exposeNullableContentKind_when_specRendered() throws Exception {
+        JsonNode params = schemas().path("NotificationParams");
+        JsonNode contentKind = params.path("properties").path("contentKind");
+
+        assertThat(contentKind.isMissingNode()).as("contentKind must be in the spec").isFalse();
+        assertThat(texts(contentKind.path("enum")))
+                .containsExactlyInAnyOrder("REVIEW", "CLIENT_REVIEW", "PORTFOLIO_PHOTO", "PROFILE");
+        assertThat(texts(contentKind.path("type"))).contains("null");
+        assertThat(texts(params.path("required"))).doesNotContain("contentKind");
     }
 }

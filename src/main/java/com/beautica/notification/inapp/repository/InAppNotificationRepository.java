@@ -362,6 +362,50 @@ public interface InAppNotificationRepository extends Repository<InAppNotificatio
             @Param("suggestionId") UUID suggestionId,
             @Param("dedupKey") String dedupKey);
 
+    /**
+     * Phase 415 — one moderation-outcome item per recipient, in one statement. Only {@code moderated_target_type} and
+     * the dedup key are set (V219 shape CHECK). Driven by {@code users} and filtered to active accounts, so a deleted
+     * or deactivated recipient simply yields no row (D6). One array bind parameter, so the
+     * statement text (and its plan cache entry) is the same for any recipient count.
+     */
+    @Modifying
+    @Query(value = """
+            INSERT INTO in_app_notification (id, recipient_user_id, type, moderated_target_type, dedup_key)
+            SELECT gen_random_uuid(), u.id, :type, :targetType, :dedupKey
+              FROM users u
+             WHERE u.id = ANY(CAST(:recipientIds AS uuid[]))
+               AND u.is_active
+            ON CONFLICT (recipient_user_id, dedup_key) DO NOTHING
+            """, nativeQuery = true)
+    int insertModerationOutcome(
+            @Param("type") String type,
+            @Param("recipientIds") UUID[] recipientIds,
+            @Param("targetType") String targetType,
+            @Param("dedupKey") String dedupKey);
+
+    /** Push twin of {@link #insertModerationOutcome}. */
+    @Modifying
+    @Query(value = """
+            WITH ins AS (
+                INSERT INTO in_app_notification (id, recipient_user_id, type, moderated_target_type, dedup_key)
+                SELECT gen_random_uuid(), u.id, :type, :targetType, :dedupKey
+                  FROM users u
+                 WHERE u.id = ANY(CAST(:recipientIds AS uuid[]))
+                   AND u.is_active
+                ON CONFLICT (recipient_user_id, dedup_key) DO NOTHING
+                RETURNING id, recipient_user_id
+            )
+            INSERT INTO notification_outbox (event_type, aggregate_id)
+            SELECT 'INAPP_PUSH', ins.id FROM ins
+             WHERE EXISTS (SELECT 1 FROM device_tokens dt
+                            WHERE dt.user_id = ins.recipient_user_id AND dt.is_active)
+            """, nativeQuery = true)
+    int insertModerationOutcomeWithPush(
+            @Param("type") String type,
+            @Param("recipientIds") UUID[] recipientIds,
+            @Param("targetType") String targetType,
+            @Param("dedupKey") String dedupKey);
+
     /** Push twin of {@link #insertClientOnlyBulk}. */
     @Modifying
     @Query(value = """

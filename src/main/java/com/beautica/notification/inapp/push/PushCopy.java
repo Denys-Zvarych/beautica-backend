@@ -2,6 +2,7 @@ package com.beautica.notification.inapp.push;
 
 import com.beautica.auth.Role;
 import com.beautica.common.TimeZones;
+import com.beautica.notification.inapp.dto.ModeratedContentKind;
 import com.beautica.notification.inapp.dto.NotificationParams;
 import com.beautica.notification.inapp.entity.InAppNotificationType;
 
@@ -120,6 +121,9 @@ public final class PushCopy {
             case CATEGORY_REQUEST_REJECTED -> "Категорію відхилено";
             case SERVICE_TYPE_SUGGESTION_APPROVED -> "Тип послуги схвалено";
             case SERVICE_TYPE_SUGGESTION_REJECTED -> "Тип послуги відхилено";
+            // Phase 415 — push stays dark until release; the feed copy lives in the mobile ARB (phase 428).
+            case REPORT_CONTENT_REMOVED, REPORT_NO_VIOLATION, REPORT_REVIEWED -> "Скаргу розглянуто";
+            case CONTENT_REMOVED -> "Вміст видалено";
         };
     }
 
@@ -137,6 +141,9 @@ public final class PushCopy {
         }
         if (isRequestDecision(type)) {
             return requestDecisionBody(type, params);
+        }
+        if (type.isModerationOutcome()) {
+            return moderationOutcomeBody(type, params.contentKind());
         }
         String counterpart = sanitize(params.counterpartName());
         String service = sanitize(params.serviceName());
@@ -182,6 +189,27 @@ public final class PushCopy {
                     : "Пропозицію типу послуги «" + serviceType + "» (" + category + ") відхилено";
             default -> GENERIC_BODY;
         };
+    }
+
+    /** Phase 415 — the locked feed texts (D2); fixed copy only, no UGC. */
+    private static String moderationOutcomeBody(InAppNotificationType type, ModeratedContentKind kind) {
+        return switch (type) {
+            case REPORT_CONTENT_REMOVED -> "Дякуємо! Ми переглянули вашу скаргу, і вміст видалено.";
+            case REPORT_NO_VIOLATION -> "Ми переглянули вашу скаргу і не знайшли порушень правил.";
+            case REPORT_REVIEWED -> "Дякуємо! Ми переглянули вашу скаргу.";
+            case CONTENT_REMOVED -> contentRemovedBody(kind);
+            default -> GENERIC_BODY;
+        };
+    }
+
+    private static String contentRemovedBody(ModeratedContentKind kind) {
+        if (kind == ModeratedContentKind.PORTFOLIO_PHOTO) {
+            return "Ваше фото видалено через порушення правил спільноти.";
+        }
+        if (kind == ModeratedContentKind.CLIENT_REVIEW) {
+            return "Ваш відгук про клієнта видалено через порушення правил спільноти.";
+        }
+        return "Ваш відгук видалено через порушення правил спільноти.";
     }
 
     private static String inviteBody(NotificationParams params) {
