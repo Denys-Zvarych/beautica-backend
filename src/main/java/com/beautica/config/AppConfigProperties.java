@@ -36,7 +36,8 @@ import org.springframework.context.annotation.Configuration;
         TurnstileProperties.class,
         ModerationProperties.class,
         ModerationActionLinkProperties.class,
-        ReviewInviteProperties.class
+        ReviewInviteProperties.class,
+        CloudflareCdnProperties.class
 })
 public class AppConfigProperties {
 }

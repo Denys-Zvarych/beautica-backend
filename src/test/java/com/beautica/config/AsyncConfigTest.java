@@ -987,12 +987,12 @@ class AsyncConfigTest {
         }
 
         @Test
-        @DisplayName("blobPurgeExecutor — built as the loss-reporting executor, draining for 10 s")
+        @DisplayName("blobPurgeExecutor — built as the loss-reporting executor, draining for 20 s")
         void should_buildAsLossReportingExecutor_when_blobPurgeExecutorBuilt() {
             assertThat(bean)
                     .as("a plain executor abandons up to 500 queued purges silently on shutdown")
                     .isInstanceOf(AsyncConfig.BlobPurgeLossReportingTaskExecutor.class);
-            assertThat(AsyncConfig.BLOB_PURGE_SHUTDOWN_GRACE_SECONDS).isEqualTo(10);
+            assertThat(AsyncConfig.BLOB_PURGE_SHUTDOWN_GRACE_SECONDS).isEqualTo(20);
         }
 
         @Test

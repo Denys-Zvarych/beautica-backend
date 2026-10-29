@@ -57,6 +57,20 @@ public class R2StorageService {
     private static final String DELETE_FAILED_MESSAGE = "Failed to delete file from media storage";
     private static final String DISABLED_SUFFIX = " — R2 is disabled; no-op";
 
+    /**
+     * Phase 417 — {@code Cache-Control} sent on every upload:
+     * <ul>
+     *   <li><b>Browser window 1 day</b> ({@code max-age=86400}) — cannot be purged remotely, so it is kept short.</li>
+     *   <li><b>Edge window 7 days</b> ({@code s-maxage=604800}) — closed early by {@link CloudflareCachePurger}, which
+     *       {@link #deleteFiles} calls for every deleted key; if that purge fails, a deleted object is served from
+     *       the edge for at most 7 days.</li>
+     *   <li>{@code immutable} — relies on the {@code MediaService#buildKey} uniqueness invariant: every upload gets
+     *       a never-reused key (prefix + epoch millis + random UUID) and objects are never overwritten. If a key is
+     *       ever reused for different bytes, this header must not be sent for that key.</li>
+     * </ul>
+     */
+    static final String IMMUTABLE_CACHE_CONTROL = "public, max-age=86400, s-maxage=604800, immutable";
+
     /** S3 {@code DeleteObjects} accepts at most this many keys per request. */
     private static final int MAX_BATCH_DELETE_KEYS = 1000;
 
@@ -64,6 +78,7 @@ public class R2StorageService {
     private final String bucketName;
     private final String publicUrlPrefix;
     private final boolean r2Enabled;
+    private final CloudflareCachePurger cachePurger;
 
     /**
      * @param s3Client  optional {@link S3Client}; {@link Optional#empty()} when
@@ -72,13 +87,16 @@ public class R2StorageService {
      * @param publicUrl  base public URL for the bucket (e.g. {@code https://pub.<hash>.r2.dev});
      *                   may be blank in disabled mode; trailing slash is stripped defensively
      *                   to prevent {@code https://pub.x.r2.dev//uuid} double-slash URLs
+     * @param cachePurger edge-cache purge for deleted keys (phase 417); a no-op when not configured
      */
     public R2StorageService(
             Optional<S3Client> s3Client,
             @Value("${app.cloudflare-r2.bucket:}") String bucketName,
-            @Value("${app.cloudflare-r2.public-url:}") String publicUrl
+            @Value("${app.cloudflare-r2.public-url:}") String publicUrl,
+            CloudflareCachePurger cachePurger
     ) {
         this.s3Client = s3Client;
+        this.cachePurger = cachePurger;
         this.bucketName = bucketName;
         this.publicUrlPrefix = stripTrailingSlash(publicUrl);
         this.r2Enabled = s3Client.isPresent();
@@ -129,6 +147,7 @@ public class R2StorageService {
                 .key(key)
                 .contentType(contentType)
                 .contentLength(contentLength)
+                .cacheControl(IMMUTABLE_CACHE_CONTROL)
                 .build();
 
         try {
@@ -193,7 +212,13 @@ public class R2StorageService {
      * failure versus a reported per-key one.
      *
      * <p><b>Disabled mode:</b> logs WARN (key count only, no keys) and returns an empty set,
-     * mirroring {@link #deleteFile(String)}'s no-op contract.
+     * mirroring {@link #deleteFile(String)}'s no-op contract. Nothing is purged.
+     *
+     * <p><b>Edge-cache purge (phase 417):</b> after the deletes, the public URLs of the keys that were
+     * actually deleted (requested minus returned-failed) go to {@link CloudflareCachePurger#purgeUrls},
+     * which never throws. This is the single purge choke point: every once-served blob is deleted through
+     * here. {@link #deleteFile(String)} deliberately does NOT purge — its only caller discards a freshly
+     * uploaded, never-referenced (so never-served) blob on the request thread.
      *
      * @param keys R2 object keys to delete; duplicates are removed before chunking, order is
      *             not preserved in the returned set, an empty input is a no-op
@@ -216,7 +241,17 @@ public class R2StorageService {
             List<String> chunk = distinctKeys.subList(i, Math.min(i + MAX_BATCH_DELETE_KEYS, distinctKeys.size()));
             failedKeys.addAll(deleteChunk(chunk));
         }
+        purgeEdgeCache(distinctKeys, failedKeys);
         return failedKeys;
+    }
+
+    /** Purges the public URLs of {@code requested} minus {@code failed}; the purger never throws. */
+    private void purgeEdgeCache(List<String> requested, Set<String> failed) {
+        List<String> urls = requested.stream()
+                .filter(key -> !failed.contains(key))
+                .map(this::buildPublicUrl)
+                .toList();
+        cachePurger.purgeUrls(urls);
     }
 
     /** Deletes a single chunk (at most {@value #MAX_BATCH_DELETE_KEYS} keys) via one {@code DeleteObjects} call. */
