@@ -108,7 +108,7 @@ public final class PushCopy {
         return switch (type) {
             case BOOKING_CREATED -> "Новий запис";
             case BOOKING_CANCELLED_BY_CLIENT -> "Клієнт скасував запис";
-            case BOOKING_DECLINED -> clientRecipient ? "Ваш запис скасовано" : "Запис у вашому дні скасовано";
+            case BOOKING_DECLINED -> clientRecipient ? "Ваш запис скасовано" : "Запис скасовано";
             case BOOKING_NOT_COMPLETED -> "Візит позначено як непроведений";
             case BOOKING_RESCHEDULED -> clientRecipient ? "Ваш запис перенесено" : "Запис перенесено";
             case REVIEW_REQUESTED -> "Як пройшов візит? Залиште відгук";

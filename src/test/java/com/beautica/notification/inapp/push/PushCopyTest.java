@@ -37,7 +37,7 @@ class PushCopyTest {
         assertThat(PushCopy.title(InAppNotificationType.BOOKING_DECLINED, true))
                 .isEqualTo("Ваш запис скасовано");
         assertThat(PushCopy.title(InAppNotificationType.BOOKING_DECLINED, false))
-                .isEqualTo("Запис у вашому дні скасовано");
+                .isEqualTo("Запис скасовано");
         assertThat(PushCopy.title(InAppNotificationType.BOOKING_RESCHEDULED, true))
                 .isEqualTo("Ваш запис перенесено");
         assertThat(PushCopy.title(InAppNotificationType.BOOKING_RESCHEDULED, false))
