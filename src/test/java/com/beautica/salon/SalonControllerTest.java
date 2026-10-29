@@ -7,6 +7,8 @@ import com.beautica.auth.Role;
 import com.beautica.auth.dto.InviteResponse;
 import com.beautica.common.security.AuthorizationService;
 import com.beautica.config.WebMvcTestSupport;
+import com.beautica.favorite.repository.FavoriteRepository;
+import com.beautica.favorite.service.ProviderFavoriteDecorator;
 import com.beautica.salon.controller.SalonController;
 import com.beautica.salon.dto.CreateSalonRequest;
 import com.beautica.salon.dto.PublicSalonResponse;
@@ -70,7 +72,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  */
 @WebMvcTest(SalonController.class)
 @TestPropertySource(properties = "app.frontend.base-url=http://localhost:3000")
-@Import(WebMvcTestSupport.class)
+@Import({WebMvcTestSupport.class, ProviderFavoriteDecorator.class})
 @DisplayName("SalonController — @WebMvcTest slice")
 class SalonControllerTest {
 
@@ -138,6 +140,10 @@ class SalonControllerTest {
 
     @MockBean
     private SalonService salonService;
+
+    /** Backs the real {@link ProviderFavoriteDecorator} the controller composes post-cache. */
+    @MockBean
+    private FavoriteRepository favoriteRepository;
 
     @MockBean(name = "authz")
     private AuthorizationService authorizationService;
