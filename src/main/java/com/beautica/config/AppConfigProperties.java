@@ -5,6 +5,7 @@ import com.beautica.booking.closure.ClosureReminderProperties;
 import com.beautica.booking.retention.GuestPiiRetentionProperties;
 import com.beautica.moderation.config.ModerationProperties;
 import com.beautica.notification.crypto.OutboxCipherProperties;
+import com.beautica.review.invite.config.ReviewInviteProperties;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Configuration;
 
@@ -32,7 +33,8 @@ import org.springframework.context.annotation.Configuration;
         BookingLinksProperties.class,
         BookingInfoWorkerProperties.class,
         TurnstileProperties.class,
-        ModerationProperties.class
+        ModerationProperties.class,
+        ReviewInviteProperties.class
 })
 public class AppConfigProperties {
 }

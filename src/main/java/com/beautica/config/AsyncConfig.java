@@ -907,6 +907,60 @@ public class AsyncConfig implements AsyncConfigurer {
         return new SyncTaskExecutor();
     }
 
+    /** Phase 400 audit cycle 1 — {@link #reviewInviteExecutor()} sizing. */
+    static final int REVIEW_INVITE_POOL_SIZE = 2;
+    static final int REVIEW_INVITE_QUEUE_CAPACITY = 200;
+
+    /**
+     * Pool for the after-commit review-invite insert ({@code ReviewInviteScheduler}, phase 400 audit cycle 1).
+     *
+     * <p>An {@code AFTER_COMMIT} listener runs on the committing thread while it still holds its pooled Hikari
+     * connection, so the listener's {@code REQUIRES_NEW} insert pinned a SECOND connection per guest completion. The
+     * listener now runs here: one short read + one insert per task.
+     *
+     * <p><b>{@code CallerRunsPolicy}, deliberately.</b> This is a DB insert, not SMTP/SMS I/O (§H-2 does not apply):
+     * a dropped task is a guest who silently never gets a review invite, while caller-runs under saturation is just
+     * the pre-audit inline behaviour. Bounded queue + {@code core == max} (see {@link #smsReminderExecutor()} for why
+     * a smaller core never grows).
+     *
+     * <p><b>Shutdown.</b> {@code waitForTasksToCompleteOnShutdown} with NO {@code awaitTerminationSeconds}: the
+     * queued tasks are millisecond inserts, drained inside the lifecycle stop phase that {@code RailwayConfigTest}
+     * already budgets (2 &times; {@code timeout-per-shutdown-phase}), so no {@code *_SHUTDOWN_GRACE_SECONDS} is added
+     * to the sequential sum. A task cut there loses that visit's invite — the same accepted outcome as the
+     * listener's own failure path (logged and dropped); nothing else depends on the row.
+     *
+     * <p>No {@link DelegatingSecurityContextTaskExecutor}: the task reads ids from the event, nothing
+     * principal-derived. {@code @Profile("!test")} — see {@link #syncReviewInviteExecutor()}.
+     */
+    @Bean(name = "reviewInviteExecutor")
+    @Profile("!test")
+    public TaskExecutor reviewInviteExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(REVIEW_INVITE_POOL_SIZE);
+        executor.setMaxPoolSize(REVIEW_INVITE_POOL_SIZE);
+        executor.setAllowCoreThreadTimeOut(true);
+        executor.setKeepAliveSeconds(60);
+        executor.setQueueCapacity(REVIEW_INVITE_QUEUE_CAPACITY);
+        executor.setThreadNamePrefix("review-invite-");
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+        executor.setTaskDecorator(taskContextDecorator());
+        executor.setWaitForTasksToCompleteOnShutdown(true);
+        executor.initialize();
+        return executor;
+    }
+
+    /**
+     * Test-profile counterpart of {@link #reviewInviteExecutor()}: the invite insert runs INLINE, so an integration
+     * test that completes a guest visit observes the row the moment the completion returns (Anti-Bug §M). Same bean
+     * name, mutually exclusive profile — {@code @Async("reviewInviteExecutor")} resolves in every profile and never
+     * falls back to Spring's unbounded default executor.
+     */
+    @Bean(name = "reviewInviteExecutor")
+    @Profile("test")
+    public TaskExecutor syncReviewInviteExecutor() {
+        return new SyncTaskExecutor();
+    }
+
     @Override
     public AsyncUncaughtExceptionHandler getAsyncUncaughtExceptionHandler() {
         return (ex, method, params) ->

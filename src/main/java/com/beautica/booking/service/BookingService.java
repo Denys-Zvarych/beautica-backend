@@ -14,10 +14,12 @@ import com.beautica.booking.dto.StatusUpdateRequest;
 import com.beautica.booking.dto.UnclosedCountResponse;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingPartition;
+import com.beautica.booking.enums.BookingSource;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.enums.CancellationReason;
 import com.beautica.booking.repository.AppointmentRepository;
 import com.beautica.booking.event.BookingCompletedEvent;
+import com.beautica.booking.event.GuestBookingCompletedEvent;
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.booking.repository.BookingSpecifications;
 import com.beautica.booking.repository.ClientBookingDetailProjection;
@@ -3163,6 +3165,11 @@ public class BookingService {
         // enqueue above does.
         eventPublisher.publishEvent(new BookingCompletedEvent(
                 saved.getClient() != null ? saved.getClient().getId() : null));
+        // Phase 400 D7 — a single LINK booking (no visit header; appointment children were refused above) gets a
+        // review invite, created AFTER_COMMIT by ReviewInviteScheduler. APP / STAFF publish nothing.
+        if (saved.getBookingSource() == BookingSource.LINK) {
+            eventPublisher.publishEvent(new GuestBookingCompletedEvent(saved.getId(), clock.instant()));
+        }
         return BookingResponse.from(saved, resolveNow());
     }
 

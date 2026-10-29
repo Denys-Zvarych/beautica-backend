@@ -1131,4 +1131,74 @@ class AsyncConfigTest {
             };
         }
     }
+
+    /**
+     * Phase 400 audit cycle 2 — the after-commit review-invite insert pool ({@code ReviewInviteScheduler}). Pins the
+     * production wiring the test profile replaces with a {@code SyncTaskExecutor}.
+     */
+    @Nested
+    @DisplayName("reviewInviteExecutor bean")
+    class ReviewInviteExecutor {
+
+        private final ThreadPoolTaskExecutor bean = (ThreadPoolTaskExecutor) asyncConfig.reviewInviteExecutor();
+        private final ThreadPoolExecutor pool = bean.getThreadPoolExecutor();
+
+        @AfterEach
+        void shutDownPool() {
+            bean.shutdown();
+        }
+
+        @Test
+        @DisplayName("reviewInviteExecutor — core equals max (2), idle threads time out")
+        void should_makeCoreEqualMax_when_reviewInviteExecutorBuilt() {
+            assertThat(pool.getCorePoolSize())
+                    .as("core below max on a bounded queue never grows until the queue is full")
+                    .isEqualTo(pool.getMaximumPoolSize())
+                    .isEqualTo(AsyncConfig.REVIEW_INVITE_POOL_SIZE)
+                    .isEqualTo(2);
+            assertThat(pool.allowsCoreThreadTimeOut()).isTrue();
+        }
+
+        @Test
+        @DisplayName("reviewInviteExecutor — the queue is bounded at 200")
+        void should_boundTheQueue_when_reviewInviteExecutorBuilt() {
+            assertThat(pool.getQueue().remainingCapacity())
+                    .isEqualTo(AsyncConfig.REVIEW_INVITE_QUEUE_CAPACITY)
+                    .isEqualTo(200);
+        }
+
+        /**
+         * CallerRunsPolicy is deliberate here and NOT the §H-2 violation: the task is a millisecond DB insert, not
+         * SMTP/SMS I/O. A discarding policy would silently lose a guest's only review invite; caller-runs under
+         * saturation is just the pre-audit inline behaviour on the committing thread.
+         */
+        @Test
+        @DisplayName("reviewInviteExecutor — saturation runs the insert on the caller, it never discards an invite")
+        void should_useCallerRunsPolicy_when_reviewInviteExecutorSaturated() {
+            assertThat(pool.getRejectedExecutionHandler())
+                    .as("a discarding policy loses the guest's review invite permanently")
+                    .isInstanceOf(ThreadPoolExecutor.CallerRunsPolicy.class)
+                    .isNotInstanceOf(ThreadPoolExecutor.AbortPolicy.class)
+                    .isNotInstanceOf(ThreadPoolExecutor.DiscardPolicy.class)
+                    .isNotInstanceOf(ThreadPoolExecutor.DiscardOldestPolicy.class);
+        }
+
+        @Test
+        @DisplayName("reviewInviteExecutor — worker threads use the 'review-invite-' name prefix")
+        void should_nameWorkerThreadsWithReviewInvitePrefix_when_taskSubmitted() throws InterruptedException {
+            assertThat(captureWorkerThreadName(bean)).startsWith("review-invite-");
+        }
+
+        @Test
+        @DisplayName("reviewInviteExecutor — test-profile counterpart runs the insert inline on the caller thread")
+        void should_runInline_when_testProfileSyncExecutorUsed() {
+            TaskExecutor sync = asyncConfig.syncReviewInviteExecutor();
+            AtomicReference<Thread> ranOn = new AtomicReference<>();
+
+            sync.execute(() -> ranOn.set(Thread.currentThread()));
+
+            assertThat(sync).isInstanceOf(org.springframework.core.task.SyncTaskExecutor.class);
+            assertThat(ranOn.get()).isSameAs(Thread.currentThread());
+        }
+    }
 }

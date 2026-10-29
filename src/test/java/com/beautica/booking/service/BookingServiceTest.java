@@ -13,8 +13,11 @@ import com.beautica.booking.dto.AppointmentProviderNoteRequest;
 import com.beautica.booking.entity.Appointment;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingPartition;
+import com.beautica.booking.enums.BookingSource;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.enums.CancellationReason;
+import com.beautica.booking.event.BookingCompletedEvent;
+import com.beautica.booking.event.GuestBookingCompletedEvent;
 import com.beautica.booking.repository.AppointmentRepository;
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.booking.repository.SalonClosureBookingCandidate;
@@ -49,6 +52,8 @@ import org.springframework.data.domain.Sort;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
 import org.mockito.InjectMocks;
@@ -1590,6 +1595,47 @@ class BookingServiceTest {
         // Assert
         verify(cacheManager).getCache("revenue-dashboard");
         verify(revenueCacheMock).clear();
+    }
+
+    @Test
+    @DisplayName("phase 400 D7 — completing a single LINK guest booking publishes GuestBookingCompletedEvent"
+            + "(bookingId, now) after BookingCompletedEvent")
+    void should_publishGuestBookingCompletedEvent_when_linkBookingCompleted() {
+        // Arrange
+        UUID actorId = UUID.randomUUID();
+        Booking booking = buildElapsedBooking(bookingId, null, master, msa, BookingStatus.CONFIRMED);
+        setField(booking, "bookingSource", BookingSource.LINK);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        when(bookingRepository.save(any())).thenReturn(booking);
+
+        // Act
+        bookingService.completeBooking(actorId, bookingId);
+
+        // Assert
+        InOrder order = inOrder(eventPublisher);
+        order.verify(eventPublisher).publishEvent(new BookingCompletedEvent(null));
+        order.verify(eventPublisher).publishEvent(new GuestBookingCompletedEvent(bookingId, clock.instant()));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @EnumSource(value = BookingSource.class, names = {"APP", "STAFF"})
+    @DisplayName("phase 400 D7 — APP and STAFF completions publish BookingCompletedEvent but never "
+            + "GuestBookingCompletedEvent")
+    void should_notPublishGuestBookingCompletedEvent_when_sourceNotLink(BookingSource source) {
+        // Arrange
+        UUID actorId = UUID.randomUUID();
+        Booking booking = buildElapsedBooking(bookingId, source == BookingSource.APP ? client : null, master, msa,
+                BookingStatus.CONFIRMED);
+        setField(booking, "bookingSource", source);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        when(bookingRepository.save(any())).thenReturn(booking);
+
+        // Act
+        bookingService.completeBooking(actorId, bookingId);
+
+        // Assert
+        verify(eventPublisher).publishEvent(any(BookingCompletedEvent.class));
+        verify(eventPublisher, never()).publishEvent(any(GuestBookingCompletedEvent.class));
     }
 
     // ── notCompleteBooking ─────────────────────────────────────────────────────

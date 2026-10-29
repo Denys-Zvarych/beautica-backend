@@ -8,9 +8,11 @@ import com.beautica.booking.dto.AppointmentProviderNoteRequest;
 import com.beautica.booking.dto.AppointmentRescheduleRequest;
 import com.beautica.booking.entity.Appointment;
 import com.beautica.booking.entity.Booking;
+import com.beautica.booking.enums.BookingSource;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.enums.CancellationReason;
 import com.beautica.booking.event.BookingCompletedEvent;
+import com.beautica.booking.event.GuestVisitCompletedEvent;
 import com.beautica.booking.repository.AppointmentRepository;
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.common.cache.MasterCachePrefixEvictor;
@@ -684,6 +686,7 @@ public class AppointmentTransitionService {
         // records that faithfully and the listener skips it.
         eventPublisher.publishEvent(new BookingCompletedEvent(
                 ctx.appointment().getClient() != null ? ctx.appointment().getClient().getId() : null));
+        publishGuestVisitCompleted(appointmentId, ctx.appointment().getBookingSource());
     }
 
     /**
@@ -845,6 +848,21 @@ public class AppointmentTransitionService {
         // keeping it synchronous would pay K synchronous O(cacheSize) Caffeine scans on the request
         // thread instead of the ONE the whole-visit completeAppointment pays.
         registerEviction(List.of(target), actorId, RevenueEvictionMode.ASYNC);
+
+        // Phase 400 D1 — every item completion of a LINK visit announces it; the review-invite consumer creates at
+        // most one invite per visit, so the FIRST completed item fixes send_after.
+        publishGuestVisitCompleted(appointmentId, target.getBookingSource());
+    }
+
+    /**
+     * Phase 400 D1 — announces that a booking of a guest (LINK) visit reached COMPLETED. Published inside the
+     * completing transaction; the {@code AFTER_COMMIT} consumer ({@code ReviewInviteScheduler}) sees nothing for a
+     * rolled-back completion. APP / STAFF visits publish nothing — they never get a review-invite SMS.
+     */
+    private void publishGuestVisitCompleted(UUID appointmentId, BookingSource source) {
+        if (source == BookingSource.LINK) {
+            eventPublisher.publishEvent(new GuestVisitCompletedEvent(appointmentId, clock.instant()));
+        }
     }
 
     /**

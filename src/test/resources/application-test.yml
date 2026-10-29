@@ -175,6 +175,13 @@ app:
     retention:
       # Phase 396 — no job bean in tests; ITs drive ContentReportRetentionService directly.
       enabled: false
+  booking:
+    review-invite:
+      # Phase 400 — the ReviewInviteSendJob timer never fires mid-test (same reasoning as the outbox drain below);
+      # ITs call ReviewInviteSendJob#run() directly with a pinned clock.
+      job:
+        fixed-delay-ms: 3600000
+        initial-delay-ms: 3600000
 
 notification:
   outbox:

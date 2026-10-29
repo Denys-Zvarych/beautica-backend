@@ -4,6 +4,15 @@ public interface TokenGenerator {
 
     String generateToken();
 
+    /**
+     * A random token of {@code byteLength} bytes from the same CSPRNG as {@link #generateToken()}, base64url without
+     * padding. For short-lived capabilities whose carrier has a hard length budget (phase 400: a 16-byte review-invite
+     * token = 22 chars, so the SMS stays one UCS-2 segment).
+     *
+     * @throws IllegalArgumentException when {@code byteLength < 16} (below 128 bits of entropy)
+     */
+    String generateToken(int byteLength);
+
     String hash(String rawToken);
 
     /**

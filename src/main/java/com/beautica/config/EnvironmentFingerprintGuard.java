@@ -1,6 +1,7 @@
 package com.beautica.config;
 
 import com.beautica.notification.mail.MailTransportKind;
+import com.beautica.review.invite.config.ReviewInviteProperties;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.springframework.boot.SpringApplication;
@@ -434,12 +435,27 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
             violations.add("rule prod-admin-email-placeholder: ADMIN_EMAIL must not use a reserved test/example domain in prod");
         }
         checkProdTurnstile(env, violations);
+        checkProdReviewInviteLink(env, violations);
         // The EFFECTIVE recipient: APP_ADMIN_EMAIL (relaxed binding of app.admin-email) overrides ADMIN_EMAIL.
         String effective = readOrNull(env, "app.admin-email");
         if (!isBlank(effective) && !effective.strip().equalsIgnoreCase(adminEmail == null ? "" : adminEmail.strip())
                 && (!isEmailShaped(effective.strip()) || isPlaceholderDomain(domainOf(effective)))) {
             violations.add("rule prod-admin-email-effective: app.admin-email (APP_ADMIN_EMAIL override) must be a real "
                     + "address (not a reserved test/example domain) in prod");
+        }
+    }
+
+    /**
+     * Phase 400 audit cycle 1. The review-invite SMS carries a single-use review token; in PROD its link must point at
+     * {@code beautica.app/r/{token}} (the website that serves the review page), so an
+     * {@code APP_BOOKING_REVIEW_INVITE_SMS_TEXT} override cannot ship tokens to another host. Unset resolves to the
+     * yml/binding default, which does. Names the rule and property only — never the configured text.
+     */
+    private static void checkProdReviewInviteLink(Environment env, List<String> violations) {
+        if (!ReviewInviteProperties.linksToProdHost(
+                boundOrNull(env, "app.booking.review-invite.sms-text"))) {
+            violations.add("rule prod-review-invite-sms-link: app.booking.review-invite.sms-text must link to "
+                    + ReviewInviteProperties.PROD_LINK + " in prod");
         }
     }
 

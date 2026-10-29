@@ -96,6 +96,98 @@ public final class GuestReviewFixtures {
         return id;
     }
 
+    /**
+     * Phase 400 — a LINK visit header in {@code status} with guest phone {@code phone} and accepted privacy-policy
+     * version {@code policyVersion} ({@code null} = a pre-381 visit with no consent stamp).
+     */
+    public UUID linkVisit(String status, String phone, String policyVersion) {
+        UUID id = UUID.randomUUID();
+        jdbc.update("INSERT INTO appointments (id, status, booking_source, guest_name, guest_surname, guest_phone, "
+                        + "cancel_token_hash, guest_privacy_accepted_at, guest_privacy_policy_version, created_at, "
+                        + "updated_at) VALUES (?, ?, 'LINK', ?, ?, ?, ?, ?, ?, NOW(), NOW())",
+                id, status, GUEST_NAME, GUEST_SURNAME, phone, randomHex64(),
+                policyVersion == null ? null : java.sql.Timestamp.from(java.time.Instant.now()), policyVersion);
+        return id;
+    }
+
+    /** Phase 400 — a STAFF walk-in visit header for an unregistered guest (phone kept, no cancel link). */
+    public UUID staffGuestVisit(String status, String phone) {
+        UUID id = UUID.randomUUID();
+        jdbc.update("INSERT INTO appointments (id, status, booking_source, guest_name, guest_surname, guest_phone, "
+                        + "created_at, updated_at) VALUES (?, ?, 'STAFF', ?, ?, ?, NOW(), NOW())",
+                id, status, GUEST_NAME, GUEST_SURNAME, phone);
+        return id;
+    }
+
+    /**
+     * Phase 400 — one item of a guest visit ({@code source} LINK or STAFF, mirroring its header): {@code hoursAgo}
+     * hours in the past, 60 minutes long, so neither the overlap EXCLUDE nor a temporal guard gets in the way.
+     */
+    public UUID visitItem(UUID appointmentId, UUID masterId, UUID masterServiceId, String source, String status,
+                          String phone, int hoursAgo) {
+        UUID id = UUID.randomUUID();
+        jdbc.update("INSERT INTO bookings (id, client_id, master_id, master_service_id, salon_id, status, starts_at, "
+                        + "ends_at, price_at_booking, duration_minutes_at_booking, buffer_minutes_at_booking, "
+                        + "booking_source, guest_name, guest_surname, guest_phone, cancel_token_hash, appointment_id, "
+                        + "created_at, updated_at) "
+                        + "VALUES (?, NULL, ?, ?, NULL, ?, NOW() - make_interval(hours => ?), "
+                        + "NOW() - make_interval(hours => ?) + interval '60 minutes', 500.00, 60, 0, ?, ?, ?, ?, ?, ?, "
+                        + "NOW(), NOW())",
+                id, masterId, masterServiceId, status, hoursAgo, hoursAgo, source, GUEST_NAME, GUEST_SURNAME, phone,
+                "LINK".equals(source) ? randomHex64() : null, appointmentId);
+        return id;
+    }
+
+    /**
+     * Phase 400 D7 — a single LINK booking with NO visit header ({@code appointment_id} NULL), the shape
+     * {@code GuestBookingService#createSingleServiceBooking} persists: {@code hoursAgo} hours in the past, 60 minutes
+     * long, cancel-token hash set, privacy-policy stamp {@code policyVersion} ({@code null} = none).
+     */
+    public UUID singleLinkBooking(UUID masterId, UUID masterServiceId, String status, String phone,
+                                  String policyVersion, int hoursAgo) {
+        UUID id = UUID.randomUUID();
+        jdbc.update("INSERT INTO bookings (id, client_id, master_id, master_service_id, salon_id, status, starts_at, "
+                        + "ends_at, price_at_booking, duration_minutes_at_booking, buffer_minutes_at_booking, "
+                        + "booking_source, guest_name, guest_surname, guest_phone, cancel_token_hash, "
+                        + "guest_privacy_accepted_at, guest_privacy_policy_version, created_at, updated_at) "
+                        + "VALUES (?, NULL, ?, ?, NULL, ?, NOW() - make_interval(hours => ?), "
+                        + "NOW() - make_interval(hours => ?) + interval '60 minutes', 500.00, 60, 0, 'LINK', ?, ?, ?, ?, "
+                        + "?, ?, NOW(), NOW())",
+                id, masterId, masterServiceId, status, hoursAgo, hoursAgo, GUEST_NAME, GUEST_SURNAME, phone,
+                randomHex64(), policyVersion == null ? null : java.sql.Timestamp.from(java.time.Instant.now()),
+                policyVersion);
+        return id;
+    }
+
+    /** Phase 400 D7 — a single APP or STAFF booking of the registered {@code clientId}, no visit header. */
+    public UUID singleClientBooking(UUID clientId, UUID masterId, UUID masterServiceId, String source, String status,
+                                    int hoursAgo) {
+        UUID id = UUID.randomUUID();
+        jdbc.update("INSERT INTO bookings (id, client_id, master_id, master_service_id, salon_id, status, starts_at, "
+                        + "ends_at, price_at_booking, duration_minutes_at_booking, buffer_minutes_at_booking, "
+                        + "booking_source, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, ?, NULL, ?, NOW() - make_interval(hours => ?), "
+                        + "NOW() - make_interval(hours => ?) + interval '60 minutes', 500.00, 60, 0, ?, NOW(), NOW())",
+                id, clientId, masterId, masterServiceId, status, hoursAgo, hoursAgo, source);
+        return id;
+    }
+
+    /** Phase 400 D7 — the retention job's guest-PII erasure, applied to one LINK booking (V199/V206 shape). */
+    public void anonymiseBooking(UUID bookingId) {
+        jdbc.update("UPDATE bookings SET guest_pii_anonymised_at = NOW(), guest_surname = NULL, guest_phone = NULL, "
+                + "cancel_token_hash = NULL, client_comment = NULL, client_cancellation_note = NULL WHERE id = ?",
+                bookingId);
+    }
+
+    private static String randomHex64() {
+        return java.util.HexFormat.of().formatHex(java.nio.ByteBuffer.allocate(32)
+                .putLong(UUID.randomUUID().getMostSignificantBits())
+                .putLong(UUID.randomUUID().getLeastSignificantBits())
+                .putLong(UUID.randomUUID().getMostSignificantBits())
+                .putLong(UUID.randomUUID().getLeastSignificantBits())
+                .array());
+    }
+
     /** A review row written WITHOUT the phase-399 columns — the shape every pre-V212 writer produces. */
     public UUID legacyReview(UUID bookingId, UUID clientId, UUID masterId) {
         UUID id = UUID.randomUUID();

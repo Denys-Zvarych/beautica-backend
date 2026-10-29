@@ -6,6 +6,7 @@ import com.beautica.review.invite.entity.ReviewInvite;
 import com.beautica.review.invite.entity.ReviewInviteSkipReason;
 import com.beautica.review.invite.entity.ReviewInviteStatus;
 import com.beautica.review.invite.repository.ReviewInviteRepository;
+import com.beautica.review.invite.service.ReviewInviteTokenHasher;
 import com.beautica.review.support.GuestReviewFixtures;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -144,6 +145,20 @@ class ReviewInviteSchemaIT extends AbstractIntegrationTest {
     }
 
     @Test
+    @DisplayName("V216 — the send job's indexes are partial and mirror its predicates; the full composite is gone")
+    void should_havePartialIndexes_when_inspectingReviewInvites() {
+        Map<String, String> indexes = new java.util.HashMap<>();
+        jdbcTemplate.query("SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'review_invites'",
+                rs -> { indexes.put(rs.getString(1), rs.getString(2)); });
+
+        assertThat(indexes).doesNotContainKey("idx_review_invites_status_send_after");
+        assertThat(indexes.get("idx_review_invites_scheduled_send_after"))
+                .contains("(send_after)").contains("WHERE ((status)::text = 'SCHEDULED'::text)");
+        assertThat(indexes.get("idx_review_invites_sent_expires"))
+                .contains("(expires_at)").contains("WHERE ((status)::text = 'SENT'::text)");
+    }
+
+    @Test
     @DisplayName("SKIPPED requires a skip reason, and a skip reason is only legal on SKIPPED")
     void should_rejectInvite_when_skipReasonMismatchesStatus() {
         UUID skippedWithoutReason = fixtures.guestAppointment(GUEST_PHONE);
@@ -158,6 +173,61 @@ class ReviewInviteSchemaIT extends AbstractIntegrationTest {
                 UUID.randomUUID(), scheduledWithReason, filled((byte) 0x09)))
                 .isInstanceOf(DataIntegrityViolationException.class)
                 .hasMessageContaining("chk_review_invites_skip_reason");
+    }
+
+    @Test
+    @DisplayName("V217 — a FAILED invite that keeps its token hash is rejected")
+    void should_reject_when_failedInviteKeepsTokenHash() {
+        UUID appointmentId = fixtures.guestAppointment(GUEST_PHONE);
+
+        assertThatThrownBy(() -> insertInvite(appointmentId, "FAILED", filled((byte) 0x51)))
+                .isInstanceOf(DataIntegrityViolationException.class)
+                .hasMessageContaining("chk_review_invites_unsent_no_token");
+    }
+
+    @Test
+    @DisplayName("V217 — SCHEDULED / SKIPPED rows carrying any one token column are rejected")
+    void should_reject_when_unsentInviteCarriesAnyTokenColumn() {
+        UUID scheduledWithSentAt = fixtures.guestAppointment(GUEST_PHONE);
+        UUID scheduledWithExpiry = fixtures.guestAppointment(GUEST_PHONE);
+        UUID skippedWithHash = fixtures.guestAppointment(GUEST_PHONE);
+
+        assertThatThrownBy(() -> jdbcTemplate.update(
+                "INSERT INTO review_invites (id, appointment_id, phone_hash, status, send_after, sent_at) "
+                        + "VALUES (?, ?, ?, 'SCHEDULED', NOW(), NOW())",
+                UUID.randomUUID(), scheduledWithSentAt, filled((byte) 0x09)))
+                .isInstanceOf(DataIntegrityViolationException.class)
+                .hasMessageContaining("chk_review_invites_unsent_no_token");
+        assertThatThrownBy(() -> jdbcTemplate.update(
+                "INSERT INTO review_invites (id, appointment_id, phone_hash, status, send_after, expires_at) "
+                        + "VALUES (?, ?, ?, 'SCHEDULED', NOW(), NOW())",
+                UUID.randomUUID(), scheduledWithExpiry, filled((byte) 0x09)))
+                .isInstanceOf(DataIntegrityViolationException.class)
+                .hasMessageContaining("chk_review_invites_unsent_no_token");
+        assertThatThrownBy(() -> jdbcTemplate.update(
+                "INSERT INTO review_invites (id, appointment_id, phone_hash, token_hash, status, send_after, "
+                        + "skip_reason) VALUES (?, ?, ?, ?, 'SKIPPED', NOW(), 'OPTED_OUT')",
+                UUID.randomUUID(), skippedWithHash, filled((byte) 0x09), filled((byte) 0x52)))
+                .isInstanceOf(DataIntegrityViolationException.class)
+                .hasMessageContaining("chk_review_invites_unsent_no_token");
+    }
+
+    @Test
+    @DisplayName("V217 — every entity transition out of SENT persists a token-free row")
+    void should_persistTokenFreeRow_when_sentInviteFailsOrIsReleased() {
+        ReviewInvite ambiguous = sentThroughEntity();
+        ReviewInvite released = sentThroughEntity();
+        ReviewInvite exhausted = sentThroughEntity();
+
+        ambiguous.recordAmbiguousSend();
+        released.releaseUnsent();
+        exhausted.recordFailedSend(1);
+        reviewInviteRepository.saveAllAndFlush(List.of(ambiguous, released, exhausted));
+
+        assertThat(jdbcTemplate.queryForList(
+                "SELECT status FROM review_invites WHERE token_hash IS NULL AND sent_at IS NULL "
+                        + "AND expires_at IS NULL", String.class))
+                .containsExactlyInAnyOrder("FAILED", "SCHEDULED", "FAILED");
     }
 
     @Test
@@ -190,10 +260,101 @@ class ReviewInviteSchemaIT extends AbstractIntegrationTest {
         List<String> inviteColumns = columnsOf("review_invites");
         List<String> optOutColumns = columnsOf("sms_opt_outs");
 
-        assertThat(inviteColumns).containsExactlyInAnyOrder("id", "appointment_id", "phone_hash", "token_hash",
+        assertThat(inviteColumns).containsExactlyInAnyOrder("id", "appointment_id", "booking_id", "phone_hash",
+                "token_hash",
                 "status", "send_after", "sent_at", "expires_at", "consumed_at", "attempts", "skip_reason",
                 "created_at");
         assertThat(optOutColumns).containsExactlyInAnyOrder("phone_hash", "created_at", "source");
+    }
+
+    // ── Phase 400 D7 — V215 booking-keyed subject ─────────────────────────────
+
+    @Test
+    @DisplayName("D7 — an invite with neither subject is rejected")
+    void should_rejectInvite_when_noSubject() {
+        assertThatThrownBy(() -> insertSubjects(null, null))
+                .isInstanceOf(DataIntegrityViolationException.class)
+                .hasMessageContaining("chk_review_invites_one_subject");
+    }
+
+    @Test
+    @DisplayName("D7 — an invite with both a visit and a booking subject is rejected")
+    void should_rejectInvite_when_bothSubjects() {
+        UUID appointmentId = fixtures.guestAppointment(GUEST_PHONE);
+        UUID bookingId = singleLinkBooking();
+
+        assertThatThrownBy(() -> insertSubjects(appointmentId, bookingId))
+                .isInstanceOf(DataIntegrityViolationException.class)
+                .hasMessageContaining("chk_review_invites_one_subject");
+    }
+
+    @Test
+    @DisplayName("D7 — a second invite for the same booking is rejected")
+    void should_rejectSecondInvite_when_sameBooking() {
+        UUID bookingId = singleLinkBooking();
+        insertSubjects(null, bookingId);
+
+        assertThatThrownBy(() -> insertSubjects(null, bookingId))
+                .isInstanceOf(DataIntegrityViolationException.class)
+                .hasMessageContaining("ux_review_invites_booking");
+    }
+
+    @Test
+    @DisplayName("D7 — booking-keyed and visit-keyed rows coexist (NULL subjects are distinct)")
+    void should_coexist_when_bookingAndVisitKeyedRowsMixed() {
+        insertSubjects(null, singleLinkBooking());
+        insertSubjects(null, singleLinkBooking());
+        insertSubjects(fixtures.guestAppointment(GUEST_PHONE), null);
+        insertSubjects(fixtures.guestAppointment(GUEST_PHONE), null);
+
+        assertThat(jdbcTemplate.queryForObject("SELECT COUNT(*) FROM review_invites", Integer.class)).isEqualTo(4);
+    }
+
+    @Test
+    @DisplayName("D7 — deleting the booking deletes its invite")
+    void should_cascadeDelete_when_bookingDeleted() {
+        UUID bookingId = singleLinkBooking();
+        insertSubjects(null, bookingId);
+
+        jdbcTemplate.update("DELETE FROM bookings WHERE id = ?", bookingId);
+
+        assertThat(jdbcTemplate.queryForObject("SELECT COUNT(*) FROM review_invites", Integer.class)).isZero();
+    }
+
+    @Test
+    @DisplayName("D7 — a booking-keyed invite round-trips through the entity factory")
+    void should_persistBookingKeyedInvite_when_createdThroughFactory() {
+        UUID bookingId = singleLinkBooking();
+        ReviewInvite invite = ReviewInvite.scheduleForBooking(
+                bookingId, phoneHasher.hash(GUEST_PHONE), NOW.plus(2, ChronoUnit.HOURS), NOW);
+
+        reviewInviteRepository.saveAndFlush(invite);
+
+        Map<String, Object> row = jdbcTemplate.queryForMap("SELECT appointment_id, booking_id FROM review_invites");
+        assertThat(row.get("appointment_id")).isNull();
+        assertThat(row.get("booking_id")).isEqualTo(bookingId);
+        assertThat(reviewInviteRepository.findById(invite.getId())).get()
+                .satisfies(saved -> assertThat(saved.isBookingKeyed()).isTrue());
+    }
+
+    private UUID singleLinkBooking() {
+        UUID masterId = fixtures.independentMaster();
+        return fixtures.singleLinkBooking(masterId, fixtures.masterService(masterId), "COMPLETED", GUEST_PHONE,
+                null, 5);
+    }
+
+    private ReviewInvite sentThroughEntity() {
+        ReviewInvite invite = ReviewInvite.schedule(fixtures.guestAppointment(GUEST_PHONE),
+                phoneHasher.hash(GUEST_PHONE), NOW, NOW);
+        invite.markSent(ReviewInviteTokenHasher.hash(UUID.randomUUID().toString()), NOW, NOW.plus(14, ChronoUnit.DAYS));
+        return reviewInviteRepository.saveAndFlush(invite);
+    }
+
+    private void insertSubjects(UUID appointmentId, UUID bookingId) {
+        jdbcTemplate.update(
+                "INSERT INTO review_invites (id, appointment_id, booking_id, phone_hash, status, send_after) "
+                        + "VALUES (?, ?, ?, ?, 'SCHEDULED', NOW())",
+                UUID.randomUUID(), appointmentId, bookingId, phoneHasher.hash(GUEST_PHONE).hash());
     }
 
     private void insertSkipped(UUID appointmentId, String skipReason) {

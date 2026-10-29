@@ -393,6 +393,29 @@ app:
       # Constraint that travels with the copy wherever it lives: it must carry NO {cancelUrl} — a
       # STAFF booking has cancel_token = NULL by the V137 CHECK, so there is no link to build and
       # the placeholder would render literally in a real client's message.
+    # Phase 400 — guest review invite SMS (beautica.app/r/{token}) ~2h after a LINK visit is COMPLETED, never
+    # 21:00-09:00 Kyiv (moved to 10:00), one per visit. Bound by ReviewInviteProperties (validated at boot). Needs BOTH
+    # this flag and app.booking.sms.enabled; in staging (beautica.sms.mode=capture) the SMS lands in Mailpit.
+    review-invite:
+      # Default OFF. Turn on only after website 018 (policy that discloses invites) and 019 (/r/{token}) are live.
+      enabled: ${APP_BOOKING_REVIEW_INVITE_ENABLED:false}
+      # The website 018 privacy-policy version (e.g. 2026-11-01). Required when enabled — boot fails if blank.
+      # Guests who accepted an older version are skipped (POLICY_VERSION).
+      min-policy-version: ${APP_BOOKING_REVIEW_INVITE_MIN_POLICY_VERSION:}
+      delay: 2h
+      quiet-start: "21:00"
+      quiet-end: "09:00"
+      send-at: "10:00"
+      stale-after: 72h
+      ttl: 14d
+      # Rows per claim / expiry statement per tick (D4a — every claim is LIMITed).
+      batch-size: 50
+      max-attempts: 3
+      # One UCS-2 segment (<= 70 chars with the 22-char token) — checked at boot. Override for a non-prod web host.
+      sms-text: "${APP_BOOKING_REVIEW_INVITE_SMS_TEXT:Оцініть ваш візит: beautica.app/r/{token}}"
+      job:
+        fixed-delay-ms: 60000
+        initial-delay-ms: 60000
   booking-links:
     # Phase 375 (D6) — kill-switch for GET /api/v1/booking-links/mine. false = the app hides sharing,
     # the endpoint returns {shareEnabled:false, links:[]} and issues NO slug. Stays false in prod until

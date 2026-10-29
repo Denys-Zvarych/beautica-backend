@@ -260,6 +260,39 @@ class ProdProfileFingerprintTest {
     }
 
     @Test
+    @DisplayName("Phase 400 — prod with the committed review-invite SMS text (beautica.app/r/{token}) passes the link rule")
+    void should_passReviewInviteLinkRule_when_prodUsesDefaultSmsText() {
+        prodRunnerWithout("").run(ctx -> {
+            assertThat(ctx.getEnvironment().getProperty("app.booking.review-invite.sms-text"))
+                    .contains("beautica.app/r/{token}");
+            assertThatCode(() -> EnvironmentFingerprintGuard.verify(ctx.getEnvironment())).doesNotThrowAnyException();
+        });
+    }
+
+    @Test
+    @DisplayName("Phase 400 — prod with an SMS text override linking another host fails on prod-review-invite-sms-link")
+    void should_failGuard_when_prodReviewInviteSmsLinksOtherHost() {
+        String override = "Відгук: staging.beautica.app/r/{token}";
+        prodRunnerWithout("").withPropertyValues("APP_BOOKING_REVIEW_INVITE_SMS_TEXT=" + override)
+                .run(ctx -> assertThatThrownBy(() -> EnvironmentFingerprintGuard.verify(ctx.getEnvironment()))
+                        .hasMessageContaining("rule prod-review-invite-sms-link")
+                        .message().doesNotContain("staging.beautica.app"));
+    }
+
+    @Test
+    @DisplayName("Phase 400 — prod,staging (STAGING) may point the review-invite link at a non-prod host")
+    void should_skipReviewInviteLinkRule_when_stagingOverlay() {
+        new ApplicationContextRunner()
+                .withInitializer(new ConfigDataApplicationContextInitializer())
+                .withPropertyValues("spring.profiles.active=prod,staging", "JWT_SECRET=x",
+                        "INTERNAL_API_KEY=" + TestSecrets.INTERNAL_API_KEY, "FRONTEND_BASE_URL=https://x.invalid",
+                        "PUBLIC_BASE_URL=https://api.staging.beautica.test", "SUPPORT_EMAIL=support@test.invalid",
+                        "APP_BOOKING_REVIEW_INVITE_SMS_TEXT=Відгук: staging.beautica.app/r/{token}")
+                .run(ctx -> assertThatCode(() -> EnvironmentFingerprintGuard.verify(ctx.getEnvironment()))
+                        .doesNotThrowAnyException());
+    }
+
+    @Test
     @DisplayName("Phase 382 — prod with a Cloudflare TEST secret fails boot on prod-turnstile-secret-test-key, value never printed")
     void should_failGuard_when_prodTurnstileSecretIsTestKey() {
         String testKey = "1x0000000000000000000000000000000AA";
