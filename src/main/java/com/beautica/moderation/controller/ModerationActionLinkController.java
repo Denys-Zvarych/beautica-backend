@@ -95,7 +95,7 @@ public class ModerationActionLinkController {
         model.addAttribute("token", form.token());
         model.addAttribute("nonce", form.nonce().nonce());
         model.addAttribute("targetLabel", targetLabel(form.nonce().targetType()));
-        model.addAttribute("actionLabel", actionLabel(form.nonce().action()));
+        model.addAttribute("actionLabel", actionLabel(form.nonce().targetType(), form.nonce().action()));
         model.addAttribute("openReports", form.nonce().openReports());
         return CONFIRM_VIEW;
     }
@@ -117,6 +117,7 @@ public class ModerationActionLinkController {
     private static String heading(ModerationActionOutcome outcome) {
         return switch (outcome) {
             case DONE_REMOVED, DONE_DISMISSED, DONE_RESTORED -> "Готово";
+            case DONE_ACTIONED -> "Скаргу підтверджено";
             case INVALID -> "Посилання недійсне";
             case ALREADY_RESOLVED -> "Скаргу вже розглянуто";
             case CONTENT_GONE -> "Вміст уже видалено";
@@ -129,6 +130,8 @@ public class ModerationActionLinkController {
             case DONE_REMOVED -> "Рішення «Видалити» застосовано. Усі скарги на цей об'єкт закрито.";
             case DONE_DISMISSED -> "Скарги відхилено, вміст залишено. Усі скарги на цей об'єкт закрито.";
             case DONE_RESTORED -> "Відгук знову видимий. Усі скарги на нього закрито.";
+            case DONE_ACTIONED -> "Скаргу підтверджено. Усі скарги на цей профіль закрито. Напишіть власнику профілю "
+                    + "за адресою з листа.";
             case INVALID -> "Посилання недійсне або термін його дії минув. Якщо ви відкривали сторінку "
                     + "підтвердження кілька разів, оновіть сторінку з листа або скористайтеся чергою модерації.";
             case ALREADY_RESOLVED -> "Скаргу вже розглянуто. Повторні дії не потрібні.";
@@ -148,9 +151,10 @@ public class ModerationActionLinkController {
         };
     }
 
-    private static String actionLabel(ModerationAction action) {
+    /** A profile REMOVE only confirms the report (ACTIONED) — it is never labelled as a deletion. */
+    private static String actionLabel(ReportTargetType type, ModerationAction action) {
         return switch (action) {
-            case REMOVE -> "Видалити";
+            case REMOVE -> type.isProfile() ? "Підтвердити скаргу" : "Видалити";
             case DISMISS -> "Залишити";
             case RESTORE -> "Відновити";
         };

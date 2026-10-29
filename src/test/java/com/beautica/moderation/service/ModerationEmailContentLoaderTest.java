@@ -76,7 +76,7 @@ class ModerationEmailContentLoaderTest {
 
         ContentReportEmailModel model = loader.load(event(ReportTargetType.REVIEW));
 
-        assertThat(model.content()).isEqualTo(new ReportedContent(true, "bad \\u2066x", 2, true, null, null, null));
+        assertThat(model.content()).isEqualTo(new ReportedContent(true, "bad \\u2066x", 2, true, null, null, null, null, false));
         assertThat(model.reporterComment()).isEqualTo("see \\u202Etxet");
         assertThat(model.openReportCount()).isEqualTo(3);
         assertThat(model.actions()).isEmpty();
@@ -100,7 +100,8 @@ class ModerationEmailContentLoaderTest {
     @DisplayName("MASTER_PROFILE: one JOIN FETCH read (findByIdWithUser), display name + avatar via buildPublicUrl")
     void should_loadNameAndAvatar_when_masterProfile() {
         stubReport(ReportTargetType.MASTER_PROFILE, null, 1);
-        User user = entity(User.class, Map.of("firstName", "Олена", "lastName", "Ш", "avatarR2Key", "users/u/a.webp"));
+        User user = entity(User.class, Map.of("firstName", "Олена", "lastName", "Ш", "avatarR2Key", "users/u/a.webp",
+                "email", "master@beautica.test"));
         Master master = entity(Master.class, Map.of("user", user));
         when(masterRepository.findByIdWithUser(TARGET_ID)).thenReturn(Optional.of(master));
         when(r2StorageService.buildPublicUrl("users/u/a.webp")).thenReturn("https://pub.r2.test/users/u/a.webp");
@@ -109,32 +110,50 @@ class ModerationEmailContentLoaderTest {
 
         assertThat(model.content().displayName()).isEqualTo("Олена Ш");
         assertThat(model.content().avatarUrl()).isEqualTo("https://pub.r2.test/users/u/a.webp");
+        assertThat(model.content().ownerEmail()).as("profile flow: the master's account e-mail")
+                .isEqualTo("master@beautica.test");
         verify(masterRepository, never()).findById(any());
     }
 
     @Test
-    @DisplayName("SALON_PROFILE: salon name + logo key via buildPublicUrl")
+    @DisplayName("SALON_PROFILE: salon name + logo key via buildPublicUrl + the OWNER's e-mail as the contact")
     void should_loadSalonNameAndLogo_when_salonProfile() {
         stubReport(ReportTargetType.SALON_PROFILE, null, 1);
-        Salon salon = entity(Salon.class, Map.of("name", "Lux", "avatarR2Key", "salons/s/logo/l.webp"));
+        User owner = entity(User.class, Map.of("email", "owner@beautica.test", "emailVerified", true));
+        Salon salon = entity(Salon.class, Map.of("name", "Lux", "avatarR2Key", "salons/s/logo/l.webp", "owner", owner));
         when(salonRepository.findById(TARGET_ID)).thenReturn(Optional.of(salon));
         when(r2StorageService.buildPublicUrl("salons/s/logo/l.webp")).thenReturn("https://pub.r2.test/l.webp");
 
         ContentReportEmailModel model = loader.load(event(ReportTargetType.SALON_PROFILE));
 
-        assertThat(model.content()).isEqualTo(ReportedContent.profile("Lux", "https://pub.r2.test/l.webp"));
+        assertThat(model.content()).isEqualTo(
+                ReportedContent.profile("Lux", "https://pub.r2.test/l.webp", "owner@beautica.test", true));
     }
 
     @Test
-    @DisplayName("CLIENT_PROFILE without avatar: name only, R2 never asked")
+    @DisplayName("audit-fix: the master's emailVerified flag is loaded with the address")
+    void should_carryVerifiedFlag_when_masterEmailVerified() {
+        stubReport(ReportTargetType.MASTER_PROFILE, null, 1);
+        User user = entity(User.class, Map.of("firstName", "Олена", "email", "m@beautica.test", "emailVerified", true));
+        when(masterRepository.findByIdWithUser(TARGET_ID)).thenReturn(Optional.of(entity(Master.class,
+                Map.of("user", user))));
+
+        ContentReportEmailModel model = loader.load(event(ReportTargetType.MASTER_PROFILE));
+
+        assertThat(model.content().ownerEmailVerified()).isTrue();
+    }
+
+    @Test
+    @DisplayName("CLIENT_PROFILE without avatar: name + the client's e-mail, R2 never asked")
     void should_loadNameWithoutAvatar_when_clientWithoutAvatar() {
         stubReport(ReportTargetType.CLIENT_PROFILE, null, 1);
-        User user = entity(User.class, Map.of("firstName", "Іван"));
+        User user = entity(User.class, Map.of("firstName", "Іван", "email", "client@beautica.test"));
         when(userRepository.findById(TARGET_ID)).thenReturn(Optional.of(user));
 
         ContentReportEmailModel model = loader.load(event(ReportTargetType.CLIENT_PROFILE));
 
-        assertThat(model.content()).isEqualTo(ReportedContent.profile("Іван", null));
+        assertThat(model.content()).as("an unverified client address is carried, flagged unverified")
+                .isEqualTo(ReportedContent.profile("Іван", null, "client@beautica.test", false));
     }
 
     @Test

@@ -30,7 +30,8 @@ import java.util.UUID;
 
 /**
  * Phase 414 D1 — builds what the support report e-mail shows about one report: the target's content (review text +
- * stars, portfolio photo, or profile name + avatar), the reporter's comment and the target's OPEN-report count. Image
+ * stars, portfolio photo, or profile name + avatar + the owner's contact e-mail), the reporter's comment and the
+ * target's OPEN-report count. Image
  * URLs come from {@link R2StorageService#buildPublicUrl}. Repository access is direct, as in
  * {@link ModerationQueueService}: read-only primary-key lookups. The reporter's identity is never loaded, and the
  * reporter's comment comes from the in-memory event (no re-read of the report row).
@@ -81,7 +82,7 @@ public class ModerationEmailContentLoader {
                     .orElseGet(ReportedContent::gone);
             case CLIENT_PROFILE -> userRepository.findById(targetId)
                     .map(u -> ReportedContent.profile(DisplayNames.fullName(u.getFirstName(), u.getLastName()),
-                            avatarOf(u.getAvatarR2Key())))
+                            avatarOf(u.getAvatarR2Key()), u.getEmail(), u.isEmailVerified()))
                     .orElseGet(ReportedContent::gone);
         };
     }
@@ -90,11 +91,15 @@ public class ModerationEmailContentLoader {
         // Phase 294: a detached master has no user row; its name survives as a snapshot, its avatar does not.
         User user = master.getUser();
         return ReportedContent.profile(DisplayNames.fullName(master.displayFirstName(), master.displayLastName()),
-                user == null ? null : avatarOf(user.getAvatarR2Key()));
+                user == null ? null : avatarOf(user.getAvatarR2Key()), user == null ? null : user.getEmail(),
+                user != null && user.isEmailVerified());
     }
 
     private ReportedContent salonProfile(Salon salon) {
-        return ReportedContent.profile(salon.getName(), avatarOf(salon.imagePointer(SalonImageSlot.LOGO).key()));
+        // Salons have no separate contact e-mail column: the owner's account address is the contact.
+        User owner = salon.getOwner();
+        return ReportedContent.profile(salon.getName(), avatarOf(salon.imagePointer(SalonImageSlot.LOGO).key()),
+                owner == null ? null : owner.getEmail(), owner != null && owner.isEmailVerified());
     }
 
     private String avatarOf(String r2Key) {

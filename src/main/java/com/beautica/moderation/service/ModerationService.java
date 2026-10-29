@@ -173,7 +173,7 @@ public class ModerationService {
 
     private static ReportResolution resolutionOf(ReportTargetType type, ModerationAction action) {
         return switch (action) {
-            case REMOVE -> isProfile(type) ? ReportResolution.ACTIONED : ReportResolution.REMOVED;
+            case REMOVE -> type.isProfile() ? ReportResolution.ACTIONED : ReportResolution.REMOVED;
             case RESTORE -> ReportResolution.RESTORED;
             case DISMISS -> ReportResolution.DISMISSED;
         };
@@ -181,12 +181,6 @@ public class ModerationService {
 
     private static boolean isReview(ReportTargetType type) {
         return type == ReportTargetType.REVIEW || type == ReportTargetType.CLIENT_REVIEW;
-    }
-
-    private static boolean isProfile(ReportTargetType type) {
-        return type == ReportTargetType.MASTER_PROFILE
-                || type == ReportTargetType.SALON_PROFILE
-                || type == ReportTargetType.CLIENT_PROFILE;
     }
 
     private static String normalizeNote(String note) {

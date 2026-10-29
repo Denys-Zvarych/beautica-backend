@@ -311,10 +311,11 @@ class PushCopyTest {
     }
 
     @org.junit.jupiter.params.ParameterizedTest(name = "{0} / {1}")
-    @org.junit.jupiter.params.provider.CsvSource(delimiter = '|', value = {
+    @org.junit.jupiter.params.provider.CsvSource(delimiter = '|', quoteCharacter = '"', value = {
             "REPORT_CONTENT_REMOVED | REVIEW          | Дякуємо! Ми переглянули вашу скаргу, і вміст видалено.",
             "REPORT_NO_VIOLATION    | PORTFOLIO_PHOTO | Ми переглянули вашу скаргу і не знайшли порушень правил.",
-            "REPORT_REVIEWED        | PROFILE         | Дякуємо! Ми переглянули вашу скаргу.",
+            "REPORT_REVIEWED        | PROFILE         | Дякуємо! Скаргу підтверджено — ми зв'яжемося з власником профілю.",
+            "REPORT_REVIEWED        | REVIEW          | Дякуємо! Ми переглянули вашу скаргу.",
             "CONTENT_REMOVED        | REVIEW          | Ваш відгук видалено через порушення правил спільноти.",
             "CONTENT_REMOVED        | CLIENT_REVIEW   | Ваш відгук про клієнта видалено через порушення правил спільноти.",
             "CONTENT_REMOVED        | PORTFOLIO_PHOTO | Ваше фото видалено через порушення правил спільноти.",

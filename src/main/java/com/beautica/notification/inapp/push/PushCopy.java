@@ -197,7 +197,10 @@ public final class PushCopy {
         return switch (type) {
             case REPORT_CONTENT_REMOVED -> "Дякуємо! Ми переглянули вашу скаргу, і вміст видалено.";
             case REPORT_NO_VIOLATION -> "Ми переглянули вашу скаргу і не знайшли порушень правил.";
-            case REPORT_REVIEWED -> "Дякуємо! Ми переглянули вашу скаргу.";
+            // REPORT_REVIEWED + PROFILE is only ever a confirmed (ACTIONED) profile report.
+            case REPORT_REVIEWED -> kind == ModeratedContentKind.PROFILE
+                    ? "Дякуємо! Скаргу підтверджено — ми зв'яжемося з власником профілю."
+                    : "Дякуємо! Ми переглянули вашу скаргу.";
             case CONTENT_REMOVED -> contentRemovedBody(kind);
             case REVIEW_ABOUT_YOU_REMOVED -> "Відгук про вас видалено модерацією Beautica: він порушував правила спільноти.";
             default -> GENERIC_BODY;

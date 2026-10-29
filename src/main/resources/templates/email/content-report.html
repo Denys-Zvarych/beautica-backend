@@ -105,6 +105,27 @@
                    th:text="${reporterComment}">Коментар</div>
             </td></tr>
 
+            <!-- Profile reports only: the reported account's contact e-mail (our data, validated in ReportedContent, never
+                 the reporter's) and a mailto with a fixed subject. data-contact, not data-action: it is not a moderation
+                 button. A profile REMOVE only confirms the report; nothing is deleted or suspended. -->
+            <tr th:if="${content.ownerEmail() != null}"><td data-block="owner-contact" style="padding-bottom:20px;">
+              <div style="color:#0D0906;font-size:14px;font-weight:700;padding-bottom:6px;
+                          font-family:'Nunito','Trebuchet MS',Arial,sans-serif;">Контакт власника профілю</div>
+              <div style="color:#3D2B1A;font-size:14px;padding-bottom:10px;
+                          font-family:'Nunito','Trebuchet MS',Arial,sans-serif;">
+                <span data-block="owner-email" th:text="${content.ownerEmail()}">owner@example.com</span>
+                <span th:if="${!content.ownerEmailVerified()}" data-block="owner-email-unverified"
+                      style="color:#7A2A1A;">(не підтверджено)</span>
+              </div>
+              <table role="presentation" cellpadding="0" cellspacing="0">
+                <tr><td style="background:#6A4A28;border-radius:10px;">
+                  <a th:href="${content.ownerMailto()}" data-contact="mailto"
+                     style="display:inline-block;padding:10px 20px;color:#F5EDE0;font-size:14px;font-weight:700;
+                            text-decoration:none;font-family:'Nunito','Trebuchet MS',Arial,sans-serif;">Написати власнику</a>
+                </td></tr>
+              </table>
+            </td></tr>
+
             <tr th:if="${!actions.isEmpty()}"><td style="padding-bottom:8px;">
               <table role="presentation" cellpadding="0" cellspacing="0">
                 <tr>
@@ -119,7 +140,8 @@
                         <a th:href="${link.url()}" th:attr="data-action=${link.action().name()}"
                            style="display:inline-block;padding:12px 22px;color:#F5EDE0;font-size:15px;font-weight:700;
                                   text-decoration:none;font-family:'Nunito','Trebuchet MS',Arial,sans-serif;"
-                           th:text="${link.action().name() == 'REMOVE' ? 'Видалити'
+                           th:text="${link.action().name() == 'REMOVE'
+                                      ? (profileTarget ? 'Підтвердити скаргу' : 'Видалити')
                                       : (link.action().name() == 'RESTORE' ? 'Відновити' : 'Залишити')}">Дія</a>
                       </td></tr>
                     </table>

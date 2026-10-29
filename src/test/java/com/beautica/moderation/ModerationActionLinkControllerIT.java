@@ -252,6 +252,32 @@ class ModerationActionLinkControllerIT extends AbstractModerationIT {
                 .doesNotContain("Грубий текст").doesNotContain("REPORTER-NOTE");
     }
 
+    // ── profile flow (follow-up) ─────────────────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("profile follow-up: the confirm page labels a profile REMOVE «Підтвердити скаргу», the result page "
+            + "says «Скаргу підтверджено», reports ACTIONED, and nothing suggests a deletion")
+    void should_sayConfirmedNotDeleted_when_profileReportConfirmed() throws Exception {
+        SalonFixture salon = createSalon();
+        clearInvocations(emailService);
+        String email = unique("reporter");
+        createUser(email, "CLIENT", null);
+        assertThat(postReport(tokenFor(email), reportBody("SALON_PROFILE", salon.salonId(), "OFFENSIVE", null))
+                .getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        String token = tokenOf(linkFor(ModerationAction.REMOVE));
+
+        ResponseEntity<String> page = get(token);
+        ResponseEntity<String> done = postConfirm(token, nonceOf(page));
+
+        assertThat(page.getBody()).contains("Профіль салону", "Підтвердити скаргу").doesNotContain("Видалити");
+        assertThat(done.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(done.getBody()).contains("Скаргу підтверджено").doesNotContainIgnoringCase("видал");
+        assertThat(jdbcTemplate.queryForList("SELECT resolution FROM content_reports WHERE target_id = ?",
+                String.class, salon.salonId())).containsExactly("ACTIONED");
+        assertThat(jdbcTemplate.queryForObject("SELECT is_active FROM salons WHERE id = ?", Boolean.class,
+                salon.salonId())).as("nothing is suspended").isTrue();
+    }
+
     // ── helpers ──────────────────────────────────────────────────────────────────────────────
 
     /** A salon review with {@code reports} OPEN reports from distinct (ineligible) clients; e-mails captured. */

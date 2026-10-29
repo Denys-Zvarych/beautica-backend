@@ -281,6 +281,7 @@ public class EmailService {
         Context ctx = new Context(Locale.of("uk"));
         ctx.setVariable("reportId", model.reportId().toString());
         ctx.setVariable("targetType", model.targetType().name());
+        ctx.setVariable("profileTarget", model.targetType().isProfile());
         ctx.setVariable("targetId", model.targetId().toString());
         ctx.setVariable("reason", model.reason().name());
         ctx.setVariable("burst", burst);

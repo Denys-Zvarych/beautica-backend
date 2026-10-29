@@ -130,9 +130,12 @@ public class ModerationActionLinkService {
         try {
             ResolveReportResponse response = moderationService.resolve(
                     reportId.get(), new ResolveReportRequest(target.action(), RESOLUTION_NOTE));
-            return response.resolution() == ReportResolution.TARGET_GONE
-                    ? ModerationActionOutcome.CONTENT_GONE
-                    : ModerationActionOutcome.doneFor(target.action());
+            return switch (response.resolution()) {
+                case TARGET_GONE -> ModerationActionOutcome.CONTENT_GONE;
+                // A confirmed profile report: nothing was deleted, so never the «видалено» page.
+                case ACTIONED -> ModerationActionOutcome.DONE_ACTIONED;
+                default -> ModerationActionOutcome.doneFor(target.action());
+            };
         } catch (NotFoundException ex) {
             // The report row was purged between the lookup and the resolve: nothing left to act on.
             return ModerationActionOutcome.ALREADY_RESOLVED;

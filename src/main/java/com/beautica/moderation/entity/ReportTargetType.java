@@ -19,5 +19,13 @@ public enum ReportTargetType {
     PORTFOLIO_PHOTO,
     MASTER_PROFILE,
     SALON_PROFILE,
-    CLIENT_PROFILE
+    CLIENT_PROFILE;
+
+    /**
+     * The one "is this a profile?" rule (master, salon or client profile): a REMOVE only confirms the report
+     * ({@code ACTIONED}), and the e-mail / confirm pages label it «Підтвердити скаргу».
+     */
+    public boolean isProfile() {
+        return this == MASTER_PROFILE || this == SALON_PROFILE || this == CLIENT_PROFILE;
+    }
 }

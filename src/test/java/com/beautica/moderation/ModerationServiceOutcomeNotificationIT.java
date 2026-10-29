@@ -421,6 +421,30 @@ class ModerationServiceOutcomeNotificationIT extends AbstractModerationIT {
         }
 
         @Test
+        @DisplayName("profile follow-up: a confirmed profile report reaches the reporter's feed as REPORT_REVIEWED with "
+                + "contentKind PROFILE (the client renders «Скаргу підтверджено — ми зв'яжемося з власником профілю»); "
+                + "a dismissed one is REPORT_NO_VIOLATION, so the two never share copy")
+        void should_exposeReviewedProfileKind_when_profileReportConfirmed() throws Exception {
+            IndependentMaster master = createIndependentMaster(unique("indep"));
+            String confirmedEmail = unique("reporter");
+            insertReport(createUser(confirmedEmail, "CLIENT", null), "MASTER_PROFILE", master.masterId());
+            resolveOldest(Path.CURL, ReportTargetType.MASTER_PROFILE, master.masterId(), "REMOVE");
+            IndependentMaster other = createIndependentMaster(unique("indep"));
+            String dismissedEmail = unique("reporter");
+            insertReport(createUser(dismissedEmail, "CLIENT", null), "MASTER_PROFILE", other.masterId());
+
+            resolveOldest(Path.CURL, ReportTargetType.MASTER_PROFILE, other.masterId(), "DISMISS");
+
+            JsonNode confirmed = objectMapper.readTree(exchange(HttpMethod.GET, "/api/v1/notifications",
+                    tokenFor(confirmedEmail)).getBody()).path("data").get(0);
+            JsonNode dismissed = objectMapper.readTree(exchange(HttpMethod.GET, "/api/v1/notifications",
+                    tokenFor(dismissedEmail)).getBody()).path("data").get(0);
+            assertThat(confirmed.path("type").asText()).isEqualTo("REPORT_REVIEWED");
+            assertThat(confirmed.path("params").path("contentKind").asText()).isEqualTo("PROFILE");
+            assertThat(dismissed.path("type").asText()).isEqualTo("REPORT_NO_VIOLATION");
+        }
+
+        @Test
         @DisplayName("CLIENT_PROFILE DISMISS → reporter REPORT_NO_VIOLATION, the client nothing")
         void should_notifyNoViolation_when_clientProfileDismissed() {
             UUID client = createUser(unique("client"), "CLIENT", null);

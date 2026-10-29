@@ -214,6 +214,77 @@ class ContentReportEmailRenderTest {
         assertThat(template).doesNotContain("th:utext");
     }
 
+    // ── profile flow (follow-up) ─────────────────────────────────────────────────────────────
+
+    @org.junit.jupiter.params.ParameterizedTest(name = "{0}")
+    @org.junit.jupiter.params.provider.EnumSource(value = ReportTargetType.class,
+            names = {"MASTER_PROFILE", "SALON_PROFILE", "CLIENT_PROFILE"})
+    @DisplayName("profile: REMOVE button reads «Підтвердити скаргу» (never «Видалити»); owner e-mail + «Написати "
+            + "власнику» mailto with the fixed, encoded subject")
+    void should_renderConfirmButtonAndOwnerContact_when_profile(ReportTargetType type) throws Exception {
+        List<ModerationActionLink> links = List.of(
+                new ModerationActionLink(ModerationAction.REMOVE, BASE + "tokenRemove"),
+                new ModerationActionLink(ModerationAction.DISMISS, BASE + "tokenDismiss"));
+
+        String html = render(type, ReportedContent.profile("Lux", null, "owner@beautica.test", true), null, links);
+
+        assertThat(html).contains("Підтвердити скаргу", "Залишити", "data-block=\"owner-email\"",
+                ">owner@beautica.test<", "Написати власнику",
+                "href=\"mailto:owner@beautica.test?subject=Beautica%3A%20%D1%81%D0%BA%D0%B0%D1%80%D0%B3%D0%B0%20"
+                        + "%D0%BD%D0%B0%20%D0%B2%D0%B0%D1%88%20%D0%BF%D1%80%D0%BE%D1%84%D1%96%D0%BB%D1%8C\"")
+                .doesNotContain("Видалити");
+    }
+
+    @Test
+    @DisplayName("review: REMOVE still reads «Видалити», no owner-contact block")
+    void should_keepDeleteLabel_andNoOwnerContact_when_review() throws Exception {
+        List<ModerationActionLink> links = List.of(
+                new ModerationActionLink(ModerationAction.REMOVE, BASE + "tokenRemove"),
+                new ModerationActionLink(ModerationAction.DISMISS, BASE + "tokenDismiss"));
+
+        String html = render(ReportTargetType.REVIEW, ReportedContent.review("x", (short) 2, false), null, links);
+
+        assertThat(html).contains("Видалити").doesNotContain("Підтвердити скаргу", "owner-contact", "mailto:");
+    }
+
+    @Test
+    @DisplayName("an invalid / injection-shaped owner address is dropped: no contact block, no mailto")
+    void should_dropOwnerContact_when_addressInvalid() throws Exception {
+        String html = render(ReportTargetType.SALON_PROFILE,
+                ReportedContent.profile("Lux", null, "x@y.com\"><a href=\"javascript:alert(1)", true), null,
+                List.of());
+
+        assertThat(html).doesNotContain("owner-contact", "mailto:", "javascript:");
+    }
+
+    @Test
+    @DisplayName("audit-fix: an unverified owner address is marked «(не підтверджено)» and keeps «Написати власнику»; a "
+            + "verified one shows no marker")
+    void should_markUnverifiedOwnerEmail_when_notVerified() throws Exception {
+        String unverified = render(ReportTargetType.CLIENT_PROFILE,
+                ReportedContent.profile("Іван", null, "client@beautica.test", false), null, List.of());
+        org.mockito.Mockito.reset(mailSender);
+        message = new MimeMessage(Session.getInstance(new Properties()));
+        lenient().when(mailSender.createMimeMessage()).thenReturn(message);
+        String verified = render(ReportTargetType.CLIENT_PROFILE,
+                ReportedContent.profile("Іван", null, "client@beautica.test", true), null, List.of());
+
+        assertThat(unverified).contains("(не підтверджено)", "Написати власнику", "mailto:client@beautica.test");
+        assertThat(verified).contains("Написати власнику").doesNotContain("не підтверджено");
+    }
+
+    @Test
+    @DisplayName("audit-fix: ReportedContent.toString carries no address, text, name or URL")
+    void should_omitPiiAndUgc_when_toString() {
+        String profile = ReportedContent.profile("Олена Ш", "https://pub.r2.test/a.webp", "owner@beautica.test", true)
+                .toString();
+        String review = ReportedContent.review("Грубий текст", (short) 1, false).toString();
+
+        assertThat(profile).contains("exists=true", "kind=PROFILE", "hasOwnerEmail=true")
+                .doesNotContain("owner@beautica.test", "Олена", "pub.r2.test");
+        assertThat(review).contains("kind=REVIEW").doesNotContain("Грубий");
+    }
+
     private String render(ReportTargetType type, ReportedContent content, String comment,
                           List<ModerationActionLink> links) throws Exception {
         ContentReportEmailModel model = new ContentReportEmailModel(UUID.randomUUID(), type, UUID.randomUUID(),

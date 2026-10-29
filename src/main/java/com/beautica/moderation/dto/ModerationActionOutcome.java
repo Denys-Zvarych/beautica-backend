@@ -11,6 +11,8 @@ public enum ModerationActionOutcome {
     DONE_REMOVED(HttpStatus.OK),
     DONE_DISMISSED(HttpStatus.OK),
     DONE_RESTORED(HttpStatus.OK),
+    /** A profile report confirmed (REMOVE on a profile = {@code ACTIONED}): nothing is deleted or suspended. */
+    DONE_ACTIONED(HttpStatus.OK),
     /** Unknown, expired, used or revoked link, or a stale / mismatched confirm nonce. */
     INVALID(HttpStatus.GONE),
     /** No OPEN report left on the target, or the phase-396 resolve answered 409. */
