@@ -2258,7 +2258,12 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * PII of up to {@code batchSize} due guest/walk-in rows and returns their ids. Mirrors the
      * claim shape of {@link #claimRemindersByIds} — no read-then-write. {@code FOR UPDATE SKIP
      * LOCKED} lets two instances split a backlog without blocking or double-claiming; the
-     * {@code guest_pii_anonymised_at IS NULL} predicate makes a rerun a no-op.
+     * {@code guest_pii_anonymised_at IS NULL} predicate makes a rerun a no-op. The locking select is a
+     * {@code MATERIALIZED} CTE so {@code LIMIT}/{@code SKIP LOCKED} is evaluated exactly once: the former
+     * {@code WHERE b.id IN (SELECT ... LIMIT n FOR UPDATE SKIP LOCKED)} form, under a nested-loop semi-join
+     * that re-scans the sublink per outer row, skipped the rows it had already updated and claimed more than
+     * {@code n} (same defect as {@code InAppNotificationRepository#deleteCreatedBefore}; pinned by
+     * {@code GuestPiiRetentionIT}).
      *
      * <p>Scope: {@code client_id IS NULL}, source LINK/STAFF, never a detached ex-client row
      * ({@code client_detached_at IS NOT NULL} — that row belonged to a registered user and was
@@ -2269,6 +2274,17 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      */
     @Modifying
     @Query(value = """
+            WITH due AS MATERIALIZED (
+                SELECT x.id FROM bookings x
+                 WHERE x.client_id IS NULL
+                   AND x.guest_pii_anonymised_at IS NULL
+                   AND x.client_detached_at IS NULL
+                   AND x.booking_source IN ('LINK', 'STAFF')
+                   AND x.ends_at < :cutoff
+                 ORDER BY x.ends_at
+                 LIMIT :batchSize
+                 FOR UPDATE SKIP LOCKED
+            )
             UPDATE bookings b
                SET guest_name = :sentinel,
                    guest_surname = NULL,
@@ -2278,16 +2294,8 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
                    cancel_token_hash = NULL,
                    guest_pii_anonymised_at = now(),
                    updated_at = now()
-             WHERE b.id IN (
-                   SELECT x.id FROM bookings x
-                    WHERE x.client_id IS NULL
-                      AND x.guest_pii_anonymised_at IS NULL
-                      AND x.client_detached_at IS NULL
-                      AND x.booking_source IN ('LINK', 'STAFF')
-                      AND x.ends_at < :cutoff
-                    ORDER BY x.ends_at
-                    LIMIT :batchSize
-                    FOR UPDATE SKIP LOCKED)
+              FROM due
+             WHERE b.id = due.id
             RETURNING b.id
             """, nativeQuery = true)
     List<UUID> anonymiseDueGuestBookings(

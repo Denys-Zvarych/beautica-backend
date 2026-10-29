@@ -470,9 +470,34 @@ public interface AppointmentRepository extends JpaRepository<Appointment, UUID> 
      * is not kept beyond {@code ends_at} + 12 months when step 1 missed its header in a race.
      * Candidates are driven from items anonymised since {@code recentSince} through the partial index
      * {@code idx_bookings_guest_pii_anonymised_visit} — never a scan of every open header.
+     *
+     * <p>The locking select is a {@code MATERIALIZED} CTE so {@code LIMIT}/{@code SKIP LOCKED} is evaluated exactly
+     * once: the former {@code WHERE a.id IN (SELECT ... LIMIT n FOR UPDATE SKIP LOCKED)} form, under a nested-loop
+     * semi-join that re-scans the sublink per outer row, skipped the rows it had already updated and claimed more
+     * than {@code n} (same defect as {@code InAppNotificationRepository#deleteCreatedBefore}; pinned by
+     * {@code GuestPiiRetentionIT}).
      */
     @Modifying
     @Query(value = """
+            WITH due AS MATERIALIZED (
+                SELECT x.id FROM appointments x
+                 WHERE x.id IN (
+                       SELECT r.appointment_id FROM bookings r
+                        WHERE r.appointment_id IS NOT NULL
+                          AND r.guest_pii_anonymised_at IS NOT NULL
+                          AND r.guest_pii_anonymised_at >= :recentSince)
+                   AND x.client_id IS NULL
+                   AND x.guest_pii_anonymised_at IS NULL
+                   AND x.client_detached_at IS NULL
+                   AND x.booking_source IN ('LINK', 'STAFF')
+                   AND NOT EXISTS (
+                       SELECT 1 FROM bookings b
+                        WHERE b.appointment_id = x.id
+                          AND (b.ends_at >= :cutoff OR b.guest_pii_anonymised_at IS NULL))
+                 ORDER BY x.id
+                 LIMIT :batchSize
+                 FOR UPDATE SKIP LOCKED
+            )
             UPDATE appointments a
                SET guest_name = :sentinel,
                    guest_surname = NULL,
@@ -482,24 +507,8 @@ public interface AppointmentRepository extends JpaRepository<Appointment, UUID> 
                    cancel_token_hash = NULL,
                    guest_pii_anonymised_at = now(),
                    updated_at = now()
-             WHERE a.id IN (
-                   SELECT x.id FROM appointments x
-                    WHERE x.id IN (
-                          SELECT r.appointment_id FROM bookings r
-                           WHERE r.appointment_id IS NOT NULL
-                             AND r.guest_pii_anonymised_at IS NOT NULL
-                             AND r.guest_pii_anonymised_at >= :recentSince)
-                      AND x.client_id IS NULL
-                      AND x.guest_pii_anonymised_at IS NULL
-                      AND x.client_detached_at IS NULL
-                      AND x.booking_source IN ('LINK', 'STAFF')
-                      AND NOT EXISTS (
-                          SELECT 1 FROM bookings b
-                           WHERE b.appointment_id = x.id
-                             AND (b.ends_at >= :cutoff OR b.guest_pii_anonymised_at IS NULL))
-                    ORDER BY x.id
-                    LIMIT :batchSize
-                    FOR UPDATE SKIP LOCKED)
+              FROM due
+             WHERE a.id = due.id
             RETURNING a.id
             """, nativeQuery = true)
     List<UUID> anonymiseEndedGuestAppointments(
@@ -514,9 +523,25 @@ public interface AppointmentRepository extends JpaRepository<Appointment, UUID> 
      * fresh child-less header is NOT anonymised early — and, as a backstop, any old header whose
      * children are all anonymised but which steps 1 and 2 missed. Rides the partial
      * index {@code idx_appointments_guest_pii_due (created_at)}, whose predicate matches this WHERE.
+     * {@code MATERIALIZED} CTE claim for the same reason as {@link #anonymiseEndedGuestAppointments}.
      */
     @Modifying
     @Query(value = """
+            WITH due AS MATERIALIZED (
+                SELECT x.id FROM appointments x
+                 WHERE x.client_id IS NULL
+                   AND x.guest_pii_anonymised_at IS NULL
+                   AND x.client_detached_at IS NULL
+                   AND x.created_at < :cutoff
+                   AND x.booking_source IN ('LINK', 'STAFF')
+                   AND NOT EXISTS (
+                       SELECT 1 FROM bookings b
+                        WHERE b.appointment_id = x.id
+                          AND b.guest_pii_anonymised_at IS NULL)
+                 ORDER BY x.created_at
+                 LIMIT :batchSize
+                 FOR UPDATE SKIP LOCKED
+            )
             UPDATE appointments a
                SET guest_name = :sentinel,
                    guest_surname = NULL,
@@ -526,20 +551,8 @@ public interface AppointmentRepository extends JpaRepository<Appointment, UUID> 
                    cancel_token_hash = NULL,
                    guest_pii_anonymised_at = now(),
                    updated_at = now()
-             WHERE a.id IN (
-                   SELECT x.id FROM appointments x
-                    WHERE x.client_id IS NULL
-                      AND x.guest_pii_anonymised_at IS NULL
-                      AND x.client_detached_at IS NULL
-                      AND x.created_at < :cutoff
-                      AND x.booking_source IN ('LINK', 'STAFF')
-                      AND NOT EXISTS (
-                          SELECT 1 FROM bookings b
-                           WHERE b.appointment_id = x.id
-                             AND b.guest_pii_anonymised_at IS NULL)
-                    ORDER BY x.created_at
-                    LIMIT :batchSize
-                    FOR UPDATE SKIP LOCKED)
+              FROM due
+             WHERE a.id = due.id
             RETURNING a.id
             """, nativeQuery = true)
     List<UUID> anonymiseLeftoverGuestAppointments(

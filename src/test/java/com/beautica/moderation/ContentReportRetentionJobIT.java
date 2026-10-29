@@ -1,20 +1,27 @@
 package com.beautica.moderation;
 
 import com.beautica.config.TestSecurityConfig;
+import com.beautica.moderation.repository.ContentReportRepository;
 import com.beautica.moderation.service.ContentReportRetentionJob;
 import com.beautica.moderation.service.ContentReportRetentionService;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.ApplicationContext;
 import org.springframework.context.annotation.Import;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.sql.Timestamp;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.function.IntSupplier;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -34,6 +41,12 @@ class ContentReportRetentionJobIT extends AbstractModerationIT {
 
     @Autowired
     private ApplicationContext context;
+
+    @Autowired
+    private ContentReportRepository repository;
+
+    @Autowired
+    private PlatformTransactionManager transactionManager;
 
     @Test
     @DisplayName("live target: a resolved 5-year-old report is kept, even a sweep 10 years later")
@@ -141,6 +154,74 @@ class ContentReportRetentionJobIT extends AbstractModerationIT {
     @DisplayName("test profile: no scheduled job bean (app.moderation.retention.enabled=false)")
     void should_notCreateJobBean_when_retentionDisabled() {
         assertThat(context.getBeanNamesForType(ContentReportRetentionJob.class)).isEmpty();
+    }
+
+    /**
+     * Regression (same defect as InAppNotificationRepository#deleteCreatedBefore, commit c8d7173e) — each gone-target
+     * batch must touch exactly {@code batchSize} rows whatever plan PostgreSQL picks. The former {@code UPDATE ... WHERE
+     * id IN (SELECT ... LIMIT :n FOR UPDATE SKIP LOCKED)} form, under a nested-loop semi-join that re-scans the locking
+     * sublink per outer row, skips the rows it already updated and returns further ones past the LIMIT. The planner
+     * settings force that plan shape; the {@code MATERIALIZED} CTE evaluates the LIMIT exactly once.
+     */
+    @ParameterizedTest(name = "{0}")
+    @ValueSource(strings = {"REVIEW", "CLIENT_REVIEW", "PORTFOLIO_PHOTO", "MASTER_PROFILE", "SALON_PROFILE",
+            "CLIENT_PROFILE"})
+    @DisplayName("gone-target batch marks exactly `batchSize` reports under a re-scanning nested-loop plan")
+    void should_markExactlyBatchSize_when_plannerForcesRescanningNestedLoop(String targetType) {
+        insertReportsOnGoneTargets(targetType, 20, null);
+
+        int marked = inForcedRescanPlan(() -> switch (targetType) {
+            case "REVIEW" -> repository.markGoneReviewTargets(T0, 5);
+            case "CLIENT_REVIEW" -> repository.markGoneClientReviewTargets(T0, 5);
+            case "PORTFOLIO_PHOTO" -> repository.markGonePortfolioPhotoTargets(T0, 5);
+            case "MASTER_PROFILE" -> repository.markGoneMasterProfileTargets(T0, 5);
+            case "SALON_PROFILE" -> repository.markGoneSalonProfileTargets(T0, 5);
+            case "CLIENT_PROFILE" -> repository.markGoneClientProfileTargets(T0, 5);
+            default -> throw new IllegalArgumentException(targetType);
+        });
+
+        assertThat(marked).as("one batch must mark exactly `batchSize` reports, never more").isEqualTo(5);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM content_reports WHERE target_type = ? AND target_gone_at IS NOT NULL",
+                Integer.class, targetType)).isEqualTo(5);
+    }
+
+    @Test
+    @DisplayName("purge batch deletes exactly `batchSize` reports under a re-scanning nested-loop plan")
+    void should_purgeExactlyBatchSize_when_plannerForcesRescanningNestedLoop() {
+        insertReportsOnGoneTargets("SALON_PROFILE", 20, T0.minus(Duration.ofDays(400)));
+
+        int purged = inForcedRescanPlan(() -> repository.deleteGoneBefore(T0.minus(Duration.ofDays(365)), 5));
+
+        assertThat(purged).as("one batch must delete exactly `batchSize` reports, never more").isEqualTo(5);
+        assertThat(jdbcTemplate.queryForObject("SELECT COUNT(*) FROM content_reports", Integer.class))
+                .as("15 of the 20 eligible reports must remain after one batch of 5").isEqualTo(15);
+    }
+
+    /** Runs {@code work} in one transaction whose planner can only pick a re-scanning nested loop (reverts at commit). */
+    private int inForcedRescanPlan(IntSupplier work) {
+        Integer result = new TransactionTemplate(transactionManager).execute(status -> {
+            for (String knob : List.of("enable_hashagg", "enable_hashjoin", "enable_mergejoin", "enable_material",
+                    "enable_sort", "enable_incremental_sort")) {
+                jdbcTemplate.execute("SET LOCAL " + knob + " = off");
+            }
+            return work.getAsInt();
+        });
+        return result;
+    }
+
+    /** {@code count} reports, one reporter, each on its own random (so non-existent) target; gone-stamped if given. */
+    private void insertReportsOnGoneTargets(String targetType, int count, Instant goneAt) {
+        UUID reporter = createUser(unique("r"), "CLIENT", null);
+        Timestamp created = Timestamp.from(T0.minus(Duration.ofDays(500)));
+        Timestamp gone = goneAt == null ? null : Timestamp.from(goneAt);
+        jdbcTemplate.update("INSERT INTO content_reports (id, reporter_user_id, target_type, target_id, reason, status, "
+                        + "resolution, resolved_at, target_gone_at, created_at, updated_at) "
+                        + "SELECT gen_random_uuid(), ?, ?, gen_random_uuid(), 'SPAM', "
+                        + "CASE WHEN ?::timestamptz IS NULL THEN 'OPEN' ELSE 'RESOLVED' END, "
+                        + "CASE WHEN ?::timestamptz IS NULL THEN NULL ELSE 'TARGET_GONE' END, "
+                        + "?::timestamptz, ?::timestamptz, ?, ? FROM generate_series(1, ?)",
+                reporter, targetType, gone, gone, gone, gone, created, created, count);
     }
 
     private UUID insertReport(String targetType, UUID targetId, String status, String resolution, Instant createdAt) {

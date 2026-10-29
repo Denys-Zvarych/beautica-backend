@@ -203,7 +203,11 @@ public interface ContentReportRepository extends JpaRepository<ContentReport, UU
 
     /*
      * D7 gone-target sweep, ONE statement per target type, each an anti-join (NOT EXISTS) bounded by LIMIT :batchSize
-     * (FOR UPDATE SKIP LOCKED, so two instances never fight over a batch). ContentReportRetentionService loops each until
+     * (FOR UPDATE SKIP LOCKED, so two instances never fight over a batch). The locking select is a MATERIALIZED CTE so
+     * the LIMIT is evaluated exactly once: the former "WHERE id IN (SELECT ... LIMIT n FOR UPDATE SKIP LOCKED)" form,
+     * under a nested-loop semi-join that re-scans the sublink per outer row, skipped the rows it had already updated
+     * and touched more than n (same defect as InAppNotificationRepository#deleteCreatedBefore; pinned by
+     * ContentReportRetentionJobIT). ContentReportRetentionService loops each until
      * a batch comes back short, every batch in its own transaction. A matching report gets target_gone_at = now; an
      * OPEN one is closed as TARGET_GONE (an already-resolved report keeps its resolution). "Exists" mirrors what
      * ReportTargetVisibilityResolver accepts at intake.
@@ -212,119 +216,145 @@ public interface ContentReportRepository extends JpaRepository<ContentReport, UU
     /** Gone-target batch for {@code REVIEW}: exists = a review row that is not {@code REMOVED} (a removed review is gone for retention: a report that raced the takedown is closed here instead of staying OPEN forever). */
     @Modifying(flushAutomatically = true, clearAutomatically = true)
     @Query(value = """
+            WITH due AS MATERIALIZED (
+                SELECT c.id FROM content_reports c
+                 WHERE c.target_gone_at IS NULL
+                   AND c.target_type = 'REVIEW'
+                   AND NOT EXISTS (SELECT 1 FROM reviews r WHERE r.id = c.target_id AND r.moderation_status <> 'REMOVED')
+                 LIMIT :batchSize
+                 FOR UPDATE SKIP LOCKED
+            )
             UPDATE content_reports cr
                SET target_gone_at = :now,
                    status = 'RESOLVED',
                    resolution = CASE WHEN cr.status = 'OPEN' THEN 'TARGET_GONE' ELSE cr.resolution END,
                    resolved_at = COALESCE(cr.resolved_at, :now),
                    updated_at = :now
-             WHERE cr.id IN (SELECT c.id FROM content_reports c
-                              WHERE c.target_gone_at IS NULL
-                                AND c.target_type = 'REVIEW'
-                                AND NOT EXISTS (SELECT 1 FROM reviews r WHERE r.id = c.target_id AND r.moderation_status <> 'REMOVED')
-                              LIMIT :batchSize
-                                FOR UPDATE SKIP LOCKED)
+              FROM due
+             WHERE cr.id = due.id
             """, nativeQuery = true)
     int markGoneReviewTargets(@Param("now") Instant now, @Param("batchSize") int batchSize);
 
     /** Gone-target batch for {@code CLIENT_REVIEW}: exists = a client review row that is not {@code REMOVED}. */
     @Modifying(flushAutomatically = true, clearAutomatically = true)
     @Query(value = """
+            WITH due AS MATERIALIZED (
+                SELECT c.id FROM content_reports c
+                 WHERE c.target_gone_at IS NULL
+                   AND c.target_type = 'CLIENT_REVIEW'
+                   AND NOT EXISTS (SELECT 1 FROM client_reviews x WHERE x.id = c.target_id AND x.moderation_status <> 'REMOVED')
+                 LIMIT :batchSize
+                 FOR UPDATE SKIP LOCKED
+            )
             UPDATE content_reports cr
                SET target_gone_at = :now,
                    status = 'RESOLVED',
                    resolution = CASE WHEN cr.status = 'OPEN' THEN 'TARGET_GONE' ELSE cr.resolution END,
                    resolved_at = COALESCE(cr.resolved_at, :now),
                    updated_at = :now
-             WHERE cr.id IN (SELECT c.id FROM content_reports c
-                              WHERE c.target_gone_at IS NULL
-                                AND c.target_type = 'CLIENT_REVIEW'
-                                AND NOT EXISTS (SELECT 1 FROM client_reviews x WHERE x.id = c.target_id AND x.moderation_status <> 'REMOVED')
-                              LIMIT :batchSize
-                                FOR UPDATE SKIP LOCKED)
+              FROM due
+             WHERE cr.id = due.id
             """, nativeQuery = true)
     int markGoneClientReviewTargets(@Param("now") Instant now, @Param("batchSize") int batchSize);
 
     /** Gone-target batch for {@code PORTFOLIO_PHOTO}: exists = a {@code PORTFOLIO} media row. */
     @Modifying(flushAutomatically = true, clearAutomatically = true)
     @Query(value = """
+            WITH due AS MATERIALIZED (
+                SELECT c.id FROM content_reports c
+                 WHERE c.target_gone_at IS NULL
+                   AND c.target_type = 'PORTFOLIO_PHOTO'
+                   AND NOT EXISTS (SELECT 1 FROM media_files m WHERE m.id = c.target_id AND m.media_type = 'PORTFOLIO')
+                 LIMIT :batchSize
+                 FOR UPDATE SKIP LOCKED
+            )
             UPDATE content_reports cr
                SET target_gone_at = :now,
                    status = 'RESOLVED',
                    resolution = CASE WHEN cr.status = 'OPEN' THEN 'TARGET_GONE' ELSE cr.resolution END,
                    resolved_at = COALESCE(cr.resolved_at, :now),
                    updated_at = :now
-             WHERE cr.id IN (SELECT c.id FROM content_reports c
-                              WHERE c.target_gone_at IS NULL
-                                AND c.target_type = 'PORTFOLIO_PHOTO'
-                                AND NOT EXISTS (SELECT 1 FROM media_files m WHERE m.id = c.target_id AND m.media_type = 'PORTFOLIO')
-                              LIMIT :batchSize
-                                FOR UPDATE SKIP LOCKED)
+              FROM due
+             WHERE cr.id = due.id
             """, nativeQuery = true)
     int markGonePortfolioPhotoTargets(@Param("now") Instant now, @Param("batchSize") int batchSize);
 
     /** Gone-target batch for {@code MASTER_PROFILE}: exists = a master that is not detached (account deleted). */
     @Modifying(flushAutomatically = true, clearAutomatically = true)
     @Query(value = """
+            WITH due AS MATERIALIZED (
+                SELECT c.id FROM content_reports c
+                 WHERE c.target_gone_at IS NULL
+                   AND c.target_type = 'MASTER_PROFILE'
+                   AND NOT EXISTS (SELECT 1 FROM masters ms WHERE ms.id = c.target_id AND ms.user_id IS NOT NULL)
+                 LIMIT :batchSize
+                 FOR UPDATE SKIP LOCKED
+            )
             UPDATE content_reports cr
                SET target_gone_at = :now,
                    status = 'RESOLVED',
                    resolution = CASE WHEN cr.status = 'OPEN' THEN 'TARGET_GONE' ELSE cr.resolution END,
                    resolved_at = COALESCE(cr.resolved_at, :now),
                    updated_at = :now
-             WHERE cr.id IN (SELECT c.id FROM content_reports c
-                              WHERE c.target_gone_at IS NULL
-                                AND c.target_type = 'MASTER_PROFILE'
-                                AND NOT EXISTS (SELECT 1 FROM masters ms WHERE ms.id = c.target_id AND ms.user_id IS NOT NULL)
-                              LIMIT :batchSize
-                                FOR UPDATE SKIP LOCKED)
+              FROM due
+             WHERE cr.id = due.id
             """, nativeQuery = true)
     int markGoneMasterProfileTargets(@Param("now") Instant now, @Param("batchSize") int batchSize);
 
     /** Gone-target batch for {@code SALON_PROFILE}: exists = an active salon. */
     @Modifying(flushAutomatically = true, clearAutomatically = true)
     @Query(value = """
+            WITH due AS MATERIALIZED (
+                SELECT c.id FROM content_reports c
+                 WHERE c.target_gone_at IS NULL
+                   AND c.target_type = 'SALON_PROFILE'
+                   AND NOT EXISTS (SELECT 1 FROM salons sa WHERE sa.id = c.target_id AND sa.is_active)
+                 LIMIT :batchSize
+                 FOR UPDATE SKIP LOCKED
+            )
             UPDATE content_reports cr
                SET target_gone_at = :now,
                    status = 'RESOLVED',
                    resolution = CASE WHEN cr.status = 'OPEN' THEN 'TARGET_GONE' ELSE cr.resolution END,
                    resolved_at = COALESCE(cr.resolved_at, :now),
                    updated_at = :now
-             WHERE cr.id IN (SELECT c.id FROM content_reports c
-                              WHERE c.target_gone_at IS NULL
-                                AND c.target_type = 'SALON_PROFILE'
-                                AND NOT EXISTS (SELECT 1 FROM salons sa WHERE sa.id = c.target_id AND sa.is_active)
-                              LIMIT :batchSize
-                                FOR UPDATE SKIP LOCKED)
+              FROM due
+             WHERE cr.id = due.id
             """, nativeQuery = true)
     int markGoneSalonProfileTargets(@Param("now") Instant now, @Param("batchSize") int batchSize);
 
     /** Gone-target batch for {@code CLIENT_PROFILE}: exists = a user row. */
     @Modifying(flushAutomatically = true, clearAutomatically = true)
     @Query(value = """
+            WITH due AS MATERIALIZED (
+                SELECT c.id FROM content_reports c
+                 WHERE c.target_gone_at IS NULL
+                   AND c.target_type = 'CLIENT_PROFILE'
+                   AND NOT EXISTS (SELECT 1 FROM users u WHERE u.id = c.target_id)
+                 LIMIT :batchSize
+                 FOR UPDATE SKIP LOCKED
+            )
             UPDATE content_reports cr
                SET target_gone_at = :now,
                    status = 'RESOLVED',
                    resolution = CASE WHEN cr.status = 'OPEN' THEN 'TARGET_GONE' ELSE cr.resolution END,
                    resolved_at = COALESCE(cr.resolved_at, :now),
                    updated_at = :now
-             WHERE cr.id IN (SELECT c.id FROM content_reports c
-                              WHERE c.target_gone_at IS NULL
-                                AND c.target_type = 'CLIENT_PROFILE'
-                                AND NOT EXISTS (SELECT 1 FROM users u WHERE u.id = c.target_id)
-                              LIMIT :batchSize
-                                FOR UPDATE SKIP LOCKED)
+              FROM due
+             WHERE cr.id = due.id
             """, nativeQuery = true)
     int markGoneClientProfileTargets(@Param("now") Instant now, @Param("batchSize") int batchSize);
 
     /** D7 purge, one batch: reports whose target has been gone for longer than the retention window. */
     @Modifying(flushAutomatically = true, clearAutomatically = true)
     @Query(value = """
-            DELETE FROM content_reports
-             WHERE id IN (SELECT id FROM content_reports
-                           WHERE target_gone_at < :cutoff
-                           LIMIT :batchSize
-                             FOR UPDATE SKIP LOCKED)
+            WITH due AS MATERIALIZED (
+                SELECT id FROM content_reports
+                 WHERE target_gone_at < :cutoff
+                 LIMIT :batchSize
+                 FOR UPDATE SKIP LOCKED
+            )
+            DELETE FROM content_reports cr USING due WHERE cr.id = due.id
             """, nativeQuery = true)
     int deleteGoneBefore(@Param("cutoff") Instant cutoff, @Param("batchSize") int batchSize);
 }
