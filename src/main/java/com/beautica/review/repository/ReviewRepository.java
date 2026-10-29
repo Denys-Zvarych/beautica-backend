@@ -540,4 +540,36 @@ public interface ReviewRepository extends JpaRepository<Review, UUID> {
             ORDER BY r.createdAt DESC
             """)
     List<Review> findLatestWithGraphBySalonId(@Param("salonId") UUID salonId, Pageable pageable);
+
+    /**
+     * Phase 402 D1 — the {@code GUEST_LINK} reviews of {@code bookingIds} whose author label is not yet
+     * {@code sentinel}. Served by the UNIQUE {@code booking_id} index; at most one row per booking.
+     */
+    @Query(value = """
+            SELECT r.id AS id, r.master_id AS masterId, r.salon_id AS salonId
+              FROM reviews r
+             WHERE r.booking_id IN (:bookingIds)
+               AND r.source = 'GUEST_LINK'
+               AND r.guest_display_name <> :sentinel
+            """, nativeQuery = true)
+    List<GuestReviewRef> findGuestReviewsToAnonymise(
+            @Param("bookingIds") Collection<UUID> bookingIds, @Param("sentinel") String sentinel);
+
+    /**
+     * Phase 402 D1 — sets the author label of the given {@code GUEST_LINK} reviews to {@code sentinel}
+     * ({@code GuestPii.ANONYMISED_NAME}); rating and text stay. {@code flushAutomatically}: pending changes reach the
+     * DB first. {@code clearAutomatically} (phase 399 audit): {@code Review} has no {@code @DynamicUpdate}, so a
+     * {@code Review} already managed in this persistence context would otherwise be re-read from the L1 cache with
+     * the old label and, once dirtied (e.g. moderated), written back over the sentinel.
+     */
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query(value = """
+            UPDATE reviews
+               SET guest_display_name = :sentinel,
+                   updated_at = now()
+             WHERE id IN (:reviewIds)
+               AND source = 'GUEST_LINK'
+            """, nativeQuery = true)
+    int anonymiseGuestDisplayNames(
+            @Param("reviewIds") Collection<UUID> reviewIds, @Param("sentinel") String sentinel);
 }

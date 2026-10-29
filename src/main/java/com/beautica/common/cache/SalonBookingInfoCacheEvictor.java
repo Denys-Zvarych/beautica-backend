@@ -8,7 +8,9 @@ import org.springframework.stereotype.Component;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
+import java.util.Collection;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 import java.util.function.Predicate;
 
@@ -59,6 +61,16 @@ public class SalonBookingInfoCacheEvictor {
     public void evictSalon(UUID salonId) {
         if (salonId != null) {
             cachePrefixEvictor.evictByValue(ofSalon(salonId), CACHES);
+        }
+    }
+
+    /**
+     * Batch form of {@link #evictSalon} (phase 402 audit-fix, perf LOW): evicts the pages of every salon in
+     * {@code salonIds} in ONE value scan of the cache. Call from an {@code afterCommit} hook; empty is a no-op.
+     */
+    public void evictSalons(Collection<UUID> salonIds) {
+        if (salonIds != null && !salonIds.isEmpty()) {
+            cachePrefixEvictor.evictByValue(ofSalons(Set.copyOf(salonIds)), CACHES);
         }
     }
 
@@ -116,6 +128,10 @@ public class SalonBookingInfoCacheEvictor {
 
     static Predicate<Object> ofSalon(UUID salonId) {
         return value -> value instanceof SalonBookingSlugInfoResponse page && salonId.equals(page.salonId());
+    }
+
+    static Predicate<Object> ofSalons(Set<UUID> salonIds) {
+        return value -> value instanceof SalonBookingSlugInfoResponse page && salonIds.contains(page.salonId());
     }
 
     static Predicate<Object> listingMaster(String masterSlug) {

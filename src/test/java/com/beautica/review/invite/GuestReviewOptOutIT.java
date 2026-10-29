@@ -1,5 +1,6 @@
 package com.beautica.review.invite;
 
+import com.beautica.booking.retention.GuestPiiAnonymisationService;
 import com.beautica.booking.service.AppointmentTransitionService;
 import com.beautica.common.security.PhoneHasher;
 import com.beautica.review.invite.service.ReviewInviteTokenHasher;
@@ -46,6 +47,28 @@ class GuestReviewOptOutIT extends AbstractReviewInviteIT {
 
     @Autowired
     private AppointmentTransitionService appointmentTransitionService;
+
+    @Autowired
+    private GuestPiiAnonymisationService anonymisationService;
+
+    private HttpHeaders jsonHeaders() {
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        int n = IP_SEQ.incrementAndGet();
+        headers.set("X-Forwarded-For", "198.19." + (n / 250) + "." + (n % 250 + 1));
+        return headers;
+    }
+
+    private ResponseEntity<String> getInvite(String token) {
+        return restTemplate.exchange("/api/v1/public/review-invites/" + token, HttpMethod.GET,
+                new HttpEntity<>(jsonHeaders()), String.class);
+    }
+
+    private ResponseEntity<String> submit(String token, UUID bookingId) {
+        String body = "{\"turnstileToken\":\"t\",\"items\":[{\"bookingId\":\"" + bookingId + "\",\"rating\":5}]}";
+        return restTemplate.exchange("/api/v1/public/review-invites/" + token + "/reviews", HttpMethod.POST,
+                new HttpEntity<>(body, jsonHeaders()), String.class);
+    }
 
     private ResponseEntity<String> optOut(String token) {
         HttpHeaders headers = new HttpHeaders();
@@ -124,5 +147,39 @@ class GuestReviewOptOutIT extends AbstractReviewInviteIT {
         assertThat(tooOld.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
         assertThat(unknown.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
         assertThat(optedOut()).isFalse();
+    }
+
+    @Test
+    @DisplayName("phase 402 audit-fix: erase → the phone's SENT invite is EXPIRED at the erase; GET and submit → 404, "
+            + "the opt-out link still → 204")
+    void should_expireSentInvite_when_phoneErased() {
+        UUID bookingId = fixtures.singleLinkBooking(masterId, masterServiceId, "COMPLETED", GUEST_PHONE, POLICY, 5);
+        String token = "EraseExpiresSentTok_01";
+        invite("booking_id", bookingId, token, "SENT", Instant.now().minus(Duration.ofHours(2)));
+        UUID otherBooking = fixtures.singleLinkBooking(masterId, masterServiceId, "COMPLETED", "+380675556677",
+                POLICY, 6);
+        UUID otherInvite = UUID.randomUUID();
+        Instant sentAt = Instant.now().minus(Duration.ofHours(2));
+        jdbcTemplate.update("INSERT INTO review_invites (id, booking_id, phone_hash, token_hash, status, send_after, "
+                        + "sent_at, expires_at, created_at) VALUES (?, ?, ?, ?, 'SENT', ?, ?, ?, ?)",
+                otherInvite, otherBooking, phoneHasher.hash("+380675556677").hash(),
+                ReviewInviteTokenHasher.hash("EraseKeepsOtherTok_001"), Timestamp.from(sentAt), Timestamp.from(sentAt),
+                Timestamp.from(sentAt.plus(Duration.ofDays(14))), Timestamp.from(sentAt));
+        assertThat(getInvite(token).getStatusCode()).as("redeemable before the erase").isEqualTo(HttpStatus.OK);
+        Instant beforeErase = Instant.now();
+
+        anonymisationService.eraseByPhone(GUEST_PHONE, "SUP-402");
+
+        java.util.Map<String, Object> row = jdbcTemplate.queryForMap(
+                "SELECT status, expires_at, token_hash, sent_at FROM review_invites WHERE booking_id = ?", bookingId);
+        assertThat(row).containsEntry("status", "EXPIRED");
+        assertThat(((Timestamp) row.get("expires_at")).toInstant())
+                .isBetween(beforeErase.minus(Duration.ofSeconds(5)), Instant.now().plus(Duration.ofSeconds(5)));
+        assertThat(row.get("token_hash")).as("EXPIRED keeps the token hash for the opt-out").isNotNull();
+        assertThat(getInvite(token).getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(submit(token, bookingId).getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(optOut(token).getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(optedOut()).isTrue();
+        assertThat(inviteRow(otherInvite)).as("another phone's SENT invite").containsEntry("status", "SENT");
     }
 }

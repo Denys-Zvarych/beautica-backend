@@ -3,9 +3,11 @@ package com.beautica.booking.retention;
 import com.beautica.auth.phoneotp.PhoneOtpService;
 import com.beautica.booking.repository.AppointmentRepository;
 import com.beautica.booking.repository.BookingRepository;
+import com.beautica.booking.repository.GuestBookingSubject;
 import com.beautica.booking.service.BookingCancellationService;
 import com.beautica.booking.service.GuestVisitCancellationService;
 import com.beautica.moderation.service.ClientBlockService;
+import com.beautica.review.invite.service.GuestReviewRetentionService;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -19,8 +21,14 @@ import org.springframework.transaction.PlatformTransactionManager;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.List;
+import java.util.Set;
+import java.util.UUID;
 
+import static org.mockito.ArgumentMatchers.anyCollection;
 import static org.mockito.Mockito.inOrder;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.when;
 import static org.mockito.Mockito.verify;
 
 /**
@@ -31,12 +39,15 @@ import static org.mockito.Mockito.verify;
 @DisplayName("GuestPiiAnonymisationService — eraseByPhone anonymises guest blocks (phase 398 D7)")
 class GuestPiiAnonymisationServiceTest {
 
+    private static final Instant NOW = Instant.parse("2026-10-28T10:00:00Z");
+
     @Mock private BookingRepository bookingRepository;
     @Mock private AppointmentRepository appointmentRepository;
     @Mock private BookingCancellationService bookingCancellationService;
     @Mock private GuestVisitCancellationService guestVisitCancellationService;
     @Mock private PhoneOtpService phoneOtpService;
     @Mock private ClientBlockService clientBlockService;
+    @Mock private GuestReviewRetentionService guestReviewRetentionService;
     @Mock private PlatformTransactionManager transactionManager;
 
     private GuestPiiAnonymisationService service;
@@ -45,8 +56,8 @@ class GuestPiiAnonymisationServiceTest {
     void setUp() {
         service = new GuestPiiAnonymisationService(bookingRepository, appointmentRepository,
                 bookingCancellationService, guestVisitCancellationService, phoneOtpService, clientBlockService,
-                null, new SimpleMeterRegistry(),
-                Clock.fixed(Instant.parse("2026-10-28T10:00:00Z"), ZoneOffset.UTC), transactionManager);
+                guestReviewRetentionService, null, new SimpleMeterRegistry(),
+                Clock.fixed(NOW, ZoneOffset.UTC), transactionManager);
     }
 
     @Test
@@ -64,5 +75,62 @@ class GuestPiiAnonymisationServiceTest {
         order.verify(bookingRepository).anonymiseGuestBookingsByPhone("+380501234567", GuestPii.ANONYMISED_NAME);
         order.verify(phoneOtpService).deleteAllForPhone("+380501234567");
         order.verify(clientBlockService).anonymiseGuestBlocks("+380501234567", GuestPii.ANONYMISED_NAME);
+    }
+
+    @Test
+    @DisplayName("phase 402: erase skips the invites of the item's visit, the erased visit and the single booking, "
+            + "then anonymises their reviews — after the block rename")
+    void should_skipInvitesAndAnonymiseReviewsLast_when_erasingByPhone() {
+        UUID item = UUID.randomUUID();
+        UUID itemVisit = UUID.randomUUID();
+        UUID single = UUID.randomUUID();
+        UUID erasedVisit = UUID.randomUUID();
+        String phone = "+380501234567";
+        when(bookingRepository.anonymiseGuestBookingsByPhone(phone, GuestPii.ANONYMISED_NAME))
+                .thenReturn(List.of(item, single));
+        when(appointmentRepository.anonymiseGuestAppointmentsByPhone(phone, GuestPii.ANONYMISED_NAME))
+                .thenReturn(List.of(erasedVisit));
+        when(bookingRepository.findGuestBookingSubjects(List.of(item, single)))
+                .thenReturn(List.of(subject(item, itemVisit), subject(single, null)));
+
+        service.eraseByPhone(phone, null);
+
+        InOrder order = inOrder(clientBlockService, guestReviewRetentionService);
+        order.verify(clientBlockService).anonymiseGuestBlocks(phone, GuestPii.ANONYMISED_NAME);
+        order.verify(guestReviewRetentionService).skipScheduledInvites(Set.of(erasedVisit, itemVisit), List.of(single));
+        order.verify(guestReviewRetentionService).anonymiseReviewAuthors(List.of(item, single));
+        order.verify(guestReviewRetentionService).expireSentInvitesOfPhone(phone, NOW);
+    }
+
+    @Test
+    @DisplayName("phase 402 audit-fix: erase expires the canonical phone's SENT review invites at the clock's now")
+    void should_expireSentInvitesOfCanonicalPhone_when_erasingByPhone() {
+        service.eraseByPhone("050 123 45 67", "SUP-2");
+
+        verify(guestReviewRetentionService).expireSentInvitesOfPhone("+380501234567", NOW);
+    }
+
+    @Test
+    @DisplayName("phase 402: an erase that anonymised no booking never reads booking subjects")
+    void should_notReadSubjects_when_eraseAnonymisedNoBooking() {
+        service.eraseByPhone("+380501234567", null);
+
+        verify(bookingRepository, never()).findGuestBookingSubjects(anyCollection());
+        verify(guestReviewRetentionService).skipScheduledInvites(Set.of(), List.of());
+        verify(guestReviewRetentionService).anonymiseReviewAuthors(List.of());
+    }
+
+    private static GuestBookingSubject subject(UUID bookingId, UUID appointmentId) {
+        return new GuestBookingSubject() {
+            @Override
+            public UUID getBookingId() {
+                return bookingId;
+            }
+
+            @Override
+            public UUID getAppointmentId() {
+                return appointmentId;
+            }
+        };
     }
 }

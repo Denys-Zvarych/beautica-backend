@@ -15,8 +15,9 @@ import java.util.UUID;
 
 /**
  * Phase 399/400 — data access for {@link ReviewInvite}. Unscoped by design: invites are never read on behalf of an
- * authenticated user. Every multi-row statement is bounded by {@code :limit} (phase 400 D4a). The token lookup /
- * atomic redeem (401) and the retention purge (402) are added by the phases that own them.
+ * authenticated user. Every multi-row statement is bounded by {@code :limit} (phase 400 D4a) or by a caller-supplied id
+ * batch (phase 402 D3 skip). The token lookup / atomic redeem (401) and the retention purge (402) are added by the
+ * phases that own them.
  */
 public interface ReviewInviteRepository extends JpaRepository<ReviewInvite, UUID> {
 
@@ -189,4 +190,84 @@ public interface ReviewInviteRepository extends JpaRepository<ReviewInvite, UUID
             WHERE token_hash = :tokenHash AND status IN ('SENT', 'CONSUMED', 'EXPIRED') AND sent_at > :sentAfter
             """, nativeQuery = true)
     Optional<ReviewInvite> findOptOutable(@Param("tokenHash") byte[] tokenHash, @Param("sentAfter") Instant sentAfter);
+
+    /**
+     * Phase 402 D3 — visit-keyed arm of the anonymisation skip: every {@code SCHEDULED} invite of a visit in
+     * {@code appointmentIds} becomes {@code SKIPPED (ANONYMISED)}. Served by {@code ux_review_invites_appointment};
+     * never called with an empty list (the caller skips the statement instead of binding {@code IN ()}). Only
+     * {@code SCHEDULED} rows, which carry no token material, so {@code chk_review_invites_unsent_no_token} (V217)
+     * holds. {@code clearAutomatically}: a {@code ReviewInvite} managed in this persistence context must not be
+     * flushed later with its stale {@code SCHEDULED} state.
+     */
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query(value = """
+            UPDATE review_invites SET status = 'SKIPPED', skip_reason = 'ANONYMISED'
+             WHERE status = 'SCHEDULED' AND appointment_id IN (:appointmentIds)
+            """, nativeQuery = true)
+    int skipScheduledForAppointments(@Param("appointmentIds") Collection<UUID> appointmentIds);
+
+    /**
+     * Phase 402 D3 — booking-keyed arm of {@link #skipScheduledForAppointments} (single LINK bookings, phase 400 D7).
+     * Served by {@code ux_review_invites_booking}; never called with an empty list.
+     */
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query(value = """
+            UPDATE review_invites SET status = 'SKIPPED', skip_reason = 'ANONYMISED'
+             WHERE status = 'SCHEDULED' AND booking_id IN (:bookingIds)
+            """, nativeQuery = true)
+    int skipScheduledForBookings(@Param("bookingIds") Collection<UUID> bookingIds);
+
+    /**
+     * Phase 402 D3 — deletes up to {@code limit} terminal invites whose terminal moment is before {@code cutoff}
+     * (now − 30 days). Subject-agnostic: visit- and booking-keyed rows alike.
+     * <ul>
+     *   <li>{@code CONSUMED}: {@code consumed_at};</li>
+     *   <li>{@code EXPIRED}: {@code expires_at};</li>
+     *   <li>{@code SENT} past {@code expires_at} (audit-fix cycle 1, sec LOW): a stalled expiry — the expire sweep
+     *       never reached it — is purged on the same clock as an {@code EXPIRED} row, so a stalled sweep can never
+     *       keep a row past its promised retention;</li>
+     *   <li>{@code SKIPPED} / {@code FAILED}: the table has no terminal timestamp for these, so {@code created_at}
+     *       stands in (audit-fix cycle 1, sec LOW — formerly {@code GREATEST(created_at, send_after)}, which let a
+     *       {@code send_after} deferred by quiet hours / the completion delay push the purge PAST the promised 30
+     *       days). {@code created_at} is never later than the terminal moment, so the row is purged no later than
+     *       promised; purging it earlier is acceptable — the row holds no PII beyond the phone hash.</li>
+     * </ul>
+     * {@code SCHEDULED} and unexpired {@code SENT} rows are never deleted. The {@code MATERIALIZED} CTE evaluates the
+     * {@code LIMIT} once ({@link #expireSent}); {@code FOR UPDATE SKIP LOCKED} keeps it off rows a send tick holds.
+     * No index serves this query: the {@code OR} across four status arms (each on a different timestamp) is a
+     * bounded sequential scan of a small table, stopped early by {@code LIMIT} and kept off locked rows by
+     * {@code SKIP LOCKED}. {@code idx_review_invites_sent_expires} (V216) is not used here. Add a partial index on
+     * the predicate only if production timing of the nightly purge exceeds ~100 ms (phase 399/402 audit).
+     */
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query(value = """
+            WITH due AS MATERIALIZED (
+                SELECT id FROM review_invites
+                 WHERE (status = 'CONSUMED' AND consumed_at < :cutoff)
+                    OR (status = 'EXPIRED' AND expires_at < :cutoff)
+                    OR (status = 'SENT' AND expires_at < :cutoff)
+                    OR (status IN ('SKIPPED', 'FAILED') AND created_at < :cutoff)
+                 LIMIT :limit
+                 FOR UPDATE SKIP LOCKED
+            )
+            DELETE FROM review_invites r USING due WHERE r.id = due.id
+            """, nativeQuery = true)
+    int purgeTerminalBefore(@Param("cutoff") Instant cutoff, @Param("limit") int limit);
+
+    /**
+     * Phase 402 audit-fix cycle 1 (sec LOW) — the erase arm for SENT tokens: every {@code SENT} invite of the phone
+     * hashed to {@code phoneHash} becomes {@code EXPIRED} with {@code expires_at = now}, so its link stops resolving
+     * at once ({@link #findRedeemableOrConsumed} / {@link #consumeRedeemable} → 404). {@code EXPIRED} keeps
+     * {@code token_hash} / {@code sent_at} / {@code expires_at} ({@code chk_review_invites_sent_fields},
+     * {@code chk_review_invites_unsent_no_token} — V213/V217), so {@link #findOptOutable} still accepts the token
+     * within 30 days of sending, and {@link #purgeTerminalBefore} deletes the row 30 days after the erase. Served by
+     * the partial {@code idx_review_invites_sent_expires} (V216): the scan is bounded by the live {@code SENT} rows,
+     * which the expire sweep keeps to one review window. Manual erase only — never on a hot path.
+     */
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query(value = """
+            UPDATE review_invites SET status = 'EXPIRED', expires_at = :now
+             WHERE status = 'SENT' AND phone_hash = :phoneHash
+            """, nativeQuery = true)
+    int expireSentForPhoneHash(@Param("phoneHash") byte[] phoneHash, @Param("now") Instant now);
 }

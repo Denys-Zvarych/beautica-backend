@@ -2323,6 +2323,18 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             @Param("sentinel") String sentinel);
 
     /**
+     * Phase 402 D3 — the visit of each booking in {@code bookingIds} (primary-key lookup, bounded by the caller's
+     * batch): the review-invite skip needs the visit ids of anonymised visit items and the ids of anonymised single
+     * bookings.
+     */
+    @Query(value = """
+            SELECT b.id AS bookingId, b.appointment_id AS appointmentId
+              FROM bookings b
+             WHERE b.id IN (:bookingIds)
+            """, nativeQuery = true)
+    List<GuestBookingSubject> findGuestBookingSubjects(@Param("bookingIds") Collection<UUID> bookingIds);
+
+    /**
      * Locks (row-level {@code FOR UPDATE}, id order) the phone's upcoming single guest/walk-in
      * bookings — {@code CONFIRMED} and not yet ended, so an in-progress visit counts — and returns
      * their ids (phase 373 D12 step 2). Visit items are excluded: they are cancelled through their

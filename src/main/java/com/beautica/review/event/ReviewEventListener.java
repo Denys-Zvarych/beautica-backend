@@ -13,7 +13,9 @@ import org.springframework.transaction.event.TransactionalEventListener;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
+import java.util.Set;
 import java.util.UUID;
+import java.util.stream.Collectors;
 
 @Component
 @RequiredArgsConstructor
@@ -37,6 +39,8 @@ public class ReviewEventListener {
     private static final String SALON_DETAIL_CACHE = "salon-detail";
     private static final String REVIEWS_BY_MASTER_CACHE = "reviews-by-master";
     private static final String REVIEWS_BY_SALON_CACHE = "reviews-by-salon";
+    private static final String MASTER_KEY_PREFIX = "master:";
+    private static final String SALON_KEY_PREFIX = "salon:";
     /** {@code GET /reviews/{id}}, keyed by reviewId — see ReviewService#getReview (phase 396: no longer immutable). */
     private static final String REVIEW_DETAIL_CACHE = "review-detail";
 
@@ -108,6 +112,26 @@ public class ReviewEventListener {
     public void onReviewModerationChanged(ReviewModerationChangedEvent event) {
         recalculateAndEvict(event.masterId(), event.masterUserId(), event.salonId());
         evictAfterCompletion(() -> evictKey(REVIEW_DETAIL_CACHE, event.reviewId()));
+    }
+
+    /**
+     * Phase 402 D1 — guest review labels became «Гість». No rating moved, so this only evicts every cached public view
+     * that renders the label, with the same {@code afterCompletion} contract as the other handlers. Audit-fix cycle 1
+     * (perf LOW): a batch can carry many masters and salons, so each keyset/value scan runs ONCE for the whole batch
+     * against the set of owners — {@code reviews-by-master}, {@code reviews-by-salon} and the salon booking pages —
+     * instead of once per id; {@code review-detail} stays per key.
+     */
+    @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
+    public void onGuestReviewsAnonymised(GuestReviewsAnonymisedEvent event) {
+        evictAfterCompletion(() -> {
+            event.reviewIds().forEach(reviewId -> evictKey(REVIEW_DETAIL_CACHE, reviewId));
+            evictReviewPages(REVIEWS_BY_MASTER_CACHE, prefixes(MASTER_KEY_PREFIX, event.masterIds()));
+            if (!event.salonIds().isEmpty()) {
+                evictReviewPages(REVIEWS_BY_SALON_CACHE, prefixes(SALON_KEY_PREFIX, event.salonIds()));
+                masterProfileCacheEvictor.evictSalonBookingPages(event.salonIds());
+            }
+        });
+        masterProfileCacheEvictor.evictBookingSlugInfoAfterCommit(event.masterIds());
     }
 
     private void recalculateAndEvict(UUID masterId, UUID masterUserId, UUID salonId) {
@@ -277,24 +301,11 @@ public class ReviewEventListener {
     //
     // Cache keys use the format "master:<uuid>:page:<n>:size:<m>" (set in ReviewService).
     // Prefix scan on "master:<uuid>:" is safe — the UUID delimiter ':' cannot appear inside a UUID.
-    //
-    // Coupling note: getNativeCache() returns Caffeine's public Cache<Object,Object>.
-    // If the cache manager backend ever changes away from Caffeine, this method must be updated.
-    @SuppressWarnings("unchecked")
     private void evictMasterReviewPages(UUID masterId) {
-        org.springframework.cache.Cache springCache = cacheManager.getCache(REVIEWS_BY_MASTER_CACHE);
-        if (springCache == null) {
-            log.warn("Cache '{}' not found during eviction for master={}",
-                     REVIEWS_BY_MASTER_CACHE, masterId);
-            return;
+        if (masterId == null) {
+            return; // no key can carry "master:null:" from a real master; Set.of would NPE
         }
-        Cache<Object, Object> nativeCache = (Cache<Object, Object>) springCache.getNativeCache();
-        String prefix = "master:" + masterId + ":";
-        nativeCache.invalidateAll(
-                nativeCache.asMap().keySet().stream()
-                        .filter(k -> k instanceof String s && s.startsWith(prefix))
-                        .toList()
-        );
+        evictReviewPages(REVIEWS_BY_MASTER_CACHE, prefixes(MASTER_KEY_PREFIX, Set.of(masterId)));
     }
 
     // Evicts only the cached review pages belonging to the given salon.
@@ -302,21 +313,45 @@ public class ReviewEventListener {
     // Cache keys use the format "salon:<uuid>:sort:<sort>:page:<n>:size:<m>" (set in
     // ReviewService#getSalonReviews). Prefix scan on "salon:<uuid>:" matches every sort
     // dimension for that salon — the UUID delimiter ':' cannot appear inside a UUID.
-    // Same Caffeine-coupling caveat as evictMasterReviewPages above.
-    @SuppressWarnings("unchecked")
     private void evictSalonReviewPages(UUID salonId) {
-        org.springframework.cache.Cache springCache = cacheManager.getCache(REVIEWS_BY_SALON_CACHE);
+        if (salonId == null) {
+            return;
+        }
+        evictReviewPages(REVIEWS_BY_SALON_CACHE, prefixes(SALON_KEY_PREFIX, Set.of(salonId)));
+    }
+
+    /** {@code "<kind>:<uuid>:"} for each owner id — the owner segment of a review-page key. */
+    private static Set<String> prefixes(String kind, Set<UUID> ownerIds) {
+        return ownerIds.stream().map(id -> kind + id + ":").collect(Collectors.toUnmodifiableSet());
+    }
+
+    // ONE keyset pass over cacheName, dropping every String key whose owner segment "<kind>:<uuid>:" is in
+    // ownerPrefixes (phase 402 audit-fix, perf LOW). Equivalent to startsWith(prefix) per owner: the owner segment
+    // ends at the key's SECOND ':' because a UUID never contains one, so a set lookup replaces a scan per owner.
+    //
+    // Coupling note: getNativeCache() returns Caffeine's public Cache<Object,Object>.
+    // If the cache manager backend ever changes away from Caffeine, this method must be updated.
+    @SuppressWarnings("unchecked")
+    private void evictReviewPages(String cacheName, Set<String> ownerPrefixes) {
+        if (ownerPrefixes.isEmpty()) {
+            return;
+        }
+        org.springframework.cache.Cache springCache = cacheManager.getCache(cacheName);
         if (springCache == null) {
-            log.warn("Cache '{}' not found during eviction for salon={}",
-                     REVIEWS_BY_SALON_CACHE, salonId);
+            log.warn("Cache '{}' not found during eviction of {} owners", cacheName, ownerPrefixes.size());
             return;
         }
         Cache<Object, Object> nativeCache = (Cache<Object, Object>) springCache.getNativeCache();
-        String prefix = "salon:" + salonId + ":";
         nativeCache.invalidateAll(
                 nativeCache.asMap().keySet().stream()
-                        .filter(k -> k instanceof String s && s.startsWith(prefix))
+                        .filter(k -> k instanceof String s && ownerPrefixes.contains(ownerSegment(s)))
                         .toList()
         );
+    }
+
+    /** {@code "<kind>:<uuid>:"} of a review-page key, or {@code ""} for a key without two ':' (never a match). */
+    private static String ownerSegment(String key) {
+        int second = key.indexOf(':', key.indexOf(':') + 1);
+        return second < 0 ? "" : key.substring(0, second + 1);
     }
 }
