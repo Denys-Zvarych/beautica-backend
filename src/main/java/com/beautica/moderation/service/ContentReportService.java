@@ -123,7 +123,7 @@ public class ContentReportService {
         boolean burst = request.targetType() == ReportTargetType.REVIEW
                 && reviewAutoHideService.onReviewReported(request.targetId());
         eventPublisher.publishEvent(new ContentReportCreatedEvent(
-                id, request.targetType(), request.targetId(), request.reason(), reporterId, burst));
+                id, request.targetType(), request.targetId(), request.reason(), reporterId, burst, comment));
         log.info("Content report {} created on {} by user {}", id, request.targetType(), reporterId);
         return new CreateReportResult(new ReportResponse(id, ReportStatus.OPEN, createdAt), true);
     }

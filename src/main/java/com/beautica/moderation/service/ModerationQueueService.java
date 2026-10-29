@@ -19,6 +19,7 @@ import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
+import com.beautica.moderation.support.DisplayNames;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
@@ -32,11 +33,9 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
 import java.util.UUID;
 import java.util.function.Function;
 import java.util.stream.Collectors;
-import java.util.stream.Stream;
 
 /**
  * Phase 396 D4 — the support moderation queue: one page of reports in one status, each with a snapshot of its target
@@ -92,11 +91,12 @@ public class ModerationQueueService {
             case PORTFOLIO_PHOTO -> index(portfolioRows(ids), MediaFile::getId,
                     m -> ModerationTargetSnapshot.photo(m.getR2Url()));
             case MASTER_PROFILE -> index(masterRepository.findAllById(ids), Master::getId,
-                    m -> ModerationTargetSnapshot.profile(fullName(m.displayFirstName(), m.displayLastName())));
+                    m -> ModerationTargetSnapshot.profile(
+                            DisplayNames.fullName(m.displayFirstName(), m.displayLastName())));
             case SALON_PROFILE -> index(salonRepository.findAllById(ids), Salon::getId,
                     s -> ModerationTargetSnapshot.profile(s.getName()));
             case CLIENT_PROFILE -> index(userRepository.findAllById(ids), User::getId,
-                    u -> ModerationTargetSnapshot.profile(fullName(u.getFirstName(), u.getLastName())));
+                    u -> ModerationTargetSnapshot.profile(DisplayNames.fullName(u.getFirstName(), u.getLastName())));
         };
     }
 
@@ -111,10 +111,5 @@ public class ModerationQueueService {
         Map<UUID, ModerationTargetSnapshot> map = new HashMap<>();
         rows.forEach(row -> map.put(id.apply(row), snapshot.apply(row)));
         return map;
-    }
-
-    private static String fullName(String first, String last) {
-        String joined = Stream.of(first, last).filter(Objects::nonNull).collect(Collectors.joining(" ")).strip();
-        return joined.isEmpty() ? null : joined;
     }
 }

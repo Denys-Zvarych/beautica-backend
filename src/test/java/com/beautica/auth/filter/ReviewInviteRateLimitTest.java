@@ -54,7 +54,7 @@ class ReviewInviteRateLimitTest {
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(), permissive(), permissive(),
-                permissive(), permissive(), permissive(), props);
+                permissive(), permissive(), permissive(), permissive(), permissive(), props);
     }
 
     private static MockHttpServletRequest request(String method, String path, String remoteAddr) {

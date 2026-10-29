@@ -191,6 +191,15 @@ public interface ContentReportRepository extends JpaRepository<ContentReport, UU
             @Param("targetId") UUID targetId,
             @Param("now") Instant now);
 
+    // ── E-mail action links (phase 414) ──────────────────────────────────────────────────────
+
+    /** D9 step 2: the oldest OPEN report on one target — the report an e-mailed action resolves. */
+    Optional<ContentReport> findFirstByTargetTypeAndTargetIdAndStatusOrderByCreatedAtAscIdAsc(
+            ReportTargetType targetType, UUID targetId, ReportStatus status);
+
+    /** D1 / D7: how many reports on one target are in {@code status} (the e-mail and confirm page show the OPEN count). */
+    long countByTargetTypeAndTargetIdAndStatus(ReportTargetType targetType, UUID targetId, ReportStatus status);
+
     // ── Queue (phase 396 D4) ─────────────────────────────────────────────────────────────────
 
     /**

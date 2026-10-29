@@ -72,6 +72,10 @@ app:
     review-decision-capacity: 100000
     # Sibling GET-page bucket (60/hr in production); 429 covered by ReviewGetRateLimitRegressionTest.
     review-page-capacity: 100000
+    # Phase 414 moderation-action pages (30 / 10 per 10 min in production); the 429 is covered by
+    # ModerationActionRateLimitIT, which lowers both caps in its own context.
+    moderation-action-page-capacity: 100000
+    moderation-action-decision-capacity: 100000
     device-token-capacity: 100000
     media-upload-capacity: 100000
     verify-email-capacity: 100000

@@ -397,6 +397,19 @@ public class RateLimitConfig {
     @Value("${app.rate-limit.review-page-capacity:60}")
     private long reviewPageCapacity;
 
+    // Phase 414 D13 — per-IP caps for the support e-mail's one-click moderation pages (10-minute window). The GET
+    // confirm page and the POST decision get SEPARATE buckets (not shared with the category review buckets above), so
+    // opening a page never spends the decision budget. One support person clicks a handful of links; a garbage-token
+    // flood still hits the DB, hence the caps. Configurable so ITs on 127.0.0.1 can raise / lower them.
+    @Value("${app.rate-limit.moderation-action-page-capacity:30}")
+    private long moderationActionPageCapacity;
+
+    @Value("${app.rate-limit.moderation-action-decision-capacity:10}")
+    private long moderationActionDecisionCapacity;
+
+    /** Window of both moderation-action buckets (D13: 10 minutes). */
+    public static final Duration MODERATION_ACTION_WINDOW = Duration.ofMinutes(10);
+
     // Per-IP cap for POST /api/v1/service-types/suggest (60-minute window).
     // Like the category-request path, every successful suggestion emails the admin,
     // so this is an inbox-flood surface — kept low (5/hr) to match that posture.
@@ -1076,6 +1089,26 @@ public class RateLimitConfig {
                 REVIEW_PAGE_WINDOW.plus(EVICTION_GRACE),
                 reviewPageCapacity,
                 REVIEW_PAGE_WINDOW);
+    }
+
+    /** Phase 414 D13 — per-IP bucket for {@code GET /api/v1/moderation/actions/{token}}. */
+    @Bean
+    public LoadingCache<String, Bucket> moderationActionPageBuckets() {
+        return bucketCache(
+                DEFAULT_BUCKET_CACHE_SIZE,
+                MODERATION_ACTION_WINDOW.plus(EVICTION_GRACE),
+                moderationActionPageCapacity,
+                MODERATION_ACTION_WINDOW);
+    }
+
+    /** Phase 414 D13 — per-IP bucket for {@code POST /api/v1/moderation/actions/confirm}; separate from the page's. */
+    @Bean
+    public LoadingCache<String, Bucket> moderationActionDecisionBuckets() {
+        return bucketCache(
+                DEFAULT_BUCKET_CACHE_SIZE,
+                MODERATION_ACTION_WINDOW.plus(EVICTION_GRACE),
+                moderationActionDecisionCapacity,
+                MODERATION_ACTION_WINDOW);
     }
 
     /**

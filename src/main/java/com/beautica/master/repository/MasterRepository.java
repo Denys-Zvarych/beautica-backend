@@ -104,6 +104,17 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
             """)
     Optional<Master> findActiveByUserIdWithUserAndSalon(@Param("userId") UUID userId);
 
+    /**
+     * Phase 414 — one master by id with its (nullable, phase 294) user fetched in the same statement, for the support
+     * report e-mail (name + avatar). Active or not: a reported profile may since have been deactivated or detached.
+     */
+    @Query("""
+            SELECT m FROM Master m
+            LEFT JOIN FETCH m.user
+            WHERE m.id = :masterId
+            """)
+    Optional<Master> findByIdWithUser(@Param("masterId") UUID masterId);
+
     /** @deprecated No JOIN FETCH on user — triggers N+1. Use {@link #findBySalonIdAndIsActiveTrueWithUser} instead. */
     @Deprecated
     Page<Master> findBySalonIdAndIsActiveTrue(UUID salonId, Pageable pageable);

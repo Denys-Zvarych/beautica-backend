@@ -11,6 +11,7 @@ import com.beautica.moderation.entity.ReportResolution;
 import com.beautica.moderation.entity.ReportStatus;
 import com.beautica.moderation.entity.ReportTargetType;
 import com.beautica.moderation.repository.ContentReportRepository;
+import com.beautica.moderation.repository.ModerationActionTokenRepository;
 import com.beautica.review.entity.ModerationStatus;
 import com.beautica.review.service.ReviewModerationService;
 import com.beautica.review.service.ReviewModerationService.LockedReview;
@@ -61,12 +62,15 @@ class ModerationServiceTest {
     @Mock
     private ProviderModerationLock providerLock;
 
+    @Mock
+    private ModerationActionTokenRepository actionTokenRepository;
+
     private ModerationService service;
 
     @BeforeEach
     void setUp() {
-        service = new ModerationService(repository, reviewModerationService, providerLock, mediaService,
-                Clock.fixed(NOW, ZoneOffset.UTC));
+        service = new ModerationService(repository, actionTokenRepository, reviewModerationService, providerLock,
+                mediaService, Clock.fixed(NOW, ZoneOffset.UTC));
     }
 
     @Test
@@ -243,6 +247,67 @@ class ModerationServiceTest {
                         e -> assertThat(e.getStatus()).isEqualTo(HttpStatus.CONFLICT));
 
         verify(repository, never()).markTargetGone(any(), any(), any());
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @EnumSource(ModerationAction.class)
+    @DisplayName("phase 414 D11: every successful resolve revokes all live e-mail action links of the target")
+    void should_revokeActionLinks_when_resolved(ModerationAction action) {
+        stubReport(ReportTargetType.REVIEW, ReportStatus.OPEN);
+        stubLockedReview();
+        stubResolved(1);
+
+        service.resolve(REPORT_ID, new ResolveReportRequest(action, null));
+
+        verify(actionTokenRepository).revokeAllForTarget(ReportTargetType.REVIEW, TARGET_ID, NOW);
+    }
+
+    @Test
+    @DisplayName("phase 414 D11: a TARGET_GONE resolve revokes the links too")
+    void should_revokeActionLinks_when_targetGone() {
+        stubReport(ReportTargetType.REVIEW, ReportStatus.OPEN);
+        when(reviewModerationService.lockReview(TARGET_ID)).thenReturn(Optional.empty());
+        stubResolved(1);
+
+        service.resolve(REPORT_ID, new ResolveReportRequest(ModerationAction.REMOVE, null));
+
+        verify(actionTokenRepository).revokeAllForTarget(ReportTargetType.REVIEW, TARGET_ID, NOW);
+    }
+
+    @Test
+    @DisplayName("phase 414 D11: a 409 resolve (nothing left to close) revokes nothing — its transaction rolls back")
+    void should_notRevokeActionLinks_when_conflict() {
+        stubReport(ReportTargetType.SALON_PROFILE, ReportStatus.OPEN);
+        stubResolved(0);
+
+        assertThatThrownBy(() -> service.resolve(REPORT_ID, new ResolveReportRequest(ModerationAction.DISMISS, null)))
+                .isInstanceOf(BusinessException.class);
+
+        verifyNoInteractions(actionTokenRepository);
+    }
+
+    @Test
+    @DisplayName("phase 414 D9: the oldest OPEN report on a target is looked up by target + OPEN status")
+    void should_returnOldestOpenReportId_when_present() {
+        ContentReport report = BeanUtils.instantiateClass(ContentReport.class);
+        ReflectionTestUtils.setField(report, "id", REPORT_ID);
+        when(repository.findFirstByTargetTypeAndTargetIdAndStatusOrderByCreatedAtAscIdAsc(
+                ReportTargetType.REVIEW, TARGET_ID, ReportStatus.OPEN)).thenReturn(Optional.of(report));
+
+        Optional<UUID> found = service.findOldestOpenReportId(ReportTargetType.REVIEW, TARGET_ID);
+
+        assertThat(found).contains(REPORT_ID);
+    }
+
+    @Test
+    @DisplayName("phase 414: the OPEN count is the repository count for the target in OPEN status")
+    void should_countOpenReports_when_asked() {
+        when(repository.countByTargetTypeAndTargetIdAndStatus(ReportTargetType.REVIEW, TARGET_ID, ReportStatus.OPEN))
+                .thenReturn(4L);
+
+        long count = service.countOpenReports(ReportTargetType.REVIEW, TARGET_ID);
+
+        assertThat(count).isEqualTo(4L);
     }
 
     private LockedReview stubLockedReview() {

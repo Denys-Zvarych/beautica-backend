@@ -6,14 +6,18 @@ import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
 import com.beautica.config.AsyncConfig;
 import com.beautica.config.SupportProperties;
+import com.beautica.moderation.dto.ContentReportEmailModel;
+import com.beautica.moderation.dto.ModerationAction;
+import com.beautica.moderation.dto.ModerationActionLink;
+import com.beautica.moderation.dto.ReportedContent;
 import com.beautica.moderation.entity.ReportReason;
 import com.beautica.moderation.entity.ReportTargetType;
 import com.beautica.moderation.event.ContentReportCreatedEvent;
+import com.beautica.moderation.event.ContentReportEmailDispatcher;
 import com.beautica.moderation.event.ContentReportEmailListener;
+import com.beautica.moderation.service.ModerationActionLinkService;
+import com.beautica.moderation.service.ModerationEmailContentLoader;
 import com.beautica.notification.EmailService;
-import jakarta.mail.Session;
-import jakarta.mail.internet.MimeMessage;
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -21,178 +25,156 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.slf4j.LoggerFactory;
 import org.springframework.core.task.TaskRejectedException;
+import org.springframework.dao.DataAccessResourceFailureException;
+import org.springframework.scheduling.annotation.Async;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
-import org.springframework.mail.javamail.JavaMailSender;
-import org.thymeleaf.spring6.SpringTemplateEngine;
-import org.thymeleaf.templatemode.TemplateMode;
-import org.thymeleaf.templateresolver.ClassLoaderTemplateResolver;
 
-import java.io.InputStream;
-import java.nio.charset.StandardCharsets;
-import java.util.Properties;
-import java.util.Set;
+import java.lang.reflect.Method;
+import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
-import java.util.stream.Collectors;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
-import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.Mockito.mock;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
-import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.when;
 
 /**
- * Phase 395 D7 — the support e-mail for a content report carries identifiers only: report id, target type/id,
- * reason, reporter id. Neither the reported text nor the reporter's comment may appear. Renders the real
- * {@code templates/email/content-report.html} through a real Thymeleaf engine into a real {@link MimeMessage}.
+ * Phase 395 D7 / 414 — the support e-mail listener (request thread: hand-off only) and dispatcher (reportEmailExecutor:
+ * content model D1, minted action links D3, send). Covers the routing (normal vs burst), the skip / drop paths and
+ * the bounded executor. What the e-mail RENDERS is pinned by {@link ContentReportEmailRenderTest}.
  */
 @ExtendWith(MockitoExtension.class)
-@DisplayName("Content report support e-mail — ids only (phase 395 D7)")
+@DisplayName("Content report support e-mail — listener (phase 395 D7 / 414)")
 class ContentReportEmailTest {
 
-    private static final String TEMPLATE = "templates/email/content-report.html";
-    private static final Set<String> ALLOWED_TEMPLATE_VARIABLES =
-            // "burst" (phase 396) is a boolean flag, not UGC.
-            Set.of("reportId", "targetType", "targetId", "reason", "reporterUserId", "burst");
+    @Mock
+    private EmailService emailService;
 
     @Mock
-    private JavaMailSender mailSender;
+    private ModerationEmailContentLoader contentLoader;
 
-    private EmailService emailService;
-    private MimeMessage message;
+    @Mock
+    private ModerationActionLinkService actionLinkService;
 
-    @BeforeEach
-    void setUp() {
-        var resolver = new ClassLoaderTemplateResolver();
-        resolver.setPrefix("templates/");
-        resolver.setSuffix(".html");
-        resolver.setTemplateMode(TemplateMode.HTML);
-        resolver.setCharacterEncoding("UTF-8");
-        var engine = new SpringTemplateEngine();
-        engine.setTemplateResolver(resolver);
-        emailService = new EmailService(mailSender, engine, "noreply@beautica.app");
-        message = new MimeMessage(Session.getInstance(new Properties()));
+    @Mock
+    private ContentReportEmailDispatcher dispatcherMock;
+
+    // ── listener: request thread, hand-off only ──────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("audit-fix: the listener only hands the event to the dispatcher — no load, no mint, no send on the "
+            + "request thread")
+    void should_onlyHandOff_when_reportCreated() {
+        ContentReportCreatedEvent event = event(ReportTargetType.REVIEW, false);
+
+        listener("support@beautica.test").onContentReportCreated(event);
+
+        verify(dispatcherMock).dispatch("support@beautica.test", event);
+        verifyNoInteractions(emailService, contentLoader, actionLinkService);
     }
 
     @Test
-    @DisplayName("listener → e-mail to the support inbox containing every id, the reason and target type")
-    void should_sendIdsOnlyEmail_when_reportCreated() throws Exception {
-        when(mailSender.createMimeMessage()).thenReturn(message);
-        UUID reportId = UUID.randomUUID();
-        UUID targetId = UUID.randomUUID();
-        UUID reporterId = UUID.randomUUID();
-        ContentReportEmailListener listener = new ContentReportEmailListener(supportInbox("support@beautica.test"),
-                emailService);
+    @DisplayName("audit-fix: the dispatcher runs on reportEmailExecutor (@Async), so load + mint + send are off-thread")
+    void should_runOnReportEmailExecutor_when_dispatching() throws Exception {
+        Method dispatch = ContentReportEmailDispatcher.class.getMethod(
+                "dispatch", String.class, ContentReportCreatedEvent.class);
 
-        listener.onContentReportCreated(new ContentReportCreatedEvent(
-                reportId, ReportTargetType.REVIEW, targetId, ReportReason.HARASSMENT, reporterId, false));
+        Async async = dispatch.getAnnotation(Async.class);
 
-        verify(mailSender).send(message);
-        String html = message.getContent().toString();
-        assertThat(message.getAllRecipients()[0].toString()).isEqualTo("support@beautica.test");
-        assertThat(html).contains(reportId.toString(), targetId.toString(), reporterId.toString(),
-                "REVIEW", "HARASSMENT");
-        assertThat(message.getSubject()).isEqualTo("[Beautica Report] REVIEW — HARASSMENT");
+        assertThat(async).as("dispatch must be @Async").isNotNull();
+        assertThat(async.value()).isEqualTo("reportEmailExecutor");
     }
 
     @Test
-    @DisplayName("phase 396: a burst event → [BURST] subject + burst banner; a normal event carries neither")
-    void should_flagBurst_when_eventIsBurst() throws Exception {
-        MimeMessage normal = new MimeMessage(Session.getInstance(new Properties()));
-        when(mailSender.createMimeMessage()).thenReturn(message, normal);
-        ContentReportEmailListener listener = new ContentReportEmailListener(supportInbox("support@beautica.test"),
-                emailService);
-
-        listener.onContentReportCreated(new ContentReportCreatedEvent(
-                UUID.randomUUID(), ReportTargetType.REVIEW, UUID.randomUUID(), ReportReason.SPAM, UUID.randomUUID(), true));
-        listener.onContentReportCreated(new ContentReportCreatedEvent(
-                UUID.randomUUID(), ReportTargetType.REVIEW, UUID.randomUUID(), ReportReason.SPAM, UUID.randomUUID(), false));
-
-        assertThat(message.getSubject()).isEqualTo("[BURST] [Beautica Report] REVIEW — SPAM");
-        assertThat(message.getContent().toString()).contains("Сплеск скарг");
-        assertThat(normal.getSubject()).isEqualTo("[Beautica Report] REVIEW — SPAM");
-        assertThat(normal.getContent().toString()).doesNotContain("Сплеск скарг");
-    }
-
-    @Test
-    @DisplayName("the template binds only the id/enum variables + the burst flag — no slot for review text or comment")
-    void should_bindOnlyIdVariables_when_templateParsed() throws Exception {
-        String template;
-        try (InputStream in = getClass().getClassLoader().getResourceAsStream(TEMPLATE)) {
-            assertThat(in).as("template on the classpath").isNotNull();
-            template = new String(in.readAllBytes(), StandardCharsets.UTF_8);
-        }
-
-        Matcher matcher = Pattern.compile("\\$\\{\\s*([A-Za-z_][A-Za-z0-9_.]*)").matcher(template);
-        Set<String> variables = matcher.results().map(m -> m.group(1)).collect(Collectors.toSet());
-
-        assertThat(variables).isEqualTo(ALLOWED_TEMPLATE_VARIABLES);
-    }
-
-    @Test
-    @DisplayName("the rendered body contains no review text or reporter comment even when both exist")
-    void should_notContainUgc_when_rendered() throws Exception {
-        when(mailSender.createMimeMessage()).thenReturn(message);
-        // What the DB holds for this report — none of it is passed to the e-mail path.
-        String reviewText = "REVIEW-TEXT-SENTINEL";
-        String reporterComment = "REPORTER-COMMENT-SENTINEL";
-
-        emailService.sendContentReportEmail("support@beautica.test", UUID.randomUUID(), "REVIEW",
-                UUID.randomUUID(), "OTHER", UUID.randomUUID());
-
-        String html = message.getContent().toString();
-        assertThat(html).doesNotContain(reviewText).doesNotContain(reporterComment);
-        assertThat(message.getSubject()).doesNotContain(reviewText).doesNotContain(reporterComment);
-    }
-
-    @Test
-    @DisplayName("blank SUPPORT_EMAIL → no e-mail attempted (the DB row stays authoritative)")
+    @DisplayName("blank SUPPORT_EMAIL → nothing dispatched (the DB row stays authoritative)")
     void should_skipEmail_when_supportInboxBlank() {
-        EmailService email = mock(EmailService.class);
-        ContentReportEmailListener listener = new ContentReportEmailListener(supportInbox(""), email);
+        listener("").onContentReportCreated(event(ReportTargetType.SALON_PROFILE, false));
 
-        listener.onContentReportCreated(new ContentReportCreatedEvent(UUID.randomUUID(),
-                ReportTargetType.SALON_PROFILE, UUID.randomUUID(), ReportReason.SPAM, UUID.randomUUID(), false));
-
-        verifyNoInteractions(email);
-        verify(mailSender, never()).send(any(MimeMessage.class));
+        verifyNoInteractions(dispatcherMock);
     }
 
     @Test
     @DisplayName("saturated reportEmailExecutor → hand-off dropped with ONE WARN line, no stack, no exception")
     void should_logSingleWarn_when_reportEmailExecutorRejects() {
-        EmailService email = mock(EmailService.class);
+        ContentReportCreatedEvent event = event(ReportTargetType.REVIEW, false);
         doThrow(new TaskRejectedException("Executor rejected task"))
-                .when(email).sendContentReportEmail(anyString(), any(), anyString(), any(), anyString(), any());
-        ContentReportEmailListener listener = new ContentReportEmailListener(supportInbox("support@beautica.test"),
-                email);
-        UUID reportId = UUID.randomUUID();
-        Logger listenerLogger = (Logger) LoggerFactory.getLogger(ContentReportEmailListener.class);
-        ListAppender<ILoggingEvent> appender = new ListAppender<>();
-        appender.start();
-        listenerLogger.addAppender(appender);
+                .when(dispatcherMock).dispatch(anyString(), any());
 
-        try {
-            assertThatCode(() -> listener.onContentReportCreated(new ContentReportCreatedEvent(reportId,
-                    ReportTargetType.REVIEW, UUID.randomUUID(), ReportReason.SPAM, UUID.randomUUID(), false)))
-                    .doesNotThrowAnyException();
-        } finally {
-            listenerLogger.detachAppender(appender);
-        }
+        List<ILoggingEvent> logged = captureLog(ContentReportEmailListener.class, () -> assertThatCode(
+                () -> listener("support@beautica.test").onContentReportCreated(event)).doesNotThrowAnyException());
 
-        assertThat(appender.list).singleElement().satisfies(event -> {
-            assertThat(event.getLevel()).isEqualTo(Level.WARN);
-            assertThat(event.getFormattedMessage()).contains(reportId.toString(), "reportEmailExecutor saturated");
-            assertThat(event.getThrowableProxy()).as("no stack trace").isNull();
+        assertThat(logged).singleElement().satisfies(line -> {
+            assertThat(line.getLevel()).isEqualTo(Level.WARN);
+            assertThat(line.getFormattedMessage())
+                    .contains(event.reportId().toString(), "reportEmailExecutor saturated");
+            assertThat(line.getThrowableProxy()).as("no stack trace").isNull();
         });
+    }
+
+    // ── dispatcher: report-email thread ───────────────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("dispatcher → content model with the minted links to the support inbox (normal send)")
+    void should_sendModelWithLinks_when_dispatched() {
+        ContentReportCreatedEvent event = event(ReportTargetType.REVIEW, false);
+        ContentReportEmailModel loaded = model(event, ReportedContent.review("text", (short) 2, true));
+        List<ModerationActionLink> links = List.of(
+                new ModerationActionLink(ModerationAction.REMOVE, "https://api.beautica.test/x"));
+        when(contentLoader.load(event)).thenReturn(loaded);
+        when(actionLinkService.mintFor(ReportTargetType.REVIEW, event.targetId(), true)).thenReturn(links);
+
+        dispatcher().dispatch("support@beautica.test", event);
+
+        verify(emailService).sendContentReportEmail("support@beautica.test", loaded.withActions(links));
+        verify(emailService, never()).sendContentReportBurstEmail(anyString(), any());
+    }
+
+    @Test
+    @DisplayName("phase 396: a burst event → the burst send")
+    void should_routeBurst_when_eventIsBurst() {
+        ContentReportCreatedEvent event = event(ReportTargetType.SALON_PROFILE, true);
+        ContentReportEmailModel loaded = model(event, ReportedContent.profile("Salon", null));
+        when(contentLoader.load(event)).thenReturn(loaded);
+        when(actionLinkService.mintFor(ReportTargetType.SALON_PROFILE, event.targetId(), false)).thenReturn(List.of());
+
+        dispatcher().dispatch("support@beautica.test", event);
+
+        verify(emailService).sendContentReportBurstEmail("support@beautica.test", loaded);
+        verify(emailService, never()).sendContentReportEmail(anyString(), any());
+    }
+
+    @Test
+    @DisplayName("a DB failure while loading content → nudge dropped with ONE WARN line, no stack, no throw")
+    void should_dropWithSingleWarn_when_contentLoadFails() {
+        ContentReportCreatedEvent event = event(ReportTargetType.REVIEW, false);
+        when(contentLoader.load(event)).thenThrow(new DataAccessResourceFailureException("db down"));
+
+        List<ILoggingEvent> logged = captureLog(ContentReportEmailDispatcher.class,
+                () -> dispatcher().dispatch("support@beautica.test", event));
+
+        assertThat(logged).singleElement().satisfies(line -> {
+            assertThat(line.getLevel()).isEqualTo(Level.WARN);
+            assertThat(line.getFormattedMessage()).contains(event.reportId().toString())
+                    .doesNotContain("db down");
+            assertThat(line.getThrowableProxy()).as("no stack trace").isNull();
+        });
+        verifyNoInteractions(emailService, actionLinkService);
+    }
+
+    @Test
+    @DisplayName("the event carries the comment in memory but never prints it")
+    void should_omitComment_when_eventPrinted() {
+        ContentReportCreatedEvent event = new ContentReportCreatedEvent(UUID.randomUUID(), ReportTargetType.REVIEW,
+                UUID.randomUUID(), ReportReason.SPAM, UUID.randomUUID(), false, "SECRET-COMMENT");
+
+        assertThat(event.toString()).doesNotContain("SECRET-COMMENT");
     }
 
     @Test
@@ -226,9 +208,36 @@ class ContentReportEmailTest {
         }
     }
 
-    private static SupportProperties supportInbox(String email) {
+    private ContentReportEmailListener listener(String supportEmail) {
         SupportProperties properties = new SupportProperties();
-        properties.setEmail(email);
-        return properties;
+        properties.setEmail(supportEmail);
+        return new ContentReportEmailListener(properties, dispatcherMock);
+    }
+
+    private ContentReportEmailDispatcher dispatcher() {
+        return new ContentReportEmailDispatcher(emailService, contentLoader, actionLinkService);
+    }
+
+    private static ContentReportCreatedEvent event(ReportTargetType type, boolean burst) {
+        return new ContentReportCreatedEvent(UUID.randomUUID(), type, UUID.randomUUID(), ReportReason.SPAM,
+                UUID.randomUUID(), burst, null);
+    }
+
+    private static ContentReportEmailModel model(ContentReportCreatedEvent event, ReportedContent content) {
+        return new ContentReportEmailModel(event.reportId(), event.targetType(), event.targetId(), event.reason(),
+                event.reporterUserId(), event.burst(), content, null, 1, List.of());
+    }
+
+    private static List<ILoggingEvent> captureLog(Class<?> source, Runnable action) {
+        Logger logger = (Logger) LoggerFactory.getLogger(source);
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            action.run();
+        } finally {
+            logger.detachAppender(appender);
+        }
+        return appender.list;
     }
 }

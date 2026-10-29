@@ -2,6 +2,7 @@ package com.beautica.moderation.service;
 
 import com.beautica.moderation.config.ModerationProperties;
 import com.beautica.moderation.repository.ContentReportRepository;
+import com.beautica.moderation.repository.ModerationActionTokenRepository;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -37,6 +38,9 @@ class ContentReportRetentionServiceTest {
     private ContentReportRepository repository;
 
     @Mock
+    private ModerationActionTokenRepository tokenRepository;
+
+    @Mock
     private PlatformTransactionManager transactionManager;
 
     @Test
@@ -70,14 +74,29 @@ class ContentReportRetentionServiceTest {
 
         service().sweep(NOW);
 
-        // review: 2 batches; 5 other types: 1 each; purge: 1 → 8 transactions.
-        verify(transactionManager, times(8)).commit(any());
+        // review: 2 batches; 5 other types: 1 each; purge: 1; phase 414 link revoke: 1, link purge: 1 → 10.
+        verify(transactionManager, times(10)).commit(any());
     }
 
     private ContentReportRetentionService service() {
         ModerationProperties properties = new ModerationProperties(3, 5, Duration.ofMinutes(10), 1,
                 Duration.ofHours(24), new ModerationProperties.Retention(false, "0 37 3 * * *", BATCH, MAX_BATCHES));
-        return new ContentReportRetentionService(repository, properties, transactionManager);
+        return new ContentReportRetentionService(repository, tokenRepository, properties, transactionManager);
+    }
+
+    @Test
+    @DisplayName("phase 414: after the report purge, live links without an OPEN report are revoked and links expired "
+            + "more than 30 days ago are purged, each batched")
+    void should_revokeAndPurgeActionLinks_when_swept() {
+        when(tokenRepository.revokeLiveWithoutOpenReport(NOW_MICROS, BATCH)).thenReturn(2, 1);
+        when(tokenRepository.deleteExpiredBefore(NOW_MICROS.minus(Duration.ofDays(30)), BATCH)).thenReturn(0);
+
+        service().sweep(NOW);
+
+        var order = inOrder(repository, tokenRepository);
+        order.verify(repository).deleteGoneBefore(CUTOFF, BATCH);
+        order.verify(tokenRepository, times(2)).revokeLiveWithoutOpenReport(NOW_MICROS, BATCH);
+        order.verify(tokenRepository).deleteExpiredBefore(NOW_MICROS.minus(Duration.ofDays(30)), BATCH);
     }
 
     @Test

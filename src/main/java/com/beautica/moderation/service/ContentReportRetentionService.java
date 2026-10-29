@@ -2,6 +2,7 @@ package com.beautica.moderation.service;
 
 import com.beautica.moderation.config.ModerationProperties;
 import com.beautica.moderation.repository.ContentReportRepository;
+import com.beautica.moderation.repository.ModerationActionTokenRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -9,6 +10,7 @@ import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.temporal.ChronoUnit;
@@ -29,6 +31,10 @@ import java.util.function.IntUnaryOperator;
  * pattern: a failure keeps the earlier batches, and no single statement holds row locks over the whole table.
  * Reports on a live target are never purged, whatever their age. {@code now} is a parameter (the job passes the
  * injected {@code Clock}'s instant) so tests pin it.
+ *
+ * <p>Phase 414: the same sweep then (3) revokes every live e-mail action link whose target has no OPEN report left —
+ * the bulk {@code TARGET_GONE} closure above does not go through {@code ModerationService#resolve}, so this is its
+ * D11 link kill — and (4) deletes action-link rows that expired more than 30 days ago (D16). Same batching.
  */
 @Service
 public class ContentReportRetentionService {
@@ -38,7 +44,11 @@ public class ContentReportRetentionService {
     /** D7: one year after the target is gone. */
     static final int RETENTION_YEARS = 1;
 
+    /** Phase 414 D16: expired action-link rows are kept this long past expiry, then purged. */
+    static final Duration ACTION_TOKEN_GRACE = Duration.ofDays(30);
+
     private final ContentReportRepository contentReportRepository;
+    private final ModerationActionTokenRepository actionTokenRepository;
     private final ModerationProperties.Retention retention;
     private final TransactionTemplate batchTx;
 
@@ -46,9 +56,11 @@ public class ContentReportRetentionService {
     public record SweepResult(int markedGone, int purged) {}
 
     public ContentReportRetentionService(ContentReportRepository contentReportRepository,
+                                         ModerationActionTokenRepository actionTokenRepository,
                                          ModerationProperties properties,
                                          PlatformTransactionManager transactionManager) {
         this.contentReportRepository = contentReportRepository;
+        this.actionTokenRepository = actionTokenRepository;
         this.retention = properties.retention();
         this.batchTx = new TransactionTemplate(transactionManager);
         this.batchTx.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
@@ -62,7 +74,11 @@ public class ContentReportRetentionService {
         }
         Instant cutoff = cutoff(stamp);
         int purged = inBatches(batch -> contentReportRepository.deleteGoneBefore(cutoff, batch));
-        log.info("Content report retention: {} reports marked target-gone, {} purged", markedGone, purged);
+        int revokedLinks = inBatches(batch -> actionTokenRepository.revokeLiveWithoutOpenReport(stamp, batch));
+        Instant tokenCutoff = stamp.minus(ACTION_TOKEN_GRACE);
+        int purgedLinks = inBatches(batch -> actionTokenRepository.deleteExpiredBefore(tokenCutoff, batch));
+        log.info("Content report retention: {} reports marked target-gone, {} purged; {} action links revoked, "
+                + "{} purged", markedGone, purged, revokedLinks, purgedLinks);
         return new SweepResult(markedGone, purged);
     }
 

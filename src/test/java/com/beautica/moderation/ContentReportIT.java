@@ -2,6 +2,7 @@ package com.beautica.moderation;
 
 import com.beautica.auth.Role;
 import com.beautica.config.TestSecurityConfig;
+import com.beautica.moderation.dto.ContentReportEmailModel;
 import com.beautica.moderation.dto.CreateReportRequest;
 import com.beautica.moderation.entity.ReportReason;
 import com.beautica.moderation.entity.ReportTargetType;
@@ -35,6 +36,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.never;
@@ -88,9 +90,10 @@ class ContentReportIT extends AbstractModerationIT {
         assertThat(jdbcTemplate.queryForObject(
                 "SELECT comment FROM content_reports WHERE reporter_user_id = ?", String.class, reporterId))
                 .isEqualTo("SECRET-COMMENT-TEXT");
-        verify(emailService, times(1)).sendContentReportEmail(
-                SUPPORT_EMAIL, UUID.fromString(created.path("id").asText()), "REVIEW", reviewId, "OFFENSIVE",
-                reporterId);
+        verify(emailService, times(1)).sendContentReportEmail(eq(SUPPORT_EMAIL), argThat(m ->
+                m.reportId().equals(UUID.fromString(created.path("id").asText()))
+                        && m.targetType().name().equals("REVIEW") && m.targetId().equals(reviewId)
+                        && m.reason().name().equals("OFFENSIVE") && reporterId.equals(m.reporterUserId())));
     }
 
     @Test
@@ -128,8 +131,7 @@ class ContentReportIT extends AbstractModerationIT {
             pool.shutdownNow();
         }
         assertThat(countReports(reporterId)).isEqualTo(1);
-        verify(emailService, times(1)).sendContentReportEmail(
-                anyString(), any(), anyString(), any(), anyString(), eq(reporterId));
+        verify(emailService, times(1)).sendContentReportEmail(anyString(), emailFromReporter(reporterId));
     }
 
     @Test
@@ -146,7 +148,7 @@ class ContentReportIT extends AbstractModerationIT {
         assertThat(missing.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
         assertThat(withoutRequestId(invisible)).isEqualTo(withoutRequestId(missing));
         assertThat(jdbcTemplate.queryForObject("SELECT COUNT(*) FROM content_reports", Integer.class)).isZero();
-        verify(emailService, never()).sendContentReportEmail(anyString(), any(), anyString(), any(), anyString(), any());
+        verify(emailService, never()).sendContentReportEmail(anyString(), any());
     }
 
     @Test
@@ -187,7 +189,7 @@ class ContentReportIT extends AbstractModerationIT {
         assertThat(byOwner.getStatusCode()).as("body: %s", byOwner.getBody()).isEqualTo(HttpStatus.BAD_REQUEST);
         assertThat(byAdmin.getStatusCode()).as("body: %s", byAdmin.getBody()).isEqualTo(HttpStatus.BAD_REQUEST);
         assertThat(countReportsOnTarget("CLIENT_REVIEW", clientReviewId)).isZero();
-        verify(emailService, never()).sendContentReportEmail(anyString(), any(), anyString(), any(), anyString(), any());
+        verify(emailService, never()).sendContentReportEmail(anyString(), any());
     }
 
     @Test
@@ -218,7 +220,7 @@ class ContentReportIT extends AbstractModerationIT {
 
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
         assertThat(countReports(clientId)).isZero();
-        verify(emailService, never()).sendContentReportEmail(anyString(), any(), anyString(), any(), anyString(), any());
+        verify(emailService, never()).sendContentReportEmail(anyString(), any());
     }
 
     @Test
@@ -272,8 +274,8 @@ class ContentReportIT extends AbstractModerationIT {
         assertThat(countReports(indepUserId)).isEqualTo(1);
         assertThat(countReports(adminId)).isEqualTo(1);
         assertThat(countReportsOnTarget("REVIEW", reviewId)).isEqualTo(4);
-        verify(emailService, times(4)).sendContentReportEmail(
-                eq(SUPPORT_EMAIL), any(), eq("REVIEW"), eq(reviewId), eq("OFFENSIVE"), any());
+        verify(emailService, times(4)).sendContentReportEmail(eq(SUPPORT_EMAIL),
+                emailFor("REVIEW", reviewId, "OFFENSIVE"));
     }
 
     @Test
@@ -319,7 +321,7 @@ class ContentReportIT extends AbstractModerationIT {
         assertThat(byAdmin.getStatusCode()).as("assigned admin — body: %s", byAdmin.getBody())
                 .isEqualTo(HttpStatus.BAD_REQUEST);
         assertThat(countReportsOnTarget("PORTFOLIO_PHOTO", photoId)).isZero();
-        verify(emailService, never()).sendContentReportEmail(anyString(), any(), anyString(), any(), anyString(), any());
+        verify(emailService, never()).sendContentReportEmail(anyString(), any());
     }
 
     @Test
@@ -520,10 +522,9 @@ class ContentReportIT extends AbstractModerationIT {
         assertThat(bystander.getStatusCode()).as("per-user bucket — body: %s", bystander.getBody())
                 .isEqualTo(HttpStatus.CREATED);
         assertThat(countReports(floodId)).isEqualTo(20);
-        verify(emailService, never()).sendContentReportEmail(
-                anyString(), any(), anyString(), eq(salonIds.get(20)), anyString(), eq(floodId));
-        verify(emailService, times(20)).sendContentReportEmail(
-                anyString(), any(), anyString(), any(), anyString(), eq(floodId));
+        verify(emailService, never()).sendContentReportEmail(anyString(), argThat(m ->
+                m.targetId().equals(salonIds.get(20)) && floodId.equals(m.reporterUserId())));
+        verify(emailService, times(20)).sendContentReportEmail(anyString(), emailFromReporter(floodId));
     }
 
     // ── QA: D7 e-mail is sent after COMMIT only ──────────────────────────────────────────────
@@ -539,12 +540,12 @@ class ContentReportIT extends AbstractModerationIT {
         doAnswer(invocation -> {
             // Read on ANOTHER thread: on this one jdbcTemplate would join the request's bound JPA connection
             // and see the uncommitted row. A fresh pooled connection sees only COMMITTED rows.
-            UUID reportId = invocation.getArgument(1);
+            UUID reportId = invocation.<ContentReportEmailModel>getArgument(1).reportId();
             committedRowsAtSend.set(CompletableFuture.supplyAsync(() -> jdbcTemplate.queryForObject(
                     "SELECT COUNT(*) FROM content_reports WHERE id = ?", Integer.class, reportId))
                     .get(30, TimeUnit.SECONDS));
             return null;
-        }).when(emailService).sendContentReportEmail(anyString(), any(), anyString(), any(), anyString(), any());
+        }).when(emailService).sendContentReportEmail(anyString(), any());
 
         ResponseEntity<String> resp = postReport(tokenFor(clientEmail), reportBody("SALON_PROFILE", salon.salonId(), "SPAM", null));
 
@@ -570,7 +571,7 @@ class ContentReportIT extends AbstractModerationIT {
 
         assertThat(createdInsideTx).as("precondition: the service did create the row").isTrue();
         assertThat(countReports(clientId)).isZero();
-        verify(emailService, never()).sendContentReportEmail(anyString(), any(), anyString(), any(), anyString(), any());
+        verify(emailService, never()).sendContentReportEmail(anyString(), any());
     }
 
     // ── phase 396: auto-hide (D2), hidden-review 404 (395 audit input 5), reporter SET NULL (input 1) ──
@@ -662,13 +663,13 @@ class ContentReportIT extends AbstractModerationIT {
         for (UUID reviewId : reviewIds) {
             reportReview(eligibleClient(salon).email(), reviewId);
         }
-        verify(emailService, never()).sendContentReportBurstEmail(anyString(), any(), anyString(), any(), anyString(), any());
+        verify(emailService, never()).sendContentReportBurstEmail(anyString(), any());
 
         reportReview(eligibleClient(salon).email(), target);
         reportReview(eligibleClient(salon).email(), target);
 
-        verify(emailService, times(2)).sendContentReportBurstEmail(
-                eq(SUPPORT_EMAIL), any(), eq("REVIEW"), eq(target), eq("OFFENSIVE"), any());
+        verify(emailService, times(2)).sendContentReportBurstEmail(eq(SUPPORT_EMAIL),
+                emailFor("REVIEW", target, "OFFENSIVE"));
         assertThat(jdbcTemplate.queryForObject(
                 "SELECT COUNT(*) FROM content_reports WHERE burst_hold AND status = 'OPEN'", Integer.class))
                 .isEqualTo(6);
@@ -779,8 +780,8 @@ class ContentReportIT extends AbstractModerationIT {
         assertThat(jdbcTemplate.queryForObject(
                 "SELECT COUNT(*) FROM content_reports WHERE target_id = ? AND burst_hold AND status = 'OPEN'",
                 Integer.class, second)).isEqualTo(3);
-        verify(emailService, times(1)).sendContentReportBurstEmail(
-                eq(SUPPORT_EMAIL), any(), eq("REVIEW"), eq(second), eq("OFFENSIVE"), any());
+        verify(emailService, times(1)).sendContentReportBurstEmail(eq(SUPPORT_EMAIL),
+                emailFor("REVIEW", second, "OFFENSIVE"));
     }
 
     @Test
@@ -805,8 +806,7 @@ class ContentReportIT extends AbstractModerationIT {
         assertThat(staffStatuses).as("staff reports are accepted, just never counted").containsOnly(201);
         assertThat(jdbcTemplate.queryForObject("SELECT COUNT(*) FROM content_reports WHERE burst_hold", Integer.class))
                 .isZero();
-        verify(emailService, never()).sendContentReportBurstEmail(anyString(), any(), anyString(), any(), anyString(),
-                any());
+        verify(emailService, never()).sendContentReportBurstEmail(anyString(), any());
         assertThat(moderationStatus(target)).isEqualTo("HIDDEN_PENDING");
     }
 

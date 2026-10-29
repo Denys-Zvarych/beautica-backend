@@ -119,6 +119,15 @@ class ModerationQueueServiceTest {
     }
 
     @Test
+    @DisplayName("phase 414: zero-width characters in queue snapshots become visible \\uXXXX too")
+    void should_escapeZeroWidth_when_snapshotBuilt() {
+        ModerationTargetSnapshot review = ModerationTargetSnapshot.review(
+                "re\u200Bmo\u200Cve\u200D \u2060x\u2064 \uFEFFend", (short) 2, ModerationStatus.VISIBLE);
+
+        assertThat(review.text()).isEqualTo("re\\u200Bmo\\u200Cve\\u200D \\u2060x\\u2064 \\uFEFFend");
+    }
+
+    @Test
     @DisplayName("snapshot text / name: bidi overrides, isolates, marks and line separators become visible \\uXXXX")
     void should_escapeBidiControls_when_snapshotBuilt() {
         String spoofed = "ok \u202Eevomer\u202C \u2066x\u2069\u200F\u2028end";

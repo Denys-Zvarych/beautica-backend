@@ -4,6 +4,7 @@ import com.beautica.AbstractIntegrationTest;
 import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.LoginRequest;
 import com.beautica.common.ApiResponse;
+import com.beautica.moderation.dto.ContentReportEmailModel;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -23,6 +24,7 @@ import java.util.Map;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.argThat;
 
 /**
  * Shared seeding + HTTP helpers for the moderation integration tests (phases 395/396, §M-3): users, salons, masters,
@@ -30,6 +32,18 @@ import static org.assertj.core.api.Assertions.assertThat;
  * calls. Stateless — every helper takes what it needs and returns ids.
  */
 abstract class AbstractModerationIT extends AbstractIntegrationTest {
+
+    /** Phase 414: matches the support-e-mail model of a report on {@code targetId} (type + reason by wire name). */
+    protected static ContentReportEmailModel emailFor(String targetType, UUID targetId, String reason) {
+        return argThat(m -> m != null && m.targetType().name().equals(targetType)
+                && m.targetId().equals(targetId) && m.reason().name().equals(reason));
+    }
+
+    /** Phase 414: matches the support-e-mail model of a report filed by {@code reporterId}. */
+    protected static ContentReportEmailModel emailFromReporter(UUID reporterId) {
+        return argThat(m -> m != null && reporterId.equals(m.reporterUserId()));
+    }
+
 
     static final String TEST_PASSWORD = "Str0ngP@ss1!";
     static final String REPORTS_URL = "/api/v1/reports";
@@ -135,6 +149,46 @@ abstract class AbstractModerationIT extends AbstractIntegrationTest {
 
     protected static String unique(String prefix) {
         return "report-" + prefix + "-" + UUID.randomUUID() + "@beautica.test";
+    }
+
+    // ── phase 414 e-mail action link helpers (shared by the action-link ITs) ──────────────────
+
+    static final String ACTION_CONFIRM_URL = "/api/v1/moderation/actions/confirm";
+    private static final java.util.regex.Pattern NONCE_FIELD =
+            java.util.regex.Pattern.compile("name=\"nonce\" value=\"([A-Za-z0-9_-]+)\"");
+
+    /** The confirm-page form POST ({@code token} / {@code nonce} omitted when {@code null}). */
+    protected ResponseEntity<String> postConfirm(String token, String nonce) {
+        org.springframework.util.MultiValueMap<String, String> form = new org.springframework.util.LinkedMultiValueMap<>();
+        if (token != null) {
+            form.add("token", token);
+        }
+        if (nonce != null) {
+            form.add("nonce", nonce);
+        }
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_FORM_URLENCODED);
+        return restTemplate.exchange(ACTION_CONFIRM_URL, HttpMethod.POST, new HttpEntity<>(form, headers), String.class);
+    }
+
+    /** The single-use nonce of a 200 confirm page. */
+    protected static String nonceOf(ResponseEntity<String> page) {
+        assertThat(page.getStatusCode()).as("confirm page: %s", page.getBody()).isEqualTo(HttpStatus.OK);
+        java.util.regex.Matcher matcher = NONCE_FIELD.matcher(page.getBody());
+        assertThat(matcher.find()).as("confirm page carries a nonce").isTrue();
+        return matcher.group(1);
+    }
+
+    protected int openReports(UUID targetId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM content_reports WHERE target_id = ? AND status = 'OPEN'", Integer.class,
+                targetId);
+    }
+
+    /** Unused, unrevoked action-link rows of a target (expiry ignored). */
+    protected int liveTokens(UUID targetId) {
+        return jdbcTemplate.queryForObject("SELECT COUNT(*) FROM moderation_action_tokens WHERE target_id = ? "
+                + "AND used_at IS NULL AND revoked_at IS NULL", Integer.class, targetId);
     }
 
     // ── queries ──────────────────────────────────────────────────────────────────

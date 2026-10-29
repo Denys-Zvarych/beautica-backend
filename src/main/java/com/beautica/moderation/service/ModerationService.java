@@ -11,6 +11,7 @@ import com.beautica.moderation.entity.ReportResolution;
 import com.beautica.moderation.entity.ReportStatus;
 import com.beautica.moderation.entity.ReportTargetType;
 import com.beautica.moderation.repository.ContentReportRepository;
+import com.beautica.moderation.repository.ModerationActionTokenRepository;
 import com.beautica.review.entity.ModerationStatus;
 import com.beautica.review.service.ReviewModerationService;
 import com.beautica.review.service.ReviewModerationService.LockedReview;
@@ -43,6 +44,9 @@ import java.util.UUID;
  * that finds no OPEN report left to close (a concurrent resolve won). RESTORE / DISMISS of a {@code REMOVED} review or
  * client review is 409 (D21: REMOVED is final); support closes such a report with REMOVE, and the retention sweep
  * treats a removed review as a gone target. The note is stored, never logged.
+ *
+ * <p>Phase 414 D11: this is the ONE resolve path (curl and the e-mail buttons alike), and every successful resolve
+ * revokes all live e-mail action links of the target in the same transaction, so no older e-mail can act again.
  */
 @Service
 @RequiredArgsConstructor
@@ -52,6 +56,7 @@ public class ModerationService {
     private static final String REPORT_ALREADY_RESOLVED = "Report already resolved";
 
     private final ContentReportRepository contentReportRepository;
+    private final ModerationActionTokenRepository actionTokenRepository;
     private final ReviewModerationService reviewModerationService;
     private final ProviderModerationLock providerLock;
     private final MediaService mediaService;
@@ -82,9 +87,24 @@ public class ModerationService {
         if (resolution == ReportResolution.REMOVED || resolution == ReportResolution.TARGET_GONE) {
             contentReportRepository.markTargetGone(type, targetId, now);
         }
+        actionTokenRepository.revokeAllForTarget(type, targetId, now);
         log.info("Moderation: {} reports on {} {} resolved as {} (action {})",
                 resolved, type, targetId, resolution, action);
         return new ResolveReportResponse(type, targetId, resolution, resolved);
+    }
+
+    /** Phase 414 D9: the oldest OPEN report on a target, the one an e-mailed action resolves. */
+    @Transactional(readOnly = true)
+    public Optional<UUID> findOldestOpenReportId(ReportTargetType type, UUID targetId) {
+        return contentReportRepository
+                .findFirstByTargetTypeAndTargetIdAndStatusOrderByCreatedAtAscIdAsc(type, targetId, ReportStatus.OPEN)
+                .map(ContentReport::getId);
+    }
+
+    /** Phase 414 D1 / D7: OPEN reports on a target (shown in the e-mail and on the confirm page). */
+    @Transactional(readOnly = true)
+    public long countOpenReports(ReportTargetType type, UUID targetId) {
+        return contentReportRepository.countByTargetTypeAndTargetIdAndStatus(type, targetId, ReportStatus.OPEN);
     }
 
     private static void requireApplicable(ReportTargetType type, ModerationAction action) {

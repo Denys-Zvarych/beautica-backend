@@ -49,6 +49,12 @@ public class SecurityConfig {
             "/api/v1/service-types/suggestions/approve",
             "/api/v1/service-types/suggestions/reject");
 
+    /**
+     * Phase 414: the moderation-action confirm form (moderation-action-confirm.html) posts here. Own CORS entry that
+     * admits ONLY the API's public origin (the page is served by this backend; the website never posts here).
+     */
+    private static final String MODERATION_ACTION_CONFIRM_PATH = "/api/v1/moderation/actions/confirm";
+
     private final JwtAuthenticationFilter jwtAuthenticationFilter;
     private final AuthRateLimitFilter authRateLimitFilter;
     private final BookingRateLimitFilter bookingRateLimitFilter;
@@ -194,6 +200,12 @@ public class SecurityConfig {
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/service-types/suggestions/review").permitAll();
                     auth.requestMatchers(HttpMethod.POST, "/api/v1/service-types/suggestions/approve").permitAll();
                     auth.requestMatchers(HttpMethod.POST, "/api/v1/service-types/suggestions/reject").permitAll();
+                    // Phase 414 D14 — one-click moderation links from the support report e-mail. The single-use
+                    // token (path segment on the GET, form field + confirm nonce on the POST) IS the credential.
+                    // GET only renders a confirm page; only the POST acts. Exact shapes only: /internal/** stays
+                    // behind X-Internal-Key.
+                    auth.requestMatchers(HttpMethod.GET, "/api/v1/moderation/actions/*").permitAll();
+                    auth.requestMatchers(HttpMethod.POST, MODERATION_ACTION_CONFIRM_PATH).permitAll();
                     // Phase 10.4 KATOTTH locality reference reads — DELIBERATE
                     // public allow-list (not incidental). These three GETs
                     // expose only non-sensitive reference data (oblast/city/
@@ -326,6 +338,11 @@ public class SecurityConfig {
         for (String path : REVIEW_POST_PATHS) {
             source.registerCorsConfiguration(path, reviewPost);
         }
+        CorsConfiguration moderationConfirm = new CorsConfiguration();
+        moderationConfirm.setAllowedOrigins(List.of(publicBaseUrlProperties.getPublicBaseUrl()));
+        moderationConfirm.setAllowedMethods(List.of("POST"));
+        moderationConfirm.setAllowCredentials(false);
+        source.registerCorsConfiguration(MODERATION_ACTION_CONFIRM_PATH, moderationConfirm);
         source.registerCorsConfiguration("/**", config);
         return source;
     }

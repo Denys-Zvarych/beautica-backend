@@ -64,6 +64,9 @@ public abstract class AbstractIntegrationTest {
         // Phase 395 (V207) / 396 (V208): content_reports.reporter_user_id FK -> users(id) ON DELETE SET NULL; no FK
         // points at it. Deleted explicitly before users so cleanup does not rely on the FK action (§O-7).
         jdbcTemplate.execute("DELETE FROM content_reports");
+        // Phase 414 (V218): moderation_action_tokens has no FK in either direction (polymorphic target, like
+        // content_reports); deleted explicitly so no live link leaks between tests (§O-7).
+        jdbcTemplate.execute("DELETE FROM moderation_action_tokens");
         // Phase 397 (V210): client_blocks FKs masters/salons/users (CASCADE) and users (SET NULL); no FK points at
         // it. Deleted explicitly before every parent so cleanup does not rely on the FK actions (§O-7).
         jdbcTemplate.execute("DELETE FROM client_blocks");

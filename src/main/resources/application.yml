@@ -550,6 +550,10 @@ app:
     # flood guard (see RateLimitConfig#inviteCapacity). Local seeding raises it via
     # scripts/start-backend.sh (APP_RATE_LIMIT_INVITE_CAPACITY); prod keeps 15.
     invite-capacity: 15
+    # Phase 414 D13 — the support e-mail's one-click moderation pages, per IP per 10 minutes: the GET confirm page
+    # and the POST decision have separate buckets. Optional overrides (APP_RATE_LIMIT_MODERATION_ACTION_*).
+    moderation-action-page-capacity: 30
+    moderation-action-decision-capacity: 10
   # Phase 373 — guest/walk-in PII retention. GuestPiiRetentionJob anonymises guest_name/surname/
   # phone, guest notes and cancel_token of client-less LINK/STAFF bookings + visit headers this many
   # calendar months after ends_at. retention-months is validated >= 12 (privacy policy promise).
@@ -574,6 +578,9 @@ app:
     # threshold hit holds that review's reports for support and sends a [BURST] e-mail instead of hiding.
     auto-hide-cap: 1
     auto-hide-cap-window: 24h
+    # Phase 414 D4 — lifetime of a one-click action link in the support report e-mail (optional override
+    # APP_MODERATION_ACTION_LINK_TTL, ISO-8601, PT1H..P30D).
+    action-link-ttl: P7D
     retention:
       # D7 ContentReportRetentionJob: gone-target sweep + purge of reports whose target is gone > 1 year.
       enabled: true

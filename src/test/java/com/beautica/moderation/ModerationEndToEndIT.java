@@ -161,8 +161,7 @@ class ModerationEndToEndIT extends AbstractModerationIT {
                 reportReview(eligibleClient(salon).email(), target);
             }
 
-            verify(emailService, never()).sendContentReportBurstEmail(anyString(), any(), anyString(), any(),
-                    anyString(), any());
+            verify(emailService, never()).sendContentReportBurstEmail(anyString(), any());
             assertThat(jdbcTemplate.queryForObject("SELECT COUNT(*) FROM content_reports WHERE burst_hold",
                     Integer.class)).isZero();
             assertThat(moderationStatus(target)).isEqualTo("HIDDEN_PENDING");
@@ -202,12 +201,11 @@ class ModerationEndToEndIT extends AbstractModerationIT {
             UUID other = insertReview(createUser(unique("author"), "CLIENT", null), salon, "Інший");
 
             reportReview(eligibleClient(salon).email(), other);
-            verify(emailService, never()).sendContentReportBurstEmail(anyString(), any(), anyString(), any(),
-                    anyString(), any());
+            verify(emailService, never()).sendContentReportBurstEmail(anyString(), any());
             reportReview(eligibleClient(salon).email(), other);
 
-            verify(emailService, times(1)).sendContentReportBurstEmail(anyString(), any(), eq("REVIEW"), eq(other),
-                    eq("OFFENSIVE"), any());
+            verify(emailService, times(1)).sendContentReportBurstEmail(anyString(),
+                    emailFor("REVIEW", other, "OFFENSIVE"));
             assertThat(moderationStatus(hidden)).isEqualTo("HIDDEN_PENDING");
             assertThat(jdbcTemplate.queryForObject("SELECT COUNT(*) FROM content_reports WHERE burst_hold",
                     Integer.class)).isEqualTo(5);

@@ -289,6 +289,23 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     private static final int REVIEW_PAGE_RETRY_AFTER_SECONDS = 3600;
     private static final String CATEGORY_REVIEW_PAGE_PATH_PREFIX = "/api/v1/service-categories/requests/review/";
     private static final String SUGGESTION_REVIEW_PAGE_PATH = "/api/v1/service-types/suggestions/review";
+    // Phase 414 D13 — the support e-mail's one-click moderation pages (ModerationActionLinkController): the GET confirm
+    // page (token as trailing path segment) and the POST decision. Own per-IP buckets (moderationActionPageBuckets /
+    // moderationActionDecisionBuckets, RateLimitConfig), never the category review buckets. The 429 is an HTML page:
+    // these routes are opened in a browser from an e-mail, so a JSON body would be the only non-HTML page they serve.
+    private static final String MODERATION_ACTION_PAGE_PATH_PREFIX = "/api/v1/moderation/actions/";
+    private static final String MODERATION_ACTION_CONFIRM_PATH = "/api/v1/moderation/actions/confirm";
+    private static final long MODERATION_ACTION_PAGE_DEFAULT_CAPACITY = 30;
+    private static final long MODERATION_ACTION_DECISION_DEFAULT_CAPACITY = 10;
+    private static final Duration MODERATION_ACTION_WINDOW = Duration.ofMinutes(10);
+    private static final int MODERATION_ACTION_RETRY_AFTER_SECONDS = 600;
+    private static final byte[] TOO_MANY_REQUESTS_HTML = ("<!DOCTYPE html><html lang=\"uk\"><head><meta charset=\"UTF-8\"/>"
+            + "<meta name=\"robots\" content=\"noindex,nofollow\"/><title>Забагато запитів</title></head>"
+            + "<body style=\"font-family:Arial,sans-serif;background:#E6DDD0;margin:0;padding:48px 16px;\">"
+            + "<div style=\"max-width:480px;margin:0 auto;background:#FDFAF7;border-radius:16px;padding:40px;"
+            + "text-align:center;\"><h1 style=\"font-size:22px;\">Забагато запитів</h1>"
+            + "<p>Зачекайте кілька хвилин і спробуйте ще раз.</p></div></body></html>")
+            .getBytes(StandardCharsets.UTF_8);
     // category-request bucket window is 60 minutes — Retry-After reflects the window.
     private static final int CATEGORY_REQUEST_RETRY_AFTER_SECONDS = 3600;
     // suggest-service-type bucket window is 60 minutes — Retry-After reflects the window.
@@ -809,6 +826,11 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // RateLimitConfig#reviewPageBuckets (app.rate-limit.review-page-capacity).
     private final LoadingCache<String, Bucket> reviewPageBuckets;
 
+    // Phase 414 D13 — moderation-action page / decision buckets. Injected from RateLimitConfig on the Spring
+    // constructor; the public (test) constructor builds them at the production defaults.
+    private final LoadingCache<String, Bucket> moderationActionPageBuckets;
+    private final LoadingCache<String, Bucket> moderationActionDecisionBuckets;
+
     // Configured website-Worker secret for the info reads, or null when the feature is off (blank config).
     // A secret: never logged.
     private final String bookingInfoWorkerKey;
@@ -869,6 +891,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                 inviteBuckets,
                 reviewDecisionBuckets,
                 reviewPageBuckets,
+                moderationActionBuckets(MODERATION_ACTION_PAGE_DEFAULT_CAPACITY),
+                moderationActionBuckets(MODERATION_ACTION_DECISION_DEFAULT_CAPACITY),
                 new BookingInfoWorkerProperties());
     }
 
@@ -900,6 +924,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             @Qualifier("inviteBuckets") LoadingCache<String, Bucket> inviteBuckets,
             @Qualifier("reviewDecisionBuckets") LoadingCache<String, Bucket> reviewDecisionBuckets,
             @Qualifier("reviewPageBuckets") LoadingCache<String, Bucket> reviewPageBuckets,
+            @Qualifier("moderationActionPageBuckets") LoadingCache<String, Bucket> moderationActionPageBuckets,
+            @Qualifier("moderationActionDecisionBuckets") LoadingCache<String, Bucket> moderationActionDecisionBuckets,
             BookingInfoWorkerProperties bookingInfoWorker) {
         this.registerBuckets = registerBuckets;
         this.loginBuckets = loginBuckets;
@@ -926,6 +952,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         this.inviteBuckets = inviteBuckets;
         this.reviewDecisionBuckets = reviewDecisionBuckets;
         this.reviewPageBuckets = reviewPageBuckets;
+        this.moderationActionPageBuckets = moderationActionPageBuckets;
+        this.moderationActionDecisionBuckets = moderationActionDecisionBuckets;
         this.bookingInfoWorkerKey = bookingInfoWorker.isEnabled() ? bookingInfoWorker.getWorkerKey() : null;
         this.otpVerifyBuckets = Caffeine.newBuilder()
                 .maximumSize(100_000)
@@ -1016,6 +1044,19 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                 .expireAfterAccess(ROTATE_STAFF_WINDOW.plusMinutes(5))
                 .build(key -> Bucket.builder()
                         .addLimit(rotateStaffBandwidth())
+                        .build());
+    }
+
+    /** Default-capacity moderation-action bucket cache for the public (test) constructor; same shape as RateLimitConfig. */
+    private static LoadingCache<String, Bucket> moderationActionBuckets(long capacity) {
+        return Caffeine.newBuilder()
+                .maximumSize(100_000)
+                .expireAfterAccess(MODERATION_ACTION_WINDOW.plusMinutes(5))
+                .build(key -> Bucket.builder()
+                        .addLimit(BandwidthBuilder.builder()
+                                .capacity(capacity)
+                                .refillIntervally(capacity, MODERATION_ACTION_WINDOW)
+                                .build())
                         .build());
     }
 
@@ -1601,6 +1642,19 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             return;
         }
 
+        // Phase 414 D13 — moderation-action pages: the POST decision first (its exact path also starts with the page
+        // prefix), then any other GET/HEAD under the prefix (the token page). Both answer 429 as an HTML page.
+        if (path.startsWith(MODERATION_ACTION_PAGE_PATH_PREFIX)) {
+            if (HttpMethod.POST.matches(method) && MODERATION_ACTION_CONFIRM_PATH.equals(path)) {
+                applyHtmlRateLimit(request, response, filterChain, moderationActionDecisionBuckets);
+                return;
+            }
+            if (isGetOrHead(method)) {
+                applyHtmlRateLimit(request, response, filterChain, moderationActionPageBuckets);
+                return;
+            }
+        }
+
         // Admin review-page rate-limit: GET /api/v1/service-categories/requests/review/{token} and
         // GET /api/v1/service-types/suggestions/review — both permitAll, token-in-URL, and both hit the
         // DB on a garbage token (loadForReview). Matched on the normalised path (encoded variants
@@ -1926,6 +1980,31 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         } else {
             writeTooManyRequests(response, computeRetryAfterSeconds(probe, retryAfterSeconds));
         }
+    }
+
+    /** Per-IP limit whose 429 is the HTML page (phase 414 moderation-action routes). */
+    private void applyHtmlRateLimit(HttpServletRequest request,
+                                    HttpServletResponse response,
+                                    FilterChain filterChain,
+                                    LoadingCache<String, Bucket> cache) throws ServletException, IOException {
+        ConsumptionProbe probe = cache.get(resolveBucketKey(request)).tryConsumeAndReturnRemaining(1L);
+        if (probe.isConsumed()) {
+            filterChain.doFilter(request, response);
+            return;
+        }
+        response.setStatus(429);
+        response.setContentType("text/html;charset=UTF-8");
+        response.setHeader("X-Content-Type-Options", "nosniff");
+        response.setHeader("Cache-Control", "no-store");
+        response.setHeader("X-Robots-Tag", "noindex, nofollow");
+        // The 429 page has no form, so no-referrer cannot break a same-origin POST here (unlike the confirm page).
+        response.setHeader("Referrer-Policy", "no-referrer");
+        response.setHeader("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; "
+                + "frame-ancestors 'none'; base-uri 'none'");
+        response.setHeader("Retry-After",
+                String.valueOf(computeRetryAfterSeconds(probe, MODERATION_ACTION_RETRY_AFTER_SECONDS)));
+        response.setContentLength(TOO_MANY_REQUESTS_HTML.length);
+        response.getOutputStream().write(TOO_MANY_REQUESTS_HTML);
     }
 
     static int computeRetryAfterSeconds(ConsumptionProbe probe, int fallbackSeconds) {

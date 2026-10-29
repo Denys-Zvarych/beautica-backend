@@ -49,9 +49,13 @@ import org.springframework.security.task.DelegatingSecurityContextTaskExecutor;
  * supportEmailTaskPool         35 s  Help/Contact mails. NOT outbox-backed -> cut = lost (user can resend).
  *                                    &ge; one in-flight Brevo API send WITH attachments (connect 3 s + the
  *                                    30 s send-with-attachments read budget, Phase 374) + margin.
- * reportEmailTaskPool           5 s  phase-395 "content reported" nudges, ids only, no attachments. NOT
- *                                    outbox-backed -> cut = lost nudge; the content_reports row is the
- *                                    authoritative worklist, so nothing is lost from moderation.
+ * reportEmailTaskPool           5 s  phase-395/414 "content reported" support e-mail. Since the phase-414
+ *                                    audit-fix ONE task = 2 short DB transactions (content load, action-link
+ *                                    mint) + one SMTP / Brevo send of up to ~25 s, so the 5 s grace can cut a
+ *                                    task mid-send. Accepted: NOT outbox-backed -> cut = lost nudge; the
+ *                                    content_reports row is the authoritative worklist, and tokens minted for
+ *                                    an e-mail that never left are unreachable (only their hashes exist) and
+ *                                    expire (7 d) and are purged by the retention job (expiry + 30 d).
  * smsSendExecutor              20 s  request-path booking SMS (walk-in / guest confirmation + guest
  *                                    cancellation) AND, since phase 390, guest provider-cancellation SMS
  *                                    handed off by the outbox drain, whose row is ALREADY SENT. NOT
@@ -253,10 +257,27 @@ public class AsyncConfig implements AsyncConfigurer {
     // Help/Contact-us mail. Single thread, bounded queue, AbortPolicy: on saturation the listener logs
     // one WARN and drops the nudge — the content_reports row is the authoritative worklist. Same
     // SecurityContext + classloader propagation rationale as emailExecutor.
+    //
+    // Phase 414 audit-fix: the whole support e-mail (content load + action-link minting + send) runs on this pool
+    // (ContentReportEmailDispatcher), not on the request thread. {@code @Profile("!test")}: the test profile registers
+    // a synchronous stand-in under the SAME bean name ({@link #syncReportEmailExecutor()}).
     @Bean(name = "reportEmailExecutor")
+    @Profile("!test")
     public TaskExecutor reportEmailExecutor(
             @Qualifier("reportEmailTaskPool") ThreadPoolTaskExecutor reportEmailTaskPool) {
         return new DelegatingSecurityContextTaskExecutor(reportEmailTaskPool);
+    }
+
+    /**
+     * Test-profile counterpart of {@link #reportEmailExecutor(ThreadPoolTaskExecutor)} — inline execution, so an
+     * integration test observes the support report e-mail (and its minted links) the moment {@code POST /reports}
+     * returns (Anti-Bug §M: no sleeps, no races). Same bean name, mutually exclusive profile. The bounded production
+     * pool and its AbortPolicy are pinned directly by {@code ContentReportEmailTest} via {@link #reportEmailTaskPool()}.
+     */
+    @Bean(name = "reportEmailExecutor")
+    @Profile("test")
+    public TaskExecutor syncReportEmailExecutor() {
+        return new SyncTaskExecutor();
     }
 
     /**
