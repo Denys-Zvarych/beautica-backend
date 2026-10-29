@@ -1,3 +1,5 @@
+-- non-destructive
+-- Reason: new table created in this file; its CHECKs and unique indexes constrain only rows written by this release.
 -- Phase 414 — one-click moderation actions from the support report e-mail.
 -- One row per e-mailed button: a 7-day, single-use capability for (target, action). Only the lower-hex SHA-256 of the
 -- raw token is stored (the raw token lives in the e-mail body only), same scheme as platform_categories.token_hash.
