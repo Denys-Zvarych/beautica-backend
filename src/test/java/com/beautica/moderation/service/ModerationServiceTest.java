@@ -12,6 +12,7 @@ import com.beautica.moderation.entity.ReportStatus;
 import com.beautica.moderation.entity.ReportTargetType;
 import com.beautica.moderation.repository.ContentReportRepository;
 import com.beautica.moderation.repository.ModerationActionTokenRepository;
+import com.beautica.moderation.service.ModerationAuthorResolver.Parties;
 import com.beautica.notification.inapp.service.InAppNotificationService;
 import com.beautica.review.entity.ModerationStatus;
 import com.beautica.review.service.ReviewModerationService;
@@ -82,6 +83,8 @@ class ModerationServiceTest {
     void setUp() {
         service = new ModerationService(repository, actionTokenRepository, reviewModerationService, providerLock,
                 mediaService, authorResolver, inAppNotificationService, Clock.fixed(NOW, ZoneOffset.UTC));
+        // The real resolver never returns null; a REMOVE with no stub resolves to "no author, no subject".
+        org.mockito.Mockito.lenient().when(authorResolver.resolve(any(), any())).thenReturn(Parties.none());
     }
 
     @Test
@@ -328,7 +331,8 @@ class ModerationServiceTest {
     void should_notifyReportersAndAuthor_when_removeOnPhoto() {
         stubReport(ReportTargetType.PORTFOLIO_PHOTO, ReportStatus.OPEN);
         Set<UUID> author = Set.of(UUID.randomUUID(), UUID.randomUUID());
-        when(authorResolver.resolve(ReportTargetType.PORTFOLIO_PHOTO, TARGET_ID)).thenReturn(new java.util.LinkedHashSet<>(author));
+        when(authorResolver.resolve(ReportTargetType.PORTFOLIO_PHOTO, TARGET_ID))
+                .thenReturn(new Parties(new java.util.LinkedHashSet<>(author), new java.util.LinkedHashSet<>()));
         when(mediaService.deletePortfolioPhotoForModeration(TARGET_ID)).thenReturn(true);
         stubResolved(2);
         UUID reporterA = UUID.randomUUID();
@@ -343,7 +347,7 @@ class ModerationServiceTest {
         order.verify(mediaService).deletePortfolioPhotoForModeration(TARGET_ID);
         order.verify(inAppNotificationService).notifyModerationOutcome(new ModerationOutcome(
                 ReportTargetType.PORTFOLIO_PHOTO, ReportResolution.REMOVED, REPORT_ID,
-                Set.of(reporterA, reporterB), author));
+                Set.of(reporterA, reporterB), author, Set.of()));
     }
 
     @ParameterizedTest(name = "{0}")
@@ -363,17 +367,18 @@ class ModerationServiceTest {
 
         verifyNoInteractions(authorResolver);
         verify(inAppNotificationService).notifyModerationOutcome(new ModerationOutcome(
-                ReportTargetType.REVIEW, expected, REPORT_ID, Set.of(reporter), Set.of()));
+                ReportTargetType.REVIEW, expected, REPORT_ID, Set.of(reporter), Set.of(), Set.of()));
     }
 
     @Test
-    @DisplayName("audit-fix PERF 2/4: on a review REMOVE the author ids are read BEFORE the review row lock and the "
+    @DisplayName("audit-fix PERF 2/4: on a review REMOVE the author + subject ids are read BEFORE the review row lock and the "
             + "provider lock, and handed to the feed unchanged")
     void should_resolveAuthorIdsBeforeLocks_when_removeOnReview() {
         stubReport(ReportTargetType.REVIEW, ReportStatus.OPEN);
         UUID author = UUID.randomUUID();
-        when(authorResolver.resolve(ReportTargetType.REVIEW, TARGET_ID))
-                .thenReturn(new java.util.LinkedHashSet<>(Set.of(author)));
+        UUID subject = UUID.randomUUID();
+        when(authorResolver.resolve(ReportTargetType.REVIEW, TARGET_ID)).thenReturn(new Parties(
+                new java.util.LinkedHashSet<>(Set.of(author)), new java.util.LinkedHashSet<>(Set.of(subject))));
         LockedReview locked = stubLockedReview();
         stubResolved(1);
 
@@ -384,7 +389,8 @@ class ModerationServiceTest {
         order.verify(reviewModerationService).lockReview(TARGET_ID);
         order.verify(providerLock).lock(locked);
         order.verify(inAppNotificationService).notifyModerationOutcome(new ModerationOutcome(
-                ReportTargetType.REVIEW, ReportResolution.REMOVED, REPORT_ID, Set.of(), Set.of(author)));
+                ReportTargetType.REVIEW, ReportResolution.REMOVED, REPORT_ID, Set.of(), Set.of(author),
+                Set.of(subject)));
     }
 
     @Test

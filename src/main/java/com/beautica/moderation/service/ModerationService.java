@@ -85,7 +85,7 @@ public class ModerationService {
         requireApplicable(type, action);
         // Lock-free reads first (audit-fix cycle 1, PERF 4): the author ids are scalars, read before applyToTarget
         // takes the review row lock / provider lock.
-        Set<UUID> authorIds = authorIdsOf(type, targetId, action);
+        ModerationAuthorResolver.Parties parties = partiesOf(type, targetId, action);
 
         boolean targetExists = applyToTarget(type, targetId, action);
         ReportResolution resolution = targetExists ? resolutionOf(type, action) : ReportResolution.TARGET_GONE;
@@ -101,7 +101,7 @@ public class ModerationService {
             contentReportRepository.markTargetGone(type, targetId, now);
         }
         actionTokenRepository.revokeAllForTarget(type, targetId, now);
-        notifyOutcome(type, targetId, resolution, reportId, authorIds, now);
+        notifyOutcome(type, targetId, resolution, reportId, parties, now);
         log.info("Moderation: {} reports on {} {} resolved as {} (action {})",
                 resolved, type, targetId.toString().substring(0, TARGET_ID_LOG_PREFIX), resolution, action);
         return new ResolveReportResponse(type, targetId, resolution, resolved);
@@ -122,17 +122,20 @@ public class ModerationService {
     }
 
     /** Phase 415: the author is looked up only when there will be removed content to tell them about. */
-    private Set<UUID> authorIdsOf(ReportTargetType type, UUID targetId, ModerationAction action) {
-        return action == ModerationAction.REMOVE ? authorResolver.resolve(type, targetId) : Set.of();
+    private ModerationAuthorResolver.Parties partiesOf(ReportTargetType type, UUID targetId, ModerationAction action) {
+        return action == ModerationAction.REMOVE
+                ? authorResolver.resolve(type, targetId)
+                : ModerationAuthorResolver.Parties.none();
     }
 
     /** Phase 415 D8: feed rows for the reporters (and the author) in this transaction — curl and e-mail alike. */
     private void notifyOutcome(ReportTargetType type, UUID targetId, ReportResolution resolution, UUID reportId,
-                               Set<UUID> authorIds, Instant resolvedAt) {
+                               ModerationAuthorResolver.Parties parties, Instant resolvedAt) {
         Set<UUID> reporterIds = new LinkedHashSet<>(
                 contentReportRepository.findReporterIdsResolvedAt(type, targetId, resolvedAt));
         inAppNotificationService.notifyModerationOutcome(
-                new ModerationOutcome(type, resolution, reportId, reporterIds, authorIds));
+                new ModerationOutcome(type, resolution, reportId, reporterIds, parties.authorIds(),
+                        parties.subjectIds()));
     }
 
     private static void requireApplicable(ReportTargetType type, ModerationAction action) {

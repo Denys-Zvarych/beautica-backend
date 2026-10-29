@@ -61,7 +61,8 @@ class ModerationOutcomeFeedEndToEndIT extends AbstractModerationIT {
 
         @Test
         @DisplayName("independent master + a client report the review via API, curl REMOVE → both reporters see "
-                + "REPORT_CONTENT_REMOVED(REVIEW), the client author sees CONTENT_REMOVED(REVIEW) in GET /notifications")
+                + "REPORT_CONTENT_REMOVED(REVIEW), the client author sees CONTENT_REMOVED(REVIEW) in GET /notifications; "
+                + "the master (reviewed subject AND reporter) gets BOTH their reporter item and the subject item")
         void should_showOutcomeInEveryRecipientsFeed_when_reviewRemovedViaCurl() throws Exception {
             String masterEmail = unique("indep");
             IndependentMaster master = createIndependentMaster(masterEmail);
@@ -77,19 +78,24 @@ class ModerationOutcomeFeedEndToEndIT extends AbstractModerationIT {
 
             assertThat(resolve(firstReport, "REMOVE").getStatusCode()).isEqualTo(HttpStatus.OK);
 
-            assertSingleOutcome(masterReporter, "REPORT_CONTENT_REMOVED", "REVIEW", reviewId);
+            assertThat(moderationItems(masterReporter)).extracting(n -> n.path("type").asText())
+                    .as("audit-fix SEC 3: reporter + subject rows").containsExactlyInAnyOrder(
+                            "REPORT_CONTENT_REMOVED", "REVIEW_ABOUT_YOU_REMOVED");
             assertSingleOutcome(clientReporter, "REPORT_CONTENT_REMOVED", "REVIEW", reviewId);
             assertSingleOutcome(author, "CONTENT_REMOVED", "REVIEW", reviewId);
-            assertThat(unread(masterReporter)).as("master reporter unread").isEqualTo(masterUnread + 1);
+            assertThat(unread(masterReporter)).as("master reporter unread").isEqualTo(masterUnread + 2);
             assertThat(unread(clientReporter)).as("client reporter unread").isEqualTo(clientUnread + 1);
             assertThat(unread(author)).as("author unread").isEqualTo(authorUnread + 1);
         }
 
         @Test
-        @DisplayName("salon review reported by a client, e-mail REMOVE → reporter + author see their item; the "
-                + "salon owner and salon master (reviewed, not reporters) see nothing")
-        void should_notifyReporterAndAuthorOnly_when_salonReviewRemovedViaEmail() throws Exception {
+        @DisplayName("salon review reported by a client, e-mail REMOVE → reporter + author see their item; owner + "
+                + "admin see REVIEW_ABOUT_YOU_REMOVED(REVIEW); the salon master whose booking it was sees nothing")
+        void should_notifySalonSubjectNotMaster_when_salonReviewRemovedViaEmail() throws Exception {
             SalonFixture salon = createSalon();
+            String adminEmail = unique("admin");
+            createUser(adminEmail, "SALON_ADMIN", salon.salonId());
+            Actor admin = actor(adminEmail);
             Actor author = client("author");
             UUID reviewId = insertReview(author.id(), salon, REVIEW_TEXT);
             Actor reporter = client("reporter");
@@ -101,8 +107,28 @@ class ModerationOutcomeFeedEndToEndIT extends AbstractModerationIT {
 
             assertSingleOutcome(reporter, "REPORT_CONTENT_REMOVED", "REVIEW", reviewId);
             assertSingleOutcome(author, "CONTENT_REMOVED", "REVIEW", reviewId);
-            assertThat(moderationItems(owner)).as("salon owner feed").isEmpty();
-            assertThat(moderationItems(salonMaster)).as("salon master feed").isEmpty();
+            assertSingleOutcome(owner, "REVIEW_ABOUT_YOU_REMOVED", "REVIEW", reviewId);
+            assertSingleOutcome(admin, "REVIEW_ABOUT_YOU_REMOVED", "REVIEW", reviewId);
+            assertThat(moderationItems(salonMaster)).as("salon rule: never the salon master").isEmpty();
+        }
+
+        @Test
+        @DisplayName("independent master's review reported by a client, curl REMOVE → the reviewed master sees "
+                + "REVIEW_ABOUT_YOU_REMOVED(REVIEW) with no review text, reporter or ids")
+        void should_showSubjectItem_when_independentReviewRemoved() throws Exception {
+            String masterEmail = unique("indep");
+            IndependentMaster master = createIndependentMaster(masterEmail);
+            Actor masterActor = new Actor(master.userId(), tokenFor(masterEmail));
+            Actor author = client("author");
+            UUID reviewId = insertIndependentReviewWithText(author.id(), master.masterId());
+            Actor reporter = client("reporter");
+            int masterUnread = unread(masterActor);
+            UUID reportId = fileReport(reporter, "REVIEW", reviewId);
+
+            assertThat(resolve(reportId, "REMOVE").getStatusCode()).isEqualTo(HttpStatus.OK);
+
+            assertSingleOutcome(masterActor, "REVIEW_ABOUT_YOU_REMOVED", "REVIEW", reviewId, reporter.id(), author.id());
+            assertThat(unread(masterActor)).as("subject unread").isEqualTo(masterUnread + 1);
         }
     }
 
@@ -160,7 +186,8 @@ class ModerationOutcomeFeedEndToEndIT extends AbstractModerationIT {
 
     @Test
     @DisplayName("salon client review reported via API by another provider who served the client, curl REMOVE → "
-            + "owner sees CONTENT_REMOVED(CLIENT_REVIEW); the salon master whose name it carries sees nothing")
+            + "owner sees CONTENT_REMOVED(CLIENT_REVIEW), the reviewed client REVIEW_ABOUT_YOU_REMOVED(CLIENT_REVIEW); "
+            + "the salon master whose name it carries sees nothing")
     void should_neverNotifySalonMaster_when_salonClientReviewRemoved() throws Exception {
         SalonFixture salon = createSalon();
         Actor owner = actor(salon.ownerEmail());
@@ -178,7 +205,8 @@ class ModerationOutcomeFeedEndToEndIT extends AbstractModerationIT {
         assertSingleOutcome(reporter, "REPORT_CONTENT_REMOVED", "CLIENT_REVIEW", clientReviewId, salon.salonId());
         assertSingleOutcome(owner, "CONTENT_REMOVED", "CLIENT_REVIEW", clientReviewId, salon.salonId());
         assertThat(moderationItems(salonMaster)).as("salon master feed").isEmpty();
-        assertThat(moderationItems(subject)).as("the reviewed client is not the author").isEmpty();
+        assertSingleOutcome(subject, "REVIEW_ABOUT_YOU_REMOVED", "CLIENT_REVIEW", clientReviewId, salon.salonId(),
+                reporter.id());
     }
 
     // ── independent master photo ─────────────────────────────────────────────────────────────
@@ -200,6 +228,25 @@ class ModerationOutcomeFeedEndToEndIT extends AbstractModerationIT {
         assertSingleOutcome(reporter, "REPORT_CONTENT_REMOVED", "PORTFOLIO_PHOTO", photoId, master.masterId());
         assertSingleOutcome(masterActor, "CONTENT_REMOVED", "PORTFOLIO_PHOTO", photoId, master.masterId());
         assertThat(unread(masterActor)).as("master unread").isEqualTo(masterUnread + 1);
+    }
+
+    // ── salon master's personal photo (salon rule) ──────────────────────────────────────────
+
+    @Test
+    @DisplayName("client reports a salon master's personal portfolio photo, curl REMOVE → owner sees "
+            + "CONTENT_REMOVED(PORTFOLIO_PHOTO); the salon master sees nothing (salon rule)")
+    void should_notifySalon_when_salonMasterPhotoRemoved() throws Exception {
+        SalonFixture salon = createSalon();
+        Actor owner = actor(salon.ownerEmail());
+        Actor salonMaster = actor(salon.masterEmail());
+        UUID photoId = insertMasterPortfolioPhoto(salon.masterId());
+        Actor reporter = client("reporter");
+        UUID reportId = fileReport(reporter, "PORTFOLIO_PHOTO", photoId);
+
+        assertThat(resolve(reportId, "REMOVE").getStatusCode()).isEqualTo(HttpStatus.OK);
+
+        assertSingleOutcome(owner, "CONTENT_REMOVED", "PORTFOLIO_PHOTO", photoId, salon.masterId());
+        assertThat(moderationItems(salonMaster)).as("salon rule: never the salon master").isEmpty();
     }
 
     // ── D11 telemetry ────────────────────────────────────────────────────────────────────────
@@ -294,7 +341,7 @@ class ModerationOutcomeFeedEndToEndIT extends AbstractModerationIT {
         List<JsonNode> items = new ArrayList<>();
         for (JsonNode item : objectMapper.readTree(feed.getBody()).path("data")) {
             String type = item.path("type").asText();
-            if (type.startsWith("REPORT_") || type.equals("CONTENT_REMOVED")) {
+            if (type.startsWith("REPORT_") || type.equals("CONTENT_REMOVED") || type.equals("REVIEW_ABOUT_YOU_REMOVED")) {
                 items.add(item);
             }
         }

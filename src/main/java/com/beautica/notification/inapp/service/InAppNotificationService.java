@@ -389,41 +389,60 @@ public class InAppNotificationService {
     /**
      * Phase 415 D6 / D8 — the feed rows for one {@code ModerationService#resolve} call, in its transaction (a rolled
      * back resolve writes nothing). Reporters get the outcome type; the author of removed content gets
-     * {@code CONTENT_REMOVED}, unless they are also a reporter (no double row). The author ids (a salon's owner + active
-     * admins for salon content) arrive pre-resolved as scalars, so nothing is loaded here while the caller's
-     * moderation locks are held. Guests have no account and so never appear here. One statement per recipient group.
+     * {@code CONTENT_REMOVED} — ALSO when they reported it (audit-fix cycle 2: a salon team's reporting admin must not
+     * be the only author without the row); the subject of a removed review gets
+     * {@code REVIEW_ABOUT_YOU_REMOVED} — ALSO when they reported it (audit-fix SEC 3: dropping it for reporters would
+     * let a salon team spot the reporter by comparing feeds) — unless they are the author (author wins). Author and
+     * subject ids arrive pre-resolved as scalars, so nothing is loaded here while the caller's locks are held. All
+     * groups go out in ONE statement (audit-fix PERF 5).
      */
     @Transactional(propagation = Propagation.MANDATORY)
     public void notifyModerationOutcome(ModerationOutcome outcome) {
         InAppNotificationType reporterType =
                 ModerationOutcomeTypes.reporterType(outcome.targetType(), outcome.resolution());
         Set<UUID> reporters = outcome.reporterIds();
-        writeModerationOutcome(reporterType, reporters, outcome);
 
-        Set<UUID> authors = Set.of();
+        Set<UUID> authors = new LinkedHashSet<>();
         if (ModerationOutcomeTypes.notifiesAuthor(outcome.targetType(), outcome.resolution())) {
-            authors = new LinkedHashSet<>(outcome.authorIds());
-            authors.removeAll(reporters);
-            writeModerationOutcome(InAppNotificationType.CONTENT_REMOVED, authors, outcome);
+            authors.addAll(outcome.authorIds());
+        }
+        Set<UUID> subjects = new LinkedHashSet<>();
+        if (ModerationOutcomeTypes.notifiesSubject(outcome.targetType(), outcome.resolution())) {
+            subjects.addAll(outcome.subjectIds());
+            subjects.removeAll(outcome.authorIds());
+        }
+
+        List<UUID> recipientIds = new ArrayList<>();
+        List<String> types = new ArrayList<>();
+        addRows(recipientIds, types, reporters, reporterType);
+        addRows(recipientIds, types, authors, InAppNotificationType.CONTENT_REMOVED);
+        addRows(recipientIds, types, subjects, InAppNotificationType.REVIEW_ABOUT_YOU_REMOVED);
+        if (!recipientIds.isEmpty()) {
+            writeModerationOutcomes(recipientIds, types, outcome);
         }
         // D11: types and counts only — never a user id, comment or content.
-        log.info("in-app moderation outcome targetType={} resolution={} reporterType={} reporters={} authors={}",
-                outcome.targetType(), outcome.resolution(), reporterType, reporters.size(), authors.size());
+        log.info("in-app moderation outcome targetType={} resolution={} reporterType={} reporters={} authors={} "
+                        + "subjects={}", outcome.targetType(), outcome.resolution(), reporterType, reporters.size(),
+                authors.size(), subjects.size());
     }
 
-    private void writeModerationOutcome(
-            InAppNotificationType type, Set<UUID> recipients, ModerationOutcome outcome) {
-        if (recipients.isEmpty()) {
-            return;
+    private static void addRows(List<UUID> recipientIds, List<String> types, Set<UUID> group,
+                                InAppNotificationType type) {
+        for (UUID id : group) {
+            recipientIds.add(id);
+            types.add(type.name());
         }
+    }
+
+    private void writeModerationOutcomes(List<UUID> recipientIds, List<String> types, ModerationOutcome outcome) {
+        UUID[] ids = recipientIds.toArray(UUID[]::new);
+        String[] typeNames = types.toArray(String[]::new);
         String targetType = outcome.targetType().name();
-        String dedupKey = dedupKey(type, outcome.batchReportId());
-        UUID[] recipientIds = recipients.toArray(UUID[]::new);
         if (pushEnabled) {
-            repository.insertModerationOutcomeWithPush(type.name(), recipientIds, targetType, dedupKey);
+            repository.insertModerationOutcomesWithPush(ids, typeNames, targetType, outcome.batchReportId());
             return;
         }
-        repository.insertModerationOutcome(type.name(), recipientIds, targetType, dedupKey);
+        repository.insertModerationOutcomes(ids, typeNames, targetType, outcome.batchReportId());
     }
 
     private void writeRequestDecision(

@@ -15,6 +15,7 @@ import com.beautica.notification.inapp.entity.InAppNotificationType;
  *       <td>REPORT_REVIEWED</td></tr>
  *   <tr><td>profile</td><td>(n/a)</td><td>REPORT_NO_VIOLATION (DISMISSED)</td><td>REPORT_REVIEWED</td></tr>
  * </table>
+ * The subject of a removed review / client review gets {@code REVIEW_ABOUT_YOU_REMOVED}.
  * The author gets {@code CONTENT_REMOVED} only for {@code REMOVED} content; never on DISMISS / RESTORE (D4), a gone
  * target (D5) or a profile.
  */
@@ -35,6 +36,15 @@ final class ModerationOutcomeTypes {
 
     static boolean notifiesAuthor(ReportTargetType targetType, ReportResolution resolution) {
         return resolution == ReportResolution.REMOVED && isContent(targetType);
+    }
+
+    /**
+     * Phase 415 follow-up — the subject of a removed review / client review (the reviewed provider or client) gets
+     * {@code REVIEW_ABOUT_YOU_REMOVED}; never for a photo, a profile, or any non-REMOVED resolution.
+     */
+    static boolean notifiesSubject(ReportTargetType targetType, ReportResolution resolution) {
+        return resolution == ReportResolution.REMOVED
+                && (targetType == ReportTargetType.REVIEW || targetType == ReportTargetType.CLIENT_REVIEW);
     }
 
     static boolean isContent(ReportTargetType targetType) {

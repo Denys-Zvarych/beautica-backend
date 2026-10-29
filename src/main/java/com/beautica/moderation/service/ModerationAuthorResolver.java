@@ -13,19 +13,25 @@ import java.util.Set;
 import java.util.UUID;
 
 /**
- * Phase 415 D6 — the accounts told that a review, client review or photo was removed. {@link ModerationService} calls
- * this BEFORE the action and before any lock (a removed photo's row is deleted), and every read is a scalar query
- * that loads no entity: the review row lock and the provider lock taken next see no stale managed instance, and no
- * entity graph is hydrated while they are held (audit-fix cycle 1, PERF 2 / 4).
+ * Phase 415 D6 — the accounts told that a review, client review or photo was removed: its AUTHOR, and (follow-up) the
+ * SUBJECT of a removed review. {@link ModerationService} calls this BEFORE the action and before any lock (a removed
+ * photo's row is deleted), and every read is a scalar query that loads no entity.
  *
- * <ul>
- *   <li>{@code REVIEW} — the client who wrote it; a guest review has no account, so nobody.</li>
- *   <li>{@code CLIENT_REVIEW} — an independent master's review: that master. A salon review is the salon's (only the
- *       owner and admins write it, stored under the performing master's name), so the owner + active admins.</li>
- *   <li>{@code PORTFOLIO_PHOTO} — a salon photo belongs to the salon, never to the uploader: owner + active admins; a
- *       master photo: that master.</li>
- *   <li>Profiles — nobody (no content is removed).</li>
- * </ul>
+ * <p><b>Salon rule (user, locked):</b> for anything salon-related ONLY the salon — its owner + active admins — is
+ * notified, never a salon master. For a review / client review the salon is the row's own {@code salon_id} only (NULL
+ * = the master's independent period, V41, so the master answers even after joining a salon); a salon master's
+ * personal portfolio photo goes to their current salon. A closed salon notifies nobody.
+ *
+ * <table>
+ *   <caption>Author / subject per target</caption>
+ *   <tr><th>Target</th><th>Author</th><th>Subject</th></tr>
+ *   <tr><td>REVIEW</td><td>the client who wrote it (guest: nobody)</td>
+ *       <td>independent master, or the salon</td></tr>
+ *   <tr><td>CLIENT_REVIEW</td><td>independent master, or the salon</td><td>the reviewed client</td></tr>
+ *   <tr><td>PORTFOLIO_PHOTO</td><td>independent master, or the salon (salon or salon-master photo)</td>
+ *       <td>nobody</td></tr>
+ *   <tr><td>profiles</td><td>nobody</td><td>nobody</td></tr>
+ * </table>
  * Repository access is direct, as in {@link ReportTargetVisibilityResolver}.
  */
 @Component
@@ -37,32 +43,45 @@ public class ModerationAuthorResolver {
     private final MediaRepository mediaRepository;
     private final SalonRepository salonRepository;
 
-    /** @return a mutable set of author account ids; empty when nobody answers for the target */
-    public Set<UUID> resolve(ReportTargetType type, UUID targetId) {
+    /** The parties of removed content, as mutable id sets (empty when nobody applies). */
+    public record Parties(Set<UUID> authorIds, Set<UUID> subjectIds) {
+
+        public static Parties none() {
+            return new Parties(new LinkedHashSet<>(), new LinkedHashSet<>());
+        }
+    }
+
+    public Parties resolve(ReportTargetType type, UUID targetId) {
         return switch (type) {
-            case REVIEW -> reviewRepository.findClientIdById(targetId)
-                    .map(this::single)
-                    .orElseGet(LinkedHashSet::new);
+            case REVIEW -> reviewRepository.findModerationPartiesById(targetId)
+                    .map(ref -> new Parties(single(ref.getClientId()),
+                            salonOrMaster(ref.getSalonId(), ref.getMasterUserId())))
+                    .orElseGet(Parties::none);
             case CLIENT_REVIEW -> clientReviewRepository.findAuthorRefById(targetId)
-                    .map(ref -> salonOrMaster(ref.getSalonId(), ref.getMasterUserId()))
-                    .orElseGet(LinkedHashSet::new);
+                    .map(ref -> new Parties(salonOrMaster(ref.getSalonId(), ref.getMasterUserId()),
+                            single(ref.getSubjectClientId())))
+                    .orElseGet(Parties::none);
             case PORTFOLIO_PHOTO -> mediaRepository.findPortfolioOwnerRefById(targetId)
-                    .map(ref -> salonOrMaster(ref.getSalonId(), ref.getMasterUserId()))
-                    .orElseGet(LinkedHashSet::new);
-            case MASTER_PROFILE, SALON_PROFILE, CLIENT_PROFILE -> new LinkedHashSet<>();
+                    .map(ref -> new Parties(salonOrMaster(ref.getSalonId(), ref.getMasterUserId()),
+                            new LinkedHashSet<>()))
+                    .orElseGet(Parties::none);
+            case MASTER_PROFILE, SALON_PROFILE, CLIENT_PROFILE -> Parties.none();
         };
     }
 
+    /** Salon (owner + active admins) when there is one — never the salon master; otherwise the master's account. */
     private Set<UUID> salonOrMaster(UUID salonId, UUID masterUserId) {
         if (salonId != null) {
             return new LinkedHashSet<>(salonRepository.findOwnerAndActiveAdminIds(salonId));
         }
-        return masterUserId == null ? new LinkedHashSet<>() : single(masterUserId);
+        return single(masterUserId);
     }
 
-    private Set<UUID> single(UUID userId) {
+    private static Set<UUID> single(UUID userId) {
         Set<UUID> ids = new LinkedHashSet<>();
-        ids.add(userId);
+        if (userId != null) {
+            ids.add(userId);
+        }
         return ids;
     }
 }

@@ -15,16 +15,19 @@ import java.util.UUID;
  * @param resolution    the resolution every closed report got
  * @param batchReportId the report id passed to {@code resolve}; the dedup key suffix (D7)
  * @param reporterIds   distinct, non-null reporter accounts of the reports this call closed
- * @param authorIds     the accounts that answer for the content (see {@link ModerationAuthorResolver}), resolved as
- *                      scalars BEFORE the target locks were taken; empty unless the action was a REMOVE on a review /
- *                      client review / photo
+ * @param authorIds     the accounts that answer for the content (see {@link ModerationAuthorResolver}); empty unless
+ *                      the action was a REMOVE on a review / client review / photo
+ * @param subjectIds    the accounts the removed review is ABOUT (follow-up): the reviewed provider (independent master,
+ *                      or the salon's owner + active admins) for a review, the reviewed client for a client review;
+ *                      empty otherwise
  */
 public record ModerationOutcome(
         ReportTargetType targetType,
         ReportResolution resolution,
         UUID batchReportId,
         Set<UUID> reporterIds,
-        Set<UUID> authorIds) {
+        Set<UUID> authorIds,
+        Set<UUID> subjectIds) {
 
     public ModerationOutcome {
         Objects.requireNonNull(targetType, "targetType");
@@ -32,5 +35,6 @@ public record ModerationOutcome(
         Objects.requireNonNull(batchReportId, "batchReportId");
         reporterIds = Set.copyOf(reporterIds);
         authorIds = authorIds == null ? Set.of() : Set.copyOf(authorIds);
+        subjectIds = subjectIds == null ? Set.of() : Set.copyOf(subjectIds);
     }
 }

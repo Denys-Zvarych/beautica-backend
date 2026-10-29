@@ -124,6 +124,7 @@ public final class PushCopy {
             // Phase 415 — push stays dark until release; the feed copy lives in the mobile ARB (phase 428).
             case REPORT_CONTENT_REMOVED, REPORT_NO_VIOLATION, REPORT_REVIEWED -> "Скаргу розглянуто";
             case CONTENT_REMOVED -> "Вміст видалено";
+            case REVIEW_ABOUT_YOU_REMOVED -> "Відгук видалено";
         };
     }
 
@@ -198,6 +199,7 @@ public final class PushCopy {
             case REPORT_NO_VIOLATION -> "Ми переглянули вашу скаргу і не знайшли порушень правил.";
             case REPORT_REVIEWED -> "Дякуємо! Ми переглянули вашу скаргу.";
             case CONTENT_REMOVED -> contentRemovedBody(kind);
+            case REVIEW_ABOUT_YOU_REMOVED -> "Відгук про вас видалено модерацією Beautica: він порушував правила спільноти.";
             default -> GENERIC_BODY;
         };
     }

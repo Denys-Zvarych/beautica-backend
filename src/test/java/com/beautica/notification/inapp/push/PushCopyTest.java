@@ -303,6 +303,13 @@ class PushCopyTest {
                         "contentKind");
     }
 
+    @Test
+    @DisplayName("phase 415 follow-up: REVIEW_ABOUT_YOU_REMOVED push title is «Відгук видалено» for every recipient")
+    void should_useLockedTitle_when_reviewAboutYouRemoved() {
+        assertThat(PushCopy.title(InAppNotificationType.REVIEW_ABOUT_YOU_REMOVED, true)).isEqualTo("Відгук видалено");
+        assertThat(PushCopy.title(InAppNotificationType.REVIEW_ABOUT_YOU_REMOVED, false)).isEqualTo("Відгук видалено");
+    }
+
     @org.junit.jupiter.params.ParameterizedTest(name = "{0} / {1}")
     @org.junit.jupiter.params.provider.CsvSource(delimiter = '|', value = {
             "REPORT_CONTENT_REMOVED | REVIEW          | Дякуємо! Ми переглянули вашу скаргу, і вміст видалено.",
@@ -310,7 +317,9 @@ class PushCopyTest {
             "REPORT_REVIEWED        | PROFILE         | Дякуємо! Ми переглянули вашу скаргу.",
             "CONTENT_REMOVED        | REVIEW          | Ваш відгук видалено через порушення правил спільноти.",
             "CONTENT_REMOVED        | CLIENT_REVIEW   | Ваш відгук про клієнта видалено через порушення правил спільноти.",
-            "CONTENT_REMOVED        | PORTFOLIO_PHOTO | Ваше фото видалено через порушення правил спільноти."
+            "CONTENT_REMOVED        | PORTFOLIO_PHOTO | Ваше фото видалено через порушення правил спільноти.",
+            "REVIEW_ABOUT_YOU_REMOVED | REVIEW        | Відгук про вас видалено модерацією Beautica: він порушував правила спільноти.",
+            "REVIEW_ABOUT_YOU_REMOVED | CLIENT_REVIEW | Відгук про вас видалено модерацією Beautica: він порушував правила спільноти."
     })
     @DisplayName("phase 415: moderation outcome bodies are the locked feed texts per content kind")
     void should_useLockedCopy_when_moderationOutcome(InAppNotificationType type,

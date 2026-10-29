@@ -2,7 +2,7 @@ package com.beautica.notification.inapp.entity;
 
 /**
  * The set of in-app feed event types (phase 332). Mirrors the DB CHECK constraint
- * {@code in_app_notification_type_chk} in {@code V181__create_in_app_notification.sql} (latest form: V219) exactly —
+ * {@code in_app_notification_type_chk} in {@code V181__create_in_app_notification.sql} (latest form: V221) exactly —
  * an unknown value is rejected at compile time here rather than reaching the DB and failing the
  * CHECK at insert time. Any addition to this enum MUST be added to that CHECK in the same PR.
  *
@@ -35,11 +35,16 @@ public enum InAppNotificationType {
     /** Phase 415 — reporter: neutral "we reviewed your report" (profile actioned, target already gone). */
     REPORT_REVIEWED,
     /** Phase 415 — author: their review / client review / photo was removed. */
-    CONTENT_REMOVED;
+    CONTENT_REMOVED,
+    /**
+     * Phase 415 follow-up — the subject of a removed review: the reviewed provider (independent master, or the salon's
+     * owner + active admins) for a review, the reviewed client for a client review. No reporter, no review text.
+     */
+    REVIEW_ABOUT_YOU_REMOVED;
 
     /** Phase 415 — the moderation-outcome types; each carries {@code moderated_target_type} and no other referent. */
     public boolean isModerationOutcome() {
         return this == REPORT_CONTENT_REMOVED || this == REPORT_NO_VIOLATION
-                || this == REPORT_REVIEWED || this == CONTENT_REMOVED;
+                || this == REPORT_REVIEWED || this == CONTENT_REMOVED || this == REVIEW_ABOUT_YOU_REMOVED;
     }
 }

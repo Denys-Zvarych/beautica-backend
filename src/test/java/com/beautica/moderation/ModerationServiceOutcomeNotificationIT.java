@@ -100,7 +100,8 @@ class ModerationServiceOutcomeNotificationIT extends AbstractModerationIT {
         }
 
         @Test
-        @DisplayName("an independent master's review REMOVE → the client author is told, the master is not")
+        @DisplayName("an independent master's review REMOVE → the client author gets CONTENT_REMOVED, the reviewed "
+                + "master REVIEW_ABOUT_YOU_REMOVED(REVIEW)")
         void should_notifyClientAuthor_when_independentReviewRemoved() {
             IndependentMaster master = createIndependentMaster(unique("indep"));
             UUID author = createUser(unique("author"), "CLIENT", null);
@@ -112,7 +113,58 @@ class ModerationServiceOutcomeNotificationIT extends AbstractModerationIT {
 
             assertThat(rowsOf(r1)).containsExactly(row("REPORT_CONTENT_REMOVED", "REVIEW"));
             assertThat(rowsOf(author)).containsExactly(row("CONTENT_REMOVED", "REVIEW"));
-            assertThat(rowsOf(master.userId())).isEmpty();
+            assertThat(rowsOf(master.userId())).containsExactly(row("REVIEW_ABOUT_YOU_REMOVED", "REVIEW"));
+        }
+
+        @Test
+        @DisplayName("salon review (salon master's booking) REMOVE → owner + active admin get REVIEW_ABOUT_YOU_REMOVED; "
+                + "the salon master, an inactive admin and another salon's admin get nothing")
+        void should_notifySalonNotMaster_when_salonReviewRemoved() {
+            SalonFixture salon = createSalon();
+            UUID admin = createUser(unique("admin"), "SALON_ADMIN", salon.salonId());
+            UUID inactiveAdmin = createUser(unique("admin-off"), "SALON_ADMIN", salon.salonId());
+            jdbcTemplate.update("UPDATE users SET is_active = false WHERE id = ?", inactiveAdmin);
+            UUID foreignAdmin = createUser(unique("admin-x"), "SALON_ADMIN", createSalon().salonId());
+            UUID reviewId = insertReview(createUser(unique("author"), "CLIENT", null), salon, "Грубо");
+            insertReport(reporter(), "REVIEW", reviewId);
+
+            resolveOldest(Path.CURL, ReportTargetType.REVIEW, reviewId, "REMOVE");
+
+            assertThat(rowsOf(ownerIdOf(salon))).containsExactly(row("REVIEW_ABOUT_YOU_REMOVED", "REVIEW"));
+            assertThat(rowsOf(admin)).containsExactly(row("REVIEW_ABOUT_YOU_REMOVED", "REVIEW"));
+            assertThat(rowsOf(userIdOf(salon.masterEmail()))).as("salon rule: never the salon master").isEmpty();
+            assertThat(rowsOf(inactiveAdmin)).isEmpty();
+            assertThat(rowsOf(foreignAdmin)).isEmpty();
+        }
+
+        @Test
+        @DisplayName("audit-fix SEC 1: an independent-period review (salon_id NULL) removed after the master joined a "
+                + "salon → the reviewed master is the subject, the new salon gets nothing")
+        void should_notifyMaster_notNewSalon_when_independentEraReviewRemovedAfterJoiningSalon() {
+            IndependentMaster master = createIndependentMaster(unique("indep"));
+            UUID reviewId = insertIndependentReview(createUser(unique("author"), "CLIENT", null), master.masterId());
+            SalonFixture newSalon = createSalon();
+            joinSalon(master, newSalon);
+            insertReport(reporter(), "REVIEW", reviewId);
+
+            resolveOldest(Path.CURL, ReportTargetType.REVIEW, reviewId, "REMOVE");
+
+            assertThat(rowsOf(master.userId())).containsExactly(row("REVIEW_ABOUT_YOU_REMOVED", "REVIEW"));
+            assertThat(rowsOf(ownerIdOf(newSalon))).as("the new salon was not reviewed").isEmpty();
+        }
+
+        @Test
+        @DisplayName("audit-fix SEC 3: the reviewed master who also reported the review gets BOTH the reporter row and "
+                + "the subject row (no reporter inference by comparing feeds)")
+        void should_writeReporterAndSubjectRows_when_subjectIsReporter() {
+            IndependentMaster master = createIndependentMaster(unique("indep"));
+            UUID reviewId = insertIndependentReview(createUser(unique("author"), "CLIENT", null), master.masterId());
+            insertReport(master.userId(), "REVIEW", reviewId);
+
+            resolveOldest(Path.CURL, ReportTargetType.REVIEW, reviewId, "REMOVE");
+
+            assertThat(rowsOf(master.userId())).containsExactlyInAnyOrder(
+                    row("REPORT_CONTENT_REMOVED", "REVIEW"), row("REVIEW_ABOUT_YOU_REMOVED", "REVIEW"));
         }
 
         @Test
@@ -150,7 +202,9 @@ class ModerationServiceOutcomeNotificationIT extends AbstractModerationIT {
             assertThat(rowsOf(r1)).containsExactly(row("REPORT_CONTENT_REMOVED", "REVIEW"));
             assertThat(rowsOf(r2)).containsExactly(row("REPORT_CONTENT_REMOVED", "REVIEW"));
             assertThat(rowsOf(author)).containsExactly(row("CONTENT_REMOVED", "REVIEW"));
-            assertThat(rowsOf(ownerIdOf(salon))).as("the reviewed provider is not the author").isEmpty();
+            assertThat(rowsOf(ownerIdOf(salon))).as("the reviewed salon is the subject, not the author")
+                    .containsExactly(row("REVIEW_ABOUT_YOU_REMOVED", "REVIEW"));
+            assertThat(rowsOf(userIdOf(salon.masterEmail()))).isEmpty();
         }
     }
 
@@ -176,7 +230,8 @@ class ModerationServiceOutcomeNotificationIT extends AbstractModerationIT {
             assertThat(rowsOf(ownerIdOf(salon))).containsExactly(row("CONTENT_REMOVED", "CLIENT_REVIEW"));
             assertThat(rowsOf(admin)).containsExactly(row("CONTENT_REMOVED", "CLIENT_REVIEW"));
             assertThat(rowsOf(userIdOf(salon.masterEmail()))).isEmpty();
-            assertThat(rowsOf(client)).as("the reviewed client is not the author").isEmpty();
+            assertThat(rowsOf(client)).as("the reviewed client is the subject")
+                    .containsExactly(row("REVIEW_ABOUT_YOU_REMOVED", "CLIENT_REVIEW"));
         }
 
         @Test
@@ -197,6 +252,29 @@ class ModerationServiceOutcomeNotificationIT extends AbstractModerationIT {
 
             assertThat(rowsOf(r1)).containsExactly(row("REPORT_CONTENT_REMOVED", "CLIENT_REVIEW"));
             assertThat(rowsOf(master.userId())).containsExactly(row("CONTENT_REMOVED", "CLIENT_REVIEW"));
+            assertThat(rowsOf(client)).containsExactly(row("REVIEW_ABOUT_YOU_REMOVED", "CLIENT_REVIEW"));
+        }
+
+        @Test
+        @DisplayName("audit-fix SEC 2: an independent-period client review (salon_id NULL) removed after the master "
+                + "joined a salon → the author master is told, the new salon gets nothing")
+        void should_notifyAuthorMaster_when_independentClientReviewRemovedAfterJoiningSalon() {
+            IndependentMaster master = createIndependentMaster(unique("indep"));
+            UUID client = createUser(unique("client"), "CLIENT", null);
+            UUID bookingId = insertIndependentBooking(client, master.masterId());
+            UUID clientReviewId = UUID.randomUUID();
+            jdbcTemplate.update(
+                    "INSERT INTO client_reviews (id, booking_id, subject_client_id, author_master_id, salon_id, rating, "
+                            + "comment, created_at, updated_at) VALUES (?, ?, ?, ?, NULL, 2, 'Пізно', NOW(), NOW())",
+                    clientReviewId, bookingId, client, master.masterId());
+            SalonFixture newSalon = createSalon();
+            joinSalon(master, newSalon);
+            insertReport(reporter(), "CLIENT_REVIEW", clientReviewId);
+
+            resolveOldest(Path.CURL, ReportTargetType.CLIENT_REVIEW, clientReviewId, "REMOVE");
+
+            assertThat(rowsOf(master.userId())).containsExactly(row("CONTENT_REMOVED", "CLIENT_REVIEW"));
+            assertThat(rowsOf(ownerIdOf(newSalon))).isEmpty();
         }
     }
 
@@ -230,17 +308,55 @@ class ModerationServiceOutcomeNotificationIT extends AbstractModerationIT {
         }
 
         @Test
-        @DisplayName("salon master's own portfolio photo REMOVE → that salon master is the author, not the owner")
-        void should_notifySalonMaster_when_masterPhotoRemoved() {
+        @DisplayName("salon master's own portfolio photo REMOVE → salon rule: owner + admin get CONTENT_REMOVED, the "
+                + "salon master nothing")
+        void should_notifySalon_when_salonMasterPhotoRemoved() {
             SalonFixture salon = createSalon();
+            UUID admin = createUser(unique("admin"), "SALON_ADMIN", salon.salonId());
             UUID photoId = insertMasterPortfolioPhoto(salon.masterId());
             UUID r1 = reporter();
             insertReport(r1, "PORTFOLIO_PHOTO", photoId);
 
             resolveOldest(Path.CURL, ReportTargetType.PORTFOLIO_PHOTO, photoId, "REMOVE");
 
-            assertThat(rowsOf(userIdOf(salon.masterEmail()))).containsExactly(row("CONTENT_REMOVED", "PORTFOLIO_PHOTO"));
+            assertThat(rowsOf(ownerIdOf(salon))).containsExactly(row("CONTENT_REMOVED", "PORTFOLIO_PHOTO"));
+            assertThat(rowsOf(admin)).containsExactly(row("CONTENT_REMOVED", "PORTFOLIO_PHOTO"));
+            assertThat(rowsOf(userIdOf(salon.masterEmail()))).isEmpty();
+        }
+
+        @Test
+        @DisplayName("audit-fix cycle 2: a salon admin who reported the salon photo gets BOTH REPORT_CONTENT_REMOVED and "
+                + "CONTENT_REMOVED, like the owner and the other admin (no reporter inference by feed diff)")
+        void should_writeContentRemoved_when_salonAdminAuthorAlsoReported() {
+            SalonFixture salon = createSalon();
+            UUID reportingAdmin = createUser(unique("admin-r"), "SALON_ADMIN", salon.salonId());
+            UUID otherAdmin = createUser(unique("admin-o"), "SALON_ADMIN", salon.salonId());
+            UUID photoId = insertSalonPortfolioPhoto(salon.salonId());
+            insertReport(reportingAdmin, "PORTFOLIO_PHOTO", photoId);
+
+            resolveOldest(Path.CURL, ReportTargetType.PORTFOLIO_PHOTO, photoId, "REMOVE");
+
+            assertThat(rowsOf(reportingAdmin)).containsExactlyInAnyOrder(
+                    row("REPORT_CONTENT_REMOVED", "PORTFOLIO_PHOTO"), row("CONTENT_REMOVED", "PORTFOLIO_PHOTO"));
+            assertThat(rowsOf(otherAdmin)).containsExactly(row("CONTENT_REMOVED", "PORTFOLIO_PHOTO"));
+            assertThat(rowsOf(ownerIdOf(salon))).containsExactly(row("CONTENT_REMOVED", "PORTFOLIO_PHOTO"));
+        }
+
+        @Test
+        @DisplayName("audit-fix SEC 4: a CLOSED salon's photo REMOVE → reporter told, owner and admin get nothing")
+        void should_notifyNobodyFromSalon_when_salonClosed() {
+            SalonFixture salon = createSalon();
+            UUID admin = createUser(unique("admin"), "SALON_ADMIN", salon.salonId());
+            UUID photoId = insertSalonPortfolioPhoto(salon.salonId());
+            UUID r1 = reporter();
+            insertReport(r1, "PORTFOLIO_PHOTO", photoId);
+            jdbcTemplate.update("UPDATE salons SET is_active = false WHERE id = ?", salon.salonId());
+
+            resolveOldest(Path.CURL, ReportTargetType.PORTFOLIO_PHOTO, photoId, "REMOVE");
+
+            assertThat(rowsOf(r1)).containsExactly(row("REPORT_CONTENT_REMOVED", "PORTFOLIO_PHOTO"));
             assertThat(rowsOf(ownerIdOf(salon))).isEmpty();
+            assertThat(rowsOf(admin)).isEmpty();
         }
 
         @Test
@@ -393,6 +509,14 @@ class ModerationServiceOutcomeNotificationIT extends AbstractModerationIT {
     }
 
     // ── helpers ──────────────────────────────────────────────────────────────────────────────
+
+    /** The master moves from independent to a salon (a later {@code masters.salon_id}). */
+    private void joinSalon(IndependentMaster master, SalonFixture salon) {
+        jdbcTemplate.update("UPDATE masters SET salon_id = ?, master_type = 'SALON_MASTER' WHERE id = ?",
+                salon.salonId(), master.masterId());
+        jdbcTemplate.update("UPDATE users SET role = 'SALON_MASTER', salon_id = ? WHERE id = ?",
+                salon.salonId(), master.userId());
+    }
 
     private UUID reporter() {
         return createUser(unique("reporter"), "CLIENT", null);

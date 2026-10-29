@@ -363,35 +363,35 @@ public interface InAppNotificationRepository extends Repository<InAppNotificatio
             @Param("dedupKey") String dedupKey);
 
     /**
-     * Phase 415 — one moderation-outcome item per recipient, in one statement. Only {@code moderated_target_type} and
-     * the dedup key are set (V219 shape CHECK). Driven by {@code users} and filtered to active accounts, so a deleted
-     * or deactivated recipient simply yields no row (D6). One array bind parameter, so the
-     * statement text (and its plan cache entry) is the same for any recipient count.
+     * Phase 415 — every moderation-outcome row of ONE resolution (reporters, author, subject) in one statement:
+     * {@code recipientIds[i]} gets type {@code types[i]} (the two arrays are parallel). The dedup key is built per row
+     * as {@code <type>:<batchReportId>}, so a recipient with two roles (e.g. reporter + subject) gets two rows, and a
+     * replay collapses via {@code ON CONFLICT DO NOTHING}. Only {@code moderated_target_type} and the key are set
+     * (V219/V221 shape CHECK). Driven by {@code users} and filtered to active accounts, so a deleted or deactivated
+     * recipient yields no row (D6). Audit-fix PERF 5: one round trip under the resolve locks, not one per group.
      */
     @Modifying
     @Query(value = """
             INSERT INTO in_app_notification (id, recipient_user_id, type, moderated_target_type, dedup_key)
-            SELECT gen_random_uuid(), u.id, :type, :targetType, :dedupKey
-              FROM users u
-             WHERE u.id = ANY(CAST(:recipientIds AS uuid[]))
-               AND u.is_active
+            SELECT gen_random_uuid(), u.id, v.type, :targetType, v.type || ':' || CAST(:batchReportId AS text)
+              FROM unnest(CAST(:recipientIds AS uuid[]), CAST(:types AS text[])) AS v(recipient_id, type)
+              JOIN users u ON u.id = v.recipient_id AND u.is_active
             ON CONFLICT (recipient_user_id, dedup_key) DO NOTHING
             """, nativeQuery = true)
-    int insertModerationOutcome(
-            @Param("type") String type,
+    int insertModerationOutcomes(
             @Param("recipientIds") UUID[] recipientIds,
+            @Param("types") String[] types,
             @Param("targetType") String targetType,
-            @Param("dedupKey") String dedupKey);
+            @Param("batchReportId") UUID batchReportId);
 
-    /** Push twin of {@link #insertModerationOutcome}. */
+    /** Push twin of {@link #insertModerationOutcomes}. */
     @Modifying
     @Query(value = """
             WITH ins AS (
                 INSERT INTO in_app_notification (id, recipient_user_id, type, moderated_target_type, dedup_key)
-                SELECT gen_random_uuid(), u.id, :type, :targetType, :dedupKey
-                  FROM users u
-                 WHERE u.id = ANY(CAST(:recipientIds AS uuid[]))
-                   AND u.is_active
+                SELECT gen_random_uuid(), u.id, v.type, :targetType, v.type || ':' || CAST(:batchReportId AS text)
+                  FROM unnest(CAST(:recipientIds AS uuid[]), CAST(:types AS text[])) AS v(recipient_id, type)
+                  JOIN users u ON u.id = v.recipient_id AND u.is_active
                 ON CONFLICT (recipient_user_id, dedup_key) DO NOTHING
                 RETURNING id, recipient_user_id
             )
@@ -400,11 +400,11 @@ public interface InAppNotificationRepository extends Repository<InAppNotificatio
              WHERE EXISTS (SELECT 1 FROM device_tokens dt
                             WHERE dt.user_id = ins.recipient_user_id AND dt.is_active)
             """, nativeQuery = true)
-    int insertModerationOutcomeWithPush(
-            @Param("type") String type,
+    int insertModerationOutcomesWithPush(
             @Param("recipientIds") UUID[] recipientIds,
+            @Param("types") String[] types,
             @Param("targetType") String targetType,
-            @Param("dedupKey") String dedupKey);
+            @Param("batchReportId") UUID batchReportId);
 
     /** Push twin of {@link #insertClientOnlyBulk}. */
     @Modifying

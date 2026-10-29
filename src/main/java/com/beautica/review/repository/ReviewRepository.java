@@ -573,10 +573,29 @@ public interface ReviewRepository extends JpaRepository<Review, UUID> {
     int anonymiseGuestDisplayNames(
             @Param("reviewIds") Collection<UUID> reviewIds, @Param("sentinel") String sentinel);
 
-    /**
-     * Phase 415 — the review's author account (scalar, nothing enters the persistence context); empty for a guest
-     * review or a detached client.
-     */
-    @Query("SELECT r.client.id FROM Review r WHERE r.id = :reviewId")
-    Optional<UUID> findClientIdById(@Param("reviewId") UUID reviewId);
+    /** Phase 415 — the parties of a review for moderation notifications (scalars only). */
+    interface ReviewModerationPartiesRef {
+        /** The author; null for a guest review or a detached client. */
+        UUID getClientId();
+
+        /**
+         * The reviewed salon: the review's own {@code salon_id} ONLY. NULL means the master's independent period (V41),
+         * so a master who has since joined a salon is still the subject, never the new salon (audit-fix SEC 1).
+         */
+        UUID getSalonId();
+
+        /** The reviewed master's account (used only when there is no salon). */
+        UUID getMasterUserId();
+    }
+
+    /** Phase 415 — scalar parties lookup (nothing enters the persistence context). */
+    @Query(value = """
+            SELECT r.client_id AS clientId,
+                   r.salon_id AS salonId,
+                   m.user_id AS masterUserId
+              FROM reviews r
+              JOIN masters m ON m.id = r.master_id
+             WHERE r.id = :reviewId
+            """, nativeQuery = true)
+    Optional<ReviewModerationPartiesRef> findModerationPartiesById(@Param("reviewId") UUID reviewId);
 }

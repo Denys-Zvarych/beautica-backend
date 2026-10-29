@@ -147,16 +147,23 @@ public interface ClientReviewRepository extends JpaRepository<ClientReview, UUID
     @Query("DELETE FROM ClientReview cr WHERE cr.subjectClient.id = :subjectClientId")
     void deleteBySubjectClientId(@Param("subjectClientId") UUID subjectClientId);
 
-    /** Phase 415 — who answers for a client review: the author master's account and, for a salon review, the salon. */
+    /**
+     * Phase 415 — the parties of a client review: who answers for it (the salon when the review's own {@code salon_id}
+     * is set, else the author master's account — a NULL salon_id is an independent-period review, so a master who has
+     * since joined a salon still answers for it; audit-fix SEC 2) and the reviewed client.
+     */
     interface ClientReviewAuthorRef {
         UUID getMasterUserId();
 
         UUID getSalonId();
+
+        UUID getSubjectClientId();
     }
 
     /** Phase 415 — scalar author lookup (nothing enters the persistence context). */
     @Query(value = """
-            SELECT m.user_id AS masterUserId, cr.salon_id AS salonId
+            SELECT m.user_id AS masterUserId, cr.salon_id AS salonId,
+                   cr.subject_client_id AS subjectClientId
               FROM client_reviews cr
               JOIN masters m ON m.id = cr.author_master_id
              WHERE cr.id = :clientReviewId

@@ -44,7 +44,7 @@ class RequestDecisionOpenApiContractIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("NotificationResponse.type lists the 4 decision types, the 4 phase-415 moderation types and the 10 "
+    @DisplayName("NotificationResponse.type lists the 4 decision types, the 5 phase-415 moderation types and the 10 "
             + "existing ones")
     void should_listFourNewTypes_and_keepTheTenExisting() throws Exception {
         List<String> types = texts(schemas().path("NotificationResponse").path("properties").path("type").path("enum"));
@@ -55,8 +55,9 @@ class RequestDecisionOpenApiContractIT extends AbstractIntegrationTest {
                 "BOOKING_CANCELLED_MASTER_REMOVED", "REVIEW_RECEIVED", "INVITE_ACCEPTED",
                 "CATEGORY_REQUEST_APPROVED", "CATEGORY_REQUEST_REJECTED",
                 "SERVICE_TYPE_SUGGESTION_APPROVED", "SERVICE_TYPE_SUGGESTION_REJECTED",
-                "REPORT_CONTENT_REMOVED", "REPORT_NO_VIOLATION", "REPORT_REVIEWED", "CONTENT_REMOVED")
-                .hasSize(18);
+                "REPORT_CONTENT_REMOVED", "REPORT_NO_VIOLATION", "REPORT_REVIEWED", "CONTENT_REMOVED",
+                "REVIEW_ABOUT_YOU_REMOVED")
+                .hasSize(19);
     }
 
     @Test

@@ -41,6 +41,8 @@ class InAppModerationOutcomeMigrationIT extends AbstractIntegrationTest {
     @ParameterizedTest(name = "{0} / {1}")
     @CsvSource({
             "REPORT_CONTENT_REMOVED, REVIEW",
+            "REVIEW_ABOUT_YOU_REMOVED, REVIEW",
+            "REVIEW_ABOUT_YOU_REMOVED, CLIENT_REVIEW",
             "REPORT_NO_VIOLATION, CLIENT_PROFILE",
             "REPORT_REVIEWED, SALON_PROFILE",
             "REPORT_REVIEWED, MASTER_PROFILE",
@@ -150,6 +152,46 @@ class InAppModerationOutcomeMigrationIT extends AbstractIntegrationTest {
         try (var in = InAppModerationOutcomeMigrationIT.class.getResourceAsStream("/db/migration/" + file)) {
             assertThat(in).as("migration %s on the classpath", file).isNotNull();
             return new String(in.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+        }
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @CsvSource({"PORTFOLIO_PHOTO", "MASTER_PROFILE", "SALON_PROFILE", "CLIENT_PROFILE"})
+    @DisplayName("follow-up V221: REVIEW_ABOUT_YOU_REMOVED is only for a review or client review")
+    void should_reject_when_reviewAboutYouOnNonReview(String targetType) {
+        assertRejected(() -> insert("REVIEW_ABOUT_YOU_REMOVED", targetType, null, "REVIEW_ABOUT_YOU_REMOVED:" + batch),
+                SHAPE);
+    }
+
+    @Test
+    @DisplayName("follow-up V221: REVIEW_ABOUT_YOU_REMOVED needs its own '<TYPE>:<uuid>' key and no booking")
+    void should_reject_when_reviewAboutYouKeyOrShapeWrong() {
+        assertRejected(() -> insert("REVIEW_ABOUT_YOU_REMOVED", "REVIEW", null, "CONTENT_REMOVED:" + batch),
+                "in_app_notification_dedup_key_chk");
+        assertRejected(() -> insert("REVIEW_ABOUT_YOU_REMOVED", "REVIEW", UUID.randomUUID(),
+                "REVIEW_ABOUT_YOU_REMOVED:" + batch), SHAPE);
+    }
+
+    @Test
+    @DisplayName("follow-up V221/V222: V221 re-adds its 3 CHECKs NOT VALID under a lock_timeout, V222 validates each, "
+            + "and the catalog shows them validated")
+    void should_addNotValid_and_validateInV222_when_migrated() throws Exception {
+        String v221 = migration("V221__inapp_review_about_you_removed_type.sql");
+        String v222 = migration("V222__inapp_review_about_you_removed_validate.sql");
+        String v221Code = v221.replaceAll("(?m)--.*$", "");
+
+        assertThat(v221).contains("SET LOCAL lock_timeout");
+        assertThat(java.util.regex.Pattern.compile("\\bNOT VALID\\s*[,;]").matcher(v221Code).results().count())
+                .as("every ADD CONSTRAINT in V221 is NOT VALID").isEqualTo(3L);
+        assertThat(java.util.regex.Pattern.compile("\\bADD CONSTRAINT\\b").matcher(v221Code).results().count())
+                .isEqualTo(3L);
+        assertThat(v222).contains("SET LOCAL lock_timeout");
+        for (String constraint : List.of("in_app_notification_type_chk", "in_app_notification_shape_chk",
+                "in_app_notification_dedup_key_chk")) {
+            assertThat(v222).contains("VALIDATE CONSTRAINT " + constraint + ";");
+            assertThat(jdbcTemplate.queryForObject("SELECT convalidated FROM pg_constraint "
+                    + "WHERE conrelid = 'in_app_notification'::regclass AND conname = ?", Boolean.class, constraint))
+                    .as("%s validated", constraint).isTrue();
         }
     }
 }
