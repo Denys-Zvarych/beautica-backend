@@ -1,6 +1,7 @@
--- non-destructive
--- Reason: review_invites was created in V213 of this same unreleased track and is empty in every environment, so
--- relaxing appointment_id NOT NULL, adding booking_id and the new CHECK needs no backfill and no NOT VALID step.
+-- contract-of: V213
+-- Why contract-of V213: this file reshapes V213's review_invites (appointment_id DROP NOT NULL, a booking_id FK
+-- REFERENCES bookings, a UNIQUE and a CHECK). review_invites was created in V213 of this same unreleased track and
+-- is empty in every environment, so this needs no backfill and no NOT VALID step.
 -- Phase 400 D7 — an invite's subject is a visit (appointment_id) OR a single LINK booking without a visit header
 -- (booking_id, bookings.appointment_id IS NULL). Exactly one is set (chk_review_invites_one_subject).
 -- ux_review_invites_booking is the ON CONFLICT target for booking-keyed inserts and serves the lookups; NULL

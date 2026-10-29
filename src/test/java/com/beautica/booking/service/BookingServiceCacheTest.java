@@ -154,6 +154,11 @@ class BookingServiceCacheTest {
     // all four tests below at context load with NoSuchBeanDefinitionException, not on an assertion.
     // The eviction paths exercised here use appointment-less bookings, so the mock is never called.
     @MockBean com.beautica.booking.repository.AppointmentRepository appointmentRepository;
+    // Phases 397/398: ClientBlockService (provider detail block state) and BookingBlockGuard (create-time block
+    // refusal) entered the BookingService constructor. Same slice rule as above — supply them as mocks; the
+    // eviction paths exercised here never reach either.
+    @MockBean com.beautica.moderation.service.ClientBlockService clientBlockService;
+    @MockBean com.beautica.moderation.service.BookingBlockGuard bookingBlockGuard;
 
     /** Fixed so a test can seed a master-calendar key that really belongs to the booking's master. */
     private static final UUID MASTER_ID = UUID.randomUUID();
