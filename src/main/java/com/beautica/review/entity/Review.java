@@ -153,6 +153,15 @@ public class Review extends AuditableEntity {
     }
 
     /**
+     * Phase 401 D5 — the «Ім'я П.» label {@link #guestLinkReview} would snapshot for these raw guest fields, for the
+     * guest review page's preview ({@code displayName}). The same rule, never a re-implementation; «Гість» when nothing
+     * usable is left. Never throws.
+     */
+    public static String guestDisplayNameFor(String guestName, String guestSurname) {
+        return GuestDisplayName.of(guestName, guestSurname);
+    }
+
+    /**
      * Phase 399 audit — the public {@code @Builder} can set any {@link #guestDisplayName}; this lifecycle guard keeps a
      * {@link ReviewSource#GUEST_LINK} row to a label {@link GuestDisplayName} could have built (one name word, an
      * optional «X.» initial, no digit), so a builder-written full surname or phone fragment never reaches the cached

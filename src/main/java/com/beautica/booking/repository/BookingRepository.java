@@ -736,6 +736,53 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     Optional<Booking> findByIdWithFullGraph(@Param("id") UUID id);
 
     /**
+     * Phase 401 D8 — the reviewable bookings of a VISIT-keyed review invite: the COMPLETED LINK guest bookings
+     * ({@code client_id IS NULL}) of {@code appointmentId}, ordered by {@code startsAt}. One statement, same fetch graph
+     * as {@link #findByIdWithFullGraph} (master + user, salon, service definition), because the guest review page reads
+     * the master name, the salon name and the service name of every row and the review create path reads
+     * {@code m.user}. Plus {@code m.salon} (phase 401 audit-fix): the provider card's master-visibility rule reads
+     * {@code master.getSalon().isActive()}, which was otherwise one lazy SELECT per GET. Bounded by the visit's size (at most 10 items). Unscoped: the caller
+     * ({@code GuestReviewService#resolveInviteBookings}) only ever passes an invite's own subject.
+     */
+    @Query("""
+            SELECT b FROM Booking b
+            JOIN FETCH b.master m
+            LEFT JOIN FETCH m.user
+            LEFT JOIN FETCH m.salon
+            LEFT JOIN FETCH b.salon
+            JOIN FETCH b.masterService ms
+            JOIN FETCH ms.serviceDefinition
+            WHERE b.appointment.id = :appointmentId
+              AND b.status = com.beautica.booking.enums.BookingStatus.COMPLETED
+              AND b.bookingSource = com.beautica.booking.enums.BookingSource.LINK
+              AND b.client IS NULL
+            ORDER BY b.startsAt ASC, b.id ASC
+            """)
+    List<Booking> findGuestReviewableByAppointmentIdWithGraph(@Param("appointmentId") UUID appointmentId);
+
+    /**
+     * Phase 401 D8 — the reviewable booking of a BOOKING-keyed review invite (V215): {@code bookingId} only when it
+     * still has no visit header ({@code appointment_id IS NULL}) and is a COMPLETED LINK guest booking
+     * ({@code client_id IS NULL}); otherwise empty. Same fetch graph as
+     * {@link #findGuestReviewableByAppointmentIdWithGraph}.
+     */
+    @Query("""
+            SELECT b FROM Booking b
+            JOIN FETCH b.master m
+            LEFT JOIN FETCH m.user
+            LEFT JOIN FETCH m.salon
+            LEFT JOIN FETCH b.salon
+            JOIN FETCH b.masterService ms
+            JOIN FETCH ms.serviceDefinition
+            WHERE b.id = :bookingId
+              AND b.appointment IS NULL
+              AND b.status = com.beautica.booking.enums.BookingStatus.COMPLETED
+              AND b.bookingSource = com.beautica.booking.enums.BookingSource.LINK
+              AND b.client IS NULL
+            """)
+    Optional<Booking> findGuestReviewableSingleBookingWithGraph(@Param("bookingId") UUID bookingId);
+
+    /**
      * All chained booking rows of ONE multi-service visit (BE-3), ordered by {@code startsAt}
      * ascending. That ordering is retained unconditionally, but "back-to-back" is NOT: once any
      * item has been rescheduled individually (phase 30.1's relaxed contiguity —

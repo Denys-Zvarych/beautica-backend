@@ -5,16 +5,18 @@ import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Instant;
 import java.util.Collection;
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 
 /**
  * Phase 399/400 — data access for {@link ReviewInvite}. Unscoped by design: invites are never read on behalf of an
  * authenticated user. Every multi-row statement is bounded by {@code :limit} (phase 400 D4a). The token lookup /
- * atomic consume (401) and the retention purge (402) are added by the phases that own them.
+ * atomic redeem (401) and the retention purge (402) are added by the phases that own them.
  */
 public interface ReviewInviteRepository extends JpaRepository<ReviewInvite, UUID> {
 
@@ -133,4 +135,58 @@ public interface ReviewInviteRepository extends JpaRepository<ReviewInvite, UUID
             WHERE b.id IN (:bookingIds) AND b.appointment_id IS NULL
             """, nativeQuery = true)
     List<ReviewInviteVisitView> findBookingViews(@Param("bookingIds") Collection<UUID> bookingIds);
+
+    /**
+     * Phase 401 D2 — the redemption lookup, read side (the guest review page's GET): the invite whose token hashes to
+     * {@code tokenHash} ONLY when it is redeemable ({@code SENT} and unexpired) or already {@code CONSUMED} — hash,
+     * status and expiry in ONE predicate, never a load-by-hash followed by a redeemability check in Java. The caller
+     * only tells the two matching states apart ({@code CONSUMED} → «Відгук уже залишено», website 019 input); every
+     * other row (SCHEDULED, SKIPPED, FAILED, EXPIRED, SENT past expiry) and an unknown hash are both absent → the one
+     * 404. Phase 401 audit-fix (perf INFO): replaces the former redeemable lookup + consumed-exists probe pair, so an
+     * {@code ALREADY_REVIEWED} or unknown token costs one statement instead of two. Served by
+     * {@code ux_review_invites_token_hash}.
+     */
+    @Query(value = """
+            SELECT * FROM review_invites
+            WHERE token_hash = :tokenHash
+              AND ((status = 'SENT' AND expires_at > :now) OR status = 'CONSUMED')
+            """, nativeQuery = true)
+    Optional<ReviewInvite> findRedeemableOrConsumed(@Param("tokenHash") byte[] tokenHash, @Param("now") Instant now);
+
+    /**
+     * Phase 401 D2/D4 — the submit's atomic redeem: {@code SENT → CONSUMED} for the invite whose token hashes to
+     * {@code tokenHash}, only while still {@code SENT} and unexpired, returning the consumed row (empty = not redeemable
+     * → 404). Phase 401 audit-fix (perf INFO): one statement replaces the former {@code SELECT … FOR UPDATE} + {@code
+     * UPDATE … WHERE id} pair with the same guarantees —
+     * <ul>
+     *   <li><b>race</b>: a concurrent submit of the same token blocks on the row lock this UPDATE takes; once the winner
+     *       commits, Postgres (READ COMMITTED) re-checks the predicate on the new row version and the loser updates no
+     *       row (→ 404). If the winner rolls back, the loser consumes it — exactly the {@code FOR UPDATE} behaviour;</li>
+     *   <li><b>rollback</b>: the caller validates the items and writes the reviews AFTER this, in the same
+     *       transaction, so a 400/404/409 on any item rolls the consume back and the token stays {@code SENT}.</li>
+     * </ul>
+     * Not {@code @Modifying}: {@code @Modifying} routes the query through {@code executeUpdate}, which rejects a
+     * statement that returns rows — {@code RETURNING *} makes this a row-returning statement mapped to the entity.
+     * Phase 401 audit-fix cycle 2 (sec INFO): explicitly read-write {@code @Transactional} — a declared query method
+     * otherwise inherits {@code SimpleJpaRepository}'s class-level {@code readOnly = true} — joining the caller's
+     * transaction (the submit), so the consume still rolls back with any 400/404/409 of the items.
+     */
+    @Transactional
+    @Query(value = """
+            UPDATE review_invites SET status = 'CONSUMED', consumed_at = :now
+            WHERE token_hash = :tokenHash AND status = 'SENT' AND expires_at > :now
+            RETURNING *
+            """, nativeQuery = true)
+    Optional<ReviewInvite> consumeRedeemable(@Param("tokenHash") byte[] tokenHash, @Param("now") Instant now);
+
+    /**
+     * Phase 401 D6 — the opt-out lookup: an invite that was actually sent ({@code SENT}, {@code CONSUMED} or
+     * {@code EXPIRED}) no earlier than {@code sentAfter} (now − 30 days), so a guest can still opt out after reviewing
+     * or after the review window closed. Hash, status and send-time in one predicate.
+     */
+    @Query(value = """
+            SELECT * FROM review_invites
+            WHERE token_hash = :tokenHash AND status IN ('SENT', 'CONSUMED', 'EXPIRED') AND sent_at > :sentAfter
+            """, nativeQuery = true)
+    Optional<ReviewInvite> findOptOutable(@Param("tokenHash") byte[] tokenHash, @Param("sentAfter") Instant sentAfter);
 }

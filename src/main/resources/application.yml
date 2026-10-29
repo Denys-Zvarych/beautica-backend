@@ -446,6 +446,8 @@ app:
     # hostname/action, so staging leaves both empty.
     expected-hostnames: []
     expected-action: ""
+    # Phase 401 — the guest review page (/r/{token}: submit + opt-out) renders its widget with this action.
+    review-expected-action: ""
   admin-email: ${ADMIN_EMAIL:admin@beautica.app}
   support:
     # Fixed destination inbox for the Help / Contact-us feature

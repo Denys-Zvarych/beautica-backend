@@ -128,6 +128,32 @@ abstract class AbstractReviewInviteIT extends AbstractIntegrationTest {
                 .toList();
     }
 
+    /**
+     * Phase 401 audit-fix — moves {@link #masterId} into a new active salon owned by a separate SALON_OWNER account
+     * (so owner ≠ performing master); returns the salon id. Bookings seeded afterwards still carry
+     * {@code salon_id = NULL}; {@link #attachToSalon} stamps them.
+     */
+    protected UUID affiliateMasterWithSalon() {
+        UUID ownerId = fixtures.user("SALON_OWNER", "Олег", "Власник");
+        UUID salonId = UUID.randomUUID();
+        jdbcTemplate.update("INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at, city_id) "
+                + "VALUES (?, ?, 'Лаванда', true, NOW(), NOW(), ?)", salonId, ownerId, testCityId());
+        jdbcTemplate.update("UPDATE masters SET salon_id = ?, master_type = 'SALON_MASTER' WHERE id = ?", salonId,
+                masterId);
+        return salonId;
+    }
+
+    protected UUID salonOwnerId(UUID salonId) {
+        return jdbcTemplate.queryForObject("SELECT owner_id FROM salons WHERE id = ?", UUID.class, salonId);
+    }
+
+    /** Stamps {@code salon_id} on the given bookings (a salon-performed visit). */
+    protected void attachToSalon(UUID salonId, UUID... bookingIds) {
+        for (UUID bookingId : bookingIds) {
+            jdbcTemplate.update("UPDATE bookings SET salon_id = ? WHERE id = ?", salonId, bookingId);
+        }
+    }
+
     /** A COMPLETED guest LINK visit with one COMPLETED, unreviewed item. */
     protected UUID completedLinkVisit(String phone, String policyVersion) {
         UUID appointmentId = fixtures.linkVisit("COMPLETED", phone, policyVersion);

@@ -383,6 +383,17 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // guestAvailabilityBuckets would do the same to the date-browsing budget. A page open costs one token,
     // so 60/min is far above human use even behind carrier-grade NAT. Built internally like
     // guestAvailabilityBuckets so the public constructor stays unchanged.
+    // Phase 401 D1 — the guest review page's public routes (/api/v1/public/review-invites/{token}...). No OTP: the
+    // 128-bit token in the path is the credential, so these per-IP buckets (plus Turnstile on the POSTs) are the
+    // flood guard. GET (the page read, SSR via the website Worker — keyed like the /book info reads, see
+    // resolveGuestInfoBucketKey): 30 / 10 min. POST (submit + opt-out share ONE bucket — a guest needs at most a
+    // couple, and each runs a locked lookup plus up to 10 review inserts): 5 / 10 min. Built internally like the
+    // other guest buckets so the public constructor stays unchanged.
+    private static final String REVIEW_INVITE_PATH_PREFIX = "/api/v1/public/review-invites/";
+    private static final long REVIEW_INVITE_GET_CAPACITY = 30;
+    private static final long REVIEW_INVITE_POST_CAPACITY = 5;
+    private static final Duration REVIEW_INVITE_WINDOW = Duration.ofMinutes(10);
+    private static final int REVIEW_INVITE_RETRY_AFTER_SECONDS = 600;
     private static final long GUEST_INFO_CAPACITY = 60;
     private static final Duration GUEST_INFO_WINDOW = Duration.ofMinutes(1);
     // Entry cap for guestInfoBuckets (perf audit L1). Lower than the 100_000 the other per-IP caches use:
@@ -393,6 +404,10 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // calls from one egress IP; with a matching secret its forwarded visitor IP keys the bucket instead.
     private static final String WORKER_KEY_HEADER = "X-Beautica-Worker-Key";
     private static final String CF_CONNECTING_IP_HEADER = "CF-Connecting-IP";
+    // Phase 401 (website audit 2026-10-28): Cloudflare drops CF-Connecting-IP on a Workers subrequest, so the Worker
+    // forwards the visitor IP in this header. Trusted ONLY with a matching worker key (like CF-Connecting-IP) and
+    // preferred over CF-Connecting-IP when both hold a valid IP literal.
+    private static final String CLIENT_IP_HEADER = "X-Beautica-Client-IP";
     private static final int MAX_IP_LITERAL_LENGTH = 45;
     private static final Pattern IPV4_LITERAL = Pattern.compile(
             "^((25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)\\.){3}(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)$");
@@ -712,6 +727,9 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // Per-IP bucket for GET /api/v1/book/{slug}/info + GET /api/v1/book/s/{slug}/info (phase 377 audit),
     // see GUEST_INFO_CAPACITY. Built internally, like guestAvailabilityBuckets.
     private final LoadingCache<String, Bucket> guestInfoBuckets;
+    // Phase 401 D1 — per-IP buckets for the guest review page, see REVIEW_INVITE_GET_CAPACITY.
+    private final LoadingCache<String, Bucket> reviewInviteGetBuckets;
+    private final LoadingCache<String, Bucket> reviewInvitePostBuckets;
     // Per-IP bucket for GET /api/v1/search/** — the SEC-fix scraping guard for the permitAll()
     // discovery reads (which now surface authed-only independent-master street addresses).
     // Built internally rather than injected so the public 16-arg constructor stays stable for
@@ -945,6 +963,18 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                 .build(key -> Bucket.builder()
                         .addLimit(guestInfoBandwidth())
                         .build());
+        this.reviewInviteGetBuckets = Caffeine.newBuilder()
+                .maximumSize(GUEST_INFO_MAX_ENTRIES)
+                .expireAfterAccess(REVIEW_INVITE_WINDOW.plusMinutes(5))
+                .build(key -> Bucket.builder()
+                        .addLimit(reviewInviteBandwidth(REVIEW_INVITE_GET_CAPACITY))
+                        .build());
+        this.reviewInvitePostBuckets = Caffeine.newBuilder()
+                .maximumSize(GUEST_INFO_MAX_ENTRIES)
+                .expireAfterAccess(REVIEW_INVITE_WINDOW.plusMinutes(5))
+                .build(key -> Bucket.builder()
+                        .addLimit(reviewInviteBandwidth(REVIEW_INVITE_POST_CAPACITY))
+                        .build());
         this.searchBuckets = Caffeine.newBuilder()
                 .maximumSize(100_000)
                 .expireAfterAccess(SEARCH_WINDOW.plusMinutes(5))
@@ -987,6 +1017,13 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                 .build(key -> Bucket.builder()
                         .addLimit(rotateStaffBandwidth())
                         .build());
+    }
+
+    private static Bandwidth reviewInviteBandwidth(long capacity) {
+        return BandwidthBuilder.builder()
+                .capacity(capacity)
+                .refillIntervally(capacity, REVIEW_INVITE_WINDOW)
+                .build();
     }
 
     private static Bandwidth otpVerifyBandwidth() {
@@ -1206,6 +1243,22 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                                     FilterChain filterChain) throws ServletException, IOException {
         String path = resolveMatchPath(request);
         String method = request.getMethod();
+
+        // Phase 401 D1 — guest review page: GET/HEAD /api/v1/public/review-invites/{token} (keyed on the visitor IP
+        // forwarded by the website Worker when it carries the worker key, else the client IP) and the two POSTs
+        // (/reviews, /opt-out) on a shared POST bucket. No other route starts with this prefix.
+        if (path.startsWith(REVIEW_INVITE_PATH_PREFIX)) {
+            if (isGetOrHead(method)) {
+                applyRateLimit(request, response, filterChain, reviewInviteGetBuckets,
+                        REVIEW_INVITE_RETRY_AFTER_SECONDS, 1L, perIpv6Prefix(resolveGuestInfoBucketKey(request)));
+                return;
+            }
+            if (HttpMethod.POST.matches(method)) {
+                applyRateLimit(request, response, filterChain, reviewInvitePostBuckets,
+                        REVIEW_INVITE_RETRY_AFTER_SECONDS, 1L, perIpv6Prefix(resolveBucketKey(request)));
+                return;
+            }
+        }
 
         // Device-token rate-limit: POST or DELETE /api/v1/devices/token — checked before
         // the POST-only branch so DELETE is also covered.
@@ -1910,7 +1963,7 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     /**
      * Bucket key for the booking-page info reads. With the website-Worker feature on, a request carrying a
      * matching {@value #WORKER_KEY_HEADER} (constant-time compare) is keyed on the visitor IP in
-     * {@value #CF_CONNECTING_IP_HEADER}, so the Worker's single egress IP does not pool every visitor into one
+     * {@value #CLIENT_IP_HEADER} (phase 401) or, failing that, {@value #CF_CONNECTING_IP_HEADER}, so the Worker's single egress IP does not pool every visitor into one
      * bucket. Anything else — feature off, no header, wrong key, missing or non-IP-literal
      * CF-Connecting-IP — falls back to {@link #resolveBucketKey} exactly as before.
      */
@@ -1922,7 +1975,10 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         if (supplied == null || !ConstantTimeSecrets.matches(supplied, bookingInfoWorkerKey)) {
             return resolveBucketKey(request);
         }
-        String visitorKey = visitorIpBucketKey(request.getHeader(CF_CONNECTING_IP_HEADER));
+        String visitorKey = visitorIpBucketKey(request.getHeader(CLIENT_IP_HEADER));
+        if (visitorKey == null) {
+            visitorKey = visitorIpBucketKey(request.getHeader(CF_CONNECTING_IP_HEADER));
+        }
         return visitorKey != null ? visitorKey : resolveBucketKey(request);
     }
 
@@ -1952,6 +2008,17 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         } catch (UnknownHostException e) {
             return null;
         }
+    }
+
+    /**
+     * Phase 401 audit-fix — the review-invite buckets only: {@code key} re-keyed by {@link #visitorIpBucketKey} (an IPv6
+     * client on its /64, IPv4 unchanged), so one subscriber rotating the low 64 bits of its address cannot mint a fresh
+     * 5-request POST budget per address. A key that is not a bare IP literal (already {@code …/64}, or the clamped
+     * remote address) is returned as is. Every other bucket keeps its per-address key.
+     */
+    static String perIpv6Prefix(String key) {
+        String prefixed = visitorIpBucketKey(key);
+        return prefixed != null ? prefixed : key;
     }
 
     /** True when the first {@value #IPV6_BUCKET_PREFIX_BYTES} bytes (the /64 prefix) are all zero. */

@@ -4,6 +4,8 @@ import com.beautica.support.TestSecrets;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.springframework.boot.test.system.CapturedOutput;
 import org.springframework.boot.test.system.OutputCaptureExtension;
 import org.springframework.mock.env.MockEnvironment;
@@ -71,7 +73,10 @@ class EnvironmentFingerprintGuardTest {
                 // Phase 382: prod must run Turnstile with a real (non-test) secret.
                 .withProperty("app.turnstile.enabled", "true")
                 .withProperty("app.turnstile.secret-key", TURNSTILE_REAL_SECRET)
-                .withProperty("app.turnstile.siteverify-url", TURNSTILE_SITEVERIFY_URL);
+                .withProperty("app.turnstile.siteverify-url", TURNSTILE_SITEVERIFY_URL)
+                // Phase 401 audit-fix: prod pins both widget actions (prod-turnstile-action).
+                .withProperty("app.turnstile.expected-action", "otp_send")
+                .withProperty("app.turnstile.review-expected-action", "review_submit");
         env.setActiveProfiles("prod");
         return env;
     }
@@ -1146,6 +1151,29 @@ class EnvironmentFingerprintGuardTest {
                     .isInstanceOf(IllegalStateException.class)
                     .hasMessageContaining("prod-turnstile-siteverify-url");
         }
+    }
+
+    @ParameterizedTest(name = "[{index}] {0}=''{1}''")
+    @CsvSource(delimiter = '|', value = {
+            "app.turnstile.expected-action|''", "app.turnstile.expected-action|'   '",
+            "app.turnstile.expected-action|review_submit",
+            "app.turnstile.review-expected-action|''", "app.turnstile.review-expected-action|otp_send"})
+    @DisplayName("prod with a blank or swapped Turnstile action fails naming prod-turnstile-action")
+    void should_fail_when_prodTurnstileActionBlankOrWrong(String property, String value) {
+        MockEnvironment env = prodEnv().withProperty(property, value);
+
+        assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("prod-turnstile-action");
+    }
+
+    @Test
+    @DisplayName("prod,staging (STAGING) leaves both Turnstile actions empty — prod-turnstile-action does not apply")
+    void should_pass_when_stagingTurnstileActionsEmpty() {
+        MockEnvironment env = stagingEnv().withProperty("app.turnstile.expected-action", "")
+                .withProperty("app.turnstile.review-expected-action", "");
+
+        assertThatCode(() -> run(env, DeployEnvironment.STAGING, SmsMode.CAPTURE)).doesNotThrowAnyException();
     }
 
     @Test

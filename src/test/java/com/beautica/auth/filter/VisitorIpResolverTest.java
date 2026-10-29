@@ -55,4 +55,38 @@ class VisitorIpResolverTest {
         assertThat(resolver(KEY).resolve(request(KEY, "evil.example.com"))).isEqualTo("198.51.100.20");
         assertThat(resolver(KEY).resolve(request(KEY, null))).isEqualTo("198.51.100.20");
     }
+
+    @Test
+    @DisplayName("should_preferBeauticaClientIp_when_workerKeyMatches")
+    void should_preferBeauticaClientIp_when_workerKeyMatches() {
+        MockHttpServletRequest both = request(KEY, "203.0.113.7");
+        both.addHeader("X-Beautica-Client-IP", "198.51.100.77");
+        MockHttpServletRequest clientIpOnly = request(KEY, null);
+        clientIpOnly.addHeader("X-Beautica-Client-IP", "198.51.100.78");
+        MockHttpServletRequest badClientIp = request(KEY, "203.0.113.8");
+        badClientIp.addHeader("X-Beautica-Client-IP", "not-an-ip");
+
+        String fromBoth = resolver(KEY).resolve(both);
+        String fromClientIpOnly = resolver(KEY).resolve(clientIpOnly);
+        String fromBadClientIp = resolver(KEY).resolve(badClientIp);
+
+        assertThat(fromBoth).isEqualTo("198.51.100.77");
+        assertThat(fromClientIpOnly).isEqualTo("198.51.100.78");
+        assertThat(fromBadClientIp).isEqualTo("203.0.113.8");
+    }
+
+    @Test
+    @DisplayName("should_ignoreBeauticaClientIp_when_workerKeyMissingOrWrong")
+    void should_ignoreBeauticaClientIp_when_workerKeyMissingOrWrong() {
+        MockHttpServletRequest noKey = request(null, null);
+        noKey.addHeader("X-Beautica-Client-IP", "198.51.100.77");
+        MockHttpServletRequest wrongKey = request("wrong-key-wrong-key-wrong-key-wrong-key", null);
+        wrongKey.addHeader("X-Beautica-Client-IP", "198.51.100.77");
+
+        String fromNoKey = resolver(KEY).resolve(noKey);
+        String fromWrongKey = resolver(KEY).resolve(wrongKey);
+
+        assertThat(fromNoKey).isEqualTo("198.51.100.20");
+        assertThat(fromWrongKey).isEqualTo("198.51.100.20");
+    }
 }

@@ -54,6 +54,8 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
@@ -1030,5 +1032,189 @@ class ReviewServiceTest {
                         .isEqualTo(HttpStatus.BAD_REQUEST));
 
         verify(reviewRepository, never()).findIdsBySalonIdOrderByCreatedAtDesc(any(), any());
+    }
+
+    // ── createGuestLinkReviews (phase 401 D3/D5) ─────────────────────────────
+
+    private Booking guestLinkBooking(BookingStatus status) {
+        return guestLinkBooking(BOOKING_ID, status);
+    }
+
+    private Booking guestLinkBooking(UUID bookingId, BookingStatus status) {
+        Master master = mock(Master.class);
+        lenient().when(master.getId()).thenReturn(MASTER_ID);
+        User masterUser = mock(User.class);
+        lenient().when(masterUser.getId()).thenReturn(MASTER_USER_ID);
+        lenient().when(master.getUser()).thenReturn(masterUser);
+        Booking booking = mock(Booking.class);
+        lenient().when(booking.getId()).thenReturn(bookingId);
+        lenient().when(booking.getStatus()).thenReturn(status);
+        lenient().when(booking.getMaster()).thenReturn(master);
+        lenient().when(booking.getSalon()).thenReturn(null);
+        lenient().when(booking.getGuestName()).thenReturn("Олена");
+        lenient().when(booking.getGuestSurname()).thenReturn("Кравець");
+        return booking;
+    }
+
+    private static List<GuestLinkReviewDraft> drafts(Booking booking, int rating, String comment) {
+        return List.of(new GuestLinkReviewDraft(booking, rating, comment));
+    }
+
+    @Test
+    @DisplayName("should_saveGuestLinkReviewAndAnnounce_when_guestBookingCompleted")
+    void should_saveGuestLinkReviewAndAnnounce_when_guestBookingCompleted() {
+        Booking booking = guestLinkBooking(BookingStatus.COMPLETED);
+        Review saved = mock(Review.class);
+        when(saved.getId()).thenReturn(REVIEW_ID);
+        when(reviewRepository.findReviewedBookingIds(List.of(BOOKING_ID))).thenReturn(List.of());
+        stubSaveAll(saved);
+
+        reviewService.createGuestLinkReviews(drafts(booking, 4, "Добре"));
+
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<List<Review>> captor = ArgumentCaptor.forClass(List.class);
+        verify(reviewRepository).saveAll(captor.capture());
+        verify(reviewRepository).flush();
+        assertThat(captor.getValue()).hasSize(1);
+        Review written = captor.getValue().get(0);
+        assertThat(written.getSource()).isEqualTo(com.beautica.review.entity.ReviewSource.GUEST_LINK);
+        assertThat(written.getClient()).isNull();
+        assertThat(written.getGuestDisplayName()).isEqualTo("Олена К.");
+        assertThat(written.getRating()).isEqualTo((short) 4);
+        assertThat(written.getComment()).isEqualTo("Добре");
+        verify(eventPublisher).publishEvent(new ReviewCreatedEvent(MASTER_ID, MASTER_USER_ID, null, null));
+        verify(inAppNotificationService).notifyReviewReceived(REVIEW_ID, booking, null);
+    }
+
+    @Test
+    @DisplayName("should_checkDuplicatesInOneQuery_when_severalGuestItemsSubmitted")
+    void should_checkDuplicatesInOneQuery_when_severalGuestItemsSubmitted() {
+        UUID secondId = UUID.randomUUID();
+        UUID thirdId = UUID.randomUUID();
+        Booking first = guestLinkBooking(BOOKING_ID, BookingStatus.COMPLETED);
+        Booking second = guestLinkBooking(secondId, BookingStatus.COMPLETED);
+        Booking third = guestLinkBooking(thirdId, BookingStatus.COMPLETED);
+        Review saved = mock(Review.class);
+        when(saved.getId()).thenReturn(REVIEW_ID);
+        when(reviewRepository.findReviewedBookingIds(List.of(BOOKING_ID, secondId, thirdId))).thenReturn(List.of());
+        stubSaveAll(saved);
+
+        reviewService.createGuestLinkReviews(List.of(new GuestLinkReviewDraft(first, 5, null),
+                new GuestLinkReviewDraft(second, 4, null), new GuestLinkReviewDraft(third, 3, null)));
+
+        verify(reviewRepository).findReviewedBookingIds(List.of(BOOKING_ID, secondId, thirdId));
+        verify(reviewRepository, never()).existsByBookingId(any());
+        // Phase 401 audit-fix cycle 2: one batch insert + one flush, never a flush per item.
+        verify(reviewRepository).saveAll(argThat((List<Review> l) -> l.size() == 3));
+        verify(reviewRepository).flush();
+        verify(reviewRepository, never()).saveAndFlush(any());
+    }
+
+    @Test
+    @DisplayName("should_publishOneRatingEventPerProvider_but_notifyPerBooking_when_severalGuestItemsSubmitted")
+    void should_publishOneRatingEventPerProvider_but_notifyPerBooking_when_severalGuestItemsSubmitted() {
+        UUID secondId = UUID.randomUUID();
+        UUID thirdId = UUID.randomUUID();
+        Booking first = guestLinkBooking(BOOKING_ID, BookingStatus.COMPLETED);
+        Booking second = guestLinkBooking(secondId, BookingStatus.COMPLETED);
+        Booking third = guestLinkBooking(thirdId, BookingStatus.COMPLETED);
+        Review saved = mock(Review.class);
+        when(saved.getId()).thenReturn(REVIEW_ID);
+        when(reviewRepository.findReviewedBookingIds(any())).thenReturn(List.of());
+        stubSaveAll(saved);
+
+        reviewService.createGuestLinkReviews(List.of(new GuestLinkReviewDraft(first, 5, null),
+                new GuestLinkReviewDraft(second, 4, null), new GuestLinkReviewDraft(third, 3, null)));
+
+        verify(eventPublisher, org.mockito.Mockito.times(1)).publishEvent(any(Object.class));
+        verify(eventPublisher).publishEvent(new ReviewCreatedEvent(MASTER_ID, MASTER_USER_ID, null, null));
+        verify(inAppNotificationService).notifyReviewReceived(REVIEW_ID, first, null);
+        verify(inAppNotificationService).notifyReviewReceived(REVIEW_ID, second, null);
+        verify(inAppNotificationService).notifyReviewReceived(REVIEW_ID, third, null);
+    }
+
+    @Test
+    @DisplayName("should_throw409WithoutSaving_when_anyGuestItemAlreadyReviewed")
+    void should_throw409WithoutSaving_when_anyGuestItemAlreadyReviewed() {
+        UUID secondId = UUID.randomUUID();
+        Booking first = guestLinkBooking(BOOKING_ID, BookingStatus.COMPLETED);
+        Booking second = guestLinkBooking(secondId, BookingStatus.COMPLETED);
+        when(reviewRepository.findReviewedBookingIds(List.of(BOOKING_ID, secondId))).thenReturn(List.of(secondId));
+
+        assertThatThrownBy(() -> reviewService.createGuestLinkReviews(List.of(
+                new GuestLinkReviewDraft(first, 5, null), new GuestLinkReviewDraft(second, 3, null))))
+                .isInstanceOfSatisfying(BusinessException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(HttpStatus.CONFLICT));
+
+        verify(reviewRepository, never()).saveAll(any());
+        verify(eventPublisher, never()).publishEvent(any());
+    }
+
+    @Test
+    @DisplayName("should_throw409_when_guestReviewInsertRacesUniqueConstraint")
+    void should_throw409_when_guestReviewInsertRacesUniqueConstraint() {
+        Booking booking = guestLinkBooking(BookingStatus.COMPLETED);
+        when(reviewRepository.findReviewedBookingIds(List.of(BOOKING_ID))).thenReturn(List.of());
+        when(reviewRepository.saveAll(anyList())).thenAnswer(inv -> inv.getArgument(0));
+        org.mockito.Mockito.doThrow(new org.springframework.dao.DataIntegrityViolationException("ux_reviews_booking"))
+                .when(reviewRepository).flush();
+
+        assertThatThrownBy(() -> reviewService.createGuestLinkReviews(drafts(booking, 5, null)))
+                .isInstanceOfSatisfying(BusinessException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(HttpStatus.CONFLICT));
+
+        verify(eventPublisher, never()).publishEvent(any());
+    }
+
+    @Test
+    @DisplayName("should_throw400_when_guestBookingNotReviewable")
+    void should_throw400_when_guestBookingNotReviewable() {
+        Booking booking = guestLinkBooking(BookingStatus.CANCELLED);
+        when(reviewRepository.findReviewedBookingIds(List.of(BOOKING_ID))).thenReturn(List.of(BOOKING_ID));
+
+        // Same per-item precedence as the app path: eligibility (400) before the duplicate check (409).
+        assertThatThrownBy(() -> reviewService.createGuestLinkReviews(drafts(booking, 5, null)))
+                .isInstanceOfSatisfying(BusinessException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(HttpStatus.BAD_REQUEST));
+
+        verify(reviewRepository, never()).saveAll(any());
+    }
+
+    @Test
+    @DisplayName("should_announceSalonOnce_when_salonVisitServedBySeveralMasters")
+    void should_announceSalonOnce_when_salonVisitServedBySeveralMasters() {
+        UUID secondId = UUID.randomUUID();
+        UUID secondMasterId = UUID.randomUUID();
+        UUID secondMasterUserId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        Salon salon = mock(Salon.class);
+        when(salon.getId()).thenReturn(salonId);
+        Booking first = guestLinkBooking(BOOKING_ID, BookingStatus.COMPLETED);
+        when(first.getSalon()).thenReturn(salon);
+        Booking second = guestLinkBooking(secondId, BookingStatus.COMPLETED);
+        when(second.getSalon()).thenReturn(salon);
+        Master secondMaster = mock(Master.class);
+        when(secondMaster.getId()).thenReturn(secondMasterId);
+        User secondMasterUser = mock(User.class);
+        when(secondMasterUser.getId()).thenReturn(secondMasterUserId);
+        when(secondMaster.getUser()).thenReturn(secondMasterUser);
+        when(second.getMaster()).thenReturn(secondMaster);
+        Review saved = mock(Review.class);
+        when(saved.getId()).thenReturn(REVIEW_ID);
+        when(reviewRepository.findReviewedBookingIds(any())).thenReturn(List.of());
+        stubSaveAll(saved);
+
+        reviewService.createGuestLinkReviews(List.of(new GuestLinkReviewDraft(first, 5, null),
+                new GuestLinkReviewDraft(second, 4, null)));
+
+        verify(eventPublisher, org.mockito.Mockito.times(2)).publishEvent(any(Object.class));
+        verify(eventPublisher).publishEvent(new ReviewCreatedEvent(MASTER_ID, MASTER_USER_ID, salonId, null));
+        verify(eventPublisher).publishEvent(
+                new ReviewCreatedEvent(secondMasterId, secondMasterUserId, null, null));
+    }
+
+    private void stubSaveAll(Review saved) {
+        when(reviewRepository.saveAll(anyList()))
+                .thenAnswer(inv -> ((List<?>) inv.getArgument(0)).stream().map(r -> saved).toList());
     }
 }

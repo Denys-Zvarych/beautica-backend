@@ -486,6 +486,29 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
         } else if (TURNSTILE_TEST_SECRET.matcher(secret.strip()).matches()) {
             violations.add("rule prod-turnstile-secret-test-key: TURNSTILE_SECRET_KEY must not be a Cloudflare test secret in prod");
         }
+        checkProdTurnstileActions(env, violations);
+    }
+
+    /** The widget actions the website renders (application-prod.yml); Cloudflare echoes them back in siteverify. */
+    static final String TURNSTILE_OTP_ACTION = "otp_send";
+    static final String TURNSTILE_REVIEW_ACTION = "review_submit";
+
+    /**
+     * Phase 401 audit-fix. An empty expected action switches the siteverify action check off ({@code TurnstileVerifier}),
+     * so a token solved for one widget would be accepted by the other route. In prod both must be the exact actions the
+     * website renders: {@value #TURNSTILE_OTP_ACTION} (OTP send) and {@value #TURNSTILE_REVIEW_ACTION} (guest review
+     * page). Names the rule and properties only.
+     */
+    private static void checkProdTurnstileActions(Environment env, List<String> violations) {
+        if (!TURNSTILE_OTP_ACTION.equals(stripped(boundOrNull(env, "app.turnstile.expected-action")))
+                || !TURNSTILE_REVIEW_ACTION.equals(stripped(boundOrNull(env, "app.turnstile.review-expected-action")))) {
+            violations.add("rule prod-turnstile-action: app.turnstile.expected-action must be " + TURNSTILE_OTP_ACTION
+                    + " and app.turnstile.review-expected-action must be " + TURNSTILE_REVIEW_ACTION + " in prod");
+        }
+    }
+
+    private static String stripped(String value) {
+        return value == null ? null : value.strip();
     }
 
     /** Lower-cased domain of an e-mail address, trailing dot removed. */

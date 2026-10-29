@@ -280,6 +280,13 @@ public class SecurityConfig {
                     // path shape from POST /api/v1/book/*/booking (slug, then literal
                     // "booking"), so the two matchers cannot shadow or collide with each other.
                     auth.requestMatchers(HttpMethod.POST, "/api/v1/book/cancel/*").permitAll();
+                    // Phase 401 — guest review page (beautica.app/r/{token}). No account and no OTP: the one-time
+                    // invite token in the path is the credential, validated in GuestReviewService; Turnstile + the
+                    // per-IP AuthRateLimitFilter buckets guard it. Exact shapes only: the read, the submit, the opt-out.
+                    auth.requestMatchers(HttpMethod.GET, "/api/v1/public/review-invites/*").permitAll();
+                    auth.requestMatchers(HttpMethod.HEAD, "/api/v1/public/review-invites/*").permitAll();
+                    auth.requestMatchers(HttpMethod.POST, "/api/v1/public/review-invites/*/reviews").permitAll();
+                    auth.requestMatchers(HttpMethod.POST, "/api/v1/public/review-invites/*/opt-out").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/salons/{salonId}/portfolio").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/masters/{masterId}/portfolio").permitAll();
                     // Internal management API — authenticated by InternalApiKeyFilter (X-Internal-Key header),

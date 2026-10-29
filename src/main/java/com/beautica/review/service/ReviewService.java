@@ -38,12 +38,15 @@ import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
 import java.time.Clock;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -92,20 +95,7 @@ public class ReviewService {
             throw new ForbiddenException("Not authorized to review this booking");
         }
 
-        // Locked product decision: a booking that entered the client's "Past" tab BY ELAPSED TIME
-        // is reviewable even when the provider never marked it COMPLETED — mirrors
-        // BookingService#canReview exactly (same BookingClosureRule#isReviewEligible call), so a
-        // client offered the canReview CTA can never land here and get rejected. NOT_COMPLETED /
-        // CANCELLED / DECLINED stay unreviewable regardless of endsAt — see that method's javadoc.
-        if (!BookingClosureRule.isReviewEligible(booking.getStatus(), booking.getEndsAt(), resolveNow())) {
-            throw new BusinessException(HttpStatus.BAD_REQUEST,
-                    "This booking is not yet eligible for a review");
-        }
-
-        if (reviewRepository.existsByBookingId(booking.getId())) {
-            throw new BusinessException(HttpStatus.CONFLICT,
-                    "Review already exists for this booking");
-        }
+        requireReviewable(booking);
 
         Review review = Review.builder()
                 .booking(booking)
@@ -116,13 +106,145 @@ public class ReviewService {
                 .comment(request.comment())
                 .build();
 
-        Review saved;
-        try {
-            saved = reviewRepository.saveAndFlush(review);
-        } catch (DataIntegrityViolationException e) {
-            throw new BusinessException(HttpStatus.CONFLICT,
-                    "Review already exists for this booking");
+        Review saved = saveAndAnnounce(review, booking, clientId);
+        // The caller just wrote it (phase 395 authoredByViewer).
+        return ReviewResponse.from(saved).withAuthoredByViewer(true);
+    }
+
+    /**
+     * Phase 401 D3/D5 — the guest-link twin of {@link #createReview}: same eligibility gate, same one-review-per-booking
+     * rule (409), same persistence, rating-recalculation event and provider notification — only the author differs (no
+     * account; the «Ім'я П.» snapshot built by {@link Review#guestLinkReview}). The caller ({@code GuestReviewService})
+     * has already proved every booking is a COMPLETED LINK guest booking of the invite (D5a) and validated rating/comment
+     * with the same Bean Validation rules as {@code CreateReviewRequest}. Joins the caller's transaction (the invite
+     * consume, D4), so a 400/409 on any item rolls the whole submit back.
+     *
+     * <p>Phase 401 audit-fix (perf LOW): the duplicate check is ONE {@code findReviewedBookingIds} over the whole
+     * submit, not one {@code existsByBookingId} per item. Items are still checked in submission order with the same
+     * per-item precedence as {@link #requireReviewable} (eligibility 400 before duplicate 409), and the UNIQUE
+     * constraint on {@code reviews.booking_id} still turns a concurrent insert into the same 409.
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void createGuestLinkReviews(List<GuestLinkReviewDraft> drafts) {
+        Set<UUID> alreadyReviewed = new HashSet<>(reviewRepository.findReviewedBookingIds(
+                drafts.stream().map(d -> d.booking().getId()).toList()));
+        OffsetDateTime now = resolveNow();
+        for (GuestLinkReviewDraft draft : drafts) {
+            Booking booking = draft.booking();
+            requireEligible(booking, now);
+            if (alreadyReviewed.contains(booking.getId())) {
+                throw reviewAlreadyExists();
+            }
         }
+        // Phase 401 audit-fix (perf MEDIUM): ONE ReviewCreatedEvent per distinct provider of the submit, published
+        // after every row is written, so the AFTER_COMMIT ReviewEventListener runs one master + one salon
+        // recalculation (each already counting every review of this commit) and one round of cache evictions —
+        // never N identical ones. The notification stays per booking (architect D10).
+        //
+        // Coalesced HERE, not in the listener: Spring dispatches AFTER_COMMIT listeners from afterCompletion, after
+        // the transaction's synchronizations are cleared, so a listener-side "already handled in this transaction"
+        // set has no transaction to live in (GuestReviewRatingCoalescingIT caught exactly that).
+        List<Review> saved = persistAll(drafts.stream()
+                .map(d -> Review.guestLinkReview(d.booking(), (short) d.rating(), d.comment(),
+                        d.booking().getGuestName(), d.booking().getGuestSurname()))
+                .toList());
+        Set<ProviderKey> announcedProviders = new HashSet<>();
+        Set<UUID> announcedSalons = new HashSet<>();
+        List<ReviewCreatedEvent> ratingEvents = new ArrayList<>();
+        for (int i = 0; i < drafts.size(); i++) {
+            Booking booking = drafts.get(i).booking();
+            ReviewCreatedEvent event = ratingEventFor(booking, null);
+            if (announcedProviders.add(new ProviderKey(event.masterId(), event.salonId()))) {
+                ratingEvents.add(withSalonOnce(event, announcedSalons));
+            }
+            inAppNotificationService.notifyReviewReceived(saved.get(i).getId(), booking, null);
+        }
+        ratingEvents.forEach(eventPublisher::publishEvent);
+    }
+
+    /** One (master, salon-at-booking-time) pair of a guest submit — the rating-event dedup key. */
+    private record ProviderKey(UUID masterId, UUID salonId) {}
+
+    /**
+     * Phase 401 audit-fix cycle 2 (perf LOW): a salon visit served by K masters yields K master events but must
+     * recalculate / evict its salon ONCE — the first event for a salon carries its id, every later one carries
+     * {@code null} (the listener skips the salon branch on null; the passport evictor reads only {@code clientId}).
+     */
+    private static ReviewCreatedEvent withSalonOnce(ReviewCreatedEvent event, Set<UUID> announcedSalons) {
+        if (event.salonId() == null || announcedSalons.add(event.salonId())) {
+            return event;
+        }
+        return new ReviewCreatedEvent(event.masterId(), event.masterUserId(), null, event.clientId());
+    }
+
+    /**
+     * The eligibility half shared by both create paths. Locked product decision: a booking that entered the client's
+     * "Past" tab BY ELAPSED TIME is reviewable even when the provider never marked it COMPLETED — mirrors
+     * BookingService#canReview exactly (same BookingClosureRule#isReviewEligible call), so a client offered the
+     * canReview CTA can never land here and get rejected. NOT_COMPLETED / CANCELLED / DECLINED stay unreviewable
+     * regardless of endsAt — see that method's javadoc.
+     */
+    private void requireReviewable(Booking booking) {
+        requireEligible(booking, resolveNow());
+
+        if (reviewRepository.existsByBookingId(booking.getId())) {
+            throw reviewAlreadyExists();
+        }
+    }
+
+    private static void requireEligible(Booking booking, OffsetDateTime now) {
+        if (!BookingClosureRule.isReviewEligible(booking.getStatus(), booking.getEndsAt(), now)) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST,
+                    "This booking is not yet eligible for a review");
+        }
+    }
+
+    private static BusinessException reviewAlreadyExists() {
+        return new BusinessException(HttpStatus.CONFLICT, "Review already exists for this booking");
+    }
+
+    /**
+     * The persistence + side-effect half shared by both create paths.
+     *
+     * @param authorClientId the authoring CLIENT ({@code users.id}), or {@code null} for a guest-link review
+     */
+    private Review saveAndAnnounce(Review review, Booking booking, UUID authorClientId) {
+        Review saved = persist(review);
+        eventPublisher.publishEvent(ratingEventFor(booking, authorClientId));
+        // Phase 333, matrix row 8 — the rated master + the business owner (never admins). The
+        // reviewing CLIENT is the actor and is excluded (a guest author has no account: null, a
+        // no-op). `booking` is already the caller's own loaded, managed entity (item 8 of the
+        // audit-fix cycle 1 backlog) — never reloaded (audit-fix cycle 1, finding 1).
+        inAppNotificationService.notifyReviewReceived(saved.getId(), booking, authorClientId);
+        return saved;
+    }
+
+    /** Insert + flush; a concurrent insert for the same booking hits the UNIQUE booking_id → the same 409. */
+    private Review persist(Review review) {
+        try {
+            return reviewRepository.saveAndFlush(review);
+        } catch (DataIntegrityViolationException e) {
+            throw reviewAlreadyExists();
+        }
+    }
+
+    /**
+     * Guest-path batch insert: one {@code saveAll} + ONE flush (phase 401 audit-fix cycle 2, perf INFO) instead of a
+     * flush per item. A concurrent insert for any booking of the batch hits the UNIQUE booking_id → the same 409,
+     * and the caller's transaction (with the invite consume) rolls back as a whole.
+     */
+    private List<Review> persistAll(List<Review> reviews) {
+        try {
+            List<Review> saved = reviewRepository.saveAll(reviews);
+            reviewRepository.flush();
+            return saved;
+        } catch (DataIntegrityViolationException e) {
+            throw reviewAlreadyExists();
+        }
+    }
+
+    /** The rating-recalculation / cache-eviction event for a review of {@code booking}. */
+    private static ReviewCreatedEvent ratingEventFor(Booking booking, UUID authorClientId) {
         // booking.getSalon() is already populated on Review.salon by the builder above
         // (verified: createReview sets .salon(booking.getSalon()), not a lazy re-derivation
         // from master.getSalon() — booking.salon is the source of truth for "which salon
@@ -134,27 +256,20 @@ public class ReviewService {
         // getUser() are both fully hydrated entities in this persistence context — not proxies —
         // and getId() reads an in-memory field. No lazy initialisation, no extra statement on the
         // review-create path.
-        // clientId is the AUTHOR (this method's authenticated principal argument), carried so
-        // ClientPassportCacheEvictor can drop that client's cached BEAUTY PASSPORT — its
-        // reviewsWritten line just changed. Costs nothing: it is already a parameter.
+        // authorClientId is the AUTHOR, carried so ClientPassportCacheEvictor can drop that
+        // client's cached BEAUTY PASSPORT — its reviewsWritten line just changed. null for a
+        // guest-link review (no account, no passport; the evictor is null-safe).
         // V157 / phase 294 D1: masters.user_id is nullable. A review can only be written against a
         // COMPLETED booking whose provider is still live, so this is null in no reachable flow
         // today — but a null here would NPE on a write path rather than fail a guard, so the read
         // is guarded and the userId-keyed cache eviction is simply skipped for a detached master
         // (there is no GET /masters/me for a deleted account to serve stale).
         User masterUser = booking.getMaster().getUser();
-        eventPublisher.publishEvent(new ReviewCreatedEvent(
+        return new ReviewCreatedEvent(
                 booking.getMaster().getId(),
                 masterUser != null ? masterUser.getId() : null,
                 salonId,
-                clientId));
-        // Phase 333, matrix row 8 — the rated master + the business owner (never admins). The
-        // reviewing CLIENT is the actor and is excluded. `booking` is already the caller's own
-        // loaded, managed entity (item 8 of the audit-fix cycle 1 backlog) — never reloaded
-        // (audit-fix cycle 1, finding 1).
-        inAppNotificationService.notifyReviewReceived(saved.getId(), booking, clientId);
-        // The caller just wrote it (phase 395 authoredByViewer).
-        return ReviewResponse.from(saved).withAuthoredByViewer(true);
+                authorClientId);
     }
 
     private static final int MAX_PAGE_NUMBER = 10_000;

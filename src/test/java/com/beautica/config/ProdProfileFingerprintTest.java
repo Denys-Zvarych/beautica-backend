@@ -248,6 +248,7 @@ class ProdProfileFingerprintTest {
             assertThat(env.getProperty("app.turnstile.expected-hostnames[0]")).isEqualTo("beautica.app");
             assertThat(env.getProperty("app.turnstile.expected-hostnames[1]")).isEqualTo("www.beautica.app");
             assertThat(env.getProperty("app.turnstile.expected-action")).isEqualTo("otp_send");
+            assertThat(env.getProperty("app.turnstile.review-expected-action")).isEqualTo("review_submit");
         });
     }
 
@@ -303,6 +304,17 @@ class ProdProfileFingerprintTest {
     }
 
     @Test
+    @DisplayName("Phase 401 — an override blanking either Turnstile action fails boot on prod-turnstile-action")
+    void should_failGuard_when_prodTurnstileActionBlankedByEnvOverride() {
+        for (String override : new String[] {"app.turnstile.expected-action=", "app.turnstile.review-expected-action="}) {
+            prodRunnerWithout("").withPropertyValues(override).run(ctx -> assertThatThrownBy(
+                            () -> EnvironmentFingerprintGuard.verify(ctx.getEnvironment()))
+                    .as(override)
+                    .hasMessageContaining("rule prod-turnstile-action"));
+        }
+    }
+
+    @Test
     @DisplayName("Phase 382 — an env override cannot switch Turnstile off in prod: prod-turnstile-disabled")
     void should_failGuard_when_prodTurnstileDisabledByEnvOverride() {
         prodRunnerWithout("").withPropertyValues("app.turnstile.enabled=false").run(ctx -> assertThatThrownBy(
@@ -322,6 +334,7 @@ class ProdProfileFingerprintTest {
                     assertThat(env.getProperty("app.turnstile.secret-key"))
                             .isEqualTo("1x0000000000000000000000000000000AA");
                     assertThat(env.getProperty("app.turnstile.expected-action")).isEmpty();
+                    assertThat(env.getProperty("app.turnstile.review-expected-action")).isEmpty();
                 });
     }
 
