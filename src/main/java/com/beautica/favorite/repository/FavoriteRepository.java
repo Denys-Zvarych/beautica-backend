@@ -42,6 +42,36 @@ public interface FavoriteRepository extends JpaRepository<Favorite, UUID> {
     boolean existsByClientIdAndTargetTypeAndTargetId(
             UUID clientId, FavoriteTargetType targetType, UUID targetId);
 
+    /**
+     * The single-row membership probe behind the profile {@code isFavorite}
+     * ({@code GET /masters/{id}}, {@code GET /salons/{id}}, via {@code ProviderFavoriteDecorator}).
+     *
+     * <p>Unlike the derived {@link #existsByClientIdAndTargetTypeAndTargetId} — which Hibernate
+     * renders as {@code SELECT f.id ... FETCH FIRST 1}, dragging the non-indexed {@code id} column
+     * in and forcing a heap visit — this selects only a constant, so every referenced column is in
+     * {@code uq_favorite (client_id, target_type, target_id)} and Postgres can answer it with an
+     * index-only scan. Pinned by {@code ProviderFavoriteCacheIT} via {@code EXPLAIN}.
+     */
+    String FAVORITE_EXISTS_SQL = """
+            SELECT EXISTS (
+                SELECT 1 FROM favorites
+                WHERE client_id = :clientId
+                  AND target_type = :targetType
+                  AND target_id = :targetId
+            )
+            """;
+
+    @Transactional(readOnly = true)
+    @Query(value = FAVORITE_EXISTS_SQL, nativeQuery = true)
+    boolean existsFavoriteRow(@Param("clientId") UUID clientId,
+                              @Param("targetType") String targetType,
+                              @Param("targetId") UUID targetId);
+
+    /** Typed entry point for {@link #existsFavoriteRow}: the enum is bound by its stored name. */
+    default boolean isFavorited(UUID clientId, FavoriteTargetType targetType, UUID targetId) {
+        return existsFavoriteRow(clientId, targetType.name(), targetId);
+    }
+
     Optional<Favorite> findByClientIdAndTargetTypeAndTargetId(
             UUID clientId, FavoriteTargetType targetType, UUID targetId);
 
@@ -618,6 +648,9 @@ public interface FavoriteRepository extends JpaRepository<Favorite, UUID> {
      * = {@code service_definitions.id} values, salon-service-favourites track), NOT the wish-list
      * page above. Renamed from a {@code SERVICE}-implicit method to an explicit {@code targetType}
      * parameter for exactly this reuse — every caller now states which arm it means.
+     * Also backs the per-page {@code isFavorite} on {@code GET /search/masters} ({@code MASTER})
+     * and {@code GET /search/salons} ({@code SALON}) via {@code ProviderFavoriteDecorator}; renamed
+     * from {@code findFavoritedServiceIds} because it was never service-specific.
      *
      * <p><b>One statement, membership tested in memory</b> against the returned {@link Set} —
      * deliberately not {@code existsBy…} per row (N+1) and not {@link #findFavoriteServiceRows}
@@ -656,7 +689,7 @@ public interface FavoriteRepository extends JpaRepository<Favorite, UUID> {
               AND f.targetType = :targetType
               AND f.targetId IN :targetIds
             """)
-    Set<UUID> findFavoritedServiceIds(@Param("clientId") UUID clientId,
+    Set<UUID> findFavoritedTargetIds(@Param("clientId") UUID clientId,
                                        @Param("targetType") FavoriteTargetType targetType,
                                        @Param("targetIds") Collection<UUID> targetIds);
 }

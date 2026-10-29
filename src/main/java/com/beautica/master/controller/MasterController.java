@@ -1,5 +1,6 @@
 package com.beautica.master.controller;
 
+import com.beautica.common.web.PerViewerResponses;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.booking.dto.AvailableSlotResponse;
 import com.beautica.booking.dto.BookingResponse;
@@ -10,6 +11,7 @@ import com.beautica.common.ApiResponse;
 import com.beautica.common.PageResponse;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.security.AuthenticationUtils;
+import com.beautica.favorite.service.ProviderFavoriteDecorator;
 import com.beautica.master.dto.MasterDetailResponse;
 import com.beautica.master.dto.MasterProfileUpdateRequest;
 import com.beautica.master.dto.MasterPublicProfileResponse;
@@ -68,6 +70,7 @@ public class MasterController {
     private final SlotCalculationService slotCalculationService;
     private final ScheduleOverrideConflictService scheduleOverrideConflictService;
     private final UserService userService;
+    private final ProviderFavoriteDecorator providerFavoriteDecorator;
 
     /**
      * The authenticated provider's own master profile.
@@ -129,10 +132,19 @@ public class MasterController {
      * {@code INDEPENDENT_MASTER} — an independent master's address is their discoverable
      * business location, matching what {@code GET /masters/me} / {@code GET /independent-masters/me}
      * return to the master themselves. {@code phoneNumber} is always masked on this endpoint.
+     *
+     * <p>{@code isFavorite} is attached HERE, after the shared {@code master-detail} cache read,
+     * by {@link ProviderFavoriteDecorator} — never inside the cached service method, which would
+     * leak one client's favourite to every other caller.
      */
     @GetMapping("/{masterId}")
-    public ApiResponse<MasterDetailResponse> getMasterDetail(@PathVariable UUID masterId) {
-        return ApiResponse.ok(MasterDetailResponse.fromPublic(masterService.getMasterDetail(masterId)));
+    public ResponseEntity<ApiResponse<MasterDetailResponse>> getMasterDetail(
+            @PathVariable UUID masterId, Authentication authentication) {
+        MasterDetailResponse publicDetail =
+                MasterDetailResponse.fromPublic(masterService.getMasterDetail(masterId));
+        // Per-viewer body (isFavorite) on a shared public route → no-store + Vary: Authorization.
+        return PerViewerResponses.ok(
+                ApiResponse.ok(providerFavoriteDecorator.decorate(publicDetail, authentication)));
     }
 
     @GetMapping("/by-salon/{salonId}")

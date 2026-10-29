@@ -1,5 +1,7 @@
 package com.beautica.master;
 
+import com.beautica.favorite.repository.FavoriteRepository;
+import com.beautica.favorite.service.ProviderFavoriteDecorator;
 import com.beautica.auth.AccessTokenDenylist;
 import com.beautica.auth.JwtAuthenticationFilter;
 import com.beautica.auth.JwtTokenProvider;
@@ -89,7 +91,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
         // definition by name — see that class's javadoc for why the exact runtime type matters.
         "spring.main.allow-bean-definition-overriding=true"})
 @EnableConfigurationProperties(com.beautica.config.PublicBaseUrlProperties.class)
-@Import({WebMvcTestSupport.class,
+@Import({WebMvcTestSupport.class, ProviderFavoriteDecorator.class,
         com.beautica.config.SecurityConfig.class,
         MasterMeSecurityMatcherTest.SecurityTestFilters.class})
 @DisplayName("SecurityConfig — GET /api/v1/masters/me must not fall through the {masterId} permitAll matcher")
@@ -162,6 +164,10 @@ class MasterMeSecurityMatcherTest {
 
     @MockBean
     private MasterService masterService;
+
+    /** Backs the real {@link ProviderFavoriteDecorator} the controller composes post-cache. */
+    @MockBean
+    private FavoriteRepository favoriteRepository;
 
     @MockBean
     private SlotCalculationService slotCalculationService;

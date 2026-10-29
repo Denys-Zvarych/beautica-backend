@@ -1,5 +1,7 @@
 package com.beautica.search.dto;
 
+import io.swagger.v3.oas.annotations.media.Schema;
+
 import java.math.BigDecimal;
 import java.util.List;
 import java.util.UUID;
@@ -116,8 +118,30 @@ public record MasterSearchResult(
         String street,
         String buildingNo,
         String locationNote,
-        List<String> matchedServiceNames
+        List<String> matchedServiceNames,
+        /**
+         * Whether the CALLER has favourited this master. Always {@code false} inside the search
+         * cache (shared across callers) and for anonymous/non-CLIENT callers; set per request,
+         * AFTER the cache read, by {@code ProviderFavoriteDecorator} with one batched query per
+         * page (Phase 243 pattern).
+         */
+        @Schema(defaultValue = "false", description = "Whether the signed-in CLIENT has favourited "
+                + "this master. Always false for anonymous and non-CLIENT callers. Decorated "
+                + "per request, after the cache read.")
+        boolean isFavorite
 ) {
+
+    /** Additive-field constructor: the caller-agnostic shape, {@code isFavorite = false}. */
+    public MasterSearchResult(
+            UUID masterId, String firstName, String lastName, String cityLabel,
+            String districtLabel, Double avgRating, Integer reviewCount, String avatarUrl,
+            BigDecimal minEffectivePrice, BigDecimal priceMax, List<String> serviceNames,
+            String street, String buildingNo, String locationNote,
+            List<String> matchedServiceNames) {
+        this(masterId, firstName, lastName, cityLabel, districtLabel, avgRating, reviewCount,
+                avatarUrl, minEffectivePrice, priceMax, serviceNames, street, buildingNo,
+                locationNote, matchedServiceNames, false);
+    }
 
     /**
      * Returns a copy with the auth-gated street-level fields ({@code street},
@@ -133,7 +157,16 @@ public record MasterSearchResult(
         return new MasterSearchResult(
                 masterId, firstName, lastName, cityLabel, districtLabel,
                 avgRating, reviewCount, avatarUrl, minEffectivePrice, priceMax,
-                serviceNames, null, null, null, matchedServiceNames
+                serviceNames, null, null, null, matchedServiceNames, isFavorite
+        );
+    }
+
+    /** Returns a copy carrying the caller-specific {@code isFavorite} (post-cache only). */
+    public MasterSearchResult withIsFavorite(boolean isFavorite) {
+        return new MasterSearchResult(
+                masterId, firstName, lastName, cityLabel, districtLabel,
+                avgRating, reviewCount, avatarUrl, minEffectivePrice, priceMax,
+                serviceNames, street, buildingNo, locationNote, matchedServiceNames, isFavorite
         );
     }
 }

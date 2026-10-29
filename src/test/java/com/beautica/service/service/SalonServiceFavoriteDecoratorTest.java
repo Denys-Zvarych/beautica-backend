@@ -135,7 +135,7 @@ class SalonServiceFavoriteDecoratorTest {
         SalonServiceCatalogResponse catalog =
                 catalogWith(group("MANICURE", stub(favourited), stub(notFavourited)));
         Authentication client = authenticatedAs(clientId, Role.CLIENT);
-        when(favoriteRepository.findFavoritedServiceIds(
+        when(favoriteRepository.findFavoritedTargetIds(
                 eq(clientId), eq(FavoriteTargetType.SALON_SERVICE), any()))
                 .thenReturn(Set.of(favourited));
 
@@ -164,7 +164,7 @@ class SalonServiceFavoriteDecoratorTest {
         SalonServiceCategoryGroup group2 = group("PEDICURE", stub(favouritedInGroup2));
         SalonServiceCatalogResponse catalog = new SalonServiceCatalogResponse(List.of(group1, group2));
         Authentication client = authenticatedAs(clientId, Role.CLIENT);
-        when(favoriteRepository.findFavoritedServiceIds(
+        when(favoriteRepository.findFavoritedTargetIds(
                 eq(clientId), eq(FavoriteTargetType.SALON_SERVICE), any()))
                 .thenReturn(Set.of(favouritedInGroup2));
 
@@ -189,7 +189,7 @@ class SalonServiceFavoriteDecoratorTest {
                 "MANICURE", "Манікюр", 1, List.of(original));
         SalonServiceCatalogResponse catalog = new SalonServiceCatalogResponse(List.of(originalGroup));
         Authentication client = authenticatedAs(clientId, Role.CLIENT);
-        when(favoriteRepository.findFavoritedServiceIds(
+        when(favoriteRepository.findFavoritedTargetIds(
                 eq(clientId), eq(FavoriteTargetType.SALON_SERVICE), any()))
                 .thenReturn(Set.of());
 
@@ -205,21 +205,21 @@ class SalonServiceFavoriteDecoratorTest {
     }
 
     @Test
-    @DisplayName("queries findFavoritedServiceIds with exactly the SALON_SERVICE target type — "
+    @DisplayName("queries findFavoritedTargetIds with exactly the SALON_SERVICE target type — "
             + "never SERVICE, the sibling MASTER-arm's target type")
     void should_queryWithSalonServiceTargetType_never_serviceTargetType() {
         UUID clientId = UUID.randomUUID();
         UUID serviceDefId = UUID.randomUUID();
         SalonServiceCatalogResponse catalog = catalogWith(group("MANICURE", stub(serviceDefId)));
         Authentication client = authenticatedAs(clientId, Role.CLIENT);
-        when(favoriteRepository.findFavoritedServiceIds(any(), any(), any())).thenReturn(Set.of());
+        when(favoriteRepository.findFavoritedTargetIds(any(), any(), any())).thenReturn(Set.of());
 
         decorator.decorate(catalog, client);
 
-        verify(favoriteRepository).findFavoritedServiceIds(
+        verify(favoriteRepository).findFavoritedTargetIds(
                 eq(clientId), eq(FavoriteTargetType.SALON_SERVICE), eq(List.of(serviceDefId)));
         verify(favoriteRepository, never())
-                .findFavoritedServiceIds(any(), eq(FavoriteTargetType.SERVICE), any());
+                .findFavoritedTargetIds(any(), eq(FavoriteTargetType.SERVICE), any());
     }
 
     // ── helpers ─────────────────────────────────────────────────────────────────

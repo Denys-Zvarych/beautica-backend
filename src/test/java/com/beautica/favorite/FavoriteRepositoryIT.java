@@ -14,7 +14,7 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * Integration coverage for {@link FavoriteRepository#findFavoritedServiceIds(UUID,
+ * Integration coverage for {@link FavoriteRepository#findFavoritedTargetIds(UUID,
  * FavoriteTargetType, java.util.Collection)} — the membership query backing the
  * {@code isFavorite} decoration on {@code GET /masters/{masterId}/services} (Phase 32.1 D5), run
  * against real Postgres.
@@ -24,7 +24,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * prove the JPQL itself is correct against a real schema — in particular the {@code targetType}
  * predicate, which is the one collision the polymorphic, FK-less {@code target_id} column can hit.
  */
-@DisplayName("FavoriteRepository.findFavoritedServiceIds — integration")
+@DisplayName("FavoriteRepository.findFavoritedTargetIds — integration")
 class FavoriteRepositoryIT extends AbstractIntegrationTest {
 
     @Autowired
@@ -33,7 +33,7 @@ class FavoriteRepositoryIT extends AbstractIntegrationTest {
     @Test
     @DisplayName("returns only the SERVICE-favourited ids that are also in the requested id set — a "
             + "mixed in/out set proves the IN predicate, not just 'client has some favourite'")
-    void should_returnOnlyMatchingIds_when_findFavoritedServiceIds() {
+    void should_returnOnlyMatchingIds_when_findFavoritedTargetIds() {
         UUID clientId = createClient("fav-repo-mixed-client@beautica.test");
         UUID master = createIndependentMaster("fav-repo-mixed-master@beautica.test");
         UUID favouritedInSet = createMasterService(master);
@@ -42,7 +42,7 @@ class FavoriteRepositoryIT extends AbstractIntegrationTest {
         insertFavorite(clientId, FavoriteTargetType.SERVICE, favouritedInSet);
         insertFavorite(clientId, FavoriteTargetType.SERVICE, favouritedNotInSet);
 
-        Set<UUID> result = favoriteRepository.findFavoritedServiceIds(
+        Set<UUID> result = favoriteRepository.findFavoritedTargetIds(
                 clientId, FavoriteTargetType.SERVICE, List.of(favouritedInSet, notFavouritedInSet));
 
         assertThat(result)
@@ -65,7 +65,7 @@ class FavoriteRepositoryIT extends AbstractIntegrationTest {
         // to stop.
         insertFavorite(clientId, FavoriteTargetType.MASTER, masterServiceId);
 
-        Set<UUID> result = favoriteRepository.findFavoritedServiceIds(
+        Set<UUID> result = favoriteRepository.findFavoritedTargetIds(
                 clientId, FavoriteTargetType.SERVICE, List.of(masterServiceId));
 
         assertThat(result)
@@ -99,7 +99,7 @@ class FavoriteRepositoryIT extends AbstractIntegrationTest {
         // row — nothing in the schema forbids this collision.
         insertFavorite(clientId, FavoriteTargetType.SALON_SERVICE, masterServiceId);
 
-        Set<UUID> result = favoriteRepository.findFavoritedServiceIds(
+        Set<UUID> result = favoriteRepository.findFavoritedTargetIds(
                 clientId, FavoriteTargetType.SERVICE, List.of(masterServiceId));
 
         assertThat(result)
@@ -118,7 +118,7 @@ class FavoriteRepositoryIT extends AbstractIntegrationTest {
         UUID masterServiceId = createMasterService(master);
         insertFavorite(clientId, FavoriteTargetType.SERVICE, masterServiceId);
 
-        Set<UUID> result = favoriteRepository.findFavoritedServiceIds(
+        Set<UUID> result = favoriteRepository.findFavoritedTargetIds(
                 clientId, FavoriteTargetType.SALON_SERVICE, List.of(masterServiceId));
 
         assertThat(result)
@@ -136,7 +136,7 @@ class FavoriteRepositoryIT extends AbstractIntegrationTest {
         UUID notFavourited = UUID.randomUUID();
         insertFavorite(clientId, FavoriteTargetType.SALON_SERVICE, salonServiceDefId);
 
-        Set<UUID> result = favoriteRepository.findFavoritedServiceIds(
+        Set<UUID> result = favoriteRepository.findFavoritedTargetIds(
                 clientId, FavoriteTargetType.SALON_SERVICE, List.of(salonServiceDefId, notFavourited));
 
         assertThat(result).containsExactly(salonServiceDefId);
@@ -149,7 +149,7 @@ class FavoriteRepositoryIT extends AbstractIntegrationTest {
         UUID master = createIndependentMaster("fav-repo-none-master@beautica.test");
         UUID masterServiceId = createMasterService(master);
 
-        Set<UUID> result = favoriteRepository.findFavoritedServiceIds(
+        Set<UUID> result = favoriteRepository.findFavoritedTargetIds(
                 clientId, FavoriteTargetType.SERVICE, List.of(masterServiceId));
 
         assertThat(result).isNotNull().isEmpty();

@@ -37,6 +37,11 @@ public record MasterDetailResponse(
         BigDecimal avgRating,
         int reviewCount,
         MasterType masterType,
+        /**
+         * The affiliated salon's public view. Its nested {@code salon.isFavorite} is ALWAYS
+         * {@code false}: only the top-level {@link #isFavorite} (this master) is decorated per
+         * caller; a client app must read the salon's own flag from {@code GET /salons/{id}}.
+         */
         PublicSalonResponse salon,
         List<WorkingHoursResponse> workingHours,
         // Locality cascade IDs — populated for authenticated callers only.
@@ -85,8 +90,41 @@ public record MasterDetailResponse(
         @Schema(types = {"string", "null"}, nullable = true, description = "Bare hromada adjective of the master's own "
                 + "settlement, populated only when its name is ambiguous within its oblast; null "
                 + "otherwise and wherever cityId is masked.")
-        String cityHromadaNameUk
+        String cityHromadaNameUk,
+        /**
+         * Whether the CALLER has favourited this master. {@code true}/{@code false} for an
+         * authenticated CLIENT; always {@code false} for anonymous and non-CLIENT callers.
+         *
+         * <p><b>Never set inside a cached factory.</b> {@code master-detail} is keyed by
+         * {@code masterId} alone and shared across every caller, so this flag is always
+         * {@code false} in the cached entry and attached per request, AFTER the cache read, by
+         * {@code ProviderFavoriteDecorator} through {@link #withIsFavorite} — the Phase 243
+         * pattern ({@code MasterServiceFavoriteDecorator}). Covers THIS master only — the nested
+         * {@code salon.isFavorite} is always {@code false}.
+         */
+        @Schema(defaultValue = "false", description = "Whether the signed-in CLIENT has favourited "
+                + "this master. Always false for anonymous and non-CLIENT callers. Decorated "
+                + "per request, after the cache read. The nested salon.isFavorite is always false.")
+        boolean isFavorite
 ) {
+    /**
+     * Additive-field constructor: every pre-existing call site builds the response without the
+     * caller-specific {@code isFavorite}, which then defaults to {@code false} — exactly the
+     * shape the cached factories must produce.
+     */
+    public MasterDetailResponse(
+            UUID masterId, String firstName, String lastName, String phoneNumber, String city,
+            String street, String buildingNo, String locationNote, String bio, String instagram,
+            String professionalTitle, String avatarUrl, BigDecimal avgRating, int reviewCount,
+            MasterType masterType, PublicSalonResponse salon, List<WorkingHoursResponse> workingHours,
+            UUID cityId, UUID oblastId, UUID districtId, Integer bookingsThisMonth, String region,
+            SettlementType citySettlementType, String cityHromadaNameUk) {
+        this(masterId, firstName, lastName, phoneNumber, city, street, buildingNo, locationNote,
+                bio, instagram, professionalTitle, avatarUrl, avgRating, reviewCount, masterType,
+                salon, workingHours, cityId, oblastId, districtId, bookingsThisMonth, region,
+                citySettlementType, cityHromadaNameUk, false);
+    }
+
     /**
      * Builds a fully-populated response including locality cascade IDs.
      *
@@ -196,7 +234,8 @@ public record MasterDetailResponse(
                 // name while publishing the oblast/hromada would leak the locality they hide.
                 isIndependent ? full.region() : null,
                 isIndependent ? full.citySettlementType() : null,
-                isIndependent ? full.cityHromadaNameUk() : null
+                isIndependent ? full.cityHromadaNameUk() : null,
+                full.isFavorite()
         );
     }
 
@@ -213,6 +252,19 @@ public record MasterDetailResponse(
                 masterId, firstName, lastName, phoneNumber, city, street, buildingNo,
                 locationNote, bio, instagram, professionalTitle, avatarUrl, avgRating,
                 reviewCount, masterType, salon, workingHours, cityId, oblastId, districtId,
-                bookingsThisMonth, region, citySettlementType, cityHromadaNameUk);
+                bookingsThisMonth, region, citySettlementType, cityHromadaNameUk, isFavorite);
+    }
+
+    /**
+     * Returns a copy carrying the caller-specific {@code isFavorite} — the only supported way to
+     * set it to {@code true}. Called by {@code ProviderFavoriteDecorator} after the cache read,
+     * never inside a cached factory (see the component doc).
+     */
+    public MasterDetailResponse withIsFavorite(boolean isFavorite) {
+        return new MasterDetailResponse(
+                masterId, firstName, lastName, phoneNumber, city, street, buildingNo,
+                locationNote, bio, instagram, professionalTitle, avatarUrl, avgRating,
+                reviewCount, masterType, salon, workingHours, cityId, oblastId, districtId,
+                bookingsThisMonth, region, citySettlementType, cityHromadaNameUk, isFavorite);
     }
 }

@@ -77,7 +77,7 @@ public class SalonServiceFavoriteDecorator {
             return catalog;
         }
 
-        Set<UUID> favoritedIds = favoriteRepository.findFavoritedServiceIds(
+        Set<UUID> favoritedIds = favoriteRepository.findFavoritedTargetIds(
                 clientId, FavoriteTargetType.SALON_SERVICE, serviceDefIds);
 
         List<SalonServiceCategoryGroup> decorated = groups.stream()

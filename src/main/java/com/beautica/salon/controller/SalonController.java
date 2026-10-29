@@ -1,11 +1,13 @@
 package com.beautica.salon.controller;
 
+import com.beautica.common.web.PerViewerResponses;
 import com.beautica.auth.dto.InviteResponse;
 import com.beautica.booking.dto.BookableMasterResponse;
 import com.beautica.booking.service.BookingMasterService;
 import com.beautica.common.ApiResponse;
 import com.beautica.common.PageResponse;
 import com.beautica.common.security.AuthenticationUtils;
+import com.beautica.favorite.service.ProviderFavoriteDecorator;
 import com.beautica.master.dto.MasterSummaryResponse;
 import com.beautica.salon.dto.CreateSalonRequest;
 import com.beautica.salon.dto.InviteRequest;
@@ -66,6 +68,7 @@ public class SalonController {
 
     private final SalonService salonService;
     private final BookingMasterService bookingMasterService;
+    private final ProviderFavoriteDecorator providerFavoriteDecorator;
 
     @PostMapping
     @PreAuthorize("hasRole('SALON_OWNER')")
@@ -85,9 +88,17 @@ public class SalonController {
         return ApiResponse.ok(salonService.getOwnerSalons(ownerId));
     }
 
+    /**
+     * Public salon profile. {@code isFavorite} is attached HERE, after the shared
+     * {@code salon-detail} cache read, by {@link ProviderFavoriteDecorator} — never inside the
+     * cached service method, which would leak one client's favourite to every other caller.
+     */
     @GetMapping("/{salonId}")
-    public ApiResponse<PublicSalonResponse> getSalon(@PathVariable UUID salonId) {
-        return ApiResponse.ok(salonService.getPublicSalon(salonId));
+    public ResponseEntity<ApiResponse<PublicSalonResponse>> getSalon(@PathVariable UUID salonId,
+                                                                     Authentication authentication) {
+        // Per-viewer body (isFavorite) on a shared public route → no-store + Vary: Authorization.
+        return PerViewerResponses.ok(ApiResponse.ok(providerFavoriteDecorator.decorate(
+                salonService.getPublicSalon(salonId), authentication)));
     }
 
     @PatchMapping("/{salonId}")
