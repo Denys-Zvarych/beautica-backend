@@ -289,6 +289,23 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     private static final int REVIEW_PAGE_RETRY_AFTER_SECONDS = 3600;
     private static final String CATEGORY_REVIEW_PAGE_PATH_PREFIX = "/api/v1/service-categories/requests/review/";
     private static final String SUGGESTION_REVIEW_PAGE_PATH = "/api/v1/service-types/suggestions/review";
+    // Phase 414 D13 — the support e-mail's one-click moderation pages (ModerationActionLinkController): the GET confirm
+    // page (token as trailing path segment) and the POST decision. Own per-IP buckets (moderationActionPageBuckets /
+    // moderationActionDecisionBuckets, RateLimitConfig), never the category review buckets. The 429 is an HTML page:
+    // these routes are opened in a browser from an e-mail, so a JSON body would be the only non-HTML page they serve.
+    private static final String MODERATION_ACTION_PAGE_PATH_PREFIX = "/api/v1/moderation/actions/";
+    private static final String MODERATION_ACTION_CONFIRM_PATH = "/api/v1/moderation/actions/confirm";
+    private static final long MODERATION_ACTION_PAGE_DEFAULT_CAPACITY = 30;
+    private static final long MODERATION_ACTION_DECISION_DEFAULT_CAPACITY = 10;
+    private static final Duration MODERATION_ACTION_WINDOW = Duration.ofMinutes(10);
+    private static final int MODERATION_ACTION_RETRY_AFTER_SECONDS = 600;
+    private static final byte[] TOO_MANY_REQUESTS_HTML = ("<!DOCTYPE html><html lang=\"uk\"><head><meta charset=\"UTF-8\"/>"
+            + "<meta name=\"robots\" content=\"noindex,nofollow\"/><title>Забагато запитів</title></head>"
+            + "<body style=\"font-family:Arial,sans-serif;background:#E6DDD0;margin:0;padding:48px 16px;\">"
+            + "<div style=\"max-width:480px;margin:0 auto;background:#FDFAF7;border-radius:16px;padding:40px;"
+            + "text-align:center;\"><h1 style=\"font-size:22px;\">Забагато запитів</h1>"
+            + "<p>Зачекайте кілька хвилин і спробуйте ще раз.</p></div></body></html>")
+            .getBytes(StandardCharsets.UTF_8);
     // category-request bucket window is 60 minutes — Retry-After reflects the window.
     private static final int CATEGORY_REQUEST_RETRY_AFTER_SECONDS = 3600;
     // suggest-service-type bucket window is 60 minutes — Retry-After reflects the window.
@@ -335,7 +352,7 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // Per-IP cap for POST /api/v1/book/cancel/{token} (10 / 15 min). The endpoint is
     // permitAll() — the guest holds only the one-time cancel token, validated inside the
     // booking service, not the Spring filter chain — so without this a single source IP can
-    // pour cancel attempts: each accepted POST runs a findByCancelTokenWithGraph JOIN-FETCH +
+    // pour cancel attempts: each accepted POST runs a findByCancelTokenHashWithGraph JOIN-FETCH +
     // conditional UPDATE, and a successful cancel dispatches a billable SMS. The token is
     // 122-bit (not brute-forceable), so the cap is generous enough for a legitimate guest
     // retrying their own cancel. Built internally (not an injected @Qualifier bean) so the
@@ -343,6 +360,14 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // this filter directly.
     private static final long CANCEL_POST_CAPACITY = 10;
     private static final Duration CANCEL_POST_WINDOW = Duration.ofMinutes(15);
+    // Per-IP cap for GET /api/v1/book/cancel/{token} (10 / 60 s) — the cancel PAGE's info read
+    // (review-trust phase 1). Until this cap the read fell through the unconditional non-POST bypass
+    // with no throttle at all, so one IP could replay token lookups at line rate (each a SHA-256 +
+    // index probe + graph load). The page makes one read per open, so 10 / min never touches a guest
+    // reloading their own link. Separate from cancelPostBuckets so reads never spend the POST budget.
+    // Internal (not an injected @Qualifier bean) for the same constructor-stability reason as above.
+    private static final long CANCEL_INFO_CAPACITY = 10;
+    private static final Duration CANCEL_INFO_WINDOW = Duration.ofSeconds(60);
     // Per-IP cap for GET /api/v1/book/{slug}/availability (60 / 60 s) — the LOW-fix flood guard for the
     // last unthrottled permitAll() surface under /book. Deliberately the SAME budget as slotsBuckets
     // (the authenticated twin, GET /masters/{id}/slots + /working-days, default 60/60s): the two answer
@@ -375,6 +400,17 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // guestAvailabilityBuckets would do the same to the date-browsing budget. A page open costs one token,
     // so 60/min is far above human use even behind carrier-grade NAT. Built internally like
     // guestAvailabilityBuckets so the public constructor stays unchanged.
+    // Phase 401 D1 — the guest review page's public routes (/api/v1/public/review-invites/{token}...). No OTP: the
+    // 128-bit token in the path is the credential, so these per-IP buckets (plus Turnstile on the POSTs) are the
+    // flood guard. GET (the page read, SSR via the website Worker — keyed like the /book info reads, see
+    // resolveGuestInfoBucketKey): 30 / 10 min. POST (submit + opt-out share ONE bucket — a guest needs at most a
+    // couple, and each runs a locked lookup plus up to 10 review inserts): 5 / 10 min. Built internally like the
+    // other guest buckets so the public constructor stays unchanged.
+    private static final String REVIEW_INVITE_PATH_PREFIX = "/api/v1/public/review-invites/";
+    private static final long REVIEW_INVITE_GET_CAPACITY = 30;
+    private static final long REVIEW_INVITE_POST_CAPACITY = 5;
+    private static final Duration REVIEW_INVITE_WINDOW = Duration.ofMinutes(10);
+    private static final int REVIEW_INVITE_RETRY_AFTER_SECONDS = 600;
     private static final long GUEST_INFO_CAPACITY = 60;
     private static final Duration GUEST_INFO_WINDOW = Duration.ofMinutes(1);
     // Entry cap for guestInfoBuckets (perf audit L1). Lower than the 100_000 the other per-IP caches use:
@@ -385,6 +421,10 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // calls from one egress IP; with a matching secret its forwarded visitor IP keys the bucket instead.
     private static final String WORKER_KEY_HEADER = "X-Beautica-Worker-Key";
     private static final String CF_CONNECTING_IP_HEADER = "CF-Connecting-IP";
+    // Phase 401 (website audit 2026-10-28): Cloudflare drops CF-Connecting-IP on a Workers subrequest, so the Worker
+    // forwards the visitor IP in this header. Trusted ONLY with a matching worker key (like CF-Connecting-IP) and
+    // preferred over CF-Connecting-IP when both hold a valid IP literal.
+    private static final String CLIENT_IP_HEADER = "X-Beautica-Client-IP";
     private static final int MAX_IP_LITERAL_LENGTH = 45;
     private static final Pattern IPV4_LITERAL = Pattern.compile(
             "^((25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)\\.){3}(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)$");
@@ -694,6 +734,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // rather than injected so the public 16-arg constructor stays stable for the slice/regression
     // tests that construct this filter directly.
     private final LoadingCache<String, Bucket> cancelPostBuckets;
+    // Per-IP bucket for GET/HEAD /api/v1/book/cancel/{token} — see CANCEL_INFO_CAPACITY.
+    private final LoadingCache<String, Bucket> cancelInfoBuckets;
     // Per-IP bucket for GET /api/v1/book/{slug}/availability — the LOW-fix flood guard for the public
     // booking page's slot read, the one permitAll() surface under /book that had no bucket at all. Built
     // internally rather than injected so the public 19-arg constructor stays stable for the
@@ -702,6 +744,9 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // Per-IP bucket for GET /api/v1/book/{slug}/info + GET /api/v1/book/s/{slug}/info (phase 377 audit),
     // see GUEST_INFO_CAPACITY. Built internally, like guestAvailabilityBuckets.
     private final LoadingCache<String, Bucket> guestInfoBuckets;
+    // Phase 401 D1 — per-IP buckets for the guest review page, see REVIEW_INVITE_GET_CAPACITY.
+    private final LoadingCache<String, Bucket> reviewInviteGetBuckets;
+    private final LoadingCache<String, Bucket> reviewInvitePostBuckets;
     // Per-IP bucket for GET /api/v1/search/** — the SEC-fix scraping guard for the permitAll()
     // discovery reads (which now surface authed-only independent-master street addresses).
     // Built internally rather than injected so the public 16-arg constructor stays stable for
@@ -781,6 +826,11 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // RateLimitConfig#reviewPageBuckets (app.rate-limit.review-page-capacity).
     private final LoadingCache<String, Bucket> reviewPageBuckets;
 
+    // Phase 414 D13 — moderation-action page / decision buckets. Injected from RateLimitConfig on the Spring
+    // constructor; the public (test) constructor builds them at the production defaults.
+    private final LoadingCache<String, Bucket> moderationActionPageBuckets;
+    private final LoadingCache<String, Bucket> moderationActionDecisionBuckets;
+
     // Configured website-Worker secret for the info reads, or null when the feature is off (blank config).
     // A secret: never logged.
     private final String bookingInfoWorkerKey;
@@ -841,6 +891,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                 inviteBuckets,
                 reviewDecisionBuckets,
                 reviewPageBuckets,
+                moderationActionBuckets(MODERATION_ACTION_PAGE_DEFAULT_CAPACITY),
+                moderationActionBuckets(MODERATION_ACTION_DECISION_DEFAULT_CAPACITY),
                 new BookingInfoWorkerProperties());
     }
 
@@ -872,6 +924,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             @Qualifier("inviteBuckets") LoadingCache<String, Bucket> inviteBuckets,
             @Qualifier("reviewDecisionBuckets") LoadingCache<String, Bucket> reviewDecisionBuckets,
             @Qualifier("reviewPageBuckets") LoadingCache<String, Bucket> reviewPageBuckets,
+            @Qualifier("moderationActionPageBuckets") LoadingCache<String, Bucket> moderationActionPageBuckets,
+            @Qualifier("moderationActionDecisionBuckets") LoadingCache<String, Bucket> moderationActionDecisionBuckets,
             BookingInfoWorkerProperties bookingInfoWorker) {
         this.registerBuckets = registerBuckets;
         this.loginBuckets = loginBuckets;
@@ -898,6 +952,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         this.inviteBuckets = inviteBuckets;
         this.reviewDecisionBuckets = reviewDecisionBuckets;
         this.reviewPageBuckets = reviewPageBuckets;
+        this.moderationActionPageBuckets = moderationActionPageBuckets;
+        this.moderationActionDecisionBuckets = moderationActionDecisionBuckets;
         this.bookingInfoWorkerKey = bookingInfoWorker.isEnabled() ? bookingInfoWorker.getWorkerKey() : null;
         this.otpVerifyBuckets = Caffeine.newBuilder()
                 .maximumSize(100_000)
@@ -917,6 +973,12 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                 .build(key -> Bucket.builder()
                         .addLimit(cancelPostBandwidth())
                         .build());
+        this.cancelInfoBuckets = Caffeine.newBuilder()
+                .maximumSize(100_000)
+                .expireAfterAccess(CANCEL_INFO_WINDOW.plusMinutes(5))
+                .build(key -> Bucket.builder()
+                        .addLimit(cancelInfoBandwidth())
+                        .build());
         this.guestAvailabilityBuckets = Caffeine.newBuilder()
                 .maximumSize(100_000)
                 .expireAfterAccess(GUEST_AVAILABILITY_WINDOW.plusMinutes(5))
@@ -928,6 +990,18 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                 .expireAfterAccess(GUEST_INFO_WINDOW.plusMinutes(5))
                 .build(key -> Bucket.builder()
                         .addLimit(guestInfoBandwidth())
+                        .build());
+        this.reviewInviteGetBuckets = Caffeine.newBuilder()
+                .maximumSize(GUEST_INFO_MAX_ENTRIES)
+                .expireAfterAccess(REVIEW_INVITE_WINDOW.plusMinutes(5))
+                .build(key -> Bucket.builder()
+                        .addLimit(reviewInviteBandwidth(REVIEW_INVITE_GET_CAPACITY))
+                        .build());
+        this.reviewInvitePostBuckets = Caffeine.newBuilder()
+                .maximumSize(GUEST_INFO_MAX_ENTRIES)
+                .expireAfterAccess(REVIEW_INVITE_WINDOW.plusMinutes(5))
+                .build(key -> Bucket.builder()
+                        .addLimit(reviewInviteBandwidth(REVIEW_INVITE_POST_CAPACITY))
                         .build());
         this.searchBuckets = Caffeine.newBuilder()
                 .maximumSize(100_000)
@@ -973,6 +1047,26 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                         .build());
     }
 
+    /** Default-capacity moderation-action bucket cache for the public (test) constructor; same shape as RateLimitConfig. */
+    private static LoadingCache<String, Bucket> moderationActionBuckets(long capacity) {
+        return Caffeine.newBuilder()
+                .maximumSize(100_000)
+                .expireAfterAccess(MODERATION_ACTION_WINDOW.plusMinutes(5))
+                .build(key -> Bucket.builder()
+                        .addLimit(BandwidthBuilder.builder()
+                                .capacity(capacity)
+                                .refillIntervally(capacity, MODERATION_ACTION_WINDOW)
+                                .build())
+                        .build());
+    }
+
+    private static Bandwidth reviewInviteBandwidth(long capacity) {
+        return BandwidthBuilder.builder()
+                .capacity(capacity)
+                .refillIntervally(capacity, REVIEW_INVITE_WINDOW)
+                .build();
+    }
+
     private static Bandwidth otpVerifyBandwidth() {
         return BandwidthBuilder.builder()
                 .capacity(OTP_VERIFY_CAPACITY)
@@ -991,6 +1085,13 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         return BandwidthBuilder.builder()
                 .capacity(CANCEL_POST_CAPACITY)
                 .refillIntervally(CANCEL_POST_CAPACITY, CANCEL_POST_WINDOW)
+                .build();
+    }
+
+    private static Bandwidth cancelInfoBandwidth() {
+        return BandwidthBuilder.builder()
+                .capacity(CANCEL_INFO_CAPACITY)
+                .refillIntervally(CANCEL_INFO_CAPACITY, CANCEL_INFO_WINDOW)
                 .build();
     }
 
@@ -1183,6 +1284,22 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                                     FilterChain filterChain) throws ServletException, IOException {
         String path = resolveMatchPath(request);
         String method = request.getMethod();
+
+        // Phase 401 D1 — guest review page: GET/HEAD /api/v1/public/review-invites/{token} (keyed on the visitor IP
+        // forwarded by the website Worker when it carries the worker key, else the client IP) and the two POSTs
+        // (/reviews, /opt-out) on a shared POST bucket. No other route starts with this prefix.
+        if (path.startsWith(REVIEW_INVITE_PATH_PREFIX)) {
+            if (isGetOrHead(method)) {
+                applyRateLimit(request, response, filterChain, reviewInviteGetBuckets,
+                        REVIEW_INVITE_RETRY_AFTER_SECONDS, 1L, perIpv6Prefix(resolveGuestInfoBucketKey(request)));
+                return;
+            }
+            if (HttpMethod.POST.matches(method)) {
+                applyRateLimit(request, response, filterChain, reviewInvitePostBuckets,
+                        REVIEW_INVITE_RETRY_AFTER_SECONDS, 1L, perIpv6Prefix(resolveBucketKey(request)));
+                return;
+            }
+        }
 
         // Device-token rate-limit: POST or DELETE /api/v1/devices/token — checked before
         // the POST-only branch so DELETE is also covered.
@@ -1461,6 +1578,16 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             return;
         }
 
+        // Cancel-info read rate-limit: GET/HEAD /api/v1/book/cancel/{token} — the same prefix as the
+        // POST branch above, split by method onto its own bucket (cancelInfoBuckets, 10 / 60 s per IP).
+        // Checked before the unconditional non-POST bypass below, which it previously fell through.
+        // HEAD is routed by Spring to the @GetMapping handler, so it is throttled identically.
+        if (isGetOrHead(method)
+                && path.startsWith(CANCEL_POST_PATH_PREFIX)) {
+            applyRateLimit(request, response, filterChain, cancelInfoBuckets, RETRY_AFTER_SECONDS);
+            return;
+        }
+
         // Guest-booking-POST rate-limit: POST /api/v1/book/{slug}/booking — matched by
         // prefix + suffix (the {slug} is one path segment). Placed before the exact-path POST
         // branch below. The /booking suffix does not match the OTP exact paths (/send, /verify),
@@ -1513,6 +1640,19 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         if (isGetOrHead(method) && INVITE_VALIDATE_PATH.equals(path)) {
             applyRateLimit(request, response, filterChain, inviteValidateBuckets, RETRY_AFTER_SECONDS);
             return;
+        }
+
+        // Phase 414 D13 — moderation-action pages: the POST decision first (its exact path also starts with the page
+        // prefix), then any other GET/HEAD under the prefix (the token page). Both answer 429 as an HTML page.
+        if (path.startsWith(MODERATION_ACTION_PAGE_PATH_PREFIX)) {
+            if (HttpMethod.POST.matches(method) && MODERATION_ACTION_CONFIRM_PATH.equals(path)) {
+                applyHtmlRateLimit(request, response, filterChain, moderationActionDecisionBuckets);
+                return;
+            }
+            if (isGetOrHead(method)) {
+                applyHtmlRateLimit(request, response, filterChain, moderationActionPageBuckets);
+                return;
+            }
         }
 
         // Admin review-page rate-limit: GET /api/v1/service-categories/requests/review/{token} and
@@ -1842,6 +1982,31 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         }
     }
 
+    /** Per-IP limit whose 429 is the HTML page (phase 414 moderation-action routes). */
+    private void applyHtmlRateLimit(HttpServletRequest request,
+                                    HttpServletResponse response,
+                                    FilterChain filterChain,
+                                    LoadingCache<String, Bucket> cache) throws ServletException, IOException {
+        ConsumptionProbe probe = cache.get(resolveBucketKey(request)).tryConsumeAndReturnRemaining(1L);
+        if (probe.isConsumed()) {
+            filterChain.doFilter(request, response);
+            return;
+        }
+        response.setStatus(429);
+        response.setContentType("text/html;charset=UTF-8");
+        response.setHeader("X-Content-Type-Options", "nosniff");
+        response.setHeader("Cache-Control", "no-store");
+        response.setHeader("X-Robots-Tag", "noindex, nofollow");
+        // The 429 page has no form, so no-referrer cannot break a same-origin POST here (unlike the confirm page).
+        response.setHeader("Referrer-Policy", "no-referrer");
+        response.setHeader("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; "
+                + "frame-ancestors 'none'; base-uri 'none'");
+        response.setHeader("Retry-After",
+                String.valueOf(computeRetryAfterSeconds(probe, MODERATION_ACTION_RETRY_AFTER_SECONDS)));
+        response.setContentLength(TOO_MANY_REQUESTS_HTML.length);
+        response.getOutputStream().write(TOO_MANY_REQUESTS_HTML);
+    }
+
     static int computeRetryAfterSeconds(ConsumptionProbe probe, int fallbackSeconds) {
         long nanos = probe.getNanosToWaitForRefill();
         // Bucket4j reports Long.MAX_VALUE for "never refills"; guard before any arithmetic (overflow).
@@ -1877,7 +2042,7 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     /**
      * Bucket key for the booking-page info reads. With the website-Worker feature on, a request carrying a
      * matching {@value #WORKER_KEY_HEADER} (constant-time compare) is keyed on the visitor IP in
-     * {@value #CF_CONNECTING_IP_HEADER}, so the Worker's single egress IP does not pool every visitor into one
+     * {@value #CLIENT_IP_HEADER} (phase 401) or, failing that, {@value #CF_CONNECTING_IP_HEADER}, so the Worker's single egress IP does not pool every visitor into one
      * bucket. Anything else — feature off, no header, wrong key, missing or non-IP-literal
      * CF-Connecting-IP — falls back to {@link #resolveBucketKey} exactly as before.
      */
@@ -1889,7 +2054,10 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         if (supplied == null || !ConstantTimeSecrets.matches(supplied, bookingInfoWorkerKey)) {
             return resolveBucketKey(request);
         }
-        String visitorKey = visitorIpBucketKey(request.getHeader(CF_CONNECTING_IP_HEADER));
+        String visitorKey = visitorIpBucketKey(request.getHeader(CLIENT_IP_HEADER));
+        if (visitorKey == null) {
+            visitorKey = visitorIpBucketKey(request.getHeader(CF_CONNECTING_IP_HEADER));
+        }
         return visitorKey != null ? visitorKey : resolveBucketKey(request);
     }
 
@@ -1919,6 +2087,17 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         } catch (UnknownHostException e) {
             return null;
         }
+    }
+
+    /**
+     * Phase 401 audit-fix — the review-invite buckets only: {@code key} re-keyed by {@link #visitorIpBucketKey} (an IPv6
+     * client on its /64, IPv4 unchanged), so one subscriber rotating the low 64 bits of its address cannot mint a fresh
+     * 5-request POST budget per address. A key that is not a bare IP literal (already {@code …/64}, or the clamped
+     * remote address) is returned as is. Every other bucket keeps its per-address key.
+     */
+    static String perIpv6Prefix(String key) {
+        String prefixed = visitorIpBucketKey(key);
+        return prefixed != null ? prefixed : key;
     }
 
     /** True when the first {@value #IPV6_BUCKET_PREFIX_BYTES} bytes (the /64 prefix) are all zero. */

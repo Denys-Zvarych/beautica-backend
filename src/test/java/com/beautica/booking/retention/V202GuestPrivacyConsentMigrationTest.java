@@ -128,7 +128,8 @@ class V202GuestPrivacyConsentMigrationTest {
             assertThat(after.remove("guest_pii_anonymised_at")).as("marker of %s", shape).isNull();
             Map<String, Object> before = new HashMap<>(BOOKINGS_BEFORE.get(id));
             before.remove("guest_pii_anonymised_at");
-            assertThat(after).as("booking shape: %s", shape).isEqualTo(before);
+            // V206 (head) moves the plaintext cancel token into its hash.
+            assertThat(after).as("booking shape: %s", shape).isEqualTo(GuestPiiFixtures.afterV206(before));
         });
         Map<String, Object> visit = new HashMap<>(jdbc.queryForMap("SELECT * FROM appointments WHERE id = ?", legacyVisit));
         assertThat(visit.remove("guest_privacy_accepted_at")).isNull();
@@ -136,7 +137,7 @@ class V202GuestPrivacyConsentMigrationTest {
         assertThat(visit.remove("guest_pii_anonymised_at")).isNull();
         Map<String, Object> visitExpected = new HashMap<>(visitBefore);
         visitExpected.remove("guest_pii_anonymised_at");
-        assertThat(visit).isEqualTo(visitExpected);
+        assertThat(visit).isEqualTo(GuestPiiFixtures.afterV206(visitExpected));
     }
 
     @Test

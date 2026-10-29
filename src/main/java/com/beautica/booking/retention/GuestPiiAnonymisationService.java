@@ -5,9 +5,12 @@ import com.beautica.booking.entity.Appointment;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.repository.AppointmentRepository;
 import com.beautica.booking.repository.BookingRepository;
+import com.beautica.booking.repository.GuestBookingSubject;
 import com.beautica.booking.service.BookingCancellationService;
 import com.beautica.booking.service.GuestVisitCancellationService;
 import com.beautica.common.util.UkrainianPhoneNormalizer;
+import com.beautica.moderation.service.ClientBlockService;
+import com.beautica.review.invite.service.GuestReviewRetentionService;
 import io.micrometer.core.instrument.MeterRegistry;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.lang.Nullable;
@@ -22,9 +25,13 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.function.Function;
 import java.util.function.Supplier;
@@ -45,7 +52,14 @@ import java.util.stream.Collectors;
  * <p><b>Erase ({@link #eraseByPhone}).</b> One transaction, in this order (D12): normalise the phone,
  * lock the phone's upcoming guest visits and single bookings, cancel them through the existing guest
  * cancellation seams (provider outbox + in-app rows, no guest SMS), anonymise every guest row of the
- * phone regardless of age, delete its OTP rows. A rollback leaves neither a cancellation nor a wipe.
+ * phone regardless of age, delete its OTP rows, rename its GUEST client blocks to the anonymised name (phase 398
+ * D7 — hash and last 4 stay, so the block stays enforced). A rollback leaves neither a cancellation nor a wipe.
+ *
+ * <p><b>Guest reviews (phase 402).</b> Wherever booking rows are anonymised (each retention batch, the erase), the
+ * same transaction sets the author label of their {@code GUEST_LINK} reviews to {@link GuestPii#ANONYMISED_NAME} and
+ * skips their visits' / single bookings' {@code SCHEDULED} review invites ({@code ANONYMISED}); headers anonymised by
+ * the two sweeps skip their visit invites too. The erase also expires the phone's {@code SENT} invites (audit-fix
+ * cycle 1), so an already-delivered review link stops resolving. {@code sms_opt_outs} is never touched (402 D2).
  *
  * <p>Logs carry counts, the cutoff and the support ticket reference only — never a phone, a name or
  * a row id (§I).
@@ -68,6 +82,8 @@ public class GuestPiiAnonymisationService {
     private final BookingCancellationService bookingCancellationService;
     private final GuestVisitCancellationService guestVisitCancellationService;
     private final PhoneOtpService phoneOtpService;
+    private final ClientBlockService clientBlockService;
+    private final GuestReviewRetentionService guestReviewRetentionService;
     private final GuestPiiRetentionProperties properties;
     private final MeterRegistry meterRegistry;
     private final Clock clock;
@@ -79,6 +95,8 @@ public class GuestPiiAnonymisationService {
             BookingCancellationService bookingCancellationService,
             GuestVisitCancellationService guestVisitCancellationService,
             PhoneOtpService phoneOtpService,
+            ClientBlockService clientBlockService,
+            GuestReviewRetentionService guestReviewRetentionService,
             GuestPiiRetentionProperties properties,
             MeterRegistry meterRegistry,
             Clock clock,
@@ -88,6 +106,8 @@ public class GuestPiiAnonymisationService {
         this.bookingCancellationService = bookingCancellationService;
         this.guestVisitCancellationService = guestVisitCancellationService;
         this.phoneOtpService = phoneOtpService;
+        this.clientBlockService = clientBlockService;
+        this.guestReviewRetentionService = guestReviewRetentionService;
         this.properties = properties;
         this.meterRegistry = meterRegistry;
         this.clock = clock;
@@ -117,10 +137,10 @@ public class GuestPiiAnonymisationService {
             }
         }
         OffsetDateTime recentSince = OffsetDateTime.now(clock).minus(LEFTOVER_LOOKBACK);
-        visits += sweep(() -> appointmentRepository.anonymiseEndedGuestAppointments(
-                utcCutoff, recentSince, GuestPii.ANONYMISED_NAME, batchSize), batchSize, maxBatches);
-        visits += sweep(() -> appointmentRepository.anonymiseLeftoverGuestAppointments(
-                utcCutoff, GuestPii.ANONYMISED_NAME, batchSize), batchSize, maxBatches);
+        visits += sweep(() -> skipVisitInvites(appointmentRepository.anonymiseEndedGuestAppointments(
+                utcCutoff, recentSince, GuestPii.ANONYMISED_NAME, batchSize)), batchSize, maxBatches);
+        visits += sweep(() -> skipVisitInvites(appointmentRepository.anonymiseLeftoverGuestAppointments(
+                utcCutoff, GuestPii.ANONYMISED_NAME, batchSize)), batchSize, maxBatches);
         record("job", bookings, visits);
         log.info("Guest PII retention: anonymised {} bookings, {} visits in {} ms (cutoff {})",
                 bookings, visits, clock.millis() - startedAt, cutoff);
@@ -148,9 +168,38 @@ public class GuestPiiAnonymisationService {
         if (bookingIds.isEmpty()) {
             return new int[]{0, 0};
         }
-        int headers = appointmentRepository
-                .anonymiseGuestAppointmentsOfBookings(bookingIds, GuestPii.ANONYMISED_NAME).size();
-        return new int[]{bookingIds.size(), headers};
+        List<UUID> headerIds = appointmentRepository
+                .anonymiseGuestAppointmentsOfBookings(bookingIds, GuestPii.ANONYMISED_NAME);
+        anonymiseGuestReviewData(bookingIds, headerIds);
+        return new int[]{bookingIds.size(), headerIds.size()};
+    }
+
+    /** Phase 402 D3 — a sweep's anonymised headers skip their visit invites; returns the ids unchanged. */
+    private List<UUID> skipVisitInvites(List<UUID> appointmentIds) {
+        guestReviewRetentionService.skipScheduledInvites(appointmentIds, List.of());
+        return appointmentIds;
+    }
+
+    /**
+     * Phase 402 D1/D3 — in the anonymising transaction: guest review labels of {@code bookingIds} → «Гість», and the
+     * {@code SCHEDULED} invites of their visits (a visit item's {@code appointment_id}, plus {@code headerIds}) and of
+     * the single bookings among them → {@code SKIPPED (ANONYMISED)}. Runs after every other statement of the
+     * transaction: the review update clears the persistence context (phase 399 audit).
+     */
+    private void anonymiseGuestReviewData(Collection<UUID> bookingIds, Collection<UUID> headerIds) {
+        Set<UUID> appointmentIds = new LinkedHashSet<>(headerIds);
+        List<UUID> singleBookingIds = new ArrayList<>();
+        if (!bookingIds.isEmpty()) {
+            for (GuestBookingSubject subject : bookingRepository.findGuestBookingSubjects(bookingIds)) {
+                if (subject.getAppointmentId() != null) {
+                    appointmentIds.add(subject.getAppointmentId());
+                } else {
+                    singleBookingIds.add(subject.getBookingId());
+                }
+            }
+        }
+        guestReviewRetentionService.skipScheduledInvites(appointmentIds, singleBookingIds);
+        guestReviewRetentionService.anonymiseReviewAuthors(bookingIds);
     }
 
     /**
@@ -173,17 +222,26 @@ public class GuestPiiAnonymisationService {
         int visitsCancelled = cancelVisits(visitIds);
         int bookingsCancelled = cancelSingleBookings(bookingIds);
 
-        int bookingsAnonymised = bookingRepository
-                .anonymiseGuestBookingsByPhone(phone, GuestPii.ANONYMISED_NAME).size();
-        int visitsAnonymised = appointmentRepository
-                .anonymiseGuestAppointmentsByPhone(phone, GuestPii.ANONYMISED_NAME).size();
+        List<UUID> anonymisedBookingIds = bookingRepository
+                .anonymiseGuestBookingsByPhone(phone, GuestPii.ANONYMISED_NAME);
+        List<UUID> anonymisedVisitIds = appointmentRepository
+                .anonymiseGuestAppointmentsByPhone(phone, GuestPii.ANONYMISED_NAME);
+        int bookingsAnonymised = anonymisedBookingIds.size();
+        int visitsAnonymised = anonymisedVisitIds.size();
         int otpRowsDeleted = phoneOtpService.deleteAllForPhone(phone);
+        // Phase 398 D7 — the phone's GUEST blocks lose their name snapshot but keep hash + last 4: an active
+        // safety record, so the block keeps refusing this phone. anonymiseDue never touches blocks.
+        int blocksAnonymised = clientBlockService.anonymiseGuestBlocks(phone, GuestPii.ANONYMISED_NAME);
+        // Phase 402 — last: the review label update clears the persistence context. sms_opt_outs is kept (402 D2).
+        anonymiseGuestReviewData(anonymisedBookingIds, anonymisedVisitIds);
+        // Phase 402 audit-fix (sec LOW) — the phone's already-sent review links die with the erase (SENT → EXPIRED).
+        int invitesExpired = guestReviewRetentionService.expireSentInvitesOfPhone(phone, clock.instant());
 
         record("manual", bookingsAnonymised, visitsAnonymised);
         log.info("Guest PII erase (ticket {}): cancelled {} bookings, {} visits; anonymised {} bookings, "
-                        + "{} visits; deleted {} OTP rows in {} ms",
-                ticketRef == null ? "none" : ticketRef, bookingsCancelled, visitsCancelled,
-                bookingsAnonymised, visitsAnonymised, otpRowsDeleted, clock.millis() - startedAt);
+                        + "{} visits, {} blocks; expired {} review invites; deleted {} OTP rows in {} ms",
+                ticketRef == null ? "none" : ticketRef, bookingsCancelled, visitsCancelled, bookingsAnonymised,
+                visitsAnonymised, blocksAnonymised, invitesExpired, otpRowsDeleted, clock.millis() - startedAt);
         return new GuestPiiAnonymisationResult(
                 bookingsCancelled, visitsCancelled, bookingsAnonymised, visitsAnonymised, otpRowsDeleted);
     }

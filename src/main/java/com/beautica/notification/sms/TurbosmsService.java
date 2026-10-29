@@ -6,9 +6,15 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.client.JdkClientHttpRequestFactory;
+import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestClient;
 
+import javax.net.ssl.SSLHandshakeException;
+import java.net.ConnectException;
+import java.net.NoRouteToHostException;
+import java.net.UnknownHostException;
 import java.net.http.HttpClient;
+import java.net.http.HttpConnectTimeoutException;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
@@ -40,6 +46,8 @@ public class TurbosmsService implements SmsService {
 
     private static final String SUCCESS_STATUS = "OK";
     private static final String FAILURE_STATUS = "FAILED";
+    /** Cause-chain walk bound in {@link #isOutcomeUnknown}; real chains are 2-4 deep. */
+    static final int MAX_CAUSE_DEPTH = 16;
     private final RestClient restClient;
     private final String baseUrl;
     private final String token;
@@ -131,10 +139,38 @@ public class TurbosmsService implements SmsService {
             // message (may contain the URL with embedded data) or the SMS text/token.
             log.warn("SMS send status={} to={} cause={}",
                     FAILURE_STATUS, mask(phoneE164), e.getClass().getSimpleName());
+            if (isOutcomeUnknown(e)) {
+                throw new SmsDeliveryAmbiguousException("SMS delivery outcome unknown", e);
+            }
             throw new SmsDeliveryException("SMS delivery failed", e);
         }
 
         log.info("SMS send status={} to={}", SUCCESS_STATUS, mask(phoneE164));
+    }
+
+    /**
+     * Phase 400 (audit cycle 1) — {@code true} when the request may have reached Turbosms: an I/O failure
+     * ({@link ResourceAccessException}) that is NOT a pre-send connection failure. A read timeout or a connection
+     * dropped after the request was written leaves the provider's verdict unknown — it may have billed and delivered.
+     * Connection refused, connect timeout, unknown host, no route and a failed TLS handshake all happen before the
+     * request is written, so those stay definite (retry-safe) failures.
+     */
+    static boolean isOutcomeUnknown(RuntimeException e) {
+        if (!(e instanceof ResourceAccessException)) {
+            return false;
+        }
+        // Depth-capped (audit cycle 2): a cyclic cause chain longer than self-reference (A -> B -> A) would spin
+        // forever. Hitting the cap with no pre-send cause found reads as UNKNOWN — the safe side (never retried).
+        int depth = 0;
+        for (Throwable t = e; t != null && depth < MAX_CAUSE_DEPTH;
+                t = t.getCause() == t ? null : t.getCause(), depth++) {
+            if (t instanceof ConnectException || t instanceof HttpConnectTimeoutException
+                    || t instanceof UnknownHostException || t instanceof NoRouteToHostException
+                    || t instanceof SSLHandshakeException) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /** @see PhoneMask#mask(String) — the one masking rule, shared with {@link NoOpSmsService}. */

@@ -31,6 +31,12 @@ public final class CapturingSmsSender {
 
     private static final Pattern NON_DIGITS = Pattern.compile("\\D");
     private static final Pattern LINE_BREAKS_AND_CONTROL = Pattern.compile("[\\r\\n\\p{Cntrl}]+");
+    /**
+     * Phase 400 audit cycle 1 — the review-invite path segment ({@code beautica.app/r/{token}}): everything after it
+     * is the single-use review token, which must not leak into the Mailpit subject (list views, notifications).
+     */
+    static final String REVIEW_LINK_MARKER = "/r/";
+    static final String TOKEN_MASK = "***";
 
     private final JavaMailSender mailSender;
     private final String fromAddress;
@@ -63,9 +69,19 @@ public final class CapturingSmsSender {
         log.info("SMS captured to mail to={}", PhoneMask.mask(phoneE164));
     }
 
-    /** First {@value #SUBJECT_TEXT_CHARS} chars on one line — CR/LF stripped so the subject cannot inject headers. */
+    /**
+     * First {@value #SUBJECT_TEXT_CHARS} chars on one line — CR/LF stripped so the subject cannot inject headers. A
+     * review-invite link is cut right after {@value #REVIEW_LINK_MARKER} and masked, so no token character reaches the
+     * subject (the body still carries the full text). Texts without the marker are unchanged.
+     */
     static String subjectFor(String text) {
         String flat = text == null ? "" : LINE_BREAKS_AND_CONTROL.matcher(text).replaceAll(" ").strip();
+        int link = flat.indexOf(REVIEW_LINK_MARKER);
+        if (link >= 0) {
+            String head = flat.substring(0, link + REVIEW_LINK_MARKER.length());
+            return SUBJECT_PREFIX + (head.length() <= SUBJECT_TEXT_CHARS
+                    ? head + TOKEN_MASK : flat.substring(0, Math.min(link, SUBJECT_TEXT_CHARS)));
+        }
         return SUBJECT_PREFIX + (flat.length() <= SUBJECT_TEXT_CHARS ? flat : flat.substring(0, SUBJECT_TEXT_CHARS));
     }
 }

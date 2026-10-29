@@ -42,7 +42,7 @@ import static org.mockito.Mockito.verify;
 /**
  * Headline concurrency regression for Phase 13.4 — two guests POST the SAME cancel token
  * at the same instant. The one-time atomic consume
- * ({@code BookingRepository.consumeCancelToken}) must let EXACTLY ONE racer win: one 204,
+ * ({@code BookingRepository.consumeCancelTokenHash}) must let EXACTLY ONE racer win: one 204,
  * one 404, the booking ends CANCELLED with a nulled token, and the cancellation SMS fires
  * exactly once. This proves the conditional UPDATE closes the check-then-act double-cancel
  * race a naive "load → flip → save" flow would leave open.
@@ -147,7 +147,7 @@ class GuestCancelConcurrencyIT {
         String status = jdbcTemplate.queryForObject(
                 "SELECT status FROM bookings WHERE master_id = ?", String.class, masterId);
         Integer liveTokens = jdbcTemplate.queryForObject(
-                "SELECT COUNT(*) FROM bookings WHERE cancel_token IS NOT NULL", Integer.class);
+                "SELECT COUNT(*) FROM bookings WHERE cancel_token_hash IS NOT NULL", Integer.class);
         assertThat(status).isEqualTo("CANCELLED");
         assertThat(liveTokens).as("cancel token consumed").isZero();
         assertThat(bookingRepository.count()).isEqualTo(1L);

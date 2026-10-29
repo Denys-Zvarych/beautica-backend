@@ -1,5 +1,8 @@
 package com.beautica.search.controller;
 
+import com.beautica.favorite.entity.FavoriteTargetType;
+import com.beautica.favorite.repository.FavoriteRepository;
+import com.beautica.favorite.service.ProviderFavoriteDecorator;
 import com.beautica.auth.JwtAuthenticationFilter;
 import com.beautica.auth.JwtTokenProvider;
 import com.beautica.common.exception.GlobalExceptionHandler;
@@ -38,12 +41,18 @@ import java.math.BigDecimal;
 import java.util.List;
 import java.util.UUID;
 
+import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.hasItem;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.authentication;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
@@ -64,7 +73,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  */
 @WebMvcTest(SearchController.class)
 @TestPropertySource(properties = "app.frontend.base-url=http://localhost:3000")
-@Import({WebMvcTestSupport.class, GlobalExceptionHandler.class})
+@Import({WebMvcTestSupport.class, GlobalExceptionHandler.class, ProviderFavoriteDecorator.class})
 @DisplayName("SearchController — @WebMvcTest slice")
 class SearchControllerTest {
 
@@ -103,6 +112,10 @@ class SearchControllerTest {
 
     @MockBean
     private SearchService searchService;
+
+    /** Backs the real {@link ProviderFavoriteDecorator} the controller composes post-cache. */
+    @MockBean
+    private FavoriteRepository favoriteRepository;
 
     @MockBean
     private JwtTokenProvider jwtTokenProvider;
@@ -214,9 +227,9 @@ class SearchControllerTest {
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.success").value(false))
                 .andExpect(jsonPath("$.message").value(org.hamcrest.Matchers.not(
-                        org.hamcrest.Matchers.containsString("not-a-uuid"))))
+                        containsString("not-a-uuid"))))
                 .andExpect(jsonPath("$.errors['location.cityId']").value(org.hamcrest.Matchers.not(
-                        org.hamcrest.Matchers.containsString("not-a-uuid"))));
+                        containsString("not-a-uuid"))));
     }
 
     @Test
@@ -794,7 +807,7 @@ class SearchControllerTest {
                 // bound from the per-field @Max(500)/@Max(100) caps, both of which pass here.
                 .andExpect(jsonPath("$.errors.withinResultWindow").exists())
                 .andExpect(jsonPath("$.errors.withinResultWindow").value(
-                        org.hamcrest.Matchers.containsString("10000")))
+                        containsString("10000")))
                 .andExpect(jsonPath("$.errors.page").doesNotExist())
                 .andExpect(jsonPath("$.errors.size").doesNotExist());
     }
@@ -1344,5 +1357,91 @@ class SearchControllerTest {
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.success").value(true));
+    }
+
+    // ── isFavorite — per-caller, post-cache, one batched query per page ──────
+
+    private static org.springframework.security.core.Authentication clientWithId(UUID clientId) {
+        var token = new org.springframework.security.authentication.UsernamePasswordAuthenticationToken(
+                "client@test.com", "n/a",
+                List.of(new org.springframework.security.core.authority.SimpleGrantedAuthority("ROLE_CLIENT")));
+        token.setDetails(clientId);
+        return token;
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — CLIENT: isFavorite flags the page from ONE batched favourites query")
+    void should_flagFavoritedMastersWithOneQuery_when_clientSearches() throws Exception {
+        UUID clientId = UUID.randomUUID();
+        MasterSearchResult favorited = sampleMasterResult();
+        MasterSearchResult other = sampleMasterResult();
+        when(searchService.searchMasters(any(), any(Pageable.class))).thenReturn(
+                new PageImpl<>(List.of(favorited, other), PageRequest.of(0, 20), 2L));
+        when(favoriteRepository.findFavoritedTargetIds(
+                clientId, FavoriteTargetType.MASTER, List.of(favorited.masterId(), other.masterId())))
+                .thenReturn(java.util.Set.of(favorited.masterId()));
+
+        mockMvc.perform(get(MASTERS_URL)
+                        .with(authentication(clientWithId(clientId)))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.data[0].isFavorite").value(true))
+                .andExpect(jsonPath("$.data.data[1].isFavorite").value(false));
+
+        verify(favoriteRepository, times(1)).findFavoritedTargetIds(any(), any(), any());
+        verifyNoMoreInteractions(favoriteRepository);
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/salons — CLIENT: isFavorite flags the page from ONE batched favourites query")
+    void should_flagFavoritedSalonsWithOneQuery_when_clientSearches() throws Exception {
+        UUID clientId = UUID.randomUUID();
+        SalonSearchResult favorited = sampleSalonResult();
+        SalonSearchResult other = sampleSalonResult();
+        when(searchService.searchSalons(any(SalonSearchRequest.class), any(Pageable.class))).thenReturn(
+                new PageImpl<>(List.of(favorited, other), PageRequest.of(0, 20), 2L));
+        when(favoriteRepository.findFavoritedTargetIds(
+                clientId, FavoriteTargetType.SALON, List.of(favorited.salonId(), other.salonId())))
+                .thenReturn(java.util.Set.of(other.salonId()));
+
+        mockMvc.perform(get(SALONS_URL)
+                        .with(authentication(clientWithId(clientId)))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.data[0].isFavorite").value(false))
+                .andExpect(jsonPath("$.data.data[1].isFavorite").value(true));
+
+        verify(favoriteRepository, times(1)).findFavoritedTargetIds(any(), any(), any());
+        verifyNoMoreInteractions(favoriteRepository);
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — anonymous: isFavorite=false on every card, no favourites query")
+    void should_returnIsFavoriteFalse_when_anonymousSearchesMasters() throws Exception {
+        when(searchService.searchMasters(any(), any(Pageable.class))).thenReturn(
+                new PageImpl<>(List.of(sampleMasterResult()), PageRequest.of(0, 20), 1L));
+
+        mockMvc.perform(get(MASTERS_URL).accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.data[0].isFavorite").value(false));
+
+        verifyNoInteractions(favoriteRepository);
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters + /salons — per-viewer body: Cache-Control: no-store and Vary: Authorization")
+    void should_setNoStoreAndVaryAuthorization_when_searching() throws Exception {
+        when(searchService.searchMasters(any(), any(Pageable.class))).thenReturn(
+                new PageImpl<>(List.of(sampleMasterResult()), PageRequest.of(0, 20), 1L));
+        when(searchService.searchSalons(any(SalonSearchRequest.class), any(Pageable.class))).thenReturn(
+                new PageImpl<>(List.of(sampleSalonResult()), PageRequest.of(0, 20), 1L));
+
+        for (String url : List.of(MASTERS_URL, SALONS_URL)) {
+            mockMvc.perform(get(url).accept(MediaType.APPLICATION_JSON))
+                    .andExpect(status().isOk())
+                    .andExpect(header().string("Cache-Control", "no-store"))
+                    .andExpect(header().stringValues("Vary", hasItem(
+                            containsString("Authorization"))));
+        }
     }
 }

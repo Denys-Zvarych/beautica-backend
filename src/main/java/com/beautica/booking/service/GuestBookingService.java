@@ -20,6 +20,7 @@ import com.beautica.config.BookingSmsProperties;
 import com.beautica.master.dto.MasterWorkingDayResponse;
 import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
+import com.beautica.moderation.service.BookingBlockGuard;
 import com.beautica.notification.inapp.entity.InAppNotificationType;
 import com.beautica.notification.inapp.service.InAppNotificationService;
 import com.beautica.notification.service.NotificationOutboxService;
@@ -86,6 +87,8 @@ public class GuestBookingService {
     private final SalonGuestMasterResolver salonGuestMasterResolver;
     /** Phase 393 audit — max 10 bookings per guest token (jti), shared by both create routes. */
     private final GuestTokenBookingCap guestTokenBookingCap;
+    /** Phase 398 — refuses a create when the provider blocked the OTP-verified phone (BOOKING_UNAVAILABLE). */
+    private final BookingBlockGuard bookingBlockGuard;
 
     public GuestBookingService(
             GuestTokenProvider guestTokenProvider,
@@ -104,7 +107,8 @@ public class GuestBookingService {
             InAppNotificationService inAppNotificationService,
             RetiredBookingSlugGuard retiredBookingSlugGuard,
             SalonGuestMasterResolver salonGuestMasterResolver,
-            GuestTokenBookingCap guestTokenBookingCap) {
+            GuestTokenBookingCap guestTokenBookingCap,
+            BookingBlockGuard bookingBlockGuard) {
         this.guestTokenProvider = guestTokenProvider;
         this.masterRepository = masterRepository;
         this.masterServiceRepository = masterServiceRepository;
@@ -122,6 +126,7 @@ public class GuestBookingService {
         this.retiredBookingSlugGuard = retiredBookingSlugGuard;
         this.salonGuestMasterResolver = salonGuestMasterResolver;
         this.guestTokenBookingCap = guestTokenBookingCap;
+        this.bookingBlockGuard = bookingBlockGuard;
     }
 
     /**
@@ -309,8 +314,8 @@ public class GuestBookingService {
     /**
      * The shared create body of both guest routes. Order is load-bearing: token (401) → per-token booking cap
      * (429, phase 393 audit — reserved here, released if this transaction rolls back) → start-time window (400) →
-     * master resolution (404/410) → service / slot checks. {@code masterResolver} runs inside this transaction, so
-     * the returned master stays managed.
+     * master resolution (404/410) → provider block (409 BOOKING_UNAVAILABLE, phase 398) → service / slot checks.
+     * {@code masterResolver} runs inside this transaction, so the returned master stays managed.
      */
     private GuestBookingResponse createFor(
             String bearerToken, Supplier<Master> masterResolver, GuestBookingRequest req) {
@@ -325,6 +330,11 @@ public class GuestBookingService {
         BookingStartsAtValidator.validate(req.startsAt(), kyivClock);
 
         Master master = masterResolver.get();
+        // Phase 398 D2 — provider block gate on the phone the guest token proves (never request-body data); scope
+        // from the TARGET master. At create, not OTP verify: verify carries no provider context and would turn
+        // into a "blocked anywhere?" probe. Before every slot check, lock and side effect; the per-token cap
+        // reserved above is released by this transaction's rollback.
+        bookingBlockGuard.requireGuestMayBook(master, guestPhone);
 
         // BE-7: a masterServiceIds list (even a single element) is a multi-service VISIT — ONE Appointment
         // header + N chained CONFIRMED bookings sharing one cancel token and one reminder. A legacy

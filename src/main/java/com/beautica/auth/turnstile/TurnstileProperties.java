@@ -36,6 +36,12 @@ public class TurnstileProperties {
     private Duration readTimeout = Duration.ofSeconds(2);
     private List<String> expectedHostnames = new ArrayList<>();
     private String expectedAction = "";
+    /**
+     * Phase 401 — the action the guest review page ({@code /r/{token}}: submit and opt-out) renders its widget with.
+     * Checked on the review-invite routes only, instead of {@link #expectedAction}; empty = no action check (local,
+     * test, staging), like {@link #expectedAction}.
+     */
+    private String reviewExpectedAction = "";
 
     @AssertTrue(message = "app.turnstile.secret-key (TURNSTILE_SECRET_KEY) must be set when app.turnstile.enabled is true")
     public boolean isSecretConfiguredWhenEnabled() {
@@ -97,5 +103,13 @@ public class TurnstileProperties {
 
     public void setExpectedAction(String expectedAction) {
         this.expectedAction = expectedAction == null ? "" : expectedAction.strip();
+    }
+
+    public String getReviewExpectedAction() {
+        return reviewExpectedAction;
+    }
+
+    public void setReviewExpectedAction(String reviewExpectedAction) {
+        this.reviewExpectedAction = reviewExpectedAction == null ? "" : reviewExpectedAction.strip();
     }
 }

@@ -7,7 +7,9 @@ import com.beautica.booking.dto.AppointmentRescheduleRequest;
 import com.beautica.booking.dto.AvailableSlotResponse;
 import com.beautica.booking.entity.Appointment;
 import com.beautica.booking.event.BookingCompletedEvent;
+import com.beautica.booking.event.GuestVisitCompletedEvent;
 import com.beautica.booking.entity.Booking;
+import com.beautica.booking.enums.BookingSource;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.enums.CancellationReason;
 import com.beautica.booking.repository.AppointmentRepository;
@@ -358,6 +360,67 @@ class AppointmentTransitionServiceTest {
         verify(eventPublisher).publishEvent(new BookingCompletedEvent(null));
         // A guest visit has no account to review with, so no review prompt is enqueued either.
         verify(outboxService, never()).enqueueReviewRequested(any());
+    }
+
+    // ── Phase 400 D1: GuestVisitCompletedEvent — LINK visits only, appointments.id, server clock ──────────────────
+
+    @Test
+    @DisplayName("completeAppointment of a LINK visit publishes GuestVisitCompletedEvent with the appointment id "
+            + "and the server-clock instant")
+    void should_publishGuestVisitCompleted_when_linkVisitCompleted() {
+        Appointment appointment = Appointment.builder()
+                .id(appointmentId).status(BookingStatus.CONFIRMED).bookingSource(BookingSource.LINK).build();
+        when(appointmentRepository.lockHeaderRegardlessOfStatus(appointmentId))
+                .thenReturn(Optional.of(appointmentId));
+        when(appointmentRepository.findById(appointmentId)).thenReturn(Optional.of(appointment));
+        when(bookingRepository.findByAppointmentIdWithGraph(appointmentId))
+                .thenReturn(List.of(confirmedItemOf(UUID.randomUUID())));
+
+        appointmentTransitionService.completeAppointment(UUID.randomUUID(), appointmentId);
+
+        verify(eventPublisher).publishEvent(new GuestVisitCompletedEvent(appointmentId, clock.instant()));
+    }
+
+    @Test
+    @DisplayName("completeAppointment of an APP visit publishes no GuestVisitCompletedEvent")
+    void should_notPublishGuestVisitCompleted_when_appVisitCompleted() {
+        Appointment appointment = confirmedAppointmentFor(null);
+        when(appointmentRepository.lockHeaderRegardlessOfStatus(appointmentId))
+                .thenReturn(Optional.of(appointmentId));
+        when(appointmentRepository.findById(appointmentId)).thenReturn(Optional.of(appointment));
+        when(bookingRepository.findByAppointmentIdWithGraph(appointmentId))
+                .thenReturn(List.of(confirmedItemOf(UUID.randomUUID())));
+
+        appointmentTransitionService.completeAppointment(UUID.randomUUID(), appointmentId);
+
+        verify(eventPublisher, never()).publishEvent(any(GuestVisitCompletedEvent.class));
+    }
+
+    @Test
+    @DisplayName("completeAppointmentItem of a LINK visit item publishes GuestVisitCompletedEvent even when the "
+            + "visit stays open (the first COMPLETED item fixes send_after)")
+    void should_publishGuestVisitCompleted_when_linkVisitItemCompleted() {
+        UUID first = UUID.randomUUID();
+        Booking target = linkItemOf(first);
+        Booking sibling = linkItemOf(UUID.randomUUID());
+        when(bookingRepository.findByAppointmentIdWithGraph(appointmentId)).thenReturn(List.of(target, sibling));
+        when(bookingRepository.existsConfirmedById(first)).thenReturn(true);
+
+        appointmentTransitionService.completeAppointmentItem(UUID.randomUUID(), appointmentId, first);
+
+        verify(eventPublisher).publishEvent(new GuestVisitCompletedEvent(appointmentId, clock.instant()));
+    }
+
+    private Booking linkItemOf(UUID bookingId) {
+        return Booking.builder()
+                .id(bookingId)
+                .master(Master.builder().id(UUID.randomUUID()).isActive(true).build())
+                .masterService(MasterServiceAssignment.builder().id(UUID.randomUUID()).isActive(true).build())
+                .status(BookingStatus.CONFIRMED)
+                .bookingSource(BookingSource.LINK)
+                .startsAt(OffsetDateTime.parse("2026-07-26T09:00:00Z"))
+                .endsAt(OffsetDateTime.parse("2026-07-26T10:00:00Z"))
+                .build();
     }
 
     private Appointment confirmedAppointmentFor(User client) {

@@ -84,6 +84,7 @@ class AsyncConfigShutdownOrderingTest {
         List<ThreadPoolTaskExecutor> pools = List.of(
                 context.getBean("emailTaskPool", ThreadPoolTaskExecutor.class),
                 context.getBean("supportEmailTaskPool", ThreadPoolTaskExecutor.class),
+                context.getBean("reportEmailTaskPool", ThreadPoolTaskExecutor.class),
                 context.getBean("pushTaskPool", ThreadPoolTaskExecutor.class));
         // Core size is 4: the first 4 tasks run, the rest queue. With wait=true the executor's lifecycle
         // stop() is a no-op (ContextClosedEvent only sets lateShutdown), so ALL draining — running tasks and

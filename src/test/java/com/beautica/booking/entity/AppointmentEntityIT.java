@@ -1,5 +1,6 @@
 package com.beautica.booking.entity;
 
+import com.beautica.booking.domain.CancelTokenHasher;
 import com.beautica.AbstractDataJpaTest;
 import com.beautica.auth.Role;
 import com.beautica.booking.enums.BookingSource;
@@ -183,7 +184,10 @@ class AppointmentEntityIT extends AbstractDataJpaTest {
         assertThat(loaded.getStatus()).isEqualTo(BookingStatus.CONFIRMED);
         assertThat(loaded.getClientComment()).isEqualTo("Please arrive 5 minutes early");
         assertThat(loaded.getIdempotencyKey()).isEqualTo(appointment.getIdempotencyKey());
-        assertThat(loaded.getCancelToken()).isEqualTo(cancelToken);
+        assertThat(loaded.getCancelTokenHash())
+                .as("V206: only the SHA-256 of the token is persisted")
+                .isEqualTo(CancelTokenHasher.hash(cancelToken));
+        assertThat(loaded.getCancelToken()).as("the raw token is never loaded").isNull();
         assertThat(loaded.getBookingSource()).isEqualTo(BookingSource.LINK);
         assertThat(loaded.getGuestName()).isEqualTo("Iryna");
         assertThat(loaded.getGuestSurname()).isEqualTo("Melnyk");
@@ -216,7 +220,7 @@ class AppointmentEntityIT extends AbstractDataJpaTest {
         assertThat(saved.getIdempotencyKey()).isEqualTo(appointment.getIdempotencyKey());
         assertThat(saved.getGuestName()).as("an APP visit carries no guest identity (V126)").isNull();
         assertThat(saved.getGuestPhone()).isNull();
-        assertThat(saved.getCancelToken()).as("an APP visit carries no cancel token (V126)").isNull();
+        assertThat(saved.getCancelTokenHash()).as("an APP visit carries no cancel token (V126)").isNull();
     }
 
     @Test
@@ -459,17 +463,17 @@ class AppointmentEntityIT extends AbstractDataJpaTest {
 
         Appointment saved = em.persistFlushFind(terminal);
 
-        assertThat(saved.getCancelToken()).isNull();
+        assertThat(saved.getCancelTokenHash()).isNull();
     }
 
     @Test
-    @DisplayName("ux_appointments_cancel_token — a duplicate non-null cancel_token is rejected (partial-unique index)")
+    @DisplayName("ux_appointments_cancel_token_hash — a duplicate non-null cancel_token_hash is rejected (partial-unique index)")
     void should_rejectAppointment_when_duplicateCancelToken() {
         UUID sharedToken = UUID.randomUUID();
 
         // Only a LINK visit may carry a cancel_token: chk_appointment_guest_fields (V126) forbids it
         // on an APP row. Both rows are otherwise valid LINK visits (client_id NULL + guest identity),
-        // so the ONLY constraint that can fire on the second is ux_appointments_cancel_token.
+        // so the ONLY constraint that can fire on the second is ux_appointments_cancel_token_hash (V206).
         Appointment first = guestVisit(BookingStatus.CONFIRMED)
                 .cancelToken(sharedToken)
                 .build();
@@ -485,7 +489,7 @@ class AppointmentEntityIT extends AbstractDataJpaTest {
     }
 
     @Test
-    @DisplayName("ux_appointments_cancel_token — two visits with a NULL cancel_token both persist "
+    @DisplayName("ux_appointments_cancel_token_hash — two visits with a NULL cancel_token_hash both persist "
             + "(partiality: uniqueness is only over non-NULL rows)")
     void should_allowMultipleAppointments_when_cancelTokenIsNull() {
         Appointment first = Appointment.builder()
@@ -503,8 +507,8 @@ class AppointmentEntityIT extends AbstractDataJpaTest {
 
         assertThat(first.getId()).isNotNull();
         assertThat(second.getId()).isNotNull();
-        assertThat(first.getCancelToken()).isNull();
-        assertThat(second.getCancelToken()).isNull();
+        assertThat(first.getCancelTokenHash()).isNull();
+        assertThat(second.getCancelTokenHash()).isNull();
     }
 
     @Test
@@ -556,9 +560,9 @@ class AppointmentEntityIT extends AbstractDataJpaTest {
         assertThat(second.getId()).isNotNull();
     }
 
-    // ── consumeCancelToken (cycle-3 audit finding 2 — lock_timeout fused) ────────────────────────
+    // ── consumeCancelTokenHash (cycle-3 audit finding 2 — lock_timeout fused) ────────────────────────
     @Test
-    @DisplayName("consumeCancelToken — flips a CONFIRMED guest visit header to CANCELLED/CLIENT_CANCELLED "
+    @DisplayName("consumeCancelTokenHash — flips a CONFIRMED guest visit header to CANCELLED/CLIENT_CANCELLED "
             + "and nulls the token, in one conditional UPDATE (native-SQL rewrite regression: the query "
             + "moved from JPQL to a native set_config-fused UPDATE for cycle-3 finding 2 — this proves the "
             + "rewrite still updates the right row with the right values, not just that it compiles)")
@@ -568,26 +572,26 @@ class AppointmentEntityIT extends AbstractDataJpaTest {
         em.persistAndFlush(visit);
         em.clear();
 
-        int updated = appointmentRepository.consumeCancelToken(token);
+        int updated = appointmentRepository.consumeCancelTokenHash(CancelTokenHasher.hash(token));
 
         assertThat(updated).as("exactly one header row is flipped by the winning consume").isEqualTo(1);
         Appointment reloaded = appointmentRepository.findById(visit.getId()).orElseThrow();
         assertThat(reloaded.getStatus()).isEqualTo(BookingStatus.CANCELLED);
         assertThat(reloaded.getCancellationReason()).isEqualTo(CancellationReason.CLIENT_CANCELLED);
-        assertThat(reloaded.getCancelToken()).as("token is nulled so the link cannot be replayed").isNull();
+        assertThat(reloaded.getCancelTokenHash()).as("token hash is nulled so the link cannot be replayed").isNull();
     }
 
     @Test
-    @DisplayName("consumeCancelToken — a replayed/already-consumed token updates 0 rows (idempotent "
+    @DisplayName("consumeCancelTokenHash — a replayed/already-consumed token updates 0 rows (idempotent "
             + "by consequence, same as the pre-rewrite JPQL version)")
     void should_updateZeroRows_when_tokenAlreadyConsumed() {
         UUID token = UUID.randomUUID();
         Appointment visit = guestVisit(BookingStatus.CONFIRMED).cancelToken(token).build();
         em.persistAndFlush(visit);
         em.clear();
-        assertThat(appointmentRepository.consumeCancelToken(token)).isEqualTo(1);
+        assertThat(appointmentRepository.consumeCancelTokenHash(CancelTokenHasher.hash(token))).isEqualTo(1);
 
-        int replay = appointmentRepository.consumeCancelToken(token);
+        int replay = appointmentRepository.consumeCancelTokenHash(CancelTokenHasher.hash(token));
 
         assertThat(replay).as("the token is already NULL — the WHERE clause matches nothing").isEqualTo(0);
     }

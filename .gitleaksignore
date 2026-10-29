@@ -105,3 +105,14 @@ f7d5cf62c55b7a08ba8d71679777365aeec1a047:src/test/java/com/beautica/config/Outbo
 # runtime-built Base64 of fixed bytes in the next commit; this pins only the
 # historical finding. (Value deliberately not reproduced here.)
 7440b2fbc3e6cc1871bc1d9a82c946b2f68cf0b3:src/test/java/com/beautica/config/BookingInfoWorkerPropertiesTest.java:generic-api-key:83
+
+# --- PR #174 (reviewed 2026-10-29) -----------------------------------------
+# CapturingSmsSenderTest: a hand-typed 22-char dummy shaped like a review-invite
+# URL token, used only to prove CapturingSmsSender masks every token character
+# in the Mailpit subject. Never issued by the app; not a credential.
+7f32888a53cab85dac9cce6103883aca314d483b:src/test/java/com/beautica/notification/sms/CapturingSmsSenderTest.java:generic-api-key:59
+7f32888a53cab85dac9cce6103883aca314d483b:src/test/java/com/beautica/notification/sms/CapturingSmsSenderTest.java:generic-api-key:70
+# CancelTokenHasherTest: TOKEN_SHA256 is the SHA-256 of the fixed test UUID
+# literal on the line above it (the V206 backfill preimage) - a derived test
+# vector, not a secret.
+9804c95abf664107595511076d33b39c859c598b:src/test/java/com/beautica/booking/domain/CancelTokenHasherTest.java:generic-api-key:18

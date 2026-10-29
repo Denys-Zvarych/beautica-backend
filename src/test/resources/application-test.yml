@@ -72,6 +72,10 @@ app:
     review-decision-capacity: 100000
     # Sibling GET-page bucket (60/hr in production); 429 covered by ReviewGetRateLimitRegressionTest.
     review-page-capacity: 100000
+    # Phase 414 moderation-action pages (30 / 10 per 10 min in production); the 429 is covered by
+    # ModerationActionRateLimitIT, which lowers both caps in its own context.
+    moderation-action-page-capacity: 100000
+    moderation-action-decision-capacity: 100000
     device-token-capacity: 100000
     media-upload-capacity: 100000
     verify-email-capacity: 100000
@@ -146,6 +150,8 @@ app:
   security:
     # Test profile only — fixed 32+ char value so the context loads under `test`.
     otp-pepper: test-otp-pepper-fixed-value-min-32-characters
+    # Phase 397 — test profile only.
+    phone-hash-pepper: test-phone-hash-pepper-fixed-value-min-32-chars
   verification:
     cumulative-failure-threshold: 10
     lockout-duration: 15m
@@ -169,6 +175,17 @@ app:
   guest-pii-retention:
     # Phase 373 — no job bean in tests; ITs drive GuestPiiAnonymisationService directly.
     enabled: false
+  moderation:
+    retention:
+      # Phase 396 — no job bean in tests; ITs drive ContentReportRetentionService directly.
+      enabled: false
+  booking:
+    review-invite:
+      # Phase 400 — the ReviewInviteSendJob timer never fires mid-test (same reasoning as the outbox drain below);
+      # ITs call ReviewInviteSendJob#run() directly with a pinned clock.
+      job:
+        fixed-delay-ms: 3600000
+        initial-delay-ms: 3600000
 
 notification:
   outbox:

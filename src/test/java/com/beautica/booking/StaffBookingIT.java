@@ -150,7 +150,7 @@ class StaffBookingIT extends AbstractIntegrationTest {
             assertThat(row.get("guest_name")).isEqualTo("Олена");
             assertThat(row.get("guest_surname")).isEqualTo("Коваль");
             assertThat(row.get("client_id")).as("STAFF walk-in ⇒ client_id NULL (V137)").isNull();
-            assertThat(row.get("cancel_token")).as("STAFF walk-in ⇒ cancel_token NULL (V137)").isNull();
+            assertThat(row.get("cancel_token_hash")).as("STAFF walk-in ⇒ cancel_token NULL (V137)").isNull();
             assertThat(row.get("appointment_id"))
                     .as("Phase 22.12 — N = 1 still creates an appointments header, no size "
                             + "short-circuit; see VisitShapeBoundary for the header-row assertions")
@@ -639,7 +639,7 @@ class StaffBookingIT extends AbstractIntegrationTest {
             Map<String, Object> header = appointmentRow(appointmentId);
             assertThat(header.get("booking_source")).isEqualTo("STAFF");
             assertThat(header.get("status")).isEqualTo("CONFIRMED");
-            assertThat(header.get("cancel_token")).as("no guest self-cancel link for a staff visit").isNull();
+            assertThat(header.get("cancel_token_hash")).as("no guest self-cancel link for a staff visit").isNull();
             assertThat(header.get("created_by_user_id")).isEqualTo(salon.staffUserId());
             assertThat(header.get("salon_id"))
                     .as("the header must carry the booked salon — a salon-less STAFF header is "
@@ -674,7 +674,7 @@ class StaffBookingIT extends AbstractIntegrationTest {
                 assertThat(row.get("appointment_id")).isEqualTo(appointmentId);
                 assertThat(row.get("booking_source")).isEqualTo("STAFF");
                 assertThat(row.get("status")).isEqualTo("CONFIRMED");
-                assertThat(row.get("cancel_token")).isNull();
+                assertThat(row.get("cancel_token_hash")).isNull();
             });
         }
     }

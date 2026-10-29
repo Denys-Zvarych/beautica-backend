@@ -35,7 +35,7 @@ import org.springframework.security.task.DelegatingSecurityContextTaskExecutor;
  * <p><b>The deploy platform's SIGTERM→SIGKILL window must be at least this worst case.</b> A shorter
  * window kills the JVM mid-drain, losing the non-recoverable work below AND the abandonment report. On
  * Railway this is {@code deploy.drainingSeconds} in {@code railway.json} (&ge; this sum + the 30 s scheduler grace
- * ({@code SchedulingConfig}) + 2 lifecycle phases + margin = 185 + 30 + 2&times;20 + 20 = 275 &rarr; 280; pinned by
+ * ({@code SchedulingConfig}) + 2 lifecycle phases + margin = 190 + 30 + 2&times;20 + 20 = 280; pinned by
  * {@code RailwayConfigTest}). The push pool must drain before {@code FirebaseConfig} is destroyed
  * ({@code @DependsOn}, see {@code AsyncConfigShutdownOrderingTest}).
  *
@@ -49,6 +49,13 @@ import org.springframework.security.task.DelegatingSecurityContextTaskExecutor;
  * supportEmailTaskPool         35 s  Help/Contact mails. NOT outbox-backed -> cut = lost (user can resend).
  *                                    &ge; one in-flight Brevo API send WITH attachments (connect 3 s + the
  *                                    30 s send-with-attachments read budget, Phase 374) + margin.
+ * reportEmailTaskPool           5 s  phase-395/414 "content reported" support e-mail. Since the phase-414
+ *                                    audit-fix ONE task = 2 short DB transactions (content load, action-link
+ *                                    mint) + one SMTP / Brevo send of up to ~25 s, so the 5 s grace can cut a
+ *                                    task mid-send. Accepted: NOT outbox-backed -> cut = lost nudge; the
+ *                                    content_reports row is the authoritative worklist, and tokens minted for
+ *                                    an e-mail that never left are unreachable (only their hashes exist) and
+ *                                    expire (7 d) and are purged by the retention job (expiry + 30 d).
  * smsSendExecutor              20 s  request-path booking SMS (walk-in / guest confirmation + guest
  *                                    cancellation) AND, since phase 390, guest provider-cancellation SMS
  *                                    handed off by the outbox drain, whose row is ALREADY SENT. NOT
@@ -61,7 +68,7 @@ import org.springframework.security.task.DelegatingSecurityContextTaskExecutor;
  * blobPurgeExecutor            10 s  after-commit R2 deletes of already-dereferenced blobs; cut = accepted
  *                                    orphan blob (never a dangling pointer), same policy as a failed delete;
  *                                    reported at WARN with task + key counts.
- * total (sequential worst)    185 s
+ * total (sequential worst)    190 s
  * </pre>
  * Outbox-driven work (invite/booking email, push fan-out) is re-queued by the outbox drain worker on the
  * next boot unless the hand-off was already accepted (push: see
@@ -76,6 +83,9 @@ public class AsyncConfig implements AsyncConfigurer {
     static final int EMAIL_SHUTDOWN_GRACE_SECONDS = 20;
     /** Phase 374: covers one attachment-bearing Brevo API send (connect 3 s + read 30 s) plus margin. */
     static final int SUPPORT_EMAIL_SHUTDOWN_GRACE_SECONDS = 35;
+    /** Phase 395: one in-flight ids-only report nudge; the DB row is authoritative, so a cut send is accepted. */
+    static final int REPORT_EMAIL_SHUTDOWN_GRACE_SECONDS = 5;
+    static final int REPORT_EMAIL_QUEUE_CAPACITY = 50;
     static final int PUSH_SHUTDOWN_GRACE_SECONDS = 30;
     static final int SMS_SEND_SHUTDOWN_GRACE_SECONDS = 20;
     static final int CACHE_EVICTION_SHUTDOWN_GRACE_SECONDS = 10;
@@ -224,6 +234,50 @@ public class AsyncConfig implements AsyncConfigurer {
     public TaskExecutor supportEmailExecutor(
             @Qualifier("supportEmailTaskPool") ThreadPoolTaskExecutor supportEmailTaskPool) {
         return new DelegatingSecurityContextTaskExecutor(supportEmailTaskPool);
+    }
+
+    /** Inner pool of {@link #reportEmailExecutor(ThreadPoolTaskExecutor)} — see {@link #emailTaskPool()}. */
+    @Bean(name = "reportEmailTaskPool", defaultCandidate = false)
+    public ThreadPoolTaskExecutor reportEmailTaskPool() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(1);
+        executor.setMaxPoolSize(1);
+        executor.setQueueCapacity(REPORT_EMAIL_QUEUE_CAPACITY);
+        executor.setThreadNamePrefix("report-email-");
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.AbortPolicy());
+        executor.setWaitForTasksToCompleteOnShutdown(true);
+        executor.setAwaitTerminationSeconds(REPORT_EMAIL_SHUTDOWN_GRACE_SECONDS);
+        executor.setTaskDecorator(contextPropagatingDecorator());
+        executor.initialize();
+        return executor;
+    }
+
+    // Phase 395 — dedicated pool for "content reported" support nudges, isolated from supportEmailExecutor
+    // so a report burst (20/user/day across many users) cannot queue ahead of, or reject, a user's
+    // Help/Contact-us mail. Single thread, bounded queue, AbortPolicy: on saturation the listener logs
+    // one WARN and drops the nudge — the content_reports row is the authoritative worklist. Same
+    // SecurityContext + classloader propagation rationale as emailExecutor.
+    //
+    // Phase 414 audit-fix: the whole support e-mail (content load + action-link minting + send) runs on this pool
+    // (ContentReportEmailDispatcher), not on the request thread. {@code @Profile("!test")}: the test profile registers
+    // a synchronous stand-in under the SAME bean name ({@link #syncReportEmailExecutor()}).
+    @Bean(name = "reportEmailExecutor")
+    @Profile("!test")
+    public TaskExecutor reportEmailExecutor(
+            @Qualifier("reportEmailTaskPool") ThreadPoolTaskExecutor reportEmailTaskPool) {
+        return new DelegatingSecurityContextTaskExecutor(reportEmailTaskPool);
+    }
+
+    /**
+     * Test-profile counterpart of {@link #reportEmailExecutor(ThreadPoolTaskExecutor)} — inline execution, so an
+     * integration test observes the support report e-mail (and its minted links) the moment {@code POST /reports}
+     * returns (Anti-Bug §M: no sleeps, no races). Same bean name, mutually exclusive profile. The bounded production
+     * pool and its AbortPolicy are pinned directly by {@code ContentReportEmailTest} via {@link #reportEmailTaskPool()}.
+     */
+    @Bean(name = "reportEmailExecutor")
+    @Profile("test")
+    public TaskExecutor syncReportEmailExecutor() {
+        return new SyncTaskExecutor();
     }
 
     /**
@@ -871,6 +925,60 @@ public class AsyncConfig implements AsyncConfigurer {
     @Bean(name = "blobPurgeExecutor")
     @Profile("test")
     public TaskExecutor syncBlobPurgeExecutor() {
+        return new SyncTaskExecutor();
+    }
+
+    /** Phase 400 audit cycle 1 — {@link #reviewInviteExecutor()} sizing. */
+    static final int REVIEW_INVITE_POOL_SIZE = 2;
+    static final int REVIEW_INVITE_QUEUE_CAPACITY = 200;
+
+    /**
+     * Pool for the after-commit review-invite insert ({@code ReviewInviteScheduler}, phase 400 audit cycle 1).
+     *
+     * <p>An {@code AFTER_COMMIT} listener runs on the committing thread while it still holds its pooled Hikari
+     * connection, so the listener's {@code REQUIRES_NEW} insert pinned a SECOND connection per guest completion. The
+     * listener now runs here: one short read + one insert per task.
+     *
+     * <p><b>{@code CallerRunsPolicy}, deliberately.</b> This is a DB insert, not SMTP/SMS I/O (§H-2 does not apply):
+     * a dropped task is a guest who silently never gets a review invite, while caller-runs under saturation is just
+     * the pre-audit inline behaviour. Bounded queue + {@code core == max} (see {@link #smsReminderExecutor()} for why
+     * a smaller core never grows).
+     *
+     * <p><b>Shutdown.</b> {@code waitForTasksToCompleteOnShutdown} with NO {@code awaitTerminationSeconds}: the
+     * queued tasks are millisecond inserts, drained inside the lifecycle stop phase that {@code RailwayConfigTest}
+     * already budgets (2 &times; {@code timeout-per-shutdown-phase}), so no {@code *_SHUTDOWN_GRACE_SECONDS} is added
+     * to the sequential sum. A task cut there loses that visit's invite — the same accepted outcome as the
+     * listener's own failure path (logged and dropped); nothing else depends on the row.
+     *
+     * <p>No {@link DelegatingSecurityContextTaskExecutor}: the task reads ids from the event, nothing
+     * principal-derived. {@code @Profile("!test")} — see {@link #syncReviewInviteExecutor()}.
+     */
+    @Bean(name = "reviewInviteExecutor")
+    @Profile("!test")
+    public TaskExecutor reviewInviteExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(REVIEW_INVITE_POOL_SIZE);
+        executor.setMaxPoolSize(REVIEW_INVITE_POOL_SIZE);
+        executor.setAllowCoreThreadTimeOut(true);
+        executor.setKeepAliveSeconds(60);
+        executor.setQueueCapacity(REVIEW_INVITE_QUEUE_CAPACITY);
+        executor.setThreadNamePrefix("review-invite-");
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+        executor.setTaskDecorator(taskContextDecorator());
+        executor.setWaitForTasksToCompleteOnShutdown(true);
+        executor.initialize();
+        return executor;
+    }
+
+    /**
+     * Test-profile counterpart of {@link #reviewInviteExecutor()}: the invite insert runs INLINE, so an integration
+     * test that completes a guest visit observes the row the moment the completion returns (Anti-Bug §M). Same bean
+     * name, mutually exclusive profile — {@code @Async("reviewInviteExecutor")} resolves in every profile and never
+     * falls back to Spring's unbounded default executor.
+     */
+    @Bean(name = "reviewInviteExecutor")
+    @Profile("test")
+    public TaskExecutor syncReviewInviteExecutor() {
         return new SyncTaskExecutor();
     }
 

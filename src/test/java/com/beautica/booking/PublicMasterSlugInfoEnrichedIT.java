@@ -202,9 +202,10 @@ class PublicMasterSlugInfoEnrichedIT extends AbstractIntegrationTest {
         assertThat(keys(body.path("ratingDistribution").get(0))).isEqualTo(Set.of("rating", "count"));
         assertThat(keys(body.path("portfolio").get(0)))
                 .isEqualTo(Set.of("id", "entityType", "entityId", "mediaType", "url", "createdAt"));
+        // Phase 395 added authoredByViewer (boolean, always false here); phase 399 D2 added source (APP | GUEST_LINK).
         assertThat(keys(body.path("latestReviews").get(0)))
                 .isEqualTo(Set.of("id", "masterId", "clientDisplayName", "serviceName", "rating", "comment",
-                        "createdAt"));
+                        "createdAt", "authoredByViewer", "source"));
         List<String> allKeys = new ArrayList<>();
         collectKeys(body, allKeys);
         assertThat(allKeys).noneMatch(k -> k.toLowerCase().matches(".*(instagram|email|phone).*"));

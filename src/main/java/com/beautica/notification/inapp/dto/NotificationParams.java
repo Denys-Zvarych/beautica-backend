@@ -42,6 +42,9 @@ import java.time.Instant;
  *                         typed. Null on every approve, on a reject without a reason, and on every
  *                         other type. For suggestion items {@code serviceName} carries the suggested
  *                         service-type name.
+ * @param contentKind      phase 415, moderation-outcome types only — which kind of content the resolved report was
+ *                         about ({@code REVIEW} / {@code CLIENT_REVIEW} / {@code PORTFOLIO_PHOTO} / {@code PROFILE}),
+ *                         so the client picks the copy variant. Null on every other type.
  */
 public record NotificationParams(
         @Schema(types = {"string", "null"}, nullable = true) String counterpartName,
@@ -53,14 +56,29 @@ public record NotificationParams(
         @Schema(types = {"string", "null"}, nullable = true) String subjectName,
         @Schema(types = {"string", "null"}, nullable = true) Role subjectRole,
         @Schema(types = {"string", "null"}, nullable = true) String categoryName,
-        @Schema(types = {"string", "null"}, nullable = true) String decisionReason
+        @Schema(types = {"string", "null"}, nullable = true) String decisionReason,
+        @Schema(types = {"string", "null"}, nullable = true) ModeratedContentKind contentKind
 ) {
+
+    /** Pre-phase-415 shape: every item type except the moderation outcomes. */
+    public NotificationParams(
+            String counterpartName, String serviceName, int serviceCount, Instant startsAt,
+            String salonName, String masterName, String subjectName, Role subjectRole,
+            String categoryName, String decisionReason) {
+        this(counterpartName, serviceName, serviceCount, startsAt, salonName, masterName,
+                subjectName, subjectRole, categoryName, decisionReason, null);
+    }
+
+    /** Phase 415 — a moderation-outcome item: only {@code contentKind} is set. */
+    public static NotificationParams moderationOutcome(ModeratedContentKind contentKind) {
+        return new NotificationParams(null, null, 0, null, null, null, null, null, null, null, contentKind);
+    }
 
     /** Pre-phase-372 shape: every booking/invite item, with no request-decision fields. */
     public NotificationParams(
             String counterpartName, String serviceName, int serviceCount, Instant startsAt,
             String salonName, String masterName, String subjectName, Role subjectRole) {
         this(counterpartName, serviceName, serviceCount, startsAt, salonName, masterName,
-                subjectName, subjectRole, null, null);
+                subjectName, subjectRole, null, null, null);
     }
 }

@@ -5,6 +5,9 @@ import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingSource;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
+import com.beautica.moderation.entity.ReportResolution;
+import com.beautica.moderation.entity.ReportTargetType;
+import com.beautica.moderation.service.ModerationOutcome;
 import com.beautica.notification.inapp.entity.InAppNotificationType;
 import com.beautica.notification.inapp.repository.InAppNotificationRepository;
 import com.beautica.salon.entity.Salon;
@@ -14,7 +17,9 @@ import com.beautica.user.UserRepository;
 import java.time.Instant;
 import java.util.Collection;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -512,5 +517,153 @@ class InAppNotificationServiceTest {
         verify(repository).insertRequestDecisionWithPush(
                 "CATEGORY_REQUEST_REJECTED", requesterId, 5L, null, "CATEGORY_REQUEST_REJECTED:5");
         verify(repository, never()).insertRequestDecision(any(), any(), any(), any(), any());
+    }
+
+    // ── Phase 415 — moderation outcomes (one merged statement per resolution) ─────────────────────
+
+    @org.junit.jupiter.params.ParameterizedTest(name = "{0} {1} -> {2}")
+    @org.junit.jupiter.params.provider.CsvSource({
+            "REVIEW, REMOVED, REPORT_CONTENT_REMOVED",
+            "CLIENT_REVIEW, REMOVED, REPORT_CONTENT_REMOVED",
+            "PORTFOLIO_PHOTO, REMOVED, REPORT_CONTENT_REMOVED",
+            "REVIEW, RESTORED, REPORT_NO_VIOLATION",
+            "REVIEW, DISMISSED, REPORT_NO_VIOLATION",
+            "PORTFOLIO_PHOTO, DISMISSED, REPORT_NO_VIOLATION",
+            "REVIEW, TARGET_GONE, REPORT_REVIEWED",
+            "PORTFOLIO_PHOTO, TARGET_GONE, REPORT_REVIEWED",
+            "MASTER_PROFILE, ACTIONED, REPORT_REVIEWED",
+            "SALON_PROFILE, ACTIONED, REPORT_REVIEWED",
+            "CLIENT_PROFILE, ACTIONED, REPORT_REVIEWED",
+            "CLIENT_PROFILE, DISMISSED, REPORT_NO_VIOLATION"
+    })
+    @DisplayName("D1/D4/D5 — reporter type per target and resolution, target type + batch id bound")
+    void should_mapReporterType_when_resolved(ReportTargetType target, ReportResolution resolution,
+                                              InAppNotificationType expected) {
+        UUID reporter = UUID.randomUUID();
+        UUID batch = UUID.randomUUID();
+
+        service.notifyModerationOutcome(new ModerationOutcome(target, resolution, batch, Set.of(reporter), null, null));
+
+        assertThat(writtenRows(target.name(), batch)).containsExactly(Map.entry(reporter, expected.name()));
+    }
+
+    @Test
+    @DisplayName("REMOVE of a review — reporter, author and subject rows go out in ONE statement (audit-fix PERF 5)")
+    void should_writeAllGroupsInOneStatement_when_reviewRemoved() {
+        UUID reporter = UUID.randomUUID();
+        UUID author = UUID.randomUUID();
+        UUID subjectA = UUID.randomUUID();
+        UUID subjectB = UUID.randomUUID();
+        UUID batch = UUID.randomUUID();
+
+        service.notifyModerationOutcome(new ModerationOutcome(ReportTargetType.REVIEW, ReportResolution.REMOVED, batch,
+                Set.of(reporter), Set.of(author), Set.of(subjectA, subjectB)));
+
+        assertThat(writtenRows("REVIEW", batch)).containsExactlyInAnyOrder(
+                Map.entry(reporter, "REPORT_CONTENT_REMOVED"),
+                Map.entry(author, "CONTENT_REMOVED"),
+                Map.entry(subjectA, "REVIEW_ABOUT_YOU_REMOVED"),
+                Map.entry(subjectB, "REVIEW_ABOUT_YOU_REMOVED"));
+    }
+
+    @Test
+    @DisplayName("audit-fix SEC 3 — a subject who also reported gets BOTH rows (no reporter inference by feed diff); "
+            + "the author still wins over the subject")
+    void should_writeSubjectRowToReporter_and_letAuthorWin() {
+        UUID reporterSubject = UUID.randomUUID();
+        UUID authorSubject = UUID.randomUUID();
+        UUID plainSubject = UUID.randomUUID();
+        UUID batch = UUID.randomUUID();
+
+        service.notifyModerationOutcome(new ModerationOutcome(ReportTargetType.CLIENT_REVIEW,
+                ReportResolution.REMOVED, batch, Set.of(reporterSubject), Set.of(authorSubject),
+                Set.of(reporterSubject, authorSubject, plainSubject)));
+
+        assertThat(writtenRows("CLIENT_REVIEW", batch)).containsExactlyInAnyOrder(
+                Map.entry(reporterSubject, "REPORT_CONTENT_REMOVED"),
+                Map.entry(reporterSubject, "REVIEW_ABOUT_YOU_REMOVED"),
+                Map.entry(authorSubject, "CONTENT_REMOVED"),
+                Map.entry(plainSubject, "REVIEW_ABOUT_YOU_REMOVED"));
+    }
+
+    @Test
+    @DisplayName("audit-fix cycle 2 — an author who also reported gets BOTH the reporter row and CONTENT_REMOVED "
+            + "(no reporter inference inside a salon team)")
+    void should_writeBothRows_when_authorIsReporter() {
+        UUID author = UUID.randomUUID();
+        UUID batch = UUID.randomUUID();
+
+        service.notifyModerationOutcome(new ModerationOutcome(ReportTargetType.REVIEW, ReportResolution.REMOVED,
+                batch, Set.of(author), Set.of(author), null));
+
+        assertThat(writtenRows("REVIEW", batch)).containsExactlyInAnyOrder(
+                Map.entry(author, "REPORT_CONTENT_REMOVED"), Map.entry(author, "CONTENT_REMOVED"));
+    }
+
+    @Test
+    @DisplayName("audit-fix PERF 2 — pre-resolved salon author ids are written as-is; no Salon / User entity is loaded")
+    void should_writePreResolvedAuthorIds_without_loadingEntities() {
+        UUID adminId = UUID.randomUUID();
+        UUID batch = UUID.randomUUID();
+
+        service.notifyModerationOutcome(new ModerationOutcome(ReportTargetType.PORTFOLIO_PHOTO,
+                ReportResolution.REMOVED, batch, Set.of(), Set.of(ownerId, adminId), null));
+
+        assertThat(writtenRows("PORTFOLIO_PHOTO", batch)).containsExactlyInAnyOrder(
+                Map.entry(ownerId, "CONTENT_REMOVED"), Map.entry(adminId, "CONTENT_REMOVED"));
+        org.mockito.Mockito.verifyNoInteractions(salonRepository, userRepository);
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest(name = "{0} {1}")
+    @org.junit.jupiter.params.provider.CsvSource({"PORTFOLIO_PHOTO, REMOVED", "REVIEW, DISMISSED", "REVIEW, RESTORED",
+            "REVIEW, TARGET_GONE", "CLIENT_REVIEW, DISMISSED"})
+    @DisplayName("D4 — no author or subject row for a photo subject or any resolution other than REMOVED of a review")
+    void should_notNotifySubjectOrAuthor_when_notApplicable(ReportTargetType target, ReportResolution resolution) {
+        UUID subject = UUID.randomUUID();
+        UUID author = UUID.randomUUID();
+        boolean authorApplies = resolution == ReportResolution.REMOVED;
+
+        service.notifyModerationOutcome(new ModerationOutcome(target, resolution, UUID.randomUUID(), Set.of(),
+                authorApplies ? Set.of() : Set.of(author), Set.of(subject)));
+
+        verify(repository, never()).insertModerationOutcomes(any(), any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("nobody to notify → no statement at all")
+    void should_writeNothing_when_noRecipients() {
+        service.notifyModerationOutcome(new ModerationOutcome(ReportTargetType.SALON_PROFILE,
+                ReportResolution.ACTIONED, UUID.randomUUID(), Set.of(), null, null));
+
+        verify(repository, never()).insertModerationOutcomes(any(), any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("pushEnabled=true routes the merged moderation write to its push twin")
+    void should_usePushTwin_when_pushEnabledModerationOutcome() {
+        service = new InAppNotificationService(
+                repository, salonRepository, new InAppRecipientResolver(userRepository), true);
+
+        service.notifyModerationOutcome(new ModerationOutcome(ReportTargetType.SALON_PROFILE,
+                ReportResolution.ACTIONED, UUID.randomUUID(), Set.of(UUID.randomUUID()), null, null));
+
+        verify(repository).insertModerationOutcomesWithPush(any(), any(), eq("SALON_PROFILE"), any());
+        verify(repository, never()).insertModerationOutcomes(any(), any(), any(), any());
+    }
+
+    /**
+     * The (recipient, type) rows of the single merged insert, asserting it ran exactly once with the expected target
+     * type and batch id and with parallel arrays of equal length.
+     */
+    private List<Map.Entry<UUID, String>> writtenRows(String targetType, UUID batch) {
+        ArgumentCaptor<UUID[]> ids = ArgumentCaptor.forClass(UUID[].class);
+        ArgumentCaptor<String[]> types = ArgumentCaptor.forClass(String[].class);
+        verify(repository, times(1)).insertModerationOutcomes(ids.capture(), types.capture(), eq(targetType), eq(batch));
+        assertThat(ids.getValue()).hasSameSizeAs(types.getValue());
+        List<Map.Entry<UUID, String>> rows = new java.util.ArrayList<>();
+        for (int i = 0; i < ids.getValue().length; i++) {
+            rows.add(Map.entry(ids.getValue()[i], types.getValue()[i]));
+        }
+        return rows;
     }
 }

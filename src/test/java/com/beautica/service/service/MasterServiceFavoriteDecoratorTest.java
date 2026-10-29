@@ -101,7 +101,7 @@ class MasterServiceFavoriteDecoratorTest {
         UUID notFavourited = UUID.randomUUID();
         List<MasterServiceResponse> services = List.of(stub(favourited), stub(notFavourited));
         Authentication client = authenticatedAs(clientId, Role.CLIENT);
-        when(favoriteRepository.findFavoritedServiceIds(eq(clientId), eq(FavoriteTargetType.SERVICE), any()))
+        when(favoriteRepository.findFavoritedTargetIds(eq(clientId), eq(FavoriteTargetType.SERVICE), any()))
                 .thenReturn(Set.of(favourited));
 
         List<MasterServiceResponse> result = decorator.decorate(services, client);
@@ -126,7 +126,7 @@ class MasterServiceFavoriteDecoratorTest {
         List<MasterServiceResponse> result = decorator.decorate(List.of(), client);
 
         assertThat(result).isEmpty();
-        verify(favoriteRepository, never()).findFavoritedServiceIds(any(), any(), any());
+        verify(favoriteRepository, never()).findFavoritedTargetIds(any(), any(), any());
     }
 
     @Test
@@ -137,7 +137,7 @@ class MasterServiceFavoriteDecoratorTest {
         MasterServiceResponse original = stub(UUID.randomUUID());
         List<MasterServiceResponse> services = List.of(original);
         Authentication client = authenticatedAs(clientId, Role.CLIENT);
-        when(favoriteRepository.findFavoritedServiceIds(eq(clientId), eq(FavoriteTargetType.SERVICE), any()))
+        when(favoriteRepository.findFavoritedTargetIds(eq(clientId), eq(FavoriteTargetType.SERVICE), any()))
                 .thenReturn(Set.of());
 
         List<MasterServiceResponse> result = decorator.decorate(services, client);

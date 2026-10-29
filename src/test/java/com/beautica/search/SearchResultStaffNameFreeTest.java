@@ -25,6 +25,9 @@ class SearchResultStaffNameFreeTest {
 
         assertThat(components).containsExactlyInAnyOrder(
                 "salonId", "name", "cityLabel", "districtLabel", "avatarUrl", "priceMin", "priceMax",
-                "serviceNames", "street", "buildingNo", "locationNote", "matchedServiceNames");
+                "serviceNames", "street", "buildingNo", "locationNote", "matchedServiceNames",
+                // Not staff data and never cached as true: per-caller flag, decorated after the
+                // cache read by ProviderFavoriteDecorator — no rename eviction needed.
+                "isFavorite");
     }
 }

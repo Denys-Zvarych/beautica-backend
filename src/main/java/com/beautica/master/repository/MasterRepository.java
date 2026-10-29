@@ -104,6 +104,17 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
             """)
     Optional<Master> findActiveByUserIdWithUserAndSalon(@Param("userId") UUID userId);
 
+    /**
+     * Phase 414 — one master by id with its (nullable, phase 294) user fetched in the same statement, for the support
+     * report e-mail (name + avatar). Active or not: a reported profile may since have been deactivated or detached.
+     */
+    @Query("""
+            SELECT m FROM Master m
+            LEFT JOIN FETCH m.user
+            WHERE m.id = :masterId
+            """)
+    Optional<Master> findByIdWithUser(@Param("masterId") UUID masterId);
+
     /** @deprecated No JOIN FETCH on user — triggers N+1. Use {@link #findBySalonIdAndIsActiveTrueWithUser} instead. */
     @Deprecated
     Page<Master> findBySalonIdAndIsActiveTrue(UUID salonId, Pageable pageable);
@@ -519,7 +530,7 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
      * from its snapshot, so dirty-checking never writes the column back.
      *
      * <p><b>3s {@code lock_timeout}, fused</b> (perf audit L3) — the {@code FROM (SELECT set_config(...))}
-     * join-source shape of {@code AppointmentRepository#consumeCancelToken} (an {@code UPDATE} has no target
+     * join-source shape of {@code AppointmentRepository#consumeCancelTokenHash} (an {@code UPDATE} has no target
      * list to carry it): Postgres evaluates the 1-row source, and so sets the transaction-local GUC, before
      * the implicit row lock on the matching master row, so a concurrent holder bounds this wait to 3s like
      * the salon twin {@code SalonRepository#lockSalonIdsWithoutBookingSlug}. A longer wait fails with

@@ -5,6 +5,7 @@ import com.beautica.service.entity.ServiceTypeSuggestion;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingSource;
 import com.beautica.master.entity.Master;
+import com.beautica.moderation.service.ModerationOutcome;
 import com.beautica.notification.inapp.entity.InAppNotificationType;
 import com.beautica.notification.inapp.repository.InAppNotificationRepository;
 import com.beautica.salon.entity.Salon;
@@ -383,6 +384,65 @@ public class InAppNotificationService {
                 : InAppNotificationType.SERVICE_TYPE_SUGGESTION_REJECTED;
         writeRequestDecision(type, requesterId, null, suggestion.getId(), dedupKey(type, suggestion.getId()));
         log.debug("in-app notify type={} suggestionId={}", type, suggestion.getId());
+    }
+
+    /**
+     * Phase 415 D6 / D8 — the feed rows for one {@code ModerationService#resolve} call, in its transaction (a rolled
+     * back resolve writes nothing). Reporters get the outcome type; the author of removed content gets
+     * {@code CONTENT_REMOVED} — ALSO when they reported it (audit-fix cycle 2: a salon team's reporting admin must not
+     * be the only author without the row); the subject of a removed review gets
+     * {@code REVIEW_ABOUT_YOU_REMOVED} — ALSO when they reported it (audit-fix SEC 3: dropping it for reporters would
+     * let a salon team spot the reporter by comparing feeds) — unless they are the author (author wins). Author and
+     * subject ids arrive pre-resolved as scalars, so nothing is loaded here while the caller's locks are held. All
+     * groups go out in ONE statement (audit-fix PERF 5).
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void notifyModerationOutcome(ModerationOutcome outcome) {
+        InAppNotificationType reporterType =
+                ModerationOutcomeTypes.reporterType(outcome.targetType(), outcome.resolution());
+        Set<UUID> reporters = outcome.reporterIds();
+
+        Set<UUID> authors = new LinkedHashSet<>();
+        if (ModerationOutcomeTypes.notifiesAuthor(outcome.targetType(), outcome.resolution())) {
+            authors.addAll(outcome.authorIds());
+        }
+        Set<UUID> subjects = new LinkedHashSet<>();
+        if (ModerationOutcomeTypes.notifiesSubject(outcome.targetType(), outcome.resolution())) {
+            subjects.addAll(outcome.subjectIds());
+            subjects.removeAll(outcome.authorIds());
+        }
+
+        List<UUID> recipientIds = new ArrayList<>();
+        List<String> types = new ArrayList<>();
+        addRows(recipientIds, types, reporters, reporterType);
+        addRows(recipientIds, types, authors, InAppNotificationType.CONTENT_REMOVED);
+        addRows(recipientIds, types, subjects, InAppNotificationType.REVIEW_ABOUT_YOU_REMOVED);
+        if (!recipientIds.isEmpty()) {
+            writeModerationOutcomes(recipientIds, types, outcome);
+        }
+        // D11: types and counts only — never a user id, comment or content.
+        log.info("in-app moderation outcome targetType={} resolution={} reporterType={} reporters={} authors={} "
+                        + "subjects={}", outcome.targetType(), outcome.resolution(), reporterType, reporters.size(),
+                authors.size(), subjects.size());
+    }
+
+    private static void addRows(List<UUID> recipientIds, List<String> types, Set<UUID> group,
+                                InAppNotificationType type) {
+        for (UUID id : group) {
+            recipientIds.add(id);
+            types.add(type.name());
+        }
+    }
+
+    private void writeModerationOutcomes(List<UUID> recipientIds, List<String> types, ModerationOutcome outcome) {
+        UUID[] ids = recipientIds.toArray(UUID[]::new);
+        String[] typeNames = types.toArray(String[]::new);
+        String targetType = outcome.targetType().name();
+        if (pushEnabled) {
+            repository.insertModerationOutcomesWithPush(ids, typeNames, targetType, outcome.batchReportId());
+            return;
+        }
+        repository.insertModerationOutcomes(ids, typeNames, targetType, outcome.batchReportId());
     }
 
     private void writeRequestDecision(

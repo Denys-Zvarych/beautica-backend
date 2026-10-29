@@ -12,8 +12,10 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.slf4j.LoggerFactory;
+import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestClient;
 
+import java.net.ServerSocket;
 import java.time.Duration;
 
 import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
@@ -147,6 +149,52 @@ class TurbosmsServiceTest {
     }
 
     @Test
+    @Timeout(5)
+    @DisplayName("read timeout after the request was written → AMBIGUOUS outcome (the provider may have sent it)")
+    void should_throwAmbiguous_when_turbosmsReadTimesOut() {
+        TurbosmsProperties props = new TurbosmsProperties();
+        props.setToken(TOKEN);
+        props.setBaseUrl(wireMock.baseUrl() + PATH);
+        props.setReadTimeout(Duration.ofMillis(300));
+        TurbosmsService shortTimeout = new TurbosmsService(RestClient.builder(), props);
+        wireMock.stubFor(post(urlEqualTo(PATH))
+                .willReturn(aResponse().withStatus(200).withFixedDelay(2000)
+                        .withBody("{\"response_status\":\"OK\"}")));
+
+        assertThatThrownBy(() -> shortTimeout.send(PHONE, OTP_TEXT))
+                .isInstanceOf(SmsDeliveryAmbiguousException.class);
+        wireMock.verify(1, postRequestedFor(urlEqualTo(PATH)));
+    }
+
+    @Test
+    @DisplayName("an HTTP error status is a DEFINITE refusal, not an ambiguous outcome")
+    void should_throwDefiniteFailure_when_responseIs5xx() {
+        wireMock.stubFor(post(urlEqualTo(PATH)).willReturn(aResponse().withStatus(503)));
+
+        assertThatThrownBy(() -> service.send(PHONE, OTP_TEXT))
+                .isInstanceOf(SmsDeliveryException.class)
+                .isNotInstanceOf(SmsDeliveryAmbiguousException.class);
+    }
+
+    @Test
+    @Timeout(10)
+    @DisplayName("connection refused (request never sent) is a DEFINITE failure, not an ambiguous outcome")
+    void should_throwDefiniteFailure_when_connectionRefused() throws Exception {
+        int closedPort;
+        try (ServerSocket socket = new ServerSocket(0)) {
+            closedPort = socket.getLocalPort();
+        }
+        TurbosmsProperties props = new TurbosmsProperties();
+        props.setToken(TOKEN);
+        props.setBaseUrl("http://127.0.0.1:" + closedPort + PATH);
+        TurbosmsService refused = new TurbosmsService(RestClient.builder(), props);
+
+        assertThatThrownBy(() -> refused.send(PHONE, OTP_TEXT))
+                .isInstanceOf(SmsDeliveryException.class)
+                .isNotInstanceOf(SmsDeliveryAmbiguousException.class);
+    }
+
+    @Test
     @DisplayName("should_failFast_when_turbosmsTimeoutIsNullZeroOrNegative")
     void should_failFast_when_turbosmsTimeoutIsNullZeroOrNegative() {
         for (Duration bad : new Duration[]{null, Duration.ZERO, Duration.ofSeconds(-1)}) {
@@ -205,6 +253,44 @@ class TurbosmsServiceTest {
         assertThat(allLogs).doesNotContain("482913");
         assertThat(allLogs).doesNotContain(PHONE);
         assertThat(allLogs).contains("+380***4567");
+    }
+
+    @Test
+    @Timeout(5)
+    @DisplayName("isOutcomeUnknown — a cyclic cause chain (A -> B -> A) terminates and reads as UNKNOWN")
+    void should_terminateAsUnknown_when_causeChainIsCyclic() {
+        java.io.IOException first = new java.io.IOException("first");
+        java.io.IOException second = new java.io.IOException("second", first);
+        first.initCause(second);
+        ResourceAccessException e = new ResourceAccessException("I/O error", second);
+
+        boolean unknown = TurbosmsService.isOutcomeUnknown(e);
+
+        assertThat(unknown).isTrue();
+    }
+
+    @Test
+    @DisplayName("isOutcomeUnknown — a pre-send cause inside the depth cap is definite; one past it is UNKNOWN")
+    void should_honourDepthCap_when_preSendCauseIsDeep() {
+        ResourceAccessException shallow = new ResourceAccessException("I/O error",
+                wrap(new java.net.ConnectException("refused"), TurbosmsService.MAX_CAUSE_DEPTH - 2));
+        ResourceAccessException deep = new ResourceAccessException("I/O error",
+                wrap(new java.net.ConnectException("refused"), TurbosmsService.MAX_CAUSE_DEPTH));
+
+        boolean shallowUnknown = TurbosmsService.isOutcomeUnknown(shallow);
+        boolean deepUnknown = TurbosmsService.isOutcomeUnknown(deep);
+
+        assertThat(shallowUnknown).as("ConnectException at depth %s", TurbosmsService.MAX_CAUSE_DEPTH - 1).isFalse();
+        assertThat(deepUnknown).as("ConnectException past the cap").isTrue();
+    }
+
+    /** {@code root} under {@code layers} IOException wrappers. */
+    private static java.io.IOException wrap(java.io.IOException root, int layers) {
+        java.io.IOException t = root;
+        for (int i = 0; i < layers; i++) {
+            t = new java.io.IOException("layer " + i, t);
+        }
+        return t;
     }
 
     private String renderLogs() {

@@ -102,8 +102,40 @@ public record PublicSalonResponse(
                         + "ONLY when its name is ambiguous within its oblast (same rule as "
                         + "GET /settlements hromadaNameUk); null otherwise. The oblast half of "
                         + "the label is `region`.")
-        String cityHromadaNameUk
+        String cityHromadaNameUk,
+        /**
+         * Whether the CALLER has favourited this salon. {@code true}/{@code false} for an
+         * authenticated CLIENT; always {@code false} for anonymous and non-CLIENT callers, and
+         * always {@code false} where this DTO is nested: {@code MasterDetailResponse.salon.isFavorite}
+         * is never decorated, so it reads {@code false} even for a salon the client favourited.
+         * Only the top-level {@code GET /salons/{id}} body carries the real flag.
+         *
+         * <p><b>Never set inside a cached factory.</b> {@code salon-detail} is keyed by
+         * {@code salonId} alone and shared across every caller, so the flag is always
+         * {@code false} in the cached entry and attached per request, AFTER the cache read, by
+         * {@code ProviderFavoriteDecorator} through {@link #withIsFavorite} — the Phase 243
+         * pattern ({@code SalonServiceFavoriteDecorator}).
+         */
+        @Schema(defaultValue = "false", description = "Whether the signed-in CLIENT has favourited "
+                + "this salon. Always false for anonymous and non-CLIENT callers, and where this "
+                + "object is nested in another response. Decorated per request, after the cache read.")
+        boolean isFavorite
 ) {
+    /**
+     * Additive-field constructor: builds the caller-agnostic shape with {@code isFavorite =
+     * false} — the only shape a cached factory may produce.
+     */
+    public PublicSalonResponse(
+            UUID id, String name, String description, String city, String region, String address,
+            UUID cityId, UUID oblastId, UUID districtId, String street, String buildingNo,
+            String locationNote, String phone, String instagramUrl, String avatarUrl,
+            String coverImageUrl, BigDecimal avgRating, int reviewCount,
+            SettlementType citySettlementType, String cityHromadaNameUk) {
+        this(id, name, description, city, region, address, cityId, oblastId, districtId, street,
+                buildingNo, locationNote, phone, instagramUrl, avatarUrl, coverImageUrl, avgRating,
+                reviewCount, citySettlementType, cityHromadaNameUk, false);
+    }
+
     /**
      * @param salon    the salon entity
      * @param oblastId the PK of the Oblast that owns {@code salon.getCityId()}, resolved by
@@ -142,6 +174,17 @@ public record PublicSalonResponse(
                 settlement == null ? null : settlement.settlementType(),
                 settlement == null ? null : settlement.hromadaNameUk()
         );
+    }
+
+    /**
+     * Returns a copy carrying the caller-specific {@code isFavorite}. Called by
+     * {@code ProviderFavoriteDecorator} after the cache read, never inside a cached factory.
+     */
+    public PublicSalonResponse withIsFavorite(boolean isFavorite) {
+        return new PublicSalonResponse(id, name, description, city, region, address, cityId,
+                oblastId, districtId, street, buildingNo, locationNote, phone, instagramUrl,
+                avatarUrl, coverImageUrl, avgRating, reviewCount, citySettlementType,
+                cityHromadaNameUk, isFavorite);
     }
 
     /**

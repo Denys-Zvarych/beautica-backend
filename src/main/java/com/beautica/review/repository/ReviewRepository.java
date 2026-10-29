@@ -4,16 +4,51 @@ import com.beautica.review.dto.MyReviewResponse;
 import com.beautica.review.entity.Review;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
+import jakarta.persistence.LockModeType;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Lock;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
+import java.util.Collection;
 import java.util.List;
+import java.time.Instant;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 
+/**
+ * <b>Phase 396 D3 — moderation visibility.</b> Every PUBLIC read here (master/salon lists and their counts, the
+ * newest-reviews pages, the rating histograms, {@link #findByIdWithAssociations} behind {@code GET /reviews/{id}})
+ * and both rating aggregates ({@link #recalculateMasterRating}, {@link #recalculateSalonRating}) filter
+ * {@code moderation_status = 'VISIBLE'}. Deliberately UNFILTERED: the author's own {@link #findMyReviews}, the
+ * booking-detail {@link #findViewByBookingId} (row kept for canReview, body nulled unless VISIBLE), and the existence probes
+ * ({@link #existsByBookingId}, {@link #findReviewedBookingIds}) — a hidden review still occupies its booking, so it
+ * can never be written twice. A new public read MUST carry the same predicate.
+ */
 public interface ReviewRepository extends JpaRepository<Review, UUID> {
+
+    /**
+     * Phase 396 — the review row, locked {@code FOR UPDATE}, for a moderation transition. Serialises concurrent
+     * reports on the same review so the auto-hide count of the second one sees the first one's committed row.
+     */
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("SELECT r FROM Review r WHERE r.id = :id")
+    Optional<Review> findByIdForUpdate(@Param("id") UUID id);
+
+    /**
+     * Phase 396 auto-hide cap — reviews of the same provider as {@code reviewId} (its master, or its salon) that an
+     * auto-hide moved to HIDDEN_PENDING at or after {@code since}. Provider resolved in SQL from the review row, so a
+     * null salon needs no null-typed bind. Served by the partial {@code idx_reviews_auto_hidden_at} (V209).
+     */
+    @Query(value = """
+            SELECT COUNT(*) FROM reviews r
+              JOIN reviews p ON p.id = :reviewId
+             WHERE r.auto_hidden_at >= :since
+               AND (r.master_id = p.master_id OR r.salon_id = p.salon_id)
+            """, nativeQuery = true)
+    long countAutoHiddenForProviderSince(@Param("reviewId") UUID reviewId, @Param("since") Instant since);
 
     // Cheaper than findByBookingId(...).isPresent() — derived as SELECT COUNT(*) > 0.
     boolean existsByBookingId(UUID bookingId);
@@ -50,12 +85,27 @@ public interface ReviewRepository extends JpaRepository<Review, UUID> {
      * Do NOT widen it to carry the author's name or the service name — see
      * {@link BookingReviewView}'s javadoc.
      */
+    /**
+     * Phase 395 — of the given review ids (one page, at most {@code max-page-size}), those written by
+     * {@code clientId}. Backs the per-viewer {@code authoredByViewer} flag on the cached public review lists;
+     * primary-key lookups only, no association is loaded.
+     */
+    @Query("SELECT r.id FROM Review r WHERE r.client.id = :clientId AND r.id IN :ids")
+    Set<UUID> findIdsByClientIdAndIdIn(@Param("clientId") UUID clientId, @Param("ids") Collection<UUID> ids);
+
     @Query("""
             SELECT new com.beautica.review.repository.BookingReviewView(
-                r.rating, r.comment)
+                r.id,
+                CASE WHEN r.moderationStatus = com.beautica.review.entity.ModerationStatus.VISIBLE
+                     THEN r.rating ELSE NULL END,
+                CASE WHEN r.moderationStatus = com.beautica.review.entity.ModerationStatus.VISIBLE
+                     THEN r.comment ELSE NULL END)
             FROM Review r
             WHERE r.booking.id = :bookingId
             """)
+    // Phase 396 audit-fix: the ROW is returned whatever the moderation status (a hidden / removed review still
+    // occupies its booking, so canReview stays false), but its body (rating + comment) only while VISIBLE. A null
+    // rating marks a moderated review; BookingService then omits reviewByClient.
     Optional<BookingReviewView> findViewByBookingId(@Param("bookingId") UUID bookingId);
 
     // Two-query pattern — avoids HHH90003004 (Hibernate in-memory pagination warning).
@@ -63,11 +113,13 @@ public interface ReviewRepository extends JpaRepository<Review, UUID> {
     @Query(value = """
             SELECT r.id FROM Review r
             WHERE r.master.id = :masterId
+              AND r.moderationStatus = com.beautica.review.entity.ModerationStatus.VISIBLE
             ORDER BY r.createdAt DESC
             """,
            countQuery = """
             SELECT COUNT(r) FROM Review r
             WHERE r.master.id = :masterId
+              AND r.moderationStatus = com.beautica.review.entity.ModerationStatus.VISIBLE
             """)
     Page<UUID> findIdsByMasterIdOrderByCreatedAtDesc(@Param("masterId") UUID masterId, Pageable pageable);
 
@@ -84,33 +136,39 @@ public interface ReviewRepository extends JpaRepository<Review, UUID> {
     @Query(value = """
             SELECT r.id FROM Review r
             WHERE r.master.id = :masterId
+              AND r.moderationStatus = com.beautica.review.entity.ModerationStatus.VISIBLE
             ORDER BY r.createdAt ASC
             """,
            countQuery = """
             SELECT COUNT(r) FROM Review r
             WHERE r.master.id = :masterId
+              AND r.moderationStatus = com.beautica.review.entity.ModerationStatus.VISIBLE
             """)
     Page<UUID> findIdsByMasterIdOrderByCreatedAtAsc(@Param("masterId") UUID masterId, Pageable pageable);
 
     @Query(value = """
             SELECT r.id FROM Review r
             WHERE r.master.id = :masterId
+              AND r.moderationStatus = com.beautica.review.entity.ModerationStatus.VISIBLE
             ORDER BY r.rating DESC, r.createdAt DESC
             """,
            countQuery = """
             SELECT COUNT(r) FROM Review r
             WHERE r.master.id = :masterId
+              AND r.moderationStatus = com.beautica.review.entity.ModerationStatus.VISIBLE
             """)
     Page<UUID> findIdsByMasterIdOrderByRatingDescCreatedAtDesc(@Param("masterId") UUID masterId, Pageable pageable);
 
     @Query(value = """
             SELECT r.id FROM Review r
             WHERE r.master.id = :masterId
+              AND r.moderationStatus = com.beautica.review.entity.ModerationStatus.VISIBLE
             ORDER BY r.rating ASC, r.createdAt DESC
             """,
            countQuery = """
             SELECT COUNT(r) FROM Review r
             WHERE r.master.id = :masterId
+              AND r.moderationStatus = com.beautica.review.entity.ModerationStatus.VISIBLE
             """)
     Page<UUID> findIdsByMasterIdOrderByRatingAscCreatedAtDesc(@Param("masterId") UUID masterId, Pageable pageable);
 
@@ -221,6 +279,7 @@ public interface ReviewRepository extends JpaRepository<Review, UUID> {
             JOIN FETCH b.masterService ms
             JOIN FETCH ms.serviceDefinition
             WHERE r.id = :id
+              AND r.moderationStatus = com.beautica.review.entity.ModerationStatus.VISIBLE
             """)
     Optional<Review> findByIdWithAssociations(@Param("id") UUID id);
 
@@ -236,7 +295,8 @@ public interface ReviewRepository extends JpaRepository<Review, UUID> {
               FROM (SELECT COALESCE(AVG(r.rating::numeric), 0) AS avg_rating,
                            COUNT(*) AS cnt
                       FROM reviews r
-                     WHERE r.master_id = :masterId) agg
+                     WHERE r.master_id = :masterId
+                       AND r.moderation_status = 'VISIBLE') agg
              WHERE m.id = :masterId
             """, nativeQuery = true)
     void recalculateMasterRating(@Param("masterId") UUID masterId);
@@ -306,6 +366,7 @@ public interface ReviewRepository extends JpaRepository<Review, UUID> {
                               FROM reviews r
                               JOIN masters m ON m.id = r.master_id
                              WHERE r.salon_id = :salonId
+                               AND r.moderation_status = 'VISIBLE'
                                AND m.salon_id = :salonId
                                AND m.is_active = true
                              GROUP BY r.master_id) pm) agg
@@ -333,6 +394,7 @@ public interface ReviewRepository extends JpaRepository<Review, UUID> {
             FROM Review r
             JOIN r.master m
             WHERE r.salon.id = :salonId
+              AND r.moderationStatus = com.beautica.review.entity.ModerationStatus.VISIBLE
               AND m.salon.id = :salonId
               AND m.isActive = true
             GROUP BY r.rating
@@ -347,7 +409,8 @@ public interface ReviewRepository extends JpaRepository<Review, UUID> {
      * every star rating is present in the response. No new index needed: {@code reviews.master_id}
      * is already indexed (used by {@link #findIdsByMasterIdOrderByCreatedAtDesc}).
      */
-    @Query("SELECT r.rating AS rating, COUNT(r) AS count FROM Review r WHERE r.master.id = :masterId GROUP BY r.rating")
+    @Query("SELECT r.rating AS rating, COUNT(r) AS count FROM Review r WHERE r.master.id = :masterId"
+            + " AND r.moderationStatus = com.beautica.review.entity.ModerationStatus.VISIBLE GROUP BY r.rating")
     List<RatingCountProjection> countByMasterIdGroupByRating(@Param("masterId") UUID masterId);
 
     // ── Salon reviews — sortable list (Phase 13.6) ─────────────────────────────
@@ -362,44 +425,52 @@ public interface ReviewRepository extends JpaRepository<Review, UUID> {
     @Query(value = """
             SELECT r.id FROM Review r
             WHERE r.salon.id = :salonId
+              AND r.moderationStatus = com.beautica.review.entity.ModerationStatus.VISIBLE
             ORDER BY r.createdAt DESC
             """,
            countQuery = """
             SELECT COUNT(r) FROM Review r
             WHERE r.salon.id = :salonId
+              AND r.moderationStatus = com.beautica.review.entity.ModerationStatus.VISIBLE
             """)
     Page<UUID> findIdsBySalonIdOrderByCreatedAtDesc(@Param("salonId") UUID salonId, Pageable pageable);
 
     @Query(value = """
             SELECT r.id FROM Review r
             WHERE r.salon.id = :salonId
+              AND r.moderationStatus = com.beautica.review.entity.ModerationStatus.VISIBLE
             ORDER BY r.createdAt ASC
             """,
            countQuery = """
             SELECT COUNT(r) FROM Review r
             WHERE r.salon.id = :salonId
+              AND r.moderationStatus = com.beautica.review.entity.ModerationStatus.VISIBLE
             """)
     Page<UUID> findIdsBySalonIdOrderByCreatedAtAsc(@Param("salonId") UUID salonId, Pageable pageable);
 
     @Query(value = """
             SELECT r.id FROM Review r
             WHERE r.salon.id = :salonId
+              AND r.moderationStatus = com.beautica.review.entity.ModerationStatus.VISIBLE
             ORDER BY r.rating DESC, r.createdAt DESC
             """,
            countQuery = """
             SELECT COUNT(r) FROM Review r
             WHERE r.salon.id = :salonId
+              AND r.moderationStatus = com.beautica.review.entity.ModerationStatus.VISIBLE
             """)
     Page<UUID> findIdsBySalonIdOrderByRatingDescCreatedAtDesc(@Param("salonId") UUID salonId, Pageable pageable);
 
     @Query(value = """
             SELECT r.id FROM Review r
             WHERE r.salon.id = :salonId
+              AND r.moderationStatus = com.beautica.review.entity.ModerationStatus.VISIBLE
             ORDER BY r.rating ASC, r.createdAt DESC
             """,
            countQuery = """
             SELECT COUNT(r) FROM Review r
             WHERE r.salon.id = :salonId
+              AND r.moderationStatus = com.beautica.review.entity.ModerationStatus.VISIBLE
             """)
     Page<UUID> findIdsBySalonIdOrderByRatingAscCreatedAtDesc(@Param("salonId") UUID salonId, Pageable pageable);
 
@@ -450,6 +521,7 @@ public interface ReviewRepository extends JpaRepository<Review, UUID> {
             JOIN FETCH b.masterService ms
             JOIN FETCH ms.serviceDefinition
             WHERE r.master.id = :masterId
+              AND r.moderationStatus = com.beautica.review.entity.ModerationStatus.VISIBLE
             ORDER BY r.createdAt DESC
             """)
     List<Review> findLatestWithGraphByMasterId(@Param("masterId") UUID masterId, Pageable pageable);
@@ -464,7 +536,66 @@ public interface ReviewRepository extends JpaRepository<Review, UUID> {
             JOIN FETCH b.masterService ms
             JOIN FETCH ms.serviceDefinition
             WHERE r.salon.id = :salonId
+              AND r.moderationStatus = com.beautica.review.entity.ModerationStatus.VISIBLE
             ORDER BY r.createdAt DESC
             """)
     List<Review> findLatestWithGraphBySalonId(@Param("salonId") UUID salonId, Pageable pageable);
+
+    /**
+     * Phase 402 D1 — the {@code GUEST_LINK} reviews of {@code bookingIds} whose author label is not yet
+     * {@code sentinel}. Served by the UNIQUE {@code booking_id} index; at most one row per booking.
+     */
+    @Query(value = """
+            SELECT r.id AS id, r.master_id AS masterId, r.salon_id AS salonId
+              FROM reviews r
+             WHERE r.booking_id IN (:bookingIds)
+               AND r.source = 'GUEST_LINK'
+               AND r.guest_display_name <> :sentinel
+            """, nativeQuery = true)
+    List<GuestReviewRef> findGuestReviewsToAnonymise(
+            @Param("bookingIds") Collection<UUID> bookingIds, @Param("sentinel") String sentinel);
+
+    /**
+     * Phase 402 D1 — sets the author label of the given {@code GUEST_LINK} reviews to {@code sentinel}
+     * ({@code GuestPii.ANONYMISED_NAME}); rating and text stay. {@code flushAutomatically}: pending changes reach the
+     * DB first. {@code clearAutomatically} (phase 399 audit): {@code Review} has no {@code @DynamicUpdate}, so a
+     * {@code Review} already managed in this persistence context would otherwise be re-read from the L1 cache with
+     * the old label and, once dirtied (e.g. moderated), written back over the sentinel.
+     */
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query(value = """
+            UPDATE reviews
+               SET guest_display_name = :sentinel,
+                   updated_at = now()
+             WHERE id IN (:reviewIds)
+               AND source = 'GUEST_LINK'
+            """, nativeQuery = true)
+    int anonymiseGuestDisplayNames(
+            @Param("reviewIds") Collection<UUID> reviewIds, @Param("sentinel") String sentinel);
+
+    /** Phase 415 — the parties of a review for moderation notifications (scalars only). */
+    interface ReviewModerationPartiesRef {
+        /** The author; null for a guest review or a detached client. */
+        UUID getClientId();
+
+        /**
+         * The reviewed salon: the review's own {@code salon_id} ONLY. NULL means the master's independent period (V41),
+         * so a master who has since joined a salon is still the subject, never the new salon (audit-fix SEC 1).
+         */
+        UUID getSalonId();
+
+        /** The reviewed master's account (used only when there is no salon). */
+        UUID getMasterUserId();
+    }
+
+    /** Phase 415 — scalar parties lookup (nothing enters the persistence context). */
+    @Query(value = """
+            SELECT r.client_id AS clientId,
+                   r.salon_id AS salonId,
+                   m.user_id AS masterUserId
+              FROM reviews r
+              JOIN masters m ON m.id = r.master_id
+             WHERE r.id = :reviewId
+            """, nativeQuery = true)
+    Optional<ReviewModerationPartiesRef> findModerationPartiesById(@Param("reviewId") UUID reviewId);
 }

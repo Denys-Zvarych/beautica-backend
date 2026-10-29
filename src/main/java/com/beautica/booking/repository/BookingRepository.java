@@ -736,6 +736,53 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     Optional<Booking> findByIdWithFullGraph(@Param("id") UUID id);
 
     /**
+     * Phase 401 D8 — the reviewable bookings of a VISIT-keyed review invite: the COMPLETED LINK guest bookings
+     * ({@code client_id IS NULL}) of {@code appointmentId}, ordered by {@code startsAt}. One statement, same fetch graph
+     * as {@link #findByIdWithFullGraph} (master + user, salon, service definition), because the guest review page reads
+     * the master name, the salon name and the service name of every row and the review create path reads
+     * {@code m.user}. Plus {@code m.salon} (phase 401 audit-fix): the provider card's master-visibility rule reads
+     * {@code master.getSalon().isActive()}, which was otherwise one lazy SELECT per GET. Bounded by the visit's size (at most 10 items). Unscoped: the caller
+     * ({@code GuestReviewService#resolveInviteBookings}) only ever passes an invite's own subject.
+     */
+    @Query("""
+            SELECT b FROM Booking b
+            JOIN FETCH b.master m
+            LEFT JOIN FETCH m.user
+            LEFT JOIN FETCH m.salon
+            LEFT JOIN FETCH b.salon
+            JOIN FETCH b.masterService ms
+            JOIN FETCH ms.serviceDefinition
+            WHERE b.appointment.id = :appointmentId
+              AND b.status = com.beautica.booking.enums.BookingStatus.COMPLETED
+              AND b.bookingSource = com.beautica.booking.enums.BookingSource.LINK
+              AND b.client IS NULL
+            ORDER BY b.startsAt ASC, b.id ASC
+            """)
+    List<Booking> findGuestReviewableByAppointmentIdWithGraph(@Param("appointmentId") UUID appointmentId);
+
+    /**
+     * Phase 401 D8 — the reviewable booking of a BOOKING-keyed review invite (V215): {@code bookingId} only when it
+     * still has no visit header ({@code appointment_id IS NULL}) and is a COMPLETED LINK guest booking
+     * ({@code client_id IS NULL}); otherwise empty. Same fetch graph as
+     * {@link #findGuestReviewableByAppointmentIdWithGraph}.
+     */
+    @Query("""
+            SELECT b FROM Booking b
+            JOIN FETCH b.master m
+            LEFT JOIN FETCH m.user
+            LEFT JOIN FETCH m.salon
+            LEFT JOIN FETCH b.salon
+            JOIN FETCH b.masterService ms
+            JOIN FETCH ms.serviceDefinition
+            WHERE b.id = :bookingId
+              AND b.appointment IS NULL
+              AND b.status = com.beautica.booking.enums.BookingStatus.COMPLETED
+              AND b.bookingSource = com.beautica.booking.enums.BookingSource.LINK
+              AND b.client IS NULL
+            """)
+    Optional<Booking> findGuestReviewableSingleBookingWithGraph(@Param("bookingId") UUID bookingId);
+
+    /**
      * All chained booking rows of ONE multi-service visit (BE-3), ordered by {@code startsAt}
      * ascending. That ordering is retained unconditionally, but "back-to-back" is NOT: once any
      * item has been rescheduled individually (phase 30.1's relaxed contiguity —
@@ -1701,6 +1748,113 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     List<SalonClosureBookingCandidate> findConfirmedFutureByClientId(
             @Param("clientId") UUID clientId, @Param("now") OffsetDateTime now);
 
+    // ── Client-block booking cascade (Phase 398 user decision 2026-10-28) ─────────────────────
+
+    /**
+     * Phase 398 — the future {@code CONFIRMED} bookings of ONE registered client with ONE independent master: the
+     * candidate scan of a new master-scope CLIENT block ({@code BookingService#declineFutureConfirmedForBlockedClient}).
+     * Same scope-agnostic {@link SalonClosureBookingCandidate} shape as its siblings; bounded by the master's
+     * own future calendar for one client. Served by {@code idx_bookings_client_slot_overlap} ({@code client_id,
+     * starts_at, ends_at}, partial on {@code CONFIRMED AND client_id IS NOT NULL}) — one client's future
+     * {@code CONFIRMED} rows are a handful, so {@code master_id} is a cheap residual filter; the master-leading
+     * {@code idx_bookings_master_slot_overlap} would scan the master's whole future calendar instead.
+     */
+    @Query("""
+            SELECT new com.beautica.booking.repository.SalonClosureBookingCandidate(
+                b.id,
+                b.appointment.id,
+                b.master.id,
+                b.startsAt
+            )
+            FROM Booking b
+            WHERE b.master.id = :masterId
+              AND b.client.id = :clientId
+              AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
+              AND b.startsAt > :now
+            """)
+    List<SalonClosureBookingCandidate> findConfirmedFutureByMasterIdAndClientId(
+            @Param("masterId") UUID masterId, @Param("clientId") UUID clientId, @Param("now") OffsetDateTime now);
+
+    /**
+     * Salon-scope twin of {@link #findConfirmedFutureByMasterIdAndClientId} — every master of the salon (the
+     * booking's own {@code salon_id} snapshot, which is the scope a salon block is written under). Served by the
+     * same {@code client_id}-leading partial index as its master twin ({@code idx_bookings_client_slot_overlap});
+     * {@code salon_id} is the residual filter.
+     */
+    @Query("""
+            SELECT new com.beautica.booking.repository.SalonClosureBookingCandidate(
+                b.id,
+                b.appointment.id,
+                b.master.id,
+                b.startsAt
+            )
+            FROM Booking b
+            WHERE b.salon.id = :salonId
+              AND b.client.id = :clientId
+              AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
+              AND b.startsAt > :now
+            """)
+    List<SalonClosureBookingCandidate> findConfirmedFutureBySalonIdAndClientId(
+            @Param("salonId") UUID salonId, @Param("clientId") UUID clientId, @Param("now") OffsetDateTime now);
+
+    /**
+     * Phase 398 — the future {@code CONFIRMED} LINK guest bookings of ONE OTP-verified phone with ONE independent
+     * master (new master-scope GUEST block). Matched by the canonical E.164 string the OTP gate pins
+     * ({@code PhoneOtpService} accepts only {@code +380XXXXXXXXX}), which is the exact pre-image of the block's
+     * {@code phone_hash}. LINK rows only — a STAFF walk-in's phone was typed by staff, never verified (D8).
+     *
+     * <p>The {@code guestPiiAnonymisedAt IS NULL AND clientDetachedAt IS NULL} conjuncts change no result — they
+     * only let the planner pick {@code idx_bookings_guest_phone_open} (V199, partial on exactly that predicate).
+     * {@code chk_bookings_guest_fields} (V206) makes them redundant for every LINK row: the LINK arm requires
+     * {@code client_detached_at IS NULL}, and a non-null {@code guest_phone} (implied by the equality match) is
+     * only allowed in the {@code guest_pii_anonymised_at IS NULL} sub-arm.
+     */
+    @Query("""
+            SELECT new com.beautica.booking.repository.SalonClosureBookingCandidate(
+                b.id,
+                b.appointment.id,
+                b.master.id,
+                b.startsAt
+            )
+            FROM Booking b
+            WHERE b.master.id = :masterId
+              AND b.client IS NULL
+              AND b.bookingSource = com.beautica.booking.enums.BookingSource.LINK
+              AND b.guestPhone = :guestPhone
+              AND b.guestPiiAnonymisedAt IS NULL
+              AND b.clientDetachedAt IS NULL
+              AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
+              AND b.startsAt > :now
+            """)
+    List<SalonClosureBookingCandidate> findConfirmedFutureLinkGuestByMasterIdAndPhone(
+            @Param("masterId") UUID masterId, @Param("guestPhone") String guestPhone,
+            @Param("now") OffsetDateTime now);
+
+    /**
+     * Salon-scope twin of {@link #findConfirmedFutureLinkGuestByMasterIdAndPhone} — same predicate, same
+     * {@code idx_bookings_guest_phone_open} access path.
+     */
+    @Query("""
+            SELECT new com.beautica.booking.repository.SalonClosureBookingCandidate(
+                b.id,
+                b.appointment.id,
+                b.master.id,
+                b.startsAt
+            )
+            FROM Booking b
+            WHERE b.salon.id = :salonId
+              AND b.client IS NULL
+              AND b.bookingSource = com.beautica.booking.enums.BookingSource.LINK
+              AND b.guestPhone = :guestPhone
+              AND b.guestPiiAnonymisedAt IS NULL
+              AND b.clientDetachedAt IS NULL
+              AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
+              AND b.startsAt > :now
+            """)
+    List<SalonClosureBookingCandidate> findConfirmedFutureLinkGuestBySalonIdAndPhone(
+            @Param("salonId") UUID salonId, @Param("guestPhone") String guestPhone,
+            @Param("now") OffsetDateTime now);
+
     /**
      * Every booking row still attached to {@code clientId} — the CLIENT account self-deletion
      * detach loop ({@code ClientAccountDeletionService}). Called AFTER the future-{@code
@@ -1981,7 +2135,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * Cancels every still-{@code CONFIRMED} child booking of a guest visit in ONE conditional UPDATE:
      * flips each to {@code CANCELLED}, stamps {@code CLIENT_CANCELLED}, and nulls its per-item cancel
      * token (V91 permits a NULL token on a terminal LINK row). Called by
-     * {@code GuestVisitCancellationService} right after {@code AppointmentRepository#consumeCancelToken}
+     * {@code GuestVisitCancellationService} right after {@code AppointmentRepository#consumeCancelTokenHash}
      * wins the header race, so the header and all N items reach {@code CANCELLED} atomically in the same
      * transaction — freeing every item's slot (the {@code no_overlapping_bookings} EXCLUDE predicate is
      * {@code status = 'CONFIRMED'} only). Rides the partial index {@code idx_bookings_appointment}.
@@ -1993,7 +2147,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             UPDATE Booking b
                SET b.status = com.beautica.booking.enums.BookingStatus.CANCELLED,
                    b.cancellationReason = com.beautica.booking.enums.CancellationReason.CLIENT_CANCELLED,
-                   b.cancelToken = null
+                   b.cancelTokenHash = null
              WHERE b.appointment.id = :appointmentId
                AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
             """)
@@ -2043,19 +2197,20 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
 
     // ── Guest-cancel by link (Phase 13.4) ─────────────────────────────────────
     /**
-     * Resolves a guest (LINK) booking by its one-time {@code cancel_token} for the
-     * public cancel page. The lookup hits the V90 partial-unique index
-     * {@code idx_bookings_cancel_token} (UNIQUE over non-NULL rows only).
+     * Resolves a guest (LINK) booking by the hash of its one-time cancel token
+     * ({@code cancel_token_hash}, see {@code CancelTokenHasher}) for the public cancel page. The lookup
+     * hits the V206 partial-unique index {@code ux_bookings_cancel_token_hash} (UNIQUE over non-NULL
+     * rows only).
      *
      * <p>The master + service graph is JOIN-FETCHed so the cancel-info page can render
      * {@code masterName}/{@code serviceName} without a lazy load (Anti-Bug §E-2).
      *
-     * <p>A consumed token is {@code NULL} (set by {@link #consumeCancelToken}), so a
+     * <p>A consumed token's hash is {@code NULL} (set by {@link #consumeCancelTokenHash}), so a
      * replayed link returns empty → 404 (no info leak about token state).
      *
      * <p><b>BE-7 (guest visits).</b> The {@code b.appointment IS NULL} guard confines this legacy
      * single-booking path to true standalone guest bookings. A multi-service visit's child item
-     * carries its own per-item {@code cancel_token} (mandated by the V91 {@code chk_bookings_guest_fields}
+     * carries its own per-item {@code cancel_token_hash} (mandated by the V206 {@code chk_bookings_guest_fields}
      * CHECK) but MUST only be cancellable as a whole visit via the header token
      * ({@code GuestVisitCancellationService}). Were a per-item token accepted here it would cancel one
      * item and desync the {@code Appointment} header + siblings. Excluding {@code appointment_id IS NOT
@@ -2068,20 +2223,20 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             LEFT JOIN FETCH m.user
             JOIN FETCH b.masterService ms
             JOIN FETCH ms.serviceDefinition
-            WHERE b.cancelToken = :cancelToken
+            WHERE b.cancelTokenHash = :cancelTokenHash
               AND b.appointment IS NULL
             """)
-    Optional<Booking> findByCancelTokenWithGraph(@Param("cancelToken") UUID cancelToken);
+    Optional<Booking> findByCancelTokenHashWithGraph(@Param("cancelTokenHash") String cancelTokenHash);
 
     /**
      * Atomically consumes a cancel token: flips a still-{@code CONFIRMED} guest booking
-     * to {@code CANCELLED} and nulls the token, in a single conditional UPDATE.
+     * to {@code CANCELLED} and nulls the token hash, in a single conditional UPDATE.
      *
-     * <p><b>One-time / race-safe.</b> The {@code WHERE cancel_token = :token AND status =
-     * CONFIRMED} predicate guarantees that of N concurrent {@code POST /cancel/{token}}
+     * <p><b>One-time / race-safe.</b> The {@code WHERE cancel_token_hash = :cancelTokenHash AND
+     * status = CONFIRMED} predicate guarantees that of N concurrent {@code POST /cancel/{token}}
      * requests, exactly ONE UPDATE affects 1 row; every other affects 0. Only the winner
      * fires the cancellation SMS + master notification, so the side-effects run exactly
-     * once. A replayed POST (token already NULL) updates 0 rows → the service maps it to
+     * once. A replayed POST (hash already NULL) updates 0 rows → the service maps it to
      * 404. This mirrors the atomic check-and-set used by the Phase 13.2 OTP recorder and
      * avoids the check-then-act double-cancel race a load→mutate→save flow would leave open.
      *
@@ -2091,11 +2246,11 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     @Query("""
             UPDATE Booking b
                SET b.status = com.beautica.booking.enums.BookingStatus.CANCELLED,
-                   b.cancelToken = null
-             WHERE b.cancelToken = :cancelToken
+                   b.cancelTokenHash = null
+             WHERE b.cancelTokenHash = :cancelTokenHash
                AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
             """)
-    int consumeCancelToken(@Param("cancelToken") UUID cancelToken);
+    int consumeCancelTokenHash(@Param("cancelTokenHash") String cancelTokenHash);
 
     // ── Guest-PII retention / erase (phase 373) ───────────────────────────────
     /**
@@ -2103,7 +2258,12 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * PII of up to {@code batchSize} due guest/walk-in rows and returns their ids. Mirrors the
      * claim shape of {@link #claimRemindersByIds} — no read-then-write. {@code FOR UPDATE SKIP
      * LOCKED} lets two instances split a backlog without blocking or double-claiming; the
-     * {@code guest_pii_anonymised_at IS NULL} predicate makes a rerun a no-op.
+     * {@code guest_pii_anonymised_at IS NULL} predicate makes a rerun a no-op. The locking select is a
+     * {@code MATERIALIZED} CTE so {@code LIMIT}/{@code SKIP LOCKED} is evaluated exactly once: the former
+     * {@code WHERE b.id IN (SELECT ... LIMIT n FOR UPDATE SKIP LOCKED)} form, under a nested-loop semi-join
+     * that re-scans the sublink per outer row, skipped the rows it had already updated and claimed more than
+     * {@code n} (same defect as {@code InAppNotificationRepository#deleteCreatedBefore}; pinned by
+     * {@code GuestPiiRetentionIT}).
      *
      * <p>Scope: {@code client_id IS NULL}, source LINK/STAFF, never a detached ex-client row
      * ({@code client_detached_at IS NOT NULL} — that row belonged to a registered user and was
@@ -2114,25 +2274,28 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      */
     @Modifying
     @Query(value = """
+            WITH due AS MATERIALIZED (
+                SELECT x.id FROM bookings x
+                 WHERE x.client_id IS NULL
+                   AND x.guest_pii_anonymised_at IS NULL
+                   AND x.client_detached_at IS NULL
+                   AND x.booking_source IN ('LINK', 'STAFF')
+                   AND x.ends_at < :cutoff
+                 ORDER BY x.ends_at
+                 LIMIT :batchSize
+                 FOR UPDATE SKIP LOCKED
+            )
             UPDATE bookings b
                SET guest_name = :sentinel,
                    guest_surname = NULL,
                    guest_phone = NULL,
                    client_comment = NULL,
                    client_cancellation_note = NULL,
-                   cancel_token = NULL,
+                   cancel_token_hash = NULL,
                    guest_pii_anonymised_at = now(),
                    updated_at = now()
-             WHERE b.id IN (
-                   SELECT x.id FROM bookings x
-                    WHERE x.client_id IS NULL
-                      AND x.guest_pii_anonymised_at IS NULL
-                      AND x.client_detached_at IS NULL
-                      AND x.booking_source IN ('LINK', 'STAFF')
-                      AND x.ends_at < :cutoff
-                    ORDER BY x.ends_at
-                    LIMIT :batchSize
-                    FOR UPDATE SKIP LOCKED)
+              FROM due
+             WHERE b.id = due.id
             RETURNING b.id
             """, nativeQuery = true)
     List<UUID> anonymiseDueGuestBookings(
@@ -2153,7 +2316,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
                    guest_phone = NULL,
                    client_comment = NULL,
                    client_cancellation_note = NULL,
-                   cancel_token = NULL,
+                   cancel_token_hash = NULL,
                    guest_pii_anonymised_at = now(),
                    updated_at = now()
              WHERE guest_phone = :phone
@@ -2166,6 +2329,18 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     List<UUID> anonymiseGuestBookingsByPhone(
             @Param("phone") String phone,
             @Param("sentinel") String sentinel);
+
+    /**
+     * Phase 402 D3 — the visit of each booking in {@code bookingIds} (primary-key lookup, bounded by the caller's
+     * batch): the review-invite skip needs the visit ids of anonymised visit items and the ids of anonymised single
+     * bookings.
+     */
+    @Query(value = """
+            SELECT b.id AS bookingId, b.appointment_id AS appointmentId
+              FROM bookings b
+             WHERE b.id IN (:bookingIds)
+            """, nativeQuery = true)
+    List<GuestBookingSubject> findGuestBookingSubjects(@Param("bookingIds") Collection<UUID> bookingIds);
 
     /**
      * Locks (row-level {@code FOR UPDATE}, id order) the phone's upcoming single guest/walk-in
@@ -2192,7 +2367,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             @Param("now") OffsetDateTime now);
 
     /**
-     * Tokenless counterpart of {@link #consumeCancelToken} for a STAFF walk-in row (phase 373 D12):
+     * Tokenless counterpart of {@link #consumeCancelTokenHash} for a STAFF walk-in row (phase 373 D12):
      * the same status flip, guarded on {@code CONFIRMED} and on the row being account-less, and
      * stamps {@code updated_at} (D12). Returns 0 when a concurrent cancel already won, so the caller
      * skips the side-effects. Native so {@code updated_at} is set by the database clock, like every
@@ -2202,11 +2377,50 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     @Query(value = """
             UPDATE bookings
                SET status = 'CANCELLED',
-                   cancel_token = NULL,
+                   cancel_token_hash = NULL,
                    updated_at = now()
              WHERE id = :id
                AND status = 'CONFIRMED'
                AND client_id IS NULL
             """, nativeQuery = true)
     int cancelGuestRowById(@Param("id") UUID id);
+
+    /**
+     * Phase 395 D2 — does {@code actorUserId} see this registered client through at least one booking, as the
+     * performing master or as the owner of the booking's salon? Backs the {@code CLIENT_PROFILE} /
+     * {@code CLIENT_REVIEW} reportability check ({@code ReportTargetVisibilityResolver}). Mirrors the master and
+     * owner arms of {@code AuthorizationService#isViewAuthorized}: a {@code SALON_MASTER} needs the master row
+     * still active ({@code requireActiveMaster = true}), every other role does not. The assigned
+     * {@code SALON_ADMIN} arm is {@link #existsByClientIdAndSalonId}. Bounded by one client's bookings via
+     * {@code idx_bookings_client_starts_at}.
+     *
+     * <p>Native {@code SELECT EXISTS} (pattern of {@code SalonRepository#existsByIdAndOwnerId}) so Postgres stops at
+     * the first matching booking instead of counting them all. Same predicate as the former JPQL count: the
+     * {@code users} join was only ever read for its id, which is {@code masters.user_id} itself, and the salon
+     * owner's id is {@code salons.owner_id}.
+     */
+    @Query(value = """
+            SELECT EXISTS (
+                SELECT 1
+                  FROM bookings b
+                  JOIN masters m ON m.id = b.master_id
+                  LEFT JOIN salons s ON s.id = b.salon_id
+                 WHERE b.client_id = :clientId
+                   AND ((m.user_id = :actorUserId AND (m.is_active = true OR :requireActiveMaster = false))
+                        OR s.owner_id = :actorUserId))
+            """, nativeQuery = true)
+    boolean existsClientBookingVisibleToProvider(
+            @Param("clientId") UUID clientId,
+            @Param("actorUserId") UUID actorUserId,
+            @Param("requireActiveMaster") boolean requireActiveMaster);
+
+    /**
+     * Phase 395 D2 — the assigned {@code SALON_ADMIN} arm of {@link #existsClientBookingVisibleToProvider}:
+     * a booking of this client at the admin's salon. Native {@code SELECT EXISTS}: stops at the first row.
+     */
+    @Query(value = """
+            SELECT EXISTS (
+                SELECT 1 FROM bookings b WHERE b.client_id = :clientId AND b.salon_id = :salonId)
+            """, nativeQuery = true)
+    boolean existsByClientIdAndSalonId(@Param("clientId") UUID clientId, @Param("salonId") UUID salonId);
 }

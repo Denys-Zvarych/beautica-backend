@@ -17,6 +17,7 @@ import java.util.HexFormat;
 public class SecureTokenGenerator implements TokenGenerator {
 
     private static final int TOKEN_BYTES = 32;
+    private static final int MIN_TOKEN_BYTES = 16;
     private static final String HMAC_ALGORITHM = "HmacSHA256";
     private static final Base64.Encoder BASE64URL = Base64.getUrlEncoder().withoutPadding();
 
@@ -51,7 +52,15 @@ public class SecureTokenGenerator implements TokenGenerator {
 
     @Override
     public String generateToken() {
-        var bytes = new byte[TOKEN_BYTES];
+        return generateToken(TOKEN_BYTES);
+    }
+
+    @Override
+    public String generateToken(int byteLength) {
+        if (byteLength < MIN_TOKEN_BYTES) {
+            throw new IllegalArgumentException("Token must carry at least " + MIN_TOKEN_BYTES + " random bytes");
+        }
+        var bytes = new byte[byteLength];
         secureRandom.nextBytes(bytes);
         return BASE64URL.encodeToString(bytes);
     }

@@ -1,5 +1,6 @@
 package com.beautica.notification;
 
+import com.beautica.moderation.dto.ContentReportEmailModel;
 import com.beautica.support.dto.SupportAttachment;
 import jakarta.mail.internet.MimeMessage;
 import org.slf4j.Logger;
@@ -16,6 +17,7 @@ import org.thymeleaf.spring6.SpringTemplateEngine;
 
 import java.util.List;
 import java.util.Locale;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 
 /**
@@ -227,5 +229,66 @@ public class EmailService {
                     toEmail, senderUserId, ex.getClass().getSimpleName());
             return CompletableFuture.failedFuture(ex);
         }
+    }
+
+    /**
+     * Phase 395 D7 / 414 — tells the support inbox that a piece of UGC was reported. Since phase 414 the e-mail shows
+     * the reported content (D1: text + stars, photo, or profile name + avatar), the reporter's comment, the target's
+     * open-report count and the one-click action buttons (D3). Every user-written string reaches the template already
+     * bidi-escaped and URL-defanged ({@link ContentReportEmailModel}) and is rendered with {@code th:text}
+     * (HTML-escaped). The model's links carry raw single-use tokens: nothing here logs the model, a link or any UGC.
+     *
+     * <p>Synchronous since the phase-414 audit-fix: the caller, {@code ContentReportEmailDispatcher}, already runs on
+     * the dedicated {@code reportEmailExecutor} (it loads the content and mints the links there, off the request
+     * thread). Lossy by design: the DB row is authoritative, so a failed send loses only the nudge (returned as a
+     * failed future, logged with the exception type only).
+     */
+    public CompletableFuture<Void> sendContentReportEmail(String toEmail, ContentReportEmailModel model) {
+        return sendContentReport(toEmail, model, false);
+    }
+
+    /**
+     * Phase 396 burst guard — the same report e-mail, flagged as part of a report burst on one provider (subject
+     * prefix {@code [BURST]} and a banner): the reports of that wave are held from auto-hide until support resolves
+     * them. Same caller thread, same lossy contract as {@link #sendContentReportEmail}.
+     */
+    public CompletableFuture<Void> sendContentReportBurstEmail(String toEmail, ContentReportEmailModel model) {
+        return sendContentReport(toEmail, model, true);
+    }
+
+    private CompletableFuture<Void> sendContentReport(String toEmail, ContentReportEmailModel model, boolean burst) {
+        try {
+            String html = renderContentReport(model, burst);
+
+            MimeMessage message = mailSender.createMimeMessage();
+            MimeMessageHelper helper = new MimeMessageHelper(message, "UTF-8");
+            helper.setFrom(fromEmail);
+            helper.setTo(toEmail);
+            helper.setSubject((burst ? "[BURST] " : "") + "[Beautica Report] " + model.targetType().name()
+                    + " — " + model.reason().name());
+            helper.setText(html, true);
+
+            mailSender.send(message);
+            return CompletableFuture.completedFuture(null);
+        } catch (Exception ex) {
+            log.error("Failed to send content report email for report {}: {}",
+                    model.reportId(), ex.getClass().getSimpleName());
+            return CompletableFuture.failedFuture(ex);
+        }
+    }
+
+    private String renderContentReport(ContentReportEmailModel model, boolean burst) {
+        Context ctx = new Context(Locale.of("uk"));
+        ctx.setVariable("reportId", model.reportId().toString());
+        ctx.setVariable("targetType", model.targetType().name());
+        ctx.setVariable("profileTarget", model.targetType().isProfile());
+        ctx.setVariable("targetId", model.targetId().toString());
+        ctx.setVariable("reason", model.reason().name());
+        ctx.setVariable("burst", burst);
+        ctx.setVariable("content", model.content());
+        ctx.setVariable("reporterComment", model.reporterComment());
+        ctx.setVariable("openReportCount", model.openReportCount());
+        ctx.setVariable("actions", model.actions());
+        return templateEngine.process("email/content-report", ctx);
     }
 }

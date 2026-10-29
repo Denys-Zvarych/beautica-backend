@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org" lang="uk">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <meta name="robots" content="noindex,nofollow"/>
+  <title>Підтвердження рішення модерації</title>
+</head>
+<!-- Phase 414 D7: this GET page changes NOTHING. The decision happens only on the POST form below, which carries the
+     single-use token and this page's nonce. No UGC is shown here (a forwarded link must not re-expose content). -->
+<body style="margin:0;padding:0;background-color:#E6DDD0;font-family:'Nunito','Trebuchet MS',Arial,sans-serif;">
+  <div style="max-width:480px;margin:48px auto;padding:0 16px;">
+    <div style="background:#FDFAF7;border:1px solid #D4C5B5;border-radius:16px;padding:40px;">
+      <h1 style="color:#0D0906;font-size:22px;font-weight:700;margin:0 0 16px;">
+        Підтвердіть рішення
+      </h1>
+      <p style="color:#3D2B1A;font-size:15px;line-height:1.7;margin:0 0 24px;">
+        Нічого не зміниться, доки ви не натиснете «Підтвердити». Дія закриє всі відкриті скарги на цей об'єкт.
+      </p>
+
+      <div style="background:#F3EBE0;border-radius:10px;padding:16px 18px;margin-bottom:28px;
+                  color:#3D2B1A;font-size:14px;line-height:1.8;">
+        <strong>Об'єкт:</strong> <span th:text="${targetLabel}">Відгук клієнта</span><br/>
+        <strong>Рішення:</strong> <span th:text="${actionLabel}">Видалити</span><br/>
+        <strong>Відкритих скарг:</strong> <span th:text="${openReports}">1</span>
+      </div>
+
+      <form th:action="@{/api/v1/moderation/actions/confirm}" method="post" style="margin:0;">
+        <input type="hidden" name="token" th:value="${token}"/>
+        <input type="hidden" name="nonce" th:value="${nonce}"/>
+        <button type="submit"
+                style="background:#6A4A28;color:#F5EDE0;border:0;cursor:pointer;
+                       font-size:16px;font-weight:700;padding:14px 30px;border-radius:12px;">
+          Підтвердити
+        </button>
+      </form>
+    </div>
+  </div>
+</body>
+</html>

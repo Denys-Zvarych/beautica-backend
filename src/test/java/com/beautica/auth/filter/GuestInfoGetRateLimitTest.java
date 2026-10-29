@@ -85,7 +85,7 @@ class GuestInfoGetRateLimitTest {
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(), permissive(), permissive(),
-                permissive(), permissive(), permissive(), props);
+                permissive(), permissive(), permissive(), permissive(), permissive(), props);
     }
 
     /** A Worker-shaped request: Worker egress IP as the socket peer, optional key + visitor headers. */
@@ -412,7 +412,7 @@ class GuestInfoGetRateLimitTest {
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(), permissive(), permissive(),
-                permissive(), permissive(), permissive(), props);
+                permissive(), permissive(), permissive(), permissive(), permissive(), props);
         exhaustViaWorker(filter, "   ", VISITOR_A);
 
         MockHttpServletResponse otherVisitor = fireOnce(filter, workerGet(SALON_INFO_PATH, "   ", VISITOR_B));

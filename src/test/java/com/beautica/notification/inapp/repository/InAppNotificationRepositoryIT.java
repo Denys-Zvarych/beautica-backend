@@ -313,7 +313,10 @@ class InAppNotificationRepositoryIT extends AbstractDataJpaTest {
     @ParameterizedTest
     @EnumSource(value = InAppNotificationType.class, mode = EnumSource.Mode.EXCLUDE, names = {
             "CATEGORY_REQUEST_APPROVED", "CATEGORY_REQUEST_REJECTED",
-            "SERVICE_TYPE_SUGGESTION_APPROVED", "SERVICE_TYPE_SUGGESTION_REJECTED"})
+            "SERVICE_TYPE_SUGGESTION_APPROVED", "SERVICE_TYPE_SUGGESTION_REJECTED",
+            // phase 415: moderation outcomes carry no booking — covered by their own shape/push tests
+            "REPORT_CONTENT_REMOVED", "REPORT_NO_VIOLATION", "REPORT_REVIEWED", "CONTENT_REMOVED",
+            "REVIEW_ABOUT_YOU_REMOVED"})
     @DisplayName("in_app_notification_dedup_key_chk (V183) — every one of the 10 booking-keyed TYPE literals accepts "
             + "the common TYPE:uuid form, not just the 2-3 spot-checked above")
     void should_acceptTypeColonUuid_when_everyEnumType(InAppNotificationType type) {
@@ -680,7 +683,10 @@ class InAppNotificationRepositoryIT extends AbstractDataJpaTest {
 
     @ParameterizedTest
     @EnumSource(value = InAppNotificationType.class, mode = EnumSource.Mode.EXCLUDE, names = {"INVITE_ACCEPTED",
-            "CATEGORY_REQUEST_APPROVED", "CATEGORY_REQUEST_REJECTED", "SERVICE_TYPE_SUGGESTION_APPROVED", "SERVICE_TYPE_SUGGESTION_REJECTED"})
+            "CATEGORY_REQUEST_APPROVED", "CATEGORY_REQUEST_REJECTED", "SERVICE_TYPE_SUGGESTION_APPROVED", "SERVICE_TYPE_SUGGESTION_REJECTED",
+            // phase 415: moderation outcomes carry no booking — covered by their own shape/push tests
+            "REPORT_CONTENT_REMOVED", "REPORT_NO_VIOLATION", "REPORT_REVIEWED", "CONTENT_REMOVED",
+            "REVIEW_ABOUT_YOU_REMOVED"})
     @DisplayName("in_app_notification_shape_chk — booking_id alone satisfies every booking/review type")
     void should_acceptWithBookingIdOnly_when_rawInsert(InAppNotificationType type) {
         int inserted = repository.insertIgnoringDuplicate(UUID.randomUUID(), client.getId(), type.name(),
@@ -890,6 +896,41 @@ class InAppNotificationRepositoryIT extends AbstractDataJpaTest {
         assertThat(plan)
                 .as("the retention sweep's driving subquery must be able to use the created_at index:\n" + plan)
                 .contains("in_app_notification_created_idx");
+    }
+
+    /**
+     * Regression (PR #174 CI, shard 2) — {@code deleteCreatedBefore} must never delete more than
+     * {@code limit} rows, whatever plan PostgreSQL picks. The former {@code DELETE ... WHERE id IN
+     * (SELECT ... LIMIT :limit FOR UPDATE SKIP LOCKED)} form, under a nested-loop semi-join that
+     * re-scans the locking sublink per outer row, skipped the tuples it had already deleted and
+     * returned the next ones: {@code LIMIT 5} over 20 eligible rows deleted 12. The planner settings
+     * below force exactly that plan shape (it surfaced in CI only through statistics drift); with the
+     * {@code MATERIALIZED} CTE the {@code LIMIT} is evaluated once and the count is exact.
+     */
+    @Test
+    @DisplayName("deleteCreatedBefore deletes exactly `limit` rows even when the planner picks a "
+            + "re-scanning nested-loop semi-join (no over-delete past LIMIT)")
+    void should_deleteExactlyLimitRows_when_plannerForcesRescanningNestedLoop() {
+        Instant old = Instant.parse("2020-01-01T00:00:00Z");
+        Instant cutoff = Instant.parse("2021-01-01T00:00:00Z");
+        for (int i = 0; i < 20; i++) {
+            insertWithCreatedAt(client.getId(), old);
+        }
+        // Transaction-local (the @DataJpaTest transaction): the plan shape that re-scanned the old
+        // IN-sublink. Reverts at the test's rollback.
+        for (String knob : List.of("enable_hashagg", "enable_hashjoin", "enable_mergejoin",
+                "enable_material", "enable_sort", "enable_incremental_sort")) {
+            jdbcTemplate.execute("SET LOCAL " + knob + " = off");
+        }
+
+        int deleted = repository.deleteCreatedBefore(cutoff, 5);
+
+        assertThat(deleted).as("one batch must delete exactly `limit` rows, never more").isEqualTo(5);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT count(*) FROM in_app_notification WHERE created_at < ?", Long.class,
+                java.sql.Timestamp.from(cutoff)))
+                .as("15 of the 20 eligible rows must remain after one LIMIT-5 batch")
+                .isEqualTo(15L);
     }
 
     // ── type/dedup-regex/enum drift guard (audit-fix cycle 2, finding 2) ───────────────────────
@@ -1383,7 +1424,10 @@ class InAppNotificationRepositoryIT extends AbstractDataJpaTest {
 
     @ParameterizedTest
     @EnumSource(value = InAppNotificationType.class, mode = EnumSource.Mode.EXCLUDE, names = {
-            "CATEGORY_REQUEST_APPROVED", "CATEGORY_REQUEST_REJECTED", "SERVICE_TYPE_SUGGESTION_APPROVED", "SERVICE_TYPE_SUGGESTION_REJECTED"})
+            "CATEGORY_REQUEST_APPROVED", "CATEGORY_REQUEST_REJECTED", "SERVICE_TYPE_SUGGESTION_APPROVED", "SERVICE_TYPE_SUGGESTION_REJECTED",
+            // phase 415: moderation outcomes carry no booking — covered by their own shape/push tests
+            "REPORT_CONTENT_REMOVED", "REPORT_NO_VIOLATION", "REPORT_REVIEWED", "CONTENT_REMOVED",
+            "REVIEW_ABOUT_YOU_REMOVED"})
     @DisplayName("insertForRecipientsWithPush writes exactly one INAPP_PUSH row per feed row, for every "
             + "type — aggregate_id is the feed row id, status PENDING, NO payload (ids only)")
     void should_writeOnePushRowPerFeedRow_when_insertForRecipientsWithPush(InAppNotificationType type) {
@@ -1408,6 +1452,64 @@ class InAppNotificationRepositoryIT extends AbstractDataJpaTest {
             assertThat(((Number) r.get("attempts")).intValue()).isZero();
             assertThat(r.get("payload")).as("ids only — nothing rendered or personal in the outbox").isNull();
         });
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = InAppNotificationType.class, names = {
+            "REPORT_CONTENT_REMOVED", "REPORT_NO_VIOLATION", "REPORT_REVIEWED", "CONTENT_REMOVED",
+            "REVIEW_ABOUT_YOU_REMOVED"})
+    @DisplayName("phase 415: insertModerationOutcomesWithPush writes one feed row + one INAPP_PUSH row per recipient "
+            + "with key '<TYPE>:<batch>'; a replay writes nothing")
+    void should_writeOnePushRowPerFeedRow_when_insertModerationOutcomesWithPush(InAppNotificationType type) {
+        giveEveryUserAToken();
+        UUID batch = UUID.randomUUID();
+        UUID[] ids = {client.getId(), teammate.getId()};
+        String[] types = {type.name(), type.name()};
+
+        int written = repository.insertModerationOutcomesWithPush(ids, types, "REVIEW", batch);
+        int replay = repository.insertModerationOutcomesWithPush(ids, types, "REVIEW", batch);
+
+        assertThat(written).isEqualTo(2);
+        assertThat(replay).isZero();
+        assertThat(countRows()).isEqualTo(2);
+        assertThat(countPushRows()).isEqualTo(2);
+        assertThat(jdbcTemplate.queryForList("SELECT dedup_key FROM in_app_notification", String.class))
+                .containsOnly(type.name() + ":" + batch);
+        assertThat(jdbcTemplate.queryForList("SELECT moderated_target_type FROM in_app_notification", String.class))
+                .containsOnly("REVIEW");
+    }
+
+    @Test
+    @DisplayName("phase 415 audit-fix PERF 5: ONE insertModerationOutcomes call writes mixed types, incl. two rows for "
+            + "one recipient with two roles (reporter + subject), each with its own '<TYPE>:<batch>' key")
+    void should_writeMixedTypesInOneStatement_when_insertModerationOutcomes() {
+        UUID batch = UUID.randomUUID();
+
+        int written = repository.insertModerationOutcomes(
+                new UUID[] {client.getId(), client.getId(), teammate.getId()},
+                new String[] {"REPORT_CONTENT_REMOVED", "REVIEW_ABOUT_YOU_REMOVED", "CONTENT_REMOVED"},
+                "CLIENT_REVIEW", batch);
+
+        assertThat(written).isEqualTo(3);
+        assertThat(jdbcTemplate.queryForList(
+                "SELECT recipient_user_id || '|' || type || '|' || dedup_key FROM in_app_notification", String.class))
+                .containsExactlyInAnyOrder(
+                        client.getId() + "|REPORT_CONTENT_REMOVED|REPORT_CONTENT_REMOVED:" + batch,
+                        client.getId() + "|REVIEW_ABOUT_YOU_REMOVED|REVIEW_ABOUT_YOU_REMOVED:" + batch,
+                        teammate.getId() + "|CONTENT_REMOVED|CONTENT_REMOVED:" + batch);
+    }
+
+    @Test
+    @DisplayName("phase 415: insertModerationOutcomes skips a deactivated recipient")
+    void should_skipInactiveRecipient_when_insertModerationOutcomes() {
+        jdbcTemplate.update("UPDATE users SET is_active = false WHERE id = ?", teammate.getId());
+
+        int written = repository.insertModerationOutcomes(new UUID[] {client.getId(), teammate.getId()},
+                new String[] {"REPORT_REVIEWED", "REPORT_REVIEWED"}, "SALON_PROFILE", UUID.randomUUID());
+
+        assertThat(written).isEqualTo(1);
+        assertThat(jdbcTemplate.queryForList("SELECT recipient_user_id FROM in_app_notification", UUID.class))
+                .containsExactly(client.getId());
     }
 
     @Test

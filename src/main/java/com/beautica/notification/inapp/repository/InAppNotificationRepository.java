@@ -119,7 +119,7 @@ public interface InAppNotificationRepository extends Repository<InAppNotificatio
      * {@code read_at} defaults to {@code NULL}.
      *
      * <p>Native, not JPQL: {@code type} is bound as its {@link Enum#name()} string against the
-     * plain {@code VARCHAR} column, matching {@code AppointmentRepository#consumeCancelToken}'s
+     * plain {@code VARCHAR} column, matching {@code AppointmentRepository#consumeCancelTokenHash}'s
      * convention for the same reason — there is no {@code @Enumerated} metadata to consult outside
      * an entity attribute path in a native query.
      *
@@ -362,6 +362,50 @@ public interface InAppNotificationRepository extends Repository<InAppNotificatio
             @Param("suggestionId") UUID suggestionId,
             @Param("dedupKey") String dedupKey);
 
+    /**
+     * Phase 415 — every moderation-outcome row of ONE resolution (reporters, author, subject) in one statement:
+     * {@code recipientIds[i]} gets type {@code types[i]} (the two arrays are parallel). The dedup key is built per row
+     * as {@code <type>:<batchReportId>}, so a recipient with two roles (e.g. reporter + subject) gets two rows, and a
+     * replay collapses via {@code ON CONFLICT DO NOTHING}. Only {@code moderated_target_type} and the key are set
+     * (V219/V221 shape CHECK). Driven by {@code users} and filtered to active accounts, so a deleted or deactivated
+     * recipient yields no row (D6). Audit-fix PERF 5: one round trip under the resolve locks, not one per group.
+     */
+    @Modifying
+    @Query(value = """
+            INSERT INTO in_app_notification (id, recipient_user_id, type, moderated_target_type, dedup_key)
+            SELECT gen_random_uuid(), u.id, v.type, :targetType, v.type || ':' || CAST(:batchReportId AS text)
+              FROM unnest(CAST(:recipientIds AS uuid[]), CAST(:types AS text[])) AS v(recipient_id, type)
+              JOIN users u ON u.id = v.recipient_id AND u.is_active
+            ON CONFLICT (recipient_user_id, dedup_key) DO NOTHING
+            """, nativeQuery = true)
+    int insertModerationOutcomes(
+            @Param("recipientIds") UUID[] recipientIds,
+            @Param("types") String[] types,
+            @Param("targetType") String targetType,
+            @Param("batchReportId") UUID batchReportId);
+
+    /** Push twin of {@link #insertModerationOutcomes}. */
+    @Modifying
+    @Query(value = """
+            WITH ins AS (
+                INSERT INTO in_app_notification (id, recipient_user_id, type, moderated_target_type, dedup_key)
+                SELECT gen_random_uuid(), u.id, v.type, :targetType, v.type || ':' || CAST(:batchReportId AS text)
+                  FROM unnest(CAST(:recipientIds AS uuid[]), CAST(:types AS text[])) AS v(recipient_id, type)
+                  JOIN users u ON u.id = v.recipient_id AND u.is_active
+                ON CONFLICT (recipient_user_id, dedup_key) DO NOTHING
+                RETURNING id, recipient_user_id
+            )
+            INSERT INTO notification_outbox (event_type, aggregate_id)
+            SELECT 'INAPP_PUSH', ins.id FROM ins
+             WHERE EXISTS (SELECT 1 FROM device_tokens dt
+                            WHERE dt.user_id = ins.recipient_user_id AND dt.is_active)
+            """, nativeQuery = true)
+    int insertModerationOutcomesWithPush(
+            @Param("recipientIds") UUID[] recipientIds,
+            @Param("types") String[] types,
+            @Param("targetType") String targetType,
+            @Param("batchReportId") UUID batchReportId);
+
     /** Push twin of {@link #insertClientOnlyBulk}. */
     @Modifying
     @Query(value = """
@@ -449,18 +493,31 @@ public interface InAppNotificationRepository extends Repository<InAppNotificatio
      * the same rows and deadlocking on the DELETE; a skipped (locked) row is simply picked up by the next
      * batch/run. It does not change which index drives the subquery.
      *
-     * @return the number of rows actually deleted (may be less than {@code limit})
+     * <p><b>Why the locking select is a {@code MATERIALIZED} CTE, not an {@code IN}-sublink.</b> The
+     * earlier form {@code DELETE ... WHERE id IN (SELECT id ... LIMIT :limit FOR UPDATE SKIP LOCKED)}
+     * could delete MORE than {@code limit} rows: when the planner picks a nested-loop semi-join with
+     * the sublink on the inner side, the {@code LockRows} subquery is re-scanned per outer row, and on
+     * each re-scan it skips the tuples this same {@code DELETE} has already removed (self-modified, so
+     * "locked") and returns the next ones past the {@code LIMIT}. Reproduced on PostgreSQL 18 with 20
+     * eligible rows: {@code LIMIT 5} deleted 12. A batch that returns {@code != limit} also ends the
+     * {@code InAppNotificationCleanupJob} loop early, so the per-run budget accounting broke too (the
+     * plan flip is statistics-driven, which is why it surfaced only in one CI shard ordering). The
+     * {@code MATERIALIZED} CTE evaluates {@code LIMIT}/{@code FOR UPDATE SKIP LOCKED} exactly once —
+     * the same fix and rationale as {@code NotificationOutboxRepository#claimPendingBatch} and
+     * {@code ReviewInviteRepository#purgeTerminalBefore}.
+     *
+     * @return the number of rows actually deleted (never more than {@code limit}; may be less)
      */
     @Modifying
     @Query(value = """
-            DELETE FROM in_app_notification
-             WHERE id IN (
-                 SELECT id FROM in_app_notification
-                  WHERE created_at < :cutoff
-                  ORDER BY created_at, id
-                  LIMIT :limit
-                  FOR UPDATE SKIP LOCKED
-             )
+            WITH doomed AS MATERIALIZED (
+                SELECT id FROM in_app_notification
+                 WHERE created_at < :cutoff
+                 ORDER BY created_at, id
+                 LIMIT :limit
+                 FOR UPDATE SKIP LOCKED
+            )
+            DELETE FROM in_app_notification n USING doomed WHERE n.id = doomed.id
             """, nativeQuery = true)
     int deleteCreatedBefore(@Param("cutoff") Instant cutoff, @Param("limit") int limit);
 }

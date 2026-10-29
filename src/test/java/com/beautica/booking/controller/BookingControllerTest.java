@@ -160,7 +160,9 @@ class BookingControllerTest {
                 // clientAvgRating / clientReviewCount (two-sided ratings additive) — literal stub
                 new BigDecimal("4.50"), 7,
                 // guestPhone (phase 386 additive) — null: a registered client's booking
-                null
+                null,
+                // clientBlocked / clientBlockId / clientBlockable (phase 397 additive) — literal stub
+                false, null, false
         );
     }
 

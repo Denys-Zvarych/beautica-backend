@@ -35,8 +35,15 @@ import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -149,7 +156,7 @@ class ReviewServiceCacheTest {
     // ── reviews-by-master cache (FIX 13) ─────────────────────────────────────
 
     @Test
-    @DisplayName("should_returnCachedPage_when_getReviewsForMasterCalledTwice")
+    @DisplayName("master reviews page: second call with the same master, sort and page is served from cache — repository hit once")
     void should_returnCachedPage_when_getReviewsForMasterCalledTwice() {
         UUID masterId = UUID.randomUUID();
         UUID reviewId = UUID.randomUUID();
@@ -190,7 +197,7 @@ class ReviewServiceCacheTest {
     }
 
     @Test
-    @DisplayName("should_cacheIndependently_when_getReviewsForMasterCalledWithDifferentSort")
+    @DisplayName("master reviews page: NEWEST and HIGHEST sorts are cached under separate keys — each sort hits its repository query once")
     void should_cacheIndependently_when_getReviewsForMasterCalledWithDifferentSort() {
         UUID masterId = UUID.randomUUID();
         UUID reviewId = UUID.randomUUID();
@@ -226,6 +233,41 @@ class ReviewServiceCacheTest {
                 .findIdsByMasterIdOrderByRatingDescCreatedAtDesc(masterId, PageRequest.of(0, 20));
     }
 
+    @Test
+    @DisplayName("review-detail (sync=true): an evict racing an in-flight load waits for it and then drops the "
+            + "loaded entry — a review hidden while a reader was loading it is never pinned for the TTL")
+    void should_dropInFlightLoad_when_moderationEvictRacesLoad() throws Exception {
+        UUID reviewId = UUID.randomUUID();
+        User client = mock(User.class);
+        Master master = mock(Master.class);
+        Review review = buildReview(reviewId, client, master, (short) 1, "Погано");
+        CountDownLatch loading = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        when(reviewRepository.findByIdWithAssociations(reviewId)).thenAnswer(invocation -> {
+            loading.countDown();
+            assertThat(release.await(5, TimeUnit.SECONDS)).isTrue();
+            return Optional.of(review);
+        });
+        Cache reviewDetail = cacheManager.getCache("review-detail");
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        try {
+            Future<ReviewResponse> reader = pool.submit(() -> reviewService.getReview(reviewId));
+            assertThat(loading.await(5, TimeUnit.SECONDS)).as("reader is inside the load").isTrue();
+            Future<?> evictor = pool.submit(() -> reviewDetail.evict(reviewId));
+
+            assertThatThrownBy(() -> evictor.get(200, TimeUnit.MILLISECONDS))
+                    .as("the evict waits behind the in-flight load").isInstanceOf(TimeoutException.class);
+            release.countDown();
+            reader.get(5, TimeUnit.SECONDS);
+            evictor.get(5, TimeUnit.SECONDS);
+
+            assertThat(reviewDetail.get(reviewId)).as("the stale load did not survive the evict").isNull();
+        } finally {
+            release.countDown();
+            pool.shutdownNow();
+        }
+    }
+
     private Review buildReview(UUID id, User client, Master master, short rating, String comment) {
         Review r = mock(Review.class);
         when(r.getId()).thenReturn(id);
@@ -257,7 +299,7 @@ class ReviewServiceCacheTest {
     // ── reviews-by-salon cache (Finding 1 — perf follow-up) ─────────────────────
 
     @Test
-    @DisplayName("should_returnCachedPage_when_getSalonReviewsCalledTwiceWithSameArgs")
+    @DisplayName("salon reviews page: second call with the same salon, sort and page is served from cache — repository hit once")
     void should_returnCachedPage_when_getSalonReviewsCalledTwiceWithSameArgs() {
         UUID salonId = UUID.randomUUID();
         UUID reviewId = UUID.randomUUID();
@@ -283,7 +325,7 @@ class ReviewServiceCacheTest {
     }
 
     @Test
-    @DisplayName("should_cacheIndependently_when_getSalonReviewsCalledWithDifferentSort")
+    @DisplayName("salon reviews page: NEWEST and HIGHEST sorts are cached under separate keys — each sort hits its repository query once")
     void should_cacheIndependently_when_getSalonReviewsCalledWithDifferentSort() {
         UUID salonId = UUID.randomUUID();
         UUID reviewId = UUID.randomUUID();

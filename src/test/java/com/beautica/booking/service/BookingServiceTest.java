@@ -13,8 +13,11 @@ import com.beautica.booking.dto.AppointmentProviderNoteRequest;
 import com.beautica.booking.entity.Appointment;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingPartition;
+import com.beautica.booking.enums.BookingSource;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.enums.CancellationReason;
+import com.beautica.booking.event.BookingCompletedEvent;
+import com.beautica.booking.event.GuestBookingCompletedEvent;
 import com.beautica.booking.repository.AppointmentRepository;
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.booking.repository.SalonClosureBookingCandidate;
@@ -31,6 +34,7 @@ import com.beautica.master.entity.MasterType;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.master.service.ScheduleDateMath;
 import com.beautica.booking.service.SlotCalculationService;
+import com.beautica.notification.inapp.entity.InAppNotificationType;
 import com.beautica.notification.inapp.service.InAppNotificationService;
 import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.service.entity.MasterServiceAssignment;
@@ -48,6 +52,8 @@ import org.springframework.data.domain.Sort;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
 import org.mockito.InjectMocks;
@@ -89,6 +95,7 @@ import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
@@ -139,6 +146,7 @@ class BookingServiceTest {
     private BookingService bookingService;
 
     private static final ZoneId KYIV = ZoneId.of("Europe/Kyiv");
+    private static final UUID REVIEW_BY_CLIENT_ID = UUID.fromString("00000000-0000-0000-0000-0000000003a5");
 
     private UUID clientId;
     private UUID masterId;
@@ -152,6 +160,12 @@ class BookingServiceTest {
 
     @Mock
     private org.springframework.context.ApplicationEventPublisher eventPublisher;
+
+    @Mock
+    private com.beautica.moderation.service.ClientBlockService clientBlockService;
+
+    @Mock
+    private com.beautica.moderation.service.BookingBlockGuard bookingBlockGuard;
 
     @BeforeEach
     void setUp() {
@@ -179,8 +193,13 @@ class BookingServiceTest {
                 appointmentTransitionService,
                 appointmentRepository,
                 eventPublisher,
-                inAppNotificationService
+                inAppNotificationService,
+                clientBlockService,
+                bookingBlockGuard
         );
+        // Phase 397: provider-role detail reads ask for the block state; default to "not blockable".
+        lenient().when(clientBlockService.blockStateFor(any(), any(), any()))
+                .thenReturn(com.beautica.moderation.dto.ClientBlockState.NOT_BLOCKABLE);
 
         clientId = UUID.randomUUID();
         masterId = UUID.randomUUID();
@@ -416,6 +435,38 @@ class BookingServiceTest {
         assertThat(captor.getValue().getStatus()).isEqualTo(BookingStatus.CONFIRMED);
         assertThat(result).isNotNull();
         verify(slotCalculationService).evictMasterAvailabilityCaches(masterId);
+    }
+
+    @Test
+    @DisplayName("phase 398 — client blocked in the target's scope: BOOKING_UNAVAILABLE before any lock or save")
+    void should_reject409BeforeLock_when_clientBlockedByTargetProvider() {
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msa));
+        when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
+        org.mockito.Mockito.doThrow(com.beautica.common.exception.BookingUnavailableException.forMaster())
+                .when(bookingBlockGuard).requireClientMayBook(master, clientId);
+
+        assertThatThrownBy(() -> bookingService.createBooking(clientId, null, validRequest()))
+                .isInstanceOf(com.beautica.common.exception.BookingUnavailableException.class);
+
+        verify(bookingRepository, never()).acquireClientAdvisoryLockWithTimeout(any());
+        verify(bookingRepository, never()).acquireAdvisoryLock(any());
+        verify(bookingRepository, never()).saveAndFlush(any());
+        verifyNoInteractions(outboxService);
+    }
+
+    @Test
+    @DisplayName("phase 398 — an idempotent replay of a pre-block booking never reaches the block guard (D5)")
+    void should_replayWithoutBlockCheck_when_idempotencyKeyMatches() {
+        String key = "pre-block-key";
+        Booking existing = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        when(bookingRepository.findActiveByClientIdAndIdempotencyKey(clientId, key)).thenReturn(Optional.of(existing));
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(existing));
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
+
+        bookingService.createBooking(clientId, key, validRequest());
+
+        verifyNoInteractions(bookingBlockGuard);
     }
 
     @Test
@@ -1183,6 +1234,126 @@ class BookingServiceTest {
                 eq(CancellationReason.PROVIDER_UNAVAILABLE), any());
     }
 
+    // ── Phase 398 — client-block cascade (user decision 2026-10-28) ───────────────────────────
+
+    @Test
+    void should_declineClientStandaloneBookingWithNeutralNotice_when_clientBlockedInMasterScope() {
+        UUID actorId = UUID.randomUUID();
+        OffsetDateTime startsAt = OffsetDateTime.now(clock).plusDays(1);
+        when(bookingRepository.findConfirmedFutureByMasterIdAndClientId(eq(masterId), eq(clientId), any()))
+                .thenReturn(List.of(new SalonClosureBookingCandidate(bookingId, null, masterId, startsAt)));
+        Booking booking = buildBookingStartingAt(bookingId, client, master, msa, BookingStatus.CONFIRMED, startsAt);
+        when(bookingRepository.findAllByIdInWithFullGraph(List.of(bookingId))).thenReturn(List.of(booking));
+        when(bookingRepository.declineConfirmedBulk(eq(List.of(bookingId)), any(), any(), any()))
+                .thenReturn(List.of(bookingId));
+
+        int declined = bookingService.declineFutureConfirmedForBlockedClient(actorId, masterId, null, clientId);
+
+        assertThat(declined).isEqualTo(1);
+        verify(authz).enforceCanCancelBooking(actorId, booking);
+        verify(outboxService).enqueueStatusChanged(bookingId);
+        verify(outboxService, never()).enqueueSalonClosed(any());
+        verify(outboxService, never()).enqueueMasterRemoved(any());
+        verify(inAppNotificationService).notifyBookingEvent(InAppNotificationType.BOOKING_DECLINED, booking, actorId);
+        verify(inAppNotificationService, never()).notifyClientOnlyBulk(any(), any(), any());
+        verify(bookingRepository).declineConfirmedBulk(
+                eq(List.of(bookingId)), eq(CancellationReason.PROVIDER_UNAVAILABLE.name()), isNull(), any());
+        verify(bookingRepository, never()).findConfirmedFutureBySalonIdAndClientId(any(), any(), any());
+    }
+
+    @Test
+    void should_authorizeVisitsWithoutSeededMemo_when_clientBlockedInSalonScope() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID appointmentId = UUID.randomUUID();
+        UUID item1 = UUID.randomUUID();
+        UUID item2 = UUID.randomUUID();
+        OffsetDateTime start = OffsetDateTime.now(clock).plusDays(1);
+        when(bookingRepository.findConfirmedFutureBySalonIdAndClientId(eq(salonId), eq(clientId), any()))
+                .thenReturn(List.of(
+                        new SalonClosureBookingCandidate(item1, appointmentId, masterId, start),
+                        new SalonClosureBookingCandidate(item2, appointmentId, masterId, start.plusHours(1))));
+        when(appointmentTransitionService.declineAppointmentItemsBulk(any(), any(), any()))
+                .thenReturn(Set.of(item1, item2));
+        Booking representative = buildBookingStartingAt(item1, client, master, msa, BookingStatus.CONFIRMED, start);
+        when(bookingRepository.findAllByIdInWithFullGraph(List.of(item1))).thenReturn(List.of(representative));
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<Map<AuthorizationService.MemoKey, Boolean>> memoCaptor = ArgumentCaptor.forClass(Map.class);
+
+        int declined = bookingService.declineFutureConfirmedForBlockedClient(actorId, null, salonId, clientId);
+
+        assertThat(declined).as("a 2-item visit counts as ONE cancelled visit").isEqualTo(1);
+        verify(authz).enforceCanManageAppointments(eq(actorId), eq(Set.of(appointmentId)), memoCaptor.capture());
+        assertThat(memoCaptor.getValue())
+                .as("no ownership pre-seed: the block cascade re-authorizes every visit")
+                .isEmpty();
+        verify(appointmentTransitionService).declineAppointmentItemsBulk(
+                eq(Map.of(appointmentId, List.of(item1, item2))), eq(CancellationReason.PROVIDER_UNAVAILABLE), any());
+        verify(outboxService, times(1)).enqueueStatusChanged(item1);
+        verify(inAppNotificationService, times(1)).notifyVisitEvent(
+                InAppNotificationType.BOOKING_DECLINED, appointmentId, representative, actorId);
+        verify(inAppNotificationService, never()).notifyBookingEvent(any(), any(), any());
+        verify(inAppNotificationService, never()).notifyClientOnlyBulk(any(), any(), any());
+        verify(salonRepository, never()).existsByIdAndOwnerId(any(), any());
+    }
+
+    @Test
+    void should_countVisitsAndNotifyEachViaDeclinePath_when_blockCascadeMixesStandaloneAndVisit() {
+        UUID actorId = UUID.randomUUID();
+        UUID appointmentId = UUID.randomUUID();
+        UUID item1 = UUID.randomUUID();
+        UUID item2 = UUID.randomUUID();
+        OffsetDateTime start = OffsetDateTime.now(clock).plusDays(1);
+        when(bookingRepository.findConfirmedFutureLinkGuestByMasterIdAndPhone(eq(masterId), eq("+380501234567"), any()))
+                .thenReturn(List.of(
+                        new SalonClosureBookingCandidate(bookingId, null, masterId, start),
+                        new SalonClosureBookingCandidate(item1, appointmentId, masterId, start.plusDays(1)),
+                        new SalonClosureBookingCandidate(item2, appointmentId, masterId, start.plusDays(1).plusHours(1))));
+        Booking standalone = buildBookingStartingAt(bookingId, client, master, msa, BookingStatus.CONFIRMED, start);
+        Booking visitItem = buildBookingStartingAt(
+                item1, client, master, msa, BookingStatus.CONFIRMED, start.plusDays(1));
+        when(bookingRepository.findAllByIdInWithFullGraph(List.of(bookingId))).thenReturn(List.of(standalone));
+        when(bookingRepository.findAllByIdInWithFullGraph(List.of(item1))).thenReturn(List.of(visitItem));
+        when(bookingRepository.declineConfirmedBulk(eq(List.of(bookingId)), any(), any(), any()))
+                .thenReturn(List.of(bookingId));
+        when(appointmentTransitionService.declineAppointmentItemsBulk(any(), any(), any()))
+                .thenReturn(Set.of(item1, item2));
+
+        int declined = bookingService.declineFutureConfirmedForBlockedGuest(actorId, masterId, null, "+380501234567");
+
+        assertThat(declined).as("1 standalone + 1 two-item visit = 2 visits, not 3 rows").isEqualTo(2);
+        verify(inAppNotificationService).notifyBookingEvent(InAppNotificationType.BOOKING_DECLINED, standalone, actorId);
+        verify(inAppNotificationService).notifyVisitEvent(
+                InAppNotificationType.BOOKING_DECLINED, appointmentId, visitItem, actorId);
+        verify(outboxService).enqueueStatusChanged(bookingId);
+        verify(outboxService).enqueueStatusChanged(item1);
+        verify(outboxService, never()).enqueueStatusChanged(item2);
+    }
+
+    @Test
+    void should_scanLinkGuestBookingsByPhone_when_guestBlockedInSalonScope() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        when(bookingRepository.findConfirmedFutureLinkGuestBySalonIdAndPhone(eq(salonId), eq("+380501234567"), any()))
+                .thenReturn(List.of());
+
+        int declined = bookingService.declineFutureConfirmedForBlockedGuest(actorId, null, salonId, "+380501234567");
+
+        assertThat(declined).isZero();
+        verify(bookingRepository, never()).findConfirmedFutureLinkGuestByMasterIdAndPhone(any(), any(), any());
+        verifyNoInteractions(outboxService, inAppNotificationService);
+    }
+
+    @Test
+    void should_rejectAmbiguousScope_when_bothOrNeitherScopeIdGiven() {
+        UUID actorId = UUID.randomUUID();
+
+        assertThatThrownBy(() -> bookingService.declineFutureConfirmedForBlockedClient(
+                actorId, masterId, UUID.randomUUID(), clientId)).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> bookingService.declineFutureConfirmedForBlockedGuest(
+                actorId, null, null, "+380501234567")).isInstanceOf(IllegalArgumentException.class);
+    }
+
     // ── declineFutureConfirmedBookingsForMasterRemoval (Phase 298 — master-removal sibling of the
     // salon-closure cascade above; shares declineFutureConfirmed's entire body via D4) ──────────
 
@@ -1424,6 +1595,47 @@ class BookingServiceTest {
         // Assert
         verify(cacheManager).getCache("revenue-dashboard");
         verify(revenueCacheMock).clear();
+    }
+
+    @Test
+    @DisplayName("phase 400 D7 — completing a single LINK guest booking publishes GuestBookingCompletedEvent"
+            + "(bookingId, now) after BookingCompletedEvent")
+    void should_publishGuestBookingCompletedEvent_when_linkBookingCompleted() {
+        // Arrange
+        UUID actorId = UUID.randomUUID();
+        Booking booking = buildElapsedBooking(bookingId, null, master, msa, BookingStatus.CONFIRMED);
+        setField(booking, "bookingSource", BookingSource.LINK);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        when(bookingRepository.save(any())).thenReturn(booking);
+
+        // Act
+        bookingService.completeBooking(actorId, bookingId);
+
+        // Assert
+        InOrder order = inOrder(eventPublisher);
+        order.verify(eventPublisher).publishEvent(new BookingCompletedEvent(null));
+        order.verify(eventPublisher).publishEvent(new GuestBookingCompletedEvent(bookingId, clock.instant()));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @EnumSource(value = BookingSource.class, names = {"APP", "STAFF"})
+    @DisplayName("phase 400 D7 — APP and STAFF completions publish BookingCompletedEvent but never "
+            + "GuestBookingCompletedEvent")
+    void should_notPublishGuestBookingCompletedEvent_when_sourceNotLink(BookingSource source) {
+        // Arrange
+        UUID actorId = UUID.randomUUID();
+        Booking booking = buildElapsedBooking(bookingId, source == BookingSource.APP ? client : null, master, msa,
+                BookingStatus.CONFIRMED);
+        setField(booking, "bookingSource", source);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        when(bookingRepository.save(any())).thenReturn(booking);
+
+        // Act
+        bookingService.completeBooking(actorId, bookingId);
+
+        // Assert
+        verify(eventPublisher).publishEvent(any(BookingCompletedEvent.class));
+        verify(eventPublisher, never()).publishEvent(any(GuestBookingCompletedEvent.class));
     }
 
     // ── notCompleteBooking ─────────────────────────────────────────────────────
@@ -4939,7 +5151,7 @@ class BookingServiceTest {
             // statement count and the short-circuit in front of it are unchanged.
             when(reviewRepository.findViewByBookingId(bookingId)).thenReturn(
                     reviewExists
-                            ? Optional.of(new com.beautica.review.repository.BookingReviewView((short) 5, "Гарно"))
+                            ? Optional.of(new com.beautica.review.repository.BookingReviewView(REVIEW_BY_CLIENT_ID, (short) 5, "Гарно"))
                             : Optional.empty());
         }
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
@@ -4968,6 +5180,13 @@ class BookingServiceTest {
     @DisplayName("canReview is true for a COMPLETED booking with no existing review")
     void should_returnCanReviewTrue_when_bookingCompletedAndNoReview() {
         assertThat(getBookingWith(BookingStatus.COMPLETED, false).canReview()).isTrue();
+    }
+
+    @Test
+    @DisplayName("phase 395 — reviewByClient carries the review id (report target)")
+    void should_exposeReviewId_when_bookingCompletedAndReviewExists() {
+        assertThat(getBookingWith(BookingStatus.COMPLETED, true).reviewByClient().id())
+                .isEqualTo(REVIEW_BY_CLIENT_ID);
     }
 
     @Test

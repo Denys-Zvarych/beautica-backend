@@ -9,6 +9,7 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 
+import com.beautica.booking.domain.CancelTokenHasher;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.auth.phoneotp.GuestTokenProvider;
 import com.beautica.booking.dto.AvailableSlotResponse;
@@ -32,6 +33,7 @@ import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.StreamSupport;
 import javax.sql.DataSource;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.mockito.stubbing.Answer;
@@ -58,7 +60,6 @@ import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
 class GuestVisitLinkParityIT extends AbstractIntegrationTest {
 
     private static final ZoneId KYIV = ZoneId.of("Europe/Kyiv");
-    private static final String TEST_PASSWORD = "Str0ngP@ss1!";
     private static final String GUEST_PHONE = "+380509998877";
 
     /**
@@ -114,6 +115,13 @@ class GuestVisitLinkParityIT extends AbstractIntegrationTest {
     @Autowired
     private DataSource dataSource;
 
+    private GuestLinkFixtures fixtures;
+
+    @BeforeEach
+    void initFixtures() {
+        fixtures = new GuestLinkFixtures(jdbcTemplate, passwordEncoder, clock);
+    }
+
     private LocalDate today() {
         return LocalDate.now(clock.withZone(KYIV));
     }
@@ -123,12 +131,12 @@ class GuestVisitLinkParityIT extends AbstractIntegrationTest {
             + "back-to-back, each guest-populated, under one cancel token")
     void should_create2ChainedConfirmedItemsUnderOneAppointment_when_guestBooksTwoServices() throws Exception {
         String slug = "guest-visit-" + Long.toString(System.nanoTime(), 36);
-        UUID masterId = createMasterWithSlug("guest-visit-master-" + System.nanoTime() + "@beautica.test", slug);
-        seedOpenWeek(masterId);
-        UUID svc1 = createService(masterId, 30, 0);
-        UUID svc2 = createService(masterId, 30, 1);
+        UUID masterId = fixtures.createMasterWithSlug("guest-visit-master-" + System.nanoTime() + "@beautica.test", slug);
+        fixtures.seedOpenWeek(masterId);
+        UUID svc1 = fixtures.createService(masterId, 30, 0);
+        UUID svc2 = fixtures.createService(masterId, 30, 1);
 
-        ZonedDateTime startsAt = ZonedDateTime.now(KYIV)
+        ZonedDateTime startsAt = ZonedDateTime.now(clock.withZone(KYIV))
                 .plusDays(3).withHour(10).withMinute(0).withSecond(0).withNano(0);
 
         GuestBookingResponse created = postVisit(slug, List.of(svc1, svc2), startsAt);
@@ -137,7 +145,7 @@ class GuestVisitLinkParityIT extends AbstractIntegrationTest {
         assertThat(created.durationMinutes()).as("summed service duration (30 + 30)").isEqualTo(60);
 
         List<Map<String, Object>> items = jdbcTemplate.queryForList(
-                "SELECT status, starts_at, ends_at, booking_source, guest_phone, client_id, cancel_token "
+                "SELECT status, starts_at, ends_at, booking_source, guest_phone, client_id, cancel_token_hash "
                         + "FROM bookings WHERE appointment_id = ? ORDER BY starts_at",
                 created.appointmentId());
         assertThat(items).as("two chained booking items under one appointment").hasSize(2);
@@ -146,19 +154,19 @@ class GuestVisitLinkParityIT extends AbstractIntegrationTest {
             assertThat(row.get("booking_source")).isEqualTo("LINK");
             assertThat(row.get("guest_phone")).isEqualTo(GUEST_PHONE);
             assertThat(row.get("client_id")).as("a guest item has no registered client").isNull();
-            assertThat(row.get("cancel_token")).as("V91 requires a token on every CONFIRMED LINK row").isNotNull();
+            assertThat(row.get("cancel_token_hash")).as("V91 requires a token on every CONFIRMED LINK row").isNotNull();
         });
         assertThat(items.get(0).get("ends_at"))
                 .as("items are contiguous: item0 ends exactly where item1 starts")
                 .isEqualTo(items.get(1).get("starts_at"));
 
         Map<String, Object> appt = jdbcTemplate.queryForMap(
-                "SELECT status, booking_source, client_id, cancel_token FROM appointments WHERE id = ?",
+                "SELECT status, booking_source, client_id, cancel_token_hash FROM appointments WHERE id = ?",
                 created.appointmentId());
         assertThat(appt.get("status")).isEqualTo("CONFIRMED");
         assertThat(appt.get("booking_source")).isEqualTo("LINK");
         assertThat(appt.get("client_id")).as("V126: a LINK visit header has no client").isNull();
-        assertThat(appt.get("cancel_token")).as("the visit-level cancel token lives on the header").isNotNull();
+        assertThat(appt.get("cancel_token_hash")).as("the visit-level cancel token lives on the header").isNotNull();
 
         // ONE new-booking outbox row for the whole visit (never one per service).
         Integer newBookingRows = jdbcTemplate.queryForObject(
@@ -170,11 +178,11 @@ class GuestVisitLinkParityIT extends AbstractIntegrationTest {
     @DisplayName("the visit cancel token cancels BOTH items and the header, freeing the slots")
     void should_cancelWholeVisit_when_visitCancelTokenPosted() throws Exception {
         String slug = "guest-cancel-" + Long.toString(System.nanoTime(), 36);
-        UUID masterId = createMasterWithSlug("guest-cancel-master-" + System.nanoTime() + "@beautica.test", slug);
-        seedOpenWeek(masterId);
-        UUID svc1 = createService(masterId, 30, 0);
-        UUID svc2 = createService(masterId, 30, 1);
-        ZonedDateTime startsAt = ZonedDateTime.now(KYIV)
+        UUID masterId = fixtures.createMasterWithSlug("guest-cancel-master-" + System.nanoTime() + "@beautica.test", slug);
+        fixtures.seedOpenWeek(masterId);
+        UUID svc1 = fixtures.createService(masterId, 30, 0);
+        UUID svc2 = fixtures.createService(masterId, 30, 1);
+        ZonedDateTime startsAt = ZonedDateTime.now(clock.withZone(KYIV))
                 .plusDays(3).withHour(12).withMinute(0).withSecond(0).withNano(0);
 
         GuestBookingResponse created = postVisit(slug, List.of(svc1, svc2), startsAt);
@@ -187,17 +195,17 @@ class GuestVisitLinkParityIT extends AbstractIntegrationTest {
                 .isEqualTo(HttpStatus.NO_CONTENT);
 
         List<Map<String, Object>> items = jdbcTemplate.queryForList(
-                "SELECT status, cancel_token FROM bookings WHERE appointment_id = ?", created.appointmentId());
+                "SELECT status, cancel_token_hash FROM bookings WHERE appointment_id = ?", created.appointmentId());
         assertThat(items).as("both items were cancelled by the one token").hasSize(2);
         assertThat(items).allSatisfy(row -> {
             assertThat(row.get("status")).isEqualTo("CANCELLED");
-            assertThat(row.get("cancel_token")).as("per-item tokens nulled on cancel").isNull();
+            assertThat(row.get("cancel_token_hash")).as("per-item tokens nulled on cancel").isNull();
         });
 
         Map<String, Object> appt = jdbcTemplate.queryForMap(
-                "SELECT status, cancel_token FROM appointments WHERE id = ?", created.appointmentId());
+                "SELECT status, cancel_token_hash FROM appointments WHERE id = ?", created.appointmentId());
         assertThat(appt.get("status")).isEqualTo("CANCELLED");
-        assertThat(appt.get("cancel_token")).as("the visit token is consumed (nulled)").isNull();
+        assertThat(appt.get("cancel_token_hash")).as("the visit token is consumed (nulled)").isNull();
 
         // A replayed POST (token already consumed / nulled) is an idempotent 404 — no second cancel.
         ResponseEntity<Void> replay = restTemplate.exchange(
@@ -210,11 +218,11 @@ class GuestVisitLinkParityIT extends AbstractIntegrationTest {
             + "CONFIRMED (no desync); the header token still cancels the whole visit")
     void should_rejectPerItemTokenAndKeepVisitConfirmed_when_childTokenPostedToLegacyPath() throws Exception {
         String slug = "guest-desync-" + Long.toString(System.nanoTime(), 36);
-        UUID masterId = createMasterWithSlug("guest-desync-master-" + System.nanoTime() + "@beautica.test", slug);
-        seedOpenWeek(masterId);
-        UUID svc1 = createService(masterId, 30, 0);
-        UUID svc2 = createService(masterId, 30, 1);
-        ZonedDateTime startsAt = ZonedDateTime.now(KYIV)
+        UUID masterId = fixtures.createMasterWithSlug("guest-desync-master-" + System.nanoTime() + "@beautica.test", slug);
+        fixtures.seedOpenWeek(masterId);
+        UUID svc1 = fixtures.createService(masterId, 30, 0);
+        UUID svc2 = fixtures.createService(masterId, 30, 1);
+        ZonedDateTime startsAt = ZonedDateTime.now(clock.withZone(KYIV))
                 .plusDays(3).withHour(14).withMinute(0).withSecond(0).withNano(0);
 
         GuestBookingResponse created = postVisit(slug, List.of(svc1, svc2), startsAt);
@@ -222,10 +230,17 @@ class GuestVisitLinkParityIT extends AbstractIntegrationTest {
 
         // A visit child item carries its OWN per-item cancel_token (V91 mandates one on every CONFIRMED
         // LINK row). Pull one directly from the item row and present it to the SAME public cancel endpoint.
-        UUID perItemToken = jdbcTemplate.queryForObject(
-                "SELECT cancel_token FROM bookings WHERE appointment_id = ? ORDER BY starts_at LIMIT 1",
-                UUID.class, created.appointmentId());
-        assertThat(perItemToken).as("a child item has its own per-item token").isNotNull();
+        // V206: only per-item token HASHES are stored, so the raw per-item token is unrecoverable. Pin a
+        // KNOWN token onto the first item through the legacy plaintext column — V206's trigger hashes it
+        // into cancel_token_hash exactly as a real per-item token is stored.
+        UUID perItemToken = UUID.randomUUID();
+        jdbcTemplate.update("UPDATE bookings SET cancel_token = ? WHERE id = (SELECT id FROM bookings "
+                + "WHERE appointment_id = ? ORDER BY starts_at LIMIT 1)", perItemToken, created.appointmentId());
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT cancel_token_hash FROM bookings WHERE appointment_id = ? ORDER BY starts_at LIMIT 1",
+                String.class, created.appointmentId()))
+                .as("a child item has its own per-item token (stored as its hash)")
+                .isEqualTo(CancelTokenHasher.hash(perItemToken));
         assertThat(perItemToken.toString()).as("the per-item token is NOT the header token")
                 .isNotEqualTo(headerToken);
 
@@ -238,16 +253,16 @@ class GuestVisitLinkParityIT extends AbstractIntegrationTest {
 
         // No desync: the header and BOTH items stay CONFIRMED, every per-item token still present.
         List<Map<String, Object>> itemsAfterReject = jdbcTemplate.queryForList(
-                "SELECT status, cancel_token FROM bookings WHERE appointment_id = ?", created.appointmentId());
+                "SELECT status, cancel_token_hash FROM bookings WHERE appointment_id = ?", created.appointmentId());
         assertThat(itemsAfterReject).hasSize(2);
         assertThat(itemsAfterReject).allSatisfy(row -> {
             assertThat(row.get("status")).as("the legacy path must NOT cancel a single visit item").isEqualTo("CONFIRMED");
-            assertThat(row.get("cancel_token")).as("per-item token untouched").isNotNull();
+            assertThat(row.get("cancel_token_hash")).as("per-item token untouched").isNotNull();
         });
         Map<String, Object> apptAfterReject = jdbcTemplate.queryForMap(
-                "SELECT status, cancel_token FROM appointments WHERE id = ?", created.appointmentId());
+                "SELECT status, cancel_token_hash FROM appointments WHERE id = ?", created.appointmentId());
         assertThat(apptAfterReject.get("status")).as("the visit header stays CONFIRMED").isEqualTo("CONFIRMED");
-        assertThat(apptAfterReject.get("cancel_token")).as("the header token is untouched").isNotNull();
+        assertThat(apptAfterReject.get("cancel_token_hash")).as("the header token is untouched").isNotNull();
 
         // The HEADER token still cancels the WHOLE visit → 204, both items + header CANCELLED.
         ResponseEntity<Void> headerResp = restTemplate.exchange(
@@ -270,15 +285,15 @@ class GuestVisitLinkParityIT extends AbstractIntegrationTest {
     @DisplayName("the reminder sweep sends exactly ONE reminder for a 2-service visit and marks every item")
     void should_sendOneReminder_when_multiServiceVisitDueForReminder() throws Exception {
         String slug = "guest-remind-" + Long.toString(System.nanoTime(), 36);
-        UUID masterId = createMasterWithSlug("guest-remind-master-" + System.nanoTime() + "@beautica.test", slug);
-        UUID svc1 = createService(masterId, 30, 0);
-        UUID svc2 = createService(masterId, 30, 1);
+        UUID masterId = fixtures.createMasterWithSlug("guest-remind-master-" + System.nanoTime() + "@beautica.test", slug);
+        UUID svc1 = fixtures.createService(masterId, 30, 0);
+        UUID svc2 = fixtures.createService(masterId, 30, 1);
 
         // Place item0 inside the sweep's [now+23h, now+25h] reminder window at now+23h30m (item1 follows
         // 30 min later). Uses the real clock the job reads. midnightSafeAnchor may push the pair up to
         // CHAIN_MINUTES later so the chain never straddles Kyiv midnight; +23h30m leaves 90 min of head-
         // room below the window's upper edge, so the shifted anchor is always still due in this sweep.
-        ZonedDateTime startsAt = midnightSafeAnchor(ZonedDateTime.now(KYIV)
+        ZonedDateTime startsAt = midnightSafeAnchor(ZonedDateTime.now(clock.withZone(KYIV))
                 .plusHours(23).plusMinutes(30).withSecond(0).withNano(0), CHAIN_MINUTES);
         // Schedule anchored at the derived (wall-clock-relative) start, so it is slot #0 — the create
         // path now requires the visit to fall on the master's schedule.
@@ -304,10 +319,10 @@ class GuestVisitLinkParityIT extends AbstractIntegrationTest {
     @DisplayName("legacy single-service guest booking + cancel-by-token still work (appointment_id NULL)")
     void should_keepLegacySingleServicePathIntact_when_guestBooksOneService() throws Exception {
         String slug = "guest-legacy-" + Long.toString(System.nanoTime(), 36);
-        UUID masterId = createMasterWithSlug("guest-legacy-master-" + System.nanoTime() + "@beautica.test", slug);
-        seedOpenWeek(masterId);
-        UUID svc = createService(masterId, 60, 0);
-        ZonedDateTime startsAt = ZonedDateTime.now(KYIV)
+        UUID masterId = fixtures.createMasterWithSlug("guest-legacy-master-" + System.nanoTime() + "@beautica.test", slug);
+        fixtures.seedOpenWeek(masterId);
+        UUID svc = fixtures.createService(masterId, 60, 0);
+        ZonedDateTime startsAt = ZonedDateTime.now(clock.withZone(KYIV))
                 .plusDays(4).withHour(9).withMinute(0).withSecond(0).withNano(0);
 
         String body = """
@@ -321,23 +336,25 @@ class GuestVisitLinkParityIT extends AbstractIntegrationTest {
 
         assertThat(created.appointmentId()).as("a legacy single-service booking has NO appointment").isNull();
         Map<String, Object> row = jdbcTemplate.queryForMap(
-                "SELECT status, booking_source, appointment_id, cancel_token FROM bookings WHERE id = ?",
+                "SELECT status, booking_source, appointment_id, cancel_token_hash FROM bookings WHERE id = ?",
                 created.bookingId());
         assertThat(row.get("status")).isEqualTo("CONFIRMED");
         assertThat(row.get("booking_source")).isEqualTo("LINK");
         assertThat(row.get("appointment_id")).as("legacy path keeps appointment_id NULL").isNull();
-        assertThat(row.get("cancel_token")).isNotNull();
 
         String token = created.cancelUrl().substring(created.cancelUrl().lastIndexOf('/') + 1);
+        assertThat(row.get("cancel_token_hash"))
+                .as("V206: the row stores only the SHA-256 of the token handed to the guest")
+                .isEqualTo(CancelTokenHasher.hash(UUID.fromString(token)));
         ResponseEntity<Void> cancelResp = restTemplate.exchange(
                 "/api/v1/book/cancel/" + token, HttpMethod.POST, new HttpEntity<>(xffHeaders()), Void.class);
         assertThat(cancelResp.getStatusCode())
                 .as("legacy single-booking cancel-by-token still returns 204")
                 .isEqualTo(HttpStatus.NO_CONTENT);
         Map<String, Object> after = jdbcTemplate.queryForMap(
-                "SELECT status, cancel_token FROM bookings WHERE id = ?", created.bookingId());
+                "SELECT status, cancel_token_hash FROM bookings WHERE id = ?", created.bookingId());
         assertThat(after.get("status")).isEqualTo("CANCELLED");
-        assertThat(after.get("cancel_token")).isNull();
+        assertThat(after.get("cancel_token_hash")).isNull();
     }
 
     // ── point 2: multi-service availability sized to the summed back-to-back block ──
@@ -347,9 +364,9 @@ class GuestVisitLinkParityIT extends AbstractIntegrationTest {
             + "alone); a single ?serviceId=A stays the legacy single-service result")
     void should_sizeAvailabilityToSummedBlock_when_twoServicesRequested() throws Exception {
         String slug = "guest-avail-" + Long.toString(System.nanoTime(), 36);
-        UUID masterId = createMasterWithSlug("guest-avail-master-" + System.nanoTime() + "@beautica.test", slug);
-        UUID svcA = createService(masterId, 60, 0); // effective 60 (buffer 0)
-        UUID svcB = createService(masterId, 30, 1); // effective 30
+        UUID masterId = fixtures.createMasterWithSlug("guest-avail-master-" + System.nanoTime() + "@beautica.test", slug);
+        UUID svcA = fixtures.createService(masterId, 60, 0); // effective 60 (buffer 0)
+        UUID svcB = fixtures.createService(masterId, 30, 1); // effective 30
         LocalDate day = today().plusDays(7);
         seedWorkingDay(masterId, day, LocalTime.of(9, 0), LocalTime.of(12, 0));
 
@@ -386,8 +403,8 @@ class GuestVisitLinkParityIT extends AbstractIntegrationTest {
             + "the XOR, so the service rejects it)")
     void should_return400_when_neitherServiceIdNorMasterServiceIds() {
         String slug = "guest-xor-" + Long.toString(System.nanoTime(), 36);
-        createMasterWithSlug("guest-xor-master-" + System.nanoTime() + "@beautica.test", slug);
-        ZonedDateTime startsAt = ZonedDateTime.now(KYIV)
+        fixtures.createMasterWithSlug("guest-xor-master-" + System.nanoTime() + "@beautica.test", slug);
+        ZonedDateTime startsAt = ZonedDateTime.now(clock.withZone(KYIV))
                 .plusDays(3).withHour(10).withMinute(0).withSecond(0).withNano(0);
         String body = """
                 {"startsAt":"%s","name":"Оксана","surname":"Мельник","privacyAccepted":true,"privacyPolicyVersion":"2026-10-20"}
@@ -409,12 +426,12 @@ class GuestVisitLinkParityIT extends AbstractIntegrationTest {
             + "is created; the lone serviceId is ignored)")
     void should_preferMasterServiceIds_when_bothPresent() throws Exception {
         String slug = "guest-both-" + Long.toString(System.nanoTime(), 36);
-        UUID masterId = createMasterWithSlug("guest-both-master-" + System.nanoTime() + "@beautica.test", slug);
-        seedOpenWeek(masterId);
-        UUID svc1 = createService(masterId, 30, 0);
-        UUID svc2 = createService(masterId, 30, 1);
-        UUID svcLone = createService(masterId, 45, 2);
-        ZonedDateTime startsAt = ZonedDateTime.now(KYIV)
+        UUID masterId = fixtures.createMasterWithSlug("guest-both-master-" + System.nanoTime() + "@beautica.test", slug);
+        fixtures.seedOpenWeek(masterId);
+        UUID svc1 = fixtures.createService(masterId, 30, 0);
+        UUID svc2 = fixtures.createService(masterId, 30, 1);
+        UUID svcLone = fixtures.createService(masterId, 45, 2);
+        ZonedDateTime startsAt = ZonedDateTime.now(clock.withZone(KYIV))
                 .plusDays(3).withHour(16).withMinute(0).withSecond(0).withNano(0);
         String body = """
                 {"serviceId":"%s","masterServiceIds":["%s","%s"],"startsAt":"%s","name":"Оксана","surname":"Мельник","privacyAccepted":true,"privacyPolicyVersion":"2026-10-20"}
@@ -445,10 +462,10 @@ class GuestVisitLinkParityIT extends AbstractIntegrationTest {
             + "guard the legacy single path enforces), nothing persisted")
     void should_return400_when_multiServiceGuestNameHasControlChar() {
         String slug = "guest-ctrl-" + Long.toString(System.nanoTime(), 36);
-        UUID masterId = createMasterWithSlug("guest-ctrl-master-" + System.nanoTime() + "@beautica.test", slug);
-        UUID svc1 = createService(masterId, 30, 0);
-        UUID svc2 = createService(masterId, 30, 1);
-        ZonedDateTime startsAt = ZonedDateTime.now(KYIV)
+        UUID masterId = fixtures.createMasterWithSlug("guest-ctrl-master-" + System.nanoTime() + "@beautica.test", slug);
+        UUID svc1 = fixtures.createService(masterId, 30, 0);
+        UUID svc2 = fixtures.createService(masterId, 30, 1);
+        ZonedDateTime startsAt = ZonedDateTime.now(clock.withZone(KYIV))
                 .plusDays(3).withHour(11).withMinute(0).withSecond(0).withNano(0);
         // Embedded NUL in the name — an SMS/log-injection surface the @Pattern rejects.
         String body = """
@@ -508,12 +525,12 @@ class GuestVisitLinkParityIT extends AbstractIntegrationTest {
             + "was reached: zero appointment header, zero item rows, only the blocker survives)")
     void should_rollbackWholeVisit_when_chainOverlapsExistingBooking() throws Exception {
         String slug = "guest-atomic-" + Long.toString(System.nanoTime(), 36);
-        UUID masterId = createMasterWithSlug("guest-atomic-master-" + System.nanoTime() + "@beautica.test", slug);
+        UUID masterId = fixtures.createMasterWithSlug("guest-atomic-master-" + System.nanoTime() + "@beautica.test", slug);
         // On-schedule so the fit gate passes on its own merits — at gate time the master is genuinely free.
-        seedOpenWeek(masterId);
-        UUID svc1 = createService(masterId, 30, 0);
-        UUID svc2 = createService(masterId, 30, 1);
-        ZonedDateTime startsAt = ZonedDateTime.now(KYIV)
+        fixtures.seedOpenWeek(masterId);
+        UUID svc1 = fixtures.createService(masterId, 30, 0);
+        UUID svc2 = fixtures.createService(masterId, 30, 1);
+        ZonedDateTime startsAt = ZonedDateTime.now(clock.withZone(KYIV))
                 .plusDays(3).withHour(10).withMinute(0).withSecond(0).withNano(0);
         UUID clientId = seedClient();
 
@@ -571,9 +588,9 @@ class GuestVisitLinkParityIT extends AbstractIntegrationTest {
             + "startsAt falls OUTSIDE the sweep window — so a later sweep can never re-remind the tail")
     void should_markTailItemOutsideWindow_when_visitReminded() throws Exception {
         String slug = "guest-tail-" + Long.toString(System.nanoTime(), 36);
-        UUID masterId = createMasterWithSlug("guest-tail-master-" + System.nanoTime() + "@beautica.test", slug);
-        UUID svc1 = createService(masterId, 30, 0);
-        UUID svc2 = createService(masterId, 30, 1);
+        UUID masterId = fixtures.createMasterWithSlug("guest-tail-master-" + System.nanoTime() + "@beautica.test", slug);
+        UUID svc1 = fixtures.createService(masterId, 30, 0);
+        UUID svc2 = fixtures.createService(masterId, 30, 1);
 
         // Create the visit through the REAL create path at a fixed, midnight-safe anchor, then retime its
         // rows into the sweep window. This test — alone among the three reminder tests — cannot use
@@ -583,15 +600,15 @@ class GuestVisitLinkParityIT extends AbstractIntegrationTest {
         // (freedom = Σ of the leading items' durations < Σ of ALL of them), so no wall-clock-derived anchor
         // can be both due-in-window and schedule-fittable at every hour of the day. Retiming decouples the
         // sweep — the actual subject here — from the create path's schedule gate entirely.
-        ZonedDateTime createdAt = ZonedDateTime.now(KYIV)
+        ZonedDateTime createdAt = ZonedDateTime.now(clock.withZone(KYIV))
                 .plusDays(3).withHour(10).withMinute(0).withSecond(0).withNano(0);
-        seedOpenWeek(masterId);
+        fixtures.seedOpenWeek(masterId);
         GuestBookingResponse created = postVisit(slug, List.of(svc1, svc2), createdAt);
 
         // item0 at now+24h45m is INSIDE the [now+23h, now+25h] window; item1 (30-min service) at
         // now+25h15m is OUTSIDE it. The query returns only item0, but the visit's dedup UPDATE must
         // still stamp item1.reminder_sent=true.
-        ZonedDateTime item0 = ZonedDateTime.now(KYIV)
+        ZonedDateTime item0 = ZonedDateTime.now(clock.withZone(KYIV))
                 .plusHours(24).plusMinutes(45).withSecond(0).withNano(0);
         retimeVisitItems(created.appointmentId(), item0, 30);
         clearInvocations(smsService);
@@ -616,13 +633,13 @@ class GuestVisitLinkParityIT extends AbstractIntegrationTest {
             + "single guest booking — no cross-contamination")
     void should_remindVisitOnceAndSingleOnce_when_mixedSweep() throws Exception {
         String visitSlug = "guest-mix-v-" + Long.toString(System.nanoTime(), 36);
-        UUID visitMaster = createMasterWithSlug("guest-mix-v-" + System.nanoTime() + "@beautica.test", visitSlug);
-        UUID vSvc1 = createService(visitMaster, 30, 0);
-        UUID vSvc2 = createService(visitMaster, 30, 1);
+        UUID visitMaster = fixtures.createMasterWithSlug("guest-mix-v-" + System.nanoTime() + "@beautica.test", visitSlug);
+        UUID vSvc1 = fixtures.createService(visitMaster, 30, 0);
+        UUID vSvc2 = fixtures.createService(visitMaster, 30, 1);
         // Same 90-min headroom below the window's upper edge as
         // should_sendOneReminder_when_multiServiceVisitDueForReminder, so midnightSafeAnchor's ≤60-min
         // shift can never push the visit out of this sweep.
-        ZonedDateTime visitStart = midnightSafeAnchor(ZonedDateTime.now(KYIV)
+        ZonedDateTime visitStart = midnightSafeAnchor(ZonedDateTime.now(clock.withZone(KYIV))
                 .plusHours(23).plusMinutes(30).withSecond(0).withNano(0), CHAIN_MINUTES);
         // Only the VISIT goes through the create path (and therefore the schedule-fit gate); the legacy
         // single booking below is inserted directly, so its master needs no schedule.
@@ -633,9 +650,9 @@ class GuestVisitLinkParityIT extends AbstractIntegrationTest {
         // due in the same sweep window.
         String legacyPhone = "+380671112233";
         String legacySlug = "guest-mix-s-" + Long.toString(System.nanoTime(), 36);
-        UUID legacyMaster = createMasterWithSlug("guest-mix-s-" + System.nanoTime() + "@beautica.test", legacySlug);
-        UUID lSvc = createService(legacyMaster, 60, 0);
-        OffsetDateTime legacyStart = ZonedDateTime.now(KYIV)
+        UUID legacyMaster = fixtures.createMasterWithSlug("guest-mix-s-" + System.nanoTime() + "@beautica.test", legacySlug);
+        UUID lSvc = fixtures.createService(legacyMaster, 60, 0);
+        OffsetDateTime legacyStart = ZonedDateTime.now(clock.withZone(KYIV))
                 .plusHours(24).withSecond(0).withNano(0).toOffsetDateTime();
         UUID legacyBookingId = insertLegacyGuestBooking(legacyMaster, lSvc, legacyStart, legacyPhone);
 
@@ -676,47 +693,6 @@ class GuestVisitLinkParityIT extends AbstractIntegrationTest {
         return objectMapper.readValue(resp.getBody(), GuestBookingResponse.class);
     }
 
-    private UUID createMasterWithSlug(String email, String slug) {
-        UUID userId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO users (id, email, password_hash, role, is_active, email_verified, first_name, last_name) "
-                        + "VALUES (?, ?, ?, 'INDEPENDENT_MASTER', true, true, 'Наталія', 'Бойко')",
-                userId, email, passwordEncoder.encode(TEST_PASSWORD));
-        UUID masterId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO masters (id, user_id, master_type, is_active, booking_slug, created_at, updated_at) "
-                        + "VALUES (?, ?, 'INDEPENDENT_MASTER', true, ?, NOW(), NOW())",
-                masterId, userId, slug);
-        return masterId;
-    }
-
-    /** Seeds a master service with the given duration; {@code typeOffset} picks a distinct service_type. */
-    private UUID createService(UUID masterId, int durationMinutes, int typeOffset) {
-        UUID ownerId = jdbcTemplate.queryForObject(
-                "SELECT user_id FROM masters WHERE id = ?", UUID.class, masterId);
-        UUID serviceDefId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO service_definitions (id, owner_type, owner_id, name, service_type_id, "
-                        + "base_duration_minutes, base_price, buffer_minutes_after, is_active, created_at, updated_at) "
-                        + "VALUES (?, 'INDEPENDENT_MASTER', ?, ?, ?, ?, 350.00, 0, true, NOW(), NOW())",
-                serviceDefId, ownerId, "Послуга-" + typeOffset, resolveServiceTypeId(typeOffset), durationMinutes);
-        UUID masterServiceId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) "
-                        + "VALUES (?, ?, ?, true, NOW(), NOW())",
-                masterServiceId, masterId, serviceDefId);
-        return masterServiceId;
-    }
-
-    private UUID resolveServiceTypeId(int offset) {
-        return jdbcTemplate.queryForObject(
-                "SELECT st.id FROM service_types st "
-                        + "JOIN platform_categories pc ON pc.name = st.platform_category_name "
-                        + "WHERE st.is_active = TRUE AND pc.active = TRUE AND pc.status = 'APPROVED' "
-                        + "ORDER BY st.name_uk OFFSET ? LIMIT 1",
-                UUID.class, offset);
-    }
-
     private HttpHeaders guestHeaders() {
         HttpHeaders headers = new HttpHeaders();
         headers.setBearerAuth(guestTokenProvider.generate(GUEST_PHONE));
@@ -748,43 +724,10 @@ class GuestVisitLinkParityIT extends AbstractIntegrationTest {
                 .toList();
     }
 
-    private UUID seedSchedule(UUID masterId, LocalDate validFrom, LocalDate validTo) {
-        UUID scheduleId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO weekly_schedules (id, master_id, valid_from, valid_to, created_at, updated_at) "
-                        + "VALUES (?, ?, ?, ?, NOW(), NOW())",
-                scheduleId, masterId, validFrom, validTo);
-        return scheduleId;
-    }
-
-    private void addInterval(UUID scheduleId, int isoDow, LocalTime start, LocalTime end) {
-        jdbcTemplate.update(
-                "INSERT INTO working_intervals (id, schedule_id, day_of_week, start_time, end_time) "
-                        + "VALUES (?, ?, ?, ?, ?)",
-                UUID.randomUUID(), scheduleId, isoDow, start, end);
-    }
-
     /** One open-ended working interval on {@code day}'s ISO weekday, valid from today. */
     private void seedWorkingDay(UUID masterId, LocalDate day, LocalTime start, LocalTime end) {
-        UUID sched = seedSchedule(masterId, today(), null);
-        addInterval(sched, day.getDayOfWeek().getValue(), start, end);
-    }
-
-    /**
-     * Open-ended weekly schedule, all seven ISO weekdays 08:00–20:00 — required by every test that
-     * expects a guest create to SUCCEED, now that all three create paths enforce schedule fit
-     * (2026-08-11). Before that gate a master with no schedule at all could still be booked, so these
-     * tests never seeded one.
-     *
-     * <p>Callers must place their {@code startsAt} on the 30-minute grid the slot walker anchors at the
-     * interval start (08:00) — i.e. :00 or :30 — otherwise no candidate matches. Wall-clock-relative
-     * tests use {@link #seedWeekAnchoredAt} instead.
-     */
-    private void seedOpenWeek(UUID masterId) {
-        UUID sched = seedSchedule(masterId, today(), null);
-        for (int isoDow = 1; isoDow <= 7; isoDow++) {
-            addInterval(sched, isoDow, LocalTime.of(8, 0), LocalTime.of(20, 0));
-        }
+        UUID sched = fixtures.seedSchedule(masterId, today(), null);
+        fixtures.addInterval(sched, day.getDayOfWeek().getValue(), start, end);
     }
 
     /**
@@ -816,9 +759,9 @@ class GuestVisitLinkParityIT extends AbstractIntegrationTest {
                     "Anchor " + start + " + " + chainMinutes + "min crosses Kyiv midnight; the schedule "
                             + "model cannot express it. Anchor via midnightSafeAnchor(...) first.");
         }
-        UUID sched = seedSchedule(masterId, today(), null);
+        UUID sched = fixtures.seedSchedule(masterId, today(), null);
         for (int isoDow = 1; isoDow <= 7; isoDow++) {
-            addInterval(sched, isoDow, start, end);
+            fixtures.addInterval(sched, isoDow, start, end);
         }
     }
 

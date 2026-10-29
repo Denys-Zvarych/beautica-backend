@@ -37,11 +37,22 @@ public class ClientReviewEventListener {
     @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void onClientReviewCreated(ClientReviewCreatedEvent event) {
+        recalculate(event.clientId());
+    }
+
+    /** Phase 396 D3 — a moderation transition moves the client's VISIBLE-only aggregate the same way. */
+    @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void onClientReviewModerationChanged(ClientReviewModerationChangedEvent event) {
+        recalculate(event.clientId());
+    }
+
+    private void recalculate(java.util.UUID clientId) {
         try {
-            clientReviewRepository.recalculateClientRating(event.clientId());
+            clientReviewRepository.recalculateClientRating(clientId);
         } catch (Exception ex) {
             log.error("recalculateClientRating failed for client={} — {}",
-                    event.clientId(), ex.getClass().getSimpleName());
+                    clientId, ex.getClass().getSimpleName());
         }
     }
 }

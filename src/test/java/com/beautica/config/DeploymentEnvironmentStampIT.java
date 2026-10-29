@@ -109,6 +109,8 @@ class DeploymentEnvironmentStampIT {
                     // Phase 382 D7: prod Turnstile ON, real-shaped (non-test) secret, Cloudflare's siteverify URL.
                     "app.turnstile.enabled=true", "app.turnstile.secret-key=0x4AAAAAAAfixtureNotARealSecretZZ9",
                     "app.turnstile.siteverify-url=https://challenges.cloudflare.com/turnstile/v0/siteverify",
+                    // Phase 401 audit-fix: prod pins both widget actions (prod-turnstile-action).
+                    "app.turnstile.expected-action=otp_send", "app.turnstile.review-expected-action=review_submit",
                     // Phase 374: prod must resolve the Brevo HTTPS API transport (prod-mail-transport et al.).
                     "app.mail.transport=brevo-api", "app.mail.brevo-api.api-key=xkeysib-fixture-api-key",
                     "app.mail.logo-url=https://beautica.app/email/logo.png"));

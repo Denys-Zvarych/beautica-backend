@@ -1,5 +1,6 @@
 package com.beautica.booking.entity;
 
+import com.beautica.booking.domain.CancelTokenHasher;
 import com.beautica.booking.domain.GuestConsent;
 import com.beautica.booking.enums.BookingSource;
 import com.beautica.booking.enums.BookingStatus;
@@ -23,6 +24,7 @@ import jakarta.persistence.Index;
 import jakarta.persistence.JoinColumn;
 import jakarta.persistence.ManyToOne;
 import jakarta.persistence.Table;
+import jakarta.persistence.Transient;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Getter;
@@ -67,11 +69,12 @@ import java.util.UUID;
                 // predicate nor INCLUDE (§E-6, same convention as V123 note above) — mirrored by key only.
                 @Index(name = "idx_bookings_master_completed_client", columnList = "master_id"),
                 @Index(name = "idx_bookings_salon_completed_client", columnList = "salon_id"),
-                // partial UNIQUE index (V90): cancel-token lookup for the public guest-cancel page.
-                // JPA cannot encode WHERE cancel_token IS NOT NULL nor the partial-uniqueness —
-                // the predicate + UNIQUE live in V90 only (V90 dropped the V89 full unique
-                // constraint + non-unique partial index in favour of one partial-unique index).
-                @Index(name = "idx_bookings_cancel_token", columnList = "cancel_token"),
+                // partial UNIQUE index (V206): cancel-token-HASH lookup for the public guest-cancel page.
+                // JPA cannot encode WHERE cancel_token_hash IS NOT NULL nor the partial-uniqueness —
+                // the predicate + UNIQUE live in V206 only. The V90 idx_bookings_cancel_token on the
+                // retired plaintext column (always NULL since V206) is dropped with that column by the
+                // follow-up contract migration.
+                @Index(name = "ux_bookings_cancel_token_hash", columnList = "cancel_token_hash"),
                 // partial index (V89): hourly guest-reminder sweep.
                 // JPA cannot encode WHERE booking_source='LINK' AND reminder_sent=FALSE —
                 // predicate lives in V89 only; do NOT treat this annotation as authoritative.
@@ -463,16 +466,23 @@ public class Booking extends AuditableEntity {
         this.clientDetachedAt = at;
     }
 
-    // Uniqueness is enforced by the V90 partial-unique index (UNIQUE only over non-NULL
-    // rows). `unique = true` here would direct Hibernate ddl-auto to recreate the full
-    // unique constraint V90 deliberately dropped, so it is intentionally omitted.
+    // V206: only the SHA-256 of the guest cancel token is stored (CancelTokenHasher); the raw token
+    // exists only in the guest's SMS / link and the create response. Uniqueness is enforced by the
+    // V206 partial-unique index (UNIQUE only over non-NULL rows) — `unique = true` here would direct
+    // Hibernate ddl-auto to recreate a full unique constraint, so it is intentionally omitted.
     //
-    // @JsonIgnore: cancel_token is a guest-cancel CAPABILITY token — whoever holds it can cancel
-    // this booking. With multi-service visits (BE-7) each item carries its own per-item token, so
-    // there are now N per visit; shield every JSON serialization path so a future accidental
-    // entity-return can never leak them (mirrors Appointment.cancelToken).
+    // @JsonIgnore: the hash is the lookup key of a guest-cancel CAPABILITY — shield every JSON
+    // serialization path so a future accidental entity-return can never leak it (mirrors Appointment).
     @JsonIgnore
-    @Column(name = "cancel_token")
+    @Column(name = "cancel_token_hash", length = 64)
+    private String cancelTokenHash;
+
+    // The RAW cancel token, held in memory only on the instance that minted it (so the create path can
+    // build the guest's cancel link) — never persisted, never loaded: a booking read from the database
+    // always has this null. Set only through the builder's cancelToken(UUID), which also sets
+    // cancelTokenHash. @JsonIgnore for the same capability reason as above.
+    @JsonIgnore
+    @Transient
     private UUID cancelToken;
 
     @Setter
@@ -741,5 +751,19 @@ public class Booking extends AuditableEntity {
     public void reschedule(OffsetDateTime newStartsAt, OffsetDateTime newEndsAt) {
         this.startsAt = newStartsAt;
         this.endsAt = newEndsAt;
+    }
+
+    /**
+     * Lombok fills in the remaining builder methods. {@code cancelToken(UUID)} is hand-written so the
+     * persisted {@link #cancelTokenHash} can never drift from the in-memory raw {@link #cancelToken}:
+     * setting one always sets the other (V206 — only the hash is stored).
+     */
+    public static class BookingBuilder {
+
+        public BookingBuilder cancelToken(UUID cancelToken) {
+            this.cancelToken = cancelToken;
+            this.cancelTokenHash = cancelToken == null ? null : CancelTokenHasher.hash(cancelToken);
+            return this;
+        }
     }
 }

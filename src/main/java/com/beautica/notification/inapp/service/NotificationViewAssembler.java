@@ -6,6 +6,7 @@ import com.beautica.booking.entity.Booking;
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.common.security.AuthorizationService;
 import com.beautica.master.entity.Master;
+import com.beautica.notification.inapp.dto.ModeratedContentKind;
 import com.beautica.notification.inapp.dto.NotificationParams;
 import com.beautica.notification.inapp.dto.NotificationResponse;
 import com.beautica.notification.inapp.dto.NotificationTarget;
@@ -284,6 +285,9 @@ public class NotificationViewAssembler {
             InAppNotification row, UUID actorId, Role actorRole, Hydrated hydrated, ActorFacts facts,
             OffsetDateTime now) {
 
+        if (row.getType().isModerationOutcome()) {
+            return resolveModerationOutcome(row);
+        }
         if (row.getType() == InAppNotificationType.INVITE_ACCEPTED) {
             return resolveInviteAccepted(row, actorId, actorRole, hydrated.subjectsById(), facts);
         }
@@ -291,6 +295,20 @@ public class NotificationViewAssembler {
             return resolveRequestDecision(row, hydrated.requestDecisions());
         }
         return resolveBookingEvent(row, actorId, actorRole, hydrated, facts, now);
+    }
+
+    // ── phase 415: moderation outcomes ─────────────────────────────────────────────────────────
+
+    /**
+     * The recipient is a reporter or the author the write path picked, so no visibility check applies. D9: the
+     * target is always {@code NONE} (no deep link to hidden / removed content or a blocked profile); the params carry
+     * only the content kind, never UGC, names or the target id.
+     */
+    private static NotificationResponse resolveModerationOutcome(InAppNotification row) {
+        NotificationParams params = NotificationParams.moderationOutcome(
+                ModeratedContentKind.fromTargetType(row.getModeratedTargetType()));
+        return new NotificationResponse(row.getId(), row.getType(), row.getCreatedAt(), row.getReadAt() != null,
+                NotificationTarget.none(null), params);
     }
 
     // ── phase 372: category-request / service-type-suggestion decisions ─────────────────────────

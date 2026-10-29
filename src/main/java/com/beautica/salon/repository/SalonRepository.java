@@ -979,4 +979,19 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
     List<UUID> findBookableSalonIds(
             @Param("salonIds") Collection<UUID> salonIds,
             @Param(com.beautica.master.repository.MasterBookabilitySql.TODAY_PARAM) java.time.LocalDate today);
+
+    /**
+     * Phase 415 — the salon's owner plus its active admins, as ids, in one statement and without loading a
+     * {@code Salon} or {@code User} entity (the author recipients of removed salon content; same admin rule as
+     * {@code UserRepository#findBySalonIdAndRoleAndIsActiveTrue}). Empty for an unknown or closed
+     * ({@code is_active = false}) salon: a closed salon notifies nobody (audit-fix SEC 4).
+     */
+    @Query(value = """
+            SELECT s.owner_id FROM salons s WHERE s.id = :salonId AND s.is_active
+            UNION
+            SELECT u.id FROM users u
+              JOIN salons s ON s.id = u.salon_id
+             WHERE s.id = :salonId AND s.is_active AND u.role = 'SALON_ADMIN' AND u.is_active
+            """, nativeQuery = true)
+    List<UUID> findOwnerAndActiveAdminIds(@Param("salonId") UUID salonId);
 }

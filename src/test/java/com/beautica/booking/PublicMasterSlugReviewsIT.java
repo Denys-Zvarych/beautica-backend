@@ -167,8 +167,12 @@ class PublicMasterSlugReviewsIT extends AbstractIntegrationTest {
         Set<String> keys = new HashSet<>();
         Iterator<String> names = item.fieldNames();
         names.forEachRemaining(keys::add);
+        // Phase 395 added authoredByViewer (a boolean, no PII) - always false on the anonymous slug page.
+        // Phase 399 D2 added source (APP | GUEST_LINK, no PII) - additive.
         assertThat(keys).isEqualTo(Set.of("id", "masterId", "clientDisplayName", "serviceName", "rating", "comment",
-                "createdAt"));
+                "createdAt", "authoredByViewer", "source"));
+        assertThat(item.path("authoredByViewer").asBoolean()).isFalse();
+        assertThat(item.path("source").asText()).isEqualTo("APP");
         assertThat(item.path("clientDisplayName").asText()).isEqualTo("Ірина К.");
         assertThat(response.getBody()).doesNotContain("Кравчук").doesNotContain("@beautica.test")
                 .doesNotContain(PublicBookingPageFixtures.SEEDED_PHONE);

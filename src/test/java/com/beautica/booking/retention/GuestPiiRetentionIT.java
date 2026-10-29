@@ -115,6 +115,7 @@ class GuestPiiRetentionIT extends AbstractIntegrationTest {
         assertThat(row.get("guest_phone")).isNull();
         assertThat(row.get("client_comment")).isNull();
         assertThat(row.get("client_cancellation_note")).isNull();
+        assertThat(row.get("cancel_token_hash")).as("V206: the anonymiser clears the token hash").isNull();
         assertThat(row.get("cancel_token")).isNull();
         assertThat(row.get("guest_pii_anonymised_at")).isNotNull();
     }
@@ -504,6 +505,72 @@ class GuestPiiRetentionIT extends AbstractIntegrationTest {
                     .isEqualTo(2);
         }
 
+        /*
+         * Regression (same defect as InAppNotificationRepository#deleteCreatedBefore, commit c8d7173e): each claim must
+         * touch exactly `batchSize` rows whatever plan PostgreSQL picks. The former UPDATE ... WHERE id IN (SELECT ...
+         * LIMIT :n FOR UPDATE SKIP LOCKED) form, under a nested-loop semi-join that re-scans the locking sublink per
+         * outer row, skips the rows it already updated and returns further ones past the LIMIT. The planner settings
+         * below force that plan shape; the MATERIALIZED CTE evaluates the LIMIT exactly once.
+         */
+
+        @Test
+        @DisplayName("booking claim anonymises exactly `batchSize` rows under a re-scanning nested-loop plan")
+        void should_claimExactlyBatchSizeBookings_when_plannerForcesRescanningNestedLoop() {
+            // Inserted oldest-first, so the outer seq scan meets rows in the claim's ORDER BY ends_at order — the
+            // order in which a re-scanning sublink keeps handing out rows past the LIMIT.
+            for (int i = 0; i < 20; i++) {
+                fx.bulkCompletedLink(provider, 1, beforeCutoff(100 - i));
+            }
+
+            List<UUID> claimed = inForcedRescanPlan(() -> bookingRepository.anonymiseDueGuestBookings(
+                    cutoff.atOffset(ZoneOffset.UTC), SENTINEL, 5));
+
+            assertThat(claimed).as("one batch must claim exactly `batchSize` rows, never more").hasSize(5);
+            assertThat(fx.count("SELECT COUNT(*) FROM bookings WHERE guest_pii_anonymised_at IS NOT NULL"))
+                    .isEqualTo(5);
+        }
+
+        @Test
+        @DisplayName("ended-visit sweep anonymises exactly `batchSize` headers under a re-scanning nested-loop plan")
+        void should_claimExactlyBatchSizeEndedVisits_when_plannerForcesRescanningNestedLoop() {
+            fx.bulkLinkedVisits(provider, 20, 20, beforeCutoff(1));
+            jdbcTemplate.update("UPDATE bookings SET guest_name = ?, guest_surname = NULL, guest_phone = NULL, "
+                    + "client_comment = NULL, client_cancellation_note = NULL, cancel_token = NULL, "
+                    + "guest_pii_anonymised_at = now() WHERE appointment_id IS NOT NULL", SENTINEL);
+
+            List<UUID> claimed = inForcedRescanPlan(() -> appointmentRepository.anonymiseEndedGuestAppointments(
+                    cutoff.atOffset(ZoneOffset.UTC), OffsetDateTime.now(ZoneOffset.UTC).minusDays(30), SENTINEL, 5));
+
+            assertThat(claimed).as("one batch must claim exactly `batchSize` headers, never more").hasSize(5);
+            assertThat(fx.count("SELECT COUNT(*) FROM appointments WHERE guest_pii_anonymised_at IS NOT NULL"))
+                    .isEqualTo(5);
+        }
+
+        @Test
+        @DisplayName("leftover sweep anonymises exactly `batchSize` headers under a re-scanning nested-loop plan")
+        void should_claimExactlyBatchSizeLeftoverVisits_when_plannerForcesRescanningNestedLoop() {
+            fx.bulkLinkedVisits(provider, 20, 0, beforeCutoff(1));
+            jdbcTemplate.update("UPDATE appointments SET created_at = ?", beforeCutoff(1));
+
+            List<UUID> claimed = inForcedRescanPlan(() -> appointmentRepository.anonymiseLeftoverGuestAppointments(
+                    cutoff.atOffset(ZoneOffset.UTC), SENTINEL, 5));
+
+            assertThat(claimed).as("one batch must claim exactly `batchSize` headers, never more").hasSize(5);
+            assertThat(fx.count("SELECT COUNT(*) FROM appointments WHERE guest_pii_anonymised_at IS NOT NULL"))
+                    .isEqualTo(5);
+        }
+
+        /** Runs {@code work} in one transaction whose planner can only pick a re-scanning nested loop. */
+        private List<UUID> inForcedRescanPlan(java.util.function.Supplier<List<UUID>> work) {
+            return new TransactionTemplate(transactionManager).execute(s -> {
+                for (String knob : List.of("enable_hashagg", "enable_hashjoin", "enable_mergejoin",
+                        "enable_material", "enable_sort", "enable_incremental_sort")) {
+                    jdbcTemplate.execute("SET LOCAL " + knob + " = off");
+                }
+                return work.get();
+            });
+        }
+
         @Test
         @DisplayName("EXPLAIN: every retention claim is answerable from an index whose predicate matches it")
         void should_planClaimsOnIndexes() {
@@ -774,7 +841,7 @@ class GuestPiiRetentionIT extends AbstractIntegrationTest {
             Map<String, Object> row = fx.booking(single);
             assertThat(row.get("status")).isEqualTo("CONFIRMED");
             assertThat(row.get("guest_phone")).isEqualTo(PHONE);
-            assertThat(row.get("cancel_token")).isNotNull();
+            assertThat(row.get("cancel_token_hash")).isNotNull();
             assertThat(fx.count("SELECT COUNT(*) FROM notification_outbox")).isZero();
             assertThat(fx.count("SELECT COUNT(*) FROM in_app_notification")).isZero();
         }

@@ -271,6 +271,31 @@ public class RateLimitConfig {
     // evaluate FIRST: caching the per-master bookability verdict at {masterId, duration, from, to}.
     // ══════════════════════════════════════════════════════════════════════════════════════════
 
+    /**
+     * Per-AUTHENTICATED-USER cap (24-hour window) on NEW content reports, {@code POST /api/v1/reports} (phase 395
+     * D6: 20 per 24 h). Consumed directly by {@code ContentReportService} rather than by a servlet filter: an
+     * idempotent repeat of an existing report (D4) must answer 200 without spending a token, and only the service
+     * knows whether the report already exists. Every new report e-mails the support inbox, so this is also the
+     * inbox-flood bound for the endpoint. Configurable so tests can lower or raise it.
+     */
+    @Value("${app.rate-limit.content-report-capacity:20}")
+    private long contentReportCapacity;
+
+    private static final Duration CONTENT_REPORT_WINDOW = Duration.ofHours(24);
+
+    /**
+     * Phase 397 audit-fix — per-AUTHENTICATED-USER cap (1-hour window) shared by {@code POST /api/v1/blocks} and
+     * {@code DELETE /api/v1/blocks/{blockId}}. Consumed by {@code ClientBlockService} (bound by field name
+     * {@code clientBlockWriteBuckets}) after the role gate, one token per call, repeats included: it bounds
+     * booking-id probing through the 404 path and block/unblock churn. Legitimate use is a handful a month.
+     * Configurable so tests can pin it.
+     */
+    @Value("${app.rate-limit.client-block-write-capacity:30}")
+    private long clientBlockWriteCapacity;
+
+    /** Window of {@link #clientBlockWriteCapacity}; {@code ClientBlockService} answers 429 with this Retry-After. */
+    public static final Duration CLIENT_BLOCK_WRITE_WINDOW = Duration.ofHours(1);
+
     @Value("${app.rate-limit.device-token-capacity:30}")
     private long deviceTokenCapacity;
 
@@ -371,6 +396,19 @@ public class RateLimitConfig {
     // for page reloads. Configurable so ITs on 127.0.0.1 can raise the cap.
     @Value("${app.rate-limit.review-page-capacity:60}")
     private long reviewPageCapacity;
+
+    // Phase 414 D13 — per-IP caps for the support e-mail's one-click moderation pages (10-minute window). The GET
+    // confirm page and the POST decision get SEPARATE buckets (not shared with the category review buckets above), so
+    // opening a page never spends the decision budget. One support person clicks a handful of links; a garbage-token
+    // flood still hits the DB, hence the caps. Configurable so ITs on 127.0.0.1 can raise / lower them.
+    @Value("${app.rate-limit.moderation-action-page-capacity:30}")
+    private long moderationActionPageCapacity;
+
+    @Value("${app.rate-limit.moderation-action-decision-capacity:10}")
+    private long moderationActionDecisionCapacity;
+
+    /** Window of both moderation-action buckets (D13: 10 minutes). */
+    public static final Duration MODERATION_ACTION_WINDOW = Duration.ofMinutes(10);
 
     // Per-IP cap for POST /api/v1/service-types/suggest (60-minute window).
     // Like the category-request path, every successful suggestion emails the admin,
@@ -848,6 +886,33 @@ public class RateLimitConfig {
                 DEFAULT_BUCKET_CACHE_SIZE, STANDARD_EVICTION, notificationFeedCapacity, ONE_MINUTE);
     }
 
+    /**
+     * Per-user bucket (see {@link #contentReportCapacity}) consumed by {@code ContentReportService} (bound by
+     * field name {@code contentReportBuckets}). {@code expireAfterAccess} gives the usual 5-minute grace past the
+     * 24-hour window.
+     */
+    @Bean
+    public LoadingCache<String, Bucket> contentReportBuckets() {
+        return bucketCache(
+                DEFAULT_BUCKET_CACHE_SIZE,
+                CONTENT_REPORT_WINDOW.plus(EVICTION_GRACE),
+                contentReportCapacity,
+                CONTENT_REPORT_WINDOW);
+    }
+
+    /**
+     * Per-user bucket (see {@link #clientBlockWriteCapacity}) consumed by {@code ClientBlockService}.
+     * {@code expireAfterAccess} gives the usual 5-minute grace past the 1-hour window.
+     */
+    @Bean
+    public LoadingCache<String, Bucket> clientBlockWriteBuckets() {
+        return bucketCache(
+                DEFAULT_BUCKET_CACHE_SIZE,
+                CLIENT_BLOCK_WRITE_WINDOW.plus(EVICTION_GRACE),
+                clientBlockWriteCapacity,
+                CLIENT_BLOCK_WRITE_WINDOW);
+    }
+
     @Bean
     public LoadingCache<String, Bucket> deviceTokenBuckets() {
         return bucketCache(DEFAULT_BUCKET_CACHE_SIZE, STANDARD_EVICTION, deviceTokenCapacity, ONE_MINUTE);
@@ -1024,6 +1089,26 @@ public class RateLimitConfig {
                 REVIEW_PAGE_WINDOW.plus(EVICTION_GRACE),
                 reviewPageCapacity,
                 REVIEW_PAGE_WINDOW);
+    }
+
+    /** Phase 414 D13 — per-IP bucket for {@code GET /api/v1/moderation/actions/{token}}. */
+    @Bean
+    public LoadingCache<String, Bucket> moderationActionPageBuckets() {
+        return bucketCache(
+                DEFAULT_BUCKET_CACHE_SIZE,
+                MODERATION_ACTION_WINDOW.plus(EVICTION_GRACE),
+                moderationActionPageCapacity,
+                MODERATION_ACTION_WINDOW);
+    }
+
+    /** Phase 414 D13 — per-IP bucket for {@code POST /api/v1/moderation/actions/confirm}; separate from the page's. */
+    @Bean
+    public LoadingCache<String, Bucket> moderationActionDecisionBuckets() {
+        return bucketCache(
+                DEFAULT_BUCKET_CACHE_SIZE,
+                MODERATION_ACTION_WINDOW.plus(EVICTION_GRACE),
+                moderationActionDecisionCapacity,
+                MODERATION_ACTION_WINDOW);
     }
 
     /**

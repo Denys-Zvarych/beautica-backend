@@ -1,5 +1,8 @@
 package com.beautica.master;
 
+import com.beautica.favorite.entity.FavoriteTargetType;
+import com.beautica.favorite.repository.FavoriteRepository;
+import com.beautica.favorite.service.ProviderFavoriteDecorator;
 import com.beautica.auth.JwtAuthenticationFilter;
 import com.beautica.auth.JwtTokenProvider;
 import com.beautica.auth.Role;
@@ -54,18 +57,22 @@ import org.springframework.data.domain.Page;
 import org.springframework.test.util.ReflectionTestUtils;
 import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.PageRequest;
+import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.hasItem;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.authentication;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.csrf;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.patch;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
@@ -79,7 +86,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  */
 @WebMvcTest(MasterController.class)
 @TestPropertySource(properties = "app.frontend.base-url=http://localhost:3000")
-@Import(WebMvcTestSupport.class)
+@Import({WebMvcTestSupport.class, ProviderFavoriteDecorator.class})
 @DisplayName("MasterController — @WebMvcTest slice")
 class MasterControllerTest {
 
@@ -119,6 +126,10 @@ class MasterControllerTest {
 
     @MockBean
     private MasterService masterService;
+
+    /** Backs the real {@link ProviderFavoriteDecorator} the controller composes post-cache. */
+    @MockBean
+    private FavoriteRepository favoriteRepository;
 
     @MockBean
     private SlotCalculationService slotCalculationService;
@@ -195,6 +206,62 @@ class MasterControllerTest {
         mockMvc.perform(get(MASTERS_URL + "/" + unknownMasterId)
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isNotFound());
+    }
+
+    @Test
+    @DisplayName("GET /{masterId} — anonymous caller: isFavorite=false and no favourites query")
+    void should_returnIsFavoriteFalse_when_anonymousGetsMasterDetail() throws Exception {
+        var masterId = UUID.randomUUID();
+        when(masterService.getMasterDetail(masterId)).thenReturn(stubMasterDetail(masterId, UUID.randomUUID()));
+
+        mockMvc.perform(get(MASTERS_URL + "/" + masterId).accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.isFavorite").value(false));
+
+        verifyNoInteractions(favoriteRepository);
+    }
+
+    @Test
+    @DisplayName("GET /{masterId} — CLIENT who favourited the master: isFavorite=true (decorated post-cache)")
+    void should_returnIsFavoriteTrue_when_clientFavoritedMaster() throws Exception {
+        var masterId = UUID.randomUUID();
+        var clientId = UUID.randomUUID();
+        when(masterService.getMasterDetail(masterId)).thenReturn(stubMasterDetail(masterId, UUID.randomUUID()));
+        when(favoriteRepository.isFavorited(clientId, FavoriteTargetType.MASTER, masterId)).thenReturn(true);
+
+        mockMvc.perform(get(MASTERS_URL + "/" + masterId)
+                        .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.isFavorite").value(true));
+    }
+
+    @Test
+    @DisplayName("GET /{masterId} — per-viewer body: Cache-Control: no-store and Vary: Authorization")
+    void should_setNoStoreAndVaryAuthorization_when_getMasterDetail() throws Exception {
+        var masterId = UUID.randomUUID();
+        when(masterService.getMasterDetail(masterId)).thenReturn(stubMasterDetail(masterId, UUID.randomUUID()));
+
+        mockMvc.perform(get(MASTERS_URL + "/" + masterId).accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(header().string("Cache-Control", "no-store"))
+                .andExpect(header().stringValues("Vary", hasItem(
+                        containsString("Authorization"))));
+    }
+
+    @Test
+    @DisplayName("GET /{masterId} — non-CLIENT caller (SALON_OWNER): isFavorite=false, no favourites query")
+    void should_returnIsFavoriteFalse_when_salonOwnerGetsMasterDetail() throws Exception {
+        var masterId = UUID.randomUUID();
+        when(masterService.getMasterDetail(masterId)).thenReturn(stubMasterDetail(masterId, UUID.randomUUID()));
+
+        mockMvc.perform(get(MASTERS_URL + "/" + masterId)
+                        .with(authenticatedAs(UUID.randomUUID(), "owner@beautica.test", Role.SALON_OWNER))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.isFavorite").value(false));
+
+        verifyNoInteractions(favoriteRepository);
     }
 
     @Test
@@ -729,7 +796,7 @@ class MasterControllerTest {
                 .andExpect(jsonPath("$.message").value("Invalid request"))
                 // The descriptive guard text must never reach the client body.
                 .andExpect(jsonPath("$.message").value(org.hamcrest.Matchers.not(
-                        org.hamcrest.Matchers.containsString("Duplicate"))));
+                        containsString("Duplicate"))));
     }
 
     // V83 deleted the legacy POST/DELETE /{masterId}/schedule-exceptions endpoints. Per-date overrides

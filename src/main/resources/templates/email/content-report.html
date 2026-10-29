@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org" lang="uk">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Нова скарга на контент</title>
+</head>
+<!-- Phase 414 (reverses the 395 ids-only rule, user-approved 2026-10-29): the reported content, the reporter's
+     comment and the open-report count are shown so support can decide from the inbox. EVERY user-written value is
+     rendered with th:text (HTML-escaped) and arrives already bidi-escaped (BidiEscaper). Never render a user value unescaped.
+     The buttons are single-use links: GET only opens a confirm page; nothing changes until it is confirmed.
+     The reporter is never shown, not even by id (audit-fix). URLs inside user text arrive defanged (UrlDefanger:
+     hxxps://, [.]) so a mail client cannot auto-link them. -->
+<body style="margin:0;padding:0;background-color:#E6DDD0;font-family:'Nunito','Trebuchet MS',Arial,sans-serif;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#E6DDD0;">
+    <tr><td align="center" style="padding:32px 16px;">
+      <table role="presentation" width="520" cellpadding="0" cellspacing="0"
+             style="background:#FDFAF7;border:1px solid #D4C5B5;border-radius:16px;max-width:520px;width:100%;">
+        <tr><td style="padding:40px 40px 0;">
+
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+
+            <tr th:if="${burst}"><td style="padding-bottom:16px;">
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0"
+                     style="background:#F6D9D2;border-radius:10px;">
+                <tr><td style="padding:12px 18px;color:#7A2A1A;font-size:14px;font-weight:700;line-height:1.6;
+                               font-family:'Nunito','Trebuchet MS',Arial,sans-serif;">
+                  Сплеск скарг на цього надавача. Автоприховування для цих скарг призупинено до рішення підтримки.
+                </td></tr>
+              </table>
+            </td></tr>
+
+            <tr><td style="color:#0D0906;font-size:22px;font-weight:700;line-height:1.3;padding-bottom:12px;
+                           font-family:'Nunito','Trebuchet MS',Arial,sans-serif;">
+              Нова скарга на контент
+            </td></tr>
+
+            <tr><td style="padding-bottom:24px;">
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0"
+                     style="background:#F3EBE0;border-radius:10px;">
+                <tr><td style="padding:16px 18px;color:#3D2B1A;font-size:14px;line-height:1.8;
+                               font-family:'Nunito','Trebuchet MS',Arial,sans-serif;">
+                  <strong>ID скарги:</strong> <span th:text="${reportId}">report-id</span><br/>
+                  <strong>Тип об'єкта:</strong> <span th:text="${targetType}">REVIEW</span><br/>
+                  <strong>ID об'єкта:</strong> <span th:text="${targetId}">target-id</span><br/>
+                  <strong>Причина:</strong> <span th:text="${reason}">OFFENSIVE</span><br/>
+                  <strong>Відкритих скарг на об'єкт:</strong> <span th:text="${openReportCount}">1</span>
+                </td></tr>
+              </table>
+            </td></tr>
+
+            <tr><td style="color:#0D0906;font-size:16px;font-weight:700;padding-bottom:8px;
+                           font-family:'Nunito','Trebuchet MS',Arial,sans-serif;">
+              Контент, на який поскаржились
+            </td></tr>
+            <tr><td data-block="ugc-warning" style="color:#7A2A1A;font-size:12px;padding-bottom:6px;
+                           font-family:'Nunito','Trebuchet MS',Arial,sans-serif;">
+              Текст користувача — не переходьте за посиланнями
+            </td></tr>
+            <tr><td style="padding-bottom:20px;">
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0"
+                     style="background:#FFFFFF;border:1px solid #EDE4D7;border-radius:10px;">
+                <tr><td style="padding:16px 18px;color:#3D2B1A;font-size:14px;line-height:1.7;
+                               font-family:'Nunito','Trebuchet MS',Arial,sans-serif;">
+                  <span th:if="${!content.exists()}" data-block="gone">Вміст уже видалено.</span>
+                  <th:block th:if="${content.exists()}">
+                    <div th:if="${content.rating() != null}" data-block="stars"
+                         style="color:#B89A7A;font-size:18px;letter-spacing:2px;padding-bottom:6px;"
+                         th:text="${#strings.repeat('★', content.rating()) + #strings.repeat('☆', 5 - content.rating())}">★★★☆☆</div>
+                    <div th:if="${content.text() != null}" data-block="text"
+                         style="white-space:pre-wrap;word-break:break-word;" th:text="${content.text()}">Текст відгуку</div>
+                    <div th:if="${content.rating() != null and content.text() == null}"
+                         style="color:#9A836E;">Без тексту</div>
+                    <div th:if="${content.hiddenPending()}" style="color:#7A2A1A;font-size:13px;padding-top:6px;">
+                      Відгук автоматично приховано до рішення підтримки.
+                    </div>
+                    <img th:if="${content.photoUrl() != null}" data-block="photo" th:src="${content.photoUrl()}"
+                         alt="Фото з портфоліо" width="440"
+                         style="display:block;max-width:100%;height:auto;border-radius:8px;"/>
+                    <table th:if="${content.displayName() != null or content.avatarUrl() != null}"
+                           role="presentation" cellpadding="0" cellspacing="0" data-block="profile">
+                      <tr>
+                        <td th:if="${content.avatarUrl() != null}" style="padding-right:12px;">
+                          <img th:src="${content.avatarUrl()}" alt="Аватар" width="56" height="56"
+                               style="display:block;border-radius:28px;"/>
+                        </td>
+                        <td style="font-size:15px;font-weight:700;" th:text="${content.displayName()}">Ім'я</td>
+                      </tr>
+                    </table>
+                  </th:block>
+                </td></tr>
+              </table>
+            </td></tr>
+
+            <tr th:if="${reporterComment != null}"><td style="padding-bottom:20px;">
+              <div style="color:#0D0906;font-size:14px;font-weight:700;padding-bottom:6px;
+                          font-family:'Nunito','Trebuchet MS',Arial,sans-serif;">Коментар до скарги</div>
+              <div style="color:#7A2A1A;font-size:12px;padding-bottom:6px;
+                          font-family:'Nunito','Trebuchet MS',Arial,sans-serif;">
+                Текст користувача — не переходьте за посиланнями
+              </div>
+              <div data-block="comment" style="background:#F3EBE0;border-radius:10px;padding:12px 16px;color:#3D2B1A;
+                          font-size:14px;line-height:1.6;white-space:pre-wrap;word-break:break-word;
+                          font-family:'Nunito','Trebuchet MS',Arial,sans-serif;"
+                   th:text="${reporterComment}">Коментар</div>
+            </td></tr>
+
+            <!-- Profile reports only: the reported account's contact e-mail (our data, validated in ReportedContent, never
+                 the reporter's) and a mailto with a fixed subject. data-contact, not data-action: it is not a moderation
+                 button. A profile REMOVE only confirms the report; nothing is deleted or suspended. -->
+            <tr th:if="${content.ownerEmail() != null}"><td data-block="owner-contact" style="padding-bottom:20px;">
+              <div style="color:#0D0906;font-size:14px;font-weight:700;padding-bottom:6px;
+                          font-family:'Nunito','Trebuchet MS',Arial,sans-serif;">Контакт власника профілю</div>
+              <div style="color:#3D2B1A;font-size:14px;padding-bottom:10px;
+                          font-family:'Nunito','Trebuchet MS',Arial,sans-serif;">
+                <span data-block="owner-email" th:text="${content.ownerEmail()}">owner@example.com</span>
+                <span th:if="${!content.ownerEmailVerified()}" data-block="owner-email-unverified"
+                      style="color:#7A2A1A;">(не підтверджено)</span>
+              </div>
+              <table role="presentation" cellpadding="0" cellspacing="0">
+                <tr><td style="background:#6A4A28;border-radius:10px;">
+                  <a th:href="${content.ownerMailto()}" data-contact="mailto"
+                     style="display:inline-block;padding:10px 20px;color:#F5EDE0;font-size:14px;font-weight:700;
+                            text-decoration:none;font-family:'Nunito','Trebuchet MS',Arial,sans-serif;">Написати власнику</a>
+                </td></tr>
+              </table>
+            </td></tr>
+
+            <tr th:if="${!actions.isEmpty()}"><td style="padding-bottom:8px;">
+              <table role="presentation" cellpadding="0" cellspacing="0">
+                <tr>
+                  <td th:each="link : ${actions}" style="padding:0 8px 8px 0;">
+                    <!-- Bulletproof button: a padded table cell around a link, no JS, no images. -->
+                    <table role="presentation" cellpadding="0" cellspacing="0">
+                      <tr><td th:style="${link.action().name() == 'REMOVE'
+                                  ? 'background:#8A3A2E;border-radius:10px;'
+                                  : (link.action().name() == 'RESTORE'
+                                      ? 'background:#3F6F3F;border-radius:10px;'
+                                      : 'background:#6A4A28;border-radius:10px;')}">
+                        <a th:href="${link.url()}" th:attr="data-action=${link.action().name()}"
+                           style="display:inline-block;padding:12px 22px;color:#F5EDE0;font-size:15px;font-weight:700;
+                                  text-decoration:none;font-family:'Nunito','Trebuchet MS',Arial,sans-serif;"
+                           th:text="${link.action().name() == 'REMOVE'
+                                      ? (profileTarget ? 'Підтвердити скаргу' : 'Видалити')
+                                      : (link.action().name() == 'RESTORE' ? 'Відновити' : 'Залишити')}">Дія</a>
+                      </td></tr>
+                    </table>
+                  </td>
+                </tr>
+              </table>
+            </td></tr>
+
+          </table>
+
+        </td></tr>
+
+        <tr><td style="padding:24px 40px 32px;border-top:1px solid #EDE4D7;">
+          <span style="color:#9A836E;font-size:12px;line-height:1.6;
+                       font-family:'Nunito','Trebuchet MS',Arial,sans-serif;">
+            Кнопки діють 7 днів, кожна — один раз; спершу відкриється сторінка підтвердження.
+            Будь-яке рішення щодо цього об'єкта (з листа чи з черги) робить усі кнопки недійсними.
+            Мета реакції — 24 години.
+          </span>
+        </td></tr>
+      </table>
+
+      <table role="presentation" width="520" cellpadding="0" cellspacing="0" style="max-width:520px;width:100%;">
+        <tr><td align="center" style="padding-top:20px;">
+          <span style="color:#9A836E;font-size:12px;font-family:'Nunito','Trebuchet MS',Arial,sans-serif;">
+            © Beautica — платформа краси
+          </span>
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>

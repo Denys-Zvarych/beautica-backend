@@ -1,5 +1,6 @@
 package com.beautica.booking.entity;
 
+import com.beautica.booking.domain.CancelTokenHasher;
 import com.beautica.booking.domain.GuestConsent;
 import com.beautica.booking.enums.BookingSource;
 import com.beautica.booking.enums.BookingStatus;
@@ -20,6 +21,7 @@ import jakarta.persistence.Index;
 import jakarta.persistence.JoinColumn;
 import jakarta.persistence.ManyToOne;
 import jakarta.persistence.Table;
+import jakarta.persistence.Transient;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Getter;
@@ -63,10 +65,12 @@ import java.util.UUID;
                 // finding) — the migration is the source of truth.
                 @Index(name = "idx_appointments_client_id", columnList = "client_id"),
                 @Index(name = "idx_appointments_salon_id", columnList = "salon_id"),
-                // partial UNIQUE index (V124): guest-cancel token lookup. JPA cannot encode the
-                // WHERE cancel_token IS NOT NULL predicate nor the partial-uniqueness — both live
-                // in V124's ux_appointments_cancel_token only.
-                @Index(name = "ux_appointments_cancel_token", columnList = "cancel_token"),
+                // partial UNIQUE index (V206): guest-cancel token-HASH lookup. JPA cannot encode the
+                // WHERE cancel_token_hash IS NOT NULL predicate nor the partial-uniqueness — both live
+                // in V206's ux_appointments_cancel_token_hash only. V124's ux_appointments_cancel_token
+                // on the retired plaintext column (always NULL since V206) goes with that column in the
+                // follow-up contract migration.
+                @Index(name = "ux_appointments_cancel_token_hash", columnList = "cancel_token_hash"),
                 // partial UNIQUE dedup index (V124), mirroring bookings' uq_client_idempotency_key_active
                 // (V18/V113): stops a client-retry race persisting duplicate appointment headers. JPA
                 // cannot encode the WHERE idempotency_key IS NOT NULL AND status = 'CONFIRMED' predicate
@@ -147,15 +151,21 @@ public class Appointment extends AuditableEntity {
     @Column(name = "idempotency_key", length = 64)
     private String idempotencyKey;
 
-    // Uniqueness is enforced by the V124 partial-unique index (UNIQUE only over non-NULL rows);
-    // `unique = true` here would direct ddl-auto to recreate a full unique constraint — omitted,
-    // exactly as on Booking.cancelToken.
+    // V206: only the SHA-256 of the visit's guest cancel token is stored (CancelTokenHasher). Uniqueness
+    // is enforced by the V206 partial-unique index (UNIQUE only over non-NULL rows); `unique = true` here
+    // would direct ddl-auto to recreate a full unique constraint — omitted, exactly as on Booking.
     //
-    // @JsonIgnore: cancel_token is a guest-cancel CAPABILITY token — whoever holds it can cancel
-    // the visit. Shielded from every JSON serialization path so a future accidental entity-return
-    // can never leak it (matches InviteToken/RefreshToken token-field shielding).
+    // @JsonIgnore: the hash is the lookup key of a guest-cancel CAPABILITY — shielded from every JSON
+    // serialization path (matches InviteToken/RefreshToken token-field shielding).
     @JsonIgnore
-    @Column(name = "cancel_token")
+    @Column(name = "cancel_token_hash", length = 64)
+    private String cancelTokenHash;
+
+    // The RAW cancel token, in memory only on the instance that minted it — never persisted, never
+    // loaded (always null on an appointment read from the database). Set only through the builder's
+    // cancelToken(UUID), which also sets cancelTokenHash.
+    @JsonIgnore
+    @Transient
     private UUID cancelToken;
 
     // Defaults to APP so the registered-client path need not set it explicitly — Hibernate always
@@ -346,5 +356,19 @@ public class Appointment extends AuditableEntity {
                 // cancelToken stays null: no guest self-cancel link for a staff visit.
                 .createdByUserId(createdByUserId)
                 .build();
+    }
+
+    /**
+     * Lombok fills in the remaining builder methods. {@code cancelToken(UUID)} is hand-written so the
+     * persisted {@link #cancelTokenHash} can never drift from the in-memory raw {@link #cancelToken}
+     * (V206 — only the hash is stored).
+     */
+    public static class AppointmentBuilder {
+
+        public AppointmentBuilder cancelToken(UUID cancelToken) {
+            this.cancelToken = cancelToken;
+            this.cancelTokenHash = cancelToken == null ? null : CancelTokenHasher.hash(cancelToken);
+            return this;
+        }
     }
 }

@@ -399,6 +399,30 @@ public class GlobalExceptionHandler {
                 .body(ApiResponse.error("Too many bookings declined recently — please wait before retrying"));
     }
 
+    /**
+     * 429 for the phase-395 per-user content-report budget — see {@link ContentReportRateLimitedException}. Generic
+     * message, no budget figures echoed (same posture as {@link #handleResendThrottled}).
+     */
+    @ExceptionHandler(ContentReportRateLimitedException.class)
+    public ResponseEntity<ApiResponse<Void>> handleContentReportRateLimited(ContentReportRateLimitedException ex) {
+        return ResponseEntity
+                .status(HttpStatus.TOO_MANY_REQUESTS)
+                .header("Retry-After", String.valueOf(ex.getRetryAfterSeconds()))
+                .body(ApiResponse.error("Too many reports — please try again later"));
+    }
+
+    /**
+     * 429 for the phase-397 per-user block/unblock budget — see {@link ClientBlockRateLimitedException}. The same
+     * generic body {@code BookingRateLimitFilter} writes for its per-user buckets; no budget figures echoed.
+     */
+    @ExceptionHandler(ClientBlockRateLimitedException.class)
+    public ResponseEntity<ApiResponse<Void>> handleClientBlockRateLimited(ClientBlockRateLimitedException ex) {
+        return ResponseEntity
+                .status(HttpStatus.TOO_MANY_REQUESTS)
+                .header("Retry-After", String.valueOf(ex.getRetryAfterSeconds()))
+                .body(ApiResponse.error("Too many requests — please slow down"));
+    }
+
     @ExceptionHandler(NotFoundException.class)
     public ResponseEntity<ApiResponse<Void>> handleNotFound(NotFoundException ex) {
         // Return a generic message — do not echo ex.getMessage() which may reveal internal
@@ -421,6 +445,22 @@ public class GlobalExceptionHandler {
                 .status(HttpStatus.GONE)
                 .cacheControl(GONE_CACHE_CONTROL)
                 .body(new ApiResponse<>(false, new GoneErrorResponse(ex.getCode()), ex.getMessage()));
+    }
+
+    /**
+     * Phase 398 D3 — {@code 409} for a booking create the provider's client block refuses. Body:
+     * {@code data.code} = {@link BookingUnavailableException#BOOKING_UNAVAILABLE} plus the exception's constant,
+     * neutral message; identical for the app and LINK guest paths. A separate exception type (not a
+     * {@link BusinessException}), so every existing 409 body is untouched. Never cached: unlike a retired link,
+     * an unblock makes the same request succeed.
+     */
+    @ExceptionHandler(BookingUnavailableException.class)
+    public ResponseEntity<ApiResponse<BookingUnavailableResponse>> handleBookingUnavailable(
+            BookingUnavailableException ex) {
+        log.debug("Booking unavailable [{}]", ex.getCode());
+        return ResponseEntity
+                .status(HttpStatus.CONFLICT)
+                .body(new ApiResponse<>(false, new BookingUnavailableResponse(ex.getCode()), ex.getMessage()));
     }
 
     @ExceptionHandler(ForbiddenException.class)

@@ -75,6 +75,13 @@ public final class PiiRedactor {
             "(?<![A-Za-z0-9_-])(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
                     + "|(?=[A-Za-z_-]*+\\d)[A-Za-z0-9_-]{20,}+|[A-Za-z0-9_-]{32,}+)(?![A-Za-z0-9_-])");
 
+    /**
+     * Phase 401 audit-fix — a route segment whose NEXT segment is always a capability token, whatever its shape: the
+     * guest review page's {@code /review-invites/{token}}. {@link #PATH_TOKEN_PATTERN} only catches a short token that
+     * happens to contain a digit, so a digit-free 16–31-char token would otherwise reach Sentry verbatim.
+     */
+    private static final String REVIEW_INVITES_SEGMENT = "review-invites";
+
     /** Non-alphanumeric characters that may continue a secret across the truncation cut (email, token, JWT, path). */
     private static final String SECRET_RUN_PUNCTUATION = "@%._+:/-";
 
@@ -147,9 +154,17 @@ public final class PiiRedactor {
         String[] segments = path.split("/", -1);
         for (int i = 0; i < segments.length; i++) {
             segments[i] = normaliseSegment(segments[i]);
+            if (i > 0 && REVIEW_INVITES_SEGMENT.equals(segments[i - 1]) && isConcreteSegment(segments[i])) {
+                segments[i] = TOKEN;
+            }
         }
         String masked = PATH_TOKEN_PATTERN.matcher(String.join("/", segments)).replaceAll(Matcher.quoteReplacement(TOKEN));
         return redact(masked);
+    }
+
+    /** Non-empty and not a route template ({@code {token}}), which stays readable in transaction names. */
+    private static boolean isConcreteSegment(String segment) {
+        return !segment.isEmpty() && !(segment.startsWith("{") && segment.endsWith("}"));
     }
 
     private static String normaliseSegment(String segment) {

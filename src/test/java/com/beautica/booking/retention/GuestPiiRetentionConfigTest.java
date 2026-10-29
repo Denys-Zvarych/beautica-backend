@@ -114,6 +114,9 @@ class GuestPiiRetentionConfigTest {
         return runner
                 .withUserConfiguration(Scheduling.class, GuestPiiRetentionJob.class)
                 .withBean(GuestPiiAnonymisationService.class, () -> mock(GuestPiiAnonymisationService.class))
+                // Phase 402: the job also runs the guest-review retention pass — a collaborator, mocked for wiring only.
+                .withBean(com.beautica.review.invite.service.GuestReviewRetentionService.class,
+                        () -> mock(com.beautica.review.invite.service.GuestReviewRetentionService.class))
                 .withBean(Clock.class, Clock::systemUTC);
     }
 

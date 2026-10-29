@@ -7,6 +7,8 @@ import com.beautica.salon.entity.Salon;
 import com.beautica.user.User;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
+import jakarta.persistence.EnumType;
+import jakarta.persistence.Enumerated;
 import jakarta.persistence.FetchType;
 import jakarta.persistence.GeneratedValue;
 import jakarta.persistence.GenerationType;
@@ -99,4 +101,27 @@ public class ClientReview extends AuditableEntity {
     @Size(max = 2000)
     @Column(length = 2000)
     private String comment;
+
+    /**
+     * Phase 396 D1. Public reads and rating aggregates include only {@link ModerationStatus#VISIBLE}. Changed only
+     * through {@link #moderate}, by {@code ReviewModerationService}.
+     */
+    @Builder.Default
+    @Enumerated(EnumType.STRING)
+    @Column(name = "moderation_status", nullable = false, length = 16)
+    private ModerationStatus moderationStatus = ModerationStatus.VISIBLE;
+
+    /**
+     * Moves this review to {@code target}. {@link ModerationStatus#REMOVED} is terminal: a late RESTORE / DISMISS
+     * (e.g. on a report that raced the takedown) never brings removed content back.
+     *
+     * @return {@code true} when the status changed (the caller then publishes a recalculation event)
+     */
+    public boolean moderate(ModerationStatus target) {
+        if (moderationStatus == target || moderationStatus == ModerationStatus.REMOVED) {
+            return false;
+        }
+        moderationStatus = target;
+        return true;
+    }
 }
