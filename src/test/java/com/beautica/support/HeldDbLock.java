@@ -68,6 +68,11 @@ public final class HeldDbLock implements AutoCloseable {
         return new HeldDbLock(dataSource, "SELECT id FROM masters WHERE id = ? FOR NO KEY UPDATE", masterId);
     }
 
+    /** Holds a {@code FOR UPDATE} row lock on one {@code bookings} row (phase 408/413 SKIP LOCKED claim IT). */
+    public static HeldDbLock bookingRow(DataSource dataSource, UUID bookingId) throws Exception {
+        return new HeldDbLock(dataSource, "SELECT id FROM bookings WHERE id = ? FOR UPDATE", bookingId);
+    }
+
     /** Holds a {@code FOR UPDATE} row lock on one {@code telegram_link_tokens} row (phase 405 lock-order IT). */
     public static HeldDbLock telegramLinkToken(DataSource dataSource, byte[] tokenHash) throws Exception {
         return new HeldDbLock(dataSource, "SELECT token_hash FROM telegram_link_tokens WHERE token_hash = ? FOR UPDATE",

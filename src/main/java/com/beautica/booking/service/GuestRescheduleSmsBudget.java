@@ -83,6 +83,40 @@ public class GuestRescheduleSmsBudget {
     }
 
     /**
+     * Phase 408 audit-fix (security MEDIUM) — the per-phone budget for a provider-cancellation message to a STAFF
+     * walk-in's typed-in phone. Shares the SAME count as the walk-in confirmation and the reschedule SMS (5 per phone
+     * per rolling hour, {@link BookingRepository#countPhoneSmsBudgetUsedSince}) and records its reservation in the
+     * same {@code guest_reschedule_sms_sends} log, so create + reschedule + decline spam on one number stays capped.
+     * Also at most one cancellation message per visit per window ({@link
+     * BookingRepository#existsVisitCancellationSendSince}). Silent: {@code false} skips the message only.
+     *
+     * <p>Idempotent per outbox row (audit-fix cycle 2, same precedent as {@link #tryReserve}): a back-pressure re-queue
+     * of the same row finds its own reservation ({@code outbox_entry_id}, V223 partial unique index) and proceeds
+     * without spending budget again, so retries can never exhaust it and silently drop the message.
+     */
+    @Transactional
+    public boolean tryReserveWalkInCancellation(UUID bookingId, @Nullable UUID appointmentId, String phoneE164,
+                                                @Nullable UUID outboxEntryId) {
+        bookingRepository.acquireWalkInPhoneLock(phoneE164);
+        if (outboxEntryId != null && sendRepository.existsByOutboxEntryId(outboxEntryId)) {
+            return true; // a back-pressure retry of the same outbox row reuses its reservation
+        }
+        Instant now = clock.instant();
+        Instant since = now.minus(StaffBookingService.WALK_IN_PHONE_WINDOW);
+        if (appointmentId != null && bookingRepository.existsVisitCancellationSendSince(appointmentId, bookingId, since)) {
+            log.info("event=walk_in_cancellation_sms_suppressed reason=visit_already_notified bookingId={}", bookingId);
+            return false;
+        }
+        if (bookingRepository.countPhoneSmsBudgetUsedSince(phoneE164, since).total()
+                >= StaffBookingService.MAX_WALK_INS_PER_PHONE_PER_WINDOW) {
+            log.info("event=walk_in_cancellation_sms_suppressed reason=per_phone_budget bookingId={}", bookingId);
+            return false;
+        }
+        sendRepository.save(GuestRescheduleSmsSend.of(bookingId, outboxEntryId, now));
+        return true;
+    }
+
+    /**
      * Daily purge (04:13 UTC, clear of the 03:xx jobs) of rows past every window: the SMS send log
      * (1 h window) and the provider-reschedule log behind the request cap (24 h window).
      */

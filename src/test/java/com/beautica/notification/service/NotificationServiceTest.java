@@ -78,6 +78,8 @@ class NotificationServiceTest {
                 FRONTEND_BASE_URL);
         // Phase 431: the budget grants by default; the cap rows below override it.
         lenient().when(rescheduleSmsBudget.tryReserve(any(), any(), any())).thenReturn(true);
+        // Phase 408 audit-fix: the walk-in cancellation budget grants by default; the cap row below overrides it.
+        lenient().when(rescheduleSmsBudget.tryReserveWalkInCancellation(any(), any(), any(), any())).thenReturn(true);
     }
 
     // -------------------------------------------------------------------------
@@ -247,20 +249,66 @@ class NotificationServiceTest {
     }
 
     /**
-     * Phase 22.1 (security MEDIUM): the guest-SMS branch must key on {@code BookingSource.LINK},
-     * not on {@code client == null}. A STAFF walk-in's phone is typed in by a salon employee about a
-     * third party and verified by nothing, so it is never an SMS destination.
+     * Phase 408 (user decision 2026-10-28, reverses the Phase 22.1 / 390 LINK-only scope): a declined STAFF
+     * walk-in with a phone gets the same fixed provider-cancellation copy as a LINK guest — no provider note.
      */
     @Test
-    @DisplayName("a declined STAFF walk-in booking sends NO SMS — the phone was typed by staff, "
-            + "not proven by the recipient (unlike a LINK guest's OTP-verified number)")
-    void should_notSendDeclineSms_when_staffWalkInBookingDeclined() {
+    @DisplayName("a declined STAFF walk-in with a phone gets ONE provider-cancellation message, same fixed "
+            + "copy as a LINK guest, no provider note and no email")
+    void should_sendDeclineSms_when_staffWalkInBookingDeclined() {
         Booking booking = buildStaffWalkInBookingMockForDecline("Майстер захворів");
 
         service.notifyBookingStatusChanged(BookingVisit.single(booking));
 
-        verifyNoInteractions(bookingSmsDispatcher);
+        assertThat(dispatchedText()).isEqualTo(BODY_0108);
         verify(emailService, never()).sendBookingDeclinedEmail(anyString(), any());
+    }
+
+    @Test
+    @DisplayName("Phase 408 audit-fix: a walk-in whose phone budget is exhausted gets no cancellation message, silently")
+    void should_skipWalkInCancellationSms_when_phoneBudgetExhausted() {
+        Booking booking = buildStaffWalkInBookingMockForDecline(null);
+        when(rescheduleSmsBudget.tryReserveWalkInCancellation(any(), any(), eq(GUEST_PHONE), any())).thenReturn(false);
+
+        service.notifyBookingStatusChanged(BookingVisit.single(booking));
+
+        verifyNoInteractions(bookingSmsDispatcher);
+        verifyNoInteractions(emailService);
+    }
+
+    @Test
+    @DisplayName("Phase 408 audit-fix cycle 2: the drained outbox entry id reaches the walk-in budget (retry idempotency)")
+    void should_passOutboxEntryIdToWalkInBudget_when_drainedWithEntryId() {
+        Booking booking = buildStaffWalkInBookingMockForDecline(null);
+        UUID entryId = UUID.randomUUID();
+
+        service.notifyBookingStatusChanged(BookingVisit.single(booking), entryId);
+
+        verify(rescheduleSmsBudget).tryReserveWalkInCancellation(any(), any(), eq(GUEST_PHONE), eq(entryId));
+        assertThat(dispatchedText()).isEqualTo(BODY_0108);
+    }
+
+    @Test
+    @DisplayName("Phase 408 audit-fix: a LINK guest's decline never touches the walk-in budget")
+    void should_notReserveWalkInBudget_when_linkGuestDeclined() {
+        Booking booking = buildGuestBookingMockForDecline(null);
+
+        service.notifyBookingStatusChanged(BookingVisit.single(booking));
+
+        verify(rescheduleSmsBudget, never()).tryReserveWalkInCancellation(any(), any(), any(), any());
+        assertThat(dispatchedText()).startsWith("Beautica: Ваш запис ");
+    }
+
+    @Test
+    @DisplayName("a declined STAFF walk-in WITHOUT a phone gets nothing")
+    void should_sendNothing_when_staffWalkInWithoutPhoneDeclined() {
+        Booking booking = buildStaffWalkInBookingMockForDecline(null);
+        when(booking.getGuestPhone()).thenReturn(null);
+
+        service.notifyBookingStatusChanged(BookingVisit.single(booking));
+
+        verifyNoInteractions(bookingSmsDispatcher);
+        verifyNoInteractions(emailService);
     }
 
     @Test
@@ -477,15 +525,15 @@ class NotificationServiceTest {
     }
 
     @Test
-    @DisplayName("notifySalonClosed never sends SMS for a STAFF walk-in — the phone was typed by "
-            + "staff, not proven by the recipient (same gate as notifyBookingStatusChanged)")
-    void should_notSendSms_when_notifySalonClosedForStaffWalkIn() {
+    @DisplayName("Phase 408: notifySalonClosed sends a STAFF walk-in with a phone the same closure copy as a "
+            + "LINK guest (no rebook link), no email")
+    void should_sendSms_when_notifySalonClosedForStaffWalkIn() {
         Booking booking = buildStaffWalkInBookingMockForDecline(null);
         BookingVisit visit = BookingVisit.single(booking);
 
         service.notifySalonClosed(visit);
 
-        verifyNoInteractions(bookingSmsDispatcher);
+        assertThat(dispatchedText()).isEqualTo(BODY_0108);
         verifyNoInteractions(emailService);
     }
 
@@ -584,15 +632,15 @@ class NotificationServiceTest {
     }
 
     @Test
-    @DisplayName("notifyMasterRemoved never sends SMS for a STAFF walk-in — same gate as "
-            + "notifySalonClosed / notifyBookingStatusChanged")
-    void should_notSendSms_when_notifyMasterRemovedForStaffWalkIn() {
+    @DisplayName("Phase 408: notifyMasterRemoved sends a STAFF walk-in with a phone the same master-removed "
+            + "copy as a LINK guest, no email")
+    void should_sendSms_when_notifyMasterRemovedForStaffWalkIn() {
         Booking booking = buildStaffWalkInBookingMockForDecline(null);
         BookingVisit visit = BookingVisit.single(booking);
 
         service.notifyMasterRemoved(visit);
 
-        verifyNoInteractions(bookingSmsDispatcher);
+        assertThat(dispatchedText()).isEqualTo(BODY_0108);
         verifyNoInteractions(emailService);
     }
 

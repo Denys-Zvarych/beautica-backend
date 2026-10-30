@@ -39,6 +39,8 @@ final class TelegramSendGate {
     static final int MAX_BACKED_OFF_CHATS = 10_000;
     /** Upper bound on an honoured {@code retry_after}, so a garbage value cannot mute a chat for days. */
     static final Duration MAX_BACKOFF = Duration.ofHours(1);
+    /** Phase 408 audit-fix — the bounded wait of {@link #tryAdmitWaiting}, per stage (permit, then token). */
+    static final Duration ADMISSION_WAIT = Duration.ofMillis(500);
 
     /** Why a send was refused; the name is logged as {@code cause=}. */
     enum Refusal { BACKOFF, RATE_LIMITED, CONCURRENCY }
@@ -87,6 +89,40 @@ final class TelegramSendGate {
             return Optional.of(Refusal.CONCURRENCY);
         }
         if (!bucket.tryConsume(1)) {
+            inFlight.release();
+            return Optional.of(Refusal.RATE_LIMITED);
+        }
+        return Optional.empty();
+    }
+
+    /**
+     * Phase 408 audit-fix — {@link #tryAdmit} with a short bounded wait, for the guest-message router only (pool and
+     * scheduler threads, never a request or webhook thread): waits up to {@link #ADMISSION_WAIT} for a concurrency
+     * permit and up to {@link #ADMISSION_WAIT} for a rate token, so a reminder batch start does not push linked
+     * guests to paid SMS merely because the burst bucket was momentarily empty. The per-chat back-off is still
+     * never waited out. An interrupt refuses ({@code CONCURRENCY}) and keeps the flag set.
+     */
+    Optional<Refusal> tryAdmitWaiting(long chatId) {
+        Instant until = blockedUntil.getIfPresent(chatId);
+        if (until != null && clock.instant().isBefore(until)) {
+            return Optional.of(Refusal.BACKOFF);
+        }
+        try {
+            if (!inFlight.tryAcquire(ADMISSION_WAIT.toNanos(), TimeUnit.NANOSECONDS)) {
+                return Optional.of(Refusal.CONCURRENCY);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return Optional.of(Refusal.CONCURRENCY);
+        }
+        boolean token;
+        try {
+            token = bucket.asBlocking().tryConsume(1, ADMISSION_WAIT);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            token = false;
+        }
+        if (!token) {
             inFlight.release();
             return Optional.of(Refusal.RATE_LIMITED);
         }

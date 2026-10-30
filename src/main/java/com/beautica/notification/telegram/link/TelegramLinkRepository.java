@@ -75,15 +75,31 @@ public interface TelegramLinkRepository extends JpaRepository<TelegramLink, UUID
     int transitionByChatBounded(@Param("chatId") long chatId, @Param("from") String from, @Param("to") String to,
                                 @Param("now") Instant now);
 
-    @Modifying(flushAutomatically = true, clearAutomatically = true)
-    @Query("""
-            UPDATE TelegramLink l SET l.status = :to, l.statusChangedAt = :now
-             WHERE l.id = :id AND l.status = :from
-            """)
-    int transitionById(@Param("id") UUID id, @Param("from") TelegramLinkStatus from,
-                       @Param("to") TelegramLinkStatus to, @Param("now") Instant now);
+    /**
+     * Moves one link from {@code from} to {@code to} only while it still points at {@code chatId} (phase 408
+     * audit-fix: a 403 from a stale chat must not block the phone after it was re-linked to a new chat — the upsert
+     * keeps the row id and swaps {@code chat_id}). Fused, transaction-local 3 s {@code lock_timeout}, same shape as
+     * {@link #transitionByChatBounded}.
+     */
+    default int transitionById(UUID id, long chatId, TelegramLinkStatus from, TelegramLinkStatus to, Instant now) {
+        return transitionByIdBounded(id, chatId, from.name(), to.name(), now);
+    }
 
     @Modifying(flushAutomatically = true, clearAutomatically = true)
-    @Query("UPDATE TelegramLink l SET l.lastSentAt = :now WHERE l.id = :id")
+    @Query(value = """
+            UPDATE telegram_links l SET status = :to, status_changed_at = :now
+              FROM (SELECT set_config('lock_timeout', '3s', true)) lock_cfg
+             WHERE l.id = :id AND l.chat_id = :chatId AND l.status = :from
+            """, nativeQuery = true)
+    int transitionByIdBounded(@Param("id") UUID id, @Param("chatId") long chatId, @Param("from") String from,
+                              @Param("to") String to, @Param("now") Instant now);
+
+    /** Stamps {@code last_sent_at}; fused, transaction-local 3 s {@code lock_timeout} (phase 408 audit-fix). */
+    @Modifying(flushAutomatically = true, clearAutomatically = true)
+    @Query(value = """
+            UPDATE telegram_links l SET last_sent_at = :now
+              FROM (SELECT set_config('lock_timeout', '3s', true)) lock_cfg
+             WHERE l.id = :id
+            """, nativeQuery = true)
     int touchLastSent(@Param("id") UUID id, @Param("now") Instant now);
 }

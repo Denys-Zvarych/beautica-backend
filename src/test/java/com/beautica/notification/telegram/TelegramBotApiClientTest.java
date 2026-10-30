@@ -609,6 +609,62 @@ class TelegramBotApiClientTest {
                         "event=telegram_send outcome=transient status=429");
     }
 
+    // ── phase 408 audit-fix: bounded wait for router callers ───────────────
+
+    @Test
+    @Timeout(20)
+    @DisplayName("13 concurrent router sends (sendWaiting) → >= 8 delivered, none refused for concurrency")
+    void should_deliverBurst_when_routerSendsWaitAtGate() throws Exception {
+        wireMock.stubFor(post(urlEqualTo(PATH)).willReturn(aResponse().withStatus(200)
+                .withHeader("Content-Type", "application/json").withBody(OK_BODY).withFixedDelay(50)));
+        TelegramProperties properties = new TelegramProperties(false, TelegramMode.LIVE, TOKEN, "beautica_app_bot",
+                "a".repeat(64), wireMock.baseUrl(), Duration.ofMinutes(30), java.util.List.of());
+        TelegramBotApiClient realClock = new TelegramBotApiClient(properties, Clock.systemUTC(), Duration.ofSeconds(4),
+                new Semaphore(TelegramSendGate.MAX_CONCURRENT_SENDS));
+        int burst = 13;
+        java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(burst);
+        java.util.concurrent.CountDownLatch start = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.atomic.AtomicInteger delivered = new java.util.concurrent.atomic.AtomicInteger();
+        List<java.util.concurrent.Future<?>> futures = new ArrayList<>();
+
+        for (int i = 0; i < burst; i++) {
+            long chat = CHAT_ID + i;
+            futures.add(pool.submit(() -> {
+                start.await();
+                try {
+                    realClock.sendWaiting(chat, TEXT);
+                    delivered.incrementAndGet();
+                } catch (TelegramDeliveryException refused) {
+                    // counted below through the log
+                }
+                return null;
+            }));
+        }
+        start.countDown();
+        for (java.util.concurrent.Future<?> future : futures) {
+            future.get();
+        }
+        pool.shutdown();
+
+        assertThat(delivered.get()).isGreaterThanOrEqualTo(8);
+        assertThat(logAppender.list).map(ILoggingEvent::getFormattedMessage)
+                .noneMatch(line -> line.contains("cause=concurrency"));
+    }
+
+    @Test
+    @DisplayName("send() (webhook / non-router path) stays non-blocking: an empty bucket refuses at once")
+    void should_refuseImmediately_when_nonWaitingSendFindsEmptyBucket() {
+        stub(200, OK_BODY);
+        for (int i = 0; i < TelegramSendGate.BURST_CAPACITY; i++) {
+            client.send(CHAT_ID, TEXT);
+        }
+        long started = System.nanoTime();
+
+        assertThatThrownBy(() -> client.send(CHAT_ID, TEXT)).isInstanceOf(TelegramDeliveryException.class);
+
+        assertThat(Duration.ofNanos(System.nanoTime() - started)).isLessThan(TelegramSendGate.ADMISSION_WAIT);
+    }
+
     // ── helpers ────────────────────────────────────────────────────────────
 
     private TelegramBotApiClient newClient(Duration readTimeout) {

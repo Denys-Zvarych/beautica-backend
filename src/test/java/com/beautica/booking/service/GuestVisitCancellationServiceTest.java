@@ -1,5 +1,6 @@
 package com.beautica.booking.service;
 
+import com.beautica.notification.channel.GuestMessageRouters;
 import com.beautica.booking.domain.CancelTokenHasher;
 import com.beautica.booking.entity.Appointment;
 import com.beautica.booking.entity.Booking;
@@ -102,7 +103,7 @@ class GuestVisitCancellationServiceTest {
      * while still proving the service holds no {@code SmsService} of its own.
      */
     private BookingSmsDispatcher smsDispatcher() {
-        return new BookingSmsDispatcher(smsService, new SyncTaskExecutor());
+        return new BookingSmsDispatcher(smsService, GuestMessageRouters.smsOnly(smsService), new SyncTaskExecutor());
     }
 
     @Nested

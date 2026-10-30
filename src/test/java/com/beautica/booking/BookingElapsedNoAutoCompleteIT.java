@@ -139,6 +139,8 @@ class BookingElapsedNoAutoCompleteIT extends AbstractIntegrationTest {
                         + "the phase 431 log-retention purge, neither of which touches booking status")
                 .containsExactly(
                         "BookingReminderJob#sendReminders",
+                        // Phase 413: the 2h-before guest reminder — sends a reminder, never a status transition.
+                        "BookingReminderJob#sweepTwoHour",
                         // Phase 431: a 2-day retention purge of the reschedule logs — never a status transition.
                         "GuestRescheduleSmsBudget#purgeExpired");
     }

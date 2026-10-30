@@ -358,6 +358,13 @@ app:
     # appointment during which a guest may still cancel via the cancel link.
     # A cancel request inside this window returns 422.
     cancel-window-hours: ${BOOKING_CANCEL_WINDOW_HOURS:2}
+    # Phase 413 — 2h-before guest reminder (BookingReminderJob#sweepTwoHour, every 15 min, window [now+1h45, now+2h15)).
+    # Never sent 21:00-09:00 Kyiv (skipped, not deferred); skipped when the booking was made < min-lead before its
+    # start. Goes to Telegram when the guest's phone is linked (phase 408), else SMS. Text: BookingSmsProperties
+    # .Sms#reminder2h (Java default only, no yml copy).
+    reminder-2h:
+      enabled: ${APP_BOOKING_REMINDER_2H_ENABLED:false}
+      min-lead: ${APP_BOOKING_REMINDER_2H_MIN_LEAD:3h}
     sms:
       # Phase 22.7 — THE single "are we spending SMS money" switch. Read by SmsConfig, which uses
       # it to choose the SmsService bean itself (NoOpSmsService when false, TurbosmsService when

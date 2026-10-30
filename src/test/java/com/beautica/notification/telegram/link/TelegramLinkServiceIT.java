@@ -415,14 +415,30 @@ class TelegramLinkServiceIT extends AbstractIntegrationTest {
         }
 
         @Test
-        @DisplayName("markBlocked(linkId) → findActive empty")
+        @DisplayName("markBlocked(linkId, chat) → findActive empty")
         void should_block_when_markBlockedByLinkId() {
             link(GUEST_PHONE, CHAT);
             UUID linkId = service.findActiveForPhone(GUEST_PHONE).orElseThrow().linkId();
 
-            service.markBlocked(linkId);
+            service.markBlocked(linkId, CHAT);
 
             assertThat(service.findActiveForPhone(GUEST_PHONE)).isEmpty();
+        }
+
+        @Test
+        @DisplayName("phase 408 audit-fix: a late 403 from the OLD chat does not block the phone re-linked to a new chat")
+        void should_notBlockRelinkedChat_when_staleChatReturns403() {
+            link(GUEST_PHONE, CHAT);
+            UUID linkId = service.findActiveForPhone(GUEST_PHONE).orElseThrow().linkId();
+            long newChat = CHAT + 1;
+            link(GUEST_PHONE, newChat);
+
+            service.markBlocked(linkId, CHAT);
+
+            assertThat(service.findActiveForPhone(GUEST_PHONE)).hasValueSatisfying(active -> {
+                assertThat(active.linkId()).isEqualTo(linkId);
+                assertThat(active.chatId()).isEqualTo(newChat);
+            });
         }
 
         @Test

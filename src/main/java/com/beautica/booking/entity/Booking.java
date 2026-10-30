@@ -79,6 +79,8 @@ import java.util.UUID;
                 // JPA cannot encode WHERE booking_source='LINK' AND reminder_sent=FALSE —
                 // predicate lives in V89 only; do NOT treat this annotation as authoritative.
                 @Index(name = "idx_bookings_reminder", columnList = "starts_at"),
+                // partial index (V225): 15-min 2h-reminder sweep; predicate LINK AND CONFIRMED AND reminder_2h_sent=FALSE in V225 only.
+                @Index(name = "idx_bookings_reminder_2h", columnList = "starts_at"),
                 // idx_bookings_master_client_starts_at (V93) served the per-client "latest
                 // booking" LATERAL subquery formerly in FavoriteRepository.findFavoriteMasterRows.
                 // DROPPED by V144 once the favourites category axis was reversed from "last
@@ -488,6 +490,11 @@ public class Booking extends AuditableEntity {
     @Setter
     @Column(name = "reminder_sent", nullable = false)
     private boolean reminderSent;
+
+    // Phase 413 (V225) — 2h-before reminder claim flag. Written only by the native claim in BookingRepository
+    // (claimTwoHourRemindersByIds / claimTwoHourVisitRemindersByAppointmentIds); read by the sweep's JPQL filter.
+    @Column(name = "reminder_2h_sent", nullable = false)
+    private boolean reminder2hSent;
 
     // ── Staff-booking provenance (Phase 22.1 / V137) ──────────────────────────
     /**

@@ -25,6 +25,16 @@ public interface TelegramMessenger {
     void send(long chatId, String text);
 
     /**
+     * Phase 408 audit-fix — {@link #send} that may wait briefly (bounded, at most
+     * {@code TelegramBotApiClient.MAX_ADMISSION_WAIT}) for the outbound rate/concurrency gate instead of refusing at
+     * once. For the guest-message router only — never call it from a request or webhook thread. Implementations
+     * without a gate send immediately.
+     */
+    default void sendWaiting(long chatId, String text) {
+        send(chatId, text);
+    }
+
+    /**
      * Shared argument check for every implementation that actually delivers (live and capture).
      *
      * @throws IllegalArgumentException when {@code text} is null, blank or over {@value #MAX_TEXT_LENGTH} chars (D3)

@@ -24,11 +24,21 @@ public final class AllowListTelegramMessenger implements TelegramMessenger {
 
     @Override
     public void send(long chatId, String text) {
+        requireAllowed(chatId, text);
+        delegate.send(chatId, text);
+    }
+
+    @Override
+    public void sendWaiting(long chatId, String text) {
+        requireAllowed(chatId, text);
+        delegate.sendWaiting(chatId, text);
+    }
+
+    private void requireAllowed(long chatId, String text) {
         TelegramMessenger.requireSendable(text);
         if (!allowList.allows(chatId)) {
             log.info("event=telegram_send outcome=transient status=not_allow_listed");
-            throw new TelegramDeliveryException(NOT_ALLOW_LISTED);
+            throw new TelegramNotAllowListedException(NOT_ALLOW_LISTED);
         }
-        delegate.send(chatId, text);
     }
 }

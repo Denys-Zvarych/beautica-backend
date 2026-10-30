@@ -30,6 +30,44 @@ public class BookingSmsProperties {
 
     private final Sms sms = new Sms();
 
+    /** Phase 413 — the 2h-before guest reminder ({@code app.booking.reminder-2h.*}). */
+    private final Reminder2h reminder2h = new Reminder2h();
+
+    public Reminder2h getReminder2h() {
+        return reminder2h;
+    }
+
+    /**
+     * Phase 413 D3/D6 — {@code enabled} (env {@code APP_BOOKING_REMINDER_2H_ENABLED}, default off) and
+     * {@code min-lead}: no 2h reminder for a booking created less than this long before its start (the
+     * confirmation SMS just arrived).
+     */
+    public static class Reminder2h {
+
+        private boolean enabled = false;
+
+        private java.time.Duration minLead = java.time.Duration.ofHours(3);
+
+        public boolean isEnabled() {
+            return enabled;
+        }
+
+        public void setEnabled(boolean enabled) {
+            this.enabled = enabled;
+        }
+
+        public java.time.Duration getMinLead() {
+            return minLead;
+        }
+
+        public void setMinLead(java.time.Duration minLead) {
+            if (minLead == null || minLead.isNegative()) {
+                throw new IllegalArgumentException("app.booking.reminder-2h.min-lead must be >= 0");
+            }
+            this.minLead = minLead;
+        }
+    }
+
     public int getAvailabilityMaxDays() {
         return availabilityMaxDays;
     }
@@ -164,6 +202,23 @@ public class BookingSmsProperties {
 
         public String getReminder() {
             return reminder;
+        }
+
+        /**
+         * Phase 413 D5 — the 2h-before reminder. Java default only (walk-in precedent: no yml copy). "Сьогодні"
+         * is safe: the sweep sends only 09:00–21:00 Kyiv with a 1h45–2h15 lead, so the visit is the same day.
+         */
+        private String reminder2h =
+                "Beautica: Нагадуємо!\n"
+                        + "{serviceName} у {masterName}\n"
+                        + "Сьогодні о {time}";
+
+        public String getReminder2h() {
+            return reminder2h;
+        }
+
+        public void setReminder2h(String reminder2h) {
+            this.reminder2h = reminder2h;
         }
 
         public void setReminder(String reminder) {

@@ -446,6 +446,26 @@ abstract class AbstractWalkInBookingSmsIT extends AbstractStaffBookingIT {
         return bookingId;
     }
 
+    /**
+     * Phase 408 QA — a CONFIRMED guest (LINK) row with an explicit {@code created_at} (the 2h sweep's short-notice
+     * rule reads it, so a DB {@code NOW()} would couple the test to the wall clock). Promoted when a third routing
+     * suite needed it (Q4). The cancel token is stored as its hash, like the production create path.
+     */
+    protected UUID insertGuestLinkBooking(String phone, java.time.OffsetDateTime startsAt, java.time.Duration length,
+                                          java.time.Instant createdAt) {
+        UUID bookingId = UUID.randomUUID();
+        java.time.OffsetDateTime created = java.time.OffsetDateTime.ofInstant(createdAt, java.time.ZoneOffset.UTC);
+        jdbcTemplate.update("INSERT INTO bookings (id, master_id, master_service_id, salon_id, status, starts_at, "
+                        + "ends_at, price_at_booking, duration_minutes_at_booking, buffer_minutes_at_booking, "
+                        + "booking_source, guest_name, guest_surname, guest_phone, cancel_token_hash, created_at, "
+                        + "updated_at) VALUES (?, ?, ?, ?, 'CONFIRMED', ?, ?, 350.00, ?, 0, 'LINK', ?, ?, ?, "
+                        + "encode(sha256(convert_to(?, 'UTF8')), 'hex'), ?, ?)",
+                bookingId, salon.masterId(), salon.masterServiceId(), salon.salonId(), startsAt, startsAt.plus(length),
+                (int) length.toMinutes(), GUEST_NAME, GUEST_SURNAME, phone, UUID.randomUUID().toString(), created,
+                created);
+        return bookingId;
+    }
+
     protected int otpRowCount(String phone) {
         return jdbcTemplate.queryForObject(
                 "SELECT count(*) FROM phone_otps WHERE phone = ?", Integer.class, phone);

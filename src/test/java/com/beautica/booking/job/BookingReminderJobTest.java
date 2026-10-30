@@ -57,7 +57,8 @@ class BookingReminderJobTest {
     @BeforeEach
     void setUp() {
         Clock clock = Clock.fixed(OffsetDateTime.parse("2026-06-01T10:00:00Z").toInstant(), ZoneOffset.UTC);
-        job = new BookingReminderJob(bookingRepository, new BookingSmsProperties(), events, clock);
+        job = new BookingReminderJob(bookingRepository, new BookingSmsProperties(), events, clock,
+                new io.micrometer.core.instrument.simple.SimpleMeterRegistry());
         logAppender = new ListAppender<>();
         logAppender.start();
         jobLogger = (Logger) LoggerFactory.getLogger(BookingReminderJob.class);

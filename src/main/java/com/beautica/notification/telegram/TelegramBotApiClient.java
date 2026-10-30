@@ -45,8 +45,11 @@ import java.util.regex.Pattern;
 @Slf4j
 public class TelegramBotApiClient implements TelegramMessenger {
 
-    static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(2);
-    static final Duration READ_TIMEOUT = Duration.ofSeconds(4);
+    public static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(2);
+    public static final Duration READ_TIMEOUT = Duration.ofSeconds(4);
+    /** Phase 408 audit-fix — longest {@link #sendWaiting} admission wait: concurrency permit + rate token. */
+    public static final Duration MAX_ADMISSION_WAIT =
+            TelegramSendGate.ADMISSION_WAIT.plus(TelegramSendGate.ADMISSION_WAIT);
     static final int MAX_DESCRIPTION_CHARS = 200;
     static final int MAX_RESPONSE_BYTES = 16 * 1024;
 
@@ -84,8 +87,18 @@ public class TelegramBotApiClient implements TelegramMessenger {
 
     @Override
     public void send(long chatId, String text) {
+        send(chatId, text, () -> gate.tryAdmit(chatId));
+    }
+
+    /** Phase 408 audit-fix — bounded wait at the gate (router callers only, see {@link TelegramMessenger}). */
+    @Override
+    public void sendWaiting(long chatId, String text) {
+        send(chatId, text, () -> gate.tryAdmitWaiting(chatId));
+    }
+
+    private void send(long chatId, String text, java.util.function.Supplier<Optional<TelegramSendGate.Refusal>> admit) {
         TelegramMessenger.requireSendable(text);
-        Optional<TelegramSendGate.Refusal> refusal = gate.tryAdmit(chatId);
+        Optional<TelegramSendGate.Refusal> refusal = admit.get();
         if (refusal.isPresent()) {
             String cause = refusal.get().name().toLowerCase(Locale.ROOT);
             log.warn("event=telegram_send outcome=transient status={} cause={}", NO_STATUS, cause);

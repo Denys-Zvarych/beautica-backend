@@ -13,7 +13,7 @@ import org.springframework.http.ResponseEntity;
  * Synthetic Bot API updates + the authenticated POST for the phase 406 webhook ITs (shared by
  * {@code TelegramWebhookControllerIT} and {@code TelegramWebhookAllowListIT}, §M.3).
  */
-final class TelegramWebhookTestSupport {
+public final class TelegramWebhookTestSupport {
 
     static final String PATH = "/api/v1/telegram/webhook";
     /** Bot API {@code secret_token} alphabet; a compile-time constant (used in {@code @TestPropertySource}). */
@@ -24,7 +24,7 @@ final class TelegramWebhookTestSupport {
 
     private final TestRestTemplate restTemplate;
 
-    TelegramWebhookTestSupport(TestRestTemplate restTemplate) {
+    public TelegramWebhookTestSupport(TestRestTemplate restTemplate) {
         this.restTemplate = restTemplate;
     }
 
@@ -32,7 +32,8 @@ final class TelegramWebhookTestSupport {
         return post(json, SECRET, "198.51.100.1");
     }
 
-    ResponseEntity<String> post(String body, String secret, String clientIp) {
+    /** Public (phase 408 QA): {@code GuestMessageRoutingIT} links a phone through the real webhook with its own secret. */
+    public ResponseEntity<String> post(String body, String secret, String clientIp) {
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
         headers.set("X-Forwarded-For", clientIp);
@@ -45,12 +46,12 @@ final class TelegramWebhookTestSupport {
     /** Built with Jackson, not string formatting, so any text or phone is escaped correctly (QA Q16). */
     private static final ObjectMapper JSON = new ObjectMapper();
 
-    static String text(long chatId, String text) {
+    public static String text(long chatId, String text) {
         return chatMessage(chatId, "private", chatId, text);
     }
 
     /** A text message in a chat of any {@code type} ({@code group}, {@code supergroup}, {@code channel}, …). */
-    static String chatMessage(long chatId, String chatType, long fromId, String text) {
+    public static String chatMessage(long chatId, String chatType, long fromId, String text) {
         ObjectNode update = JSON.createObjectNode().put("update_id", 1);
         ObjectNode message = update.putObject("message").put("message_id", 5).put("date", 1_761_818_400);
         message.putObject("chat").put("id", chatId).put("type", chatType).put("first_name", "Гість");
@@ -59,7 +60,7 @@ final class TelegramWebhookTestSupport {
         return update.toString();
     }
 
-    static String contact(long chatId, String phone, long contactUserId) {
+    public static String contact(long chatId, String phone, long contactUserId) {
         ObjectNode update = JSON.createObjectNode().put("update_id", 2);
         ObjectNode message = update.putObject("message").put("message_id", 6).put("date", 1_761_818_400);
         message.putObject("chat").put("id", chatId).put("type", "private");

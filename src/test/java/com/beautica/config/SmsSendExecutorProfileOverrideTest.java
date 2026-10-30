@@ -1,5 +1,6 @@
 package com.beautica.config;
 
+import com.beautica.notification.channel.GuestMessageRouters;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.beautica.booking.service.BookingSmsDispatcher;
@@ -177,7 +178,7 @@ class SmsSendExecutorProfileOverrideTest {
             @Bean
             BookingSmsDispatcher bookingSmsDispatcher(
                     SmsService smsService, @Qualifier(SEND_BEAN) TaskExecutor send) {
-                return new BookingSmsDispatcher(smsService, send);
+                return new BookingSmsDispatcher(smsService, GuestMessageRouters.smsOnly(smsService), send);
             }
         }
     }

@@ -54,6 +54,16 @@ public class NotificationService {
      */
     private static final Set<BookingSource> RESCHEDULE_SMS_SOURCES = EnumSet.of(BookingSource.LINK, BookingSource.STAFF);
 
+    /**
+     * Phase 408 (user decision 2026-10-28, reverses the phase 390 / 22.1 LINK-only scope) — the account-less
+     * sources whose guest phone receives the provider-cancellation message (decline, salon closure, master
+     * removal): an OTP-verified LINK guest and a STAFF walk-in with a phone. Fixed copy, no provider-authored
+     * text (same reasoning as {@link #RESCHEDULE_SMS_SOURCES}). Delivered through {@code GuestMessageRouter}:
+     * Telegram when that phone is linked, SMS otherwise.
+     */
+    private static final Set<BookingSource> PROVIDER_CANCELLATION_SMS_SOURCES =
+            EnumSet.of(BookingSource.LINK, BookingSource.STAFF);
+
     // Explicit constructor — @RequiredArgsConstructor cannot bind the @Value frontend base URL.
     public NotificationService(
             EmailNotificationService emailService,
@@ -124,6 +134,15 @@ public class NotificationService {
 
     /** @see #notifyNewBooking(BookingVisit) for why this takes a visit rather than a booking. */
     public void notifyBookingStatusChanged(BookingVisit visit) {
+        notifyBookingStatusChanged(visit, null);
+    }
+
+    /**
+     * Phase 408 audit-fix cycle 2 — as {@link #notifyBookingStatusChanged(BookingVisit)}, with the outbox entry id the
+     * drain is processing, so a walk-in's cancellation budget reservation is reused (not re-spent) on a back-pressure
+     * retry of the same row.
+     */
+    public void notifyBookingStatusChanged(BookingVisit visit, @Nullable UUID outboxEntryId) {
         Booking booking = visit.lead();
         // Guest (LINK) bookings have a null client (V89 chk_bookings_guest_fields) and no
         // account to notify by email/push. Repurposing PATCH /decline as provider-initiated
@@ -139,16 +158,16 @@ public class NotificationService {
         // status without a dedicated guest-booking test (track 24.x fixed seven separate
         // client==null null-derefs in exactly this area).
         //
-        // Phase 22.1 (security): the SMS half is gated on the SOURCE, not on the null client.
-        // V137 makes client_id IS NULL reachable for a STAFF walk-in — a phone TYPED IN by a salon
-        // employee about a third party, verified by nothing. A LINK guest, by contrast, proved
-        // their number by answering an OTP before the booking existed. Keying the SMS on
-        // `client == null` would treat the two identically and turn every staff-entered digit
-        // string into a destination the platform sends Beautica-branded, provider-authored text
-        // to with no consent step anywhere: a typo texts a stranger, and a deliberate entry makes
-        // us an on-demand SMS relay (unsolicited-SMS amplification, sender-reputation damage,
-        // Turbosms cost). The gate is "SMS iff LINK" and both halves are pinned by
-        // NotificationServiceTest (#should_notSendDeclineSms_when_staffWalkInBookingDeclined /
+        // Phase 22.1 / 408 (security): the message half is gated on the SOURCE, not on the null client.
+        // Phase 22.1 kept it LINK-only because a STAFF walk-in's phone is TYPED IN by a salon employee
+        // and verified by nothing. Phase 408 (user decision 2026-10-28) widened it to STAFF walk-ins with a
+        // phone (PROVIDER_CANCELLATION_SMS_SOURCES), and the 22.1 risk is contained instead of excluded:
+        // the copy is fixed GuestProviderCancellationSmsText (no provider-authored text), and every STAFF
+        // message spends the shared per-phone budget plus one-per-visit-per-window
+        // (GuestRescheduleSmsBudget#tryReserveWalkInCancellation, in sendLinkGuestProviderCancellationSms),
+        // so typed-in numbers cannot be turned into an SMS relay. APP rows never reach this branch. Pinned by
+        // NotificationServiceTest (#should_sendDeclineSms_when_staffWalkInBookingDeclined,
+        // #should_skipWalkInCancellationSms_when_phoneBudgetExhausted,
         // #should_stillSendDeclineSms_when_linkGuestBookingDeclined).
         //
         // The null-client early return itself stays, and must: it is what keeps getClient()
@@ -163,9 +182,9 @@ public class NotificationService {
         // the source gate narrows it.
         if (booking.getClient() == null) {
             if (booking.getStatus() == BookingStatus.DECLINED
-                    && booking.getBookingSource() == BookingSource.LINK) {
+                    && PROVIDER_CANCELLATION_SMS_SOURCES.contains(booking.getBookingSource())) {
                 sendLinkGuestProviderCancellationSms(booking, "DECLINED",
-                        guestCancellationSmsText.forDecline(booking, declinedStart(visit)));
+                        guestCancellationSmsText.forDecline(booking, declinedStart(visit)), outboxEntryId);
             } else {
                 log.debug("Skipping STATUS_CHANGED notification for account-less guest booking {}", booking.getId());
             }
@@ -385,11 +404,16 @@ public class NotificationService {
      * either, unlike the decline path.
      */
     public void notifySalonClosed(BookingVisit visit) {
+        notifySalonClosed(visit, null);
+    }
+
+    /** {@link #notifySalonClosed(BookingVisit)} with the drained outbox entry id (walk-in budget idempotency). */
+    public void notifySalonClosed(BookingVisit visit, @Nullable UUID outboxEntryId) {
         Booking booking = visit.lead();
         if (booking.getClient() == null) {
-            if (booking.getBookingSource() == BookingSource.LINK) {
+            if (PROVIDER_CANCELLATION_SMS_SOURCES.contains(booking.getBookingSource())) {
                 sendLinkGuestProviderCancellationSms(booking, "SALON_CLOSED",
-                        guestCancellationSmsText.forSalonClosed(visit.startsAt()));
+                        guestCancellationSmsText.forSalonClosed(visit.startsAt()), outboxEntryId);
             } else {
                 log.debug("Skipping SALON_CLOSED notification for account-less non-LINK booking {}",
                         booking.getId());
@@ -420,11 +444,16 @@ public class NotificationService {
      * {@link #notifySalonClosed(BookingVisit)} — {@link BookingVisit} exposes no note accessor).
      */
     public void notifyMasterRemoved(BookingVisit visit) {
+        notifyMasterRemoved(visit, null);
+    }
+
+    /** {@link #notifyMasterRemoved(BookingVisit)} with the drained outbox entry id (walk-in budget idempotency). */
+    public void notifyMasterRemoved(BookingVisit visit, @Nullable UUID outboxEntryId) {
         Booking booking = visit.lead();
         if (booking.getClient() == null) {
-            if (booking.getBookingSource() == BookingSource.LINK) {
+            if (PROVIDER_CANCELLATION_SMS_SOURCES.contains(booking.getBookingSource())) {
                 sendLinkGuestProviderCancellationSms(booking, "MASTER_REMOVED",
-                        guestCancellationSmsText.forMasterRemoved(booking, visit.startsAt()));
+                        guestCancellationSmsText.forMasterRemoved(booking, visit.startsAt()), outboxEntryId);
             } else {
                 log.debug("Skipping MASTER_REMOVED notification for account-less non-LINK booking {}",
                         booking.getId());
@@ -489,20 +518,29 @@ public class NotificationService {
      * or per declined service line, so a guest gets one SMS per provider action. The text comes
      * from {@link GuestProviderCancellationSmsText} and carries no provider-authored content.
      *
-     * <p>Named for {@code LINK} rather than "guest" deliberately (Phase 22.1): a STAFF walk-in is
-     * also account-less, but its phone was typed by an employee about a third party rather than
-     * proven by the recipient's own OTP, so it is NOT an eligible destination. Only the LINK
-     * branches above may call this — do not re-generalise it to "any booking with a guestPhone".
+     * <p>Phase 408 widened the callers to STAFF walk-ins with a phone (user decision 2026-10-28, reversing
+     * the Phase 22.1 / 390 LINK-only scope; see {@link #PROVIDER_CANCELLATION_SMS_SOURCES}). The name is kept
+     * for history. Only those branches may call this — never an APP booking. The message goes through
+     * {@code GuestMessageRouter} (Telegram when linked, else SMS) inside {@link BookingSmsDispatcher}.
      *
      * <p>{@link BookingSmsDispatcher} owns the send-failure swallow-and-log (kind + exception class only, never
      * the phone or the text — Anti-Bug §I) and the {@code app.booking.sms.enabled} gate (it holds
      * the gated {@code SmsService} bean). This runs on the outbox drain thread, which only ever sees
      * committed rows, so a rolled-back cancellation can never reach it.
      */
-    private void sendLinkGuestProviderCancellationSms(Booking lead, String eventType, String text) {
+    private void sendLinkGuestProviderCancellationSms(Booking lead, String eventType, String text,
+                                                      @Nullable UUID outboxEntryId) {
         String phone = lead.getGuestPhone();
         if (phone == null || phone.isBlank()) {
             log.warn("Guest {} (booking {}) has no guestPhone — skipping SMS", eventType, lead.getId());
+            return;
+        }
+        // Phase 408 audit-fix (security MEDIUM): a walk-in's phone was typed by staff, so its cancellation message
+        // spends the shared per-phone budget (and at most one per visit per window); silent skip when exhausted.
+        // LINK guests (OTP-verified) are unchanged.
+        if (lead.getBookingSource() == BookingSource.STAFF && !guestRescheduleSmsBudget.tryReserveWalkInCancellation(
+                lead.getId(), lead.getAppointment() == null ? null : lead.getAppointment().getId(), phone,
+                outboxEntryId)) {
             return;
         }
         // dispatchOrThrow, never dispatch: this runs on the outbox drain, which can retry. A
@@ -527,7 +565,7 @@ public class NotificationService {
         if (type == OutboxEventType.BOOKING_RESCHEDULED) {
             return routesToGuestRescheduleSms(lead);
         }
-        if (lead.getClient() != null || lead.getBookingSource() != BookingSource.LINK
+        if (lead.getClient() != null || !PROVIDER_CANCELLATION_SMS_SOURCES.contains(lead.getBookingSource())
                 || lead.getGuestPhone() == null || lead.getGuestPhone().isBlank()) {
             return false;
         }

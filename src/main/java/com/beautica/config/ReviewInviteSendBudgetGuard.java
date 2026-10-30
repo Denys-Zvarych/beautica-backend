@@ -28,6 +28,8 @@ class ReviewInviteSendBudgetGuard {
                 OutboundTimeouts.requirePositive(
                         "app.sms.turbosms.connect-timeout", turbosmsProperties.getConnectTimeout()),
                 OutboundTimeouts.requirePositive(
-                        "app.sms.turbosms.read-timeout", turbosmsProperties.getReadTimeout()));
+                        "app.sms.turbosms.read-timeout", turbosmsProperties.getReadTimeout()),
+                // Phase 408: a routed invite tries Telegram first, so its worst send carries that leg too.
+                ReviewInviteProperties.TELEGRAM_LEG_WORST_CASE);
     }
 }

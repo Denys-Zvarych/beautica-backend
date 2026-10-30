@@ -30,6 +30,13 @@ import java.util.regex.Pattern;
 @RequiredArgsConstructor
 public class TelegramLinkService {
 
+    /**
+     * Phase 408 audit-fix cycle 2 — longest a {@link #markBlocked(UUID, long)} write can wait on a held link row: the
+     * fused, transaction-local {@code lock_timeout} of {@code TelegramLinkRepository#transitionByIdBounded}. Part of
+     * the router's worst-case Telegram leg ({@code ReviewInviteProperties.TELEGRAM_LEG_WORST_CASE}).
+     */
+    public static final java.time.Duration MARK_BLOCKED_MAX_WAIT = java.time.Duration.ofSeconds(3);
+
     /** D6 — at most this many live tokens per phone; issuing one more deletes the oldest. */
     static final int MAX_LIVE_TOKENS_PER_PHONE = 5;
     /** D6 — 32 random bytes, base64url without padding. */
@@ -152,10 +159,13 @@ public class TelegramLinkService {
                 clock.instant());
     }
 
-    /** Phase 408 calls this after a failed send inside its own flow, so it commits on its own (REQUIRES_NEW). */
+    /**
+     * Phase 408 calls this after a 403 inside its own flow, so it commits on its own (REQUIRES_NEW). Matches the
+     * chat the failed send went to: a phone re-linked to a new chat meanwhile stays ACTIVE (audit-fix, security LOW).
+     */
     @Transactional(propagation = Propagation.REQUIRES_NEW)
-    public void markBlocked(UUID linkId) {
-        linkRepository.transitionById(linkId, TelegramLinkStatus.ACTIVE, TelegramLinkStatus.BLOCKED,
+    public void markBlocked(UUID linkId, long chatId) {
+        linkRepository.transitionById(linkId, chatId, TelegramLinkStatus.ACTIVE, TelegramLinkStatus.BLOCKED,
                 clock.instant());
     }
 
@@ -170,7 +180,12 @@ public class TelegramLinkService {
                 clock.instant());
     }
 
-    @Transactional
+    /**
+     * Phase 408 calls this after a delivered send, possibly from an after-commit callback whose (completed)
+     * transaction is still bound to the thread; REQUIRES_NEW so the stamp always commits on its own, like
+     * {@link #markBlocked(UUID)}.
+     */
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void touchLastSent(UUID linkId) {
         linkRepository.touchLastSent(linkId, clock.instant());
     }

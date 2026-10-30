@@ -1,5 +1,6 @@
 package com.beautica.booking.service;
 
+import com.beautica.notification.channel.GuestMessageRouters;
 import com.beautica.TestConstants;
 import com.beautica.auth.Role;
 import com.beautica.booking.dto.AppointmentDetailResponse;
@@ -130,7 +131,7 @@ class StaffBookingServiceTest {
      * profile, so ordering is deterministic here for the same reason it is there.
      */
     private BookingSmsDispatcher bookingSmsDispatcher() {
-        return new BookingSmsDispatcher(smsService, new SyncTaskExecutor());
+        return new BookingSmsDispatcher(smsService, GuestMessageRouters.smsOnly(smsService), new SyncTaskExecutor());
     }
 
     private final UUID masterId = UUID.randomUUID();
