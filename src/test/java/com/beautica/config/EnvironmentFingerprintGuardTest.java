@@ -1181,4 +1181,107 @@ class EnvironmentFingerprintGuardTest {
     void should_pass_when_prodSiteverifyUrlIsCloudflare() {
         assertThatCode(() -> run(prodEnv(), DeployEnvironment.PROD, SmsMode.TURBOSMS)).doesNotThrowAnyException();
     }
+
+    // ── Phase 404 audit: Telegram ──────────────────────────────────────────
+
+    @Test
+    @DisplayName("prod with Telegram enabled in capture mode — fails prod-telegram-mode")
+    void should_failBoot_when_prodTelegramCapture() {
+        MockEnvironment env = prodEnv().withProperty("app.telegram.enabled", "true")
+                .withProperty("app.telegram.mode", "capture");
+
+        assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("prod-telegram-mode");
+    }
+
+    @Test
+    @DisplayName("prod with Telegram enabled and mode unset (live) or explicitly live — passes")
+    void should_pass_when_prodTelegramLive() {
+        MockEnvironment unset = prodEnv().withProperty("app.telegram.enabled", "true");
+        MockEnvironment live = prodEnv().withProperty("app.telegram.enabled", "true")
+                .withProperty("app.telegram.mode", "live");
+
+        assertThatCode(() -> run(unset, DeployEnvironment.PROD, SmsMode.TURBOSMS)).doesNotThrowAnyException();
+        assertThatCode(() -> run(live, DeployEnvironment.PROD, SmsMode.TURBOSMS)).doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("prod with Telegram off in capture mode — passes (mode is only checked when enabled)")
+    void should_pass_when_prodTelegramCaptureButDisabled() {
+        MockEnvironment env = prodEnv().withProperty("app.telegram.mode", "capture");
+
+        assertThatCode(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS)).doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("prod with a non-Telegram api-base-url — fails prod-telegram-api-base-url, even with the flag off")
+    void should_failBoot_when_prodTelegramApiBaseUrlNotTelegram() {
+        for (String url : new String[]{"https://telegram.evil.example", "https://api.telegram.org/", "http://api.telegram.org"}) {
+            MockEnvironment env = prodEnv().withProperty("app.telegram.api-base-url", url);
+
+            assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                    .hasMessageContaining("prod-telegram-api-base-url");
+        }
+    }
+
+    @Test
+    @DisplayName("prod with the exact Bot API origin — passes")
+    void should_pass_when_prodTelegramApiBaseUrlExact() {
+        MockEnvironment env = prodEnv().withProperty("app.telegram.api-base-url", "https://api.telegram.org");
+
+        assertThatCode(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS)).doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("staging with TELEGRAM_BOT_TOKEN set — fails naming the variable, message carries no value")
+    void should_failNamingTheVariable_when_stagingHasTelegramToken() {
+        String token = "123456789:" + "x".repeat(35);
+        MockEnvironment raw = stagingEnv().withProperty("TELEGRAM_BOT_TOKEN", token);
+        MockEnvironment bound = stagingEnv().withProperty("app.telegram.bot-token", token);
+
+        for (MockEnvironment env : new MockEnvironment[]{raw, bound}) {
+            assertThatThrownBy(() -> run(env, DeployEnvironment.STAGING, SmsMode.CAPTURE))
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("staging-telegram-token-blank")
+                    .message().doesNotContain(token);
+        }
+    }
+
+    @Test
+    @DisplayName("prod with Telegram enabled and an unknown mode value — fails prod-telegram-mode (unconvertible is not live)")
+    void should_failBoot_when_prodTelegramModeUnconvertible() {
+        MockEnvironment env = prodEnv().withProperty("app.telegram.enabled", "true")
+                .withProperty("app.telegram.mode", "shadow");
+
+        assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("prod-telegram-mode");
+    }
+
+    @Test
+    @DisplayName("prod-telegram-api-base-url names the rule but never echoes the configured host")
+    void should_notEchoHost_when_prodTelegramApiBaseUrlRejected() {
+        MockEnvironment env = prodEnv().withProperty("app.telegram.api-base-url", "https://tg-zq77.evil.example");
+
+        assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                .hasMessageContaining("prod-telegram-api-base-url")
+                .message().doesNotContain("tg-zq77");
+    }
+
+    @Test
+    @DisplayName("staging with a whitespace-only TELEGRAM_BOT_TOKEN — passes (blank, as Railway renders an emptied var)")
+    void should_pass_when_stagingTelegramTokenWhitespace() {
+        MockEnvironment env = stagingEnv().withProperty("TELEGRAM_BOT_TOKEN", "   ");
+
+        assertThatCode(() -> run(env, DeployEnvironment.STAGING, SmsMode.CAPTURE)).doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("prod with TELEGRAM_BOT_TOKEN set — passes (the staging-only token rule does not fire in prod)")
+    void should_pass_when_prodHasTelegramToken() {
+        MockEnvironment env = prodEnv().withProperty("TELEGRAM_BOT_TOKEN", "123456789:" + "x".repeat(35));
+
+        assertThatCode(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS)).doesNotThrowAnyException();
+    }
 }

@@ -112,6 +112,10 @@ app:
       # logged instead of billed (the OTP goes to Mailpit via beautica.sms.mode=capture above). Hardcoded false with NO env placeholder — unlike the base
       # profile, local must not be flippable by a stray shell export.
       enabled: false
+  telegram:
+    # Phase 404 — local never reaches the Bot API: with APP_TELEGRAM_ENABLED=true messages go to Mailpit
+    # (tg+<chatId>@telegram.local.invalid). Flag itself stays inherited (default false).
+    mode: capture
   booking-links:
     # Phase 375 (D6) — sharing on locally (prod default is false); export
     # BOOKING_LINKS_SHARE_ENABLED=false to exercise the switched-off state.

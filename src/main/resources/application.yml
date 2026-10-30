@@ -482,6 +482,19 @@ app:
       base-url: ${TURBOSMS_BASE_URL:https://api.turbosms.ua/message/send.json}
       connect-timeout: 3s
       read-timeout: 5s
+  telegram:
+    # Phase 404 — opt-in Telegram reminder channel (TelegramConfig). OFF by default: NoOpTelegramMessenger
+    # throws, so every message falls back to SMS. Write the flag as true/false (no relaxed binding).
+    # mode: live (Bot API, prod only — TelegramEnvGuard refuses it on staging) | capture (Mailpit).
+    # enabled=true + live fails boot unless token, username and webhook secret are all set (TelegramProperties).
+    # The token is a secret and is never logged.
+    enabled: ${APP_TELEGRAM_ENABLED:false}
+    mode: live
+    bot-token: ${TELEGRAM_BOT_TOKEN:}
+    bot-username: ${TELEGRAM_BOT_USERNAME:}
+    webhook-secret: ${TELEGRAM_WEBHOOK_SECRET:}
+    api-base-url: https://api.telegram.org
+    link-token-ttl: 30m
   json:
     # Global Jackson StreamReadConstraints (see JsonConfig / JsonConstraintsProperties).
     # max-string-length caps a single JSON string token at the PARSE phase so a multi-MB

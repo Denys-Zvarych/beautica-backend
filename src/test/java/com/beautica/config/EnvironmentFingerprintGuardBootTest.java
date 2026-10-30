@@ -126,4 +126,21 @@ class EnvironmentFingerprintGuardBootTest {
         assertThat(thrown).isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("internal-api-key-blank");
     }
+
+    @Test
+    @DisplayName("Phase 404 — prod,staging with TELEGRAM_BOT_TOKEN set: startup aborts naming staging-telegram-token-blank, token not echoed")
+    void should_abortBeforeContext_when_stagingHasTelegramBotToken() {
+        String token = "123456789:" + "z".repeat(35);
+
+        Throwable thrown = catchThrowable(() -> new SpringApplicationBuilder(EmptyConfig.class)
+                .web(WebApplicationType.NONE)
+                .profiles("prod", "staging")
+                .run("--TELEGRAM_BOT_TOKEN=" + token, "--spring.main.banner-mode=off",
+                        "--JWT_SECRET=x", "--INTERNAL_API_KEY=" + TestSecrets.INTERNAL_API_KEY, "--FRONTEND_BASE_URL=https://x.invalid",
+                        "--PUBLIC_BASE_URL=https://api.staging.beautica.test", "--SUPPORT_EMAIL=support@test.invalid"));
+
+        assertThat(thrown).isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("staging-telegram-token-blank")
+                .message().doesNotContain(token);
+    }
 }

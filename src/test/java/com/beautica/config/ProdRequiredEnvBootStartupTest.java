@@ -253,4 +253,22 @@ class ProdRequiredEnvBootStartupTest {
 
         assertThat(message).contains("rule prod-mail-logo-url");
     }
+
+    @Test
+    @DisplayName("Phase 404 prod-telegram-mode — prod boot with APP_TELEGRAM_ENABLED=true in capture mode aborts")
+    void should_abortBoot_when_prodTelegramEnabledInCaptureMode() {
+        Map<String, String> vars = passingProdVars();
+        vars.put("APP_TELEGRAM_ENABLED", "true");
+
+        assertThat(guardMessageOfFailedBoot(vars, "--app.telegram.mode=capture")).contains("rule prod-telegram-mode");
+    }
+
+    @Test
+    @DisplayName("Phase 404 prod-telegram-api-base-url — a command-line Bot API origin override aborts the prod boot, host not echoed")
+    void should_abortBoot_when_prodTelegramApiBaseUrlOverridden() {
+        String message = guardMessageOfFailedBoot(passingProdVars(),
+                "--app.telegram.api-base-url=https://tg-zq77.example.org");
+
+        assertThat(message).contains("rule prod-telegram-api-base-url").doesNotContain("tg-zq77");
+    }
 }

@@ -415,6 +415,7 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
         if (smsModeOf(env) != SmsMode.TURBOSMS) {
             violations.add("rule prod-sms-mode: beautica.sms.mode must be turbosms in prod");
         }
+        checkProdTelegram(env, violations);
         String support = supportEmail(env);
         if (!isEmailShaped(support) || isPlaceholderDomain(support.substring(support.lastIndexOf('@') + 1))) {
             violations.add("rule prod-support-email: app.support.email must be a real address (local@domain.tld, not a reserved test domain) in prod");
@@ -442,6 +443,44 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
                 && (!isEmailShaped(effective.strip()) || isPlaceholderDomain(domainOf(effective)))) {
             violations.add("rule prod-admin-email-effective: app.admin-email (APP_ADMIN_EMAIL override) must be a real "
                     + "address (not a reserved test/example domain) in prod");
+        }
+    }
+
+    static final String TELEGRAM_API_ORIGIN = "https://api.telegram.org";
+    private static final String TELEGRAM_BOT_TOKEN_PROPERTY = "app.telegram.bot-token";
+
+    /**
+     * Phase 404 audit. {@code prod-telegram-mode}: with the channel on, prod must deliver for real — capture would
+     * silently mail guests' reminders to a capture inbox instead of Telegram. {@code prod-telegram-api-base-url}: the
+     * bot token travels in the URL path of every call, so only the real Bot API origin may receive it in prod (same
+     * intent as {@code prod-brevo-api-base-url}); unset resolves to the binding default. Names rules only, no values.
+     */
+    private static void checkProdTelegram(Environment env, List<String> violations) {
+        if (telegramEnabled(env) && telegramModeOf(env) != TelegramMode.LIVE) {
+            violations.add("rule prod-telegram-mode: app.telegram.mode must be live in prod when app.telegram.enabled=true");
+        }
+        String baseUrl = boundOrNull(env, "app.telegram.api-base-url");
+        if (baseUrl != null && !TELEGRAM_API_ORIGIN.equals(baseUrl)) {
+            violations.add("rule prod-telegram-api-base-url: app.telegram.api-base-url must be exactly "
+                    + TELEGRAM_API_ORIGIN + " in prod");
+        }
+    }
+
+    /** Same resolution as {@code TelegramProperties}; an unconvertible value reads as off (TelegramConfig fails it). */
+    private static boolean telegramEnabled(Environment env) {
+        try {
+            return Binder.get(env).bind("app.telegram.enabled", Boolean.class).orElse(false);
+        } catch (org.springframework.boot.context.properties.bind.BindException e) {
+            return false;
+        }
+    }
+
+    /** Unset → {@link TelegramMode#LIVE}, the binding default; an unconvertible value is not live. */
+    private static TelegramMode telegramModeOf(Environment env) {
+        try {
+            return Binder.get(env).bind("app.telegram.mode", TelegramMode.class).orElse(TelegramMode.LIVE);
+        } catch (org.springframework.boot.context.properties.bind.BindException e) {
+            return null;
         }
     }
 
@@ -612,6 +651,10 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
         }
         if (!isBlank(env.getProperty("TURBOSMS_TOKEN")) || !isBlank(env.getProperty("app.sms.turbosms.token"))) {
             violations.add("rule staging-turbosms-token-blank: TURBOSMS_TOKEN must be blank in staging");
+        }
+        // Phase 404 audit: the only bot is prod's (D8) — its token must never reach a staging deploy.
+        if (!isBlank(readOrNull(env, "TELEGRAM_BOT_TOKEN")) || !isBlank(boundOrNull(env, TELEGRAM_BOT_TOKEN_PROPERTY))) {
+            violations.add("rule staging-telegram-token-blank: TELEGRAM_BOT_TOKEN must be blank in staging");
         }
         if (!isBlank(env.getProperty("BREVO_SMTP_KEY")) || !isBlank(env.getProperty("spring.mail.password"))) {
             violations.add("rule staging-brevo-key-blank: BREVO_SMTP_KEY must be blank in staging");
