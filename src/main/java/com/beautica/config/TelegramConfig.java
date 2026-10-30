@@ -1,8 +1,12 @@
 package com.beautica.config;
 
+import com.beautica.notification.telegram.AllowAllTelegramChatAllowList;
+import com.beautica.notification.telegram.AllowListTelegramMessenger;
 import com.beautica.notification.telegram.CapturingTelegramMessenger;
 import com.beautica.notification.telegram.NoOpTelegramMessenger;
+import com.beautica.notification.telegram.StagingTelegramChatAllowList;
 import com.beautica.notification.telegram.TelegramBotApiClient;
+import com.beautica.notification.telegram.TelegramChatAllowList;
 import com.beautica.notification.telegram.TelegramMessenger;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
@@ -10,6 +14,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Profile;
 import org.springframework.mail.javamail.JavaMailSender;
 
 import java.time.Clock;
@@ -34,15 +39,44 @@ import java.time.Clock;
  * unparseable value fails the binding and therefore the boot. Mode-specific collaborators are resolved lazily
  * ({@link ObjectProvider}) so the off and capture cells need neither a {@link Clock} nor a mail sender they do not use.
  * Credentials are validated at bind time by {@link TelegramProperties}; staging is fenced by {@link TelegramEnvGuard}.
+ *
+ * <h2>Staging tester allow-list (Phase 432, D3)</h2>
+ * Exactly one {@link TelegramChatAllowList}: {@link StagingTelegramChatAllowList} when EITHER staging signal is
+ * present — the {@code staging} profile or {@code beautica.environment=staging} (432 audit-fix: the environment alone
+ * used to select allow-all and skip {@link TelegramEnvGuard}) — and {@link AllowAllTelegramChatAllowList} otherwise.
+ * The environment-only path applies the same {@link TelegramEnvGuard} rule. The live client is wrapped in
+ * {@link AllowListTelegramMessenger} unless the allow-list is the allow-all one — i.e. on staging only, and fail
+ * closed should a future profile add another restricting list. Capture mode never reaches Telegram, so it is not
+ * wrapped.
  */
 @Slf4j
 @Configuration
-@EnableConfigurationProperties(TelegramProperties.class)
+// DeploymentProperties is also registered by AppConfigProperties; repeated here so the TelegramConfig slice tests
+// (ApplicationContextRunner) can resolve the environment-based allow-list selection — a duplicate is a no-op.
+@EnableConfigurationProperties({TelegramProperties.class, DeploymentProperties.class})
 public class TelegramConfig {
+
+    @Bean
+    @Profile("staging")
+    public TelegramChatAllowList stagingTelegramChatAllowList(TelegramProperties properties) {
+        return new StagingTelegramChatAllowList(properties.stagingAllowedChatIdValues());
+    }
+
+    /** Fail closed: a staging environment without the staging profile still gets the tester list and its guard. */
+    @Bean
+    @Profile("!staging")
+    public TelegramChatAllowList telegramChatAllowList(TelegramProperties properties, DeploymentProperties deployment) {
+        if (deployment.environment() == DeployEnvironment.STAGING) {
+            TelegramEnvGuard.requireAllowListWhenLive(properties);
+            return new StagingTelegramChatAllowList(properties.stagingAllowedChatIdValues());
+        }
+        return new AllowAllTelegramChatAllowList();
+    }
 
     @Bean
     public TelegramMessenger telegramMessenger(
             TelegramProperties properties,
+            TelegramChatAllowList allowList,
             ObjectProvider<Clock> clock,
             ObjectProvider<JavaMailSender> mailSender,
             @Value("${app.invite.from-email:noreply@beautica.app}") String fromAddress) {
@@ -51,15 +85,24 @@ public class TelegramConfig {
             return new NoOpTelegramMessenger();
         }
         return switch (properties.mode()) {
-            case LIVE -> {
-                log.info("Telegram channel is ENABLED in LIVE mode — registering TelegramBotApiClient");
-                yield new TelegramBotApiClient(properties, clock.getObject());
-            }
+            case LIVE -> liveMessenger(properties, clock.getObject(), allowList);
             case CAPTURE -> {
                 log.warn("Telegram channel is ENABLED in CAPTURE mode — messages are mailed to the capture inbox, "
                         + "nothing reaches Telegram");
                 yield new CapturingTelegramMessenger(mailSender.getObject(), fromAddress);
             }
         };
+    }
+
+    private static TelegramMessenger liveMessenger(TelegramProperties properties, Clock clock,
+                                                   TelegramChatAllowList allowList) {
+        TelegramBotApiClient client = new TelegramBotApiClient(properties, clock);
+        if (allowList instanceof AllowAllTelegramChatAllowList) {
+            log.info("Telegram channel is ENABLED in LIVE mode — registering TelegramBotApiClient");
+            return client;
+        }
+        log.info("Telegram channel is ENABLED in LIVE mode — registering TelegramBotApiClient behind the staging "
+                + "tester allow-list");
+        return new AllowListTelegramMessenger(client, allowList);
     }
 }

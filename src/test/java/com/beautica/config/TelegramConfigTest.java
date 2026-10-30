@@ -1,8 +1,12 @@
 package com.beautica.config;
 
+import com.beautica.notification.telegram.AllowAllTelegramChatAllowList;
+import com.beautica.notification.telegram.AllowListTelegramMessenger;
 import com.beautica.notification.telegram.CapturingTelegramMessenger;
 import com.beautica.notification.telegram.NoOpTelegramMessenger;
+import com.beautica.notification.telegram.StagingTelegramChatAllowList;
 import com.beautica.notification.telegram.TelegramBotApiClient;
+import com.beautica.notification.telegram.TelegramChatAllowList;
 import com.beautica.notification.telegram.TelegramDeliveryException;
 import com.beautica.notification.telegram.TelegramMessenger;
 import jakarta.mail.Message;
@@ -20,6 +24,7 @@ import org.springframework.mail.javamail.JavaMailSender;
 
 import java.time.Clock;
 import java.time.Duration;
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -302,6 +307,176 @@ class TelegramConfigTest {
                     .isExactlyInstanceOf(TelegramDeliveryException.class)
                     .hasMessage("Telegram channel is disabled (app.telegram.enabled=false)");
         }
+    }
+
+    // ── Phase 432 D3: staging tester allow-list ──
+
+    @Test
+    @DisplayName("allow-list \"1,2\" (and \" 1 , 2 \") binds to [1, 2]")
+    void should_bindAllowList_when_commaSeparatedPositiveIds() {
+        for (String raw : new String[]{"1,2", " 1 , 2 "}) {
+            runner.withPropertyValues("app.telegram.staging-allowed-chat-ids=" + raw).run(context ->
+                    assertThat(context.getBean(TelegramProperties.class).stagingAllowedChatIdValues())
+                            .as("raw=%s", raw).containsExactly(1L, 2L));
+        }
+    }
+
+    @Test
+    @DisplayName("allow-list unset or empty → empty list")
+    void should_bindEmptyAllowList_when_unsetOrEmpty() {
+        runner.run(context ->
+                assertThat(context.getBean(TelegramProperties.class).stagingAllowedChatIds()).isEmpty());
+        runner.withPropertyValues("app.telegram.staging-allowed-chat-ids=").run(context ->
+                assertThat(context.getBean(TelegramProperties.class).stagingAllowedChatIds()).isEmpty());
+    }
+
+    @Test
+    @DisplayName("allow-list with a bad entry (-5, 0, x, blank, 0x1F, #1F, +5, 1e3, overflow) → context fails; no entry echoed anywhere in the failure")
+    void should_failContext_when_allowListInvalid() {
+        String testerId = "111222333";
+        for (String bad : new String[]{"-5", "0", "x", "", " ", "0x1F", "#1F", "+5", "1e3", "١٢", "99999999999999999999"}) {
+            String raw = testerId + "," + bad + ",444555666";
+            runner.withPropertyValues("app.telegram.staging-allowed-chat-ids=" + raw).run(context -> {
+                assertThat(context).as("bad=%s", bad).hasFailed();
+                assertThat(rootMessage(context.getStartupFailure())).as("bad=%s", bad)
+                        .contains("staging-allowed-chat-ids");
+                assertThat(failureReport(context.getStartupFailure())).as("bad=%s", bad)
+                        .doesNotContain(testerId).doesNotContain("444555666");
+                if (!bad.isBlank()) {
+                    assertThat(failureReport(context.getStartupFailure())).as("bad=%s", bad)
+                            .doesNotContain("=" + bad).doesNotContain("\"" + bad + "\"");
+                }
+            });
+        }
+    }
+
+    @Test
+    @DisplayName("allow-list entries are stored canonical (leading zeros dropped)")
+    void should_canonicaliseAllowList_when_leadingZeros() {
+        runner.withPropertyValues("app.telegram.staging-allowed-chat-ids=007,42").run(context -> {
+            TelegramProperties props = context.getBean(TelegramProperties.class);
+            assertThat(props.stagingAllowedChatIds()).containsExactly("7", "42");
+            assertThat(props.stagingAllowedChatIdValues()).containsExactly(7L, 42L);
+        });
+    }
+
+    @Test
+    @DisplayName("432 audit-fix — beautica.environment=staging WITHOUT the staging profile → StagingTelegramChatAllowList + allow-list decorator")
+    void should_selectStagingAllowList_when_stagingEnvironmentWithoutStagingProfile() {
+        runner.withPropertyValues(VALID_LIVE)
+                .withPropertyValues("beautica.environment=staging", "app.telegram.staging-allowed-chat-ids=1")
+                .run(context -> {
+                    assertThat(context).hasNotFailed();
+                    assertThat(context).getBean(TelegramChatAllowList.class)
+                            .isInstanceOf(StagingTelegramChatAllowList.class);
+                    assertThat(context).getBean(TelegramMessenger.class).isInstanceOf(AllowListTelegramMessenger.class);
+                    assertThat(context.getBean(TelegramChatAllowList.class).allows(2L)).isFalse();
+                });
+    }
+
+    @Test
+    @DisplayName("432 audit-fix — beautica.environment=staging without the profile + enabled + live + empty list → context fails (same guard rule)")
+    void should_fail_when_stagingEnvironmentWithoutStagingProfile() {
+        runner.withPropertyValues(VALID_LIVE).withPropertyValues("beautica.environment=staging").run(context -> {
+            assertThat(context).hasFailed();
+            assertThat(rootMessage(context.getStartupFailure())).contains("TELEGRAM_STAGING_ALLOWED_CHAT_IDS");
+        });
+    }
+
+    @Test
+    @DisplayName("432 audit-fix — beautica.environment=staging without the profile + flag off + no list → boots, NoOp")
+    void should_boot_when_stagingEnvironmentWithoutProfileFlagOff() {
+        runner.withPropertyValues("beautica.environment=staging").run(context -> {
+            assertThat(context).hasNotFailed();
+            assertThat(context).getBean(TelegramMessenger.class).isInstanceOf(NoOpTelegramMessenger.class);
+            assertThat(context).getBean(TelegramChatAllowList.class).isInstanceOf(StagingTelegramChatAllowList.class);
+        });
+    }
+
+    @Test
+    @DisplayName("432 audit-fix — beautica.environment=prod or local → AllowAllTelegramChatAllowList")
+    void should_selectAllowAll_when_prodOrLocalEnvironment() {
+        for (String environment : new String[]{"prod", "local"}) {
+            runner.withPropertyValues(VALID_LIVE).withPropertyValues("beautica.environment=" + environment)
+                    .run(context -> assertThat(context).getBean(TelegramChatAllowList.class)
+                            .as("environment=%s", environment).isInstanceOf(AllowAllTelegramChatAllowList.class));
+        }
+    }
+
+    @Test
+    @DisplayName("allow-list ids are not printed by the properties toString")
+    void should_notPrintAllowListIds_when_toString() {
+        runner.withPropertyValues("app.telegram.staging-allowed-chat-ids=987654321").run(context ->
+                assertThat(context.getBean(TelegramProperties.class).toString())
+                        .doesNotContain("987654321").contains("<1 entries>"));
+    }
+
+    @Test
+    @DisplayName("staging + live → AllowListTelegramMessenger over the live client, StagingTelegramChatAllowList, one of each")
+    void should_wrapLiveClient_when_staging() {
+        runner.withInitializer(context -> context.getEnvironment().setActiveProfiles("staging"))
+                .withPropertyValues(VALID_LIVE).withPropertyValues("app.telegram.staging-allowed-chat-ids=1,2")
+                .run(context -> {
+                    assertThat(context).hasNotFailed();
+                    assertThat(context).getBeans(TelegramMessenger.class).hasSize(1);
+                    assertThat(context).getBean(TelegramMessenger.class).isInstanceOf(AllowListTelegramMessenger.class);
+                    assertThat(context).getBeans(TelegramChatAllowList.class).hasSize(1);
+                    assertThat(context).getBean(TelegramChatAllowList.class)
+                            .isInstanceOf(StagingTelegramChatAllowList.class);
+                });
+    }
+
+    @Test
+    @DisplayName("staging + capture → Capturing, not wrapped (nothing reaches Telegram)")
+    void should_notWrapCapture_when_staging() {
+        runner.withInitializer(context -> context.getEnvironment().setActiveProfiles("staging"))
+                .withPropertyValues("app.telegram.enabled=true", "app.telegram.mode=capture").run(context ->
+                        assertThat(context).getBean(TelegramMessenger.class)
+                                .isInstanceOf(CapturingTelegramMessenger.class));
+    }
+
+    @Test
+    @DisplayName("prod + live with an allow-list set → bare TelegramBotApiClient and AllowAllTelegramChatAllowList (list ignored)")
+    void should_registerBareClientAndAllowAll_when_prod() {
+        runner.withInitializer(context -> context.getEnvironment().setActiveProfiles("prod"))
+                .withPropertyValues(VALID_LIVE).withPropertyValues("app.telegram.staging-allowed-chat-ids=1")
+                .run(context -> {
+                    assertThat(context).hasNotFailed();
+                    assertThat(context).getBean(TelegramMessenger.class).isExactlyInstanceOf(TelegramBotApiClient.class);
+                    assertThat(context).getBeans(TelegramChatAllowList.class).hasSize(1);
+                    TelegramChatAllowList allowList = context.getBean(TelegramChatAllowList.class);
+                    assertThat(allowList).isInstanceOf(AllowAllTelegramChatAllowList.class);
+                    assertThat(allowList.allows(42L)).isTrue();
+                });
+    }
+
+    @Test
+    @DisplayName("StagingTelegramChatAllowList allows exactly the listed ids; empty allows nothing")
+    void should_allowOnlyListedChats_when_stagingAllowList() {
+        TelegramChatAllowList listed = new StagingTelegramChatAllowList(List.of(111L, 222L));
+        TelegramChatAllowList empty = new StagingTelegramChatAllowList(List.of());
+
+        assertThat(listed.allows(111L)).isTrue();
+        assertThat(listed.allows(222L)).isTrue();
+        assertThat(listed.allows(333L)).isFalse();
+        assertThat(listed.allows(-111L)).isFalse();
+        assertThat(empty.allows(111L)).isFalse();
+    }
+
+    /**
+     * Everything Spring Boot's failure report could print: each cause's toString plus, for a bind failure, the bound
+     * property (name, value and origin) that {@code BindFailureAnalyzer} renders as "Property / Value / Origin".
+     */
+    private static String failureReport(Throwable t) {
+        StringBuilder report = new StringBuilder();
+        for (Throwable c = t; c != null; c = c.getCause() == c ? null : c.getCause()) {
+            report.append(c).append('\n');
+            if (c instanceof org.springframework.boot.context.properties.bind.BindException bind
+                    && bind.getProperty() != null) {
+                report.append(bind.getProperty()).append('\n');
+            }
+        }
+        return report.toString();
     }
 
     private static String rootMessage(Throwable t) {

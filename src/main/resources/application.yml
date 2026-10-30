@@ -485,9 +485,10 @@ app:
   telegram:
     # Phase 404 — opt-in Telegram reminder channel (TelegramConfig). OFF by default: NoOpTelegramMessenger
     # throws, so every message falls back to SMS. Write the flag as true/false (no relaxed binding).
-    # mode: live (Bot API, prod only — TelegramEnvGuard refuses it on staging) | capture (Mailpit).
-    # enabled=true + live fails boot unless token, username and webhook secret are all set (TelegramProperties).
-    # The token is a secret and is never logged.
+    # mode: live (Bot API) | capture (Mailpit). Staging runs its OWN bot (phase 432): EnvironmentFingerprintGuard
+    # refuses the prod bot's token/username there, and TelegramEnvGuard requires a non-empty tester allow-list when
+    # enabled + live. enabled=true + live fails boot unless token, username and webhook secret are all set
+    # (TelegramProperties). The token is a secret and is never logged.
     enabled: ${APP_TELEGRAM_ENABLED:false}
     mode: live
     bot-token: ${TELEGRAM_BOT_TOKEN:}
@@ -495,6 +496,9 @@ app:
     webhook-secret: ${TELEGRAM_WEBHOOK_SECRET:}
     api-base-url: https://api.telegram.org
     link-token-ttl: 30m
+    # Phase 432 D3 — staging-only tester allow-list: comma-separated positive chat ids (private chat id = user id).
+    # Blank entries, negatives and non-numbers fail boot. Read on staging only; prod ignores it.
+    staging-allowed-chat-ids: ${TELEGRAM_STAGING_ALLOWED_CHAT_IDS:}
   json:
     # Global Jackson StreamReadConstraints (see JsonConfig / JsonConstraintsProperties).
     # max-string-length caps a single JSON string token at the PARSE phase so a multi-MB

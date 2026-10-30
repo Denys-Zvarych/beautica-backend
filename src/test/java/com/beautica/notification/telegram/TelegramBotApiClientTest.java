@@ -617,7 +617,7 @@ class TelegramBotApiClientTest {
 
     private TelegramBotApiClient newClient(Duration readTimeout, Semaphore slots) {
         TelegramProperties properties = new TelegramProperties(false, TelegramMode.LIVE, TOKEN, "beautica_app_bot",
-                "a".repeat(64), wireMock.baseUrl(), Duration.ofMinutes(30));
+                "a".repeat(64), wireMock.baseUrl(), Duration.ofMinutes(30), java.util.List.of());
         return new TelegramBotApiClient(properties, clock, readTimeout, slots);
     }
 

@@ -1234,21 +1234,6 @@ class EnvironmentFingerprintGuardTest {
     }
 
     @Test
-    @DisplayName("staging with TELEGRAM_BOT_TOKEN set — fails naming the variable, message carries no value")
-    void should_failNamingTheVariable_when_stagingHasTelegramToken() {
-        String token = "123456789:" + "x".repeat(35);
-        MockEnvironment raw = stagingEnv().withProperty("TELEGRAM_BOT_TOKEN", token);
-        MockEnvironment bound = stagingEnv().withProperty("app.telegram.bot-token", token);
-
-        for (MockEnvironment env : new MockEnvironment[]{raw, bound}) {
-            assertThatThrownBy(() -> run(env, DeployEnvironment.STAGING, SmsMode.CAPTURE))
-                    .isInstanceOf(IllegalStateException.class)
-                    .hasMessageContaining("staging-telegram-token-blank")
-                    .message().doesNotContain(token);
-        }
-    }
-
-    @Test
     @DisplayName("prod with Telegram enabled and an unknown mode value — fails prod-telegram-mode (unconvertible is not live)")
     void should_failBoot_when_prodTelegramModeUnconvertible() {
         MockEnvironment env = prodEnv().withProperty("app.telegram.enabled", "true")
@@ -1270,18 +1255,197 @@ class EnvironmentFingerprintGuardTest {
     }
 
     @Test
-    @DisplayName("staging with a whitespace-only TELEGRAM_BOT_TOKEN — passes (blank, as Railway renders an emptied var)")
-    void should_pass_when_stagingTelegramTokenWhitespace() {
-        MockEnvironment env = stagingEnv().withProperty("TELEGRAM_BOT_TOKEN", "   ");
-
-        assertThatCode(() -> run(env, DeployEnvironment.STAGING, SmsMode.CAPTURE)).doesNotThrowAnyException();
-    }
-
-    @Test
     @DisplayName("prod with TELEGRAM_BOT_TOKEN set — passes (the staging-only token rule does not fire in prod)")
     void should_pass_when_prodHasTelegramToken() {
         MockEnvironment env = prodEnv().withProperty("TELEGRAM_BOT_TOKEN", "123456789:" + "x".repeat(35));
 
         assertThatCode(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS)).doesNotThrowAnyException();
+    }
+
+    // ── Phase 432: staging runs its own bot; the prod bot is refused by identity ──
+
+    /** Fake staging-bot fixtures, built (not literal) so gitleaks generic-api-key does not fire. */
+    private static final String STAGING_BOT_TOKEN = "7000000001:" + "s".repeat(35);
+    private static final String PROD_ID_TOKEN = EnvironmentFingerprintGuard.PROD_TELEGRAM_BOT_ID + ":" + "p".repeat(35);
+
+    @Test
+    @DisplayName("staging with a prod-id token (env var or bound property) — fails staging-telegram-not-prod-bot, no token or id echoed")
+    void should_failNotProdBot_when_stagingHasProdIdToken() {
+        MockEnvironment raw = stagingEnv().withProperty("TELEGRAM_BOT_TOKEN", PROD_ID_TOKEN);
+        MockEnvironment bound = stagingEnv().withProperty("app.telegram.bot-token", " " + PROD_ID_TOKEN + " ");
+
+        for (MockEnvironment env : new MockEnvironment[]{raw, bound}) {
+            assertThatThrownBy(() -> run(env, DeployEnvironment.STAGING, SmsMode.CAPTURE))
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("staging-telegram-not-prod-bot")
+                    .message().doesNotContain(PROD_ID_TOKEN).doesNotContain("p".repeat(35))
+                    .doesNotContain(Long.toString(EnvironmentFingerprintGuard.PROD_TELEGRAM_BOT_ID));
+        }
+    }
+
+    @Test
+    @DisplayName("staging with the prod bot username in any case or with '@' — fails staging-telegram-not-prod-bot, username not echoed")
+    void should_failNotProdBot_when_stagingHasProdUsername() {
+        for (String username : new String[]{"beautica_app_bot", "@Beautica_App_Bot", "BEAUTICA_APP_BOT"}) {
+            MockEnvironment raw = stagingEnv().withProperty("TELEGRAM_BOT_TOKEN", STAGING_BOT_TOKEN)
+                    .withProperty("TELEGRAM_BOT_USERNAME", username);
+            MockEnvironment bound = stagingEnv().withProperty("app.telegram.bot-username", username);
+
+            for (MockEnvironment env : new MockEnvironment[]{raw, bound}) {
+                assertThatThrownBy(() -> run(env, DeployEnvironment.STAGING, SmsMode.CAPTURE))
+                        .as("username=%s", username)
+                        .isInstanceOf(IllegalStateException.class)
+                        .hasMessageContaining("staging-telegram-not-prod-bot")
+                        .message().doesNotContainIgnoringCase("beautica_app_bot");
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("staging with the prod bot and the flag off — still fails (the rule runs whatever the flag)")
+    void should_failNotProdBot_when_stagingProdBotFlagOff() {
+        MockEnvironment env = stagingEnv().withProperty("app.telegram.enabled", "false")
+                .withProperty("TELEGRAM_BOT_TOKEN", PROD_ID_TOKEN);
+
+        assertThatThrownBy(() -> run(env, DeployEnvironment.STAGING, SmsMode.CAPTURE))
+                .hasMessageContaining("staging-telegram-not-prod-bot");
+    }
+
+    @Test
+    @DisplayName("staging with a non-prod token and username — passes with the flag on or off")
+    void should_pass_when_stagingHasStagingBot() {
+        for (String flag : new String[]{"true", "false"}) {
+            MockEnvironment env = stagingEnv().withProperty("app.telegram.enabled", flag)
+                    .withProperty("TELEGRAM_BOT_TOKEN", STAGING_BOT_TOKEN)
+                    .withProperty("TELEGRAM_BOT_USERNAME", "bt_qa_x7k2_bot")
+                    .withProperty("app.telegram.bot-token", STAGING_BOT_TOKEN)
+                    .withProperty("app.telegram.bot-username", "bt_qa_x7k2_bot");
+
+            assertThatCode(() -> run(env, DeployEnvironment.STAGING, SmsMode.CAPTURE))
+                    .as("enabled=%s", flag).doesNotThrowAnyException();
+        }
+    }
+
+    @Test
+    @DisplayName("staging with a token whose id only contains the prod id — passes (the id is compared exactly)")
+    void should_pass_when_stagingTokenIdMerelyContainsProdId() {
+        MockEnvironment env = stagingEnv()
+                .withProperty("TELEGRAM_BOT_TOKEN", "1" + EnvironmentFingerprintGuard.PROD_TELEGRAM_BOT_ID + ":" + "s".repeat(35));
+
+        assertThatCode(() -> run(env, DeployEnvironment.STAGING, SmsMode.CAPTURE)).doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("staging with a malformed token (abc, 123, :x) — fails staging-telegram-token-format, token not echoed")
+    void should_failTokenFormat_when_stagingTokenMalformed() {
+        for (String token : new String[]{"abc", "123", ":x"}) {
+            MockEnvironment env = stagingEnv().withProperty("TELEGRAM_BOT_TOKEN", token);
+
+            assertThatThrownBy(() -> run(env, DeployEnvironment.STAGING, SmsMode.CAPTURE))
+                    .as("token=%s", token)
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("staging-telegram-token-format")
+                    .message().doesNotContain(token);
+        }
+    }
+
+    @Test
+    @DisplayName("staging with a blank or whitespace-only token — passes (as Railway renders an emptied var)")
+    void should_pass_when_stagingTelegramTokenBlankOrWhitespace() {
+        for (String token : new String[]{"", "   "}) {
+            MockEnvironment env = stagingEnv().withProperty("TELEGRAM_BOT_TOKEN", token)
+                    .withProperty("app.telegram.bot-token", token);
+
+            assertThatCode(() -> run(env, DeployEnvironment.STAGING, SmsMode.CAPTURE)).doesNotThrowAnyException();
+        }
+    }
+
+    @Test
+    @DisplayName("prod with the prod bot (token id and username) — passes (the staging-only rules do not fire in prod)")
+    void should_pass_when_prodHasProdBot() {
+        MockEnvironment env = prodEnv().withProperty("TELEGRAM_BOT_TOKEN", PROD_ID_TOKEN)
+                .withProperty("TELEGRAM_BOT_USERNAME", "beautica_app_bot")
+                .withProperty("app.telegram.bot-username", "beautica_app_bot");
+
+        assertThatCode(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS)).doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("prod with a malformed token — passes (staging-telegram-token-format is staging-only; TelegramProperties owns prod)")
+    void should_pass_when_prodHasMalformedTokenFlagOff() {
+        MockEnvironment env = prodEnv().withProperty("TELEGRAM_BOT_TOKEN", "abc");
+
+        assertThatCode(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS)).doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("PROD_TELEGRAM_BOT_ID / PROD_TELEGRAM_BOT_USERNAME are pinned to the owner-supplied values (432 D1)")
+    void should_pinProdBotIdentity() {
+        assertThat(EnvironmentFingerprintGuard.PROD_TELEGRAM_BOT_ID).isEqualTo(9132001358L);
+        assertThat(EnvironmentFingerprintGuard.PROD_TELEGRAM_BOT_USERNAME).isEqualTo("beautica_app_bot");
+    }
+
+    // ── Phase 432 audit-fix cycle 2: prod-telegram-is-prod-bot ──
+
+    private static MockEnvironment prodTelegramLive(String token, String username) {
+        return prodEnv().withProperty("app.telegram.enabled", "true").withProperty("app.telegram.mode", "live")
+                .withProperty("TELEGRAM_BOT_TOKEN", token).withProperty("app.telegram.bot-token", token)
+                .withProperty("TELEGRAM_BOT_USERNAME", username).withProperty("app.telegram.bot-username", username);
+    }
+
+    @Test
+    @DisplayName("prod, flag on + live, staging-bot or malformed token (env var or bound property) — fails prod-telegram-is-prod-bot, nothing echoed")
+    void should_reject_when_prodUsesNonProdBot() {
+        MockEnvironment both = prodTelegramLive(STAGING_BOT_TOKEN, "beautica_app_bot");
+        MockEnvironment rawOnly = prodTelegramLive(PROD_ID_TOKEN, "beautica_app_bot")
+                .withProperty("TELEGRAM_BOT_TOKEN", STAGING_BOT_TOKEN);
+        MockEnvironment boundOnly = prodTelegramLive(PROD_ID_TOKEN, "beautica_app_bot")
+                .withProperty("app.telegram.bot-token", STAGING_BOT_TOKEN);
+        MockEnvironment malformed = prodTelegramLive("abc", "beautica_app_bot");
+
+        for (MockEnvironment env : new MockEnvironment[]{both, rawOnly, boundOnly, malformed}) {
+            assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("prod-telegram-is-prod-bot")
+                    .message().doesNotContain(STAGING_BOT_TOKEN).doesNotContain("7000000001")
+                    .doesNotContain("s".repeat(35)).doesNotContain("beautica_app_bot");
+        }
+    }
+
+    @Test
+    @DisplayName("prod, flag on + live, prod-id token but another username (env var or bound property) — fails prod-telegram-is-prod-bot, username not echoed")
+    void should_reject_when_prodUsernameMismatch() {
+        MockEnvironment both = prodTelegramLive(PROD_ID_TOKEN, "bt_qa_x7k2_bot");
+        MockEnvironment rawOnly = prodTelegramLive(PROD_ID_TOKEN, "beautica_app_bot")
+                .withProperty("TELEGRAM_BOT_USERNAME", "bt_qa_x7k2_bot");
+        MockEnvironment boundOnly = prodTelegramLive(PROD_ID_TOKEN, "beautica_app_bot")
+                .withProperty("app.telegram.bot-username", "bt_qa_x7k2_bot");
+
+        for (MockEnvironment env : new MockEnvironment[]{both, rawOnly, boundOnly}) {
+            assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                    .hasMessageContaining("prod-telegram-is-prod-bot")
+                    .message().doesNotContain("bt_qa_x7k2_bot").doesNotContain(PROD_ID_TOKEN)
+                    .doesNotContain(Long.toString(EnvironmentFingerprintGuard.PROD_TELEGRAM_BOT_ID));
+        }
+    }
+
+    @Test
+    @DisplayName("prod, flag on + live, prod bot (username in any case / with '@') — passes")
+    void should_boot_when_prodBotAndFlagOn() {
+        for (String username : new String[]{"beautica_app_bot", "@Beautica_App_Bot", "BEAUTICA_APP_BOT"}) {
+            assertThatCode(() -> run(prodTelegramLive(PROD_ID_TOKEN, username), DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                    .as("username=%s", username).doesNotThrowAnyException();
+        }
+    }
+
+    @Test
+    @DisplayName("prod, flag off (or capture-free dark deploy) — passes with any token and username, including the staging bot's")
+    void should_boot_when_prodFlagOffAnyToken() {
+        for (String token : new String[]{STAGING_BOT_TOKEN, PROD_ID_TOKEN, "abc"}) {
+            MockEnvironment env = prodTelegramLive(token, "bt_qa_x7k2_bot").withProperty("app.telegram.enabled", "false");
+
+            assertThatCode(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS)).as("token=%s", token)
+                    .doesNotThrowAnyException();
+        }
     }
 }

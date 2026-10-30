@@ -271,4 +271,75 @@ class ProdRequiredEnvBootStartupTest {
 
         assertThat(message).contains("rule prod-telegram-api-base-url").doesNotContain("tg-zq77");
     }
+
+    // ── Phase 432: prod talks to the prod bot only (prod-telegram-is-prod-bot), proven in a real prod boot ──
+
+    /** Owner-supplied prod bot id (432 D1) with a fake, low-entropy secret part. */
+    private static final String PROD_BOT_TOKEN = EnvironmentFingerprintGuard.PROD_TELEGRAM_BOT_ID + ":" + "p".repeat(35);
+    private static final String STAGING_BOT_TOKEN = "7000000001:" + "s".repeat(35);
+    private static final String WEBHOOK_SECRET = "prod_boot_webhook_secret_" + "w".repeat(39);
+
+    private static Map<String, String> prodTelegramVars(String token, String username, boolean enabled) {
+        Map<String, String> vars = passingProdVars();
+        vars.put("TELEGRAM_BOT_TOKEN", token);
+        vars.put("TELEGRAM_BOT_USERNAME", username);
+        vars.put("TELEGRAM_WEBHOOK_SECRET", WEBHOOK_SECRET);
+        vars.put("APP_TELEGRAM_ENABLED", Boolean.toString(enabled));
+        return vars;
+    }
+
+    /** {@link #prodApp} with the real Telegram wiring instead of the empty config, so bean selection is observable. */
+    private static SpringApplicationBuilder prodTelegramApp(Map<String, String> vars) {
+        return prodApp(vars).sources(EnvironmentFingerprintGuardBootTest.TelegramWiring.class);
+    }
+
+    @Test
+    @DisplayName("Phase 432 — prod with the PROD bot token + username and the flag off: boots dark (NoOp, allow-all list)")
+    void should_bootDark_when_prodHasProdBotAndFlagOff() {
+        try (ConfigurableApplicationContext ctx =
+                     prodTelegramApp(prodTelegramVars(PROD_BOT_TOKEN, "beautica_app_bot", false)).run()) {
+            assertThat(ctx.getBean(com.beautica.notification.telegram.TelegramMessenger.class))
+                    .isInstanceOf(com.beautica.notification.telegram.NoOpTelegramMessenger.class);
+            assertThat(ctx.getBean(com.beautica.notification.telegram.TelegramChatAllowList.class))
+                    .isInstanceOf(com.beautica.notification.telegram.AllowAllTelegramChatAllowList.class);
+            assertThat(ctx.getBeansOfType(TelegramEnvGuard.class)).as("no staging guard on prod").isEmpty();
+        }
+    }
+
+    @Test
+    @DisplayName("Phase 432 — prod with the PROD bot, flag on + live: boots with the bare (unwrapped) TelegramBotApiClient")
+    void should_bootBareLiveClient_when_prodHasProdBotAndFlagOn() {
+        try (ConfigurableApplicationContext ctx =
+                     prodTelegramApp(prodTelegramVars(PROD_BOT_TOKEN, "beautica_app_bot", true)).run()) {
+            assertThat(ctx.getBean(com.beautica.notification.telegram.TelegramMessenger.class))
+                    .isExactlyInstanceOf(com.beautica.notification.telegram.TelegramBotApiClient.class);
+        }
+    }
+
+    @Test
+    @DisplayName("Phase 432 prod-telegram-is-prod-bot — prod boot with the flag on and the STAGING bot token aborts, nothing echoed")
+    void should_abortBoot_when_prodEnabledWithStagingBotToken() {
+        String message = guardMessageOfFailedBoot(prodTelegramVars(STAGING_BOT_TOKEN, "beautica_app_bot", true));
+
+        assertThat(message).contains("rule prod-telegram-is-prod-bot")
+                .doesNotContain(STAGING_BOT_TOKEN).doesNotContain("s".repeat(35)).doesNotContain("7000000001");
+    }
+
+    @Test
+    @DisplayName("Phase 432 prod-telegram-is-prod-bot — prod boot with the flag on, prod token but the staging username aborts, username not echoed")
+    void should_abortBoot_when_prodEnabledWithStagingBotUsername() {
+        String message = guardMessageOfFailedBoot(prodTelegramVars(PROD_BOT_TOKEN, "bt_qa_x7k2_bot", true));
+
+        assertThat(message).contains("rule prod-telegram-is-prod-bot").doesNotContain("bt_qa_x7k2_bot");
+    }
+
+    @Test
+    @DisplayName("Phase 432 — prod with the STAGING bot token but the flag off: boots dark (the rule only gates a live channel)")
+    void should_bootDark_when_prodHasStagingBotTokenAndFlagOff() {
+        try (ConfigurableApplicationContext ctx =
+                     prodTelegramApp(prodTelegramVars(STAGING_BOT_TOKEN, "bt_qa_x7k2_bot", false)).run()) {
+            assertThat(ctx.getBean(com.beautica.notification.telegram.TelegramMessenger.class))
+                    .isInstanceOf(com.beautica.notification.telegram.NoOpTelegramMessenger.class);
+        }
+    }
 }

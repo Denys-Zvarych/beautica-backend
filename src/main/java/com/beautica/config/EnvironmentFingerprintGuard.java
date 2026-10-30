@@ -48,6 +48,12 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
     static final String RAILWAY_ENV_VAR = "RAILWAY_ENVIRONMENT_NAME";
     static final String STAGING_BUCKET = "beautica-media-staging";
     static final String PROD_BUCKET = "beautica-media-prod";
+    /**
+     * Phase 432 D1: the prod Telegram bot ({@code @beautica_app_bot}), pinned in code so an env edit cannot lift the
+     * staging refusal. Not a secret — {@code getMe} exposes it; a token is {@code <botId>:<secret>}.
+     */
+    static final long PROD_TELEGRAM_BOT_ID = 9132001358L;
+    static final String PROD_TELEGRAM_BOT_USERNAME = "beautica_app_bot";
     static final String DEV_INTERNAL_API_KEY = "changeme-dev-only";
     static final int MIN_INTERNAL_API_KEY_LENGTH = 32;
     static final String SENTRY_EU_HOST_SUFFIX = ".de.sentry.io";
@@ -416,6 +422,7 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
             violations.add("rule prod-sms-mode: beautica.sms.mode must be turbosms in prod");
         }
         checkProdTelegram(env, violations);
+        checkProdTelegramBot(env, violations);
         String support = supportEmail(env);
         if (!isEmailShaped(support) || isPlaceholderDomain(support.substring(support.lastIndexOf('@') + 1))) {
             violations.add("rule prod-support-email: app.support.email must be a real address (local@domain.tld, not a reserved test domain) in prod");
@@ -448,6 +455,7 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
 
     static final String TELEGRAM_API_ORIGIN = "https://api.telegram.org";
     private static final String TELEGRAM_BOT_TOKEN_PROPERTY = "app.telegram.bot-token";
+    private static final String TELEGRAM_BOT_USERNAME_PROPERTY = "app.telegram.bot-username";
 
     /**
      * Phase 404 audit. {@code prod-telegram-mode}: with the channel on, prod must deliver for real — capture would
@@ -463,6 +471,37 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
         if (baseUrl != null && !TELEGRAM_API_ORIGIN.equals(baseUrl)) {
             violations.add("rule prod-telegram-api-base-url: app.telegram.api-base-url must be exactly "
                     + TELEGRAM_API_ORIGIN + " in prod");
+        }
+    }
+
+    /**
+     * Phase 432 audit-fix cycle 2. {@code prod-telegram-is-prod-bot}: with the channel on in live mode, prod must talk
+     * to the prod bot only — a copied staging token would deliver real customers' reminders through the public test
+     * bot with the allow-all list. Every non-blank token (raw env var and bound property, checked separately) must
+     * carry {@link #PROD_TELEGRAM_BOT_ID}, a malformed one counts as not the prod bot (fail closed), and every
+     * non-blank username must be {@link #PROD_TELEGRAM_BOT_USERNAME} (case-insensitive, {@code @} stripped). A blank
+     * value is left to {@code TelegramProperties}, which fails the same cell at bind time. Flag off or capture mode:
+     * not checked, so prod boots dark with whatever token is set. Names the rule only — never token, id or username.
+     */
+    private static void checkProdTelegramBot(Environment env, List<String> violations) {
+        if (!telegramEnabled(env) || telegramModeOf(env) != TelegramMode.LIVE) {
+            return;
+        }
+        boolean otherBot = false;
+        for (String raw : new String[]{readOrNull(env, "TELEGRAM_BOT_TOKEN"), boundOrNull(env, TELEGRAM_BOT_TOKEN_PROPERTY)}) {
+            if (!isBlank(raw)) {
+                String token = raw.strip();
+                otherBot |= !TelegramProperties.BOT_TOKEN.matcher(token).matches()
+                        || !isProdBotId(token.substring(0, token.indexOf(':')));
+            }
+        }
+        for (String raw : new String[]{readOrNull(env, "TELEGRAM_BOT_USERNAME"), boundOrNull(env, TELEGRAM_BOT_USERNAME_PROPERTY)}) {
+            otherBot |= !isBlank(raw) && !isProdBotUsername(raw);
+        }
+        if (otherBot) {
+            violations.add("rule prod-telegram-is-prod-bot: TELEGRAM_BOT_TOKEN / app.telegram.bot-token and "
+                    + "TELEGRAM_BOT_USERNAME / app.telegram.bot-username must be the prod bot's in prod when "
+                    + "app.telegram.enabled=true and mode=live");
         }
     }
 
@@ -652,10 +691,7 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
         if (!isBlank(env.getProperty("TURBOSMS_TOKEN")) || !isBlank(env.getProperty("app.sms.turbosms.token"))) {
             violations.add("rule staging-turbosms-token-blank: TURBOSMS_TOKEN must be blank in staging");
         }
-        // Phase 404 audit: the only bot is prod's (D8) — its token must never reach a staging deploy.
-        if (!isBlank(readOrNull(env, "TELEGRAM_BOT_TOKEN")) || !isBlank(boundOrNull(env, TELEGRAM_BOT_TOKEN_PROPERTY))) {
-            violations.add("rule staging-telegram-token-blank: TELEGRAM_BOT_TOKEN must be blank in staging");
-        }
+        checkStagingTelegram(env, violations);
         if (!isBlank(env.getProperty("BREVO_SMTP_KEY")) || !isBlank(env.getProperty("spring.mail.password"))) {
             violations.add("rule staging-brevo-key-blank: BREVO_SMTP_KEY must be blank in staging");
         }
@@ -675,6 +711,57 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
             violations.add("rule staging-turnstile-secret-not-test-key: TURNSTILE_SECRET_KEY must be a Cloudflare "
                     + "test secret (or unset, for the default) in staging");
         }
+    }
+
+    /**
+     * Phase 432 D1/D2 (replaces 404's {@code staging-telegram-token-blank}): staging runs its own bot, so a token is
+     * allowed, but never the prod bot's. Both rules run whatever {@code app.telegram.enabled} is. The raw env var and
+     * the bound property are checked separately, so neither spelling can hide the other. Messages name the rule and
+     * the properties only — never the token, the bot id or the username.
+     */
+    private static void checkStagingTelegram(Environment env, List<String> violations) {
+        boolean prodBot = false;
+        boolean malformed = false;
+        for (String raw : new String[]{readOrNull(env, "TELEGRAM_BOT_TOKEN"), boundOrNull(env, TELEGRAM_BOT_TOKEN_PROPERTY)}) {
+            if (isBlank(raw)) {
+                continue;
+            }
+            String token = raw.strip();
+            if (!TelegramProperties.BOT_TOKEN.matcher(token).matches()) {
+                malformed = true;
+            } else if (isProdBotId(token.substring(0, token.indexOf(':')))) {
+                prodBot = true;
+            }
+        }
+        for (String raw : new String[]{readOrNull(env, "TELEGRAM_BOT_USERNAME"), boundOrNull(env, TELEGRAM_BOT_USERNAME_PROPERTY)}) {
+            prodBot |= isProdBotUsername(raw);
+        }
+        if (prodBot) {
+            violations.add("rule staging-telegram-not-prod-bot: TELEGRAM_BOT_TOKEN / app.telegram.bot-token and "
+                    + "TELEGRAM_BOT_USERNAME / app.telegram.bot-username must not be the prod bot's in staging");
+        }
+        if (malformed) {
+            violations.add("rule staging-telegram-token-format: TELEGRAM_BOT_TOKEN / app.telegram.bot-token must be "
+                    + "blank or <digits>:<base64url> in staging");
+        }
+    }
+
+    /** Compared as a decimal string, so an id too long for a {@code long} cannot throw. Leading zeros are ignored. */
+    private static boolean isProdBotId(String botId) {
+        String id = botId.replaceFirst("^0+(?=.)", "");
+        return id.equals(Long.toString(PROD_TELEGRAM_BOT_ID));
+    }
+
+    /** Telegram usernames are case-insensitive; a leading {@code @} is stripped. */
+    private static boolean isProdBotUsername(String raw) {
+        if (isBlank(raw)) {
+            return false;
+        }
+        String username = raw.strip();
+        if (username.startsWith("@")) {
+            username = username.substring(1).strip();
+        }
+        return username.equalsIgnoreCase(PROD_TELEGRAM_BOT_USERNAME);
     }
 
     private static String supportEmail(Environment env) {
