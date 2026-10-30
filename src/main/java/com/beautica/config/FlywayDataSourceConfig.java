@@ -2,6 +2,7 @@ package com.beautica.config;
 
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.autoconfigure.flyway.FlywayDataSource;
 import org.springframework.boot.autoconfigure.jdbc.DataSourceProperties;
 import org.springframework.boot.context.properties.ConfigurationProperties;
@@ -32,6 +33,14 @@ import javax.sql.DataSource;
  * {@code local} (Docker), and any other non-test profile resolve the correct URL,
  * username, and password automatically — nothing is hardcoded.
  *
+ * <p><strong>Both beans are {@code defaultCandidate = false}.</strong> {@link FlywayDataSource} is only
+ * a qualifier: without this flag the bean is a by-type autowire candidate, so
+ * {@code DataSourceAutoConfiguration}'s {@code @ConditionalOnMissingBean(DataSource.class)} backs off
+ * and JPA/JdbcTemplate run on this 2-connection pool (the bug fixed here). Non-default candidates are
+ * invisible to {@code @ConditionalOnMissingBean} and to unqualified injection, so Boot builds the
+ * application pool from {@code spring.datasource.hikari.*} while Flyway still resolves this bean via
+ * its {@code @FlywayDataSource} qualifier.
+ *
  * <p><strong>Test profile is deliberately excluded</strong> ({@code @Profile("!test")}).
  * Integration tests supply the datasource dynamically via Testcontainers
  * {@code @DynamicPropertySource} at context-load time. Under {@code test} we let
@@ -56,15 +65,16 @@ public class FlywayDataSourceConfig {
      * URL/username/password as the primary {@link DataSource}, across every
      * non-test profile, without hardcoding.
      */
-    @Bean
+    @Bean(defaultCandidate = false)
     @ConfigurationProperties("spring.datasource")
     public DataSourceProperties flywayDataSourceProperties() {
         return new DataSourceProperties();
     }
 
-    @Bean
+    @Bean(defaultCandidate = false)
     @FlywayDataSource
-    public DataSource flywayDataSource(DataSourceProperties flywayDataSourceProperties) {
+    public DataSource flywayDataSource(
+            @Qualifier("flywayDataSourceProperties") DataSourceProperties flywayDataSourceProperties) {
         HikariConfig cfg = new HikariConfig();
         cfg.setJdbcUrl(flywayDataSourceProperties.determineUrl());
         cfg.setUsername(flywayDataSourceProperties.determineUsername());

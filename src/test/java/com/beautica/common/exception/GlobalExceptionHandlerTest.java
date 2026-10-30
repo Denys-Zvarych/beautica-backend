@@ -1318,6 +1318,25 @@ class GlobalExceptionHandlerTest {
     }
 
     @Test
+    @DisplayName("handleQueryTimeout — statement_timeout (57014) is a 503 with the generic 503 body, no SQL echoed")
+    void should_return503WithGenericBody_when_queryTimeoutException() throws Exception {
+        var ex = new org.springframework.dao.QueryTimeoutException(
+                "JDBC exception executing SQL [SELECT s.* FROM salons s FOR UPDATE] [ERROR: canceling statement "
+                        + "due to statement timeout]",
+                new java.sql.SQLException("canceling statement due to statement timeout", "57014"));
+
+        ResponseEntity<ApiResponse<Void>> response = handler.handleQueryTimeout(ex);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
+        assertThat(new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(response.getBody()))
+                .as("same wire shape as every other 503 (ApiResponse.error), generic text, nothing from the cause")
+                .isEqualTo("{\"success\":false,\"data\":null,\"message\":\"Service temporarily unavailable\"}");
+        assertThat(listAppender.list)
+                .extracting(ILoggingEvent::getFormattedMessage)
+                .noneMatch(m -> m.contains("SELECT") || m.contains("57014") || m.contains("salons"));
+    }
+
+    @Test
     @DisplayName("F6a scope: the GLOBAL 55P03 mapping is unchanged — a lock failure outside the portfolio path is "
             + "still 409")
     void should_keepGlobalLockTimeoutAt409_when_notPortfolioPath() {
