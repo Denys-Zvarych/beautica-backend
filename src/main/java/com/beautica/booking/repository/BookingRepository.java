@@ -517,6 +517,58 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             """, nativeQuery = true)
     long countStaffWalkInVisitsForPhoneSince(@Param("phone") String phone, @Param("since") Instant since);
 
+    /**
+     * Phase 431 — one phone's SMS activity since {@code since}, both halves in ONE statement: the walk-in
+     * VISITS {@link #countStaffWalkInVisitsForPhoneSince} counts (same predicate, same V138 index) and the
+     * guest reschedule SMS sent to that phone. Used ONLY by {@code GuestRescheduleSmsBudget#tryReserve},
+     * which spends the shared {@link PhoneSmsBudgetUsage#total()}. The walk-in create keeps calling
+     * {@link #countStaffWalkInVisitsForPhoneSince} alone (pre-431 plan and verdict, user rule 2026-10-30:
+     * one provider's reschedule SMS must never block another's walk-in), so it never scans the send log.
+     *
+     * <p>The send log stores no phone: its destination is the booking's own {@code guest_phone}, reached
+     * by PK join from the {@code sent_at}-indexed window. Callers hold {@link #acquireWalkInPhoneLock}
+     * first, so neither half can be read stale. Aliases are quoted so the projection getters match.
+     */
+    @Query(value = """
+            SELECT (SELECT count(DISTINCT coalesce(b.appointment_id, b.id))
+                      FROM bookings b
+                     WHERE b.guest_phone = :phone
+                       AND b.booking_source = 'STAFF'
+                       AND b.created_at > :since) AS "walkInVisits",
+                   (SELECT count(*)
+                      FROM guest_reschedule_sms_sends s
+                      JOIN bookings rb ON rb.id = s.booking_id
+                     WHERE rb.guest_phone = :phone
+                       AND s.sent_at > :since) AS "rescheduleSends"
+            """, nativeQuery = true)
+    PhoneSmsBudgetUsage countPhoneSmsBudgetUsedSince(@Param("phone") String phone, @Param("since") Instant since);
+
+    /**
+     * Phase 431 — provider reschedules of one guest booking/visit ({@code scopeId}: the appointment id
+     * for a visit, else the booking id) since {@code since}. Callers hold the per-master advisory lock,
+     * which every reschedule of that booking/visit also takes, so count-then-insert cannot race.
+     * Index {@code idx_guest_provider_reschedules_scope_at}.
+     */
+    @Query(value = """
+            SELECT count(*) FROM guest_provider_reschedules
+             WHERE scope_id = :scopeId AND rescheduled_at > :since
+            """, nativeQuery = true)
+    long countGuestProviderReschedulesSince(@Param("scopeId") UUID scopeId, @Param("since") Instant since);
+
+    /** Phase 431 — records one provider reschedule of a guest booking/visit (see the count above). */
+    @Modifying
+    @Query(value = """
+            INSERT INTO guest_provider_reschedules (scope_id, booking_id, rescheduled_at)
+            VALUES (:scopeId, :bookingId, :at)
+            """, nativeQuery = true)
+    int recordGuestProviderReschedule(@Param("scopeId") UUID scopeId, @Param("bookingId") UUID bookingId,
+                                      @Param("at") Instant at);
+
+    /** Phase 431 — retention: rows past the 24 h window are dead weight. */
+    @Modifying
+    @Query(value = "DELETE FROM guest_provider_reschedules WHERE rescheduled_at < :cutoff", nativeQuery = true)
+    int deleteGuestProviderReschedulesBefore(@Param("cutoff") Instant cutoff);
+
     // ── Client booking-detail projection (Phase 19.3; sentinel removed Phase 26.7.1) ──
     /**
      * Hydrates a bounded set of booking ids into the enriched

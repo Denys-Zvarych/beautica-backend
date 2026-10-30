@@ -58,6 +58,8 @@ class NotificationServiceTest {
     private EmailNotificationService emailService;
     @Mock
     private BookingSmsDispatcher bookingSmsDispatcher;
+    @Mock
+    private com.beautica.booking.service.GuestRescheduleSmsBudget rescheduleSmsBudget;
 
     private NotificationService service;
 
@@ -71,7 +73,11 @@ class NotificationServiceTest {
         BookingLinksProperties links = new BookingLinksProperties();
         links.setShareEnabled(true);
         service = new NotificationService(
-                emailService, bookingSmsDispatcher, new GuestProviderCancellationSmsText(links), FRONTEND_BASE_URL);
+                emailService, bookingSmsDispatcher, new GuestProviderCancellationSmsText(links),
+                new GuestRescheduleSmsText(new com.beautica.config.BookingSmsProperties()), rescheduleSmsBudget,
+                FRONTEND_BASE_URL);
+        // Phase 431: the budget grants by default; the cap rows below override it.
+        lenient().when(rescheduleSmsBudget.tryReserve(any(), any(), any())).thenReturn(true);
     }
 
     // -------------------------------------------------------------------------
@@ -915,6 +921,254 @@ class NotificationServiceTest {
     }
 
     // -------------------------------------------------------------------------
+    // Phase 431 — guest reschedule SMS (notifyBookingRescheduledClient, null-client branch)
+    // -------------------------------------------------------------------------
+
+    private static final BookingSmsDispatcher.Kind RESCHEDULE_KIND = BookingSmsDispatcher.Kind.GUEST_PROVIDER_RESCHEDULE;
+    /** The NEW start every reschedule mock carries: Kyiv 10:00 on 01.08.2026. */
+    private static final String RESCHEDULE_0108 = "Beautica: Ваш запис перенесено на 01.08.2026 о 10:00.";
+
+    @Test
+    @DisplayName("Phase 431: a provider reschedule of a LINK guest booking queues ONE fixed-copy SMS with the new "
+            + "Kyiv date/time, no email")
+    void should_dispatchOneRescheduleSms_when_linkGuestBookingRescheduledByProvider() {
+        Booking booking = lenientRouteBooking(BookingSource.LINK, null, BookingStatus.CONFIRMED, GUEST_PHONE);
+
+        service.notifyBookingRescheduledClient(booking);
+
+        verify(bookingSmsDispatcher).dispatchOrThrow(RESCHEDULE_KIND, GUEST_PHONE, RESCHEDULE_0108);
+        verifyNoMoreInteractions(bookingSmsDispatcher);
+        verifyNoInteractions(emailService);
+    }
+
+    @Test
+    @DisplayName("Phase 431: a provider reschedule of a STAFF walk-in queues the same SMS (user decision 2026-10-30)")
+    void should_dispatchOneRescheduleSms_when_staffWalkInRescheduledByProvider() {
+        Booking booking = lenientRouteBooking(BookingSource.STAFF, null, BookingStatus.CONFIRMED, GUEST_PHONE);
+
+        service.notifyBookingRescheduledClient(booking);
+
+        verify(bookingSmsDispatcher).dispatchOrThrow(RESCHEDULE_KIND, GUEST_PHONE, RESCHEDULE_0108);
+        verifyNoInteractions(emailService);
+    }
+
+    @ParameterizedTest(name = "phone=[{0}]")
+    @org.junit.jupiter.params.provider.NullAndEmptySource
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"  "})
+    @DisplayName("Phase 431: an anonymised (guest_phone NULL) or phone-less guest gets no reschedule SMS and nothing throws")
+    void should_skipRescheduleSms_when_guestPhoneMissing(String phone) {
+        Booking booking = lenientRouteBooking(BookingSource.LINK, null, BookingStatus.CONFIRMED, phone);
+
+        service.notifyBookingRescheduledClient(booking);
+
+        verifyNoInteractions(bookingSmsDispatcher, emailService);
+    }
+
+    @Test
+    @DisplayName("Phase 431: a registered client's provider reschedule still sends the client email only — no SMS")
+    void should_sendClientEmailOnly_when_registeredClientRescheduledByProvider() {
+        Booking booking = buildBookingMock(UUID.randomUUID(), UUID.randomUUID(), BookingStatus.CONFIRMED);
+
+        service.notifyBookingRescheduledClient(booking);
+
+        verify(emailService).sendBookingRescheduledClientEmail("client@example.com", booking);
+        verifyNoInteractions(bookingSmsDispatcher);
+    }
+
+    @Test
+    @DisplayName("Phase 431: a saturated SMS pool propagates out of the guest reschedule so the drain re-queues the row")
+    void should_propagateBackpressure_when_guestRescheduleSmsPoolSaturated() {
+        Booking booking = lenientRouteBooking(BookingSource.LINK, null, BookingStatus.CONFIRMED, GUEST_PHONE);
+        doThrow(new com.beautica.notification.sms.SmsBackpressureException("saturated"))
+                .when(bookingSmsDispatcher).dispatchOrThrow(eq(RESCHEDULE_KIND), eq(GUEST_PHONE), anyString());
+
+        assertThatThrownBy(() -> service.notifyBookingRescheduledClient(booking))
+                .isInstanceOf(com.beautica.notification.sms.SmsBackpressureException.class);
+    }
+
+    @Test
+    @DisplayName("Phase 431: the CLIENT-initiated reschedule (provider-facing email) never sends an SMS, even for a "
+            + "LINK guest row with a phone")
+    void should_neverSendSms_when_clientInitiatedRescheduleNotifiesProvider() {
+        Booking booking = lenientRouteBooking(BookingSource.LINK, null, BookingStatus.CONFIRMED, GUEST_PHONE);
+        User masterUser = mock(User.class);
+        lenient().when(masterUser.getEmail()).thenReturn("master@example.com");
+        lenient().when(booking.getMaster()).thenReturn(Master.builder().user(masterUser).build());
+
+        service.notifyBookingRescheduled(booking);
+
+        verifyNoInteractions(bookingSmsDispatcher);
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 431 audit-fix cycle 1 — stale / burst / budget bounds on the guest reschedule SMS
+    // -------------------------------------------------------------------------
+
+    /** 2026-08-01T10:00+03:00 — the start every lenientRouteBooking carries. */
+    private static final long ROUTE_START_EPOCH = OffsetDateTime.parse("2026-08-01T10:00:00+03:00").toEpochSecond();
+
+    @ParameterizedTest
+    @EnumSource(value = BookingStatus.class, names = "CONFIRMED", mode = EnumSource.Mode.EXCLUDE)
+    @DisplayName("Phase 431: a booking cancelled / declined / closed before the drain gets no reschedule SMS")
+    void should_skipSms_when_bookingNoLongerConfirmed(BookingStatus status) {
+        Booking booking = lenientRouteBooking(BookingSource.LINK, null, status, GUEST_PHONE);
+
+        service.notifyBookingRescheduledClient(booking, UUID.randomUUID(), ROUTE_START_EPOCH);
+
+        verifyNoInteractions(bookingSmsDispatcher, rescheduleSmsBudget);
+    }
+
+    @Test
+    @DisplayName("Phase 431: a row superseded by a later move (payload start != current start) sends nothing")
+    void should_skipSms_when_rowSupersededByLaterMove() {
+        Booking booking = lenientRouteBooking(BookingSource.LINK, null, BookingStatus.CONFIRMED, GUEST_PHONE);
+
+        service.notifyBookingRescheduledClient(booking, UUID.randomUUID(), ROUTE_START_EPOCH - 3600);
+
+        verifyNoInteractions(bookingSmsDispatcher, rescheduleSmsBudget);
+    }
+
+    @Test
+    @DisplayName("Phase 431: the row for the CURRENT start reserves budget under its outbox entry id, then sends")
+    void should_reserveAndSend_when_rowMatchesCurrentStart() {
+        Booking booking = lenientRouteBooking(BookingSource.LINK, null, BookingStatus.CONFIRMED, GUEST_PHONE);
+        UUID entryId = UUID.randomUUID();
+
+        service.notifyBookingRescheduledClient(booking, entryId, ROUTE_START_EPOCH);
+
+        org.mockito.InOrder order = org.mockito.Mockito.inOrder(rescheduleSmsBudget, bookingSmsDispatcher);
+        order.verify(rescheduleSmsBudget).tryReserve(booking.getId(), GUEST_PHONE, entryId);
+        order.verify(bookingSmsDispatcher).dispatchOrThrow(RESCHEDULE_KIND, GUEST_PHONE, RESCHEDULE_0108);
+    }
+
+    @Test
+    @DisplayName("Phase 431: over the per-booking cap or the per-phone budget — no SMS, no exception, no email")
+    void should_skipSms_when_budgetRefuses() {
+        Booking booking = lenientRouteBooking(BookingSource.LINK, null, BookingStatus.CONFIRMED, GUEST_PHONE);
+        when(rescheduleSmsBudget.tryReserve(any(), any(), any())).thenReturn(false);
+
+        service.notifyBookingRescheduledClient(booking, UUID.randomUUID(), ROUTE_START_EPOCH);
+
+        verifyNoInteractions(bookingSmsDispatcher, emailService);
+    }
+
+    @Test
+    @DisplayName("Phase 431: a pre-431 row (no start) still sends while CONFIRMED")
+    void should_sendSms_when_legacyRowHasNoStart() {
+        Booking booking = lenientRouteBooking(BookingSource.LINK, null, BookingStatus.CONFIRMED, GUEST_PHONE);
+
+        service.notifyBookingRescheduledClient(booking, UUID.randomUUID(), null);
+
+        verify(bookingSmsDispatcher).dispatchOrThrow(RESCHEDULE_KIND, GUEST_PHONE, RESCHEDULE_0108);
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 431 — performing-master e-mail on a provider reschedule / decline
+    // -------------------------------------------------------------------------
+
+    @Test
+    @DisplayName("Phase 431: the salon owner moves the salon master's booking — the master gets the 'salon moved it' email")
+    void should_emailPerformingMaster_when_otherProviderReschedules() {
+        UUID masterUserId = UUID.randomUUID();
+        Booking booking = buildBookingMock(masterUserId, UUID.randomUUID(), BookingStatus.CONFIRMED);
+
+        service.notifyMasterOfProviderReschedule(booking, UUID.randomUUID());
+
+        verify(emailService).sendBookingRescheduledBySalonEmail("master@example.com", booking);
+        verifyNoMoreInteractions(emailService);
+        verifyNoInteractions(bookingSmsDispatcher);
+    }
+
+    @Test
+    @DisplayName("Phase 431: the performing master moved the booking themselves — no self-notification")
+    void should_notEmailMaster_when_masterIsTheRescheduleActor() {
+        UUID masterUserId = UUID.randomUUID();
+        Booking booking = buildBookingMock(masterUserId, UUID.randomUUID(), BookingStatus.CONFIRMED);
+
+        service.notifyMasterOfProviderReschedule(booking, masterUserId);
+
+        verifyNoInteractions(emailService, bookingSmsDispatcher);
+    }
+
+    @Test
+    @DisplayName("Phase 431: an unknown actor (pre-431 row) never emails the master")
+    void should_notEmailMaster_when_rescheduleActorUnknown() {
+        Booking booking = buildBookingMock(UUID.randomUUID(), UUID.randomUUID(), BookingStatus.CONFIRMED);
+
+        service.notifyMasterOfProviderReschedule(booking, null);
+
+        verifyNoInteractions(emailService, bookingSmsDispatcher);
+    }
+
+    @Test
+    @DisplayName("Phase 431: a detached master (no user) gets nothing and nothing throws")
+    void should_notEmailMaster_when_performingMasterDetached() {
+        Booking booking = buildBookingMock(UUID.randomUUID(), UUID.randomUUID(), BookingStatus.DECLINED);
+        when(booking.getMaster()).thenReturn(Master.builder().user(null).build());
+
+        service.notifyMasterOfProviderDecline(BookingVisit.single(booking), UUID.randomUUID());
+
+        verifyNoInteractions(emailService);
+    }
+
+    @Test
+    @DisplayName("Phase 431: an admin declines the salon master's single booking — the master gets ONE 'salon "
+            + "cancelled' email for that booking")
+    void should_emailPerformingMaster_when_otherProviderDeclines() {
+        Booking booking = buildBookingMock(UUID.randomUUID(), UUID.randomUUID(), BookingStatus.DECLINED);
+
+        service.notifyMasterOfProviderDecline(BookingVisit.single(booking), UUID.randomUUID());
+
+        verify(emailService).sendBookingDeclinedBySalonEmail("master@example.com", BookingVisit.single(booking));
+        verifyNoMoreInteractions(emailService);
+    }
+
+    @Test
+    @DisplayName("Phase 431: a whole-visit decline emails the master ONCE, naming the whole visit")
+    void should_emailMasterOncePerVisit_when_wholeVisitDeclined() {
+        Booking lead = buildBookingMock(UUID.randomUUID(), UUID.randomUUID(), BookingStatus.DECLINED);
+        BookingVisit visit = wholeVisitDecline(lead, 3);
+
+        service.notifyMasterOfProviderDecline(visit, UUID.randomUUID());
+
+        verify(emailService).sendBookingDeclinedBySalonEmail("master@example.com", visit);
+        verifyNoMoreInteractions(emailService);
+    }
+
+    @Test
+    @DisplayName("Phase 431: a per-service decline within a visit names only that service")
+    void should_emailMasterForDeclinedServiceOnly_when_oneVisitItemDeclined() {
+        Booking lead = buildBookingMock(UUID.randomUUID(), UUID.randomUUID(), BookingStatus.DECLINED);
+        BookingVisit perItem = visitOf(lead, 3);
+
+        service.notifyMasterOfProviderDecline(perItem, UUID.randomUUID());
+
+        verify(emailService).sendBookingDeclinedBySalonEmail("master@example.com", BookingVisit.single(lead));
+    }
+
+    @Test
+    @DisplayName("Phase 431: the performing master declined it themselves — no self-notification")
+    void should_notEmailMaster_when_masterIsTheDeclineActor() {
+        UUID masterUserId = UUID.randomUUID();
+        Booking booking = buildBookingMock(masterUserId, UUID.randomUUID(), BookingStatus.DECLINED);
+
+        service.notifyMasterOfProviderDecline(BookingVisit.single(booking), masterUserId);
+
+        verifyNoInteractions(emailService);
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = BookingStatus.class, names = "DECLINED", mode = EnumSource.Mode.EXCLUDE)
+    @DisplayName("Phase 431: only a DECLINED row emails the master — every other status is a no-op")
+    void should_notEmailMaster_when_statusIsNotDeclined(BookingStatus status) {
+        Booking booking = buildBookingMock(UUID.randomUUID(), UUID.randomUUID(), status);
+
+        service.notifyMasterOfProviderDecline(BookingVisit.single(booking), UUID.randomUUID());
+
+        verifyNoInteractions(emailService);
+    }
+
+    // -------------------------------------------------------------------------
     // routesToLinkGuestSms — parity with the three LINK-guest SMS branches (phase 390, perf LOW-1)
     // -------------------------------------------------------------------------
 
@@ -928,7 +1182,8 @@ class NotificationServiceTest {
         for (OutboxEventType type : List.of(
                 OutboxEventType.STATUS_CHANGED,
                 OutboxEventType.SALON_CLOSED,
-                OutboxEventType.MASTER_REMOVED)) {
+                OutboxEventType.MASTER_REMOVED,
+                OutboxEventType.BOOKING_RESCHEDULED)) {
             for (BookingSource source : BookingSource.values()) {
                 for (boolean hasClient : new boolean[] {false, true}) {
                     for (BookingStatus status : BookingStatus.values()) {
@@ -959,6 +1214,8 @@ class NotificationServiceTest {
             case STATUS_CHANGED -> service.notifyBookingStatusChanged(visit);
             case SALON_CLOSED -> service.notifySalonClosed(visit);
             case MASTER_REMOVED -> service.notifyMasterRemoved(visit);
+            // Phase 431 — the provider-initiated route (the only one a null-client booking can take).
+            case BOOKING_RESCHEDULED -> service.notifyBookingRescheduledClient(booking);
             default -> throw new IllegalArgumentException(type.name());
         }
 
@@ -968,7 +1225,7 @@ class NotificationServiceTest {
 
     @ParameterizedTest
     @EnumSource(value = OutboxEventType.class,
-            names = {"STATUS_CHANGED", "SALON_CLOSED", "MASTER_REMOVED"},
+            names = {"STATUS_CHANGED", "SALON_CLOSED", "MASTER_REMOVED", "BOOKING_RESCHEDULED"},
             mode = EnumSource.Mode.EXCLUDE)
     @DisplayName("routesToLinkGuestSms is false for every event type that never sends a guest SMS, even on a "
             + "declined LINK guest booking")
@@ -991,7 +1248,7 @@ class NotificationServiceTest {
      */
     @ParameterizedTest(name = "{0}")
     @EnumSource(value = OutboxEventType.class,
-            names = {"STATUS_CHANGED", "SALON_CLOSED", "MASTER_REMOVED", "INAPP_PUSH"},
+            names = {"STATUS_CHANGED", "SALON_CLOSED", "MASTER_REMOVED", "BOOKING_RESCHEDULED", "INAPP_PUSH"},
             mode = EnumSource.Mode.EXCLUDE)
     @DisplayName("every non-SMS event type's notify path never reaches the SMS dispatcher, even for a declined "
             + "LINK guest booking with a phone")
@@ -1005,13 +1262,12 @@ class NotificationServiceTest {
         switch (type) {
             case NEW_BOOKING -> service.notifyNewBooking(BookingVisit.single(booking));
             case CLIENT_CANCELLED -> service.notifyClientCancelled(booking);
-            case BOOKING_RESCHEDULED -> {
-                service.notifyBookingRescheduled(booking);
-                service.notifyBookingRescheduledClient(booking);
-            }
             case REVIEW_REQUESTED -> service.notifyReviewRequested(booking);
             case CLOSURE_REMINDER -> service.notifyClosureReminder(booking);
             case INVITE -> service.sendInviteEmail("invitee@example.com", "https://app.beautica.ua/i", "Salon");
+            case MASTER_BOOKING_RESCHEDULED -> service.notifyMasterOfProviderReschedule(booking, UUID.randomUUID());
+            case MASTER_BOOKING_DECLINED ->
+                    service.notifyMasterOfProviderDecline(BookingVisit.single(booking), UUID.randomUUID());
             default -> throw new IllegalArgumentException("unmapped event type " + type.name());
         }
 

@@ -7,6 +7,7 @@ import com.beautica.AbstractIntegrationTest;
 import com.beautica.auth.phoneotp.GuestTokenProvider;
 import com.beautica.booking.job.BookingReminderJob;
 import com.beautica.config.TestSecurityConfig;
+import com.beautica.notification.service.NotificationOutboxDrainWorker;
 import com.beautica.notification.sms.SmsService;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.github.tomakehurst.wiremock.WireMockServer;
@@ -175,6 +176,10 @@ abstract class AbstractWalkInBookingSmsIT extends AbstractStaffBookingIT {
 
     @Autowired
     private BookingReminderJob bookingReminderJob;
+
+    /** Used by the promoted guest-settle helpers below (phase 431). */
+    @Autowired
+    private NotificationOutboxDrainWorker settleDrainWorker;
 
     /**
      * Root-logger capture, not a per-class one: "never logs the body or an unmasked phone" is a claim
@@ -382,6 +387,63 @@ abstract class AbstractWalkInBookingSmsIT extends AbstractStaffBookingIT {
                  WHERE id = ?
                 """, bookingId);
         bookingReminderJob.sendReminders();
+    }
+
+    // ── guest (LINK) fixtures — promoted from GuestProviderCancellationSmsIT (phase 431) ──────────
+    //
+    // Promoted, not copied, when GuestRescheduleSmsIT became the second suite needing them (Q4
+    // two-occurrence threshold). Behaviour is unchanged for the original caller.
+
+    /** The single Turbosms message text — fails unless exactly one provider call was made. */
+    protected String sentText() throws Exception {
+        List<LoggedRequest> requests = TURBOSMS.findAll(postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
+        assertThat(requests).as("exactly one SMS").hasSize(1);
+        return sentTurbosmsPayload().path("sms").path("text").asText();
+    }
+
+    /** Creates a guest booking, drains its own NEW_BOOKING, and clears the confirmation SMS. */
+    protected UUID createGuestBookingAndSettle(OffsetDateTime startsAt) {
+        assertThat(createGuestBooking(startsAt).getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        settleDrainWorker.drain();
+        resetTurbosms();
+        return (UUID) onlyBooking().get("id");
+    }
+
+    /** Creates an N-service guest visit through the public route, drains, clears the SMS; returns the visit id. */
+    protected UUID createGuestVisitAndSettle(OffsetDateTime startsAt, List<UUID> masterServiceIds) {
+        String ids = masterServiceIds.stream().map(id -> "\"" + id + "\"").reduce((a, b) -> a + "," + b).orElseThrow();
+        String body = """
+                {"masterServiceIds":[%s],"startsAt":"%s","name":"%s","surname":"%s","privacyAccepted":true,"privacyPolicyVersion":"2026-10-20"}
+                """.formatted(ids, startsAt, GUEST_NAME, GUEST_SURNAME);
+        ResponseEntity<String> resp = restTemplate.exchange("/api/v1/book/" + salon.bookingSlug() + "/booking",
+                HttpMethod.POST, new HttpEntity<>(body, guestBookingHeaders()), String.class);
+        assertThat(resp.getStatusCode()).as("guest visit create body=%s", resp.getBody()).isEqualTo(HttpStatus.CREATED);
+        settleDrainWorker.drain();
+        resetTurbosms();
+        return jdbcTemplate.queryForObject(
+                "SELECT DISTINCT appointment_id FROM bookings WHERE appointment_id IS NOT NULL", UUID.class);
+    }
+
+    /**
+     * A CONFIRMED guest (LINK) row seeded directly against the fixture salon — the public create route
+     * cannot target an invited {@code SALON_MASTER} (no own booking link).
+     */
+    protected UUID insertConfirmedLinkBooking(UUID masterId, UUID masterServiceId, OffsetDateTime startsAt) {
+        return insertConfirmedLinkBooking(masterId, masterServiceId, salon.salonId(), startsAt);
+    }
+
+    /** As above, with an explicit (nullable — independent master) salon. Returns the booking id. */
+    protected UUID insertConfirmedLinkBooking(UUID masterId, UUID masterServiceId, UUID salonId,
+                                              OffsetDateTime startsAt) {
+        UUID bookingId = UUID.randomUUID();
+        jdbcTemplate.update("INSERT INTO bookings (id, master_id, master_service_id, salon_id, status, starts_at, "
+                        + "ends_at, price_at_booking, duration_minutes_at_booking, buffer_minutes_at_booking, "
+                        + "booking_source, guest_name, guest_surname, guest_phone, cancel_token, created_at, "
+                        + "updated_at) VALUES (?, ?, ?, ?, 'CONFIRMED', ?, ?, 350.00, 60, 0, 'LINK', ?, ?, ?, ?, "
+                        + "NOW(), NOW())",
+                bookingId, masterId, masterServiceId, salonId, startsAt, startsAt.plusHours(1),
+                GUEST_NAME, GUEST_SURNAME, LINK_PHONE, UUID.randomUUID());
+        return bookingId;
     }
 
     protected int otpRowCount(String phone) {

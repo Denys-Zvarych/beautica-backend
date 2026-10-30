@@ -29,6 +29,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
@@ -505,5 +506,54 @@ class NotificationOutboxServiceTest {
         // Positive proof the URL passed validation: cipher.seal must have been invoked
         // with the exact plaintext URL.
         verify(cipher).seal(eq(url));
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 431 — provider reschedule start + performing-master rows
+    // -------------------------------------------------------------------------
+
+    @Test
+    @DisplayName("Phase 431: a provider reschedule row carries initiatedBy=PROVIDER and the new start in epoch seconds")
+    void should_writeInitiatedByAndStartsAt_when_providerRescheduleEnqueued() throws Exception {
+        UUID bookingId = UUID.randomUUID();
+        java.time.Instant newStart = java.time.Instant.parse("2026-11-02T10:00:00Z");
+        ArgumentCaptor<NotificationOutboxEntry> captor = ArgumentCaptor.forClass(NotificationOutboxEntry.class);
+
+        service.enqueueBookingRescheduled(bookingId, true, newStart);
+
+        verify(outboxRepository).save(captor.capture());
+        assertThat(captor.getValue().getEventType()).isEqualTo(OutboxEventType.BOOKING_RESCHEDULED);
+        Map<String, String> parsed = MAPPER.readValue(captor.getValue().getPayload(),
+                new TypeReference<Map<String, String>>() {});
+        assertThat(parsed).containsOnly(
+                Map.entry("initiatedBy", "PROVIDER"),
+                Map.entry("startsAt", Long.toString(newStart.getEpochSecond())));
+    }
+
+    @Test
+    @DisplayName("Phase 431: a performing-master row carries only the actor id")
+    void should_writeActorOnlyMasterRow_when_masterIsNotTheActor() throws Exception {
+        UUID bookingId = UUID.randomUUID();
+        UUID actor = UUID.randomUUID();
+        ArgumentCaptor<NotificationOutboxEntry> captor = ArgumentCaptor.forClass(NotificationOutboxEntry.class);
+
+        service.enqueueMasterBookingDeclined(bookingId, UUID.randomUUID(), actor);
+
+        verify(outboxRepository).save(captor.capture());
+        assertThat(captor.getValue().getEventType()).isEqualTo(OutboxEventType.MASTER_BOOKING_DECLINED);
+        assertThat(captor.getValue().getAggregateId()).isEqualTo(bookingId);
+        assertThat(MAPPER.readValue(captor.getValue().getPayload(), new TypeReference<Map<String, String>>() {}))
+                .containsOnly(Map.entry("actorUserId", actor.toString()));
+    }
+
+    @Test
+    @DisplayName("Phase 431: no master row when the master is the actor, or detached (no account)")
+    void should_notEnqueueMasterRow_when_masterIsActorOrDetached() {
+        UUID actor = UUID.randomUUID();
+
+        service.enqueueMasterBookingRescheduled(UUID.randomUUID(), actor, actor);
+        service.enqueueMasterBookingDeclined(UUID.randomUUID(), null, actor);
+
+        verifyNoInteractions(outboxRepository);
     }
 }

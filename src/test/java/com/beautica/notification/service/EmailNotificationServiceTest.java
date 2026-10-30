@@ -673,6 +673,76 @@ class EmailNotificationServiceTest {
     }
 
     // -------------------------------------------------------------------------
+    // Phase 431 — performing-master e-mails for a salon-side reschedule / decline
+    // -------------------------------------------------------------------------
+
+    @Test
+    @DisplayName("Phase 431: sendBookingRescheduledBySalonEmail uses its own template + subject and resolves a "
+            + "GUEST by name — never the phone")
+    void should_useSalonTemplateAndGuestName_when_sendBookingRescheduledBySalonEmailCalled() throws Exception {
+        MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
+        when(mailSender.createMimeMessage()).thenReturn(realMessage);
+        when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>moved</html>");
+        User masterUser = mock(User.class);
+        when(masterUser.getFirstName()).thenReturn("Майстер");
+        when(masterUser.getLastName()).thenReturn("Іванов");
+        ServiceDefinition serviceDefinition = mock(ServiceDefinition.class);
+        when(serviceDefinition.getName()).thenReturn("Тест послуга");
+        MasterServiceAssignment masterService = mock(MasterServiceAssignment.class);
+        when(masterService.getServiceDefinition()).thenReturn(serviceDefinition);
+        Booking booking = mock(Booking.class);
+        when(booking.getClient()).thenReturn(null);
+        when(booking.getGuestName()).thenReturn("Гість");
+        when(booking.getGuestSurname()).thenReturn("Тестовий");
+        when(booking.getMaster()).thenReturn(Master.builder().user(masterUser).build());
+        when(booking.getMasterService()).thenReturn(masterService);
+        when(booking.getStartsAt()).thenReturn(OffsetDateTime.of(2025, 7, 1, 9, 0, 0, 0, ZoneOffset.UTC));
+        ArgumentCaptor<String> templateCaptor = ArgumentCaptor.forClass(String.class);
+        ArgumentCaptor<IContext> contextCaptor = ArgumentCaptor.forClass(IContext.class);
+
+        service.sendBookingRescheduledBySalonEmail("master@example.com", booking);
+
+        verify(templateEngine).process(templateCaptor.capture(), contextCaptor.capture());
+        verify(mailSender).send(realMessage);
+        assertThat(templateCaptor.getValue()).isEqualTo("email/booking-rescheduled-by-salon-provider");
+        assertThat(realMessage.getSubject()).isEqualTo("Салон переніс бронювання");
+        Context captured = (Context) contextCaptor.getValue();
+        assertThat(captured.getVariable("clientName")).isEqualTo("Гість Тестовий");
+        assertThat(captured.getVariable("masterName")).isEqualTo("Майстер Іванов");
+        assertThat(captured.getVariable("serviceName")).isEqualTo("Тест послуга");
+        assertThat(captured.getVariableNames()).noneMatch(name -> name.toLowerCase().contains("phone"))
+                .noneMatch(name -> name.toLowerCase().contains("note") || name.toLowerCase().contains("comment"));
+        verify(booking, never()).getGuestPhone();
+    }
+
+    @Test
+    @DisplayName("Phase 431: sendBookingDeclinedBySalonEmail uses its own template + subject, the visit variables "
+            + "and no note or phone")
+    void should_useSalonTemplateWithoutNotes_when_sendBookingDeclinedBySalonEmailCalled() throws Exception {
+        MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
+        when(mailSender.createMimeMessage()).thenReturn(realMessage);
+        when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>declined</html>");
+        Booking booking = buildBookingMock("Тест", "Клієнт", "Майстер", "Іванов", "Тест послуга",
+                OffsetDateTime.of(2025, 7, 1, 9, 0, 0, 0, ZoneOffset.UTC));
+        ArgumentCaptor<String> templateCaptor = ArgumentCaptor.forClass(String.class);
+        ArgumentCaptor<IContext> contextCaptor = ArgumentCaptor.forClass(IContext.class);
+
+        service.sendBookingDeclinedBySalonEmail("master@example.com", BookingVisit.single(booking));
+
+        verify(templateEngine).process(templateCaptor.capture(), contextCaptor.capture());
+        assertThat(templateCaptor.getValue()).isEqualTo("email/booking-declined-by-salon-provider");
+        assertThat(realMessage.getSubject()).isEqualTo("Салон скасував бронювання");
+        Context captured = (Context) contextCaptor.getValue();
+        assertThat(captured.getVariable("clientName")).isEqualTo("Тест Клієнт");
+        assertThat(captured.getVariable("serviceNames")).isEqualTo(List.of("Тест послуга"));
+        assertThat(captured.getVariable("visitDuration")).isNull();
+        assertThat(captured.getVariableNames()).noneMatch(name -> name.toLowerCase().contains("phone"))
+                .noneMatch(name -> name.toLowerCase().contains("note") || name.toLowerCase().contains("comment"));
+        verify(booking, never()).getProviderComment();
+        verify(booking, never()).getGuestPhone();
+    }
+
+    // -------------------------------------------------------------------------
     // Error resilience
     // -------------------------------------------------------------------------
 

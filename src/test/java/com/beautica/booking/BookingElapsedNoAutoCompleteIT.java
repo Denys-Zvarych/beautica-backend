@@ -116,7 +116,8 @@ class BookingElapsedNoAutoCompleteIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("the only @Scheduled bean in com.beautica.booking is BookingReminderJob#sendReminders — there is deliberately no completion sweep")
+    @DisplayName("the only @Scheduled beans in com.beautica.booking are BookingReminderJob#sendReminders and the phase 431 "
+            + "retention purge — there is deliberately no completion sweep")
     void should_haveNoScheduledBookingSweep_beyondTheGuestReminder() {
         Set<String> scheduledBookingMethods = new TreeSet<>();
         for (String beanName : applicationContext.getBeanDefinitionNames()) {
@@ -134,8 +135,12 @@ class BookingElapsedNoAutoCompleteIT extends AbstractIntegrationTest {
 
         assertThat(scheduledBookingMethods)
                 .as("adding any new scheduled booking job (e.g. an auto-complete sweep) must consciously "
-                        + "confront this rule — the only permitted scheduled booking job is the guest reminder")
-                .containsExactly("BookingReminderJob#sendReminders");
+                        + "confront this rule — the only permitted scheduled booking jobs are the guest reminder and "
+                        + "the phase 431 log-retention purge, neither of which touches booking status")
+                .containsExactly(
+                        "BookingReminderJob#sendReminders",
+                        // Phase 431: a 2-day retention purge of the reschedule logs — never a status transition.
+                        "GuestRescheduleSmsBudget#purgeExpired");
     }
 
     // ── ONLY MANUAL PATH TO "PAST": each provider role can mark the elapsed booking COMPLETED ────

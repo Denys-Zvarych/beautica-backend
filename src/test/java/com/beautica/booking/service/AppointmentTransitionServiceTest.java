@@ -1135,7 +1135,8 @@ class AppointmentTransitionServiceTest {
 
         appointmentTransitionService.rescheduleAppointmentItem(actorId, Role.SALON_OWNER, appointmentId, targetId, req);
 
-        verify(outboxService).enqueueBookingRescheduled(targetId, true);
+        // Phase 431 — the provider-initiated row also carries the moved item's new start.
+        verify(outboxService).enqueueBookingRescheduled(targetId, true, newStartsAt.toInstant());
         // Provider path never touches enforceCanManageAppointment's return value here — this test
         // stubs it as a no-op via the default Mockito void behaviour (authorized).
         verify(authz).enforceCanManageAppointment(actorId, appointmentId);

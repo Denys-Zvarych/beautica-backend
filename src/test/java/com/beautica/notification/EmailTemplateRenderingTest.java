@@ -300,6 +300,59 @@ class EmailTemplateRenderingTest {
     }
 
 
+    // Phase 431 — performing-master e-mails for a salon-side reschedule / decline
+
+    @Test
+    @DisplayName("Phase 431: booking-rescheduled-by-salon-provider renders the fields and says the SALON moved it")
+    void should_renderSalonWording_when_rescheduledBySalonTemplateProcessed() {
+        var ctx = new Context();
+        ctx.setVariable("masterName", "Оксана");
+        ctx.setVariable("clientName", "Гість Тестовий");
+        ctx.setVariable("serviceName", "Стрижка");
+        ctx.setVariable("startsAt", "11:00, 21 травня 2026");
+
+        String html = templateEngine.process("email/booking-rescheduled-by-salon-provider", ctx);
+
+        assertThat(html).contains("Оксана").contains("Гість Тестовий").contains("Стрижка")
+                .contains("11:00, 21 травня 2026").contains("Салон переніс ваше бронювання");
+        assertThat(body(html)).doesNotContain("Клієнт переніс");
+    }
+
+    @Test
+    @DisplayName("Phase 431: booking-declined-by-salon-provider names every service of a whole-visit decline once")
+    void should_renderEveryService_when_declinedBySalonTemplateProcessedForVisit() {
+        var ctx = new Context();
+        ctx.setVariable("masterName", "Оксана");
+        ctx.setVariable("clientName", "Іван Петренко");
+        ctx.setVariable("serviceNames", List.of("Стрижка", "Фарбування"));
+        ctx.setVariable("serviceLabel", "Послуги");
+        ctx.setVariable("startsAt", "10:00, 20 травня 2026");
+        ctx.setVariable("visitDuration", "2 год (до 12:00)");
+
+        String html = templateEngine.process("email/booking-declined-by-salon-provider", ctx);
+
+        assertThat(html).contains("Оксана").contains("Іван Петренко").contains("Стрижка").contains("Фарбування")
+                .contains("10:00, 20 травня 2026").contains("Салон скасував ваше бронювання")
+                .contains("2 год (до 12:00)");
+        assertThat(body(html)).doesNotContain("Нове бронювання");
+    }
+
+    @Test
+    @DisplayName("Phase 431: booking-declined-by-salon-provider omits the duration row for a single service")
+    void should_omitDurationRow_when_declinedBySalonTemplateProcessedForSingleService() {
+        var ctx = new Context();
+        ctx.setVariable("masterName", "Оксана");
+        ctx.setVariable("clientName", "Іван Петренко");
+        ctx.setVariable("serviceNames", List.of("Стрижка"));
+        ctx.setVariable("serviceLabel", "Послуга");
+        ctx.setVariable("startsAt", "10:00, 20 травня 2026");
+        ctx.setVariable("visitDuration", null);
+
+        String html = templateEngine.process("email/booking-declined-by-salon-provider", ctx);
+
+        assertThat(html).contains("Стрижка").doesNotContain("Тривалість");
+    }
+
     // Phase 25.5 (Fix D3): booking-cancelled-provider no longer takes a single `comment`
     // variable — the cancellation-time note (`cancellationNote`) and the booking-creation note
     // (`creationNote`) are distinct variables under distinct labels, so they can never swap

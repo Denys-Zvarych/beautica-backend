@@ -392,6 +392,10 @@ app:
       # Phase 390 — the guest provider-cancellation SMS (decline, salon closure, master removal) is
       # fixed copy in GuestProviderCancellationSmsText, not a template here (no provider text in it;
       # its length is pinned by tests). Do not re-add `decline:` / `decline-reason:` — nothing reads them.
+      # Phase 431 — the guest reschedule SMS (provider moved a LINK guest's / walk-in's booking) has no
+      # key here either, on the walk-in precedent below: its single source is
+      # BookingSmsProperties.Sms#reschedule. Override with APP_BOOKING_SMS_RESCHEDULE (relaxed binding);
+      # GuestRescheduleSmsText fails boot unless it keeps {date} and {time} and fits 2 UCS-2 segments.
       # Phase 22.7 — the walk-in confirmation (POST /api/v1/masters/{masterId}/bookings) is the ONE
       # template with no key here, deliberately (QA MEDIUM, 2026-08-18). Its text lives in exactly
       # one place: BookingSmsProperties.Sms#walkInConfirmation. A yml copy identical to that default

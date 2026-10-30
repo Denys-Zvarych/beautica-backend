@@ -4,6 +4,7 @@ import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingSource;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.service.BookingSmsDispatcher;
+import com.beautica.booking.service.GuestRescheduleSmsBudget;
 import com.beautica.common.util.SchemeGuard;
 import com.beautica.notification.entity.OutboxEventType;
 import com.beautica.user.User;
@@ -13,6 +14,9 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.time.OffsetDateTime;
+import java.util.EnumSet;
+import java.util.Set;
+import java.util.UUID;
 
 /**
  * Thin notification-side facade that dispatches email and (guest-only) SMS notifications. Push is
@@ -36,18 +40,34 @@ public class NotificationService {
     private final EmailNotificationService emailService;
     private final BookingSmsDispatcher bookingSmsDispatcher;
     private final GuestProviderCancellationSmsText guestCancellationSmsText;
+    private final GuestRescheduleSmsText guestRescheduleSmsText;
+    private final GuestRescheduleSmsBudget guestRescheduleSmsBudget;
     private final String frontendBaseUrl;
+
+    /**
+     * Phase 431 — the account-less sources whose guest phone may receive the reschedule SMS: an
+     * OTP-verified LINK guest and a STAFF walk-in (user decision 2026-10-30). The walk-in's phone
+     * already receives the phase 22.7 walk-in confirmation SMS; the reschedule copy is fixed text with
+     * no provider-authored content, so the Phase 22.1 "provider-authored text to an unverified
+     * number" concern does not apply. APP is listed out explicitly: an APP row with a null client is
+     * a detached account, whose {@code guest_phone} is NULL by the CHECK anyway.
+     */
+    private static final Set<BookingSource> RESCHEDULE_SMS_SOURCES = EnumSet.of(BookingSource.LINK, BookingSource.STAFF);
 
     // Explicit constructor — @RequiredArgsConstructor cannot bind the @Value frontend base URL.
     public NotificationService(
             EmailNotificationService emailService,
             BookingSmsDispatcher bookingSmsDispatcher,
             GuestProviderCancellationSmsText guestCancellationSmsText,
+            GuestRescheduleSmsText guestRescheduleSmsText,
+            GuestRescheduleSmsBudget guestRescheduleSmsBudget,
             @Value("${app.frontend.base-url}") String frontendBaseUrl
     ) {
         this.emailService = emailService;
         this.bookingSmsDispatcher = bookingSmsDispatcher;
         this.guestCancellationSmsText = guestCancellationSmsText;
+        this.guestRescheduleSmsText = guestRescheduleSmsText;
+        this.guestRescheduleSmsBudget = guestRescheduleSmsBudget;
         this.frontendBaseUrl = frontendBaseUrl;
     }
 
@@ -193,18 +213,106 @@ public class NotificationService {
      * client-facing twin of {@link #notifyBookingRescheduled(Booking)}, which stays unchanged for
      * the client-initiated case).
      *
-     * <p>A guest (LINK) booking has no client account ({@code booking.getClient() == null}) — no
-     * email/push channel exists to reach. Skips cleanly, mirroring {@link
-     * #notifyReviewRequested(Booking)}'s guest guard; a provider CAN reach this path for a guest
-     * booking ({@code BookingService.rescheduleBooking}'s provider branch does not require a
-     * client to exist), so this guard is load-bearing, not defensive-only.
+     * <p>A guest booking (LINK guest or STAFF walk-in) has no client account
+     * ({@code booking.getClient() == null}) and so no email/push channel. Phase 431 (user decision
+     * 2026-10-30): instead of the former silent skip, that guest gets ONE fixed-copy SMS naming the
+     * NEW Kyiv date/time ({@link GuestRescheduleSmsText}) — see {@link #sendGuestRescheduleSms}. The
+     * null-client branch still returns before {@code getClient().getEmail()}, so the registered-client
+     * email path below is unchanged.
+     *
+     * <p>At most one SMS per outbox row: the whole-visit reschedule enqueues ONE row (the visit's first
+     * item, whose start IS the new visit start) and a per-service move enqueues one row for the moved
+     * service — the phase 390 decline cardinality, mirrored. Audit-fix cycle 1 bounds it further, see
+     * {@link #sendGuestRescheduleSms}.
+     *
+     * <p>This 1-arg form is a row with no outbox context (a pre-431 row has no new start): the SMS is
+     * sent only while the booking is {@code CONFIRMED}, with no retry de-duplication of the budget.
      */
     public void notifyBookingRescheduledClient(Booking booking) {
+        notifyBookingRescheduledClient(booking, null, null);
+    }
+
+    /**
+     * {@link #notifyBookingRescheduledClient(Booking)} with the outbox context of a phase 431 row.
+     *
+     * @param outboxEntryId    the dispatched row — de-duplicates the SMS budget reservation across a
+     *                         back-pressure retry; {@code null} when there is none
+     * @param newStartsEpochSec the payload's NEW start (epoch seconds); {@code null} on a pre-431 row
+     */
+    public void notifyBookingRescheduledClient(Booking booking, @Nullable UUID outboxEntryId,
+                                               @Nullable Long newStartsEpochSec) {
         if (booking.getClient() == null) {
-            log.debug("Skipping client-facing BOOKING_RESCHEDULED for account-less guest booking {}", booking.getId());
+            if (RESCHEDULE_SMS_SOURCES.contains(booking.getBookingSource())) {
+                sendGuestRescheduleSms(booking, outboxEntryId, newStartsEpochSec);
+            } else {
+                log.debug("Skipping client-facing BOOKING_RESCHEDULED for account-less guest booking {}", booking.getId());
+            }
             return;
         }
         emailService.sendBookingRescheduledClientEmail(booking.getClient().getEmail(), booking);
+    }
+
+    /**
+     * Phase 431 — on a PROVIDER-initiated reschedule, also e-mails the booking's PERFORMING MASTER
+     * (salon master, or the salon owner performing their own booking) that the salon moved it, unless
+     * that master is the actor (an independent master or owner moving their own booking gets nothing).
+     * The master's in-app feed item and push already come from
+     * {@code InAppNotificationService#notifyRescheduled} (rule 6, actor excluded); this adds only the
+     * e-mail the master already gets for a client-initiated move.
+     *
+     * <p>Dispatched from its OWN outbox row ({@code MASTER_BOOKING_RESCHEDULED}, audit-fix cycle 1),
+     * never chained with the client/guest notification: each has its own retry state, so a failing
+     * master mail cannot block or DEAD the guest SMS, and a re-queued guest SMS never repeats this mail.
+     * The row is enqueued only when the master is not the actor; the check here is defence in depth.
+     *
+     * @param actorUserId who moved the booking, from the outbox payload; {@code null} (a row written
+     *                    before phase 431) is "unknown", and an unknown actor never gets the e-mail
+     */
+    public void notifyMasterOfProviderReschedule(Booking booking, @Nullable UUID actorUserId) {
+        User masterUser = performingMasterUnlessActor(booking, actorUserId, "MASTER_BOOKING_RESCHEDULED");
+        if (masterUser != null) {
+            emailService.sendBookingRescheduledBySalonEmail(masterUser.getEmail(), booking);
+        }
+    }
+
+    /**
+     * Phase 431 — on a PROVIDER decline ({@code STATUS_CHANGED} row whose booking is {@code DECLINED}),
+     * also e-mails the PERFORMING MASTER that the salon cancelled it, unless they are the actor. ONE
+     * e-mail per row: a whole-visit decline names the whole visit (one row per visit), a per-service
+     * decline names that service only — the same split {@link #isWholeVisitDecline} drives for the
+     * client. The feed item and push already come from {@code InAppNotificationService}'s decline row
+     * (performing master unless actor). No note and no guest phone reach the e-mail. Any other status
+     * is a no-op. Dispatched from its OWN outbox row ({@code MASTER_BOOKING_DECLINED}), for the same
+     * reason as {@link #notifyMasterOfProviderReschedule}.
+     *
+     * @param actorUserId who declined, from the outbox payload; {@code null} never gets the e-mail
+     */
+    public void notifyMasterOfProviderDecline(BookingVisit visit, @Nullable UUID actorUserId) {
+        Booking booking = visit.lead();
+        if (booking.getStatus() != BookingStatus.DECLINED) {
+            return;
+        }
+        User masterUser = performingMasterUnlessActor(booking, actorUserId, "MASTER_BOOKING_DECLINED");
+        if (masterUser != null) {
+            emailService.sendBookingDeclinedBySalonEmail(masterUser.getEmail(),
+                    isWholeVisitDecline(visit) ? visit : BookingVisit.single(booking));
+        }
+    }
+
+    /**
+     * The performing master's user, or {@code null} when the actor is unknown, the master is detached,
+     * or the master IS the actor. Identifiers only in the log (Anti-Bug §I).
+     */
+    @Nullable
+    private static User performingMasterUnlessActor(Booking booking, @Nullable UUID actorUserId, String type) {
+        if (actorUserId == null) {
+            return null;
+        }
+        User masterUser = providerRecipient(booking, type);
+        if (masterUser == null || actorUserId.equals(masterUser.getId())) {
+            return null;
+        }
+        return masterUser;
     }
 
     /**
@@ -408,13 +516,17 @@ public class NotificationService {
      * Whether dispatching an outbox row of {@code type} for {@code lead} would hand an SMS to
      * {@link BookingSmsDispatcher#dispatchOrThrow} — i.e. whether it reaches
      * {@link #sendLinkGuestProviderCancellationSms} through the {@code STATUS_CHANGED}/DECLINED,
-     * {@code SALON_CLOSED} or {@code MASTER_REMOVED} LINK-guest branch, with a phone to send to.
+     * {@code SALON_CLOSED} or {@code MASTER_REMOVED} LINK-guest branch, or (phase 431) the
+     * {@code BOOKING_RESCHEDULED} guest branch ({@link #routesToGuestRescheduleSms}), with a phone to send to.
      *
      * <p>Read-only, no side effects. Lets {@code NotificationOutboxDrainWorker} defer the batch's
      * remaining SMS rows once the SMS pool has pushed back, without submitting each one to be refused.
      * Must mirror those three branches exactly; parity is pinned in {@code NotificationServiceTest}.
      */
     public boolean routesToLinkGuestSms(OutboxEventType type, Booking lead) {
+        if (type == OutboxEventType.BOOKING_RESCHEDULED) {
+            return routesToGuestRescheduleSms(lead);
+        }
         if (lead.getClient() != null || lead.getBookingSource() != BookingSource.LINK
                 || lead.getGuestPhone() == null || lead.getGuestPhone().isBlank()) {
             return false;
@@ -424,6 +536,66 @@ public class NotificationService {
             case SALON_CLOSED, MASTER_REMOVED -> true;
             default -> false;
         };
+    }
+
+    /**
+     * Phase 431 — the {@code BOOKING_RESCHEDULED} half of {@link #routesToLinkGuestSms}: mirrors the
+     * guest branch of {@link #notifyBookingRescheduledClient} (null client, LINK or STAFF source, a
+     * phone, still {@code CONFIRMED}). An UPPER bound, which is all the drain's back-pressure deferral
+     * needs: it cannot see the payload (a superseded start, or a pre-27.3 row with no
+     * {@code initiatedBy}, which a guest can never write since guests cannot reschedule) nor the send
+     * budget (a DB read); such rows are merely deferred with the batch's SMS rows while the SMS pool
+     * is saturated.
+     */
+    private boolean routesToGuestRescheduleSms(Booking lead) {
+        return lead.getClient() == null && RESCHEDULE_SMS_SOURCES.contains(lead.getBookingSource())
+                && lead.getStatus() == BookingStatus.CONFIRMED
+                && lead.getGuestPhone() != null && !lead.getGuestPhone().isBlank();
+    }
+
+    /**
+     * Phase 431 — queues the reschedule SMS for an account-less guest. Mirrors
+     * {@link #sendLinkGuestProviderCancellationSms}: the no-phone skip (which also covers an anonymised
+     * guest — phase 373 nulls {@code guest_phone}), {@code dispatchOrThrow} so a saturated SMS pool
+     * re-queues the row rather than losing the message, and the {@code app.booking.sms.enabled} gate
+     * held by {@link BookingSmsDispatcher}'s {@code SmsService}. Neither the phone nor the text is
+     * logged.
+     *
+     * <p>Audit-fix cycle 1 (security HIGH) — a provider can move one booking at will, so the send is
+     * bounded, cheapest check first:
+     * <ol>
+     *   <li><b>Stale / cancelled:</b> skipped unless the booking is still {@code CONFIRMED} — no SMS
+     *       for a booking cancelled or declined before the drain.</li>
+     *   <li><b>Burst collapse:</b> skipped unless the booking still starts at the row's NEW start, so
+     *       N quick moves send ONE SMS, for the last move. A pre-431 row (no start) skips this check.</li>
+     *   <li><b>Per-phone budget:</b> {@link GuestRescheduleSmsBudget#tryReserve} — 5 per phone per
+     *       rolling hour, shared with the walk-in confirmation SMS; silent (SMS skipped only).</li>
+     * </ol>
+     * The per-booking bound (5 provider reschedules per guest booking/visit per 24 h) is enforced on
+     * the reschedule REQUEST, not here.
+     * Each skip affects the SMS only; logs carry the booking id, never the phone.
+     */
+    private void sendGuestRescheduleSms(Booking booking, @Nullable UUID outboxEntryId,
+                                        @Nullable Long newStartsEpochSec) {
+        String phone = booking.getGuestPhone();
+        if (phone == null || phone.isBlank()) {
+            log.warn("Guest BOOKING_RESCHEDULED (booking {}) has no guestPhone — skipping SMS", booking.getId());
+            return;
+        }
+        if (booking.getStatus() != BookingStatus.CONFIRMED) {
+            log.debug("Guest BOOKING_RESCHEDULED (booking {}) is no longer CONFIRMED — skipping SMS", booking.getId());
+            return;
+        }
+        if (newStartsEpochSec != null && booking.getStartsAt().toEpochSecond() != newStartsEpochSec) {
+            log.debug("Guest BOOKING_RESCHEDULED (booking {}) was superseded by a later move — skipping SMS",
+                    booking.getId());
+            return;
+        }
+        if (!guestRescheduleSmsBudget.tryReserve(booking.getId(), phone, outboxEntryId)) {
+            return;
+        }
+        bookingSmsDispatcher.dispatchOrThrow(BookingSmsDispatcher.Kind.GUEST_PROVIDER_RESCHEDULE, phone,
+                guestRescheduleSmsText.render(booking.getStartsAt()));
     }
 
     /**
