@@ -301,6 +301,17 @@ app:
     # Outbound HTTP timeouts (Duration). socket-timeout is per-read INACTIVITY, not a total deadline.
     connection-timeout: 5s
     socket-timeout: 30s
+  # Phase 417 — Cloudflare edge-cache purge of deleted media (R2StorageService#deleteFiles). Blank zone-id or
+  # purge-token = purge disabled (WARN at boot when R2 is enabled): a deleted object then stays edge-cached for
+  # up to the 7-day s-maxage. The token is a Cache-Purge-only API token for zone beautica.app.
+  cloudflare-cdn:
+    zone-id: ${CLOUDFLARE_CDN_ZONE_ID:}
+    purge-token: ${CLOUDFLARE_CDN_PURGE_TOKEN:}
+    api-base-url: https://api.cloudflare.com/client/v4
+    # Any other api-base-url is refused at boot unless this is true (SSRF guard; tests only).
+    allow-custom-api-base-url: false
+    connect-timeout: 2s
+    read-timeout: 5s
   firebase:
     service-account: ${FIREBASE_SERVICE_ACCOUNT:}
     connect-timeout: 5s

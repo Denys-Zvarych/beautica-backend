@@ -1,9 +1,15 @@
 package com.beautica.media;
 
 import com.beautica.config.TestSecurityConfig;
+import com.beautica.media.service.CloudflareCachePurger;
 import com.beautica.media.service.R2StorageService;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.github.tomakehurst.wiremock.WireMockServer;
+import com.github.tomakehurst.wiremock.core.WireMockConfiguration;
+import com.github.tomakehurst.wiremock.verification.LoggedRequest;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -17,6 +23,11 @@ import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
+import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.model.DeleteObjectsRequest;
+import software.amazon.awssdk.services.s3.model.DeleteObjectsResponse;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -26,6 +37,12 @@ import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
 
 import static com.beautica.support.R2DeleteLedger.purgedKeys;
+import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
+import static com.github.tomakehurst.wiremock.client.WireMock.equalTo;
+import static com.github.tomakehurst.wiremock.client.WireMock.equalToJson;
+import static com.github.tomakehurst.wiremock.client.WireMock.post;
+import static com.github.tomakehurst.wiremock.client.WireMock.postRequestedFor;
+import static com.github.tomakehurst.wiremock.client.WireMock.urlEqualTo;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
@@ -33,6 +50,7 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doNothing;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.mockingDetails;
 import static org.mockito.Mockito.reset;
 import static org.mockito.Mockito.when;
@@ -53,6 +71,33 @@ class R2BlobPurgeEndToEndIT extends AbstractMediaIntegrationTest {
         return "/api/v1/salons/" + salonId + "/portfolio";
     }
     private static final String CDN = "https://cdn.example/";
+
+    /** Phase 417 — Cloudflare API stand-in for the edge-cache purge. */
+    private static final String CF_ZONE = "0123456789abcdef0123456789abcdef";
+    private static final String CF_TOKEN = "it-purge-token";
+    private static final String CF_PURGE_PATH = "/client/v4/zones/" + CF_ZONE + "/purge_cache";
+    private static WireMockServer cloudflare;
+
+    @BeforeAll
+    static void startCloudflare() {
+        cloudflare = new WireMockServer(WireMockConfiguration.options().dynamicPort());
+        cloudflare.start();
+    }
+
+    @AfterAll
+    static void stopCloudflare() {
+        cloudflare.stop();
+    }
+
+    @DynamicPropertySource
+    static void cloudflareCdn(DynamicPropertyRegistry registry) {
+        registry.add("app.cloudflare-cdn.api-base-url", () -> "http://localhost:" + cloudflare.port() + "/client/v4");
+        registry.add("app.cloudflare-cdn.allow-custom-api-base-url", () -> "true");
+        registry.add("app.cloudflare-cdn.zone-id", () -> CF_ZONE);
+        registry.add("app.cloudflare-cdn.purge-token", () -> CF_TOKEN);
+    }
+
+    @Autowired private CloudflareCachePurger cloudflareCachePurger;
 
     @Autowired private TestRestTemplate restTemplate;
     @Autowired private ObjectMapper objectMapper;
@@ -179,6 +224,29 @@ class R2BlobPurgeEndToEndIT extends AbstractMediaIntegrationTest {
         assertThat(purgedKeys(r2)).as("a rolled-back row delete must never purge the live blob").isEmpty();
     }
 
+    @Test
+    @DisplayName("DELETE /salons/{id}/portfolio/{mediaId} — phase 417: after commit, ONE Cloudflare purge_cache call "
+            + "carries exactly the deleted object's public URL")
+    void should_purgeDeletedObjectUrlFromEdgeOnce_when_portfolioPhotoDeletedAfterCommit() throws Exception {
+        Owner o = owner("pf-cdn");
+        String key = "portfolio/salons/" + o.salonId() + "/cdn.jpg";
+        UUID mediaId = insertPortfolioRow(o.ownerId(), o.salonId(), key);
+        R2StorageService realR2 = realR2WithCloudflareOk();
+        List<Integer> rowCountWhenPurged = new CopyOnWriteArrayList<>();
+        doAnswer(inv -> {
+            rowCountWhenPurged.add(mediaRowCount(mediaId));
+            return realR2.deleteFiles(inv.getArgument(0));
+        }).when(r2).deleteFiles(any());
+
+        ResponseEntity<Void> resp = deletePortfolio(o.salonId(), mediaId, o.token());
+
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(rowCountWhenPurged).as("purge ran after the row delete committed").containsExactly(0);
+        cloudflare.verify(1, postRequestedFor(urlEqualTo(CF_PURGE_PATH))
+                .withHeader("Authorization", equalTo("Bearer " + CF_TOKEN))
+                .withRequestBody(equalToJson("{\"files\":[\"" + CDN + key + "\"]}")));
+    }
+
     // ── avatar ──────────────────────────────────────────────────────────────────
 
     @Test
@@ -292,7 +360,78 @@ class R2BlobPurgeEndToEndIT extends AbstractMediaIntegrationTest {
                 "SELECT count(*) FROM media_files WHERE entity_id = ?", Integer.class, o.salonId())).isZero();
     }
 
+    // ── phase 417: edge purge on account / salon deletion ──────────────────────
+
+    @Test
+    @DisplayName("DELETE /users/me — phase 417: the deleted account's avatar URL is purged from the Cloudflare edge, "
+            + "and nothing else")
+    void should_purgeAvatarUrlFromEdge_when_clientDeletesAccount() throws Exception {
+        String email = "cdn-selfdel-" + System.nanoTime() + "@beautica.test";
+        UUID userId = insertClient(email);
+        String token = loginAndGetToken(email);
+        assertThat(postAvatar(token).getStatusCode()).isEqualTo(HttpStatus.OK);
+        String key = avatarKey(userId);
+        R2StorageService realR2 = realR2WithCloudflareOk();
+        doAnswer(inv -> realR2.deleteFiles(inv.getArgument(0))).when(r2).deleteFiles(any());
+
+        ResponseEntity<Void> resp = restTemplate.exchange("/api/v1/users/me", HttpMethod.DELETE,
+                new HttpEntity<>(bearer(token)), Void.class);
+
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(key).as("fixture: the upload stored a keyed avatar").isNotNull();
+        assertThat(edgePurgedUrls()).as("Cloudflare purge_cache files across all calls")
+                .containsExactly(CDN + key);
+    }
+
+    @Test
+    @DisplayName("DELETE /salons/{id} — phase 417: own logo + portfolio URLs are purged from the Cloudflare edge; "
+            + "the foreign cover URL the row points at is NOT")
+    void should_purgeOwnSalonImageryUrlsFromEdge_when_salonDeleted() throws Exception {
+        Owner o = owner("salon-cdn");
+        Owner other = owner("salon-cdn-other");
+        String logoKey = "salons/" + o.salonId() + "/logo/l.jpg";
+        String foreignCoverKey = "salons/" + other.salonId() + "/cover/c.jpg";
+        jdbcTemplate.update("UPDATE salons SET avatar_url = ?, cover_image_url = ? WHERE id = ?",
+                CDN + logoKey, CDN + foreignCoverKey, o.salonId());
+        String portfolioKey = "portfolio/salons/" + o.salonId() + "/p.jpg";
+        insertPortfolioRow(o.ownerId(), o.salonId(), portfolioKey);
+        R2StorageService realR2 = realR2WithCloudflareOk();
+        doAnswer(inv -> realR2.deleteFiles(inv.getArgument(0))).when(r2).deleteFiles(any());
+
+        ResponseEntity<Void> resp = restTemplate.exchange("/api/v1/salons/" + o.salonId(), HttpMethod.DELETE,
+                new HttpEntity<>(bearer(o.token())), Void.class);
+
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(edgePurgedUrls()).as("Cloudflare purge_cache files across all calls")
+                .containsExactlyInAnyOrder(CDN + logoKey, CDN + portfolioKey)
+                .doesNotContain(CDN + foreignCoverKey);
+    }
+
     // ── helpers ─────────────────────────────────────────────────────────────────
+
+    /**
+     * Resets the Cloudflare stand-in to answer every purge with success and returns a REAL R2StorageService (S3
+     * mocked) wired to the Spring-configured purger, so its deleteFiles runs the phase-417 purge hook. Tests route
+     * the @MockBean's after-commit deleteFiles into it, keeping the mock's ledger intact.
+     */
+    private R2StorageService realR2WithCloudflareOk() {
+        cloudflare.resetAll();
+        cloudflare.stubFor(post(urlEqualTo(CF_PURGE_PATH)).willReturn(aResponse().withStatus(200)
+                .withHeader("Content-Type", "application/json").withBody("{\"success\":true,\"errors\":[]}")));
+        S3Client s3 = mock(S3Client.class);
+        when(s3.deleteObjects(any(DeleteObjectsRequest.class))).thenReturn(DeleteObjectsResponse.builder().build());
+        return new R2StorageService(Optional.of(s3), "test-bucket", CDN, cloudflareCachePurger);
+    }
+
+    /** Every URL sent to Cloudflare purge_cache (with the expected bearer), across all requests, in order. */
+    private List<String> edgePurgedUrls() throws Exception {
+        List<String> urls = new ArrayList<>();
+        for (LoggedRequest req : cloudflare.findAll(postRequestedFor(urlEqualTo(CF_PURGE_PATH))
+                .withHeader("Authorization", equalTo("Bearer " + CF_TOKEN)))) {
+            objectMapper.readTree(req.getBodyAsString()).get("files").forEach(f -> urls.add(f.asText()));
+        }
+        return urls;
+    }
 
     private record Owner(UUID ownerId, UUID salonId, String token) {}
 

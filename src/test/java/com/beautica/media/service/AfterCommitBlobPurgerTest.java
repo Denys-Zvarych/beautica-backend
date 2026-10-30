@@ -17,9 +17,13 @@ import org.springframework.core.task.TaskRejectedException;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
+import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.model.DeleteObjectsRequest;
+import software.amazon.awssdk.services.s3.model.DeleteObjectsResponse;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -27,6 +31,7 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyCollection;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
@@ -129,6 +134,24 @@ class AfterCommitBlobPurgerTest {
 
         assertThatCode(() -> purger.dispatch(List.of("avatars/secret-id/a.jpg"), "test")).doesNotThrowAnyException();
 
+        assertThat(logs.list).filteredOn(e -> e.getLevel() == Level.WARN).singleElement()
+                .satisfies(e -> assertThat(e.getFormattedMessage()).doesNotContain("secret-id"));
+    }
+
+    @Test
+    @DisplayName("phase 417: an exception escaping the edge-cache purge inside deleteFiles still leaves purgeNow "
+            + "non-throwing (WARN without keys)")
+    void should_stayNonThrowing_when_edgeCachePurgeThrowsInsideDeleteFiles() {
+        S3Client s3 = mock(S3Client.class);
+        when(s3.deleteObjects(any(DeleteObjectsRequest.class))).thenReturn(DeleteObjectsResponse.builder().build());
+        CloudflareCachePurger cdn = mock(CloudflareCachePurger.class);
+        doThrow(new IllegalStateException("purge exploded")).when(cdn).purgeUrls(anyCollection());
+        R2StorageService realR2 = new R2StorageService(Optional.of(s3), "bucket", "https://media.example", cdn);
+        AfterCommitBlobPurger purger = new AfterCommitBlobPurger(realR2, new SyncTaskExecutor(), meters);
+
+        assertThatCode(() -> purger.dispatch(List.of("avatars/secret-id/a.jpg"), "test")).doesNotThrowAnyException();
+
+        verify(cdn).purgeUrls(anyCollection());
         assertThat(logs.list).filteredOn(e -> e.getLevel() == Level.WARN).singleElement()
                 .satisfies(e -> assertThat(e.getFormattedMessage()).doesNotContain("secret-id"));
     }

@@ -27,15 +27,17 @@ import org.springframework.security.task.DelegatingSecurityContextTaskExecutor;
 /**
  * Async executors and their shutdown budget.
  *
- * <h4>Shutdown budget — sequential worst case ~185 s</h4>
+ * <h4>Shutdown budget — sequential worst case ~200 s</h4>
  * <p>Each pool drains in its own {@code destroy()}, and Spring runs those calls SEQUENTIALLY, so the
  * worst case is the SUM of every {@code awaitTerminationSeconds} (an idle pool returns at once; the sum
- * is reached only when every pool is still busy): 30+20+35+20+30+30+10+10 = 185 s.
+ * is reached only when every pool is still busy). The nine pools in the table below, in table order:
+ * 30+20+35+5+20+30+30+10+20 = 200 s. Adding the 30 s {@code SchedulingConfig} scheduler grace gives the
+ * 230 s grace sum {@code RailwayConfigTest} computes from every {@code *_SHUTDOWN_GRACE_SECONDS} constant.
  *
  * <p><b>The deploy platform's SIGTERM→SIGKILL window must be at least this worst case.</b> A shorter
  * window kills the JVM mid-drain, losing the non-recoverable work below AND the abandonment report. On
  * Railway this is {@code deploy.drainingSeconds} in {@code railway.json} (&ge; this sum + the 30 s scheduler grace
- * ({@code SchedulingConfig}) + 2 lifecycle phases + margin = 190 + 30 + 2&times;20 + 20 = 280; pinned by
+ * ({@code SchedulingConfig}) + 2 lifecycle phases + margin = (200 + 30) + 2&times;20 + 20 = 290; pinned by
  * {@code RailwayConfigTest}). The push pool must drain before {@code FirebaseConfig} is destroyed
  * ({@code @DependsOn}, see {@code AsyncConfigShutdownOrderingTest}).
  *
@@ -65,10 +67,12 @@ import org.springframework.security.task.DelegatingSecurityContextTaskExecutor;
  * smsReminderExecutor          30 s  guest 24h reminder SMS. NOT recoverable (reminderSent already
  *                                    committed); reported at ERROR. ~6 s drains a full queue at healthy RTT.
  * cacheEvictionExecutor        10 s  in-memory Caffeine scans; the cache dies with the JVM -> irrelevant.
- * blobPurgeExecutor            10 s  after-commit R2 deletes of already-dereferenced blobs; cut = accepted
- *                                    orphan blob (never a dangling pointer), same policy as a failed delete;
- *                                    reported at WARN with task + key counts.
- * total (sequential worst)    190 s
+ * blobPurgeExecutor            20 s  after-commit R2 deletes of already-dereferenced blobs + the phase-417
+ *                                    Cloudflare edge purge; cut = accepted orphan blob / edge copy (never a
+ *                                    dangling pointer), same policy as a failed delete; reported at WARN with
+ *                                    task + key counts. 20 s covers one worst-case purge chunk (~15 s:
+ *                                    2 s connect + 5 s read, 1 s pause, again).
+ * total (sequential worst)    200 s  (9 pools; + 30 s SchedulingConfig = 230 s, see RailwayConfigTest)
  * </pre>
  * Outbox-driven work (invite/booking email, push fan-out) is re-queued by the outbox drain worker on the
  * next boot unless the hand-off was already accepted (push: see
@@ -89,7 +93,8 @@ public class AsyncConfig implements AsyncConfigurer {
     static final int PUSH_SHUTDOWN_GRACE_SECONDS = 30;
     static final int SMS_SEND_SHUTDOWN_GRACE_SECONDS = 20;
     static final int CACHE_EVICTION_SHUTDOWN_GRACE_SECONDS = 10;
-    static final int BLOB_PURGE_SHUTDOWN_GRACE_SECONDS = 10;
+    /** Phase 417 audit-fix 2: one worst-case Cloudflare purge chunk (~15 s) plus margin. */
+    static final int BLOB_PURGE_SHUTDOWN_GRACE_SECONDS = 20;
     static final int BLOB_PURGE_POOL_SIZE = 2;
     static final int BLOB_PURGE_QUEUE_CAPACITY = 500;
 
@@ -829,7 +834,7 @@ public class AsyncConfig implements AsyncConfigurer {
     @Bean(name = "blobPurgeExecutor")
     @Profile("!test")
     public TaskExecutor blobPurgeExecutor() {
-        // Loss-reporting subclass (perf PERF-2): the 10 s drain can abandon up to BLOB_PURGE_QUEUE_CAPACITY
+        // Loss-reporting subclass (perf PERF-2): the 20 s drain can abandon up to BLOB_PURGE_QUEUE_CAPACITY
         // queued purges; without it they vanish behind Spring's count-less timeout warning.
         ThreadPoolTaskExecutor executor = new BlobPurgeLossReportingTaskExecutor(BLOB_PURGE_SHUTDOWN_GRACE_SECONDS);
         executor.setCorePoolSize(BLOB_PURGE_POOL_SIZE);

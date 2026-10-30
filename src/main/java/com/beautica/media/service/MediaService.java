@@ -1396,6 +1396,9 @@ public class MediaService {
         );
     }
 
+    // INVARIANT: every upload gets a never-reused key and objects are never overwritten.
+    // R2StorageService.IMMUTABLE_CACHE_CONTROL (immutable plus a 7-day edge TTL) depends on this.
+    // Never derive keys from client input or entity ids alone. See phase 417.
     /**
      * Build a server-generated R2 key from a stable prefix + millis + UUID + the
      * canonical extension for the detected MIME. Client filenames are never used.
