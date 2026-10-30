@@ -117,6 +117,31 @@ class ReviewPageCorsIT extends AbstractIntegrationTest {
     }
 
     @Test
+    @DisplayName("phase 414: the moderation-action confirm POST admits the public origin only; null / foreign rejected")
+    void should_scopeCors_when_moderationActionConfirm() throws Exception {
+        String confirm = "/api/v1/moderation/actions/confirm";
+
+        MockHttpServletResponse publicOrigin = postWithOrigin(confirm, PUBLIC_BASE).getResponse();
+        MockHttpServletResponse nullOrigin = postWithOrigin(confirm, "null").getResponse();
+        MockHttpServletResponse foreign = postWithOrigin(confirm, "https://evil.example").getResponse();
+
+        assertThat(publicOrigin.getStatus()).as("no nonce → the friendly INVALID page, not a CORS 403").isEqualTo(410);
+        assertThat(publicOrigin.getHeader("Access-Control-Allow-Origin")).isEqualTo(PUBLIC_BASE);
+        assertThat(nullOrigin.getStatus()).isEqualTo(403);
+        assertThat(foreign.getStatus()).isEqualTo(403);
+    }
+
+    @Test
+    @DisplayName("audit-fix: the moderation-action confirm POST has its own CORS entry — the website origin is rejected")
+    void should_rejectFrontendOrigin_when_moderationActionConfirm() throws Exception {
+        MockHttpServletResponse response = postWithOrigin("/api/v1/moderation/actions/confirm", FRONTEND_BASE)
+                .getResponse();
+
+        assertThat(response.getStatus()).isEqualTo(403);
+        assertThat(response.getHeader("Access-Control-Allow-Origin")).isNull();
+    }
+
+    @Test
     @DisplayName("trailing-slash path does not inherit the scoped entry: public origin is not served 2xx")
     void should_notSucceed_when_pathHasTrailingSlash() throws Exception {
         MockHttpServletResponse response = postWithOrigin(APPROVE_CAT + "/", PUBLIC_BASE).getResponse();

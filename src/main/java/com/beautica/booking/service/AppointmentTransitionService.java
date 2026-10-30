@@ -8,9 +8,11 @@ import com.beautica.booking.dto.AppointmentProviderNoteRequest;
 import com.beautica.booking.dto.AppointmentRescheduleRequest;
 import com.beautica.booking.entity.Appointment;
 import com.beautica.booking.entity.Booking;
+import com.beautica.booking.enums.BookingSource;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.enums.CancellationReason;
 import com.beautica.booking.event.BookingCompletedEvent;
+import com.beautica.booking.event.GuestVisitCompletedEvent;
 import com.beautica.booking.repository.AppointmentRepository;
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.common.cache.MasterCachePrefixEvictor;
@@ -19,6 +21,7 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ClientBookingConflictException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
+import com.beautica.common.exception.RescheduleLimitReachedException;
 import com.beautica.common.security.AuthorizationService;
 import com.beautica.master.entity.Master;
 import com.beautica.notification.inapp.entity.InAppNotificationType;
@@ -32,11 +35,14 @@ import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
@@ -173,6 +179,10 @@ public class AppointmentTransitionService {
 
         // No revenue eviction on a decline (mirrors BookingService#declineBooking).
         persistAndNotify(ctx.appointment(), ctx.items(), null);
+        // Phase 431 — ONE performing-master e-mail row per visit (own retry state), keyed to the same
+        // first item as the client row; skipped when the master declined it themselves.
+        outboxService.enqueueMasterBookingDeclined(
+                ctx.items().get(0).getId(), masterUserIdOf(ctx.items().get(0)), actorId);
         // Phase 333, matrix row 3 — client (if registered) + performing master unless actor. Once
         // per appointment (visit granularity) — incl. walk-ins (restricted to the master cell inside
         // InAppNotificationService, since a walk-in's clientId is always null). `ctx.firstItem()`
@@ -305,6 +315,8 @@ public class AppointmentTransitionService {
 
         // Reference the DECLINED CHILD (not item 0) so the client notification names the right service.
         outboxService.enqueueStatusChanged(target.getId());
+        // Phase 431: the performing master's e-mail as its own row (skipped when they are the actor).
+        outboxService.enqueueMasterBookingDeclined(target.getId(), masterUserIdOf(target), actorId);
         // Phase 333, matrix row 3 — per-item, booking-keyed (visit granularity does not apply to a
         // per-service decline): client (if registered) + performing master unless actor. `target` is
         // already loaded (via loadItemsOrThrow above) — never reloaded (audit-fix cycle 1, finding 1).
@@ -684,6 +696,7 @@ public class AppointmentTransitionService {
         // records that faithfully and the listener skips it.
         eventPublisher.publishEvent(new BookingCompletedEvent(
                 ctx.appointment().getClient() != null ? ctx.appointment().getClient().getId() : null));
+        publishGuestVisitCompleted(appointmentId, ctx.appointment().getBookingSource());
     }
 
     /**
@@ -845,6 +858,21 @@ public class AppointmentTransitionService {
         // keeping it synchronous would pay K synchronous O(cacheSize) Caffeine scans on the request
         // thread instead of the ONE the whole-visit completeAppointment pays.
         registerEviction(List.of(target), actorId, RevenueEvictionMode.ASYNC);
+
+        // Phase 400 D1 — every item completion of a LINK visit announces it; the review-invite consumer creates at
+        // most one invite per visit, so the FIRST completed item fixes send_after.
+        publishGuestVisitCompleted(appointmentId, target.getBookingSource());
+    }
+
+    /**
+     * Phase 400 D1 — announces that a booking of a guest (LINK) visit reached COMPLETED. Published inside the
+     * completing transaction; the {@code AFTER_COMMIT} consumer ({@code ReviewInviteScheduler}) sees nothing for a
+     * rolled-back completion. APP / STAFF visits publish nothing — they never get a review-invite SMS.
+     */
+    private void publishGuestVisitCompleted(UUID appointmentId, BookingSource source) {
+        if (source == BookingSource.LINK) {
+            eventPublisher.publishEvent(new GuestVisitCompletedEvent(appointmentId, clock.instant()));
+        }
     }
 
     /**
@@ -996,6 +1024,10 @@ public class AppointmentTransitionService {
         if (lockResult == null) {
             throw new BusinessException(HttpStatus.INTERNAL_SERVER_ERROR, "Advisory lock acquisition failed");
         }
+        // Phase 431 — guest-visit reschedule cap, under the master lock and before any change.
+        if (initiatedByProvider) {
+            assertGuestRescheduleWithinLimitAndRecord(confirmedItems.get(0), appointmentId);
+        }
 
         // Global lock order: client(1) advisory → master(0) advisory → appointment header → booking
         // rows. The header lock sits AFTER both advisory locks: every cascade (master self-delete/
@@ -1032,7 +1064,8 @@ public class AppointmentTransitionService {
 
         // Phase 27.3 outbox family, reused verbatim: referencing the FIRST (confirmed) item only
         // (never one per service) — the drain worker addresses the OTHER party from that one booking.
-        outboxService.enqueueBookingRescheduled(saved.get(0).getId(), initiatedByProvider);
+        // Phase 431: a PROVIDER move records the new start and enqueues the master e-mail row.
+        enqueueRescheduled(saved.get(0), initiatedByProvider, actorUserId);
         // Phase 333, matrix row 4 — once per appointment (visit granularity). `saved.get(0)` is the
         // same managed item instance already loaded — never reloaded (audit-fix cycle 1, finding 1).
         inAppNotificationService.notifyRescheduledVisit(
@@ -1208,6 +1241,10 @@ public class AppointmentTransitionService {
         if (lockResult == null) {
             throw new BusinessException(HttpStatus.INTERNAL_SERVER_ERROR, "Advisory lock acquisition failed");
         }
+        // Phase 431 — a one-service move counts against the VISIT's guest reschedule cap.
+        if (initiatedByProvider) {
+            assertGuestRescheduleWithinLimitAndRecord(target, appointmentId);
+        }
 
         // Global lock order: client(1) → master(0) → appointment header → booking rows (header AFTER
         // both advisory locks, matching every cascade). Unlike
@@ -1242,7 +1279,8 @@ public class AppointmentTransitionService {
         // oversight; do not "restore symmetry" with the decline/cancel item paths by adding one.
 
         // Reference the MOVED CHILD (never item 0) so the notification names the right service.
-        outboxService.enqueueBookingRescheduled(saved.getId(), initiatedByProvider);
+        // Phase 431: a PROVIDER move records the new start and enqueues the master e-mail row.
+        enqueueRescheduled(saved, initiatedByProvider, actorUserId);
         // Phase 333, matrix row 4 — per-item, booking-keyed (a per-item reschedule stays per-booking,
         // never visit-level). `saved` is `target` post-reschedule (same managed instance) — never
         // reloaded (audit-fix cycle 1, finding 1).
@@ -1895,6 +1933,60 @@ public class AppointmentTransitionService {
         appointmentRepository.save(appointment);
         outboxService.enqueueStatusChanged(items.get(0).getId());
         registerEviction(items, revenueActorId);
+    }
+
+    /**
+     * Phase 431 — the provider-initiated reschedule row records the moved booking's NEW start (guest
+     * SMS burst collapse) and a separate performing-master e-mail row is enqueued (skipped when the
+     * master is the actor); the client-initiated row is written exactly as before (the 2-arg form).
+     */
+    private void enqueueRescheduled(Booking moved, boolean initiatedByProvider, UUID actorUserId) {
+        if (initiatedByProvider) {
+            outboxService.enqueueBookingRescheduled(moved.getId(), true, moved.getStartsAt().toInstant());
+            outboxService.enqueueMasterBookingRescheduled(moved.getId(), masterUserIdOf(moved), actorUserId);
+        } else {
+            outboxService.enqueueBookingRescheduled(moved.getId(), false);
+        }
+    }
+
+    /** Phase 431 — provider reschedules allowed per guest booking/visit per {@link #GUEST_RESCHEDULE_WINDOW}. */
+    static final long MAX_GUEST_PROVIDER_RESCHEDULES = 5;
+    static final Duration GUEST_RESCHEDULE_WINDOW = Duration.ofHours(24);
+
+    /**
+     * Phase 431 (user decision 2026-10-30) — at most {@link #MAX_GUEST_PROVIDER_RESCHEDULES} PROVIDER
+     * reschedules per GUEST booking or visit ({@code client_id IS NULL}) per rolling
+     * {@link #GUEST_RESCHEDULE_WINDOW}; the next one is rejected with
+     * {@link RescheduleLimitReachedException} ({@code 409 RESCHEDULE_LIMIT_REACHED}) before any change.
+     * Counts reschedules, not SMS: a whole-visit move counts once, a one-service move counts against
+     * its visit ({@code scope} = the appointment id, else the booking id). A registered client's
+     * booking has no cap.
+     *
+     * <p>Callers invoke it AFTER the per-master advisory lock: every reschedule of the same
+     * booking/visit takes that lock, so the count and the insert cannot race. The record rolls back
+     * with the transaction if the reschedule later fails (e.g. a slot conflict), so only committed
+     * reschedules count. Shared with {@code BookingService#rescheduleBooking}.
+     *
+     * @param moved         the moved booking (the first item for a whole-visit move)
+     * @param appointmentId the visit, or {@code null} for a standalone booking
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void assertGuestRescheduleWithinLimitAndRecord(Booking moved, UUID appointmentId) {
+        if (moved.getClient() != null) {
+            return;
+        }
+        UUID scopeId = appointmentId != null ? appointmentId : moved.getId();
+        Instant now = clock.instant();
+        if (bookingRepository.countGuestProviderReschedulesSince(scopeId, now.minus(GUEST_RESCHEDULE_WINDOW))
+                >= MAX_GUEST_PROVIDER_RESCHEDULES) {
+            throw new RescheduleLimitReachedException();
+        }
+        bookingRepository.recordGuestProviderReschedule(scopeId, moved.getId(), now);
+    }
+
+    /** Phase 431 — the performing master's user id, or {@code null} for a detached master. */
+    private static UUID masterUserIdOf(Booking booking) {
+        return booking.getMaster().getUser() == null ? null : booking.getMaster().getUser().getId();
     }
 
     /**

@@ -178,6 +178,31 @@ public class BookingSmsProperties {
             this.cancellation = cancellation;
         }
 
+        /**
+         * Phase 431 — the SMS an account-less guest (LINK guest or STAFF walk-in) gets when the
+         * PROVIDER moves their booking, or one service of their visit, to a new time. Placeholders:
+         * {@code {date}} ({@code dd.MM.yyyy}) and {@code {time}} ({@code HH:mm}), both Kyiv wall clock,
+         * each exactly once. Fixed copy otherwise — no provider note, no master/salon name — on the
+         * phase 390 cancellation-SMS precedent ({@code GuestProviderCancellationSmsText}), whose
+         * "Beautica: " prefix it follows.
+         *
+         * <p>53 UCS-2 chars rendered (one segment). {@code GuestRescheduleSmsText} fails boot when an
+         * override drops a placeholder or renders over two UCS-2 segments (134 chars).
+         *
+         * <p>Like {@link #walkInConfirmation}, this Java literal is the SINGLE source of the copy:
+         * {@code application.yml} carries no {@code reschedule:} key. Override per environment with
+         * the relaxed-binding env var {@code APP_BOOKING_SMS_RESCHEDULE}.
+         */
+        private String reschedule = "Beautica: Ваш запис перенесено на {date} о {time}.";
+
+        public String getReschedule() {
+            return reschedule;
+        }
+
+        public void setReschedule(String reschedule) {
+            this.reschedule = reschedule;
+        }
+
         // Phase 390: the guest provider-cancellation SMS (decline, salon closure, master removal)
         // is fixed copy in notification/service/GuestProviderCancellationSmsText, not a template
         // here — it carries no provider text and its length is pinned by tests. The former

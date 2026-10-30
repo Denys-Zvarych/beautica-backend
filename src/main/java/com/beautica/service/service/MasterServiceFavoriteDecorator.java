@@ -64,7 +64,7 @@ public class MasterServiceFavoriteDecorator {
         }
 
         List<UUID> targetIds = services.stream().map(MasterServiceResponse::id).toList();
-        Set<UUID> favoritedIds = favoriteRepository.findFavoritedServiceIds(
+        Set<UUID> favoritedIds = favoriteRepository.findFavoritedTargetIds(
                 clientId, FavoriteTargetType.SERVICE, targetIds);
 
         return services.stream()

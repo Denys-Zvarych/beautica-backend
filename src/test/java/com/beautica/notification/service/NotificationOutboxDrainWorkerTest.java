@@ -1070,4 +1070,122 @@ class NotificationOutboxDrainWorkerTest {
         assertThat(outboxEntry.getLastError()).isNotNull();
         verify(notificationService, never()).sendInviteEmail(any(), any(), any());
     }
+
+    // ── Phase 431 audit-fix cycle 1: the performing-master mail is its own row ─────────────────
+
+    private static final String PROVIDER_RESCHEDULE_PAYLOAD = "{\"initiatedBy\":\"PROVIDER\",\"startsAt\":\"1785600000\"}";
+
+    private static String actorPayload(UUID actor) {
+        return "{\"actorUserId\":\"" + actor + "\"}";
+    }
+
+    @Test
+    @DisplayName("Phase 431: the guest SMS row is back-pressured and retried, the master row is sent ONCE — the "
+            + "master mail is never repeated by the guest row's re-queue")
+    void should_sendMasterEmailOnce_when_guestSmsBackpressuredThenRetried() {
+        NotificationOutboxDrainWorker w = workerWithRealMapper();
+        UUID bookingId = UUID.randomUUID();
+        UUID actor = UUID.randomUUID();
+        NotificationOutboxEntry guestRow = entry(OutboxEventType.BOOKING_RESCHEDULED, 0, PROVIDER_RESCHEDULE_PAYLOAD, bookingId);
+        NotificationOutboxEntry masterRow = entry(OutboxEventType.MASTER_BOOKING_RESCHEDULED, 0, actorPayload(actor), bookingId);
+        Booking booking = mock(Booking.class);
+        when(booking.getId()).thenReturn(bookingId);
+        when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(booking));
+        when(outboxRepository.claimPendingBatch(50))
+                .thenReturn(List.of(guestRow, masterRow))
+                .thenReturn(List.of(guestRow));
+        doThrow(new com.beautica.notification.sms.SmsBackpressureException("saturated"))
+                .doNothing()
+                .when(notificationService).notifyBookingRescheduledClient(booking, null, 1785600000L);
+
+        w.drain();
+        assertThat(guestRow.getStatus()).isEqualTo(OutboxStatus.PENDING);
+        assertThat(masterRow.getStatus()).isEqualTo(OutboxStatus.SENT);
+        w.drain();
+
+        assertThat(guestRow.getStatus()).isEqualTo(OutboxStatus.SENT);
+        assertThat(guestRow.getAttempts()).as("back-pressure is not an attempt").isZero();
+        verify(notificationService, times(1)).notifyMasterOfProviderReschedule(booking, actor);
+        verify(notificationService, times(2)).notifyBookingRescheduledClient(booking, null, 1785600000L);
+    }
+
+    @Test
+    @DisplayName("Phase 431: a permanently failing master mail walks only ITS row to DEAD — the guest row is SENT")
+    void should_stillSendGuestSms_when_masterEmailPermanentlyFails() {
+        NotificationOutboxDrainWorker w = workerWithRealMapper();
+        UUID bookingId = UUID.randomUUID();
+        UUID actor = UUID.randomUUID();
+        NotificationOutboxEntry guestRow = entry(OutboxEventType.BOOKING_RESCHEDULED, 0, PROVIDER_RESCHEDULE_PAYLOAD, bookingId);
+        NotificationOutboxEntry masterRow = entry(OutboxEventType.MASTER_BOOKING_RESCHEDULED,
+                NotificationOutboxDrainWorker.MAX_ATTEMPTS - 1, actorPayload(actor), bookingId);
+        Booking booking = mock(Booking.class);
+        when(booking.getId()).thenReturn(bookingId);
+        when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(booking));
+        when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(masterRow, guestRow));
+        doThrow(new IllegalStateException("template broken"))
+                .when(notificationService).notifyMasterOfProviderReschedule(booking, actor);
+
+        w.drain();
+
+        assertThat(masterRow.getStatus()).isEqualTo(OutboxStatus.DEAD);
+        assertThat(guestRow.getStatus()).isEqualTo(OutboxStatus.SENT);
+        verify(notificationService).notifyBookingRescheduledClient(booking, null, 1785600000L);
+    }
+
+    @Test
+    @DisplayName("Phase 431: a legacy PROVIDER row (no startsAt, no actor) drains to SENT through the client path "
+            + "with no start, and never reaches the master mail")
+    void should_drainLegacyProviderRow_when_payloadPredatesPhase431() {
+        NotificationOutboxDrainWorker w = workerWithRealMapper();
+        UUID bookingId = UUID.randomUUID();
+        NotificationOutboxEntry legacy = entry(OutboxEventType.BOOKING_RESCHEDULED, 0, "{\"initiatedBy\":\"PROVIDER\"}", bookingId);
+        Booking booking = mock(Booking.class);
+        when(booking.getId()).thenReturn(bookingId);
+        when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(booking));
+        when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(legacy));
+
+        w.drain();
+
+        assertThat(legacy.getStatus()).isEqualTo(OutboxStatus.SENT);
+        verify(notificationService).notifyBookingRescheduledClient(booking, null, null);
+        verify(notificationService, never()).notifyMasterOfProviderReschedule(any(), any());
+        verify(notificationService, never()).notifyBookingRescheduled(any());
+    }
+
+    @Test
+    @DisplayName("Phase 431: a MASTER_BOOKING_DECLINED row resolves the visit and passes the payload actor")
+    void should_dispatchMasterDecline_when_masterDeclinedRowProcessed() {
+        NotificationOutboxDrainWorker w = workerWithRealMapper();
+        UUID bookingId = UUID.randomUUID();
+        UUID actor = UUID.randomUUID();
+        NotificationOutboxEntry row = entry(OutboxEventType.MASTER_BOOKING_DECLINED, 0, actorPayload(actor), bookingId);
+        Booking booking = mock(Booking.class);
+        when(booking.getId()).thenReturn(bookingId);
+        when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(booking));
+        when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(row));
+
+        w.drain();
+
+        assertThat(row.getStatus()).isEqualTo(OutboxStatus.SENT);
+        verify(notificationService).notifyMasterOfProviderDecline(BookingVisit.single(booking), actor);
+        verify(notificationService, never()).notifyBookingStatusChanged(any());
+    }
+
+    @Test
+    @DisplayName("Phase 431: an unreadable actor id is treated as unknown (null), never thrown")
+    void should_passNullActor_when_actorIdUnreadable() {
+        NotificationOutboxDrainWorker w = workerWithRealMapper();
+        UUID bookingId = UUID.randomUUID();
+        NotificationOutboxEntry row = entry(OutboxEventType.MASTER_BOOKING_RESCHEDULED, 0,
+                "{\"actorUserId\":\"not-a-uuid\"}", bookingId);
+        Booking booking = mock(Booking.class);
+        when(booking.getId()).thenReturn(bookingId);
+        when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(booking));
+        when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(row));
+
+        w.drain();
+
+        assertThat(row.getStatus()).isEqualTo(OutboxStatus.SENT);
+        verify(notificationService).notifyMasterOfProviderReschedule(booking, null);
+    }
 }

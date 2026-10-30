@@ -1285,6 +1285,23 @@ class GlobalExceptionHandlerTest {
                 .isEqualTo("Portfolio photo limit reached");
     }
 
+    // ── guest reschedule cap (Phase 431, D4b) ──────────────────────────────────
+
+    @Test
+    @DisplayName("handleRescheduleLimitReached — 409 with the exact coded body the mobile app branches on")
+    void should_return409WithExactRescheduleLimitBody_when_rescheduleLimitReached() throws Exception {
+        var ex = new RescheduleLimitReachedException();
+
+        ResponseEntity<ApiResponse<com.beautica.booking.dto.RescheduleLimitReachedResponse>> response =
+                handler.handleRescheduleLimitReached(ex);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+        assertThat(new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(response.getBody()))
+                .as("wire body; data.code is the mobile contract, message is the cap's own copy")
+                .isEqualTo("{\"success\":false,\"data\":{\"code\":\"RESCHEDULE_LIMIT_REACHED\"},"
+                        + "\"message\":\"Reschedule limit reached for this booking\"}");
+    }
+
     @Test
     @DisplayName("handlePortfolioBusy — 503 + Retry-After, allow-listed message, no data")
     void should_return503WithRetryAfter_when_portfolioBusy() {
@@ -1733,5 +1750,39 @@ class GlobalExceptionHandlerTest {
      */
     private enum SelfRegistrationRoleStub {
         CLIENT, INDEPENDENT_MASTER
+    }
+
+    @Test
+    @DisplayName("ContentReportRateLimitedException → 429 with Retry-After and a generic message (phase 395 D6)")
+    void should_return429WithRetryAfter_when_contentReportRateLimited() {
+        ContentReportRateLimitedException ex = new ContentReportRateLimitedException(86_400);
+
+        ResponseEntity<ApiResponse<Void>> response = handler.handleContentReportRateLimited(ex);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.TOO_MANY_REQUESTS);
+        assertThat(response.getHeaders().getFirst(HttpHeaders.RETRY_AFTER)).isEqualTo("86400");
+        assertThat(response.getBody()).isNotNull();
+        assertThat(response.getBody().success()).isFalse();
+        assertThat(response.getBody().message())
+                .isEqualTo("Too many reports — please try again later")
+                .doesNotContain("20")
+                .doesNotContain("86400");
+    }
+
+    @Test
+    @DisplayName("ClientBlockRateLimitedException → standard 429 with Retry-After, no budget figures (phase 397)")
+    void should_return429WithRetryAfter_when_clientBlockRateLimited() {
+        ClientBlockRateLimitedException ex = new ClientBlockRateLimitedException(3_600);
+
+        ResponseEntity<ApiResponse<Void>> response = handler.handleClientBlockRateLimited(ex);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.TOO_MANY_REQUESTS);
+        assertThat(response.getHeaders().getFirst(HttpHeaders.RETRY_AFTER)).isEqualTo("3600");
+        assertThat(response.getBody()).isNotNull();
+        assertThat(response.getBody().success()).isFalse();
+        assertThat(response.getBody().message())
+                .isEqualTo("Too many requests — please slow down")
+                .doesNotContain("30")
+                .doesNotContain("3600");
     }
 }

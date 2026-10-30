@@ -106,7 +106,10 @@ public class NotificationOutboxDrainWorker {
      */
     private static final Set<OutboxEventType> VISIT_AWARE_EVENTS = Set.of(
             OutboxEventType.NEW_BOOKING, OutboxEventType.STATUS_CHANGED, OutboxEventType.SALON_CLOSED,
-            OutboxEventType.MASTER_REMOVED);
+            OutboxEventType.MASTER_REMOVED,
+            // Phase 431 — the performing master's decline mail names the whole visit for a whole-visit
+            // decline (one row per visit, keyed to the same first item as the STATUS_CHANGED row).
+            OutboxEventType.MASTER_BOOKING_DECLINED);
 
     /**
      * Redacts URL query strings, JWT-shaped values, and Bearer header values from
@@ -546,13 +549,23 @@ public class NotificationOutboxDrainWorker {
             case CLIENT_CANCELLED -> notificationService.notifyClientCancelled(getBooking(entry, bookingCache));
             case BOOKING_RESCHEDULED -> {
                 Booking booking = getBooking(entry, bookingCache);
-                if (resolveRescheduleInitiatedByProvider(entry)) {
-                    notificationService.notifyBookingRescheduledClient(booking);
+                // INFO (perf): the payload is parsed ONCE for both fields.
+                Map<String, String> payload = readPayload(entry);
+                if (isProviderInitiated(payload)) {
+                    // Phase 431 — the entry id de-duplicates the SMS budget reservation across a
+                    // back-pressure retry; the payload start collapses bursts / skips stale sends.
+                    notificationService.notifyBookingRescheduledClient(
+                            booking, entry.getId(), epochSecondsOrNull(payload.get(NotificationOutboxService.STARTS_AT)));
                 } else {
                     notificationService.notifyBookingRescheduled(booking);
                 }
             }
             case REVIEW_REQUESTED -> notificationService.notifyReviewRequested(getBooking(entry, bookingCache));
+            // Phase 431 — the performing master's own rows (own retry state, see OutboxEventType).
+            case MASTER_BOOKING_RESCHEDULED -> notificationService.notifyMasterOfProviderReschedule(
+                    getBooking(entry, bookingCache), actorUserIdOrNull(entry, readPayload(entry)));
+            case MASTER_BOOKING_DECLINED -> notificationService.notifyMasterOfProviderDecline(
+                    getVisit(entry, bookingCache, visitSiblings), actorUserIdOrNull(entry, readPayload(entry)));
             case CLOSURE_REMINDER -> notificationService.notifyClosureReminder(getBooking(entry, bookingCache));
             case SALON_CLOSED -> notificationService.notifySalonClosed(getVisit(entry, bookingCache, visitSiblings));
             case MASTER_REMOVED -> notificationService.notifyMasterRemoved(getVisit(entry, bookingCache, visitSiblings));
@@ -593,12 +606,44 @@ public class NotificationOutboxDrainWorker {
      * documented backward-compatible default (see {@code NotificationOutboxService
      * #enqueueBookingRescheduled(UUID, boolean)}).
      */
-    private boolean resolveRescheduleInitiatedByProvider(NotificationOutboxEntry entry) {
+    private static boolean isProviderInitiated(Map<String, String> payload) {
+        return "PROVIDER".equals(payload.get("initiatedBy"));
+    }
+
+    /** The row's JSON payload, parsed once; an absent payload is an empty map. */
+    private Map<String, String> readPayload(NotificationOutboxEntry entry) {
         String payload = entry.getPayload();
-        if (payload == null || payload.isBlank()) {
-            return false;
+        return payload == null || payload.isBlank() ? Map.of() : readJson(payload);
+    }
+
+    /**
+     * Phase 431 — the acting user's id of a performing-master row, or {@code null} when absent or
+     * unreadable. {@code null} is "unknown", and an unknown actor is never e-mailed (it could be the
+     * master themselves).
+     */
+    private static UUID actorUserIdOrNull(NotificationOutboxEntry entry, Map<String, String> payload) {
+        String actor = payload.get(NotificationOutboxService.ACTOR_USER_ID);
+        if (actor == null) {
+            return null;
         }
-        return "PROVIDER".equals(readJson(payload).get("initiatedBy"));
+        try {
+            return UUID.fromString(actor);
+        } catch (IllegalArgumentException e) {
+            log.warn("Outbox entry [{}] has an unreadable actorUserId — treating the actor as unknown", entry.getId());
+            return null;
+        }
+    }
+
+    /** Phase 431 — a provider reschedule's NEW start (epoch seconds), or {@code null} on a pre-431 row. */
+    private static Long epochSecondsOrNull(String value) {
+        if (value == null) {
+            return null;
+        }
+        try {
+            return Long.parseLong(value);
+        } catch (NumberFormatException e) {
+            return null;
+        }
     }
 
     /**

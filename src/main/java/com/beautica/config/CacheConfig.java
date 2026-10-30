@@ -172,7 +172,7 @@ public class CacheConfig {
      *   portfolio           — per-entity portfolio listing, public unauthenticated GET — 5 min TTL, max 2000 entries
      *   reviews-by-master   — paginated review list per master, public endpoint — 5 min TTL, max 1000 entries
      *   reviews-by-salon    — paginated review list per salon, public endpoint — 5 min TTL, max 1000 entries
-     *   review-detail       — single review by ID, public endpoint — 10 min TTL, max 2000 entries (immutable; no evict path)
+     *   review-detail       — single review by ID, public endpoint — 10 min TTL, max 2000 entries (evicted per key on a phase-396 moderation transition)
      *   platform-category-order — approved+active PlatformCategory ordering used to sort a salon's
      *                             public catalog groups (ServiceCatalogService#buildCategoryOrderAndNames);
      *                             admin-approval-gated reference data, identical across every
@@ -519,7 +519,7 @@ public class CacheConfig {
                         .maximumSize(1000)
                         .expireAfterWrite(5, TimeUnit.MINUTES)
                         .build());
-        // Phase 8 — single review by ID; reviews are immutable after creation so TTL is the only expiry path.
+        // Phase 8 — single review by ID. Phase 396: evicted per key by ReviewEventListener on a moderation transition.
         manager.registerCustomCache("review-detail",
                 Caffeine.newBuilder()
                         .maximumSize(2000)

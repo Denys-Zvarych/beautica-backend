@@ -13,6 +13,7 @@ import com.beautica.review.dto.MasterReviewSummaryResponse;
 import com.beautica.review.dto.ReviewResponse;
 import com.beautica.review.dto.SalonReviewSummaryResponse;
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -359,6 +360,40 @@ class ReviewIntegrationTest extends AbstractIntegrationTest {
         assertThat(secondWrapper.data().data().get(0).rating())
                 .as("the persisted review rating must be 4")
                 .isEqualTo(4);
+    }
+
+    @Test
+    @DisplayName("phase 395 — authoredByViewer: true for the author only; the shared cache never leaks it")
+    void should_flagAuthoredByViewerPerCaller_when_masterReviewsListedByAuthorOtherAndAnonymous() throws Exception {
+        UUID masterId        = createIndependentMaster("im-abv-" + System.nanoTime() + "@beautica.test");
+        UUID masterServiceId = createIndependentMasterService(masterId);
+        String authorEmail   = "cli-abv-" + System.nanoTime() + "@beautica.test";
+        String authorToken   = createClientAndGetToken(authorEmail);
+        UUID bookingId       = createCompletedBooking(resolveUserIdByEmail(authorEmail), masterId, masterServiceId);
+        assertThat(postReview(authorToken, bookingId, 5).getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        String otherToken    = createClientAndGetToken("cli-abv-other-" + System.nanoTime() + "@beautica.test");
+        String url           = MASTERS_URL + "/" + masterId + "/reviews";
+
+        // The author reads first, so the cache entry is populated on the author's request.
+        JsonNode byAuthor = getJson(url, authorToken);
+        JsonNode byOther = getJson(url, otherToken);
+        JsonNode anonymous = getJson(url, null);
+        String reviewId = byAuthor.path("data").path("data").get(0).path("id").asText();
+        JsonNode single = getJson(REVIEWS_URL + "/" + reviewId, authorToken);
+
+        assertThat(byAuthor.path("data").path("data").get(0).path("authoredByViewer").asBoolean()).isTrue();
+        assertThat(byOther.path("data").path("data").get(0).path("authoredByViewer").asBoolean()).isFalse();
+        assertThat(anonymous.path("data").path("data").get(0).path("authoredByViewer").isBoolean()).isTrue();
+        assertThat(anonymous.path("data").path("data").get(0).path("authoredByViewer").asBoolean()).isFalse();
+        assertThat(single.path("data").path("authoredByViewer").asBoolean()).isTrue();
+    }
+
+    private JsonNode getJson(String url, String tokenOrNull) throws Exception {
+        HttpHeaders headers = tokenOrNull == null ? new HttpHeaders() : bearerHeaders(tokenOrNull);
+        ResponseEntity<String> resp = restTemplate.exchange(url, org.springframework.http.HttpMethod.GET,
+                new org.springframework.http.HttpEntity<>(headers), String.class);
+        assertThat(resp.getStatusCode()).as("GET %s body=%s", url, resp.getBody()).isEqualTo(HttpStatus.OK);
+        return objectMapper.readTree(resp.getBody());
     }
 
     // ── Master reviews summary (Phase 8.10) ─────────────────────────────────────

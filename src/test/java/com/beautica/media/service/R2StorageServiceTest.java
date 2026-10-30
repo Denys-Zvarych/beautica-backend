@@ -28,6 +28,7 @@ import software.amazon.awssdk.services.s3.model.S3Exception;
 
 import java.io.ByteArrayInputStream;
 import java.io.InputStream;
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
@@ -66,6 +67,9 @@ class R2StorageServiceTest {
     @Mock
     private S3Client s3Client;
 
+    @Mock
+    private CloudflareCachePurger purger;
+
     // ── Logback ListAppender wiring ───────────────────────────────────────────
 
     private ListAppender<ILoggingEvent> listAppender;
@@ -95,7 +99,7 @@ class R2StorageServiceTest {
     void should_redactKeyInLog_when_uploadFileCalledWithR2DisabledAndUuidKey() {
         // Arrange — key that is UUID-shaped; must not appear in the WARN log
         String uuidKey = UUID.randomUUID().toString();
-        R2StorageService service = new R2StorageService(Optional.empty(), BUCKET, PUBLIC_URL);
+        R2StorageService service = new R2StorageService(Optional.empty(), BUCKET, PUBLIC_URL, purger);
         listAppender.list.clear(); // discard boot-time WARN from constructor
 
         // Act
@@ -124,7 +128,7 @@ class R2StorageServiceTest {
     void should_redactKeyInLog_when_deleteFileCalledWithR2DisabledAndUuidKey() {
         // Arrange
         String uuidKey = UUID.randomUUID().toString();
-        R2StorageService service = new R2StorageService(Optional.empty(), BUCKET, PUBLIC_URL);
+        R2StorageService service = new R2StorageService(Optional.empty(), BUCKET, PUBLIC_URL, purger);
         listAppender.list.clear();
 
         // Act
@@ -153,7 +157,7 @@ class R2StorageServiceTest {
     void should_redactKeyInLog_when_buildPublicUrlCalledWithR2DisabledAndUuidKey() {
         // Arrange
         String uuidKey = UUID.randomUUID().toString();
-        R2StorageService service = new R2StorageService(Optional.empty(), BUCKET, PUBLIC_URL);
+        R2StorageService service = new R2StorageService(Optional.empty(), BUCKET, PUBLIC_URL, purger);
         listAppender.list.clear();
 
         // Act
@@ -180,15 +184,15 @@ class R2StorageServiceTest {
     @Test
     @DisplayName("isEnabled reflects whether an S3Client is wired")
     void should_reflectFlag_when_isEnabledCalled() {
-        assertThat(new R2StorageService(Optional.empty(), BUCKET, PUBLIC_URL).isEnabled()).isFalse();
-        assertThat(new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL).isEnabled()).isTrue();
+        assertThat(new R2StorageService(Optional.empty(), BUCKET, PUBLIC_URL, purger).isEnabled()).isFalse();
+        assertThat(new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL, purger).isEnabled()).isTrue();
     }
 
     @Test
     @DisplayName("throws IllegalStateException when R2 is enabled and bucket name is blank")
     void should_throwIllegalState_when_r2EnabledAndBucketNameIsBlank() {
         assertThatThrownBy(() ->
-                new R2StorageService(Optional.of(s3Client), "", PUBLIC_URL))
+                new R2StorageService(Optional.of(s3Client), "", PUBLIC_URL, purger))
             .isInstanceOf(IllegalStateException.class)
             .hasMessageContaining("app.cloudflare-r2.bucket is blank")
             .hasMessageNotContaining("bucket-name");
@@ -198,7 +202,7 @@ class R2StorageServiceTest {
     @DisplayName("throws IllegalStateException when R2 is enabled and public URL is blank")
     void should_throwIllegalState_when_r2EnabledAndPublicUrlIsBlank() {
         assertThatThrownBy(() ->
-                new R2StorageService(Optional.of(s3Client), BUCKET, ""))
+                new R2StorageService(Optional.of(s3Client), BUCKET, "", purger))
             .isInstanceOf(IllegalStateException.class)
             .hasMessageContaining("public-url");
     }
@@ -206,7 +210,7 @@ class R2StorageServiceTest {
     @Test
     @DisplayName("uploadFile returns early without S3 interaction and never reads the stream when R2 is disabled")
     void should_returnEarly_when_uploadFileCalledWithR2Disabled() {
-        R2StorageService service = new R2StorageService(Optional.empty(), BUCKET, PUBLIC_URL);
+        R2StorageService service = new R2StorageService(Optional.empty(), BUCKET, PUBLIC_URL, purger);
         ByteArrayInputStream content = new ByteArrayInputStream(PAYLOAD);
 
         service.uploadFile(KEY, content, PAYLOAD.length, CONTENT_TYPE);
@@ -221,9 +225,23 @@ class R2StorageServiceTest {
     }
 
     @Test
+    @DisplayName("uploadFile sends the phase-417 Cache-Control (1 d browser, 7 d edge, immutable) on every PutObjectRequest")
+    void should_setImmutableCacheControl_when_uploadFileCalledWithR2Enabled() {
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL, purger);
+        InputStream content = new ByteArrayInputStream(PAYLOAD);
+        ArgumentCaptor<PutObjectRequest> requestCaptor = ArgumentCaptor.forClass(PutObjectRequest.class);
+
+        service.uploadFile(KEY, content, PAYLOAD.length, CONTENT_TYPE);
+
+        verify(s3Client).putObject(requestCaptor.capture(), any(RequestBody.class));
+        assertThat(requestCaptor.getValue().cacheControl())
+                .isEqualTo("public, max-age=86400, s-maxage=604800, immutable");
+    }
+
+    @Test
     @DisplayName("uploadFile calls putObject with correct bucket/key/contentType/contentLength when enabled")
     void should_callPutObject_when_uploadFileCalledWithR2Enabled() {
-        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL, purger);
         InputStream content = new ByteArrayInputStream(PAYLOAD);
         ArgumentCaptor<PutObjectRequest> requestCaptor = ArgumentCaptor.forClass(PutObjectRequest.class);
 
@@ -240,7 +258,7 @@ class R2StorageServiceTest {
     @Test
     @DisplayName("deleteFile returns early without S3 interaction when R2 is disabled")
     void should_returnEarly_when_deleteFileCalledWithR2Disabled() {
-        R2StorageService service = new R2StorageService(Optional.empty(), BUCKET, PUBLIC_URL);
+        R2StorageService service = new R2StorageService(Optional.empty(), BUCKET, PUBLIC_URL, purger);
 
         service.deleteFile(KEY);
 
@@ -250,7 +268,7 @@ class R2StorageServiceTest {
     @Test
     @DisplayName("deleteFile calls deleteObject with correct bucket/key when enabled")
     void should_callDeleteObject_when_deleteFileCalledWithR2Enabled() {
-        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL, purger);
         ArgumentCaptor<DeleteObjectRequest> requestCaptor = ArgumentCaptor.forClass(DeleteObjectRequest.class);
 
         service.deleteFile(KEY);
@@ -264,7 +282,7 @@ class R2StorageServiceTest {
     @Test
     @DisplayName("buildPublicUrl returns empty string when R2 is disabled")
     void should_returnEmptyString_when_buildPublicUrlCalledWithR2Disabled() {
-        R2StorageService service = new R2StorageService(Optional.empty(), BUCKET, PUBLIC_URL);
+        R2StorageService service = new R2StorageService(Optional.empty(), BUCKET, PUBLIC_URL, purger);
 
         String url = service.buildPublicUrl(KEY);
 
@@ -274,7 +292,7 @@ class R2StorageServiceTest {
     @Test
     @DisplayName("buildPublicUrl concatenates configured public URL prefix and key when enabled")
     void should_concatenatePublicUrlAndKey_when_buildPublicUrlCalledWithR2Enabled() {
-        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL, purger);
 
         String url = service.buildPublicUrl(KEY);
 
@@ -284,7 +302,7 @@ class R2StorageServiceTest {
     @Test
     @DisplayName("buildPublicUrl strips trailing slash so concatenation never produces double slash")
     void should_stripTrailingSlash_when_publicUrlHasTrailingSlash() {
-        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL_TRAILING);
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL_TRAILING, purger);
 
         String url = service.buildPublicUrl(KEY);
 
@@ -297,7 +315,7 @@ class R2StorageServiceTest {
     @Test
     @DisplayName("uploadFile translates S3Exception to BusinessException (502) without leaking SDK details")
     void should_translateS3Exception_when_uploadFileFails() {
-        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL, purger);
         InputStream content = new ByteArrayInputStream(PAYLOAD);
         S3Exception sdkException = (S3Exception) S3Exception.builder().message("fail").build();
         when(s3Client.putObject(any(PutObjectRequest.class), any(RequestBody.class)))
@@ -317,7 +335,7 @@ class R2StorageServiceTest {
     @Test
     @DisplayName("uploadFile translates SdkClientException to BusinessException (502) without leaking SDK details")
     void should_translateSdkClientException_when_uploadFileFails() {
-        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL, purger);
         InputStream content = new ByteArrayInputStream(PAYLOAD);
         SdkClientException sdkException = SdkClientException.builder().message("network down").build();
         when(s3Client.putObject(any(PutObjectRequest.class), any(RequestBody.class)))
@@ -337,7 +355,7 @@ class R2StorageServiceTest {
     @Test
     @DisplayName("deleteFile translates S3Exception to BusinessException (502) without leaking SDK details")
     void should_translateS3Exception_when_deleteFileFails() {
-        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL, purger);
         S3Exception sdkException = (S3Exception) S3Exception.builder().message("fail").build();
         when(s3Client.deleteObject(any(DeleteObjectRequest.class)))
                 .thenThrow(sdkException);
@@ -356,7 +374,7 @@ class R2StorageServiceTest {
     @Test
     @DisplayName("deleteFile translates SdkClientException to BusinessException (502) without leaking SDK details")
     void should_translateSdkClientException_when_deleteFileFails() {
-        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL, purger);
         SdkClientException sdkException = SdkClientException.builder().message("network down").build();
         when(s3Client.deleteObject(any(DeleteObjectRequest.class)))
                 .thenThrow(sdkException);
@@ -378,7 +396,7 @@ class R2StorageServiceTest {
     @DisplayName("ERROR log omits R2 key and contains '[key omitted]' when uploadFile fails in enabled mode")
     void should_omitKeyInErrorLog_when_uploadFailsInEnabledMode() {
         // Arrange
-        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL, purger);
         listAppender.list.clear();
         S3Exception sdkException = (S3Exception) S3Exception.builder().message("fail").build();
         when(s3Client.putObject(any(PutObjectRequest.class), any(RequestBody.class)))
@@ -410,7 +428,7 @@ class R2StorageServiceTest {
     @DisplayName("ERROR log omits R2 key and contains '[key omitted]' when deleteFile fails in enabled mode")
     void should_omitKeyInErrorLog_when_deleteFailsInEnabledMode() {
         // Arrange
-        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL, purger);
         listAppender.list.clear();
         S3Exception sdkException = (S3Exception) S3Exception.builder().message("fail").build();
         when(s3Client.deleteObject(any(DeleteObjectRequest.class)))
@@ -446,7 +464,7 @@ class R2StorageServiceTest {
         // builder. In the Mockito-mock context the builder accepts null and the mock's putObject
         // returns null (no exception). Pin this observable behaviour so a future null-guard
         // addition is a visible, deliberate change tracked by a green→red flip here.
-        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL, purger);
         ByteArrayInputStream content = new ByteArrayInputStream("data".getBytes());
         ArgumentCaptor<PutObjectRequest> captor = ArgumentCaptor.forClass(PutObjectRequest.class);
 
@@ -464,7 +482,7 @@ class R2StorageServiceTest {
         // The service has no empty-key guard; an empty key is passed straight to the SDK.
         // With a Mockito mock the call completes without exception — pin this behaviour so
         // a future null/empty guard is a visible, deliberate change.
-        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL, purger);
         ArgumentCaptor<DeleteObjectRequest> captor = ArgumentCaptor.forClass(DeleteObjectRequest.class);
 
         service.deleteFile("");
@@ -482,7 +500,7 @@ class R2StorageServiceTest {
         // publicUrlPrefix + "/" + key. A null key is String-concatenated to the literal
         // "null" (no NPE). Pin this so a future null-guard addition is a deliberate,
         // test-visible green→red flip rather than a silent behaviour change.
-        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL, purger);
 
         String url = service.buildPublicUrl(null);
 
@@ -496,7 +514,7 @@ class R2StorageServiceTest {
     void should_yieldTrailingSlashUrl_when_keyIsEmptyOnBuildPublicUrlEnabled() {
         // An empty key produces publicUrlPrefix + "/" + "" = ".../". Pin this boundary so a
         // future guard (e.g. rejecting blank keys) is a visible, deliberate change.
-        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL, purger);
 
         String url = service.buildPublicUrl("");
 
@@ -511,7 +529,7 @@ class R2StorageServiceTest {
     @DisplayName("returns disabled-mode response with empty URL when R2 is disabled — uploadFile is no-op, buildPublicUrl returns empty")
     void should_returnEmptyUrl_when_r2IsDisabledOnUploadFile() {
         // Arrange
-        R2StorageService disabledService = new R2StorageService(Optional.empty(), BUCKET, PUBLIC_URL);
+        R2StorageService disabledService = new R2StorageService(Optional.empty(), BUCKET, PUBLIC_URL, purger);
         ByteArrayInputStream content = new ByteArrayInputStream(PAYLOAD);
 
         // Act — uploadFile is void; the disabled-mode contract is: no S3 interaction,
@@ -534,7 +552,7 @@ class R2StorageServiceTest {
     @Test
     @DisplayName("extractKeyFromPublicUrl recovers the key when the URL carries the configured prefix")
     void should_recoverKey_when_urlCarriesConfiguredPrefix() {
-        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL, purger);
 
         Optional<String> key = service.extractKeyFromPublicUrl("https://pub.example.r2.dev/portfolio/salons/s1/photo.jpg");
 
@@ -544,7 +562,7 @@ class R2StorageServiceTest {
     @Test
     @DisplayName("extractKeyFromPublicUrl round-trips with buildPublicUrl")
     void should_roundTrip_when_extractingAKeyBuildPublicUrlProduced() {
-        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL, purger);
         String builtUrl = service.buildPublicUrl(KEY);
 
         Optional<String> extracted = service.extractKeyFromPublicUrl(builtUrl);
@@ -555,7 +573,7 @@ class R2StorageServiceTest {
     @Test
     @DisplayName("extractKeyFromPublicUrl returns empty — the D2 safety guard — for a URL from a foreign host")
     void should_returnEmpty_when_urlLacksConfiguredPrefix() {
-        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL, purger);
 
         Optional<String> key = service.extractKeyFromPublicUrl("https://evil.example.com/portfolio/salons/s1/photo.jpg");
 
@@ -572,7 +590,7 @@ class R2StorageServiceTest {
             "https://pub.example.r2.dev.evil.com/avatars/u/x.jpg"})
     @DisplayName("extractKeyFromPublicUrl rejects absolute paths, traversal, query/fragment, backslashes and look-alike hosts")
     void should_returnEmpty_when_urlRemainderIsNotAPlainRelativeKey(String url) {
-        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL, purger);
 
         assertThat(service.extractKeyFromPublicUrl(url)).isEmpty();
     }
@@ -580,7 +598,7 @@ class R2StorageServiceTest {
     @Test
     @DisplayName("extractKeyFromPublicUrl returns empty for a null URL")
     void should_returnEmpty_when_urlIsNull() {
-        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL, purger);
 
         Optional<String> key = service.extractKeyFromPublicUrl(null);
 
@@ -591,7 +609,7 @@ class R2StorageServiceTest {
     @DisplayName("extractKeyFromPublicUrl returns empty for a malformed value that merely CONTAINS the prefix "
             + "mid-string rather than starting with it")
     void should_returnEmpty_when_prefixIsNotAtTheStart() {
-        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL, purger);
 
         Optional<String> key = service.extractKeyFromPublicUrl(
                 "https://evil.example.com/redirect?to=" + PUBLIC_URL + "/portfolio/salons/s1/photo.jpg");
@@ -602,7 +620,7 @@ class R2StorageServiceTest {
     @Test
     @DisplayName("extractKeyFromPublicUrl returns empty when the URL is exactly the bare prefix with nothing after it")
     void should_returnEmpty_when_urlIsBarePrefixWithNoRemainder() {
-        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL, purger);
 
         Optional<String> key = service.extractKeyFromPublicUrl(PUBLIC_URL + "/");
 
@@ -612,7 +630,7 @@ class R2StorageServiceTest {
     @Test
     @DisplayName("extractKeyFromPublicUrl returns empty when R2 is disabled, regardless of the URL")
     void should_returnEmpty_when_r2Disabled() {
-        R2StorageService service = new R2StorageService(Optional.empty(), BUCKET, PUBLIC_URL);
+        R2StorageService service = new R2StorageService(Optional.empty(), BUCKET, PUBLIC_URL, purger);
 
         Optional<String> key = service.extractKeyFromPublicUrl(PUBLIC_URL + "/some/key.jpg");
 
@@ -624,7 +642,7 @@ class R2StorageServiceTest {
     @Test
     @DisplayName("deleteFiles returns an empty set and never touches S3 for an empty key collection")
     void should_returnEmptySet_when_deleteFilesCalledWithNoKeys() {
-        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL, purger);
 
         Set<String> failed = service.deleteFiles(List.of());
 
@@ -635,7 +653,7 @@ class R2StorageServiceTest {
     @Test
     @DisplayName("deleteFiles returns an empty set without S3 interaction when R2 is disabled")
     void should_returnEmptySet_when_deleteFilesCalledWithR2Disabled() {
-        R2StorageService service = new R2StorageService(Optional.empty(), BUCKET, PUBLIC_URL);
+        R2StorageService service = new R2StorageService(Optional.empty(), BUCKET, PUBLIC_URL, purger);
 
         Set<String> failed = service.deleteFiles(List.of("a", "b"));
 
@@ -646,7 +664,7 @@ class R2StorageServiceTest {
     @Test
     @DisplayName("deleteFiles issues ONE DeleteObjects call carrying every key when all keys fit in a single chunk")
     void should_issueSingleDeleteObjectsCall_when_deleteFilesCalledWithFewKeys() {
-        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL, purger);
         ArgumentCaptor<DeleteObjectsRequest> captor = ArgumentCaptor.forClass(DeleteObjectsRequest.class);
         when(s3Client.deleteObjects(any(DeleteObjectsRequest.class)))
                 .thenReturn(DeleteObjectsResponse.builder().build());
@@ -665,7 +683,7 @@ class R2StorageServiceTest {
     @Test
     @DisplayName("deleteFiles maps S3's per-key Errors back to the returned failed-key set")
     void should_mapPerKeyErrors_when_deleteObjectsReportsPartialFailure() {
-        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL, purger);
         when(s3Client.deleteObjects(any(DeleteObjectsRequest.class)))
                 .thenReturn(DeleteObjectsResponse.builder()
                         .errors(S3Error.builder().key("k-b").code("AccessDenied").build())
@@ -680,7 +698,7 @@ class R2StorageServiceTest {
     @DisplayName("deleteFiles reports every key in a chunk as failed, without throwing, when the whole "
             + "DeleteObjects round-trip throws S3Exception")
     void should_reportAllKeysFailed_when_deleteObjectsThrowsS3Exception() {
-        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL, purger);
         S3Exception sdkException = (S3Exception) S3Exception.builder().message("fail").build();
         when(s3Client.deleteObjects(any(DeleteObjectsRequest.class))).thenThrow(sdkException);
 
@@ -693,7 +711,7 @@ class R2StorageServiceTest {
     @DisplayName("deleteFiles reports every key in a chunk as failed, without throwing, when the whole "
             + "DeleteObjects round-trip throws SdkClientException")
     void should_reportAllKeysFailed_when_deleteObjectsThrowsSdkClientException() {
-        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL, purger);
         SdkClientException sdkException = SdkClientException.builder().message("network down").build();
         when(s3Client.deleteObjects(any(DeleteObjectsRequest.class))).thenThrow(sdkException);
 
@@ -705,7 +723,7 @@ class R2StorageServiceTest {
     @Test
     @DisplayName("deleteFiles chunks at the 1000-key S3 DeleteObjects limit — 1500 keys become two calls")
     void should_chunkAtOneThousandKeys_when_deleteFilesCalledWithMoreThanTheLimit() {
-        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL, purger);
         List<String> keys = IntStream.range(0, 1500)
                 .mapToObj(i -> "key-" + i)
                 .toList();
@@ -725,7 +743,7 @@ class R2StorageServiceTest {
     @Test
     @DisplayName("deleteFiles de-duplicates repeated keys before calling S3")
     void should_deduplicateKeys_when_deleteFilesCalledWithDuplicates() {
-        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL, purger);
         ArgumentCaptor<DeleteObjectsRequest> captor = ArgumentCaptor.forClass(DeleteObjectsRequest.class);
         when(s3Client.deleteObjects(any(DeleteObjectsRequest.class)))
                 .thenReturn(DeleteObjectsResponse.builder().build());
@@ -747,7 +765,7 @@ class R2StorageServiceTest {
         // A loop bound off by one (e.g. `i <= size` instead of `i < size`) would slip an extra,
         // empty chunk in at exactly the boundary and go undetected by the existing 1500-key test,
         // which only proves the FIRST chunk caps at 1000 — it never proves 1000 alone stays ONE call.
-        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL, purger);
         List<String> keys = IntStream.range(0, 1000).mapToObj(i -> "key-" + i).toList();
         when(s3Client.deleteObjects(any(DeleteObjectsRequest.class)))
                 .thenReturn(DeleteObjectsResponse.builder().build());
@@ -762,7 +780,7 @@ class R2StorageServiceTest {
     @DisplayName("deleteFiles issues exactly TWO DeleteObjects calls for 1001 keys — one key past the "
             + "boundary already forces a second, near-empty chunk")
     void should_issueTwoCalls_when_deleteFilesCalledWithOneThousandAndOneKeys() {
-        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL, purger);
         List<String> keys = IntStream.range(0, 1001).mapToObj(i -> "key-" + i).toList();
         when(s3Client.deleteObjects(any(DeleteObjectsRequest.class)))
                 .thenReturn(DeleteObjectsResponse.builder().build());
@@ -785,7 +803,7 @@ class R2StorageServiceTest {
         // intended `failedKeys.addAll(deleteChunk(chunk))` (accumulate) — every other failure test
         // in this class uses a single chunk, so none of them can observe that regression; only a
         // multi-chunk run where EACH chunk independently reports a failure can.
-        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL, purger);
         List<String> keys = IntStream.range(0, 1001).mapToObj(i -> "key-" + i).toList();
         when(s3Client.deleteObjects(any(DeleteObjectsRequest.class)))
                 .thenReturn(
@@ -801,5 +819,45 @@ class R2StorageServiceTest {
         assertThat(failed)
                 .as("both chunk-1's and chunk-2's reported failures must survive in the final set")
                 .containsExactlyInAnyOrder("key-500", "key-1000");
+    }
+
+    // ── Phase 417 — edge-cache purge on deleteFiles ──────────────────────────
+
+    @Test
+    @DisplayName("deleteFiles purges the public URLs of the successfully deleted keys only")
+    @SuppressWarnings("unchecked")
+    void should_purgeOnlyDeletedKeysPublicUrls_when_deleteFilesPartiallyFails() {
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL, purger);
+        when(s3Client.deleteObjects(any(DeleteObjectsRequest.class)))
+                .thenReturn(DeleteObjectsResponse.builder()
+                        .errors(S3Error.builder().key("k-b").code("AccessDenied").build())
+                        .build());
+        ArgumentCaptor<Collection<String>> urls = ArgumentCaptor.forClass(Collection.class);
+
+        service.deleteFiles(List.of("k-a", "k-b", "k-c"));
+
+        verify(purger).purgeUrls(urls.capture());
+        assertThat(urls.getValue()).containsExactlyInAnyOrder(PUBLIC_URL + "/k-a", PUBLIC_URL + "/k-c");
+    }
+
+    @Test
+    @DisplayName("deleteFiles never calls the purger when R2 is disabled")
+    void should_neverCallPurger_when_deleteFilesCalledWithR2Disabled() {
+        R2StorageService service = new R2StorageService(Optional.empty(), BUCKET, PUBLIC_URL, purger);
+
+        service.deleteFiles(List.of("k-a", "k-b"));
+
+        verifyNoInteractions(purger);
+    }
+
+    @Test
+    @DisplayName("deleteFile (single, never-served blob discard) never purges the edge cache")
+    void should_neverPurge_when_deleteFileCalled() {
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL, purger);
+
+        service.deleteFile(KEY);
+
+        verify(s3Client).deleteObject(any(DeleteObjectRequest.class));
+        verifyNoInteractions(purger);
     }
 }

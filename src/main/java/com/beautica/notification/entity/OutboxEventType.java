@@ -79,5 +79,20 @@ public enum OutboxEventType {
      * {@code FIREBASE_ENABLED=true} — prod stays dark with zero outbox churn. Widened into the CHECK
      * by {@code V184__outbox_event_type_inapp_push.sql}.
      */
-    INAPP_PUSH
+    INAPP_PUSH,
+
+    /**
+     * Phase 431 — the PERFORMING master's "the salon moved your booking" e-mail. Its own row (own
+     * retry state), enqueued beside the client/guest {@link #BOOKING_RESCHEDULED} row only when the
+     * master is not the actor. Payload {@code {"actorUserId":"<uuid>"}}; aggregate = booking id.
+     */
+    MASTER_BOOKING_RESCHEDULED,
+
+    /**
+     * Phase 431 — the PERFORMING master's "the salon cancelled your booking / visit" e-mail. Its own
+     * row beside the client/guest {@link #STATUS_CHANGED} row of a provider decline, only when the
+     * master is not the actor. Payload {@code {"actorUserId":"<uuid>"}}; aggregate = booking id (the
+     * visit's first item for a whole-visit decline).
+     */
+    MASTER_BOOKING_DECLINED
 }

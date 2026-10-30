@@ -1,18 +1,30 @@
 package com.beautica.review.repository;
 
 import com.beautica.review.entity.ClientReview;
+import jakarta.persistence.LockModeType;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Lock;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 
 /**
  * Data access for {@link ClientReview} — the master&rarr;client review direction (Phase 27.4-27.6).
+ *
+ * <p>Phase 396 D3: the client's rating aggregate ({@link #recalculateClientRating}) and its histogram
+ * ({@link #countBySubjectClientIdGroupByRating}) count only {@code moderation_status = 'VISIBLE'} rows; the
+ * existence probes stay unfiltered (a removed review still occupies its booking).
  */
 public interface ClientReviewRepository extends JpaRepository<ClientReview, UUID> {
+
+    /** Phase 396 — the row locked {@code FOR UPDATE} for a moderation transition. */
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("SELECT cr FROM ClientReview cr WHERE cr.id = :id")
+    Optional<ClientReview> findByIdForUpdate(@Param("id") UUID id);
 
     // Duplicate-review guard (Phase 27.5) — cheaper than findByBookingId(...).isPresent(),
     // mirrors ReviewRepository#existsByBookingId.
@@ -93,7 +105,8 @@ public interface ClientReviewRepository extends JpaRepository<ClientReview, UUID
               FROM (SELECT AVG(cr.rating::numeric) AS avg_rating,
                            COUNT(*) AS cnt
                       FROM client_reviews cr
-                     WHERE cr.subject_client_id = :clientId) agg
+                     WHERE cr.subject_client_id = :clientId
+                       AND cr.moderation_status = 'VISIBLE') agg
              WHERE u.id = :clientId
             """, nativeQuery = true)
     void recalculateClientRating(@Param("clientId") UUID clientId);
@@ -115,7 +128,8 @@ public interface ClientReviewRepository extends JpaRepository<ClientReview, UUID
      * ReviewRepository#countByMasterIdGroupByRating} / {@code #countBySalonIdGroupByRating}) take
      * the same approach.
      */
-    @Query("SELECT cr.rating AS rating, COUNT(cr) AS count FROM ClientReview cr WHERE cr.subjectClient.id = :clientId GROUP BY cr.rating")
+    @Query("SELECT cr.rating AS rating, COUNT(cr) AS count FROM ClientReview cr WHERE cr.subjectClient.id = :clientId"
+            + " AND cr.moderationStatus = com.beautica.review.entity.ModerationStatus.VISIBLE GROUP BY cr.rating")
     List<RatingCountProjection> countBySubjectClientIdGroupByRating(@Param("clientId") UUID clientId);
 
     /**
@@ -132,4 +146,27 @@ public interface ClientReviewRepository extends JpaRepository<ClientReview, UUID
     @Modifying
     @Query("DELETE FROM ClientReview cr WHERE cr.subjectClient.id = :subjectClientId")
     void deleteBySubjectClientId(@Param("subjectClientId") UUID subjectClientId);
+
+    /**
+     * Phase 415 — the parties of a client review: who answers for it (the salon when the review's own {@code salon_id}
+     * is set, else the author master's account — a NULL salon_id is an independent-period review, so a master who has
+     * since joined a salon still answers for it; audit-fix SEC 2) and the reviewed client.
+     */
+    interface ClientReviewAuthorRef {
+        UUID getMasterUserId();
+
+        UUID getSalonId();
+
+        UUID getSubjectClientId();
+    }
+
+    /** Phase 415 — scalar author lookup (nothing enters the persistence context). */
+    @Query(value = """
+            SELECT m.user_id AS masterUserId, cr.salon_id AS salonId,
+                   cr.subject_client_id AS subjectClientId
+              FROM client_reviews cr
+              JOIN masters m ON m.id = cr.author_master_id
+             WHERE cr.id = :clientReviewId
+            """, nativeQuery = true)
+    Optional<ClientReviewAuthorRef> findAuthorRefById(@Param("clientReviewId") UUID clientReviewId);
 }

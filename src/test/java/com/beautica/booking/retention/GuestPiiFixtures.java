@@ -1,5 +1,6 @@
 package com.beautica.booking.retention;
 
+import com.beautica.booking.domain.CancelTokenHasher;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 
@@ -7,6 +8,7 @@ import java.math.BigDecimal;
 import java.sql.Timestamp;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -171,6 +173,18 @@ final class GuestPiiFixtures {
 
     Map<String, Object> appointmentRow(UUID id) {
         return jdbc.queryForMap("SELECT * FROM appointments WHERE id = ?", id);
+    }
+
+    /**
+     * The row a pre-V206 snapshot becomes once V206 has run: the plaintext {@code cancel_token} is
+     * cleared and {@code cancel_token_hash} holds its SHA-256 ({@link CancelTokenHasher}) — or NULL when
+     * there was no token. For the migration tests that compare a legacy row before/after migrating to head.
+     */
+    static Map<String, Object> afterV206(Map<String, Object> before) {
+        Map<String, Object> expected = new HashMap<>(before);
+        Object plain = expected.put("cancel_token", null);
+        expected.put("cancel_token_hash", plain == null ? null : CancelTokenHasher.hash((UUID) plain));
+        return expected;
     }
 
     void insertOtp(String phone) {

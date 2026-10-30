@@ -1,5 +1,6 @@
 package com.beautica.booking.service;
 
+import com.beautica.booking.domain.CancelTokenHasher;
 import com.beautica.booking.dto.CancelTokenInfoResponse;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingStatus;
@@ -52,6 +53,8 @@ import static org.mockito.Mockito.when;
 class BookingCancellationServiceTest {
 
     private static final UUID TOKEN = UUID.randomUUID();
+    /** V206: repositories are keyed by the token's SHA-256 hash, never the raw token. */
+    private static final String TOKEN_HASH = CancelTokenHasher.hash(TOKEN);
     private static final UUID BOOKING_ID = UUID.randomUUID();
     private static final String GUEST_PHONE = "+380501234567";
     private static final OffsetDateTime NOW = OffsetDateTime.parse("2026-06-01T10:00:00Z");
@@ -95,7 +98,7 @@ class BookingCancellationServiceTest {
     @DisplayName("getInfo should return cancellable=true when the appointment is well outside the window")
     void should_returnCancellableTrue_when_appointmentFarEnough() {
         OffsetDateTime startsAt = NOW.plusHours(5);
-        when(bookingRepository.findByCancelTokenWithGraph(TOKEN))
+        when(bookingRepository.findByCancelTokenHashWithGraph(TOKEN_HASH))
                 .thenReturn(Optional.of(booking(startsAt, BookingStatus.CONFIRMED)));
 
         CancelTokenInfoResponse info = service.getInfo(TOKEN);
@@ -111,7 +114,7 @@ class BookingCancellationServiceTest {
     @DisplayName("getInfo should return cancellable=false when the appointment is inside the 2h window")
     void should_returnCancellableFalse_when_appointmentInsideWindow() {
         OffsetDateTime startsAt = NOW.plusHours(1);
-        when(bookingRepository.findByCancelTokenWithGraph(TOKEN))
+        when(bookingRepository.findByCancelTokenHashWithGraph(TOKEN_HASH))
                 .thenReturn(Optional.of(booking(startsAt, BookingStatus.CONFIRMED)));
 
         CancelTokenInfoResponse info = service.getInfo(TOKEN);
@@ -122,7 +125,7 @@ class BookingCancellationServiceTest {
     @Test
     @DisplayName("getInfo should throw 404 when the token is unknown / already consumed")
     void should_throwNotFound_when_tokenAbsent() {
-        when(bookingRepository.findByCancelTokenWithGraph(TOKEN)).thenReturn(Optional.empty());
+        when(bookingRepository.findByCancelTokenHashWithGraph(TOKEN_HASH)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> service.getInfo(TOKEN))
                 .isInstanceOf(NotFoundException.class);
@@ -131,7 +134,7 @@ class BookingCancellationServiceTest {
     @Test
     @DisplayName("getInfo should throw 404 when the booking is no longer CONFIRMED")
     void should_throwNotFound_when_statusNotConfirmed() {
-        when(bookingRepository.findByCancelTokenWithGraph(TOKEN))
+        when(bookingRepository.findByCancelTokenHashWithGraph(TOKEN_HASH))
                 .thenReturn(Optional.of(booking(NOW.plusHours(5), BookingStatus.COMPLETED)));
 
         assertThatThrownBy(() -> service.getInfo(TOKEN))
@@ -144,13 +147,13 @@ class BookingCancellationServiceTest {
     @DisplayName("cancel should atomically consume the token, enqueue the master push, and send the Ukrainian SMS")
     void should_cancelAndNotify_when_outsideWindow() {
         OffsetDateTime startsAt = NOW.plusHours(5);
-        when(bookingRepository.findByCancelTokenWithGraph(TOKEN))
+        when(bookingRepository.findByCancelTokenHashWithGraph(TOKEN_HASH))
                 .thenReturn(Optional.of(booking(startsAt, BookingStatus.CONFIRMED)));
-        when(bookingRepository.consumeCancelToken(TOKEN)).thenReturn(1);
+        when(bookingRepository.consumeCancelTokenHash(TOKEN_HASH)).thenReturn(1);
 
         service.cancel(TOKEN);
 
-        verify(bookingRepository).consumeCancelToken(TOKEN);
+        verify(bookingRepository).consumeCancelTokenHash(TOKEN_HASH);
         verify(outboxService).enqueueClientCancelled(BOOKING_ID);
         ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
         verify(smsService).send(eq(GUEST_PHONE), textCaptor.capture());
@@ -164,14 +167,14 @@ class BookingCancellationServiceTest {
     @DisplayName("cancel should throw 422 with the Ukrainian message and fire NO side-effects when inside the window")
     void should_throw422_when_insideWindow() {
         OffsetDateTime startsAt = NOW.plusHours(1);
-        when(bookingRepository.findByCancelTokenWithGraph(TOKEN))
+        when(bookingRepository.findByCancelTokenHashWithGraph(TOKEN_HASH))
                 .thenReturn(Optional.of(booking(startsAt, BookingStatus.CONFIRMED)));
 
         assertThatThrownBy(() -> service.cancel(TOKEN))
                 .isInstanceOf(BusinessException.class)
                 .extracting("status").isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
 
-        verify(bookingRepository, never()).consumeCancelToken(TOKEN);
+        verify(bookingRepository, never()).consumeCancelTokenHash(TOKEN_HASH);
         verifyNoInteractions(outboxService, smsService);
     }
 
@@ -179,9 +182,9 @@ class BookingCancellationServiceTest {
     @DisplayName("cancel should throw 404 and fire NO side-effects when the conditional consume updates 0 rows (lost race / replay)")
     void should_throwNotFound_when_consumeUpdatesZeroRows() {
         OffsetDateTime startsAt = NOW.plusHours(5);
-        when(bookingRepository.findByCancelTokenWithGraph(TOKEN))
+        when(bookingRepository.findByCancelTokenHashWithGraph(TOKEN_HASH))
                 .thenReturn(Optional.of(booking(startsAt, BookingStatus.CONFIRMED)));
-        when(bookingRepository.consumeCancelToken(TOKEN)).thenReturn(0);
+        when(bookingRepository.consumeCancelTokenHash(TOKEN_HASH)).thenReturn(0);
 
         assertThatThrownBy(() -> service.cancel(TOKEN))
                 .isInstanceOf(NotFoundException.class);
@@ -193,12 +196,12 @@ class BookingCancellationServiceTest {
     @Test
     @DisplayName("cancel should throw 404 when the token is unknown (no consume attempt)")
     void should_throwNotFound_when_cancelTokenAbsent() {
-        when(bookingRepository.findByCancelTokenWithGraph(TOKEN)).thenReturn(Optional.empty());
+        when(bookingRepository.findByCancelTokenHashWithGraph(TOKEN_HASH)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> service.cancel(TOKEN))
                 .isInstanceOf(NotFoundException.class);
 
-        verify(bookingRepository, never()).consumeCancelToken(TOKEN);
+        verify(bookingRepository, never()).consumeCancelTokenHash(TOKEN_HASH);
         verifyNoInteractions(outboxService, smsService);
     }
 
@@ -211,9 +214,9 @@ class BookingCancellationServiceTest {
         // "Манікюр {date} о {time}" rendered a SECOND, provider-positioned date/time line inside
         // copy the guest reads as platform text — and SMS is the only channel a guest has.
         OffsetDateTime startsAt = NOW.plusHours(5); // 2026-06-01T15:00Z → 18:00 Kyiv on 01.06.2026
-        when(bookingRepository.findByCancelTokenWithGraph(TOKEN))
+        when(bookingRepository.findByCancelTokenHashWithGraph(TOKEN_HASH))
                 .thenReturn(Optional.of(booking(startsAt, BookingStatus.CONFIRMED, "Манікюр {date} о {time}")));
-        when(bookingRepository.consumeCancelToken(TOKEN)).thenReturn(1);
+        when(bookingRepository.consumeCancelTokenHash(TOKEN_HASH)).thenReturn(1);
         ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
 
         service.cancel(TOKEN);
@@ -235,7 +238,7 @@ class BookingCancellationServiceTest {
     @DisplayName("cancelGuestBooking(sendGuestSms=false) should consume, notify the provider and evict, but send NO guest SMS")
     void should_notifyProviderWithoutGuestSms_when_seamCalledWithSmsSuppressed() {
         Booking booking = booking(NOW.plusMinutes(30), BookingStatus.CONFIRMED);
-        when(bookingRepository.consumeCancelToken(TOKEN)).thenReturn(1);
+        when(bookingRepository.consumeCancelTokenHash(TOKEN_HASH)).thenReturn(1);
 
         boolean cancelled = service.cancelGuestBooking(booking, false);
 
@@ -256,7 +259,7 @@ class BookingCancellationServiceTest {
         boolean cancelled = service.cancelGuestBooking(booking, false);
 
         assertThat(cancelled).isTrue();
-        verify(bookingRepository, never()).consumeCancelToken(org.mockito.ArgumentMatchers.any());
+        verify(bookingRepository, never()).consumeCancelTokenHash(org.mockito.ArgumentMatchers.any());
         verify(outboxService).enqueueClientCancelled(BOOKING_ID);
     }
 

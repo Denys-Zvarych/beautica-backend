@@ -59,6 +59,7 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.function.Supplier;
@@ -874,6 +875,25 @@ public class MediaService {
         evictPortfolioCache(target.entityType(), target.entityId());
     }
 
+    /**
+     * Phase 396 D4 — support takedown of one portfolio photo (MASTER or SALON row), called only by
+     * {@code ModerationService} behind {@code X-Internal-Key}: no actor, so no ownership check. Same M1 invariant as
+     * the owner deletes ({@link #deletePortfolioRow}: row deleted in its own {@code txWrite}, blob purged only after
+     * that commits) and the same post-commit portfolio-cache eviction.
+     *
+     * @return {@code false} when no {@code PORTFOLIO} row with this id exists (already deleted)
+     */
+    public boolean deletePortfolioPhotoForModeration(UUID mediaId) {
+        Optional<DeleteTarget> target = txWrite.execute(status -> mediaRepo.findById(mediaId)
+                .filter(mf -> mf.getMediaType() == MediaType.PORTFOLIO)
+                .map(this::deletePortfolioRow));
+        if (target == null || target.isEmpty()) {
+            return false;
+        }
+        evictPortfolioCache(target.get().entityType(), target.get().entityId());
+        return true;
+    }
+
     /** Shared write step of both portfolio deletes: runs inside {@code txWrite}; registers the after-commit purge. */
     private DeleteTarget deletePortfolioRow(MediaFile mf) {
         DeleteTarget target = new DeleteTarget(mf.getR2Key(), mf.getEntityType(), mf.getEntityId());
@@ -1376,6 +1396,9 @@ public class MediaService {
         );
     }
 
+    // INVARIANT: every upload gets a never-reused key and objects are never overwritten.
+    // R2StorageService.IMMUTABLE_CACHE_CONTROL (immutable plus a 7-day edge TTL) depends on this.
+    // Never derive keys from client input or entity ids alone. See phase 417.
     /**
      * Build a server-generated R2 key from a stable prefix + millis + UUID + the
      * canonical extension for the detected MIME. Client filenames are never used.

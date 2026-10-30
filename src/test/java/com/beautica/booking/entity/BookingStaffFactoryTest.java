@@ -54,7 +54,7 @@ class BookingStaffFactoryTest {
     void should_leaveCancelTokenAndClientNull_when_walkInBookingBuilt() {
         Booking booking = staffBooking("Олена", "Коваль", "+380501234567", STAFF_ID);
 
-        assertThat(booking.getCancelToken()).isNull();
+        assertThat(booking.getCancelTokenHash()).isNull();
         assertThat(booking.getClient()).isNull();
     }
 

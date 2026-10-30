@@ -301,6 +301,17 @@ app:
     # Outbound HTTP timeouts (Duration). socket-timeout is per-read INACTIVITY, not a total deadline.
     connection-timeout: 5s
     socket-timeout: 30s
+  # Phase 417 — Cloudflare edge-cache purge of deleted media (R2StorageService#deleteFiles). Blank zone-id or
+  # purge-token = purge disabled (WARN at boot when R2 is enabled): a deleted object then stays edge-cached for
+  # up to the 7-day s-maxage. The token is a Cache-Purge-only API token for zone beautica.app.
+  cloudflare-cdn:
+    zone-id: ${CLOUDFLARE_CDN_ZONE_ID:}
+    purge-token: ${CLOUDFLARE_CDN_PURGE_TOKEN:}
+    api-base-url: https://api.cloudflare.com/client/v4
+    # Any other api-base-url is refused at boot unless this is true (SSRF guard; tests only).
+    allow-custom-api-base-url: false
+    connect-timeout: 2s
+    read-timeout: 5s
   firebase:
     service-account: ${FIREBASE_SERVICE_ACCOUNT:}
     connect-timeout: 5s
@@ -381,6 +392,10 @@ app:
       # Phase 390 — the guest provider-cancellation SMS (decline, salon closure, master removal) is
       # fixed copy in GuestProviderCancellationSmsText, not a template here (no provider text in it;
       # its length is pinned by tests). Do not re-add `decline:` / `decline-reason:` — nothing reads them.
+      # Phase 431 — the guest reschedule SMS (provider moved a LINK guest's / walk-in's booking) has no
+      # key here either, on the walk-in precedent below: its single source is
+      # BookingSmsProperties.Sms#reschedule. Override with APP_BOOKING_SMS_RESCHEDULE (relaxed binding);
+      # GuestRescheduleSmsText fails boot unless it keeps {date} and {time} and fits 2 UCS-2 segments.
       # Phase 22.7 — the walk-in confirmation (POST /api/v1/masters/{masterId}/bookings) is the ONE
       # template with no key here, deliberately (QA MEDIUM, 2026-08-18). Its text lives in exactly
       # one place: BookingSmsProperties.Sms#walkInConfirmation. A yml copy identical to that default
@@ -393,6 +408,29 @@ app:
       # Constraint that travels with the copy wherever it lives: it must carry NO {cancelUrl} — a
       # STAFF booking has cancel_token = NULL by the V137 CHECK, so there is no link to build and
       # the placeholder would render literally in a real client's message.
+    # Phase 400 — guest review invite SMS (beautica.app/r/{token}) ~2h after a LINK visit is COMPLETED, never
+    # 21:00-09:00 Kyiv (moved to 10:00), one per visit. Bound by ReviewInviteProperties (validated at boot). Needs BOTH
+    # this flag and app.booking.sms.enabled; in staging (beautica.sms.mode=capture) the SMS lands in Mailpit.
+    review-invite:
+      # Default OFF. Turn on only after website 018 (policy that discloses invites) and 019 (/r/{token}) are live.
+      enabled: ${APP_BOOKING_REVIEW_INVITE_ENABLED:false}
+      # The website 018 privacy-policy version (e.g. 2026-11-01). Required when enabled — boot fails if blank.
+      # Guests who accepted an older version are skipped (POLICY_VERSION).
+      min-policy-version: ${APP_BOOKING_REVIEW_INVITE_MIN_POLICY_VERSION:}
+      delay: 2h
+      quiet-start: "21:00"
+      quiet-end: "09:00"
+      send-at: "10:00"
+      stale-after: 72h
+      ttl: 14d
+      # Rows per claim / expiry statement per tick (D4a — every claim is LIMITed).
+      batch-size: 50
+      max-attempts: 3
+      # One UCS-2 segment (<= 70 chars with the 22-char token) — checked at boot. Override for a non-prod web host.
+      sms-text: "${APP_BOOKING_REVIEW_INVITE_SMS_TEXT:Оцініть ваш візит: beautica.app/r/{token}}"
+      job:
+        fixed-delay-ms: 60000
+        initial-delay-ms: 60000
   booking-links:
     # Phase 375 (D6) — kill-switch for GET /api/v1/booking-links/mine. false = the app hides sharing,
     # the endpoint returns {shareEnabled:false, links:[]} and issues NO slug. Stays false in prod until
@@ -423,6 +461,8 @@ app:
     # hostname/action, so staging leaves both empty.
     expected-hostnames: []
     expected-action: ""
+    # Phase 401 — the guest review page (/r/{token}: submit + opt-out) renders its widget with this action.
+    review-expected-action: ""
   admin-email: ${ADMIN_EMAIL:admin@beautica.app}
   support:
     # Fixed destination inbox for the Help / Contact-us feature
@@ -461,6 +501,10 @@ app:
     # JWT_SECRET. Generate: openssl rand -base64 32. Empty default forces every
     # profile to supply a value or fail fast at startup (>= 32 chars required).
     otp-pepper: ${APP_OTP_PEPPER:}
+    # Phase 397 D3 — keyed HMAC-SHA256 pepper for the stable phone hash (client blocks, phase-399 SMS
+    # opt-outs). Dedicated, NOT APP_OTP_PEPPER: it can never rotate without orphaning every stored hash.
+    # Generate: openssl rand -base64 32. Empty default forces every profile to supply one (>= 32 chars).
+    phone-hash-pepper: ${PHONE_HASH_PEPPER:}
   verification:
     # Resend-surviving cumulative brute-force bound: after this many lifetime
     # failed verifies (NOT reset by resend) the account is locked for
@@ -521,6 +565,10 @@ app:
     # flood guard (see RateLimitConfig#inviteCapacity). Local seeding raises it via
     # scripts/start-backend.sh (APP_RATE_LIMIT_INVITE_CAPACITY); prod keeps 15.
     invite-capacity: 15
+    # Phase 414 D13 — the support e-mail's one-click moderation pages, per IP per 10 minutes: the GET confirm page
+    # and the POST decision have separate buckets. Optional overrides (APP_RATE_LIMIT_MODERATION_ACTION_*).
+    moderation-action-page-capacity: 30
+    moderation-action-decision-capacity: 10
   # Phase 373 — guest/walk-in PII retention. GuestPiiRetentionJob anonymises guest_name/surname/
   # phone, guest notes and cancel_token of client-less LINK/STAFF bookings + visit headers this many
   # calendar months after ends_at. retention-months is validated >= 12 (privacy policy promise).
@@ -532,6 +580,30 @@ app:
     retention-months: 12
     batch-size: 500
     max-batches-per-run: 200
+  # Phase 396 — UGC moderation. No env var: defaults are the production values.
+  moderation:
+    # D2 (locked 2026-10-28): distinct eligible reporters (CLIENT with a COMPLETED booking at the provider) that
+    # auto-hide a review.
+    auto-hide-threshold: 3
+    # Burst guard: this many OPEN review reports on one provider within burst-window hold those reports (no
+    # auto-hide from them until support resolves) and flag the support e-mail as a burst.
+    burst-threshold: 5
+    burst-window: 10m
+    # Audit-fix D16: at most this many auto-hides per provider (master or salon) per auto-hide-cap-window. A further
+    # threshold hit holds that review's reports for support and sends a [BURST] e-mail instead of hiding.
+    auto-hide-cap: 1
+    auto-hide-cap-window: 24h
+    # Phase 414 D4 — lifetime of a one-click action link in the support report e-mail (optional override
+    # APP_MODERATION_ACTION_LINK_TTL, ISO-8601, PT1H..P30D).
+    action-link-ttl: P7D
+    retention:
+      # D7 ContentReportRetentionJob: gone-target sweep + purge of reports whose target is gone > 1 year.
+      enabled: true
+      # Staggered from the 03:00 / 03:17 / 03:27 / 03:42 / 03:57 UTC cleanup cluster.
+      cron: "0 37 3 * * *"
+      # Same batching as guest-pii-retention: rows per statement, batch budget per statement kind per run.
+      batch-size: 500
+      max-batches-per-run: 200
   outbox:
     # Base64-encoded 32-byte (AES-256) symmetric key for OutboxPayloadCipher.
     # Generate with: openssl rand -base64 32

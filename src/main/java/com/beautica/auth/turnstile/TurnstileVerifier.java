@@ -64,6 +64,19 @@ public class TurnstileVerifier {
      * @throws BusinessException          (503) when siteverify cannot be reached or answered unusably
      */
     public void verify(String token, String remoteIp) {
+        verify(token, remoteIp, properties.getExpectedAction());
+    }
+
+    /**
+     * Phase 401 — {@link #verify(String, String)} for the guest review page (submit and opt-out): identical checks,
+     * but the action must equal {@code app.turnstile.review-expected-action} (the website renders that widget with
+     * {@code review_submit}, not {@code otp_send}).
+     */
+    public void verifyReviewInvite(String token, String remoteIp) {
+        verify(token, remoteIp, properties.getReviewExpectedAction());
+    }
+
+    private void verify(String token, String remoteIp, String expectedAction) {
         if (!properties.isEnabled()) {
             return;
         }
@@ -80,7 +93,6 @@ public class TurnstileVerifier {
             log.warn("turnstile rejected reason=hostname-mismatch");
             throw new TurnstileRejectedException();
         }
-        String expectedAction = properties.getExpectedAction();
         if (!expectedAction.isEmpty() && !expectedAction.equals(answer.action())) {
             log.warn("turnstile rejected reason=action-mismatch");
             throw new TurnstileRejectedException();

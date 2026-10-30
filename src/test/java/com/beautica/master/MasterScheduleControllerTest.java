@@ -1,5 +1,7 @@
 package com.beautica.master;
 
+import com.beautica.favorite.repository.FavoriteRepository;
+import com.beautica.favorite.service.ProviderFavoriteDecorator;
 import com.beautica.auth.JwtAuthenticationFilter;
 import com.beautica.auth.JwtTokenProvider;
 import com.beautica.auth.Role;
@@ -69,7 +71,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  */
 @WebMvcTest(MasterController.class)
 @TestPropertySource(properties = "app.frontend.base-url=http://localhost:3000")
-@Import(WebMvcTestSupport.class)
+@Import({WebMvcTestSupport.class, ProviderFavoriteDecorator.class})
 @DisplayName("MasterController — schedule endpoints (@WebMvcTest slice)")
 class MasterScheduleControllerTest {
 
@@ -103,6 +105,10 @@ class MasterScheduleControllerTest {
 
     @MockBean
     private MasterService masterService;
+
+    /** Backs the real {@link ProviderFavoriteDecorator} the controller composes post-cache. */
+    @MockBean
+    private FavoriteRepository favoriteRepository;
 
     @MockBean
     private SlotCalculationService slotCalculationService;

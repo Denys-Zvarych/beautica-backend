@@ -5,6 +5,7 @@ import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.LoginRequest;
 import com.beautica.common.ApiResponse;
 import com.beautica.config.TestSecurityConfig;
+import com.beautica.moderation.entity.ReportTargetType;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -314,10 +315,37 @@ class BookingNoteVisibilityIT extends AbstractIntegrationTest {
                 "SELECT column_name FROM information_schema.columns "
                         + "WHERE table_name = 'in_app_notification' "
                         + "AND data_type IN ('text', 'character varying') "
-                        + "AND column_name NOT IN ('type', 'dedup_key')",
+                        + "AND column_name NOT IN ('type', 'dedup_key', 'moderated_target_type')",
                 String.class);
         assertThat(textColumns)
-                .as("every column besides the closed-enum type/dedup_key is a UUID or timestamp")
+                .as("every column besides the closed-enum type/dedup_key/moderated_target_type is a UUID "
+                        + "or timestamp")
                 .isEmpty();
+
+        // moderated_target_type (V219) is exempt above ONLY because a validated CHECK pins it to the
+        // ReportTargetType literals — prove that here so the exemption can never admit free text.
+        var moderatedTargetChecks = jdbcTemplate.queryForList(
+                "SELECT pg_get_constraintdef(c.oid) FROM pg_constraint c "
+                        + "JOIN pg_class t ON t.oid = c.conrelid "
+                        + "WHERE t.relname = 'in_app_notification' AND c.contype = 'c' AND c.convalidated "
+                        + "AND c.conname = 'chk_inapp_moderated_target_type'",
+                String.class);
+        assertThat(moderatedTargetChecks)
+                .as("moderated_target_type is guarded by exactly one validated CHECK")
+                .hasSize(1);
+        String checkDef = moderatedTargetChecks.get(0);
+        assertThat(checkDef)
+                .as("the CHECK constrains moderated_target_type to a closed literal list, no pattern match")
+                .contains("moderated_target_type IS NULL")
+                .doesNotContainIgnoringCase("LIKE")
+                .doesNotContain("~");
+        for (ReportTargetType literal : ReportTargetType.values()) {
+            assertThat(checkDef)
+                    .as("CHECK literal list covers ReportTargetType.%s", literal.name())
+                    .contains("'" + literal.name() + "'");
+        }
+        assertThat(checkDef.split("'", -1).length / 2)
+                .as("CHECK admits exactly the ReportTargetType literals — no extra free-form values")
+                .isEqualTo(ReportTargetType.values().length);
     }
 }

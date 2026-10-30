@@ -1,7 +1,9 @@
 package com.beautica.search.controller;
 
+import com.beautica.common.web.PerViewerResponses;
 import com.beautica.common.ApiResponse;
 import com.beautica.common.PageResponse;
+import com.beautica.favorite.service.ProviderFavoriteDecorator;
 import com.beautica.search.dto.MasterSearchRequest;
 import com.beautica.search.dto.MasterSearchResult;
 import com.beautica.search.dto.SalonSearchRequest;
@@ -14,6 +16,7 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
+import org.springframework.http.ResponseEntity;
 import org.springframework.security.authentication.AnonymousAuthenticationToken;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
@@ -100,6 +103,7 @@ public class SearchController {
     private static final String QUERY_TOO_SHORT_MESSAGE = "Введіть щонайменше 3 символи";
 
     private final SearchService searchService;
+    private final ProviderFavoriteDecorator providerFavoriteDecorator;
 
     /**
      * Search active masters by optional FK location filter
@@ -116,12 +120,13 @@ public class SearchController {
      * {@code MethodArgumentNotValidException} branches.</p>
      */
     @GetMapping("/masters")
-    public ApiResponse<PageResponse<MasterSearchResult>> searchMasters(
+    public ResponseEntity<ApiResponse<PageResponse<MasterSearchResult>>> searchMasters(
             @Valid @ModelAttribute MasterSearchRequest request
     ) {
         Pageable pageable = resolvePageable(request.page(), request.size());
         if (isQueryTooShort(request.q())) {
-            return tooShortQueryResponse(pageable.getPageNumber(), pageable.getPageSize());
+            return PerViewerResponses.ok(
+                    tooShortQueryResponse(pageable.getPageNumber(), pageable.getPageSize()));
         }
         Page<MasterSearchResult> result = searchService.searchMasters(request, pageable);
         // AUTH-GATE street address per-request, AFTER the cache read. Anonymous callers get
@@ -134,13 +139,16 @@ public class SearchController {
         List<MasterSearchResult> content = isAuthenticated()
                 ? result.getContent()
                 : result.getContent().stream().map(MasterSearchResult::withoutStreetAddress).toList();
-        return ApiResponse.ok(PageResponse.of(
-                content,
+        // Per-caller isFavorite, AFTER the shared search cache read: one batched favourites
+        // query for the whole page (ProviderFavoriteDecorator), zero for non-CLIENT callers.
+        // Per-viewer body (isFavorite, street) on a shared public route → no-store + Vary.
+        return PerViewerResponses.ok(ApiResponse.ok(PageResponse.of(
+                providerFavoriteDecorator.decorateMasters(content, currentAuthentication()),
                 result.getNumber(),
                 result.getSize(),
                 result.getTotalElements(),
                 result.getTotalPages()
-        ));
+        )));
     }
 
     /**
@@ -153,25 +161,28 @@ public class SearchController {
      * envelope.</p>
      */
     @GetMapping("/salons")
-    public ApiResponse<PageResponse<SalonSearchResult>> searchSalons(
+    public ResponseEntity<ApiResponse<PageResponse<SalonSearchResult>>> searchSalons(
             @Valid @ModelAttribute SalonSearchRequest request
     ) {
         Pageable pageable = resolvePageable(request.page(), request.size());
         if (isQueryTooShort(request.q())) {
-            return tooShortQueryResponse(pageable.getPageNumber(), pageable.getPageSize());
+            return PerViewerResponses.ok(
+                    tooShortQueryResponse(pageable.getPageNumber(), pageable.getPageSize()));
         }
         Page<SalonSearchResult> result = searchService.searchSalons(request, pageable);
         // AUTH-GATE street address per-request, AFTER the cache read (see masters).
         List<SalonSearchResult> content = isAuthenticated()
                 ? result.getContent()
                 : result.getContent().stream().map(SalonSearchResult::withoutStreetAddress).toList();
-        return ApiResponse.ok(PageResponse.of(
-                content,
+        // Per-caller isFavorite, AFTER the cache read (see masters).
+        // Per-viewer body (isFavorite, street) on a shared public route → no-store + Vary.
+        return PerViewerResponses.ok(ApiResponse.ok(PageResponse.of(
+                providerFavoriteDecorator.decorateSalons(content, currentAuthentication()),
                 result.getNumber(),
                 result.getSize(),
                 result.getTotalElements(),
                 result.getTotalPages()
-        ));
+        )));
     }
 
     /**
@@ -235,9 +246,13 @@ public class SearchController {
      * across the anon/authenticated boundary.</p>
      */
     private static boolean isAuthenticated() {
-        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+        Authentication auth = currentAuthentication();
         return auth != null
                 && auth.isAuthenticated()
                 && !(auth instanceof AnonymousAuthenticationToken);
+    }
+
+    private static Authentication currentAuthentication() {
+        return SecurityContextHolder.getContext().getAuthentication();
     }
 }

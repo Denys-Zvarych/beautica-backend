@@ -2,6 +2,8 @@ package com.beautica.booking.dto;
 
 import io.swagger.v3.oas.annotations.media.Schema;
 
+import java.util.UUID;
+
 /**
  * The CLIENT-authored review of the provider, as it hangs off ONE booking (Phase 317).
  *
@@ -26,6 +28,8 @@ import io.swagger.v3.oas.annotations.media.Schema;
  * name and photo the enclosing {@code BookingDetailResponse} already renders; repeating it here
  * would be a second, independently-drifting copy of the same PII.
  *
+ * @param id the review's id (phase 395) — the {@code targetId} for {@code POST /reports} with
+ *           {@code targetType = REVIEW}; already public through {@code GET /masters/&#123;id&#125;/reviews}
  * @param rating the client's 1-5 star rating, widened from the entity's {@code Short} exactly as
  *               {@code ReviewResponse#from} widens it, so the two surfaces agree on the wire type
  * @param comment the client's free text, or {@code null} — a rating may be left without one
@@ -35,6 +39,9 @@ import io.swagger.v3.oas.annotations.media.Schema;
         + "client — that is a separate entity, written through POST /client-reviews and gated by "
         + "providerCanReviewClient.")
 public record ClientAuthoredReviewResponse(
+
+        @Schema(description = "The review's id — targetId for POST /reports (targetType REVIEW).")
+        UUID id,
 
         @Schema(description = "The client's star rating for this booking, 1-5.")
         Integer rating,

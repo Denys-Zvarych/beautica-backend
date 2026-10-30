@@ -193,7 +193,7 @@ class StaffBookingServiceTest {
             assertThat(saved.getBookingSource()).isEqualTo(BookingSource.STAFF);
             assertThat(saved.getCreatedByUserId()).isEqualTo(staffUserId);
             assertThat(saved.getClient()).as("a walk-in has no account (V137 STAFF branch)").isNull();
-            assertThat(saved.getCancelToken()).as("no guest self-cancel link for a staff booking").isNull();
+            assertThat(saved.getCancelTokenHash()).as("no guest self-cancel link for a staff booking").isNull();
             assertThat(response.status())
                     .as("the visit response comes straight from the mocked AppointmentService#enrich "
                             + "seam — see should_enrichWithHeaderAndSavedChain_when_visitCreated for "
@@ -1030,6 +1030,19 @@ class StaffBookingServiceTest {
             // strict-vs-non-strict comparison error would show up here rather than only in prod.
             assertThat(create(command(guest(RAW_PHONE))).status()).isEqualTo(BookingStatus.CONFIRMED);
             verify(smsService).send(eq(E164_PHONE), any(String.class));
+        }
+
+        @Test
+        @DisplayName("should_neverReadTheRescheduleSmsCount_when_walkInCreated")
+        void should_neverReadTheRescheduleSmsCount_when_walkInCreated() {
+            stubHappyPath(salonMaster(), assignment(null, null));
+
+            create(command(guest(RAW_PHONE)));
+
+            // Phase 431 (user rule 2026-10-30 + perf LOW): the walk-in verdict counts walk-in visits only,
+            // so reschedule SMS — possibly another provider's — can never push it to 429, and the walk-in
+            // create never scans the reschedule send log.
+            verify(bookingRepository, never()).countPhoneSmsBudgetUsedSince(any(), any());
         }
     }
 

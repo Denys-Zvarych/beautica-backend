@@ -86,6 +86,17 @@ class PiiRedactorTest {
         assertThat(PiiRedactor.redactPath(url)).isEqualTo(expected);
     }
 
+    @ParameterizedTest
+    @CsvSource(delimiter = '|', value = {
+            "/api/v1/public/review-invites/AbCdEfGhIjKlMnOp|/api/v1/public/review-invites/[token]",
+            "POST /api/v1/public/review-invites/AbCdEfGhIjKlMnOpQrStUvWx/reviews|POST /api/v1/public/review-invites/[token]/reviews",
+            "/api/v1/public/review-invites/abc-def_ghi/opt-out?x=1|/api/v1/public/review-invites/[token]/opt-out",
+            "GET /api/v1/public/review-invites/{token}|GET /api/v1/public/review-invites/{token}"})
+    @DisplayName("redactPath — the segment after /review-invites/ is always masked, even with no digit; template kept")
+    void should_maskReviewInviteToken_when_tokenHasNoDigit(String url, String expected) {
+        assertThat(PiiRedactor.redactPath(url)).isEqualTo(expected);
+    }
+
     @Test
     @DisplayName("redactPath also strips query/fragment and redacts PII in plain segments")
     void should_redactPiiInPath_when_segmentIsAPhone() {

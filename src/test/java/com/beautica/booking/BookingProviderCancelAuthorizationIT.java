@@ -6,6 +6,7 @@ import com.beautica.auth.dto.LoginRequest;
 import com.beautica.common.ApiResponse;
 import com.beautica.config.TestSecurityConfig;
 import com.beautica.notification.entity.NotificationOutboxEntry;
+import com.beautica.notification.entity.OutboxEventType;
 import com.beautica.notification.entity.OutboxStatus;
 import com.beautica.notification.repository.NotificationOutboxRepository;
 import com.beautica.notification.service.NotificationOutboxDrainWorker;
@@ -370,21 +371,24 @@ class BookingProviderCancelAuthorizationIT extends AbstractIntegrationTest {
         assertThat(dbStatus(bookingId)).isEqualTo("DECLINED");
 
         List<NotificationOutboxEntry> pending = outboxRepository.findAll();
-        assertThat(pending)
-                .as("declineBooking must enqueue exactly one STATUS_CHANGED row for the guest booking")
-                .hasSize(1);
+        NotificationOutboxEntry statusRow = onlyRowOfType(pending, OutboxEventType.STATUS_CHANGED);
+        // Phase 431 — the actor (owner) is not the performing SALON_MASTER, so the master's e-mail is
+        // its own MASTER_BOOKING_DECLINED row beside the client/guest row.
+        NotificationOutboxEntry masterRow = onlyRowOfType(pending, OutboxEventType.MASTER_BOOKING_DECLINED);
+        assertThat(pending).as("exactly the STATUS_CHANGED row plus the performing-master row").hasSize(2);
 
         // Drain for real — NotificationService/NotificationOutboxService are NOT mocked in this
         // class, so this exercises the real guard: without it, getClient().getEmail() NPEs inside
         // dispatch and the drain worker marks the row DEAD after MAX_ATTEMPTS.
         drainWorker.drain();
 
-        NotificationOutboxEntry drained = outboxRepository.findById(pending.get(0).getId()).orElseThrow();
+        NotificationOutboxEntry drained = outboxRepository.findById(statusRow.getId()).orElseThrow();
         assertThat(drained.getStatus())
                 .as("the null-client guard must let the guest-booking STATUS_CHANGED entry drain to "
                         + "SENT (a clean no-op dispatch), never DEAD")
                 .isEqualTo(OutboxStatus.SENT);
         assertThat(drained.getLastError()).isNull();
+        assertMasterRowDrainedAndMailed(masterRow, salon);
 
         long deadRows = outboxRepository.findAll().stream()
                 .filter(e -> e.getStatus() == OutboxStatus.DEAD)
@@ -426,15 +430,18 @@ class BookingProviderCancelAuthorizationIT extends AbstractIntegrationTest {
         assertThat(dbStatus(bookingId)).isEqualTo("DECLINED");
 
         List<NotificationOutboxEntry> pending = outboxRepository.findAll();
-        assertThat(pending).hasSize(1);
+        NotificationOutboxEntry statusRow = onlyRowOfType(pending, OutboxEventType.STATUS_CHANGED);
+        NotificationOutboxEntry masterRow = onlyRowOfType(pending, OutboxEventType.MASTER_BOOKING_DECLINED);
+        assertThat(pending).as("exactly the STATUS_CHANGED row plus the performing-master row").hasSize(2);
 
         drainWorker.drain();
 
-        NotificationOutboxEntry drained = outboxRepository.findById(pending.get(0).getId()).orElseThrow();
+        NotificationOutboxEntry drained = outboxRepository.findById(statusRow.getId()).orElseThrow();
         assertThat(drained.getStatus())
                 .as("a guest decline with no note must still drain to SENT, never DEAD")
                 .isEqualTo(OutboxStatus.SENT);
         assertThat(drained.getLastError()).isNull();
+        assertMasterRowDrainedAndMailed(masterRow, salon);
 
         long deadRows = outboxRepository.findAll().stream()
                 .filter(e -> e.getStatus() == OutboxStatus.DEAD)
@@ -674,6 +681,29 @@ class BookingProviderCancelAuthorizationIT extends AbstractIntegrationTest {
      * NULL, {@code booking_source = 'LINK'}, guest fields populated, and a non-null
      * {@code cancel_token} (V91 CHECK requires it for any ACTIVE — i.e. CONFIRMED — LINK row).
      */
+    /** Exactly one row of {@code type} among {@code rows} (phase 431: the master row is separate). */
+    private static NotificationOutboxEntry onlyRowOfType(List<NotificationOutboxEntry> rows, OutboxEventType type) {
+        List<NotificationOutboxEntry> ofType = rows.stream().filter(e -> e.getEventType() == type).toList();
+        assertThat(ofType).as("exactly one %s row", type).hasSize(1);
+        return ofType.get(0);
+    }
+
+    /**
+     * Phase 431 — the performing master's own decline row drains to SENT (no DEAD, no error) and e-mails
+     * that master once; the acting owner gets no master e-mail.
+     */
+    private void assertMasterRowDrainedAndMailed(NotificationOutboxEntry masterRow, Salon salon) {
+        NotificationOutboxEntry drained = outboxRepository.findById(masterRow.getId()).orElseThrow();
+        assertThat(drained.getStatus()).as("the master row drains to SENT").isEqualTo(OutboxStatus.SENT);
+        assertThat(drained.getLastError()).isNull();
+        org.mockito.Mockito.verify(emailNotificationService, org.mockito.Mockito.times(1))
+                .sendBookingDeclinedBySalonEmail(org.mockito.ArgumentMatchers.eq(salon.masterEmail),
+                        org.mockito.ArgumentMatchers.any());
+        org.mockito.Mockito.verify(emailNotificationService, org.mockito.Mockito.never())
+                .sendBookingDeclinedBySalonEmail(org.mockito.ArgumentMatchers.eq(salon.ownerEmail),
+                        org.mockito.ArgumentMatchers.any());
+    }
+
     private UUID insertConfirmedGuestSalonBooking(Salon salon) {
         UUID masterServiceId = createSalonService(salon.salonId);
         UUID bookingId = UUID.randomUUID();

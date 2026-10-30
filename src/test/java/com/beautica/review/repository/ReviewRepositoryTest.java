@@ -8,6 +8,7 @@ import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.review.entity.Review;
+import com.beautica.review.entity.ReviewSource;
 import com.beautica.salon.entity.Salon;
 import com.beautica.service.entity.CatalogCategory;
 import com.beautica.service.entity.MasterServiceAssignment;
@@ -19,6 +20,8 @@ import com.beautica.user.User;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import com.beautica.review.dto.MyReviewResponse;
 import jakarta.persistence.EntityManagerFactory;
 import org.hibernate.SessionFactory;
@@ -947,5 +950,40 @@ class ReviewRepositoryTest extends AbstractDataJpaTest {
                 .build();
         em.persist(review);
         em.flush();
+    }
+
+    // ── phase 399 audit: GUEST_LINK display-name lifecycle guard ─────────────
+
+    @ParameterizedTest(name = "[{index}] label=«{0}»")
+    @ValueSource(strings = {"Олена Кравець", "0 5 0 1"})
+    @DisplayName("a GUEST_LINK review persisted via the builder with a non-normalised display name is rejected")
+    void should_reject_guestLinkReview_when_displayNameBypassesFactory(String label) {
+        Review review = guestLinkViaBuilder(label);
+
+        assertThatThrownBy(() -> {
+            em.persist(review);
+            em.flush();
+        }).isInstanceOf(IllegalStateException.class);
+    }
+
+    @Test
+    @DisplayName("a GUEST_LINK review persisted via the builder with a factory-shaped display name is accepted")
+    void should_persist_guestLinkReview_when_displayNameIsNormalised() {
+        Review review = guestLinkViaBuilder("Олена К.");
+
+        em.persist(review);
+        em.flush();
+
+        assertThat(reviewRepository.existsByBookingId(completedBooking.getId())).isTrue();
+    }
+
+    private Review guestLinkViaBuilder(String label) {
+        return Review.builder()
+                .booking(completedBooking)
+                .master(master)
+                .rating((short) 5)
+                .source(ReviewSource.GUEST_LINK)
+                .guestDisplayName(label)
+                .build();
     }
 }

@@ -125,6 +125,14 @@ public class MasterProfileCacheEvictor {
         salonBookingInfoCacheEvictor.evictSalon(salonId);
     }
 
+    /**
+     * Batch immediate form of {@link #evictSalonBookingPage} (phase 402 audit-fix, perf LOW): one value scan for all
+     * of {@code salonIds}, for callers already past the commit.
+     */
+    public void evictSalonBookingPages(Collection<UUID> salonIds) {
+        salonBookingInfoCacheEvictor.evictSalons(salonIds);
+    }
+
     private void registerSlugEviction(Collection<String> slugs) {
         if (slugs.isEmpty()) {
             return;

@@ -37,7 +37,7 @@ class PushCopyTest {
         assertThat(PushCopy.title(InAppNotificationType.BOOKING_DECLINED, true))
                 .isEqualTo("Ваш запис скасовано");
         assertThat(PushCopy.title(InAppNotificationType.BOOKING_DECLINED, false))
-                .isEqualTo("Запис у вашому дні скасовано");
+                .isEqualTo("Запис скасовано");
         assertThat(PushCopy.title(InAppNotificationType.BOOKING_RESCHEDULED, true))
                 .isEqualTo("Ваш запис перенесено");
         assertThat(PushCopy.title(InAppNotificationType.BOOKING_RESCHEDULED, false))
@@ -298,7 +298,37 @@ class PushCopyTest {
                 .containsExactly("counterpartName", "serviceName", "serviceCount", "startsAt",
                         "salonName", "masterName", "subjectName", "subjectRole",
                         // phase 372: a category name and the admin's reject reason (free text, never on a lock screen)
-                        "categoryName", "decisionReason");
+                        "categoryName", "decisionReason",
+                        // phase 415: an enum (content kind of a moderation outcome), never free text
+                        "contentKind");
+    }
+
+    @Test
+    @DisplayName("phase 415 follow-up: REVIEW_ABOUT_YOU_REMOVED push title is «Відгук видалено» for every recipient")
+    void should_useLockedTitle_when_reviewAboutYouRemoved() {
+        assertThat(PushCopy.title(InAppNotificationType.REVIEW_ABOUT_YOU_REMOVED, true)).isEqualTo("Відгук видалено");
+        assertThat(PushCopy.title(InAppNotificationType.REVIEW_ABOUT_YOU_REMOVED, false)).isEqualTo("Відгук видалено");
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest(name = "{0} / {1}")
+    @org.junit.jupiter.params.provider.CsvSource(delimiter = '|', quoteCharacter = '"', value = {
+            "REPORT_CONTENT_REMOVED | REVIEW          | Дякуємо! Ми переглянули вашу скаргу, і вміст видалено.",
+            "REPORT_NO_VIOLATION    | PORTFOLIO_PHOTO | Ми переглянули вашу скаргу і не знайшли порушень правил.",
+            "REPORT_REVIEWED        | PROFILE         | Дякуємо! Скаргу підтверджено — ми зв'яжемося з власником профілю.",
+            "REPORT_REVIEWED        | REVIEW          | Дякуємо! Ми переглянули вашу скаргу.",
+            "CONTENT_REMOVED        | REVIEW          | Ваш відгук видалено через порушення правил спільноти.",
+            "CONTENT_REMOVED        | CLIENT_REVIEW   | Ваш відгук про клієнта видалено через порушення правил спільноти.",
+            "CONTENT_REMOVED        | PORTFOLIO_PHOTO | Ваше фото видалено через порушення правил спільноти.",
+            "REVIEW_ABOUT_YOU_REMOVED | REVIEW        | Відгук про вас видалено модерацією Beautica: він порушував правила спільноти.",
+            "REVIEW_ABOUT_YOU_REMOVED | CLIENT_REVIEW | Відгук про вас видалено модерацією Beautica: він порушував правила спільноти."
+    })
+    @DisplayName("phase 415: moderation outcome bodies are the locked feed texts per content kind")
+    void should_useLockedCopy_when_moderationOutcome(InAppNotificationType type,
+                                                     com.beautica.notification.inapp.dto.ModeratedContentKind kind,
+                                                     String expected) {
+        String body = PushCopy.body(type, true, NotificationParams.moderationOutcome(kind));
+
+        assertThat(body).isEqualTo(expected);
     }
 
     @Test

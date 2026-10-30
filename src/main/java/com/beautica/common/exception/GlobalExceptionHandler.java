@@ -6,6 +6,7 @@ import com.beautica.auth.dto.InviteErrorResponse;
 import com.beautica.booking.dto.BookingElapsedResponse;
 import com.beautica.booking.dto.ClientBookingConflictResponse;
 import com.beautica.common.ApiResponse;
+import com.beautica.booking.dto.RescheduleLimitReachedResponse;
 import com.beautica.media.dto.PortfolioLimitReachedResponse;
 import com.beautica.salon.dto.SalonDeletionBlockedResponse;
 import com.beautica.service.dto.DuplicateServiceResponse;
@@ -328,6 +329,23 @@ public class GlobalExceptionHandler {
     }
 
     /**
+     * Phase 431 — distinct 409 for the guest-booking reschedule cap (5 provider reschedules per guest
+     * booking/visit per rolling 24 h): the {@link RescheduleLimitReachedResponse} body carries
+     * {@code RESCHEDULE_LIMIT_REACHED} under {@code data.code}, which {@link #handleBusiness}'s
+     * genericised CONFLICT branch would otherwise drop. A new code; no existing body changes.
+     */
+    @ExceptionHandler(RescheduleLimitReachedException.class)
+    public ResponseEntity<ApiResponse<RescheduleLimitReachedResponse>> handleRescheduleLimitReached(
+            RescheduleLimitReachedException ex) {
+        log.debug("Reschedule rejected: {}", ex.getClass().getSimpleName());
+        return ResponseEntity
+                .status(HttpStatus.CONFLICT)
+                .body(new ApiResponse<>(false,
+                        new RescheduleLimitReachedResponse(RescheduleLimitReachedException.ERROR_CODE),
+                        "Reschedule limit reached for this booking"));
+    }
+
+    /**
      * 503 + {@code Retry-After} for a portfolio upload that lost the owning row lock (audit cycle 1 F6a).
      * Only {@code MediaService}'s portfolio path throws it; the global {@code 55P03 -> 409} mapping in
      * {@link #handlePessimisticLockingFailure} is unchanged for every other endpoint.
@@ -399,6 +417,30 @@ public class GlobalExceptionHandler {
                 .body(ApiResponse.error("Too many bookings declined recently — please wait before retrying"));
     }
 
+    /**
+     * 429 for the phase-395 per-user content-report budget — see {@link ContentReportRateLimitedException}. Generic
+     * message, no budget figures echoed (same posture as {@link #handleResendThrottled}).
+     */
+    @ExceptionHandler(ContentReportRateLimitedException.class)
+    public ResponseEntity<ApiResponse<Void>> handleContentReportRateLimited(ContentReportRateLimitedException ex) {
+        return ResponseEntity
+                .status(HttpStatus.TOO_MANY_REQUESTS)
+                .header("Retry-After", String.valueOf(ex.getRetryAfterSeconds()))
+                .body(ApiResponse.error("Too many reports — please try again later"));
+    }
+
+    /**
+     * 429 for the phase-397 per-user block/unblock budget — see {@link ClientBlockRateLimitedException}. The same
+     * generic body {@code BookingRateLimitFilter} writes for its per-user buckets; no budget figures echoed.
+     */
+    @ExceptionHandler(ClientBlockRateLimitedException.class)
+    public ResponseEntity<ApiResponse<Void>> handleClientBlockRateLimited(ClientBlockRateLimitedException ex) {
+        return ResponseEntity
+                .status(HttpStatus.TOO_MANY_REQUESTS)
+                .header("Retry-After", String.valueOf(ex.getRetryAfterSeconds()))
+                .body(ApiResponse.error("Too many requests — please slow down"));
+    }
+
     @ExceptionHandler(NotFoundException.class)
     public ResponseEntity<ApiResponse<Void>> handleNotFound(NotFoundException ex) {
         // Return a generic message — do not echo ex.getMessage() which may reveal internal
@@ -421,6 +463,22 @@ public class GlobalExceptionHandler {
                 .status(HttpStatus.GONE)
                 .cacheControl(GONE_CACHE_CONTROL)
                 .body(new ApiResponse<>(false, new GoneErrorResponse(ex.getCode()), ex.getMessage()));
+    }
+
+    /**
+     * Phase 398 D3 — {@code 409} for a booking create the provider's client block refuses. Body:
+     * {@code data.code} = {@link BookingUnavailableException#BOOKING_UNAVAILABLE} plus the exception's constant,
+     * neutral message; identical for the app and LINK guest paths. A separate exception type (not a
+     * {@link BusinessException}), so every existing 409 body is untouched. Never cached: unlike a retired link,
+     * an unblock makes the same request succeed.
+     */
+    @ExceptionHandler(BookingUnavailableException.class)
+    public ResponseEntity<ApiResponse<BookingUnavailableResponse>> handleBookingUnavailable(
+            BookingUnavailableException ex) {
+        log.debug("Booking unavailable [{}]", ex.getCode());
+        return ResponseEntity
+                .status(HttpStatus.CONFLICT)
+                .body(new ApiResponse<>(false, new BookingUnavailableResponse(ex.getCode()), ex.getMessage()));
     }
 
     @ExceptionHandler(ForbiddenException.class)

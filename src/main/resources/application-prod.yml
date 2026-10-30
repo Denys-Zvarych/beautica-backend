@@ -70,6 +70,8 @@ app:
       - beautica.app
       - www.beautica.app
     expected-action: otp_send
+    # Phase 401 — the guest review page (/r/{token}: submit + opt-out) renders its widget with this action.
+    review-expected-action: review_submit
   # No dev default (it used to live in the base profile). Empty when INTERNAL_API_KEY is unset, so
   # EnvironmentFingerprintGuard aborts startup with a clear rule instead of an unresolved-placeholder error.
   internal-api-key: ${INTERNAL_API_KEY:}

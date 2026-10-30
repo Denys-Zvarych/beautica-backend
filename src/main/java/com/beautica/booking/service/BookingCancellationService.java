@@ -1,5 +1,6 @@
 package com.beautica.booking.service;
 
+import com.beautica.booking.domain.CancelTokenHasher;
 import com.beautica.booking.dto.CancelTokenInfoResponse;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingStatus;
@@ -36,7 +37,7 @@ import java.util.UUID;
  * check-then-act "load → flip status → save" sequence — two concurrent {@code POST}s
  * could both read {@code status=CONFIRMED} and both fire side-effects. Instead, the
  * status flip + token null is a single conditional UPDATE
- * ({@link BookingRepository#consumeCancelToken(UUID)}) whose {@code WHERE} guards on the
+ * ({@link BookingRepository#consumeCancelTokenHash}) whose {@code WHERE} guards on the
  * token still being present and {@code CONFIRMED}. Exactly one racer updates 1 row and
  * proceeds to the cancellation SMS + master notification; every other updates 0 rows and
  * is mapped to 404. A replayed link (token already null) likewise updates 0 rows → 404,
@@ -100,7 +101,7 @@ public class BookingCancellationService {
         // BE-7: a token on an Appointment is a multi-service visit — served by the visit service. Only a
         // token that resolves to no visit falls through to the legacy single-booking path below.
         return guestVisitCancellationService.getInfo(token)
-                .orElseGet(() -> buildInfo(loadCancellableOrThrow(token)));
+                .orElseGet(() -> buildInfo(loadCancellableOrThrow(CancelTokenHasher.hash(token))));
     }
 
     /**
@@ -118,7 +119,9 @@ public class BookingCancellationService {
         if (guestVisitCancellationService.cancel(token)) {
             return;
         }
-        Booking booking = loadCancellableOrThrow(token);
+        // V206: only the token's hash is stored — hash once, look up and consume by the hash.
+        String tokenHash = CancelTokenHasher.hash(token);
+        Booking booking = loadCancellableOrThrow(tokenHash);
 
         if (!isCancellable(booking)) {
             throw new BusinessException(
@@ -127,7 +130,7 @@ public class BookingCancellationService {
                             .formatted(smsProperties.getCancelWindowHours()));
         }
 
-        if (!cancelValidated(booking, token, true)) {
+        if (!cancelValidated(booking, tokenHash, true)) {
             // Lost the race or already consumed between load and update — no side-effects.
             throw new NotFoundException("Cancel token not found");
         }
@@ -140,7 +143,7 @@ public class BookingCancellationService {
      * guest-PII erase, which bypasses the 2-hour window on purpose and passes
      * {@code sendGuestSms = false}.
      *
-     * <p>A row with a cancel token is consumed via {@link BookingRepository#consumeCancelToken};
+     * <p>A row with a cancel token is consumed via {@link BookingRepository#consumeCancelTokenHash};
      * a tokenless STAFF walk-in row via {@link BookingRepository#cancelGuestRowById}. Both are
      * conditional UPDATEs: when 0 rows match (a concurrent cancel already won) nothing else runs.
      *
@@ -154,13 +157,13 @@ public class BookingCancellationService {
      */
     @Transactional(propagation = Propagation.MANDATORY)
     public boolean cancelGuestBooking(Booking booking, boolean sendGuestSms) {
-        return cancelValidated(booking, booking.getCancelToken(), sendGuestSms);
+        return cancelValidated(booking, booking.getCancelTokenHash(), sendGuestSms);
     }
 
-    private boolean cancelValidated(Booking booking, UUID token, boolean sendGuestSms) {
+    private boolean cancelValidated(Booking booking, String tokenHash, boolean sendGuestSms) {
         // Atomic one-time consume: only the winner of any concurrent race updates 1 row.
-        int updated = token != null
-                ? bookingRepository.consumeCancelToken(token)
+        int updated = tokenHash != null
+                ? bookingRepository.consumeCancelTokenHash(tokenHash)
                 : bookingRepository.cancelGuestRowById(booking.getId());
         if (updated == 0) {
             return false;
@@ -184,8 +187,8 @@ public class BookingCancellationService {
 
     // ── internals ──────────────────────────────────────────────────────────────
 
-    private Booking loadCancellableOrThrow(UUID token) {
-        Booking booking = bookingRepository.findByCancelTokenWithGraph(token)
+    private Booking loadCancellableOrThrow(String tokenHash) {
+        Booking booking = bookingRepository.findByCancelTokenHashWithGraph(tokenHash)
                 .orElseThrow(() -> new NotFoundException("Cancel token not found"));
         // A consumed/terminal booking has no valid cancel path. 404 (not 409) — the same
         // response a fully unknown token yields, so the caller cannot probe token state.

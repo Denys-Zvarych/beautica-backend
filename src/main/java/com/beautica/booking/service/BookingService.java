@@ -14,10 +14,12 @@ import com.beautica.booking.dto.StatusUpdateRequest;
 import com.beautica.booking.dto.UnclosedCountResponse;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingPartition;
+import com.beautica.booking.enums.BookingSource;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.enums.CancellationReason;
 import com.beautica.booking.repository.AppointmentRepository;
 import com.beautica.booking.event.BookingCompletedEvent;
+import com.beautica.booking.event.GuestBookingCompletedEvent;
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.booking.repository.BookingSpecifications;
 import com.beautica.booking.repository.ClientBookingDetailProjection;
@@ -37,6 +39,10 @@ import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.security.AuthenticationUtils;
 import com.beautica.common.security.AuthorizationService;
 import com.beautica.master.entity.Master;
+import com.beautica.moderation.dto.ClientBlockState;
+import com.beautica.moderation.service.ClientBlockScopeResolver;
+import com.beautica.moderation.service.BookingBlockGuard;
+import com.beautica.moderation.service.ClientBlockService;
 import com.beautica.master.entity.MasterType;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.salon.entity.Salon;
@@ -62,6 +68,7 @@ import org.springframework.data.domain.Sort;
 import org.springframework.data.jpa.domain.Specification;
 import org.springframework.http.HttpStatus;
 import org.springframework.security.core.Authentication;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
@@ -126,6 +133,10 @@ public class BookingService {
     // why it is never called FROM NotificationOutboxService). MANDATORY propagation: every call site
     // below is already inside this class's own @Transactional method.
     private final InAppNotificationService inAppNotificationService;
+    // Phase 397 — the provider booking detail's clientBlocked / clientBlockId / clientBlockable.
+    private final ClientBlockService clientBlockService;
+    // Phase 398 — refuses a create when the provider blocked this client account (BOOKING_UNAVAILABLE).
+    private final BookingBlockGuard bookingBlockGuard;
 
     /**
      * Creates a booking (or replays an idempotent one) and returns the <b>enriched</b> detail view.
@@ -232,8 +243,11 @@ public class BookingService {
                 && canReview(booking.getStatus(), booking.getEndsAt(), now,
                         reviewByClient.isPresent(), hasClient);
         boolean providerCanReviewClient = computeProviderCanReviewClient(actorUserId, booking, now);
+        // Phase 396: a hidden / removed review comes back with a null body (it still blocks canReview above) and is
+        // omitted from the response rather than rendered as an empty review.
         BookingDetailResponse detail = enrichSingle(booking, canReview, providerCanReviewClient, now,
-                reviewByClient.map(BookingService::toClientAuthoredReview).orElse(null));
+                reviewByClient.filter(view -> view.rating() != null)
+                        .map(BookingService::toClientAuthoredReview).orElse(null));
         // Phase 386 D1/D2 (audience per the 2026-10-22 user rule) - the guest's phone, on THIS read only. The audience
         // is decided explicitly by ROLE: INDEPENDENT_MASTER, SALON_OWNER, SALON_ADMIN. A SALON_MASTER never sees it
         // (even as the performing master), nor does a CLIENT; the owning-client probe is kept as a second, independent
@@ -242,10 +256,39 @@ public class BookingService {
         // touches the SecurityContext, which a registered-client booking never needs (direct non-HTTP service calls
         // carry none) and which adds no statement. The owning-client probe stays as a second, independent guard (free for a
         // guest booking: null client short-circuits before any role read).
-        return booking.getClient() == null && authz.isGuestPhoneAudience()
+        BookingDetailResponse withPhone = booking.getClient() == null && authz.isGuestPhoneAudience()
                 && !authz.isOwningClientViewer(actorUserId, booking)
                 ? detail.withProviderVisibleGuestPhone(booking)
                 : detail;
+        return withClientBlockState(actorUserId, booking, withPhone);
+    }
+
+    /**
+     * Phase 397 (mobile 425) — the viewer's block state on the detail read. Only a blocker-role viewer
+     * (INDEPENDENT_MASTER / SALON_OWNER / SALON_ADMIN) pays the one block lookup; any other viewer, or a direct
+     * service call with no SecurityContext, keeps the false/null/false defaults with no statement.
+     */
+    private BookingDetailResponse withClientBlockState(UUID actorUserId, Booking booking,
+                                                       BookingDetailResponse detail) {
+        Role role = currentRoleOrNull();
+        if (!ClientBlockScopeResolver.isBlockerRole(role)) {
+            return detail;
+        }
+        ClientBlockState state = clientBlockService.blockStateFor(actorUserId, role, booking);
+        return state.blockable() ? detail.withClientBlockState(true, state.blockId()) : detail;
+    }
+
+    @Nullable
+    private static Role currentRoleOrNull() {
+        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+        if (auth == null) {
+            return null;
+        }
+        try {
+            return AuthenticationUtils.role(auth);
+        } catch (ForbiddenException e) {
+            return null;
+        }
     }
 
     /**
@@ -258,7 +301,7 @@ public class BookingService {
      * {@code GET /masters/&#123;id&#125;/reviews}.
      */
     private static ClientAuthoredReviewResponse toClientAuthoredReview(BookingReviewView view) {
-        return new ClientAuthoredReviewResponse(view.rating().intValue(), view.comment());
+        return new ClientAuthoredReviewResponse(view.id(), view.rating().intValue(), view.comment());
     }
 
     /**
@@ -614,7 +657,11 @@ public class BookingService {
                 p.clientReviewCount(),
                 // Phase 386: a CLIENT-scoped projection (JOIN b.client) can never be a guest booking, and a
                 // registered client's phone is never provider-visible — null, always.
-                null);
+                null,
+                // Phase 397: a CLIENT viewer can never block — block state is false/null/false on this path.
+                false,
+                null,
+                false);
     }
 
     /**
@@ -1930,6 +1977,9 @@ public class BookingService {
     public BookingResponse declineBooking(UUID actorUserId, UUID bookingId, StatusUpdateRequest req) {
         Booking saved = declineBookingCore(actorUserId, bookingId, req);
         outboxService.enqueueStatusChanged(saved.getId());
+        // Phase 431 — the performing master's e-mail is its OWN row (own retry state), skipped when
+        // the master declined it themselves.
+        outboxService.enqueueMasterBookingDeclined(saved.getId(), masterUserIdOf(saved), actorUserId);
         // Phase 333, matrix row 3 — client (if registered) + performing master unless actor. `saved`
         // is already the full graph loaded by declineBookingCore (audit-fix cycle 1, finding 1) —
         // never reloaded here.
@@ -2170,6 +2220,70 @@ public class BookingService {
         List<SalonClosureBookingCandidate> candidates =
                 bookingRepository.findConfirmedFutureByMasterId(masterId, now);
         declineFutureConfirmed(actorUserId, candidates, salonId, now, OutboxEventType.MASTER_REMOVED, false);
+    }
+
+    // ── Client-block booking cascade (Phase 398 user decision 2026-10-28) ──────────────────────
+
+    /**
+     * Phase 398 — a NEW provider block of a registered client declines every future {@code CONFIRMED} booking of
+     * that account in the block scope: the independent master ({@code masterId}) or every master of the salon
+     * ({@code salonId}, the bookings' own {@code salon_id} snapshot). Exactly one of the two is non-null.
+     *
+     * <p>Shares the WHOLE decline body with the salon-closure / master-removal cascades ({@link
+     * #declineFutureConfirmed}): {@code DECLINED} / {@code PROVIDER_UNAVAILABLE}, no provider comment, whole visit
+     * (all future items, header collapsed), one notice per visit, by-master slot eviction after commit. Only the
+     * notice differs: the NEUTRAL provider-decline one — {@code STATUS_CHANGED} (email / guest SMS) plus in-app
+     * {@code BOOKING_DECLINED} (push) per visit through the SAME recipient rule as {@code PATCH /decline}: the
+     * registered client and the performing master, minus the actor (orchestrator decision 2026-10-28) — never
+     * anything that mentions a block.
+     *
+     * <p>Full per-row provider authorization runs (no pre-seeded ownership memo): the actor reached here from
+     * {@code ClientBlockService}'s scope resolver, but every decline is still re-authorized against the booking's
+     * own master/salon, exactly like {@code PATCH /bookings/{id}/decline}.
+     *
+     * <p><b>Accepted residual:</b> no advisory lock is taken (a salon scope would need one per master, in an order
+     * the scan cannot know before it runs). A booking committed concurrently with the block — after this scan — is
+     * left {@code CONFIRMED}; the create gate refuses every later one and the provider can decline it by hand.
+     *
+     * @return the number of VISITS this call declined — a standalone booking counts 1, a multi-service appointment
+     *         counts 1 however many items it had (orchestrator decision 2026-10-28)
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public int declineFutureConfirmedForBlockedClient(
+            UUID actorUserId, @Nullable UUID masterId, @Nullable UUID salonId, UUID clientId) {
+        requireExactlyOneScope(masterId, salonId);
+        OffsetDateTime now = resolveNow();
+        List<SalonClosureBookingCandidate> candidates = masterId != null
+                ? bookingRepository.findConfirmedFutureByMasterIdAndClientId(masterId, clientId, now)
+                : bookingRepository.findConfirmedFutureBySalonIdAndClientId(salonId, clientId, now);
+        return declineFutureConfirmed(actorUserId, candidates, salonId, now, OutboxEventType.STATUS_CHANGED,
+                /* skipProviderAuthorization= */ false, /* ownershipProven= */ false);
+    }
+
+    /**
+     * Guest twin of {@link #declineFutureConfirmedForBlockedClient}: a NEW GUEST block declines every future
+     * {@code CONFIRMED} LINK guest booking of the OTP-verified phone in scope. {@code guestPhone} is the canonical
+     * E.164 form — the pre-image of the block's {@code phone_hash}. The guest learns of it through the existing
+     * provider-cancel SMS ({@code STATUS_CHANGED} / {@code DECLINED} LINK branch), nothing else.
+     *
+     * @return the number of VISITS this call declined (see {@link #declineFutureConfirmedForBlockedClient})
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public int declineFutureConfirmedForBlockedGuest(
+            UUID actorUserId, @Nullable UUID masterId, @Nullable UUID salonId, String guestPhone) {
+        requireExactlyOneScope(masterId, salonId);
+        OffsetDateTime now = resolveNow();
+        List<SalonClosureBookingCandidate> candidates = masterId != null
+                ? bookingRepository.findConfirmedFutureLinkGuestByMasterIdAndPhone(masterId, guestPhone, now)
+                : bookingRepository.findConfirmedFutureLinkGuestBySalonIdAndPhone(salonId, guestPhone, now);
+        return declineFutureConfirmed(actorUserId, candidates, salonId, now, OutboxEventType.STATUS_CHANGED,
+                /* skipProviderAuthorization= */ false, /* ownershipProven= */ false);
+    }
+
+    private static void requireExactlyOneScope(UUID masterId, UUID salonId) {
+        if ((masterId == null) == (salonId == null)) {
+            throw new IllegalArgumentException("Exactly one of masterId / salonId must be set");
+        }
     }
 
     // ── CLIENT account self-deletion booking cascade (Phase 338 — REVERSES Phase 300 D4's
@@ -2552,8 +2666,27 @@ public class BookingService {
     private void declineFutureConfirmed(
             UUID actorUserId, List<SalonClosureBookingCandidate> candidates, UUID salonId,
             OffsetDateTime now, OutboxEventType eventType, boolean skipProviderAuthorization) {
+        // The three original callers each prove ownership of salonId (or skip authorization) first.
+        declineFutureConfirmed(actorUserId, candidates, salonId, now, eventType, skipProviderAuthorization,
+                /* ownershipProven= */ !skipProviderAuthorization);
+    }
+
+    /**
+     * @param ownershipProven Phase 398 — {@code true} when the caller already proved {@code actorUserId} owns
+     *                        {@code salonId}, which pre-seeds the SALON_OWNER management memo below; the
+     *                        client-block cascade passes {@code false} so every appointment visit is authorized
+     *                        from scratch.
+     * @param eventType       {@code SALON_CLOSED} / {@code MASTER_REMOVED}, or {@code STATUS_CHANGED} for the
+     *                        client-block cascade (the neutral provider-decline notice + in-app
+     *                        {@code BOOKING_DECLINED} to the client and the performing master)
+     * @return the number of visits that had at least one row moved to {@code DECLINED} (one per notice)
+     */
+    private int declineFutureConfirmed(
+            UUID actorUserId, List<SalonClosureBookingCandidate> candidates, UUID salonId,
+            OffsetDateTime now, OutboxEventType eventType, boolean skipProviderAuthorization,
+            boolean ownershipProven) {
         if (candidates.isEmpty()) {
-            return;
+            return 0;
         }
 
         StatusUpdateRequest declineRequest =
@@ -2591,7 +2724,7 @@ public class BookingService {
         // memory — see AuthorizationService#enforceCanManageAppointment(UUID, UUID, Map)'s Javadoc
         // for the memo's lifetime contract (never retained past this one method call).
         Map<AuthorizationService.MemoKey, Boolean> managementAccessMemo = new HashMap<>();
-        if (!skipProviderAuthorization) {
+        if (ownershipProven) {
             managementAccessMemo.put(new AuthorizationService.MemoKey(actorUserId, salonId), true);
         }
 
@@ -2666,6 +2799,8 @@ public class BookingService {
             switch (eventType) {
                 case SALON_CLOSED -> outboxService.enqueueSalonClosed(representativeId);
                 case MASTER_REMOVED -> outboxService.enqueueMasterRemoved(representativeId);
+                // Phase 398 client-block cascade — the same neutral notice PATCH /decline enqueues.
+                case STATUS_CHANGED -> outboxService.enqueueStatusChanged(representativeId);
                 default -> throw new IllegalStateException(
                         "declineFutureConfirmed does not support outbox event type " + eventType);
             }
@@ -2679,13 +2814,17 @@ public class BookingService {
         // count — a 4th per-visit statement here would have broken that invariant). The SAME
         // eventType selects the in-app type, so a salon closure and a master removal/self-delete
         // (this shared body's 3 callers) can never diverge on which of the two rows they write.
-        InAppNotificationType inAppType = switch (eventType) {
-            case SALON_CLOSED -> InAppNotificationType.BOOKING_CANCELLED_SALON_CLOSED;
-            case MASTER_REMOVED -> InAppNotificationType.BOOKING_CANCELLED_MASTER_REMOVED;
-            default -> throw new IllegalStateException(
-                    "declineFutureConfirmed does not support outbox event type " + eventType);
-        };
-        inAppNotificationService.notifyClientOnlyBulk(inAppType, representativeIds, actorUserId);
+        if (eventType == OutboxEventType.STATUS_CHANGED) {
+            notifyBlockDeclinedVisits(candidates, representativeIds, standaloneBookingsById, actorUserId);
+        } else {
+            InAppNotificationType inAppType = switch (eventType) {
+                case SALON_CLOSED -> InAppNotificationType.BOOKING_CANCELLED_SALON_CLOSED;
+                case MASTER_REMOVED -> InAppNotificationType.BOOKING_CANCELLED_MASTER_REMOVED;
+                default -> throw new IllegalStateException(
+                        "declineFutureConfirmed does not support outbox event type " + eventType);
+            };
+            inAppNotificationService.notifyClientOnlyBulk(inAppType, representativeIds, actorUserId);
+        }
 
         Set<UUID> masterIds = candidates.stream()
                 .map(SalonClosureBookingCandidate::masterId)
@@ -2693,6 +2832,45 @@ public class BookingService {
         for (UUID masterId : masterIds) {
             registerSlotEviction(masterId, salonId);
             evictMasterCalendarAfterCommit(masterId);
+        }
+        return representativeIds.size();
+    }
+
+    /**
+     * Phase 398 (orchestrator decision 2026-10-28) — the client-block cascade's in-app {@code BOOKING_DECLINED}
+     * rows go through the SAME per-event path an ordinary provider decline uses — {@code notifyBookingEvent} for a
+     * standalone booking ({@code PATCH /bookings/{id}/decline}), {@code notifyVisitEvent} for a visit (whole-visit
+     * decline) — so the recipients are identical: the registered client plus the performing master, minus the
+     * actor (an independent master blocking for themselves, or an owner who performs the booking). No block-specific
+     * copy exists. Per visit rather than one bulk statement: the cascade is bounded to ONE client's future
+     * bookings in one scope. The appointment representatives are loaded in ONE batched read (the standalone ones
+     * are already in memory).
+     */
+    private void notifyBlockDeclinedVisits(
+            List<SalonClosureBookingCandidate> candidates, List<UUID> representativeIds,
+            Map<UUID, Booking> standaloneBookingsById, UUID actorUserId) {
+        Map<UUID, UUID> appointmentIdByBookingId = new HashMap<>();
+        for (SalonClosureBookingCandidate candidate : candidates) {
+            if (candidate.appointmentId() != null) {
+                appointmentIdByBookingId.put(candidate.bookingId(), candidate.appointmentId());
+            }
+        }
+        List<UUID> visitRepresentativeIds = representativeIds.stream()
+                .filter(appointmentIdByBookingId::containsKey)
+                .toList();
+        Map<UUID, Booking> visitRepresentatives = visitRepresentativeIds.isEmpty()
+                ? Map.of()
+                : bookingRepository.findAllByIdInWithFullGraph(visitRepresentativeIds).stream()
+                        .collect(Collectors.toMap(Booking::getId, Function.identity()));
+        for (UUID representativeId : representativeIds) {
+            UUID appointmentId = appointmentIdByBookingId.get(representativeId);
+            if (appointmentId == null) {
+                inAppNotificationService.notifyBookingEvent(InAppNotificationType.BOOKING_DECLINED,
+                        standaloneBookingsById.get(representativeId), actorUserId);
+            } else {
+                inAppNotificationService.notifyVisitEvent(InAppNotificationType.BOOKING_DECLINED,
+                        appointmentId, visitRepresentatives.get(representativeId), actorUserId);
+            }
         }
     }
 
@@ -2990,6 +3168,11 @@ public class BookingService {
         // enqueue above does.
         eventPublisher.publishEvent(new BookingCompletedEvent(
                 saved.getClient() != null ? saved.getClient().getId() : null));
+        // Phase 400 D7 — a single LINK booking (no visit header; appointment children were refused above) gets a
+        // review invite, created AFTER_COMMIT by ReviewInviteScheduler. APP / STAFF publish nothing.
+        if (saved.getBookingSource() == BookingSource.LINK) {
+            eventPublisher.publishEvent(new GuestBookingCompletedEvent(saved.getId(), clock.instant()));
+        }
         return BookingResponse.from(saved, resolveNow());
     }
 
@@ -3669,6 +3852,11 @@ public class BookingService {
         // re-reads this booking's CONFIRMED status fresh from the DB, and no phase-2 collapse ever
         // follows a reschedule.
         UUID appointmentId = booking.getAppointment() != null ? booking.getAppointment().getId() : null;
+        // Phase 431 — guest booking/visit reschedule cap (5 per 24 h), under the master lock and
+        // before any change; a one-service move counts against its visit.
+        if (initiatedByProvider) {
+            appointmentTransitionService.assertGuestRescheduleWithinLimitAndRecord(booking, appointmentId);
+        }
         if (appointmentId != null) {
             appointmentTransitionService.lockAppointmentHeaderBeforeItemReschedule(appointmentId);
         }
@@ -3691,7 +3879,15 @@ public class BookingService {
         // Phase 27.3: the outbox payload records who initiated the move, so the drain worker can
         // address the notification to the OTHER party (client-initiated -> notify the provider,
         // unchanged; provider-initiated -> notify the client).
-        outboxService.enqueueBookingRescheduled(saved.getId(), initiatedByProvider);
+        // Phase 431 — a PROVIDER move records the new start (guest-SMS burst collapse) and enqueues
+        // the performing master's e-mail as its own row (skipped when they moved it themselves). The
+        // client-initiated row is written exactly as before.
+        if (initiatedByProvider) {
+            outboxService.enqueueBookingRescheduled(saved.getId(), true, newStartsAt.toInstant());
+            outboxService.enqueueMasterBookingRescheduled(saved.getId(), masterUserIdOf(saved), actorUserId);
+        } else {
+            outboxService.enqueueBookingRescheduled(saved.getId(), false);
+        }
         // Phase 333, matrix row 4 — performing master always (unless actor), plus the other party
         // (client if provider-initiated, owner+admins if client-initiated); walk-ins restrict to the
         // master cell only. See InAppNotificationService#notifyRescheduled.
@@ -3857,6 +4053,11 @@ public class BookingService {
         if (client.getRole() != Role.CLIENT) {
             throw new ForbiddenException("Only clients can create bookings");
         }
+        // Phase 398 D1 — provider block gate: scope from the TARGET master (salon or independent), CLIENT rows
+        // by account id only. Before both locks, so a refused create never contends for them. An idempotent
+        // replay of a still-active booking returns from createBooking before reaching here; a pre-block future
+        // booking was DECLINED by the block (phase 398 user decision), so its retry is refused like a fresh create.
+        bookingBlockGuard.requireClientMayBook(master, clientId);
 
         // Client lock (salt 1) is always acquired BEFORE the master lock (salt 0) — the
         // deterministic global order that keeps the two lock classes deadlock-free (see
@@ -4267,5 +4468,13 @@ public class BookingService {
 
     private void doEvictRevenueDashboard(UUID actorId) {
         cachePrefixEvictor.evictByKeyPrefixNow(actorId, "revenue-dashboard");
+    }
+
+    /**
+     * Phase 431 — the performing master's user id for the master outbox row, or {@code null} for a
+     * detached master (no account, nobody to e-mail).
+     */
+    private static UUID masterUserIdOf(Booking booking) {
+        return booking.getMaster().getUser() == null ? null : booking.getMaster().getUser().getId();
     }
 }

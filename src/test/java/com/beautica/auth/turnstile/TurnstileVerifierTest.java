@@ -89,6 +89,14 @@ class TurnstileVerifierTest {
                 props(true, List.of("beautica.app", "www.beautica.app"), "otp_send", Duration.ofSeconds(3)));
     }
 
+    /** Phase 401 — prod-like, with the guest review page's widget action configured. */
+    private TurnstileVerifier prodLikeWithReviewAction() {
+        TurnstileProperties props = props(true, List.of("beautica.app", "www.beautica.app"), "otp_send",
+                Duration.ofSeconds(3));
+        props.setReviewExpectedAction(" review_submit ");
+        return new TurnstileVerifier(RestClient.builder(), props);
+    }
+
     private TurnstileVerifier lenient() {
         return new TurnstileVerifier(RestClient.builder(), props(true, List.of(), "", Duration.ofSeconds(3)));
     }
@@ -280,5 +288,29 @@ class TurnstileVerifierTest {
         assertThat(String.join("\n", lines)).doesNotContain(SECRET).doesNotContain(TOKEN);
         assertThat(logAppender.list).allSatisfy(event ->
                 assertThat(event.getThrowableProxy()).as("no stack trace (it could carry the URL)").isNull());
+    }
+
+    @Test
+    @DisplayName("should_acceptReviewSubmitAction_when_verifyingReviewInvite")
+    void should_acceptReviewSubmitAction_when_verifyingReviewInvite() {
+        stub(200, "{\"success\":true,\"hostname\":\"beautica.app\",\"action\":\"review_submit\"}");
+
+        assertThatCode(() -> prodLikeWithReviewAction().verifyReviewInvite(TOKEN, IP)).doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("should_rejectOtpSendAction_when_verifyingReviewInvite")
+    void should_rejectOtpSendAction_when_verifyingReviewInvite() {
+        stub(200, SUCCESS);
+
+        assertRejected(() -> prodLikeWithReviewAction().verifyReviewInvite(TOKEN, IP));
+    }
+
+    @Test
+    @DisplayName("should_keepOtpSendAction_when_verifyingOtpWithReviewActionConfigured")
+    void should_keepOtpSendAction_when_verifyingOtpWithReviewActionConfigured() {
+        stub(200, "{\"success\":true,\"hostname\":\"beautica.app\",\"action\":\"review_submit\"}");
+
+        assertRejected(() -> prodLikeWithReviewAction().verify(TOKEN, IP));
     }
 }

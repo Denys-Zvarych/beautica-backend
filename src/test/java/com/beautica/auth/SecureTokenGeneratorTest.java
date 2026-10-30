@@ -264,4 +264,27 @@ class SecureTokenGeneratorTest {
 
         assertThat(actual).isEqualTo(expected);
     }
+
+    @Test
+    @DisplayName("generateToken(16) produces a 22-char base64url token (phase 400 review invite)")
+    void should_return22CharBase64UrlToken_when_16BytesRequested() {
+        var token = tokenGenerator.generateToken(16);
+
+        assertThat(token).hasSize(22).matches("[A-Za-z0-9_-]{22}");
+    }
+
+    @Test
+    @DisplayName("generateToken() keeps its 32-byte / 43-char contract")
+    void should_return43CharToken_when_defaultLengthRequested() {
+        var token = tokenGenerator.generateToken();
+
+        assertThat(token).hasSize(43);
+    }
+
+    @Test
+    @DisplayName("generateToken refuses fewer than 16 random bytes")
+    void should_throw_when_fewerThan16BytesRequested() {
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> tokenGenerator.generateToken(15))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
 }

@@ -59,6 +59,7 @@ class AppointmentServiceTest {
     private static final UUID MASTER_ID = UUID.randomUUID();
     private static final UUID CLIENT_ID = UUID.randomUUID();
     private static final UUID MASTER_SERVICE_ID = UUID.randomUUID();
+    private static final String IDEMPOTENCY_KEY = "visit-key-1";
 
     @Mock
     private AppointmentRepository appointmentRepository;
@@ -84,6 +85,9 @@ class AppointmentServiceTest {
     // only so @InjectMocks can satisfy the constructor.
     @Mock
     private Clock clock;
+
+    @Mock
+    private com.beautica.moderation.service.BookingBlockGuard bookingBlockGuard;
 
     @InjectMocks
     private AppointmentService appointmentService;
@@ -139,6 +143,74 @@ class AppointmentServiceTest {
                 .isInstanceOf(NotFoundException.class);
 
         verifyNoInteractions(visitPlanner);
+    }
+
+    // ── Phase 398 QA LOW — the block gate runs AFTER the under-lock replay re-check ─────────────
+
+    @Test
+    @DisplayName("an idempotent replay found under the client lock returns before the block gate runs")
+    void should_replayWithoutBlockCheck_when_visitFoundOnUnderLockRecheck() {
+        UUID existingId = UUID.randomUUID();
+        arrangeCreateUpToReplay();
+        // Fast path (no lock) misses, the authoritative re-check under the client lock hits.
+        com.beautica.booking.entity.Appointment existing = appointment(existingId);
+        when(appointmentRepository.findActiveByClientIdAndIdempotencyKey(CLIENT_ID, IDEMPOTENCY_KEY))
+                .thenReturn(Optional.empty(), Optional.of(existing));
+        when(appointmentRepository.findById(existingId)).thenReturn(Optional.of(existing));
+        when(bookingRepository.findByAppointmentIdWithGraph(existingId)).thenReturn(List.of());
+
+        // enrichCreated(existingId) reached with the replayed id; the empty item list is this fixture's stop.
+        assertThatThrownBy(() -> appointmentService.createAppointment(CLIENT_ID, IDEMPOTENCY_KEY, request()))
+                .isInstanceOf(NotFoundException.class)
+                .hasMessage("Appointment has no booking items");
+
+        verifyNoInteractions(bookingBlockGuard);
+        verify(bookingRepository, never()).acquireAdvisoryLockWithTimeout(any());
+    }
+
+    @Test
+    @DisplayName("a non-replay create runs the block gate after the client lock + replay re-check, before the "
+            + "master lock")
+    void should_runBlockCheckAfterReplayRecheck_when_noExistingVisit() {
+        Master master = arrangeCreateUpToReplay();
+        when(appointmentRepository.findActiveByClientIdAndIdempotencyKey(CLIENT_ID, IDEMPOTENCY_KEY))
+                .thenReturn(Optional.empty());
+        org.mockito.Mockito.doThrow(com.beautica.common.exception.BookingUnavailableException.forSalon())
+                .when(bookingBlockGuard).requireClientMayBook(master, CLIENT_ID);
+
+        assertThatThrownBy(() -> appointmentService.createAppointment(CLIENT_ID, IDEMPOTENCY_KEY, request()))
+                .isInstanceOf(com.beautica.common.exception.BookingUnavailableException.class);
+
+        org.mockito.InOrder order = org.mockito.Mockito.inOrder(bookingRepository, appointmentRepository,
+                bookingBlockGuard);
+        order.verify(bookingRepository).acquireClientAdvisoryLockWithTimeout(CLIENT_ID);
+        order.verify(appointmentRepository).findActiveByClientIdAndIdempotencyKey(CLIENT_ID, IDEMPOTENCY_KEY);
+        order.verify(bookingBlockGuard).requireClientMayBook(master, CLIENT_ID);
+        verify(bookingRepository, never()).acquireAdvisoryLockWithTimeout(any());
+        verify(appointmentRepository, never()).save(any());
+    }
+
+    /** Bookable master, a fixed clock the request's start is valid against, one planned item, a CLIENT, a lock. */
+    private Master arrangeCreateUpToReplay() {
+        ReflectionTestUtils.setField(appointmentService, "clock",
+                Clock.fixed(java.time.Instant.parse("2026-08-09T08:00:00Z"), java.time.ZoneOffset.UTC));
+        Master master = salonMaster(true);
+        when(masterRepository.findByIdWithUserAndSalon(MASTER_ID)).thenReturn(Optional.of(master));
+        java.time.OffsetDateTime start = request().startsAt().toOffsetDateTime();
+        when(visitPlanner.planChainedItems(any(), any(), any())).thenReturn(List.of(new VisitPlanner.PlannedItem(
+                null, start, start.plusHours(1), 60, 0, BigDecimal.TEN, null)));
+        com.beautica.user.User client = org.mockito.Mockito.mock(com.beautica.user.User.class);
+        when(client.getRole()).thenReturn(com.beautica.auth.Role.CLIENT);
+        when(userRepository.findById(CLIENT_ID)).thenReturn(Optional.of(client));
+        when(bookingRepository.acquireClientAdvisoryLockWithTimeout(CLIENT_ID)).thenReturn(1);
+        return master;
+    }
+
+    private static com.beautica.booking.entity.Appointment appointment(UUID id) {
+        com.beautica.booking.entity.Appointment appointment =
+                org.mockito.Mockito.mock(com.beautica.booking.entity.Appointment.class);
+        org.mockito.Mockito.lenient().when(appointment.getId()).thenReturn(id);
+        return appointment;
     }
 
     // ── fixtures ─────────────────────────────────────────────────────────────────────

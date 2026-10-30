@@ -1,6 +1,7 @@
 package com.beautica.config;
 
 import com.beautica.notification.mail.MailTransportKind;
+import com.beautica.review.invite.config.ReviewInviteProperties;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.springframework.boot.SpringApplication;
@@ -434,12 +435,27 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
             violations.add("rule prod-admin-email-placeholder: ADMIN_EMAIL must not use a reserved test/example domain in prod");
         }
         checkProdTurnstile(env, violations);
+        checkProdReviewInviteLink(env, violations);
         // The EFFECTIVE recipient: APP_ADMIN_EMAIL (relaxed binding of app.admin-email) overrides ADMIN_EMAIL.
         String effective = readOrNull(env, "app.admin-email");
         if (!isBlank(effective) && !effective.strip().equalsIgnoreCase(adminEmail == null ? "" : adminEmail.strip())
                 && (!isEmailShaped(effective.strip()) || isPlaceholderDomain(domainOf(effective)))) {
             violations.add("rule prod-admin-email-effective: app.admin-email (APP_ADMIN_EMAIL override) must be a real "
                     + "address (not a reserved test/example domain) in prod");
+        }
+    }
+
+    /**
+     * Phase 400 audit cycle 1. The review-invite SMS carries a single-use review token; in PROD its link must point at
+     * {@code beautica.app/r/{token}} (the website that serves the review page), so an
+     * {@code APP_BOOKING_REVIEW_INVITE_SMS_TEXT} override cannot ship tokens to another host. Unset resolves to the
+     * yml/binding default, which does. Names the rule and property only — never the configured text.
+     */
+    private static void checkProdReviewInviteLink(Environment env, List<String> violations) {
+        if (!ReviewInviteProperties.linksToProdHost(
+                boundOrNull(env, "app.booking.review-invite.sms-text"))) {
+            violations.add("rule prod-review-invite-sms-link: app.booking.review-invite.sms-text must link to "
+                    + ReviewInviteProperties.PROD_LINK + " in prod");
         }
     }
 
@@ -470,6 +486,29 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
         } else if (TURNSTILE_TEST_SECRET.matcher(secret.strip()).matches()) {
             violations.add("rule prod-turnstile-secret-test-key: TURNSTILE_SECRET_KEY must not be a Cloudflare test secret in prod");
         }
+        checkProdTurnstileActions(env, violations);
+    }
+
+    /** The widget actions the website renders (application-prod.yml); Cloudflare echoes them back in siteverify. */
+    static final String TURNSTILE_OTP_ACTION = "otp_send";
+    static final String TURNSTILE_REVIEW_ACTION = "review_submit";
+
+    /**
+     * Phase 401 audit-fix. An empty expected action switches the siteverify action check off ({@code TurnstileVerifier}),
+     * so a token solved for one widget would be accepted by the other route. In prod both must be the exact actions the
+     * website renders: {@value #TURNSTILE_OTP_ACTION} (OTP send) and {@value #TURNSTILE_REVIEW_ACTION} (guest review
+     * page). Names the rule and properties only.
+     */
+    private static void checkProdTurnstileActions(Environment env, List<String> violations) {
+        if (!TURNSTILE_OTP_ACTION.equals(stripped(boundOrNull(env, "app.turnstile.expected-action")))
+                || !TURNSTILE_REVIEW_ACTION.equals(stripped(boundOrNull(env, "app.turnstile.review-expected-action")))) {
+            violations.add("rule prod-turnstile-action: app.turnstile.expected-action must be " + TURNSTILE_OTP_ACTION
+                    + " and app.turnstile.review-expected-action must be " + TURNSTILE_REVIEW_ACTION + " in prod");
+        }
+    }
+
+    private static String stripped(String value) {
+        return value == null ? null : value.strip();
     }
 
     /** Lower-cased domain of an e-mail address, trailing dot removed. */

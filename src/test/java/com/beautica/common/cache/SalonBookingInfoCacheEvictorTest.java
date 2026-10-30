@@ -83,6 +83,20 @@ class SalonBookingInfoCacheEvictorTest {
     }
 
     @Test
+    @DisplayName("phase 402 audit: evictSalons removes every listed salon's page in one call, keeps the others")
+    void should_evictAllListedSalons_when_evictSalonsCalled() {
+        UUID salonC = UUID.randomUUID();
+        cache.put("salon-c-3333", page(salonC, "iryna-k-cc33"));
+
+        evictor.evictSalons(java.util.Set.of(salonA, salonC));
+        evictor.evictSalons(java.util.Set.of());
+
+        assertThat(cache.get("salon-a-1111")).isNull();
+        assertThat(cache.get("salon-c-3333")).isNull();
+        assertThat(cache.get("salon-b-2222")).isNotNull();
+    }
+
+    @Test
     @DisplayName("null salon id / master slug → no-op")
     void should_keepEverything_when_keyNull() {
 

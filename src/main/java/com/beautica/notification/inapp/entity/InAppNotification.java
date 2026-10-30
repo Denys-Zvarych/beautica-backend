@@ -123,6 +123,14 @@ public class InAppNotification {
     private UUID serviceTypeSuggestionId;
 
     /**
+     * Phase 415 (V219) — the {@code ReportTargetType} literal of the resolved report target, set only on the four
+     * moderation-outcome types (D3); null on every other type ({@code in_app_notification_shape_chk}). Picks the
+     * copy variant on the client; no target id or content is stored.
+     */
+    @Column(name = "moderated_target_type", length = 32)
+    private String moderatedTargetType;
+
+    /**
      * Idempotency key, unique per {@code (recipient_user_id, dedup_key)} — enforced by
      * {@code in_app_notification_dedup_uq}. A re-entrant transition (retry, a per-booking loop
      * inside a whole-visit op) collapses to one item via {@code INSERT ... ON CONFLICT DO NOTHING}.

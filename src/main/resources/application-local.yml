@@ -84,6 +84,8 @@ app:
     # Env-wrapped so a future profile copy can't silently reuse the committed dev value;
     # the default keeps local behaviour unchanged.
     otp-pepper: ${APP_OTP_PEPPER:local-dev-otp-pepper-not-for-prod-min32chars}
+    # Phase 397 — local dev only; prod value: openssl rand -base64 32.
+    phone-hash-pepper: ${PHONE_HASH_PEPPER:local-dev-phone-hash-pepper-not-for-prod-min32}
   verification:
     cumulative-failure-threshold: 10
     lockout-duration: 15m

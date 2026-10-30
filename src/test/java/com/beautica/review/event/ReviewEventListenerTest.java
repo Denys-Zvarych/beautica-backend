@@ -9,6 +9,7 @@ import com.beautica.review.service.RatingRecalculationService;
 import com.beautica.review.service.ReviewService;
 import com.beautica.booking.repository.BookingRepository;
 import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -23,21 +24,26 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.cache.CacheManager;
+import org.springframework.cache.caffeine.CaffeineCache;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.transaction.UnexpectedRollbackException;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionSynchronizationUtils;
 
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatNoException;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 @DisplayName("ReviewEventListener — unit")
 @ExtendWith(MockitoExtension.class)
@@ -134,6 +140,112 @@ class ReviewEventListenerTest {
                 .noneMatch(e -> e.getLevel() == Level.ERROR);
     }
 
+    // ── phase 396: moderation transition — same recalculation, plus the review-detail key ─────
+
+    @Test
+    @DisplayName("should_recalculateBothRatings_and_evictOnlyThatReviewDetail_when_moderationChanged")
+    void should_recalculateBothRatings_and_evictOnlyThatReviewDetail_when_moderationChanged() {
+        UUID reviewId = UUID.randomUUID();
+        UUID otherReviewId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        Map<String, org.springframework.cache.Cache> caches = new HashMap<>();
+        when(cacheManager.getCache(anyString())).thenAnswer(inv ->
+                caches.computeIfAbsent(inv.getArgument(0), name -> new CaffeineCache(
+                        name, Caffeine.newBuilder().build())));
+        cacheManager.getCache("review-detail").put(reviewId, "cached");
+        cacheManager.getCache("review-detail").put(otherReviewId, "other");
+
+        reviewEventListener.onReviewModerationChanged(
+                new ReviewModerationChangedEvent(reviewId, masterId, UUID.randomUUID(), salonId));
+        TransactionSynchronizationUtils.invokeAfterCompletion(
+                TransactionSynchronizationManager.getSynchronizations(), TransactionSynchronization.STATUS_COMMITTED);
+
+        verify(ratingRecalculationService).recalculateMasterRating(masterId);
+        verify(ratingRecalculationService).recalculateSalonRating(salonId);
+        assertThat(caches.get("review-detail").get(reviewId)).as("moderated review evicted").isNull();
+        assertThat(caches.get("review-detail").get(otherReviewId)).as("other reviews untouched").isNotNull();
+    }
+
+    // ── phase 402 audit (perf LOW): a guest-review anonymisation batch scans each cache ONCE ────
+
+    @Test
+    @DisplayName("phase 402 D1: guest reviews of three masters anonymised → every review-detail key, each master and salon review page and the salon booking pages evicted in one pass")
+    void should_evictAllAffectedKeysInOnePass_when_guestReviewsOfThreeMastersAnonymised() {
+        // Arrange
+        UUID m1 = UUID.randomUUID();
+        UUID m2 = UUID.randomUUID();
+        UUID m3 = UUID.randomUUID();
+        UUID untouchedMaster = UUID.randomUUID();
+        UUID s1 = UUID.randomUUID();
+        UUID s2 = UUID.randomUUID();
+        UUID untouchedSalon = UUID.randomUUID();
+        UUID review = UUID.randomUUID();
+        Cache<Object, Object> masterPages = Caffeine.newBuilder().build();
+        Cache<Object, Object> salonPages = Caffeine.newBuilder().build();
+        for (UUID m : List.of(m1, m2, m3, untouchedMaster)) {
+            masterPages.put("master:" + m + ":sort:NEWEST:page:0:size:5", "page");
+            masterPages.put("master:" + m + ":sort:TOP:page:1:size:20", "page");
+        }
+        for (UUID s : List.of(s1, s2, untouchedSalon)) {
+            salonPages.put("salon:" + s + ":sort:NEWEST:page:0:size:5", "page");
+        }
+        masterPages.put("master:", "malformed-key-kept");
+        org.springframework.cache.Cache masterCache = org.mockito.Mockito.mock(org.springframework.cache.Cache.class);
+        org.springframework.cache.Cache salonCache = org.mockito.Mockito.mock(org.springframework.cache.Cache.class);
+        org.springframework.cache.Cache detailCache = org.mockito.Mockito.mock(org.springframework.cache.Cache.class);
+        when(masterCache.getNativeCache()).thenReturn(masterPages);
+        when(salonCache.getNativeCache()).thenReturn(salonPages);
+        when(cacheManager.getCache("reviews-by-master")).thenReturn(masterCache);
+        when(cacheManager.getCache("reviews-by-salon")).thenReturn(salonCache);
+        when(cacheManager.getCache("review-detail")).thenReturn(detailCache);
+        GuestReviewsAnonymisedEvent event = new GuestReviewsAnonymisedEvent(
+                java.util.Set.of(review), java.util.Set.of(m1, m2, m3), java.util.Set.of(s1, s2));
+
+        // Act
+        reviewEventListener.onGuestReviewsAnonymised(event);
+        TransactionSynchronizationUtils.invokeAfterCompletion(
+                TransactionSynchronizationManager.getSynchronizations(), TransactionSynchronization.STATUS_COMMITTED);
+
+        // Assert
+        verify(masterCache, org.mockito.Mockito.times(1)).getNativeCache();
+        verify(salonCache, org.mockito.Mockito.times(1)).getNativeCache();
+        verify(cacheManager, org.mockito.Mockito.times(1)).getCache("reviews-by-master");
+        verify(cacheManager, org.mockito.Mockito.times(1)).getCache("reviews-by-salon");
+        assertThat(masterPages.asMap().keySet()).as("only the untouched master's pages + the malformed key stay")
+                .containsExactlyInAnyOrder("master:" + untouchedMaster + ":sort:NEWEST:page:0:size:5",
+                        "master:" + untouchedMaster + ":sort:TOP:page:1:size:20", "master:");
+        assertThat(salonPages.asMap().keySet())
+                .containsExactly("salon:" + untouchedSalon + ":sort:NEWEST:page:0:size:5");
+        verify(detailCache).evict(review);
+        verify(masterProfileCacheEvictor).evictSalonBookingPages(java.util.Set.of(s1, s2));
+        verify(masterProfileCacheEvictor, never()).evictSalonBookingPage(any());
+        verify(masterProfileCacheEvictor).evictBookingSlugInfoAfterCommit(java.util.Set.of(m1, m2, m3));
+    }
+
+    @Test
+    @DisplayName("phase 402 D1: anonymised reviews of independent masters only → salon review pages and booking pages untouched")
+    void should_notTouchSalonCaches_when_anonymisedReviewsHaveNoSalon() {
+        // Arrange
+        UUID master = UUID.randomUUID();
+        Cache<Object, Object> masterPages = Caffeine.newBuilder().build();
+        masterPages.put("master:" + master + ":sort:NEWEST:page:0:size:5", "page");
+        org.springframework.cache.Cache masterCache = org.mockito.Mockito.mock(org.springframework.cache.Cache.class);
+        when(masterCache.getNativeCache()).thenReturn(masterPages);
+        when(cacheManager.getCache("reviews-by-master")).thenReturn(masterCache);
+
+        // Act
+        reviewEventListener.onGuestReviewsAnonymised(new GuestReviewsAnonymisedEvent(
+                java.util.Set.of(), java.util.Set.of(master), java.util.Set.of()));
+        TransactionSynchronizationUtils.invokeAfterCompletion(
+                TransactionSynchronizationManager.getSynchronizations(), TransactionSynchronization.STATUS_COMMITTED);
+
+        // Assert
+        assertThat(masterPages.asMap()).isEmpty();
+        verify(cacheManager, never()).getCache("reviews-by-salon");
+        verify(masterProfileCacheEvictor, never()).evictSalonBookingPages(any());
+    }
+
     // ── phase 380 audit: booking-slug-info is evicted AFTER the review pages ───────────────────
 
     @Test
@@ -141,7 +253,7 @@ class ReviewEventListenerTest {
     void should_evictSlugInfoAfterReviewPages_when_reviewCreated() {
         UUID masterId = UUID.randomUUID();
         com.github.benmanes.caffeine.cache.Cache<Object, Object> reviewPages =
-                com.github.benmanes.caffeine.cache.Caffeine.newBuilder().build();
+                Caffeine.newBuilder().build();
         reviewPages.put("master:" + masterId + ":sort:NEWEST:page:0:size:5", "stale-reviews");
         org.springframework.cache.Cache springCache = org.mockito.Mockito.mock(org.springframework.cache.Cache.class);
         org.mockito.Mockito.when(springCache.getNativeCache()).thenReturn(reviewPages);

@@ -48,6 +48,8 @@ app:
     secret-key: ${TURNSTILE_SECRET_KEY:1x0000000000000000000000000000000AA}
     expected-hostnames: []
     expected-action: ""
+    # Phase 401 — the guest review page (/r/{token}) widget action; empty = no check (test keys).
+    review-expected-action: ""
   # Phase 374: staging stays on SMTP (Mailpit) — overrides prod's brevo-api, and keeps the inline CID logo.
   # The fingerprint guard fails the boot on transport != smtp (staging-mail-transport) or a set BREVO_API_KEY.
   mail:

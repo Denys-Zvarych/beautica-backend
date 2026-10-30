@@ -93,7 +93,7 @@ class BookingClientReviewExposureIT extends AbstractIntegrationTest {
     @DisplayName("the SALON_OWNER reads the client's rating AND the full comment on the booking")
     void should_exposeRatingAndFullComment_when_ownerReadsAReviewedBooking() throws Exception {
         Fixture fx = seedCompletedBooking("bcre-owner-");
-        leaveClientReview(fx, 5, REVIEW_COMMENT);
+        String reviewId = leaveClientReview(fx, 5, REVIEW_COMMENT);
 
         JsonNode review = getBookingDetail(fx.bookingId(), tokenFor(fx.ownerEmail())).path("reviewByClient");
 
@@ -101,6 +101,10 @@ class BookingClientReviewExposureIT extends AbstractIntegrationTest {
                 .as("the field must be populated on the detail path for a reviewed booking")
                 .isFalse();
         assertThat(review.path("rating").asInt()).isEqualTo(5);
+        assertThat(review.path("id").asText())
+                .as("phase 395 — the review id, so the provider can report it (POST /reports, REVIEW)")
+                .isNotBlank()
+                .isEqualTo(reviewId);
         assertThat(review.path("comment").asText())
                 .as("D2 — the FULL comment, byte-for-byte. Truncating or masking it would be "
                         + "theatre: the same text is already public on GET /masters/{id}/reviews.")
@@ -357,7 +361,8 @@ class BookingClientReviewExposureIT extends AbstractIntegrationTest {
      * worse, pass against a silently mangled round trip. The null branch OMITS the field rather than
      * sending an explicit {@code null}, which is what a client rating without writing actually does.
      */
-    private void leaveClientReview(Fixture fx, int rating, String comment) throws Exception {
+    /** Creates the client's review through the real endpoint and returns its id. */
+    private String leaveClientReview(Fixture fx, int rating, String comment) throws Exception {
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("bookingId", fx.bookingId().toString());
         payload.put("rating", rating);
@@ -371,6 +376,7 @@ class BookingClientReviewExposureIT extends AbstractIntegrationTest {
         assertThat(resp.getStatusCode())
                 .as("premise — the client's review must actually be created, body=%s", resp.getBody())
                 .isEqualTo(HttpStatus.CREATED);
+        return objectMapper.readTree(resp.getBody()).path("data").path("id").asText();
     }
 
     private String tokenFor(String email) throws Exception {

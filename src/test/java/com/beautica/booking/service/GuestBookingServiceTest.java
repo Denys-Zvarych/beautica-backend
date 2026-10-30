@@ -1,5 +1,6 @@
 package com.beautica.booking.service;
 
+import com.beautica.booking.domain.CancelTokenHasher;
 import com.beautica.auth.phoneotp.GuestTokenProvider;
 import com.beautica.booking.dto.GuestBookingRequest;
 import com.beautica.booking.dto.GuestBookingResponse;
@@ -73,6 +74,7 @@ class GuestBookingServiceTest {
     @Mock private RetiredBookingSlugGuard retiredBookingSlugGuard;
     @Mock private SalonGuestMasterResolver salonGuestMasterResolver;
     @Mock private GuestTokenBookingCap guestTokenBookingCap;
+    @Mock private com.beautica.moderation.service.BookingBlockGuard bookingBlockGuard;
 
     private GuestBookingService service;
 
@@ -87,7 +89,8 @@ class GuestBookingServiceTest {
                 new BookingSmsProperties(), salonCatalogCacheEvictor,
                 new VisitPlanner(masterServiceRepository), FRONTEND,
                 java.time.Clock.fixed(OffsetDateTime.parse("2026-06-01T10:00:00Z").toInstant(), ZoneOffset.UTC),
-                inAppNotificationService, retiredBookingSlugGuard, salonGuestMasterResolver, guestTokenBookingCap);
+                inAppNotificationService, retiredBookingSlugGuard, salonGuestMasterResolver, guestTokenBookingCap,
+                bookingBlockGuard);
 
         // Phase 337 fix: BookingSlotLockGuard.lockMasterAndAssertFree now re-checks bookability
         // AFTER the advisory lock (PostLockSlotGuard, closing the self-delete-race CRITICAL), fused
@@ -153,6 +156,10 @@ class GuestBookingServiceTest {
         assertThat(saved.getGuestPhone()).isEqualTo(GUEST_PHONE);
         assertThat(saved.getCancelToken()).isNotNull();
         assertThat(response.cancelUrl()).startsWith(FRONTEND + "/book/cancel/");
+        // V206: the persisted column is the SHA-256 of the raw token the guest's link carries.
+        UUID linkToken = UUID.fromString(response.cancelUrl().substring((FRONTEND + "/book/cancel/").length()));
+        assertThat(linkToken).isEqualTo(saved.getCancelToken());
+        assertThat(saved.getCancelTokenHash()).isEqualTo(CancelTokenHasher.hash(linkToken));
 
         verify(outboxService).enqueueNewBooking(any());
         ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
@@ -246,6 +253,25 @@ class GuestBookingServiceTest {
         // was never reached, so no lock-acquisition attempt (and therefore no timeout) happened.
         verify(bookingRepository, never()).acquireAdvisoryLockWithTimeout(any());
         verify(bookingRepository, never()).acquireAdvisoryLock(any());
+    }
+
+    @Test
+    @DisplayName("phase 398 — a blocked verified phone: the guard gets the TARGET master + token phone, and the "
+            + "refusal stops before any service lookup, lock or SMS")
+    void should_reject409BeforeLock_when_guestPhoneBlocked() {
+        OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
+        when(guestTokenProvider.validateClaims(anyString())).thenReturn(GUEST_CLAIMS);
+        com.beautica.master.entity.Master target = master();
+        when(masterRepository.findByBookingSlugWithUser(SLUG)).thenReturn(Optional.of(target));
+        org.mockito.Mockito.doThrow(com.beautica.common.exception.BookingUnavailableException.forMaster())
+                .when(bookingBlockGuard).requireGuestMayBook(target, GUEST_PHONE);
+
+        assertThatThrownBy(() -> service.createGuestBooking(
+                "Bearer t", SLUG, new GuestBookingRequest(serviceId, null, startsAt, "Олена", "Коваль", true, "2026-10-20")))
+                .isInstanceOf(com.beautica.common.exception.BookingUnavailableException.class);
+
+        verifyNoInteractions(masterServiceRepository, smsService);
+        verify(bookingRepository, never()).acquireAdvisoryLockWithTimeout(any());
     }
 
     // ── REGRESSION PINS (Phase 13.3): startsAt lead-time + max-window parity ──
