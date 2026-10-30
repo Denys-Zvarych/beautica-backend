@@ -299,6 +299,11 @@ public class SecurityConfig {
                     auth.requestMatchers(HttpMethod.HEAD, "/api/v1/public/review-invites/*").permitAll();
                     auth.requestMatchers(HttpMethod.POST, "/api/v1/public/review-invites/*/reviews").permitAll();
                     auth.requestMatchers(HttpMethod.POST, "/api/v1/public/review-invites/*/opt-out").permitAll();
+                    // Phase 406 D1/D2 — Telegram Bot API webhook. Telegram holds no JWT; the controller authenticates
+                    // every call by the X-Telegram-Bot-Api-Secret-Token header (constant-time) and throttles failed
+                    // ones per IP. Exact path, POST only; the controller bean exists only with app.telegram.enabled,
+                    // so a dark deploy answers 404.
+                    auth.requestMatchers(HttpMethod.POST, "/api/v1/telegram/webhook").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/salons/{salonId}/portfolio").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/masters/{masterId}/portfolio").permitAll();
                     // Internal management API — authenticated by InternalApiKeyFilter (X-Internal-Key header),

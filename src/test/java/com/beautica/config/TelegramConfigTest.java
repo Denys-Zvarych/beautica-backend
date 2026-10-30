@@ -189,6 +189,36 @@ class TelegramConfigTest {
     }
 
     @Test
+    @DisplayName("phase 406: enabled + capture + malformed secret → context fails at bind time, secret not echoed")
+    void should_failContext_when_captureModeSecretMalformed() {
+        runner.withPropertyValues("app.telegram.enabled=true", "app.telegram.mode=capture",
+                        "app.telegram.webhook-secret=short")
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    assertThat(rootMessage(context.getStartupFailure()))
+                            .contains("app.telegram.webhook-secret has an invalid format").doesNotContain("short");
+                });
+    }
+
+    @Test
+    @DisplayName("phase 406: flag off + malformed secret → boots (a dark deploy never fails on an unused secret)")
+    void should_boot_when_flagOffWithMalformedSecret() {
+        runner.withPropertyValues("app.telegram.webhook-secret=short")
+                .run(context -> assertThat(context).hasNotFailed());
+    }
+
+    @Test
+    @DisplayName("phase 406: committed local profile + flag on → its dev webhook secret passes the format check")
+    void should_bindLocalDevSecret_when_localProfileEnabled() {
+        runner.withInitializer(new ConfigDataApplicationContextInitializer())
+                .withPropertyValues("spring.profiles.active=local", "APP_TELEGRAM_ENABLED=true").run(context -> {
+                    assertThat(context).hasNotFailed();
+                    assertThat(context.getBean(TelegramProperties.class).webhookSecret())
+                            .matches("^[A-Za-z0-9_-]{32,256}$");
+                });
+    }
+
+    @Test
     @DisplayName("enabled + live + username with '@' → context fails")
     void should_failContext_when_usernameHasAt() {
         runner.withPropertyValues(VALID_LIVE).withPropertyValues("app.telegram.bot-username=@beautica_app_bot")

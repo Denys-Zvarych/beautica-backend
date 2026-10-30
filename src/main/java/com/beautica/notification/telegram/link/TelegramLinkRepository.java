@@ -30,8 +30,18 @@ public interface TelegramLinkRepository extends JpaRepository<TelegramLink, UUID
     int upsert(@Param("id") UUID id, @Param("phoneHash") byte[] phoneHash, @Param("chatId") long chatId,
                @Param("now") Instant now);
 
+    /**
+     * Deletes the chat's links. Phase 406 audit: bounded by the same fused, transaction-local 3 s
+     * {@code lock_timeout} as every other 405 lock — the joined one-row config subquery is evaluated before the
+     * delete locks a row (a joined row needs both sides), so a held row aborts with {@code 55P03} instead of
+     * parking a webhook thread.
+     */
     @Modifying(flushAutomatically = true, clearAutomatically = true)
-    @Query("DELETE FROM TelegramLink l WHERE l.chatId = :chatId")
+    @Query(value = """
+            DELETE FROM telegram_links l
+             USING (SELECT set_config('lock_timeout', '3s', true)) lock_cfg
+             WHERE l.chat_id = :chatId
+            """, nativeQuery = true)
     int deleteByChat(@Param("chatId") long chatId);
 
     @Modifying(flushAutomatically = true, clearAutomatically = true)
@@ -39,13 +49,22 @@ public interface TelegramLinkRepository extends JpaRepository<TelegramLink, UUID
     int deleteByPhone(@Param("phoneHash") byte[] phoneHash);
 
     /** Moves the chat's {@code from} rows to {@code to}; no-op on rows already in another state. */
+    default int transitionByChat(long chatId, TelegramLinkStatus from, TelegramLinkStatus to, Instant now) {
+        return transitionByChatBounded(chatId, from.name(), to.name(), now);
+    }
+
+    /**
+     * {@link #transitionByChat} with the fused, transaction-local 3 s {@code lock_timeout} (phase 406 audit; same
+     * shape as {@link #deleteByChat}). Status values are the {@link TelegramLinkStatus} names (V224 CHECK).
+     */
     @Modifying(flushAutomatically = true, clearAutomatically = true)
-    @Query("""
-            UPDATE TelegramLink l SET l.status = :to, l.statusChangedAt = :now
-             WHERE l.chatId = :chatId AND l.status = :from
-            """)
-    int transitionByChat(@Param("chatId") long chatId, @Param("from") TelegramLinkStatus from,
-                         @Param("to") TelegramLinkStatus to, @Param("now") Instant now);
+    @Query(value = """
+            UPDATE telegram_links l SET status = :to, status_changed_at = :now
+              FROM (SELECT set_config('lock_timeout', '3s', true)) lock_cfg
+             WHERE l.chat_id = :chatId AND l.status = :from
+            """, nativeQuery = true)
+    int transitionByChatBounded(@Param("chatId") long chatId, @Param("from") String from, @Param("to") String to,
+                                @Param("now") Instant now);
 
     @Modifying(flushAutomatically = true, clearAutomatically = true)
     @Query("""

@@ -15,9 +15,10 @@ import java.util.regex.Pattern;
  * username or webhook secret fails the context at bind time: unlike Turbosms (blank token = loud at send time),
  * a live Telegram channel without credentials would silently route every message to SMS fallback.
  *
- * <p>In that same cell (and only there, so a dark deploy can never fail boot on a credential it does not use)
- * each value is format-checked: the webhook secret must use the Bot API {@code secret_token} alphabet with
- * ≥ 32 chars of entropy; the token
+ * <p>The webhook secret, when set, is format-checked whenever {@code enabled=true} in ANY mode (phase 406: it
+ * authenticates the webhook in capture mode too): the Bot API {@code secret_token} alphabet with ≥ 32 chars of
+ * entropy. In the enabled + live cell only (so a dark deploy can never fail boot on a credential it does not use)
+ * the other values are format-checked too: the token
  * must look like {@code <digits>:<base64url>} (it is spliced into the URL path, so {@code /}, {@code ?} or
  * {@code #} would redirect the call); the username is stored without {@code @}; the API base URL must be
  * {@code https} (the token travels in the path) — plain {@code http} is allowed for loopback hosts only (tests).
@@ -78,12 +79,17 @@ public record TelegramProperties(
             requirePresent("app.telegram.webhook-secret (TELEGRAM_WEBHOOK_SECRET)", webhookSecret);
             requireFormat("app.telegram.bot-token", botToken, BOT_TOKEN, "<digits>:<base64url>");
             requireFormat("app.telegram.bot-username", botUsername, BOT_USERNAME, "5-32 chars [A-Za-z0-9_], no '@'");
-            requireFormat("app.telegram.webhook-secret", webhookSecret, WEBHOOK_SECRET,
-                    "32-256 chars [A-Za-z0-9_-]");
             if (apiBaseUrl == null || !API_BASE_URL.matcher(apiBaseUrl).matches()) {
                 throw new IllegalStateException(
                         "app.telegram.api-base-url must be an https origin (http only for localhost)");
             }
+        }
+        // Phase 406 security audit: the secret authenticates the webhook in every mode (capture included), so a set
+        // secret is format-checked whenever the channel is on. A blank one still boots off-live and fails closed
+        // (TelegramWebhookSecretVerifier rejects every call).
+        if (enabled && !webhookSecret.isEmpty()) {
+            requireFormat("app.telegram.webhook-secret", webhookSecret, WEBHOOK_SECRET,
+                    "32-256 chars [A-Za-z0-9_-]");
         }
         stagingAllowedChatIds = requirePositiveChatIds(stagingAllowedChatIds);
         OutboundTimeouts.requirePositive("app.telegram.link-token-ttl", linkTokenTtl);

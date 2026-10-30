@@ -11,6 +11,7 @@ import io.github.bucket4j.Bucket;
 import jakarta.annotation.PostConstruct;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Conditional;
 import org.springframework.context.annotation.Configuration;
 
 import java.time.Duration;
@@ -24,6 +25,9 @@ public class RateLimitConfig {
     private static final long DEFAULT_BUCKET_CACHE_SIZE = 100_000;
     private static final long VERIFY_EMAIL_BUCKET_CACHE_SIZE = 50_000;
     private static final long RESEND_VERIFICATION_BUCKET_CACHE_SIZE = 10_000;
+    // Phase 406 perf audit: only callers that FAIL the webhook secret land here (guessers / scanners), never
+    // Telegram itself, so a small dedicated cap bounds the memory an IP-rotating flood can pin.
+    private static final long TELEGRAM_WEBHOOK_REJECT_BUCKET_CACHE_SIZE = 10_000;
 
     private static final Duration STANDARD_EVICTION = Duration.ofHours(1);
     private static final Duration ONE_MINUTE = Duration.ofMinutes(1);
@@ -566,6 +570,12 @@ public class RateLimitConfig {
     private long supportContactCapacity;
 
     private static final Duration SUPPORT_CONTACT_WINDOW = Duration.ofMinutes(60);
+
+    // Phase 406 D4 — per-IP cap on POST /api/v1/telegram/webhook calls that FAIL the secret check (60-second
+    // window). Charged by TelegramWebhookSecretVerifier only on a rejected call, so genuine Telegram traffic (which
+    // carries the secret) is never throttled; past the cap a guesser gets 429 instead of 401.
+    @Value("${app.rate-limit.telegram-webhook-capacity:60}")
+    private long telegramWebhookCapacity;
 
     // Per-IP cap for POST /api/v1/book/otp/send (15-minute window). Every successful
     // request dispatches an SMS via Turbosms — a billable, outbound-quota / SMS-bomb
@@ -1234,6 +1244,22 @@ public class RateLimitConfig {
                 SUPPORT_CONTACT_WINDOW.plus(EVICTION_GRACE),
                 supportContactCapacity,
                 SUPPORT_CONTACT_WINDOW);
+    }
+
+    /**
+     * Phase 406 D4 — per-IP bucket for rejected Telegram webhook calls (bad / missing secret), consumed by
+     * {@code TelegramWebhookSecretVerifier}, not by a filter: only the verifier knows whether the secret matched, and
+     * a filter-level bucket would also count Telegram's own authenticated deliveries. Built only while the channel
+     * is on ({@link TelegramEnabledCondition}); its sole consumer, the verifier, has the same condition.
+     */
+    @Bean
+    @Conditional(TelegramEnabledCondition.class)
+    public LoadingCache<String, Bucket> telegramWebhookRejectBuckets() {
+        return bucketCache(
+                TELEGRAM_WEBHOOK_REJECT_BUCKET_CACHE_SIZE,
+                ONE_MINUTE.plus(EVICTION_GRACE),
+                telegramWebhookCapacity,
+                ONE_MINUTE);
     }
 
     /**

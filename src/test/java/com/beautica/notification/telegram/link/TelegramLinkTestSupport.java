@@ -12,24 +12,24 @@ import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * Shared fixtures for the phase 405 ITs: a hand-moved clock bean (bean name {@code systemClock} overrides
+ * Shared fixtures for the phase 405 ITs and the phase 406 webhook ITs: a hand-moved clock bean (bean name {@code systemClock} overrides
  * {@code ClockConfig}, test profile allows overriding) and guest LINK bookings to hang tokens on. One shared
  * {@code @TestConfiguration} so every Telegram-link IT reuses the same cached Spring context.
  */
-final class TelegramLinkTestSupport {
+public final class TelegramLinkTestSupport {
 
-    static final Instant T0 = Instant.parse("2026-10-30T10:00:00Z");
-    static final String BOT_USERNAME = "beautica_test_bot";
-    static final String BOT_USERNAME_PROPERTY = "app.telegram.bot-username=" + BOT_USERNAME;
-    static final String GUEST_PHONE = "+380501234567";
-    static final String OTHER_PHONE = "+380671112233";
+    public static final Instant T0 = Instant.parse("2026-10-30T10:00:00Z");
+    public static final String BOT_USERNAME = "beautica_test_bot";
+    public static final String BOT_USERNAME_PROPERTY = "app.telegram.bot-username=" + BOT_USERNAME;
+    public static final String GUEST_PHONE = "+380501234567";
+    public static final String OTHER_PHONE = "+380671112233";
 
     private static final AtomicInteger HOUR_OFFSET = new AtomicInteger(10);
 
     @TestConfiguration
-    static class ClockConfig {
+    public static class ClockConfig {
         @Bean
-        MutableTestClock systemClock() {
+        public MutableTestClock systemClock() {
             return new MutableTestClock(T0);
         }
     }
@@ -39,13 +39,13 @@ final class TelegramLinkTestSupport {
     private UUID masterId;
     private UUID masterServiceId;
 
-    TelegramLinkTestSupport(JdbcTemplate jdbcTemplate, PasswordEncoder passwordEncoder) {
+    public TelegramLinkTestSupport(JdbcTemplate jdbcTemplate, PasswordEncoder passwordEncoder) {
         this.jdbcTemplate = jdbcTemplate;
         this.fixtures = new BookingTestFixtures(null, jdbcTemplate, null, passwordEncoder);
     }
 
     /** A COMPLETED guest LINK booking in the past (distinct hour per call, so no overlap guard can fire). */
-    UUID guestBooking(String guestPhone) {
+    public UUID guestBooking(String guestPhone) {
         if (masterId == null) {
             masterId = fixtures.createIndependentMaster("tg-link-" + System.nanoTime() + "@beautica.test");
             masterServiceId = fixtures.createIndependentMasterService(masterId);
@@ -63,7 +63,7 @@ final class TelegramLinkTestSupport {
     }
 
     /** The raw start token out of {@code https://t.me/<bot>?start=<token>}. */
-    static String rawToken(IssuedLink link) {
+    public static String rawToken(IssuedLink link) {
         return link.url().substring(link.url().indexOf("?start=") + "?start=".length());
     }
 }

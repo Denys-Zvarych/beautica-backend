@@ -62,6 +62,14 @@ public class TelegramLinkService {
         return new IssuedLink(DEEP_LINK.formatted(properties.botUsername(), rawToken), expiresAt);
     }
 
+    /**
+     * D6 token shape (43 base64url chars), shared with the webhook (406) so it can skip DB work for a {@code /start}
+     * payload that can never be a token.
+     */
+    public static boolean isWellFormedToken(String rawToken) {
+        return rawToken != null && TOKEN_SHAPE.matcher(rawToken).matches();
+    }
+
     @Transactional
     public ClaimResult claim(String rawToken, long chatId) {
         ClaimResult result = doClaim(rawToken, chatId);
@@ -70,7 +78,7 @@ public class TelegramLinkService {
     }
 
     private ClaimResult doClaim(String rawToken, long chatId) {
-        if (rawToken == null || !TOKEN_SHAPE.matcher(rawToken).matches()) {
+        if (!isWellFormedToken(rawToken)) {
             return ClaimResult.INVALID;
         }
         tokenRepository.acquireChatClaimLock(chatId);
@@ -151,10 +159,14 @@ public class TelegramLinkService {
                 clock.instant());
     }
 
-    /** BLOCKED → ACTIVE only; a chat without a link stays unlinked. */
+    /**
+     * BLOCKED → ACTIVE only; a chat without a link stays unlinked.
+     *
+     * @return how many of the chat's links moved to ACTIVE (0 when none was BLOCKED)
+     */
     @Transactional
-    public void reactivate(long chatId) {
-        linkRepository.transitionByChat(chatId, TelegramLinkStatus.BLOCKED, TelegramLinkStatus.ACTIVE,
+    public int reactivate(long chatId) {
+        return linkRepository.transitionByChat(chatId, TelegramLinkStatus.BLOCKED, TelegramLinkStatus.ACTIVE,
                 clock.instant());
     }
 
