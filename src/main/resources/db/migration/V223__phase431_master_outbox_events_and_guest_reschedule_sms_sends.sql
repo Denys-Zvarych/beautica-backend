@@ -1,3 +1,5 @@
+-- non-destructive
+-- Reason: chk_outbox_event is re-added as a strict superset (every prior value kept, two new values); the unique index and CHECKs are on tables created in this file and constrain only rows written by this release.
 -- Phase 431 (audit-fix cycle 1).
 --
 -- 1. Widen chk_outbox_event to admit the two performing-master rows. The master e-mail is its OWN
