@@ -6,6 +6,7 @@ import com.beautica.auth.dto.InviteErrorResponse;
 import com.beautica.booking.dto.BookingElapsedResponse;
 import com.beautica.booking.dto.ClientBookingConflictResponse;
 import com.beautica.common.ApiResponse;
+import com.beautica.booking.dto.RescheduleLimitReachedResponse;
 import com.beautica.media.dto.PortfolioLimitReachedResponse;
 import com.beautica.salon.dto.SalonDeletionBlockedResponse;
 import com.beautica.service.dto.DuplicateServiceResponse;
@@ -325,6 +326,23 @@ public class GlobalExceptionHandler {
                 .body(new ApiResponse<>(false,
                         new PortfolioLimitReachedResponse(PortfolioLimitReachedException.ERROR_CODE),
                         "Portfolio photo limit reached"));
+    }
+
+    /**
+     * Phase 431 — distinct 409 for the guest-booking reschedule cap (5 provider reschedules per guest
+     * booking/visit per rolling 24 h): the {@link RescheduleLimitReachedResponse} body carries
+     * {@code RESCHEDULE_LIMIT_REACHED} under {@code data.code}, which {@link #handleBusiness}'s
+     * genericised CONFLICT branch would otherwise drop. A new code; no existing body changes.
+     */
+    @ExceptionHandler(RescheduleLimitReachedException.class)
+    public ResponseEntity<ApiResponse<RescheduleLimitReachedResponse>> handleRescheduleLimitReached(
+            RescheduleLimitReachedException ex) {
+        log.debug("Reschedule rejected: {}", ex.getClass().getSimpleName());
+        return ResponseEntity
+                .status(HttpStatus.CONFLICT)
+                .body(new ApiResponse<>(false,
+                        new RescheduleLimitReachedResponse(RescheduleLimitReachedException.ERROR_CODE),
+                        "Reschedule limit reached for this booking"));
     }
 
     /**

@@ -1977,6 +1977,9 @@ public class BookingService {
     public BookingResponse declineBooking(UUID actorUserId, UUID bookingId, StatusUpdateRequest req) {
         Booking saved = declineBookingCore(actorUserId, bookingId, req);
         outboxService.enqueueStatusChanged(saved.getId());
+        // Phase 431 — the performing master's e-mail is its OWN row (own retry state), skipped when
+        // the master declined it themselves.
+        outboxService.enqueueMasterBookingDeclined(saved.getId(), masterUserIdOf(saved), actorUserId);
         // Phase 333, matrix row 3 — client (if registered) + performing master unless actor. `saved`
         // is already the full graph loaded by declineBookingCore (audit-fix cycle 1, finding 1) —
         // never reloaded here.
@@ -3849,6 +3852,11 @@ public class BookingService {
         // re-reads this booking's CONFIRMED status fresh from the DB, and no phase-2 collapse ever
         // follows a reschedule.
         UUID appointmentId = booking.getAppointment() != null ? booking.getAppointment().getId() : null;
+        // Phase 431 — guest booking/visit reschedule cap (5 per 24 h), under the master lock and
+        // before any change; a one-service move counts against its visit.
+        if (initiatedByProvider) {
+            appointmentTransitionService.assertGuestRescheduleWithinLimitAndRecord(booking, appointmentId);
+        }
         if (appointmentId != null) {
             appointmentTransitionService.lockAppointmentHeaderBeforeItemReschedule(appointmentId);
         }
@@ -3871,7 +3879,15 @@ public class BookingService {
         // Phase 27.3: the outbox payload records who initiated the move, so the drain worker can
         // address the notification to the OTHER party (client-initiated -> notify the provider,
         // unchanged; provider-initiated -> notify the client).
-        outboxService.enqueueBookingRescheduled(saved.getId(), initiatedByProvider);
+        // Phase 431 — a PROVIDER move records the new start (guest-SMS burst collapse) and enqueues
+        // the performing master's e-mail as its own row (skipped when they moved it themselves). The
+        // client-initiated row is written exactly as before.
+        if (initiatedByProvider) {
+            outboxService.enqueueBookingRescheduled(saved.getId(), true, newStartsAt.toInstant());
+            outboxService.enqueueMasterBookingRescheduled(saved.getId(), masterUserIdOf(saved), actorUserId);
+        } else {
+            outboxService.enqueueBookingRescheduled(saved.getId(), false);
+        }
         // Phase 333, matrix row 4 — performing master always (unless actor), plus the other party
         // (client if provider-initiated, owner+admins if client-initiated); walk-ins restrict to the
         // master cell only. See InAppNotificationService#notifyRescheduled.
@@ -4452,5 +4468,13 @@ public class BookingService {
 
     private void doEvictRevenueDashboard(UUID actorId) {
         cachePrefixEvictor.evictByKeyPrefixNow(actorId, "revenue-dashboard");
+    }
+
+    /**
+     * Phase 431 — the performing master's user id for the master outbox row, or {@code null} for a
+     * detached master (no account, nobody to e-mail).
+     */
+    private static UUID masterUserIdOf(Booking booking) {
+        return booking.getMaster().getUser() == null ? null : booking.getMaster().getUser().getId();
     }
 }

@@ -1031,6 +1031,19 @@ class StaffBookingServiceTest {
             assertThat(create(command(guest(RAW_PHONE))).status()).isEqualTo(BookingStatus.CONFIRMED);
             verify(smsService).send(eq(E164_PHONE), any(String.class));
         }
+
+        @Test
+        @DisplayName("should_neverReadTheRescheduleSmsCount_when_walkInCreated")
+        void should_neverReadTheRescheduleSmsCount_when_walkInCreated() {
+            stubHappyPath(salonMaster(), assignment(null, null));
+
+            create(command(guest(RAW_PHONE)));
+
+            // Phase 431 (user rule 2026-10-30 + perf LOW): the walk-in verdict counts walk-in visits only,
+            // so reschedule SMS — possibly another provider's — can never push it to 429, and the walk-in
+            // create never scans the reschedule send log.
+            verify(bookingRepository, never()).countPhoneSmsBudgetUsedSince(any(), any());
+        }
     }
 
     // ════════════════════════════════════════════════════════════════════════════════

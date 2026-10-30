@@ -174,6 +174,37 @@ public class EmailNotificationService {
     }
 
     /**
+     * Phase 431 — tells the booking's PERFORMING MASTER that the salon side (owner / admin) moved
+     * their booking to a new time. Same variables as {@link #sendBookingRescheduledEmail}, but its own
+     * template, because that one's copy says the CLIENT moved it. {@code clientName} resolves a guest
+     * or walk-in by name only — the guest phone is never put into a master-facing context. No note.
+     */
+    public void sendBookingRescheduledBySalonEmail(String to, Booking booking) {
+        var ctx = new Context();
+        ctx.setVariable("masterName", masterDisplayName(booking));
+        ctx.setVariable("clientName", resolveClientName(booking));
+        ctx.setVariable("serviceName", booking.getMasterService().getServiceDefinition().getName());
+        ctx.setVariable("startsAt", formatStartsAt(booking));
+        send(to, "Салон переніс бронювання", "email/booking-rescheduled-by-salon-provider", ctx);
+    }
+
+    /**
+     * Phase 431 — tells the booking's PERFORMING MASTER that the salon side (owner / admin) cancelled
+     * their booking, or their whole visit (one e-mail per visit, naming every service through the
+     * shared visit variables). The master-facing twin of {@link #sendClientCancelledEmail} with
+     * "cancelled by the salon" copy. {@code clientName} resolves a guest or walk-in by name only — the
+     * guest phone is never put into a master-facing context — and no note of any kind is read.
+     */
+    public void sendBookingDeclinedBySalonEmail(String to, BookingVisit visit) {
+        Booking booking = visit.lead();
+        var ctx = new Context();
+        ctx.setVariable("masterName", masterDisplayName(booking));
+        ctx.setVariable("clientName", resolveClientName(booking));
+        applyVisitVariables(ctx, visit);
+        send(to, "Салон скасував бронювання", "email/booking-declined-by-salon-provider", ctx);
+    }
+
+    /**
      * Client-facing twin of {@link #sendBookingRescheduledEmail} (Phase 27.3) — sent when a
      * PROVIDER moves a booking, mirroring that method's structure/variables exactly, re-addressed
      * to the client with client-appropriate copy.

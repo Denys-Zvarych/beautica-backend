@@ -176,8 +176,8 @@ public class StaffBookingService {
      * being limited. 5 per hour clears every legitimate shape (a client rebooked after a cancel, a
      * family sharing one number, a corrected time) by a wide margin while removing the loop.
      */
-    private static final long MAX_WALK_INS_PER_PHONE_PER_WINDOW = 5;
-    private static final Duration WALK_IN_PHONE_WINDOW = Duration.ofHours(1);
+    static final long MAX_WALK_INS_PER_PHONE_PER_WINDOW = 5;
+    static final Duration WALK_IN_PHONE_WINDOW = Duration.ofHours(1);
 
     /**
      * Creates one {@code CONFIRMED}, {@code STAFF}-sourced VISIT for an account-less walk-in
@@ -409,6 +409,10 @@ public class StaffBookingService {
         // the SAME lock — a lock on the raw string would be inert against exactly the alternation
         // the normalisation exists to defeat.
         bookingRepository.acquireWalkInPhoneLock(guestPhone);
+        // Phase 431: the walk-in verdict counts walk-in VISITS only — exactly the pre-431 budget and
+        // query plan. Guest reschedule SMS (possibly another provider's) must never push a walk-in
+        // create to 429 (user rule 2026-10-30); the reschedule side alone reads the combined count
+        // (GuestRescheduleSmsBudget, BookingRepository#countPhoneSmsBudgetUsedSince).
         long recent = bookingRepository.countStaffWalkInVisitsForPhoneSince(
                 guestPhone, clock.instant().minus(WALK_IN_PHONE_WINDOW));
         if (recent >= MAX_WALK_INS_PER_PHONE_PER_WINDOW) {

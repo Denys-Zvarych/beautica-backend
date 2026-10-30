@@ -78,7 +78,14 @@ public class BookingSmsDispatcher {
          * thread, which is already after commit; routed here so a Turbosms stall never holds the
          * drain batch, and so the drop/failure lines name it like every other booking SMS.
          */
-        GUEST_PROVIDER_CANCELLATION("guest_provider_cancellation");
+        GUEST_PROVIDER_CANCELLATION("guest_provider_cancellation"),
+        /**
+         * Phase 431 — the provider side (independent master, salon owner or admin) moved an
+         * account-less guest's booking, or one service of their visit, to a new time. Queued from
+         * {@code NotificationService} on the outbox drain thread, exactly like
+         * {@link #GUEST_PROVIDER_CANCELLATION}.
+         */
+        GUEST_PROVIDER_RESCHEDULE("guest_provider_reschedule");
 
         private final String token;
 

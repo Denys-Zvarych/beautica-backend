@@ -1285,6 +1285,23 @@ class GlobalExceptionHandlerTest {
                 .isEqualTo("Portfolio photo limit reached");
     }
 
+    // ── guest reschedule cap (Phase 431, D4b) ──────────────────────────────────
+
+    @Test
+    @DisplayName("handleRescheduleLimitReached — 409 with the exact coded body the mobile app branches on")
+    void should_return409WithExactRescheduleLimitBody_when_rescheduleLimitReached() throws Exception {
+        var ex = new RescheduleLimitReachedException();
+
+        ResponseEntity<ApiResponse<com.beautica.booking.dto.RescheduleLimitReachedResponse>> response =
+                handler.handleRescheduleLimitReached(ex);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+        assertThat(new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(response.getBody()))
+                .as("wire body; data.code is the mobile contract, message is the cap's own copy")
+                .isEqualTo("{\"success\":false,\"data\":{\"code\":\"RESCHEDULE_LIMIT_REACHED\"},"
+                        + "\"message\":\"Reschedule limit reached for this booking\"}");
+    }
+
     @Test
     @DisplayName("handlePortfolioBusy — 503 + Retry-After, allow-listed message, no data")
     void should_return503WithRetryAfter_when_portfolioBusy() {

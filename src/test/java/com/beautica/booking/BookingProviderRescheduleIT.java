@@ -97,7 +97,11 @@ class BookingProviderRescheduleIT extends AbstractIntegrationTest {
                 String.class, bookingId))
                 .isEqualTo("12:00");
 
-        List<NotificationOutboxEntry> rows = outboxRepository.findAll();
+        // Phase 431: the performing master's e-mail is its own MASTER_BOOKING_RESCHEDULED row when the
+        // master is not the actor — filter to the client/guest row this assertion is about.
+        List<NotificationOutboxEntry> rows = outboxRepository.findAll().stream()
+                .filter(row -> row.getEventType() == com.beautica.notification.entity.OutboxEventType.BOOKING_RESCHEDULED)
+                .toList();
         assertThat(rows)
                 .as("the reschedule must enqueue exactly one BOOKING_RESCHEDULED row")
                 .hasSize(1);
@@ -274,7 +278,11 @@ class BookingProviderRescheduleIT extends AbstractIntegrationTest {
                 String.class, bookingId))
                 .isEqualTo("14:00");
 
-        List<NotificationOutboxEntry> rows = outboxRepository.findAll();
+        // Phase 431: the performing master's e-mail is its own MASTER_BOOKING_RESCHEDULED row when the
+        // master is not the actor — filter to the client/guest row this assertion is about.
+        List<NotificationOutboxEntry> rows = outboxRepository.findAll().stream()
+                .filter(row -> row.getEventType() == com.beautica.notification.entity.OutboxEventType.BOOKING_RESCHEDULED)
+                .toList();
         assertThat(rows)
                 .as("a provider-initiated reschedule of a guest booking must still enqueue a BOOKING_RESCHEDULED row "
                         + "(the null-client guard lives in the notification drain path, not the outbox enqueue)")

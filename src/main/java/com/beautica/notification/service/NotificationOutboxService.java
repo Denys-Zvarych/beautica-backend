@@ -12,6 +12,8 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.Instant;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
@@ -41,6 +43,11 @@ import java.util.UUID;
 @Service
 @RequiredArgsConstructor
 public class NotificationOutboxService {
+
+    /** Phase 431 — payload key of the acting user's id (performing-master rows). */
+    public static final String ACTOR_USER_ID = "actorUserId";
+    /** Phase 431 — payload key of a provider reschedule's NEW start, epoch seconds. */
+    public static final String STARTS_AT = "startsAt";
 
     private static final int MAX_EMAIL_LENGTH = 254;
     private static final int MAX_SALON_NAME_LENGTH = 255;
@@ -131,6 +138,60 @@ public class NotificationOutboxService {
         Objects.requireNonNull(bookingId, "bookingId must not be null");
         String payload = writeJson(Map.of("initiatedBy", initiatedByProvider ? "PROVIDER" : "CLIENT"));
         save(OutboxEventType.BOOKING_RESCHEDULED, bookingId, payload);
+    }
+
+    /**
+     * Phase 431 — {@link #enqueueBookingRescheduled(UUID, boolean)} plus the NEW start in epoch seconds
+     * ({@code {"initiatedBy":"PROVIDER","startsAt":"<epoch>"}}). The drain sends the guest reschedule
+     * SMS only while the booking is still {@code CONFIRMED} AND still starts at that instant, so a burst
+     * of moves collapses to one SMS (for the last move) and a booking cancelled before the drain gets
+     * none. The {@code initiatedBy} field is written exactly as before. A row without {@code startsAt}
+     * (written before phase 431) is sent only while the booking is {@code CONFIRMED}.
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void enqueueBookingRescheduled(UUID bookingId, boolean initiatedByProvider, Instant newStartsAt) {
+        Objects.requireNonNull(bookingId, "bookingId must not be null");
+        Objects.requireNonNull(newStartsAt, "newStartsAt must not be null");
+        Map<String, String> fields = new LinkedHashMap<>();
+        fields.put("initiatedBy", initiatedByProvider ? "PROVIDER" : "CLIENT");
+        fields.put(STARTS_AT, Long.toString(newStartsAt.getEpochSecond()));
+        save(OutboxEventType.BOOKING_RESCHEDULED, bookingId, writeJson(fields));
+    }
+
+    /**
+     * Phase 431 — enqueues the PERFORMING master's "the salon moved your booking" e-mail as its OWN
+     * row ({@link OutboxEventType#MASTER_BOOKING_RESCHEDULED}), beside the client/guest row of a
+     * provider reschedule. Nothing is enqueued when the master has no account (detached) or is the
+     * actor — no self-notification. See {@link #enqueueMasterBookingDeclined} for why it is its own row.
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void enqueueMasterBookingRescheduled(UUID bookingId, UUID masterUserId, UUID actorUserId) {
+        enqueueMasterRow(OutboxEventType.MASTER_BOOKING_RESCHEDULED, bookingId, masterUserId, actorUserId);
+    }
+
+    /**
+     * Phase 431 — enqueues the PERFORMING master's "the salon cancelled your booking / visit" e-mail as
+     * its OWN row ({@link OutboxEventType#MASTER_BOOKING_DECLINED}), beside the client/guest
+     * {@code STATUS_CHANGED} row of a provider decline (the visit's first item for a whole-visit
+     * decline — one e-mail per visit).
+     *
+     * <p>Separate rows, same transaction: each side has its own retry state, so a failing master mail
+     * can neither block nor DEAD the client/guest notification, and an SMS back-pressure re-queue of
+     * the guest row never repeats the master mail. Skipped when the master has no account or is the
+     * actor. The payload is {@code {"actorUserId":"<uuid>"}} — a user id only, no name, phone or note.
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void enqueueMasterBookingDeclined(UUID bookingId, UUID masterUserId, UUID actorUserId) {
+        enqueueMasterRow(OutboxEventType.MASTER_BOOKING_DECLINED, bookingId, masterUserId, actorUserId);
+    }
+
+    private void enqueueMasterRow(OutboxEventType type, UUID bookingId, UUID masterUserId, UUID actorUserId) {
+        Objects.requireNonNull(bookingId, "bookingId must not be null");
+        Objects.requireNonNull(actorUserId, "actorUserId must not be null");
+        if (masterUserId == null || masterUserId.equals(actorUserId)) {
+            return;
+        }
+        save(type, bookingId, writeJson(Map.of(ACTOR_USER_ID, actorUserId.toString())));
     }
 
     /**

@@ -89,6 +89,10 @@ public abstract class AbstractIntegrationTest {
         // Phase 29.6 (V132): booking_closure_reminders.booking_id FK -> bookings(id) ON DELETE
         // CASCADE, but §O-7 forbids relying on CASCADE here — delete explicitly, before bookings.
         jdbcTemplate.execute("DELETE FROM booking_closure_reminders");
+        // Phase 431 (V223): guest_reschedule_sms_sends.booking_id FK -> bookings(id) ON DELETE CASCADE;
+        // §O-7 — deleted explicitly, before bookings.
+        jdbcTemplate.execute("DELETE FROM guest_reschedule_sms_sends");
+        jdbcTemplate.execute("DELETE FROM guest_provider_reschedules");
         jdbcTemplate.execute("DELETE FROM bookings");
         // BE-1 (V124/V125): bookings.appointment_id FK → appointments(id), so bookings above must
         // be deleted FIRST; appointments in turn FK users(id)/salons(id), so it precedes both.

@@ -61,7 +61,7 @@ class NotificationOutboxEmailFailureTest {
     @BeforeEach
     void setUp() {
         EmailNotificationService email = new EmailNotificationService(mailSender, templateEngine, "noreply@beautica.app");
-        NotificationService notification = new NotificationService(email, null, null, "https://beautica.app");
+        NotificationService notification = new NotificationService(email, null, null, null, null, "https://beautica.app");
         worker = new NotificationOutboxDrainWorker(
                 outboxRepository, notification, bookingRepository, visitResolver, MAPPER, cipher, inAppPushDispatcher,
                 new io.micrometer.core.instrument.simple.SimpleMeterRegistry());
