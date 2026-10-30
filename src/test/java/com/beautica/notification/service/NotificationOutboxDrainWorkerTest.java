@@ -23,6 +23,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import java.time.Instant;
+import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -1004,25 +1005,24 @@ class NotificationOutboxDrainWorkerTest {
     // ── Test D: purgeStaleOutboxRows deletes SENT and DEAD, not PENDING ─────────
 
     @Test
-    @DisplayName("deleteByStatusInAndUpdatedAtBefore is called with SENT and DEAD statuses and a 30-day cutoff")
+    @DisplayName("purge batch is called with SENT and DEAD statuses, a 30-day cutoff and the batch size")
     void should_callDeleteWithCorrectStatusesAndCutoff_when_purgeStaleOutboxRowsCalled() {
         // Arrange
-        ArgumentCaptor<List<OutboxStatus>> statusCaptor =
-                ArgumentCaptor.forClass((Class) List.class);
+        ArgumentCaptor<Collection<String>> statusCaptor =
+                ArgumentCaptor.forClass((Class) Collection.class);
         ArgumentCaptor<Instant> cutoffCaptor = ArgumentCaptor.forClass(Instant.class);
 
         // Act
         worker.purgeStaleOutboxRows();
 
         // Assert — statuses and cutoff
-        verify(outboxRepository).deleteByStatusInAndUpdatedAtBefore(
-                statusCaptor.capture(), cutoffCaptor.capture());
+        verify(outboxRepository).deleteTerminalBatchBefore(
+                statusCaptor.capture(), cutoffCaptor.capture(),
+                org.mockito.ArgumentMatchers.eq(NotificationOutboxDrainWorker.PURGE_BATCH_SIZE));
 
         assertThat(statusCaptor.getValue())
-                .as("purge status list must include SENT")
-                .contains(OutboxStatus.SENT)
-                .as("purge status list must include DEAD")
-                .contains(OutboxStatus.DEAD);
+                .as("purge status list must be exactly SENT and DEAD")
+                .containsExactlyInAnyOrder(OutboxStatus.SENT.name(), OutboxStatus.DEAD.name());
 
         Instant expectedCutoff = Instant.now().minus(java.time.Duration.ofDays(30));
         assertThat(cutoffCaptor.getValue())
@@ -1031,22 +1031,58 @@ class NotificationOutboxDrainWorkerTest {
     }
 
     @Test
-    @DisplayName("deleteByStatusInAndUpdatedAtBefore is never called with PENDING in the status list")
+    @DisplayName("purge batch is never called with PENDING in the status list")
     void should_notIncludePendingInPurge_when_purgeStaleOutboxRowsCalled() {
         // Arrange
-        ArgumentCaptor<List<OutboxStatus>> statusCaptor =
-                ArgumentCaptor.forClass((Class) List.class);
+        ArgumentCaptor<Collection<String>> statusCaptor =
+                ArgumentCaptor.forClass((Class) Collection.class);
 
         // Act
         worker.purgeStaleOutboxRows();
 
         // Assert — PENDING must never appear in the delete predicate
-        verify(outboxRepository).deleteByStatusInAndUpdatedAtBefore(
-                statusCaptor.capture(), any(Instant.class));
+        verify(outboxRepository).deleteTerminalBatchBefore(
+                statusCaptor.capture(), any(Instant.class), org.mockito.ArgumentMatchers.anyInt());
 
         assertThat(statusCaptor.getValue())
                 .as("PENDING rows must never be purged by the TTL job")
-                .doesNotContain(OutboxStatus.PENDING);
+                .doesNotContain(OutboxStatus.PENDING.name());
+    }
+
+    @Test
+    @DisplayName("purge loops while a batch is full, stops on the first short batch, all with the same cutoff")
+    void should_loopUntilShortBatch_when_purgeBacklogSpansSeveralBatches() {
+        // Arrange — two full batches, then a short one
+        int full = NotificationOutboxDrainWorker.PURGE_BATCH_SIZE;
+        when(outboxRepository.deleteTerminalBatchBefore(
+                org.mockito.ArgumentMatchers.anyCollection(), any(Instant.class), org.mockito.ArgumentMatchers.anyInt()))
+                .thenReturn(full, full, 7);
+        ArgumentCaptor<Instant> cutoffCaptor = ArgumentCaptor.forClass(Instant.class);
+
+        // Act
+        worker.purgeStaleOutboxRows();
+
+        // Assert
+        verify(outboxRepository, times(3)).deleteTerminalBatchBefore(
+                org.mockito.ArgumentMatchers.anyCollection(), cutoffCaptor.capture(),
+                org.mockito.ArgumentMatchers.anyInt());
+        assertThat(cutoffCaptor.getAllValues()).as("one cutoff for the whole run").containsOnly(cutoffCaptor.getValue());
+    }
+
+    @Test
+    @DisplayName("purge stops at the per-run batch ceiling even when every batch is full")
+    void should_stopAtMaxBatches_when_everyBatchIsFull() {
+        // Arrange
+        when(outboxRepository.deleteTerminalBatchBefore(
+                org.mockito.ArgumentMatchers.anyCollection(), any(Instant.class), org.mockito.ArgumentMatchers.anyInt()))
+                .thenReturn(NotificationOutboxDrainWorker.PURGE_BATCH_SIZE);
+
+        // Act
+        worker.purgeStaleOutboxRows();
+
+        // Assert
+        verify(outboxRepository, times(NotificationOutboxDrainWorker.PURGE_MAX_BATCHES)).deleteTerminalBatchBefore(
+                org.mockito.ArgumentMatchers.anyCollection(), any(Instant.class), org.mockito.ArgumentMatchers.anyInt());
     }
 
     // ── Test C: malformed INVITE JSON payload → dead-letter ───────────────────

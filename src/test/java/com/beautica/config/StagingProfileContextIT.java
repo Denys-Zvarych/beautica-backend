@@ -4,6 +4,7 @@ import com.beautica.notification.sms.CapturingOtpSmsSender;
 import com.beautica.notification.sms.OtpSmsSender;
 import com.beautica.notification.sms.SmsService;
 import com.beautica.notification.sms.CapturingSmsService;
+import com.zaxxer.hikari.HikariDataSource;
 import jakarta.mail.Message;
 import jakarta.mail.Session;
 import jakarta.mail.internet.MimeMessage;
@@ -21,6 +22,7 @@ import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.mail.javamail.JavaMailSender;
 
+import javax.sql.DataSource;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -128,5 +130,50 @@ class StagingProfileContextIT extends AbstractStagingProfileIT {
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
         assertThat(turbosmsStub().getAllServeEvents()).isEmpty();
+    }
+
+    @Autowired
+    private DataSource appDataSource;
+
+    @Test
+    @DisplayName("hotfix app-datasource-pool — app connections come from the hikari.* pool (max 10, statement_timeout 5s, no lock_timeout), not flyway-pool")
+    void should_runAppOnHikariPropertiesPool_when_prodAndStagingProfilesActive() throws Exception {
+        HikariDataSource pool = appDataSource.unwrap(HikariDataSource.class);
+
+        String lockTimeout = jdbcTemplate.queryForObject("SHOW lock_timeout", String.class);
+        String statementTimeout = jdbcTemplate.queryForObject("SHOW statement_timeout", String.class);
+
+        assertThat(pool.getPoolName()).as("app must not run on Flyway's pool").isNotEqualTo("flyway-pool");
+        assertThat(pool.getMaximumPoolSize()).as("application.yml hikari.maximum-pool-size").isEqualTo(10);
+        assertThat(lockTimeout).as("Flyway's SET lock_timeout must not reach app sessions").isEqualTo("0");
+        assertThat(statementTimeout).as("application.yml hikari.connection-init-sql").isEqualTo("5s");
+    }
+
+    @Autowired
+    private org.springframework.boot.actuate.health.HealthContributorRegistry healthContributorRegistry;
+
+    @Autowired
+    private org.springframework.context.ApplicationContext applicationContext;
+
+    @Test
+    @DisplayName("hotfix app-datasource-pool — the 'db' health indicator probes the app dataSource, never flyway-pool")
+    void should_probeAppDataSource_when_dbHealthIndicatorRuns() throws Exception {
+        var contributor = healthContributorRegistry.getContributor("db");
+
+        assertThat(contributor)
+                .as("one app DataSource => a single DataSourceHealthIndicator; a composite would mean flyway-pool "
+                        + "became an autowire candidate again, actual=%s", contributor)
+                .isInstanceOf(org.springframework.boot.actuate.jdbc.DataSourceHealthIndicator.class);
+        var indicator = (org.springframework.boot.actuate.jdbc.DataSourceHealthIndicator) contributor;
+        DataSource probed = (DataSource) org.springframework.test.util.ReflectionTestUtils.getField(indicator, "dataSource");
+
+        assertThat(probed)
+                .as("readiness must probe the pool that serves requests (bean 'dataSource')")
+                .isSameAs(applicationContext.getBean("dataSource"))
+                .isNotSameAs(applicationContext.getBean("flywayDataSource"));
+        assertThat(probed.unwrap(HikariDataSource.class).getPoolName()).isNotEqualTo("flyway-pool");
+        assertThat(indicator.health().getStatus())
+                .as("the probe must actually succeed against the app pool")
+                .isEqualTo(org.springframework.boot.actuate.health.Status.UP);
     }
 }

@@ -180,7 +180,7 @@ public interface NotificationOutboxRepository extends JpaRepository<Notification
      * dispatch outcome — e.g. mid-rollout on Railway, or an OOM during SMTP dispatch.
      *
      * <p>A single bounded {@code UPDATE}, no per-row materialisation — mirrors
-     * {@code deleteByStatusInAndUpdatedAtBefore}. Counts as a delivery attempt: {@code attempts}
+     * {@code deleteTerminalBatchBefore}. Counts as a delivery attempt: {@code attempts}
      * is incremented exactly as a failed dispatch would, and if that reaches {@code maxAttempts}
      * the row goes straight to {@code DEAD} instead of back to {@code PENDING} — otherwise a
      * "poison" entry that crashes the worker every time it is dispatched would loop
@@ -221,21 +221,43 @@ public interface NotificationOutboxRepository extends JpaRepository<Notification
     long countByStatus(OutboxStatus status);
 
     /**
-     * Deletes terminal rows (SENT or DEAD) whose {@code updated_at} is before the
-     * given cutoff. Called by the daily TTL purge job in
-     * {@link com.beautica.notification.service.NotificationOutboxDrainWorker#purgeStaleOutboxRows()}.
+     * Deletes ONE bounded batch of terminal rows (status in {@code statuses}, i.e. SENT/DEAD) whose
+     * {@code updated_at} is before {@code cutoff}, in its own {@code REQUIRES_NEW} transaction. Called in a
+     * loop by the daily TTL purge job
+     * {@link com.beautica.notification.service.NotificationOutboxDrainWorker#purgeStaleOutboxRows()} until a
+     * batch deletes fewer than {@code limit} rows.
      *
-     * <p>The partial index {@code idx_outbox_terminal_updated} (V59) covers
-     * {@code (updated_at) WHERE status IN ('SENT','DEAD')} — this delete uses that
-     * index and avoids a sequential scan on a large table.
+     * <p><b>A real set-based DELETE.</b> The derived {@code deleteByStatusInAndUpdatedAtBefore} this replaces
+     * was not one: Spring Data derived deletes SELECT the matching entities and {@code em.remove()} them one
+     * by one, all inside a single transaction. This statement deletes in the database, at most {@code limit}
+     * rows per short transaction, so a large backlog never becomes one long row-lock-holding transaction.
      *
-     * <p>Spring Data derives this as a {@code DELETE FROM notification_outbox WHERE
-     * status IN (?) AND updated_at < ?} — no custom {@code @Query} needed.
+     * <p>Predicate unchanged: {@code status IN (:statuses) AND updated_at < :cutoff}, served by the partial
+     * index {@code idx_outbox_terminal_updated} (V59, {@code (updated_at) WHERE status IN ('SENT','DEAD')}).
+     * The {@code MATERIALIZED} CTE evaluates {@code LIMIT}/{@code FOR UPDATE SKIP LOCKED} exactly once — the
+     * shape and rationale of {@code InAppNotificationRepository#deleteCreatedBefore} (an {@code IN}-sublink can
+     * delete more than {@code limit} rows under a nested-loop re-scan). {@code SKIP LOCKED} never waits.
      *
-     * <p>Fix MEDIUM-8 PERF.
+     * @param statuses {@link OutboxStatus} names to purge (the caller passes SENT and DEAD)
+     * @return the number of rows deleted (never more than {@code limit})
      */
+    @Modifying
     @Transactional(propagation = Propagation.REQUIRES_NEW)
-    void deleteByStatusInAndUpdatedAtBefore(List<OutboxStatus> statuses, Instant cutoff);
+    @Query(value = """
+            WITH doomed AS MATERIALIZED (
+                SELECT id FROM notification_outbox
+                 WHERE status IN (:statuses)
+                   AND updated_at < :cutoff
+                 ORDER BY updated_at, id
+                 LIMIT :limit
+                 FOR UPDATE SKIP LOCKED
+            )
+            DELETE FROM notification_outbox o USING doomed WHERE o.id = doomed.id
+            """, nativeQuery = true)
+    int deleteTerminalBatchBefore(
+            @Param("statuses") Collection<String> statuses,
+            @Param("cutoff") Instant cutoff,
+            @Param("limit") @Min(1) @Max(5000) int limit);
 
     /**
      * Deletes every outbox row addressed to one of the given {@code aggregateId}s (i.e.
@@ -271,7 +293,7 @@ public interface NotificationOutboxRepository extends JpaRepository<Notification
      * event type(s) being superseded over a blanket per-aggregate delete.
      *
      * <p>Deliberately participates in the CALLER's transaction (unlike
-     * {@link #deleteByStatusInAndUpdatedAtBefore}, which is an isolated housekeeping sweep) — this
+     * {@link #deleteTerminalBatchBefore}, which is an isolated housekeeping sweep) — this
      * delete must commit or roll back atomically with the booking delete it is paired with, so no
      * explicit {@code @Transactional} propagation is declared here.
      *

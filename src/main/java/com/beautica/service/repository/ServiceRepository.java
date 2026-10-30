@@ -1,5 +1,6 @@
 package com.beautica.service.repository;
 
+import com.beautica.common.repository.TransactionLockTimeout;
 import com.beautica.service.entity.OwnerType;
 import com.beautica.service.entity.ServiceDefinition;
 import org.springframework.data.domain.Pageable;
@@ -15,7 +16,7 @@ import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
-public interface ServiceRepository extends JpaRepository<ServiceDefinition, UUID> {
+public interface ServiceRepository extends JpaRepository<ServiceDefinition, UUID>, TransactionLockTimeout {
 
     /**
      * @deprecated Unbounded result — add a Pageable overload before using.
@@ -125,8 +126,14 @@ public interface ServiceRepository extends JpaRepository<ServiceDefinition, UUID
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("SELECT sd FROM ServiceDefinition sd WHERE sd.ownerType = :ownerType AND sd.ownerId = :ownerId "
             + "ORDER BY sd.id")
-    List<ServiceDefinition> lockAllByOwnerOrderById(
+    List<ServiceDefinition> lockAllByOwnerOrderByIdNoLockTimeout(
             @Param("ownerType") OwnerType ownerType, @Param("ownerId") UUID ownerId);
+
+    /** {@link #lockAllByOwnerOrderByIdNoLockTimeout} bounded by the transaction-local 3s {@code lock_timeout} ({@link TransactionLockTimeout}). */
+    default List<ServiceDefinition> lockAllByOwnerOrderById(OwnerType ownerType, UUID ownerId) {
+        applyTransactionLockTimeout();
+        return lockAllByOwnerOrderByIdNoLockTimeout(ownerType, ownerId);
+    }
 
     /**
      * Phase 342 B/G — the cheap service-layer gate for photo upload/delete: the id of the definition
@@ -149,7 +156,13 @@ public interface ServiceRepository extends JpaRepository<ServiceDefinition, UUID
      */
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("SELECT sd FROM ServiceDefinition sd WHERE sd.id = :id")
-    Optional<ServiceDefinition> findByIdForUpdate(@Param("id") UUID id);
+    Optional<ServiceDefinition> findByIdForUpdateNoLockTimeout(@Param("id") UUID id);
+
+    /** {@link #findByIdForUpdateNoLockTimeout} bounded by the transaction-local 3s {@code lock_timeout} ({@link TransactionLockTimeout}). */
+    default Optional<ServiceDefinition> findByIdForUpdate(UUID id) {
+        applyTransactionLockTimeout();
+        return findByIdForUpdateNoLockTimeout(id);
+    }
 
     /** Nulls both photo pointers of every definition owned by {@code (ownerType, ownerId)}. */
     @Modifying

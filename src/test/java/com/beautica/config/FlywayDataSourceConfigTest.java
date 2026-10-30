@@ -5,8 +5,15 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.autoconfigure.AutoConfigurations;
 import org.springframework.boot.autoconfigure.context.ConfigurationPropertiesAutoConfiguration;
+import org.flywaydb.core.Flyway;
+import org.springframework.boot.autoconfigure.flyway.FlywayAutoConfiguration;
 import org.springframework.boot.autoconfigure.flyway.FlywayDataSource;
+import org.springframework.boot.autoconfigure.flyway.FlywayMigrationStrategy;
+import org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration;
+import org.springframework.boot.autoconfigure.jdbc.JdbcTemplateAutoConfiguration;
+import org.springframework.boot.test.context.ConfigDataApplicationContextInitializer;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
+import org.springframework.jdbc.core.JdbcTemplate;
 
 import javax.sql.DataSource;
 
@@ -149,5 +156,158 @@ class FlywayDataSourceConfigTest {
                 .run(context -> assertThat(context)
                         .as("@Profile(\"!test\") MUST exclude the bean under 'test' — the Testcontainers carve-out")
                         .doesNotHaveBean("flywayDataSource"));
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // App-pool wiring (hotfix fix/app-datasource-pool). With DataSourceAutoConfiguration present, the
+    // Flyway pool must NOT satisfy @ConditionalOnMissingBean(DataSource): Boot has to build its own
+    // pool from spring.datasource.hikari.*, and only Flyway may see flyway-pool.
+    // ---------------------------------------------------------------------------------------------
+
+    /** Configured app pool size — application.yml spring.datasource.hikari.maximum-pool-size. */
+    private static final int APP_POOL_MAX = 10;
+    private static final String APP_INIT_SQL = "SET statement_timeout = '5s'";
+    private static final long APP_LEAK_DETECTION_MS = 35_000L;
+    private static final long APP_CONNECTION_TIMEOUT_MS = 10_000L;
+    private static final String FLYWAY_POOL_NAME = "flyway-pool";
+
+    /**
+     * Full DataSource + JdbcTemplate + Flyway auto-configuration under profile {@code prod}, reading the
+     * REAL {@code application.yml} / {@code application-prod.yml} (only the URL/credentials are pointed
+     * at the mock driver). A no-op {@link FlywayMigrationStrategy} keeps {@code migrate()} from running.
+     */
+    private ApplicationContextRunner prodProfileWithAutoConfiguredAppPool() {
+        return new ApplicationContextRunner()
+                .withInitializer(new ConfigDataApplicationContextInitializer())
+                .withConfiguration(AutoConfigurations.of(
+                        ConfigurationPropertiesAutoConfiguration.class,
+                        DataSourceAutoConfiguration.class,
+                        JdbcTemplateAutoConfiguration.class,
+                        FlywayAutoConfiguration.class))
+                .withUserConfiguration(FlywayDataSourceConfig.class)
+                .withBean(FlywayMigrationStrategy.class, () -> flyway -> { })
+                .withPropertyValues("spring.profiles.active=prod")
+                .withPropertyValues(MOCK_DATASOURCE_PROPS);
+    }
+
+    @Test
+    @DisplayName("prod profile — two DataSources: Boot's app pool plus the dedicated flyway-pool")
+    void should_registerAppAndFlywayDataSources_when_prodProfileWithAutoConfiguration() {
+        prodProfileWithAutoConfiguredAppPool().run(context -> {
+            assertThat(context).hasNotFailed();
+
+            assertThat(context.getBeanNamesForType(DataSource.class))
+                    .as("Boot's dataSource must exist alongside flywayDataSource, not back off because of it")
+                    .containsExactlyInAnyOrder("dataSource", "flywayDataSource");
+        });
+    }
+
+    @Test
+    @DisplayName("prod profile — the injected app DataSource is Boot's Hikari pool sized from spring.datasource.hikari.*")
+    void should_injectHikariAppPoolFromHikariProperties_when_prodProfileWithAutoConfiguration() {
+        prodProfileWithAutoConfiguredAppPool().run(context -> {
+            HikariDataSource app = context.getBean(DataSource.class).unwrap(HikariDataSource.class);
+
+            assertThat(app.getPoolName()).as("app code must never run on Flyway's pool").isNotEqualTo(FLYWAY_POOL_NAME);
+            assertThat(app.getMaximumPoolSize()).isEqualTo(APP_POOL_MAX);
+            assertThat(app.getLeakDetectionThreshold()).isEqualTo(APP_LEAK_DETECTION_MS);
+            assertThat(app.getConnectionTimeout()).isEqualTo(APP_CONNECTION_TIMEOUT_MS);
+            assertThat(app.getConnectionInitSql())
+                    .as("app connections run the statement_timeout backstop, never Flyway's lock_timeout")
+                    .isEqualTo(APP_INIT_SQL)
+                    .doesNotContain("lock_timeout");
+        });
+    }
+
+    @Test
+    @DisplayName("prod profile — JdbcTemplate is wired to the app pool, not flyway-pool")
+    void should_wireJdbcTemplateToAppPool_when_prodProfileWithAutoConfiguration() {
+        prodProfileWithAutoConfiguredAppPool().run(context -> {
+            DataSource jdbcTemplateDs = context.getBean(JdbcTemplate.class).getDataSource();
+
+            assertThat(jdbcTemplateDs).isSameAs(context.getBean("dataSource"));
+            assertThat(jdbcTemplateDs.unwrap(HikariDataSource.class).getPoolName()).isNotEqualTo(FLYWAY_POOL_NAME);
+        });
+    }
+
+    @Test
+    @DisplayName("prod profile — Flyway is still routed to flyway-pool via the @FlywayDataSource qualifier")
+    void should_wireFlywayToFlywayPool_when_prodProfileWithAutoConfiguration() {
+        prodProfileWithAutoConfiguredAppPool().run(context -> {
+            DataSource flywayDs = context.getBean(Flyway.class).getConfiguration().getDataSource();
+
+            assertThat(flywayDs).isSameAs(context.getBean("flywayDataSource"));
+            assertThat(flywayDs.unwrap(HikariDataSource.class).getPoolName()).isEqualTo(FLYWAY_POOL_NAME);
+        });
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Transport parity (security LOW, hotfix fix/app-datasource-pool). Railway hands the app a
+    // postgresql:// DATABASE_URL with no sslmode; DatabaseUrlNormalizerPostProcessor rewrites it to a
+    // jdbc: URL with sslmode=require. Now that the app pool is Boot's own (no longer flyway-pool), BOTH
+    // pools must read that normalised URL — neither may fall back to the raw value or to pgjdbc's
+    // plaintext-capable default (prefer). Runs the real post-processor; no database is contacted.
+    // ---------------------------------------------------------------------------------------------
+
+    private static final String RAILWAY_DATABASE_URL = "postgresql://u:p@x.railway.internal/db";
+
+    /**
+     * Same auto-configuration as {@link #prodProfileWithAutoConfiguredAppPool()}, but the datasource comes
+     * from {@code DATABASE_URL} via the real {@link DatabaseUrlNormalizerPostProcessor} (applied after
+     * config data, as Boot orders it — the class is not {@code Ordered}). Only the driver is a stub.
+     */
+    private ApplicationContextRunner prodProfileFromRailwayDatabaseUrl() {
+        return new ApplicationContextRunner()
+                .withInitializer(new ConfigDataApplicationContextInitializer())
+                .withInitializer(ctx -> new DatabaseUrlNormalizerPostProcessor()
+                        .postProcessEnvironment(ctx.getEnvironment(), new org.springframework.boot.SpringApplication()))
+                .withConfiguration(AutoConfigurations.of(
+                        ConfigurationPropertiesAutoConfiguration.class,
+                        DataSourceAutoConfiguration.class,
+                        JdbcTemplateAutoConfiguration.class,
+                        FlywayAutoConfiguration.class))
+                .withUserConfiguration(FlywayDataSourceConfig.class)
+                .withBean(FlywayMigrationStrategy.class, () -> flyway -> { })
+                .withPropertyValues(
+                        "spring.profiles.active=prod",
+                        "DATABASE_URL=" + RAILWAY_DATABASE_URL,
+                        "spring.datasource.driver-class-name=" + RailwayInternalMockJdbcDriver.class.getName());
+    }
+
+    @Test
+    @DisplayName("prod + Railway DATABASE_URL — BOTH the app pool and flyway-pool connect with sslmode=require")
+    void should_requireSslOnBothPools_when_prodRailwayDatabaseUrlNormalized() {
+        prodProfileFromRailwayDatabaseUrl().run(context -> {
+            assertThat(context).hasNotFailed();
+            HikariDataSource app = context.getBean("dataSource", DataSource.class).unwrap(HikariDataSource.class);
+            HikariDataSource flyway = context.getBean("flywayDataSource", HikariDataSource.class);
+
+            assertThat(app).as("the app pool must be its own pool, not flyway-pool").isNotSameAs(flyway);
+            assertThat(app.getJdbcUrl())
+                    .as("app pool must use the normalised private-network URL with TLS forced, actual=%s",
+                            app.getJdbcUrl())
+                    .startsWith(RailwayInternalMockJdbcDriver.URL_PREFIX + "db?")
+                    .contains("sslmode=require");
+            assertThat(flyway.getJdbcUrl())
+                    .as("flyway-pool must use the same normalised URL with TLS forced, actual=%s", flyway.getJdbcUrl())
+                    .startsWith(RailwayInternalMockJdbcDriver.URL_PREFIX + "db?")
+                    .contains("sslmode=require");
+        });
+    }
+
+    @Test
+    @DisplayName("prod + Railway DATABASE_URL — both pools authenticate as the DATABASE_URL user-info")
+    void should_useDatabaseUrlCredentialsOnBothPools_when_prodRailwayDatabaseUrlNormalized() {
+        prodProfileFromRailwayDatabaseUrl().run(context -> {
+            HikariDataSource app = context.getBean("dataSource", DataSource.class).unwrap(HikariDataSource.class);
+            HikariDataSource flyway = context.getBean("flywayDataSource", HikariDataSource.class);
+
+            assertThat(app.getUsername()).as("app pool username from DATABASE_URL user-info").isEqualTo("u");
+            assertThat(flyway.getUsername()).as("flyway-pool username from DATABASE_URL user-info").isEqualTo("u");
+            assertThat(app.getPassword())
+                    .as("both pools must carry the DATABASE_URL password (values not echoed)")
+                    .isEqualTo(flyway.getPassword())
+                    .isEqualTo("p");
+        });
     }
 }

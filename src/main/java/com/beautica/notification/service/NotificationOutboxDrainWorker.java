@@ -501,6 +501,11 @@ public class NotificationOutboxDrainWorker {
     }
 
     private static final Duration OUTBOX_RETENTION = Duration.ofDays(30);
+    /** Rows per purge batch; each batch is its own short transaction. */
+    static final int PURGE_BATCH_SIZE = 1000;
+    /** Per-run ceiling (100k rows); any remainder is picked up by the next daily run. */
+    static final int PURGE_MAX_BATCHES = 100;
+    private static final List<String> PURGE_STATUSES = List.of(OutboxStatus.SENT.name(), OutboxStatus.DEAD.name());
 
     /**
      * Purges terminal outbox rows (SENT or DEAD) older than 30 days.
@@ -510,17 +515,26 @@ public class NotificationOutboxDrainWorker {
      * {@code idx_outbox_terminal_updated} (V59) makes this DELETE efficient even on
      * large tables — it pre-filters the {@code (status, updated_at)} columns.
      *
+     * <p>Bulk DELETE in bounded batches ({@link NotificationOutboxRepository#deleteTerminalBatchBefore}),
+     * each in its own {@code REQUIRES_NEW} transaction, so this method runs NOT_SUPPORTED: an outer
+     * transaction would only pin a second connection idle for the whole loop. Stops when a batch deletes
+     * fewer than {@link #PURGE_BATCH_SIZE} rows or after {@link #PURGE_MAX_BATCHES}.
+     *
      * <p>Fix MEDIUM-8 PERF.
      */
     @Scheduled(cron = "0 0 3 * * *")
-    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    @Transactional(propagation = Propagation.NOT_SUPPORTED)
     public void purgeStaleOutboxRows() {
         Instant cutoff = Instant.now().minus(OUTBOX_RETENTION);
-        outboxRepository.deleteByStatusInAndUpdatedAtBefore(
-                List.of(OutboxStatus.SENT, OutboxStatus.DEAD),
-                cutoff
-        );
-        log.info("Outbox TTL purge complete (cutoff={})", cutoff);
+        int deleted;
+        int batches = 0;
+        long total = 0;
+        do {
+            deleted = outboxRepository.deleteTerminalBatchBefore(PURGE_STATUSES, cutoff, PURGE_BATCH_SIZE);
+            total += deleted;
+            batches++;
+        } while (deleted == PURGE_BATCH_SIZE && batches < PURGE_MAX_BATCHES);
+        log.info("Outbox TTL purge complete (cutoff={}, deleted={}, batches={})", cutoff, total, batches);
     }
 
     /**
