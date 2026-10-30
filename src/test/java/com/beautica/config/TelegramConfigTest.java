@@ -205,6 +205,29 @@ class TelegramConfigTest {
     }
 
     @Test
+    @DisplayName("link-token-ttl of exactly 24h binds (404 audit INFO upper bound is inclusive)")
+    void should_bindLinkTokenTtl_when_exactly24Hours() {
+        runner.withPropertyValues("app.telegram.link-token-ttl=24h").run(context ->
+                assertThat(context.getBean(TelegramProperties.class).linkTokenTtl()).isEqualTo(Duration.ofHours(24)));
+    }
+
+    @Test
+    @DisplayName("link-token-ttl over 24h → context fails")
+    void should_failContext_when_linkTokenTtlOver24Hours() {
+        runner.withPropertyValues("app.telegram.link-token-ttl=1441m").run(context -> {
+            assertThat(context).hasFailed();
+            assertThat(rootMessage(context.getStartupFailure()))
+                    .isEqualTo("app.telegram.link-token-ttl must not exceed PT24H");
+        });
+    }
+
+    @Test
+    @DisplayName("link-token-ttl zero → context fails")
+    void should_failContext_when_linkTokenTtlZero() {
+        runner.withPropertyValues("app.telegram.link-token-ttl=0s").run(context -> assertThat(context).hasFailed());
+    }
+
+    @Test
     @DisplayName("properties toString redacts token and secret")
     void should_redactSecrets_when_toString() {
         runner.withPropertyValues(VALID_LIVE).run(context ->

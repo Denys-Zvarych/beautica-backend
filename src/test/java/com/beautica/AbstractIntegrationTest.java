@@ -1,6 +1,7 @@
 package com.beautica;
 
 import com.beautica.config.TestAsyncConfig;
+import com.beautica.config.TestPoolSessionResetConfig;
 import com.beautica.notification.EmailService;
 import com.beautica.notification.service.EmailNotificationService;
 import com.beautica.support.LocalityTestLookup;
@@ -38,7 +39,7 @@ import java.util.UUID;
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @ActiveProfiles("test")
 @ExtendWith(SlowTestExtension.class)
-@Import(TestAsyncConfig.class)
+@Import({TestAsyncConfig.class, TestPoolSessionResetConfig.class})
 public abstract class AbstractIntegrationTest {
 
     @MockBean
@@ -93,6 +94,11 @@ public abstract class AbstractIntegrationTest {
         // §O-7 — deleted explicitly, before bookings.
         jdbcTemplate.execute("DELETE FROM guest_reschedule_sms_sends");
         jdbcTemplate.execute("DELETE FROM guest_provider_reschedules");
+        // Phase 405 (V224): telegram_link_tokens.booking_id FK -> bookings(id) ON DELETE CASCADE; §O-7 — deleted
+        // explicitly, before bookings. telegram_links has no FK either way (phone hash + chat id) and would otherwise
+        // leak links between tests.
+        jdbcTemplate.execute("DELETE FROM telegram_link_tokens");
+        jdbcTemplate.execute("DELETE FROM telegram_links");
         jdbcTemplate.execute("DELETE FROM bookings");
         // BE-1 (V124/V125): bookings.appointment_id FK → appointments(id), so bookings above must
         // be deleted FIRST; appointments in turn FK users(id)/salons(id), so it precedes both.

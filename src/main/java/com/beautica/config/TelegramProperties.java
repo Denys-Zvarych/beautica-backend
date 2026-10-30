@@ -29,7 +29,8 @@ import java.util.regex.Pattern;
  * @param botUsername   env {@code TELEGRAM_BOT_USERNAME}, without {@code @}
  * @param webhookSecret env {@code TELEGRAM_WEBHOOK_SECRET} ({@code openssl rand -hex 32})
  * @param apiBaseUrl    Bot API origin, default {@code https://api.telegram.org}
- * @param linkTokenTtl  lifetime of a chat-link token (used from phase 405), default 30 minutes (= phase 405 D6)
+ * @param linkTokenTtl  lifetime of a chat-link token (used from phase 405), default 30 minutes (= phase 405 D6),
+ *                      positive and at most {@link #MAX_LINK_TOKEN_TTL}
  */
 @ConfigurationProperties(prefix = "app.telegram")
 public record TelegramProperties(
@@ -41,6 +42,11 @@ public record TelegramProperties(
         @DefaultValue("https://api.telegram.org") String apiBaseUrl,
         @DefaultValue("30m") Duration linkTokenTtl) {
 
+    /**
+     * Upper bound on {@link #linkTokenTtl} (404 security audit INFO): a link token is a bearer capability for a
+     * guest's phone hash, and phase 409 purges rows only one day past expiry, so a longer TTL is a misconfiguration.
+     */
+    public static final Duration MAX_LINK_TOKEN_TTL = Duration.ofHours(24);
     private static final Pattern WEBHOOK_SECRET = Pattern.compile("^[A-Za-z0-9_-]{32,256}$");
     /** Bot API token shape; shared with {@code TelegramBotApiClient}, which splices the token into the URL path. */
     public static final Pattern BOT_TOKEN = Pattern.compile("^[0-9]+:[A-Za-z0-9_-]+$");
@@ -67,6 +73,9 @@ public record TelegramProperties(
             }
         }
         OutboundTimeouts.requirePositive("app.telegram.link-token-ttl", linkTokenTtl);
+        if (linkTokenTtl.compareTo(MAX_LINK_TOKEN_TTL) > 0) {
+            throw new IllegalStateException("app.telegram.link-token-ttl must not exceed " + MAX_LINK_TOKEN_TTL);
+        }
     }
 
     /** Redacted — the generated record {@code toString} would print the token and the webhook secret. */
