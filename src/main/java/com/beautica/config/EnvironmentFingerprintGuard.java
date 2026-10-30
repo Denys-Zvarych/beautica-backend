@@ -66,6 +66,8 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
 
     private static final Profiles PROD = Profiles.of("prod");
     private static final Profiles STAGING = Profiles.of("staging");
+    private static final Profiles TEST = Profiles.of("test");
+    static final String GUEST_PII_RETENTION_ENABLED = "app.guest-pii-retention.enabled";
 
     /** Placeholder an operator sets for {@code BREVO_SMTP_LOGIN}/{@code BREVO_SMTP_KEY} until Brevo exists (Phase 367 D9). */
     static final String BREVO_PENDING = "PENDING";
@@ -130,6 +132,7 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
             checkR2Bucket(env, environment, violations);
             checkLinkBaseUrls(env, environment, violations);
             checkInternalApiKey(env, violations);
+            checkRetentionJobs(env, environment, violations);
             if (environment == DeployEnvironment.PROD) {
                 checkProd(env, violations);
                 if (brevoApiTransport(env)) {
@@ -197,6 +200,24 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
         }
         if (enabled && !environment.token().equals(readOrNull(env, "sentry.environment"))) {
             violations.add("rule sentry-environment: sentry.environment must equal beautica.environment");
+        }
+    }
+
+    /**
+     * Phase 409 audit-fix cycle 1 — the timers behind privacy-policy retention promises cannot be switched off
+     * outside LOCAL: {@code app.guest-pii-retention.enabled=false} would stop guest anonymisation, the D1 link step and
+     * the D2 blocked-link purge; an active {@code test} profile would drop {@code TelegramLinkTokenPurgeJob}
+     * ({@code @Profile("!test")}, the 2-day code purge and the orphan backstop). Unset = enabled (matchIfMissing).
+     */
+    private static void checkRetentionJobs(Environment env, DeployEnvironment environment, List<String> violations) {
+        String retention = readOrNull(env, GUEST_PII_RETENTION_ENABLED);
+        if (!isBlank(retention) && !"true".equalsIgnoreCase(retention.strip())) {
+            violations.add("rule retention-jobs-enabled: " + GUEST_PII_RETENTION_ENABLED + " must be true in "
+                    + environment.token());
+        }
+        if (env.acceptsProfiles(TEST)) {
+            violations.add("rule retention-jobs-enabled: the test profile must not be active in " + environment.token()
+                    + " (it disables TelegramLinkTokenPurgeJob)");
         }
     }
 

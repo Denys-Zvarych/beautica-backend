@@ -3,6 +3,7 @@ package com.beautica.booking.retention;
 import com.beautica.auth.phoneotp.PhoneOtpService;
 import com.beautica.booking.entity.Appointment;
 import com.beautica.booking.entity.Booking;
+import com.beautica.booking.repository.AnonymisedGuestBooking;
 import com.beautica.booking.repository.AppointmentRepository;
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.booking.repository.GuestBookingSubject;
@@ -10,9 +11,12 @@ import com.beautica.booking.service.BookingCancellationService;
 import com.beautica.booking.service.GuestVisitCancellationService;
 import com.beautica.common.util.UkrainianPhoneNormalizer;
 import com.beautica.moderation.service.ClientBlockService;
+import com.beautica.notification.telegram.link.TelegramLinkRetentionService;
 import com.beautica.review.invite.service.GuestReviewRetentionService;
 import io.micrometer.core.instrument.MeterRegistry;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.PessimisticLockingFailureException;
+import org.springframework.dao.QueryTimeoutException;
 import org.springframework.lang.Nullable;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -31,6 +35,7 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.function.Function;
@@ -61,6 +66,16 @@ import java.util.stream.Collectors;
  * the two sweeps skip their visit invites too. The erase also expires the phone's {@code SENT} invites (audit-fix
  * cycle 1), so an already-delivered review link stops resolving. {@code sms_opt_outs} is never touched (402 D2).
  *
+ * <p><b>Telegram links (phase 409).</b> Each retention batch deletes, in its own transaction and as its last statement,
+ * the links of the phones it just anonymised that have no other non-anonymised booking left, under a per-phone
+ * retention lock taken before that check so two instances cannot both keep the link (D1). The erase deletes the
+ * phone's tokens and link last (D3). Both use the fused 3 s {@code lock_timeout}; it is set last so it bounds only
+ * the Telegram statements. D2 (BLOCKED purge) runs from {@code GuestPiiRetentionJob}; the token purge (D4) and the
+ * weekly orphan backstop from {@code TelegramLinkTokenPurgeJob}.
+ *
+ * <p>A claim batch aborted by a lock or statement timeout ends the claim loop (logged, counts only); the header
+ * sweeps still run and the remaining rows are picked up next run.
+ *
  * <p>Logs carry counts, the cutoff and the support ticket reference only — never a phone, a name or
  * a row id (§I).
  */
@@ -84,6 +99,7 @@ public class GuestPiiAnonymisationService {
     private final PhoneOtpService phoneOtpService;
     private final ClientBlockService clientBlockService;
     private final GuestReviewRetentionService guestReviewRetentionService;
+    private final TelegramLinkRetentionService telegramLinkRetentionService;
     private final GuestPiiRetentionProperties properties;
     private final MeterRegistry meterRegistry;
     private final Clock clock;
@@ -97,6 +113,7 @@ public class GuestPiiAnonymisationService {
             PhoneOtpService phoneOtpService,
             ClientBlockService clientBlockService,
             GuestReviewRetentionService guestReviewRetentionService,
+            TelegramLinkRetentionService telegramLinkRetentionService,
             GuestPiiRetentionProperties properties,
             MeterRegistry meterRegistry,
             Clock clock,
@@ -108,6 +125,7 @@ public class GuestPiiAnonymisationService {
         this.phoneOtpService = phoneOtpService;
         this.clientBlockService = clientBlockService;
         this.guestReviewRetentionService = guestReviewRetentionService;
+        this.telegramLinkRetentionService = telegramLinkRetentionService;
         this.properties = properties;
         this.meterRegistry = meterRegistry;
         this.clock = clock;
@@ -128,10 +146,19 @@ public class GuestPiiAnonymisationService {
         OffsetDateTime utcCutoff = cutoff.atOffset(ZoneOffset.UTC);
         int bookings = 0;
         int visits = 0;
+        int links = 0;
         for (int batch = 0; batch < maxBatches; batch++) {
-            int[] claimed = batchTx.execute(status -> claimBookingBatch(utcCutoff, batchSize));
+            int[] claimed;
+            try {
+                claimed = batchTx.execute(status -> claimBookingBatch(utcCutoff, batchSize));
+            } catch (PessimisticLockingFailureException | QueryTimeoutException e) {
+                log.warn("Guest PII retention: claim batch aborted ({}) after {} bookings; ending the claim loop",
+                        e.getClass().getSimpleName(), bookings);
+                break;
+            }
             bookings += claimed[0];
             visits += claimed[1];
+            links += claimed[2];
             if (claimed[0] < batchSize) {
                 break;
             }
@@ -142,8 +169,9 @@ public class GuestPiiAnonymisationService {
         visits += sweep(() -> skipVisitInvites(appointmentRepository.anonymiseLeftoverGuestAppointments(
                 utcCutoff, GuestPii.ANONYMISED_NAME, batchSize)), batchSize, maxBatches);
         record("job", bookings, visits);
-        log.info("Guest PII retention: anonymised {} bookings, {} visits in {} ms (cutoff {})",
-                bookings, visits, clock.millis() - startedAt, cutoff);
+        log.info("Guest PII retention: anonymised {} bookings, {} visits; deleted {} Telegram links in {} ms "
+                        + "(cutoff {})",
+                bookings, visits, links, clock.millis() - startedAt, cutoff);
         return GuestPiiAnonymisationResult.ofRetention(bookings, visits);
     }
 
@@ -161,17 +189,36 @@ public class GuestPiiAnonymisationService {
         return total;
     }
 
-    /** One booking batch + the headers it completes; {@code [bookings, headers]}. */
+    /** One booking batch + the headers it completes + the links it frees; {@code [bookings, headers, links]}. */
     private int[] claimBookingBatch(OffsetDateTime utcCutoff, int batchSize) {
-        List<UUID> bookingIds = bookingRepository.anonymiseDueGuestBookings(
+        List<AnonymisedGuestBooking> claimed = bookingRepository.anonymiseDueGuestBookingsWithPhones(
                 utcCutoff, GuestPii.ANONYMISED_NAME, batchSize);
-        if (bookingIds.isEmpty()) {
-            return new int[]{0, 0};
+        if (claimed.isEmpty()) {
+            return new int[]{0, 0, 0};
         }
+        List<UUID> bookingIds = claimed.stream().map(AnonymisedGuestBooking::getBookingId).toList();
         List<UUID> headerIds = appointmentRepository
                 .anonymiseGuestAppointmentsOfBookings(bookingIds, GuestPii.ANONYMISED_NAME);
         anonymiseGuestReviewData(bookingIds, headerIds);
-        return new int[]{bookingIds.size(), headerIds.size()};
+        return new int[]{bookingIds.size(), headerIds.size(), unlinkFreedPhones(claimed)};
+    }
+
+    /**
+     * Phase 409 D1 — last statements of the batch transaction: per linked phone, the retention lock, then the
+     * "still has a non-anonymised guest booking?" check (this batch's rows are already wiped, so they no longer
+     * count), then the link delete. Atomic with the batch: a rollback keeps the rows un-anonymised, so the next run
+     * re-collects the phone.
+     */
+    private int unlinkFreedPhones(List<AnonymisedGuestBooking> claimed) {
+        Set<String> phones = claimed.stream()
+                .map(AnonymisedGuestBooking::getGuestPhone)
+                .filter(Objects::nonNull)
+                .collect(Collectors.toCollection(LinkedHashSet::new));
+        if (phones.isEmpty()) {
+            return 0;
+        }
+        return telegramLinkRetentionService.unlinkPhonesWithoutOpenBookings(
+                phones, bookingRepository::findGuestPhonesWithOpenBookings);
     }
 
     /** Phase 402 D3 — a sweep's anonymised headers skip their visit invites; returns the ids unchanged. */
@@ -236,12 +283,16 @@ public class GuestPiiAnonymisationService {
         anonymiseGuestReviewData(anonymisedBookingIds, anonymisedVisitIds);
         // Phase 402 audit-fix (sec LOW) — the phone's already-sent review links die with the erase (SENT → EXPIRED).
         int invitesExpired = guestReviewRetentionService.expireSentInvitesOfPhone(phone, clock.instant());
+        // Phase 409 D3 — last: its fused 3 s lock_timeout is transaction-local, so it bounds only these deletes.
+        TelegramLinkRetentionService.Erasure telegram = telegramLinkRetentionService.eraseForPhone(phone);
 
         record("manual", bookingsAnonymised, visitsAnonymised);
         log.info("Guest PII erase (ticket {}): cancelled {} bookings, {} visits; anonymised {} bookings, "
-                        + "{} visits, {} blocks; expired {} review invites; deleted {} OTP rows in {} ms",
+                        + "{} visits, {} blocks; expired {} review invites; deleted {} OTP rows, {} Telegram links, "
+                        + "{} Telegram link tokens in {} ms",
                 ticketRef == null ? "none" : ticketRef, bookingsCancelled, visitsCancelled, bookingsAnonymised,
-                visitsAnonymised, blocksAnonymised, invitesExpired, otpRowsDeleted, clock.millis() - startedAt);
+                visitsAnonymised, blocksAnonymised, invitesExpired, otpRowsDeleted, telegram.links(),
+                telegram.tokens(), clock.millis() - startedAt);
         return new GuestPiiAnonymisationResult(
                 bookingsCancelled, visitsCancelled, bookingsAnonymised, visitsAnonymised, otpRowsDeleted);
     }

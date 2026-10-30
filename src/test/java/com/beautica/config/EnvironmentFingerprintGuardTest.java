@@ -100,6 +100,73 @@ class EnvironmentFingerprintGuardTest {
     }
 
     @Test
+    @DisplayName("phase 409: app.guest-pii-retention.enabled=false fails in staging and prod, passes in local")
+    void should_fail_when_retentionJobDisabledOutsideLocal() {
+        MockEnvironment staging = stagingEnv().withProperty("app.guest-pii-retention.enabled", "false");
+        MockEnvironment prod = prodEnv().withProperty("app.guest-pii-retention.enabled", "false");
+        MockEnvironment local = new MockEnvironment().withProperty("app.guest-pii-retention.enabled", "false");
+
+        assertThatThrownBy(() -> run(staging, DeployEnvironment.STAGING, SmsMode.CAPTURE))
+                .isInstanceOf(IllegalStateException.class).hasMessageContaining("retention-jobs-enabled");
+        assertThatThrownBy(() -> run(prod, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                .isInstanceOf(IllegalStateException.class).hasMessageContaining("retention-jobs-enabled");
+        assertThatCode(() -> run(local, DeployEnvironment.LOCAL, SmsMode.TURBOSMS)).doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("phase 409: an active test profile (drops TelegramLinkTokenPurgeJob) fails in prod")
+    void should_fail_when_testProfileActiveInProd() {
+        MockEnvironment prod = prodEnv();
+        prod.setActiveProfiles("prod", "test");
+
+        assertThatThrownBy(() -> run(prod, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("test profile must not be active");
+    }
+
+    @Test
+    @DisplayName("phase 409: an active test profile (drops TelegramLinkTokenPurgeJob) fails in staging too")
+    void should_fail_when_testProfileActiveInStaging() {
+        MockEnvironment staging = stagingEnv();
+        staging.setActiveProfiles("prod", "staging", "test");
+
+        assertThatThrownBy(() -> run(staging, DeployEnvironment.STAGING, SmsMode.CAPTURE))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("rule retention-jobs-enabled")
+                .hasMessageContaining("test profile must not be active");
+    }
+
+    @ParameterizedTest(name = "app.guest-pii-retention.enabled=''{0}'' fails in prod")
+    @CsvSource({"no", "0", "off", "yes", "flase"})
+    @DisplayName("phase 409: anything but a literal true for app.guest-pii-retention.enabled fails closed in prod")
+    void should_failClosed_when_retentionFlagIsNotLiteralTrue(String value) {
+        MockEnvironment prod = prodEnv().withProperty("app.guest-pii-retention.enabled", value);
+
+        assertThatThrownBy(() -> run(prod, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("rule retention-jobs-enabled")
+                .hasMessageContaining("app.guest-pii-retention.enabled must be true");
+    }
+
+    @ParameterizedTest(name = "app.guest-pii-retention.enabled=''{0}'' passes in prod")
+    @CsvSource({"true", "TRUE", "' true '"})
+    @DisplayName("phase 409: a literal true (any case, padded) for app.guest-pii-retention.enabled passes in prod")
+    void should_pass_when_retentionFlagIsLiteralTrue(String value) {
+        MockEnvironment prod = prodEnv().withProperty("app.guest-pii-retention.enabled", value);
+
+        assertThatCode(() -> run(prod, DeployEnvironment.PROD, SmsMode.TURBOSMS)).doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("phase 409: a genuinely local run may use the test profile (the retention-jobs rule is deploy-only)")
+    void should_pass_when_testProfileActiveLocally() {
+        MockEnvironment local = new MockEnvironment();
+        local.setActiveProfiles("test");
+
+        assertThatCode(() -> run(local, DeployEnvironment.LOCAL, SmsMode.TURBOSMS)).doesNotThrowAnyException();
+    }
+
+    @Test
     @DisplayName("staging with TURBOSMS_TOKEN set — fails naming TURBOSMS_TOKEN, message carries no value")
     void should_failNamingTheVariable_when_stagingHasTurbosmsToken() {
         MockEnvironment env = stagingEnv().withProperty("TURBOSMS_TOKEN", SECRET)

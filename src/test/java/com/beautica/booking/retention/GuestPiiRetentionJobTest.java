@@ -1,5 +1,6 @@
 package com.beautica.booking.retention;
 
+import com.beautica.notification.telegram.link.TelegramLinkRetentionService;
 import com.beautica.review.invite.service.GuestReviewRetentionService;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -33,11 +34,31 @@ class GuestPiiRetentionJobTest {
     @Mock
     private GuestReviewRetentionService guestReviewRetentionService;
 
+    @Mock
+    private TelegramLinkRetentionService telegramLinkRetentionService;
+
+    @Test
+    @DisplayName("phase 409 D2: purges BLOCKED Telegram links at the clock's now, even when anonymisation and the "
+            + "invite purge both throw; its own failure is swallowed")
+    void should_purgeBlockedLinks_when_everythingElseThrows() {
+        when(anonymisationService.anonymiseDue(any())).thenThrow(new IllegalStateException("db down"));
+        doThrow(new IllegalStateException("purge")).when(guestReviewRetentionService)
+                .purgeInvites(any(), anyInt(), anyInt());
+        doThrow(new IllegalStateException("tg")).when(telegramLinkRetentionService)
+                .purgeBlockedLinks(any(), anyInt(), anyInt());
+        GuestPiiRetentionJob job = new GuestPiiRetentionJob(anonymisationService, guestReviewRetentionService,
+                telegramLinkRetentionService, properties(12), Clock.fixed(NOW, ZoneOffset.UTC));
+
+        assertThatThrownBy(job::run).isInstanceOf(IllegalStateException.class).hasMessage("db down");
+
+        verify(telegramLinkRetentionService).purgeBlockedLinks(NOW, 500, 200);
+    }
+
     @Test
     @DisplayName("passes now minus 12 calendar months (UTC) from the injected clock")
     void should_passNowMinusTwelveMonths_when_run() {
         GuestPiiRetentionJob job = new GuestPiiRetentionJob(
-                anonymisationService, guestReviewRetentionService, properties(12), Clock.fixed(NOW, ZoneOffset.UTC));
+                anonymisationService, guestReviewRetentionService, telegramLinkRetentionService, properties(12), Clock.fixed(NOW, ZoneOffset.UTC));
 
         job.run();
 
@@ -48,7 +69,7 @@ class GuestPiiRetentionJobTest {
     @DisplayName("phase 402 D3: purges review invites at the clock's now with the retention batch settings")
     void should_purgeInvitesWithBatchSettings_when_run() {
         GuestPiiRetentionJob job = new GuestPiiRetentionJob(
-                anonymisationService, guestReviewRetentionService, properties(12), Clock.fixed(NOW, ZoneOffset.UTC));
+                anonymisationService, guestReviewRetentionService, telegramLinkRetentionService, properties(12), Clock.fixed(NOW, ZoneOffset.UTC));
 
         job.run();
 
@@ -60,7 +81,7 @@ class GuestPiiRetentionJobTest {
     void should_purgeInvites_when_anonymisationThrows() {
         when(anonymisationService.anonymiseDue(any())).thenThrow(new IllegalStateException("db down"));
         GuestPiiRetentionJob job = new GuestPiiRetentionJob(
-                anonymisationService, guestReviewRetentionService, properties(12), Clock.fixed(NOW, ZoneOffset.UTC));
+                anonymisationService, guestReviewRetentionService, telegramLinkRetentionService, properties(12), Clock.fixed(NOW, ZoneOffset.UTC));
 
         assertThatThrownBy(job::run).isInstanceOf(IllegalStateException.class).hasMessage("db down");
 
@@ -73,7 +94,7 @@ class GuestPiiRetentionJobTest {
         doThrow(new IllegalStateException("purge")).when(guestReviewRetentionService)
                 .purgeInvites(any(), anyInt(), anyInt());
         GuestPiiRetentionJob job = new GuestPiiRetentionJob(
-                anonymisationService, guestReviewRetentionService, properties(12), Clock.fixed(NOW, ZoneOffset.UTC));
+                anonymisationService, guestReviewRetentionService, telegramLinkRetentionService, properties(12), Clock.fixed(NOW, ZoneOffset.UTC));
 
         job.run();
 
@@ -84,7 +105,7 @@ class GuestPiiRetentionJobTest {
     @DisplayName("uses calendar months: 29 Feb minus 12 months clamps to 28 Feb")
     void should_useCalendarMonths_when_dayDoesNotExistInTargetMonth() {
         GuestPiiRetentionJob job = new GuestPiiRetentionJob(
-                anonymisationService, guestReviewRetentionService, properties(12),
+                anonymisationService, guestReviewRetentionService, telegramLinkRetentionService, properties(12),
                 Clock.fixed(Instant.parse("2028-02-29T03:27:00Z"), ZoneOffset.UTC));
 
         Instant cutoff = job.cutoff();
@@ -98,6 +119,7 @@ class GuestPiiRetentionJobTest {
         ApplicationContextRunner runner = new ApplicationContextRunner()
                 .withBean(GuestPiiAnonymisationService.class, () -> mock(GuestPiiAnonymisationService.class))
                 .withBean(GuestReviewRetentionService.class, () -> mock(GuestReviewRetentionService.class))
+                .withBean(TelegramLinkRetentionService.class, () -> mock(TelegramLinkRetentionService.class))
                 .withBean(GuestPiiRetentionProperties.class, () -> properties(12))
                 .withBean(Clock.class, Clock::systemUTC)
                 .withUserConfiguration(GuestPiiRetentionJob.class);

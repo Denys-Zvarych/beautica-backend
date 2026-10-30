@@ -4,6 +4,8 @@ import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Instant;
 import java.util.List;
@@ -107,4 +109,48 @@ public interface TelegramLinkTokenRepository extends JpaRepository<TelegramLinkT
             """, nativeQuery = true)
     int deleteLiveBeyondNewest(@Param("phoneHash") byte[] phoneHash, @Param("now") Instant now,
                                @Param("keep") int keep);
+
+    /**
+     * Phase 409 D4 — deletes ONE bounded batch of tokens whose {@code expires_at} is before {@code cutoff}, in ANY
+     * state (terminal {@code LINKED}/{@code MISMATCH} rows hold {@code claimed_chat_id} + {@code phone_hash}), in its
+     * own {@code REQUIRES_NEW} transaction (the {@code NotificationOutboxRepository#deleteTerminalBatchBefore}
+     * shape). Served by {@code idx_tg_tokens_expiry} (V224). {@code MATERIALIZED} CTE so {@code LIMIT}/
+     * {@code SKIP LOCKED} is evaluated exactly once; {@code SKIP LOCKED} never waits (a row a claim/prove holds is
+     * taken next run).
+     * No tie-break column in the {@code ORDER BY}: a {@code SKIP LOCKED} claim never waits, so lock order cannot
+     * deadlock, and which equal-timestamp row goes first does not matter.
+     *
+     * @return rows deleted, never more than {@code limit}
+     */
+    @Modifying
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    @Query(value = """
+            WITH doomed AS MATERIALIZED (
+                SELECT token_hash FROM telegram_link_tokens
+                 WHERE expires_at < :cutoff
+                 ORDER BY expires_at
+                 LIMIT :limit
+                 FOR UPDATE SKIP LOCKED
+            )
+            DELETE FROM telegram_link_tokens t USING doomed WHERE t.token_hash = doomed.token_hash
+            """, nativeQuery = true)
+    int deleteExpiredBatchBefore(@Param("cutoff") Instant cutoff, @Param("limit") int limit);
+
+    /**
+     * Phase 409 D3 — the erase: deletes every token of the phone (any state, any age). Victims are row-locked in
+     * {@code token_hash} order — the order {@link #lockClaimRows} and {@link #deleteLiveBeyondNewest} lock in, so an
+     * erase racing a claim cannot deadlock — under the fused, transaction-local 3 s {@code lock_timeout}
+     * ({@code 55P03} instead of a parked erase). Rides {@code idx_tg_tokens_phone}; a phone holds a handful of rows.
+     */
+    @Modifying(flushAutomatically = true, clearAutomatically = true)
+    @Query(value = """
+            DELETE FROM telegram_link_tokens
+             WHERE token_hash IN (
+                   SELECT v.token_hash FROM telegram_link_tokens v
+                   CROSS JOIN (SELECT set_config('lock_timeout', '3s', true)) lock_cfg
+                    WHERE v.phone_hash = :phoneHash
+                    ORDER BY v.token_hash
+                    FOR UPDATE OF v)
+            """, nativeQuery = true)
+    int deleteAllByPhoneHash(@Param("phoneHash") byte[] phoneHash);
 }

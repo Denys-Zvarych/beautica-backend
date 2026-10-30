@@ -400,6 +400,8 @@ public interface MasterServiceRepository extends JpaRepository<MasterServiceAssi
      *       ({@code TelegramLinkTokenRepository#acquirePhoneIssueLock}, {@code PHONE_ISSUE_LOCK_SEED})</li>
      *   <li>{@code 6} — Telegram link-token per-CHAT claim lock
      *       ({@code TelegramLinkTokenRepository#acquireChatClaimLock}, {@code CHAT_CLAIM_LOCK_SEED})</li>
+     *   <li>{@code 7} — Telegram link per-PHONE retention lock (phase 409 D1), keyed on the phone HASH hex
+     *       ({@code TelegramLinkRepository#acquirePhoneRetentionLock}, {@code PHONE_RETENTION_LOCK_SEED})</li>
      * </ul>
      *
      * <p>Salt {@code 2} replaced an earlier salt {@code 0} (bulk-additive re-audit). Keyed on the

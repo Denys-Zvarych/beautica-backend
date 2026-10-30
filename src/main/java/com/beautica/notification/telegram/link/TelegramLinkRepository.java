@@ -4,13 +4,30 @@ import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Instant;
+import java.util.Collection;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
 /** Phase 405 — {@code telegram_links}. Unscoped: callers prove phone/chat ownership first. */
 public interface TelegramLinkRepository extends JpaRepository<TelegramLink, UUID> {
+
+    /**
+     * {@code hashtextextended} seed of the per-phone retention lock (phase 409 D1). Allocated in the ONE registry —
+     * the "Advisory-lock salt allocation" list on {@code MasterServiceRepository#acquireBulkSetupLockWithTimeout}.
+     */
+    int PHONE_RETENTION_LOCK_SEED = 7;
+
+    /** One link as the orphan backstop sees it: id + phone hash, nothing else. */
+    interface LinkKey {
+        UUID getId();
+
+        byte[] getPhoneHash();
+    }
 
     Optional<TelegramLink> findByPhoneHash(byte[] phoneHash);
 
@@ -56,6 +73,99 @@ public interface TelegramLinkRepository extends JpaRepository<TelegramLink, UUID
              WHERE l.phone_hash = :phoneHash
             """, nativeQuery = true)
     int deleteByPhone(@Param("phoneHash") byte[] phoneHash);
+
+    /**
+     * Phase 409 D1 — deletes the links of {@code phoneHashes} (phones whose last guest booking the retention batch
+     * just anonymised, still unbooked under the retention lock). Runs inside the batch transaction; the same fused,
+     * transaction-local 3 s {@code lock_timeout} as {@link #deleteByPhone}: a held row aborts the batch with
+     * {@code 55P03} (rolled back, retried next run) instead of waiting out the statement timeout. Rides
+     * {@code ux_telegram_links_phone}; the caller bounds the collection by its batch size.
+     */
+    @Modifying(flushAutomatically = true, clearAutomatically = true)
+    @Query(value = """
+            DELETE FROM telegram_links l
+             USING (SELECT set_config('lock_timeout', '3s', true)) lock_cfg
+             WHERE l.phone_hash IN (:phoneHashes)
+            """, nativeQuery = true)
+    int deleteByPhones(@Param("phoneHashes") Collection<byte[]> phoneHashes);
+
+    /**
+     * Phase 409 D1 — which of {@code phoneHashes} have a link at all (most freed phones never linked Telegram), so the
+     * retention batch locks and re-checks only those. Rides {@code ux_telegram_links_phone}; no row lock.
+     */
+    @Query(value = "SELECT l.phone_hash FROM telegram_links l WHERE l.phone_hash IN (:phoneHashes)",
+            nativeQuery = true)
+    List<byte[]> findLinkedPhoneHashes(@Param("phoneHashes") Collection<byte[]> phoneHashes);
+
+    /**
+     * Phase 409 D1 (audit-fix cycle 1) — per-phone retention lock, keyed on the phone HASH hex (never the raw phone),
+     * taken by every retention batch for each linked phone, in hash order, BEFORE its "still has a booking?" check.
+     * Two instances that anonymise the phone's last two bookings in parallel therefore serialise: the second waits
+     * for the first to commit, and its (READ COMMITTED, later) check sees both bookings anonymised and deletes the
+     * link. Fused transaction-local 3 s {@code lock_timeout}, like {@code TelegramLinkTokenRepository
+     * #acquirePhoneIssueLock}: a longer wait aborts the batch with {@code 55P03}.
+     */
+    @Query(value = "SELECT 1 FROM (SELECT set_config('lock_timeout', '3s', true), "
+            + "pg_advisory_xact_lock(hashtextextended(encode(:phoneHash, 'hex'), " + PHONE_RETENTION_LOCK_SEED
+            + "))) sub", nativeQuery = true)
+    Integer acquirePhoneRetentionLock(@Param("phoneHash") byte[] phoneHash);
+
+    /**
+     * Phase 409 orphan backstop (audit-fix cycle 1) — one keyset page of links created before {@code linkedBefore},
+     * in id order after {@code afterId}. Primary-key range scan bounded by {@code limit}; no row lock.
+     */
+    @Query(value = """
+            SELECT l.id AS id, l.phone_hash AS phoneHash FROM telegram_links l
+             WHERE l.id > :afterId AND l.linked_at < :linkedBefore
+             ORDER BY l.id
+             LIMIT :limit
+            """, nativeQuery = true)
+    List<LinkKey> findLinkKeysPage(@Param("afterId") UUID afterId, @Param("linkedBefore") Instant linkedBefore,
+                                   @Param("limit") int limit);
+
+    /**
+     * Phase 409 orphan backstop — deletes the given links (one backstop page, bounded by its size) in its own
+     * {@code REQUIRES_NEW} transaction. {@code SKIP LOCKED} never waits; {@code linked_at} is re-checked so a link
+     * re-bound since the page was read (the upsert keeps the id and restamps {@code linked_at}) survives.
+     */
+    @Modifying
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    @Query(value = """
+            WITH doomed AS MATERIALIZED (
+                SELECT id FROM telegram_links
+                 WHERE id IN (:ids) AND linked_at < :linkedBefore
+                 FOR UPDATE SKIP LOCKED
+            )
+            DELETE FROM telegram_links l USING doomed WHERE l.id = doomed.id
+            """, nativeQuery = true)
+    int deleteOrphansByIds(@Param("ids") Collection<UUID> ids, @Param("linkedBefore") Instant linkedBefore);
+
+    /**
+     * Phase 409 D2 — deletes ONE bounded batch of {@code BLOCKED} links whose {@code status_changed_at} is before
+     * {@code cutoff}, in its own {@code REQUIRES_NEW} transaction (the {@code NotificationOutboxRepository
+     * #deleteTerminalBatchBefore} shape). Served by the partial index {@code idx_telegram_links_blocked} (V224); the
+     * {@code MATERIALIZED} CTE evaluates {@code LIMIT}/{@code FOR UPDATE SKIP LOCKED} exactly once, and
+     * {@code SKIP LOCKED} never waits, so no {@code lock_timeout} is needed. A row a webhook is reactivating right now
+     * is skipped and re-evaluated next run.
+     * No tie-break column in the {@code ORDER BY}: a {@code SKIP LOCKED} claim never waits, so lock order cannot
+     * deadlock, and which equal-timestamp row goes first does not matter.
+     *
+     * @return rows deleted, never more than {@code limit}
+     */
+    @Modifying
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    @Query(value = """
+            WITH doomed AS MATERIALIZED (
+                SELECT id FROM telegram_links
+                 WHERE status = 'BLOCKED'
+                   AND status_changed_at < :cutoff
+                 ORDER BY status_changed_at
+                 LIMIT :limit
+                 FOR UPDATE SKIP LOCKED
+            )
+            DELETE FROM telegram_links l USING doomed WHERE l.id = doomed.id
+            """, nativeQuery = true)
+    int deleteBlockedBatchBefore(@Param("cutoff") Instant cutoff, @Param("limit") int limit);
 
     /** Moves the chat's {@code from} rows to {@code to}; no-op on rows already in another state. */
     default int transitionByChat(long chatId, TelegramLinkStatus from, TelegramLinkStatus to, Instant now) {

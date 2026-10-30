@@ -2468,10 +2468,21 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * @param cutoff   rows whose {@code ends_at} is strictly before this instant are due
      * @param sentinel the fixed replacement name ({@code GuestPii.ANONYMISED_NAME})
      */
+    default List<UUID> anonymiseDueGuestBookings(OffsetDateTime cutoff, String sentinel, int batchSize) {
+        return anonymiseDueGuestBookingsWithPhones(cutoff, sentinel, batchSize).stream()
+                .map(AnonymisedGuestBooking::getBookingId)
+                .toList();
+    }
+
+    /**
+     * {@link #anonymiseDueGuestBookings} returning, per anonymised row, the guest phone it held before the wipe
+     * (phase 409 D1 — the batch's Telegram link cleanup). The phone comes from the {@code due} CTE, whose snapshot
+     * predates the UPDATE; the statement, claim and field treatment are exactly the ones documented above.
+     */
     @Modifying
     @Query(value = """
             WITH due AS MATERIALIZED (
-                SELECT x.id FROM bookings x
+                SELECT x.id, x.guest_phone FROM bookings x
                  WHERE x.client_id IS NULL
                    AND x.guest_pii_anonymised_at IS NULL
                    AND x.client_detached_at IS NULL
@@ -2492,12 +2503,45 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
                    updated_at = now()
               FROM due
              WHERE b.id = due.id
-            RETURNING b.id
+            RETURNING b.id AS bookingId, due.guest_phone AS guestPhone
             """, nativeQuery = true)
-    List<UUID> anonymiseDueGuestBookings(
+    List<AnonymisedGuestBooking> anonymiseDueGuestBookingsWithPhones(
             @Param("cutoff") OffsetDateTime cutoff,
             @Param("sentinel") String sentinel,
             @Param("batchSize") int batchSize);
+
+    /**
+     * Phase 409 D1 — which of {@code phones} still have a non-anonymised guest/walk-in booking (any age, any status):
+     * a Telegram link of such a phone is kept. Same scope as the retention claim; rides the partial index
+     * {@code idx_bookings_guest_phone_open} (V199), whose predicate this WHERE repeats. {@code phones} is bounded by
+     * the caller's batch.
+     */
+    @Query(value = """
+            SELECT DISTINCT b.guest_phone FROM bookings b
+             WHERE b.guest_phone IN (:phones)
+               AND b.client_id IS NULL
+               AND b.guest_pii_anonymised_at IS NULL
+               AND b.client_detached_at IS NULL
+               AND b.booking_source IN ('LINK', 'STAFF')
+            """, nativeQuery = true)
+    List<String> findGuestPhonesWithOpenBookings(@Param("phones") Collection<String> phones);
+
+    /**
+     * Phase 409 Telegram orphan backstop — one keyset page of the distinct phones that still have a non-anonymised
+     * guest/walk-in booking, in phone order after {@code after}. Ordered range read of the partial index
+     * {@code idx_bookings_guest_phone_open} (V199, same predicate), bounded by {@code limit}.
+     */
+    @Query(value = """
+            SELECT DISTINCT b.guest_phone FROM bookings b
+             WHERE b.guest_phone > :after
+               AND b.client_id IS NULL
+               AND b.guest_pii_anonymised_at IS NULL
+               AND b.client_detached_at IS NULL
+               AND b.booking_source IN ('LINK', 'STAFF')
+             ORDER BY b.guest_phone
+             LIMIT :limit
+            """, nativeQuery = true)
+    List<String> findOpenGuestPhonesPage(@Param("after") String after, @Param("limit") int limit);
 
     /**
      * Internal erase path (phase 373 D9): anonymises EVERY not-yet-anonymised guest/walk-in row of
