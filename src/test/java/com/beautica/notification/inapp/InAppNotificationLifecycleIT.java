@@ -312,6 +312,7 @@ class InAppNotificationLifecycleIT extends AbstractIntegrationTest {
         String owner = token(rig.ownerEmail());
         String master = token(rig.masterEmail());
         Integer outboxBefore = jdbcTemplate.queryForObject("SELECT COUNT(*) FROM notification_outbox", Integer.class);
+        Map<String, Integer> typesBefore = outboxTypeCounts();
 
         String createBody = """
                 {"masterServiceIds":["%s","%s"],"startsAt":"%s",
@@ -344,6 +345,11 @@ class InAppNotificationLifecycleIT extends AbstractIntegrationTest {
         assertThat(unread(master)).isEqualTo(2);
         assertThat(types(owner)).isEmpty();
         assertThat(types(admin)).isEmpty();
+        // Phase 431: the admin (actor) is not the performing master, so the master's e-mail is its own
+        // MASTER_BOOKING_RESCHEDULED row beside the client/guest BOOKING_RESCHEDULED row (the walk-in's
+        // guest SMS is sent from that row at drain time — it adds no row of its own).
+        assertThat(outboxTypeDelta(typesBefore)).as("outbox rows enqueued by the reschedule")
+                .containsOnly(Map.entry("BOOKING_RESCHEDULED", 1), Map.entry("MASTER_BOOKING_RESCHEDULED", 1));
 
         expectStatus(patch("/api/v1/appointments/" + appointmentId + "/decline", admin, "{}"), HttpStatus.NO_CONTENT);
 
@@ -354,11 +360,37 @@ class InAppNotificationLifecycleIT extends AbstractIntegrationTest {
         assertThat(types(admin)).as("admin (actor) never hears about walk-ins").isEmpty();
         // NOTE (phase 336 finding): unlike CREATE, the pre-existing appointment reschedule/decline
         // paths (AppointmentTransitionService#enqueueBookingRescheduled / #enqueueStatusChanged) DO
-        // enqueue one outbox row each, walk-in or not — one per step here. The outbox is dark at the
-        // delivery layer until release; this pins the current count so a change is deliberate.
+        // enqueue one client/guest outbox row each, walk-in or not. Phase 431 adds exactly one
+        // performing-master row per step (MASTER_BOOKING_RESCHEDULED / MASTER_BOOKING_DECLINED), because
+        // the admin actor is not the performing master. Pinned by type so a change is deliberate.
+        assertThat(outboxTypeDelta(typesBefore)).as("outbox rows enqueued by reschedule + decline, by type")
+                .containsOnly(
+                        Map.entry("BOOKING_RESCHEDULED", 1), Map.entry("MASTER_BOOKING_RESCHEDULED", 1),
+                        Map.entry("STATUS_CHANGED", 1), Map.entry("MASTER_BOOKING_DECLINED", 1));
         assertThat(jdbcTemplate.queryForObject("SELECT COUNT(*) FROM notification_outbox", Integer.class))
-                .as("reschedule + decline each enqueue exactly one (pre-existing) outbox row")
-                .isEqualTo(outboxBefore + 2);
+                .isEqualTo(outboxBefore + 4);
+    }
+
+    /** Outbox row count per event type. */
+    private Map<String, Integer> outboxTypeCounts() {
+        Map<String, Integer> counts = new java.util.HashMap<>();
+        jdbcTemplate.query("SELECT event_type, COUNT(*) AS n FROM notification_outbox GROUP BY event_type",
+                rs -> {
+                    counts.put(rs.getString("event_type"), rs.getInt("n"));
+                });
+        return counts;
+    }
+
+    /** Rows added per event type since {@code before}; types with no new rows are omitted. */
+    private Map<String, Integer> outboxTypeDelta(Map<String, Integer> before) {
+        Map<String, Integer> delta = new java.util.HashMap<>();
+        outboxTypeCounts().forEach((type, n) -> {
+            int added = n - before.getOrDefault(type, 0);
+            if (added != 0) {
+                delta.put(type, added);
+            }
+        });
+        return delta;
     }
 
     // ── 6. invite acceptance ─────────────────────────────────────────────────────────────────
