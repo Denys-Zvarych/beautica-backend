@@ -589,10 +589,12 @@ public interface AppointmentRepository extends JpaRepository<Appointment, UUID> 
     /**
      * Locks (id order) the phone's upcoming guest/walk-in visit headers: header {@code CONFIRMED} and
      * at least one {@code CONFIRMED} item not yet ended (phase 373 D12 step 2). See
-     * {@code BookingRepository#lockUpcomingGuestSingleBookingIdsByPhone} for the race rationale.
+     * {@code BookingRepository#lockUpcomingGuestSingleBookingIdsByPhone} for the race rationale. Fused
+     * transaction-local 3s {@code lock_timeout} ({@code FOR UPDATE OF a} keeps the lock on the header only).
      */
     @Query(value = """
             SELECT a.id FROM appointments a
+            CROSS JOIN (SELECT set_config('lock_timeout', '3s', true)) lock_cfg
              WHERE a.guest_phone = :phone
                AND a.client_id IS NULL
                AND a.guest_pii_anonymised_at IS NULL

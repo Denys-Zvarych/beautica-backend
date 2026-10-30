@@ -3,6 +3,7 @@ package com.beautica.config;
 import com.beautica.AbstractIntegrationTest;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -60,5 +61,86 @@ class DataSourceStatementTimeoutIT extends AbstractIntegrationTest {
                         () -> jdbcTemplate.execute("SELECT pg_sleep(8)")))
                 .as("a statement running past statement_timeout must be cancelled by the server")
                 .isNotNull();
+    }
+
+    @Autowired
+    private jakarta.persistence.EntityManager entityManager;
+
+    @Autowired
+    private org.springframework.transaction.PlatformTransactionManager transactionManager;
+
+    @Test
+    @DisplayName("a JPA statement cancelled by statement_timeout translates to Spring QueryTimeoutException (the 503 handler's type)")
+    void should_translateToQueryTimeoutException_when_jpaStatementExceedsStatementTimeout() {
+        // GlobalExceptionHandler#handleQueryTimeout maps org.springframework.dao.QueryTimeoutException to 503. This
+        // pins that a real 57014 on the JPA path (what every repository method runs on) arrives as exactly that
+        // type after Spring's persistence-exception translation — otherwise the handler would be dead code and the
+        // timeout would still fall through to the generic 500. SET LOCAL keeps the test at ~100 ms instead of 5 s.
+        var tx = new org.springframework.transaction.support.TransactionTemplate(transactionManager);
+
+        Throwable thrown = org.assertj.core.api.Assertions.catchThrowable(() -> tx.executeWithoutResult(status -> {
+            entityManager.createNativeQuery("SELECT set_config('statement_timeout', '100ms', true)").getSingleResult();
+            try {
+                entityManager.createNativeQuery("SELECT CAST(pg_sleep(2) AS text)").getSingleResult();
+            } catch (RuntimeException ex) {
+                throw org.springframework.orm.jpa.EntityManagerFactoryUtils.convertJpaAccessExceptionIfPossible(ex);
+            }
+        }));
+
+        assertThat(thrown).isInstanceOf(org.springframework.dao.QueryTimeoutException.class);
+    }
+
+    @Autowired
+    private com.beautica.salon.repository.SalonRepository salonRepository;
+
+    @Autowired
+    private javax.sql.DataSource dataSource;
+
+    @Test
+    @DisplayName("a lock wait cancelled by statement_timeout on a REAL repository call is a 503 through MockMvc, not a 500")
+    void should_return503_when_repositoryLockWaitIsCancelledByStatementTimeout() throws Exception {
+        // The end-to-end shape the 503 handler exists for: a statement the server cancels (57014) on the
+        // repository proxy's own exception translation (not a hand-called convertJpaAccessExceptionIfPossible),
+        // then resolved by the real GlobalExceptionHandler through Spring MVC's resolver chain. An advisory lock
+        // held on another connection blocks lockBookingSlugCandidates; a transaction-local 300ms
+        // statement_timeout fires before the query's own fused 3s lock_timeout, so the wait ends as 57014,
+        // never 55P03 (that one is the 409 path).
+        String slug = "stmt-timeout-" + java.util.UUID.randomUUID();
+        var tx = new org.springframework.transaction.support.TransactionTemplate(transactionManager);
+        Throwable thrown;
+        try (var ignored = com.beautica.support.HeldDbLock.salonSlugCandidates(dataSource, new String[] {slug})) {
+            thrown = org.assertj.core.api.Assertions.catchThrowable(() -> tx.executeWithoutResult(status -> {
+                entityManager.createNativeQuery("SELECT set_config('statement_timeout', '300ms', true)")
+                        .getSingleResult();
+                salonRepository.lockBookingSlugCandidates(new String[] {slug});
+            }));
+        }
+        assertThat(thrown)
+                .as("the repository proxy must translate 57014 to the 503 handler's type, actual=%s", thrown)
+                .isInstanceOf(org.springframework.dao.QueryTimeoutException.class);
+
+        var mockMvc = org.springframework.test.web.servlet.setup.MockMvcBuilders
+                .standaloneSetup(new ThrowingController((RuntimeException) thrown))
+                .setControllerAdvice(new com.beautica.common.exception.GlobalExceptionHandler())
+                .build();
+
+        mockMvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get("/stmt-timeout"))
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isServiceUnavailable())
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.content().json(
+                        "{\"success\":false,\"data\":null,\"message\":\"Service temporarily unavailable\"}", true));
+    }
+
+    @org.springframework.web.bind.annotation.RestController
+    static class ThrowingController {
+        private final RuntimeException toThrow;
+
+        ThrowingController(RuntimeException toThrow) {
+            this.toThrow = toThrow;
+        }
+
+        @org.springframework.web.bind.annotation.GetMapping("/stmt-timeout")
+        String fail() {
+            throw toThrow;
+        }
     }
 }

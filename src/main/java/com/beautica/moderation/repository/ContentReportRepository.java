@@ -148,9 +148,11 @@ public interface ContentReportRepository extends JpaRepository<ContentReport, UU
      * different reviews can neither both miss a burst nor both pass the cap, and two overlapping multi-row hold
      * UPDATEs never interleave. Two-key form: its key space never overlaps the single-bigint
      * {@code pg_advisory_xact_lock(hashtext(..))} locks used elsewhere. The scalar wrapper exists because
-     * {@code pg_advisory_xact_lock} returns {@code void}.
+     * {@code pg_advisory_xact_lock} returns {@code void}. Fused transaction-local 3s {@code lock_timeout}
+     * (set first, left to right), the {@code BookingRepository#acquireClientAdvisoryLockWithTimeout} shape.
      */
-    @Query(value = "SELECT 1 FROM (SELECT pg_advisory_xact_lock(:namespace, hashtext(:key))) AS l", nativeQuery = true)
+    @Query(value = "SELECT 1 FROM (SELECT set_config('lock_timeout', '3s', true), "
+            + "pg_advisory_xact_lock(:namespace, hashtext(:key))) AS l", nativeQuery = true)
     int lockProviderKey(@Param("namespace") int namespace, @Param("key") String key);
 
     // ── Resolve (phase 396 D4) ───────────────────────────────────────────────────────────────

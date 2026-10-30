@@ -20,6 +20,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.dao.CannotAcquireLockException;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.dao.PessimisticLockingFailureException;
+import org.springframework.dao.QueryTimeoutException;
 import org.springframework.http.CacheControl;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -690,6 +691,23 @@ public class GlobalExceptionHandler {
         return ResponseEntity
                 .status(HttpStatus.CONFLICT)
                 .body(ApiResponse.error("Request could not be completed due to a conflict"));
+    }
+
+    /**
+     * 503 for a statement the server cancelled at the pool's {@code statement_timeout} (SQLState {@code 57014},
+     * translated by Hibernate/Spring to {@link QueryTimeoutException}). The app pool deliberately sets no session
+     * {@code lock_timeout}, so a lock wait that does not bound itself (every lock query is meant to fuse the
+     * transaction-local {@code set_config('lock_timeout', '3s', true)}) and any runaway statement end here instead
+     * of in {@link #handleGeneric}'s 500. Transient and retryable, hence 503. Same body shape as every other 503:
+     * {@code success=false}, {@code data=null}, the fixed {@link ServiceUnavailableMessages#GENERIC} text. No SQL,
+     * SQLState or timeout value is echoed; only the class name is logged (§I/§N).
+     */
+    @ExceptionHandler(QueryTimeoutException.class)
+    public ResponseEntity<ApiResponse<Void>> handleQueryTimeout(QueryTimeoutException ex) {
+        log.warn("Statement cancelled by statement_timeout: {}", ex.getClass().getSimpleName());
+        return ResponseEntity
+                .status(HttpStatus.SERVICE_UNAVAILABLE)
+                .body(ApiResponse.error(ServiceUnavailableMessages.GENERIC));
     }
 
     @ExceptionHandler(DataIntegrityViolationException.class)

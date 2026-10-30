@@ -1,5 +1,6 @@
 package com.beautica.user;
 
+import com.beautica.common.repository.TransactionLockTimeout;
 import jakarta.persistence.LockModeType;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
@@ -12,7 +13,7 @@ import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
-public interface InviteTokenRepository extends JpaRepository<InviteToken, UUID> {
+public interface InviteTokenRepository extends JpaRepository<InviteToken, UUID>, TransactionLockTimeout {
 
     Optional<InviteToken> findByToken(String token);
 
@@ -48,7 +49,13 @@ public interface InviteTokenRepository extends JpaRepository<InviteToken, UUID> 
 
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("SELECT t FROM InviteToken t WHERE t.token = :token")
-    Optional<InviteToken> findByTokenForUpdate(@Param("token") String token);
+    Optional<InviteToken> findByTokenForUpdateNoLockTimeout(@Param("token") String token);
+
+    /** {@link #findByTokenForUpdateNoLockTimeout} bounded by the transaction-local 3s {@code lock_timeout} ({@link TransactionLockTimeout}). */
+    default Optional<InviteToken> findByTokenForUpdate(String token) {
+        applyTransactionLockTimeout();
+        return findByTokenForUpdateNoLockTimeout(token);
+    }
 
     /**
      * {@code PESSIMISTIC_WRITE}-locked lookup by id — Phase 23.1 QA audit (Security MEDIUM) fix.
@@ -65,7 +72,13 @@ public interface InviteTokenRepository extends JpaRepository<InviteToken, UUID> 
      */
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("SELECT t FROM InviteToken t WHERE t.id = :id")
-    Optional<InviteToken> findByIdForUpdate(@Param("id") UUID id);
+    Optional<InviteToken> findByIdForUpdateNoLockTimeout(@Param("id") UUID id);
+
+    /** {@link #findByIdForUpdateNoLockTimeout} bounded by the transaction-local 3s {@code lock_timeout} ({@link TransactionLockTimeout}). */
+    default Optional<InviteToken> findByIdForUpdate(UUID id) {
+        applyTransactionLockTimeout();
+        return findByIdForUpdateNoLockTimeout(id);
+    }
 
     /**
      * FULL invite history for a salon — {@code GET /salons/{salonId}/invites}. Deliberately

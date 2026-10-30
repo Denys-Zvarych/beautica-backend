@@ -98,6 +98,22 @@ class PasswordResetTicketRepositoryDataJpaTest extends AbstractDataJpaTest {
     }
 
     @Test
+    @DisplayName("findByTicketHashForUpdate bounds its row-lock wait: the transaction's lock_timeout is 3s afterwards")
+    void should_setTransactionLockTimeout_when_findByTicketHashForUpdate() {
+        repo.saveAndFlush(new PasswordResetTicket(TICKET_HASH, userId, future()));
+        em.clear();
+        String before = (String) em.getEntityManager().createNativeQuery("SHOW lock_timeout").getSingleResult();
+
+        repo.findByTicketHashForUpdate(TICKET_HASH);
+        String after = (String) em.getEntityManager().createNativeQuery("SHOW lock_timeout").getSingleResult();
+
+        assertThat(before).as("the pool sets no session lock_timeout").isEqualTo("0");
+        assertThat(after)
+                .as("TransactionLockTimeout default wrapper must set the tx-local 3s lock_timeout before the lock")
+                .isEqualTo("3s");
+    }
+
+    @Test
     @DisplayName("markAllUsedByUserId flips all of the user's unused tickets to used and leaves other users untouched")
     void should_flipAllUnusedTickets_when_markAllUsedByUserId() {
         UUID firstId = repo.saveAndFlush(new PasswordResetTicket(hash("u1-a"), userId, future())).getId();

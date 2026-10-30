@@ -2431,20 +2431,22 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * bookings — {@code CONFIRMED} and not yet ended, so an in-progress visit counts — and returns
      * their ids (phase 373 D12 step 2). Visit items are excluded: they are cancelled through their
      * header. The lock serialises the erase against a concurrent token cancel: whichever commits
-     * first wins, and the other matches 0 rows on its conditional UPDATE.
+     * first wins, and the other matches 0 rows on its conditional UPDATE. Fused transaction-local 3s
+     * {@code lock_timeout}; {@code OF b} keeps the row lock off the one-row config subquery.
      */
     @Query(value = """
-            SELECT id FROM bookings
-             WHERE guest_phone = :phone
-               AND client_id IS NULL
-               AND guest_pii_anonymised_at IS NULL
-               AND client_detached_at IS NULL
-               AND booking_source IN ('LINK', 'STAFF')
-               AND appointment_id IS NULL
-               AND status = 'CONFIRMED'
-               AND ends_at > :now
-             ORDER BY id
-             FOR UPDATE
+            SELECT b.id FROM bookings b
+            CROSS JOIN (SELECT set_config('lock_timeout', '3s', true)) lock_cfg
+             WHERE b.guest_phone = :phone
+               AND b.client_id IS NULL
+               AND b.guest_pii_anonymised_at IS NULL
+               AND b.client_detached_at IS NULL
+               AND b.booking_source IN ('LINK', 'STAFF')
+               AND b.appointment_id IS NULL
+               AND b.status = 'CONFIRMED'
+               AND b.ends_at > :now
+             ORDER BY b.id
+             FOR UPDATE OF b
             """, nativeQuery = true)
     List<UUID> lockUpcomingGuestSingleBookingIdsByPhone(
             @Param("phone") String phone,

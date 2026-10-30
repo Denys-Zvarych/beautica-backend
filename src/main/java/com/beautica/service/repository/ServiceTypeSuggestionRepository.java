@@ -1,5 +1,6 @@
 package com.beautica.service.repository;
 
+import com.beautica.common.repository.TransactionLockTimeout;
 import com.beautica.service.entity.ServiceTypeSuggestion;
 import com.beautica.service.entity.ServiceTypeSuggestionStatus;
 import jakarta.persistence.LockModeType;
@@ -15,7 +16,7 @@ import java.util.UUID;
  * Data access for {@link ServiceTypeSuggestion}. Mirrors the token-lookup +
  * dedup-existence shape of {@code PlatformCategoryRepository}.
  */
-public interface ServiceTypeSuggestionRepository extends JpaRepository<ServiceTypeSuggestion, UUID> {
+public interface ServiceTypeSuggestionRepository extends JpaRepository<ServiceTypeSuggestion, UUID>, TransactionLockTimeout {
 
     /**
      * Token lookup for the approve/reject POST. Matched on the hashed token only;
@@ -30,7 +31,13 @@ public interface ServiceTypeSuggestionRepository extends JpaRepository<ServiceTy
      */
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("select s from ServiceTypeSuggestion s where s.tokenHash = :tokenHash")
-    Optional<ServiceTypeSuggestion> findByTokenHashForUpdate(@Param("tokenHash") String tokenHash);
+    Optional<ServiceTypeSuggestion> findByTokenHashForUpdateNoLockTimeout(@Param("tokenHash") String tokenHash);
+
+    /** {@link #findByTokenHashForUpdateNoLockTimeout} bounded by the transaction-local 3s {@code lock_timeout} ({@link TransactionLockTimeout}). */
+    default Optional<ServiceTypeSuggestion> findByTokenHashForUpdate(String tokenHash) {
+        applyTransactionLockTimeout();
+        return findByTokenHashForUpdateNoLockTimeout(tokenHash);
+    }
 
     /**
      * Dedup guard: returns {@code true} when a PENDING suggestion already exists for

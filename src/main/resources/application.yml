@@ -11,15 +11,23 @@ spring:
       idle-timeout: 300000
       minimum-idle: 2              # Low startup footprint on Railway 512MB; pool grows on demand
       maximum-pool-size: 10        # App container (512MB, -Xmx256m); Flyway pool 2 + headroom; max_connections default 100, confirm in M7. No pooler: if a transaction-mode pooler is ever added, revisit server-side prepares (prepareThreshold).
-      connection-timeout: 20000    # Fail faster under pool saturation; 30s was masking exhaustion (was 30000)
-      leak-detection-threshold: 10000  # Alert on connections held > 10 s — indicates a blocking or long-running query
+      # Wait for a free connection before failing the request. 10 s (was 20000, before that 30000): with
+      # virtual threads a burst queues many requests on the pool at once, and 20 s was a long hang before
+      # the 500. Still above the 5 s statement_timeout below, so one slow statement finishing frees a
+      # connection well before a queued request gives up.
+      connection-timeout: 10000
+      # WARN when a connection is held longer than this. 35 s (was 10000): ABOVE the longest deliberate
+      # transaction budget — deactivateSalon, staff self-delete and client self-delete are
+      # @Transactional(timeout = 30), remove-master is 15 s — so those legitimate long holds no longer log a false
+      # "Apparent connection leak". Anything past 35 s has outlived every budget and is a real leak.
+      leak-detection-threshold: 35000
       # Server-side ceiling on EVERY application statement — the backstop this pool never had.
       # statement_timeout previously appeared only inside individual migrations (SET LOCAL in
       # V139/V159/V165 and friends), so no runtime query had any ceiling at all: a single
       # pathological plan (the Phase 326 zero-trigram sequential scan was one, at 119 ms x 240
       # requests/minute/IP) could hold all 10 connections until the client gave up, and
       # connection-timeout above then queues logins and booking writes behind it. leak-detection
-      # only LOGS at 10 s; this one actually aborts, and it does so in the database, where a
+      # only LOGS (at 35 s); this one actually aborts, and it does so in the database, where a
       # runaway statement keeps burning CPU long after the JVM has walked away.
       #
       # 5 s is ~40x the slowest legitimate statement measured on this schema (the salon-board
