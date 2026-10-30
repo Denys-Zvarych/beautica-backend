@@ -75,6 +75,8 @@ class GuestBookingServiceTest {
     @Mock private SalonGuestMasterResolver salonGuestMasterResolver;
     @Mock private GuestTokenBookingCap guestTokenBookingCap;
     @Mock private com.beautica.moderation.service.BookingBlockGuard bookingBlockGuard;
+    @Mock private com.beautica.notification.telegram.link.GuestTelegramLinkService guestTelegramLinkService;
+    @Mock private org.springframework.transaction.PlatformTransactionManager transactionManager;
 
     private GuestBookingService service;
 
@@ -90,7 +92,7 @@ class GuestBookingServiceTest {
                 new VisitPlanner(masterServiceRepository), FRONTEND,
                 java.time.Clock.fixed(OffsetDateTime.parse("2026-06-01T10:00:00Z").toInstant(), ZoneOffset.UTC),
                 inAppNotificationService, retiredBookingSlugGuard, salonGuestMasterResolver, guestTokenBookingCap,
-                bookingBlockGuard);
+                bookingBlockGuard, guestTelegramLinkService, transactionManager);
 
         // Phase 337 fix: BookingSlotLockGuard.lockMasterAndAssertFree now re-checks bookability
         // AFTER the advisory lock (PostLockSlotGuard, closing the self-delete-race CRITICAL), fused
@@ -131,6 +133,127 @@ class GuestBookingServiceTest {
         Booking saved = savedCaptor.getValue().get(0);
         assertThat(saved.getGuestPrivacyAcceptedAt()).isEqualTo(java.time.Instant.parse("2026-06-01T10:00:00Z"));
         assertThat(saved.getGuestPrivacyPolicyVersion()).isEqualTo("2026-10-20.2");
+    }
+
+    @Test
+    @DisplayName("should attach the telegram block for the OTP-verified phone and never issue a link token (phase 407 D6)")
+    void should_attachTelegramAvailability_when_bookingCreated() {
+        OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
+        stubHappyPath(startsAt);
+        when(bookingRepository.saveAll(any())).thenAnswer(inv -> inv.getArgument(0));
+        var availability = new com.beautica.notification.telegram.link.dto.TelegramAvailability(true, true);
+        when(guestTelegramLinkService.availabilityForPhone(GUEST_PHONE)).thenReturn(availability);
+
+        GuestBookingResponse response = service.createGuestBooking("Bearer guest.jwt.token", SLUG,
+                new GuestBookingRequest(serviceId, null, startsAt, "Олена", "Коваль", true, "2026-10-20"));
+
+        assertThat(response.telegram()).isSameAs(availability);
+        verify(guestTelegramLinkService).availabilityForPhone(GUEST_PHONE);
+        org.mockito.Mockito.verifyNoMoreInteractions(guestTelegramLinkService);
+    }
+
+    @Test
+    @DisplayName("should read the telegram link state only AFTER the booking transaction committed (phase 407 audit)")
+    void should_readTelegramStateAfterCommit_when_bookingCreated() {
+        OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
+        stubHappyPath(startsAt);
+        when(bookingRepository.saveAll(any())).thenAnswer(inv -> inv.getArgument(0));
+
+        service.createGuestBooking("Bearer guest.jwt.token", SLUG,
+                new GuestBookingRequest(serviceId, null, startsAt, "Олена", "Коваль", true, "2026-10-20"));
+
+        var order = org.mockito.Mockito.inOrder(transactionManager, bookingRepository, guestTelegramLinkService);
+        order.verify(transactionManager).getTransaction(any());
+        order.verify(bookingRepository).saveAll(any());
+        order.verify(transactionManager).commit(any());
+        order.verify(guestTelegramLinkService).availabilityForPhone(GUEST_PHONE);
+    }
+
+    @Test
+    @DisplayName("salon route attaches the telegram block too, once, read after the commit (phase 407 D6)")
+    void should_attachTelegramAfterCommit_when_salonRouteBookingCreated() {
+        OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
+        when(guestTokenProvider.validateClaims(anyString())).thenReturn(GUEST_CLAIMS);
+        when(salonGuestMasterResolver.resolveBookableMaster(SALON_SLUG, masterId)).thenReturn(master());
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, serviceId))
+                .thenReturn(Optional.of(masterService()));
+        when(bookingRepository.acquireAdvisoryLockWithTimeout(masterId)).thenReturn(1);
+        stubSlotAvailable(startsAt);
+        when(bookingRepository.saveAll(any())).thenAnswer(inv -> inv.getArgument(0));
+        var availability = new com.beautica.notification.telegram.link.dto.TelegramAvailability(true, false);
+        when(guestTelegramLinkService.availabilityForPhone(GUEST_PHONE)).thenReturn(availability);
+
+        GuestBookingResponse response = service.createSalonGuestBooking("Bearer guest.jwt", SALON_SLUG, masterId,
+                new GuestBookingRequest(serviceId, null, startsAt, "Олена", "Коваль", true, "2026-10-20"));
+
+        assertThat(response.telegram()).isSameAs(availability);
+        var order = org.mockito.Mockito.inOrder(transactionManager, guestTelegramLinkService);
+        order.verify(transactionManager).commit(any());
+        order.verify(guestTelegramLinkService).availabilityForPhone(GUEST_PHONE);
+        org.mockito.Mockito.verifyNoMoreInteractions(guestTelegramLinkService);
+    }
+
+    @Test
+    @DisplayName("a rolled-back create (slot taken) never reads the telegram link state (phase 407 D6)")
+    void should_notReadTelegramState_when_createRolledBack() {
+        OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
+        when(guestTokenProvider.validateClaims(anyString())).thenReturn(GUEST_CLAIMS);
+        when(masterRepository.findByBookingSlugWithUser(SLUG)).thenReturn(Optional.of(master()));
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, serviceId))
+                .thenReturn(Optional.of(masterService()));
+        when(bookingRepository.acquireAdvisoryLockWithTimeout(masterId)).thenReturn(1);
+        when(bookingRepository.findPostLockBookabilityAndOverlap(eq(masterId), any(), any()))
+                .thenReturn(Optional.of(new TestPostLockSlotCheck(true, true)));
+        stubSlotAvailable(startsAt);
+
+        assertThatThrownBy(() -> service.createGuestBooking("Bearer guest.jwt.token", SLUG,
+                new GuestBookingRequest(serviceId, null, startsAt, "Олена", "Коваль", true, "2026-10-20")))
+                .isInstanceOf(BusinessException.class)
+                .extracting("status").isEqualTo(org.springframework.http.HttpStatus.CONFLICT);
+
+        verify(transactionManager).rollback(any());
+        verify(transactionManager, never()).commit(any());
+        verifyNoInteractions(guestTelegramLinkService);
+    }
+
+    @Test
+    @DisplayName("should still return the committed booking with telegram UNAVAILABLE when the link read throws")
+    void should_returnBookingWithUnavailableTelegram_when_linkReadThrows() {
+        OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
+        stubHappyPath(startsAt);
+        when(bookingRepository.saveAll(any())).thenAnswer(inv -> inv.getArgument(0));
+        var linkService = org.mockito.Mockito.mock(com.beautica.notification.telegram.link.TelegramLinkService.class);
+        when(linkService.statusForPhone(GUEST_PHONE))
+                .thenThrow(new org.springframework.dao.QueryTimeoutException("statement timeout"));
+        var realTelegram = new com.beautica.notification.telegram.link.GuestTelegramLinkService(
+                org.mockito.Mockito.mock(GuestCancelTokenResolver.class), linkService,
+                new com.beautica.config.TelegramProperties(true, com.beautica.config.TelegramMode.CAPTURE, "",
+                        "beautica_test_bot", "", "https://api.telegram.org", java.time.Duration.ofMinutes(30),
+                        List.of()),
+                com.github.benmanes.caffeine.cache.Caffeine.newBuilder()
+                        .build(key -> io.github.bucket4j.Bucket.builder()
+                                .addLimit(io.github.bucket4j.BandwidthBuilder.builder().capacity(3)
+                                        .refillIntervally(3, java.time.Duration.ofMinutes(10)).build())
+                                .build()),
+                transactionManager, java.time.Clock.systemUTC());
+        GuestBookingService withRealTelegram = new GuestBookingService(
+                guestTokenProvider, masterRepository, masterServiceRepository, bookingRepository,
+                appointmentRepository, slotCalculationService, outboxService, smsDispatcher(),
+                new BookingSmsProperties(), salonCatalogCacheEvictor,
+                new VisitPlanner(masterServiceRepository), FRONTEND,
+                java.time.Clock.fixed(OffsetDateTime.parse("2026-06-01T10:00:00Z").toInstant(), ZoneOffset.UTC),
+                inAppNotificationService, retiredBookingSlugGuard, salonGuestMasterResolver, guestTokenBookingCap,
+                bookingBlockGuard, realTelegram, transactionManager);
+
+        GuestBookingResponse response = withRealTelegram.createGuestBooking("Bearer guest.jwt.token", SLUG,
+                new GuestBookingRequest(serviceId, null, startsAt, "Олена", "Коваль", true, "2026-10-20"));
+
+        assertThat(response.cancelUrl()).startsWith(FRONTEND + "/book/cancel/");
+        assertThat(response.telegram())
+                .isEqualTo(com.beautica.notification.telegram.link.dto.TelegramAvailability.UNAVAILABLE);
+        verify(bookingRepository).saveAll(any());
+        verify(transactionManager).commit(any());
+        verify(transactionManager, never()).rollback(any());
     }
 
     @Test

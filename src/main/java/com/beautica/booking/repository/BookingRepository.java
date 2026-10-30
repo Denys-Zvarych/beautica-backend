@@ -1,5 +1,6 @@
 package com.beautica.booking.repository;
 
+import com.beautica.booking.dto.GuestCancelTokenTarget;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.enums.CancellationReason;
@@ -2279,6 +2280,37 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
               AND b.appointment IS NULL
             """)
     Optional<Booking> findByCancelTokenHashWithGraph(@Param("cancelTokenHash") String cancelTokenHash);
+
+    /**
+     * Phase 407 — scalar projection of a standalone guest booking by its cancel-token hash, for the guest Telegram
+     * link API: same partial-unique index and {@code appointment IS NULL} rule as {@link #findByCancelTokenHashWithGraph},
+     * without the master / service graph that API never reads.
+     */
+    @Query("""
+            SELECT new com.beautica.booking.dto.GuestCancelTokenTarget(
+                       b.id, b.bookingSource, b.status, b.guestPhone, b.startsAt)
+              FROM Booking b
+             WHERE b.cancelTokenHash = :cancelTokenHash
+               AND b.appointment IS NULL
+            """)
+    Optional<GuestCancelTokenTarget> findGuestTokenTargetByCancelTokenHash(
+            @Param("cancelTokenHash") String cancelTokenHash);
+
+    /**
+     * Phase 407 — the visit counterpart: the header's source / status / phone with its FIRST item's id and start, in
+     * one statement (header by the V206 partial-unique hash index, items by {@code idx_bookings_appointment}).
+     */
+    @Query("""
+            SELECT new com.beautica.booking.dto.GuestCancelTokenTarget(
+                       b.id, a.bookingSource, a.status, a.guestPhone, b.startsAt)
+              FROM Booking b
+              JOIN b.appointment a
+             WHERE a.cancelTokenHash = :cancelTokenHash
+             ORDER BY b.startsAt ASC, b.id ASC
+             LIMIT 1
+            """)
+    Optional<GuestCancelTokenTarget> findGuestVisitTokenTargetByCancelTokenHash(
+            @Param("cancelTokenHash") String cancelTokenHash);
 
     /**
      * Atomically consumes a cancel token: flips a still-{@code CONFIRMED} guest booking

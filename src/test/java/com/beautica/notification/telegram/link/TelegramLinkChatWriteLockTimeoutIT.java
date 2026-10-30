@@ -116,6 +116,18 @@ class TelegramLinkChatWriteLockTimeoutIT extends AbstractIntegrationTest {
     }
 
     @Test
+    @DisplayName("abort phone unlink and keep link when link row held (phase 407 audit)")
+    void should_abortPhoneUnlinkAndKeepLink_when_linkRowHeld() throws Exception {
+        List<Map<String, Object>> before = linkRows();
+
+        Throwable thrown = failureWhileHeld(() -> service.unlinkPhone(GUEST_PHONE));
+
+        assertLockTimeout(thrown);
+        assertThat(linkRows()).isEqualTo(before);
+        assertThat(service.unlinkPhone(GUEST_PHONE)).as("retry after release").isTrue();
+    }
+
+    @Test
     @DisplayName("abort mark blocked and keep active when link row held")
     void should_abortMarkBlockedAndKeepActive_when_linkRowHeld() throws Exception {
         List<Map<String, Object>> before = linkRows();
