@@ -61,11 +61,20 @@ import org.springframework.security.task.DelegatingSecurityContextTaskExecutor;
  * smsSendExecutor              20 s  request-path booking SMS (walk-in / guest confirmation + guest
  *                                    cancellation) AND, since phase 390, guest provider-cancellation SMS
  *                                    handed off by the outbox drain, whose row is ALREADY SENT. NOT
- *                                    recoverable for either; reported at ERROR with counts.
+ *                                    recoverable for either; reported at ERROR with counts. Phase 408: a
+ *                                    provider-cancellation task is now Telegram (gate wait <= 1 s + 2 s
+ *                                    connect + 4 s read) then, on failure, SMS (3 s + 5 s) = 15 s, and on
+ *                                    the 403 path also markBlocked (<= 3 s lock wait) = 18 s worst case,
+ *                                    so the 20 s grace covers ONE such in-flight task per worker; a queue
+ *                                    backlog is abandoned and counted, as before.
  * smsReminderDispatchExecutor  30 s  one hand-off task per hourly batch; cut = whole batch un-fanned-out.
  *                                    NOT recoverable (reminderSent already committed); reported at ERROR.
- * smsReminderExecutor          30 s  guest 24h reminder SMS. NOT recoverable (reminderSent already
- *                                    committed); reported at ERROR. ~6 s drains a full queue at healthy RTT.
+ * smsReminderExecutor          30 s  guest 24h / 2h (phase 413) reminders. NOT recoverable (reminderSent /
+ *                                    reminder_2h_sent already committed); reported at ERROR. ~6 s drains a
+ *                                    full queue at healthy RTT. Phase 408: a task is Telegram then SMS
+ *                                    fallback (+ markBlocked on a 403), 18 s worst case (see
+ *                                    smsSendExecutor), so the 30 s grace covers ONE worst-case in-flight
+ *                                    task per worker; the rest is counted as lost.
  * cacheEvictionExecutor        10 s  in-memory Caffeine scans; the cache dies with the JVM -> irrelevant.
  * blobPurgeExecutor            20 s  after-commit R2 deletes of already-dereferenced blobs + the phase-417
  *                                    Cloudflare edge purge; cut = accepted orphan blob / edge copy (never a
@@ -644,7 +653,8 @@ public class AsyncConfig implements AsyncConfigurer {
             }
             log.error("{} executor={} queuedTasksAbandoned={} inFlightTasksKilled={} graceSeconds={} — "
                             + "queued tasks are already committed as reminderSent and no later sweep "
-                            + "re-selects them; in-flight tasks were cut mid-request, delivery unknown",
+                            + "re-selects them; in-flight tasks were cut mid-request, delivery unknown "
+                            + "(phase 408: counts include routed reminders, Telegram attempt + SMS fallback)",
                     LOSS_EVENT, beanName, queuedTasksAbandoned, inFlightTasksKilled, graceSeconds);
         }
     }
@@ -691,7 +701,8 @@ public class AsyncConfig implements AsyncConfigurer {
                 return;
             }
             log.error("{} executor=smsSendExecutor queuedTasksAbandoned={} inFlightTasksKilled={} graceSeconds={} "
-                            + "— queued booking SMS will never be sent; in-flight sends were cut, delivery unknown",
+                            + "— queued booking SMS will never be sent; in-flight sends were cut, delivery unknown "
+                            + "(phase 408: counts include routed provider cancellations, Telegram + SMS fallback)",
                     LOSS_EVENT, queuedTasksAbandoned, inFlightTasksKilled, graceSeconds);
         }
     }

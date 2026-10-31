@@ -879,7 +879,7 @@ class BookingRepositoryTest extends AbstractDataJpaTest {
         OffsetDateTime from = OffsetDateTime.of(2026, 6, 2, 0, 0, 0, 0, ZoneOffset.UTC);
         OffsetDateTime to = OffsetDateTime.of(2026, 6, 3, 0, 0, 0, 0, ZoneOffset.UTC);
 
-        List<Booking> result = bookingRepository.findGuestBookingsForReminder(from, to);
+        List<Booking> result = bookingRepository.findGuestBookingsForReminder(from, to, false);
 
         assertThat(result)
                 .as("only the not-yet-reminded due booking is returned; the reminderSent=true "

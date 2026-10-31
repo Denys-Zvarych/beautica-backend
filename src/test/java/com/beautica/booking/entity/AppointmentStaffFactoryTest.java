@@ -45,6 +45,20 @@ class AppointmentStaffFactoryTest {
     }
 
     @Test
+    @DisplayName("phase 412 — should keep the raw token in memory and persist only its hash when a cancel token is given")
+    void should_hashCancelToken_when_staffHeaderBuiltWithToken() {
+        UUID token = UUID.fromString("22222222-2222-2222-2222-222222222222");
+
+        Appointment appointment = Appointment.staffAppointment(
+                null, "Олена", "Коваль", "+380501234567", token, STAFF_ID);
+
+        assertThat(appointment.getCancelToken()).isEqualTo(token);
+        assertThat(appointment.getCancelTokenHash())
+                .isEqualTo(com.beautica.booking.domain.CancelTokenHasher.hash(token));
+        assertThat(appointment.getBookingSource()).isEqualTo(BookingSource.STAFF);
+    }
+
+    @Test
     @DisplayName("should throw BusinessException(BAD_REQUEST) when guestName is blank")
     void should_throwBusinessExceptionBadRequest_when_guestNameBlank() {
         assertThatThrownBy(() -> Appointment.staffAppointment(

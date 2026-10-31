@@ -1,5 +1,6 @@
 package com.beautica.booking.service;
 
+import com.beautica.notification.channel.GuestMessageRouters;
 import com.beautica.TestConstants;
 import com.beautica.auth.Role;
 import com.beautica.booking.dto.AppointmentDetailResponse;
@@ -82,6 +83,8 @@ import static org.mockito.Mockito.when;
 class StaffBookingServiceTest {
 
     private static final Instant NOW = Instant.parse("2026-06-01T10:00:00Z");
+    /** Low-entropy fake origin for the walk-in cancel link (phase 412). */
+    private static final String CANCEL_BASE_URL = "https://beautica.test";
     private static final OffsetDateTime START = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
     private static final String RAW_PHONE = "050 123 45 67";
     private static final String E164_PHONE = "+380501234567";
@@ -130,7 +133,7 @@ class StaffBookingServiceTest {
      * profile, so ordering is deterministic here for the same reason it is there.
      */
     private BookingSmsDispatcher bookingSmsDispatcher() {
-        return new BookingSmsDispatcher(smsService, new SyncTaskExecutor());
+        return new BookingSmsDispatcher(smsService, GuestMessageRouters.smsOnly(smsService), new SyncTaskExecutor());
     }
 
     private final UUID masterId = UUID.randomUUID();
@@ -148,7 +151,8 @@ class StaffBookingServiceTest {
                 masterRepository, bookingRepository, appointmentRepository, slotCalculationService,
                 salonCatalogCacheEvictor, new VisitPlanner(masterServiceRepository),
                 bookingSmsDispatcher(), new BookingSmsProperties(),
-                Clock.fixed(NOW, ZoneOffset.UTC), appointmentService, inAppNotificationService);
+                Clock.fixed(NOW, ZoneOffset.UTC), appointmentService, inAppNotificationService,
+                new GuestCancelUrlBuilder(CANCEL_BASE_URL));
         // Lenient: rejection-path tests never reach the enrich() call, and MockitoExtension's
         // default STRICT_STUBS would otherwise flag this as an unnecessary stub for every one of
         // them. The return value is a placeholder — no test in this suite asserts on its content;
@@ -796,19 +800,25 @@ class StaffBookingServiceTest {
                     .contains("12:00");
         }
 
+        /**
+         * Phase 412 D1/D3 (reverses 254 D) — the SMS carries the visit's one-time cancel link, and the
+         * token in it is the one whose HASH the header persists (no plaintext at rest, 394).
+         */
         @Test
-        @DisplayName("should_omitAnyCancelLink_when_sending")
-        void should_omitAnyCancelLink_when_sending() {
+        @DisplayName("walk-in SMS carries the visit cancel link whose token hash the header stores; items stay tokenless")
+        void should_carryTheVisitCancelLink_when_sending() {
             stubHappyPath(salonMaster(), assignment(null, null));
 
             create(command(guest(RAW_PHONE)));
 
-            // A STAFF booking has cancel_token = NULL (V137), so there is nothing to link to. Both
-            // an actual URL and an unsubstituted placeholder would be defects a client would see.
-            assertThat(captureSmsText())
-                    .doesNotContain("http")
-                    .doesNotContain("{cancelUrl}")
-                    .doesNotContain("Скасувати: ");
+            String text = captureSmsText();
+            assertThat(text).doesNotContain("{cancelUrl}").contains("Скасувати: " + CANCEL_BASE_URL + "/book/cancel/");
+            UUID token = UUID.fromString(text.substring(text.lastIndexOf('/') + 1));
+            ArgumentCaptor<Appointment> header = ArgumentCaptor.forClass(Appointment.class);
+            verify(appointmentRepository).save(header.capture());
+            assertThat(header.getValue().getCancelTokenHash())
+                    .isEqualTo(com.beautica.booking.domain.CancelTokenHasher.hash(token));
+            assertThat(captureSaved().getCancelTokenHash()).as("child rows stay tokenless").isNull();
         }
 
         @Test
@@ -828,7 +838,7 @@ class StaffBookingServiceTest {
         }
 
         @Test
-        @DisplayName("should_callTheSeamRegardless_when_theFeatureFlagIsOff")
+        @DisplayName("walk-in SMS is still handed to the sender seam when the SMS flag is off (the bean suppresses it)")
         void should_callTheSeamRegardless_when_theFeatureFlagIsOff() {
             BookingSmsProperties properties = new BookingSmsProperties();
             properties.getSms().setEnabled(false);
@@ -836,7 +846,7 @@ class StaffBookingServiceTest {
                     masterRepository, bookingRepository, appointmentRepository, slotCalculationService,
                     salonCatalogCacheEvictor, new VisitPlanner(masterServiceRepository),
                     bookingSmsDispatcher(), properties, Clock.fixed(NOW, ZoneOffset.UTC), appointmentService,
-                    inAppNotificationService);
+                    inAppNotificationService, new GuestCancelUrlBuilder(CANCEL_BASE_URL));
             stubHappyPath(salonMaster(), assignment(null, null));
 
             create(command(guest(RAW_PHONE)));
@@ -855,7 +865,7 @@ class StaffBookingServiceTest {
          * misplaced space, a changed line break) shows up here even if every fragment still matches.
          */
         @Test
-        @DisplayName("should_renderByteIdenticalBody_when_singleService")
+        @DisplayName("single-service walk-in SMS renders the exact expected body, ending in the cancel link")
         void should_renderByteIdenticalBody_when_singleService() {
             stubHappyPath(salonMaster(), assignment(null, null));
 
@@ -865,7 +875,8 @@ class StaffBookingServiceTest {
                     "Beautica: Запис підтверджено!\n"
                             + "Марія Левченко, Манікюр\n"
                             + "10.06.2026 о 12:00\n\n"
-                            + "Скасувати — за телефоном майстра.");
+                            + "Скасувати: " + CANCEL_BASE_URL + "/book/cancel/"
+                            + header().getCancelToken());
         }
 
         /**
@@ -891,6 +902,19 @@ class StaffBookingServiceTest {
                     .contains("12:00");
         }
 
+        @Test
+        @DisplayName("three-service walk-in gets one cancel token on the header only, and the SMS links to it")
+        void should_issueOneVisitTokenOnTheHeaderOnly_when_threeServiceVisitCreated() {
+            stubThreeServiceVisit();
+
+            create(threeServiceCommand());
+
+            assertThat(header().getCancelTokenHash()).as("ONE token per visit, on the header (412 D1)").isNotNull();
+            assertThat(captureSavedBookings()).hasSize(3)
+                    .allSatisfy(item -> assertThat(item.getCancelTokenHash()).isNull());
+            assertThat(captureSmsText()).endsWith("/book/cancel/" + header().getCancelToken());
+        }
+
         /**
          * The budget query is consulted ONCE per visit, never once per chained service — a per-item
          * call would be exactly the row-vs-visit confusion
@@ -912,6 +936,12 @@ class StaffBookingServiceTest {
         private String captureSmsText() {
             ArgumentCaptor<String> captor = ArgumentCaptor.forClass(String.class);
             verify(smsService).send(eq(E164_PHONE), captor.capture());
+            return captor.getValue();
+        }
+
+        private Appointment header() {
+            ArgumentCaptor<Appointment> captor = ArgumentCaptor.forClass(Appointment.class);
+            verify(appointmentRepository).save(captor.capture());
             return captor.getValue();
         }
     }

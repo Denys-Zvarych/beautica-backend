@@ -1,6 +1,7 @@
 package com.beautica.booking.event;
 
 import java.util.List;
+import java.util.Objects;
 
 /**
  * Carries the guest 24h reminder SMS messages that {@code BookingReminderJob} committed to sending,
@@ -32,16 +33,25 @@ import java.util.List;
  * @param reminders one entry per reminder to deliver — one per legacy single guest booking, and
  *                  exactly one per multi-service guest visit (BE-7 dedup happens in the job)
  */
-public record GuestRemindersDueEvent(List<GuestReminderSms> reminders) {
+public record GuestRemindersDueEvent(ReminderType type, List<GuestReminderSms> reminders) {
+
+    /** Phase 413 D1 — which sweep produced the batch; picks the router kind (408) and nothing else. */
+    public enum ReminderType { H24, H2 }
 
     public GuestRemindersDueEvent {
+        type = Objects.requireNonNull(type, "type");
         reminders = List.copyOf(reminders);
     }
 
-    /** Size only — never the recipients. See the PII note on the type. */
+    /** The pre-413 shape: a 24h reminder batch. */
+    public GuestRemindersDueEvent(List<GuestReminderSms> reminders) {
+        this(ReminderType.H24, reminders);
+    }
+
+    /** Type and size only — never the recipients. See the PII note on the type. */
     @Override
     public String toString() {
-        return "GuestRemindersDueEvent[reminders=" + reminders.size() + " redacted]";
+        return "GuestRemindersDueEvent[type=" + type + ", reminders=" + reminders.size() + " redacted]";
     }
 
     /**

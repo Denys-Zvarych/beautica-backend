@@ -1,5 +1,7 @@
 package com.beautica.booking.dto;
 
+import com.beautica.notification.telegram.link.dto.TelegramAvailability;
+
 import java.time.OffsetDateTime;
 import java.util.UUID;
 
@@ -16,6 +18,9 @@ import java.util.UUID;
  * first chained item, {@code serviceName} the first service, and {@code durationMinutes} the summed
  * service duration. The visit-level cancel token (which cancels ALL items) is embedded in
  * {@code cancelUrl} — the token itself is never returned as a bare field.
+ *
+ * <p><b>Phase 407 D6 (additive).</b> {@code telegram} = {@code {available, linked}} for the booker's OTP-verified
+ * phone, once per response (a salon multi-master checkout is one call per master). An older site ignores it.
  */
 public record GuestBookingResponse(
         UUID bookingId,
@@ -24,8 +29,16 @@ public record GuestBookingResponse(
         String masterName,
         String serviceName,
         int durationMinutes,
-        String cancelUrl
+        String cancelUrl,
+        TelegramAvailability telegram
 ) {
+
+    /** Pre-407 7-arg shape ({@code telegram} {@code null}) — kept for existing call-sites; see {@link #withTelegram}. */
+    public GuestBookingResponse(
+            UUID bookingId, UUID appointmentId, OffsetDateTime startsAt, String masterName,
+            String serviceName, int durationMinutes, String cancelUrl) {
+        this(bookingId, appointmentId, startsAt, masterName, serviceName, durationMinutes, cancelUrl, null);
+    }
 
     /**
      * Legacy 6-arg factory for a single-service guest booking (no appointment) — preserves the
@@ -34,6 +47,12 @@ public record GuestBookingResponse(
     public GuestBookingResponse(
             UUID bookingId, OffsetDateTime startsAt, String masterName,
             String serviceName, int durationMinutes, String cancelUrl) {
-        this(bookingId, null, startsAt, masterName, serviceName, durationMinutes, cancelUrl);
+        this(bookingId, null, startsAt, masterName, serviceName, durationMinutes, cancelUrl, null);
+    }
+
+    /** Phase 407 D6 — the same response with its {@code telegram} block set. */
+    public GuestBookingResponse withTelegram(TelegramAvailability availability) {
+        return new GuestBookingResponse(bookingId, appointmentId, startsAt, masterName, serviceName, durationMinutes,
+                cancelUrl, availability);
     }
 }

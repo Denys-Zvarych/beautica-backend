@@ -111,13 +111,13 @@ class GuestReminderSweepPersistenceIT extends AbstractIntegrationTest {
         seedGuestBookingDueForReminder();
         OffsetDateTime now = OffsetDateTime.now(clock);
 
-        assertThat(bookingRepository.findGuestBookingsForReminder(now.plusHours(23), now.plusHours(25)))
+        assertThat(bookingRepository.findGuestBookingsForReminder(now.plusHours(23), now.plusHours(25), false))
                 .as("fixture sanity: the seeded booking must be due, or the assertion below is vacuous")
                 .hasSize(1);
 
         bookingReminderJob.sendReminders();
 
-        assertThat(bookingRepository.findGuestBookingsForReminder(now.plusHours(23), now.plusHours(25)))
+        assertThat(bookingRepository.findGuestBookingsForReminder(now.plusHours(23), now.plusHours(25), false))
                 .as("the sweep re-selects an already-reminded booking — every hourly tick would send the "
                         + "guest the same reminder again")
                 .isEmpty();

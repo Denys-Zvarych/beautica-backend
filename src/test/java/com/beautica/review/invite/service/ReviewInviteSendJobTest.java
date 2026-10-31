@@ -1,5 +1,6 @@
 package com.beautica.review.invite.service;
 
+import com.beautica.notification.channel.GuestMessageRouters;
 import com.beautica.notification.sms.SmsDeliveryAmbiguousException;
 import com.beautica.notification.sms.SmsDeliveryException;
 import com.beautica.notification.sms.SmsService;
@@ -44,7 +45,7 @@ class ReviewInviteSendJobTest {
     @BeforeEach
     void setUp() {
         job = new ReviewInviteSendJob(sendService, new QuietHoursCalculator(ReviewInviteTestProperties.enabled()),
-                smsService, ReviewInviteTestProperties.enabled(), Clock.fixed(MIDDAY, ZoneOffset.UTC));
+                GuestMessageRouters.smsOnly(smsService), ReviewInviteTestProperties.enabled(), Clock.fixed(MIDDAY, ZoneOffset.UTC));
     }
 
     @Test
@@ -122,7 +123,7 @@ class ReviewInviteSendJobTest {
         Duration budget = ReviewInviteTestProperties.enabled().sendBudget();
         // tick start, before send #1 (in budget), before send #2 (budget spent)
         ReviewInviteSendJob budgeted = new ReviewInviteSendJob(sendService,
-                new QuietHoursCalculator(ReviewInviteTestProperties.enabled()), smsService,
+                new QuietHoursCalculator(ReviewInviteTestProperties.enabled()), GuestMessageRouters.smsOnly(smsService),
                 ReviewInviteTestProperties.enabled(),
                 new SequenceClock(MIDDAY, MIDDAY.plusSeconds(1), MIDDAY.plus(budget)));
         when(sendService.claimAndPrepare(MIDDAY)).thenReturn(List.of(first, second, third));

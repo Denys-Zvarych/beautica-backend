@@ -11,6 +11,7 @@ import io.github.bucket4j.Bucket;
 import jakarta.annotation.PostConstruct;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Conditional;
 import org.springframework.context.annotation.Configuration;
 
 import java.time.Duration;
@@ -24,6 +25,9 @@ public class RateLimitConfig {
     private static final long DEFAULT_BUCKET_CACHE_SIZE = 100_000;
     private static final long VERIFY_EMAIL_BUCKET_CACHE_SIZE = 50_000;
     private static final long RESEND_VERIFICATION_BUCKET_CACHE_SIZE = 10_000;
+    // Phase 406 perf audit: only callers that FAIL the webhook secret land here (guessers / scanners), never
+    // Telegram itself, so a small dedicated cap bounds the memory an IP-rotating flood can pin.
+    private static final long TELEGRAM_WEBHOOK_REJECT_BUCKET_CACHE_SIZE = 10_000;
 
     private static final Duration STANDARD_EVICTION = Duration.ofHours(1);
     private static final Duration ONE_MINUTE = Duration.ofMinutes(1);
@@ -566,6 +570,41 @@ public class RateLimitConfig {
     private long supportContactCapacity;
 
     private static final Duration SUPPORT_CONTACT_WINDOW = Duration.ofMinutes(60);
+
+    // Phase 406 D4 — per-IP cap on POST /api/v1/telegram/webhook calls that FAIL the secret check (60-second
+    // window). Charged by TelegramWebhookSecretVerifier only on a rejected call, so genuine Telegram traffic (which
+    // carries the secret) is never throttled; past the cap a guesser gets 429 instead of 401.
+    @Value("${app.rate-limit.telegram-webhook-capacity:60}")
+    private long telegramWebhookCapacity;
+
+    // Phase 407 D5 — the guest Telegram link API (POST /api/v1/book/telegram/{link-token,status,unlink}), permitAll and
+    // keyed by the booking's cancel token. link-token: 5 / 10 min per IP (telegramLinkIssueBuckets, AuthRateLimitFilter)
+    // PLUS 3 / 10 min per cancel-token hash (telegramLinkTokenBuckets, GuestTelegramLinkService — the token is in the
+    // body, which the filter does not read); each issue writes a token row under a per-phone advisory lock.
+    // status + unlink share 30 / 10 min per IP (telegramLinkReadBuckets): one read per page open / tab return.
+    /** Production default of {@code app.rate-limit.telegram-link-capacity}; also AuthRateLimitFilter's test default. */
+    public static final long TELEGRAM_LINK_DEFAULT_CAPACITY = 5;
+    /** Production default of {@code app.rate-limit.telegram-link-token-capacity}. */
+    public static final long TELEGRAM_LINK_TOKEN_DEFAULT_CAPACITY = 3;
+    /** Production default of {@code app.rate-limit.telegram-link-read-capacity}; also AuthRateLimitFilter's. */
+    public static final long TELEGRAM_LINK_READ_DEFAULT_CAPACITY = 30;
+    // Per-token keys are 64-char hashes of one-off cancel tokens: few live at once, so a small cap bounds the memory a
+    // flood of random tokens can pin (phase 407 perf audit; same reasoning as the webhook reject cache).
+    private static final long TELEGRAM_LINK_TOKEN_BUCKET_CACHE_SIZE = 10_000;
+    /** Entry cap of the two per-IP telegram-link caches; shared with AuthRateLimitFilter's test-constructor defaults. */
+    public static final long TELEGRAM_LINK_IP_BUCKET_CACHE_SIZE = DEFAULT_BUCKET_CACHE_SIZE;
+
+    @Value("${app.rate-limit.telegram-link-capacity:" + TELEGRAM_LINK_DEFAULT_CAPACITY + "}")
+    private long telegramLinkCapacity;
+
+    @Value("${app.rate-limit.telegram-link-token-capacity:" + TELEGRAM_LINK_TOKEN_DEFAULT_CAPACITY + "}")
+    private long telegramLinkTokenCapacity;
+
+    @Value("${app.rate-limit.telegram-link-read-capacity:" + TELEGRAM_LINK_READ_DEFAULT_CAPACITY + "}")
+    private long telegramLinkReadCapacity;
+
+    /** Window of every phase 407 bucket; {@code GuestTelegramLinkService} derives its Retry-After fallback from it. */
+    public static final Duration TELEGRAM_LINK_WINDOW = Duration.ofMinutes(10);
 
     // Per-IP cap for POST /api/v1/book/otp/send (15-minute window). Every successful
     // request dispatches an SMS via Turbosms — a billable, outbound-quota / SMS-bomb
@@ -1234,6 +1273,55 @@ public class RateLimitConfig {
                 SUPPORT_CONTACT_WINDOW.plus(EVICTION_GRACE),
                 supportContactCapacity,
                 SUPPORT_CONTACT_WINDOW);
+    }
+
+    /**
+     * Phase 406 D4 — per-IP bucket for rejected Telegram webhook calls (bad / missing secret), consumed by
+     * {@code TelegramWebhookSecretVerifier}, not by a filter: only the verifier knows whether the secret matched, and
+     * a filter-level bucket would also count Telegram's own authenticated deliveries. Built only while the channel
+     * is on ({@link TelegramEnabledCondition}); its sole consumer, the verifier, has the same condition.
+     */
+    @Bean
+    @Conditional(TelegramEnabledCondition.class)
+    public LoadingCache<String, Bucket> telegramWebhookRejectBuckets() {
+        return bucketCache(
+                TELEGRAM_WEBHOOK_REJECT_BUCKET_CACHE_SIZE,
+                ONE_MINUTE.plus(EVICTION_GRACE),
+                telegramWebhookCapacity,
+                ONE_MINUTE);
+    }
+
+    /** Phase 407 D5 — per-IP bucket for {@code POST /api/v1/book/telegram/link-token} (AuthRateLimitFilter). */
+    @Bean
+    public LoadingCache<String, Bucket> telegramLinkIssueBuckets() {
+        return bucketCache(
+                TELEGRAM_LINK_IP_BUCKET_CACHE_SIZE,
+                TELEGRAM_LINK_WINDOW.plus(EVICTION_GRACE),
+                telegramLinkCapacity,
+                TELEGRAM_LINK_WINDOW);
+    }
+
+    /**
+     * Phase 407 D5 — per-cancel-token-hash bucket for {@code POST /api/v1/book/telegram/link-token}, consumed by
+     * {@code GuestTelegramLinkService} (the token travels in the body). Keyed on the SHA-256 hex, never the raw token.
+     */
+    @Bean
+    public LoadingCache<String, Bucket> telegramLinkTokenBuckets() {
+        return bucketCache(
+                TELEGRAM_LINK_TOKEN_BUCKET_CACHE_SIZE,
+                TELEGRAM_LINK_WINDOW.plus(EVICTION_GRACE),
+                telegramLinkTokenCapacity,
+                TELEGRAM_LINK_WINDOW);
+    }
+
+    /** Phase 407 D5 — per-IP bucket shared by {@code POST /api/v1/book/telegram/status} and {@code /unlink}. */
+    @Bean
+    public LoadingCache<String, Bucket> telegramLinkReadBuckets() {
+        return bucketCache(
+                TELEGRAM_LINK_IP_BUCKET_CACHE_SIZE,
+                TELEGRAM_LINK_WINDOW.plus(EVICTION_GRACE),
+                telegramLinkReadCapacity,
+                TELEGRAM_LINK_WINDOW);
     }
 
     /**

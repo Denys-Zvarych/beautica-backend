@@ -294,7 +294,7 @@ class NotificationOutboxDrainWorkerTest {
         when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(booking));
         // What BookingSmsDispatcher#dispatchOrThrow propagates through NotificationService.
         doThrow(new com.beautica.notification.sms.SmsBackpressureException("smsSendExecutor saturated"))
-                .when(notificationService).notifyBookingStatusChanged(BookingVisit.single(booking));
+                .when(notificationService).notifyBookingStatusChanged(eq(BookingVisit.single(booking)), any());
 
         worker.drain();
 
@@ -323,7 +323,7 @@ class NotificationOutboxDrainWorkerTest {
         when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(declined, closed));
         when(cipher.open("v1:STUB")).thenReturn("https://app.beautica.ua/invite/accept?token=ABC");
         doThrow(new com.beautica.notification.sms.SmsBackpressureException("smsSendExecutor saturated"))
-                .when(notificationService).notifyBookingStatusChanged(BookingVisit.single(declined));
+                .when(notificationService).notifyBookingStatusChanged(eq(BookingVisit.single(declined)), any());
         when(notificationService.routesToLinkGuestSms(OutboxEventType.SALON_CLOSED, closed)).thenReturn(true);
 
         w.drain();
@@ -335,7 +335,7 @@ class NotificationOutboxDrainWorkerTest {
         assertThat(email1.getStatus()).isEqualTo(OutboxStatus.SENT);
         assertThat(email2.getStatus()).isEqualTo(OutboxStatus.SENT);
         verify(notificationService, times(2)).sendInviteEmail(any(), any(), any());
-        verify(notificationService, never()).notifySalonClosed(any());
+        verify(notificationService, never()).notifySalonClosed(any(), any());
     }
 
     @Test
@@ -354,14 +354,14 @@ class NotificationOutboxDrainWorkerTest {
         when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(declinedSms, clientRow));
         when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(declined, clientBooking));
         doThrow(new com.beautica.notification.sms.SmsBackpressureException("smsSendExecutor saturated"))
-                .when(notificationService).notifyBookingStatusChanged(BookingVisit.single(declined));
+                .when(notificationService).notifyBookingStatusChanged(eq(BookingVisit.single(declined)), any());
         when(notificationService.routesToLinkGuestSms(OutboxEventType.MASTER_REMOVED, clientBooking)).thenReturn(false);
 
         worker.drain();
 
         assertThat(declinedSms.getStatus()).isEqualTo(OutboxStatus.PENDING);
         assertThat(clientRow.getStatus()).isEqualTo(OutboxStatus.SENT);
-        verify(notificationService).notifyMasterRemoved(BookingVisit.single(clientBooking));
+        verify(notificationService).notifyMasterRemoved(eq(BookingVisit.single(clientBooking)), any());
     }
 
     @Test
@@ -386,7 +386,7 @@ class NotificationOutboxDrainWorkerTest {
         when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(declined, closed));
         when(cipher.open("v1:STUB")).thenReturn("https://app.beautica.ua/invite/accept?token=ABC");
         doThrow(new com.beautica.notification.sms.SmsBackpressureException("smsSendExecutor saturated"))
-                .when(notificationService).notifyBookingStatusChanged(BookingVisit.single(declined));
+                .when(notificationService).notifyBookingStatusChanged(eq(BookingVisit.single(declined)), any());
         when(notificationService.routesToLinkGuestSms(OutboxEventType.SALON_CLOSED, closed)).thenReturn(true);
 
         // Act
@@ -600,6 +600,7 @@ class NotificationOutboxDrainWorkerTest {
     void should_callNotifyStatusChanged_when_statusChangedEntryProcessed() {
         UUID bookingId = UUID.randomUUID();
         NotificationOutboxEntry outboxEntry = entry(OutboxEventType.STATUS_CHANGED, 0, null, bookingId);
+        org.springframework.test.util.ReflectionTestUtils.setField(outboxEntry, "id", UUID.randomUUID());
         Booking booking = mock(Booking.class);
 
         when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
@@ -608,7 +609,9 @@ class NotificationOutboxDrainWorkerTest {
 
         worker.drain();
 
-        verify(notificationService, times(1)).notifyBookingStatusChanged(BookingVisit.single(booking));
+        // Phase 408 audit-fix cycle 2: the entry id is threaded through (walk-in budget retry idempotency).
+        verify(notificationService, times(1)).notifyBookingStatusChanged(
+                eq(BookingVisit.single(booking)), eq(outboxEntry.getId()));
         assertThat(outboxEntry.getStatus()).isEqualTo(OutboxStatus.SENT);
     }
 
@@ -799,7 +802,7 @@ class NotificationOutboxDrainWorkerTest {
         when(booking3.getId()).thenReturn(bookingId3);
         when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(booking1, booking2, booking3));
         doThrow(new RuntimeException("status change failed"))
-                .when(notificationService).notifyBookingStatusChanged(BookingVisit.single(booking3));
+                .when(notificationService).notifyBookingStatusChanged(eq(BookingVisit.single(booking3)), any());
 
         worker.drain();
 
@@ -906,6 +909,7 @@ class NotificationOutboxDrainWorkerTest {
     void should_callNotifySalonClosed_when_salonClosedEntryProcessed() {
         UUID bookingId = UUID.randomUUID();
         NotificationOutboxEntry outboxEntry = entry(OutboxEventType.SALON_CLOSED, 0, null, bookingId);
+        org.springframework.test.util.ReflectionTestUtils.setField(outboxEntry, "id", UUID.randomUUID());
         Booking booking = mock(Booking.class);
 
         when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
@@ -916,7 +920,7 @@ class NotificationOutboxDrainWorkerTest {
 
         // SALON_CLOSED is visit-aware (VISIT_AWARE_EVENTS) so it must route through the resolved
         // BookingVisit, exactly like NEW_BOOKING/STATUS_CHANGED — not a bare Booking.
-        verify(notificationService, times(1)).notifySalonClosed(BookingVisit.single(booking));
+        verify(notificationService, times(1)).notifySalonClosed(eq(BookingVisit.single(booking)), eq(outboxEntry.getId()));
         assertThat(outboxEntry.getStatus()).isEqualTo(OutboxStatus.SENT);
     }
 
@@ -943,7 +947,7 @@ class NotificationOutboxDrainWorkerTest {
 
         // MASTER_REMOVED is visit-aware (VISIT_AWARE_EVENTS), exactly like SALON_CLOSED — must
         // route through the resolved BookingVisit, not a bare Booking.
-        verify(notificationService, times(1)).notifyMasterRemoved(BookingVisit.single(booking));
+        verify(notificationService, times(1)).notifyMasterRemoved(eq(BookingVisit.single(booking)), any());
         assertThat(outboxEntry.getStatus()).isEqualTo(OutboxStatus.SENT);
     }
 
@@ -975,7 +979,7 @@ class NotificationOutboxDrainWorkerTest {
         worker.drain();
 
         verify(notificationService, never()).notifyNewBooking(any());
-        verify(notificationService, never()).notifyBookingStatusChanged(any());
+        verify(notificationService, never()).notifyBookingStatusChanged(any(), any());
         verify(notificationService, never()).sendInviteEmail(any(), any(), any());
     }
 
@@ -1204,7 +1208,7 @@ class NotificationOutboxDrainWorkerTest {
 
         assertThat(row.getStatus()).isEqualTo(OutboxStatus.SENT);
         verify(notificationService).notifyMasterOfProviderDecline(BookingVisit.single(booking), actor);
-        verify(notificationService, never()).notifyBookingStatusChanged(any());
+        verify(notificationService, never()).notifyBookingStatusChanged(any(), any());
     }
 
     @Test

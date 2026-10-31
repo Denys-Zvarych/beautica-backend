@@ -358,6 +358,13 @@ app:
     # appointment during which a guest may still cancel via the cancel link.
     # A cancel request inside this window returns 422.
     cancel-window-hours: ${BOOKING_CANCEL_WINDOW_HOURS:2}
+    # Phase 413 — 2h-before guest reminder (BookingReminderJob#sweepTwoHour, every 15 min, window [now+1h45, now+2h15)).
+    # Never sent 21:00-09:00 Kyiv (skipped, not deferred); skipped when the booking was made < min-lead before its
+    # start. Goes to Telegram when the guest's phone is linked (phase 408), else SMS. Text: BookingSmsProperties
+    # .Sms#reminder2h (Java default only, no yml copy).
+    reminder-2h:
+      enabled: ${APP_BOOKING_REMINDER_2H_ENABLED:false}
+      min-lead: ${APP_BOOKING_REMINDER_2H_MIN_LEAD:3h}
     sms:
       # Phase 22.7 — THE single "are we spending SMS money" switch. Read by SmsConfig, which uses
       # it to choose the SmsService bean itself (NoOpSmsService when false, TurbosmsService when
@@ -404,18 +411,17 @@ app:
       # key here either, on the walk-in precedent below: its single source is
       # BookingSmsProperties.Sms#reschedule. Override with APP_BOOKING_SMS_RESCHEDULE (relaxed binding);
       # GuestRescheduleSmsText fails boot unless it keeps {date} and {time} and fits 2 UCS-2 segments.
-      # Phase 22.7 — the walk-in confirmation (POST /api/v1/masters/{masterId}/bookings) is the ONE
-      # template with no key here, deliberately (QA MEDIUM, 2026-08-18). Its text lives in exactly
-      # one place: BookingSmsProperties.Sms#walkInConfirmation. A yml copy identical to that default
-      # used to sit here, which made the Java literal dead code — two sources of truth for one
-      # user-visible string, and mutating the Java one changed nothing in any profile.
-      #
-      # Do NOT re-add `walk-in-confirmation:` merely to make the copy visible from config; that
-      # silently kills the Java default again. Add it only to genuinely OVERRIDE the text, and note
-      # in the same commit that BookingSmsProperties' default is then no longer the live value.
-      # Constraint that travels with the copy wherever it lives: it must carry NO {cancelUrl} — a
-      # STAFF booking has cancel_token = NULL by the V137 CHECK, so there is no link to build and
-      # the placeholder would render literally in a real client's message.
+      # Phase 22.7 / 412 — the walk-in confirmation (POST /api/v1/masters/{masterId}/bookings). Phase 412 D3
+      # restored this key (it had been removed in 22.7 as a duplicate of the Java default): it is now the LIVE
+      # value, and BookingSmsProperties.Sms#walkInConfirmation is the identical fallback — change both together.
+      # Reversed by 412: it now carries {cancelUrl} — the walk-in visit header holds a one-time cancel token
+      # (V226) and StaffBookingService always maps cancelUrl to /book/cancel/{token}. 3 UCS-2 segments typical.
+      walk-in-confirmation: |-
+        Beautica: Запис підтверджено!
+        {masterName}, {serviceName}
+        {date} о {time}
+
+        Скасувати: {cancelUrl}
     # Phase 400 — guest review invite SMS (beautica.app/r/{token}) ~2h after a LINK visit is COMPLETED, never
     # 21:00-09:00 Kyiv (moved to 10:00), one per visit. Bound by ReviewInviteProperties (validated at boot). Needs BOTH
     # this flag and app.booking.sms.enabled; in staging (beautica.sms.mode=capture) the SMS lands in Mailpit.
@@ -490,6 +496,23 @@ app:
       base-url: ${TURBOSMS_BASE_URL:https://api.turbosms.ua/message/send.json}
       connect-timeout: 3s
       read-timeout: 5s
+  telegram:
+    # Phase 404 — opt-in Telegram reminder channel (TelegramConfig). OFF by default: NoOpTelegramMessenger
+    # throws, so every message falls back to SMS. Write the flag as true/false (no relaxed binding).
+    # mode: live (Bot API) | capture (Mailpit). Staging runs its OWN bot (phase 432): EnvironmentFingerprintGuard
+    # refuses the prod bot's token/username there, and TelegramEnvGuard requires a non-empty tester allow-list when
+    # enabled + live. enabled=true + live fails boot unless token, username and webhook secret are all set
+    # (TelegramProperties). The token is a secret and is never logged.
+    enabled: ${APP_TELEGRAM_ENABLED:false}
+    mode: live
+    bot-token: ${TELEGRAM_BOT_TOKEN:}
+    bot-username: ${TELEGRAM_BOT_USERNAME:}
+    webhook-secret: ${TELEGRAM_WEBHOOK_SECRET:}
+    api-base-url: https://api.telegram.org
+    link-token-ttl: 30m
+    # Phase 432 D3 — staging-only tester allow-list: comma-separated positive chat ids (private chat id = user id).
+    # Blank entries, negatives and non-numbers fail boot. Read on staging only; prod ignores it.
+    staging-allowed-chat-ids: ${TELEGRAM_STAGING_ALLOWED_CHAT_IDS:}
   json:
     # Global Jackson StreamReadConstraints (see JsonConfig / JsonConstraintsProperties).
     # max-string-length caps a single JSON string token at the PARSE phase so a multi-MB

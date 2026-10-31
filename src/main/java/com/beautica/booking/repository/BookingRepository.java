@@ -1,5 +1,7 @@
 package com.beautica.booking.repository;
 
+import com.beautica.common.repository.TransactionLockTimeout;
+import com.beautica.booking.dto.GuestCancelTokenTarget;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.enums.CancellationReason;
@@ -61,7 +63,8 @@ import java.util.UUID;
  * {@link #findAllCompletionAccessByAppointmentId}, where an inner join silently defeated an ALL-ROWS
  * contract and was an authorization BYPASS (2026-09 audit finding 2).
  */
-public interface BookingRepository extends JpaRepository<Booking, UUID>, BookingRepositoryCustom {
+public interface BookingRepository extends JpaRepository<Booking, UUID>, BookingRepositoryCustom,
+        TransactionLockTimeout {
 
     // ── ID-only paginated queries — two-query pattern (Fix H1 — HHH90003004) ──
     //
@@ -542,6 +545,27 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
                        AND s.sent_at > :since) AS "rescheduleSends"
             """, nativeQuery = true)
     PhoneSmsBudgetUsage countPhoneSmsBudgetUsedSince(@Param("phone") String phone, @Param("since") Instant since);
+
+    /**
+     * Phase 408 audit-fix (security MEDIUM) — whether another service line of the same walk-in visit was already
+     * DECLINED and its cancellation message reserved since {@code since} (a {@code guest_reschedule_sms_sends} row on
+     * that sibling). One cancellation message per visit per window, however many lines are declined one by one.
+     * Known edge (accepted, no {@code kind} column): a RESCHEDULE reservation on a sibling that was later declined also
+     * counts as "already notified" for that visit within the window.
+     */
+    @Query(value = """
+            SELECT EXISTS (
+                SELECT 1
+                  FROM guest_reschedule_sms_sends s
+                  JOIN bookings sib ON sib.id = s.booking_id
+                 WHERE sib.appointment_id = :appointmentId
+                   AND sib.id <> :bookingId
+                   AND sib.status = 'DECLINED'
+                   AND s.sent_at > :since)
+            """, nativeQuery = true)
+    boolean existsVisitCancellationSendSince(@Param("appointmentId") UUID appointmentId,
+                                             @Param("bookingId") UUID bookingId,
+                                             @Param("since") Instant since);
 
     /**
      * Phase 431 — provider reschedules of one guest booking/visit ({@code scopeId}: the appointment id
@@ -2151,10 +2175,12 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
 
     // ── Guest-booking reminder sweep (Phase 13.3) ─────────────────────────────
     /**
-     * Loads guest (LINK) bookings due for a 24h reminder SMS. Bounded by a narrow
+     * Loads guest (LINK) bookings due for a 24h reminder SMS — plus, phase 413 D4 / 412, STAFF walk-ins
+     * with a guest phone when {@code includeWalkIns} (the job passes the walk-in SMS gate,
+     * {@code app.booking.sms.enabled}). Bounded by a narrow
      * {@code [from, to)} window supplied by {@link com.beautica.booking.job.BookingReminderJob}
      * (Anti-Bug §E-3: not unbounded), and aligned with the partial index
-     * {@code idx_bookings_reminder} (LINK + reminder_sent = FALSE).
+     * {@code idx_bookings_reminder} (V227: LINK | STAFF + guest_phone NOT NULL + reminder_sent = FALSE).
      *
      * <p>The fetched rows are mutated ({@code reminderSent = true}) by the job inside its
      * transaction and flushed by dirty checking (no explicit save — they are managed), so the
@@ -2171,16 +2197,21 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             JOIN FETCH b.master m
             LEFT JOIN FETCH m.user
             JOIN FETCH b.masterService ms
-            JOIN FETCH ms.serviceDefinition
+            JOIN FETCH ms.serviceDefinition sd
+            JOIN FETCH sd.serviceType
             LEFT JOIN FETCH b.appointment
-            WHERE b.bookingSource = com.beautica.booking.enums.BookingSource.LINK
+            WHERE (b.bookingSource = com.beautica.booking.enums.BookingSource.LINK
+                   OR (b.bookingSource = com.beautica.booking.enums.BookingSource.STAFF
+                       AND :includeWalkIns = true))
+              AND b.guestPhone IS NOT NULL
               AND b.reminderSent = false
               AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
               AND b.startsAt BETWEEN :from AND :to
             """)
     List<Booking> findGuestBookingsForReminder(
             @Param("from") OffsetDateTime from,
-            @Param("to") OffsetDateTime to);
+            @Param("to") OffsetDateTime to,
+            @Param("includeWalkIns") boolean includeWalkIns);
 
     // ── Guest (LINK) visit cancel by link (BE-7) ──────────────────────────────
     /**
@@ -2247,6 +2278,101 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             """, nativeQuery = true)
     List<UUID> claimVisitRemindersByAppointmentIds(@Param("appointmentIds") Collection<UUID> appointmentIds);
 
+    // ── Guest 2h-before reminder sweep (Phase 413) ────────────────────────────
+    /** Phase 408/413 audit-fix — rows one 2h sweep tick selects (and therefore claims) at most. */
+    int TWO_HOUR_REMINDER_BATCH_CAP = 500;
+
+    /**
+     * Phase 413 D1 — guest (LINK) bookings due for the 2h-before reminder, plus (D4, after 412) STAFF walk-ins with a
+     * guest phone when {@code includeWalkIns}: the 24h finder's exact graph and source predicate (so the
+     * reminder renders with no lazy load) over the half-open {@code [from, to)} window, on the partial index
+     * {@code idx_bookings_reminder_2h} (V227: LINK | STAFF, guest phone, CONFIRMED, not yet reminded). Bounded twice (Anti-Bug §E-3): the
+     * 30-minute window the job supplies and {@code limit} ({@link #TWO_HOUR_REMINDER_BATCH_CAP}); the overflow is
+     * picked up by the next 15-minute tick. All joins are to-one, so the limit applies in SQL.
+     */
+    @Query("""
+            SELECT b FROM Booking b
+            JOIN FETCH b.master m
+            LEFT JOIN FETCH m.user
+            JOIN FETCH b.masterService ms
+            JOIN FETCH ms.serviceDefinition sd
+            JOIN FETCH sd.serviceType
+            LEFT JOIN FETCH b.appointment
+            WHERE (b.bookingSource = com.beautica.booking.enums.BookingSource.LINK
+                   OR (b.bookingSource = com.beautica.booking.enums.BookingSource.STAFF
+                       AND :includeWalkIns = true))
+              AND b.guestPhone IS NOT NULL
+              AND b.reminder2hSent = false
+              AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
+              AND b.startsAt >= :from
+              AND b.startsAt < :to
+            ORDER BY b.startsAt, b.id
+            """)
+    List<Booking> findGuestBookingsForTwoHourReminder(
+            @Param("from") OffsetDateTime from,
+            @Param("to") OffsetDateTime to,
+            @Param("includeWalkIns") boolean includeWalkIns,
+            org.springframework.data.domain.Limit limit);
+
+    /**
+     * Phase 413 — claims the given single bookings for the 2h reminder: flips {@code reminder_2h_sent} only where
+     * still {@code false} and returns the ids this call won. Audit-fix: rows locked by anyone else are SKIPPED
+     * ({@code FOR UPDATE SKIP LOCKED}) rather than waited on, so one held row (a concurrent cancel, the other
+     * instance) never fails the whole sweep; a skipped row is re-selected next tick if still unclaimed. Call
+     * {@link #claimTwoHourRemindersByIds} (3 s lock_timeout wrapper, kept for any non-skippable lock).
+     */
+    @Query(value = """
+            WITH c AS (
+                SELECT id FROM bookings
+                 WHERE id IN (:ids)
+                   AND reminder_2h_sent = FALSE
+                 FOR UPDATE SKIP LOCKED)
+            UPDATE bookings b
+               SET reminder_2h_sent = TRUE
+              FROM c
+             WHERE b.id = c.id
+            RETURNING b.id
+            """, nativeQuery = true)
+    List<UUID> claimTwoHourRemindersByIdsNoLockTimeout(@Param("ids") Collection<UUID> ids);
+
+    /** {@link #claimTwoHourRemindersByIdsNoLockTimeout} bounded by the transaction-local 3s {@code lock_timeout}. */
+    default List<UUID> claimTwoHourRemindersByIds(Collection<UUID> ids) {
+        applyTransactionLockTimeout();
+        return claimTwoHourRemindersByIdsNoLockTimeout(ids);
+    }
+
+    /**
+     * Phase 413 — visit counterpart: flips EVERY unlocked, unflagged item of each visit and returns each visit it
+     * flipped, once. Audit-fix: {@code SKIP LOCKED} as above, and a visit any of whose items is already flagged is
+     * never claimed again ({@code NOT EXISTS}), so a service added to the visit later — or an item skipped while
+     * locked — can never cause a second 2h reminder. Call {@link #claimTwoHourVisitRemindersByAppointmentIds}.
+     */
+    @Query(value = """
+            WITH c AS (
+                SELECT b.id FROM bookings b
+                 WHERE b.appointment_id IN (:appointmentIds)
+                   AND b.reminder_2h_sent = FALSE
+                   AND NOT EXISTS (SELECT 1 FROM bookings o
+                                    WHERE o.appointment_id = b.appointment_id
+                                      AND o.reminder_2h_sent = TRUE)
+                 FOR UPDATE OF b SKIP LOCKED),
+            u AS (
+                UPDATE bookings b
+                   SET reminder_2h_sent = TRUE
+                  FROM c
+                 WHERE b.id = c.id
+                RETURNING b.appointment_id)
+            SELECT DISTINCT appointment_id FROM u
+            """, nativeQuery = true)
+    List<UUID> claimTwoHourVisitRemindersByAppointmentIdsNoLockTimeout(
+            @Param("appointmentIds") Collection<UUID> appointmentIds);
+
+    /** {@link #claimTwoHourVisitRemindersByAppointmentIdsNoLockTimeout} bounded by the tx-local 3s lock_timeout. */
+    default List<UUID> claimTwoHourVisitRemindersByAppointmentIds(Collection<UUID> appointmentIds) {
+        applyTransactionLockTimeout();
+        return claimTwoHourVisitRemindersByAppointmentIdsNoLockTimeout(appointmentIds);
+    }
+
     // ── Guest-cancel by link (Phase 13.4) ─────────────────────────────────────
     /**
      * Resolves a guest (LINK) booking by the hash of its one-time cancel token
@@ -2279,6 +2405,37 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
               AND b.appointment IS NULL
             """)
     Optional<Booking> findByCancelTokenHashWithGraph(@Param("cancelTokenHash") String cancelTokenHash);
+
+    /**
+     * Phase 407 — scalar projection of a standalone guest booking by its cancel-token hash, for the guest Telegram
+     * link API: same partial-unique index and {@code appointment IS NULL} rule as {@link #findByCancelTokenHashWithGraph},
+     * without the master / service graph that API never reads.
+     */
+    @Query("""
+            SELECT new com.beautica.booking.dto.GuestCancelTokenTarget(
+                       b.id, b.bookingSource, b.status, b.guestPhone, b.startsAt)
+              FROM Booking b
+             WHERE b.cancelTokenHash = :cancelTokenHash
+               AND b.appointment IS NULL
+            """)
+    Optional<GuestCancelTokenTarget> findGuestTokenTargetByCancelTokenHash(
+            @Param("cancelTokenHash") String cancelTokenHash);
+
+    /**
+     * Phase 407 — the visit counterpart: the header's source / status / phone with its FIRST item's id and start, in
+     * one statement (header by the V206 partial-unique hash index, items by {@code idx_bookings_appointment}).
+     */
+    @Query("""
+            SELECT new com.beautica.booking.dto.GuestCancelTokenTarget(
+                       b.id, a.bookingSource, a.status, a.guestPhone, b.startsAt)
+              FROM Booking b
+              JOIN b.appointment a
+             WHERE a.cancelTokenHash = :cancelTokenHash
+             ORDER BY b.startsAt ASC, b.id ASC
+             LIMIT 1
+            """)
+    Optional<GuestCancelTokenTarget> findGuestVisitTokenTargetByCancelTokenHash(
+            @Param("cancelTokenHash") String cancelTokenHash);
 
     /**
      * Atomically consumes a cancel token: flips a still-{@code CONFIRMED} guest booking
@@ -2324,10 +2481,21 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * @param cutoff   rows whose {@code ends_at} is strictly before this instant are due
      * @param sentinel the fixed replacement name ({@code GuestPii.ANONYMISED_NAME})
      */
+    default List<UUID> anonymiseDueGuestBookings(OffsetDateTime cutoff, String sentinel, int batchSize) {
+        return anonymiseDueGuestBookingsWithPhones(cutoff, sentinel, batchSize).stream()
+                .map(AnonymisedGuestBooking::getBookingId)
+                .toList();
+    }
+
+    /**
+     * {@link #anonymiseDueGuestBookings} returning, per anonymised row, the guest phone it held before the wipe
+     * (phase 409 D1 — the batch's Telegram link cleanup). The phone comes from the {@code due} CTE, whose snapshot
+     * predates the UPDATE; the statement, claim and field treatment are exactly the ones documented above.
+     */
     @Modifying
     @Query(value = """
             WITH due AS MATERIALIZED (
-                SELECT x.id FROM bookings x
+                SELECT x.id, x.guest_phone FROM bookings x
                  WHERE x.client_id IS NULL
                    AND x.guest_pii_anonymised_at IS NULL
                    AND x.client_detached_at IS NULL
@@ -2348,12 +2516,45 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
                    updated_at = now()
               FROM due
              WHERE b.id = due.id
-            RETURNING b.id
+            RETURNING b.id AS bookingId, due.guest_phone AS guestPhone
             """, nativeQuery = true)
-    List<UUID> anonymiseDueGuestBookings(
+    List<AnonymisedGuestBooking> anonymiseDueGuestBookingsWithPhones(
             @Param("cutoff") OffsetDateTime cutoff,
             @Param("sentinel") String sentinel,
             @Param("batchSize") int batchSize);
+
+    /**
+     * Phase 409 D1 — which of {@code phones} still have a non-anonymised guest/walk-in booking (any age, any status):
+     * a Telegram link of such a phone is kept. Same scope as the retention claim; rides the partial index
+     * {@code idx_bookings_guest_phone_open} (V199), whose predicate this WHERE repeats. {@code phones} is bounded by
+     * the caller's batch.
+     */
+    @Query(value = """
+            SELECT DISTINCT b.guest_phone FROM bookings b
+             WHERE b.guest_phone IN (:phones)
+               AND b.client_id IS NULL
+               AND b.guest_pii_anonymised_at IS NULL
+               AND b.client_detached_at IS NULL
+               AND b.booking_source IN ('LINK', 'STAFF')
+            """, nativeQuery = true)
+    List<String> findGuestPhonesWithOpenBookings(@Param("phones") Collection<String> phones);
+
+    /**
+     * Phase 409 Telegram orphan backstop — one keyset page of the distinct phones that still have a non-anonymised
+     * guest/walk-in booking, in phone order after {@code after}. Ordered range read of the partial index
+     * {@code idx_bookings_guest_phone_open} (V199, same predicate), bounded by {@code limit}.
+     */
+    @Query(value = """
+            SELECT DISTINCT b.guest_phone FROM bookings b
+             WHERE b.guest_phone > :after
+               AND b.client_id IS NULL
+               AND b.guest_pii_anonymised_at IS NULL
+               AND b.client_detached_at IS NULL
+               AND b.booking_source IN ('LINK', 'STAFF')
+             ORDER BY b.guest_phone
+             LIMIT :limit
+            """, nativeQuery = true)
+    List<String> findOpenGuestPhonesPage(@Param("after") String after, @Param("limit") int limit);
 
     /**
      * Internal erase path (phase 373 D9): anonymises EVERY not-yet-anonymised guest/walk-in row of

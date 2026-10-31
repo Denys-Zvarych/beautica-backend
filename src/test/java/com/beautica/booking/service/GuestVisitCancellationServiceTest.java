@@ -1,5 +1,6 @@
 package com.beautica.booking.service;
 
+import com.beautica.notification.channel.GuestMessageRouters;
 import com.beautica.booking.domain.CancelTokenHasher;
 import com.beautica.booking.entity.Appointment;
 import com.beautica.booking.entity.Booking;
@@ -102,7 +103,7 @@ class GuestVisitCancellationServiceTest {
      * while still proving the service holds no {@code SmsService} of its own.
      */
     private BookingSmsDispatcher smsDispatcher() {
-        return new BookingSmsDispatcher(smsService, new SyncTaskExecutor());
+        return new BookingSmsDispatcher(smsService, GuestMessageRouters.smsOnly(smsService), new SyncTaskExecutor());
     }
 
     @Nested
@@ -185,6 +186,26 @@ class GuestVisitCancellationServiceTest {
             verify(bookingRepository).cancelItemsByAppointmentId(APPOINTMENT_ID);
             verify(outboxService).enqueueClientCancelled(BOOKING_ID);
             verify(smsService).send(eq(GUEST_PHONE), any());
+        }
+
+        /** Phase 412 audit-fix — a walk-in's cancel SMS and cancel page name the platform service type. */
+        @Test
+        @DisplayName("names the PLATFORM service type, never the custom name, when a walk-in visit is cancelled")
+        void should_usePlatformServiceName_when_walkInVisitCancelled() {
+            String hostile = "Акція! пишіть на example.test";
+            when(appointmentRepository.findByCancelTokenHash(TOKEN_HASH))
+                    .thenReturn(Optional.of(appointment(BookingStatus.CONFIRMED)));
+            when(bookingRepository.findByAppointmentIdWithGraph(APPOINTMENT_ID))
+                    .thenReturn(List.of(walkInItem(CANCELLABLE_START, hostile)));
+            when(appointmentRepository.consumeCancelTokenHash(TOKEN_HASH)).thenReturn(1);
+
+            String pageServiceName = service.getInfo(TOKEN).orElseThrow().serviceName();
+            service.cancel(TOKEN);
+
+            ArgumentCaptor<String> text = ArgumentCaptor.forClass(String.class);
+            verify(smsService).send(eq(GUEST_PHONE), text.capture());
+            assertThat(text.getValue()).contains(PLATFORM_SERVICE_NAME).doesNotContain("example.test");
+            assertThat(pageServiceName).isEqualTo(PLATFORM_SERVICE_NAME);
         }
     }
 
@@ -345,7 +366,29 @@ class GuestVisitCancellationServiceTest {
                 .build();
     }
 
-    private Booking item(OffsetDateTime startsAt, String serviceName) {
+    private static final String PLATFORM_SERVICE_NAME = "Манікюр класичний";
+
+    /** A STAFF walk-in item whose service carries a custom name AND a platform service type. */
+    private Booking walkInItem(OffsetDateTime startsAt, String customServiceName) {
+        Booking base = item(startsAt, customServiceName);
+        ServiceDefinition def = ServiceDefinition.builder()
+                .name(customServiceName)
+                .serviceType(com.beautica.service.entity.ServiceType.builder().nameUk(PLATFORM_SERVICE_NAME).build())
+                .baseDurationMinutes(60).bufferMinutesAfter(0).basePrice(new BigDecimal("350.00"))
+                .build();
+        MasterServiceAssignment msa = MasterServiceAssignment.builder()
+                .id(UUID.randomUUID()).master(base.getMaster()).serviceDefinition(def).isActive(true).build();
+        return Booking.builder()
+                .id(BOOKING_ID).master(base.getMaster()).masterService(msa)
+                .appointment(appointment(BookingStatus.CONFIRMED))
+                .bookingSource(com.beautica.booking.enums.BookingSource.STAFF)
+                .status(BookingStatus.CONFIRMED).startsAt(startsAt).endsAt(startsAt.plusMinutes(60))
+                .priceAtBooking(new BigDecimal("350.00")).durationMinutesAtBooking(60)
+                .guestPhone(GUEST_PHONE)
+                .build();
+    }
+
+        private Booking item(OffsetDateTime startsAt, String serviceName) {
         User user = new User("m@beautica.test", "x", com.beautica.auth.Role.SALON_MASTER,
                 "Марія", "Левченко", null);
         Master master = Master.builder().id(UUID.randomUUID()).user(user).isActive(true).build();

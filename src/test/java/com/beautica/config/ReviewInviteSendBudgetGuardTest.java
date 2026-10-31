@@ -20,19 +20,32 @@ class ReviewInviteSendBudgetGuardTest {
     private static final String PREFIX = "app.booking.review-invite";
 
     @Test
-    @DisplayName("the static 20 s cap equals the grace minus the DEFAULT Turbosms connect + read timeouts minus the write-back margin")
+    @DisplayName("the static 10 s cap equals the grace minus the Telegram leg minus the DEFAULT Turbosms connect + read "
+            + "timeouts minus the write-back margin")
     void should_matchStaticCap_when_derivedFromDefaultTimeouts() {
         TurbosmsProperties defaults = new TurbosmsProperties();
 
         Duration derived = ReviewInviteProperties.maxSendBudget(
                 Duration.ofSeconds(SchedulingConfig.SCHEDULER_SHUTDOWN_GRACE_SECONDS),
-                defaults.getConnectTimeout(), defaults.getReadTimeout());
+                defaults.getConnectTimeout(), defaults.getReadTimeout(),
+                ReviewInviteProperties.TELEGRAM_LEG_WORST_CASE);
 
-        assertThat(derived).isEqualTo(ReviewInviteProperties.MAX_SEND_BUDGET);
+        assertThat(derived).isEqualTo(ReviewInviteProperties.MAX_SEND_BUDGET).isEqualTo(Duration.ofSeconds(10));
+        assertThat(ReviewInviteProperties.DEFAULT_SEND_BUDGET).isLessThanOrEqualTo(derived);
     }
 
     @Test
-    @DisplayName("the default 20 s budget boots with the default Turbosms timeouts")
+    @DisplayName("phase 408: the Telegram leg = live client's admission wait + connect + read + markBlocked lock wait")
+    void should_matchTelegramClient_when_telegramLegDerived() {
+        assertThat(ReviewInviteProperties.TELEGRAM_LEG_WORST_CASE).isEqualTo(
+                com.beautica.notification.telegram.TelegramBotApiClient.MAX_ADMISSION_WAIT
+                        .plus(com.beautica.notification.telegram.TelegramBotApiClient.CONNECT_TIMEOUT)
+                        .plus(com.beautica.notification.telegram.TelegramBotApiClient.READ_TIMEOUT)
+                        .plus(com.beautica.notification.telegram.link.TelegramLinkService.MARK_BLOCKED_MAX_WAIT));
+    }
+
+    @Test
+    @DisplayName("the default 10 s budget boots with the default Turbosms timeouts")
     void should_boot_when_defaultsConfigured() {
         ReviewInviteProperties props = bind(Map.of("app.booking.other", "x"));
 
@@ -43,7 +56,7 @@ class ReviewInviteSendBudgetGuardTest {
     @Test
     @DisplayName("the max budget boots exactly at the derived bound")
     void should_boot_when_budgetEqualsDerivedBound() {
-        ReviewInviteProperties props = bind(Map.of(PREFIX + ".send-budget", "20s"));
+        ReviewInviteProperties props = bind(Map.of(PREFIX + ".send-budget", "10s"));
 
         assertThatCode(() -> new ReviewInviteSendBudgetGuard(props, new TurbosmsProperties()))
                 .doesNotThrowAnyException();
@@ -58,7 +71,7 @@ class ReviewInviteSendBudgetGuardTest {
 
         assertThatThrownBy(() -> new ReviewInviteSendBudgetGuard(props, turbosms))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("send-budget must be <= PT15S");
+                .hasMessageContaining("send-budget must be <= PT5S");
     }
 
     @Test

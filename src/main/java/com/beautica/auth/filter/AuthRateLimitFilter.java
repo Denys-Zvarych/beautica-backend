@@ -3,6 +3,7 @@ package com.beautica.auth.filter;
 import com.beautica.common.security.BearerTokenExtractor;
 import com.beautica.common.security.ConstantTimeSecrets;
 import com.beautica.config.BookingInfoWorkerProperties;
+import com.beautica.config.RateLimitConfig;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.github.benmanes.caffeine.cache.LoadingCache;
 import io.github.bucket4j.Bandwidth;
@@ -296,6 +297,15 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     private static final String MODERATION_ACTION_PAGE_PATH_PREFIX = "/api/v1/moderation/actions/";
     private static final String MODERATION_ACTION_CONFIRM_PATH = "/api/v1/moderation/actions/confirm";
     private static final long MODERATION_ACTION_PAGE_DEFAULT_CAPACITY = 30;
+    // Phase 407 D5 — guest Telegram link API (permitAll, cancel token in the BODY). Exact paths; the per-IP buckets are
+    // injected from RateLimitConfig (telegramLinkIssueBuckets 5 / 10 min, telegramLinkReadBuckets 30 / 10 min shared by
+    // status + unlink); the public (test) constructor builds them at RateLimitConfig's defaults. The per-cancel-token
+    // bucket (3 / 10 min) lives in GuestTelegramLinkService, which is the first place the token is parsed.
+    static final String TELEGRAM_LINK_TOKEN_PATH = "/api/v1/book/telegram/link-token";
+    static final String TELEGRAM_LINK_STATUS_PATH = "/api/v1/book/telegram/status";
+    static final String TELEGRAM_LINK_UNLINK_PATH = "/api/v1/book/telegram/unlink";
+    private static final int TELEGRAM_LINK_RETRY_AFTER_SECONDS =
+            (int) RateLimitConfig.TELEGRAM_LINK_WINDOW.toSeconds();
     private static final long MODERATION_ACTION_DECISION_DEFAULT_CAPACITY = 10;
     private static final Duration MODERATION_ACTION_WINDOW = Duration.ofMinutes(10);
     private static final int MODERATION_ACTION_RETRY_AFTER_SECONDS = 600;
@@ -831,6 +841,10 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     private final LoadingCache<String, Bucket> moderationActionPageBuckets;
     private final LoadingCache<String, Bucket> moderationActionDecisionBuckets;
 
+    // Phase 407 D5 — guest Telegram link API per-IP buckets, see TELEGRAM_LINK_TOKEN_PATH.
+    private final LoadingCache<String, Bucket> telegramLinkIssueBuckets;
+    private final LoadingCache<String, Bucket> telegramLinkReadBuckets;
+
     // Configured website-Worker secret for the info reads, or null when the feature is off (blank config).
     // A secret: never logged.
     private final String bookingInfoWorkerKey;
@@ -893,7 +907,74 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                 reviewPageBuckets,
                 moderationActionBuckets(MODERATION_ACTION_PAGE_DEFAULT_CAPACITY),
                 moderationActionBuckets(MODERATION_ACTION_DECISION_DEFAULT_CAPACITY),
+                telegramLinkBuckets(RateLimitConfig.TELEGRAM_LINK_DEFAULT_CAPACITY),
+                telegramLinkBuckets(RateLimitConfig.TELEGRAM_LINK_READ_DEFAULT_CAPACITY),
                 new BookingInfoWorkerProperties());
+    }
+
+    /**
+     * Pre-407 package-private shape (website-Worker key, no Telegram link buckets) kept for the same-package
+     * filter tests that build it directly; the phase 407 buckets get their production defaults.
+     */
+    AuthRateLimitFilter(
+            @Qualifier("registerBuckets") LoadingCache<String, Bucket> registerBuckets,
+            @Qualifier("loginBuckets") LoadingCache<String, Bucket> loginBuckets,
+            @Qualifier("refreshBuckets") LoadingCache<String, Bucket> refreshBuckets,
+            @Qualifier("verifyEmailBuckets") LoadingCache<String, Bucket> verifyEmailBuckets,
+            @Qualifier("slotsBuckets") LoadingCache<String, Bucket> slotsBuckets,
+            @Qualifier("deviceTokenBuckets") LoadingCache<String, Bucket> deviceTokenBuckets,
+            @Qualifier("mediaUploadBuckets") LoadingCache<String, Bucket> mediaUploadBuckets,
+            @Qualifier("profileUpdateBuckets") LoadingCache<String, Bucket> profileUpdateBuckets,
+            @Qualifier("resendVerificationBuckets") LoadingCache<String, Bucket> resendVerificationBuckets,
+            @Qualifier("forgotPasswordBuckets") LoadingCache<String, Bucket> forgotPasswordBuckets,
+            @Qualifier("resetPasswordBuckets") LoadingCache<String, Bucket> resetPasswordBuckets,
+            @Qualifier("categoryRequestBuckets") LoadingCache<String, Bucket> categoryRequestBuckets,
+            @Qualifier("suggestServiceTypeBuckets") LoadingCache<String, Bucket> suggestServiceTypeBuckets,
+            @Qualifier("bulkServiceSetupBuckets") LoadingCache<String, Bucket> bulkServiceSetupBuckets,
+            @Qualifier("supportContactBuckets") LoadingCache<String, Bucket> supportContactBuckets,
+            @Qualifier("otpSendBuckets") LoadingCache<String, Bucket> otpSendBuckets,
+            @Qualifier("verifyPasswordResetOtpBuckets") LoadingCache<String, Bucket> verifyPasswordResetOtpBuckets,
+            @Qualifier("changePasswordOtpBuckets") LoadingCache<String, Bucket> changePasswordOtpBuckets,
+            @Qualifier("serviceWriteBuckets") LoadingCache<String, Bucket> serviceWriteBuckets,
+            @Qualifier("inviteValidateBuckets") LoadingCache<String, Bucket> inviteValidateBuckets,
+            @Qualifier("inviteAcceptBuckets") LoadingCache<String, Bucket> inviteAcceptBuckets,
+            @Qualifier("catalogueBrowseBuckets") LoadingCache<String, Bucket> catalogueBrowseBuckets,
+            @Qualifier("inviteBuckets") LoadingCache<String, Bucket> inviteBuckets,
+            @Qualifier("reviewDecisionBuckets") LoadingCache<String, Bucket> reviewDecisionBuckets,
+            @Qualifier("reviewPageBuckets") LoadingCache<String, Bucket> reviewPageBuckets,
+            @Qualifier("moderationActionPageBuckets") LoadingCache<String, Bucket> moderationActionPageBuckets,
+            @Qualifier("moderationActionDecisionBuckets") LoadingCache<String, Bucket> moderationActionDecisionBuckets,
+            BookingInfoWorkerProperties bookingInfoWorker) {
+        this(registerBuckets,
+                loginBuckets,
+                refreshBuckets,
+                verifyEmailBuckets,
+                slotsBuckets,
+                deviceTokenBuckets,
+                mediaUploadBuckets,
+                profileUpdateBuckets,
+                resendVerificationBuckets,
+                forgotPasswordBuckets,
+                resetPasswordBuckets,
+                categoryRequestBuckets,
+                suggestServiceTypeBuckets,
+                bulkServiceSetupBuckets,
+                supportContactBuckets,
+                otpSendBuckets,
+                verifyPasswordResetOtpBuckets,
+                changePasswordOtpBuckets,
+                serviceWriteBuckets,
+                inviteValidateBuckets,
+                inviteAcceptBuckets,
+                catalogueBrowseBuckets,
+                inviteBuckets,
+                reviewDecisionBuckets,
+                reviewPageBuckets,
+                moderationActionPageBuckets,
+                moderationActionDecisionBuckets,
+                telegramLinkBuckets(RateLimitConfig.TELEGRAM_LINK_DEFAULT_CAPACITY),
+                telegramLinkBuckets(RateLimitConfig.TELEGRAM_LINK_READ_DEFAULT_CAPACITY),
+                bookingInfoWorker);
     }
 
     /** Spring constructor: as the public one, plus the optional website-Worker key (feature off when blank). */
@@ -926,6 +1007,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             @Qualifier("reviewPageBuckets") LoadingCache<String, Bucket> reviewPageBuckets,
             @Qualifier("moderationActionPageBuckets") LoadingCache<String, Bucket> moderationActionPageBuckets,
             @Qualifier("moderationActionDecisionBuckets") LoadingCache<String, Bucket> moderationActionDecisionBuckets,
+            @Qualifier("telegramLinkIssueBuckets") LoadingCache<String, Bucket> telegramLinkIssueBuckets,
+            @Qualifier("telegramLinkReadBuckets") LoadingCache<String, Bucket> telegramLinkReadBuckets,
             BookingInfoWorkerProperties bookingInfoWorker) {
         this.registerBuckets = registerBuckets;
         this.loginBuckets = loginBuckets;
@@ -954,6 +1037,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         this.reviewPageBuckets = reviewPageBuckets;
         this.moderationActionPageBuckets = moderationActionPageBuckets;
         this.moderationActionDecisionBuckets = moderationActionDecisionBuckets;
+        this.telegramLinkIssueBuckets = telegramLinkIssueBuckets;
+        this.telegramLinkReadBuckets = telegramLinkReadBuckets;
         this.bookingInfoWorkerKey = bookingInfoWorker.isEnabled() ? bookingInfoWorker.getWorkerKey() : null;
         this.otpVerifyBuckets = Caffeine.newBuilder()
                 .maximumSize(100_000)
@@ -1056,6 +1141,19 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                         .addLimit(BandwidthBuilder.builder()
                                 .capacity(capacity)
                                 .refillIntervally(capacity, MODERATION_ACTION_WINDOW)
+                                .build())
+                        .build());
+    }
+
+    /** Default-capacity phase 407 bucket cache for the public (test) constructor; same shape as RateLimitConfig. */
+    private static LoadingCache<String, Bucket> telegramLinkBuckets(long capacity) {
+        return Caffeine.newBuilder()
+                .maximumSize(RateLimitConfig.TELEGRAM_LINK_IP_BUCKET_CACHE_SIZE)
+                .expireAfterAccess(RateLimitConfig.TELEGRAM_LINK_WINDOW.plusMinutes(5))
+                .build(key -> Bucket.builder()
+                        .addLimit(BandwidthBuilder.builder()
+                                .capacity(capacity)
+                                .refillIntervally(capacity, RateLimitConfig.TELEGRAM_LINK_WINDOW)
                                 .build())
                         .build());
     }
@@ -1585,6 +1683,21 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         if (isGetOrHead(method)
                 && path.startsWith(CANCEL_POST_PATH_PREFIX)) {
             applyRateLimit(request, response, filterChain, cancelInfoBuckets, RETRY_AFTER_SECONDS);
+            return;
+        }
+
+        // Phase 407 D5 — guest Telegram link API: exact POST paths, before the guest-booking prefix branch below (no
+        // overlap: none of these ends in /booking). link-token on its own bucket; status + unlink share one. Keyed per
+        // IPv6 /64 like the review-invite routes, so one host cannot rotate addresses inside its prefix.
+        if (HttpMethod.POST.matches(method) && TELEGRAM_LINK_TOKEN_PATH.equals(path)) {
+            applyRateLimit(request, response, filterChain, telegramLinkIssueBuckets,
+                    TELEGRAM_LINK_RETRY_AFTER_SECONDS, 1L, perIpv6Prefix(resolveBucketKey(request)));
+            return;
+        }
+        if (HttpMethod.POST.matches(method)
+                && (TELEGRAM_LINK_STATUS_PATH.equals(path) || TELEGRAM_LINK_UNLINK_PATH.equals(path))) {
+            applyRateLimit(request, response, filterChain, telegramLinkReadBuckets,
+                    TELEGRAM_LINK_RETRY_AFTER_SECONDS, 1L, perIpv6Prefix(resolveBucketKey(request)));
             return;
         }
 

@@ -112,6 +112,13 @@ app:
       # logged instead of billed (the OTP goes to Mailpit via beautica.sms.mode=capture above). Hardcoded false with NO env placeholder — unlike the base
       # profile, local must not be flippable by a stray shell export.
       enabled: false
+  telegram:
+    # Phase 404 — local never reaches the Bot API: with APP_TELEGRAM_ENABLED=true messages go to Mailpit
+    # (tg+<chatId>@telegram.local.invalid). Flag itself stays inherited (default false).
+    mode: capture
+    # Phase 406 D9 — fixed dev-only webhook secret so scripts/telegram-fake-update.sh can authenticate against
+    # localhost (the script uses the same default). Not a real secret: local never registers a webhook.
+    webhook-secret: ${TELEGRAM_WEBHOOK_SECRET:local-dev-telegram-webhook-secret-0000}
   booking-links:
     # Phase 375 (D6) — sharing on locally (prod default is false); export
     # BOOKING_LINKS_SHARE_ENABLED=false to exercise the switched-off state.

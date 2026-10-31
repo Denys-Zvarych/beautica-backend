@@ -105,6 +105,11 @@ class PublicSalonGuestBookingIT extends AbstractIntegrationTest {
         assertThat(a.path("appointmentId").asText()).isNotBlank().isNotEqualTo(b.path("appointmentId").asText());
         assertThat(a.path("cancelUrl").asText()).contains("/book/cancel/").isNotEqualTo(b.path("cancelUrl").asText());
         assertThat(a.path("durationMinutes").asInt()).isEqualTo(60);
+        for (JsonNode created : List.of(a, b)) {
+            assertThat(created.path("telegram").toString())
+                    .as("phase 407 D6: once per salon-route response, channel off in the test profile")
+                    .isEqualTo("{\"available\":false,\"linked\":false}");
+        }
         for (UUID master : List.of(masterA, masterB)) {
             Map<String, Object> row = jdbcTemplate.queryForMap("SELECT b.status, b.booking_source, b.salon_id, "
                     + "b.guest_phone, b.client_id, b.guest_privacy_policy_version, a.client_comment "

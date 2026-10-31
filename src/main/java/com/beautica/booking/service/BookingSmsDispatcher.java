@@ -1,5 +1,7 @@
 package com.beautica.booking.service;
 
+import com.beautica.notification.channel.GuestMessageKind;
+import com.beautica.notification.channel.GuestMessageRouter;
 import com.beautica.notification.sms.SmsBackpressureException;
 import com.beautica.notification.sms.SmsService;
 import org.slf4j.Logger;
@@ -63,8 +65,9 @@ public class BookingSmsDispatcher {
     /**
      * Which message was queued. Present only so the drop line and the failure line name the lost
      * message: five senders share one pool, and {@code event=booking_sms_dropped} on its own tells an
-     * operator that something was lost but not what. Never rendered into the SMS, never a routing
-     * decision — every kind takes the identical path.
+     * operator that something was lost but not what. Never rendered into the SMS. Since phase 408 it is a
+     * routing decision for exactly one kind: {@link #GUEST_PROVIDER_CANCELLATION} goes through
+     * {@code GuestMessageRouter} (Telegram when linked, else SMS); every other kind is SMS-only.
      */
     public enum Kind {
 
@@ -108,11 +111,18 @@ public class BookingSmsDispatcher {
     static final int OUTBOX_QUEUE_RESERVE = 50;
 
     private final SmsService smsService;
+    private final GuestMessageRouter guestMessageRouter;
     private final TaskExecutor smsSendExecutor;
 
+    /**
+     * @param guestMessageRouter phase 408 — used for {@link Kind#GUEST_PROVIDER_CANCELLATION} only; every other
+     *                           kind keeps calling {@code smsService} directly and never reaches the router
+     */
     public BookingSmsDispatcher(SmsService smsService,
+                                GuestMessageRouter guestMessageRouter,
                                 @Qualifier("smsSendExecutor") TaskExecutor smsSendExecutor) {
         this.smsService = smsService;
+        this.guestMessageRouter = guestMessageRouter;
         this.smsSendExecutor = smsSendExecutor;
     }
 
@@ -201,9 +211,22 @@ public class BookingSmsDispatcher {
      */
     private void sendSafely(Kind kind, String phoneE164, String text) {
         try {
-            smsService.send(phoneE164, text);
+            send(kind, phoneE164, text);
         } catch (RuntimeException e) {
             log.warn("Booking SMS send failed: kind={} cause={}", kind.token(), e.getClass().getSimpleName());
+        }
+    }
+
+    /**
+     * Phase 408 D1 — only the provider-cancellation branch is routed (Telegram when the phone is linked, SMS
+     * otherwise). Confirmations, the guest's own cancellation and the reschedule notice stay on the exact
+     * pre-408 {@code smsService.send} call: the router is never in their path.
+     */
+    private void send(Kind kind, String phoneE164, String text) {
+        if (kind == Kind.GUEST_PROVIDER_CANCELLATION) {
+            guestMessageRouter.deliver(GuestMessageKind.GUEST_PROVIDER_CANCELLATION, phoneE164, text);
+        } else {
+            smsService.send(phoneE164, text);
         }
     }
 }

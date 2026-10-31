@@ -21,6 +21,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.mail.javamail.JavaMailSender;
+import org.springframework.test.context.TestPropertySource;
 
 import javax.sql.DataSource;
 import java.util.regex.Matcher;
@@ -41,6 +42,15 @@ import static org.mockito.Mockito.when;
  * real here (staging is not skipped) and must pass with the staging overlay's own values.
  */
 @DisplayName("prod,staging profile — capture wiring (Phase 368)")
+// Phase 432 (owner state 2026-10-30): Railway staging already carries the staging bot's token, username and webhook
+// secret with APP_TELEGRAM_ENABLED=false and no TELEGRAM_STAGING_ALLOWED_CHAT_IDS. That exact shape must boot.
+// Fake, low-entropy fixtures (the bot id is not the prod one).
+@TestPropertySource(properties = {
+        "TELEGRAM_BOT_TOKEN=7000000001:ssssssssssssssssssssssssssssssssss",
+        "TELEGRAM_BOT_USERNAME=bt_qa_x7k2_bot",
+        "TELEGRAM_WEBHOOK_SECRET=staging_it_webhook_secret_ssssssssssssssssssssssssssssssssss",
+        "APP_TELEGRAM_ENABLED=false"
+})
 class StagingProfileContextIT extends AbstractStagingProfileIT {
 
     private static final Pattern CODE = Pattern.compile("(\\d{6})");
@@ -75,6 +85,21 @@ class StagingProfileContextIT extends AbstractStagingProfileIT {
 
     @Autowired
     private org.springframework.context.ApplicationContext context;
+
+    @Test
+    @DisplayName("Phase 432 — Railway staging shape (staging bot creds, flag off, no allow-list) boots: NoOp, guard present, empty list")
+    void should_bootWithNoOpTelegram_when_stagingBotCredentialsSetAndFlagOff() {
+        var properties = context.getBean(TelegramProperties.class);
+
+        assertThat(properties.enabled()).isFalse();
+        assertThat(properties.botUsername()).isEqualTo("bt_qa_x7k2_bot");
+        assertThat(properties.stagingAllowedChatIds()).isEmpty();
+        assertThat(context.getBean(com.beautica.notification.telegram.TelegramMessenger.class))
+                .isInstanceOf(com.beautica.notification.telegram.NoOpTelegramMessenger.class);
+        assertThat(context.getBeansOfType(TelegramEnvGuard.class)).hasSize(1);
+        assertThat(context.getBean(com.beautica.notification.telegram.TelegramChatAllowList.class))
+                .isInstanceOf(com.beautica.notification.telegram.StagingTelegramChatAllowList.class);
+    }
 
     @Test
     @DisplayName("Phase 374 — staging overrides prod's brevo-api: SMTP transport, inline logo, SMTP probe only")

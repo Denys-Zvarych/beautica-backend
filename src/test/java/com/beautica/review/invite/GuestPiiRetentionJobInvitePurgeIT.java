@@ -1,5 +1,6 @@
 package com.beautica.review.invite;
 
+import com.beautica.notification.telegram.link.TelegramLinkRetentionService;
 import com.beautica.booking.retention.GuestPii;
 import com.beautica.booking.retention.GuestPiiAnonymisationService;
 import com.beautica.booking.retention.GuestPiiRetentionJob;
@@ -51,10 +52,11 @@ class GuestPiiRetentionJobInvitePurgeIT extends AbstractReviewInviteIT {
 
     @Autowired private GuestPiiAnonymisationService anonymisationService;
     @Autowired private GuestReviewRetentionService retentionService;
+    @Autowired private TelegramLinkRetentionService telegramLinkRetentionService;
     @Autowired private ApplicationContext applicationContext;
 
     private GuestPiiRetentionJob job() {
-        return new GuestPiiRetentionJob(anonymisationService, retentionService, PROPERTIES,
+        return new GuestPiiRetentionJob(anonymisationService, retentionService, telegramLinkRetentionService, PROPERTIES,
                 Clock.fixed(NOW, ZoneOffset.UTC));
     }
 

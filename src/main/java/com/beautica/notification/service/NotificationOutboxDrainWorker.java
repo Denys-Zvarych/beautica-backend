@@ -559,7 +559,10 @@ public class NotificationOutboxDrainWorker {
             // booking rows are hydrated here (see BookingVisitResolver) and threaded through every
             // channel. Cardinality is untouched — still one row, one notification, N services named.
             case NEW_BOOKING      -> notificationService.notifyNewBooking(getVisit(entry, bookingCache, visitSiblings));
-            case STATUS_CHANGED   -> notificationService.notifyBookingStatusChanged(getVisit(entry, bookingCache, visitSiblings));
+            // Phase 408 audit-fix cycle 2: the entry id keeps a walk-in's cancellation budget reservation idempotent
+            // across a back-pressure retry (same precedent as BOOKING_RESCHEDULED below).
+            case STATUS_CHANGED   -> notificationService.notifyBookingStatusChanged(
+                    getVisit(entry, bookingCache, visitSiblings), entry.getId());
             case CLIENT_CANCELLED -> notificationService.notifyClientCancelled(getBooking(entry, bookingCache));
             case BOOKING_RESCHEDULED -> {
                 Booking booking = getBooking(entry, bookingCache);
@@ -581,8 +584,9 @@ public class NotificationOutboxDrainWorker {
             case MASTER_BOOKING_DECLINED -> notificationService.notifyMasterOfProviderDecline(
                     getVisit(entry, bookingCache, visitSiblings), actorUserIdOrNull(entry, readPayload(entry)));
             case CLOSURE_REMINDER -> notificationService.notifyClosureReminder(getBooking(entry, bookingCache));
-            case SALON_CLOSED -> notificationService.notifySalonClosed(getVisit(entry, bookingCache, visitSiblings));
-            case MASTER_REMOVED -> notificationService.notifyMasterRemoved(getVisit(entry, bookingCache, visitSiblings));
+            case SALON_CLOSED -> notificationService.notifySalonClosed(getVisit(entry, bookingCache, visitSiblings), entry.getId());
+            case MASTER_REMOVED -> notificationService.notifyMasterRemoved(
+                    getVisit(entry, bookingCache, visitSiblings), entry.getId());
             // Phase 339 — one Android push for one feed row; aggregate_id is the feed row id. The push
             // was rendered from live data in the pre-load block; an id with no plan is a D8 skip
             // (row gone/read, recipient gone or token-less) and is marked SENT without calling FCM.

@@ -45,7 +45,7 @@ public record ReviewInviteProperties(
         @DefaultValue("50") int batchSize,
         @DefaultValue("3") int maxAttempts,
         @DefaultValue(DEFAULT_SMS_TEXT) String smsText,
-        @DefaultValue("20s") Duration sendBudget
+        @DefaultValue("10s") Duration sendBudget
 ) {
 
     public static final String TOKEN_PLACEHOLDER = "{token}";
@@ -59,7 +59,7 @@ public record ReviewInviteProperties(
     /** The only link host/path a PROD invite may carry (website 019 serves {@code /r/{token}} there). */
     public static final String PROD_LINK = "beautica.app/r/" + TOKEN_PLACEHOLDER;
     /** Default {@code sendBudget}. */
-    public static final Duration DEFAULT_SEND_BUDGET = Duration.ofSeconds(20);
+    public static final Duration DEFAULT_SEND_BUDGET = Duration.ofSeconds(10);
     /**
      * Time reserved after the last in-flight SMS for its outcome write-back: the post-send
      * {@code recordFailedSend}/{@code recordAmbiguousSend} transaction that settles the row. Without it a
@@ -67,14 +67,26 @@ public record ReviewInviteProperties(
      */
     public static final Duration SEND_WRITE_BACK_MARGIN = Duration.ofSeconds(2);
     /**
-     * Static bind-time ceiling, audit cycle 2: {@code SchedulingConfig.SCHEDULER_SHUTDOWN_GRACE_SECONDS} (30 s) minus
-     * the default Turbosms connect (3 s) and read (5 s) timeouts minus {@link #SEND_WRITE_BACK_MARGIN} (2 s). The
-     * budget is checked BEFORE each send, so the worst tick is budget + one in-flight send + its write-back;
-     * 20 + 3 + 5 + 2 = 30 s still drains inside the grace. The exact bound for the timeouts actually configured is
+     * Static bind-time ceiling, audit cycle 2 (phase 408 audit-fix: minus the Telegram leg):
+     * {@code SchedulingConfig.SCHEDULER_SHUTDOWN_GRACE_SECONDS} (30 s) minus {@link #TELEGRAM_LEG_WORST_CASE} (10 s)
+     * minus the default Turbosms connect (3 s) and read (5 s) timeouts minus {@link #SEND_WRITE_BACK_MARGIN} (2 s).
+     * The budget is checked BEFORE each send, so the worst tick is budget + one in-flight routed send (Telegram 403,
+     * SMS, markBlocked) + its write-back; 10 + 10 + 3 + 5 + 2 = 30 s still drains inside the grace. The exact bound for the timeouts actually configured is
      * re-derived at boot by {@code ReviewInviteSendBudgetGuard} through {@link #requireSendBudgetWithin}; this
      * constant only rejects an obviously oversized value at bind time.
      */
-    public static final Duration MAX_SEND_BUDGET = Duration.ofSeconds(20);
+    // Accepted (phase 408 audit, 2026-10-30): the worst tick is exactly 30 s (10 budget + 10 Telegram leg + 8 SMS +
+    // 2 write-back) — zero slack against the scheduler grace. It does not count Hikari pool-acquire waits; a slow
+    // pool at shutdown can cost the final write-back (row stays SENT / unreleased), never a lost message.
+    public static final Duration MAX_SEND_BUDGET = Duration.ofSeconds(10);
+
+    /**
+     * Phase 408 audit-fix — the Telegram work around the SMS on a routed invite: send-gate admission wait (1 s) + Bot
+     * API connect (2 s) + read (4 s) + (cycle 2) the gone-path {@code markBlocked} lock wait (3 s) that follows the
+     * SMS fallback. Mirrors {@code TelegramBotApiClient} / {@code TelegramLinkService} constants (pinned by
+     * {@code ReviewInviteSendBudgetGuardTest}). The worst send is: Telegram 403, SMS fallback, then markBlocked.
+     */
+    public static final Duration TELEGRAM_LEG_WORST_CASE = Duration.ofSeconds(10);
 
     /**
      * {@value #PROD_LINK}, optionally {@code https://}, as a whole word: preceded by start/whitespace (so neither
@@ -122,8 +134,9 @@ public record ReviewInviteProperties(
      * {@link #SEND_WRITE_BACK_MARGIN} for its outcome write) still finishes inside {@code shutdownGrace}. Zero or
      * negative when the timeouts alone exceed the grace.
      */
-    public static Duration maxSendBudget(Duration shutdownGrace, Duration connectTimeout, Duration readTimeout) {
-        return shutdownGrace.minus(connectTimeout).minus(readTimeout).minus(SEND_WRITE_BACK_MARGIN);
+    public static Duration maxSendBudget(Duration shutdownGrace, Duration connectTimeout, Duration readTimeout,
+                                         Duration telegramLeg) {
+        return shutdownGrace.minus(telegramLeg).minus(connectTimeout).minus(readTimeout).minus(SEND_WRITE_BACK_MARGIN);
     }
 
     /**
@@ -131,12 +144,14 @@ public record ReviewInviteProperties(
      * actually configured: a shutdown would otherwise cut the last in-flight send, which is then neither marked sent
      * nor released.
      */
-    public void requireSendBudgetWithin(Duration shutdownGrace, Duration connectTimeout, Duration readTimeout) {
-        Duration max = maxSendBudget(shutdownGrace, connectTimeout, readTimeout);
+    public void requireSendBudgetWithin(Duration shutdownGrace, Duration connectTimeout, Duration readTimeout,
+                                        Duration telegramLeg) {
+        Duration max = maxSendBudget(shutdownGrace, connectTimeout, readTimeout, telegramLeg);
         if (sendBudget.compareTo(max) > 0) {
             throw new IllegalStateException("app.booking.review-invite.send-budget must be <= " + max
-                    + " (scheduler grace " + shutdownGrace + " - sms connect " + connectTimeout + " - sms read "
-                    + readTimeout + " - write-back " + SEND_WRITE_BACK_MARGIN + "; was " + sendBudget + ")");
+                    + " (scheduler grace " + shutdownGrace + " - telegram leg " + telegramLeg + " - sms connect "
+                    + connectTimeout + " - sms read " + readTimeout + " - write-back " + SEND_WRITE_BACK_MARGIN
+                    + "; was " + sendBudget + ")");
         }
     }
 

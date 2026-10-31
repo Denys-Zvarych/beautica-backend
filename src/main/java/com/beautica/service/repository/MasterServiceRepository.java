@@ -394,6 +394,14 @@ public interface MasterServiceRepository extends JpaRepository<MasterServiceAssi
      *   <li>{@code 2} — this bulk service-setup lock</li>
      *   <li>{@code 3} — staff walk-in per-RECIPIENT-PHONE SMS-budget lock
      *       ({@code BookingRepository#acquireWalkInPhoneLock})</li>
+     *   <li>{@code 4} — salon booking-slug candidate lock
+     *       ({@code SalonRepository#lockBookingSlugCandidates}, {@code SalonRepository.BOOKING_SLUG_LOCK_SEED})</li>
+     *   <li>{@code 5} — Telegram link-token per-PHONE issue lock, keyed on the phone HASH hex, never the raw phone
+     *       ({@code TelegramLinkTokenRepository#acquirePhoneIssueLock}, {@code PHONE_ISSUE_LOCK_SEED})</li>
+     *   <li>{@code 6} — Telegram link-token per-CHAT claim lock
+     *       ({@code TelegramLinkTokenRepository#acquireChatClaimLock}, {@code CHAT_CLAIM_LOCK_SEED})</li>
+     *   <li>{@code 7} — Telegram link per-PHONE retention lock (phase 409 D1), keyed on the phone HASH hex
+     *       ({@code TelegramLinkRepository#acquirePhoneRetentionLock}, {@code PHONE_RETENTION_LOCK_SEED})</li>
      * </ul>
      *
      * <p>Salt {@code 2} replaced an earlier salt {@code 0} (bulk-additive re-audit). Keyed on the

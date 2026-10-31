@@ -114,6 +114,11 @@ import java.util.UUID;
  * defeat that design and re-open the "the next call site forgets the gate" failure it exists to
  * close. See {@link #registerWalkInConfirmationSms}.
  *
+ * <p><b>Phase 412 — the cancel link.</b> The visit header carries a one-time guest cancel token
+ * (reverses phases 168 / 171 / 254 D), and the SMS renders {@code {cancelUrl}} =
+ * {@link GuestCancelUrlBuilder#build}: the walk-in cancels on the same public page and through the same
+ * {@code POST /api/v1/book/cancel/{token}} visit path as a LINK guest ({@code GuestVisitCancellationService}).
+ *
  * <p>Because the send now costs real money, the create is also SMS-spend throttled on two
  * independent axes: per staff actor by {@code staffBookingSmsBuckets} (the filter), and per
  * RECIPIENT by {@link #assertWalkInSmsBudgetForPhone} here. Neither subsumes the other — see that
@@ -159,6 +164,8 @@ public class StaffBookingService {
     // Phase 333 — see InAppNotificationService's class javadoc for why this is a separate seam from
     // the (deliberately untouched, per this class's own "Not here" section) outbox.
     private final InAppNotificationService inAppNotificationService;
+    /** Phase 412 D3 — the walk-in's {@code /book/cancel/{token}} link, the same page a LINK guest uses. */
+    private final GuestCancelUrlBuilder guestCancelUrlBuilder;
 
     /**
      * Per-recipient ceiling on walk-in confirmation SMS, mirroring {@code PhoneOtpService}'s
@@ -327,8 +334,13 @@ public class StaffBookingService {
         BookingSlotLockGuard.lockMasterAndAssertFree(
                 bookingRepository, master.getId(), firstStart, lastEnd);
 
+        // Phase 412 D1 — the walk-in gets a one-time cancel token exactly like a LINK visit: ONE per visit, on the
+        // header (only its hash is persisted); the child rows stay tokenless. A walk-in always has a phone
+        // (requireStaffWalkInIdentity), so the token is always issued; with the SMS gate off it is never sent and
+        // stays a harmless hash.
+        UUID cancelToken = UUID.randomUUID();
         Appointment appointment = Appointment.staffAppointment(
-                master.getSalon(), guest.name(), guest.surname(), guestPhone, actorId);
+                master.getSalon(), guest.name(), guest.surname(), guestPhone, cancelToken, actorId);
 
         List<Booking> bookings = new ArrayList<>(items.size());
         for (VisitPlanner.PlannedItem item : items) {
@@ -363,7 +375,8 @@ public class StaffBookingService {
         // above the master lock; the rendering itself is pure string work.
         registerWalkInConfirmationSms(
                 guestPhone,
-                buildWalkInConfirmationSms(master, firstServiceName, items.size(), firstStart, lastEnd));
+                buildWalkInConfirmationSms(master, firstServiceName, items.size(), firstStart, lastEnd,
+                        guestCancelUrlBuilder.build(cancelToken)));
 
         // REUSE-FIRST (Phase 22.14): the visit-detail enrichment is AppointmentService#enrich's job,
         // not a second mapper here. `saved` already carries everything `enrich` dereferences —
@@ -610,7 +623,7 @@ public class StaffBookingService {
      */
     private String buildWalkInConfirmationSms(
             Master master, String firstServiceName, int totalServiceCount,
-            OffsetDateTime startsAt, OffsetDateTime endsAt) {
+            OffsetDateTime startsAt, OffsetDateTime endsAt, String cancelUrl) {
         if (endsAt.isBefore(startsAt)) {
             // Defensive invariant, never client-triggered: VisitPlanner#assertContiguous already
             // guarantees lastEnd >= firstStart for any chain that reaches this method.
@@ -622,7 +635,8 @@ public class StaffBookingService {
                 "masterName", masterName(master),
                 "serviceName", visitServiceNamePhrase(firstServiceName, totalServiceCount),
                 "date", DATE_FMT.format(kyiv),
-                "time", TIME_FMT.format(kyiv)));
+                "time", TIME_FMT.format(kyiv),
+                "cancelUrl", cancelUrl));
     }
 
     /**
