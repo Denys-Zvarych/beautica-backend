@@ -39,10 +39,12 @@ class AllowListTelegramMessengerTest {
     }
 
     @Test
-    @DisplayName("chat not on the list → TelegramDeliveryException, delegate never called, no chat id or text in logs")
+    @DisplayName("chat not on the list → TelegramNotAllowListedException (a TelegramDeliveryException), delegate never called, no chat id or text in logs")
     void should_throwDeliveryAndSkipDelegate_when_chatNotAllowed(CapturedOutput output) {
         assertThatThrownBy(() -> messenger.send(OTHER_CHAT, "Нагадування"))
-                .isExactlyInstanceOf(TelegramDeliveryException.class)
+                .isExactlyInstanceOf(TelegramNotAllowListedException.class)
+                // Typed apart for the router metric (408 audit-fix), still a delivery failure → SMS fallback.
+                .isInstanceOf(TelegramDeliveryException.class)
                 .message().doesNotContain(Long.toString(OTHER_CHAT));
 
         verify(delegate, never()).send(anyLong(), anyString());

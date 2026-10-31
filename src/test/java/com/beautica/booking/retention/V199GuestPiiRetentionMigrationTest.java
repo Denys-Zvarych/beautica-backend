@@ -123,6 +123,8 @@ class V199GuestPiiRetentionMigrationTest {
             // V202 (phase 381) adds the NULL consent pair to the head schema this test migrates to.
             assertThat(after.remove("guest_privacy_accepted_at")).as("consent of %s", shape).isNull();
             assertThat(after.remove("guest_privacy_policy_version")).as("consent version of %s", shape).isNull();
+            // V225 (phase 413) adds the 2h-reminder claim flag to bookings only, constant DEFAULT FALSE.
+            assertThat(after.remove("reminder_2h_sent")).as("2h reminder flag of %s", shape).isEqualTo(false);
             // V206 (head) moves the plaintext cancel token into its hash.
             assertThat(after).as("booking shape: %s", shape).isEqualTo(GuestPiiFixtures.afterV206(BOOKINGS_BEFORE.get(id)));
         });

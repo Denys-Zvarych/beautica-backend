@@ -117,6 +117,10 @@ class GuestPiiRetentionConfigTest {
                 // Phase 402: the job also runs the guest-review retention pass — a collaborator, mocked for wiring only.
                 .withBean(com.beautica.review.invite.service.GuestReviewRetentionService.class,
                         () -> mock(com.beautica.review.invite.service.GuestReviewRetentionService.class))
+                // Phase 409 D2: the same run purges BLOCKED Telegram links — mocked for wiring only. Its own hourly /
+                // weekly crons live on TelegramLinkTokenPurgeJob (not loaded here), so this job still owns ONE task.
+                .withBean(com.beautica.notification.telegram.link.TelegramLinkRetentionService.class,
+                        () -> mock(com.beautica.notification.telegram.link.TelegramLinkRetentionService.class))
                 .withBean(Clock.class, Clock::systemUTC);
     }
 

@@ -2,6 +2,7 @@ package com.beautica.config;
 
 import com.beautica.notification.telegram.TelegramBotApiClient;
 import com.beautica.notification.telegram.TelegramDeliveryException;
+import com.beautica.notification.telegram.TelegramNotAllowListedException;
 import com.beautica.notification.telegram.TelegramMessenger;
 import com.github.tomakehurst.wiremock.WireMockServer;
 import org.junit.jupiter.api.AfterEach;
@@ -64,13 +65,15 @@ class TelegramStagingOutboundDeliveryTest {
     }
 
     @Test
-    @DisplayName("staging, chat not on the list → TelegramDeliveryException (SMS fallback signal) and ZERO requests reach the Bot API")
+    @DisplayName("staging, chat not on the list → TelegramNotAllowListedException (a TelegramDeliveryException, SMS fallback signal) and ZERO requests reach the Bot API")
     void should_makeNoHttpCallAndThrowDelivery_when_stagingChatNotAllowListed() {
         withProfile("staging").run(context -> {
             TelegramMessenger messenger = context.getBean(TelegramMessenger.class);
 
             assertThatThrownBy(() -> messenger.send(STRANGER_CHAT, TEXT))
-                    .isExactlyInstanceOf(TelegramDeliveryException.class)
+                    .isExactlyInstanceOf(TelegramNotAllowListedException.class)
+                    // Typed apart for the router metric (408 audit-fix), still a delivery failure → SMS fallback.
+                    .isInstanceOf(TelegramDeliveryException.class)
                     .message().doesNotContain(Long.toString(STRANGER_CHAT)).doesNotContain(TEXT);
             botApi.verify(0, anyRequestedFor(anyUrl()));
         });

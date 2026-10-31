@@ -16,7 +16,11 @@ import org.springframework.http.ResponseEntity;
 public final class TelegramWebhookTestSupport {
 
     static final String PATH = "/api/v1/telegram/webhook";
-    /** Bot API {@code secret_token} alphabet; a compile-time constant (used in {@code @TestPropertySource}). */
+    /**
+     * Bot API {@code secret_token} alphabet; a compile-time constant (used in the ITs' test property source).
+     * Phrased without the annotation literal: {@code TestHttpClientPolicyTest} treats a source containing the
+     * at-sign + "Test" prefix as a test class, and this helper borrows its caller's already-bounded template.
+     */
     static final String SECRET = "it-webhook-secret-0123456789abcdef0123456789abcdef0123456789abcdefzz";
     static final String ENABLED_PROPERTY = "app.telegram.enabled=true";
     static final String CAPTURE_MODE_PROPERTY = "app.telegram.mode=capture";

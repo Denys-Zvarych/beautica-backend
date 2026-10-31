@@ -126,6 +126,8 @@ class V202GuestPrivacyConsentMigrationTest {
             assertThat(after.remove("guest_privacy_accepted_at")).as("consent of %s", shape).isNull();
             assertThat(after.remove("guest_privacy_policy_version")).as("version of %s", shape).isNull();
             assertThat(after.remove("guest_pii_anonymised_at")).as("marker of %s", shape).isNull();
+            // V225 (phase 413) adds the 2h-reminder claim flag to bookings only, constant DEFAULT FALSE.
+            assertThat(after.remove("reminder_2h_sent")).as("2h reminder flag of %s", shape).isEqualTo(false);
             Map<String, Object> before = new HashMap<>(BOOKINGS_BEFORE.get(id));
             before.remove("guest_pii_anonymised_at");
             // V206 (head) moves the plaintext cancel token into its hash.
