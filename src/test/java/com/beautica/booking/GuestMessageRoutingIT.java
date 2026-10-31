@@ -379,6 +379,10 @@ class GuestMessageRoutingIT extends AbstractWalkInBookingSmsIT {
         assertThat(linkStatusAndChat()).as("405/406: contact share proved the booking phone")
                 .isEqualTo("ACTIVE/" + ALLOWED_CHAT);
         assertThat(telegramRequests()).as("the webhook replies inline, never through the Bot API").isEmpty();
+        awaitTelegramRequests(1);
+        assertThat(telegramTexts()).as("the booking details follow the LINKED reply")
+                .singleElement().asString().startsWith("Запис підтверджено ✅\n");
+        stubTelegram(200, OK_BODY);
 
         reminderJob.sendReminders();
 
@@ -406,6 +410,98 @@ class GuestMessageRoutingIT extends AbstractWalkInBookingSmsIT {
         assertThat(sentText()).contains("Завтра о");
         assertThat(telegramRequests()).as("a BLOCKED link is never tried again").isEmpty();
         assertNoPiiInLogs(LINK_PHONE, LINK_SUBSCRIBER_DIGITS);
+    }
+
+    @Test
+    @DisplayName("after the LINKED webhook reply, one outbound sendMessage carries the booking details; an "
+            + "ALREADY_LINKED re-tap sends none")
+    void should_sendBookingDetailsOnceAfterLinkedReply_when_guestSharesPhone() throws Exception {
+        jdbcTemplate.update("UPDATE salons SET street = 'вул. Хрещатик', building_no = '1' WHERE id = ?",
+                salon.salonId());
+        OffsetDateTime startsAt = tomorrowKyivAt(10);
+        UUID bookingId = insertLinkBooking(LINK_PHONE, startsAt);
+        String startToken = TelegramLinkTestSupport.rawToken(linkService.issueForBooking(bookingId, LINK_PHONE));
+        TelegramWebhookTestSupport webhook = new TelegramWebhookTestSupport(restTemplate);
+        webhook.post(TelegramWebhookTestSupport.text(ALLOWED_CHAT, "/start " + startToken), WEBHOOK_SECRET,
+                "198.51.100.51");
+
+        ResponseEntity<String> linked = webhook.post(
+                TelegramWebhookTestSupport.contact(ALLOWED_CHAT, LINK_PHONE.substring(1), ALLOWED_CHAT),
+                WEBHOOK_SECRET, "198.51.100.52");
+
+        assertThat(readJson(linked.getBody()).path("text").asText()).startsWith("Тепер усі сповіщення");
+        assertThat(telegramRequests()).as("the details are scheduled after the reply, not sent inline").isEmpty();
+        awaitTelegramRequests(1);
+        String salonName = jdbcTemplate.queryForObject("SELECT name FROM salons WHERE id = ?", String.class,
+                salon.salonId());
+        assertThat(telegramTexts()).containsExactly("Запис підтверджено ✅\n"
+                + "Послуга: " + SERVICE_NAME + "\n"
+                + "Дата: " + DATE_FMT.format(startsAt.atZoneSameInstant(TimeZones.KYIV)) + " о " + kyivTime(startsAt)
+                + "\n"
+                + "Майстер: " + MASTER_NAME + "\n"
+                + "Салон: " + salonName + "\n"
+                + "Адреса: вул. Хрещатик, 1\n"
+                + "Ціна: 350 ₴");
+        assertThat(json(telegramRequests().get(0)).path("chat_id").asLong()).isEqualTo(ALLOWED_CHAT);
+        TURBOSMS.verify(0, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
+
+        ResponseEntity<String> retap = webhook.post(TelegramWebhookTestSupport.text(ALLOWED_CHAT,
+                "/start " + startToken), WEBHOOK_SECRET, "198.51.100.53");
+
+        assertThat(readJson(retap.getBody()).path("text").asText()).startsWith("Тепер усі сповіщення");
+        Awaitility.await().during(Duration.ofSeconds(3)).atMost(Duration.ofSeconds(5))
+                .until(() -> telegramRequests().size() == 1);
+        assertNoPiiInLogs(LINK_PHONE, LINK_SUBSCRIBER_DIGITS);
+        assertThat(logMessages()).noneMatch(line -> line.contains(String.valueOf(ALLOWED_CHAT)));
+    }
+
+    @Test
+    @DisplayName("a two-service guest visit: the details list both services in time order and the summed price "
+            + "(real visit query, real Bot API wire)")
+    void should_listEveryVisitServiceAndSummedPrice_when_linkedBookingBelongsToVisit() throws Exception {
+        UUID secondServiceId = insertService(salon.masterId(), "SALON", salon.salonId());
+        jdbcTemplate.update("UPDATE service_definitions SET name = 'Педикюр' WHERE id = "
+                + "(SELECT service_def_id FROM master_services WHERE id = ?)", secondServiceId);
+        OffsetDateTime startsAt = tomorrowKyivAt(10);
+        UUID appointmentId = insertGuestLinkAppointment(LINK_PHONE, now.minus(Duration.ofDays(1)), now);
+        UUID lead = insertLinkBooking(LINK_PHONE, startsAt);
+        UUID second = insertLinkBooking(LINK_PHONE, startsAt.plusHours(1));
+        jdbcTemplate.update("UPDATE bookings SET appointment_id = ? WHERE id IN (?, ?)", appointmentId, lead, second);
+        jdbcTemplate.update("UPDATE bookings SET master_service_id = ? WHERE id = ?", secondServiceId, second);
+
+        linkThroughWebhook(lead, "198.51.100.61");
+
+        awaitTelegramRequests(1);
+        assertThat(telegramTexts()).singleElement().asString()
+                .as("both visit lines, lead first, prices of both frozen rows summed")
+                .contains("\nПослуги: " + SERVICE_NAME + ", Педикюр\n")
+                .contains("\nДата: " + DATE_FMT.format(startsAt.atZoneSameInstant(TimeZones.KYIV)) + " о "
+                        + kyivTime(startsAt) + "\n")
+                .contains("\nСалон: ")
+                .endsWith("\nЦіна: 700 ₴");
+        TURBOSMS.verify(0, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
+    }
+
+    @Test
+    @DisplayName("booking cancelled after the link token was issued → LINKED reply, but no details message is sent")
+    void should_sendNoDetails_when_bookingNoLongerConfirmedAtSendTime() throws Exception {
+        UUID bookingId = insertLinkBooking(LINK_PHONE, tomorrowKyivAt(10));
+        String startToken = TelegramLinkTestSupport.rawToken(linkService.issueForBooking(bookingId, LINK_PHONE));
+        TelegramWebhookTestSupport webhook = new TelegramWebhookTestSupport(restTemplate);
+        webhook.post(TelegramWebhookTestSupport.text(ALLOWED_CHAT, "/start " + startToken), WEBHOOK_SECRET,
+                "198.51.100.71");
+        jdbcTemplate.update("UPDATE bookings SET status = 'CANCELLED' WHERE id = ?", bookingId);
+
+        ResponseEntity<String> linked = webhook.post(
+                TelegramWebhookTestSupport.contact(ALLOWED_CHAT, LINK_PHONE.substring(1), ALLOWED_CHAT),
+                WEBHOOK_SECRET, "198.51.100.72");
+
+        assertThat(readJson(linked.getBody()).path("text").asText()).startsWith("Тепер усі сповіщення");
+        assertThat(linkStatusAndChat()).as("the link itself still succeeds").isEqualTo("ACTIVE/" + ALLOWED_CHAT);
+        Awaitility.await().atMost(Duration.ofSeconds(10)).until(() -> logMessages().stream()
+                .anyMatch(line -> line.contains("event=telegram_booking_details result=NOTHING_TO_CONFIRM")));
+        assertThat(telegramRequests()).as("a cancelled booking is never «confirmed» to the guest").isEmpty();
+        TURBOSMS.verify(0, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
     }
 
     @Test
@@ -589,6 +685,23 @@ class GuestMessageRoutingIT extends AbstractWalkInBookingSmsIT {
     private String statusChangedRowStatus(UUID bookingId) {
         return jdbcTemplate.queryForObject("SELECT status FROM notification_outbox "
                 + "WHERE event_type = 'STATUS_CHANGED' AND aggregate_id = ?", String.class, bookingId);
+    }
+
+    /** Issues a link token for {@code bookingId} and runs /start + own-contact share through the real webhook. */
+    private void linkThroughWebhook(UUID bookingId, String sourceIp) {
+        String startToken = TelegramLinkTestSupport.rawToken(linkService.issueForBooking(bookingId, LINK_PHONE));
+        TelegramWebhookTestSupport webhook = new TelegramWebhookTestSupport(restTemplate);
+        webhook.post(TelegramWebhookTestSupport.text(ALLOWED_CHAT, "/start " + startToken), WEBHOOK_SECRET, sourceIp);
+        ResponseEntity<String> linked = webhook.post(
+                TelegramWebhookTestSupport.contact(ALLOWED_CHAT, LINK_PHONE.substring(1), ALLOWED_CHAT),
+                WEBHOOK_SECRET, sourceIp);
+        assertThat(readJson(linked.getBody()).path("text").asText()).as("fixture: contact share did not link")
+                .startsWith("Тепер усі сповіщення");
+    }
+
+    /** The post-link details message is scheduled {@code SEND_DELAY} after the webhook reply (real scheduler). */
+    private void awaitTelegramRequests(int count) {
+        Awaitility.await().atMost(Duration.ofSeconds(10)).until(() -> telegramRequests().size() >= count);
     }
 
     private List<LoggedRequest> telegramRequests() {

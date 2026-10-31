@@ -998,6 +998,52 @@ public class AsyncConfig implements AsyncConfigurer {
         return new SyncTaskExecutor();
     }
 
+    /** {@link #telegramDetailsExecutor()} sizing: one Telegram send at a time, a small bounded backlog. */
+    static final int TELEGRAM_DETAILS_POOL_SIZE = 1;
+    static final int TELEGRAM_DETAILS_QUEUE_CAPACITY = 50;
+
+    /**
+     * Pool for the one-off «booking details» Telegram message sent after a fresh link
+     * ({@code LinkedBookingDetailsSender}). Kept OFF {@link #smsSendExecutor()} so this best-effort follow-up never
+     * consumes the request-path booking-SMS / provider-cancellation budget.
+     *
+     * <p>{@code AbortPolicy}: a refused hand-off is logged by the sender ({@code result=DROPPED}, no PII) and dropped —
+     * the guest already has the confirmation SMS (§H-2: no caller-runs for notification I/O). {@code core == max}
+     * (see {@link #smsReminderExecutor()} for why a smaller core never grows); the thread dies back when idle.
+     *
+     * <p><b>Shutdown.</b> No drain ({@code waitForTasksToCompleteOnShutdown = false}, no
+     * {@code *_SHUTDOWN_GRACE_SECONDS}): an abandoned details message is an accepted loss, so this pool adds nothing
+     * to the sequential shutdown budget above. No security-context wrapper: the task carries ids only.
+     * {@code @Profile("!test")} — see {@link #syncTelegramDetailsExecutor()}.
+     */
+    @Bean(name = "telegramDetailsExecutor")
+    @Profile("!test")
+    public TaskExecutor telegramDetailsExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(TELEGRAM_DETAILS_POOL_SIZE);
+        executor.setMaxPoolSize(TELEGRAM_DETAILS_POOL_SIZE);
+        executor.setAllowCoreThreadTimeOut(true);
+        executor.setKeepAliveSeconds(60);
+        executor.setQueueCapacity(TELEGRAM_DETAILS_QUEUE_CAPACITY);
+        executor.setThreadNamePrefix("telegram-details-");
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.AbortPolicy());
+        executor.setTaskDecorator(taskContextDecorator());
+        executor.setWaitForTasksToCompleteOnShutdown(false);
+        executor.initialize();
+        return executor;
+    }
+
+    /**
+     * Test-profile counterpart of {@link #telegramDetailsExecutor()}: the send runs inline on the scheduler thread
+     * that hands it off (Anti-Bug §M). Same bean name, mutually exclusive profile, so the {@code @Qualifier} in
+     * {@code LinkedBookingDetailsSender} resolves in every profile.
+     */
+    @Bean(name = "telegramDetailsExecutor")
+    @Profile("test")
+    public TaskExecutor syncTelegramDetailsExecutor() {
+        return new SyncTaskExecutor();
+    }
+
     @Override
     public AsyncUncaughtExceptionHandler getAsyncUncaughtExceptionHandler() {
         return (ex, method, params) ->

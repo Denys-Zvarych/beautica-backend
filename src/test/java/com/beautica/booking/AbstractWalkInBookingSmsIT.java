@@ -466,6 +466,23 @@ abstract class AbstractWalkInBookingSmsIT extends AbstractStaffBookingIT {
         return bookingId;
     }
 
+    /**
+     * A CONFIRMED guest (LINK) appointment header for a multi-service visit, with explicit {@code created_at} /
+     * {@code updated_at} (never DB {@code NOW()}). Attach items by setting {@code bookings.appointment_id}. Promoted
+     * when a second routing suite needed it (REUSE-FIRST). The cancel token is stored as its hash. Returns its id.
+     */
+    protected UUID insertGuestLinkAppointment(String phone, java.time.Instant createdAt, java.time.Instant updatedAt) {
+        UUID appointmentId = UUID.randomUUID();
+        jdbcTemplate.update("INSERT INTO appointments (id, salon_id, status, booking_source, guest_name, "
+                        + "guest_surname, guest_phone, cancel_token_hash, created_at, updated_at) "
+                        + "VALUES (?, ?, 'CONFIRMED', 'LINK', ?, ?, ?, encode(sha256(convert_to(?, 'UTF8')), 'hex'), "
+                        + "?, ?)",
+                appointmentId, salon.salonId(), GUEST_NAME, GUEST_SURNAME, phone, UUID.randomUUID().toString(),
+                java.time.OffsetDateTime.ofInstant(createdAt, java.time.ZoneOffset.UTC),
+                java.time.OffsetDateTime.ofInstant(updatedAt, java.time.ZoneOffset.UTC));
+        return appointmentId;
+    }
+
     protected int otpRowCount(String phone) {
         return jdbcTemplate.queryForObject(
                 "SELECT count(*) FROM phone_otps WHERE phone = ?", Integer.class, phone);

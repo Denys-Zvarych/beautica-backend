@@ -115,30 +115,40 @@ public class TelegramLinkService {
 
     @Transactional
     public ProofResult proveContact(long chatId, String contactPhone, Long contactUserId, long fromId) {
-        ProofResult result = doProve(chatId, contactPhone, contactUserId, fromId);
-        log.info("event=telegram_link op=prove result={}", result);
-        return result;
+        return proveContactForBooking(chatId, contactPhone, contactUserId, fromId).result();
     }
 
-    private ProofResult doProve(long chatId, String contactPhone, Long contactUserId, long fromId) {
+    /**
+     * {@link #proveContact} that also names the booking the proven token was issued for, so the webhook can follow
+     * the LINKED reply with that booking's details. Same single transaction; the booking id is set on
+     * {@link ProofResult#LINKED} only.
+     */
+    @Transactional
+    public ContactProof proveContactForBooking(long chatId, String contactPhone, Long contactUserId, long fromId) {
+        ContactProof proof = doProve(chatId, contactPhone, contactUserId, fromId);
+        log.info("event=telegram_link op=prove result={}", proof.result());
+        return proof;
+    }
+
+    private ContactProof doProve(long chatId, String contactPhone, Long contactUserId, long fromId) {
         // Own contact only (not a forwarded card); and in a private chat chat.id == from.id, so any other pairing is
         // not a guest's own private chat (defence in depth behind 406's chat.type filter).
         if (contactUserId == null || contactUserId != fromId || chatId != fromId) {
-            return ProofResult.NOT_OWN_CONTACT;
+            return ContactProof.of(ProofResult.NOT_OWN_CONTACT);
         }
         Instant now = clock.instant();
         Optional<TelegramLinkToken> pending = tokenRepository.findPendingClaimForUpdate(chatId, now);
         if (pending.isEmpty()) {
-            return ProofResult.NO_PENDING;
+            return ContactProof.of(ProofResult.NO_PENDING);
         }
         TelegramLinkToken token = pending.get();
         if (!token.phoneMatches(hashContactPhone(contactPhone))) {
             token.finish(TelegramTokenState.MISMATCH, now);
-            return ProofResult.MISMATCH;
+            return ContactProof.of(ProofResult.MISMATCH);
         }
         token.finish(TelegramTokenState.LINKED, now);
         linkRepository.upsert(UUID.randomUUID(), token.getPhoneHash(), chatId, now);
-        return ProofResult.LINKED;
+        return ContactProof.linked(token.getBookingId(), token.getPhoneHash());
     }
 
     @Transactional

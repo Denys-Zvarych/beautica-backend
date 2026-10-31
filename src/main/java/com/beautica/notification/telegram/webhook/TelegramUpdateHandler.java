@@ -2,6 +2,7 @@ package com.beautica.notification.telegram.webhook;
 
 import com.beautica.notification.telegram.TelegramChatAllowList;
 import com.beautica.notification.telegram.link.ClaimResult;
+import com.beautica.notification.telegram.link.ContactProof;
 import com.beautica.notification.telegram.link.ProofResult;
 import com.beautica.notification.telegram.link.TelegramLinkService;
 import com.beautica.notification.telegram.webhook.TelegramBotReplies.Reply;
@@ -19,12 +20,14 @@ import java.util.Optional;
 import java.util.regex.Pattern;
 
 /**
- * Phase 406 D5 — turns one authenticated Bot API update into at most one {@code sendMessage} reply.
+ * Phase 406 D5 — turns one authenticated Bot API update into at most one {@code sendMessage} reply. A fresh LINKED
+ * proof additionally schedules one outbound follow-up with the booking details ({@link LinkedBookingDetailsSender}).
  *
  * <p><b>Transaction boundary.</b> Deliberately not {@code @Transactional}: every {@link TelegramLinkService} call is
  * its own transaction (405 perf rule — {@code claim} / {@code proveContact} must never run inside an outer
  * transaction that already loaded the token), and the reply goes back in the HTTP response, so no outbound call
- * is ever made while a row or advisory lock is held.
+ * is ever made while a row or advisory lock is held — nor on the webhook thread at all: the LINKED follow-up is only
+ * scheduled here, after the proof committed.
  *
  * <p><b>Staging inbound gate (432 D3).</b> Only private chats are processed, and a chat that the
  * {@link TelegramChatAllowList} refuses is dropped (no reply, no service call, no DB write) before anything beyond
@@ -54,6 +57,7 @@ public class TelegramUpdateHandler {
 
     private final TelegramLinkService linkService;
     private final TelegramChatAllowList allowList;
+    private final LinkedBookingDetailsSender bookingDetailsSender;
 
     /**
      * The «try again» answer for an update the controller could not admit (concurrency cap full): no service call,
@@ -149,11 +153,12 @@ public class TelegramUpdateHandler {
             return TelegramBotReplies.notOwnContact(chatId);
         }
         try {
-            ProofResult result = linkService.proveContact(
+            ContactProof proof = linkService.proveContactForBooking(
                     chatId, message.contact().phoneNumber(), message.contact().userId(), fromId);
+            ProofResult result = proof.result();
             logUpdate("contact", result.name());
             return switch (result) {
-                case LINKED -> TelegramBotReplies.linked(chatId);
+                case LINKED -> onLinked(chatId, proof);
                 case MISMATCH -> TelegramBotReplies.mismatch(chatId);
                 case NOT_OWN_CONTACT -> TelegramBotReplies.notOwnContact(chatId);
                 case NO_PENDING -> TelegramBotReplies.helpRemovingKeyboard(chatId);
@@ -162,6 +167,17 @@ public class TelegramUpdateHandler {
             logUpdate("contact", "LOCK_TIMEOUT");
             return TelegramBotReplies.tryAgain(chatId, TelegramBotReplies.SHARE_PHONE_KEYBOARD);
         }
+    }
+
+    /**
+     * The proof has committed (its own transaction), so the details follow-up is scheduled now; it reaches the chat
+     * after this LINKED reply (see {@link LinkedBookingDetailsSender}). Only a fresh link triggers it — a re-tap of
+     * an already-linked chat ({@code /start} → {@code ALREADY_LINKED}) does not repeat the booking details.
+     */
+    private Reply onLinked(long chatId, ContactProof proof) {
+        proof.linkedBookingId().ifPresent(bookingId ->
+                bookingDetailsSender.scheduleAfterLink(chatId, bookingId, proof.phoneHash()));
+        return TelegramBotReplies.linked(chatId);
     }
 
     private Reply onStop(long chatId) {

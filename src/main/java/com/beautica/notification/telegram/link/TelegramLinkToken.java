@@ -149,6 +149,11 @@ public class TelegramLinkToken implements Persistable<byte[]> {
         return tokenHash.clone();
     }
 
+    /** The booking the token was issued for (407) — the booking whose details follow a successful link. */
+    public UUID getBookingId() {
+        return bookingId;
+    }
+
     @PostPersist
     @PostLoad
     void markPersisted() {

@@ -2,6 +2,7 @@ package com.beautica.booking.repository;
 
 import com.beautica.AbstractDataJpaTest;
 import com.beautica.auth.Role;
+import com.beautica.booking.entity.Appointment;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.master.entity.Master;
@@ -14,6 +15,7 @@ import com.beautica.service.entity.PriceType;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.entity.ServiceType;
 import com.beautica.user.User;
+import org.hibernate.Hibernate;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -1323,4 +1325,53 @@ class BookingRepositoryTest extends AbstractDataJpaTest {
                 .isEmpty();
     }
 
+
+    // ── findWithVisitForGuestDetails (Telegram booking details after linking) ──────
+
+    private Booking walkIn(Appointment appointment, OffsetDateTime startsAt) {
+        Booking booking = Booking.staffBooking(master, masterService, null, startsAt, startsAt.plusHours(1),
+                new BigDecimal("450.00"), null, 60, 0, "Олена", "Коваль", "+380501234567",
+                master.getUser().getId());
+        booking.setAppointment(appointment);
+        em.persist(booking);
+        return booking;
+    }
+
+    @Test
+    @DisplayName("should_returnWholeVisitWithServiceTypeFetched_when_bookingBelongsToVisit")
+    void should_returnWholeVisitWithServiceTypeFetched_when_bookingBelongsToVisit() {
+        Appointment visit = Appointment.staffAppointment(null, "Олена", "Коваль", "+380501234567",
+                master.getUser().getId());
+        em.persist(visit);
+        OffsetDateTime start = OffsetDateTime.of(2026, 6, 2, 10, 0, 0, 0, ZoneOffset.UTC);
+        Booking lead = walkIn(visit, start);
+        Booking second = walkIn(visit, start.plusHours(1));
+        Booking unrelated = walkIn(null, start.plusHours(3));
+        em.flush();
+        em.clear();
+
+        List<Booking> rows = bookingRepository.findWithVisitForGuestDetails(lead.getId());
+
+        assertThat(rows).extracting(Booking::getId)
+                .containsExactlyInAnyOrder(lead.getId(), second.getId())
+                .doesNotContain(unrelated.getId());
+        assertThat(rows).allSatisfy(row -> assertThat(
+                Hibernate.isInitialized(row.getMasterService().getServiceDefinition().getServiceType()))
+                .as("walk-in names read sd.serviceType: fetched in the same statement, no lazy load")
+                .isTrue());
+    }
+
+    @Test
+    @DisplayName("should_returnOnlyTheBooking_when_bookingHasNoVisit")
+    void should_returnOnlyTheBooking_when_bookingHasNoVisit() {
+        OffsetDateTime start = OffsetDateTime.of(2026, 6, 2, 10, 0, 0, 0, ZoneOffset.UTC);
+        Booking single = walkIn(null, start);
+        walkIn(null, start.plusHours(2));
+        em.flush();
+        em.clear();
+
+        List<Booking> rows = bookingRepository.findWithVisitForGuestDetails(single.getId());
+
+        assertThat(rows).extracting(Booking::getId).containsExactly(single.getId());
+    }
 }
