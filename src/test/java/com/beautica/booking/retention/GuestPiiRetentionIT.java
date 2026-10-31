@@ -460,6 +460,36 @@ class GuestPiiRetentionIT extends AbstractIntegrationTest {
         }
 
         @Test
+        @DisplayName("phase 412 D5: an aged STAFF walk-in header carrying a cancel token is anonymised, token cleared")
+        void should_clearWalkInHeaderToken_when_staffVisitAged() {
+            UUID header = fx.appointment("STAFF", "COMPLETED", PHONE, UUID.randomUUID(), provider.ownerUserId());
+            fx.visitItem(provider, header, "STAFF", "COMPLETED", beforeCutoff(5), PHONE);
+            assertThat(fx.appointmentRow(header).get("cancel_token_hash")).as("fixture sanity").isNotNull();
+
+            GuestPiiAnonymisationResult result = service.anonymiseDue(cutoff);
+
+            assertThat(result.visitsAnonymised()).isEqualTo(1);
+            assertAnonymised(fx.appointmentRow(header));
+            assertThat(fx.appointmentRow(header).get("cancel_token_hash")).isNull();
+        }
+
+        @Test
+        @DisplayName("phase 412 D5: erase consumes an upcoming STAFF walk-in visit's cancel token and sends no SMS")
+        void should_consumeWalkInToken_when_upcomingStaffVisitErased() {
+            OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
+            UUID header = fx.appointment("STAFF", "CONFIRMED", PHONE, UUID.randomUUID(), provider.ownerUserId());
+            UUID item = fx.visitItem(provider, header, "STAFF", "CONFIRMED", now.plusDays(3), PHONE);
+
+            GuestPiiAnonymisationResult result = service.eraseByPhone(PHONE, null);
+
+            assertThat(result.visitsCancelled()).isEqualTo(1);
+            assertThat(fx.appointmentRow(header).get("status")).isEqualTo("CANCELLED");
+            assertThat(fx.appointmentRow(header).get("cancel_token_hash")).isNull();
+            assertThat(fx.booking(item).get("status")).isEqualTo("CANCELLED");
+            verifyNoInteractions(smsService);
+        }
+
+        @Test
         @DisplayName("the tokenless cancel-by-id statements stamp updated_at (D12)")
         void should_stampUpdatedAt_when_cancelledById() {
             OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);

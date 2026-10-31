@@ -318,10 +318,10 @@ public class Appointment extends AuditableEntity {
      * before the row exists, mirroring {@link Booking#staffBooking} and the DB CHECK
      * {@code chk_appointment_guest_fields} (V139).
      *
-     * <p><b>No cancel token.</b> Unlike a LINK visit, a staff-created visit carries NO guest
-     * self-cancel link — the V139 STAFF branch requires {@code cancel_token IS NULL}. Only the
-     * provider closes it, through a management endpoint. This is the same rule
-     * {@code Booking.staffBooking} applies to the child rows, so header and children agree.
+     * <p><b>No cancel token from this overload.</b> Reversed by phase 412 (V226): the walk-in create
+     * path uses the 6-argument overload below, which carries the visit's guest cancel token. This
+     * tokenless form remains for callers that build a header with no self-cancel link. The child rows
+     * ({@code Booking.staffBooking}) stay tokenless either way.
      *
      * <p><b>Surname is REQUIRED</b>, unlike the LINK branch where it stays optional (V91's
      * rationale). The two branches intentionally differ; do not unify them.
@@ -343,6 +343,25 @@ public class Appointment extends AuditableEntity {
             String guestSurname,
             String guestPhone,
             UUID createdByUserId) {
+        return staffAppointment(salon, guestName, guestSurname, guestPhone, null, createdByUserId);
+    }
+
+    /**
+     * Phase 412 D1 — the walk-in visit header WITH the guest's one-time cancel token, issued exactly like
+     * {@link #guestAppointment}'s (raw token in memory for the SMS link, only its {@link CancelTokenHasher}
+     * hash persisted). Reverses the "no cancel token" rule above: V226 lets a LIVE walk-in header (guest
+     * phone present — always, by {@link Booking#requireStaffWalkInIdentity}) carry the token; the child
+     * {@code bookings} rows stay tokenless (the visit token is the only one any lookup accepts).
+     *
+     * @param cancelToken the visit-level one-time cancel token, or {@code null} for a tokenless header
+     */
+    public static Appointment staffAppointment(
+            Salon salon,
+            String guestName,
+            String guestSurname,
+            String guestPhone,
+            UUID cancelToken,
+            UUID createdByUserId) {
         Booking.requireStaffWalkInIdentity(guestName, guestSurname, guestPhone, createdByUserId);
         return Appointment.builder()
                 // No client FK: the walk-in mode has no registered account
@@ -353,7 +372,8 @@ public class Appointment extends AuditableEntity {
                 .guestName(guestName)
                 .guestSurname(guestSurname)
                 .guestPhone(guestPhone)
-                // cancelToken stays null: no guest self-cancel link for a staff visit.
+                // Phase 412: the visit's guest cancel token (null only via the 5-argument overload).
+                .cancelToken(cancelToken)
                 .createdByUserId(createdByUserId)
                 .build();
     }

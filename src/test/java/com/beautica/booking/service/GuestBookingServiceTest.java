@@ -90,7 +90,7 @@ class GuestBookingServiceTest {
                 guestTokenProvider, masterRepository, masterServiceRepository, bookingRepository,
                 appointmentRepository, slotCalculationService, outboxService, smsDispatcher(),
                 new BookingSmsProperties(), salonCatalogCacheEvictor,
-                new VisitPlanner(masterServiceRepository), FRONTEND,
+                new VisitPlanner(masterServiceRepository), new GuestCancelUrlBuilder(FRONTEND),
                 java.time.Clock.fixed(OffsetDateTime.parse("2026-06-01T10:00:00Z").toInstant(), ZoneOffset.UTC),
                 inAppNotificationService, retiredBookingSlugGuard, salonGuestMasterResolver, guestTokenBookingCap,
                 bookingBlockGuard, guestTelegramLinkService, transactionManager);
@@ -241,7 +241,7 @@ class GuestBookingServiceTest {
                 guestTokenProvider, masterRepository, masterServiceRepository, bookingRepository,
                 appointmentRepository, slotCalculationService, outboxService, smsDispatcher(),
                 new BookingSmsProperties(), salonCatalogCacheEvictor,
-                new VisitPlanner(masterServiceRepository), FRONTEND,
+                new VisitPlanner(masterServiceRepository), new GuestCancelUrlBuilder(FRONTEND),
                 java.time.Clock.fixed(OffsetDateTime.parse("2026-06-01T10:00:00Z").toInstant(), ZoneOffset.UTC),
                 inAppNotificationService, retiredBookingSlugGuard, salonGuestMasterResolver, guestTokenBookingCap,
                 bookingBlockGuard, realTelegram, transactionManager);

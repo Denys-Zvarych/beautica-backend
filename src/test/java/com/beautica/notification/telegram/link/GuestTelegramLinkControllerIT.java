@@ -12,7 +12,6 @@ import com.beautica.support.MutableTestClock;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -53,8 +52,8 @@ import static org.mockito.Mockito.doThrow;
  * {@code telegram} block of a real guest booking. Capture mode: the flag is on with no Bot API credentials.
  * {@link TelegramLinkService} is a spy so one case can make the post-commit link read fail.
  *
- * <p>The V206 {@code chk_bookings_guest_fields} CHECK forbids a cancel token on any APP row (pinned below) and, until
- * phase 412 relaxes its STAFF arm, on any STAFF row — the STAFF cases are written but {@code @Disabled} until 412.
+ * <p>The {@code chk_bookings_guest_fields} CHECK forbids a cancel token on any APP row (pinned below); V226 (phase 412)
+ * lets a live STAFF walk-in with a guest phone carry one, which the STAFF cases below exercise.
  */
 @Import({TestSecurityConfig.class, TelegramLinkTestSupport.ClockConfig.class})
 @TestPropertySource(properties = {
@@ -419,8 +418,7 @@ class GuestTelegramLinkControllerIT extends AbstractIntegrationTest {
     // ── STAFF walk-ins (phase 412) ───────────────────────────────────────────────────────────────────
 
     @Nested
-    @Disabled("pending 412: STAFF cancel token")
-    @DisplayName("STAFF walk-in (enable when phase 412 lands)")
+    @DisplayName("STAFF walk-in (phase 412)")
     class StaffWalkIn {
 
         @Test

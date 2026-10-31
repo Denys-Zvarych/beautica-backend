@@ -37,6 +37,7 @@ import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.never;
@@ -95,13 +96,13 @@ class BookingReminderJobTwoHourTest {
     @Test
     @DisplayName("window = [now+1h45, now+2h15): the query gets exactly those bounds")
     void should_queryHalfOpenWindow_when_daytime() {
-        when(bookingRepository.findGuestBookingsForTwoHourReminder(any(), any(), any())).thenReturn(List.of());
+        when(bookingRepository.findGuestBookingsForTwoHourReminder(any(), any(), anyBoolean(), any())).thenReturn(List.of());
 
         jobAt(MIDDAY_KYIV).sweepTwoHour();
 
         OffsetDateTime now = OffsetDateTime.ofInstant(MIDDAY_KYIV, ZoneOffset.UTC);
         verify(bookingRepository).findGuestBookingsForTwoHourReminder(
-                now.plus(Duration.ofMinutes(105)), now.plus(Duration.ofMinutes(135)), Limit.of(500));
+                now.plus(Duration.ofMinutes(105)), now.plus(Duration.ofMinutes(135)), false, Limit.of(500));
     }
 
     @ParameterizedTest(name = "{0} → night={1}")
@@ -141,7 +142,7 @@ class BookingReminderJobTwoHourTest {
     void should_send_when_justBeforeNight() {
         Instant now = Instant.parse("2026-06-01T17:59:00Z");
         Booking booking = guestBooking("+380501111111", now.plus(Duration.ofHours(2)), now.minus(Duration.ofDays(1)));
-        when(bookingRepository.findGuestBookingsForTwoHourReminder(any(), any(), any())).thenReturn(List.of(booking));
+        when(bookingRepository.findGuestBookingsForTwoHourReminder(any(), any(), anyBoolean(), any())).thenReturn(List.of(booking));
 
         jobAt(now).sweepTwoHour();
 
@@ -153,7 +154,7 @@ class BookingReminderJobTwoHourTest {
     void should_publishH2EventWithTwoHourTemplate_when_bookingDue() {
         Booking booking = guestBooking("+380501111111", MIDDAY_KYIV.plus(Duration.ofHours(2)),
                 MIDDAY_KYIV.minus(Duration.ofDays(1)));
-        when(bookingRepository.findGuestBookingsForTwoHourReminder(any(), any(), any())).thenReturn(List.of(booking));
+        when(bookingRepository.findGuestBookingsForTwoHourReminder(any(), any(), anyBoolean(), any())).thenReturn(List.of(booking));
 
         jobAt(MIDDAY_KYIV).sweepTwoHour();
 
@@ -172,7 +173,7 @@ class BookingReminderJobTwoHourTest {
     void should_skipAndNotClaim_when_shortNotice() {
         Instant startsAt = MIDDAY_KYIV.plus(Duration.ofHours(2));
         Booking shortNotice = guestBooking("+380501111111", startsAt, startsAt.minus(Duration.ofMinutes(179)));
-        when(bookingRepository.findGuestBookingsForTwoHourReminder(any(), any(), any())).thenReturn(List.of(shortNotice));
+        when(bookingRepository.findGuestBookingsForTwoHourReminder(any(), any(), anyBoolean(), any())).thenReturn(List.of(shortNotice));
 
         jobAt(MIDDAY_KYIV).sweepTwoHour();
 
@@ -187,7 +188,7 @@ class BookingReminderJobTwoHourTest {
     void should_send_when_createdExactlyMinLeadBefore() {
         Instant startsAt = MIDDAY_KYIV.plus(Duration.ofHours(2));
         Booking booking = guestBooking("+380501111111", startsAt, startsAt.minus(Duration.ofHours(3)));
-        when(bookingRepository.findGuestBookingsForTwoHourReminder(any(), any(), any())).thenReturn(List.of(booking));
+        when(bookingRepository.findGuestBookingsForTwoHourReminder(any(), any(), anyBoolean(), any())).thenReturn(List.of(booking));
 
         jobAt(MIDDAY_KYIV).sweepTwoHour();
 
@@ -199,7 +200,7 @@ class BookingReminderJobTwoHourTest {
     void should_publishNothing_when_claimLost() {
         Booking booking = guestBooking("+380501111111", MIDDAY_KYIV.plus(Duration.ofHours(2)),
                 MIDDAY_KYIV.minus(Duration.ofDays(1)));
-        when(bookingRepository.findGuestBookingsForTwoHourReminder(any(), any(), any())).thenReturn(List.of(booking));
+        when(bookingRepository.findGuestBookingsForTwoHourReminder(any(), any(), anyBoolean(), any())).thenReturn(List.of(booking));
         doReturn(List.of()).when(bookingRepository).claimTwoHourRemindersByIds(any());
 
         jobAt(MIDDAY_KYIV).sweepTwoHour();

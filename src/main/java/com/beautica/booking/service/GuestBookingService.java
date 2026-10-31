@@ -30,7 +30,6 @@ import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.repository.MasterServiceRepository;
 import com.beautica.service.service.SalonCatalogCacheEvictor;
 import io.jsonwebtoken.JwtException;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
@@ -80,7 +79,8 @@ public class GuestBookingService {
     private final BookingSmsProperties smsProperties;
     private final SalonCatalogCacheEvictor salonCatalogCacheEvictor;
     private final VisitPlanner visitPlanner;
-    private final String frontendBaseUrl;
+    /** The guest's public cancel link — shared with the STAFF walk-in path (phase 412). */
+    private final GuestCancelUrlBuilder guestCancelUrlBuilder;
     private final Clock kyivClock;
     // Phase 333 — see InAppNotificationService's class javadoc for why this is a separate seam from
     // outboxService, never called from it.
@@ -110,7 +110,7 @@ public class GuestBookingService {
             BookingSmsProperties smsProperties,
             SalonCatalogCacheEvictor salonCatalogCacheEvictor,
             VisitPlanner visitPlanner,
-            @Value("${app.frontend.base-url}") String frontendBaseUrl,
+            GuestCancelUrlBuilder guestCancelUrlBuilder,
             Clock clock,
             InAppNotificationService inAppNotificationService,
             RetiredBookingSlugGuard retiredBookingSlugGuard,
@@ -130,7 +130,7 @@ public class GuestBookingService {
         this.smsProperties = smsProperties;
         this.salonCatalogCacheEvictor = salonCatalogCacheEvictor;
         this.visitPlanner = visitPlanner;
-        this.frontendBaseUrl = frontendBaseUrl;
+        this.guestCancelUrlBuilder = guestCancelUrlBuilder;
         this.kyivClock = clock.withZone(TimeZones.KYIV);
         this.inAppNotificationService = inAppNotificationService;
         this.retiredBookingSlugGuard = retiredBookingSlugGuard;
@@ -421,7 +421,7 @@ public class GuestBookingService {
         // (audit-fix cycle 1, finding 1).
         inAppNotificationService.notifyBookingEvent(InAppNotificationType.BOOKING_CREATED, saved, null);
 
-        String cancelUrl = buildCancelUrl(saved.getCancelToken().toString());
+        String cancelUrl = guestCancelUrlBuilder.build(saved.getCancelToken());
         registerAfterCommit(master, msa, saved, guestPhone, cancelUrl);
 
         return buildResponse(master, msa, saved, cancelUrl);
@@ -505,7 +505,7 @@ public class GuestBookingService {
         inAppNotificationService.notifyVisitEvent(
                 InAppNotificationType.BOOKING_CREATED, appointment.getId(), saved.get(0), null);
 
-        String cancelUrl = buildCancelUrl(cancelToken.toString());
+        String cancelUrl = guestCancelUrlBuilder.build(cancelToken);
         registerVisitAfterCommit(master, items, saved.get(0), guestPhone, cancelUrl);
         return buildVisitResponse(master, appointment, saved.get(0), items, cancelUrl);
     }
@@ -707,10 +707,6 @@ public class GuestBookingService {
                 items.get(0).masterService().getServiceDefinition().getName(),
                 totalDuration,
                 cancelUrl);
-    }
-
-    private String buildCancelUrl(String cancelToken) {
-        return frontendBaseUrl + "/book/cancel/" + cancelToken;
     }
 
     // V157 / phase 294 D3: displayFirstName()/displayLastName(), never getUser().getFirstName().

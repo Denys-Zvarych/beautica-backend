@@ -1,6 +1,7 @@
 package com.beautica.booking.service;
 
 import com.beautica.booking.domain.CancelTokenHasher;
+import com.beautica.booking.domain.GuestSmsServiceName;
 import com.beautica.booking.dto.CancelTokenInfoResponse;
 import com.beautica.booking.entity.Appointment;
 import com.beautica.booking.entity.Booking;
@@ -105,7 +106,7 @@ public class GuestVisitCancellationService {
         Booking first = items.get(0);
         return Optional.of(new CancelTokenInfoResponse(
                 masterName(first.getMaster()),
-                first.getMasterService().getServiceDefinition().getName(),
+                GuestSmsServiceName.of(first),
                 first.getStartsAt(),
                 isCancellable(first.getStartsAt()),
                 first.getStartsAt().minusHours(smsProperties.getCancelWindowHours())));
@@ -269,7 +270,7 @@ public class GuestVisitCancellationService {
     private String buildCancellationSms(Booking first) {
         OffsetDateTime kyiv = first.getStartsAt().atZoneSameInstant(TimeZones.KYIV).toOffsetDateTime();
         return Placeholders.format(smsProperties.getSms().getCancellation(), Map.of(
-                "serviceName", first.getMasterService().getServiceDefinition().getName(),
+                "serviceName", GuestSmsServiceName.of(first),
                 "masterName", masterName(first.getMaster()),
                 "date", DATE_FMT.format(kyiv),
                 "time", TIME_FMT.format(kyiv)));

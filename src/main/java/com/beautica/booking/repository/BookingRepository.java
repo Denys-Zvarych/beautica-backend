@@ -2175,10 +2175,12 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
 
     // ── Guest-booking reminder sweep (Phase 13.3) ─────────────────────────────
     /**
-     * Loads guest (LINK) bookings due for a 24h reminder SMS. Bounded by a narrow
+     * Loads guest (LINK) bookings due for a 24h reminder SMS — plus, phase 413 D4 / 412, STAFF walk-ins
+     * with a guest phone when {@code includeWalkIns} (the job passes the walk-in SMS gate,
+     * {@code app.booking.sms.enabled}). Bounded by a narrow
      * {@code [from, to)} window supplied by {@link com.beautica.booking.job.BookingReminderJob}
      * (Anti-Bug §E-3: not unbounded), and aligned with the partial index
-     * {@code idx_bookings_reminder} (LINK + reminder_sent = FALSE).
+     * {@code idx_bookings_reminder} (V227: LINK | STAFF + guest_phone NOT NULL + reminder_sent = FALSE).
      *
      * <p>The fetched rows are mutated ({@code reminderSent = true}) by the job inside its
      * transaction and flushed by dirty checking (no explicit save — they are managed), so the
@@ -2195,16 +2197,21 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             JOIN FETCH b.master m
             LEFT JOIN FETCH m.user
             JOIN FETCH b.masterService ms
-            JOIN FETCH ms.serviceDefinition
+            JOIN FETCH ms.serviceDefinition sd
+            JOIN FETCH sd.serviceType
             LEFT JOIN FETCH b.appointment
-            WHERE b.bookingSource = com.beautica.booking.enums.BookingSource.LINK
+            WHERE (b.bookingSource = com.beautica.booking.enums.BookingSource.LINK
+                   OR (b.bookingSource = com.beautica.booking.enums.BookingSource.STAFF
+                       AND :includeWalkIns = true))
+              AND b.guestPhone IS NOT NULL
               AND b.reminderSent = false
               AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
               AND b.startsAt BETWEEN :from AND :to
             """)
     List<Booking> findGuestBookingsForReminder(
             @Param("from") OffsetDateTime from,
-            @Param("to") OffsetDateTime to);
+            @Param("to") OffsetDateTime to,
+            @Param("includeWalkIns") boolean includeWalkIns);
 
     // ── Guest (LINK) visit cancel by link (BE-7) ──────────────────────────────
     /**
@@ -2276,9 +2283,10 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     int TWO_HOUR_REMINDER_BATCH_CAP = 500;
 
     /**
-     * Phase 413 D1 — guest (LINK) bookings due for the 2h-before reminder: the 24h finder's exact graph (so the
+     * Phase 413 D1 — guest (LINK) bookings due for the 2h-before reminder, plus (D4, after 412) STAFF walk-ins with a
+     * guest phone when {@code includeWalkIns}: the 24h finder's exact graph and source predicate (so the
      * reminder renders with no lazy load) over the half-open {@code [from, to)} window, on the partial index
-     * {@code idx_bookings_reminder_2h} (V225: LINK, CONFIRMED, not yet reminded). Bounded twice (Anti-Bug §E-3): the
+     * {@code idx_bookings_reminder_2h} (V227: LINK | STAFF, guest phone, CONFIRMED, not yet reminded). Bounded twice (Anti-Bug §E-3): the
      * 30-minute window the job supplies and {@code limit} ({@link #TWO_HOUR_REMINDER_BATCH_CAP}); the overflow is
      * picked up by the next 15-minute tick. All joins are to-one, so the limit applies in SQL.
      */
@@ -2287,9 +2295,13 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             JOIN FETCH b.master m
             LEFT JOIN FETCH m.user
             JOIN FETCH b.masterService ms
-            JOIN FETCH ms.serviceDefinition
+            JOIN FETCH ms.serviceDefinition sd
+            JOIN FETCH sd.serviceType
             LEFT JOIN FETCH b.appointment
-            WHERE b.bookingSource = com.beautica.booking.enums.BookingSource.LINK
+            WHERE (b.bookingSource = com.beautica.booking.enums.BookingSource.LINK
+                   OR (b.bookingSource = com.beautica.booking.enums.BookingSource.STAFF
+                       AND :includeWalkIns = true))
+              AND b.guestPhone IS NOT NULL
               AND b.reminder2hSent = false
               AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
               AND b.startsAt >= :from
@@ -2299,6 +2311,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     List<Booking> findGuestBookingsForTwoHourReminder(
             @Param("from") OffsetDateTime from,
             @Param("to") OffsetDateTime to,
+            @Param("includeWalkIns") boolean includeWalkIns,
             org.springframework.data.domain.Limit limit);
 
     /**

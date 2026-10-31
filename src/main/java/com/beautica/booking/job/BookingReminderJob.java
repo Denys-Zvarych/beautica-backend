@@ -1,6 +1,7 @@
 package com.beautica.booking.job;
 
 import com.beautica.booking.entity.Booking;
+import com.beautica.booking.domain.GuestSmsServiceName;
 import com.beautica.booking.event.GuestRemindersDueEvent;
 import com.beautica.booking.event.GuestRemindersDueEvent.GuestReminderSms;
 import com.beautica.booking.event.GuestRemindersDueEvent.ReminderType;
@@ -103,7 +104,7 @@ public class BookingReminderJob {
         OffsetDateTime from = now.plus(WINDOW_START);
         OffsetDateTime to = now.plus(WINDOW_END);
 
-        List<Booking> due = bookingRepository.findGuestBookingsForReminder(from, to);
+        List<Booking> due = bookingRepository.findGuestBookingsForReminder(from, to, includeWalkIns());
         if (due.isEmpty()) {
             return;
         }
@@ -208,7 +209,7 @@ public class BookingReminderJob {
             return;
         }
         List<Booking> due = bookingRepository.findGuestBookingsForTwoHourReminder(
-                now.plus(TWO_HOUR_WINDOW_START), now.plus(TWO_HOUR_WINDOW_END),
+                now.plus(TWO_HOUR_WINDOW_START), now.plus(TWO_HOUR_WINDOW_END), includeWalkIns(),
                 Limit.of(BookingRepository.TWO_HOUR_REMINDER_BATCH_CAP));
         if (due.isEmpty()) {
             return;
@@ -223,6 +224,15 @@ public class BookingReminderJob {
         }
         countTwoHour(OUTCOME_SENT, reminders.size());
         log.info("Guest 2h reminders: {} dispatched from {} due rows", reminders.size(), due.size());
+    }
+
+    /**
+     * Phase 413 D4 (after 412) — STAFF walk-ins with a guest phone join BOTH sweeps only while the walk-in SMS gate
+     * ({@code app.booking.sms.enabled}, phase 254) is on. Off → LINK guests only, exactly the pre-412 selection, so a
+     * Telegram-routed (408) walk-in reminder never goes out while walk-in SMS is still dark.
+     */
+    private boolean includeWalkIns() {
+        return smsProperties.getSms().isEnabled();
     }
 
     /** D2 — true from 21:00 (inclusive) to 09:00 (exclusive) Kyiv wall-clock time, DST-aware. */
@@ -324,7 +334,7 @@ public class BookingReminderJob {
     private String buildReminderSms(Booking booking, String template) {
         OffsetDateTime kyiv = booking.getStartsAt().atZoneSameInstant(TimeZones.KYIV).toOffsetDateTime();
         return Placeholders.format(template, Map.of(
-                "serviceName", booking.getMasterService().getServiceDefinition().getName(),
+                "serviceName", GuestSmsServiceName.of(booking), // 413 D4: platform name for walk-ins
                 "masterName", masterName(booking),
                 "time", TIME_FMT.format(kyiv)));
     }

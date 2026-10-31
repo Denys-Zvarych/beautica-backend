@@ -411,18 +411,17 @@ app:
       # key here either, on the walk-in precedent below: its single source is
       # BookingSmsProperties.Sms#reschedule. Override with APP_BOOKING_SMS_RESCHEDULE (relaxed binding);
       # GuestRescheduleSmsText fails boot unless it keeps {date} and {time} and fits 2 UCS-2 segments.
-      # Phase 22.7 — the walk-in confirmation (POST /api/v1/masters/{masterId}/bookings) is the ONE
-      # template with no key here, deliberately (QA MEDIUM, 2026-08-18). Its text lives in exactly
-      # one place: BookingSmsProperties.Sms#walkInConfirmation. A yml copy identical to that default
-      # used to sit here, which made the Java literal dead code — two sources of truth for one
-      # user-visible string, and mutating the Java one changed nothing in any profile.
-      #
-      # Do NOT re-add `walk-in-confirmation:` merely to make the copy visible from config; that
-      # silently kills the Java default again. Add it only to genuinely OVERRIDE the text, and note
-      # in the same commit that BookingSmsProperties' default is then no longer the live value.
-      # Constraint that travels with the copy wherever it lives: it must carry NO {cancelUrl} — a
-      # STAFF booking has cancel_token = NULL by the V137 CHECK, so there is no link to build and
-      # the placeholder would render literally in a real client's message.
+      # Phase 22.7 / 412 — the walk-in confirmation (POST /api/v1/masters/{masterId}/bookings). Phase 412 D3
+      # restored this key (it had been removed in 22.7 as a duplicate of the Java default): it is now the LIVE
+      # value, and BookingSmsProperties.Sms#walkInConfirmation is the identical fallback — change both together.
+      # Reversed by 412: it now carries {cancelUrl} — the walk-in visit header holds a one-time cancel token
+      # (V226) and StaffBookingService always maps cancelUrl to /book/cancel/{token}. 3 UCS-2 segments typical.
+      walk-in-confirmation: |-
+        Beautica: Запис підтверджено!
+        {masterName}, {serviceName}
+        {date} о {time}
+
+        Скасувати: {cancelUrl}
     # Phase 400 — guest review invite SMS (beautica.app/r/{token}) ~2h after a LINK visit is COMPLETED, never
     # 21:00-09:00 Kyiv (moved to 10:00), one per visit. Bound by ReviewInviteProperties (validated at boot). Needs BOTH
     # this flag and app.booking.sms.enabled; in staging (beautica.sms.mode=capture) the SMS lands in Mailpit.

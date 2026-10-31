@@ -35,6 +35,7 @@ import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.never;
@@ -83,7 +84,7 @@ class BookingReminderJobTest {
     void should_publishRemindersAndMark_when_bookingsDue() {
         Booking b1 = guestBooking("+380501111111");
         Booking b2 = guestBooking("+380502222222");
-        when(bookingRepository.findGuestBookingsForReminder(any(), any())).thenReturn(List.of(b1, b2));
+        when(bookingRepository.findGuestBookingsForReminder(any(), any(), anyBoolean())).thenReturn(List.of(b1, b2));
 
         job.sendReminders();
 
@@ -108,7 +109,7 @@ class BookingReminderJobTest {
     @Test
     @DisplayName("should not re-save managed rows — dirty checking flushes reminderSent at commit")
     void should_notCallSaveAll_when_bookingsDue() {
-        when(bookingRepository.findGuestBookingsForReminder(any(), any()))
+        when(bookingRepository.findGuestBookingsForReminder(any(), any(), anyBoolean()))
                 .thenReturn(List.of(guestBooking("+380501111111")));
 
         job.sendReminders();
@@ -119,7 +120,7 @@ class BookingReminderJobTest {
     @Test
     @DisplayName("should publish nothing and not save when nothing is due (already-reminded excluded by query)")
     void should_doNothing_when_noBookingsDue() {
-        when(bookingRepository.findGuestBookingsForReminder(any(), any())).thenReturn(List.of());
+        when(bookingRepository.findGuestBookingsForReminder(any(), any(), anyBoolean())).thenReturn(List.of());
 
         job.sendReminders();
 
@@ -144,7 +145,7 @@ class BookingReminderJobTest {
         Booking visitItem2 = guestBooking("+380502222222");
         visitItem1.setAppointment(Appointment.builder().id(appointmentId).build());
         visitItem2.setAppointment(Appointment.builder().id(appointmentId).build());
-        when(bookingRepository.findGuestBookingsForReminder(any(), any()))
+        when(bookingRepository.findGuestBookingsForReminder(any(), any(), anyBoolean()))
                 .thenReturn(List.of(single, visitItem1, visitItem2));
 
         job.sendReminders();
@@ -183,7 +184,7 @@ class BookingReminderJobTest {
     @DisplayName("the claim must precede the hand-off, so a lost dispatch never duplicates")
     void should_markReminderSentBeforePublishing_when_bookingsDue() {
         Booking due = guestBooking("+380501111111");
-        when(bookingRepository.findGuestBookingsForReminder(any(), any())).thenReturn(List.of(due));
+        when(bookingRepository.findGuestBookingsForReminder(any(), any(), anyBoolean())).thenReturn(List.of(due));
         List<String> order = new ArrayList<>();
         doAnswer(inv -> {
             order.add("claim");
@@ -202,7 +203,7 @@ class BookingReminderJobTest {
         Booking single = guestBooking("+380501111111");
         Booking visitItem = guestBooking("+380502222222");
         visitItem.setAppointment(Appointment.builder().id(UUID.randomUUID()).build());
-        when(bookingRepository.findGuestBookingsForReminder(any(), any())).thenReturn(List.of(single, visitItem));
+        when(bookingRepository.findGuestBookingsForReminder(any(), any(), anyBoolean())).thenReturn(List.of(single, visitItem));
         org.mockito.Mockito.doReturn(List.of()).when(bookingRepository).claimRemindersByIds(any());
         org.mockito.Mockito.doReturn(List.of()).when(bookingRepository).claimVisitRemindersByAppointmentIds(any());
 
@@ -221,7 +222,7 @@ class BookingReminderJobTest {
         // SECOND, provider-positioned time inside copy the guest reads as platform text — and SMS is
         // the only channel a guest has.
         Booking due = guestBooking("+380501111111", "Манікюр {time}");
-        when(bookingRepository.findGuestBookingsForReminder(any(), any())).thenReturn(List.of(due));
+        when(bookingRepository.findGuestBookingsForReminder(any(), any(), anyBoolean())).thenReturn(List.of(due));
 
         job.sendReminders();
 
@@ -238,6 +239,54 @@ class BookingReminderJobTest {
         verify(events).publishEvent(captor.capture());
         assertThat(captor.getValue()).isInstanceOf(GuestRemindersDueEvent.class);
         return (GuestRemindersDueEvent) captor.getValue();
+    }
+
+    // ── phase 413 D4 (after 412) — walk-ins in the 24h sweep ─────────────────────────────────
+
+    @Test
+    @DisplayName("should select LINK guests only when the walk-in SMS gate is off")
+    void should_excludeWalkIns_when_smsGateOff() {
+        when(bookingRepository.findGuestBookingsForReminder(any(), any(), anyBoolean())).thenReturn(List.of());
+
+        job.sendReminders();
+
+        verify(bookingRepository).findGuestBookingsForReminder(any(), any(), org.mockito.ArgumentMatchers.eq(false));
+    }
+
+    @Test
+    @DisplayName("should include walk-ins and name the PLATFORM service type when the walk-in SMS gate is on")
+    void should_includeWalkInsWithPlatformServiceName_when_smsGateOn() {
+        BookingSmsProperties properties = new BookingSmsProperties();
+        properties.getSms().setEnabled(true);
+        job = new BookingReminderJob(bookingRepository, properties, events,
+                Clock.fixed(OffsetDateTime.parse("2026-06-01T10:00:00Z").toInstant(), ZoneOffset.UTC),
+                new io.micrometer.core.instrument.simple.SimpleMeterRegistry());
+        Booking walkIn = walkInBooking("+380503333333", "Акція! пишіть на example.test");
+        when(bookingRepository.findGuestBookingsForReminder(any(), any(), org.mockito.ArgumentMatchers.eq(true)))
+                .thenReturn(List.of(walkIn));
+
+        job.sendReminders();
+
+        GuestRemindersDueEvent.GuestReminderSms sms = publishedEvent().reminders().get(0);
+        assertThat(sms.phoneE164()).isEqualTo("+380503333333");
+        assertThat(sms.text()).contains("Манікюр класичний").doesNotContain("example.test");
+    }
+
+    private Booking walkInBooking(String phone, String customServiceName) {
+        User user = new User("m@beautica.test", "x", com.beautica.auth.Role.SALON_MASTER, "Марія", "Левченко", null);
+        Master master = Master.builder().user(user).isActive(true).build();
+        com.beautica.service.entity.ServiceType type = com.beautica.service.entity.ServiceType.builder()
+                .nameUk("Манікюр класичний").build();
+        ServiceDefinition def = ServiceDefinition.builder()
+                .name(customServiceName).serviceType(type).baseDurationMinutes(60).bufferMinutesAfter(0)
+                .basePrice(new BigDecimal("350.00")).build();
+        MasterServiceAssignment msa = MasterServiceAssignment.builder()
+                .master(master).serviceDefinition(def).isActive(true).build();
+        return Booking.staffBooking(
+                master, msa, null,
+                OffsetDateTime.parse("2026-06-02T10:00:00+03:00"),
+                OffsetDateTime.parse("2026-06-02T11:00:00+03:00"),
+                new BigDecimal("350.00"), null, 60, 0, "Олена", "Коваль", phone, UUID.randomUUID());
     }
 
     private Booking guestBooking(String phone) {

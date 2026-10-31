@@ -71,6 +71,7 @@ class GuestTwoHourReminderIT extends AbstractWalkInBookingSmsIT {
     @AfterEach
     void restoreFlagAndClock() {
         smsProperties.getReminder2h().setEnabled(true);
+        smsProperties.getSms().setEnabled(true);
         clock.set(NOW);
     }
 
@@ -210,7 +211,8 @@ class GuestTwoHourReminderIT extends AbstractWalkInBookingSmsIT {
             jdbcTemplate.execute("SET LOCAL enable_seqscan = off");
             List<String> rows = jdbcTemplate.queryForList("""
                     EXPLAIN SELECT id FROM bookings
-                     WHERE booking_source = 'LINK' AND status = 'CONFIRMED' AND reminder_2h_sent = FALSE
+                     WHERE (booking_source = 'LINK' OR booking_source = 'STAFF') AND guest_phone IS NOT NULL
+                       AND status = 'CONFIRMED' AND reminder_2h_sent = FALSE
                        AND starts_at >= now() + interval '105 minutes' AND starts_at < now() + interval '135 minutes'
                     """, String.class);
             status.setRollbackOnly();
@@ -295,6 +297,118 @@ class GuestTwoHourReminderIT extends AbstractWalkInBookingSmsIT {
     private boolean reminded(UUID bookingId) {
         return Boolean.TRUE.equals(jdbcTemplate.queryForObject(
                 "SELECT reminder_2h_sent FROM bookings WHERE id = ?", Boolean.class, bookingId));
+    }
+
+    // ── phase 413 D4 (after 412): walk-ins in the 2h sweep ────────────────────────────────────────
+
+    @Test
+    @DisplayName("D4: STAFF walk-in visit with a phone → exactly one 2h reminder naming the platform service type")
+    void should_remindWalkInVisitOnce_when_walkInGateOn() throws Exception {
+        UUID appointmentId = insertWalkInVisit(at(NOW.plus(Duration.ofMinutes(110))), 2);
+
+        reminderJob.sweepTwoHour();
+        reminderJob.sweepTwoHour();
+
+        assertThat(sentText())
+                .startsWith("Beautica: Нагадуємо!\n" + platformServiceName() + " у " + MASTER_NAME)
+                .doesNotContain(SERVICE_NAME)
+                .endsWith("Сьогодні о 13:50");
+        assertThat(jdbcTemplate.queryForObject("SELECT count(*) FROM bookings WHERE appointment_id = ? "
+                + "AND reminder_2h_sent", Integer.class, appointmentId)).isEqualTo(2);
+    }
+
+    @Test
+    @DisplayName("D4: walk-in SMS gate off → the walk-in is neither selected nor claimed; LINK unchanged")
+    void should_skipWalkIn_when_walkInGateOff() throws Exception {
+        smsProperties.getSms().setEnabled(false);
+        UUID appointmentId = insertWalkInVisit(at(NOW.plus(Duration.ofMinutes(110))), 1);
+        UUID link = insertLinkBooking(at(NOW.plus(Duration.ofMinutes(120))), NOW.minus(Duration.ofDays(1)));
+
+        reminderJob.sweepTwoHour();
+
+        assertThat(sentText()).isEqualTo(TWO_HOUR_PREFIX + "14:00");
+        assertThat(reminded(link)).isTrue();
+        assertThat(jdbcTemplate.queryForObject("SELECT count(*) FROM bookings WHERE appointment_id = ? "
+                + "AND reminder_2h_sent", Integer.class, appointmentId)).isZero();
+    }
+
+    @Test
+    @DisplayName("D4: phone-less STAFF row (registered client) in the 2h window, gate on → never selected nor claimed")
+    void should_notClaimPhonelessStaffRow_when_twoHourSweepRunsWithGateOn() {
+        UUID bookingId = insertRegisteredClientStaffBooking(at(NOW.plus(Duration.ofMinutes(110))));
+
+        reminderJob.sweepTwoHour();
+
+        TURBOSMS.verify(0, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
+        assertThat(jdbcTemplate.queryForObject("SELECT reminder_2h_sent FROM bookings WHERE id = ?",
+                Boolean.class, bookingId)).as("guestPhone IS NOT NULL keeps the row out of the claim").isFalse();
+    }
+
+    @Test
+    @DisplayName("D4: phone-less STAFF row (registered client) in the 24h window, gate on → never selected nor claimed")
+    void should_notClaimPhonelessStaffRow_when_dayBeforeSweepRunsWithGateOn() {
+        UUID bookingId = insertRegisteredClientStaffBooking(at(NOW.plus(Duration.ofHours(24))));
+
+        reminderJob.sendReminders();
+
+        TURBOSMS.verify(0, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
+        assertThat(jdbcTemplate.queryForObject("SELECT reminder_sent FROM bookings WHERE id = ?",
+                Boolean.class, bookingId)).as("guestPhone IS NOT NULL keeps the row out of the claim").isFalse();
+    }
+
+    @Test
+    @DisplayName("D4: walk-in SMS gate off → the 24h sweep neither selects nor claims a walk-in")
+    void should_skipWalkIn_when_dayBeforeSweepRunsWithGateOff() {
+        smsProperties.getSms().setEnabled(false);
+        UUID appointmentId = insertWalkInVisit(at(NOW.plus(Duration.ofHours(24))), 1);
+
+        reminderJob.sendReminders();
+
+        assertThat(jdbcTemplate.queryForObject("SELECT count(*) FROM bookings WHERE appointment_id = ? "
+                + "AND reminder_sent", Integer.class, appointmentId)).as("gate off → walk-in not claimed").isZero();
+    }
+
+    /** A STAFF booking for a REGISTERED client: client_id set, no guest columns, no token (V226 STAFF sub-arm 1). */
+    private UUID insertRegisteredClientStaffBooking(OffsetDateTime startsAt) {
+        SeededUser client = insertUser("CLIENT", null);
+        UUID bookingId = UUID.randomUUID();
+        jdbcTemplate.update("INSERT INTO bookings (id, client_id, master_id, master_service_id, salon_id, status, "
+                        + "starts_at, ends_at, price_at_booking, duration_minutes_at_booking, "
+                        + "buffer_minutes_at_booking, booking_source, created_by_user_id, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, ?, ?, 'CONFIRMED', ?, ?, 350.00, 10, 0, 'STAFF', ?, ?, ?)",
+                bookingId, client.id(), salon.masterId(), salon.masterServiceId(), salon.salonId(),
+                startsAt, startsAt.plusMinutes(10), salon.ownerId(), at(NOW.minus(Duration.ofDays(1))), at(NOW));
+        return bookingId;
+    }
+
+    /** A STAFF walk-in visit as StaffBookingService persists it since 412: header token only, tokenless items. */
+    private UUID insertWalkInVisit(OffsetDateTime startsAt, int items) {
+        UUID appointmentId = UUID.randomUUID();
+        jdbcTemplate.update("INSERT INTO appointments (id, salon_id, status, booking_source, guest_name, "
+                        + "guest_surname, guest_phone, cancel_token_hash, created_by_user_id, created_at, updated_at) "
+                        + "VALUES (?, ?, 'CONFIRMED', 'STAFF', ?, ?, ?, encode(sha256(convert_to(?, 'UTF8')), 'hex'), "
+                        + "?, ?, ?)",
+                appointmentId, salon.salonId(), GUEST_NAME, GUEST_SURNAME, E164_PHONE, UUID.randomUUID().toString(),
+                salon.ownerId(), at(NOW.minus(Duration.ofDays(1))), at(NOW));
+        for (int i = 0; i < items; i++) {
+            OffsetDateTime itemStart = startsAt.plusMinutes(10L * i);
+            jdbcTemplate.update("INSERT INTO bookings (id, master_id, master_service_id, salon_id, appointment_id, "
+                            + "status, starts_at, ends_at, price_at_booking, duration_minutes_at_booking, "
+                            + "buffer_minutes_at_booking, booking_source, guest_name, guest_surname, guest_phone, "
+                            + "created_by_user_id, created_at, updated_at) "
+                            + "VALUES (?, ?, ?, ?, ?, 'CONFIRMED', ?, ?, 350.00, 10, 0, 'STAFF', ?, ?, ?, ?, ?, ?)",
+                    UUID.randomUUID(), salon.masterId(), salon.masterServiceId(), salon.salonId(), appointmentId,
+                    itemStart, itemStart.plusMinutes(10), GUEST_NAME, GUEST_SURNAME, E164_PHONE, salon.ownerId(),
+                    at(NOW.minus(Duration.ofDays(1))), at(NOW));
+        }
+        return appointmentId;
+    }
+
+    private String platformServiceName() {
+        return jdbcTemplate.queryForObject("SELECT st.name_uk FROM master_services ms "
+                + "JOIN service_definitions sd ON sd.id = ms.service_def_id "
+                + "JOIN service_types st ON st.id = sd.service_type_id WHERE ms.id = ?",
+                String.class, salon.masterServiceId());
     }
 
     private UUID insertLinkBooking(OffsetDateTime startsAt, Instant createdAt) {
