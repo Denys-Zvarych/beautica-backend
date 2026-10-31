@@ -3,7 +3,7 @@ package com.beautica.notification.telegram.webhook;
 import com.beautica.booking.service.GuestBookingDetailsText;
 import com.beautica.config.BookingSmsProperties;
 import com.beautica.config.TelegramProperties;
-import com.beautica.notification.telegram.TelegramMessenger;
+import com.beautica.notification.channel.GuestMessageRouter;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.core.task.TaskExecutor;
@@ -17,7 +17,8 @@ import java.util.concurrent.RejectedExecutionException;
 
 /**
  * The second message after a successful phone proof: the linked booking's details ({@link GuestBookingDetailsText}),
- * sent through the outbound {@link TelegramMessenger} (404), never in the webhook response.
+ * sent through {@link GuestMessageRouter#deliverTelegramOnly} (the one owner of the bounded-wait Telegram gate),
+ * never in the webhook response.
  *
  * <p><b>Ordering.</b> The LINKED reply travels in the webhook HTTP response, which Telegram executes only once it
  * has received that response. The details are therefore scheduled {@link #SEND_DELAY} later on the shared
@@ -46,20 +47,20 @@ public class LinkedBookingDetailsSender {
     private static final String DROPPED = "DROPPED";
 
     private final GuestBookingDetailsText detailsText;
-    private final TelegramMessenger telegramMessenger;
+    private final GuestMessageRouter guestMessageRouter;
     private final TelegramProperties telegramProperties;
     private final BookingSmsProperties bookingSmsProperties;
     private final TaskScheduler taskScheduler;
     private final TaskExecutor sendExecutor;
 
     public LinkedBookingDetailsSender(GuestBookingDetailsText detailsText,
-                                      TelegramMessenger telegramMessenger,
+                                      GuestMessageRouter guestMessageRouter,
                                       TelegramProperties telegramProperties,
                                       BookingSmsProperties bookingSmsProperties,
                                       TaskScheduler taskScheduler,
                                       @Qualifier("telegramDetailsExecutor") TaskExecutor sendExecutor) {
         this.detailsText = detailsText;
-        this.telegramMessenger = telegramMessenger;
+        this.guestMessageRouter = guestMessageRouter;
         this.telegramProperties = telegramProperties;
         this.bookingSmsProperties = bookingSmsProperties;
         this.taskScheduler = taskScheduler;
@@ -100,8 +101,8 @@ public class LinkedBookingDetailsSender {
                 logResult("NOTHING_TO_CONFIRM");
                 return;
             }
-            telegramMessenger.sendWaiting(chatId, text.get());
-            logResult("SENT");
+            // The router logs a failed send (class only) and drops it — no SMS fallback for this follow-up.
+            logResult(guestMessageRouter.deliverTelegramOnly(chatId, text.get()) ? "SENT" : "NOT_SENT");
         } catch (RuntimeException e) {
             log.warn("event=telegram_booking_details result=FAILED cause={}", e.getClass().getSimpleName());
         }

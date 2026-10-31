@@ -13,6 +13,7 @@ import com.beautica.notification.telegram.TelegramMessenger;
 import com.beautica.notification.telegram.TelegramRecipientGoneException;
 import com.beautica.notification.telegram.link.ActiveLink;
 import com.beautica.notification.telegram.link.TelegramLinkService;
+import com.beautica.notification.telegram.webhook.LinkedBookingDetailsSender;
 import com.tngtech.archunit.core.domain.JavaClasses;
 import com.tngtech.archunit.core.importer.ClassFileImporter;
 import com.tngtech.archunit.core.importer.ImportOption;
@@ -229,7 +230,43 @@ class GuestMessageRouterTest {
     }
 
     @Test
-    @DisplayName("allow-list: only the 3 routed callers may depend on the router; Telegram only via router/config")
+    @DisplayName("Telegram-only: gates open + send OK → sendWaiting with the text, true, no SMS, no lookup")
+    void should_sendViaGateWithoutSms_when_telegramOnlySucceeds() {
+
+        boolean sent = router.deliverTelegramOnly(CHAT_ID, TEXT);
+
+        assertThat(sent).isTrue();
+        verify(telegramMessenger).sendWaiting(CHAT_ID, TEXT);
+        verifyNoInteractions(smsService, linkService);
+    }
+
+    @Test
+    @DisplayName("Telegram-only: any Telegram failure → false, dropped, never an SMS, link untouched")
+    void should_dropWithoutSms_when_telegramOnlyFails() {
+        doThrow(new TelegramRecipientGoneException("403")).when(telegramMessenger).sendWaiting(CHAT_ID, TEXT);
+
+        boolean sent = router.deliverTelegramOnly(CHAT_ID, TEXT);
+
+        assertThat(sent).isFalse();
+        verifyNoInteractions(smsService, linkService);
+    }
+
+    @Test
+    @DisplayName("Telegram-only: Telegram flag off or booking-SMS gate off → false, nothing sent on any channel")
+    void should_sendNothing_when_telegramOnlyGated() {
+        GuestMessageRouter flagOff = routerWith(false, true);
+        GuestMessageRouter smsGateOff = routerWith(true, false);
+
+        boolean flagOffSent = flagOff.deliverTelegramOnly(CHAT_ID, TEXT);
+        boolean gateOffSent = smsGateOff.deliverTelegramOnly(CHAT_ID, TEXT);
+
+        assertThat(flagOffSent).isFalse();
+        assertThat(gateOffSent).isFalse();
+        verifyNoInteractions(telegramMessenger, smsService, linkService);
+    }
+
+    @Test
+    @DisplayName("allow-list: only the 3 routed callers (+ the Telegram-only details sender) may depend on the router; Telegram only via router/config")
     void should_confineRouterAndMessenger_when_scanningProductionClasses() {
         JavaClasses production = production();
 
@@ -238,6 +275,9 @@ class GuestMessageRouterTest {
                 .and().doNotHaveFullyQualifiedName(GuestReminderDispatcher.class.getName())
                 .and().doNotHaveFullyQualifiedName(BookingSmsDispatcher.class.getName())
                 .and().doNotHaveFullyQualifiedName(ReviewInviteSendJob.class.getName())
+                // Phase 433: the post-link booking-details follow-up, via the Telegram-only entry point
+                // (deliverTelegramOnly) so the bounded-wait gate stays owned by the router — never sendWaiting.
+                .and().doNotHaveFullyQualifiedName(LinkedBookingDetailsSender.class.getName())
                 .should().dependOnClassesThat().haveFullyQualifiedName(GuestMessageRouter.class.getName())
                 .check(production);
         noClasses()

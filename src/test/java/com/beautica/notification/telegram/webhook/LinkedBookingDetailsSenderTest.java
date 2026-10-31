@@ -3,8 +3,7 @@ package com.beautica.notification.telegram.webhook;
 import com.beautica.booking.service.GuestBookingDetailsText;
 import com.beautica.config.BookingSmsProperties;
 import com.beautica.config.TelegramProperties;
-import com.beautica.notification.telegram.TelegramDeliveryException;
-import com.beautica.notification.telegram.TelegramMessenger;
+import com.beautica.notification.channel.GuestMessageRouter;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -31,7 +30,6 @@ import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
-import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -53,7 +51,7 @@ class LinkedBookingDetailsSenderTest {
             "event=telegram_booking_details result=FAILED cause=DataAccessResourceFailureException";
 
     @Mock private GuestBookingDetailsText detailsText;
-    @Mock private TelegramMessenger telegramMessenger;
+    @Mock private GuestMessageRouter guestMessageRouter;
     @Mock private TaskScheduler taskScheduler;
 
     private final BookingSmsProperties smsProperties = new BookingSmsProperties();
@@ -68,7 +66,7 @@ class LinkedBookingDetailsSenderTest {
     private LinkedBookingDetailsSender sender(boolean telegramEnabled, TaskExecutor executor) {
         telegram = mock(TelegramProperties.class);
         lenient().when(telegram.enabled()).thenReturn(telegramEnabled);
-        return new LinkedBookingDetailsSender(detailsText, telegramMessenger, telegram, smsProperties, taskScheduler,
+        return new LinkedBookingDetailsSender(detailsText, guestMessageRouter, telegram, smsProperties, taskScheduler,
                 executor);
     }
 
@@ -89,7 +87,7 @@ class LinkedBookingDetailsSenderTest {
         ArgumentCaptor<Instant> at = ArgumentCaptor.forClass(Instant.class);
         verify(taskScheduler).schedule(any(Runnable.class), at.capture());
         assertThat(at.getValue()).isEqualTo(NOW.plus(LinkedBookingDetailsSender.SEND_DELAY));
-        verifyNoInteractions(detailsText, telegramMessenger);
+        verifyNoInteractions(detailsText, guestMessageRouter);
     }
 
     @Test
@@ -102,7 +100,7 @@ class LinkedBookingDetailsSenderTest {
 
         scheduledTask().run();
 
-        verify(telegramMessenger).sendWaiting(CHAT, TEXT);
+        verify(guestMessageRouter).deliverTelegramOnly(CHAT, TEXT);
     }
 
     @Test
@@ -112,7 +110,7 @@ class LinkedBookingDetailsSenderTest {
 
         sender.scheduleAfterLink(CHAT, BOOKING_ID, PHONE_HASH);
 
-        verifyNoInteractions(taskScheduler, detailsText, telegramMessenger);
+        verifyNoInteractions(taskScheduler, detailsText, guestMessageRouter);
     }
 
     @Test
@@ -123,7 +121,7 @@ class LinkedBookingDetailsSenderTest {
 
         sender.scheduleAfterLink(CHAT, BOOKING_ID, PHONE_HASH);
 
-        verifyNoInteractions(taskScheduler, detailsText, telegramMessenger);
+        verifyNoInteractions(taskScheduler, detailsText, guestMessageRouter);
     }
 
     @Test
@@ -134,17 +132,20 @@ class LinkedBookingDetailsSenderTest {
 
         sender.send(CHAT, BOOKING_ID, PHONE_HASH);
 
-        verify(telegramMessenger, never()).sendWaiting(anyLong(), anyString());
+        verify(guestMessageRouter, never()).deliverTelegramOnly(anyLong(), anyString());
     }
 
     @Test
-    @DisplayName("swallow a failed Telegram send")
-    void should_swallowFailure_when_telegramSendFails() {
+    @DisplayName("a send the router dropped is logged NOT_SENT, never SENT, and never throws")
+    void should_logNotSent_when_routerDropsSend(CapturedOutput output) {
         when(detailsText.render(BOOKING_ID, PHONE_HASH)).thenReturn(Optional.of(TEXT));
-        doThrow(new TelegramDeliveryException("timeout")).when(telegramMessenger).sendWaiting(CHAT, TEXT);
+        when(guestMessageRouter.deliverTelegramOnly(CHAT, TEXT)).thenReturn(false);
         LinkedBookingDetailsSender sender = sender(true, new SyncTaskExecutor());
 
         assertThatCode(() -> sender.send(CHAT, BOOKING_ID, PHONE_HASH)).doesNotThrowAnyException();
+
+        assertThat(output.getAll()).contains("event=telegram_booking_details result=NOT_SENT")
+                .doesNotContain("result=SENT").doesNotContain(Long.toString(CHAT));
     }
 
     @Test
@@ -156,7 +157,7 @@ class LinkedBookingDetailsSenderTest {
 
         assertThatCode(() -> sender.send(CHAT, BOOKING_ID, PHONE_HASH)).doesNotThrowAnyException();
 
-        verifyNoInteractions(telegramMessenger);
+        verifyNoInteractions(guestMessageRouter);
         assertThat(output.getAll()).contains(FAILED_LINE)
                 .doesNotContain(Long.toString(CHAT)).doesNotContain(BOOKING_ID.toString())
                 .doesNotContain("pool exhausted");
@@ -187,7 +188,7 @@ class LinkedBookingDetailsSenderTest {
 
         assertThatCode(() -> scheduledTask().run()).doesNotThrowAnyException();
 
-        verifyNoInteractions(detailsText, telegramMessenger);
+        verifyNoInteractions(detailsText, guestMessageRouter);
         assertDroppedLoggedWithoutPii(output);
     }
 
@@ -206,7 +207,7 @@ class LinkedBookingDetailsSenderTest {
 
         scheduledTask().run();
 
-        verifyNoInteractions(detailsText, telegramMessenger);
+        verifyNoInteractions(detailsText, guestMessageRouter);
     }
 
     @Test
@@ -219,7 +220,7 @@ class LinkedBookingDetailsSenderTest {
 
         scheduledTask().run();
 
-        verifyNoInteractions(detailsText, telegramMessenger);
+        verifyNoInteractions(detailsText, guestMessageRouter);
     }
 
     @Test

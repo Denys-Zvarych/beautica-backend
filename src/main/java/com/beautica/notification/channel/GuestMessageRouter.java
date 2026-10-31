@@ -62,6 +62,8 @@ public class GuestMessageRouter {
     static final String METRIC = "beautica.guest_message";
     static final String CHANNEL_SMS = "sms";
     static final String CHANNEL_TELEGRAM = "telegram";
+    /** Log token for {@link #deliverTelegramOnly} (not a {@link GuestMessageKind}: never SMS-routed, no counters). */
+    static final String TELEGRAM_ONLY_KIND = "linked_booking_details";
 
     /** D7 reason tag values, each with the channel it is counted on. */
     enum Reason {
@@ -143,6 +145,31 @@ public class GuestMessageRouter {
             return;
         }
         deliverViaTelegram(kind, link.get(), phoneE164, text);
+    }
+
+    /**
+     * Phase 433 — Telegram-only send to a chat the caller already resolved (the booking-details follow-up right after
+     * a fresh link). Same bounded-wait gate ({@link TelegramMessenger#sendWaiting}) and the same dark-launch gates as
+     * {@link #deliver}, but no SMS fallback: the guest already has the SMS confirmation, so a failure is logged
+     * (exception class only) and dropped. Same threading rule as {@link #deliver}: pool threads only.
+     *
+     * @return {@code true} when Telegram accepted the message; {@code false} when gated off or the send failed
+     */
+    public boolean deliverTelegramOnly(long chatId, String text) {
+        if (!telegramProperties.enabled() || !bookingSmsProperties.getSms().isEnabled()) {
+            return false;
+        }
+        if (TransactionSynchronizationManager.isActualTransactionActive()) {
+            log.warn("event=guest_message kind={} warning=inside_transaction", TELEGRAM_ONLY_KIND);
+        }
+        try {
+            telegramMessenger.sendWaiting(chatId, text);
+            return true;
+        } catch (RuntimeException e) {
+            log.warn("event=guest_message kind={} channel={} result=DROPPED cause={}", TELEGRAM_ONLY_KIND,
+                    CHANNEL_TELEGRAM, e.getClass().getSimpleName());
+            return false;
+        }
     }
 
     private void deliverViaTelegram(GuestMessageKind kind, ActiveLink link, String phoneE164, String text) {
