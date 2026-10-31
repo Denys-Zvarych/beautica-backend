@@ -891,6 +891,30 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     List<Booking> findByAppointmentIdWithGraph(@Param("appointmentId") UUID appointmentId);
 
     /**
+     * The booking {@code bookingId} plus, when it belongs to a multi-service visit, every other row of that visit — in
+     * ONE statement, for {@code GuestBookingDetailsText} (Telegram details after linking). Without an
+     * {@code appointment_id} the subquery yields {@code NULL}, so only the booking itself matches.
+     *
+     * <p>Dedicated query on purpose: it is {@link #findByAppointmentIdWithGraph}'s graph plus
+     * {@code sd.serviceType}, which {@code GuestSmsServiceName} reads for a {@code STAFF} walk-in (platform name)
+     * and which the two widely shared graph queries must not be widened to fetch. {@code b.client} is not fetched:
+     * the caller only null-checks it, which the FK answers without a statement. Bounded by one visit
+     * ({@code SlotCalculationService.MAX_SERVICES_PER_VISIT} rows); no ordering — the caller sorts.
+     */
+    @Query("""
+            SELECT b FROM Booking b
+            JOIN FETCH b.master m
+            LEFT JOIN FETCH m.user
+            LEFT JOIN FETCH b.salon
+            JOIN FETCH b.masterService ms
+            JOIN FETCH ms.serviceDefinition sd
+            JOIN FETCH sd.serviceType
+            WHERE b.id = :bookingId
+               OR b.appointment.id = (SELECT l.appointment.id FROM Booking l WHERE l.id = :bookingId)
+            """)
+    List<Booking> findWithVisitForGuestDetails(@Param("bookingId") UUID bookingId);
+
+    /**
      * Multi-header form of {@link #findByAppointmentIdWithGraph} with the SAME graph (phase 373
      * audit-fix cycle 1): the internal guest-PII erase cancels every upcoming visit of one phone and
      * needs each visit's items fully loaded for the guest-cancel seam's notifications — one statement

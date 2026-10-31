@@ -2,6 +2,7 @@ package com.beautica.notification.telegram.webhook;
 
 import com.beautica.notification.telegram.TelegramChatAllowList;
 import com.beautica.notification.telegram.link.ClaimResult;
+import com.beautica.notification.telegram.link.ContactProof;
 import com.beautica.notification.telegram.link.ProofResult;
 import com.beautica.notification.telegram.link.TelegramLinkService;
 import com.beautica.notification.telegram.webhook.TelegramBotReplies.Reply;
@@ -16,6 +17,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.InOrder;
 import org.mockito.Mock;
@@ -24,6 +26,7 @@ import org.springframework.dao.PessimisticLockingFailureException;
 import org.springframework.dao.QueryTimeoutException;
 
 import java.util.Optional;
+import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.anyLong;
@@ -34,6 +37,7 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
 @ExtendWith(MockitoExtension.class)
@@ -43,15 +47,18 @@ class TelegramUpdateHandlerTest {
     private static final long CHAT = 7_123_456_789L;
     private static final String TOKEN = "A".repeat(43);
     private static final String PHONE = "+380501234567";
+    private static final UUID BOOKING_ID = UUID.fromString("11111111-2222-3333-4444-555555555555");
+    private static final byte[] PHONE_HASH = {1, 2, 3, 4};
 
     @Mock private TelegramLinkService linkService;
     @Mock private TelegramChatAllowList allowList;
+    @Mock private LinkedBookingDetailsSender bookingDetailsSender;
 
     private TelegramUpdateHandler handler;
 
     @BeforeEach
     void setUp() {
-        handler = new TelegramUpdateHandler(linkService, allowList);
+        handler = new TelegramUpdateHandler(linkService, allowList, bookingDetailsSender);
         lenient().when(allowList.allows(anyLong())).thenReturn(true);
     }
 
@@ -258,7 +265,8 @@ class TelegramUpdateHandlerTest {
     @Test
     @DisplayName("reply linked with unlink keyboard when contact matches")
     void should_replyLinkedWithUnlinkKeyboard_when_contactMatches() {
-        when(linkService.proveContact(CHAT, PHONE, CHAT, CHAT)).thenReturn(ProofResult.LINKED);
+        when(linkService.proveContactForBooking(CHAT, PHONE, CHAT, CHAT))
+                .thenReturn(ContactProof.linked(BOOKING_ID, PHONE_HASH));
 
         Reply reply = reply(contact(CHAT, CHAT));
 
@@ -269,7 +277,8 @@ class TelegramUpdateHandlerTest {
     @Test
     @DisplayName("reply mismatch and remove keyboard when contact differs")
     void should_replyMismatchAndRemoveKeyboard_when_contactDiffers() {
-        when(linkService.proveContact(CHAT, PHONE, CHAT, CHAT)).thenReturn(ProofResult.MISMATCH);
+        when(linkService.proveContactForBooking(CHAT, PHONE, CHAT, CHAT))
+                .thenReturn(ContactProof.of(ProofResult.MISMATCH));
 
         Reply reply = reply(contact(CHAT, CHAT));
 
@@ -278,9 +287,55 @@ class TelegramUpdateHandlerTest {
     }
 
     @Test
+    @DisplayName("schedule booking details once for the linked booking when contact matches")
+    void should_scheduleBookingDetailsOnce_when_contactMatches() {
+        when(linkService.proveContactForBooking(CHAT, PHONE, CHAT, CHAT))
+                .thenReturn(ContactProof.linked(BOOKING_ID, PHONE_HASH));
+
+        reply(contact(CHAT, CHAT));
+
+        verify(bookingDetailsSender, times(1)).scheduleAfterLink(CHAT, BOOKING_ID, PHONE_HASH);
+        verifyNoMoreInteractions(bookingDetailsSender);
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = ProofResult.class, names = {"MISMATCH", "NOT_OWN_CONTACT", "NO_PENDING"})
+    @DisplayName("schedule no booking details when the contact proof does not link")
+    void should_scheduleNoBookingDetails_when_proofDoesNotLink(ProofResult result) {
+        when(linkService.proveContactForBooking(CHAT, PHONE, CHAT, CHAT)).thenReturn(ContactProof.of(result));
+
+        reply(contact(CHAT, CHAT));
+
+        verifyNoInteractions(bookingDetailsSender);
+    }
+
+    @Test
+    @DisplayName("schedule no booking details when the proof hits a lock timeout")
+    void should_scheduleNoBookingDetails_when_proofHitsLockTimeout() {
+        when(linkService.proveContactForBooking(CHAT, PHONE, CHAT, CHAT))
+                .thenThrow(new PessimisticLockingFailureException("55P03"));
+
+        reply(contact(CHAT, CHAT));
+
+        verifyNoInteractions(bookingDetailsSender);
+    }
+
+    @ParameterizedTest
+    @EnumSource(ClaimResult.class)
+    @DisplayName("schedule no booking details on /start, including an ALREADY_LINKED re-tap")
+    void should_scheduleNoBookingDetails_when_startIsHandled(ClaimResult result) {
+        lenient().when(linkService.claim(TOKEN, CHAT)).thenReturn(result);
+
+        reply(text("/start " + TOKEN));
+
+        verifyNoInteractions(bookingDetailsSender);
+    }
+
+    @Test
     @DisplayName("ask own contact again when contact is forwarded")
     void should_askOwnContactAgain_when_contactIsForwarded() {
-        when(linkService.proveContact(CHAT, PHONE, 42L, CHAT)).thenReturn(ProofResult.NOT_OWN_CONTACT);
+        when(linkService.proveContactForBooking(CHAT, PHONE, 42L, CHAT))
+                .thenReturn(ContactProof.of(ProofResult.NOT_OWN_CONTACT));
 
         Reply reply = reply(contact(42L, CHAT));
 
@@ -300,7 +355,8 @@ class TelegramUpdateHandlerTest {
     @Test
     @DisplayName("reply help and remove keyboard when contact has no pending claim")
     void should_replyHelpAndRemoveKeyboard_when_contactHasNoPendingClaim() {
-        when(linkService.proveContact(CHAT, PHONE, CHAT, CHAT)).thenReturn(ProofResult.NO_PENDING);
+        when(linkService.proveContactForBooking(CHAT, PHONE, CHAT, CHAT))
+                .thenReturn(ContactProof.of(ProofResult.NO_PENDING));
 
         Reply reply = reply(contact(CHAT, CHAT));
 
@@ -311,7 +367,7 @@ class TelegramUpdateHandlerTest {
     @Test
     @DisplayName("reply try again with share keyboard when proof hits lock timeout")
     void should_replyTryAgainWithShareKeyboard_when_proofHitsLockTimeout() {
-        when(linkService.proveContact(CHAT, PHONE, CHAT, CHAT))
+        when(linkService.proveContactForBooking(CHAT, PHONE, CHAT, CHAT))
                 .thenThrow(new PessimisticLockingFailureException("55P03"));
 
         Reply reply = reply(contact(CHAT, CHAT));

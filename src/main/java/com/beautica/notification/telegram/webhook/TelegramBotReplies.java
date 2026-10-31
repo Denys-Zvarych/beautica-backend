@@ -9,7 +9,9 @@ import java.util.List;
  * Phase 406 D5 — the bot's Ukrainian copy and reply keyboards, and the webhook-response {@code sendMessage} shape.
  *
  * <p>Every reply travels in the webhook HTTP response body ({@code {"method":"sendMessage",...}}), so the backend
- * never makes an outbound call for a conversation step. No reply ever carries booking data or a phone.
+ * never makes an outbound call for a conversation step. No webhook reply ever carries booking data or a phone; the
+ * booking details that follow a fresh LINKED reply are a separate outbound message
+ * ({@link LinkedBookingDetailsSender}).
  */
 public final class TelegramBotReplies {
 

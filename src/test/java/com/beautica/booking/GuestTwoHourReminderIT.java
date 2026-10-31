@@ -416,13 +416,7 @@ class GuestTwoHourReminderIT extends AbstractWalkInBookingSmsIT {
     }
 
     private UUID insertLinkVisit(OffsetDateTime startsAt, int items) {
-        UUID appointmentId = UUID.randomUUID();
-        jdbcTemplate.update("INSERT INTO appointments (id, salon_id, status, booking_source, guest_name, "
-                        + "guest_surname, guest_phone, cancel_token_hash, created_at, updated_at) "
-                        + "VALUES (?, ?, 'CONFIRMED', 'LINK', ?, ?, ?, encode(sha256(convert_to(?, 'UTF8')), 'hex'), "
-                        + "?, ?)",
-                appointmentId, salon.salonId(), GUEST_NAME, GUEST_SURNAME, LINK_PHONE, UUID.randomUUID().toString(),
-                at(NOW.minus(Duration.ofDays(1))), at(NOW));
+        UUID appointmentId = insertGuestLinkAppointment(LINK_PHONE, NOW.minus(Duration.ofDays(1)), NOW);
         for (int i = 0; i < items; i++) {
             OffsetDateTime itemStart = startsAt.plusHours(i);
             UUID bookingId = insertLinkBooking(itemStart, NOW.minus(Duration.ofDays(1)));

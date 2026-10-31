@@ -54,13 +54,14 @@ class TelegramWebhookControllerTest {
     @Mock private TelegramWebhookSecretVerifier verifier;
     @Mock private TelegramLinkService linkService;
     @Mock private TelegramChatAllowList allowList;
+    @Mock private LinkedBookingDetailsSender bookingDetailsSender;
 
     private final ObjectMapper objectMapper = new ObjectMapper();
     private TelegramUpdateHandler handler;
 
     @BeforeEach
     void setUp() {
-        handler = new TelegramUpdateHandler(linkService, allowList);
+        handler = new TelegramUpdateHandler(linkService, allowList, bookingDetailsSender);
         when(verifier.verify(any())).thenReturn(Outcome.ACCEPTED);
         lenient().when(allowList.allows(anyLong())).thenReturn(true);
     }

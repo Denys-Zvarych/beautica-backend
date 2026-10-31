@@ -178,6 +178,32 @@ class TelegramLinkServiceIT extends AbstractIntegrationTest {
         }
 
         @Test
+        @DisplayName("proveContactForBooking on LINKED → the token's booking id and the proven phone's hash")
+        void should_returnBookingIdAndPhoneHash_when_proofLinks() {
+            UUID bookingId = support.guestBooking(GUEST_PHONE);
+            service.claim(rawToken(service.issueForBooking(bookingId, GUEST_PHONE)), CHAT);
+
+            ContactProof proof = service.proveContactForBooking(CHAT, CONTACT_BARE, CHAT, CHAT);
+
+            assertThat(proof.result()).isEqualTo(ProofResult.LINKED);
+            assertThat(proof.linkedBookingId()).contains(bookingId);
+            assertThat(proof.phoneHash()).isEqualTo(phoneHasher.hash(GUEST_PHONE).hash());
+        }
+
+        @Test
+        @DisplayName("proveContactForBooking on MISMATCH → neither booking id nor phone hash")
+        void should_returnNoBookingIdNorPhoneHash_when_proofMismatches() {
+            UUID bookingId = support.guestBooking(GUEST_PHONE);
+            service.claim(rawToken(service.issueForBooking(bookingId, GUEST_PHONE)), CHAT);
+
+            ContactProof proof = service.proveContactForBooking(CHAT, "380671112233", CHAT, CHAT);
+
+            assertThat(proof.result()).isEqualTo(ProofResult.MISMATCH);
+            assertThat(proof.linkedBookingId()).isEmpty();
+            assertThat(proof.phoneHash()).isNull();
+        }
+
+        @Test
         @DisplayName("different phone → MISMATCH, no link, token terminal; second share → NO_PENDING; no raw phone kept")
         void should_mismatch_when_contactPhoneDiffers(CapturedOutput output) {
             String token = issueToken(GUEST_PHONE);
