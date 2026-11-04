@@ -33,8 +33,14 @@ import java.util.concurrent.RejectedExecutionException;
  * <p><b>Phone re-check.</b> The proven phone hash travels with the job; the details render only while the booking's
  * current guest phone still hashes to it ({@link GuestBookingDetailsText#render}).
  *
+ * <p><b>Why it still exists (user decision 2026-11-04).</b> Confirmations are now routed through
+ * {@code GuestMessageRouter} too, but the link is created AFTER the booking — the confirmation of the booking being
+ * linked has already gone out on the channel that was current then: by SMS when the phone was not linked yet, or to
+ * the previously linked (proven) chat when the phone is being re-linked — so this follow-up is the only way that
+ * booking's details reach the new Telegram chat. Later bookings on a linked phone get their confirmation in Telegram directly.
+ *
  * <p><b>Failure.</b> Best effort, at most once: a refused hand-off or a failed send is logged and dropped (the guest
- * already has the confirmation SMS). Logs carry the result and the exception class only — never the chat id, the
+ * already has the confirmation, by SMS or in the previously linked chat). Logs carry the result and the exception class only — never the chat id, the
  * booking, the phone or the text.
  */
 @Slf4j

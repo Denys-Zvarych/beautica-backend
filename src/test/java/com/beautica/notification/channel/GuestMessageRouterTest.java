@@ -131,6 +131,15 @@ class GuestMessageRouterTest {
 
     /** The final copy of each routed kind (phase 435 follow-up), with realistic values. */
     private static final java.util.Map<GuestMessageKind, String> FINAL_TEXTS = java.util.Map.of(
+            GuestMessageKind.GUEST_CONFIRMATION, """
+                    Beautica: Ваш запис підтверджено!
+                    Студія Лілія | Марія Левченко | Манікюр 27.10.2026 о 14:00
+                    Адреса: Хрещатик 10 (вхід з двору)
+                    Скасувати: https://beautica.app/c/Ab3dE5gH7jK9mN1p""",
+            GuestMessageKind.WALK_IN_CONFIRMATION, """
+                    Beautica: Ваш запис підтверджено!
+                    Студія Лілія | Марія Левченко | Манікюр 27.10.2026 о 14:00
+                    Скасувати: https://beautica.app/c/Ab3dE5gH7jK9mN1p""",
             GuestMessageKind.GUEST_REMINDER_24H, """
                     Beautica: Нагадуємо, що завтра у Вас запис!
 
@@ -352,7 +361,7 @@ class GuestMessageRouterTest {
     }
 
     @Test
-    @DisplayName("Kind.GUEST_PROVIDER_CANCELLATION (the one routed booking kind) is used only by NotificationService")
+    @DisplayName("Kind.GUEST_PROVIDER_CANCELLATION (the outbox-driven routed kind) is used only by NotificationService")
     void should_referenceRoutedKindOnlyFromNotificationService_when_scanningProductionClasses() {
         noClasses()
                 .that().doNotHaveFullyQualifiedName(NotificationService.class.getName())

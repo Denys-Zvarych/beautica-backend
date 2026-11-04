@@ -136,7 +136,7 @@ class StaffBookingServiceTest {
      * profile, so ordering is deterministic here for the same reason it is there.
      */
     private BookingSmsDispatcher bookingSmsDispatcher() {
-        return new BookingSmsDispatcher(smsService, GuestMessageRouters.smsOnly(smsService), new SyncTaskExecutor());
+        return new BookingSmsDispatcher(GuestMessageRouters.smsOnly(smsService), new SyncTaskExecutor());
     }
 
     private final UUID masterId = UUID.randomUUID();

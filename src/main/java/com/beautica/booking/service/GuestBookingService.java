@@ -52,8 +52,9 @@ import java.util.function.Supplier;
 /**
  * Creates auto-confirmed guest (LINK) bookings from the public booking link
  * (Phase 13.3). A phone-verified guest holding a {@code type=GUEST} JWT picks a
- * free slot; the booking is persisted as {@code CONFIRMED}, a confirmation SMS is
- * sent, and the master is notified via the outbox.
+ * free slot; the booking is persisted as {@code CONFIRMED}, a confirmation is
+ * sent (Telegram when the phone is linked, SMS otherwise — {@code GuestMessageRouter},
+ * user decision 2026-11-04), and the master is notified via the outbox.
  *
  * <p><b>Concurrency.</b> Double-booking is prevented by the exact mechanism the
  * regular {@code BookingService.doCreateBooking} uses: a per-master Postgres
