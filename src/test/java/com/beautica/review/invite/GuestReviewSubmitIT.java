@@ -245,6 +245,24 @@ class GuestReviewSubmitIT extends AbstractReviewInviteIT {
     }
 
     @Test
+    @DisplayName("phase 434: a STAFF walk-in visit invite (no policy version) → its COMPLETED item reviews as "
+            + "GUEST_LINK, 201, the token is CONSUMED")
+    void should_acceptWalkInItem_when_staffVisitInviteRedeemed() {
+        UUID appointmentId = fixtures.staffGuestVisit("COMPLETED", GUEST_PHONE);
+        UUID walkIn = fixtures.visitItem(appointmentId, masterId, masterServiceId, "STAFF", "COMPLETED", GUEST_PHONE,
+                5);
+        String token = newToken();
+        UUID inviteId = sentVisitInvite(appointmentId, token);
+
+        ResponseEntity<String> created = submit(token, "[" + item(walkIn, 5, null) + "]");
+
+        assertThat(created.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        assertThat(inviteRow(inviteId).get("status")).isEqualTo("CONSUMED");
+        assertThat(reviewsOf(walkIn)).singleElement()
+                .satisfies(row -> assertThat(row.get("source")).isEqualTo("GUEST_LINK"));
+    }
+
+    @Test
     @DisplayName("an already-reviewed item → 409 and the whole submit rolls back (token stays SENT, no other row)")
     void should_rollBackConsume_when_anItemAlreadyReviewed() {
         UUID appointmentId = fixtures.linkVisit("COMPLETED", GUEST_PHONE, POLICY);

@@ -22,6 +22,9 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
+import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
@@ -103,6 +106,55 @@ class GuestMessageRouterTest {
         verifyNoInteractions(smsService);
         assertThat(count("telegram", "sent")).isEqualTo(1.0);
     }
+
+    /**
+     * Phase 435 follow-up ("same sms should be in telegram") — per routed kind, the final copy reaches Telegram (linked)
+     * and SMS (not linked) as the SAME string, untouched by the router.
+     */
+    @ParameterizedTest
+    @EnumSource(GuestMessageKind.class)
+    @DisplayName("phase 435 follow-up: every routed kind sends the identical final text over Telegram and SMS")
+    void should_sendIdenticalTextOnBothChannels_when_anyKindRouted(GuestMessageKind kind) {
+        String text = FINAL_TEXTS.get(kind);
+        when(linkService.findActiveForPhone(PHONE))
+                .thenReturn(Optional.of(new ActiveLink(LINK_ID, CHAT_ID)), Optional.empty());
+        ArgumentCaptor<String> telegramText = ArgumentCaptor.forClass(String.class);
+        ArgumentCaptor<String> smsText = ArgumentCaptor.forClass(String.class);
+
+        router.deliver(kind, PHONE, text);
+        router.deliver(kind, PHONE, text);
+
+        verify(telegramMessenger).sendWaiting(org.mockito.ArgumentMatchers.eq(CHAT_ID), telegramText.capture());
+        verify(smsService).send(org.mockito.ArgumentMatchers.eq(PHONE), smsText.capture());
+        assertThat(telegramText.getValue()).isEqualTo(smsText.getValue()).isEqualTo(text);
+    }
+
+    /** The final copy of each routed kind (phase 435 follow-up), with realistic values. */
+    private static final java.util.Map<GuestMessageKind, String> FINAL_TEXTS = java.util.Map.of(
+            GuestMessageKind.GUEST_REMINDER_24H, """
+                    Beautica: Нагадуємо, що завтра у Вас запис!
+
+                    Студія Лілія | Марія Левченко | Манікюр о 14:00
+                    Адреса: Хрещатик 10 (вхід з двору)
+                    Скасувати запис: https://beautica.app/c/Ab3dE5gH7jK9mN1p""",
+            GuestMessageKind.GUEST_REMINDER_2H, """
+                    Beautica: Нагадуємо, що сьогодні у Вас запис!
+
+                    Марія Левченко | Манікюр о 14:00
+                    Адреса: Сагайдачного 3А
+                    Скасувати запис: https://beautica.app/c/Ab3dE5gH7jK9mN1p""",
+            GuestMessageKind.GUEST_PROVIDER_CANCELLATION, """
+                    Beautica: Ваш запис 26.10.2026 о 10:00 скасовано.
+
+                    Деталі або записатись знову https://beautica.app/c/Ab3dE5gH7jK9mN1p""",
+            GuestMessageKind.GUEST_PROVIDER_RESCHEDULE, """
+                    Beautica: Ваш запис перенесено на 27.10.2026 о 12:00.
+
+                    Деталі або записатись знову https://beautica.app/c/Ab3dE5gH7jK9mN1p""",
+            GuestMessageKind.GUEST_REVIEW_INVITE, """
+                    Beautica: Дякуємо, що обрали наш сервіс. Залиште свій відгук про Ваш візит!
+
+                    https://beautica.app/r/token""");
 
     @Test
     @DisplayName("D2.3 a failed touchLastSent after delivery never triggers an SMS or escapes")

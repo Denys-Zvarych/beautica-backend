@@ -24,6 +24,9 @@ public final class ReviewInviteTestProperties {
     public static ReviewInviteProperties of(boolean enabled, String minPolicyVersion) {
         return new ReviewInviteProperties(enabled, minPolicyVersion, Duration.ofHours(2), LocalTime.of(21, 0),
                 LocalTime.of(9, 0), LocalTime.of(10, 0), Duration.ofHours(72), Duration.ofDays(14), 50, 3,
-                ReviewInviteProperties.DEFAULT_SMS_TEXT, ReviewInviteProperties.DEFAULT_SEND_BUDGET);
+                ReviewInviteProperties.DEFAULT_SMS_TEXT, ReviewInviteProperties.DEFAULT_SEND_BUDGET,
+                ReviewInviteProperties.DEFAULT_STAFF_PHONE_WINDOW,
+                ReviewInviteProperties.DEFAULT_STAFF_PHONE_GLOBAL_CAP,
+                ReviewInviteProperties.DEFAULT_STAFF_PROVIDER_DAILY_CAP);
     }
 }

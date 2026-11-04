@@ -84,7 +84,7 @@ class TelegramUpdateHandlerTest {
     }
 
     @Test
-    @DisplayName("ask for phone with share keyboard when start claims")
+    @DisplayName("/start with a fresh token claims the link and asks the guest to share their phone via the share keyboard")
     void should_askForPhoneWithShareKeyboard_when_startClaims() {
         when(linkService.claim(TOKEN, CHAT)).thenReturn(ClaimResult.CLAIMED);
 
@@ -95,7 +95,7 @@ class TelegramUpdateHandlerTest {
     }
 
     @Test
-    @DisplayName("claim once without reactivate when claim answers already linked")
+    @DisplayName("/start on an already-linked chat replies «linked» with the unlink keyboard, claims once and never reactivates")
     void should_claimOnceWithoutReactivate_when_claimAnswersAlreadyLinked() {
         when(linkService.claim(TOKEN, CHAT)).thenReturn(ClaimResult.ALREADY_LINKED);
 
@@ -108,7 +108,7 @@ class TelegramUpdateHandlerTest {
     }
 
     @Test
-    @DisplayName("reactivate then reclaim when invalid and chat had blocked link")
+    @DisplayName("/start rejected for a chat that had blocked the bot reactivates the link, retries the claim and replies «linked»")
     void should_reactivateThenReclaim_when_invalidAndChatHadBlockedLink() {
         when(linkService.claim(TOKEN, CHAT)).thenReturn(ClaimResult.INVALID, ClaimResult.ALREADY_LINKED);
         when(linkService.reactivate(CHAT)).thenReturn(1);
@@ -123,7 +123,7 @@ class TelegramUpdateHandlerTest {
     }
 
     @Test
-    @DisplayName("not reclaim when invalid and nothing reactivated")
+    @DisplayName("/start rejected with nothing to reactivate claims only once and replies «invalid link»")
     void should_notReclaim_when_invalidAndNothingReactivated() {
         when(linkService.claim(TOKEN, CHAT)).thenReturn(ClaimResult.INVALID);
         when(linkService.reactivate(CHAT)).thenReturn(0);
@@ -135,7 +135,7 @@ class TelegramUpdateHandlerTest {
     }
 
     @ParameterizedTest
-    @DisplayName("not reactivate when start payload is not token shaped")
+    @DisplayName("/start with a payload that is not token-shaped replies «invalid link» and never tries to reactivate")
     @ValueSource(strings = {"garbage", "A", "%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%"})
     void should_notReactivate_when_startPayloadIsNotTokenShaped(String payload) {
         when(linkService.claim(payload, CHAT)).thenReturn(ClaimResult.INVALID);
@@ -147,7 +147,7 @@ class TelegramUpdateHandlerTest {
     }
 
     @Test
-    @DisplayName("return share keyboard when busy reply for contact share")
+    @DisplayName("busy webhook answers a contact share with «try again» and keeps the share keyboard, without touching the link service")
     void should_returnShareKeyboard_when_busyReplyForContactShare() {
         Reply reply = handler.busyReply(contact(CHAT, CHAT)).orElseThrow();
 
@@ -157,7 +157,7 @@ class TelegramUpdateHandlerTest {
     }
 
     @Test
-    @DisplayName("leave keyboard unchanged when busy reply for text")
+    @DisplayName("busy webhook answers a text command without changing the keyboard")
     void should_leaveKeyboardUnchanged_when_busyReplyForText() {
         Reply reply = handler.busyReply(text("/stop")).orElseThrow();
 
@@ -165,7 +165,7 @@ class TelegramUpdateHandlerTest {
     }
 
     @Test
-    @DisplayName("reply try again when unlink hits lock timeout")
+    @DisplayName("/stop during a row-lock timeout replies «try again» and leaves the keyboard unchanged")
     void should_replyTryAgain_when_unlinkHitsLockTimeout() {
         when(linkService.unlinkChat(CHAT)).thenThrow(new PessimisticLockingFailureException("55P03"));
 
@@ -176,7 +176,7 @@ class TelegramUpdateHandlerTest {
     }
 
     @Test
-    @DisplayName("swallow without reply when membership hits query timeout")
+    @DisplayName("bot-blocked event during a query timeout is swallowed with no reply")
     void should_swallowWithoutReply_when_membershipHitsQueryTimeout() {
         doThrow(new QueryTimeoutException("55P03")).when(linkService).markBlocked(CHAT);
 
@@ -186,7 +186,7 @@ class TelegramUpdateHandlerTest {
     }
 
     @Test
-    @DisplayName("answer try again without service call when busy reply for listed private chat")
+    @DisplayName("busy webhook answers an allow-listed private chat with «try again» and never calls the link service")
     void should_answerTryAgainWithoutServiceCall_when_busyReplyForListedPrivateChat() {
         Reply reply = handler.busyReply(text("/start " + TOKEN)).orElseThrow();
 
@@ -196,7 +196,7 @@ class TelegramUpdateHandlerTest {
     }
 
     @Test
-    @DisplayName("answer nothing when busy reply for unlisted group or membership")
+    @DisplayName("busy webhook stays silent for an unlisted chat, a group chat and a membership event")
     void should_answerNothing_when_busyReplyForUnlistedGroupOrMembership() {
         when(allowList.allows(CHAT)).thenReturn(false);
         TelegramUpdate group = new TelegramUpdate(1L,
@@ -209,7 +209,7 @@ class TelegramUpdateHandlerTest {
     }
 
     @Test
-    @DisplayName("reply invalid and remove keyboard when claim invalid")
+    @DisplayName("/start with an unknown or expired token replies «invalid link» and removes the keyboard")
     void should_replyInvalidAndRemoveKeyboard_when_claimInvalid() {
         when(linkService.claim(TOKEN, CHAT)).thenReturn(ClaimResult.INVALID);
 
@@ -220,7 +220,7 @@ class TelegramUpdateHandlerTest {
     }
 
     @Test
-    @DisplayName("accept bot suffixed command when start addressed to bot")
+    @DisplayName("/Start@bot_name with a token is treated like /start and asks for the phone")
     void should_acceptBotSuffixedCommand_when_startAddressedToBot() {
         when(linkService.claim(TOKEN, CHAT)).thenReturn(ClaimResult.CLAIMED);
 
@@ -230,7 +230,7 @@ class TelegramUpdateHandlerTest {
     }
 
     @Test
-    @DisplayName("reply try again when claim hits lock timeout")
+    @DisplayName("/start during a row-lock timeout replies «try again» and leaves the keyboard unchanged")
     void should_replyTryAgain_when_claimHitsLockTimeout() {
         when(linkService.claim(TOKEN, CHAT)).thenThrow(new PessimisticLockingFailureException("55P03"));
 
@@ -241,7 +241,7 @@ class TelegramUpdateHandlerTest {
     }
 
     @ParameterizedTest
-    @DisplayName("reply help without keyboard change when no token or other text")
+    @DisplayName("/start without a token, /help or free text replies with help, keeps the keyboard and never calls the link service")
     @ValueSource(strings = {"/start", "/start   ", "/help", "привіт"})
     void should_replyHelpWithoutKeyboardChange_when_noTokenOrOtherText(String text) {
         Reply reply = reply(text(text));
@@ -252,8 +252,9 @@ class TelegramUpdateHandlerTest {
     }
 
     @ParameterizedTest
-    @DisplayName("unlink and remove keyboard when stop or unlink button")
-    @ValueSource(strings = {"/stop", "/STOP", "Повернутися до SMS", "  Повернутися до SMS "})
+    @DisplayName("/stop or an unlink button label (any case for /stop, padded labels) unlinks the chat, confirms and removes the keyboard")
+    @ValueSource(strings = {"/stop", "/STOP", "Відписатися від Telegram", "  Відписатися від Telegram ",
+            "Повернутися до SMS", "  Повернутися до SMS "})
     void should_unlinkAndRemoveKeyboard_when_stopOrUnlinkButton(String text) {
         Reply reply = reply(text(text));
 
@@ -262,8 +263,29 @@ class TelegramUpdateHandlerTest {
         assertThat(reply.replyMarkup()).isEqualTo(TelegramBotReplies.REMOVE_KEYBOARD);
     }
 
+    @ParameterizedTest
+    @DisplayName("text that only resembles an unlink button label replies with help and keeps the link")
+    @ValueSource(strings = {"Відписатися", "від Telegram", "Відписатися від Telegram зараз",
+            "Будь ласка, Відписатися від Telegram", "відписатися від telegram", "Відписатися від Telegram!",
+            "Повернутися", "Повернутися до SMS будь ласка", "Хочу Повернутися до SMS", "повернутися до sms"})
+    void should_replyHelpAndKeepLink_when_textIsNearMissOfUnlinkLabel(String text) {
+        Reply reply = reply(text(text));
+
+        assertThat(reply.text()).as("near-miss «%s» must not unlink", text).isEqualTo(TelegramBotReplies.HELP);
+        assertThat(reply.replyMarkup()).isNull();
+        verifyNoInteractions(linkService);
+    }
+
     @Test
-    @DisplayName("reply linked with unlink keyboard when contact matches")
+    @DisplayName("«linked» reply quotes the current unlink button label and never the legacy one")
+    void should_nameCurrentUnlinkLabel_when_linkedReplyText() {
+        assertThat(TelegramBotReplies.LINKED)
+                .contains("«" + TelegramBotReplies.UNLINK_BUTTON_TEXT + "»")
+                .doesNotContain(TelegramBotReplies.LEGACY_UNLINK_BUTTON_TEXT);
+    }
+
+    @Test
+    @DisplayName("guest shares their own phone matching the booking: link confirmed and the unlink keyboard shown")
     void should_replyLinkedWithUnlinkKeyboard_when_contactMatches() {
         when(linkService.proveContactForBooking(CHAT, PHONE, CHAT, CHAT))
                 .thenReturn(ContactProof.linked(BOOKING_ID, PHONE_HASH));
@@ -275,7 +297,7 @@ class TelegramUpdateHandlerTest {
     }
 
     @Test
-    @DisplayName("reply mismatch and remove keyboard when contact differs")
+    @DisplayName("guest shares a phone that differs from the booking: «mismatch» reply and the keyboard removed")
     void should_replyMismatchAndRemoveKeyboard_when_contactDiffers() {
         when(linkService.proveContactForBooking(CHAT, PHONE, CHAT, CHAT))
                 .thenReturn(ContactProof.of(ProofResult.MISMATCH));
@@ -287,7 +309,7 @@ class TelegramUpdateHandlerTest {
     }
 
     @Test
-    @DisplayName("schedule booking details once for the linked booking when contact matches")
+    @DisplayName("guest shares the matching phone: booking details are scheduled exactly once for that booking")
     void should_scheduleBookingDetailsOnce_when_contactMatches() {
         when(linkService.proveContactForBooking(CHAT, PHONE, CHAT, CHAT))
                 .thenReturn(ContactProof.linked(BOOKING_ID, PHONE_HASH));
@@ -300,7 +322,7 @@ class TelegramUpdateHandlerTest {
 
     @ParameterizedTest
     @EnumSource(value = ProofResult.class, names = {"MISMATCH", "NOT_OWN_CONTACT", "NO_PENDING"})
-    @DisplayName("schedule no booking details when the contact proof does not link")
+    @DisplayName("contact share that does not link (mismatch, not own contact, no pending claim) schedules no booking details")
     void should_scheduleNoBookingDetails_when_proofDoesNotLink(ProofResult result) {
         when(linkService.proveContactForBooking(CHAT, PHONE, CHAT, CHAT)).thenReturn(ContactProof.of(result));
 
@@ -310,7 +332,7 @@ class TelegramUpdateHandlerTest {
     }
 
     @Test
-    @DisplayName("schedule no booking details when the proof hits a lock timeout")
+    @DisplayName("contact share during a row-lock timeout schedules no booking details")
     void should_scheduleNoBookingDetails_when_proofHitsLockTimeout() {
         when(linkService.proveContactForBooking(CHAT, PHONE, CHAT, CHAT))
                 .thenThrow(new PessimisticLockingFailureException("55P03"));
@@ -322,7 +344,7 @@ class TelegramUpdateHandlerTest {
 
     @ParameterizedTest
     @EnumSource(ClaimResult.class)
-    @DisplayName("schedule no booking details on /start, including an ALREADY_LINKED re-tap")
+    @DisplayName("/start never schedules booking details, whatever the claim result, including an already-linked re-tap")
     void should_scheduleNoBookingDetails_when_startIsHandled(ClaimResult result) {
         lenient().when(linkService.claim(TOKEN, CHAT)).thenReturn(result);
 
@@ -332,7 +354,7 @@ class TelegramUpdateHandlerTest {
     }
 
     @Test
-    @DisplayName("ask own contact again when contact is forwarded")
+    @DisplayName("guest forwards someone else's contact: asked again for their own phone with the share keyboard")
     void should_askOwnContactAgain_when_contactIsForwarded() {
         when(linkService.proveContactForBooking(CHAT, PHONE, 42L, CHAT))
                 .thenReturn(ContactProof.of(ProofResult.NOT_OWN_CONTACT));
@@ -344,7 +366,7 @@ class TelegramUpdateHandlerTest {
     }
 
     @Test
-    @DisplayName("reply not own without service call when contact has no sender")
+    @DisplayName("contact message without a sender replies «not your contact» and never calls the link service")
     void should_replyNotOwnWithoutServiceCall_when_contactHasNoSender() {
         Reply reply = reply(contact(CHAT, null));
 
@@ -353,7 +375,7 @@ class TelegramUpdateHandlerTest {
     }
 
     @Test
-    @DisplayName("reply help and remove keyboard when contact has no pending claim")
+    @DisplayName("contact shared with no pending /start claim replies with help and removes the keyboard")
     void should_replyHelpAndRemoveKeyboard_when_contactHasNoPendingClaim() {
         when(linkService.proveContactForBooking(CHAT, PHONE, CHAT, CHAT))
                 .thenReturn(ContactProof.of(ProofResult.NO_PENDING));
@@ -365,7 +387,7 @@ class TelegramUpdateHandlerTest {
     }
 
     @Test
-    @DisplayName("reply try again with share keyboard when proof hits lock timeout")
+    @DisplayName("contact share during a row-lock timeout replies «try again» and keeps the share keyboard")
     void should_replyTryAgainWithShareKeyboard_when_proofHitsLockTimeout() {
         when(linkService.proveContactForBooking(CHAT, PHONE, CHAT, CHAT))
                 .thenThrow(new PessimisticLockingFailureException("55P03"));
@@ -377,7 +399,7 @@ class TelegramUpdateHandlerTest {
     }
 
     @Test
-    @DisplayName("mark blocked without reply when kicked")
+    @DisplayName("guest blocks the bot in a private chat: link marked blocked, no reply sent")
     void should_markBlockedWithoutReply_when_kicked() {
         Optional<Reply> reply = handler.handle(membership("private", "kicked"));
 
@@ -386,7 +408,7 @@ class TelegramUpdateHandlerTest {
     }
 
     @Test
-    @DisplayName("reactivate without reply when member again")
+    @DisplayName("guest unblocks the bot in a private chat: link reactivated, no reply sent")
     void should_reactivateWithoutReply_when_memberAgain() {
         Optional<Reply> reply = handler.handle(membership("private", "member"));
 
@@ -395,7 +417,7 @@ class TelegramUpdateHandlerTest {
     }
 
     @Test
-    @DisplayName("ignore membership when status unsupported or chat not private")
+    @DisplayName("membership event with an unsupported status or from a group chat is ignored")
     void should_ignoreMembership_when_statusUnsupportedOrChatNotPrivate() {
         handler.handle(membership("private", "left"));
         handler.handle(membership("group", "kicked"));
@@ -404,7 +426,7 @@ class TelegramUpdateHandlerTest {
     }
 
     @Test
-    @DisplayName("ignore without service call when chat not private")
+    @DisplayName("/start from a group chat is ignored with no reply, no allow-list check and no link service call")
     void should_ignoreWithoutServiceCall_when_chatNotPrivate() {
         TelegramUpdate group = new TelegramUpdate(1L,
                 new Message(new Chat(-100L, "group"), new User(CHAT), "/start " + TOKEN, null), null);
@@ -416,7 +438,7 @@ class TelegramUpdateHandlerTest {
     }
 
     @Test
-    @DisplayName("drop without service call when chat not allow listed")
+    @DisplayName("chat not on the allow-list: /start, contact share and block events are dropped with no reply and no link service call")
     void should_dropWithoutServiceCall_when_chatNotAllowListed() {
         when(allowList.allows(CHAT)).thenReturn(false);
 
@@ -431,7 +453,7 @@ class TelegramUpdateHandlerTest {
     }
 
     @Test
-    @DisplayName("ignore when message has no text or update is unsupported")
+    @DisplayName("message without text (e.g. a sticker) or an unsupported update type is ignored")
     void should_ignore_when_messageHasNoTextOrUpdateIsUnsupported() {
         TelegramUpdate sticker = new TelegramUpdate(1L,
                 new Message(new Chat(CHAT, "private"), new User(CHAT), null, null), null);

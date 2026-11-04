@@ -89,9 +89,9 @@ class GuestMessageTelegramOffIT extends AbstractWalkInBookingSmsIT {
         reminderJob.sweepTwoHour();
 
         assertThat(reminder24h).isEqualTo(
-                "Beautica: Нагадуємо!\n" + SERVICE_NAME + " у " + MASTER_NAME + "\nЗавтра о " + kyivTime(in24h));
+                salonReminderPrefix("завтра") + SERVICE_NAME + " о " + kyivTime(in24h));
         assertThat(sentText()).isEqualTo(
-                "Beautica: Нагадуємо!\n" + SERVICE_NAME + " у " + MASTER_NAME + "\nСьогодні о " + kyivTime(in2h));
+                salonReminderPrefix("сьогодні") + SERVICE_NAME + " о " + kyivTime(in2h));
         assertThat(telegramRequests()).isEmpty();
         assertThat(jdbcTemplate.queryForObject("SELECT status || '/' || (last_sent_at IS NULL) FROM telegram_links",
                 String.class)).isEqualTo("ACTIVE/true");

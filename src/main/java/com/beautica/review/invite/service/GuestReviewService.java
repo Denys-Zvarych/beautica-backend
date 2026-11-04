@@ -123,9 +123,9 @@ public class GuestReviewService {
     }
 
     /**
-     * D8 — the ONE place an invite turns into its reviewable bookings: COMPLETED LINK guest bookings
-     * ({@code client_id IS NULL}) of the invite's visit, by start time; or, for a booking-keyed invite (V215), its one
-     * booking while it still has no visit header and passes the same filter. Anything else (an APP or STAFF booking,
+     * D8 — the ONE place an invite turns into its reviewable bookings: COMPLETED LINK guest or (phase 434) STAFF
+     * walk-in bookings ({@code client_id IS NULL}) of the invite's visit, by start time; or, for a booking-keyed invite
+     * (V215), its one booking while it still has no visit header and passes the same filter. Anything else (an APP booking,
      * a registered client, not COMPLETED, since attached to a visit) is simply absent (D5a). One fetch-joined
      * statement per subject kind. Callers must hold a transaction.
      */

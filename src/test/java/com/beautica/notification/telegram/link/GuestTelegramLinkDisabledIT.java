@@ -125,6 +125,6 @@ class GuestTelegramLinkDisabledIT extends AbstractIntegrationTest {
         assertThat(response.getStatusCode()).as("body=%s", response.getBody()).isEqualTo(HttpStatus.CREATED);
         JsonNode created = objectMapper.readTree(response.getBody());
         assertThat(created.path("telegram").toString()).isEqualTo("{\"available\":false,\"linked\":false}");
-        assertThat(created.path("cancelUrl").asText()).contains("/book/cancel/");
+        assertThat(created.path("cancelUrl").asText()).contains("/c/");
     }
 }

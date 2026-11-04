@@ -103,7 +103,7 @@ class PublicSalonGuestBookingIT extends AbstractIntegrationTest {
         JsonNode a = created(first);
         JsonNode b = created(second);
         assertThat(a.path("appointmentId").asText()).isNotBlank().isNotEqualTo(b.path("appointmentId").asText());
-        assertThat(a.path("cancelUrl").asText()).contains("/book/cancel/").isNotEqualTo(b.path("cancelUrl").asText());
+        assertThat(a.path("cancelUrl").asText()).contains("/c/").isNotEqualTo(b.path("cancelUrl").asText());
         assertThat(a.path("durationMinutes").asInt()).isEqualTo(60);
         for (JsonNode created : List.of(a, b)) {
             assertThat(created.path("telegram").toString())
@@ -123,7 +123,7 @@ class PublicSalonGuestBookingIT extends AbstractIntegrationTest {
             assertThat(row.get("client_comment")).isEqualTo(master.equals(masterA) ? "Коментар А" : "Коментар Б");
         }
         for (JsonNode created : List.of(a, b)) {
-            String cancelToken = created.path("cancelUrl").asText().replaceAll(".*/book/cancel/", "");
+            String cancelToken = created.path("cancelUrl").asText().replaceAll(".*/c/", "");
             assertThat(get(BOOK + "cancel/" + cancelToken).getStatusCode()).isEqualTo(HttpStatus.OK);
         }
     }

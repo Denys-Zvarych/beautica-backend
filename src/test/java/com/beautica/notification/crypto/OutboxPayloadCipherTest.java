@@ -178,4 +178,43 @@ class OutboxPayloadCipherTest {
         assertThatThrownBy(() -> cipher.open(null))
                 .isInstanceOf(IllegalStateException.class);
     }
+
+    // ── Phase 435 audit-fix: opt-in AES-GCM associated data (withKey(..., true)) ─────────────
+
+    private static final String BOUND_KEY = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+
+    @Test
+    void should_refuseBoundCalls_when_outboxBeanDidNotOptIn() {
+        // Act + Assert — the outbox bean's behaviour is unchanged: no AAD path at all
+        assertThatThrownBy(() -> cipher.sealBound("x", "bookings:1".getBytes()))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("associated data not enabled");
+        assertThat(cipher.open(cipher.seal("x"))).isEqualTo("x");
+    }
+
+    @Test
+    void should_roundTripOnlyWithSameAssociatedData_when_optedIn() {
+        // Arrange
+        OutboxPayloadCipher bound = OutboxPayloadCipher.withKey(BOUND_KEY, "k", true);
+
+        // Act
+        String body = bound.sealBound("token", "bookings:1".getBytes());
+
+        // Assert
+        assertThat(bound.openBound(body, "bookings:1".getBytes())).isEqualTo("token");
+        assertThatThrownBy(() -> bound.openBound(body, "bookings:2".getBytes()))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("corrupt or tampered");
+    }
+
+    @Test
+    void should_refuseUnboundSeal_when_optedIn() {
+        // Arrange
+        OutboxPayloadCipher bound = OutboxPayloadCipher.withKey(BOUND_KEY, "k", true);
+
+        // Act + Assert — an opted-in instance never writes an unbound value, but still reads legacy v1: ones
+        assertThatThrownBy(() -> bound.seal("x")).isInstanceOf(IllegalStateException.class);
+        assertThatThrownBy(() -> bound.sealBound("x", new byte[0])).isInstanceOf(IllegalStateException.class);
+        assertThat(bound.open(OutboxPayloadCipher.withKey(BOUND_KEY, "k").seal("legacy"))).isEqualTo("legacy");
+    }
 }

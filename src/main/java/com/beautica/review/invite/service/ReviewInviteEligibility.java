@@ -29,10 +29,16 @@ import java.util.stream.Collectors;
  *   <li>guest PII anonymised → {@link ReviewInviteSkipReason#ANONYMISED}</li>
  *   <li>no (valid) guest phone → {@link ReviewInviteSkipReason#NO_PHONE}</li>
  *   <li>phone hash in {@code sms_opt_outs} → {@link ReviewInviteSkipReason#OPTED_OUT}</li>
- *   <li>accepted policy older than {@code min-policy-version} (or none) → {@link ReviewInviteSkipReason#POLICY_VERSION}</li>
+ *   <li>LINK only: accepted policy older than {@code min-policy-version} (or none) →
+ *       {@link ReviewInviteSkipReason#POLICY_VERSION}; phase 434 — a STAFF walk-in is exempt (it never records one)</li>
  *   <li>no COMPLETED booking left without a review → {@link ReviewInviteSkipReason#NOTHING_TO_REVIEW}</li>
+ *   <li>phase 434 audit-fix, STAFF walk-in only ({@link StaffWalkInInviteGuard}): provider's own account phone →
+ *       {@link ReviewInviteSkipReason#PROVIDER_OWN_PHONE}; same phone invited for the same provider within
+ *       {@code staff-phone-window} → {@link ReviewInviteSkipReason#REPEAT_PHONE}. Last, because it queries; a LINK
+ *       visit never reaches it</li>
  * </ol>
- * A visit that is not a LINK guest visit never gets a row ({@link VisitSnapshot#isGuestLinkVisit}); should one ever
+ * A visit that is neither a LINK guest nor a STAFF walk-in visit never gets a row
+ * ({@link VisitSnapshot#isReviewInviteVisit}); should one ever
  * reach the send path it is reported as {@code NOTHING_TO_REVIEW} — there is nothing a guest may review there.
  * The opt-out lookup runs only when every cheaper gate before it passed. The send job preloads it for a whole batch
  * ({@link #preload}, one query, each phone hashed once) and passes the result to
@@ -45,16 +51,19 @@ public class ReviewInviteEligibility {
     private final BookingSmsProperties bookingSmsProperties;
     private final PhoneHasher phoneHasher;
     private final SmsOptOutRepository smsOptOutRepository;
+    private final StaffWalkInInviteGuard staffWalkInGuard;
     private final Optional<PolicyVersion> minPolicyVersion;
 
     public ReviewInviteEligibility(ReviewInviteProperties properties,
                                    BookingSmsProperties bookingSmsProperties,
                                    PhoneHasher phoneHasher,
-                                   SmsOptOutRepository smsOptOutRepository) {
+                                   SmsOptOutRepository smsOptOutRepository,
+                                   StaffWalkInInviteGuard staffWalkInGuard) {
         this.properties = properties;
         this.bookingSmsProperties = bookingSmsProperties;
         this.phoneHasher = phoneHasher;
         this.smsOptOutRepository = smsOptOutRepository;
+        this.staffWalkInGuard = staffWalkInGuard;
         this.minPolicyVersion = PolicyVersion.parse(properties.minPolicyVersion());
     }
 
@@ -152,13 +161,15 @@ public class ReviewInviteEligibility {
         if (optedOut.test(phone.hash())) {
             return Verdict.skip(phone, ReviewInviteSkipReason.OPTED_OUT);
         }
-        if (!policyAccepted(visit.policyVersion())) {
+        if (visit.isGuestLinkVisit() && !policyAccepted(visit.policyVersion())) {
             return Verdict.skip(phone, ReviewInviteSkipReason.POLICY_VERSION);
         }
-        if (!visit.isGuestLinkVisit() || !visit.hasUnreviewedCompleted()) {
+        if (!visit.isReviewInviteVisit() || !visit.hasUnreviewedCompleted()) {
             return Verdict.skip(phone, ReviewInviteSkipReason.NOTHING_TO_REVIEW);
         }
-        return Verdict.eligible(phone);
+        return staffWalkInGuard.check(visit, phone)
+                .map(reason -> Verdict.skip(phone, reason))
+                .orElseGet(() -> Verdict.eligible(phone));
     }
 
     private boolean policyAccepted(String accepted) {

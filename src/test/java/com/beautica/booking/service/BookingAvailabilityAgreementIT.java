@@ -1,5 +1,6 @@
 package com.beautica.booking.service;
 
+import com.beautica.booking.domain.GuestCancelToken;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.booking.dto.AppointmentCancelRequest;
 import com.beautica.booking.dto.AvailableSlotResponse;
@@ -1093,7 +1094,7 @@ class BookingAvailabilityAgreementIT extends AbstractIntegrationTest {
         // The public guest cancel: token consumed atomically, then the after-commit hook fires the
         // SMS and the SAME by-master availability sweep. No SMS provider is configured under the
         // test profile, so the send throws and is swallowed by design — the eviction must still run.
-        bookingCancellationService.cancel(cancelToken);
+        bookingCancellationService.cancel(GuestCancelToken.of(cancelToken));
 
         assertThat(slotStarts(m.masterId(), day, svcB))
                 .as("the guest-freed 11:00 is bookable on service B on the very next read; 15:00 "

@@ -81,7 +81,7 @@ class ReviewInviteSendJobIT extends AbstractReviewInviteIT {
         assertThat(requests).hasSize(1);
         String text = payload(requests.get(0)).path("sms").path("text").asText();
         assertThat(payload(requests.get(0)).path("recipients").get(0).asText()).isEqualTo(GUEST_PHONE);
-        assertThat(text).startsWith("Оцініть ваш візит: beautica.app/r/").hasSize(56);
+        assertThat(text).startsWith("Beautica: Дякуємо, що обрали наш сервіс. Залиште свій відгук про Ваш візит!\n\nhttps://beautica.app/r/").hasSize(122);
         String token = text.substring(text.lastIndexOf('/') + 1);
         assertThat(token).matches("[A-Za-z0-9_-]{22}");
 
@@ -307,7 +307,7 @@ class ReviewInviteSendJobIT extends AbstractReviewInviteIT {
         assertThat(requests).hasSize(1);
         String text = payload(requests.get(0)).path("sms").path("text").asText();
         assertThat(payload(requests.get(0)).path("recipients").get(0).asText()).isEqualTo(GUEST_PHONE);
-        assertThat(text).startsWith("Оцініть ваш візит: beautica.app/r/").hasSize(56);
+        assertThat(text).startsWith("Beautica: Дякуємо, що обрали наш сервіс. Залиште свій відгук про Ваш візит!\n\nhttps://beautica.app/r/").hasSize(122);
         Map<String, Object> row = inviteRow(inviteId);
         assertThat(row.get("status")).isEqualTo("SENT");
         assertThat((byte[]) row.get("token_hash"))
@@ -349,6 +349,41 @@ class ReviewInviteSendJobIT extends AbstractReviewInviteIT {
         job.tick(MIDDAY);
 
         assertSkipped(inviteId, "ANONYMISED");
+    }
+
+    // ── Phase 434 audit-fix — the send-time re-check of the STAFF walk-in phone guards ──
+
+    @Test
+    @DisplayName("434 audit-fix — control: a due STAFF walk-in invite with no earlier invite for the phone + master "
+            + "→ SENT, one SMS")
+    void should_sendStaffWalkInInvite_when_noEarlierInviteForPhoneAndProvider() {
+        UUID walkIn = completedStaffWalkIn(masterId, masterServiceId, GUEST_PHONE, 4);
+        UUID inviteId = scheduledInvite(walkIn, phoneHash(), MIDDAY.minusSeconds(60));
+
+        job.tick(MIDDAY);
+
+        assertThat(inviteRow(inviteId).get("status")).isEqualTo("SENT");
+        assertThat(turbosmsRequests()).hasSize(1);
+    }
+
+    @Test
+    @DisplayName("434 audit-fix — a SCHEDULED STAFF walk-in invite that became ineligible after scheduling (an EARLIER "
+            + "invite for the same phone + master committed later, e.g. a concurrent completion) → SKIPPED "
+            + "(REPEAT_PHONE) at send, no SMS; the earlier invite is untouched")
+    void should_skipRepeatPhoneAtSend_when_earlierInviteForSamePhoneAndProviderAppearsAfterScheduling() {
+        UUID laterWalkIn = completedStaffWalkIn(masterId, masterServiceId, GUEST_PHONE, 4);
+        UUID inviteId = scheduledInvite(laterWalkIn, phoneHash(), MIDDAY.minusSeconds(60));
+        UUID earlierWalkIn = completedStaffWalkIn(masterId, masterServiceId, GUEST_PHONE, 8);
+        UUID earlierInviteId = UUID.randomUUID();
+        jdbcTemplate.update("INSERT INTO review_invites (id, appointment_id, phone_hash, status, send_after, created_at) "
+                        + "VALUES (?, ?, ?, 'SCHEDULED', ?, ?)", earlierInviteId, earlierWalkIn, phoneHash(),
+                Timestamp.from(MIDDAY.plus(Duration.ofHours(1))), Timestamp.from(MIDDAY.minusSeconds(120)));
+
+        job.tick(MIDDAY);
+
+        assertSkipped(inviteId, "REPEAT_PHONE");
+        assertThat(inviteRow(earlierInviteId).get("status")).as("not due yet, never claimed").isEqualTo("SCHEDULED");
+        assertThat(logLines()).noneMatch(line -> line.contains(GUEST_SUBSCRIBER_DIGITS));
     }
 
     private UUID dueBookingInvite() {

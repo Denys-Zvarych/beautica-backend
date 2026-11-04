@@ -103,7 +103,7 @@ class TelegramWebhookControllerIT extends AbstractIntegrationTest {
     }
 
     private static void assertUnlinkKeyboard(JsonNode markup) {
-        assertThat(markup.path("keyboard").get(0).get(0).path("text").asText()).isEqualTo("Повернутися до SMS");
+        assertThat(markup.path("keyboard").get(0).get(0).path("text").asText()).isEqualTo("Відписатися від Telegram");
         assertThat(markup.path("keyboard").get(0).get(0).has("request_contact")).isFalse();
         assertThat(markup.path("resize_keyboard").asBoolean()).isTrue();
         assertThat(markup.path("is_persistent").asBoolean()).isTrue();
@@ -332,6 +332,17 @@ class TelegramWebhookControllerIT extends AbstractIntegrationTest {
         @Test
         @DisplayName("delete link when unlink button text")
         void should_deleteLink_when_unlinkButtonText() throws Exception {
+            linkChat();
+
+            JsonNode markup = reply(webhook.post(text(CHAT, "Відписатися від Telegram")), TelegramBotReplies.STOPPED);
+
+            assertRemoveKeyboard(markup);
+            assertThat(linkCount()).isZero();
+        }
+
+        @Test
+        @DisplayName("delete link when legacy unlink button text from a pre-rename keyboard")
+        void should_deleteLink_when_legacyUnlinkButtonText() throws Exception {
             linkChat();
 
             JsonNode markup = reply(webhook.post(text(CHAT, "Повернутися до SMS")), TelegramBotReplies.STOPPED);

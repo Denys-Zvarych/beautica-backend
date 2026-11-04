@@ -62,7 +62,7 @@ public interface TelegramLinkRepository extends JpaRepository<TelegramLink, UUID
     int deleteByChat(@Param("chatId") long chatId);
 
     /**
-     * Deletes the phone's link (guest «Повернутися до SMS», phase 407 unlink). Phase 407 perf audit: the same fused,
+     * Deletes the phone's link (guest «Відписатися від Telegram», phase 407 unlink). Phase 407 perf audit: the same fused,
      * transaction-local 3 s {@code lock_timeout} shape as {@link #deleteByChat}, so a held row aborts with
      * {@code 55P03} (global 409) instead of waiting out the statement timeout.
      */

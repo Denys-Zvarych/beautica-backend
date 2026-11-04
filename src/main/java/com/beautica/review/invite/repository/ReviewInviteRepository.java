@@ -270,4 +270,153 @@ public interface ReviewInviteRepository extends JpaRepository<ReviewInvite, UUID
              WHERE status = 'SENT' AND phone_hash = :phoneHash
             """, nativeQuery = true)
     int expireSentForPhoneHash(@Param("phoneHash") byte[] phoneHash, @Param("now") Instant now);
+
+    /**
+     * Phase 434 audit-fix (sec M1) — {@code true} when {@code phoneHash} already has a NON-SKIPPED invite for the same
+     * provider as the subject ({@code appointmentId} or {@code bookingId}; exactly one is non-null), created in
+     * {@code [anchor − windowSeconds, anchor)}. Provider = the performing master of any booking of the subject, or —
+     * for a salon booking — its salon. {@code anchor} is the subject's own invite {@code created_at} when it has one
+     * (send-time re-check: only EARLIER invites count, so of two concurrent rows the older one still sends), else
+     * {@code now} (create time). The subject's own row never counts. SKIPPED rows never count: an invite that was
+     * never sent does not consume the phone's window. Served by the partial
+     * {@code idx_review_invites_phone_created (phone_hash, created_at) WHERE status <> 'SKIPPED'} (V228) — keep that
+     * predicate identical. Bounded by one phone's invites in one window.
+     * <p>
+     * Sec LOW-2 (deleting a booking to reset the window) — not reachable, so the provider is derived through
+     * {@code bookings} rather than stored on the invite: the window only counts invites whose booking still exists
+     * ({@code review_invites.appointment_id}/{@code booking_id} are {@code ON DELETE CASCADE}, V213/V215), but no
+     * provider-reachable path hard-deletes a booking or visit header. No code issues {@code DELETE FROM bookings} /
+     * {@code appointments} (phase 337 dropped the last one); every FK from {@code bookings} ({@code master_id},
+     * {@code master_service_id}, {@code salon_id}, {@code appointment_id}, V18/V125) is {@code NO ACTION}, so a
+     * service-definition delete (cascades to {@code master_services}) or a master/salon delete aborts while a booking
+     * references it; {@code StaffAccountDisposalService} detaches a master with booking history instead of deleting
+     * it, and a salon delete deactivates; {@code reviews.booking_id} is {@code RESTRICT}. If a booking hard-delete is
+     * ever added, store {@code master_id}/{@code salon_id} on {@code review_invites} first.
+     */
+    @Query(value = """
+            WITH cur AS (
+                SELECT b.master_id, b.salon_id FROM bookings b
+                 WHERE b.appointment_id = CAST(:appointmentId AS uuid) OR b.id = CAST(:bookingId AS uuid)
+            ), anchor AS (
+                SELECT COALESCE((SELECT s.created_at FROM review_invites s
+                                  WHERE s.appointment_id = CAST(:appointmentId AS uuid)
+                                     OR s.booking_id = CAST(:bookingId AS uuid)), :now) AS at
+            )
+            SELECT EXISTS (
+                SELECT 1 FROM review_invites p
+                CROSS JOIN anchor
+                JOIN bookings pb ON pb.appointment_id = p.appointment_id OR pb.id = p.booking_id
+                JOIN cur ON pb.master_id = cur.master_id
+                         OR (cur.salon_id IS NOT NULL AND pb.salon_id = cur.salon_id)
+                WHERE p.phone_hash = :phoneHash
+                  AND p.status <> 'SKIPPED'
+                  AND p.created_at >= anchor.at - make_interval(secs => CAST(:windowSeconds AS double precision))
+                  AND p.created_at < anchor.at
+                  AND NOT COALESCE(p.appointment_id = CAST(:appointmentId AS uuid)
+                                   OR p.booking_id = CAST(:bookingId AS uuid), FALSE)
+            )
+            """, nativeQuery = true)
+    boolean existsPriorInviteForPhoneAndProvider(@Param("phoneHash") byte[] phoneHash,
+                                                 @Param("appointmentId") UUID appointmentId,
+                                                 @Param("bookingId") UUID bookingId,
+                                                 @Param("now") Instant now,
+                                                 @Param("windowSeconds") long windowSeconds);
+
+    /**
+     * Phase 434 audit-fix (sec M2, LOW-1) — the account phones of everyone on the provider side of the subject
+     * ({@code appointmentId} or {@code bookingId}; exactly one is non-null), in ONE statement:
+     * <ul>
+     *   <li>each performing master's user;</li>
+     *   <li>for a salon booking: the salon owner, every master whose {@code masters.salon_id} is the salon, and every
+     *       non-client user whose {@code users.salon_id} is the salon (SALON_ADMIN, SALON_MASTER, any staff role) —
+     *       a colleague's phone farms the salon's rating just like the master's own.</li>
+     * </ul>
+     * Raw PII, compared by {@code PhoneHasher} key in the caller and never logged. Bounded by one visit's masters plus
+     * one salon's staff (served by {@code idx_masters_salon_id} / {@code idx_users_salon_id}).
+     */
+    @Query(value = """
+            WITH cur AS (
+                SELECT b.master_id, b.salon_id FROM bookings b
+                 WHERE b.appointment_id = CAST(:appointmentId AS uuid) OR b.id = CAST(:bookingId AS uuid)
+            )
+            SELECT u.phone_number FROM users u JOIN masters m ON m.user_id = u.id JOIN cur ON cur.master_id = m.id
+             WHERE u.phone_number IS NOT NULL
+            UNION
+            SELECT u.phone_number FROM users u JOIN salons s ON s.owner_id = u.id JOIN cur ON cur.salon_id = s.id
+             WHERE u.phone_number IS NOT NULL
+            UNION
+            SELECT u.phone_number FROM users u JOIN masters m ON m.user_id = u.id JOIN cur ON m.salon_id = cur.salon_id
+             WHERE u.phone_number IS NOT NULL
+            UNION
+            SELECT u.phone_number FROM users u JOIN cur ON u.salon_id = cur.salon_id
+             WHERE u.role <> 'CLIENT' AND u.phone_number IS NOT NULL
+            """, nativeQuery = true)
+    List<String> findProviderAccountPhones(@Param("appointmentId") UUID appointmentId,
+                                           @Param("bookingId") UUID bookingId);
+
+    /**
+     * Phase 434 audit-fix (sec LOW-4, global cap) — the number of NON-SKIPPED <b>STAFF</b> invites (any provider) for
+     * {@code phoneHash} created in {@code [anchor − windowSeconds, anchor)}, the subject's own row excluded. Anchor as
+     * in {@link #existsPriorInviteForPhoneAndProvider}. STAFF = the subject's {@code booking_source} (visit header for
+     * a visit-keyed row, the booking for a booking-keyed row); LINK rows never count. Served by
+     * {@code idx_review_invites_phone_created} (V228); bounded by one phone's invites in one window.
+     */
+    @Query(value = """
+            WITH anchor AS (
+                SELECT COALESCE((SELECT s.created_at FROM review_invites s
+                                  WHERE s.appointment_id = CAST(:appointmentId AS uuid)
+                                     OR s.booking_id = CAST(:bookingId AS uuid)), :now) AS at
+            )
+            SELECT COUNT(*) FROM review_invites p
+            CROSS JOIN anchor
+            LEFT JOIN appointments pa ON pa.id = p.appointment_id
+            LEFT JOIN bookings pb ON pb.id = p.booking_id
+            WHERE p.phone_hash = :phoneHash
+              AND p.status <> 'SKIPPED'
+              AND p.created_at >= anchor.at - make_interval(secs => CAST(:windowSeconds AS double precision))
+              AND p.created_at < anchor.at
+              AND NOT COALESCE(p.appointment_id = CAST(:appointmentId AS uuid)
+                               OR p.booking_id = CAST(:bookingId AS uuid), FALSE)
+              AND COALESCE(pa.booking_source, pb.booking_source) = 'STAFF'
+            """, nativeQuery = true)
+    long countPriorStaffInvitesForPhone(@Param("phoneHash") byte[] phoneHash,
+                                        @Param("appointmentId") UUID appointmentId,
+                                        @Param("bookingId") UUID bookingId,
+                                        @Param("now") Instant now,
+                                        @Param("windowSeconds") long windowSeconds);
+
+    /**
+     * Phase 434 audit-fix (sec LOW-4, per-provider cap) — the number of NON-SKIPPED <b>STAFF</b> invites created in
+     * {@code [anchor − windowSeconds, anchor)} for the same provider as the subject (performing master, or — for a
+     * salon booking — its salon; same provider match as {@link #existsPriorInviteForPhoneAndProvider}), the subject's
+     * own row excluded. Anchor as there. Served by the partial
+     * {@code idx_review_invites_created_unskipped (created_at) WHERE status <> 'SKIPPED'} (V229) — keep that predicate
+     * identical; bounded by the platform's non-skipped invites of one window (24 h).
+     */
+    @Query(value = """
+            WITH cur AS (
+                SELECT b.master_id, b.salon_id FROM bookings b
+                 WHERE b.appointment_id = CAST(:appointmentId AS uuid) OR b.id = CAST(:bookingId AS uuid)
+            ), anchor AS (
+                SELECT COALESCE((SELECT s.created_at FROM review_invites s
+                                  WHERE s.appointment_id = CAST(:appointmentId AS uuid)
+                                     OR s.booking_id = CAST(:bookingId AS uuid)), :now) AS at
+            )
+            SELECT COUNT(DISTINCT p.id) FROM review_invites p
+            CROSS JOIN anchor
+            LEFT JOIN appointments pa ON pa.id = p.appointment_id
+            JOIN bookings pb ON pb.appointment_id = p.appointment_id OR pb.id = p.booking_id
+            JOIN cur ON pb.master_id = cur.master_id
+                     OR (cur.salon_id IS NOT NULL AND pb.salon_id = cur.salon_id)
+            WHERE p.status <> 'SKIPPED'
+              AND p.created_at >= anchor.at - make_interval(secs => CAST(:windowSeconds AS double precision))
+              AND p.created_at < anchor.at
+              AND NOT COALESCE(p.appointment_id = CAST(:appointmentId AS uuid)
+                               OR p.booking_id = CAST(:bookingId AS uuid), FALSE)
+              AND COALESCE(pa.booking_source, pb.booking_source) = 'STAFF'
+            """, nativeQuery = true)
+    long countRecentStaffInvitesForProvider(@Param("appointmentId") UUID appointmentId,
+                                            @Param("bookingId") UUID bookingId,
+                                            @Param("now") Instant now,
+                                            @Param("windowSeconds") long windowSeconds);
 }

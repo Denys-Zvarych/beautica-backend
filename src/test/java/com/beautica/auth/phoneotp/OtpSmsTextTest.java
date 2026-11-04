@@ -12,27 +12,27 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Phase 389 — the guest OTP SMS template: exact text, origin-bound last line, one UCS-2 segment. */
-@DisplayName("OtpSmsText — guest OTP SMS template (Phase 389)")
+@DisplayName("OtpSmsText — guest OTP SMS template (Phase 389/435)")
 class OtpSmsTextTest {
 
     private static final String CODE = "932279";
 
     @Test
-    @DisplayName("with a domain — exact two-paragraph text, 62 chars")
+    @DisplayName("with a domain — exact two-paragraph text, «Beautica:» first, 66 chars")
     void should_renderTwoParagraphsWithDomainLine_when_domainPresent() {
         String text = OtpSmsText.forDomain(Optional.of("beautica.app")).render(CODE);
 
-        assertThat(text).isEqualTo("Код Beautica: 932279. Нікому не кажіть.\n\n@beautica.app #932279");
-        assertThat(text).hasSize(62);
+        assertThat(text).isEqualTo("Beautica: Ваш код 932279. Нікому не кажіть.\n\n@beautica.app #932279");
+        assertThat(text).hasSize(66);
     }
 
     @Test
-    @DisplayName("without a domain — first line only, 39 chars")
+    @DisplayName("without a domain — first line only, 43 chars")
     void should_renderFirstLineOnly_when_domainEmpty() {
         String text = OtpSmsText.forDomain(Optional.empty()).render(CODE);
 
-        assertThat(text).isEqualTo("Код Beautica: 932279. Нікому не кажіть.");
-        assertThat(text).hasSize(39);
+        assertThat(text).isEqualTo("Beautica: Ваш код 932279. Нікому не кажіть.");
+        assertThat(text).hasSize(43);
     }
 
     @Test
@@ -46,7 +46,7 @@ class OtpSmsTextTest {
     }
 
     @Test
-    @DisplayName("18-char host — still one 70-char UCS-2 segment")
+    @DisplayName("14-char host — still one 70-char UCS-2 segment")
     void should_fitOneUcs2Segment_when_hostAtMaximumLength() {
         String longestHost = "a".repeat(OtpDomainRules.MAX_HOST_LENGTH - 4) + ".app";
 
@@ -57,7 +57,7 @@ class OtpSmsTextTest {
     }
 
     @Test
-    @DisplayName("18-char host with CRLF line breaks — still one 70-char segment")
+    @DisplayName("14-char host with CRLF line breaks — still one 70-char segment")
     void should_fitOneUcs2Segment_when_gatewayRewritesNewlinesToCrlfAtMaximumHostLength() {
         String longestHost = "a".repeat(OtpDomainRules.MAX_HOST_LENGTH - 4) + ".app";
 
@@ -68,15 +68,23 @@ class OtpSmsTextTest {
     }
 
     @Test
-    @DisplayName("stg.beautica.app (suggested staging host) is accepted")
-    void should_acceptSuggestedStagingHost_when_built() {
-        String text = OtpSmsText.forDomain(Optional.of("stg.beautica.app")).render(CODE);
+    @DisplayName("a 14-char staging host (s.beautica.app) is accepted")
+    void should_acceptShortStagingHost_when_built() {
+        String text = OtpSmsText.forDomain(Optional.of("s.beautica.app")).render(CODE);
 
-        assertThat(text).endsWith("\n\n@stg.beautica.app #" + CODE);
+        assertThat(text).endsWith("\n\n@s.beautica.app #" + CODE);
     }
 
     @Test
-    @DisplayName("19-char host is rejected (would risk a second segment)")
+    @DisplayName("phase 435: stg.beautica.app (16 chars) no longer fits one segment and is rejected")
+    void should_throw_when_hostIsSixteenCharStagingHost() {
+        assertThatThrownBy(() -> OtpSmsText.forDomain(Optional.of("stg.beautica.app")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("at most 14");
+    }
+
+    @Test
+    @DisplayName("15-char host is rejected (would risk a second segment)")
     void should_throw_when_hostLongerThanMaximum() {
         String tooLong = "a".repeat(OtpDomainRules.MAX_HOST_LENGTH - 3) + ".app";
 

@@ -1,6 +1,9 @@
 package com.beautica.config;
 
+import jakarta.validation.constraints.Max;
+import jakarta.validation.constraints.Min;
 import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.validation.annotation.Validated;
 
 /**
  * Typed config for guest-booking SMS templates and the availability window
@@ -13,6 +16,7 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  * appointment details) is still never logged (Anti-Bug §I).
  */
 @ConfigurationProperties(prefix = "app.booking")
+@Validated
 public class BookingSmsProperties {
 
     /**
@@ -27,6 +31,20 @@ public class BookingSmsProperties {
      * {@code startsAt - now < this} is rejected with HTTP 422. Default 2.
      */
     private int cancelWindowHours = 2;
+
+    /**
+     * Phase 435 audit-fix — how long, in days after its START, a guest's own page ({@code GET /book/cancel/{token}})
+     * stays readable once the booking or visit is terminal (CANCELLED / DECLINED / COMPLETED / NOT_COMPLETED). Past
+     * it the token 404s like an unknown one. Default 30. A {@code CONFIRMED} booking is never cut off by this.
+     * Audit-fix cycle 2: bound to {@value #MIN_TERMINAL_VIEW_DAYS}..{@value #MAX_TERMINAL_VIEW_DAYS} — boot fails
+     * outside it (0 or negative would 404 a guest's page the moment it turns terminal; huge values keep it open forever).
+     */
+    @Min(MIN_TERMINAL_VIEW_DAYS)
+    @Max(MAX_TERMINAL_VIEW_DAYS)
+    private int terminalViewDays = 30;
+
+    static final int MIN_TERMINAL_VIEW_DAYS = 1;
+    static final int MAX_TERMINAL_VIEW_DAYS = 365;
 
     private final Sms sms = new Sms();
 
@@ -84,6 +102,14 @@ public class BookingSmsProperties {
         this.cancelWindowHours = cancelWindowHours;
     }
 
+    public int getTerminalViewDays() {
+        return terminalViewDays;
+    }
+
+    public void setTerminalViewDays(int terminalViewDays) {
+        this.terminalViewDays = terminalViewDays;
+    }
+
     public Sms getSms() {
         return sms;
     }
@@ -97,7 +123,7 @@ public class BookingSmsProperties {
          * {@code local}. Railway override at release: {@code APP_BOOKING_SMS_ENABLED=true}.
          *
          * <p>Governs <b>all</b> outbound booking SMS at once — walk-in confirmation, guest
-         * confirmation, 24h reminder, cancellation and provider decline — because it is consumed
+         * confirmation, 24h reminder and provider decline — because it is consumed
          * by {@code SmsConfig}, which uses it to pick the {@code SmsService} bean itself
          * ({@code NoOpSmsService} when off, {@code TurbosmsService} when on) rather than by any
          * individual sender. No call site reads this field; if you find yourself adding an
@@ -114,29 +140,38 @@ public class BookingSmsProperties {
         private boolean enabled = false;
 
         /**
-         * Confirmation template. Placeholders: {@code {masterName}},
-         * {@code {serviceName}}, {@code {date}}, {@code {time}}, {@code {cancelUrl}}.
+         * Confirmation template. Placeholders: {@code {date}}, {@code {time}}, {@code {masterName}},
+         * {@code {cancelUrl}}. Phase 435 (user decision 2026-11-04): no {@code {serviceName}} — it is no
+         * longer substituted. Phase 435 follow-up: the optional «Адреса: {address} ({locationNote})» line (dropped
+         * without an address; brackets dropped without a note) — rendered by {@code GuestConfirmationSmsText}, which
+         * also renders the Telegram details after linking, so both channels carry the same text.
          */
         private String confirmation =
-                "Beautica: Запис підтверджено!\n"
-                        + "{masterName}, {serviceName}\n"
-                        + "{date} о {time}\n\n"
+                "Beautica: Ваш запис підтверджено!\n\n"
+                        + "{date} о {time}\n"
+                        + "Майстер {masterName}.\n"
+                        + "Адреса: {address} ({locationNote})\n"
                         + "Скасувати: {cancelUrl}";
 
         /**
-         * 24h reminder template. Placeholders: {@code {serviceName}},
-         * {@code {masterName}}, {@code {time}}.
+         * 24h reminder template (phase 435 copy, user decision 2026-11-04). Placeholders: {@code {masterName}},
+         * {@code {serviceName}} (a visit: «first та ще N послуг(и)»), {@code {time}}, {@code {address}}. The
+         * {@code {address}} line is OPTIONAL — dropped whole when the booking has no address
+         * ({@code Placeholders#formatDroppingEmptyLines}). So is the optional «Скасувати запис: {cancelUrl}» line —
+         * the guest's own booking page rebuilt from the sealed token (V230), dropped when it cannot be built. The
+         * user's «✨» is not in the copy (no UCS-2-safe emoji; see the phase-435 doc).
          */
         private String reminder =
-                "Beautica: Нагадуємо!\n"
-                        + "{serviceName} у {masterName}\n"
-                        + "Завтра о {time}";
+                "Beautica: Нагадуємо, що завтра у Вас запис!\n\n"
+                        + "{masterName} | {serviceName} о {time}\n"
+                        + "Адреса: {address} ({locationNote})\n"
+                        + "Скасувати запис: {cancelUrl}";
 
         /**
          * Walk-in (STAFF-sourced) confirmation template — the SMS a master's own walk-in client
          * receives after the provider keys the appointment in (Phase 22.7). Placeholders:
-         * {@code {masterName}}, {@code {serviceName}}, {@code {date}}, {@code {time}},
-         * {@code {cancelUrl}}.
+         * {@code {date}}, {@code {time}}, {@code {masterName}}, {@code {cancelUrl}} (phase 435: no
+         * {@code {serviceName}}).
          *
          * <p><b>Phase 412 D3 — gains {@code {cancelUrl}}</b> (reverses 254 D's «must never gain one»).
          * The walk-in visit header now carries a one-time cancel token (V226), and
@@ -146,9 +181,8 @@ public class BookingSmsProperties {
          * the pre-412 «Скасувати — за телефоном майстра.» line is dropped. 3 UCS-2 segments (~154 chars) for a typical
          * master/service.
          *
-         * <p>Kept separate from {@link #confirmation} (the LINK copy) even though the wording now matches:
-         * the walk-in SMS renders the PLATFORM service name, never the provider's custom one, and its copy
-         * may diverge again without touching the LINK SMS.
+         * <p>Kept separate from {@link #confirmation} (the LINK copy) even though the wording matches
+         * (phase 435, user decision 2026-11-04): its copy may diverge again without touching the LINK SMS.
          *
          * <h4>Two homes, kept identical (phase 412 D3)</h4>
          * D3 restores the {@code app.booking.sms.walk-in-confirmation} key in {@code application.yml},
@@ -156,10 +190,78 @@ public class BookingSmsProperties {
          * fallback for a context without that file. Change both together.
          */
         private String walkInConfirmation =
-                "Beautica: Запис підтверджено!\n"
-                        + "{masterName}, {serviceName}\n"
-                        + "{date} о {time}\n\n"
+                "Beautica: Ваш запис підтверджено!\n\n"
+                        + "{date} о {time}\n"
+                        + "Майстер {masterName}.\n"
+                        + "Адреса: {address} ({locationNote})\n"
                         + "Скасувати: {cancelUrl}";
+
+        /**
+         * Phase 435 — SALON variants (user decision 2026-11-04): a salon booking names the salon AND the
+         * performing master; the independent-master copy above stays as is. Picked by whether the booking has a
+         * salon. Placeholders add {@code {salonName}} (salon reminders also {@code {salonAddress}}, an optional
+         * line dropped when the salon has no address). Kept identical to their {@code application.yml} keys.
+         */
+        private String confirmationSalon =
+                "Beautica: Ваш запис підтверджено!\n\n"
+                        + "{date} о {time}\n"
+                        + "Салон {salonName}, майстер {masterName}.\n"
+                        + "Адреса: {address} ({locationNote})\n"
+                        + "Скасувати: {cancelUrl}";
+
+        /** Phase 435 — salon variant of {@link #walkInConfirmation}; same copy as {@link #confirmationSalon}. */
+        private String walkInConfirmationSalon =
+                "Beautica: Ваш запис підтверджено!\n\n"
+                        + "{date} о {time}\n"
+                        + "Салон {salonName}, майстер {masterName}.\n"
+                        + "Адреса: {address} ({locationNote})\n"
+                        + "Скасувати: {cancelUrl}";
+
+        /** Phase 435 — salon variant of {@link #reminder}. */
+        private String reminderSalon =
+                "Beautica: Нагадуємо, що завтра у Вас запис!\n\n"
+                        + "{salonName} | {masterName} | {serviceName} о {time}\n"
+                        + "Адреса: {salonAddress} ({locationNote})\n"
+                        + "Скасувати запис: {cancelUrl}";
+
+        /** Phase 435 — salon variant of {@link #reminder2h} (Java default only, like {@code reminder2h}). */
+        private String reminder2hSalon =
+                "Beautica: Нагадуємо, що сьогодні у Вас запис!\n\n"
+                        + "{salonName} | {masterName} | {serviceName} о {time}\n"
+                        + "Адреса: {salonAddress} ({locationNote})\n"
+                        + "Скасувати запис: {cancelUrl}";
+
+        public String getConfirmationSalon() {
+            return confirmationSalon;
+        }
+
+        public void setConfirmationSalon(String confirmationSalon) {
+            this.confirmationSalon = confirmationSalon;
+        }
+
+        public String getWalkInConfirmationSalon() {
+            return walkInConfirmationSalon;
+        }
+
+        public void setWalkInConfirmationSalon(String walkInConfirmationSalon) {
+            this.walkInConfirmationSalon = walkInConfirmationSalon;
+        }
+
+        public String getReminderSalon() {
+            return reminderSalon;
+        }
+
+        public void setReminderSalon(String reminderSalon) {
+            this.reminderSalon = reminderSalon;
+        }
+
+        public String getReminder2hSalon() {
+            return reminder2hSalon;
+        }
+
+        public void setReminder2hSalon(String reminder2hSalon) {
+            this.reminder2hSalon = reminder2hSalon;
+        }
 
         public String getConfirmation() {
             return confirmation;
@@ -185,27 +287,19 @@ public class BookingSmsProperties {
             this.walkInConfirmation = walkInConfirmation;
         }
 
-        /**
-         * Cancellation-confirmation template (Phase 13.4). Placeholders:
-         * {@code {serviceName}}, {@code {masterName}}, {@code {date}}, {@code {time}}.
-         */
-        private String cancellation =
-                "Beautica: Ваш запис скасовано.\n"
-                        + "{serviceName} у {masterName}\n"
-                        + "{date} о {time}";
-
         public String getReminder() {
             return reminder;
         }
 
         /**
-         * Phase 413 D5 — the 2h-before reminder. Java default only (walk-in precedent: no yml copy). "Сьогодні"
+         * Phase 413 D5 / 435 — the 2h-before reminder: the 24h copy with «сьогодні». Java default only (walk-in precedent: no yml copy). "Сьогодні"
          * is safe: the sweep sends only 09:00–21:00 Kyiv with a 1h45–2h15 lead, so the visit is the same day.
          */
         private String reminder2h =
-                "Beautica: Нагадуємо!\n"
-                        + "{serviceName} у {masterName}\n"
-                        + "Сьогодні о {time}";
+                "Beautica: Нагадуємо, що сьогодні у Вас запис!\n\n"
+                        + "{masterName} | {serviceName} о {time}\n"
+                        + "Адреса: {address} ({locationNote})\n"
+                        + "Скасувати запис: {cancelUrl}";
 
         public String getReminder2h() {
             return reminder2h;
@@ -219,14 +313,6 @@ public class BookingSmsProperties {
             this.reminder = reminder;
         }
 
-        public String getCancellation() {
-            return cancellation;
-        }
-
-        public void setCancellation(String cancellation) {
-            this.cancellation = cancellation;
-        }
-
         /**
          * Phase 431 — the SMS an account-less guest (LINK guest or STAFF walk-in) gets when the
          * PROVIDER moves their booking, or one service of their visit, to a new time. Placeholders:
@@ -235,8 +321,10 @@ public class BookingSmsProperties {
          * phase 390 cancellation-SMS precedent ({@code GuestProviderCancellationSmsText}), whose
          * "Beautica: " prefix it follows.
          *
-         * <p>53 UCS-2 chars rendered (one segment). {@code GuestRescheduleSmsText} fails boot when an
-         * override drops a placeholder or renders over two UCS-2 segments (134 chars).
+         * <p>53 UCS-2 chars rendered (one segment; phase 435 follow-up wording «перенесено на {date} о {time}.»). {@code GuestRescheduleSmsText} fails boot when an
+         * override drops a placeholder or renders over two UCS-2 segments (134 chars). Phase 435 (user
+         * decision 2026-11-04): new wording, and {@code GuestRescheduleSmsText} appends the shared
+         * «Деталі або записатись знову {url}» paragraph after this body when a rebook link exists.
          *
          * <p>Like {@link #walkInConfirmation}, this Java literal is the SINGLE source of the copy:
          * {@code application.yml} carries no {@code reschedule:} key. Override per environment with

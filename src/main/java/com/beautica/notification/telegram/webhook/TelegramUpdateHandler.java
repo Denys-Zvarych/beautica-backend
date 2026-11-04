@@ -105,7 +105,7 @@ public class TelegramUpdateHandler {
     }
 
     private Reply onText(long chatId, String text) {
-        if (TelegramBotReplies.UNLINK_BUTTON_TEXT.equals(text)) {
+        if (TelegramBotReplies.isUnlinkButton(text)) {
             return onStop(chatId);
         }
         String[] parts = WHITESPACE.split(text, 2);

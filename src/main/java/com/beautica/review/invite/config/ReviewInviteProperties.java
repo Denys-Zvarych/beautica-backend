@@ -1,5 +1,6 @@
 package com.beautica.review.invite.config;
 
+import com.beautica.review.invite.service.GuestReviewRetentionService;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.boot.context.properties.bind.DefaultValue;
 import org.springframework.format.annotation.DateTimeFormat;
@@ -25,12 +26,20 @@ import java.util.regex.Pattern;
  * @param ttl              D4 — {@code expires_at = sent_at + ttl}
  * @param batchSize        D4a — rows per claim / expiry statement (one job tick)
  * @param maxAttempts      D4 — SMS failures before {@code FAILED}
- * @param smsText          D5 — SMS copy; must contain {@code {token}} exactly once and render to one UCS-2 segment.
+ * @param smsText          D5 — SMS copy; must contain {@code {token}} exactly once and render to at most two UCS-2
+ *                         segments ({@value #MAX_UCS2_CHARS} chars; phase 435 — the title + {@code https://} link
+ *                         no longer fit one).
  *                         In PROD it must also link to {@value #PROD_LINK} ({@link #linksToProdHost}, enforced by
  *                         {@code EnvironmentFingerprintGuard} rule {@code prod-review-invite-sms-link})
  * @param sendBudget       audit cycle 1 — wall-clock budget of one job tick's send loop; claimed rows not attempted
  *                         when it runs out go back to {@code SCHEDULED}. Capped at the 30 s scheduler shutdown grace minus one
  *                         in-flight SMS (connect + read timeout) minus {@link #SEND_WRITE_BACK_MARGIN}
+ * @param staffPhoneWindow      phase 434 audit-fix — STAFF walk-in repeat/global-cap window; at most
+ *                              {@code GuestReviewRetentionService.INVITE_RETENTION} (30 d), or the purge would delete
+ *                              the prior invites the window is meant to see
+ * @param staffPhoneGlobalCap   phase 434 audit-fix (LOW-4) — max non-skipped STAFF invites per phone across all
+ *                              providers within {@code staffPhoneWindow}
+ * @param staffProviderDailyCap phase 434 audit-fix (LOW-4) — max non-skipped STAFF invites per provider in 24 h
  */
 @ConfigurationProperties(prefix = "app.booking.review-invite")
 public record ReviewInviteProperties(
@@ -45,14 +54,28 @@ public record ReviewInviteProperties(
         @DefaultValue("50") int batchSize,
         @DefaultValue("3") int maxAttempts,
         @DefaultValue(DEFAULT_SMS_TEXT) String smsText,
-        @DefaultValue("10s") Duration sendBudget
+        @DefaultValue("10s") Duration sendBudget,
+        @DefaultValue("30d") Duration staffPhoneWindow,
+        @DefaultValue("3") int staffPhoneGlobalCap,
+        @DefaultValue("50") int staffProviderDailyCap
 ) {
 
     public static final String TOKEN_PLACEHOLDER = "{token}";
-    public static final String DEFAULT_SMS_TEXT = "Оцініть ваш візит: beautica.app/r/" + TOKEN_PLACEHOLDER;
+    /**
+     * Phase 435 (user decisions 2026-11-04): the user's thank-you copy, «Beautica:» title first (every SMS starts
+     * with it), and a full {@code https://} link on its own line — the bare {@code beautica.app/...} was not
+     * tappable on real phones. The user's «🤍» is left out: a non-BMP emoji has no UCS-2 form and Turbosms /
+     * carrier support for it is unverified. 122 chars rendered = two UCS-2 segments.
+     */
+    public static final String DEFAULT_SMS_TEXT =
+            "Beautica: Дякуємо, що обрали наш сервіс. Залиште свій відгук про Ваш візит!\n\n"
+                    + "https://beautica.app/r/" + TOKEN_PLACEHOLDER;
 
-    /** One UCS-2 SMS segment (Cyrillic forces UCS-2). */
-    public static final int MAX_SINGLE_SEGMENT_UCS2 = 70;
+    /**
+     * Two concatenated UCS-2 SMS segments (2 × 67 chars after the UDH; Cyrillic forces UCS-2). Phase 435 raised
+     * this from one segment (70) — the new copy renders to 122.
+     */
+    public static final int MAX_UCS2_CHARS = 134;
     /** Raw token length: 16 random bytes, base64url without padding. */
     public static final int TOKEN_LENGTH = 22;
 
@@ -60,6 +83,12 @@ public record ReviewInviteProperties(
     public static final String PROD_LINK = "beautica.app/r/" + TOKEN_PLACEHOLDER;
     /** Default {@code sendBudget}. */
     public static final Duration DEFAULT_SEND_BUDGET = Duration.ofSeconds(10);
+    /** Default {@code staffPhoneWindow}. */
+    public static final Duration DEFAULT_STAFF_PHONE_WINDOW = Duration.ofDays(30);
+    /** Default {@code staffPhoneGlobalCap}. */
+    public static final int DEFAULT_STAFF_PHONE_GLOBAL_CAP = 3;
+    /** Default {@code staffProviderDailyCap}. */
+    public static final int DEFAULT_STAFF_PROVIDER_DAILY_CAP = 50;
     /**
      * Time reserved after the last in-flight SMS for its outcome write-back: the post-send
      * {@code recordFailedSend}/{@code recordAmbiguousSend} transaction that settles the row. Without it a
@@ -98,6 +127,8 @@ public record ReviewInviteProperties(
     private static final Pattern POLICY_VERSION = Pattern.compile("^\\d{4}-\\d{2}-\\d{2}(\\.\\d{1,3})?$");
     private static final int MAX_BATCH_SIZE = 1_000;
     private static final int MAX_ATTEMPTS_CAP = 10;
+    private static final int MAX_STAFF_PHONE_GLOBAL_CAP = 100;
+    private static final int MAX_STAFF_PROVIDER_DAILY_CAP = 10_000;
 
     public ReviewInviteProperties {
         if (minPolicyVersion == null) {
@@ -121,8 +152,15 @@ public record ReviewInviteProperties(
         }
         requireInRange("batch-size", batchSize, MAX_BATCH_SIZE);
         requireInRange("max-attempts", maxAttempts, MAX_ATTEMPTS_CAP);
-        requireSingleSegmentTemplate(smsText);
+        requireTemplateWithinBudget(smsText);
         requirePositive("send-budget", sendBudget);
+        requirePositive("staff-phone-window", staffPhoneWindow);
+        if (staffPhoneWindow.compareTo(GuestReviewRetentionService.INVITE_RETENTION) > 0) {
+            throw new IllegalStateException("app.booking.review-invite.staff-phone-window must be <= "
+                    + GuestReviewRetentionService.INVITE_RETENTION + " (invite retention; was " + staffPhoneWindow + ")");
+        }
+        requireInRange("staff-phone-global-cap", staffPhoneGlobalCap, MAX_STAFF_PHONE_GLOBAL_CAP);
+        requireInRange("staff-provider-daily-cap", staffProviderDailyCap, MAX_STAFF_PROVIDER_DAILY_CAP);
         if (sendBudget.compareTo(MAX_SEND_BUDGET) > 0) {
             throw new IllegalStateException("app.booking.review-invite.send-budget must be <= " + MAX_SEND_BUDGET
                     + " (was " + sendBudget + ")");
@@ -171,15 +209,15 @@ public record ReviewInviteProperties(
         return !time.isBefore(quietStart) || time.isBefore(quietEnd);
     }
 
-    private static void requireSingleSegmentTemplate(String smsText) {
+    private static void requireTemplateWithinBudget(String smsText) {
         if (smsText == null || smsText.indexOf(TOKEN_PLACEHOLDER) < 0
                 || smsText.indexOf(TOKEN_PLACEHOLDER) != smsText.lastIndexOf(TOKEN_PLACEHOLDER)) {
             throw new IllegalStateException("app.booking.review-invite.sms-text must contain {token} exactly once");
         }
         int rendered = smsText.length() - TOKEN_PLACEHOLDER.length() + TOKEN_LENGTH;
-        if (rendered > MAX_SINGLE_SEGMENT_UCS2) {
+        if (rendered > MAX_UCS2_CHARS) {
             throw new IllegalStateException("app.booking.review-invite.sms-text renders to " + rendered
-                    + " chars; one UCS-2 segment is " + MAX_SINGLE_SEGMENT_UCS2);
+                    + " chars; two UCS-2 segments are " + MAX_UCS2_CHARS);
         }
     }
 

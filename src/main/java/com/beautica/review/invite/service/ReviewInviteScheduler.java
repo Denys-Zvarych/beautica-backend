@@ -32,9 +32,11 @@ import java.util.UUID;
  *   <li><b>Once per visit.</b> {@code INSERT … ON CONFLICT (appointment_id) DO NOTHING}: an item-level completion
  *       followed by the header completion (or a replay) leaves the first row untouched, so {@code send_after} is
  *       derived from the first COMPLETED booking.</li>
- *   <li><b>Which rows.</b> Only LINK visits with no account. Flag off (either), anonymised or phone-less visits get
+ *   <li><b>Which rows.</b> Only LINK or (phase 434) STAFF visits with no account. Flag off (either), anonymised or phone-less visits get
  *       no row at all; a visit failing a later gate (opt-out, policy version, nothing to review) gets a row that is
- *       {@code SKIPPED} from birth with the reason — the send job re-checks every gate anyway.</li>
+ *       {@code SKIPPED} from birth with the reason — the send job re-checks every gate anyway. Phase 434 audit-fix: a
+ *       STAFF walk-in is also {@code SKIPPED} from birth for the provider's own phone ({@code PROVIDER_OWN_PHONE}) or a
+ *       phone already invited for the same provider within {@code staff-phone-window} ({@code REPEAT_PHONE}).</li>
  *   <li><b>Never throws.</b> Spring propagates an exception out of an {@code afterCommit} callback to the caller of
  *       an already-committed completion; a failed invite is logged (class name and appointment id only) and
  *       dropped — the guest simply gets no invite for that visit.</li>
@@ -117,7 +119,7 @@ public class ReviewInviteScheduler {
     }
 
     private void createInvite(VisitSnapshot visit, Instant completedAt) {
-        if (!visit.isGuestLinkVisit()) {
+        if (!visit.isReviewInviteVisit()) {
             return;
         }
         Verdict verdict = eligibility.evaluate(visit);
@@ -143,7 +145,8 @@ public class ReviewInviteScheduler {
                         invite.getPhoneHash(), invite.getStatus().name(), invite.getSendAfter(), skipReason,
                         invite.getCreatedAt());
         if (inserted == 1) {
-            log.info("Review invite created: invite={} status={}", invite.getId(), invite.getStatus());
+            log.info("Review invite created: invite={} status={} reason={}", invite.getId(), invite.getStatus(),
+                    skipReason);
         }
     }
 

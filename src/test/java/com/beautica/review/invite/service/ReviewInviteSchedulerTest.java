@@ -133,10 +133,53 @@ class ReviewInviteSchedulerTest {
     }
 
     @Test
-    @DisplayName("STAFF and APP visits never create a row and never reach the eligibility gates")
-    void should_insertNothing_when_staffOrAppVisit() {
+    @DisplayName("phase 434 — an eligible STAFF walk-in visit (no account) gets ONE SCHEDULED row, like a LINK visit")
+    void should_insertScheduled_when_eligibleStaffWalkInVisit() {
         stubTransaction();
         stubVisit(BookingSource.STAFF, false);
+        when(eligibility.evaluate(any())).thenReturn(new Verdict(PHONE_HASHER.hash(PHONE), null));
+
+        scheduler.onGuestVisitCompleted(new GuestVisitCompletedEvent(appointmentId, COMPLETED_AT));
+
+        verify(repository).insertIfAbsent(any(), eq(appointmentId), eq(PHONE_HASHER.hash(PHONE).hash()),
+                eq("SCHEDULED"), eq(COMPLETED_AT.plusSeconds(7_200)), isNull(), eq(NOW));
+    }
+
+    @Test
+    @DisplayName("434 audit-fix M1 — a STAFF walk-in whose phone was already invited for the same provider → row "
+            + "SKIPPED (REPEAT_PHONE) from birth, never SCHEDULED")
+    void should_skipInvite_when_samePhoneInvitedSameProviderWithinWindow() {
+        stubTransaction();
+        stubVisit(BookingSource.STAFF, false);
+        when(eligibility.evaluate(any()))
+                .thenReturn(new Verdict(PHONE_HASHER.hash(PHONE), ReviewInviteSkipReason.REPEAT_PHONE));
+
+        scheduler.onGuestVisitCompleted(new GuestVisitCompletedEvent(appointmentId, COMPLETED_AT));
+
+        verify(repository).insertIfAbsent(any(), eq(appointmentId), eq(PHONE_HASHER.hash(PHONE).hash()),
+                eq("SKIPPED"), any(), eq("REPEAT_PHONE"), eq(NOW));
+    }
+
+    @Test
+    @DisplayName("434 audit-fix M2 — a single STAFF walk-in booking on the provider's own phone → booking-keyed row "
+            + "SKIPPED (PROVIDER_OWN_PHONE)")
+    void should_skipInvite_when_staffWalkInBookingOnProviderOwnPhone() {
+        stubTransaction();
+        stubBooking(BookingSource.STAFF, false);
+        when(eligibility.evaluate(any()))
+                .thenReturn(new Verdict(PHONE_HASHER.hash(PHONE), ReviewInviteSkipReason.PROVIDER_OWN_PHONE));
+
+        scheduler.onGuestBookingCompleted(new GuestBookingCompletedEvent(bookingId, COMPLETED_AT));
+
+        verify(repository).insertIfAbsentForBooking(any(), eq(bookingId), any(), eq("SKIPPED"), any(),
+                eq("PROVIDER_OWN_PHONE"), eq(NOW));
+    }
+
+    @Test
+    @DisplayName("STAFF visits with an account and APP visits never create a row and never reach the eligibility gates")
+    void should_insertNothing_when_staffWithClientOrAppVisit() {
+        stubTransaction();
+        stubVisit(BookingSource.STAFF, true);
         scheduler.onGuestVisitCompleted(new GuestVisitCompletedEvent(appointmentId, COMPLETED_AT));
         stubVisit(BookingSource.APP, true);
 
@@ -186,10 +229,23 @@ class ReviewInviteSchedulerTest {
     }
 
     @Test
-    @DisplayName("D7 — an APP / STAFF single booking never creates a row")
-    void should_insertNothing_when_bookingNotGuestLink() {
+    @DisplayName("phase 434 — an eligible single STAFF walk-in booking gets ONE booking-keyed SCHEDULED row")
+    void should_insertBookingKeyedScheduled_when_eligibleStaffWalkInBooking() {
         stubTransaction();
         stubBooking(BookingSource.STAFF, false);
+        when(eligibility.evaluate(any())).thenReturn(new Verdict(PHONE_HASHER.hash(PHONE), null));
+
+        scheduler.onGuestBookingCompleted(new GuestBookingCompletedEvent(bookingId, COMPLETED_AT));
+
+        verify(repository).insertIfAbsentForBooking(any(), eq(bookingId), eq(PHONE_HASHER.hash(PHONE).hash()),
+                eq("SCHEDULED"), eq(COMPLETED_AT.plusSeconds(7_200)), isNull(), eq(NOW));
+    }
+
+    @Test
+    @DisplayName("D7 — an APP single booking or a STAFF one with an account never creates a row")
+    void should_insertNothing_when_bookingNotGuestLink() {
+        stubTransaction();
+        stubBooking(BookingSource.STAFF, true);
         scheduler.onGuestBookingCompleted(new GuestBookingCompletedEvent(bookingId, COMPLETED_AT));
         stubBooking(BookingSource.APP, true);
 

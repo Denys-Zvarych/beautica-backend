@@ -348,7 +348,7 @@ class RetiredBookingLinkPublicIT extends AbstractIntegrationTest {
         assertThat(created.getStatusCode()).as(created.getBody()).isEqualTo(HttpStatus.CREATED);
         // V206: the DB holds only the token's hash — the raw token is the one handed to the guest.
         String cancelToken = objectMapper.readTree(created.getBody()).path("cancelUrl").asText()
-                .replaceAll(".*/book/cancel/", "");
+                .replaceAll(".*/c/", "");
 
         regenerateMaster(master);
 

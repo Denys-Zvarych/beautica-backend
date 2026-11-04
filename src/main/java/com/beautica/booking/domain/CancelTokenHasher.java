@@ -18,7 +18,7 @@ import java.util.UUID;
  * ({@code encode(sha256(convert_to(cancel_token::text, 'UTF8')), 'hex')} — Postgres renders a
  * {@code uuid} as the same lower-case hyphenated text as {@link UUID#toString()}).
  *
- * <p>Unsalted on purpose: the preimage is a 122-bit random UUID, so the hash is not invertible by
+ * <p>Unsalted on purpose: the preimage is a 122-bit random UUID (legacy) or ~95 random bits (short, phase 435), so the hash is not invertible by
  * guessing, and a deterministic hash is what lets the unique index answer the lookup.
  */
 public final class CancelTokenHasher {
@@ -29,10 +29,19 @@ public final class CancelTokenHasher {
     private CancelTokenHasher() {
     }
 
-    /** The 64-char lower-hex stored form of {@code token}. */
+    /** The 64-char lower-hex stored form of a legacy UUID {@code token} — identical to {@code hash(GuestCancelToken.of(token))}. */
     public static String hash(UUID token) {
         Objects.requireNonNull(token, "token");
-        byte[] preimage = token.toString().getBytes(StandardCharsets.UTF_8);
+        return hash(GuestCancelToken.of(token));
+    }
+
+    /**
+     * The 64-char lower-hex stored form of {@code token}: SHA-256 of its raw string (a legacy UUID: its canonical
+     * {@link UUID#toString()}, so every pre-existing hash still matches; a short token: its 16 base62 characters).
+     */
+    public static String hash(GuestCancelToken token) {
+        Objects.requireNonNull(token, "token");
+        byte[] preimage = token.value().getBytes(StandardCharsets.UTF_8);
         return HEX.formatHex(newSha256().digest(preimage));
     }
 

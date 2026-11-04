@@ -107,7 +107,7 @@ class PhoneOtpServiceTest {
         ArgumentCaptor<String> smsText = ArgumentCaptor.forClass(String.class);
         verify(otpSmsSender).send(eq(PHONE), smsText.capture());
         Matcher m = Pattern
-                .compile("Код Beautica: (\\d{6})\\. Нікому не кажіть\\.\n\n@beautica\\.app #(\\d{6})")
+                .compile("Beautica: Ваш код (\\d{6})\\. Нікому не кажіть\\.\n\n@beautica\\.app #(\\d{6})")
                 .matcher(smsText.getValue());
         assertThat(m.matches()).as("exact Phase 389 template, got: %s", smsText.getValue()).isTrue();
         assertThat(m.group(2)).as("the origin-bound line carries the same code").isEqualTo(m.group(1));
@@ -129,7 +129,7 @@ class PhoneOtpServiceTest {
 
         ArgumentCaptor<String> smsText = ArgumentCaptor.forClass(String.class);
         verify(otpSmsSender).send(eq(PHONE), smsText.capture());
-        assertThat(smsText.getValue()).matches("Код Beautica: \\d{6}\\. Нікому не кажіть\\.");
+        assertThat(smsText.getValue()).matches("Beautica: Ваш код \\d{6}\\. Нікому не кажіть\\.");
     }
 
     @Test

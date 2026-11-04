@@ -1,5 +1,6 @@
 package com.beautica.booking.service;
 
+import com.beautica.booking.domain.GuestCancelToken;
 import com.beautica.booking.domain.CancelTokenHasher;
 import com.beautica.booking.dto.GuestCancelTokenTarget;
 import com.beautica.booking.repository.BookingRepository;
@@ -8,7 +9,6 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.Optional;
-import java.util.UUID;
 
 /**
  * Phase 407 — resolves a guest cancel token to the facts the guest Telegram link API needs, over the SAME hash-at-rest
@@ -23,7 +23,7 @@ public class GuestCancelTokenResolver {
 
     /** {@link #resolveByHash} for a raw token. */
     @Transactional(readOnly = true)
-    public Optional<GuestCancelTokenTarget> resolve(UUID cancelToken) {
+    public Optional<GuestCancelTokenTarget> resolve(GuestCancelToken cancelToken) {
         return resolveByHash(CancelTokenHasher.hash(cancelToken));
     }
 

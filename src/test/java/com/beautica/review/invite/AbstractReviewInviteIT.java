@@ -154,6 +154,13 @@ abstract class AbstractReviewInviteIT extends AbstractIntegrationTest {
         }
     }
 
+    /** Phase 434 — a COMPLETED STAFF walk-in visit (no account) of {@code master} with one COMPLETED, unreviewed item. */
+    protected UUID completedStaffWalkIn(UUID master, UUID service, String phone, int hoursAgo) {
+        UUID appointmentId = fixtures.staffGuestVisit("COMPLETED", phone);
+        fixtures.visitItem(appointmentId, master, service, "STAFF", "COMPLETED", phone, hoursAgo);
+        return appointmentId;
+    }
+
     /** A COMPLETED guest LINK visit with one COMPLETED, unreviewed item. */
     protected UUID completedLinkVisit(String phone, String policyVersion) {
         UUID appointmentId = fixtures.linkVisit("COMPLETED", phone, policyVersion);

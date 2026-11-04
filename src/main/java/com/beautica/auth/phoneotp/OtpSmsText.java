@@ -12,7 +12,7 @@ import java.util.regex.Pattern;
  * WebOTP (Chrome Android) and Apple domain-bound codes (iOS Safari) require: it must be the FINAL line,
  * formatted exactly {@code @host #code}, host bare (no scheme, port or path):
  * <pre>
- * Код Beautica: 123456. Нікому не кажіть.
+ * Beautica: Ваш код 123456. Нікому не кажіть.
  *
  * &#64;beautica.app #123456
  * </pre>
@@ -23,11 +23,11 @@ import java.util.regex.Pattern;
  * instance at construction.
  *
  * <h2>One SMS segment</h2>
- * The text is Cyrillic, so it is sent as UCS-2: 70 characters per single segment. The first line is 39
- * characters, the domain line adds {@code 2 (blank line) + 1 + host + 2 + 6}, so the whole message is
- * {@code 50 + host.length()} characters. {@link OtpDomainRules#MAX_HOST_LENGTH} = 18 keeps every allowed
- * host inside one segment even if the gateway turns each {@code \n} into {@code \r\n}
- * ({@code beautica.app} → 62, 64 with CRLF). Boot-time validation of {@code beautica.sms.otp-domain}
+ * The text is Cyrillic, so it is sent as UCS-2: 70 characters per single segment. The first line is 43
+ * characters (phase 435: «Beautica:» title first, user decision 2026-11-04 — was 39), the domain line adds
+ * {@code 2 (blank line) + 1 + host + 2 + 6}, so the whole message is {@code 54 + host.length()} characters.
+ * {@link OtpDomainRules#MAX_HOST_LENGTH} = 14 keeps every allowed host inside one segment even if the gateway
+ * turns each {@code \n} into {@code \r\n} ({@code beautica.app} → 66, 68 with CRLF). Boot-time validation of {@code beautica.sms.otp-domain}
  * uses the same constants ({@code DeploymentProperties.Sms}).
  *
  * <p>The text carries a live credential: never log it.
@@ -39,7 +39,7 @@ public final class OtpSmsText {
 
     private static final Pattern HOST = Pattern.compile(OtpDomainRules.HOST_REGEX);
     private static final Pattern CODE = Pattern.compile("\\d{6}");
-    private static final String FIRST_LINE_PREFIX = "Код Beautica: ";
+    private static final String FIRST_LINE_PREFIX = "Beautica: Ваш код ";
     private static final String FIRST_LINE_SUFFIX = ". Нікому не кажіть.";
 
     /** {@code "\n\n@host #"}, or empty when there is no domain line. */

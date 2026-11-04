@@ -1,5 +1,6 @@
 package com.beautica.booking;
 
+import com.beautica.booking.domain.GuestCancelToken;
 import com.beautica.booking.domain.CancelTokenHasher;
 import com.beautica.common.TimeZones;
 import com.beautica.notification.sms.SmsService;
@@ -59,7 +60,7 @@ class WalkInBookingSmsEnabledIT extends AbstractWalkInBookingSmsIT {
     }
 
     @Test
-    @DisplayName("flag on — the body names the master, the date and the Kyiv wall-clock time")
+    @DisplayName("flag on — the body names the salon, the master, the date and the Kyiv wall-clock time, no service")
     void should_renderMasterNameDateAndTime_when_theGateIsOn() throws Exception {
         OffsetDateTime startsAt = tomorrowAtNoon();
         assertThat(createWalkIn(startsAt).getStatusCode()).isEqualTo(HttpStatus.CREATED);
@@ -69,11 +70,10 @@ class WalkInBookingSmsEnabledIT extends AbstractWalkInBookingSmsIT {
                 .as("the MASTER's name, not the guest's — the client is being told who they will see")
                 .contains(MASTER_NAME)
                 .doesNotContain(GUEST_NAME)
-                // The PLATFORM taxonomy name, never the provider's custom service_definitions.name
-                // (security LOW, 2026-08-19). This message reaches a number that never opted in, so
-                // the only free text a self-registered account can put into a Beautica-branded SMS is
-                // its own display name — the service string is platform-authored.
-                .contains(platformServiceName())
+                // Phase 435: salon variant — the salon's name and the performing master, and no
+                // service name at all (neither the provider's custom nor the platform one).
+                .contains("Салон " + fixtureSalonName(salon.salonId()) + ", майстер " + MASTER_NAME + ".")
+                .doesNotContain(platformServiceName())
                 .doesNotContain(SERVICE_NAME)
                 .contains(DATE_FMT.format(startsAt.atZoneSameInstant(TimeZones.KYIV)))
                 .as("the wall clock the client reads, not the UTC instant the column stores")
@@ -92,37 +92,31 @@ class WalkInBookingSmsEnabledIT extends AbstractWalkInBookingSmsIT {
                 .doesNotContain("{")
                 .contains("Скасувати: ")
                 .doesNotContain("за телефоном майстра")
-                .containsPattern("/book/cancel/[0-9a-f-]{36}$");
-        UUID token = tokenOf(text);
+                .containsPattern("/c/[0-9A-Za-z]{16}$");
+        GuestCancelToken token = tokenOf(text);
         assertThat(jdbcTemplate.queryForObject("SELECT cancel_token_hash FROM appointments WHERE id = ?",
                 String.class, onlyBooking().get("appointment_id")))
                 .as("only the hash is at rest (394)").isEqualTo(CancelTokenHasher.hash(token));
         assertThat(onlyBooking().get("cancel_token_hash")).as("child rows stay tokenless").isNull();
     }
 
-    /** Phase 412 D4 — the walk-in cancels by link through the LINK visit path: one guest SMS, one provider row. */
+    /** Phase 412 D4 / 435 — the walk-in cancels by link through the LINK visit path: NO guest SMS, one provider row. */
     @Test
-    @DisplayName("flag on — cancelling a walk-in by its link → CANCELLED, one cancel SMS, one provider notification")
+    @DisplayName("flag on — cancelling a walk-in by its link → CANCELLED, no guest SMS (phase 435), one provider notification")
     void should_cancelWalkInVisit_when_cancelLinkFollowed() throws Exception {
         assertThat(createWalkIn(tomorrowAtNoon()).getStatusCode()).isEqualTo(HttpStatus.CREATED);
-        UUID token = tokenOf(sentTurbosmsPayload().path("sms").path("text").asText());
+        GuestCancelToken token = tokenOf(sentTurbosmsPayload().path("sms").path("text").asText());
         UUID bookingId = (UUID) onlyBooking().get("id");
         UUID appointmentId = (UUID) onlyBooking().get("appointment_id");
         resetTurbosms();
 
-        ResponseEntity<String> cancel = restTemplate.postForEntity("/api/v1/book/cancel/" + token, null, String.class);
+        ResponseEntity<String> cancel = restTemplate.postForEntity("/api/v1/book/cancel/" + token.value(), null, String.class);
 
         assertThat(cancel.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
         assertThat(onlyBooking().get("status")).isEqualTo("CANCELLED");
         assertThat(jdbcTemplate.queryForObject("SELECT status FROM appointments WHERE id = ?", String.class,
                 appointmentId)).isEqualTo("CANCELLED");
-        TURBOSMS.verify(1, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
-        assertThat(sentTurbosmsPayload().path("recipients").get(0).asText()).isEqualTo(E164_PHONE);
-        assertThat(sentTurbosmsPayload().path("sms").path("text").asText())
-                .contains("скасовано")
-                .as("the cancel SMS names the PLATFORM service type, never the provider's custom name")
-                .contains(platformServiceName())
-                .doesNotContain(SERVICE_NAME);
+        TURBOSMS.verify(0, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
         assertThat(jdbcTemplate.queryForObject("SELECT COUNT(*) FROM notification_outbox WHERE "
                 + "event_type = 'CLIENT_CANCELLED' AND aggregate_id = ?", Integer.class, bookingId)).isEqualTo(1);
         assertThat(jdbcTemplate.queryForObject("SELECT COUNT(*) FROM in_app_notification WHERE "
@@ -134,11 +128,11 @@ class WalkInBookingSmsEnabledIT extends AbstractWalkInBookingSmsIT {
     @DisplayName("flag on — a consumed walk-in link answers 404 and sends nothing (one-time, as LINK)")
     void should_return404_when_walkInLinkReplayed() throws Exception {
         assertThat(createWalkIn(tomorrowAtNoon()).getStatusCode()).isEqualTo(HttpStatus.CREATED);
-        UUID token = tokenOf(sentTurbosmsPayload().path("sms").path("text").asText());
-        restTemplate.postForEntity("/api/v1/book/cancel/" + token, null, String.class);
+        GuestCancelToken token = tokenOf(sentTurbosmsPayload().path("sms").path("text").asText());
+        restTemplate.postForEntity("/api/v1/book/cancel/" + token.value(), null, String.class);
         resetTurbosms();
 
-        ResponseEntity<String> replay = restTemplate.postForEntity("/api/v1/book/cancel/" + token, null, String.class);
+        ResponseEntity<String> replay = restTemplate.postForEntity("/api/v1/book/cancel/" + token.value(), null, String.class);
 
         assertThat(replay.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
         TURBOSMS.verify(0, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
@@ -148,11 +142,11 @@ class WalkInBookingSmsEnabledIT extends AbstractWalkInBookingSmsIT {
     @DisplayName("flag on — a walk-in inside the cancel cutoff answers the existing 422, still CONFIRMED")
     void should_return422_when_walkInInsideCutoff() throws Exception {
         assertThat(createWalkIn(tomorrowAtNoon()).getStatusCode()).isEqualTo(HttpStatus.CREATED);
-        UUID token = tokenOf(sentTurbosmsPayload().path("sms").path("text").asText());
+        GuestCancelToken token = tokenOf(sentTurbosmsPayload().path("sms").path("text").asText());
         jdbcTemplate.update("UPDATE bookings SET starts_at = NOW() + interval '30 minutes', "
                 + "ends_at = NOW() + interval '90 minutes' WHERE id = ?", onlyBooking().get("id"));
 
-        ResponseEntity<String> cancel = restTemplate.postForEntity("/api/v1/book/cancel/" + token, null, String.class);
+        ResponseEntity<String> cancel = restTemplate.postForEntity("/api/v1/book/cancel/" + token.value(), null, String.class);
 
         assertThat(cancel.getStatusCode()).isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
         assertThat(onlyBooking().get("status")).isEqualTo("CONFIRMED");
@@ -163,14 +157,14 @@ class WalkInBookingSmsEnabledIT extends AbstractWalkInBookingSmsIT {
     @DisplayName("flag on — walk-in A's link cancels visit A only; visit B stays CONFIRMED and its own link still works")
     void should_cancelOnlyOwnVisit_when_twoWalkInVisitsExist() throws Exception {
         UUID visitA = createWalkInVisitId(tomorrowAtNoon());
-        UUID tokenA = tokenOf(sentTurbosmsPayload().path("sms").path("text").asText());
+        GuestCancelToken tokenA = tokenOf(sentTurbosmsPayload().path("sms").path("text").asText());
         resetTurbosms();
         UUID visitB = createWalkInVisitId(tomorrowAt(LocalTime.of(15, 0)));
-        UUID tokenB = tokenOf(sentTurbosmsPayload().path("sms").path("text").asText());
+        GuestCancelToken tokenB = tokenOf(sentTurbosmsPayload().path("sms").path("text").asText());
         resetTurbosms();
 
         ResponseEntity<String> cancelA =
-                restTemplate.postForEntity("/api/v1/book/cancel/" + tokenA, null, String.class);
+                restTemplate.postForEntity("/api/v1/book/cancel/" + tokenA.value(), null, String.class);
 
         assertThat(cancelA.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
         assertThat(visitStatus(visitA)).isEqualTo("CANCELLED");
@@ -179,7 +173,7 @@ class WalkInBookingSmsEnabledIT extends AbstractWalkInBookingSmsIT {
                 visitB)).as("nor visit B's items").containsExactly("CONFIRMED");
         assertThat(jdbcTemplate.queryForObject("SELECT cancel_token_hash FROM appointments WHERE id = ?",
                 String.class, visitB)).as("visit B's token is not consumed").isEqualTo(CancelTokenHasher.hash(tokenB));
-        assertThat(restTemplate.postForEntity("/api/v1/book/cancel/" + tokenB, null, String.class).getStatusCode())
+        assertThat(restTemplate.postForEntity("/api/v1/book/cancel/" + tokenB.value(), null, String.class).getStatusCode())
                 .as("visit B still cancels by its own link").isEqualTo(HttpStatus.NO_CONTENT);
     }
 
@@ -188,7 +182,7 @@ class WalkInBookingSmsEnabledIT extends AbstractWalkInBookingSmsIT {
     @DisplayName("flag on — the raw walk-in token appears in no column of the header or the item, only its hash")
     void should_storeNoPlaintextToken_when_walkInCreated() throws Exception {
         UUID appointmentId = createWalkInVisitId(tomorrowAtNoon());
-        UUID token = tokenOf(sentTurbosmsPayload().path("sms").path("text").asText());
+        GuestCancelToken token = tokenOf(sentTurbosmsPayload().path("sms").path("text").asText());
 
         String headerRow = jdbcTemplate.queryForObject(
                 "SELECT row_to_json(a)::text FROM appointments a WHERE a.id = ?", String.class, appointmentId);
@@ -196,9 +190,9 @@ class WalkInBookingSmsEnabledIT extends AbstractWalkInBookingSmsIT {
                 "SELECT row_to_json(b)::text FROM bookings b WHERE b.appointment_id = ?", String.class, appointmentId);
 
         assertThat(headerRow).as("header row=%s", headerRow)
-                .doesNotContain(token.toString())
+                .doesNotContain(token.value())
                 .contains(CancelTokenHasher.hash(token));
-        assertThat(itemRow).as("item row").doesNotContain(token.toString());
+        assertThat(itemRow).as("item row").doesNotContain(token.value());
         assertThat(jdbcTemplate.queryForObject("SELECT count(*) FROM appointments a JOIN bookings b "
                         + "ON b.appointment_id = a.id WHERE a.id = ? "
                         + "AND (a.cancel_token IS NOT NULL OR b.cancel_token IS NOT NULL)",
@@ -232,8 +226,8 @@ class WalkInBookingSmsEnabledIT extends AbstractWalkInBookingSmsIT {
         assertThat(onlyBooking().get("reminder_sent")).isEqualTo(true);
     }
 
-    private static UUID tokenOf(String smsText) {
-        return UUID.fromString(smsText.substring(smsText.lastIndexOf('/') + 1).trim());
+    private static GuestCancelToken tokenOf(String smsText) {
+        return GuestCancelToken.valueOf(smsText.substring(smsText.lastIndexOf('/') + 1).trim());
     }
 
     @Test
@@ -376,11 +370,10 @@ class WalkInBookingSmsEnabledIT extends AbstractWalkInBookingSmsIT {
                 .as("addressed to the OTP-verified guest phone the token carries")
                 .isEqualTo(LINK_PHONE);
         assertThat(sent.path("sms").path("text").asText())
-                .as("the LINK template — unlike the walk-in one — DOES carry a self-cancel link, "
-                        + "which is what makes this a different template and not the same assertion twice")
+                .as("the LINK template carries the self-cancel link and (phase 435) no service name")
                 .contains("Скасувати:")
                 .contains(MASTER_NAME)
-                .contains(SERVICE_NAME);
+                .doesNotContain(SERVICE_NAME);
     }
 
     /**
@@ -440,8 +433,9 @@ class WalkInBookingSmsEnabledIT extends AbstractWalkInBookingSmsIT {
                         + "not depend on how many services the visit chains")
                 .isEqualTo(E164_PHONE);
         assertThat(sent.path("sms").path("text").asText())
-                .as("D3 — first service named, plural-correct «та ще N послуг(и)» for the rest")
-                .contains(firstServicePlatformName + " та ще 4 послуги");
+                .as("phase 435 — ONE SMS for the visit, naming no service and no «та ще» count")
+                .doesNotContain(firstServicePlatformName)
+                .doesNotContain("та ще");
     }
 
     /**

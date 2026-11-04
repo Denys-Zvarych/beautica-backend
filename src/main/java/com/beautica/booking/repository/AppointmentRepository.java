@@ -69,6 +69,14 @@ public interface AppointmentRepository extends JpaRepository<Appointment, UUID> 
     Optional<Appointment> findByCancelTokenHash(@Param("cancelTokenHash") String cancelTokenHash);
 
     /**
+     * Phase 435 — the sealed visit cancel token (V230) by header id, scalar, for {@code GuestBookingPageLinks} when the
+     * caller's booking holds an uninitialised header proxy (the outbox drain loads bookings without the header and runs
+     * outside a transaction). Primary-key probe; empty when the header is gone or carries no sealed token.
+     */
+    @Query("SELECT a.cancelTokenSealed FROM Appointment a WHERE a.id = :id AND a.cancelTokenSealed IS NOT NULL")
+    Optional<String> findCancelTokenSealedById(@Param("id") UUID id);
+
+    /**
      * Atomically consumes a visit's cancel token: flips a still-{@code CONFIRMED} guest visit HEADER to
      * {@code CANCELLED}, stamps {@code CLIENT_CANCELLED}, and nulls the token hash, in a single conditional
      * UPDATE. Mirrors {@code BookingRepository#consumeCancelTokenHash} lifted to the aggregate header: of N
@@ -98,7 +106,8 @@ public interface AppointmentRepository extends JpaRepository<Appointment, UUID> 
             UPDATE appointments
                SET status = 'CANCELLED',
                    cancellation_reason = 'CLIENT_CANCELLED',
-                   cancel_token_hash = NULL
+                   cancel_token_hash = NULL,
+                   cancel_token_sealed = NULL
               FROM (SELECT set_config('lock_timeout', '3s', true)) AS lock_cfg
              WHERE appointments.cancel_token_hash = :cancelTokenHash
                AND appointments.status = 'CONFIRMED'
@@ -440,6 +449,7 @@ public interface AppointmentRepository extends JpaRepository<Appointment, UUID> 
                    client_comment = NULL,
                    client_cancellation_note = NULL,
                    cancel_token_hash = NULL,
+                   cancel_token_sealed = NULL,
                    guest_pii_anonymised_at = now(),
                    updated_at = now()
              WHERE a.id IN (
@@ -505,6 +515,7 @@ public interface AppointmentRepository extends JpaRepository<Appointment, UUID> 
                    client_comment = NULL,
                    client_cancellation_note = NULL,
                    cancel_token_hash = NULL,
+                   cancel_token_sealed = NULL,
                    guest_pii_anonymised_at = now(),
                    updated_at = now()
               FROM due
@@ -549,6 +560,7 @@ public interface AppointmentRepository extends JpaRepository<Appointment, UUID> 
                    client_comment = NULL,
                    client_cancellation_note = NULL,
                    cancel_token_hash = NULL,
+                   cancel_token_sealed = NULL,
                    guest_pii_anonymised_at = now(),
                    updated_at = now()
               FROM due
@@ -573,6 +585,7 @@ public interface AppointmentRepository extends JpaRepository<Appointment, UUID> 
                    client_comment = NULL,
                    client_cancellation_note = NULL,
                    cancel_token_hash = NULL,
+                   cancel_token_sealed = NULL,
                    guest_pii_anonymised_at = now(),
                    updated_at = now()
              WHERE guest_phone = :phone
@@ -624,6 +637,7 @@ public interface AppointmentRepository extends JpaRepository<Appointment, UUID> 
                SET status = 'CANCELLED',
                    cancellation_reason = 'CLIENT_CANCELLED',
                    cancel_token_hash = NULL,
+                   cancel_token_sealed = NULL,
                    updated_at = now()
              WHERE id = :id
                AND status = 'CONFIRMED'

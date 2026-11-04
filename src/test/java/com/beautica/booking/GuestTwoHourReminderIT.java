@@ -45,8 +45,6 @@ class GuestTwoHourReminderIT extends AbstractWalkInBookingSmsIT {
      */
     private static final Instant NOW = java.time.LocalDate.now(com.beautica.common.TimeZones.KYIV)
             .atTime(12, 0).atZone(com.beautica.common.TimeZones.KYIV).toInstant();
-    private static final String TWO_HOUR_PREFIX = "Beautica: Нагадуємо!\n" + SERVICE_NAME + " у " + MASTER_NAME
-            + "\nСьогодні о ";
 
     @Autowired private BookingReminderJob reminderJob;
     @Autowired private BookingSmsProperties smsProperties;
@@ -81,13 +79,13 @@ class GuestTwoHourReminderIT extends AbstractWalkInBookingSmsIT {
         UUID bookingId = insertLinkBooking(at(NOW.plus(Duration.ofHours(24))), NOW.minus(Duration.ofDays(2)));
 
         reminderJob.sendReminders();
-        assertThat(sentText()).contains("Завтра о");
+        assertThat(sentText()).contains("що завтра у Вас запис");
         resetTurbosms();
         clock.set(NOW.plus(Duration.ofHours(22)));
         reminderJob.sweepTwoHour();
         reminderJob.sweepTwoHour();
 
-        assertThat(sentText()).isEqualTo(TWO_HOUR_PREFIX + "12:00");
+        assertThat(sentText()).isEqualTo(twoHourPrefix() + "12:00");
         assertThat(jdbcTemplate.queryForObject("SELECT reminder_2h_sent FROM bookings WHERE id = ?",
                 Boolean.class, bookingId)).isTrue();
     }
@@ -99,7 +97,9 @@ class GuestTwoHourReminderIT extends AbstractWalkInBookingSmsIT {
 
         reminderJob.sweepTwoHour();
 
-        assertThat(sentText()).isEqualTo(TWO_HOUR_PREFIX + "14:00");
+        assertThat(sentText()).as("phase 435: a visit names its first service plus «та ще N послуга»")
+                .isEqualTo(salonReminderPrefix("сьогодні") + SERVICE_NAME + " та ще "
+                        + com.beautica.common.util.UkrainianPlurals.servicesPhrase(1) + " о 14:00");
         assertThat(jdbcTemplate.queryForObject("SELECT count(*) FROM bookings WHERE appointment_id = ? "
                 + "AND reminder_2h_sent", Integer.class, appointmentId)).isEqualTo(2);
     }
@@ -150,7 +150,7 @@ class GuestTwoHourReminderIT extends AbstractWalkInBookingSmsIT {
         reminderJob.sweepTwoHour();
         reminderJob.sendReminders();
 
-        assertThat(sentText()).contains("Завтра о");
+        assertThat(sentText()).contains("що завтра у Вас запис");
         assertThat(reminded(twoHour)).as("flag off → not even claimed").isFalse();
     }
 
@@ -164,13 +164,13 @@ class GuestTwoHourReminderIT extends AbstractWalkInBookingSmsIT {
             reminderJob.sweepTwoHour();
         }
 
-        assertThat(sentText()).isEqualTo(TWO_HOUR_PREFIX + "13:50");
+        assertThat(sentText()).isEqualTo(twoHourPrefix() + "13:50");
         assertThat(reminded(free)).isTrue();
         assertThat(reminded(held)).isFalse();
         resetTurbosms();
         clock.set(NOW.plus(Duration.ofMinutes(15)));
         reminderJob.sweepTwoHour();
-        assertThat(sentText()).isEqualTo(TWO_HOUR_PREFIX + "14:05");
+        assertThat(sentText()).isEqualTo(twoHourPrefix() + "14:05");
         assertThat(reminded(held)).isTrue();
     }
 
@@ -179,7 +179,7 @@ class GuestTwoHourReminderIT extends AbstractWalkInBookingSmsIT {
     void should_notRemindAgain_when_serviceAddedToRemindedVisit() throws Exception {
         UUID appointmentId = insertLinkVisit(at(NOW.plus(Duration.ofMinutes(110))), 1);
         reminderJob.sweepTwoHour();
-        assertThat(sentText()).contains("Сьогодні о");
+        assertThat(sentText()).contains("що сьогодні у Вас запис");
         resetTurbosms();
         UUID added = insertLinkBooking(at(NOW.plus(Duration.ofMinutes(125))), NOW.minus(Duration.ofDays(1)));
         jdbcTemplate.update("UPDATE bookings SET appointment_id = ? WHERE id = ?", appointmentId, added);
@@ -246,7 +246,7 @@ class GuestTwoHourReminderIT extends AbstractWalkInBookingSmsIT {
 
         assertThat(reminded(bookingId)).isEqualTo(sends);
         if (sends) {
-            assertThat(sentText()).isEqualTo(TWO_HOUR_PREFIX
+            assertThat(sentText()).isEqualTo(twoHourPrefix()
                     + java.time.format.DateTimeFormatter.ofPattern("HH:mm")
                             .format(startsAt.atZoneSameInstant(com.beautica.common.TimeZones.KYIV)));
         } else {
@@ -310,9 +310,9 @@ class GuestTwoHourReminderIT extends AbstractWalkInBookingSmsIT {
         reminderJob.sweepTwoHour();
 
         assertThat(sentText())
-                .startsWith("Beautica: Нагадуємо!\n" + platformServiceName() + " у " + MASTER_NAME)
-                .doesNotContain(SERVICE_NAME)
-                .endsWith("Сьогодні о 13:50");
+                .isEqualTo(salonReminderPrefix("сьогодні") + platformServiceName() + " та ще "
+                        + com.beautica.common.util.UkrainianPlurals.servicesPhrase(1) + " о 13:50")
+                .doesNotContain(SERVICE_NAME);
         assertThat(jdbcTemplate.queryForObject("SELECT count(*) FROM bookings WHERE appointment_id = ? "
                 + "AND reminder_2h_sent", Integer.class, appointmentId)).isEqualTo(2);
     }
@@ -326,7 +326,7 @@ class GuestTwoHourReminderIT extends AbstractWalkInBookingSmsIT {
 
         reminderJob.sweepTwoHour();
 
-        assertThat(sentText()).isEqualTo(TWO_HOUR_PREFIX + "14:00");
+        assertThat(sentText()).isEqualTo(twoHourPrefix() + "14:00");
         assertThat(reminded(link)).isTrue();
         assertThat(jdbcTemplate.queryForObject("SELECT count(*) FROM bookings WHERE appointment_id = ? "
                 + "AND reminder_2h_sent", Integer.class, appointmentId)).isZero();
@@ -402,6 +402,11 @@ class GuestTwoHourReminderIT extends AbstractWalkInBookingSmsIT {
                     at(NOW.minus(Duration.ofDays(1))), at(NOW));
         }
         return appointmentId;
+    }
+
+    /** Phase 435 — the fixture salon's 2h reminder up to the time (salon variant, no address). */
+    private String twoHourPrefix() {
+        return salonReminderPrefix("сьогодні") + SERVICE_NAME + " о ";
     }
 
     private String platformServiceName() {

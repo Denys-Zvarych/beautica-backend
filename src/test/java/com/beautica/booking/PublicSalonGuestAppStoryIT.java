@@ -334,7 +334,7 @@ class PublicSalonGuestAppStoryIT extends AbstractIntegrationTest {
     }
 
     private static String cancelToken(JsonNode created) {
-        return created.path("cancelUrl").asText().replaceAll(".*/book/cancel/", "");
+        return created.path("cancelUrl").asText().replaceAll(".*/c/", "");
     }
 
     private static UUID bookingId(JsonNode created) {

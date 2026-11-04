@@ -187,6 +187,22 @@ final class GuestPiiFixtures {
         return expected;
     }
 
+    /**
+     * Projects a post-migration row onto the columns {@code expected} names, so a whole-row
+     * before/after comparison checks only the pre-existing columns and a column added by any later
+     * migration (V230 {@code cancel_token_sealed}, and whatever comes next) cannot break it. A
+     * pre-existing column that vanished stays absent here, so the comparison still fails on it.
+     */
+    static Map<String, Object> onlyColumnsOf(Map<String, Object> expected, Map<String, Object> actual) {
+        Map<String, Object> projected = new HashMap<>();
+        for (String column : expected.keySet()) {
+            if (actual.containsKey(column)) {
+                projected.put(column, actual.get(column));
+            }
+        }
+        return projected;
+    }
+
     void insertOtp(String phone) {
         jdbc.update("INSERT INTO phone_otps (phone, code_hash, expires_at, used, attempts, created_at) "
                 + "VALUES (?, 'abc', NOW() + INTERVAL '5 minutes', false, 0, NOW())", phone);

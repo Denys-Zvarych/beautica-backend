@@ -1,11 +1,14 @@
 package com.beautica.booking.job;
 
-import com.beautica.booking.entity.Booking;
+import com.beautica.booking.domain.GuestSmsProviderText;
 import com.beautica.booking.domain.GuestSmsServiceName;
-import com.beautica.booking.event.GuestRemindersDueEvent;
+import com.beautica.booking.domain.GuestVisitAddress;
+import com.beautica.booking.entity.Booking;
 import com.beautica.booking.event.GuestRemindersDueEvent.GuestReminderSms;
 import com.beautica.booking.event.GuestRemindersDueEvent.ReminderType;
+import com.beautica.booking.event.GuestRemindersDueEvent;
 import com.beautica.booking.repository.BookingRepository;
+import com.beautica.booking.service.GuestBookingPageLinks;
 import com.beautica.common.TimeZones;
 import com.beautica.common.util.Placeholders;
 import com.beautica.config.BookingSmsProperties;
@@ -25,13 +28,16 @@ import java.time.LocalTime;
 import java.time.OffsetDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.stream.Collectors;
 
 /**
  * Hourly sweep that sends a 24h reminder SMS for upcoming guest (LINK) bookings
@@ -62,6 +68,14 @@ import java.util.UUID;
 public class BookingReminderJob {
 
     private static final DateTimeFormatter TIME_FMT = DateTimeFormatter.ofPattern("HH:mm");
+    private static final String ADDRESS = "address";
+    /** Phase 435 — template lines dropped whole when their value is absent. */
+    private static final String SALON_ADDRESS = "salonAddress";
+    /** Phase 435 — the guest's own booking page; its «Скасувати запис:» line is dropped when no link exists. */
+    private static final String CANCEL_URL = "cancelUrl";
+    private static final Set<String> OPTIONAL_PLACEHOLDERS = Set.of(ADDRESS, SALON_ADDRESS, CANCEL_URL);
+    /** Audit-fix — the address placeholders, dropped first when the reminder is over the length cap. */
+    private static final Set<String> ADDRESS_PLACEHOLDERS = Set.of(ADDRESS, SALON_ADDRESS);
     private static final Duration WINDOW_START = Duration.ofHours(23);
     private static final Duration WINDOW_END = Duration.ofHours(25);
 
@@ -83,18 +97,22 @@ public class BookingReminderJob {
     private final ApplicationEventPublisher events;
     private final Clock clock;
     private final MeterRegistry meterRegistry;
+    /** Phase 435 — the guest's own booking page for the «Скасувати запис:» line (dropped when absent). */
+    private final GuestBookingPageLinks pageLinks;
 
     public BookingReminderJob(
             BookingRepository bookingRepository,
             BookingSmsProperties smsProperties,
             ApplicationEventPublisher events,
             Clock clock,
-            MeterRegistry meterRegistry) {
+            MeterRegistry meterRegistry,
+            GuestBookingPageLinks pageLinks) {
         this.bookingRepository = bookingRepository;
         this.smsProperties = smsProperties;
         this.events = events;
         this.clock = clock;
         this.meterRegistry = meterRegistry;
+        this.pageLinks = pageLinks;
     }
 
     @Scheduled(cron = "0 0 * * * *")
@@ -147,18 +165,24 @@ public class BookingReminderJob {
         // user), so it cannot run in the after-commit dispatcher. Only Strings cross the boundary.
         List<GuestReminderSms> reminders = new ArrayList<>();
 
+        BookingSmsProperties.Sms sms = smsProperties.getSms();
         for (Booking booking : singles) {
-            collectReminder(reminders, booking);
+            collectReminder(reminders, booking, reminderTemplate(booking, sms.getReminder(), sms.getReminderSalon()), 1);
         }
         // No setReminderSent(true) / saveAll: the native claim above (claimRemindersByIds) already
         // persisted reminder_sent = TRUE for exactly these rows, as the visit claim does for visits. The
         // in-memory flag is left stale on purpose (nothing later in this transaction reads it), which keeps
         // Hibernate's dirty check from issuing a redundant UPDATE per row at commit.
 
-        for (List<Booking> items : visits.values()) {
-            // Remind on the earliest item; the SMS renders that item's service/time as the visit summary.
+        Map<UUID, Long> itemCounts = visitItemCounts(visits.keySet());
+        for (Map.Entry<UUID, List<Booking>> visit : visits.entrySet()) {
+            // Remind on the earliest item; the SMS renders that item's service/time as the visit summary, with
+            // «та ще N послуг(и)» for the rest of the visit (phase 435).
+            List<Booking> items = visit.getValue();
             items.sort(Comparator.comparing(Booking::getStartsAt));
-            collectReminder(reminders, items.get(0));
+            Booking lead = items.get(0);
+            collectReminder(reminders, lead, reminderTemplate(lead, sms.getReminder(), sms.getReminderSalon()),
+                    itemCounts.getOrDefault(visit.getKey(), 1L));
         }
 
         // Hand the batch to GuestReminderDispatcher, which fires only once THIS transaction commits and
@@ -216,8 +240,16 @@ public class BookingReminderJob {
         }
         List<Booking> leads = claimTwoHourLeads(due, config.getMinLead());
         List<GuestReminderSms> reminders = new ArrayList<>();
+        Map<UUID, Long> itemCounts = visitItemCounts(leads.stream()
+                .filter(lead -> lead.getAppointment() != null)
+                .map(lead -> lead.getAppointment().getId())
+                .toList());
+        BookingSmsProperties.Sms sms = smsProperties.getSms();
         for (Booking lead : leads) {
-            collectReminder(reminders, lead, smsProperties.getSms().getReminder2h());
+            long itemCount = lead.getAppointment() == null
+                    ? 1 : itemCounts.getOrDefault(lead.getAppointment().getId(), 1L);
+            collectReminder(reminders, lead, reminderTemplate(lead, sms.getReminder2h(), sms.getReminder2hSalon()),
+                    itemCount);
         }
         if (!reminders.isEmpty()) {
             events.publishEvent(new GuestRemindersDueEvent(ReminderType.H2, reminders));
@@ -300,11 +332,30 @@ public class BookingReminderJob {
      * <p>The booking is still marked reminded when rendering fails: the cause is a deterministic data
      * problem that would fail identically on the next sweep, so retrying it hourly would only re-log.
      */
-    private void collectReminder(List<GuestReminderSms> reminders, Booking booking) {
-        collectReminder(reminders, booking, smsProperties.getSms().getReminder());
+    /**
+     * Phase 435 — the salon variant (salon name + performing master) whenever the booking has a salon. Audit-fix: the
+     * independent-master template rides along as the fallback {@link GuestSmsProviderText#render} uses when the salon
+     * name is dropped (URL-like) or the message is over the length cap.
+     */
+    private static ReminderTemplates reminderTemplate(Booking booking, String masterTemplate, String salonTemplate) {
+        return new ReminderTemplates(booking.getSalon() != null ? salonTemplate : null, masterTemplate);
     }
 
-    private void collectReminder(List<GuestReminderSms> reminders, Booking booking, String template) {
+    private record ReminderTemplates(String salon, String master) {
+    }
+
+    /** Phase 435 — CONFIRMED item count per claimed visit, one grouped query; empty input → no query. */
+    private Map<UUID, Long> visitItemCounts(Collection<UUID> appointmentIds) {
+        if (appointmentIds.isEmpty()) {
+            return Map.of();
+        }
+        return bookingRepository.countConfirmedItemsByAppointmentIds(appointmentIds).stream()
+                .collect(Collectors.toMap(BookingRepository.VisitItemCount::getAppointmentId,
+                        BookingRepository.VisitItemCount::getItemCount));
+    }
+
+    private void collectReminder(List<GuestReminderSms> reminders, Booking booking, ReminderTemplates template,
+                                 long itemCount) {
         // Phase 373 defensive guard: an anonymised guest row has guest_phone NULL. The sweep's
         // window (upcoming CONFIRMED) cannot reach one — retention needs ends_at > 12 months ago and
         // the erase cancels upcoming rows before wiping — but a null must never reach the SMS sender.
@@ -313,7 +364,7 @@ public class BookingReminderJob {
             return;
         }
         try {
-            reminders.add(new GuestReminderSms(booking.getGuestPhone(), buildReminderSms(booking, template)));
+            reminders.add(new GuestReminderSms(booking.getGuestPhone(), buildReminderSms(booking, template, itemCount)));
         } catch (RuntimeException e) {
             log.warn("Guest reminder SMS could not be rendered: {}", e.getClass().getSimpleName());
         }
@@ -327,16 +378,33 @@ public class BookingReminderJob {
      * was substituted BEFORE {@code {time}}, so the later {@code replace} re-scanned the service
      * name it had just written in. A provider who named a service {@code "Манікюр {time}"}
      * therefore got a second, fabricated time expanded inside a message the guest reads as platform
-     * copy — SMS is a guest's only channel. This template carries no {@code {cancelUrl}}, so there
-     * is no link to duplicate, but the layout-steering vector is the same. A single pass copies
+     * copy — SMS is a guest's only channel. Since phase 435 this template also carries {@code {cancelUrl}}, which
+     * the same single pass keeps from being duplicated or forged by a value. A single pass copies
      * substituted values out verbatim, so data can never become markup.
+     *
+     * <p>Phase 435: the «Адреса:» line is optional — dropped whole when {@link GuestVisitAddress} finds none; so is the
+     * «Скасувати запис: {cancelUrl}» line when {@link GuestBookingPageLinks} cannot build the guest's page.
      */
-    private String buildReminderSms(Booking booking, String template) {
+    private String buildReminderSms(Booking booking, ReminderTemplates template, long itemCount) {
         OffsetDateTime kyiv = booking.getStartsAt().atZoneSameInstant(TimeZones.KYIV).toOffsetDateTime();
-        return Placeholders.format(template, Map.of(
-                "serviceName", GuestSmsServiceName.of(booking), // 413 D4: platform name for walk-ins
-                "masterName", masterName(booking),
-                "time", TIME_FMT.format(kyiv)));
+        Map<String, String> values = new HashMap<>();
+        // 413 D4: platform name for walk-ins; phase 435: «та ще N послуг(и)» for a visit. Audit-fix: every provider
+        // value goes through GuestSmsProviderText (one line, capped; salon name / address dropped when URL-like).
+        values.put("serviceName", GuestSmsServiceName.visitPhrase(
+                GuestSmsProviderText.personName(GuestSmsServiceName.of(booking)), itemCount));
+        // Audit-fix cycle 2: a URL-like master name is dropped — render then removes the master segment.
+        GuestSmsProviderText.masterName(masterName(booking)).ifPresent(name -> values.put("masterName", name));
+        values.put("time", TIME_FMT.format(kyiv));
+        // Phase 435 follow-up: the address (both keys) plus the « ({locationNote})» value, kept only beside an address.
+        values.putAll(GuestVisitAddress.smsValues(booking, ADDRESS_PLACEHOLDERS));
+        if (booking.getSalon() != null) {
+            GuestSmsProviderText.salonName(booking.getSalon().getName())
+                    .ifPresent(name -> values.put("salonName", name));
+        }
+        pageLinks.forBooking(booking).ifPresent(url -> values.put(CANCEL_URL, url));
+        // Capped at GuestSmsProviderText.MAX_SMS_CHARS: the note goes first, then the address line, then the salon.
+        return GuestSmsProviderText.render(template.salon(), template.master(), values,
+                OPTIONAL_PLACEHOLDERS, ADDRESS_PLACEHOLDERS);
     }
 
     // V157 / phase 294 D3: a reminder is sent about a HISTORICAL booking whose master may have been

@@ -313,7 +313,7 @@ public class GuestPiiAnonymisationService {
             Appointment appointment = headers.get(appointmentId);
             List<Booking> items = itemsByVisit.getOrDefault(appointmentId, List.of());
             if (appointment != null && !items.isEmpty()
-                    && guestVisitCancellationService.cancelGuestVisit(appointment, items, false)) {
+                    && guestVisitCancellationService.cancelGuestVisit(appointment, items)) {
                 cancelled++;
             }
         }
@@ -326,7 +326,7 @@ public class GuestPiiAnonymisationService {
         }
         int cancelled = 0;
         for (Booking booking : bookingRepository.findAllByIdsWithGraph(bookingIds)) {
-            if (bookingCancellationService.cancelGuestBooking(booking, false)) {
+            if (bookingCancellationService.cancelGuestBooking(booking)) {
                 cancelled++;
             }
         }

@@ -32,7 +32,7 @@ import java.util.function.IntSupplier;
  *   <li>D4 {@link #purgeExpiredTokens} — tokens of any state one day past {@code expires_at}
  *       ({@link TelegramLinkTokenPurgeJob}).</li>
  * </ul>
- * Opt-out ({@code /stop}, «Повернутися до SMS») is the immediate {@link TelegramLinkService#unlinkChat} /
+ * Opt-out ({@code /stop}, «Відписатися від Telegram») is the immediate {@link TelegramLinkService#unlinkChat} /
  * {@link TelegramLinkService#unlinkPhone} delete (405/407). Callers log counts only — no phone, hash, chat id or token
  * ever leaves this class.
  */

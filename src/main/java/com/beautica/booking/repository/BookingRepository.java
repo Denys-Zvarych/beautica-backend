@@ -813,7 +813,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
 
     /**
      * Phase 401 D8 — the reviewable bookings of a VISIT-keyed review invite: the COMPLETED LINK guest bookings
-     * ({@code client_id IS NULL}) of {@code appointmentId}, ordered by {@code startsAt}. One statement, same fetch graph
+     * (phase 434: or STAFF walk-in bookings) with {@code client_id IS NULL} of {@code appointmentId}, ordered by {@code startsAt}. One statement, same fetch graph
      * as {@link #findByIdWithFullGraph} (master + user, salon, service definition), because the guest review page reads
      * the master name, the salon name and the service name of every row and the review create path reads
      * {@code m.user}. Plus {@code m.salon} (phase 401 audit-fix): the provider card's master-visibility rule reads
@@ -830,7 +830,8 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             JOIN FETCH ms.serviceDefinition
             WHERE b.appointment.id = :appointmentId
               AND b.status = com.beautica.booking.enums.BookingStatus.COMPLETED
-              AND b.bookingSource = com.beautica.booking.enums.BookingSource.LINK
+              AND b.bookingSource IN (com.beautica.booking.enums.BookingSource.LINK,
+                                      com.beautica.booking.enums.BookingSource.STAFF)
               AND b.client IS NULL
             ORDER BY b.startsAt ASC, b.id ASC
             """)
@@ -838,8 +839,8 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
 
     /**
      * Phase 401 D8 — the reviewable booking of a BOOKING-keyed review invite (V215): {@code bookingId} only when it
-     * still has no visit header ({@code appointment_id IS NULL}) and is a COMPLETED LINK guest booking
-     * ({@code client_id IS NULL}); otherwise empty. Same fetch graph as
+     * still has no visit header ({@code appointment_id IS NULL}) and is a COMPLETED LINK guest or (phase 434) STAFF
+     * walk-in booking ({@code client_id IS NULL}); otherwise empty. Same fetch graph as
      * {@link #findGuestReviewableByAppointmentIdWithGraph}.
      */
     @Query("""
@@ -853,7 +854,8 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             WHERE b.id = :bookingId
               AND b.appointment IS NULL
               AND b.status = com.beautica.booking.enums.BookingStatus.COMPLETED
-              AND b.bookingSource = com.beautica.booking.enums.BookingSource.LINK
+              AND b.bookingSource IN (com.beautica.booking.enums.BookingSource.LINK,
+                                      com.beautica.booking.enums.BookingSource.STAFF)
               AND b.client IS NULL
             """)
     Optional<Booking> findGuestReviewableSingleBookingWithGraph(@Param("bookingId") UUID bookingId);
@@ -2224,6 +2226,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             JOIN FETCH ms.serviceDefinition sd
             JOIN FETCH sd.serviceType
             LEFT JOIN FETCH b.appointment
+            LEFT JOIN FETCH b.salon
             WHERE (b.bookingSource = com.beautica.booking.enums.BookingSource.LINK
                    OR (b.bookingSource = com.beautica.booking.enums.BookingSource.STAFF
                        AND :includeWalkIns = true))
@@ -2254,7 +2257,8 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             UPDATE Booking b
                SET b.status = com.beautica.booking.enums.BookingStatus.CANCELLED,
                    b.cancellationReason = com.beautica.booking.enums.CancellationReason.CLIENT_CANCELLED,
-                   b.cancelTokenHash = null
+                   b.cancelTokenHash = null,
+                   b.cancelTokenSealed = null
              WHERE b.appointment.id = :appointmentId
                AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
             """)
@@ -2303,6 +2307,29 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     List<UUID> claimVisitRemindersByAppointmentIds(@Param("appointmentIds") Collection<UUID> appointmentIds);
 
     // ── Guest 2h-before reminder sweep (Phase 413) ────────────────────────────
+    /** Phase 435 — one visit's still-{@code CONFIRMED} item count (see {@link #countConfirmedItemsByAppointmentIds}). */
+    interface VisitItemCount {
+        UUID getAppointmentId();
+
+        long getItemCount();
+    }
+
+    /**
+     * Phase 435 — the {@code CONFIRMED} item count of each given visit, for the reminder's «та ще N послуг(и)»
+     * phrase. One grouped statement per sweep (bounded by the sweep's claimed visits), on the partial index
+     * {@code idx_bookings_appointment}; counts every item, including a tail outside the sweep window, and skips
+     * items a per-item decline already cancelled.
+     */
+    @Query("""
+            SELECT b.appointment.id AS appointmentId, COUNT(b) AS itemCount
+              FROM Booking b
+             WHERE b.appointment.id IN :appointmentIds
+               AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
+             GROUP BY b.appointment.id
+            """)
+    List<VisitItemCount> countConfirmedItemsByAppointmentIds(
+            @Param("appointmentIds") Collection<UUID> appointmentIds);
+
     /** Phase 408/413 audit-fix — rows one 2h sweep tick selects (and therefore claims) at most. */
     int TWO_HOUR_REMINDER_BATCH_CAP = 500;
 
@@ -2322,6 +2349,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             JOIN FETCH ms.serviceDefinition sd
             JOIN FETCH sd.serviceType
             LEFT JOIN FETCH b.appointment
+            LEFT JOIN FETCH b.salon
             WHERE (b.bookingSource = com.beautica.booking.enums.BookingSource.LINK
                    OR (b.bookingSource = com.beautica.booking.enums.BookingSource.STAFF
                        AND :includeWalkIns = true))
@@ -2405,7 +2433,8 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * rows only).
      *
      * <p>The master + service graph is JOIN-FETCHed so the cancel-info page can render
-     * {@code masterName}/{@code serviceName} without a lazy load (Anti-Bug §E-2).
+     * {@code masterName}/{@code serviceName} without a lazy load (Anti-Bug §E-2); phase 435 adds the salon for
+     * the page's {@code rebookPath}.
      *
      * <p>A consumed token's hash is {@code NULL} (set by {@link #consumeCancelTokenHash}), so a
      * replayed link returns empty → 404 (no info leak about token state).
@@ -2425,6 +2454,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             LEFT JOIN FETCH m.user
             JOIN FETCH b.masterService ms
             JOIN FETCH ms.serviceDefinition
+            LEFT JOIN FETCH b.salon
             WHERE b.cancelTokenHash = :cancelTokenHash
               AND b.appointment IS NULL
             """)
@@ -2479,7 +2509,8 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     @Query("""
             UPDATE Booking b
                SET b.status = com.beautica.booking.enums.BookingStatus.CANCELLED,
-                   b.cancelTokenHash = null
+                   b.cancelTokenHash = null,
+                   b.cancelTokenSealed = null
              WHERE b.cancelTokenHash = :cancelTokenHash
                AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
             """)
@@ -2536,6 +2567,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
                    client_comment = NULL,
                    client_cancellation_note = NULL,
                    cancel_token_hash = NULL,
+                   cancel_token_sealed = NULL,
                    guest_pii_anonymised_at = now(),
                    updated_at = now()
               FROM due
@@ -2594,6 +2626,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
                    client_comment = NULL,
                    client_cancellation_note = NULL,
                    cancel_token_hash = NULL,
+                   cancel_token_sealed = NULL,
                    guest_pii_anonymised_at = now(),
                    updated_at = now()
              WHERE guest_phone = :phone
@@ -2657,6 +2690,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             UPDATE bookings
                SET status = 'CANCELLED',
                    cancel_token_hash = NULL,
+                   cancel_token_sealed = NULL,
                    updated_at = now()
              WHERE id = :id
                AND status = 'CONFIRMED'

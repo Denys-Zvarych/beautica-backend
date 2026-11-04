@@ -394,9 +394,9 @@ public class NotificationService {
      * {@code users.email NOT NULL}) — email + push. A guest ({@code LINK}) visit has no account
      * and no email; its {@code guestPhone} is OTP-verified, so it gets an SMS instead
      * (phase 390 — the fixed {@link GuestProviderCancellationSmsText#forSalonClosed} copy via
-     * {@link #sendLinkGuestProviderCancellationSms}). A STAFF walk-in's phone was typed by an
-     * employee, not proven by the recipient (Phase 22.1) — it is NOT an eligible SMS destination
-     * and is left a silent no-op, same gate as {@link #notifyBookingStatusChanged(BookingVisit)}.
+     * {@link #sendLinkGuestProviderCancellationSms}). Since phase 408 (user decision 2026-10-28) a
+     * STAFF walk-in with a phone gets the same fixed-copy message ({@link #PROVIDER_CANCELLATION_SMS_SOURCES});
+     * any other account-less row is a silent no-op.
      *
      * <p><b>No booking note is ever read here</b> (D10) — {@link BookingVisit} exposes no
      * accessor for {@code clientComment}/{@code clientCancellationNote}/{@code providerComment} by
@@ -413,7 +413,7 @@ public class NotificationService {
         if (booking.getClient() == null) {
             if (PROVIDER_CANCELLATION_SMS_SOURCES.contains(booking.getBookingSource())) {
                 sendLinkGuestProviderCancellationSms(booking, "SALON_CLOSED",
-                        guestCancellationSmsText.forSalonClosed(visit.startsAt()), outboxEntryId);
+                        guestCancellationSmsText.forSalonClosed(booking, visit.startsAt()), outboxEntryId);
             } else {
                 log.debug("Skipping SALON_CLOSED notification for account-less non-LINK booking {}",
                         booking.getId());
@@ -433,9 +433,8 @@ public class NotificationService {
      * <p>Same per-visit / per-audience shape as {@link #notifySalonClosed(BookingVisit)}: takes a
      * {@link BookingVisit} (one {@code MASTER_REMOVED} row is enqueued per VISIT, D12), a
      * registered client gets email + push, a guest ({@code LINK}) visit gets the phase 390 SMS
-     * ({@link GuestProviderCancellationSmsText#forMasterRemoved}, rebook link to the salon page
-     * only), and a STAFF walk-in's unverified phone is left a
-     * silent no-op — identical gate to the salon-closure path.
+     * ({@link GuestProviderCancellationSmsText#forMasterRemoved}; phase 435: no rebook link), and a STAFF walk-in with a phone gets the same message (phase 408,
+     * {@link #PROVIDER_CANCELLATION_SMS_SOURCES}) — identical gate to the salon-closure path.
      *
      * <p>The email states the master is no longer working at this salon and the appointment was
      * cancelled — it must never imply the salon closed and must never name a replacement master
@@ -633,7 +632,7 @@ public class NotificationService {
             return;
         }
         bookingSmsDispatcher.dispatchOrThrow(BookingSmsDispatcher.Kind.GUEST_PROVIDER_RESCHEDULE, phone,
-                guestRescheduleSmsText.render(booking.getStartsAt()));
+                guestRescheduleSmsText.render(booking));
     }
 
     /**

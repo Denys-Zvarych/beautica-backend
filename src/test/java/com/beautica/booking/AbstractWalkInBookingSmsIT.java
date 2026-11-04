@@ -261,7 +261,7 @@ abstract class AbstractWalkInBookingSmsIT extends AbstractStaffBookingIT {
                 .noneMatch(line -> line.contains(subscriberDigits))
                 .as("the rendered body carries the client's appointment details (Anti-Bug §I)")
                 .noneMatch(line -> line.contains(SERVICE_NAME))
-                .noneMatch(line -> line.contains("Запис підтверджено"))
+                .noneMatch(line -> line.contains("запис підтверджено"))
                 .noneMatch(line -> line.contains("Нагадуємо"))
                 .noneMatch(line -> line.contains("Нікому не кажіть"));
     }
@@ -395,6 +395,16 @@ abstract class AbstractWalkInBookingSmsIT extends AbstractStaffBookingIT {
     // two-occurrence threshold). Behaviour is unchanged for the original caller.
 
     /** The single Turbosms message text — fails unless exactly one provider call was made. */
+    /**
+     * Phase 435 — the start of a reminder for the fixture SALON booking (salon variant), up to the service name:
+     * {@code day} is «завтра» (24h) or «сьогодні» (2h). The fixture salon has no address, so the «Адреса:» line
+     * is dropped and the text ends with « о HH:mm».
+     */
+    protected String salonReminderPrefix(String day) {
+        return "Beautica: Нагадуємо, що " + day + " у Вас запис!\n\n"
+                + fixtureSalonName(salon.salonId()) + " | " + MASTER_NAME + " | ";
+    }
+
     protected String sentText() throws Exception {
         List<LoggedRequest> requests = TURBOSMS.findAll(postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
         assertThat(requests).as("exactly one SMS").hasSize(1);
@@ -403,14 +413,33 @@ abstract class AbstractWalkInBookingSmsIT extends AbstractStaffBookingIT {
 
     /** Creates a guest booking, drains its own NEW_BOOKING, and clears the confirmation SMS. */
     protected UUID createGuestBookingAndSettle(OffsetDateTime startsAt) {
-        assertThat(createGuestBooking(startsAt).getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        return createGuestBookingSettled(startsAt).id();
+    }
+
+    /**
+     * Phase 435 — a public-route create, drained and cleared, plus the guest's own page link ({@code cancelUrl}) the
+     * create returned. The row carries the V230 sealed token, so provider SMS append «Деталі або записатись знову
+     * {cancelUrl}».
+     */
+    protected record SettledGuest(UUID id, String cancelUrl) {}
+
+    /** As {@link #createGuestBookingAndSettle}, keeping the returned {@code cancelUrl}. */
+    protected SettledGuest createGuestBookingSettled(OffsetDateTime startsAt) {
+        ResponseEntity<String> resp = createGuestBooking(startsAt);
+        assertThat(resp.getStatusCode()).as("guest create body=%s", resp.getBody()).isEqualTo(HttpStatus.CREATED);
+        String cancelUrl = guestPageUrlOf(resp);
         settleDrainWorker.drain();
         resetTurbosms();
-        return (UUID) onlyBooking().get("id");
+        return new SettledGuest((UUID) onlyBooking().get("id"), cancelUrl);
     }
 
     /** Creates an N-service guest visit through the public route, drains, clears the SMS; returns the visit id. */
     protected UUID createGuestVisitAndSettle(OffsetDateTime startsAt, List<UUID> masterServiceIds) {
+        return createGuestVisitSettled(startsAt, masterServiceIds).id();
+    }
+
+    /** As {@link #createGuestVisitAndSettle}, keeping the returned {@code cancelUrl}; {@code id} is the visit id. */
+    protected SettledGuest createGuestVisitSettled(OffsetDateTime startsAt, List<UUID> masterServiceIds) {
         String ids = masterServiceIds.stream().map(id -> "\"" + id + "\"").reduce((a, b) -> a + "," + b).orElseThrow();
         String body = """
                 {"masterServiceIds":[%s],"startsAt":"%s","name":"%s","surname":"%s","privacyAccepted":true,"privacyPolicyVersion":"2026-10-20"}
@@ -418,10 +447,18 @@ abstract class AbstractWalkInBookingSmsIT extends AbstractStaffBookingIT {
         ResponseEntity<String> resp = restTemplate.exchange("/api/v1/book/" + salon.bookingSlug() + "/booking",
                 HttpMethod.POST, new HttpEntity<>(body, guestBookingHeaders()), String.class);
         assertThat(resp.getStatusCode()).as("guest visit create body=%s", resp.getBody()).isEqualTo(HttpStatus.CREATED);
+        String cancelUrl = guestPageUrlOf(resp);
         settleDrainWorker.drain();
         resetTurbosms();
-        return jdbcTemplate.queryForObject(
-                "SELECT DISTINCT appointment_id FROM bookings WHERE appointment_id IS NOT NULL", UUID.class);
+        return new SettledGuest(jdbcTemplate.queryForObject(
+                "SELECT DISTINCT appointment_id FROM bookings WHERE appointment_id IS NOT NULL", UUID.class), cancelUrl);
+    }
+
+    /** The guest's own page link ({@code /book/cancel/{token}}) from a public-route create response. */
+    protected String guestPageUrlOf(ResponseEntity<String> created) {
+        String url = readJson(created.getBody()).path("cancelUrl").asText();
+        assertThat(url).as("create response cancelUrl").matches("^https?://.+/c/[0-9A-Za-z]{16}$");
+        return url;
     }
 
     /**

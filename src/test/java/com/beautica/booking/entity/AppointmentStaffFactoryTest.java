@@ -1,5 +1,6 @@
 package com.beautica.booking.entity;
 
+import com.beautica.booking.domain.GuestCancelToken;
 import com.beautica.TestConstants;
 import com.beautica.booking.enums.BookingSource;
 import com.beautica.booking.enums.BookingStatus;
@@ -50,9 +51,9 @@ class AppointmentStaffFactoryTest {
         UUID token = UUID.fromString("22222222-2222-2222-2222-222222222222");
 
         Appointment appointment = Appointment.staffAppointment(
-                null, "Олена", "Коваль", "+380501234567", token, STAFF_ID);
+                null, "Олена", "Коваль", "+380501234567", GuestCancelToken.of(token), STAFF_ID);
 
-        assertThat(appointment.getCancelToken()).isEqualTo(token);
+        assertThat(appointment.getCancelToken()).isEqualTo(GuestCancelToken.of(token));
         assertThat(appointment.getCancelTokenHash())
                 .isEqualTo(com.beautica.booking.domain.CancelTokenHasher.hash(token));
         assertThat(appointment.getBookingSource()).isEqualTo(BookingSource.STAFF);

@@ -10,6 +10,7 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 
 import com.beautica.booking.domain.CancelTokenHasher;
+import com.beautica.booking.domain.GuestCancelToken;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.auth.phoneotp.GuestTokenProvider;
 import com.beautica.booking.dto.AvailableSlotResponse;
@@ -345,7 +346,7 @@ class GuestVisitLinkParityIT extends AbstractIntegrationTest {
         String token = created.cancelUrl().substring(created.cancelUrl().lastIndexOf('/') + 1);
         assertThat(row.get("cancel_token_hash"))
                 .as("V206: the row stores only the SHA-256 of the token handed to the guest")
-                .isEqualTo(CancelTokenHasher.hash(UUID.fromString(token)));
+                .isEqualTo(CancelTokenHasher.hash(GuestCancelToken.valueOf(token)));
         ResponseEntity<Void> cancelResp = restTemplate.exchange(
                 "/api/v1/book/cancel/" + token, HttpMethod.POST, new HttpEntity<>(xffHeaders()), Void.class);
         assertThat(cancelResp.getStatusCode())
