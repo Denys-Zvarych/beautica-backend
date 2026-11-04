@@ -1,5 +1,7 @@
 package com.beautica.booking.service;
 
+import com.beautica.booking.crypto.GuestCancelTokenCipher;
+import com.beautica.booking.domain.GuestSmsProviderText;
 import com.beautica.booking.domain.MasterBookability;
 import com.beautica.booking.dto.AppointmentDetailResponse;
 import com.beautica.booking.dto.StaffBookingCommand;
@@ -15,7 +17,6 @@ import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.util.Placeholders;
 import com.beautica.common.util.UkrainianPhoneNormalizer;
-import com.beautica.common.util.UkrainianPlurals;
 import com.beautica.config.BookingSmsProperties;
 import com.beautica.location.DiscoveryLocationResolver.DiscoveryLabels;
 import com.beautica.master.entity.Master;
@@ -23,7 +24,6 @@ import com.beautica.master.repository.MasterRepository;
 import com.beautica.notification.inapp.entity.InAppNotificationType;
 import com.beautica.notification.inapp.service.InAppNotificationService;
 import com.beautica.salon.entity.Salon;
-import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.service.SalonCatalogCacheEvictor;
 import com.beautica.user.User;
 import lombok.RequiredArgsConstructor;
@@ -37,8 +37,10 @@ import java.time.Duration;
 import java.time.OffsetDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 
 /**
@@ -143,6 +145,7 @@ public class StaffBookingService {
     /** Kyiv civil date rendered for the client, matching {@code GuestBookingService}'s SMS copy. */
     private static final DateTimeFormatter DATE_FMT = DateTimeFormatter.ofPattern("dd.MM.yyyy");
     private static final DateTimeFormatter TIME_FMT = DateTimeFormatter.ofPattern("HH:mm");
+    private static final String SALON_NAME = "salonName";
 
     private final MasterRepository masterRepository;
     private final BookingRepository bookingRepository;
@@ -166,6 +169,8 @@ public class StaffBookingService {
     private final InAppNotificationService inAppNotificationService;
     /** Phase 412 D3 — the walk-in's {@code /book/cancel/{token}} link, the same page a LINK guest uses. */
     private final GuestCancelUrlBuilder guestCancelUrlBuilder;
+    /** Phase 435 — seals the walk-in's visit token (V230) so later guest SMS can link the guest's own page. */
+    private final GuestCancelTokenCipher guestCancelTokenCipher;
 
     /**
      * Per-recipient ceiling on walk-in confirmation SMS, mirroring {@code PhoneOtpService}'s
@@ -304,19 +309,10 @@ public class StaffBookingService {
         // the 3s lock_timeout the whole transaction then inherits.
         assertWalkInSmsBudgetForPhone(guestPhone);
 
-        // Read-only enrichment work HOISTED ABOVE the per-master lock (perf LOW, 2026-08-22). Both
-        // resolutions below are pure reads that need no lock, and both used to run after it — the
-        // platform service name is one lazy `service_types` load and the discovery labels are two
-        // SELECTs, so ~3 round-trips of lock-irrelevant work sat inside the window every other
-        // request against this master queues on. Nothing here depends on the lock's outcome, and
-        // both inputs (`items` from the planner, `master` with its user + salon JOIN FETCHed) are
-        // already resolved and managed at this point, so this is a pure move.
-        //
-        // Only the FIRST item's platform name is resolved (perf MEDIUM, 2026-08-20):
-        // visitServiceNamePhrase never reads past index 0, so resolving all N would issue N-1
-        // wasted `service_types` lazy loads. `items.size()` stands in for the discarded remainder.
-        String firstServiceName =
-                platformServiceName(items.get(0).masterService().getServiceDefinition());
+        // Read-only enrichment work HOISTED ABOVE the per-master lock (perf LOW, 2026-08-22): the
+        // discovery labels are two SELECTs of lock-irrelevant work, so they run before the window every
+        // other request against this master queues on. Phase 435 dropped the service name from the
+        // walk-in SMS, so the platform service-name lookup that used to sit here is gone.
         // Same locality rule AppointmentService#enrich applies (booked salon wins, else the master's
         // own user row), resolved through that class's own helper rather than a second copy here —
         // `master.getSalon()` IS the instance handed into every Booking.staffBooking(...) below, and
@@ -362,20 +358,23 @@ public class StaffBookingService {
         // no_overlapping_bookings violation on ANY item maps to the identical 409 — no partial visit
         // is ever persisted (atomic, one transaction).
         appointmentRepository.save(appointment);
+        // Phase 435 — the header's reversible token copy (V230). Audit-fix: sealed once persist assigned the header id,
+        // which is the AES-GCM associated data ("appointments:<id>"); written with the header at the flush below.
+        appointment.attachSealedCancelToken(guestCancelTokenCipher.seal(
+                cancelToken, GuestCancelTokenCipher.Row.appointment(appointment.getId())));
         List<Booking> saved = BookingSlotLockGuard.saveOrConflict(bookingRepository, bookings);
 
         // ONCE per visit, not once per item: all N rows share one master and one salon, so N calls
         // would evict the same two keys N times for nothing.
         registerSlotEviction(master.getId(), salonIdOf(saved.get(0)));
         registerInAppFeedNotification(appointment, saved.get(0), actorId);
-        // Rendered NOW, inside the transaction, while `master` and `items` are still managed — the
-        // callback runs after the persistence context closes, so touching a lazy association from
-        // there would be a LazyInitializationException. EXACTLY ONE SMS for the whole visit, naming
-        // the first service and counting the rest (Phase 22.13). `firstServiceName` was resolved
-        // above the master lock; the rendering itself is pure string work.
+        // Rendered NOW, inside the transaction, while `master` is still managed — the callback runs
+        // after the persistence context closes, so touching a lazy association from there would be a
+        // LazyInitializationException. EXACTLY ONE SMS for the whole visit (Phase 22.13); since phase
+        // 435 it names no service at all, only the visit start and the master.
         registerWalkInConfirmationSms(
                 guestPhone,
-                buildWalkInConfirmationSms(master, firstServiceName, items.size(), firstStart, lastEnd,
+                buildWalkInConfirmationSms(master, firstStart, lastEnd,
                         guestCancelUrlBuilder.build(cancelToken)));
 
         // REUSE-FIRST (Phase 22.14): the visit-detail enrichment is AppointmentService#enrich's job,
@@ -594,36 +593,32 @@ public class StaffBookingService {
      *
      * <p>{@link Placeholders#format} rather than chained {@link String#replace} for the reason
      * documented on {@code GuestBookingService#buildConfirmationSms}: sequential replacement
-     * re-scans values it has already substituted, so a provider who names a service
-     * {@code "Манікюр {time}"} could rewrite the rest of a message the client reads as platform
-     * copy. A single pass copies substituted values out verbatim, so data can never become markup.
+     * re-scans values it has already substituted. A single pass copies substituted values out
+     * verbatim, so data can never become markup.
      *
      * <p>{@code date}/{@code time} render {@code startsAt} — the Kyiv civil values of the VISIT's own
-     * start, {@code firstStart}, never a later item's. That is unchanged at N = 1 (byte-identical to
-     * the pre-22.13 rendering — the walk-in template carries no end-time placeholder, mirroring
-     * {@code GuestBookingService}'s own multi-service confirmation, which likewise never renders an
-     * end time). {@code endsAt} is still accepted and validated here — the caller MUST pass
-     * {@code lastEnd} (the visit's own {@code [firstStart, lastEnd)} span), never
-     * {@code items.get(0).endsAt()} — so a future template that surfaces the visit's finish time
+     * start, {@code firstStart}, never a later item's. {@code endsAt} is still accepted and validated
+     * here — the caller MUST pass {@code lastEnd} (the visit's own {@code [firstStart, lastEnd)} span),
+     * never {@code items.get(0).endsAt()} — so a future template that surfaces the visit's finish time
      * cannot silently inherit a wrong value from this method's call sites.
      *
-     * <p>{@code firstServiceName} is the PLATFORM name of the visit's first item, in performance
-     * order — see {@link #platformServiceName}. {@code totalServiceCount} is the visit's item count
-     * ({@code items.size()}, never re-derived from a materialised name list). {@link
-     * #visitServiceNamePhrase} collapses the pair to "first service, count the rest" (D3): a
-     * single-service visit renders the bare name, unchanged; an N ≥ 2 visit appends «та ще N
-     * послуг(и)» via {@link UkrainianPlurals}, never the full list — the same space/segment-budget
-     * rule {@code GuestBookingService#visitSmsServiceName} already applies to the client-facing
-     * confirmation.
+     * <p><b>Phase 435 — no service name.</b> The copy (user decision 2026-11-04) is date/time, master
+     * and cancel link only, so no {@code serviceName} is substituted: the platform-name lookup and the
+     * «та ще N послуг(и)» phrase that used to feed it are gone. This also closes the provider-text
+     * channel the platform name existed to narrow (security LOW, 2026-08-19) — no service text of any
+     * kind reaches a phone that never opted in.
      *
-     * <p>Only the FIRST item's name is ever resolved by the caller (perf MEDIUM, 2026-08-20): this
-     * method never reads past the first name, so a fully-materialised {@code List<String>} of every
-     * item's platform name would cost N−1 wasted {@code service_types} lazy loads for a value this
-     * method discards.
+     * <p>{@code masterName} is narrowed by {@code @NoDigits} plus the no-control-character pattern on every
+     * registration DTO, which still admits dots ({@code t.me/promo}). It is capped to
+     * {@link GuestSmsProviderText#MAX_PERSON_NAME} chars and, since audit-fix cycle 2, DROPPED when it looks like a
+     * URL: the SMS then has no «Майстер …» line (salon variant: «Салон {salonName}.»).
+     *
+     * <p>Phase 435 — a SALON walk-in uses the salon variant, which also names the salon (the salon the visit is
+     * booked at, {@code master.getSalon()}). Audit-fix: the salon name goes through {@link GuestSmsProviderText} —
+     * one line, ≤ 40 chars, and DROPPED (independent-master copy instead) when it looks like a URL/domain.
      */
     private String buildWalkInConfirmationSms(
-            Master master, String firstServiceName, int totalServiceCount,
-            OffsetDateTime startsAt, OffsetDateTime endsAt, String cancelUrl) {
+            Master master, OffsetDateTime startsAt, OffsetDateTime endsAt, String cancelUrl) {
         if (endsAt.isBefore(startsAt)) {
             // Defensive invariant, never client-triggered: VisitPlanner#assertContiguous already
             // guarantees lastEnd >= firstStart for any chain that reaches this method.
@@ -631,67 +626,22 @@ public class StaffBookingService {
                     "Visit end precedes its own start");
         }
         OffsetDateTime kyiv = startsAt.atZoneSameInstant(TimeZones.KYIV).toOffsetDateTime();
-        return Placeholders.format(smsProperties.getSms().getWalkInConfirmation(), Map.of(
-                "masterName", masterName(master),
-                "serviceName", visitServiceNamePhrase(firstServiceName, totalServiceCount),
-                "date", DATE_FMT.format(kyiv),
-                "time", TIME_FMT.format(kyiv),
-                "cancelUrl", cancelUrl));
-    }
-
-    /**
-     * D3's "name the first service, count the rest": {@code ("Манікюр", 1)} → {@code "Манікюр"}
-     * (byte-identical to the pre-22.13 single-service rendering); {@code ("Манікюр", 3)} →
-     * {@code "Манікюр та ще 2 послуги"}. Mirrors {@code GuestBookingService#visitSmsServiceName}'s
-     * shape exactly (first name + count of the rest, never the full list) — REUSE of the pattern, not
-     * a fork, since the two methods differ only in WHICH name source they read (platform taxonomy
-     * here, provider-custom there).
-     *
-     * <p>{@link UkrainianPlurals#servicesPhrase}, not hand-rolled pluralisation: Ukrainian numeral
-     * agreement is one/few/many, so a naive {@code " та ще " + n + " послуги"} is wrong for both 5
-     * ("послуг") and 1 (which never reaches this branch — see below).
-     */
-    private static String visitServiceNamePhrase(String firstServiceName, int totalServiceCount) {
-        int remaining = totalServiceCount - 1;
-        if (remaining <= 0) {
-            return firstServiceName;
+        BookingSmsProperties.Sms sms = smsProperties.getSms();
+        Map<String, String> values = new HashMap<>();
+        // Audit-fix: provider text via GuestSmsProviderText — salon name capped, dropped when URL-like (→ the
+        // independent-master copy), master name capped and dropped when URL-like (→ no master segment); the whole SMS
+        // capped (salon dropped first if over).
+        if (master.getSalon() != null) {
+            GuestSmsProviderText.salonName(master.getSalon().getName())
+                    .ifPresent(name -> values.put(SALON_NAME, name));
         }
-        return firstServiceName + " та ще " + UkrainianPlurals.servicesPhrase(remaining);
-    }
-
-    /**
-     * The PLATFORM-curated Ukrainian display name of the booked service type — deliberately NOT
-     * {@link ServiceDefinition#getName()} (security LOW, 2026-08-19).
-     *
-     * <h4>Why the custom name may not go into this message</h4>
-     * A walk-in confirmation is the one piece of Beautica copy that reaches a phone which never
-     * opted in: the number is typed by the provider, and the recipient's only signal that the
-     * message is legitimate is the branding. {@code ServiceDefinition.name} is a self-registered
-     * provider's free text — {@code CreateServiceDefinitionRequest} accepts 100 characters of any
-     * non-control string — so a hostile account could put its own call to action into a branded SMS
-     * and, at the per-account rate limit, address it to hundreds of distinct strangers an hour once
-     * {@code app.booking.sms.enabled} flips at release. {@link Placeholders#format} stops that value
-     * from becoming template MARKUP; it cannot stop the value from BEING the payload.
-     *
-     * <p>{@code ServiceType.nameUk} closes the channel outright rather than filtering it: the
-     * taxonomy is platform-authored (created through the internal service-type endpoints, not by
-     * providers), so nothing an account controls reaches the wire. It is also what the provider
-     * would have got anyway — {@code ServiceCatalogService#resolveCreateName} already defaults a
-     * blank custom name to exactly this string.
-     *
-     * <p>Reading it costs one extra lazy load, taken INSIDE the transaction with the assignment
-     * still managed. Both hops are non-null by schema ({@code service_type_id} is NOT NULL with an
-     * {@code optional = false} {@code @ManyToOne}; {@code name_uk} is NOT NULL), so no fallback is
-     * reachable and none is written — a silent fallback to the custom name would re-open the vector
-     * for exactly the rows an attacker can create.
-     *
-     * <p>Not applied to {@code masterName}: a provider's own name is required content the client
-     * needs in order to recognise the booking, and it is already narrowed by {@code @NoDigits} plus
-     * the no-control-character pattern on every registration DTO. Removing it is a product decision,
-     * not a hardening one.
-     */
-    private static String platformServiceName(ServiceDefinition definition) {
-        return definition.getServiceType().getNameUk();
+        GuestSmsProviderText.masterName(masterName(master)).ifPresent(name -> values.put("masterName", name));
+        values.put("date", DATE_FMT.format(kyiv));
+        values.put("time", TIME_FMT.format(kyiv));
+        values.put("cancelUrl", cancelUrl);
+        return GuestSmsProviderText.render(
+                master.getSalon() != null ? sms.getWalkInConfirmationSalon() : null,
+                sms.getWalkInConfirmation(), values, Set.of(), Set.of());
     }
 
     /**

@@ -139,7 +139,7 @@ class PhoneOtpSendHttpIT extends AbstractIntegrationTest {
         String sms = text.getValue();
         String code = sms.replaceAll("(?s).*?(\\d{6}).*", "$1");
         assertThat(sms)
-                .startsWith("Код Beautica: " + code + ". Нікому не кажіть.")
+                .startsWith("Beautica: Ваш код " + code + ". Нікому не кажіть.")
                 .endsWith("\n\n@" + OTP_DOMAIN + " #" + code);
         assertThat(sms.lines().reduce((first, second) -> second).orElseThrow())
                 .as("the origin-bound line must be the final line (WebOTP / Apple domain-bound codes)")

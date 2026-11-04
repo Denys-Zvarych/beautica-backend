@@ -81,7 +81,7 @@ class ReviewInviteSendJobIT extends AbstractReviewInviteIT {
         assertThat(requests).hasSize(1);
         String text = payload(requests.get(0)).path("sms").path("text").asText();
         assertThat(payload(requests.get(0)).path("recipients").get(0).asText()).isEqualTo(GUEST_PHONE);
-        assertThat(text).startsWith("Оцініть ваш візит: beautica.app/r/").hasSize(56);
+        assertThat(text).startsWith("Beautica: Дякуємо, що обрали наш сервіс. Залиште свій відгук про Ваш візит!\n\nhttps://beautica.app/r/").hasSize(122);
         String token = text.substring(text.lastIndexOf('/') + 1);
         assertThat(token).matches("[A-Za-z0-9_-]{22}");
 
@@ -307,7 +307,7 @@ class ReviewInviteSendJobIT extends AbstractReviewInviteIT {
         assertThat(requests).hasSize(1);
         String text = payload(requests.get(0)).path("sms").path("text").asText();
         assertThat(payload(requests.get(0)).path("recipients").get(0).asText()).isEqualTo(GUEST_PHONE);
-        assertThat(text).startsWith("Оцініть ваш візит: beautica.app/r/").hasSize(56);
+        assertThat(text).startsWith("Beautica: Дякуємо, що обрали наш сервіс. Залиште свій відгук про Ваш візит!\n\nhttps://beautica.app/r/").hasSize(122);
         Map<String, Object> row = inviteRow(inviteId);
         assertThat(row.get("status")).isEqualTo("SENT");
         assertThat((byte[]) row.get("token_hash"))

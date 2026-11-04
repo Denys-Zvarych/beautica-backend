@@ -105,6 +105,9 @@ app:
   outbox:
     # Local dev only — never use in prod. Generate prod value with: openssl rand -base64 32
     payload-key: ${OUTBOX_PAYLOAD_KEY}
+  guest-cancel-token:
+    # Local dev only (committed on purpose; GuestCancelTokenKeyDevGuard refuses it outside local/test).
+    key: ${GUEST_CANCEL_TOKEN_KEY:XWr8dDi+di4G1u+XHkTbsBdNmx/OGugrJzLpKJ3T4+E=}
   booking:
     sms:
       # Phase 22.7 — restated here, not inherited, so a developer reading only the local profile

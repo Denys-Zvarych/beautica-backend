@@ -26,8 +26,8 @@ class DeploymentPropertiesOtpDomainTest {
     @ParameterizedTest
     @ValueSource(strings = {"https://x", "x:8080", "beautica.app/book", "BEAUTICA.APP", "beautica",
             "beautica..app", "beautica_app.ua", "a-very-long-staging.beautica.app",
-            "staging.beautica.app", "stage1.beautica.app"})
-    @DisplayName("non-bare or over-18-char host fails context startup")
+            "staging.beautica.app", "stage1.beautica.app", "stg.beautica.app"})
+    @DisplayName("non-bare or over-14-char host fails context startup")
     void should_failBoot_when_otpDomainNotBareHost(String host) {
         runner.withPropertyValues("beautica.sms.otp-domain=" + host).run(context -> {
             assertThat(context).hasFailed();
@@ -45,7 +45,7 @@ class DeploymentPropertiesOtpDomainTest {
     }
 
     @Test
-    @DisplayName("exactly 18-char host binds (boundary)")
+    @DisplayName("exactly 14-char host binds (boundary)")
     void should_bindHost_when_otpDomainAtMaximumLength() {
         String longestHost = "a".repeat(OtpDomainRules.MAX_HOST_LENGTH - 4) + ".app";
 

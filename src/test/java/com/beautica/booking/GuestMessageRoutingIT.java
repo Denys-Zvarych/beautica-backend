@@ -167,8 +167,8 @@ class GuestMessageRoutingIT extends AbstractWalkInBookingSmsIT {
         reminderJob.sweepTwoHour();
 
         assertThat(telegramTexts()).containsExactly(
-                "Beautica: Нагадуємо!\n" + SERVICE_NAME + " у " + MASTER_NAME + "\nЗавтра о " + kyivTime(in24h),
-                "Beautica: Нагадуємо!\n" + SERVICE_NAME + " у " + MASTER_NAME + "\nСьогодні о " + kyivTime(in2h));
+                salonReminderPrefix("завтра") + SERVICE_NAME + " о " + kyivTime(in24h),
+                salonReminderPrefix("сьогодні") + SERVICE_NAME + " о " + kyivTime(in2h));
         assertThat(telegramRequests()).allSatisfy(r ->
                 assertThat(json(r).path("chat_id").asLong()).isEqualTo(ALLOWED_CHAT));
         TURBOSMS.verify(0, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
@@ -201,7 +201,7 @@ class GuestMessageRoutingIT extends AbstractWalkInBookingSmsIT {
         reminderJob.sweepTwoHour();
 
         assertThat(sentText()).isEqualTo(
-                "Beautica: Нагадуємо!\n" + SERVICE_NAME + " у " + MASTER_NAME + "\nСьогодні о " + kyivTime(in2h));
+                salonReminderPrefix("сьогодні") + SERVICE_NAME + " о " + kyivTime(in2h));
         assertThat(telegramRequests()).isEmpty();
     }
 
@@ -229,7 +229,7 @@ class GuestMessageRoutingIT extends AbstractWalkInBookingSmsIT {
         reminderJob.sweepTwoHour();
 
         assertThat(telegramRequests()).hasSize(1);
-        assertThat(sentText()).contains("Сьогодні о");
+        assertThat(sentText()).contains("що сьогодні у Вас запис");
         assertThat(jdbcTemplate.queryForObject("SELECT status FROM telegram_links", String.class))
                 .isEqualTo("BLOCKED");
         assertThat(logMessages()).noneMatch(line -> line.contains("bot was blocked by the user"));
@@ -239,7 +239,7 @@ class GuestMessageRoutingIT extends AbstractWalkInBookingSmsIT {
         insertLinkBooking(LINK_PHONE, at(now.plus(Duration.ofHours(24))));
         reminderJob.sendReminders();
 
-        assertThat(sentText()).contains("Завтра о");
+        assertThat(sentText()).contains("що завтра у Вас запис");
         assertThat(telegramRequests()).isEmpty();
     }
 
@@ -269,7 +269,7 @@ class GuestMessageRoutingIT extends AbstractWalkInBookingSmsIT {
         reminderJob.sweepTwoHour();
 
         assertThat(telegramRequests()).isEmpty();
-        assertThat(sentText()).contains("Сьогодні о");
+        assertThat(sentText()).contains("що сьогодні у Вас запис");
         assertThat(sentTurbosmsPayload().path("recipients").get(0).asText()).isEqualTo(STRANGER_PHONE);
         assertThat(jdbcTemplate.queryForObject("SELECT status FROM telegram_links", String.class))
                 .isEqualTo("ACTIVE");
@@ -353,12 +353,12 @@ class GuestMessageRoutingIT extends AbstractWalkInBookingSmsIT {
 
     @ParameterizedTest(name = "{0}")
     @EnumSource(value = BookingSmsDispatcher.Kind.class,
-            names = {"GUEST_CONFIRMATION", "WALK_IN_CONFIRMATION", "GUEST_CANCELLATION", "GUEST_VISIT_CANCELLATION"})
+            names = {"GUEST_CONFIRMATION", "WALK_IN_CONFIRMATION"})
     @DisplayName("unrouted kinds with an ACTIVE link → SMS only, the Bot API is never called")
     void should_sendSmsOnly_when_kindIsUnrouted(BookingSmsDispatcher.Kind kind) {
         link(LINK_PHONE, ALLOWED_CHAT);
 
-        bookingSmsDispatcher.dispatch(kind, LINK_PHONE, "Beautica: Запис підтверджено!");
+        bookingSmsDispatcher.dispatch(kind, LINK_PHONE, "Beautica: Ваш запис підтверджено!");
 
         TURBOSMS.verify(1, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
         assertThat(telegramRequests()).isEmpty();
@@ -386,7 +386,7 @@ class GuestMessageRoutingIT extends AbstractWalkInBookingSmsIT {
 
         reminderJob.sendReminders();
 
-        assertThat(telegramTexts()).singleElement().asString().contains("Завтра о");
+        assertThat(telegramTexts()).singleElement().asString().contains("що завтра у Вас запис");
         assertThat(json(telegramRequests().get(0)).path("chat_id").asLong()).isEqualTo(ALLOWED_CHAT);
         TURBOSMS.verify(0, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
 
@@ -397,7 +397,7 @@ class GuestMessageRoutingIT extends AbstractWalkInBookingSmsIT {
         reminderJob.sendReminders();
 
         assertThat(telegramRequests()).as("one Telegram attempt, answered 403").hasSize(1);
-        assertThat(sentText()).as("the same reminder falls back to SMS").contains("Завтра о");
+        assertThat(sentText()).as("the same reminder falls back to SMS").contains("що завтра у Вас запис");
         assertThat(linkStatusAndChat()).isEqualTo("BLOCKED/" + ALLOWED_CHAT);
 
         resetTurbosms();
@@ -407,7 +407,7 @@ class GuestMessageRoutingIT extends AbstractWalkInBookingSmsIT {
 
         reminderJob.sendReminders();
 
-        assertThat(sentText()).contains("Завтра о");
+        assertThat(sentText()).contains("що завтра у Вас запис");
         assertThat(telegramRequests()).as("a BLOCKED link is never tried again").isEmpty();
         assertNoPiiInLogs(LINK_PHONE, LINK_SUBSCRIBER_DIGITS);
     }
@@ -553,14 +553,14 @@ class GuestMessageRoutingIT extends AbstractWalkInBookingSmsIT {
         drainWorker.drain();
 
         assertThat(created.getStatusCode()).as("body=%s", created.getBody()).isEqualTo(HttpStatus.CREATED);
-        assertThat(sentText()).startsWith("Beautica: Запис підтверджено!").contains("/book/cancel/");
+        assertThat(sentText()).startsWith("Beautica: Ваш запис підтверджено!").contains("/book/cancel/");
         assertThat(telegramRequests()).isEmpty();
     }
 
     @Test
-    @DisplayName("always-SMS at IT level: the guest's own cancellation (public cancel link) with an ACTIVE link → "
-            + "one SMS, no Bot API call")
-    void should_sendGuestCancellationBySmsOnly_when_phoneLinked() throws Exception {
+    @DisplayName("the guest's own cancellation (public cancel link) with an ACTIVE link → no guest message at all "
+            + "(phase 435, user decision 2026-11-04): zero SMS, no Bot API call")
+    void should_sendNoGuestMessage_when_guestCancelsWithPhoneLinked() throws Exception {
         link(LINK_PHONE, ALLOWED_CHAT);
         ResponseEntity<String> created = createGuestBooking(tomorrowKyivAt(12));
         assertThat(created.getStatusCode()).as("body=%s", created.getBody()).isEqualTo(HttpStatus.CREATED);
@@ -577,7 +577,7 @@ class GuestMessageRoutingIT extends AbstractWalkInBookingSmsIT {
         drainWorker.drain();
 
         assertThat(cancelled.getStatusCode().is2xxSuccessful()).as("body=%s", cancelled.getBody()).isTrue();
-        TURBOSMS.verify(1, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
+        TURBOSMS.verify(0, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
         assertThat(telegramRequests()).isEmpty();
     }
 

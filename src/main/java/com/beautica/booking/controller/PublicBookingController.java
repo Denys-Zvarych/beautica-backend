@@ -263,9 +263,9 @@ public class PublicBookingController {
     }
 
     /**
-     * Cancel-page info for a one-time cancel token (Phase 13.4). 404 when the token is
-     * unknown, already consumed, or the booking is no longer {@code CONFIRMED} — no
-     * information is leaked about which condition held. {@code token} is a
+     * Guest booking page info for a cancel token (Phase 13.4). Phase 435: a booking that is
+     * no longer {@code CONFIRMED} returns a read-only view ({@code status}, {@code cancellable=false})
+     * instead of 404; 404 remains for an unknown, guest-consumed or anonymised token. {@code token} is a
      * {@link UUID} {@code @PathVariable}: Spring's converter returns 400 on a malformed
      * value before this method runs, so no manual format validation is needed.
      */

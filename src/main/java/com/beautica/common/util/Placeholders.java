@@ -55,4 +55,78 @@ public final class Placeholders {
         matcher.appendTail(rendered);
         return rendered.toString();
     }
+
+    /** Three or more consecutive line breaks — what dropping a paragraph leaves behind. */
+    private static final Pattern EXTRA_BLANK_LINES = Pattern.compile("\n{3,}");
+
+    /**
+     * Phase 435 — {@link #format} for templates with OPTIONAL lines: every template line holding a placeholder in
+     * {@code optional} whose value is {@code null} or blank is removed before rendering (so it never renders as a
+     * literal {@code {key}} or a dangling label such as «Адреса: »), then the blank-line runs that removal leaves
+     * are collapsed to one blank line and leading/trailing line breaks are trimmed. Every other placeholder behaves
+     * exactly as in {@link #format} — still ONE pass, so a substituted value never becomes markup.
+     *
+     * <p>Values are copied verbatim: a caller substituting free text that may hold line breaks must flatten it
+     * first, or the value could forge extra lines in a platform-branded message.
+     *
+     * @param optional placeholder names (without braces) whose line is dropped when the value is absent
+     */
+    public static String formatDroppingEmptyLines(String template, Map<String, String> values,
+                                                  java.util.Set<String> optional) {
+        if (template == null) {
+            return null;
+        }
+        StringBuilder kept = new StringBuilder(template.length());
+        for (String line : template.split("\n", -1)) {
+            if (!holdsAbsentOptional(line, values, optional)) {
+                kept.append(line).append('\n');
+            }
+        }
+        String rendered = format(kept.substring(0, Math.max(0, kept.length() - 1)), values);
+        return trimLineBreaks(EXTRA_BLANK_LINES.matcher(rendered).replaceAll("\n\n"));
+    }
+
+    private static boolean holdsAbsentOptional(String line, Map<String, String> values, java.util.Set<String> optional) {
+        Matcher matcher = PLACEHOLDER.matcher(line);
+        while (matcher.find()) {
+            String key = matcher.group(1);
+            String value = values.get(key);
+            if (optional.contains(key) && (value == null || value.isBlank())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static String trimLineBreaks(String text) {
+        int start = 0;
+        int end = text.length();
+        while (start < end && text.charAt(start) == '\n') {
+            start++;
+        }
+        while (end > start && text.charAt(end - 1) == '\n') {
+            end--;
+        }
+        return text.substring(start, end);
+    }
+
+    /**
+     * Unicode format characters (zero-width, soft hyphen, bidi overrides such as U+202E) — removed, so none reaches an
+     * SMS (audit-fix cycle 2).
+     */
+    private static final Pattern FORMAT_CHARS = Pattern.compile("\\p{Cf}");
+
+    /** Control characters, line/paragraph separators and whitespace runs. */
+    private static final Pattern CONTROL_OR_SPACE = Pattern.compile("[\\p{Cntrl}\\s\\u0085\\u2028\\u2029]+");
+
+    /**
+     * Phase 435 — provider free text (salon name, address) flattened to one line for an SMS value: every control
+     * character / line break / whitespace run becomes one space, every {@code \p{Cf}} format character is removed,
+     * trimmed; {@code null} → {@code ""}. Without it a
+     * value could forge extra lines inside a Beautica-branded message.
+     */
+    public static String singleLine(String value) {
+        return value == null ? ""
+                : CONTROL_OR_SPACE.matcher(FORMAT_CHARS.matcher(value).replaceAll("")).replaceAll(" ").trim();
+    }
 }

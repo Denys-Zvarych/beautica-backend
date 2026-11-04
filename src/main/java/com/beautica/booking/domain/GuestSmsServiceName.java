@@ -1,5 +1,6 @@
 package com.beautica.booking.domain;
 
+import com.beautica.common.util.UkrainianPlurals;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingSource;
 import com.beautica.service.entity.ServiceDefinition;
@@ -25,5 +26,23 @@ public final class GuestSmsServiceName {
         return booking.getBookingSource() == BookingSource.STAFF
                 ? definition.getServiceType().getNameUk()
                 : definition.getName();
+    }
+
+    /**
+     * Phase 435 — the reminder's {@code {serviceName}} for a whole visit: {@link #of} of the first item plus
+     * «та ще N послуг(и)» for the rest ({@code itemCount <= 1} → the bare name). Never the full list: the SMS
+     * segment budget.
+     */
+    public static String visitPhrase(Booking first, long itemCount) {
+        return visitPhrase(of(first), itemCount);
+    }
+
+    /** Audit-fix — {@link #visitPhrase(Booking, long)} over an already-resolved (e.g. length-capped) first name. */
+    public static String visitPhrase(String name, long itemCount) {
+        long remaining = itemCount - 1;
+        if (remaining <= 0) {
+            return name;
+        }
+        return name + " та ще " + UkrainianPlurals.servicesPhrase(Math.toIntExact(remaining));
     }
 }

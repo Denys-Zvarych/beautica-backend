@@ -35,7 +35,7 @@ class ReviewInvitePropertiesTest {
         assertThat(props.ttl()).isEqualTo(Duration.ofDays(14));
         assertThat(props.batchSize()).isEqualTo(50);
         assertThat(props.maxAttempts()).isEqualTo(3);
-        assertThat(props.smsText()).isEqualTo("Оцініть ваш візит: beautica.app/r/{token}");
+        assertThat(props.smsText()).isEqualTo("Beautica: Дякуємо, що обрали наш сервіс. Залиште свій відгук про Ваш візит!\n\nhttps://beautica.app/r/" + "{token}");
         assertThat(props.sendBudget()).isEqualTo(Duration.ofSeconds(10));
         assertThat(props.staffPhoneWindow()).isEqualTo(Duration.ofDays(30));
         assertThat(props.staffPhoneGlobalCap()).isEqualTo(3);
@@ -107,13 +107,14 @@ class ReviewInvitePropertiesTest {
     }
 
     @Test
-    @DisplayName("an SMS copy that would exceed one UCS-2 segment with the 22-char token fails the boot")
+    @DisplayName("an SMS copy that would exceed two UCS-2 segments (134) with the 22-char token fails the boot")
     void should_failBinding_when_smsTextTooLong() {
-        String text = "Оцініть, будь ласка, ваш нещодавній візит тут: beautica.app/r/{token}";
+        // 98 + "beautica.app/r/" (15) + 22-char token = 135 chars rendered — one past two segments
+        String text = "ж".repeat(98) + " beautica.app/r/{token}".substring(1);
 
         assertThatThrownBy(() -> bind(Map.of(PREFIX + ".sms-text", text)))
                 .isInstanceOf(BindException.class)
-                .rootCause().hasMessageContaining("one UCS-2 segment is 70");
+                .rootCause().hasMessageContaining("two UCS-2 segments are 134");
     }
 
     @Test

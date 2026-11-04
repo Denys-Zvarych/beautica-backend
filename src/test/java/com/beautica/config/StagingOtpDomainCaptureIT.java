@@ -42,10 +42,10 @@ import static org.mockito.Mockito.when;
 @DisplayName("prod,staging + OTP_SMS_DOMAIN — captured guest OTP SMS carries the origin-bound last line (Phase 389 QA)")
 class StagingOtpDomainCaptureIT extends AbstractStagingProfileIT {
 
-    static final String STAGING_HOST = "stg.beautica.app";
+    static final String STAGING_HOST = "s.beautica.app";
 
     private static final Pattern BODY = Pattern.compile(
-            "Код Beautica: (\\d{6})\\. Нікому не кажіть\\.\n\n@" + Pattern.quote(STAGING_HOST) + " #(\\d{6})");
+            "Beautica: Ваш код (\\d{6})\\. Нікому не кажіть\\.\n\n@" + Pattern.quote(STAGING_HOST) + " #(\\d{6})");
 
     @Autowired
     private TestRestTemplate restTemplate;
@@ -86,7 +86,7 @@ class StagingOtpDomainCaptureIT extends AbstractStagingProfileIT {
     }
 
     @Test
-    @DisplayName("captured OTP body is exactly the two-paragraph template, final line `@stg.beautica.app #code`, same code twice")
+    @DisplayName("captured OTP body is exactly the two-paragraph template, final line `@s.beautica.app #code`, same code twice")
     void should_captureExactDomainBoundBody_when_otpSmsDomainSetViaStagingPlaceholder() throws Exception {
         String phone = randomPhone();
 
@@ -105,7 +105,7 @@ class StagingOtpDomainCaptureIT extends AbstractStagingProfileIT {
         assertThat(mail.getRecipients(Message.RecipientType.TO)[0].toString())
                 .isEqualTo("sms" + phone + "@sms.staging.invalid");
         assertThat(mail.getSubject()).as("subject is the flattened first line, never the raw CR/LF text")
-                .startsWith("[SMS] Код Beautica: " + m.group(1) + ". Нікому не кажіть.")
+                .startsWith("[SMS] Beautica: Ваш код " + m.group(1) + ". Нікому не кажіть.")
                 .doesNotContain("\n");
         assertThat(turbosmsStub().getAllServeEvents()).as("no call reached Turbosms").isEmpty();
     }

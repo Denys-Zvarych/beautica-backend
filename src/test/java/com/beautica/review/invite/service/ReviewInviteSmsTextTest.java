@@ -12,23 +12,25 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 @DisplayName("ReviewInviteSmsText — phase 400 D5")
 class ReviewInviteSmsTextTest {
 
-    private static final int ONE_UCS2_SEGMENT = 70;
+    /** Two concatenated UCS-2 segments (phase 435). */
+    private static final int TWO_UCS2_SEGMENTS = 134;
 
     private final ReviewInviteSmsText smsText = new ReviewInviteSmsText(ReviewInviteTestProperties.enabled());
     private final SecureTokenGenerator tokens =
             new SecureTokenGenerator(new OtpPepperConfig("unit-test-otp-pepper-min-32-characters!"));
 
     @Test
-    @DisplayName("exact copy, 56 chars, one UCS-2 segment, with a real 16-byte token")
+    @DisplayName("phase 435: exact copy, «Beautica:» first, https link on its own line, 122 chars (two UCS-2 segments)")
     void should_renderExactSingleSegmentText_when_realTokenIssued() {
         String token = tokens.generateToken(ReviewInviteSendService.TOKEN_BYTES);
 
         String text = smsText.render(token);
 
         assertThat(token).hasSize(22).matches("[A-Za-z0-9_-]{22}");
-        assertThat(text).isEqualTo("Оцініть ваш візит: beautica.app/r/" + token);
-        assertThat(text).hasSize(56);
-        assertThat(text.length()).isLessThanOrEqualTo(ONE_UCS2_SEGMENT);
+        assertThat(text).isEqualTo("Beautica: Дякуємо, що обрали наш сервіс. Залиште свій відгук про Ваш візит!\n\nhttps://beautica.app/r/" + token);
+        assertThat(text).hasSize(122);
+        assertThat(text.length()).isLessThanOrEqualTo(TWO_UCS2_SEGMENTS);
+        assertThat(text.substring(text.lastIndexOf('\n') + 1)).startsWith("https://");
     }
 
     @Test

@@ -57,7 +57,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 @DisplayName("Review invite — phase 400 end-to-end IT (REST completion → send job → SMS)")
 class ReviewInviteEndToEndIT extends AbstractReviewInviteIT {
 
-    private static final String REVIEW_LINK_PREFIX = "Оцініть ваш візит: beautica.app/r/";
+    private static final String REVIEW_LINK_PREFIX =
+            "Beautica: Дякуємо, що обрали наш сервіс. Залиште свій відгук про Ваш візит!\n\nhttps://beautica.app/r/";
 
     @Autowired
     private TestRestTemplate restTemplate;
@@ -319,7 +320,7 @@ class ReviewInviteEndToEndIT extends AbstractReviewInviteIT {
         assertThat(requests).as("exactly one SMS").hasSize(1);
         assertThat(payload(requests.get(0)).path("recipients").get(0).asText()).isEqualTo(phone);
         String text = payload(requests.get(0)).path("sms").path("text").asText();
-        assertThat(text).startsWith(REVIEW_LINK_PREFIX).hasSize(56);
+        assertThat(text).startsWith(REVIEW_LINK_PREFIX).hasSize(122);
         String token = text.substring(REVIEW_LINK_PREFIX.length());
         assertThat(token).matches("[A-Za-z0-9_-]{22}");
         return token;

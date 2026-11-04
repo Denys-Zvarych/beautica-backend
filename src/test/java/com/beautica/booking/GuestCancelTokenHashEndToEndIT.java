@@ -2,6 +2,7 @@ package com.beautica.booking;
 
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.auth.phoneotp.GuestTokenProvider;
+import com.beautica.booking.crypto.GuestCancelTokenCipher;
 import com.beautica.booking.dto.GuestBookingResponse;
 import com.beautica.notification.sms.SmsService;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -22,6 +23,8 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
 import java.time.Clock;
+import java.time.Duration;
+import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.util.LinkedHashMap;
@@ -48,6 +51,8 @@ class GuestCancelTokenHashEndToEndIT extends AbstractIntegrationTest {
     private static final ZoneId KYIV = ZoneId.of("Europe/Kyiv");
     private static final String GUEST_PHONE = "+380509998866";
     private static final String CANCEL_PATH = "/api/v1/book/cancel/";
+    /** {@code app.booking.terminal-view-days} default (30) — the test profile does not override it. */
+    private static final Duration TERMINAL_VIEW = Duration.ofDays(30);
 
     // Own per-IP bucket per test (RFC 5737 TEST-NET-3): the guest-booking, cancel-POST and the new
     // cancel-info caps are per IP and shared across the cached context.
@@ -68,6 +73,9 @@ class GuestCancelTokenHashEndToEndIT extends AbstractIntegrationTest {
 
     @Autowired
     private Clock clock;
+
+    @Autowired
+    private GuestCancelTokenCipher guestCancelTokenCipher;
 
     @MockBean
     private SmsService smsService;
@@ -102,12 +110,26 @@ class GuestCancelTokenHashEndToEndIT extends AbstractIntegrationTest {
         assertThat(rowText("bookings", created.bookingId()))
                 .as("the raw token appears in no column of the booking row")
                 .doesNotContain(token);
+        // Phase 435 (V230): the reversible copy is stored sealed and opens to the guest's token.
+        String sealed = jdbcTemplate.queryForObject(
+                "SELECT cancel_token_sealed FROM bookings WHERE id = ?", String.class, created.bookingId());
+        // Audit-fix: v2:<kid>: format, AES-GCM bound to this row ("bookings:<id>") — sealed after the persist.
+        assertThat(sealed).matches("^v2:[0-9a-f]{8}:[A-Za-z0-9+/]+={0,2}$");
+        assertThat(guestCancelTokenCipher.open(sealed,
+                com.beautica.booking.crypto.GuestCancelTokenCipher.Row.booking(created.bookingId()))).hasToString(token);
+
+        setMasterStreet(masterId, "Сагайдачного", "3А");
 
         ResponseEntity<String> info = get(token);
         assertThat(info.getStatusCode()).as(info.getBody()).isEqualTo(HttpStatus.OK);
         JsonNode infoBody = objectMapper.readTree(info.getBody());
         assertThat(infoBody.path("serviceName").asText()).isEqualTo("Манікюр-хеш");
         assertThat(infoBody.path("cancellable").asBoolean()).isTrue();
+        // Phase 435: independent master — no salon name; the master's own street + building is the address.
+        assertThat(infoBody.has("salonName")).isTrue();
+        assertThat(infoBody.get("salonName").isNull()).isTrue();
+        assertThat(infoBody.path("address").asText()).isEqualTo("Сагайдачного 3А");
+        assertNoGuestPii(info.getBody());
 
         assertThat(post(token).getStatusCode()).as("first POST consumes the token").isEqualTo(HttpStatus.NO_CONTENT);
         assertReplayIndistinguishableFromUnknownToken(token);
@@ -116,6 +138,90 @@ class GuestCancelTokenHashEndToEndIT extends AbstractIntegrationTest {
                 "SELECT status, cancel_token_hash FROM bookings WHERE id = ?", created.bookingId());
         assertThat(after.get("status")).isEqualTo("CANCELLED");
         assertThat(after.get("cancel_token_hash")).as("consumed: hash nulled").isNull();
+        assertThat(jdbcTemplate.queryForObject("SELECT cancel_token_sealed FROM bookings WHERE id = ?",
+                String.class, created.bookingId())).as("consumed: sealed copy nulled with the hash").isNull();
+    }
+
+    @Test
+    @DisplayName("phase 435: a provider-declined LINK booking — GET 200 read-only view (status DECLINED, not "
+            + "cancellable); POST still 404 and changes nothing")
+    void should_returnReadOnlyViewAndRefuseCancel_when_bookingDeclined() throws Exception {
+        String slug = "hash-e2e-declined-" + Long.toString(System.nanoTime(), 36);
+        UUID masterId = fixtures.createMasterWithSlug(slug + "@beautica.test", slug);
+        fixtures.seedOpenWeek(masterId);
+        UUID svc = fixtures.createService(masterId, "Манікюр-відхилено", 60, 0);
+        ZonedDateTime startsAt = ZonedDateTime.now(clock.withZone(KYIV)).plusDays(3)
+                .withHour(11).withMinute(0).withSecond(0).withNano(0);
+        GuestBookingResponse created = postBooking(slug, Map.of("serviceId", svc), startsAt);
+        String token = tokenOf(created);
+        jdbcTemplate.update("UPDATE bookings SET status = 'DECLINED' WHERE id = ?", created.bookingId());
+
+        ResponseEntity<String> info = get(token);
+
+        assertThat(info.getStatusCode()).as(info.getBody()).isEqualTo(HttpStatus.OK);
+        JsonNode body = objectMapper.readTree(info.getBody());
+        assertThat(body.path("status").asText()).isEqualTo("DECLINED");
+        assertThat(body.path("cancellable").asBoolean(true)).isFalse();
+        assertThat(body.path("serviceName").asText()).isEqualTo("Манікюр-відхилено");
+        // Phase 435: the venue fields ride on the read-only view too — this master has no street → null.
+        assertThat(body.has("address")).isTrue();
+        assertThat(body.get("address").isNull()).isTrue();
+        assertThat(body.get("salonName").isNull()).isTrue();
+        assertNoGuestPii(info.getBody());
+        assertThat(post(token).getStatusCode()).as("no cancel of a declined booking").isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(jdbcTemplate.queryForObject("SELECT status FROM bookings WHERE id = ?", String.class,
+                created.bookingId())).isEqualTo("DECLINED");
+    }
+
+    @Test
+    @DisplayName("phase 435: V230 trigger — a writer that nulls only the hash (previous app image) nulls the sealed copy too")
+    void should_nullSealedCopy_when_legacyWriterNullsOnlyTheHash() throws Exception {
+        String slug = "hash-e2e-trigger-" + Long.toString(System.nanoTime(), 36);
+        UUID masterId = fixtures.createMasterWithSlug(slug + "@beautica.test", slug);
+        fixtures.seedOpenWeek(masterId);
+        UUID svc = fixtures.createService(masterId, "Манікюр-тригер", 60, 0);
+        ZonedDateTime startsAt = ZonedDateTime.now(clock.withZone(KYIV)).plusDays(3)
+                .withHour(15).withMinute(0).withSecond(0).withNano(0);
+        GuestBookingResponse created = postBooking(slug, Map.of("serviceId", svc), startsAt);
+
+        jdbcTemplate.update("UPDATE bookings SET status = 'CANCELLED', cancel_token_hash = NULL WHERE id = ?",
+                created.bookingId());
+
+        assertThat(jdbcTemplate.queryForObject("SELECT cancel_token_sealed FROM bookings WHERE id = ?",
+                String.class, created.bookingId())).isNull();
+    }
+
+    @Test
+    @DisplayName("phase 435 audit-fix: V231 leaves all four cancel_token_sealed CHECKs VALIDATED")
+    void should_haveValidatedSealedChecks_when_migrated() {
+        Integer validated = jdbcTemplate.queryForObject("""
+                SELECT COUNT(*) FROM pg_constraint
+                 WHERE conname IN ('chk_bookings_cancel_token_sealed_format', 'chk_bookings_cancel_token_sealed_pair',
+                                   'chk_appointments_cancel_token_sealed_format',
+                                   'chk_appointments_cancel_token_sealed_pair')
+                   AND convalidated
+                """, Integer.class);
+
+        assertThat(validated).isEqualTo(4);
+    }
+
+    @Test
+    @DisplayName("phase 435 audit-fix: a DECLINED booking's page 404s once it started > terminal-view-days ago")
+    void should_return404_when_terminalBookingStartedLongAgo() throws Exception {
+        String slug = "hash-e2e-window-" + Long.toString(System.nanoTime(), 36);
+        UUID masterId = fixtures.createMasterWithSlug(slug + "@beautica.test", slug);
+        fixtures.seedOpenWeek(masterId);
+        UUID svc = fixtures.createService(masterId, "Манікюр-вікно", 60, 0);
+        ZonedDateTime startsAt = ZonedDateTime.now(clock.withZone(KYIV)).plusDays(3)
+                .withHour(16).withMinute(0).withSecond(0).withNano(0);
+        GuestBookingResponse created = postBooking(slug, Map.of("serviceId", svc), startsAt);
+        String token = tokenOf(created);
+        jdbcTemplate.update("UPDATE bookings SET status = 'DECLINED', starts_at = starts_at - interval '40 days', "
+                + "ends_at = ends_at - interval '40 days' WHERE id = ?", created.bookingId());
+
+        ResponseEntity<String> info = get(token);
+
+        assertThat(info.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
     }
 
     @Test
@@ -140,6 +246,14 @@ class GuestCancelTokenHashEndToEndIT extends AbstractIntegrationTest {
         assertThat(header.get("cancel_token")).as("no plaintext token on the header").isNull();
         assertThat(header.get("cancel_token_hash")).isEqualTo(expectedHash);
         assertThat(rowText("appointments", created.appointmentId())).doesNotContain(token);
+        // Phase 435 (V230): only the header carries the sealed copy (the per-item tokens are never linked).
+        assertThat(guestCancelTokenCipher.open(jdbcTemplate.queryForObject(
+                "SELECT cancel_token_sealed FROM appointments WHERE id = ?", String.class, created.appointmentId()),
+                com.beautica.booking.crypto.GuestCancelTokenCipher.Row.appointment(created.appointmentId())))
+                .hasToString(token);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM bookings WHERE appointment_id = ? AND cancel_token_sealed IS NOT NULL",
+                Integer.class, created.appointmentId())).isZero();
 
         List<Map<String, Object>> items = jdbcTemplate.queryForList(
                 "SELECT id, cancel_token, cancel_token_hash FROM bookings WHERE appointment_id = ?",
@@ -154,9 +268,15 @@ class GuestCancelTokenHashEndToEndIT extends AbstractIntegrationTest {
                 .as("each item mints its own token")
                 .isNotEqualTo(items.get(1).get("cancel_token_hash"));
 
+        setMasterStreet(masterId, "Хрещатик", "22");
+
         ResponseEntity<String> info = get(token);
         assertThat(info.getStatusCode()).as(info.getBody()).isEqualTo(HttpStatus.OK);
-        assertThat(objectMapper.readTree(info.getBody()).path("cancellable").asBoolean()).isTrue();
+        JsonNode infoBody = objectMapper.readTree(info.getBody());
+        assertThat(infoBody.path("cancellable").asBoolean()).isTrue();
+        assertThat(infoBody.get("salonName").isNull()).isTrue();
+        assertThat(infoBody.path("address").asText()).isEqualTo("Хрещатик 22");
+        assertNoGuestPii(info.getBody());
 
         assertThat(post(token).getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
         assertReplayIndistinguishableFromUnknownToken(token);
@@ -165,6 +285,8 @@ class GuestCancelTokenHashEndToEndIT extends AbstractIntegrationTest {
                 "SELECT status, cancel_token_hash FROM appointments WHERE id = ?", created.appointmentId());
         assertThat(headerAfter.get("status")).isEqualTo("CANCELLED");
         assertThat(headerAfter.get("cancel_token_hash")).isNull();
+        assertThat(jdbcTemplate.queryForObject("SELECT cancel_token_sealed FROM appointments WHERE id = ?",
+                String.class, created.appointmentId())).as("consumed: sealed copy nulled").isNull();
         assertThat(jdbcTemplate.queryForObject(
                 "SELECT COUNT(*) FROM bookings WHERE appointment_id = ? AND status = 'CANCELLED' "
                         + "AND cancel_token_hash IS NULL", Integer.class, created.appointmentId()))
@@ -172,7 +294,179 @@ class GuestCancelTokenHashEndToEndIT extends AbstractIntegrationTest {
                 .isEqualTo(2);
     }
 
+    // ── phase 435 QA: salon variant ─────────────────────────────────────────────
+
+    @Test
+    @DisplayName("phase 435: salon LINK booking — sealed copy bound to its row; GET carries the salon name and the "
+            + "SALON's street address (not the master's own)")
+    void should_returnSalonNameAndSalonAddress_when_salonBookingOpened() throws Exception {
+        String slug = "hash-e2e-salon-" + Long.toString(System.nanoTime(), 36);
+        GuestLinkFixtures.SalonMaster salon = fixtures.createSalonOwnerMasterWithSlug(
+                slug + "@beautica.test", slug, "Студія Лілія", testCityId());
+        fixtures.seedOpenWeek(salon.masterId());
+        UUID svc = fixtures.createSalonService(salon.masterId(), salon.salonId(), "Манікюр-салон", 60, 0);
+        ZonedDateTime startsAt = ZonedDateTime.now(clock.withZone(KYIV)).plusDays(3)
+                .withHour(10).withMinute(0).withSecond(0).withNano(0);
+        GuestBookingResponse created = postBooking(slug, Map.of("serviceId", svc), startsAt);
+        String token = tokenOf(created);
+        setSalonAddress(salon.salonId(), "Хрещатик", "10", null);
+        setMasterStreet(salon.masterId(), "Сагайдачного", "3А");
+
+        ResponseEntity<String> info = get(token);
+
+        assertThat(info.getStatusCode()).as(info.getBody()).isEqualTo(HttpStatus.OK);
+        assertThat(jdbcTemplate.queryForObject("SELECT salon_id FROM bookings WHERE id = ?", UUID.class,
+                created.bookingId())).as("the public route created a SALON booking").isEqualTo(salon.salonId());
+        assertThat(guestCancelTokenCipher.open(jdbcTemplate.queryForObject(
+                "SELECT cancel_token_sealed FROM bookings WHERE id = ?", String.class, created.bookingId()),
+                GuestCancelTokenCipher.Row.booking(created.bookingId()))).hasToString(token);
+        JsonNode body = objectMapper.readTree(info.getBody());
+        assertThat(body.path("status").asText()).isEqualTo("CONFIRMED");
+        assertThat(body.path("cancellable").asBoolean()).isTrue();
+        assertThat(body.path("salonName").asText()).isEqualTo("Студія Лілія");
+        assertThat(body.path("address").asText()).as("salon address wins over the master's own").isEqualTo("Хрещатик 10");
+        assertNoGuestPii(info.getBody());
+    }
+
+    @Test
+    @DisplayName("phase 435: salon LINK visit declined by the provider — GET 200 read-only (DECLINED, not cancellable) "
+            + "with the salon name and the salon's LEGACY free-text address; POST 404")
+    void should_returnReadOnlySalonViewWithLegacyAddress_when_salonVisitDeclined() throws Exception {
+        String slug = "hash-e2e-salon-visit-" + Long.toString(System.nanoTime(), 36);
+        GuestLinkFixtures.SalonMaster salon = fixtures.createSalonOwnerMasterWithSlug(
+                slug + "@beautica.test", slug, "Beauty Room", testCityId());
+        fixtures.seedOpenWeek(salon.masterId());
+        UUID svc1 = fixtures.createSalonService(salon.masterId(), salon.salonId(), "Салон-візит-1", 30, 0);
+        UUID svc2 = fixtures.createSalonService(salon.masterId(), salon.salonId(), "Салон-візит-2", 30, 1);
+        ZonedDateTime startsAt = ZonedDateTime.now(clock.withZone(KYIV)).plusDays(4)
+                .withHour(11).withMinute(0).withSecond(0).withNano(0);
+        GuestBookingResponse created = postBooking(slug, Map.of("masterServiceIds", List.of(svc1, svc2)), startsAt);
+        String token = tokenOf(created);
+        setSalonAddress(salon.salonId(), null, null, "вул. Велика Васильківська, 5");
+        declineVisit(created.appointmentId());
+
+        ResponseEntity<String> info = get(token);
+
+        assertThat(info.getStatusCode()).as(info.getBody()).isEqualTo(HttpStatus.OK);
+        JsonNode body = objectMapper.readTree(info.getBody());
+        assertThat(body.path("status").asText()).isEqualTo("DECLINED");
+        assertThat(body.path("cancellable").asBoolean(true)).isFalse();
+        assertThat(body.path("salonName").asText()).isEqualTo("Beauty Room");
+        assertThat(body.path("address").asText()).isEqualTo("вул. Велика Васильківська, 5");
+        assertNoGuestPii(info.getBody());
+        assertThat(post(token).getStatusCode()).as("no cancel of a declined visit").isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(jdbcTemplate.queryForObject("SELECT status FROM appointments WHERE id = ?", String.class,
+                created.appointmentId())).isEqualTo("DECLINED");
+    }
+
+    // ── phase 435 QA: terminal-view-days (30) boundary ─────────────────────────
+
+    @Test
+    @DisplayName("phase 435: a DECLINED booking that started 30 days minus 5 minutes ago is still shown read-only (200)")
+    void should_showReadOnlyView_when_terminalBookingStartedJustInsideWindow() throws Exception {
+        String token = declinedBookingStartedAgo(TERMINAL_VIEW.minusMinutes(5), "inside");
+
+        ResponseEntity<String> info = get(token);
+
+        assertThat(info.getStatusCode()).as(info.getBody()).isEqualTo(HttpStatus.OK);
+        JsonNode body = objectMapper.readTree(info.getBody());
+        assertThat(body.path("status").asText()).isEqualTo("DECLINED");
+        assertThat(body.path("cancellable").asBoolean(true)).isFalse();
+    }
+
+    @Test
+    @DisplayName("phase 435: a DECLINED booking that started 30 days plus 5 minutes ago 404s byte-identical to an "
+            + "unknown token")
+    void should_return404LikeUnknownToken_when_terminalBookingStartedJustOutsideWindow() throws Exception {
+        String token = declinedBookingStartedAgo(TERMINAL_VIEW.plusMinutes(5), "outside");
+
+        ResponseEntity<String> info = get(token);
+        ResponseEntity<String> unknown = get(UUID.randomUUID().toString());
+
+        assertThat(info.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(stableBody(info)).as("no expired-vs-unknown oracle").isEqualTo(stableBody(unknown));
+    }
+
+    @Test
+    @DisplayName("phase 435: a CONFIRMED booking is never cut off by the terminal window — started 40 days ago, "
+            + "GET still 200 (not cancellable: already started)")
+    void should_showBooking_when_confirmedBookingStartedLongAgo() throws Exception {
+        String slug = "hash-e2e-old-confirmed-" + Long.toString(System.nanoTime(), 36);
+        UUID masterId = fixtures.createMasterWithSlug(slug + "@beautica.test", slug);
+        fixtures.seedOpenWeek(masterId);
+        UUID svc = fixtures.createService(masterId, "Манікюр-старий", 60, 0);
+        GuestBookingResponse created = postBooking(slug, Map.of("serviceId", svc),
+                ZonedDateTime.now(clock.withZone(KYIV)).plusDays(3).withHour(12).withMinute(0).withSecond(0).withNano(0));
+        String token = tokenOf(created);
+        moveBookingStart(created.bookingId(), "CONFIRMED", Duration.ofDays(40));
+
+        ResponseEntity<String> info = get(token);
+
+        assertThat(info.getStatusCode()).as(info.getBody()).isEqualTo(HttpStatus.OK);
+        JsonNode body = objectMapper.readTree(info.getBody());
+        assertThat(body.path("status").asText()).isEqualTo("CONFIRMED");
+        assertThat(body.path("cancellable").asBoolean(true)).isFalse();
+    }
+
+    @Test
+    @DisplayName("phase 435: a DECLINED visit whose items started 31 days ago 404s like an unknown token "
+            + "(the single-booking path is not consulted)")
+    void should_return404_when_terminalVisitStartedOutsideWindow() throws Exception {
+        String slug = "hash-e2e-visit-window-" + Long.toString(System.nanoTime(), 36);
+        UUID masterId = fixtures.createMasterWithSlug(slug + "@beautica.test", slug);
+        fixtures.seedOpenWeek(masterId);
+        UUID svc1 = fixtures.createService(masterId, "Візит-вікно-1", 30, 0);
+        UUID svc2 = fixtures.createService(masterId, "Візит-вікно-2", 30, 1);
+        GuestBookingResponse created = postBooking(slug, Map.of("masterServiceIds", List.of(svc1, svc2)),
+                ZonedDateTime.now(clock.withZone(KYIV)).plusDays(4).withHour(14).withMinute(0).withSecond(0).withNano(0));
+        String token = tokenOf(created);
+        declineVisit(created.appointmentId());
+        jdbcTemplate.update("UPDATE bookings SET starts_at = starts_at - interval '35 days', "
+                + "ends_at = ends_at - interval '35 days' WHERE appointment_id = ?", created.appointmentId());
+
+        ResponseEntity<String> info = get(token);
+        ResponseEntity<String> unknown = get(UUID.randomUUID().toString());
+
+        assertThat(info.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(stableBody(info)).isEqualTo(stableBody(unknown));
+    }
+
+    /** A LINK booking made through the public route, then DECLINED with its start moved to {@code now - ago}. */
+    private String declinedBookingStartedAgo(Duration ago, String tag) throws Exception {
+        String slug = "hash-e2e-bound-" + tag + "-" + Long.toString(System.nanoTime(), 36);
+        UUID masterId = fixtures.createMasterWithSlug(slug + "@beautica.test", slug);
+        fixtures.seedOpenWeek(masterId);
+        UUID svc = fixtures.createService(masterId, "Манікюр-межа", 60, 0);
+        GuestBookingResponse created = postBooking(slug, Map.of("serviceId", svc),
+                ZonedDateTime.now(clock.withZone(KYIV)).plusDays(3).withHour(9).withMinute(0).withSecond(0).withNano(0));
+        String token = tokenOf(created);
+        moveBookingStart(created.bookingId(), "DECLINED", ago);
+        return token;
+    }
+
+    /** Sets {@code status} and moves the booking so it started {@code ago} before the application clock's now. */
+    private void moveBookingStart(UUID bookingId, String status, Duration ago) {
+        OffsetDateTime start = OffsetDateTime.now(clock).minus(ago);
+        jdbcTemplate.update("UPDATE bookings SET status = ?, starts_at = ?, ends_at = ? WHERE id = ?",
+                status, start, start.plusHours(1), bookingId);
+    }
+
+    private void declineVisit(UUID appointmentId) {
+        jdbcTemplate.update("UPDATE appointments SET status = 'DECLINED' WHERE id = ?", appointmentId);
+        jdbcTemplate.update("UPDATE bookings SET status = 'DECLINED' WHERE appointment_id = ?", appointmentId);
+    }
+
+    private void setSalonAddress(UUID salonId, String street, String buildingNo, String legacyAddress) {
+        jdbcTemplate.update("UPDATE salons SET street = ?, building_no = ?, address = ? WHERE id = ?",
+                street, buildingNo, legacyAddress, salonId);
+    }
+
     // ── assertions ─────────────────────────────────────────────────────────────
+
+    /** Phase 435: the public page carries no guest PII — neither the guest's phone nor their name. */
+    private static void assertNoGuestPii(String body) {
+        assertThat(body).doesNotContain(GUEST_PHONE).doesNotContain("Оксана").doesNotContain("Мельник");
+    }
 
     private void assertReplayIndistinguishableFromUnknownToken(String consumedToken) throws Exception {
         String unknown = UUID.randomUUID().toString();
@@ -242,6 +536,11 @@ class GuestCancelTokenHashEndToEndIT extends AbstractIntegrationTest {
         String token = url.substring(url.lastIndexOf('/') + 1);
         assertThat(UUID.fromString(token).toString()).as("the link carries the raw UUID token").isEqualTo(token);
         return token;
+    }
+
+    private void setMasterStreet(UUID masterId, String street, String buildingNo) {
+        jdbcTemplate.update("UPDATE users SET street = ?, building_no = ? "
+                + "WHERE id = (SELECT user_id FROM masters WHERE id = ?)", street, buildingNo, masterId);
     }
 
     // ── DB oracles ─────────────────────────────────────────────────────────────

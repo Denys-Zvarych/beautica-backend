@@ -354,11 +354,16 @@ class PublicBookingControllerTest {
         var info = new CancelTokenInfoResponse(
                 "Марія Левченко", "Манікюр",
                 OffsetDateTime.parse("2099-06-10T12:00:00+03:00"), true,
-                OffsetDateTime.parse("2099-06-10T10:00:00+03:00"));
+                OffsetDateTime.parse("2099-06-10T10:00:00+03:00"),
+                com.beautica.booking.enums.BookingStatus.CONFIRMED, null, "Студія Лілія", "Хрещатик 10");
         when(bookingCancellationService.getInfo(token)).thenReturn(info);
 
         mockMvc.perform(get("/api/v1/book/cancel/" + token).accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isOk())
+                .andExpect(jsonPath("$.salonName").value("Студія Лілія"))
+                .andExpect(jsonPath("$.address").value("Хрещатик 10"))
+                .andExpect(jsonPath("$.guestPhone").doesNotExist())
+                .andExpect(jsonPath("$.guestName").doesNotExist())
                 .andExpect(jsonPath("$.masterName").value("Марія Левченко"))
                 .andExpect(jsonPath("$.serviceName").value("Манікюр"))
                 .andExpect(jsonPath("$.cancellable").value(true))
@@ -372,12 +377,39 @@ class PublicBookingControllerTest {
         var info = new CancelTokenInfoResponse(
                 "Ivan", "Стрижка",
                 OffsetDateTime.parse("2099-06-10T12:00:00+03:00"), false,
-                OffsetDateTime.parse("2099-06-10T10:00:00+03:00"));
+                OffsetDateTime.parse("2099-06-10T10:00:00+03:00"),
+                com.beautica.booking.enums.BookingStatus.CONFIRMED, null, null, null);
         when(bookingCancellationService.getInfo(token)).thenReturn(info);
 
         mockMvc.perform(get("/api/v1/book/cancel/" + token).accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.cancellable").value(false));
+                .andExpect(jsonPath("$.cancellable").value(false))
+                .andExpect(jsonPath("$.salonName").isEmpty())
+                .andExpect(jsonPath("$.address").isEmpty());
+    }
+
+    @Test
+    @DisplayName("phase 435: GET /book/cancel/{token} — 200 read-only view with status + rebookPath for a declined booking")
+    void should_return200ReadOnlyViewWithStatus_when_bookingDeclined() throws Exception {
+        // Arrange
+        UUID token = UUID.randomUUID();
+        var info = new CancelTokenInfoResponse(
+                "Ivan", "Стрижка",
+                OffsetDateTime.parse("2099-06-10T12:00:00+03:00"), false,
+                OffsetDateTime.parse("2099-06-10T10:00:00+03:00"),
+                com.beautica.booking.enums.BookingStatus.DECLINED, "/book/ivan-petrenko", null, "Сагайдачного 3А");
+        when(bookingCancellationService.getInfo(token)).thenReturn(info);
+
+        // Act + Assert
+        mockMvc.perform(get("/api/v1/book/cancel/" + token).accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("DECLINED"))
+                .andExpect(jsonPath("$.cancellable").value(false))
+                .andExpect(jsonPath("$.rebookPath").value("/book/ivan-petrenko"))
+                .andExpect(jsonPath("$.salonName").isEmpty())
+                .andExpect(jsonPath("$.address").value("Сагайдачного 3А"))
+                .andExpect(jsonPath("$.masterName").value("Ivan"))
+                .andExpect(jsonPath("$.startsAt").exists());
     }
 
     @Test

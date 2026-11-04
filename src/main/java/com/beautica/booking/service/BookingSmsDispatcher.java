@@ -23,7 +23,7 @@ import java.util.concurrent.RejectedExecutionException;
  * while it still holds its pooled Hikari connection (Spring releases that at
  * {@code afterCompletion}, one phase later; see {@code AsyncConfig#smsReminderDispatchExecutor} for
  * the measurements). So every guest create, every guest cancel, every whole-visit cancel and every
- * walk-in create paid the full Turbosms round trip in its own p99 — up to the 5 s read cap plus 3 s
+ * walk-in create (the two cancels send no guest SMS since phase 435) paid the full Turbosms round trip in its own p99 — up to the 5 s read cap plus 3 s
  * connect on a stalling provider — for a message whose delivery the caller neither sees nor can act
  * on, and against a {@code leak-detection-threshold: 10000} that such a stall walks straight into.
  * Virtual threads remove the pool-exhaustion half of that, not the latency half.
@@ -73,8 +73,6 @@ public class BookingSmsDispatcher {
 
         WALK_IN_CONFIRMATION("walk_in_confirmation"),
         GUEST_CONFIRMATION("guest_confirmation"),
-        GUEST_CANCELLATION("guest_cancellation"),
-        GUEST_VISIT_CANCELLATION("guest_visit_cancellation"),
         /**
          * Phase 390 — the provider side cancelled a guest's booking or visit (decline, salon
          * closure, master removal). Queued from {@code NotificationService} on the outbox drain
@@ -219,7 +217,7 @@ public class BookingSmsDispatcher {
 
     /**
      * Phase 408 D1 — only the provider-cancellation branch is routed (Telegram when the phone is linked, SMS
-     * otherwise). Confirmations, the guest's own cancellation and the reschedule notice stay on the exact
+     * otherwise). Confirmations and the reschedule notice stay on the exact
      * pre-408 {@code smsService.send} call: the router is never in their path.
      */
     private void send(Kind kind, String phoneE164, String text) {

@@ -168,6 +168,14 @@ public class Appointment extends AuditableEntity {
     @Transient
     private UUID cancelToken;
 
+    // Phase 435 (V230) — the same token sealed with AES-256-GCM (GuestCancelTokenCipher), so later guest SMS can
+    // rebuild the guest's own /book/cancel/{token} link. Never a lookup key (the hash is). NULL on rows created
+    // before V230, and nulled with the hash (explicitly in every hash-nulling statement + the V230 trigger).
+    // @JsonIgnore: opening it yields the cancel capability.
+    @JsonIgnore
+    @Column(name = "cancel_token_sealed", length = 128)
+    private String cancelTokenSealed;
+
     // Defaults to APP so the registered-client path need not set it explicitly — Hibernate always
     // emits the column in the INSERT, so a null here would violate the NOT NULL despite the DB
     // DEFAULT. Mirrors Booking.bookingSource.
@@ -376,6 +384,20 @@ public class Appointment extends AuditableEntity {
                 .cancelToken(cancelToken)
                 .createdByUserId(createdByUserId)
                 .build();
+    }
+
+    /**
+     * Phase 435 — stores the sealed copy of the token THIS instance minted (the caller seals it with
+     * {@code GuestCancelTokenCipher}, which an entity cannot reach). Only valid on a freshly built appointment that
+     * still holds its raw token in memory.
+     *
+     * @throws IllegalStateException when this instance holds no raw token (loaded from the DB, or tokenless)
+     */
+    public void attachSealedCancelToken(String sealed) {
+        if (cancelToken == null) {
+            throw new IllegalStateException("No in-memory cancel token to seal");
+        }
+        this.cancelTokenSealed = sealed;
     }
 
     /**

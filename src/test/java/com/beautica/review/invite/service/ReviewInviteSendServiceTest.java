@@ -69,7 +69,7 @@ class ReviewInviteSendServiceTest {
         assertThat(prepared).singleElement().satisfies(sms -> {
             assertThat(sms.inviteId()).isEqualTo(invite.getId());
             assertThat(sms.phoneE164()).isEqualTo(PHONE);
-            assertThat(sms.text()).isEqualTo("Оцініть ваш візит: beautica.app/r/" + TOKEN);
+            assertThat(sms.text()).isEqualTo("Beautica: Дякуємо, що обрали наш сервіс. Залиште свій відгук про Ваш візит!\n\nhttps://beautica.app/r/" + TOKEN);
             assertThat(sms.toString()).doesNotContain(TOKEN).doesNotContain(PHONE);
         });
         assertThat(invite.getStatus()).isEqualTo(ReviewInviteStatus.SENT);

@@ -38,7 +38,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 @DisplayName("SalonGuestBookingSmsIT — phase 393 per-master confirmation + phase 390 decline SMS on salon routes")
 class SalonGuestBookingSmsIT extends AbstractWalkInBookingSmsIT {
 
-    private static final String SALON_REBOOK = " Записатися знову: beautica.app/book/s/";
 
     @Autowired private GuestTokenProvider guestTokenProvider;
     @Autowired private NotificationOutboxDrainWorker drainWorker;
@@ -110,7 +109,13 @@ class SalonGuestBookingSmsIT extends AbstractWalkInBookingSmsIT {
         assertThat(decline.getStatusCode()).as(decline.getBody()).isEqualTo(HttpStatus.NO_CONTENT);
         JsonNode payload = sentTurbosmsPayload();
         assertThat(payload.path("recipients").get(0).asText()).isEqualTo(LINK_PHONE);
-        assertThat(payload.path("sms").path("text").asText()).endsWith(SALON_REBOOK + salonSlug);
+        // Phase 435: no rebook link — the sealed visit links the guest's OWN booking page instead.
+        String cancelUrl = readJson(created.getBody()).path("cancelUrl").asText();
+        assertThat(cancelUrl).matches("^https?://.+/book/cancel/[0-9a-f-]{36}$");
+        assertThat(payload.path("sms").path("text").asText())
+                .startsWith("Beautica: Ваш запис ")
+                .endsWith(" скасовано.\n\nДеталі або записатись знову " + cancelUrl)
+                .doesNotContain(salonSlug);
     }
 
     private ResponseEntity<String> salonBook(UUID masterId, UUID masterServiceId, OffsetDateTime startsAt,

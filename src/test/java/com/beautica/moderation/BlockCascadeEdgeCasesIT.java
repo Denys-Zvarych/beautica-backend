@@ -165,8 +165,8 @@ class BlockCascadeEdgeCasesIT extends AbstractBookingBlockIT {
 
     @Test
     @DisplayName("guest block on a 2-service LINK visit: exactly ONE provider-cancel SMS for the visit, unchanged "
-            + "text incl. the «Записатися знову» rebook link, nothing about a block")
-    void should_sendOneSmsPerVisitWithRebookLink_when_salonBlocksGuestWithVisit() throws Exception {
+            + "text (phase 435: no rebook link), nothing about a block")
+    void should_sendOneSmsPerVisit_when_salonBlocksGuestWithVisit() throws Exception {
         SalonFixture salon = createSalon();
         UUID first = makeSalonMasterBookable(salon.salonId(), salon.masterId());
         UUID second = assignmentOf(
@@ -190,10 +190,14 @@ class BlockCascadeEdgeCasesIT extends AbstractBookingBlockIT {
         ArgumentCaptor<String> text = ArgumentCaptor.forClass(String.class);
         verify(bookingSmsDispatcher, times(1)).dispatchOrThrow(
                 eq(BookingSmsDispatcher.Kind.GUEST_PROVIDER_CANCELLATION), eq(GUEST_PHONE), text.capture());
+        String cancelUrl = readTree(created).path("cancelUrl").asText();
+        assertThat(cancelUrl).matches("^https?://.+/book/cancel/[0-9a-f-]{36}$");
         assertThat(text.getValue())
                 .startsWith("Beautica: Ваш запис ")
-                .contains("скасовано. Записатися знову: ")
-                .endsWith("/book/s/" + salonSlug)
+                .as("phase 435: the sealed visit links the guest's own booking page")
+                .endsWith(" скасовано.\n\nДеталі або записатись знову " + cancelUrl)
+                .as("phase 435: no rebook link")
+                .doesNotContain(salonSlug)
                 .doesNotContainIgnoringCase("блок");
     }
 

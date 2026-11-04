@@ -2,6 +2,7 @@ package com.beautica.config;
 
 import com.beautica.auth.turnstile.TurnstileProperties;
 import com.beautica.booking.closure.ClosureReminderProperties;
+import com.beautica.booking.crypto.GuestCancelTokenCipherProperties;
 import com.beautica.booking.retention.GuestPiiRetentionProperties;
 import com.beautica.moderation.config.ModerationActionLinkProperties;
 import com.beautica.moderation.config.ModerationProperties;
@@ -14,6 +15,7 @@ import org.springframework.context.annotation.Configuration;
 @EnableConfigurationProperties({
         JwtConfig.class,
         OutboxCipherProperties.class,
+        GuestCancelTokenCipherProperties.class,
         OtpPepperConfig.class,
         PhoneHashPepperConfig.class,
         VerificationPolicyConfig.class,

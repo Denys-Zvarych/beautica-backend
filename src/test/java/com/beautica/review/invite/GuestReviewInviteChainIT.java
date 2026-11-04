@@ -53,7 +53,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 class GuestReviewInviteChainIT extends AbstractReviewInviteIT {
 
     private static final String BASE = "/api/v1/public/review-invites/";
-    private static final String REVIEW_LINK_PREFIX = "Оцініть ваш візит: beautica.app/r/";
+    private static final String REVIEW_LINK_PREFIX =
+            "Beautica: Дякуємо, що обрали наш сервіс. Залиште свій відгук про Ваш візит!\n\nhttps://beautica.app/r/";
     private static final ZoneId KYIV = ZoneId.of("Europe/Kyiv");
     private static final AtomicInteger IP_SEQ = new AtomicInteger();
 

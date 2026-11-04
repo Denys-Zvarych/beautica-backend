@@ -358,6 +358,9 @@ app:
     # appointment during which a guest may still cancel via the cancel link.
     # A cancel request inside this window returns 422.
     cancel-window-hours: ${BOOKING_CANCEL_WINDOW_HOURS:2}
+    # Phase 435 audit-fix — days after its start that a TERMINAL (cancelled/declined/completed/no-show) booking's
+    # guest page GET /book/cancel/{token} stays readable; afterwards the token 404s.
+    terminal-view-days: ${BOOKING_TERMINAL_VIEW_DAYS:30}
     # Phase 413 — 2h-before guest reminder (BookingReminderJob#sweepTwoHour, every 15 min, window [now+1h45, now+2h15)).
     # Never sent 21:00-09:00 Kyiv (skipped, not deferred); skipped when the booking was made < min-lead before its
     # start. Goes to Telegram when the guest's phone is linked (phase 408), else SMS. Text: BookingSmsProperties
@@ -390,20 +393,40 @@ app:
       # Ukrainian SMS copy with {placeholder} tokens substituted at send time
       # (GuestBookingService / BookingReminderJob). Multiline via YAML block scalar.
       # Rendered text (a guest's appointment details) is never logged.
+      # Phase 435 (user decision 2026-11-04) — no {serviceName}: it is no longer substituted.
       confirmation: |-
-        Beautica: Запис підтверджено!
-        {masterName}, {serviceName}
-        {date} о {time}
+        Beautica: Ваш запис підтверджено!
 
-        Скасувати: {cancelUrl}
-      reminder: |-
-        Beautica: Нагадуємо!
-        {serviceName} у {masterName}
-        Завтра о {time}
-      cancellation: |-
-        Beautica: Ваш запис скасовано.
-        {serviceName} у {masterName}
         {date} о {time}
+        Майстер {masterName}.
+        Скасувати: {cancelUrl}
+      # Phase 435 — salon bookings name the salon and the performing master (picked when the booking has a salon).
+      confirmation-salon: |-
+        Beautica: Ваш запис підтверджено!
+
+        {date} о {time}
+        Салон {salonName}, майстер {masterName}.
+        Скасувати: {cancelUrl}
+      # Phase 435 — the «Адреса:» line is dropped when the booking has no address; the «Скасувати запис:» line
+      # when the guest's own page cannot be rebuilt (row created before V230 — no sealed token).
+      reminder: |-
+        Beautica: Нагадуємо, що завтра у Вас запис!
+
+        {masterName} | {serviceName} о {time}
+
+        Адреса: {address}
+
+        Скасувати запис: {cancelUrl}
+      reminder-salon: |-
+        Beautica: Нагадуємо, що завтра у Вас запис!
+
+        {salonName} | {masterName} | {serviceName} о {time}
+
+        Адреса: {salonAddress}
+
+        Скасувати запис: {cancelUrl}
+      # Phase 435 — no `cancellation:` key: the guest who cancels via the cancel link gets no SMS
+      # (user decision 2026-11-04). Do not re-add it — nothing reads it.
       # Phase 390 — the guest provider-cancellation SMS (decline, salon closure, master removal) is
       # fixed copy in GuestProviderCancellationSmsText, not a template here (no provider text in it;
       # its length is pinned by tests). Do not re-add `decline:` / `decline-reason:` — nothing reads them.
@@ -416,11 +439,18 @@ app:
       # value, and BookingSmsProperties.Sms#walkInConfirmation is the identical fallback — change both together.
       # Reversed by 412: it now carries {cancelUrl} — the walk-in visit header holds a one-time cancel token
       # (V226) and StaffBookingService always maps cancelUrl to /book/cancel/{token}. 3 UCS-2 segments typical.
+      # Phase 435: same copy as `confirmation` (no {serviceName}).
       walk-in-confirmation: |-
-        Beautica: Запис підтверджено!
-        {masterName}, {serviceName}
-        {date} о {time}
+        Beautica: Ваш запис підтверджено!
 
+        {date} о {time}
+        Майстер {masterName}.
+        Скасувати: {cancelUrl}
+      walk-in-confirmation-salon: |-
+        Beautica: Ваш запис підтверджено!
+
+        {date} о {time}
+        Салон {salonName}, майстер {masterName}.
         Скасувати: {cancelUrl}
     # Phase 400 — guest review invite SMS (beautica.app/r/{token}) ~2h after a LINK visit is COMPLETED, never
     # 21:00-09:00 Kyiv (moved to 10:00), one per visit. Bound by ReviewInviteProperties (validated at boot). Needs BOTH
@@ -447,8 +477,10 @@ app:
       # within staff-phone-window (PHONE_GLOBAL_CAP), and per provider (master, or salon) in 24 h (PROVIDER_DAILY_CAP).
       staff-phone-global-cap: 3
       staff-provider-daily-cap: 50
-      # One UCS-2 segment (<= 70 chars with the 22-char token) — checked at boot. Override for a non-prod web host.
-      sms-text: "${APP_BOOKING_REVIEW_INVITE_SMS_TEXT:Оцініть ваш візит: beautica.app/r/{token}}"
+      # Phase 435 (user decision 2026-11-04) — «Beautica:» title, thank-you line, tappable https link on its own
+      # line: 122 chars with the 22-char token = two UCS-2 segments (<= 134, checked at boot). No emoji (UCS-2).
+      # Override for a non-prod web host.
+      sms-text: "${APP_BOOKING_REVIEW_INVITE_SMS_TEXT:Beautica: Дякуємо, що обрали наш сервіс. Залиште свій відгук про Ваш візит!\n\nhttps://beautica.app/r/{token}}"
       job:
         fixed-delay-ms: 60000
         initial-delay-ms: 60000
@@ -647,6 +679,14 @@ app:
     # Generate with: openssl rand -base64 32
     # Empty default forces every profile (incl. test) to provide a value or fail fast at startup.
     payload-key: ${OUTBOX_PAYLOAD_KEY:}
+  guest-cancel-token:
+    # Phase 435 — Base64 32-byte (AES-256) key sealing the guest cancel token at rest (GuestCancelTokenCipher),
+    # so later guest SMS can link the guest's own /book/cancel/{token} page. Dedicated, NOT OUTBOX_PAYLOAD_KEY.
+    # Generate with: openssl rand -base64 32. Empty default = boot fails in every profile that does not set it.
+    key: ${GUEST_CANCEL_TOKEN_KEY:}
+    # Phase 435 audit-fix — DECRYPT-ONLY previous key during a rotation (values are sealed v2:<kid>:…, so open picks
+    # the key by kid). Empty outside a rotation. Rotation steps: docs/backend-phases/phase-435-guest-sms-copy.md.
+    key-previous: ${GUEST_CANCEL_TOKEN_KEY_PREVIOUS:}
   # app.internal-api-key is deliberately NOT defined in the base profile: a base default would
   # reach prod. It is mapped from INTERNAL_API_KEY in application-prod.yml (staging inherits it;
   # EnvironmentFingerprintGuard enforces non-blank, non-default, >= 32 chars) and given a dev-only

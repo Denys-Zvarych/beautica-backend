@@ -413,7 +413,7 @@ public class NotificationService {
         if (booking.getClient() == null) {
             if (PROVIDER_CANCELLATION_SMS_SOURCES.contains(booking.getBookingSource())) {
                 sendLinkGuestProviderCancellationSms(booking, "SALON_CLOSED",
-                        guestCancellationSmsText.forSalonClosed(visit.startsAt()), outboxEntryId);
+                        guestCancellationSmsText.forSalonClosed(booking, visit.startsAt()), outboxEntryId);
             } else {
                 log.debug("Skipping SALON_CLOSED notification for account-less non-LINK booking {}",
                         booking.getId());
@@ -433,8 +433,7 @@ public class NotificationService {
      * <p>Same per-visit / per-audience shape as {@link #notifySalonClosed(BookingVisit)}: takes a
      * {@link BookingVisit} (one {@code MASTER_REMOVED} row is enqueued per VISIT, D12), a
      * registered client gets email + push, a guest ({@code LINK}) visit gets the phase 390 SMS
-     * ({@link GuestProviderCancellationSmsText#forMasterRemoved}, rebook link to the salon page
-     * only), and a STAFF walk-in with a phone gets the same message (phase 408,
+     * ({@link GuestProviderCancellationSmsText#forMasterRemoved}; phase 435: no rebook link), and a STAFF walk-in with a phone gets the same message (phase 408,
      * {@link #PROVIDER_CANCELLATION_SMS_SOURCES}) — identical gate to the salon-closure path.
      *
      * <p>The email states the master is no longer working at this salon and the appointment was
@@ -633,7 +632,7 @@ public class NotificationService {
             return;
         }
         bookingSmsDispatcher.dispatchOrThrow(BookingSmsDispatcher.Kind.GUEST_PROVIDER_RESCHEDULE, phone,
-                guestRescheduleSmsText.render(booking.getStartsAt()));
+                guestRescheduleSmsText.render(booking));
     }
 
     /**

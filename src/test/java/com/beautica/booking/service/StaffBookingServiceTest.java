@@ -1,5 +1,6 @@
 package com.beautica.booking.service;
 
+import com.beautica.booking.crypto.GuestCancelTokenCipherFixtures;
 import com.beautica.notification.channel.GuestMessageRouters;
 import com.beautica.TestConstants;
 import com.beautica.auth.Role;
@@ -92,6 +93,7 @@ class StaffBookingServiceTest {
 
     /** The platform-curated {@code ServiceType.nameUk} — the ONLY service string the SMS may carry. */
     private static final String PLATFORM_SERVICE_NAME = "Манікюр";
+    private static final String SALON_NAME = "Beauty Room";
     private static final int BASE_DURATION = 60;
     private static final int BUFFER = 15;
 
@@ -152,7 +154,7 @@ class StaffBookingServiceTest {
                 salonCatalogCacheEvictor, new VisitPlanner(masterServiceRepository),
                 bookingSmsDispatcher(), new BookingSmsProperties(),
                 Clock.fixed(NOW, ZoneOffset.UTC), appointmentService, inAppNotificationService,
-                new GuestCancelUrlBuilder(CANCEL_BASE_URL));
+                new GuestCancelUrlBuilder(CANCEL_BASE_URL), GuestCancelTokenCipherFixtures.testCipher());
         // Lenient: rejection-path tests never reach the enrich() call, and MockitoExtension's
         // default STRICT_STUBS would otherwise flag this as an unnecessary stub for every one of
         // them. The return value is a placeholder — no test in this suite asserts on its content;
@@ -175,6 +177,13 @@ class StaffBookingServiceTest {
         // every pre-existing create-path test's intent unchanged.
         lenient().when(bookingRepository.findPostLockBookabilityAndOverlap(any(), any(), any()))
                 .thenReturn(Optional.of(new TestPostLockSlotCheck(true, false)));
+
+        // Phase 435 audit-fix — the header's cancel token is sealed AFTER persist (AES-GCM AAD = the header id), so
+        // the mocked persist assigns the id the way Hibernate's UUID generator does.
+        lenient().when(appointmentRepository.save(any())).thenAnswer(inv -> {
+            ReflectionTestUtils.setField((Object) inv.getArgument(0), "id", UUID.randomUUID());
+            return inv.getArgument(0);
+        });
     }
 
     // ════════════════════════════════════════════════════════════════════════════════
@@ -752,48 +761,34 @@ class StaffBookingServiceTest {
         }
 
         /**
-         * The custom service name is attacker-authored text and must never reach a branded SMS
-         * (security LOW, 2026-08-19).
-         *
-         * <p>A walk-in confirmation goes to a Ukrainian number that never opted in — the recipient's
-         * only signal that it is legitimate is the Beautica branding. {@code ServiceDefinition.name}
-         * is 100 characters of free text a self-registered provider chooses
-         * ({@code CreateServiceDefinitionRequest}: {@code @Size(max = 100)} plus a
-         * no-control-characters {@code @Pattern}, and nothing else), and at the walk-in rate limit
-         * that is hundreds of attacker-authored SMS an hour to distinct strangers once
-         * {@code app.booking.sms.enabled} flips at release. {@code Placeholders#format} already stops
-         * such a value becoming template MARKUP; it cannot stop the value from BEING the payload.
-         *
-         * <p>So the copy renders {@code ServiceType.nameUk}, which is platform-authored taxonomy.
-         * Both halves are asserted: the platform name is present AND the hostile string is absent —
-         * the second is the one that fails if someone "restores" the custom name alongside it.
+         * Phase 435 (user decision 2026-11-04) — the walk-in confirmation names NO service at all. The custom
+         * service name is attacker-authored text that must never reach a branded SMS (security LOW,
+         * 2026-08-19); since 435 the platform taxonomy name is gone too, so both are asserted absent.
          */
         @Test
-        @DisplayName("should_usePlatformServiceTypeName_when_masterSetCustomServiceName")
-        void should_usePlatformServiceTypeName_when_masterSetCustomServiceName() {
+        @DisplayName("phase 435: the walk-in SMS carries no service name — neither the custom nor the platform one")
+        void should_carryNoServiceName_when_masterSetCustomServiceName() {
             String hostile = "УВАГА! Ваш запис скасовано, деталі: beautica-support.example/win";
             stubHappyPath(salonMaster(), assignmentWithCustomServiceName(hostile));
 
             create(command(guest(RAW_PHONE)));
 
             assertThat(captureSmsText())
-                    .as("the branded SMS must carry the platform taxonomy name, never the "
-                            + "provider's own string")
-                    .contains(PLATFORM_SERVICE_NAME)
                     .doesNotContain(hostile)
-                    .doesNotContain("beautica-support.example");
+                    .doesNotContain("beautica-support.example")
+                    .doesNotContain(PLATFORM_SERVICE_NAME);
         }
 
         @Test
-        @DisplayName("should_renderMasterServiceDateAndTimeInKyivCivilTime_when_sending")
-        void should_renderMasterServiceDateAndTimeInKyivCivilTime_when_sending() {
+        @DisplayName("should_renderSalonMasterDateAndTimeInKyivCivilTime_when_sending")
+        void should_renderSalonMasterDateAndTimeInKyivCivilTime_when_sending() {
             stubHappyPath(salonMaster(), assignment(null, null));
 
             create(command(guest(RAW_PHONE)));
 
             assertThat(captureSmsText())
                     .contains("Марія Левченко")
-                    .contains("Манікюр")
+                    .contains(SALON_NAME)
                     // START is 2026-06-10T12:00+03:00 — the client reads a wall clock, not the UTC
                     // instant the column stores.
                     .contains("10.06.2026")
@@ -818,7 +813,12 @@ class StaffBookingServiceTest {
             verify(appointmentRepository).save(header.capture());
             assertThat(header.getValue().getCancelTokenHash())
                     .isEqualTo(com.beautica.booking.domain.CancelTokenHasher.hash(token));
+            // Phase 435 (V230): the header's sealed copy opens to the same token; children carry none.
+            assertThat(GuestCancelTokenCipherFixtures.testCipher().open(header.getValue().getCancelTokenSealed(),
+                    com.beautica.booking.crypto.GuestCancelTokenCipher.Row.appointment(header.getValue().getId())))
+                    .isEqualTo(token);
             assertThat(captureSaved().getCancelTokenHash()).as("child rows stay tokenless").isNull();
+            assertThat(captureSaved().getCancelTokenSealed()).isNull();
         }
 
         @Test
@@ -846,7 +846,8 @@ class StaffBookingServiceTest {
                     masterRepository, bookingRepository, appointmentRepository, slotCalculationService,
                     salonCatalogCacheEvictor, new VisitPlanner(masterServiceRepository),
                     bookingSmsDispatcher(), properties, Clock.fixed(NOW, ZoneOffset.UTC), appointmentService,
-                    inAppNotificationService, new GuestCancelUrlBuilder(CANCEL_BASE_URL));
+                    inAppNotificationService, new GuestCancelUrlBuilder(CANCEL_BASE_URL),
+                    GuestCancelTokenCipherFixtures.testCipher());
             stubHappyPath(salonMaster(), assignment(null, null));
 
             create(command(guest(RAW_PHONE)));
@@ -858,44 +859,117 @@ class StaffBookingServiceTest {
         }
 
         /**
-         * The byte-identical N = 1 golden string (D3, Phase 22.13) — widening the builder to accept
-         * a service LIST must not perturb the single-service rendering by even one character.
-         * {@code should_renderMasterServiceDateAndTimeInKyivCivilTime_when_sending} above already
-         * checks the individual fragments; this pins the WHOLE string so any stray character (a
-         * misplaced space, a changed line break) shows up here even if every fragment still matches.
+         * The whole-string pins (phase 435 copy): any stray character (a misplaced space, a changed line
+         * break) shows up here even if every fragment still matches.
          */
         @Test
-        @DisplayName("single-service walk-in SMS renders the exact expected body, ending in the cancel link")
-        void should_renderByteIdenticalBody_when_singleService() {
+        @DisplayName("phase 435: a SALON walk-in SMS renders the exact salon variant — salon and performing master")
+        void should_renderExactSalonVariant_when_salonWalkIn() {
             stubHappyPath(salonMaster(), assignment(null, null));
 
             create(command(guest(RAW_PHONE)));
 
             assertThat(captureSmsText()).isEqualTo(
-                    "Beautica: Запис підтверджено!\n"
-                            + "Марія Левченко, Манікюр\n"
-                            + "10.06.2026 о 12:00\n\n"
+                    "Beautica: Ваш запис підтверджено!\n\n"
+                            + "10.06.2026 о 12:00\n"
+                            + "Салон Beauty Room, майстер Марія Левченко.\n"
+                            + "Скасувати: " + CANCEL_BASE_URL + "/book/cancel/"
+                            + header().getCancelToken());
+        }
+
+        @Test
+        @DisplayName("phase 435: an INDEPENDENT-master walk-in SMS renders the exact master copy, no salon line")
+        void should_renderExactMasterVariant_when_independentWalkIn() {
+            stubHappyPath(independentMaster(), assignmentOf(independentMaster(), null, null));
+
+            createAs(masterUserId, command(new StaffBookingScope.Self(masterUserId), guest(RAW_PHONE)));
+
+            assertThat(captureSmsText()).isEqualTo(
+                    "Beautica: Ваш запис підтверджено!\n\n"
+                            + "10.06.2026 о 12:00\n"
+                            + "Майстер Марія Левченко.\n"
+                            + "Скасувати: " + CANCEL_BASE_URL + "/book/cancel/"
+                            + header().getCancelToken());
+        }
+
+        @Test
+        @DisplayName("phase 435 audit-fix: a long salon name is cut to 40 chars with «…» in the walk-in SMS")
+        void should_truncateSalonName_when_walkInSmsRendered() {
+            String longName = "Студія краси та догляду Лілія на Подолі біля метро Контрактова";
+            stubHappyPath(salonMasterNamed(longName), assignment(null, null));
+
+            create(command(guest(RAW_PHONE)));
+
+            String expectedSalon = longName.substring(0, 39).stripTrailing() + "…";
+            assertThat(expectedSalon).hasSizeLessThanOrEqualTo(40);
+            assertThat(captureSmsText())
+                    .contains("Салон " + expectedSalon + ", майстер Марія Левченко.\n")
+                    .doesNotContain(longName);
+        }
+
+        @Test
+        @DisplayName("phase 435 audit-fix: a URL-like salon name is dropped with the «Салон» part (master copy instead)")
+        void should_dropUrlLikeSalonName() {
+            stubHappyPath(salonMasterNamed("Знижки на beauty-deals.com"), assignment(null, null));
+
+            create(command(guest(RAW_PHONE)));
+
+            assertThat(captureSmsText()).isEqualTo(
+                    "Beautica: Ваш запис підтверджено!\n\n"
+                            + "10.06.2026 о 12:00\n"
+                            + "Майстер Марія Левченко.\n"
+                            + "Скасувати: " + CANCEL_BASE_URL + "/book/cancel/"
+                            + header().getCancelToken());
+        }
+
+        @Test
+        @DisplayName("audit-fix cycle 2: a URL-like master name is dropped — no «Майстер» line; salon variant «Салон X.»")
+        void should_omitMasterName_when_masterNameIsUrlLike() {
+            Master salonMaster = salonMaster();
+            ReflectionTestUtils.setField(salonMaster.getUser(), "firstName", "bit.ly/sale");
+            ReflectionTestUtils.setField(salonMaster.getUser(), "lastName", "Знижки");
+            stubHappyPath(salonMaster, assignment(null, null));
+
+            create(command(guest(RAW_PHONE)));
+
+            assertThat(captureSmsText()).isEqualTo(
+                    "Beautica: Ваш запис підтверджено!\n\n"
+                            + "10.06.2026 о 12:00\n"
+                            + "Салон Beauty Room.\n"
+                            + "Скасувати: " + CANCEL_BASE_URL + "/book/cancel/"
+                            + header().getCancelToken());
+        }
+
+        @Test
+        @DisplayName("audit-fix cycle 2: an independent master with a URL-like name gets the SMS without the «Майстер» line")
+        void should_omitMasterLine_when_independentMasterNameIsUrlLike() {
+            Master master = independentMaster();
+            ReflectionTestUtils.setField(master.getUser(), "firstName", "t . me/promo");
+            stubHappyPath(master, assignmentOf(master, null, null));
+
+            createAs(masterUserId, command(new StaffBookingScope.Self(masterUserId), guest(RAW_PHONE)));
+
+            assertThat(captureSmsText()).isEqualTo(
+                    "Beautica: Ваш запис підтверджено!\n\n"
+                            + "10.06.2026 о 12:00\n"
                             + "Скасувати: " + CANCEL_BASE_URL + "/book/cancel/"
                             + header().getCancelToken());
         }
 
         /**
-         * D3: name the first service, count the rest — never the full list, and never one SMS per
-         * service. A count-only assertion (verifying {@code smsService.send} was invoked exactly
-         * once) would pass even with the pre-22.13 first-service-only text, since a 3-service visit
-         * still sends exactly one message either way; only inspecting the BODY proves the copy
-         * actually widened.
+         * Phase 435 — one SMS for the whole visit, naming no service: the pre-435 «first та ще N послуг(и)»
+         * phrase must not survive in the copy.
          */
         @Test
-        @DisplayName("should_nameFirstServiceAndCountTheRest_when_threeServiceVisitCreated")
-        void should_nameFirstServiceAndCountTheRest_when_threeServiceVisitCreated() {
+        @DisplayName("phase 435: a three-service walk-in visit SMS names no service and no «та ще» count")
+        void should_nameNoServiceAndNoCount_when_threeServiceVisitCreated() {
             stubThreeServiceVisit();
 
             create(threeServiceCommand());
 
             assertThat(captureSmsText())
-                    .as("first service named, plural-correct count of the remaining two")
-                    .contains(PLATFORM_SERVICE_NAME + " та ще 2 послуги")
+                    .doesNotContain(PLATFORM_SERVICE_NAME)
+                    .doesNotContain("та ще")
                     .as("the rendered date/time are the VISIT's own start (firstStart), unchanged "
                             + "by widening the builder to accept the whole chain")
                     .contains("10.06.2026")
@@ -1494,11 +1568,15 @@ class StaffBookingServiceTest {
     }
 
     private Master salonMaster() {
+        return salonMasterNamed(SALON_NAME);
+    }
+
+    private Master salonMasterNamed(String salonName) {
         return Master.builder()
                 .id(masterId)
                 .user(user(Role.SALON_MASTER))
                 .salon(Salon.builder()
-                        .cityId(TestConstants.DEFAULT_TEST_CITY_ID).id(salonId).isActive(true).build())
+                        .cityId(TestConstants.DEFAULT_TEST_CITY_ID).id(salonId).name(salonName).isActive(true).build())
                 .isActive(true)
                 .build();
     }

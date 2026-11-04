@@ -1,6 +1,7 @@
 package com.beautica.booking.service;
 
 import com.beautica.notification.channel.GuestMessageRouters;
+import com.beautica.booking.crypto.GuestCancelTokenCipherFixtures;
 import com.beautica.booking.domain.CancelTokenHasher;
 import com.beautica.auth.phoneotp.GuestTokenProvider;
 import com.beautica.booking.dto.GuestBookingRequest;
@@ -91,6 +92,7 @@ class GuestBookingServiceTest {
                 appointmentRepository, slotCalculationService, outboxService, smsDispatcher(),
                 new BookingSmsProperties(), salonCatalogCacheEvictor,
                 new VisitPlanner(masterServiceRepository), new GuestCancelUrlBuilder(FRONTEND),
+                GuestCancelTokenCipherFixtures.testCipher(),
                 java.time.Clock.fixed(OffsetDateTime.parse("2026-06-01T10:00:00Z").toInstant(), ZoneOffset.UTC),
                 inAppNotificationService, retiredBookingSlugGuard, salonGuestMasterResolver, guestTokenBookingCap,
                 bookingBlockGuard, guestTelegramLinkService, transactionManager);
@@ -100,6 +102,12 @@ class GuestBookingServiceTest {
         // since the Phase 337 follow-up with the overlap re-check into one statement. Defaulting to
         // "still bookable, no overlap" here (lenient — only the create-path tests reach this call)
         // keeps every pre-existing create-path test's intent unchanged.
+        // Phase 435 audit-fix — the cancel token is sealed AFTER persist (AES-GCM AAD = the row id), so the mocked
+        // persist must assign ids the way Hibernate's UUID generator does.
+        lenient().when(appointmentRepository.save(any())).thenAnswer(inv -> {
+            org.springframework.test.util.ReflectionTestUtils.setField((Object) inv.getArgument(0), "id", UUID.randomUUID());
+            return inv.getArgument(0);
+        });
         lenient().when(bookingRepository.findPostLockBookabilityAndOverlap(any(), any(), any()))
                 .thenReturn(Optional.of(new TestPostLockSlotCheck(true, false)));
     }
@@ -124,7 +132,7 @@ class GuestBookingServiceTest {
     void should_persistConsentFromClockAndRequest_when_singleServiceBooked() {
         OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
         stubHappyPath(startsAt);
-        when(bookingRepository.saveAll(any())).thenAnswer(inv -> inv.getArgument(0));
+        when(bookingRepository.saveAll(any())).thenAnswer(GuestBookingServiceTest::persistedWithIds);
 
         service.createGuestBooking("Bearer guest.jwt.token", SLUG,
                 new GuestBookingRequest(serviceId, null, startsAt, "Олена", "Коваль", true, "2026-10-20.2"));
@@ -141,7 +149,7 @@ class GuestBookingServiceTest {
     void should_attachTelegramAvailability_when_bookingCreated() {
         OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
         stubHappyPath(startsAt);
-        when(bookingRepository.saveAll(any())).thenAnswer(inv -> inv.getArgument(0));
+        when(bookingRepository.saveAll(any())).thenAnswer(GuestBookingServiceTest::persistedWithIds);
         var availability = new com.beautica.notification.telegram.link.dto.TelegramAvailability(true, true);
         when(guestTelegramLinkService.availabilityForPhone(GUEST_PHONE)).thenReturn(availability);
 
@@ -158,7 +166,7 @@ class GuestBookingServiceTest {
     void should_readTelegramStateAfterCommit_when_bookingCreated() {
         OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
         stubHappyPath(startsAt);
-        when(bookingRepository.saveAll(any())).thenAnswer(inv -> inv.getArgument(0));
+        when(bookingRepository.saveAll(any())).thenAnswer(GuestBookingServiceTest::persistedWithIds);
 
         service.createGuestBooking("Bearer guest.jwt.token", SLUG,
                 new GuestBookingRequest(serviceId, null, startsAt, "Олена", "Коваль", true, "2026-10-20"));
@@ -180,7 +188,7 @@ class GuestBookingServiceTest {
                 .thenReturn(Optional.of(masterService()));
         when(bookingRepository.acquireAdvisoryLockWithTimeout(masterId)).thenReturn(1);
         stubSlotAvailable(startsAt);
-        when(bookingRepository.saveAll(any())).thenAnswer(inv -> inv.getArgument(0));
+        when(bookingRepository.saveAll(any())).thenAnswer(GuestBookingServiceTest::persistedWithIds);
         var availability = new com.beautica.notification.telegram.link.dto.TelegramAvailability(true, false);
         when(guestTelegramLinkService.availabilityForPhone(GUEST_PHONE)).thenReturn(availability);
 
@@ -222,7 +230,7 @@ class GuestBookingServiceTest {
     void should_returnBookingWithUnavailableTelegram_when_linkReadThrows() {
         OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
         stubHappyPath(startsAt);
-        when(bookingRepository.saveAll(any())).thenAnswer(inv -> inv.getArgument(0));
+        when(bookingRepository.saveAll(any())).thenAnswer(GuestBookingServiceTest::persistedWithIds);
         var linkService = org.mockito.Mockito.mock(com.beautica.notification.telegram.link.TelegramLinkService.class);
         when(linkService.statusForPhone(GUEST_PHONE))
                 .thenThrow(new org.springframework.dao.QueryTimeoutException("statement timeout"));
@@ -242,6 +250,7 @@ class GuestBookingServiceTest {
                 appointmentRepository, slotCalculationService, outboxService, smsDispatcher(),
                 new BookingSmsProperties(), salonCatalogCacheEvictor,
                 new VisitPlanner(masterServiceRepository), new GuestCancelUrlBuilder(FRONTEND),
+                GuestCancelTokenCipherFixtures.testCipher(),
                 java.time.Clock.fixed(OffsetDateTime.parse("2026-06-01T10:00:00Z").toInstant(), ZoneOffset.UTC),
                 inAppNotificationService, retiredBookingSlugGuard, salonGuestMasterResolver, guestTokenBookingCap,
                 bookingBlockGuard, realTelegram, transactionManager);
@@ -262,7 +271,7 @@ class GuestBookingServiceTest {
     void should_createConfirmedGuestBooking_when_slotIsFree() {
         OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
         stubHappyPath(startsAt);
-        when(bookingRepository.saveAll(any())).thenAnswer(inv -> inv.getArgument(0));
+        when(bookingRepository.saveAll(any())).thenAnswer(GuestBookingServiceTest::persistedWithIds);
 
         GuestBookingResponse response = service.createGuestBooking(
                 "Bearer guest.jwt.token", SLUG,
@@ -284,12 +293,15 @@ class GuestBookingServiceTest {
         UUID linkToken = UUID.fromString(response.cancelUrl().substring((FRONTEND + "/book/cancel/").length()));
         assertThat(linkToken).isEqualTo(saved.getCancelToken());
         assertThat(saved.getCancelTokenHash()).isEqualTo(CancelTokenHasher.hash(linkToken));
+        // Phase 435 (V230): the reversible copy opens to the very token the guest's link carries.
+        assertThat(GuestCancelTokenCipherFixtures.testCipher().open(saved.getCancelTokenSealed(),
+                com.beautica.booking.crypto.GuestCancelTokenCipher.Row.booking(saved.getId()))).isEqualTo(linkToken);
 
         verify(outboxService).enqueueNewBooking(any());
         ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
         verify(smsService).send(eq(GUEST_PHONE), textCaptor.capture());
         assertThat(textCaptor.getValue())
-                .contains("Запис підтверджено")
+                .contains("Ваш запис підтверджено")
                 .contains(response.cancelUrl());
         // Advisory-lock DoS fix regression: the fused acquireAdvisoryLockWithTimeout() query
         // (perf fix — sets the transaction-scoped lock_timeout AND takes the master lock in one
@@ -320,7 +332,7 @@ class GuestBookingServiceTest {
     void should_evictAvailabilityCachesBeforeSendingTheConfirmation_when_bookingCreated() {
         OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
         stubHappyPath(startsAt);
-        when(bookingRepository.saveAll(any())).thenAnswer(inv -> inv.getArgument(0));
+        when(bookingRepository.saveAll(any())).thenAnswer(GuestBookingServiceTest::persistedWithIds);
 
         service.createGuestBooking("Bearer guest.jwt.token", SLUG,
                 new GuestBookingRequest(serviceId, null, startsAt, "Олена", "Коваль", true, "2026-10-20"));
@@ -490,9 +502,8 @@ class GuestBookingServiceTest {
     // ── multi-service visit (BE-7) — ONE SMS naming the whole visit ───────────
 
     @Test
-    @DisplayName("should name the visit as «<first> та ще N послуги» in the ONE guest confirmation SMS "
-            + "when a multi-service visit is booked")
-    void should_nameTheWholeVisitInOneSms_when_guestBooksMultipleServices() {
+    @DisplayName("phase 435: ONE guest confirmation SMS for a multi-service visit, naming no service at all")
+    void should_sendOneSmsWithoutServiceNames_when_guestBooksMultipleServices() {
         OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
         UUID secondServiceId = UUID.randomUUID();
         UUID thirdServiceId = UUID.randomUUID();
@@ -511,7 +522,7 @@ class GuestBookingServiceTest {
         when(bookingRepository.acquireAdvisoryLockWithTimeout(masterId)).thenReturn(1);
         when(bookingRepository.findPostLockBookabilityAndOverlap(eq(masterId), any(), any()))
                 .thenReturn(Optional.of(new TestPostLockSlotCheck(true, false)));
-        when(bookingRepository.saveAll(any())).thenAnswer(inv -> inv.getArgument(0));
+        when(bookingRepository.saveAll(any())).thenAnswer(GuestBookingServiceTest::persistedWithIds);
         stubVisitSlotAvailable(startsAt, List.of(serviceId, secondServiceId, thirdServiceId));
 
         GuestBookingResponse response = service.createGuestBooking(
@@ -521,11 +532,13 @@ class GuestBookingServiceTest {
         ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
         verify(smsService).send(eq(GUEST_PHONE), textCaptor.capture());
         assertThat(textCaptor.getValue())
-                .as("the guest must learn the visit covers more than the lead service")
-                .isEqualTo("Beautica: Запис підтверджено!\n"
-                        + "Марія Левченко, Манікюр та ще 2 послуги\n"
-                        + "10.06.2026 о 12:00\n\n"
-                        + "Скасувати: " + response.cancelUrl());
+                .as("phase 435 copy: date/time, master and cancel link — no service name, no «та ще» phrase")
+                .isEqualTo("Beautica: Ваш запис підтверджено!\n\n"
+                        + "10.06.2026 о 12:00\n"
+                        + "Майстер Марія Левченко.\n"
+                        + "Скасувати: " + response.cancelUrl())
+                .doesNotContain("Манікюр")
+                .doesNotContain("та ще");
         // Exactly ONE SMS and ONE outbox row for the whole visit — cardinality is unchanged.
         verify(smsService).send(anyString(), anyString());
         verify(outboxService).enqueueNewBooking(any());
@@ -540,7 +553,7 @@ class GuestBookingServiceTest {
 
     private Booking createSingleAndCapture(GuestBookingRequest request) {
         stubHappyPath(request.startsAt());
-        when(bookingRepository.saveAll(any())).thenAnswer(inv -> inv.getArgument(0));
+        when(bookingRepository.saveAll(any())).thenAnswer(GuestBookingServiceTest::persistedWithIds);
         service.createGuestBooking("Bearer guest.jwt.token", SLUG, request);
         ArgumentCaptor<List<Booking>> savedCaptor = ArgumentCaptor.forClass(List.class);
         verify(bookingRepository).saveAll(savedCaptor.capture());
@@ -588,7 +601,7 @@ class GuestBookingServiceTest {
         when(bookingRepository.acquireAdvisoryLockWithTimeout(masterId)).thenReturn(1);
         when(bookingRepository.findPostLockBookabilityAndOverlap(eq(masterId), any(), any()))
                 .thenReturn(Optional.of(new TestPostLockSlotCheck(true, false)));
-        when(bookingRepository.saveAll(any())).thenAnswer(inv -> inv.getArgument(0));
+        when(bookingRepository.saveAll(any())).thenAnswer(GuestBookingServiceTest::persistedWithIds);
         stubVisitSlotAvailable(startsAt, List.of(serviceId, secondServiceId));
 
         service.createGuestBooking("Bearer guest.jwt.token", SLUG,
@@ -600,6 +613,39 @@ class GuestBookingServiceTest {
         List<Booking> children = savedCaptor.getValue();
         assertThat(children.get(0).getAppointment().getClientComment()).isEqualTo("Буду з дитиною");
         assertThat(children).allSatisfy(child -> assertThat(child.getClientComment()).isNull());
+    }
+
+    @Test
+    @DisplayName("phase 435: a visit seals the HEADER token (the one in the guest's link); child tokens stay hash-only")
+    void should_sealHeaderTokenOnly_when_visitBooked() {
+        // Arrange
+        OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
+        UUID secondServiceId = UUID.randomUUID();
+        when(guestTokenProvider.validateClaims(anyString())).thenReturn(GUEST_CLAIMS);
+        when(masterRepository.findByBookingSlugWithUser(SLUG)).thenReturn(Optional.of(master()));
+        when(masterServiceRepository.findByMasterIdAndIdInWithGraph(masterId, Set.of(serviceId, secondServiceId)))
+                .thenReturn(List.of(masterService(), masterService(secondServiceId, "Педикюр")));
+        when(bookingRepository.acquireAdvisoryLockWithTimeout(masterId)).thenReturn(1);
+        when(bookingRepository.findPostLockBookabilityAndOverlap(eq(masterId), any(), any()))
+                .thenReturn(Optional.of(new TestPostLockSlotCheck(true, false)));
+        when(bookingRepository.saveAll(any())).thenAnswer(GuestBookingServiceTest::persistedWithIds);
+        stubVisitSlotAvailable(startsAt, List.of(serviceId, secondServiceId));
+
+        // Act
+        GuestBookingResponse response = service.createGuestBooking("Bearer guest.jwt.token", SLUG,
+                new GuestBookingRequest(null, List.of(serviceId, secondServiceId), startsAt, "Олена", "Коваль",
+                        true, "2026-10-20", null));
+
+        // Assert
+        ArgumentCaptor<List<Booking>> savedCaptor = ArgumentCaptor.forClass(List.class);
+        verify(bookingRepository).saveAll(savedCaptor.capture());
+        List<Booking> children = savedCaptor.getValue();
+        UUID linkToken = UUID.fromString(response.cancelUrl().substring((FRONTEND + "/book/cancel/").length()));
+        assertThat(GuestCancelTokenCipherFixtures.testCipher()
+                .open(children.get(0).getAppointment().getCancelTokenSealed(),
+                        com.beautica.booking.crypto.GuestCancelTokenCipher.Row.appointment(
+                                children.get(0).getAppointment().getId()))).isEqualTo(linkToken);
+        assertThat(children).allSatisfy(child -> assertThat(child.getCancelTokenSealed()).isNull());
     }
 
     @Test
@@ -622,7 +668,7 @@ class GuestBookingServiceTest {
         when(bookingRepository.acquireAdvisoryLockWithTimeout(masterId)).thenReturn(1);
         when(bookingRepository.findPostLockBookabilityAndOverlap(eq(masterId), any(), any()))
                 .thenReturn(Optional.of(new TestPostLockSlotCheck(true, false)));
-        when(bookingRepository.saveAll(any())).thenAnswer(inv -> inv.getArgument(0));
+        when(bookingRepository.saveAll(any())).thenAnswer(GuestBookingServiceTest::persistedWithIds);
         stubVisitSlotAvailable(startsAt, List.of(serviceId, secondServiceId));
 
         service.createGuestBooking("Bearer guest.jwt.token", SLUG,
@@ -643,9 +689,8 @@ class GuestBookingServiceTest {
     }
 
     @Test
-    @DisplayName("should send the bare service name — no «та ще» suffix — when a one-item "
-            + "masterServiceIds visit is booked")
-    void should_sendBareServiceName_when_guestVisitCarriesASingleService() {
+    @DisplayName("phase 435: a one-item masterServiceIds visit renders the exact new confirmation copy")
+    void should_renderExactConfirmation_when_guestVisitCarriesASingleService() {
         OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
         when(guestTokenProvider.validateClaims(anyString())).thenReturn(GUEST_CLAIMS);
         when(masterRepository.findByBookingSlugWithUser(SLUG)).thenReturn(Optional.of(master()));
@@ -656,7 +701,7 @@ class GuestBookingServiceTest {
         when(bookingRepository.acquireAdvisoryLockWithTimeout(masterId)).thenReturn(1);
         when(bookingRepository.findPostLockBookabilityAndOverlap(eq(masterId), any(), any()))
                 .thenReturn(Optional.of(new TestPostLockSlotCheck(true, false)));
-        when(bookingRepository.saveAll(any())).thenAnswer(inv -> inv.getArgument(0));
+        when(bookingRepository.saveAll(any())).thenAnswer(GuestBookingServiceTest::persistedWithIds);
         stubVisitSlotAvailable(startsAt, List.of(serviceId));
 
         GuestBookingResponse response = service.createGuestBooking(
@@ -665,15 +710,83 @@ class GuestBookingServiceTest {
 
         ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
         verify(smsService).send(eq(GUEST_PHONE), textCaptor.capture());
-        // CHAR-EXACT on purpose: this is the dominant production shape, and the whole point of the
-        // visit refactor is that it did not touch it. A `contains` assertion would tolerate the
-        // «та ще 0 послуг» / stray-separator class of regression the new branch can introduce.
+        // CHAR-EXACT on purpose: this is the dominant production shape (user copy 2026-11-04).
         assertThat(textCaptor.getValue())
-                .as("a one-item visit must render the pre-visit SMS byte for byte")
-                .isEqualTo("Beautica: Запис підтверджено!\n"
-                        + "Марія Левченко, Манікюр\n"
-                        + "10.06.2026 о 12:00\n\n"
+                .as("a one-item visit must render the confirmation SMS byte for byte")
+                .isEqualTo("Beautica: Ваш запис підтверджено!\n\n"
+                        + "10.06.2026 о 12:00\n"
+                        + "Майстер Марія Левченко.\n"
                         + "Скасувати: " + response.cancelUrl());
+    }
+
+    @Test
+    @DisplayName("phase 435: a SALON booking renders the salon variant — salon name and the performing master")
+    void should_renderSalonVariant_when_masterBelongsToASalon() {
+        // Arrange
+        OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
+        User user = new User("m@beautica.test", "x", com.beautica.auth.Role.SALON_MASTER,
+                "Марія", "Левченко", null);
+        Master salonMaster = Master.builder().id(masterId).user(user).isActive(true)
+                .salon(com.beautica.salon.entity.Salon.builder()
+                        .id(UUID.randomUUID()).name("Beauty\nRoom").isActive(true).build())
+                .build();
+        when(guestTokenProvider.validateClaims(anyString())).thenReturn(GUEST_CLAIMS);
+        when(masterRepository.findByBookingSlugWithUser(SLUG)).thenReturn(Optional.of(salonMaster));
+        when(masterServiceRepository.findByMasterIdAndIdInWithGraph(masterId, Set.of(serviceId)))
+                .thenReturn(List.of(masterService()));
+        when(bookingRepository.acquireAdvisoryLockWithTimeout(masterId)).thenReturn(1);
+        when(bookingRepository.findPostLockBookabilityAndOverlap(eq(masterId), any(), any()))
+                .thenReturn(Optional.of(new TestPostLockSlotCheck(true, false)));
+        when(bookingRepository.saveAll(any())).thenAnswer(GuestBookingServiceTest::persistedWithIds);
+        stubVisitSlotAvailable(startsAt, List.of(serviceId));
+
+        // Act
+        GuestBookingResponse response = service.createGuestBooking(
+                "Bearer guest.jwt.token", SLUG,
+                new GuestBookingRequest(null, List.of(serviceId), startsAt, "Олена", "Коваль", true, "2026-10-20"));
+
+        // Assert — the salon name arrives with a line break (provider text) and is flattened to one line
+        ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
+        verify(smsService).send(eq(GUEST_PHONE), textCaptor.capture());
+        assertThat(textCaptor.getValue()).isEqualTo("Beautica: Ваш запис підтверджено!\n\n"
+                + "10.06.2026 о 12:00\n"
+                + "Салон Beauty Room, майстер Марія Левченко.\n"
+                + "Скасувати: " + response.cancelUrl());
+    }
+
+    @Test
+    @DisplayName("audit-fix cycle 2: a URL-like master name is dropped — independent copy loses «Майстер», salon copy reads «Салон X.»")
+    void should_omitMasterName_when_masterNameIsUrlLike() {
+        // Arrange
+        OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
+        User user = new User("m@beautica.test", "x", com.beautica.auth.Role.SALON_MASTER,
+                "bit.ly/sale", "Знижки", null);
+        Master salonMaster = Master.builder().id(masterId).user(user).isActive(true)
+                .salon(com.beautica.salon.entity.Salon.builder()
+                        .id(UUID.randomUUID()).name("Beauty Room").isActive(true).build())
+                .build();
+        when(guestTokenProvider.validateClaims(anyString())).thenReturn(GUEST_CLAIMS);
+        when(masterRepository.findByBookingSlugWithUser(SLUG)).thenReturn(Optional.of(salonMaster));
+        when(masterServiceRepository.findByMasterIdAndIdInWithGraph(masterId, Set.of(serviceId)))
+                .thenReturn(List.of(masterService()));
+        when(bookingRepository.acquireAdvisoryLockWithTimeout(masterId)).thenReturn(1);
+        when(bookingRepository.findPostLockBookabilityAndOverlap(eq(masterId), any(), any()))
+                .thenReturn(Optional.of(new TestPostLockSlotCheck(true, false)));
+        when(bookingRepository.saveAll(any())).thenAnswer(GuestBookingServiceTest::persistedWithIds);
+        stubVisitSlotAvailable(startsAt, List.of(serviceId));
+
+        // Act
+        GuestBookingResponse response = service.createGuestBooking(
+                "Bearer guest.jwt.token", SLUG,
+                new GuestBookingRequest(null, List.of(serviceId), startsAt, "Олена", "Коваль", true, "2026-10-20"));
+
+        // Assert
+        ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
+        verify(smsService).send(eq(GUEST_PHONE), textCaptor.capture());
+        assertThat(textCaptor.getValue()).isEqualTo("Beautica: Ваш запис підтверджено!\n\n"
+                + "10.06.2026 о 12:00\n"
+                + "Салон Beauty Room.\n"
+                + "Скасувати: " + response.cancelUrl());
     }
 
     // ── helpers ──────────────────────────────────────────────────────────────
@@ -719,8 +832,8 @@ class GuestBookingServiceTest {
     }
 
     @Test
-    @DisplayName("a provider-chosen service name containing a template placeholder is emitted "
-            + "LITERALLY — it must not steer the guest SMS or duplicate the cancel link")
+    @DisplayName("phase 435: a provider-chosen service name (even one holding a placeholder) never reaches the "
+            + "guest SMS and cannot duplicate the cancel link")
     void should_notExpandAPlaceholderInsideAServiceName_when_theConfirmationSmsIsBuilt() {
         // The service name is provider-controlled free text. Chained String.replace substituted
         // {serviceName} BEFORE {date}/{time}/{cancelUrl}, so each later replace re-scanned the name
@@ -735,7 +848,7 @@ class GuestBookingServiceTest {
         when(bookingRepository.acquireAdvisoryLockWithTimeout(masterId)).thenReturn(1);
         when(bookingRepository.findPostLockBookabilityAndOverlap(eq(masterId), any(), any()))
                 .thenReturn(Optional.of(new TestPostLockSlotCheck(true, false)));
-        when(bookingRepository.saveAll(any())).thenAnswer(inv -> inv.getArgument(0));
+        when(bookingRepository.saveAll(any())).thenAnswer(GuestBookingServiceTest::persistedWithIds);
         stubSlotAvailable(startsAt);
 
         GuestBookingResponse response = service.createGuestBooking(
@@ -746,8 +859,8 @@ class GuestBookingServiceTest {
         verify(smsService).send(eq(GUEST_PHONE), textCaptor.capture());
         String sms = textCaptor.getValue();
         assertThat(sms)
-                .as("the braces that arrived as DATA must survive as text")
-                .contains("Манікюр {cancelUrl} {date}");
+                .as("phase 435: the service name is not part of the copy at all")
+                .doesNotContain("Манікюр");
         assertThat(countOccurrences(sms, response.cancelUrl()))
                 .as("the cancel link appears exactly once, where the TEMPLATE puts it")
                 .isEqualTo(1);
@@ -993,7 +1106,7 @@ class GuestBookingServiceTest {
                 .thenReturn(Optional.of(masterService()));
         when(bookingRepository.acquireAdvisoryLockWithTimeout(masterId)).thenReturn(1);
         stubSlotAvailable(startsAt);
-        when(bookingRepository.saveAll(any())).thenAnswer(inv -> inv.getArgument(0));
+        when(bookingRepository.saveAll(any())).thenAnswer(GuestBookingServiceTest::persistedWithIds);
 
         GuestBookingResponse response = service.createSalonGuestBooking("Bearer guest.jwt", SALON_SLUG, masterId,
                 new GuestBookingRequest(serviceId, null, startsAt, "Олена", "Коваль", true, "2026-10-20"));
@@ -1085,5 +1198,12 @@ class GuestBookingServiceTest {
                 .isInstanceOf(io.jsonwebtoken.JwtException.class);
 
         verifyNoInteractions(guestTokenBookingCap);
+    }
+
+    /** Phase 435 audit-fix — a mocked {@code saveAll} that assigns ids like Hibernate's persist (seal needs the id). */
+    private static List<Booking> persistedWithIds(org.mockito.invocation.InvocationOnMock inv) {
+        List<Booking> bookings = inv.getArgument(0);
+        bookings.forEach(b -> org.springframework.test.util.ReflectionTestUtils.setField(b, "id", UUID.randomUUID()));
+        return bookings;
     }
 }

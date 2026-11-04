@@ -59,7 +59,7 @@ class WalkInBookingSmsEnabledIT extends AbstractWalkInBookingSmsIT {
     }
 
     @Test
-    @DisplayName("flag on — the body names the master, the date and the Kyiv wall-clock time")
+    @DisplayName("flag on — the body names the salon, the master, the date and the Kyiv wall-clock time, no service")
     void should_renderMasterNameDateAndTime_when_theGateIsOn() throws Exception {
         OffsetDateTime startsAt = tomorrowAtNoon();
         assertThat(createWalkIn(startsAt).getStatusCode()).isEqualTo(HttpStatus.CREATED);
@@ -69,11 +69,10 @@ class WalkInBookingSmsEnabledIT extends AbstractWalkInBookingSmsIT {
                 .as("the MASTER's name, not the guest's — the client is being told who they will see")
                 .contains(MASTER_NAME)
                 .doesNotContain(GUEST_NAME)
-                // The PLATFORM taxonomy name, never the provider's custom service_definitions.name
-                // (security LOW, 2026-08-19). This message reaches a number that never opted in, so
-                // the only free text a self-registered account can put into a Beautica-branded SMS is
-                // its own display name — the service string is platform-authored.
-                .contains(platformServiceName())
+                // Phase 435: salon variant — the salon's name and the performing master, and no
+                // service name at all (neither the provider's custom nor the platform one).
+                .contains("Салон " + fixtureSalonName(salon.salonId()) + ", майстер " + MASTER_NAME + ".")
+                .doesNotContain(platformServiceName())
                 .doesNotContain(SERVICE_NAME)
                 .contains(DATE_FMT.format(startsAt.atZoneSameInstant(TimeZones.KYIV)))
                 .as("the wall clock the client reads, not the UTC instant the column stores")
@@ -100,9 +99,9 @@ class WalkInBookingSmsEnabledIT extends AbstractWalkInBookingSmsIT {
         assertThat(onlyBooking().get("cancel_token_hash")).as("child rows stay tokenless").isNull();
     }
 
-    /** Phase 412 D4 — the walk-in cancels by link through the LINK visit path: one guest SMS, one provider row. */
+    /** Phase 412 D4 / 435 — the walk-in cancels by link through the LINK visit path: NO guest SMS, one provider row. */
     @Test
-    @DisplayName("flag on — cancelling a walk-in by its link → CANCELLED, one cancel SMS, one provider notification")
+    @DisplayName("flag on — cancelling a walk-in by its link → CANCELLED, no guest SMS (phase 435), one provider notification")
     void should_cancelWalkInVisit_when_cancelLinkFollowed() throws Exception {
         assertThat(createWalkIn(tomorrowAtNoon()).getStatusCode()).isEqualTo(HttpStatus.CREATED);
         UUID token = tokenOf(sentTurbosmsPayload().path("sms").path("text").asText());
@@ -116,13 +115,7 @@ class WalkInBookingSmsEnabledIT extends AbstractWalkInBookingSmsIT {
         assertThat(onlyBooking().get("status")).isEqualTo("CANCELLED");
         assertThat(jdbcTemplate.queryForObject("SELECT status FROM appointments WHERE id = ?", String.class,
                 appointmentId)).isEqualTo("CANCELLED");
-        TURBOSMS.verify(1, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
-        assertThat(sentTurbosmsPayload().path("recipients").get(0).asText()).isEqualTo(E164_PHONE);
-        assertThat(sentTurbosmsPayload().path("sms").path("text").asText())
-                .contains("скасовано")
-                .as("the cancel SMS names the PLATFORM service type, never the provider's custom name")
-                .contains(platformServiceName())
-                .doesNotContain(SERVICE_NAME);
+        TURBOSMS.verify(0, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
         assertThat(jdbcTemplate.queryForObject("SELECT COUNT(*) FROM notification_outbox WHERE "
                 + "event_type = 'CLIENT_CANCELLED' AND aggregate_id = ?", Integer.class, bookingId)).isEqualTo(1);
         assertThat(jdbcTemplate.queryForObject("SELECT COUNT(*) FROM in_app_notification WHERE "
@@ -376,11 +369,10 @@ class WalkInBookingSmsEnabledIT extends AbstractWalkInBookingSmsIT {
                 .as("addressed to the OTP-verified guest phone the token carries")
                 .isEqualTo(LINK_PHONE);
         assertThat(sent.path("sms").path("text").asText())
-                .as("the LINK template — unlike the walk-in one — DOES carry a self-cancel link, "
-                        + "which is what makes this a different template and not the same assertion twice")
+                .as("the LINK template carries the self-cancel link and (phase 435) no service name")
                 .contains("Скасувати:")
                 .contains(MASTER_NAME)
-                .contains(SERVICE_NAME);
+                .doesNotContain(SERVICE_NAME);
     }
 
     /**
@@ -440,8 +432,9 @@ class WalkInBookingSmsEnabledIT extends AbstractWalkInBookingSmsIT {
                         + "not depend on how many services the visit chains")
                 .isEqualTo(E164_PHONE);
         assertThat(sent.path("sms").path("text").asText())
-                .as("D3 — first service named, plural-correct «та ще N послуг(и)» for the rest")
-                .contains(firstServicePlatformName + " та ще 4 послуги");
+                .as("phase 435 — ONE SMS for the visit, naming no service and no «та ще» count")
+                .doesNotContain(firstServicePlatformName)
+                .doesNotContain("та ще");
     }
 
     /**

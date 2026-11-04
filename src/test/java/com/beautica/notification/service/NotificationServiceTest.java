@@ -8,7 +8,6 @@ import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingSource;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.service.BookingSmsDispatcher;
-import com.beautica.config.BookingLinksProperties;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
 import com.beautica.notification.entity.OutboxEventType;
@@ -67,14 +66,23 @@ class NotificationServiceTest {
     private static final BookingSmsDispatcher.Kind KIND = BookingSmsDispatcher.Kind.GUEST_PROVIDER_CANCELLATION;
     /** Kyiv 10:00 on 01.08.2026 — the start every guest mock below carries. */
     private static final String BODY_0108 = "Beautica: Ваш запис 01.08.2026 о 10:00 скасовано.";
+    /** Phase 435 — the guest's own page, rebuilt from the sealed token. */
+    private static final com.beautica.booking.crypto.GuestCancelTokenCipher CIPHER =
+            com.beautica.booking.crypto.GuestCancelTokenCipherFixtures.testCipher();
+    private static final UUID GUEST_TOKEN = UUID.fromString("123e4567-e89b-12d3-a456-426614174000");
+    private static final String DETAILS_LINE =
+            "\n\nДеталі або записатись знову " + FRONTEND_BASE_URL + "/book/cancel/" + GUEST_TOKEN;
 
     @BeforeEach
     void setUp() {
-        BookingLinksProperties links = new BookingLinksProperties();
-        links.setShareEnabled(true);
+        GuestProviderCancellationSmsText cancellationText = new GuestProviderCancellationSmsText(
+                new com.beautica.booking.service.GuestBookingPageLinks(CIPHER,
+                        new com.beautica.booking.service.GuestCancelUrlBuilder(FRONTEND_BASE_URL),
+                        mock(com.beautica.booking.repository.AppointmentRepository.class)));
         service = new NotificationService(
-                emailService, bookingSmsDispatcher, new GuestProviderCancellationSmsText(links),
-                new GuestRescheduleSmsText(new com.beautica.config.BookingSmsProperties()), rescheduleSmsBudget,
+                emailService, bookingSmsDispatcher, cancellationText,
+                new GuestRescheduleSmsText(new com.beautica.config.BookingSmsProperties(), cancellationText),
+                rescheduleSmsBudget,
                 FRONTEND_BASE_URL);
         // Phase 431: the budget grants by default; the cap rows below override it.
         lenient().when(rescheduleSmsBudget.tryReserve(any(), any(), any())).thenReturn(true);
@@ -178,6 +186,37 @@ class NotificationServiceTest {
     }
 
     @Test
+    @DisplayName("Phase 435: a declined guest booking with a sealed token gets the «Деталі» line with its own page")
+    void should_appendGuestPageLine_when_guestBookingDeclinedWithSealedToken() {
+        // Arrange
+        Booking booking = buildGuestBookingMockForDecline(null);
+        UUID bookingId = booking.getId();
+        when(booking.getCancelTokenSealed()).thenReturn(CIPHER.seal(GUEST_TOKEN, com.beautica.booking.crypto.GuestCancelTokenCipher.Row.booking(bookingId)));
+
+        // Act
+        service.notifyBookingStatusChanged(BookingVisit.single(booking));
+
+        // Assert
+        assertThat(dispatchedText()).endsWith(DETAILS_LINE).startsWith("Beautica: Ваш запис ");
+    }
+
+    @Test
+    @DisplayName("Phase 435: a salon closure of a sealed-token guest booking links the guest's own page")
+    void should_appendGuestPageLine_when_salonClosedWithSealedToken() {
+        // Arrange
+        Booking booking = buildGuestBookingMockForSalonClosed(
+                "Тест послуга", OffsetDateTime.parse("2026-08-01T10:00:00+03:00"));
+        UUID bookingId = booking.getId();
+        when(booking.getCancelTokenSealed()).thenReturn(CIPHER.seal(GUEST_TOKEN, com.beautica.booking.crypto.GuestCancelTokenCipher.Row.booking(bookingId)));
+
+        // Act
+        service.notifySalonClosed(BookingVisit.single(booking));
+
+        // Assert
+        assertThat(dispatchedText()).isEqualTo(BODY_0108 + DETAILS_LINE);
+    }
+
+    @Test
     @DisplayName("Phase 390: a saturated smsSendExecutor propagates out of the guest decline so the outbox "
             + "drain re-queues the row instead of marking it SENT")
     void should_propagateRejection_when_guestDeclineSmsExecutorSaturated() {
@@ -192,15 +231,15 @@ class NotificationServiceTest {
     }
 
     @Test
-    @DisplayName("Phase 390: the guest decline SMS is the fixed copy + the master's rebook link — no "
-            + "provider note, service name or master name")
+    @DisplayName("Phase 390/435: the guest decline SMS is the fixed copy — no provider note, service name, "
+            + "master name or rebook link")
     void should_renderFixedCopyWithoutProviderText_when_guestBookingDeclined() {
         Booking booking = buildGuestBookingMockForDecline("Майстер захворів https://evil.example");
 
         service.notifyBookingStatusChanged(BookingVisit.single(booking));
 
         assertThat(dispatchedText())
-                .isEqualTo(BODY_0108 + " Записатися знову: beautica.app/book/test-master")
+                .isEqualTo(BODY_0108)
                 .doesNotContain("Майстер захворів")
                 .doesNotContain("evil")
                 .doesNotContain("Тест послуга")
@@ -612,7 +651,7 @@ class NotificationServiceTest {
         service.notifyMasterRemoved(BookingVisit.single(booking));
 
         assertThat(dispatchedText())
-                .isEqualTo(BODY_0108 + " Записатися знову: beautica.app/book/s/test-salon")
+                .isEqualTo(BODY_0108)
                 .doesNotContain("test-master")
                 .doesNotContain("Тест послуга");
         verifyNoInteractions(emailService);
@@ -974,7 +1013,7 @@ class NotificationServiceTest {
 
     private static final BookingSmsDispatcher.Kind RESCHEDULE_KIND = BookingSmsDispatcher.Kind.GUEST_PROVIDER_RESCHEDULE;
     /** The NEW start every reschedule mock carries: Kyiv 10:00 on 01.08.2026. */
-    private static final String RESCHEDULE_0108 = "Beautica: Ваш запис перенесено на 01.08.2026 о 10:00.";
+    private static final String RESCHEDULE_0108 = "Beautica: Ваш запис 01.08.2026 о 10:00 перенесено.";
 
     @Test
     @DisplayName("Phase 431: a provider reschedule of a LINK guest booking queues ONE fixed-copy SMS with the new "
