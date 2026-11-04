@@ -37,6 +37,37 @@ class ReviewInvitePropertiesTest {
         assertThat(props.maxAttempts()).isEqualTo(3);
         assertThat(props.smsText()).isEqualTo("Оцініть ваш візит: beautica.app/r/{token}");
         assertThat(props.sendBudget()).isEqualTo(Duration.ofSeconds(10));
+        assertThat(props.staffPhoneWindow()).isEqualTo(Duration.ofDays(30));
+        assertThat(props.staffPhoneGlobalCap()).isEqualTo(3);
+        assertThat(props.staffProviderDailyCap()).isEqualTo(50);
+    }
+
+    @Test
+    @DisplayName("434 audit-fix LOW-3 — a staff-phone-window longer than the 30 d invite retention fails the boot")
+    void should_failBinding_when_staffPhoneWindowExceedsRetention() {
+        assertThatThrownBy(() -> bind(Map.of(PREFIX + ".staff-phone-window", "31d")))
+                .isInstanceOf(BindException.class)
+                .hasRootCauseMessage("app.booking.review-invite.staff-phone-window must be <= PT720H (invite "
+                        + "retention; was PT744H)");
+    }
+
+    @Test
+    @DisplayName("434 audit-fix LOW-3 — a staff-phone-window equal to the retention binds")
+    void should_bind_when_staffPhoneWindowEqualsRetention() {
+        assertThat(bind(Map.of(PREFIX + ".staff-phone-window", "30d")).staffPhoneWindow())
+                .isEqualTo(Duration.ofDays(30));
+    }
+
+    @Test
+    @DisplayName("434 audit-fix LOW-4 — a zero STAFF cap fails the boot")
+    void should_failBinding_when_staffCapZero() {
+        assertThatThrownBy(() -> bind(Map.of(PREFIX + ".staff-phone-global-cap", "0")))
+                .isInstanceOf(BindException.class)
+                .hasRootCauseMessage("app.booking.review-invite.staff-phone-global-cap must be in [1, 100] (was 0)");
+        assertThatThrownBy(() -> bind(Map.of(PREFIX + ".staff-provider-daily-cap", "0")))
+                .isInstanceOf(BindException.class)
+                .hasRootCauseMessage("app.booking.review-invite.staff-provider-daily-cap must be in [1, 10000] "
+                        + "(was 0)");
     }
 
     @Test

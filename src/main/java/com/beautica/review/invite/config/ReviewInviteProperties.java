@@ -1,5 +1,6 @@
 package com.beautica.review.invite.config;
 
+import com.beautica.review.invite.service.GuestReviewRetentionService;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.boot.context.properties.bind.DefaultValue;
 import org.springframework.format.annotation.DateTimeFormat;
@@ -31,6 +32,12 @@ import java.util.regex.Pattern;
  * @param sendBudget       audit cycle 1 — wall-clock budget of one job tick's send loop; claimed rows not attempted
  *                         when it runs out go back to {@code SCHEDULED}. Capped at the 30 s scheduler shutdown grace minus one
  *                         in-flight SMS (connect + read timeout) minus {@link #SEND_WRITE_BACK_MARGIN}
+ * @param staffPhoneWindow      phase 434 audit-fix — STAFF walk-in repeat/global-cap window; at most
+ *                              {@code GuestReviewRetentionService.INVITE_RETENTION} (30 d), or the purge would delete
+ *                              the prior invites the window is meant to see
+ * @param staffPhoneGlobalCap   phase 434 audit-fix (LOW-4) — max non-skipped STAFF invites per phone across all
+ *                              providers within {@code staffPhoneWindow}
+ * @param staffProviderDailyCap phase 434 audit-fix (LOW-4) — max non-skipped STAFF invites per provider in 24 h
  */
 @ConfigurationProperties(prefix = "app.booking.review-invite")
 public record ReviewInviteProperties(
@@ -45,7 +52,10 @@ public record ReviewInviteProperties(
         @DefaultValue("50") int batchSize,
         @DefaultValue("3") int maxAttempts,
         @DefaultValue(DEFAULT_SMS_TEXT) String smsText,
-        @DefaultValue("10s") Duration sendBudget
+        @DefaultValue("10s") Duration sendBudget,
+        @DefaultValue("30d") Duration staffPhoneWindow,
+        @DefaultValue("3") int staffPhoneGlobalCap,
+        @DefaultValue("50") int staffProviderDailyCap
 ) {
 
     public static final String TOKEN_PLACEHOLDER = "{token}";
@@ -60,6 +70,12 @@ public record ReviewInviteProperties(
     public static final String PROD_LINK = "beautica.app/r/" + TOKEN_PLACEHOLDER;
     /** Default {@code sendBudget}. */
     public static final Duration DEFAULT_SEND_BUDGET = Duration.ofSeconds(10);
+    /** Default {@code staffPhoneWindow}. */
+    public static final Duration DEFAULT_STAFF_PHONE_WINDOW = Duration.ofDays(30);
+    /** Default {@code staffPhoneGlobalCap}. */
+    public static final int DEFAULT_STAFF_PHONE_GLOBAL_CAP = 3;
+    /** Default {@code staffProviderDailyCap}. */
+    public static final int DEFAULT_STAFF_PROVIDER_DAILY_CAP = 50;
     /**
      * Time reserved after the last in-flight SMS for its outcome write-back: the post-send
      * {@code recordFailedSend}/{@code recordAmbiguousSend} transaction that settles the row. Without it a
@@ -98,6 +114,8 @@ public record ReviewInviteProperties(
     private static final Pattern POLICY_VERSION = Pattern.compile("^\\d{4}-\\d{2}-\\d{2}(\\.\\d{1,3})?$");
     private static final int MAX_BATCH_SIZE = 1_000;
     private static final int MAX_ATTEMPTS_CAP = 10;
+    private static final int MAX_STAFF_PHONE_GLOBAL_CAP = 100;
+    private static final int MAX_STAFF_PROVIDER_DAILY_CAP = 10_000;
 
     public ReviewInviteProperties {
         if (minPolicyVersion == null) {
@@ -123,6 +141,13 @@ public record ReviewInviteProperties(
         requireInRange("max-attempts", maxAttempts, MAX_ATTEMPTS_CAP);
         requireSingleSegmentTemplate(smsText);
         requirePositive("send-budget", sendBudget);
+        requirePositive("staff-phone-window", staffPhoneWindow);
+        if (staffPhoneWindow.compareTo(GuestReviewRetentionService.INVITE_RETENTION) > 0) {
+            throw new IllegalStateException("app.booking.review-invite.staff-phone-window must be <= "
+                    + GuestReviewRetentionService.INVITE_RETENTION + " (invite retention; was " + staffPhoneWindow + ")");
+        }
+        requireInRange("staff-phone-global-cap", staffPhoneGlobalCap, MAX_STAFF_PHONE_GLOBAL_CAP);
+        requireInRange("staff-provider-daily-cap", staffProviderDailyCap, MAX_STAFF_PROVIDER_DAILY_CAP);
         if (sendBudget.compareTo(MAX_SEND_BUDGET) > 0) {
             throw new IllegalStateException("app.booking.review-invite.send-budget must be <= " + MAX_SEND_BUDGET
                     + " (was " + sendBudget + ")");

@@ -440,6 +440,13 @@ app:
       # Rows per claim / expiry statement per tick (D4a — every claim is LIMITed).
       batch-size: 50
       max-attempts: 3
+      # Phase 434 audit-fix — a STAFF walk-in invite is SKIPPED (REPEAT_PHONE) when the same phone already got an
+      # invite for the same provider (master, or salon of a salon booking) within this window.
+      staff-phone-window: 30d
+      # Phase 434 audit-fix (LOW-4) — STAFF walk-in caps: max non-skipped STAFF invites per phone across ALL providers
+      # within staff-phone-window (PHONE_GLOBAL_CAP), and per provider (master, or salon) in 24 h (PROVIDER_DAILY_CAP).
+      staff-phone-global-cap: 3
+      staff-provider-daily-cap: 50
       # One UCS-2 segment (<= 70 chars with the 22-char token) — checked at boot. Override for a non-prod web host.
       sms-text: "${APP_BOOKING_REVIEW_INVITE_SMS_TEXT:Оцініть ваш візит: beautica.app/r/{token}}"
       job:

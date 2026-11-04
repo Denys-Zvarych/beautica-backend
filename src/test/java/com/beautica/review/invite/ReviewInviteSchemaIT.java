@@ -156,6 +156,8 @@ class ReviewInviteSchemaIT extends AbstractIntegrationTest {
                 .contains("(send_after)").contains("WHERE ((status)::text = 'SCHEDULED'::text)");
         assertThat(indexes.get("idx_review_invites_sent_expires"))
                 .contains("(expires_at)").contains("WHERE ((status)::text = 'SENT'::text)");
+        assertThat(indexes.get("idx_review_invites_created_unskipped"))
+                .contains("(created_at)").contains("WHERE ((status)::text <> 'SKIPPED'::text)");
     }
 
     @Test

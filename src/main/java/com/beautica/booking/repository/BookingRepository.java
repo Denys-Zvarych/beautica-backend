@@ -813,7 +813,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
 
     /**
      * Phase 401 D8 — the reviewable bookings of a VISIT-keyed review invite: the COMPLETED LINK guest bookings
-     * ({@code client_id IS NULL}) of {@code appointmentId}, ordered by {@code startsAt}. One statement, same fetch graph
+     * (phase 434: or STAFF walk-in bookings) with {@code client_id IS NULL} of {@code appointmentId}, ordered by {@code startsAt}. One statement, same fetch graph
      * as {@link #findByIdWithFullGraph} (master + user, salon, service definition), because the guest review page reads
      * the master name, the salon name and the service name of every row and the review create path reads
      * {@code m.user}. Plus {@code m.salon} (phase 401 audit-fix): the provider card's master-visibility rule reads
@@ -830,7 +830,8 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             JOIN FETCH ms.serviceDefinition
             WHERE b.appointment.id = :appointmentId
               AND b.status = com.beautica.booking.enums.BookingStatus.COMPLETED
-              AND b.bookingSource = com.beautica.booking.enums.BookingSource.LINK
+              AND b.bookingSource IN (com.beautica.booking.enums.BookingSource.LINK,
+                                      com.beautica.booking.enums.BookingSource.STAFF)
               AND b.client IS NULL
             ORDER BY b.startsAt ASC, b.id ASC
             """)
@@ -838,8 +839,8 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
 
     /**
      * Phase 401 D8 — the reviewable booking of a BOOKING-keyed review invite (V215): {@code bookingId} only when it
-     * still has no visit header ({@code appointment_id IS NULL}) and is a COMPLETED LINK guest booking
-     * ({@code client_id IS NULL}); otherwise empty. Same fetch graph as
+     * still has no visit header ({@code appointment_id IS NULL}) and is a COMPLETED LINK guest or (phase 434) STAFF
+     * walk-in booking ({@code client_id IS NULL}); otherwise empty. Same fetch graph as
      * {@link #findGuestReviewableByAppointmentIdWithGraph}.
      */
     @Query("""
@@ -853,7 +854,8 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             WHERE b.id = :bookingId
               AND b.appointment IS NULL
               AND b.status = com.beautica.booking.enums.BookingStatus.COMPLETED
-              AND b.bookingSource = com.beautica.booking.enums.BookingSource.LINK
+              AND b.bookingSource IN (com.beautica.booking.enums.BookingSource.LINK,
+                                      com.beautica.booking.enums.BookingSource.STAFF)
               AND b.client IS NULL
             """)
     Optional<Booking> findGuestReviewableSingleBookingWithGraph(@Param("bookingId") UUID bookingId);

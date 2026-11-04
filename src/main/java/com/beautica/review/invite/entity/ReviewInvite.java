@@ -39,7 +39,11 @@ import java.util.UUID;
         // constraints (V213); ux_review_invites_booking (V215).
         indexes = {
                 @Index(name = "idx_review_invites_scheduled_send_after", columnList = "send_after"),
-                @Index(name = "idx_review_invites_sent_expires", columnList = "expires_at")
+                @Index(name = "idx_review_invites_sent_expires", columnList = "expires_at"),
+                // V228 — partial WHERE status <> 'SKIPPED' (phase 434 audit-fix, STAFF repeat-phone lookup).
+                @Index(name = "idx_review_invites_phone_created", columnList = "phone_hash, created_at"),
+                // V229 — partial WHERE status <> 'SKIPPED' (phase 434 audit-fix, STAFF per-provider daily cap).
+                @Index(name = "idx_review_invites_created_unskipped", columnList = "created_at")
         }
 )
 @Getter

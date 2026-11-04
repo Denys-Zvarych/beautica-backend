@@ -411,13 +411,66 @@ class AppointmentTransitionServiceTest {
         verify(eventPublisher).publishEvent(new GuestVisitCompletedEvent(appointmentId, clock.instant()));
     }
 
+    // ── Phase 434: STAFF walk-in visits publish too (the scheduler drops STAFF visits with an account) ──────────────
+
+    @Test
+    @DisplayName("phase 434 — completeAppointment of a STAFF walk-in visit publishes GuestVisitCompletedEvent with the "
+            + "appointment id and the server-clock instant")
+    void should_publishGuestVisitCompleted_when_staffWalkInVisitCompleted() {
+        Appointment appointment = Appointment.builder()
+                .id(appointmentId).status(BookingStatus.CONFIRMED).bookingSource(BookingSource.STAFF).build();
+        when(appointmentRepository.lockHeaderRegardlessOfStatus(appointmentId))
+                .thenReturn(Optional.of(appointmentId));
+        when(appointmentRepository.findById(appointmentId)).thenReturn(Optional.of(appointment));
+        when(bookingRepository.findByAppointmentIdWithGraph(appointmentId))
+                .thenReturn(List.of(confirmedItemOf(UUID.randomUUID())));
+
+        appointmentTransitionService.completeAppointment(UUID.randomUUID(), appointmentId);
+
+        verify(eventPublisher).publishEvent(new GuestVisitCompletedEvent(appointmentId, clock.instant()));
+    }
+
+    @Test
+    @DisplayName("phase 434 — completeAppointmentItem of a STAFF walk-in visit item publishes GuestVisitCompletedEvent "
+            + "while the visit stays open")
+    void should_publishGuestVisitCompleted_when_staffWalkInVisitItemCompleted() {
+        UUID first = UUID.randomUUID();
+        Booking target = itemOf(first, BookingSource.STAFF);
+        Booking sibling = itemOf(UUID.randomUUID(), BookingSource.STAFF);
+        when(bookingRepository.findByAppointmentIdWithGraph(appointmentId)).thenReturn(List.of(target, sibling));
+        when(bookingRepository.existsConfirmedById(first)).thenReturn(true);
+
+        appointmentTransitionService.completeAppointmentItem(UUID.randomUUID(), appointmentId, first);
+
+        verify(eventPublisher).publishEvent(new GuestVisitCompletedEvent(appointmentId, clock.instant()));
+    }
+
+    @Test
+    @DisplayName("phase 434 — completeAppointmentItem of an APP visit item publishes no GuestVisitCompletedEvent")
+    void should_notPublishGuestVisitCompleted_when_appVisitItemCompleted() {
+        UUID first = UUID.randomUUID();
+        Booking target = itemOf(first, BookingSource.APP);
+        Booking sibling = itemOf(UUID.randomUUID(), BookingSource.APP);
+        when(bookingRepository.findByAppointmentIdWithGraph(appointmentId)).thenReturn(List.of(target, sibling));
+        when(bookingRepository.existsConfirmedById(first)).thenReturn(true);
+
+        appointmentTransitionService.completeAppointmentItem(UUID.randomUUID(), appointmentId, first);
+
+        assertThat(target.getStatus()).as("the item itself still completes").isEqualTo(BookingStatus.COMPLETED);
+        verify(eventPublisher, never()).publishEvent(any(GuestVisitCompletedEvent.class));
+    }
+
     private Booking linkItemOf(UUID bookingId) {
+        return itemOf(bookingId, BookingSource.LINK);
+    }
+
+    private Booking itemOf(UUID bookingId, BookingSource source) {
         return Booking.builder()
                 .id(bookingId)
                 .master(Master.builder().id(UUID.randomUUID()).isActive(true).build())
                 .masterService(MasterServiceAssignment.builder().id(UUID.randomUUID()).isActive(true).build())
                 .status(BookingStatus.CONFIRMED)
-                .bookingSource(BookingSource.LINK)
+                .bookingSource(source)
                 .startsAt(OffsetDateTime.parse("2026-07-26T09:00:00Z"))
                 .endsAt(OffsetDateTime.parse("2026-07-26T10:00:00Z"))
                 .build();
