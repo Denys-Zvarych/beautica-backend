@@ -664,7 +664,7 @@ class GuestRescheduleSmsIT extends AbstractWalkInBookingSmsIT {
     /** Body only — rows seeded without the V230 sealed token ({@code insertConfirmedLinkBooking}): no link. */
     private static String expectedSms(OffsetDateTime newStart) {
         var kyiv = newStart.atZoneSameInstant(TimeZones.KYIV);
-        return "Beautica: Ваш запис " + DATE_FMT.format(kyiv) + " о " + TIME_FMT.format(kyiv) + " перенесено.";
+        return "Beautica: Ваш запис перенесено на " + DATE_FMT.format(kyiv) + " о " + TIME_FMT.format(kyiv) + ".";
     }
 
     /** Phase 435 — sealed-token rows (public create, walk-in): the body plus the guest's own page paragraph. */
@@ -672,9 +672,9 @@ class GuestRescheduleSmsIT extends AbstractWalkInBookingSmsIT {
         return expectedSms(newStart) + "\n\nДеталі або записатись знову " + pageUrl;
     }
 
-    /** The guest's own page ({@code /book/cancel/{token}}) a walk-in confirmation SMS carries. */
+    /** The guest's own page ({@code /c/{token}}, phase 435 follow-up) a walk-in confirmation SMS carries. */
     private static String pageUrlIn(String smsText) {
-        java.util.regex.Matcher m = java.util.regex.Pattern.compile("https?://\\S+/book/cancel/[0-9a-f-]{36}")
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("https?://\\S+/c/[0-9A-Za-z]{16}")
                 .matcher(smsText);
         assertThat(m.find()).as("walk-in SMS carries the guest page link").isTrue();
         return m.group();

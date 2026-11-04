@@ -1,10 +1,11 @@
 package com.beautica.booking.service;
 
+import com.beautica.booking.domain.GuestCancelToken;
 import com.beautica.booking.dto.AvailableSlotResponse;
 import com.beautica.booking.dto.BookingLinkKind;
 import com.beautica.booking.dto.BookingPriceRange;
 import com.beautica.booking.domain.GuestConsent;
-import com.beautica.booking.domain.GuestSmsProviderText;
+import com.beautica.booking.domain.GuestConfirmationSmsText;
 import com.beautica.booking.dto.GuestBookingRequest;
 import com.beautica.booking.dto.GuestBookingResponse;
 import com.beautica.notification.telegram.link.GuestTelegramLinkService;
@@ -42,13 +43,9 @@ import java.math.BigDecimal;
 import java.time.Clock;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
-import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.Objects;
-import java.util.Set;
 import java.util.UUID;
 import java.util.function.Supplier;
 
@@ -68,8 +65,6 @@ import java.util.function.Supplier;
 @Service
 public class GuestBookingService {
 
-    private static final DateTimeFormatter DATE_FMT = DateTimeFormatter.ofPattern("dd.MM.yyyy");
-    private static final DateTimeFormatter TIME_FMT = DateTimeFormatter.ofPattern("HH:mm");
 
     private final GuestTokenProvider guestTokenProvider;
     private final MasterRepository masterRepository;
@@ -476,7 +471,7 @@ public class GuestBookingService {
         BookingSlotLockGuard.lockMasterAndAssertFree(
                 bookingRepository, master.getId(), firstStart, lastEnd);
 
-        UUID cancelToken = UUID.randomUUID();
+        GuestCancelToken cancelToken = GuestCancelToken.generate();
         // ONE consent instance for the header and every child: identical values by construction.
         GuestConsent consent = consentOf(req);
         Appointment appointment = Appointment.guestAppointment(
@@ -592,7 +587,7 @@ public class GuestBookingService {
     }
 
     private void registerAfterCommit(Master master, Booking saved, String guestPhone, String cancelUrl) {
-        String smsText = buildConfirmationSms(master, saved, cancelUrl);
+        String smsText = buildConfirmationSms(saved, cancelUrl);
         // Capture the salon id inside the transaction (before the afterCommit callback runs) —
         // null for an independent master (no salon catalogue entry).
         UUID salonId = saved.getSalon() != null ? saved.getSalon().getId() : null;
@@ -631,7 +626,7 @@ public class GuestBookingService {
      */
     private void registerVisitAfterCommit(Master master, Booking firstSaved, String guestPhone,
                                           String cancelUrl) {
-        String smsText = buildConfirmationSms(master, firstSaved, cancelUrl);
+        String smsText = buildConfirmationSms(firstSaved, cancelUrl);
         UUID salonId = master.getSalon() != null ? master.getSalon().getId() : null;
         Runnable task = () -> {
             // Eviction first, send second — see registerAfterCommit for why this order is
@@ -662,25 +657,11 @@ public class GuestBookingService {
      * and cancel link only, so a visit's «та ще N послуг(и)» phrase is gone with it. A SALON booking uses the
      * salon variant, which also names the salon (flattened to one line — provider text).
      */
-    private String buildConfirmationSms(Master master, Booking saved, String cancelUrl) {
-        OffsetDateTime kyiv = saved.getStartsAt().atZoneSameInstant(TimeZones.KYIV).toOffsetDateTime();
+    private String buildConfirmationSms(Booking saved, String cancelUrl) {
+        // Phase 435 follow-up: the shared renderer (also the walk-in SMS and the Telegram details) — provider text
+        // via GuestSmsProviderText, the «Адреса: … (note)» line from GuestVisitAddress. `saved` carries `master`.
         BookingSmsProperties.Sms sms = smsProperties.getSms();
-        Map<String, String> values = new HashMap<>();
-        // Audit-fix: provider text via GuestSmsProviderText — salon name capped, dropped when URL-like (→ the
-        // independent-master copy), master name capped and dropped when URL-like (→ no «Майстер» line / «Салон X.»);
-        // the whole SMS capped (salon dropped first if over).
-        if (saved.getSalon() != null) {
-            GuestSmsProviderText.salonName(saved.getSalon().getName())
-                    .ifPresent(name -> values.put("salonName", name));
-        }
-        // Audit-fix cycle 2: a URL-like master name is dropped — render then removes the master segment.
-        GuestSmsProviderText.masterName(masterName(master)).ifPresent(name -> values.put("masterName", name));
-        values.put("date", DATE_FMT.format(kyiv));
-        values.put("time", TIME_FMT.format(kyiv));
-        values.put("cancelUrl", cancelUrl);
-        return GuestSmsProviderText.render(
-                saved.getSalon() != null ? sms.getConfirmationSalon() : null,
-                sms.getConfirmation(), values, Set.of(), Set.of());
+        return GuestConfirmationSmsText.render(sms.getConfirmationSalon(), sms.getConfirmation(), saved, cancelUrl);
     }
 
     private GuestBookingResponse buildResponse(Master master, MasterServiceAssignment msa,

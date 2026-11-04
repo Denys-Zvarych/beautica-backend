@@ -10,6 +10,11 @@ public enum GuestMessageKind {
     GUEST_REMINDER_24H("guest_reminder_24h"),
     GUEST_REMINDER_2H("guest_reminder_2h"),
     GUEST_PROVIDER_CANCELLATION("guest_provider_cancellation"),
+    /**
+     * Phase 435 follow-up (user decision 2026-11-04, "same sms should be in telegram") — the provider moved the guest's
+     * booking (phase 431 notice). Gates and the per-phone budget stay in {@code NotificationService}, before routing.
+     */
+    GUEST_PROVIDER_RESCHEDULE("guest_provider_reschedule"),
     GUEST_REVIEW_INVITE("guest_review_invite");
 
     private final String token;

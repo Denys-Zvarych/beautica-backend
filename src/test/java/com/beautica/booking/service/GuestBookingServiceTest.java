@@ -1,5 +1,6 @@
 package com.beautica.booking.service;
 
+import com.beautica.booking.domain.GuestCancelToken;
 import com.beautica.notification.channel.GuestMessageRouters;
 import com.beautica.booking.crypto.GuestCancelTokenCipherFixtures;
 import com.beautica.booking.domain.CancelTokenHasher;
@@ -258,7 +259,7 @@ class GuestBookingServiceTest {
         GuestBookingResponse response = withRealTelegram.createGuestBooking("Bearer guest.jwt.token", SLUG,
                 new GuestBookingRequest(serviceId, null, startsAt, "Олена", "Коваль", true, "2026-10-20"));
 
-        assertThat(response.cancelUrl()).startsWith(FRONTEND + "/book/cancel/");
+        assertThat(response.cancelUrl()).startsWith(FRONTEND + "/c/");
         assertThat(response.telegram())
                 .isEqualTo(com.beautica.notification.telegram.link.dto.TelegramAvailability.UNAVAILABLE);
         verify(bookingRepository).saveAll(any());
@@ -288,10 +289,13 @@ class GuestBookingServiceTest {
         assertThat(saved.getGuestName()).isEqualTo("Олена");
         assertThat(saved.getGuestPhone()).isEqualTo(GUEST_PHONE);
         assertThat(saved.getCancelToken()).isNotNull();
-        assertThat(response.cancelUrl()).startsWith(FRONTEND + "/book/cancel/");
+        assertThat(response.cancelUrl()).startsWith(FRONTEND + "/c/");
         // V206: the persisted column is the SHA-256 of the raw token the guest's link carries.
-        UUID linkToken = UUID.fromString(response.cancelUrl().substring((FRONTEND + "/book/cancel/").length()));
+        GuestCancelToken linkToken = GuestCancelToken.valueOf(response.cancelUrl().substring((FRONTEND + "/c/").length()));
         assertThat(linkToken).isEqualTo(saved.getCancelToken());
+        // Phase 435 follow-up: a NEW token is the short form — 16 base62 chars, never a UUID.
+        assertThat(linkToken.value()).matches("[0-9A-Za-z]{16}");
+        assertThat(linkToken.isLegacy()).isFalse();
         assertThat(saved.getCancelTokenHash()).isEqualTo(CancelTokenHasher.hash(linkToken));
         // Phase 435 (V230): the reversible copy opens to the very token the guest's link carries.
         assertThat(GuestCancelTokenCipherFixtures.testCipher().open(saved.getCancelTokenSealed(),
@@ -640,7 +644,7 @@ class GuestBookingServiceTest {
         ArgumentCaptor<List<Booking>> savedCaptor = ArgumentCaptor.forClass(List.class);
         verify(bookingRepository).saveAll(savedCaptor.capture());
         List<Booking> children = savedCaptor.getValue();
-        UUID linkToken = UUID.fromString(response.cancelUrl().substring((FRONTEND + "/book/cancel/").length()));
+        GuestCancelToken linkToken = GuestCancelToken.valueOf(response.cancelUrl().substring((FRONTEND + "/c/").length()));
         assertThat(GuestCancelTokenCipherFixtures.testCipher()
                 .open(children.get(0).getAppointment().getCancelTokenSealed(),
                         com.beautica.booking.crypto.GuestCancelTokenCipher.Row.appointment(
@@ -752,6 +756,43 @@ class GuestBookingServiceTest {
                 + "10.06.2026 о 12:00\n"
                 + "Салон Beauty Room, майстер Марія Левченко.\n"
                 + "Скасувати: " + response.cancelUrl());
+    }
+
+    @Test
+    @DisplayName("phase 435 follow-up: the salon address and location note follow the master line, brackets around the note")
+    void should_renderSalonAddressWithNote_when_salonHasThem() {
+        // Arrange
+        OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
+        User user = new User("m@beautica.test", "x", com.beautica.auth.Role.SALON_MASTER,
+                "Марія", "Левченко", null);
+        com.beautica.salon.entity.Salon salon = com.beautica.salon.entity.Salon.builder()
+                .id(UUID.randomUUID()).name("Beauty Room").isActive(true)
+                .street("Хрещатик").buildingNo("10").locationNote("вхід з двору").build();
+        Master salonMaster = Master.builder().id(masterId).user(user).isActive(true).salon(salon).build();
+        when(guestTokenProvider.validateClaims(anyString())).thenReturn(GUEST_CLAIMS);
+        when(masterRepository.findByBookingSlugWithUser(SLUG)).thenReturn(Optional.of(salonMaster));
+        when(masterServiceRepository.findByMasterIdAndIdInWithGraph(masterId, Set.of(serviceId)))
+                .thenReturn(List.of(masterService()));
+        when(bookingRepository.acquireAdvisoryLockWithTimeout(masterId)).thenReturn(1);
+        when(bookingRepository.findPostLockBookabilityAndOverlap(eq(masterId), any(), any()))
+                .thenReturn(Optional.of(new TestPostLockSlotCheck(true, false)));
+        when(bookingRepository.saveAll(any())).thenAnswer(GuestBookingServiceTest::persistedWithIds);
+        stubVisitSlotAvailable(startsAt, List.of(serviceId));
+
+        // Act
+        GuestBookingResponse response = service.createGuestBooking(
+                "Bearer guest.jwt.token", SLUG,
+                new GuestBookingRequest(null, List.of(serviceId), startsAt, "Олена", "Коваль", true, "2026-10-20"));
+
+        // Assert
+        ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
+        verify(smsService).send(eq(GUEST_PHONE), textCaptor.capture());
+        assertThat(textCaptor.getValue()).isEqualTo("Beautica: Ваш запис підтверджено!\n\n"
+                + "10.06.2026 о 12:00\n"
+                + "Салон Beauty Room, майстер Марія Левченко.\n"
+                + "Адреса: Хрещатик 10 (вхід з двору)\n"
+                + "Скасувати: " + response.cancelUrl());
+        assertThat(response.cancelUrl()).matches("https://app\\.beautica\\.test/c/[0-9A-Za-z]{16}");
     }
 
     @Test
@@ -1115,7 +1156,7 @@ class GuestBookingServiceTest {
         verify(bookingRepository).saveAll(saved.capture());
         assertThat(saved.getValue().get(0).getBookingSource()).isEqualTo(BookingSource.LINK);
         assertThat(saved.getValue().get(0).getGuestPhone()).isEqualTo(GUEST_PHONE);
-        assertThat(response.cancelUrl()).startsWith(FRONTEND + "/book/cancel/");
+        assertThat(response.cancelUrl()).startsWith(FRONTEND + "/c/");
         verify(smsService).send(eq(GUEST_PHONE), org.mockito.ArgumentMatchers.contains(response.cancelUrl()));
         verify(masterRepository, never()).findByBookingSlugWithUser(any());
     }

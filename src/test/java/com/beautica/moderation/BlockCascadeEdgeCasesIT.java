@@ -191,7 +191,7 @@ class BlockCascadeEdgeCasesIT extends AbstractBookingBlockIT {
         verify(bookingSmsDispatcher, times(1)).dispatchOrThrow(
                 eq(BookingSmsDispatcher.Kind.GUEST_PROVIDER_CANCELLATION), eq(GUEST_PHONE), text.capture());
         String cancelUrl = readTree(created).path("cancelUrl").asText();
-        assertThat(cancelUrl).matches("^https?://.+/book/cancel/[0-9a-f-]{36}$");
+        assertThat(cancelUrl).matches("^https?://.+/c/[0-9A-Za-z]{16}$");
         assertThat(text.getValue())
                 .startsWith("Beautica: Ваш запис ")
                 .as("phase 435: the sealed visit links the guest's own booking page")

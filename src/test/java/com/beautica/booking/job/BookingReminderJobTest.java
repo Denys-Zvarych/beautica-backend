@@ -273,9 +273,56 @@ class BookingReminderJobTest {
     }
 
     @Test
-    @DisplayName("phase 435 audit-fix: an over-long salon reminder drops the «Адреса:» line first and stays within the cap")
+    @DisplayName("phase 435 follow-up: an over-long salon reminder drops the location note first, keeps the address, stays within the cap")
     void should_capReminderLength_when_addressLong() {
-        // Arrange — every provider value is long: salon 60, master 2×30, service 60, address 100, plus the page link
+        // Arrange — every provider value is long: salon 60, master 2×30, service 60, address 100, note 100, plus the link
+        Booking booking = longSalonBooking("п".repeat(100));
+        when(bookingRepository.findGuestBookingsForReminder(any(), any(), anyBoolean())).thenReturn(List.of(booking));
+
+        // Act
+        job.sendReminders();
+
+        // Assert
+        String text = publishedEvent().reminders().get(0).text();
+        assertThat(text.length()).isLessThanOrEqualTo(com.beautica.booking.domain.GuestSmsProviderText.MAX_SMS_CHARS);
+        assertThat(text).contains("\nАдреса: вулиця " + "Х".repeat(52) + "…\n").doesNotContain("п".repeat(10))
+                .doesNotContain("(")
+                .startsWith("Beautica: Нагадуємо, що завтра у Вас запис!\n\nСтудія " + "С".repeat(32) + "… | ")
+                .endsWith("\nСкасувати запис: https://beautica.app/c/" + booking.getCancelToken().value());
+    }
+
+    @Test
+    @DisplayName("phase 435 follow-up: the salon reminder renders the exact copy — no blank lines, address with note")
+    void should_renderExactSalonReminder_when_salonHasAddressAndNote() {
+        // Arrange
+        User user = new User("m@beautica.test", "x", com.beautica.auth.Role.SALON_MASTER, "Марія", "Левченко", null);
+        Master master = Master.builder().user(user).isActive(true).build();
+        ServiceDefinition def = ServiceDefinition.builder()
+                .name("Манікюр").baseDurationMinutes(60).bufferMinutesAfter(0)
+                .basePrice(new BigDecimal("350.00")).build();
+        MasterServiceAssignment msa = MasterServiceAssignment.builder()
+                .master(master).serviceDefinition(def).isActive(true).build();
+        com.beautica.salon.entity.Salon salon = com.beautica.salon.entity.Salon.builder().id(UUID.randomUUID())
+                .name("Beauty Room").street("Хрещатик").buildingNo("10").locationNote("вхід з двору")
+                .isActive(true).build();
+        Booking booking = sealed(Booking.guestBooking(master, msa, salon,
+                OffsetDateTime.parse("2026-06-02T14:00:00+03:00"), OffsetDateTime.parse("2026-06-02T15:00:00+03:00"),
+                new BigDecimal("350.00"), null, 60, 0, "Олена", "Коваль", "+380501111111", null));
+        when(bookingRepository.findGuestBookingsForReminder(any(), any(), anyBoolean())).thenReturn(List.of(booking));
+
+        // Act
+        job.sendReminders();
+
+        // Assert
+        assertThat(publishedEvent().reminders().get(0).text()).isEqualTo("""
+                Beautica: Нагадуємо, що завтра у Вас запис!
+
+                Beauty Room | Марія Левченко | Манікюр о 14:00
+                Адреса: Хрещатик 10 (вхід з двору)
+                Скасувати запис: https://beautica.app/c/""" + booking.getCancelToken().value());
+    }
+
+    private static Booking longSalonBooking(String locationNote) {
         User user = new User("m@beautica.test", "x", com.beautica.auth.Role.SALON_MASTER,
                 "Олександра" + "а".repeat(20), "Левченко" + "о".repeat(22), null);
         Master master = Master.builder().user(user).isActive(true).build();
@@ -286,25 +333,18 @@ class BookingReminderJobTest {
                 .master(master).serviceDefinition(def).isActive(true).build();
         com.beautica.salon.entity.Salon salon = com.beautica.salon.entity.Salon.builder().id(UUID.randomUUID())
                 .name("Студія " + "С".repeat(53)).street("вулиця " + "Х".repeat(93)).buildingNo("10")
-                .isActive(true).build();
-        Booking booking = Booking.guestBooking(master, msa, salon,
+                .locationNote(locationNote).isActive(true).build();
+        return sealed(Booking.guestBooking(master, msa, salon,
                 OffsetDateTime.parse("2026-06-02T10:00:00+03:00"), OffsetDateTime.parse("2026-06-02T11:00:00+03:00"),
-                new BigDecimal("350.00"), null, 60, 0, "Олена", "Коваль", "+380501111111", null);
+                new BigDecimal("350.00"), null, 60, 0, "Олена", "Коваль", "+380501111111", null));
+    }
+
+    private static Booking sealed(Booking booking) {
         org.springframework.test.util.ReflectionTestUtils.setField(booking, "id", UUID.randomUUID());
         booking.attachSealedCancelToken(com.beautica.booking.crypto.GuestCancelTokenCipherFixtures.testCipher()
                 .seal(booking.getCancelToken(),
                         com.beautica.booking.crypto.GuestCancelTokenCipher.Row.booking(booking.getId())));
-        when(bookingRepository.findGuestBookingsForReminder(any(), any(), anyBoolean())).thenReturn(List.of(booking));
-
-        // Act
-        job.sendReminders();
-
-        // Assert
-        String text = publishedEvent().reminders().get(0).text();
-        assertThat(text.length()).isLessThanOrEqualTo(com.beautica.booking.domain.GuestSmsProviderText.MAX_SMS_CHARS);
-        assertThat(text).doesNotContain("Адреса:")
-                .startsWith("Beautica: Нагадуємо, що завтра у Вас запис!\n\nСтудія " + "С".repeat(32) + "… | ")
-                .endsWith("\n\nСкасувати запис: https://beautica.app/book/cancel/" + booking.getCancelToken());
+        return booking;
     }
 
     @Test

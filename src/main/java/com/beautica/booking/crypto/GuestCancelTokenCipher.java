@@ -1,5 +1,6 @@
 package com.beautica.booking.crypto;
 
+import com.beautica.booking.domain.GuestCancelToken;
 import com.beautica.notification.crypto.OutboxPayloadCipher;
 import org.springframework.stereotype.Component;
 
@@ -12,7 +13,8 @@ import java.util.UUID;
 
 /**
  * Phase 435 — reversible at-rest copy of the guest's one-time cancel token, so every later guest SMS
- * (provider cancel, reschedule, reminders) can carry the guest's own {@code /book/cancel/{token}} page.
+ * (provider cancel, reschedule, reminders) can carry the guest's own booking page ({@code /c/{token}}). The sealed plaintext is the raw token as issued: 16
+ * base62 chars (phase 435 follow-up) or a legacy canonical UUID.
  *
  * <p>The SHA-256 hash ({@code CancelTokenHasher}) stays the ONLY lookup key; the sealed copy is never queried.
  * Sealing reuses {@link OutboxPayloadCipher}'s AES-256-GCM (fresh 12-byte IV per call, 128-bit tag) over the dedicated
@@ -69,22 +71,28 @@ public class GuestCancelTokenCipher {
      * Seals {@code token} bound to {@code row} under the current key; a fresh IV per call, so sealing the same token
      * twice yields different values.
      */
-    public String seal(UUID token, Row row) {
+    public String seal(GuestCancelToken token, Row row) {
         if (token == null) {
             throw new IllegalStateException("cancel token must not be null");
         }
         requireRow(row);
-        return V2_PREFIX + currentKid + ":" + current.sealBound(token.toString(), row.associatedData());
+        return V2_PREFIX + currentKid + ":" + current.sealBound(token.value(), row.associatedData());
+    }
+
+    /** {@link #seal(GuestCancelToken, Row)} for a legacy UUID token (its canonical string is sealed). */
+    public String seal(UUID token, Row row) {
+        return seal(token == null ? null : GuestCancelToken.of(token), row);
     }
 
     /**
      * Opens a value produced by {@link #seal} for the SAME {@code row}.
      *
      * @throws IllegalStateException on a wrong/unknown key, tampering, a value moved from another row, an unknown
-     *                               version (including the unbound {@code v1:}), or a plaintext that is not a UUID — the message never names the token or
+     *                               version (including the unbound {@code v1:}), or a plaintext that is neither a short token
+     *                               nor a UUID ({@link GuestCancelToken#parse}) — the message never names the token or
      *                               the sealed value
      */
-    public UUID open(String sealed, Row row) {
+    public GuestCancelToken open(String sealed, Row row) {
         requireRow(row);
         if (sealed != null && sealed.startsWith(V2_PREFIX)) {
             return toToken(openV2(sealed.substring(V2_PREFIX.length()), row));
@@ -108,12 +116,9 @@ public class GuestCancelTokenCipher {
         throw new IllegalStateException(OPEN_FAILED + " — unknown key id");
     }
 
-    private static UUID toToken(String plaintext) {
-        try {
-            return UUID.fromString(plaintext);
-        } catch (IllegalArgumentException e) {
-            throw new IllegalStateException(OPEN_FAILED + " — not a cancel token");
-        }
+    private static GuestCancelToken toToken(String plaintext) {
+        return GuestCancelToken.parse(plaintext)
+                .orElseThrow(() -> new IllegalStateException(OPEN_FAILED + " — not a cancel token"));
     }
 
     private static void requireRow(Row row) {

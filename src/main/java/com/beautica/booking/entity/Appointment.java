@@ -1,6 +1,7 @@
 package com.beautica.booking.entity;
 
 import com.beautica.booking.domain.CancelTokenHasher;
+import com.beautica.booking.domain.GuestCancelToken;
 import com.beautica.booking.domain.GuestConsent;
 import com.beautica.booking.enums.BookingSource;
 import com.beautica.booking.enums.BookingStatus;
@@ -166,7 +167,7 @@ public class Appointment extends AuditableEntity {
     // cancelToken(UUID), which also sets cancelTokenHash.
     @JsonIgnore
     @Transient
-    private UUID cancelToken;
+    private GuestCancelToken cancelToken;
 
     // Phase 435 (V230) — the same token sealed with AES-256-GCM (GuestCancelTokenCipher), so later guest SMS can
     // rebuild the guest's own /book/cancel/{token} link. Never a lookup key (the hash is). NULL on rows created
@@ -278,7 +279,7 @@ public class Appointment extends AuditableEntity {
             String guestName,
             String guestSurname,
             String guestPhone,
-            UUID cancelToken,
+            GuestCancelToken cancelToken,
             GuestConsent consent) {
         return guestAppointment(salon, guestName, guestSurname, guestPhone, cancelToken, consent, null);
     }
@@ -293,7 +294,7 @@ public class Appointment extends AuditableEntity {
             String guestName,
             String guestSurname,
             String guestPhone,
-            UUID cancelToken,
+            GuestCancelToken cancelToken,
             GuestConsent consent,
             String clientComment) {
         if (guestName == null || guestName.isBlank()) {
@@ -368,7 +369,7 @@ public class Appointment extends AuditableEntity {
             String guestName,
             String guestSurname,
             String guestPhone,
-            UUID cancelToken,
+            GuestCancelToken cancelToken,
             UUID createdByUserId) {
         Booking.requireStaffWalkInIdentity(guestName, guestSurname, guestPhone, createdByUserId);
         return Appointment.builder()
@@ -407,7 +408,12 @@ public class Appointment extends AuditableEntity {
      */
     public static class AppointmentBuilder {
 
+        /** A legacy UUID token (tests, fixtures) — same as {@code cancelToken(GuestCancelToken.of(uuid))}. */
         public AppointmentBuilder cancelToken(UUID cancelToken) {
+            return cancelToken(cancelToken == null ? null : GuestCancelToken.of(cancelToken));
+        }
+
+        public AppointmentBuilder cancelToken(GuestCancelToken cancelToken) {
             this.cancelToken = cancelToken;
             this.cancelTokenHash = cancelToken == null ? null : CancelTokenHasher.hash(cancelToken);
             return this;

@@ -1,11 +1,16 @@
 package com.beautica.booking.service;
 
+import com.beautica.booking.crypto.GuestCancelTokenCipher;
+import com.beautica.booking.crypto.GuestCancelTokenCipherFixtures;
+import com.beautica.booking.domain.GuestCancelToken;
+import com.beautica.booking.domain.GuestConfirmationSmsText;
 import com.beautica.booking.entity.Appointment;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingSource;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.common.security.PhoneHasher;
+import com.beautica.config.BookingSmsProperties;
 import com.beautica.config.PhoneHashPepperConfig;
 import com.beautica.master.entity.Master;
 import com.beautica.salon.entity.Salon;
@@ -34,7 +39,12 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
-/** Plain mocks (no strict-stubs extension): each booking fixture stubs every getter the renderer may read. */
+/**
+ * Plain mocks (no strict-stubs extension): each booking fixture stubs every getter the renderer may read.
+ *
+ * <p>Phase 435 follow-up — the Telegram details ARE the confirmation SMS: every content test asserts the exact text and
+ * that it equals {@link GuestConfirmationSmsText#render} over the SMS templates the guest's SMS used.
+ */
 @DisplayName("GuestBookingDetailsText — Telegram booking details after linking")
 class GuestBookingDetailsTextTest {
 
@@ -47,6 +57,11 @@ class GuestBookingDetailsTextTest {
     private static final PhoneHasher PHONE_HASHER =
             new PhoneHasher(new PhoneHashPepperConfig("unit-test-pepper-unit-test-pepper-0123456789"));
     private static final byte[] PROVEN = PHONE_HASHER.hash(GUEST_PHONE).hash();
+    private static final String FRONTEND = "https://beautica.app";
+    private static final GuestCancelToken TOKEN = GuestCancelToken.valueOf("Ab3dE5gH7jK9mN1p");
+    private static final String LINK = FRONTEND + "/c/" + TOKEN.value();
+    private static final GuestCancelTokenCipher CIPHER = GuestCancelTokenCipherFixtures.testCipher();
+    private static final BookingSmsProperties.Sms SMS = new BookingSmsProperties().getSms();
 
     private BookingRepository bookingRepository;
     private GuestBookingDetailsText detailsText;
@@ -56,7 +71,8 @@ class GuestBookingDetailsTextTest {
     @BeforeEach
     void setUp() {
         bookingRepository = mock(BookingRepository.class);
-        detailsText = new GuestBookingDetailsText(bookingRepository, PHONE_HASHER, Clock.fixed(NOW, ZoneOffset.UTC));
+        detailsText = new GuestBookingDetailsText(bookingRepository, PHONE_HASHER, Clock.fixed(NOW, ZoneOffset.UTC),
+                new BookingSmsProperties(), GuestCancelTokenCipherFixtures.testPageLinks(FRONTEND));
         master = mock(Master.class);
         when(master.displayFirstName()).thenReturn(" Марія ");
         when(master.displayLastName()).thenReturn("Левченко");
@@ -64,6 +80,7 @@ class GuestBookingDetailsTextTest {
         when(salon.getName()).thenReturn("Beauty Room");
         when(salon.getStreet()).thenReturn("вул. Хрещатик");
         when(salon.getBuildingNo()).thenReturn("1");
+        when(salon.getLocationNote()).thenReturn("вхід з двору");
     }
 
     private Booking booking(UUID id, String service, OffsetDateTime startsAt, BookingStatus status,
@@ -83,6 +100,8 @@ class GuestBookingDetailsTextTest {
         when(booking.getGuestPhone()).thenReturn(GUEST_PHONE);
         when(booking.getPriceAtBooking()).thenReturn(new BigDecimal(price));
         when(booking.getPriceMaxAtBooking()).thenReturn(priceMax == null ? null : new BigDecimal(priceMax));
+        when(booking.getCancelTokenSealed()).thenReturn(
+                CIPHER.seal(TOKEN, GuestCancelTokenCipher.Row.booking(id)));
         return booking;
     }
 
@@ -91,60 +110,71 @@ class GuestBookingDetailsTextTest {
     }
 
     @Test
-    @DisplayName("render heading, service, Kyiv date/time, master, salon, address and price for one booking")
-    void should_renderAllDetails_when_singleSalonBooking() {
-        found(booking(BOOKING_ID, "Манікюр", STARTS_AT, BookingStatus.CONFIRMED, "350.00", null));
+    @DisplayName("render exactly the salon confirmation SMS — salon, master, address with note, own page link")
+    void should_renderSalonConfirmationSms_when_singleSalonBooking() {
+        Booking lead = booking(BOOKING_ID, "Манікюр", STARTS_AT, BookingStatus.CONFIRMED, "350.00", null);
+        found(lead);
 
         Optional<String> text = detailsText.render(BOOKING_ID, PROVEN);
 
         assertThat(text).contains("""
-                Запис підтверджено ✅
-                Послуга: Манікюр
-                Дата: 03.11.2026 о 10:00
-                Майстер: Марія Левченко
-                Салон: Beauty Room
-                Адреса: вул. Хрещатик, 1
-                Ціна: 350 ₴""");
+                Beautica: Ваш запис підтверджено!
+
+                03.11.2026 о 10:00
+                Салон Beauty Room, майстер Марія Левченко.
+                Адреса: вул. Хрещатик 1 (вхід з двору)
+                Скасувати: https://beautica.app/c/Ab3dE5gH7jK9mN1p""");
+        assertThat(text).as("Telegram text == the LINK confirmation SMS text")
+                .contains(GuestConfirmationSmsText.render(SMS.getConfirmationSalon(), SMS.getConfirmation(), lead, LINK));
     }
 
     @Test
-    @DisplayName("list every CONFIRMED visit service in time order and sum the price band")
-    void should_listConfirmedServicesAndSumBand_when_visit() {
+    @DisplayName("link the VISIT header's page and use the first CONFIRMED item's time for a visit")
+    void should_linkVisitHeaderPage_when_visit() {
         Booking lead = booking(BOOKING_ID, "Стрижка", STARTS_AT, BookingStatus.CONFIRMED, "300.00", "500.00");
         Appointment appointment = mock(Appointment.class);
         when(appointment.getId()).thenReturn(APPOINTMENT_ID);
+        when(appointment.getCancelTokenSealed()).thenReturn(
+                CIPHER.seal(TOKEN, GuestCancelTokenCipher.Row.appointment(APPOINTMENT_ID)));
         when(lead.getAppointment()).thenReturn(appointment);
         Booking second = booking(UUID.randomUUID(), "Укладка", STARTS_AT.plusHours(1), BookingStatus.CONFIRMED,
                 "200.00", null);
-        Booking declined = booking(UUID.randomUUID(), "Фарбування", STARTS_AT.plusHours(2), BookingStatus.DECLINED,
-                "900.00", null);
-        found(second, declined, lead);
+        when(second.getAppointment()).thenReturn(appointment);
+        found(second, lead);
 
         String text = detailsText.render(BOOKING_ID, PROVEN).orElseThrow();
 
-        assertThat(text).contains("\nПослуги: Стрижка, Укладка\n").doesNotContain("Фарбування")
-                .endsWith("\nЦіна: від 500 до 700 ₴");
+        assertThat(text).contains("\n03.11.2026 о 10:00\n").endsWith("\nСкасувати: " + LINK)
+                .doesNotContain("Стрижка").doesNotContain("Ціна");
     }
 
     @Test
-    @DisplayName("use the independent master's own address and no salon line when there is no salon")
-    void should_useMasterAddressWithoutSalonLine_when_independentMaster() {
+    @DisplayName("render the independent-master SMS with the master's own address and note")
+    void should_renderMasterConfirmationSms_when_independentMaster() {
         Booking lead = booking(BOOKING_ID, "Манікюр", STARTS_AT, BookingStatus.CONFIRMED, "350.50", null);
         when(lead.getSalon()).thenReturn(null);
         User masterUser = mock(User.class);
         when(masterUser.getStreet()).thenReturn("вул. Січових Стрільців");
         when(masterUser.getBuildingNo()).thenReturn(null);
+        when(masterUser.getLocationNote()).thenReturn("2 поверх");
         when(master.getUser()).thenReturn(masterUser);
         found(lead);
 
         String text = detailsText.render(BOOKING_ID, PROVEN).orElseThrow();
 
-        assertThat(text).doesNotContain("Салон:").contains("\nАдреса: вул. Січових Стрільців\n")
-                .endsWith("\nЦіна: 350.50 ₴");
+        assertThat(text).isEqualTo("""
+                Beautica: Ваш запис підтверджено!
+
+                03.11.2026 о 10:00
+                Майстер Марія Левченко.
+                Адреса: вул. Січових Стрільців (2 поверх)
+                Скасувати: https://beautica.app/c/Ab3dE5gH7jK9mN1p""");
+        assertThat(text).isEqualTo(
+                GuestConfirmationSmsText.render(SMS.getConfirmationSalon(), SMS.getConfirmation(), lead, LINK));
     }
 
     @Test
-    @DisplayName("omit the address line when the salon has none")
+    @DisplayName("omit the address line (and its note) when the salon has no address")
     void should_omitAddressLine_when_salonHasNoAddress() {
         when(salon.getStreet()).thenReturn(" ");
         when(salon.getBuildingNo()).thenReturn(null);
@@ -152,7 +182,32 @@ class GuestBookingDetailsTextTest {
 
         String text = detailsText.render(BOOKING_ID, PROVEN).orElseThrow();
 
-        assertThat(text).doesNotContain("Адреса:");
+        assertThat(text).doesNotContain("Адреса:").doesNotContain("вхід з двору");
+    }
+
+    @Test
+    @DisplayName("sanitise provider text like the SMS — a URL-like salon name and note are dropped")
+    void should_dropUrlLikeProviderText_when_rendered() {
+        when(salon.getName()).thenReturn("Знижки на beauty-deals.com");
+        when(salon.getLocationNote()).thenReturn("t.me/promo");
+        found(booking(BOOKING_ID, "Манікюр", STARTS_AT, BookingStatus.CONFIRMED, "350.00", null));
+
+        String text = detailsText.render(BOOKING_ID, PROVEN).orElseThrow();
+
+        assertThat(text).contains("\nМайстер Марія Левченко.\nАдреса: вул. Хрещатик 1\n")
+                .doesNotContain("beauty-deals").doesNotContain("t.me");
+    }
+
+    @Test
+    @DisplayName("drop the «Скасувати:» line when the row has no sealed token (created before V230)")
+    void should_dropCancelLine_when_noSealedToken() {
+        Booking lead = booking(BOOKING_ID, "Манікюр", STARTS_AT, BookingStatus.CONFIRMED, "350.00", null);
+        when(lead.getCancelTokenSealed()).thenReturn(null);
+        found(lead);
+
+        String text = detailsText.render(BOOKING_ID, PROVEN).orElseThrow();
+
+        assertThat(text).endsWith("(вхід з двору)").doesNotContain("Скасувати");
     }
 
     @Test
@@ -209,22 +264,25 @@ class GuestBookingDetailsTextTest {
     }
 
     @Test
-    @DisplayName("name a walk-in visit's services by platform service type, loading the whole visit in one query")
-    void should_usePlatformNamesInOneQuery_when_walkInVisit() {
+    @DisplayName("render the walk-in confirmation SMS for a STAFF visit, loading the whole visit in one query")
+    void should_renderWalkInSmsInOneQuery_when_walkInVisit() {
         Booking lead = walkIn(booking(BOOKING_ID, "Мій манікюр", STARTS_AT, BookingStatus.CONFIRMED, "350.00", null),
                 "Манікюр");
         Booking second = walkIn(booking(UUID.randomUUID(), "Мій педикюр", STARTS_AT.plusHours(1),
                 BookingStatus.CONFIRMED, "400.00", null), "Педикюр");
         Appointment appointment = mock(Appointment.class);
         when(appointment.getId()).thenReturn(APPOINTMENT_ID);
+        when(appointment.getCancelTokenSealed()).thenReturn(
+                CIPHER.seal(TOKEN, GuestCancelTokenCipher.Row.appointment(APPOINTMENT_ID)));
         when(lead.getAppointment()).thenReturn(appointment);
         when(second.getAppointment()).thenReturn(appointment);
         found(second, lead);
 
         String text = detailsText.render(BOOKING_ID, PROVEN).orElseThrow();
 
-        assertThat(text).contains("\nПослуги: Манікюр, Педикюр\n").doesNotContain("Мій ")
-                .endsWith("\nЦіна: 750 ₴");
+        assertThat(text).isEqualTo(GuestConfirmationSmsText.render(
+                SMS.getWalkInConfirmationSalon(), SMS.getWalkInConfirmation(), lead, LINK));
+        assertThat(text).doesNotContain("Мій ");
         verify(bookingRepository, times(1)).findWithVisitForGuestDetails(BOOKING_ID);
         verify(bookingRepository, never()).findByAppointmentIdWithGraph(any());
         verify(bookingRepository, never()).findAllByIdsWithGraph(any());
@@ -238,7 +296,7 @@ class GuestBookingDetailsTextTest {
 
         String text = detailsText.render(BOOKING_ID, PROVEN).orElseThrow();
 
-        assertThat(text).as("07:00Z is 10:00 Kyiv in June, actual=%s", text).contains("\nДата: 15.06.2027 о 10:00\n");
+        assertThat(text).as("07:00Z is 10:00 Kyiv in June, actual=%s", text).contains("\n15.06.2027 о 10:00\n");
     }
 
     @Test
@@ -254,8 +312,7 @@ class GuestBookingDetailsTextTest {
 
         String text = detailsText.render(BOOKING_ID, PROVEN).orElseThrow();
 
-        assertThat(text).contains("\nПослуга: Укладка\n").doesNotContain("Стрижка")
-                .contains("\nДата: 03.11.2026 о 11:00\n").endsWith("\nЦіна: 200 ₴");
+        assertThat(text).contains("\n03.11.2026 о 11:00\n");
     }
 
     @Test
@@ -269,16 +326,6 @@ class GuestBookingDetailsTextTest {
         found(lead, second);
 
         assertThat(detailsText.render(BOOKING_ID, PROVEN)).isEmpty();
-    }
-
-    @Test
-    @DisplayName("show a single price, not «від X до X», when the frozen ceiling equals the floor")
-    void should_renderFixedPrice_when_ceilingEqualsFloor() {
-        found(booking(BOOKING_ID, "Манікюр", STARTS_AT, BookingStatus.CONFIRMED, "350.00", "350.00"));
-
-        String text = detailsText.render(BOOKING_ID, PROVEN).orElseThrow();
-
-        assertThat(text).endsWith("\nЦіна: 350 ₴").doesNotContain("від");
     }
 
     private static Booking walkIn(Booking booking, String platformName) {

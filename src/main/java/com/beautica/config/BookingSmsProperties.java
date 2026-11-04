@@ -142,12 +142,15 @@ public class BookingSmsProperties {
         /**
          * Confirmation template. Placeholders: {@code {date}}, {@code {time}}, {@code {masterName}},
          * {@code {cancelUrl}}. Phase 435 (user decision 2026-11-04): no {@code {serviceName}} — it is no
-         * longer substituted.
+         * longer substituted. Phase 435 follow-up: the optional «Адреса: {address} ({locationNote})» line (dropped
+         * without an address; brackets dropped without a note) — rendered by {@code GuestConfirmationSmsText}, which
+         * also renders the Telegram details after linking, so both channels carry the same text.
          */
         private String confirmation =
                 "Beautica: Ваш запис підтверджено!\n\n"
                         + "{date} о {time}\n"
                         + "Майстер {masterName}.\n"
+                        + "Адреса: {address} ({locationNote})\n"
                         + "Скасувати: {cancelUrl}";
 
         /**
@@ -160,8 +163,8 @@ public class BookingSmsProperties {
          */
         private String reminder =
                 "Beautica: Нагадуємо, що завтра у Вас запис!\n\n"
-                        + "{masterName} | {serviceName} о {time}\n\n"
-                        + "Адреса: {address}\n\n"
+                        + "{masterName} | {serviceName} о {time}\n"
+                        + "Адреса: {address} ({locationNote})\n"
                         + "Скасувати запис: {cancelUrl}";
 
         /**
@@ -190,6 +193,7 @@ public class BookingSmsProperties {
                 "Beautica: Ваш запис підтверджено!\n\n"
                         + "{date} о {time}\n"
                         + "Майстер {masterName}.\n"
+                        + "Адреса: {address} ({locationNote})\n"
                         + "Скасувати: {cancelUrl}";
 
         /**
@@ -202,6 +206,7 @@ public class BookingSmsProperties {
                 "Beautica: Ваш запис підтверджено!\n\n"
                         + "{date} о {time}\n"
                         + "Салон {salonName}, майстер {masterName}.\n"
+                        + "Адреса: {address} ({locationNote})\n"
                         + "Скасувати: {cancelUrl}";
 
         /** Phase 435 — salon variant of {@link #walkInConfirmation}; same copy as {@link #confirmationSalon}. */
@@ -209,20 +214,21 @@ public class BookingSmsProperties {
                 "Beautica: Ваш запис підтверджено!\n\n"
                         + "{date} о {time}\n"
                         + "Салон {salonName}, майстер {masterName}.\n"
+                        + "Адреса: {address} ({locationNote})\n"
                         + "Скасувати: {cancelUrl}";
 
         /** Phase 435 — salon variant of {@link #reminder}. */
         private String reminderSalon =
                 "Beautica: Нагадуємо, що завтра у Вас запис!\n\n"
-                        + "{salonName} | {masterName} | {serviceName} о {time}\n\n"
-                        + "Адреса: {salonAddress}\n\n"
+                        + "{salonName} | {masterName} | {serviceName} о {time}\n"
+                        + "Адреса: {salonAddress} ({locationNote})\n"
                         + "Скасувати запис: {cancelUrl}";
 
         /** Phase 435 — salon variant of {@link #reminder2h} (Java default only, like {@code reminder2h}). */
         private String reminder2hSalon =
                 "Beautica: Нагадуємо, що сьогодні у Вас запис!\n\n"
-                        + "{salonName} | {masterName} | {serviceName} о {time}\n\n"
-                        + "Адреса: {salonAddress}\n\n"
+                        + "{salonName} | {masterName} | {serviceName} о {time}\n"
+                        + "Адреса: {salonAddress} ({locationNote})\n"
                         + "Скасувати запис: {cancelUrl}";
 
         public String getConfirmationSalon() {
@@ -291,8 +297,8 @@ public class BookingSmsProperties {
          */
         private String reminder2h =
                 "Beautica: Нагадуємо, що сьогодні у Вас запис!\n\n"
-                        + "{masterName} | {serviceName} о {time}\n\n"
-                        + "Адреса: {address}\n\n"
+                        + "{masterName} | {serviceName} о {time}\n"
+                        + "Адреса: {address} ({locationNote})\n"
                         + "Скасувати запис: {cancelUrl}";
 
         public String getReminder2h() {
@@ -315,7 +321,7 @@ public class BookingSmsProperties {
          * phase 390 cancellation-SMS precedent ({@code GuestProviderCancellationSmsText}), whose
          * "Beautica: " prefix it follows.
          *
-         * <p>50 UCS-2 chars rendered (one segment). {@code GuestRescheduleSmsText} fails boot when an
+         * <p>53 UCS-2 chars rendered (one segment; phase 435 follow-up wording «перенесено на {date} о {time}.»). {@code GuestRescheduleSmsText} fails boot when an
          * override drops a placeholder or renders over two UCS-2 segments (134 chars). Phase 435 (user
          * decision 2026-11-04): new wording, and {@code GuestRescheduleSmsText} appends the shared
          * «Деталі або записатись знову {url}» paragraph after this body when a rebook link exists.
@@ -324,7 +330,7 @@ public class BookingSmsProperties {
          * {@code application.yml} carries no {@code reschedule:} key. Override per environment with
          * the relaxed-binding env var {@code APP_BOOKING_SMS_RESCHEDULE}.
          */
-        private String reschedule = "Beautica: Ваш запис {date} о {time} перенесено.";
+        private String reschedule = "Beautica: Ваш запис перенесено на {date} о {time}.";
 
         public String getReschedule() {
             return reschedule;

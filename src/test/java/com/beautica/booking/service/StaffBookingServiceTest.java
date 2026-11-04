@@ -1,5 +1,6 @@
 package com.beautica.booking.service;
 
+import com.beautica.booking.domain.GuestCancelToken;
 import com.beautica.booking.crypto.GuestCancelTokenCipherFixtures;
 import com.beautica.notification.channel.GuestMessageRouters;
 import com.beautica.TestConstants;
@@ -807,8 +808,9 @@ class StaffBookingServiceTest {
             create(command(guest(RAW_PHONE)));
 
             String text = captureSmsText();
-            assertThat(text).doesNotContain("{cancelUrl}").contains("Скасувати: " + CANCEL_BASE_URL + "/book/cancel/");
-            UUID token = UUID.fromString(text.substring(text.lastIndexOf('/') + 1));
+            assertThat(text).doesNotContain("{cancelUrl}").contains("Скасувати: " + CANCEL_BASE_URL + "/c/");
+            GuestCancelToken token = GuestCancelToken.valueOf(text.substring(text.lastIndexOf('/') + 1));
+            assertThat(token.value()).as("phase 435 follow-up: a new token is 16 base62 chars").matches("[0-9A-Za-z]{16}");
             ArgumentCaptor<Appointment> header = ArgumentCaptor.forClass(Appointment.class);
             verify(appointmentRepository).save(header.capture());
             assertThat(header.getValue().getCancelTokenHash())
@@ -873,8 +875,42 @@ class StaffBookingServiceTest {
                     "Beautica: Ваш запис підтверджено!\n\n"
                             + "10.06.2026 о 12:00\n"
                             + "Салон Beauty Room, майстер Марія Левченко.\n"
-                            + "Скасувати: " + CANCEL_BASE_URL + "/book/cancel/"
-                            + header().getCancelToken());
+                            + "Скасувати: " + CANCEL_BASE_URL + "/c/"
+                            + header().getCancelToken().value());
+        }
+
+        @Test
+        @DisplayName("phase 435 follow-up: a salon walk-in SMS carries the salon address with its location note")
+        void should_renderSalonAddressWithNote_when_salonHasThem() {
+            Master master = salonMaster();
+            ReflectionTestUtils.setField(master.getSalon(), "street", "Хрещатик");
+            ReflectionTestUtils.setField(master.getSalon(), "buildingNo", "10");
+            ReflectionTestUtils.setField(master.getSalon(), "locationNote", "вхід\nз двору");
+            stubHappyPath(master, assignment(null, null));
+
+            create(command(guest(RAW_PHONE)));
+
+            assertThat(captureSmsText()).isEqualTo(
+                    "Beautica: Ваш запис підтверджено!\n\n"
+                            + "10.06.2026 о 12:00\n"
+                            + "Салон Beauty Room, майстер Марія Левченко.\n"
+                            + "Адреса: Хрещатик 10 (вхід з двору)\n"
+                            + "Скасувати: " + CANCEL_BASE_URL + "/c/"
+                            + header().getCancelToken().value());
+        }
+
+        @Test
+        @DisplayName("phase 435 follow-up: an independent master's own address without a note renders no brackets")
+        void should_renderAddressWithoutBrackets_when_noLocationNote() {
+            Master master = independentMaster();
+            ReflectionTestUtils.setField(master.getUser(), "street", "Сагайдачного");
+            ReflectionTestUtils.setField(master.getUser(), "buildingNo", "3А");
+            stubHappyPath(master, assignmentOf(master, null, null));
+
+            createAs(masterUserId, command(new StaffBookingScope.Self(masterUserId), guest(RAW_PHONE)));
+
+            assertThat(captureSmsText()).contains("\nМайстер Марія Левченко.\nАдреса: Сагайдачного 3А\nСкасувати: ")
+                    .doesNotContain("(");
         }
 
         @Test
@@ -888,8 +924,8 @@ class StaffBookingServiceTest {
                     "Beautica: Ваш запис підтверджено!\n\n"
                             + "10.06.2026 о 12:00\n"
                             + "Майстер Марія Левченко.\n"
-                            + "Скасувати: " + CANCEL_BASE_URL + "/book/cancel/"
-                            + header().getCancelToken());
+                            + "Скасувати: " + CANCEL_BASE_URL + "/c/"
+                            + header().getCancelToken().value());
         }
 
         @Test
@@ -918,8 +954,8 @@ class StaffBookingServiceTest {
                     "Beautica: Ваш запис підтверджено!\n\n"
                             + "10.06.2026 о 12:00\n"
                             + "Майстер Марія Левченко.\n"
-                            + "Скасувати: " + CANCEL_BASE_URL + "/book/cancel/"
-                            + header().getCancelToken());
+                            + "Скасувати: " + CANCEL_BASE_URL + "/c/"
+                            + header().getCancelToken().value());
         }
 
         @Test
@@ -936,8 +972,8 @@ class StaffBookingServiceTest {
                     "Beautica: Ваш запис підтверджено!\n\n"
                             + "10.06.2026 о 12:00\n"
                             + "Салон Beauty Room.\n"
-                            + "Скасувати: " + CANCEL_BASE_URL + "/book/cancel/"
-                            + header().getCancelToken());
+                            + "Скасувати: " + CANCEL_BASE_URL + "/c/"
+                            + header().getCancelToken().value());
         }
 
         @Test
@@ -952,8 +988,8 @@ class StaffBookingServiceTest {
             assertThat(captureSmsText()).isEqualTo(
                     "Beautica: Ваш запис підтверджено!\n\n"
                             + "10.06.2026 о 12:00\n"
-                            + "Скасувати: " + CANCEL_BASE_URL + "/book/cancel/"
-                            + header().getCancelToken());
+                            + "Скасувати: " + CANCEL_BASE_URL + "/c/"
+                            + header().getCancelToken().value());
         }
 
         /**
@@ -986,7 +1022,7 @@ class StaffBookingServiceTest {
             assertThat(header().getCancelTokenHash()).as("ONE token per visit, on the header (412 D1)").isNotNull();
             assertThat(captureSavedBookings()).hasSize(3)
                     .allSatisfy(item -> assertThat(item.getCancelTokenHash()).isNull());
-            assertThat(captureSmsText()).endsWith("/book/cancel/" + header().getCancelToken());
+            assertThat(captureSmsText()).endsWith("/c/" + header().getCancelToken().value());
         }
 
         /**

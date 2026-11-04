@@ -1,5 +1,6 @@
 package com.beautica.booking.service;
 
+import com.beautica.booking.domain.GuestCancelToken;
 import com.beautica.booking.domain.CancelTokenHasher;
 import com.beautica.booking.domain.GuestPageWindow;
 import com.beautica.booking.domain.GuestVisitAddress;
@@ -96,7 +97,7 @@ public class BookingCancellationService {
      * @throws NotFoundException when the token is unknown, consumed or anonymised (→ 404)
      */
     @Transactional(readOnly = true)
-    public CancelTokenInfoResponse getInfo(UUID token) {
+    public CancelTokenInfoResponse getInfo(GuestCancelToken token) {
         // BE-7: a token on an Appointment is a multi-service visit — served by the visit service. Only a
         // token that resolves to no visit falls through to the legacy single-booking path below.
         return guestVisitCancellationService.getInfo(token)
@@ -111,7 +112,7 @@ public class BookingCancellationService {
      * @throws BusinessException  with 422 when the cancellation window has closed
      */
     @Transactional
-    public void cancel(UUID token) {
+    public void cancel(GuestCancelToken token) {
         // BE-7: a token on an Appointment cancels the WHOLE visit (header + all items) via the visit
         // service; it returns true when it handled the token. Only a non-visit token falls through to
         // the legacy single-booking cancel below (byte-for-byte unchanged).
@@ -225,7 +226,8 @@ public class BookingCancellationService {
                 booking.getStatus(),
                 guestRebookPaths.forBooking(booking).orElse(null),
                 salonName(booking),
-                GuestVisitAddress.of(booking));
+                GuestVisitAddress.of(booking),
+                GuestVisitAddress.pageLocationNote(booking));
     }
 
     private void registerAfterCommitEviction(Booking booking) {

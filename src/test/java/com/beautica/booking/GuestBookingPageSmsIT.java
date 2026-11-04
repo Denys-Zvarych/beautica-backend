@@ -26,7 +26,7 @@ import static com.github.tomakehurst.wiremock.client.WireMock.urlEqualTo;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * Phase 435 QA — the guest's OWN booking page link ({@code /book/cancel/{token}}, rebuilt from the V230 sealed copy)
+ * Phase 435 QA — the guest's OWN booking page link ({@code /c/{token}} since the follow-up, rebuilt from the V230 sealed copy)
  * and the removed self-cancel SMS, asserted at the Turbosms wire (real gated {@code SmsService}, real outbox drain,
  * real {@code GuestCancelTokenCipher}). Every row creates its booking through the public LINK route, so the sealed
  * copy is the one production writes — no fixture guesses its format or row binding.
@@ -159,8 +159,8 @@ class GuestBookingPageSmsIT extends AbstractWalkInBookingSmsIT {
     @DisplayName("24h reminder for a SALON LINK booking → exact salon variant: salon | master | service line, the "
             + "salon's «Адреса:» line and the guest's own page as «Скасувати запис:»")
     void should_sendSalonReminderWithAddressAndOwnPage_when_salonBookingDueTomorrow() throws Exception {
-        jdbcTemplate.update("UPDATE salons SET name = 'Студія Лілія', street = 'Хрещатик', building_no = '10' "
-                + "WHERE id = ?", salon.salonId());
+        jdbcTemplate.update("UPDATE salons SET name = 'Студія Лілія', street = 'Хрещатик', building_no = '10', "
+                + "location_note = 'вхід з двору' WHERE id = ?", salon.salonId());
         ResponseEntity<String> created = createGuestBooking(tomorrowAtNoon());
         String cancelUrl = cancelUrlOf(created);
         UUID bookingId = UUID.fromString(readJson(created.getBody()).path("bookingId").asText());
@@ -172,8 +172,8 @@ class GuestBookingPageSmsIT extends AbstractWalkInBookingSmsIT {
                 "SELECT starts_at FROM bookings WHERE id = ?", OffsetDateTime.class, bookingId);
         String time = HH_MM.format(remindedStart.atZoneSameInstant(TimeZones.KYIV));
         assertThat(sentText()).isEqualTo("Beautica: Нагадуємо, що завтра у Вас запис!\n\n"
-                + "Студія Лілія | " + MASTER_NAME + " | " + SERVICE_NAME + " о " + time + "\n\n"
-                + "Адреса: Хрещатик 10\n\n"
+                + "Студія Лілія | " + MASTER_NAME + " | " + SERVICE_NAME + " о " + time + "\n"
+                + "Адреса: Хрещатик 10 (вхід з двору)\n"
                 + "Скасувати запис: " + cancelUrl);
         assertThat(sentTurbosmsPayload().path("recipients").get(0).asText()).isEqualTo(LINK_PHONE);
     }
@@ -194,7 +194,7 @@ class GuestBookingPageSmsIT extends AbstractWalkInBookingSmsIT {
     private String cancelUrlOf(ResponseEntity<String> created) {
         assertThat(created.getStatusCode()).as(created.getBody()).isEqualTo(HttpStatus.CREATED);
         String url = readJson(created.getBody()).path("cancelUrl").asText();
-        assertThat(url).matches("^https?://.+/book/cancel/[0-9a-f-]{36}$");
+        assertThat(url).matches("^https?://.+/c/[0-9A-Za-z]{16}$");
         return url;
     }
 

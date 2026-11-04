@@ -1,5 +1,6 @@
 package com.beautica.booking.service;
 
+import com.beautica.booking.domain.GuestCancelToken;
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
@@ -62,7 +63,23 @@ class GuestBookingPageLinksTest {
                 .cancelTokenSealed(CIPHER.seal(TOKEN, Row.booking(BOOKING_ID))).build();
 
         // Act + Assert
-        assertThat(links.forBooking(booking)).contains(FRONTEND + "/book/cancel/" + TOKEN);
+        assertThat(links.forBooking(booking)).contains(FRONTEND + "/c/" + TOKEN);
+    }
+
+    @Test
+    @DisplayName("phase 435 follow-up: a short token links /c/<16 base62>; a legacy UUID one keeps working on /c/<uuid>")
+    void should_buildShortPage_when_shortTokenSealed() {
+        // Arrange
+        GuestCancelToken shortToken = GuestCancelToken.generate();
+        Booking booking = Booking.builder().id(BOOKING_ID).cancelToken(shortToken)
+                .cancelTokenSealed(CIPHER.seal(shortToken, Row.booking(BOOKING_ID))).build();
+
+        // Act
+        String url = links.forBooking(booking).orElseThrow();
+
+        // Assert
+        assertThat(url).isEqualTo(FRONTEND + "/c/" + shortToken.value()).matches(".*/c/[0-9A-Za-z]{16}");
+        assertThat(url.length()).isEqualTo(FRONTEND.length() + 3 + GuestCancelToken.SHORT_LENGTH);
     }
 
     @Test
@@ -77,7 +94,7 @@ class GuestBookingPageLinksTest {
                 .appointment(header).build();
 
         // Act + Assert
-        assertThat(links.forBooking(item)).contains(FRONTEND + "/book/cancel/" + TOKEN);
+        assertThat(links.forBooking(item)).contains(FRONTEND + "/c/" + TOKEN);
         verifyNoInteractions(appointmentRepository);
     }
 

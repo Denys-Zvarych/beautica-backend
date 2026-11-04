@@ -1,6 +1,7 @@
 package com.beautica.booking.entity;
 
 import com.beautica.booking.domain.CancelTokenHasher;
+import com.beautica.booking.domain.GuestCancelToken;
 import com.beautica.booking.domain.GuestConsent;
 import com.beautica.booking.enums.BookingSource;
 import com.beautica.booking.enums.BookingStatus;
@@ -485,7 +486,7 @@ public class Booking extends AuditableEntity {
     // cancelTokenHash. @JsonIgnore for the same capability reason as above.
     @JsonIgnore
     @Transient
-    private UUID cancelToken;
+    private GuestCancelToken cancelToken;
 
     // Phase 435 (V230) — the same token sealed with AES-256-GCM (GuestCancelTokenCipher), so later guest SMS can
     // rebuild the guest's own /book/cancel/{token} link. Never a lookup key (the hash is). NULL on rows created
@@ -630,7 +631,7 @@ public class Booking extends AuditableEntity {
                 .guestName(guestName)
                 .guestSurname(guestSurname)
                 .guestPhone(guestPhone)
-                .cancelToken(UUID.randomUUID())
+                .cancelToken(GuestCancelToken.generate())
                 .reminderSent(false)
                 .guestPrivacyAcceptedAt(consent == null ? null : consent.acceptedAt())
                 .guestPrivacyPolicyVersion(consent == null ? null : consent.policyVersion())
@@ -789,7 +790,12 @@ public class Booking extends AuditableEntity {
      */
     public static class BookingBuilder {
 
+        /** A legacy UUID token (tests, fixtures) — same as {@code cancelToken(GuestCancelToken.of(uuid))}. */
         public BookingBuilder cancelToken(UUID cancelToken) {
+            return cancelToken(cancelToken == null ? null : GuestCancelToken.of(cancelToken));
+        }
+
+        public BookingBuilder cancelToken(GuestCancelToken cancelToken) {
             this.cancelToken = cancelToken;
             this.cancelTokenHash = cancelToken == null ? null : CancelTokenHasher.hash(cancelToken);
             return this;

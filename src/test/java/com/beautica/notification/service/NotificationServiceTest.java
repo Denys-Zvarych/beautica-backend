@@ -71,7 +71,7 @@ class NotificationServiceTest {
             com.beautica.booking.crypto.GuestCancelTokenCipherFixtures.testCipher();
     private static final UUID GUEST_TOKEN = UUID.fromString("123e4567-e89b-12d3-a456-426614174000");
     private static final String DETAILS_LINE =
-            "\n\nДеталі або записатись знову " + FRONTEND_BASE_URL + "/book/cancel/" + GUEST_TOKEN;
+            "\n\nДеталі або записатись знову " + FRONTEND_BASE_URL + "/c/" + GUEST_TOKEN;
 
     @BeforeEach
     void setUp() {
@@ -1013,7 +1013,7 @@ class NotificationServiceTest {
 
     private static final BookingSmsDispatcher.Kind RESCHEDULE_KIND = BookingSmsDispatcher.Kind.GUEST_PROVIDER_RESCHEDULE;
     /** The NEW start every reschedule mock carries: Kyiv 10:00 on 01.08.2026. */
-    private static final String RESCHEDULE_0108 = "Beautica: Ваш запис 01.08.2026 о 10:00 перенесено.";
+    private static final String RESCHEDULE_0108 = "Beautica: Ваш запис перенесено на 01.08.2026 о 10:00.";
 
     @Test
     @DisplayName("Phase 431: a provider reschedule of a LINK guest booking queues ONE fixed-copy SMS with the new "

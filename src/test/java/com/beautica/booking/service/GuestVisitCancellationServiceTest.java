@@ -1,5 +1,6 @@
 package com.beautica.booking.service;
 
+import com.beautica.booking.domain.GuestCancelToken;
 import com.beautica.booking.domain.CancelTokenHasher;
 import com.beautica.booking.entity.Appointment;
 import com.beautica.booking.entity.Booking;
@@ -68,7 +69,7 @@ import static org.mockito.Mockito.when;
 @DisplayName("GuestVisitCancellationService — guest cancel of a whole visit")
 class GuestVisitCancellationServiceTest {
 
-    private static final UUID TOKEN = UUID.randomUUID();
+    private static final GuestCancelToken TOKEN = GuestCancelToken.of(UUID.randomUUID());
     /** V206: repositories are keyed by the token's SHA-256 hash, never the raw token. */
     private static final String TOKEN_HASH = CancelTokenHasher.hash(TOKEN);
     private static final UUID APPOINTMENT_ID = UUID.randomUUID();

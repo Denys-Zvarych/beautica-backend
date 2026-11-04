@@ -457,7 +457,7 @@ abstract class AbstractWalkInBookingSmsIT extends AbstractStaffBookingIT {
     /** The guest's own page link ({@code /book/cancel/{token}}) from a public-route create response. */
     protected String guestPageUrlOf(ResponseEntity<String> created) {
         String url = readJson(created.getBody()).path("cancelUrl").asText();
-        assertThat(url).as("create response cancelUrl").matches("^https?://.+/book/cancel/[0-9a-f-]{36}$");
+        assertThat(url).as("create response cancelUrl").matches("^https?://.+/c/[0-9A-Za-z]{16}$");
         return url;
     }
 

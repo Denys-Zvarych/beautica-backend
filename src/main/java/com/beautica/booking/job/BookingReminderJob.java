@@ -395,16 +395,14 @@ public class BookingReminderJob {
         // Audit-fix cycle 2: a URL-like master name is dropped — render then removes the master segment.
         GuestSmsProviderText.masterName(masterName(booking)).ifPresent(name -> values.put("masterName", name));
         values.put("time", TIME_FMT.format(kyiv));
-        GuestSmsProviderText.address(GuestVisitAddress.of(booking)).ifPresent(address -> {
-            values.put(ADDRESS, address);
-            values.put(SALON_ADDRESS, address);
-        });
+        // Phase 435 follow-up: the address (both keys) plus the « ({locationNote})» value, kept only beside an address.
+        values.putAll(GuestVisitAddress.smsValues(booking, ADDRESS_PLACEHOLDERS));
         if (booking.getSalon() != null) {
             GuestSmsProviderText.salonName(booking.getSalon().getName())
                     .ifPresent(name -> values.put("salonName", name));
         }
         pageLinks.forBooking(booking).ifPresent(url -> values.put(CANCEL_URL, url));
-        // Capped at GuestSmsProviderText.MAX_SMS_CHARS: the address line goes first, then the salon.
+        // Capped at GuestSmsProviderText.MAX_SMS_CHARS: the note goes first, then the address line, then the salon.
         return GuestSmsProviderText.render(template.salon(), template.master(), values,
                 OPTIONAL_PLACEHOLDERS, ADDRESS_PLACEHOLDERS);
     }

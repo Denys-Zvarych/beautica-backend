@@ -113,12 +113,13 @@ class BookingSmsDispatcherTest {
 
     /**
      * Phase 408 — the unrouted-kind guard. With Telegram ON and the phone ACTIVE-linked, every kind except the
-     * provider cancellation still goes by SMS and never touches the link store or the messenger. Mutation: routing
+     * provider cancellation and (phase 435 follow-up) the provider reschedule still goes by SMS and never touches the link store or the messenger. Mutation: routing
      * {@code GUEST_CONFIRMATION} through the router turns this red.
      */
     @org.junit.jupiter.params.ParameterizedTest(name = "{0}")
     @org.junit.jupiter.params.provider.EnumSource(value = BookingSmsDispatcher.Kind.class,
-            names = "GUEST_PROVIDER_CANCELLATION", mode = org.junit.jupiter.params.provider.EnumSource.Mode.EXCLUDE)
+            names = {"GUEST_PROVIDER_CANCELLATION", "GUEST_PROVIDER_RESCHEDULE"},
+            mode = org.junit.jupiter.params.provider.EnumSource.Mode.EXCLUDE)
     @DisplayName("should_sendSmsOnly_when_kindIsNotRoutedEvenIfLinked")
     void should_sendSmsOnly_when_kindIsNotRoutedEvenIfLinked(BookingSmsDispatcher.Kind kind) {
         TelegramMessenger messenger = org.mockito.Mockito.mock(TelegramMessenger.class);
@@ -134,9 +135,11 @@ class BookingSmsDispatcherTest {
         verifyNoInteractions(messenger, links);
     }
 
-    @Test
-    @DisplayName("should_routeProviderCancellationToTelegram_when_phoneIsLinked")
-    void should_routeProviderCancellationToTelegram_when_phoneIsLinked() {
+    @org.junit.jupiter.params.ParameterizedTest(name = "{0}")
+    @org.junit.jupiter.params.provider.EnumSource(value = BookingSmsDispatcher.Kind.class,
+            names = {"GUEST_PROVIDER_CANCELLATION", "GUEST_PROVIDER_RESCHEDULE"})
+    @DisplayName("should_routeProviderCancellationAndRescheduleToTelegram_when_phoneIsLinked")
+    void should_routeProviderCancellationToTelegram_when_phoneIsLinked(BookingSmsDispatcher.Kind kind) {
         TelegramMessenger messenger = org.mockito.Mockito.mock(TelegramMessenger.class);
         TelegramLinkService links = org.mockito.Mockito.mock(TelegramLinkService.class);
         org.mockito.Mockito.when(links.findActiveForPhone(PHONE))
@@ -144,7 +147,7 @@ class BookingSmsDispatcherTest {
         BookingSmsDispatcher dispatcher = new BookingSmsDispatcher(smsService, linkedRouter(messenger, links),
                 new SyncTaskExecutor());
 
-        dispatcher.dispatchOrThrow(GUEST_KIND, PHONE, TEXT);
+        dispatcher.dispatchOrThrow(kind, PHONE, TEXT);
 
         verify(messenger).sendWaiting(42L, TEXT);
         verifyNoInteractions(smsService);

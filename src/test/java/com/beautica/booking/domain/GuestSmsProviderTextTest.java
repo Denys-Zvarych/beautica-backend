@@ -107,6 +107,78 @@ class GuestSmsProviderTextTest {
         assertThat(noSalon).isEqualTo("Beautica: X\n\n" + "M".repeat(40) + "\n\nEnd");
     }
 
+    private static final String NOTE_SALON = "Beautica: X\n\n{salonName} | {masterName}\nАдреса: {address} ({locationNote})\nEnd";
+    private static final String NOTE_MASTER = "Beautica: X\n\n{masterName}\nАдреса: {address} ({locationNote})\nEnd";
+
+    @Test
+    @DisplayName("a location note follows the address rules: one line, capped at 60, dropped when URL-like")
+    void should_sanitiseLocationNote_when_provided() {
+        // Act + Assert
+        assertThat(GuestSmsProviderText.locationNote("вхід\nз двору")).contains("вхід з двору");
+        assertThat(GuestSmsProviderText.locationNote("Н".repeat(100)).orElseThrow()).hasSize(60).endsWith("…");
+        assertThat(GuestSmsProviderText.locationNote("пишіть t.me/promo")).isEmpty();
+        assertThat(GuestSmsProviderText.locationNote(" ")).isEmpty();
+    }
+
+    @Test
+    @DisplayName("render keeps « (note)» after the address, and drops the brackets when there is no note")
+    void should_dropBrackets_when_noLocationNote() {
+        // Arrange
+        Map<String, String> withNote = new HashMap<>(Map.of("masterName", "Марія", "address", "Хрещатик 10",
+                GuestSmsProviderText.LOCATION_NOTE, "вхід з двору"));
+        Map<String, String> noNote = new HashMap<>(Map.of("masterName", "Марія", "address", "Хрещатик 10"));
+
+        // Act
+        String noted = GuestSmsProviderText.render(null, NOTE_MASTER, withNote, Set.of(), Set.of("address"));
+        String plain = GuestSmsProviderText.render(null, NOTE_MASTER, noNote, Set.of(), Set.of("address"));
+
+        // Assert
+        assertThat(noted).isEqualTo("Beautica: X\n\nМарія\nАдреса: Хрещатик 10 (вхід з двору)\nEnd");
+        assertThat(plain).isEqualTo("Beautica: X\n\nМарія\nАдреса: Хрещатик 10\nEnd");
+    }
+
+    @Test
+    @DisplayName("render never shows the note without an address — the whole «Адреса:» line goes")
+    void should_dropNoteWithAddress_when_noAddress() {
+        // Arrange
+        Map<String, String> values = new HashMap<>(Map.of("masterName", "Марія",
+                GuestSmsProviderText.LOCATION_NOTE, "вхід з двору"));
+
+        // Act + Assert
+        assertThat(GuestSmsProviderText.render(null, NOTE_MASTER, values, Set.of(), Set.of("address")))
+                .isEqualTo("Beautica: X\n\nМарія\nEnd");
+    }
+
+    @Test
+    @DisplayName("render drops the note first, then the address, then the salon, to fit the cap")
+    void should_dropNoteThenAddressThenSalon_when_overCap() {
+        // Arrange
+        Map<String, String> values = new HashMap<>();
+        values.put("salonName", "S".repeat(40));
+        values.put("masterName", "M".repeat(40));
+        values.put("address", "A".repeat(60));
+        values.put(GuestSmsProviderText.LOCATION_NOTE, "N".repeat(60));
+        String fullLength = GuestSmsProviderText.render(NOTE_SALON, NOTE_MASTER, values, Set.of(), Set.of("address"));
+        // pad so the full text is 1 over the cap, but the text without the 63-char « (N…)» fits
+        String tight = NOTE_SALON + "x".repeat(GuestSmsProviderText.MAX_SMS_CHARS - fullLength.length() + 1);
+        // pad so even without the note it does not fit, but without the address line it does
+        String tighter = NOTE_SALON + "x".repeat(GuestSmsProviderText.MAX_SMS_CHARS - fullLength.length() + 64);
+        // pad so no salon variant fits
+        String tightest = NOTE_SALON + "x".repeat(GuestSmsProviderText.MAX_SMS_CHARS);
+
+        // Act
+        String noNote = GuestSmsProviderText.render(tight, NOTE_MASTER, values, Set.of(), Set.of("address"));
+        String noAddress = GuestSmsProviderText.render(tighter, NOTE_MASTER, values, Set.of(), Set.of("address"));
+        String noSalon = GuestSmsProviderText.render(tightest, NOTE_MASTER, values, Set.of(), Set.of("address"));
+
+        // Assert
+        assertThat(fullLength).contains("Адреса: " + "A".repeat(60) + " (" + "N".repeat(60) + ")");
+        assertThat(noNote).contains("Адреса: " + "A".repeat(60) + "\n").doesNotContain("N".repeat(60))
+                .contains("S".repeat(40));
+        assertThat(noAddress).doesNotContain("Адреса").contains("S".repeat(40));
+        assertThat(noSalon).isEqualTo("Beautica: X\n\n" + "M".repeat(40) + "\nEnd");
+    }
+
     @Test
     @DisplayName("render uses the master template when the salon name was dropped")
     void should_useMasterTemplate_when_noSalonName() {
@@ -162,14 +234,14 @@ class GuestSmsProviderTextTest {
         BookingSmsProperties.Sms sms = new BookingSmsProperties().getSms();
         Map<String, String> values = new HashMap<>(Map.of(
                 "salonName", "Beauty Room", "date", "10.06.2026", "time", "12:00", "serviceName", "Манікюр",
-                "cancelUrl", "https://beautica.app/book/cancel/x"));
+                "cancelUrl", "https://beautica.app/c/x"));
         GuestSmsProviderText.masterName("t.me/promo").ifPresent(name -> values.put("masterName", name));
 
         // Act
         String confirmationSalon = GuestSmsProviderText.render(
-                sms.getWalkInConfirmationSalon(), sms.getWalkInConfirmation(), values, Set.of(), Set.of());
+                sms.getWalkInConfirmationSalon(), sms.getWalkInConfirmation(), values, Set.of(), Set.of("address"));
         String confirmation = GuestSmsProviderText.render(
-                null, sms.getWalkInConfirmation(), values, Set.of(), Set.of());
+                null, sms.getWalkInConfirmation(), values, Set.of(), Set.of("address"));
         String reminderSalon = GuestSmsProviderText.render(
                 sms.getReminderSalon(), sms.getReminder(), values, Set.of("address", "salonAddress"), Set.of());
         String reminder = GuestSmsProviderText.render(
@@ -178,11 +250,11 @@ class GuestSmsProviderTextTest {
         // Assert
         assertThat(values).doesNotContainKey("masterName");
         assertThat(confirmationSalon).isEqualTo("Beautica: Ваш запис підтверджено!\n\n10.06.2026 о 12:00\n"
-                + "Салон Beauty Room.\nСкасувати: https://beautica.app/book/cancel/x");
+                + "Салон Beauty Room.\nСкасувати: https://beautica.app/c/x");
         assertThat(confirmation).isEqualTo("Beautica: Ваш запис підтверджено!\n\n10.06.2026 о 12:00\n"
-                + "Скасувати: https://beautica.app/book/cancel/x");
-        assertThat(reminderSalon).contains("\n\nBeauty Room | Манікюр о 12:00\n\n").doesNotContain("{masterName}");
-        assertThat(reminder).contains("\n\nМанікюр о 12:00\n\n").doesNotContain("{masterName}").doesNotContain("|");
+                + "Скасувати: https://beautica.app/c/x");
+        assertThat(reminderSalon).contains("\n\nBeauty Room | Манікюр о 12:00\n").doesNotContain("{masterName}");
+        assertThat(reminder).contains("\n\nМанікюр о 12:00\n").doesNotContain("{masterName}").doesNotContain("|");
     }
 
     @ParameterizedTest

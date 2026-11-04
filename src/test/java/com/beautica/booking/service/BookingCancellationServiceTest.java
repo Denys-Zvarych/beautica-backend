@@ -1,5 +1,6 @@
 package com.beautica.booking.service;
 
+import com.beautica.booking.domain.GuestCancelToken;
 import com.beautica.notification.channel.GuestMessageRouter;
 import com.beautica.booking.domain.CancelTokenHasher;
 import com.beautica.booking.dto.CancelTokenInfoResponse;
@@ -59,7 +60,7 @@ import static org.mockito.Mockito.when;
 @DisplayName("BookingCancellationService — guest cancel by link")
 class BookingCancellationServiceTest {
 
-    private static final UUID TOKEN = UUID.randomUUID();
+    private static final GuestCancelToken TOKEN = GuestCancelToken.of(UUID.randomUUID());
     /** V206: repositories are keyed by the token's SHA-256 hash, never the raw token. */
     private static final String TOKEN_HASH = CancelTokenHasher.hash(TOKEN);
     private static final UUID BOOKING_ID = UUID.randomUUID();
@@ -445,7 +446,7 @@ class BookingCancellationServiceTest {
         return booking(startsAt, status, serviceName, TOKEN);
     }
 
-    private Booking booking(OffsetDateTime startsAt, BookingStatus status, String serviceName, UUID cancelToken) {
+    private Booking booking(OffsetDateTime startsAt, BookingStatus status, String serviceName, GuestCancelToken cancelToken) {
         Master master = Master.builder().id(UUID.randomUUID()).user(masterUser()).isActive(true).build();
         return booking(startsAt, status, serviceName, cancelToken, master);
     }
@@ -459,12 +460,12 @@ class BookingCancellationServiceTest {
         return new User("m@beautica.test", "x", com.beautica.auth.Role.SALON_MASTER, "Марія", "Левченко", null);
     }
 
-    private Booking booking(OffsetDateTime startsAt, BookingStatus status, String serviceName, UUID cancelToken,
+    private Booking booking(OffsetDateTime startsAt, BookingStatus status, String serviceName, GuestCancelToken cancelToken,
                             Master master) {
         return booking(startsAt, status, serviceName, cancelToken, master, null);
     }
 
-    private Booking booking(OffsetDateTime startsAt, BookingStatus status, String serviceName, UUID cancelToken,
+    private Booking booking(OffsetDateTime startsAt, BookingStatus status, String serviceName, GuestCancelToken cancelToken,
                             Master master, Salon salon) {
         ServiceDefinition def = ServiceDefinition.builder()
                 .name(serviceName)

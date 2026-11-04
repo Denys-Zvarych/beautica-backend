@@ -28,6 +28,10 @@ import java.time.OffsetDateTime;
  * @param address        phase 435 — where the visit happens, the same text the reminder SMS shows
  *                       ({@code GuestVisitAddress}: salon street + building, else its legacy free-text address; an
  *                       independent master's own street + building); {@code null} when there is none
+ * @param locationNote   phase 435 follow-up — the provider's «how to find us» note for that address (the salon's, else
+ *                       the independent master's own {@code location_note}), the SMS rules applied
+ *                       ({@code GuestSmsProviderText#locationNote}: one line, ≤ 60 chars, {@code null} when URL-like);
+ *                       {@code null} when blank or when {@code address} is {@code null}
  */
 public record CancelTokenInfoResponse(
         String masterName,
@@ -38,6 +42,15 @@ public record CancelTokenInfoResponse(
         BookingStatus status,
         String rebookPath,
         String salonName,
-        String address
+        String address,
+        String locationNote
 ) {
+
+    /** The pre-follow-up 9-field shape ({@code locationNote} {@code null}). */
+    public CancelTokenInfoResponse(String masterName, String serviceName, OffsetDateTime startsAt, boolean cancellable,
+                                   OffsetDateTime windowClosesAt, BookingStatus status, String rebookPath,
+                                   String salonName, String address) {
+        this(masterName, serviceName, startsAt, cancellable, windowClosesAt, status, rebookPath, salonName, address,
+                null);
+    }
 }

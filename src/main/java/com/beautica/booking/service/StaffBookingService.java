@@ -1,6 +1,8 @@
 package com.beautica.booking.service;
 
+import com.beautica.booking.domain.GuestCancelToken;
 import com.beautica.booking.crypto.GuestCancelTokenCipher;
+import com.beautica.booking.domain.GuestConfirmationSmsText;
 import com.beautica.booking.domain.GuestSmsProviderText;
 import com.beautica.booking.domain.MasterBookability;
 import com.beautica.booking.dto.AppointmentDetailResponse;
@@ -11,7 +13,6 @@ import com.beautica.booking.entity.Appointment;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.repository.AppointmentRepository;
 import com.beautica.booking.repository.BookingRepository;
-import com.beautica.common.TimeZones;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
@@ -35,12 +36,8 @@ import org.springframework.transaction.annotation.Transactional;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.OffsetDateTime;
-import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
-import java.util.Set;
 import java.util.UUID;
 
 /**
@@ -142,10 +139,6 @@ import java.util.UUID;
 @RequiredArgsConstructor
 public class StaffBookingService {
 
-    /** Kyiv civil date rendered for the client, matching {@code GuestBookingService}'s SMS copy. */
-    private static final DateTimeFormatter DATE_FMT = DateTimeFormatter.ofPattern("dd.MM.yyyy");
-    private static final DateTimeFormatter TIME_FMT = DateTimeFormatter.ofPattern("HH:mm");
-    private static final String SALON_NAME = "salonName";
 
     private final MasterRepository masterRepository;
     private final BookingRepository bookingRepository;
@@ -334,7 +327,7 @@ public class StaffBookingService {
         // header (only its hash is persisted); the child rows stay tokenless. A walk-in always has a phone
         // (requireStaffWalkInIdentity), so the token is always issued; with the SMS gate off it is never sent and
         // stays a harmless hash.
-        UUID cancelToken = UUID.randomUUID();
+        GuestCancelToken cancelToken = GuestCancelToken.generate();
         Appointment appointment = Appointment.staffAppointment(
                 master.getSalon(), guest.name(), guest.surname(), guestPhone, cancelToken, actorId);
 
@@ -374,7 +367,7 @@ public class StaffBookingService {
         // 435 it names no service at all, only the visit start and the master.
         registerWalkInConfirmationSms(
                 guestPhone,
-                buildWalkInConfirmationSms(master, firstStart, lastEnd,
+                buildWalkInConfirmationSms(saved.get(0), firstStart, lastEnd,
                         guestCancelUrlBuilder.build(cancelToken)));
 
         // REUSE-FIRST (Phase 22.14): the visit-detail enrichment is AppointmentService#enrich's job,
@@ -618,48 +611,17 @@ public class StaffBookingService {
      * one line, ≤ 40 chars, and DROPPED (independent-master copy instead) when it looks like a URL/domain.
      */
     private String buildWalkInConfirmationSms(
-            Master master, OffsetDateTime startsAt, OffsetDateTime endsAt, String cancelUrl) {
+            Booking first, OffsetDateTime startsAt, OffsetDateTime endsAt, String cancelUrl) {
         if (endsAt.isBefore(startsAt)) {
             // Defensive invariant, never client-triggered: VisitPlanner#assertContiguous already
             // guarantees lastEnd >= firstStart for any chain that reaches this method.
             throw new BusinessException(HttpStatus.INTERNAL_SERVER_ERROR,
                     "Visit end precedes its own start");
         }
-        OffsetDateTime kyiv = startsAt.atZoneSameInstant(TimeZones.KYIV).toOffsetDateTime();
+        // Phase 435 follow-up: the shared renderer (also the LINK SMS and the Telegram details). `first` is the visit's
+        // first item: it starts at `startsAt` and carries the same `master` / `master.getSalon()` instances.
         BookingSmsProperties.Sms sms = smsProperties.getSms();
-        Map<String, String> values = new HashMap<>();
-        // Audit-fix: provider text via GuestSmsProviderText — salon name capped, dropped when URL-like (→ the
-        // independent-master copy), master name capped and dropped when URL-like (→ no master segment); the whole SMS
-        // capped (salon dropped first if over).
-        if (master.getSalon() != null) {
-            GuestSmsProviderText.salonName(master.getSalon().getName())
-                    .ifPresent(name -> values.put(SALON_NAME, name));
-        }
-        GuestSmsProviderText.masterName(masterName(master)).ifPresent(name -> values.put("masterName", name));
-        values.put("date", DATE_FMT.format(kyiv));
-        values.put("time", TIME_FMT.format(kyiv));
-        values.put("cancelUrl", cancelUrl);
-        return GuestSmsProviderText.render(
-                master.getSalon() != null ? sms.getWalkInConfirmationSalon() : null,
-                sms.getWalkInConfirmation(), values, Set.of(), Set.of());
-    }
-
-    /**
-     * «Ім'я Прізвище» for the SMS, null-safe on either half.
-     *
-     * <p>Deliberately a private copy of {@code GuestBookingService#masterName} rather than a shared
-     * helper: four booking services already carry this same three-line formatter and consolidating
-     * all of them is a refactor of its own, outside a phase whose subject is a feature gate.
-     */
-    // V157 / phase 294 D3: displayFirstName()/displayLastName(), never getUser().getFirstName().
-    // A detached master (staff account hard-deleted, historical stub kept) has no user row, so the
-    // old two-line walk NPEs; the accessors fall back to the name snapshot taken at detach time.
-    // Still null-safe on either half — users.first_name / users.last_name are both nullable.
-    private static String masterName(Master master) {
-        String firstName = master.displayFirstName();
-        String lastName = master.displayLastName();
-        String first = firstName == null ? "" : firstName.trim();
-        String last = lastName == null ? "" : lastName.trim();
-        return (first + " " + last).trim();
+        return GuestConfirmationSmsText.render(
+                sms.getWalkInConfirmationSalon(), sms.getWalkInConfirmation(), first, cancelUrl);
     }
 }

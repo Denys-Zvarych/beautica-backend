@@ -81,6 +81,22 @@ public final class PiiRedactor {
      * happens to contain a digit, so a digit-free 16–31-char token would otherwise reach Sentry verbatim.
      */
     private static final String REVIEW_INVITES_SEGMENT = "review-invites";
+    /**
+     * Phase 435 follow-up — {@code /book/cancel/{token}}: a short guest cancel token is 16 base62 chars, below
+     * {@link #PATH_TOKEN_PATTERN}'s 20-char floor, so the segment after {@code book/cancel} is masked by position.
+     */
+    private static final String BOOK_SEGMENT = "book";
+    private static final String CANCEL_SEGMENT = "cancel";
+    /** The website's short guest cancel link {@code /c/{token}} (see {@code GuestCancelUrlBuilder}). */
+    private static final String SHORT_CANCEL_SEGMENT = "c";
+    /** The guest cancel token shape: exactly 16 base62 chars. */
+    private static final Pattern GUEST_CANCEL_TOKEN = Pattern.compile("[0-9A-Za-z]{16}");
+    /**
+     * A 16-char guest cancel token in free text, only directly after {@code /c/} or {@code /book/cancel/} — below
+     * {@link #MIXED_TOKEN_PATTERN}'s 32-char floor, so it is masked by prefix; a bare 16-char word stays readable.
+     */
+    private static final Pattern SHORT_CANCEL_TOKEN_PATTERN =
+            Pattern.compile("(?<=/c/|/book/cancel/)[0-9A-Za-z]{16}(?![0-9A-Za-z])");
 
     /** Non-alphanumeric characters that may continue a secret across the truncation cut (email, token, JWT, path). */
     private static final String SECRET_RUN_PUNCTUATION = "@%._+:/-";
@@ -117,6 +133,7 @@ public final class PiiRedactor {
         if (out.indexOf('@') >= 0 || out.contains("%40")) {
             out = EMAIL_PATTERN.matcher(out).replaceAll(Matcher.quoteReplacement(EMAIL));
         }
+        out = SHORT_CANCEL_TOKEN_PATTERN.matcher(out).replaceAll(Matcher.quoteReplacement(TOKEN));
         out = MIXED_TOKEN_PATTERN.matcher(out).replaceAll(Matcher.quoteReplacement(TOKEN));
         out = OTP_AFTER_KEYWORD.matcher(out).replaceAll("$1$2" + Matcher.quoteReplacement(OTP));
         out = OTP_BEFORE_KEYWORD.matcher(out).replaceAll(Matcher.quoteReplacement(OTP) + "$1$2");
@@ -155,6 +172,15 @@ public final class PiiRedactor {
         for (int i = 0; i < segments.length; i++) {
             segments[i] = normaliseSegment(segments[i]);
             if (i > 0 && REVIEW_INVITES_SEGMENT.equals(segments[i - 1]) && isConcreteSegment(segments[i])) {
+                segments[i] = TOKEN;
+            }
+            // A segment PATH_TOKEN_PATTERN already masks (a UUID, maybe with a suffix) is left to it, keeping the suffix.
+            if (i > 1 && CANCEL_SEGMENT.equals(segments[i - 1]) && BOOK_SEGMENT.equals(segments[i - 2])
+                    && isConcreteSegment(segments[i]) && !PATH_TOKEN_PATTERN.matcher(segments[i]).find()) {
+                segments[i] = TOKEN;
+            }
+            if (i > 0 && SHORT_CANCEL_SEGMENT.equals(segments[i - 1])
+                    && GUEST_CANCEL_TOKEN.matcher(segments[i]).matches()) {
                 segments[i] = TOKEN;
             }
         }

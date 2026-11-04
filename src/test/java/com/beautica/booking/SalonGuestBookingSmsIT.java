@@ -111,7 +111,7 @@ class SalonGuestBookingSmsIT extends AbstractWalkInBookingSmsIT {
         assertThat(payload.path("recipients").get(0).asText()).isEqualTo(LINK_PHONE);
         // Phase 435: no rebook link — the sealed visit links the guest's OWN booking page instead.
         String cancelUrl = readJson(created.getBody()).path("cancelUrl").asText();
-        assertThat(cancelUrl).matches("^https?://.+/book/cancel/[0-9a-f-]{36}$");
+        assertThat(cancelUrl).matches("^https?://.+/c/[0-9A-Za-z]{16}$");
         assertThat(payload.path("sms").path("text").asText())
                 .startsWith("Beautica: Ваш запис ")
                 .endsWith(" скасовано.\n\nДеталі або записатись знову " + cancelUrl)
@@ -131,6 +131,6 @@ class SalonGuestBookingSmsIT extends AbstractWalkInBookingSmsIT {
     }
 
     private String cancelPath(ResponseEntity<String> created) {
-        return readJson(created.getBody()).path("cancelUrl").asText().replaceAll(".*/book/cancel/", "");
+        return readJson(created.getBody()).path("cancelUrl").asText().replaceAll(".*/c/", "");
     }
 }

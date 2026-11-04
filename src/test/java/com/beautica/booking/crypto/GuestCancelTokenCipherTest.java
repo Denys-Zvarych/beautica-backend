@@ -1,5 +1,6 @@
 package com.beautica.booking.crypto;
 
+import com.beautica.booking.domain.GuestCancelToken;
 import com.beautica.booking.crypto.GuestCancelTokenCipher.Row;
 import com.beautica.notification.crypto.OutboxPayloadCipher;
 import org.junit.jupiter.api.DisplayName;
@@ -31,7 +32,7 @@ class GuestCancelTokenCipherTest {
         String sealed = cipher.seal(TOKEN, ROW);
 
         // Assert
-        assertThat(cipher.open(sealed, ROW)).isEqualTo(TOKEN);
+        assertThat(cipher.open(sealed, ROW)).isEqualTo(GuestCancelToken.of(TOKEN));
         assertThat(sealed).matches("^v2:[0-9a-f]{8}:[A-Za-z0-9+/]+={0,2}$").matches(V230_FORMAT)
                 .doesNotContain(TOKEN.toString());
         assertThat(sealed.length()).isLessThanOrEqualTo(128);
@@ -77,8 +78,8 @@ class GuestCancelTokenCipherTest {
                 new GuestCancelTokenCipherProperties(GuestCancelTokenCipherFixtures.TEST_KEY, OTHER_KEY));
 
         // Act + Assert
-        assertThat(rotated.open(sealedUnderOld, ROW)).isEqualTo(TOKEN);
-        assertThat(rotated.open(rotated.seal(TOKEN, ROW), ROW)).isEqualTo(TOKEN);
+        assertThat(rotated.open(sealedUnderOld, ROW)).isEqualTo(GuestCancelToken.of(TOKEN));
+        assertThat(rotated.open(rotated.seal(TOKEN, ROW), ROW)).isEqualTo(GuestCancelToken.of(TOKEN));
         assertThat(rotated.seal(TOKEN, ROW)).as("new values use the CURRENT key's id")
                 .startsWith(cipher.seal(TOKEN, ROW).substring(0, 12));
     }

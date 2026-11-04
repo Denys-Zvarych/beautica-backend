@@ -1,5 +1,6 @@
 package com.beautica.notification.service;
 
+import com.beautica.booking.domain.GuestCancelToken;
 import com.beautica.booking.crypto.GuestCancelTokenCipher;
 import com.beautica.booking.crypto.GuestCancelTokenCipherFixtures;
 import com.beautica.booking.entity.Booking;
@@ -32,8 +33,8 @@ class GuestRescheduleSmsTextTest {
 
         String sms = text.render(startingAt("2026-10-26T08:00:00Z"));
 
-        assertThat(sms).isEqualTo("Beautica: Ваш запис 26.10.2026 о 10:00 перенесено.");
-        assertThat(sms).hasSize(50);
+        assertThat(sms).isEqualTo("Beautica: Ваш запис перенесено на 26.10.2026 о 10:00.");
+        assertThat(sms).hasSize(53);
         assertThat(sms.length()).isLessThanOrEqualTo(ONE_SEGMENT);
     }
 
@@ -44,7 +45,7 @@ class GuestRescheduleSmsTextTest {
 
         String sms = text.render(startingAt("2026-07-01T21:30:00Z"));
 
-        assertThat(sms).isEqualTo("Beautica: Ваш запис 02.07.2026 о 00:30 перенесено.");
+        assertThat(sms).isEqualTo("Beautica: Ваш запис перенесено на 02.07.2026 о 00:30.");
     }
 
     @Test
@@ -127,8 +128,27 @@ class GuestRescheduleSmsTextTest {
         String sms = text.render(booking);
 
         // Assert
-        assertThat(sms).isEqualTo("Beautica: Ваш запис 26.10.2026 о 10:00 перенесено.\n\n"
-                + "Деталі або записатись знову https://beautica.app/book/cancel/123e4567-e89b-12d3-a456-426614174000");
+        assertThat(sms).isEqualTo("Beautica: Ваш запис перенесено на 26.10.2026 о 10:00.\n\n"
+                + "Деталі або записатись знову https://beautica.app/c/123e4567-e89b-12d3-a456-426614174000");
+    }
+
+    @Test
+    @DisplayName("phase 435 follow-up: a short-token booking gets the NEW time and the short /c/ link — 2 UCS-2 parts")
+    void should_renderShortLink_when_shortTokenSealed() {
+        // Arrange
+        GuestCancelToken token = GuestCancelToken.valueOf("Ab3dE5gH7jK9mN1p");
+        Booking booking = Booking.builder().startsAt(OffsetDateTime.parse("2026-10-26T08:00:00Z"))
+                .id(ROW_ID).cancelToken(token).cancelTokenSealed(CIPHER.seal(token,
+                        com.beautica.booking.crypto.GuestCancelTokenCipher.Row.booking(ROW_ID))).build();
+        GuestRescheduleSmsText text = new GuestRescheduleSmsText(new BookingSmsProperties(), links());
+
+        // Act
+        String sms = text.render(booking);
+
+        // Assert
+        assertThat(sms).isEqualTo("Beautica: Ваш запис перенесено на 26.10.2026 о 10:00.\n\n"
+                + "Деталі або записатись знову https://beautica.app/c/Ab3dE5gH7jK9mN1p");
+        assertThat(sms.length()).as("2 concatenated UCS-2 parts").isLessThanOrEqualTo(134).isGreaterThan(ONE_SEGMENT);
     }
 
     private static final GuestCancelTokenCipher CIPHER = GuestCancelTokenCipherFixtures.testCipher();

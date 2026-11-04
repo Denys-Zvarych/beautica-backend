@@ -39,7 +39,7 @@ class CancelTokenHasherTest {
     @Test
     @DisplayName("a null token is rejected, never hashed to a constant")
     void should_throw_when_tokenIsNull() {
-        assertThatThrownBy(() -> CancelTokenHasher.hash(null))
+        assertThatThrownBy(() -> CancelTokenHasher.hash((UUID) null))
                 .isInstanceOf(NullPointerException.class)
                 .hasMessage("token");
     }
@@ -49,14 +49,14 @@ class CancelTokenHasherTest {
     void should_setHashTogetherWithRawToken_when_bookingBuiltWithCancelToken() {
         Booking booking = Booking.builder().cancelToken(TOKEN).build();
 
-        assertThat(booking.getCancelToken()).isEqualTo(TOKEN);
+        assertThat(booking.getCancelToken()).isEqualTo(com.beautica.booking.domain.GuestCancelToken.of(TOKEN));
         assertThat(booking.getCancelTokenHash()).isEqualTo(TOKEN_SHA256);
     }
 
     @Test
     @DisplayName("Booking builder cancelToken(null) leaves the stored hash NULL")
     void should_leaveHashNull_when_bookingBuiltWithNullCancelToken() {
-        Booking booking = Booking.builder().cancelToken(null).build();
+        Booking booking = Booking.builder().cancelToken((UUID) null).build();
 
         assertThat(booking.getCancelTokenHash()).isNull();
     }
@@ -66,7 +66,7 @@ class CancelTokenHasherTest {
     void should_setHashTogetherWithRawToken_when_appointmentBuiltWithCancelToken() {
         Appointment appointment = Appointment.builder().cancelToken(TOKEN).build();
 
-        assertThat(appointment.getCancelToken()).isEqualTo(TOKEN);
+        assertThat(appointment.getCancelToken()).isEqualTo(com.beautica.booking.domain.GuestCancelToken.of(TOKEN));
         assertThat(appointment.getCancelTokenHash()).isEqualTo(TOKEN_SHA256);
     }
 }

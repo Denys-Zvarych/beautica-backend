@@ -216,15 +216,17 @@ public class BookingSmsDispatcher {
     }
 
     /**
-     * Phase 408 D1 — only the provider-cancellation branch is routed (Telegram when the phone is linked, SMS
-     * otherwise). Confirmations and the reschedule notice stay on the exact
-     * pre-408 {@code smsService.send} call: the router is never in their path.
+     * Phase 408 D1 — the provider-cancellation branch is routed (Telegram when the phone is linked, SMS otherwise);
+     * phase 435 follow-up (user decision 2026-11-04) — so is the provider reschedule notice, with the identical text.
+     * Confirmations stay on the exact pre-408 {@code smsService.send} call: the router is never in their path.
      */
     private void send(Kind kind, String phoneE164, String text) {
-        if (kind == Kind.GUEST_PROVIDER_CANCELLATION) {
-            guestMessageRouter.deliver(GuestMessageKind.GUEST_PROVIDER_CANCELLATION, phoneE164, text);
-        } else {
-            smsService.send(phoneE164, text);
+        switch (kind) {
+            case GUEST_PROVIDER_CANCELLATION ->
+                    guestMessageRouter.deliver(GuestMessageKind.GUEST_PROVIDER_CANCELLATION, phoneE164, text);
+            case GUEST_PROVIDER_RESCHEDULE ->
+                    guestMessageRouter.deliver(GuestMessageKind.GUEST_PROVIDER_RESCHEDULE, phoneE164, text);
+            case WALK_IN_CONFIRMATION, GUEST_CONFIRMATION -> smsService.send(phoneE164, text);
         }
     }
 }

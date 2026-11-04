@@ -116,7 +116,7 @@ class GuestCancelTokenHashEndToEndIT extends AbstractIntegrationTest {
         // Audit-fix: v2:<kid>: format, AES-GCM bound to this row ("bookings:<id>") — sealed after the persist.
         assertThat(sealed).matches("^v2:[0-9a-f]{8}:[A-Za-z0-9+/]+={0,2}$");
         assertThat(guestCancelTokenCipher.open(sealed,
-                com.beautica.booking.crypto.GuestCancelTokenCipher.Row.booking(created.bookingId()))).hasToString(token);
+                com.beautica.booking.crypto.GuestCancelTokenCipher.Row.booking(created.bookingId()))).extracting(com.beautica.booking.domain.GuestCancelToken::value).isEqualTo(token);
 
         setMasterStreet(masterId, "Сагайдачного", "3А");
 
@@ -129,6 +129,9 @@ class GuestCancelTokenHashEndToEndIT extends AbstractIntegrationTest {
         assertThat(infoBody.has("salonName")).isTrue();
         assertThat(infoBody.get("salonName").isNull()).isTrue();
         assertThat(infoBody.path("address").asText()).isEqualTo("Сагайдачного 3А");
+        // Phase 435 follow-up: additive `locationNote`, null when the master has none.
+        assertThat(infoBody.has("locationNote")).isTrue();
+        assertThat(infoBody.get("locationNote").isNull()).isTrue();
         assertNoGuestPii(info.getBody());
 
         assertThat(post(token).getStatusCode()).as("first POST consumes the token").isEqualTo(HttpStatus.NO_CONTENT);
@@ -250,7 +253,7 @@ class GuestCancelTokenHashEndToEndIT extends AbstractIntegrationTest {
         assertThat(guestCancelTokenCipher.open(jdbcTemplate.queryForObject(
                 "SELECT cancel_token_sealed FROM appointments WHERE id = ?", String.class, created.appointmentId()),
                 com.beautica.booking.crypto.GuestCancelTokenCipher.Row.appointment(created.appointmentId())))
-                .hasToString(token);
+                .extracting(com.beautica.booking.domain.GuestCancelToken::value).isEqualTo(token);
         assertThat(jdbcTemplate.queryForObject(
                 "SELECT COUNT(*) FROM bookings WHERE appointment_id = ? AND cancel_token_sealed IS NOT NULL",
                 Integer.class, created.appointmentId())).isZero();
@@ -311,6 +314,9 @@ class GuestCancelTokenHashEndToEndIT extends AbstractIntegrationTest {
         String token = tokenOf(created);
         setSalonAddress(salon.salonId(), "Хрещатик", "10", null);
         setMasterStreet(salon.masterId(), "Сагайдачного", "3А");
+        jdbcTemplate.update("UPDATE salons SET location_note = ? WHERE id = ?", "  вхід   з двору ", salon.salonId());
+        jdbcTemplate.update("UPDATE users SET location_note = 'master note' "
+                + "WHERE id = (SELECT user_id FROM masters WHERE id = ?)", salon.masterId());
 
         ResponseEntity<String> info = get(token);
 
@@ -319,13 +325,47 @@ class GuestCancelTokenHashEndToEndIT extends AbstractIntegrationTest {
                 created.bookingId())).as("the public route created a SALON booking").isEqualTo(salon.salonId());
         assertThat(guestCancelTokenCipher.open(jdbcTemplate.queryForObject(
                 "SELECT cancel_token_sealed FROM bookings WHERE id = ?", String.class, created.bookingId()),
-                GuestCancelTokenCipher.Row.booking(created.bookingId()))).hasToString(token);
+                GuestCancelTokenCipher.Row.booking(created.bookingId()))).extracting(com.beautica.booking.domain.GuestCancelToken::value).isEqualTo(token);
         JsonNode body = objectMapper.readTree(info.getBody());
         assertThat(body.path("status").asText()).isEqualTo("CONFIRMED");
         assertThat(body.path("cancellable").asBoolean()).isTrue();
         assertThat(body.path("salonName").asText()).isEqualTo("Студія Лілія");
         assertThat(body.path("address").asText()).as("salon address wins over the master's own").isEqualTo("Хрещатик 10");
+        assertThat(body.path("locationNote").asText()).as("the SALON's note (not the master's), whitespace collapsed")
+                .isEqualTo("вхід з двору");
         assertNoGuestPii(info.getBody());
+    }
+
+    @Test
+    @DisplayName("phase 435 follow-up: a LEGACY UUID token (issued before the short format) still opens and cancels")
+    void should_acceptLegacyUuidToken_when_issuedBeforeShortFormat() throws Exception {
+        String slug = "hash-e2e-legacy-" + Long.toString(System.nanoTime(), 36);
+        UUID masterId = fixtures.createMasterWithSlug(slug + "@beautica.test", slug);
+        fixtures.seedOpenWeek(masterId);
+        UUID svc = fixtures.createService(masterId, "Манікюр-легасі", 60, 0);
+        ZonedDateTime startsAt = ZonedDateTime.now(clock.withZone(KYIV)).plusDays(3)
+                .withHour(11).withMinute(0).withSecond(0).withNano(0);
+        GuestBookingResponse created = postBooking(slug, Map.of("serviceId", svc), startsAt);
+        String legacy = UUID.randomUUID().toString();
+        // A pre-follow-up row: the hash of a UUID token (the V230 trigger nulls the sealed copy with the new hash).
+        jdbcTemplate.update("UPDATE bookings SET cancel_token_hash = ? WHERE id = ?", pgSha256(legacy),
+                created.bookingId());
+
+        ResponseEntity<String> info = get(legacy);
+        ResponseEntity<String> upperCase = get(legacy.toUpperCase());
+
+        assertThat(info.getStatusCode()).as(info.getBody()).isEqualTo(HttpStatus.OK);
+        assertThat(objectMapper.readTree(info.getBody()).path("serviceName").asText()).isEqualTo("Манікюр-легасі");
+        assertThat(upperCase.getStatusCode()).as("UUID spelling normalised as before").isEqualTo(HttpStatus.OK);
+        assertThat(post(legacy).getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
+    }
+
+    @Test
+    @DisplayName("phase 435 follow-up: a malformed token is still a 400 before any lookup (both formats validated)")
+    void should_return400_when_tokenMalformed() {
+        assertThat(get("Ab3dE5gH7jK9mN1").getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(get("not-a-token").getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(post("Ab3dE5gH7jK9mN1pq").getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
     }
 
     @Test
@@ -532,9 +572,10 @@ class GuestCancelTokenHashEndToEndIT extends AbstractIntegrationTest {
 
     private static String tokenOf(GuestBookingResponse created) {
         String url = created.cancelUrl();
-        assertThat(url).contains("/book/cancel/");
+        // Phase 435 follow-up: the short link {base}/c/{token}, a NEW token being 16 base62 chars.
+        assertThat(url).contains("/c/");
         String token = url.substring(url.lastIndexOf('/') + 1);
-        assertThat(UUID.fromString(token).toString()).as("the link carries the raw UUID token").isEqualTo(token);
+        assertThat(token).as("the link carries the raw short token").matches("[0-9A-Za-z]{16}");
         return token;
     }
 

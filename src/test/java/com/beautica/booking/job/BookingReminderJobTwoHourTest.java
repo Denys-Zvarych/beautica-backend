@@ -235,7 +235,7 @@ class BookingReminderJobTwoHourTest {
         // Assert
         assertThat(publishedEvent().reminders()).singleElement().satisfies(r -> assertThat(r.text()).isEqualTo(
                 "Beautica: Нагадуємо, що сьогодні у Вас запис!\n\n"
-                        + "Марія Левченко | Манікюр о 14:00\n\n"
+                        + "Марія Левченко | Манікюр о 14:00\n"
                         + "Адреса: Хуторівка 40А"));
     }
 
@@ -257,7 +257,7 @@ class BookingReminderJobTwoHourTest {
         // Assert
         assertThat(publishedEvent().reminders()).singleElement().satisfies(r -> assertThat(r.text()).isEqualTo(
                 "Beautica: Нагадуємо, що сьогодні у Вас запис!\n\n"
-                        + "Beauty Room | Марія Левченко | Манікюр о 14:00\n\n"
+                        + "Beauty Room | Марія Левченко | Манікюр о 14:00\n"
                         + "Адреса: Хрещатик 10"));
     }
 
@@ -305,11 +305,11 @@ class BookingReminderJobTwoHourTest {
     }
 
     @Test
-    @DisplayName("phase 435: a sealed-token booking's reminder ends with «Скасувати запис:» and the guest's own page")
+    @DisplayName("phase 435 follow-up: a sealed-token reminder renders address (note) and the short own-page link, no blank lines")
     void should_appendCancelLine_when_tokenSealed() {
         // Arrange
         Salon salon = Salon.builder().id(UUID.randomUUID()).name("Beauty Room").street("Хрещатик").buildingNo("10")
-                .isActive(true).build();
+                .locationNote("вхід з двору").isActive(true).build();
         Booking booking = guestBooking("+380501111111", MIDDAY_KYIV.plus(Duration.ofHours(2)),
                 MIDDAY_KYIV.minus(Duration.ofDays(1)), salon);
         org.springframework.test.util.ReflectionTestUtils.setField(booking, "id", UUID.randomUUID());
@@ -324,13 +324,13 @@ class BookingReminderJobTwoHourTest {
         // Assert
         assertThat(publishedEvent().reminders()).singleElement().satisfies(r -> assertThat(r.text()).isEqualTo(
                 "Beautica: Нагадуємо, що сьогодні у Вас запис!\n\n"
-                        + "Beauty Room | Марія Левченко | Манікюр о 14:00\n\n"
-                        + "Адреса: Хрещатик 10\n\n"
-                        + "Скасувати запис: https://beautica.app/book/cancel/" + booking.getCancelToken()));
+                        + "Beauty Room | Марія Левченко | Манікюр о 14:00\n"
+                        + "Адреса: Хрещатик 10 (вхід з двору)\n"
+                        + "Скасувати запис: https://beautica.app/c/" + booking.getCancelToken().value()));
     }
 
     @Test
-    @DisplayName("phase 435: a visit reminder links the VISIT header's token")
+    @DisplayName("phase 435: a visit reminder links the VISIT header's token — a legacy UUID one on /c/ too")
     void should_linkVisitHeaderToken_when_visitReminded() {
         // Arrange
         UUID headerToken = UUID.randomUUID();
@@ -348,7 +348,7 @@ class BookingReminderJobTwoHourTest {
 
         // Assert
         assertThat(publishedEvent().reminders()).singleElement().satisfies(r -> assertThat(r.text())
-                .endsWith("\n\nСкасувати запис: https://beautica.app/book/cancel/" + headerToken));
+                .endsWith("\nСкасувати запис: https://beautica.app/c/" + headerToken));
     }
 
     private static final com.beautica.booking.crypto.GuestCancelTokenCipher CIPHER =

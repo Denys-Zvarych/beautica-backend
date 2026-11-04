@@ -1,6 +1,7 @@
 package com.beautica.notification.telegram.link;
 
 import com.beautica.booking.domain.CancelTokenHasher;
+import com.beautica.booking.domain.GuestCancelToken;
 import com.beautica.booking.dto.GuestCancelTokenTarget;
 import com.beautica.booking.enums.BookingSource;
 import com.beautica.booking.enums.BookingStatus;
@@ -27,7 +28,6 @@ import org.springframework.transaction.support.TransactionTemplate;
 import java.time.Clock;
 import java.time.OffsetDateTime;
 import java.util.Objects;
-import java.util.UUID;
 
 /**
  * Phase 407 — the guest Telegram link API behind {@link GuestTelegramLinkController}: resolves the booking from its
@@ -81,7 +81,7 @@ public class GuestTelegramLinkService {
     /** D3 link-token: a fresh deep link, or {@code alreadyLinked} when the booking phone has an ACTIVE link. */
     public GuestTelegramLinkResponse issueLinkToken(String cancelToken) {
         requireLinkable("issue");
-        String tokenHash = CancelTokenHasher.hash(UUID.fromString(cancelToken));
+        String tokenHash = CancelTokenHasher.hash(GuestCancelToken.valueOf(cancelToken));
         consumeTokenBudget(tokenHash);
         IssueCheck check = Objects.requireNonNull(readOnlyTx.execute(status -> checkIssuable(tokenHash)));
         if (check.alreadyLinked()) {
@@ -158,7 +158,7 @@ public class GuestTelegramLinkService {
     }
 
     private static String hashOf(String cancelToken) {
-        return CancelTokenHasher.hash(UUID.fromString(cancelToken));
+        return CancelTokenHasher.hash(GuestCancelToken.valueOf(cancelToken));
     }
 
     /** D2 — a LINK booking, or a STAFF walk-in (412: it holds a cancel token only with a guest phone); phone kept. */

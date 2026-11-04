@@ -5,8 +5,13 @@ import com.beautica.common.util.Placeholders;
 import com.beautica.salon.entity.Salon;
 import com.beautica.user.User;
 
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+
 /**
- * Phase 435 — where a guest's visit happens, as shown to an account-less guest (reminder SMS, public cancel page).
+ * Phase 435 — where a guest's visit happens (and, since the follow-up, its {@link #locationNote}), as shown to an account-less guest (reminder SMS, public cancel page).
  *
  * <p>The SALON's address for a salon booking, else the master's own address (an independent master; a detached
  * master has no user row → none). Street + building number («Хрещатик 10»); a salon with no street falls back to its
@@ -29,6 +34,54 @@ public final class GuestVisitAddress {
         }
         User user = booking.getMaster().getUser();
         return user == null ? null : streetAddress(user.getStreet(), user.getBuildingNo(), null);
+    }
+
+    /**
+     * Phase 435 follow-up — the visit's location note («landmark / how to find», {@code location_note}), picked like
+     * {@link #of}: the SALON's for a salon booking, else the independent master's own ({@code users.location_note});
+     * a detached master has none. Flattened to one line; {@code null} when blank. Shown only next to an address —
+     * callers drop it when {@link #of} is {@code null}.
+     */
+    public static String locationNote(Booking booking) {
+        Salon salon = booking.getSalon();
+        if (salon != null) {
+            return blankToNull(Placeholders.singleLine(salon.getLocationNote()));
+        }
+        User user = booking.getMaster().getUser();
+        return user == null ? null : blankToNull(Placeholders.singleLine(user.getLocationNote()));
+    }
+
+    /**
+     * Phase 435 follow-up — the SMS / Telegram placeholder values for the «Адреса: {address} ({locationNote})» line:
+     * the address ({@link GuestSmsProviderText#address}) under every key of {@code addressKeys}, and the note
+     * ({@link GuestSmsProviderText#locationNote}) under {@link GuestSmsProviderText#LOCATION_NOTE} — only when the
+     * address is kept. Empty map when there is no usable address.
+     */
+    public static Map<String, String> smsValues(Booking booking, Set<String> addressKeys) {
+        Optional<String> address = GuestSmsProviderText.address(of(booking));
+        if (address.isEmpty()) {
+            return Map.of();
+        }
+        Map<String, String> values = new HashMap<>();
+        addressKeys.forEach(key -> values.put(key, address.get()));
+        GuestSmsProviderText.locationNote(locationNote(booking))
+                .ifPresent(note -> values.put(GuestSmsProviderText.LOCATION_NOTE, note));
+        return values;
+    }
+
+    /**
+     * Phase 435 follow-up — the note for the public guest page ({@code CancelTokenInfoResponse#locationNote}): the same
+     * rules as the SMS ({@link GuestSmsProviderText#locationNote}), and {@code null} whenever there is no address.
+     */
+    public static String pageLocationNote(Booking booking) {
+        if (of(booking) == null) {
+            return null;
+        }
+        return GuestSmsProviderText.locationNote(locationNote(booking)).orElse(null);
+    }
+
+    private static String blankToNull(String value) {
+        return value.isEmpty() ? null : value;
     }
 
     private static String streetAddress(String street, String buildingNo, String legacy) {

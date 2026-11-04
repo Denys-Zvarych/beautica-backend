@@ -399,6 +399,7 @@ app:
 
         {date} о {time}
         Майстер {masterName}.
+        Адреса: {address} ({locationNote})
         Скасувати: {cancelUrl}
       # Phase 435 — salon bookings name the salon and the performing master (picked when the booking has a salon).
       confirmation-salon: |-
@@ -406,24 +407,23 @@ app:
 
         {date} о {time}
         Салон {salonName}, майстер {masterName}.
+        Адреса: {address} ({locationNote})
         Скасувати: {cancelUrl}
       # Phase 435 — the «Адреса:» line is dropped when the booking has no address; the «Скасувати запис:» line
       # when the guest's own page cannot be rebuilt (row created before V230 — no sealed token).
+      # Phase 435 follow-up (2026-11-04) — no blank lines after the title; « ({locationNote})» is the provider's
+      # «how to find us» note, its brackets dropped when there is none (GuestSmsProviderText). Same for confirmations.
       reminder: |-
         Beautica: Нагадуємо, що завтра у Вас запис!
 
         {masterName} | {serviceName} о {time}
-
-        Адреса: {address}
-
+        Адреса: {address} ({locationNote})
         Скасувати запис: {cancelUrl}
       reminder-salon: |-
         Beautica: Нагадуємо, що завтра у Вас запис!
 
         {salonName} | {masterName} | {serviceName} о {time}
-
-        Адреса: {salonAddress}
-
+        Адреса: {salonAddress} ({locationNote})
         Скасувати запис: {cancelUrl}
       # Phase 435 — no `cancellation:` key: the guest who cancels via the cancel link gets no SMS
       # (user decision 2026-11-04). Do not re-add it — nothing reads it.
@@ -438,19 +438,21 @@ app:
       # restored this key (it had been removed in 22.7 as a duplicate of the Java default): it is now the LIVE
       # value, and BookingSmsProperties.Sms#walkInConfirmation is the identical fallback — change both together.
       # Reversed by 412: it now carries {cancelUrl} — the walk-in visit header holds a one-time cancel token
-      # (V226) and StaffBookingService always maps cancelUrl to /book/cancel/{token}. 3 UCS-2 segments typical.
+      # (V226) and StaffBookingService always maps cancelUrl to /c/{token} (phase 435 follow-up; was /book/cancel/{token}). 3 UCS-2 segments typical.
       # Phase 435: same copy as `confirmation` (no {serviceName}).
       walk-in-confirmation: |-
         Beautica: Ваш запис підтверджено!
 
         {date} о {time}
         Майстер {masterName}.
+        Адреса: {address} ({locationNote})
         Скасувати: {cancelUrl}
       walk-in-confirmation-salon: |-
         Beautica: Ваш запис підтверджено!
 
         {date} о {time}
         Салон {salonName}, майстер {masterName}.
+        Адреса: {address} ({locationNote})
         Скасувати: {cancelUrl}
     # Phase 400 — guest review invite SMS (beautica.app/r/{token}) ~2h after a LINK visit is COMPLETED, never
     # 21:00-09:00 Kyiv (moved to 10:00), one per visit. Bound by ReviewInviteProperties (validated at boot). Needs BOTH

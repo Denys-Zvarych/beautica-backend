@@ -36,7 +36,10 @@ import java.util.regex.Pattern;
  *       ≤ {@value #MAX_PERSON_NAME} UTF-16 units, truncated with «…» never inside a surrogate pair. The service name
  *       is required content (the guest must recognise the booking), so it is capped, not dropped;</li>
  *   <li>{@link #render} caps the whole message at {@value #MAX_SMS_CHARS} chars (5 UCS-2 segments), dropping the
- *       optional lines first: the address, then the salon (falling back to the independent-master template).</li>
+ *       optional parts first: the location note, then the address, then the salon (falling back to the
+ *       independent-master template).</li>
+ *   <li>phase 435 follow-up — the location note ({@link #locationNote}) follows the address rules (one line,
+ *       ≤ {@value #MAX_LOCATION_NOTE}, dropped when URL-like); its brackets go with it.</li>
  * </ul>
  */
 public final class GuestSmsProviderText {
@@ -44,6 +47,10 @@ public final class GuestSmsProviderText {
     public static final int MAX_SALON_NAME = 40;
     public static final int MAX_ADDRESS = 60;
     public static final int MAX_PERSON_NAME = 40;
+    /** Phase 435 follow-up — the provider's «how to find us» note shown in brackets after the address. */
+    public static final int MAX_LOCATION_NOTE = 60;
+    /** Placeholder of the location note — its « ({locationNote})» segment is removed when the note is absent. */
+    public static final String LOCATION_NOTE = "locationNote";
     /** 5 concatenated UCS-2 segments of 67 chars. */
     public static final int MAX_SMS_CHARS = 335;
 
@@ -96,6 +103,8 @@ public final class GuestSmsProviderText {
                     + "|\\{masterName}[ \\t]*\\|[ \\t]*"        // «{masterName} | {serviceName} …»
                     + "|[ \\t]*\\|[ \\t]*\\{masterName}");      // «… | {masterName}»
     private static final String MASTER_NAME = "masterName";
+    /** « ({locationNote})» — the bracketed note after the address (phase 435 follow-up). */
+    private static final Pattern NOTE_SEGMENT = Pattern.compile("[ \\t]*\\(\\{locationNote}\\)");
 
     private GuestSmsProviderText() {
     }
@@ -108,6 +117,14 @@ public final class GuestSmsProviderText {
     /** The address for an SMS, or empty when absent or URL-like (drop the «Адреса:» line). */
     public static Optional<String> address(String raw) {
         return droppingUrls(raw, MAX_ADDRESS);
+    }
+
+    /**
+     * Phase 435 follow-up — the location note («landmark / how to find») for an SMS, or empty when absent or URL-like
+     * (drop the bracketed segment). Same rules as the address: one line, ≤ {@value #MAX_LOCATION_NOTE}.
+     */
+    public static Optional<String> locationNote(String raw) {
+        return droppingUrls(raw, MAX_LOCATION_NOTE);
     }
 
     /** A service name: one line, capped; never dropped (required content). */
@@ -162,6 +179,11 @@ public final class GuestSmsProviderText {
         return skeleton.toString();
     }
 
+    /** {@code template} without its « ({locationNote})» segment; {@code null} stays {@code null}. */
+    static String withoutNote(String template) {
+        return template == null ? null : NOTE_SEGMENT.matcher(template).replaceAll("");
+    }
+
     /** {@code template} without its master segment (see {@link #MASTER_SEGMENT}); {@code null} stays {@code null}. */
     static String withoutMaster(String template) {
         return template == null ? null : MASTER_SEGMENT.matcher(template).replaceAll("");
@@ -183,45 +205,64 @@ public final class GuestSmsProviderText {
     }
 
     /**
-     * Renders the SMS within {@link #MAX_SMS_CHARS}, trying in order: the salon template with the address, the salon
-     * template without it, then {@code masterTemplate} without it. The salon template is skipped when it is
-     * {@code null} or {@code values} holds no {@code salonName}. Lines whose placeholder is in {@code optional} (or is
-     * an address key) are dropped whole when their value is absent ({@link Placeholders#formatDroppingEmptyLines}).
-     * When no variant fits (an oversized configured template), the shortest attempt is returned.
+     * Renders the SMS within {@link #MAX_SMS_CHARS}, trying in order: the salon template with the address and the
+     * location note, without the note, without the address, then {@code masterTemplate} without the address. The
+     * salon template is skipped when it is {@code null} or {@code values} holds no {@code salonName} (then the master
+     * template is tried with the note, without it, then without the address). Lines whose placeholder is in
+     * {@code optional} (or is an address key) are dropped whole when their value is absent
+     * ({@link Placeholders#formatDroppingEmptyLines}). When no variant fits (an oversized configured template), the
+     * shortest attempt is returned.
+     *
+     * <p>Phase 435 follow-up: the « ({locationNote})» segment is removed from a template whenever the attempt has no
+     * {@value #LOCATION_NOTE} value (absent, URL-like, or dropped for length); the note never outlives the address —
+     * with no address the whole «Адреса:» line, note included, is dropped.
      *
      * <p>Audit-fix cycle 2: when {@code values} holds no {@code masterName} (dropped as URL-like), the master segment
      * is removed from both templates first ({@link #withoutMaster}) and any line still holding it is dropped.
      *
-     * @param values      sanitised placeholder values; {@code salonName} / address keys may be absent
-     * @param addressKeys the placeholders that carry the address (dropped first)
+     * @param values      sanitised placeholder values; {@code salonName} / address keys / {@code locationNote} may be
+     *                    absent
+     * @param addressKeys the placeholders that carry the address (dropped after the note)
      */
     public static String render(String salonTemplate, String masterTemplate, Map<String, String> values,
                                 Set<String> optional, Set<String> addressKeys) {
         Set<String> droppable = new HashSet<>(optional);
         droppable.addAll(addressKeys);
+        droppable.add(LOCATION_NOTE);
         if (!values.containsKey(MASTER_NAME)) {
             salonTemplate = withoutMaster(salonTemplate);
             masterTemplate = withoutMaster(masterTemplate);
             droppable.add(MASTER_NAME);
         }
-        Map<String, String> withoutAddress = new HashMap<>(values);
+        Map<String, String> withoutNote = new HashMap<>(values);
+        withoutNote.remove(LOCATION_NOTE);
+        Map<String, String> withoutAddress = new HashMap<>(withoutNote);
         addressKeys.forEach(withoutAddress::remove);
 
         List<String> attempts = new ArrayList<>(4);
         String salonName = values.get("salonName");
-        if (salonTemplate != null && salonName != null && !salonName.isBlank()) {
-            attempts.add(Placeholders.formatDroppingEmptyLines(salonTemplate, values, droppable));
-            attempts.add(Placeholders.formatDroppingEmptyLines(salonTemplate, withoutAddress, droppable));
+        String first = salonTemplate != null && salonName != null && !salonName.isBlank() ? salonTemplate : null;
+        if (first != null) {
+            attempts.add(attempt(first, values, droppable));
+            attempts.add(attempt(first, withoutNote, droppable));
+            attempts.add(attempt(first, withoutAddress, droppable));
         } else {
-            attempts.add(Placeholders.formatDroppingEmptyLines(masterTemplate, values, droppable));
+            attempts.add(attempt(masterTemplate, values, droppable));
+            attempts.add(attempt(masterTemplate, withoutNote, droppable));
         }
-        attempts.add(Placeholders.formatDroppingEmptyLines(masterTemplate, withoutAddress, droppable));
+        attempts.add(attempt(masterTemplate, withoutAddress, droppable));
         for (String attempt : attempts) {
             if (attempt.length() <= MAX_SMS_CHARS) {
                 return attempt;
             }
         }
         return attempts.get(attempts.size() - 1);
+    }
+
+    private static String attempt(String template, Map<String, String> values, Set<String> droppable) {
+        String note = values.get(LOCATION_NOTE);
+        String shaped = note == null || note.isBlank() ? withoutNote(template) : template;
+        return Placeholders.formatDroppingEmptyLines(shaped, values, droppable);
     }
 
     private static Optional<String> droppingUrls(String raw, int max) {

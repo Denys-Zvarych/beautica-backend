@@ -1,5 +1,6 @@
 package com.beautica.booking.service;
 
+import com.beautica.booking.domain.GuestCancelToken;
 import com.beautica.booking.domain.CancelTokenHasher;
 import com.beautica.booking.domain.GuestPageWindow;
 import com.beautica.booking.domain.GuestSmsServiceName;
@@ -99,7 +100,7 @@ public class GuestVisitCancellationService {
      * {@code CONFIRMED} (read-only view, {@code status} = the header's).
      */
     @Transactional(readOnly = true)
-    public Optional<CancelTokenInfoResponse> getInfo(UUID token) {
+    public Optional<CancelTokenInfoResponse> getInfo(GuestCancelToken token) {
         Appointment appointment = findVisitByToken(token);
         if (appointment == null) {
             return Optional.empty();
@@ -125,7 +126,8 @@ public class GuestVisitCancellationService {
                 appointment.getStatus(),
                 guestRebookPaths.forBooking(first).orElse(null),
                 salonName(first),
-                GuestVisitAddress.of(first)));
+                GuestVisitAddress.of(first),
+                GuestVisitAddress.pageLocationNote(first)));
     }
 
     /**
@@ -137,7 +139,7 @@ public class GuestVisitCancellationService {
      * @throws NotFoundException with 404 on a lost race (header consumed between load and update)
      */
     @Transactional
-    public boolean cancel(UUID token) {
+    public boolean cancel(GuestCancelToken token) {
         List<Booking> items = loadLiveVisitItems(token);
         if (items.isEmpty()) {
             return false; // not a visit token — let the caller try the legacy single-booking path
@@ -209,7 +211,7 @@ public class GuestVisitCancellationService {
      * an itemless header. The status guard keeps a consumed/terminal visit indistinguishable from an
      * unknown token (no state oracle), matching the single path.
      */
-    private List<Booking> loadLiveVisitItems(UUID token) {
+    private List<Booking> loadLiveVisitItems(GuestCancelToken token) {
         Appointment appointment = findVisitByToken(token);
         if (appointment == null || appointment.getStatus() != BookingStatus.CONFIRMED) {
             return List.of();
@@ -218,7 +220,7 @@ public class GuestVisitCancellationService {
     }
 
     /** The visit header holding this token's hash, any status; {@code null} when none. */
-    private Appointment findVisitByToken(UUID token) {
+    private Appointment findVisitByToken(GuestCancelToken token) {
         // V206: only the token's hash is stored — the lookup hashes the incoming token.
         return appointmentRepository.findByCancelTokenHash(CancelTokenHasher.hash(token)).orElse(null);
     }
