@@ -28,9 +28,9 @@ class GuestProviderCancellationSmsTextTest {
     private static final String BODY = "Beautica: Ваш запис 26.10.2026 о 10:00 скасовано.";
     private static final String DETAILS = "\n\nДеталі або записатись знову ";
     private static final int SINGLE_UCS2_SEGMENT = 70;
-    /** A guest booking page as it would be built: https origin + /book/cancel/ + a UUID token (69 chars). */
+    /** A guest booking page as it would be built (phase 435 follow-up): https origin + /c/ + a legacy UUID token (59 chars). */
     private static final String GUEST_PAGE =
-            "https://beautica.app/book/cancel/123e4567-e89b-12d3-a456-426614174000";
+            "https://beautica.app/c/123e4567-e89b-12d3-a456-426614174000";
 
     private static final UUID TOKEN = UUID.fromString("123e4567-e89b-12d3-a456-426614174000");
     private static final GuestCancelTokenCipher CIPHER = GuestCancelTokenCipherFixtures.testCipher();
@@ -93,7 +93,7 @@ class GuestProviderCancellationSmsTextTest {
 
         // Assert
         assertThat(sms).isEqualTo(BODY + DETAILS + GUEST_PAGE);
-        assertThat(sms).hasSize(148);
+        assertThat(sms).hasSize(138);
     }
 
     @Test
@@ -126,12 +126,12 @@ class GuestProviderCancellationSmsTextTest {
     }
 
     @Test
-    @DisplayName("with a link, the «Деталі» paragraph follows a blank line (148 chars, three segments)")
+    @DisplayName("with a link, the «Деталі» paragraph follows a blank line (138 chars, three segments)")
     void should_appendDetailsParagraph_when_linkPresent() {
         String sms = text.render(STARTS_AT, Optional.of(GUEST_PAGE));
 
         assertThat(sms).isEqualTo(BODY + DETAILS + GUEST_PAGE);
-        assertThat(sms).hasSize(148);
+        assertThat(sms).hasSize(138);
         assertThat(sms.length()).isLessThanOrEqualTo(GuestProviderCancellationSmsText.MAX_UCS2_CHARS);
     }
 

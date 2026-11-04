@@ -147,19 +147,29 @@ class ReviewInviteEndToEndIT extends AbstractReviewInviteIT {
     }
 
     @Test
-    @DisplayName("STAFF walk-in visit (guest phone on file) completed over REST → no invite row, a tick sends nothing")
-    void should_createNoRowAndSendNothing_when_staffWalkInVisitCompletedOverRest() {
+    @DisplayName("phase 434: STAFF walk-in visit (guest phone on file) completed over REST → ONE visit-keyed row, "
+            + "a tick sends ONE review SMS, row SENT with hash only")
+    void should_sendOneReviewSms_when_staffWalkInVisitCompletedOverRest() throws Exception {
         UUID appointmentId = fixtures.staffGuestVisit("CONFIRMED", GUEST_PHONE);
         fixtures.visitItem(appointmentId, masterId, masterServiceId, "STAFF", "CONFIRMED", GUEST_PHONE, 3);
 
         ResponseEntity<String> completed = patch("/api/v1/appointments/" + appointmentId + "/complete");
-        job.tick(MIDDAY.plus(Duration.ofDays(400)));
+        List<Map<String, Object>> rows = jdbcTemplate.queryForList("SELECT * FROM review_invites");
+        int smsBeforeTick = turbosmsRequests().size();
+        Instant sendAfter = ((Timestamp) rows.get(0).get("send_after")).toInstant();
+        job.tick(sendAfter);
+        job.tick(sendAfter.plusSeconds(60));
 
         assertThat(completed.getStatusCode()).as(completed.getBody()).isEqualTo(HttpStatus.NO_CONTENT);
         assertThat(jdbcTemplate.queryForObject("SELECT status FROM appointments WHERE id = ?", String.class,
                 appointmentId)).isEqualTo("COMPLETED");
-        assertThat(inviteCount()).isZero();
-        assertThat(turbosmsRequests()).isEmpty();
+        assertThat(rows).as("walk-ins get the invite too (phase 434, user decision 2026-11-04)").hasSize(1);
+        assertThat(rows.get(0).get("status")).isEqualTo("SCHEDULED");
+        assertThat(rows.get(0).get("appointment_id")).isEqualTo(appointmentId);
+        assertThat(rows.get(0).get("booking_id")).isNull();
+        assertThat(smsBeforeTick).as("completion itself never sends").isZero();
+        String token = assertOneReviewSmsTo(GUEST_PHONE);
+        assertSentWithHashOnly((UUID) rows.get(0).get("id"), token, sendAfter);
     }
 
     // ── gates flipping between create and send ────────────────────────────────

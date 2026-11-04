@@ -101,11 +101,12 @@ class StagingOtpDomainCaptureIT extends AbstractStagingProfileIT {
         assertThat(body.substring(body.lastIndexOf('\n') + 1))
                 .as("WebOTP / Apple domain-bound codes need `@host #code` as the FINAL line")
                 .isEqualTo("@" + STAGING_HOST + " #" + m.group(1));
-        assertThat(body.length()).as("one UCS-2 segment").isEqualTo(50 + STAGING_HOST.length()).isLessThanOrEqualTo(70);
+        assertThat(body.length()).as("one UCS-2 segment").isEqualTo(54 + STAGING_HOST.length()).isLessThanOrEqualTo(70);
         assertThat(mail.getRecipients(Message.RecipientType.TO)[0].toString())
                 .isEqualTo("sms" + phone + "@sms.staging.invalid");
-        assertThat(mail.getSubject()).as("subject is the flattened first line, never the raw CR/LF text")
-                .startsWith("[SMS] Beautica: Ваш код " + m.group(1) + ". Нікому не кажіть.")
+        // Phase 435: the 43-char first line is now longer than the capture's 40-char subject cap.
+        assertThat(mail.getSubject()).as("subject is the flattened first line cut at 40 chars, never the raw CR/LF text")
+                .isEqualTo("[SMS] " + ("Beautica: Ваш код " + m.group(1) + ". Нікому не кажіть.").substring(0, 40))
                 .doesNotContain("\n");
         assertThat(turbosmsStub().getAllServeEvents()).as("no call reached Turbosms").isEmpty();
     }

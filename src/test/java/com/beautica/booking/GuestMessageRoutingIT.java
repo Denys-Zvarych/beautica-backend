@@ -491,6 +491,10 @@ class GuestMessageRoutingIT extends AbstractWalkInBookingSmsIT {
         drainWorker.drain();
         String sms = sentText();
         UUID bookingId = UUID.fromString(readJson(created.getBody()).findValue("bookingId").asText());
+        // The real hourly BookingReminderJob cron (wall clock, "0 0 * * * *") reads the pinned test clock, for which
+        // this booking sits inside the 23–25h window: a run crossing a wall-clock hour would add a 24h reminder to
+        // the Telegram wire (CI 2026-11-04 14:00:00). The reminder is not under test here — mark it already sent.
+        jdbcTemplate.update("UPDATE bookings SET reminder_sent = TRUE WHERE id = ?", bookingId);
         resetTurbosms();
         stubTelegram(200, OK_BODY);
 
