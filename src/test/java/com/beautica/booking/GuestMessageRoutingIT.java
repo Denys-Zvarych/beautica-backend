@@ -51,6 +51,11 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
+import static com.beautica.booking.GuestMessageExpectedCopy.CANCEL_LINK_SUFFIX_REGEX;
+import static com.beautica.booking.GuestMessageExpectedCopy.CONFIRMATION_HEADLINE;
+import static com.beautica.booking.GuestMessageExpectedCopy.PROVIDER_CANCELLATION_BODY_REGEX;
+import static com.beautica.booking.GuestMessageExpectedCopy.reschedule;
+import static com.beautica.booking.GuestMessageExpectedCopy.rescheduleWithDetails;
 import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
 import static com.github.tomakehurst.wiremock.client.WireMock.post;
 import static com.github.tomakehurst.wiremock.client.WireMock.postRequestedFor;
@@ -214,7 +219,7 @@ class GuestMessageRoutingIT extends AbstractWalkInBookingSmsIT {
         decline(bookingId);
         drainWorker.drain();
 
-        assertThat(telegramTexts()).singleElement().asString().startsWith("Beautica: Ваш запис ");
+        assertThat(telegramTexts()).singleElement().asString().containsPattern(PROVIDER_CANCELLATION_BODY_REGEX);
         TURBOSMS.verify(0, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
         assertThat(statusChangedRowStatus(bookingId)).isEqualTo("SENT");
     }
@@ -254,7 +259,7 @@ class GuestMessageRoutingIT extends AbstractWalkInBookingSmsIT {
         drainWorker.drain();
 
         assertThat(telegramRequests()).hasSize(1);
-        assertThat(sentText()).startsWith("Beautica: Ваш запис ");
+        assertThat(sentText()).containsPattern(PROVIDER_CANCELLATION_BODY_REGEX);
         assertThat(statusChangedRowStatus(bookingId)).isEqualTo("SENT");
         assertThat(jdbcTemplate.queryForObject("SELECT status FROM telegram_links", String.class))
                 .isEqualTo("ACTIVE");
@@ -284,7 +289,7 @@ class GuestMessageRoutingIT extends AbstractWalkInBookingSmsIT {
         decline(bookingId);
         drainWorker.drain();
 
-        assertThat(telegramTexts()).singleElement().asString().startsWith("Beautica: Ваш запис ");
+        assertThat(telegramTexts()).singleElement().asString().containsPattern(PROVIDER_CANCELLATION_BODY_REGEX);
         TURBOSMS.verify(0, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
     }
 
@@ -296,7 +301,7 @@ class GuestMessageRoutingIT extends AbstractWalkInBookingSmsIT {
         decline(bookingId);
         drainWorker.drain();
 
-        assertThat(sentText()).startsWith("Beautica: Ваш запис ");
+        assertThat(sentText()).containsPattern(PROVIDER_CANCELLATION_BODY_REGEX);
         assertThat(telegramRequests()).isEmpty();
     }
 
@@ -354,14 +359,29 @@ class GuestMessageRoutingIT extends AbstractWalkInBookingSmsIT {
     @ParameterizedTest(name = "{0}")
     @EnumSource(value = BookingSmsDispatcher.Kind.class,
             names = {"GUEST_CONFIRMATION", "WALK_IN_CONFIRMATION"})
-    @DisplayName("unrouted kinds with an ACTIVE link → SMS only, the Bot API is never called")
-    void should_sendSmsOnly_when_kindIsUnrouted(BookingSmsDispatcher.Kind kind) {
+    @DisplayName("user decision 2026-11-04: confirmation kinds with an ACTIVE link → Telegram only, no SMS")
+    void should_sendConfirmationToTelegramOnly_when_phoneLinked(BookingSmsDispatcher.Kind kind) {
         link(LINK_PHONE, ALLOWED_CHAT);
 
-        bookingSmsDispatcher.dispatch(kind, LINK_PHONE, "Beautica: Ваш запис підтверджено!");
+        bookingSmsDispatcher.dispatch(kind, LINK_PHONE, CONFIRMATION_HEADLINE);
 
+        assertThat(telegramTexts()).containsExactly(CONFIRMATION_HEADLINE);
+        TURBOSMS.verify(0, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @EnumSource(value = BookingSmsDispatcher.Kind.class,
+            names = {"GUEST_CONFIRMATION", "WALK_IN_CONFIRMATION"})
+    @DisplayName("user decision 2026-11-04: confirmation kinds with an ACTIVE link + Telegram 500 → one SMS fallback")
+    void should_fallBackToSms_when_confirmationTelegramSendFails(BookingSmsDispatcher.Kind kind) {
+        link(LINK_PHONE, ALLOWED_CHAT);
+        stubTelegram(500, "{\"ok\":false,\"error_code\":500,\"description\":\"Internal Server Error\"}");
+
+        bookingSmsDispatcher.dispatch(kind, LINK_PHONE, CONFIRMATION_HEADLINE);
+
+        assertThat(telegramRequests()).hasSize(1);
         TURBOSMS.verify(1, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
-        assertThat(telegramRequests()).isEmpty();
+        assertThat(linkStatusAndChat()).as("a transient failure leaves the link ACTIVE").isEqualTo("ACTIVE/" + ALLOWED_CHAT);
     }
 
     @Test
@@ -381,7 +401,7 @@ class GuestMessageRoutingIT extends AbstractWalkInBookingSmsIT {
         assertThat(telegramRequests()).as("the webhook replies inline, never through the Bot API").isEmpty();
         awaitTelegramRequests(1);
         assertThat(telegramTexts()).as("the booking details follow the LINKED reply")
-                .singleElement().asString().startsWith("Beautica: Ваш запис підтверджено!\n\n");
+                .singleElement().asString().startsWith(CONFIRMATION_HEADLINE + "\n\n");
         stubTelegram(200, OK_BODY);
 
         reminderJob.sendReminders();
@@ -436,7 +456,7 @@ class GuestMessageRoutingIT extends AbstractWalkInBookingSmsIT {
                 salon.salonId());
         // Phase 435 follow-up: the details ARE the confirmation SMS copy (row inserted without a sealed token → no
         // «Скасувати:» line).
-        assertThat(telegramTexts()).containsExactly("Beautica: Ваш запис підтверджено!\n\n"
+        assertThat(telegramTexts()).containsExactly(CONFIRMATION_HEADLINE + "\n\n"
                 + DATE_FMT.format(startsAt.atZoneSameInstant(TimeZones.KYIV)) + " о " + kyivTime(startsAt) + "\n"
                 + "Салон " + salonName + ", майстер " + MASTER_NAME + ".\n"
                 + "Адреса: вул. Хрещатик 1");
@@ -472,7 +492,7 @@ class GuestMessageRoutingIT extends AbstractWalkInBookingSmsIT {
         awaitTelegramRequests(1);
         assertThat(telegramTexts()).singleElement().asString()
                 .as("phase 435 follow-up: the visit's confirmation SMS copy — the lead's start, no service list")
-                .startsWith("Beautica: Ваш запис підтверджено!\n\n"
+                .startsWith(CONFIRMATION_HEADLINE + "\n\n"
                         + DATE_FMT.format(startsAt.atZoneSameInstant(TimeZones.KYIV)) + " о " + kyivTime(startsAt) + "\n")
                 .contains("\nСалон ")
                 .doesNotContain("Педикюр")
@@ -504,7 +524,7 @@ class GuestMessageRoutingIT extends AbstractWalkInBookingSmsIT {
         assertThat(telegramTexts()).containsExactly(sms);
         assertThat(sms).contains("\nАдреса: Хрещатик 10 (вхід з двору)\nСкасувати: ")
                 .endsWith(readJson(created.getBody()).findValue("cancelUrl").asText())
-                .containsPattern("/c/[0-9A-Za-z]{16}$");
+                .containsPattern(CANCEL_LINK_SUFFIX_REGEX);
         TURBOSMS.verify(0, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
     }
 
@@ -570,17 +590,69 @@ class GuestMessageRoutingIT extends AbstractWalkInBookingSmsIT {
     }
 
     @Test
-    @DisplayName("always-SMS at IT level: public guest booking (confirmation + cancel link) with an ACTIVE link → "
-            + "one SMS, no Bot API call")
-    void should_sendGuestConfirmationBySmsOnly_when_phoneLinked() throws Exception {
+    @DisplayName("user decision 2026-11-04: public guest booking (confirmation + cancel link) with an ACTIVE link → "
+            + "Telegram only, no SMS")
+    void should_sendGuestConfirmationToTelegramOnly_when_phoneLinked() throws Exception {
         link(LINK_PHONE, ALLOWED_CHAT);
 
         ResponseEntity<String> created = createGuestBooking(tomorrowKyivAt(12));
         drainWorker.drain();
 
         assertThat(created.getStatusCode()).as("body=%s", created.getBody()).isEqualTo(HttpStatus.CREATED);
-        assertThat(sentText()).startsWith("Beautica: Ваш запис підтверджено!").containsPattern("/c/[0-9A-Za-z]{16}$");
+        assertThat(telegramTexts()).singleElement().asString().startsWith(CONFIRMATION_HEADLINE)
+                .endsWith(readJson(created.getBody()).findValue("cancelUrl").asText())
+                .containsPattern(CANCEL_LINK_SUFFIX_REGEX);
+        TURBOSMS.verify(0, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
+    }
+
+    @Test
+    @DisplayName("user decision 2026-11-04: guest unsubscribed («Відписатися від Telegram») → the public booking "
+            + "confirmation + cancel link goes by SMS, the Bot API is never called")
+    void should_sendGuestConfirmationBySms_when_guestUnsubscribedFromTelegram() throws Exception {
+        link(LINK_PHONE, ALLOWED_CHAT);
+        assertThat(linkService.unlinkPhone(LINK_PHONE)).as("fixture: the unsubscribe removed the link").isTrue();
+
+        ResponseEntity<String> created = createGuestBooking(tomorrowKyivAt(12));
+        drainWorker.drain();
+
+        assertThat(created.getStatusCode()).as("body=%s", created.getBody()).isEqualTo(HttpStatus.CREATED);
+        assertThat(sentText()).startsWith(CONFIRMATION_HEADLINE)
+                .endsWith(readJson(created.getBody()).findValue("cancelUrl").asText())
+                .containsPattern(CANCEL_LINK_SUFFIX_REGEX);
         assertThat(telegramRequests()).isEmpty();
+    }
+
+    @Test
+    @DisplayName("user decision 2026-11-04: BLOCKED link (guest blocked the bot) → the public booking confirmation "
+            + "goes by SMS, no Bot API call, the link stays BLOCKED")
+    void should_sendGuestConfirmationBySms_when_linkBlocked() throws Exception {
+        link(LINK_PHONE, ALLOWED_CHAT);
+        linkService.markBlocked(ALLOWED_CHAT);
+
+        ResponseEntity<String> created = createGuestBooking(tomorrowKyivAt(12));
+        drainWorker.drain();
+
+        assertThat(created.getStatusCode()).as("body=%s", created.getBody()).isEqualTo(HttpStatus.CREATED);
+        assertThat(sentText()).startsWith(CONFIRMATION_HEADLINE)
+                .endsWith(readJson(created.getBody()).findValue("cancelUrl").asText());
+        assertThat(telegramRequests()).isEmpty();
+        assertThat(linkStatusAndChat()).as("a BLOCKED link is never re-activated by a send")
+                .isEqualTo("BLOCKED/" + ALLOWED_CHAT);
+    }
+
+    @Test
+    @DisplayName("user decision 2026-11-04: walk-in created by the owner for a linked phone → the walk-in "
+            + "confirmation + cancel link reaches Telegram only, no SMS")
+    void should_sendWalkInConfirmationToTelegramOnly_when_phoneLinked() {
+        link(E164_PHONE, ALLOWED_CHAT);
+
+        ResponseEntity<String> created = createWalkIn(tomorrowKyivAt(12));
+        drainWorker.drain();
+
+        assertConfirmedWalkInBody(created);
+        assertThat(telegramTexts()).singleElement().asString().startsWith(CONFIRMATION_HEADLINE)
+                .containsPattern(CANCEL_LINK_SUFFIX_REGEX);
+        TURBOSMS.verify(0, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
     }
 
     @Test
@@ -620,8 +692,7 @@ class GuestMessageRoutingIT extends AbstractWalkInBookingSmsIT {
                 new com.beautica.booking.dto.RescheduleBookingRequest(newStart, false));
         drainWorker.drain();
 
-        assertThat(telegramTexts()).containsExactly("Beautica: Ваш запис перенесено на "
-                + DATE_FMT.format(newStart.atZoneSameInstant(TimeZones.KYIV)) + " о " + kyivTime(newStart) + ".");
+        assertThat(telegramTexts()).containsExactly(reschedule(newStart));
         TURBOSMS.verify(0, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
     }
 
@@ -637,6 +708,8 @@ class GuestMessageRoutingIT extends AbstractWalkInBookingSmsIT {
         UUID bookingId = UUID.fromString(readJson(created.getBody()).findValue("bookingId").asText());
         drainWorker.drain();
         resetTurbosms();
+        // The confirmation itself went to Telegram (linked phone, user decision 2026-11-04) — clear that request.
+        stubTelegram(200, OK_BODY);
         authenticateAsOwner();
         OffsetDateTime newStart = tomorrowKyivAt(14);
 
@@ -646,10 +719,8 @@ class GuestMessageRoutingIT extends AbstractWalkInBookingSmsIT {
         drainWorker.drain();
 
         // Assert
-        assertThat(cancelUrl).containsPattern("/c/[0-9A-Za-z]{16}$");
-        assertThat(telegramTexts()).containsExactly("Beautica: Ваш запис перенесено на "
-                + DATE_FMT.format(newStart.atZoneSameInstant(TimeZones.KYIV)) + " о " + kyivTime(newStart) + ".\n\n"
-                + "Деталі або записатись знову " + cancelUrl);
+        assertThat(cancelUrl).containsPattern(CANCEL_LINK_SUFFIX_REGEX);
+        assertThat(telegramTexts()).containsExactly(rescheduleWithDetails(newStart, cancelUrl));
         TURBOSMS.verify(0, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
     }
 
@@ -664,8 +735,7 @@ class GuestMessageRoutingIT extends AbstractWalkInBookingSmsIT {
                 new com.beautica.booking.dto.RescheduleBookingRequest(newStart, false));
         drainWorker.drain();
 
-        assertThat(sentText()).isEqualTo("Beautica: Ваш запис перенесено на "
-                + DATE_FMT.format(newStart.atZoneSameInstant(TimeZones.KYIV)) + " о " + kyivTime(newStart) + ".");
+        assertThat(sentText()).isEqualTo(reschedule(newStart));
         assertThat(telegramRequests()).isEmpty();
     }
 

@@ -125,7 +125,7 @@ class GuestBookingServiceTest {
      * while still proving the service holds no {@code SmsService} of its own.
      */
     private BookingSmsDispatcher smsDispatcher() {
-        return new BookingSmsDispatcher(smsService, GuestMessageRouters.smsOnly(smsService), new SyncTaskExecutor());
+        return new BookingSmsDispatcher(GuestMessageRouters.smsOnly(smsService), new SyncTaskExecutor());
     }
 
     @Test

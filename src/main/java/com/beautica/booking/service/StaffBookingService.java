@@ -111,7 +111,8 @@ import java.util.UUID;
  * message to, holds the real collaborator in production and a log-only {@code NoOpSmsService}
  * everywhere else and cannot tell the difference. An {@code if (properties.isEnabled())} here would
  * defeat that design and re-open the "the next call site forgets the gate" failure it exists to
- * close. See {@link #registerWalkInConfirmationSms}.
+ * close. See {@link #registerWalkInConfirmationSms}. Since the 2026-11-04 user decision the dispatcher delivers it
+ * through {@code GuestMessageRouter}: Telegram when the phone is linked, SMS otherwise and on any Telegram failure.
  *
  * <p><b>Phase 412 — the cancel link.</b> The visit header carries a one-time guest cancel token
  * (reverses phases 168 / 171 / 254 D), and the SMS renders {@code {cancelUrl}} =

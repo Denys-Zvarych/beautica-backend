@@ -3,7 +3,6 @@ package com.beautica.booking.service;
 import com.beautica.notification.channel.GuestMessageKind;
 import com.beautica.notification.channel.GuestMessageRouter;
 import com.beautica.notification.sms.SmsBackpressureException;
-import com.beautica.notification.sms.SmsService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Qualifier;
@@ -46,11 +45,12 @@ import java.util.concurrent.RejectedExecutionException;
  *       write as failed).</li>
  * </ul>
  *
- * <p>It injects {@link SmsService}, so it is fully on the {@code app.booking.sms.enabled} gate and
- * knows nothing about it: with the gate off it hands a {@code NoOpSmsService} call to the pool,
- * which is cheap and correct. That is also why this class is the ONLY booking-side {@code
- * SmsService} consumer worth having — the OTP carve-out ({@code OtpSmsSender}) is deliberately
- * unreachable from this package, mechanically enforced by {@code SmsFeatureGateTest}.
+ * <p>Every kind is delivered through {@link GuestMessageRouter} (user decision 2026-11-04: every guest
+ * notification goes to Telegram when the phone is linked, SMS otherwise and on any Telegram failure). The router's
+ * SMS leg is the gated {@code SmsService}, so this class stays fully on the {@code app.booking.sms.enabled} gate and
+ * knows nothing about it: with the gate off the router hands the message to the {@code NoOpSmsService}, which is
+ * cheap and correct. The OTP carve-out ({@code OtpSmsSender}) is deliberately unreachable from this package —
+ * the guest phone-OTP always stays SMS — mechanically enforced by {@code SmsFeatureGateTest}.
  *
  * <p><b>Out of scope:</b> the 24 h reminder, which is not on a request thread at all and already has
  * its own two-stage pool with opposite rejection semantics ({@code smsReminderExecutor}, a
@@ -65,33 +65,37 @@ public class BookingSmsDispatcher {
     /**
      * Which message was queued. Present only so the drop line and the failure line name the lost
      * message: five senders share one pool, and {@code event=booking_sms_dropped} on its own tells an
-     * operator that something was lost but not what. Never rendered into the SMS. Since phase 408 it is a
-     * routing decision for exactly one kind: {@link #GUEST_PROVIDER_CANCELLATION} goes through
-     * {@code GuestMessageRouter} (Telegram when linked, else SMS); every other kind is SMS-only.
+     * operator that something was lost but not what. Never rendered into the SMS. Each kind also names the
+     * {@link GuestMessageKind} it is routed as (user decision 2026-11-04: every kind goes through
+     * {@code GuestMessageRouter} — Telegram when linked, else SMS).
      */
     public enum Kind {
 
-        WALK_IN_CONFIRMATION("walk_in_confirmation"),
-        GUEST_CONFIRMATION("guest_confirmation"),
+        /** The walk-in confirmation (+ cancel link) — routed since the 2026-11-04 user decision. */
+        WALK_IN_CONFIRMATION("walk_in_confirmation", GuestMessageKind.WALK_IN_CONFIRMATION),
+        /** The public guest booking confirmation (+ cancel link) — routed since the 2026-11-04 user decision. */
+        GUEST_CONFIRMATION("guest_confirmation", GuestMessageKind.GUEST_CONFIRMATION),
         /**
          * Phase 390 — the provider side cancelled a guest's booking or visit (decline, salon
          * closure, master removal). Queued from {@code NotificationService} on the outbox drain
          * thread, which is already after commit; routed here so a Turbosms stall never holds the
          * drain batch, and so the drop/failure lines name it like every other booking SMS.
          */
-        GUEST_PROVIDER_CANCELLATION("guest_provider_cancellation"),
+        GUEST_PROVIDER_CANCELLATION("guest_provider_cancellation", GuestMessageKind.GUEST_PROVIDER_CANCELLATION),
         /**
          * Phase 431 — the provider side (independent master, salon owner or admin) moved an
          * account-less guest's booking, or one service of their visit, to a new time. Queued from
          * {@code NotificationService} on the outbox drain thread, exactly like
          * {@link #GUEST_PROVIDER_CANCELLATION}.
          */
-        GUEST_PROVIDER_RESCHEDULE("guest_provider_reschedule");
+        GUEST_PROVIDER_RESCHEDULE("guest_provider_reschedule", GuestMessageKind.GUEST_PROVIDER_RESCHEDULE);
 
         private final String token;
+        private final GuestMessageKind routedAs;
 
-        Kind(String token) {
+        Kind(String token, GuestMessageKind routedAs) {
             this.token = token;
+            this.routedAs = routedAs;
         }
 
         /** Stable, machine-greppable log token — renaming one is an alerting change. */
@@ -108,18 +112,15 @@ public class BookingSmsDispatcher {
      */
     static final int OUTBOX_QUEUE_RESERVE = 50;
 
-    private final SmsService smsService;
     private final GuestMessageRouter guestMessageRouter;
     private final TaskExecutor smsSendExecutor;
 
     /**
-     * @param guestMessageRouter phase 408 — used for {@link Kind#GUEST_PROVIDER_CANCELLATION} only; every other
-     *                           kind keeps calling {@code smsService} directly and never reaches the router
+     * @param guestMessageRouter the one channel seam for every kind (Telegram when linked, SMS otherwise and as the
+     *                           fallback); its SMS leg is the gated {@code SmsService}
      */
-    public BookingSmsDispatcher(SmsService smsService,
-                                GuestMessageRouter guestMessageRouter,
+    public BookingSmsDispatcher(GuestMessageRouter guestMessageRouter,
                                 @Qualifier("smsSendExecutor") TaskExecutor smsSendExecutor) {
-        this.smsService = smsService;
         this.guestMessageRouter = guestMessageRouter;
         this.smsSendExecutor = smsSendExecutor;
     }
@@ -209,24 +210,9 @@ public class BookingSmsDispatcher {
      */
     private void sendSafely(Kind kind, String phoneE164, String text) {
         try {
-            send(kind, phoneE164, text);
+            guestMessageRouter.deliver(kind.routedAs, phoneE164, text);
         } catch (RuntimeException e) {
             log.warn("Booking SMS send failed: kind={} cause={}", kind.token(), e.getClass().getSimpleName());
-        }
-    }
-
-    /**
-     * Phase 408 D1 — the provider-cancellation branch is routed (Telegram when the phone is linked, SMS otherwise);
-     * phase 435 follow-up (user decision 2026-11-04) — so is the provider reschedule notice, with the identical text.
-     * Confirmations stay on the exact pre-408 {@code smsService.send} call: the router is never in their path.
-     */
-    private void send(Kind kind, String phoneE164, String text) {
-        switch (kind) {
-            case GUEST_PROVIDER_CANCELLATION ->
-                    guestMessageRouter.deliver(GuestMessageKind.GUEST_PROVIDER_CANCELLATION, phoneE164, text);
-            case GUEST_PROVIDER_RESCHEDULE ->
-                    guestMessageRouter.deliver(GuestMessageKind.GUEST_PROVIDER_RESCHEDULE, phoneE164, text);
-            case WALK_IN_CONFIRMATION, GUEST_CONFIRMATION -> smsService.send(phoneE164, text);
         }
     }
 }

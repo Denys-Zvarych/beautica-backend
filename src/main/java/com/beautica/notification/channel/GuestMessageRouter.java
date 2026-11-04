@@ -19,8 +19,9 @@ import java.util.Map;
 import java.util.Optional;
 
 /**
- * Phase 408 — the one seam (D1) that sends a non-urgent guest message to Telegram when that phone has an ACTIVE
- * link and to SMS otherwise, with SMS as the fallback for every Telegram failure ("never lose a message" beats
+ * Phase 408 — the one seam (D1) that sends a guest notification to Telegram when that phone has an ACTIVE
+ * link and to SMS otherwise (user decision 2026-11-04: every guest notification incl. the confirmations; only the
+ * phone-OTP, sent through {@code OtpSmsSender}, never comes here and always stays SMS), with SMS as the fallback for every Telegram failure ("never lose a message" beats
  * "never duplicate", D3).
  *
  * <h2>Resolution (D2, in order)</h2>
@@ -35,7 +36,7 @@ import java.util.Optional;
  *   <li>Staging allow-list refusal ({@link TelegramNotAllowListedException}) → SMS, counted {@code not_allow_listed}.</li>
  *   <li>Any other {@code RuntimeException} on the Telegram path (transient, rate limit, back-off) → SMS at once, link
  *       untouched, no Telegram retry.</li>
- *   <li>The link lookup throws → SMS.</li>
+ *   <li>The link lookup throws → SMS (incl. a Hikari connection-timeout, up to 10 s, on an exhausted pool).</li>
  * </ol>
  * SMS failures propagate exactly as before, so every caller keeps its own retry / swallow semantics.
  *
@@ -135,6 +136,11 @@ public class GuestMessageRouter {
         }
         Optional<ActiveLink> link;
         try {
+            // Bound (audit-fix): this lookup is NOT separately time-bounded. On an exhausted Hikari pool it waits
+            // up to spring.datasource.hikari.connection-timeout (10 s) for a connection, competing with request
+            // threads, then throws -> LOOKUP_ERROR_FALLBACK (SMS). No clean per-call bound exists: Hikari's
+            // timeout is pool-wide, and an idle-connection probe would route ACTIVE-linked guests to SMS under
+            // ordinary load (a routing change). The 10 s is budgeted in AsyncConfig (smsSendExecutor, 28 s).
             link = linkService.findActiveForPhone(phoneE164);
         } catch (RuntimeException e) {
             fallback(kind, Reason.LOOKUP_ERROR_FALLBACK, phoneE164, text);
@@ -150,7 +156,8 @@ public class GuestMessageRouter {
     /**
      * Phase 433 — Telegram-only send to a chat the caller already resolved (the booking-details follow-up right after
      * a fresh link). Same bounded-wait gate ({@link TelegramMessenger#sendWaiting}) and the same dark-launch gates as
-     * {@link #deliver}, but no SMS fallback: the guest already has the SMS confirmation, so a failure is logged
+     * {@link #deliver}, but no SMS fallback: the guest already has the confirmation (sent before this link existed —
+     * by SMS, or to a previously linked chat when the phone is being re-linked), so a failure is logged
      * (exception class only) and dropped. Same threading rule as {@link #deliver}: pool threads only.
      *
      * @return {@code true} when Telegram accepted the message; {@code false} when gated off or the send failed

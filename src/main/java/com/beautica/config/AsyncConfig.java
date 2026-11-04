@@ -62,19 +62,24 @@ import org.springframework.security.task.DelegatingSecurityContextTaskExecutor;
  *                                    cancellation) AND, since phase 390, guest provider-cancellation SMS
  *                                    handed off by the outbox drain, whose row is ALREADY SENT. NOT
  *                                    recoverable for either; reported at ERROR with counts. Phase 408: a
- *                                    provider-cancellation task is now Telegram (gate wait <= 1 s + 2 s
- *                                    connect + 4 s read) then, on failure, SMS (3 s + 5 s) = 15 s, and on
- *                                    the 403 path also markBlocked (<= 3 s lock wait) = 18 s worst case,
- *                                    so the 20 s grace covers ONE such in-flight task per worker; a queue
+ *                                    guest / walk-in confirmation or provider-cancellation task is now a
+ *                                    link lookup, then Telegram (gate wait <= 1 s + 2 s connect + 4 s
+ *                                    read) then, on failure, SMS (3 s + 5 s) = 15 s, and on the 403 path
+ *                                    also markBlocked (<= 3 s lock wait) = 18 s; with the lookup waiting
+ *                                    its full Hikari connection-timeout (10 s, pool exhausted) the
+ *                                    absolute worst case is 28 s. The 20 s grace covers ONE such
+ *                                    in-flight task per worker on a healthy DB, not the 28 s pool-
+ *                                    exhausted case (accepted: that task is cut and counted); a queue
  *                                    backlog is abandoned and counted, as before.
  * smsReminderDispatchExecutor  30 s  one hand-off task per hourly batch; cut = whole batch un-fanned-out.
  *                                    NOT recoverable (reminderSent already committed); reported at ERROR.
  * smsReminderExecutor          30 s  guest 24h / 2h (phase 413) reminders. NOT recoverable (reminderSent /
  *                                    reminder_2h_sent already committed); reported at ERROR. ~6 s drains a
  *                                    full queue at healthy RTT. Phase 408: a task is Telegram then SMS
- *                                    fallback (+ markBlocked on a 403), 18 s worst case (see
- *                                    smsSendExecutor), so the 30 s grace covers ONE worst-case in-flight
- *                                    task per worker; the rest is counted as lost.
+ *                                    fallback (+ markBlocked on a 403), 18 s worst case, 28 s with the
+ *                                    link lookup's 10 s Hikari connection wait (see smsSendExecutor), so
+ *                                    the 30 s grace covers ONE worst-case in-flight task per worker; the
+ *                                    rest is counted as lost.
  * cacheEvictionExecutor        10 s  in-memory Caffeine scans; the cache dies with the JVM -> irrelevant.
  * blobPurgeExecutor            20 s  after-commit R2 deletes of already-dereferenced blobs + the phase-417
  *                                    Cloudflare edge purge; cut = accepted orphan blob / edge copy (never a
@@ -464,8 +469,14 @@ public class AsyncConfig implements AsyncConfigurer {
     }
 
     /**
-     * Pool for REQUEST-PATH outbound SMS — today the walk-in confirmation
-     * ({@code BookingSmsDispatcher}, backend-perf MEDIUM 2026-08-18).
+     * Pool for REQUEST-PATH outbound guest messages — the guest and walk-in booking confirmations
+     * ({@code BookingSmsDispatcher}, backend-perf MEDIUM 2026-08-18). Since phase 408 each confirmation
+     * goes through {@code GuestMessageRouter}: a link lookup (one short read transaction), then Telegram
+     * when the phone has an ACTIVE link (gate wait &le; 1 s + 2 s connect + 4 s read = up to ~7 s) and, on
+     * any Telegram failure, the SMS fallback (3 s connect + 5 s read = ~8 s), i.e. 15 s worst case per
+     * task, 18 s with the post-403 {@code markBlocked} lock wait. The link lookup itself can add up to
+     * {@code spring.datasource.hikari.connection-timeout} (10 s) when the 10-connection pool is exhausted
+     * — it is NOT separately bounded (see {@code GuestMessageRouter#deliver}): 28 s absolute worst case.
      *
      * <p><b>Why it is not {@link #smsReminderExecutor()}</b>, even though both send SMS (Anti-Bug
      * §H-4 asks for consolidation of pools doing the same work). The two differ in the only property
@@ -489,12 +500,15 @@ public class AsyncConfig implements AsyncConfigurer {
      * <p><b>Sizing.</b> {@code corePoolSize == maxPoolSize == 4} for the reason spelled out on
      * {@link #smsReminderExecutor()}: a {@link ThreadPoolExecutor} only grows past its core size once
      * the QUEUE is full, so a core smaller than max would deliver the core's concurrency and nothing
-     * more. Four workers at a ~100 ms provider RTT clear ~40 sends/s, orders of magnitude above the
-     * walk-in create rate that the tighter {@code staffBookingSmsBuckets} budget now caps.
-     * {@code allowCoreThreadTimeOut} lets all four die back after 60 s idle. The 200-slot queue IS
-     * the bulkhead against a Turbosms outage: at the 5 s read cap the pool drains ~0.8 sends/s, so a
-     * sustained outage fills the queue and subsequent sends are dropped-and-logged in bounded time
-     * instead of each paying a full timeout on a request thread.
+     * more. Four workers at a ~100 ms provider RTT (SMS or Telegram, plus a few ms of link lookup)
+     * clear ~40 sends/s, orders of magnitude above the guest + walk-in create rate that the
+     * {@code staffBookingSmsBuckets} / guest OTP budgets cap. {@code allowCoreThreadTimeOut} lets all
+     * four die back after 60 s idle. The 200-slot queue IS the bulkhead against a provider outage:
+     * unlinked phones (SMS only) at the 8 s SMS cap drain 4 / 8 = ~0.5 sends/s; linked phones during a
+     * Telegram outage pay 15 s (Telegram ~7 s + SMS fallback ~8 s) = ~0.27 sends/s, ~0.22 at the 18 s
+     * markBlocked path, and ~0.14 sends/s if the link lookup also waits its full 10 s for a Hikari
+     * connection. A sustained outage therefore fills the queue and subsequent sends are
+     * dropped-and-logged in bounded time instead of each paying a full timeout on a request thread.
      *
      * <p><b>Shared with the outbox drain (phase 390).</b> Guest provider-cancellation SMS are submitted
      * from the drain via {@code BookingSmsDispatcher#dispatchOrThrow}, which never takes the last

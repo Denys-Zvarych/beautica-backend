@@ -15,6 +15,8 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Import;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.context.TestPropertySource;
@@ -29,6 +31,9 @@ import java.time.format.DateTimeFormatter;
 import java.util.List;
 import java.util.UUID;
 
+import static com.beautica.booking.GuestMessageExpectedCopy.CANCEL_LINK_SUFFIX_REGEX;
+import static com.beautica.booking.GuestMessageExpectedCopy.CONFIRMATION_HEADLINE;
+import static com.beautica.booking.GuestMessageExpectedCopy.PROVIDER_CANCELLATION_BODY_REGEX;
 import static com.github.tomakehurst.wiremock.client.WireMock.postRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.urlEqualTo;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -106,11 +111,31 @@ class GuestMessageTelegramOffIT extends AbstractWalkInBookingSmsIT {
                 new StatusUpdateRequest(CancellationReason.PROVIDER_UNAVAILABLE, null));
         drainWorker.drain();
 
-        assertThat(sentText()).startsWith("Beautica: Ваш запис ");
+        assertThat(sentText()).containsPattern(PROVIDER_CANCELLATION_BODY_REGEX);
         TURBOSMS.verify(1, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
         assertThat(telegramRequests()).isEmpty();
     }
 
+
+    @Test
+    @DisplayName("user decision 2026-11-04: ACTIVE link + flag off → public guest booking confirmation + cancel link "
+            + "by exactly one SMS, no Bot API call, link untouched")
+    void should_sendGuestConfirmationBySms_when_telegramFlagOffAndPhoneLinked() throws Exception {
+        OffsetDateTime startsAt = NOW.atZone(TimeZones.KYIV).toLocalDate().plusDays(1).atTime(12, 0)
+                .atZone(TimeZones.KYIV).toOffsetDateTime();
+
+        ResponseEntity<String> created = createGuestBooking(startsAt);
+        drainWorker.drain();
+
+        assertThat(created.getStatusCode()).as("body=%s", created.getBody()).isEqualTo(HttpStatus.CREATED);
+        assertThat(sentText()).startsWith(CONFIRMATION_HEADLINE)
+                .endsWith(readJson(created.getBody()).findValue("cancelUrl").asText())
+                .containsPattern(CANCEL_LINK_SUFFIX_REGEX);
+        assertThat(telegramRequests()).isEmpty();
+        assertThat(jdbcTemplate.queryForObject("SELECT status || '/' || (last_sent_at IS NULL) FROM telegram_links",
+                String.class)).as("flag off never reads past the gate, so the link is never touched")
+                .isEqualTo("ACTIVE/true");
+    }
     private UUID insertLinkBooking(OffsetDateTime startsAt) {
         return insertGuestLinkBooking(LINK_PHONE, startsAt, Duration.ofHours(1), NOW.minus(Duration.ofDays(1)));
     }
