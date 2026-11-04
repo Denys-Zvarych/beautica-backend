@@ -253,13 +253,35 @@ class TelegramUpdateHandlerTest {
 
     @ParameterizedTest
     @DisplayName("unlink and remove keyboard when stop or unlink button")
-    @ValueSource(strings = {"/stop", "/STOP", "Повернутися до SMS", "  Повернутися до SMS "})
+    @ValueSource(strings = {"/stop", "/STOP", "Відписатися від Telegram", "  Відписатися від Telegram ",
+            "Повернутися до SMS", "  Повернутися до SMS "})
     void should_unlinkAndRemoveKeyboard_when_stopOrUnlinkButton(String text) {
         Reply reply = reply(text(text));
 
         verify(linkService).unlinkChat(CHAT);
         assertThat(reply.text()).isEqualTo(TelegramBotReplies.STOPPED);
         assertThat(reply.replyMarkup()).isEqualTo(TelegramBotReplies.REMOVE_KEYBOARD);
+    }
+
+    @ParameterizedTest
+    @DisplayName("reply help and keep the link when text only resembles an unlink button label")
+    @ValueSource(strings = {"Відписатися", "від Telegram", "Відписатися від Telegram зараз",
+            "Будь ласка, Відписатися від Telegram", "відписатися від telegram", "Відписатися від Telegram!",
+            "Повернутися", "Повернутися до SMS будь ласка", "Хочу Повернутися до SMS", "повернутися до sms"})
+    void should_replyHelpAndKeepLink_when_textIsNearMissOfUnlinkLabel(String text) {
+        Reply reply = reply(text(text));
+
+        assertThat(reply.text()).as("near-miss «%s» must not unlink", text).isEqualTo(TelegramBotReplies.HELP);
+        assertThat(reply.replyMarkup()).isNull();
+        verifyNoInteractions(linkService);
+    }
+
+    @Test
+    @DisplayName("linked reply names the current unlink button label, not the legacy one")
+    void should_nameCurrentUnlinkLabel_when_linkedReplyText() {
+        assertThat(TelegramBotReplies.LINKED)
+                .contains("«" + TelegramBotReplies.UNLINK_BUTTON_TEXT + "»")
+                .doesNotContain(TelegramBotReplies.LEGACY_UNLINK_BUTTON_TEXT);
     }
 
     @Test

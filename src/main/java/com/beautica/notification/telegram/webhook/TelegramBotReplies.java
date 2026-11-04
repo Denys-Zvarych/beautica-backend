@@ -16,14 +16,19 @@ import java.util.List;
 public final class TelegramBotReplies {
 
     /** Text of the K2 button; the bot treats an incoming message with exactly this text like {@code /stop}. */
-    public static final String UNLINK_BUTTON_TEXT = "Повернутися до SMS";
+    public static final String UNLINK_BUTTON_TEXT = "Відписатися від Telegram";
+    /**
+     * Pre-2026-11-04 K2 label. A reply keyboard persists client-side until replaced, so guests linked before the
+     * rename still press this text; it is accepted as {@code /stop} until those keyboards age out.
+     */
+    static final String LEGACY_UNLINK_BUTTON_TEXT = "Повернутися до SMS";
     static final String SHARE_PHONE_BUTTON_TEXT = "Поділитися номером";
 
     static final String ASK_PHONE = "Щоб отримувати нагадування про запис тут, підтвердьте номер телефону, який ви "
             + "вказали під час запису: натисніть «Поділитися номером» нижче.";
     static final String LINKED = "Тепер усі сповіщення про ваш запис у Beautica ви отримуватимете тут: нагадування "
-            + "та зміни від майстра чи салону. Підтвердження запису й коди й надалі приходять SMS. Щоб повернутися "
-            + "до SMS, натисніть «Повернутися до SMS» або надішліть /stop.";
+            + "та зміни від майстра чи салону. Підтвердження запису й коди й надалі приходять SMS. Щоб знову "
+            + "отримувати повідомлення SMS, натисніть «Відписатися від Telegram» або надішліть /stop.";
     static final String INVALID_LINK = "Посилання недійсне або застаріло. Відкрийте його знову зі сторінки запису на "
             + "beautica.app. Поки що сповіщення надходитимуть SMS.";
     static final String MISMATCH = "Цей номер не збігається з номером у записі, тому Telegram не підключено. "
@@ -48,6 +53,11 @@ public final class TelegramBotReplies {
     static final RemoveKeyboard REMOVE_KEYBOARD = new RemoveKeyboard(true);
 
     private static final String SEND_MESSAGE = "sendMessage";
+
+    /** True for the current K2 label and the legacy one (exact match on the already-stripped text). */
+    static boolean isUnlinkButton(String text) {
+        return UNLINK_BUTTON_TEXT.equals(text) || LEGACY_UNLINK_BUTTON_TEXT.equals(text);
+    }
 
     private TelegramBotReplies() {
     }

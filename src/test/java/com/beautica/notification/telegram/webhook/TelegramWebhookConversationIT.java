@@ -122,7 +122,7 @@ class TelegramWebhookConversationIT extends AbstractIntegrationTest {
     }
 
     private static void assertUnlinkKeyboard(JsonNode markup) {
-        assertThat(markup.path("keyboard").get(0).get(0).path("text").asText()).isEqualTo("Повернутися до SMS");
+        assertThat(markup.path("keyboard").get(0).get(0).path("text").asText()).isEqualTo("Відписатися від Telegram");
         assertThat(markup.path("is_persistent").asBoolean()).isTrue();
     }
 
