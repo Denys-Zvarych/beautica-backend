@@ -1,7 +1,9 @@
 <!DOCTYPE html>
 <!--
   Template: email/booking-cancelled-provider
-  Variables: masterName (String), clientName (String), serviceName (String),
+  Variables: masterName (String), clientName (String), serviceName (String — the first service; the
+             single row used when serviceNames is absent), serviceNames (List<String>, NULLABLE —
+             phase 436: one row per cancelled service), serviceLabel (String — «Послуга»/«Послуги»),
              startsAt (String — pre-formatted), cancellationNote (String, nullable — the
              client's /cancel note, Fix D3), creationNote (String, nullable — the client's
              booking-creation note; NEVER shown under the cancellation-reason label)
@@ -68,7 +70,7 @@
                     Ім'я клієнта
                   </td>
                 </tr>
-                <tr>
+                <tr th:if="${serviceNames == null}">
                   <td style="padding:12px 16px;background:#EDE4D7;font-weight:700;
                              color:#0D0906;font-size:14px;border-top:1px solid #D4C5B5;
                              font-family:'Nunito','Trebuchet MS',Arial,sans-serif;">
@@ -77,6 +79,20 @@
                   <td style="padding:12px 16px;color:#3D2B1A;font-size:14px;border-top:1px solid #D4C5B5;
                              font-family:'Nunito','Trebuchet MS',Arial,sans-serif;"
                       th:text="${serviceName}">
+                    Назва послуги
+                  </td>
+                </tr>
+                <!-- Phase 436: one row per service cancelled in the request; the label only on the first row. -->
+                <tr th:each="cancelledService,cancelledIter : ${serviceNames}">
+                  <td style="padding:12px 16px;background:#EDE4D7;font-weight:700;
+                             color:#0D0906;font-size:14px;border-top:1px solid #D4C5B5;
+                             font-family:'Nunito','Trebuchet MS',Arial,sans-serif;"
+                      th:text="${cancelledIter.first} ? ${serviceLabel} : ''">
+                    Послуга
+                  </td>
+                  <td style="padding:12px 16px;color:#3D2B1A;font-size:14px;border-top:1px solid #D4C5B5;
+                             font-family:'Nunito','Trebuchet MS',Arial,sans-serif;"
+                      th:text="${cancelledService}">
                     Назва послуги
                   </td>
                 </tr>

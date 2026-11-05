@@ -678,7 +678,7 @@ class GuestTelegramLinkControllerIT extends AbstractIntegrationTest {
             headers.set("X-Forwarded-For", nextIp());
             ResponseEntity<String> cancelled = restTemplate.exchange("/api/v1/book/cancel/" + cancelToken,
                     HttpMethod.POST, new HttpEntity<>(headers), String.class);
-            assertThat(cancelled.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
+            assertThat(cancelled.getStatusCode()).isEqualTo(HttpStatus.OK);
 
             assertGeneric404(post("status", cancelToken));
         }

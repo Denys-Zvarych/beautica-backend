@@ -25,6 +25,7 @@ import org.springframework.transaction.annotation.Transactional;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -545,7 +546,7 @@ public class NotificationOutboxDrainWorker {
      */
     private List<Booking> visitAwareLeads(List<NotificationOutboxEntry> batch, Map<UUID, Booking> bookingCache) {
         return batch.stream()
-                .filter(e -> VISIT_AWARE_EVENTS.contains(e.getEventType()))
+                .filter(e -> VISIT_AWARE_EVENTS.contains(e.getEventType()) || isAggregatedClientCancel(e))
                 .map(e -> bookingCache.get(e.getAggregateId()))
                 .filter(Objects::nonNull)
                 .toList();
@@ -563,7 +564,7 @@ public class NotificationOutboxDrainWorker {
             // across a back-pressure retry (same precedent as BOOKING_RESCHEDULED below).
             case STATUS_CHANGED   -> notificationService.notifyBookingStatusChanged(
                     getVisit(entry, bookingCache, visitSiblings), entry.getId());
-            case CLIENT_CANCELLED -> notificationService.notifyClientCancelled(getBooking(entry, bookingCache));
+            case CLIENT_CANCELLED -> dispatchClientCancelled(entry, bookingCache, visitSiblings);
             case BOOKING_RESCHEDULED -> {
                 Booking booking = getBooking(entry, bookingCache);
                 // INFO (perf): the payload is parsed ONCE for both fields.
@@ -614,6 +615,50 @@ public class NotificationOutboxDrainWorker {
                 );
             }
         }
+    }
+
+    /**
+     * Phase 436 — a {@code CLIENT_CANCELLED} row WITH a payload names the services one guest cancel-by-link request
+     * cancelled: the provider e-mail lists exactly those (the visit's CANCELLED siblings filtered by the payload ids).
+     * A payload-less row — every other caller and every pre-436 row — keeps the single-booking e-mail.
+     */
+    private void dispatchClientCancelled(NotificationOutboxEntry entry, Map<UUID, Booking> bookingCache,
+                                         Map<UUID, List<Booking>> visitSiblings) {
+        Booking lead = getBooking(entry, bookingCache);
+        Set<UUID> cancelledIds = cancelledBookingIds(entry);
+        if (cancelledIds.isEmpty()) {
+            notificationService.notifyClientCancelled(lead);
+            return;
+        }
+        BookingVisit visit = visitResolver.resolve(lead, visitSiblings);
+        List<Booking> cancelled = visit.items().stream()
+                .filter(item -> cancelledIds.contains(item.getId()))
+                .toList();
+        notificationService.notifyClientCancelled(cancelled.isEmpty()
+                ? BookingVisit.single(lead)
+                : BookingVisit.of(lead, cancelled, visit.appointmentStatus()));
+    }
+
+    private boolean isAggregatedClientCancel(NotificationOutboxEntry entry) {
+        return entry.getEventType() == OutboxEventType.CLIENT_CANCELLED
+                && entry.getPayload() != null && !entry.getPayload().isBlank();
+    }
+
+    /** The payload's cancelled booking ids; empty when absent. An unreadable id is skipped, never fatal. */
+    private Set<UUID> cancelledBookingIds(NotificationOutboxEntry entry) {
+        String ids = readPayload(entry).get(NotificationOutboxService.CANCELLED_BOOKING_IDS);
+        if (ids == null || ids.isBlank()) {
+            return Set.of();
+        }
+        Set<UUID> result = new LinkedHashSet<>();
+        for (String id : ids.split(",")) {
+            try {
+                result.add(UUID.fromString(id.trim()));
+            } catch (IllegalArgumentException e) {
+                log.warn("Outbox entry [{}] has an unreadable cancelled booking id — skipped", entry.getId());
+            }
+        }
+        return result;
     }
 
     /**

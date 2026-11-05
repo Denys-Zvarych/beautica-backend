@@ -214,8 +214,10 @@ class GuestTelegramLinkEndToEndIT extends AbstractIntegrationTest {
         assertBotSaid(webhook.post(contact(GUEST_CHAT, GUEST_CONTACT, GUEST_CHAT)), TelegramBotReplies.LINKED);
         HttpHeaders headers = new HttpHeaders();
         headers.set("X-Forwarded-For", nextIp());
-        assertThat(restTemplate.exchange("/api/v1/book/cancel/" + cancelToken, HttpMethod.POST,
-                new HttpEntity<>(headers), String.class).getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
+        // Phase 436: the POST answers 200 with the page view after the cancel.
+        JsonNode cancelled = json(restTemplate.exchange("/api/v1/book/cancel/" + cancelToken, HttpMethod.POST,
+                new HttpEntity<>(headers), String.class), HttpStatus.OK);
+        assertThat(cancelled.path("items").path(0).path("status").asText()).isEqualTo("CANCELLED");
 
         ResponseEntity<String> status = api("status", cancelToken);
         ResponseEntity<String> unlink = api("unlink", cancelToken);

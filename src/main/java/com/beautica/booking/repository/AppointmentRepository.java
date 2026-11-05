@@ -180,6 +180,28 @@ public interface AppointmentRepository extends JpaRepository<Appointment, UUID> 
     Optional<UUID> lockHeaderIfConfirmed(@Param("appointmentId") UUID appointmentId);
 
     /**
+     * Phase 436 audit-fix (perf L2) — {@link #lockHeaderIfConfirmed} that also re-checks, in the SAME locking
+     * statement, that the header still holds {@code cancelTokenHash}: the guest partial-cancel path locks the header
+     * and confirms its token is not consumed in one round-trip, instead of a second hash lookup under the lock. Same
+     * {@code lock_timeout} fusion and wrapper as {@link #lockHeaderIfConfirmed}.
+     *
+     * @return the header's id if it is CONFIRMED, still carries this token hash and is now locked; empty otherwise
+     *         (consumed / unknown token, or the header left CONFIRMED) — the caller maps that to 404
+     */
+    @Query(value = """
+            SELECT id FROM (
+                SELECT set_config('lock_timeout', '3s', true) AS lock_cfg, a.id AS id
+                  FROM appointments a
+                 WHERE a.id = :appointmentId AND a.status = 'CONFIRMED'
+                   AND a.cancel_token_hash = :cancelTokenHash
+                 FOR UPDATE
+            ) locked
+            """, nativeQuery = true)
+    Optional<UUID> lockHeaderIfConfirmedWithToken(
+            @Param("appointmentId") UUID appointmentId,
+            @Param("cancelTokenHash") String cancelTokenHash);
+
+    /**
      * Unconditionally locks the visit HEADER row via {@code SELECT ... FOR UPDATE}, regardless of
      * its status — the status-agnostic counterpart of {@link #lockHeaderIfConfirmed}, used by the
      * four WHOLE-VISIT transition methods ({@code AppointmentTransitionService#cancelAppointment} /

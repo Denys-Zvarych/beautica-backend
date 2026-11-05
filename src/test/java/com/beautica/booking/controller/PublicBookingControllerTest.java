@@ -434,25 +434,129 @@ class PublicBookingControllerTest {
     }
 
     @Test
-    @DisplayName("POST /book/cancel/{token} — 204 No Content, NO auth required")
-    void should_return204_when_cancelSucceeds() throws Exception {
+    @DisplayName("phase 436: POST /book/cancel/{token} without a body — 200 with the after-view, NO auth required")
+    void should_return200WithView_when_cancelSucceeds() throws Exception {
         GuestCancelToken token = GuestCancelToken.of(UUID.randomUUID());
-        org.mockito.Mockito.doNothing().when(bookingCancellationService).cancel(token);
+        when(bookingCancellationService.cancel(org.mockito.ArgumentMatchers.eq(token),
+                org.mockito.ArgumentMatchers.isNull())).thenReturn(cancelledView());
 
         mockMvc.perform(post("/api/v1/book/cancel/" + token.value()))
-                .andExpect(status().isNoContent());
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("CANCELLED"))
+                .andExpect(jsonPath("$.items[0].status").value("CANCELLED"))
+                .andExpect(jsonPath("$.items[0].cancellable").value(false))
+                .andExpect(jsonPath("$.items[0].durationMinutes").value(60));
 
-        verify(bookingCancellationService).cancel(token);
+        verify(bookingCancellationService).cancel(org.mockito.ArgumentMatchers.eq(token),
+                org.mockito.ArgumentMatchers.isNull());
+    }
+
+    @Test
+    @DisplayName("phase 436: POST /book/cancel/{token} with {} — cancels everything cancellable (backward compatible)")
+    void should_passNoIds_when_bodyIsEmptyObject() throws Exception {
+        GuestCancelToken token = GuestCancelToken.of(UUID.randomUUID());
+        when(bookingCancellationService.cancel(org.mockito.ArgumentMatchers.eq(token),
+                org.mockito.ArgumentMatchers.isNull())).thenReturn(cancelledView());
+
+        mockMvc.perform(post("/api/v1/book/cancel/" + token.value())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isOk());
+    }
+
+    @Test
+    @DisplayName("phase 436: POST /book/cancel/{token} with bookingIds — passes exactly those ids")
+    void should_passIds_when_bodyNamesBookings() throws Exception {
+        GuestCancelToken token = GuestCancelToken.of(UUID.randomUUID());
+        UUID a = UUID.randomUUID();
+        UUID b = UUID.randomUUID();
+        when(bookingCancellationService.cancel(token, List.of(a, b))).thenReturn(cancelledView());
+
+        mockMvc.perform(post("/api/v1/book/cancel/" + token.value())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"bookingIds\":[\"" + a + "\",\"" + b + "\"]}"))
+                .andExpect(status().isOk());
+
+        verify(bookingCancellationService).cancel(token, List.of(a, b));
+    }
+
+    @Test
+    @DisplayName("phase 436: POST /book/cancel/{token} with \"bookingIds\": [] — 400 through the real handler, never cancel-all")
+    void should_return400_when_bookingIdsEmpty() throws Exception {
+        GuestCancelToken token = GuestCancelToken.of(UUID.randomUUID());
+        when(bookingCancellationService.cancel(token, List.of())).thenThrow(new BusinessException(
+                org.springframework.http.HttpStatus.BAD_REQUEST, "bookingIds must not be empty"));
+
+        mockMvc.perform(post("/api/v1/book/cancel/" + token.value())
+                        .contentType(MediaType.APPLICATION_JSON).content("{\"bookingIds\":[]}"))
+                .andExpect(status().isBadRequest());
+
+        verify(bookingCancellationService).cancel(token, List.of());
+    }
+
+    @Test
+    @DisplayName("phase 436 audit-fix: POST /book/cancel/{token} with a ~1 MB bookingIds array — 413 before parsing, service never called")
+    void should_return413_when_cancelBodyOverCap() throws Exception {
+        GuestCancelToken token = GuestCancelToken.of(UUID.randomUUID());
+        String id = "\"" + UUID.randomUUID() + "\"";
+        String hugeBody = "{\"bookingIds\":[" + String.join(",", java.util.Collections.nCopies(26_000, id)) + "]}";
+
+        mockMvc.perform(post("/api/v1/book/cancel/" + token.value())
+                        .contentType(MediaType.APPLICATION_JSON).content(hugeBody))
+                .andExpect(status().isPayloadTooLarge())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.message").value("Request body too large"));
+
+        verifyNoInteractions(bookingCancellationService);
+    }
+
+    @Test
+    @DisplayName("phase 436 audit-fix: a body of 10 ids stays well under the cap and reaches the service")
+    void should_passBody_when_tenIdsUnderCap() throws Exception {
+        GuestCancelToken token = GuestCancelToken.of(UUID.randomUUID());
+        List<UUID> ids = java.util.stream.Stream.generate(UUID::randomUUID).limit(10).toList();
+        String body = "{\"bookingIds\":[" + ids.stream().map(u -> "\"" + u + "\"")
+                .collect(java.util.stream.Collectors.joining(",")) + "]}";
+        when(bookingCancellationService.cancel(token, ids)).thenReturn(cancelledView());
+
+        mockMvc.perform(post("/api/v1/book/cancel/" + token.value())
+                        .contentType(MediaType.APPLICATION_JSON).content(body))
+                .andExpect(status().isOk());
+    }
+
+    @Test
+    @DisplayName("phase 436: POST /book/cancel/{token} with 11 bookingIds — 400, service never called")
+    void should_return400_when_moreThanTenBookingIds() throws Exception {
+        GuestCancelToken token = GuestCancelToken.of(UUID.randomUUID());
+        String ids = java.util.stream.Stream.generate(() -> "\"" + UUID.randomUUID() + "\"").limit(11)
+                .collect(java.util.stream.Collectors.joining(","));
+
+        mockMvc.perform(post("/api/v1/book/cancel/" + token.value())
+                        .contentType(MediaType.APPLICATION_JSON).content("{\"bookingIds\":[" + ids + "]}"))
+                .andExpect(status().isBadRequest());
+
+        verifyNoInteractions(bookingCancellationService);
+    }
+
+    @Test
+    @DisplayName("phase 436: POST /book/cancel/{token} with a malformed bookingId — generic 400, service never called")
+    void should_return400_when_bookingIdMalformed() throws Exception {
+        GuestCancelToken token = GuestCancelToken.of(UUID.randomUUID());
+
+        mockMvc.perform(post("/api/v1/book/cancel/" + token.value())
+                        .contentType(MediaType.APPLICATION_JSON).content("{\"bookingIds\":[\"nope\"]}"))
+                .andExpect(status().isBadRequest());
+
+        verifyNoInteractions(bookingCancellationService);
     }
 
     @Test
     @DisplayName("POST /book/cancel/{token} — 422 when inside the cancellation window")
     void should_return422_when_postInsideWindow() throws Exception {
         GuestCancelToken token = GuestCancelToken.of(UUID.randomUUID());
-        org.mockito.Mockito.doThrow(new BusinessException(
-                        org.springframework.http.HttpStatus.UNPROCESSABLE_ENTITY,
-                        "Скасування недоступне — менше ніж 2 год до запису"))
-                .when(bookingCancellationService).cancel(token);
+        when(bookingCancellationService.cancel(org.mockito.ArgumentMatchers.eq(token),
+                org.mockito.ArgumentMatchers.isNull())).thenThrow(new BusinessException(
+                org.springframework.http.HttpStatus.UNPROCESSABLE_ENTITY,
+                "Скасування недоступне — менше ніж 2 год до запису"));
 
         mockMvc.perform(post("/api/v1/book/cancel/" + token.value()))
                 .andExpect(status().isUnprocessableEntity())
@@ -468,8 +572,9 @@ class PublicBookingControllerTest {
     @DisplayName("POST /book/cancel/{token} — 404 when token already consumed (idempotent replay)")
     void should_return404_when_postTokenConsumed() throws Exception {
         GuestCancelToken token = GuestCancelToken.of(UUID.randomUUID());
-        org.mockito.Mockito.doThrow(new NotFoundException("Cancel token not found"))
-                .when(bookingCancellationService).cancel(token);
+        when(bookingCancellationService.cancel(org.mockito.ArgumentMatchers.eq(token),
+                org.mockito.ArgumentMatchers.isNull()))
+                .thenThrow(new NotFoundException("Cancel token not found"));
 
         mockMvc.perform(post("/api/v1/book/cancel/" + token.value()))
                 .andExpect(status().isNotFound());
@@ -482,6 +587,17 @@ class PublicBookingControllerTest {
                 .andExpect(status().isBadRequest());
 
         verifyNoInteractions(bookingCancellationService);
+    }
+
+    /** Phase 436 — a one-line after-cancel view. */
+    private static CancelTokenInfoResponse cancelledView() {
+        OffsetDateTime startsAt = OffsetDateTime.parse("2099-06-10T12:00:00+03:00");
+        return new CancelTokenInfoResponse(
+                "Ivan", "Стрижка", startsAt, false, startsAt.minusHours(2),
+                com.beautica.booking.enums.BookingStatus.CANCELLED, null, null, null, null,
+                List.of(new com.beautica.booking.dto.CancelTokenItemResponse(
+                        UUID.randomUUID(), "Стрижка", startsAt, 60,
+                        com.beautica.booking.enums.BookingStatus.CANCELLED, false)));
     }
 
     /** Phase 380: a fully populated enriched master payload around the legacy four fields. */

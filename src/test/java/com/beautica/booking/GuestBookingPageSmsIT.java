@@ -125,7 +125,7 @@ class GuestBookingPageSmsIT extends AbstractWalkInBookingSmsIT {
         ResponseEntity<String> cancel = postCancel(token);
         drainWorker.drain();
 
-        assertThat(cancel.getStatusCode()).as(cancel.getBody()).isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(cancel.getStatusCode()).as(cancel.getBody()).isEqualTo(HttpStatus.OK);
         assertThat(jdbcTemplate.queryForObject("SELECT status FROM bookings WHERE id = ?", String.class, bookingId))
                 .isEqualTo("CANCELLED");
         TURBOSMS.verify(0, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
@@ -147,7 +147,7 @@ class GuestBookingPageSmsIT extends AbstractWalkInBookingSmsIT {
         ResponseEntity<String> cancel = postCancel(token);
         drainWorker.drain();
 
-        assertThat(cancel.getStatusCode()).as(cancel.getBody()).isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(cancel.getStatusCode()).as(cancel.getBody()).isEqualTo(HttpStatus.OK);
         assertThat(jdbcTemplate.queryForObject("SELECT status FROM appointments WHERE id = ?", String.class,
                 appointmentId)).isEqualTo("CANCELLED");
         TURBOSMS.verify(0, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));

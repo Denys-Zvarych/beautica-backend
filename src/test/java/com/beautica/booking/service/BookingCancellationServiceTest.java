@@ -35,6 +35,7 @@ import java.time.Clock;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -337,6 +338,110 @@ class BookingCancellationServiceTest {
                 org.mockito.ArgumentMatchers.eq(InAppNotificationType.BOOKING_CANCELLED_BY_CLIENT),
                 org.mockito.ArgumentMatchers.any(Booking.class), org.mockito.ArgumentMatchers.isNull());
         verify(slotCalculationService).evictMasterAvailabilityCaches(org.mockito.ArgumentMatchers.any(UUID.class));
+    }
+
+    @Test
+    @DisplayName("phase 436: a single-booking cancel returns the after-view — CANCELLED, one non-cancellable line")
+    void should_returnCancelledView_when_singleBookingCancelled() {
+        // Arrange
+        when(bookingRepository.findByCancelTokenHashWithGraph(TOKEN_HASH))
+                .thenReturn(Optional.of(booking(NOW.plusHours(5), BookingStatus.CONFIRMED)));
+        when(bookingRepository.consumeCancelTokenHash(TOKEN_HASH)).thenReturn(1);
+
+        // Act
+        CancelTokenInfoResponse after = service.cancel(TOKEN, List.of(BOOKING_ID));
+
+        // Assert
+        assertThat(after.status()).isEqualTo(BookingStatus.CANCELLED);
+        assertThat(after.cancellable()).isFalse();
+        assertThat(after.items()).singleElement().satisfies(line -> {
+            assertThat(line.bookingId()).isEqualTo(BOOKING_ID);
+            assertThat(line.status()).isEqualTo(BookingStatus.CANCELLED);
+            assertThat(line.cancellable()).isFalse();
+        });
+    }
+
+    @Test
+    @DisplayName("phase 436: a single-booking token with any other id 404s and cancels nothing")
+    void should_throw404_when_singleBookingTokenNamesOtherId() {
+        // Arrange
+        when(bookingRepository.findByCancelTokenHashWithGraph(TOKEN_HASH))
+                .thenReturn(Optional.of(booking(NOW.plusHours(5), BookingStatus.CONFIRMED)));
+
+        // Act + Assert
+        assertThatThrownBy(() -> service.cancel(TOKEN, List.of(BOOKING_ID, UUID.randomUUID())))
+                .isInstanceOf(NotFoundException.class);
+        verify(bookingRepository, never()).consumeCancelTokenHash(TOKEN_HASH);
+        verifyNoInteractions(outboxService, inAppNotificationService);
+    }
+
+    @Test
+    @DisplayName("phase 436: duplicate ids 400 before any lookup")
+    void should_throw400_when_duplicateIds() {
+        // Act + Assert
+        assertThatThrownBy(() -> service.cancel(TOKEN, List.of(BOOKING_ID, BOOKING_ID)))
+                .isInstanceOf(BusinessException.class)
+                .extracting("status").isEqualTo(org.springframework.http.HttpStatus.BAD_REQUEST);
+        verifyNoInteractions(guestVisitCancellationService, bookingRepository);
+    }
+
+    @Test
+    @DisplayName("phase 436: no ids reach the visit service as null (cancel-all), never as an empty list (= 400)")
+    void should_passNullToVisitService_when_noIds() {
+        // Arrange
+        when(bookingRepository.findByCancelTokenHashWithGraph(TOKEN_HASH))
+                .thenReturn(Optional.of(booking(NOW.plusHours(5), BookingStatus.CONFIRMED)));
+        when(bookingRepository.consumeCancelTokenHash(TOKEN_HASH)).thenReturn(1);
+
+        // Act
+        service.cancel(TOKEN);
+
+        // Assert
+        verify(guestVisitCancellationService).cancel(TOKEN, null);
+    }
+
+    @Test
+    @DisplayName("phase 436: an empty selection is 400, never cancel-all")
+    void should_throw400_when_emptySelection() {
+        // Act + Assert
+        assertThatThrownBy(() -> service.cancel(TOKEN, List.of()))
+                .isInstanceOf(BusinessException.class)
+                .extracting("status").isEqualTo(org.springframework.http.HttpStatus.BAD_REQUEST);
+        verifyNoInteractions(guestVisitCancellationService, bookingRepository);
+    }
+
+    @Test
+    @DisplayName("phase 436: a visit token's after-view is returned as-is, the single path untouched")
+    void should_returnVisitView_when_visitServiceHandledToken() {
+        // Arrange
+        CancelTokenInfoResponse visitView = new CancelTokenInfoResponse(
+                "Марія", "Манікюр", NOW.plusHours(5), true, NOW.plusHours(3), BookingStatus.CONFIRMED,
+                null, null, null, null);
+        when(guestVisitCancellationService.cancel(TOKEN, List.of(BOOKING_ID))).thenReturn(Optional.of(visitView));
+
+        // Act
+        CancelTokenInfoResponse result = service.cancel(TOKEN, List.of(BOOKING_ID));
+
+        // Assert
+        assertThat(result).isSameAs(visitView);
+        verifyNoInteractions(bookingRepository);
+    }
+
+    @Test
+    @DisplayName("phase 436: getInfo of a single booking carries one line")
+    void should_returnOneLine_when_singleBookingInfo() {
+        // Arrange
+        when(bookingRepository.findByCancelTokenHashWithGraph(TOKEN_HASH))
+                .thenReturn(Optional.of(booking(NOW.plusHours(5), BookingStatus.CONFIRMED)));
+
+        // Act
+        CancelTokenInfoResponse info = service.getInfo(TOKEN);
+
+        // Assert
+        assertThat(info.items()).singleElement().satisfies(line -> {
+            assertThat(line.bookingId()).isEqualTo(BOOKING_ID);
+            assertThat(line.cancellable()).isTrue();
+        });
     }
 
     @Test

@@ -112,7 +112,7 @@ class WalkInBookingSmsEnabledIT extends AbstractWalkInBookingSmsIT {
 
         ResponseEntity<String> cancel = restTemplate.postForEntity("/api/v1/book/cancel/" + token.value(), null, String.class);
 
-        assertThat(cancel.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(cancel.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(onlyBooking().get("status")).isEqualTo("CANCELLED");
         assertThat(jdbcTemplate.queryForObject("SELECT status FROM appointments WHERE id = ?", String.class,
                 appointmentId)).isEqualTo("CANCELLED");
@@ -166,7 +166,7 @@ class WalkInBookingSmsEnabledIT extends AbstractWalkInBookingSmsIT {
         ResponseEntity<String> cancelA =
                 restTemplate.postForEntity("/api/v1/book/cancel/" + tokenA.value(), null, String.class);
 
-        assertThat(cancelA.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(cancelA.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(visitStatus(visitA)).isEqualTo("CANCELLED");
         assertThat(visitStatus(visitB)).as("token A must never reach visit B's header").isEqualTo("CONFIRMED");
         assertThat(jdbcTemplate.queryForList("SELECT status FROM bookings WHERE appointment_id = ?", String.class,
@@ -174,7 +174,7 @@ class WalkInBookingSmsEnabledIT extends AbstractWalkInBookingSmsIT {
         assertThat(jdbcTemplate.queryForObject("SELECT cancel_token_hash FROM appointments WHERE id = ?",
                 String.class, visitB)).as("visit B's token is not consumed").isEqualTo(CancelTokenHasher.hash(tokenB));
         assertThat(restTemplate.postForEntity("/api/v1/book/cancel/" + tokenB.value(), null, String.class).getStatusCode())
-                .as("visit B still cancels by its own link").isEqualTo(HttpStatus.NO_CONTENT);
+                .as("visit B still cancels by its own link").isEqualTo(HttpStatus.OK);
     }
 
     /** Phase 412 QA (394 invariant) — the raw walk-in token is never at rest, in any column of either table. */

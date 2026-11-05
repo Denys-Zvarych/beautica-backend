@@ -730,7 +730,7 @@ class GuestPiiRetentionIT extends AbstractIntegrationTest {
             ResponseEntity<String> tooLate = restTemplate.exchange("/api/v1/book/cancel/" + nearToken,
                     HttpMethod.POST, HttpEntity.EMPTY, String.class);
 
-            assertThat(ok.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
+            assertThat(ok.getStatusCode()).isEqualTo(HttpStatus.OK);
             assertThat(tooLate.getStatusCode()).isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
             assertThat(fx.booking(far).get("status")).isEqualTo("CANCELLED");
             assertThat(fx.count("SELECT COUNT(*) FROM notification_outbox WHERE event_type = 'CLIENT_CANCELLED' "
@@ -908,7 +908,7 @@ class GuestPiiRetentionIT extends AbstractIntegrationTest {
                 erase.get(60, TimeUnit.SECONDS);
                 HttpStatus cancelStatus = HttpStatus.valueOf(cancel.get(60, TimeUnit.SECONDS).getStatusCode().value());
 
-                assertThat(cancelStatus).isIn(HttpStatus.NO_CONTENT, HttpStatus.NOT_FOUND);
+                assertThat(cancelStatus).isIn(HttpStatus.OK, HttpStatus.NOT_FOUND);
                 assertThat(fx.booking(single).get("status")).isEqualTo("CANCELLED");
                 assertThat(fx.count("SELECT COUNT(*) FROM notification_outbox WHERE event_type = 'CLIENT_CANCELLED' "
                         + "AND aggregate_id = ?", single)).isEqualTo(1);

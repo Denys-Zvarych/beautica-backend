@@ -886,7 +886,8 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             LEFT JOIN FETCH m.user
             LEFT JOIN FETCH b.salon
             JOIN FETCH b.masterService ms
-            JOIN FETCH ms.serviceDefinition
+            JOIN FETCH ms.serviceDefinition sd
+            JOIN FETCH sd.serviceType
             WHERE b.appointment.id = :appointmentId
             ORDER BY b.startsAt ASC
             """)
@@ -2263,6 +2264,33 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
                AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
             """)
     int cancelItemsByAppointmentId(@Param("appointmentId") UUID appointmentId);
+
+    /**
+     * Phase 436 — guest PARTIAL cancel by link: cancels only the named child bookings of one guest visit, in ONE
+     * conditional UPDATE. Every guard is in the {@code WHERE}: the row belongs to {@code appointmentId}, is still
+     * {@code CONFIRMED} and starts after {@code cutoff} ({@code now + cancel window}). The caller compares the row
+     * count with the request size and rolls back with 422 on any shortfall (a racer moved one row first), so a
+     * request is all-or-nothing. The caller holds the header lock ({@code AppointmentRepository#lockHeaderIfConfirmed})
+     * — the appointments-before-bookings lock order.
+     *
+     * @return the number of item rows cancelled
+     */
+    @Modifying
+    @Query("""
+            UPDATE Booking b
+               SET b.status = com.beautica.booking.enums.BookingStatus.CANCELLED,
+                   b.cancellationReason = com.beautica.booking.enums.CancellationReason.CLIENT_CANCELLED,
+                   b.cancelTokenHash = null,
+                   b.cancelTokenSealed = null
+             WHERE b.id IN :bookingIds
+               AND b.appointment.id = :appointmentId
+               AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
+               AND b.startsAt > :cutoff
+            """)
+    int cancelGuestVisitItemsByIds(
+            @Param("appointmentId") UUID appointmentId,
+            @Param("bookingIds") Collection<UUID> bookingIds,
+            @Param("cutoff") OffsetDateTime cutoff);
 
     /**
      * Atomically CLAIMS the given legacy single guest bookings for their reminder: flips

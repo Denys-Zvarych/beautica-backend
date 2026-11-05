@@ -14,9 +14,11 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Instant;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
+import java.util.stream.Collectors;
 
 /**
  * Writes notification outbox entries atomically within the caller's transaction.
@@ -48,6 +50,9 @@ public class NotificationOutboxService {
     public static final String ACTOR_USER_ID = "actorUserId";
     /** Phase 431 — payload key of a provider reschedule's NEW start, epoch seconds. */
     public static final String STARTS_AT = "startsAt";
+
+    /** Phase 436 — {@code CLIENT_CANCELLED} payload key: the request's cancelled booking ids, comma-separated. */
+    public static final String CANCELLED_BOOKING_IDS = "cancelledBookingIds";
 
     private static final int MAX_EMAIL_LENGTH = 254;
     private static final int MAX_SALON_NAME_LENGTH = 255;
@@ -208,6 +213,23 @@ public class NotificationOutboxService {
     public void enqueueClientCancelled(UUID bookingId) {
         Objects.requireNonNull(bookingId, "bookingId must not be null");
         save(OutboxEventType.CLIENT_CANCELLED, bookingId, null);
+    }
+
+    /**
+     * Phase 436 — a {@code CLIENT_CANCELLED} row for a guest's cancel by link that names exactly the services
+     * cancelled in that request: ONE row per request, keyed to {@code leadBookingId}, whose payload carries the
+     * request's booking ids ({@value #CANCELLED_BOOKING_IDS}, comma-separated) so the drain worker lists only those
+     * services in the provider e-mail. Booking ids only — no note, no PII.
+     *
+     * @param leadBookingId       the first booking cancelled in the request (visit order)
+     * @param cancelledBookingIds every booking cancelled in the request, {@code leadBookingId} included
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void enqueueClientCancelled(UUID leadBookingId, List<UUID> cancelledBookingIds) {
+        Objects.requireNonNull(leadBookingId, "leadBookingId must not be null");
+        Objects.requireNonNull(cancelledBookingIds, "cancelledBookingIds must not be null");
+        String ids = cancelledBookingIds.stream().map(UUID::toString).collect(Collectors.joining(","));
+        save(OutboxEventType.CLIENT_CANCELLED, leadBookingId, writeJson(Map.of(CANCELLED_BOOKING_IDS, ids)));
     }
 
     /**

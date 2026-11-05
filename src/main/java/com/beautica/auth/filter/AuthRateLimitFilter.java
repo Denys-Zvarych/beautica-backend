@@ -19,8 +19,8 @@ import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.http.HttpMethod;
 import org.springframework.stereotype.Component;
 import org.springframework.util.StringUtils;
+import com.beautica.common.web.RequestMatchPath;
 import org.springframework.web.filter.OncePerRequestFilter;
-import org.springframework.web.util.UrlPathHelper;
 
 import java.io.IOException;
 import java.net.Inet6Address;
@@ -258,20 +258,6 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     private static final String ROTATE_ADMIN_SALON_PATH_PREFIX = "/api/v1/salons/";
     private static final String ROTATE_MASTER_SALON_PATH_PREFIX = "/api/v1/masters/";
     private static final String ROTATE_STAFF_SALON_PATH_SUFFIX = "/salon";
-    // Resolves the DECODED + NORMALIZED request path for rule matching (see resolveMatchPath).
-    // urlDecode + removeSemicolonContent are UrlPathHelper defaults; set explicitly so the
-    // security-critical decode step is self-documenting and cannot be silently disabled by a
-    // future default change. Stateless after construction and thread-safe for the read-only
-    // getPathWithinApplication call, so a single shared static instance is correct.
-    private static final UrlPathHelper MATCH_PATH_HELPER = createMatchPathHelper();
-
-    private static UrlPathHelper createMatchPathHelper() {
-        UrlPathHelper helper = new UrlPathHelper();
-        helper.setUrlDecode(true);
-        helper.setRemoveSemicolonContent(true);
-        return helper;
-    }
-
     private static final int RETRY_AFTER_SECONDS = 60;
     // review-decision bucket window is 60 minutes — Retry-After reflects the window.
     private static final int REVIEW_DECISION_RETRY_AFTER_SECONDS = 3600;
@@ -1848,31 +1834,12 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     }
 
     /**
-     * Resolves the path used for throttle-rule matching from the request's DECODED and
-     * NORMALIZED path — mirroring how Spring MVC routes the request — instead of the raw,
-     * percent-encoded, un-normalized {@link HttpServletRequest#getRequestURI()}.
-     *
-     * <p>The servlet container hands back {@code getRequestURI()} exactly as received: still
-     * percent-encoded and not collapsed. Spring MVC, however, routes on the decoded/normalized
-     * path, so matching a rule on the raw URI lets a caller reach a throttled handler with an
-     * equivalent spelling that skips the rule — e.g. {@code POST /api/v1/auth/logi%6e} (routes to
-     * login, unthrottled credential stuffing) or {@code GET /api/v1/masters/{id}/working%2ddays}.
-     * {@code StrictHttpFirewall} does not reject these.
-     *
-     * <p>This filter runs BEFORE the {@code DispatcherServlet} parses and caches the request path,
-     * so {@code ServletRequestPathUtils.getCachedPath(request)} is not yet populated here. We
-     * therefore decode/normalize independently via {@link UrlPathHelper} (which percent-decodes
-     * ONCE, strips {@code ;matrix} content, and collapses duplicate slashes) and then fold any
-     * {@code .}/{@code ..} segments that survive decoding (e.g. {@code %2e%2e}) with
-     * {@link StringUtils#cleanPath}. {@code cleanPath} performs no decoding, so there is no
-     * double-decode (which would itself open a bypass). Verified against spring-web 6.2.6:
-     * {@code working%2ddays -> working-days}, {@code logi%6e -> login},
-     * {@code /auth/./login -> /auth/login}, {@code //auth -> /auth}, {@code %2e%2e -> ..} folded,
-     * while unencoded paths pass through byte-for-byte so every existing rule's spelling still
-     * matches.
+     * The path used for throttle-rule matching: the request's DECODED and NORMALIZED path, as Spring MVC routes it —
+     * never the raw percent-encoded {@code getRequestURI()} (e.g. {@code logi%6e} must match the login rule). The
+     * implementation lives in {@link RequestMatchPath} (promoted, phase 436), shared with every path-scoped filter.
      */
     private String resolveMatchPath(HttpServletRequest request) {
-        return StringUtils.cleanPath(MATCH_PATH_HELPER.getPathWithinApplication(request));
+        return RequestMatchPath.of(request);
     }
 
     /**
@@ -2004,7 +1971,7 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
      * when — the {@code {id}} segment would bind to a {@code UUID} path variable in Spring MVC.
      *
      * <p>{@code path} is already percent-decoded by {@link #resolveMatchPath} (via
-     * {@link UrlPathHelper}, as Spring's router decodes path variables), so {@code %20} arrives
+     * {@code UrlPathHelper}, as Spring's router decodes path variables), so {@code %20} arrives
      * here as a literal space. Spring's {@code StringToUUIDConverter} binds
      * {@code UUID.fromString(source.trim())} after a {@code hasText} guard, and
      * {@code UUID.fromString} accepts non-canonical short spellings — so this applies that exact

@@ -3,6 +3,7 @@ package com.beautica.booking.dto;
 import com.beautica.booking.enums.BookingStatus;
 
 import java.time.OffsetDateTime;
+import java.util.List;
 
 /**
  * Public cancel-page payload for {@code GET /api/v1/book/cancel/{token}} (Phase 13.4).
@@ -32,6 +33,9 @@ import java.time.OffsetDateTime;
  *                       the independent master's own {@code location_note}), the SMS rules applied
  *                       ({@code GuestSmsProviderText#locationNote}: one line, ≤ 60 chars, {@code null} when URL-like);
  *                       {@code null} when blank or when {@code address} is {@code null}
+ * @param items          phase 436 — every service line of the visit (one for a single booking), ordered by
+ *                       {@code startsAt}; never {@code null}. {@code cancellable} above is {@code true} when at least
+ *                       one line is cancellable
  */
 public record CancelTokenInfoResponse(
         String masterName,
@@ -43,14 +47,27 @@ public record CancelTokenInfoResponse(
         String rebookPath,
         String salonName,
         String address,
-        String locationNote
+        String locationNote,
+        List<CancelTokenItemResponse> items
 ) {
+
+    public CancelTokenInfoResponse {
+        items = items == null ? List.of() : List.copyOf(items);
+    }
+
+    /** The pre-436 10-field shape (no {@code items}). */
+    public CancelTokenInfoResponse(String masterName, String serviceName, OffsetDateTime startsAt, boolean cancellable,
+                                   OffsetDateTime windowClosesAt, BookingStatus status, String rebookPath,
+                                   String salonName, String address, String locationNote) {
+        this(masterName, serviceName, startsAt, cancellable, windowClosesAt, status, rebookPath, salonName, address,
+                locationNote, List.of());
+    }
 
     /** The pre-follow-up 9-field shape ({@code locationNote} {@code null}). */
     public CancelTokenInfoResponse(String masterName, String serviceName, OffsetDateTime startsAt, boolean cancellable,
                                    OffsetDateTime windowClosesAt, BookingStatus status, String rebookPath,
                                    String salonName, String address) {
         this(masterName, serviceName, startsAt, cancellable, windowClosesAt, status, rebookPath, salonName, address,
-                null);
+                null, List.of());
     }
 }
