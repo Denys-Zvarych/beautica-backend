@@ -134,7 +134,7 @@ class GuestCancelTokenHashEndToEndIT extends AbstractIntegrationTest {
         assertThat(infoBody.get("locationNote").isNull()).isTrue();
         assertNoGuestPii(info.getBody());
 
-        assertThat(post(token).getStatusCode()).as("first POST consumes the token").isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(post(token).getStatusCode()).as("first POST consumes the token").isEqualTo(HttpStatus.OK);
         assertReplayIndistinguishableFromUnknownToken(token);
 
         Map<String, Object> after = jdbcTemplate.queryForMap(
@@ -281,7 +281,7 @@ class GuestCancelTokenHashEndToEndIT extends AbstractIntegrationTest {
         assertThat(infoBody.path("address").asText()).isEqualTo("Хрещатик 22");
         assertNoGuestPii(info.getBody());
 
-        assertThat(post(token).getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(post(token).getStatusCode()).isEqualTo(HttpStatus.OK);
         assertReplayIndistinguishableFromUnknownToken(token);
 
         Map<String, Object> headerAfter = jdbcTemplate.queryForMap(
@@ -357,7 +357,7 @@ class GuestCancelTokenHashEndToEndIT extends AbstractIntegrationTest {
         assertThat(info.getStatusCode()).as(info.getBody()).isEqualTo(HttpStatus.OK);
         assertThat(objectMapper.readTree(info.getBody()).path("serviceName").asText()).isEqualTo("Манікюр-легасі");
         assertThat(upperCase.getStatusCode()).as("UUID spelling normalised as before").isEqualTo(HttpStatus.OK);
-        assertThat(post(legacy).getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(post(legacy).getStatusCode()).isEqualTo(HttpStatus.OK);
     }
 
     @Test

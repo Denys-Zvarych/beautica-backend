@@ -123,7 +123,7 @@ class GuestCancelConcurrencyIT {
                     go.await();
                     ResponseEntity<String> resp = restTemplate.exchange(
                             url, HttpMethod.POST, new HttpEntity<>(null), String.class);
-                    if (resp.getStatusCode() == HttpStatus.NO_CONTENT) {
+                    if (resp.getStatusCode() == HttpStatus.OK) { // phase 436: 200 + after-view (was 204)
                         noContent.incrementAndGet();
                     } else if (resp.getStatusCode() == HttpStatus.NOT_FOUND) {
                         notFound.incrementAndGet();
@@ -140,7 +140,7 @@ class GuestCancelConcurrencyIT {
         boolean finished = done.await(30, TimeUnit.SECONDS);
 
         assertThat(finished).as("both racers must finish within 30s").isTrue();
-        assertThat(noContent.get()).as("exactly one 204").isEqualTo(1);
+        assertThat(noContent.get()).as("exactly one 200 (phase 436; was 204)").isEqualTo(1);
         assertThat(notFound.get()).as("exactly one 404").isEqualTo(1);
 
         // The single surviving row is CANCELLED with a consumed (null) token.

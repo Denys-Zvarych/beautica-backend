@@ -471,6 +471,18 @@ public class NotificationService {
     }
 
     /**
+     * Phase 436 — the aggregated {@code CLIENT_CANCELLED} e-mail of one guest cancel-by-link request: ONE e-mail
+     * listing every service in {@code visit} (exactly the services cancelled in that request).
+     */
+    public void notifyClientCancelled(BookingVisit visit) {
+        User masterUser = providerRecipient(visit.lead(), "CLIENT_CANCELLED");
+        if (masterUser == null) {
+            return;
+        }
+        emailService.sendClientCancelledEmail(masterUser.getEmail(), visit);
+    }
+
+    /**
      * Forwards a pre-built invite acceptance URL to the email transport.
      *
      * <p>The caller is responsible for URL construction and validation

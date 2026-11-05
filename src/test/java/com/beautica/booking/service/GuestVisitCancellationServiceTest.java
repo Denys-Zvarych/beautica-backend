@@ -2,6 +2,8 @@ package com.beautica.booking.service;
 
 import com.beautica.booking.domain.GuestCancelToken;
 import com.beautica.booking.domain.CancelTokenHasher;
+import com.beautica.booking.dto.CancelTokenInfoResponse;
+import com.beautica.booking.dto.CancelTokenItemResponse;
 import com.beautica.booking.entity.Appointment;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingStatus;
@@ -12,6 +14,7 @@ import com.beautica.common.exception.NotFoundException;
 import com.beautica.config.BookingLinksProperties;
 import com.beautica.config.BookingSmsProperties;
 import com.beautica.master.entity.Master;
+import com.beautica.notification.inapp.entity.InAppNotificationType;
 import com.beautica.notification.inapp.service.InAppNotificationService;
 import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.notification.channel.GuestMessageRouter;
@@ -38,11 +41,15 @@ import java.time.ZoneOffset;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.argThat;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
@@ -66,7 +73,7 @@ import static org.mockito.Mockito.when;
  * {@link GuestMessaging#should_holdNoGuestMessagingCollaborator_when_constructed}.
  */
 @ExtendWith(MockitoExtension.class)
-@DisplayName("GuestVisitCancellationService — guest cancel of a whole visit")
+@DisplayName("GuestVisitCancellationService — guest cancel of a visit (whole or partial)")
 class GuestVisitCancellationServiceTest {
 
     private static final GuestCancelToken TOKEN = GuestCancelToken.of(UUID.randomUUID());
@@ -134,48 +141,78 @@ class GuestVisitCancellationServiceTest {
             // The other half of the boundary: proves the 422 tests above fail for the WINDOW and not
             // because the fixture is uncancellable for some unrelated reason.
             liveVisitStartingAt(NOW.plusHours(2).plusMinutes(1));
+            itemsUpdateReturns(Set.of(BOOKING_ID), 1);
             when(appointmentRepository.consumeCancelTokenHash(TOKEN_HASH)).thenReturn(1);
 
-            assertThat(service.cancel(TOKEN)).isTrue();
+            CancelTokenInfoResponse after = service.cancel(TOKEN).orElseThrow();
 
-            verify(bookingRepository).cancelItemsByAppointmentId(APPOINTMENT_ID);
-            verify(outboxService).enqueueClientCancelled(BOOKING_ID);
+            assertThat(after.status()).isEqualTo(BookingStatus.CANCELLED);
+            verify(outboxService).enqueueClientCancelled(BOOKING_ID, List.of(BOOKING_ID));
         }
     }
 
     @Nested
-    @DisplayName("cancel — atomic one-time token consume")
+    @DisplayName("cancel — header lock + atomic token consume")
     class TokenConsume {
 
         @Test
-        @DisplayName("throws 404 and fires NO side-effect when the conditional consume updates 0 rows (replay / lost race)")
+        @DisplayName("throws 404 and fires NO side-effect when the header left CONFIRMED before the lock (lost race)")
+        void should_throw404_when_headerLockFindsNoConfirmedRow() {
+            when(appointmentRepository.findByCancelTokenHash(TOKEN_HASH))
+                    .thenReturn(Optional.of(appointment(BookingStatus.CONFIRMED)));
+            when(appointmentRepository.lockHeaderIfConfirmedWithToken(APPOINTMENT_ID, TOKEN_HASH)).thenReturn(Optional.empty());
+
+            assertThatThrownBy(() -> service.cancel(TOKEN))
+                    .isInstanceOf(NotFoundException.class)
+                    .hasMessageContaining("Cancel token not found");
+
+            assertNothingWasCancelled();
+        }
+
+        @Test
+        @DisplayName("throws 404 with ONE hash lookup when the token was consumed between the first read and the lock")
+        void should_throw404_when_tokenGoneAfterLock() {
+            // The locking statement itself re-checks the token hash (perf L2): no second findByCancelTokenHash.
+            when(appointmentRepository.findByCancelTokenHash(TOKEN_HASH))
+                    .thenReturn(Optional.of(appointment(BookingStatus.CONFIRMED)));
+            when(appointmentRepository.lockHeaderIfConfirmedWithToken(APPOINTMENT_ID, TOKEN_HASH))
+                    .thenReturn(Optional.empty());
+
+            assertThatThrownBy(() -> service.cancel(TOKEN)).isInstanceOf(NotFoundException.class);
+
+            verify(appointmentRepository, org.mockito.Mockito.times(1)).findByCancelTokenHash(TOKEN_HASH);
+            assertNothingWasCancelled();
+        }
+
+        @Test
+        @DisplayName("throws 404 and notifies nobody when the header consume updates 0 rows")
         void should_throw404_when_consumeCancelTokenHashReturnsZero() {
-            // consumeCancelTokenHash is the single-use gate: its WHERE guards on the token still being
-            // present AND the header still CONFIRMED. A replayed link, or the loser of a concurrent
-            // double-click, updates 0 rows and must abort BEFORE the items are cancelled — otherwise a
-            // second caller re-cancels an already-cancelled visit and re-notifies the provider.
             liveVisitStartingAt(CANCELLABLE_START);
+            itemsUpdateReturns(Set.of(BOOKING_ID), 1);
             when(appointmentRepository.consumeCancelTokenHash(TOKEN_HASH)).thenReturn(0);
 
             assertThatThrownBy(() -> service.cancel(TOKEN))
                     .isInstanceOf(NotFoundException.class)
                     .hasMessageContaining("Cancel token not found");
 
-            verify(bookingRepository, never()).cancelItemsByAppointmentId(any());
-            verifyNoInteractions(outboxService, slotCalculationService, salonCatalogCacheEvictor);
+            verifyNoInteractions(outboxService, inAppNotificationService, slotCalculationService,
+                    salonCatalogCacheEvictor);
         }
 
         @Test
-        @DisplayName("consumes the token exactly once on the happy path, then cancels the items and notifies")
+        @DisplayName("consumes the token exactly once on the happy path, cancels the items, notifies once and evicts")
         void should_consumeTokenOnce_when_visitIsCancellable() {
             liveVisitStartingAt(CANCELLABLE_START);
+            itemsUpdateReturns(Set.of(BOOKING_ID), 1);
             when(appointmentRepository.consumeCancelTokenHash(TOKEN_HASH)).thenReturn(1);
 
-            assertThat(service.cancel(TOKEN)).isTrue();
+            service.cancel(TOKEN);
 
             verify(appointmentRepository).consumeCancelTokenHash(TOKEN_HASH);
-            verify(bookingRepository).cancelItemsByAppointmentId(APPOINTMENT_ID);
-            verify(outboxService).enqueueClientCancelled(BOOKING_ID);
+            verify(outboxService).enqueueClientCancelled(BOOKING_ID, List.of(BOOKING_ID));
+            verify(inAppNotificationService).notifyVisitEvent(
+                    eq(InAppNotificationType.BOOKING_CANCELLED_BY_CLIENT), eq(APPOINTMENT_ID), any(Booking.class),
+                    isNull());
             verify(slotCalculationService).evictMasterAvailabilityCaches(any(UUID.class));
         }
 
@@ -186,14 +223,208 @@ class GuestVisitCancellationServiceTest {
             String hostile = "Акція! пишіть на example.test";
             when(appointmentRepository.findByCancelTokenHash(TOKEN_HASH))
                     .thenReturn(Optional.of(appointment(BookingStatus.CONFIRMED)));
+            when(appointmentRepository.lockHeaderIfConfirmedWithToken(APPOINTMENT_ID, TOKEN_HASH)).thenReturn(Optional.of(APPOINTMENT_ID));
             when(bookingRepository.findByAppointmentIdWithGraph(APPOINTMENT_ID))
                     .thenReturn(List.of(walkInItem(CANCELLABLE_START, hostile)));
+            itemsUpdateReturns(Set.of(BOOKING_ID), 1);
             when(appointmentRepository.consumeCancelTokenHash(TOKEN_HASH)).thenReturn(1);
 
             String pageServiceName = service.getInfo(TOKEN).orElseThrow().serviceName();
+            CancelTokenInfoResponse after = service.cancel(TOKEN).orElseThrow();
 
-            assertThat(service.cancel(TOKEN)).isTrue();
             assertThat(pageServiceName).isEqualTo(PLATFORM_SERVICE_NAME);
+            assertThat(after.items()).extracting(CancelTokenItemResponse::serviceName)
+                    .containsExactly(PLATFORM_SERVICE_NAME);
+        }
+    }
+
+    @Nested
+    @DisplayName("phase 436 — partial cancel by bookingIds")
+    class PartialCancel {
+
+        private final UUID first = UUID.randomUUID();
+        private final UUID middle = UUID.randomUUID();
+        private final UUID last = UUID.randomUUID();
+
+        @Test
+        @DisplayName("cancels only the middle line, keeps the header and token live, and returns the after-view")
+        void should_cancelOnlyNamedLine_when_middleServiceChosen() {
+            liveVisit(line(first, CANCELLABLE_START, BookingStatus.CONFIRMED),
+                    line(middle, CANCELLABLE_START.plusHours(1), BookingStatus.CONFIRMED),
+                    line(last, CANCELLABLE_START.plusHours(2), BookingStatus.CONFIRMED));
+            itemsUpdateReturns(Set.of(middle), 1);
+
+            CancelTokenInfoResponse after = service.cancel(TOKEN, List.of(middle)).orElseThrow();
+
+            assertThat(after.status()).isEqualTo(BookingStatus.CONFIRMED);
+            assertThat(after.cancellable()).isTrue();
+            assertThat(after.items()).extracting(CancelTokenItemResponse::bookingId)
+                    .containsExactly(first, middle, last);
+            assertThat(after.items()).extracting(CancelTokenItemResponse::status)
+                    .containsExactly(BookingStatus.CONFIRMED, BookingStatus.CANCELLED, BookingStatus.CONFIRMED);
+            assertThat(after.items()).extracting(CancelTokenItemResponse::cancellable)
+                    .containsExactly(true, false, true);
+            verify(appointmentRepository, never()).consumeCancelTokenHash(any());
+            verify(outboxService).enqueueClientCancelled(middle, List.of(middle));
+            verify(inAppNotificationService).notifyVisitEvent(
+                    eq(InAppNotificationType.BOOKING_CANCELLED_BY_CLIENT), eq(APPOINTMENT_ID),
+                    bookingWithId(middle), isNull(), eq(middle));
+        }
+
+        @Test
+        @DisplayName("sends ONE e-mail row naming every line cancelled in the request, in visit order")
+        void should_enqueueOneAggregatedRow_when_severalLinesChosen() {
+            liveVisit(line(first, CANCELLABLE_START, BookingStatus.CONFIRMED),
+                    line(middle, CANCELLABLE_START.plusHours(1), BookingStatus.CONFIRMED),
+                    line(last, CANCELLABLE_START.plusHours(2), BookingStatus.CONFIRMED));
+            itemsUpdateReturns(Set.of(last, first), 2);
+
+            service.cancel(TOKEN, List.of(last, first));
+
+            verify(outboxService).enqueueClientCancelled(first, List.of(first, last));
+            verify(outboxService, never()).enqueueClientCancelled(any(UUID.class));
+        }
+
+        @Test
+        @DisplayName("cancelling the last CONFIRMED line flips the header and consumes the token")
+        void should_consumeToken_when_lastConfirmedLineCancelled() {
+            liveVisit(line(first, CANCELLABLE_START, BookingStatus.CANCELLED),
+                    line(middle, CANCELLABLE_START.plusHours(1), BookingStatus.CONFIRMED));
+            itemsUpdateReturns(Set.of(middle), 1);
+            when(appointmentRepository.consumeCancelTokenHash(TOKEN_HASH)).thenReturn(1);
+
+            CancelTokenInfoResponse after = service.cancel(TOKEN, null).orElseThrow();
+
+            assertThat(after.status()).isEqualTo(BookingStatus.CANCELLED);
+            assertThat(after.cancellable()).isFalse();
+            verify(inAppNotificationService).notifyVisitEvent(
+                    eq(InAppNotificationType.BOOKING_CANCELLED_BY_CLIENT), eq(APPOINTMENT_ID), bookingWithId(middle),
+                    isNull());
+        }
+
+        @Test
+        @DisplayName("404s the whole request, cancelling nothing, when an id is not a line of this visit")
+        void should_throw404_when_idNotInVisit() {
+            liveVisit(line(first, CANCELLABLE_START, BookingStatus.CONFIRMED));
+
+            assertThatThrownBy(() -> service.cancel(TOKEN, List.of(first, UUID.randomUUID())))
+                    .isInstanceOf(NotFoundException.class);
+
+            assertNothingWasCancelled();
+        }
+
+        @Test
+        @DisplayName("422s the whole request when a chosen line is inside the cancel window")
+        void should_throw422_when_chosenLineInsideWindow() {
+            liveVisit(line(first, NOW.plusHours(1), BookingStatus.CONFIRMED),
+                    line(middle, CANCELLABLE_START, BookingStatus.CONFIRMED));
+
+            assertThatThrownBy(() -> service.cancel(TOKEN, List.of(first, middle)))
+                    .isInstanceOf(BusinessException.class)
+                    .extracting("status").isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
+
+            assertNothingWasCancelled();
+        }
+
+        @Test
+        @DisplayName("422s when a chosen line is already CANCELLED")
+        void should_throw422_when_chosenLineNotConfirmed() {
+            liveVisit(line(first, CANCELLABLE_START, BookingStatus.CANCELLED),
+                    line(middle, CANCELLABLE_START.plusHours(1), BookingStatus.CONFIRMED));
+
+            assertThatThrownBy(() -> service.cancel(TOKEN, List.of(first)))
+                    .isInstanceOf(BusinessException.class)
+                    .hasMessageContaining("вже скасовано")
+                    .extracting("status").isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
+
+            assertNothingWasCancelled();
+        }
+
+        @Test
+        @DisplayName("422s and notifies nobody when the conditional UPDATE matches fewer rows than requested (race)")
+        void should_throw422_when_updateRowCountShort() {
+            liveVisit(line(first, CANCELLABLE_START, BookingStatus.CONFIRMED),
+                    line(middle, CANCELLABLE_START.plusHours(1), BookingStatus.CONFIRMED));
+            itemsUpdateReturns(Set.of(first, middle), 1);
+
+            assertThatThrownBy(() -> service.cancel(TOKEN, List.of(first, middle)))
+                    .isInstanceOf(BusinessException.class)
+                    .extracting("status").isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
+
+            verifyNoInteractions(outboxService, inAppNotificationService, slotCalculationService);
+        }
+
+        @Test
+        @DisplayName("400s on duplicate ids before touching the database")
+        void should_throw400_when_duplicateIds() {
+            assertThatThrownBy(() -> service.cancel(TOKEN, List.of(first, first)))
+                    .isInstanceOf(BusinessException.class)
+                    .extracting("status").isEqualTo(HttpStatus.BAD_REQUEST);
+
+            verifyNoInteractions(appointmentRepository, bookingRepository);
+        }
+
+        @Test
+        @DisplayName("400s on an EMPTY selection — never cancel-all — before touching the database")
+        void should_throw400_when_emptySelection() {
+            assertThatThrownBy(() -> service.cancel(TOKEN, List.of()))
+                    .isInstanceOf(BusinessException.class)
+                    .extracting("status").isEqualTo(HttpStatus.BAD_REQUEST);
+
+            verifyNoInteractions(appointmentRepository, bookingRepository);
+        }
+
+        @Test
+        @DisplayName("400s on more than 10 ids before touching the database")
+        void should_throw400_when_moreThanTenIds() {
+            List<UUID> eleven = java.util.stream.Stream.generate(UUID::randomUUID).limit(11).toList();
+
+            assertThatThrownBy(() -> service.cancel(TOKEN, eleven))
+                    .isInstanceOf(BusinessException.class)
+                    .extracting("status").isEqualTo(HttpStatus.BAD_REQUEST);
+
+            verifyNoInteractions(appointmentRepository, bookingRepository);
+        }
+
+        @Test
+        @DisplayName("getInfo lists every line in visit order with its own cancellable flag")
+        void should_listLinesWithFlags_when_getInfo() {
+            when(appointmentRepository.findByCancelTokenHash(TOKEN_HASH))
+                    .thenReturn(Optional.of(appointment(BookingStatus.CONFIRMED)));
+            when(bookingRepository.findByAppointmentIdWithGraph(APPOINTMENT_ID)).thenReturn(List.of(
+                    line(first, NOW.plusHours(1), BookingStatus.CONFIRMED),
+                    line(middle, CANCELLABLE_START, BookingStatus.DECLINED),
+                    line(last, CANCELLABLE_START.plusHours(1), BookingStatus.CONFIRMED)));
+
+            CancelTokenInfoResponse info = service.getInfo(TOKEN).orElseThrow();
+
+            assertThat(info.items()).extracting(CancelTokenItemResponse::cancellable)
+                    .containsExactly(false, false, true);
+            assertThat(info.items()).extracting(CancelTokenItemResponse::durationMinutes)
+                    .containsOnly(60);
+            assertThat(info.cancellable()).isTrue();
+        }
+
+        private void liveVisit(Booking... lines) {
+            when(appointmentRepository.findByCancelTokenHash(TOKEN_HASH))
+                    .thenReturn(Optional.of(appointment(BookingStatus.CONFIRMED)));
+            when(appointmentRepository.lockHeaderIfConfirmedWithToken(APPOINTMENT_ID, TOKEN_HASH)).thenReturn(Optional.of(APPOINTMENT_ID));
+            when(bookingRepository.findByAppointmentIdWithGraph(APPOINTMENT_ID)).thenReturn(List.of(lines));
+        }
+
+        private Booking line(UUID id, OffsetDateTime startsAt, BookingStatus status) {
+            Booking base = item(startsAt, "Послуга " + id);
+            return Booking.builder()
+                    .id(id).master(base.getMaster()).masterService(base.getMasterService())
+                    .appointment(appointment(BookingStatus.CONFIRMED))
+                    .status(status).startsAt(startsAt).endsAt(startsAt.plusMinutes(60))
+                    .priceAtBooking(new BigDecimal("350.00")).durationMinutesAtBooking(60)
+                    .guestPhone(GUEST_PHONE)
+                    .build();
+        }
+
+        private Booking bookingWithId(UUID id) {
+            return argThat(b -> b != null && id.equals(b.getId()));
         }
     }
 
@@ -316,7 +547,7 @@ class GuestVisitCancellationServiceTest {
         @DisplayName("address is null when the master has no street")
         void should_returnNullAddress_when_noAddressKnown() {
             // Arrange
-            liveVisitStartingAt(CANCELLABLE_START);
+            visitInfoStartingAt(CANCELLABLE_START);
 
             // Act
             var info = service.getInfo(TOKEN).orElseThrow();
@@ -332,14 +563,14 @@ class GuestVisitCancellationServiceTest {
     class NotAVisitToken {
 
         @Test
-        @DisplayName("returns false without touching anything when the token matches no appointment header")
-        void should_returnFalse_when_tokenIsNotAVisitHeader() {
+        @DisplayName("returns empty without touching anything when the token matches no appointment header")
+        void should_returnEmpty_when_tokenIsNotAVisitHeader() {
             when(appointmentRepository.findByCancelTokenHash(TOKEN_HASH)).thenReturn(Optional.empty());
 
             assertThat(service.cancel(TOKEN))
                     .as("an unknown token is not this service's business — the caller falls through "
                             + "to the legacy single-booking path")
-                    .isFalse();
+                    .isEmpty();
 
             verify(appointmentRepository, never()).consumeCancelTokenHash(any());
             verifyNoInteractions(
@@ -347,30 +578,32 @@ class GuestVisitCancellationServiceTest {
         }
 
         @Test
-        @DisplayName("returns false — indistinguishably from an unknown token — when the header is no longer CONFIRMED")
-        void should_returnFalse_when_visitHeaderIsNoLongerConfirmed() {
+        @DisplayName("returns empty — indistinguishably from an unknown token — when the header is no longer CONFIRMED")
+        void should_returnEmpty_when_visitHeaderIsNoLongerConfirmed() {
             // No state oracle: an already-cancelled visit must produce the SAME observable outcome as a
             // token that never existed. If this branch ever threw 422/409 instead, the public endpoint
             // would confirm to an unauthenticated caller that a given token WAS a real appointment.
             when(appointmentRepository.findByCancelTokenHash(TOKEN_HASH))
                     .thenReturn(Optional.of(appointment(BookingStatus.CANCELLED)));
 
-            assertThat(service.cancel(TOKEN)).isFalse();
+            assertThat(service.cancel(TOKEN)).isEmpty();
 
+            verify(appointmentRepository, never()).lockHeaderIfConfirmedWithToken(any(), any());
             verify(bookingRepository, never()).findByAppointmentIdWithGraph(any());
             verify(appointmentRepository, never()).consumeCancelTokenHash(any());
             verifyNoInteractions(outboxService, slotCalculationService, salonCatalogCacheEvictor);
         }
 
         @Test
-        @DisplayName("returns false rather than blowing up when a CONFIRMED header has no items (defensive)")
-        void should_returnFalse_when_confirmedHeaderHasNoItems() {
+        @DisplayName("returns empty rather than blowing up when a CONFIRMED header has no items (defensive)")
+        void should_returnEmpty_when_confirmedHeaderHasNoItems() {
             // items.get(0) on an empty list would surface as a 500 on a permitAll endpoint.
             when(appointmentRepository.findByCancelTokenHash(TOKEN_HASH))
                     .thenReturn(Optional.of(appointment(BookingStatus.CONFIRMED)));
+            when(appointmentRepository.lockHeaderIfConfirmedWithToken(APPOINTMENT_ID, TOKEN_HASH)).thenReturn(Optional.of(APPOINTMENT_ID));
             when(bookingRepository.findByAppointmentIdWithGraph(APPOINTMENT_ID)).thenReturn(List.of());
 
-            assertThat(service.cancel(TOKEN)).isFalse();
+            assertThat(service.cancel(TOKEN)).isEmpty();
 
             verify(appointmentRepository, never()).consumeCancelTokenHash(any());
             verifyNoInteractions(outboxService, slotCalculationService, salonCatalogCacheEvictor);
@@ -444,19 +677,39 @@ class GuestVisitCancellationServiceTest {
 
     // ── helpers ────────────────────────────────────────────────────────────────
 
-    /** Stubs a CONFIRMED header whose single item starts at {@code startsAt}. */
+    /** Stubs a CONFIRMED, lockable header whose single item starts at {@code startsAt}. */
     private void liveVisitStartingAt(OffsetDateTime startsAt) {
+        when(appointmentRepository.findByCancelTokenHash(TOKEN_HASH))
+                .thenReturn(Optional.of(appointment(BookingStatus.CONFIRMED)));
+        when(appointmentRepository.lockHeaderIfConfirmedWithToken(APPOINTMENT_ID, TOKEN_HASH)).thenReturn(Optional.of(APPOINTMENT_ID));
+        when(bookingRepository.findByAppointmentIdWithGraph(APPOINTMENT_ID))
+                .thenReturn(List.of(item(startsAt, "Манікюр")));
+    }
+
+    /** Stubs a CONFIRMED header + one item for a read-only {@code getInfo} (no lock). */
+    private void visitInfoStartingAt(OffsetDateTime startsAt) {
         when(appointmentRepository.findByCancelTokenHash(TOKEN_HASH))
                 .thenReturn(Optional.of(appointment(BookingStatus.CONFIRMED)));
         when(bookingRepository.findByAppointmentIdWithGraph(APPOINTMENT_ID))
                 .thenReturn(List.of(item(startsAt, "Манікюр")));
     }
 
+    /** Stubs the per-line conditional UPDATE for exactly {@code ids}, cutoff = now + 2h. */
+    private void itemsUpdateReturns(Set<UUID> ids, int rows) {
+        when(bookingRepository.cancelGuestVisitItemsByIds(
+                eq(APPOINTMENT_ID),
+                argThat(c -> c != null && c.size() == ids.size() && ids.containsAll(c)),
+                argThat(cutoff -> cutoff != null && cutoff.isEqual(NOW.plusHours(2)))))
+                .thenReturn(rows);
+    }
+
     /** Q6 — a rejected cancel must leave the visit and every downstream side-effect untouched. */
     private void assertNothingWasCancelled() {
         verify(appointmentRepository, never()).consumeCancelTokenHash(any());
+        verify(bookingRepository, never()).cancelGuestVisitItemsByIds(any(), any(), any());
         verify(bookingRepository, never()).cancelItemsByAppointmentId(any());
-        verifyNoInteractions(outboxService, slotCalculationService, salonCatalogCacheEvictor);
+        verifyNoInteractions(outboxService, inAppNotificationService, slotCalculationService,
+                salonCatalogCacheEvictor);
     }
 
     private Appointment appointment(BookingStatus status) {

@@ -5,6 +5,7 @@ import com.beautica.booking.domain.CancelTokenHasher;
 import com.beautica.booking.domain.GuestPageWindow;
 import com.beautica.booking.domain.GuestVisitAddress;
 import com.beautica.booking.dto.CancelTokenInfoResponse;
+import com.beautica.booking.dto.CancelTokenItemResponse;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.repository.BookingRepository;
@@ -17,7 +18,6 @@ import com.beautica.notification.inapp.entity.InAppNotificationType;
 import com.beautica.notification.inapp.service.InAppNotificationService;
 import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.service.service.SalonCatalogCacheEvictor;
-import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
@@ -26,6 +26,8 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
 
 import java.time.Clock;
 import java.time.OffsetDateTime;
+import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 
 /**
@@ -101,39 +103,59 @@ public class BookingCancellationService {
         // BE-7: a token on an Appointment is a multi-service visit — served by the visit service. Only a
         // token that resolves to no visit falls through to the legacy single-booking path below.
         return guestVisitCancellationService.getInfo(token)
-                .orElseGet(() -> buildInfo(loadByTokenOrThrow(CancelTokenHasher.hash(token))));
+                .orElseGet(() -> {
+                    Booking booking = loadByTokenOrThrow(CancelTokenHasher.hash(token));
+                    return buildInfo(booking, booking.getStatus());
+                });
     }
 
     /**
-     * Cancels a guest booking by its one-time token.
+     * Cancels a guest booking (or every cancellable line of a visit) by its one-time token.
      *
-     * @throws NotFoundException  when the token is unknown / consumed or the booking is
-     *                            not {@code CONFIRMED} (→ 404), including a replayed POST
-     * @throws BusinessException  with 422 when the cancellation window has closed
+     * @see #cancel(GuestCancelToken, List)
      */
     @Transactional
-    public void cancel(GuestCancelToken token) {
-        // BE-7: a token on an Appointment cancels the WHOLE visit (header + all items) via the visit
-        // service; it returns true when it handled the token. Only a non-visit token falls through to
-        // the legacy single-booking cancel below (byte-for-byte unchanged).
-        if (guestVisitCancellationService.cancel(token)) {
-            return;
+    public CancelTokenInfoResponse cancel(GuestCancelToken token) {
+        return cancel(token, null);
+    }
+
+    /**
+     * Phase 436 — cancels by token, optionally only the named lines ({@code bookingIds}; {@code null} = everything
+     * cancellable, empty = 400), and returns the page view after the cancel.
+     *
+     * @throws NotFoundException  when the token is unknown / consumed or the booking is
+     *                            not {@code CONFIRMED} (→ 404), including a replayed POST; also when an id
+     *                            is not a line of this token's booking / visit
+     * @throws BusinessException  with 422 when the cancellation window has closed / a line is no longer
+     *                            cancellable, 400 on an empty list, more than 10 or duplicate ids
+     */
+    @Transactional
+    public CancelTokenInfoResponse cancel(GuestCancelToken token, List<UUID> bookingIds) {
+        List<UUID> requested = GuestCancelSelection.requestedIds(bookingIds);
+        // BE-7: a token on an Appointment is a visit, handled by the visit service; only a non-visit token
+        // falls through to the legacy single-booking cancel below.
+        Optional<CancelTokenInfoResponse> visit = guestVisitCancellationService.cancel(token, bookingIds); // raw ids: null = all
+        if (visit.isPresent()) {
+            return visit.get();
         }
         // V206: only the token's hash is stored — hash once, look up and consume by the hash.
         String tokenHash = CancelTokenHasher.hash(token);
         Booking booking = loadCancellableOrThrow(tokenHash);
+        // Phase 436: a single-booking token has exactly one line — any other id is 404.
+        if (requested.stream().anyMatch(id -> !id.equals(booking.getId()))) {
+            throw GuestCancelSelection.tokenNotFound();
+        }
 
         if (!isCancellable(booking)) {
-            throw new BusinessException(
-                    HttpStatus.UNPROCESSABLE_ENTITY,
-                    "Скасування недоступне — менше ніж %d год до запису"
-                            .formatted(smsProperties.getCancelWindowHours()));
+            throw GuestCancelSelection.windowClosed(smsProperties.getCancelWindowHours());
         }
 
         if (!cancelValidated(booking, tokenHash)) {
             // Lost the race or already consumed between load and update — no side-effects.
-            throw new NotFoundException("Cancel token not found");
+            throw GuestCancelSelection.tokenNotFound();
         }
+        // The bulk UPDATE does not refresh the loaded entity — the view shows the new status explicitly.
+        return buildInfo(booking, BookingStatus.CANCELLED);
     }
 
     /**
@@ -207,27 +229,31 @@ public class BookingCancellationService {
     }
 
     private boolean isCancellable(Booking booking) {
-        if (booking.getStatus() != BookingStatus.CONFIRMED) {
-            return false; // phase 435 read-only view
-        }
-        OffsetDateTime now = OffsetDateTime.now(kyivClock);
-        return booking.getStartsAt().isAfter(now.plusHours(smsProperties.getCancelWindowHours()));
+        return GuestCancelSelection.cancellable(booking, booking.getStatus(), cancelCutoff());
     }
 
-    private CancelTokenInfoResponse buildInfo(Booking booking) {
+    private OffsetDateTime cancelCutoff() {
+        return OffsetDateTime.now(kyivClock).plusHours(smsProperties.getCancelWindowHours());
+    }
+
+    /** {@code status} is the booking's view status — its own, or CANCELLED right after this request cancelled it. */
+    private CancelTokenInfoResponse buildInfo(Booking booking, BookingStatus status) {
         OffsetDateTime windowClosesAt =
                 booking.getStartsAt().minusHours(smsProperties.getCancelWindowHours());
+        String serviceName = booking.getMasterService().getServiceDefinition().getName();
+        CancelTokenItemResponse line = GuestCancelSelection.item(booking, serviceName, status, true, cancelCutoff());
         return new CancelTokenInfoResponse(
                 masterName(booking.getMaster()),
-                booking.getMasterService().getServiceDefinition().getName(),
+                serviceName,
                 booking.getStartsAt(),
-                isCancellable(booking),
+                line.cancellable(),
                 windowClosesAt,
-                booking.getStatus(),
+                status,
                 guestRebookPaths.forBooking(booking).orElse(null),
                 salonName(booking),
                 GuestVisitAddress.of(booking),
-                GuestVisitAddress.pageLocationNote(booking));
+                GuestVisitAddress.pageLocationNote(booking),
+                List.of(line));
     }
 
     private void registerAfterCommitEviction(Booking booking) {
