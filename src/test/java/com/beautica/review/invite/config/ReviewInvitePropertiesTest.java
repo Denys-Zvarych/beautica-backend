@@ -35,7 +35,6 @@ class ReviewInvitePropertiesTest {
         assertThat(props.ttl()).isEqualTo(Duration.ofDays(14));
         assertThat(props.batchSize()).isEqualTo(50);
         assertThat(props.maxAttempts()).isEqualTo(3);
-        assertThat(props.smsText()).isEqualTo("Beautica: Дякуємо, що обрали наш сервіс. Залиште свій відгук про Ваш візит!\n\nhttps://beautica.app/r/" + "{token}");
         assertThat(props.sendBudget()).isEqualTo(Duration.ofSeconds(10));
         assertThat(props.staffPhoneWindow()).isEqualTo(Duration.ofDays(30));
         assertThat(props.staffPhoneGlobalCap()).isEqualTo(3);
@@ -107,25 +106,6 @@ class ReviewInvitePropertiesTest {
     }
 
     @Test
-    @DisplayName("an SMS copy that would exceed two UCS-2 segments (134) with the 22-char token fails the boot")
-    void should_failBinding_when_smsTextTooLong() {
-        // 98 + "beautica.app/r/" (15) + 22-char token = 135 chars rendered — one past two segments
-        String text = "ж".repeat(98) + " beautica.app/r/{token}".substring(1);
-
-        assertThatThrownBy(() -> bind(Map.of(PREFIX + ".sms-text", text)))
-                .isInstanceOf(BindException.class)
-                .rootCause().hasMessageContaining("two UCS-2 segments are 134");
-    }
-
-    @Test
-    @DisplayName("an SMS copy without {token} fails the boot")
-    void should_failBinding_when_smsTextHasNoToken() {
-        assertThatThrownBy(() -> bind(Map.of(PREFIX + ".sms-text", "Оцініть ваш візит: beautica.app")))
-                .isInstanceOf(BindException.class)
-                .hasRootCauseMessage("app.booking.review-invite.sms-text must contain {token} exactly once");
-    }
-
-    @Test
     @DisplayName("a send-at inside the quiet window fails the boot (invites would be pushed into the night)")
     void should_failBinding_when_sendAtInsideQuietWindow() {
         assertThatThrownBy(() -> bind(Map.of(PREFIX + ".send-at", "08:00")))
@@ -192,27 +172,6 @@ class ReviewInvitePropertiesTest {
         assertThatThrownBy(() -> pastBound.requireSendBudgetWithin(grace, connect, slowRead, telegram))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("send-budget must be <= PT3S");
-    }
-
-    @Test
-    @DisplayName("prod link rule: beautica.app/r/{token} as a whole word passes (also https://); the default passes")
-    void should_acceptProdLink_when_hostIsBeauticaApp() {
-        assertThat(ReviewInviteProperties.linksToProdHost(ReviewInviteProperties.DEFAULT_SMS_TEXT)).isTrue();
-        assertThat(ReviewInviteProperties.linksToProdHost(null)).isTrue();
-        assertThat(ReviewInviteProperties.linksToProdHost("Відгук: https://beautica.app/r/{token}")).isTrue();
-        assertThat(ReviewInviteProperties.linksToProdHost("beautica.app/r/{token}.")).isTrue();
-    }
-
-    @Test
-    @DisplayName("prod link rule: another host, a look-alike host, a host prefix, http or another path all fail")
-    void should_rejectProdLink_when_hostOrPathDiffers() {
-        assertThat(ReviewInviteProperties.linksToProdHost("Відгук: staging.beautica.app/r/{token}")).isFalse();
-        assertThat(ReviewInviteProperties.linksToProdHost("Відгук: evil-beautica.app/r/{token}")).isFalse();
-        assertThat(ReviewInviteProperties.linksToProdHost("Відгук: evil.com/beautica.app/r/{token}")).isFalse();
-        assertThat(ReviewInviteProperties.linksToProdHost("Відгук: http://beautica.app/r/{token}")).isFalse();
-        assertThat(ReviewInviteProperties.linksToProdHost("Відгук: beautica.app/x/{token}")).isFalse();
-        assertThat(ReviewInviteProperties.linksToProdHost("Відгук: beautica.app.evil.com/r/{token}")).isFalse();
-        assertThat(ReviewInviteProperties.linksToProdHost("Відгук: beautica.app/r/{token}x")).isFalse();
     }
 
     private static ReviewInviteProperties bind(Map<String, String> values) {

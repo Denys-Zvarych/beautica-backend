@@ -1,6 +1,8 @@
 package com.beautica.review.invite.service;
 
 import com.beautica.review.invite.config.ReviewInviteProperties;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 /**
@@ -8,19 +10,27 @@ import org.springframework.stereotype.Component;
  * <pre>
  * Beautica: Дякуємо, що обрали наш сервіс. Залиште свій відгук про Ваш візит!
  *
- * https://beautica.app/r/{token}
+ * {app.frontend.base-url}/r/{token}
  * </pre>
- * 122 chars with the 22-char token, two UCS-2 segments. The copy is the config key {@code app.booking.review-invite.sms-text}; its two-segment budget is enforced
- * at bind time by {@link ReviewInviteProperties}. No provider text, no guest data.
- * The rendered text carries the raw token, so it is never logged.
+ * The copy is {@link ReviewInviteProperties#SMS_COPY} (code, not config); the link origin is
+ * {@code app.frontend.base-url} ({@code FRONTEND_BASE_URL}), as in {@code GuestCancelUrlBuilder}. In prod
+ * ({@value ReviewInviteProperties#PROD_ORIGIN}) it renders to 122 chars with the 22-char token — two UCS-2 segments.
+ * The two-segment budget ({@value ReviewInviteProperties#MAX_UCS2_CHARS}) is checked once at construction: an
+ * overrun fails the boot on the prod origin and is only warned about on a longer non-prod (staging) origin, so staging
+ * still sends the full copy. No provider text, no guest data. The rendered text carries the raw token, so neither it
+ * nor the text is ever logged.
  */
+@Slf4j
 @Component
 public class ReviewInviteSmsText {
 
-    private final String template;
+    private final String linkPrefix;
 
-    public ReviewInviteSmsText(ReviewInviteProperties properties) {
-        this.template = properties.smsText();
+    public ReviewInviteSmsText(@Value("${app.frontend.base-url}") String frontendBaseUrl) {
+        // Stripped like EnvironmentFingerprintGuard#checkProdReviewInviteLink, so the guard and the link agree.
+        String origin = frontendBaseUrl.strip();
+        this.linkPrefix = ReviewInviteProperties.SMS_COPY + origin + ReviewInviteProperties.REVIEW_PATH;
+        requireWithinBudget(ReviewInviteProperties.SMS_COPY, origin);
     }
 
     public String render(String rawToken) {
@@ -28,6 +38,23 @@ public class ReviewInviteSmsText {
             throw new IllegalArgumentException("Review invite token must be " + ReviewInviteProperties.TOKEN_LENGTH
                     + " chars");
         }
-        return template.replace(ReviewInviteProperties.TOKEN_PLACEHOLDER, rawToken);
+        return linkPrefix + rawToken;
+    }
+
+    /**
+     * Two-segment budget check, package-private and copy-parameterised for tests. The prod-origin throw is
+     * unreachable with today's copy (122 chars); it guards future copy growth from silently going to three segments.
+     */
+    static void requireWithinBudget(String copy, String origin) {
+        int rendered = copy.length() + origin.length() + ReviewInviteProperties.REVIEW_PATH.length()
+                + ReviewInviteProperties.TOKEN_LENGTH;
+        if (rendered <= ReviewInviteProperties.MAX_UCS2_CHARS) {
+            return;
+        }
+        if (ReviewInviteProperties.PROD_ORIGIN.equals(origin)) {
+            throw new IllegalStateException("review-invite SMS renders to " + rendered
+                    + " chars; two UCS-2 segments are " + ReviewInviteProperties.MAX_UCS2_CHARS);
+        }
+        log.warn("event=review_invite_sms rule=two-segment-budget length={} (non-prod origin, not enforced)", rendered);
     }
 }

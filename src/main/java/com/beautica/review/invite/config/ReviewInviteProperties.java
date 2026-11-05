@@ -26,11 +26,6 @@ import java.util.regex.Pattern;
  * @param ttl              D4 — {@code expires_at = sent_at + ttl}
  * @param batchSize        D4a — rows per claim / expiry statement (one job tick)
  * @param maxAttempts      D4 — SMS failures before {@code FAILED}
- * @param smsText          D5 — SMS copy; must contain {@code {token}} exactly once and render to at most two UCS-2
- *                         segments ({@value #MAX_UCS2_CHARS} chars; phase 435 — the title + {@code https://} link
- *                         no longer fit one).
- *                         In PROD it must also link to {@value #PROD_LINK} ({@link #linksToProdHost}, enforced by
- *                         {@code EnvironmentFingerprintGuard} rule {@code prod-review-invite-sms-link})
  * @param sendBudget       audit cycle 1 — wall-clock budget of one job tick's send loop; claimed rows not attempted
  *                         when it runs out go back to {@code SCHEDULED}. Capped at the 30 s scheduler shutdown grace minus one
  *                         in-flight SMS (connect + read timeout) minus {@link #SEND_WRITE_BACK_MARGIN}
@@ -53,23 +48,24 @@ public record ReviewInviteProperties(
         @DefaultValue("14d") Duration ttl,
         @DefaultValue("50") int batchSize,
         @DefaultValue("3") int maxAttempts,
-        @DefaultValue(DEFAULT_SMS_TEXT) String smsText,
         @DefaultValue("10s") Duration sendBudget,
         @DefaultValue("30d") Duration staffPhoneWindow,
         @DefaultValue("3") int staffPhoneGlobalCap,
         @DefaultValue("50") int staffProviderDailyCap
 ) {
 
-    public static final String TOKEN_PLACEHOLDER = "{token}";
     /**
      * Phase 435 (user decisions 2026-11-04): the user's thank-you copy, «Beautica:» title first (every SMS starts
-     * with it), and a full {@code https://} link on its own line — the bare {@code beautica.app/...} was not
-     * tappable on real phones. The user's «🤍» is left out: a non-BMP emoji has no UCS-2 form and Turbosms /
-     * carrier support for it is unverified. 122 chars rendered = two UCS-2 segments.
+     * with it), then a blank line; the full {@code https://} link follows on its own line — the bare
+     * {@code beautica.app/...} was not tappable on real phones. The user's «🤍» is left out: a non-BMP emoji has no
+     * UCS-2 form and Turbosms / carrier support for it is unverified. The link is
+     * {@code {app.frontend.base-url}}{@value #REVIEW_PATH}{@code {token}} (built by {@code ReviewInviteSmsText});
+     * in prod that renders to 122 chars = two UCS-2 segments.
      */
-    public static final String DEFAULT_SMS_TEXT =
-            "Beautica: Дякуємо, що обрали наш сервіс. Залиште свій відгук про Ваш візит!\n\n"
-                    + "https://beautica.app/r/" + TOKEN_PLACEHOLDER;
+    public static final String SMS_COPY =
+            "Beautica: Дякуємо, що обрали наш сервіс. Залиште свій відгук про Ваш візит!\n\n";
+    /** Website 019 serves the review page at {@code {origin}/r/{token}}. */
+    public static final String REVIEW_PATH = "/r/";
 
     /**
      * Two concatenated UCS-2 SMS segments (2 × 67 chars after the UDH; Cyrillic forces UCS-2). Phase 435 raised
@@ -79,8 +75,12 @@ public record ReviewInviteProperties(
     /** Raw token length: 16 random bytes, base64url without padding. */
     public static final int TOKEN_LENGTH = 22;
 
-    /** The only link host/path a PROD invite may carry (website 019 serves {@code /r/{token}} there). */
-    public static final String PROD_LINK = "beautica.app/r/" + TOKEN_PLACEHOLDER;
+    /**
+     * The only {@code app.frontend.base-url} a PROD invite may link to (enforced by {@code EnvironmentFingerprintGuard}
+     * rule {@code prod-review-invite-sms-link} when invites are enabled; also the only origin whose two-segment
+     * budget overrun fails the boot).
+     */
+    public static final String PROD_ORIGIN = "https://beautica.app";
     /** Default {@code sendBudget}. */
     public static final Duration DEFAULT_SEND_BUDGET = Duration.ofSeconds(10);
     /** Default {@code staffPhoneWindow}. */
@@ -117,13 +117,6 @@ public record ReviewInviteProperties(
      */
     public static final Duration TELEGRAM_LEG_WORST_CASE = Duration.ofSeconds(10);
 
-    /**
-     * {@value #PROD_LINK}, optionally {@code https://}, as a whole word: preceded by start/whitespace (so neither
-     * {@code evil-beautica.app} nor {@code evil.com/beautica.app} matches) and followed by end/whitespace/punctuation.
-     */
-    private static final Pattern PROD_LINK_PATTERN =
-            Pattern.compile("(?<!\\S)(?:https://)?beautica\\.app/r/\\{token\\}(?=$|[\\s.,!?])");
-
     private static final Pattern POLICY_VERSION = Pattern.compile("^\\d{4}-\\d{2}-\\d{2}(\\.\\d{1,3})?$");
     private static final int MAX_BATCH_SIZE = 1_000;
     private static final int MAX_ATTEMPTS_CAP = 10;
@@ -152,7 +145,6 @@ public record ReviewInviteProperties(
         }
         requireInRange("batch-size", batchSize, MAX_BATCH_SIZE);
         requireInRange("max-attempts", maxAttempts, MAX_ATTEMPTS_CAP);
-        requireTemplateWithinBudget(smsText);
         requirePositive("send-budget", sendBudget);
         requirePositive("staff-phone-window", staffPhoneWindow);
         if (staffPhoneWindow.compareTo(GuestReviewRetentionService.INVITE_RETENTION) > 0) {
@@ -193,32 +185,12 @@ public record ReviewInviteProperties(
         }
     }
 
-    /**
-     * Audit cycle 1 — {@code true} when {@code smsText} links to {@value #PROD_LINK} (host validated as a whole word).
-     * A {@code null} template is the binding default, which does.
-     */
-    public static boolean linksToProdHost(String smsText) {
-        return smsText == null || PROD_LINK_PATTERN.matcher(smsText).find();
-    }
-
     /** {@code [quietStart, quietEnd)}, wrapping midnight when {@code quietStart > quietEnd}. */
     public static boolean isQuiet(LocalTime time, LocalTime quietStart, LocalTime quietEnd) {
         if (quietStart.isBefore(quietEnd)) {
             return !time.isBefore(quietStart) && time.isBefore(quietEnd);
         }
         return !time.isBefore(quietStart) || time.isBefore(quietEnd);
-    }
-
-    private static void requireTemplateWithinBudget(String smsText) {
-        if (smsText == null || smsText.indexOf(TOKEN_PLACEHOLDER) < 0
-                || smsText.indexOf(TOKEN_PLACEHOLDER) != smsText.lastIndexOf(TOKEN_PLACEHOLDER)) {
-            throw new IllegalStateException("app.booking.review-invite.sms-text must contain {token} exactly once");
-        }
-        int rendered = smsText.length() - TOKEN_PLACEHOLDER.length() + TOKEN_LENGTH;
-        if (rendered > MAX_UCS2_CHARS) {
-            throw new IllegalStateException("app.booking.review-invite.sms-text renders to " + rendered
-                    + " chars; two UCS-2 segments are " + MAX_UCS2_CHARS);
-        }
     }
 
     private static void requirePositive(String name, Duration value) {
