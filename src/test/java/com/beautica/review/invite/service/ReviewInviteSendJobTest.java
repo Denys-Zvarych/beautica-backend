@@ -1,9 +1,14 @@
 package com.beautica.review.invite.service;
 
+import com.beautica.auth.SecureTokenGenerator;
+import com.beautica.config.OtpPepperConfig;
+import com.beautica.notification.channel.GuestMessageKind;
+import com.beautica.notification.channel.GuestMessageRouter;
 import com.beautica.notification.channel.GuestMessageRouters;
 import com.beautica.notification.sms.SmsDeliveryAmbiguousException;
 import com.beautica.notification.sms.SmsDeliveryException;
 import com.beautica.notification.sms.SmsService;
+import com.beautica.review.invite.config.ReviewInviteProperties;
 import com.beautica.review.invite.support.ReviewInviteTestProperties;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -24,6 +29,7 @@ import java.util.UUID;
 
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -58,6 +64,27 @@ class ReviewInviteSendJobTest {
 
         verify(sendService).expireSent(MIDDAY);
         verify(smsService).send("+380501234567", "text");
+        verify(sendService, never()).recordFailedSend(any());
+    }
+
+    @Test
+    @DisplayName("2026-11-05: the routed invite (Telegram or SMS) gets the full thank-you copy + staging link, not link-only")
+    void should_routeFullCopyAsReviewInvite_when_stagingOriginRendered() {
+        String origin = "https://dev-beautica-site.beautica-ua.workers.dev";
+        String token = new SecureTokenGenerator(new OtpPepperConfig("unit-test-otp-pepper-min-32-characters!"))
+                .generateToken(ReviewInviteSendService.TOKEN_BYTES);
+        String rendered = new ReviewInviteSmsText(origin).render(token);
+        PreparedInviteSms sms = new PreparedInviteSms(UUID.randomUUID(), "+380501234567", rendered);
+        when(sendService.claimAndPrepare(MIDDAY)).thenReturn(List.of(sms));
+        GuestMessageRouter router = mock(GuestMessageRouter.class);
+        ReviewInviteSendJob routedJob = new ReviewInviteSendJob(sendService,
+                new QuietHoursCalculator(ReviewInviteTestProperties.enabled()), router,
+                ReviewInviteTestProperties.enabled(), Clock.fixed(MIDDAY, ZoneOffset.UTC));
+
+        routedJob.run();
+
+        verify(router).deliver(GuestMessageKind.GUEST_REVIEW_INVITE, "+380501234567",
+                ReviewInviteProperties.SMS_COPY + origin + ReviewInviteProperties.REVIEW_PATH + token);
         verify(sendService, never()).recordFailedSend(any());
     }
 

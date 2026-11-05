@@ -1,6 +1,7 @@
 package com.beautica.review.invite;
 
 import com.beautica.common.security.PhoneHasher;
+import com.beautica.review.invite.config.ReviewInviteProperties;
 import com.beautica.review.invite.entity.SmsOptOut;
 import com.beautica.review.invite.entity.SmsOptOutSource;
 import com.beautica.review.invite.repository.ReviewInviteRepository;
@@ -9,6 +10,7 @@ import com.beautica.review.invite.service.PreparedInviteSms;
 import com.beautica.review.invite.service.ReviewInviteSendJob;
 import com.beautica.review.invite.service.ReviewInviteSendService;
 import com.beautica.review.invite.service.ReviewInviteTokenHasher;
+import com.beautica.review.invite.support.ReviewInviteTestProperties;
 import com.github.tomakehurst.wiremock.verification.LoggedRequest;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -42,6 +44,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * parked by the test profile.
  */
 @TestPropertySource(properties = {
+        "app.frontend.base-url=https://beautica.app",
         "app.booking.sms.enabled=true",
         "app.booking.review-invite.enabled=true",
         "app.booking.review-invite.min-policy-version=2026-10-20",
@@ -81,7 +84,7 @@ class ReviewInviteSendJobIT extends AbstractReviewInviteIT {
         assertThat(requests).hasSize(1);
         String text = payload(requests.get(0)).path("sms").path("text").asText();
         assertThat(payload(requests.get(0)).path("recipients").get(0).asText()).isEqualTo(GUEST_PHONE);
-        assertThat(text).startsWith("Beautica: Дякуємо, що обрали наш сервіс. Залиште свій відгук про Ваш візит!\n\nhttps://beautica.app/r/").hasSize(122);
+        assertThat(text).startsWith(ReviewInviteTestProperties.PROD_SMS_PREFIX).hasSize(ReviewInviteTestProperties.PROD_SMS_PREFIX.length() + ReviewInviteProperties.TOKEN_LENGTH);
         String token = text.substring(text.lastIndexOf('/') + 1);
         assertThat(token).matches("[A-Za-z0-9_-]{22}");
 
@@ -307,7 +310,7 @@ class ReviewInviteSendJobIT extends AbstractReviewInviteIT {
         assertThat(requests).hasSize(1);
         String text = payload(requests.get(0)).path("sms").path("text").asText();
         assertThat(payload(requests.get(0)).path("recipients").get(0).asText()).isEqualTo(GUEST_PHONE);
-        assertThat(text).startsWith("Beautica: Дякуємо, що обрали наш сервіс. Залиште свій відгук про Ваш візит!\n\nhttps://beautica.app/r/").hasSize(122);
+        assertThat(text).startsWith(ReviewInviteTestProperties.PROD_SMS_PREFIX).hasSize(ReviewInviteTestProperties.PROD_SMS_PREFIX.length() + ReviewInviteProperties.TOKEN_LENGTH);
         Map<String, Object> row = inviteRow(inviteId);
         assertThat(row.get("status")).isEqualTo("SENT");
         assertThat((byte[]) row.get("token_hash"))

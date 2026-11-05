@@ -5,6 +5,7 @@ import com.beautica.auth.Role;
 import com.beautica.common.security.PhoneHasher;
 import com.beautica.review.invite.service.ReviewInviteSendJob;
 import com.beautica.review.invite.service.ReviewInviteTokenHasher;
+import com.beautica.review.invite.support.ReviewInviteTestProperties;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.github.tomakehurst.wiremock.verification.LoggedRequest;
@@ -45,6 +46,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * carries its own {@code X-Forwarded-For} so the per-IP buckets never interfere.
  */
 @TestPropertySource(properties = {
+        "app.frontend.base-url=https://beautica.app",
         "app.booking.sms.enabled=true",
         "app.booking.review-invite.enabled=true",
         "app.booking.review-invite.min-policy-version=2026-10-20"
@@ -54,7 +56,7 @@ class GuestReviewInviteChainIT extends AbstractReviewInviteIT {
 
     private static final String BASE = "/api/v1/public/review-invites/";
     private static final String REVIEW_LINK_PREFIX =
-            "Beautica: Дякуємо, що обрали наш сервіс. Залиште свій відгук про Ваш візит!\n\nhttps://beautica.app/r/";
+            ReviewInviteTestProperties.PROD_SMS_PREFIX;
     private static final ZoneId KYIV = ZoneId.of("Europe/Kyiv");
     private static final AtomicInteger IP_SEQ = new AtomicInteger();
 

@@ -7,6 +7,7 @@ import com.beautica.notification.service.NotificationService;
 import com.beautica.notification.sms.SmsDeliveryException;
 import com.beautica.notification.telegram.TelegramNotAllowListedException;
 import com.beautica.review.invite.service.ReviewInviteSendJob;
+import com.beautica.review.invite.support.ReviewInviteTestProperties;
 import com.beautica.notification.sms.SmsService;
 import com.beautica.notification.telegram.TelegramDeliveryException;
 import com.beautica.notification.telegram.TelegramMessenger;
@@ -160,10 +161,7 @@ class GuestMessageRouterTest {
                     Beautica: Ваш запис перенесено на 27.10.2026 о 12:00.
 
                     Деталі або записатись знову https://beautica.app/c/Ab3dE5gH7jK9mN1p""",
-            GuestMessageKind.GUEST_REVIEW_INVITE, """
-                    Beautica: Дякуємо, що обрали наш сервіс. Залиште свій відгук про Ваш візит!
-
-                    https://beautica.app/r/token""");
+            GuestMessageKind.GUEST_REVIEW_INVITE, ReviewInviteTestProperties.PROD_SMS_PREFIX + "token");
 
     @Test
     @DisplayName("D2.3 a failed touchLastSent after delivery never triggers an SMS or escapes")

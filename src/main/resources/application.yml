@@ -479,10 +479,7 @@ app:
       # within staff-phone-window (PHONE_GLOBAL_CAP), and per provider (master, or salon) in 24 h (PROVIDER_DAILY_CAP).
       staff-phone-global-cap: 3
       staff-provider-daily-cap: 50
-      # Phase 435 (user decision 2026-11-04) — «Beautica:» title, thank-you line, tappable https link on its own
-      # line: 122 chars with the 22-char token = two UCS-2 segments (<= 134, checked at boot). No emoji (UCS-2).
-      # Override for a non-prod web host.
-      sms-text: "${APP_BOOKING_REVIEW_INVITE_SMS_TEXT:Beautica: Дякуємо, що обрали наш сервіс. Залиште свій відгук про Ваш візит!\n\nhttps://beautica.app/r/{token}}"
+      # The invite SMS copy is in code (ReviewInviteProperties.SMS_COPY); its link origin is app.frontend.base-url.
       job:
         fixed-delay-ms: 60000
         initial-delay-ms: 60000

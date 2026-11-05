@@ -35,6 +35,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 @ExtendWith(OutputCaptureExtension.class)
 @TestPropertySource(properties = {
+        "app.frontend.base-url=https://beautica.app",
         "app.booking.sms.enabled=true",
         "app.booking.review-invite.enabled=true",
         "app.booking.review-invite.min-policy-version=2026-10-20"

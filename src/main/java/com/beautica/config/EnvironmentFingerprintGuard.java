@@ -528,8 +528,17 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
 
     /** Same resolution as {@code TelegramProperties}; an unconvertible value reads as off (TelegramConfig fails it). */
     private static boolean telegramEnabled(Environment env) {
+        return boundFlag(env, "app.telegram.enabled");
+    }
+
+    /**
+     * Binds a boolean flag exactly as its {@code @ConfigurationProperties} consumer does (Spring's conversion also
+     * accepts {@code 1}/{@code on}/{@code yes}, which {@code Boolean.parseBoolean} reads as {@code false}). Unset or
+     * unconvertible → {@code false}; the consumer's own binding fails boot on an unconvertible value.
+     */
+    private static boolean boundFlag(Environment env, String property) {
         try {
-            return Binder.get(env).bind("app.telegram.enabled", Boolean.class).orElse(false);
+            return Binder.get(env).bind(property, Boolean.class).orElse(false);
         } catch (org.springframework.boot.context.properties.bind.BindException e) {
             return false;
         }
@@ -545,16 +554,20 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
     }
 
     /**
-     * Phase 400 audit cycle 1. The review-invite SMS carries a single-use review token; in PROD its link must point at
-     * {@code beautica.app/r/{token}} (the website that serves the review page), so an
-     * {@code APP_BOOKING_REVIEW_INVITE_SMS_TEXT} override cannot ship tokens to another host. Unset resolves to the
-     * yml/binding default, which does. Names the rule and property only — never the configured text.
+     * Phase 400 audit cycle 1 / 2026-11-05 fix. The review-invite SMS carries a single-use review token; its link is
+     * {@code {app.frontend.base-url}/r/{token}}, so in PROD with review invites enabled the frontend origin must be
+     * exactly {@value ReviewInviteProperties#PROD_ORIGIN} (the website that serves the review page) — tokens cannot be
+     * shipped to another host. Invites disabled send nothing, so the rule does not apply. Names the rule and property
+     * only — never the configured value.
      */
     private static void checkProdReviewInviteLink(Environment env, List<String> violations) {
-        if (!ReviewInviteProperties.linksToProdHost(
-                boundOrNull(env, "app.booking.review-invite.sms-text"))) {
-            violations.add("rule prod-review-invite-sms-link: app.booking.review-invite.sms-text must link to "
-                    + ReviewInviteProperties.PROD_LINK + " in prod");
+        if (!boundFlag(env, "app.booking.review-invite.enabled")) {
+            return;
+        }
+        String origin = boundOrNull(env, "app.frontend.base-url");
+        if (origin == null || !ReviewInviteProperties.PROD_ORIGIN.equals(origin.strip())) {
+            violations.add("rule prod-review-invite-sms-link: app.frontend.base-url must be "
+                    + ReviewInviteProperties.PROD_ORIGIN + " in prod when review invites are enabled");
         }
     }
 
@@ -569,7 +582,7 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
     private static final String TURNSTILE_SITEVERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
 
     private static void checkProdTurnstile(Environment env, List<String> violations) {
-        if (!Boolean.parseBoolean(boundOrNull(env, "app.turnstile.enabled"))) {
+        if (!boundFlag(env, "app.turnstile.enabled")) {
             violations.add("rule prod-turnstile-disabled: app.turnstile.enabled must be true in prod");
         }
         // Phase 382 audit: a redirected siteverify URL would send the real secret and every visitor token to a
