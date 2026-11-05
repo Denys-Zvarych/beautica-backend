@@ -6,6 +6,7 @@ import com.beautica.salon.dto.CreateSalonRequest;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.salon.service.SalonService;
 import com.beautica.support.HeldDbLock;
+import com.beautica.support.LockWaiters;
 import com.beautica.support.RepositorySpies;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
@@ -26,6 +27,7 @@ import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import javax.sql.DataSource;
+import java.time.Duration;
 
 import java.util.List;
 import java.util.UUID;
@@ -39,6 +41,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 
 /**
  * Perf LOW-A — concurrency regression for the per-owner active-salon cap
@@ -183,14 +187,24 @@ class SalonCreateCapConcurrencyIT extends AbstractIntegrationTest {
         // together push the owner to 51 active salons. If the lock is genuinely taken and held,
         // create #2 cannot get past its own SELECT ... FOR UPDATE while #1 sits paused — no other
         // actor exists in this test that could release it.
-        boolean secondFinishedWhileFirstPaused = secondDone.await(3, TimeUnit.SECONDS);
-        assertThat(secondFinishedWhileFirstPaused)
-                .as("FALSIFIABLE ASSERTION: the racing create must still be BLOCKED on the owner row "
-                        + "lock while create #1 holds it uncommitted — if this is true the cap check "
+        //
+        // Bounded pg_stat_activity poll, not a fixed await: create #2's owner lock
+        // (UserRepository#findByIdForUpdate) bounds its wait with the transaction-local 3s lock_timeout, and
+        // holding #1 for >= 3s makes #2 fail with a lock-timeout 409 indistinguishable by status from the cap
+        // 409 (see the lock-grant assertion below). Releasing the moment #2 is SEEN waiting on the users row
+        // lock proves the block directly; an unserialised (pre-fix) #2 finishes without waiting and fails fast.
+        boolean secondBlockedOnOwnerLock = LockWaiters.awaitBlockedOnLock(
+                jdbcTemplate, "from users", secondDone, Duration.ofSeconds(10));
+        assertThat(secondBlockedOnOwnerLock)
+                .as("FALSIFIABLE ASSERTION: the racing create must be observed BLOCKED on the owner row "
+                        + "lock while create #1 holds it uncommitted — if it is not, the cap check "
                         + "is the unserialised read-then-write it used to be, and N concurrent "
                         + "creates can each read `count < %s` and each insert",
                         SalonService.MAX_ACTIVE_SALONS_PER_OWNER)
-                .isFalse();
+                .isTrue();
+        assertThat(secondDone.getCount())
+                .as("create #2 must still be in flight while create #1 holds the owner lock")
+                .isEqualTo(1L);
 
         releaseFirst.countDown();
         assertThat(firstDone.await(15, TimeUnit.SECONDS))
@@ -206,6 +220,20 @@ class SalonCreateCapConcurrencyIT extends AbstractIntegrationTest {
                 .as("one create must be accepted and the other rejected with the cap conflict — "
                         + "bodies: %s | %s", firstResponse.get().getBody(), secondResponse.get().getBody())
                 .containsExactlyInAnyOrder(HttpStatus.CREATED, HttpStatus.CONFLICT);
+
+        // The 409 must be the CAP, not a lock timeout. Both bodies are the same genericised conflict
+        // text (GlobalExceptionHandler#handleBusiness / #handlePessimisticLockingFailure), so prove the
+        // path instead: the loser was GRANTED the owner lock (the seam counts only returned locks — a
+        // 55P03 throws before the increment) and then ran the cap count, which is what rejected it.
+        assertThat(locksGranted.get())
+                .as("both creates must obtain the owner row lock; 1 means #2 timed out on it (409 from "
+                        + "lock_timeout, not from the cap)")
+                .isEqualTo(2);
+        verify(salonRepository, times(2)).countByOwnerIdAndIsActiveTrue(ownerId);
+        ResponseEntity<String> loser = firstResponse.get().getStatusCode() == HttpStatus.CONFLICT
+                ? firstResponse.get() : secondResponse.get();
+        assertThat(objectMapper.readTree(loser.getBody()).path("message").asText())
+                .isEqualTo("Request could not be completed due to a conflict");
 
         assertThat(activeSalonCount(ownerId))
                 .as("THE decisive assertion: the owner must end at exactly the cap, never above it — "

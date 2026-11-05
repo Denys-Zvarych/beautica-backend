@@ -7,6 +7,7 @@ import com.beautica.common.ApiResponse;
 import com.beautica.common.exception.InviteTokenException;
 import com.beautica.config.TestSecurityConfig;
 import com.beautica.salon.service.SalonService;
+import com.beautica.support.LockWaiters;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -28,6 +29,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.sql.Timestamp;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.HexFormat;
@@ -83,7 +85,8 @@ import static org.mockito.Mockito.doAnswer;
  * and a flush) and reliably commits before accept's much heavier HTTP round trip (validation,
  * hashing, its own DB round trip) even reaches the database — pure thread-scheduling luck, not the
  * lock, produced the "safe" result. The fix below is the assertion actually in this test: BEFORE
- * releasing cancel, assert that accept has NOT completed within a generous 3s window. Only a
+ * releasing cancel, assert that accept is observed waiting on the row lock in pg_stat_activity
+ * ({@code LockWaiters}; originally a fixed 3s window). Only a
  * genuinely held row lock can force that; nothing else in this test blocks accept for any
  * meaningful time. Verified against a throwaway revert of the production line: with {@code
  * findById} (no lock), {@code acceptDone.await(3, SECONDS)} returned {@code true} (accept finished
@@ -190,14 +193,24 @@ class PendingInviteCancelAcceptRaceIT extends AbstractIntegrationTest {
         // this class's own falsification note below). Asserting non-completion under contention,
         // rather than only the eventual outcome, is the only way to prove the LOCK itself — not
         // just favourable scheduling — is what produces the result.
-        boolean acceptFinishedWhileCancelStillPaused = acceptDone.await(3, TimeUnit.SECONDS);
-        assertThat(acceptFinishedWhileCancelStillPaused)
-                .as("FALSIFIABLE ASSERTION: the racing accept must still be BLOCKED on the row lock "
-                        + "while cancel holds it uncommitted — if this is true, cancel's read took no "
+        //
+        // Bounded pg_stat_activity poll, not a fixed await: accept's findByTokenForUpdate bounds its wait with
+        // the transaction-local 3s lock_timeout (TransactionLockTimeout), so holding cancel for >= 3s would
+        // turn accept into a 409 lock-timeout instead of the race outcome asserted below (400 INVITE_REVOKED).
+        // Releasing the moment accept is SEEN waiting on the invite_tokens row lock proves the block directly
+        // and leaves no timing window; an unblocked (pre-fix) accept finishes without waiting and fails fast.
+        boolean acceptBlockedOnRowLock = LockWaiters.awaitBlockedOnLock(
+                jdbcTemplate, "invite_tokens", acceptDone, Duration.ofSeconds(10));
+        assertThat(acceptBlockedOnRowLock)
+                .as("FALSIFIABLE ASSERTION: the racing accept must be observed BLOCKED on the row lock "
+                        + "while cancel holds it uncommitted — if it is not, cancel's read took no "
                         + "lock at all (the pre-fix defect) and accept was free to run/commit "
                         + "unconditionally the whole time, which is exactly the vulnerable window "
                         + "that let an already-cancelled invite still provision an account")
-                .isFalse();
+                .isTrue();
+        assertThat(acceptDone.getCount())
+                .as("accept must still be in flight while cancel holds the lock")
+                .isEqualTo(1L);
 
         releaseCancel.countDown();
         boolean cancelFinished = cancelDone.await(15, TimeUnit.SECONDS);

@@ -15,6 +15,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import lombok.extern.slf4j.Slf4j;
@@ -169,6 +170,32 @@ public class InAppNotificationService {
         }
         UUID salonId = salonIdOf(representative.getSalon());
         String dedupKey = dedupKey(type, appointmentId);
+        write(type, recipients, null, appointmentId, salonId, null, dedupKey);
+        log.debug("in-app notify type={} appointmentId={} recipients={}", type, appointmentId, recipients.size());
+    }
+
+    /**
+     * Phase 436 — {@link #notifyVisitEvent(InAppNotificationType, UUID, Booking, UUID)} for an event that can happen
+     * more than once on one visit (a guest's partial cancel by link): the de-dup key also carries
+     * {@code occurrenceId} (the first booking the event touched, unique per occurrence), so a second occurrence is
+     * not swallowed by the per-visit key's {@code ON CONFLICT DO NOTHING}. A retry of the SAME occurrence still
+     * de-duplicates.
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void notifyVisitEvent(
+            InAppNotificationType type, UUID appointmentId, Booking representative, UUID actorUserId,
+            UUID occurrenceId) {
+        Objects.requireNonNull(occurrenceId, "occurrenceId must not be null");
+        UUID clientId = clientIdOf(representative);
+        boolean walkIn = representative.getBookingSource() == BookingSource.STAFF;
+        Set<UUID> recipients = recipientsForSimpleEvent(
+                type, representative.getMaster(), representative.getSalon(), clientId, walkIn);
+        recipients.remove(actorUserId);
+        if (recipients.isEmpty()) {
+            return;
+        }
+        UUID salonId = salonIdOf(representative.getSalon());
+        String dedupKey = dedupKey(type, appointmentId) + ":" + occurrenceId;
         write(type, recipients, null, appointmentId, salonId, null, dedupKey);
         log.debug("in-app notify type={} appointmentId={} recipients={}", type, appointmentId, recipients.size());
     }

@@ -35,8 +35,38 @@ class ReviewInvitePropertiesTest {
         assertThat(props.ttl()).isEqualTo(Duration.ofDays(14));
         assertThat(props.batchSize()).isEqualTo(50);
         assertThat(props.maxAttempts()).isEqualTo(3);
-        assertThat(props.smsText()).isEqualTo("Оцініть ваш візит: beautica.app/r/{token}");
-        assertThat(props.sendBudget()).isEqualTo(Duration.ofSeconds(20));
+        assertThat(props.sendBudget()).isEqualTo(Duration.ofSeconds(10));
+        assertThat(props.staffPhoneWindow()).isEqualTo(Duration.ofDays(30));
+        assertThat(props.staffPhoneGlobalCap()).isEqualTo(3);
+        assertThat(props.staffProviderDailyCap()).isEqualTo(50);
+    }
+
+    @Test
+    @DisplayName("434 audit-fix LOW-3 — a staff-phone-window longer than the 30 d invite retention fails the boot")
+    void should_failBinding_when_staffPhoneWindowExceedsRetention() {
+        assertThatThrownBy(() -> bind(Map.of(PREFIX + ".staff-phone-window", "31d")))
+                .isInstanceOf(BindException.class)
+                .hasRootCauseMessage("app.booking.review-invite.staff-phone-window must be <= PT720H (invite "
+                        + "retention; was PT744H)");
+    }
+
+    @Test
+    @DisplayName("434 audit-fix LOW-3 — a staff-phone-window equal to the retention binds")
+    void should_bind_when_staffPhoneWindowEqualsRetention() {
+        assertThat(bind(Map.of(PREFIX + ".staff-phone-window", "30d")).staffPhoneWindow())
+                .isEqualTo(Duration.ofDays(30));
+    }
+
+    @Test
+    @DisplayName("434 audit-fix LOW-4 — a zero STAFF cap fails the boot")
+    void should_failBinding_when_staffCapZero() {
+        assertThatThrownBy(() -> bind(Map.of(PREFIX + ".staff-phone-global-cap", "0")))
+                .isInstanceOf(BindException.class)
+                .hasRootCauseMessage("app.booking.review-invite.staff-phone-global-cap must be in [1, 100] (was 0)");
+        assertThatThrownBy(() -> bind(Map.of(PREFIX + ".staff-provider-daily-cap", "0")))
+                .isInstanceOf(BindException.class)
+                .hasRootCauseMessage("app.booking.review-invite.staff-provider-daily-cap must be in [1, 10000] "
+                        + "(was 0)");
     }
 
     @Test
@@ -76,24 +106,6 @@ class ReviewInvitePropertiesTest {
     }
 
     @Test
-    @DisplayName("an SMS copy that would exceed one UCS-2 segment with the 22-char token fails the boot")
-    void should_failBinding_when_smsTextTooLong() {
-        String text = "Оцініть, будь ласка, ваш нещодавній візит тут: beautica.app/r/{token}";
-
-        assertThatThrownBy(() -> bind(Map.of(PREFIX + ".sms-text", text)))
-                .isInstanceOf(BindException.class)
-                .rootCause().hasMessageContaining("one UCS-2 segment is 70");
-    }
-
-    @Test
-    @DisplayName("an SMS copy without {token} fails the boot")
-    void should_failBinding_when_smsTextHasNoToken() {
-        assertThatThrownBy(() -> bind(Map.of(PREFIX + ".sms-text", "Оцініть ваш візит: beautica.app")))
-                .isInstanceOf(BindException.class)
-                .hasRootCauseMessage("app.booking.review-invite.sms-text must contain {token} exactly once");
-    }
-
-    @Test
     @DisplayName("a send-at inside the quiet window fails the boot (invites would be pushed into the night)")
     void should_failBinding_when_sendAtInsideQuietWindow() {
         assertThatThrownBy(() -> bind(Map.of(PREFIX + ".send-at", "08:00")))
@@ -122,62 +134,44 @@ class ReviewInvitePropertiesTest {
     }
 
     @Test
-    @DisplayName("send-budget binds up to the 20 s static cap (30 s grace - 3 s connect - 5 s read - 2 s write-back); 21 s fails the boot")
+    @DisplayName("send-budget binds up to the 10 s static cap (30 s grace - 10 s Telegram leg - 3 s connect - 5 s read - 2 s write-back); 11 s fails the boot")
     void should_bindSendBudgetAndCapIt_when_configured() {
-        assertThat(bind(Map.of(PREFIX + ".send-budget", "15s")).sendBudget()).isEqualTo(Duration.ofSeconds(15));
-        assertThat(bind(Map.of(PREFIX + ".send-budget", "20s")).sendBudget()).isEqualTo(Duration.ofSeconds(20));
-        assertThatThrownBy(() -> bind(Map.of(PREFIX + ".send-budget", "21s")))
+        assertThat(bind(Map.of(PREFIX + ".send-budget", "7s")).sendBudget()).isEqualTo(Duration.ofSeconds(7));
+        assertThat(bind(Map.of(PREFIX + ".send-budget", "10s")).sendBudget()).isEqualTo(Duration.ofSeconds(10));
+        assertThatThrownBy(() -> bind(Map.of(PREFIX + ".send-budget", "11s")))
                 .isInstanceOf(BindException.class)
-                .rootCause().hasMessageContaining("send-budget must be <= PT20S");
+                .rootCause().hasMessageContaining("send-budget must be <= PT10S");
         assertThatThrownBy(() -> bind(Map.of(PREFIX + ".send-budget", "0s")))
                 .isInstanceOf(BindException.class)
                 .rootCause().hasMessageContaining("send-budget must be positive");
     }
 
     @Test
-    @DisplayName("maxSendBudget = grace - connect - read - write-back margin")
+    @DisplayName("maxSendBudget = grace - Telegram leg - sms connect - sms read - write-back margin")
     void should_deriveMaxSendBudget_when_givenGraceAndTimeouts() {
         Duration max = ReviewInviteProperties.maxSendBudget(
-                Duration.ofSeconds(30), Duration.ofSeconds(3), Duration.ofSeconds(5));
+                Duration.ofSeconds(30), Duration.ofSeconds(3), Duration.ofSeconds(5), Duration.ofSeconds(10));
 
-        assertThat(max).isEqualTo(Duration.ofSeconds(20));
+        assertThat(max).isEqualTo(Duration.ofSeconds(10));
         assertThat(ReviewInviteProperties.SEND_WRITE_BACK_MARGIN).isEqualTo(Duration.ofSeconds(2));
     }
 
     @Test
     @DisplayName("requireSendBudgetWithin passes at the derived bound and fails one millisecond past it")
     void should_failSendBudgetCheck_when_budgetPlusInFlightSendExceedsGrace() {
-        ReviewInviteProperties atBound = bind(Map.of(PREFIX + ".send-budget", "10s"));
-        ReviewInviteProperties pastBound = bind(Map.of(PREFIX + ".send-budget", "10001ms"));
+        ReviewInviteProperties atBound = bind(Map.of(PREFIX + ".send-budget", "3s"));
+        ReviewInviteProperties pastBound = bind(Map.of(PREFIX + ".send-budget", "3001ms"));
         Duration grace = Duration.ofSeconds(30);
         Duration connect = Duration.ofSeconds(3);
-        Duration slowRead = Duration.ofSeconds(15);
+        Duration slowRead = Duration.ofSeconds(12);
 
-        assertThatCode(() -> atBound.requireSendBudgetWithin(grace, connect, slowRead)).doesNotThrowAnyException();
-        assertThatThrownBy(() -> pastBound.requireSendBudgetWithin(grace, connect, slowRead))
+        Duration telegram = ReviewInviteProperties.TELEGRAM_LEG_WORST_CASE;
+
+        assertThatCode(() -> atBound.requireSendBudgetWithin(grace, connect, slowRead, telegram))
+                .doesNotThrowAnyException();
+        assertThatThrownBy(() -> pastBound.requireSendBudgetWithin(grace, connect, slowRead, telegram))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("send-budget must be <= PT10S");
-    }
-
-    @Test
-    @DisplayName("prod link rule: beautica.app/r/{token} as a whole word passes (also https://); the default passes")
-    void should_acceptProdLink_when_hostIsBeauticaApp() {
-        assertThat(ReviewInviteProperties.linksToProdHost(ReviewInviteProperties.DEFAULT_SMS_TEXT)).isTrue();
-        assertThat(ReviewInviteProperties.linksToProdHost(null)).isTrue();
-        assertThat(ReviewInviteProperties.linksToProdHost("Відгук: https://beautica.app/r/{token}")).isTrue();
-        assertThat(ReviewInviteProperties.linksToProdHost("beautica.app/r/{token}.")).isTrue();
-    }
-
-    @Test
-    @DisplayName("prod link rule: another host, a look-alike host, a host prefix, http or another path all fail")
-    void should_rejectProdLink_when_hostOrPathDiffers() {
-        assertThat(ReviewInviteProperties.linksToProdHost("Відгук: staging.beautica.app/r/{token}")).isFalse();
-        assertThat(ReviewInviteProperties.linksToProdHost("Відгук: evil-beautica.app/r/{token}")).isFalse();
-        assertThat(ReviewInviteProperties.linksToProdHost("Відгук: evil.com/beautica.app/r/{token}")).isFalse();
-        assertThat(ReviewInviteProperties.linksToProdHost("Відгук: http://beautica.app/r/{token}")).isFalse();
-        assertThat(ReviewInviteProperties.linksToProdHost("Відгук: beautica.app/x/{token}")).isFalse();
-        assertThat(ReviewInviteProperties.linksToProdHost("Відгук: beautica.app.evil.com/r/{token}")).isFalse();
-        assertThat(ReviewInviteProperties.linksToProdHost("Відгук: beautica.app/r/{token}x")).isFalse();
+                .hasMessageContaining("send-budget must be <= PT3S");
     }
 
     private static ReviewInviteProperties bind(Map<String, String> values) {

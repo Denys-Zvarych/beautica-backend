@@ -1,5 +1,6 @@
 package com.beautica.booking.event;
 
+import com.beautica.notification.channel.GuestMessageRouters;
 import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
@@ -90,7 +91,7 @@ class GuestReminderDispatcherTest {
         }).when(smsService).send(anyString(), anyString());
 
         try {
-            new GuestReminderDispatcher(smsService, new SyncTaskExecutor(), pool).onGuestRemindersDue(event(3));
+            new GuestReminderDispatcher(GuestMessageRouters.smsOnly(smsService), new SyncTaskExecutor(), pool).onGuestRemindersDue(event(3));
             assertThat(sent.await(10, TimeUnit.SECONDS)).as("all three sends ran").isTrue();
         } finally {
             // Must be in a finally: ThreadPoolTaskExecutor's workers are NON-daemon, so a failing
@@ -128,7 +129,7 @@ class GuestReminderDispatcherTest {
         doThrow(new SmsDeliveryException("provider timeout"))
                 .when(smsService).send(eq("+38050000000"), anyString());
 
-        new GuestReminderDispatcher(smsService, new SyncTaskExecutor(), new SyncTaskExecutor()).onGuestRemindersDue(event(3));
+        new GuestReminderDispatcher(GuestMessageRouters.smsOnly(smsService), new SyncTaskExecutor(), new SyncTaskExecutor()).onGuestRemindersDue(event(3));
 
         verify(smsService).send(eq("+38050000000"), anyString());
         verify(smsService).send(eq("+38050000001"), anyString());
@@ -151,7 +152,7 @@ class GuestReminderDispatcherTest {
             task.run();
         };
 
-        assertThatCode(() -> new GuestReminderDispatcher(smsService, new SyncTaskExecutor(), rejectsTheSecond)
+        assertThatCode(() -> new GuestReminderDispatcher(GuestMessageRouters.smsOnly(smsService), new SyncTaskExecutor(), rejectsTheSecond)
                 .onGuestRemindersDue(event(3))).doesNotThrowAnyException();
 
         verify(smsService).send(eq("+38050000000"), anyString());
@@ -170,7 +171,7 @@ class GuestReminderDispatcherTest {
         doThrow(new SmsDeliveryException("provider rejected +38050000000"))
                 .when(smsService).send(anyString(), anyString());
 
-        new GuestReminderDispatcher(smsService, new SyncTaskExecutor(), new SyncTaskExecutor()).onGuestRemindersDue(event(1));
+        new GuestReminderDispatcher(GuestMessageRouters.smsOnly(smsService), new SyncTaskExecutor(), new SyncTaskExecutor()).onGuestRemindersDue(event(1));
 
         assertThat(logAppender.list)
                 .isNotEmpty()
@@ -215,7 +216,7 @@ class GuestReminderDispatcherTest {
         }).when(smsService).send(anyString(), anyString());
 
         Thread submitter = new Thread(
-                () -> new GuestReminderDispatcher(smsService, new SyncTaskExecutor(), bean).onGuestRemindersDue(event(batch)),
+                () -> new GuestReminderDispatcher(GuestMessageRouters.smsOnly(smsService), new SyncTaskExecutor(), bean).onGuestRemindersDue(event(batch)),
                 "test-publisher");
         try {
             submitter.start();
@@ -280,7 +281,7 @@ class GuestReminderDispatcherTest {
         }).when(smsService).send(anyString(), anyString());
 
         Thread committer = new Thread(
-                () -> new GuestReminderDispatcher(smsService, dispatchPool, sendPool)
+                () -> new GuestReminderDispatcher(GuestMessageRouters.smsOnly(smsService), dispatchPool, sendPool)
                         .onGuestRemindersDue(event(batch)),
                 "test-committer");
         try {
@@ -326,7 +327,7 @@ class GuestReminderDispatcherTest {
             task.run();
         };
 
-        new GuestReminderDispatcher(smsService, countingDispatch, new SyncTaskExecutor())
+        new GuestReminderDispatcher(GuestMessageRouters.smsOnly(smsService), countingDispatch, new SyncTaskExecutor())
                 .onGuestRemindersDue(event(50));
 
         assertThat(handOffs)
@@ -347,7 +348,7 @@ class GuestReminderDispatcherTest {
             throw new TaskRejectedException("dispatch queue full");
         };
 
-        assertThatCode(() -> new GuestReminderDispatcher(smsService, alwaysRejects, new SyncTaskExecutor())
+        assertThatCode(() -> new GuestReminderDispatcher(GuestMessageRouters.smsOnly(smsService), alwaysRejects, new SyncTaskExecutor())
                 .onGuestRemindersDue(event(3)))
                 .as("an escaping throwable fails an already-committed sweep")
                 .doesNotThrowAnyException();
@@ -373,7 +374,7 @@ class GuestReminderDispatcherTest {
         doThrow(new NoClassDefFoundError("okhttp3/internal/Util"))
                 .when(smsService).send(eq("+38050000000"), anyString());
 
-        assertThatCode(() -> new GuestReminderDispatcher(smsService, new SyncTaskExecutor(), new SyncTaskExecutor())
+        assertThatCode(() -> new GuestReminderDispatcher(GuestMessageRouters.smsOnly(smsService), new SyncTaskExecutor(), new SyncTaskExecutor())
                 .onGuestRemindersDue(event(2)))
                 .as("an escaping Error bypasses the log encoder entirely")
                 .doesNotThrowAnyException();
@@ -395,7 +396,7 @@ class GuestReminderDispatcherTest {
                 new IOException("socket read", new InterruptedException("pool shutting down"))))
                 .when(smsService).send(anyString(), anyString());
 
-        new GuestReminderDispatcher(smsService, new SyncTaskExecutor(), new SyncTaskExecutor()).onGuestRemindersDue(event(1));
+        new GuestReminderDispatcher(GuestMessageRouters.smsOnly(smsService), new SyncTaskExecutor(), new SyncTaskExecutor()).onGuestRemindersDue(event(1));
 
         // Thread.interrupted() reads AND clears, so the flag cannot leak into a sibling test.
         assertThat(Thread.interrupted())
@@ -409,7 +410,7 @@ class GuestReminderDispatcherTest {
         doThrow(new SmsDeliveryException("provider timeout"))
                 .when(smsService).send(anyString(), anyString());
 
-        new GuestReminderDispatcher(smsService, new SyncTaskExecutor(), new SyncTaskExecutor()).onGuestRemindersDue(event(1));
+        new GuestReminderDispatcher(GuestMessageRouters.smsOnly(smsService), new SyncTaskExecutor(), new SyncTaskExecutor()).onGuestRemindersDue(event(1));
 
         assertThat(Thread.interrupted())
                 .as("blanket-interrupting on any failure would cancel unrelated work on a shared thread")
@@ -440,7 +441,7 @@ class GuestReminderDispatcherTest {
         AtomicBoolean interruptedAfterwards = new AtomicBoolean();
 
         assertTimeoutPreemptively(Duration.ofSeconds(5), () -> {
-            new GuestReminderDispatcher(smsService, new SyncTaskExecutor(), new SyncTaskExecutor())
+            new GuestReminderDispatcher(GuestMessageRouters.smsOnly(smsService), new SyncTaskExecutor(), new SyncTaskExecutor())
                     .onGuestRemindersDue(event(1));
             // Read-and-clear inside the timed body so the flag cannot leak into a sibling test.
             interruptedAfterwards.set(Thread.interrupted());
@@ -479,7 +480,7 @@ class GuestReminderDispatcherTest {
                 .when(smsService).send(anyString(), anyString());
 
         try {
-            new GuestReminderDispatcher(smsService, new SyncTaskExecutor(), new SyncTaskExecutor())
+            new GuestReminderDispatcher(GuestMessageRouters.smsOnly(smsService), new SyncTaskExecutor(), new SyncTaskExecutor())
                     .onGuestRemindersDue(event(1));
         } finally {
             dispatcherLogger.detachAppender(flagProbe);

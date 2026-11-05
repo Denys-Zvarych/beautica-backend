@@ -1201,4 +1201,127 @@ class AsyncConfigTest {
             assertThat(ranOn.get()).isSameAs(Thread.currentThread());
         }
     }
+
+    /**
+     * Phase 433 — the one-off «booking details» Telegram send after a fresh link ({@code LinkedBookingDetailsSender}).
+     * Pins the production wiring the test profile replaces with a {@code SyncTaskExecutor}: one send at a time, a
+     * small bounded backlog, AbortPolicy (never the scheduler thread), and no shutdown drain (accepted loss).
+     */
+    @Nested
+    @DisplayName("telegramDetailsExecutor bean")
+    class TelegramDetailsExecutor {
+
+        private final ThreadPoolTaskExecutor bean = (ThreadPoolTaskExecutor) asyncConfig.telegramDetailsExecutor();
+        private final ThreadPoolExecutor pool = bean.getThreadPoolExecutor();
+
+        @AfterEach
+        void shutDownPool() {
+            pool.shutdownNow();
+        }
+
+        @Test
+        @DisplayName("telegramDetailsExecutor — exactly one send thread (core equals max), idle thread times out")
+        void should_useOneThreadWithCoreEqualMax_when_telegramDetailsExecutorBuilt() {
+            assertThat(pool.getCorePoolSize())
+                    .as("core below max on a bounded queue never grows until the queue is full")
+                    .isEqualTo(pool.getMaximumPoolSize())
+                    .isEqualTo(AsyncConfig.TELEGRAM_DETAILS_POOL_SIZE)
+                    .isEqualTo(1);
+            assertThat(pool.allowsCoreThreadTimeOut()).as("a rare follow-up must not park a thread").isTrue();
+        }
+
+        @Test
+        @DisplayName("telegramDetailsExecutor — the queue is bounded at 50")
+        void should_boundTheQueueAtFifty_when_telegramDetailsExecutorBuilt() {
+            assertThat(pool.getQueue().remainingCapacity())
+                    .isEqualTo(AsyncConfig.TELEGRAM_DETAILS_QUEUE_CAPACITY)
+                    .isEqualTo(50);
+        }
+
+        @Test
+        @DisplayName("telegramDetailsExecutor — saturation ABORTS; the Telegram send never runs on the scheduler thread")
+        void should_useAbortPolicy_when_telegramDetailsExecutorSaturated() {
+            assertThat(pool.getRejectedExecutionHandler())
+                    .as("§H-2: no caller-runs for notification I/O — the caller is the shared TaskScheduler thread")
+                    .isInstanceOf(ThreadPoolExecutor.AbortPolicy.class)
+                    .isNotInstanceOf(ThreadPoolExecutor.CallerRunsPolicy.class)
+                    .isNotInstanceOf(AsyncConfig.CallerBlocksPolicy.class);
+        }
+
+        @Test
+        @DisplayName("telegramDetailsExecutor — the 52nd hand-off (1 running + 50 queued) is refused, not run inline")
+        void should_rejectHandOff_when_runningSlotAndQueueAreFull() throws InterruptedException {
+            CountDownLatch running = new CountDownLatch(1);
+            CountDownLatch release = new CountDownLatch(1);
+            AtomicReference<Thread> overflowRanOn = new AtomicReference<>();
+            try {
+                bean.execute(() -> {
+                    running.countDown();
+                    awaitQuietly(release);
+                });
+                assertThat(running.await(5, TimeUnit.SECONDS)).as("fixture: worker never started").isTrue();
+                for (int i = 0; i < AsyncConfig.TELEGRAM_DETAILS_QUEUE_CAPACITY; i++) {
+                    bean.execute(() -> { });
+                }
+
+                assertThatThrownBy(() -> bean.execute(() -> overflowRanOn.set(Thread.currentThread())))
+                        .isInstanceOf(org.springframework.core.task.TaskRejectedException.class);
+                assertThat(overflowRanOn.get()).as("a refused hand-off must never run on the caller").isNull();
+            } finally {
+                release.countDown();
+            }
+        }
+
+        @Test
+        @DisplayName("telegramDetailsExecutor — shutdown does not drain: queued details messages are abandoned")
+        void should_abandonQueuedSends_when_shutdownWithoutDrain() throws InterruptedException {
+            CountDownLatch running = new CountDownLatch(1);
+            CountDownLatch release = new CountDownLatch(1);
+            AtomicReference<Boolean> queuedRan = new AtomicReference<>(false);
+            try {
+                bean.execute(() -> {
+                    running.countDown();
+                    awaitQuietly(release);
+                });
+                assertThat(running.await(5, TimeUnit.SECONDS)).as("fixture: worker never started").isTrue();
+                bean.execute(() -> queuedRan.set(true));
+
+                bean.shutdown();
+
+                assertThat(pool.getQueue())
+                        .as("waitForTasksToCompleteOnShutdown=false → shutdownNow empties the queue")
+                        .isEmpty();
+            } finally {
+                release.countDown();
+            }
+            assertThat(pool.awaitTermination(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(queuedRan.get()).as("an abandoned details message is an accepted loss").isFalse();
+        }
+
+        @Test
+        @DisplayName("telegramDetailsExecutor — worker threads use the 'telegram-details-' name prefix")
+        void should_nameWorkerThreadsWithTelegramDetailsPrefix_when_taskSubmitted() throws InterruptedException {
+            assertThat(captureWorkerThreadName(bean)).startsWith("telegram-details-");
+        }
+
+        @Test
+        @DisplayName("telegramDetailsExecutor — test-profile counterpart runs the send inline on the caller thread")
+        void should_runInline_when_testProfileSyncTelegramDetailsExecutorUsed() {
+            TaskExecutor sync = asyncConfig.syncTelegramDetailsExecutor();
+            AtomicReference<Thread> ranOn = new AtomicReference<>();
+
+            sync.execute(() -> ranOn.set(Thread.currentThread()));
+
+            assertThat(sync).isInstanceOf(org.springframework.core.task.SyncTaskExecutor.class);
+            assertThat(ranOn.get()).isSameAs(Thread.currentThread());
+        }
+
+        private static void awaitQuietly(CountDownLatch latch) {
+            try {
+                latch.await(30, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
 }

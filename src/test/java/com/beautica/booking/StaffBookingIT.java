@@ -639,7 +639,9 @@ class StaffBookingIT extends AbstractIntegrationTest {
             Map<String, Object> header = appointmentRow(appointmentId);
             assertThat(header.get("booking_source")).isEqualTo("STAFF");
             assertThat(header.get("status")).isEqualTo("CONFIRMED");
-            assertThat(header.get("cancel_token_hash")).as("no guest self-cancel link for a staff visit").isNull();
+            assertThat((String) header.get("cancel_token_hash"))
+                    .as("phase 412: ONE guest cancel token per walk-in visit, on the header, stored as its hash")
+                    .matches("^[0-9a-f]{64}$");
             assertThat(header.get("created_by_user_id")).isEqualTo(salon.staffUserId());
             assertThat(header.get("salon_id"))
                     .as("the header must carry the booked salon — a salon-less STAFF header is "

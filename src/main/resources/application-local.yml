@@ -105,6 +105,9 @@ app:
   outbox:
     # Local dev only — never use in prod. Generate prod value with: openssl rand -base64 32
     payload-key: ${OUTBOX_PAYLOAD_KEY}
+  guest-cancel-token:
+    # Local dev only (committed on purpose; GuestCancelTokenKeyDevGuard refuses it outside local/test).
+    key: ${GUEST_CANCEL_TOKEN_KEY:XWr8dDi+di4G1u+XHkTbsBdNmx/OGugrJzLpKJ3T4+E=}
   booking:
     sms:
       # Phase 22.7 — restated here, not inherited, so a developer reading only the local profile
@@ -112,6 +115,13 @@ app:
       # logged instead of billed (the OTP goes to Mailpit via beautica.sms.mode=capture above). Hardcoded false with NO env placeholder — unlike the base
       # profile, local must not be flippable by a stray shell export.
       enabled: false
+  telegram:
+    # Phase 404 — local never reaches the Bot API: with APP_TELEGRAM_ENABLED=true messages go to Mailpit
+    # (tg+<chatId>@telegram.local.invalid). Flag itself stays inherited (default false).
+    mode: capture
+    # Phase 406 D9 — fixed dev-only webhook secret so scripts/telegram-fake-update.sh can authenticate against
+    # localhost (the script uses the same default). Not a real secret: local never registers a webhook.
+    webhook-secret: ${TELEGRAM_WEBHOOK_SECRET:local-dev-telegram-webhook-secret-0000}
   booking-links:
     # Phase 375 (D6) — sharing on locally (prod default is false); export
     # BOOKING_LINKS_SHARE_ENABLED=false to exercise the switched-off state.

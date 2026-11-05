@@ -1,5 +1,6 @@
 package com.beautica.service.repository;
 
+import com.beautica.common.repository.TransactionLockTimeout;
 import com.beautica.service.entity.PlatformCategory;
 import jakarta.persistence.LockModeType;
 import org.springframework.data.jpa.repository.JpaRepository;
@@ -11,7 +12,7 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 
-public interface PlatformCategoryRepository extends JpaRepository<PlatformCategory, Long> {
+public interface PlatformCategoryRepository extends JpaRepository<PlatformCategory, Long>, TransactionLockTimeout {
 
     boolean existsByNameIgnoreCase(String name);
 
@@ -62,7 +63,13 @@ public interface PlatformCategoryRepository extends JpaRepository<PlatformCatego
      */
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("select c from PlatformCategory c where c.tokenHash = :tokenHash")
-    Optional<PlatformCategory> findByTokenHashForUpdate(@Param("tokenHash") String tokenHash);
+    Optional<PlatformCategory> findByTokenHashForUpdateNoLockTimeout(@Param("tokenHash") String tokenHash);
+
+    /** {@link #findByTokenHashForUpdateNoLockTimeout} bounded by the transaction-local 3s {@code lock_timeout} ({@link TransactionLockTimeout}). */
+    default Optional<PlatformCategory> findByTokenHashForUpdate(String tokenHash) {
+        applyTransactionLockTimeout();
+        return findByTokenHashForUpdateNoLockTimeout(tokenHash);
+    }
 
     /**
      * Resolves a platform category by its canonical (exact-case) name slug. Used by

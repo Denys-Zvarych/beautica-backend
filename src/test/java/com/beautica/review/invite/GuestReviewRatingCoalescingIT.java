@@ -38,6 +38,7 @@ import static org.mockito.Mockito.verify;
  * ITs' context is impossible. Its tests share that one context, so the extra boot is paid once.
  */
 @TestPropertySource(properties = {
+        "app.frontend.base-url=https://beautica.app",
         "app.booking.sms.enabled=true",
         "app.booking.review-invite.enabled=true",
         "app.booking.review-invite.min-policy-version=2026-10-20"

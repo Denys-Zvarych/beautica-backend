@@ -1,7 +1,12 @@
 package com.beautica.booking.service;
 
+import com.beautica.booking.domain.GuestCancelToken;
 import com.beautica.booking.domain.CancelTokenHasher;
+import com.beautica.booking.domain.GuestPageWindow;
+import com.beautica.booking.domain.GuestSmsServiceName;
+import com.beautica.booking.domain.GuestVisitAddress;
 import com.beautica.booking.dto.CancelTokenInfoResponse;
+import com.beautica.booking.dto.CancelTokenItemResponse;
 import com.beautica.booking.entity.Appointment;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingStatus;
@@ -10,14 +15,12 @@ import com.beautica.booking.repository.BookingRepository;
 import com.beautica.common.TimeZones;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.NotFoundException;
-import com.beautica.common.util.Placeholders;
 import com.beautica.config.BookingSmsProperties;
 import com.beautica.master.entity.Master;
 import com.beautica.notification.inapp.entity.InAppNotificationType;
 import com.beautica.notification.inapp.service.InAppNotificationService;
 import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.service.service.SalonCatalogCacheEvictor;
-import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
@@ -26,16 +29,20 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
 
 import java.time.Clock;
 import java.time.OffsetDateTime;
-import java.time.format.DateTimeFormatter;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 
 /**
  * Public guest-cancellation flow for a multi-service LINK <b>visit</b> (BE-7). One {@code cancel_token}
  * lives on the {@link Appointment} header; following the single cancel link in the confirmation SMS
- * cancels the WHOLE visit — the header AND every chained {@link Booking} item — in lockstep.
+ * cancels every cancellable chained {@link Booking} item, or (phase 436) only the items the guest names. The header
+ * flips to {@code CANCELLED} — and the token is consumed — once no {@code CONFIRMED} item remains.
  *
  * <p><b>Relationship to {@link BookingCancellationService}.</b> That service owns the legacy
  * single-booking guest-cancel path (token on the {@code bookings} row, {@code appointment_id} NULL) and
@@ -44,24 +51,21 @@ import java.util.UUID;
  * the legacy single-booking path. So one public endpoint ({@code POST /api/v1/book/cancel/{token}})
  * transparently serves both shapes.
  *
- * <p><b>One-time consume / concurrency</b> mirrors the single path: the header status-flip + token-null
- * is a single conditional UPDATE ({@link AppointmentRepository#consumeCancelTokenHash}) guarded on the
- * token still being present and {@code CONFIRMED}. Exactly one racer updates 1 header row and proceeds
- * to cancel the items ({@link BookingRepository#cancelItemsByAppointmentId(UUID)}), notify the master
- * once, and — after commit — send ONE cancellation SMS and evict availability caches; every other racer
- * updates 0 rows and is mapped to 404. The master notification is written inside the transaction; the
- * SMS is dispatched only {@code afterCommit} — a rolled-back cancel sends nothing.
+ * <p><b>Concurrency (phase 436).</b> A guest cancel locks the header row first, re-checks the token under the lock,
+ * then cancels the chosen items with one conditional UPDATE whose row count must match the request (else 422 and
+ * rollback); a lost race is 404. The master is notified once per request inside the transaction; the eviction runs
+ * only {@code afterCommit}. The internal {@link #cancelGuestVisit} seam keeps the pre-436 whole-visit consume.
+ *
+ * <p><b>No guest message (phase 435).</b> The guest who cancels their own visit gets NO SMS / Telegram
+ * copy — the old «Ваш запис скасовано» SMS was removed by user decision 2026-11-04 («we have two
+ * cancelled sms»). Only the provider is told.
  */
 @Service
 public class GuestVisitCancellationService {
 
-    private static final DateTimeFormatter DATE_FMT = DateTimeFormatter.ofPattern("dd.MM.yyyy");
-    private static final DateTimeFormatter TIME_FMT = DateTimeFormatter.ofPattern("HH:mm");
-
     private final AppointmentRepository appointmentRepository;
     private final BookingRepository bookingRepository;
     private final NotificationOutboxService outboxService;
-    private final BookingSmsDispatcher bookingSmsDispatcher;
     private final SlotCalculationService slotCalculationService;
     private final BookingSmsProperties smsProperties;
     private final SalonCatalogCacheEvictor salonCatalogCacheEvictor;
@@ -69,83 +73,122 @@ public class GuestVisitCancellationService {
     // Phase 333 — see InAppNotificationService's class javadoc for why this is a separate seam from
     // outboxService, never called from it.
     private final InAppNotificationService inAppNotificationService;
+    private final GuestRebookPaths guestRebookPaths;
 
     public GuestVisitCancellationService(
             AppointmentRepository appointmentRepository,
             BookingRepository bookingRepository,
             NotificationOutboxService outboxService,
-            BookingSmsDispatcher bookingSmsDispatcher,
             SlotCalculationService slotCalculationService,
             BookingSmsProperties smsProperties,
             SalonCatalogCacheEvictor salonCatalogCacheEvictor,
             Clock clock,
-            InAppNotificationService inAppNotificationService) {
+            InAppNotificationService inAppNotificationService,
+            GuestRebookPaths guestRebookPaths) {
         this.appointmentRepository = appointmentRepository;
         this.bookingRepository = bookingRepository;
         this.outboxService = outboxService;
-        this.bookingSmsDispatcher = bookingSmsDispatcher;
         this.slotCalculationService = slotCalculationService;
         this.smsProperties = smsProperties;
         this.salonCatalogCacheEvictor = salonCatalogCacheEvictor;
         this.kyivClock = clock.withZone(TimeZones.KYIV);
         this.inAppNotificationService = inAppNotificationService;
+        this.guestRebookPaths = guestRebookPaths;
     }
 
     /**
-     * Cancel-page summary for a visit token, or {@link Optional#empty()} when the token is not a live
-     * visit token (unknown / consumed / non-CONFIRMED) — the caller then tries the legacy single path.
-     * A present-but-not-yet-cancellable visit still returns its summary with {@code cancellable=false}.
+     * Guest page summary for a visit token, or {@link Optional#empty()} when the token is not a visit token (unknown /
+     * consumed / anonymised) — the caller then tries the legacy single path. A present-but-not-yet-cancellable visit
+     * returns its summary with {@code cancellable=false}; phase 435: so does a visit whose header is no longer
+     * {@code CONFIRMED} (read-only view, {@code status} = the header's).
      */
     @Transactional(readOnly = true)
-    public Optional<CancelTokenInfoResponse> getInfo(UUID token) {
-        List<Booking> items = loadLiveVisitItems(token);
+    public Optional<CancelTokenInfoResponse> getInfo(GuestCancelToken token) {
+        Appointment appointment = findVisitByToken(token);
+        if (appointment == null) {
+            return Optional.empty();
+        }
+        List<Booking> items = bookingRepository.findByAppointmentIdWithGraph(appointment.getId());
         if (items.isEmpty()) {
             return Optional.empty();
         }
-        Booking first = items.get(0);
-        return Optional.of(new CancelTokenInfoResponse(
-                masterName(first.getMaster()),
-                first.getMasterService().getServiceDefinition().getName(),
-                first.getStartsAt(),
-                isCancellable(first.getStartsAt()),
-                first.getStartsAt().minusHours(smsProperties.getCancelWindowHours())));
+        // Phase 435 audit-fix — a terminal visit that started more than terminal-view-days ago: 404, like an unknown
+        // token (thrown here, not Optional.empty(), so the single-booking fallback is not consulted).
+        if (GuestPageWindow.expired(appointment.getStatus(), items.get(0).getStartsAt(),
+                OffsetDateTime.now(kyivClock), smsProperties.getTerminalViewDays())) {
+            throw GuestCancelSelection.tokenNotFound();
+        }
+        return Optional.of(buildInfo(appointment.getStatus(), items, Set.of()));
     }
 
     /**
-     * Cancels the whole visit by its one-time token. Returns {@code true} when the token corresponded to
-     * a visit and was handled (cancelled, or a lost race → 404); {@code false} when the token is not a
-     * visit token at all, so the caller can fall through to the legacy single-booking path.
+     * Cancels the whole visit by its one-time token — every cancellable line (pre-436 behaviour).
      *
-     * @throws BusinessException with 422 when the cancellation window has closed
-     * @throws NotFoundException with 404 on a lost race (header consumed between load and update)
+     * @see #cancel(GuestCancelToken, List)
      */
     @Transactional
-    public boolean cancel(UUID token) {
-        List<Booking> items = loadLiveVisitItems(token);
+    public Optional<CancelTokenInfoResponse> cancel(GuestCancelToken token) {
+        return cancel(token, null);
+    }
+
+    /**
+     * Phase 436 — cancels the named lines of a visit by its token (all cancellable lines when {@code bookingIds} is
+     * {@code null}; an empty list is 400), all or nothing, and returns the page view after the cancel. {@link Optional#empty()} when the token is
+     * not a live visit token, so the caller can fall through to the legacy single-booking path.
+     *
+     * <p><b>Concurrency.</b> The header row is locked first, its token re-checked in the same statement
+     * ({@link AppointmentRepository#lockHeaderIfConfirmedWithToken}, the appointments-before-bookings order), and the
+     * lines are read after it, so
+     * the «does any CONFIRMED line remain» decision is taken on fresh rows that no other header-locking writer can
+     * change. The lines are cancelled by ONE conditional UPDATE whose row count must equal the request size.
+     *
+     * <p><b>Token lifetime.</b> The header (and its token) is consumed only when no CONFIRMED line remains. While a
+     * CONFIRMED line remains the token stays — {@code chk_appointment_guest_fields} requires a token hash on a live
+     * LINK header — so the guest can reopen the page and cancel the rest.
+     *
+     * @throws NotFoundException 404 when an id is not a line of this visit, or on a lost race
+     * @throws BusinessException 422 when a line is no longer cancellable (nothing is cancelled), 400 on bad ids
+     */
+    @Transactional
+    public Optional<CancelTokenInfoResponse> cancel(GuestCancelToken token, List<UUID> bookingIds) {
+        List<UUID> requested = GuestCancelSelection.requestedIds(bookingIds);
+        String tokenHash = CancelTokenHasher.hash(token); // hashed once for the lookup, the lock and the consume
+        Appointment appointment = findVisitByHash(tokenHash);
+        if (appointment == null || appointment.getStatus() != BookingStatus.CONFIRMED) {
+            return Optional.empty(); // not a live visit token — let the caller try the legacy single-booking path
+        }
+        UUID appointmentId = appointment.getId();
+        // Lost race: the header left CONFIRMED, or its token was consumed, before this request took the lock — both
+        // re-checked inside the one locking statement.
+        if (appointmentRepository.lockHeaderIfConfirmedWithToken(appointmentId, tokenHash).isEmpty()) {
+            throw GuestCancelSelection.tokenNotFound();
+        }
+        List<Booking> items = bookingRepository.findByAppointmentIdWithGraph(appointmentId);
         if (items.isEmpty()) {
-            return false; // not a visit token — let the caller try the legacy single-booking path
+            return Optional.empty();
         }
-        Booking first = items.get(0);
-
-        if (!isCancellable(first.getStartsAt())) {
-            throw new BusinessException(
-                    HttpStatus.UNPROCESSABLE_ENTITY,
-                    "Скасування недоступне — менше ніж %d год до запису"
-                            .formatted(smsProperties.getCancelWindowHours()));
+        OffsetDateTime cutoff = cancelCutoff();
+        List<Booking> targets = selectTargets(items, requested, cutoff);
+        Set<UUID> targetIds = targets.stream().map(Booking::getId).collect(Collectors.toCollection(LinkedHashSet::new));
+        if (bookingRepository.cancelGuestVisitItemsByIds(appointmentId, targetIds, cutoff) != targetIds.size()) {
+            throw GuestCancelSelection.windowClosed(smsProperties.getCancelWindowHours()); // rolls the request back
         }
-
-        if (!cancelValidated(first.getAppointment().getId(), CancelTokenHasher.hash(token), items, true)) {
-            throw new NotFoundException("Cancel token not found");
+        boolean confirmedRemain = items.stream()
+                .anyMatch(b -> b.getStatus() == BookingStatus.CONFIRMED && !targetIds.contains(b.getId()));
+        if (!confirmedRemain && appointmentRepository.consumeCancelTokenHash(tokenHash) == 0) {
+            throw GuestCancelSelection.tokenNotFound();
         }
-        return true;
+        notifyProviderOfPartialOrWholeCancel(appointmentId, targets, confirmedRemain);
+        registerAfterCommit(items);
+        return Optional.of(buildInfo(confirmedRemain ? BookingStatus.CONFIRMED : BookingStatus.CANCELLED,
+                items, targetIds));
     }
 
     /**
      * Cancels one already-validated guest/walk-in visit (header + every {@code CONFIRMED} item) and
-     * fires the provider notifications — everything {@link #cancel(UUID)} does after its token lookup
-     * and 2-hour check (phase 373 D12 seam, extracted without behaviour change). Also called by the
-     * internal guest-PII erase, which bypasses the 2-hour window and passes {@code sendGuestSms =
-     * false}.
+     * fires the provider notifications — the pre-436 whole-visit cancel after its token lookup and
+     * 2-hour check (phase 373 D12 seam). Called by the internal guest-PII erase, which bypasses the
+     * 2-hour window. Sends the guest nothing (phase 435).
      *
      * <p>A header with a cancel token is consumed via {@link AppointmentRepository#consumeCancelTokenHash};
      * a tokenless STAFF walk-in header via {@link AppointmentRepository#cancelGuestVisitById}. On 0
@@ -153,15 +196,14 @@ public class GuestVisitCancellationService {
      *
      * @param appointment  the visit header
      * @param items        the visit's graph-fetched items in visit order (non-empty)
-     * @param sendGuestSms whether the after-commit guest SMS is sent; cache eviction runs either way
      * @return {@code true} when this call cancelled the visit, {@code false} on a lost race
      */
     @Transactional(propagation = Propagation.MANDATORY)
-    public boolean cancelGuestVisit(Appointment appointment, List<Booking> items, boolean sendGuestSms) {
-        return cancelValidated(appointment.getId(), appointment.getCancelTokenHash(), items, sendGuestSms);
+    public boolean cancelGuestVisit(Appointment appointment, List<Booking> items) {
+        return cancelValidated(appointment.getId(), appointment.getCancelTokenHash(), items);
     }
 
-    private boolean cancelValidated(UUID appointmentId, String tokenHash, List<Booking> items, boolean sendGuestSms) {
+    private boolean cancelValidated(UUID appointmentId, String tokenHash, List<Booking> items) {
         Booking first = items.get(0);
         // Atomic one-time consume of the header token: only the winner of any concurrent race updates 1
         // row and cancels the items + fires the side-effects; a replay / lost race updates 0 rows → 404.
@@ -177,68 +219,124 @@ public class GuestVisitCancellationService {
         // service), reusing the CLIENT_CANCELLED event the single guest-cancel path uses.
         outboxService.enqueueClientCancelled(first.getId());
         // Phase 333, matrix row 2 — provider set; no actor (guest, no user account). `first` is
-        // already the graph-fetched item loadLiveVisitItems loaded above — never reloaded
-        // (audit-fix cycle 1, finding 1).
+        // the caller's already graph-fetched item — never reloaded (audit-fix cycle 1, finding 1).
         inAppNotificationService.notifyVisitEvent(
                 InAppNotificationType.BOOKING_CANCELLED_BY_CLIENT, appointmentId, first, null);
 
-        registerAfterCommit(items, sendGuestSms);
+        registerAfterCommit(items);
         return true;
     }
 
     // ── internals ──────────────────────────────────────────────────────────────
 
     /**
-     * Loads a visit's ordered, graph-fetched items for a token, or an empty list when the token is not a
-     * live visit token: unknown / already-consumed appointment, a non-CONFIRMED header, or (defensively)
-     * an itemless header. The status guard keeps a consumed/terminal visit indistinguishable from an
-     * unknown token (no state oracle), matching the single path.
+     * The lines one request cancels: every cancellable line when {@code requested} is empty (422 when there is none),
+     * else exactly the named ones — 404 when any id is not a line of this visit, 422 when any is no longer
+     * cancellable. Validation runs over the whole request before anything is written.
      */
-    private List<Booking> loadLiveVisitItems(UUID token) {
-        // V206: only the token's hash is stored — the lookup hashes the incoming token.
-        Appointment appointment = appointmentRepository.findByCancelTokenHash(CancelTokenHasher.hash(token))
-                .orElse(null);
-        if (appointment == null || appointment.getStatus() != BookingStatus.CONFIRMED) {
-            return List.of();
+    private List<Booking> selectTargets(List<Booking> items, List<UUID> requested, OffsetDateTime cutoff) {
+        int windowHours = smsProperties.getCancelWindowHours();
+        if (requested.isEmpty()) {
+            List<Booking> all = items.stream()
+                    .filter(b -> GuestCancelSelection.cancellable(b, b.getStatus(), cutoff))
+                    .toList();
+            if (all.isEmpty()) {
+                throw GuestCancelSelection.windowClosed(windowHours);
+            }
+            return all;
         }
-        return bookingRepository.findByAppointmentIdWithGraph(appointment.getId());
-    }
-
-    private boolean isCancellable(OffsetDateTime visitStart) {
-        OffsetDateTime now = OffsetDateTime.now(kyivClock);
-        return visitStart.isAfter(now.plusHours(smsProperties.getCancelWindowHours()));
+        Map<UUID, Booking> byId = items.stream().collect(Collectors.toMap(Booking::getId, Function.identity()));
+        if (!byId.keySet().containsAll(requested)) {
+            throw GuestCancelSelection.tokenNotFound();
+        }
+        for (UUID id : requested) {
+            Booking line = byId.get(id);
+            if (!GuestCancelSelection.cancellable(line, line.getStatus(), cutoff)) {
+                throw GuestCancelSelection.notCancellable(line, windowHours);
+            }
+        }
+        // Visit order (startsAt), not request order — the first target is the notifications' lead.
+        return items.stream().filter(b -> requested.contains(b.getId())).toList();
     }
 
     /**
-     * After-commit side-effects for a whole-visit cancel: ONE cancellation SMS (first item's service +
-     * time) plus availability-cache eviction fanned out over every item — reusing the exact
+     * ONE provider e-mail and ONE in-app event per request (locked decision 2026-11-05). The e-mail row carries the
+     * request's booking ids so it lists exactly the services cancelled here. The in-app row of a request that leaves
+     * the visit live is keyed by its first cancelled line, so a later request on the same visit is not de-duplicated
+     * away; the request that ends the visit keeps the pre-436 visit key. No note is read or written.
+     */
+    private void notifyProviderOfPartialOrWholeCancel(UUID appointmentId, List<Booking> targets,
+                                                     boolean visitStaysLive) {
+        Booking lead = targets.get(0);
+        outboxService.enqueueClientCancelled(lead.getId(), targets.stream().map(Booking::getId).toList());
+        if (visitStaysLive) {
+            inAppNotificationService.notifyVisitEvent(
+                    InAppNotificationType.BOOKING_CANCELLED_BY_CLIENT, appointmentId, lead, null, lead.getId());
+        } else {
+            inAppNotificationService.notifyVisitEvent(
+                    InAppNotificationType.BOOKING_CANCELLED_BY_CLIENT, appointmentId, lead, null);
+        }
+    }
+
+    /**
+     * The page view: header fields from the first line (visit start), one {@code items} entry per line with
+     * {@code cancelledNow} shown as CANCELLED (a bulk UPDATE does not refresh the loaded entities).
+     */
+    private CancelTokenInfoResponse buildInfo(BookingStatus headerStatus, List<Booking> items, Set<UUID> cancelledNow) {
+        OffsetDateTime cutoff = cancelCutoff();
+        boolean live = headerStatus == BookingStatus.CONFIRMED;
+        List<CancelTokenItemResponse> lines = items.stream()
+                .map(b -> GuestCancelSelection.item(b, GuestSmsServiceName.of(b),
+                        cancelledNow.contains(b.getId()) ? BookingStatus.CANCELLED : b.getStatus(), live, cutoff))
+                .toList();
+        Booking first = items.get(0);
+        return new CancelTokenInfoResponse(
+                masterName(first.getMaster()),
+                GuestSmsServiceName.of(first),
+                first.getStartsAt(),
+                lines.stream().anyMatch(CancelTokenItemResponse::cancellable),
+                first.getStartsAt().minusHours(smsProperties.getCancelWindowHours()),
+                headerStatus,
+                guestRebookPaths.forBooking(first).orElse(null),
+                salonName(first),
+                GuestVisitAddress.of(first),
+                GuestVisitAddress.pageLocationNote(first),
+                lines);
+    }
+
+    /** The visit header holding this token's hash, any status; {@code null} when none. */
+    private Appointment findVisitByToken(GuestCancelToken token) {
+        // V206: only the token's hash is stored — the lookup hashes the incoming token.
+        return findVisitByHash(CancelTokenHasher.hash(token));
+    }
+
+    private Appointment findVisitByHash(String tokenHash) {
+        return appointmentRepository.findByCancelTokenHash(tokenHash).orElse(null);
+    }
+
+    private OffsetDateTime cancelCutoff() {
+        return OffsetDateTime.now(kyivClock).plusHours(smsProperties.getCancelWindowHours());
+    }
+
+    /**
+     * After-commit side-effects for a whole-visit cancel: availability-cache eviction (no guest SMS,
+     * phase 435) fanned out over every item — reusing the exact
      * single-service booking-write eviction hooks so a parallel reader cannot repopulate stale data
      * mid-write. Distinct (Kyiv-civil date, masterServiceId) keys are collected across all items (both
      * start and end day, in the rare event a service spans midnight); the per-master free-slot verdict
      * and the salon catalogue are each evicted once.
      */
-    private void registerAfterCommit(List<Booking> items, boolean sendGuestSms) {
+    private void registerAfterCommit(List<Booking> items) {
         Booking first = items.get(0);
-        Master master = first.getMaster();
-        UUID masterId = master.getId();
+        UUID masterId = first.getMaster().getId();
         UUID salonId = first.getSalon() != null ? first.getSalon().getId() : null;
-        // Phase 373: an erase request captures neither the phone nor the text for after-commit use.
-        String phone = sendGuestSms ? first.getGuestPhone() : null;
-        String smsText = sendGuestSms ? buildCancellationSms(first) : null;
 
         Runnable task = () -> {
-            // EVICTION FIRST, DISPATCH SECOND — see BookingCancellationService#registerAfterCommitSms
-            // for why this order is load-bearing and why it was reversed (perf LOW, 2026-08-19).
-            //
             // Cancelling FREES the master's time, which widens the slots offered for every service
             // this master performs on those dates — swept by master prefix, not per (date, service).
             slotCalculationService.evictMasterAvailabilityCaches(masterId);
             if (salonId != null) {
                 salonCatalogCacheEvictor.evictCatalogOnly(salonId);
-            }
-            if (sendGuestSms) {
-                bookingSmsDispatcher.dispatch(
-                        BookingSmsDispatcher.Kind.GUEST_VISIT_CANCELLATION, phone, smsText);
             }
         };
         if (TransactionSynchronizationManager.isSynchronizationActive()) {
@@ -253,26 +351,9 @@ public class GuestVisitCancellationService {
         }
     }
 
-    /**
-     * Renders the guest visit-cancellation SMS in ONE pass over the template — see
-     * {@link Placeholders#format}.
-     *
-     * <p>Chained {@link String#replace} was a template-injection vector here: {@code {serviceName}}
-     * was substituted BEFORE {@code {date}} and {@code {time}}, so each later {@code replace}
-     * re-scanned the service name it had just written in. A provider who named a service
-     * {@code "Манікюр {date}"} therefore got a second, fabricated date/time line expanded inside a
-     * message the guest reads as platform copy — SMS is a guest's only channel. This template
-     * carries no {@code {cancelUrl}}, so there is no link to duplicate, but the layout-steering
-     * vector is the same. A single pass copies substituted values out verbatim, so data can never
-     * become markup.
-     */
-    private String buildCancellationSms(Booking first) {
-        OffsetDateTime kyiv = first.getStartsAt().atZoneSameInstant(TimeZones.KYIV).toOffsetDateTime();
-        return Placeholders.format(smsProperties.getSms().getCancellation(), Map.of(
-                "serviceName", first.getMasterService().getServiceDefinition().getName(),
-                "masterName", masterName(first.getMaster()),
-                "date", DATE_FMT.format(kyiv),
-                "time", TIME_FMT.format(kyiv)));
+    /** Phase 435 — the salon's name for a salon booking; {@code null} for an independent master. */
+    private static String salonName(Booking booking) {
+        return booking.getSalon() == null ? null : booking.getSalon().getName();
     }
 
     // V157 / phase 294 D3: displayFirstName()/displayLastName(), never getUser().getFirstName().

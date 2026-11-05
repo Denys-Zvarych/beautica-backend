@@ -1,7 +1,9 @@
 package com.beautica.booking.event;
 
 import com.beautica.booking.event.GuestRemindersDueEvent.GuestReminderSms;
-import com.beautica.notification.sms.SmsService;
+import com.beautica.booking.event.GuestRemindersDueEvent.ReminderType;
+import com.beautica.notification.channel.GuestMessageKind;
+import com.beautica.notification.channel.GuestMessageRouter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Qualifier;
@@ -84,15 +86,19 @@ public class GuestReminderDispatcher {
      */
     private static final int MAX_CAUSE_CHAIN_DEPTH = 16;
 
-    private final SmsService smsService;
+    private final GuestMessageRouter guestMessageRouter;
     private final TaskExecutor smsReminderDispatchExecutor;
     private final TaskExecutor smsReminderExecutor;
 
+    /**
+     * @param guestMessageRouter phase 408 — Telegram when the guest's phone is linked, SMS otherwise; with
+     *                           {@code app.telegram.enabled=false} it is the exact pre-408 {@code SmsService#send}
+     */
     public GuestReminderDispatcher(
-            SmsService smsService,
+            GuestMessageRouter guestMessageRouter,
             @Qualifier("smsReminderDispatchExecutor") TaskExecutor smsReminderDispatchExecutor,
             @Qualifier("smsReminderExecutor") TaskExecutor smsReminderExecutor) {
-        this.smsService = smsService;
+        this.guestMessageRouter = guestMessageRouter;
         this.smsReminderDispatchExecutor = smsReminderDispatchExecutor;
         this.smsReminderExecutor = smsReminderExecutor;
     }
@@ -123,9 +129,10 @@ public class GuestReminderDispatcher {
      */
     private void fanOut(GuestRemindersDueEvent event) {
         int rejected = 0;
+        GuestMessageKind kind = kindOf(event.type());
         for (GuestReminderSms reminder : event.reminders()) {
             try {
-                smsReminderExecutor.execute(() -> sendSafely(reminder));
+                smsReminderExecutor.execute(() -> sendSafely(kind, reminder));
             } catch (RejectedExecutionException e) {
                 // Residual path only — CallerBlocksPolicy parks on a full queue instead of rejecting,
                 // so this fires only when the pool is shutting down or this thread was interrupted
@@ -165,9 +172,9 @@ public class GuestReminderDispatcher {
      * interruptible I/O would not — and this is the one log line that explains why the worker is stopping,
      * so its survival must be a property of this method rather than of the configured appender.
      */
-    private void sendSafely(GuestReminderSms reminder) {
+    private void sendSafely(GuestMessageKind kind, GuestReminderSms reminder) {
         try {
-            smsService.send(reminder.phoneE164(), reminder.text());
+            guestMessageRouter.deliver(kind, reminder.phoneE164(), reminder.text());
         } catch (Throwable t) {
             boolean interrupted = containsInterrupted(t);
             log.warn("Guest reminder SMS failed: {}", t.getClass().getSimpleName());
@@ -199,5 +206,13 @@ public class GuestReminderDispatcher {
             cause = cause.getCause();
         }
         return false;
+    }
+
+    /** Phase 408 D1 — the router kind per reminder sweep. */
+    private static GuestMessageKind kindOf(ReminderType type) {
+        return switch (type) {
+            case H24 -> GuestMessageKind.GUEST_REMINDER_24H;
+            case H2 -> GuestMessageKind.GUEST_REMINDER_2H;
+        };
     }
 }

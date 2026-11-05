@@ -284,10 +284,29 @@ class V139AppointmentsStaffSourceMigrationTest extends AbstractIntegrationTest {
 
     // ── chk_appointment_guest_fields — STAFF branch rejects ────────────────────
 
+    /**
+     * Reversed by phase 412 (V226): a LIVE walk-in (guest phone present) may now carry the guest cancel token; a
+     * STAFF header still never carries one without a phone (the registered-client mode below).
+     */
     @Test
-    @DisplayName("a STAFF header with a cancel_token (staff visits have no guest cancel link)")
-    void should_rejectStaffHeader_when_cancelTokenPresent() {
-        assertStaffRowRejected(null, "Олена", "Коваль", "+380501234567", UUID.randomUUID());
+    @DisplayName("V226: a STAFF walk-in header with a phone MAY carry a cancel_token (phase 412)")
+    void should_acceptStaffHeader_when_walkInWithPhoneCarriesCancelToken() {
+        BookingMigrationFixtures.Ids ids = BookingMigrationFixtures.seedBookingGraph(jdbcTemplate);
+        UUID id = UUID.randomUUID();
+
+        jdbcTemplate.update(INSERT_WITH_IDENTITY, id, null, "STAFF", "Олена", "Коваль", "+380501234567",
+                UUID.randomUUID(), ids.staffUserId());
+
+        assertThat(jdbcTemplate.queryForObject("SELECT cancel_token_hash FROM appointments WHERE id = ?", String.class, id))
+                .as("stored as its hash only (V206 trigger)").matches("^[0-9a-f]{64}$");
+    }
+
+    @Test
+    @DisplayName("V226: a STAFF header with no guest phone (registered client) and a cancel_token")
+    void should_rejectStaffHeader_when_cancelTokenWithoutPhone() {
+        BookingMigrationFixtures.Ids ids = BookingMigrationFixtures.seedBookingGraph(jdbcTemplate);
+
+        assertStaffRowRejected(ids.clientId(), null, null, null, UUID.randomUUID());
     }
 
     @Test

@@ -1,10 +1,12 @@
 package com.beautica.booking.controller;
 
+import com.beautica.booking.domain.GuestCancelToken;
 import com.beautica.booking.dto.AvailableSlotResponse;
 import com.beautica.booking.dto.BookingSlugInfoResponse;
 import com.beautica.booking.dto.CancelTokenInfoResponse;
 import com.beautica.booking.dto.GuestBookingRequest;
 import com.beautica.booking.dto.GuestBookingResponse;
+import com.beautica.booking.dto.GuestCancelRequest;
 import com.beautica.booking.dto.SalonBookingSlugInfoResponse;
 import com.beautica.common.PageResponse;
 import com.beautica.master.dto.MasterWorkingDayResponse;
@@ -24,6 +26,7 @@ import jakarta.validation.constraints.NotEmpty;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Size;
+import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.media.Content;
 import io.swagger.v3.oas.annotations.responses.ApiResponse;
 import io.swagger.v3.oas.annotations.responses.ApiResponses;
@@ -263,26 +266,41 @@ public class PublicBookingController {
     }
 
     /**
-     * Cancel-page info for a one-time cancel token (Phase 13.4). 404 when the token is
-     * unknown, already consumed, or the booking is no longer {@code CONFIRMED} — no
-     * information is leaked about which condition held. {@code token} is a
-     * {@link UUID} {@code @PathVariable}: Spring's converter returns 400 on a malformed
-     * value before this method runs, so no manual format validation is needed.
+     * Guest booking page info for a cancel token (Phase 13.4). Phase 435: a booking that is
+     * no longer {@code CONFIRMED} returns a read-only view ({@code status}, {@code cancellable=false})
+     * instead of 404; 404 remains for an unknown, guest-consumed or anonymised token. {@code token} is a
+     * {@link GuestCancelToken} {@code @PathVariable} (16 base62 chars, or a legacy UUID): Spring converts it through
+     * {@link GuestCancelToken#valueOf}, so a malformed value is a 400 before this method runs, as for the former
+     * {@code UUID} variable.
      */
     @GetMapping("/cancel/{token}")
-    public ResponseEntity<CancelTokenInfoResponse> cancelInfo(@PathVariable UUID token) {
+    public ResponseEntity<CancelTokenInfoResponse> cancelInfo(@PathVariable GuestCancelToken token) {
         return ResponseEntity.ok(bookingCancellationService.getInfo(token));
     }
 
     /**
-     * Cancels a guest booking by its one-time token (Phase 13.4) → 204 No Content. A
-     * replayed POST (token already consumed) returns 404; a request inside the
-     * cancellation window returns 422. The service consumes the token atomically so
-     * concurrent POSTs trigger exactly one cancellation side-effect.
+     * Cancels by the guest's one-time token (Phase 13.4) → 200 with the page view after the cancel (phase 436; was
+     * 204). The OPTIONAL body {@code {"bookingIds": [...]}} names the service lines to cancel; no body or {@code {}}
+     * cancels every cancellable line, an empty {@code bookingIds} is 400. All or nothing: an id that is not a line of the token's booking /
+     * visit → 404, a line no longer cancellable (inside the window or not CONFIRMED) → 422, more than 10 or duplicate
+     * ids → 400. A replayed POST (token consumed) → 404. No note is accepted.
      */
+    @Operation(summary = "Cancel a guest booking or some of a visit's services by the SMS cancel token")
+    @ApiResponses({
+            @ApiResponse(responseCode = "200", description = "Cancelled; the page view after the cancel"),
+            @ApiResponse(responseCode = "400", description = "Malformed token, empty, more than 10 or duplicate bookingIds",
+                    content = @Content()),
+            @ApiResponse(responseCode = "404", description = "Unknown / consumed token, or a bookingId not in it",
+                    content = @Content()),
+            @ApiResponse(responseCode = "422", description = "A chosen service can no longer be cancelled",
+                    content = @Content())
+    })
     @PostMapping("/cancel/{token}")
-    public ResponseEntity<Void> cancel(@PathVariable UUID token) {
-        bookingCancellationService.cancel(token);
-        return ResponseEntity.noContent().build();
+    public ResponseEntity<CancelTokenInfoResponse> cancel(
+            @PathVariable GuestCancelToken token,
+            @Valid @RequestBody(required = false) GuestCancelRequest request) {
+        // null (no body / no bookingIds key) = cancel all; an explicit [] is rejected with 400 by the service.
+        List<UUID> bookingIds = request == null ? null : request.bookingIds();
+        return ResponseEntity.ok(bookingCancellationService.cancel(token, bookingIds));
     }
 }

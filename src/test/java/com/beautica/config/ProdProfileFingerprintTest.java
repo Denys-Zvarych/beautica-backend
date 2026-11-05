@@ -1,11 +1,17 @@
 package com.beautica.config;
 
+import com.beautica.review.invite.config.ReviewInviteProperties;
 import com.beautica.support.TestSecrets;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.boot.context.properties.bind.Binder;
 import org.springframework.boot.test.context.ConfigDataApplicationContextInitializer;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
+import org.springframework.core.env.MapPropertySource;
+
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
@@ -162,7 +168,7 @@ class ProdProfileFingerprintTest {
 
     // ---- Phase 367 D5: each new required variable, removed alone from a passing prod set, fails boot on its own rule ----
 
-    private static final java.util.Map<String, String> PROD_REQUIRED = java.util.Map.of(
+    private static final Map<String, String> PROD_REQUIRED = Map.of(
             "SENTRY_DSN", "https://0123456789abcdef@o42.ingest.de.sentry.io/4500000000000001",
             "TURBOSMS_TOKEN", "turbosms-fixture-token",
             "ADMIN_EMAIL", "admin@beautica.ua",
@@ -261,34 +267,87 @@ class ProdProfileFingerprintTest {
     }
 
     @Test
-    @DisplayName("Phase 400 — prod with the committed review-invite SMS text (beautica.app/r/{token}) passes the link rule")
-    void should_passReviewInviteLinkRule_when_prodUsesDefaultSmsText() {
+    @DisplayName("2026-11-05 — prod with review invites disabled skips the link rule (FRONTEND_BASE_URL may be any https origin)")
+    void should_skipReviewInviteLinkRule_when_prodInvitesDisabled() {
         prodRunnerWithout("").run(ctx -> {
-            assertThat(ctx.getEnvironment().getProperty("app.booking.review-invite.sms-text"))
-                    .contains("beautica.app/r/{token}");
+            assertThat(ctx.getEnvironment().getProperty("app.frontend.base-url")).isEqualTo("https://app.beautica.ua");
             assertThatCode(() -> EnvironmentFingerprintGuard.verify(ctx.getEnvironment())).doesNotThrowAnyException();
         });
     }
 
     @Test
-    @DisplayName("Phase 400 — prod with an SMS text override linking another host fails on prod-review-invite-sms-link")
-    void should_failGuard_when_prodReviewInviteSmsLinksOtherHost() {
-        String override = "Відгук: staging.beautica.app/r/{token}";
-        prodRunnerWithout("").withPropertyValues("APP_BOOKING_REVIEW_INVITE_SMS_TEXT=" + override)
+    @DisplayName("2026-11-05 — prod with review invites enabled and FRONTEND_BASE_URL=https://beautica.app passes the link rule")
+    void should_passReviewInviteLinkRule_when_prodInvitesEnabledOnProdOrigin() {
+        prodRunnerWithout("").withPropertyValues("APP_BOOKING_REVIEW_INVITE_ENABLED=true",
+                        "FRONTEND_BASE_URL=" + ReviewInviteProperties.PROD_ORIGIN)
+                .run(ctx -> assertThatCode(() -> EnvironmentFingerprintGuard.verify(ctx.getEnvironment()))
+                        .doesNotThrowAnyException());
+    }
+
+    @Test
+    @DisplayName("audit cycle 4 — a whitespace-padded prod FRONTEND_BASE_URL passes the link rule (stripped); only frontend-base-url-shape fires")
+    void should_passReviewInviteLinkRule_when_prodOriginHasTrailingWhitespace() {
+        // TestPropertyValues trims values, so the padded origin goes in through a raw, highest-precedence source.
+        prodRunnerWithout("").withPropertyValues("APP_BOOKING_REVIEW_INVITE_ENABLED=true")
+                .withInitializer(ctx -> ctx.getEnvironment().getPropertySources().addFirst(
+                        new MapPropertySource("padded-frontend-origin",
+                                Map.of("FRONTEND_BASE_URL", ReviewInviteProperties.PROD_ORIGIN + " "))))
+                .run(ctx -> {
+                    assertThat(ctx.getEnvironment().getProperty("app.frontend.base-url"))
+                            .isEqualTo(ReviewInviteProperties.PROD_ORIGIN + " ");
+                    assertThatThrownBy(() -> EnvironmentFingerprintGuard.verify(ctx.getEnvironment()))
+                            .hasMessageContaining("rule frontend-base-url-shape")
+                            .message().doesNotContain("rule prod-review-invite-sms-link");
+                });
+    }
+
+    @Test
+    @DisplayName("2026-11-05 — prod with review invites enabled and another FRONTEND_BASE_URL fails on prod-review-invite-sms-link, value never printed")
+    void should_failGuard_when_prodInvitesEnabledOnOtherOrigin() {
+        prodRunnerWithout("").withPropertyValues("APP_BOOKING_REVIEW_INVITE_ENABLED=true",
+                        "FRONTEND_BASE_URL=https://staging.beautica.app")
                 .run(ctx -> assertThatThrownBy(() -> EnvironmentFingerprintGuard.verify(ctx.getEnvironment()))
                         .hasMessageContaining("rule prod-review-invite-sms-link")
                         .message().doesNotContain("staging.beautica.app"));
     }
 
+    @ParameterizedTest(name = "APP_BOOKING_REVIEW_INVITE_ENABLED={0}")
+    @ValueSource(strings = {"1", "on", "yes", "TRUE"})
+    @DisplayName("2026-11-05 — every truthy spelling Spring binds as enabled triggers prod-review-invite-sms-link on a non-prod origin")
+    void should_failGuard_when_prodInvitesEnabledBySpringTruthySpelling(String enabled) {
+        prodRunnerWithout("").withPropertyValues("APP_BOOKING_REVIEW_INVITE_ENABLED=" + enabled)
+                .run(ctx -> assertThatThrownBy(() -> EnvironmentFingerprintGuard.verify(ctx.getEnvironment()))
+                        .hasMessageContaining("rule prod-review-invite-sms-link"));
+    }
+
+    @ParameterizedTest(name = "APP_BOOKING_REVIEW_INVITE_ENABLED={0}")
+    @ValueSource(strings = {"false", "0", "off", "no"})
+    @DisplayName("2026-11-05 — invites bound as disabled skip prod-review-invite-sms-link on a non-prod origin")
+    void should_skipReviewInviteLinkRule_when_prodInvitesDisabledBySpringFalsySpelling(String enabled) {
+        prodRunnerWithout("").withPropertyValues("APP_BOOKING_REVIEW_INVITE_ENABLED=" + enabled)
+                .run(ctx -> assertThatCode(() -> EnvironmentFingerprintGuard.verify(ctx.getEnvironment()))
+                        .doesNotThrowAnyException());
+    }
+
+    @ParameterizedTest(name = "FRONTEND_BASE_URL={0}")
+    @ValueSource(strings = {"https://beautica.app/", "http://beautica.app", "https://beautica.app.evil.com",
+            "https://www.beautica.app"})
+    @DisplayName("2026-11-05 — near-miss origins of https://beautica.app fail prod-review-invite-sms-link when invites are enabled")
+    void should_failGuard_when_prodInvitesEnabledOnNearMissOrigin(String origin) {
+        prodRunnerWithout("").withPropertyValues("APP_BOOKING_REVIEW_INVITE_ENABLED=true", "FRONTEND_BASE_URL=" + origin)
+                .run(ctx -> assertThatThrownBy(() -> EnvironmentFingerprintGuard.verify(ctx.getEnvironment()))
+                        .hasMessageContaining("rule prod-review-invite-sms-link"));
+    }
+
     @Test
-    @DisplayName("Phase 400 — prod,staging (STAGING) may point the review-invite link at a non-prod host")
+    @DisplayName("Phase 400 — prod,staging (STAGING) with review invites enabled may link to a non-prod origin")
     void should_skipReviewInviteLinkRule_when_stagingOverlay() {
         new ApplicationContextRunner()
                 .withInitializer(new ConfigDataApplicationContextInitializer())
                 .withPropertyValues("spring.profiles.active=prod,staging", "JWT_SECRET=x",
                         "INTERNAL_API_KEY=" + TestSecrets.INTERNAL_API_KEY, "FRONTEND_BASE_URL=https://x.invalid",
                         "PUBLIC_BASE_URL=https://api.staging.beautica.test", "SUPPORT_EMAIL=support@test.invalid",
-                        "APP_BOOKING_REVIEW_INVITE_SMS_TEXT=Відгук: staging.beautica.app/r/{token}")
+                        "APP_BOOKING_REVIEW_INVITE_ENABLED=true")
                 .run(ctx -> assertThatCode(() -> EnvironmentFingerprintGuard.verify(ctx.getEnvironment()))
                         .doesNotThrowAnyException());
     }
@@ -312,6 +371,32 @@ class ProdProfileFingerprintTest {
                     .as(override)
                     .hasMessageContaining("rule prod-turnstile-action"));
         }
+    }
+
+    @ParameterizedTest(name = "app.turnstile.enabled={0}")
+    @ValueSource(strings = {"1", "on", "yes", "TRUE"})
+    @DisplayName("2026-11-05 — every truthy spelling Spring binds as enabled satisfies prod-turnstile-disabled")
+    void should_passGuard_when_prodTurnstileEnabledBySpringTruthySpelling(String enabled) {
+        prodRunnerWithout("").withPropertyValues("app.turnstile.enabled=" + enabled)
+                .run(ctx -> assertThatCode(() -> EnvironmentFingerprintGuard.verify(ctx.getEnvironment()))
+                        .doesNotThrowAnyException());
+    }
+
+    @ParameterizedTest(name = "app.turnstile.enabled={0}")
+    @ValueSource(strings = {"0", "off", "no"})
+    @DisplayName("2026-11-05 — every falsy spelling Spring binds as disabled fails prod-turnstile-disabled")
+    void should_failGuard_when_prodTurnstileDisabledBySpringFalsySpelling(String enabled) {
+        prodRunnerWithout("").withPropertyValues("app.turnstile.enabled=" + enabled)
+                .run(ctx -> assertThatThrownBy(() -> EnvironmentFingerprintGuard.verify(ctx.getEnvironment()))
+                        .hasMessageContaining("rule prod-turnstile-disabled"));
+    }
+
+    @Test
+    @DisplayName("audit cycle 3 — an unbindable app.turnstile.enabled=maybe fails closed on prod-turnstile-disabled")
+    void should_failGuard_when_prodTurnstileFlagMalformed() {
+        prodRunnerWithout("").withPropertyValues("app.turnstile.enabled=maybe")
+                .run(ctx -> assertThatThrownBy(() -> EnvironmentFingerprintGuard.verify(ctx.getEnvironment()))
+                        .hasMessageContaining("rule prod-turnstile-disabled"));
     }
 
     @Test

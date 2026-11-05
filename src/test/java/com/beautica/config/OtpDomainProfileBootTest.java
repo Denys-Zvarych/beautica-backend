@@ -84,11 +84,11 @@ class OtpDomainProfileBootTest {
     }
 
     @Test
-    @DisplayName("prod,staging — OTP_SMS_DOMAIN=stg.beautica.app overrides prod's beautica.app")
+    @DisplayName("prod,staging — OTP_SMS_DOMAIN=s.beautica.app overrides prod's beautica.app")
     void should_bindStagingHost_when_stagingOtpSmsDomainValid() {
-        runner("prod,staging", Map.of("OTP_SMS_DOMAIN", "stg.beautica.app")).run(ctx -> {
+        runner("prod,staging", Map.of("OTP_SMS_DOMAIN", "s.beautica.app")).run(ctx -> {
             assertThat(ctx).hasNotFailed();
-            assertThat(ctx.getBean(DeploymentProperties.class).sms().otpDomainHost()).contains("stg.beautica.app");
+            assertThat(ctx.getBean(DeploymentProperties.class).sms().otpDomainHost()).contains("s.beautica.app");
         });
     }
 

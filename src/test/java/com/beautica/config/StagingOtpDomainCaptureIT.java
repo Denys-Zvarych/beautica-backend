@@ -42,10 +42,10 @@ import static org.mockito.Mockito.when;
 @DisplayName("prod,staging + OTP_SMS_DOMAIN — captured guest OTP SMS carries the origin-bound last line (Phase 389 QA)")
 class StagingOtpDomainCaptureIT extends AbstractStagingProfileIT {
 
-    static final String STAGING_HOST = "stg.beautica.app";
+    static final String STAGING_HOST = "s.beautica.app";
 
     private static final Pattern BODY = Pattern.compile(
-            "Код Beautica: (\\d{6})\\. Нікому не кажіть\\.\n\n@" + Pattern.quote(STAGING_HOST) + " #(\\d{6})");
+            "Beautica: Ваш код (\\d{6})\\. Нікому не кажіть\\.\n\n@" + Pattern.quote(STAGING_HOST) + " #(\\d{6})");
 
     @Autowired
     private TestRestTemplate restTemplate;
@@ -86,7 +86,7 @@ class StagingOtpDomainCaptureIT extends AbstractStagingProfileIT {
     }
 
     @Test
-    @DisplayName("captured OTP body is exactly the two-paragraph template, final line `@stg.beautica.app #code`, same code twice")
+    @DisplayName("captured OTP body is exactly the two-paragraph template, final line `@s.beautica.app #code`, same code twice")
     void should_captureExactDomainBoundBody_when_otpSmsDomainSetViaStagingPlaceholder() throws Exception {
         String phone = randomPhone();
 
@@ -101,11 +101,12 @@ class StagingOtpDomainCaptureIT extends AbstractStagingProfileIT {
         assertThat(body.substring(body.lastIndexOf('\n') + 1))
                 .as("WebOTP / Apple domain-bound codes need `@host #code` as the FINAL line")
                 .isEqualTo("@" + STAGING_HOST + " #" + m.group(1));
-        assertThat(body.length()).as("one UCS-2 segment").isEqualTo(50 + STAGING_HOST.length()).isLessThanOrEqualTo(70);
+        assertThat(body.length()).as("one UCS-2 segment").isEqualTo(54 + STAGING_HOST.length()).isLessThanOrEqualTo(70);
         assertThat(mail.getRecipients(Message.RecipientType.TO)[0].toString())
                 .isEqualTo("sms" + phone + "@sms.staging.invalid");
-        assertThat(mail.getSubject()).as("subject is the flattened first line, never the raw CR/LF text")
-                .startsWith("[SMS] Код Beautica: " + m.group(1) + ". Нікому не кажіть.")
+        // Phase 435: the 43-char first line is now longer than the capture's 40-char subject cap.
+        assertThat(mail.getSubject()).as("subject is the flattened first line cut at 40 chars, never the raw CR/LF text")
+                .isEqualTo("[SMS] " + ("Beautica: Ваш код " + m.group(1) + ". Нікому не кажіть.").substring(0, 40))
                 .doesNotContain("\n");
         assertThat(turbosmsStub().getAllServeEvents()).as("no call reached Turbosms").isEmpty();
     }

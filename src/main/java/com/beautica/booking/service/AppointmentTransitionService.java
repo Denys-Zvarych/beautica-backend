@@ -867,10 +867,11 @@ public class AppointmentTransitionService {
     /**
      * Phase 400 D1 — announces that a booking of a guest (LINK) visit reached COMPLETED. Published inside the
      * completing transaction; the {@code AFTER_COMMIT} consumer ({@code ReviewInviteScheduler}) sees nothing for a
-     * rolled-back completion. APP / STAFF visits publish nothing — they never get a review-invite SMS.
+     * rolled-back completion. Phase 434 — a STAFF (walk-in) visit publishes too; the consumer keeps only walk-ins
+     * with no account ({@code VisitSnapshot#isReviewInviteVisit}). APP visits publish nothing.
      */
     private void publishGuestVisitCompleted(UUID appointmentId, BookingSource source) {
-        if (source == BookingSource.LINK) {
+        if (source == BookingSource.LINK || source == BookingSource.STAFF) {
             eventPublisher.publishEvent(new GuestVisitCompletedEvent(appointmentId, clock.instant()));
         }
     }

@@ -1,5 +1,6 @@
 package com.beautica.booking.retention;
 
+import com.beautica.notification.telegram.link.TelegramLinkRetentionService;
 import com.beautica.review.invite.service.GuestReviewRetentionService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -20,7 +21,10 @@ import java.time.ZoneOffset;
  * ({@link GuestReviewRetentionService#purgeInvites}, same batch size and per-run budget): {@code SKIPPED} /
  * {@code FAILED} 30 days after creation (can be earlier than their terminal moment), {@code SENT}-past-expiry /
  * {@code EXPIRED} / {@code CONSUMED} 30 days after expiry / consume. The purge runs even
- * when the anonymisation throws, and a purge failure is logged, never thrown over it. Absent when {@code app.guest-pii-retention.enabled=false} (test profile).
+ * when the anonymisation throws, and a purge failure is logged, never thrown over it. Phase 409 D2: the same
+ * {@code finally} purges {@code BLOCKED} Telegram links {@value TelegramLinkRetentionService#BLOCKED_RETENTION_MONTHS}
+ * months after the block (a fixed period, not {@code retention-months}), equally logged-not-thrown.
+ * {@code EnvironmentFingerprintGuard} refuses {@code enabled=false} on staging/prod. Absent when {@code app.guest-pii-retention.enabled=false} (test profile).
  */
 @Slf4j
 @Component
@@ -30,15 +34,18 @@ public class GuestPiiRetentionJob {
 
     private final GuestPiiAnonymisationService anonymisationService;
     private final GuestReviewRetentionService guestReviewRetentionService;
+    private final TelegramLinkRetentionService telegramLinkRetentionService;
     private final GuestPiiRetentionProperties properties;
     private final Clock clock;
 
     public GuestPiiRetentionJob(GuestPiiAnonymisationService anonymisationService,
                                 GuestReviewRetentionService guestReviewRetentionService,
+                                TelegramLinkRetentionService telegramLinkRetentionService,
                                 GuestPiiRetentionProperties properties,
                                 Clock clock) {
         this.anonymisationService = anonymisationService;
         this.guestReviewRetentionService = guestReviewRetentionService;
+        this.telegramLinkRetentionService = telegramLinkRetentionService;
         this.properties = properties;
         this.clock = clock;
     }
@@ -48,7 +55,20 @@ public class GuestPiiRetentionJob {
         try {
             anonymisationService.anonymiseDue(cutoff());
         } finally {
+            // Both swallow their own failures, so neither can skip the other or mask an anonymisation failure.
             purgeInvites();
+            purgeBlockedTelegramLinks();
+        }
+    }
+
+    /** Phase 409 D2 — logged, never thrown (same reason as {@link #purgeInvites}); counts only. */
+    private void purgeBlockedTelegramLinks() {
+        try {
+            int deleted = telegramLinkRetentionService.purgeBlockedLinks(
+                    clock.instant(), properties.batchSize(), properties.maxBatchesPerRun());
+            log.info("Blocked Telegram link purge: deleted {} links", deleted);
+        } catch (RuntimeException e) {
+            log.error("Blocked Telegram link purge failed: {}", e.getClass().getSimpleName());
         }
     }
 

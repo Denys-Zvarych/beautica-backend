@@ -1,5 +1,6 @@
 package com.beautica.booking.entity;
 
+import com.beautica.booking.domain.GuestCancelToken;
 import com.beautica.TestConstants;
 import com.beautica.booking.enums.BookingSource;
 import com.beautica.booking.enums.BookingStatus;
@@ -42,6 +43,20 @@ class AppointmentStaffFactoryTest {
         assertThat(appointment.getGuestSurname()).isEqualTo("Коваль");
         assertThat(appointment.getGuestPhone()).isEqualTo("+380501234567");
         assertThat(appointment.getCreatedByUserId()).isEqualTo(STAFF_ID);
+    }
+
+    @Test
+    @DisplayName("phase 412 — should keep the raw token in memory and persist only its hash when a cancel token is given")
+    void should_hashCancelToken_when_staffHeaderBuiltWithToken() {
+        UUID token = UUID.fromString("22222222-2222-2222-2222-222222222222");
+
+        Appointment appointment = Appointment.staffAppointment(
+                null, "Олена", "Коваль", "+380501234567", GuestCancelToken.of(token), STAFF_ID);
+
+        assertThat(appointment.getCancelToken()).isEqualTo(GuestCancelToken.of(token));
+        assertThat(appointment.getCancelTokenHash())
+                .isEqualTo(com.beautica.booking.domain.CancelTokenHasher.hash(token));
+        assertThat(appointment.getBookingSource()).isEqualTo(BookingSource.STAFF);
     }
 
     @Test

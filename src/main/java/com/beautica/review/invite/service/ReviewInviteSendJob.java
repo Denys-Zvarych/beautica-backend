@@ -1,7 +1,8 @@
 package com.beautica.review.invite.service;
 
 import com.beautica.notification.sms.SmsDeliveryAmbiguousException;
-import com.beautica.notification.sms.SmsService;
+import com.beautica.notification.channel.GuestMessageKind;
+import com.beautica.notification.channel.GuestMessageRouter;
 import com.beautica.review.invite.config.ReviewInviteProperties;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -25,7 +26,8 @@ import java.util.UUID;
  *       UNKNOWN outcome ({@link SmsDeliveryAmbiguousException}: read timeout after the request was written) goes
  *       through {@link ReviewInviteSendService#recordAmbiguousSend} — {@code FAILED}, never retried, because the SMS
  *       may already have been delivered;</li>
- *   <li>the send loop runs within {@code app.booking.review-invite.send-budget} (20 s, below the 30 s scheduler
+ *   <li>the send loop runs within {@code app.booking.review-invite.send-budget} (10 s, capped at
+ *       {@link ReviewInviteProperties#MAX_SEND_BUDGET}, below the 30 s scheduler
  *       shutdown grace): when it runs out, the claimed rows not yet attempted are handed back through
  *       {@link ReviewInviteSendService#releaseUnsent} ({@code SCHEDULED}, token voided) for the next tick.</li>
  * </ol>
@@ -40,18 +42,18 @@ public class ReviewInviteSendJob {
 
     private final ReviewInviteSendService sendService;
     private final QuietHoursCalculator quietHours;
-    private final SmsService smsService;
+    private final GuestMessageRouter guestMessageRouter;
     private final ReviewInviteProperties properties;
     private final Clock clock;
 
     public ReviewInviteSendJob(ReviewInviteSendService sendService,
                                QuietHoursCalculator quietHours,
-                               SmsService smsService,
+                               GuestMessageRouter guestMessageRouter,
                                ReviewInviteProperties properties,
                                Clock clock) {
         this.sendService = sendService;
         this.quietHours = quietHours;
-        this.smsService = smsService;
+        this.guestMessageRouter = guestMessageRouter;
         this.properties = properties;
         this.clock = clock;
     }
@@ -96,7 +98,8 @@ public class ReviewInviteSendJob {
 
     private void send(PreparedInviteSms sms) {
         try {
-            smsService.send(sms.phoneE164(), sms.text());
+            // Phase 408 — Telegram when the guest's phone is linked, else SMS; SMS failures propagate as before.
+            guestMessageRouter.deliver(GuestMessageKind.GUEST_REVIEW_INVITE, sms.phoneE164(), sms.text());
             log.info("Review invite SMS sent: invite={}", sms.inviteId());
         } catch (SmsDeliveryAmbiguousException e) {
             log.warn("Review invite SMS outcome unknown, not retried: invite={} cause={}",

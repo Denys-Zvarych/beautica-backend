@@ -1,5 +1,12 @@
 package com.beautica.booking.service;
 
+import com.beautica.notification.channel.GuestMessageKind;
+import com.beautica.notification.channel.GuestMessageRouter;
+import com.beautica.notification.channel.GuestMessageRouters;
+import com.beautica.notification.telegram.TelegramDeliveryException;
+import com.beautica.notification.telegram.TelegramMessenger;
+import com.beautica.notification.telegram.link.ActiveLink;
+import com.beautica.notification.telegram.link.TelegramLinkService;
 import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
@@ -12,6 +19,13 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
+import com.tngtech.archunit.core.domain.JavaClass;
+import com.tngtech.archunit.core.domain.JavaClasses;
+import com.tngtech.archunit.core.importer.ClassFileImporter;
+import com.tngtech.archunit.core.importer.ImportOption;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.slf4j.LoggerFactory;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
@@ -21,6 +35,8 @@ import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
+import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -30,20 +46,22 @@ import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.noClasses;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.when;
 
 /**
  * {@link BookingSmsDispatcher} — the hand-off that keeps the Turbosms round trip off the request
  * thread (backend-perf MEDIUM, 2026-08-18; widened from the walk-in path to all four request-path
  * senders, backend-perf LOW, 2026-08-19).
  *
- * <p>{@link BookingSmsDispatcher.Kind} is deliberately NOT parameterised across the rows below.
- * The kind is a log label and nothing else — it selects no branch, changes no path, and reaches no
- * message body — so a {@code @ParameterizedTest} over four constants would multiply the run time
- * while asserting the same single code path four times. The one row where the kind is observable is
- * the drop log, and that row asserts it explicitly.
+ * <p>{@link BookingSmsDispatcher.Kind} is parameterised only across the routing rows (linked → Telegram,
+ * not linked → SMS, Telegram failure → SMS): since the 2026-11-04 user decision every kind goes through
+ * {@code GuestMessageRouter}, and those rows prove no kind bypasses it. The hand-off rows below run one
+ * kind — the executor path does not depend on it.
  *
  * <p>The pool's own configuration is asserted in {@code AsyncConfigTest}; what is asserted here is
  * the contract the CALLER depends on, and every row below is about a way this class could silently
@@ -69,6 +87,7 @@ class BookingSmsDispatcherTest {
             BookingSmsDispatcher.Kind.GUEST_PROVIDER_CANCELLATION;
     private static final String PHONE = "+380501234567";
     private static final String TEXT = "Beautica: Запис підтверджено!";
+    private static final long CHAT_ID = 42L;
 
     @Mock private SmsService smsService;
 
@@ -93,7 +112,7 @@ class BookingSmsDispatcherTest {
     @DisplayName("should_submitTheSendToTheExecutor_when_dispatched")
     void should_submitTheSendToTheExecutor_when_dispatched() {
         RecordingExecutor executor = new RecordingExecutor();
-        BookingSmsDispatcher dispatcher = new BookingSmsDispatcher(smsService, executor);
+        BookingSmsDispatcher dispatcher = new BookingSmsDispatcher(GuestMessageRouters.smsOnly(smsService), executor);
 
         dispatcher.dispatch(KIND, PHONE, TEXT);
 
@@ -106,11 +125,108 @@ class BookingSmsDispatcherTest {
         verify(smsService).send(eq(PHONE), eq(TEXT));
     }
 
+    /**
+     * User decision 2026-11-04 — every kind (confirmations included) goes through {@code GuestMessageRouter}: with
+     * Telegram ON and the phone ACTIVE-linked the message reaches Telegram only, as the identical text, and no SMS
+     * leaves. Mutation: restoring a direct {@code smsService.send} for any kind turns its row red.
+     */
+    @ParameterizedTest(name = "{0}")
+    @EnumSource(BookingSmsDispatcher.Kind.class)
+    @DisplayName("should_sendToTelegramOnly_when_phoneIsLinked")
+    void should_sendToTelegramOnly_when_phoneIsLinked(BookingSmsDispatcher.Kind kind) {
+        TelegramMessenger messenger = mock(TelegramMessenger.class);
+        TelegramLinkService links = mock(TelegramLinkService.class);
+        when(links.findActiveForPhone(PHONE)).thenReturn(Optional.of(new ActiveLink(UUID.randomUUID(), CHAT_ID)));
+        BookingSmsDispatcher dispatcher = new BookingSmsDispatcher(linkedRouter(messenger, links),
+                new SyncTaskExecutor());
+
+        dispatcher.dispatch(kind, PHONE, TEXT);
+
+        verify(messenger).sendWaiting(CHAT_ID, TEXT);
+        verifyNoInteractions(smsService);
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @EnumSource(BookingSmsDispatcher.Kind.class)
+    @DisplayName("should_sendSmsOnly_when_phoneIsNotLinked")
+    void should_sendSmsOnly_when_phoneIsNotLinked(BookingSmsDispatcher.Kind kind) {
+        TelegramMessenger messenger = mock(TelegramMessenger.class);
+        TelegramLinkService links = mock(TelegramLinkService.class);
+        when(links.findActiveForPhone(PHONE)).thenReturn(Optional.empty());
+        BookingSmsDispatcher dispatcher = new BookingSmsDispatcher(linkedRouter(messenger, links),
+                new SyncTaskExecutor());
+
+        dispatcher.dispatch(kind, PHONE, TEXT);
+
+        verify(smsService).send(PHONE, TEXT);
+        verifyNoInteractions(messenger);
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @EnumSource(BookingSmsDispatcher.Kind.class)
+    @DisplayName("should_fallBackToSms_when_telegramSendFails")
+    void should_fallBackToSms_when_telegramSendFails(BookingSmsDispatcher.Kind kind) {
+        TelegramMessenger messenger = mock(TelegramMessenger.class);
+        TelegramLinkService links = mock(TelegramLinkService.class);
+        when(links.findActiveForPhone(PHONE)).thenReturn(Optional.of(new ActiveLink(UUID.randomUUID(), CHAT_ID)));
+        doThrow(new TelegramDeliveryException("bot api 500")).when(messenger).sendWaiting(CHAT_ID, TEXT);
+        BookingSmsDispatcher dispatcher = new BookingSmsDispatcher(linkedRouter(messenger, links),
+                new SyncTaskExecutor());
+
+        dispatcher.dispatch(kind, PHONE, TEXT);
+
+        verify(messenger).sendWaiting(CHAT_ID, TEXT);
+        verify(smsService).send(PHONE, TEXT);
+    }
+
+    /** The routed kind keeps the dispatcher's log token, so metrics and booking-SMS log lines name the same message. */
+    @ParameterizedTest(name = "{0}")
+    @EnumSource(BookingSmsDispatcher.Kind.class)
+    @DisplayName("should_routeAsTheSameNamedGuestMessageKind_when_anyKindDispatched")
+    void should_routeAsTheSameNamedGuestMessageKind_when_anyKindDispatched(BookingSmsDispatcher.Kind kind) {
+        GuestMessageRouter router = mock(GuestMessageRouter.class);
+        BookingSmsDispatcher dispatcher = new BookingSmsDispatcher(router, new SyncTaskExecutor());
+
+        dispatcher.dispatch(kind, PHONE, TEXT);
+
+        verify(router).deliver(GuestMessageKind.valueOf(kind.name()), PHONE, TEXT);
+        assertThat(GuestMessageKind.valueOf(kind.name()).token()).isEqualTo(kind.token());
+    }
+
+    /**
+     * The one exception to "every guest notification via the router": the guest phone-OTP stays SMS. Structural, so a
+     * future refactor cannot route it by accident — the OTP sender's package never reaches the router or this
+     * dispatcher, and neither of them ever holds the OTP sender.
+     */
+    @Test
+    @DisplayName("should_keepOtpOffTheRouter_when_scanningProductionClasses")
+    void should_keepOtpOffTheRouter_when_scanningProductionClasses() {
+        JavaClasses production = new ClassFileImporter()
+                .withImportOption(ImportOption.Predefined.DO_NOT_INCLUDE_TESTS)
+                .importPackages("com.beautica.auth.phoneotp", "com.beautica.booking.service",
+                        "com.beautica.notification.channel");
+        assertThat(production.stream().map(JavaClass::getSimpleName))
+                .contains("PhoneOtpService", "BookingSmsDispatcher", "GuestMessageRouter");
+
+        noClasses().that().resideInAPackage("com.beautica.auth.phoneotp..")
+                .should().dependOnClassesThat().haveSimpleName("GuestMessageRouter")
+                .orShould().dependOnClassesThat().haveSimpleName("BookingSmsDispatcher")
+                .check(production);
+        noClasses().that().haveSimpleName("GuestMessageRouter").or().haveSimpleName("BookingSmsDispatcher")
+                .should().dependOnClassesThat().haveSimpleName("OtpSmsSender")
+                .check(production);
+    }
+
+    private GuestMessageRouter linkedRouter(TelegramMessenger messenger, TelegramLinkService links) {
+        return new GuestMessageRouter(smsService, messenger, links, GuestMessageRouters.telegramProperties(true),
+                GuestMessageRouters.bookingSms(true), new SimpleMeterRegistry());
+    }
+
     @Test
     @DisplayName("should_swallowTheFailure_when_theProviderThrows")
     void should_swallowTheFailure_when_theProviderThrows() {
         doThrow(new SmsDeliveryException("provider down")).when(smsService).send(anyString(), anyString());
-        BookingSmsDispatcher dispatcher = new BookingSmsDispatcher(smsService, new SyncTaskExecutor());
+        BookingSmsDispatcher dispatcher = new BookingSmsDispatcher(GuestMessageRouters.smsOnly(smsService), new SyncTaskExecutor());
 
         // Synchronous executor, so the failure would surface at the call site if it escaped at all —
         // and the call site is an afterCommit callback on an already-committed booking.
@@ -125,7 +241,7 @@ class BookingSmsDispatcherTest {
         TaskExecutor saturated = task -> {
             throw new RejectedExecutionException("smsSendExecutor is full");
         };
-        BookingSmsDispatcher dispatcher = new BookingSmsDispatcher(smsService, saturated);
+        BookingSmsDispatcher dispatcher = new BookingSmsDispatcher(GuestMessageRouters.smsOnly(smsService), saturated);
 
         assertThatCode(() -> dispatcher.dispatch(KIND, PHONE, TEXT)).doesNotThrowAnyException();
 
@@ -152,7 +268,7 @@ class BookingSmsDispatcherTest {
         TaskExecutor saturated = task -> {
             throw new RejectedExecutionException("smsSendExecutor is full");
         };
-        new BookingSmsDispatcher(smsService, saturated).dispatch(KIND, PHONE, TEXT);
+        new BookingSmsDispatcher(GuestMessageRouters.smsOnly(smsService), saturated).dispatch(KIND, PHONE, TEXT);
 
         assertThat(appender.list)
                 .as("a dropped confirmation must be reported at ERROR under a stable alert token")
@@ -175,7 +291,7 @@ class BookingSmsDispatcherTest {
         TaskExecutor saturated = task -> {
             throw new RejectedExecutionException("smsSendExecutor is full");
         };
-        BookingSmsDispatcher dispatcher = new BookingSmsDispatcher(smsService, saturated);
+        BookingSmsDispatcher dispatcher = new BookingSmsDispatcher(GuestMessageRouters.smsOnly(smsService), saturated);
 
         // The outbox drain needs the rejection to re-queue the row; swallowing it would mark it SENT.
         assertThatThrownBy(() -> dispatcher.dispatchOrThrow(GUEST_KIND, PHONE, TEXT))
@@ -196,7 +312,7 @@ class BookingSmsDispatcherTest {
     void should_submitAndSwallowProviderFailure_when_dispatchOrThrowAccepted() {
         doThrow(new SmsDeliveryException("provider down")).when(smsService).send(anyString(), anyString());
         RecordingExecutor executor = new RecordingExecutor();
-        BookingSmsDispatcher dispatcher = new BookingSmsDispatcher(smsService, executor);
+        BookingSmsDispatcher dispatcher = new BookingSmsDispatcher(GuestMessageRouters.smsOnly(smsService), executor);
 
         dispatcher.dispatchOrThrow(GUEST_KIND, PHONE, TEXT);
 
@@ -214,7 +330,7 @@ class BookingSmsDispatcherTest {
         CountDownLatch release = new CountDownLatch(1);
         ThreadPoolTaskExecutor pool = blockedPool(release, BookingSmsDispatcher.OUTBOX_QUEUE_RESERVE - 1);
         try {
-            BookingSmsDispatcher dispatcher = new BookingSmsDispatcher(smsService, pool);
+            BookingSmsDispatcher dispatcher = new BookingSmsDispatcher(GuestMessageRouters.smsOnly(smsService), pool);
 
             assertThatThrownBy(() -> dispatcher.dispatchOrThrow(GUEST_KIND, PHONE, TEXT))
                     .isInstanceOf(SmsBackpressureException.class);
@@ -235,7 +351,7 @@ class BookingSmsDispatcherTest {
         CountDownLatch release = new CountDownLatch(1);
         ThreadPoolTaskExecutor pool = blockedPool(release, BookingSmsDispatcher.OUTBOX_QUEUE_RESERVE);
         try {
-            BookingSmsDispatcher dispatcher = new BookingSmsDispatcher(smsService, pool);
+            BookingSmsDispatcher dispatcher = new BookingSmsDispatcher(GuestMessageRouters.smsOnly(smsService), pool);
 
             dispatcher.dispatchOrThrow(GUEST_KIND, PHONE, TEXT);
 
@@ -254,7 +370,7 @@ class BookingSmsDispatcherTest {
         // One free slot left: deep inside the reserve, still above zero.
         ThreadPoolTaskExecutor pool = blockedPool(release, 1);
         try {
-            BookingSmsDispatcher dispatcher = new BookingSmsDispatcher(smsService, pool);
+            BookingSmsDispatcher dispatcher = new BookingSmsDispatcher(GuestMessageRouters.smsOnly(smsService), pool);
 
             dispatcher.dispatch(KIND, PHONE, TEXT);
 

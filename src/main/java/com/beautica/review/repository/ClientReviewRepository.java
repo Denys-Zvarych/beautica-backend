@@ -1,5 +1,6 @@
 package com.beautica.review.repository;
 
+import com.beautica.common.repository.TransactionLockTimeout;
 import com.beautica.review.entity.ClientReview;
 import jakarta.persistence.LockModeType;
 import org.springframework.data.jpa.repository.JpaRepository;
@@ -19,12 +20,18 @@ import java.util.UUID;
  * ({@link #countBySubjectClientIdGroupByRating}) count only {@code moderation_status = 'VISIBLE'} rows; the
  * existence probes stay unfiltered (a removed review still occupies its booking).
  */
-public interface ClientReviewRepository extends JpaRepository<ClientReview, UUID> {
+public interface ClientReviewRepository extends JpaRepository<ClientReview, UUID>, TransactionLockTimeout {
 
     /** Phase 396 — the row locked {@code FOR UPDATE} for a moderation transition. */
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("SELECT cr FROM ClientReview cr WHERE cr.id = :id")
-    Optional<ClientReview> findByIdForUpdate(@Param("id") UUID id);
+    Optional<ClientReview> findByIdForUpdateNoLockTimeout(@Param("id") UUID id);
+
+    /** {@link #findByIdForUpdateNoLockTimeout} bounded by the transaction-local 3s {@code lock_timeout} ({@link TransactionLockTimeout}). */
+    default Optional<ClientReview> findByIdForUpdate(UUID id) {
+        applyTransactionLockTimeout();
+        return findByIdForUpdateNoLockTimeout(id);
+    }
 
     // Duplicate-review guard (Phase 27.5) — cheaper than findByBookingId(...).isPresent(),
     // mirrors ReviewRepository#existsByBookingId.

@@ -271,4 +271,29 @@ class PiiRedactorTest {
         assertThat(PiiRedactor.redact("xeyJab.cd.ef")).isEqualTo("xeyJab.cd.ef");
         assertThat(PiiRedactor.redact("t=eyJab.cd.ef")).isEqualTo("t=" + PiiRedactor.JWT);
     }
+
+    @Test
+    @DisplayName("16-char guest cancel token — masked after /c/ and /book/cancel/, a bare 16-char word untouched")
+    void should_maskShortCancelToken_inFreeTextAndCPath() {
+        String token = "aB3dE5fG7hJ9kL1m";
+        String word = "configurationKey";
+
+        String freeText = PiiRedactor.redact("link https://beautica.app/c/" + token + " failed");
+        String apiFreeText = PiiRedactor.redact("POST /api/v1/book/cancel/" + token + " -> 404");
+        String apiPath = PiiRedactor.redactPath("/api/v1/book/cancel/" + token);
+        String cPath = PiiRedactor.redactPath("/c/" + token);
+        String telegramPath = PiiRedactor.redactPath("/api/v1/book/telegram/link-token");
+        String unrelated = PiiRedactor.redact("missing " + word + " in /api/v1/" + word);
+        String unrelatedPath = PiiRedactor.redactPath("/api/v1/" + word);
+
+        assertThat(token).hasSize(16);
+        assertThat(word).hasSize(16);
+        assertThat(freeText).isEqualTo("link https://beautica.app/c/" + PiiRedactor.TOKEN + " failed");
+        assertThat(apiFreeText).isEqualTo("POST /api/v1/book/cancel/" + PiiRedactor.TOKEN + " -> 404");
+        assertThat(apiPath).isEqualTo("/api/v1/book/cancel/" + PiiRedactor.TOKEN);
+        assertThat(cPath).isEqualTo("/c/" + PiiRedactor.TOKEN);
+        assertThat(telegramPath).isEqualTo("/api/v1/book/telegram/link-token");
+        assertThat(unrelated).isEqualTo("missing " + word + " in /api/v1/" + word);
+        assertThat(unrelatedPath).isEqualTo("/api/v1/" + word);
+    }
 }

@@ -44,6 +44,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <p>Same {@code @TestPropertySource} as {@code GuestReviewSubmitIT}, so the Spring context is shared.
  */
 @TestPropertySource(properties = {
+        "app.frontend.base-url=https://beautica.app",
         "app.booking.sms.enabled=true",
         "app.booking.review-invite.enabled=true",
         "app.booking.review-invite.min-policy-version=2026-10-20"

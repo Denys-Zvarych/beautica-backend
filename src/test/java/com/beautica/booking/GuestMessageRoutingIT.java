@@ -1,0 +1,868 @@
+package com.beautica.booking;
+
+import com.beautica.booking.dto.AppointmentProviderNoteRequest;
+import com.beautica.booking.dto.StatusUpdateRequest;
+import com.beautica.booking.enums.CancellationReason;
+import com.beautica.booking.job.BookingReminderJob;
+import com.beautica.booking.service.BookingService;
+import com.beautica.booking.service.BookingSmsDispatcher;
+import com.beautica.common.TimeZones;
+import com.beautica.common.security.PhoneHasher;
+import com.beautica.notification.service.NotificationOutboxDrainWorker;
+import com.beautica.notification.telegram.StagingTelegramChatAllowList;
+import com.beautica.notification.telegram.TelegramChatAllowList;
+import com.beautica.notification.telegram.link.TelegramLinkRepository;
+import com.beautica.notification.telegram.link.TelegramLinkTestSupport;
+import com.beautica.notification.telegram.webhook.TelegramWebhookTestSupport;
+import com.beautica.support.MutableTestClock;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.github.tomakehurst.wiremock.WireMockServer;
+import com.github.tomakehurst.wiremock.verification.LoggedRequest;
+import org.awaitility.Awaitility;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.TestConfiguration;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Import;
+import org.springframework.http.HttpEntity;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.test.context.TestPropertySource;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
+
+import java.time.Duration;
+import java.time.Instant;
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
+import java.util.List;
+import java.util.UUID;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+
+import static com.beautica.booking.GuestMessageExpectedCopy.CANCEL_LINK_SUFFIX_REGEX;
+import static com.beautica.booking.GuestMessageExpectedCopy.CONFIRMATION_HEADLINE;
+import static com.beautica.booking.GuestMessageExpectedCopy.PROVIDER_CANCELLATION_BODY_REGEX;
+import static com.beautica.booking.GuestMessageExpectedCopy.reschedule;
+import static com.beautica.booking.GuestMessageExpectedCopy.rescheduleWithDetails;
+import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
+import static com.github.tomakehurst.wiremock.client.WireMock.post;
+import static com.github.tomakehurst.wiremock.client.WireMock.postRequestedFor;
+import static com.github.tomakehurst.wiremock.client.WireMock.urlEqualTo;
+import static com.github.tomakehurst.wiremock.core.WireMockConfiguration.options;
+import static org.assertj.core.api.Assertions.assertThat;
+
+/**
+ * Phase 408 — the guest-message channel router end to end: real outbox drain, real reminder job (24h + the 413 2h
+ * sweep), real {@code TelegramBotApiClient} against a WireMock Bot API behind the staging allow-list, and the real
+ * gated Turbosms {@code SmsService} against WireMock. Every assertion reads the two provider wires, so "Telegram
+ * only" / "exactly one SMS" are claims about what would actually be delivered.
+ *
+ * <p>The clock is pinned to 12:00 Kyiv (daytime) so the 2h sweep's night rule never fires; every booking is
+ * written relative to it. Nothing here goes through an authenticated HTTP call (JJWT validates against the system
+ * clock), so declines run through {@link BookingService} directly, as the outbox sees them.
+ */
+@TestPropertySource(properties = {
+        "app.booking.sms.enabled=true",
+        "app.booking.reminder-2h.enabled=true",
+        "app.telegram.enabled=true",
+        "app.telegram.mode=live",
+        "app.telegram.bot-username=" + TelegramLinkTestSupport.BOT_USERNAME,
+        "app.telegram.webhook-secret=" + GuestMessageRoutingIT.WEBHOOK_SECRET,
+        "app.telegram.bot-token=" + GuestMessageRoutingIT.BOT_TOKEN})
+@Import({GuestMessageRoutingIT.ClockConfig.class, GuestMessageRoutingIT.AllowListConfig.class})
+@DisplayName("GuestMessageRoutingIT — phase 408 Telegram-when-linked, SMS otherwise")
+class GuestMessageRoutingIT extends AbstractWalkInBookingSmsIT {
+
+    /** Obviously fake, built (not literal) so secret scanners do not fire. */
+    static final String BOT_TOKEN = "123456789:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+    static final String WEBHOOK_SECRET = "it-routing-secret-0123456789abcdef0123456789abcdef";
+    private static final String GONE_BODY =
+            "{\"ok\":false,\"error_code\":403,\"description\":\"Forbidden: bot was blocked by the user\"}";
+    /** A second chat the same phone is re-linked to (phase 408 markBlocked chat-match race). */
+    private static final long RELINKED_CHAT = 7_300_000_002L;
+    private static final String SEND_PATH = "/bot" + BOT_TOKEN + "/sendMessage";
+    private static final String OK_BODY = "{\"ok\":true,\"result\":{\"message_id\":1}}";
+
+    private static final long ALLOWED_CHAT = 7_300_000_001L;
+    private static final long STRANGER_CHAT = 7_399_999_999L;
+    private static final String STRANGER_PHONE = "+380503334455";
+    /**
+     * Each test starts one minute after the previous one ended (never earlier): the live client's send gate refills
+     * from this clock, so a clock that never moves, or moves back, would rate-limit the sixth send of the class.
+     * Stays within Kyiv daytime from the 12:00 base.
+     */
+    private Instant now;
+    /** 12:00 Kyiv on the REAL Kyiv date (the base class seeds the schedule from the real date). */
+    private static final Instant BASE = java.time.LocalDate.now(TimeZones.KYIV).atTime(12, 0)
+            .atZone(TimeZones.KYIV).toInstant();
+    private static final DateTimeFormatter TIME_FMT = DateTimeFormatter.ofPattern("HH:mm");
+
+    static final WireMockServer TELEGRAM = new WireMockServer(options().dynamicPort());
+
+    static {
+        TELEGRAM.start();
+        Runtime.getRuntime().addShutdownHook(new Thread(TELEGRAM::stop));
+    }
+
+    @DynamicPropertySource
+    static void telegramEndpoint(DynamicPropertyRegistry registry) {
+        registry.add("app.telegram.api-base-url", () -> "http://localhost:" + TELEGRAM.port());
+    }
+
+    /** Starts at {@link #BASE}, so the base class's schedule seeding (which runs first) sees today's date. */
+    @TestConfiguration
+    static class ClockConfig {
+        @Bean
+        MutableTestClock systemClock() {
+            return new MutableTestClock(BASE);
+        }
+    }
+
+    /** Phase 432 staging allow-list in front of the live client: only {@link #ALLOWED_CHAT} may be messaged. */
+    @TestConfiguration
+    static class AllowListConfig {
+        @Bean
+        TelegramChatAllowList telegramChatAllowList() {
+            return new StagingTelegramChatAllowList(List.of(ALLOWED_CHAT));
+        }
+    }
+
+    @Autowired private BookingReminderJob reminderJob;
+    @Autowired private NotificationOutboxDrainWorker drainWorker;
+    @Autowired private BookingService bookingService;
+    @Autowired private com.beautica.booking.service.GuestRescheduleSmsBudget smsBudget;
+    @Autowired private com.beautica.booking.service.AppointmentTransitionService appointmentTransitionService;
+    @Autowired private BookingSmsDispatcher bookingSmsDispatcher;
+    @Autowired private TelegramLinkRepository linkRepository;
+    @Autowired private PhoneHasher phoneHasher;
+    @Autowired private PlatformTransactionManager transactionManager;
+    @Autowired private MutableTestClock clock;
+    @Autowired private com.beautica.notification.telegram.link.TelegramLinkService linkService;
+
+    @BeforeEach
+    void resetTelegramAndClock() {
+        Instant previous = clock.instant();
+        now = (previous.isBefore(BASE) ? BASE : previous).plus(Duration.ofMinutes(1));
+        clock.set(now);
+        stubTelegram(200, OK_BODY);
+    }
+
+    @Test
+    @DisplayName("ACTIVE link → 24h and 2h reminders reach Telegram only, text identical to the SMS template")
+    void should_sendRemindersToTelegramOnly_when_phoneLinked() throws Exception {
+        link(LINK_PHONE, ALLOWED_CHAT);
+        OffsetDateTime in24h = at(now.plus(Duration.ofHours(24)));
+        OffsetDateTime in2h = at(now.plus(Duration.ofHours(2)));
+        insertLinkBooking(LINK_PHONE, in24h);
+        insertLinkBooking(LINK_PHONE, in2h);
+
+        reminderJob.sendReminders();
+        reminderJob.sweepTwoHour();
+
+        assertThat(telegramTexts()).containsExactly(
+                salonReminderPrefix("завтра") + SERVICE_NAME + " о " + kyivTime(in24h),
+                salonReminderPrefix("сьогодні") + SERVICE_NAME + " о " + kyivTime(in2h));
+        assertThat(telegramRequests()).allSatisfy(r ->
+                assertThat(json(r).path("chat_id").asLong()).isEqualTo(ALLOWED_CHAT));
+        TURBOSMS.verify(0, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
+        assertThat(jdbcTemplate.queryForObject("SELECT last_sent_at IS NOT NULL FROM telegram_links",
+                Boolean.class)).isTrue();
+        assertNoPiiInLogs(LINK_PHONE, LINK_SUBSCRIBER_DIGITS);
+        assertThat(logMessages()).noneMatch(line -> line.contains(String.valueOf(ALLOWED_CHAT)));
+    }
+
+    @Test
+    @DisplayName("the 2h reminder is sent once: a second tick inside the window sends nothing more")
+    void should_sendTwoHourReminderOnce_when_sweptTwice() {
+        link(LINK_PHONE, ALLOWED_CHAT);
+        insertLinkBooking(LINK_PHONE, at(now.plus(Duration.ofMinutes(120))));
+
+        reminderJob.sweepTwoHour();
+        clock.advance(Duration.ofMinutes(15));
+        reminderJob.sweepTwoHour();
+
+        assertThat(telegramRequests()).hasSize(1);
+        TURBOSMS.verify(0, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
+    }
+
+    @Test
+    @DisplayName("not linked → the 2h reminder goes by SMS (SMS guests get the new 2h reminder too)")
+    void should_sendTwoHourReminderBySms_when_notLinked() throws Exception {
+        OffsetDateTime in2h = at(now.plus(Duration.ofHours(2)));
+        insertLinkBooking(LINK_PHONE, in2h);
+
+        reminderJob.sweepTwoHour();
+
+        assertThat(sentText()).isEqualTo(
+                salonReminderPrefix("сьогодні") + SERVICE_NAME + " о " + kyivTime(in2h));
+        assertThat(telegramRequests()).isEmpty();
+    }
+
+    @Test
+    @DisplayName("provider decline of a linked LINK guest → one Telegram message, no SMS, outbox row SENT")
+    void should_sendDeclineToTelegram_when_phoneLinked() {
+        link(LINK_PHONE, ALLOWED_CHAT);
+        UUID bookingId = insertLinkBooking(LINK_PHONE, at(now.plus(Duration.ofDays(1))));
+
+        decline(bookingId);
+        drainWorker.drain();
+
+        assertThat(telegramTexts()).singleElement().asString().containsPattern(PROVIDER_CANCELLATION_BODY_REGEX);
+        TURBOSMS.verify(0, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
+        assertThat(statusChangedRowStatus(bookingId)).isEqualTo("SENT");
+    }
+
+    @Test
+    @DisplayName("Telegram 403 → exactly one SMS + link BLOCKED; the next reminder goes by SMS without calling Telegram")
+    void should_fallBackAndBlock_when_telegramSaysGone() throws Exception {
+        link(LINK_PHONE, ALLOWED_CHAT);
+        stubTelegram(403, "{\"ok\":false,\"error_code\":403,\"description\":\"Forbidden: bot was blocked by the user\"}");
+        insertLinkBooking(LINK_PHONE, at(now.plus(Duration.ofHours(2))));
+
+        reminderJob.sweepTwoHour();
+
+        assertThat(telegramRequests()).hasSize(1);
+        assertThat(sentText()).contains("що сьогодні у Вас запис");
+        assertThat(jdbcTemplate.queryForObject("SELECT status FROM telegram_links", String.class))
+                .isEqualTo("BLOCKED");
+        assertThat(logMessages()).noneMatch(line -> line.contains("bot was blocked by the user"));
+
+        resetTurbosms();
+        stubTelegram(200, OK_BODY);
+        insertLinkBooking(LINK_PHONE, at(now.plus(Duration.ofHours(24))));
+        reminderJob.sendReminders();
+
+        assertThat(sentText()).contains("що завтра у Вас запис");
+        assertThat(telegramRequests()).isEmpty();
+    }
+
+    @Test
+    @DisplayName("outbox decline with Telegram 500 → exactly one SMS, row SENT, link untouched")
+    void should_fallBackToSms_when_telegramFailsTransiently() throws Exception {
+        link(LINK_PHONE, ALLOWED_CHAT);
+        stubTelegram(500, "{\"ok\":false,\"error_code\":500,\"description\":\"Internal Server Error\"}");
+        UUID bookingId = insertLinkBooking(LINK_PHONE, at(now.plus(Duration.ofDays(1))));
+
+        decline(bookingId);
+        drainWorker.drain();
+
+        assertThat(telegramRequests()).hasSize(1);
+        assertThat(sentText()).containsPattern(PROVIDER_CANCELLATION_BODY_REGEX);
+        assertThat(statusChangedRowStatus(bookingId)).isEqualTo("SENT");
+        assertThat(jdbcTemplate.queryForObject("SELECT status FROM telegram_links", String.class))
+                .isEqualTo("ACTIVE");
+    }
+
+    @Test
+    @DisplayName("staging allow-list refuses a non-listed chat → no Bot API call, exactly one SMS (432 QA INFO)")
+    void should_fallBackToSms_when_chatNotOnStagingAllowList() throws Exception {
+        link(STRANGER_PHONE, STRANGER_CHAT);
+        insertLinkBooking(STRANGER_PHONE, at(now.plus(Duration.ofHours(2))));
+
+        reminderJob.sweepTwoHour();
+
+        assertThat(telegramRequests()).isEmpty();
+        assertThat(sentText()).contains("що сьогодні у Вас запис");
+        assertThat(sentTurbosmsPayload().path("recipients").get(0).asText()).isEqualTo(STRANGER_PHONE);
+        assertThat(jdbcTemplate.queryForObject("SELECT status FROM telegram_links", String.class))
+                .isEqualTo("ACTIVE");
+    }
+
+    @Test
+    @DisplayName("walk-in with a linked phone declined by the provider → exactly one Telegram message, no SMS")
+    void should_sendWalkInDeclineToTelegram_when_phoneLinked() {
+        link(E164_PHONE, ALLOWED_CHAT);
+        UUID bookingId = insertWalkIn(E164_PHONE, at(now.plus(Duration.ofDays(1))));
+
+        decline(bookingId);
+        drainWorker.drain();
+
+        assertThat(telegramTexts()).singleElement().asString().containsPattern(PROVIDER_CANCELLATION_BODY_REGEX);
+        TURBOSMS.verify(0, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
+    }
+
+    @Test
+    @DisplayName("walk-in with an unlinked phone declined by the provider → exactly one SMS")
+    void should_sendWalkInDeclineBySms_when_notLinked() throws Exception {
+        UUID bookingId = insertWalkIn(E164_PHONE, at(now.plus(Duration.ofDays(1))));
+
+        decline(bookingId);
+        drainWorker.drain();
+
+        assertThat(sentText()).containsPattern(PROVIDER_CANCELLATION_BODY_REGEX);
+        assertThat(telegramRequests()).isEmpty();
+    }
+
+    @Test
+    @DisplayName("audit-fix: a 10-service walk-in visit declined as a whole → exactly ONE message")
+    void should_sendOneMessage_when_tenServiceWalkInVisitDeclined() {
+        UUID appointmentId = insertWalkInVisit(E164_PHONE, at(now.plus(Duration.ofDays(1))), 10);
+        authenticateAsOwner();
+
+        appointmentTransitionService.declineAppointment(salon.ownerId(), appointmentId,
+                new AppointmentProviderNoteRequest(null));
+        drainWorker.drain();
+
+        TURBOSMS.verify(1, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
+    }
+
+    @Test
+    @DisplayName("audit-fix: walk-in visit lines declined one by one → one message per visit per window")
+    void should_sendOneMessagePerVisit_when_walkInLinesDeclinedOneByOne() {
+        UUID appointmentId = insertWalkInVisit(E164_PHONE, at(now.plus(Duration.ofDays(1))), 3);
+        authenticateAsOwner();
+        List<UUID> items = jdbcTemplate.queryForList(
+                "SELECT id FROM bookings WHERE appointment_id = ? ORDER BY starts_at", UUID.class, appointmentId);
+
+        appointmentTransitionService.declineAppointmentItem(salon.ownerId(), appointmentId, items.get(0),
+                new AppointmentProviderNoteRequest(null));
+        drainWorker.drain();
+        appointmentTransitionService.declineAppointmentItem(salon.ownerId(), appointmentId, items.get(1),
+                new AppointmentProviderNoteRequest(null));
+        drainWorker.drain();
+
+        TURBOSMS.verify(1, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
+    }
+
+    @Test
+    @DisplayName("audit-fix cycle 2: a back-pressure re-queued walk-in row reserves budget ONCE and sends ONCE")
+    void should_reserveOnceAndSendOnce_when_walkInCancellationRowRequeued() {
+        UUID bookingId = insertWalkIn(E164_PHONE, at(now.plus(Duration.ofDays(1))));
+        decline(bookingId);
+        UUID entryId = jdbcTemplate.queryForObject("SELECT id FROM notification_outbox "
+                + "WHERE event_type = 'STATUS_CHANGED' AND aggregate_id = ?", UUID.class, bookingId);
+        // Six earlier drain attempts of THIS row, each reserving before back-pressure re-queued it.
+        for (int attempt = 0; attempt < 6; attempt++) {
+            assertThat(smsBudget.tryReserveWalkInCancellation(bookingId, null, E164_PHONE, entryId)).isTrue();
+        }
+
+        drainWorker.drain();
+
+        assertThat(jdbcTemplate.queryForObject("SELECT count(*) FROM guest_reschedule_sms_sends "
+                + "WHERE outbox_entry_id = ?", Integer.class, entryId)).isEqualTo(1);
+        TURBOSMS.verify(1, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
+        assertThat(statusChangedRowStatus(bookingId)).isEqualTo("SENT");
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @EnumSource(value = BookingSmsDispatcher.Kind.class,
+            names = {"GUEST_CONFIRMATION", "WALK_IN_CONFIRMATION"})
+    @DisplayName("user decision 2026-11-04: confirmation kinds with an ACTIVE link → Telegram only, no SMS")
+    void should_sendConfirmationToTelegramOnly_when_phoneLinked(BookingSmsDispatcher.Kind kind) {
+        link(LINK_PHONE, ALLOWED_CHAT);
+
+        bookingSmsDispatcher.dispatch(kind, LINK_PHONE, CONFIRMATION_HEADLINE);
+
+        assertThat(telegramTexts()).containsExactly(CONFIRMATION_HEADLINE);
+        TURBOSMS.verify(0, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @EnumSource(value = BookingSmsDispatcher.Kind.class,
+            names = {"GUEST_CONFIRMATION", "WALK_IN_CONFIRMATION"})
+    @DisplayName("user decision 2026-11-04: confirmation kinds with an ACTIVE link + Telegram 500 → one SMS fallback")
+    void should_fallBackToSms_when_confirmationTelegramSendFails(BookingSmsDispatcher.Kind kind) {
+        link(LINK_PHONE, ALLOWED_CHAT);
+        stubTelegram(500, "{\"ok\":false,\"error_code\":500,\"description\":\"Internal Server Error\"}");
+
+        bookingSmsDispatcher.dispatch(kind, LINK_PHONE, CONFIRMATION_HEADLINE);
+
+        assertThat(telegramRequests()).hasSize(1);
+        TURBOSMS.verify(1, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
+        assertThat(linkStatusAndChat()).as("a transient failure leaves the link ACTIVE").isEqualTo("ACTIVE/" + ALLOWED_CHAT);
+    }
+
+    @Test
+    @DisplayName("E2E: guest links via bot /start + contact share → 24h reminder in Telegram only; Telegram 403 → "
+            + "link BLOCKED + the reminder by SMS; the next 24h reminder → SMS only, Bot API untouched")
+    void should_linkDeliverFallBackAndStayOnSms_when_guestLinksThenBlocksBot() throws Exception {
+        UUID first = insertLinkBooking(LINK_PHONE, at(now.plus(Duration.ofHours(24))));
+        String startToken = TelegramLinkTestSupport.rawToken(linkService.issueForBooking(first, LINK_PHONE));
+        TelegramWebhookTestSupport webhook = new TelegramWebhookTestSupport(restTemplate);
+
+        assertThat(webhook.post(TelegramWebhookTestSupport.text(ALLOWED_CHAT, "/start " + startToken),
+                WEBHOOK_SECRET, "198.51.100.41").getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(webhook.post(TelegramWebhookTestSupport.contact(ALLOWED_CHAT, LINK_PHONE.substring(1), ALLOWED_CHAT),
+                WEBHOOK_SECRET, "198.51.100.42").getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(linkStatusAndChat()).as("405/406: contact share proved the booking phone")
+                .isEqualTo("ACTIVE/" + ALLOWED_CHAT);
+        assertThat(telegramRequests()).as("the webhook replies inline, never through the Bot API").isEmpty();
+        awaitTelegramRequests(1);
+        assertThat(telegramTexts()).as("the booking details follow the LINKED reply")
+                .singleElement().asString().startsWith(CONFIRMATION_HEADLINE + "\n\n");
+        stubTelegram(200, OK_BODY);
+
+        reminderJob.sendReminders();
+
+        assertThat(telegramTexts()).singleElement().asString().contains("що завтра у Вас запис");
+        assertThat(json(telegramRequests().get(0)).path("chat_id").asLong()).isEqualTo(ALLOWED_CHAT);
+        TURBOSMS.verify(0, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
+
+        stubTelegram(403, GONE_BODY);
+        advanceClock(Duration.ofMinutes(70));
+        insertLinkBooking(LINK_PHONE, at(now.plus(Duration.ofHours(24))));
+
+        reminderJob.sendReminders();
+
+        assertThat(telegramRequests()).as("one Telegram attempt, answered 403").hasSize(1);
+        assertThat(sentText()).as("the same reminder falls back to SMS").contains("що завтра у Вас запис");
+        assertThat(linkStatusAndChat()).isEqualTo("BLOCKED/" + ALLOWED_CHAT);
+
+        resetTurbosms();
+        stubTelegram(200, OK_BODY);
+        advanceClock(Duration.ofMinutes(70));
+        insertLinkBooking(LINK_PHONE, at(now.plus(Duration.ofHours(24))));
+
+        reminderJob.sendReminders();
+
+        assertThat(sentText()).contains("що завтра у Вас запис");
+        assertThat(telegramRequests()).as("a BLOCKED link is never tried again").isEmpty();
+        assertNoPiiInLogs(LINK_PHONE, LINK_SUBSCRIBER_DIGITS);
+    }
+
+    @Test
+    @DisplayName("after the LINKED webhook reply, one outbound sendMessage carries the booking details; an "
+            + "ALREADY_LINKED re-tap sends none")
+    void should_sendBookingDetailsOnceAfterLinkedReply_when_guestSharesPhone() throws Exception {
+        jdbcTemplate.update("UPDATE salons SET street = 'вул. Хрещатик', building_no = '1' WHERE id = ?",
+                salon.salonId());
+        OffsetDateTime startsAt = tomorrowKyivAt(10);
+        UUID bookingId = insertLinkBooking(LINK_PHONE, startsAt);
+        String startToken = TelegramLinkTestSupport.rawToken(linkService.issueForBooking(bookingId, LINK_PHONE));
+        TelegramWebhookTestSupport webhook = new TelegramWebhookTestSupport(restTemplate);
+        webhook.post(TelegramWebhookTestSupport.text(ALLOWED_CHAT, "/start " + startToken), WEBHOOK_SECRET,
+                "198.51.100.51");
+
+        ResponseEntity<String> linked = webhook.post(
+                TelegramWebhookTestSupport.contact(ALLOWED_CHAT, LINK_PHONE.substring(1), ALLOWED_CHAT),
+                WEBHOOK_SECRET, "198.51.100.52");
+
+        assertThat(readJson(linked.getBody()).path("text").asText()).startsWith("Тепер усі сповіщення");
+        assertThat(telegramRequests()).as("the details are scheduled after the reply, not sent inline").isEmpty();
+        awaitTelegramRequests(1);
+        String salonName = jdbcTemplate.queryForObject("SELECT name FROM salons WHERE id = ?", String.class,
+                salon.salonId());
+        // Phase 435 follow-up: the details ARE the confirmation SMS copy (row inserted without a sealed token → no
+        // «Скасувати:» line).
+        assertThat(telegramTexts()).containsExactly(CONFIRMATION_HEADLINE + "\n\n"
+                + DATE_FMT.format(startsAt.atZoneSameInstant(TimeZones.KYIV)) + " о " + kyivTime(startsAt) + "\n"
+                + "Салон " + salonName + ", майстер " + MASTER_NAME + ".\n"
+                + "Адреса: вул. Хрещатик 1");
+        assertThat(json(telegramRequests().get(0)).path("chat_id").asLong()).isEqualTo(ALLOWED_CHAT);
+        TURBOSMS.verify(0, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
+
+        ResponseEntity<String> retap = webhook.post(TelegramWebhookTestSupport.text(ALLOWED_CHAT,
+                "/start " + startToken), WEBHOOK_SECRET, "198.51.100.53");
+
+        assertThat(readJson(retap.getBody()).path("text").asText()).startsWith("Тепер усі сповіщення");
+        Awaitility.await().during(Duration.ofSeconds(3)).atMost(Duration.ofSeconds(5))
+                .until(() -> telegramRequests().size() == 1);
+        assertNoPiiInLogs(LINK_PHONE, LINK_SUBSCRIBER_DIGITS);
+        assertThat(logMessages()).noneMatch(line -> line.contains(String.valueOf(ALLOWED_CHAT)));
+    }
+
+    @Test
+    @DisplayName("a two-service guest visit: the details are the visit's confirmation SMS, lead's start "
+            + "(real visit query, real Bot API wire)")
+    void should_listEveryVisitServiceAndSummedPrice_when_linkedBookingBelongsToVisit() throws Exception {
+        UUID secondServiceId = insertService(salon.masterId(), "SALON", salon.salonId());
+        jdbcTemplate.update("UPDATE service_definitions SET name = 'Педикюр' WHERE id = "
+                + "(SELECT service_def_id FROM master_services WHERE id = ?)", secondServiceId);
+        OffsetDateTime startsAt = tomorrowKyivAt(10);
+        UUID appointmentId = insertGuestLinkAppointment(LINK_PHONE, now.minus(Duration.ofDays(1)), now);
+        UUID lead = insertLinkBooking(LINK_PHONE, startsAt);
+        UUID second = insertLinkBooking(LINK_PHONE, startsAt.plusHours(1));
+        jdbcTemplate.update("UPDATE bookings SET appointment_id = ? WHERE id IN (?, ?)", appointmentId, lead, second);
+        jdbcTemplate.update("UPDATE bookings SET master_service_id = ? WHERE id = ?", secondServiceId, second);
+
+        linkThroughWebhook(lead, "198.51.100.61");
+
+        awaitTelegramRequests(1);
+        assertThat(telegramTexts()).singleElement().asString()
+                .as("phase 435 follow-up: the visit's confirmation SMS copy — the lead's start, no service list")
+                .startsWith(CONFIRMATION_HEADLINE + "\n\n"
+                        + DATE_FMT.format(startsAt.atZoneSameInstant(TimeZones.KYIV)) + " о " + kyivTime(startsAt) + "\n")
+                .contains("\nСалон ")
+                .doesNotContain("Педикюр")
+                .doesNotContain("Ціна");
+        TURBOSMS.verify(0, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
+    }
+
+    @Test
+    @DisplayName("phase 435 follow-up (\"same sms should be in telegram\"): a public booking's confirmation SMS and the "
+            + "Telegram details after linking are the SAME text — address with note, short own-page link")
+    void should_sendConfirmationSmsTextToTelegram_when_guestLinksAfterPublicBooking() throws Exception {
+        jdbcTemplate.update("UPDATE salons SET street = 'Хрещатик', building_no = '10', location_note = 'вхід з двору' "
+                + "WHERE id = ?", salon.salonId());
+        ResponseEntity<String> created = createGuestBooking(tomorrowKyivAt(12));
+        assertThat(created.getStatusCode()).as("body=%s", created.getBody()).isEqualTo(HttpStatus.CREATED);
+        drainWorker.drain();
+        String sms = sentText();
+        UUID bookingId = UUID.fromString(readJson(created.getBody()).findValue("bookingId").asText());
+        // The real hourly BookingReminderJob cron (wall clock, "0 0 * * * *") reads the pinned test clock, for which
+        // this booking sits inside the 23–25h window: a run crossing a wall-clock hour would add a 24h reminder to
+        // the Telegram wire (CI 2026-11-04 14:00:00). The reminder is not under test here — mark it already sent.
+        jdbcTemplate.update("UPDATE bookings SET reminder_sent = TRUE WHERE id = ?", bookingId);
+        resetTurbosms();
+        stubTelegram(200, OK_BODY);
+
+        linkThroughWebhook(bookingId, "198.51.100.81");
+
+        awaitTelegramRequests(1);
+        assertThat(telegramTexts()).containsExactly(sms);
+        assertThat(sms).contains("\nАдреса: Хрещатик 10 (вхід з двору)\nСкасувати: ")
+                .endsWith(readJson(created.getBody()).findValue("cancelUrl").asText())
+                .containsPattern(CANCEL_LINK_SUFFIX_REGEX);
+        TURBOSMS.verify(0, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
+    }
+
+    @Test
+    @DisplayName("booking cancelled after the link token was issued → LINKED reply, but no details message is sent")
+    void should_sendNoDetails_when_bookingNoLongerConfirmedAtSendTime() throws Exception {
+        UUID bookingId = insertLinkBooking(LINK_PHONE, tomorrowKyivAt(10));
+        String startToken = TelegramLinkTestSupport.rawToken(linkService.issueForBooking(bookingId, LINK_PHONE));
+        TelegramWebhookTestSupport webhook = new TelegramWebhookTestSupport(restTemplate);
+        webhook.post(TelegramWebhookTestSupport.text(ALLOWED_CHAT, "/start " + startToken), WEBHOOK_SECRET,
+                "198.51.100.71");
+        jdbcTemplate.update("UPDATE bookings SET status = 'CANCELLED' WHERE id = ?", bookingId);
+
+        ResponseEntity<String> linked = webhook.post(
+                TelegramWebhookTestSupport.contact(ALLOWED_CHAT, LINK_PHONE.substring(1), ALLOWED_CHAT),
+                WEBHOOK_SECRET, "198.51.100.72");
+
+        assertThat(readJson(linked.getBody()).path("text").asText()).startsWith("Тепер усі сповіщення");
+        assertThat(linkStatusAndChat()).as("the link itself still succeeds").isEqualTo("ACTIVE/" + ALLOWED_CHAT);
+        Awaitility.await().atMost(Duration.ofSeconds(10)).until(() -> logMessages().stream()
+                .anyMatch(line -> line.contains("event=telegram_booking_details result=NOTHING_TO_CONFIRM")));
+        assertThat(telegramRequests()).as("a cancelled booking is never «confirmed» to the guest").isEmpty();
+        TURBOSMS.verify(0, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
+    }
+
+    @Test
+    @DisplayName("audit-fix (markBlocked chat match): a 403 for the OLD chat never blocks the phone re-linked to a "
+            + "new chat while the fallback SMS was in flight")
+    void should_keepRelinkedPhoneActive_when_lateGoneArrivesForOldChat() throws Exception {
+        link(LINK_PHONE, ALLOWED_CHAT);
+        stubTelegram(403, GONE_BODY);
+        // A slow SMS leg holds the router between its link lookup (old chat) and the post-SMS markBlocked.
+        TURBOSMS.resetAll();
+        TURBOSMS.stubFor(post(urlEqualTo(TURBOSMS_PATH)).willReturn(aResponse().withStatus(200)
+                .withFixedDelay(1_500).withHeader("Content-Type", "application/json")
+                .withBody("{\"response_status\":\"OK\"}")));
+        insertLinkBooking(LINK_PHONE, at(now.plus(Duration.ofHours(2))));
+        ExecutorService sweeper = Executors.newSingleThreadExecutor();
+        try {
+            Future<?> sweep = sweeper.submit(reminderJob::sweepTwoHour);
+            Awaitility.await().atMost(Duration.ofSeconds(10)).until(() -> !telegramRequests().isEmpty());
+
+            link(LINK_PHONE, RELINKED_CHAT);
+            sweep.get(20, TimeUnit.SECONDS);
+        } finally {
+            sweeper.shutdownNow();
+        }
+
+        TURBOSMS.verify(1, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
+        assertThat(linkStatusAndChat()).as("the re-linked chat stays ACTIVE").isEqualTo("ACTIVE/" + RELINKED_CHAT);
+    }
+
+    @Test
+    @DisplayName("always-SMS at IT level: guest OTP with an ACTIVE link → one SMS, the Bot API is never called")
+    void should_sendOtpBySmsOnly_when_phoneLinked() {
+        link(LINK_PHONE, ALLOWED_CHAT);
+
+        ResponseEntity<String> response = sendOtp(LINK_PHONE);
+
+        assertThat(response.getStatusCode().is2xxSuccessful()).as("body=%s", response.getBody()).isTrue();
+        TURBOSMS.verify(1, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
+        assertThat(telegramRequests()).isEmpty();
+    }
+
+    @Test
+    @DisplayName("user decision 2026-11-04: public guest booking (confirmation + cancel link) with an ACTIVE link → "
+            + "Telegram only, no SMS")
+    void should_sendGuestConfirmationToTelegramOnly_when_phoneLinked() throws Exception {
+        link(LINK_PHONE, ALLOWED_CHAT);
+
+        ResponseEntity<String> created = createGuestBooking(tomorrowKyivAt(12));
+        drainWorker.drain();
+
+        assertThat(created.getStatusCode()).as("body=%s", created.getBody()).isEqualTo(HttpStatus.CREATED);
+        assertThat(telegramTexts()).singleElement().asString().startsWith(CONFIRMATION_HEADLINE)
+                .endsWith(readJson(created.getBody()).findValue("cancelUrl").asText())
+                .containsPattern(CANCEL_LINK_SUFFIX_REGEX);
+        TURBOSMS.verify(0, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
+    }
+
+    @Test
+    @DisplayName("user decision 2026-11-04: guest unsubscribed («Відписатися від Telegram») → the public booking "
+            + "confirmation + cancel link goes by SMS, the Bot API is never called")
+    void should_sendGuestConfirmationBySms_when_guestUnsubscribedFromTelegram() throws Exception {
+        link(LINK_PHONE, ALLOWED_CHAT);
+        assertThat(linkService.unlinkPhone(LINK_PHONE)).as("fixture: the unsubscribe removed the link").isTrue();
+
+        ResponseEntity<String> created = createGuestBooking(tomorrowKyivAt(12));
+        drainWorker.drain();
+
+        assertThat(created.getStatusCode()).as("body=%s", created.getBody()).isEqualTo(HttpStatus.CREATED);
+        assertThat(sentText()).startsWith(CONFIRMATION_HEADLINE)
+                .endsWith(readJson(created.getBody()).findValue("cancelUrl").asText())
+                .containsPattern(CANCEL_LINK_SUFFIX_REGEX);
+        assertThat(telegramRequests()).isEmpty();
+    }
+
+    @Test
+    @DisplayName("user decision 2026-11-04: BLOCKED link (guest blocked the bot) → the public booking confirmation "
+            + "goes by SMS, no Bot API call, the link stays BLOCKED")
+    void should_sendGuestConfirmationBySms_when_linkBlocked() throws Exception {
+        link(LINK_PHONE, ALLOWED_CHAT);
+        linkService.markBlocked(ALLOWED_CHAT);
+
+        ResponseEntity<String> created = createGuestBooking(tomorrowKyivAt(12));
+        drainWorker.drain();
+
+        assertThat(created.getStatusCode()).as("body=%s", created.getBody()).isEqualTo(HttpStatus.CREATED);
+        assertThat(sentText()).startsWith(CONFIRMATION_HEADLINE)
+                .endsWith(readJson(created.getBody()).findValue("cancelUrl").asText());
+        assertThat(telegramRequests()).isEmpty();
+        assertThat(linkStatusAndChat()).as("a BLOCKED link is never re-activated by a send")
+                .isEqualTo("BLOCKED/" + ALLOWED_CHAT);
+    }
+
+    @Test
+    @DisplayName("user decision 2026-11-04: walk-in created by the owner for a linked phone → the walk-in "
+            + "confirmation + cancel link reaches Telegram only, no SMS")
+    void should_sendWalkInConfirmationToTelegramOnly_when_phoneLinked() {
+        link(E164_PHONE, ALLOWED_CHAT);
+
+        ResponseEntity<String> created = createWalkIn(tomorrowKyivAt(12));
+        drainWorker.drain();
+
+        assertConfirmedWalkInBody(created);
+        assertThat(telegramTexts()).singleElement().asString().startsWith(CONFIRMATION_HEADLINE)
+                .containsPattern(CANCEL_LINK_SUFFIX_REGEX);
+        TURBOSMS.verify(0, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
+    }
+
+    @Test
+    @DisplayName("the guest's own cancellation (public cancel link) with an ACTIVE link → no guest message at all "
+            + "(phase 435, user decision 2026-11-04): zero SMS, no Bot API call")
+    void should_sendNoGuestMessage_when_guestCancelsWithPhoneLinked() throws Exception {
+        link(LINK_PHONE, ALLOWED_CHAT);
+        ResponseEntity<String> created = createGuestBooking(tomorrowKyivAt(12));
+        assertThat(created.getStatusCode()).as("body=%s", created.getBody()).isEqualTo(HttpStatus.CREATED);
+        drainWorker.drain();
+        String cancelUrl = readJson(created.getBody()).findValue("cancelUrl").asText();
+        resetTurbosms();
+        stubTelegram(200, OK_BODY);
+
+        HttpHeaders headers = new HttpHeaders();
+        headers.set("X-Forwarded-For", PublicBookingPageFixtures.randomIp());
+        ResponseEntity<String> cancelled = restTemplate.exchange(
+                "/api/v1/book/cancel/" + cancelUrl.substring(cancelUrl.lastIndexOf('/') + 1), HttpMethod.POST,
+                new HttpEntity<>(headers), String.class);
+        drainWorker.drain();
+
+        assertThat(cancelled.getStatusCode().is2xxSuccessful()).as("body=%s", cancelled.getBody()).isTrue();
+        TURBOSMS.verify(0, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
+        assertThat(telegramRequests()).isEmpty();
+    }
+
+    @Test
+    @DisplayName("phase 435 follow-up: provider reschedule of a linked LINK guest (431 notice) → Telegram only, the "
+            + "exact SMS copy (NEW time), no SMS")
+    void should_sendRescheduleToTelegram_when_phoneLinked() throws Exception {
+        link(LINK_PHONE, ALLOWED_CHAT);
+        UUID bookingId = insertLinkBooking(LINK_PHONE, tomorrowKyivAt(12));
+        authenticateAsOwner();
+        OffsetDateTime newStart = tomorrowKyivAt(14);
+
+        bookingService.rescheduleBooking(salon.ownerId(), com.beautica.auth.Role.SALON_OWNER, bookingId,
+                new com.beautica.booking.dto.RescheduleBookingRequest(newStart, false));
+        drainWorker.drain();
+
+        assertThat(telegramTexts()).containsExactly(reschedule(newStart));
+        TURBOSMS.verify(0, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
+    }
+
+    @Test
+    @DisplayName("phase 435 follow-up QA: provider reschedule of a linked PUBLIC-route guest (sealed token) → Telegram "
+            + "carries the full SMS copy incl. «Деталі або записатись знову» + the guest's own /c/<16> page; no SMS")
+    void should_sendRescheduleWithOwnPageLinkToTelegram_when_linkedPublicBookingMoved() throws Exception {
+        // Arrange
+        link(LINK_PHONE, ALLOWED_CHAT);
+        ResponseEntity<String> created = createGuestBooking(tomorrowKyivAt(12));
+        assertThat(created.getStatusCode()).as("body=%s", created.getBody()).isEqualTo(HttpStatus.CREATED);
+        String cancelUrl = readJson(created.getBody()).findValue("cancelUrl").asText();
+        UUID bookingId = UUID.fromString(readJson(created.getBody()).findValue("bookingId").asText());
+        drainWorker.drain();
+        resetTurbosms();
+        // The confirmation itself went to Telegram (linked phone, user decision 2026-11-04) — clear that request.
+        stubTelegram(200, OK_BODY);
+        authenticateAsOwner();
+        OffsetDateTime newStart = tomorrowKyivAt(14);
+
+        // Act
+        bookingService.rescheduleBooking(salon.ownerId(), com.beautica.auth.Role.SALON_OWNER, bookingId,
+                new com.beautica.booking.dto.RescheduleBookingRequest(newStart, false));
+        drainWorker.drain();
+
+        // Assert
+        assertThat(cancelUrl).containsPattern(CANCEL_LINK_SUFFIX_REGEX);
+        assertThat(telegramTexts()).containsExactly(rescheduleWithDetails(newStart, cancelUrl));
+        TURBOSMS.verify(0, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
+    }
+
+    @Test
+    @DisplayName("phase 435 follow-up: provider reschedule of an UNlinked LINK guest → the same text by SMS, no Bot API")
+    void should_sendRescheduleBySms_when_notLinked() throws Exception {
+        UUID bookingId = insertLinkBooking(LINK_PHONE, tomorrowKyivAt(12));
+        authenticateAsOwner();
+        OffsetDateTime newStart = tomorrowKyivAt(14);
+
+        bookingService.rescheduleBooking(salon.ownerId(), com.beautica.auth.Role.SALON_OWNER, bookingId,
+                new com.beautica.booking.dto.RescheduleBookingRequest(newStart, false));
+        drainWorker.drain();
+
+        assertThat(sentText()).isEqualTo(reschedule(newStart));
+        assertThat(telegramRequests()).isEmpty();
+    }
+
+    // ── fixtures ──────────────────────────────────────────────────────────────
+
+    private void advanceClock(Duration by) {
+        clock.advance(by);
+        now = clock.instant();
+    }
+
+    private String linkStatusAndChat() {
+        return jdbcTemplate.queryForObject("SELECT status || '/' || chat_id FROM telegram_links", String.class);
+    }
+
+    /** A slot inside the seeded 09:00–17:00 schedule, tomorrow on the clock's Kyiv date. */
+    private OffsetDateTime tomorrowKyivAt(int hour) {
+        return now.atZone(TimeZones.KYIV).toLocalDate().plusDays(1).atTime(hour, 0).atZone(TimeZones.KYIV)
+                .toOffsetDateTime();
+    }
+
+    private void stubTelegram(int status, String body) {
+        TELEGRAM.resetAll();
+        TELEGRAM.stubFor(post(urlEqualTo(SEND_PATH)).willReturn(aResponse().withStatus(status)
+                .withHeader("Content-Type", "application/json").withBody(body)));
+    }
+
+    private void link(String phone, long chatId) {
+        new TransactionTemplate(transactionManager).executeWithoutResult(s ->
+                linkRepository.upsert(UUID.randomUUID(), phoneHasher.hash(phone).hash(), chatId, now));
+    }
+
+    /** A confirmed LINK booking created a day earlier (never short notice). */
+    private UUID insertLinkBooking(String phone, OffsetDateTime startsAt) {
+        return insertGuestLinkBooking(phone, startsAt, Duration.ofHours(1), now.minus(Duration.ofDays(1)));
+    }
+
+    private UUID insertWalkIn(String phone, OffsetDateTime startsAt) {
+        UUID bookingId = UUID.randomUUID();
+        jdbcTemplate.update("INSERT INTO bookings (id, master_id, master_service_id, salon_id, status, starts_at, "
+                        + "ends_at, price_at_booking, duration_minutes_at_booking, buffer_minutes_at_booking, "
+                        + "booking_source, guest_name, guest_surname, guest_phone, created_by_user_id, created_at, "
+                        + "updated_at) VALUES (?, ?, ?, ?, 'CONFIRMED', ?, ?, 350.00, 60, 0, 'STAFF', ?, ?, ?, ?, ?, ?)",
+                bookingId, salon.masterId(), salon.masterServiceId(), salon.salonId(), startsAt, startsAt.plusHours(1),
+                GUEST_NAME, GUEST_SURNAME, phone, salon.ownerId(), at(now.minus(Duration.ofDays(1))), at(now));
+        return bookingId;
+    }
+
+    /** The appointment transition guard reads the caller from the SecurityContext (cleared after each test). */
+    private void authenticateAsOwner() {
+        var token = new org.springframework.security.authentication.UsernamePasswordAuthenticationToken(
+                salon.ownerId(), null,
+                List.of(new org.springframework.security.core.authority.SimpleGrantedAuthority("ROLE_SALON_OWNER")));
+        token.setDetails(salon.ownerId());
+        org.springframework.security.core.context.SecurityContextHolder.getContext().setAuthentication(token);
+    }
+
+    @org.junit.jupiter.api.AfterEach
+    void clearSecurityContext() {
+        org.springframework.security.core.context.SecurityContextHolder.clearContext();
+    }
+
+    private UUID insertWalkInVisit(String phone, OffsetDateTime startsAt, int items) {
+        UUID appointmentId = UUID.randomUUID();
+        jdbcTemplate.update("INSERT INTO appointments (id, salon_id, status, booking_source, guest_name, "
+                        + "guest_surname, guest_phone, created_at, updated_at) "
+                        + "VALUES (?, ?, 'CONFIRMED', 'STAFF', ?, ?, ?, ?, ?)",
+                appointmentId, salon.salonId(), GUEST_NAME, GUEST_SURNAME, phone, at(now.minus(Duration.ofDays(1))),
+                at(now));
+        for (int i = 0; i < items; i++) {
+            OffsetDateTime itemStart = startsAt.plusMinutes(10L * i);
+            UUID bookingId = UUID.randomUUID();
+            jdbcTemplate.update("INSERT INTO bookings (id, master_id, master_service_id, salon_id, appointment_id, "
+                            + "status, starts_at, ends_at, price_at_booking, duration_minutes_at_booking, "
+                            + "buffer_minutes_at_booking, booking_source, guest_name, guest_surname, guest_phone, "
+                            + "created_by_user_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'CONFIRMED', ?, ?, "
+                            + "350.00, 10, 0, 'STAFF', ?, ?, ?, ?, ?, ?)",
+                    bookingId, salon.masterId(), salon.masterServiceId(), salon.salonId(), appointmentId, itemStart,
+                    itemStart.plusMinutes(10), GUEST_NAME, GUEST_SURNAME, phone, salon.ownerId(),
+                    at(now.minus(Duration.ofDays(1))), at(now));
+        }
+        return appointmentId;
+    }
+
+    private void decline(UUID bookingId) {
+        bookingService.declineBooking(salon.ownerId(), bookingId,
+                new StatusUpdateRequest(CancellationReason.PROVIDER_UNAVAILABLE, null));
+    }
+
+    private String statusChangedRowStatus(UUID bookingId) {
+        return jdbcTemplate.queryForObject("SELECT status FROM notification_outbox "
+                + "WHERE event_type = 'STATUS_CHANGED' AND aggregate_id = ?", String.class, bookingId);
+    }
+
+    /** Issues a link token for {@code bookingId} and runs /start + own-contact share through the real webhook. */
+    private void linkThroughWebhook(UUID bookingId, String sourceIp) {
+        String startToken = TelegramLinkTestSupport.rawToken(linkService.issueForBooking(bookingId, LINK_PHONE));
+        TelegramWebhookTestSupport webhook = new TelegramWebhookTestSupport(restTemplate);
+        webhook.post(TelegramWebhookTestSupport.text(ALLOWED_CHAT, "/start " + startToken), WEBHOOK_SECRET, sourceIp);
+        ResponseEntity<String> linked = webhook.post(
+                TelegramWebhookTestSupport.contact(ALLOWED_CHAT, LINK_PHONE.substring(1), ALLOWED_CHAT),
+                WEBHOOK_SECRET, sourceIp);
+        assertThat(readJson(linked.getBody()).path("text").asText()).as("fixture: contact share did not link")
+                .startsWith("Тепер усі сповіщення");
+    }
+
+    /** The post-link details message is scheduled {@code SEND_DELAY} after the webhook reply (real scheduler). */
+    private void awaitTelegramRequests(int count) {
+        Awaitility.await().atMost(Duration.ofSeconds(10)).until(() -> telegramRequests().size() >= count);
+    }
+
+    private List<LoggedRequest> telegramRequests() {
+        return TELEGRAM.findAll(postRequestedFor(urlEqualTo(SEND_PATH)));
+    }
+
+    private List<String> telegramTexts() {
+        return telegramRequests().stream().map(r -> json(r).path("text").asText()).toList();
+    }
+
+    private JsonNode json(LoggedRequest request) {
+        return readJson(request.getBodyAsString());
+    }
+
+    private static OffsetDateTime at(Instant instant) {
+        return OffsetDateTime.ofInstant(instant, ZoneOffset.UTC);
+    }
+
+    private static String kyivTime(OffsetDateTime startsAt) {
+        return TIME_FMT.format(startsAt.atZoneSameInstant(TimeZones.KYIV));
+    }
+}

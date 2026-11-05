@@ -59,12 +59,47 @@ final class GuestLinkFixtures {
      */
     UUID createService(UUID masterId, String name, int durationMinutes, int typeOffset) {
         UUID ownerId = jdbc.queryForObject("SELECT user_id FROM masters WHERE id = ?", UUID.class, masterId);
+        return insertMasterService(masterId, "INDEPENDENT_MASTER", ownerId, name, durationMinutes, typeOffset);
+    }
+
+    /** A salon-owned master service (owner_type SALON) performed by {@code masterId}; see {@link #createService}. */
+    UUID createSalonService(UUID masterId, UUID salonId, String name, int durationMinutes, int typeOffset) {
+        return insertMasterService(masterId, "SALON", salonId, name, durationMinutes, typeOffset);
+    }
+
+    /**
+     * Phase 435 QA — an active salon (named {@code salonName}, in {@code cityId}) whose OWNER-operated master
+     * ({@code master_type = 'SALON_OWNER'}) carries {@code slug} as its booking slug, so the public
+     * {@code /book/{slug}/booking} route creates a SALON booking. Returns the salon and master ids.
+     */
+    SalonMaster createSalonOwnerMasterWithSlug(String email, String slug, String salonName, UUID cityId) {
+        UUID userId = UUID.randomUUID();
+        jdbc.update(
+                "INSERT INTO users (id, email, password_hash, role, is_active, email_verified, first_name, last_name) "
+                        + "VALUES (?, ?, ?, 'SALON_OWNER', true, true, 'Марія', 'Левченко')",
+                userId, email, passwordEncoder.encode(TEST_PASSWORD));
+        UUID salonId = UUID.randomUUID();
+        jdbc.update("INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at, city_id) "
+                + "VALUES (?, ?, ?, true, NOW(), NOW(), ?)", salonId, userId, salonName, cityId);
+        UUID masterId = UUID.randomUUID();
+        jdbc.update(
+                "INSERT INTO masters (id, user_id, salon_id, master_type, is_active, booking_slug, created_at, "
+                        + "updated_at) VALUES (?, ?, ?, 'SALON_OWNER', true, ?, NOW(), NOW())",
+                masterId, userId, salonId, slug);
+        return new SalonMaster(salonId, masterId);
+    }
+
+    record SalonMaster(UUID salonId, UUID masterId) {
+    }
+
+    private UUID insertMasterService(UUID masterId, String ownerType, UUID ownerId, String name, int durationMinutes,
+                                     int typeOffset) {
         UUID serviceDefId = UUID.randomUUID();
         jdbc.update(
                 "INSERT INTO service_definitions (id, owner_type, owner_id, name, service_type_id, "
                         + "base_duration_minutes, base_price, buffer_minutes_after, is_active, created_at, updated_at) "
-                        + "VALUES (?, 'INDEPENDENT_MASTER', ?, ?, ?, ?, 350.00, 0, true, NOW(), NOW())",
-                serviceDefId, ownerId, name, resolveServiceTypeId(typeOffset), durationMinutes);
+                        + "VALUES (?, ?, ?, ?, ?, ?, 350.00, 0, true, NOW(), NOW())",
+                serviceDefId, ownerType, ownerId, name, resolveServiceTypeId(typeOffset), durationMinutes);
         UUID masterServiceId = UUID.randomUUID();
         jdbc.update(
                 "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) "

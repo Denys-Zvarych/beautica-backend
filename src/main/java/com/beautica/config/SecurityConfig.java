@@ -292,6 +292,11 @@ public class SecurityConfig {
                     // path shape from POST /api/v1/book/*/booking (slug, then literal
                     // "booking"), so the two matchers cannot shadow or collide with each other.
                     auth.requestMatchers(HttpMethod.POST, "/api/v1/book/cancel/*").permitAll();
+                    // Phase 407 D3 — guest Telegram link API (website success screen + cancel page). No JWT: the
+                    // booking's cancel token in the body is the credential, resolved by GuestTelegramLinkService;
+                    // per-IP + per-token buckets guard it. Exact paths, POST only — distinct from */booking.
+                    auth.requestMatchers(HttpMethod.POST, "/api/v1/book/telegram/link-token",
+                            "/api/v1/book/telegram/status", "/api/v1/book/telegram/unlink").permitAll();
                     // Phase 401 — guest review page (beautica.app/r/{token}). No account and no OTP: the one-time
                     // invite token in the path is the credential, validated in GuestReviewService; Turnstile + the
                     // per-IP AuthRateLimitFilter buckets guard it. Exact shapes only: the read, the submit, the opt-out.
@@ -299,6 +304,11 @@ public class SecurityConfig {
                     auth.requestMatchers(HttpMethod.HEAD, "/api/v1/public/review-invites/*").permitAll();
                     auth.requestMatchers(HttpMethod.POST, "/api/v1/public/review-invites/*/reviews").permitAll();
                     auth.requestMatchers(HttpMethod.POST, "/api/v1/public/review-invites/*/opt-out").permitAll();
+                    // Phase 406 D1/D2 — Telegram Bot API webhook. Telegram holds no JWT; the controller authenticates
+                    // every call by the X-Telegram-Bot-Api-Secret-Token header (constant-time) and throttles failed
+                    // ones per IP. Exact path, POST only; the controller bean exists only with app.telegram.enabled,
+                    // so a dark deploy answers 404.
+                    auth.requestMatchers(HttpMethod.POST, "/api/v1/telegram/webhook").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/salons/{salonId}/portfolio").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/masters/{masterId}/portfolio").permitAll();
                     // Internal management API — authenticated by InternalApiKeyFilter (X-Internal-Key header),

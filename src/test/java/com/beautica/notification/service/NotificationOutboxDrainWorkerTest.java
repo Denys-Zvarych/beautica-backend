@@ -23,6 +23,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import java.time.Instant;
+import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -293,7 +294,7 @@ class NotificationOutboxDrainWorkerTest {
         when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(booking));
         // What BookingSmsDispatcher#dispatchOrThrow propagates through NotificationService.
         doThrow(new com.beautica.notification.sms.SmsBackpressureException("smsSendExecutor saturated"))
-                .when(notificationService).notifyBookingStatusChanged(BookingVisit.single(booking));
+                .when(notificationService).notifyBookingStatusChanged(eq(BookingVisit.single(booking)), any());
 
         worker.drain();
 
@@ -322,7 +323,7 @@ class NotificationOutboxDrainWorkerTest {
         when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(declined, closed));
         when(cipher.open("v1:STUB")).thenReturn("https://app.beautica.ua/invite/accept?token=ABC");
         doThrow(new com.beautica.notification.sms.SmsBackpressureException("smsSendExecutor saturated"))
-                .when(notificationService).notifyBookingStatusChanged(BookingVisit.single(declined));
+                .when(notificationService).notifyBookingStatusChanged(eq(BookingVisit.single(declined)), any());
         when(notificationService.routesToLinkGuestSms(OutboxEventType.SALON_CLOSED, closed)).thenReturn(true);
 
         w.drain();
@@ -334,7 +335,7 @@ class NotificationOutboxDrainWorkerTest {
         assertThat(email1.getStatus()).isEqualTo(OutboxStatus.SENT);
         assertThat(email2.getStatus()).isEqualTo(OutboxStatus.SENT);
         verify(notificationService, times(2)).sendInviteEmail(any(), any(), any());
-        verify(notificationService, never()).notifySalonClosed(any());
+        verify(notificationService, never()).notifySalonClosed(any(), any());
     }
 
     @Test
@@ -353,14 +354,14 @@ class NotificationOutboxDrainWorkerTest {
         when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(declinedSms, clientRow));
         when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(declined, clientBooking));
         doThrow(new com.beautica.notification.sms.SmsBackpressureException("smsSendExecutor saturated"))
-                .when(notificationService).notifyBookingStatusChanged(BookingVisit.single(declined));
+                .when(notificationService).notifyBookingStatusChanged(eq(BookingVisit.single(declined)), any());
         when(notificationService.routesToLinkGuestSms(OutboxEventType.MASTER_REMOVED, clientBooking)).thenReturn(false);
 
         worker.drain();
 
         assertThat(declinedSms.getStatus()).isEqualTo(OutboxStatus.PENDING);
         assertThat(clientRow.getStatus()).isEqualTo(OutboxStatus.SENT);
-        verify(notificationService).notifyMasterRemoved(BookingVisit.single(clientBooking));
+        verify(notificationService).notifyMasterRemoved(eq(BookingVisit.single(clientBooking)), any());
     }
 
     @Test
@@ -385,7 +386,7 @@ class NotificationOutboxDrainWorkerTest {
         when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(declined, closed));
         when(cipher.open("v1:STUB")).thenReturn("https://app.beautica.ua/invite/accept?token=ABC");
         doThrow(new com.beautica.notification.sms.SmsBackpressureException("smsSendExecutor saturated"))
-                .when(notificationService).notifyBookingStatusChanged(BookingVisit.single(declined));
+                .when(notificationService).notifyBookingStatusChanged(eq(BookingVisit.single(declined)), any());
         when(notificationService.routesToLinkGuestSms(OutboxEventType.SALON_CLOSED, closed)).thenReturn(true);
 
         // Act
@@ -599,6 +600,7 @@ class NotificationOutboxDrainWorkerTest {
     void should_callNotifyStatusChanged_when_statusChangedEntryProcessed() {
         UUID bookingId = UUID.randomUUID();
         NotificationOutboxEntry outboxEntry = entry(OutboxEventType.STATUS_CHANGED, 0, null, bookingId);
+        org.springframework.test.util.ReflectionTestUtils.setField(outboxEntry, "id", UUID.randomUUID());
         Booking booking = mock(Booking.class);
 
         when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
@@ -607,7 +609,9 @@ class NotificationOutboxDrainWorkerTest {
 
         worker.drain();
 
-        verify(notificationService, times(1)).notifyBookingStatusChanged(BookingVisit.single(booking));
+        // Phase 408 audit-fix cycle 2: the entry id is threaded through (walk-in budget retry idempotency).
+        verify(notificationService, times(1)).notifyBookingStatusChanged(
+                eq(BookingVisit.single(booking)), eq(outboxEntry.getId()));
         assertThat(outboxEntry.getStatus()).isEqualTo(OutboxStatus.SENT);
     }
 
@@ -798,7 +802,7 @@ class NotificationOutboxDrainWorkerTest {
         when(booking3.getId()).thenReturn(bookingId3);
         when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(booking1, booking2, booking3));
         doThrow(new RuntimeException("status change failed"))
-                .when(notificationService).notifyBookingStatusChanged(BookingVisit.single(booking3));
+                .when(notificationService).notifyBookingStatusChanged(eq(BookingVisit.single(booking3)), any());
 
         worker.drain();
 
@@ -905,6 +909,7 @@ class NotificationOutboxDrainWorkerTest {
     void should_callNotifySalonClosed_when_salonClosedEntryProcessed() {
         UUID bookingId = UUID.randomUUID();
         NotificationOutboxEntry outboxEntry = entry(OutboxEventType.SALON_CLOSED, 0, null, bookingId);
+        org.springframework.test.util.ReflectionTestUtils.setField(outboxEntry, "id", UUID.randomUUID());
         Booking booking = mock(Booking.class);
 
         when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
@@ -915,7 +920,7 @@ class NotificationOutboxDrainWorkerTest {
 
         // SALON_CLOSED is visit-aware (VISIT_AWARE_EVENTS) so it must route through the resolved
         // BookingVisit, exactly like NEW_BOOKING/STATUS_CHANGED — not a bare Booking.
-        verify(notificationService, times(1)).notifySalonClosed(BookingVisit.single(booking));
+        verify(notificationService, times(1)).notifySalonClosed(eq(BookingVisit.single(booking)), eq(outboxEntry.getId()));
         assertThat(outboxEntry.getStatus()).isEqualTo(OutboxStatus.SENT);
     }
 
@@ -942,7 +947,7 @@ class NotificationOutboxDrainWorkerTest {
 
         // MASTER_REMOVED is visit-aware (VISIT_AWARE_EVENTS), exactly like SALON_CLOSED — must
         // route through the resolved BookingVisit, not a bare Booking.
-        verify(notificationService, times(1)).notifyMasterRemoved(BookingVisit.single(booking));
+        verify(notificationService, times(1)).notifyMasterRemoved(eq(BookingVisit.single(booking)), any());
         assertThat(outboxEntry.getStatus()).isEqualTo(OutboxStatus.SENT);
     }
 
@@ -974,7 +979,7 @@ class NotificationOutboxDrainWorkerTest {
         worker.drain();
 
         verify(notificationService, never()).notifyNewBooking(any());
-        verify(notificationService, never()).notifyBookingStatusChanged(any());
+        verify(notificationService, never()).notifyBookingStatusChanged(any(), any());
         verify(notificationService, never()).sendInviteEmail(any(), any(), any());
     }
 
@@ -1004,25 +1009,24 @@ class NotificationOutboxDrainWorkerTest {
     // ── Test D: purgeStaleOutboxRows deletes SENT and DEAD, not PENDING ─────────
 
     @Test
-    @DisplayName("deleteByStatusInAndUpdatedAtBefore is called with SENT and DEAD statuses and a 30-day cutoff")
+    @DisplayName("purge batch is called with SENT and DEAD statuses, a 30-day cutoff and the batch size")
     void should_callDeleteWithCorrectStatusesAndCutoff_when_purgeStaleOutboxRowsCalled() {
         // Arrange
-        ArgumentCaptor<List<OutboxStatus>> statusCaptor =
-                ArgumentCaptor.forClass((Class) List.class);
+        ArgumentCaptor<Collection<String>> statusCaptor =
+                ArgumentCaptor.forClass((Class) Collection.class);
         ArgumentCaptor<Instant> cutoffCaptor = ArgumentCaptor.forClass(Instant.class);
 
         // Act
         worker.purgeStaleOutboxRows();
 
         // Assert — statuses and cutoff
-        verify(outboxRepository).deleteByStatusInAndUpdatedAtBefore(
-                statusCaptor.capture(), cutoffCaptor.capture());
+        verify(outboxRepository).deleteTerminalBatchBefore(
+                statusCaptor.capture(), cutoffCaptor.capture(),
+                org.mockito.ArgumentMatchers.eq(NotificationOutboxDrainWorker.PURGE_BATCH_SIZE));
 
         assertThat(statusCaptor.getValue())
-                .as("purge status list must include SENT")
-                .contains(OutboxStatus.SENT)
-                .as("purge status list must include DEAD")
-                .contains(OutboxStatus.DEAD);
+                .as("purge status list must be exactly SENT and DEAD")
+                .containsExactlyInAnyOrder(OutboxStatus.SENT.name(), OutboxStatus.DEAD.name());
 
         Instant expectedCutoff = Instant.now().minus(java.time.Duration.ofDays(30));
         assertThat(cutoffCaptor.getValue())
@@ -1031,22 +1035,58 @@ class NotificationOutboxDrainWorkerTest {
     }
 
     @Test
-    @DisplayName("deleteByStatusInAndUpdatedAtBefore is never called with PENDING in the status list")
+    @DisplayName("purge batch is never called with PENDING in the status list")
     void should_notIncludePendingInPurge_when_purgeStaleOutboxRowsCalled() {
         // Arrange
-        ArgumentCaptor<List<OutboxStatus>> statusCaptor =
-                ArgumentCaptor.forClass((Class) List.class);
+        ArgumentCaptor<Collection<String>> statusCaptor =
+                ArgumentCaptor.forClass((Class) Collection.class);
 
         // Act
         worker.purgeStaleOutboxRows();
 
         // Assert — PENDING must never appear in the delete predicate
-        verify(outboxRepository).deleteByStatusInAndUpdatedAtBefore(
-                statusCaptor.capture(), any(Instant.class));
+        verify(outboxRepository).deleteTerminalBatchBefore(
+                statusCaptor.capture(), any(Instant.class), org.mockito.ArgumentMatchers.anyInt());
 
         assertThat(statusCaptor.getValue())
                 .as("PENDING rows must never be purged by the TTL job")
-                .doesNotContain(OutboxStatus.PENDING);
+                .doesNotContain(OutboxStatus.PENDING.name());
+    }
+
+    @Test
+    @DisplayName("purge loops while a batch is full, stops on the first short batch, all with the same cutoff")
+    void should_loopUntilShortBatch_when_purgeBacklogSpansSeveralBatches() {
+        // Arrange — two full batches, then a short one
+        int full = NotificationOutboxDrainWorker.PURGE_BATCH_SIZE;
+        when(outboxRepository.deleteTerminalBatchBefore(
+                org.mockito.ArgumentMatchers.anyCollection(), any(Instant.class), org.mockito.ArgumentMatchers.anyInt()))
+                .thenReturn(full, full, 7);
+        ArgumentCaptor<Instant> cutoffCaptor = ArgumentCaptor.forClass(Instant.class);
+
+        // Act
+        worker.purgeStaleOutboxRows();
+
+        // Assert
+        verify(outboxRepository, times(3)).deleteTerminalBatchBefore(
+                org.mockito.ArgumentMatchers.anyCollection(), cutoffCaptor.capture(),
+                org.mockito.ArgumentMatchers.anyInt());
+        assertThat(cutoffCaptor.getAllValues()).as("one cutoff for the whole run").containsOnly(cutoffCaptor.getValue());
+    }
+
+    @Test
+    @DisplayName("purge stops at the per-run batch ceiling even when every batch is full")
+    void should_stopAtMaxBatches_when_everyBatchIsFull() {
+        // Arrange
+        when(outboxRepository.deleteTerminalBatchBefore(
+                org.mockito.ArgumentMatchers.anyCollection(), any(Instant.class), org.mockito.ArgumentMatchers.anyInt()))
+                .thenReturn(NotificationOutboxDrainWorker.PURGE_BATCH_SIZE);
+
+        // Act
+        worker.purgeStaleOutboxRows();
+
+        // Assert
+        verify(outboxRepository, times(NotificationOutboxDrainWorker.PURGE_MAX_BATCHES)).deleteTerminalBatchBefore(
+                org.mockito.ArgumentMatchers.anyCollection(), any(Instant.class), org.mockito.ArgumentMatchers.anyInt());
     }
 
     // ── Test C: malformed INVITE JSON payload → dead-letter ───────────────────
@@ -1168,7 +1208,7 @@ class NotificationOutboxDrainWorkerTest {
 
         assertThat(row.getStatus()).isEqualTo(OutboxStatus.SENT);
         verify(notificationService).notifyMasterOfProviderDecline(BookingVisit.single(booking), actor);
-        verify(notificationService, never()).notifyBookingStatusChanged(any());
+        verify(notificationService, never()).notifyBookingStatusChanged(any(), any());
     }
 
     @Test

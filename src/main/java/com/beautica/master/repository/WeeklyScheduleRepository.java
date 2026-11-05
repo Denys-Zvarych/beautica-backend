@@ -1,5 +1,6 @@
 package com.beautica.master.repository;
 
+import com.beautica.common.repository.TransactionLockTimeout;
 import com.beautica.common.DateRange;
 import com.beautica.master.entity.WeeklySchedule;
 import jakarta.persistence.LockModeType;
@@ -20,7 +21,7 @@ import java.util.UUID;
  * <p>NOTE: finders are unscoped — they trust the caller-supplied {@code masterId}. The service layer
  * must enforce ownership before calling (a master may only read/write their own schedules).
  */
-public interface WeeklyScheduleRepository extends JpaRepository<WeeklySchedule, UUID> {
+public interface WeeklyScheduleRepository extends JpaRepository<WeeklySchedule, UUID>, TransactionLockTimeout {
 
     /**
      * Schedules whose active window covers {@code date}. {@code validTo IS NULL} = open-ended,
@@ -61,7 +62,13 @@ public interface WeeklyScheduleRepository extends JpaRepository<WeeklySchedule, 
             WHERE ws.master.id = :masterId
             ORDER BY ws.validFrom ASC
             """)
-    List<WeeklySchedule> findByMasterIdForUpdate(@Param("masterId") UUID masterId);
+    List<WeeklySchedule> findByMasterIdForUpdateNoLockTimeout(@Param("masterId") UUID masterId);
+
+    /** {@link #findByMasterIdForUpdateNoLockTimeout} bounded by the transaction-local 3s {@code lock_timeout} ({@link TransactionLockTimeout}). */
+    default List<WeeklySchedule> findByMasterIdForUpdate(UUID masterId) {
+        applyTransactionLockTimeout();
+        return findByMasterIdForUpdateNoLockTimeout(masterId);
+    }
 
     /**
      * Phase 15.5: a master's weekly templates ordered by {@code validFrom}, with

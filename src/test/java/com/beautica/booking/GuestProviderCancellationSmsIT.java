@@ -34,9 +34,10 @@ import static org.assertj.core.api.Assertions.assertThat;
  * test profile). Every assertion reads the provider wire, so "exactly one SMS with this exact text"
  * is a claim about what would actually be sent and billed.
  *
- * <p>The seeded fixture master is a {@code SALON_OWNER}-type master WITH a booking slug, so the
- * decline rows also prove the locked access rule: only an {@code INDEPENDENT_MASTER}'s own page is
- * ever offered — an owner's (or salon master's) decline links the SALON page.
+ * <p>Phase 435: rows created through the public route carry the V230 sealed token, so the SMS ends with
+ * «Деталі або записатись знову {guest's own /book/cancel/ page}»; rows seeded directly
+ * ({@link #insertConfirmedLinkBooking}, no sealed token — a pre-V230 row) get the body alone. No row
+ * ever links a master or salon rebook page.
  *
  * <p>The flag-off row lives in {@link WalkInBookingSmsIT} (the flag-off context of the same
  * hierarchy); this class shares its context with {@link WalkInBookingSmsEnabledIT}.
@@ -46,7 +47,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 @DisplayName("GuestProviderCancellationSmsIT — phase 390 guest SMS on provider cancellation")
 class GuestProviderCancellationSmsIT extends AbstractWalkInBookingSmsIT {
 
-    private static final String SALON_REBOOK = " Записатися знову: beautica.app/book/s/";
 
     @Autowired
     private NotificationOutboxDrainWorker drainWorker;
@@ -59,20 +59,20 @@ class GuestProviderCancellationSmsIT extends AbstractWalkInBookingSmsIT {
 
     @Test
     @DisplayName("provider declines a guest single booking — exactly ONE SMS, exact fixed text with "
-            + "the SALON's rebook link (owner-type master), no provider note, ≤ 2 UCS-2 segments, and "
-            + "neither the phone nor the body ever reaches stdout/stderr")
+            + "the guest's OWN booking page (sealed token, phase 435), never the salon/master rebook page, no "
+            + "provider note, ≤ 3 UCS-2 segments, and neither the phone nor the body ever reaches stdout/stderr")
     void should_sendOneExactSms_when_providerDeclinesGuestBooking(CapturedOutput output) throws Exception {
         OffsetDateTime startsAt = tomorrowAtNoon();
-        UUID bookingId = createGuestBookingAndSettle(startsAt);
-        String salonSlug = giveSalonSlug();
+        SettledGuest guest = createGuestBookingSettled(startsAt);
+        giveSalonSlug();
 
-        ResponseEntity<Void> resp = declineBooking(bookingId, "Майстер захворів, див. evil.example");
+        ResponseEntity<Void> resp = declineBooking(guest.id(), "Майстер захворів, див. evil.example");
         drainWorker.drain();
 
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
         String text = sentText();
-        assertThat(text).isEqualTo(expectedBody(startsAt) + SALON_REBOOK + salonSlug);
-        assertThat(text.length()).isLessThanOrEqualTo(134);
+        assertThat(text).isEqualTo(expectedWithPage(startsAt, guest.cancelUrl()));
+        assertThat(text.length()).isLessThanOrEqualTo(201);
         assertThat(text).doesNotContain("захворів").doesNotContain(SERVICE_NAME).doesNotContain(MASTER_NAME)
                 .as("an owner-type master's own slug is never offered").doesNotContain(salon.bookingSlug());
         assertThat(sentTurbosmsPayload().path("recipients").get(0).asText()).isEqualTo(LINK_PHONE);
@@ -92,8 +92,9 @@ class GuestProviderCancellationSmsIT extends AbstractWalkInBookingSmsIT {
     void should_sendOneSmsPerVisit_when_providerDeclinesWholeGuestVisit() throws Exception {
         OffsetDateTime startsAt = tomorrowAt(java.time.LocalTime.of(10, 0));
         UUID second = insertService(salon.masterId(), "SALON", salon.salonId());
-        UUID appointmentId = createGuestVisitAndSettle(startsAt, List.of(salon.masterServiceId(), second));
-        String salonSlug = giveSalonSlug();
+        SettledGuest visit = createGuestVisitSettled(startsAt, List.of(salon.masterServiceId(), second));
+        UUID appointmentId = visit.id();
+        giveSalonSlug();
 
         ResponseEntity<String> resp = restTemplate.exchange(
                 "/api/v1/appointments/" + appointmentId + "/decline", HttpMethod.PATCH,
@@ -104,7 +105,7 @@ class GuestProviderCancellationSmsIT extends AbstractWalkInBookingSmsIT {
         assertThat(jdbcTemplate.queryForObject(
                 "SELECT count(*) FROM bookings WHERE appointment_id = ? AND status = 'DECLINED'",
                 Integer.class, appointmentId)).isEqualTo(2);
-        assertThat(sentText()).isEqualTo(expectedBody(startsAt) + SALON_REBOOK + salonSlug);
+        assertThat(sentText()).isEqualTo(expectedWithPage(startsAt, visit.cancelUrl()));
     }
 
     @Test
@@ -161,11 +162,11 @@ class GuestProviderCancellationSmsIT extends AbstractWalkInBookingSmsIT {
     }
 
     @Test
-    @DisplayName("salon closure cascades over a future guest booking — exactly ONE SMS, body only "
-            + "(no rebook link: the salon is gone)")
-    void should_sendOneBodyOnlySms_when_salonClosureCancelsGuestBooking() throws Exception {
+    @DisplayName("salon closure cascades over a future guest booking — exactly ONE SMS linking the guest's own "
+            + "(now read-only) booking page, never a rebook page (the salon is gone)")
+    void should_sendOneOwnPageSms_when_salonClosureCancelsGuestBooking() throws Exception {
         OffsetDateTime startsAt = tomorrowAtNoon();
-        createGuestBookingAndSettle(startsAt);
+        SettledGuest guest = createGuestBookingSettled(startsAt);
 
         ResponseEntity<String> resp = restTemplate.exchange(
                 "/api/v1/salons/" + salon.salonId(), HttpMethod.DELETE,
@@ -173,12 +174,12 @@ class GuestProviderCancellationSmsIT extends AbstractWalkInBookingSmsIT {
         drainWorker.drain();
 
         assertThat(resp.getStatusCode()).as("salon delete body=%s", resp.getBody()).isEqualTo(HttpStatus.NO_CONTENT);
-        assertThat(sentText()).isEqualTo(expectedBody(startsAt));
+        assertThat(sentText()).isEqualTo(expectedWithPage(startsAt, guest.cancelUrl()));
     }
 
     @Test
-    @DisplayName("master removal cascades over a future guest booking — exactly ONE SMS with the SALON's "
-            + "rebook link only, never the removed master's own page")
+    @DisplayName("master removal cascades over a future legacy guest booking (no sealed token) — exactly ONE "
+            + "body-only SMS, never the removed master's own page")
     void should_sendOneSalonLinkSms_when_masterRemovalCancelsGuestBooking() throws Exception {
         OffsetDateTime startsAt = tomorrowAtNoon();
         String salonSlug = giveSalonSlug();
@@ -198,14 +199,14 @@ class GuestProviderCancellationSmsIT extends AbstractWalkInBookingSmsIT {
 
         assertThat(resp.getStatusCode()).as("master removal body=%s", resp.getBody()).isEqualTo(HttpStatus.NO_CONTENT);
         String text = sentText();
-        assertThat(text).isEqualTo(expectedBody(startsAt) + SALON_REBOOK + salonSlug);
+        assertThat(text).isEqualTo(expectedBody(startsAt));
         assertThat(text).doesNotContain(removedMasterSlug);
         assertThat(sentTurbosmsPayload().path("recipients").get(0).asText()).isEqualTo(LINK_PHONE);
     }
 
     @Test
-    @DisplayName("an INDEPENDENT master declines a guest booking — exactly ONE SMS with the master's OWN "
-            + "rebook link (the page the guest booked through)")
+    @DisplayName("an INDEPENDENT master declines a legacy guest booking (no sealed token) — exactly ONE "
+            + "body-only SMS, no rebook link")
     void should_sendOneMasterLinkSms_when_independentMasterDeclinesGuestBooking() throws Exception {
         OffsetDateTime startsAt = tomorrowAtNoon();
         Independent independent = seedIndependentMaster();
@@ -219,14 +220,14 @@ class GuestProviderCancellationSmsIT extends AbstractWalkInBookingSmsIT {
 
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
         String text = sentText();
-        assertThat(text).isEqualTo(expectedBody(startsAt) + " Записатися знову: beautica.app/book/" + masterSlug);
+        assertThat(text).isEqualTo(expectedBody(startsAt));
         assertThat(text).doesNotContain("/book/s/").doesNotContain(MASTER_NAME);
         assertThat(sentTurbosmsPayload().path("recipients").get(0).asText()).isEqualTo(LINK_PHONE);
     }
 
     @Test
-    @DisplayName("a guest booking with an invited SALON_MASTER (who has a slug) is declined — exactly ONE SMS with "
-            + "the SALON's rebook link, never the salon master's own page")
+    @DisplayName("a legacy guest booking (no sealed token) with an invited SALON_MASTER (who has a slug) is declined "
+            + "— exactly ONE body-only SMS, never the salon master's own page")
     void should_sendOneSalonLinkSms_when_salonMasterGuestBookingDeclined() throws Exception {
         OffsetDateTime startsAt = tomorrowAtNoon();
         String salonSlug = giveSalonSlug();
@@ -244,7 +245,7 @@ class GuestProviderCancellationSmsIT extends AbstractWalkInBookingSmsIT {
 
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
         String text = sentText();
-        assertThat(text).isEqualTo(expectedBody(startsAt) + SALON_REBOOK + salonSlug);
+        assertThat(text).isEqualTo(expectedBody(startsAt));
         assertThat(text).as("a salon master's own page is never offered").doesNotContain(salonMasterSlug);
     }
 
@@ -253,6 +254,11 @@ class GuestProviderCancellationSmsIT extends AbstractWalkInBookingSmsIT {
     private static String expectedBody(OffsetDateTime startsAt) {
         return "Beautica: Ваш запис " + DATE_FMT.format(startsAt.atZoneSameInstant(TimeZones.KYIV))
                 + " о " + startsAt.atZoneSameInstant(TimeZones.KYIV).toLocalTime() + " скасовано.";
+    }
+
+    /** Phase 435 — the body plus the guest's own booking page paragraph (sealed-token rows). */
+    private static String expectedWithPage(OffsetDateTime startsAt, String cancelUrl) {
+        return expectedBody(startsAt) + "\n\nДеталі або записатись знову " + cancelUrl;
     }
 
     /** Gives the fixture salon a V200-shaped booking slug and returns it. */

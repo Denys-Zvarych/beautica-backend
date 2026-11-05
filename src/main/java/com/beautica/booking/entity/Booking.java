@@ -1,6 +1,7 @@
 package com.beautica.booking.entity;
 
 import com.beautica.booking.domain.CancelTokenHasher;
+import com.beautica.booking.domain.GuestCancelToken;
 import com.beautica.booking.domain.GuestConsent;
 import com.beautica.booking.enums.BookingSource;
 import com.beautica.booking.enums.BookingStatus;
@@ -79,6 +80,8 @@ import java.util.UUID;
                 // JPA cannot encode WHERE booking_source='LINK' AND reminder_sent=FALSE —
                 // predicate lives in V89 only; do NOT treat this annotation as authoritative.
                 @Index(name = "idx_bookings_reminder", columnList = "starts_at"),
+                // partial index (V225): 15-min 2h-reminder sweep; predicate LINK AND CONFIRMED AND reminder_2h_sent=FALSE in V225 only.
+                @Index(name = "idx_bookings_reminder_2h", columnList = "starts_at"),
                 // idx_bookings_master_client_starts_at (V93) served the per-client "latest
                 // booking" LATERAL subquery formerly in FavoriteRepository.findFavoriteMasterRows.
                 // DROPPED by V144 once the favourites category axis was reversed from "last
@@ -483,11 +486,24 @@ public class Booking extends AuditableEntity {
     // cancelTokenHash. @JsonIgnore for the same capability reason as above.
     @JsonIgnore
     @Transient
-    private UUID cancelToken;
+    private GuestCancelToken cancelToken;
+
+    // Phase 435 (V230) — the same token sealed with AES-256-GCM (GuestCancelTokenCipher), so later guest SMS can
+    // rebuild the guest's own /book/cancel/{token} link. Never a lookup key (the hash is). NULL on rows created
+    // before V230, and nulled with the hash (explicitly in every hash-nulling statement + the V230 trigger).
+    // @JsonIgnore: opening it yields the cancel capability.
+    @JsonIgnore
+    @Column(name = "cancel_token_sealed", length = 128)
+    private String cancelTokenSealed;
 
     @Setter
     @Column(name = "reminder_sent", nullable = false)
     private boolean reminderSent;
+
+    // Phase 413 (V225) — 2h-before reminder claim flag. Written only by the native claim in BookingRepository
+    // (claimTwoHourRemindersByIds / claimTwoHourVisitRemindersByAppointmentIds); read by the sweep's JPQL filter.
+    @Column(name = "reminder_2h_sent", nullable = false)
+    private boolean reminder2hSent;
 
     // ── Staff-booking provenance (Phase 22.1 / V137) ──────────────────────────
     /**
@@ -615,7 +631,7 @@ public class Booking extends AuditableEntity {
                 .guestName(guestName)
                 .guestSurname(guestSurname)
                 .guestPhone(guestPhone)
-                .cancelToken(UUID.randomUUID())
+                .cancelToken(GuestCancelToken.generate())
                 .reminderSent(false)
                 .guestPrivacyAcceptedAt(consent == null ? null : consent.acceptedAt())
                 .guestPrivacyPolicyVersion(consent == null ? null : consent.policyVersion())
@@ -754,13 +770,32 @@ public class Booking extends AuditableEntity {
     }
 
     /**
+     * Phase 435 — stores the sealed copy of the token THIS instance minted (the caller seals it with
+     * {@code GuestCancelTokenCipher}, which an entity cannot reach). Only valid on a freshly built booking that
+     * still holds its raw token in memory.
+     *
+     * @throws IllegalStateException when this instance holds no raw token (loaded from the DB, or tokenless)
+     */
+    public void attachSealedCancelToken(String sealed) {
+        if (cancelToken == null) {
+            throw new IllegalStateException("No in-memory cancel token to seal");
+        }
+        this.cancelTokenSealed = sealed;
+    }
+
+    /**
      * Lombok fills in the remaining builder methods. {@code cancelToken(UUID)} is hand-written so the
      * persisted {@link #cancelTokenHash} can never drift from the in-memory raw {@link #cancelToken}:
      * setting one always sets the other (V206 — only the hash is stored).
      */
     public static class BookingBuilder {
 
+        /** A legacy UUID token (tests, fixtures) — same as {@code cancelToken(GuestCancelToken.of(uuid))}. */
         public BookingBuilder cancelToken(UUID cancelToken) {
+            return cancelToken(cancelToken == null ? null : GuestCancelToken.of(cancelToken));
+        }
+
+        public BookingBuilder cancelToken(GuestCancelToken cancelToken) {
             this.cancelToken = cancelToken;
             this.cancelTokenHash = cancelToken == null ? null : CancelTokenHasher.hash(cancelToken);
             return this;

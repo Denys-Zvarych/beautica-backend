@@ -4,6 +4,10 @@ import com.beautica.AbstractIntegrationTest;
 import com.beautica.auth.Role;
 import com.beautica.booking.enums.CancellationReason;
 import com.beautica.booking.repository.BookingRepository;
+import com.beautica.booking.retention.GuestPiiAnonymisationService;
+import com.beautica.common.security.PhoneHasher;
+import com.beautica.notification.telegram.link.TelegramLinkRows;
+import com.beautica.notification.telegram.link.TelegramLinkStatus;
 import com.beautica.media.service.R2StorageService;
 import com.beautica.salon.service.SalonService;
 import org.junit.jupiter.api.AfterEach;
@@ -22,6 +26,7 @@ import org.springframework.transaction.annotation.Transactional;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
 import java.util.List;
 import java.util.UUID;
 
@@ -68,6 +73,12 @@ class SalonDeactivationCascadeIT extends AbstractIntegrationTest {
 
     @Autowired
     private PasswordEncoder passwordEncoder;
+
+    @Autowired
+    private GuestPiiAnonymisationService guestPiiAnonymisationService;
+
+    @Autowired
+    private PhoneHasher phoneHasher;
 
     /**
      * {@code @SpyBean}, not plain {@code @Autowired} (perf MEDIUM, phase 337 cycle-2 audit): this
@@ -618,6 +629,34 @@ class SalonDeactivationCascadeIT extends AbstractIntegrationTest {
     }
 
     // ── fixtures ────────────────────────────────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("phase 409 — deleting the salon keeps the guest's last booking row, so retention still deletes the "
+            + "phone's Telegram link")
+    void should_deleteLink_when_salonDeletedWithPhonesLastBooking() {
+        Salon salon = createSalon();
+        String phone = "+380501234567";
+        Instant cutoff = Instant.now().atOffset(ZoneOffset.UTC).minusMonths(12).toInstant();
+        OffsetDateTime lastVisit = cutoff.minusSeconds(86_400).atOffset(ZoneOffset.UTC);
+        UUID bookingId = UUID.randomUUID();
+        jdbcTemplate.update("INSERT INTO bookings (id, client_id, master_id, master_service_id, salon_id, status, "
+                        + "starts_at, ends_at, price_at_booking, duration_minutes_at_booking, buffer_minutes_at_booking, "
+                        + "booking_source, guest_name, guest_surname, guest_phone, created_at, updated_at) "
+                        + "VALUES (?, NULL, ?, ?, ?, 'COMPLETED', ?, ?, 500.00, 60, 0, 'LINK', 'Гість', 'Тестовий', ?, "
+                        + "NOW(), NOW())",
+                bookingId, salon.masterId(), salon.masterServiceId(), salon.salonId(), lastVisit.minusMinutes(60),
+                lastVisit, phone);
+        TelegramLinkRows rows = new TelegramLinkRows(jdbcTemplate);
+        UUID link = rows.link(phoneHasher.hash(phone).hash(), 4_040_409L, TelegramLinkStatus.ACTIVE,
+                cutoff.minusSeconds(30L * 86_400));
+
+        salonService.deactivateSalon(salon.ownerId(), salon.salonId());
+        boolean bookingSurvivedDeletion = rows.count("SELECT count(*) FROM bookings WHERE id = ?", bookingId) == 1;
+        guestPiiAnonymisationService.anonymiseDue(cutoff);
+
+        assertThat(bookingSurvivedDeletion).as("salon deletion never hard-deletes a booking").isTrue();
+        assertThat(rows.linkExists(link)).isFalse();
+    }
 
     private record Salon(UUID ownerId, UUID salonId, UUID masterId, UUID masterServiceId,
                           UUID masterUserId, UUID serviceDefId) {}

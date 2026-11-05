@@ -171,6 +171,9 @@ app:
   outbox:
     # Test profile only — Base64 of 32 zero bytes; integration tests don't exercise real ciphertext content.
     payload-key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+  guest-cancel-token:
+    # Test profile only — Base64 of 32 0x01 bytes (distinct from the outbox key on purpose).
+    key: AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=
   internal-api-key: test-internal-api-key
   guest-pii-retention:
     # Phase 373 — no job bean in tests; ITs drive GuestPiiAnonymisationService directly.

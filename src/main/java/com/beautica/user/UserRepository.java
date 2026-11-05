@@ -1,5 +1,6 @@
 package com.beautica.user;
 
+import com.beautica.common.repository.TransactionLockTimeout;
 import com.beautica.auth.Role;
 import jakarta.persistence.LockModeType;
 import jakarta.persistence.QueryHint;
@@ -17,7 +18,7 @@ import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
-public interface UserRepository extends JpaRepository<User, UUID> {
+public interface UserRepository extends JpaRepository<User, UUID>, TransactionLockTimeout {
 
     Optional<User> findByEmail(String email);
 
@@ -161,7 +162,13 @@ public interface UserRepository extends JpaRepository<User, UUID> {
      */
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("SELECT u FROM User u WHERE u.email = :email")
-    Optional<User> findByEmailForUpdate(@Param("email") String email);
+    Optional<User> findByEmailForUpdateNoLockTimeout(@Param("email") String email);
+
+    /** {@link #findByEmailForUpdateNoLockTimeout} bounded by the transaction-local 3s {@code lock_timeout} ({@link TransactionLockTimeout}). */
+    default Optional<User> findByEmailForUpdate(String email) {
+        applyTransactionLockTimeout();
+        return findByEmailForUpdateNoLockTimeout(email);
+    }
 
     /**
      * Id-keyed counterpart of {@link #findByEmailForUpdate} — used by the authenticated
@@ -172,7 +179,13 @@ public interface UserRepository extends JpaRepository<User, UUID> {
      */
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("SELECT u FROM User u WHERE u.id = :userId")
-    Optional<User> findByIdForUpdate(@Param("userId") UUID userId);
+    Optional<User> findByIdForUpdateNoLockTimeout(@Param("userId") UUID userId);
+
+    /** {@link #findByIdForUpdateNoLockTimeout} bounded by the transaction-local 3s {@code lock_timeout} ({@link TransactionLockTimeout}). */
+    default Optional<User> findByIdForUpdate(UUID userId) {
+        applyTransactionLockTimeout();
+        return findByIdForUpdateNoLockTimeout(userId);
+    }
 
     /**
      * Row-locks the given users ({@code FOR UPDATE}, ordered by id so two concurrent batches always lock in
@@ -185,14 +198,18 @@ public interface UserRepository extends JpaRepository<User, UUID> {
      * <p>The native query declares its query space ({@code users}) via {@link HibernateHints#HINT_NATIVE_SPACES}
      * (perf P-L3): without it Hibernate cannot tell which tables a native statement touches and auto-flushes
      * (dirty-checking) the WHOLE persistence context first. With it, only pending {@code users} changes flush.
+     *
+     * <p>Fused transaction-local 3s {@code lock_timeout} ({@code TransactionLockTimeout}); {@code OF u} keeps the
+     * row lock off the one-row config subquery.
      */
     @QueryHints(@QueryHint(name = HibernateHints.HINT_NATIVE_SPACES, value = "users"))
     @Query(value = """
             SELECT u.id AS "id", u.avatar_r2_key AS "avatarR2Key", u.avatar_url AS "avatarUrl"
             FROM users u
+            CROSS JOIN (SELECT set_config('lock_timeout', '3s', true)) lock_cfg
             WHERE u.id IN (:ids)
             ORDER BY u.id
-            FOR UPDATE
+            FOR UPDATE OF u
             """, nativeQuery = true)
     List<UserAvatarPointers> lockAvatarPointersByIdIn(@Param("ids") Collection<UUID> ids);
 

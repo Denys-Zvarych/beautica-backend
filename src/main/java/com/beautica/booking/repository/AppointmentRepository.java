@@ -69,6 +69,14 @@ public interface AppointmentRepository extends JpaRepository<Appointment, UUID> 
     Optional<Appointment> findByCancelTokenHash(@Param("cancelTokenHash") String cancelTokenHash);
 
     /**
+     * Phase 435 — the sealed visit cancel token (V230) by header id, scalar, for {@code GuestBookingPageLinks} when the
+     * caller's booking holds an uninitialised header proxy (the outbox drain loads bookings without the header and runs
+     * outside a transaction). Primary-key probe; empty when the header is gone or carries no sealed token.
+     */
+    @Query("SELECT a.cancelTokenSealed FROM Appointment a WHERE a.id = :id AND a.cancelTokenSealed IS NOT NULL")
+    Optional<String> findCancelTokenSealedById(@Param("id") UUID id);
+
+    /**
      * Atomically consumes a visit's cancel token: flips a still-{@code CONFIRMED} guest visit HEADER to
      * {@code CANCELLED}, stamps {@code CLIENT_CANCELLED}, and nulls the token hash, in a single conditional
      * UPDATE. Mirrors {@code BookingRepository#consumeCancelTokenHash} lifted to the aggregate header: of N
@@ -98,7 +106,8 @@ public interface AppointmentRepository extends JpaRepository<Appointment, UUID> 
             UPDATE appointments
                SET status = 'CANCELLED',
                    cancellation_reason = 'CLIENT_CANCELLED',
-                   cancel_token_hash = NULL
+                   cancel_token_hash = NULL,
+                   cancel_token_sealed = NULL
               FROM (SELECT set_config('lock_timeout', '3s', true)) AS lock_cfg
              WHERE appointments.cancel_token_hash = :cancelTokenHash
                AND appointments.status = 'CONFIRMED'
@@ -169,6 +178,28 @@ public interface AppointmentRepository extends JpaRepository<Appointment, UUID> 
             ) locked
             """, nativeQuery = true)
     Optional<UUID> lockHeaderIfConfirmed(@Param("appointmentId") UUID appointmentId);
+
+    /**
+     * Phase 436 audit-fix (perf L2) — {@link #lockHeaderIfConfirmed} that also re-checks, in the SAME locking
+     * statement, that the header still holds {@code cancelTokenHash}: the guest partial-cancel path locks the header
+     * and confirms its token is not consumed in one round-trip, instead of a second hash lookup under the lock. Same
+     * {@code lock_timeout} fusion and wrapper as {@link #lockHeaderIfConfirmed}.
+     *
+     * @return the header's id if it is CONFIRMED, still carries this token hash and is now locked; empty otherwise
+     *         (consumed / unknown token, or the header left CONFIRMED) — the caller maps that to 404
+     */
+    @Query(value = """
+            SELECT id FROM (
+                SELECT set_config('lock_timeout', '3s', true) AS lock_cfg, a.id AS id
+                  FROM appointments a
+                 WHERE a.id = :appointmentId AND a.status = 'CONFIRMED'
+                   AND a.cancel_token_hash = :cancelTokenHash
+                 FOR UPDATE
+            ) locked
+            """, nativeQuery = true)
+    Optional<UUID> lockHeaderIfConfirmedWithToken(
+            @Param("appointmentId") UUID appointmentId,
+            @Param("cancelTokenHash") String cancelTokenHash);
 
     /**
      * Unconditionally locks the visit HEADER row via {@code SELECT ... FOR UPDATE}, regardless of
@@ -440,6 +471,7 @@ public interface AppointmentRepository extends JpaRepository<Appointment, UUID> 
                    client_comment = NULL,
                    client_cancellation_note = NULL,
                    cancel_token_hash = NULL,
+                   cancel_token_sealed = NULL,
                    guest_pii_anonymised_at = now(),
                    updated_at = now()
              WHERE a.id IN (
@@ -505,6 +537,7 @@ public interface AppointmentRepository extends JpaRepository<Appointment, UUID> 
                    client_comment = NULL,
                    client_cancellation_note = NULL,
                    cancel_token_hash = NULL,
+                   cancel_token_sealed = NULL,
                    guest_pii_anonymised_at = now(),
                    updated_at = now()
               FROM due
@@ -549,6 +582,7 @@ public interface AppointmentRepository extends JpaRepository<Appointment, UUID> 
                    client_comment = NULL,
                    client_cancellation_note = NULL,
                    cancel_token_hash = NULL,
+                   cancel_token_sealed = NULL,
                    guest_pii_anonymised_at = now(),
                    updated_at = now()
               FROM due
@@ -573,6 +607,7 @@ public interface AppointmentRepository extends JpaRepository<Appointment, UUID> 
                    client_comment = NULL,
                    client_cancellation_note = NULL,
                    cancel_token_hash = NULL,
+                   cancel_token_sealed = NULL,
                    guest_pii_anonymised_at = now(),
                    updated_at = now()
              WHERE guest_phone = :phone
@@ -589,10 +624,12 @@ public interface AppointmentRepository extends JpaRepository<Appointment, UUID> 
     /**
      * Locks (id order) the phone's upcoming guest/walk-in visit headers: header {@code CONFIRMED} and
      * at least one {@code CONFIRMED} item not yet ended (phase 373 D12 step 2). See
-     * {@code BookingRepository#lockUpcomingGuestSingleBookingIdsByPhone} for the race rationale.
+     * {@code BookingRepository#lockUpcomingGuestSingleBookingIdsByPhone} for the race rationale. Fused
+     * transaction-local 3s {@code lock_timeout} ({@code FOR UPDATE OF a} keeps the lock on the header only).
      */
     @Query(value = """
             SELECT a.id FROM appointments a
+            CROSS JOIN (SELECT set_config('lock_timeout', '3s', true)) lock_cfg
              WHERE a.guest_phone = :phone
                AND a.client_id IS NULL
                AND a.guest_pii_anonymised_at IS NULL
@@ -622,6 +659,7 @@ public interface AppointmentRepository extends JpaRepository<Appointment, UUID> 
                SET status = 'CANCELLED',
                    cancellation_reason = 'CLIENT_CANCELLED',
                    cancel_token_hash = NULL,
+                   cancel_token_sealed = NULL,
                    updated_at = now()
              WHERE id = :id
                AND status = 'CONFIRMED'

@@ -42,9 +42,22 @@ public record VisitSnapshot(
                 view.getHasUnreviewedCompleted());
     }
 
-    /** Only a LINK visit with no account ever gets an invite (D2: never STAFF, never APP). */
+    /** A LINK visit with no account — the only source the min-policy-version gate (D2) applies to. */
     public boolean isGuestLinkVisit() {
         return source == BookingSource.LINK && !hasClient;
+    }
+
+    /**
+     * Phase 434 — a STAFF (walk-in) visit with no account. Gets the same invite as a LINK guest but is exempt from the
+     * min-policy-version gate: walk-ins never record a {@code guest_privacy_policy_version} (user decision 2026-11-04).
+     */
+    public boolean isGuestStaffVisit() {
+        return source == BookingSource.STAFF && !hasClient;
+    }
+
+    /** Phase 434 — the visits that get a review invite: a LINK guest or a STAFF walk-in, never APP, never an account. */
+    public boolean isReviewInviteVisit() {
+        return isGuestLinkVisit() || isGuestStaffVisit();
     }
 
     @Override

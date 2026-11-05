@@ -68,6 +68,7 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 
@@ -94,6 +95,9 @@ class GuestPiiRetentionIT extends AbstractIntegrationTest {
     @SpyBean private BookingRepository bookingRepository;
     @MockBean private SmsService smsService;
 
+    /** Phase 435 — a well-formed v2 sealed value (V230 v2-only format CHECK); the content is irrelevant to the purge. */
+    private static final String SEALED = "v2:00000000:AAAAAAAAAAAAAAAAAAAAAA==";
+
     private GuestPiiFixtures fx;
     private GuestPiiFixtures.Provider provider;
     private Instant cutoff;
@@ -116,6 +120,7 @@ class GuestPiiRetentionIT extends AbstractIntegrationTest {
         assertThat(row.get("client_comment")).isNull();
         assertThat(row.get("client_cancellation_note")).isNull();
         assertThat(row.get("cancel_token_hash")).as("V206: the anonymiser clears the token hash").isNull();
+        assertThat(row.get("cancel_token_sealed")).as("V230: and the sealed token copy").isNull();
         assertThat(row.get("cancel_token")).isNull();
         assertThat(row.get("guest_pii_anonymised_at")).isNotNull();
     }
@@ -460,6 +465,39 @@ class GuestPiiRetentionIT extends AbstractIntegrationTest {
         }
 
         @Test
+        @DisplayName("phase 412 D5: an aged STAFF walk-in header carrying a cancel token is anonymised, token cleared")
+        void should_clearWalkInHeaderToken_when_staffVisitAged() {
+            UUID header = fx.appointment("STAFF", "COMPLETED", PHONE, UUID.randomUUID(), provider.ownerUserId());
+            fx.visitItem(provider, header, "STAFF", "COMPLETED", beforeCutoff(5), PHONE);
+            assertThat(fx.appointmentRow(header).get("cancel_token_hash")).as("fixture sanity").isNotNull();
+            jdbcTemplate.update("UPDATE appointments SET cancel_token_sealed = ? WHERE id = ?", SEALED, header);
+
+            GuestPiiAnonymisationResult result = service.anonymiseDue(cutoff);
+
+            assertThat(result.visitsAnonymised()).isEqualTo(1);
+            assertAnonymised(fx.appointmentRow(header));
+            assertThat(fx.appointmentRow(header).get("cancel_token_hash")).isNull();
+        }
+
+        @Test
+        @DisplayName("phase 412 D5: erase consumes an upcoming STAFF walk-in visit's cancel token and sends no SMS")
+        void should_consumeWalkInToken_when_upcomingStaffVisitErased() {
+            OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
+            UUID header = fx.appointment("STAFF", "CONFIRMED", PHONE, UUID.randomUUID(), provider.ownerUserId());
+            UUID item = fx.visitItem(provider, header, "STAFF", "CONFIRMED", now.plusDays(3), PHONE);
+            jdbcTemplate.update("UPDATE appointments SET cancel_token_sealed = ? WHERE id = ?", SEALED, header);
+
+            GuestPiiAnonymisationResult result = service.eraseByPhone(PHONE, null);
+
+            assertThat(result.visitsCancelled()).isEqualTo(1);
+            assertThat(fx.appointmentRow(header).get("status")).isEqualTo("CANCELLED");
+            assertThat(fx.appointmentRow(header).get("cancel_token_hash")).isNull();
+            assertThat(fx.appointmentRow(header).get("cancel_token_sealed")).as("V230: erase nulls the sealed copy").isNull();
+            assertThat(fx.booking(item).get("status")).isEqualTo("CANCELLED");
+            verifyNoInteractions(smsService);
+        }
+
+        @Test
         @DisplayName("the tokenless cancel-by-id statements stamp updated_at (D12)")
         void should_stampUpdatedAt_when_cancelledById() {
             OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
@@ -679,7 +717,7 @@ class GuestPiiRetentionIT extends AbstractIntegrationTest {
         }
 
         @Test
-        @DisplayName("seam regression: a live booking >2 h out still cancels by token with the guest SMS; inside 2 h is 422")
+        @DisplayName("seam regression: a live booking >2 h out still cancels by token (phase 435: no guest SMS); inside 2 h is 422")
         void should_keepTokenPathBehaviour() {
             UUID farToken = UUID.randomUUID();
             UUID nearToken = UUID.randomUUID();
@@ -692,12 +730,13 @@ class GuestPiiRetentionIT extends AbstractIntegrationTest {
             ResponseEntity<String> tooLate = restTemplate.exchange("/api/v1/book/cancel/" + nearToken,
                     HttpMethod.POST, HttpEntity.EMPTY, String.class);
 
-            assertThat(ok.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
+            assertThat(ok.getStatusCode()).isEqualTo(HttpStatus.OK);
             assertThat(tooLate.getStatusCode()).isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
             assertThat(fx.booking(far).get("status")).isEqualTo("CANCELLED");
             assertThat(fx.count("SELECT COUNT(*) FROM notification_outbox WHERE event_type = 'CLIENT_CANCELLED' "
                     + "AND aggregate_id = ?", far)).isEqualTo(1);
-            verify(smsService).send(eq(PHONE), anyString());
+            // Phase 435 (user decision 2026-11-04): the guest's own cancel sends the guest no SMS.
+            verify(smsService, never()).send(eq(PHONE), anyString());
         }
 
         @Test
@@ -869,7 +908,7 @@ class GuestPiiRetentionIT extends AbstractIntegrationTest {
                 erase.get(60, TimeUnit.SECONDS);
                 HttpStatus cancelStatus = HttpStatus.valueOf(cancel.get(60, TimeUnit.SECONDS).getStatusCode().value());
 
-                assertThat(cancelStatus).isIn(HttpStatus.NO_CONTENT, HttpStatus.NOT_FOUND);
+                assertThat(cancelStatus).isIn(HttpStatus.OK, HttpStatus.NOT_FOUND);
                 assertThat(fx.booking(single).get("status")).isEqualTo("CANCELLED");
                 assertThat(fx.count("SELECT COUNT(*) FROM notification_outbox WHERE event_type = 'CLIENT_CANCELLED' "
                         + "AND aggregate_id = ?", single)).isEqualTo(1);

@@ -25,6 +25,7 @@ import org.springframework.transaction.annotation.Transactional;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -501,6 +502,11 @@ public class NotificationOutboxDrainWorker {
     }
 
     private static final Duration OUTBOX_RETENTION = Duration.ofDays(30);
+    /** Rows per purge batch; each batch is its own short transaction. */
+    static final int PURGE_BATCH_SIZE = 1000;
+    /** Per-run ceiling (100k rows); any remainder is picked up by the next daily run. */
+    static final int PURGE_MAX_BATCHES = 100;
+    private static final List<String> PURGE_STATUSES = List.of(OutboxStatus.SENT.name(), OutboxStatus.DEAD.name());
 
     /**
      * Purges terminal outbox rows (SENT or DEAD) older than 30 days.
@@ -510,17 +516,26 @@ public class NotificationOutboxDrainWorker {
      * {@code idx_outbox_terminal_updated} (V59) makes this DELETE efficient even on
      * large tables — it pre-filters the {@code (status, updated_at)} columns.
      *
+     * <p>Bulk DELETE in bounded batches ({@link NotificationOutboxRepository#deleteTerminalBatchBefore}),
+     * each in its own {@code REQUIRES_NEW} transaction, so this method runs NOT_SUPPORTED: an outer
+     * transaction would only pin a second connection idle for the whole loop. Stops when a batch deletes
+     * fewer than {@link #PURGE_BATCH_SIZE} rows or after {@link #PURGE_MAX_BATCHES}.
+     *
      * <p>Fix MEDIUM-8 PERF.
      */
     @Scheduled(cron = "0 0 3 * * *")
-    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    @Transactional(propagation = Propagation.NOT_SUPPORTED)
     public void purgeStaleOutboxRows() {
         Instant cutoff = Instant.now().minus(OUTBOX_RETENTION);
-        outboxRepository.deleteByStatusInAndUpdatedAtBefore(
-                List.of(OutboxStatus.SENT, OutboxStatus.DEAD),
-                cutoff
-        );
-        log.info("Outbox TTL purge complete (cutoff={})", cutoff);
+        int deleted;
+        int batches = 0;
+        long total = 0;
+        do {
+            deleted = outboxRepository.deleteTerminalBatchBefore(PURGE_STATUSES, cutoff, PURGE_BATCH_SIZE);
+            total += deleted;
+            batches++;
+        } while (deleted == PURGE_BATCH_SIZE && batches < PURGE_MAX_BATCHES);
+        log.info("Outbox TTL purge complete (cutoff={}, deleted={}, batches={})", cutoff, total, batches);
     }
 
     /**
@@ -531,7 +546,7 @@ public class NotificationOutboxDrainWorker {
      */
     private List<Booking> visitAwareLeads(List<NotificationOutboxEntry> batch, Map<UUID, Booking> bookingCache) {
         return batch.stream()
-                .filter(e -> VISIT_AWARE_EVENTS.contains(e.getEventType()))
+                .filter(e -> VISIT_AWARE_EVENTS.contains(e.getEventType()) || isAggregatedClientCancel(e))
                 .map(e -> bookingCache.get(e.getAggregateId()))
                 .filter(Objects::nonNull)
                 .toList();
@@ -545,8 +560,11 @@ public class NotificationOutboxDrainWorker {
             // booking rows are hydrated here (see BookingVisitResolver) and threaded through every
             // channel. Cardinality is untouched — still one row, one notification, N services named.
             case NEW_BOOKING      -> notificationService.notifyNewBooking(getVisit(entry, bookingCache, visitSiblings));
-            case STATUS_CHANGED   -> notificationService.notifyBookingStatusChanged(getVisit(entry, bookingCache, visitSiblings));
-            case CLIENT_CANCELLED -> notificationService.notifyClientCancelled(getBooking(entry, bookingCache));
+            // Phase 408 audit-fix cycle 2: the entry id keeps a walk-in's cancellation budget reservation idempotent
+            // across a back-pressure retry (same precedent as BOOKING_RESCHEDULED below).
+            case STATUS_CHANGED   -> notificationService.notifyBookingStatusChanged(
+                    getVisit(entry, bookingCache, visitSiblings), entry.getId());
+            case CLIENT_CANCELLED -> dispatchClientCancelled(entry, bookingCache, visitSiblings);
             case BOOKING_RESCHEDULED -> {
                 Booking booking = getBooking(entry, bookingCache);
                 // INFO (perf): the payload is parsed ONCE for both fields.
@@ -567,8 +585,9 @@ public class NotificationOutboxDrainWorker {
             case MASTER_BOOKING_DECLINED -> notificationService.notifyMasterOfProviderDecline(
                     getVisit(entry, bookingCache, visitSiblings), actorUserIdOrNull(entry, readPayload(entry)));
             case CLOSURE_REMINDER -> notificationService.notifyClosureReminder(getBooking(entry, bookingCache));
-            case SALON_CLOSED -> notificationService.notifySalonClosed(getVisit(entry, bookingCache, visitSiblings));
-            case MASTER_REMOVED -> notificationService.notifyMasterRemoved(getVisit(entry, bookingCache, visitSiblings));
+            case SALON_CLOSED -> notificationService.notifySalonClosed(getVisit(entry, bookingCache, visitSiblings), entry.getId());
+            case MASTER_REMOVED -> notificationService.notifyMasterRemoved(
+                    getVisit(entry, bookingCache, visitSiblings), entry.getId());
             // Phase 339 — one Android push for one feed row; aggregate_id is the feed row id. The push
             // was rendered from live data in the pre-load block; an id with no plan is a D8 skip
             // (row gone/read, recipient gone or token-less) and is marked SENT without calling FCM.
@@ -596,6 +615,50 @@ public class NotificationOutboxDrainWorker {
                 );
             }
         }
+    }
+
+    /**
+     * Phase 436 — a {@code CLIENT_CANCELLED} row WITH a payload names the services one guest cancel-by-link request
+     * cancelled: the provider e-mail lists exactly those (the visit's CANCELLED siblings filtered by the payload ids).
+     * A payload-less row — every other caller and every pre-436 row — keeps the single-booking e-mail.
+     */
+    private void dispatchClientCancelled(NotificationOutboxEntry entry, Map<UUID, Booking> bookingCache,
+                                         Map<UUID, List<Booking>> visitSiblings) {
+        Booking lead = getBooking(entry, bookingCache);
+        Set<UUID> cancelledIds = cancelledBookingIds(entry);
+        if (cancelledIds.isEmpty()) {
+            notificationService.notifyClientCancelled(lead);
+            return;
+        }
+        BookingVisit visit = visitResolver.resolve(lead, visitSiblings);
+        List<Booking> cancelled = visit.items().stream()
+                .filter(item -> cancelledIds.contains(item.getId()))
+                .toList();
+        notificationService.notifyClientCancelled(cancelled.isEmpty()
+                ? BookingVisit.single(lead)
+                : BookingVisit.of(lead, cancelled, visit.appointmentStatus()));
+    }
+
+    private boolean isAggregatedClientCancel(NotificationOutboxEntry entry) {
+        return entry.getEventType() == OutboxEventType.CLIENT_CANCELLED
+                && entry.getPayload() != null && !entry.getPayload().isBlank();
+    }
+
+    /** The payload's cancelled booking ids; empty when absent. An unreadable id is skipped, never fatal. */
+    private Set<UUID> cancelledBookingIds(NotificationOutboxEntry entry) {
+        String ids = readPayload(entry).get(NotificationOutboxService.CANCELLED_BOOKING_IDS);
+        if (ids == null || ids.isBlank()) {
+            return Set.of();
+        }
+        Set<UUID> result = new LinkedHashSet<>();
+        for (String id : ids.split(",")) {
+            try {
+                result.add(UUID.fromString(id.trim()));
+            } catch (IllegalArgumentException e) {
+                log.warn("Outbox entry [{}] has an unreadable cancelled booking id — skipped", entry.getId());
+            }
+        }
+        return result;
     }
 
     /**

@@ -105,6 +105,7 @@ class GuestRescheduleSmsIT extends AbstractWalkInBookingSmsIT {
     void should_sendOneSms_when_providerReschedulesWalkIn() throws Exception {
         assertThat(createWalkIn(tomorrowAtNoon()).getStatusCode()).isEqualTo(HttpStatus.CREATED);
         drainWorker.drain();
+        String pageUrl = pageUrlIn(sentText());
         resetTurbosms();
         UUID bookingId = (UUID) onlyBooking().get("id");
         OffsetDateTime newStart = tomorrowAt(LocalTime.of(15, 0));
@@ -113,7 +114,8 @@ class GuestRescheduleSmsIT extends AbstractWalkInBookingSmsIT {
         drainWorker.drain();
 
         assertThat(resp.getStatusCode()).as("body=%s", resp.getBody()).isEqualTo(HttpStatus.OK);
-        assertThat(sentText()).isEqualTo(expectedSms(newStart));
+        assertThat(sentText()).as("sealed visit header (V230) → the guest's own page is linked")
+                .isEqualTo(expectedSms(newStart, pageUrl));
         assertThat(sentTurbosmsPayload().path("recipients").get(0).asText()).isEqualTo(E164_PHONE);
     }
 
@@ -151,8 +153,9 @@ class GuestRescheduleSmsIT extends AbstractWalkInBookingSmsIT {
     @DisplayName("one service of a guest visit is moved — exactly ONE SMS, naming that service's new time")
     void should_sendOneSms_when_oneGuestVisitServiceMoved() throws Exception {
         UUID second = insertService(salon.masterId(), "SALON", salon.salonId());
-        UUID appointmentId = createGuestVisitAndSettle(tomorrowAt(LocalTime.of(10, 0)),
+        SettledGuest visit = createGuestVisitSettled(tomorrowAt(LocalTime.of(10, 0)),
                 List.of(salon.masterServiceId(), second));
+        UUID appointmentId = visit.id();
         UUID secondItem = visitItems(appointmentId).get(1);
         OffsetDateTime newStart = tomorrowAt(LocalTime.of(15, 0));
 
@@ -163,15 +166,16 @@ class GuestRescheduleSmsIT extends AbstractWalkInBookingSmsIT {
         drainWorker.drain();
 
         assertThat(resp.getStatusCode()).as("body=%s", resp.getBody()).isEqualTo(HttpStatus.OK);
-        assertThat(sentText()).isEqualTo(expectedSms(newStart));
+        assertThat(sentText()).isEqualTo(expectedSms(newStart, visit.cancelUrl()));
     }
 
     @Test
     @DisplayName("a whole guest visit is moved — exactly ONE SMS for the visit, naming its new start")
     void should_sendOneSmsPerVisit_when_wholeGuestVisitMoved() throws Exception {
         UUID second = insertService(salon.masterId(), "SALON", salon.salonId());
-        UUID appointmentId = createGuestVisitAndSettle(tomorrowAt(LocalTime.of(10, 0)),
+        SettledGuest visit = createGuestVisitSettled(tomorrowAt(LocalTime.of(10, 0)),
                 List.of(salon.masterServiceId(), second));
+        UUID appointmentId = visit.id();
         OffsetDateTime newStart = tomorrowAt(LocalTime.of(13, 0));
 
         ResponseEntity<String> resp = restTemplate.exchange(
@@ -181,7 +185,7 @@ class GuestRescheduleSmsIT extends AbstractWalkInBookingSmsIT {
         drainWorker.drain();
 
         assertThat(resp.getStatusCode()).as("body=%s", resp.getBody()).isEqualTo(HttpStatus.OK);
-        assertThat(sentText()).isEqualTo(expectedSms(newStart));
+        assertThat(sentText()).isEqualTo(expectedSms(newStart, visit.cancelUrl()));
     }
 
     // ── Audit-fix cycle 1: burst collapse, staleness, request cap, per-phone budget ───
@@ -657,8 +661,22 @@ class GuestRescheduleSmsIT extends AbstractWalkInBookingSmsIT {
                 bookingId).toInstant();
     }
 
+    /** Body only — rows seeded without the V230 sealed token ({@code insertConfirmedLinkBooking}): no link. */
     private static String expectedSms(OffsetDateTime newStart) {
         var kyiv = newStart.atZoneSameInstant(TimeZones.KYIV);
         return "Beautica: Ваш запис перенесено на " + DATE_FMT.format(kyiv) + " о " + TIME_FMT.format(kyiv) + ".";
+    }
+
+    /** Phase 435 — sealed-token rows (public create, walk-in): the body plus the guest's own page paragraph. */
+    private static String expectedSms(OffsetDateTime newStart, String pageUrl) {
+        return expectedSms(newStart) + "\n\nДеталі або записатись знову " + pageUrl;
+    }
+
+    /** The guest's own page ({@code /c/{token}}, phase 435 follow-up) a walk-in confirmation SMS carries. */
+    private static String pageUrlIn(String smsText) {
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("https?://\\S+/c/[0-9A-Za-z]{16}")
+                .matcher(smsText);
+        assertThat(m.find()).as("walk-in SMS carries the guest page link").isTrue();
+        return m.group();
     }
 }

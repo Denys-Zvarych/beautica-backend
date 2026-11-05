@@ -2520,4 +2520,58 @@ class AuthRateLimitFilterTest {
                     .isNotNull();
         }
     }
+
+    // ==========================================================================
+    @Nested
+    @DisplayName("POST /api/v1/book/telegram/* (phase 407 D5)")
+    class TelegramLinkEndpoints {
+
+        private static final String LINK_TOKEN = "/api/v1/book/telegram/link-token";
+        private static final String STATUS = "/api/v1/book/telegram/status";
+        private static final String UNLINK = "/api/v1/book/telegram/unlink";
+
+        /** Real filter, every injected bucket permissive; the telegram buckets get their production defaults. */
+        private AuthRateLimitFilter realFilter() {
+            return filterWithMediaCapacity(1_000_000);
+        }
+
+        private int fire(AuthRateLimitFilter real, String path, String ip) throws Exception {
+            var request = new MockHttpServletRequest("POST", path);
+            request.setRemoteAddr(ip);
+            var response = new MockHttpServletResponse();
+            real.doFilterInternal(request, response, new MockFilterChain());
+            return response.getStatus();
+        }
+
+        @Test
+        @DisplayName("link-token: 5 per IPv6 /64, a rotated interface id shares the bucket, another /64 does not")
+        void should_shareLinkTokenBucketAcrossIpv6Slash64_when_interfaceIdRotates() throws Exception {
+            AuthRateLimitFilter real = realFilter();
+            for (int i = 1; i <= 5; i++) {
+                assertThat(fire(real, LINK_TOKEN, "2001:db8:1:2::" + Integer.toHexString(i))).isEqualTo(200);
+            }
+
+            int samePrefix = fire(real, LINK_TOKEN, "2001:db8:1:2:ffff:ffff:ffff:ffff");
+            int otherPrefix = fire(real, LINK_TOKEN, "2001:db8:1:3::1");
+
+            assertThat(samePrefix).isEqualTo(429);
+            assertThat(otherPrefix).isEqualTo(200);
+        }
+
+        @Test
+        @DisplayName("status + unlink: one shared 30-token bucket per IPv6 /64, separate from link-token")
+        void should_shareReadBucketAcrossStatusAndUnlink_when_samePrefix() throws Exception {
+            AuthRateLimitFilter real = realFilter();
+            for (int i = 1; i <= 30; i++) {
+                String path = i % 2 == 0 ? STATUS : UNLINK;
+                assertThat(fire(real, path, "2001:db8:5:6::" + Integer.toHexString(i))).isEqualTo(200);
+            }
+
+            int limited = fire(real, STATUS, "2001:db8:5:6::abcd");
+            int linkTokenStillOpen = fire(real, LINK_TOKEN, "2001:db8:5:6::abcd");
+
+            assertThat(limited).isEqualTo(429);
+            assertThat(linkTokenStillOpen).isEqualTo(200);
+        }
+    }
 }

@@ -51,6 +51,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <p>Same {@code @TestPropertySource} as {@code ReviewInviteSchedulerIT}, so the Spring context is shared.
  */
 @TestPropertySource(properties = {
+        "app.frontend.base-url=https://beautica.app",
         "app.booking.sms.enabled=true",
         "app.booking.review-invite.enabled=true",
         "app.booking.review-invite.min-policy-version=2026-10-20"
@@ -242,6 +243,24 @@ class GuestReviewSubmitIT extends AbstractReviewInviteIT {
         assertThat(inviteRow(inviteId).get("status")).isEqualTo("SENT");
         assertThat(reviewsOf(foreignLink)).isEmpty();
         assertThat(reviewsOf(appBooking)).isEmpty();
+    }
+
+    @Test
+    @DisplayName("phase 434: a STAFF walk-in visit invite (no policy version) → its COMPLETED item reviews as "
+            + "GUEST_LINK, 201, the token is CONSUMED")
+    void should_acceptWalkInItem_when_staffVisitInviteRedeemed() {
+        UUID appointmentId = fixtures.staffGuestVisit("COMPLETED", GUEST_PHONE);
+        UUID walkIn = fixtures.visitItem(appointmentId, masterId, masterServiceId, "STAFF", "COMPLETED", GUEST_PHONE,
+                5);
+        String token = newToken();
+        UUID inviteId = sentVisitInvite(appointmentId, token);
+
+        ResponseEntity<String> created = submit(token, "[" + item(walkIn, 5, null) + "]");
+
+        assertThat(created.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        assertThat(inviteRow(inviteId).get("status")).isEqualTo("CONSUMED");
+        assertThat(reviewsOf(walkIn)).singleElement()
+                .satisfies(row -> assertThat(row.get("source")).isEqualTo("GUEST_LINK"));
     }
 
     @Test

@@ -11,15 +11,23 @@ spring:
       idle-timeout: 300000
       minimum-idle: 2              # Low startup footprint on Railway 512MB; pool grows on demand
       maximum-pool-size: 10        # App container (512MB, -Xmx256m); Flyway pool 2 + headroom; max_connections default 100, confirm in M7. No pooler: if a transaction-mode pooler is ever added, revisit server-side prepares (prepareThreshold).
-      connection-timeout: 20000    # Fail faster under pool saturation; 30s was masking exhaustion (was 30000)
-      leak-detection-threshold: 10000  # Alert on connections held > 10 s — indicates a blocking or long-running query
+      # Wait for a free connection before failing the request. 10 s (was 20000, before that 30000): with
+      # virtual threads a burst queues many requests on the pool at once, and 20 s was a long hang before
+      # the 500. Still above the 5 s statement_timeout below, so one slow statement finishing frees a
+      # connection well before a queued request gives up.
+      connection-timeout: 10000
+      # WARN when a connection is held longer than this. 35 s (was 10000): ABOVE the longest deliberate
+      # transaction budget — deactivateSalon, staff self-delete and client self-delete are
+      # @Transactional(timeout = 30), remove-master is 15 s — so those legitimate long holds no longer log a false
+      # "Apparent connection leak". Anything past 35 s has outlived every budget and is a real leak.
+      leak-detection-threshold: 35000
       # Server-side ceiling on EVERY application statement — the backstop this pool never had.
       # statement_timeout previously appeared only inside individual migrations (SET LOCAL in
       # V139/V159/V165 and friends), so no runtime query had any ceiling at all: a single
       # pathological plan (the Phase 326 zero-trigram sequential scan was one, at 119 ms x 240
       # requests/minute/IP) could hold all 10 connections until the client gave up, and
       # connection-timeout above then queues logins and booking writes behind it. leak-detection
-      # only LOGS at 10 s; this one actually aborts, and it does so in the database, where a
+      # only LOGS (at 35 s); this one actually aborts, and it does so in the database, where a
       # runaway statement keeps burning CPU long after the JVM has walked away.
       #
       # 5 s is ~40x the slowest legitimate statement measured on this schema (the salon-board
@@ -350,6 +358,16 @@ app:
     # appointment during which a guest may still cancel via the cancel link.
     # A cancel request inside this window returns 422.
     cancel-window-hours: ${BOOKING_CANCEL_WINDOW_HOURS:2}
+    # Phase 435 audit-fix — days after its start that a TERMINAL (cancelled/declined/completed/no-show) booking's
+    # guest page GET /book/cancel/{token} stays readable; afterwards the token 404s.
+    terminal-view-days: ${BOOKING_TERMINAL_VIEW_DAYS:30}
+    # Phase 413 — 2h-before guest reminder (BookingReminderJob#sweepTwoHour, every 15 min, window [now+1h45, now+2h15)).
+    # Never sent 21:00-09:00 Kyiv (skipped, not deferred); skipped when the booking was made < min-lead before its
+    # start. Goes to Telegram when the guest's phone is linked (phase 408), else SMS. Text: BookingSmsProperties
+    # .Sms#reminder2h (Java default only, no yml copy).
+    reminder-2h:
+      enabled: ${APP_BOOKING_REMINDER_2H_ENABLED:false}
+      min-lead: ${APP_BOOKING_REMINDER_2H_MIN_LEAD:3h}
     sms:
       # Phase 22.7 — THE single "are we spending SMS money" switch. Read by SmsConfig, which uses
       # it to choose the SmsService bean itself (NoOpSmsService when false, TurbosmsService when
@@ -375,20 +393,40 @@ app:
       # Ukrainian SMS copy with {placeholder} tokens substituted at send time
       # (GuestBookingService / BookingReminderJob). Multiline via YAML block scalar.
       # Rendered text (a guest's appointment details) is never logged.
+      # Phase 435 (user decision 2026-11-04) — no {serviceName}: it is no longer substituted.
       confirmation: |-
-        Beautica: Запис підтверджено!
-        {masterName}, {serviceName}
-        {date} о {time}
+        Beautica: Ваш запис підтверджено!
 
-        Скасувати: {cancelUrl}
-      reminder: |-
-        Beautica: Нагадуємо!
-        {serviceName} у {masterName}
-        Завтра о {time}
-      cancellation: |-
-        Beautica: Ваш запис скасовано.
-        {serviceName} у {masterName}
         {date} о {time}
+        Майстер {masterName}.
+        Адреса: {address} ({locationNote})
+        Скасувати: {cancelUrl}
+      # Phase 435 — salon bookings name the salon and the performing master (picked when the booking has a salon).
+      confirmation-salon: |-
+        Beautica: Ваш запис підтверджено!
+
+        {date} о {time}
+        Салон {salonName}, майстер {masterName}.
+        Адреса: {address} ({locationNote})
+        Скасувати: {cancelUrl}
+      # Phase 435 — the «Адреса:» line is dropped when the booking has no address; the «Скасувати запис:» line
+      # when the guest's own page cannot be rebuilt (row created before V230 — no sealed token).
+      # Phase 435 follow-up (2026-11-04) — no blank lines after the title; « ({locationNote})» is the provider's
+      # «how to find us» note, its brackets dropped when there is none (GuestSmsProviderText). Same for confirmations.
+      reminder: |-
+        Beautica: Нагадуємо, що завтра у Вас запис!
+
+        {masterName} | {serviceName} о {time}
+        Адреса: {address} ({locationNote})
+        Скасувати запис: {cancelUrl}
+      reminder-salon: |-
+        Beautica: Нагадуємо, що завтра у Вас запис!
+
+        {salonName} | {masterName} | {serviceName} о {time}
+        Адреса: {salonAddress} ({locationNote})
+        Скасувати запис: {cancelUrl}
+      # Phase 435 — no `cancellation:` key: the guest who cancels via the cancel link gets no SMS
+      # (user decision 2026-11-04). Do not re-add it — nothing reads it.
       # Phase 390 — the guest provider-cancellation SMS (decline, salon closure, master removal) is
       # fixed copy in GuestProviderCancellationSmsText, not a template here (no provider text in it;
       # its length is pinned by tests). Do not re-add `decline:` / `decline-reason:` — nothing reads them.
@@ -396,18 +434,26 @@ app:
       # key here either, on the walk-in precedent below: its single source is
       # BookingSmsProperties.Sms#reschedule. Override with APP_BOOKING_SMS_RESCHEDULE (relaxed binding);
       # GuestRescheduleSmsText fails boot unless it keeps {date} and {time} and fits 2 UCS-2 segments.
-      # Phase 22.7 — the walk-in confirmation (POST /api/v1/masters/{masterId}/bookings) is the ONE
-      # template with no key here, deliberately (QA MEDIUM, 2026-08-18). Its text lives in exactly
-      # one place: BookingSmsProperties.Sms#walkInConfirmation. A yml copy identical to that default
-      # used to sit here, which made the Java literal dead code — two sources of truth for one
-      # user-visible string, and mutating the Java one changed nothing in any profile.
-      #
-      # Do NOT re-add `walk-in-confirmation:` merely to make the copy visible from config; that
-      # silently kills the Java default again. Add it only to genuinely OVERRIDE the text, and note
-      # in the same commit that BookingSmsProperties' default is then no longer the live value.
-      # Constraint that travels with the copy wherever it lives: it must carry NO {cancelUrl} — a
-      # STAFF booking has cancel_token = NULL by the V137 CHECK, so there is no link to build and
-      # the placeholder would render literally in a real client's message.
+      # Phase 22.7 / 412 — the walk-in confirmation (POST /api/v1/masters/{masterId}/bookings). Phase 412 D3
+      # restored this key (it had been removed in 22.7 as a duplicate of the Java default): it is now the LIVE
+      # value, and BookingSmsProperties.Sms#walkInConfirmation is the identical fallback — change both together.
+      # Reversed by 412: it now carries {cancelUrl} — the walk-in visit header holds a one-time cancel token
+      # (V226) and StaffBookingService always maps cancelUrl to /c/{token} (phase 435 follow-up; was /book/cancel/{token}). 3 UCS-2 segments typical.
+      # Phase 435: same copy as `confirmation` (no {serviceName}).
+      walk-in-confirmation: |-
+        Beautica: Ваш запис підтверджено!
+
+        {date} о {time}
+        Майстер {masterName}.
+        Адреса: {address} ({locationNote})
+        Скасувати: {cancelUrl}
+      walk-in-confirmation-salon: |-
+        Beautica: Ваш запис підтверджено!
+
+        {date} о {time}
+        Салон {salonName}, майстер {masterName}.
+        Адреса: {address} ({locationNote})
+        Скасувати: {cancelUrl}
     # Phase 400 — guest review invite SMS (beautica.app/r/{token}) ~2h after a LINK visit is COMPLETED, never
     # 21:00-09:00 Kyiv (moved to 10:00), one per visit. Bound by ReviewInviteProperties (validated at boot). Needs BOTH
     # this flag and app.booking.sms.enabled; in staging (beautica.sms.mode=capture) the SMS lands in Mailpit.
@@ -426,8 +472,14 @@ app:
       # Rows per claim / expiry statement per tick (D4a — every claim is LIMITed).
       batch-size: 50
       max-attempts: 3
-      # One UCS-2 segment (<= 70 chars with the 22-char token) — checked at boot. Override for a non-prod web host.
-      sms-text: "${APP_BOOKING_REVIEW_INVITE_SMS_TEXT:Оцініть ваш візит: beautica.app/r/{token}}"
+      # Phase 434 audit-fix — a STAFF walk-in invite is SKIPPED (REPEAT_PHONE) when the same phone already got an
+      # invite for the same provider (master, or salon of a salon booking) within this window.
+      staff-phone-window: 30d
+      # Phase 434 audit-fix (LOW-4) — STAFF walk-in caps: max non-skipped STAFF invites per phone across ALL providers
+      # within staff-phone-window (PHONE_GLOBAL_CAP), and per provider (master, or salon) in 24 h (PROVIDER_DAILY_CAP).
+      staff-phone-global-cap: 3
+      staff-provider-daily-cap: 50
+      # The invite SMS copy is in code (ReviewInviteProperties.SMS_COPY); its link origin is app.frontend.base-url.
       job:
         fixed-delay-ms: 60000
         initial-delay-ms: 60000
@@ -482,6 +534,23 @@ app:
       base-url: ${TURBOSMS_BASE_URL:https://api.turbosms.ua/message/send.json}
       connect-timeout: 3s
       read-timeout: 5s
+  telegram:
+    # Phase 404 — opt-in Telegram reminder channel (TelegramConfig). OFF by default: NoOpTelegramMessenger
+    # throws, so every message falls back to SMS. Write the flag as true/false (no relaxed binding).
+    # mode: live (Bot API) | capture (Mailpit). Staging runs its OWN bot (phase 432): EnvironmentFingerprintGuard
+    # refuses the prod bot's token/username there, and TelegramEnvGuard requires a non-empty tester allow-list when
+    # enabled + live. enabled=true + live fails boot unless token, username and webhook secret are all set
+    # (TelegramProperties). The token is a secret and is never logged.
+    enabled: ${APP_TELEGRAM_ENABLED:false}
+    mode: live
+    bot-token: ${TELEGRAM_BOT_TOKEN:}
+    bot-username: ${TELEGRAM_BOT_USERNAME:}
+    webhook-secret: ${TELEGRAM_WEBHOOK_SECRET:}
+    api-base-url: https://api.telegram.org
+    link-token-ttl: 30m
+    # Phase 432 D3 — staging-only tester allow-list: comma-separated positive chat ids (private chat id = user id).
+    # Blank entries, negatives and non-numbers fail boot. Read on staging only; prod ignores it.
+    staging-allowed-chat-ids: ${TELEGRAM_STAGING_ALLOWED_CHAT_IDS:}
   json:
     # Global Jackson StreamReadConstraints (see JsonConfig / JsonConstraintsProperties).
     # max-string-length caps a single JSON string token at the PARSE phase so a multi-MB
@@ -609,6 +678,14 @@ app:
     # Generate with: openssl rand -base64 32
     # Empty default forces every profile (incl. test) to provide a value or fail fast at startup.
     payload-key: ${OUTBOX_PAYLOAD_KEY:}
+  guest-cancel-token:
+    # Phase 435 — Base64 32-byte (AES-256) key sealing the guest cancel token at rest (GuestCancelTokenCipher),
+    # so later guest SMS can link the guest's own /book/cancel/{token} page. Dedicated, NOT OUTBOX_PAYLOAD_KEY.
+    # Generate with: openssl rand -base64 32. Empty default = boot fails in every profile that does not set it.
+    key: ${GUEST_CANCEL_TOKEN_KEY:}
+    # Phase 435 audit-fix — DECRYPT-ONLY previous key during a rotation (values are sealed v2:<kid>:…, so open picks
+    # the key by kid). Empty outside a rotation. Rotation steps: docs/backend-phases/phase-435-guest-sms-copy.md.
+    key-previous: ${GUEST_CANCEL_TOKEN_KEY_PREVIOUS:}
   # app.internal-api-key is deliberately NOT defined in the base profile: a base default would
   # reach prod. It is mapped from INTERNAL_API_KEY in application-prod.yml (staging inherits it;
   # EnvironmentFingerprintGuard enforces non-blank, non-default, >= 32 chars) and given a dev-only

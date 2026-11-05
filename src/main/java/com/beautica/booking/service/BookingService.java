@@ -3169,8 +3169,9 @@ public class BookingService {
         eventPublisher.publishEvent(new BookingCompletedEvent(
                 saved.getClient() != null ? saved.getClient().getId() : null));
         // Phase 400 D7 — a single LINK booking (no visit header; appointment children were refused above) gets a
-        // review invite, created AFTER_COMMIT by ReviewInviteScheduler. APP / STAFF publish nothing.
-        if (saved.getBookingSource() == BookingSource.LINK) {
+        // review invite, created AFTER_COMMIT by ReviewInviteScheduler. Phase 434 — a single STAFF (walk-in) booking
+        // publishes too; the scheduler keeps only walk-ins with no account. APP publishes nothing.
+        if (saved.getBookingSource() == BookingSource.LINK || saved.getBookingSource() == BookingSource.STAFF) {
             eventPublisher.publishEvent(new GuestBookingCompletedEvent(saved.getId(), clock.instant()));
         }
         return BookingResponse.from(saved, resolveNow());

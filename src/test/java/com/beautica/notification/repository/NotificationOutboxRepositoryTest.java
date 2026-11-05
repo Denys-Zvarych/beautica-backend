@@ -435,7 +435,7 @@ class NotificationOutboxRepositoryTest extends AbstractDataJpaTest {
     // ── Purge query ───────────────────────────────────────────────────────────
 
     /**
-     * Verifies {@link NotificationOutboxRepository#deleteByStatusInAndUpdatedAtBefore}:
+     * Verifies {@link NotificationOutboxRepository#deleteTerminalBatchBefore}:
      * <ul>
      *   <li>Deletes SENT rows whose {@code updated_at} is before the cutoff.</li>
      *   <li>Deletes DEAD rows whose {@code updated_at} is before the cutoff.</li>
@@ -445,7 +445,7 @@ class NotificationOutboxRepositoryTest extends AbstractDataJpaTest {
      *
      * <p>The {@code insertOutboxRow} helper sets {@code updated_at} equal to the supplied
      * {@code createdAt} timestamp via raw JDBC. Because
-     * {@link NotificationOutboxRepository#deleteByStatusInAndUpdatedAtBefore} is annotated
+     * {@link NotificationOutboxRepository#deleteTerminalBatchBefore} is annotated
      * with {@code @Transactional(propagation = REQUIRES_NEW)}, it opens a new database
      * transaction that must be able to read the test rows. The {@code @DataJpaTest}
      * default outer transaction would keep the JDBC inserts uncommitted, making them
@@ -476,9 +476,11 @@ class NotificationOutboxRepositoryTest extends AbstractDataJpaTest {
         insertOutboxRow(oldPendingId, OutboxEventType.CLIENT_CANCELLED, "PENDING", old);
 
         // Act — REQUIRES_NEW inner transaction; rows are now auto-committed so they are visible.
-        repo.deleteByStatusInAndUpdatedAtBefore(List.of(OutboxStatus.SENT, OutboxStatus.DEAD), cutoff);
+        int deleted = repo.deleteTerminalBatchBefore(
+                List.of(OutboxStatus.SENT.name(), OutboxStatus.DEAD.name()), cutoff, 100);
 
         // Assert — verify via JDBC so no transaction boundary issues with the persistence context.
+        assertThat(deleted).as("exactly the two old terminal rows").isEqualTo(2);
         assertThat(rowExists(oldSentId))
                 .as("old SENT row must be deleted by the purge query")
                 .isFalse();
@@ -495,6 +497,33 @@ class NotificationOutboxRepositoryTest extends AbstractDataJpaTest {
         // Cleanup — NOT_SUPPORTED means no rollback; we must delete manually.
         jdbcTemplate.update("DELETE FROM notification_outbox WHERE id IN (?, ?, ?, ?)",
                 recentSentId, oldPendingId, oldSentId, oldDeadId);
+    }
+
+    @Test
+    @Transactional(propagation = Propagation.NOT_SUPPORTED)
+    @DisplayName("purge batch deletes at most `limit` rows, oldest first, in one set-based statement")
+    void should_deleteAtMostLimitOldestFirst_when_backlogExceedsBatch() {
+        // Arrange — three old SENT rows at distinct ages
+        Instant cutoff = Instant.now().minus(java.time.Duration.ofDays(30));
+        UUID oldest = UUID.randomUUID();
+        UUID middle = UUID.randomUUID();
+        UUID newest = UUID.randomUUID();
+        insertOutboxRow(oldest, OutboxEventType.NEW_BOOKING, "SENT", cutoff.minusSeconds(3 * 3600));
+        insertOutboxRow(middle, OutboxEventType.NEW_BOOKING, "SENT", cutoff.minusSeconds(2 * 3600));
+        insertOutboxRow(newest, OutboxEventType.NEW_BOOKING, "SENT", cutoff.minusSeconds(3600));
+
+        // Act
+        int first = repo.deleteTerminalBatchBefore(List.of(OutboxStatus.SENT.name()), cutoff, 2);
+        boolean newestSurvivedFirstBatch = rowExists(newest);
+        int second = repo.deleteTerminalBatchBefore(List.of(OutboxStatus.SENT.name()), cutoff, 2);
+
+        // Assert
+        assertThat(first).as("a batch never exceeds its limit").isEqualTo(2);
+        assertThat(rowExists(oldest)).isFalse();
+        assertThat(rowExists(middle)).isFalse();
+        assertThat(newestSurvivedFirstBatch).as("ordered by updated_at: the newest row is left for the next batch").isTrue();
+        assertThat(second).as("the short batch that ends the worker's loop").isEqualTo(1);
+        assertThat(rowExists(newest)).isFalse();
     }
 
     private boolean rowExists(UUID id) {

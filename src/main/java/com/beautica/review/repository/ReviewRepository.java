@@ -1,5 +1,6 @@
 package com.beautica.review.repository;
 
+import com.beautica.common.repository.TransactionLockTimeout;
 import com.beautica.review.dto.MyReviewResponse;
 import com.beautica.review.entity.Review;
 import org.springframework.data.domain.Page;
@@ -27,7 +28,7 @@ import java.util.UUID;
  * ({@link #existsByBookingId}, {@link #findReviewedBookingIds}) — a hidden review still occupies its booking, so it
  * can never be written twice. A new public read MUST carry the same predicate.
  */
-public interface ReviewRepository extends JpaRepository<Review, UUID> {
+public interface ReviewRepository extends JpaRepository<Review, UUID>, TransactionLockTimeout {
 
     /**
      * Phase 396 — the review row, locked {@code FOR UPDATE}, for a moderation transition. Serialises concurrent
@@ -35,7 +36,13 @@ public interface ReviewRepository extends JpaRepository<Review, UUID> {
      */
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("SELECT r FROM Review r WHERE r.id = :id")
-    Optional<Review> findByIdForUpdate(@Param("id") UUID id);
+    Optional<Review> findByIdForUpdateNoLockTimeout(@Param("id") UUID id);
+
+    /** {@link #findByIdForUpdateNoLockTimeout} bounded by the transaction-local 3s {@code lock_timeout} ({@link TransactionLockTimeout}). */
+    default Optional<Review> findByIdForUpdate(UUID id) {
+        applyTransactionLockTimeout();
+        return findByIdForUpdateNoLockTimeout(id);
+    }
 
     /**
      * Phase 396 auto-hide cap — reviews of the same provider as {@code reviewId} (its master, or its salon) that an

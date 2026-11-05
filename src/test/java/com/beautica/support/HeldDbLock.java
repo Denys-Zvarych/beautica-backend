@@ -1,5 +1,6 @@
 package com.beautica.support;
 
+import com.beautica.notification.telegram.link.TelegramLinkTokenRepository;
 import com.beautica.salon.repository.SalonRepository;
 
 import javax.sql.DataSource;
@@ -65,6 +66,40 @@ public final class HeldDbLock implements AutoCloseable {
     /** Holds a {@code FOR NO KEY UPDATE} row lock on the master (blocks its conditional slug {@code UPDATE}). */
     public static HeldDbLock masterRow(DataSource dataSource, UUID masterId) throws Exception {
         return new HeldDbLock(dataSource, "SELECT id FROM masters WHERE id = ? FOR NO KEY UPDATE", masterId);
+    }
+
+    /** Holds a {@code FOR UPDATE} row lock on one {@code bookings} row (phase 408/413 SKIP LOCKED claim IT). */
+    public static HeldDbLock bookingRow(DataSource dataSource, UUID bookingId) throws Exception {
+        return new HeldDbLock(dataSource, "SELECT id FROM bookings WHERE id = ? FOR UPDATE", bookingId);
+    }
+
+    /** Holds a {@code FOR UPDATE} row lock on one {@code telegram_link_tokens} row (phase 405 lock-order IT). */
+    public static HeldDbLock telegramLinkToken(DataSource dataSource, byte[] tokenHash) throws Exception {
+        return new HeldDbLock(dataSource, "SELECT token_hash FROM telegram_link_tokens WHERE token_hash = ? FOR UPDATE",
+                tokenHash);
+    }
+
+    /** Holds a {@code FOR UPDATE} row lock on the {@code telegram_links} row of one phone hash (phase 405). */
+    public static HeldDbLock telegramLink(DataSource dataSource, byte[] phoneHash) throws Exception {
+        return new HeldDbLock(dataSource, "SELECT id FROM telegram_links WHERE phone_hash = ? FOR UPDATE", phoneHash);
+    }
+
+    /**
+     * Holds the per-phone Telegram link-token issue advisory lock
+     * ({@code TelegramLinkTokenRepository#acquirePhoneIssueLock}) — same key expression and seed.
+     */
+    public static HeldDbLock telegramPhoneIssueLock(DataSource dataSource, byte[] phoneHash) throws Exception {
+        return new HeldDbLock(dataSource, "SELECT pg_advisory_xact_lock(hashtextextended(encode(?, 'hex'), "
+                + TelegramLinkTokenRepository.PHONE_ISSUE_LOCK_SEED + "))", phoneHash);
+    }
+
+    /**
+     * Holds the per-chat Telegram claim advisory lock ({@code TelegramLinkTokenRepository#acquireChatClaimLock})
+     * — same key expression and seed.
+     */
+    public static HeldDbLock telegramChatClaimLock(DataSource dataSource, long chatId) throws Exception {
+        return new HeldDbLock(dataSource, "SELECT pg_advisory_xact_lock(hashtextextended(CAST(? AS text), "
+                + TelegramLinkTokenRepository.CHAT_CLAIM_LOCK_SEED + "))", chatId);
     }
 
     @Override

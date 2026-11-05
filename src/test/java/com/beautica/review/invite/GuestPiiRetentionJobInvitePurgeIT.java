@@ -1,5 +1,6 @@
 package com.beautica.review.invite;
 
+import com.beautica.notification.telegram.link.TelegramLinkRetentionService;
 import com.beautica.booking.retention.GuestPii;
 import com.beautica.booking.retention.GuestPiiAnonymisationService;
 import com.beautica.booking.retention.GuestPiiRetentionJob;
@@ -35,6 +36,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <p>Same {@code @TestPropertySource} as {@code GuestReviewSubmitIT}, so the Spring context is shared.
  */
 @TestPropertySource(properties = {
+        "app.frontend.base-url=https://beautica.app",
         "app.booking.sms.enabled=true",
         "app.booking.review-invite.enabled=true",
         "app.booking.review-invite.min-policy-version=2026-10-20"
@@ -51,10 +53,11 @@ class GuestPiiRetentionJobInvitePurgeIT extends AbstractReviewInviteIT {
 
     @Autowired private GuestPiiAnonymisationService anonymisationService;
     @Autowired private GuestReviewRetentionService retentionService;
+    @Autowired private TelegramLinkRetentionService telegramLinkRetentionService;
     @Autowired private ApplicationContext applicationContext;
 
     private GuestPiiRetentionJob job() {
-        return new GuestPiiRetentionJob(anonymisationService, retentionService, PROPERTIES,
+        return new GuestPiiRetentionJob(anonymisationService, retentionService, telegramLinkRetentionService, PROPERTIES,
                 Clock.fixed(NOW, ZoneOffset.UTC));
     }
 

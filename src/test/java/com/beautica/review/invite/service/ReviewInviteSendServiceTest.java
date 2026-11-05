@@ -4,6 +4,7 @@ import com.beautica.auth.TokenGenerator;
 import com.beautica.booking.enums.BookingSource;
 import com.beautica.common.security.PhoneHasher;
 import com.beautica.config.PhoneHashPepperConfig;
+import com.beautica.review.invite.config.ReviewInviteProperties;
 import com.beautica.review.invite.entity.ReviewInvite;
 import com.beautica.review.invite.entity.ReviewInviteSkipReason;
 import com.beautica.review.invite.entity.ReviewInviteStatus;
@@ -53,7 +54,7 @@ class ReviewInviteSendServiceTest {
     @BeforeEach
     void setUp() {
         service = new ReviewInviteSendService(repository, eligibility, tokenGenerator,
-                new ReviewInviteSmsText(ReviewInviteTestProperties.enabled()), ReviewInviteTestProperties.enabled());
+                new ReviewInviteSmsText(ReviewInviteProperties.PROD_ORIGIN), ReviewInviteTestProperties.enabled());
     }
 
     @Test
@@ -69,7 +70,7 @@ class ReviewInviteSendServiceTest {
         assertThat(prepared).singleElement().satisfies(sms -> {
             assertThat(sms.inviteId()).isEqualTo(invite.getId());
             assertThat(sms.phoneE164()).isEqualTo(PHONE);
-            assertThat(sms.text()).isEqualTo("Оцініть ваш візит: beautica.app/r/" + TOKEN);
+            assertThat(sms.text()).isEqualTo(ReviewInviteTestProperties.PROD_SMS_PREFIX + TOKEN);
             assertThat(sms.toString()).doesNotContain(TOKEN).doesNotContain(PHONE);
         });
         assertThat(invite.getStatus()).isEqualTo(ReviewInviteStatus.SENT);

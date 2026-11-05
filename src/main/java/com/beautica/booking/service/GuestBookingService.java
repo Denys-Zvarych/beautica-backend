@@ -1,12 +1,16 @@
 package com.beautica.booking.service;
 
+import com.beautica.booking.domain.GuestCancelToken;
 import com.beautica.booking.dto.AvailableSlotResponse;
 import com.beautica.booking.dto.BookingLinkKind;
 import com.beautica.booking.dto.BookingPriceRange;
 import com.beautica.booking.domain.GuestConsent;
+import com.beautica.booking.domain.GuestConfirmationSmsText;
 import com.beautica.booking.dto.GuestBookingRequest;
 import com.beautica.booking.dto.GuestBookingResponse;
+import com.beautica.notification.telegram.link.GuestTelegramLinkService;
 import com.beautica.booking.entity.Appointment;
+import com.beautica.booking.crypto.GuestCancelTokenCipher;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.repository.AppointmentRepository;
 import com.beautica.booking.repository.BookingRepository;
@@ -14,7 +18,6 @@ import com.beautica.common.TimeZones;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.util.Placeholders;
-import com.beautica.common.util.UkrainianPlurals;
 import com.beautica.auth.phoneotp.GuestTokenProvider;
 import com.beautica.config.BookingSmsProperties;
 import com.beautica.master.dto.MasterWorkingDayResponse;
@@ -29,28 +32,29 @@ import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.repository.MasterServiceRepository;
 import com.beautica.service.service.SalonCatalogCacheEvictor;
 import io.jsonwebtoken.JwtException;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.math.BigDecimal;
 import java.time.Clock;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
-import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
 import java.util.function.Supplier;
 
 /**
  * Creates auto-confirmed guest (LINK) bookings from the public booking link
  * (Phase 13.3). A phone-verified guest holding a {@code type=GUEST} JWT picks a
- * free slot; the booking is persisted as {@code CONFIRMED}, a confirmation SMS is
- * sent, and the master is notified via the outbox.
+ * free slot; the booking is persisted as {@code CONFIRMED}, a confirmation is
+ * sent (Telegram when the phone is linked, SMS otherwise — {@code GuestMessageRouter},
+ * user decision 2026-11-04), and the master is notified via the outbox.
  *
  * <p><b>Concurrency.</b> Double-booking is prevented by the exact mechanism the
  * regular {@code BookingService.doCreateBooking} uses: a per-master Postgres
@@ -62,8 +66,6 @@ import java.util.function.Supplier;
 @Service
 public class GuestBookingService {
 
-    private static final DateTimeFormatter DATE_FMT = DateTimeFormatter.ofPattern("dd.MM.yyyy");
-    private static final DateTimeFormatter TIME_FMT = DateTimeFormatter.ofPattern("HH:mm");
 
     private final GuestTokenProvider guestTokenProvider;
     private final MasterRepository masterRepository;
@@ -76,7 +78,10 @@ public class GuestBookingService {
     private final BookingSmsProperties smsProperties;
     private final SalonCatalogCacheEvictor salonCatalogCacheEvictor;
     private final VisitPlanner visitPlanner;
-    private final String frontendBaseUrl;
+    /** The guest's public cancel link — shared with the STAFF walk-in path (phase 412). */
+    private final GuestCancelUrlBuilder guestCancelUrlBuilder;
+    /** Phase 435 — seals the minted cancel token so later guest SMS can link the guest's own page. */
+    private final GuestCancelTokenCipher guestCancelTokenCipher;
     private final Clock kyivClock;
     // Phase 333 — see InAppNotificationService's class javadoc for why this is a separate seam from
     // outboxService, never called from it.
@@ -89,6 +94,10 @@ public class GuestBookingService {
     private final GuestTokenBookingCap guestTokenBookingCap;
     /** Phase 398 — refuses a create when the provider blocked the OTP-verified phone (BOOKING_UNAVAILABLE). */
     private final BookingBlockGuard bookingBlockGuard;
+    /** Phase 407 D6 — the {@code telegram} block of the create response (read only; never issues a link token). */
+    private final GuestTelegramLinkService guestTelegramLinkService;
+    /** The create transaction (replaces the former {@code @Transactional} on the two create methods, phase 407 audit). */
+    private final TransactionTemplate bookingTx;
 
     public GuestBookingService(
             GuestTokenProvider guestTokenProvider,
@@ -102,13 +111,16 @@ public class GuestBookingService {
             BookingSmsProperties smsProperties,
             SalonCatalogCacheEvictor salonCatalogCacheEvictor,
             VisitPlanner visitPlanner,
-            @Value("${app.frontend.base-url}") String frontendBaseUrl,
+            GuestCancelUrlBuilder guestCancelUrlBuilder,
+            GuestCancelTokenCipher guestCancelTokenCipher,
             Clock clock,
             InAppNotificationService inAppNotificationService,
             RetiredBookingSlugGuard retiredBookingSlugGuard,
             SalonGuestMasterResolver salonGuestMasterResolver,
             GuestTokenBookingCap guestTokenBookingCap,
-            BookingBlockGuard bookingBlockGuard) {
+            BookingBlockGuard bookingBlockGuard,
+            GuestTelegramLinkService guestTelegramLinkService,
+            PlatformTransactionManager transactionManager) {
         this.guestTokenProvider = guestTokenProvider;
         this.masterRepository = masterRepository;
         this.masterServiceRepository = masterServiceRepository;
@@ -120,13 +132,16 @@ public class GuestBookingService {
         this.smsProperties = smsProperties;
         this.salonCatalogCacheEvictor = salonCatalogCacheEvictor;
         this.visitPlanner = visitPlanner;
-        this.frontendBaseUrl = frontendBaseUrl;
+        this.guestCancelUrlBuilder = guestCancelUrlBuilder;
+        this.guestCancelTokenCipher = guestCancelTokenCipher;
         this.kyivClock = clock.withZone(TimeZones.KYIV);
         this.inAppNotificationService = inAppNotificationService;
         this.retiredBookingSlugGuard = retiredBookingSlugGuard;
         this.salonGuestMasterResolver = salonGuestMasterResolver;
         this.guestTokenBookingCap = guestTokenBookingCap;
         this.bookingBlockGuard = bookingBlockGuard;
+        this.guestTelegramLinkService = guestTelegramLinkService;
+        this.bookingTx = new TransactionTemplate(transactionManager);
     }
 
     /**
@@ -281,12 +296,12 @@ public class GuestBookingService {
      * @throws NotFoundException when the slug or service is unknown (→ 404)
      * @throws BusinessException with 409 when the slot is taken
      */
-    @Transactional
     public GuestBookingResponse createGuestBooking(String bearerToken, String slug, GuestBookingRequest req) {
         // See resolveBookableMasterId: the liveness + salon-active rule lives in the finder's JPQL,
         // so no redundant .filter(Master::isActive) is applied on top of it.
-        return createFor(bearerToken, () -> masterRepository.findByBookingSlugWithUser(slug)
-                .orElseThrow(() -> bookingPageNotFound(slug)), req);
+        return createThenAttachTelegram(() -> createFor(bearerToken,
+                () -> masterRepository.findByBookingSlugWithUser(slug).orElseThrow(() -> bookingPageNotFound(slug)),
+                req));
     }
 
     /**
@@ -304,11 +319,31 @@ public class GuestBookingService {
      * {@code AuthRateLimitFilter}) and — independent of the caller's IP — the per-token cap of 10 committed
      * bookings ({@link GuestTokenBookingCap}, phase 393 audit), all consumed by every call, master or salon route.
      */
-    @Transactional
     public GuestBookingResponse createSalonGuestBooking(
             String bearerToken, String salonSlug, UUID masterId, GuestBookingRequest req) {
-        return createFor(bearerToken,
-                () -> salonGuestMasterResolver.resolveBookableMaster(salonSlug, masterId), req);
+        return createThenAttachTelegram(() -> createFor(bearerToken,
+                () -> salonGuestMasterResolver.resolveBookableMaster(salonSlug, masterId), req));
+    }
+
+    /**
+     * Runs the create in ONE read-write transaction ({@link #bookingTx} — the same REQUIRED / rollback-on-unchecked
+     * semantics the former method-level {@code @Transactional} had), then — after it committed — attaches the phase 407
+     * D6 {@code telegram} block. The link-state read is outside the booking transaction on purpose (407 audit): it
+     * never extends the booking's lock span and can never roll the booking back; a failed read degrades to
+     * {@code UNAVAILABLE} inside {@link GuestTelegramLinkService#availabilityForPhone}. The link token itself is issued
+     * lazily by {@code POST /book/telegram/link-token}, never here.
+     */
+    private GuestBookingResponse createThenAttachTelegram(Supplier<CreatedGuestBooking> create) {
+        CreatedGuestBooking created = Objects.requireNonNull(bookingTx.execute(status -> create.get()));
+        return created.response().withTelegram(guestTelegramLinkService.availabilityForPhone(created.guestPhone()));
+    }
+
+    /** The committed create result plus the OTP-verified phone the D6 read needs; never leaves this class. */
+    private record CreatedGuestBooking(GuestBookingResponse response, String guestPhone) {
+        @Override
+        public String toString() {
+            return "CreatedGuestBooking[response=" + response + ", guestPhone=<redacted>]";
+        }
     }
 
     /**
@@ -317,7 +352,7 @@ public class GuestBookingService {
      * master resolution (404/410) → provider block (409 BOOKING_UNAVAILABLE, phase 398) → service / slot checks.
      * {@code masterResolver} runs inside this transaction, so the returned master stays managed.
      */
-    private GuestBookingResponse createFor(
+    private CreatedGuestBooking createFor(
             String bearerToken, Supplier<Master> masterResolver, GuestBookingRequest req) {
         GuestTokenProvider.GuestTokenClaims guest = extractGuestClaims(bearerToken);
         guestTokenBookingCap.reserve(guest);
@@ -340,13 +375,16 @@ public class GuestBookingService {
         // header + N chained CONFIRMED bookings sharing one cancel token and one reminder. A legacy
         // serviceId-only request keeps the byte-for-byte single-booking path (appointment_id NULL). Exactly
         // one of the two must be supplied; the DTO cannot express that XOR, so it is enforced here.
+        GuestBookingResponse response;
         if (req.masterServiceIds() != null && !req.masterServiceIds().isEmpty()) {
-            return createGuestVisit(master, req, req.masterServiceIds(), guestPhone);
-        }
-        if (req.serviceId() == null) {
+            response = createGuestVisit(master, req, req.masterServiceIds(), guestPhone);
+        } else if (req.serviceId() == null) {
             throw new BusinessException(HttpStatus.BAD_REQUEST, "serviceId or masterServiceIds is required");
+        } else {
+            response = createSingleServiceBooking(master, req, guestPhone);
         }
-        return createSingleServiceBooking(master, req, guestPhone);
+        // Phase 407 D6 — the telegram block is attached after commit by createThenAttachTelegram.
+        return new CreatedGuestBooking(response, guestPhone);
     }
 
     /**
@@ -386,8 +424,8 @@ public class GuestBookingService {
         // (audit-fix cycle 1, finding 1).
         inAppNotificationService.notifyBookingEvent(InAppNotificationType.BOOKING_CREATED, saved, null);
 
-        String cancelUrl = buildCancelUrl(saved.getCancelToken().toString());
-        registerAfterCommit(master, msa, saved, guestPhone, cancelUrl);
+        String cancelUrl = guestCancelUrlBuilder.build(saved.getCancelToken());
+        registerAfterCommit(master, saved, guestPhone, cancelUrl);
 
         return buildResponse(master, msa, saved, cancelUrl);
     }
@@ -434,7 +472,7 @@ public class GuestBookingService {
         BookingSlotLockGuard.lockMasterAndAssertFree(
                 bookingRepository, master.getId(), firstStart, lastEnd);
 
-        UUID cancelToken = UUID.randomUUID();
+        GuestCancelToken cancelToken = GuestCancelToken.generate();
         // ONE consent instance for the header and every child: identical values by construction.
         GuestConsent consent = consentOf(req);
         Appointment appointment = Appointment.guestAppointment(
@@ -456,6 +494,10 @@ public class GuestBookingService {
             // The header is saved first so bookings.appointment_id resolves; the flush makes the EXCLUDE
             // constraint authoritative — an overlapping chain rolls the whole visit back (atomic).
             appointmentRepository.save(appointment);
+            // Phase 435 — only the header's token is ever linked; the per-item child tokens stay hash-only (dead).
+            // Audit-fix: sealed once persist assigned the header id (AES-GCM associated data "appointments:<id>").
+            appointment.attachSealedCancelToken(guestCancelTokenCipher.seal(
+                    cancelToken, GuestCancelTokenCipher.Row.appointment(appointment.getId())));
             saved = bookingRepository.saveAll(children);
             bookingRepository.flush();
         } catch (DataIntegrityViolationException e) {
@@ -470,8 +512,8 @@ public class GuestBookingService {
         inAppNotificationService.notifyVisitEvent(
                 InAppNotificationType.BOOKING_CREATED, appointment.getId(), saved.get(0), null);
 
-        String cancelUrl = buildCancelUrl(cancelToken.toString());
-        registerVisitAfterCommit(master, items, saved.get(0), guestPhone, cancelUrl);
+        String cancelUrl = guestCancelUrlBuilder.build(cancelToken);
+        registerVisitAfterCommit(master, saved.get(0), guestPhone, cancelUrl);
         return buildVisitResponse(master, appointment, saved.get(0), items, cancelUrl);
     }
 
@@ -527,7 +569,13 @@ public class GuestBookingService {
                 price, BookingPriceRange.resolveCeiling(msa),
                 duration, buffer, req.name(), req.surname(), guestPhone, consentOf(req),
                 BookingComments.normalize(req.clientComment()));
-        return BookingSlotLockGuard.saveOrConflict(bookingRepository, booking);
+        Booking saved = BookingSlotLockGuard.saveOrConflict(bookingRepository, booking);
+        // Phase 435 — the reversible copy beside the hash (V230), so later guest SMS can link this booking's page.
+        // Audit-fix: sealed AFTER the persist, because the AES-GCM associated data is the row id ("bookings:<id>"),
+        // which Hibernate assigns at persist; the managed entity writes it at commit.
+        saved.attachSealedCancelToken(guestCancelTokenCipher.seal(
+                saved.getCancelToken(), GuestCancelTokenCipher.Row.booking(saved.getId())));
+        return saved;
     }
 
     /**
@@ -539,9 +587,8 @@ public class GuestBookingService {
         return new GuestConsent(kyivClock.instant(), req.privacyPolicyVersion());
     }
 
-    private void registerAfterCommit(Master master, MasterServiceAssignment msa,
-                                     Booking saved, String guestPhone, String cancelUrl) {
-        String smsText = buildConfirmationSms(master, msa, saved, cancelUrl);
+    private void registerAfterCommit(Master master, Booking saved, String guestPhone, String cancelUrl) {
+        String smsText = buildConfirmationSms(saved, cancelUrl);
         // Capture the salon id inside the transaction (before the afterCommit callback runs) —
         // null for an independent master (no salon catalogue entry).
         UUID salonId = saved.getSalon() != null ? saved.getSalon().getId() : null;
@@ -571,16 +618,16 @@ public class GuestBookingService {
     }
 
     /**
-     * After-commit side-effects for a guest VISIT create (BE-7): ONE confirmation SMS (built from the
-     * first item, reusing the single-service template) plus availability-cache eviction — reusing the
+     * After-commit side-effects for a guest VISIT create (BE-7): ONE confirmation SMS (the visit start,
+     * reusing the single-service template) plus availability-cache eviction — reusing the
      * exact single-service eviction hook so a parallel reader cannot repopulate stale data mid-write.
      * The visit occupies a contiguous block of the master's time, so the by-master sweep in
      * {@link SlotCalculationService#evictMasterAvailabilityCaches} subsumes the per-{@code (date,
      * service)} key set this method used to enumerate; the salon catalogue is evicted once.
      */
-    private void registerVisitAfterCommit(Master master, List<VisitPlanner.PlannedItem> items,
-                                          Booking firstSaved, String guestPhone, String cancelUrl) {
-        String smsText = buildConfirmationSms(master, visitSmsServiceName(items), firstSaved, cancelUrl);
+    private void registerVisitAfterCommit(Master master, Booking firstSaved, String guestPhone,
+                                          String cancelUrl) {
+        String smsText = buildConfirmationSms(firstSaved, cancelUrl);
         UUID salonId = master.getSalon() != null ? master.getSalon().getId() : null;
         Runnable task = () -> {
             // Eviction first, send second — see registerAfterCommit for why this order is
@@ -595,11 +642,6 @@ public class GuestBookingService {
         BookingAfterCommit.run(task);
     }
 
-    private String buildConfirmationSms(Master master, MasterServiceAssignment msa,
-                                        Booking saved, String cancelUrl) {
-        return buildConfirmationSms(master, msa.getServiceDefinition().getName(), saved, cancelUrl);
-    }
-
     /**
      * Renders the guest confirmation SMS in ONE pass over the template — see
      * {@link Placeholders#format}.
@@ -611,36 +653,16 @@ public class GuestBookingService {
      * expanded a second time, in a position of their choosing, inside a message the guest reads as
      * platform copy — and with {@code {date}}/{@code {time}} could rearrange the layout around it.
      * A single pass copies substituted values out verbatim, so data can never become markup.
-     */
-    private String buildConfirmationSms(Master master, String serviceName,
-                                        Booking saved, String cancelUrl) {
-        OffsetDateTime kyiv = saved.getStartsAt().atZoneSameInstant(TimeZones.KYIV).toOffsetDateTime();
-        return Placeholders.format(smsProperties.getSms().getConfirmation(), Map.of(
-                "masterName", masterName(master),
-                "serviceName", serviceName,
-                "date", DATE_FMT.format(kyiv),
-                "time", TIME_FMT.format(kyiv),
-                "cancelUrl", cancelUrl));
-    }
-
-    /**
-     * The {@code {serviceName}} substitution for a multi-service visit's ONE confirmation SMS:
-     * the first service plus «та ще N послуг(и)» — e.g. «Стрижка та ще 2 послуги».
      *
-     * <p>Deliberately NOT the full list. This SMS already carries the master name, date, time and a
-     * cancel URL; a Cyrillic segment is ~70 characters, so concatenating up to ten service names
-     * would push a routine booking several segments past the budget (and risk provider-side
-     * truncation of the cancel link, the one part of the message the guest cannot do without).
-     * A single-service visit ({@code items.size() == 1}) returns the bare service name — the
-     * pre-visit text, unchanged.
+     * <p><b>Phase 435 — no service name</b> (user decision 2026-11-04): the copy is date/time, master
+     * and cancel link only, so a visit's «та ще N послуг(и)» phrase is gone with it. A SALON booking uses the
+     * salon variant, which also names the salon (flattened to one line — provider text).
      */
-    private static String visitSmsServiceName(List<VisitPlanner.PlannedItem> items) {
-        String first = items.get(0).masterService().getServiceDefinition().getName();
-        int remaining = items.size() - 1;
-        if (remaining <= 0) {
-            return first;
-        }
-        return first + " та ще " + UkrainianPlurals.servicesPhrase(remaining);
+    private String buildConfirmationSms(Booking saved, String cancelUrl) {
+        // Phase 435 follow-up: the shared renderer (also the walk-in SMS and the Telegram details) — provider text
+        // via GuestSmsProviderText, the «Адреса: … (note)» line from GuestVisitAddress. `saved` carries `master`.
+        BookingSmsProperties.Sms sms = smsProperties.getSms();
+        return GuestConfirmationSmsText.render(sms.getConfirmationSalon(), sms.getConfirmation(), saved, cancelUrl);
     }
 
     private GuestBookingResponse buildResponse(Master master, MasterServiceAssignment msa,
@@ -672,10 +694,6 @@ public class GuestBookingService {
                 items.get(0).masterService().getServiceDefinition().getName(),
                 totalDuration,
                 cancelUrl);
-    }
-
-    private String buildCancelUrl(String cancelToken) {
-        return frontendBaseUrl + "/book/cancel/" + cancelToken;
     }
 
     // V157 / phase 294 D3: displayFirstName()/displayLastName(), never getUser().getFirstName().

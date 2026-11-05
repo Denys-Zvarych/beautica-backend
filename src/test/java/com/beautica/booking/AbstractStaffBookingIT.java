@@ -167,12 +167,21 @@ abstract class AbstractStaffBookingIT extends AbstractIntegrationTest {
      * against V86's partial unique index and inside the
      * {@code ^[a-z0-9][a-z0-9\-]*[a-z0-9]$} / 60-char contract without any extra state.
      */
+    /**
+     * Phase 435 — the fixture salon's name: «S-{uuid}» (38 chars) stays under
+     * {@code GuestSmsProviderText.MAX_SALON_NAME} (40), so guest SMS rows assert the name verbatim instead of the
+     * truncated «…» form. Unique per salon.
+     */
+    protected static String fixtureSalonName(UUID salonId) {
+        return "S-" + salonId;
+    }
+
     protected Salon seedSalon() {
         SeededUser owner = insertUser("SALON_OWNER", null);
 
         UUID salonId = UUID.randomUUID();
         jdbcTemplate.update("INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at, city_id) "
-                + "VALUES (?, ?, ?, true, NOW(), NOW(), ?)", salonId, owner.id(), "Salon-" + salonId, testCityId());
+                + "VALUES (?, ?, ?, true, NOW(), NOW(), ?)", salonId, owner.id(), fixtureSalonName(salonId), testCityId());
 
         UUID masterId = UUID.randomUUID();
         String slug = "m-" + masterId;

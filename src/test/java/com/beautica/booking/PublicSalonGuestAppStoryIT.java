@@ -185,7 +185,10 @@ class PublicSalonGuestAppStoryIT extends AbstractIntegrationTest {
 
         ResponseEntity<String> cancelled = post(BOOK + "cancel/" + cancelA, null, null);
 
-        assertThat(cancelled.getStatusCode()).as(cancelled.getBody()).isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(cancelled.getStatusCode()).as(cancelled.getBody()).isEqualTo(HttpStatus.OK);
+        // Phase 436: the POST answers with the page view after the cancel.
+        assertThat(objectMapper.readTree(cancelled.getBody()).path("items").path(0).path("status").asText())
+                .isEqualTo("CANCELLED");
         assertThat(statusOfGuestBooking(masterA)).isEqualTo("CANCELLED");
         assertThat(statusOfGuestBooking(masterB)).as("B untouched by A's cancel").isEqualTo("CONFIRMED");
         assertThat(get(BOOK + "cancel/" + cancelA).getStatusCode()).as("A's link consumed")
@@ -334,7 +337,7 @@ class PublicSalonGuestAppStoryIT extends AbstractIntegrationTest {
     }
 
     private static String cancelToken(JsonNode created) {
-        return created.path("cancelUrl").asText().replaceAll(".*/book/cancel/", "");
+        return created.path("cancelUrl").asText().replaceAll(".*/c/", "");
     }
 
     private static UUID bookingId(JsonNode created) {

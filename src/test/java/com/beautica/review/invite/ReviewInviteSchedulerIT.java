@@ -1,9 +1,11 @@
 package com.beautica.review.invite;
 
 import com.beautica.booking.event.GuestBookingCompletedEvent;
+import com.beautica.booking.event.GuestVisitCompletedEvent;
 import com.beautica.booking.service.AppointmentTransitionService;
 import com.beautica.booking.service.BookingService;
 import com.beautica.common.security.PhoneHasher;
+import com.beautica.review.invite.config.ReviewInviteProperties;
 import com.beautica.review.invite.entity.SmsOptOut;
 import com.beautica.review.invite.entity.SmsOptOutSource;
 import com.beautica.review.invite.repository.SmsOptOutRepository;
@@ -15,6 +17,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.test.context.TestPropertySource;
 
 import java.sql.Timestamp;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.Map;
 import java.util.UUID;
@@ -26,6 +29,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * {@code GuestVisitCompletedEvent} → AFTER_COMMIT {@code ReviewInviteScheduler}), both flags on.
  */
 @TestPropertySource(properties = {
+        "app.frontend.base-url=https://beautica.app",
         "app.booking.sms.enabled=true",
         "app.booking.review-invite.enabled=true",
         "app.booking.review-invite.min-policy-version=2026-10-20"
@@ -88,15 +92,67 @@ class ReviewInviteSchedulerIT extends AbstractReviewInviteIT {
     }
 
     @Test
-    @DisplayName("a STAFF walk-in visit for an unregistered guest (phone on file) never gets an invite")
-    void should_createNoInvite_when_staffVisitCompleted() {
+    @DisplayName("phase 434 — a STAFF walk-in visit for an unregistered guest (no policy version) → one SCHEDULED invite")
+    void should_createInvite_when_staffWalkInVisitCompleted() {
         UUID appointmentId = fixtures.staffGuestVisit("CONFIRMED", GUEST_PHONE);
         fixtures.visitItem(appointmentId, masterId, masterServiceId, "STAFF", "CONFIRMED", GUEST_PHONE, 3);
 
         authenticateAsMaster();
         appointmentTransitionService.completeAppointment(masterUserId, appointmentId);
 
+        assertThat(inviteCount()).isEqualTo(1);
+        assertThat(statusOf(appointmentId)).isEqualTo("SCHEDULED");
+    }
+
+    @Test
+    @DisplayName("phase 434 — item-level completion of a STAFF walk-in visit (visit stays open) → one SCHEDULED invite")
+    void should_createInvite_when_staffWalkInVisitItemCompleted() {
+        UUID appointmentId = fixtures.staffGuestVisit("CONFIRMED", GUEST_PHONE);
+        UUID first = fixtures.visitItem(appointmentId, masterId, masterServiceId, "STAFF", "CONFIRMED", GUEST_PHONE, 3);
+        fixtures.visitItem(appointmentId, masterId, masterServiceId, "STAFF", "CONFIRMED", GUEST_PHONE, 2);
+
+        authenticateAsMaster();
+        appointmentTransitionService.completeAppointmentItem(masterUserId, appointmentId, first);
+
+        assertThat(inviteCount()).isEqualTo(1);
+        assertThat(statusOf(appointmentId)).isEqualTo("SCHEDULED");
+        assertThat(turbosmsRequests()).as("creation never sends").isEmpty();
+    }
+
+    @Test
+    @DisplayName("phase 434 — whole-visit completion of an APP visit and of a STAFF visit WITH an account → no invite")
+    void should_createNoInvite_when_appVisitOrStaffVisitWithClientCompleted() {
+        UUID clientId = fixtures.user("CLIENT", "Олена", "Бондар");
+        UUID appVisit = confirmedClientVisit(clientId, "APP", 5);
+        UUID staffVisit = confirmedClientVisit(clientId, "STAFF", 3);
+
+        authenticateAsMaster();
+        appointmentTransitionService.completeAppointment(masterUserId, appVisit);
+        appointmentTransitionService.completeAppointment(masterUserId, staffVisit);
+
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM bookings WHERE appointment_id IN (?, ?) AND status = 'COMPLETED'",
+                Long.class, appVisit, staffVisit)).as("both visits really completed").isEqualTo(2L);
         assertThat(inviteCount()).isZero();
+    }
+
+    @Test
+    @DisplayName("phase 434 — completing a single STAFF walk-in booking (no account, no policy version) → ONE "
+            + "booking-keyed SCHEDULED invite keyed by the walk-in phone")
+    void should_createBookingKeyedInvite_when_singleStaffWalkInBookingCompleted() {
+        UUID bookingId = fixtures.visitItem(null, masterId, masterServiceId, "STAFF", "CONFIRMED", GUEST_PHONE, 2);
+
+        authenticateAsMaster();
+        bookingService.completeBooking(masterUserId, bookingId);
+
+        assertThat(inviteCount()).isEqualTo(1);
+        Map<String, Object> row = jdbcTemplate.queryForMap(
+                "SELECT * FROM review_invites WHERE booking_id = ?", bookingId);
+        assertThat(row.get("appointment_id")).isNull();
+        assertThat(row.get("status")).isEqualTo("SCHEDULED");
+        assertThat(row.get("skip_reason")).isNull();
+        assertThat((byte[]) row.get("phone_hash")).isEqualTo(phoneHasher.hash(GUEST_PHONE).hash());
+        assertThat(turbosmsRequests()).as("creation never sends").isEmpty();
     }
 
     @Test
@@ -217,9 +273,188 @@ class ReviewInviteSchedulerIT extends AbstractReviewInviteIT {
         assertThat(inviteCount()).isZero();
     }
 
+    // ── Phase 434 audit-fix (sec M1/M2) — STAFF walk-in phone guards ──
+
+    @Test
+    @DisplayName("434 audit-fix M1 — a second STAFF walk-in on the same phone for the same master within the window "
+            + "→ SKIPPED (REPEAT_PHONE); the first stays SCHEDULED")
+    void should_skipInvite_when_samePhoneInvitedSameProviderWithinWindow() {
+        UUID first = completedStaffWalkIn(masterId, masterServiceId, GUEST_PHONE, 8);
+        UUID second = completedStaffWalkIn(masterId, masterServiceId, GUEST_PHONE, 4);
+
+        fireVisitCompleted(first);
+        fireVisitCompleted(second);
+
+        assertThat(statusOf(first)).isEqualTo("SCHEDULED");
+        assertThat(statusOf(second)).isEqualTo("SKIPPED");
+        assertThat(skipReasonOf(second)).isEqualTo("REPEAT_PHONE");
+        assertThat(logLines()).noneMatch(line -> line.contains(GUEST_SUBSCRIBER_DIGITS));
+    }
+
+    @Test
+    @DisplayName("434 audit-fix M1 — same phone, a DIFFERENT master → still invited")
+    void should_inviteStaffWalkIn_when_samePhoneDifferentProvider() {
+        UUID otherMasterId = fixtures.independentMaster();
+        UUID otherServiceId = fixtures.masterService(otherMasterId);
+        UUID first = completedStaffWalkIn(masterId, masterServiceId, GUEST_PHONE, 8);
+        UUID second = completedStaffWalkIn(otherMasterId, otherServiceId, GUEST_PHONE, 4);
+
+        fireVisitCompleted(first);
+        fireVisitCompleted(second);
+
+        assertThat(statusOf(first)).isEqualTo("SCHEDULED");
+        assertThat(statusOf(second)).isEqualTo("SCHEDULED");
+    }
+
+    @Test
+    @DisplayName("434 audit-fix M1 — the prior invite for the same phone + master is older than the window → invited")
+    void should_inviteStaffWalkIn_when_priorInviteOutsideWindow() {
+        UUID old = completedStaffWalkIn(masterId, masterServiceId, GUEST_PHONE, 8);
+        scheduledInvite(old, phoneHasher.hash(GUEST_PHONE).hash(), Instant.now().minus(Duration.ofDays(31)));
+        UUID fresh = completedStaffWalkIn(masterId, masterServiceId, GUEST_PHONE, 4);
+
+        fireVisitCompleted(fresh);
+
+        assertThat(statusOf(fresh)).isEqualTo("SCHEDULED");
+    }
+
+    @Test
+    @DisplayName("434 audit-fix M2 — a STAFF walk-in on the performing master's own account phone (other format) "
+            + "→ SKIPPED (PROVIDER_OWN_PHONE)")
+    void should_skipInvite_when_walkInPhoneIsMasterOwnPhone() {
+        jdbcTemplate.update("UPDATE users SET phone_number = '050 222 33 44' WHERE id = ?", masterUserId);
+        UUID appointmentId = completedStaffWalkIn(masterId, masterServiceId, GUEST_PHONE, 4);
+
+        fireVisitCompleted(appointmentId);
+
+        assertThat(skipReasonOf(appointmentId)).isEqualTo("PROVIDER_OWN_PHONE");
+    }
+
+    @Test
+    @DisplayName("434 audit-fix M2 — a salon STAFF walk-in on the salon owner's phone → SKIPPED (PROVIDER_OWN_PHONE)")
+    void should_skipInvite_when_walkInPhoneIsSalonOwnerPhone() {
+        UUID salonId = affiliateMasterWithSalon();
+        jdbcTemplate.update("UPDATE users SET phone_number = ? WHERE id = ?", GUEST_PHONE, salonOwnerId(salonId));
+        UUID appointmentId = fixtures.staffGuestVisit("COMPLETED", GUEST_PHONE);
+        UUID item = fixtures.visitItem(appointmentId, masterId, masterServiceId, "STAFF", "COMPLETED", GUEST_PHONE, 4);
+        attachToSalon(salonId, item);
+
+        fireVisitCompleted(appointmentId);
+
+        assertThat(skipReasonOf(appointmentId)).isEqualTo("PROVIDER_OWN_PHONE");
+    }
+
+    @Test
+    @DisplayName("434 audit-fix — LINK is unaffected: a LINK visit on a phone already STAFF-invited for the same master, "
+            + "and on the master's own phone, is still SCHEDULED")
+    void should_inviteLinkVisit_when_phoneAlreadyStaffInvitedOrProviderOwn() {
+        jdbcTemplate.update("UPDATE users SET phone_number = ? WHERE id = ?", GUEST_PHONE, masterUserId);
+        UUID walkIn = completedStaffWalkIn(masterId, masterServiceId, GUEST_PHONE, 8);
+        scheduledInvite(walkIn, phoneHasher.hash(GUEST_PHONE).hash(), Instant.now().minus(Duration.ofDays(1)));
+        UUID link = completedLinkVisit(GUEST_PHONE, POLICY);
+
+        fireVisitCompleted(link);
+
+        assertThat(statusOf(link)).isEqualTo("SCHEDULED");
+    }
+
+    @Test
+    @DisplayName("434 audit-fix LOW-1 — a salon STAFF walk-in on a COLLEAGUE salon master's phone (not the performing "
+            + "master) → SKIPPED (PROVIDER_OWN_PHONE)")
+    void should_skipProviderOwnPhone_when_walkInPhoneIsColleagueSalonMaster() {
+        UUID salonId = affiliateMasterWithSalon();
+        UUID colleagueUserId = fixtures.user("SALON_MASTER", "Оксана", "Колега");
+        jdbcTemplate.update("UPDATE users SET phone_number = '050 222 33 44', salon_id = ? WHERE id = ?", salonId,
+                colleagueUserId);
+        jdbcTemplate.update("INSERT INTO masters (id, user_id, master_type, salon_id, is_active, created_at, updated_at) "
+                + "VALUES (?, ?, 'SALON_MASTER', ?, true, NOW(), NOW())", UUID.randomUUID(), colleagueUserId, salonId);
+        UUID appointmentId = fixtures.staffGuestVisit("COMPLETED", GUEST_PHONE);
+        UUID item = fixtures.visitItem(appointmentId, masterId, masterServiceId, "STAFF", "COMPLETED", GUEST_PHONE, 4);
+        attachToSalon(salonId, item);
+
+        fireVisitCompleted(appointmentId);
+
+        assertThat(skipReasonOf(appointmentId)).isEqualTo("PROVIDER_OWN_PHONE");
+        assertThat(logLines()).noneMatch(line -> line.contains(GUEST_SUBSCRIBER_DIGITS));
+    }
+
+    @Test
+    @DisplayName("434 audit-fix LOW-4 — the phone already has 3 non-skipped STAFF invites at 3 OTHER masters within "
+            + "the window → the 4th provider's walk-in is SKIPPED (PHONE_GLOBAL_CAP); the first 3 stay SCHEDULED")
+    void should_skipPhoneGlobalCap_when_phoneHasThreeStaffInvitesAcrossProviders() {
+        UUID[] prior = new UUID[3];
+        for (int i = 0; i < prior.length; i++) {
+            UUID otherMaster = fixtures.independentMaster();
+            prior[i] = completedStaffWalkIn(otherMaster, fixtures.masterService(otherMaster), GUEST_PHONE, 8);
+            fireVisitCompleted(prior[i]);
+        }
+        UUID fourth = completedStaffWalkIn(masterId, masterServiceId, GUEST_PHONE, 4);
+
+        fireVisitCompleted(fourth);
+
+        for (UUID appointmentId : prior) {
+            assertThat(statusOf(appointmentId)).isEqualTo("SCHEDULED");
+        }
+        assertThat(skipReasonOf(fourth)).isEqualTo("PHONE_GLOBAL_CAP");
+        assertThat(logLines()).noneMatch(line -> line.contains(GUEST_SUBSCRIBER_DIGITS));
+    }
+
+    @Test
+    @DisplayName("434 audit-fix LOW-4 — the master already created 50 non-skipped STAFF invites (distinct phones) in "
+            + "the last 24 h → the next walk-in is SKIPPED (PROVIDER_DAILY_CAP)")
+    void should_skipProviderDailyCap_when_providerCreatedFiftyStaffInvitesToday() {
+        seedRecentStaffInvitesForMaster(ReviewInviteProperties.DEFAULT_STAFF_PROVIDER_DAILY_CAP);
+        UUID next = completedStaffWalkIn(masterId, masterServiceId, GUEST_PHONE, 1);
+
+        fireVisitCompleted(next);
+
+        assertThat(skipReasonOf(next)).isEqualTo("PROVIDER_DAILY_CAP");
+    }
+
+    @Test
+    @DisplayName("434 audit-fix LOW-4 — boundary: the master has 49 (cap − 1) non-skipped STAFF invites in the last "
+            + "24 h → the next walk-in is still SCHEDULED, no skip reason")
+    void should_inviteStaffWalkIn_when_providerOneBelowDailyCap() {
+        seedRecentStaffInvitesForMaster(ReviewInviteProperties.DEFAULT_STAFF_PROVIDER_DAILY_CAP - 1);
+        UUID next = completedStaffWalkIn(masterId, masterServiceId, GUEST_PHONE, 1);
+
+        fireVisitCompleted(next);
+
+        assertThat(statusOf(next)).as("49 prior invites is below the cap of 50").isEqualTo("SCHEDULED");
+        assertThat(skipReasonOf(next)).isNull();
+    }
+
+    /** {@code count} SCHEDULED STAFF invites for {@link #masterId}, distinct phones, created an hour ago. */
+    private void seedRecentStaffInvitesForMaster(int count) {
+        Instant anHourAgo = Instant.now().minus(Duration.ofHours(1));
+        for (int i = 0; i < count; i++) {
+            String phone = String.format("+38067%07d", i);
+            UUID visit = completedStaffWalkIn(masterId, masterServiceId, phone, 2 + i);
+            scheduledInvite(visit, phoneHasher.hash(phone).hash(), anHourAgo);
+        }
+    }
+
+    private void fireVisitCompleted(UUID appointmentId) {
+        reviewInviteScheduler.onGuestVisitCompleted(new GuestVisitCompletedEvent(appointmentId, Instant.now()));
+    }
+
     private String bookingInviteColumn(UUID bookingId, String column) {
         return jdbcTemplate.queryForObject(
                 "SELECT " + column + " FROM review_invites WHERE booking_id = ?", String.class, bookingId);
+    }
+
+    /** A CONFIRMED one-item {@code source} visit (APP or STAFF) of the registered {@code clientId}. */
+    private UUID confirmedClientVisit(UUID clientId, String source, int hoursAgo) {
+        UUID appointmentId = UUID.randomUUID();
+        jdbcTemplate.update("INSERT INTO appointments (id, client_id, status, booking_source, created_at, updated_at) "
+                + "VALUES (?, ?, 'CONFIRMED', ?, NOW(), NOW())", appointmentId, clientId, source);
+        jdbcTemplate.update("INSERT INTO bookings (id, client_id, master_id, master_service_id, salon_id, status, "
+                        + "starts_at, ends_at, price_at_booking, duration_minutes_at_booking, buffer_minutes_at_booking, "
+                        + "booking_source, appointment_id, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, ?, NULL, 'CONFIRMED', NOW() - make_interval(hours => ?), "
+                        + "NOW() - make_interval(hours => ?) + interval '60 minutes', 500.00, 60, 0, ?, ?, NOW(), NOW())",
+                UUID.randomUUID(), clientId, masterId, masterServiceId, hoursAgo, hoursAgo, source, appointmentId);
+        return appointmentId;
     }
 
     private UUID confirmedLinkVisit(String phone, String policyVersion) {

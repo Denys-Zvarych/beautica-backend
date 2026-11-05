@@ -33,10 +33,10 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mockito.Mockito.atMost;
+import static org.mockito.Mockito.after;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
-import static org.mockito.Mockito.timeout;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 
 /**
@@ -123,7 +123,7 @@ class GuestCancelConcurrencyIT {
                     go.await();
                     ResponseEntity<String> resp = restTemplate.exchange(
                             url, HttpMethod.POST, new HttpEntity<>(null), String.class);
-                    if (resp.getStatusCode() == HttpStatus.NO_CONTENT) {
+                    if (resp.getStatusCode() == HttpStatus.OK) { // phase 436: 200 + after-view (was 204)
                         noContent.incrementAndGet();
                     } else if (resp.getStatusCode() == HttpStatus.NOT_FOUND) {
                         notFound.incrementAndGet();
@@ -140,7 +140,7 @@ class GuestCancelConcurrencyIT {
         boolean finished = done.await(30, TimeUnit.SECONDS);
 
         assertThat(finished).as("both racers must finish within 30s").isTrue();
-        assertThat(noContent.get()).as("exactly one 204").isEqualTo(1);
+        assertThat(noContent.get()).as("exactly one 200 (phase 436; was 204)").isEqualTo(1);
         assertThat(notFound.get()).as("exactly one 404").isEqualTo(1);
 
         // The single surviving row is CANCELLED with a consumed (null) token.
@@ -152,9 +152,8 @@ class GuestCancelConcurrencyIT {
         assertThat(liveTokens).as("cancel token consumed").isZero();
         assertThat(bookingRepository.count()).isEqualTo(1L);
 
-        // The cancellation SMS (after-commit) is dispatched exactly once — only the winner.
-        verify(smsService, timeout(5_000)).send(eq(GUEST_PHONE), anyString());
-        verify(smsService, atMost(1)).send(eq(GUEST_PHONE), anyString());
+        // Guest self-cancel sends the guest NO SMS (decision 2026-11-04) — neither racer.
+        verify(smsService, after(2_000).never()).send(eq(GUEST_PHONE), anyString());
     }
 
     // ── helpers ────────────────────────────────────────────────────────────────

@@ -1,6 +1,7 @@
 package com.beautica.booking.entity;
 
 import com.beautica.booking.domain.CancelTokenHasher;
+import com.beautica.booking.domain.GuestCancelToken;
 import com.beautica.booking.domain.GuestConsent;
 import com.beautica.booking.enums.BookingSource;
 import com.beautica.booking.enums.BookingStatus;
@@ -166,7 +167,15 @@ public class Appointment extends AuditableEntity {
     // cancelToken(UUID), which also sets cancelTokenHash.
     @JsonIgnore
     @Transient
-    private UUID cancelToken;
+    private GuestCancelToken cancelToken;
+
+    // Phase 435 (V230) — the same token sealed with AES-256-GCM (GuestCancelTokenCipher), so later guest SMS can
+    // rebuild the guest's own /book/cancel/{token} link. Never a lookup key (the hash is). NULL on rows created
+    // before V230, and nulled with the hash (explicitly in every hash-nulling statement + the V230 trigger).
+    // @JsonIgnore: opening it yields the cancel capability.
+    @JsonIgnore
+    @Column(name = "cancel_token_sealed", length = 128)
+    private String cancelTokenSealed;
 
     // Defaults to APP so the registered-client path need not set it explicitly — Hibernate always
     // emits the column in the INSERT, so a null here would violate the NOT NULL despite the DB
@@ -270,7 +279,7 @@ public class Appointment extends AuditableEntity {
             String guestName,
             String guestSurname,
             String guestPhone,
-            UUID cancelToken,
+            GuestCancelToken cancelToken,
             GuestConsent consent) {
         return guestAppointment(salon, guestName, guestSurname, guestPhone, cancelToken, consent, null);
     }
@@ -285,7 +294,7 @@ public class Appointment extends AuditableEntity {
             String guestName,
             String guestSurname,
             String guestPhone,
-            UUID cancelToken,
+            GuestCancelToken cancelToken,
             GuestConsent consent,
             String clientComment) {
         if (guestName == null || guestName.isBlank()) {
@@ -318,10 +327,10 @@ public class Appointment extends AuditableEntity {
      * before the row exists, mirroring {@link Booking#staffBooking} and the DB CHECK
      * {@code chk_appointment_guest_fields} (V139).
      *
-     * <p><b>No cancel token.</b> Unlike a LINK visit, a staff-created visit carries NO guest
-     * self-cancel link — the V139 STAFF branch requires {@code cancel_token IS NULL}. Only the
-     * provider closes it, through a management endpoint. This is the same rule
-     * {@code Booking.staffBooking} applies to the child rows, so header and children agree.
+     * <p><b>No cancel token from this overload.</b> Reversed by phase 412 (V226): the walk-in create
+     * path uses the 6-argument overload below, which carries the visit's guest cancel token. This
+     * tokenless form remains for callers that build a header with no self-cancel link. The child rows
+     * ({@code Booking.staffBooking}) stay tokenless either way.
      *
      * <p><b>Surname is REQUIRED</b>, unlike the LINK branch where it stays optional (V91's
      * rationale). The two branches intentionally differ; do not unify them.
@@ -343,6 +352,25 @@ public class Appointment extends AuditableEntity {
             String guestSurname,
             String guestPhone,
             UUID createdByUserId) {
+        return staffAppointment(salon, guestName, guestSurname, guestPhone, null, createdByUserId);
+    }
+
+    /**
+     * Phase 412 D1 — the walk-in visit header WITH the guest's one-time cancel token, issued exactly like
+     * {@link #guestAppointment}'s (raw token in memory for the SMS link, only its {@link CancelTokenHasher}
+     * hash persisted). Reverses the "no cancel token" rule above: V226 lets a LIVE walk-in header (guest
+     * phone present — always, by {@link Booking#requireStaffWalkInIdentity}) carry the token; the child
+     * {@code bookings} rows stay tokenless (the visit token is the only one any lookup accepts).
+     *
+     * @param cancelToken the visit-level one-time cancel token, or {@code null} for a tokenless header
+     */
+    public static Appointment staffAppointment(
+            Salon salon,
+            String guestName,
+            String guestSurname,
+            String guestPhone,
+            GuestCancelToken cancelToken,
+            UUID createdByUserId) {
         Booking.requireStaffWalkInIdentity(guestName, guestSurname, guestPhone, createdByUserId);
         return Appointment.builder()
                 // No client FK: the walk-in mode has no registered account
@@ -353,9 +381,24 @@ public class Appointment extends AuditableEntity {
                 .guestName(guestName)
                 .guestSurname(guestSurname)
                 .guestPhone(guestPhone)
-                // cancelToken stays null: no guest self-cancel link for a staff visit.
+                // Phase 412: the visit's guest cancel token (null only via the 5-argument overload).
+                .cancelToken(cancelToken)
                 .createdByUserId(createdByUserId)
                 .build();
+    }
+
+    /**
+     * Phase 435 — stores the sealed copy of the token THIS instance minted (the caller seals it with
+     * {@code GuestCancelTokenCipher}, which an entity cannot reach). Only valid on a freshly built appointment that
+     * still holds its raw token in memory.
+     *
+     * @throws IllegalStateException when this instance holds no raw token (loaded from the DB, or tokenless)
+     */
+    public void attachSealedCancelToken(String sealed) {
+        if (cancelToken == null) {
+            throw new IllegalStateException("No in-memory cancel token to seal");
+        }
+        this.cancelTokenSealed = sealed;
     }
 
     /**
@@ -365,7 +408,12 @@ public class Appointment extends AuditableEntity {
      */
     public static class AppointmentBuilder {
 
+        /** A legacy UUID token (tests, fixtures) — same as {@code cancelToken(GuestCancelToken.of(uuid))}. */
         public AppointmentBuilder cancelToken(UUID cancelToken) {
+            return cancelToken(cancelToken == null ? null : GuestCancelToken.of(cancelToken));
+        }
+
+        public AppointmentBuilder cancelToken(GuestCancelToken cancelToken) {
             this.cancelToken = cancelToken;
             this.cancelTokenHash = cancelToken == null ? null : CancelTokenHasher.hash(cancelToken);
             return this;

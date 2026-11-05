@@ -32,9 +32,13 @@ public interface PhoneOtpRepository extends JpaRepository<PhoneOtp, Long> {
      * first inside the issuing transaction so the rate-limit count-then-insert cannot interleave
      * between two requests for the same phone. (Postgres-only; the project runs Postgres in every
      * profile, including Testcontainers.) The scalar select wrapper exists because
-     * {@code pg_advisory_xact_lock} returns {@code void}, which Hibernate cannot map.
+     * {@code pg_advisory_xact_lock} returns {@code void}, which Hibernate cannot map. The fused
+     * transaction-local 3s {@code lock_timeout} (evaluated first, left to right — the
+     * {@code BookingRepository#acquireClientAdvisoryLockWithTimeout} shape) turns a long wait into
+     * {@code 55P03} → 409 instead of a {@code statement_timeout} abort.
      */
-    @Query(value = "SELECT 1 FROM (SELECT pg_advisory_xact_lock(hashtext(:phone))) AS l", nativeQuery = true)
+    @Query(value = "SELECT 1 FROM (SELECT set_config('lock_timeout', '3s', true), "
+            + "pg_advisory_xact_lock(hashtext(:phone))) AS l", nativeQuery = true)
     int lockPhoneForSend(@Param("phone") String phone);
 
     /**

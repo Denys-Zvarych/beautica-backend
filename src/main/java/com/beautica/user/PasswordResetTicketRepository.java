@@ -1,5 +1,6 @@
 package com.beautica.user;
 
+import com.beautica.common.repository.TransactionLockTimeout;
 import jakarta.persistence.LockModeType;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Lock;
@@ -24,7 +25,7 @@ import java.util.UUID;
  * ownership against the authenticated principal — ownership validation is the
  * responsibility of the service layer ({@code PasswordResetService.resetPassword}).
  */
-public interface PasswordResetTicketRepository extends JpaRepository<PasswordResetTicket, UUID> {
+public interface PasswordResetTicketRepository extends JpaRepository<PasswordResetTicket, UUID>, TransactionLockTimeout {
 
     /**
      * Non-locking lookup — suitable for read-only checks (e.g. tests, admin tooling).
@@ -42,7 +43,13 @@ public interface PasswordResetTicketRepository extends JpaRepository<PasswordRes
      */
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("SELECT t FROM PasswordResetTicket t WHERE t.ticketHash = :ticketHash")
-    Optional<PasswordResetTicket> findByTicketHashForUpdate(@Param("ticketHash") String ticketHash);
+    Optional<PasswordResetTicket> findByTicketHashForUpdateNoLockTimeout(@Param("ticketHash") String ticketHash);
+
+    /** {@link #findByTicketHashForUpdateNoLockTimeout} bounded by the transaction-local 3s {@code lock_timeout} ({@link TransactionLockTimeout}). */
+    default Optional<PasswordResetTicket> findByTicketHashForUpdate(String ticketHash) {
+        applyTransactionLockTimeout();
+        return findByTicketHashForUpdateNoLockTimeout(ticketHash);
+    }
 
     /**
      * Bulk-marks all unused reset tickets for the given user as consumed.

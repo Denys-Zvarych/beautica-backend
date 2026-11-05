@@ -345,8 +345,10 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
      *
      * <p>{@code FOR NO KEY UPDATE}, the lock {@code deactivateSalon} already held before Phase 343 via its
      * non-key {@code is_active} UPDATE (auto-flushed just before this query by the declared query space) —
-     * so this read adds no lock strength and FK inserts referencing the salon are never blocked by it. No
-     * {@code lock_timeout} here: the deletion's own 30s transaction timeout bounds it, unchanged since pre-343.
+     * so this read adds no lock strength and FK inserts referencing the salon are never blocked by it. Fused
+     * transaction-local 3s {@code lock_timeout} (same shape as {@link #findByIdForUpdate}): the app pool sets no
+     * session {@code lock_timeout}, so without it a wait would hit the 5s {@code statement_timeout} (503) instead
+     * of {@code 55P03} → 409. It also bounds every later lock wait in the deletion transaction.
      * Query space declared so Hibernate auto-flushes only pending {@code salons} changes (perf P-L3).
      */
     @QueryHints(@QueryHint(name = HibernateHints.HINT_NATIVE_SPACES, value = "salons"))
@@ -354,8 +356,9 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
             SELECT s.avatar_url AS "avatarUrl", s.avatar_r2_key AS "avatarR2Key",
                    s.cover_image_url AS "coverImageUrl", s.cover_r2_key AS "coverR2Key"
             FROM salons s
+            CROSS JOIN (SELECT set_config('lock_timeout', '3s', true)) lock_cfg
             WHERE s.id = :salonId
-            FOR NO KEY UPDATE
+            FOR NO KEY UPDATE OF s
             """, nativeQuery = true)
     Optional<SalonImagePointers> lockImagePointers(@Param("salonId") UUID salonId);
 

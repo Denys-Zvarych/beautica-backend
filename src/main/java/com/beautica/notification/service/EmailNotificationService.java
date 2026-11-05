@@ -443,11 +443,23 @@ public class EmailNotificationService {
      * row — the two can never swap slots again.
      */
     public void sendClientCancelledEmail(String to, Booking booking) {
+        sendClientCancelledEmail(to, BookingVisit.single(booking));
+    }
+
+    /**
+     * Phase 436 — the client-cancelled provider e-mail for one or more services: {@code serviceNames} gets one row
+     * per cancelled service (visit order) under «Послуга»/«Послуги»; {@code startsAt} is the first one's start. The
+     * notes are the lead booking's, exactly as the single-booking e-mail had them.
+     */
+    public void sendClientCancelledEmail(String to, BookingVisit visit) {
+        Booking booking = visit.lead();
         var ctx = new Context();
         ctx.setVariable("masterName", masterDisplayName(booking));
         ctx.setVariable("clientName", resolveClientName(booking));
-        ctx.setVariable("serviceName", booking.getMasterService().getServiceDefinition().getName());
-        ctx.setVariable("startsAt", formatStartsAt(booking));
+        ctx.setVariable("serviceName", visit.leadServiceName());
+        ctx.setVariable("serviceNames", visit.serviceNames());
+        ctx.setVariable("serviceLabel", visit.isMultiService() ? "Послуги" : "Послуга");
+        ctx.setVariable("startsAt", formatStartsAt(visit.startsAt()));
         ctx.setVariable("cancellationNote", booking.getClientCancellationNote());
         ctx.setVariable("creationNote", booking.getClientComment());
         send(to, "Клієнт скасував бронювання", "email/booking-cancelled-provider", ctx);

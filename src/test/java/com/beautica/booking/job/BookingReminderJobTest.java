@@ -35,6 +35,7 @@ import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.never;
@@ -57,7 +58,8 @@ class BookingReminderJobTest {
     @BeforeEach
     void setUp() {
         Clock clock = Clock.fixed(OffsetDateTime.parse("2026-06-01T10:00:00Z").toInstant(), ZoneOffset.UTC);
-        job = new BookingReminderJob(bookingRepository, new BookingSmsProperties(), events, clock);
+        job = new BookingReminderJob(bookingRepository, new BookingSmsProperties(), events, clock,
+                new io.micrometer.core.instrument.simple.SimpleMeterRegistry(), com.beautica.booking.crypto.GuestCancelTokenCipherFixtures.testPageLinks("https://beautica.app"));
         logAppender = new ListAppender<>();
         logAppender.start();
         jobLogger = (Logger) LoggerFactory.getLogger(BookingReminderJob.class);
@@ -82,7 +84,7 @@ class BookingReminderJobTest {
     void should_publishRemindersAndMark_when_bookingsDue() {
         Booking b1 = guestBooking("+380501111111");
         Booking b2 = guestBooking("+380502222222");
-        when(bookingRepository.findGuestBookingsForReminder(any(), any())).thenReturn(List.of(b1, b2));
+        when(bookingRepository.findGuestBookingsForReminder(any(), any(), anyBoolean())).thenReturn(List.of(b1, b2));
 
         job.sendReminders();
 
@@ -107,7 +109,7 @@ class BookingReminderJobTest {
     @Test
     @DisplayName("should not re-save managed rows — dirty checking flushes reminderSent at commit")
     void should_notCallSaveAll_when_bookingsDue() {
-        when(bookingRepository.findGuestBookingsForReminder(any(), any()))
+        when(bookingRepository.findGuestBookingsForReminder(any(), any(), anyBoolean()))
                 .thenReturn(List.of(guestBooking("+380501111111")));
 
         job.sendReminders();
@@ -118,7 +120,7 @@ class BookingReminderJobTest {
     @Test
     @DisplayName("should publish nothing and not save when nothing is due (already-reminded excluded by query)")
     void should_doNothing_when_noBookingsDue() {
-        when(bookingRepository.findGuestBookingsForReminder(any(), any())).thenReturn(List.of());
+        when(bookingRepository.findGuestBookingsForReminder(any(), any(), anyBoolean())).thenReturn(List.of());
 
         job.sendReminders();
 
@@ -143,7 +145,7 @@ class BookingReminderJobTest {
         Booking visitItem2 = guestBooking("+380502222222");
         visitItem1.setAppointment(Appointment.builder().id(appointmentId).build());
         visitItem2.setAppointment(Appointment.builder().id(appointmentId).build());
-        when(bookingRepository.findGuestBookingsForReminder(any(), any()))
+        when(bookingRepository.findGuestBookingsForReminder(any(), any(), anyBoolean()))
                 .thenReturn(List.of(single, visitItem1, visitItem2));
 
         job.sendReminders();
@@ -182,7 +184,7 @@ class BookingReminderJobTest {
     @DisplayName("the claim must precede the hand-off, so a lost dispatch never duplicates")
     void should_markReminderSentBeforePublishing_when_bookingsDue() {
         Booking due = guestBooking("+380501111111");
-        when(bookingRepository.findGuestBookingsForReminder(any(), any())).thenReturn(List.of(due));
+        when(bookingRepository.findGuestBookingsForReminder(any(), any(), anyBoolean())).thenReturn(List.of(due));
         List<String> order = new ArrayList<>();
         doAnswer(inv -> {
             order.add("claim");
@@ -201,7 +203,7 @@ class BookingReminderJobTest {
         Booking single = guestBooking("+380501111111");
         Booking visitItem = guestBooking("+380502222222");
         visitItem.setAppointment(Appointment.builder().id(UUID.randomUUID()).build());
-        when(bookingRepository.findGuestBookingsForReminder(any(), any())).thenReturn(List.of(single, visitItem));
+        when(bookingRepository.findGuestBookingsForReminder(any(), any(), anyBoolean())).thenReturn(List.of(single, visitItem));
         org.mockito.Mockito.doReturn(List.of()).when(bookingRepository).claimRemindersByIds(any());
         org.mockito.Mockito.doReturn(List.of()).when(bookingRepository).claimVisitRemindersByAppointmentIds(any());
 
@@ -220,7 +222,7 @@ class BookingReminderJobTest {
         // SECOND, provider-positioned time inside copy the guest reads as platform text — and SMS is
         // the only channel a guest has.
         Booking due = guestBooking("+380501111111", "Манікюр {time}");
-        when(bookingRepository.findGuestBookingsForReminder(any(), any())).thenReturn(List.of(due));
+        when(bookingRepository.findGuestBookingsForReminder(any(), any(), anyBoolean())).thenReturn(List.of(due));
 
         job.sendReminders();
 
@@ -237,6 +239,163 @@ class BookingReminderJobTest {
         verify(events).publishEvent(captor.capture());
         assertThat(captor.getValue()).isInstanceOf(GuestRemindersDueEvent.class);
         return (GuestRemindersDueEvent) captor.getValue();
+    }
+
+    // ── phase 413 D4 (after 412) — walk-ins in the 24h sweep ─────────────────────────────────
+
+    @Test
+    @DisplayName("should select LINK guests only when the walk-in SMS gate is off")
+    void should_excludeWalkIns_when_smsGateOff() {
+        when(bookingRepository.findGuestBookingsForReminder(any(), any(), anyBoolean())).thenReturn(List.of());
+
+        job.sendReminders();
+
+        verify(bookingRepository).findGuestBookingsForReminder(any(), any(), org.mockito.ArgumentMatchers.eq(false));
+    }
+
+    @Test
+    @DisplayName("should include walk-ins and name the PLATFORM service type when the walk-in SMS gate is on")
+    void should_includeWalkInsWithPlatformServiceName_when_smsGateOn() {
+        BookingSmsProperties properties = new BookingSmsProperties();
+        properties.getSms().setEnabled(true);
+        job = new BookingReminderJob(bookingRepository, properties, events,
+                Clock.fixed(OffsetDateTime.parse("2026-06-01T10:00:00Z").toInstant(), ZoneOffset.UTC),
+                new io.micrometer.core.instrument.simple.SimpleMeterRegistry(), com.beautica.booking.crypto.GuestCancelTokenCipherFixtures.testPageLinks("https://beautica.app"));
+        Booking walkIn = walkInBooking("+380503333333", "Акція! пишіть на example.test");
+        when(bookingRepository.findGuestBookingsForReminder(any(), any(), org.mockito.ArgumentMatchers.eq(true)))
+                .thenReturn(List.of(walkIn));
+
+        job.sendReminders();
+
+        GuestRemindersDueEvent.GuestReminderSms sms = publishedEvent().reminders().get(0);
+        assertThat(sms.phoneE164()).isEqualTo("+380503333333");
+        assertThat(sms.text()).contains("Манікюр класичний").doesNotContain("example.test");
+    }
+
+    @Test
+    @DisplayName("phase 435 follow-up: an over-long salon reminder drops the location note first, keeps the address, stays within the cap")
+    void should_capReminderLength_when_addressLong() {
+        // Arrange — every provider value is long: salon 60, master 2×30, service 60, address 100, note 100, plus the link
+        Booking booking = longSalonBooking("п".repeat(100));
+        when(bookingRepository.findGuestBookingsForReminder(any(), any(), anyBoolean())).thenReturn(List.of(booking));
+
+        // Act
+        job.sendReminders();
+
+        // Assert
+        String text = publishedEvent().reminders().get(0).text();
+        assertThat(text.length()).isLessThanOrEqualTo(com.beautica.booking.domain.GuestSmsProviderText.MAX_SMS_CHARS);
+        assertThat(text).contains("\nАдреса: вулиця " + "Х".repeat(52) + "…\n").doesNotContain("п".repeat(10))
+                .doesNotContain("(")
+                .startsWith("Beautica: Нагадуємо, що завтра у Вас запис!\n\nСтудія " + "С".repeat(32) + "… | ")
+                .endsWith("\nСкасувати запис: https://beautica.app/c/" + booking.getCancelToken().value());
+    }
+
+    @Test
+    @DisplayName("phase 435 follow-up: the salon reminder renders the exact copy — no blank lines, address with note")
+    void should_renderExactSalonReminder_when_salonHasAddressAndNote() {
+        // Arrange
+        User user = new User("m@beautica.test", "x", com.beautica.auth.Role.SALON_MASTER, "Марія", "Левченко", null);
+        Master master = Master.builder().user(user).isActive(true).build();
+        ServiceDefinition def = ServiceDefinition.builder()
+                .name("Манікюр").baseDurationMinutes(60).bufferMinutesAfter(0)
+                .basePrice(new BigDecimal("350.00")).build();
+        MasterServiceAssignment msa = MasterServiceAssignment.builder()
+                .master(master).serviceDefinition(def).isActive(true).build();
+        com.beautica.salon.entity.Salon salon = com.beautica.salon.entity.Salon.builder().id(UUID.randomUUID())
+                .name("Beauty Room").street("Хрещатик").buildingNo("10").locationNote("вхід з двору")
+                .isActive(true).build();
+        Booking booking = sealed(Booking.guestBooking(master, msa, salon,
+                OffsetDateTime.parse("2026-06-02T14:00:00+03:00"), OffsetDateTime.parse("2026-06-02T15:00:00+03:00"),
+                new BigDecimal("350.00"), null, 60, 0, "Олена", "Коваль", "+380501111111", null));
+        when(bookingRepository.findGuestBookingsForReminder(any(), any(), anyBoolean())).thenReturn(List.of(booking));
+
+        // Act
+        job.sendReminders();
+
+        // Assert
+        assertThat(publishedEvent().reminders().get(0).text()).isEqualTo("""
+                Beautica: Нагадуємо, що завтра у Вас запис!
+
+                Beauty Room | Марія Левченко | Манікюр о 14:00
+                Адреса: Хрещатик 10 (вхід з двору)
+                Скасувати запис: https://beautica.app/c/""" + booking.getCancelToken().value());
+    }
+
+    private static Booking longSalonBooking(String locationNote) {
+        User user = new User("m@beautica.test", "x", com.beautica.auth.Role.SALON_MASTER,
+                "Олександра" + "а".repeat(20), "Левченко" + "о".repeat(22), null);
+        Master master = Master.builder().user(user).isActive(true).build();
+        ServiceDefinition def = ServiceDefinition.builder()
+                .name("Манікюр " + "м".repeat(52)).baseDurationMinutes(60).bufferMinutesAfter(0)
+                .basePrice(new BigDecimal("350.00")).build();
+        MasterServiceAssignment msa = MasterServiceAssignment.builder()
+                .master(master).serviceDefinition(def).isActive(true).build();
+        com.beautica.salon.entity.Salon salon = com.beautica.salon.entity.Salon.builder().id(UUID.randomUUID())
+                .name("Студія " + "С".repeat(53)).street("вулиця " + "Х".repeat(93)).buildingNo("10")
+                .locationNote(locationNote).isActive(true).build();
+        return sealed(Booking.guestBooking(master, msa, salon,
+                OffsetDateTime.parse("2026-06-02T10:00:00+03:00"), OffsetDateTime.parse("2026-06-02T11:00:00+03:00"),
+                new BigDecimal("350.00"), null, 60, 0, "Олена", "Коваль", "+380501111111", null));
+    }
+
+    private static Booking sealed(Booking booking) {
+        org.springframework.test.util.ReflectionTestUtils.setField(booking, "id", UUID.randomUUID());
+        booking.attachSealedCancelToken(com.beautica.booking.crypto.GuestCancelTokenCipherFixtures.testCipher()
+                .seal(booking.getCancelToken(),
+                        com.beautica.booking.crypto.GuestCancelTokenCipher.Row.booking(booking.getId())));
+        return booking;
+    }
+
+    @Test
+    @DisplayName("audit-fix cycle 2: a URL-like master name is dropped with its reminder segment (independent + salon)")
+    void should_omitMasterName_when_masterNameIsUrlLike() {
+        // Arrange
+        User user = new User("m@beautica.test", "x", com.beautica.auth.Role.SALON_MASTER, "t.me/promo", "Знижки", null);
+        Master master = Master.builder().user(user).isActive(true).build();
+        ServiceDefinition def = ServiceDefinition.builder()
+                .name("Манікюр").baseDurationMinutes(60).bufferMinutesAfter(0)
+                .basePrice(new BigDecimal("350.00")).build();
+        MasterServiceAssignment msa = MasterServiceAssignment.builder()
+                .master(master).serviceDefinition(def).isActive(true).build();
+        com.beautica.salon.entity.Salon salon = com.beautica.salon.entity.Salon.builder().id(UUID.randomUUID())
+                .name("Beauty Room").isActive(true).build();
+        OffsetDateTime start = OffsetDateTime.parse("2026-06-02T10:00:00+03:00");
+        Booking independent = Booking.guestBooking(master, msa, null, start, start.plusHours(1),
+                new BigDecimal("350.00"), null, 60, 0, "Олена", "Коваль", "+380501111111", null);
+        Booking atSalon = Booking.guestBooking(master, msa, salon, start, start.plusHours(1),
+                new BigDecimal("350.00"), null, 60, 0, "Олена", "Коваль", "+380502222222", null);
+        when(bookingRepository.findGuestBookingsForReminder(any(), any(), anyBoolean()))
+                .thenReturn(List.of(independent, atSalon));
+
+        // Act
+        job.sendReminders();
+
+        // Assert
+        List<GuestRemindersDueEvent.GuestReminderSms> sms = publishedEvent().reminders();
+        assertThat(sms).extracting(GuestRemindersDueEvent.GuestReminderSms::text)
+                .noneMatch(text -> text.contains("t.me") || text.contains("Знижки") || text.contains("|  |"));
+        assertThat(sms.get(0).text())
+                .isEqualTo("Beautica: Нагадуємо, що завтра у Вас запис!\n\nМанікюр о 10:00");
+        assertThat(sms.get(1).text())
+                .isEqualTo("Beautica: Нагадуємо, що завтра у Вас запис!\n\nBeauty Room | Манікюр о 10:00");
+    }
+
+    private Booking walkInBooking(String phone, String customServiceName) {
+        User user = new User("m@beautica.test", "x", com.beautica.auth.Role.SALON_MASTER, "Марія", "Левченко", null);
+        Master master = Master.builder().user(user).isActive(true).build();
+        com.beautica.service.entity.ServiceType type = com.beautica.service.entity.ServiceType.builder()
+                .nameUk("Манікюр класичний").build();
+        ServiceDefinition def = ServiceDefinition.builder()
+                .name(customServiceName).serviceType(type).baseDurationMinutes(60).bufferMinutesAfter(0)
+                .basePrice(new BigDecimal("350.00")).build();
+        MasterServiceAssignment msa = MasterServiceAssignment.builder()
+                .master(master).serviceDefinition(def).isActive(true).build();
+        return Booking.staffBooking(
+                master, msa, null,
+                OffsetDateTime.parse("2026-06-02T10:00:00+03:00"),
+                OffsetDateTime.parse("2026-06-02T11:00:00+03:00"),
+                new BigDecimal("350.00"), null, 60, 0, "Олена", "Коваль", phone, UUID.randomUUID());
     }
 
     private Booking guestBooking(String phone) {

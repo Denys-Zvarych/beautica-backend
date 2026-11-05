@@ -4,6 +4,7 @@ import com.beautica.notification.sms.CapturingOtpSmsSender;
 import com.beautica.notification.sms.OtpSmsSender;
 import com.beautica.notification.sms.SmsService;
 import com.beautica.notification.sms.CapturingSmsService;
+import com.zaxxer.hikari.HikariDataSource;
 import jakarta.mail.Message;
 import jakarta.mail.Session;
 import jakarta.mail.internet.MimeMessage;
@@ -20,7 +21,9 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.mail.javamail.JavaMailSender;
+import org.springframework.test.context.TestPropertySource;
 
+import javax.sql.DataSource;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -39,6 +42,15 @@ import static org.mockito.Mockito.when;
  * real here (staging is not skipped) and must pass with the staging overlay's own values.
  */
 @DisplayName("prod,staging profile — capture wiring (Phase 368)")
+// Phase 432 (owner state 2026-10-30): Railway staging already carries the staging bot's token, username and webhook
+// secret with APP_TELEGRAM_ENABLED=false and no TELEGRAM_STAGING_ALLOWED_CHAT_IDS. That exact shape must boot.
+// Fake, low-entropy fixtures (the bot id is not the prod one).
+@TestPropertySource(properties = {
+        "TELEGRAM_BOT_TOKEN=7000000001:ssssssssssssssssssssssssssssssssss",
+        "TELEGRAM_BOT_USERNAME=bt_qa_x7k2_bot",
+        "TELEGRAM_WEBHOOK_SECRET=staging_it_webhook_secret_ssssssssssssssssssssssssssssssssss",
+        "APP_TELEGRAM_ENABLED=false"
+})
 class StagingProfileContextIT extends AbstractStagingProfileIT {
 
     private static final Pattern CODE = Pattern.compile("(\\d{6})");
@@ -73,6 +85,21 @@ class StagingProfileContextIT extends AbstractStagingProfileIT {
 
     @Autowired
     private org.springframework.context.ApplicationContext context;
+
+    @Test
+    @DisplayName("Phase 432 — Railway staging shape (staging bot creds, flag off, no allow-list) boots: NoOp, guard present, empty list")
+    void should_bootWithNoOpTelegram_when_stagingBotCredentialsSetAndFlagOff() {
+        var properties = context.getBean(TelegramProperties.class);
+
+        assertThat(properties.enabled()).isFalse();
+        assertThat(properties.botUsername()).isEqualTo("bt_qa_x7k2_bot");
+        assertThat(properties.stagingAllowedChatIds()).isEmpty();
+        assertThat(context.getBean(com.beautica.notification.telegram.TelegramMessenger.class))
+                .isInstanceOf(com.beautica.notification.telegram.NoOpTelegramMessenger.class);
+        assertThat(context.getBeansOfType(TelegramEnvGuard.class)).hasSize(1);
+        assertThat(context.getBean(com.beautica.notification.telegram.TelegramChatAllowList.class))
+                .isInstanceOf(com.beautica.notification.telegram.StagingTelegramChatAllowList.class);
+    }
 
     @Test
     @DisplayName("Phase 374 — staging overrides prod's brevo-api: SMTP transport, inline logo, SMTP probe only")
@@ -128,5 +155,50 @@ class StagingProfileContextIT extends AbstractStagingProfileIT {
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
         assertThat(turbosmsStub().getAllServeEvents()).isEmpty();
+    }
+
+    @Autowired
+    private DataSource appDataSource;
+
+    @Test
+    @DisplayName("hotfix app-datasource-pool — app connections come from the hikari.* pool (max 10, statement_timeout 5s, no lock_timeout), not flyway-pool")
+    void should_runAppOnHikariPropertiesPool_when_prodAndStagingProfilesActive() throws Exception {
+        HikariDataSource pool = appDataSource.unwrap(HikariDataSource.class);
+
+        String lockTimeout = jdbcTemplate.queryForObject("SHOW lock_timeout", String.class);
+        String statementTimeout = jdbcTemplate.queryForObject("SHOW statement_timeout", String.class);
+
+        assertThat(pool.getPoolName()).as("app must not run on Flyway's pool").isNotEqualTo("flyway-pool");
+        assertThat(pool.getMaximumPoolSize()).as("application.yml hikari.maximum-pool-size").isEqualTo(10);
+        assertThat(lockTimeout).as("Flyway's SET lock_timeout must not reach app sessions").isEqualTo("0");
+        assertThat(statementTimeout).as("application.yml hikari.connection-init-sql").isEqualTo("5s");
+    }
+
+    @Autowired
+    private org.springframework.boot.actuate.health.HealthContributorRegistry healthContributorRegistry;
+
+    @Autowired
+    private org.springframework.context.ApplicationContext applicationContext;
+
+    @Test
+    @DisplayName("hotfix app-datasource-pool — the 'db' health indicator probes the app dataSource, never flyway-pool")
+    void should_probeAppDataSource_when_dbHealthIndicatorRuns() throws Exception {
+        var contributor = healthContributorRegistry.getContributor("db");
+
+        assertThat(contributor)
+                .as("one app DataSource => a single DataSourceHealthIndicator; a composite would mean flyway-pool "
+                        + "became an autowire candidate again, actual=%s", contributor)
+                .isInstanceOf(org.springframework.boot.actuate.jdbc.DataSourceHealthIndicator.class);
+        var indicator = (org.springframework.boot.actuate.jdbc.DataSourceHealthIndicator) contributor;
+        DataSource probed = (DataSource) org.springframework.test.util.ReflectionTestUtils.getField(indicator, "dataSource");
+
+        assertThat(probed)
+                .as("readiness must probe the pool that serves requests (bean 'dataSource')")
+                .isSameAs(applicationContext.getBean("dataSource"))
+                .isNotSameAs(applicationContext.getBean("flywayDataSource"));
+        assertThat(probed.unwrap(HikariDataSource.class).getPoolName()).isNotEqualTo("flyway-pool");
+        assertThat(indicator.health().getStatus())
+                .as("the probe must actually succeed against the app pool")
+                .isEqualTo(org.springframework.boot.actuate.health.Status.UP);
     }
 }

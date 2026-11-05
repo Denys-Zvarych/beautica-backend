@@ -8,7 +8,6 @@ import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingSource;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.service.BookingSmsDispatcher;
-import com.beautica.config.BookingLinksProperties;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
 import com.beautica.notification.entity.OutboxEventType;
@@ -67,17 +66,28 @@ class NotificationServiceTest {
     private static final BookingSmsDispatcher.Kind KIND = BookingSmsDispatcher.Kind.GUEST_PROVIDER_CANCELLATION;
     /** Kyiv 10:00 on 01.08.2026 — the start every guest mock below carries. */
     private static final String BODY_0108 = "Beautica: Ваш запис 01.08.2026 о 10:00 скасовано.";
+    /** Phase 435 — the guest's own page, rebuilt from the sealed token. */
+    private static final com.beautica.booking.crypto.GuestCancelTokenCipher CIPHER =
+            com.beautica.booking.crypto.GuestCancelTokenCipherFixtures.testCipher();
+    private static final UUID GUEST_TOKEN = UUID.fromString("123e4567-e89b-12d3-a456-426614174000");
+    private static final String DETAILS_LINE =
+            "\n\nДеталі або записатись знову " + FRONTEND_BASE_URL + "/c/" + GUEST_TOKEN;
 
     @BeforeEach
     void setUp() {
-        BookingLinksProperties links = new BookingLinksProperties();
-        links.setShareEnabled(true);
+        GuestProviderCancellationSmsText cancellationText = new GuestProviderCancellationSmsText(
+                new com.beautica.booking.service.GuestBookingPageLinks(CIPHER,
+                        new com.beautica.booking.service.GuestCancelUrlBuilder(FRONTEND_BASE_URL),
+                        mock(com.beautica.booking.repository.AppointmentRepository.class)));
         service = new NotificationService(
-                emailService, bookingSmsDispatcher, new GuestProviderCancellationSmsText(links),
-                new GuestRescheduleSmsText(new com.beautica.config.BookingSmsProperties()), rescheduleSmsBudget,
+                emailService, bookingSmsDispatcher, cancellationText,
+                new GuestRescheduleSmsText(new com.beautica.config.BookingSmsProperties(), cancellationText),
+                rescheduleSmsBudget,
                 FRONTEND_BASE_URL);
         // Phase 431: the budget grants by default; the cap rows below override it.
         lenient().when(rescheduleSmsBudget.tryReserve(any(), any(), any())).thenReturn(true);
+        // Phase 408 audit-fix: the walk-in cancellation budget grants by default; the cap row below overrides it.
+        lenient().when(rescheduleSmsBudget.tryReserveWalkInCancellation(any(), any(), any(), any())).thenReturn(true);
     }
 
     // -------------------------------------------------------------------------
@@ -176,6 +186,37 @@ class NotificationServiceTest {
     }
 
     @Test
+    @DisplayName("Phase 435: a declined guest booking with a sealed token gets the «Деталі» line with its own page")
+    void should_appendGuestPageLine_when_guestBookingDeclinedWithSealedToken() {
+        // Arrange
+        Booking booking = buildGuestBookingMockForDecline(null);
+        UUID bookingId = booking.getId();
+        when(booking.getCancelTokenSealed()).thenReturn(CIPHER.seal(GUEST_TOKEN, com.beautica.booking.crypto.GuestCancelTokenCipher.Row.booking(bookingId)));
+
+        // Act
+        service.notifyBookingStatusChanged(BookingVisit.single(booking));
+
+        // Assert
+        assertThat(dispatchedText()).endsWith(DETAILS_LINE).startsWith("Beautica: Ваш запис ");
+    }
+
+    @Test
+    @DisplayName("Phase 435: a salon closure of a sealed-token guest booking links the guest's own page")
+    void should_appendGuestPageLine_when_salonClosedWithSealedToken() {
+        // Arrange
+        Booking booking = buildGuestBookingMockForSalonClosed(
+                "Тест послуга", OffsetDateTime.parse("2026-08-01T10:00:00+03:00"));
+        UUID bookingId = booking.getId();
+        when(booking.getCancelTokenSealed()).thenReturn(CIPHER.seal(GUEST_TOKEN, com.beautica.booking.crypto.GuestCancelTokenCipher.Row.booking(bookingId)));
+
+        // Act
+        service.notifySalonClosed(BookingVisit.single(booking));
+
+        // Assert
+        assertThat(dispatchedText()).isEqualTo(BODY_0108 + DETAILS_LINE);
+    }
+
+    @Test
     @DisplayName("Phase 390: a saturated smsSendExecutor propagates out of the guest decline so the outbox "
             + "drain re-queues the row instead of marking it SENT")
     void should_propagateRejection_when_guestDeclineSmsExecutorSaturated() {
@@ -190,15 +231,15 @@ class NotificationServiceTest {
     }
 
     @Test
-    @DisplayName("Phase 390: the guest decline SMS is the fixed copy + the master's rebook link — no "
-            + "provider note, service name or master name")
+    @DisplayName("Phase 390/435: the guest decline SMS is the fixed copy — no provider note, service name, "
+            + "master name or rebook link")
     void should_renderFixedCopyWithoutProviderText_when_guestBookingDeclined() {
         Booking booking = buildGuestBookingMockForDecline("Майстер захворів https://evil.example");
 
         service.notifyBookingStatusChanged(BookingVisit.single(booking));
 
         assertThat(dispatchedText())
-                .isEqualTo(BODY_0108 + " Записатися знову: beautica.app/book/test-master")
+                .isEqualTo(BODY_0108)
                 .doesNotContain("Майстер захворів")
                 .doesNotContain("evil")
                 .doesNotContain("Тест послуга")
@@ -247,20 +288,66 @@ class NotificationServiceTest {
     }
 
     /**
-     * Phase 22.1 (security MEDIUM): the guest-SMS branch must key on {@code BookingSource.LINK},
-     * not on {@code client == null}. A STAFF walk-in's phone is typed in by a salon employee about a
-     * third party and verified by nothing, so it is never an SMS destination.
+     * Phase 408 (user decision 2026-10-28, reverses the Phase 22.1 / 390 LINK-only scope): a declined STAFF
+     * walk-in with a phone gets the same fixed provider-cancellation copy as a LINK guest — no provider note.
      */
     @Test
-    @DisplayName("a declined STAFF walk-in booking sends NO SMS — the phone was typed by staff, "
-            + "not proven by the recipient (unlike a LINK guest's OTP-verified number)")
-    void should_notSendDeclineSms_when_staffWalkInBookingDeclined() {
+    @DisplayName("a declined STAFF walk-in with a phone gets ONE provider-cancellation message, same fixed "
+            + "copy as a LINK guest, no provider note and no email")
+    void should_sendDeclineSms_when_staffWalkInBookingDeclined() {
         Booking booking = buildStaffWalkInBookingMockForDecline("Майстер захворів");
 
         service.notifyBookingStatusChanged(BookingVisit.single(booking));
 
-        verifyNoInteractions(bookingSmsDispatcher);
+        assertThat(dispatchedText()).isEqualTo(BODY_0108);
         verify(emailService, never()).sendBookingDeclinedEmail(anyString(), any());
+    }
+
+    @Test
+    @DisplayName("Phase 408 audit-fix: a walk-in whose phone budget is exhausted gets no cancellation message, silently")
+    void should_skipWalkInCancellationSms_when_phoneBudgetExhausted() {
+        Booking booking = buildStaffWalkInBookingMockForDecline(null);
+        when(rescheduleSmsBudget.tryReserveWalkInCancellation(any(), any(), eq(GUEST_PHONE), any())).thenReturn(false);
+
+        service.notifyBookingStatusChanged(BookingVisit.single(booking));
+
+        verifyNoInteractions(bookingSmsDispatcher);
+        verifyNoInteractions(emailService);
+    }
+
+    @Test
+    @DisplayName("Phase 408 audit-fix cycle 2: the drained outbox entry id reaches the walk-in budget (retry idempotency)")
+    void should_passOutboxEntryIdToWalkInBudget_when_drainedWithEntryId() {
+        Booking booking = buildStaffWalkInBookingMockForDecline(null);
+        UUID entryId = UUID.randomUUID();
+
+        service.notifyBookingStatusChanged(BookingVisit.single(booking), entryId);
+
+        verify(rescheduleSmsBudget).tryReserveWalkInCancellation(any(), any(), eq(GUEST_PHONE), eq(entryId));
+        assertThat(dispatchedText()).isEqualTo(BODY_0108);
+    }
+
+    @Test
+    @DisplayName("Phase 408 audit-fix: a LINK guest's decline never touches the walk-in budget")
+    void should_notReserveWalkInBudget_when_linkGuestDeclined() {
+        Booking booking = buildGuestBookingMockForDecline(null);
+
+        service.notifyBookingStatusChanged(BookingVisit.single(booking));
+
+        verify(rescheduleSmsBudget, never()).tryReserveWalkInCancellation(any(), any(), any(), any());
+        assertThat(dispatchedText()).startsWith("Beautica: Ваш запис ");
+    }
+
+    @Test
+    @DisplayName("a declined STAFF walk-in WITHOUT a phone gets nothing")
+    void should_sendNothing_when_staffWalkInWithoutPhoneDeclined() {
+        Booking booking = buildStaffWalkInBookingMockForDecline(null);
+        when(booking.getGuestPhone()).thenReturn(null);
+
+        service.notifyBookingStatusChanged(BookingVisit.single(booking));
+
+        verifyNoInteractions(bookingSmsDispatcher);
+        verifyNoInteractions(emailService);
     }
 
     @Test
@@ -477,15 +564,15 @@ class NotificationServiceTest {
     }
 
     @Test
-    @DisplayName("notifySalonClosed never sends SMS for a STAFF walk-in — the phone was typed by "
-            + "staff, not proven by the recipient (same gate as notifyBookingStatusChanged)")
-    void should_notSendSms_when_notifySalonClosedForStaffWalkIn() {
+    @DisplayName("Phase 408: notifySalonClosed sends a STAFF walk-in with a phone the same closure copy as a "
+            + "LINK guest (no rebook link), no email")
+    void should_sendSms_when_notifySalonClosedForStaffWalkIn() {
         Booking booking = buildStaffWalkInBookingMockForDecline(null);
         BookingVisit visit = BookingVisit.single(booking);
 
         service.notifySalonClosed(visit);
 
-        verifyNoInteractions(bookingSmsDispatcher);
+        assertThat(dispatchedText()).isEqualTo(BODY_0108);
         verifyNoInteractions(emailService);
     }
 
@@ -564,7 +651,7 @@ class NotificationServiceTest {
         service.notifyMasterRemoved(BookingVisit.single(booking));
 
         assertThat(dispatchedText())
-                .isEqualTo(BODY_0108 + " Записатися знову: beautica.app/book/s/test-salon")
+                .isEqualTo(BODY_0108)
                 .doesNotContain("test-master")
                 .doesNotContain("Тест послуга");
         verifyNoInteractions(emailService);
@@ -584,15 +671,15 @@ class NotificationServiceTest {
     }
 
     @Test
-    @DisplayName("notifyMasterRemoved never sends SMS for a STAFF walk-in — same gate as "
-            + "notifySalonClosed / notifyBookingStatusChanged")
-    void should_notSendSms_when_notifyMasterRemovedForStaffWalkIn() {
+    @DisplayName("Phase 408: notifyMasterRemoved sends a STAFF walk-in with a phone the same master-removed "
+            + "copy as a LINK guest, no email")
+    void should_sendSms_when_notifyMasterRemovedForStaffWalkIn() {
         Booking booking = buildStaffWalkInBookingMockForDecline(null);
         BookingVisit visit = BookingVisit.single(booking);
 
         service.notifyMasterRemoved(visit);
 
-        verifyNoInteractions(bookingSmsDispatcher);
+        assertThat(dispatchedText()).isEqualTo(BODY_0108);
         verifyNoInteractions(emailService);
     }
 

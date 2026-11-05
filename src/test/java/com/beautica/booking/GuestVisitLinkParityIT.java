@@ -10,6 +10,7 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 
 import com.beautica.booking.domain.CancelTokenHasher;
+import com.beautica.booking.domain.GuestCancelToken;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.auth.phoneotp.GuestTokenProvider;
 import com.beautica.booking.dto.AvailableSlotResponse;
@@ -191,8 +192,8 @@ class GuestVisitLinkParityIT extends AbstractIntegrationTest {
         ResponseEntity<Void> cancelResp = restTemplate.exchange(
                 "/api/v1/book/cancel/" + token, HttpMethod.POST, new HttpEntity<>(xffHeaders()), Void.class);
         assertThat(cancelResp.getStatusCode())
-                .as("the one visit token must cancel the whole visit → 204")
-                .isEqualTo(HttpStatus.NO_CONTENT);
+                .as("the one visit token must cancel the whole visit → 200 (phase 436; was 204)")
+                .isEqualTo(HttpStatus.OK);
 
         List<Map<String, Object>> items = jdbcTemplate.queryForList(
                 "SELECT status, cancel_token_hash FROM bookings WHERE appointment_id = ?", created.appointmentId());
@@ -269,8 +270,8 @@ class GuestVisitLinkParityIT extends AbstractIntegrationTest {
                 "/api/v1/book/cancel/" + headerToken, HttpMethod.POST,
                 new HttpEntity<>(xffHeaders()), Void.class);
         assertThat(headerResp.getStatusCode())
-                .as("the header token still cancels the whole visit → 204")
-                .isEqualTo(HttpStatus.NO_CONTENT);
+                .as("the header token still cancels the whole visit → 200 (phase 436; was 204)")
+                .isEqualTo(HttpStatus.OK);
         List<Map<String, Object>> itemsAfterCancel = jdbcTemplate.queryForList(
                 "SELECT status FROM bookings WHERE appointment_id = ?", created.appointmentId());
         assertThat(itemsAfterCancel).hasSize(2);
@@ -345,12 +346,12 @@ class GuestVisitLinkParityIT extends AbstractIntegrationTest {
         String token = created.cancelUrl().substring(created.cancelUrl().lastIndexOf('/') + 1);
         assertThat(row.get("cancel_token_hash"))
                 .as("V206: the row stores only the SHA-256 of the token handed to the guest")
-                .isEqualTo(CancelTokenHasher.hash(UUID.fromString(token)));
+                .isEqualTo(CancelTokenHasher.hash(GuestCancelToken.valueOf(token)));
         ResponseEntity<Void> cancelResp = restTemplate.exchange(
                 "/api/v1/book/cancel/" + token, HttpMethod.POST, new HttpEntity<>(xffHeaders()), Void.class);
         assertThat(cancelResp.getStatusCode())
-                .as("legacy single-booking cancel-by-token still returns 204")
-                .isEqualTo(HttpStatus.NO_CONTENT);
+                .as("legacy single-booking cancel-by-token still returns 200 (phase 436; was 204)")
+                .isEqualTo(HttpStatus.OK);
         Map<String, Object> after = jdbcTemplate.queryForMap(
                 "SELECT status, cancel_token_hash FROM bookings WHERE id = ?", created.bookingId());
         assertThat(after.get("status")).isEqualTo("CANCELLED");

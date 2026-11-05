@@ -17,7 +17,19 @@ import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 
+import com.beautica.notification.telegram.CapturingTelegramMessenger;
+import com.beautica.notification.telegram.NoOpTelegramMessenger;
+import com.beautica.notification.telegram.TelegramBotApiClient;
+import com.beautica.notification.telegram.TelegramDeliveryException;
+import com.beautica.notification.telegram.TelegramMessenger;
+import org.springframework.context.ApplicationContext;
+
+import java.lang.reflect.Field;
+import java.lang.reflect.Modifier;
+import java.util.Arrays;
+
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Smoke: the context boots and the only exposed actuator endpoint is {@code health}, UP including
@@ -37,6 +49,9 @@ class BeauticaApplicationTests extends AbstractIntegrationTest {
 
     @Autowired
     private ObjectMapper objectMapper;
+
+    @Autowired
+    private ApplicationContext applicationContext;
 
     @Test
     @DisplayName("should_returnUpWithDbComponent_when_healthRequested")
@@ -65,5 +80,21 @@ class BeauticaApplicationTests extends AbstractIntegrationTest {
                 "/actuator/env", HttpMethod.GET, new HttpEntity<>(headers), String.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+    }
+
+    @Test
+    @DisplayName("Phase 404 — default config: the only TelegramMessenger is the NoOp, no live/capture bean, send falls back")
+    void should_wireOnlyNoOpTelegramMessenger_when_defaultConfig() {
+        var messengers = applicationContext.getBeansOfType(TelegramMessenger.class);
+
+        assertThat(messengers.values()).singleElement().isExactlyInstanceOf(NoOpTelegramMessenger.class);
+        assertThat(applicationContext.getBeansOfType(TelegramBotApiClient.class)).isEmpty();
+        assertThat(applicationContext.getBeansOfType(CapturingTelegramMessenger.class)).isEmpty();
+        // Structural no-network proof: the NoOp holds no collaborator at all (no RestClient, no mail sender).
+        assertThat(Arrays.stream(NoOpTelegramMessenger.class.getDeclaredFields())
+                .filter(f -> !Modifier.isStatic(f.getModifiers())).map(Field::getName)).isEmpty();
+        assertThatThrownBy(() -> messengers.values().iterator().next().send(1L, "hi"))
+                .isExactlyInstanceOf(TelegramDeliveryException.class)
+                .hasMessageContaining("app.telegram.enabled=false");
     }
 }
