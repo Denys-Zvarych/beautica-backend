@@ -91,7 +91,11 @@ class DbBackupRoundTripIT {
     private static final String SENTRY_PATH = "/cron/beautica-db-backup/";
     private static final String AGE_MAGIC = "age-encryption.org/v1";
     private static final Pattern RESULT_LINE = Pattern.compile("(?m)^db_backup_result .*$");
-    private static final Pattern STATUS_PARAM = Pattern.compile("status=(\\w+)");
+    private static final Pattern STATUS_PARAM = Pattern.compile("[?&]status=(\\w+)");
+    private static final Pattern CHECK_IN_ID_PARAM = Pattern.compile("[?&]check_in_id=([^&]*)");
+    private static final String CHECK_IN_ID_RE = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+    // The od /dev/urandom fallback stamps version 4 and the RFC 4122 variant.
+    private static final String V4_CHECK_IN_ID_RE = "[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
 
     private static final SecureRandom RANDOM = new SecureRandom();
     private static final ObjectMapper JSON = new ObjectMapper();
@@ -196,7 +200,7 @@ class DbBackupRoundTripIT {
         byte[] object = s3.getObjectAsBytes(b -> b.bucket(BACKUP_BUCKET).key(keys.get(0))).asByteArray();
         assertThat(new String(object, 0, AGE_MAGIC.length(), StandardCharsets.ISO_8859_1))
                 .as("object is age ciphertext, not a plaintext PGDMP archive").isEqualTo(AGE_MAGIC);
-        assertThat(checkInStatuses()).containsExactly("in_progress", "ok");
+        assertPairedCheckIns(run, "ok", 200);
         assertNoLeak(run.output());
 
         try (PostgreSQLContainer<?> target = new PostgreSQLContainer<>(TestPostgresImage.dockerImageName())
@@ -255,7 +259,7 @@ class DbBackupRoundTripIT {
         assertThat(run.exitCode()).isEqualTo(2);
         assertThat(run.resultLine()).startsWith("db_backup_result status=size_warn ");
         assertThat(keys(BACKUP_BUCKET)).hasSize(1);
-        assertThat(checkInStatuses()).containsExactly("in_progress", "error");
+        assertPairedCheckIns(run, "error", 200);
         assertNoLeak(run.output());
     }
 
@@ -270,7 +274,7 @@ class DbBackupRoundTripIT {
         assertThat(run.exitCode()).isZero();
         assertThat(run.resultLine()).startsWith("db_backup_result status=ok ");
         assertThat(keys(BACKUP_BUCKET)).hasSize(1);
-        assertThat(checkInStatuses()).containsExactly("in_progress", "ok");
+        assertPairedCheckIns(run, "ok", 500);
         assertNoLeak(run.output());
     }
 
@@ -318,7 +322,10 @@ class DbBackupRoundTripIT {
     void should_attemptOnce_when_storageAnswers403() throws Exception {
         String wrongSecret = randomToken(32);
 
-        Run run = runBackup(Map.of("BACKUP_R2_SECRET_ACCESS_KEY", wrongSecret));
+        // The 403 comes from the curl shim, not the gateway: versitygw rejects a bad signature from the headers and
+        // closes while curl is still sending the body, so a real wrong-secret PUT of a multi-hundred-KiB dump ends
+        // http=000 / curl exit 55 in a few percent of runs (correctly retried by backup.sh) -- a flaky 403.
+        Run run = runBackup(Map.of("BACKUP_R2_SECRET_ACCESS_KEY", wrongSecret, "SHIM_FAULT", "forbidden"), curlShim());
 
         assertThat(run.exitCode()).isNotZero();
         assertThat(run.output()).contains("upload attempt 1 http=403").doesNotContain("upload attempt 2");
@@ -326,7 +333,7 @@ class DbBackupRoundTripIT {
         assertThat(run.resultLine()).startsWith("db_backup_result status=error ");
         assertThat(run.output()).doesNotContain(wrongSecret);
         assertThat(keys(BACKUP_BUCKET)).isEmpty();
-        assertThat(checkInStatuses()).containsExactly("in_progress", "error");
+        assertPairedCheckIns(run, "error", 200);
     }
 
     @Test
@@ -443,7 +450,7 @@ class DbBackupRoundTripIT {
                 .doesNotContain("upload attempt 3");
         assertThat(run.resultLine()).startsWith("db_backup_result status=ok ");
         assertThat(keys(BACKUP_BUCKET)).hasSize(1);
-        assertThat(checkInStatuses()).containsExactly("in_progress", "ok");
+        assertPairedCheckIns(run, "ok", 200);
         assertNoLeak(run.output());
     }
 
@@ -457,7 +464,7 @@ class DbBackupRoundTripIT {
                 .doesNotContain("upload attempt 2");
         assertThat(run.resultLine()).startsWith("db_backup_result status=ok ");
         assertThat(keys(BACKUP_BUCKET)).hasSize(1);
-        assertThat(checkInStatuses()).containsExactly("in_progress", "ok");
+        assertPairedCheckIns(run, "ok", 200);
         assertNoLeak(run.output());
     }
 
@@ -507,7 +514,7 @@ class DbBackupRoundTripIT {
                 .doesNotContain("780s").doesNotContain("database not reachable").doesNotContain("dumping");
         assertThat(run.resultLine()).startsWith("db_backup_result status=error ");
         assertThat(keys(BACKUP_BUCKET)).isEmpty();
-        assertThat(checkInStatuses()).containsExactly("in_progress", "error");
+        assertPairedCheckIns(run, "error", 200);
     }
 
     @Test
@@ -563,7 +570,7 @@ class DbBackupRoundTripIT {
                 "db_backup: upload failed").doesNotContain("upload attempt 4");
         assertThat(run.resultLine()).startsWith("db_backup_result status=error ");
         assertThat(keys(BACKUP_BUCKET)).isEmpty();
-        assertThat(checkInStatuses()).containsExactly("in_progress", "error");
+        assertPairedCheckIns(run, "error", 200);
         assertNoLeak(run.output());
     }
 
@@ -577,7 +584,7 @@ class DbBackupRoundTripIT {
                 .doesNotContain("copy attempt 2");
         assertThat(run.resultLine()).startsWith("db_backup_result status=error ").contains(" weekly=0 ");
         assertThat(keys(BACKUP_BUCKET)).hasSize(1).allMatch(k -> k.startsWith("daily/"));
-        assertThat(checkInStatuses()).containsExactly("in_progress", "error");
+        assertPairedCheckIns(run, "error", 200);
         assertNoLeak(run.output());
     }
 
@@ -598,7 +605,7 @@ class DbBackupRoundTripIT {
         assertThat(duration.find()).isTrue();
         assertThat(Integer.parseInt(duration.group(1))).as("seconds: deadline 12 + kill grace, not the 90 s hang").isLessThan(30);
         assertThat(keys(BACKUP_BUCKET)).isEmpty();
-        assertThat(checkInStatuses()).containsExactly("in_progress", "error");
+        assertPairedCheckIns(run, "error", 200);
         assertNoLeak(run.output());
     }
 
@@ -625,6 +632,90 @@ class DbBackupRoundTripIT {
             assertThat(run.output()).contains("probe tool=" + tool + " inherited_secret=0");
         }
         assertThat(run.output()).doesNotContain("inherited_secret=1");
+    }
+
+    @Test
+    @DisplayName("an unreachable check-in endpoint (closed port) logs http=000 for both check-ins and never fails the backup")
+    void should_exitZero_when_checkInEndpointUnreachable() throws Exception {
+        Run run = runBackup(Map.of("BACKUP_SENTRY_CRON_URL", "http://sentrystub:1" + SENTRY_PATH + SENTRY_KEY + "/"));
+
+        assertThat(run.exitCode()).as(run.output()).isZero();
+        assertThat(run.resultLine()).startsWith("db_backup_result status=ok ");
+        assertThat(keys(BACKUP_BUCKET)).hasSize(1);
+        assertThat(run.output()).contains("db_backup: checkin in_progress http=000").contains("db_backup: checkin ok http=000");
+        assertThat(checkIns()).as("nothing reached the stub's real port").isEmpty();
+        assertThat(run.output()).doesNotContain(SENTRY_KEY, SENTRY_PATH);
+        assertNoLeak(run.output());
+    }
+
+    @Test
+    @DisplayName("when the kernel UUID cannot be read, the od fallback yields one valid v4 dashed check_in_id on both check-ins")
+    void should_sendSameDashedUuid_when_kernelUuidUnreadable() throws Exception {
+        // cat shim: refuses ONLY the kernel UUID path (backup.sh uses cat for nothing else), so new_checkin_id falls back to od.
+        byte[] shim = ("""
+                #!/bin/sh
+                for a in "$@"; do
+                  if [ "$a" = /proc/sys/kernel/random/uuid ]; then
+                    echo "probe kernel_uuid=refused" > /proc/1/fd/1 2>/dev/null || true
+                    exit 1
+                  fi
+                done
+                PATH="${PATH#/usr/local/sbin:}"
+                exec cat "$@"
+                """).getBytes(StandardCharsets.UTF_8);
+
+        Run run = runBackup(Map.of(), Map.of("/usr/local/sbin/cat", Transferable.of(shim, 0755)));
+
+        assertThat(run.exitCode()).as(run.output()).isZero();
+        assertThat(run.output()).as("fallback path was forced").contains("probe kernel_uuid=refused");
+        assertPairedCheckIns(run, "ok", 200);
+        assertThat(checkIns().get(0).id()).as("od fallback id").matches(V4_CHECK_IN_ID_RE);
+        assertNoLeak(run.output());
+    }
+
+    @Test
+    @DisplayName("when neither the kernel UUID nor od yields an id, both check-ins still go out (in_progress then ok), just without check_in_id")
+    void should_sendCheckInsWithoutId_when_noUuidSourceUsable() throws Exception {
+        byte[] refuseCat = ("""
+                #!/bin/sh
+                for a in "$@"; do
+                  [ "$a" = /proc/sys/kernel/random/uuid ] && exit 1
+                done
+                PATH="${PATH#/usr/local/sbin:}"
+                exec cat "$@"
+                """).getBytes(StandardCharsets.UTF_8);
+        byte[] brokenOd = """
+                #!/bin/sh
+                echo "probe od=broken" > /proc/1/fd/1 2>/dev/null || true
+                exit 1
+                """.getBytes(StandardCharsets.UTF_8);
+
+        Run run = runBackup(Map.of(), Map.of(
+                "/usr/local/sbin/cat", Transferable.of(refuseCat, 0755),
+                "/usr/local/sbin/od", Transferable.of(brokenOd, 0755)));
+
+        assertThat(run.exitCode()).as(run.output()).isZero();
+        assertThat(run.output()).as("od fallback was reached and failed").contains("probe od=broken");
+        assertThat(run.resultLine()).startsWith("db_backup_result status=ok ");
+        assertThat(checkIns()).as("both check-ins sent, neither carries a check_in_id")
+                .containsExactly(new CheckIn(null, "in_progress"), new CheckIn(null, "ok"));
+        assertThat(run.output()).contains("db_backup: checkin in_progress http=200").contains("db_backup: checkin ok http=200");
+        assertNoLeak(run.output());
+    }
+
+    @Test
+    @DisplayName("a check-in URL with a control character is never sent: both check-ins log 'skipped' and the backup still ends ok")
+    void should_logSkippedAndExitZero_when_checkInUrlHasControlCharacter() throws Exception {
+        Run run = runBackup(Map.of("BACKUP_SENTRY_CRON_URL", "http://sentrystub:8080" + SENTRY_PATH + SENTRY_KEY + "/\t"));
+
+        assertThat(run.exitCode()).as(run.output()).isZero();
+        assertThat(run.resultLine()).startsWith("db_backup_result status=ok ");
+        assertThat(keys(BACKUP_BUCKET)).hasSize(1);
+        assertThat(run.output()).contains("db_backup: checkin in_progress skipped").contains("db_backup: checkin ok skipped")
+                .doesNotContain("db_backup: checkin in_progress http=").doesNotContain("db_backup: checkin ok http=");
+        assertThat(checkIns()).as("a URL that cannot be put in a curl config is never requested").isEmpty();
+        assertThat(run.output()).doesNotContain(SENTRY_KEY, SENTRY_PATH);
+        assertNoLeak(run.output());
     }
 
     // ── helpers ─────────────────────────────────────────────────────────────────────────────────
@@ -707,15 +798,43 @@ class DbBackupRoundTripIT {
 
     /** Check-in statuses in arrival order (WireMock lists newest first). */
     private static List<String> checkInStatuses() throws Exception {
+        return checkIns().stream().map(CheckIn::status).toList();
+    }
+
+    /** One received check-in: its {@code check_in_id} (null when absent) and {@code status}. */
+    private record CheckIn(String id, String status) {
+    }
+
+    /** Check-ins in arrival order (WireMock lists newest first). */
+    private static List<CheckIn> checkIns() throws Exception {
         JsonNode requests = JSON.readTree(wiremock("GET", "/__admin/requests", null)).get("requests");
-        List<String> statuses = new ArrayList<>();
+        List<CheckIn> checkIns = new ArrayList<>();
         for (JsonNode r : requests) {
-            Matcher m = STATUS_PARAM.matcher(r.get("request").get("url").asText());
-            if (m.find()) {
-                statuses.add(0, m.group(1));
+            String url = r.get("request").get("url").asText();
+            Matcher status = STATUS_PARAM.matcher(url);
+            if (status.find()) {
+                Matcher id = CHECK_IN_ID_PARAM.matcher(url);
+                checkIns.add(0, new CheckIn(id.find() ? id.group(1) : null, status.group(1)));
             }
         }
-        return statuses;
+        return checkIns;
+    }
+
+    /**
+     * Exactly two check-ins, in_progress then {@code finalStatus}, sharing one canonical dashed-UUID check_in_id (so Sentry pairs them
+     * whatever order it processes them in); both logged with the HTTP code, the closing one before the result line,
+     * and neither the Sentry key nor its path is ever printed.
+     */
+    private static void assertPairedCheckIns(Run run, String finalStatus, int httpCode) throws Exception {
+        List<CheckIn> checkIns = checkIns();
+        assertThat(checkIns).extracting(CheckIn::status).containsExactly("in_progress", finalStatus);
+        assertThat(checkIns.get(0).id()).as("check_in_id").matches(CHECK_IN_ID_RE);
+        assertThat(checkIns.get(1).id()).as("same check_in_id on both check-ins").isEqualTo(checkIns.get(0).id());
+        String closing = "db_backup: checkin " + finalStatus + " http=" + httpCode;
+        assertThat(run.output()).contains("db_backup: checkin in_progress http=" + httpCode).contains(closing);
+        assertThat(run.output().indexOf(closing)).as("closing check-in logged before the result line")
+                .isLessThan(run.output().indexOf("db_backup_result "));
+        assertThat(run.output()).doesNotContain(SENTRY_KEY, SENTRY_PATH);
     }
 
     private static void stubCheckIn(int status) throws Exception {
@@ -758,7 +877,7 @@ class DbBackupRoundTripIT {
     /**
      * A {@code curl} shim in front of the image's curl that injects ONE storage fault into the Nth upload PUT
      * (SHIM_PUT_N, default 0 = the first; {@code all} = every PUT). SHIM_FAULT: {@code unavailable} answers 503 without
-     * sending anything; {@code fake200} answers 200 with an empty body without sending anything;
+     * sending anything; {@code forbidden} answers 403 without sending anything; {@code fake200} answers 200 with an empty body without sending anything;
      * {@code lost} really sends the request (the object is stored) but reports 000 / exit 28, as a timeout after the
      * server applied the write would; {@code dropped} reports 000 without sending anything. HEAD, GET, copies of
      * other numbers and the Sentry check-in pass straight through to the real curl.
@@ -792,6 +911,7 @@ class DbBackupRoundTripIT {
                 if [ "${SHIM_PUT_N:-0}" != all ] && [ "$n" != "${SHIM_PUT_N:-0}" ]; then real "$@"; exit $?; fi
                 case "$SHIM_FAULT" in
                   unavailable) printf 503; exit 0 ;;
+                  forbidden) printf 403; exit 0 ;;
                   fake200) printf 200; exit 0 ;;
                   dropped) printf 000; exit 28 ;;
                   lost) real "$@" >/dev/null; printf 000; exit 28 ;;
