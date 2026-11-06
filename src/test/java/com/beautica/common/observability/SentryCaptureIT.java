@@ -2,6 +2,8 @@ package com.beautica.common.observability;
 
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.common.web.RequestIdFilter;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.tomakehurst.wiremock.WireMockServer;
 import com.github.tomakehurst.wiremock.core.WireMockConfiguration;
 import com.github.tomakehurst.wiremock.verification.LoggedRequest;
@@ -54,6 +56,10 @@ class SentryCaptureIT extends AbstractIntegrationTest {
     private static final String JWT_CANARY =
             // JWT-shaped fixture split at the dots so secret scanners (gitleaks jwt) do not flag the source; runtime value unchanged.
             "eyJhbGciOiJIUzI1NiJ9" + "." + "eyJzdWIiOiJjYW5hcnktdXNlciJ9" + "." + "c2lnbmF0dXJlLWNhbmFyeS0zNzE";
+
+    private static final String DOTTED_PHONE_CANARY = "050.111.22.33";
+    private static final String NBSP_PHONE_CANARY = "050\u00A0111\u00A022\u00A033";
+    private static final String REFRESH_CANARY = "rt-canary-Qx7Lm";
 
     private static final WireMockServer SENTRY_STUB = startSentryStub();
 
@@ -132,6 +138,48 @@ class SentryCaptureIT extends AbstractIntegrationTest {
                 .doesNotContain(NON_REQUEST_BREADCRUMB)
                 .doesNotContain(NOTE_CANARY, PHONE_CANARY, "380501112233", JWT_CANARY, "eyJhbGciOiJIUzI1NiJ9",
                         "phone=", internalApiKey);
+    }
+
+    @Test
+    @DisplayName("exception message with a dotted phone, an NBSP-grouped phone and X-Refresh-Token — the captured event's value is exactly the redacted text")
+    void should_redactDottedNbspPhoneAndRefreshHeader_when_exceptionMessageCarriesThem() throws Exception {
+        HttpHeaders headers = new HttpHeaders();
+        headers.set("X-Internal-Key", internalApiKey);
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        String canaries = DOTTED_PHONE_CANARY + " / " + NBSP_PHONE_CANARY + " / X-Refresh-Token: " + REFRESH_CANARY;
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                "/api/v1/internal/test-only/observability/boom?phone={phone}", HttpMethod.POST,
+                new HttpEntity<>("{\"a\":1}", headers), String.class, canaries);
+        Sentry.flush(5_000);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.INTERNAL_SERVER_ERROR);
+        String requestId = response.getHeaders().getFirst(RequestIdFilter.HEADER);
+        await().atMost(Duration.ofSeconds(10)).untilAsserted(() ->
+                assertThat(eventEnvelopes()).filteredOn(e -> e.contains(requestId)).hasSize(1));
+        String envelope = eventEnvelopes().stream().filter(e -> e.contains(requestId)).findFirst().orElseThrow();
+        JsonNode event = eventPayload(envelope);
+        String value = event.at("/exception/values/0/value").asText();
+        assertThat(value)
+                .as("exception value sent to Sentry, actual=%s", value)
+                .isEqualTo("probe failure for [phone] / [phone] / X-Refresh-Token=[redacted] with 1 field(s)");
+        assertThat(envelope)
+                .doesNotContain(REFRESH_CANARY, "111.22.33", "111\u00A022", "111\\u00a022", "111\\u00A022");
+    }
+
+    /** The event item's JSON payload: the envelope line that parses to an object carrying {@code event_id} and {@code exception}. */
+    private static JsonNode eventPayload(String envelope) throws IOException {
+        ObjectMapper mapper = new ObjectMapper();
+        for (String line : envelope.split("\n")) {
+            if (line.isBlank() || !line.startsWith("{")) {
+                continue;
+            }
+            JsonNode node = mapper.readTree(line);
+            if (node.has("exception")) {
+                return node;
+            }
+        }
+        throw new AssertionError("no event payload in envelope");
     }
 
     @Test

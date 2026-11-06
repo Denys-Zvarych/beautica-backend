@@ -28,6 +28,56 @@ class PiiRedactorTest {
     }
 
     @ParameterizedTest
+    @ValueSource(strings = {
+            "050 111 22 33", "(050) 111-22-33", "050-111-22-33", "050.111.22.33",
+            "+38 050 111 22 33", "+380 50 111 22 33", "+38.050.111.22.33", "+380.50.111.22.33",
+            "(050) 111.22.33", "050.111-22 33"})
+    @DisplayName("separator-formatted Ukrainian phones (space / dash / dot / parens, mixed) — redacted to [phone]")
+    void should_redactPhone_when_separatorFormatted(String phone) {
+        String redacted = PiiRedactor.redact("call " + phone + " now");
+
+        assertThat(redacted).isEqualTo("call " + PiiRedactor.PHONE + " now");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"9.30.1", "v9.30.1", "2026-11-06 10:00", "2026-11-06T10:00:00.123Z",
+            "1.050.111.22.33", "050.111.22.33.4", "a050.111.22.33", "build 0.123.456.78"})
+    @DisplayName("versions, timestamps, dotted runs glued to a word/version — not taken for a phone")
+    void should_keepText_when_versionOrTimestampOrGluedRun(String text) {
+        assertThat(PiiRedactor.redact("at " + text + " end")).isEqualTo("at " + text + " end");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"0a1b2c3d4e5f60718293a4b5c6d7e8f9", "3f2b8c1e-9a7d-4e21-8b6f-0c5d4e3a2b19"})
+    @DisplayName("32-hex request id / UUID — never reported as [phone] (masked as [token] by the opaque-token rule)")
+    void should_notRedactAsPhone_when_hexIdOrUuid(String id) {
+        String redacted = PiiRedactor.redact("request " + id + " failed");
+
+        assertThat(redacted).doesNotContain(PiiRedactor.PHONE).isEqualTo("request " + PiiRedactor.TOKEN + " failed");
+    }
+
+    @ParameterizedTest
+    @CsvSource(delimiter = '|', value = {
+            "login failed password=hunter2 for x|login failed password=[redacted] for x",
+            "payload pin: 1234|payload pin=[redacted]",
+            "cfg secret = 's3 cr3t' loaded|cfg secret=[redacted] loaded",
+            "body {\"client_secret\":\"abc def\"}|body {\"client_secret=[redacted]}",
+            "refreshToken: \"r1 r2\" expired|refreshToken=[redacted] expired",
+            "PASSWORD_HASH=abc|PASSWORD_HASH=[redacted]",
+            "accessToken=abc|accessToken=[redacted]"})
+    @DisplayName("secret key-values in free text (quoted or bare, : or =, any case) — value replaced, key kept")
+    void should_redactSecretValue_when_keyValueInFreeText(String text, String expected) {
+        assertThat(PiiRedactor.redact(text)).isEqualTo(expected);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"Invalid input: shipping", "spin 3", "no tokens here", "POST /api/v1/auth/refresh"})
+    @DisplayName("words merely containing or naming a secret key, without a key=value — kept")
+    void should_keepText_when_noSecretKeyValue(String text) {
+        assertThat(PiiRedactor.redact(text)).isEqualTo(text);
+    }
+
+    @ParameterizedTest
     @ValueSource(strings = {"year 2025", "price 1500 UAH", "salon 12", "duration 90 min"})
     @DisplayName("short numbers that are not phones or OTP-adjacent — kept (no over-reach on prices/years)")
     void should_keepShortNumbers_when_notPhoneShaped(String text) {
@@ -295,5 +345,150 @@ class PiiRedactorTest {
         assertThat(telegramPath).isEqualTo("/api/v1/book/telegram/link-token");
         assertThat(unrelated).isEqualTo("missing " + word + " in /api/v1/" + word);
         assertThat(unrelatedPath).isEqualTo("/api/v1/" + word);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {" ", " ", " ", "‐", "‑", "‒", "–", "—", "―"})
+    @DisplayName("phones grouped with Unicode spaces / dashes (NBSP, thin, narrow NBSP, U+2010–U+2015) — redacted")
+    void should_redactPhone_when_unicodeSeparator(String sep) {
+        String international = "+380" + sep + "50" + sep + "111" + sep + "22" + sep + "33";
+        String national = "050" + sep + "111" + sep + "22" + sep + "33";
+        String dotted = "050." + "111" + sep + "22" + sep + "33";
+        String foreign = "+48" + sep + "512" + sep + "345" + sep + "678";
+
+        assertThat(PiiRedactor.redact("call " + international + " now")).isEqualTo("call [phone] now");
+        assertThat(PiiRedactor.redact("call " + national + " now")).isEqualTo("call [phone] now");
+        assertThat(PiiRedactor.redact("call " + dotted + " now")).isEqualTo("call [phone] now");
+        assertThat(PiiRedactor.redact("call " + foreign + " now")).isEqualTo("call [phone] now");
+    }
+
+    @ParameterizedTest
+    @CsvSource(delimiter = '|', value = {
+            "refresh-token: abc123|refresh-token=[redacted]",
+            "X-Refresh-Token: abc|X-Refresh-Token=[redacted]",
+            "hdr x-api-secret=abc end|hdr x-api-secret=[redacted] end",
+            "x-password=abc|x-password=[redacted]"})
+    @DisplayName("hyphenated / header-shaped secret keys — value replaced, key kept")
+    void should_redactSecretValue_when_hyphenatedKey(String text, String expected) {
+        assertThat(PiiRedactor.redact(text)).isEqualTo(expected);
+    }
+
+    @ParameterizedTest
+    @CsvSource(delimiter = '|', value = {
+            "GET /p?pin=1234 failed|GET /p?pin=[token] failed",
+            "GET /p?a=1&pin=1234 failed|GET /p?a=1&pin=[token] failed",
+            "GET /p?token=abc&pin=1234 failed|GET /p?token=[token]&pin=[token] failed",
+            "GET /p?refresh=abc&user_pin=99 failed|GET /p?refresh=[token]&user_pin=[token] failed",
+            "GET /p?shipping=fast&mapping=on&spin=3 ok|GET /p?shipping=fast&mapping=on&spin=3 ok"})
+    @DisplayName("?pin= / &refresh= query params — value masked; shipping= / mapping= / spin= untouched")
+    void should_redactQueryPin_when_exactKey(String text, String expected) {
+        assertThat(PiiRedactor.redact(text)).isEqualTo(expected);
+    }
+
+    @ParameterizedTest
+    @CsvSource(delimiter = '|', value = {
+            "your PIN 1234 ok|your PIN [redacted] ok",
+            "pin 98765|pin [redacted]",
+            "spin 1234|spin 1234",
+            "pinned 1234|pinned 1234"})
+    @DisplayName("spaced 'PIN 1234' — digits redacted; spin / pinned untouched")
+    void should_redactSpacedPin_when_pinKeywordThenDigits(String text, String expected) {
+        assertThat(PiiRedactor.redact(text)).isEqualTo(expected);
+    }
+
+    @Test
+    @DisplayName("escaped quote inside a quoted secret value — whole value redacted, no tail leaks")
+    void should_redactWholeQuotedValue_when_escapedQuoteInside() {
+        assertThat(PiiRedactor.redact("password: \"pa\\\"ss rest\" end")).isEqualTo("password=[redacted] end");
+        assertThat(PiiRedactor.redact("secret='a\\'b c' end")).isEqualTo("secret=[redacted] end");
+    }
+
+    @ParameterizedTest
+    @CsvSource(delimiter = '|', value = {
+            "shipping: x|shipping: x",
+            "mapping=y|mapping=y",
+            "opinion: z|opinion: z",
+            "user_pin: 1|user_pin=[redacted]",
+            "pinCode=2|pinCode=[redacted]",
+            "pin_code: 3|pin_code=[redacted]"})
+    @DisplayName("pin as a key segment only — shipping/mapping/opinion kept, user_pin/pinCode/pin_code redacted")
+    void should_redactPinOnlyAsKeySegment(String text, String expected) {
+        assertThat(PiiRedactor.redact(text)).isEqualTo(expected);
+    }
+
+    @Test
+    @Timeout(value = 2, unit = TimeUnit.SECONDS, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
+    @DisplayName("100 KB adversarial input for the key/pin/quote/Unicode-separator rules — bounded time")
+    void should_redactQuickly_when_adversarialForKeyPinQuoteRules() {
+        String adversarial = "x-".repeat(10_000) + "pin" + "\"\\".repeat(10_000) + " pin " + "1".repeat(10_000)
+                + " " + "0 ".repeat(10_000) + "?" + "a_".repeat(10_000) + "pin" + " password: '" + "\\'".repeat(10_000);
+
+        String redacted = "";
+        for (int i = 0; i < 50; i++) {
+            redacted = PiiRedactor.redact(adversarial);
+        }
+
+        // Only the 6 KB window is scanned here; per-rule worst cases: should_redactQuickly_when_singleAdversarialFragmentFillsWindow.
+        assertThat(redacted).as("truncated to the cap, actual length=%s", redacted.length())
+                .endsWith(PiiRedactor.TRUNCATED)
+                .hasSizeLessThanOrEqualTo(PiiRedactor.MAX_LENGTH + PiiRedactor.TRUNCATED.length());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"\u2000", "\u2007", "\u200A", "\u200B", "\u205F", "\u3000", "\u2212"})
+    @DisplayName("phones grouped with the remaining Unicode spaces / minus sign (en quad, figure, hair, ZWSP, ideographic, U+2212) — redacted")
+    void should_redactPhone_when_rareUnicodeSeparator(String sep) {
+        String national = "050" + sep + "111" + sep + "22" + sep + "33";
+        String international = "+380" + sep + "50" + sep + "111" + sep + "22" + sep + "33";
+
+        assertThat(PiiRedactor.redact("call " + national + " now")).isEqualTo("call [phone] now");
+        assertThat(PiiRedactor.redact("call " + international + " now")).isEqualTo("call [phone] now");
+    }
+
+    @ParameterizedTest
+    @CsvSource(delimiter = '|', value = {
+            "pin 123 ok|pin 123 ok",
+            "pin 1234 ok|pin [redacted] ok",
+            "PIN\t\t5678|PIN [redacted]"})
+    @DisplayName("spaced PIN boundary — 3 digits kept, exactly 4 redacted, tab-separated redacted")
+    void should_redactSpacedPin_onlyFromFourDigits(String text, String expected) {
+        String input = text.replace("\\t", "\t");
+
+        assertThat(PiiRedactor.redact(input)).isEqualTo(expected);
+    }
+
+    @Test
+    @DisplayName("unterminated quoted secret value — everything to the end redacted, no tail leaks")
+    void should_redactToEnd_when_quotedSecretValueUnterminated() {
+        assertThat(PiiRedactor.redact("password: \"abc def ghi")).isEqualTo("password=[redacted]");
+        assertThat(PiiRedactor.redact("token='abc def")).isEqualTo("token=[redacted]");
+    }
+
+    @Test
+    @DisplayName("hyphenated query key — later params kept; a hyphenated header key is still redacted")
+    void should_keepLaterQueryParams_when_hyphenatedSecretKeyInQuery() {
+        String query = PiiRedactor.redact("?a=1&x-refresh-token=SECRET&b=2");
+        String header = PiiRedactor.redact("X-Refresh-Token: abc");
+
+        assertThat(query).isEqualTo("?a=1&x-refresh-token=[token]&b=2").doesNotContain("SECRET");
+        assertThat(header).isEqualTo("X-Refresh-Token=[redacted]").doesNotContain("abc");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"x-", "\"\\", "1", "0 ", "a_", "\\'", "\u00A0"})
+    @Timeout(value = 2, unit = TimeUnit.SECONDS, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
+    @DisplayName("each adversarial fragment under the 4 KB cap (no truncation hides it) — bounded time")
+    void should_redactQuickly_when_singleAdversarialFragmentFillsWindow(String unit) {
+        String fragment = unit.repeat(1_000 / unit.length());
+        String adversarial = "pin " + fragment + " password: '" + fragment + "?a_pin=" + fragment + " 050" + fragment;
+
+        String redacted = "";
+        for (int i = 0; i < 50; i++) {
+            redacted = PiiRedactor.redact(adversarial);
+        }
+
+        assertThat(adversarial.length()).as("fragment must stay inside the pattern window").isLessThanOrEqualTo(
+                PiiRedactor.MAX_LENGTH);
+        assertThat(redacted).as("the password value is always redacted").contains("password=[redacted]");
     }
 }
