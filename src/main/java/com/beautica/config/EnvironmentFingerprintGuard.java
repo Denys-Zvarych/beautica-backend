@@ -80,8 +80,14 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
     /** Prod e-mail logo must be served from our own site (same domain as the sender). */
     static final String PROD_LOGO_URL_PREFIX = "https://beautica.app/";
 
-    /** Conservative floor for {@code TURBOSMS_TOKEN} and {@code SMSCLUB_TOKEN}; the provider documents no length (see {@link #isPlaceholderSecret}). */
+    /** Conservative floor for {@code TURBOSMS_TOKEN}; the provider documents no length (see {@link #isPlaceholderSecret}). */
     static final int MIN_SMS_TOKEN_LENGTH = 16;
+    /**
+     * Floor for {@code SMSCLUB_TOKEN}. Real SMSClub API tokens are 15 characters, mixed-case alphanumeric
+     * (observed 2026-11-07), so the shared {@link #MIN_SMS_TOKEN_LENGTH} of 16 rejected a real token and
+     * crashed prod boot; 12 still rejects short placeholder words.
+     */
+    static final int MIN_SMSCLUB_TOKEN_LENGTH = 12;
     private static final List<String> SECRET_PLACEHOLDERS = List.of("pending", "changeme", "todo", "xxx", "tbd");
 
     private final Log log;
@@ -495,9 +501,9 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
         if (isBlank(token)) {
             violations.add("rule prod-smsclub-token-blank: SMSCLUB_TOKEN (app.sms.smsclub.token) must be set in prod "
                     + "when beautica.sms.mode=smsclub");
-        } else if (isPlaceholderSecret(token)) {
+        } else if (isPlaceholderSecret(token, MIN_SMSCLUB_TOKEN_LENGTH)) {
             violations.add("rule prod-smsclub-token-placeholder: SMSCLUB_TOKEN (app.sms.smsclub.token) must be a real "
-                    + "token (at least " + MIN_SMS_TOKEN_LENGTH + " characters, not a placeholder) in prod");
+                    + "token (at least " + MIN_SMSCLUB_TOKEN_LENGTH + " characters, not a placeholder) in prod");
         }
         String rawSender = readOrNull(env, "SMSCLUB_SENDER_NAME");
         String boundSender = boundOrNull(env, "app.sms.smsclub.sender-name");
@@ -686,8 +692,13 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
      * conservative: real keys are long random strings, never a short word.
      */
     private static boolean isPlaceholderSecret(String value) {
+        return isPlaceholderSecret(value, MIN_SMS_TOKEN_LENGTH);
+    }
+
+    /** As {@link #isPlaceholderSecret(String)}, with a provider-specific length floor. */
+    private static boolean isPlaceholderSecret(String value, int minLength) {
         String v = value.strip().toLowerCase(Locale.ROOT);
-        return v.length() < MIN_SMS_TOKEN_LENGTH || SECRET_PLACEHOLDERS.contains(v);
+        return v.length() < minLength || SECRET_PLACEHOLDERS.contains(v);
     }
 
     /**

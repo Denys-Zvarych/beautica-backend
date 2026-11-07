@@ -190,11 +190,11 @@ class ProdRequiredEnvBootStartupTest {
     @DisplayName("phase 439: prod-smsclub-token-placeholder — smsclub mode with a short SMSCLUB_TOKEN aborts, value not echoed")
     void should_abortBoot_when_prodSmsClubTokenIsPlaceholder() {
         Map<String, String> vars = passingProdVars();
-        vars.put("SMSCLUB_TOKEN", "zq77-short-tok");
+        vars.put("SMSCLUB_TOKEN", "zq77-shortk"); // 11 chars < MIN_SMSCLUB_TOKEN_LENGTH
 
         String message = guardMessageOfFailedBoot(vars, SMSCLUB_MODE);
 
-        assertThat(message).contains("rule prod-smsclub-token-placeholder").doesNotContain("zq77-short-tok");
+        assertThat(message).contains("rule prod-smsclub-token-placeholder").doesNotContain("zq77-shortk");
     }
 
     @Test
