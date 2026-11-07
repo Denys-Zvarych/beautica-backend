@@ -1515,4 +1515,131 @@ class EnvironmentFingerprintGuardTest {
                     .doesNotThrowAnyException();
         }
     }
+
+    // ── phase 439: SMSClub mode-dependent rules ────────────────────────────────
+
+    private static final String SMSCLUB_TOKEN = "smsclub-fixture-token-value";
+
+    @Test
+    @DisplayName("phase 439: prod + smsclub + real SMSCLUB_TOKEN + blank TURBOSMS_TOKEN — passes (TurboSMS rules are mode-bound)")
+    void should_pass_when_prodSmsClubHasTokenAndTurbosmsTokenIsBlank() {
+        MockEnvironment env = prodEnv().withProperty("TURBOSMS_TOKEN", "").withProperty("SMSCLUB_TOKEN", SMSCLUB_TOKEN);
+
+        assertThatCode(() -> run(env, DeployEnvironment.PROD, SmsMode.SMSCLUB)).doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("phase 439: prod-smsclub-token-blank — prod + smsclub without SMSCLUB_TOKEN fails, no TurboSMS rule named")
+    void should_fail_when_prodSmsClubTokenBlank() {
+        MockEnvironment env = prodEnv().withProperty("TURBOSMS_TOKEN", "").withProperty("SMSCLUB_TOKEN", " ");
+
+        assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.SMSCLUB))
+                .hasMessageContaining("rule prod-smsclub-token-blank").hasMessageContaining("SMSCLUB_TOKEN")
+                .message().doesNotContain("prod-turbosms-token").doesNotContain("prod-sms-mode");
+    }
+
+    @Test
+    @DisplayName("phase 439: prod-smsclub-token-blank — a token set via app.sms.smsclub.token passes")
+    void should_acceptTokenViaProperty_when_prodSmsClub() {
+        MockEnvironment env = prodEnv().withProperty("app.sms.smsclub.token", SMSCLUB_TOKEN);
+
+        assertThatCode(() -> run(env, DeployEnvironment.PROD, SmsMode.SMSCLUB)).doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("phase 439: prod-smsclub-token-placeholder — PENDING/changeme/short token fails, value not echoed")
+    void should_fail_when_prodSmsClubTokenIsPlaceholderOrShort() {
+        for (String bad : List.of("PENDING", "ChangeMe", "todo", "XXX", "short-token")) {
+            MockEnvironment env = prodEnv().withProperty("SMSCLUB_TOKEN", bad);
+
+            assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.SMSCLUB))
+                    .as("token=%s", bad)
+                    .hasMessageContaining("rule prod-smsclub-token-placeholder")
+                    .message().doesNotContain("=" + bad).doesNotContain("prod-smsclub-token-blank");
+        }
+    }
+
+    @Test
+    @DisplayName("phase 439: prod-smsclub-sender-blank — an explicitly blank sender name fails; unset uses the default")
+    void should_fail_when_prodSmsClubSenderIsBlank() {
+        MockEnvironment raw = prodEnv().withProperty("SMSCLUB_TOKEN", SMSCLUB_TOKEN).withProperty("SMSCLUB_SENDER_NAME", "");
+        MockEnvironment bound = prodEnv().withProperty("SMSCLUB_TOKEN", SMSCLUB_TOKEN)
+                .withProperty("app.sms.smsclub.sender-name", " ");
+        MockEnvironment named = prodEnv().withProperty("SMSCLUB_TOKEN", SMSCLUB_TOKEN)
+                .withProperty("app.sms.smsclub.sender-name", "BEAUTY");
+
+        assertThatThrownBy(() -> run(raw, DeployEnvironment.PROD, SmsMode.SMSCLUB))
+                .hasMessageContaining("rule prod-smsclub-sender-blank");
+        assertThatThrownBy(() -> run(bound, DeployEnvironment.PROD, SmsMode.SMSCLUB))
+                .hasMessageContaining("rule prod-smsclub-sender-blank");
+        assertThatCode(() -> run(named, DeployEnvironment.PROD, SmsMode.SMSCLUB)).doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("phase 439 audit-fix: prod-smsclub-base-url — any endpoint other than exactly the SMSClub send URL "
+            + "fails in prod smsclub mode, no value echoed")
+    void should_failProdBoot_when_smsClubBaseUrlOverridden() {
+        for (String url : List.of("http://im.smsclub.mobi/sms/send", "https://im.smsclub.mobi.evil-zq.example/sms/send",
+                "https://im.smsclub.mobi/sms/send/", "http://127.0.0.1:8089/sms/send")) {
+            MockEnvironment env = prodEnv().withProperty("SMSCLUB_TOKEN", SMSCLUB_TOKEN)
+                    .withProperty("app.sms.smsclub.base-url", url);
+
+            assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.SMSCLUB))
+                    .hasMessageContaining("rule prod-smsclub-base-url")
+                    .message().doesNotContain("evil-zq").doesNotContain("127.0.0.1").doesNotContain("http://im.");
+        }
+    }
+
+    @Test
+    @DisplayName("phase 439 audit-fix: prod-smsclub-base-url — the exact SMSClub send URL passes")
+    void should_pass_when_prodSmsClubBaseUrlIsTheRealEndpoint() {
+        MockEnvironment env = prodEnv().withProperty("SMSCLUB_TOKEN", SMSCLUB_TOKEN)
+                .withProperty("app.sms.smsclub.base-url", "https://im.smsclub.mobi/sms/send");
+
+        assertThatCode(() -> run(env, DeployEnvironment.PROD, SmsMode.SMSCLUB)).doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("phase 439: prod + turbosms — SMSClub rules never apply (blank SMSCLUB_TOKEN passes; TurboSMS rules unchanged)")
+    void should_applyOnlyTurbosmsRules_when_prodModeIsTurbosms() {
+        MockEnvironment blankSmsClub = prodEnv().withProperty("SMSCLUB_TOKEN", "").withProperty("SMSCLUB_SENDER_NAME", "");
+        MockEnvironment blankTurbo = prodEnv().withProperty("TURBOSMS_TOKEN", "").withProperty("SMSCLUB_TOKEN", SMSCLUB_TOKEN);
+
+        assertThatCode(() -> run(blankSmsClub, DeployEnvironment.PROD, SmsMode.TURBOSMS)).doesNotThrowAnyException();
+        assertThatThrownBy(() -> run(blankTurbo, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                .hasMessageContaining("rule prod-turbosms-token-blank")
+                .message().doesNotContain("smsclub");
+    }
+
+    @Test
+    @DisplayName("phase 439: staging-smsclub-token-present — capture + SMSCLUB_TOKEN (env or property) fails, value not echoed")
+    void should_fail_when_stagingCaptureHasSmsClubToken() {
+        MockEnvironment raw = stagingEnv().withProperty("SMSCLUB_TOKEN", SECRET);
+        MockEnvironment bound = stagingEnv().withProperty("app.sms.smsclub.token", SECRET);
+
+        for (MockEnvironment env : List.of(raw, bound)) {
+            assertThatThrownBy(() -> run(env, DeployEnvironment.STAGING, SmsMode.CAPTURE))
+                    .hasMessageContaining("rule staging-smsclub-token-present").hasMessageContaining("SMSCLUB_TOKEN")
+                    .message().doesNotContain(SECRET);
+        }
+    }
+
+    @Test
+    @DisplayName("phase 439: staging opt-in — smsclub mode is accepted, with or without SMSCLUB_TOKEN")
+    void should_pass_when_stagingOptsIntoSmsClub() {
+        MockEnvironment withToken = stagingEnv().withProperty("SMSCLUB_TOKEN", SMSCLUB_TOKEN);
+
+        assertThatCode(() -> run(withToken, DeployEnvironment.STAGING, SmsMode.SMSCLUB)).doesNotThrowAnyException();
+        assertThatCode(() -> run(stagingEnv(), DeployEnvironment.STAGING, SmsMode.SMSCLUB)).doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("phase 439: staging opt-in does not lift staging-turbosms-token-blank")
+    void should_keepTurbosmsTokenBan_when_stagingOptsIntoSmsClub() {
+        MockEnvironment env = stagingEnv().withProperty("TURBOSMS_TOKEN", SECRET).withProperty("SMSCLUB_TOKEN", SMSCLUB_TOKEN);
+
+        assertThatThrownBy(() -> run(env, DeployEnvironment.STAGING, SmsMode.SMSCLUB))
+                .hasMessageContaining("rule staging-turbosms-token-blank")
+                .message().doesNotContain("staging-sms-mode").doesNotContain("staging-smsclub-token-present");
+    }
 }
