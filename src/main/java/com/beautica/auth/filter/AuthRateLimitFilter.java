@@ -157,6 +157,10 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // route under that prefix ends in the literal "/services" (unlike the salon side), so a plain
     // prefix+suffix check is unambiguous here — no disambiguation helper needed.
     private static final String MASTER_SERVICES_PATH_SUFFIX = "/services";
+    // Phase 437 — GET /api/v1/app/config, the public app compatibility config. Joins the catalogue-browse
+    // branch (decision 4): anonymous callers are charged per IP on catalogueBrowseBuckets, a Bearer-carrying
+    // call is deferred exactly like the other routes there. No new bucket bean.
+    static final String APP_CONFIG_PATH = "/api/v1/app/config";
     // permitAll public profile/roster reads, throttled to cap id-sweeps (audit 2026-10-05,
     // finding 2; the roster reads run an uncached bookability EXISTS gate per request via
     // MasterRepository#findBookableIdsBySalonId): GET /api/v1/masters/{id}, GET /api/v1/masters/by-salon/{salonId},
@@ -1560,7 +1564,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                 && (isSalonCatalogueServicesPath(path)
                         || (path.startsWith(MASTER_AVAILABILITY_PATH_PREFIX)
                                 && path.endsWith(MASTER_SERVICES_PATH_SUFFIX))
-                        || isPublicProfileReadPath(path))) {
+                        || isPublicProfileReadPath(path)
+                        || path.equals(APP_CONFIG_PATH))) {
             if (BearerTokenExtractor.extract(request) != null) {
                 // NOT charged on any bucket here — not even the authenticated per-IP ceiling. This
                 // filter runs before JWT validation, so charging the ceiling here let a junk

@@ -180,6 +180,9 @@ public class SecurityConfig {
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/salons/{salonId}/services/{serviceDefId}/masters").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/service-categories").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/service-types").permitAll();
+                    // Phase 437 — app version compatibility config (env-backed, no PII, identical for every
+                    // caller). Exact path; anonymous callers are throttled per IP on catalogueBrowseBuckets.
+                    auth.requestMatchers(HttpMethod.GET, "/api/v1/app/config").permitAll();
                     // Self-service category approval pages — token-authenticated
                     // (the unguessable single-use token IS the credential), so the
                     // routes are permitAll at the Spring Security layer. The GET
