@@ -115,7 +115,7 @@ class PhoneOtpControllerTest {
 
         org.mockito.InOrder order = org.mockito.Mockito.inOrder(turnstileVerifier, phoneOtpService);
         order.verify(turnstileVerifier).verify("tok-1", "203.0.113.7");
-        order.verify(phoneOtpService).sendOtp(VALID_PHONE);
+        order.verify(phoneOtpService).sendOtp(VALID_PHONE, null);
     }
 
     @Test
@@ -163,6 +163,62 @@ class PhoneOtpControllerTest {
                                 + "a".repeat(2049) + "\"}"))
                 .andExpect(status().isBadRequest());
 
+        verifyNoInteractions(turnstileVerifier, phoneOtpService);
+    }
+
+    @Autowired
+    private com.fasterxml.jackson.databind.ObjectMapper objectMapper;
+
+    /** Phase 440 — the send body via Jackson (Q16); {@code smsFormat == null} leaves the key out entirely. */
+    private String sendBody(String smsFormat) throws Exception {
+        java.util.Map<String, Object> body = new java.util.LinkedHashMap<>();
+        body.put("phone", VALID_PHONE);
+        body.put("privacyAccepted", true);
+        body.put("privacyPolicyVersion", "2026-10-20");
+        if (smsFormat != null) {
+            body.put("smsFormat", smsFormat);
+        }
+        return objectMapper.writeValueAsString(body);
+    }
+
+    @Test
+    @DisplayName("phase 440: smsFormat missing — 200, service gets null")
+    void should_passNullFormat_when_smsFormatMissing() throws Exception {
+        mockMvc.perform(post("/api/v1/book/otp/send")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(sendBody(null)))
+                .andExpect(status().isOk());
+
+        org.mockito.Mockito.verify(phoneOtpService).sendOtp(VALID_PHONE, null);
+    }
+
+    @ParameterizedTest(name = "\"{0}\"")
+    @ValueSource(strings = {"PLAIN", "FOO", "plain", "", "P23456789012345678901234567890AB"})
+    @DisplayName("phase 440: smsFormat PLAIN / unknown / lower-case / blank / exactly 32 chars — 200 (never 400), service gets the raw value")
+    void should_passRawFormat_when_smsFormatGiven(String smsFormat) throws Exception {
+        mockMvc.perform(post("/api/v1/book/otp/send")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(sendBody(smsFormat)))
+                .andExpect(status().isOk());
+
+        org.mockito.Mockito.verify(phoneOtpService).sendOtp(VALID_PHONE, smsFormat);
+    }
+
+    @Test
+    @DisplayName("phase 440: smsFormat of 33 chars — 400 with the standard validation body, value not echoed, no SMS")
+    void should_return400AndNotSend_when_smsFormatLongerThan32() throws Exception {
+        String tooLong = "Q".repeat(33);
+
+        String body = mockMvc.perform(post("/api/v1/book/otp/send")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(sendBody(tooLong)))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.message").value("Validation failed — check request parameters"))
+                .andExpect(jsonPath("$.errors.smsFormat").value("size must be between 0 and 32"))
+                .andReturn().getResponse().getContentAsString(java.nio.charset.StandardCharsets.UTF_8);
+
+        org.assertj.core.api.Assertions.assertThat(body).as("the rejected value is never echoed").doesNotContain(tooLong);
         verifyNoInteractions(turnstileVerifier, phoneOtpService);
     }
 

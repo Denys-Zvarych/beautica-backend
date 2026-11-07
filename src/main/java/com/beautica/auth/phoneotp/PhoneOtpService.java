@@ -4,6 +4,8 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ServiceUnavailableMessages;
 import com.beautica.config.DeploymentProperties;
 import com.beautica.notification.sms.OtpSmsSender;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
@@ -21,7 +23,9 @@ import java.security.SecureRandom;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.EnumMap;
 import java.util.HexFormat;
+import java.util.Map;
 import java.util.Optional;
 import java.util.regex.Pattern;
 
@@ -53,6 +57,10 @@ public class PhoneOtpService {
     private static final Duration OTP_TTL = Duration.ofMinutes(10);
     private static final int CODE_BOUND_EXCLUSIVE = 1_000_000; // 000000..999999
     private static final String GENERIC_VERIFY_FAILURE = "Invalid or expired code";
+    /** Phase 440 — delivered OTP SMS per format (tag {@code format}); naming as {@code beautica.guest_message}. */
+    static final String SENT_METRIC = "beautica.otp_sms.sent";
+    /** Phase 440 — a non-blank {@code smsFormat} that named no format (sent as {@code DOMAIN_BOUND}). */
+    static final String FORMAT_FALLBACK_METRIC = "beautica.otp_sms.format_fallback";
 
     private final PhoneOtpRepository phoneOtpRepository;
     private final PhoneOtpAttemptRecorder attemptRecorder;
@@ -63,6 +71,8 @@ public class PhoneOtpService {
     private final TransactionTemplate requiresNewTx;
     /** Phase 389 — SMS template with the {@code beautica.sms.otp-domain} suffix pre-built (host validated once). */
     private final OtpSmsText otpSmsText;
+    private final Map<OtpSmsFormat, Counter> sentCounters = new EnumMap<>(OtpSmsFormat.class);
+    private final Counter formatFallbackCounter;
 
     public PhoneOtpService(PhoneOtpRepository phoneOtpRepository,
                            PhoneOtpAttemptRecorder attemptRecorder,
@@ -70,7 +80,8 @@ public class PhoneOtpService {
                            OtpSmsSender otpSmsSender,
                            Clock clock,
                            PlatformTransactionManager transactionManager,
-                           DeploymentProperties deploymentProperties) {
+                           DeploymentProperties deploymentProperties,
+                           MeterRegistry meterRegistry) {
         this.otpSmsText = OtpSmsText.forDomain(deploymentProperties.sms().otpDomainHost());
         this.phoneOtpRepository = phoneOtpRepository;
         this.attemptRecorder = attemptRecorder;
@@ -80,6 +91,12 @@ public class PhoneOtpService {
         this.clock = clock;
         this.requiresNewTx = new TransactionTemplate(transactionManager);
         this.requiresNewTx.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+        for (OtpSmsFormat format : OtpSmsFormat.values()) {
+            sentCounters.put(format, Counter.builder(SENT_METRIC)
+                    .tag("format", format.metricTag())
+                    .register(meterRegistry));
+        }
+        this.formatFallbackCounter = Counter.builder(FORMAT_FALLBACK_METRIC).register(meterRegistry);
     }
 
     /**
@@ -99,16 +116,34 @@ public class PhoneOtpService {
      */
     @Transactional(propagation = Propagation.NOT_SUPPORTED)
     public void sendOtp(String phone) {
+        sendOtp(phone, null);
+    }
+
+    /**
+     * Phase 440 — as {@link #sendOtp(String)}, with the caller-requested SMS text. {@code requestedFormat} is the
+     * raw request value: missing/blank/unknown sends {@link OtpSmsFormat#DOMAIN_BOUND} (never a 400); an unknown
+     * non-blank value also increments {@value #FORMAT_FALLBACK_METRIC}.
+     */
+    @Transactional(propagation = Propagation.NOT_SUPPORTED)
+    public void sendOtp(String phone, String requestedFormat) {
         if (!E164_UA.matcher(phone).matches()) {
             throw new BusinessException(HttpStatus.BAD_REQUEST, "Invalid phone format");
         }
+        OtpSmsFormat format = resolveFormat(requestedFormat);
 
         String code = generateCode();
         Long otpId = requiresNewTx.execute(status -> issueOtpRow(phone, code));
 
-        dispatchCode(phone, code, otpId);
+        dispatchCode(phone, code, otpId, format);
         invalidateOlderCodesQuietly(phone, otpId);
-        log.info("OTP sent to {}", maskPhone(phone));
+        log.info("OTP sent to {} format={}", maskPhone(phone), format.metricTag());
+    }
+
+    private OtpSmsFormat resolveFormat(String requestedFormat) {
+        if (OtpSmsFormat.isUnrecognised(requestedFormat)) {
+            formatFallbackCounter.increment();
+        }
+        return OtpSmsFormat.fromRequest(requestedFormat);
     }
 
     /**
@@ -164,9 +199,10 @@ public class PhoneOtpService {
      * the code and never the unmasked phone (Anti-Bug §I). The 503 body is generic for the same
      * reason.
      */
-    private void dispatchCode(String phone, String code, Long otpId) {
+    private void dispatchCode(String phone, String code, Long otpId, OtpSmsFormat format) {
         try {
-            otpSmsSender.send(phone, otpSmsText.render(code));
+            otpSmsSender.send(phone, otpSmsText.render(code, format));
+            sentCounters.get(format).increment();
         } catch (RuntimeException e) {
             log.warn("OTP send failed for {}: {}", maskPhone(phone), e.getClass().getSimpleName());
             burnUndeliveredRowQuietly(otpId);

@@ -18,6 +18,9 @@ import java.util.regex.Pattern;
  * </pre>
  * Without a domain (local/test) only the first line is sent.
  *
+ * <p>Phase 440 — {@link OtpSmsFormat#PLAIN} sends only the first line even with a domain (in-app browsers that
+ * do not offer domain-bound codes); {@link #render(String)} is {@link OtpSmsFormat#DOMAIN_BOUND}.
+ *
  * <p>The host is validated once, in {@link #forDomain}, which pre-builds the domain suffix; the
  * per-send {@link #render} only checks the code and concatenates. {@code PhoneOtpService} builds one
  * instance at construction.
@@ -63,11 +66,24 @@ public final class OtpSmsText {
      * @throws IllegalArgumentException on a malformed code (programming error)
      */
     public String render(String code) {
+        return render(code, OtpSmsFormat.DOMAIN_BOUND);
+    }
+
+    /**
+     * Phase 440.
+     *
+     * @param code   the 6-digit one-time code
+     * @param format {@link OtpSmsFormat#PLAIN} = first line only; {@link OtpSmsFormat#DOMAIN_BOUND} = today's text
+     * @return the SMS text, at most {@value #MAX_SINGLE_SEGMENT_CHARS} characters
+     * @throws IllegalArgumentException on a malformed code (programming error)
+     */
+    public String render(String code, OtpSmsFormat format) {
         if (code == null || !CODE.matcher(code).matches()) {
             throw new IllegalArgumentException("OTP code must be exactly 6 digits");
         }
         String firstLine = FIRST_LINE_PREFIX + code + FIRST_LINE_SUFFIX;
-        return domainSuffix.isEmpty() ? firstLine : firstLine + domainSuffix + code;
+        boolean domainLine = format != OtpSmsFormat.PLAIN && !domainSuffix.isEmpty();
+        return domainLine ? firstLine + domainSuffix + code : firstLine;
     }
 
     private static String requireValidHost(String host) {

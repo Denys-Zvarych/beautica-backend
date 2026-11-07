@@ -20,6 +20,10 @@ import jakarta.validation.constraints.Size;
  * too. This call only VALIDATES it; nothing is persisted (the booking POST stores the proof).
  *
  * <p>Phase 382 — {@code turnstileToken}: see the component's comment.
+ *
+ * <p>Phase 440 — {@code smsFormat}: optional, a plain {@code String} (not a Jackson enum, which would 400 on an
+ * unknown value). Missing/blank/unknown means {@code DOMAIN_BOUND}; parsed by {@link OtpSmsFormat#fromRequest}
+ * in the service. Last component + the 4-arg constructor keep every existing caller compiling.
  */
 public record PhoneOtpSendRequest(
         @NotBlank
@@ -44,8 +48,20 @@ public record PhoneOtpSendRequest(
         @Schema(description = "Required when Turnstile is enabled (prod, staging).", nullable = true,
                 maxLength = 2048)
         @Size(max = 2048)
-        String turnstileToken
+        String turnstileToken,
+
+        @Schema(description = "Optional OTP SMS text. PLAIN = human line only; anything else (missing, null, "
+                + "unknown) = DOMAIN_BOUND (adds the origin-bound `@host #code` line).",
+                allowableValues = {"DOMAIN_BOUND", "PLAIN"}, nullable = true, maxLength = 32)
+        @Size(max = 32)
+        String smsFormat
 ) {
+
+    /** Pre-phase-440 shape: {@code smsFormat} absent ({@code DOMAIN_BOUND}). */
+    public PhoneOtpSendRequest(String phone, Boolean privacyAccepted, String privacyPolicyVersion,
+                               String turnstileToken) {
+        this(phone, privacyAccepted, privacyPolicyVersion, turnstileToken, null);
+    }
 
     /**
      * Phase 382 audit: the generated record {@code toString} would print the phone and the Turnstile token. Neither
