@@ -5,14 +5,20 @@ import com.beautica.notification.sms.CapturingSmsSender;
 import com.beautica.notification.sms.CapturingSmsService;
 import com.beautica.notification.sms.NoOpSmsService;
 import com.beautica.notification.sms.OtpSmsSender;
+import com.beautica.notification.sms.SmsClubOtpSmsSender;
+import com.beautica.notification.sms.SmsClubService;
 import com.beautica.notification.sms.SmsService;
+import com.beautica.notification.sms.StagingSmsDailyCap;
 import com.beautica.notification.sms.TurbosmsOtpSmsSender;
 import com.beautica.notification.sms.TurbosmsService;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Profile;
 import org.springframework.mail.javamail.JavaMailSender;
 import org.springframework.web.client.RestClient;
 
@@ -21,6 +27,7 @@ import java.lang.annotation.ElementType;
 import java.lang.annotation.Retention;
 import java.lang.annotation.RetentionPolicy;
 import java.lang.annotation.Target;
+import java.time.Clock;
 
 /**
  * Selects the {@link SmsService} implementation from the single money gate
@@ -87,9 +94,16 @@ import java.lang.annotation.Target;
  * </table>
  * and the (ungated) {@link OtpSmsSender}: {@code turbosms} → {@link TurbosmsOtpSmsSender}, {@code capture}
  * → {@link CapturingOtpSmsSender}. Exactly one bean of each type in every cell.
+ *
+ * <h2>Third mode: {@code smsclub} (Phase 439)</h2>
+ * {@code beautica.sms.mode=smsclub} swaps the provider for SMSClub: booking {@link SmsService} (gate on) is
+ * {@link SmsClubService} built with {@code app.sms.smsclub.lifetime-minutes}, and the ungated {@link OtpSmsSender}
+ * is {@link SmsClubOtpSmsSender} over its own {@link SmsClubService} built with {@code otp-lifetime-minutes}. Gate
+ * off still resolves {@link NoOpSmsService}. No {@code matchIfMissing}: SMSClub is only ever an explicit choice.
  */
 @Slf4j
 @Configuration
+@EnableConfigurationProperties(SmsClubProperties.class)
 public class SmsConfig {
 
     /** Active only for {@code beautica.sms.mode=turbosms}, or when the property is absent. */
@@ -106,6 +120,14 @@ public class SmsConfig {
     @Documented
     @ConditionalOnProperty(prefix = "beautica.sms", name = "mode", havingValue = "capture")
     @interface OnCaptureMode {
+    }
+
+    /** Active only for {@code beautica.sms.mode=smsclub} (Phase 439). */
+    @Target(ElementType.METHOD)
+    @Retention(RetentionPolicy.RUNTIME)
+    @Documented
+    @ConditionalOnProperty(prefix = "beautica.sms", name = "mode", havingValue = "smsclub")
+    @interface OnSmsClubMode {
     }
 
     /**
@@ -203,5 +225,46 @@ public class SmsConfig {
     @OnCaptureMode
     public OtpSmsSender capturingOtpSmsSender(CapturingSmsSender capturingSmsSender) {
         return new CapturingOtpSmsSender(capturingSmsSender);
+    }
+
+    /**
+     * Phase 439 — booking SMS through SMSClub: gate on AND {@code beautica.sms.mode=smsclub}. A blank
+     * {@code SMSCLUB_TOKEN} is not a boot failure here (the prod guard owns that rule); the first send throws.
+     */
+    @Bean
+    @OnSmsClubMode
+    @ConditionalOnProperty(prefix = "app.booking.sms", name = "enabled", havingValue = "true")
+    public SmsService smsClubService(RestClient.Builder restClientBuilder, SmsClubProperties properties,
+                                     ObjectProvider<StagingSmsDailyCap> stagingDailyCap) {
+        log.info("Booking SMS is ENABLED (app.booking.sms.enabled=true) in SMSCLUB mode — "
+                + "registering SmsClubService; outbound messages will be billed");
+        return new SmsClubService(restClientBuilder, properties, properties.getLifetimeMinutes(),
+                stagingDailyCap.getIfAvailable());
+    }
+
+    /**
+     * Phase 439 — the auth-channel sender in {@code smsclub} mode: unconditional on the money gate, like
+     * {@link #otpSmsSender}, with its own {@link SmsClubService} built with the OTP lifetime.
+     */
+    @Bean
+    @OnSmsClubMode
+    public OtpSmsSender smsClubOtpSmsSender(RestClient.Builder restClientBuilder, SmsClubProperties properties,
+                                            ObjectProvider<StagingSmsDailyCap> stagingDailyCap) {
+        return new SmsClubOtpSmsSender(new SmsClubService(restClientBuilder, properties,
+                properties.getOtpLifetimeMinutes(), stagingDailyCap.getIfAvailable()));
+    }
+
+    /**
+     * Phase 439 audit-fix — staging's {@code smsclub} opt-in runs behind the always-pass Turnstile test secret, so
+     * real sends are capped per Kyiv day ({@code app.sms.smsclub.staging-daily-cap}). One instance, shared by both
+     * {@link SmsClubService}s above. Never registered in prod (no {@code staging} profile) nor in capture mode.
+     */
+    @Bean
+    @OnSmsClubMode
+    @Profile("staging")
+    public StagingSmsDailyCap stagingSmsDailyCap(Clock clock, SmsClubProperties properties) {
+        log.warn("SMSCLUB opt-in on staging: real sends capped at {} per Kyiv day — set beautica.sms.mode=capture "
+                + "after testing", properties.getStagingDailyCap());
+        return new StagingSmsDailyCap(clock, properties.getStagingDailyCap());
     }
 }

@@ -1,6 +1,7 @@
 package com.beautica.config;
 
 import com.beautica.review.invite.config.ReviewInviteProperties;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import java.time.Duration;
@@ -19,16 +20,30 @@ import java.time.Duration;
 @Component
 class ReviewInviteSendBudgetGuard {
 
-    ReviewInviteSendBudgetGuard(ReviewInviteProperties reviewInviteProperties, TurbosmsProperties turbosmsProperties) {
+    private static final String SMSCLUB_MODE = "smsclub";
+
+    /**
+     * @param smsMode raw {@code beautica.sms.mode}; Phase 439 audit-fix — in {@code smsclub} mode the in-flight SMS is
+     *                an SMSClub call, so its timeouts bound the tick. {@code turbosms}, {@code capture} and an unset
+     *                mode keep the original Turbosms check (matched case-insensitively, like {@code SmsConfig}).
+     */
+    ReviewInviteSendBudgetGuard(ReviewInviteProperties reviewInviteProperties, TurbosmsProperties turbosmsProperties,
+                                SmsClubProperties smsClubProperties,
+                                @Value("${beautica.sms.mode:turbosms}") String smsMode) {
         if (!reviewInviteProperties.enabled()) {
             return; // no send loop runs (every row is skipped INVITES_DISABLED), so there is no tick to bound
         }
+        boolean smsClub = SMSCLUB_MODE.equalsIgnoreCase(smsMode == null ? "" : smsMode.strip());
+        Duration connectTimeout = smsClub
+                ? OutboundTimeouts.requirePositive("app.sms.smsclub.connect-timeout", smsClubProperties.getConnectTimeout())
+                : OutboundTimeouts.requirePositive("app.sms.turbosms.connect-timeout", turbosmsProperties.getConnectTimeout());
+        Duration readTimeout = smsClub
+                ? OutboundTimeouts.requirePositive("app.sms.smsclub.read-timeout", smsClubProperties.getReadTimeout())
+                : OutboundTimeouts.requirePositive("app.sms.turbosms.read-timeout", turbosmsProperties.getReadTimeout());
         reviewInviteProperties.requireSendBudgetWithin(
                 Duration.ofSeconds(SchedulingConfig.SCHEDULER_SHUTDOWN_GRACE_SECONDS),
-                OutboundTimeouts.requirePositive(
-                        "app.sms.turbosms.connect-timeout", turbosmsProperties.getConnectTimeout()),
-                OutboundTimeouts.requirePositive(
-                        "app.sms.turbosms.read-timeout", turbosmsProperties.getReadTimeout()),
+                connectTimeout,
+                readTimeout,
                 // Phase 408: a routed invite tries Telegram first, so its worst send carries that leg too.
                 ReviewInviteProperties.TELEGRAM_LEG_WORST_CASE);
     }

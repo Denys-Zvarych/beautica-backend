@@ -8,5 +8,10 @@ public enum SmsMode {
     /** The paid Turbosms provider (default). */
     TURBOSMS,
     /** Mail each SMS to a Mailpit inbox; nothing reaches the provider. Staging only. */
-    CAPTURE
+    CAPTURE,
+    /**
+     * The paid SMSClub provider (Phase 439, alpha-name BEAUTY). Allowed in prod; on staging only as an opt-in
+     * real-phone test ({@code EnvironmentFingerprintGuard}).
+     */
+    SMSCLUB
 }
