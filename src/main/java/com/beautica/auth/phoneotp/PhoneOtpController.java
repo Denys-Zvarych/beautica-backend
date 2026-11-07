@@ -39,7 +39,7 @@ public class PhoneOtpController {
     @PostMapping("/send")
     public ApiResponse<Void> send(@Valid @RequestBody PhoneOtpSendRequest request, HttpServletRequest httpRequest) {
         turnstileVerifier.verify(request.turnstileToken(), visitorIpResolver.resolve(httpRequest));
-        phoneOtpService.sendOtp(request.phone());
+        phoneOtpService.sendOtp(request.phone(), request.smsFormat());
         return ApiResponse.ok(null);
     }
 

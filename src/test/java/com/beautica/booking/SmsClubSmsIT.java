@@ -1,5 +1,6 @@
 package com.beautica.booking;
 
+import com.beautica.auth.phoneotp.OtpSmsExpectedCopy;
 import com.beautica.notification.sms.OtpSmsSender;
 import com.beautica.notification.sms.SmsClubOtpSmsSender;
 import com.beautica.notification.sms.SmsClubService;
@@ -34,10 +35,13 @@ import static org.assertj.core.api.Assertions.assertThat;
  * package-private {@link AbstractWalkInBookingSmsIT} rig (fixtures, HTTP helpers, root log capture) rather than
  * fork it. No {@code SmsService} mock — the bean SmsConfig selects IS the subject.
  */
-@TestPropertySource(properties = {"app.booking.sms.enabled=true", "beautica.sms.mode=smsclub"})
+// Phase 440: otp-domain set so DOMAIN_BOUND and PLAIN differ on the SMSClub wire (empty would render both alike).
+@TestPropertySource(properties = {"app.booking.sms.enabled=true", "beautica.sms.mode=smsclub",
+        "beautica.sms.otp-domain=" + SmsClubSmsIT.OTP_DOMAIN})
 @DisplayName("SmsClubSmsIT — beautica.sms.mode=smsclub, booking flag on")
 class SmsClubSmsIT extends AbstractWalkInBookingSmsIT {
 
+    static final String OTP_DOMAIN = "beautica.app";
     private static final String SMSCLUB_PATH = "/sms/send";
     private static final String SMSCLUB_TOKEN = "wiremock-smsclub-token";
 
@@ -137,6 +141,57 @@ class SmsClubSmsIT extends AbstractWalkInBookingSmsIT {
                 .noneMatch(line -> line.toLowerCase(java.util.Locale.ROOT).contains("black list"));
         assertNoPiiInLogs(E164_PHONE, PHONE_SUBSCRIBER_DIGITS);
     }
+    /** Phase 440 — the guest OTP send with an explicit {@code smsFormat}, body via Jackson (Q16). */
+    private ResponseEntity<String> sendOtp(String phone, String smsFormat) throws Exception {
+        org.springframework.http.HttpHeaders headers = new org.springframework.http.HttpHeaders();
+        headers.setContentType(org.springframework.http.MediaType.APPLICATION_JSON);
+        headers.set("X-Forwarded-For", PublicBookingPageFixtures.randomIp());
+        String body = objectMapper.writeValueAsString(java.util.Map.of("phone", phone, "privacyAccepted", true,
+                "privacyPolicyVersion", "2026-10-20", "smsFormat", smsFormat));
+        return restTemplate.exchange("/api/v1/book/otp/send", org.springframework.http.HttpMethod.POST,
+                new org.springframework.http.HttpEntity<>(body, headers), String.class);
+    }
+
+    private static String codeIn(String text) {
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("\\d{6}").matcher(text);
+        assertThat(m.find()).as("no 6-digit code in the SMSClub message").isTrue();
+        return m.group();
+    }
+
+    @Test
+    @DisplayName("phase 440: smsFormat PLAIN in smsclub mode — SMSClub `message` is exactly the human line, log says format=plain")
+    void should_sendPlainMessageToSmsClub_when_smsFormatPlain() throws Exception {
+        stubSuccessFor(OTP_PHONE);
+
+        ResponseEntity<String> resp = sendOtp(OTP_PHONE, "PLAIN");
+
+        assertThat(resp.getStatusCode()).as("body=%s", resp.getBody()).isEqualTo(HttpStatus.OK);
+        String message = onlySmsClubPayload().path("message").asText();
+        String code = codeIn(message);
+        assertThat(message).isEqualTo(OtpSmsExpectedCopy.plain(code)).doesNotContain("@" + OTP_DOMAIN);
+        TURBOSMS.verify(0, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
+        assertThat(logMessages())
+                .anyMatch(line -> line.startsWith("OTP sent to ") && line.endsWith(" format=plain"))
+                .noneMatch(line -> line.contains(code));
+        assertNoPiiInLogs(OTP_PHONE, OTP_SUBSCRIBER_DIGITS);
+    }
+
+    @Test
+    @DisplayName("phase 440: no smsFormat in smsclub mode — SMSClub `message` is today's domain-bound text, log says format=domain_bound")
+    void should_sendDomainBoundMessageToSmsClub_when_smsFormatMissing() throws Exception {
+        stubSuccessFor(OTP_PHONE);
+
+        ResponseEntity<String> resp = sendOtp(OTP_PHONE);
+
+        assertThat(resp.getStatusCode()).as("body=%s", resp.getBody()).isEqualTo(HttpStatus.OK);
+        String message = onlySmsClubPayload().path("message").asText();
+        String code = codeIn(message);
+        assertThat(message).isEqualTo(OtpSmsExpectedCopy.domainBound(code, OTP_DOMAIN));
+        assertThat(logMessages())
+                .anyMatch(line -> line.startsWith("OTP sent to ") && line.endsWith(" format=domain_bound"))
+                .noneMatch(line -> line.contains(code));
+    }
+
     /**
      * QA phase 439 — the OTP channel's failure path in smsclub mode: an SMSClub refusal (business 200 or HTTP error)
      * must surface exactly as a Turbosms failure does — the generic 503, one provider call, no retry, nothing secret

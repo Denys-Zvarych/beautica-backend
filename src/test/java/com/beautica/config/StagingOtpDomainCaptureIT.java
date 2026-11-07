@@ -1,5 +1,6 @@
 package com.beautica.config;
 
+import com.beautica.auth.phoneotp.OtpSmsExpectedCopy;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.mail.Message;
 import jakarta.mail.Session;
@@ -44,8 +45,7 @@ class StagingOtpDomainCaptureIT extends AbstractStagingProfileIT {
 
     static final String STAGING_HOST = "s.beautica.app";
 
-    private static final Pattern BODY = Pattern.compile(
-            "Beautica: Ваш код (\\d{6})\\. Нікому не кажіть\\.\n\n@" + Pattern.quote(STAGING_HOST) + " #(\\d{6})");
+    private static final Pattern CODE = Pattern.compile("\\d{6}");
 
     @Autowired
     private TestRestTemplate restTemplate;
@@ -79,6 +79,19 @@ class StagingOtpDomainCaptureIT extends AbstractStagingProfileIT {
                 "privacyPolicyVersion", "2026-10-20", "turnstileToken", "XXXX.DUMMY.TOKEN.XXXX"));
     }
 
+    private ResponseEntity<String> sendOtp(String phone, String smsFormat) throws Exception {
+        return post("/api/v1/book/otp/send", Map.of("phone", phone, "privacyAccepted", true,
+                "privacyPolicyVersion", "2026-10-20", "turnstileToken", "XXXX.DUMMY.TOKEN.XXXX",
+                "smsFormat", smsFormat));
+    }
+
+    /** The first 6-digit run of the captured body (the code is random). */
+    private static String codeIn(String body) {
+        Matcher m = CODE.matcher(body);
+        assertThat(m.find()).as("no 6-digit code in: %s", body).isTrue();
+        return m.group();
+    }
+
     private MimeMessage sentMessage() {
         ArgumentCaptor<MimeMessage> sent = ArgumentCaptor.forClass(MimeMessage.class);
         verify(mailSender).send(sent.capture());
@@ -95,18 +108,18 @@ class StagingOtpDomainCaptureIT extends AbstractStagingProfileIT {
         assertThat(response.getStatusCode()).as("body=%s", response.getBody()).isEqualTo(HttpStatus.OK);
         MimeMessage mail = sentMessage();
         String body = mail.getContent().toString();
-        Matcher m = BODY.matcher(body);
-        assertThat(m.matches()).as("exact Phase 389 template through the capture transport, got: %s", body).isTrue();
-        assertThat(m.group(2)).as("origin-bound line carries the same code as the first line").isEqualTo(m.group(1));
+        String code = codeIn(body);
+        assertThat(body).as("exact Phase 389 template through the capture transport, same code in both lines")
+                .isEqualTo(OtpSmsExpectedCopy.domainBound(code, STAGING_HOST));
         assertThat(body.substring(body.lastIndexOf('\n') + 1))
                 .as("WebOTP / Apple domain-bound codes need `@host #code` as the FINAL line")
-                .isEqualTo("@" + STAGING_HOST + " #" + m.group(1));
+                .isEqualTo("@" + STAGING_HOST + " #" + code);
         assertThat(body.length()).as("one UCS-2 segment").isEqualTo(54 + STAGING_HOST.length()).isLessThanOrEqualTo(70);
         assertThat(mail.getRecipients(Message.RecipientType.TO)[0].toString())
                 .isEqualTo("sms" + phone + "@sms.staging.invalid");
         // Phase 435: the 43-char first line is now longer than the capture's 40-char subject cap.
         assertThat(mail.getSubject()).as("subject is the flattened first line cut at 40 chars, never the raw CR/LF text")
-                .isEqualTo("[SMS] " + ("Beautica: Ваш код " + m.group(1) + ". Нікому не кажіть.").substring(0, 40))
+                .isEqualTo("[SMS] " + OtpSmsExpectedCopy.plain(code).substring(0, 40))
                 .doesNotContain("\n");
         assertThat(turbosmsStub().getAllServeEvents()).as("no call reached Turbosms").isEmpty();
     }
@@ -116,12 +129,25 @@ class StagingOtpDomainCaptureIT extends AbstractStagingProfileIT {
     void should_verifyAndIssueGuestToken_when_codeReadFromDomainBoundCapture() throws Exception {
         String phone = randomPhone();
         sendOtp(phone);
-        Matcher m = BODY.matcher(sentMessage().getContent().toString());
-        assertThat(m.matches()).isTrue();
+        String body = sentMessage().getContent().toString();
+        String code = codeIn(body);
+        assertThat(body).isEqualTo(OtpSmsExpectedCopy.domainBound(code, STAGING_HOST));
 
-        ResponseEntity<String> verified = post("/api/v1/book/otp/verify", Map.of("phone", phone, "code", m.group(2)));
+        ResponseEntity<String> verified = post("/api/v1/book/otp/verify", Map.of("phone", phone, "code", code));
 
         assertThat(verified.getStatusCode()).as("body=%s", verified.getBody()).isEqualTo(HttpStatus.OK);
         assertThat(verified.getBody()).contains("guestToken");
+    }
+
+    @Test
+    @DisplayName("phase 440: smsFormat PLAIN on the staging domain — captured body has no domain line")
+    void should_captureHumanLineOnly_when_smsFormatPlain() throws Exception {
+        String phone = randomPhone();
+
+        ResponseEntity<String> response = sendOtp(phone, "PLAIN");
+
+        assertThat(response.getStatusCode()).as("body=%s", response.getBody()).isEqualTo(HttpStatus.OK);
+        String body = sentMessage().getContent().toString();
+        assertThat(body).isEqualTo(OtpSmsExpectedCopy.plain(codeIn(body))).doesNotContain("@" + STAGING_HOST);
     }
 }
