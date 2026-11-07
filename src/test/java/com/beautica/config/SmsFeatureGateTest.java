@@ -4,6 +4,8 @@ import com.beautica.notification.sms.CapturingOtpSmsSender;
 import com.beautica.notification.sms.CapturingSmsService;
 import com.beautica.notification.sms.NoOpSmsService;
 import com.beautica.notification.sms.OtpSmsSender;
+import com.beautica.notification.sms.SmsClubOtpSmsSender;
+import com.beautica.notification.sms.SmsClubService;
 import com.beautica.notification.sms.SmsService;
 import com.beautica.notification.sms.TurbosmsOtpSmsSender;
 import com.beautica.notification.sms.TurbosmsService;
@@ -54,6 +56,9 @@ class SmsFeatureGateTest {
 
     /** Phase 368: the staging capture adapter — the second (and last) named implementation exemption. */
     private static final String OTP_SENDER_CAPTURE_IMPL_SIMPLE_NAME = "CapturingOtpSmsSender";
+
+    /** Phase 439: the SMSClub adapter — the third named implementation exemption. */
+    private static final String OTP_SENDER_SMSCLUB_IMPL_SIMPLE_NAME = "SmsClubOtpSmsSender";
 
     private static final String MODE = "beautica.sms.mode";
 
@@ -241,13 +246,14 @@ class SmsFeatureGateTest {
                 .as("the rule below matches by simple name — both must still exist, or an "
                         + "exemption would silently be excluding nothing")
                 .contains(OTP_SENDER_SIMPLE_NAME, OTP_SENDER_IMPL_SIMPLE_NAME,
-                        OTP_SENDER_CAPTURE_IMPL_SIMPLE_NAME);
+                        OTP_SENDER_CAPTURE_IMPL_SIMPLE_NAME, OTP_SENDER_SMSCLUB_IMPL_SIMPLE_NAME);
 
         noClasses()
                 .that().resideOutsideOfPackage("com.beautica.auth..")
                 .and().doNotHaveFullyQualifiedName(SmsConfig.class.getName())
                 .and().doNotHaveSimpleName(OTP_SENDER_IMPL_SIMPLE_NAME)
                 .and().doNotHaveSimpleName(OTP_SENDER_CAPTURE_IMPL_SIMPLE_NAME)
+                .and().doNotHaveSimpleName(OTP_SENDER_SMSCLUB_IMPL_SIMPLE_NAME)
                 .should().dependOnClassesThat().haveSimpleName(OTP_SENDER_SIMPLE_NAME)
                 .as("only the auth package (plus SmsConfig, which constructs the bean, and "
                         + "TurbosmsOtpSmsSender, which implements it) may reach OtpSmsSender — "
@@ -291,6 +297,51 @@ class SmsFeatureGateTest {
             assertThat(context).getBean(SmsService.class).isInstanceOf(NoOpSmsService.class);
             assertThat(context).getBean(OtpSmsSender.class).isInstanceOf(CapturingOtpSmsSender.class);
         });
+    }
+
+    @Test
+    @DisplayName("phase 439: mode=smsclub + flag on — SMSClub beans for booking SMS AND OTP; no Turbosms bean")
+    void should_registerSmsClubBeans_when_modeIsSmsClubAndGateIsOn() {
+        runner.withPropertyValues(FLAG + "=true", MODE + "=smsclub").run(context -> {
+            assertThat(context).hasNotFailed();
+            assertThat(context).getBean(SmsService.class).isInstanceOf(SmsClubService.class);
+            assertThat(context).getBean(OtpSmsSender.class).isInstanceOf(SmsClubOtpSmsSender.class);
+            assertThat(context).doesNotHaveBean(TurbosmsService.class);
+            assertThat(context).doesNotHaveBean(TurbosmsOtpSmsSender.class);
+            assertThat(context.getBeanNamesForType(SmsService.class)).hasSize(1);
+            assertThat(context.getBeanNamesForType(OtpSmsSender.class)).hasSize(1);
+        });
+    }
+
+    @Test
+    @DisplayName("phase 439: mode=smsclub + flag off/absent — booking stays NoOp, the OTP still goes through SMSClub")
+    void should_keepBookingSmsOff_when_modeIsSmsClubAndGateIsOffOrAbsent() {
+        for (String[] scenario : new String[][]{{MODE + "=smsclub"}, {FLAG + "=false", MODE + "=smsclub"}}) {
+            runner.withPropertyValues(scenario).run(context -> {
+                assertThat(context).hasNotFailed();
+                assertThat(context).getBean(SmsService.class).isInstanceOf(NoOpSmsService.class);
+                assertThat(context).getBean(OtpSmsSender.class).isInstanceOf(SmsClubOtpSmsSender.class);
+                assertThat(context.getBeanNamesForType(SmsService.class)).hasSize(1);
+                assertThat(context.getBeanNamesForType(OtpSmsSender.class)).hasSize(1);
+            });
+        }
+    }
+
+    @Test
+    @DisplayName("phase 439: mode=turbosms/absent/capture — no SMSClub bean in any flag state")
+    void should_notRegisterSmsClubBeans_when_modeIsNotSmsClub() {
+        for (String mode : new String[]{null, "turbosms", "capture"}) {
+            for (String flag : new String[]{"true", "false"}) {
+                ApplicationContextRunner scenario = mode == null
+                        ? runner.withPropertyValues(FLAG + "=" + flag)
+                        : runner.withPropertyValues(FLAG + "=" + flag, MODE + "=" + mode);
+                scenario.run(context -> {
+                    assertThat(context).hasNotFailed();
+                    assertThat(context).doesNotHaveBean(SmsClubService.class);
+                    assertThat(context).doesNotHaveBean(SmsClubOtpSmsSender.class);
+                });
+            }
+        }
     }
 
     @Test

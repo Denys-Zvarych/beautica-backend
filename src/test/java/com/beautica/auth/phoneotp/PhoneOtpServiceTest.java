@@ -5,6 +5,8 @@ import com.beautica.config.DeployEnvironment;
 import com.beautica.config.DeploymentProperties;
 import com.beautica.config.SmsMode;
 import com.beautica.notification.sms.OtpSmsSender;
+import com.beautica.notification.sms.SmsDeliveryException;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.assertj.core.api.ThrowableAssert.ThrowingCallable;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -55,6 +57,7 @@ class PhoneOtpServiceTest {
     @Mock private OtpSmsSender otpSmsSender;
 
     private final RecordingTransactionManager txManager = new RecordingTransactionManager();
+    private final SimpleMeterRegistry meterRegistry = new SimpleMeterRegistry();
     private PhoneOtpService service;
 
     @BeforeEach
@@ -62,12 +65,161 @@ class PhoneOtpServiceTest {
         service = new PhoneOtpService(phoneOtpRepository, attemptRecorder, guestTokenProvider,
                 otpSmsSender, Clock.fixed(FIXED_NOW, ZoneOffset.UTC), txManager,
                 new DeploymentProperties(DeployEnvironment.LOCAL,
-                        new DeploymentProperties.Sms(SmsMode.TURBOSMS, OTP_DOMAIN)));
+                        new DeploymentProperties.Sms(SmsMode.TURBOSMS, OTP_DOMAIN)), meterRegistry);
     }
 
     private static String sha256Hex(String value) throws Exception {
         byte[] hash = MessageDigest.getInstance("SHA-256").digest(value.getBytes(StandardCharsets.UTF_8));
         return HexFormat.of().formatHex(hash);
+    }
+
+    /** The first 6-digit run of the captured SMS (the code is random). */
+    private static String codeIn(String sms) {
+        Matcher m = Pattern.compile("\\d{6}").matcher(sms);
+        assertThat(m.find()).as("no 6-digit code in: %s", sms).isTrue();
+        return m.group();
+    }
+
+    private String capturedSms() {
+        ArgumentCaptor<String> smsText = ArgumentCaptor.forClass(String.class);
+        verify(otpSmsSender).send(eq(PHONE), smsText.capture());
+        return smsText.getValue();
+    }
+
+    private double sentCount(OtpSmsFormat format) {
+        return meterRegistry.counter(PhoneOtpService.SENT_METRIC, "format", format.metricTag()).count();
+    }
+
+    private double fallbackCount() {
+        return meterRegistry.counter(PhoneOtpService.FORMAT_FALLBACK_METRIC).count();
+    }
+
+    // ── sendOtp — phase 440 smsFormat ──────────────────────────────────────────
+
+    @Test
+    @DisplayName("phase 440: sendOtp(phone, \"PLAIN\") sends the human line only and counts format=plain")
+    void should_sendPlainText_when_formatPlain() {
+        service.sendOtp(PHONE, "PLAIN");
+
+        String sms = capturedSms();
+        assertThat(sms).isEqualTo(OtpSmsExpectedCopy.plain(codeIn(sms)));
+        assertThat(sentCount(OtpSmsFormat.PLAIN)).isEqualTo(1.0);
+        assertThat(sentCount(OtpSmsFormat.DOMAIN_BOUND)).isZero();
+        assertThat(fallbackCount()).isZero();
+    }
+
+    @Test
+    @DisplayName("phase 440: sendOtp(phone) sends domain-bound, counts format=domain_bound, no fallback")
+    void should_sendDomainBoundText_when_noFormat() {
+        service.sendOtp(PHONE);
+
+        String sms = capturedSms();
+        assertThat(sms).isEqualTo(OtpSmsExpectedCopy.domainBound(codeIn(sms), OTP_DOMAIN));
+        assertThat(sentCount(OtpSmsFormat.DOMAIN_BOUND)).isEqualTo(1.0);
+        assertThat(sentCount(OtpSmsFormat.PLAIN)).isZero();
+        assertThat(fallbackCount()).isZero();
+    }
+
+    @Test
+    @DisplayName("phase 440: unknown \"FOO\" sends domain-bound and counts one fallback")
+    void should_sendDomainBoundAndCountFallback_when_formatUnknown() {
+        service.sendOtp(PHONE, "FOO");
+
+        String sms = capturedSms();
+        assertThat(sms).isEqualTo(OtpSmsExpectedCopy.domainBound(codeIn(sms), OTP_DOMAIN));
+        assertThat(sentCount(OtpSmsFormat.DOMAIN_BOUND)).isEqualTo(1.0);
+        assertThat(fallbackCount()).isEqualTo(1.0);
+    }
+
+    @Test
+    @DisplayName("phase 440: a failed provider send increments no sent counter")
+    void should_notCountSent_when_senderThrows() {
+        org.mockito.Mockito.doThrow(new SmsDeliveryException("down"))
+                .when(otpSmsSender).send(eq(PHONE), anyString());
+
+        assertThatThrownBy(() -> service.sendOtp(PHONE, "PLAIN")).isInstanceOf(BusinessException.class);
+
+        assertThat(sentCount(OtpSmsFormat.PLAIN)).isZero();
+        assertThat(sentCount(OtpSmsFormat.DOMAIN_BOUND)).isZero();
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest(name = "[{index}] \"{0}\"")
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"", "   "})
+    @DisplayName("phase 440: a blank smsFormat sends domain-bound and is NOT counted as a fallback")
+    void should_sendDomainBoundWithoutFallback_when_formatBlank(String blank) {
+        service.sendOtp(PHONE, blank);
+
+        String sms = capturedSms();
+        assertThat(sms).isEqualTo(OtpSmsExpectedCopy.domainBound(codeIn(sms), OTP_DOMAIN));
+        assertThat(sentCount(OtpSmsFormat.DOMAIN_BOUND)).isEqualTo(1.0);
+        assertThat(fallbackCount()).as("blank = 'not sent', not an unknown value").isZero();
+    }
+
+    @Test
+    @DisplayName("phase 440: mixed-case padded \" pLaIn \" is PLAIN — no fallback counted")
+    void should_sendPlainWithoutFallback_when_formatMixedCaseAndPadded() {
+        service.sendOtp(PHONE, " pLaIn ");
+
+        String sms = capturedSms();
+        assertThat(sms).isEqualTo(OtpSmsExpectedCopy.plain(codeIn(sms)));
+        assertThat(sentCount(OtpSmsFormat.PLAIN)).isEqualTo(1.0);
+        assertThat(fallbackCount()).isZero();
+    }
+
+    @Test
+    @DisplayName("phase 440: an unknown format on a failed send still counts the fallback but no sent")
+    void should_countFallbackButNotSent_when_formatUnknownAndSenderThrows() {
+        org.mockito.Mockito.doThrow(new SmsDeliveryException("down"))
+                .when(otpSmsSender).send(eq(PHONE), anyString());
+
+        assertThatThrownBy(() -> service.sendOtp(PHONE, "FOO")).isInstanceOf(BusinessException.class);
+
+        assertThat(fallbackCount()).isEqualTo(1.0);
+        assertThat(sentCount(OtpSmsFormat.DOMAIN_BOUND)).isZero();
+    }
+
+    @Test
+    @DisplayName("phase 440: the send log line carries format=plain, the masked phone, never the code")
+    void should_logFormatAndNeverCode_when_plainOtpSent() {
+        var appender = new ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent>();
+        var logger = (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(PhoneOtpService.class);
+        appender.start();
+        logger.addAppender(appender);
+        java.util.List<String> lines;
+        String code;
+        try {
+            service.sendOtp(PHONE, "PLAIN");
+
+            code = codeIn(capturedSms());
+            lines = appender.list.stream().map(ch.qos.logback.classic.spi.ILoggingEvent::getFormattedMessage).toList();
+        } finally {
+            logger.detachAppender(appender);
+        }
+
+        assertThat(lines).as("exactly today's send line plus the format field")
+                .contains("OTP sent to +380***4567 format=plain");
+        assertThat(lines).as("the code never reaches a log line, nor the raw phone")
+                .noneMatch(line -> line.contains(code))
+                .noneMatch(line -> line.contains(PHONE));
+    }
+
+    @Test
+    @DisplayName("phase 440: the default send log line says format=domain_bound")
+    void should_logDomainBoundFormat_when_noFormatGiven() {
+        var appender = new ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent>();
+        var logger = (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(PhoneOtpService.class);
+        appender.start();
+        logger.addAppender(appender);
+        java.util.List<String> lines;
+        try {
+            service.sendOtp(PHONE);
+
+            lines = appender.list.stream().map(ch.qos.logback.classic.spi.ILoggingEvent::getFormattedMessage).toList();
+        } finally {
+            logger.detachAppender(appender);
+        }
+
+        assertThat(lines).contains("OTP sent to +380***4567 format=domain_bound");
     }
 
     // ── sendOtp ────────────────────────────────────────────────────────────────
@@ -106,14 +258,13 @@ class PhoneOtpServiceTest {
 
         ArgumentCaptor<String> smsText = ArgumentCaptor.forClass(String.class);
         verify(otpSmsSender).send(eq(PHONE), smsText.capture());
-        Matcher m = Pattern
-                .compile("Beautica: Ваш код (\\d{6})\\. Нікому не кажіть\\.\n\n@beautica\\.app #(\\d{6})")
-                .matcher(smsText.getValue());
-        assertThat(m.matches()).as("exact Phase 389 template, got: %s", smsText.getValue()).isTrue();
-        assertThat(m.group(2)).as("the origin-bound line carries the same code").isEqualTo(m.group(1));
+        String code = codeIn(smsText.getValue());
+        assertThat(smsText.getValue())
+                .as("exact Phase 389 template, same code in both lines")
+                .isEqualTo(OtpSmsExpectedCopy.domainBound(code, OTP_DOMAIN));
         ArgumentCaptor<PhoneOtp> saved = ArgumentCaptor.forClass(PhoneOtp.class);
         verify(phoneOtpRepository).save(saved.capture());
-        assertThat(saved.getValue().getCodeHash()).isEqualTo(sha256Hex(m.group(1)));
+        assertThat(saved.getValue().getCodeHash()).isEqualTo(sha256Hex(code));
     }
 
     @Test
@@ -122,14 +273,14 @@ class PhoneOtpServiceTest {
         PhoneOtpService noDomain = new PhoneOtpService(phoneOtpRepository, attemptRecorder,
                 guestTokenProvider, otpSmsSender, Clock.fixed(FIXED_NOW, ZoneOffset.UTC), txManager,
                 new DeploymentProperties(DeployEnvironment.LOCAL,
-                        new DeploymentProperties.Sms(SmsMode.TURBOSMS, "")));
+                        new DeploymentProperties.Sms(SmsMode.TURBOSMS, "")), meterRegistry);
         when(phoneOtpRepository.countByPhoneAndCreatedAtAfter(eq(PHONE), any())).thenReturn(0);
 
         noDomain.sendOtp(PHONE);
 
         ArgumentCaptor<String> smsText = ArgumentCaptor.forClass(String.class);
         verify(otpSmsSender).send(eq(PHONE), smsText.capture());
-        assertThat(smsText.getValue()).matches("Beautica: Ваш код \\d{6}\\. Нікому не кажіть\\.");
+        assertThat(smsText.getValue()).isEqualTo(OtpSmsExpectedCopy.plain(codeIn(smsText.getValue())));
     }
 
     @Test
@@ -140,7 +291,7 @@ class PhoneOtpServiceTest {
 
         ThrowingCallable construct = () -> new PhoneOtpService(
                 phoneOtpRepository, attemptRecorder, guestTokenProvider, otpSmsSender,
-                Clock.fixed(FIXED_NOW, ZoneOffset.UTC), txManager, badDomain);
+                Clock.fixed(FIXED_NOW, ZoneOffset.UTC), txManager, badDomain, meterRegistry);
 
         assertThatThrownBy(construct)
                 .as("the host is validated once, at construction, not per send")

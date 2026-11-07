@@ -3,6 +3,8 @@ package com.beautica.config;
 import com.beautica.review.invite.config.ReviewInviteProperties;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.boot.context.properties.bind.Binder;
 import org.springframework.boot.context.properties.source.MapConfigurationPropertySource;
 
@@ -18,6 +20,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class ReviewInviteSendBudgetGuardTest {
 
     private static final String PREFIX = "app.booking.review-invite";
+    private static final String TURBOSMS = "turbosms";
 
     @Test
     @DisplayName("the static 10 s cap equals the grace minus the Telegram leg minus the DEFAULT Turbosms connect + read "
@@ -49,7 +52,7 @@ class ReviewInviteSendBudgetGuardTest {
     void should_boot_when_defaultsConfigured() {
         ReviewInviteProperties props = bind(Map.of("app.booking.other", "x"));
 
-        assertThatCode(() -> new ReviewInviteSendBudgetGuard(props, new TurbosmsProperties()))
+        assertThatCode(() -> new ReviewInviteSendBudgetGuard(props, new TurbosmsProperties(), new SmsClubProperties(), TURBOSMS))
                 .doesNotThrowAnyException();
     }
 
@@ -58,7 +61,7 @@ class ReviewInviteSendBudgetGuardTest {
     void should_boot_when_budgetEqualsDerivedBound() {
         ReviewInviteProperties props = bind(Map.of(PREFIX + ".send-budget", "10s"));
 
-        assertThatCode(() -> new ReviewInviteSendBudgetGuard(props, new TurbosmsProperties()))
+        assertThatCode(() -> new ReviewInviteSendBudgetGuard(props, new TurbosmsProperties(), new SmsClubProperties(), TURBOSMS))
                 .doesNotThrowAnyException();
     }
 
@@ -69,7 +72,7 @@ class ReviewInviteSendBudgetGuardTest {
         TurbosmsProperties turbosms = new TurbosmsProperties();
         turbosms.setReadTimeout(Duration.ofSeconds(10));
 
-        assertThatThrownBy(() -> new ReviewInviteSendBudgetGuard(props, turbosms))
+        assertThatThrownBy(() -> new ReviewInviteSendBudgetGuard(props, turbosms, new SmsClubProperties(), TURBOSMS))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("send-budget must be <= PT5S");
     }
@@ -81,7 +84,7 @@ class ReviewInviteSendBudgetGuardTest {
         TurbosmsProperties turbosms = new TurbosmsProperties();
         turbosms.setConnectTimeout(Duration.ZERO);
 
-        assertThatThrownBy(() -> new ReviewInviteSendBudgetGuard(props, turbosms))
+        assertThatThrownBy(() -> new ReviewInviteSendBudgetGuard(props, turbosms, new SmsClubProperties(), TURBOSMS))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("app.sms.turbosms.connect-timeout");
     }
@@ -93,7 +96,44 @@ class ReviewInviteSendBudgetGuardTest {
         TurbosmsProperties turbosms = new TurbosmsProperties();
         turbosms.setReadTimeout(Duration.ofSeconds(25));
 
-        assertThatCode(() -> new ReviewInviteSendBudgetGuard(props, turbosms)).doesNotThrowAnyException();
+        assertThatCode(() -> new ReviewInviteSendBudgetGuard(props, turbosms, new SmsClubProperties(), TURBOSMS)).doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("phase 439 audit-fix: in smsclub mode a raised SMSClub read timeout fails the boot, naming the bound")
+    void should_failBoot_when_smsClubModeReadTimeoutRaisedPastGrace() {
+        ReviewInviteProperties props = bind(Map.of(PREFIX + ".enabled", "true", PREFIX + ".min-policy-version", "2026-10-20"));
+        SmsClubProperties smsClub = new SmsClubProperties();
+        smsClub.setReadTimeout(Duration.ofSeconds(10));
+
+        assertThatThrownBy(() -> new ReviewInviteSendBudgetGuard(props, new TurbosmsProperties(), smsClub, "smsclub"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("send-budget must be <= PT5S");
+    }
+
+    @Test
+    @DisplayName("phase 439 audit-fix: in smsclub mode a zero SMSClub timeout fails the boot with the SMSClub property name")
+    void should_failBoot_when_smsClubModeTimeoutNotPositive() {
+        ReviewInviteProperties props = bind(Map.of(PREFIX + ".enabled", "true", PREFIX + ".min-policy-version", "2026-10-20"));
+        SmsClubProperties smsClub = new SmsClubProperties();
+        smsClub.setConnectTimeout(Duration.ZERO);
+
+        assertThatThrownBy(() -> new ReviewInviteSendBudgetGuard(props, new TurbosmsProperties(), smsClub, "SMSCLUB"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("app.sms.smsclub.connect-timeout");
+    }
+
+    @ParameterizedTest(name = "mode = {0}")
+    @ValueSource(strings = {"capture", TURBOSMS})
+    @DisplayName("phase 439 audit-fix: capture and turbosms modes keep checking the Turbosms timeouts, "
+            + "so a raised SMSClub timeout there still boots")
+    void should_ignoreSmsClubTimeouts_when_modeIsNotSmsClub(String mode) {
+        ReviewInviteProperties props = bind(Map.of(PREFIX + ".enabled", "true", PREFIX + ".min-policy-version", "2026-10-20"));
+        SmsClubProperties smsClub = new SmsClubProperties();
+        smsClub.setReadTimeout(Duration.ofSeconds(25));
+
+        assertThatCode(() -> new ReviewInviteSendBudgetGuard(props, new TurbosmsProperties(), smsClub, mode))
+                .doesNotThrowAnyException();
     }
 
     private static ReviewInviteProperties bind(Map<String, String> values) {

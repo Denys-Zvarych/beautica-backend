@@ -248,8 +248,10 @@ beautica:
   # Railway's injected environment name and the resource names. Default `local` = guard skipped.
   environment: local
   sms:
-    # turbosms (default) | capture. capture mails every SMS to a Mailpit inbox instead of the
-    # provider (staging only; the fingerprint guard rejects it in prod).
+    # turbosms (default) | capture | smsclub. capture mails every SMS to a Mailpit inbox instead of the
+    # provider (staging only; the fingerprint guard rejects it in prod). smsclub (phase 439) sends through
+    # SMSClub (app.sms.smsclub); allowed in prod, and on staging only as an opt-in real-phone test.
+    # Env: BEAUTICA_SMS_MODE.
     mode: turbosms
     # Phase 389 — bare website host for the guest OTP SMS's last line `@host #code` (WebOTP on Chrome
     # Android, domain-bound autofill on iOS Safari). Blank (local/test) = no domain line. prod pins
@@ -542,6 +544,21 @@ app:
       base-url: ${TURBOSMS_BASE_URL:https://api.turbosms.ua/message/send.json}
       connect-timeout: 3s
       read-timeout: 5s
+    # Phase 439 — SMSClub provider (alpha-name BEAUTY), active only with beautica.sms.mode=smsclub. Same
+    # degradation as turbosms: a blank token boots, the first send throws SmsDeliveryException; the prod guard
+    # (prod-smsclub-token-*) requires it in smsclub mode. The token is a secret and is never logged.
+    # SMSCLUB_BASE_URL is a test override only — never set it on Railway.
+    smsclub:
+      token: ${SMSCLUB_TOKEN:}
+      sender-name: ${SMSCLUB_SENDER_NAME:BEAUTY}
+      base-url: ${SMSCLUB_BASE_URL:https://im.smsclub.mobi/sms/send}
+      connect-timeout: 3s
+      read-timeout: 5s
+      lifetime-minutes: 60       # booking / reminder / review SMS
+      otp-lifetime-minutes: 10   # OTP sender; must be <= the OTP code TTL (SmsClubPropertiesTest)
+      # Phase 439 audit-fix: staging-only real-send ceiling per Kyiv day while the smsclub opt-in is on
+      # (StagingSmsDailyCap); ignored in prod and in capture mode.
+      staging-daily-cap: ${SMSCLUB_STAGING_DAILY_CAP:50}
   telegram:
     # Phase 404 — opt-in Telegram reminder channel (TelegramConfig). OFF by default: NoOpTelegramMessenger
     # throws, so every message falls back to SMS. Write the flag as true/false (no relaxed binding).

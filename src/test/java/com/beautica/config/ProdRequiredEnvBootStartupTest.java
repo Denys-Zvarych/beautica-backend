@@ -161,6 +161,52 @@ class ProdRequiredEnvBootStartupTest {
                 .doesNotContain("zq77-short-tok");
     }
 
+    /** A command-line arg: the yml declares the mode literally, so a default property could not override it. */
+    private static final String SMSCLUB_MODE = "--beautica.sms.mode=smsclub";
+
+    @Test
+    @DisplayName("phase 439: smsclub mode + SMSCLUB_TOKEN, no TURBOSMS_TOKEN — prod boots (TurboSMS rules are mode-bound)")
+    void should_boot_when_prodSmsClubModeHasTokenAndNoTurbosmsToken() {
+        Map<String, String> vars = passingProdVars();
+        vars.remove("TURBOSMS_TOKEN");
+        vars.put("SMSCLUB_TOKEN", "smsclub-fixture-token-value");
+
+        try (ConfigurableApplicationContext ctx = prodApp(vars).run(SMSCLUB_MODE)) {
+            assertThat(ctx.isActive()).as("prod context must be up in smsclub mode").isTrue();
+        }
+    }
+
+    @Test
+    @DisplayName("phase 439: prod-smsclub-token-blank — smsclub mode without SMSCLUB_TOKEN aborts")
+    void should_abortBoot_when_prodSmsClubTokenMissing() {
+        Map<String, String> vars = passingProdVars();
+
+        String message = guardMessageOfFailedBoot(vars, SMSCLUB_MODE);
+
+        assertThat(message).contains("rule prod-smsclub-token-blank").doesNotContain("rule prod-sms-mode");
+    }
+
+    @Test
+    @DisplayName("phase 439: prod-smsclub-token-placeholder — smsclub mode with a short SMSCLUB_TOKEN aborts, value not echoed")
+    void should_abortBoot_when_prodSmsClubTokenIsPlaceholder() {
+        Map<String, String> vars = passingProdVars();
+        vars.put("SMSCLUB_TOKEN", "zq77-short-tok");
+
+        String message = guardMessageOfFailedBoot(vars, SMSCLUB_MODE);
+
+        assertThat(message).contains("rule prod-smsclub-token-placeholder").doesNotContain("zq77-short-tok");
+    }
+
+    @Test
+    @DisplayName("phase 439: prod-smsclub-sender-blank — smsclub mode with SMSCLUB_SENDER_NAME set blank aborts")
+    void should_abortBoot_when_prodSmsClubSenderBlank() {
+        Map<String, String> vars = passingProdVars();
+        vars.put("SMSCLUB_TOKEN", "smsclub-fixture-token-value");
+        vars.put("SMSCLUB_SENDER_NAME", "");
+
+        assertThat(guardMessageOfFailedBoot(vars, SMSCLUB_MODE)).contains("rule prod-smsclub-sender-blank");
+    }
+
     @Test
     @DisplayName("prod-admin-email-unset — prod boot without ADMIN_EMAIL aborts although the yml default would apply")
     void should_abortBoot_when_prodAdminEmailMissing() {

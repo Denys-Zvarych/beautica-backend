@@ -80,7 +80,7 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
     /** Prod e-mail logo must be served from our own site (same domain as the sender). */
     static final String PROD_LOGO_URL_PREFIX = "https://beautica.app/";
 
-    /** Conservative floor for {@code TURBOSMS_TOKEN}; the provider documents no length (see {@link #isPlaceholderSecret}). */
+    /** Conservative floor for {@code TURBOSMS_TOKEN} and {@code SMSCLUB_TOKEN}; the provider documents no length (see {@link #isPlaceholderSecret}). */
     static final int MIN_SMS_TOKEN_LENGTH = 16;
     private static final List<String> SECRET_PLACEHOLDERS = List.of("pending", "changeme", "todo", "xxx", "tbd");
 
@@ -439,8 +439,9 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
         if (isLoopback(host) || host.startsWith("mailpit")) {
             violations.add("rule prod-mail-host: spring.mail.host must not be loopback or a mailpit host in prod");
         }
-        if (smsModeOf(env) != SmsMode.TURBOSMS) {
-            violations.add("rule prod-sms-mode: beautica.sms.mode must be turbosms in prod");
+        SmsMode smsMode = smsModeOf(env);
+        if (smsMode != SmsMode.TURBOSMS && smsMode != SmsMode.SMSCLUB) {
+            violations.add("rule prod-sms-mode: beautica.sms.mode must be turbosms or smsclub in prod");
         }
         checkProdTelegram(env, violations);
         checkProdTelegramBot(env, violations);
@@ -449,12 +450,12 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
             violations.add("rule prod-support-email: app.support.email must be a real address (local@domain.tld, not a reserved test domain) in prod");
         }
         // Phase 367 D5: without these the app boots "healthy" but guest OTP 503s / admin mail goes to the yml default.
-        String smsToken = firstNonBlank(readOrNull(env, "TURBOSMS_TOKEN"), readOrNull(env, "app.sms.turbosms.token"));
-        if (isBlank(smsToken)) {
-            violations.add("rule prod-turbosms-token-blank: TURBOSMS_TOKEN (app.sms.turbosms.token) must be set in prod");
-        } else if (isPlaceholderSecret(smsToken)) {
-            violations.add("rule prod-turbosms-token-placeholder: TURBOSMS_TOKEN (app.sms.turbosms.token) must be a real "
-                    + "token (at least " + MIN_SMS_TOKEN_LENGTH + " characters, not a placeholder) in prod");
+        // Phase 439: the provider token rules follow the active mode; the inactive provider's token is not required
+        // (keep TURBOSMS_TOKEN set for one release anyway, so a mode rollback works).
+        if (smsMode == SmsMode.TURBOSMS) {
+            checkProdTurbosmsToken(env, violations);
+        } else if (smsMode == SmsMode.SMSCLUB) {
+            checkProdSmsClub(env, violations);
         }
         // The raw env var, not app.admin-email: that property carries the silent yml default.
         String adminEmail = readOrNull(env, "ADMIN_EMAIL");
@@ -472,6 +473,51 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
             violations.add("rule prod-admin-email-effective: app.admin-email (APP_ADMIN_EMAIL override) must be a real "
                     + "address (not a reserved test/example domain) in prod");
         }
+    }
+
+    private static void checkProdTurbosmsToken(Environment env, List<String> violations) {
+        String smsToken = firstNonBlank(readOrNull(env, "TURBOSMS_TOKEN"), readOrNull(env, "app.sms.turbosms.token"));
+        if (isBlank(smsToken)) {
+            violations.add("rule prod-turbosms-token-blank: TURBOSMS_TOKEN (app.sms.turbosms.token) must be set in prod");
+        } else if (isPlaceholderSecret(smsToken)) {
+            violations.add("rule prod-turbosms-token-placeholder: TURBOSMS_TOKEN (app.sms.turbosms.token) must be a real "
+                    + "token (at least " + MIN_SMS_TOKEN_LENGTH + " characters, not a placeholder) in prod");
+        }
+    }
+
+    /**
+     * Phase 439 D4 — {@code beautica.sms.mode=smsclub} in prod: a real {@code SMSCLUB_TOKEN} and a non-blank sender
+     * name. An unbound sender name falls back to the {@code SmsClubProperties} default ({@code BEAUTY}); only an
+     * explicitly blank one is a violation. Names the rule and the property only, never a value.
+     */
+    private static void checkProdSmsClub(Environment env, List<String> violations) {
+        String token = smsClubToken(env);
+        if (isBlank(token)) {
+            violations.add("rule prod-smsclub-token-blank: SMSCLUB_TOKEN (app.sms.smsclub.token) must be set in prod "
+                    + "when beautica.sms.mode=smsclub");
+        } else if (isPlaceholderSecret(token)) {
+            violations.add("rule prod-smsclub-token-placeholder: SMSCLUB_TOKEN (app.sms.smsclub.token) must be a real "
+                    + "token (at least " + MIN_SMS_TOKEN_LENGTH + " characters, not a placeholder) in prod");
+        }
+        String rawSender = readOrNull(env, "SMSCLUB_SENDER_NAME");
+        String boundSender = boundOrNull(env, "app.sms.smsclub.sender-name");
+        if ((rawSender != null && rawSender.isBlank()) || (boundSender != null && boundSender.isBlank())) {
+            violations.add("rule prod-smsclub-sender-blank: SMSCLUB_SENDER_NAME (app.sms.smsclub.sender-name) must not "
+                    + "be blank in prod when beautica.sms.mode=smsclub");
+        }
+        // Phase 439 audit-fix: the Bearer token rides every call, so only the real SMSClub endpoint may receive it in
+        // prod (same intent as prod-brevo-api-base-url / prod-telegram-api-base-url); unset resolves to the default.
+        String baseUrl = boundOrNull(env, SMSCLUB_BASE_URL_PROPERTY);
+        if (baseUrl != null && !SmsClubProperties.DEFAULT_BASE_URL.equals(baseUrl)) {
+            violations.add("rule prod-smsclub-base-url: " + SMSCLUB_BASE_URL_PROPERTY + " must be exactly "
+                    + SmsClubProperties.DEFAULT_BASE_URL + " in prod");
+        }
+    }
+
+    static final String SMSCLUB_BASE_URL_PROPERTY = "app.sms.smsclub.base-url";
+
+    private static String smsClubToken(Environment env) {
+        return firstNonBlank(readOrNull(env, "SMSCLUB_TOKEN"), readOrNull(env, "app.sms.smsclub.token"));
     }
 
     static final String TELEGRAM_API_ORIGIN = "https://api.telegram.org";
@@ -736,8 +782,16 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
         if (!isEmailShaped(support) || !support.endsWith(".invalid")) {
             violations.add("rule staging-support-email: app.support.email must be set to a .invalid address in staging");
         }
-        if (smsModeOf(env) != SmsMode.CAPTURE) {
-            violations.add("rule staging-sms-mode: beautica.sms.mode must be capture in staging");
+        // Phase 439 (user decision 2026-11-07): capture is the default; smsclub is an opt-in real-phone test, and the
+        // SMSClub token may be present only while that opt-in is on.
+        SmsMode smsMode = smsModeOf(env);
+        if (smsMode != SmsMode.CAPTURE && smsMode != SmsMode.SMSCLUB) {
+            violations.add("rule staging-sms-mode: beautica.sms.mode must be capture (or smsclub for an opt-in "
+                    + "real-phone test) in staging");
+        }
+        if (smsMode != SmsMode.SMSCLUB && !isBlank(smsClubToken(env))) {
+            violations.add("rule staging-smsclub-token-present: SMSCLUB_TOKEN must be blank in staging unless "
+                    + "beautica.sms.mode=smsclub");
         }
         // Phase 382 D7: a REAL secret on staging is a leak risk and would reject the test widget's dummy token.
         String turnstileSecret = boundOrNull(env, "app.turnstile.secret-key");

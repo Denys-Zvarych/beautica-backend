@@ -6,15 +6,9 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.client.JdkClientHttpRequestFactory;
-import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestClient;
 
-import javax.net.ssl.SSLHandshakeException;
-import java.net.ConnectException;
-import java.net.NoRouteToHostException;
-import java.net.UnknownHostException;
 import java.net.http.HttpClient;
-import java.net.http.HttpConnectTimeoutException;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
@@ -46,8 +40,8 @@ public class TurbosmsService implements SmsService {
 
     private static final String SUCCESS_STATUS = "OK";
     private static final String FAILURE_STATUS = "FAILED";
-    /** Cause-chain walk bound in {@link #isOutcomeUnknown}; real chains are 2-4 deep. */
-    static final int MAX_CAUSE_DEPTH = 16;
+    /** Cause-chain walk bound in {@link #isOutcomeUnknown}; real chains are 2-4 deep (owned by {@link SmsTransportErrors}). */
+    static final int MAX_CAUSE_DEPTH = SmsTransportErrors.MAX_CAUSE_DEPTH;
     private final RestClient restClient;
     private final String baseUrl;
     private final String token;
@@ -150,27 +144,14 @@ public class TurbosmsService implements SmsService {
 
     /**
      * Phase 400 (audit cycle 1) — {@code true} when the request may have reached Turbosms: an I/O failure
-     * ({@link ResourceAccessException}) that is NOT a pre-send connection failure. A read timeout or a connection
+     * ({@link org.springframework.web.client.ResourceAccessException}) that is NOT a pre-send connection failure. A read timeout or a connection
      * dropped after the request was written leaves the provider's verdict unknown — it may have billed and delivered.
      * Connection refused, connect timeout, unknown host, no route and a failed TLS handshake all happen before the
      * request is written, so those stay definite (retry-safe) failures.
      */
     static boolean isOutcomeUnknown(RuntimeException e) {
-        if (!(e instanceof ResourceAccessException)) {
-            return false;
-        }
-        // Depth-capped (audit cycle 2): a cyclic cause chain longer than self-reference (A -> B -> A) would spin
-        // forever. Hitting the cap with no pre-send cause found reads as UNKNOWN — the safe side (never retried).
-        int depth = 0;
-        for (Throwable t = e; t != null && depth < MAX_CAUSE_DEPTH;
-                t = t.getCause() == t ? null : t.getCause(), depth++) {
-            if (t instanceof ConnectException || t instanceof HttpConnectTimeoutException
-                    || t instanceof UnknownHostException || t instanceof NoRouteToHostException
-                    || t instanceof SSLHandshakeException) {
-                return false;
-            }
-        }
-        return true;
+        // Phase 439: the classification moved, verbatim, to SmsTransportErrors so SMSClub shares it.
+        return SmsTransportErrors.isOutcomeUnknown(e);
     }
 
     /** @see PhoneMask#mask(String) — the one masking rule, shared with {@link NoOpSmsService}. */

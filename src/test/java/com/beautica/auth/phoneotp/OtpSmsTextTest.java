@@ -22,7 +22,7 @@ class OtpSmsTextTest {
     void should_renderTwoParagraphsWithDomainLine_when_domainPresent() {
         String text = OtpSmsText.forDomain(Optional.of("beautica.app")).render(CODE);
 
-        assertThat(text).isEqualTo("Beautica: Ваш код 932279. Нікому не кажіть.\n\n@beautica.app #932279");
+        assertThat(text).isEqualTo(OtpSmsExpectedCopy.domainBound(CODE, "beautica.app"));
         assertThat(text).hasSize(66);
     }
 
@@ -31,8 +31,41 @@ class OtpSmsTextTest {
     void should_renderFirstLineOnly_when_domainEmpty() {
         String text = OtpSmsText.forDomain(Optional.empty()).render(CODE);
 
-        assertThat(text).isEqualTo("Beautica: Ваш код 932279. Нікому не кажіть.");
+        assertThat(text).isEqualTo(OtpSmsExpectedCopy.plain(CODE));
         assertThat(text).hasSize(43);
+    }
+
+    @Test
+    @DisplayName("phase 440: PLAIN with a domain — human line only, 43 chars, no `@` or `#`")
+    void should_renderFirstLineOnly_when_plainFormatWithDomain() {
+        String text = OtpSmsText.forDomain(Optional.of("beautica.app")).render(CODE, OtpSmsFormat.PLAIN);
+
+        assertThat(text).isEqualTo(OtpSmsExpectedCopy.plain(CODE)).hasSize(43).doesNotContain("@", "#");
+        assertThat(text.length()).isLessThanOrEqualTo(OtpSmsText.MAX_SINGLE_SEGMENT_CHARS);
+    }
+
+    @Test
+    @DisplayName("phase 440: DOMAIN_BOUND and the 1-arg render are both today's domain-bound text")
+    void should_renderDomainBound_when_domainBoundFormatOrNoFormat() {
+        OtpSmsText template = OtpSmsText.forDomain(Optional.of("beautica.app"));
+
+        String explicit = template.render(CODE, OtpSmsFormat.DOMAIN_BOUND);
+        String legacy = template.render(CODE);
+
+        assertThat(explicit).isEqualTo(OtpSmsExpectedCopy.domainBound(CODE, "beautica.app"));
+        assertThat(legacy).isEqualTo(explicit);
+    }
+
+    @Test
+    @DisplayName("phase 440: no domain — both formats send the human line only")
+    void should_renderFirstLineForBothFormats_when_domainEmpty() {
+        OtpSmsText template = OtpSmsText.forDomain(Optional.empty());
+
+        String plain = template.render(CODE, OtpSmsFormat.PLAIN);
+        String domainBound = template.render(CODE, OtpSmsFormat.DOMAIN_BOUND);
+
+        assertThat(plain).isEqualTo(OtpSmsExpectedCopy.plain(CODE));
+        assertThat(domainBound).isEqualTo(OtpSmsExpectedCopy.plain(CODE));
     }
 
     @Test

@@ -78,7 +78,8 @@ class PhoneOtpVerifyBruteForceTest {
         service = new PhoneOtpService(phoneOtpRepository, attemptRecorder, guestTokenProvider,
                 otpSmsSender, Clock.fixed(FIXED_NOW, ZoneOffset.UTC), txManager,
                 new DeploymentProperties(DeployEnvironment.LOCAL,
-                        new DeploymentProperties.Sms(SmsMode.TURBOSMS, null)));
+                        new DeploymentProperties.Sms(SmsMode.TURBOSMS, null)),
+                new io.micrometer.core.instrument.simple.SimpleMeterRegistry());
     }
 
     private static String sha256Hex(String value) throws Exception {
