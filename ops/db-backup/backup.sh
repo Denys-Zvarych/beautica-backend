@@ -21,7 +21,7 @@
 # secret value is ever printed (missing variables are named, never their values), and no tool's
 # stderr is forwarded (pg_dump/curl error text can carry the host).
 set -euo pipefail
-# Fixed PATH, no startup-file injection. /usr/local/sbin stays first: the IT curl shim lives there.
+# Fixed PATH, no startup-file injection. /usr/local/sbin stays first: the IT curl/cat shims live there.
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 unset BASH_ENV ENV
 umask 077
@@ -49,6 +49,7 @@ EXPECT_MD5=""
 HEAD_CONFIRMED=0
 CURL_PROTO='=https'
 SENTRY_URL=""
+CHECKIN_ID=""
 R2_KEY_ID=""
 R2_SECRET=""
 LAST_CODE=000
@@ -77,13 +78,45 @@ cfg_escape() {
 
 # Sentry Cron check-in. Best effort: 5 s timeout, never fails the backup. The URL is a secret, so it
 # rides a curl config on stdin (never argv) and curl's stderr is discarded. https only in prod.
+# Both check-ins of a run carry the same check_in_id, so Sentry pairs ok/error with THIS run's in_progress
+# even when it processes them out of order (unpaired, a late in_progress stayed open and timed out).
+# Logs only the status and the HTTP code (000 = transport failure), never the URL, key or path.
 checkin() {
     [ -n "$SENTRY_URL" ] || return 0
-    local sep='?' esc
+    local sep='?' esc query code
     [[ "$SENTRY_URL" == *\?* ]] && sep='&'
-    esc="$(cfg_escape "${SENTRY_URL}${sep}status=$1")" || return 0
-    printf 'silent\nproto = "%s"\nconnect-timeout = 5\nmax-time = 5\noutput = "/dev/null"\nurl = "%s"\n' "$CURL_PROTO" "$esc" \
-        | curl -K - >/dev/null 2>&1 || true
+    query="status=$1"
+    [ -z "$CHECKIN_ID" ] || query="check_in_id=${CHECKIN_ID}&${query}"
+    if ! esc="$(cfg_escape "${SENTRY_URL}${sep}${query}")"; then
+        log "checkin $1 skipped" || true
+        return 0
+    fi
+    code="$(printf 'silent\nproto = "%s"\nconnect-timeout = 5\nmax-time = 5\noutput = "/dev/null"\nwrite-out = "%%{http_code}"\nurl = "%s"\n' "$CURL_PROTO" "$esc" \
+        | curl -K - 2>/dev/null)" || true
+    [[ "$code" =~ ^[0-9]{3}$ ]] || code=000
+    log "checkin $1 http=${code}" || true   # on the exit-handler path: never abort before the result line
+}
+
+# One id per run: a canonical lowercase dashed UUID (8-4-4-4-12), the form Sentry documents for check_in_id.
+# The kernel's random UUID is read with cat (an IT shim can make it fail to exercise the fallback); the fallback
+# formats 16 bytes of /dev/urandom as a version-4 / RFC 4122-variant UUID. An unusable id only drops check_in_id;
+# the check-ins still go out.
+UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+new_checkin_id() {
+    local id="" hex="" variant
+    if [ -r /proc/sys/kernel/random/uuid ]; then
+        id="$(cat /proc/sys/kernel/random/uuid 2>/dev/null)" || id=""
+    fi
+    if ! [[ "$id" =~ $UUID_RE ]]; then
+        id=""
+        hex="$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')" || hex=""
+        if [[ "$hex" =~ ^[0-9a-f]{32}$ ]]; then
+            variant=$(( (16#${hex:16:2} & 0x3f) | 0x80 ))
+            printf -v id '%s-%s-4%s-%02x%s-%s' "${hex:0:8}" "${hex:8:4}" "${hex:13:3}" "$variant" "${hex:18:2}" "${hex:20:12}"
+        fi
+    fi
+    [[ "$id" =~ $UUID_RE ]] || id=""
+    printf '%s' "$id"
 }
 
 on_exit() {
@@ -286,6 +319,7 @@ R2_KEY_ID="$BACKUP_R2_ACCESS_KEY_ID"
 R2_SECRET="$BACKUP_R2_SECRET_ACCESS_KEY"
 unset BACKUP_R2_ACCESS_KEY_ID BACKUP_R2_SECRET_ACCESS_KEY BACKUP_SENTRY_CRON_URL
 
+CHECKIN_ID="$(new_checkin_id)"
 CHECKIN=1
 checkin in_progress
 

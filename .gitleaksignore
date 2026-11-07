@@ -125,3 +125,7 @@ f7d5cf62c55b7a08ba8d71679777365aeec1a047:src/test/java/com/beautica/config/Outbo
 # GuestCancelTokenKeyDevGuard refuses it outside the local profile. Never a
 # staging/prod key (reviewed 2026-11-04).
 c886fda4ca7a69f4899ac0fdb1ece57de282ff2e:src/test/java/com/beautica/booking/crypto/GuestCancelTokenCipherTest.java:generic-api-key:21
+# SentryPiiScrubberTest: "rt-canary-Qx7Lm" is a synthetic X-Refresh-Token canary
+# that the scrubber test proves gets redacted. Never issued by the app, not a
+# credential (reviewed 2026-11-06).
+1756002fee1766a1b79779fad250c57783cd7d61:src/test/java/com/beautica/common/observability/SentryPiiScrubberTest.java:generic-api-key:434

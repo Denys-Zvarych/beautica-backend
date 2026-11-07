@@ -320,6 +320,14 @@ app:
     allow-custom-api-base-url: false
     connect-timeout: 2s
     read-timeout: 5s
+  # Phase 437 — GET /api/v1/app/config (mobile 438 forced-update gate). Compared against the Android versionCode
+  # (pubspec +N). Defaults never block anyone. Boot fails on a negative code, latest < min, or a store URL not on
+  # https://play.google.com/. Raise APP_ANDROID_MIN_VERSION_CODE only after the replacement build is live on Play.
+  client-version:
+    android:
+      min-version-code: ${APP_ANDROID_MIN_VERSION_CODE:0}
+      latest-version-code: ${APP_ANDROID_LATEST_VERSION_CODE:0}
+      store-url: ${APP_ANDROID_STORE_URL:https://play.google.com/store/apps/details?id=com.beautica.app}
   firebase:
     service-account: ${FIREBASE_SERVICE_ACCOUNT:}
     connect-timeout: 5s

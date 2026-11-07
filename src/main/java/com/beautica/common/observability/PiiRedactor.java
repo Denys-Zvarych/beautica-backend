@@ -27,6 +27,7 @@ public final class PiiRedactor {
     static final String OTP = "[otp]";
     static final String BEARER = "Bearer [redacted]";
     static final String TOKEN = "[token]";
+    static final String SECRET = "[redacted]";
     static final String TRUNCATED = "…[truncated]";
     static final int MAX_LENGTH = 4096;
     /**
@@ -39,7 +40,23 @@ public final class PiiRedactor {
     private static final Pattern BEARER_PATTERN = Pattern.compile("(?i)bearer\\s++[^\\s,;\"']++");
     /** {@code ?token=…}, {@code &key=…}, {@code ;sig=…} in free text (exception values, URLs in messages). */
     private static final Pattern QUERY_SECRET_PATTERN =
-            Pattern.compile("(?i)([?&;][\\w-]{0,40}?(?:token|key|code|sig|signature|password|secret|otp)=)[^&\\s\"'#]++");
+            Pattern.compile("(?i)([?&;](?:[\\w-]{0,40}?(?:token|key|code|sig|signature|password|secret|otp)"
+                    // pin / refresh only as the whole key or a _/- segment: ?pin=, &user_pin=, never &shipping=.
+                    + "|(?:[\\w-]{0,40}?[_-])?(?:pin|refresh))=)[^&\\s\"'#]++");
+    /**
+     * {@code password=…}, {@code "pin": "…"}, {@code refreshToken: '…'} in free text (mirrors the app's crash
+     * scrubber). The key starts a word (not after {@code ?&;} or a word char, so query params stay with
+     * {@link #QUERY_SECRET_PATTERN}) and may be hyphenated ({@code X-Refresh-Token: …}); {@code pin} counts only as
+     * the whole key or a key segment ({@code user_pin}, {@code pinCode}), never inside {@code shipping}/{@code opinion}.
+     * A quoted value is taken whole, quote to quote, honouring {@code \"} escapes. Possessive, so linear.
+     */
+    private static final Pattern SECRET_KEY_VALUE_PATTERN = Pattern.compile(
+            "(?i)(?<![\\w?&;-])((?:[a-z0-9_-]{0,32}?(?:password|token|refresh|secret)[\\w-]{0,32}+"
+                    + "|(?:[a-z0-9_-]{0,32}?[_-])?pin(?:code|[_-][\\w-]{0,32}+)?))"
+                    + "[\"']?\\s{0,8}+[:=]\\s{0,8}+"
+                    + "(?:\"(?:[^\"\\\\]|\\\\.)*+\"?|'(?:[^'\\\\]|\\\\.)*+'?|\\S++)");
+    /** {@code PIN 1234} — a spaced PIN in free text (parity with the app scrubber's {@code _pinSpaced}). */
+    private static final Pattern PIN_SPACED_PATTERN = Pattern.compile("(?i)(?<![A-Za-z])(pin)\\s{1,8}+\\d{4,}+");
     /** Unicode local part and labels (Cyrillic / IDN); {@code %40} is a URL-encoded {@code @}. */
     private static final Pattern EMAIL_PATTERN = Pattern.compile(
             "(?<![\\p{L}\\p{N}._+-])[\\p{L}\\p{N}._+-]++(?:@|%40)(?:[\\p{L}\\p{N}-]++\\.)++\\p{L}{2,}+");
@@ -56,13 +73,31 @@ public final class PiiRedactor {
     /** 4–6 digits within 20 characters before an otp/code/код keyword. */
     private static final Pattern OTP_BEFORE_KEYWORD =
             Pattern.compile("(?<!\\d)\\d{4,6}(?!\\d)(.{0,20}?)(otp|code|код)", OTP_FLAGS);
+    /**
+     * Whitespace a phone may be grouped with: ASCII {@code \s} plus NBSP, the U+2000–U+200B spaces (thin, hair,
+     * zero-width), narrow NBSP and the other Unicode spaces Java's {@code \s} does not match.
+     */
+    private static final String PHONE_SPACE = "\\s\\u00A0\\u2000-\\u200B\\u202F\\u205F\\u3000";
+    /** ASCII hyphen plus the Unicode hyphens/dashes U+2010–U+2015 and minus sign U+2212. */
+    private static final String PHONE_DASH = "\\-\\u2010-\\u2015\\u2212";
+    private static final String SEP = "[" + PHONE_SPACE + "()" + PHONE_DASH + "]";
+    private static final String GAP = "[" + PHONE_SPACE + PHONE_DASH + "]";
+    private static final String DOT_SEP = "[" + PHONE_SPACE + "()." + PHONE_DASH + "]";
+    private static final String DOT_GAP = "[" + PHONE_SPACE + "." + PHONE_DASH + "]";
     private static final List<Pattern> PHONE_PATTERNS = List.of(
             // International: +380501112233, 380501112233, +380 50 111 22 33, +38 (050) 111-22-33.
-            Pattern.compile("\\+?38[\\s()-]{0,3}0[\\s()-]{0,3}\\d{2}[\\s()-]{0,3}\\d{3}[\\s-]{0,2}\\d{2}[\\s-]{0,2}\\d{2}(?!\\d)"),
+            Pattern.compile("\\+?38" + SEP + "{0,3}0" + SEP + "{0,3}\\d{2}" + SEP + "{0,3}\\d{3}" + GAP + "{0,2}\\d{2}"
+                    + GAP + "{0,2}\\d{2}(?!\\d)"),
             // National: 0501112233, 050 111 22 33, (050) 111-22-33, 050-111-22-33.
-            Pattern.compile("(?<![\\d+])\\(?0[\\s()-]{0,3}\\d{2}[\\s()-]{0,3}\\d{3}[\\s-]{0,2}\\d{2}[\\s-]{0,2}\\d{2}(?!\\d)"),
+            Pattern.compile("(?<![\\d+])\\(?0" + SEP + "{0,3}\\d{2}" + SEP + "{0,3}\\d{3}" + GAP + "{0,2}\\d{2}"
+                    + GAP + "{0,2}\\d{2}(?!\\d)"),
+            // Dot-separated or mixed: 050.111.22.33, +38.050.111.22.33, +380.50.111.22.33, (050) 111.22.33.
+            // Not inside a word, hex id or dotted version (no letter/digit/+ or "digit." before, no letter/digit
+            // or ".digit" after).
+            Pattern.compile("(?<![0-9A-Za-z+]|\\d\\.)(?:\\+?38" + DOT_SEP + "{0,3}|\\()?0" + DOT_SEP + "{0,3}\\d{2}"
+                    + DOT_SEP + "{0,3}\\d{3}" + DOT_GAP + "{0,2}\\d{2}" + DOT_GAP + "{0,2}\\d{2}(?![0-9A-Za-z]|\\.\\d)"),
             // Any other country code with spaced/dashed groups: +48 512 345 678, +1-202-555-0143.
-            Pattern.compile("\\+\\d{1,3}(?:[\\s-]?\\d{2,4}){2,5}(?!\\d)"),
+            Pattern.compile("\\+\\d{1,3}(?:" + GAP + "?\\d{2,4}){2,5}(?!\\d)"),
             Pattern.compile("(?<!\\d)\\d{9,}+"));
 
     /**
@@ -130,6 +165,8 @@ public final class PiiRedactor {
         }
         out = BEARER_PATTERN.matcher(out).replaceAll(Matcher.quoteReplacement(BEARER));
         out = QUERY_SECRET_PATTERN.matcher(out).replaceAll("$1" + Matcher.quoteReplacement(TOKEN));
+        out = SECRET_KEY_VALUE_PATTERN.matcher(out).replaceAll("$1=" + Matcher.quoteReplacement(SECRET));
+        out = PIN_SPACED_PATTERN.matcher(out).replaceAll("$1 " + Matcher.quoteReplacement(SECRET));
         if (out.indexOf('@') >= 0 || out.contains("%40")) {
             out = EMAIL_PATTERN.matcher(out).replaceAll(Matcher.quoteReplacement(EMAIL));
         }
