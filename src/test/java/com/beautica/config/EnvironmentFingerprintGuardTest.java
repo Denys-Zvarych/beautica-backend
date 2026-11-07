@@ -6,6 +6,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.boot.test.system.CapturedOutput;
 import org.springframework.boot.test.system.OutputCaptureExtension;
 import org.springframework.mock.env.MockEnvironment;
@@ -1557,6 +1558,71 @@ class EnvironmentFingerprintGuardTest {
                     .hasMessageContaining("rule prod-smsclub-token-placeholder")
                     .message().doesNotContain("=" + bad).doesNotContain("prod-smsclub-token-blank");
         }
+    }
+
+    @Test
+    @DisplayName("prod-smsclub-token-placeholder: a 15-char alphanumeric token (real SMSClub length) passes")
+    void should_pass_when_prodSmsClubTokenIsFifteenChars() {
+        MockEnvironment env = prodEnv().withProperty("SMSCLUB_TOKEN", "abcdefghijklmno");
+
+        assertThatCode(() -> run(env, DeployEnvironment.PROD, SmsMode.SMSCLUB)).doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("prod-smsclub-token-placeholder: a token of exactly 12 chars (the SMSClub floor) passes — floor is inclusive")
+    void should_pass_when_prodSmsClubTokenIsExactlyTwelveChars() {
+        String token = "abcdefghijkl";
+        MockEnvironment env = prodEnv().withProperty("SMSCLUB_TOKEN", token);
+
+        assertThat(token).as("fixture must sit exactly on the floor").hasSize(12);
+        assertThat(EnvironmentFingerprintGuard.MIN_SMSCLUB_TOKEN_LENGTH).as("SMSClub floor").isEqualTo(12);
+        assertThatCode(() -> run(env, DeployEnvironment.PROD, SmsMode.SMSCLUB)).doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("prod-smsclub-token-placeholder: an 11-char token (below the SMSClub floor) fails, minimum printed")
+    void should_fail_when_prodSmsClubTokenIsElevenChars() {
+        MockEnvironment env = prodEnv().withProperty("SMSCLUB_TOKEN", "abcdefghijk");
+
+        assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.SMSCLUB))
+                .hasMessageContaining("rule prod-smsclub-token-placeholder")
+                .hasMessageContaining("at least " + EnvironmentFingerprintGuard.MIN_SMSCLUB_TOKEN_LENGTH + " characters")
+                .message().doesNotContain("abcdefghijk");
+    }
+
+    @ParameterizedTest(name = "SMSCLUB_TOKEN=''{0}'' fails, value not echoed")
+    @ValueSource(strings = {"changeme", "pending"})
+    @DisplayName("prod-smsclub-token-placeholder: changeme / pending placeholders still fail under the 12-char floor")
+    void should_fail_when_prodSmsClubTokenIsChangemeOrPending(String bad) {
+        MockEnvironment env = prodEnv().withProperty("SMSCLUB_TOKEN", bad);
+
+        assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.SMSCLUB))
+                .hasMessageContaining("rule prod-smsclub-token-placeholder")
+                .message().doesNotContain(bad);
+    }
+
+    @Test
+    @DisplayName("prod-smsclub-token-placeholder: a token padded to 13 chars but 11 after strip fails — floor applies post-strip")
+    void should_fail_when_prodSmsClubTokenIsPaddedToTwelve() {
+        String token = " abcdefghijk ";
+        MockEnvironment env = prodEnv().withProperty("SMSCLUB_TOKEN", token);
+
+        assertThat(token).as("raw fixture clears the floor").hasSize(13);
+        assertThat(token.strip()).as("stripped fixture sits below the floor").hasSize(11);
+        assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.SMSCLUB))
+                .hasMessageContaining("rule prod-smsclub-token-placeholder")
+                .message().doesNotContain("abcdefghijk");
+    }
+
+    @Test
+    @DisplayName("prod-turbosms-token-placeholder: a 15-char token still fails (TurboSMS keeps the 16-char floor)")
+    void should_fail_when_prodTurbosmsTokenIsFifteenChars() {
+        MockEnvironment env = prodEnv().withProperty("TURBOSMS_TOKEN", "abcdefghijklmno");
+
+        assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                .hasMessageContaining("rule prod-turbosms-token-placeholder")
+                .hasMessageContaining("at least " + EnvironmentFingerprintGuard.MIN_SMS_TOKEN_LENGTH + " characters")
+                .message().doesNotContain("abcdefghijklmno");
     }
 
     @Test
