@@ -39,7 +39,8 @@ import org.springframework.context.annotation.Configuration;
         ModerationProperties.class,
         ModerationActionLinkProperties.class,
         ReviewInviteProperties.class,
-        CloudflareCdnProperties.class
+        CloudflareCdnProperties.class,
+        ClientVersionProperties.class
 })
 public class AppConfigProperties {
 }

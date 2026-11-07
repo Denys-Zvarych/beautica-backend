@@ -427,4 +427,21 @@ class SentryPiiScrubberTest {
 
         assertThat(result.getMessage().getFormatted()).isEqualTo("hello [email]");
     }
+
+    @Test
+    @DisplayName("exception value + message with dotted / NBSP phones and an X-Refresh-Token header — exact redacted text")
+    void should_redactDottedNbspPhoneAndRefreshHeader_when_eventCarriesThem() {
+        String raw = "failed for 050.111.22.33 / 050\u00A0111\u00A022\u00A033 / X-Refresh-Token: rt-canary-Qx7Lm";
+        String expected = "failed for [phone] / [phone] / X-Refresh-Token=[redacted]";
+        SentryEvent event = new SentryEvent();
+        event.setExceptions(new ArrayList<>(List.of(exception("IllegalStateException", raw))));
+        Message message = new Message();
+        message.setFormatted(raw);
+        event.setMessage(message);
+
+        SentryEvent result = scrubber.execute(event, new Hint());
+
+        assertThat(result.getExceptions().get(0).getValue()).isEqualTo(expected);
+        assertThat(result.getMessage().getFormatted()).isEqualTo(expected);
+    }
 }
