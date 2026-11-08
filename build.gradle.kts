@@ -164,6 +164,19 @@ tasks.withType<Test> {
         "-Xshare:off"
     )
 
+    // Repo files read by source-guard tests (RailwayConfigTest, GracefulShutdownConfigTest, ci/*,
+    // PostgresImagePinConsistencyTest) are not on the test classpath, so without these inputs a change
+    // to only one of them leaves `test` UP-TO-DATE / FROM-CACHE and replays a stale green.
+    inputs.files("Dockerfile", "railway.json", "gradle/wrapper/gradle-wrapper.properties")
+        .withPropertyName("deployConfigFiles")
+        .withPathSensitivity(PathSensitivity.RELATIVE)
+    inputs.files(
+        ".github/workflows", ".github/CODEOWNERS", ".gitattributes",
+        "docker/local/docker-compose.yml", "scripts/ci", "scripts/forbid_th_utext_in_email.sh"
+    )
+        .withPropertyName("repoGuardFiles")
+        .withPathSensitivity(PathSensitivity.RELATIVE)
+
     // PR #105 (2026-08-08): `./gradlew test` was killed mid-run by
     // TestSuiteExecutionException ("Could not complete execution for Gradle Test
     // Executor 1") — a forked test-JVM death, not an assertion failure. No

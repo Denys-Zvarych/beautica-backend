@@ -1,19 +1,22 @@
 # ─── Stage 1: build ───────────────────────────────────────────────────────────
-FROM eclipse-temurin:21-jdk-alpine AS builder
+# Gradle is preinstalled in the image so the build never downloads the wrapper distribution:
+# services.gradle.org redirects to GitHub release assets, and a slow GitHub first byte (up to 27s)
+# blew the wrapper's networkTimeout=10000 and failed Railway deploys. The tag's Gradle version
+# MUST match distributionUrl in gradle/wrapper/gradle-wrapper.properties (guarded by RailwayConfigTest).
+# Digest pinned on purpose (multi-arch index, so linux/amd64 resolves): update it TOGETHER with the wrapper version.
+FROM gradle:8.10-jdk21-alpine@sha256:8721f7ba7260103b5157925e2666c6fd611e7741905fb032dfa8dbd8d12f4b2e AS builder
 
 WORKDIR /app
 
-# Copy Gradle wrapper and build files first for layer caching
-COPY gradlew gradlew.bat ./
-COPY gradle ./gradle
+# Copy build files first for layer caching (no wrapper: gradle/ holds only the wrapper, no version catalog)
 COPY settings.gradle.kts build.gradle.kts ./
 
 # Download dependencies (cached unless build files change)
-RUN ./gradlew dependencies --no-daemon --quiet
+RUN gradle dependencies --no-daemon --quiet
 
 # Copy source and build
 COPY src ./src
-RUN ./gradlew bootJar --no-daemon -x test
+RUN gradle bootJar --no-daemon -x test
 
 # ─── Stage 2: runtime ─────────────────────────────────────────────────────────
 FROM eclipse-temurin:21-jre-alpine AS runtime
