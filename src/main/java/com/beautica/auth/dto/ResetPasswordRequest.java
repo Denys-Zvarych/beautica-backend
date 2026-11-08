@@ -41,4 +41,14 @@ public record ResetPasswordRequest(
         @StrongPassword
         String newPassword
 
-) {}
+) {
+
+    /**
+     * Phase 442 audit — the new password and the reset ticket must never reach a log line: the default record {@code toString}
+     * would print every component.
+     */
+    @Override
+    public String toString() {
+        return "ResetPasswordRequest[]";
+    }
+}

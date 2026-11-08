@@ -331,6 +331,11 @@ app:
     allow-custom-api-base-url: false
     connect-timeout: 2s
     read-timeout: 5s
+  # Phase 442 — terms + privacy consent on register / register-independent-master / invite-accept.
+  # false: a request with NO consent fields passes (legacy builds) and stores nothing; partial/false is always 400.
+  # Flip to true only after (1) mobile 443 is live on Play and (2) APP_ANDROID_MIN_VERSION_CODE forces that build.
+  auth:
+    require-terms-consent: ${APP_AUTH_REQUIRE_TERMS_CONSENT:false}
   # Phase 437 — GET /api/v1/app/config (mobile 438 forced-update gate). Compared against the Android versionCode
   # (pubspec +N). Defaults never block anyone. Boot fails on a negative code, latest < min, or a store URL not on
   # https://play.google.com/. Raise APP_ANDROID_MIN_VERSION_CODE only after the replacement build is live on Play.
