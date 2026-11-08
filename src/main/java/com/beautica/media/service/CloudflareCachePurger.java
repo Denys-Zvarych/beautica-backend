@@ -1,8 +1,12 @@
 package com.beautica.media.service;
 
+import com.beautica.common.observability.ExternalCallFailure;
 import com.beautica.config.CloudflareCdnProperties;
 import com.beautica.notification.mail.BrevoRestClients;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.ObjectReader;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.observation.ObservationRegistry;
@@ -13,10 +17,12 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatusCode;
 import org.springframework.http.MediaType;
+import org.springframework.http.client.ClientHttpResponse;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestClient;
-import org.springframework.web.client.RestClientException;
 
+import java.io.IOException;
+import java.io.InputStream;
 import java.time.Clock;
 import java.time.Duration;
 import java.util.Collection;
@@ -57,7 +63,13 @@ public class CloudflareCachePurger {
     static final int MAX_URLS_PER_REQUEST = 100;
     static final Duration DEFAULT_RETRY_DELAY = Duration.ofSeconds(1);
 
+    /** Cloudflare's purge answer is a few hundred bytes; anything past this cap is not read (audit-fix cycle 1). */
+    static final int MAX_RESPONSE_BYTES = 4096;
+    private static final ObjectReader RESPONSE_READER = new ObjectMapper()
+            .disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES).readerFor(PurgeResponse.class);
     private static final String PURGE_PATH = "/zones/{zoneId}/purge_cache";
+    private static final String SERVICE = "cdn-purge";
+    private static final String OP_PURGE = "purge";
     private static final String CONNECT_PROPERTY = "app.cloudflare-cdn.connect-timeout";
     private static final String READ_PROPERTY = "app.cloudflare-cdn.read-timeout";
 
@@ -146,6 +158,7 @@ public class CloudflareCachePurger {
             breaker.recordOutageFailure();
         }
         failedUrls.increment(chunk.size());
+        // Summary after the retry; each failed attempt already logged its own ERROR (phase 441).
         log.warn("Cloudflare cache purge failed (urlCount={}, errorCode={}, urls=[omitted])",
                 chunk.size(), outcome.errorCode());
     }
@@ -174,26 +187,48 @@ public class CloudflareCachePurger {
                     .exchange((request, response) -> classify(response.getStatusCode(), readBody(response)), true);
         } catch (RuntimeException ex) {
             boolean transport = BrevoRestClients.isTransportFailure(ex);
+            // Phase 441: one ERROR per failed attempt. The URL carries only the zone id; the token is a header.
+            failure().reason(ExternalCallFailure.transportReason(ex))
+                    .detail(ExternalCallFailure.rootCauseName(ex)).log(log, ex);
             return new Outcome(false, transport, ex.getClass().getSimpleName());
         }
     }
 
-    private static PurgeResponse readBody(RestClient.RequestHeadersSpec.ConvertibleClientHttpResponse response) {
-        try {
-            return response.bodyTo(PurgeResponse.class);
-        } catch (RestClientException unreadable) {
-            // Non-JSON error page (e.g. a 502 from an intermediary) — classified by status alone.
+    private static ExternalCallFailure failure() {
+        return ExternalCallFailure.of(SERVICE, OP_PURGE);
+    }
+
+    /**
+     * At most {@value #MAX_RESPONSE_BYTES} bytes are read, then parsed (audit-fix cycle 1: never an uncapped body).
+     * A non-JSON error page (e.g. a 502 from an intermediary), an empty or an oversized (truncated) body yields
+     * {@code null} — classified by status alone.
+     */
+    private static PurgeResponse readBody(ClientHttpResponse response) {
+        try (InputStream body = response.getBody()) {
+            byte[] bytes = body.readNBytes(MAX_RESPONSE_BYTES);
+            return bytes.length == 0 ? null : RESPONSE_READER.readValue(bytes);
+        } catch (IOException | RuntimeException unreadable) {
             return null;
         }
     }
 
     private static Outcome classify(HttpStatusCode status, PurgeResponse body) {
         String code = errorCode(status, body);
-        if (status.value() == 429 || status.is5xxServerError()) {
-            return new Outcome(false, true, code);
+        boolean retryable = status.value() == 429 || status.is5xxServerError();
+        boolean success = !retryable && status.value() == 200 && body != null && body.success();
+        if (!success) {
+            // Phase 441: one ERROR per failed attempt, with Cloudflare's first error message as the detail.
+            failure().http(status.value()).reason(body == null && status.value() == 200
+                    ? ExternalCallFailure.UNREADABLE_RESPONSE : code).detail(errorMessage(body)).log(log);
         }
-        boolean success = status.value() == 200 && body != null && body.success();
-        return new Outcome(success, false, code);
+        return new Outcome(success, retryable, code);
+    }
+
+    private static String errorMessage(PurgeResponse body) {
+        if (body == null || body.errors() == null || body.errors().isEmpty()) {
+            return null;
+        }
+        return body.errors().get(0).message();
     }
 
     private static String errorCode(HttpStatusCode status, PurgeResponse body) {
@@ -233,5 +268,5 @@ public class CloudflareCachePurger {
     record PurgeResponse(boolean success, List<CloudflareError> errors) {}
 
     @JsonIgnoreProperties(ignoreUnknown = true)
-    record CloudflareError(int code) {}
+    record CloudflareError(int code, String message) {}
 }

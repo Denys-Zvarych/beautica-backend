@@ -21,12 +21,12 @@ import static org.assertj.core.api.Assertions.assertThat;
 class SmsClubPropertiesTest {
 
     @Test
-    @DisplayName("an unbound instance carries the contract defaults (BEAUTY, real endpoint, 3s/5s, 60/10 min, staging cap 50)")
+    @DisplayName("an unbound instance carries the contract defaults (Beauty, real endpoint, 3s/5s, 60/10 min, staging cap 50)")
     void should_haveContractDefaults_when_unbound() {
         SmsClubProperties props = new SmsClubProperties();
 
         assertThat(props.getToken()).isEmpty();
-        assertThat(props.getSenderName()).isEqualTo("BEAUTY");
+        assertThat(props.getSenderName()).isEqualTo("Beauty");
         assertThat(props.getBaseUrl()).isEqualTo("https://im.smsclub.mobi/sms/send");
         assertThat(props.getConnectTimeout()).isEqualTo(Duration.ofSeconds(3));
         assertThat(props.getReadTimeout()).isEqualTo(Duration.ofSeconds(5));
@@ -41,7 +41,7 @@ class SmsClubPropertiesTest {
         SmsClubProperties props = bindFromApplicationYml();
 
         assertThat(props.getToken()).isEmpty();
-        assertThat(props.getSenderName()).isEqualTo("BEAUTY");
+        assertThat(props.getSenderName()).isEqualTo("Beauty");
         assertThat(props.getBaseUrl()).isEqualTo("https://im.smsclub.mobi/sms/send");
         assertThat(props.getLifetimeMinutes()).isEqualTo(60);
         assertThat(props.getOtpLifetimeMinutes()).isEqualTo(10);

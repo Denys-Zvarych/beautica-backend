@@ -164,6 +164,9 @@ class CapturingTelegramMessengerTest {
 
         assertThat(logAppender.list).extracting(ILoggingEvent::getFormattedMessage)
                 .containsExactly("event=telegram_send outcome=ok status=capture",
+                        // Phase 441: the failed capture-mail send is ONE external-call ERROR (MailSendFailures).
+                        "External call failed service=brevo-smtp op=send http=- reason=rejected to=- "
+                                + "detail=telegram-capture MailSendException",
                         "event=telegram_send outcome=transient status=capture cause=MailSendException")
                 .allSatisfy(line -> assertThat(line).doesNotContain(Long.toString(CHAT_ID), TEXT, "Ab3_xY9"));
     }

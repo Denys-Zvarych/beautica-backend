@@ -1,9 +1,15 @@
 package com.beautica.config;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
+import jakarta.mail.AuthenticationFailedException;
 import jakarta.mail.MessagingException;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.test.system.CapturedOutput;
 import org.springframework.boot.test.system.OutputCaptureExtension;
@@ -49,6 +55,29 @@ class BrevoConnectionProbeTest {
         assertThat(unreachable).isTrue();
         assertThat(output.getOut()).contains("prod-brevo-auth-failed").contains("MessagingException")
                 .doesNotContain("secret-login");
+    }
+
+    @Test
+    @DisplayName("phase 441: SMTP probe auth rejected — exactly one ERROR external-call line, service=brevo-smtp reason=auth, no login")
+    void should_logOneBrevoSmtpError_when_probeAuthIsRejected() throws Exception {
+        JavaMailSenderImpl sender = mock(JavaMailSenderImpl.class);
+        doThrow(new AuthenticationFailedException("535 auth failed for secret-login")).when(sender).testConnection();
+        Logger probeLogger = (Logger) LoggerFactory.getLogger(BrevoConnectionProbe.class);
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        probeLogger.addAppender(appender);
+
+        try {
+            probeWith(sender).isUnreachable();
+        } finally {
+            probeLogger.detachAppender(appender);
+            appender.stop();
+        }
+
+        assertThat(appender.list).filteredOn(e -> e.getLevel() == Level.ERROR).singleElement()
+                .extracting(ILoggingEvent::getFormattedMessage)
+                .isEqualTo("External call failed service=brevo-smtp op=probe http=- reason=auth to=- "
+                        + "detail=rule prod-brevo-auth-failed AuthenticationFailedException");
     }
 
     @Test

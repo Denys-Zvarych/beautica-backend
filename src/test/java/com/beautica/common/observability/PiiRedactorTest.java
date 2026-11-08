@@ -91,10 +91,20 @@ class PiiRedactorTest {
             "тест@приклад.укр|[email]",
             "ольга.коваль@gmail.com|[email]",
             "canary%40x.ua|[email]",
-            "user%40Mail.Example.com|[email]"})
+            "user%40Mail.Example.com|[email]",
+            "olena@localhost|[email]",
+            "foo@bar|[email]",
+            "foo%40bar|[email]"})
     @DisplayName("email shapes (ASCII, Cyrillic/IDN, %40-encoded) — replaced by [email]")
     void should_redactEmail_when_anyShape(String email, String expected) {
         assertThat(PiiRedactor.redact("to " + email + " ok")).isEqualTo("to " + expected + " ok");
+    }
+
+    @Test
+    @DisplayName("audit-fix 441: an address ending a sentence is redacted and the full stop kept")
+    void should_redactEmailAndKeepFullStop_when_addressEndsSentence() {
+        assertThat(PiiRedactor.redact("Contact foo@bar.com.")).isEqualTo("Contact [email].");
+        assertThat(PiiRedactor.redact("Contact foo@bar.")).isEqualTo("Contact [email].");
     }
 
     @ParameterizedTest

@@ -1,5 +1,8 @@
 package com.beautica.notification.sms;
 
+import com.beautica.common.observability.ExternalCallFailure;
+import com.beautica.common.observability.SentryEventCapture;
+import io.sentry.SentryEvent;
 import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
@@ -25,6 +28,7 @@ import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.List;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Stream;
@@ -110,7 +114,7 @@ class SmsClubServiceTest {
                 .withHeader("Content-Type", containing("application/json"))
                 .withHeader("Accept", containing("application/json"))
                 .withRequestBody(equalToJson("""
-                        {"phone":["380671234567"],"src_addr":"BEAUTY","message":"Ваш код Beautica 482913","lifetime":60}
+                        {"phone":["380671234567"],"src_addr":"Beauty","message":"Ваш код Beautica 482913","lifetime":60}
                         """)));
     }
 
@@ -123,7 +127,7 @@ class SmsClubServiceTest {
         noLifetime.send(PHONE, OTP_TEXT);
 
         wireMock.verify(1, postRequestedFor(urlEqualTo(PATH)).withRequestBody(equalToJson("""
-                {"phone":["380671234567"],"src_addr":"BEAUTY","message":"Ваш код Beautica 482913"}
+                {"phone":["380671234567"],"src_addr":"Beauty","message":"Ваш код Beautica 482913"}
                 """)));
     }
 
@@ -180,7 +184,8 @@ class SmsClubServiceTest {
             "Not enough money. It is necessary to refill the balance|NO_FUNDS",
             "Message cannot be blank|MESSAGE_BLANK",
             "Something new from the provider 380671234567|OTHER"})
-    @DisplayName("an add_info entry for the sent number is a definite rejection carrying only its fixed reason token")
+    @DisplayName("an add_info entry for the sent number is a definite rejection: the exception carries only the reason "
+            + "token, the ERROR log adds the provider text with the number masked (phase 441)")
     void should_throwDefiniteRejectionWithReasonToken_when_addInfoNamesTheNumber(String text, String reason) {
         stub(200, addInfo(DIGITS, text));
 
@@ -189,8 +194,10 @@ class SmsClubServiceTest {
                 .isNotInstanceOf(SmsDeliveryAmbiguousException.class)
                 .hasMessage("SMSClub rejected the message reason=" + reason);
         wireMock.verify(1, postRequestedFor(urlEqualTo(PATH)));
-        assertThat(renderLogs()).contains("reason=" + reason).doesNotContain(DIGITS)
-                .doesNotContainIgnoringCase(text.substring(0, 12));
+        assertThat(logAppender.list).filteredOn(e -> e.getLevel() == Level.ERROR).singleElement()
+                .satisfies(e -> assertThat(e.getFormattedMessage())
+                        .contains("service=smsclub op=send http=200 reason=" + reason.toLowerCase(java.util.Locale.ROOT))
+                        .containsIgnoringCase(text.substring(0, 12)).doesNotContain(DIGITS));
     }
 
     @ParameterizedTest(name = "src_addr ''{0}''")
@@ -237,14 +244,93 @@ class SmsClubServiceTest {
     }
 
     @Test
-    @DisplayName("HTTP 401 raises the AUTH alarm at ERROR level")
+    @DisplayName("HTTP 401 raises the auth alarm at ERROR level")
     void should_logAuthAlarmAtError_when_statusIs401() {
         stub(401, "{}");
 
         assertThatThrownBy(() -> service.send(PHONE, OTP_TEXT)).isInstanceOf(SmsDeliveryException.class);
 
         assertThat(logAppender.list).anyMatch(e -> e.getLevel() == Level.ERROR
-                && e.getFormattedMessage().contains("reason=AUTH"));
+                && e.getFormattedMessage().contains("http=401 reason=auth"));
+    }
+
+    @Test
+    @DisplayName("phase 441: HTTP 400 with a wrong-sender body is ONE ERROR with the stable template, the provider "
+            + "reason text as detail and the masked recipient — never the token, text, OTP or full number")
+    void should_logOneErrorWithProviderReason_when_status400CarriesSenderRejection() {
+        stub(400, "{\"success_request\":{\"add_info\":{\"src_addr\":\"Sender name is incorrect: BEAUTY for "
+                + DIGITS + "\"}}}");
+
+        assertThatThrownBy(() -> service.send(PHONE, OTP_TEXT)).isInstanceOf(SmsDeliveryException.class)
+                .hasMessage("SMSClub rejected the request with HTTP 400");
+
+        assertThat(logAppender.list).filteredOn(e -> e.getLevel() == Level.ERROR).singleElement()
+                .satisfies(e -> {
+                    assertThat(e.getMessage()).isEqualTo(ExternalCallFailure.MESSAGE);
+                    assertThat(e.getFormattedMessage())
+                            .isEqualTo("External call failed service=smsclub op=send http=400 reason=sender_invalid "
+                                    + "to=+380***4567 detail=Sender name is incorrect: BEAUTY for [phone]");
+                });
+        assertThat(renderLogs()).doesNotContain(TOKEN).doesNotContain(OTP_TEXT).doesNotContain("482913")
+                .doesNotContain(DIGITS);
+    }
+
+    @Test
+    @DisplayName("phase 441: a 4xx body echoing the token, the message text and the OTP is scrubbed before logging")
+    void should_scrubTokenTextAndOtp_when_errorBodyEchoesThem() {
+        stub(422, "{\"message\":\"bad request " + TOKEN + " " + OTP_TEXT + " code 482913 to " + DIGITS + "\"}");
+
+        assertThatThrownBy(() -> service.send(PHONE, OTP_TEXT)).isInstanceOf(SmsDeliveryException.class);
+
+        assertThat(logAppender.list).filteredOn(e -> e.getLevel() == Level.ERROR).singleElement()
+                .satisfies(e -> assertThat(e.getFormattedMessage()).contains("http=422 reason=other")
+                        .contains("detail=bad request").doesNotContain(TOKEN).doesNotContain(OTP_TEXT)
+                        .doesNotContain("482913").doesNotContain(DIGITS));
+    }
+
+    @Test
+    @DisplayName("audit-fix 441: a non-2xx body in an unknown JSON shape is never logged — only its length — so an "
+            + "escaped guest cancel link (\\/c\\/<token>) reaches neither the log nor the Sentry event")
+    void should_logOnlyBodyLength_when_errorBodyHasUnexpectedShape() {
+        String body = "{\"result\":{\"link\":\"https:\\/\\/beautica.app\\/c\\/AbCdEfGh12345678\"}}";
+        stub(400, body);
+        List<SentryEvent> events;
+
+        try (SentryEventCapture sentry = SentryEventCapture.attach(serviceLogger)) {
+            assertThatThrownBy(() -> service.send(PHONE, OTP_TEXT)).isInstanceOf(SmsDeliveryException.class);
+            events = sentry.forwarded();
+        }
+
+        assertThat(logAppender.list).filteredOn(e -> e.getLevel() == Level.ERROR).singleElement()
+                .satisfies(e -> assertThat(e.getFormattedMessage())
+                        .contains("http=400 reason=http_400")
+                        .contains("detail=unparsed(len=" + body.length() + ")"));
+        assertThat(renderLogs()).doesNotContain("AbCdEfGh").doesNotContain("beautica.app");
+        assertThat(events).singleElement().satisfies(e -> {
+            assertThat(e.getMessage().getFormatted()).doesNotContain("AbCdEfGh");
+            assertThat(String.join(" ", e.getMessage().getParams())).doesNotContain("AbCdEfGh");
+        });
+    }
+
+    @Test
+    @DisplayName("audit-fix 441: a visitor-driven PHONE_INVALID flood stays ERROR on every attempt but reaches "
+            + "Sentry exactly 5 times (the window budget), under one smsclub/phone_invalid fingerprint")
+    void should_capSentryEvents_when_manyPhoneInvalidRejections() {
+        stub(200, addInfo(DIGITS, "incorrect phone number"));
+        int attempts = 30;
+        List<SentryEvent> events;
+
+        try (SentryEventCapture sentry = SentryEventCapture.attach(serviceLogger)) {
+            for (int i = 0; i < attempts; i++) {
+                assertThatThrownBy(() -> service.send(PHONE, OTP_TEXT)).isInstanceOf(SmsDeliveryException.class);
+            }
+            events = sentry.forwarded();
+        }
+
+        assertThat(logAppender.list).filteredOn(e -> e.getLevel() == Level.ERROR).hasSize(attempts)
+                .allSatisfy(e -> assertThat(e.getFormattedMessage()).contains("reason=phone_invalid"));
+        assertThat(events).hasSize(5).allSatisfy(e -> assertThat(e.getFingerprints())
+                .containsExactly("external-call", "smsclub", "phone_invalid"));
     }
 
     // ── transport ───────────────────────────────────────────────────────────
@@ -387,8 +473,9 @@ class SmsClubServiceTest {
         Throwable thrown = org.assertj.core.api.Assertions.catchThrowable(() -> service.send(PHONE, OTP_TEXT));
 
         String allLogs = renderLogs();
+        // Phase 441: the provider's add_info text ("black list") IS logged now — sanitised, never the number.
         assertThat(allLogs).isNotBlank().doesNotContain(TOKEN).doesNotContain(OTP_TEXT).doesNotContain("482913")
-                .doesNotContain(DIGITS).doesNotContain("671234567").doesNotContainIgnoringCase("black list")
+                .doesNotContain(DIGITS).doesNotContain("671234567").containsIgnoringCase("black list")
                 .contains("+380***4567");
         assertThat(thrown.getMessage()).doesNotContain(DIGITS).doesNotContain(TOKEN);
     }
@@ -396,7 +483,7 @@ class SmsClubServiceTest {
     // ── phase 439 QA additions ──────────────────────────────────────────────
 
     @Test
-    @DisplayName("src_addr carries the configured sender name, not the BEAUTY default, when SMSCLUB_SENDER_NAME is overridden")
+    @DisplayName("src_addr carries the configured sender name, not the Beauty default, when SMSCLUB_SENDER_NAME is overridden")
     void should_sendConfiguredSenderName_when_senderNameIsOverridden() {
         stub(200, SUCCESS);
         SmsClubProperties own = props(wireMock.baseUrl() + PATH);
@@ -503,7 +590,8 @@ class SmsClubServiceTest {
                 .isInstanceOf(SmsDeliveryAmbiguousException.class)
                 .hasMessage("SMS delivery outcome unknown");
         wireMock.verify(1, postRequestedFor(urlEqualTo(PATH)));
-        assertThat(renderLogs()).contains("status=UNKNOWN").contains("reason=UNREADABLE_RESPONSE");
+        assertThat(logAppender.list).filteredOn(e -> e.getLevel() == Level.ERROR).singleElement()
+                .satisfies(e -> assertThat(e.getFormattedMessage()).contains("http=200 reason=unreadable_response"));
     }
 
     @Test
@@ -533,7 +621,7 @@ class SmsClubServiceTest {
     }
 
     @Test
-    @DisplayName("401 AUTH alarm names neither the token nor the number, and a non-401 is WARN, not ERROR")
+    @DisplayName("phase 441: 401 and 429 are each ONE ERROR; the 401 echoing the token never logs it")
     void should_keepAuthAlarmFreeOfSecrets_when_statusIs401() {
         stub(401, "{\"token\":\"" + TOKEN + "\"}");
         assertThatThrownBy(() -> service.send(PHONE, OTP_TEXT)).isInstanceOf(SmsDeliveryException.class);
@@ -541,11 +629,12 @@ class SmsClubServiceTest {
         assertThatThrownBy(() -> service.send(PHONE, OTP_TEXT)).isInstanceOf(SmsDeliveryException.class);
 
         assertThat(logAppender.list).filteredOn(e -> e.getLevel() == Level.ERROR)
-                .singleElement()
-                .satisfies(e -> assertThat(e.getFormattedMessage()).contains("http=401")
-                        .doesNotContain(TOKEN).doesNotContain(DIGITS));
-        assertThat(logAppender.list).anyMatch(e -> e.getLevel() == Level.WARN
-                && e.getFormattedMessage().contains("http=429") && !e.getFormattedMessage().contains("AUTH"));
+                .extracting(ILoggingEvent::getFormattedMessage)
+                .hasSize(2)
+                .anySatisfy(m -> assertThat(m).contains("http=401 reason=auth"))
+                .anySatisfy(m -> assertThat(m).contains("http=429 reason=http_429"))
+                .allSatisfy(m -> assertThat(m).doesNotContain(TOKEN).doesNotContain(DIGITS));
+        assertThat(logAppender.list).noneMatch(e -> e.getLevel() == Level.WARN);
     }
 
     @ParameterizedTest(name = "fault {0}")
@@ -591,8 +680,13 @@ class SmsClubServiceTest {
 
         assertThat(thrown).isInstanceOf(SmsDeliveryAmbiguousException.class)
                 .hasMessage("SMS delivery outcome unknown");
-        assertThat(renderLogs()).contains("cause=").doesNotContain(DIGITS).doesNotContain(TOKEN)
-                .doesNotContain(wireMock.baseUrl());
+        assertThat(logAppender.list).filteredOn(e -> e.getLevel() == Level.ERROR).singleElement()
+                .satisfies(e -> {
+                    assertThat(e.getFormattedMessage()).contains("service=smsclub op=send http=- reason=timeout")
+                            .contains("to=+380***4567");
+                    assertThat(e.getThrowableProxy()).as("exception attached for the Sentry stack trace").isNotNull();
+                });
+        assertThat(renderLogs()).doesNotContain(DIGITS).doesNotContain(TOKEN).doesNotContain(wireMock.baseUrl());
     }
 
     @Test

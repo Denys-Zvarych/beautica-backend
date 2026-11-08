@@ -1,10 +1,16 @@
 package com.beautica.notification.service;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import com.beautica.config.FirebaseConfig;
 import com.beautica.notification.repository.DeviceTokenRepository;
 import com.google.firebase.messaging.FirebaseMessagingException;
 import com.google.firebase.messaging.Message;
 import com.google.firebase.messaging.MessagingErrorCode;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -12,6 +18,7 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.slf4j.LoggerFactory;
 
 import java.lang.reflect.Field;
 import java.util.Collection;
@@ -44,6 +51,78 @@ class PushNotificationServiceTest {
 
     @InjectMocks
     private PushNotificationService pushNotificationService;
+
+    private final Logger serviceLogger = (Logger) LoggerFactory.getLogger(PushNotificationService.class);
+    private final ListAppender<ILoggingEvent> logAppender = new ListAppender<>();
+
+    @BeforeEach
+    void captureLogs() {
+        logAppender.start();
+        serviceLogger.addAppender(logAppender);
+    }
+
+    @AfterEach
+    void detachLogs() {
+        serviceLogger.detachAppender(logAppender);
+        logAppender.stop();
+    }
+
+    private List<ILoggingEvent> errorEvents() {
+        return logAppender.list.stream().filter(e -> e.getLevel() == Level.ERROR).toList();
+    }
+
+    @Test
+    @DisplayName("phase 441: FCM INTERNAL — one ERROR external-call line, service=fcm reason=internal, device id only, exception attached")
+    void should_logOneFcmError_when_firebaseThrowsInternal() throws Exception {
+        UUID userId = UUID.randomUUID();
+        UUID deviceId = UUID.randomUUID();
+        DeviceTokenRepository.DeviceTokenSummary token = buildSummary(deviceId, "fcm-secret-token-value");
+        when(deviceTokenRepository.findActiveTokenSummaryByUserId(userId)).thenReturn(List.of(token));
+        FirebaseMessagingException mockEx = mock(FirebaseMessagingException.class);
+        when(mockEx.getMessagingErrorCode()).thenReturn(MessagingErrorCode.INTERNAL);
+        doThrow(mockEx).when(firebaseSender).send(any(Message.class));
+
+        pushNotificationService.sendToDevices(userId, List.of(token), "Title", "Body", Map.of());
+
+        assertThat(errorEvents()).singleElement().satisfies(e -> {
+            assertThat(e.getFormattedMessage()).isEqualTo("External call failed service=fcm op=send http=- "
+                    + "reason=internal to=device:" + deviceId + " detail=-");
+            assertThat(e.getThrowableProxy()).as("stack trace for Sentry").isNotNull();
+        });
+        assertThat(logAppender.list).noneMatch(e -> e.getFormattedMessage().contains("fcm-secret-token-value"));
+    }
+
+    @Test
+    @DisplayName("phase 441: unexpected RuntimeException around the FCM call — one ERROR, reason=unexpected, root cause class as detail")
+    void should_logOneFcmErrorWithUnexpectedReason_when_sendThrowsRuntimeException() throws Exception {
+        UUID userId = UUID.randomUUID();
+        UUID deviceId = UUID.randomUUID();
+        DeviceTokenRepository.DeviceTokenSummary token = buildSummary(deviceId, "fcm-runtime-token");
+        when(deviceTokenRepository.findActiveTokenSummaryByUserId(userId)).thenReturn(List.of(token));
+        doThrow(new IllegalStateException("boom")).when(firebaseSender).send(any(Message.class));
+
+        pushNotificationService.sendToDevices(userId, List.of(token), "T", "B", Map.of());
+
+        assertThat(errorEvents()).singleElement()
+                .extracting(ILoggingEvent::getFormattedMessage)
+                .isEqualTo("External call failed service=fcm op=send http=- reason=unexpected to=device:" + deviceId
+                        + " detail=IllegalStateException");
+    }
+
+    @Test
+    @DisplayName("phase 441: FCM UNREGISTERED — stale token cleanup, no ERROR (not a service failure)")
+    void should_notLogError_when_firebaseReturnsUnregistered() throws Exception {
+        UUID userId = UUID.randomUUID();
+        DeviceTokenRepository.DeviceTokenSummary token = buildSummary(UUID.randomUUID(), "fcm-stale-token");
+        when(deviceTokenRepository.findActiveTokenSummaryByUserId(userId)).thenReturn(List.of(token));
+        FirebaseMessagingException mockEx = mock(FirebaseMessagingException.class);
+        when(mockEx.getMessagingErrorCode()).thenReturn(MessagingErrorCode.UNREGISTERED);
+        doThrow(mockEx).when(firebaseSender).send(any(Message.class));
+
+        pushNotificationService.sendToDevices(userId, List.of(token), "Title", "Body", Map.of());
+
+        assertThat(errorEvents()).isEmpty();
+    }
 
     @Test
     @DisplayName("should send to all devices when user has multiple tokens")
@@ -148,8 +227,8 @@ class PushNotificationServiceTest {
     }
 
     @Test
-    @DisplayName("should not throw and log warn when Firebase throws other error")
-    void should_notThrowAndLogWarn_when_firebaseThrowsOtherError() throws Exception {
+    @DisplayName("should not throw and keep the token when Firebase throws another error")
+    void should_notThrowAndKeepToken_when_firebaseThrowsOtherError() throws Exception {
         UUID userId = UUID.randomUUID();
         DeviceTokenRepository.DeviceTokenSummary token = buildSummary(UUID.randomUUID(), "fcm-error-token");
         when(deviceTokenRepository.findActiveTokenSummaryByUserId(userId)).thenReturn(List.of(token));
@@ -321,7 +400,7 @@ class PushNotificationServiceTest {
 
     private DeviceTokenRepository.DeviceTokenSummary buildSummary(UUID id, String rawToken) {
         DeviceTokenRepository.DeviceTokenSummary summary = mock(DeviceTokenRepository.DeviceTokenSummary.class);
-        // getId() is only accessed in log.warn on the exception path — lenient avoids UnnecessaryStubbingException
+        // getId() is only accessed in the ERROR line on the exception path — lenient avoids UnnecessaryStubbingException
         // in happy-path tests where no exception is thrown
         lenient().when(summary.getId()).thenReturn(id);
         when(summary.getToken()).thenReturn(rawToken);

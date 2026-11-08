@@ -291,6 +291,29 @@ class TurnstileVerifierTest {
     }
 
     @Test
+    @DisplayName("phase 441: a server-side error code (bad secret) and a 5xx are ERROR; a visitor-side rejection is not")
+    void should_logErrorOnlyForServiceSideFailures_when_siteverifyFails() {
+        stub(200, "{\"success\":false,\"error-codes\":[\"invalid-input-response\"]}");
+        assertRejected(() -> prodLike().verify(TOKEN, IP));
+        assertThat(logAppender.list).noneMatch(e -> e.getLevel() == Level.ERROR);
+        wireMock.resetAll();
+        stub(200, "{\"success\":false,\"error-codes\":[\"invalid-input-secret\"]}");
+        assertRejected(() -> prodLike().verify(TOKEN, IP));
+        wireMock.resetAll();
+        stub(502, "{}");
+
+        assertUnavailable(() -> prodLike().verify(TOKEN, IP));
+
+        assertThat(logAppender.list).filteredOn(e -> e.getLevel() == Level.ERROR)
+                .extracting(ILoggingEvent::getFormattedMessage)
+                .containsExactly(
+                        "External call failed service=turnstile op=verify http=200 reason=invalid_input_secret to=- "
+                                + "detail=invalid-input-secret",
+                        "External call failed service=turnstile op=verify http=502 reason=http_502 to=- detail=-")
+                .allSatisfy(m -> assertThat(m).doesNotContain(SECRET).doesNotContain(TOKEN));
+    }
+
+    @Test
     @DisplayName("should_acceptReviewSubmitAction_when_verifyingReviewInvite")
     void should_acceptReviewSubmitAction_when_verifyingReviewInvite() {
         stub(200, "{\"success\":true,\"hostname\":\"beautica.app\",\"action\":\"review_submit\"}");

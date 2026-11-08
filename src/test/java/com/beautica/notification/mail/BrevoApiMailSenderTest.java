@@ -334,7 +334,8 @@ class BrevoApiMailSenderTest {
     }
 
     @Test
-    @DisplayName("redaction — no api-key, recipient, body or Brevo message in logs or exception messages")
+    @DisplayName("redaction — no api-key, recipient or body in logs or exception messages; Brevo's message only in the "
+            + "redacted log detail (phase 441), never in an exception")
     void should_neverLeakSecretsOrPii_when_failing(CapturedOutput output) throws Exception {
         stubStatus(400, "{\"code\":\"invalid_parameter\",\"message\":\"" + BREVO_MESSAGE + "\"}");
         Throwable permanent = catchThrowable(() -> sender.send(message()));
@@ -351,7 +352,80 @@ class BrevoApiMailSenderTest {
             assertThat(t.getCause()).isNull();
         }
         assertThat(output.getAll()).doesNotContain(API_KEY).doesNotContain(RECIPIENT)
-                .doesNotContain(BODY_MARKER).doesNotContain("echoed");
+                .doesNotContain(BODY_MARKER).contains("detail=echoed [email] is invalid");
+    }
+
+    @Test
+    @DisplayName("phase 441: a 400 is ONE ERROR with the stable template, the whitelisted code as reason and Brevo's "
+            + "message (recipient redacted) as detail")
+    void should_logOneErrorWithCodeAndRedactedMessage_when_400() throws Exception {
+        stubStatus(400, "{\"code\":\"invalid_parameter\",\"message\":\"" + BREVO_MESSAGE + "\"}");
+        ch.qos.logback.classic.Logger logger =
+                (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(BrevoApiMailSender.class);
+        ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> appender =
+                new ch.qos.logback.core.read.ListAppender<>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            MimeMessage message = message();
+
+            catchThrowable(() -> sender.send(message));
+
+            assertThat(appender.list).filteredOn(e -> e.getLevel() == ch.qos.logback.classic.Level.ERROR)
+                    .singleElement().satisfies(e -> {
+                        assertThat(e.getMessage()).isEqualTo(
+                                com.beautica.common.observability.ExternalCallFailure.MESSAGE);
+                        assertThat(e.getFormattedMessage()).isEqualTo("External call failed service=brevo-api op=send "
+                                + "http=400 reason=invalid_parameter to=- detail=echoed [email] is invalid");
+                    });
+            assertThat(appender.list).noneMatch(e -> e.getLevel() == ch.qos.logback.classic.Level.WARN);
+        } finally {
+            logger.detachAppender(appender);
+        }
+    }
+
+    private java.util.List<String> errorLinesFor(int status, String body) throws Exception {
+        stubStatus(status, body);
+        ch.qos.logback.classic.Logger logger =
+                (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(BrevoApiMailSender.class);
+        ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> appender =
+                new ch.qos.logback.core.read.ListAppender<>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            MimeMessage message = message();
+
+            catchThrowable(() -> sender.send(message));
+
+            return appender.list.stream().filter(e -> e.getLevel() == ch.qos.logback.classic.Level.ERROR)
+                    .map(ch.qos.logback.classic.spi.ILoggingEvent::getFormattedMessage).toList();
+        } finally {
+            logger.detachAppender(appender);
+        }
+    }
+
+    @Test
+    @DisplayName("audit-fix 441: a non-string message (unexpected JSON shape) is never echoed — only its length — so an "
+            + "escaped guest cancel link cannot slip past the redactor")
+    void should_logOnlyLength_when_messageIsNotAString() throws Exception {
+        String message = "{\"link\":\"https:\\/\\/beautica.app\\/c\\/AbCdEfGh12345678\"}";
+
+        java.util.List<String> lines = errorLinesFor(400, "{\"code\":\"invalid_parameter\",\"message\":" + message + "}");
+
+        assertThat(lines).singleElement().satisfies(line -> assertThat(line)
+                .startsWith("External call failed service=brevo-api op=send http=400 reason=invalid_parameter to=- "
+                        + "detail=unparsed(len=")
+                .doesNotContain("AbCdEfGh").doesNotContain("beautica.app"));
+    }
+
+    @Test
+    @DisplayName("audit-fix 441 (INFO): an address without a TLD in Brevo's message is redacted too")
+    void should_redactTldLessAddress_when_brevoMessageEchoesIt() throws Exception {
+        java.util.List<String> lines =
+                errorLinesFor(400, "{\"code\":\"invalid_parameter\",\"message\":\"email olena@localhost is invalid\"}");
+
+        assertThat(lines).singleElement().satisfies(line -> assertThat(line)
+                .endsWith("detail=email [email] is invalid").doesNotContain("olena"));
     }
 
     @Test

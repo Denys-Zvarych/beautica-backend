@@ -4,6 +4,7 @@ import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
+import com.beautica.common.observability.ExternalCallFailure;
 import com.beautica.config.TurbosmsProperties;
 import com.github.tomakehurst.wiremock.WireMockServer;
 import org.junit.jupiter.api.AfterEach;
@@ -17,12 +18,15 @@ import org.springframework.web.client.RestClient;
 
 import java.net.ServerSocket;
 import java.time.Duration;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
 import static com.github.tomakehurst.wiremock.client.WireMock.absent;
 import static com.github.tomakehurst.wiremock.client.WireMock.containing;
 import static com.github.tomakehurst.wiremock.client.WireMock.equalTo;
 import static com.github.tomakehurst.wiremock.client.WireMock.equalToJson;
+import static com.github.tomakehurst.wiremock.client.WireMock.lessThanOrExactly;
 import static com.github.tomakehurst.wiremock.client.WireMock.post;
 import static com.github.tomakehurst.wiremock.client.WireMock.postRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.urlEqualTo;
@@ -156,14 +160,45 @@ class TurbosmsServiceTest {
         props.setToken(TOKEN);
         props.setBaseUrl(wireMock.baseUrl() + PATH);
         props.setReadTimeout(Duration.ofMillis(300));
-        TurbosmsService shortTimeout = new TurbosmsService(RestClient.builder(), props);
+        // Attempts are counted client-side: Spring's JDK read-timeout clock starts at sendAsync, so on a cold JVM the
+        // 300 ms can expire before the request reaches WireMock — a server-side "exactly 1" count races. The client
+        // count is deterministic and is the invariant under test (the send is never repeated).
+        AtomicInteger attempts = new AtomicInteger();
+        RestClient.Builder counting = RestClient.builder().requestInterceptor((request, body, execution) -> {
+            attempts.incrementAndGet();
+            return execution.execute(request, body);
+        });
+        TurbosmsService shortTimeout = new TurbosmsService(counting, props);
         wireMock.stubFor(post(urlEqualTo(PATH))
                 .willReturn(aResponse().withStatus(200).withFixedDelay(2000)
                         .withBody("{\"response_status\":\"OK\"}")));
 
         assertThatThrownBy(() -> shortTimeout.send(PHONE, OTP_TEXT))
                 .isInstanceOf(SmsDeliveryAmbiguousException.class);
-        wireMock.verify(1, postRequestedFor(urlEqualTo(PATH)));
+        assertThat(attempts).hasValue(1);
+        wireMock.verify(lessThanOrExactly(1), postRequestedFor(urlEqualTo(PATH)));
+    }
+
+    @Test
+    @Timeout(5)
+    @DisplayName("a bare CancellationException from the client call (JDK-client read-timeout race) is ambiguous")
+    void should_throwAmbiguous_when_clientCallThrowsBareCancellation() {
+        RestClient.Builder cancelling = RestClient.builder().requestInterceptor((request, body, execution) -> {
+            throw new CancellationException();
+        });
+        TurbosmsProperties props = new TurbosmsProperties();
+        props.setToken(TOKEN);
+        props.setBaseUrl(wireMock.baseUrl() + PATH);
+        TurbosmsService cancelled = new TurbosmsService(cancelling, props);
+
+        Throwable thrown = org.assertj.core.api.Assertions.catchThrowable(() -> cancelled.send(PHONE, OTP_TEXT));
+
+        assertThat(thrown).isInstanceOf(SmsDeliveryAmbiguousException.class)
+                .hasMessage("SMS delivery outcome unknown")
+                .hasCauseInstanceOf(CancellationException.class);
+        assertThat(logAppender.list).filteredOn(e -> e.getLevel() == Level.ERROR).singleElement()
+                .satisfies(e -> assertThat(e.getFormattedMessage())
+                        .startsWith("External call failed service=turbosms op=send http=- reason=timeout"));
     }
 
     @Test
@@ -253,6 +288,63 @@ class TurbosmsServiceTest {
         assertThat(allLogs).doesNotContain("482913");
         assertThat(allLogs).doesNotContain(PHONE);
         assertThat(allLogs).contains("+380***4567");
+    }
+
+    // ── phase 441: every failed call is ONE ERROR ───────────────────────────
+
+    @Test
+    @DisplayName("phase 441: a 4xx is ONE ERROR with the stable template and Turbosms' response_status as detail")
+    void should_logOneErrorWithResponseStatus_when_responseIs4xx() {
+        wireMock.stubFor(post(urlEqualTo(PATH)).willReturn(aResponse().withStatus(400)
+                .withHeader("Content-Type", "application/json")
+                .withBody("{\"response_code\":800,\"response_status\":\"NOT_ALLOWED_RECIPIENT\",\"echo\":\""
+                        + OTP_TEXT + "\"}")));
+
+        assertThatThrownBy(() -> service.send(PHONE, OTP_TEXT)).isInstanceOf(SmsDeliveryException.class);
+
+        assertThat(logAppender.list).filteredOn(e -> e.getLevel() == Level.ERROR).singleElement()
+                .satisfies(e -> {
+                    assertThat(e.getMessage()).isEqualTo(ExternalCallFailure.MESSAGE);
+                    assertThat(e.getFormattedMessage()).isEqualTo("External call failed service=turbosms op=send "
+                            + "http=400 reason=http_400 to=+380***4567 detail=NOT_ALLOWED_RECIPIENT");
+                });
+        assertThat(logAppender.list).noneMatch(e -> e.getLevel() == Level.WARN);
+        assertThat(renderLogs()).doesNotContain(OTP_TEXT).doesNotContain(TOKEN).doesNotContain(PHONE);
+    }
+
+    @Test
+    @Timeout(5)
+    @DisplayName("phase 441: a read timeout is ONE ERROR reason=timeout with the exception attached")
+    void should_logOneErrorWithException_when_readTimesOut() {
+        TurbosmsProperties props = new TurbosmsProperties();
+        props.setToken(TOKEN);
+        props.setBaseUrl(wireMock.baseUrl() + PATH);
+        props.setReadTimeout(Duration.ofMillis(300));
+        TurbosmsService shortTimeout = new TurbosmsService(RestClient.builder(), props);
+        wireMock.stubFor(post(urlEqualTo(PATH)).willReturn(aResponse().withStatus(200).withFixedDelay(2000)));
+
+        assertThatThrownBy(() -> shortTimeout.send(PHONE, OTP_TEXT)).isInstanceOf(SmsDeliveryAmbiguousException.class);
+
+        assertThat(logAppender.list).filteredOn(e -> e.getLevel() == Level.ERROR).singleElement()
+                .satisfies(e -> {
+                    assertThat(e.getFormattedMessage())
+                            .startsWith("External call failed service=turbosms op=send http=- reason=timeout");
+                    assertThat(e.getThrowableProxy()).isNotNull();
+                });
+    }
+
+    @Test
+    @DisplayName("phase 441: a blank token is ONE ERROR reason=not_configured, with no HTTP call")
+    void should_logNotConfiguredError_when_tokenIsBlank() {
+        TurbosmsProperties blank = new TurbosmsProperties();
+        blank.setToken(" ");
+        blank.setBaseUrl(wireMock.baseUrl() + PATH);
+
+        assertThatThrownBy(() -> new TurbosmsService(RestClient.builder(), blank).send(PHONE, OTP_TEXT))
+                .isInstanceOf(SmsDeliveryException.class);
+
+        assertThat(logAppender.list).filteredOn(e -> e.getLevel() == Level.ERROR).singleElement()
+                .satisfies(e -> assertThat(e.getFormattedMessage()).contains("reason=not_configured"));
     }
 
     @Test

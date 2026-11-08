@@ -1,5 +1,6 @@
 package com.beautica.notification.telegram;
 
+import com.beautica.notification.mail.MailSendFailures;
 import jakarta.mail.MessagingException;
 import jakarta.mail.internet.MimeMessage;
 import lombok.extern.slf4j.Slf4j;
@@ -43,6 +44,10 @@ public final class CapturingTelegramMessenger implements TelegramMessenger {
             helper.setText(text, false);
             mailSender.send(message);
         } catch (MailException | MessagingException e) {
+            if (e instanceof MailException mailFailure) {
+                // Phase 441: the failed capture-mail send is one ERROR (MailSendFailures); the line below stays WARN.
+                MailSendFailures.log(log, "telegram-capture", mailFailure);
+            }
             log.warn("event=telegram_send outcome=transient status=capture cause={}", e.getClass().getSimpleName());
             throw new TelegramDeliveryException("Telegram capture mail failed: " + e.getClass().getSimpleName());
         }

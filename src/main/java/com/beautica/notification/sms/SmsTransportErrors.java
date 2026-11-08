@@ -55,8 +55,8 @@ final class SmsTransportErrors {
     }
 
     /**
-     * Phase 439 audit cycle 2 — {@link #isOutcomeUnknown(RuntimeException)} plus one additive guard, used only by
-     * {@link SmsClubService} (TurboSMS keeps the single-argument form unchanged).
+     * Phase 439 audit cycle 2 — {@link #isOutcomeUnknown(RuntimeException)} plus one additive guard, used by both
+     * {@link SmsClubService} and {@link TurbosmsService} (TurboSMS switched to it in phase 441).
      *
      * <p>Spring 6.2.6 {@code JdkClientHttpRequest} enforces the read timeout by cancelling the response future; when
      * the cancel wins the race, {@code future.get()} throws a bare {@link CancellationException} that RestClient does

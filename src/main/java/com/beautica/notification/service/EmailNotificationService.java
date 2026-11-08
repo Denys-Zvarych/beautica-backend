@@ -4,6 +4,7 @@ import com.beautica.booking.entity.Booking;
 import com.beautica.common.util.SchemeGuard;
 import com.beautica.master.entity.Master;
 import com.beautica.notification.mail.BrevoPermanentMailException;
+import com.beautica.notification.mail.MailSendFailures;
 import com.beautica.notification.mail.MailTransportProperties;
 import com.beautica.user.User;
 import jakarta.mail.MessagingException;
@@ -397,7 +398,10 @@ public class EmailNotificationService {
             addLogo(helper);
 
             mailSender.send(helper.getMimeMessage());
-        } catch (MessagingException | MailException e) {
+        } catch (MailException e) {
+            // Non-fatal: the user can request a new code. Phase 441: one ERROR at the transport (MailSendFailures).
+            MailSendFailures.log(log, "email/reset-password-otp", e);
+        } catch (MessagingException e) {
             // Non-fatal: delivery failure is acceptable; the user can request a new code.
             // The email is PII — never log it. Log template + exception type only.
             log.error("sendPasswordResetOtpEmail failed: template=email/reset-password-otp exception={}",
@@ -421,7 +425,10 @@ public class EmailNotificationService {
             addLogo(helper);
 
             mailSender.send(helper.getMimeMessage());
-        } catch (MessagingException | MailException e) {
+        } catch (MailException e) {
+            // Phase 441: one ERROR at the transport (MailSendFailures).
+            MailSendFailures.log(log, "email/verify-email", e);
+        } catch (MessagingException e) {
             log.error("sendVerificationEmail failed: template=email/verify-email exception={}", e.getClass().getSimpleName());
             // delivery failure is non-fatal — caller retries via resend endpoint
         }
@@ -503,9 +510,14 @@ public class EmailNotificationService {
         } catch (BrevoPermanentMailException ex) {
             // Phase 374 D5: the Brevo API rejected THIS message (bad parameter, unconvertible MIME). Not evidence
             // the provider is down, so it must not feed the e-mail breaker. Never thrown on the SMTP path.
-            log.error("Failed to send email [template={}]: {}", template, ex.getClass().getSimpleName());
+            // Phase 441: BrevoApiMailSender already logged the ERROR; this is the WARN re-map.
+            MailSendFailures.log(log, template, ex);
             throw new EmailDeliveryException(template, false);
-        } catch (MessagingException | MailException ex) {
+        } catch (MailException ex) {
+            // Phase 441: one ERROR per failed send at the transport (MailSendFailures); 'to' is never logged.
+            MailSendFailures.log(log, template, ex);
+            throw new EmailDeliveryException(template, true);
+        } catch (MessagingException ex) {
             // 'to' is PII — never log it. Log template + exception type only.
             log.error("Failed to send email [template={}]: {}", template, ex.getClass().getSimpleName());
             // Propagate (no cause, no message echo): the outbox drain worker must take its

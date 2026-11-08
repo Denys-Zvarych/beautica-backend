@@ -20,11 +20,16 @@ public class SentryOptionsConfig {
 
     static final String IN_APP_PACKAGE = "com.beautica";
 
-    /** Client disconnects are not server faults: they never become events. */
+    /**
+     * Client disconnects are not server faults: they never become events. The {@link ExternalCallFailure} MDC keys
+     * become Sentry tags, which {@link ExternalCallSentryThrottle} reads to fingerprint and budget the event.
+     */
     @Bean
     public Sentry.OptionsConfiguration<SentryOptions> beauticaSentryOptions() {
         return options -> {
             options.addInAppInclude(IN_APP_PACKAGE);
+            options.addContextTag(ExternalCallFailure.TAG_SERVICE);
+            options.addContextTag(ExternalCallFailure.TAG_REASON);
             options.addIgnoredExceptionForType(ClientAbortException.class);
             options.addIgnoredExceptionForType(AsyncRequestNotUsableException.class);
         };

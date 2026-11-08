@@ -3,6 +3,7 @@ package com.beautica.auth.turnstile;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ServiceUnavailableMessages;
 import com.beautica.common.exception.TurnstileRejectedException;
+import com.beautica.common.observability.ExternalCallFailure;
 import com.beautica.config.OutboundTimeouts;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
@@ -30,6 +31,12 @@ import java.util.Set;
  * followed, explicit connect/read timeouts, no retry (a replayed token is {@code timeout-or-duplicate}).
  * Timeouts are connect 2s + read 2s (a request waits at most ~4s before failing closed). <b>Secrets:</b> neither the secret nor the token is logged or put in an exception message; a rejection
  * logs Cloudflare's {@code error-codes} only.
+ *
+ * <p><b>Failures are ERROR (phase 441).</b> A failed siteverify call — timeout, I/O, non-2xx, empty body — and a
+ * {@code success:false} carrying a server-side code ({@link #SERVICE_SIDE_ERROR_CODES}: wrong/missing secret, bad
+ * request, Cloudflare internal error) log ONE {@link ExternalCallFailure} ERROR ({@code service=turnstile}). A
+ * visitor-side rejection ({@code invalid-input-response}, {@code timeout-or-duplicate}, hostname/action mismatch) is a
+ * successful call whose answer is "check failed" — it stays WARN.
  */
 @Slf4j
 @Component
@@ -37,6 +44,11 @@ public class TurnstileVerifier {
 
     /** Cloudflare caps a Turnstile token at 2048 characters. */
     static final int MAX_TOKEN_LENGTH = 2048;
+    /** Siteverify {@code error-codes} that mean our call was broken, not the visitor's token (phase 441). */
+    static final Set<String> SERVICE_SIDE_ERROR_CODES =
+            Set.of("missing-input-secret", "invalid-input-secret", "bad-request", "internal-error");
+    private static final String SERVICE = "turnstile";
+    private static final String OP_VERIFY = "verify";
 
     private final TurnstileProperties properties;
     private final RestClient restClient;
@@ -86,7 +98,11 @@ public class TurnstileVerifier {
         }
         TurnstileSiteverifyResponse answer = callSiteverify(token, remoteIp);
         if (!answer.success()) {
-            log.warn("turnstile rejected codes={}", answer.errorCodes() == null ? List.of() : answer.errorCodes());
+            List<String> codes = answer.errorCodes() == null ? List.of() : answer.errorCodes();
+            codes.stream().filter(SERVICE_SIDE_ERROR_CODES::contains).findFirst().ifPresent(code ->
+                    // Phase 441: a secret/request/provider-side code means the CALL failed, not the visitor → ERROR.
+                    failure().http(HttpStatus.OK.value()).reason(code).detail(String.join(",", codes)).log(log));
+            log.warn("turnstile rejected codes={}", codes);
             throw new TurnstileRejectedException();
         }
         if (!expectedHostnames.isEmpty() && !expectedHostnames.contains(answer.hostname())) {
@@ -115,7 +131,9 @@ public class TurnstileVerifier {
                     .body(form)
                     .retrieve()
                     .onStatus(status -> !status.is2xxSuccessful(), (req, res) -> {
-                        throw unavailable("status=" + res.getStatusCode().value());
+                        int code = res.getStatusCode().value();
+                        failure().http(code).reason("http_" + code).log(log);
+                        throw unavailable("status=" + code);
                     })
                     .body(TurnstileSiteverifyResponse.class);
         } catch (BusinessException e) {
@@ -123,16 +141,25 @@ public class TurnstileVerifier {
         } catch (RuntimeException e) {
             // Translating, never swallowing: ANY failure to obtain a usable answer must fail CLOSED as a 503.
             // That includes the JDK client's read timeout, which surfaces as a bare CancellationException
-            // (not a RestClientException), plus connect errors and body-conversion failures. Only the
-            // exception TYPE is logged: the message could carry the URL, and the request holds the secret.
+            // (not a RestClientException), plus connect errors and body-conversion failures. The secret travels in
+            // the form body, which RestClient's exceptions never echo; the URL is the public siteverify endpoint.
+            failure().reason(ExternalCallFailure.transportReason(e))
+                    .detail(ExternalCallFailure.rootCauseName(e)).log(log, e);
             throw unavailable("cause=" + e.getClass().getSimpleName());
         }
         if (answer == null) {
+            failure().http(HttpStatus.OK.value()).reason(ExternalCallFailure.UNREADABLE_RESPONSE)
+                    .detail("empty body").log(log);
             throw unavailable("cause=empty-body");
         }
         return answer;
     }
 
+    private static ExternalCallFailure failure() {
+        return ExternalCallFailure.of(SERVICE, OP_VERIFY);
+    }
+
+    /** The ERROR line was already logged by the caller (phase 441); this WARN keeps the 503 mapping visible. */
     private static BusinessException unavailable(String reason) {
         log.warn("turnstile siteverify unavailable {}", reason);
         return new BusinessException(HttpStatus.SERVICE_UNAVAILABLE, ServiceUnavailableMessages.TURNSTILE_UNAVAILABLE);

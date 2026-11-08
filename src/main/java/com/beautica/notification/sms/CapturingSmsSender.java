@@ -1,5 +1,6 @@
 package com.beautica.notification.sms;
 
+import com.beautica.notification.mail.MailSendFailures;
 import jakarta.mail.internet.MimeMessage;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.mail.MailException;
@@ -64,6 +65,10 @@ public final class CapturingSmsSender {
             helper.setText(text == null ? "" : text, false);
             mailSender.send(message);
         } catch (MailException | jakarta.mail.MessagingException e) {
+            if (e instanceof MailException mailFailure) {
+                // Phase 441: the failed capture-mail send is one ERROR (MailSendFailures).
+                MailSendFailures.log(log, "sms-capture", mailFailure);
+            }
             throw new SmsDeliveryException("SMS capture mail failed: " + e.getClass().getSimpleName(), e);
         }
         log.info("SMS captured to mail to={}", PhoneMask.mask(phoneE164));

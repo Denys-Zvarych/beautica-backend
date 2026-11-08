@@ -1,11 +1,16 @@
 package com.beautica.notification.sms;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import jakarta.mail.Message;
 import jakarta.mail.Session;
 import jakarta.mail.internet.MimeMessage;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.slf4j.LoggerFactory;
 import org.springframework.mail.MailSendException;
 import org.springframework.mail.javamail.JavaMailSender;
 
@@ -98,5 +103,30 @@ class CapturingSmsSenderTest {
         assertThatThrownBy(() -> sender.send(null, "x")).isInstanceOf(SmsDeliveryException.class);
 
         verify(mailSender, never()).send(any(MimeMessage.class));
+    }
+
+    @Test
+    @DisplayName("phase 441: capture-mail SMTP failure — exactly one brevo-smtp ERROR (context sms-capture), no phone, still throws")
+    void should_logOneBrevoSmtpError_when_captureMailSendFails() {
+        stubMessage();
+        doThrow(new MailSendException("550 rejected sms+380671234567@capture")).when(mailSender).send(any(MimeMessage.class));
+        Logger senderLogger = (Logger) LoggerFactory.getLogger(CapturingSmsSender.class);
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        senderLogger.addAppender(appender);
+
+        try {
+            assertThatThrownBy(() -> sender.send("+380671234567", "Beautica: 123456"))
+                    .isInstanceOf(SmsDeliveryException.class);
+        } finally {
+            senderLogger.detachAppender(appender);
+            appender.stop();
+        }
+
+        assertThat(appender.list).filteredOn(e -> e.getLevel() == Level.ERROR).singleElement()
+                .extracting(ILoggingEvent::getFormattedMessage)
+                .isEqualTo("External call failed service=brevo-smtp op=send http=- reason=rejected to=- "
+                        + "detail=sms-capture MailSendException");
+        assertThat(appender.list).noneMatch(e -> e.getFormattedMessage().contains("380671234567"));
     }
 }

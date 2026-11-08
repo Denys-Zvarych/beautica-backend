@@ -1,6 +1,7 @@
 package com.beautica.notification;
 
 import com.beautica.moderation.dto.ContentReportEmailModel;
+import com.beautica.notification.mail.MailSendFailures;
 import com.beautica.support.dto.SupportAttachment;
 import jakarta.mail.internet.MimeMessage;
 import org.slf4j.Logger;
@@ -60,7 +61,8 @@ public class EmailService {
             helper.setText(body, false);
             mailSender.send(message);
         } catch (MailException ex) {
-            log.error("Failed to send admin notification email: {}", ex.getClass().getSimpleName());
+            // Phase 441: one ERROR per failed send, logged at the transport call (see MailSendFailures).
+            MailSendFailures.log(log, "admin-notification", ex);
         } catch (Exception ex) {
             log.error("Failed to send admin notification email: {}", ex.getClass().getSimpleName());
         }
@@ -106,7 +108,8 @@ public class EmailService {
             helper.setText(html, true);
             mailSender.send(message);
         } catch (MailException ex) {
-            log.error("Failed to send category-request notification email: {}", ex.getClass().getSimpleName());
+            // Phase 441: one ERROR per failed send, logged at the transport call (see MailSendFailures).
+            MailSendFailures.log(log, "category-request", ex);
         } catch (Exception ex) {
             log.error("Failed to send category-request notification email: {}", ex.getClass().getSimpleName());
         }
@@ -154,7 +157,8 @@ public class EmailService {
             helper.setText(html, true);
             mailSender.send(message);
         } catch (MailException ex) {
-            log.error("Failed to send service-type-suggestion notification email: {}", ex.getClass().getSimpleName());
+            // Phase 441: one ERROR per failed send, logged at the transport call (see MailSendFailures).
+            MailSendFailures.log(log, "service-type-suggestion", ex);
         } catch (Exception ex) {
             log.error("Failed to send service-type-suggestion notification email: {}", ex.getClass().getSimpleName());
         }
@@ -225,8 +229,15 @@ public class EmailService {
             // post-202 send failure would otherwise be silent. Log recipient inbox + sender
             // userId + exception type (no message body, no token bytes — no PII beyond the
             // audit identity already logged at accept time) so the drop is observable.
-            log.error("Failed to send support contact email to {} from user {}: {}",
-                    toEmail, senderUserId, ex.getClass().getSimpleName());
+            if (ex instanceof MailException mailFailure) {
+                // Phase 441: the transport failure is the one ERROR (MailSendFailures); this line is the audit trail.
+                MailSendFailures.log(log, "support-contact", mailFailure);
+                log.warn("Failed to send support contact email to {} from user {}: {}",
+                        toEmail, senderUserId, ex.getClass().getSimpleName());
+            } else {
+                log.error("Failed to send support contact email to {} from user {}: {}",
+                        toEmail, senderUserId, ex.getClass().getSimpleName());
+            }
             return CompletableFuture.failedFuture(ex);
         }
     }
@@ -271,8 +282,15 @@ public class EmailService {
             mailSender.send(message);
             return CompletableFuture.completedFuture(null);
         } catch (Exception ex) {
-            log.error("Failed to send content report email for report {}: {}",
-                    model.reportId(), ex.getClass().getSimpleName());
+            if (ex instanceof MailException mailFailure) {
+                // Phase 441: the transport failure is the one ERROR (MailSendFailures); this line keeps the report id.
+                MailSendFailures.log(log, "content-report", mailFailure);
+                log.warn("Failed to send content report email for report {}: {}",
+                        model.reportId(), ex.getClass().getSimpleName());
+            } else {
+                log.error("Failed to send content report email for report {}: {}",
+                        model.reportId(), ex.getClass().getSimpleName());
+            }
             return CompletableFuture.failedFuture(ex);
         }
     }

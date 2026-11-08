@@ -42,7 +42,8 @@ class SentryPiiScrubberTest {
     private static final String BEARER_CANARY = "abc";
     private static final String NOTE_CANARY = "NOTE-CANARY-371";
 
-    private final SentryPiiScrubber scrubber = new SentryPiiScrubber();
+    private final SentryPiiScrubber scrubber = new SentryPiiScrubber(
+            new ExternalCallSentryThrottle(java.time.Clock.systemUTC(), SentryEventCapture.DEFAULT_LIMITS));
 
     private static SentryException exception(String type, String value) {
         SentryException exception = new SentryException();
