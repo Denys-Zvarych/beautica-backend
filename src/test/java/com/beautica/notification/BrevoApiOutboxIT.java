@@ -209,6 +209,36 @@ class BrevoApiOutboxIT extends AbstractIntegrationTest {
     }
 
     @Test
+    @DisplayName("phase 441: Brevo 503 on an outbox row — exactly one ERROR (brevo-api, at the call); the drain worker re-maps at WARN")
+    void should_logOneErrorOnly_when_outboxDrainHitsBrevo503() {
+        stub(503, "{\"code\":\"x\",\"message\":\"down\"}");
+        UUID row = enqueueInvite("one-zq441@beautica.test", 5);
+        ch.qos.logback.classic.Logger root = (ch.qos.logback.classic.Logger)
+                org.slf4j.LoggerFactory.getLogger(org.slf4j.Logger.ROOT_LOGGER_NAME);
+        var appender = new ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent>();
+        appender.start();
+        root.addAppender(appender);
+
+        try {
+            drainWorker.drain();
+        } finally {
+            root.detachAppender(appender);
+            appender.stop();
+        }
+
+        assertThat(row(row).get("attempts")).isEqualTo(1);
+        assertThat(appender.list)
+                .filteredOn(e -> e.getLevel() == ch.qos.logback.classic.Level.ERROR)
+                .filteredOn(e -> !e.getLoggerName().startsWith("com.beautica.support"))
+                .as("one failed call = one ERROR; outbox / EmailNotificationService only re-map")
+                .singleElement()
+                .satisfies(e -> assertThat(e.getFormattedMessage())
+                        .startsWith("External call failed service=brevo-api op=send http=503 "));
+        assertThat(appender.list).anyMatch(e -> e.getLevel() == ch.qos.logback.classic.Level.WARN
+                && e.getFormattedMessage().startsWith("Outbox dispatch failed"));
+    }
+
+    @Test
     @DisplayName("support contact — attachment and reply-to go out in a single API request")
     void should_sendSupportContactInOneRequest_when_attachmentAndReplyTo() throws Exception {
         stub(201, "{\"messageId\":\"m\"}");

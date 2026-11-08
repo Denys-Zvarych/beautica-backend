@@ -49,7 +49,12 @@ import java.util.Set;
  * otherwise pile up in the shared root scope and be copied into every request's scope (audit-fix cycle 1,
  * perf 8). Request-thread breadcrumbs live in the request's forked scope and die with it.
  *
- * <p>Pure and stateless; never throws a business exception (a failing scrubber would drop the event).
+ * <p><b>External-call events</b> (phase 441 audit-fix) first go through {@link ExternalCallSentryThrottle}: fingerprinted
+ * per (service, reason) and dropped once that key's budget is spent. It lives here, not in a second
+ * {@code BeforeSendCallback} bean, because the starter wires exactly one.
+ *
+ * <p>Stateless apart from the throttle's bounded budget map; never throws a business exception (a failing scrubber
+ * would drop the event).
  * Present only when the Sentry auto-configuration is (a {@code sentry.dsn} property exists).
  */
 @Component
@@ -67,8 +72,17 @@ public class SentryPiiScrubber implements SentryOptions.BeforeSendCallback,
             "DataIntegrityViolationException", "SQLException", "PSQLException",
             "ConstraintViolationException", "JDBCException", "PersistenceException");
 
+    private final ExternalCallSentryThrottle externalCallThrottle;
+
+    public SentryPiiScrubber(ExternalCallSentryThrottle externalCallThrottle) {
+        this.externalCallThrottle = externalCallThrottle;
+    }
+
     @Override
     public SentryEvent execute(SentryEvent event, Hint hint) {
+        if (externalCallThrottle.apply(event) == null) {
+            return null;
+        }
         scrubBase(event);
         event.setTransaction(PiiRedactor.redactPath(event.getTransaction()));
         List<Breadcrumb> breadcrumbs = event.getBreadcrumbs();

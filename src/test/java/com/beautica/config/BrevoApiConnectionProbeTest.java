@@ -79,7 +79,9 @@ class BrevoApiConnectionProbeTest {
 
         assertThat(r401).isEqualTo(BrevoApiConnectionProbe.Result.REJECTED);
         assertThat(r403).isEqualTo(BrevoApiConnectionProbe.Result.REJECTED);
-        assertThat(output.getAll()).contains("rule prod-brevo-api-auth-failed").contains("HTTP 401")
+        // Phase 441: a failed probe is the stable external-call ERROR; the rule token rides in the detail.
+        assertThat(output.getAll()).contains("rule prod-brevo-api-auth-failed")
+                .contains("ERROR").contains("External call failed service=brevo-api op=probe http=401")
                 .doesNotContain(API_KEY).doesNotContain("owner@beautica.app");
     }
 

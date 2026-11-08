@@ -393,7 +393,7 @@ class R2StorageServiceTest {
     // ── MEDIUM-1: enabled-mode error log key redaction ────────────────────────
 
     @Test
-    @DisplayName("ERROR log omits R2 key and contains '[key omitted]' when uploadFile fails in enabled mode")
+    @DisplayName("ERROR log (phase 441 template) omits the R2 key when uploadFile fails in enabled mode")
     void should_omitKeyInErrorLog_when_uploadFailsInEnabledMode() {
         // Arrange
         R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL, purger);
@@ -417,15 +417,16 @@ class R2StorageServiceTest {
         assertThat(errors).as("exactly one ERROR log emitted on upload failure").hasSize(1);
         String formattedMessage = errors.get(0).getFormattedMessage();
         assertThat(formattedMessage)
-                .as("ERROR log must contain '[key omitted]' sentinel")
-                .contains("[key omitted]");
+                .as("phase 441: the stable external-call template, with no key field")
+                .startsWith("External call failed service=r2 op=upload ");
+        assertThat(errors.get(0).getThrowableProxy()).as("SDK exception attached for Sentry").isNotNull();
         assertThat(formattedMessage)
                 .as("ERROR log must not contain the raw R2 key")
                 .doesNotContain("test-key");
     }
 
     @Test
-    @DisplayName("ERROR log omits R2 key and contains '[key omitted]' when deleteFile fails in enabled mode")
+    @DisplayName("ERROR log (phase 441 template) omits the R2 key when deleteFile fails in enabled mode")
     void should_omitKeyInErrorLog_when_deleteFailsInEnabledMode() {
         // Arrange
         R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL, purger);
@@ -448,8 +449,9 @@ class R2StorageServiceTest {
         assertThat(errors).as("exactly one ERROR log emitted on delete failure").hasSize(1);
         String formattedMessage = errors.get(0).getFormattedMessage();
         assertThat(formattedMessage)
-                .as("ERROR log must contain '[key omitted]' sentinel")
-                .contains("[key omitted]");
+                .as("phase 441: the stable external-call template, with no key field")
+                .startsWith("External call failed service=r2 op=delete ");
+        assertThat(errors.get(0).getThrowableProxy()).as("SDK exception attached for Sentry").isNotNull();
         assertThat(formattedMessage)
                 .as("ERROR log must not contain the raw R2 key")
                 .doesNotContain("test-key");

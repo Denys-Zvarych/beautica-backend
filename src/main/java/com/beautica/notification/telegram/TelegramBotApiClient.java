@@ -1,5 +1,6 @@
 package com.beautica.notification.telegram;
 
+import com.beautica.common.observability.ExternalCallFailure;
 import com.beautica.config.TelegramProperties;
 import com.beautica.notification.mail.BrevoRestClients;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -36,6 +37,14 @@ import java.util.regex.Pattern;
  * and chain no cause (Spring's I/O exception message embeds the URL). Log lines are exactly
  * {@code event=telegram_send outcome=<ok|gone|transient> status=<http|none>} — never chat id, never text.
  *
+ * <h2>Failures are ERROR (phase 441)</h2>
+ * A failed request — non-2xx, {@code ok:false}, timeout / I/O, an oversized or unreadable answer — additionally logs
+ * ONE {@link ExternalCallFailure} ERROR line ({@code service=telegram}) with the capped {@code description} as
+ * {@code detail}; the {@code event=telegram_send outcome=transient} WARN line stays as before. The exception is NEVER attached (its message embeds the URL, i.e. the token); the root cause
+ * class name is the {@code detail} instead. Kept non-ERROR: {@code outcome=gone} (403 / chat not found — the guest
+ * blocked the bot; routine, the router marks the link blocked and falls back to SMS) and a {@link TelegramSendGate}
+ * refusal (no request was made).
+ *
  * <h2>Before any request (D4 + audit)</h2>
  * {@link TelegramSendGate}: per-chat 429 back-off, 30-per-second-window global rate limit, {@value TelegramSendGate#MAX_CONCURRENT_SENDS}
  * concurrent requests. A refusal is {@link TelegramDeliveryException} with no HTTP call.
@@ -56,6 +65,8 @@ public class TelegramBotApiClient implements TelegramMessenger {
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final String CHAT_NOT_FOUND = "chat not found";
     private static final String NO_STATUS = "none";
+    private static final String SERVICE = "telegram";
+    private static final String OP_SEND = "send";
     private static final int TOO_MANY_REQUESTS = 429;
     private static final Pattern CONTROL_CHARS = Pattern.compile("\\p{Cntrl}+");
 
@@ -129,6 +140,8 @@ public class TelegramBotApiClient implements TelegramMessenger {
             throw e;
         } catch (RuntimeException e) {
             // Timeout / I/O / serialization. Only the simple class name: the message carries the URL (token).
+            failure().reason(ExternalCallFailure.transportReason(e)).detail(ExternalCallFailure.rootCauseName(e))
+                    .log(log);
             log.warn("event=telegram_send outcome=transient status={} cause={}", NO_STATUS,
                     e.getClass().getSimpleName());
             throw new TelegramDeliveryException("Telegram send failed: " + e.getClass().getSimpleName());
@@ -153,6 +166,7 @@ public class TelegramBotApiClient implements TelegramMessenger {
             JsonNode retryAfter = json.path("parameters").path("retry_after");
             gate.backOff(chatId, retryAfter.isIntegralNumber() ? retryAfter.asLong() : 0);
         }
+        failure().http(status).reason(failureReason(status, json)).detail(description).log(log);
         log.warn("event=telegram_send outcome=transient status={}", status);
         throw new TelegramDeliveryException("Telegram sendMessage failed: HTTP " + status + " (" + description + ")");
     }
@@ -164,6 +178,7 @@ public class TelegramBotApiClient implements TelegramMessenger {
     private static JsonNode readBounded(InputStream body) throws IOException {
         byte[] bytes = body.readNBytes(MAX_RESPONSE_BYTES + 1);
         if (bytes.length > MAX_RESPONSE_BYTES) {
+            failure().reason("oversized_response").log(log);
             log.warn("event=telegram_send outcome=transient status={} cause=oversized_response", NO_STATUS);
             throw new TelegramDeliveryException("Telegram response exceeds " + MAX_RESPONSE_BYTES + " bytes");
         }
@@ -175,6 +190,21 @@ public class TelegramBotApiClient implements TelegramMessenger {
         } catch (IOException e) {
             return null;
         }
+    }
+
+    /** {@code rate_limited}, {@code unreadable_response} / {@code not_ok} for a 2xx, else {@code http_<status>}. */
+    private static String failureReason(int status, JsonNode json) {
+        if (status == TOO_MANY_REQUESTS) {
+            return "rate_limited";
+        }
+        if (status >= 200 && status < 300) {
+            return json == null ? ExternalCallFailure.UNREADABLE_RESPONSE : "not_ok";
+        }
+        return "http_" + status;
+    }
+
+    private static ExternalCallFailure failure() {
+        return ExternalCallFailure.of(SERVICE, OP_SEND);
     }
 
     /** Telegram's {@code description}, single-line and capped; {@code "no description"} when absent. */

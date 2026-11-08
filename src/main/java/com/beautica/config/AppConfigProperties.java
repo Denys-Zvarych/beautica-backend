@@ -4,6 +4,7 @@ import com.beautica.auth.turnstile.TurnstileProperties;
 import com.beautica.booking.closure.ClosureReminderProperties;
 import com.beautica.booking.crypto.GuestCancelTokenCipherProperties;
 import com.beautica.booking.retention.GuestPiiRetentionProperties;
+import com.beautica.common.observability.ExternalCallSentryLimitProperties;
 import com.beautica.moderation.config.ModerationActionLinkProperties;
 import com.beautica.moderation.config.ModerationProperties;
 import com.beautica.notification.crypto.OutboxCipherProperties;
@@ -40,7 +41,8 @@ import org.springframework.context.annotation.Configuration;
         ModerationActionLinkProperties.class,
         ReviewInviteProperties.class,
         CloudflareCdnProperties.class,
-        ClientVersionProperties.class
+        ClientVersionProperties.class,
+        ExternalCallSentryLimitProperties.class
 })
 public class AppConfigProperties {
 }

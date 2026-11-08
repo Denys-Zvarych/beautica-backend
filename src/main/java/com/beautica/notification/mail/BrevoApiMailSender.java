@@ -1,6 +1,8 @@
 package com.beautica.notification.mail;
 
+import com.beautica.common.observability.ExternalCallFailure;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -33,9 +35,15 @@ import java.util.Properties;
  * account-side codes → {@link BrevoTransientMailException} (retry + breaker); any other 4xx and local conversion
  * failures → {@link BrevoPermanentMailException}.
  *
- * <p><b>Redaction.</b> Exceptions read {@code "Brevo API HTTP <status> code=<whitelisted code>"}. The Brevo
- * {@code message} (can echo the recipient), bodies, recipients and the api-key never reach a log line or an
- * exception. {@code messageId} is logged at DEBUG only. Not a component: {@link MailTransportConfig} registers it
+ * <p><b>Redaction.</b> Exceptions read {@code "Brevo API HTTP <status> code=<whitelisted code>"}. Bodies, recipients
+ * and the api-key never reach a log line or an exception. {@code messageId} is logged at DEBUG only.
+ *
+ * <p><b>Failures are ERROR (phase 441).</b> Every failed {@code POST} — non-2xx, timeout / I/O, unreadable answer —
+ * logs ONE {@link ExternalCallFailure} line ({@code service=brevo-api op=send}). A non-2xx carries the whitelisted
+ * {@code code} as {@code reason} and Brevo's {@code message} as {@code detail}, passed through
+ * {@link com.beautica.common.observability.PiiRedactor} (it can echo the recipient address) and capped; the message
+ * still never enters an exception or {@code last_error}. Callers above log WARN only. A local MIME conversion
+ * failure is not an external call and stays WARN. Not a component: {@link MailTransportConfig} registers it
  * only when {@code app.mail.transport=brevo-api}.
  */
 @Slf4j
@@ -47,6 +55,8 @@ public class BrevoApiMailSender implements JavaMailSender {
     private static final int MAX_ERROR_BODY_BYTES = 4096;
     private static final int TOO_MANY_REQUESTS = 429;
     private static final int PAYMENT_REQUIRED = 402;
+    /** Not a Brevo code, so {@link BrevoErrorCode#parse} maps it to {@link BrevoErrorCode#OTHER}. */
+    private static final String UNREADABLE_CODE = "unreadable";
     private static final ObjectMapper ERROR_READER = new ObjectMapper();
 
     private final RestClient restClient;
@@ -109,32 +119,48 @@ public class BrevoApiMailSender implements JavaMailSender {
     }
 
     private void sendOne(MimeMessage message) {
+        BrevoEmailRequest request;
         try {
-            BrevoEmailRequest request = MimeToBrevoPayloadMapper.map(message, properties.senderName());
-            SendResponse response = post(request);
-            success.increment();
-            log.debug("Brevo API accepted messageId={}", response == null ? null : response.messageId());
+            request = MimeToBrevoPayloadMapper.map(message, properties.senderName());
         } catch (BrevoPermanentMailException e) {
+            // Local conversion failure: no request was made, so this is not an external-call failure.
             permanentFailure.increment();
             log.warn("Brevo API send failed permanently: {}", e.getMessage());
             throw e;
-        } catch (BrevoTransientMailException e) {
-            transientFailure.increment();
-            log.warn("Brevo API send failed transiently: {}", e.getMessage());
-            throw e;
         } catch (RuntimeException e) {
-            if (BrevoRestClients.isTransportFailure(e)) {
-                // Network / timeout, however the JDK client surfaces it (ResourceAccessException, or a bare
-                // CancellationException when the read timeout cancels the response future) — provider-side.
-                transientFailure.increment();
-                log.warn("Brevo API send failed transiently: I/O {}", rootCauseName(e));
-                throw new BrevoTransientMailException("Brevo API I/O failure " + rootCauseName(e));
-            }
-            // Serialization / unexpected client error — local, not evidence the provider is down.
+            // Unexpected local mapping failure — same outcome as before phase 441 (permanent), still not a call.
             permanentFailure.increment();
             log.warn("Brevo API send failed permanently: {}", e.getClass().getSimpleName());
             throw new BrevoPermanentMailException("Brevo API client failure " + e.getClass().getSimpleName());
         }
+        try {
+            SendResponse response = post(request);
+            success.increment();
+            log.debug("Brevo API accepted messageId={}", response == null ? null : response.messageId());
+        } catch (BrevoPermanentMailException e) {
+            // Already logged at ERROR by the status handler, with Brevo's redacted message.
+            permanentFailure.increment();
+            throw e;
+        } catch (BrevoTransientMailException e) {
+            transientFailure.increment();
+            throw e;
+        } catch (RuntimeException e) {
+            // The URL carries no secret (api-key header) and RestClient never echoes the request body.
+            failure().reason(ExternalCallFailure.transportReason(e)).detail(rootCauseName(e)).log(log, e);
+            if (BrevoRestClients.isTransportFailure(e)) {
+                // Network / timeout, however the JDK client surfaces it (ResourceAccessException, or a bare
+                // CancellationException when the read timeout cancels the response future) — provider-side.
+                transientFailure.increment();
+                throw new BrevoTransientMailException("Brevo API I/O failure " + rootCauseName(e));
+            }
+            // Serialization / unexpected client error — local, not evidence the provider is down.
+            permanentFailure.increment();
+            throw new BrevoPermanentMailException("Brevo API client failure " + e.getClass().getSimpleName());
+        }
+    }
+
+    private static ExternalCallFailure failure() {
+        return ExternalCallFailure.of("brevo-api", "send");
     }
 
     /** Plain sends keep the 10 s budget; only a send carrying attachments gets the longer one. */
@@ -151,7 +177,11 @@ public class BrevoApiMailSender implements JavaMailSender {
                 .body(request)
                 .retrieve()
                 .onStatus(status -> !status.is2xxSuccessful(), (req, res) -> {
-                    throw classify(res.getStatusCode(), readCode(res));
+                    ErrorBody error = readError(res);
+                    BrevoErrorCode code = BrevoErrorCode.parse(error.code());
+                    failure().http(res.getStatusCode().value()).reason(code.token())
+                            .detail(error.messageText()).log(log);
+                    throw classify(res.getStatusCode(), code);
                 })
                 .body(SendResponse.class);
     }
@@ -165,16 +195,21 @@ public class BrevoApiMailSender implements JavaMailSender {
         return systemSide ? new BrevoTransientMailException(message) : new BrevoPermanentMailException(message);
     }
 
-    /** Reads the {@code code} field only, from a size-capped body; the {@code message} is discarded unread. */
-    static BrevoErrorCode readCode(ClientHttpResponse response) {
+    /**
+     * Reads {@code code} and {@code message} from a size-capped body. {@code code} is mapped through the
+     * {@link BrevoErrorCode} whitelist; {@code message} only ever reaches the redacted log {@code detail}.
+     * An empty body yields a {@code null} code ({@link BrevoErrorCode#NONE}); an unreadable one {@code "unreadable"}
+     * ({@link BrevoErrorCode#OTHER}).
+     */
+    static ErrorBody readError(ClientHttpResponse response) {
         try (InputStream body = response.getBody()) {
             byte[] bytes = body.readNBytes(MAX_ERROR_BODY_BYTES);
             if (bytes.length == 0) {
-                return BrevoErrorCode.NONE;
+                return new ErrorBody(null, null);
             }
-            return BrevoErrorCode.parse(ERROR_READER.readValue(bytes, ErrorBody.class).code());
+            return ERROR_READER.readValue(bytes, ErrorBody.class);
         } catch (IOException | RuntimeException e) {
-            return BrevoErrorCode.OTHER;
+            return new ErrorBody(UNREADABLE_CODE, null);
         }
     }
 
@@ -186,9 +221,20 @@ public class BrevoApiMailSender implements JavaMailSender {
         return root.getClass().getSimpleName();
     }
 
-    /** Only {@code code} is bound; {@code message} is ignored on purpose. */
+    /** {@code code} (whitelisted) and {@code message} (redacted log detail only); everything else is ignored. */
     @JsonIgnoreProperties(ignoreUnknown = true)
-    record ErrorBody(String code) {
+    record ErrorBody(String code, JsonNode message) {
+
+        /**
+         * The message when it is a JSON scalar (decoded text). An object/array is never echoed — only its length
+         * (audit-fix cycle 1, security: raw JSON can carry escaped secrets the redactor cannot see).
+         */
+        String messageText() {
+            if (message == null || message.isNull()) {
+                return null;
+            }
+            return message.isValueNode() ? message.asText() : "unparsed(len=" + message.toString().length() + ")";
+        }
     }
 
     @JsonIgnoreProperties(ignoreUnknown = true)

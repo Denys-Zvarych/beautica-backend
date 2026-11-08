@@ -10,7 +10,7 @@ public enum SmsMode {
     /** Mail each SMS to a Mailpit inbox; nothing reaches the provider. Staging only. */
     CAPTURE,
     /**
-     * The paid SMSClub provider (Phase 439, alpha-name BEAUTY). Allowed in prod; on staging only as an opt-in
+     * The paid SMSClub provider (Phase 439, alpha-name Beauty, case-sensitive). Allowed in prod; on staging only as an opt-in
      * real-phone test ({@code EnvironmentFingerprintGuard}).
      */
     SMSCLUB

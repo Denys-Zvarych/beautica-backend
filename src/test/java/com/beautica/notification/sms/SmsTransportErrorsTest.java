@@ -117,7 +117,7 @@ class SmsTransportErrorsTest {
     }
 
     @Test
-    @DisplayName("isOutcomeUnknown (TurboSMS path) is unchanged: a bare CancellationException is not ambiguous")
+    @DisplayName("isOutcomeUnknown (single-argument form) does not treat a bare CancellationException as ambiguous")
     void should_keepTurbosmsClassificationUnchanged_when_bareCancellationIsThrown() {
         CancellationException cancelled = new CancellationException();
 

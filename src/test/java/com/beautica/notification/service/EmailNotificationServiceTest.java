@@ -1412,4 +1412,84 @@ class EmailNotificationServiceTest {
     private User buildUser(String email, String firstName) {
         return new User(email, "hash", Role.CLIENT, firstName, "Test", null);
     }
+
+    // ── phase 441: ERROR level at every MailSendFailures call site ───────────────
+
+    private java.util.List<ch.qos.logback.classic.spi.ILoggingEvent> logsOf(Runnable action) {
+        ch.qos.logback.classic.Logger serviceLogger = (ch.qos.logback.classic.Logger)
+                org.slf4j.LoggerFactory.getLogger(EmailNotificationService.class);
+        var appender = new ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent>();
+        appender.start();
+        serviceLogger.addAppender(appender);
+        try {
+            action.run();
+        } finally {
+            serviceLogger.detachAppender(appender);
+            appender.stop();
+        }
+        return appender.list;
+    }
+
+    private void stubSendFailure(RuntimeException failure) {
+        when(mailSender.createMimeMessage()).thenReturn(new MimeMessage(Session.getInstance(new Properties())));
+        when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>x</html>");
+        doThrow(failure).when(mailSender).send(any(MimeMessage.class));
+    }
+
+    private static java.util.List<String> errorLines(java.util.List<ch.qos.logback.classic.spi.ILoggingEvent> events) {
+        return events.stream().filter(e -> e.getLevel() == ch.qos.logback.classic.Level.ERROR)
+                .map(ch.qos.logback.classic.spi.ILoggingEvent::getFormattedMessage).toList();
+    }
+
+    @Test
+    @DisplayName("phase 441: password-reset OTP SMTP failure — exactly one brevo-smtp ERROR, no address")
+    void should_logOneBrevoSmtpError_when_passwordResetOtpSendFails() {
+        stubSendFailure(new MailSendException("550 rejected u441@example.com"));
+        User user = mock(User.class);
+        when(user.getEmail()).thenReturn("u441@example.com");
+
+        var events = logsOf(() -> service.sendPasswordResetOtpEmail(user, "123456"));
+
+        assertThat(errorLines(events)).containsExactly("External call failed service=brevo-smtp op=send http=- "
+                + "reason=rejected to=- detail=email/reset-password-otp MailSendException");
+        assertThat(events).noneMatch(e -> e.getFormattedMessage().contains("u441@example.com"));
+    }
+
+    @Test
+    @DisplayName("phase 441: verify-email SMTP failure — exactly one brevo-smtp ERROR")
+    void should_logOneBrevoSmtpError_when_verificationEmailSendFails() {
+        stubSendFailure(new MailSendException("550 rejected"));
+
+        var events = logsOf(() -> service.sendVerificationEmail("v441@example.com", "654321"));
+
+        assertThat(errorLines(events)).containsExactly("External call failed service=brevo-smtp op=send http=- "
+                + "reason=rejected to=- detail=email/verify-email MailSendException");
+    }
+
+    @Test
+    @DisplayName("phase 441: outbox template send, SMTP failure — exactly one brevo-smtp ERROR, then EmailDeliveryException")
+    void should_logOneBrevoSmtpError_when_templateSendFailsOverSmtp() {
+        stubSendFailure(new MailSendException("550 rejected"));
+
+        var events = logsOf(() -> assertThatThrownBy(() ->
+                service.sendInviteEmail("i441@example.com", "https://beautica.app/invite/x", "Salon"))
+                .isInstanceOf(EmailDeliveryException.class));
+
+        assertThat(errorLines(events)).containsExactly("External call failed service=brevo-smtp op=send http=- "
+                + "reason=rejected to=- detail=email/invite-master MailSendException");
+    }
+
+    @Test
+    @DisplayName("phase 441: outbox template send, Brevo API permanent failure — WARN only, no second ERROR")
+    void should_logNoError_when_templateSendFailsOverBrevoApi() {
+        stubSendFailure(new com.beautica.notification.mail.BrevoPermanentMailException("Brevo API HTTP 400"));
+
+        var events = logsOf(() -> assertThatThrownBy(() ->
+                service.sendInviteEmail("i441@example.com", "https://beautica.app/invite/x", "Salon"))
+                .isInstanceOf(EmailDeliveryException.class));
+
+        assertThat(errorLines(events)).as("BrevoApiMailSender already logged the ERROR").isEmpty();
+        assertThat(events).anyMatch(e -> e.getLevel() == ch.qos.logback.classic.Level.WARN
+                && e.getFormattedMessage().contains("reported by the brevo-api transport"));
+    }
 }

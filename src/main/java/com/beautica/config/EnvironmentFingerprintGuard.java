@@ -493,7 +493,7 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
 
     /**
      * Phase 439 D4 — {@code beautica.sms.mode=smsclub} in prod: a real {@code SMSCLUB_TOKEN} and a non-blank sender
-     * name. An unbound sender name falls back to the {@code SmsClubProperties} default ({@code BEAUTY}); only an
+     * name. An unbound sender name falls back to the {@code SmsClubProperties} default ({@code Beauty}); only an
      * explicitly blank one is a violation. Names the rule and the property only, never a value.
      */
     private static void checkProdSmsClub(Environment env, List<String> violations) {

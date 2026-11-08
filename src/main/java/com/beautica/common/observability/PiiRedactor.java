@@ -57,9 +57,13 @@ public final class PiiRedactor {
                     + "(?:\"(?:[^\"\\\\]|\\\\.)*+\"?|'(?:[^'\\\\]|\\\\.)*+'?|\\S++)");
     /** {@code PIN 1234} — a spaced PIN in free text (parity with the app scrubber's {@code _pinSpaced}). */
     private static final Pattern PIN_SPACED_PATTERN = Pattern.compile("(?i)(?<![A-Za-z])(pin)\\s{1,8}+\\d{4,}+");
-    /** Unicode local part and labels (Cyrillic / IDN); {@code %40} is a URL-encoded {@code @}. */
+    /**
+     * Unicode local part and labels (Cyrillic / IDN); {@code %40} is a URL-encoded {@code @}. The domain is one or more
+     * dot-separated labels with no TLD requirement (audit-fix cycle 1: {@code foo@bar} is an address too), so a
+     * trailing sentence dot is left outside the match. Over-redaction ({@code Object@1a2b}) is accepted.
+     */
     private static final Pattern EMAIL_PATTERN = Pattern.compile(
-            "(?<![\\p{L}\\p{N}._+-])[\\p{L}\\p{N}._+-]++(?:@|%40)(?:[\\p{L}\\p{N}-]++\\.)++\\p{L}{2,}+");
+            "(?<![\\p{L}\\p{N}._+-])[\\p{L}\\p{N}._+-]++(?:@|%40)[\\p{L}\\p{N}-]++(?:\\.[\\p{L}\\p{N}-]++)*+");
     /**
      * A ≥32-char run mixing letters and digits (opaque API tokens, FCM device tokens, UUIDs). Anchored to the
      * start of a run, look-aheads bounded to the run, so it stays linear.
