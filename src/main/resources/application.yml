@@ -291,6 +291,15 @@ sentry:
     minimum-breadcrumb-level: info
 
 app:
+  # Phase 441 audit-fix: per-(service, reason) Sentry budget for ExternalCallFailure events (ExternalCallSentryThrottle).
+  # Only the Sentry events are capped — every failure still writes its ERROR log line. Each key also gets its own
+  # fingerprint ["external-call", service, reason], so every distinct (service, reason) opens its own Sentry issue.
+  observability:
+    external-call-sentry:
+      max-events-per-window: 5
+      window: 10m            # base window; doubles after a window that dropped events, resets after a quiet one
+      max-keys: 256
+      max-window: 24h        # backoff cap: a key failing non-stop settles at ~5 events/day
   jwt:
     secret: ${JWT_SECRET}
     access-token-expiration: 3600000      # 1 hour in ms
@@ -544,13 +553,13 @@ app:
       base-url: ${TURBOSMS_BASE_URL:https://api.turbosms.ua/message/send.json}
       connect-timeout: 3s
       read-timeout: 5s
-    # Phase 439 — SMSClub provider (alpha-name BEAUTY), active only with beautica.sms.mode=smsclub. Same
+    # Phase 439 — SMSClub provider (alpha-name Beauty, case-sensitive), active only with beautica.sms.mode=smsclub. Same
     # degradation as turbosms: a blank token boots, the first send throws SmsDeliveryException; the prod guard
     # (prod-smsclub-token-*) requires it in smsclub mode. The token is a secret and is never logged.
     # SMSCLUB_BASE_URL is a test override only — never set it on Railway.
     smsclub:
       token: ${SMSCLUB_TOKEN:}
-      sender-name: ${SMSCLUB_SENDER_NAME:BEAUTY}
+      sender-name: ${SMSCLUB_SENDER_NAME:Beauty}
       base-url: ${SMSCLUB_BASE_URL:https://im.smsclub.mobi/sms/send}
       connect-timeout: 3s
       read-timeout: 5s

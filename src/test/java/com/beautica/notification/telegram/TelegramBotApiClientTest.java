@@ -163,6 +163,57 @@ class TelegramBotApiClientTest {
         assertNoSecrets(thrown);
     }
 
+    // ── phase 441: failed calls are ONE ERROR ──────────────────────────────
+
+    @Test
+    @DisplayName("phase 441: 400 other description → ONE ERROR, stable template, Telegram description as detail")
+    void should_logOneErrorWithDescription_when_badRequestOther() {
+        stub(400, error(400, "Bad Request: message text is empty"));
+
+        catchThrowable(() -> client.send(CHAT_ID, TEXT));
+
+        assertThat(clientErrors()).singleElement().satisfies(e -> {
+            assertThat(e.getMessage()).isEqualTo(com.beautica.common.observability.ExternalCallFailure.MESSAGE);
+            assertThat(e.getFormattedMessage()).isEqualTo("External call failed service=telegram op=send http=400 "
+                    + "reason=http_400 to=- detail=Bad Request: message text is empty");
+        });
+    }
+
+    @Test
+    @DisplayName("phase 441: 403 bot blocked (routine, link gets blocked) stays WARN — no ERROR")
+    void should_notLogError_when_recipientGone() {
+        stub(403, error(403, "Forbidden: bot was blocked by the user"));
+
+        catchThrowable(() -> client.send(CHAT_ID, TEXT));
+
+        assertThat(clientErrors()).isEmpty();
+    }
+
+    @Test
+    @Timeout(10)
+    @DisplayName("phase 441: a read timeout → ONE ERROR reason=timeout, no exception attached (its message holds the "
+            + "token URL)")
+    void should_logOneErrorWithoutThrowable_when_readTimesOut() {
+        TelegramBotApiClient slow = newClient(Duration.ofMillis(300));
+        wireMock.stubFor(post(urlEqualTo(PATH)).willReturn(aResponse().withStatus(200).withFixedDelay(2000)
+                .withBody(OK_BODY)));
+
+        catchThrowable(() -> slow.send(CHAT_ID, TEXT));
+
+        assertThat(clientErrors()).singleElement().satisfies(e -> {
+            assertThat(e.getFormattedMessage()).startsWith("External call failed service=telegram op=send http=- "
+                    + "reason=timeout").doesNotContain(TOKEN);
+            assertThat(e.getThrowableProxy()).isNull();
+        });
+    }
+
+    private List<ILoggingEvent> clientErrors() {
+        return logAppender.list.stream()
+                .filter(e -> e.getLoggerName().equals(TelegramBotApiClient.class.getName()))
+                .filter(e -> e.getLevel() == Level.ERROR)
+                .toList();
+    }
+
     @Test
     @DisplayName("429 with retry_after → transient")
     void should_throwTransient_when_rateLimited() {

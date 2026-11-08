@@ -1,11 +1,13 @@
 package com.beautica.media.service;
 
 import com.beautica.common.exception.BusinessException;
+import com.beautica.common.observability.ExternalCallFailure;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import software.amazon.awssdk.core.exception.SdkClientException;
+import software.amazon.awssdk.core.exception.SdkException;
 import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.model.Delete;
@@ -55,6 +57,7 @@ public class R2StorageService {
 
     private static final String UPLOAD_FAILED_MESSAGE = "Failed to upload file to media storage";
     private static final String DELETE_FAILED_MESSAGE = "Failed to delete file from media storage";
+    private static final String SERVICE = "r2";
     private static final String DISABLED_SUFFIX = " — R2 is disabled; no-op";
 
     /**
@@ -153,8 +156,8 @@ public class R2StorageService {
         try {
             s3Client.get().putObject(request, RequestBody.fromInputStream(content, contentLength));
         } catch (S3Exception | SdkClientException ex) {
-            // Key encodes the user UUID — omit from ERROR log to avoid PII in log aggregators.
-            log.error("R2 upload failed for key=[key omitted]: {}", ex.getClass().getSimpleName());
+            // Key encodes the user UUID — never logged (phase 441 template: no key field).
+            r2Failure("upload", ex);
             throw new BusinessException(HttpStatus.BAD_GATEWAY, UPLOAD_FAILED_MESSAGE);
         }
     }
@@ -185,8 +188,8 @@ public class R2StorageService {
         try {
             s3Client.get().deleteObject(request);
         } catch (S3Exception | SdkClientException ex) {
-            // Key encodes the user UUID — omit from ERROR log to avoid PII in log aggregators.
-            log.error("R2 delete failed for key=[key omitted]: {}", ex.getClass().getSimpleName());
+            // Key encodes the user UUID — never logged (phase 441 template: no key field).
+            r2Failure("delete", ex);
             throw new BusinessException(HttpStatus.BAD_GATEWAY, DELETE_FAILED_MESSAGE);
         }
     }
@@ -270,14 +273,16 @@ public class R2StorageService {
             if (response.errors() == null || response.errors().isEmpty()) {
                 return Set.of();
             }
-            log.warn("R2 batch delete reported {} failed key(s) of {} requested",
-                    response.errors().size(), chunk.size());
+            // Phase 441: a per-key rejection inside a 2xx is a provider-reported failure → ERROR (code only, no key).
+            ExternalCallFailure.of(SERVICE, "batch_delete").http(HttpStatus.OK.value())
+                    .reason(response.errors().get(0).code())
+                    .detail(response.errors().size() + " of " + chunk.size() + " keys failed").log(log);
             return response.errors().stream()
                     .map(S3Error::key)
                     .collect(Collectors.toSet());
         } catch (S3Exception | SdkClientException ex) {
-            // Chunk keys may encode entity UUIDs — omit from ERROR log to avoid PII in log aggregators.
-            log.error("R2 batch delete failed for {} key(s): {}", chunk.size(), ex.getClass().getSimpleName());
+            // Chunk keys may encode entity UUIDs — never logged (phase 441 template: no key field).
+            r2Failure("batch_delete", ex);
             return new HashSet<>(chunk);
         }
     }
@@ -353,6 +358,23 @@ public class R2StorageService {
             return Optional.empty();
         }
         return Optional.of(key);
+    }
+
+    /**
+     * Phase 441 — one ERROR per failed R2 request: HTTP status + S3 error code for an {@link S3Exception}, a transport
+     * reason for an {@link SdkClientException}. The SDK exception rides along (its message names the operation and
+     * the S3 request id, never the object key or credentials).
+     */
+    private static void r2Failure(String op, SdkException ex) {
+        ExternalCallFailure failure = ExternalCallFailure.of(SERVICE, op);
+        if (ex instanceof S3Exception s3) {
+            String code = s3.awsErrorDetails() == null ? null : s3.awsErrorDetails().errorCode();
+            failure = failure.http(s3.statusCode()).reason(code == null ? "http_" + s3.statusCode() : code);
+        } else {
+            failure = failure.reason(ExternalCallFailure.transportReason(ex))
+                    .detail(ExternalCallFailure.rootCauseName(ex));
+        }
+        failure.log(log, ex);
     }
 
     private static String stripTrailingSlash(String url) {

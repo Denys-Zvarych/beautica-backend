@@ -1,5 +1,6 @@
 package com.beautica.notification.service;
 
+import com.beautica.common.observability.ExternalCallFailure;
 import com.beautica.config.FirebaseConfig;
 import com.beautica.notification.repository.DeviceTokenRepository;
 import com.google.firebase.messaging.AndroidConfig;
@@ -114,15 +115,27 @@ public class PushNotificationService {
                         || errorCode == MessagingErrorCode.INVALID_ARGUMENT) {
                     staleTokens.add(token.getToken());
                 } else {
-                    log.warn("Firebase send failed for device [{}]: {}", token.getId(), e.getClass().getSimpleName());
+                    // Phase 441: every other FCM failure is ONE ERROR (Sentry). UNREGISTERED / INVALID_ARGUMENT above
+                    // stay silent: a stale device token is routine cleanup (deleted below), not a service failure.
+                    fcmFailure(token, e.getHttpResponse() == null ? null : e.getHttpResponse().getStatusCode())
+                            .reason(errorCode == null ? String.valueOf(e.getErrorCode()) : errorCode.name())
+                            .log(log, e);
                 }
             } catch (Exception e) {
-                log.warn("Unexpected push dispatch error for device [{}]: {}", token.getId(), e.getClass().getSimpleName());
+                // Phase 441: the FCM call (or the message build around it) failed without a provider answer.
+                fcmFailure(token, null).reason(ExternalCallFailure.transportReason(e))
+                        .detail(ExternalCallFailure.rootCauseName(e)).log(log, e);
             }
         }
         if (!staleTokens.isEmpty()) {
             deviceTokenRepository.deleteByUserIdAndTokenIn(userId, staleTokens);
         }
+    }
+
+    /** The device row id, never the token value. */
+    private static ExternalCallFailure fcmFailure(DeviceTokenRepository.DeviceTokenSummary token, Integer http) {
+        ExternalCallFailure failure = ExternalCallFailure.of("fcm", "send").to("device:" + token.getId());
+        return http == null ? failure : failure.http(http);
     }
 
     /**

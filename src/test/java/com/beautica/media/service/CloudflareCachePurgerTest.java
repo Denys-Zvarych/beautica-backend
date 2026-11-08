@@ -185,6 +185,21 @@ class CloudflareCachePurgerTest {
     }
 
     @Test
+    @DisplayName("phase 441: each failed purge attempt is ONE ERROR with the Cloudflare error code and message")
+    void should_logOneErrorPerAttempt_when_cloudflareReturns500() {
+        stubStatus(500, "{\"success\":false,\"errors\":[{\"code\":10000,\"message\":\"boom\"}]}");
+
+        purger().purgeUrls(List.of(URL_A, URL_B));
+
+        assertThat(logAppender.list).filteredOn(e -> e.getLevel() == Level.ERROR)
+                .extracting(ILoggingEvent::getFormattedMessage)
+                .containsExactly(
+                        "External call failed service=cdn-purge op=purge http=500 reason=10000 to=- detail=boom",
+                        "External call failed service=cdn-purge op=purge http=500 reason=10000 to=- detail=boom")
+                .allSatisfy(m -> assertThat(m).doesNotContain(URL_A).doesNotContain(TOKEN));
+    }
+
+    @Test
     @DisplayName("should_retryOnceThenCountFailure_when_cloudflareReturns500")
     void should_retryOnceThenCountFailure_when_cloudflareReturns500() {
         stubStatus(500, "{\"success\":false,\"errors\":[{\"code\":10000,\"message\":\"boom\"}]}");
@@ -241,6 +256,34 @@ class CloudflareCachePurgerTest {
 
         assertThat(counter(CloudflareCachePurger.FAILED_METRIC)).isEqualTo(1.0);
         assertThat(counter(CloudflareCachePurger.PURGED_METRIC)).isZero();
+    }
+
+    @Test
+    @DisplayName("audit-fix 441: only the first 4 KB of a response are read — an oversized body is unreadable, "
+            + "never parsed whole, and the purge counts as failed with reason unreadable_response")
+    void should_treatBodyAsUnreadable_when_responseExceedsCap() {
+        String padding = "x".repeat(CloudflareCachePurger.MAX_RESPONSE_BYTES);
+        stubStatus(200, "{\"pad\":\"" + padding + "\",\"success\":true,\"errors\":[]}");
+
+        purger().purgeUrls(List.of(URL_A));
+
+        assertThat(counter(CloudflareCachePurger.FAILED_METRIC)).isEqualTo(1.0);
+        assertThat(counter(CloudflareCachePurger.PURGED_METRIC)).isZero();
+        assertThat(logAppender.list).filteredOn(e -> e.getLevel() == Level.ERROR)
+                .extracting(ILoggingEvent::getFormattedMessage)
+                .containsExactly("External call failed service=cdn-purge op=purge http=200 "
+                        + "reason=unreadable_response to=- detail=-");
+    }
+
+    @Test
+    @DisplayName("audit-fix 441: a small success body under the cap is still parsed")
+    void should_countSuccess_when_bodyWithinCap() {
+        stubStatus(200, OK_BODY);
+
+        purger().purgeUrls(List.of(URL_A));
+
+        assertThat(counter(CloudflareCachePurger.PURGED_METRIC)).isEqualTo(1.0);
+        assertThat(logAppender.list).noneMatch(e -> e.getLevel() == Level.ERROR);
     }
 
     @Test

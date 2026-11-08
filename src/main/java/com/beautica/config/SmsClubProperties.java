@@ -18,7 +18,7 @@ import java.time.Duration;
 public class SmsClubProperties {
 
     /** Default alpha-name registered with SMSCLUB ({@code src_addr}). */
-    static final String DEFAULT_SENDER_NAME = "BEAUTY";
+    static final String DEFAULT_SENDER_NAME = "Beauty";
     /** Delivery lifetime for booking / reminder / review SMS, minutes. */
     static final int DEFAULT_LIFETIME_MINUTES = 60;
     /** Delivery lifetime for the guest OTP, minutes; must not exceed the OTP code TTL (asserted in a test). */

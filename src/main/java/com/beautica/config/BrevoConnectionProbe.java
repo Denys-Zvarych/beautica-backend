@@ -1,5 +1,6 @@
 package com.beautica.config;
 
+import com.beautica.common.observability.ExternalCallFailure;
 import com.beautica.notification.mail.MailTransportCondition;
 import jakarta.mail.MessagingException;
 import lombok.extern.slf4j.Slf4j;
@@ -48,6 +49,11 @@ public class BrevoConnectionProbe {
      * @return {@code true} when the relay could not be reached/authenticated (or did not answer within
      *         {@link #WAIT}); {@code false} when it authenticated or there is nothing to probe.
      */
+    private static void probeFailure(String reason, String cause) {
+        ExternalCallFailure.of("brevo-smtp", "probe").reason(reason)
+                .detail("rule prod-brevo-auth-failed " + cause).log(log);
+    }
+
     public boolean isUnreachable() {
         if (!(mailSender.getIfAvailable() instanceof JavaMailSenderImpl impl)) {
             return false;
@@ -58,7 +64,9 @@ public class BrevoConnectionProbe {
                 impl.testConnection();
                 result.complete(false);
             } catch (MessagingException | RuntimeException e) {
-                log.warn("rule prod-brevo-auth-failed: SMTP connection/authentication to the mail relay failed: {}",
+                // Phase 441: a failed SMTP probe is an external-call failure → ONE ERROR. The exception is not
+                // attached (an SMTP message can carry addresses); its class is the detail.
+                probeFailure(e instanceof jakarta.mail.AuthenticationFailedException ? "auth" : "rejected",
                         e.getClass().getSimpleName());
                 result.complete(true);
             }
@@ -68,8 +76,7 @@ public class BrevoConnectionProbe {
         try {
             return result.get(WAIT.toMillis(), TimeUnit.MILLISECONDS);
         } catch (TimeoutException e) {
-            log.warn("rule prod-brevo-auth-failed: SMTP connection/authentication to the mail relay did not answer "
-                    + "within {} s: {}", WAIT.toSeconds(), e.getClass().getSimpleName());
+            probeFailure(ExternalCallFailure.TIMEOUT, "no answer within " + WAIT.toSeconds() + " s");
             return true;
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();

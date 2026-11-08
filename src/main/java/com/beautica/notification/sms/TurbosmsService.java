@@ -1,15 +1,21 @@
 package com.beautica.notification.sms;
 
+import com.beautica.common.observability.ExternalCallFailure;
 import com.beautica.config.OutboundTimeouts;
 import com.beautica.config.TurbosmsProperties;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
+import org.springframework.http.client.ClientHttpResponse;
 import org.springframework.http.client.JdkClientHttpRequestFactory;
 import org.springframework.web.client.RestClient;
 
+import java.io.IOException;
+import java.io.InputStream;
 import java.net.http.HttpClient;
-import java.time.Duration;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
 
@@ -27,6 +33,10 @@ import java.util.Map;
  * The masking rule itself moved to {@link PhoneMask} in Phase 22.7 so this class and
  * {@link NoOpSmsService} cannot drift into two different definitions of "masked".
  *
+ * <p><b>Failures are ERROR (phase 441).</b> Every failed attempt — a non-2xx, a timeout / I/O error, a missing token
+ * — is ONE {@link ExternalCallFailure} line ({@code service=turbosms}), so it reaches Sentry. A non-2xx logs the
+ * provider's {@code response_status} token as {@code detail} (redacted, capped); never the request body.
+ *
  * <p><b>Not a {@code @Service} since Phase 22.7.</b> This bean is now registered
  * conditionally by {@code SmsConfig}, and only when {@code app.booking.sms.enabled=true};
  * otherwise {@link NoOpSmsService} occupies the {@link SmsService} injection point. Restoring
@@ -39,7 +49,11 @@ import java.util.Map;
 public class TurbosmsService implements SmsService {
 
     private static final String SUCCESS_STATUS = "OK";
-    private static final String FAILURE_STATUS = "FAILED";
+    private static final String SERVICE = "turbosms";
+    private static final String OP_SEND = "send";
+    private static final String REASON_NOT_CONFIGURED = "not_configured";
+    private static final int MAX_ERROR_BODY_BYTES = 4096;
+    private static final ObjectMapper JSON = new ObjectMapper();
     /** Cause-chain walk bound in {@link #isOutcomeUnknown}; real chains are 2-4 deep (owned by {@link SmsTransportErrors}). */
     static final int MAX_CAUSE_DEPTH = SmsTransportErrors.MAX_CAUSE_DEPTH;
     private final RestClient restClient;
@@ -102,8 +116,7 @@ public class TurbosmsService implements SmsService {
     @Override
     public void send(String phoneE164, String text) {
         if (token == null || token.isBlank()) {
-            log.warn("SMS send status={} to={} (provider token not configured)",
-                    FAILURE_STATUS, mask(phoneE164));
+            failure(phoneE164).reason(REASON_NOT_CONFIGURED).log(log);
             throw new SmsDeliveryException("SMS provider is not configured");
         }
 
@@ -121,18 +134,19 @@ public class TurbosmsService implements SmsService {
                     // 4xx/5xx → SmsDeliveryException. The error body is NOT surfaced to the
                     // message (could echo recipient/text); only the status code is recorded.
                     .onStatus(status -> status.isError(), (req, res) -> {
-                        throw new SmsDeliveryException(
-                                "Turbosms rejected the request with HTTP " + res.getStatusCode().value());
+                        int code = res.getStatusCode().value();
+                        failure(phoneE164).http(code).reason("http_" + code)
+                                .detail(responseStatus(res)).log(log);
+                        throw new SmsDeliveryException("Turbosms rejected the request with HTTP " + code);
                     })
                     .toBodilessEntity();
         } catch (SmsDeliveryException e) {
-            log.warn("SMS send status={} to={}", FAILURE_STATUS, mask(phoneE164));
             throw e;
         } catch (RuntimeException e) {
-            // Transport / serialization failure. Log only the exception type — never the
-            // message (may contain the URL with embedded data) or the SMS text/token.
-            log.warn("SMS send status={} to={} cause={}",
-                    FAILURE_STATUS, mask(phoneE164), e.getClass().getSimpleName());
+            // Transport / serialization failure. The URL carries no secret (Bearer header) and RestClient's I/O
+            // exceptions never echo the request body, so the exception rides along for Sentry's stack trace.
+            failure(phoneE164).reason(ExternalCallFailure.transportReason(e))
+                    .detail(ExternalCallFailure.rootCauseName(e)).log(log, e);
             if (isOutcomeUnknown(e)) {
                 throw new SmsDeliveryAmbiguousException("SMS delivery outcome unknown", e);
             }
@@ -148,10 +162,35 @@ public class TurbosmsService implements SmsService {
      * dropped after the request was written leaves the provider's verdict unknown — it may have billed and delivered.
      * Connection refused, connect timeout, unknown host, no route and a failed TLS handshake all happen before the
      * request is written, so those stay definite (retry-safe) failures.
+     *
+     * <p>Phase 441 — a bare {@link java.util.concurrent.CancellationException} (Spring 6.2.6's JDK-client read-timeout
+     * cancel winning the race, not wrapped in {@code ResourceAccessException}) with no pre-send cause is also UNKNOWN.
      */
     static boolean isOutcomeUnknown(RuntimeException e) {
         // Phase 439: the classification moved, verbatim, to SmsTransportErrors so SMSClub shares it.
-        return SmsTransportErrors.isOutcomeUnknown(e);
+        // Phase 441: also treat Spring 6.2.6's bare read-timeout CancellationException as UNKNOWN, as SMSClub does.
+        return SmsTransportErrors.isOutcomeUnknownOrCancelled(e);
+    }
+
+    private static ExternalCallFailure failure(String phoneE164) {
+        return ExternalCallFailure.of(SERVICE, OP_SEND).to(mask(phoneE164));
+    }
+
+    /**
+     * Turbosms' {@code response_status} token (e.g. {@code NOT_ALLOWED_RECIPIENT}) from a size-capped error body;
+     * empty when absent or unreadable. Only that field is read — never the rest of the body.
+     */
+    private static String responseStatus(ClientHttpResponse response) {
+        try (InputStream body = response.getBody()) {
+            byte[] bytes = body.readNBytes(MAX_ERROR_BODY_BYTES);
+            if (bytes.length == 0) {
+                return "";
+            }
+            JsonNode status = JSON.readTree(new String(bytes, StandardCharsets.UTF_8)).path("response_status");
+            return status.isValueNode() ? status.asText("") : "";
+        } catch (IOException | RuntimeException e) {
+            return "";
+        }
     }
 
     /** @see PhoneMask#mask(String) — the one masking rule, shared with {@link NoOpSmsService}. */
