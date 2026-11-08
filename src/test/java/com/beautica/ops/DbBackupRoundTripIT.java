@@ -41,10 +41,7 @@ import java.sql.DriverManager;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
-import java.time.Clock;
-import java.time.DayOfWeek;
 import java.time.Duration;
-import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -55,7 +52,6 @@ import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.junit.jupiter.api.Assumptions.assumeFalse;
 
 /**
  * Phase 366 round trip of the nightly backup image ({@code ops/db-backup}) against REAL dependencies on
@@ -90,6 +86,8 @@ class DbBackupRoundTripIT {
     private static final String MEDIA_BUCKET = "beautica-media-prod";
     private static final String SENTRY_PATH = "/cron/beautica-db-backup/";
     private static final String AGE_MAGIC = "age-encryption.org/v1";
+    private static final String DAILY_PREFIX = "daily/";
+    private static final String WEEKLY_PREFIX = "weekly/";
     private static final Pattern RESULT_LINE = Pattern.compile("(?m)^db_backup_result .*$");
     private static final Pattern STATUS_PARAM = Pattern.compile("[?&]status=(\\w+)");
     private static final Pattern CHECK_IN_ID_PARAM = Pattern.compile("[?&]check_in_id=([^&]*)");
@@ -195,7 +193,7 @@ class DbBackupRoundTripIT {
 
         assertThat(run.exitCode()).isZero();
         assertThat(run.resultLine()).startsWith("db_backup_result status=ok env=staging ");
-        List<String> keys = keys(BACKUP_BUCKET);
+        List<String> keys = dailyKeys(BACKUP_BUCKET);
         assertThat(keys).hasSize(1).allMatch(k -> k.matches("daily/beautica-\\d{8}T\\d{4}Z\\.dump\\.age"));
         byte[] object = s3.getObjectAsBytes(b -> b.bucket(BACKUP_BUCKET).key(keys.get(0))).asByteArray();
         assertThat(new String(object, 0, AGE_MAGIC.length(), StandardCharsets.ISO_8859_1))
@@ -239,16 +237,18 @@ class DbBackupRoundTripIT {
     }
 
     @Test
-    @DisplayName("(b) without BACKUP_FORCE_WEEKLY a non-Sunday run writes no weekly/ object")
-    void should_writeNoWeeklyObject_when_notSundayAndNotForced() {
-        assumeFalse(LocalDate.now(Clock.systemUTC()).getDayOfWeek() == DayOfWeek.SUNDAY,
-                "weekly copies are written on Sundays (UTC) by design");
-
+    @DisplayName("(b) without BACKUP_FORCE_WEEKLY exactly one daily/ object is written on any weekday; weekly/ only as reported")
+    void should_writeExactlyOneDailyObject_when_notForcedOnAnyWeekday() {
+        // backup.sh adds a weekly/ copy on Sundays (UTC) by design; the script's own weekly=N
+        // is the oracle, so the test never reads a clock and passes on every weekday.
         Run run = runBackup(Map.of());
 
         assertThat(run.exitCode()).isZero();
-        assertThat(run.resultLine()).contains(" weekly=0 ");
-        assertThat(keys(BACKUP_BUCKET)).hasSize(1).allMatch(k -> k.startsWith("daily/"));
+        assertThat(run.resultLine()).containsPattern(" weekly=[01] ");
+        assertThat(dailyKeys(BACKUP_BUCKET)).hasSize(1);
+        int expectedWeekly = run.resultLine().contains(" weekly=1 ") ? 1 : 0;
+        assertThat(keys(BACKUP_BUCKET)).filteredOn(k -> k.startsWith(WEEKLY_PREFIX)).hasSize(expectedWeekly);
+        assertThat(keys(BACKUP_BUCKET)).allMatch(k -> k.startsWith(DAILY_PREFIX) || k.startsWith(WEEKLY_PREFIX));
     }
 
     @Test
@@ -258,7 +258,7 @@ class DbBackupRoundTripIT {
 
         assertThat(run.exitCode()).isEqualTo(2);
         assertThat(run.resultLine()).startsWith("db_backup_result status=size_warn ");
-        assertThat(keys(BACKUP_BUCKET)).hasSize(1);
+        assertThat(dailyKeys(BACKUP_BUCKET)).hasSize(1);
         assertPairedCheckIns(run, "error", 200);
         assertNoLeak(run.output());
     }
@@ -273,7 +273,7 @@ class DbBackupRoundTripIT {
 
         assertThat(run.exitCode()).isZero();
         assertThat(run.resultLine()).startsWith("db_backup_result status=ok ");
-        assertThat(keys(BACKUP_BUCKET)).hasSize(1);
+        assertThat(dailyKeys(BACKUP_BUCKET)).hasSize(1);
         assertPairedCheckIns(run, "ok", 500);
         assertNoLeak(run.output());
     }
@@ -449,7 +449,7 @@ class DbBackupRoundTripIT {
         assertThat(run.output()).contains("upload attempt 1 http=503").contains("upload attempt 2 http=200")
                 .doesNotContain("upload attempt 3");
         assertThat(run.resultLine()).startsWith("db_backup_result status=ok ");
-        assertThat(keys(BACKUP_BUCKET)).hasSize(1);
+        assertThat(dailyKeys(BACKUP_BUCKET)).hasSize(1);
         assertPairedCheckIns(run, "ok", 200);
         assertNoLeak(run.output());
     }
@@ -463,7 +463,7 @@ class DbBackupRoundTripIT {
         assertThat(run.output()).contains("upload attempt 1 http=000").contains("upload confirmed by HEAD")
                 .doesNotContain("upload attempt 2");
         assertThat(run.resultLine()).startsWith("db_backup_result status=ok ");
-        assertThat(keys(BACKUP_BUCKET)).hasSize(1);
+        assertThat(dailyKeys(BACKUP_BUCKET)).hasSize(1);
         assertPairedCheckIns(run, "ok", 200);
         assertNoLeak(run.output());
     }
@@ -557,7 +557,7 @@ class DbBackupRoundTripIT {
         assertThat(run.exitCode()).as(run.output()).isZero();
         assertThat(run.output()).contains("upload attempt 1 http=000").contains("upload attempt 2 http=200")
                 .doesNotContain("confirmed by HEAD");
-        assertThat(keys(BACKUP_BUCKET)).hasSize(1);
+        assertThat(dailyKeys(BACKUP_BUCKET)).hasSize(1);
     }
 
     @Test
@@ -641,7 +641,7 @@ class DbBackupRoundTripIT {
 
         assertThat(run.exitCode()).as(run.output()).isZero();
         assertThat(run.resultLine()).startsWith("db_backup_result status=ok ");
-        assertThat(keys(BACKUP_BUCKET)).hasSize(1);
+        assertThat(dailyKeys(BACKUP_BUCKET)).hasSize(1);
         assertThat(run.output()).contains("db_backup: checkin in_progress http=000").contains("db_backup: checkin ok http=000");
         assertThat(checkIns()).as("nothing reached the stub's real port").isEmpty();
         assertThat(run.output()).doesNotContain(SENTRY_KEY, SENTRY_PATH);
@@ -710,7 +710,7 @@ class DbBackupRoundTripIT {
 
         assertThat(run.exitCode()).as(run.output()).isZero();
         assertThat(run.resultLine()).startsWith("db_backup_result status=ok ");
-        assertThat(keys(BACKUP_BUCKET)).hasSize(1);
+        assertThat(dailyKeys(BACKUP_BUCKET)).hasSize(1);
         assertThat(run.output()).contains("db_backup: checkin in_progress skipped").contains("db_backup: checkin ok skipped")
                 .doesNotContain("db_backup: checkin in_progress http=").doesNotContain("db_backup: checkin ok http=");
         assertThat(checkIns()).as("a URL that cannot be put in a curl config is never requested").isEmpty();
@@ -794,6 +794,11 @@ class DbBackupRoundTripIT {
 
     private static List<String> keys(String bucket) {
         return s3.listObjectsV2(b -> b.bucket(bucket)).contents().stream().map(S3Object::key).sorted().toList();
+    }
+
+    /** Daily objects only: an unforced run on a Sunday (UTC) also writes a weekly/ copy by design. */
+    private static List<String> dailyKeys(String bucket) {
+        return keys(bucket).stream().filter(k -> k.startsWith(DAILY_PREFIX)).toList();
     }
 
     /** Check-in statuses in arrival order (WireMock lists newest first). */
