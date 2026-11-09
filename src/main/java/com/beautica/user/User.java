@@ -211,6 +211,21 @@ public class User extends AuditableEntity {
     @Column(name = "tokens_valid_after")
     private Instant tokensValidAfter;
 
+    // Phase 442 — terms + privacy acceptance at account creation (V232, CHECK ck_users_terms_consent_triple:
+    // all three NULL or all three set). NULL = registered before consent was recorded (no backfill). Written
+    // once by recordTermsConsent; updatable = false until a re-consent flow exists. Never exposed in a DTO.
+    @JsonIgnore
+    @Column(name = "terms_accepted_at", updatable = false)
+    private Instant termsAcceptedAt;
+
+    @JsonIgnore
+    @Column(name = "terms_version", length = 32, updatable = false)
+    private String termsVersion;
+
+    @JsonIgnore
+    @Column(name = "privacy_policy_version", length = 32, updatable = false)
+    private String privacyPolicyVersion;
+
     protected User() {
     }
 
@@ -636,5 +651,32 @@ public class User extends AuditableEntity {
 
     public int getReviewCount() {
         return reviewCount;
+    }
+
+    /**
+     * Phase 442 — records that the user accepted the given terms and privacy-policy versions at
+     * {@code acceptedAt} (server clock). Call before the first save; the columns are insert-only.
+     *
+     * @throws IllegalStateException if consent was already recorded (insert-only; no re-consent flow yet)
+     */
+    public void recordTermsConsent(Instant acceptedAt, String termsVersion, String privacyPolicyVersion) {
+        if (termsAcceptedAt != null) {
+            throw new IllegalStateException("Terms consent already recorded");
+        }
+        this.termsAcceptedAt = acceptedAt;
+        this.termsVersion = termsVersion;
+        this.privacyPolicyVersion = privacyPolicyVersion;
+    }
+
+    public Instant getTermsAcceptedAt() {
+        return termsAcceptedAt;
+    }
+
+    public String getTermsVersion() {
+        return termsVersion;
+    }
+
+    public String getPrivacyPolicyVersion() {
+        return privacyPolicyVersion;
     }
 }

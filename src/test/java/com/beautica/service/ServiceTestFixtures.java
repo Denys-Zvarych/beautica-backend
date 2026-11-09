@@ -164,7 +164,8 @@ public class ServiceTestFixtures {
     }
 
     String createIndependentMasterAndGetToken(String email) throws Exception {
-        var request = new RegisterIndependentMasterRequest(email, TEST_PASSWORD, "Anna", "Kovalenko", "+380501234567");
+        var request = new RegisterIndependentMasterRequest(email, TEST_PASSWORD, "Anna", "Kovalenko", "+380501234567",
+                true, "2026-11-07", "2026-10-20"); // phase 442: full consent is the default fixture path
         ResponseEntity<String> resp = restTemplate.postForEntity(
                 "/api/v1/auth/register/independent-master", request, String.class);
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
