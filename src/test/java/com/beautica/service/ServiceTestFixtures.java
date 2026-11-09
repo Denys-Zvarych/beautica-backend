@@ -25,13 +25,19 @@ import org.springframework.security.crypto.password.PasswordEncoder;
 import java.io.InputStream;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
+import java.util.Locale;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 public class ServiceTestFixtures {
 
     static final String TEST_PASSWORD = "Str0ngP@ss1!";
+
+    /** Seeds per-JVM unique phone suffixes so repeated independent-master registrations never collide. */
+    private static final AtomicLong PHONE_SEQUENCE = new AtomicLong(System.nanoTime() % 10_000_000L);
+    private static final long PHONE_SUFFIX_SPACE = 10_000_000L;
 
     private final TestRestTemplate restTemplate;
     private final JdbcTemplate jdbcTemplate;
@@ -50,7 +56,10 @@ public class ServiceTestFixtures {
         this.passwordEncoder = passwordEncoder;
     }
 
-    public String createSalonOwnerAndGetToken(String email) throws Exception {
+    public String createSalonOwnerAndGetToken(String rawEmail) throws Exception {
+        // Store the email the way /auth/login normalises it (lower-case), so a mixed-case caller
+        // still finds its user.
+        String email = rawEmail.toLowerCase(Locale.ROOT);
         String hash = passwordEncoder.encode(TEST_PASSWORD);
         jdbcTemplate.update(
                 "INSERT INTO users (id, email, password_hash, role, is_active, email_verified) VALUES (?, ?, ?, 'SALON_OWNER', true, true)",
@@ -164,7 +173,7 @@ public class ServiceTestFixtures {
     }
 
     String createIndependentMasterAndGetToken(String email) throws Exception {
-        var request = new RegisterIndependentMasterRequest(email, TEST_PASSWORD, "Anna", "Kovalenko", "+380501234567",
+        var request = new RegisterIndependentMasterRequest(email, TEST_PASSWORD, "Anna", "Kovalenko", nextUniquePhone(),
                 true, "2026-11-07", "2026-10-20"); // phase 442: full consent is the default fixture path
         ResponseEntity<String> resp = restTemplate.postForEntity(
                 "/api/v1/auth/register/independent-master", request, String.class);
@@ -176,6 +185,11 @@ public class ServiceTestFixtures {
         assertThat(loginResp.getStatusCode()).isEqualTo(HttpStatus.OK);
         var body = objectMapper.readValue(loginResp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
         return body.data().accessToken();
+    }
+
+    /** A fresh, valid Ukrainian mobile number ({@code +38050} + 7 digits), unique within the JVM. */
+    private static String nextUniquePhone() {
+        return String.format("+38050%07d", PHONE_SEQUENCE.getAndIncrement() % PHONE_SUFFIX_SPACE);
     }
 
     UUID createIndependentMasterService(String indepToken, String name) throws Exception {
@@ -404,14 +418,23 @@ public class ServiceTestFixtures {
      * shape instead of re-deriving it (REUSE-FIRST).
      */
     UUID insertActiveDefinitionWithoutAssignment(UUID masterId, UUID serviceTypeId) {
+        return insertActiveDefinitionWithoutAssignment(masterId, serviceTypeId, "Orphaned Active Service");
+    }
+
+    /**
+     * Same row as {@link #insertActiveDefinitionWithoutAssignment(UUID, UUID)} (60 хв) with an explicit
+     * {@code name}. Phase 464: the duplicate key includes the name, so a test that wants a bulk item
+     * (which always stores the type's {@code nameUk}) to collide with this row passes that name.
+     */
+    UUID insertActiveDefinitionWithoutAssignment(UUID masterId, UUID serviceTypeId, String name) {
         UUID defId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO service_definitions (id, owner_type, owner_id, name, service_type_id, "
                         + "base_duration_minutes, price_type, base_price, buffer_minutes_after, "
                         + "is_active, created_at, updated_at) "
-                        + "VALUES (?, 'INDEPENDENT_MASTER', ?, 'Orphaned Active Service', ?, 60, "
+                        + "VALUES (?, 'INDEPENDENT_MASTER', ?, ?, ?, 60, "
                         + "'FIXED', 400.00, 0, true, NOW(), NOW())",
-                defId, masterId, serviceTypeId);
+                defId, masterId, name, serviceTypeId);
         return defId;
     }
 

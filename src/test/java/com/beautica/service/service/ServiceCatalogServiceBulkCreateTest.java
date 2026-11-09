@@ -23,8 +23,13 @@ import com.beautica.service.repository.PlatformCategoryRepository;
 import com.beautica.service.repository.SalonBulkSetupCandidate;
 import com.beautica.service.repository.ServiceRepository;
 import com.beautica.service.repository.ServiceTypeRepository;
+import jakarta.validation.Validation;
+import jakarta.validation.Validator;
+import jakarta.validation.ValidatorFactory;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
@@ -42,7 +47,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.argThat;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -155,9 +162,20 @@ class ServiceCatalogServiceBulkCreateTest {
                 .build();
     }
 
+    /** Matches the batched guard's zipped {@code typeIds} array as a SET (item order is irrelevant here). */
+    private static UUID[] typeIdsExactly(UUID... expected) {
+        return argThat(actual -> actual != null
+                && java.util.Set.of(actual).equals(java.util.Set.of(expected)));
+    }
+
     private BulkServiceItemRequest fixedItem(UUID serviceTypeId, int duration, String price) {
         return new BulkServiceItemRequest(
                 serviceTypeId, duration, PriceType.FIXED, new BigDecimal(price), null, null);
+    }
+
+    private BulkServiceItemRequest namedItem(UUID serviceTypeId, int duration, String price, String name) {
+        return new BulkServiceItemRequest(
+                serviceTypeId, duration, PriceType.FIXED, new BigDecimal(price), null, null, name);
     }
 
     private BulkServiceItemRequest rangeItem(UUID serviceTypeId, int duration, String min, String max) {
@@ -243,9 +261,9 @@ class ServiceCatalogServiceBulkCreateTest {
         verify(serviceRepository, times(1)).flush();
 
         // PERF: and the V121 duplicate guard is ONE query for the whole batch, not one per item.
-        verify(serviceRepository, times(1)).findActiveDuplicateTypeIds(
-                OwnerType.INDEPENDENT_MASTER, masterId, java.util.Set.of(fixedTypeId, rangeTypeId));
-        verify(serviceRepository, never()).findActiveDuplicateId(any(), any(), any(), any());
+        verify(serviceRepository, times(1)).findActiveDuplicateCopies(
+                eq("INDEPENDENT_MASTER"), eq(masterId), typeIdsExactly(fixedTypeId, rangeTypeId), any(), any());
+        verify(serviceRepository, never()).findActiveDuplicateId(any(), any(), any(), anyInt(), any(), any());
 
         List<ServiceDefinition> savedDefs = defCaptor.getAllValues();
 
@@ -325,7 +343,7 @@ class ServiceCatalogServiceBulkCreateTest {
         // guard plus its findAllById re-fetch are gone from this branch entirely.
         verify(serviceRepository).findSalonBulkSetupCandidates(
                 salonId, masterId, java.util.Set.of(typeId));
-        verify(serviceRepository, never()).findActiveDuplicateTypeIds(any(), any(), any());
+        verify(serviceRepository, never()).findActiveDuplicateCopies(any(), any(), any(), any(), any());
         verify(serviceRepository, never()).findAllById(any());
 
         // Parity with the self path: the shared additive core's post-write bookkeeping must run
@@ -873,8 +891,8 @@ class ServiceCatalogServiceBulkCreateTest {
         assertThat(defCaptor.getValue().getOwnerType()).isEqualTo(OwnerType.INDEPENDENT_MASTER);
         assertThat(defCaptor.getValue().getOwnerId()).isEqualTo(masterId);
 
-        verify(serviceRepository).findActiveDuplicateTypeIds(
-                OwnerType.INDEPENDENT_MASTER, masterId, java.util.Set.of(typeId));
+        verify(serviceRepository).findActiveDuplicateCopies(
+                eq("INDEPENDENT_MASTER"), eq(masterId), typeIdsExactly(typeId), any(), any());
         verify(serviceRepository, never()).findSalonBulkSetupCandidates(any(), any(), any());
         verify(serviceRepository, never()).findAllById(any());
     }
@@ -1296,7 +1314,7 @@ class ServiceCatalogServiceBulkCreateTest {
         // …and the read-then-write duplicate guard runs strictly inside it. This last edge is the
         // one that must never regress: the guard reads owner-scoped state and then inserts, so it
         // is exactly what the lock has to serialize.
-        inOrder.verify(serviceRepository).findActiveDuplicateTypeIds(any(), any(), any());
+        inOrder.verify(serviceRepository).findActiveDuplicateCopies(any(), any(), any(), any(), any());
     }
 
     /**
@@ -1327,7 +1345,7 @@ class ServiceCatalogServiceBulkCreateTest {
         // Type resolution now precedes the lock (perf finding 2), so it is no longer a "never".
         // What must still hold is that a lock the DB refuses to confirm stops the batch BEFORE
         // the guarded critical section — no duplicate guard, no inserts.
-        verify(serviceRepository, never()).findActiveDuplicateTypeIds(any(), any(), any());
+        verify(serviceRepository, never()).findActiveDuplicateCopies(any(), any(), any(), any(), any());
         verify(serviceRepository, never()).save(any(ServiceDefinition.class));
     }
 
@@ -1368,7 +1386,7 @@ class ServiceCatalogServiceBulkCreateTest {
                 .extracting(ex -> ((BusinessException) ex).getStatus())
                 .isEqualTo(org.springframework.http.HttpStatus.SERVICE_UNAVAILABLE);
 
-        verify(serviceRepository, never()).findActiveDuplicateTypeIds(any(), any(), any());
+        verify(serviceRepository, never()).findActiveDuplicateCopies(any(), any(), any(), any(), any());
         verify(serviceRepository, never()).save(any(ServiceDefinition.class));
     }
 
@@ -1403,11 +1421,48 @@ class ServiceCatalogServiceBulkCreateTest {
                 .hasMessageNotContaining("canceling statement");
     }
 
-    // ── Duplicate serviceTypeId in batch ───────────────────────────────────────
+    // ── In-request copies (phase 464 D5) ───────────────────────────────────────
 
     @Test
-    @DisplayName("400 + nothing persisted when the batch toggles the same serviceTypeId twice")
-    void should_throwBadRequestAndPersistNothing_when_duplicateServiceTypeIdInBatch() {
+    @DisplayName("phase 464 — two items of one type that differ in duration are two copies: both persisted")
+    void should_persistBothCopies_when_batchCarriesOneTypeTwiceWithDifferentDurations() {
+        UUID userId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID typeId = UUID.randomUUID();
+        Master master = independentMaster(masterId);
+        ServiceType type = serviceType(typeId, "Класичний масаж", "NAIL_SERVICE", true);
+
+        var request = new BulkCreateServicesRequest(List.of(
+                fixedItem(typeId, 60, "350.00"),
+                fixedItem(typeId, 90, "500.00")));
+
+        when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
+        when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type));
+        when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of("NAIL_SERVICE"));
+        stubSaveEchoesEntities();
+
+        List<MasterServiceResponse> result =
+                serviceCatalogService.bulkCreateIndependentMasterServices(userId, request);
+
+        ArgumentCaptor<ServiceDefinition> defCaptor = ArgumentCaptor.forClass(ServiceDefinition.class);
+        verify(serviceRepository, times(2)).save(defCaptor.capture());
+        assertThat(defCaptor.getAllValues())
+                .extracting(ServiceDefinition::getBaseDurationMinutes)
+                .as("both copies inserted in item order")
+                .containsExactly(60, 90);
+        assertThat(result).hasSize(2);
+        // The batch guard receives ONE zipped (type, duration, name) triple per item.
+        verify(serviceRepository, times(1)).findActiveDuplicateCopies(
+                eq("INDEPENDENT_MASTER"), eq(masterId),
+                argThat((UUID[] ids) -> java.util.Arrays.equals(ids, new UUID[] {typeId, typeId})),
+                argThat((Integer[] durations) -> java.util.Arrays.equals(durations, new Integer[] {60, 90})),
+                argThat((String[] names) -> java.util.Arrays.equals(
+                        names, new String[] {"Класичний масаж", "Класичний масаж"})));
+    }
+
+    @Test
+    @DisplayName("phase 464 — 400 + nothing persisted when two items share type AND duration (same effective name)")
+    void should_throwBadRequestAndPersistNothing_when_batchCarriesExactDuplicateCopy() {
         UUID userId = UUID.randomUUID();
         UUID masterId = UUID.randomUUID();
         UUID dupTypeId = UUID.randomUUID();
@@ -1415,19 +1470,118 @@ class ServiceCatalogServiceBulkCreateTest {
 
         var request = new BulkCreateServicesRequest(List.of(
                 fixedItem(dupTypeId, 60, "350.00"),
-                fixedItem(dupTypeId, 90, "500.00")));
+                fixedItem(dupTypeId, 60, "350.00")));
 
         when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
 
         assertThatThrownBy(() -> serviceCatalogService.bulkCreateIndependentMasterServices(userId, request))
                 .isInstanceOf(BusinessException.class)
-                .hasMessageContaining("Duplicate service type");
+                .isNotInstanceOf(DuplicateServiceException.class)
+                .hasMessageContaining("Duplicate service in bulk request");
 
+        // Caught BEFORE the type lookup (unnamed items of one type compare equal there).
         verify(serviceTypeRepository, never()).findAllById(any());
+        verify(masterServiceRepository, never()).acquireBulkSetupLockWithTimeout(any());
         verify(serviceRepository, never()).save(any(ServiceDefinition.class));
     }
 
-    // ── Duplicate against ALREADY-EXISTING services (V121 guard) ───────────────
+    @Test
+    @DisplayName("phase 464 — duplicate copy next to an UNKNOWN type is still the 400, not the type 404")
+    void should_throwBadRequest_when_batchHasDuplicateCopyAndUnknownType() {
+        UUID userId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID unknownTypeId = UUID.randomUUID();
+        Master master = independentMaster(masterId);
+
+        var request = new BulkCreateServicesRequest(List.of(
+                fixedItem(unknownTypeId, 60, "350.00"),
+                fixedItem(unknownTypeId, 60, "400.00")));
+
+        when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
+
+        assertThatThrownBy(() -> serviceCatalogService.bulkCreateIndependentMasterServices(userId, request))
+                .isInstanceOf(BusinessException.class)
+                .isNotInstanceOf(NotFoundException.class)
+                .hasMessageContaining("Duplicate service in bulk request");
+        verify(serviceTypeRepository, never()).findAllById(any());
+    }
+
+    @Test
+    @DisplayName("phase 464 — 400 when one item is unnamed and the other's name equals the type name up to case/spaces")
+    void should_throwBadRequest_when_namedCopyDiffersFromDefaultNameOnlyInCaseAndSpaces() {
+        UUID userId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID typeId = UUID.randomUUID();
+        Master master = independentMaster(masterId);
+        ServiceType type = serviceType(typeId, "Класичний масаж", "NAIL_SERVICE", true);
+
+        var request = new BulkCreateServicesRequest(List.of(
+                fixedItem(typeId, 60, "350.00"),
+                namedItem(typeId, 60, "420.00", " класичний МАСАЖ ")));
+
+        when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
+        when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type));
+
+        assertThatThrownBy(() -> serviceCatalogService.bulkCreateIndependentMasterServices(userId, request))
+                .isInstanceOf(BusinessException.class)
+                .isNotInstanceOf(DuplicateServiceException.class)
+                .hasMessageContaining("Duplicate service in bulk request");
+        verify(serviceRepository, never()).save(any(ServiceDefinition.class));
+    }
+
+    @Test
+    @DisplayName("phase 464 — two items of one type and duration with DIFFERENT names are two copies; each stores its name")
+    void should_persistBothCopies_when_batchCopiesDifferInName() {
+        UUID userId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID typeId = UUID.randomUUID();
+        Master master = independentMaster(masterId);
+        ServiceType type = serviceType(typeId, "Класичний масаж", "NAIL_SERVICE", true);
+
+        var request = new BulkCreateServicesRequest(List.of(
+                fixedItem(typeId, 60, "350.00"),
+                namedItem(typeId, 60, "420.00", "Масаж спини авторський")));
+
+        when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
+        when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type));
+        when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of("NAIL_SERVICE"));
+        stubSaveEchoesEntities();
+
+        serviceCatalogService.bulkCreateIndependentMasterServices(userId, request);
+
+        ArgumentCaptor<ServiceDefinition> defCaptor = ArgumentCaptor.forClass(ServiceDefinition.class);
+        verify(serviceRepository, times(2)).save(defCaptor.capture());
+        assertThat(defCaptor.getAllValues())
+                .extracting(ServiceDefinition::getName)
+                .containsExactly("Класичний масаж", "Масаж спини авторський");
+        verify(serviceRepository).findActiveDuplicateCopies(any(), any(), any(), any(),
+                argThat((String[] names) -> java.util.Arrays.equals(
+                        names, new String[] {"Класичний масаж", "Масаж спини авторський"})));
+    }
+
+    @Test
+    @DisplayName("phase 464 D3 — 400 + nothing persisted when two items of one type differ ONLY in price")
+    void should_throwBadRequestAndPersistNothing_when_batchCopiesDifferOnlyInPrice() {
+        UUID userId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID dupTypeId = UUID.randomUUID();
+        Master master = independentMaster(masterId);
+
+        var request = new BulkCreateServicesRequest(List.of(
+                fixedItem(dupTypeId, 60, "350.00"),
+                rangeItem(dupTypeId, 60, "400.00", "900.00")));
+
+        when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
+
+        assertThatThrownBy(() -> serviceCatalogService.bulkCreateIndependentMasterServices(userId, request))
+                .isInstanceOf(BusinessException.class)
+                .isNotInstanceOf(DuplicateServiceException.class)
+                .hasMessageContaining("Duplicate service in bulk request");
+
+        verify(serviceRepository, never()).save(any(ServiceDefinition.class));
+    }
+
+    // ── Duplicate against ALREADY-EXISTING copies (V233 guard) ───────────────
 
     @Test
     @DisplayName("409 DUPLICATE_SERVICE + nothing persisted when a batch item duplicates a service the owner already has")
@@ -1457,8 +1611,8 @@ class ServiceCatalogServiceBulkCreateTest {
         // ONE batched lookup covering both items: item 1's type is free, item 2's is taken, so
         // only the taken one comes back. This is the whole point of the batched guard — a
         // per-item guard would have issued two round-trips here (and up to 100 on a full batch).
-        when(serviceRepository.findActiveDuplicateTypeIds(
-                OwnerType.INDEPENDENT_MASTER, masterId, java.util.Set.of(freshTypeId, takenTypeId)))
+        when(serviceRepository.findActiveDuplicateCopies(
+                eq("INDEPENDENT_MASTER"), eq(masterId), typeIdsExactly(freshTypeId, takenTypeId), any(), any()))
                 .thenReturn(List.of(new ActiveDuplicateProjection(takenTypeId, existingDefId)));
 
         assertThatThrownBy(() -> serviceCatalogService.bulkCreateIndependentMasterServices(userId, request))
@@ -1471,8 +1625,8 @@ class ServiceCatalogServiceBulkCreateTest {
 
         // The guard is consulted EXACTLY ONCE for the whole batch, before the persist loop —
         // this assertion is what a regression back to per-item findActiveDuplicateId would break.
-        verify(serviceRepository, times(1)).findActiveDuplicateTypeIds(any(), any(), any());
-        verify(serviceRepository, never()).findActiveDuplicateId(any(), any(), any(), any());
+        verify(serviceRepository, times(1)).findActiveDuplicateCopies(any(), any(), any(), any(), any());
+        verify(serviceRepository, never()).findActiveDuplicateId(any(), any(), any(), anyInt(), any(), any());
 
         // Running before the loop also means the colliding batch never reaches the DB at all:
         // strictly better than the old per-item behaviour, which persisted item 1 and relied on
@@ -1507,7 +1661,7 @@ class ServiceCatalogServiceBulkCreateTest {
         // The query's row order is unspecified — return the SECOND item's collision first to
         // prove the reported item is chosen by request order, not by result order. Otherwise two
         // identical requests could blame different items.
-        when(serviceRepository.findActiveDuplicateTypeIds(any(), any(), any()))
+        when(serviceRepository.findActiveDuplicateCopies(any(), any(), any(), any(), any()))
                 .thenReturn(List.of(
                         new ActiveDuplicateProjection(secondTakenTypeId, secondDefId),
                         new ActiveDuplicateProjection(firstTakenTypeId, firstDefId)));
@@ -1717,5 +1871,137 @@ class ServiceCatalogServiceBulkCreateTest {
                 .hasMessageContaining("Master not found");
 
         verify(serviceRepository, never()).save(any(ServiceDefinition.class));
+    }
+
+    // -- phase 464 audit (S-LOW): invisible / Unicode-whitespace name variants ------------------
+
+    @Test
+    @DisplayName("phase 464 audit — bulk item named typeName + U+200B fails Bean Validation (→ 400)")
+    void should_failNameValidation_when_bulkItemNameIsTypeNamePlusZeroWidthSpace() {
+        BulkServiceItemRequest item = namedItem(UUID.randomUUID(), 60, "350.00", "Класичний масаж\u200B");
+
+        var violations = validator().validate(item);
+
+        assertThat(violations)
+                .as("a zero-width (Cf) suffix must not create a visually identical 'distinct' copy")
+                .anySatisfy(v -> {
+                    assertThat(v.getPropertyPath().toString()).isEqualTo("name");
+                    assertThat(v.getMessage()).isEqualTo(ServiceNameCases.INVALID_NAME_MESSAGE);
+                });
+    }
+
+    @Test
+    @DisplayName("phase 464 audit — 400 when a named copy differs from the default name only in NBSP padding")
+    void should_throwBadRequest_when_namedCopyDiffersFromDefaultNameOnlyInNbspPadding() {
+        UUID userId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID typeId = UUID.randomUUID();
+        Master master = independentMaster(masterId);
+        ServiceType type = serviceType(typeId, "Класичний масаж", "NAIL_SERVICE", true);
+        var request = new BulkCreateServicesRequest(List.of(
+                fixedItem(typeId, 60, "350.00"),
+                namedItem(typeId, 60, "420.00", "\u00A0Класичний масаж\u00A0")));
+        when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
+        when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type));
+
+        assertThatThrownBy(() -> serviceCatalogService.bulkCreateIndependentMasterServices(userId, request))
+                .isInstanceOf(BusinessException.class)
+                .isNotInstanceOf(DuplicateServiceException.class)
+                .hasMessageContaining("Duplicate service in bulk request");
+
+        verify(serviceRepository, never()).save(any(ServiceDefinition.class));
+    }
+
+    @Test
+    @DisplayName("phase 464 audit — a NBSP-padded custom name is stored and pre-checked stripped")
+    void should_storeStrippedName_when_bulkItemNameIsNbspPadded() {
+        UUID userId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID typeId = UUID.randomUUID();
+        Master master = independentMaster(masterId);
+        ServiceType type = serviceType(typeId, "Класичний масаж", "NAIL_SERVICE", true);
+        var request = new BulkCreateServicesRequest(List.of(
+                namedItem(typeId, 60, "420.00", "\u00A0 Масаж спини\u00A0")));
+        when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
+        when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type));
+        when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of("NAIL_SERVICE"));
+        stubSaveEchoesEntities();
+
+        serviceCatalogService.bulkCreateIndependentMasterServices(userId, request);
+
+        ArgumentCaptor<ServiceDefinition> defCaptor = ArgumentCaptor.forClass(ServiceDefinition.class);
+        verify(serviceRepository).save(defCaptor.capture());
+        assertThat(defCaptor.getValue().getName()).isEqualTo("Масаж спини");
+        verify(serviceRepository).findActiveDuplicateCopies(any(), any(), any(), any(),
+                argThat((String[] names) -> java.util.Arrays.equals(names, new String[] {"Масаж спини"})));
+    }
+
+    private static Validator validator() {
+        try (ValidatorFactory factory = Validation.buildDefaultValidatorFactory()) {
+            return factory.getValidator();
+        }
+    }
+
+    // -- phase 464 name ALLOW-LIST (service layer, after NFKC + space collapse + strip) ---------
+
+    @ParameterizedTest(name = "[{index}] {0}")
+    @MethodSource("com.beautica.service.service.ServiceNameCases#rejectedNames")
+    @DisplayName("phase 464 — 400 when a bulk item name carries a character outside the allow-list")
+    void should_throwBadRequest_when_bulkItemNameOutsideAllowList(String codePoint, String name) {
+        UUID userId = UUID.randomUUID();
+        UUID typeId = UUID.randomUUID();
+        Master master = independentMaster(UUID.randomUUID());
+        var request = new BulkCreateServicesRequest(List.of(
+                namedItem(typeId, 60, "420.00", name)));
+        when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
+
+        assertThatThrownBy(() -> serviceCatalogService.bulkCreateIndependentMasterServices(userId, request))
+                .isInstanceOf(BusinessException.class)
+                .hasMessage(ServiceNameCases.INVALID_NAME_MESSAGE)
+                .extracting("status").hasToString("400 BAD_REQUEST");
+
+        verify(serviceRepository, never()).save(any(ServiceDefinition.class));
+    }
+
+    @ParameterizedTest(name = "[{index}] \"{0}\" -> \"{1}\"")
+    @MethodSource("com.beautica.service.service.ServiceNameCases#acceptedNames")
+    @DisplayName("phase 464 — an allow-listed bulk item name is accepted and stored canonical")
+    void should_storeCanonicalName_when_bulkItemNameIsAllowListed(String input, String stored) {
+        UUID userId = UUID.randomUUID();
+        UUID typeId = UUID.randomUUID();
+        Master master = independentMaster(UUID.randomUUID());
+        ServiceType type = serviceType(typeId, "Манікюр", "NAIL_SERVICE", true);
+        var request = new BulkCreateServicesRequest(List.of(namedItem(typeId, 60, "420.00", input)));
+        when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
+        when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type));
+        when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of("NAIL_SERVICE"));
+        stubSaveEchoesEntities();
+
+        serviceCatalogService.bulkCreateIndependentMasterServices(userId, request);
+
+        ArgumentCaptor<ServiceDefinition> defCaptor = ArgumentCaptor.forClass(ServiceDefinition.class);
+        verify(serviceRepository).save(defCaptor.capture());
+        assertThat(defCaptor.getValue().getName()).isEqualTo(stored);
+    }
+
+    @Test
+    @DisplayName("phase 464 audit — a decomposed й (и + U+0306) is accepted and stored composed by NFKC")
+    void should_storeComposedName_when_bulkItemNameUsesDecomposedShortI() {
+        UUID userId = UUID.randomUUID();
+        UUID typeId = UUID.randomUUID();
+        Master master = independentMaster(UUID.randomUUID());
+        ServiceType type = serviceType(typeId, "Манікюр", "NAIL_SERVICE", true);
+        var request = new BulkCreateServicesRequest(List.of(
+                namedItem(typeId, 60, "420.00", "Мані\u0438\u0306")));
+        when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
+        when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type));
+        when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of("NAIL_SERVICE"));
+        stubSaveEchoesEntities();
+
+        serviceCatalogService.bulkCreateIndependentMasterServices(userId, request);
+
+        ArgumentCaptor<ServiceDefinition> defCaptor = ArgumentCaptor.forClass(ServiceDefinition.class);
+        verify(serviceRepository).save(defCaptor.capture());
+        assertThat(defCaptor.getValue().getName()).isEqualTo("Мані\u0439");
     }
 }

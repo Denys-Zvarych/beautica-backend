@@ -203,13 +203,13 @@ class ServicesIntegrationTest extends AbstractIntegrationTest {
     // ── V121 one-active-service-per-(owner, type) — full stack ─────────────────
     //
     // The @WebMvcTest slice pins the 409's JSON shape against a mocked service, and
-    // ServiceDefinitionUniqueActiveTypeTest pins the partial index against real Postgres.
+    // ServiceDefinitionUniqueActiveCopyTest pins the partial index against real Postgres.
     // Neither proves the two meet: that a real HTTP create against a real database produces the
     // branchable body carrying a REAL, resolvable existingServiceDefId. That composition — the
     // exact call the mobile add-service screen makes — is only observable here.
 
     @Test
-    @DisplayName("409 DUPLICATE_SERVICE with the existing service's id when the salon re-adds a service type it already offers")
+    @DisplayName("409 DUPLICATE_SERVICE with the existing service's id when the salon re-adds the same copy (type, duration, name) at another price")
     void should_return409WithExistingServiceDefId_when_salonReAddsSameServiceType() throws Exception {
         // Arrange
         String ownerToken = fixtures.createSalonOwnerAndGetToken(
@@ -221,9 +221,10 @@ class ServicesIntegrationTest extends AbstractIntegrationTest {
                 new CreateServiceDefinitionRequest("Класичне нарощення", null, "NAIL_SERVICE", 60, 10,
                         PriceType.FIXED, new BigDecimal("500.00"), null, null, serviceTypeId));
 
-        // Deliberately a different name, price and duration: the locked product rule keys on the
-        // service type alone, so none of these make it a distinct service.
-        var duplicate = new CreateServiceDefinitionRequest("Класичне нарощення VIP", null, "NAIL_SERVICE", 120, 10,
+        // Phase 464: the same copy — same type, same duration, and a name that differs only in case
+        // and surrounding spaces (compared lower(btrim(name))). Only the price differs, which never
+        // makes a distinct copy (D3).
+        var duplicate = new CreateServiceDefinitionRequest(" класичне НАРОЩЕННЯ ", null, "NAIL_SERVICE", 60, 10,
                 PriceType.FIXED, new BigDecimal("900.00"), null, null, serviceTypeId);
 
         // Act
@@ -257,7 +258,7 @@ class ServicesIntegrationTest extends AbstractIntegrationTest {
                 .as("the pre-check path names the conflicting service by its service-type label")
                 .isNotNull()
                 .isEqualTo(expectedTypeName)
-                .isNotEqualTo("Класичне нарощення VIP");
+                .isNotEqualTo(" класичне НАРОЩЕННЯ ");
 
         // Nothing was written: a 409 that still inserted would leave the owner with a phantom row.
         Long definitionCount = jdbcTemplate.queryForObject(
@@ -331,7 +332,7 @@ class ServicesIntegrationTest extends AbstractIntegrationTest {
 
     @Test
     @DisplayName("PATCH /services/{id} — 409 DUPLICATE_SERVICE when the patch re-points a service "
-            + "at a type the same owner already offers, and the row is left unchanged")
+            + "onto a copy (type, duration, name) the same owner already offers, and the row is left unchanged")
     void should_return409_when_patchRepointsAtATypeTheOwnerAlreadyOffers() throws Exception {
         // Arrange — one salon, two services of two different types.
         String ownerToken = fixtures.createSalonOwnerAndGetToken(
@@ -349,9 +350,11 @@ class ServicesIntegrationTest extends AbstractIntegrationTest {
 
         // A COMBINED category + serviceTypeId patch — the exact shape whose flush ordering the
         // two-phase design exists for. Patching the type alone would leave the entity clean anyway
-        // and could not distinguish the two orderings.
+        // and could not distinguish the two orderings. Phase 464: the patch also moves the row onto
+        // the incumbent's duration and name, so it becomes the SAME copy (a different duration or
+        // name would now be a legitimate second copy).
         var repoint = new UpdateServiceDefinitionRequest(
-                null, null, "NAIL_SERVICE", null, null, null, null, null, null, takenTypeId);
+                "Класичне нарощення", null, "NAIL_SERVICE", 60, null, null, null, null, null, takenTypeId);
 
         // Act
         log.debug("Act: PATCH /api/v1/services/{} re-pointing it at service type {}, which this "
@@ -384,7 +387,7 @@ class ServicesIntegrationTest extends AbstractIntegrationTest {
 
     @Test
     @DisplayName("POST /independent-masters/me/services — 409 DUPLICATE_SERVICE when the master "
-            + "re-adds a service type they already offer, and nothing is persisted")
+            + "re-adds the same copy (type, duration, name), and nothing is persisted")
     void should_return409_when_independentMasterReAddsSameServiceType() throws Exception {
         // Arrange
         String email = "integ-indep-duptype-" + System.nanoTime() + "@beautica.test";
@@ -393,9 +396,9 @@ class ServicesIntegrationTest extends AbstractIntegrationTest {
         UUID firstServiceDefId = fixtures.createIndependentMasterService(token, "Класичне нарощення");
         UUID serviceTypeId = fixtures.resolveServiceTypeIdForCategory("NAIL_SERVICE");
 
-        // Different name, price and duration again — the rule keys on the service type alone.
-        var duplicate = new CreateServiceDefinitionRequest("Класичне нарощення VIP", null,
-                "NAIL_SERVICE", 120, 10, PriceType.FIXED, new BigDecimal("900.00"), null, null,
+        // Phase 464: the same copy (type, 60 хв, same name) at another price — still a duplicate.
+        var duplicate = new CreateServiceDefinitionRequest("Класичне нарощення", null,
+                "NAIL_SERVICE", 60, 10, PriceType.FIXED, new BigDecimal("900.00"), null, null,
                 serviceTypeId);
 
         // Act

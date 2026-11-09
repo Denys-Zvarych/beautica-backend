@@ -28,6 +28,8 @@ import com.beautica.service.service.CatalogCategoryLookup;
 import com.beautica.user.User;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InjectMocks;
@@ -285,7 +287,7 @@ class ServiceCatalogServiceTest {
         verify(serviceRepository, never()).saveAndFlush(any());
     }
 
-    // ── duplicate-service guard (V121 ux_service_def_owner_service_type_active) ─
+    // ── duplicate-service guard (V233 ux_service_def_owner_type_duration_name_active) ─
 
     @Test
     @DisplayName("throws DUPLICATE_SERVICE 409 when the salon already offers this service type")
@@ -299,7 +301,7 @@ class ServiceCatalogServiceTest {
         when(serviceType.getId()).thenReturn(serviceTypeId);
         when(serviceType.getNameUk()).thenReturn("Класичне нарощення");
         when(serviceRepository.findActiveDuplicateId(
-                OwnerType.SALON, salonId, serviceTypeId, null))
+                OwnerType.SALON, salonId, serviceTypeId, 60, "Manicure", null))
                 .thenReturn(Optional.of(existingDefId));
 
         assertThatThrownBy(() ->
@@ -318,8 +320,8 @@ class ServiceCatalogServiceTest {
     }
 
     @Test
-    @DisplayName("price and duration are irrelevant — same service type is still a duplicate")
-    void should_throwDuplicateService_when_sameTypeSubmittedWithDifferentPriceAndDuration() {
+    @DisplayName("phase 464 D3 — price is irrelevant: same type, same duration and same name at another price is still a duplicate")
+    void should_throwDuplicateService_when_sameCopySubmittedWithDifferentPrice() {
         UUID masterId = UUID.randomUUID();
         UUID userId = UUID.randomUUID();
         UUID serviceTypeId = UUID.randomUUID();
@@ -333,20 +335,42 @@ class ServiceCatalogServiceTest {
         when(serviceType.getId()).thenReturn(serviceTypeId);
         when(serviceType.getNameUk()).thenReturn("Класичне нарощення");
         when(serviceRepository.findActiveDuplicateId(
-                OwnerType.INDEPENDENT_MASTER, masterId, serviceTypeId, null))
+                OwnerType.INDEPENDENT_MASTER, masterId, serviceTypeId, 60, "Manicure", null))
                 .thenReturn(Optional.of(UUID.randomUUID()));
 
-        // Deliberately a DIFFERENT price (999.00 vs the helper's 350.00) and duration (30 vs 60):
-        // the locked product rule keys on the service type alone.
-        CreateServiceDefinitionRequest differentPriceAndDuration = new CreateServiceDefinitionRequest(
-                "Manicure", "Classic manicure", "MANICURE", 30, 10,
+        // Deliberately a DIFFERENT price (999.00 vs the helper's 350.00), same duration and name.
+        CreateServiceDefinitionRequest differentPrice = new CreateServiceDefinitionRequest(
+                "Manicure", "Classic manicure", "MANICURE", 60, 10,
                 PriceType.FIXED, new BigDecimal("999.00"), null, null, serviceTypeId);
 
         assertThatThrownBy(() ->
-                serviceCatalogService.addIndependentMasterService(userId, differentPriceAndDuration))
+                serviceCatalogService.addIndependentMasterService(userId, differentPrice))
                 .isInstanceOf(DuplicateServiceException.class);
 
         verify(serviceRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("phase 464 — the guard is keyed by the copy: it is queried with the request's duration and effective name")
+    void should_queryGuardWithDurationAndEffectiveName_when_creatingSalonService() {
+        UUID salonId = UUID.randomUUID();
+        UUID serviceTypeId = UUID.randomUUID();
+
+        when(salonRepository.existsById(salonId)).thenReturn(true);
+        ServiceType serviceType = stubActiveManicureType(serviceTypeId);
+        when(serviceType.getId()).thenReturn(serviceTypeId);
+        when(serviceType.getNameUk()).thenReturn("Класичне нарощення");
+        when(serviceRepository.saveAndFlush(any(ServiceDefinition.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        // No name in the request → the effective (stored) name is the type's nameUk.
+        CreateServiceDefinitionRequest unnamed90 = new CreateServiceDefinitionRequest(
+                null, null, "MANICURE", 90, 10,
+                PriceType.FIXED, new BigDecimal("350.00"), null, null, serviceTypeId);
+
+        serviceCatalogService.addServiceToSalon(salonId, unnamed90);
+
+        verify(serviceRepository).findActiveDuplicateId(
+                OwnerType.SALON, salonId, serviceTypeId, 90, "Класичне нарощення", null);
     }
 
     @Test
@@ -360,7 +384,7 @@ class ServiceCatalogServiceTest {
         when(serviceType.getId()).thenReturn(serviceTypeId);
         // Pre-check passes (a concurrent transaction has not committed yet)…
         when(serviceRepository.findActiveDuplicateId(
-                OwnerType.SALON, salonId, serviceTypeId, null))
+                OwnerType.SALON, salonId, serviceTypeId, 60, "Manicure", null))
                 .thenReturn(Optional.empty());
         // …and the DB index is the one that catches it at flush.
         when(serviceRepository.saveAndFlush(any(ServiceDefinition.class)))
@@ -401,7 +425,7 @@ class ServiceCatalogServiceTest {
         when(serviceType.getId()).thenReturn(serviceTypeId);
         // Pre-check passes (a concurrent transaction has not committed yet)…
         when(serviceRepository.findActiveDuplicateId(
-                OwnerType.INDEPENDENT_MASTER, masterId, serviceTypeId, null))
+                OwnerType.INDEPENDENT_MASTER, masterId, serviceTypeId, 60, "Manicure", null))
                 .thenReturn(Optional.empty());
         // …and the DB index catches it at the DEFERRED flush. This path no longer goes through
         // saveAndFlush: the definition and the assignment are saved plainly and one explicit
@@ -458,7 +482,7 @@ class ServiceCatalogServiceTest {
         ServiceType serviceType = stubActiveManicureType(serviceTypeId);
         when(serviceType.getId()).thenReturn(serviceTypeId);
         when(serviceRepository.findActiveDuplicateId(
-                OwnerType.SALON, salonId, serviceTypeId, null))
+                OwnerType.SALON, salonId, serviceTypeId, 60, "Manicure", null))
                 .thenReturn(Optional.empty());
         // A DIFFERENT constraint fails, but PgJDBC renders the offending row — description and
         // all — into the message, so the message now contains the duplicate index's name while
@@ -488,7 +512,7 @@ class ServiceCatalogServiceTest {
         ServiceType serviceType = stubActiveManicureType(serviceTypeId);
         when(serviceType.getId()).thenReturn(serviceTypeId);
         when(serviceRepository.findActiveDuplicateId(
-                OwnerType.SALON, salonId, serviceTypeId, null))
+                OwnerType.SALON, salonId, serviceTypeId, 60, "Manicure", null))
                 .thenReturn(Optional.empty());
         when(serviceRepository.saveAndFlush(any(ServiceDefinition.class)))
                 .thenThrow(DuplicateServiceViolations.violationOf("service_definitions_service_type_id_fkey"));
@@ -2485,5 +2509,57 @@ class ServiceCatalogServiceTest {
                 .as("a service with zero bookable performing masters must be excluded from the catalogue")
                 .isEmpty();
         verify(platformCategoryOrderLookup, never()).getApprovedActive();
+    }
+
+    // ── phase 464 name ALLOW-LIST (create) ────────────────────────────────────────
+
+    @ParameterizedTest(name = "[{index}] {0}")
+    @MethodSource("com.beautica.service.service.ServiceNameCases#rejectedNames")
+    @DisplayName("phase 464 — 400 on create when the name carries a character outside the allow-list")
+    void should_throwBadRequest_when_createNameOutsideAllowList(String codePoint, String name) {
+        UUID salonId = UUID.randomUUID();
+        UUID serviceTypeId = UUID.randomUUID();
+        ServiceType serviceType = mock(ServiceType.class);
+        when(serviceType.isActive()).thenReturn(true);
+        when(serviceType.getPlatformCategoryName()).thenReturn("MANICURE");
+        CreateServiceDefinitionRequest request = new CreateServiceDefinitionRequest(
+                name, "Classic manicure", "MANICURE", 60, 10,
+                PriceType.FIXED, new BigDecimal("350.00"), null, null, serviceTypeId);
+        when(salonRepository.existsById(salonId)).thenReturn(true);
+        when(platformCategoryRepository.existsByNameAndActiveTrueAndStatus(
+                "MANICURE", PlatformCategoryStatus.APPROVED)).thenReturn(true);
+        when(serviceTypeLookup.getById(serviceTypeId)).thenReturn(serviceType);
+
+        assertThatThrownBy(() -> serviceCatalogService.addServiceToSalon(salonId, request))
+                .isInstanceOf(BusinessException.class)
+                .hasMessage(ServiceNameCases.INVALID_NAME_MESSAGE)
+                .extracting("status").hasToString("400 BAD_REQUEST");
+
+        verify(serviceRepository, never()).saveAndFlush(any());
+    }
+
+    @ParameterizedTest(name = "[{index}] \"{0}\" -> \"{1}\"")
+    @MethodSource("com.beautica.service.service.ServiceNameCases#acceptedNames")
+    @DisplayName("phase 464 — an allow-listed create name is accepted and stored canonical")
+    void should_storeCanonicalName_when_createNameIsAllowListed(String input, String stored) {
+        UUID salonId = UUID.randomUUID();
+        UUID serviceTypeId = UUID.randomUUID();
+        ServiceType serviceType = mock(ServiceType.class);
+        when(serviceType.isActive()).thenReturn(true);
+        when(serviceType.getPlatformCategoryName()).thenReturn("MANICURE");
+        CreateServiceDefinitionRequest request = new CreateServiceDefinitionRequest(
+                input, "Classic manicure", "MANICURE", 60, 10,
+                PriceType.FIXED, new BigDecimal("350.00"), null, null, serviceTypeId);
+        when(salonRepository.existsById(salonId)).thenReturn(true);
+        when(platformCategoryRepository.existsByNameAndActiveTrueAndStatus(
+                "MANICURE", PlatformCategoryStatus.APPROVED)).thenReturn(true);
+        when(serviceTypeLookup.getById(serviceTypeId)).thenReturn(serviceType);
+        when(serviceRepository.saveAndFlush(any(ServiceDefinition.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        serviceCatalogService.addServiceToSalon(salonId, request);
+
+        ArgumentCaptor<ServiceDefinition> captor = ArgumentCaptor.forClass(ServiceDefinition.class);
+        verify(serviceRepository).saveAndFlush(captor.capture());
+        assertThat(captor.getValue().getName()).isEqualTo(stored);
     }
 }

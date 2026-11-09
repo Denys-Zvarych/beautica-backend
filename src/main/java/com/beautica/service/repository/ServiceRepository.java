@@ -199,9 +199,15 @@ public interface ServiceRepository extends JpaRepository<ServiceDefinition, UUID
 
     /**
      * Finds the id of an existing ACTIVE {@link ServiceDefinition} that would collide with a
-     * write for {@code (ownerType, ownerId, serviceTypeId)} — the exact key of the partial
-     * unique index {@code ux_service_def_owner_service_type_active} (V121), which enforces
-     * "one active service per owner per service type, regardless of price or duration".
+     * write for {@code (ownerType, ownerId, serviceTypeId, durationMinutes, name)} — the exact key
+     * of the partial unique index {@code ux_service_def_owner_type_duration_name_active} (V233,
+     * phase 464), which allows several active copies of one type per owner as long as each pair
+     * differs in base duration or in name. Price never participates.
+     *
+     * <p>The name is compared {@code lower(trim(name))} on BOTH sides — the same normalisation as
+     * the index's {@code lower(btrim(name))} (JPQL {@code trim} trims spaces only, exactly like
+     * Postgres {@code btrim}). Java never normalises the name for this check, so the rule lives in
+     * the index and in this predicate only.
      *
      * <p>Returns the id only (not the entity): the caller needs it solely to populate the
      * {@code DUPLICATE_SERVICE} 409 payload, so hydrating the full row would be waste.
@@ -222,6 +228,8 @@ public interface ServiceRepository extends JpaRepository<ServiceDefinition, UUID
             WHERE sd.ownerType = :ownerType
               AND sd.ownerId = :ownerId
               AND sd.serviceType.id = :serviceTypeId
+              AND sd.baseDurationMinutes = :durationMinutes
+              AND lower(trim(sd.name)) = lower(trim(:name))
               AND sd.isActive = true
               AND (:excludeId IS NULL OR sd.id <> :excludeId)
             """)
@@ -229,12 +237,15 @@ public interface ServiceRepository extends JpaRepository<ServiceDefinition, UUID
             @Param("ownerType") OwnerType ownerType,
             @Param("ownerId") UUID ownerId,
             @Param("serviceTypeId") UUID serviceTypeId,
+            @Param("durationMinutes") int durationMinutes,
+            @Param("name") String name,
             @Param("excludeId") UUID excludeId);
 
     /**
-     * Batched sibling of {@link #findActiveDuplicateId}: resolves, in ONE query, every
-     * {@code (serviceTypeId → existing active ServiceDefinition id)} pair that would collide
-     * with a multi-item write for {@code (ownerType, ownerId)}.
+     * Batched sibling of {@link #findActiveDuplicateId}: resolves, in ONE query, every existing
+     * active {@link ServiceDefinition} of {@code (ownerType, ownerId)} that collides with one of
+     * the requested copies {@code (typeIds[i], durations[i], names[i])} — the three arrays are
+     * parallel, zipped by {@code unnest}.
      *
      * <p><b>Why this exists.</b> The bulk service-create path accepts up to 100 items
      * ({@code @Size(max = 100)} on {@code BulkCreateServicesRequest}); calling
@@ -244,31 +255,43 @@ public interface ServiceRepository extends JpaRepository<ServiceDefinition, UUID
      * additionally forced a Hibernate AUTO flush, defeating JDBC insert batching — so the two
      * only pay off together.
      *
-     * <p>Returns the definition id alongside the type id (rather than type ids alone) so the
-     * caller can still populate {@code existingServiceDefId} on the {@code DUPLICATE_SERVICE}
-     * 409 and let the client deep-link to the offending row, exactly as the single-item path does.
+     * <p><b>Why native.</b> Phase 464 matches on the (type, duration, name) TUPLE per item. JPQL
+     * cannot zip parallel parameter lists, and three independent {@code IN} lists would match the
+     * cross product (item A's duration with item B's name) — a false 409. The name is compared
+     * {@code lower(btrim(...))} on both sides, the index's own expression.
+     *
+     * <p>Returns the definition id alongside the type id so the caller can populate
+     * {@code existingServiceDefId} on the {@code DUPLICATE_SERVICE} 409 and let the client
+     * deep-link to the colliding copy, exactly as the single-item path does.
      *
      * <p>No {@code excludeId} parameter: this serves create paths only, where nothing is being
      * updated in place. Use {@link #findActiveDuplicateId} for PATCH.
      *
-     * <p>Bounded by construction — {@code typeIds} is the caller's own validated, deduplicated
-     * request set, so the result can never exceed it (anti-bug §E-3). Like every finder here it
-     * is unscoped (§E-4): the caller must already have established write access to this owner.
-     * And like its sibling it is a read-then-write check, TOCTOU-prone by nature — the partial
-     * unique index {@code ux_service_def_owner_service_type_active} remains the actual guarantee.
+     * <p>Bounded by construction — the arrays are the caller's own validated request (≤ 100
+     * items), and each item can match at most one active row (the index is unique), so the result
+     * can never exceed the request (anti-bug §E-3). Like every finder here it is unscoped (§E-4):
+     * the caller must already have established write access to this owner. And like its sibling
+     * it is a read-then-write check, TOCTOU-prone by nature — the partial unique index
+     * {@code ux_service_def_owner_type_duration_name_active} remains the actual guarantee.
      */
-    @Query("""
-            SELECT new com.beautica.service.repository.ActiveDuplicateProjection(sd.serviceType.id, sd.id)
-            FROM ServiceDefinition sd
-            WHERE sd.ownerType = :ownerType
-              AND sd.ownerId = :ownerId
-              AND sd.isActive = true
-              AND sd.serviceType.id IN :typeIds
-            """)
-    List<ActiveDuplicateProjection> findActiveDuplicateTypeIds(
-            @Param("ownerType") OwnerType ownerType,
+    @Query(value = """
+            SELECT sd.service_type_id AS serviceTypeId, sd.id AS serviceDefinitionId
+            FROM service_definitions sd
+            JOIN unnest(CAST(:typeIds AS uuid[]), CAST(:durations AS int[]), CAST(:names AS text[]))
+                 AS v(type_id, duration_minutes, name)
+              ON sd.service_type_id = v.type_id
+             AND sd.base_duration_minutes = v.duration_minutes
+             AND lower(btrim(sd.name)) = lower(btrim(v.name))
+            WHERE sd.owner_type = :ownerType
+              AND sd.owner_id = :ownerId
+              AND sd.is_active = true
+            """, nativeQuery = true)
+    List<ActiveDuplicateProjection> findActiveDuplicateCopies(
+            @Param("ownerType") String ownerType,
             @Param("ownerId") UUID ownerId,
-            @Param("typeIds") Collection<UUID> typeIds);
+            @Param("typeIds") UUID[] typeIds,
+            @Param("durations") Integer[] durations,
+            @Param("names") String[] names);
 
     /**
      * Phase 302 — the ONE query the salon-branch bulk-create critical section runs: every ACTIVE
@@ -277,7 +300,7 @@ public interface ServiceRepository extends JpaRepository<ServiceDefinition, UUID
      *
      * <p><b>Three round-trips collapsed into one (perf LOW-3).</b> The salon branch previously ran
      * {@code MasterServiceRepository#findActiveAssignedServiceTypeIds} (the per-master conflict),
-     * then {@link #findActiveDuplicateTypeIds} (the salon's reusable definition ids), then
+     * then {@code findActiveDuplicateTypeIds} (the salon's reusable definition ids), then
      * {@code findAllById} to re-fetch definitions the second query had already joined. All three
      * answers live in this one row shape. It matters because the advisory lock guarding this
      * section is keyed on the SALON (audit HIGH-2): the serialized window is salon-wide, so every

@@ -74,8 +74,9 @@ public class ServiceController {
     /**
      * Description attached to the {@code 409 DUPLICATE_SERVICE} declaration on every write
      * endpoint that can raise {@code DuplicateServiceException} — the five below, i.e. every path
-     * that inserts or re-types a {@code ServiceDefinition} and so can collide with V121's
-     * {@code ux_service_def_owner_service_type_active}.
+     * that inserts or re-keys a {@code ServiceDefinition} and so can collide with V233's
+     * {@code ux_service_def_owner_type_duration_name_active} (phase 464: one active copy per
+     * owner, type, base duration and trimmed case-insensitive name).
      *
      * <p>Declared explicitly because springdoc scans controller signatures, not
      * {@code @RestControllerAdvice} handlers: without these annotations the 409's body has no
@@ -85,8 +86,10 @@ public class ServiceController {
      * this project's response envelope, which is the return type of nearly every method here.
      */
     private static final String DUPLICATE_SERVICE_409 =
-            "The owner already offers an active service of this type. One active service per "
-                    + "(owner, service type); price and duration are irrelevant. Branch on "
+            "The owner already offers an active copy of this service with the same type, same "
+                    + "duration and same name (name compared trimmed and case-insensitive). Copies "
+                    + "of one type must differ in duration or name; price is irrelevant. "
+                    + "`existingServiceDefId` names the colliding copy. Branch on "
                     + "`data.code` == DUPLICATE_SERVICE, never on `message`.";
 
     /**

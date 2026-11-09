@@ -23,6 +23,7 @@ import com.beautica.service.dto.SalonCatalogSnapshot;
 import com.beautica.service.dto.SalonServiceCatalogResponse;
 import com.beautica.service.dto.SalonServiceCategoryGroup;
 import com.beautica.service.dto.ServiceDefinitionResponse;
+import com.beautica.service.dto.ServiceNameConstraints;
 import com.beautica.service.dto.ServicePricing;
 import com.beautica.service.dto.PlatformServiceTypeResponse;
 import com.beautica.service.dto.ServiceTypeResponse;
@@ -58,11 +59,13 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
 
 
 import java.math.BigDecimal;
+import java.text.Normalizer;
 import java.time.Clock;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -71,6 +74,8 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.regex.Pattern;
+import java.util.StringJoiner;
 import java.util.UUID;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -87,11 +92,19 @@ public class ServiceCatalogService {
     public static final String SALON_CATALOG_SNAPSHOT_CACHE = "salon-catalog-snapshot";
 
     /**
-     * Name of the partial unique index added in V121 that enforces one ACTIVE service per
-     * {@code (owner_type, owner_id, service_type_id)}. Matched against the DB's constraint-violation
-     * report to translate it into a {@link DuplicateServiceException}.
+     * Name of the partial unique index added in V233 (phase 464, replacing V121's) that enforces one
+     * ACTIVE copy per {@code (owner_type, owner_id, service_type_id, base_duration_minutes,
+     * lower(btrim(name)))}. Matched against the DB's constraint-violation report to translate it
+     * into a {@link DuplicateServiceException}.
      */
-    private static final String DUPLICATE_SERVICE_INDEX = "ux_service_def_owner_service_type_active";
+    private static final String DUPLICATE_SERVICE_INDEX = "ux_service_def_owner_type_duration_name_active";
+    /** {@code service_definitions.name} column length ({@code @Column(length = 100)}). */
+    private static final int MAX_SERVICE_NAME_LENGTH = 100;
+    private static final Pattern ALLOWED_NAME_PATTERN =
+            Pattern.compile(ServiceNameConstraints.ALLOWED_NAME_REGEX);
+    private static final Pattern SPACE_RUN = Pattern.compile(" {2,}");
+    /** U+2116 — kept through NFKC by {@link #nfkcKeepingNumeroSign}. */
+    private static final String NUMERO_SIGN = "\u2116";
 
     private final ServiceRepository serviceRepository;
     private final MasterServiceRepository masterServiceRepository;
@@ -146,16 +159,18 @@ public class ServiceCatalogService {
         validateCategoryActive(request.category());
 
         ServiceType serviceType = resolveRequiredServiceType(request.serviceTypeId(), request.category());
+        String name = resolveCreateName(request.name(), serviceType);
 
         // One extra SELECT on the success path, accepted deliberately so the conflict can carry
         // existingServiceDefId — the lazy "look it up in the catch" alternative needs
         // REQUIRES_NEW (the violation aborts the tx). Rationale in full on the method.
-        assertNoActiveDuplicate(OwnerType.SALON, salonId, serviceType, null);
+        assertNoActiveDuplicate(OwnerType.SALON, salonId, serviceType,
+                request.baseDurationMinutes(), name, null);
 
         ServiceDefinition definition = ServiceDefinition.builder()
                 .ownerType(OwnerType.SALON)
                 .ownerId(salonId)
-                .name(resolveCreateName(request.name(), serviceType))
+                .name(name)
                 .description(request.description())
                 .category(request.category())
                 .baseDurationMinutes(request.baseDurationMinutes())
@@ -561,16 +576,18 @@ public class ServiceCatalogService {
         validateCategoryActive(request.category());
 
         ServiceType serviceType = resolveRequiredServiceType(request.serviceTypeId(), request.category());
+        String name = resolveCreateName(request.name(), serviceType);
 
         // Same accepted trade-off as addServiceToSalon: one SELECT on the success path buys the
         // client a deep-linkable existingServiceDefId on the rare conflict. See the method javadoc.
-        assertNoActiveDuplicate(OwnerType.INDEPENDENT_MASTER, master.getId(), serviceType, null);
+        assertNoActiveDuplicate(OwnerType.INDEPENDENT_MASTER, master.getId(), serviceType,
+                request.baseDurationMinutes(), name, null);
 
         MasterSearchVisibilityGuard.Snapshot searchBefore = searchVisibilityGuard.capture(List.of(master.getId()));
         ServiceDefinition definition = ServiceDefinition.builder()
                 .ownerType(OwnerType.INDEPENDENT_MASTER)
                 .ownerId(master.getId())
-                .name(resolveCreateName(request.name(), serviceType))
+                .name(name)
                 .description(request.description())
                 .category(request.category())
                 .baseDurationMinutes(request.baseDurationMinutes())
@@ -753,7 +770,8 @@ public class ServiceCatalogService {
      * same row, and the guard additionally catches an active definition carrying no assignment,
      * which the assignment-level check cannot see.
      *
-     * <p>Rejects duplicate {@code serviceTypeId}s within the batch, derives each service name +
+     * <p>Rejects an exact duplicate copy (type + duration + effective name) within the batch
+     * (phase 464 D5 — two items of one type that differ in duration are allowed), derives each service name +
      * category from the chosen {@link ServiceType}, reuses {@link #applyPriceMode} for the
      * validated price mode, and persists the whole batch transactionally (all-or-nothing).
      */
@@ -763,11 +781,9 @@ public class ServiceCatalogService {
             UUID ownerId,
             BulkCreateServicesRequest request) {
 
-        rejectDuplicateServiceTypeIds(request.items());
-
-        // PERF: resolve all service types in ONE query (the ids are already distinct,
-        // guaranteed by rejectDuplicateServiceTypeIds) instead of N serialized findById
-        // calls, then validate every DISTINCT derived category in ONE query instead of a
+        // PERF: resolve all service types in ONE query (resolveBulkServiceTypes de-duplicates the
+        // ids itself — since phase 464 several items may share one type) instead of N serialized
+        // findById calls, then validate every DISTINCT derived category in ONE query instead of a
         // SELECT EXISTS per item. Both walks share this resolved-types map.
         //
         // These three steps run OUTSIDE the advisory lock (backend-perf finding 2): they are
@@ -775,7 +791,22 @@ public class ServiceCatalogService {
         // platform_categories) — no owner-scoped state, so serializing them buys nothing while
         // extending the lock hold by ~2 DB round-trips on every call. Hoisting them also means a
         // request that 400s/404s on a bad service type never takes the lock at all.
+        if (ownerType == OwnerType.SALON) {
+            // phase 465 lifts this: until the salon branch resolves reuse per copy, two items of
+            // one type in one salon request would both reuse the same salon definition and hit
+            // master_services' unique key as an opaque generic 409. Keep the pre-464 per-type 400.
+            rejectDuplicateServiceTypesInRequest(request.items());
+        } else {
+            // Phase 464 D5 — before the type lookup, so duplicate + unknown type stays a 400:
+            // supplied names compare as given, blank names compare equal within one type.
+            rejectDuplicateCopiesInRequest(request.items(), Map.of());
+        }
+
+        // PERF: see above — one query for every distinct type.
         Map<UUID, ServiceType> typesById = resolveBulkServiceTypes(request.items());
+        // Second pass with the resolved types: an unnamed item's effective name is the type's
+        // nameUk, so «no name» and a name equal to nameUk (any case/spacing) are the same copy.
+        rejectDuplicateCopiesInRequest(request.items(), typesById);
         validateBulkCategoriesActive(typesById.values());
 
         // TOCTOU guard: serialize concurrent additive bulk adds against the same DEFINITION key
@@ -934,8 +965,8 @@ public class ServiceCatalogService {
 
     /**
      * Batch-resolves every {@link ServiceType} referenced by the bulk items in ONE
-     * {@code findAllById} query (the ids are already distinct — see
-     * {@link #rejectDuplicateServiceTypeIds}). Each requested id must exist and be
+     * {@code findAllById} query over the DISTINCT ids (since phase 464 several items may carry one
+     * type — see {@link #rejectDuplicateCopiesInRequest}). Each requested id must exist and be
      * active, otherwise the same errors the per-item path raised are thrown: a missing
      * id is a 404 {@link NotFoundException}, an inactive type is a 400.
      *
@@ -944,6 +975,7 @@ public class ServiceCatalogService {
     private Map<UUID, ServiceType> resolveBulkServiceTypes(List<BulkServiceItemRequest> items) {
         List<UUID> ids = items.stream()
                 .map(BulkServiceItemRequest::serviceTypeId)
+                .distinct()
                 .toList();
 
         Map<UUID, ServiceType> typesById = serviceTypeRepository.findAllById(ids).stream()
@@ -1073,7 +1105,7 @@ public class ServiceCatalogService {
         ServiceDefinition definition = ServiceDefinition.builder()
                 .ownerType(ownerType)
                 .ownerId(ownerId)
-                .name(serviceType.getNameUk())
+                .name(resolveCreateName(item.name(), serviceType))
                 .category(category)
                 .baseDurationMinutes(item.durationMinutes())
                 .bufferMinutesAfter(0)
@@ -1102,30 +1134,69 @@ public class ServiceCatalogService {
     }
 
     /**
-     * Rejects a batch that toggles the same service type on twice. Without this guard a
-     * caller could create two near-identical services in one call, which the multi-select
-     * setup screen never intends.
+     * Phase 464 D5 — rejects a batch carrying the SAME copy twice: two items with the same
+     * {@code serviceTypeId}, the same {@code durationMinutes} and the same effective name. Two
+     * items of one type that differ in duration (or name) are legitimate copies and pass; each is
+     * then checked against existing copies by {@link #assertNoActiveDuplicatesInBatch} and inserted
+     * in item order.
      *
-     * <p><b>Deliberately a 400, NOT the {@code DUPLICATE_SERVICE} 409</b> (decision made
-     * explicit alongside V121, previously accidental). The two failures are different kinds:
+     * <p><b>Effective name.</b> The item's own non-blank {@code name}, else the type's {@code nameUk}
+     * — the name {@link #createSingleFromBulkItem} stores ({@link #effectiveBulkName}). Runs twice:
+     * before the type lookup (unnamed items of one type compare equal, so a duplicate next to an
+     * unknown type is still a 400) and after it (an unnamed item equals one named like the type).
+     * Used on the INDEPENDENT_MASTER branch; the SALON branch keeps
+     * {@link #rejectDuplicateServiceTypesInRequest} until phase 465. It is normalised by
+     * {@link #normaliseCopyName} (NFKC + {@link String#strip()}, then {@code toLowerCase(Locale.ROOT)}),
+     * which agrees with the V233 index's {@code lower(btrim(name))} because stored names are already
+     * canonical; the index stays the source of truth and the backstop.
+     *
+     * <p><b>Deliberately a 400, NOT the {@code DUPLICATE_SERVICE} 409</b> (decision made explicit
+     * alongside V121, kept by 464 D5). The two failures are different kinds:
      * <ul>
      *   <li>409 {@code DUPLICATE_SERVICE} = the request conflicts with <em>server state</em> —
-     *       the owner already has this service. The client's remedy is to look at the existing
-     *       row (hence the {@code existingServiceDefId} in the payload).</li>
+     *       the owner already has this copy. The client's remedy is to look at the existing row
+     *       (hence the {@code existingServiceDefId} in the payload).</li>
      *   <li>400 here = the <em>payload itself</em> is self-inconsistent; nothing exists yet and
-     *       no server state is involved. The client's remedy is to deduplicate its own rows
-     *       before resubmitting. Returning a 409 with a null {@code existingServiceDefId} would
-     *       give the mobile screen a code it cannot act on and would blur the two branches.</li>
+     *       no server state is involved. Returning a 409 with a null {@code existingServiceDefId}
+     *       would give the mobile screen a code it cannot act on.</li>
      * </ul>
      *
-     * <p>Known gap (not introduced here, out of scope for V121): {@code handleBusiness}
-     * genericises every {@code BAD_REQUEST} body to {@code "Invalid request"} with no
-     * {@code errors} map, so this 400 currently carries no {@code items[i].serviceTypeId} field
-     * path for the setup screen to resolve back to a row. The structured-field-error channel is
-     * driven by Bean Validation ({@code MethodArgumentNotValidException}); wiring a service-layer
-     * throw into it needs a new exception type + handler and belongs in its own change.
+     * <p>Known gap (unchanged): {@code handleBusiness} genericises every {@code BAD_REQUEST} body to
+     * {@code "Invalid request"} with no {@code errors} map, so this 400 carries no field path.
      */
-    private void rejectDuplicateServiceTypeIds(List<BulkServiceItemRequest> items) {
+    private void rejectDuplicateCopiesInRequest(List<BulkServiceItemRequest> items,
+            Map<UUID, ServiceType> typesById) {
+        Set<BulkCopyKey> seen = new HashSet<>();
+        for (BulkServiceItemRequest item : items) {
+            BulkCopyKey key = new BulkCopyKey(item.serviceTypeId(), item.durationMinutes(),
+                    normaliseCopyName(effectiveBulkName(item, typesById.get(item.serviceTypeId()))));
+            if (!seen.add(key)) {
+                throw new BusinessException(HttpStatus.BAD_REQUEST,
+                        "Duplicate service in bulk request");
+            }
+        }
+    }
+
+    /**
+     * The name a bulk item will be stored under: its own non-blank {@code name}, else the type's
+     * {@code nameUk}; {@code null} when the item is unnamed and its type is not resolved yet (the
+     * pre-lookup pass, where unnamed items of one type therefore compare equal).
+     */
+    @Nullable
+    private static String effectiveBulkName(BulkServiceItemRequest item, @Nullable ServiceType type) {
+        String canonical = canonicalName(item.name());
+        if (canonical != null && !canonical.isEmpty()) {
+            return canonical;
+        }
+        return type != null ? type.getNameUk() : null;
+    }
+
+    /**
+     * Pre-464 in-request rule, kept for the SALON bulk branch only until phase 465: rejects two
+     * items of one {@code serviceTypeId} regardless of duration or name, with the same 400 as
+     * before. phase 465 lifts this.
+     */
+    private void rejectDuplicateServiceTypesInRequest(List<BulkServiceItemRequest> items) {
         long distinct = items.stream()
                 .map(BulkServiceItemRequest::serviceTypeId)
                 .distinct()
@@ -1134,6 +1205,63 @@ public class ServiceCatalogService {
             throw new BusinessException(HttpStatus.BAD_REQUEST,
                     "Duplicate service type in bulk request");
         }
+    }
+
+    /**
+     * In-request comparison key: {@link #canonicalName} then {@code toLowerCase(Locale.ROOT)}. Because
+     * every stored name is already canonical (no leading/trailing whitespace), this agrees with the
+     * V233 index expression {@code lower(btrim(name))}; {@code null} stays {@code null}.
+     */
+    @Nullable
+    private static String normaliseCopyName(@Nullable String name) {
+        String canonical = canonicalName(name);
+        return canonical == null ? null : canonical.toLowerCase(Locale.ROOT);
+    }
+
+    /**
+     * Canonical stored form of a user-supplied service name (phase 464): Unicode NFKC (keeping
+     * {@code №}, see {@link #nfkcKeepingNumeroSign}), internal
+     * runs of U+0020 collapsed to one, then {@link String#strip()}. NFKC first folds compatibility
+     * spaces (U+00A0, U+2007, U+202F) to U+0020, so collapse and strip cover them too; the stored
+     * name therefore never carries edge or doubled spaces and {@code btrim} in the V233 index is a
+     * no-op on it. Re-checks the 100-char column cap because NFKC can lengthen a string (ligatures)
+     * after Bean Validation ran, then applies the allow-list
+     * ({@link ServiceNameConstraints#ALLOWED_NAME_REGEX}) to any non-blank result. Only ever called
+     * on a name the request supplies — a stored name or a catalogue {@code nameUk} default is never
+     * re-validated. Blank stays {@code ""} so callers can default it to the type name.
+     */
+    @Nullable
+    private static String canonicalName(@Nullable String name) {
+        if (name == null) {
+            return null;
+        }
+        String nfkc = nfkcKeepingNumeroSign(name);
+        String canonical = SPACE_RUN.matcher(nfkc).replaceAll(" ").strip();
+        if (canonical.length() > MAX_SERVICE_NAME_LENGTH) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST, "Name must be at most 100 characters");
+        }
+        if (!canonical.isEmpty() && !ALLOWED_NAME_PATTERN.matcher(canonical).matches()) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST, ServiceNameConstraints.NAME_REGEX_MESSAGE);
+        }
+        return canonical;
+    }
+
+    /**
+     * NFKC everywhere except the numero sign: NFKC folds {@code №} (U+2116, the only allow-listed
+     * punctuation it changes) to {@code "No"}, which is wrong for Ukrainian names — so each
+     * {@code №}-free segment is normalised on its own and the sign is re-inserted verbatim.
+     */
+    private static String nfkcKeepingNumeroSign(String name) {
+        String[] segments = name.split(NUMERO_SIGN, -1);
+        StringJoiner joined = new StringJoiner(NUMERO_SIGN);
+        for (String segment : segments) {
+            joined.add(Normalizer.normalize(segment, Normalizer.Form.NFKC));
+        }
+        return joined.toString();
+    }
+
+    /** In-request identity of one bulk copy — see {@link #rejectDuplicateCopiesInRequest}. */
+    private record BulkCopyKey(UUID serviceTypeId, Integer durationMinutes, @Nullable String name) {
     }
 
     @Transactional(readOnly = true)
@@ -1514,7 +1642,8 @@ public class ServiceCatalogService {
      * @return the type to assign, or {@code null} when the request does not change it
      * @throws BusinessException          (400) unknown/inactive category, or a type that does not
      *                                    belong to the effective category
-     * @throws DuplicateServiceException  (409) the owner already offers an active service of this type
+     * @throws DuplicateServiceException  (409) the owner already offers an active copy with the
+     *                                    effective (type, duration, name) of this row
      */
     @Nullable
     private ServiceType resolvePatchServiceType(ServiceDefinition definition,
@@ -1527,6 +1656,7 @@ public class ServiceCatalogService {
                 request.category() != null ? request.category() : definition.getCategory();
 
         // Service type (PATCH): null = leave unchanged (never clears).
+        ServiceType serviceType = null;
         if (request.serviceTypeId() == null) {
             // Category-only PATCH: the existing service type is not re-resolved, so re-check that
             // it still belongs to the incoming category. Without this guard a category change
@@ -1538,17 +1668,39 @@ public class ServiceCatalogService {
                 throw new BusinessException(HttpStatus.BAD_REQUEST,
                         "service type does not belong to the selected category");
             }
-            return null;
+        } else {
+            serviceType = resolveServiceType(request.serviceTypeId(), effectiveCategory);
         }
 
-        ServiceType serviceType = resolveServiceType(request.serviceTypeId(), effectiveCategory);
-
-        // excludeId = this row, so re-submitting the type the definition already has is a no-op
-        // rather than a self-collision.
-        assertNoActiveDuplicate(definition.getOwnerType(), definition.getOwnerId(),
-                serviceType, definition.getId());
-
+        assertPatchKeepsCopyUnique(definition, request, serviceType);
         return serviceType;
+    }
+
+    /**
+     * Phase 464 — runs the duplicate guard whenever the PATCH touches any part of the V233 key
+     * (type, base duration or name), against the row's EFFECTIVE post-PATCH values: the request's
+     * value where present, the stored one otherwise. The effective name follows
+     * {@link #applyNamePatch} exactly (blank → the effective type's {@code nameUk}). excludeId = this
+     * row, so re-submitting the row's own current values is a no-op rather than a self-collision.
+     * Called while the entity is still CLEAN (see {@link #resolvePatchServiceType}).
+     */
+    private void assertPatchKeepsCopyUnique(ServiceDefinition definition,
+            UpdateServiceDefinitionRequest request, @Nullable ServiceType newServiceType) {
+        if (request.serviceTypeId() == null && request.baseDurationMinutes() == null
+                && request.name() == null) {
+            return;
+        }
+        ServiceType effectiveType = newServiceType != null ? newServiceType : definition.getServiceType();
+        int effectiveDuration = request.baseDurationMinutes() != null
+                ? request.baseDurationMinutes() : definition.getBaseDurationMinutes();
+        String effectiveName = definition.getName();
+        if (request.name() != null) {
+            String canonical = canonicalName(request.name());
+            effectiveName = !canonical.isEmpty() || effectiveType == null
+                    ? canonical : effectiveType.getNameUk();
+        }
+        assertNoActiveDuplicate(definition.getOwnerType(), definition.getOwnerId(),
+                effectiveType, effectiveDuration, effectiveName, definition.getId());
     }
 
     /**
@@ -1568,8 +1720,9 @@ public class ServiceCatalogService {
         if (request.name() == null) {
             return;
         }
-        if (!request.name().isBlank()) {
-            definition.setName(request.name());
+        String canonical = canonicalName(request.name());
+        if (!canonical.isEmpty()) {
+            definition.setName(canonical);
             return;
         }
         // Explicitly blank name — default to the effective service type's Ukrainian name.
@@ -2115,12 +2268,13 @@ public class ServiceCatalogService {
     }
 
     /**
-     * Rejects a write that would leave {@code (ownerType, ownerId)} with two ACTIVE services of
-     * the same {@link ServiceType} — the locked product rule "one active service per owner per
-     * service type, <em>regardless of price or duration</em>".
+     * Rejects a write that would leave {@code (ownerType, ownerId)} with two ACTIVE copies of
+     * the same {@link ServiceType} with the same base duration and the same name (trimmed,
+     * case-insensitive) — the phase-464 rule (track D2): copies of one type must differ in
+     * duration OR name; price never participates.
      *
      * <p>This is the friendly path only. The real guarantee is the partial unique index
-     * {@code ux_service_def_owner_service_type_active} (V121); this pre-check exists so the
+     * {@code ux_service_def_owner_type_duration_name_active} (V233); this pre-check exists so the
      * common case yields a branchable {@code DUPLICATE_SERVICE} 409 naming the existing service
      * instead of a bare constraint violation. Being a read-then-write check it is TOCTOU-prone,
      * which {@link #persistDefinition} closes on every write path.
@@ -2146,20 +2300,26 @@ public class ServiceCatalogService {
      *
      * @param excludeId the row being updated (so a PATCH cannot collide with itself), or
      *                  {@code null} on a create path
-     * @throws DuplicateServiceException (409) when an active service of this type already exists
+     * @param durationMinutes the copy's base duration (phase 464 key part)
+     * @param name            the copy's effective (stored) name, raw — the repository compares it
+     *                        {@code lower(trim(...))} like the V233 index; Java never normalises it
+     * @throws DuplicateServiceException (409) when an active copy with the same type, duration and
+     *                                   name already exists; {@code existingServiceDefId} names it
      */
     private void assertNoActiveDuplicate(OwnerType ownerType, UUID ownerId,
-            @Nullable ServiceType serviceType, @Nullable UUID excludeId) {
+            @Nullable ServiceType serviceType, int durationMinutes, @Nullable String name,
+            @Nullable UUID excludeId) {
 
         // Null-safe: service_type_id is NOT NULL since V111 and every create path resolves a
         // non-null type, so this is unreachable in practice — but a null here must never become
         // an NPE 500. The DB index remains the backstop.
-        if (serviceType == null || serviceType.getId() == null) {
+        if (serviceType == null || serviceType.getId() == null || name == null) {
             return;
         }
 
         serviceRepository
-                .findActiveDuplicateId(ownerType, ownerId, serviceType.getId(), excludeId)
+                .findActiveDuplicateId(ownerType, ownerId, serviceType.getId(), durationMinutes,
+                        name, excludeId)
                 .ifPresent(existingId -> {
                     throw new DuplicateServiceException(serviceType.getNameUk(), existingId);
                 });
@@ -2180,17 +2340,23 @@ public class ServiceCatalogService {
      * <p><b>This is the only cross-request conflict guard the bulk path has.</b> Bulk create is
      * additive — there is no "master must have zero services" precondition to lean on — so every
      * collision with what the owner already offers is caught here. The guard is definition-level,
-     * exactly like the V121 unique index it front-runs, which means it also covers the awkward
+     * exactly like the V233 unique index it front-runs (phase 464: keyed per copy — type,
+     * duration and name — not per type), which means it also covers the awkward
      * case of an active definition carrying no active assignment: invisible in the master's menu,
      * still a collision at INSERT. Catching it here turns that into a clean 409 naming the
      * offending item instead of a 500 at flush. {@link #flushBulkBatch} still translates a raced
-     * V121 violation as the last line of defence.
+     * V233 violation as the last line of defence. Two new copies of one type in one request (allowed
+     * by {@link #rejectDuplicateCopiesInRequest}) both pass this guard and are inserted in item order.
      *
      * <p>Reported collision is the FIRST in <em>request order</em>, not in result order: the
      * query's row order is unspecified, and blaming a later item for an earlier item's conflict
      * would make the error non-deterministic across identical requests.
      *
-     * @throws DuplicateServiceException (409) naming the first item whose type is already taken
+     * <p>The projection is keyed by type, so when several items share a type the first item of
+     * that type in request order is blamed; the payload carries only the type name and the
+     * colliding copy's id, both correct either way.
+     *
+     * @throws DuplicateServiceException (409) naming the first item whose copy is already taken
      */
     private void assertNoActiveDuplicatesInBatch(OwnerType ownerType, UUID ownerId,
             List<BulkServiceItemRequest> items, Map<UUID, ServiceType> typesById) {
@@ -2199,8 +2365,23 @@ public class ServiceCatalogService {
             return;
         }
 
+        // Phase 464 — one zipped (type, duration, effective name) triple per item; the effective
+        // name is the item's name or the type's nameUk, exactly what createSingleFromBulkItem stores. Names go to the
+        // query raw: the SQL normalises them with the index's own lower(btrim(...)).
+        int size = items.size();
+        UUID[] typeIds = new UUID[size];
+        Integer[] durations = new Integer[size];
+        String[] names = new String[size];
+        for (int i = 0; i < size; i++) {
+            BulkServiceItemRequest item = items.get(i);
+            ServiceType type = typesById.get(item.serviceTypeId());
+            typeIds[i] = item.serviceTypeId();
+            durations[i] = item.durationMinutes();
+            names[i] = effectiveBulkName(item, type);
+        }
+
         Map<UUID, UUID> existingDefIdByTypeId = serviceRepository
-                .findActiveDuplicateTypeIds(ownerType, ownerId, typesById.keySet())
+                .findActiveDuplicateCopies(ownerType.name(), ownerId, typeIds, durations, names)
                 .stream()
                 .collect(Collectors.toMap(
                         ActiveDuplicateProjection::serviceTypeId,
@@ -2620,7 +2801,8 @@ public class ServiceCatalogService {
     }
 
     /**
-     * True when the violation came from {@code ux_service_def_owner_service_type_active}.
+     * True when the violation came from {@link #DUPLICATE_SERVICE_INDEX}
+     * ({@code ux_service_def_owner_type_duration_name_active}, V233).
      *
      * <p>Matches ONLY on Hibernate's structured {@code getConstraintName()}. Be precise about what
      * that is: in Hibernate 6 {@code PostgreSQLDialect}'s {@code ViolatedConstraintNameExtractor}
@@ -2639,7 +2821,7 @@ public class ServiceCatalogService {
      * for the index name was attacker-steerable: PgJDBC renders {@code Detail: Failing row
      * contains (…)} into the exception message, echoing the caller's own {@code name} /
      * {@code description}. A request carrying
-     * {@code description = "ux_service_def_owner_service_type_active"} that tripped a
+     * {@code description = "ux_service_def_owner_type_duration_name_active"} that tripped a
      * <em>different</em> constraint would then be misclassified as {@code DUPLICATE_SERVICE},
      * turning an opaque 409 into a wrong, caller-chosen error code. A
      * {@code org.postgresql.util.PSQLException#getServerErrorMessage().getConstraint()} fallback
@@ -2741,7 +2923,8 @@ public class ServiceCatalogService {
     /**
      * Resolves the persisted name for a create request.
      *
-     * <p>When the request supplies a non-blank name it is used verbatim. When the name is
+     * <p>When the request supplies a non-blank name it is stored in canonical form
+     * ({@link #canonicalName}: NFKC + Unicode-whitespace strip). When the name is
      * null or blank, the persisted name defaults to the selected service type's Ukrainian
      * display name ({@link ServiceType#getNameUk()}). When neither a name nor a service type
      * is available, the request is rejected with a clear validation error — never persist a
@@ -2753,8 +2936,9 @@ public class ServiceCatalogService {
      * @throws BusinessException (400) when neither a name nor a service type is available
      */
     private String resolveCreateName(@Nullable String requestName, @Nullable ServiceType serviceType) {
-        if (requestName != null && !requestName.isBlank()) {
-            return requestName;
+        String canonical = canonicalName(requestName);
+        if (canonical != null && !canonical.isEmpty()) {
+            return canonical;
         }
         if (serviceType == null) {
             throw new BusinessException(HttpStatus.BAD_REQUEST, "Name or service type is required");

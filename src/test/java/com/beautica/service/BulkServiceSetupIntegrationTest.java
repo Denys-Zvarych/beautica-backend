@@ -477,11 +477,12 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
                 .serviceDefinition().id();
         BigDecimal floorBeforeAppend = fixtures.minEffectivePriceForMaster(masterId);
 
-        // Fresh type FIRST, already-owned type SECOND: a guard that stopped at the first item
-        // would let the fresh one through.
+        // Fresh type FIRST, already-owned copy SECOND: a guard that stopped at the first item
+        // would let the fresh one through. Phase 464: the colliding item repeats the owned copy's
+        // duration (60) — only the price differs, which never makes a new copy (D3).
         var secondRequest = new BulkCreateServicesRequest(List.of(
                 fixed(types.get(2).id(), 90, "500.00"),
-                fixed(types.get(0).id(), 30, "199.00")));
+                fixed(types.get(0).id(), 60, "199.00")));
 
         log.debug("Act: append a 2-item batch whose second item re-requests a service type the master already offers");
         ResponseEntity<String> second = postSelfBulk(token, secondRequest);
@@ -744,7 +745,10 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
 
         // An ACTIVE definition with NO master_services row at all: nothing shows in the master's
         // menu, yet the definition-level V121 index would still reject an insert for this type.
-        UUID orphanDefId = fixtures.insertActiveDefinitionWithoutAssignment(masterId, seededTypes.get(0).id());
+        // Phase 464: same type, duration (60) and name (the type's nameUk, which every bulk item
+        // stores) — i.e. the same copy.
+        UUID orphanDefId = fixtures.insertActiveDefinitionWithoutAssignment(
+                masterId, seededTypes.get(0).id(), seededTypes.get(0).nameUk());
 
         var request = new BulkCreateServicesRequest(List.of(
                 fixed(seededTypes.get(0).id(), 60, "350.00")));
@@ -794,12 +798,14 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
 
         // Assignmentless again, mirroring the test above; the property under test here is the
         // ROLLBACK, not the route into the duplicate check.
-        UUID existingDefId = fixtures.insertActiveDefinitionWithoutAssignment(masterId, types.get(2).id());
+        // Phase 464: the colliding item is the same copy — type, duration 60, the type's nameUk.
+        UUID existingDefId = fixtures.insertActiveDefinitionWithoutAssignment(
+                masterId, types.get(2).id(), types.get(2).nameUk());
 
         var request = new BulkCreateServicesRequest(List.of(
                 fixed(types.get(0).id(), 60, "350.00"),
                 range(types.get(1).id(), 120, "800.00", "1500.00"),
-                fixed(types.get(2).id(), 45, "275.00")));
+                fixed(types.get(2).id(), 60, "275.00")));
 
         log.debug("Act: POST a 3-item bulk batch whose THIRD item duplicates an existing active "
                 + "definition — expect 409 DUPLICATE_SERVICE and a full rollback");
@@ -870,9 +876,11 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
         var batchA = new BulkCreateServicesRequest(List.of(
                 fixed(seededTypes.get(0).id(), 60, "350.00"),
                 range(seededTypes.get(1).id(), 120, "800.00", "1500.00")));
+        // Phase 464: same durations as batch A (only the prices differ), so B is the SAME two
+        // copies — a different duration would now be a legitimate second copy, not a conflict.
         var batchB = new BulkCreateServicesRequest(List.of(
-                fixed(seededTypes.get(0).id(), 45, "275.00"),
-                range(seededTypes.get(1).id(), 90, "600.00", "1200.00")));
+                fixed(seededTypes.get(0).id(), 60, "275.00"),
+                range(seededTypes.get(1).id(), 120, "600.00", "1200.00")));
 
         CyclicBarrier startLine = new CyclicBarrier(2);
         AtomicInteger successCount = new AtomicInteger();
@@ -1689,7 +1697,7 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
 
     /** Case 10 — in-batch duplicate rejection is unchanged. */
     @Test
-    @DisplayName("a salon batch with two identical serviceTypeIds → 400, nothing written (unchanged)")
+    @DisplayName("a salon batch carrying the same copy twice (type + duration + name) → 400, nothing written")
     void should_return400AndWriteNothing_when_salonBatchRepeatsAServiceTypeId() throws Exception {
         String ownerToken = fixtures.createSalonOwnerAndGetToken(
                 "owner-302-inbatch-" + System.nanoTime() + "@beautica.test");
@@ -1698,11 +1706,13 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
 
         UUID typeId = seededTypes.get(0).id();
 
-        log.debug("Act: one batch toggles the same serviceTypeId twice");
+        // Phase 464 D5: an exact in-request duplicate copy — same type, same duration, same
+        // (default) name; only the price differs. Two items differing in duration are now legal.
+        log.debug("Act: one batch carries the same copy twice");
         ResponseEntity<String> resp = postSalonBulk(ownerToken, salonId, masterId,
                 new BulkCreateServicesRequest(List.of(
                         fixed(typeId, 60, "350.00"),
-                        fixed(typeId, 90, "450.00"))));
+                        fixed(typeId, 60, "450.00"))));
 
         assertThat(resp.getStatusCode())
                 .as("a self-inconsistent PAYLOAD is a 400, never the state-conflict 409")
