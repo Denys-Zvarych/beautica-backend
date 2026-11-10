@@ -173,12 +173,15 @@ public abstract class AbstractIntegrationTest {
      * Resolves a selectable service type this owner does not already have an ACTIVE service
      * definition for.
      *
-     * <p>Owner-scoped on purpose: V121 added {@code ux_service_def_owner_service_type_active}, a
-     * partial UNIQUE index on {@code (owner_type, owner_id, service_type_id) WHERE is_active}. A
-     * deterministic resolver ({@code ORDER BY st.name_uk LIMIT 1}) hands back the SAME type on
-     * every call, so seeding a second ACTIVE definition for one owner raises a unique violation.
-     * The {@code NOT EXISTS} guard mirrors that index predicate exactly, is stateless, and
-     * degenerates to the previous behaviour for an owner's first definition.
+     * <p>Owner-scoped on purpose: V233 (phase 464, replacing V121's per-type index) keeps
+     * {@code ux_service_def_owner_type_duration_name_active}, a partial UNIQUE index on
+     * {@code (owner_type, owner_id, service_type_id, base_duration_minutes, lower(btrim(name)))
+     * WHERE is_active}. A deterministic resolver ({@code ORDER BY st.name_uk LIMIT 1}) hands back
+     * the SAME type on every call, so seeding a second ACTIVE definition for one owner with the same
+     * duration and name raises a unique violation. The {@code NOT EXISTS} guard is deliberately
+     * STRICTER than that index (any active definition of the type, whatever its duration/name): it
+     * is stateless, can never collide, and degenerates to the previous behaviour for an owner's
+     * first definition.
      *
      * <p>Sound only because callers INSERT the definition before asking again. Throws on an empty
      * result rather than silently reusing a type if an owner exhausts the seeded selectable types.

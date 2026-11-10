@@ -45,6 +45,7 @@ import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.catchThrowable;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.anyInt;
@@ -139,6 +140,9 @@ class ServiceCatalogServiceBulkCreateTest {
     // also the concrete proof that "an unstubbed @Mock is dead weight" is false for a
     // constructor-injected collaborator (audit Q19).
     @Mock private com.beautica.common.security.AuthorizationService authz;
+    // Flush-time V233 race: looks the committed winner up (REQUIRES_NEW). Unstubbed it answers an
+    // empty list, i.e. the pre-lookup payload — mocked so the race tests never NPE.
+    @Mock private DuplicateServiceCopyLookup duplicateServiceCopyLookup;
 
     @InjectMocks private ServiceCatalogService serviceCatalogService;
 
@@ -1765,7 +1769,7 @@ class ServiceCatalogServiceBulkCreateTest {
         // per-item guard would have issued two round-trips here (and up to 100 on a full batch).
         when(serviceRepository.findActiveDuplicateCopies(
                 eq("INDEPENDENT_MASTER"), eq(masterId), typeIdsExactly(freshTypeId, takenTypeId), any(), any()))
-                .thenReturn(List.of(new ActiveDuplicateProjection(takenTypeId, existingDefId)));
+                .thenReturn(List.of(new ActiveDuplicateProjection(takenTypeId, existingDefId, 90, "Класичне нарощення")));
 
         assertThatThrownBy(() -> serviceCatalogService.bulkCreateIndependentMasterServices(userId, request))
                 .isInstanceOf(DuplicateServiceException.class)
@@ -1815,8 +1819,8 @@ class ServiceCatalogServiceBulkCreateTest {
         // identical requests could blame different items.
         when(serviceRepository.findActiveDuplicateCopies(any(), any(), any(), any(), any()))
                 .thenReturn(List.of(
-                        new ActiveDuplicateProjection(secondTakenTypeId, secondDefId),
-                        new ActiveDuplicateProjection(firstTakenTypeId, firstDefId)));
+                        new ActiveDuplicateProjection(secondTakenTypeId, secondDefId, 90, "Класичне нарощення"),
+                        new ActiveDuplicateProjection(firstTakenTypeId, firstDefId, 60, "Манікюр")));
 
         assertThatThrownBy(() -> serviceCatalogService.bulkCreateIndependentMasterServices(userId, request))
                 .isInstanceOf(DuplicateServiceException.class)
@@ -1843,7 +1847,7 @@ class ServiceCatalogServiceBulkCreateTest {
         when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of("NAIL_SERVICE"));
         stubSaveEchoesEntities();
         // Batched pre-check passes (default empty list), then a concurrent transaction commits
-        // and the V121 index catches it at the single batch flush. The translation must survive
+        // and the V233 index catches it at the single batch flush. The translation must survive
         // the move off per-item saveAndFlush, or the caller would get a generic 409 with no
         // data.code to branch on.
         org.mockito.Mockito.doThrow(DuplicateServiceViolations.violationOf(
@@ -1853,8 +1857,236 @@ class ServiceCatalogServiceBulkCreateTest {
         assertThatThrownBy(() -> serviceCatalogService.bulkCreateIndependentMasterServices(userId, request))
                 .isInstanceOf(DuplicateServiceException.class)
                 .satisfies(ex -> assertThat(((DuplicateServiceException) ex).getExistingServiceDefId())
-                        .as("the index reports the constraint, not which queued row lost")
+                        .as("the committed-winner lookup found nothing (unstubbed) → the pre-lookup payload")
                         .isNull());
+    }
+
+    @Test
+    @DisplayName("409 after a bulk flush race names the COMMITTED winner: serviceName + existingServiceDefId filled from the REQUIRES_NEW lookup")
+    void should_fillNameAndExistingId_when_bulkFlushRacesAndLookupFindsWinner() {
+        UUID userId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID typeId = UUID.randomUUID();
+        UUID winnerId = UUID.randomUUID();
+        Master master = independentMaster(masterId);
+        ServiceType type = serviceType(typeId, "Манікюр", "NAIL_SERVICE", true);
+        var request = new BulkCreateServicesRequest(List.of(
+                fixedItem(typeId, 60, "350.00"), fixedItem(typeId, 90, "500.00")));
+        when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
+        when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type));
+        when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of("NAIL_SERVICE"));
+        stubSaveEchoesEntities();
+        org.mockito.Mockito.doThrow(DuplicateServiceViolations.violationOf(
+                        DuplicateServiceViolations.DUPLICATE_SERVICE_INDEX))
+                .when(serviceRepository).flush();
+        // The 90 copy lost the race; the winner's stored name differs only in case/edge spaces.
+        when(duplicateServiceCopyLookup.findCommittedCopies(
+                eq(OwnerType.INDEPENDENT_MASTER), eq(masterId), any(), any(), any()))
+                .thenReturn(List.of(new ActiveDuplicateProjection(typeId, winnerId, 90, " манікюр ")));
+
+        Throwable thrown = catchThrowable(
+                () -> serviceCatalogService.bulkCreateIndependentMasterServices(userId, request));
+
+        assertThat(thrown).isInstanceOf(DuplicateServiceException.class);
+        DuplicateServiceException dup = (DuplicateServiceException) thrown;
+        assertThat(dup.getExistingServiceDefId()).isEqualTo(winnerId);
+        assertThat(dup.getServiceName()).isEqualTo("Манікюр");
+    }
+
+    @Test
+    @DisplayName("bulk flush race + the winner lookup itself FAILS → still the 409 DUPLICATE_SERVICE (single queued copy keeps its name, id null), never a 500")
+    void should_keepDuplicate409WithSubmittedName_when_flushRacesAndLookupThrows() {
+        UUID userId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID typeId = UUID.randomUUID();
+        Master master = independentMaster(masterId);
+        ServiceType type = serviceType(typeId, "Манікюр", "NAIL_SERVICE", true);
+        var request = new BulkCreateServicesRequest(List.of(fixedItem(typeId, 60, "350.00")));
+        when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
+        when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type));
+        when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of("NAIL_SERVICE"));
+        stubSaveEchoesEntities();
+        org.mockito.Mockito.doThrow(DuplicateServiceViolations.violationOf(
+                        DuplicateServiceViolations.DUPLICATE_SERVICE_INDEX))
+                .when(serviceRepository).flush();
+        when(duplicateServiceCopyLookup.findCommittedCopies(any(), any(), any(), any(), any()))
+                .thenThrow(new org.springframework.dao.QueryTimeoutException("second connection timed out"));
+
+        Throwable thrown = catchThrowable(
+                () -> serviceCatalogService.bulkCreateIndependentMasterServices(userId, request));
+
+        assertThat(thrown).isInstanceOf(DuplicateServiceException.class);
+        DuplicateServiceException dup = (DuplicateServiceException) thrown;
+        assertThat(dup.getServiceName()).as("the one queued copy's name is the fallback").isEqualTo("Манікюр");
+        assertThat(dup.getExistingServiceDefId()).as("no winner known → null id").isNull();
+    }
+
+    @Test
+    @DisplayName("bulk flush race + the lookup's REQUIRES_NEW transaction cannot even begin (CannotCreateTransactionException) → still the 409 DUPLICATE_SERVICE, never a 500")
+    void should_keepDuplicate409WithSubmittedName_when_flushRacesAndLookupTransactionCannotBegin() {
+        UUID userId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID typeId = UUID.randomUUID();
+        Master master = independentMaster(masterId);
+        ServiceType type = serviceType(typeId, "Манікюр", "NAIL_SERVICE", true);
+        var request = new BulkCreateServicesRequest(List.of(fixedItem(typeId, 60, "350.00")));
+        when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
+        when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type));
+        when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of("NAIL_SERVICE"));
+        stubSaveEchoesEntities();
+        org.mockito.Mockito.doThrow(DuplicateServiceViolations.violationOf(
+                        DuplicateServiceViolations.DUPLICATE_SERVICE_INDEX))
+                .when(serviceRepository).flush();
+        // A TransactionException, NOT a DataAccessException — the pool-exhausted shape.
+        when(duplicateServiceCopyLookup.findCommittedCopies(any(), any(), any(), any(), any()))
+                .thenThrow(new org.springframework.transaction.CannotCreateTransactionException(
+                        "Could not open JPA EntityManager for transaction"));
+
+        Throwable thrown = catchThrowable(
+                () -> serviceCatalogService.bulkCreateIndependentMasterServices(userId, request));
+
+        assertThat(thrown).isInstanceOf(DuplicateServiceException.class);
+        DuplicateServiceException dup = (DuplicateServiceException) thrown;
+        assertThat(dup.getServiceName()).isEqualTo("Манікюр");
+        assertThat(dup.getExistingServiceDefId()).isNull();
+    }
+
+    @Test
+    @DisplayName("bulk flush race where the lookup returns only a NON-matching row (other duration) → batch fallback: null name, null id")
+    void should_fallBackToNullNameAndId_when_batchFlushRacesAndLookupRowMatchesNoQueuedCopy() {
+        UUID userId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID typeId = UUID.randomUUID();
+        Master master = independentMaster(masterId);
+        ServiceType type = serviceType(typeId, "Манікюр", "NAIL_SERVICE", true);
+        var request = new BulkCreateServicesRequest(List.of(
+                fixedItem(typeId, 60, "350.00"), fixedItem(typeId, 90, "500.00")));
+        when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
+        when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type));
+        when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of("NAIL_SERVICE"));
+        stubSaveEchoesEntities();
+        org.mockito.Mockito.doThrow(DuplicateServiceViolations.violationOf(
+                        DuplicateServiceViolations.DUPLICATE_SERVICE_INDEX))
+                .when(serviceRepository).flush();
+        when(duplicateServiceCopyLookup.findCommittedCopies(any(), any(), any(), any(), any()))
+                .thenReturn(List.of(new ActiveDuplicateProjection(typeId, UUID.randomUUID(), 120, "Манікюр")));
+
+        Throwable thrown = catchThrowable(
+                () -> serviceCatalogService.bulkCreateIndependentMasterServices(userId, request));
+
+        assertThat(thrown).isInstanceOf(DuplicateServiceException.class);
+        DuplicateServiceException dup = (DuplicateServiceException) thrown;
+        assertThat(dup.getServiceName()).as("a 2-copy batch has no single name to fall back to").isNull();
+        assertThat(dup.getExistingServiceDefId()).as("a row for another copy is never reported").isNull();
+    }
+
+    @Test
+    @DisplayName("pre-check fold-mismatch fallback: a collision row whose stored name the Java key does not match still 409s, blaming the FIRST item of that type")
+    void should_blameFirstItemOfCollidingType_when_collisionRowNameMatchesNoItemKey() {
+        UUID userId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID typeId = UUID.randomUUID();
+        UUID rowId = UUID.randomUUID();
+        Master master = independentMaster(masterId);
+        ServiceType type = serviceType(typeId, "Манікюр", "NAIL_SERVICE", true);
+        var request = new BulkCreateServicesRequest(List.of(
+                fixedItem(typeId, 60, "350.00"), fixedItem(typeId, 90, "500.00")));
+        when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
+        when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type));
+        when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of("NAIL_SERVICE"));
+        // Simulates Postgres lower() folding a code point Java's toLowerCase does not: the DB says
+        // "collision", the in-memory item match finds none.
+        when(serviceRepository.findActiveDuplicateCopies(any(), any(), any(), any(), any()))
+                .thenReturn(List.of(new ActiveDuplicateProjection(typeId, rowId, 90, "Інша назва")));
+
+        Throwable thrown = catchThrowable(
+                () -> serviceCatalogService.bulkCreateIndependentMasterServices(userId, request));
+
+        assertThat(thrown).isInstanceOf(DuplicateServiceException.class);
+        DuplicateServiceException dup = (DuplicateServiceException) thrown;
+        assertThat(dup.getServiceName()).isEqualTo("Манікюр");
+        assertThat(dup.getExistingServiceDefId()).as("the DB-reported row, never dropped").isEqualTo(rowId);
+        verify(serviceRepository, never()).save(any(ServiceDefinition.class));
+    }
+
+    @Test
+    @DisplayName("409 blames the item that ACTUALLY collides when several items share one type (type + duration + name)")
+    void should_blameTheCollidingItemsCopy_when_severalItemsShareOneType() {
+        UUID userId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID typeId = UUID.randomUUID();
+        UUID copy60 = UUID.randomUUID();
+        UUID copy90 = UUID.randomUUID();
+        Master master = independentMaster(masterId);
+        ServiceType type = serviceType(typeId, "Манікюр", "NAIL_SERVICE", true);
+        var request = new BulkCreateServicesRequest(List.of(
+                fixedItem(typeId, 60, "350.00"), fixedItem(typeId, 90, "500.00")));
+        when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
+        when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type));
+        when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of("NAIL_SERVICE"));
+        // Both copies taken; the 90 row comes back FIRST. A per-type map would pair item 1 (60)
+        // with the 90 copy's id — the item-level match must pair it with its own copy.
+        when(serviceRepository.findActiveDuplicateCopies(any(), any(), any(), any(), any()))
+                .thenReturn(List.of(
+                        new ActiveDuplicateProjection(typeId, copy90, 90, "Манікюр"),
+                        new ActiveDuplicateProjection(typeId, copy60, 60, "Манікюр")));
+
+        Throwable thrown = catchThrowable(
+                () -> serviceCatalogService.bulkCreateIndependentMasterServices(userId, request));
+
+        assertThat(thrown).isInstanceOf(DuplicateServiceException.class);
+        assertThat(((DuplicateServiceException) thrown).getExistingServiceDefId()).isEqualTo(copy60);
+    }
+
+    @Test
+    @DisplayName("409 blames the second item when only ITS copy (same type, other duration) is taken")
+    void should_blameSecondItem_when_onlyItsCopyOfTheSharedTypeIsTaken() {
+        UUID userId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID typeId = UUID.randomUUID();
+        UUID copy90 = UUID.randomUUID();
+        Master master = independentMaster(masterId);
+        ServiceType type = serviceType(typeId, "Манікюр", "NAIL_SERVICE", true);
+        var request = new BulkCreateServicesRequest(List.of(
+                fixedItem(typeId, 60, "350.00"), fixedItem(typeId, 90, "500.00")));
+        when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
+        when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type));
+        when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of("NAIL_SERVICE"));
+        when(serviceRepository.findActiveDuplicateCopies(any(), any(), any(), any(), any()))
+                .thenReturn(List.of(new ActiveDuplicateProjection(typeId, copy90, 90, "Манікюр")));
+
+        Throwable thrown = catchThrowable(
+                () -> serviceCatalogService.bulkCreateIndependentMasterServices(userId, request));
+
+        assertThat(thrown).isInstanceOf(DuplicateServiceException.class);
+        assertThat(((DuplicateServiceException) thrown).getExistingServiceDefId()).isEqualTo(copy90);
+        verify(serviceRepository, never()).save(any(ServiceDefinition.class));
+    }
+
+    @Test
+    @DisplayName("an unnamed item whose catalogue nameUk fails today's name allow-list is NOT 400'd — catalogue names are normalised, never re-validated")
+    void should_createItem_when_catalogueNameUkFailsTheNameAllowList() {
+        UUID userId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID typeId = UUID.randomUUID();
+        Master master = independentMaster(masterId);
+        // '#' and '*' are outside ServiceNameConstraints.ALLOWED_NAME_REGEX.
+        ServiceType legacyType = serviceType(typeId, "Манікюр #1 *легасі*", "NAIL_SERVICE", true);
+        var request = new BulkCreateServicesRequest(List.of(
+                fixedItem(typeId, 60, "350.00"), fixedItem(typeId, 90, "500.00")));
+        when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
+        when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(legacyType));
+        when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of("NAIL_SERVICE"));
+        stubSaveEchoesEntities();
+
+        List<MasterServiceResponse> created =
+                serviceCatalogService.bulkCreateIndependentMasterServices(userId, request);
+
+        assertThat(created).hasSize(2);
+        ArgumentCaptor<ServiceDefinition> saved = ArgumentCaptor.forClass(ServiceDefinition.class);
+        verify(serviceRepository, times(2)).save(saved.capture());
+        assertThat(saved.getAllValues()).extracting(ServiceDefinition::getName)
+                .containsOnly("Манікюр #1 *легасі*");
     }
 
     @Test

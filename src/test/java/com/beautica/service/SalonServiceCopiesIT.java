@@ -2,7 +2,6 @@ package com.beautica.service;
 
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.config.TestSecurityConfig;
-import com.beautica.service.dto.BulkCreateServicesRequest;
 import com.beautica.service.dto.BulkServiceItemRequest;
 import com.beautica.service.dto.UpdateMasterServiceBandRequest;
 import com.beautica.service.entity.PriceType;
@@ -97,7 +96,7 @@ class SalonServiceCopiesIT extends AbstractIntegrationTest {
         ResponseEntity<String> resp = bulk(salon, masterB, item(60, "500.00"));
 
         assertThat(resp.getStatusCode()).as("body: %s", resp.getBody()).isEqualTo(HttpStatus.CREATED);
-        JsonNode row = data(resp).path(0);
+        JsonNode row = fixtures.data(resp).path(0);
         assertThat(row.path("serviceDefinition").path("id").asText()).isEqualTo(salon.copy60());
         assertThat(row.path("priceOverride").isNull()).isTrue();
         assertThat(row.path("durationOverrideMinutes").isNull()).isTrue();
@@ -113,7 +112,7 @@ class SalonServiceCopiesIT extends AbstractIntegrationTest {
 
         ResponseEntity<String> resp = bulk(salon, salon.masterA(), item(60, "800.00"));
 
-        assertDuplicateOf(resp, salon.copy60());
+        fixtures.assertDuplicateOf(resp, salon.copy60());
         assertThat(salonCopyDurations(salon.id())).containsExactlyInAnyOrder(60, 90);
     }
 
@@ -150,7 +149,7 @@ class SalonServiceCopiesIT extends AbstractIntegrationTest {
         ResponseEntity<String> resp = bulk(salon, salon.masterA(), item(90, "700.00"));
 
         assertThat(resp.getStatusCode()).as("body: %s", resp.getBody()).isEqualTo(HttpStatus.CREATED);
-        assertThat(data(resp).path(0).path("id").asText()).isEqualTo(rowId.toString());
+        assertThat(fixtures.data(resp).path(0).path("id").asText()).isEqualTo(rowId.toString());
         assertThat(rowCountOf(salon.masterA(), salon.copy90())).isEqualTo(1L);
         assertThat(activeDefIdsOf(salon.masterA())).containsExactlyInAnyOrder(salon.copy60(), salon.copy90());
     }
@@ -219,7 +218,7 @@ class SalonServiceCopiesIT extends AbstractIntegrationTest {
 
         assertThat(resp.getStatusCode()).as("body: %s", resp.getBody()).isEqualTo(HttpStatus.CREATED);
         assertThat(defIdOf(resp, 1)).isEqualTo(salon.copy60());
-        assertThat(data(resp).path(1).path("durationOverrideMinutes").isNull()).isTrue();
+        assertThat(fixtures.data(resp).path(1).path("durationOverrideMinutes").isNull()).isTrue();
         assertThat(defIdOf(resp, 0)).isNotEqualTo(salon.copy60());
         assertThat(salonCopyDurations(salon.id())).containsExactlyInAnyOrder(60, 90);
     }
@@ -227,21 +226,24 @@ class SalonServiceCopiesIT extends AbstractIntegrationTest {
     // ── AC9 ────────────────────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("AC9: C bulk 90 + 90 named → two copies matched/created per item; a repeat → 409")
+    @DisplayName("AC9: C bulk 90 + 90 named → two copies matched/created per item, C holds both; a repeat → 409, C's assignments unchanged")
     void should_resolvePerItem_when_oneBulkCarriesNamedAndUnnamedCopies() throws Exception {
         Salon salon = twoCopySalon("ac9");
         UUID masterC = fixtures.createSalonMaster(salon.id());
 
         ResponseEntity<String> first = bulk(salon, masterC, item(90, "700.00"), namedItem(90, "750.00", OTHER_NAME));
+        List<String> afterFirst = activeDefIdsOf(masterC);
         ResponseEntity<String> repeat = bulk(salon, masterC, item(90, "700.00"), namedItem(90, "750.00", OTHER_NAME));
 
         assertThat(first.getStatusCode()).as("body: %s", first.getBody()).isEqualTo(HttpStatus.CREATED);
         assertThat(defIdOf(first, 0)).isEqualTo(salon.copy90());
         String named = defIdOf(first, 1);
-        assertThat(jdbcTemplate.queryForObject(
-                "SELECT name FROM service_definitions WHERE id = ?::uuid", String.class, named)).isEqualTo(OTHER_NAME);
-        assertThat(salonCopyDurations(salon.id())).containsExactlyInAnyOrder(60, 90, 90);
-        assertDuplicateOf(repeat, salon.copy90());
+        assertThat(nameOf(named)).isEqualTo(OTHER_NAME);
+        assertThat(afterFirst).as("C holds exactly the reused 90 copy and the new named one")
+                .containsExactlyInAnyOrder(salon.copy90(), named);
+        fixtures.assertDuplicateOf(repeat, salon.copy90());
+        assertThat(activeDefIdsOf(masterC)).as("the 409 changed none of C's assignments")
+                .containsExactlyInAnyOrder(salon.copy90(), named);
         assertThat(salonCopyDurations(salon.id())).containsExactlyInAnyOrder(60, 90, 90);
     }
 
@@ -255,7 +257,7 @@ class SalonServiceCopiesIT extends AbstractIntegrationTest {
 
         ResponseEntity<String> resp = bulk(salon, masterD, item(120, "900.00"), item(120, "950.00"));
 
-        assertThat(resp.getStatusCode()).as("body: %s", resp.getBody()).isEqualTo(HttpStatus.BAD_REQUEST);
+        fixtures.assertInRequestDuplicate400(resp);
         assertThat(salonCopyDurations(salon.id())).containsExactly(60);
         assertThat(activeDefIdsOf(masterD)).isEmpty();
     }
@@ -272,9 +274,33 @@ class SalonServiceCopiesIT extends AbstractIntegrationTest {
 
         assertThat(resp.getStatusCode()).as("body: %s", resp.getBody()).isEqualTo(HttpStatus.CREATED);
         assertThat(defIdOf(resp, 0)).isEqualTo(salon.copy60());
-        assertThat(data(resp).path(0).path("durationOverrideMinutes").asInt()).isEqualTo(90);
+        assertThat(fixtures.data(resp).path(0).path("durationOverrideMinutes").asInt()).isEqualTo(90);
         assertThat(defIdOf(resp, 1)).isNotEqualTo(salon.copy60());
         assertThat(salonCopyDurations(salon.id())).containsExactlyInAnyOrder(60, 120);
+    }
+
+    // ── a deactivated copy is never a reuse candidate ──────────────────────────
+
+    @Test
+    @DisplayName("Deactivated copy: the owner retires the salon's only 60 copy; B bulk at 60 → a NEW copy, the retired one stays retired and unassigned")
+    void should_neverReuseDeactivatedCopy_when_itMatchesTheItemExactly() throws Exception {
+        Salon salon = oneCopySalon("retired");
+        ResponseEntity<String> retired = restTemplate.exchange("/api/v1/services/" + salon.copy60(), HttpMethod.DELETE,
+                new HttpEntity<>(fixtures.bearerHeaders(salon.ownerToken())), String.class);
+        UUID masterB = fixtures.createSalonMaster(salon.id());
+
+        ResponseEntity<String> resp = bulk(salon, masterB, item(60, "500.00"));
+
+        assertThat(retired.getStatusCode()).as("precondition, body: %s", retired.getBody()).isEqualTo(HttpStatus.NO_CONTENT);
+        String fresh = defIdOf(resp, 0);
+        assertThat(fresh).as("the inactive exact match must never be resolved (sd.isActive filter)")
+                .isNotEqualTo(salon.copy60());
+        assertThat(activeDefIdsOf(masterB)).containsExactly(fresh);
+        assertThat(rowCountOf(masterB, salon.copy60())).isZero();
+        assertThat(Boolean.TRUE.equals(jdbcTemplate.queryForObject(
+                "SELECT is_active FROM service_definitions WHERE id = ?::uuid", Boolean.class, salon.copy60())))
+                .as("the retired copy was not revived").isFalse();
+        assertThat(salonCopyDurations(salon.id())).containsExactly(60);
     }
 
     // ── cross-salon scoping ────────────────────────────────────────────────────
@@ -310,7 +336,7 @@ class SalonServiceCopiesIT extends AbstractIntegrationTest {
         ResponseEntity<String> resp = bulk(salon, salon.masterA(), item(90, "700.00"));
 
         assertThat(resp.getStatusCode()).as("body: %s", resp.getBody()).isEqualTo(HttpStatus.CREATED);
-        assertThat(data(resp).path(0).path("id").asText()).isEqualTo(row90.toString());
+        assertThat(fixtures.data(resp).path(0).path("id").asText()).isEqualTo(row90.toString());
         assertThat(defIdOf(resp, 0)).isEqualTo(salon.copy90());
         assertThat(activeDefIdsOf(salon.masterA())).containsExactly(salon.copy90());
         assertThat(isAssignmentActive(row60)).as("the 60 copy must not be revived by a 90 item").isFalse();
@@ -364,7 +390,7 @@ class SalonServiceCopiesIT extends AbstractIntegrationTest {
 
         assertThat(resp.getStatusCode()).as("body: %s", resp.getBody()).isEqualTo(HttpStatus.CREATED);
         assertThat(defIdOf(resp, 0)).isEqualTo(salon.copy60());
-        assertThat(data(resp).path(0).path("durationOverrideMinutes").asInt()).isEqualTo(90);
+        assertThat(fixtures.data(resp).path(0).path("durationOverrideMinutes").asInt()).isEqualTo(90);
         assertThat(salonCopyDurations(salon.id())).containsExactly(60);
     }
 
@@ -395,7 +421,7 @@ class SalonServiceCopiesIT extends AbstractIntegrationTest {
 
         assertThat(resp.getStatusCode()).as("body: %s", resp.getBody()).isEqualTo(HttpStatus.CREATED);
         assertThat(defIdOf(resp, 0)).isEqualTo(named90);
-        assertThat(data(resp).path(0).path("durationOverrideMinutes").isNull()).isTrue();
+        assertThat(fixtures.data(resp).path(0).path("durationOverrideMinutes").isNull()).isTrue();
         assertThat(salonCopyDurations(salon.id())).containsExactlyInAnyOrder(60, 90);
     }
 
@@ -414,8 +440,27 @@ class SalonServiceCopiesIT extends AbstractIntegrationTest {
 
         ResponseEntity<String> resp = bulk(salon, masterA, item(90, "700.00"));
 
-        assertDuplicateOf(resp, legacyDefId.toString());
+        fixtures.assertDuplicateOf(resp, legacyDefId.toString());
         assertThat(salonCopyDurations(salon.id())).isEmpty();
+    }
+
+    @Test
+    @DisplayName("Legacy + held salon copy: the per-type 409 names the SALON copy the master holds (deep-linkable), not the legacy row")
+    void should_reportHeldSalonCopyId_when_masterHoldsBothALegacyRowAndASalonCopyOfTheType() throws Exception {
+        Salon salon = newSalon("legacy-held");
+        UUID masterA = fixtures.createSalonMaster(salon.id());
+        String salonCopy60 = defIdOf(bulk(salon, masterA, item(60, "500.00")), 0);
+        UUID legacyDefId = fixtures.insertActiveDefinitionWithoutAssignment(masterA, typeId);
+        jdbcTemplate.update(
+                "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, true, NOW(), NOW())",
+                UUID.randomUUID(), masterA, legacyDefId);
+
+        ResponseEntity<String> resp = bulk(salon, masterA, item(90, "700.00"));
+
+        fixtures.assertDuplicateOf(resp, salonCopy60);
+        assertThat(salonCopy60).isNotEqualTo(legacyDefId.toString());
+        assertThat(salonCopyDurations(salon.id())).containsExactly(60);
     }
 
     // ── fixtures / helpers ─────────────────────────────────────────────────────
@@ -440,15 +485,15 @@ class SalonServiceCopiesIT extends AbstractIntegrationTest {
         Map<String, String> labels = Map.of(
                 defIdOf(first, 0), "copy60", defIdOf(second, 0), "copy90");
         Function<String, String> label = id -> labels.getOrDefault(id, "unknown");
-        JsonNode reuseRow = data(reuse).path(0);
+        JsonNode reuseRow = fixtures.data(reuse).path(0);
         return new CopiesRun(
                 List.of(first.getStatusCode().value(), second.getStatusCode().value(),
                         reuse.getStatusCode().value(), repeat.getStatusCode().value()),
                 label.apply(reuseRow.path("serviceDefinition").path("id").asText()),
                 reuseRow.path("durationOverrideMinutes").isNull()
                         ? null : reuseRow.path("durationOverrideMinutes").asInt(),
-                data(repeat).path("code").asText(),
-                label.apply(data(repeat).path("existingServiceDefId").asText()),
+                fixtures.data(repeat).path("code").asText(),
+                label.apply(fixtures.data(repeat).path("existingServiceDefId").asText()),
                 salonCopyDurations(driver.id()).stream().sorted().toList(),
                 activeDefIdsOf(masterA).stream().map(label).sorted().toList(),
                 activeDefIdsOf(masterB).stream().map(label).sorted().toList());
@@ -477,33 +522,20 @@ class SalonServiceCopiesIT extends AbstractIntegrationTest {
     }
 
     private BulkServiceItemRequest item(int duration, String price) {
-        return new BulkServiceItemRequest(typeId, duration, PriceType.FIXED, new BigDecimal(price), null, null);
+        return ServiceTestFixtures.bulkItem(typeId, duration, price);
     }
 
     private BulkServiceItemRequest namedItem(int duration, String price, String name) {
-        return new BulkServiceItemRequest(typeId, duration, PriceType.FIXED, new BigDecimal(price), null, null, name);
+        return ServiceTestFixtures.namedBulkItem(typeId, duration, price, name);
     }
 
     private ResponseEntity<String> bulk(Salon salon, UUID masterId, BulkServiceItemRequest... items) {
-        return restTemplate.exchange(
-                "/api/v1/salons/" + salon.id() + "/masters/" + masterId + "/services/bulk", HttpMethod.POST,
-                new HttpEntity<>(new BulkCreateServicesRequest(List.of(items)),
-                        fixtures.bearerHeaders(salon.ownerToken())), String.class);
-    }
-
-    private JsonNode data(ResponseEntity<String> resp) throws Exception {
-        return objectMapper.readTree(resp.getBody()).path("data");
+        return fixtures.postSalonBulk(salon.ownerToken(), salon.id(), masterId, List.of(items));
     }
 
     private String defIdOf(ResponseEntity<String> resp, int index) throws Exception {
         assertThat(resp.getStatusCode()).as("body: %s", resp.getBody()).isEqualTo(HttpStatus.CREATED);
-        return data(resp).path(index).path("serviceDefinition").path("id").asText();
-    }
-
-    private void assertDuplicateOf(ResponseEntity<String> resp, String existingId) throws Exception {
-        assertThat(resp.getStatusCode()).as("body: %s", resp.getBody()).isEqualTo(HttpStatus.CONFLICT);
-        assertThat(data(resp).path("code").asText()).isEqualTo("DUPLICATE_SERVICE");
-        assertThat(data(resp).path("existingServiceDefId").asText()).isEqualTo(existingId);
+        return fixtures.data(resp).path(index).path("serviceDefinition").path("id").asText();
     }
 
     private List<Integer> salonCopyDurations(UUID salonId) {

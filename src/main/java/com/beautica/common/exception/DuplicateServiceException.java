@@ -6,17 +6,17 @@ import java.util.UUID;
 
 /**
  * Thrown by {@code ServiceCatalogService} when a create/update would leave an owner
- * (a salon or a master) with two ACTIVE services of the same {@code ServiceType}.
+ * (a salon or a master) with two ACTIVE copies of the same {@code ServiceType} that share base
+ * duration AND name.
  *
- * <p>Encodes the locked product rule: one active service per {@code (owner, service type)},
- * <em>regardless of price or duration</em> — if «Класичне нарощення» is already in the menu,
- * adding it again with a different price is still a duplicate, not a variant. The key is the
- * {@code service_type_id} rather than the display name, because the name is derived from the
- * type (see {@code resolveCreateName}) and a custom name must not be able to bypass the rule.
+ * <p>Encodes the phase-464 rule: one active service per
+ * {@code (owner, service type, base duration, lower(btrim(name)))}, <em>regardless of price</em>
+ * — if «Класичне нарощення» 60 min is already in the menu, adding it again with a different price
+ * is still a duplicate; copies of one type must differ in duration or name.
  *
  * <p>Backed at the storage layer by the partial unique index
- * {@code ux_service_def_owner_service_type_active} (V121), which is what makes the guard
- * race-proof — the service-layer pre-check is the friendly path, the index is the truth.
+ * {@code ux_service_def_owner_type_duration_name_active} (V233, replacing V121's per-type index),
+ * which is what makes the guard race-proof — the service-layer pre-check is the friendly path, the index is the truth.
  *
  * <p>Surfaces as a {@code 409 Conflict} carrying the stable error code
  * {@code DUPLICATE_SERVICE} in the response body under {@code data.code}, so the mobile client
@@ -42,9 +42,9 @@ public class DuplicateServiceException extends BusinessException {
     private final String serviceName;
 
     /**
-     * Id of the existing ACTIVE {@code ServiceDefinition} that blocks the write, or
-     * {@code null} when the conflict was detected by the DB index rather than the pre-check
-     * (the index reports the constraint, not the surviving row's id).
+     * Id of the existing ACTIVE {@code ServiceDefinition} that blocks the write. On a race caught
+     * by the V233 index it is looked up afterwards ({@code DuplicateServiceCopyLookup}); it is
+     * {@code null} only when that lookup finds no match, fails, or is skipped on a busy pool.
      */
     private final UUID existingServiceDefId;
 

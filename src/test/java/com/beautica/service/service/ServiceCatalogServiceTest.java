@@ -146,6 +146,10 @@ class ServiceCatalogServiceTest {
     @Mock
     private ServicePhotoBlobPurger servicePhotoBlobPurger;
 
+    // Flush-time V233 race lookup; unstubbed = empty list = the pre-lookup 409 payload.
+    @Mock
+    private DuplicateServiceCopyLookup duplicateServiceCopyLookup;
+
     @InjectMocks
     private ServiceCatalogService serviceCatalogService;
 
@@ -442,11 +446,10 @@ class ServiceCatalogServiceTest {
                 .satisfies(ex -> {
                     DuplicateServiceException dup = (DuplicateServiceException) ex;
                     assertThat(dup.getExistingServiceDefId())
-                            .as("the index reports the constraint, not the surviving row")
+                            .as("the committed-winner lookup found nothing (unstubbed) → null id fallback")
                             .isNull();
-                    // Same as the saveAndFlush path: the id is unrecoverable, the SUBMITTED name is
-                    // not. Only the BULK path sends a null serviceName — the deferred flush here
-                    // knows exactly which single row it queued.
+                    // Fallback payload: the SUBMITTED name survives even when the lookup finds no
+                    // winner — the deferred flush here knows exactly which single row it queued.
                     assertThat(dup.getServiceName())
                             .as("the deferred-flush race path still names the service")
                             .isEqualTo("Manicure");

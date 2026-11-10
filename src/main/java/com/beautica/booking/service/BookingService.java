@@ -3,6 +3,7 @@ package com.beautica.booking.service;
 import com.beautica.auth.Role;
 import com.beautica.booking.domain.BookingClosureRule;
 import com.beautica.booking.domain.MasterBookability;
+import com.beautica.booking.domain.ServiceBookability;
 import com.beautica.booking.dto.BookingDetailResponse;
 import com.beautica.booking.dto.BookingPriceRange;
 import com.beautica.booking.dto.BookingResponse;
@@ -4028,7 +4029,8 @@ public class BookingService {
         // Pinned by FavoriteServiceIT#should_return404_when_bookingAFavoritedServiceThatWasDeactivated.
         MasterServiceAssignment msa = masterServiceRepository
                 .findByMasterIdAndIdWithGraph(request.masterId(), request.masterServiceId())
-                .filter(MasterServiceAssignment::isActive)
+                // Active assignment AND active definition (a deactivated definition does not cascade).
+                .filter(ServiceBookability::isBookable)
                 .orElseThrow(() -> new NotFoundException("Master service not found"));
 
         OffsetDateTime startsAt = request.startsAt().toOffsetDateTime();

@@ -396,6 +396,51 @@ class GuestBookingServiceTest {
     }
 
     @Test
+    @DisplayName("guest single serviceId — an ACTIVE assignment whose service DEFINITION was deactivated is refused with this path's uniform 404, nothing locked or saved")
+    void should_throw404_when_singleServiceDefinitionDeactivatedButAssignmentActive() {
+        OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
+        MasterServiceAssignment retired = masterService();
+        retired.getServiceDefinition().setActive(false);
+        when(guestTokenProvider.validateClaims(anyString())).thenReturn(GUEST_CLAIMS);
+        when(masterRepository.findByBookingSlugWithUser(SLUG)).thenReturn(Optional.of(master()));
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, serviceId))
+                .thenReturn(Optional.of(retired));
+
+        assertThatThrownBy(() -> service.createGuestBooking(
+                "Bearer t", SLUG, new GuestBookingRequest(serviceId, null, startsAt, "Олена", "Коваль", true, "2026-10-20")))
+                .isInstanceOf(NotFoundException.class)
+                .as("same message as an unknown/foreign/inactive assignment on this path — no oracle")
+                .hasMessage("Service not available for this master");
+
+        verify(bookingRepository, never()).acquireAdvisoryLockWithTimeout(any());
+        verify(bookingRepository, never()).saveAll(any());
+        verifyNoInteractions(smsService);
+    }
+
+    @Test
+    @DisplayName("guest visit — an ACTIVE assignment whose service DEFINITION was deactivated is refused with the uniform 404, nothing locked or saved")
+    void should_throw404_when_visitItemDefinitionDeactivatedButAssignmentActive() {
+        OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
+        UUID secondServiceId = UUID.randomUUID();
+        MasterServiceAssignment retired = masterService(secondServiceId, "Педикюр");
+        retired.getServiceDefinition().setActive(false);
+        when(guestTokenProvider.validateClaims(anyString())).thenReturn(GUEST_CLAIMS);
+        when(masterRepository.findByBookingSlugWithUser(SLUG)).thenReturn(Optional.of(master()));
+        when(masterServiceRepository.findByMasterIdAndIdInWithGraph(masterId, Set.of(serviceId, secondServiceId)))
+                .thenReturn(List.of(masterService(), retired));
+
+        assertThatThrownBy(() -> service.createGuestBooking("Bearer guest.jwt.token", SLUG,
+                new GuestBookingRequest(null, List.of(serviceId, secondServiceId), startsAt, "Олена", "Коваль",
+                        true, "2026-10-20", null)))
+                .isInstanceOf(NotFoundException.class)
+                .as("a retired copy must be indistinguishable from an unknown service")
+                .hasMessage("Master service not found");
+
+        verify(bookingRepository, never()).acquireAdvisoryLockWithTimeout(any());
+        verify(bookingRepository, never()).saveAll(any());
+    }
+
+    @Test
     @DisplayName("phase 398 — a blocked verified phone: the guard gets the TARGET master + token phone, and the "
             + "refusal stops before any service lookup, lock or SMS")
     void should_reject409BeforeLock_when_guestPhoneBlocked() {
@@ -925,6 +970,7 @@ class GuestBookingServiceTest {
                 .baseDurationMinutes(60)
                 .bufferMinutesAfter(0)
                 .basePrice(new BigDecimal("350.00"))
+                .isActive(true)
                 .build();
         return MasterServiceAssignment.builder()
                 .id(id)

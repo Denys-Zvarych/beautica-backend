@@ -2424,7 +2424,8 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — matchedServiceNames present (distinct, capped at 3) when filtering; EMPTY when no serviceTypeSlugs")
     void should_populateMatchedServiceNames_whenFiltering_andEmptyOtherwise() throws Exception {
-        // V121 (ux_service_def_owner_service_type_active, commit 274f15e) forbids two+ active
+        // V121 (commit 274f15e; its index is replaced by V233's ux_service_def_owner_type_duration_name_active,
+        // which still forbids same-type copies sharing duration + name) forbade two+ active
         // service_definitions sharing one service_type_id for the same owner — the original fixture
         // seeded all four names under the SAME typeIdA. Rewritten to use FOUR DISTINCT searchable
         // types instead, filtered together via serviceTypeSlugs' OR/union semantics (a provider
@@ -2791,7 +2792,8 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons — matchedServiceNames is aggregated across the salon's masters when filtering, and empty when unfiltered")
     void should_aggregateSalonMatchedServiceNames_acrossMasters_whenFiltering() throws Exception {
-        // V121 (ux_service_def_owner_service_type_active, commit 274f15e) forbids two+ active
+        // V121 (commit 274f15e; its index is replaced by V233's ux_service_def_owner_type_duration_name_active,
+        // which still forbids same-type copies sharing duration + name) forbade two+ active
         // service_definitions sharing one service_type_id for the same owner — the original fixture
         // put BOTH masters' defs under the SAME typeIdA. Rewritten so master2's def carries a DISTINCT
         // searchable type (typeIdB), filtered together via serviceTypeSlugs' OR/union semantics (a
@@ -3225,7 +3227,8 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons?serviceTypeSlugs=… — TARGET (bookable price band): with a single performing master and no override the band collapses to that master's base_price; an UNBOOKABLE owned type-T service does NOT drag the band")
     void should_collapseSalonPriceBand_toBasePrice_ignoringUnbookableOwnedService() throws Exception {
-        // V121 (ux_service_def_owner_service_type_active, commit 274f15e) forbids two+ active
+        // V121 (commit 274f15e; its index is replaced by V233's ux_service_def_owner_type_duration_name_active,
+        // which still forbids same-type copies sharing duration + name) forbade two+ active
         // service_definitions sharing one service_type_id for the same owner — the original fixture
         // put BOTH defs under the SAME typeIdA. Rewritten so the unbookable def carries a DISTINCT
         // searchable type (typeIdB), filtered together via serviceTypeSlugs' OR/union semantics (a
@@ -3261,7 +3264,8 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons?serviceTypeSlugs=… — TARGET (matched lines): matchedServiceNames reflects ONLY master-performed type-T services; an unbookable owned type-T service is NOT listed")
     void should_limitSalonMatchedServiceNames_toMasterPerformedServices() throws Exception {
-        // V121 (ux_service_def_owner_service_type_active, commit 274f15e) forbids two+ active
+        // V121 (commit 274f15e; its index is replaced by V233's ux_service_def_owner_type_duration_name_active,
+        // which still forbids same-type copies sharing duration + name) forbade two+ active
         // service_definitions sharing one service_type_id for the same owner — the original fixture
         // put BOTH defs under the SAME typeIdA. Rewritten so the unbookable def carries a DISTINCT
         // searchable type (typeIdB), filtered together via serviceTypeSlugs' OR/union semantics (a
@@ -4261,10 +4265,10 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
      * (NOT NULL), fixture rows can no longer carry a NULL FK, so every helper that
      * doesn't receive an explicit {@code serviceTypeId} substitutes a call to this
      * method. It used to return ONE fixed type (the {@code beard-correction} slug)
-     * for every call. That broke once V121 added
-     * {@code ux_service_def_owner_service_type_active} — a partial UNIQUE index on
+     * for every call. That broke once V121 added a partial UNIQUE index on
      * {@code service_definitions(owner_type, owner_id, service_type_id) WHERE
-     * is_active = true} enforcing the product rule "reject duplicate active service
+     * is_active = true} (since V233: {@code ux_service_def_owner_type_duration_name_active},
+     * which also keys on base duration + {@code lower(btrim(name))}) enforcing the product rule "reject duplicate active service
      * per owner and type" (commit 274f15e). Any fixture seeding TWO OR MORE active,
      * null-typed service_definitions for the SAME owner — a common shape for "an
      * owner has several distinct services" tests — collided on that single shared
@@ -4318,8 +4322,8 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
      * happened to also filter on an id this pool had handed out.
      *
      * <p>Added for the V121 rewrite of the four "two+ active defs sharing one
-     * service_type_id for a single owner" fixtures (see
-     * {@code ux_service_def_owner_service_type_active}, commit 274f15e): each needed
+     * service_type_id for a single owner" fixtures (V121's index, commit 274f15e — since V233
+     * {@code ux_service_def_owner_type_duration_name_active}): each needed
      * a domain-legal way to produce several DISTINCT-typed active services that
      * still all match a single combined filter, exploiting the OR/union semantics
      * of {@code serviceTypeSlugs} (a provider matches if it offers ANY selected

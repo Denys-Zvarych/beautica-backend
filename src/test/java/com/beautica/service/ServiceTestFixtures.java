@@ -4,12 +4,15 @@ import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.LoginRequest;
 import com.beautica.auth.dto.RegisterIndependentMasterRequest;
 import com.beautica.common.ApiResponse;
+import com.beautica.service.dto.BulkCreateServicesRequest;
+import com.beautica.service.dto.BulkServiceItemRequest;
 import com.beautica.service.dto.CreateServiceDefinitionRequest;
 import com.beautica.service.entity.PriceType;
 import com.beautica.service.dto.MasterServiceResponse;
 import com.beautica.service.dto.ServiceDefinitionResponse;
 import com.beautica.support.LocalityTestLookup;
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.core.io.ClassPathResource;
@@ -25,6 +28,7 @@ import org.springframework.security.crypto.password.PasswordEncoder;
 import java.io.InputStream;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 import java.util.Locale;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicLong;
@@ -179,7 +183,11 @@ public class ServiceTestFixtures {
                 "/api/v1/auth/register/independent-master", request, String.class);
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
         // Phase 1.7: registration no longer issues tokens; mark email verified then login.
-        jdbcTemplate.update("UPDATE users SET email_verified = true WHERE email = ?", email);
+        // Registration stores the email lower-cased, so match it the same way; a silent 0-row
+        // update would leave the account unverified and fail the login below misleadingly.
+        int verified = jdbcTemplate.update(
+                "UPDATE users SET email_verified = true WHERE email = lower(?)", email);
+        assertThat(verified).as("verify UPDATE must hit the registered row for %s", email).isEqualTo(1);
         ResponseEntity<String> loginResp = restTemplate.postForEntity(
                 "/api/v1/auth/login", new LoginRequest(email, TEST_PASSWORD), String.class);
         assertThat(loginResp.getStatusCode()).isEqualTo(HttpStatus.OK);
@@ -473,5 +481,57 @@ public class ServiceTestFixtures {
         headers.setBearerAuth(token);
         headers.setContentType(MediaType.APPLICATION_JSON);
         return headers;
+    }
+
+    // ── service copies (phases 464–466) — shared by the copy ITs ──────────────────
+
+    /** Unnamed FIXED bulk item: stored under the type's {@code nameUk}. */
+    static BulkServiceItemRequest bulkItem(UUID typeId, int duration, String price) {
+        return new BulkServiceItemRequest(typeId, duration, PriceType.FIXED, new BigDecimal(price), null, null);
+    }
+
+    /** Named FIXED bulk item: a copy distinct from the default-name one unless the names fold equal. */
+    static BulkServiceItemRequest namedBulkItem(UUID typeId, int duration, String price, String name) {
+        return new BulkServiceItemRequest(typeId, duration, PriceType.FIXED, new BigDecimal(price), null, null, name);
+    }
+
+    ResponseEntity<String> postIndependentBulk(String token, List<BulkServiceItemRequest> items) {
+        return restTemplate.exchange("/api/v1/independent-masters/me/services/bulk", HttpMethod.POST,
+                new HttpEntity<>(new BulkCreateServicesRequest(items), bearerHeaders(token)), String.class);
+    }
+
+    ResponseEntity<String> postSalonBulk(String token, UUID salonId, UUID masterId,
+            List<BulkServiceItemRequest> items) {
+        return restTemplate.exchange(
+                "/api/v1/salons/" + salonId + "/masters/" + masterId + "/services/bulk", HttpMethod.POST,
+                new HttpEntity<>(new BulkCreateServicesRequest(items), bearerHeaders(token)), String.class);
+    }
+
+    /** The {@code data} node of an {@code ApiResponse} body. */
+    JsonNode data(ResponseEntity<String> resp) throws Exception {
+        return objectMapper.readTree(resp.getBody()).path("data");
+    }
+
+    /** 409 {@code DUPLICATE_SERVICE} whose {@code existingServiceDefId} names {@code existingId}. */
+    void assertDuplicateOf(ResponseEntity<String> resp, String existingId) throws Exception {
+        assertThat(resp.getStatusCode()).as("body: %s", resp.getBody()).isEqualTo(HttpStatus.CONFLICT);
+        JsonNode body = data(resp);
+        assertThat(body.path("code").asText()).isEqualTo("DUPLICATE_SERVICE");
+        assertThat(body.path("existingServiceDefId").asText()).isEqualTo(existingId);
+    }
+
+    /**
+     * The in-request duplicate 400 ({@code rejectDuplicateCopiesInRequest}): {@code handleBusiness}'s
+     * genericised body — {@code success=false}, message {@code "Invalid request"}, no {@code data} —
+     * so it can never be mistaken for the {@code DUPLICATE_SERVICE} 409 or the
+     * {@code SERVICE_PRICE_SHAPE_MISMATCH} 400, which both carry a {@code data.code}.
+     */
+    void assertInRequestDuplicate400(ResponseEntity<String> resp) throws Exception {
+        assertThat(resp.getStatusCode()).as("body: %s", resp.getBody()).isEqualTo(HttpStatus.BAD_REQUEST);
+        JsonNode body = objectMapper.readTree(resp.getBody());
+        assertThat(body.path("success").asBoolean(true)).isFalse();
+        assertThat(body.path("message").asText()).isEqualTo("Invalid request");
+        assertThat(body.path("data").path("code").isMissingNode())
+                .as("no branchable code — not the 409 DUPLICATE_SERVICE nor a price-shape 400").isTrue();
     }
 }

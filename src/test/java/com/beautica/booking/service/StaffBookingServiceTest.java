@@ -512,6 +512,25 @@ class StaffBookingServiceTest {
         }
 
         @Test
+        @DisplayName("rejects an ACTIVE assignment whose service DEFINITION was deactivated — same uniform 404, nothing locked or saved")
+        void should_reject404_when_assignmentActiveButDefinitionDeactivated() {
+            MasterServiceAssignment retired = assignment(null, null);
+            retired.getServiceDefinition().setActive(false);
+            when(masterRepository.findByIdWithUserAndSalon(masterId))
+                    .thenReturn(Optional.of(salonMaster()));
+            when(masterServiceRepository.findByMasterIdAndIdInWithGraph(masterId, Set.of(masterServiceId)))
+                    .thenReturn(List.of(retired));
+
+            assertThatThrownBy(() -> create(command(guest(RAW_PHONE))))
+                    .isInstanceOf(NotFoundException.class)
+                    .as("a retired copy must be indistinguishable from an unknown service")
+                    .hasMessage("Master service not found");
+
+            verify(bookingRepository, never()).acquireAdvisoryLockWithTimeout(any());
+            verify(bookingRepository, never()).saveAll(any());
+        }
+
+        @Test
         @DisplayName("rejects a master that belongs to a different salon than the caller's")
         void should_reject403_when_masterBelongsToAnotherSalon() {
             when(masterRepository.findByIdWithUserAndSalon(masterId))
@@ -1715,6 +1734,7 @@ class StaffBookingServiceTest {
                 .baseDurationMinutes(BASE_DURATION)
                 .bufferMinutesAfter(BUFFER)
                 .basePrice(BASE_PRICE)
+                .isActive(true)
                 .build();
     }
 

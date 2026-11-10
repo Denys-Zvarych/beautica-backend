@@ -205,8 +205,9 @@ public interface ServiceRepository extends JpaRepository<ServiceDefinition, UUID
      * differs in base duration or in name. Price never participates.
      *
      * <p>The name is compared {@code lower(trim(name))} on BOTH sides — the same normalisation as
-     * the index's {@code lower(btrim(name))} (JPQL {@code trim} trims spaces only, exactly like
-     * Postgres {@code btrim}). Java never normalises the name for this check, so the rule lives in
+     * the index's {@code lower(btrim(name))}: Hibernate's PostgreSQL dialect renders JPQL
+     * {@code trim(x)} as {@code trim(both from x)}, which Postgres evaluates as {@code btrim(x)}
+     * (spaces only), so the predicate is the index expression. Java never normalises the name for this check, so the rule lives in
      * the index and in this predicate only.
      *
      * <p>Returns the id only (not the entity): the caller needs it solely to populate the
@@ -275,7 +276,8 @@ public interface ServiceRepository extends JpaRepository<ServiceDefinition, UUID
      * {@code ux_service_def_owner_type_duration_name_active} remains the actual guarantee.
      */
     @Query(value = """
-            SELECT sd.service_type_id AS serviceTypeId, sd.id AS serviceDefinitionId
+            SELECT sd.service_type_id AS serviceTypeId, sd.id AS serviceDefinitionId,
+                   sd.base_duration_minutes AS durationMinutes, sd.name AS name
             FROM service_definitions sd
             JOIN unnest(CAST(:typeIds AS uuid[]), CAST(:durations AS int[]), CAST(:names AS text[]))
                  AS v(type_id, duration_minutes, name)
@@ -326,7 +328,7 @@ public interface ServiceRepository extends JpaRepository<ServiceDefinition, UUID
      * <p>The {@code INDEPENDENT_MASTER}/{@code :masterId} arm is deliberate, not incidental: ~60
      * pre-Phase-302 rows are still master-owned (phase 303 backfills them), and a master who
      * already performs a type through one of those must keep getting the clean, item-naming 409
-     * rather than a raced V121 violation. Such a row is a CONFLICT, never a reuse candidate — the
+     * rather than a raced V233 violation. Such a row is a CONFLICT, never a reuse candidate — the
      * caller reuses only {@code ownerType = SALON} rows, since an insert here writes
      * {@code (SALON, salonId)}.
      *
@@ -342,7 +344,7 @@ public interface ServiceRepository extends JpaRepository<ServiceDefinition, UUID
      *
      * <p>Read-then-write like every guard on this path (§E-4 — unscoped by role, the caller must
      * already hold write access to both salon and master): the partial unique index
-     * {@code ux_service_def_owner_service_type_active} and {@code master_services}' unique key stay
+     * {@code ux_service_def_owner_type_duration_name_active} (V233) and {@code master_services}' unique key stay
      * the actual guarantees; the salon-keyed advisory lock is what turns ordinary contention into
      * the clean 409 instead of a constraint violation.
      *
@@ -361,6 +363,10 @@ public interface ServiceRepository extends JpaRepository<ServiceDefinition, UUID
      * not a conflict and not a fresh insert). Cardinality is unaffected: {@code master_services}'
      * unique key still bounds the join to at most one row per definition regardless of its active
      * state.
+     *
+     * <p><b>Deterministic order ({@code created_at}, then id).</b> The caller walks the rows in
+     * query order — a type's copies list, the reported conflict id, the reactivation target — so
+     * an unspecified order would let identical requests resolve differently. Oldest copy first.
      */
     @Query("""
             SELECT new com.beautica.service.repository.SalonBulkSetupCandidate(
@@ -375,6 +381,7 @@ public interface ServiceRepository extends JpaRepository<ServiceDefinition, UUID
                         AND sd.ownerId = :salonId)
                 OR (sd.ownerType = com.beautica.service.entity.OwnerType.INDEPENDENT_MASTER
                         AND sd.ownerId = :masterId))
+            ORDER BY sd.createdAt, sd.id
             """)
     List<SalonBulkSetupCandidate> findSalonBulkSetupCandidates(
             @Param("salonId") UUID salonId,

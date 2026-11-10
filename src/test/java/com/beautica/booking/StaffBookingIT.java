@@ -1098,8 +1098,9 @@ class StaffBookingIT extends AbstractIntegrationTest {
 
     /**
      * Additive overload (Phase 22.12) for a visit-create fixture that needs SEVERAL services on the
-     * SAME owner: {@code ux_service_def_owner_service_type_active} is a partial-unique index over
-     * {@code (owner_type, owner_id, service_type_id)}, so two calls sharing an owner MUST resolve
+     * SAME owner: {@code ux_service_def_owner_type_duration_name_active} (V233) is a partial-unique
+     * index over {@code (owner_type, owner_id, service_type_id, base_duration_minutes,
+     * lower(btrim(name)))} and these rows share duration and name, so two calls sharing an owner MUST resolve
      * distinct {@code service_type_id}s — {@code index} selects the Nth one, deterministically
      * ordered exactly like the single-service {@link #insertService(UUID, String, UUID)} overload's
      * OFFSET-0 pick, so existing single-service Seeds are unaffected.
@@ -1124,7 +1125,7 @@ class StaffBookingIT extends AbstractIntegrationTest {
      * V111 made {@code service_definitions.service_type_id} NOT NULL — resolve a real, selectable
      * one. {@code index} (0-based, via {@code OFFSET}) picks the Nth in a stable order, so repeated
      * calls for the SAME owner return DISTINCT ids — required by
-     * {@code ux_service_def_owner_service_type_active} (see {@link #insertService(UUID, String, UUID, int)}).
+     * {@code ux_service_def_owner_type_duration_name_active} (V233; see {@link #insertService(UUID, String, UUID, int)}).
      */
     private UUID resolveServiceTypeId(int index) {
         return jdbc.queryForObject(

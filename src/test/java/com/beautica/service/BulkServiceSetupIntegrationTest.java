@@ -37,7 +37,11 @@ import org.springframework.security.core.authority.SimpleGrantedAuthority;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.UncheckedIOException;
 import java.math.BigDecimal;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CyclicBarrier;
@@ -2222,8 +2226,19 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
         assertThat(countActiveDefinitionsForOwner("SALON", salonId)).isEqualTo(1L);
     }
 
-    private static final String RULE2_RECORDED_BODY =
-            "{\"success\":true,\"data\":[{\"id\":\"<uuid>\",\"masterId\":\"<uuid>\",\"serviceDefinition\":{\"id\":\"<uuid>\",\"name\":\"<typeName>\",\"description\":null,\"category\":\"<category>\",\"baseDurationMinutes\":60,\"bufferMinutesAfter\":0,\"isActive\":true,\"serviceTypeId\":\"<uuid>\",\"serviceTypeNameUk\":\"<typeName>\",\"serviceTypeSlug\":\"<typeSlug>\",\"photoUrl\":null,\"priceType\":\"FIXED\",\"priceMin\":500.0,\"priceMax\":null,\"priceDisplay\":\"500 ₴\",\"isFavorite\":null},\"priceOverride\":400.0,\"durationOverrideMinutes\":90,\"effectivePrice\":400.0,\"effectiveDurationMinutes\":90,\"isActive\":true,\"priceType\":\"RANGE\",\"priceMin\":400.0,\"priceMax\":900.0,\"priceDisplay\":\"від 400 до 900 ₴\",\"serviceTypeId\":\"<uuid>\",\"serviceTypeNameUk\":\"<typeName>\",\"serviceTypeSlug\":\"<typeSlug>\",\"isFavorite\":null}],\"message\":null}";
+    /** Recorded pre-465 response body (one line of canonical JSON), loaded from the test classpath. */
+    private static final String RULE2_RECORDED_BODY = loadRecordedBody("/service/phase465-rule2-recorded-body.json");
+
+    private static String loadRecordedBody(String resource) {
+        try (InputStream in = BulkServiceSetupIntegrationTest.class.getResourceAsStream(resource)) {
+            if (in == null) {
+                throw new IllegalStateException("Missing test resource " + resource);
+            }
+            return new String(in.readAllBytes(), StandardCharsets.UTF_8).strip();
+        } catch (IOException ex) {
+            throw new UncheckedIOException(ex);
+        }
+    }
 
     private String normaliseRecordedBody(String body, ServiceTestFixtures.SeededServiceType type) throws Exception {
         String canonical = objectMapper.writeValueAsString(objectMapper.readTree(body));
