@@ -63,6 +63,7 @@ class ServiceCopiesDuplicateRuleIT extends AbstractIntegrationTest {
     @Autowired private PasswordEncoder passwordEncoder;
     @Autowired private ServiceCatalogService serviceCatalogService;
     @Autowired private PlatformTransactionManager transactionManager;
+    @Autowired private com.beautica.service.repository.ServiceRepository serviceRepository;
 
     private ServiceTestFixtures fixtures;
     private UUID typeId;
@@ -299,8 +300,46 @@ class ServiceCopiesDuplicateRuleIT extends AbstractIntegrationTest {
         assertThat(loser)
                 .as("the loser reaches the index at flush; the constraint-name translation makes it the 409")
                 .isInstanceOf(DuplicateServiceException.class);
-        assertThat(((DuplicateServiceException) loser).getStatus()).isEqualTo(HttpStatus.CONFLICT);
+        DuplicateServiceException duplicate = (DuplicateServiceException) loser;
+        assertThat(duplicate.getStatus()).isEqualTo(HttpStatus.CONFLICT);
         assertThat(activeCount("INDEPENDENT_MASTER", masterId)).as("exactly one copy committed").isEqualTo(1L);
+        UUID winnerId = jdbcTemplate.queryForObject(
+                "SELECT id FROM service_definitions WHERE owner_type = 'INDEPENDENT_MASTER' AND owner_id = ? "
+                        + "AND is_active", UUID.class, masterId);
+        assertThat(duplicate.getServiceName())
+                .as("the flush-time 409 names the colliding copy like the pre-check 409 does").isEqualTo(NAME);
+        assertThat(duplicate.getExistingServiceDefId())
+                .as("the committed winner is looked up after the race (REQUIRES_NEW) and deep-linkable")
+                .isEqualTo(winnerId);
+    }
+
+    // ── Deterministic candidate order (created_at, then id) ────────────────────
+
+    @Test
+    @DisplayName("bulk-setup candidates come back oldest copy first (created_at), id breaking a created_at tie — never insertion/heap order")
+    void should_returnCandidatesOldestFirstWithIdTiebreak_when_salonHoldsSeveralCopiesOfOneType() throws Exception {
+        String ownerToken = fixtures.createSalonOwnerAndGetToken("order-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "Order Salon");
+        UUID first = UUID.fromString(data(postSalon(ownerToken, salonId, create(NAME, 60, "500.00"))).path("id").asText());
+        UUID second = UUID.fromString(data(postSalon(ownerToken, salonId, create(NAME, 90, "500.00"))).path("id").asText());
+        UUID third = UUID.fromString(data(postSalon(ownerToken, salonId, create(OTHER_NAME, 60, "500.00"))).path("id").asText());
+        // Created LAST becomes the OLDEST; the other two share one instant so only the id can order them.
+        // Updated in this order so the new heap tuples sit first, second, third: an unordered scan
+        // would return `third` LAST, so the assertion cannot pass by physical order.
+        Instant base = Instant.parse("2026-01-01T00:00:00Z");
+        jdbcTemplate.update("UPDATE service_definitions SET created_at = ? WHERE id IN (?, ?)",
+                java.sql.Timestamp.from(base.plusSeconds(60)), first, second);
+        jdbcTemplate.update("UPDATE service_definitions SET created_at = ? WHERE id = ?",
+                java.sql.Timestamp.from(base), third);
+        List<UUID> tied = java.util.stream.Stream.of(first, second)
+                .sorted(java.util.Comparator.comparing(UUID::toString)).toList();
+
+        List<UUID> order = serviceRepository.findSalonBulkSetupCandidates(salonId, UUID.randomUUID(), java.util.Set.of(typeId))
+                .stream().map(c -> c.definition().getId()).toList();
+
+        assertThat(order)
+                .as("oldest copy first, then the created_at tie broken by id (Postgres uuid order = canonical text order)")
+                .containsExactly(third, tied.get(0), tied.get(1));
     }
 
     // ── Acceptance 7 — several copies of one type in one bulk request ──────────

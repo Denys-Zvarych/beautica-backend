@@ -322,11 +322,11 @@ public interface MasterServiceRepository extends JpaRepository<MasterServiceAssi
      * {@code ServiceCatalogService#bulkCreateForMaster} passes:
      * <ul>
      *   <li>the SALON id on the SALON branch — under Phase 302 D1 the contended resource is the
-     *       salon's one ACTIVE definition per service type, enforced by V121's
-     *       {@code ux_service_def_owner_service_type_active}, and that key space is shared by
+     *       salon's ACTIVE definitions (one per copy since phase 464), enforced by V233's
+     *       {@code ux_service_def_owner_type_duration_name_active}, and that key space is shared by
      *       every master in the salon. Keying on the master instead let two DIFFERENT masters of
      *       one salon take two DIFFERENT locks, both miss the reuse lookup, and both INSERT
-     *       {@code (SALON, salonId, typeId)} — the loser then tripping V121 at flush, where only a
+     *       {@code (SALON, salonId, typeId)} — the loser then tripping the unique index at flush, where only a
      *       constraint name is available, so the client got a {@code DUPLICATE_SERVICE} 409 whose
      *       {@code serviceName} and {@code existingServiceDefId} were BOTH null. Salon-keying is
      *       strictly stronger than master-keying here: two batches for the same master are also
@@ -344,7 +344,7 @@ public interface MasterServiceRepository extends JpaRepository<MasterServiceAssi
      * transaction forces the second caller to wait for the first to commit, after which its guard
      * sees the committed rows and either REUSES the winner's definition (SALON branch) or returns
      * the clean, item-naming 409 {@code DUPLICATE_SERVICE} (a genuine per-master conflict, or the
-     * INDEPENDENT_MASTER branch's owner-level collision) rather than tripping the V121 unique
+     * INDEPENDENT_MASTER branch's owner-level collision) rather than tripping the V233 unique
      * index at flush.
      *
      * <p>The lock is held until the surrounding transaction commits or rolls back
@@ -474,7 +474,9 @@ public interface MasterServiceRepository extends JpaRepository<MasterServiceAssi
      * {@link com.beautica.booking.domain.MasterBookability#isBookable} gate in
      * {@code SlotCalculationService#hasBookableFutureSlot}, which this query's rows reach as the
      * {@code preloaded} argument from {@code BookingMasterService}. Without the fetch that gate
-     * would trigger a lazy salon load on the catalogue path.
+     * would trigger a lazy salon load on the catalogue path. {@code LEFT JOIN FETCH
+     * msa.serviceDefinition} likewise initialises the definition read by
+     * {@code ServiceBookability#isBookable}, so no caller can trigger a lazy load on it.
      *
      * <p><strong>Bookability is intentionally NOT filtered here.</strong> Whether a candidate has a
      * free future slot is resolved in-memory by
@@ -488,6 +490,7 @@ public interface MasterServiceRepository extends JpaRepository<MasterServiceAssi
             JOIN FETCH msa.master m
             JOIN FETCH m.user
             JOIN FETCH m.salon s
+            LEFT JOIN FETCH msa.serviceDefinition
             WHERE s.id = :salonId
               AND m.isActive = true
               AND msa.serviceDefinition.id = :serviceDefId

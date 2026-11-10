@@ -179,7 +179,11 @@ public class ServiceTestFixtures {
                 "/api/v1/auth/register/independent-master", request, String.class);
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
         // Phase 1.7: registration no longer issues tokens; mark email verified then login.
-        jdbcTemplate.update("UPDATE users SET email_verified = true WHERE email = ?", email);
+        // Registration stores the email lower-cased, so match it the same way; a silent 0-row
+        // update would leave the account unverified and fail the login below misleadingly.
+        int verified = jdbcTemplate.update(
+                "UPDATE users SET email_verified = true WHERE email = lower(?)", email);
+        assertThat(verified).as("verify UPDATE must hit the registered row for %s", email).isEqualTo(1);
         ResponseEntity<String> loginResp = restTemplate.postForEntity(
                 "/api/v1/auth/login", new LoginRequest(email, TEST_PASSWORD), String.class);
         assertThat(loginResp.getStatusCode()).isEqualTo(HttpStatus.OK);

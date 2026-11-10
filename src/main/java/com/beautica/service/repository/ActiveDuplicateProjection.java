@@ -13,8 +13,13 @@ import java.util.UUID;
  * {@code existingServiceDefId}, letting the mobile client deep-link straight to the offending
  * row instead of showing a dead-end error.
  *
+ * <p>{@code durationMinutes} + {@code name} (the colliding row's stored values) let the caller
+ * blame the request item that actually collides when several items share one type (phase 464:
+ * one type may hold several copies) — matched on type + duration + {@code lower(btrim(name))}.
+ *
  * <p>A record projection (native-query aliases map onto its components) rather than {@code Object[]}: the query returns two
  * bare UUIDs of identical type, and positional array access would silently survive swapping them.
  */
-public record ActiveDuplicateProjection(UUID serviceTypeId, UUID serviceDefinitionId) {
+public record ActiveDuplicateProjection(UUID serviceTypeId, UUID serviceDefinitionId,
+        Integer durationMinutes, String name) {
 }

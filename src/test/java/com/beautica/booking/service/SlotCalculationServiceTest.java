@@ -484,6 +484,8 @@ class SlotCalculationServiceTest {
         ServiceDefinition serviceDefinition = mock(ServiceDefinition.class);
         when(serviceDefinition.getBaseDurationMinutes()).thenReturn(60);
         when(serviceDefinition.getBufferMinutesAfter()).thenReturn(30);
+        // ServiceBookability: an active assignment must also point at an active definition.
+        when(serviceDefinition.isActive()).thenReturn(true);
 
         MasterServiceAssignment msa = mock(MasterServiceAssignment.class);
         when(msa.isActive()).thenReturn(true);
@@ -1373,6 +1375,59 @@ class SlotCalculationServiceTest {
                 masterId, date, date, foreignServiceId))
                 .isInstanceOf(NotFoundException.class);
 
+        verifyNoInteractions(masterScheduleService);
+    }
+
+    // ── ServiceBookability: active assignment, DEACTIVATED definition (no cascade) ─────────────
+
+    @Test
+    @DisplayName("slots: an ACTIVE assignment whose service DEFINITION is deactivated → the same 404 as an inactive one")
+    void should_throwNotFound_when_assignmentActiveButDefinitionDeactivated() {
+        UUID masterId = UUID.randomUUID();
+        MasterServiceAssignment retired = activeAssignment(masterId, 60, 0);
+        retired.getServiceDefinition().setActive(false);
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, retired.getId()))
+                .thenReturn(Optional.of(retired));
+
+        assertThatThrownBy(() -> slotCalculationService.getAvailableSlots(
+                masterId, LocalDate.of(2026, 5, 8), retired.getId()))
+                .isInstanceOf(NotFoundException.class)
+                .hasMessage("masterService not found");
+
+        verifyNoInteractions(masterScheduleService);
+    }
+
+    @Test
+    @DisplayName("slots (batched): a chained ACTIVE assignment whose DEFINITION is deactivated → the same 404")
+    void should_throwNotFound_when_chainedAssignmentDefinitionDeactivatedInBatch() {
+        UUID masterId = UUID.randomUUID();
+        UUID serviceA = UUID.randomUUID();
+        UUID serviceB = UUID.randomUUID();
+        LocalDate date = LocalDate.of(2026, 5, 8);
+        MasterServiceAssignment retired = assignment(masterId, serviceB, 60, 0);
+        retired.getServiceDefinition().setActive(false);
+        when(masterServiceRepository.findByMasterIdAndIdInWithGraph(masterId, Set.of(serviceA, serviceB)))
+                .thenReturn(List.of(assignment(masterId, serviceA, 60, 0), retired));
+
+        assertThatThrownBy(() ->
+                slotCalculationService.getBookableWorkingDays(masterId, date, date, List.of(serviceA, serviceB)))
+                .isInstanceOf(NotFoundException.class)
+                .hasMessage("masterService not found");
+
+        verifyNoInteractions(masterScheduleService);
+    }
+
+    @Test
+    @DisplayName("catalogue gate: hasBookableFutureSlot is false for an ACTIVE assignment whose DEFINITION is deactivated")
+    void should_reportNotBookable_when_assignmentActiveButDefinitionDeactivated() {
+        UUID masterId = UUID.randomUUID();
+        MasterServiceAssignment retired = activeAssignment(masterId, 60, 0);
+        retired.getServiceDefinition().setActive(false);
+
+        boolean bookable = slotCalculationService.hasBookableFutureSlot(
+                retired, LocalDate.of(2026, 5, 8), LocalDate.of(2026, 5, 9));
+
+        assertThat(bookable).isFalse();
         verifyNoInteractions(masterScheduleService);
     }
 

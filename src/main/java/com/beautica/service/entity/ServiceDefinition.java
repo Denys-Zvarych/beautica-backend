@@ -69,8 +69,8 @@ import java.util.UUID;
 // cosmetic and will never fail a boot. Only a reader can catch it — hence this note.
 //
 // Not every real index appears here: idx_service_def_category, the GIN trigram
-// idx_service_definitions_name_trgm (V98) and the PARTIAL unique ux_service_def_owner_service_type_active
-// (V121) are absent because JPA's @Index cannot express GIN or partial indices at all — see the class
+// idx_service_definitions_name_trgm (V98) and the PARTIAL unique ux_service_def_owner_type_duration_name_active
+// (V233) are absent because JPA's @Index cannot express GIN or partial indices at all — see the class
 // javadoc above for the unique one. Absent-but-real is harmless; declared-but-absent is the drift.
 @Table(name = "service_definitions",
         indexes = {

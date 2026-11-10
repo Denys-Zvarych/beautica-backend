@@ -418,6 +418,25 @@ class SalonServiceCopiesIT extends AbstractIntegrationTest {
         assertThat(salonCopyDurations(salon.id())).isEmpty();
     }
 
+    @Test
+    @DisplayName("Legacy + held salon copy: the per-type 409 names the SALON copy the master holds (deep-linkable), not the legacy row")
+    void should_reportHeldSalonCopyId_when_masterHoldsBothALegacyRowAndASalonCopyOfTheType() throws Exception {
+        Salon salon = newSalon("legacy-held");
+        UUID masterA = fixtures.createSalonMaster(salon.id());
+        String salonCopy60 = defIdOf(bulk(salon, masterA, item(60, "500.00")), 0);
+        UUID legacyDefId = fixtures.insertActiveDefinitionWithoutAssignment(masterA, typeId);
+        jdbcTemplate.update(
+                "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, true, NOW(), NOW())",
+                UUID.randomUUID(), masterA, legacyDefId);
+
+        ResponseEntity<String> resp = bulk(salon, masterA, item(90, "700.00"));
+
+        assertDuplicateOf(resp, salonCopy60);
+        assertThat(salonCopy60).isNotEqualTo(legacyDefId.toString());
+        assertThat(salonCopyDurations(salon.id())).containsExactly(60);
+    }
+
     // ── fixtures / helpers ─────────────────────────────────────────────────────
 
     /**

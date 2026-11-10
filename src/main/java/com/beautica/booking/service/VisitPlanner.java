@@ -1,5 +1,6 @@
 package com.beautica.booking.service;
 
+import com.beautica.booking.domain.ServiceBookability;
 import com.beautica.booking.dto.BookingPriceRange;
 import com.beautica.booking.entity.Booking;
 import com.beautica.common.exception.BusinessException;
@@ -149,7 +150,10 @@ class VisitPlanner {
         Map<UUID, MasterServiceAssignment> byId = masterServiceRepository
                 .findByMasterIdAndIdInWithGraph(master.getId(), distinctIds)
                 .stream()
-                .filter(MasterServiceAssignment::isActive)
+                // Active assignment AND active definition — deactivating a definition does NOT
+                // cascade to master_services. Same uniform 404 either way (no oracle);
+                // serviceDefinition is JOIN FETCHed by the finder, so this adds no query.
+                .filter(ServiceBookability::isBookable)
                 .collect(Collectors.toMap(MasterServiceAssignment::getId, Function.identity()));
 
         if (byId.size() != distinctIds.size()) {

@@ -79,7 +79,7 @@ import com.beautica.master.repository.MasterBookabilitySql;
  * trigram index serves, cutting the candidate set before the exact group
  * {@code EXISTS} runs. The salon {@code EXISTS} is correlated on
  * {@code sdq.owner_id = s.id} and is served by
- * {@code ux_service_def_owner_service_type_active} — never by the trigram index,
+ * {@code ux_service_def_owner_type_duration_name_active} (V233) — never by the trigram index,
  * in <em>any</em> formulation — so a pre-filter here only adds three more
  * per-row sub-plan evaluations. The two forms are semantically identical (the
  * per-token predicate is strictly implied by the group predicate), so this is a pure

@@ -46,6 +46,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.cache.CacheManager;
 import org.springframework.cache.annotation.Cacheable;
+import org.springframework.dao.DataAccessException;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.dao.PessimisticLockingFailureException;
 import org.springframework.data.domain.PageRequest;
@@ -53,6 +54,7 @@ import org.springframework.data.domain.Pageable;
 import org.springframework.http.HttpStatus;
 import org.springframework.lang.Nullable;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.TransactionException;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
@@ -66,6 +68,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -101,6 +104,8 @@ public class ServiceCatalogService {
     private static final String DUPLICATE_SERVICE_INDEX = "ux_service_def_owner_type_duration_name_active";
     /** {@code service_definitions.name} column length ({@code @Column(length = 100)}). */
     private static final int MAX_SERVICE_NAME_LENGTH = 100;
+    /** {@code service_type_suggestions.suggested_name} column cap (= the DTO's {@code @Size(max = 255)}). */
+    private static final int MAX_SUGGESTED_NAME_LENGTH = 255;
     private static final Pattern ALLOWED_NAME_PATTERN =
             Pattern.compile(ServiceNameConstraints.ALLOWED_NAME_REGEX);
     private static final Pattern SPACE_RUN = Pattern.compile(" {2,}");
@@ -147,6 +152,9 @@ public class ServiceCatalogService {
     // boundary for the future-booking scan must be pinned through the injected Clock so tests can
     // control it.
     private final Clock clock;
+    // Fills the flush-time DUPLICATE_SERVICE 409 (name + existingServiceDefId) from the committed
+    // winner, in its own REQUIRES_NEW transaction — see flushTranslatingDuplicateViolation.
+    private final DuplicateServiceCopyLookup duplicateServiceCopyLookup;
 
     @Transactional
     public ServiceDefinitionResponse addServiceToSalon(
@@ -628,7 +636,8 @@ public class ServiceCatalogService {
         // memory, so the unique-index violation can only surface when the INSERT actually reaches
         // the DB. Flushing here rather than at commit is what keeps that violation catchable —
         // at commit it would land outside any catch and degrade to the generic 409.
-        flushTranslatingDuplicateViolation(definition.getName());
+        flushTranslatingDuplicateViolation(OwnerType.INDEPENDENT_MASTER, master.getId(),
+                List.of(new PendingCopy(serviceType, request.baseDurationMinutes(), name, definition.getName())));
 
         // PERF-M2: keep the pre-computed min_effective_price in sync for the
         // independent master's own search entry.
@@ -895,7 +904,7 @@ public class ServiceCatalogService {
         // single-item persistDefinition does. Must happen BEFORE refreshMinEffectivePrice below:
         // that is a JPQL @Modifying query, so Hibernate's AUTO flush would emit the inserts from
         // inside it — outside any catch — and the race would degrade to a generic 409.
-        flushBulkBatch();
+        flushBulkBatch(ownerType, ownerId, pendingCopiesOf(request.items(), targets, typesById));
 
         // Keep the pre-computed min_effective_price in sync for the master's search entry
         // (PERF-M2) and evict the master's services cache after commit (anti-bug §F).
@@ -1148,8 +1157,8 @@ public class ServiceCatalogService {
      * which agrees with the V233 index's {@code lower(btrim(name))} because stored names are already
      * canonical; the index stays the source of truth and the backstop.
      *
-     * <p><b>Deliberately a 400, NOT the {@code DUPLICATE_SERVICE} 409</b> (decision made explicit
-     * alongside V121, kept by 464 D5). The two failures are different kinds:
+     * <p><b>Deliberately a 400, NOT the {@code DUPLICATE_SERVICE} 409</b> (decision first made
+     * alongside the per-type index V233 replaced, kept by 464 D5). The two failures are different kinds:
      * <ul>
      *   <li>409 {@code DUPLICATE_SERVICE} = the request conflicts with <em>server state</em> —
      *       the owner already has this copy. The client's remedy is to look at the existing row
@@ -1190,14 +1199,31 @@ public class ServiceCatalogService {
     }
 
     /**
-     * In-request comparison key: {@link #canonicalName} then {@code toLowerCase(Locale.ROOT)}. Because
-     * every stored name is already canonical (no leading/trailing whitespace), this agrees with the
-     * V233 index expression {@code lower(btrim(name))}; {@code null} stays {@code null}.
+     * In-request comparison key: {@link #normaliseNameForm} then {@code toLowerCase(Locale.ROOT)}.
+     * Because every stored name is already canonical (no leading/trailing whitespace), this agrees
+     * with the V233 index expression {@code lower(btrim(name))}; {@code null} stays {@code null}.
+     *
+     * <p>Normalise-ONLY, never the allow-list: the input is either a request name that
+     * {@link #canonicalName} already validated, or a catalogue {@code nameUk} default — and a
+     * catalogue name is never re-validated, so a non-conforming one can never 400 a bulk item.
      */
     @Nullable
     private static String normaliseCopyName(@Nullable String name) {
-        String canonical = canonicalName(name);
-        return canonical == null ? null : canonical.toLowerCase(Locale.ROOT);
+        String normalised = normaliseNameForm(name);
+        return normalised == null ? null : normalised.toLowerCase(Locale.ROOT);
+    }
+
+    /**
+     * The canonical FORM of a name with no validation: NFKC (keeping {@code №}), internal U+0020
+     * runs collapsed to one, then {@link String#strip()}. {@link #canonicalName} = this + the
+     * length re-check + the allow-list.
+     */
+    @Nullable
+    private static String normaliseNameForm(@Nullable String name) {
+        if (name == null) {
+            return null;
+        }
+        return SPACE_RUN.matcher(nfkcKeepingNumeroSign(name)).replaceAll(" ").strip();
     }
 
     /**
@@ -1210,15 +1236,15 @@ public class ServiceCatalogService {
      * after Bean Validation ran, then applies the allow-list
      * ({@link ServiceNameConstraints#ALLOWED_NAME_REGEX}) to any non-blank result. Only ever called
      * on a name the request supplies — a stored name or a catalogue {@code nameUk} default is never
-     * re-validated. Blank stays {@code ""} so callers can default it to the type name.
+     * re-validated (comparisons on those go through {@link #normaliseNameForm} only). Blank stays
+     * {@code ""} so callers can default it to the type name.
      */
     @Nullable
     private static String canonicalName(@Nullable String name) {
-        if (name == null) {
+        String canonical = normaliseNameForm(name);
+        if (canonical == null) {
             return null;
         }
-        String nfkc = nfkcKeepingNumeroSign(name);
-        String canonical = SPACE_RUN.matcher(nfkc).replaceAll(" ").strip();
         if (canonical.length() > MAX_SERVICE_NAME_LENGTH) {
             throw new BusinessException(HttpStatus.BAD_REQUEST, "Name must be at most 100 characters");
         }
@@ -1604,8 +1630,9 @@ public class ServiceCatalogService {
      * SQL, and Hibernate's AUTO flush mode pushes pending changes whose query space overlaps
      * before executing a query. Two consequences, both load-bearing:
      * <ul>
-     *   <li>The duplicate guard MUST see a clean entity. If the colliding {@code service_type_id}
-     *       were already assigned, the flush would emit the UPDATE and the V121 index would fire
+     *   <li>The duplicate guard MUST see a clean entity. If the colliding copy key (type,
+     *       duration, name) were already assigned, the flush would emit the UPDATE and the V233
+     *       index ({@code ux_service_def_owner_type_duration_name_active}) would fire
      *       INSIDE the finder call — the check could never win, and the caller would get the
      *       generic {@code DataIntegrityViolationException} 409 with no {@code data.code} instead
      *       of {@code DUPLICATE_SERVICE}.</li>
@@ -2129,6 +2156,7 @@ public class ServiceCatalogService {
     }
 
     public void suggestServiceType(SuggestServiceTypeRequest request, UUID requestedByUserId) {
+        String suggestedName = canonicalSuggestedName(request.name());
         // Resolve/validate the System-B category-name slug against platform_categories
         // (active + APPROVED) BEFORE persisting — an unknown or inactive slug yields a
         // clean 400 instead of persisting + emailing the admin a bogus suggestion
@@ -2141,7 +2169,28 @@ public class ServiceCatalogService {
         // Field escaping is handled by the suggestion's Thymeleaf email template
         // (auto-escaped), so no manual sanitize is needed here.
         serviceTypeSuggestionService.submitSuggestion(
-                request.categoryName(), request.name(), request.description(), requestedByUserId);
+                request.categoryName(), suggestedName, request.description(), requestedByUserId);
+    }
+
+    /**
+     * Canonical form of a suggested type name: the same NFKC + space-collapse + strip as
+     * {@link #normaliseNameForm}. {@code @NotBlank} and the raw {@code NAME_REGEX} both admit a
+     * name made only of {@code \p{Zs}} separators (NBSP, U+2007, …) — NFKC folds those to U+0020
+     * and the strip empties it, so the blank check re-runs here (400, never a blank row). Re-checks
+     * the 255-char column cap (NFKC can lengthen) and the post-normalisation allow-list.
+     */
+    private static String canonicalSuggestedName(@Nullable String name) {
+        String canonical = normaliseNameForm(name);
+        if (canonical == null || canonical.isEmpty()) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST, "Name is required");
+        }
+        if (canonical.length() > MAX_SUGGESTED_NAME_LENGTH) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST, "Name must be at most 255 characters");
+        }
+        if (!ALLOWED_NAME_PATTERN.matcher(canonical).matches()) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST, ServiceNameConstraints.NAME_REGEX_MESSAGE);
+        }
+        return canonical;
     }
 
     /**
@@ -2334,9 +2383,11 @@ public class ServiceCatalogService {
      * query's row order is unspecified, and blaming a later item for an earlier item's conflict
      * would make the error non-deterministic across identical requests.
      *
-     * <p>The projection is keyed by type, so when several items share a type the first item of
-     * that type in request order is blamed; the payload carries only the type name and the
-     * colliding copy's id, both correct either way.
+     * <p>Each collision row carries the stored copy's duration and name, so with several items of
+     * one type the item that ACTUALLY collides is blamed (type + duration + canonical name, see
+     * {@link #collidingCopyOf}) and the payload's {@code existingServiceDefId} is that item's copy.
+     * Should Java's case fold ever disagree with Postgres {@code lower()} on an exotic code point,
+     * the first item of a colliding type is blamed instead — the pre-464 per-type rule.
      *
      * @throws DuplicateServiceException (409) naming the first item whose copy is already taken
      */
@@ -2362,26 +2413,52 @@ public class ServiceCatalogService {
             names[i] = effectiveBulkName(item, type);
         }
 
-        Map<UUID, UUID> existingDefIdByTypeId = serviceRepository
-                .findActiveDuplicateCopies(ownerType.name(), ownerId, typeIds, durations, names)
-                .stream()
-                .collect(Collectors.toMap(
-                        ActiveDuplicateProjection::serviceTypeId,
-                        ActiveDuplicateProjection::serviceDefinitionId,
-                        (first, second) -> first));
+        List<ActiveDuplicateProjection> collisions = serviceRepository
+                .findActiveDuplicateCopies(ownerType.name(), ownerId, typeIds, durations, names);
 
-        if (existingDefIdByTypeId.isEmpty()) {
+        if (collisions.isEmpty()) {
             return;
         }
 
-        for (BulkServiceItemRequest item : items) {
-            UUID existingId = existingDefIdByTypeId.get(item.serviceTypeId());
-            if (existingId != null) {
-                ServiceType type = typesById.get(item.serviceTypeId());
-                throw new DuplicateServiceException(
-                        type != null ? type.getNameUk() : null, existingId);
+        for (int i = 0; i < size; i++) {
+            ActiveDuplicateProjection hit = collidingCopyOf(typeIds[i], durations[i], names[i], collisions);
+            if (hit != null) {
+                throw duplicateOfItem(typesById, typeIds[i], hit.serviceDefinitionId());
             }
         }
+        // Fold mismatch fallback (see javadoc): blame the first item of a colliding type.
+        for (UUID typeId : typeIds) {
+            for (ActiveDuplicateProjection collision : collisions) {
+                if (collision.serviceTypeId().equals(typeId)) {
+                    throw duplicateOfItem(typesById, typeId, collision.serviceDefinitionId());
+                }
+            }
+        }
+    }
+
+    private static DuplicateServiceException duplicateOfItem(Map<UUID, ServiceType> typesById, UUID typeId,
+            UUID existingId) {
+        ServiceType type = typesById.get(typeId);
+        return new DuplicateServiceException(type != null ? type.getNameUk() : null, existingId);
+    }
+
+    /**
+     * The collision row for ONE requested copy — same type, same duration and the same name compared
+     * the way the V233 index does ({@link #normaliseCopyName} vs {@link #sameCopyName}) — or
+     * {@code null}.
+     */
+    @Nullable
+    private static ActiveDuplicateProjection collidingCopyOf(UUID typeId, @Nullable Integer durationMinutes,
+            @Nullable String effectiveName, List<ActiveDuplicateProjection> collisions) {
+        String itemKey = normaliseCopyName(effectiveName);
+        for (ActiveDuplicateProjection collision : collisions) {
+            if (collision.serviceTypeId().equals(typeId)
+                    && Objects.equals(collision.durationMinutes(), durationMinutes)
+                    && sameCopyName(itemKey, collision.name())) {
+                return collision;
+            }
+        }
+        return null;
     }
 
     /**
@@ -2451,13 +2528,16 @@ public class ServiceCatalogService {
                 .findSalonBulkSetupCandidates(salonId, masterId, typesById.keySet());
 
         Map<UUID, UUID> legacyConflictByTypeId = legacyConflictDefIdByTypeId(candidates);
-        Map<UUID, List<SalonBulkSetupCandidate>> copiesByTypeId = salonCopiesByTypeId(candidates);
+        // Precomputed ONCE per type (not per item): the "master holds a copy" flag and the
+        // (duration, stored-name key) → copy index, so the per-item walk is O(1) lookups.
+        Map<UUID, SalonTypeCopies> copiesByTypeId = salonCopiesByTypeId(candidates);
 
         List<SalonBulkSetupCandidate> exactMatches = new ArrayList<>(items.size());
         Set<UUID> exactlyRequestedCopyIds = new HashSet<>();
         for (BulkServiceItemRequest item : items) {
-            SalonBulkSetupCandidate exact = exactSalonCopy(item, typesById.get(item.serviceTypeId()),
-                    copiesByTypeId.getOrDefault(item.serviceTypeId(), List.of()));
+            SalonBulkSetupCandidate exact = copiesOf(copiesByTypeId, item.serviceTypeId())
+                    .exactCopy(item.durationMinutes(),
+                            normaliseCopyName(effectiveBulkName(item, typesById.get(item.serviceTypeId()))));
             exactMatches.add(exact);
             if (exact != null) {
                 exactlyRequestedCopyIds.add(exact.definition().getId());
@@ -2474,7 +2554,7 @@ public class ServiceCatalogService {
                 throw new DuplicateServiceException(type.getNameUk(), legacyConflictId);
             }
             targets.add(resolveSalonItemTarget(item, type,
-                    copiesByTypeId.getOrDefault(item.serviceTypeId(), List.of()),
+                    copiesOf(copiesByTypeId, item.serviceTypeId()),
                     exactMatches.get(i), exactlyRequestedCopyIds,
                     typesTakenInRequest.contains(item.serviceTypeId())));
             // D1a — whatever this item resolved to, the master now offers a copy of the type.
@@ -2486,14 +2566,15 @@ public class ServiceCatalogService {
     /**
      * Phase 465 D1 rules 2–4 for ONE item — see {@link #resolveSalonBulkCandidates} for the table.
      *
-     * @param copies                  the salon's ACTIVE copies of the item's type (query order)
+     * @param typeCopies              the salon's ACTIVE copies of the item's type (query order),
+     *                                with the per-type flag/index precomputed once
      * @param exact                   the copy matching the item's key exactly, or {@code null}
      * @param exactlyRequestedCopyIds every copy some item of the request matches exactly
      * @param typeTakenInRequest      an earlier item of the request has the same type (D1a)
      * @throws DuplicateServiceException (409) when this master already holds {@code exact} actively
      */
     private static BulkItemTarget resolveSalonItemTarget(BulkServiceItemRequest item, ServiceType type,
-            List<SalonBulkSetupCandidate> copies, @Nullable SalonBulkSetupCandidate exact,
+            SalonTypeCopies typeCopies, @Nullable SalonBulkSetupCandidate exact,
             Set<UUID> exactlyRequestedCopyIds, boolean typeTakenInRequest) {
 
         if (exact != null) {
@@ -2502,8 +2583,8 @@ public class ServiceCatalogService {
             }
             return BulkItemTarget.reuse(exact);
         }
-        boolean masterOffersType = typeTakenInRequest
-                || copies.stream().anyMatch(SalonBulkSetupCandidate::assignedToMaster);
+        List<SalonBulkSetupCandidate> copies = typeCopies.copies();
+        boolean masterOffersType = typeTakenInRequest || typeCopies.assignedToMaster();
         if (!masterOffersType && copies.size() == 1
                 && isSingleCopyReusable(item, copies.get(0), exactlyRequestedCopyIds)) {
             return BulkItemTarget.reuse(copies.get(0));
@@ -2529,20 +2610,51 @@ public class ServiceCatalogService {
     }
 
     /**
-     * The salon copy whose (duration, name) equals the item's copy key, or {@code null}. The V233
-     * index admits at most one ACTIVE salon copy per key, so at most one can match.
+     * The salon's ACTIVE copies of ONE type, with everything the per-item walk asks of them
+     * precomputed once: whether this master holds any of them, and the copy per exact key.
+     *
+     * @param copies           query order ({@code findSalonBulkSetupCandidates} is ordered)
+     * @param assignedToMaster this master ACTIVELY holds at least one copy of the type
+     * @param byKey            (duration, stored-name key) → the first copy in query order with that
+     *                         key; the V233 index admits at most one ACTIVE copy per key anyway
      */
-    @Nullable
-    private static SalonBulkSetupCandidate exactSalonCopy(BulkServiceItemRequest item, ServiceType type,
-            List<SalonBulkSetupCandidate> copies) {
-        String itemKey = normaliseCopyName(effectiveBulkName(item, type));
-        for (SalonBulkSetupCandidate copy : copies) {
-            if (Objects.equals(item.durationMinutes(), copy.definition().getBaseDurationMinutes())
-                    && sameCopyName(itemKey, copy.definition().getName())) {
-                return copy;
+    private record SalonTypeCopies(List<SalonBulkSetupCandidate> copies, boolean assignedToMaster,
+            Map<SalonCopyKey, SalonBulkSetupCandidate> byKey) {
+
+        private static final SalonTypeCopies NONE = new SalonTypeCopies(List.of(), false, Map.of());
+
+        static SalonTypeCopies of(List<SalonBulkSetupCandidate> copies) {
+            boolean assigned = false;
+            Map<SalonCopyKey, SalonBulkSetupCandidate> byKey = new HashMap<>();
+            for (SalonBulkSetupCandidate copy : copies) {
+                assigned |= copy.assignedToMaster();
+                String storedKey = storedCopyKey(copy.definition().getName());
+                if (storedKey != null) {
+                    byKey.putIfAbsent(new SalonCopyKey(copy.definition().getBaseDurationMinutes(), storedKey), copy);
+                }
             }
+            return new SalonTypeCopies(List.copyOf(copies), assigned, byKey);
         }
-        return null;
+
+        /**
+         * The salon copy whose (duration, name) equals the item's copy key ({@link #normaliseCopyName}
+         * of its effective name), or {@code null}.
+         */
+        @Nullable
+        SalonBulkSetupCandidate exactCopy(@Nullable Integer durationMinutes, @Nullable String itemKey) {
+            if (durationMinutes == null || itemKey == null) {
+                return null;
+            }
+            return byKey.get(new SalonCopyKey(durationMinutes, itemKey));
+        }
+    }
+
+    /** A stored copy's V233 key within one type: base duration + {@code lower(btrim(name))}. */
+    private record SalonCopyKey(int durationMinutes, String nameKey) {
+    }
+
+    private static SalonTypeCopies copiesOf(Map<UUID, SalonTypeCopies> copiesByTypeId, UUID typeId) {
+        return copiesByTypeId.getOrDefault(typeId, SalonTypeCopies.NONE);
     }
 
     /**
@@ -2551,10 +2663,14 @@ public class ServiceCatalogService {
      * The stored name is never re-canonicalised (a legacy name need not pass today's allow-list).
      */
     private static boolean sameCopyName(@Nullable String itemKey, @Nullable String storedName) {
-        if (itemKey == null || storedName == null) {
-            return false;
-        }
-        return itemKey.equals(btrimSpaces(storedName).toLowerCase(Locale.ROOT));
+        String storedKey = storedCopyKey(storedName);
+        return itemKey != null && itemKey.equals(storedKey);
+    }
+
+    /** A stored name as the V233 index sees it: {@code lower(btrim(name))}; {@code null} stays null. */
+    @Nullable
+    private static String storedCopyKey(@Nullable String storedName) {
+        return storedName == null ? null : btrimSpaces(storedName).toLowerCase(Locale.ROOT);
     }
 
     /** Postgres {@code btrim(text)}: strips leading/trailing U+0020 only. */
@@ -2578,7 +2694,7 @@ public class ServiceCatalogService {
      * query, and their {@code serviceType} resolves from the persistence context
      * ({@code resolveBulkServiceTypes} loaded exactly these types), so no N+1 follows.
      */
-    private static Map<UUID, List<SalonBulkSetupCandidate>> salonCopiesByTypeId(
+    private static Map<UUID, SalonTypeCopies> salonCopiesByTypeId(
             List<SalonBulkSetupCandidate> candidates) {
         Map<UUID, List<SalonBulkSetupCandidate>> byTypeId = new LinkedHashMap<>();
         for (SalonBulkSetupCandidate candidate : candidates) {
@@ -2586,7 +2702,9 @@ public class ServiceCatalogService {
                 byTypeId.computeIfAbsent(candidate.serviceTypeId(), k -> new ArrayList<>()).add(candidate);
             }
         }
-        return byTypeId;
+        Map<UUID, SalonTypeCopies> copiesByTypeId = new LinkedHashMap<>();
+        byTypeId.forEach((typeId, copies) -> copiesByTypeId.put(typeId, SalonTypeCopies.of(copies)));
+        return copiesByTypeId;
     }
 
     /**
@@ -2783,15 +2901,41 @@ public class ServiceCatalogService {
      * {@code data.code} for the client to branch on. With {@code hibernate.jdbc.batch_size=50}
      * and {@code order_inserts=true} the whole batch leaves as a handful of round-trips.
      *
-     * <p><b>Carries no service name or id</b>, unlike every other {@code DUPLICATE_SERVICE}
-     * site. Reaching here means {@link #assertNoActiveDuplicatesInBatch} passed and a concurrent
-     * transaction won the race in between; the flush reports the constraint, not which of the N
-     * queued rows lost, and the Postgres transaction is aborted at that point so nothing further
-     * can be queried to find out. The client still gets the stable {@code DUPLICATE_SERVICE}
-     * code, which is what it branches on.
+     * <p><b>Names the colliding copy like every other {@code DUPLICATE_SERVICE} site.</b> Reaching
+     * here means the pre-check passed and a concurrent transaction won the race in between; the
+     * flush reports only the constraint, so {@link #flushTranslatingDuplicateViolation} looks the
+     * committed winner up afterwards (see there) and blames the first queued copy it matches.
      */
-    private void flushBulkBatch() {
-        flushTranslatingDuplicateViolation(null);
+    private void flushBulkBatch(OwnerType ownerType, UUID ownerId, List<PendingCopy> pendingCopies) {
+        flushTranslatingDuplicateViolation(ownerType, ownerId, pendingCopies);
+    }
+
+    /**
+     * The definitions a bulk batch INSERTS (items whose target creates a copy — a reuse inserts only
+     * an assignment), in request order, each reported under its type's {@code nameUk} exactly like
+     * the {@link #assertNoActiveDuplicatesInBatch} pre-check names it.
+     */
+    private static List<PendingCopy> pendingCopiesOf(List<BulkServiceItemRequest> items,
+            List<BulkItemTarget> targets, Map<UUID, ServiceType> typesById) {
+        List<PendingCopy> pending = new ArrayList<>(items.size());
+        for (int i = 0; i < items.size(); i++) {
+            if (targets.get(i).reusable() != null) {
+                continue;
+            }
+            BulkServiceItemRequest item = items.get(i);
+            ServiceType type = typesById.get(item.serviceTypeId());
+            pending.add(new PendingCopy(type, item.durationMinutes(), effectiveBulkName(item, type),
+                    type.getNameUk()));
+        }
+        return pending;
+    }
+
+    /**
+     * One definition INSERT queued for the next flush: its V233 key (type, duration, effective name)
+     * and the {@code serviceName} the {@code DUPLICATE_SERVICE} 409 reports when it loses a race.
+     */
+    private record PendingCopy(ServiceType type, Integer durationMinutes, @Nullable String name,
+            @Nullable String reportedName) {
     }
 
     /**
@@ -2807,21 +2951,71 @@ public class ServiceCatalogService {
      * {@code GlobalExceptionHandler#handleDataIntegrityViolation} keeps its deliberately opaque,
      * anti-enumeration response.
      *
-     * @param serviceName echoed to the client so it can name the conflicting entry without a
-     *                    second round-trip; {@code null} on the bulk path, where the flush reports
-     *                    the constraint rather than which of the N queued rows lost and the
-     *                    aborted Postgres transaction rules out looking it up
+     * <p><b>Filling {@code serviceName} + {@code existingServiceDefId}.</b> The index reports the
+     * constraint, not the surviving row, and the violation aborts this Postgres transaction, so the
+     * winner is looked up through {@link DuplicateServiceCopyLookup} in its own
+     * {@code REQUIRES_NEW} read-only transaction (owner + type + duration + canonical name, the V233
+     * key). Only this rare failing path pays for that second connection.
+     *
+     * @param pendingCopies the definition INSERTs this flush emits, in request order
      */
-    private void flushTranslatingDuplicateViolation(@Nullable String serviceName) {
+    private void flushTranslatingDuplicateViolation(OwnerType ownerType, UUID ownerId,
+            List<PendingCopy> pendingCopies) {
         try {
             serviceRepository.flush();
         } catch (DataIntegrityViolationException ex) {
             if (!isDuplicateServiceViolation(ex)) {
                 throw ex;
             }
-            // The index reports the constraint, not the surviving row — hence a null id.
-            throw new DuplicateServiceException(serviceName, null);
+            throw duplicateOfCommittedCopy(ownerType, ownerId, pendingCopies, null);
         }
+    }
+
+    /**
+     * Builds the race-loser 409 naming the committed copy the first queued INSERT collided with.
+     * Falls back to the pre-lookup payload — the single queued copy's name (or {@code null} for a
+     * batch) and a {@code null} id — when the lookup finds no match or itself fails: the stable
+     * {@code DUPLICATE_SERVICE} code must survive either way, never degrade to a 500.
+     *
+     * @param excludeId the row being UPDATED (never its own collision), or {@code null} on a create
+     */
+    private DuplicateServiceException duplicateOfCommittedCopy(OwnerType ownerType, UUID ownerId,
+            List<PendingCopy> pendingCopies, @Nullable UUID excludeId) {
+        String fallbackName = pendingCopies.size() == 1 ? pendingCopies.get(0).reportedName() : null;
+        if (pendingCopies.isEmpty()) {
+            return new DuplicateServiceException(fallbackName, null);
+        }
+        int size = pendingCopies.size();
+        UUID[] typeIds = new UUID[size];
+        Integer[] durations = new Integer[size];
+        String[] names = new String[size];
+        for (int i = 0; i < size; i++) {
+            PendingCopy copy = pendingCopies.get(i);
+            typeIds[i] = copy.type().getId();
+            durations[i] = copy.durationMinutes();
+            names[i] = copy.name();
+        }
+        List<ActiveDuplicateProjection> committed;
+        try {
+            committed = duplicateServiceCopyLookup.findCommittedCopies(ownerType, ownerId, typeIds, durations, names)
+                    .stream()
+                    .filter(row -> excludeId == null || !excludeId.equals(row.serviceDefinitionId()))
+                    .toList();
+        } catch (DataAccessException | TransactionException lookupFailure) {
+            // DataAccessException: the query failed or hit its timeout. TransactionException: the
+            // REQUIRES_NEW transaction could not even begin (e.g. CannotCreateTransactionException on
+            // an exhausted pool). Never echo SQL/driver detail (§I/§N); the 409 still carries the code.
+            log.debug("Duplicate-copy lookup after V233 race failed: {}", lookupFailure.getClass().getSimpleName());
+            return new DuplicateServiceException(fallbackName, null);
+        }
+        for (PendingCopy copy : pendingCopies) {
+            ActiveDuplicateProjection hit = collidingCopyOf(copy.type().getId(), copy.durationMinutes(),
+                    copy.name(), committed);
+            if (hit != null) {
+                return new DuplicateServiceException(copy.reportedName(), hit.serviceDefinitionId());
+            }
+        }
+        return new DuplicateServiceException(fallbackName, null);
     }
 
     /**
@@ -2861,9 +3055,16 @@ public class ServiceCatalogService {
             if (!isDuplicateServiceViolation(ex)) {
                 throw ex;
             }
-            // The index reports the constraint, not the surviving row — hence a null id. The
-            // client still gets the DUPLICATE_SERVICE code plus the name it just submitted.
-            throw new DuplicateServiceException(definition.getName(), null);
+            // The index reports the constraint, not the surviving row: look the committed winner up
+            // (REQUIRES_NEW, same as the flush paths). Fallback = the submitted name + null id. The
+            // row's own id is excluded so an UPDATE can never be reported as colliding with itself.
+            if (definition.getServiceType() == null) {
+                throw new DuplicateServiceException(definition.getName(), null);
+            }
+            throw duplicateOfCommittedCopy(definition.getOwnerType(), definition.getOwnerId(),
+                    List.of(new PendingCopy(definition.getServiceType(), definition.getBaseDurationMinutes(),
+                            definition.getName(), definition.getName())),
+                    definition.getId());
         }
     }
 

@@ -249,9 +249,73 @@ class ServiceCopiesReadPathsIT extends AbstractIntegrationTest {
         ResponseEntity<String> resp = postVisit(newClientToken("closed"), copies.ownerMasterId(),
                 List.of(copies.shortAssignment(), copies.longAssignment()), visitStart());
 
-        assertThat(resp.getStatusCode().is4xxClientError()).as("status %s body %s", resp.getStatusCode(), resp.getBody())
-                .isTrue();
+        assertThat(resp.getStatusCode()).as("body: %s", resp.getBody()).isEqualTo(HttpStatus.CONFLICT);
         assertThat(bookingRowsOf(copies.ownerMasterId())).isZero();
+    }
+
+    @Test
+    @DisplayName("A copy whose DEFINITION is deactivated (assignment still active) is refused on POST /appointments → 404, nothing written")
+    void should_refuseVisit_when_copyDefinitionDeactivatedButAssignmentActive() throws Exception {
+        Copies copies = independentMasterWithCopies("Retiredcopy");
+        deleteAsOk("/api/v1/services/" + definitionOf(copies.longAssignment()), masterToken(copies.ownerMasterId()));
+        Boolean assignmentActive = jdbcTemplate.queryForObject(
+                "SELECT is_active FROM master_services WHERE id = ?", Boolean.class, copies.longAssignment());
+
+        ResponseEntity<String> resp = postVisit(newClientToken("retired"), copies.ownerMasterId(),
+                List.of(copies.shortAssignment(), copies.longAssignment()), visitStart());
+
+        assertThat(assignmentActive)
+                .as("precondition: deactivating a definition does not cascade to its assignment")
+                .isTrue();
+        assertThat(resp.getStatusCode()).as("body: %s", resp.getBody()).isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(bookingRowsOf(copies.ownerMasterId())).isZero();
+    }
+
+    @Test
+    @DisplayName("A copy whose DEFINITION is deactivated (assignment still active) is refused on single POST /bookings → 404, nothing written")
+    void should_refuseSingleBooking_when_copyDefinitionDeactivatedButAssignmentActive() throws Exception {
+        Copies copies = independentMasterWithCopies("Retiredsingle");
+        deleteAsOk("/api/v1/services/" + definitionOf(copies.longAssignment()), masterToken(copies.ownerMasterId()));
+
+        String client = newClientToken("retiredsingle");
+
+        ResponseEntity<String> resp = postSingleBooking(client, copies.ownerMasterId(), copies.longAssignment());
+        int rowsAfterRefusal = bookingRowsOf(copies.ownerMasterId());
+        // Control: the SAME master + start with the still-active copy books, so the 404 above can only
+        // come from the retired definition (the handler masks the message as "Resource not found").
+        ResponseEntity<String> control = postSingleBooking(client, copies.ownerMasterId(), copies.shortAssignment());
+
+        assertThat(resp.getStatusCode()).as("body: %s", resp.getBody()).isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(rowsAfterRefusal).as("nothing written by the refused request").isZero();
+        assertThat(control.getStatusCode()).as("control body: %s", control.getBody()).isEqualTo(HttpStatus.CREATED);
+    }
+
+    /** Single-service {@code POST /bookings} at {@link #visitStart()}. */
+    private ResponseEntity<String> postSingleBooking(String clientToken, UUID masterId, UUID assignmentId) {
+        Map<String, Object> body = Map.of("masterId", masterId, "masterServiceId", assignmentId,
+                "startsAt", visitStart().toOffsetDateTime().toString());
+        return restTemplate.exchange("/api/v1/bookings", HttpMethod.POST,
+                new HttpEntity<>(body, bookings.bearerHeaders(clientToken)), String.class);
+    }
+
+    @Test
+    @DisplayName("Slots for a copy whose DEFINITION is deactivated → 404 (consistent with booking); the live copy still has slots")
+    void should_return404Slots_when_copyDefinitionDeactivatedButAssignmentActive() throws Exception {
+        Copies copies = independentMasterWithCopies("Retiredslots");
+        deleteAsOk("/api/v1/services/" + definitionOf(copies.longAssignment()), masterToken(copies.ownerMasterId()));
+        String client = newClientToken("retiredslots");
+        String slotsUrl = "/api/v1/masters/" + copies.ownerMasterId() + "/slots?date=" + visitDate() + "&serviceId=";
+
+        ResponseEntity<String> retired = restTemplate.exchange(slotsUrl + copies.longAssignment(), HttpMethod.GET,
+                new HttpEntity<>(bookings.bearerHeaders(client)), String.class);
+        ResponseEntity<String> pair = restTemplate.exchange(
+                slotsUrl + copies.shortAssignment() + "&serviceId=" + copies.longAssignment(), HttpMethod.GET,
+                new HttpEntity<>(bookings.bearerHeaders(client)), String.class);
+        JsonNode live = http.get(slotsUrl + copies.shortAssignment(), client).path("slots");
+
+        assertThat(retired.getStatusCode()).as("body: %s", retired.getBody()).isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(pair.getStatusCode()).as("batched path, body: %s", pair.getBody()).isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(live).as("control: the still-active copy keeps its slots").isNotEmpty();
     }
 
     @Test

@@ -127,7 +127,8 @@ class ServiceCatalogServiceCatalogTest {
                 searchVisibilityGuard,
                 servicePhotoBlobPurger,
                 bookingRepository,
-                clock
+                clock,
+                null // DuplicateServiceCopyLookup — only the flush-time V233 race path reads it
         );
     }
 
@@ -298,6 +299,34 @@ class ServiceCatalogServiceCatalogTest {
                 "Детальний опис",
                 userId
         );
+    }
+
+    @Test
+    @DisplayName("a name made only of NBSP / U+2007 / U+3000 separators passes @NotBlank but is rejected 400 after NFKC+strip — nothing submitted")
+    void should_throw400_when_suggestedNameIsOnlyUnicodeSpaceSeparators() {
+        UUID userId = UUID.randomUUID();
+        var request = new SuggestServiceTypeRequest("\u00A0\u2007\u3000", "LASH_EXTENSIONS", null);
+
+        assertThatThrownBy(() -> service.suggestServiceType(request, userId))
+                .isInstanceOf(BusinessException.class)
+                .hasMessage("Name is required")
+                .extracting("status").isEqualTo(HttpStatus.BAD_REQUEST);
+
+        verifyNoInteractions(serviceTypeSuggestionService);
+    }
+
+    @Test
+    @DisplayName("the suggested name is submitted in canonical form — NBSP folded, edges stripped, runs collapsed")
+    void should_submitCanonicalName_when_suggestedNameHasUnicodeSpacePadding() {
+        UUID userId = UUID.randomUUID();
+        String categoryName = "LASH_EXTENSIONS";
+        when(platformCategoryRepository.existsByNameAndActiveTrueAndStatus(
+                eq(categoryName), any())).thenReturn(true);
+        var request = new SuggestServiceTypeRequest("\u00A0Ламінування\u00A0\u00A0вій\u2007", categoryName, null);
+
+        service.suggestServiceType(request, userId);
+
+        verify(serviceTypeSuggestionService).submitSuggestion(categoryName, "Ламінування вій", null, userId);
     }
 
     @Test
