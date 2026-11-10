@@ -370,19 +370,38 @@ class ServiceCopiesDuplicateRuleIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("until phase 465: a SALON bulk with two items of one type (even at different durations) → 400, nothing written")
-    void should_return400_when_salonBulkCarriesOneTypeTwice() throws Exception {
+    @DisplayName("phase 465 lifted the salon per-type 400: one type at two durations in one SALON bulk → 201, two copies")
+    void should_return201_when_salonBulkCarriesOneTypeAtTwoDurations() throws Exception {
         String ownerToken = fixtures.createSalonOwnerAndGetToken("salon465-" + System.nanoTime() + "@beautica.test");
-        UUID salonId = fixtures.createSalon(ownerToken, "Pre-465 Salon");
+        UUID salonId = fixtures.createSalon(ownerToken, "Copies Salon");
         UUID masterId = fixtures.createSalonMaster(salonId);
 
-        ResponseEntity<String> resp = restTemplate.exchange(
-                "/api/v1/salons/" + salonId + "/masters/" + masterId + "/services/bulk", HttpMethod.POST,
-                new HttpEntity<>(new BulkCreateServicesRequest(List.of(item(60, "350.00"), item(90, "450.00"))),
-                        fixtures.bearerHeaders(ownerToken)), String.class);
+        ResponseEntity<String> resp = postSalonBulk(ownerToken, salonId, masterId,
+                List.of(item(60, "350.00"), item(90, "450.00")));
+
+        assertThat(resp.getStatusCode()).as("body: %s", resp.getBody()).isEqualTo(HttpStatus.CREATED);
+        assertThat(activeCount("SALON", salonId)).isEqualTo(2L);
+    }
+
+    @Test
+    @DisplayName("phase 465: a SALON bulk with an exact in-request pair (unnamed 120 twice) → 400, nothing written")
+    void should_return400_when_salonBulkCarriesAnExactPair() throws Exception {
+        String ownerToken = fixtures.createSalonOwnerAndGetToken("salon465x-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "Exact Pair Salon");
+        UUID masterId = fixtures.createSalonMaster(salonId);
+
+        ResponseEntity<String> resp = postSalonBulk(ownerToken, salonId, masterId,
+                List.of(item(120, "350.00"), item(120, "450.00")));
 
         assertThat(resp.getStatusCode()).as("body: %s", resp.getBody()).isEqualTo(HttpStatus.BAD_REQUEST);
         assertThat(activeCount("SALON", salonId)).isZero();
+    }
+
+    private ResponseEntity<String> postSalonBulk(String token, UUID salonId, UUID masterId,
+            List<BulkServiceItemRequest> items) {
+        return restTemplate.exchange(
+                "/api/v1/salons/" + salonId + "/masters/" + masterId + "/services/bulk", HttpMethod.POST,
+                new HttpEntity<>(new BulkCreateServicesRequest(items), fixtures.bearerHeaders(token)), String.class);
     }
 
     // ── Acceptance 8 — bulk against a held copy ────────────────────────────────

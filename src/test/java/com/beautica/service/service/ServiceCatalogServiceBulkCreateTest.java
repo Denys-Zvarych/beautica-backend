@@ -617,7 +617,7 @@ class ServiceCatalogServiceBulkCreateTest {
      * but never the third {@link SalonBulkSetupCandidate} shape — a master's own INACTIVE {@code
      * master_services} row for the salon's reused definition, i.e. a service this master
      * unassigned earlier via {@code unassignServiceFromMaster} and is now re-adding through the
-     * bulk screen. {@code reactivatableAssignmentIdByTypeId} (:1742) and {@code
+     * bulk screen. {@code reactivatableAssignmentIdByTypeId} (now {@code BulkItemTarget.reuse}, phase 465) and {@code
      * createSingleFromBulkItem}'s reactivation sub-branch (:776-787) existed in the diff with zero
      * unit coverage — only {@code MasterServiceUnassignIT} case 8 exercised D6, and only through
      * the SINGLE-assign endpoint, never the bulk one.
@@ -766,6 +766,158 @@ class ServiceCatalogServiceBulkCreateTest {
                 .as("350 and 350.00 are the same money — compareTo, not equals")
                 .isNull();
         assertThat(msaCaptor.getValue().getDurationOverrideMinutes()).isNull();
+    }
+
+    // ── Phase 465 D1 rules 2–4 — which salon copy an item resolves to ──────────
+
+    private static final String COPY_NAME = "Манікюр класичний";
+
+    /** An ACTIVE salon copy of {@code type} carrying an explicit {@code name} (phase 464 named copy). */
+    private ServiceDefinition namedSalonCopy(
+            UUID defId, UUID salonId, ServiceType type, String name, int durationMinutes) {
+        ServiceDefinition definition = existingSalonDefinition(defId, salonId, type, "350.00", durationMinutes);
+        definition.setName(name);
+        return definition;
+    }
+
+    /** The stubs every salon-branch resolution test needs before the candidate query. */
+    private void stubSalonBulkPrerequisites(UUID masterId, Master master, ServiceType type) {
+        when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
+        when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type));
+        when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of("NAIL_SERVICE"));
+    }
+
+    @Test
+    @DisplayName("465 D1 rule 2 — an UNNAMED item at another duration reuses the salon's single copy whatever it is called")
+    void should_reuseSingleCopy_when_unnamedItemMeetsASingleNamedCopyAtAnotherDuration() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID typeId = UUID.randomUUID();
+        Master master = salonMaster(masterId, salonId);
+        ServiceType type = serviceType(typeId, "Манікюр", "NAIL_SERVICE", true);
+        ServiceDefinition copy = namedSalonCopy(UUID.randomUUID(), salonId, type, COPY_NAME, 60);
+        var request = new BulkCreateServicesRequest(List.of(fixedItem(typeId, 90, "350.00")));
+        stubSalonBulkPrerequisites(masterId, master, type);
+        stubSalonCandidates(salonId, masterId, new SalonBulkSetupCandidate(typeId, copy, null, null));
+        stubAssignmentSaveEchoesEntity();
+
+        serviceCatalogService.bulkCreateSalonMasterServices(ACTOR_ID, salonId, masterId, request);
+
+        verify(serviceRepository, never()).save(any(ServiceDefinition.class));
+        ArgumentCaptor<MasterServiceAssignment> msaCaptor = ArgumentCaptor.forClass(MasterServiceAssignment.class);
+        verify(masterServiceRepository).save(msaCaptor.capture());
+        assertThat(msaCaptor.getValue().getServiceDefinition()).isSameAs(copy);
+        assertThat(msaCaptor.getValue().getDurationOverrideMinutes()).isEqualTo(90);
+    }
+
+    @Test
+    @DisplayName("465 D1 rule 2 — a NAMED item matching the single copy's name case/space-insensitively reuses it")
+    void should_reuseSingleCopy_when_namedItemMatchesItsNameIgnoringCaseAndSpaces() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID typeId = UUID.randomUUID();
+        Master master = salonMaster(masterId, salonId);
+        ServiceType type = serviceType(typeId, "Манікюр", "NAIL_SERVICE", true);
+        ServiceDefinition copy = namedSalonCopy(UUID.randomUUID(), salonId, type, COPY_NAME, 60);
+        var request = new BulkCreateServicesRequest(List.of(
+                namedItem(typeId, 90, "350.00", "  манікюр   КЛАСИЧНИЙ ")));
+        stubSalonBulkPrerequisites(masterId, master, type);
+        stubSalonCandidates(salonId, masterId, new SalonBulkSetupCandidate(typeId, copy, null, null));
+        stubAssignmentSaveEchoesEntity();
+
+        serviceCatalogService.bulkCreateSalonMasterServices(ACTOR_ID, salonId, masterId, request);
+
+        verify(serviceRepository, never()).save(any(ServiceDefinition.class));
+        ArgumentCaptor<MasterServiceAssignment> msaCaptor = ArgumentCaptor.forClass(MasterServiceAssignment.class);
+        verify(masterServiceRepository).save(msaCaptor.capture());
+        assertThat(msaCaptor.getValue().getServiceDefinition()).isSameAs(copy);
+        assertThat(copy.getName()).as("reuse never renames the shared copy").isEqualTo(COPY_NAME);
+    }
+
+    @Test
+    @DisplayName("465 D1 rule 4 — a NAMED item for another name creates a new named copy, never folds into the single copy")
+    void should_createNamedCopy_when_namedItemDiffersFromTheSingleCopysName() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID typeId = UUID.randomUUID();
+        Master master = salonMaster(masterId, salonId);
+        ServiceType type = serviceType(typeId, "Манікюр", "NAIL_SERVICE", true);
+        ServiceDefinition copy = namedSalonCopy(UUID.randomUUID(), salonId, type, COPY_NAME, 60);
+        var request = new BulkCreateServicesRequest(List.of(
+                namedItem(typeId, 90, "450.00", "Манікюр з дизайном")));
+        stubSalonBulkPrerequisites(masterId, master, type);
+        stubSalonCandidates(salonId, masterId, new SalonBulkSetupCandidate(typeId, copy, null, null));
+        stubSaveEchoesEntities();
+
+        serviceCatalogService.bulkCreateSalonMasterServices(ACTOR_ID, salonId, masterId, request);
+
+        ArgumentCaptor<ServiceDefinition> defCaptor = ArgumentCaptor.forClass(ServiceDefinition.class);
+        verify(serviceRepository).save(defCaptor.capture());
+        ServiceDefinition created = defCaptor.getValue();
+        assertThat(created).isNotSameAs(copy);
+        assertThat(created.getName()).isEqualTo("Манікюр з дизайном");
+        assertThat(created.getBaseDurationMinutes()).isEqualTo(90);
+        assertThat(created.getOwnerType()).isEqualTo(OwnerType.SALON);
+        assertThat(created.getOwnerId()).isEqualTo(salonId);
+    }
+
+    @Test
+    @DisplayName("465 D1 rule 4 — an UNNAMED item meeting only a NAMED copy at its duration creates the default-name copy")
+    void should_createDefaultCopy_when_unnamedItemMeetsOnlyANamedCopyAtItsDuration() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID typeId = UUID.randomUUID();
+        Master master = salonMaster(masterId, salonId);
+        ServiceType type = serviceType(typeId, "Манікюр", "NAIL_SERVICE", true);
+        ServiceDefinition default60 = existingSalonDefinition(UUID.randomUUID(), salonId, type, "350.00", 60);
+        ServiceDefinition named90 = namedSalonCopy(UUID.randomUUID(), salonId, type, COPY_NAME, 90);
+        var request = new BulkCreateServicesRequest(List.of(fixedItem(typeId, 90, "450.00")));
+        stubSalonBulkPrerequisites(masterId, master, type);
+        stubSalonCandidates(salonId, masterId,
+                new SalonBulkSetupCandidate(typeId, default60, null, null),
+                new SalonBulkSetupCandidate(typeId, named90, null, null));
+        stubSaveEchoesEntities();
+
+        serviceCatalogService.bulkCreateSalonMasterServices(ACTOR_ID, salonId, masterId, request);
+
+        ArgumentCaptor<ServiceDefinition> defCaptor = ArgumentCaptor.forClass(ServiceDefinition.class);
+        verify(serviceRepository).save(defCaptor.capture());
+        ServiceDefinition created = defCaptor.getValue();
+        assertThat(created).isNotSameAs(named90).isNotSameAs(default60);
+        assertThat(created.getName()).as("the type's default name, not the named copy's").isEqualTo("Манікюр");
+        assertThat(created.getBaseDurationMinutes()).isEqualTo(90);
+    }
+
+    @Test
+    @DisplayName("465 D1 rule 2 extra condition — another item matching the single copy exactly claims it; the other item creates a copy")
+    void should_createCopy_when_anotherItemInTheRequestMatchesTheSingleCopyExactly() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID typeId = UUID.randomUUID();
+        Master master = salonMaster(masterId, salonId);
+        ServiceType type = serviceType(typeId, "Манікюр", "NAIL_SERVICE", true);
+        ServiceDefinition copy60 = existingSalonDefinition(UUID.randomUUID(), salonId, type, "350.00", 60);
+        // 90 FIRST: without the exact-claim clause rule 2 would hand it the 60 copy, and the
+        // later 60 item would then reuse the same copy a second time.
+        var request = new BulkCreateServicesRequest(List.of(
+                fixedItem(typeId, 90, "450.00"),
+                fixedItem(typeId, 60, "350.00")));
+        stubSalonBulkPrerequisites(masterId, master, type);
+        stubSalonCandidates(salonId, masterId, new SalonBulkSetupCandidate(typeId, copy60, null, null));
+        stubSaveEchoesEntities();
+
+        List<MasterServiceResponse> result =
+                serviceCatalogService.bulkCreateSalonMasterServices(ACTOR_ID, salonId, masterId, request);
+
+        ArgumentCaptor<ServiceDefinition> defCaptor = ArgumentCaptor.forClass(ServiceDefinition.class);
+        verify(serviceRepository).save(defCaptor.capture());
+        assertThat(defCaptor.getValue().getBaseDurationMinutes()).isEqualTo(90);
+        ArgumentCaptor<MasterServiceAssignment> msaCaptor = ArgumentCaptor.forClass(MasterServiceAssignment.class);
+        verify(masterServiceRepository, times(2)).save(msaCaptor.capture());
+        assertThat(msaCaptor.getAllValues().get(0).getServiceDefinition()).isSameAs(defCaptor.getValue());
+        assertThat(msaCaptor.getAllValues().get(1).getServiceDefinition()).isSameAs(copy60);
+        assertThat(msaCaptor.getAllValues().get(1).getDurationOverrideMinutes()).isNull();
+        assertThat(result).hasSize(2);
     }
 
     /**

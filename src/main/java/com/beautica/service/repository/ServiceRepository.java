@@ -335,7 +335,10 @@ public interface ServiceRepository extends JpaRepository<ServiceDefinition, UUID
      * {@code master_services} is {@code UNIQUE (master_id, service_def_id)}, so at most one
      * assignment matches per definition. Bounded by construction (§E-3) — {@code typeIds} is the
      * caller's own validated, deduplicated request set, and at most two owners can answer for a
-     * type.
+     * type. Since phase 464/465 a salon may hold several ACTIVE copies of one type (one per
+     * {@code (base_duration_minutes, lower(btrim(name)))}), so a type returns one row PER COPY —
+     * the caller resolves each bulk item to a copy in memory; the rows stay bounded by the salon's
+     * own catalogue for the requested types.
      *
      * <p>Read-then-write like every guard on this path (§E-4 — unscoped by role, the caller must
      * already hold write access to both salon and master): the partial unique index

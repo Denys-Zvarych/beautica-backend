@@ -1612,9 +1612,13 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
                 .isZero();
     }
 
-    /** Case 7 — the 409 that survives, re-scoped to the master. */
+    /**
+     * Case 7 — the 409 that survives, re-scoped to the master and (phase 465) to the COPY: the
+     * same type at the same duration and name. The same type at ANOTHER duration is a new salon
+     * copy and returns 201 — pinned by {@code SalonServiceCopiesIT} AC1.
+     */
     @Test
-    @DisplayName("the SAME master re-submitting a service type they already offer → 409 DUPLICATE_SERVICE (D4)")
+    @DisplayName("the SAME master re-submitting a service copy they already offer → 409 DUPLICATE_SERVICE (D4, per copy since 465)")
     void should_return409_when_salonMasterResubmitsAServiceTypeTheyAlreadyOffer() throws Exception {
         String ownerToken = fixtures.createSalonOwnerAndGetToken(
                 "owner-302-dup-" + System.nanoTime() + "@beautica.test");
@@ -1628,9 +1632,9 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
         assertThat(first.getStatusCode()).isEqualTo(HttpStatus.CREATED);
         UUID defId = createdFrom(first).get(0).serviceDefinition().id();
 
-        log.debug("Act: the SAME master re-submits the same service type — expect 409, not a reuse");
+        log.debug("Act: the SAME master re-submits the same copy (type + duration, another price) — expect 409, not a reuse");
         ResponseEntity<String> second = postSalonBulk(ownerToken, salonId, masterId,
-                new BulkCreateServicesRequest(List.of(fixed(typeId, 45, "400.00"))));
+                new BulkCreateServicesRequest(List.of(fixed(typeId, 60, "400.00"))));
 
         assertThat(second.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
         assertThat(duplicateBodyFrom(second))
@@ -1784,7 +1788,7 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
      * 20 as at batch size 2.
      *
      * <p><b>What it protects.</b> The phase's central performance claim is that both salon-branch
-     * guards are BATCHED: {@code assertMasterDoesNotAlreadyOffer} is one
+     * guards are BATCHED: {@code resolveSalonBulkCandidates} (was {@code assertMasterDoesNotAlreadyOffer}) is one
      * {@code findActiveAssignedServiceTypeIds} for the whole batch and
      * {@code findReusableSalonDefinitions} is one {@code findActiveDuplicateTypeIds} for the whole
      * batch. Nothing else pinned that. A refactor back to a per-item {@code existsActive} /
@@ -2188,6 +2192,49 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
                 Integer.class, masterId))
                 .as("the authorized direct call must actually persist the batch")
                 .isEqualTo(1);
+    }
+
+    /**
+     * Phase 465 — D1 rule 2 regression proof. A salon with exactly ONE copy of a type, a second
+     * master who offers no copy of it, an unnamed item at another duration and another price
+     * shape: the item reuses that copy with a duration override and its own band, exactly as before
+     * 465. The response body is compared, normalised for generated ids/timestamps and the seeded
+     * type's catalogue strings, against {@link #RULE2_RECORDED_BODY} — recorded from the pre-465
+     * service (phase-464 head) and replayed byte-for-byte against the per-copy resolver.
+     */
+    @Test
+    @DisplayName("Phase 465 D1 rule 2: single salon copy reused by another master at another duration — body byte-identical to pre-465")
+    void should_returnRecordedBody_when_singleCopyReusedAtAnotherDuration() throws Exception {
+        String ownerToken = fixtures.createSalonOwnerAndGetToken("owner-465-rule2-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "Phase 465 Rule 2 Salon");
+        UUID masterA = fixtures.createSalonMaster(salonId);
+        UUID masterB = fixtures.createSalonMaster(salonId);
+        var type = seededTypes.get(0);
+        ResponseEntity<String> seed = postSalonBulk(ownerToken, salonId, masterA,
+                new BulkCreateServicesRequest(List.of(fixed(type.id(), 60, "500.00"))));
+
+        ResponseEntity<String> resp = postSalonBulk(ownerToken, salonId, masterB,
+                new BulkCreateServicesRequest(List.of(range(type.id(), 90, "400.00", "900.00"))));
+
+        assertThat(seed.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        assertThat(resp.getStatusCode()).as("body: %s", resp.getBody()).isEqualTo(HttpStatus.CREATED);
+        assertThat(normaliseRecordedBody(resp.getBody(), type)).isEqualTo(RULE2_RECORDED_BODY);
+        assertThat(countActiveDefinitionsForOwner("SALON", salonId)).isEqualTo(1L);
+    }
+
+    private static final String RULE2_RECORDED_BODY =
+            "{\"success\":true,\"data\":[{\"id\":\"<uuid>\",\"masterId\":\"<uuid>\",\"serviceDefinition\":{\"id\":\"<uuid>\",\"name\":\"<typeName>\",\"description\":null,\"category\":\"<category>\",\"baseDurationMinutes\":60,\"bufferMinutesAfter\":0,\"isActive\":true,\"serviceTypeId\":\"<uuid>\",\"serviceTypeNameUk\":\"<typeName>\",\"serviceTypeSlug\":\"<typeSlug>\",\"photoUrl\":null,\"priceType\":\"FIXED\",\"priceMin\":500.0,\"priceMax\":null,\"priceDisplay\":\"500 ₴\",\"isFavorite\":null},\"priceOverride\":400.0,\"durationOverrideMinutes\":90,\"effectivePrice\":400.0,\"effectiveDurationMinutes\":90,\"isActive\":true,\"priceType\":\"RANGE\",\"priceMin\":400.0,\"priceMax\":900.0,\"priceDisplay\":\"від 400 до 900 ₴\",\"serviceTypeId\":\"<uuid>\",\"serviceTypeNameUk\":\"<typeName>\",\"serviceTypeSlug\":\"<typeSlug>\",\"isFavorite\":null}],\"message\":null}";
+
+    private String normaliseRecordedBody(String body, ServiceTestFixtures.SeededServiceType type) throws Exception {
+        String canonical = objectMapper.writeValueAsString(objectMapper.readTree(body));
+        String typeSlug = jdbcTemplate.queryForObject(
+                "SELECT slug FROM service_types WHERE id = ?", String.class, type.id());
+        return canonical
+                .replace(type.nameUk(), "<typeName>")
+                .replace(typeSlug, "<typeSlug>")
+                .replace(type.platformCategoryName(), "<category>")
+                .replaceAll("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", "<uuid>")
+                .replaceAll("\\d{4}-\\d{2}-\\d{2}T[0-9:.]+Z?", "<ts>");
     }
 
     private long masterServiceRowCount() {

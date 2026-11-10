@@ -64,6 +64,7 @@ import java.time.Clock;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -693,9 +694,9 @@ public class ServiceCatalogService {
      * catalogue-setup screen and later "add more services" passes.
      *
      * @throws ForbiddenException        if the master does not belong to the given salon
-     * @throws DuplicateServiceException (409) if <em>this master</em> already offers a batch
-     *                                   item's service type (Phase 302 D4 — the salon already
-     *                                   offering it is the reuse path, not a conflict)
+     * @throws DuplicateServiceException (409) if <em>this master</em> already offers the copy a
+     *                                   batch item resolves to (Phase 302 D4 / 465 D1 — the salon
+     *                                   already offering it is the reuse path, not a conflict)
      */
     @Transactional
     public List<MasterServiceResponse> bulkCreateSalonMasterServices(
@@ -733,14 +734,16 @@ public class ServiceCatalogService {
      * An earlier revision of this javadoc claimed a single universal "owned by the master row"
      * rule; that claim was false against the catalogue query and is retired.
      *
-     * <p><b>Find-or-create on the SALON branch (D2).</b> A salon owner is shared by every master
-     * in the salon, and V121's partial unique index
-     * {@code ux_service_def_owner_service_type_active} makes one ACTIVE definition per
-     * {@code (owner_type, owner_id, service_type_id)} a hard database rule. Two masters in one
-     * salon who both perform «Манікюр» therefore cannot each mint a definition — the second insert
-     * would be refused. So the SALON branch REUSES the salon's existing active definition for a
-     * service type and only creates one when none exists, then inserts this master's assignment
-     * either way. The reuse lookup and the per-master conflict check are ONE salon-scoped query
+     * <p><b>Find-or-create on the SALON branch (D2, per copy since phase 465).</b> A salon owner is
+     * shared by every master in the salon, and V233's partial unique index
+     * {@code ux_service_def_owner_type_duration_name_active} makes one ACTIVE definition per
+     * {@code (owner_type, owner_id, service_type_id, base_duration_minutes, lower(btrim(name)))} —
+     * one salon COPY — a hard database rule. Two masters in one salon who both perform the same
+     * copy of «Манікюр» therefore cannot each mint it — the second insert would be refused. So the
+     * SALON branch resolves each item to a salon copy (phase 465 D1, see
+     * {@link #resolveSalonBulkCandidates}): it REUSES an existing copy and creates one only when no
+     * copy fits, then inserts this master's assignment either way. A salon with one copy of a type
+     * behaves exactly as before 465. The reuse lookup and the per-master conflict check are ONE salon-scoped query
      * ({@link ServiceRepository#findSalonBulkSetupCandidates}) — the same collision projection
      * shape the owner-level guard uses, with its outcome split into <em>reuse</em> (the salon's
      * own definition) and <em>throw</em> (this master already performs it); no parallel lookup is
@@ -763,9 +766,10 @@ public class ServiceCatalogService {
      * shape representable, so Phase 312 retires that guard: see
      * {@link #resolveBulkReuseBand}, which now stores the item's own band instead.
      *
-     * <p><b>The conflict is per-MASTER on the SALON branch (D4).</b> "The salon already offers
-     * this type" is the reuse path, not a conflict; {@code 409 DUPLICATE_SERVICE} fires only when
-     * <em>this master</em> already has an active assignment for the type. The INDEPENDENT_MASTER
+     * <p><b>The conflict is per-MASTER and per COPY on the SALON branch (D4, phase 465).</b> "The
+     * salon already offers this copy" is the reuse path, not a conflict; {@code 409
+     * DUPLICATE_SERVICE} fires only when <em>this master</em> already has an active assignment for
+     * the exact copy the item resolves to (same type, duration and name). The INDEPENDENT_MASTER
      * branch keeps the owner-level definition guard verbatim — for it, owner and master are the
      * same row, and the guard additionally catches an active definition carrying no assignment,
      * which the assignment-level check cannot see.
@@ -791,16 +795,11 @@ public class ServiceCatalogService {
         // platform_categories) — no owner-scoped state, so serializing them buys nothing while
         // extending the lock hold by ~2 DB round-trips on every call. Hoisting them also means a
         // request that 400s/404s on a bad service type never takes the lock at all.
-        if (ownerType == OwnerType.SALON) {
-            // phase 465 lifts this: until the salon branch resolves reuse per copy, two items of
-            // one type in one salon request would both reuse the same salon definition and hit
-            // master_services' unique key as an opaque generic 409. Keep the pre-464 per-type 400.
-            rejectDuplicateServiceTypesInRequest(request.items());
-        } else {
-            // Phase 464 D5 — before the type lookup, so duplicate + unknown type stays a 400:
-            // supplied names compare as given, blank names compare equal within one type.
-            rejectDuplicateCopiesInRequest(request.items(), Map.of());
-        }
+        // Phase 464 D5 / 465 D1a — one in-request rule for BOTH branches, before the type lookup
+        // so duplicate + unknown type stays a 400: supplied names compare as given, blank names
+        // compare equal within one type. The salon branch then resolves each surviving item to a
+        // salon copy per item (resolveSalonBulkCandidates).
+        rejectDuplicateCopiesInRequest(request.items(), Map.of());
 
         // PERF: see above — one query for every distinct type.
         Map<UUID, ServiceType> typesById = resolveBulkServiceTypes(request.items());
@@ -811,20 +810,20 @@ public class ServiceCatalogService {
 
         // TOCTOU guard: serialize concurrent additive bulk adds against the same DEFINITION key
         // space. The guard below is a read-then-write check — it reads which of the batch's
-        // service types are already taken, then inserts. Two concurrent bulk POSTs could
-        // therefore both read "type X is free" and both proceed. The V121 unique index is the
+        // copies are already taken, then inserts. Two concurrent bulk POSTs could
+        // therefore both read "copy X is free" and both proceed. The V233 unique index is the
         // correctness backstop (the loser 500s at flush and is translated to a 409), but taking a
         // transaction-scoped advisory lock makes the second caller wait for the first to commit,
         // so its guard sees the committed rows and either REUSES them or produces the clean,
         // item-naming 409 instead of a raced constraint violation. Mirrors the booking
         // overlap-guard advisory lock (anti-bug pattern).
         //
-        // THE KEY IS THE OWNER, NOT THE MASTER (phase-302 audit HIGH-2). V121 keys on
-        // (owner_type, owner_id, service_type_id), so on the SALON branch the contended resource
+        // THE KEY IS THE OWNER, NOT THE MASTER (phase-302 audit HIGH-2). V233 keys on (owner_type,
+        // owner_id, service_type_id, base_duration_minutes, lower(btrim(name))), so on the SALON branch the contended resource
         // is the SALON's definition set, shared by every master in it. Keying on masterId let two
         // DIFFERENT masters of one salon take two DIFFERENT locks, both miss
         // findSalonBulkSetupCandidates' reuse arm, and both INSERT (SALON, salonId, typeId) — the
-        // loser then tripping V121 at flush, where flushBulkBatch can only translate a constraint
+        // loser then tripping the index at flush, where flushBulkBatch can only translate a constraint
         // NAME, so the client got a DUPLICATE_SERVICE 409 with serviceName AND existingServiceDefId
         // both null. Locking the owner is strictly stronger than locking the master (two batches
         // for one master are also two batches for its salon), and exactly ONE key is taken per
@@ -846,33 +845,30 @@ public class ServiceCatalogService {
         //
         //   SALON  — the owner is shared by every master in the salon, so an owner-level
         //            definition guard would reject the salon's SECOND master from ever offering
-        //            a type the first already offers. The conflict is per-MASTER, the salon-level
-        //            hit is the reuse path, and resolveSalonBulkCandidates answers BOTH from one
+        //            a copy the first already offers. The conflict is per-MASTER per copy, the
+        //            salon-level hit is the reuse path (phase 465 D1), and resolveSalonBulkCandidates answers BOTH from one
         //            query (audit LOW-3 — three round-trips inside a now salon-wide serialized
         //            window multiplied across every concurrent master setup in the salon).
         //   INDEPENDENT_MASTER — owner and master are the same row, so the pre-existing
         //            owner-level definition guard is kept verbatim. It is strictly stronger here:
         //            it also catches an active definition carrying no active assignment, which
-        //            would still violate V121 at INSERT but is invisible to an assignment check.
+        //            would still violate V233 at INSERT but is invisible to an assignment check.
         //
         // Both guards run INSIDE the advisory lock, exactly as before: each is a read-then-write
-        // check whose only race-proof backstop is the V121 index / the master_services unique key.
-        Map<UUID, ServiceDefinition> reusableByTypeId;
-        // Phase 307 D6 — type id -> the master's own INACTIVE master_services row for that
-        // reused definition, if any. When present, createSingleFromBulkItem must REACTIVATE this
-        // exact row instead of inserting a second one (master_services' UNIQUE (master_id,
-        // service_def_id) is NOT partial). Empty on the INDEPENDENT_MASTER branch, which never
-        // reuses a definition.
-        Map<UUID, UUID> reactivateAssignmentIdByTypeId;
+        // check whose only race-proof backstop is the V233 index / the master_services unique key.
+        // Phase 465 — one target PER ITEM (index-aligned with request.items()), not per type: a
+        // salon may hold several copies of one type, and one request may carry several items of
+        // one type. Each target names the salon copy to reuse (or none = create) and, Phase 307
+        // D6, the master's own INACTIVE master_services row for that exact copy, which must be
+        // REACTIVATED instead of inserting a second one (master_services' UNIQUE (master_id,
+        // service_def_id) is NOT partial). All CREATE on the INDEPENDENT_MASTER branch, which
+        // never reuses a definition.
+        List<BulkItemTarget> targets;
         if (ownerType == OwnerType.SALON) {
-            SalonBulkCandidateResolution resolution = resolveSalonBulkCandidates(
-                    master.getId(), ownerId, request.items(), typesById);
-            reusableByTypeId = resolution.reusableByTypeId();
-            reactivateAssignmentIdByTypeId = resolution.reactivateAssignmentIdByTypeId();
+            targets = resolveSalonBulkCandidates(master.getId(), ownerId, request.items(), typesById);
         } else {
             assertNoActiveDuplicatesInBatch(ownerType, ownerId, request.items(), typesById);
-            reusableByTypeId = Map.of();
-            reactivateAssignmentIdByTypeId = Map.of();
+            targets = Collections.nCopies(request.items().size(), BulkItemTarget.CREATE);
         }
 
         // PERF (2026-09-13 audit, P1/P4): resolve EVERY reactivation target in ONE findAllById
@@ -881,18 +877,21 @@ public class ServiceCatalogService {
         // SELECTs, all of them inside the salon-keyed advisory lock, for rows the caller already
         // knew the ids of. The per-item walk is back to O(0) queries, which is what
         // createSingleFromBulkItem's own javadoc has always claimed.
-        Map<UUID, MasterServiceAssignment> reactivateAssignmentByTypeId =
-                loadReactivationTargets(reactivateAssignmentIdByTypeId);
+        Map<UUID, MasterServiceAssignment> reactivateAssignmentById = loadReactivationTargets(targets);
         MasterSearchVisibilityGuard.Snapshot searchBefore = searchVisibilityGuard.capture(List.of(master.getId()));
 
-        List<MasterServiceResponse> created = request.items().stream()
-                .map(item -> createSingleFromBulkItem(
-                        master, ownerType, ownerId, item, typesById.get(item.serviceTypeId()),
-                        reusableByTypeId.get(item.serviceTypeId()),
-                        reactivateAssignmentByTypeId.get(item.serviceTypeId())))
-                .toList();
+        List<MasterServiceResponse> created = new ArrayList<>(request.items().size());
+        for (int i = 0; i < request.items().size(); i++) {
+            BulkServiceItemRequest item = request.items().get(i);
+            BulkItemTarget target = targets.get(i);
+            created.add(createSingleFromBulkItem(
+                    master, ownerType, ownerId, item, typesById.get(item.serviceTypeId()),
+                    target.reusable(),
+                    target.reactivateAssignmentId() == null
+                            ? null : reactivateAssignmentById.get(target.reactivateAssignmentId())));
+        }
 
-        // Push the whole batch to the DB in one go, translating a V121 violation exactly as the
+        // Push the whole batch to the DB in one go, translating a V233 violation exactly as the
         // single-item persistDefinition does. Must happen BEFORE refreshMinEffectivePrice below:
         // that is a JPQL @Modifying query, so Hibernate's AUTO flush would emit the inserts from
         // inside it — outside any catch — and the race would degrade to a generic 409.
@@ -923,11 +922,11 @@ public class ServiceCatalogService {
      * {@code 0}/{@code 1}); see
      * {@link MasterServiceRepository#acquireBulkSetupLockWithTimeout(UUID)}.
      *
-     * <p><b>{@code ownerId} — the V121 key space, not the master (audit HIGH-2).</b> The contended
-     * resource is one ACTIVE definition per {@code (owner_type, owner_id, service_type_id)}: the
+     * <p><b>{@code ownerId} — the V233 key space, not the master (audit HIGH-2).</b> The contended
+     * resource is one ACTIVE definition per copy of {@code (owner_type, owner_id, service_type_id)}: the
      * SALON on the salon branch, the master row on the independent branch (where owner and master
      * are the same row). Keying on the master in a salon let two masters of one salon insert the
-     * same {@code (SALON, salonId, typeId)} and the loser trip V121 at flush, producing a 409 with
+     * same {@code (SALON, salonId, typeId)} copy and the loser trip the index at flush, producing a 409 with
      * a null {@code serviceName} AND a null {@code existingServiceDefId}.
      *
      * <p><b>Why a bounded wait rather than {@code pg_try_advisory_xact_lock}.</b> Under a
@@ -1022,7 +1021,7 @@ public class ServiceCatalogService {
     /**
      * Creates one {@link ServiceDefinition} + {@link MasterServiceAssignment} from a bulk
      * item, using the pre-resolved {@link ServiceType} (type existence, active-check,
-     * category validation, and the V121 duplicate guard are all already done in batch by the
+     * category validation, and the per-copy duplicate guard are all already done in batch by the
      * caller). The service-type's name + parent category are the source of truth for the
      * persisted name and category (no free-text name accepted).
      *
@@ -1032,9 +1031,9 @@ public class ServiceCatalogService {
      * the caller flushes the batch once.
      *
      * <p><b>Reuse branch (Phase 302 D2/D3, band resolution Phase 312 D3/D9).</b> When
-     * {@code reusable} is non-null the salon already has an ACTIVE definition for this service
-     * type, so ONLY the assignment is inserted — creating a second definition would violate
-     * V121's {@code ux_service_def_owner_service_type_active}. The reused definition is left
+     * {@code reusable} is non-null {@link #resolveSalonBulkCandidates} resolved this item to an
+     * existing ACTIVE salon copy (phase 465 D1 rules 2–3), so ONLY the assignment is inserted —
+     * the item names that copy, not a new one. The reused definition is left
      * byte-identical; {@link #resolveBulkReuseBand} decides whether the item's band matches the
      * reused definition's (Inherited — all three {@code master_services} band columns
      * {@code NULL}) or must be stored as the master's own, fully-specified band. Duration follows
@@ -1053,7 +1052,7 @@ public class ServiceCatalogService {
      * INSERT here would trip it at flush; the existing row is reactivated and its overrides
      * refreshed from this item instead.
      *
-     * @param reusable               the salon's existing active definition for this service type,
+     * @param reusable               the salon's existing active copy this item resolved to,
      *                               or {@code null} to create one (always {@code null} on the
      *                               INDEPENDENT_MASTER branch)
      * @param reactivateAssignment   the master's own INACTIVE {@code master_services} row for
@@ -1144,8 +1143,7 @@ public class ServiceCatalogService {
      * — the name {@link #createSingleFromBulkItem} stores ({@link #effectiveBulkName}). Runs twice:
      * before the type lookup (unnamed items of one type compare equal, so a duplicate next to an
      * unknown type is still a 400) and after it (an unnamed item equals one named like the type).
-     * Used on the INDEPENDENT_MASTER branch; the SALON branch keeps
-     * {@link #rejectDuplicateServiceTypesInRequest} until phase 465. It is normalised by
+     * Used on both branches (phase 465 lifted the SALON branch's pre-464 per-type 400). It is normalised by
      * {@link #normaliseCopyName} (NFKC + {@link String#strip()}, then {@code toLowerCase(Locale.ROOT)}),
      * which agrees with the V233 index's {@code lower(btrim(name))} because stored names are already
      * canonical; the index stays the source of truth and the backstop.
@@ -1189,22 +1187,6 @@ public class ServiceCatalogService {
             return canonical;
         }
         return type != null ? type.getNameUk() : null;
-    }
-
-    /**
-     * Pre-464 in-request rule, kept for the SALON bulk branch only until phase 465: rejects two
-     * items of one {@code serviceTypeId} regardless of duration or name, with the same 400 as
-     * before. phase 465 lifts this.
-     */
-    private void rejectDuplicateServiceTypesInRequest(List<BulkServiceItemRequest> items) {
-        long distinct = items.stream()
-                .map(BulkServiceItemRequest::serviceTypeId)
-                .distinct()
-                .count();
-        if (distinct != items.size()) {
-            throw new BusinessException(HttpStatus.BAD_REQUEST,
-                    "Duplicate service type in bulk request");
-        }
     }
 
     /**
@@ -2403,58 +2385,235 @@ public class ServiceCatalogService {
     }
 
     /**
-     * Phase 302 D2/D4 — the SALON branch's whole read-then-write critical section, in ONE query
-     * for the whole batch: it both rejects a genuine per-master conflict (409) and returns the
-     * salon definitions the batch should reuse.
+     * Phase 302 D2/D4, per COPY since phase 465 — the SALON branch's whole read-then-write critical
+     * section, in ONE query for the whole batch: it rejects a genuine per-master conflict (409) and
+     * resolves, for EVERY item, which salon copy it reuses (or that it creates one).
      *
      * <p><b>Why the SALON branch cannot use the owner-level guard.</b> Under D1 the owner is the
-     * salon, shared by every master in it. Asking "does the OWNER already offer this type" would
+     * salon, shared by every master in it. Asking "does the OWNER already offer this copy" would
      * reject the salon's second master from ever offering «Манікюр» — the exact opposite of the
-     * phase's goal. The salon already offering a type is the REUSE path; the only genuine
-     * conflict left is <em>this master</em> already performing it, whose backing invariant is
-     * {@code master_services}' {@code UNIQUE (master_id, service_def_id)}.
+     * phase's goal. The salon already offering a copy is the REUSE path; the only genuine
+     * conflict left is <em>this master</em> already performing that copy, whose backing invariant
+     * is {@code master_services}' {@code UNIQUE (master_id, service_def_id)}.
+     *
+     * <p><b>Phase 465 D1 — which salon copy an item means</b> (resolved in ITEM ORDER, D1a: an
+     * earlier item of the same type counts as "the master already offers this type" for the later
+     * ones). The item's copy key is its type, its {@code durationMinutes} and its effective name
+     * ({@link #effectiveBulkName}: item {@code name}, else the type {@code nameUk}), compared to a
+     * stored copy the way the V233 index does ({@link #sameCopyName}):
+     * <ol>
+     *   <li>0 active salon copies → create one (rule 1, unchanged).</li>
+     *   <li>An active salon copy matches the key exactly → reuse it (rule 3); 409 when this master
+     *       already holds it ACTIVELY, reactivation when it holds it INACTIVE (D3 — by definition
+     *       id, never another copy of the type).</li>
+     *   <li>Exactly 1 salon copy, the master offers no copy of the type (neither stored nor earlier
+     *       in this request), no other item of the request matches that copy exactly, and the item
+     *       is unnamed or named like the copy → reuse it with today's duration override (rule 2,
+     *       byte-identical to pre-465 for every salon that exists today).</li>
+     *   <li>Anything else → create a new salon copy with the item's duration and effective name
+     *       (rule 4). It cannot be an exact twin of a stored copy (rule 3 would have matched) nor of
+     *       another created item ({@link #rejectDuplicateCopiesInRequest} 400s exact in-request
+     *       pairs), so the V233 index never fires on the ordinary path.</li>
+     * </ol>
+     * The "no other item matches that copy exactly" clause of rule 2 makes the outcome independent
+     * of item order: {@code 90 + 60} against a single {@code 60} copy assigns the {@code 60} copy to
+     * the {@code 60} item and creates a {@code 90} copy, exactly like {@code 60 + 90}.
      *
      * <p><b>One round-trip, not three (audit LOW-3).</b> This previously ran a per-master
      * assignment query, then an owner-level definition query, then a {@code findAllById} that
      * merely re-fetched definitions the second query had already joined. Once the advisory lock
      * became salon-keyed (audit HIGH-2) that serialized window is salon-wide, so three round-trips
      * inside it multiply across every concurrent master setup in the salon.
-     * {@link ServiceRepository#findSalonBulkSetupCandidates} answers all three questions in one
-     * batched (never per-item) statement.
+     * {@link ServiceRepository#findSalonBulkSetupCandidates} answers every question in one
+     * batched (never per-item) statement; the per-item walk below is pure in-memory.
      *
      * <p><b>Salon-scoped (audit HIGH-1).</b> The deleted per-master finder matched on
      * {@code master_id} alone, so a master ROTATED between salons — rotation moves
      * {@code masters.salon_id} and never touches {@code master_services} — kept ACTIVE assignments
      * to the SOURCE salon's definitions and was refused in the destination with a 409 disclosing a
      * source-salon {@code existingServiceDefId}. Scoping lives in the query's owner predicate; its
-     * {@code INDEPENDENT_MASTER} arm keeps the ~60 legacy master-owned rows (phase 303 backfills
-     * them) firing as conflicts.
+     * {@code INDEPENDENT_MASTER} arm keeps the legacy master-owned rows firing as a per-TYPE
+     * conflict, exactly as before 465 ({@link #legacyConflictDefIdByTypeId}).
      *
-     * @return type id → the salon's reusable ACTIVE definition (plus, Phase 307 D6, type id → any
-     *         INACTIVE assignment of the master's own that must be reactivated rather than
-     *         re-inserted); empty when the salon offers none of the batch's types
-     * @throws DuplicateServiceException (409) naming the first item this master already offers
+     * @return one target per item, index-aligned with {@code items}
+     * @throws DuplicateServiceException (409) naming the first item, in request order, whose copy
+     *                                   this master already offers
      */
-    private SalonBulkCandidateResolution resolveSalonBulkCandidates(
+    private List<BulkItemTarget> resolveSalonBulkCandidates(
             UUID masterId, UUID salonId,
             List<BulkServiceItemRequest> items, Map<UUID, ServiceType> typesById) {
 
         if (typesById.isEmpty()) {
-            return new SalonBulkCandidateResolution(Map.of(), Map.of());
+            return Collections.nCopies(items.size(), BulkItemTarget.CREATE);
         }
 
         List<SalonBulkSetupCandidate> candidates = serviceRepository
                 .findSalonBulkSetupCandidates(salonId, masterId, typesById.keySet());
 
-        assertMasterDoesNotAlreadyOffer(candidates, items, typesById);
-        Map<UUID, ServiceDefinition> reusableByTypeId = reusableSalonDefinitions(candidates);
-        Map<UUID, UUID> reactivateAssignmentIdByTypeId = reactivatableAssignmentIdByTypeId(candidates);
-        return new SalonBulkCandidateResolution(reusableByTypeId, reactivateAssignmentIdByTypeId);
+        Map<UUID, UUID> legacyConflictByTypeId = legacyConflictDefIdByTypeId(candidates);
+        Map<UUID, List<SalonBulkSetupCandidate>> copiesByTypeId = salonCopiesByTypeId(candidates);
+
+        List<SalonBulkSetupCandidate> exactMatches = new ArrayList<>(items.size());
+        Set<UUID> exactlyRequestedCopyIds = new HashSet<>();
+        for (BulkServiceItemRequest item : items) {
+            SalonBulkSetupCandidate exact = exactSalonCopy(item, typesById.get(item.serviceTypeId()),
+                    copiesByTypeId.getOrDefault(item.serviceTypeId(), List.of()));
+            exactMatches.add(exact);
+            if (exact != null) {
+                exactlyRequestedCopyIds.add(exact.definition().getId());
+            }
+        }
+
+        Set<UUID> typesTakenInRequest = new HashSet<>();
+        List<BulkItemTarget> targets = new ArrayList<>(items.size());
+        for (int i = 0; i < items.size(); i++) {
+            BulkServiceItemRequest item = items.get(i);
+            ServiceType type = typesById.get(item.serviceTypeId());
+            UUID legacyConflictId = legacyConflictByTypeId.get(item.serviceTypeId());
+            if (legacyConflictId != null) {
+                throw new DuplicateServiceException(type.getNameUk(), legacyConflictId);
+            }
+            targets.add(resolveSalonItemTarget(item, type,
+                    copiesByTypeId.getOrDefault(item.serviceTypeId(), List.of()),
+                    exactMatches.get(i), exactlyRequestedCopyIds,
+                    typesTakenInRequest.contains(item.serviceTypeId())));
+            // D1a — whatever this item resolved to, the master now offers a copy of the type.
+            typesTakenInRequest.add(item.serviceTypeId());
+        }
+        return targets;
+    }
+
+    /**
+     * Phase 465 D1 rules 2–4 for ONE item — see {@link #resolveSalonBulkCandidates} for the table.
+     *
+     * @param copies                  the salon's ACTIVE copies of the item's type (query order)
+     * @param exact                   the copy matching the item's key exactly, or {@code null}
+     * @param exactlyRequestedCopyIds every copy some item of the request matches exactly
+     * @param typeTakenInRequest      an earlier item of the request has the same type (D1a)
+     * @throws DuplicateServiceException (409) when this master already holds {@code exact} actively
+     */
+    private static BulkItemTarget resolveSalonItemTarget(BulkServiceItemRequest item, ServiceType type,
+            List<SalonBulkSetupCandidate> copies, @Nullable SalonBulkSetupCandidate exact,
+            Set<UUID> exactlyRequestedCopyIds, boolean typeTakenInRequest) {
+
+        if (exact != null) {
+            if (exact.assignedToMaster()) {
+                throw new DuplicateServiceException(type.getNameUk(), exact.definition().getId());
+            }
+            return BulkItemTarget.reuse(exact);
+        }
+        boolean masterOffersType = typeTakenInRequest
+                || copies.stream().anyMatch(SalonBulkSetupCandidate::assignedToMaster);
+        if (!masterOffersType && copies.size() == 1
+                && isSingleCopyReusable(item, copies.get(0), exactlyRequestedCopyIds)) {
+            return BulkItemTarget.reuse(copies.get(0));
+        }
+        return BulkItemTarget.CREATE;
+    }
+
+    /**
+     * D1 rule 2's name/request half: the salon's only copy is reusable by an item of another
+     * duration when no other item claims that copy exactly, and the item is either unnamed (the
+     * pre-465 request shape — byte-identical reuse, whatever the copy is called) or carries the
+     * copy's own name. A NAMED item for another name is a different copy (rule 4), never silently
+     * folded into the existing one.
+     */
+    private static boolean isSingleCopyReusable(BulkServiceItemRequest item,
+            SalonBulkSetupCandidate copy, Set<UUID> exactlyRequestedCopyIds) {
+        if (exactlyRequestedCopyIds.contains(copy.definition().getId())) {
+            return false;
+        }
+        String supplied = canonicalName(item.name());
+        return supplied == null || supplied.isEmpty()
+                || sameCopyName(normaliseCopyName(supplied), copy.definition().getName());
+    }
+
+    /**
+     * The salon copy whose (duration, name) equals the item's copy key, or {@code null}. The V233
+     * index admits at most one ACTIVE salon copy per key, so at most one can match.
+     */
+    @Nullable
+    private static SalonBulkSetupCandidate exactSalonCopy(BulkServiceItemRequest item, ServiceType type,
+            List<SalonBulkSetupCandidate> copies) {
+        String itemKey = normaliseCopyName(effectiveBulkName(item, type));
+        for (SalonBulkSetupCandidate copy : copies) {
+            if (Objects.equals(item.durationMinutes(), copy.definition().getBaseDurationMinutes())
+                    && sameCopyName(itemKey, copy.definition().getName())) {
+                return copy;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Compares an item's normalised copy key ({@link #normaliseCopyName}) with a STORED copy name
+     * the way the V233 index does: {@code lower(btrim(name))} — spaces-only trim, then lower case.
+     * The stored name is never re-canonicalised (a legacy name need not pass today's allow-list).
+     */
+    private static boolean sameCopyName(@Nullable String itemKey, @Nullable String storedName) {
+        if (itemKey == null || storedName == null) {
+            return false;
+        }
+        return itemKey.equals(btrimSpaces(storedName).toLowerCase(Locale.ROOT));
+    }
+
+    /** Postgres {@code btrim(text)}: strips leading/trailing U+0020 only. */
+    private static String btrimSpaces(String value) {
+        int start = 0;
+        int end = value.length();
+        while (start < end && value.charAt(start) == ' ') {
+            start++;
+        }
+        while (end > start && value.charAt(end - 1) == ' ') {
+            end--;
+        }
+        return value.substring(start, end);
+    }
+
+    /**
+     * The salon's own ACTIVE copies per type, in query order. Only {@code ownerType = SALON} rows
+     * qualify — a legacy {@code INDEPENDENT_MASTER}-owned definition is a conflict signal only
+     * ({@link #legacyConflictDefIdByTypeId}); reusing it would leave the salon's catalogue without
+     * the row the catalogue query requires. The definitions arrive hydrated from the candidate
+     * query, and their {@code serviceType} resolves from the persistence context
+     * ({@code resolveBulkServiceTypes} loaded exactly these types), so no N+1 follows.
+     */
+    private static Map<UUID, List<SalonBulkSetupCandidate>> salonCopiesByTypeId(
+            List<SalonBulkSetupCandidate> candidates) {
+        Map<UUID, List<SalonBulkSetupCandidate>> byTypeId = new LinkedHashMap<>();
+        for (SalonBulkSetupCandidate candidate : candidates) {
+            if (candidate.definition().getOwnerType() == OwnerType.SALON) {
+                byTypeId.computeIfAbsent(candidate.serviceTypeId(), k -> new ArrayList<>()).add(candidate);
+            }
+        }
+        return byTypeId;
+    }
+
+    /**
+     * Phase 302 D4, kept per TYPE for legacy rows — type id → the {@code existingServiceDefId} to
+     * report, for every type the master still performs through a legacy
+     * {@code INDEPENDENT_MASTER}-owned definition (phase 303 backfilled them; any left keep their
+     * pre-465 409). The reported id prefers a SALON copy the master holds for the type: that is
+     * the row the caller is authorised for and can deep-link to.
+     */
+    private static Map<UUID, UUID> legacyConflictDefIdByTypeId(List<SalonBulkSetupCandidate> candidates) {
+        Map<UUID, UUID> legacyByTypeId = new LinkedHashMap<>();
+        Map<UUID, UUID> heldSalonCopyByTypeId = new LinkedHashMap<>();
+        for (SalonBulkSetupCandidate candidate : candidates) {
+            if (!candidate.assignedToMaster()) {
+                continue;
+            }
+            Map<UUID, UUID> target = candidate.definition().getOwnerType() == OwnerType.SALON
+                    ? heldSalonCopyByTypeId : legacyByTypeId;
+            target.putIfAbsent(candidate.serviceTypeId(), candidate.definition().getId());
+        }
+        legacyByTypeId.replaceAll((typeId, legacyId) -> heldSalonCopyByTypeId.getOrDefault(typeId, legacyId));
+        return legacyByTypeId;
     }
 
     /**
      * Phase 307 D6 + 2026-09-13 audit P1 — resolves every reactivation target in ONE
-     * {@code findAllById}, keyed back by service-type id for the per-item walk.
+     * {@code findAllById}, keyed by assignment id for the per-item walk.
      *
      * <p>{@link #createSingleFromBulkItem} previously issued {@code findById} per item, inside the
      * salon-keyed advisory lock, for ids the caller had already projected. A 100-item batch where
@@ -2466,60 +2625,42 @@ public class ServiceCatalogService {
      * means the row vanished mid-transaction and the batch must not silently insert a duplicate
      * against {@code master_services}' non-partial {@code UNIQUE (master_id, service_def_id)}.
      */
-    private Map<UUID, MasterServiceAssignment> loadReactivationTargets(
-            Map<UUID, UUID> reactivateAssignmentIdByTypeId) {
-
-        if (reactivateAssignmentIdByTypeId.isEmpty()) {
+    private Map<UUID, MasterServiceAssignment> loadReactivationTargets(List<BulkItemTarget> targets) {
+        Set<UUID> ids = targets.stream()
+                .map(BulkItemTarget::reactivateAssignmentId)
+                .filter(Objects::nonNull)
+                .collect(Collectors.toCollection(LinkedHashSet::new));
+        if (ids.isEmpty()) {
             return Map.of();
         }
 
         Map<UUID, MasterServiceAssignment> byId = masterServiceRepository
-                .findAllById(reactivateAssignmentIdByTypeId.values()).stream()
+                .findAllById(ids).stream()
                 .collect(Collectors.toMap(MasterServiceAssignment::getId, Function.identity()));
 
-        Map<UUID, MasterServiceAssignment> byTypeId = new LinkedHashMap<>();
-        reactivateAssignmentIdByTypeId.forEach((typeId, assignmentId) -> {
-            MasterServiceAssignment assignment = byId.get(assignmentId);
-            if (assignment == null) {
-                throw new IllegalStateException(
-                        "Reactivation candidate vanished mid-transaction: " + assignmentId);
-            }
-            byTypeId.put(typeId, assignment);
-        });
-        return byTypeId;
-    }
-
-    /**
-     * Bundles {@link #resolveSalonBulkCandidates}'s two answers: which definitions to reuse, and
-     * which of the master's own INACTIVE assignments must be reactivated rather than re-inserted
-     * (Phase 307 D6). A small local record rather than two separately-threaded maps or a third
-     * round-trip — both come off the same {@link SalonBulkSetupCandidate} list.
-     */
-    private record SalonBulkCandidateResolution(
-            Map<UUID, ServiceDefinition> reusableByTypeId,
-            Map<UUID, UUID> reactivateAssignmentIdByTypeId) {
-    }
-
-    /**
-     * Phase 307 D6 — type id → the master's own INACTIVE {@code master_services} row id for the
-     * salon's reused definition of that type, for every candidate the master previously
-     * unassigned. Only {@code ownerType = SALON} candidates qualify, mirroring
-     * {@link #reusableSalonDefinitions}: an {@code INDEPENDENT_MASTER}-owned legacy definition is a
-     * conflict signal only, never a reuse/reactivation target.
-     */
-    private static Map<UUID, UUID> reactivatableAssignmentIdByTypeId(
-            List<SalonBulkSetupCandidate> candidates) {
-
-        Map<UUID, UUID> reactivateByTypeId = new LinkedHashMap<>();
-        for (SalonBulkSetupCandidate candidate : candidates) {
-            if (candidate.definition().getOwnerType() == OwnerType.SALON
-                    && candidate.hasInactiveAssignment()) {
-                reactivateByTypeId.put(candidate.serviceTypeId(), candidate.masterAssignmentId());
+        for (UUID id : ids) {
+            if (!byId.containsKey(id)) {
+                throw new IllegalStateException("Reactivation candidate vanished mid-transaction: " + id);
             }
         }
-        return reactivateByTypeId;
+        return byId;
     }
 
+    /**
+     * What one bulk item writes (phase 465 — per item, not per type): the salon copy it reuses
+     * ({@code null} = create a definition) and, Phase 307 D6, the master's own INACTIVE
+     * {@code master_services} row for that exact copy, to reactivate instead of re-inserting
+     * ({@code null} = insert a fresh assignment). D3: matched by definition id, so reactivation
+     * never revives a different copy of the same type.
+     */
+    private record BulkItemTarget(@Nullable ServiceDefinition reusable, @Nullable UUID reactivateAssignmentId) {
+        private static final BulkItemTarget CREATE = new BulkItemTarget(null, null);
+
+        private static BulkItemTarget reuse(SalonBulkSetupCandidate copy) {
+            return new BulkItemTarget(copy.definition(),
+                    copy.hasInactiveAssignment() ? copy.masterAssignmentId() : null);
+        }
+    }
     /**
      * Phase 312 D3/D9 — resolves the FULL per-master band a reused item writes onto
      * {@code master_services}, superseding the Phase 302 guard that used to REJECT a shape
@@ -2618,80 +2759,6 @@ public class ServiceCatalogService {
     }
 
     /**
-     * Phase 302 D4 — the per-MASTER conflict half of {@link #resolveSalonBulkCandidates}.
-     *
-     * <p>Keyed on the SERVICE TYPE, not on the definition id: the client picks a type, and a
-     * master must not end up with two rows for the same type even if two owners held a definition
-     * for it. Checking {@code serviceDefId} instead would be satisfied by the assignment unique
-     * constraint alone and would not express this rule.
-     *
-     * <p>Reports the FIRST collision in <em>request</em> order — result order is unspecified, and
-     * blaming a later item for an earlier item's conflict would make the error non-deterministic
-     * across identical requests. The reported {@code existingServiceDefId} prefers the SALON-owned
-     * row when a legacy master-owned definition for the same type also exists: that is the row the
-     * caller is authorised for and can deep-link to.
-     *
-     * <p>Like every read-then-write guard here it is TOCTOU-prone; the assignment unique key is
-     * the actual guarantee, and the advisory lock this runs under makes ordinary contention
-     * produce this clean, item-naming 409 rather than a raced constraint violation.
-     *
-     * @throws DuplicateServiceException (409) naming the first item this master already offers
-     */
-    private static void assertMasterDoesNotAlreadyOffer(List<SalonBulkSetupCandidate> candidates,
-            List<BulkServiceItemRequest> items, Map<UUID, ServiceType> typesById) {
-
-        Map<UUID, UUID> conflictingDefIdByTypeId = new LinkedHashMap<>();
-        for (SalonBulkSetupCandidate candidate : candidates) {
-            if (!candidate.assignedToMaster()) {
-                continue;
-            }
-            boolean salonOwned = candidate.definition().getOwnerType() == OwnerType.SALON;
-            if (salonOwned || !conflictingDefIdByTypeId.containsKey(candidate.serviceTypeId())) {
-                conflictingDefIdByTypeId.put(
-                        candidate.serviceTypeId(), candidate.definition().getId());
-            }
-        }
-
-        for (BulkServiceItemRequest item : items) {
-            UUID existingId = conflictingDefIdByTypeId.get(item.serviceTypeId());
-            if (existingId != null) {
-                ServiceType type = typesById.get(item.serviceTypeId());
-                throw new DuplicateServiceException(
-                        type != null ? type.getNameUk() : null, existingId);
-            }
-        }
-    }
-
-    /**
-     * Phase 302 D2 — the REUSE half of {@link #resolveSalonBulkCandidates}: the salon's own ACTIVE
-     * definitions, keyed by service-type id, so {@link #createSingleFromBulkItem} can attach this
-     * master's assignment to them instead of minting a second definition V121 would refuse.
-     *
-     * <p>Only {@code ownerType = SALON} rows qualify. A legacy {@code INDEPENDENT_MASTER}-owned
-     * definition in the candidate set is a CONFLICT signal only (see
-     * {@link #assertMasterDoesNotAlreadyOffer}); reusing it would leave the salon's catalogue
-     * without the row the catalogue query requires. V121 admits at most one active SALON-owned
-     * definition per {@code (salonId, typeId)}, so at most one row can land per key.
-     *
-     * <p>The definitions arrive already hydrated from the candidate query — the assignment insert
-     * needs the managed entity, D3's override comparison needs its base price/duration, and the
-     * response DTO renders it. Their {@code serviceType} association resolves from the persistence
-     * context ({@code resolveBulkServiceTypes} loaded exactly these types in this transaction), so
-     * no N+1 follows.
-     */
-    private static Map<UUID, ServiceDefinition> reusableSalonDefinitions(
-            List<SalonBulkSetupCandidate> candidates) {
-
-        Map<UUID, ServiceDefinition> reusableByTypeId = new LinkedHashMap<>();
-        for (SalonBulkSetupCandidate candidate : candidates) {
-            if (candidate.definition().getOwnerType() == OwnerType.SALON) {
-                reusableByTypeId.put(candidate.serviceTypeId(), candidate.definition());
-            }
-        }
-        return reusableByTypeId;
-    }
-
-    /**
      * Phase 302 D3 — the {@code master_services.duration_override_minutes} for a reused
      * definition: the batch item's duration when it differs from the salon definition's
      * {@code base_duration_minutes}, else {@code null}.
@@ -2706,7 +2773,7 @@ public class ServiceCatalogService {
     }
 
     /**
-     * Flushes a bulk batch's pending inserts in a single round-trip, translating a V121 violation
+     * Flushes a bulk batch's pending inserts in a single round-trip, translating a V233 violation
      * into {@link DuplicateServiceException} exactly as {@link #persistDefinition} does for the
      * paths that flush through {@code saveAndFlush}.
      *
