@@ -42,9 +42,9 @@ public class DuplicateServiceException extends BusinessException {
     private final String serviceName;
 
     /**
-     * Id of the existing ACTIVE {@code ServiceDefinition} that blocks the write, or
-     * {@code null} when the conflict was detected by the DB index rather than the pre-check
-     * (the index reports the constraint, not the surviving row's id).
+     * Id of the existing ACTIVE {@code ServiceDefinition} that blocks the write. On a race caught
+     * by the V233 index it is looked up afterwards ({@code DuplicateServiceCopyLookup}); it is
+     * {@code null} only when that lookup finds no match, fails, or is skipped on a busy pool.
      */
     private final UUID existingServiceDefId;
 

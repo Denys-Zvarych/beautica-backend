@@ -11,11 +11,10 @@ import java.util.UUID;
  * SHAPE cannot be represented against the salon definition it would reuse.
  *
  * <h2>Why this exists</h2>
- * A salon-bound master's services are SALON-owned (Phase 302 D1), and V121's per-type index (since
- * V233 {@code ux_service_def_owner_type_duration_name_active}, one ACTIVE definition per copy:
- * type + duration + name) allowed exactly one ACTIVE definition per
- * {@code (owner_type, owner_id, service_type_id)}. A second master toggling a type the salon
- * already offers therefore REUSES that definition and carries their own divergence on
+ * A salon-bound master's services are SALON-owned (Phase 302 D1), and V233's
+ * {@code ux_service_def_owner_type_duration_name_active} allows exactly one ACTIVE definition per
+ * copy — {@code (owner_type, owner_id, service_type_id, base_duration_minutes, lower(btrim(name)))}.
+ * A second master toggling a copy the salon already offers therefore REUSES that definition and carries their own divergence on
  * {@code master_services} (D3). But {@code master_services} has only a {@code price_override}
  * (a floor) and a {@code duration_override_minutes} — <b>no per-master price ceiling and no
  * per-master price type</b>. So a submitted shape that disagrees with the reused definition has

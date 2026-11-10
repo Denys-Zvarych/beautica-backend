@@ -2,6 +2,7 @@ package com.beautica.service;
 
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.auth.dto.LoginRequest;
+import com.beautica.auth.phoneotp.GuestTokenProvider;
 import com.beautica.booking.BookingTestFixtures;
 import com.beautica.common.TimeZones;
 import com.beautica.config.TestSecurityConfig;
@@ -10,6 +11,8 @@ import com.beautica.favorite.entity.FavoriteTargetType;
 import com.beautica.support.BookableMasterSeeder;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -17,8 +20,10 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.HttpEntity;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
@@ -27,9 +32,13 @@ import java.time.Duration;
 import java.time.LocalDate;
 import java.time.ZonedDateTime;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.function.Function;
+import java.util.function.ToIntFunction;
 
 import static com.beautica.service.BookabilityHttp.ids;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -51,6 +60,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 class ServiceCopiesReadPathsIT extends AbstractIntegrationTest {
 
     private static final String COPY_NAME = "Класичний масаж";
+    private static final String LONG_COPY_NAME = "Класичний масаж подовжений";
+    /** The privacy-policy version a guest booking must accept (as published on /privacy). */
+    private static final String GUEST_POLICY_VERSION = "2026-10-20";
     private static final int SHORT_MIN = 60;
     private static final int LONG_MIN = 90;
     private static final int BUFFER_MIN = 5;
@@ -64,6 +76,7 @@ class ServiceCopiesReadPathsIT extends AbstractIntegrationTest {
     @Autowired private TestRestTemplate restTemplate;
     @Autowired private ObjectMapper objectMapper;
     @Autowired private PasswordEncoder passwordEncoder;
+    @Autowired private GuestTokenProvider guestTokenProvider;
 
     private BookabilityHttp http;
     private BookingTestFixtures bookings;
@@ -106,15 +119,23 @@ class ServiceCopiesReadPathsIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("AC5 (search): salon whose master holds salon copies 60 + 90 appears ONCE; «від» is the cheaper copy")
+    @DisplayName("AC5 (search): salon whose master holds salon copies 60 + 90 appears ONCE next to a one-copy control salon; "
+            + "totals count it once; «від» is the cheaper copy")
     void should_listSalonOnceWithCheaperFloor_when_salonHoldsTwoCopiesOfFilteredType() throws Exception {
         SalonCopies salon = salonWithCopies("Copies Studio");
+        UUID control = BookableMasterSeeder.insertSalon(jdbcTemplate, "Single Studio");
+        UUID controlMaster = BookableMasterSeeder.insertSalonMaster(jdbcTemplate, control);
+        assign(controlMaster, insertDefinition("SALON", control, SHORT_MIN, SHORT_PRICE));
+        BookableMasterSeeder.seedUsableSchedule(jdbcTemplate, controlMaster);
 
-        JsonNode page = http.get(salonSearchUrl());
+        JsonNode page = http.get(salonSearchUrl(20));
+        JsonNode pagedByOne = http.get(salonSearchUrl(1));
 
-        assertThat(ids(page, "salonId")).containsExactly(salon.salonId().toString());
-        assertThat(page.path("totalElements").asLong()).isEqualTo(1L);
-        assertThat(page.path("data").path(0).path("priceMin").decimalValue()).isEqualByComparingTo(SHORT_PRICE);
+        assertThat(ids(page, "salonId")).containsExactlyInAnyOrder(salon.salonId().toString(), control.toString());
+        assertThat(page.path("totalElements").asLong()).isEqualTo(2L);
+        assertThat(pagedByOne.path("totalPages").asInt()).as("one row per salon at size=1").isEqualTo(2);
+        assertThat(rowOf(page, "salonId", salon.salonId()).path("priceMin").decimalValue())
+                .isEqualByComparingTo(SHORT_PRICE);
     }
 
     // ── AC3 — favourites ────────────────────────────────────────────────────────
@@ -218,7 +239,7 @@ class ServiceCopiesReadPathsIT extends AbstractIntegrationTest {
         SalonCopies salon = salonWithCopies("Deadcopy Studio");
         deleteAsOk("/api/v1/services/" + definitionOf(salon.copies().shortAssignment()), ownerToken(salon.salonId()));
 
-        JsonNode page = http.get(salonSearchUrl());
+        JsonNode page = http.get(salonSearchUrl(20));
 
         assertThat(ids(page, "salonId")).containsExactly(salon.salonId().toString());
         assertThat(page.path("data").path(0).path("priceMin").decimalValue())
@@ -233,7 +254,7 @@ class ServiceCopiesReadPathsIT extends AbstractIntegrationTest {
         deleteAsOk("/api/v1/salons/" + salon.salonId() + "/masters/" + copies.ownerMasterId() + "/services/"
                 + definitionOf(copies.shortAssignment()), ownerToken(salon.salonId()));
 
-        JsonNode page = http.get(salonSearchUrl());
+        JsonNode page = http.get(salonSearchUrl(20));
 
         assertThat(ids(page, "salonId")).containsExactly(salon.salonId().toString());
         assertThat(page.path("data").path(0).path("priceMin").decimalValue())
@@ -250,6 +271,11 @@ class ServiceCopiesReadPathsIT extends AbstractIntegrationTest {
                 List.of(copies.shortAssignment(), copies.longAssignment()), visitStart());
 
         assertThat(resp.getStatusCode()).as("body: %s", resp.getBody()).isEqualTo(HttpStatus.CONFLICT);
+        JsonNode body = objectMapper.readTree(resp.getBody());
+        assertThat(body.path("success").asBoolean(true)).isFalse();
+        assertThat(body.path("message").asText()).as("the generic conflict, not a client-overlap or elapsed 409")
+                .isEqualTo("Request could not be completed due to a conflict");
+        assertThat(body.path("data").isNull()).as("no branchable data.code on the not-bookable refusal").isTrue();
         assertThat(bookingRowsOf(copies.ownerMasterId())).isZero();
     }
 
@@ -360,6 +386,123 @@ class ServiceCopiesReadPathsIT extends AbstractIntegrationTest {
         assertThat(ids(http.get("/api/v1/favorites/services", client), "masterServiceId")).isEmpty();
     }
 
+    // ── public catalogue reads — both copies, each under its own name + duration ──
+
+    @Test
+    @DisplayName("Public master services (GET /masters/{id}/services) list both copies, each with its own name and duration")
+    void should_listBothCopiesWithOwnNameAndDuration_when_publicMasterServicesRead() throws Exception {
+        Copies copies = independentMasterWithNamedCopies("Menucopy", null);
+
+        JsonNode rows = http.get("/api/v1/masters/" + copies.ownerMasterId() + "/services",
+                newClientToken("menu"));
+
+        assertThat(namesAndDurations(rows, r -> r.path("serviceDefinition").path("name").asText(),
+                r -> r.path("effectiveDurationMinutes").asInt()))
+                .containsExactlyInAnyOrder(COPY_NAME + "|" + SHORT_MIN, LONG_COPY_NAME + "|" + LONG_MIN);
+    }
+
+    @Test
+    @DisplayName("Booking-link page (GET /book/{slug}/info) lists both copies, each with its own name and duration")
+    void should_listBothCopiesWithOwnNameAndDuration_when_bookingLinkPageRead() throws Exception {
+        String slug = "copies-" + Long.toString(System.nanoTime(), 36);
+        independentMasterWithNamedCopies("Linkcopy", slug);
+
+        JsonNode services = publicPage("/api/v1/book/" + slug + "/info").path("services");
+
+        assertThat(namesAndDurations(services, r -> r.path("name").asText(), r -> r.path("durationMinutes").asInt()))
+                .containsExactlyInAnyOrder(COPY_NAME + "|" + SHORT_MIN, LONG_COPY_NAME + "|" + LONG_MIN);
+    }
+
+    @Test
+    @DisplayName("Salon catalogue (GET /salons/{id}/services) lists both salon copies, each with its own name and duration")
+    void should_listBothCopiesWithOwnNameAndDuration_when_salonCatalogueRead() throws Exception {
+        SalonCopies salon = salonWithNamedCopies("Menu Studio", null);
+
+        JsonNode categories = http.get("/api/v1/salons/" + salon.salonId() + "/services",
+                newClientToken("salonmenu")).path("categories");
+
+        assertThat(namesAndDurations(servicesOf(categories), r -> r.path("name").asText(),
+                r -> r.path("baseDurationMinutes").asInt()))
+                .containsExactlyInAnyOrder(COPY_NAME + "|" + SHORT_MIN, LONG_COPY_NAME + "|" + LONG_MIN);
+    }
+
+    @Test
+    @DisplayName("Salon booking-link page (GET /book/s/{slug}/info) lists both salon copies, each with its own name and duration")
+    void should_listBothCopiesWithOwnNameAndDuration_when_salonBookingLinkPageRead() throws Exception {
+        String slug = "copies-s-" + Long.toString(System.nanoTime(), 36);
+        salonWithNamedCopies("Link Studio", slug);
+
+        JsonNode categories = publicPage("/api/v1/book/s/" + slug + "/info").path("serviceCategories");
+
+        assertThat(namesAndDurations(servicesOf(categories), r -> r.path("name").asText(),
+                r -> r.path("baseDurationMinutes").asInt()))
+                .containsExactlyInAnyOrder(COPY_NAME + "|" + SHORT_MIN, LONG_COPY_NAME + "|" + LONG_MIN);
+    }
+
+    // ── guest (booking-link) visits with two copies ─────────────────────────────
+
+    @Test
+    @DisplayName("Guest visit on a master's booking link (POST /book/{slug}/booking): copy 60 + copy 90 → 201, one LINK visit, items keep their own duration/price")
+    void should_bookBothCopiesInOneGuestVisit_when_independentMasterLinkUsed() throws Exception {
+        String slug = "copies-g-" + Long.toString(System.nanoTime(), 36);
+        Copies copies = independentMasterWithNamedCopies("Guestcopy", slug);
+
+        ResponseEntity<String> resp = postGuestVisit("/api/v1/book/" + slug + "/booking", copies);
+
+        assertGuestVisitBooksBothCopies(resp);
+    }
+
+    @Test
+    @DisplayName("Guest visit on a salon booking link (POST /book/s/{slug}/masters/{id}/booking): salon copies 60 + 90 → 201, one LINK visit, own duration/price")
+    void should_bookBothCopiesInOneGuestVisit_when_salonLinkUsed() throws Exception {
+        String slug = "copies-sg-" + Long.toString(System.nanoTime(), 36);
+        Copies copies = salonWithNamedCopies("Guest Studio", slug).copies();
+
+        ResponseEntity<String> resp = postGuestVisit(
+                "/api/v1/book/s/" + slug + "/masters/" + copies.ownerMasterId() + "/booking", copies);
+
+        assertGuestVisitBooksBothCopies(resp);
+    }
+
+    /** Anonymous GET of a public booking-link page — an unwrapped body (no {@code ApiResponse}). */
+    private JsonNode publicPage(String url) throws Exception {
+        ResponseEntity<String> resp = restTemplate.getForEntity(url, String.class);
+        assertThat(resp.getStatusCode()).as("GET %s → %s", url, resp.getBody()).isEqualTo(HttpStatus.OK);
+        return objectMapper.readTree(resp.getBody());
+    }
+
+    private void assertGuestVisitBooksBothCopies(ResponseEntity<String> resp) throws Exception {
+        assertThat(resp.getStatusCode()).as("body: %s", resp.getBody()).isEqualTo(HttpStatus.CREATED);
+        UUID appointmentId = UUID.fromString(objectMapper.readTree(resp.getBody()).path("appointmentId").asText());
+        List<Map<String, Object>> items = jdbcTemplate.queryForList(
+                "SELECT duration_minutes_at_booking, price_at_booking, booking_source, starts_at, ends_at "
+                        + "FROM bookings WHERE appointment_id = ? ORDER BY starts_at", appointmentId);
+        assertThat(items).extracting(row -> row.get("duration_minutes_at_booking"))
+                .containsExactly(SHORT_MIN, LONG_MIN);
+        assertThat(items).extracting(row -> (BigDecimal) row.get("price_at_booking"))
+                .usingElementComparator(BigDecimal::compareTo).containsExactly(SHORT_PRICE, LONG_PRICE);
+        assertThat(items).extracting(row -> row.get("booking_source")).containsOnly("LINK");
+        assertThat(items.get(1).get("starts_at")).as("back-to-back").isEqualTo(items.get(0).get("ends_at"));
+    }
+
+    private ResponseEntity<String> postGuestVisit(String url, Copies copies) throws Exception {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("masterServiceIds", List.of(copies.shortAssignment().toString(), copies.longAssignment().toString()));
+        body.put("startsAt", visitStart().toOffsetDateTime().toString());
+        body.put("name", "Олена");
+        body.put("surname", "Коваль");
+        body.put("privacyAccepted", true);
+        body.put("privacyPolicyVersion", GUEST_POLICY_VERSION);
+        HttpHeaders headers = new HttpHeaders();
+        headers.setBearerAuth(guestTokenProvider.generate(
+                "+38067" + ThreadLocalRandom.current().nextInt(1_000_000, 10_000_000)));
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        // Own per-IP guest-booking bucket (RFC 5737 TEST-NET-2), never shared with sibling ITs.
+        headers.set("X-Forwarded-For", "198.51.100." + ThreadLocalRandom.current().nextInt(1, 255));
+        return restTemplate.exchange(url, HttpMethod.POST,
+                new HttpEntity<>(objectMapper.writeValueAsString(body), headers), String.class);
+    }
+
     // ── shared assertions ───────────────────────────────────────────────────────
 
     private void assertVisitBooksBothCopies(Copies copies, String clientToken) throws Exception {
@@ -430,6 +573,60 @@ class ServiceCopiesReadPathsIT extends AbstractIntegrationTest {
         return new SalonCopies(salonId, longDefinition, new Copies(salonId, masterId, shortAssignment, longAssignment));
     }
 
+    /** Independent master holding a 60 copy «{@value #COPY_NAME}» and a 90 copy «{@value #LONG_COPY_NAME}». */
+    private Copies independentMasterWithNamedCopies(String name, String bookingSlug) {
+        UUID masterId = BookableMasterSeeder.insertIndependentMaster(jdbcTemplate, name);
+        UUID shortAssignment = assign(masterId, insertNamedDefinition("INDEPENDENT_MASTER", masterId, COPY_NAME, SHORT_MIN, SHORT_PRICE));
+        UUID longAssignment = assign(masterId, insertNamedDefinition("INDEPENDENT_MASTER", masterId, LONG_COPY_NAME, LONG_MIN, LONG_PRICE));
+        BookableMasterSeeder.seedUsableSchedule(jdbcTemplate, masterId);
+        if (bookingSlug != null) {
+            jdbcTemplate.update("UPDATE masters SET booking_slug = ? WHERE id = ?", bookingSlug, masterId);
+        }
+        return new Copies(masterId, masterId, shortAssignment, longAssignment);
+    }
+
+    /** Salon whose one master is assigned both named salon copies (60 / 90). */
+    private SalonCopies salonWithNamedCopies(String name, String bookingSlug) {
+        UUID salonId = BookableMasterSeeder.insertSalon(jdbcTemplate, name);
+        UUID masterId = BookableMasterSeeder.insertSalonMaster(jdbcTemplate, salonId);
+        UUID longDefinition = insertNamedDefinition("SALON", salonId, LONG_COPY_NAME, LONG_MIN, LONG_PRICE);
+        UUID shortAssignment = assign(masterId, insertNamedDefinition("SALON", salonId, COPY_NAME, SHORT_MIN, SHORT_PRICE));
+        UUID longAssignment = assign(masterId, longDefinition);
+        BookableMasterSeeder.seedUsableSchedule(jdbcTemplate, masterId);
+        if (bookingSlug != null) {
+            jdbcTemplate.update("UPDATE salons SET booking_slug = ? WHERE id = ?", bookingSlug, salonId);
+        }
+        return new SalonCopies(salonId, longDefinition, new Copies(salonId, masterId, shortAssignment, longAssignment));
+    }
+
+    /** One copy under its own name, with the type's platform category so category-grouped reads list it. */
+    private UUID insertNamedDefinition(String ownerType, UUID ownerId, String name, int duration, BigDecimal price) {
+        UUID defId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO service_definitions (id, owner_type, owner_id, name, category, service_type_id, "
+                        + "base_duration_minutes, price_type, base_price, buffer_minutes_after, "
+                        + "is_active, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, ?, (SELECT platform_category_name FROM service_types WHERE id = ?), ?, ?, "
+                        + "'FIXED', ?, ?, true, NOW(), NOW())",
+                defId, ownerType, ownerId, name, typeId, typeId, duration, price, BUFFER_MIN);
+        return defId;
+    }
+
+    /** {@code name|duration} per row, so a swapped name/duration pairing cannot pass. */
+    private static List<String> namesAndDurations(JsonNode rows, Function<JsonNode, String> name,
+                                                  ToIntFunction<JsonNode> duration) {
+        List<String> pairs = new ArrayList<>();
+        rows.forEach(row -> pairs.add(name.apply(row) + "|" + duration.applyAsInt(row)));
+        return pairs;
+    }
+
+    /** Every service row across category groups. */
+    private static JsonNode servicesOf(JsonNode categories) {
+        ArrayNode all = JsonNodeFactory.instance.arrayNode();
+        categories.forEach(group -> group.path("services").forEach(all::add));
+        return all;
+    }
+
     /** One copy: same type, same name, its own duration + price (D2 — copies differ by duration). */
     private UUID insertDefinition(String ownerType, UUID ownerId, int duration, BigDecimal price) {
         UUID defId = UUID.randomUUID();
@@ -461,8 +658,8 @@ class ServiceCopiesReadPathsIT extends AbstractIntegrationTest {
         return "/api/v1/search/masters?serviceTypeSlugs=" + typeSlug + "&page=0&size=" + size;
     }
 
-    private String salonSearchUrl() {
-        return "/api/v1/search/salons?serviceTypeSlugs=" + typeSlug + "&size=20";
+    private String salonSearchUrl(int size) {
+        return "/api/v1/search/salons?serviceTypeSlugs=" + typeSlug + "&page=0&size=" + size;
     }
 
     private UUID definitionOf(UUID assignmentId) {

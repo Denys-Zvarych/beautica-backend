@@ -205,8 +205,9 @@ public interface ServiceRepository extends JpaRepository<ServiceDefinition, UUID
      * differs in base duration or in name. Price never participates.
      *
      * <p>The name is compared {@code lower(trim(name))} on BOTH sides — the same normalisation as
-     * the index's {@code lower(btrim(name))} (JPQL {@code trim} trims spaces only, exactly like
-     * Postgres {@code btrim}). Java never normalises the name for this check, so the rule lives in
+     * the index's {@code lower(btrim(name))}: Hibernate's PostgreSQL dialect renders JPQL
+     * {@code trim(x)} as {@code trim(both from x)}, which Postgres evaluates as {@code btrim(x)}
+     * (spaces only), so the predicate is the index expression. Java never normalises the name for this check, so the rule lives in
      * the index and in this predicate only.
      *
      * <p>Returns the id only (not the entity): the caller needs it solely to populate the

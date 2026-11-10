@@ -153,7 +153,8 @@ public class ServiceCatalogService {
     // control it.
     private final Clock clock;
     // Fills the flush-time DUPLICATE_SERVICE 409 (name + existingServiceDefId) from the committed
-    // winner, in its own REQUIRES_NEW transaction — see flushTranslatingDuplicateViolation.
+    // winner, in its own REQUIRES_NEW transaction when a pooled connection is idle — see
+    // flushTranslatingDuplicateViolation.
     private final DuplicateServiceCopyLookup duplicateServiceCopyLookup;
 
     @Transactional
@@ -2955,7 +2956,8 @@ public class ServiceCatalogService {
      * constraint, not the surviving row, and the violation aborts this Postgres transaction, so the
      * winner is looked up through {@link DuplicateServiceCopyLookup} in its own
      * {@code REQUIRES_NEW} read-only transaction (owner + type + duration + canonical name, the V233
-     * key). Only this rare failing path pays for that second connection.
+     * key). Only this rare failing path pays for that second connection, and only when the pool has
+     * one idle — it never waits on the pool while holding this aborted one (plain 409 instead).
      *
      * @param pendingCopies the definition INSERTs this flush emits, in request order
      */
@@ -3081,7 +3083,7 @@ public class ServiceCatalogService {
      * {@code extractUsingTemplate} returns the FIRST match, so caller-supplied {@code name} /
      * {@code description} text rendered into the detail cannot steer the extracted name. The
      * value is trustworthy because of where the anchor sits, not because it bypassed the message.
-     * {@code ServiceDefinitionUniqueActiveTypeTest} asserts the extraction against real Postgres,
+     * {@code ServiceDefinitionUniqueActiveCopyTest} asserts the extraction against real Postgres,
      * since a dialect that returned null or an unqualified name here would silently degrade every
      * genuine duplicate race to a generic 409 with no {@code data.code}.
      *

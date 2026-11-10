@@ -27,8 +27,8 @@ import java.util.UUID;
  *
  * <p><b>Uniqueness — one ACTIVE copy per {@code (ownerType, ownerId, serviceType, baseDuration,
  * name)}.</b> Enforced by the partial unique index
- * {@code ux_service_def_owner_type_duration_name_active} (V233, phase 464, replacing V121's
- * per-type {@code ux_service_def_owner_service_type_active}):
+ * {@code ux_service_def_owner_type_duration_name_active} (V233, phase 464, which dropped V121's
+ * one-active-per-type index):
  *
  * <pre>{@code
  * CREATE UNIQUE INDEX ux_service_def_owner_type_duration_name_active
