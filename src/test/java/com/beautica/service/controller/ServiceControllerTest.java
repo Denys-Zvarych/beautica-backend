@@ -527,8 +527,8 @@ class ServiceControllerTest {
                 PriceType.FIXED, new BigDecimal("750.00"), null, null, null, null);
         var stub = stubMasterServiceResponse(assignmentId, masterId, "Manicure");
 
-        when(authorizationService.canEditMasterServiceBand(any(), eq(salonId), eq(masterId))).thenReturn(true);
-        when(authorizationService.masterBelongsToSalon(masterId, salonId)).thenReturn(true);
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
+        when(authorizationService.masterBelongsToSalonForBandEdit(masterId, salonId)).thenReturn(true);
         when(serviceCatalogService.updateMasterServiceBand(eq(userId), eq(salonId), eq(masterId), eq(serviceDefId),
                 any(com.beautica.service.dto.UpdateMasterServiceBandRequest.class)))
                 .thenReturn(stub);
@@ -545,35 +545,32 @@ class ServiceControllerTest {
     }
 
     @Test
-    @DisplayName("PATCH .../masters/{masterId}/services/{serviceDefId} — 200 when a SALON_MASTER "
-            + "edits their OWN row (Phase 311 D5 — the ONE write a SALON_MASTER may perform)")
-    void should_return200_when_salonMasterEditsOwnBand() throws Exception {
+    @DisplayName("PATCH .../masters/{masterId}/services/{serviceDefId} — 403 when a SALON_MASTER "
+            + "edits their OWN row (Phase 463 — owner/admin only; was 200 under Phase 311 D5)")
+    void should_return403_when_salonMasterEditsOwnBand() throws Exception {
         var masterUserId = UUID.randomUUID();
         var salonId = UUID.randomUUID();
         var masterId = UUID.randomUUID();
         var serviceDefId = UUID.randomUUID();
-        var assignmentId = UUID.randomUUID();
         var request = new com.beautica.service.dto.UpdateMasterServiceBandRequest(
                 PriceType.FIXED, new BigDecimal("750.00"), null, null, null, null);
-        var stub = stubMasterServiceResponse(assignmentId, masterId, "Manicure");
 
-        when(authorizationService.canEditMasterServiceBand(any(), eq(salonId), eq(masterId))).thenReturn(true);
-        when(authorizationService.masterBelongsToSalon(masterId, salonId)).thenReturn(true);
-        when(serviceCatalogService.updateMasterServiceBand(eq(masterUserId), eq(salonId), eq(masterId), eq(serviceDefId),
-                any(com.beautica.service.dto.UpdateMasterServiceBandRequest.class)))
-                .thenReturn(stub);
+        // canManageSalon denies first; the SpEL `and` short-circuits, so no membership stub.
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(false);
 
         mockMvc.perform(patch("/api/v1/salons/" + salonId + "/masters/" + masterId + "/services/" + serviceDefId)
                         .with(authenticatedAs(masterUserId, "salonmaster@beautica.test", Role.SALON_MASTER))
                         .with(csrf())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(request)))
-                .andExpect(status().isOk());
+                .andExpect(status().isForbidden());
+
+        verify(serviceCatalogService, never()).updateMasterServiceBand(any(), any(), any(), any(), any());
     }
 
     @Test
     @DisplayName("PATCH .../masters/{masterId}/services/{serviceDefId} — 403 when a SALON_MASTER "
-            + "edits a PEER's row (canEditMasterServiceBand denies)")
+            + "edits a PEER's row (canManageSalon denies)")
     void should_return403_when_salonMasterEditsPeerBand() throws Exception {
         var masterUserId = UUID.randomUUID();
         var salonId = UUID.randomUUID();
@@ -582,7 +579,7 @@ class ServiceControllerTest {
         var request = new com.beautica.service.dto.UpdateMasterServiceBandRequest(
                 PriceType.FIXED, new BigDecimal("111.00"), null, null, null, null);
 
-        when(authorizationService.canEditMasterServiceBand(any(), eq(salonId), eq(peerMasterId))).thenReturn(false);
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(false);
 
         mockMvc.perform(patch("/api/v1/salons/" + salonId + "/masters/" + peerMasterId + "/services/" + serviceDefId)
                         .with(authenticatedAs(masterUserId, "salonmaster@beautica.test", Role.SALON_MASTER))
@@ -605,7 +602,8 @@ class ServiceControllerTest {
         var request = new com.beautica.service.dto.UpdateMasterServiceBandRequest(
                 null, new BigDecimal("750.00"), null, null, null, null);
 
-        when(authorizationService.canEditMasterServiceBand(any(), eq(salonId), eq(masterId))).thenReturn(true);
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
+        when(authorizationService.masterBelongsToSalonForBandEdit(masterId, salonId)).thenReturn(true);
 
         mockMvc.perform(patch("/api/v1/salons/" + salonId + "/masters/" + masterId + "/services/" + serviceDefId)
                         .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
@@ -628,7 +626,8 @@ class ServiceControllerTest {
         var request = new com.beautica.service.dto.UpdateMasterServiceBandRequest(
                 null, null, null, null, null, null);
 
-        when(authorizationService.canEditMasterServiceBand(any(), eq(salonId), eq(masterId))).thenReturn(true);
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
+        when(authorizationService.masterBelongsToSalonForBandEdit(masterId, salonId)).thenReturn(true);
 
         mockMvc.perform(patch("/api/v1/salons/" + salonId + "/masters/" + masterId + "/services/" + serviceDefId)
                         .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
@@ -651,8 +650,8 @@ class ServiceControllerTest {
         var request = new com.beautica.service.dto.UpdateMasterServiceBandRequest(
                 PriceType.FIXED, new BigDecimal("750.00"), null, null, null, null);
 
-        when(authorizationService.canEditMasterServiceBand(any(), eq(salonId), eq(masterId))).thenReturn(true);
-        when(authorizationService.masterBelongsToSalon(masterId, salonId)).thenReturn(true);
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
+        when(authorizationService.masterBelongsToSalonForBandEdit(masterId, salonId)).thenReturn(true);
         when(serviceCatalogService.updateMasterServiceBand(eq(userId), eq(salonId), eq(masterId), eq(serviceDefId),
                 any(com.beautica.service.dto.UpdateMasterServiceBandRequest.class)))
                 .thenThrow(new com.beautica.common.exception.NotFoundException(
@@ -1546,8 +1545,8 @@ class ServiceControllerTest {
     private org.springframework.test.web.servlet.ResultActions patchBand(UUID salonId, UUID masterId,
                                                                         UUID serviceDefId, String body)
             throws Exception {
-        when(authorizationService.canEditMasterServiceBand(any(), eq(salonId), eq(masterId))).thenReturn(true);
-        when(authorizationService.masterBelongsToSalon(masterId, salonId)).thenReturn(true);
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
+        when(authorizationService.masterBelongsToSalonForBandEdit(masterId, salonId)).thenReturn(true);
         return mockMvc.perform(patch("/api/v1/salons/" + salonId + "/masters/" + masterId
                         + "/services/" + serviceDefId)
                 .with(authenticatedAs(UUID.randomUUID(), "owner@beautica.test", Role.SALON_OWNER))

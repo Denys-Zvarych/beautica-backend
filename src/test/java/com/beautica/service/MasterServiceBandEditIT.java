@@ -447,11 +447,11 @@ class MasterServiceBandEditIT extends AbstractIntegrationTest {
                 .isEqualByComparingTo("750.00");
     }
 
-    // ── Case 19/20 — SALON_MASTER may edit their OWN row and NOTHING else (D5/D6) ──────────────
+    // ── Case 19/20 — SALON_MASTER may edit NO row, not even their own (Phase 463 reverses D5) ───
 
     @Test
-    @DisplayName("Case 19: SALON_MASTER patches their OWN row — 200; a PEER's row — 403, nothing written")
-    void should_allowOwnRow_and_refusePeerRow_when_salonMasterPatchesBand() throws Exception {
+    @DisplayName("Case 19 (Phase 463): SALON_MASTER patches their OWN row — 403; a PEER's row — 403; nothing written")
+    void should_refuseOwnRowAndPeerRow_when_salonMasterPatchesBand() throws Exception {
         String ownerToken = fixtures.createSalonOwnerAndGetToken(
                 "owner-311-c19-" + System.nanoTime() + "@beautica.test");
         UUID salonId = fixtures.createSalon(ownerToken, "Phase 311 Case 19 Salon");
@@ -466,7 +466,9 @@ class MasterServiceBandEditIT extends AbstractIntegrationTest {
         ResponseEntity<String> ownResp = patchBand(self.token(), salonId, self.masterId(), ownAssignment.definitionId(),
                 new UpdateMasterServiceBandRequest(PriceType.FIXED, new BigDecimal("750.00"), null, null, null, null))
                 .raw();
-        assertThat(ownResp.getStatusCode()).as("case 19 — own row").isEqualTo(HttpStatus.OK);
+        assertThat(ownResp.getStatusCode()).as("case 19 — own row (Phase 463: was 200)").isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(bandRow(ownAssignment.assignmentId()).get("price_override"))
+                .as("nothing written on the refused own-row edit").isNull();
 
         ResponseEntity<String> peerResp = patchBand(self.token(), salonId, peerMasterId, peerAssignment.definitionId(),
                 new UpdateMasterServiceBandRequest(PriceType.FIXED, new BigDecimal("111.00"), null, null, null, null))
@@ -889,18 +891,18 @@ class MasterServiceBandEditIT extends AbstractIntegrationTest {
     // ── Case 28 (S4, 2026-09-13 audit) — the band change is attributable to an ACTOR ────────────
 
     @Test
-    @DisplayName("Case 28 (S4): a SALON_MASTER's self-edit emits an INFO audit line naming the "
+    @DisplayName("Case 28 (S4): an OWNER's band edit emits an INFO audit line naming the "
             + "actor, master, definition and the before/after floor — the write moves public "
             + "state (catalogue hull + search band) and must not be anonymous")
-    void should_logActorAttribution_when_salonMasterEditsOwnBand() throws Exception {
+    void should_logActorAttribution_when_salonOwnerEditsBand() throws Exception {
         String ownerToken = fixtures.createSalonOwnerAndGetToken(
                 "owner-311-c28-" + System.nanoTime() + "@beautica.test");
         UUID salonId = fixtures.createSalon(ownerToken, "Phase 311 Case 28 Salon");
-        var self = fixtures.createSalonMasterWithRowAndGetToken(
-                salonId, "self-311-c28-" + System.nanoTime() + "@beautica.test");
+        // Phase 463: a SALON_MASTER can no longer self-edit, so the owner is the attributed actor.
+        UUID masterId = fixtures.createSalonMaster(salonId);
         UUID typeId = fixtures.activeSelectableServiceTypes(1).get(0).id();
         Assignment assignment = bulkCreateFixed(
-                ownerToken, salonId, self.masterId(), typeId, new BigDecimal("600.00"));
+                ownerToken, salonId, masterId, typeId, new BigDecimal("600.00"));
 
         var logger = (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(
                 com.beautica.service.service.ServiceCatalogService.class);
@@ -908,7 +910,7 @@ class MasterServiceBandEditIT extends AbstractIntegrationTest {
         appender.start();
         logger.addAppender(appender);
         try {
-            patchBand(self.token(), salonId, self.masterId(), assignment.definitionId(),
+            patchBand(ownerToken, salonId, masterId, assignment.definitionId(),
                     new UpdateMasterServiceBandRequest(
                             PriceType.FIXED, new BigDecimal("750.00"), null, null, null, null))
                     .response();
@@ -928,60 +930,18 @@ class MasterServiceBandEditIT extends AbstractIntegrationTest {
                 .hasSize(1);
         assertThat(messages.get(0))
                 .as("the line must identify WHO changed WHAT, and how the floor moved")
-                .contains("actor=" + masterUserIdOf(self.masterId()))
-                .contains("master=" + self.masterId())
+                .contains("actor=" + salonOwnerIdOf(salonId))
+                .contains("master=" + masterId)
                 .contains("serviceDef=" + assignment.definitionId())
                 .contains("600.00->750.00");
-    }
-
-    // ── Case 29 (P2/S2, 2026-09-13 audit) — the authz statement count on the PATCH ──────────────
-
-    @Test
-    @DisplayName("Case 29 (P2/S2): a SALON_MASTER self-edit issues at most 3 authorization "
-            + "statements — the masterBelongsToSalon EXISTS that ran 4-5x per request is gone")
-    void should_issueAtMostThreeAuthorizationStatements_when_salonMasterEditsOwnBand() throws Exception {
-        String ownerToken = fixtures.createSalonOwnerAndGetToken(
-                "owner-311-c29-" + System.nanoTime() + "@beautica.test");
-        UUID salonId = fixtures.createSalon(ownerToken, "Phase 311 Case 29 Salon");
-        var self = fixtures.createSalonMasterWithRowAndGetToken(
-                salonId, "self-311-c29-" + System.nanoTime() + "@beautica.test");
-        UUID typeId = fixtures.activeSelectableServiceTypes(1).get(0).id();
-        Assignment assignment = bulkCreateFixed(
-                ownerToken, salonId, self.masterId(), typeId, new BigDecimal("600.00"));
-
-        // Warm anything process-wide before measuring, then measure ONE PATCH end to end.
-        patchBand(self.token(), salonId, self.masterId(), assignment.definitionId(),
-                new UpdateMasterServiceBandRequest(PriceType.FIXED, new BigDecimal("700.00"), null, null, null, null))
-                .response();
-
-        long total = measureStatements(() -> patchBand(
-                self.token(), salonId, self.masterId(), assignment.definitionId(),
-                new UpdateMasterServiceBandRequest(PriceType.FIXED, new BigDecimal("800.00"), null, null, null, null))
-                .response());
-
-        // MEASURED: 5 prepared statements for the WHOLE request after the fix — the JWT filter's
-        // user lookup, the SpEL gate's findByIdWithUserAndSalon, the service-layer twin's
-        // findByIdWithUserAndSalon, the assignment load and the UPDATE. Before the fix, the SAME
-        // existsByIdAndSalonId EXISTS ran four more times on top of that (once inside
-        // canEditMasterServiceBand's `&&`, once as the trailing SpEL conjunct, once inside
-        // enforceCanEditMasterServiceBand's management arm and once in its own-row arm), because
-        // membership was re-queried per conjunct instead of read off the salon
-        // findByIdWithUserAndSalon already LEFT JOIN FETCHes.
-        //
-        // The bound is 6, ONE above the measured figure: re-adding even a single redundant
-        // existsByIdAndSalonId — to the SpEL expression, to the predicate, or to the enforce twin —
-        // breaks this test. A looser bound would let the regression back in silently.
-        assertThat(total)
-                .as("P2/S2 — a single band PATCH must not re-run the same authorization EXISTS "
-                        + "per conjunct; measured 5 after the fix")
-                .isLessThanOrEqualTo(6L);
     }
 
     // ── Case 30 (cycle-2 audit, B5) — the OWNER path's authz statement count ────────────────────
 
     /**
-     * Case 29's twin for the branch it never bounded. Case 29 drives the PATCH with a SALON_MASTER
-     * token, so nothing measured the OWNER/ADMIN branch — and that branch was where the duplication
+     * Case 29's twin (Case 29 — the SALON_MASTER self-edit count — was removed in Phase 463: that
+     * path now 403s). Case 29 drove the PATCH with a SALON_MASTER token, so nothing measured the
+     * OWNER/ADMIN branch — and that branch was where the duplication
      * survived: {@code canEditMasterServiceBand} (the SpEL gate) and
      * {@code enforceCanEditMasterServiceBand} (its service-layer twin) each issued
      * {@code existsByIdAndOwnerId} + {@code existsByIdAndSalonId}, four authorization statements of
@@ -993,6 +953,10 @@ class MasterServiceBandEditIT extends AbstractIntegrationTest {
      * statements, the assignment load and the UPDATE), down from 7. The bound is 6, ONE above the
      * measured figure — re-adding a single redundant authorization statement anywhere on this path
      * turns it RED.
+     *
+     * <p><b>Phase 463:</b> the band SpEL reads membership through
+     * {@code masterBelongsToSalonForBandEdit} (memoised), so the enforce twin re-issues nothing —
+     * still measured 5, bound 6 (measured+1).
      */
     @Test
     @DisplayName("Case 30 (B5): a SALON_OWNER band PATCH issues at most 6 statements — the "
@@ -1019,7 +983,7 @@ class MasterServiceBandEditIT extends AbstractIntegrationTest {
 
         assertThat(total)
                 .as("B5 — the owner branch must not authorize the same two facts twice; measured 5 "
-                        + "after the fix, 7 before")
+                        + "after the fix (Phase 463 included), 7 before")
                 .isLessThanOrEqualTo(6L);
     }
 
@@ -1170,6 +1134,12 @@ class MasterServiceBandEditIT extends AbstractIntegrationTest {
      * MEASURED bound for case 33: 5 with the memo (JWT user lookup, the band gate's two facts, the
      * assignment load, the UPDATE), 6 with the old {@code getSalon().getOwner()} lazy load (verified
      * 2026-10-06 by reverting the gate and re-measuring) — bounded AT the measured figure.
+     *
+     * <p><b>Phase 463: still 5.</b> The SpEL is {@code canManageSalon AND
+     * masterBelongsToSalonForBandEdit}; the latter reads membership through the request memo, so
+     * the enforce twin's membership check re-issues nothing (it measured 6 while the gate used the
+     * unmemoised {@code masterBelongsToSalon}). Bounded AT the measured figure: any further
+     * statement turns this red.
      */
     private static final long OWNER_ROW_BAND_STATEMENT_BOUND = 5L;
 
@@ -1292,9 +1262,9 @@ class MasterServiceBandEditIT extends AbstractIntegrationTest {
                 .orElseThrow(() -> new AssertionError("service not found in master's list: " + serviceDefId));
     }
 
-    private UUID masterUserIdOf(UUID masterId) {
+    private UUID salonOwnerIdOf(UUID salonId) {
         return jdbcTemplate.queryForObject(
-                "SELECT user_id FROM masters WHERE id = ?", UUID.class, masterId);
+                "SELECT owner_id FROM salons WHERE id = ?", UUID.class, salonId);
     }
 
     private Integer durationOverrideOf(UUID assignmentId) {

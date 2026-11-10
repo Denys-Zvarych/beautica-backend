@@ -317,8 +317,8 @@ public class ServiceCatalogService {
      * restate the current value must not trigger a needless sweep.
      *
      * @throws NotFoundException  if no ACTIVE assignment exists for {@code (masterId, serviceDefId)}
-     * @throws ForbiddenException if the actor cannot manage {@code salonId} and is not the
-     *                            {@code SALON_MASTER} of {@code masterId}
+     * @throws ForbiddenException if the actor cannot manage {@code salonId} or {@code masterId}
+     *                            is not in it — a {@code SALON_MASTER} is always denied (Phase 463)
      */
     @Transactional
     public MasterServiceResponse updateMasterServiceBand(
