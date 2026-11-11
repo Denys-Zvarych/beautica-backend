@@ -117,8 +117,8 @@ public interface AppointmentRepository extends JpaRepository<Appointment, UUID> 
     // ── Pre-lock existence/ownership check (cycle-3 audit finding 1) ─────────────────────────────
     /**
      * Resolves a visit header's {@code client_id} column WITHOUT hydrating an {@link Appointment}
-     * entity — the pre-lock ownership check {@code AppointmentTransitionService#cancelAppointment}
-     * uses to authorize the caller BEFORE {@link #lockHeaderRegardlessOfStatus} runs.
+     * entity — the pre-lock CLIENT ownership check {@code AppointmentTransitionService} uses on the
+     * per-service client paths (originally written for the whole-visit cancel, removed in phase 475).
      *
      * <p><b>Why native/scalar, not {@code findById}.</b> If this check loaded a managed
      * {@code Appointment} entity, the SUBSEQUENT {@link #lockHeaderRegardlessOfStatus} +
@@ -204,9 +204,8 @@ public interface AppointmentRepository extends JpaRepository<Appointment, UUID> 
     /**
      * Unconditionally locks the visit HEADER row via {@code SELECT ... FOR UPDATE}, regardless of
      * its status — the status-agnostic counterpart of {@link #lockHeaderIfConfirmed}, used by the
-     * four WHOLE-VISIT transition methods ({@code AppointmentTransitionService#cancelAppointment} /
-     * {@code #declineAppointment} / {@code #completeAppointment} / {@code #notCompleteAppointment})
-     * AFTER each method's own unlocked authorization check has already succeeded, but before any
+     * former WHOLE-VISIT transition methods (removed in phase 475; today's caller is
+     * {@code BookingService}) AFTER each method's own unlocked authorization check has already succeeded, but before any
      * chained item is loaded or mutated (cycle-3 audit finding 1 — a cycle-2 wording error had this
      * called at the literal top of each method, BEFORE authorization, letting a non-owner force a
      * real row lock with a guessed UUID; see {@code AppointmentTransitionService

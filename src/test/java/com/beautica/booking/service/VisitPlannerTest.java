@@ -301,6 +301,24 @@ class VisitPlannerTest {
         }
 
         /**
+         * An ACTIVE assignment whose DEFINITION was deactivated (deactivateById does not cascade to
+         * master_services) answers the identical 404 — a retired copy is never bookable and the
+         * refusal must not be distinguishable from an unknown id.
+         */
+        @Test
+        @DisplayName("should_throw404WithTheSameMessage_when_theDefinitionIsInactive")
+        void should_throw404WithTheSameMessage_when_theDefinitionIsInactive() {
+            MasterServiceAssignment retired = assignment(serviceA);
+            retired.getServiceDefinition().setActive(false);
+            stubBatch(List.of(serviceA), List.of(retired));
+
+            assertThatThrownBy(() -> planner.planChainedItems(master, List.of(serviceA), START))
+                    .isInstanceOf(NotFoundException.class)
+                    .as("an inactive definition must be indistinguishable from an unknown service")
+                    .hasMessage("Master service not found");
+        }
+
+        /**
          * A {@code null} element is short-circuited into the same 404 rather than reaching the
          * {@code IN} list. The old per-id finder answered 404 for it; letting it through would turn a
          * malformed request into a 500 (or, worse, an {@code IN (NULL)} that silently matches
@@ -422,6 +440,7 @@ class VisitPlannerTest {
                         .baseDurationMinutes(duration)
                         .bufferMinutesAfter(buffer)
                         .basePrice(price)
+                        .isActive(true)
                         .build())
                 .isActive(true)
                 .build();

@@ -49,7 +49,7 @@ public record CreateServiceDefinitionRequest(
          * "Name or service type is required" validation error.
          */
         @Size(max = 100, message = "Name must be at most 100 characters")
-        @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "Name must not contain control characters")
+        @Pattern(regexp = ServiceNameConstraints.NAME_REGEX, message = ServiceNameConstraints.NAME_REGEX_MESSAGE)
         String name,
 
         @Size(max = 2000, message = "Description must be at most 2000 characters")

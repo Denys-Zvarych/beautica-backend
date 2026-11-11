@@ -7,7 +7,7 @@ package com.beautica.booking.enums;
  * POST /bookings (APP, client)     ─┐
  * POST /book/{slug}/booking (LINK) ─┴─► CONFIRMED   (created here, ALWAYS — auto-approved)
  *                                         ├─ COMPLETED      /complete      (provider)  → reviewable
- *                                         ├─ NOT_COMPLETED  /not-complete  (provider, no-show)
+ *                                         ├─ NOT_COMPLETED  legacy no-show rows only — no route sets it (BOOK-D12, phase 475)
  *                                         ├─ CANCELLED      /cancel        (CLIENT backs out)
  *                                         └─ DECLINED       /decline       (PROVIDER backs out)
  *

@@ -17,7 +17,7 @@ import static org.assertj.core.api.Assertions.assertThatCode;
 /**
  * Phase 27.1 — pass/throw branches for the remaining anti-tamper temporal guards (complete,
  * provider reschedule), pinned against a fixed {@link Clock} so the boundary (exactly
- * {@code now}) is deterministic. Decline and not-complete are deliberately unguarded — see
+ * {@code now}) is deterministic. Decline is deliberately unguarded — see
  * {@link BookingTemporalGuard}'s class javadoc.
  */
 @DisplayName("BookingTemporalGuard — unit")

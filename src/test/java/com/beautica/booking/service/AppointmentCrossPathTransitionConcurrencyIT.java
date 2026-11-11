@@ -40,9 +40,15 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
 /**
- * Deterministic regression test for cycle-2 audit finding 1 (HIGH, PLAUSIBLE — lock-order
+ * <p><b>Phase 475.</b> The whole-visit {@code cancel}/{@code decline}/{@code reschedule} routes were
+ * removed, and with them the three tests here that raced a whole-visit transition against a per-leg
+ * one. The remaining tests race per-item paths only (per-item reschedule vs. per-item cancel/decline,
+ * the legacy booking-scoped reschedule, and the batched schedule-override decline). The history
+ * below is kept because it explains the lock order those per-item paths still follow.
+ *
+ * <p>Deterministic regression test for cycle-2 audit finding 1 (HIGH, PLAUSIBLE — lock-order
  * inversion / deadlock risk) — races a WHOLE-VISIT provider decline
- * ({@link AppointmentTransitionService#declineAppointment}) against a PER-LEG client cancel
+ * ({@code declineAppointment} (removed, phase 475)) against a PER-LEG client cancel
  * ({@code BookingService#cancelBooking}) on the SAME two-service visit, forcing both racers to
  * attempt the visit header's {@code SELECT ... FOR UPDATE} lock at effectively the same instant.
  *
@@ -64,7 +70,7 @@ import org.springframework.security.crypto.password.PasswordEncoder;
  * update on the CHILD row, not just the header, because the whole-visit path's item list was
  * loaded (and the header validated) against a stale pre-lock snapshot.
  *
- * <p><b>Fixed.</b> {@link AppointmentTransitionService#lockHeaderForWholeVisitTransition} — spied
+ * <p><b>Fixed.</b> {@code lockHeaderForWholeVisitTransition} (removed, phase 475) — spied
  * on below — now locks the header UNCONDITIONALLY at the very TOP of every whole-visit transition
  * method, before any item is loaded, mirroring the per-item path's now-earlier lock point
  * ({@code AppointmentTransitionService#lockAppointmentHeaderBeforeClientItemCancel}, also spied on
@@ -105,7 +111,7 @@ import org.springframework.security.crypto.password.PasswordEncoder;
  * {@code isIn(...)}/{@code if} executes; the test keeps passing either way. This was verified
  * empirically for two of the six (commenting out the guard and watching the test stay green). The
  * seventh test in this class,
- * {@link #should_serializeCleanlyWithCoherentFinalState_when_perItemRescheduleRacesWholeVisitDecline},
+ * {@code should_serializeCleanlyWithCoherentFinalState_when_perItemRescheduleRacesWholeVisitDecline} (removed, phase 475),
  * is exempt: its correctness comes from an UNCONDITIONAL guard on one side (the decline's header lock
  * always succeeds), so its outcome was never actually ambiguous — its {@code isIn(...)} covers the
  * OTHER racer only, never the guard under test itself.
@@ -135,7 +141,7 @@ import org.springframework.security.crypto.password.PasswordEncoder;
  * guarantee the one-sided gate no longer makes.
  */
 @Import(TestSecurityConfig.class)
-@DisplayName("Concurrent whole-visit decline vs. per-leg client cancel — lock-order/deadlock regression (fixed)")
+@DisplayName("Concurrent per-item visit transitions — lock-order / stale-snapshot regression (fixed)")
 class AppointmentCrossPathTransitionConcurrencyIT extends AbstractIntegrationTest {
 
     private static final String BOOKINGS_URL = "/api/v1/bookings";
@@ -159,334 +165,6 @@ class AppointmentCrossPathTransitionConcurrencyIT extends AbstractIntegrationTes
     @BeforeEach
     void seedFixtures() {
         fixtures = new BookingTestFixtures(restTemplate, jdbcTemplate, objectMapper, passwordEncoder);
-    }
-
-    /**
-     * QA cycle-8 rewrite (see class Javadoc "QA cycle-8 audit" section) — deterministic one-sided gate
-     * replacing the original two-arrivals {@code CyclicBarrier}. Forces the WHOLE-VISIT decline to
-     * commit FIRST, uncontended, then releases the per-leg CLIENT cancel of child0 to run its own
-     * (now-uncontended) header lock and F1 freshness re-check for real.
-     *
-     * <p><b>What this isolates.</b> {@code cancelBooking}'s own F1 freshness re-check
-     * ({@code isStillConfirmed}/{@code existsConfirmedById} on child0) — empirically confirmed to be
-     * the guard that makes this test's outcome deterministic and its removal detectable (mutation-
-     * verified: commenting it out flips the cancel response to {@code 204} and child0's DB status to
-     * {@code CANCELLED}, silently overwriting the provider's decline decision).
-     *
-     * <p><b>What this does NOT isolate</b> (see class Javadoc "What is gained" paragraph): deadlock
-     * freedom under literal simultaneous lock contention. The cancel thread is paused BEFORE it
-     * attempts its own header lock at all, so there is no real contention for
-     * {@code lockAppointmentHeaderBeforeClientItemCancel} to resolve here — that property was verified
-     * separately, empirically, for the underlying lock-order fix (see this class's own top-of-file
-     * "Before this fix" / cycle-2 trial-run paragraph).
-     */
-    @Test
-    @DisplayName("F1 (deterministic) — a per-leg client cancel of child0 that reaches its own header "
-            + "lock AFTER a whole-visit provider decline has ALREADY committed must abort 409 via its "
-            + "own freshness re-check, never overwrite the decline's DECLINED terminal state back to "
-            + "CANCELLED")
-    void should_serializeCleanlyWithNoDeadlock_when_wholeVisitDeclineRacesPerLegClientCancel() throws Exception {
-        Visit visit = createTwoServiceVisitLegs();
-        UUID appointmentId = visit.id();
-        UUID child0 = childAt(appointmentId, 0);
-        UUID child1 = childAt(appointmentId, 1);
-        String clientToken = visit.clientToken();
-        String providerToken = visit.providerToken();
-
-        // One-sided gate: the CANCEL thread's own header-lock attempt pauses BEFORE the real method
-        // ever runs — i.e. before cancel acquires any row lock on the header — so the whole-visit
-        // decline below can run to full, uncontended completion first. Only once decline has
-        // committed is cancel released to attempt its own (now-uncontended) lock + F1 recheck.
-        CountDownLatch cancelReachedGate = new CountDownLatch(1);
-        CountDownLatch declineCommitted = new CountDownLatch(1);
-        doAnswer(invocation -> {
-            cancelReachedGate.countDown();
-            boolean released = declineCommitted.await(10, TimeUnit.SECONDS);
-            if (!released) {
-                throw new IllegalStateException("decline never committed — test setup is broken");
-            }
-            return invocation.callRealMethod();
-        }).when(appointmentTransitionService).lockAppointmentHeaderBeforeClientItemCancel(eq(appointmentId));
-
-        CountDownLatch cancelDone = new CountDownLatch(1);
-        AtomicReference<ResponseEntity<String>> respCancel = new AtomicReference<>();
-        Thread.ofVirtual().start(() -> {
-            try {
-                HttpHeaders headers = fixtures.bearerHeaders(clientToken);
-                headers.setContentType(MediaType.APPLICATION_JSON);
-                HttpEntity<String> entity = new HttpEntity<>(
-                        "{\"cancellationReason\":\"CLIENT_CANCELLED\"}", headers);
-                respCancel.set(restTemplate.exchange(
-                        BOOKINGS_URL + "/" + child0 + "/cancel", HttpMethod.PATCH, entity, String.class));
-            } finally {
-                cancelDone.countDown();
-            }
-        });
-
-        boolean reachedGate = cancelReachedGate.await(10, TimeUnit.SECONDS);
-        assertThat(reachedGate).as("the cancel thread must reach its header-lock attempt within 10s").isTrue();
-
-        // Drive the whole-visit decline to full completion on the main thread WHILE the cancel
-        // thread is paused BEFORE it has acquired any lock — no contention, decline always succeeds.
-        HttpHeaders declineHeaders = fixtures.bearerHeaders(providerToken);
-        declineHeaders.setContentType(MediaType.APPLICATION_JSON);
-        ResponseEntity<String> respDecline = restTemplate.exchange(
-                APPOINTMENTS_URL + "/" + appointmentId + "/decline", HttpMethod.PATCH,
-                new HttpEntity<>("{}", declineHeaders), String.class);
-        assertThat(respDecline.getStatusCode())
-                .as("the whole-visit decline must succeed — nothing has raced it yet at this point — "
-                        + "body: %s", respDecline.getBody())
-                .isEqualTo(HttpStatus.NO_CONTENT);
-
-        declineCommitted.countDown();
-        boolean cancelFinished = cancelDone.await(10, TimeUnit.SECONDS);
-        assertThat(cancelFinished).as("the cancel thread must finish within 10s once released").isTrue();
-
-        // The single deterministic outcome this test forces: F1's freshness re-check on child0
-        // SPECIFICALLY rejects the cancel, because the decline already moved child0 off CONFIRMED.
-        assertThat(respCancel.get().getStatusCode())
-                .as("F1: the cancel's own freshness re-check must reject a leg the decline already "
-                        + "moved off CONFIRMED — body: %s", respCancel.get().getBody())
-                .isEqualTo(HttpStatus.CONFLICT);
-        assertThat(dbStatus(child0))
-                .as("F1: the provider's DECLINED decision on child0 must survive the LATER, losing "
-                        + "cancel attempt — never silently overwritten back to CANCELLED")
-                .isEqualTo("DECLINED");
-        assertThat(dbStatus(child1))
-                .as("the sibling leg is moved to DECLINED by the whole-visit transition")
-                .isEqualTo("DECLINED");
-        assertThat(appointmentStatus(appointmentId))
-                .as("the header collapses to DECLINED (the whole-visit transition's target)")
-                .isEqualTo("DECLINED");
-    }
-
-    /**
-     * Perf/QA audit F8b (cross-batch) — races a per-item CLIENT reschedule of leg0
-     * ({@link AppointmentTransitionService#rescheduleAppointmentItem}, phase 30.1/30.4 — genuinely
-     * NEW code) against a provider WHOLE-VISIT decline of the SAME visit
-     * ({@link AppointmentTransitionService#declineAppointment}), forcing both racers to attempt the
-     * visit header's lock at effectively the same instant via a {@code CyclicBarrier} rendezvous on
-     * {@link AppointmentTransitionService#lockAppointmentHeaderBeforeItemReschedule} (the reschedule
-     * item's NEW header-lock seam, phase 30.2) and
-     * {@link AppointmentTransitionService#lockHeaderForWholeVisitTransition} (the decline's existing
-     * seam) — exactly the same {@code @SpyBean} + {@code CyclicBarrier} technique the class-level
-     * test above uses, now pointed at the NEW per-item-reschedule lock instead of the per-leg-cancel
-     * one.
-     *
-     * <p><b>Coherent outcome regardless of race order.</b> The decline's header lock
-     * ({@code lockHeaderRegardlessOfStatus}) is UNCONDITIONAL — it always succeeds once acquired, so
-     * the decline HTTP call always returns {@code 204} whichever racer's lock statement runs first.
-     * The reschedule's header lock ({@code lockHeaderIfConfirmed}) is CONDITIONAL on the header still
-     * being {@code CONFIRMED} — so the reschedule HTTP call returns {@code 200} if it wins the lock
-     * race first (the header is still CONFIRMED when it locks), or {@code 409} if the decline commits
-     * first (the header is already DECLINED by the time reschedule's own lock attempt runs). Either
-     * way the header always ends DECLINED and BOTH legs always end DECLINED — leg0 either at its
-     * NEW (rescheduled) time (if reschedule won) or its ORIGINAL time (if decline won), never lost,
-     * never duplicated, never left CONFIRMED.
-     */
-    @Test
-    @DisplayName("per-item CLIENT reschedule of leg0 racing a provider WHOLE-VISIT decline of the SAME "
-            + "visit must not deadlock; the decline's effect always prevails in the terminal state "
-            + "(header + both legs end DECLINED), regardless of which racer wins the header lock first")
-    void should_serializeCleanlyWithCoherentFinalState_when_perItemRescheduleRacesWholeVisitDecline()
-            throws Exception {
-        Visit visit = createTwoServiceVisitLegs();
-        UUID appointmentId = visit.id();
-        UUID leg0 = childAt(appointmentId, 0);
-        UUID leg1 = childAt(appointmentId, 1);
-        OffsetDateTime originalLeg0Start = dbStartsAt(leg0);
-        OffsetDateTime newLeg0Start = ZonedDateTime.now(TimeZones.KYIV)
-                .plusDays(3).withHour(14).withMinute(0).withSecond(0).withNano(0).toOffsetDateTime();
-        String clientToken = visit.clientToken();
-        String providerToken = visit.providerToken();
-
-        CyclicBarrier bothRacersAtTheirHeaderLock = new CyclicBarrier(2);
-        doAnswer(invocation -> {
-            bothRacersAtTheirHeaderLock.await(10, TimeUnit.SECONDS);
-            return invocation.callRealMethod();
-        }).when(appointmentTransitionService).lockHeaderForWholeVisitTransition(eq(appointmentId));
-        doAnswer(invocation -> {
-            bothRacersAtTheirHeaderLock.await(10, TimeUnit.SECONDS);
-            return invocation.callRealMethod();
-        }).when(appointmentTransitionService).lockAppointmentHeaderBeforeItemReschedule(eq(appointmentId));
-
-        CountDownLatch go = new CountDownLatch(1);
-        CountDownLatch done = new CountDownLatch(2);
-        AtomicReference<ResponseEntity<String>> respReschedule = new AtomicReference<>();
-        AtomicReference<ResponseEntity<String>> respDecline = new AtomicReference<>();
-
-        Thread.ofVirtual().start(() -> {
-            try {
-                go.await();
-                HttpHeaders headers = fixtures.bearerHeaders(clientToken);
-                headers.setContentType(MediaType.APPLICATION_JSON);
-                String body = "{\"newStartsAt\":\"" + newLeg0Start + "\"}";
-                respReschedule.set(restTemplate.exchange(
-                        APPOINTMENTS_URL + "/" + appointmentId + "/services/" + leg0 + "/reschedule",
-                        HttpMethod.PATCH, new HttpEntity<>(body, headers), String.class));
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            } finally {
-                done.countDown();
-            }
-        });
-        Thread.ofVirtual().start(() -> {
-            try {
-                go.await();
-                HttpHeaders headers = fixtures.bearerHeaders(providerToken);
-                headers.setContentType(MediaType.APPLICATION_JSON);
-                respDecline.set(restTemplate.exchange(
-                        APPOINTMENTS_URL + "/" + appointmentId + "/decline", HttpMethod.PATCH,
-                        new HttpEntity<>("{}", headers), String.class));
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            } finally {
-                done.countDown();
-            }
-        });
-
-        go.countDown();
-        boolean finished = done.await(30, TimeUnit.SECONDS);
-
-        assertThat(finished).as("both racers must finish within 30s — no hang, no unbounded lock wait").isTrue();
-        assertThat(respDecline.get().getStatusCode())
-                .as("the whole-visit decline must ALWAYS succeed regardless of race order — body: %s",
-                        respDecline.get().getBody())
-                .isEqualTo(HttpStatus.NO_CONTENT);
-        assertThat(respReschedule.get().getStatusCode())
-                .as("the per-item reschedule must resolve to EXACTLY ONE of the two legal outcomes "
-                        + "for this race — body: %s", respReschedule.get().getBody())
-                .isIn(HttpStatus.OK, HttpStatus.CONFLICT);
-
-        assertThat(appointmentStatus(appointmentId))
-                .as("the decline's effect always prevails in the terminal header state")
-                .isEqualTo("DECLINED");
-        assertThat(dbStatus(leg0)).as("leg0 always ends DECLINED, whichever racer won the lock first")
-                .isEqualTo("DECLINED");
-        assertThat(dbStatus(leg1)).as("the untouched leg1 is also declined by the whole-visit transition")
-                .isEqualTo("DECLINED");
-
-        if (respReschedule.get().getStatusCode().equals(HttpStatus.OK)) {
-            assertThat(dbStartsAt(leg0).toInstant())
-                    .as("reschedule won the lock race FIRST and committed its move BEFORE decline's "
-                            + "fresh post-lock snapshot read it — leg0 must be DECLINED at its NEW time")
-                    .isEqualTo(newLeg0Start.toInstant());
-        } else {
-            assertThat(dbStartsAt(leg0).toInstant())
-                    .as("decline won the lock race FIRST — leg0 must be DECLINED at its ORIGINAL, "
-                            + "never-moved time")
-                    .isEqualTo(originalLeg0Start.toInstant());
-        }
-    }
-
-    /**
-     * QA cycle-8 rewrite (see class Javadoc "QA cycle-8 audit" section) — deterministic one-sided gate
-     * replacing the original two-arrivals {@code CyclicBarrier}. Forces the PER-LEG client cancel of
-     * leg0 to commit FIRST, uncontended, then releases the CLIENT-owned WHOLE-VISIT reschedule
-     * ({@code AppointmentTransitionService#rescheduleAppointment}) to run its own (now-uncontended)
-     * header lock and post-lock freshness re-check for real.
-     *
-     * <p><b>What this isolates.</b> {@code rescheduleAppointment}'s post-lock freshness re-check
-     * ({@code BookingRepository#findConfirmedIdsByAppointmentId}, cycle-5 audit finding 1) — mutation-
-     * verified: commenting it out lets the reschedule proceed after its (still-succeeding) header lock
-     * and move leg0's (and leg1's) window to the NEW block start even though leg0 was already
-     * CANCELLED, flipping this test's "leg0 stays at its ORIGINAL time" and "reschedule returns 409"
-     * assertions.
-     *
-     * <p><b>What this does NOT isolate</b> (see class Javadoc "What is gained" paragraph): deadlock
-     * freedom under literal simultaneous lock contention, nor the header LOCK's own false branch in
-     * isolation (removing only the lock call here would not by itself flip this test, since the
-     * freshness re-check alone already rejects a stale leg0 once the sequencing below forces cancel to
-     * commit first — the lock's role in TRUE concurrent contention is a separate property, not
-     * re-proven by a one-sided gate).
-     */
-    @Test
-    @DisplayName("cycle-5 finding 1 (deterministic) — a client-owned WHOLE-VISIT reschedule whose own "
-            + "header lock succeeds AFTER a per-leg client cancel of leg0 has ALREADY committed must "
-            + "abort 409 via its post-lock freshness re-check, mutating NEITHER leg0 NOR leg1")
-    void should_serializeCleanlyWithCoherentFinalState_when_wholeVisitRescheduleRacesPerLegClientCancel()
-            throws Exception {
-        Visit visit = createTwoServiceVisitLegs();
-        UUID appointmentId = visit.id();
-        UUID leg0 = childAt(appointmentId, 0);
-        UUID leg1 = childAt(appointmentId, 1);
-        OffsetDateTime originalLeg0Start = dbStartsAt(leg0);
-        OffsetDateTime originalLeg1Start = dbStartsAt(leg1);
-        OffsetDateTime newBlockStart = ZonedDateTime.now(TimeZones.KYIV)
-                .plusDays(3).withHour(14).withMinute(0).withSecond(0).withNano(0).toOffsetDateTime();
-        String clientToken = visit.clientToken();
-
-        // One-sided gate: the RESCHEDULE thread's own header-lock attempt pauses BEFORE the real
-        // method ever runs, so the per-leg cancel below can run to full, uncontended completion
-        // first. Only once cancel has committed is reschedule released to attempt its own
-        // (now-uncontended) lock + post-lock freshness re-check.
-        CountDownLatch rescheduleReachedGate = new CountDownLatch(1);
-        CountDownLatch cancelCommitted = new CountDownLatch(1);
-        doAnswer(invocation -> {
-            rescheduleReachedGate.countDown();
-            boolean released = cancelCommitted.await(10, TimeUnit.SECONDS);
-            if (!released) {
-                throw new IllegalStateException("cancel never committed — test setup is broken");
-            }
-            return invocation.callRealMethod();
-        }).when(appointmentTransitionService).lockAppointmentHeaderBeforeItemReschedule(eq(appointmentId));
-
-        CountDownLatch rescheduleDone = new CountDownLatch(1);
-        AtomicReference<ResponseEntity<String>> respReschedule = new AtomicReference<>();
-        Thread.ofVirtual().start(() -> {
-            try {
-                HttpHeaders headers = fixtures.bearerHeaders(clientToken);
-                headers.setContentType(MediaType.APPLICATION_JSON);
-                String body = "{\"newStartsAt\":\"" + newBlockStart + "\"}";
-                respReschedule.set(restTemplate.exchange(
-                        APPOINTMENTS_URL + "/" + appointmentId + "/reschedule",
-                        HttpMethod.PATCH, new HttpEntity<>(body, headers), String.class));
-            } finally {
-                rescheduleDone.countDown();
-            }
-        });
-
-        boolean reachedGate = rescheduleReachedGate.await(10, TimeUnit.SECONDS);
-        assertThat(reachedGate).as("the reschedule thread must reach its header-lock attempt within 10s").isTrue();
-
-        // Drive the per-leg cancel to full completion on the main thread WHILE the reschedule
-        // thread is paused BEFORE it has acquired any lock — no contention, cancel always succeeds.
-        HttpHeaders cancelHeaders = fixtures.bearerHeaders(clientToken);
-        cancelHeaders.setContentType(MediaType.APPLICATION_JSON);
-        HttpEntity<String> cancelEntity = new HttpEntity<>(
-                "{\"cancellationReason\":\"CLIENT_CANCELLED\"}", cancelHeaders);
-        ResponseEntity<String> respCancel = restTemplate.exchange(
-                BOOKINGS_URL + "/" + leg0 + "/cancel", HttpMethod.PATCH, cancelEntity, String.class);
-        assertThat(respCancel.getStatusCode())
-                .as("the per-leg cancel must succeed — nothing has raced it yet at this point — body: %s",
-                        respCancel.getBody())
-                .isEqualTo(HttpStatus.NO_CONTENT);
-
-        cancelCommitted.countDown();
-        boolean rescheduleFinished = rescheduleDone.await(10, TimeUnit.SECONDS);
-        assertThat(rescheduleFinished).as("the reschedule thread must finish within 10s once released").isTrue();
-
-        // The single deterministic outcome this test forces: the post-lock freshness re-check
-        // rejects the reschedule, because the cancel already moved leg0 off CONFIRMED.
-        assertThat(respReschedule.get().getStatusCode())
-                .as("the whole-visit reschedule's post-lock freshness re-check must reject a visit "
-                        + "whose leg0 the cancel already moved off CONFIRMED — body: %s",
-                        respReschedule.get().getBody())
-                .isEqualTo(HttpStatus.CONFLICT);
-        assertThat(appointmentStatus(appointmentId))
-                .as("leg1 was never touched by either racer, so the header stays CONFIRMED throughout")
-                .isEqualTo("CONFIRMED");
-        assertThat(dbStatus(leg0))
-                .as("the cancel's effect on leg0's STATUS survives the LATER, losing reschedule attempt")
-                .isEqualTo("CANCELLED");
-        assertThat(dbStartsAt(leg0).toInstant())
-                .as("the reschedule LOST the race — its post-lock recheck aborted before mutating "
-                        + "anything, so leg0 stays at its ORIGINAL time")
-                .isEqualTo(originalLeg0Start.toInstant());
-        assertThat(dbStartsAt(leg1).toInstant())
-                .as("the reschedule LOST the race — it must have mutated NOTHING; leg1 stays at its "
-                        + "ORIGINAL time, byte-for-byte")
-                .isEqualTo(originalLeg1Start.toInstant());
     }
 
     /**

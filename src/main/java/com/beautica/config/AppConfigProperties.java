@@ -42,7 +42,8 @@ import org.springframework.context.annotation.Configuration;
         ReviewInviteProperties.class,
         CloudflareCdnProperties.class,
         ClientVersionProperties.class,
-        ExternalCallSentryLimitProperties.class
+        ExternalCallSentryLimitProperties.class,
+        AuthConsentProperties.class
 })
 public class AppConfigProperties {
 }

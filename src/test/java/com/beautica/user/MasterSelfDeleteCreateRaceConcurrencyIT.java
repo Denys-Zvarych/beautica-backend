@@ -251,27 +251,6 @@ class MasterSelfDeleteCreateRaceConcurrencyIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("a WHOLE-VISIT reschedule queued on the master's advisory lock behind self-delete "
-            + "(which DECLINES the visit's items) must be rejected 409 with the items, feed and "
-            + "outbox untouched")
-    void should_return409_when_visitRescheduleQueuedBehindMasterSelfDeleteCommits() throws Exception {
-        BookingTestFixtures.VisitFixture visit = fixtures.createConfirmedVisit("self-delete-race-vresched", 2);
-        addPastCompletedBooking(visit.masterId());
-        List<UUID> itemIds = itemIdsOf(visit.id());
-        Map<UUID, Instant> before = startsOf(itemIds);
-        ZonedDateTime newStartsAt = ZonedDateTime.now(TimeZones.KYIV)
-                .plusDays(4).withHour(11).withMinute(0).withSecond(0).withNano(0);
-
-        AtomicReference<ResponseEntity<String>> response = new AtomicReference<>();
-        assertNoDeadlockDuring(() -> raceSelfDeleteAgainstMasterCreate(
-                visit.masterId(), visit.masterToken(), () -> response.set(
-                        patch("/api/v1/appointments/" + visit.id() + "/reschedule", visit.clientToken(),
-                                Map.of("newStartsAt", newStartsAt.toOffsetDateTime().toString())))));
-
-        assertRescheduleLostRace(response.get(), before, visit.id(), MSG_VISIT_NOT_CONFIRMED);
-    }
-
-    @Test
     @DisplayName("a PER-ITEM reschedule queued on the master's advisory lock behind self-delete "
             + "(which DECLINES the item) must be rejected 409 with the item, feed and outbox untouched")
     void should_return409_when_itemRescheduleQueuedBehindMasterSelfDeleteCommits() throws Exception {
@@ -296,26 +275,6 @@ class MasterSelfDeleteCreateRaceConcurrencyIT extends AbstractIntegrationTest {
     // ── reschedule vs. OTHER cascades (lock-order deadlock regression) ─────────────────────────
 
     @Test
-    @DisplayName("a provider's whole-visit reschedule racing the CLIENT's self-delete (which cancels the "
-            + "visit) must lose with a clean 409 and cause ZERO Postgres deadlocks")
-    void should_return409WithoutDeadlock_when_visitRescheduleRacesClientSelfDelete() throws Exception {
-        BookingTestFixtures.VisitFixture visit = fixtures.createConfirmedVisit("csd-race-vresched", 2);
-        List<UUID> itemIds = itemIdsOf(visit.id());
-        Map<UUID, Instant> before = startsOf(itemIds);
-        ZonedDateTime newStartsAt = ZonedDateTime.now(TimeZones.KYIV)
-                .plusDays(4).withHour(11).withMinute(0).withSecond(0).withNano(0);
-
-        AtomicReference<ResponseEntity<String>> response = new AtomicReference<>();
-        assertNoDeadlockDuring(() -> raceCascadeAgainstAction(CLIENT_LOCK_SQL, visit.clientId(),
-                () -> deleteAs(USERS_ME_URL, visit.clientToken()), HttpStatus.NO_CONTENT,
-                () -> response.set(patch("/api/v1/appointments/" + visit.id() + "/reschedule",
-                        visit.masterToken(),
-                        Map.of("newStartsAt", newStartsAt.toOffsetDateTime().toString())))));
-
-        assertRescheduleLost409(response.get(), before, MSG_VISIT_NOT_CONFIRMED);
-    }
-
-    @Test
     @DisplayName("a provider's per-item reschedule racing the CLIENT's self-delete must lose with a "
             + "clean 409 and cause ZERO Postgres deadlocks")
     void should_return409WithoutDeadlock_when_itemRescheduleRacesClientSelfDelete() throws Exception {
@@ -333,33 +292,6 @@ class MasterSelfDeleteCreateRaceConcurrencyIT extends AbstractIntegrationTest {
                         visit.masterToken(),
                         Map.of("newStartsAt", newStartsAt.toOffsetDateTime().toString(),
                                 "allowClientOverlap", false)))));
-
-        assertRescheduleLost409(response.get(), before, MSG_VISIT_NOT_CONFIRMED);
-    }
-
-    @Test
-    @DisplayName("a client's whole-visit reschedule racing the salon OWNER removing the master (which "
-            + "declines the visit) must lose with a clean 409 and cause ZERO Postgres deadlocks")
-    void should_return409WithoutDeadlock_when_visitRescheduleRacesMasterRemoval() throws Exception {
-        ClientSelfDeleteTestFixtures csd = new ClientSelfDeleteTestFixtures(jdbcTemplate, passwordEncoder);
-        ClientSelfDeleteTestFixtures.Salon salon = csd.createSalon();
-        fixtures.addWorkingHoursForEveryDay(salon.masterId());
-        UUID clientId = csd.createClient();
-        UUID appointmentId = csd.insertAppointmentHeader(clientId, salon.salonId(), "CONFIRMED");
-        ZonedDateTime startsAt = ZonedDateTime.now(TimeZones.KYIV)
-                .plusDays(3).withHour(11).withMinute(0).withSecond(0).withNano(0);
-        UUID bookingId = csd.insertBooking(clientId, salon, "CONFIRMED", startsAt.toOffsetDateTime(), appointmentId);
-        Map<UUID, Instant> before = startsOf(List.of(bookingId));
-        String ownerToken = fixtures.tokenFor(emailOf(salon.ownerId()));
-        String clientToken = fixtures.tokenFor(emailOf(clientId));
-        ZonedDateTime newStartsAt = startsAt.plusDays(1).withHour(12);
-
-        AtomicReference<ResponseEntity<String>> response = new AtomicReference<>();
-        assertNoDeadlockDuring(() -> raceCascadeAgainstAction(LOCK_SQL, salon.masterId(),
-                () -> deleteAs("/api/v1/salons/" + salon.salonId() + "/masters/" + salon.masterId(), ownerToken),
-                HttpStatus.NO_CONTENT,
-                () -> response.set(patch("/api/v1/appointments/" + appointmentId + "/reschedule", clientToken,
-                        Map.of("newStartsAt", newStartsAt.toOffsetDateTime().toString())))));
 
         assertRescheduleLost409(response.get(), before, MSG_VISIT_NOT_CONFIRMED);
     }
@@ -392,31 +324,6 @@ class MasterSelfDeleteCreateRaceConcurrencyIT extends AbstractIntegrationTest {
                                 "allowClientOverlap", false)))));
 
         assertRescheduleLost409(response.get(), before, MSG_VISIT_NOT_CONFIRMED);
-    }
-
-    @Test
-    @DisplayName("a client's whole-visit reschedule racing the master's own schedule-override cascade "
-            + "(DAY_OFF + cancelOverlapping declines the visit) must lose with a clean 409 and cause "
-            + "ZERO Postgres deadlocks")
-    void should_return409WithoutDeadlock_when_visitRescheduleRacesScheduleOverrideCascade() throws Exception {
-        BookingTestFixtures.VisitFixture visit = fixtures.createConfirmedVisit("ovr-race-vresched", 2);
-        List<UUID> itemIds = itemIdsOf(visit.id());
-        Map<UUID, Instant> before = startsOf(itemIds);
-        LocalDate visitDay = jdbcTemplate.queryForObject(
-                "SELECT MIN(starts_at) FROM bookings WHERE appointment_id = ?", OffsetDateTime.class, visit.id())
-                .atZoneSameInstant(TimeZones.KYIV).toLocalDate();
-        ZonedDateTime newStartsAt = ZonedDateTime.now(TimeZones.KYIV)
-                .plusDays(5).withHour(11).withMinute(0).withSecond(0).withNano(0);
-
-        AtomicReference<ResponseEntity<String>> response = new AtomicReference<>();
-        assertNoDeadlockDuring(() -> raceCascadeAgainstAction(LOCK_SQL, visit.masterId(),
-                () -> putDayOffCancellingOverlaps(visit.masterId(), visit.masterToken(), visitDay),
-                HttpStatus.OK,
-                () -> response.set(patch("/api/v1/appointments/" + visit.id() + "/reschedule",
-                        visit.clientToken(),
-                        Map.of("newStartsAt", newStartsAt.toOffsetDateTime().toString())))));
-
-        assertRescheduleLostRace(response.get(), before, visit.id(), MSG_VISIT_NOT_CONFIRMED);
     }
 
     @Test

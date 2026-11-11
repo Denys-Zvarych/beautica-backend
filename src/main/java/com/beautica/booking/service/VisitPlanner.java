@@ -1,7 +1,7 @@
 package com.beautica.booking.service;
 
+import com.beautica.booking.domain.ServiceBookability;
 import com.beautica.booking.dto.BookingPriceRange;
-import com.beautica.booking.entity.Booking;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.master.entity.Master;
@@ -27,8 +27,7 @@ import java.util.stream.Collectors;
  * windows AT CREATE TIME — the ONE piece of the visit-create machinery shared verbatim by BOTH the
  * authenticated APP path ({@link AppointmentService}) and the guest LINK path
  * ({@link GuestBookingService}, BE-7). "Contiguous" here scopes ONLY to {@link #planChainedItems} (the
- * create path, below) — {@link #replanFromNewStart} (the whole-visit reschedule path) never calls
- * {@link #assertContiguous}, and per-item moves (phase 30.1's relaxed contiguity —
+ * create path, below) — per-item moves (phase 30.1's relaxed contiguity —
  * {@code AppointmentTransitionService#rescheduleAppointmentItem}) bypass this class entirely, moving
  * exactly one child row directly. A visit's items are therefore contiguous only at the moment they are
  * created; the invariant is NOT re-checked or maintained afterwards.
@@ -149,7 +148,10 @@ class VisitPlanner {
         Map<UUID, MasterServiceAssignment> byId = masterServiceRepository
                 .findByMasterIdAndIdInWithGraph(master.getId(), distinctIds)
                 .stream()
-                .filter(MasterServiceAssignment::isActive)
+                // Active assignment AND active definition — deactivating a definition does NOT
+                // cascade to master_services. Same uniform 404 either way (no oracle);
+                // serviceDefinition is JOIN FETCHed by the finder, so this adds no query.
+                .filter(ServiceBookability::isBookable)
                 .collect(Collectors.toMap(MasterServiceAssignment::getId, Function.identity()));
 
         if (byId.size() != distinctIds.size()) {
@@ -195,44 +197,6 @@ class VisitPlanner {
     }
 
     /**
-     * Re-lays-out an ALREADY-BOOKED visit's chained items from a new first start, preserving
-     * each item's frozen duration/buffer snapshot (BE-4 visit reschedule) — the timing-only twin
-     * of {@link #planChainedItems}.
-     *
-     * <p>Reuses the identical back-to-back chaining formula this class uses for creation
-     * ({@code start[i] = start[i-1].endsAt}, {@code end[i] = start[i] + duration[i] + buffer[i]})
-     * and the same {@link SlotCalculationService#MAX_TOTAL_DURATION_MINUTES} &Sigma;-cap, but
-     * resolves NOTHING from {@code master_services}: {@code priceAtBooking} /
-     * {@code durationMinutesAtBooking} / {@code bufferMinutesAtBooking} stay frozen at each item's
-     * original booking-time values (mirrors {@code BookingService#rescheduleBooking}, which
-     * freezes the same two fields on the single-service path) — only the clock position of the
-     * whole block moves. A catalogue price/duration change since booking can therefore never leak
-     * into an existing visit via a reschedule.
-     *
-     * <p>{@code orderedItems} must already be ordered by {@code startsAt} ascending — the exact
-     * shape {@code BookingRepository#findByAppointmentIdWithGraph} returns — and the returned list
-     * is parallel (same size, same order): index {@code i} is item {@code i}'s new window.
-     */
-    List<PlannedWindow> replanFromNewStart(List<Booking> orderedItems, OffsetDateTime newFirstStart) {
-        List<PlannedWindow> windows = new ArrayList<>(orderedItems.size());
-        OffsetDateTime cursor = newFirstStart;
-        long totalMinutes = 0;
-        for (Booking item : orderedItems) {
-            int duration = item.getDurationMinutesAtBooking();
-            int buffer = item.getBufferMinutesAtBooking();
-            OffsetDateTime start = cursor;
-            OffsetDateTime end = start.plusMinutes((long) duration + buffer);
-            windows.add(new PlannedWindow(start, end));
-            totalMinutes += (long) duration + buffer;
-            cursor = end;
-        }
-        if (totalMinutes > SlotCalculationService.MAX_TOTAL_DURATION_MINUTES) {
-            throw new BusinessException("total service duration exceeds maximum allowed");
-        }
-        return windows;
-    }
-
-    /**
      * The planned items' already-JOIN-FETCHed assignments, PARALLEL to the {@code serviceIds} list that
      * produced them ({@link #planChainedItems} resolves in list order, so index {@code i} is service
      * {@code i}'s assignment) — the shape
@@ -257,7 +221,4 @@ class VisitPlanner {
             int buffer,
             BigDecimal price,
             BigDecimal priceMax) {}
-
-    /** One item's re-laid-out window — parallel-indexed to the caller's ordered item list. */
-    record PlannedWindow(OffsetDateTime startsAt, OffsetDateTime endsAt) {}
 }

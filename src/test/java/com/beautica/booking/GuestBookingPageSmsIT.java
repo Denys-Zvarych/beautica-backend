@@ -69,9 +69,9 @@ class GuestBookingPageSmsIT extends AbstractWalkInBookingSmsIT {
     }
 
     @Test
-    @DisplayName("provider declines a whole LINK visit → ONE SMS linking the VISIT header's page (the token the "
-            + "guest got at create)")
-    void should_sendDeclineSmsWithVisitPageLink_when_providerDeclinesLinkVisit() throws Exception {
+    @DisplayName("provider declines ONE service of a LINK visit → ONE SMS linking the VISIT header's page (the "
+            + "token the guest got at create); phase 475 removed the whole-visit decline")
+    void should_sendDeclineSmsWithVisitPageLink_when_providerDeclinesOneServiceOfLinkVisit() throws Exception {
         OffsetDateTime startsAt = tomorrowAt(java.time.LocalTime.of(10, 0));
         UUID second = insertService(salon.masterId(), "SALON", salon.salonId());
         ResponseEntity<String> created = createGuestVisit(startsAt, List.of(salon.masterServiceId(), second));
@@ -79,11 +79,17 @@ class GuestBookingPageSmsIT extends AbstractWalkInBookingSmsIT {
         UUID appointmentId = UUID.fromString(readJson(created.getBody()).path("appointmentId").asText());
         settle();
 
-        ResponseEntity<String> decline = restTemplate.exchange("/api/v1/appointments/" + appointmentId + "/decline",
-                HttpMethod.PATCH, new HttpEntity<>("{}", bearerHeaders(tokenFor(salon.ownerEmail()))), String.class);
+        String ownerToken = tokenFor(salon.ownerEmail());
+        UUID firstItem = jdbcTemplate.queryForObject(
+                "SELECT id FROM bookings WHERE appointment_id = ? ORDER BY starts_at LIMIT 1", UUID.class, appointmentId);
+
+        ResponseEntity<String> decline = restTemplate.exchange(
+                "/api/v1/appointments/" + appointmentId + "/services/" + firstItem + "/decline",
+                HttpMethod.PATCH, new HttpEntity<>("{}", bearerHeaders(ownerToken)), String.class);
         drainWorker.drain();
 
         assertThat(decline.getStatusCode()).as(decline.getBody()).isEqualTo(HttpStatus.NO_CONTENT);
+
         assertThat(sentText()).isEqualTo(cancelledBody(startsAt) + "\n\nДеталі або записатись знову " + cancelUrl);
     }
 

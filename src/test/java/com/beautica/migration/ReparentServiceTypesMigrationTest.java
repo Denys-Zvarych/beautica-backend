@@ -60,7 +60,8 @@ class ReparentServiceTypesMigrationTest extends AbstractIntegrationTest {
             "NAIL_SERVICE", "PODOLOGY", "BROWS", "LASH_LAMINATION", "LASH_EXTENSIONS",
             "MAKEUP", "COSMETOLOGY", "HARDWARE_COSMETOLOGY", "INJECTION_COSMETOLOGY",
             "AESTHETIC_COSMETOLOGY", "LASER_COSMETOLOGY", "HAIR_REMOVAL", "PERMANENT_MAKEUP",
-            "BARBERING", "BEARD_CARE"
+            "BARBERING", "BEARD_CARE",
+            "BODY_MASSAGE"   // phase 453 / V234
     );
 
     /**
@@ -74,9 +75,11 @@ class ReparentServiceTypesMigrationTest extends AbstractIntegrationTest {
 
     // Post-V81 totals: V75 seeded 140 leaves; V81 hard-deletes nail-service-pedicure-toes -> 139.
     // 26 platform_categories total (unchanged); 20 active after V81 soft-disables SHAVING.
-    private static final int TOTAL_SERVICE_TYPES = 139;
-    private static final int ACTIVE_CATEGORY_COUNT = 20;
-    private static final int TOTAL_CATEGORY_COUNT = 26;
+    // Phase 453 / V234 adds the BODY_MASSAGE platform category (+1 active, +1 total) with 11 leaves
+    // filed under the existing «Тіло» coarse bucket (no new service_categories row) -> 150 / 21 / 27.
+    private static final int TOTAL_SERVICE_TYPES = 150;
+    private static final int ACTIVE_CATEGORY_COUNT = 21;
+    private static final int TOTAL_CATEGORY_COUNT = 27;
 
     // =========================================================================
     // 1. Active-slug coverage (post-V74)
@@ -274,6 +277,7 @@ class ReparentServiceTypesMigrationTest extends AbstractIntegrationTest {
             assertBucketCount("BARBERING", 10);
             assertBucketCount("BEARD_CARE", 12);     // V81 folded 5 shaving leaves in (was 7)
             assertBucketCount("SHAVING", 0);         // V81 re-parented all shaving leaves out
+            assertBucketCount("BODY_MASSAGE", 11);   // phase 453 / V234
         }
 
         @Test

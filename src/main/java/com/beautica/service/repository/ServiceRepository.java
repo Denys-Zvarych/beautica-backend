@@ -199,9 +199,16 @@ public interface ServiceRepository extends JpaRepository<ServiceDefinition, UUID
 
     /**
      * Finds the id of an existing ACTIVE {@link ServiceDefinition} that would collide with a
-     * write for {@code (ownerType, ownerId, serviceTypeId)} — the exact key of the partial
-     * unique index {@code ux_service_def_owner_service_type_active} (V121), which enforces
-     * "one active service per owner per service type, regardless of price or duration".
+     * write for {@code (ownerType, ownerId, serviceTypeId, durationMinutes, name)} — the exact key
+     * of the partial unique index {@code ux_service_def_owner_type_duration_name_active} (V233,
+     * phase 464), which allows several active copies of one type per owner as long as each pair
+     * differs in base duration or in name. Price never participates.
+     *
+     * <p>The name is compared {@code lower(trim(name))} on BOTH sides — the same normalisation as
+     * the index's {@code lower(btrim(name))}: Hibernate's PostgreSQL dialect renders JPQL
+     * {@code trim(x)} as {@code trim(both from x)}, which Postgres evaluates as {@code btrim(x)}
+     * (spaces only), so the predicate is the index expression. Java never normalises the name for this check, so the rule lives in
+     * the index and in this predicate only.
      *
      * <p>Returns the id only (not the entity): the caller needs it solely to populate the
      * {@code DUPLICATE_SERVICE} 409 payload, so hydrating the full row would be waste.
@@ -222,6 +229,8 @@ public interface ServiceRepository extends JpaRepository<ServiceDefinition, UUID
             WHERE sd.ownerType = :ownerType
               AND sd.ownerId = :ownerId
               AND sd.serviceType.id = :serviceTypeId
+              AND sd.baseDurationMinutes = :durationMinutes
+              AND lower(trim(sd.name)) = lower(trim(:name))
               AND sd.isActive = true
               AND (:excludeId IS NULL OR sd.id <> :excludeId)
             """)
@@ -229,12 +238,15 @@ public interface ServiceRepository extends JpaRepository<ServiceDefinition, UUID
             @Param("ownerType") OwnerType ownerType,
             @Param("ownerId") UUID ownerId,
             @Param("serviceTypeId") UUID serviceTypeId,
+            @Param("durationMinutes") int durationMinutes,
+            @Param("name") String name,
             @Param("excludeId") UUID excludeId);
 
     /**
-     * Batched sibling of {@link #findActiveDuplicateId}: resolves, in ONE query, every
-     * {@code (serviceTypeId → existing active ServiceDefinition id)} pair that would collide
-     * with a multi-item write for {@code (ownerType, ownerId)}.
+     * Batched sibling of {@link #findActiveDuplicateId}: resolves, in ONE query, every existing
+     * active {@link ServiceDefinition} of {@code (ownerType, ownerId)} that collides with one of
+     * the requested copies {@code (typeIds[i], durations[i], names[i])} — the three arrays are
+     * parallel, zipped by {@code unnest}.
      *
      * <p><b>Why this exists.</b> The bulk service-create path accepts up to 100 items
      * ({@code @Size(max = 100)} on {@code BulkCreateServicesRequest}); calling
@@ -244,31 +256,44 @@ public interface ServiceRepository extends JpaRepository<ServiceDefinition, UUID
      * additionally forced a Hibernate AUTO flush, defeating JDBC insert batching — so the two
      * only pay off together.
      *
-     * <p>Returns the definition id alongside the type id (rather than type ids alone) so the
-     * caller can still populate {@code existingServiceDefId} on the {@code DUPLICATE_SERVICE}
-     * 409 and let the client deep-link to the offending row, exactly as the single-item path does.
+     * <p><b>Why native.</b> Phase 464 matches on the (type, duration, name) TUPLE per item. JPQL
+     * cannot zip parallel parameter lists, and three independent {@code IN} lists would match the
+     * cross product (item A's duration with item B's name) — a false 409. The name is compared
+     * {@code lower(btrim(...))} on both sides, the index's own expression.
+     *
+     * <p>Returns the definition id alongside the type id so the caller can populate
+     * {@code existingServiceDefId} on the {@code DUPLICATE_SERVICE} 409 and let the client
+     * deep-link to the colliding copy, exactly as the single-item path does.
      *
      * <p>No {@code excludeId} parameter: this serves create paths only, where nothing is being
      * updated in place. Use {@link #findActiveDuplicateId} for PATCH.
      *
-     * <p>Bounded by construction — {@code typeIds} is the caller's own validated, deduplicated
-     * request set, so the result can never exceed it (anti-bug §E-3). Like every finder here it
-     * is unscoped (§E-4): the caller must already have established write access to this owner.
-     * And like its sibling it is a read-then-write check, TOCTOU-prone by nature — the partial
-     * unique index {@code ux_service_def_owner_service_type_active} remains the actual guarantee.
+     * <p>Bounded by construction — the arrays are the caller's own validated request (≤ 100
+     * items), and each item can match at most one active row (the index is unique), so the result
+     * can never exceed the request (anti-bug §E-3). Like every finder here it is unscoped (§E-4):
+     * the caller must already have established write access to this owner. And like its sibling
+     * it is a read-then-write check, TOCTOU-prone by nature — the partial unique index
+     * {@code ux_service_def_owner_type_duration_name_active} remains the actual guarantee.
      */
-    @Query("""
-            SELECT new com.beautica.service.repository.ActiveDuplicateProjection(sd.serviceType.id, sd.id)
-            FROM ServiceDefinition sd
-            WHERE sd.ownerType = :ownerType
-              AND sd.ownerId = :ownerId
-              AND sd.isActive = true
-              AND sd.serviceType.id IN :typeIds
-            """)
-    List<ActiveDuplicateProjection> findActiveDuplicateTypeIds(
-            @Param("ownerType") OwnerType ownerType,
+    @Query(value = """
+            SELECT sd.service_type_id AS serviceTypeId, sd.id AS serviceDefinitionId,
+                   sd.base_duration_minutes AS durationMinutes, sd.name AS name
+            FROM service_definitions sd
+            JOIN unnest(CAST(:typeIds AS uuid[]), CAST(:durations AS int[]), CAST(:names AS text[]))
+                 AS v(type_id, duration_minutes, name)
+              ON sd.service_type_id = v.type_id
+             AND sd.base_duration_minutes = v.duration_minutes
+             AND lower(btrim(sd.name)) = lower(btrim(v.name))
+            WHERE sd.owner_type = :ownerType
+              AND sd.owner_id = :ownerId
+              AND sd.is_active = true
+            """, nativeQuery = true)
+    List<ActiveDuplicateProjection> findActiveDuplicateCopies(
+            @Param("ownerType") String ownerType,
             @Param("ownerId") UUID ownerId,
-            @Param("typeIds") Collection<UUID> typeIds);
+            @Param("typeIds") UUID[] typeIds,
+            @Param("durations") Integer[] durations,
+            @Param("names") String[] names);
 
     /**
      * Phase 302 — the ONE query the salon-branch bulk-create critical section runs: every ACTIVE
@@ -277,7 +302,7 @@ public interface ServiceRepository extends JpaRepository<ServiceDefinition, UUID
      *
      * <p><b>Three round-trips collapsed into one (perf LOW-3).</b> The salon branch previously ran
      * {@code MasterServiceRepository#findActiveAssignedServiceTypeIds} (the per-master conflict),
-     * then {@link #findActiveDuplicateTypeIds} (the salon's reusable definition ids), then
+     * then {@code findActiveDuplicateTypeIds} (the salon's reusable definition ids), then
      * {@code findAllById} to re-fetch definitions the second query had already joined. All three
      * answers live in this one row shape. It matters because the advisory lock guarding this
      * section is keyed on the SALON (audit HIGH-2): the serialized window is salon-wide, so every
@@ -303,7 +328,7 @@ public interface ServiceRepository extends JpaRepository<ServiceDefinition, UUID
      * <p>The {@code INDEPENDENT_MASTER}/{@code :masterId} arm is deliberate, not incidental: ~60
      * pre-Phase-302 rows are still master-owned (phase 303 backfills them), and a master who
      * already performs a type through one of those must keep getting the clean, item-naming 409
-     * rather than a raced V121 violation. Such a row is a CONFLICT, never a reuse candidate — the
+     * rather than a raced V233 violation. Such a row is a CONFLICT, never a reuse candidate — the
      * caller reuses only {@code ownerType = SALON} rows, since an insert here writes
      * {@code (SALON, salonId)}.
      *
@@ -312,11 +337,14 @@ public interface ServiceRepository extends JpaRepository<ServiceDefinition, UUID
      * {@code master_services} is {@code UNIQUE (master_id, service_def_id)}, so at most one
      * assignment matches per definition. Bounded by construction (§E-3) — {@code typeIds} is the
      * caller's own validated, deduplicated request set, and at most two owners can answer for a
-     * type.
+     * type. Since phase 464/465 a salon may hold several ACTIVE copies of one type (one per
+     * {@code (base_duration_minutes, lower(btrim(name)))}), so a type returns one row PER COPY —
+     * the caller resolves each bulk item to a copy in memory; the rows stay bounded by the salon's
+     * own catalogue for the requested types.
      *
      * <p>Read-then-write like every guard on this path (§E-4 — unscoped by role, the caller must
      * already hold write access to both salon and master): the partial unique index
-     * {@code ux_service_def_owner_service_type_active} and {@code master_services}' unique key stay
+     * {@code ux_service_def_owner_type_duration_name_active} (V233) and {@code master_services}' unique key stay
      * the actual guarantees; the salon-keyed advisory lock is what turns ordinary contention into
      * the clean 409 instead of a constraint violation.
      *
@@ -335,6 +363,10 @@ public interface ServiceRepository extends JpaRepository<ServiceDefinition, UUID
      * not a conflict and not a fresh insert). Cardinality is unaffected: {@code master_services}'
      * unique key still bounds the join to at most one row per definition regardless of its active
      * state.
+     *
+     * <p><b>Deterministic order ({@code created_at}, then id).</b> The caller walks the rows in
+     * query order — a type's copies list, the reported conflict id, the reactivation target — so
+     * an unspecified order would let identical requests resolve differently. Oldest copy first.
      */
     @Query("""
             SELECT new com.beautica.service.repository.SalonBulkSetupCandidate(
@@ -349,6 +381,7 @@ public interface ServiceRepository extends JpaRepository<ServiceDefinition, UUID
                         AND sd.ownerId = :salonId)
                 OR (sd.ownerType = com.beautica.service.entity.OwnerType.INDEPENDENT_MASTER
                         AND sd.ownerId = :masterId))
+            ORDER BY sd.createdAt, sd.id
             """)
     List<SalonBulkSetupCandidate> findSalonBulkSetupCandidates(
             @Param("salonId") UUID salonId,

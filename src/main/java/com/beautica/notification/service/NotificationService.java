@@ -13,7 +13,6 @@ import org.springframework.lang.Nullable;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
-import java.time.OffsetDateTime;
 import java.util.EnumSet;
 import java.util.Set;
 import java.util.UUID;
@@ -110,10 +109,9 @@ public class NotificationService {
      *       declined, its siblings stay {@code CONFIRMED}, the header stays {@code CONFIRMED}, and
      *       {@code STATUS_CHANGED} is enqueued against that ONE booking. Naming the whole visit here
      *       would tell the client that services they still have are cancelled.</li>
-     *   <li>{@code AppointmentTransitionService#declineAppointment} — the header AND every item move
-     *       to {@code DECLINED}, and {@code persistAndNotify} enqueues ONE {@code STATUS_CHANGED}
-     *       against {@code items.get(0)}. This is the path that was silently telling a client only
-     *       their first service was cancelled while the rest of the visit was gone too.</li>
+     *   <li>A whole-visit decline — the header AND every item end {@code DECLINED} (the batched
+     *       schedule-override / closure cascades, or the last per-item decline collapsing the header).
+     *       The dedicated whole-visit route ({@code declineAppointment}) was removed in phase 475.</li>
      * </ul>
      *
      * <p>The {@code isMultiService()} half is what makes a null header safe: a legacy booking with
@@ -163,7 +161,8 @@ public class NotificationService {
         // and verified by nothing. Phase 408 (user decision 2026-10-28) widened it to STAFF walk-ins with a
         // phone (PROVIDER_CANCELLATION_SMS_SOURCES), and the 22.1 risk is contained instead of excluded:
         // the copy is fixed GuestProviderCancellationSmsText (no provider-authored text), and every STAFF
-        // message spends the shared per-phone budget plus one-per-visit-per-window
+        // visit spends the shared per-phone budget once per window — its other cancelled services ride on
+        // that charge (phase 478, GST-75: one message per cancelled service)
         // (GuestRescheduleSmsBudget#tryReserveWalkInCancellation, in sendLinkGuestProviderCancellationSms),
         // so typed-in numbers cannot be turned into an SMS relay. APP rows never reach this branch. Pinned by
         // NotificationServiceTest (#should_sendDeclineSms_when_staffWalkInBookingDeclined,
@@ -184,7 +183,7 @@ public class NotificationService {
             if (booking.getStatus() == BookingStatus.DECLINED
                     && PROVIDER_CANCELLATION_SMS_SOURCES.contains(booking.getBookingSource())) {
                 sendLinkGuestProviderCancellationSms(booking, "DECLINED",
-                        guestCancellationSmsText.forDecline(booking, declinedStart(visit)), outboxEntryId);
+                        guestCancellationSmsText.forDecline(booking, booking.getStartsAt()), outboxEntryId);
             } else {
                 log.debug("Skipping STATUS_CHANGED notification for account-less guest booking {}", booking.getId());
             }
@@ -386,8 +385,9 @@ public class NotificationService {
      *
      * <p>Takes a {@link BookingVisit}, not a bare {@code Booking}, because exactly ONE
      * {@code SALON_CLOSED} outbox row is enqueued per VISIT (D12) — {@code visit} may therefore
-     * describe several declined services at once; the email names all of them, and the guest SMS
-     * (one per visit) names the visit start only.
+     * describe several declined services at once; the email names all of them. A guest visit instead
+     * gets one row per declined service (phase 478, GST-75), and each SMS names its own row's start —
+     * for a pre-478 per-visit row that row is the earliest declined item, i.e. the visit start.
      *
      * <p><b>Per-audience delivery (D8).</b> A registered client (an account exists —
      * {@code booking.getClient() != null}) always has an email on file (schema-guaranteed,
@@ -413,7 +413,7 @@ public class NotificationService {
         if (booking.getClient() == null) {
             if (PROVIDER_CANCELLATION_SMS_SOURCES.contains(booking.getBookingSource())) {
                 sendLinkGuestProviderCancellationSms(booking, "SALON_CLOSED",
-                        guestCancellationSmsText.forSalonClosed(booking, visit.startsAt()), outboxEntryId);
+                        guestCancellationSmsText.forSalonClosed(booking, booking.getStartsAt()), outboxEntryId);
             } else {
                 log.debug("Skipping SALON_CLOSED notification for account-less non-LINK booking {}",
                         booking.getId());
@@ -452,7 +452,7 @@ public class NotificationService {
         if (booking.getClient() == null) {
             if (PROVIDER_CANCELLATION_SMS_SOURCES.contains(booking.getBookingSource())) {
                 sendLinkGuestProviderCancellationSms(booking, "MASTER_REMOVED",
-                        guestCancellationSmsText.forMasterRemoved(booking, visit.startsAt()), outboxEntryId);
+                        guestCancellationSmsText.forMasterRemoved(booking, booking.getStartsAt()), outboxEntryId);
             } else {
                 log.debug("Skipping MASTER_REMOVED notification for account-less non-LINK booking {}",
                         booking.getId());
@@ -525,8 +525,9 @@ public class NotificationService {
 
     /**
      * Phase 390 — queues the provider-cancellation SMS for a {@code LINK} guest. One call per outbox
-     * row, and every caller's row is per VISIT (whole-visit decline, salon closure, master removal)
-     * or per declined service line, so a guest gets one SMS per provider action. The text comes
+     * row, and since phase 478 (GST-75) every guest row is per declined SERVICE line (manual decline,
+     * day-off / narrowed-hours override, salon closure, master removal or deletion, client block), so a
+     * guest gets one message per cancelled service, naming that service's own time. The text comes
      * from {@link GuestProviderCancellationSmsText} and carries no provider-authored content.
      *
      * <p>Phase 408 widened the callers to STAFF walk-ins with a phone (user decision 2026-10-28, reversing
@@ -547,8 +548,9 @@ public class NotificationService {
             return;
         }
         // Phase 408 audit-fix (security MEDIUM): a walk-in's phone was typed by staff, so its cancellation message
-        // spends the shared per-phone budget (and at most one per visit per window); silent skip when exhausted.
-        // LINK guests (OTP-verified) are unchanged.
+        // spends the shared per-phone budget, charged once per visit per window (phase 478: the visit's other
+        // cancelled services ride on that charge); silent skip when exhausted. LINK guests (OTP-verified) are
+        // unchanged.
         if (lead.getBookingSource() == BookingSource.STAFF && !guestRescheduleSmsBudget.tryReserveWalkInCancellation(
                 lead.getId(), lead.getAppointment() == null ? null : lead.getAppointment().getId(), phone,
                 outboxEntryId)) {
@@ -645,15 +647,6 @@ public class NotificationService {
         }
         bookingSmsDispatcher.dispatchOrThrow(BookingSmsDispatcher.Kind.GUEST_PROVIDER_RESCHEDULE, phone,
                 guestRescheduleSmsText.render(booking));
-    }
-
-    /**
-     * The appointment time the guest is told was cancelled: the whole visit's start for a
-     * whole-visit decline, otherwise the declined line's own start (siblings of a per-item decline
-     * stay booked, so naming the visit start could point at a service that is still on).
-     */
-    private static OffsetDateTime declinedStart(BookingVisit visit) {
-        return isWholeVisitDecline(visit) ? visit.startsAt() : visit.lead().getStartsAt();
     }
 
     /**

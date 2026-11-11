@@ -1,7 +1,6 @@
 package com.beautica.review.invite;
 
 import com.beautica.booking.retention.GuestPiiAnonymisationService;
-import com.beautica.booking.service.AppointmentTransitionService;
 import com.beautica.common.security.PhoneHasher;
 import com.beautica.review.invite.service.ReviewInviteTokenHasher;
 import org.junit.jupiter.api.DisplayName;
@@ -46,8 +45,6 @@ class GuestReviewOptOutIT extends AbstractReviewInviteIT {
     @Autowired
     private PhoneHasher phoneHasher;
 
-    @Autowired
-    private AppointmentTransitionService appointmentTransitionService;
 
     @Autowired
     private GuestPiiAnonymisationService anonymisationService;
@@ -108,7 +105,7 @@ class GuestReviewOptOutIT extends AbstractReviewInviteIT {
         UUID nextVisit = fixtures.linkVisit("CONFIRMED", GUEST_PHONE, POLICY);
         fixtures.visitItem(nextVisit, masterId, masterServiceId, "LINK", "CONFIRMED", GUEST_PHONE, 3);
         authenticateAsMaster();
-        appointmentTransitionService.completeAppointment(masterUserId, nextVisit);
+        completeVisitItems(nextVisit);
 
         assertThat(first.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
         assertThat(second.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);

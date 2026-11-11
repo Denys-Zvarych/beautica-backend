@@ -16,4 +16,13 @@ public record VerifyEmailRequest(
         @Pattern(regexp = "^[0-9]{6}$", message = "Code must be exactly 6 digits")
         String code
 ) {
+
+    /**
+     * Phase 442 audit — the OTP code (and the email, which is PII) must never reach a log line: the default record {@code toString}
+     * would print every component.
+     */
+    @Override
+    public String toString() {
+        return "VerifyEmailRequest[]";
+    }
 }

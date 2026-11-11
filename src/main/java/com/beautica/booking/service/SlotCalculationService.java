@@ -1,6 +1,7 @@
 package com.beautica.booking.service;
 
 import com.beautica.booking.domain.MasterBookability;
+import com.beautica.booking.domain.ServiceBookability;
 import com.beautica.booking.dto.AvailableSlotResponse;
 import com.beautica.common.BookingWindow;
 import com.beautica.common.TimeZones;
@@ -535,9 +536,9 @@ public class SlotCalculationService {
         // tap.
         //
         // For the CREATE paths this guard is only that dead-CTA fix — they re-check MasterBookability
-        // themselves. For the three RESCHEDULE routes it IS the security boundary, and the only one:
-        // BookingService#rescheduleBooking, AppointmentTransitionService#rescheduleAppointment and
-        // #rescheduleAppointmentItem all authorize a start time by requiring it to MATCH a slot this
+        // themselves. For the two RESCHEDULE routes it IS the security boundary, and the only one:
+        // BookingService#rescheduleBooking and AppointmentTransitionService#rescheduleAppointmentItem
+        // both authorize a start time by requiring it to MATCH a slot this
         // method returns, and never call MasterBookability directly. Returning an empty list here is
         // what stops a client moving a live booking onto a master whose salon has since closed —
         // so do NOT weaken or relocate this check without giving those three their own guard
@@ -885,7 +886,7 @@ public class SlotCalculationService {
         // the `preloaded` caller BookingMasterService's finder, uses an INNER JOIN FETCH — that one
         // is salon-scoped (WHERE s.id = :salonId), so a non-null salon was already required and the
         // inner join drops nothing.
-        if (msa == null || !msa.isActive() || !MasterBookability.isBookable(msa.getMaster())) {
+        if (!ServiceBookability.isBookable(msa) || !MasterBookability.isBookable(msa.getMaster())) {
             return false;
         }
         UUID masterId = msa.getMaster().getId();
@@ -1038,7 +1039,7 @@ public class SlotCalculationService {
         MasterServiceAssignment msa = masterServiceRepository
                 .findByMasterIdAndIdWithGraph(masterId, masterServiceId)
                 .orElseThrow(() -> new NotFoundException("masterService not found"));
-        if (!msa.isActive()) {
+        if (!ServiceBookability.isBookable(msa)) {
             throw new NotFoundException("masterService not found");
         }
         return msa;
@@ -1069,7 +1070,7 @@ public class SlotCalculationService {
         Map<UUID, MasterServiceAssignment> byId = masterServiceRepository
                 .findByMasterIdAndIdInWithGraph(masterId, distinctIds)
                 .stream()
-                .filter(MasterServiceAssignment::isActive)
+                .filter(ServiceBookability::isBookable)
                 .collect(Collectors.toMap(MasterServiceAssignment::getId, Function.identity()));
         if (byId.size() != distinctIds.size()) {
             throw new NotFoundException("masterService not found");
@@ -1118,8 +1119,7 @@ public class SlotCalculationService {
         }
         for (int i = 0; i < masterServiceIds.size(); i++) {
             MasterServiceAssignment msa = preloaded.get(i);
-            if (msa == null
-                    || !msa.isActive()
+            if (!ServiceBookability.isBookable(msa)
                     || !masterServiceIds.get(i).equals(msa.getId())
                     || msa.getMaster() == null
                     || !masterId.equals(msa.getMaster().getId())) {
@@ -1453,7 +1453,7 @@ public class SlotCalculationService {
      * {@code master-bookable-days} (2 000 entries) by master prefix for exactly this reason.
      *
      * <p>Called from every booking-write {@code afterCommit} hook — {@code BookingService} (create,
-     * decline, complete, not-complete, cancel, reschedule; {@code declineBookingForBatch} deliberately
+     * decline, complete, cancel, reschedule; {@code declineBookingForBatch} deliberately
      * does NOT, because its caller {@code ScheduleOverrideConflictService} issues ONE combined sweep for
      * the whole batch), {@code AppointmentService} and {@code AppointmentTransitionService}
      * (multi-service visits), {@code GuestBookingService} and {@code GuestVisitCancellationService} (LINK),

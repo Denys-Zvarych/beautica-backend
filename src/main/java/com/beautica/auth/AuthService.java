@@ -152,6 +152,7 @@ public class AuthService {
         );
         user.setVerificationCodeHash(tokenGenerator.hashOtp(rawOtp));
         user.setVerificationCodeExpiresAt(clock.instant().plus(OTP_TTL));
+        TermsConsentStamp.apply(user, request, clock.instant());
 
         var savedUser = userRepository.save(user);
 
@@ -181,6 +182,7 @@ public class AuthService {
         );
         user.setVerificationCodeHash(tokenGenerator.hashOtp(rawOtp));
         user.setVerificationCodeExpiresAt(clock.instant().plus(OTP_TTL));
+        TermsConsentStamp.apply(user, request, clock.instant());
 
         var savedUser = userRepository.save(user);
 

@@ -134,8 +134,9 @@ class V81MigrationIntegrationTest {
                 "SELECT COUNT(*) FROM platform_categories WHERE active = TRUE AND status = 'APPROVED'",
                 Long.class);
         assertThat(activeApproved)
-                .as("final list = 20 active approved categories (21 seeded minus folded SHAVING)")
-                .isEqualTo(20L);
+                .as("final list = 21 active approved categories (21 seeded minus folded SHAVING, "
+                        + "plus BODY_MASSAGE from phase 453 / V234)")
+                .isEqualTo(21L);
 
         Long shavingInApproved = jdbc.queryForObject(
                 "SELECT COUNT(*) FROM platform_categories WHERE name = ? AND active = TRUE AND status = 'APPROVED'",

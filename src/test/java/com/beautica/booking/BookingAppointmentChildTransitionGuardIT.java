@@ -34,19 +34,18 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
 /**
- * BE-4 consistency guard: THREE of the four SINGLE-booking transition endpoints —
- * {@code PATCH /bookings/{id}/decline|complete|not-complete}, all PROVIDER-initiated — must REFUSE
- * to act on a booking that is one item of a multi-service visit ({@code appointment_id != null}).
- * Transitioning a single child independently through one of those three would desync the
- * {@code appointments} header from its OTHER sibling items; a whole visit must still be moved only
- * through the {@code /appointments/{id}/...} lockstep endpoints (covered by
- * {@link AppointmentTransitionIT}) for those three transitions.
+ * BE-4 consistency guard: the two PROVIDER-initiated SINGLE-booking transition endpoints —
+ * {@code PATCH /bookings/{id}/decline|complete} — must REFUSE to act on a booking that is one item of
+ * a multi-service visit ({@code appointment_id != null}): they would bypass the header collapse and
+ * desync the {@code appointments} header from its OTHER sibling items. A visit child moves only through
+ * the per-service {@code /appointments/{id}/services/{bookingId}/...} endpoints. (Phase 475 removed
+ * {@code /bookings/{id}/not-complete} and its two tests here.)
  *
- * <p>Each of those three guard tests proves the child booking (a) is rejected with 409 by the
+ * <p>Each of those guard tests proves the child booking (a) is rejected with 409 by the
  * service-layer guard — the controller {@code @PreAuthorize} role/ownership gate passes first, so
  * this is not an authz rejection — and (b) is left byte-for-byte unchanged: still {@code CONFIRMED},
  * still bound to its appointment header. The legacy tests prove a standalone booking
- * ({@code appointment_id = null}) still transitions exactly as before through all four endpoints.
+ * ({@code appointment_id = null}) still transitions exactly as before through the remaining endpoints.
  *
  * <p><b>Track 27.x widening — {@code PATCH /bookings/{id}/cancel} is the exception.</b> The
  * CLIENT-initiated cancel no longer refuses a visit child: a client may cancel exactly one leg,
@@ -115,19 +114,6 @@ class BookingAppointmentChildTransitionGuardIT extends AbstractIntegrationTest {
         assertGuardRejected(resp, child, visit.id());
     }
 
-    @Test
-    @DisplayName("PATCH /not-complete on a visit CHILD returns 409 and the child stays CONFIRMED + "
-            + "still bound to its appointment")
-    void should_return409AndKeepChildUnchanged_when_providerMarksVisitChildNotComplete() throws Exception {
-        Visit visit = createTwoServiceVisit("noshow");
-        UUID child = firstChildOf(visit.id());
-
-        ResponseEntity<String> resp = patch(visit.masterToken(), child, "not-complete",
-                "{\"cancellationReason\":\"CLIENT_NO_SHOW\"}");
-
-        assertGuardRejected(resp, child, visit.id());
-    }
-
     // ── the per-child endpoint SUCCEEDS where the single-booking path is refused ───────────────────
 
     @Test
@@ -168,7 +154,7 @@ class BookingAppointmentChildTransitionGuardIT extends AbstractIntegrationTest {
     @Test
     @DisplayName("PATCH /cancel on ONE leg of a two-service visit returns 204, cancels only that leg, "
             + "leaves the sibling CONFIRMED, and leaves the visit HEADER CONFIRMED — the client-cancel "
-            + "widening no longer refuses an appointment child the way decline/complete/not-complete do")
+            + "widening no longer refuses an appointment child the way decline/complete do")
     void should_return204AndCancelOnlyThatLeg_when_clientCancelsOneLegOfTwoServiceVisit() throws Exception {
         Visit visit = createTwoServiceVisit("client-cancel-one-leg");
         UUID child0 = firstChildOf(visit.id());
@@ -402,21 +388,6 @@ class BookingAppointmentChildTransitionGuardIT extends AbstractIntegrationTest {
         assertThat(dbStatus(booking.bookingId())).isEqualTo("COMPLETED");
     }
 
-    @Test
-    @DisplayName("PATCH /not-complete on a LEGACY standalone booking still returns 204 and moves it "
-            + "to NOT_COMPLETED")
-    void should_return204_when_providerMarksLegacyStandaloneBookingNotComplete() throws Exception {
-        Standalone booking = createLegacyStandaloneBooking("noshow");
-
-        ResponseEntity<String> resp = patch(booking.masterToken(), booking.bookingId(), "not-complete",
-                "{\"cancellationReason\":\"CLIENT_NO_SHOW\"}");
-
-        assertThat(resp.getStatusCode())
-                .as("legacy standalone not-complete must still succeed — body: %s", resp.getBody())
-                .isEqualTo(HttpStatus.NO_CONTENT);
-        assertThat(dbStatus(booking.bookingId())).isEqualTo("NOT_COMPLETED");
-    }
-
     // ── shared assertions ─────────────────────────────────────────────────────────────────────────
 
     /** Asserts the single-booking transition was refused with 409 and the child row is unchanged. */
@@ -495,11 +466,9 @@ class BookingAppointmentChildTransitionGuardIT extends AbstractIntegrationTest {
      * the legacy path), owned by a fresh CLIENT and served by a fresh INDEPENDENT_MASTER.
      *
      * <p>FUTURE by default so the client-cancel path's elapsed-booking guard (endsAt-based) passes.
-     * {@code "complete"} and {@code "noshow"} are the two exceptions: {@code completeBooking}
-     * requires {@code now >= startsAt} (Phase 27.1), so those two fixtures are seeded ELAPSED
-     * instead — {@code notCompleteBooking} has no temporal guard, but the "noshow" fixture stays
-     * elapsed anyway as the conventional no-show default. {@code declineBooking} has no temporal
-     * guard either, so the "decline" fixture's FUTURE default is likewise just convention.
+     * {@code "complete"} is the exception: {@code completeBooking} requires {@code now >= startsAt}
+     * (Phase 27.1), so that fixture is seeded ELAPSED instead. {@code declineBooking} has no temporal
+     * guard, so the "decline" fixture's FUTURE default is just convention.
      */
     private Standalone createLegacyStandaloneBooking(String tag) throws Exception {
         String masterEmail = "child-guard-legacy-" + tag + "-master-" + System.nanoTime() + "@beautica.test";
@@ -508,7 +477,7 @@ class BookingAppointmentChildTransitionGuardIT extends AbstractIntegrationTest {
         UUID clientId = fixtures.createUser(clientEmail, "CLIENT", null);
         UUID masterServiceId = fixtures.createIndependentMasterService(masterId);
 
-        OffsetDateTime startsAt = ("complete".equals(tag) || "noshow".equals(tag))
+        OffsetDateTime startsAt = "complete".equals(tag)
                 ? OffsetDateTime.now(ZoneOffset.UTC).minusHours(1)
                 : OffsetDateTime.now(ZoneOffset.UTC).plusDays(2).withHour(10).withMinute(0).withSecond(0).withNano(0);
         UUID bookingId = UUID.randomUUID();

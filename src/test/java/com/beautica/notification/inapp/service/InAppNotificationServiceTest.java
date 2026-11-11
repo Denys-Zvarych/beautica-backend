@@ -250,28 +250,6 @@ class InAppNotificationServiceTest {
     }
 
     @Test
-    @DisplayName("notifyRescheduledVisit: dedup key is keyed to the appointment id, never a booking id")
-    void should_useAppointmentIdDedupKey_when_notifyRescheduledVisit() {
-        UUID appointmentId = UUID.randomUUID();
-        UUID bookingId = UUID.randomUUID();
-        Booking item = bookingWith(bookingId, userWithId(clientId), master, salon, BookingSource.APP);
-        Instant newStart = Instant.parse("2026-10-01T12:00:00Z");
-
-        service.notifyRescheduledVisit(appointmentId, item, false, newStart, clientId);
-
-        // initiatedByProvider=false: performing master (always) + owner/admins (client-initiated
-        // leg) = {masterUserId, ownerId}; the CLIENT is the actor and was never in that set.
-        ArgumentCaptor<Collection<UUID>> recipients = recipientsCaptor();
-        ArgumentCaptor<String> keyCaptor = ArgumentCaptor.forClass(String.class);
-        verify(repository, times(1)).insertForRecipients(
-                eq("BOOKING_RESCHEDULED"), recipients.capture(), isNull(), eq(appointmentId), any(), isNull(),
-                keyCaptor.capture());
-        assertThat(recipients.getValue()).containsExactlyInAnyOrder(masterUserId, ownerId);
-        assertThat(keyCaptor.getValue())
-                .isEqualTo("BOOKING_RESCHEDULED:" + appointmentId + ":" + newStart.getEpochSecond());
-    }
-
-    @Test
     @DisplayName("notifyInviteAccepted: dedup key is INVITE_ACCEPTED:salonId:newMemberUserId")
     void should_useSalonAndMemberIdDedupKey_when_notifyInviteAccepted() {
         UUID newMemberId = UUID.randomUUID();
@@ -649,6 +627,156 @@ class InAppNotificationServiceTest {
 
         verify(repository).insertModerationOutcomesWithPush(any(), any(), eq("SALON_PROFILE"), any());
         verify(repository, never()).insertModerationOutcomes(any(), any(), any(), any());
+    }
+
+    // ── Phase 474 — notifyBookingEventsBulk (schedule-override mass decline) ────────────────────
+
+    /** One captured feed row: (recipient, booking_id, appointment_id, salon_id, dedup_key). */
+    private record FeedRow(UUID recipient, UUID bookingId, UUID appointmentId, UUID salonId, String dedupKey) {
+    }
+
+    /** The rows of the ONE plain {@code insertEventRowsBulk} call, asserting parallel arrays of equal length. */
+    private List<FeedRow> bulkRows(InAppNotificationRepository repo, String type) {
+        ArgumentCaptor<UUID[]> recipients = ArgumentCaptor.forClass(UUID[].class);
+        ArgumentCaptor<UUID[]> bookingIds = ArgumentCaptor.forClass(UUID[].class);
+        ArgumentCaptor<UUID[]> appointmentIds = ArgumentCaptor.forClass(UUID[].class);
+        ArgumentCaptor<UUID[]> salonIds = ArgumentCaptor.forClass(UUID[].class);
+        ArgumentCaptor<String[]> keys = ArgumentCaptor.forClass(String[].class);
+        verify(repo, times(1)).insertEventRowsBulk(eq(type), recipients.capture(), bookingIds.capture(),
+                appointmentIds.capture(), salonIds.capture(), keys.capture());
+        int n = recipients.getValue().length;
+        assertThat(List.of(bookingIds.getValue().length, appointmentIds.getValue().length,
+                salonIds.getValue().length, keys.getValue().length))
+                .as("parallel arrays must all have %s elements", n)
+                .containsOnly(n);
+        List<FeedRow> rows = new java.util.ArrayList<>();
+        for (int i = 0; i < n; i++) {
+            rows.add(new FeedRow(recipients.getValue()[i], bookingIds.getValue()[i], appointmentIds.getValue()[i],
+                    salonIds.getValue()[i], keys.getValue()[i]));
+        }
+        return rows;
+    }
+
+    /** The rows every {@code insertForRecipients} call on {@code repo} wrote, flattened per recipient. */
+    private List<FeedRow> perEventRows(InAppNotificationRepository repo, String type, int calls) {
+        ArgumentCaptor<Collection<UUID>> recipients = recipientsCaptor();
+        ArgumentCaptor<UUID> bookingIds = ArgumentCaptor.forClass(UUID.class);
+        ArgumentCaptor<UUID> appointmentIds = ArgumentCaptor.forClass(UUID.class);
+        ArgumentCaptor<UUID> salonIds = ArgumentCaptor.forClass(UUID.class);
+        ArgumentCaptor<String> keys = ArgumentCaptor.forClass(String.class);
+        verify(repo, times(calls)).insertForRecipients(eq(type), recipients.capture(), bookingIds.capture(),
+                appointmentIds.capture(), salonIds.capture(), isNull(), keys.capture());
+        List<FeedRow> rows = new java.util.ArrayList<>();
+        for (int c = 0; c < calls; c++) {
+            for (UUID r : recipients.getAllValues().get(c)) {
+                rows.add(new FeedRow(r, bookingIds.getAllValues().get(c), appointmentIds.getAllValues().get(c),
+                        salonIds.getAllValues().get(c), keys.getAllValues().get(c)));
+            }
+        }
+        return rows;
+    }
+
+    @Test
+    @DisplayName("bulk decline writes exactly the rows notifyBookingEvent + notifyVisitEvent would write "
+            + "(client + performing master, owner-actor excluded), in ONE statement")
+    void should_writeSameRowsAsPerEventCalls_when_bulkDeclineMixesBookingAndVisit() {
+        UUID bookingId = UUID.randomUUID();
+        UUID appointmentId = UUID.randomUUID();
+        UUID visitClientId = UUID.randomUUID();
+        Booking standalone = bookingWith(bookingId, userWithId(clientId), master, salon, BookingSource.APP);
+        Booking visitItem = bookingWith(UUID.randomUUID(), userWithId(visitClientId), master, salon,
+                BookingSource.LINK);
+        InAppNotificationRepository perEventRepo = org.mockito.Mockito.mock(InAppNotificationRepository.class);
+        InAppNotificationService perEvent = new InAppNotificationService(
+                perEventRepo, salonRepository, new InAppRecipientResolver(userRepository), false);
+        perEvent.notifyBookingEvent(InAppNotificationType.BOOKING_DECLINED, standalone, ownerId);
+        perEvent.notifyVisitEvent(InAppNotificationType.BOOKING_DECLINED, appointmentId, visitItem, ownerId);
+
+        service.notifyBookingEventsBulk(InAppNotificationType.BOOKING_DECLINED, List.of(
+                InAppNotificationService.BookingEventTarget.forBooking(standalone),
+                InAppNotificationService.BookingEventTarget.forVisit(appointmentId, visitItem)), ownerId);
+
+        List<FeedRow> bulk = bulkRows(repository, "BOOKING_DECLINED");
+        assertThat(bulk)
+                .as("bulk rows must equal the per-event rows, bulk=%s", bulk)
+                .containsExactlyInAnyOrderElementsOf(perEventRows(perEventRepo, "BOOKING_DECLINED", 2));
+        assertThat(bulk).containsExactlyInAnyOrder(
+                new FeedRow(clientId, bookingId, null, salonId, "BOOKING_DECLINED:" + bookingId),
+                new FeedRow(masterUserId, bookingId, null, salonId, "BOOKING_DECLINED:" + bookingId),
+                new FeedRow(visitClientId, null, appointmentId, salonId, "BOOKING_DECLINED:" + appointmentId),
+                new FeedRow(masterUserId, null, appointmentId, salonId, "BOOKING_DECLINED:" + appointmentId));
+        verify(repository, never()).insertForRecipients(any(), any(), any(), any(), any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("bulk decline by the performing master removes the master from every event — client rows only")
+    void should_excludeActorFromEveryEvent_when_performingMasterBulkDeclines() {
+        UUID bookingId = UUID.randomUUID();
+        UUID appointmentId = UUID.randomUUID();
+        Booking standalone = bookingWith(bookingId, userWithId(clientId), master, salon, BookingSource.APP);
+        Booking visitItem = bookingWith(UUID.randomUUID(), userWithId(clientId), master, salon, BookingSource.APP);
+
+        service.notifyBookingEventsBulk(InAppNotificationType.BOOKING_DECLINED, List.of(
+                InAppNotificationService.BookingEventTarget.forBooking(standalone),
+                InAppNotificationService.BookingEventTarget.forVisit(appointmentId, visitItem)), masterUserId);
+
+        assertThat(bulkRows(repository, "BOOKING_DECLINED")).containsExactlyInAnyOrder(
+                new FeedRow(clientId, bookingId, null, salonId, "BOOKING_DECLINED:" + bookingId),
+                new FeedRow(clientId, null, appointmentId, salonId, "BOOKING_DECLINED:" + appointmentId));
+    }
+
+    @Test
+    @DisplayName("bulk decline of an independent master's booking binds salon_id as NULL, never another salon")
+    void should_bindNullSalonId_when_bulkDeclineTargetsIndependentMaster() {
+        UUID independentUserId = UUID.randomUUID();
+        Master independent = masterWith(UUID.randomUUID(), userWithId(independentUserId), null,
+                MasterType.INDEPENDENT_MASTER);
+        UUID bookingId = UUID.randomUUID();
+        Booking booking = bookingWith(bookingId, userWithId(clientId), independent, null, BookingSource.APP);
+
+        service.notifyBookingEventsBulk(InAppNotificationType.BOOKING_DECLINED,
+                List.of(InAppNotificationService.BookingEventTarget.forBooking(booking)), independentUserId);
+
+        assertThat(bulkRows(repository, "BOOKING_DECLINED")).containsExactly(
+                new FeedRow(clientId, bookingId, null, null, "BOOKING_DECLINED:" + bookingId));
+    }
+
+    @Test
+    @DisplayName("bulk call with no targets makes no repository call at all")
+    void should_makeNoRepositoryCall_when_bulkTargetsEmpty() {
+        service.notifyBookingEventsBulk(InAppNotificationType.BOOKING_DECLINED, List.of(), ownerId);
+
+        org.mockito.Mockito.verifyNoInteractions(repository);
+    }
+
+    @Test
+    @DisplayName("bulk call whose every target empties to no recipient (walk-in declined by its master) "
+            + "makes no repository call")
+    void should_makeNoRepositoryCall_when_everyBulkTargetHasNoRecipient() {
+        Booking walkIn = bookingWith(UUID.randomUUID(), null, master, salon, BookingSource.STAFF);
+
+        service.notifyBookingEventsBulk(InAppNotificationType.BOOKING_DECLINED,
+                List.of(InAppNotificationService.BookingEventTarget.forBooking(walkIn)), masterUserId);
+
+        org.mockito.Mockito.verifyNoInteractions(repository);
+    }
+
+    @Test
+    @DisplayName("pushEnabled=true routes the bulk event write to its push twin and never the plain insert")
+    void should_usePushTwin_when_pushEnabledBulkEventWrite() {
+        service = new InAppNotificationService(
+                repository, salonRepository, new InAppRecipientResolver(userRepository), true);
+        UUID bookingId = UUID.randomUUID();
+        Booking booking = bookingWith(bookingId, userWithId(clientId), master, salon, BookingSource.APP);
+
+        service.notifyBookingEventsBulk(InAppNotificationType.BOOKING_DECLINED,
+                List.of(InAppNotificationService.BookingEventTarget.forBooking(booking)), ownerId);
+
+        ArgumentCaptor<UUID[]> recipients = ArgumentCaptor.forClass(UUID[].class);
+        verify(repository, times(1)).insertEventRowsBulkWithPush(eq("BOOKING_DECLINED"), recipients.capture(),
+                any(), any(), any(), any());
+        assertThat(recipients.getValue()).containsExactlyInAnyOrder(clientId, masterUserId);
+        verify(repository, never()).insertEventRowsBulk(any(), any(), any(), any(), any(), any());
     }
 
     /**

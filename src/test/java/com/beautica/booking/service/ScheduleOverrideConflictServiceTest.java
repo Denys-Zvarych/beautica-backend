@@ -2,6 +2,7 @@ package com.beautica.booking.service;
 
 import com.beautica.booking.dto.AppointmentProviderNoteRequest;
 import com.beautica.booking.dto.StatusUpdateRequest;
+import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.CancellationReason;
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.booking.repository.OverrideConflictCandidate;
@@ -19,12 +20,16 @@ import com.beautica.common.exception.ScheduleOverrideDeclineBudgetExceededExcept
 import com.beautica.config.RateLimitConfig;
 import com.beautica.master.service.MasterScheduleService;
 import com.beautica.master.service.ScheduleDateMath;
+import com.beautica.notification.inapp.entity.InAppNotificationType;
+import com.beautica.notification.inapp.service.InAppNotificationService;
+import com.beautica.notification.inapp.service.InAppNotificationService.BookingEventTarget;
 import com.github.benmanes.caffeine.cache.LoadingCache;
 import io.github.bucket4j.Bucket;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import java.time.Clock;
@@ -34,6 +39,7 @@ import java.time.LocalTime;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -41,8 +47,10 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
@@ -63,6 +71,7 @@ class ScheduleOverrideConflictServiceTest {
     private BookingService bookingService;
     private AppointmentTransitionService appointmentTransitionService;
     private MasterScheduleService masterScheduleService;
+    private InAppNotificationService inAppNotificationService;
     private MasterCachePrefixEvictor cachePrefixEvictor;
     private ScheduleDateMath dateMath;
     @SuppressWarnings("unchecked")
@@ -76,6 +85,9 @@ class ScheduleOverrideConflictServiceTest {
         bookingService = mock(BookingService.class);
         appointmentTransitionService = mock(AppointmentTransitionService.class);
         masterScheduleService = mock(MasterScheduleService.class);
+        inAppNotificationService = mock(InAppNotificationService.class);
+        // A real decline never returns null; tests that care about the declined entity stub their own.
+        when(bookingService.declineBookingForBatch(any(), any(), any())).thenReturn(mock(Booking.class));
         cachePrefixEvictor = mock(MasterCachePrefixEvictor.class);
         dateMath = mock(ScheduleDateMath.class);
         scheduleOverrideDeclineBudgetBuckets = mock(LoadingCache.class);
@@ -89,7 +101,7 @@ class ScheduleOverrideConflictServiceTest {
         Clock clock = Clock.fixed(Instant.parse("2026-08-01T00:00:00Z"), ZoneOffset.UTC);
         service = new ScheduleOverrideConflictService(
                 bookingRepository, bookingService, appointmentTransitionService, masterScheduleService,
-                cachePrefixEvictor, dateMath, clock, scheduleOverrideDeclineBudgetBuckets);
+                inAppNotificationService, cachePrefixEvictor, dateMath, clock, scheduleOverrideDeclineBudgetBuckets);
         // Every write-path test needs the advisory lock to succeed (finding 2) — a non-null return
         // means "acquired". Not relevant to the authorization-failure test below (the lock is never
         // even attempted once authz throws), so a lenient default here is safe.
@@ -300,8 +312,151 @@ class ScheduleOverrideConflictServiceTest {
 
         service.applyOverrideWithConflictHandling(ACTOR_ID, MASTER_ID, request);
 
-        verify(appointmentTransitionService, org.mockito.Mockito.times(1)).declineAppointmentItems(
+        verify(appointmentTransitionService, times(1)).declineAppointmentItems(
                 eq(ACTOR_ID), eq(appointmentId), eq(List.of(booking1, booking2, booking3)), any(), eq(false));
+    }
+
+    // ── phase 474 — override declines notify like a provider decline (SCH-37 / NTF-40) ──────
+
+    private static AppointmentTransitionService.VisitItemsDecline visitDecline(
+            UUID appointmentId, boolean whole, Booking... declined) {
+        return new AppointmentTransitionService.VisitItemsDecline(appointmentId, List.of(declined), whole);
+    }
+
+    @Test
+    @DisplayName("phase 474 — standalone conflict — declined, then the provider-decline outbox rows + ONE bulk in-app "
+            + "write with the booking-keyed target (never via declineBooking)")
+    void should_enqueueProviderDeclineNotifications_when_standaloneBookingDeclinedByOverride() {
+        UUID bookingId = UUID.randomUUID();
+        Booking declined = mock(Booking.class);
+        when(bookingRepository.findConfirmedCandidatesForOverrideConflictCheck(any(), any(), any(), any()))
+                .thenReturn(List.of(standaloneCandidate(bookingId, LocalTime.of(10, 0), LocalTime.of(11, 0))));
+        when(bookingService.declineBookingForBatch(eq(ACTOR_ID), eq(bookingId), any())).thenReturn(declined);
+        var request = new ScheduleOverrideRequest(
+                DATE, ScheduleExceptionKind.DAY_OFF, WeekdayMode.INTERVAL, List.of(), null, true);
+
+        service.applyOverrideWithConflictHandling(ACTOR_ID, MASTER_ID, request);
+
+        InOrder inOrder = inOrder(bookingService, inAppNotificationService);
+        inOrder.verify(bookingService).declineBookingForBatch(eq(ACTOR_ID), eq(bookingId), any());
+        inOrder.verify(bookingService).enqueueProviderDeclineOutbox(declined, ACTOR_ID);
+        inOrder.verify(inAppNotificationService).notifyBookingEventsBulk(
+                InAppNotificationType.BOOKING_DECLINED, List.of(BookingEventTarget.forBooking(declined)), ACTOR_ID);
+        verify(bookingService, never()).declineBooking(any(), any(), any());
+        verify(bookingService, never()).enqueueProviderDeclineNotifications(any(), any());
+    }
+
+    @Test
+    @DisplayName("phase 474 — two siblings of one visit — ONE visit outbox enqueue (D4) and its target in the bulk write")
+    void should_enqueueOneVisitNotification_when_multipleSiblingsOfOneVisitDeclinedByOverride() {
+        UUID appointmentId = UUID.randomUUID();
+        UUID booking1 = UUID.randomUUID();
+        UUID booking2 = UUID.randomUUID();
+        Booking representative = mock(Booking.class);
+        var decline = visitDecline(appointmentId, true, representative, mock(Booking.class));
+        BookingEventTarget target = BookingEventTarget.forVisit(appointmentId, representative);
+        when(bookingRepository.findConfirmedCandidatesForOverrideConflictCheck(any(), any(), any(), any()))
+                .thenReturn(List.of(
+                        appointmentChildCandidate(booking1, appointmentId, LocalTime.of(9, 0), LocalTime.of(9, 30)),
+                        appointmentChildCandidate(booking2, appointmentId, LocalTime.of(9, 30), LocalTime.of(10, 0))));
+        when(appointmentTransitionService.declineAppointmentItems(
+                eq(ACTOR_ID), eq(appointmentId), eq(List.of(booking1, booking2)), any(), eq(false)))
+                .thenReturn(decline);
+        when(appointmentTransitionService.enqueueVisitItemsDeclineOutbox(decline, ACTOR_ID))
+                .thenReturn(Optional.of(target));
+        var request = new ScheduleOverrideRequest(
+                DATE, ScheduleExceptionKind.DAY_OFF, WeekdayMode.INTERVAL, List.of(), null, true);
+
+        service.applyOverrideWithConflictHandling(ACTOR_ID, MASTER_ID, request);
+
+        verify(appointmentTransitionService, times(1)).enqueueVisitItemsDeclineOutbox(decline, ACTOR_ID);
+        verify(inAppNotificationService, times(1)).notifyBookingEventsBulk(
+                InAppNotificationType.BOOKING_DECLINED, List.of(target), ACTOR_ID);
+        verifyNoInteractions(bookingService);
+    }
+
+    @Test
+    @DisplayName("phase 474 audit-fix — many visits — every decline, then every outbox enqueue, then exactly ONE bulk "
+            + "in-app write carrying every target (statement count flat in the visit count)")
+    void should_writeAllFeedRowsInOneBulkCallAfterEveryOutboxEnqueue_when_standaloneAndVisitConflictsMixed() {
+        UUID standaloneId = UUID.randomUUID();
+        UUID appointmentA = UUID.randomUUID();
+        UUID appointmentB = UUID.randomUUID();
+        UUID childA = UUID.randomUUID();
+        UUID childB = UUID.randomUUID();
+        Booking standalone = mock(Booking.class);
+        Booking repA = mock(Booking.class);
+        Booking repB = mock(Booking.class);
+        var declineA = visitDecline(appointmentA, true, repA);
+        var declineB = visitDecline(appointmentB, false, repB);
+        BookingEventTarget targetA = BookingEventTarget.forVisit(appointmentA, repA);
+        BookingEventTarget targetB = BookingEventTarget.forBooking(repB);
+        when(bookingRepository.findConfirmedCandidatesForOverrideConflictCheck(any(), any(), any(), any()))
+                .thenReturn(List.of(
+                        standaloneCandidate(standaloneId, LocalTime.of(9, 0), LocalTime.of(10, 0)),
+                        appointmentChildCandidate(childA, appointmentA, LocalTime.of(11, 0), LocalTime.of(12, 0)),
+                        appointmentChildCandidate(childB, appointmentB, LocalTime.of(13, 0), LocalTime.of(14, 0))));
+        when(bookingService.declineBookingForBatch(eq(ACTOR_ID), eq(standaloneId), any())).thenReturn(standalone);
+        when(appointmentTransitionService.declineAppointmentItems(
+                eq(ACTOR_ID), eq(appointmentA), eq(List.of(childA)), any(), eq(false))).thenReturn(declineA);
+        when(appointmentTransitionService.declineAppointmentItems(
+                eq(ACTOR_ID), eq(appointmentB), eq(List.of(childB)), any(), eq(false))).thenReturn(declineB);
+        when(appointmentTransitionService.enqueueVisitItemsDeclineOutbox(declineA, ACTOR_ID))
+                .thenReturn(Optional.of(targetA));
+        when(appointmentTransitionService.enqueueVisitItemsDeclineOutbox(declineB, ACTOR_ID))
+                .thenReturn(Optional.of(targetB));
+        var request = new ScheduleOverrideRequest(
+                DATE, ScheduleExceptionKind.DAY_OFF, WeekdayMode.INTERVAL, List.of(), null, true);
+
+        service.applyOverrideWithConflictHandling(ACTOR_ID, MASTER_ID, request);
+
+        InOrder inOrder = inOrder(bookingService, appointmentTransitionService, inAppNotificationService);
+        inOrder.verify(bookingService).declineBookingForBatch(eq(ACTOR_ID), eq(standaloneId), any());
+        inOrder.verify(appointmentTransitionService).declineAppointmentItems(
+                eq(ACTOR_ID), eq(appointmentA), eq(List.of(childA)), any(), eq(false));
+        inOrder.verify(appointmentTransitionService).declineAppointmentItems(
+                eq(ACTOR_ID), eq(appointmentB), eq(List.of(childB)), any(), eq(false));
+        inOrder.verify(bookingService).enqueueProviderDeclineOutbox(standalone, ACTOR_ID);
+        inOrder.verify(appointmentTransitionService).enqueueVisitItemsDeclineOutbox(declineA, ACTOR_ID);
+        inOrder.verify(appointmentTransitionService).enqueueVisitItemsDeclineOutbox(declineB, ACTOR_ID);
+        inOrder.verify(inAppNotificationService).notifyBookingEventsBulk(InAppNotificationType.BOOKING_DECLINED,
+                List.of(BookingEventTarget.forBooking(standalone), targetA, targetB), ACTOR_ID);
+        verify(inAppNotificationService, times(1)).notifyBookingEventsBulk(any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("phase 474 audit-fix — every visit target raced away — outbox step ran, no in-app write at all")
+    void should_skipBulkInAppWrite_when_noVisitYieldsATarget() {
+        UUID appointmentId = UUID.randomUUID();
+        UUID childId = UUID.randomUUID();
+        var decline = visitDecline(appointmentId, true);
+        when(bookingRepository.findConfirmedCandidatesForOverrideConflictCheck(any(), any(), any(), any()))
+                .thenReturn(List.of(
+                        appointmentChildCandidate(childId, appointmentId, LocalTime.of(11, 0), LocalTime.of(12, 0))));
+        when(appointmentTransitionService.declineAppointmentItems(
+                eq(ACTOR_ID), eq(appointmentId), eq(List.of(childId)), any(), eq(false))).thenReturn(decline);
+        when(appointmentTransitionService.enqueueVisitItemsDeclineOutbox(decline, ACTOR_ID)).thenReturn(Optional.empty());
+        var request = new ScheduleOverrideRequest(
+                DATE, ScheduleExceptionKind.DAY_OFF, WeekdayMode.INTERVAL, List.of(), null, true);
+
+        service.applyOverrideWithConflictHandling(ACTOR_ID, MASTER_ID, request);
+
+        verifyNoInteractions(inAppNotificationService);
+    }
+
+    @Test
+    @DisplayName("phase 474 — conflicts without cancelOverlapping — 409 and nothing enqueued")
+    void should_enqueueNothing_when_conflictsExistAndCancelOverlappingIsFalse() {
+        when(bookingRepository.findConfirmedCandidatesForOverrideConflictCheck(any(), any(), any(), any()))
+                .thenReturn(List.of(standaloneCandidate(UUID.randomUUID(), LocalTime.of(10, 0), LocalTime.of(11, 0))));
+        var request = new ScheduleOverrideRequest(DATE, ScheduleExceptionKind.DAY_OFF, List.of());
+
+        assertThatThrownBy(() -> service.applyOverrideWithConflictHandling(ACTOR_ID, MASTER_ID, request))
+                .isInstanceOf(BusinessException.class);
+
+        verify(bookingService, never()).enqueueProviderDeclineOutbox(any(), any());
+        verify(appointmentTransitionService, never()).enqueueVisitItemsDeclineOutbox(any(), any());
+        verifyNoInteractions(inAppNotificationService);
     }
 
     @Test
@@ -350,9 +505,8 @@ class ScheduleOverrideConflictServiceTest {
     // NOTE: this class used to have a "decline-rate-limiter" test section here, proving
     // ScheduleOverrideConflictService charged a proportional per-conflict token from
     // BookingDeclineRateLimiter (backend-security re-audit finding 1, ORIGINAL). That charge — and
-    // BookingDeclineRateLimiter itself — was removed on 2026-07-26 (D6, product decision reversal):
-    // an override-driven decline no longer dispatches any notification, so the SMS/notification
-    // blast-radius concern that charge existed for is gone. A DIFFERENT proportional charge was
+    // BookingDeclineRateLimiter itself — was removed on 2026-07-26 (D6). Phase 474 reversed D6 (override
+    // declines notify again, fixed copy, no note); the per-write cap and the budget below bound that. A DIFFERENT proportional charge was
     // reintroduced the same day by the 2026-07-26 re-audit (finding 1, MEDIUM — this class's own
     // dedicated scheduleOverrideDeclineBudgetBuckets, never the SMS-driven bookingDeclineBuckets):
     // the per-request (MAX_CONFLICTS_PER_WRITE=100) and per-minute (scheduleOverrideWriteCapacity=50)

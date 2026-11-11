@@ -182,9 +182,10 @@ public class GlobalExceptionHandler {
     }
 
     /**
-     * Distinct 409 for a provider adding a service they already offer — one ACTIVE service per
-     * {@code (owner, service type)}, price/duration irrelevant (V121's partial unique index
-     * {@code ux_service_def_owner_service_type_active}).
+     * Distinct 409 for a provider adding a service copy they already offer — one ACTIVE service per
+     * {@code (owner, service type, base duration, canonical name)}, the name compared
+     * {@code lower(btrim(name))}; price never participates (V233's partial unique index
+     * {@code ux_service_def_owner_type_duration_name_active}, phase 464, replacing V121's per-type one).
      *
      * <p>Must be declared alongside (Spring dispatches by exception-hierarchy depth, not
      * declaration order) {@link #handleBusiness} so the structured {@link DuplicateServiceResponse}

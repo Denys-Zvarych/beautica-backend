@@ -234,9 +234,10 @@ public class BookingTestFixtures {
      * Resolves a real, selectable {@code service_types.id} that {@code (ownerType, ownerId)} does
      * NOT already hold an ACTIVE {@code service_definitions} row for.
      *
-     * <p><b>Why this exists.</b> V121 added
-     * {@code ux_service_def_owner_service_type_active} — a partial UNIQUE index on
-     * {@code (owner_type, owner_id, service_type_id) WHERE is_active}. {@link
+     * <p><b>Why this exists.</b> V233 keeps
+     * {@code ux_service_def_owner_type_duration_name_active} — a partial UNIQUE index on
+     * {@code (owner_type, owner_id, service_type_id, base_duration_minutes, lower(btrim(name)))
+     * WHERE is_active} (it replaced V121's per-type index). {@link
      * #resolveServiceTypeId()} is deterministic ({@code ORDER BY st.name_uk LIMIT 1}), so every
      * definition seeded for one owner through it collided on the SAME type: the second insert for
      * a master now raises a unique violation. Seeding a multi-service owner is a legitimate,
@@ -416,6 +417,28 @@ public class BookingTestFixtures {
                 "DELETE FROM notification_outbox WHERE aggregate_id IN "
                         + "(SELECT id FROM bookings WHERE appointment_id = ?)",
                 appointmentId);
+    }
+
+    /**
+     * Phase 475 — completes every still-CONFIRMED service of a visit, one by one, through
+     * {@code PATCH /appointments/{id}/services/{bookingId}/complete} (the whole-visit complete route was
+     * removed). The last completion collapses the header to {@code COMPLETED} and fires the visit's
+     * single review prompt. Asserts every call returns 204 so a caller's later assertions are never
+     * vacuous.
+     */
+    public void completeEveryService(UUID appointmentId, String providerToken) {
+        List<UUID> itemIds = jdbcTemplate.queryForList(
+                "SELECT id FROM bookings WHERE appointment_id = ? AND status = 'CONFIRMED' ORDER BY starts_at, id",
+                UUID.class, appointmentId);
+        assertThat(itemIds).as("visit %s must have a CONFIRMED service to complete", appointmentId).isNotEmpty();
+        for (UUID itemId : itemIds) {
+            ResponseEntity<String> resp = restTemplate.exchange(
+                    "/api/v1/appointments/" + appointmentId + "/services/" + itemId + "/complete",
+                    HttpMethod.PATCH, new HttpEntity<>(bearerHeaders(providerToken)), String.class);
+            assertThat(resp.getStatusCode())
+                    .as("per-service complete of %s must succeed — body: %s", itemId, resp.getBody())
+                    .isEqualTo(HttpStatus.NO_CONTENT);
+        }
     }
 
     /**

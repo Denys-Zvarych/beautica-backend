@@ -47,7 +47,7 @@ import java.util.UUID;
 @ServicePriceValid
 public record UpdateServiceDefinitionRequest(
         @Size(min = 1, max = 100, message = "Name must be between 1 and 100 characters")
-        @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "Name must not contain control characters")
+        @Pattern(regexp = ServiceNameConstraints.NAME_REGEX, message = ServiceNameConstraints.NAME_REGEX_MESSAGE)
         String name,
 
         @Size(max = 2000, message = "Description must be at most 2000 characters")

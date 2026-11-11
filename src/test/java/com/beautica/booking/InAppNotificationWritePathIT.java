@@ -147,8 +147,9 @@ class InAppNotificationWritePathIT extends AbstractIntegrationTest {
      * own javadoc), so every walk-in is an appointment CHILD. {@code PATCH
      * /bookings/{id}/decline}/{@code /reschedule} therefore 409s any walk-in via {@code
      * BookingService#assertNotAppointmentChild} ("use /appointments/{id}"); the walk-in
-     * decline/reschedule tests below correctly use the {@code /appointments/{appointmentId}/...}
-     * endpoints instead, exactly as a real caller must.
+     * decline/reschedule tests below correctly use the per-service
+     * {@code /appointments/{appointmentId}/services/{bookingId}/...} endpoints instead, exactly as a
+     * real caller must.
      */
     private UUID createWalkIn(String staffToken, UUID masterId, UUID masterServiceId, ZonedDateTime startsAt) {
         String body = """
@@ -165,6 +166,12 @@ class InAppNotificationWritePathIT extends AbstractIntegrationTest {
         } catch (Exception e) {
             throw new IllegalStateException("Failed to parse walk-in response: " + resp.getBody(), e);
         }
+    }
+
+    /** The single service line of a one-service walk-in visit. */
+    private UUID onlyItemOf(UUID appointmentId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT id FROM bookings WHERE appointment_id = ?", UUID.class, appointmentId);
     }
 
     private ResponseEntity<String> patch(String path, String token, String body) {
@@ -280,29 +287,7 @@ class InAppNotificationWritePathIT extends AbstractIntegrationTest {
         assertThat(recipientsOf(rows)).doesNotContain(masterUserId);
     }
 
-    // ── row 6 — BOOKING_NOT_COMPLETED ──────────────────────────────────────────────────────
-
-    @Test
-    @DisplayName("row 6 — provider marks a no-show: client notified, provider (actor) excluded")
-    void should_notifyClient_when_notCompleted() throws Exception {
-        SalonRig rig = seedSalonRig();
-        UUID clientId = createClient();
-        UUID bookingId = createBooking(
-                fixtures.tokenFor(emailOf(clientId)), rig.masterId(), rig.masterServiceId(), tomorrowAtNoon());
-        jdbcTemplate.update("DELETE FROM in_app_notification");
-
-        String body = objectMapper.writeValueAsString(Map.of("cancellationReason", "CLIENT_NO_SHOW"));
-        ResponseEntity<String> resp = patch("/" + bookingId + "/not-complete", fixtures.tokenFor(rig.ownerEmail()), body);
-        assertThat(resp.getStatusCode()).as("not-complete must succeed — body=%s", resp.getBody())
-                .isEqualTo(HttpStatus.NO_CONTENT);
-
-        List<Map<String, Object>> rows = feedRows();
-        assertThat(rows).hasSize(1);
-        assertThat(rows.get(0).get("recipient_user_id")).isEqualTo(clientId);
-        assertThat(rows.get(0).get("type")).isEqualTo("BOOKING_NOT_COMPLETED");
-    }
-
-    // ── row 4 — BOOKING_RESCHEDULED ─────────────────────────────────────────────────────────
+    // ── row 6 — BOOKING_NOT_COMPLETED: no trigger since phase 475 (legacy feed rows still render) ──
 
     @Test
     @DisplayName("row 4 — provider reschedules: client + performing master notified (provider excluded "
@@ -359,10 +344,11 @@ class InAppNotificationWritePathIT extends AbstractIntegrationTest {
                 fixtures.tokenFor(rig.adminEmail()), rig.masterId(), rig.masterServiceId(), tomorrowAtNoon());
         jdbcTemplate.update("DELETE FROM in_app_notification");
 
-        // Whole-visit decline — a walk-in is ALWAYS an appointment child (see createWalkIn's own
+        // Per-service decline — a walk-in is ALWAYS an appointment child (see createWalkIn's own
         // javadoc), so PATCH /bookings/{id}/decline is the wrong endpoint here and 409s.
+        UUID item = onlyItemOf(appointmentId);
         ResponseEntity<String> resp = restTemplate.exchange(
-                "/api/v1/appointments/" + appointmentId + "/decline", HttpMethod.PATCH,
+                "/api/v1/appointments/" + appointmentId + "/services/" + item + "/decline", HttpMethod.PATCH,
                 new HttpEntity<>("{}", headers(fixtures.tokenFor(rig.ownerEmail()))), String.class);
         assertThat(resp.getStatusCode()).as("decline must succeed — body=%s", resp.getBody())
                 .isEqualTo(HttpStatus.NO_CONTENT);
@@ -371,7 +357,7 @@ class InAppNotificationWritePathIT extends AbstractIntegrationTest {
         assertThat(rows).hasSize(1);
         assertThat(rows.get(0).get("recipient_user_id")).isEqualTo(rig.masterUserId());
         assertThat(rows.get(0).get("type")).isEqualTo("BOOKING_DECLINED");
-        assertThat(rows.get(0).get("appointment_id")).isEqualTo(appointmentId);
+        assertThat(rows.get(0).get("booking_id")).isEqualTo(item);
     }
 
     @Test
@@ -385,8 +371,9 @@ class InAppNotificationWritePathIT extends AbstractIntegrationTest {
 
         String body = objectMapper.writeValueAsString(
                 Map.of("newStartsAt", tomorrowAtNoon().plusHours(2).toOffsetDateTime().toString()));
+        UUID item = onlyItemOf(appointmentId);
         ResponseEntity<String> resp = restTemplate.exchange(
-                "/api/v1/appointments/" + appointmentId + "/reschedule", HttpMethod.PATCH,
+                "/api/v1/appointments/" + appointmentId + "/services/" + item + "/reschedule", HttpMethod.PATCH,
                 new HttpEntity<>(body, headers(fixtures.tokenFor(rig.ownerEmail()))), String.class);
         assertThat(resp.getStatusCode()).as("reschedule must succeed — body=%s", resp.getBody()).isEqualTo(HttpStatus.OK);
 
@@ -394,7 +381,7 @@ class InAppNotificationWritePathIT extends AbstractIntegrationTest {
         assertThat(rows).hasSize(1);
         assertThat(rows.get(0).get("recipient_user_id")).isEqualTo(rig.masterUserId());
         assertThat(rows.get(0).get("type")).isEqualTo("BOOKING_RESCHEDULED");
-        assertThat(rows.get(0).get("appointment_id")).isEqualTo(appointmentId);
+        assertThat(rows.get(0).get("booking_id")).isEqualTo(item);
     }
 
     // ── row 7 — REVIEW_REQUESTED ────────────────────────────────────────────────────────────
@@ -658,49 +645,6 @@ class InAppNotificationWritePathIT extends AbstractIntegrationTest {
     // ── visit granularity ───────────────────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("visit granularity — a 3-service visit cancel writes exactly ONE row per provider-set "
-            + "member, never one per chained booking")
-    void should_writeOneRowPerRecipient_when_multiServiceVisitCancelled() throws Exception {
-        String masterEmail = "visit-master-" + System.nanoTime() + "@beautica.test";
-        UUID masterId = fixtures.createIndependentMaster(masterEmail);
-        UUID s1 = fixtures.createIndependentMasterService(masterId, "Service A");
-        UUID s2 = fixtures.createIndependentMasterService(masterId, "Service B");
-        UUID s3 = fixtures.createIndependentMasterService(masterId, "Service C");
-        fixtures.addWorkingHoursForEveryDay(masterId);
-        UUID masterUserId = jdbcTemplate.queryForObject(
-                "SELECT user_id FROM masters WHERE id = ?", UUID.class, masterId);
-        String clientEmail = "visit-client-" + System.nanoTime() + "@beautica.test";
-        UUID clientId = fixtures.createUser(clientEmail, "CLIENT", null);
-        String clientToken = fixtures.tokenFor(clientEmail);
-
-        String createBody = objectMapper.writeValueAsString(Map.of(
-                "masterId", masterId.toString(),
-                "masterServiceIds", List.of(s1.toString(), s2.toString(), s3.toString()),
-                "startsAt", tomorrowAtNoon().toOffsetDateTime().toString()));
-        ResponseEntity<String> created = restTemplate.exchange(
-                "/api/v1/appointments", HttpMethod.POST, new HttpEntity<>(createBody, headers(clientToken)), String.class);
-        assertThat(created.getStatusCode()).as("visit create must succeed — body=%s", created.getBody())
-                .isEqualTo(HttpStatus.CREATED);
-        UUID appointmentId = UUID.fromString(objectMapper.readTree(created.getBody()).path("data").path("id").asText());
-        jdbcTemplate.update("DELETE FROM in_app_notification");
-
-        ResponseEntity<String> cancelResp = restTemplate.exchange(
-                "/api/v1/appointments/" + appointmentId + "/cancel", HttpMethod.PATCH,
-                new HttpEntity<>("{}", headers(clientToken)), String.class);
-        assertThat(cancelResp.getStatusCode()).as("visit cancel must succeed — body=%s", cancelResp.getBody())
-                .isEqualTo(HttpStatus.NO_CONTENT);
-
-        List<Map<String, Object>> rows = feedRows();
-        assertThat(rows)
-                .as("ONE row for the master, never one per chained booking — a 3-service visit must not "
-                        + "become 3 bell items")
-                .hasSize(1);
-        assertThat(rows.get(0).get("recipient_user_id")).isEqualTo(masterUserId);
-        assertThat(rows.get(0).get("appointment_id")).isEqualTo(appointmentId);
-        assertThat(rows.get(0).get("booking_id")).isNull();
-    }
-
-    @Test
     @DisplayName("visit granularity — a 3-service visit CREATE (salon rig) writes exactly ONE "
             + "BOOKING_CREATED row PER recipient (owner+admin+master), never one per chained service")
     void should_writeOneRowPerRecipient_when_multiServiceVisitCreatedInSalon() throws Exception {
@@ -728,46 +672,6 @@ class InAppNotificationWritePathIT extends AbstractIntegrationTest {
         assertThat(rows).allSatisfy(r -> assertThat(r.get("type")).isEqualTo("BOOKING_CREATED"));
         assertThat(recipientsOf(rows))
                 .containsExactlyInAnyOrder(rig.ownerId(), rig.adminId(), rig.masterUserId());
-    }
-
-    @Test
-    @DisplayName("visit granularity — a 3-service visit whole-visit DECLINE (salon rig) writes exactly "
-            + "ONE BOOKING_DECLINED row per applicable recipient (client + performing master), never one "
-            + "per chained service")
-    void should_writeOneRowPerRecipient_when_multiServiceVisitDeclinedInSalon() throws Exception {
-        SalonRig rig = seedSalonRig();
-        UUID s2 = fixtures.createSalonService(rig.salonId(), rig.masterId());
-        UUID s3 = fixtures.createSalonService(rig.salonId(), rig.masterId());
-        UUID clientId = createClient();
-        String clientToken = fixtures.tokenFor(emailOf(clientId));
-
-        String createBody = objectMapper.writeValueAsString(Map.of(
-                "masterId", rig.masterId().toString(),
-                "masterServiceIds", List.of(rig.masterServiceId().toString(), s2.toString(), s3.toString()),
-                "startsAt", tomorrowAtNoon().toOffsetDateTime().toString()));
-        ResponseEntity<String> created = restTemplate.exchange(
-                "/api/v1/appointments", HttpMethod.POST, new HttpEntity<>(createBody, headers(clientToken)),
-                String.class);
-        assertThat(created.getStatusCode()).as("visit create must succeed — body=%s", created.getBody())
-                .isEqualTo(HttpStatus.CREATED);
-        UUID appointmentId = UUID.fromString(objectMapper.readTree(created.getBody()).path("data").path("id").asText());
-        jdbcTemplate.update("DELETE FROM in_app_notification");
-
-        ResponseEntity<String> declineResp = restTemplate.exchange(
-                "/api/v1/appointments/" + appointmentId + "/decline", HttpMethod.PATCH,
-                new HttpEntity<>("{}", headers(fixtures.tokenFor(rig.ownerEmail()))), String.class);
-        assertThat(declineResp.getStatusCode()).as("visit decline must succeed — body=%s", declineResp.getBody())
-                .isEqualTo(HttpStatus.NO_CONTENT);
-
-        List<Map<String, Object>> rows = feedRows();
-        assertThat(rows)
-                .as("3 chained services declined as ONE visit must write exactly one row per recipient, "
-                        + "never 3x that — a per-service loop would land at 6, and admin must get NOTHING "
-                        + "(row 3's non-acting-owner/admin rule)")
-                .hasSize(2);
-        assertThat(rows).allSatisfy(r -> assertThat(r.get("type")).isEqualTo("BOOKING_DECLINED"));
-        assertThat(recipientsOf(rows)).containsExactlyInAnyOrder(clientId, rig.masterUserId());
-        assertThat(rows.get(0).get("appointment_id")).isEqualTo(appointmentId);
     }
 
     // ── idempotency ──────────────────────────────────────────────────────────────────────────

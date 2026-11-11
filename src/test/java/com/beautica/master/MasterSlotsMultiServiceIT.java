@@ -71,8 +71,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <h2>Seeding</h2>
  * Schedules/services/bookings are seeded via raw JDBC (as {@code BookingAvailabilityAgreementIT} /
  * {@code SlotCalculationScheduleIT} do) so exact intervals and bookings can be pinned. A second service for
- * one owner uses {@link AbstractIntegrationTest#resolveUnusedServiceTypeId} to dodge V121's
- * {@code ux_service_def_owner_service_type_active} unique index.
+ * one owner uses {@link AbstractIntegrationTest#resolveUnusedServiceTypeId} to dodge V233's
+ * {@code ux_service_def_owner_type_duration_name_active} unique index.
  */
 @DisplayName("MasterSlotsMultiServiceIT — repeatable serviceId: Σ-duration slots ⇔ working-days, N=1 legacy, cap, validation (real Postgres, HTTP)")
 class MasterSlotsMultiServiceIT extends AbstractIntegrationTest {

@@ -1,5 +1,6 @@
 package com.beautica.moderation;
 
+import com.beautica.booking.GuestMessageExpectedCopy;
 import com.beautica.booking.service.BookingSmsDispatcher;
 import com.beautica.notification.inapp.entity.InAppNotificationType;
 import com.beautica.notification.inapp.push.InAppPushDispatcher;
@@ -19,6 +20,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.test.util.AopTestUtils;
 
+import java.time.OffsetDateTime;
 import java.time.ZonedDateTime;
 import java.util.ArrayList;
 import java.util.List;
@@ -164,9 +166,9 @@ class BlockCascadeEdgeCasesIT extends AbstractBookingBlockIT {
     }
 
     @Test
-    @DisplayName("guest block on a 2-service LINK visit: exactly ONE provider-cancel SMS for the visit, unchanged "
-            + "text (phase 435: no rebook link), nothing about a block")
-    void should_sendOneSmsPerVisit_when_salonBlocksGuestWithVisit() throws Exception {
+    @DisplayName("guest block on a 2-service LINK visit: ONE provider-cancel SMS PER SERVICE (GST-D13), each naming "
+            + "its own service's start, unchanged text (phase 435: no rebook link), nothing about a block")
+    void should_sendOneSmsPerService_when_salonBlocksGuestWithVisit() throws Exception {
         SalonFixture salon = createSalon();
         UUID first = makeSalonMasterBookable(salon.salonId(), salon.masterId());
         UUID second = assignmentOf(
@@ -178,6 +180,9 @@ class BlockCascadeEdgeCasesIT extends AbstractBookingBlockIT {
         UUID anyItem = UUID.fromString(readTree(created).path("bookingId").asText());
         UUID visitId = jdbcTemplate.queryForObject(
                 "SELECT appointment_id FROM bookings WHERE id = ?", UUID.class, anyItem);
+        List<OffsetDateTime> serviceStarts = jdbcTemplate.queryForList(
+                "SELECT starts_at FROM bookings WHERE appointment_id = ? ORDER BY starts_at", OffsetDateTime.class,
+                visitId);
         UUID source = insertGuestBooking(salon, "LINK", GUEST_PHONE);
 
         ResponseEntity<String> resp = postBlock(tokenFor(salon.ownerEmail()), source);
@@ -188,17 +193,20 @@ class BlockCascadeEdgeCasesIT extends AbstractBookingBlockIT {
                 "SELECT status FROM bookings WHERE appointment_id = ?", String.class, visitId))
                 .containsExactly("DECLINED", "DECLINED");
         ArgumentCaptor<String> text = ArgumentCaptor.forClass(String.class);
-        verify(bookingSmsDispatcher, times(1)).dispatchOrThrow(
+        verify(bookingSmsDispatcher, times(2)).dispatchOrThrow(
                 eq(BookingSmsDispatcher.Kind.GUEST_PROVIDER_CANCELLATION), eq(GUEST_PHONE), text.capture());
         String cancelUrl = readTree(created).path("cancelUrl").asText();
         assertThat(cancelUrl).matches("^https?://.+/c/[0-9A-Za-z]{16}$");
-        assertThat(text.getValue())
-                .startsWith("Beautica: Ваш запис ")
-                .as("phase 435: the sealed visit links the guest's own booking page")
-                .endsWith(" скасовано.\n\nДеталі або записатись знову " + cancelUrl)
-                .as("phase 435: no rebook link")
+        assertThat(serviceStarts).as("fixture: two services at distinct starts").hasSize(2).doesNotHaveDuplicates();
+        assertThat(text.getAllValues())
+                .as("GST-D13: one message per cancelled service, each its own start; phase 435: the sealed visit "
+                        + "links the guest's own page, no rebook link")
+                .containsExactlyInAnyOrderElementsOf(serviceStarts.stream()
+                        .map(start -> GuestMessageExpectedCopy.providerCancellationWithDetails(start, cancelUrl))
+                        .toList());
+        assertThat(text.getAllValues()).allSatisfy(body -> assertThat(body)
                 .doesNotContain(salonSlug)
-                .doesNotContainIgnoringCase("блок");
+                .doesNotContainIgnoringCase("блок"));
     }
 
     @Test

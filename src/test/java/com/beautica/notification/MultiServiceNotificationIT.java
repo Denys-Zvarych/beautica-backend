@@ -138,7 +138,7 @@ class MultiServiceNotificationIT extends AbstractIntegrationTest {
             real.sendBookingConfirmedEmail(inv.getArgument(0), inv.getArgument(1));
             return null;
         }).when(emailNotificationService).sendBookingConfirmedEmail(anyString(), any(BookingVisit.class));
-        // BOTH decline routes are wired: the whole-visit one and the per-item one must render for
+        // BOTH decline e-mails are wired: the whole-visit one and the per-item one must render for
         // real, or the test that pins them apart could only ever observe one of the two.
         doAnswer(inv -> {
             real.sendVisitDeclinedEmail(inv.getArgument(0), inv.getArgument(1));
@@ -261,35 +261,6 @@ class MultiServiceNotificationIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("a WHOLE-VISIT provider decline mails the client EVERY cancelled service — naming "
-            + "only the lead left them turning up for the rest")
-    void should_nameEveryCancelledService_when_theProviderDeclinesTheWholeVisit() throws Exception {
-        BookingTestFixtures.VisitFixture visit = fixtures.createConfirmedVisit(
-                "decline-notif", List.of("Стрижка", "Фарбування", "Укладка"));
-        nameUser(visit.clientId(), "Марія", "Коваленко");
-        drainWorker.drain();                       // flush the two create-time rows
-        outboxRepository.deleteAll();
-        org.mockito.Mockito.reset(mailSender);
-        Session session = Session.getInstance(new Properties());
-        when(mailSender.createMimeMessage()).thenAnswer(inv -> new MimeMessage(session));
-
-        declineWholeVisit(visit);
-        drainWorker.drain();
-
-        ArgumentCaptor<MimeMessage> captor = ArgumentCaptor.forClass(MimeMessage.class);
-        verify(mailSender, times(1)).send(captor.capture());
-        String body = htmlBodyOf(captor.getValue());
-        assertThat(recipientOf(captor.getValue())).isEqualTo(emailOfUser(visit.clientId()));
-        assertThat(body)
-                .as("declineAppointment terminates the header AND every item but enqueues ONE "
-                        + "STATUS_CHANGED keyed to the lead — all three must still be named. body=%s", body)
-                .contains("Стрижка")
-                .contains("Фарбування")
-                .contains("Укладка");
-        assertVisitOrder(body);
-    }
-
-    @Test
     @DisplayName("a PER-SERVICE decline mails the client ONLY the cancelled service — the siblings "
             + "are still on and must not be announced as cancelled")
     void should_nameOnlyTheDeclinedService_when_theProviderDeclinesOneServiceOfTheVisit() throws Exception {
@@ -388,19 +359,6 @@ class MultiServiceNotificationIT extends AbstractIntegrationTest {
     }
 
     // ── helpers ──────────────────────────────────────────────────────────────
-
-    /** {@code PATCH /appointments/{id}/decline} — the provider cancels the WHOLE visit. */
-    private void declineWholeVisit(BookingTestFixtures.VisitFixture visit) {
-        HttpHeaders headers = fixtures.bearerHeaders(visit.masterToken());
-        headers.setContentType(MediaType.APPLICATION_JSON);
-        ResponseEntity<String> resp = restTemplate.exchange(
-                "/api/v1/appointments/" + visit.id() + "/decline",
-                HttpMethod.PATCH, new HttpEntity<>("{}", headers), String.class);
-        assertThat(resp.getStatusCode().is2xxSuccessful())
-                .as("the decline must succeed or the e-mail assertions below are vacuous — body: %s",
-                        resp.getBody())
-                .isTrue();
-    }
 
     /** {@code PATCH /appointments/{id}/services/{bookingId}/decline} — ONE service line only. */
     private void declineOneService(BookingTestFixtures.VisitFixture visit, UUID bookingId) {

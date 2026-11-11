@@ -625,7 +625,7 @@ class AppointmentCreateIT extends AbstractIntegrationTest {
         UUID masterId = fixtures.createIndependentMaster(masterEmail);
         String clientEmail = "appt-cap-client-" + System.nanoTime() + "@beautica.test";
         UUID clientUserId = fixtures.createUser(clientEmail, "CLIENT", null);
-        // 350 + 350 = 700 min > MAX_TOTAL_DURATION_MINUTES (600). Two distinct services (V121-safe).
+        // 350 + 350 = 700 min > MAX_TOTAL_DURATION_MINUTES (600). Two distinct services (V233-safe).
         UUID serviceA = createFixedService(masterId, 350, 0, new BigDecimal("300.00"));
         UUID serviceB = createFixedService(masterId, 350, 0, new BigDecimal("300.00"));
         addWorkingHoursForEveryDay(masterId);
@@ -818,8 +818,8 @@ class AppointmentCreateIT extends AbstractIntegrationTest {
      * — the smoke fixture's {@code createIndependentMasterService} is hardcoded to 60min/0-buffer/₴500,
      * which cannot exercise contiguity-with-buffers, the total-duration cap, or per-item duration
      * freeze. Uses {@link com.beautica.AbstractIntegrationTest#resolveUnusedServiceTypeId} (via the
-     * fixture) so a second service for the same owner does not collide on V121's
-     * {@code ux_service_def_owner_service_type_active}.
+     * fixture) so a second service for the same owner does not collide on V233's
+     * {@code ux_service_def_owner_type_duration_name_active}.
      */
     private UUID createFixedService(UUID masterId, int durationMinutes, int bufferMinutes, BigDecimal basePrice) {
         UUID userId = jdbcTemplate.queryForObject(

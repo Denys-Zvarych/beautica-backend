@@ -274,6 +274,42 @@ public interface InAppNotificationRepository extends Repository<InAppNotificatio
             @Param("subjectUserId") UUID subjectUserId,
             @Param("dedupKey") String dedupKey);
 
+    /**
+     * Phase 474 audit-fix (perf, finding 1) — the MULTI-event form of {@link #insertForRecipients}: one
+     * statement writes the feed rows of MANY booking/visit events of the same {@code type}, for a caller that
+     * already holds every event's loaded graph (the schedule-override mass decline). Rows arrive as parallel
+     * arrays ({@code recipientIds[i]} gets {@code bookingIds[i]} / {@code appointmentIds[i]} /
+     * {@code salonIds[i]} / {@code dedupKeys[i]}) — the {@code unnest} shape {@link #insertModerationOutcomes}
+     * already uses — so the bind count is fixed (six parameters) whatever the row count, and a write declining
+     * V visits costs ONE statement, not V. Recipients/keys/salon are resolved in JAVA by the same switch
+     * {@code notifyBookingEvent}/{@code notifyVisitEvent} use, so each row is byte-identical to what those
+     * per-event calls would write (the SQL-LATERAL shape of {@link #insertProviderSetBulk} would re-derive the
+     * salon from {@code masters.salon_id}, not the booking's own salon, and could not express the decline
+     * recipient set). Driven by {@code users} like {@link #insertForRecipients}; {@code subject_user_id} stays
+     * {@code NULL}. A {@code NULL} array element ({@code booking_id} of a visit-keyed row, {@code salon_id} of an
+     * independent master) is bound as SQL {@code NULL}.
+     *
+     * @return the number of rows actually inserted
+     */
+    @Modifying
+    @Query(value = """
+            INSERT INTO in_app_notification
+                (id, recipient_user_id, type, booking_id, appointment_id, salon_id, dedup_key)
+            SELECT gen_random_uuid(), u.id, :type, v.booking_id, v.appointment_id, v.salon_id, v.dedup_key
+              FROM unnest(CAST(:recipientIds AS uuid[]), CAST(:bookingIds AS uuid[]),
+                          CAST(:appointmentIds AS uuid[]), CAST(:salonIds AS uuid[]), CAST(:dedupKeys AS text[]))
+                   AS v(recipient_id, booking_id, appointment_id, salon_id, dedup_key)
+              JOIN users u ON u.id = v.recipient_id
+            ON CONFLICT (recipient_user_id, dedup_key) DO NOTHING
+            """, nativeQuery = true)
+    int insertEventRowsBulk(
+            @Param("type") String type,
+            @Param("recipientIds") UUID[] recipientIds,
+            @Param("bookingIds") UUID[] bookingIds,
+            @Param("appointmentIds") UUID[] appointmentIds,
+            @Param("salonIds") UUID[] salonIds,
+            @Param("dedupKeys") String[] dedupKeys);
+
     // ── Phase 339 — push twins ───────────────────────────────────────────────────────────────────
     // Each twin is its non-push sibling's statement, verbatim, wrapped as the data-modifying CTE
     // `ins` (RETURNING id) plus ONE outer INSERT into notification_outbox that selects only what
@@ -405,6 +441,33 @@ public interface InAppNotificationRepository extends Repository<InAppNotificatio
             @Param("types") String[] types,
             @Param("targetType") String targetType,
             @Param("batchReportId") UUID batchReportId);
+
+    /** Push twin of {@link #insertEventRowsBulk}. */
+    @Modifying
+    @Query(value = """
+            WITH ins AS (
+                INSERT INTO in_app_notification
+                    (id, recipient_user_id, type, booking_id, appointment_id, salon_id, dedup_key)
+                SELECT gen_random_uuid(), u.id, :type, v.booking_id, v.appointment_id, v.salon_id, v.dedup_key
+                  FROM unnest(CAST(:recipientIds AS uuid[]), CAST(:bookingIds AS uuid[]),
+                              CAST(:appointmentIds AS uuid[]), CAST(:salonIds AS uuid[]), CAST(:dedupKeys AS text[]))
+                       AS v(recipient_id, booking_id, appointment_id, salon_id, dedup_key)
+                  JOIN users u ON u.id = v.recipient_id
+                ON CONFLICT (recipient_user_id, dedup_key) DO NOTHING
+                RETURNING id, recipient_user_id
+            )
+            INSERT INTO notification_outbox (event_type, aggregate_id)
+            SELECT 'INAPP_PUSH', ins.id FROM ins
+             WHERE EXISTS (SELECT 1 FROM device_tokens dt
+                            WHERE dt.user_id = ins.recipient_user_id AND dt.is_active)
+            """, nativeQuery = true)
+    int insertEventRowsBulkWithPush(
+            @Param("type") String type,
+            @Param("recipientIds") UUID[] recipientIds,
+            @Param("bookingIds") UUID[] bookingIds,
+            @Param("appointmentIds") UUID[] appointmentIds,
+            @Param("salonIds") UUID[] salonIds,
+            @Param("dedupKeys") String[] dedupKeys);
 
     /** Push twin of {@link #insertClientOnlyBulk}. */
     @Modifying

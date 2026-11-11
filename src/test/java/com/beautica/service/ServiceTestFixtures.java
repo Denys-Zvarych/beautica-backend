@@ -4,12 +4,15 @@ import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.LoginRequest;
 import com.beautica.auth.dto.RegisterIndependentMasterRequest;
 import com.beautica.common.ApiResponse;
+import com.beautica.service.dto.BulkCreateServicesRequest;
+import com.beautica.service.dto.BulkServiceItemRequest;
 import com.beautica.service.dto.CreateServiceDefinitionRequest;
 import com.beautica.service.entity.PriceType;
 import com.beautica.service.dto.MasterServiceResponse;
 import com.beautica.service.dto.ServiceDefinitionResponse;
 import com.beautica.support.LocalityTestLookup;
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.core.io.ClassPathResource;
@@ -25,13 +28,20 @@ import org.springframework.security.crypto.password.PasswordEncoder;
 import java.io.InputStream;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
+import java.util.Locale;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 public class ServiceTestFixtures {
 
     static final String TEST_PASSWORD = "Str0ngP@ss1!";
+
+    /** Seeds per-JVM unique phone suffixes so repeated independent-master registrations never collide. */
+    private static final AtomicLong PHONE_SEQUENCE = new AtomicLong(System.nanoTime() % 10_000_000L);
+    private static final long PHONE_SUFFIX_SPACE = 10_000_000L;
 
     private final TestRestTemplate restTemplate;
     private final JdbcTemplate jdbcTemplate;
@@ -50,7 +60,10 @@ public class ServiceTestFixtures {
         this.passwordEncoder = passwordEncoder;
     }
 
-    public String createSalonOwnerAndGetToken(String email) throws Exception {
+    public String createSalonOwnerAndGetToken(String rawEmail) throws Exception {
+        // Store the email the way /auth/login normalises it (lower-case), so a mixed-case caller
+        // still finds its user.
+        String email = rawEmail.toLowerCase(Locale.ROOT);
         String hash = passwordEncoder.encode(TEST_PASSWORD);
         jdbcTemplate.update(
                 "INSERT INTO users (id, email, password_hash, role, is_active, email_verified) VALUES (?, ?, ?, 'SALON_OWNER', true, true)",
@@ -164,17 +177,27 @@ public class ServiceTestFixtures {
     }
 
     String createIndependentMasterAndGetToken(String email) throws Exception {
-        var request = new RegisterIndependentMasterRequest(email, TEST_PASSWORD, "Anna", "Kovalenko", "+380501234567");
+        var request = new RegisterIndependentMasterRequest(email, TEST_PASSWORD, "Anna", "Kovalenko", nextUniquePhone(),
+                true, "2026-11-07", "2026-10-20"); // phase 442: full consent is the default fixture path
         ResponseEntity<String> resp = restTemplate.postForEntity(
                 "/api/v1/auth/register/independent-master", request, String.class);
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
         // Phase 1.7: registration no longer issues tokens; mark email verified then login.
-        jdbcTemplate.update("UPDATE users SET email_verified = true WHERE email = ?", email);
+        // Registration stores the email lower-cased, so match it the same way; a silent 0-row
+        // update would leave the account unverified and fail the login below misleadingly.
+        int verified = jdbcTemplate.update(
+                "UPDATE users SET email_verified = true WHERE email = lower(?)", email);
+        assertThat(verified).as("verify UPDATE must hit the registered row for %s", email).isEqualTo(1);
         ResponseEntity<String> loginResp = restTemplate.postForEntity(
                 "/api/v1/auth/login", new LoginRequest(email, TEST_PASSWORD), String.class);
         assertThat(loginResp.getStatusCode()).isEqualTo(HttpStatus.OK);
         var body = objectMapper.readValue(loginResp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
         return body.data().accessToken();
+    }
+
+    /** A fresh, valid Ukrainian mobile number ({@code +38050} + 7 digits), unique within the JVM. */
+    private static String nextUniquePhone() {
+        return String.format("+38050%07d", PHONE_SEQUENCE.getAndIncrement() % PHONE_SUFFIX_SPACE);
     }
 
     UUID createIndependentMasterService(String indepToken, String name) throws Exception {
@@ -403,14 +426,23 @@ public class ServiceTestFixtures {
      * shape instead of re-deriving it (REUSE-FIRST).
      */
     UUID insertActiveDefinitionWithoutAssignment(UUID masterId, UUID serviceTypeId) {
+        return insertActiveDefinitionWithoutAssignment(masterId, serviceTypeId, "Orphaned Active Service");
+    }
+
+    /**
+     * Same row as {@link #insertActiveDefinitionWithoutAssignment(UUID, UUID)} (60 хв) with an explicit
+     * {@code name}. Phase 464: the duplicate key includes the name, so a test that wants a bulk item
+     * (which always stores the type's {@code nameUk}) to collide with this row passes that name.
+     */
+    UUID insertActiveDefinitionWithoutAssignment(UUID masterId, UUID serviceTypeId, String name) {
         UUID defId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO service_definitions (id, owner_type, owner_id, name, service_type_id, "
                         + "base_duration_minutes, price_type, base_price, buffer_minutes_after, "
                         + "is_active, created_at, updated_at) "
-                        + "VALUES (?, 'INDEPENDENT_MASTER', ?, 'Orphaned Active Service', ?, 60, "
+                        + "VALUES (?, 'INDEPENDENT_MASTER', ?, ?, ?, 60, "
                         + "'FIXED', 400.00, 0, true, NOW(), NOW())",
-                defId, masterId, serviceTypeId);
+                defId, masterId, name, serviceTypeId);
         return defId;
     }
 
@@ -449,5 +481,57 @@ public class ServiceTestFixtures {
         headers.setBearerAuth(token);
         headers.setContentType(MediaType.APPLICATION_JSON);
         return headers;
+    }
+
+    // ── service copies (phases 464–466) — shared by the copy ITs ──────────────────
+
+    /** Unnamed FIXED bulk item: stored under the type's {@code nameUk}. */
+    static BulkServiceItemRequest bulkItem(UUID typeId, int duration, String price) {
+        return new BulkServiceItemRequest(typeId, duration, PriceType.FIXED, new BigDecimal(price), null, null);
+    }
+
+    /** Named FIXED bulk item: a copy distinct from the default-name one unless the names fold equal. */
+    static BulkServiceItemRequest namedBulkItem(UUID typeId, int duration, String price, String name) {
+        return new BulkServiceItemRequest(typeId, duration, PriceType.FIXED, new BigDecimal(price), null, null, name);
+    }
+
+    ResponseEntity<String> postIndependentBulk(String token, List<BulkServiceItemRequest> items) {
+        return restTemplate.exchange("/api/v1/independent-masters/me/services/bulk", HttpMethod.POST,
+                new HttpEntity<>(new BulkCreateServicesRequest(items), bearerHeaders(token)), String.class);
+    }
+
+    ResponseEntity<String> postSalonBulk(String token, UUID salonId, UUID masterId,
+            List<BulkServiceItemRequest> items) {
+        return restTemplate.exchange(
+                "/api/v1/salons/" + salonId + "/masters/" + masterId + "/services/bulk", HttpMethod.POST,
+                new HttpEntity<>(new BulkCreateServicesRequest(items), bearerHeaders(token)), String.class);
+    }
+
+    /** The {@code data} node of an {@code ApiResponse} body. */
+    JsonNode data(ResponseEntity<String> resp) throws Exception {
+        return objectMapper.readTree(resp.getBody()).path("data");
+    }
+
+    /** 409 {@code DUPLICATE_SERVICE} whose {@code existingServiceDefId} names {@code existingId}. */
+    void assertDuplicateOf(ResponseEntity<String> resp, String existingId) throws Exception {
+        assertThat(resp.getStatusCode()).as("body: %s", resp.getBody()).isEqualTo(HttpStatus.CONFLICT);
+        JsonNode body = data(resp);
+        assertThat(body.path("code").asText()).isEqualTo("DUPLICATE_SERVICE");
+        assertThat(body.path("existingServiceDefId").asText()).isEqualTo(existingId);
+    }
+
+    /**
+     * The in-request duplicate 400 ({@code rejectDuplicateCopiesInRequest}): {@code handleBusiness}'s
+     * genericised body — {@code success=false}, message {@code "Invalid request"}, no {@code data} —
+     * so it can never be mistaken for the {@code DUPLICATE_SERVICE} 409 or the
+     * {@code SERVICE_PRICE_SHAPE_MISMATCH} 400, which both carry a {@code data.code}.
+     */
+    void assertInRequestDuplicate400(ResponseEntity<String> resp) throws Exception {
+        assertThat(resp.getStatusCode()).as("body: %s", resp.getBody()).isEqualTo(HttpStatus.BAD_REQUEST);
+        JsonNode body = objectMapper.readTree(resp.getBody());
+        assertThat(body.path("success").asBoolean(true)).isFalse();
+        assertThat(body.path("message").asText()).isEqualTo("Invalid request");
+        assertThat(body.path("data").path("code").isMissingNode())
+                .as("no branchable code — not the 409 DUPLICATE_SERVICE nor a price-shape 400").isTrue();
     }
 }

@@ -402,6 +402,7 @@ public class InviteService {
                 request.phoneNumber(),
                 token.getSalonId()
         );
+        TermsConsentStamp.apply(user, request, clock.instant());
         var savedUser = userRepository.save(user);
 
         if (token.getRole() == Role.SALON_MASTER) {

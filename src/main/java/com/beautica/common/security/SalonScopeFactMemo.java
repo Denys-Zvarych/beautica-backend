@@ -22,7 +22,7 @@ import java.util.function.BooleanSupplier;
  * <h2>The duplication it removes</h2>
  * {@code PATCH /salons/{salonId}/masters/{masterId}/services/{serviceDefId}} authorizes twice by
  * design: the controller's {@code @PreAuthorize} runs
- * {@code AuthorizationService#canEditMasterServiceBand}, and the service re-proves the same grant
+ * {@code AuthorizationService#canManageSalon} (Phase 463; formerly {@code canEditMasterServiceBand}), and the service re-proves the same grant
  * through {@code AuthorizationService#enforceCanEditMasterServiceBand} so a non-HTTP caller cannot
  * bypass it (anti-bug §D defense-in-depth). For a {@code SALON_OWNER} actor that meant FOUR
  * authorization statements per request, two of them byte-identical repeats of the other two. The

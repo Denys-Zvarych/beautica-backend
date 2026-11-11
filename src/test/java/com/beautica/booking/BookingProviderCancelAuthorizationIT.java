@@ -34,16 +34,16 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * Phase 24.7 — the provider-cancellation authorization matrix for {@code PATCH /decline} and
- * {@code PATCH /not-complete} (track 24.x, decisions D1/D2), plus the two adjacent regressions
+ * Phase 24.7 — the provider-cancellation authorization matrix for {@code PATCH /decline}
+ * (track 24.x, decision D1; the {@code /not-complete} half was removed with that route in phase 475),
+ * plus the two adjacent regressions
  * the phase doc calls out explicitly: a guest-booking decline must drain the outbox cleanly (no
  * DEAD row — Risk R4 closed in 24.4), and the {@code assertTransition} state-machine guard must
  * reject a decline/complete attempted from a terminal, non-{@code CONFIRMED} source status.
  *
  * <p><b>Deliberately NOT re-covered here</b> (already asserted elsewhere — no duplication):
- * SALON_OWNER ✅ on {@code /decline} ({@link BookingIntegrationTest}) and on {@code /not-complete}
- * ({@link BookingIntegrationTest}); assigned SALON_ADMIN ✅ on both endpoints
- * ({@link BookingCompletionSecurityIT}, Decisions D1/D2); SALON_MASTER ❌ on {@code /decline}
+ * SALON_OWNER ✅ on {@code /decline} ({@link BookingIntegrationTest}); assigned SALON_ADMIN ✅
+ * ({@link BookingCompletionSecurityIT}, Decision D1); SALON_MASTER ❌ on {@code /decline}
  * ({@link BookingSecurityTest}); cross-tenant SALON_OWNER ❌ on {@code /decline}
  * ({@link BookingSecurityTest}).
  *
@@ -56,7 +56,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * performs real network I/O.
  */
 @Import(TestSecurityConfig.class)
-@DisplayName("Booking provider-cancellation — /decline + /not-complete authorization matrix (Phase 24.7)")
+@DisplayName("Booking provider-cancellation — /decline authorization matrix (Phase 24.7)")
 class BookingProviderCancelAuthorizationIT extends AbstractIntegrationTest {
 
     private static final String BOOKINGS_URL = "/api/v1/bookings";
@@ -154,121 +154,8 @@ class BookingProviderCancelAuthorizationIT extends AbstractIntegrationTest {
         assertThat(dbStatus(bookingA)).isEqualTo("CONFIRMED");
     }
 
-    // ── /not-complete — actors missing from the existing matrix ──────────────────
-
-    @Test
-    @DisplayName("PATCH /not-complete — INDEPENDENT_MASTER marking their own CONFIRMED booking not-complete returns 204")
-    void should_return204_when_independentMasterMarksOwnConfirmedBookingNotComplete() {
-        String masterEmail = "provcancel-nc-im-" + System.nanoTime() + "@beautica.test";
-        UUID masterId = createIndependentMaster(masterEmail);
-        UUID clientId = createUser("provcancel-nc-im-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
-        UUID masterServiceId = createIndependentMasterService(masterId);
-        UUID bookingId = insertElapsedConfirmedBooking(clientId, masterId, masterServiceId, null);
-
-        ResponseEntity<Void> resp = patchNotComplete(bookingId, tokenFor(masterEmail));
-
-        assertThat(resp.getStatusCode())
-                .as("independent master marking own booking not-complete must return 204")
-                .isEqualTo(HttpStatus.NO_CONTENT);
-        assertThat(dbStatus(bookingId)).isEqualTo("NOT_COMPLETED");
-    }
-
-    @Test
-    @DisplayName("PATCH /not-complete — SALON_ADMIN assigned to a DIFFERENT salon is denied with 403")
-    void should_return403_when_unassignedAdminMarksAnotherSalonsBookingNotComplete() {
-        Salon salonA = createSalon("provcancel-nc-unassigned-a-" + System.nanoTime() + "@beautica.test");
-        Salon salonB = createSalon("provcancel-nc-unassigned-b-" + System.nanoTime() + "@beautica.test");
-        String unassignedAdminEmail = "provcancel-nc-unassigned-admin-" + System.nanoTime() + "@beautica.test";
-        createUser(unassignedAdminEmail, "SALON_ADMIN", salonB.salonId);
-        UUID bookingId = insertConfirmedSalonBooking(salonA);
-
-        ResponseEntity<Void> resp = patchNotComplete(bookingId, tokenFor(unassignedAdminEmail));
-
-        assertThat(resp.getStatusCode())
-                .as("SALON_ADMIN assigned to salon B must be denied marking salon A's booking not-complete")
-                .isEqualTo(HttpStatus.FORBIDDEN);
-        assertThat(dbStatus(bookingId)).isEqualTo("CONFIRMED");
-    }
-
-    @Test
-    @DisplayName("PATCH /not-complete — CLIENT is denied with 403")
-    void should_return403_when_clientAttemptsNotComplete() {
-        Salon salon = createSalon("provcancel-nc-client-owner-" + System.nanoTime() + "@beautica.test");
-        UUID bookingId = insertConfirmedSalonBooking(salon);
-        String clientEmail = "provcancel-nc-client-" + System.nanoTime() + "@beautica.test";
-        createUser(clientEmail, "CLIENT", null);
-
-        ResponseEntity<Void> resp = patchNotComplete(bookingId, tokenFor(clientEmail));
-
-        assertThat(resp.getStatusCode())
-                .as("CLIENT must be denied /not-complete")
-                .isEqualTo(HttpStatus.FORBIDDEN);
-        assertThat(dbStatus(bookingId)).isEqualTo("CONFIRMED");
-    }
-
-    @Test
-    @DisplayName("PATCH /not-complete — SALON_MASTER (read-only role) is denied with 403")
-    void should_return403_when_salonMasterAttemptsNotComplete() {
-        Salon salon = createSalon("provcancel-nc-sm-owner-" + System.nanoTime() + "@beautica.test");
-        UUID bookingId = insertConfirmedSalonBooking(salon);
-
-        ResponseEntity<Void> resp = patchNotComplete(bookingId, tokenFor(salon.masterEmail));
-
-        assertThat(resp.getStatusCode())
-                .as("SALON_MASTER must be denied /not-complete — 403")
-                .isEqualTo(HttpStatus.FORBIDDEN);
-        assertThat(dbStatus(bookingId)).isEqualTo("CONFIRMED");
-    }
-
-    @Test
-    @DisplayName("PATCH /not-complete — INDEPENDENT_MASTER marking another master's booking not-complete is denied with 403")
-    void should_return403_when_independentMasterMarksAnotherMastersBookingNotComplete() {
-        UUID masterA = createIndependentMaster("provcancel-nc-im-a-" + System.nanoTime() + "@beautica.test");
-        UUID masterServiceA = createIndependentMasterService(masterA);
-        UUID clientId = createUser("provcancel-nc-im-client-b-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
-        UUID bookingA = insertConfirmedBooking(clientId, masterA, masterServiceA, null);
-
-        String masterBEmail = "provcancel-nc-im-b-" + System.nanoTime() + "@beautica.test";
-        createIndependentMaster(masterBEmail);
-
-        ResponseEntity<Void> resp = patchNotComplete(bookingA, tokenFor(masterBEmail));
-
-        assertThat(resp.getStatusCode())
-                .as("independent master B must not mark master A's booking not-complete — 403")
-                .isEqualTo(HttpStatus.FORBIDDEN);
-        assertThat(dbStatus(bookingA)).isEqualTo("CONFIRMED");
-    }
-
-    // ── anti-oracle pin: nonexistent booking must deny UNIFORMLY (403, not 404) ────────────────
-    // EXPECTED RED as of this writing — this pins the intended final behaviour for the incoming
-    // MEDIUM fix (existence-oracle on /not-complete). When Phase 24.7 dropped the redundant
-    // `@authz.canCancelBooking` SpEL clause from the @PreAuthorize (leaving it role-only), the gate
-    // no longer rejects an unknown booking id before the service runs. The service then hits
-    // BookingService.loadBookingOrThrow → findByIdWithFullGraph.orElseThrow(NotFoundException) → 404,
-    // which LEAKS existence: a valid provider learns "this id does not exist" (404) vs. "this id
-    // exists but is not yours" (403 — the foreign-booking cases above). The sibling /decline and
-    // /complete answer 403 uniformly because their SpEL predicate returns false for a missing id.
-    // The fix (mirror cancelBooking's Finding-8 collapse: existence + ownership → one uniform 403)
-    // must make this GREEN. Do NOT weaken this to expect 404.
-    @Test
-    @DisplayName("PATCH /not-complete — a valid provider hitting a NONEXISTENT bookingId must be denied "
-            + "with 403 (uniform with the foreign-booking denials), NOT 404 — anti existence-oracle pin "
-            + "[EXPECTED RED until the MEDIUM oracle fix lands]")
-    void should_return403_not404_when_providerNotCompletesNonexistentBooking() {
-        // A fully-valid SALON_OWNER provider — the role gate passes, so only the service-layer
-        // existence/ownership handling decides the status code.
-        Salon salon = createSalon("provcancel-nc-oracle-owner-" + System.nanoTime() + "@beautica.test");
-        UUID nonexistentBookingId = UUID.randomUUID();
-
-        ResponseEntity<Void> resp = patchNotComplete(nonexistentBookingId, tokenFor(salon.ownerEmail));
-
-        assertThat(resp.getStatusCode())
-                .as("a nonexistent booking id must be indistinguishable from a foreign one — both 403, "
-                        + "never a 404 that confirms the id does not exist (existence oracle)")
-                .isEqualTo(HttpStatus.FORBIDDEN);
-    }
-
-    // ── anti-oracle pins: /decline + /complete mirror the /not-complete collapse above ─────────────
+    // ── anti-oracle pins: /decline + /complete collapse a missing id to 403 (the /not-complete pin
+    //    that used to sit above was removed with that route in phase 475) ─────────────
     // Final audit pass: before this batch /decline and /complete loaded via loadBookingOrThrow → 404
     // for a missing id BEFORE the ownership guard, an existence oracle letting a valid provider
     // distinguish "doesn't-exist" (404) from "exists-but-not-mine" (403). Both now collapse a missing
@@ -308,24 +195,6 @@ class BookingProviderCancelAuthorizationIT extends AbstractIntegrationTest {
                 .isEqualTo(HttpStatus.FORBIDDEN);
     }
 
-    @Test
-    @DisplayName("Phase 25.9: PATCH /not-complete — 204 when comment is absent from the request body "
-            + "(the note is optional for all roles)")
-    void should_return204_when_notCompleteHasNoComment() {
-        Salon salon = createSalon("provcancel-nc-nocomment-owner-" + System.nanoTime() + "@beautica.test");
-        UUID bookingId = insertElapsedConfirmedSalonBooking(salon);
-
-        ResponseEntity<Void> resp = restTemplate.exchange(
-                BOOKINGS_URL + "/" + bookingId + "/not-complete", HttpMethod.PATCH,
-                new HttpEntity<>("{\"cancellationReason\":\"CLIENT_NO_SHOW\"}", bearerHeaders(tokenFor(salon.ownerEmail))),
-                Void.class);
-
-        assertThat(resp.getStatusCode())
-                .as("marking not-complete with no comment must return 204")
-                .isEqualTo(HttpStatus.NO_CONTENT);
-        assertThat(dbStatus(bookingId)).isEqualTo("NOT_COMPLETED");
-    }
-
     // ── guest (LINK) booking decline — Risk R4 regression ─────────────────────────
 
     /**
@@ -344,7 +213,7 @@ class BookingProviderCancelAuthorizationIT extends AbstractIntegrationTest {
      * touches {@code b.client}), so this is not an authorization bug — it is a data-access bug
      * that 404s the ENTIRE provider-side lifecycle for a guest booking: {@code GET /bookings/{id}}
      * ({@code BookingService.getBooking} uses the same query), {@code /complete}, {@code /decline},
-     * and {@code /not-complete} all go through {@code loadBookingOrThrow} and are equally broken.
+     * all go through {@code loadBookingOrThrow} and are equally broken.
      * Reported as a CRITICAL finding — do not fix the query in this file (test-only scope); route
      * to {@code backend-dev} for a {@code LEFT JOIN FETCH b.client} fix.
      */
@@ -510,15 +379,6 @@ class BookingProviderCancelAuthorizationIT extends AbstractIntegrationTest {
                 Void.class);
     }
 
-    private ResponseEntity<Void> patchNotComplete(UUID bookingId, String token) {
-        return restTemplate.exchange(
-                BOOKINGS_URL + "/" + bookingId + "/not-complete", HttpMethod.PATCH,
-                new HttpEntity<>(
-                        "{\"cancellationReason\":\"CLIENT_NO_SHOW\",\"comment\":\"Клієнт не з'явився\"}",
-                        bearerHeaders(token)),
-                Void.class);
-    }
-
     private String tokenFor(String email) {
         ResponseEntity<String> resp = restTemplate.postForEntity(
                 "/api/v1/auth/login", new LoginRequest(email, TEST_PASSWORD), String.class);
@@ -636,30 +496,6 @@ class BookingProviderCancelAuthorizationIT extends AbstractIntegrationTest {
                         "500.00, 60, 0, 'APP', NOW(), NOW())",
                 bookingId, clientId, masterId, masterServiceId, salonId);
         return bookingId;
-    }
-
-    /**
-     * ELAPSED counterpart to {@link #insertConfirmedBooking} — backs this class's {@code
-     * /not-complete} 204 (happy-path) tests. {@code /not-complete} has no temporal guard (reverted
-     * along with the rest of the elapsed-only no-show restriction), so an elapsed fixture is just
-     * the conventional default here, not a requirement.
-     */
-    private UUID insertElapsedConfirmedBooking(UUID clientId, UUID masterId, UUID masterServiceId, UUID salonId) {
-        UUID bookingId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO bookings (id, client_id, master_id, master_service_id, salon_id, status, " +
-                        "starts_at, ends_at, price_at_booking, duration_minutes_at_booking, buffer_minutes_at_booking, " +
-                        "booking_source, created_at, updated_at) " +
-                        "VALUES (?, ?, ?, ?, ?, 'CONFIRMED', NOW() - interval '2 hours', NOW() - interval '1 hour', " +
-                        "500.00, 60, 0, 'APP', NOW(), NOW())",
-                bookingId, clientId, masterId, masterServiceId, salonId);
-        return bookingId;
-    }
-
-    private UUID insertElapsedConfirmedSalonBooking(Salon salon) {
-        UUID clientId = createUser("provcancel-book-elapsed-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
-        UUID masterServiceId = createSalonService(salon.salonId);
-        return insertElapsedConfirmedBooking(clientId, salon.masterId, masterServiceId, salon.salonId);
     }
 
     private UUID insertSalonBookingWithStatus(Salon salon, String status) {

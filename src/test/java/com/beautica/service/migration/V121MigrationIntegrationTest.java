@@ -101,10 +101,13 @@ class V121MigrationIntegrationTest {
 
         seedCollidingRows();
 
-        // ── Act: apply V121 (and anything after it) onto that populated database. ──
+        // ── Act: apply V121 onto that populated database. Pinned to target 121 (phase 464): V233
+        // drops V121's index and replaces it with the per-copy key, so migrating past it would test
+        // V233, not V121. ──
         Flyway.configure()
                 .dataSource(dataSource)
                 .locations("classpath:db/migration")
+                .target("121")
                 .load()
                 .migrate();
     }
@@ -381,9 +384,12 @@ class V121MigrationIntegrationTest {
     void should_notRewriteTheLog_when_migrateIsRunAgain() {
         Long before = jdbc.queryForObject("SELECT COUNT(*) FROM v121_dedup_log", Long.class);
 
+        // Pinned to target 121 like the @BeforeAll Act (phase 464): migrating to latest here would
+        // apply V233 mid-class and drop the V121 index the sibling tests assert, order-dependently.
         Flyway.configure()
                 .dataSource(dataSource)
                 .locations("classpath:db/migration")
+                .target("121")
                 .load()
                 .migrate();
 

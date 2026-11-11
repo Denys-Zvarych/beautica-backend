@@ -21,7 +21,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * once and reused; {@code name}/{@code displayName} are always supplied valid so the
  * only violations surfaced are the ones the {@code initialServiceName} constraints
  * produce. Guards behavior #1: null/absent valid, blank valid (treated as null),
- * length &gt; 255 rejected, control char rejected.
+ * length &gt; 255 rejected, control char and any character outside
+ * {@link ServiceNameConstraints#NAME_REGEX} rejected.
  */
 @DisplayName("CreateCategoryRequestRequest — initialServiceName validation")
 class CreateCategoryRequestRequestValidationTest {
@@ -97,10 +98,23 @@ class CreateCategoryRequestRequestValidationTest {
         Set<ConstraintViolation<CreateCategoryRequestRequest>> violations = validate("Manicure\nDeluxe");
 
         assertThat(violations)
-                .as("control characters must be rejected by @Pattern(^[^\\p{Cntrl}]*$)")
+                .as("control characters must be rejected by the service-name allow-list (NAME_REGEX)")
                 .anySatisfy(v -> {
                     assertThat(v.getPropertyPath().toString()).isEqualTo("initialServiceName");
-                    assertThat(v.getMessage()).contains("control characters");
+                    assertThat(v.getMessage()).isEqualTo(ServiceNameConstraints.NAME_REGEX_MESSAGE);
+                });
+    }
+
+    @Test
+    @DisplayName("initialServiceName with a character outside the service-name allow-list is rejected")
+    void should_reject_when_initialServiceNameHasDisallowedSymbol() {
+        Set<ConstraintViolation<CreateCategoryRequestRequest>> violations = validate("Манікюр <b>💅</b>");
+
+        assertThat(violations)
+                .as("symbols/emoji outside NAME_REGEX must be rejected at the DTO boundary")
+                .anySatisfy(v -> {
+                    assertThat(v.getPropertyPath().toString()).isEqualTo("initialServiceName");
+                    assertThat(v.getMessage()).isEqualTo(ServiceNameConstraints.NAME_REGEX_MESSAGE);
                 });
     }
 

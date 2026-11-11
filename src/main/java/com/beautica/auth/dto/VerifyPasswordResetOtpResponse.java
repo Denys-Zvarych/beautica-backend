@@ -9,4 +9,13 @@ package com.beautica.auth.dto;
  *                     is the one and only time the raw value is ever transmitted.
  */
 public record VerifyPasswordResetOtpResponse(String resetTicket) {
+
+    /**
+     * Phase 442 audit — the raw reset ticket must never reach a log line: the default record {@code toString}
+     * would print every component.
+     */
+    @Override
+    public String toString() {
+        return "VerifyPasswordResetOtpResponse[]";
+    }
 }

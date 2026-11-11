@@ -3,6 +3,7 @@ package com.beautica.booking.service;
 import com.beautica.auth.Role;
 import com.beautica.booking.domain.BookingClosureRule;
 import com.beautica.booking.domain.MasterBookability;
+import com.beautica.booking.domain.ServiceBookability;
 import com.beautica.booking.dto.BookingDetailResponse;
 import com.beautica.booking.dto.BookingPriceRange;
 import com.beautica.booking.dto.BookingResponse;
@@ -1976,14 +1977,7 @@ public class BookingService {
     @Transactional
     public BookingResponse declineBooking(UUID actorUserId, UUID bookingId, StatusUpdateRequest req) {
         Booking saved = declineBookingCore(actorUserId, bookingId, req);
-        outboxService.enqueueStatusChanged(saved.getId());
-        // Phase 431 — the performing master's e-mail is its OWN row (own retry state), skipped when
-        // the master declined it themselves.
-        outboxService.enqueueMasterBookingDeclined(saved.getId(), masterUserIdOf(saved), actorUserId);
-        // Phase 333, matrix row 3 — client (if registered) + performing master unless actor. `saved`
-        // is already the full graph loaded by declineBookingCore (audit-fix cycle 1, finding 1) —
-        // never reloaded here.
-        inAppNotificationService.notifyBookingEvent(InAppNotificationType.BOOKING_DECLINED, saved, actorUserId);
+        enqueueProviderDeclineNotifications(saved, actorUserId);
         registerSlotEviction(saved.getMaster().getId(), salonIdOf(saved));
         evictMasterCalendarAfterCommit(saved.getMaster().getId());
         return BookingResponse.from(saved, resolveNow());
@@ -2000,11 +1994,10 @@ public class BookingService {
      *       ONE combined eviction itself after the whole decline loop instead of one
      *       {@code registerSlotEviction} + {@code evictMasterCalendarAfterCommit} pair PER declined
      *       booking, all for the same master;</li>
-     *   <li>the {@code outboxService.enqueueStatusChanged} notification call — a booking declined via
-     *       a schedule-override conflict enqueues NOTHING (D6, 2026-07-26 product decision reversal):
-     *       the client discovers the cancellation from the booking's status alone, and notifying for
-     *       this flow is deferred to a later phase. This is a deliberate, permanent property of THIS
-     *       method, not an oversight — do not "fix" it back by re-adding the enqueue call here.</li>
+     *   <li>its notification calls — the batch caller enqueues them itself, after the whole decline
+     *       loop, through {@link #enqueueProviderDeclineOutbox} plus one bulk in-app write (phase 474 reversed the
+     *       2026-07-26 D6 "override declines notify nobody" decision; the notify step stays OUT of this
+     *       method so the caller controls ordering and per-visit grouping).</li>
      * </ul>
      *
      * <p>Package-private: both callers live in this same package —
@@ -2016,6 +2009,43 @@ public class BookingService {
      */
     Booking declineBookingForBatch(UUID actorUserId, UUID bookingId, StatusUpdateRequest req) {
         return declineBookingCore(actorUserId, bookingId, req);
+    }
+
+    /**
+     * The notifications of a provider decline of ONE standalone booking — the exact set
+     * {@link #declineBooking} enqueues, extracted so the schedule-override-conflict path (phase 474,
+     * SCH-37 / NTF-40) notifies through the SAME calls rather than a parallel notifier:
+     * <ul>
+     *   <li>{@code STATUS_CHANGED} outbox row — the drain e-mails a registered client, and sends a
+     *       guest (LINK, or STAFF walk-in with a phone) the fixed GST-41 cancellation SMS/Telegram. A
+     *       registered client never gets SMS or Telegram (NTF-D04) — the drain's guest branch is gated
+     *       on {@code client == null};</li>
+     *   <li>{@code MASTER_BOOKING_DECLINED} row — the performing master's e-mail (phase 431), skipped
+     *       when the master is the actor;</li>
+     *   <li>in-app {@code BOOKING_DECLINED} (feed + push) — client (if registered) + performing
+     *       master unless actor (phase 333, matrix row 3).</li>
+     * </ul>
+     * Must run inside the caller's transaction (the in-app seam is {@code MANDATORY}). {@code saved}
+     * must be the full graph {@link #declineBookingCore} returns — never reloaded here.
+     */
+    void enqueueProviderDeclineNotifications(Booking saved, UUID actorUserId) {
+        enqueueProviderDeclineOutbox(saved, actorUserId);
+        // Phase 333, matrix row 3 — client (if registered) + performing master unless actor.
+        inAppNotificationService.notifyBookingEvent(InAppNotificationType.BOOKING_DECLINED, saved, actorUserId);
+    }
+
+    /**
+     * The two outbox rows of {@link #enqueueProviderDeclineNotifications}, without its in-app write — for the
+     * schedule-override mass decline (phase 474 audit-fix), which queues every outbox row first and then writes
+     * ALL the in-app {@code BOOKING_DECLINED} rows in ONE statement
+     * ({@code InAppNotificationService#notifyBookingEventsBulk} with
+     * {@code BookingEventTarget.forBooking(saved)} — the identical rows {@code notifyBookingEvent} writes).
+     */
+    void enqueueProviderDeclineOutbox(Booking saved, UUID actorUserId) {
+        outboxService.enqueueStatusChanged(saved.getId());
+        // Phase 431 — the performing master's e-mail is its OWN row (own retry state), skipped when
+        // the master declined it themselves.
+        outboxService.enqueueMasterBookingDeclined(saved.getId(), masterUserIdOf(saved), actorUserId);
     }
 
     /**
@@ -2784,18 +2814,25 @@ public class BookingService {
         }
         Set<UUID> declinedAppointmentChildIds = appointmentTransitionService.declineAppointmentItemsBulk(
                 appointmentVisitBookingIds, CancellationReason.PROVIDER_UNAVAILABLE, now);
+        // Phase 478 (GST-75): outbox rows are per visit for a registered client (D12, NTF-06) but per declined
+        // SERVICE for a guest visit — the guest's cancellation message is one SMS/Telegram per cancelled service,
+        // each naming that item's own time. In-app rows and the returned count stay per visit (representativeIds).
+        List<UUID> outboxAggregateIds = new ArrayList<>(representativeIds);
         for (List<SalonClosureBookingCandidate> visit : byVisit.values()) {
             if (visit.get(0).appointmentId() == null) {
                 continue;
             }
             representativeOf(visit, declinedAppointmentChildIds).ifPresent(representativeIds::add);
+            outboxAggregateIds.addAll(outboxAggregateIdsOf(visit, declinedAppointmentChildIds));
         }
 
         // Outbox INSERTs flush in their OWN window, after every decline above is already staged —
-        // never interleaved with a decline's own read. D12 (one row per visit) is preserved exactly:
-        // the dedup key is each visit's own content, not loop position, so processing standalone
-        // visits before appointment visits (rather than in candidate-scan order) is unobservable.
-        for (UUID representativeId : representativeIds) {
+        // never interleaved with a decline's own read. D12 (one row per registered-client visit) is
+        // preserved exactly: the dedup key is each visit's own content, not loop position, so
+        // processing standalone visits before appointment visits (rather than in candidate-scan
+        // order) is unobservable. The rows JDBC-batch (no read in between), so per-service guest rows
+        // cost ⌈rows/50⌉ statements, never one per row.
+        for (UUID representativeId : outboxAggregateIds) {
             switch (eventType) {
                 case SALON_CLOSED -> outboxService.enqueueSalonClosed(representativeId);
                 case MASTER_REMOVED -> outboxService.enqueueMasterRemoved(representativeId);
@@ -2899,6 +2936,25 @@ public class BookingService {
      *                     returned survivor list
      * @return the representative, or empty iff nothing in this visit transitioned
      */
+    /**
+     * Phase 478 (GST-75) — the outbox aggregate ids of one appointment visit of a cascade: every declined item,
+     * earliest first (ties on id), for a GUEST visit, whose cancellation message goes out once per cancelled
+     * service; the single {@link #representativeOf} otherwise (D12 — a registered client's e-mail names the whole
+     * visit once). Empty when nothing of the visit transitioned.
+     */
+    private static List<UUID> outboxAggregateIdsOf(
+            List<SalonClosureBookingCandidate> visit, Set<UUID> declinedIds) {
+        if (!visit.get(0).guest()) {
+            return representativeOf(visit, declinedIds).map(List::of).orElse(List.of());
+        }
+        return visit.stream()
+                .filter(candidate -> declinedIds.contains(candidate.bookingId()))
+                .sorted(Comparator.comparing(SalonClosureBookingCandidate::startsAt)
+                        .thenComparing(SalonClosureBookingCandidate::bookingId))
+                .map(SalonClosureBookingCandidate::bookingId)
+                .toList();
+    }
+
     private static Optional<UUID> representativeOf(
             List<SalonClosureBookingCandidate> visit, Set<UUID> declinedIds) {
         return visit.stream()
@@ -3035,12 +3091,12 @@ public class BookingService {
      * one-query-per-call semantics to before this split).
      */
     private Booking declineBookingCore(UUID actorUserId, UUID bookingId, StatusUpdateRequest req) {
-        // Fix M4: require a reason, consistent with notCompleteBooking
+        // Fix M4: require a reason (BOOK-42)
         if (req.cancellationReason() == null) {
             throw new BusinessException(HttpStatus.BAD_REQUEST, "Cancellation reason required for declining a booking");
         }
         // Existence + ownership collapse to a single uniform 403 (Finding 8 — existence oracle),
-        // mirroring notCompleteBooking / cancelBooking: a missing id and an existing-but-foreign
+        // mirroring completeBooking / cancelBooking: a missing id and an existing-but-foreign
         // booking must be indistinguishable to the caller. A plain full-graph load surfaced a 404
         // for a missing id BEFORE the ownership guard ran — letting a valid provider distinguish
         // "exists-but-not-mine" (403) from "doesn't-exist" (404). A missing booking now
@@ -3092,7 +3148,8 @@ public class BookingService {
         booking.setCancellationReason(req.cancellationReason());
         booking.setProviderComment(BookingComments.normalize(req.comment()));
         // Notification enqueue is NOT here — see this method's own javadoc: it is the caller's
-        // responsibility (declineBooking always enqueues; declineBookingForBatch never does, D6).
+        // responsibility (declineBooking enqueues inline; the override batch caller enqueues after its loop via
+        // enqueueProviderDeclineOutbox + one bulk in-app write, phase 474).
         return bookingRepository.save(booking);
     }
 
@@ -3112,13 +3169,13 @@ public class BookingService {
     @Transactional
     public BookingResponse completeBooking(UUID actorUserId, UUID bookingId) {
         // Existence + ownership collapse to a single uniform 403 (Finding 8 — existence oracle),
-        // mirroring notCompleteBooking / declineBooking: a missing id and an existing-but-foreign
+        // mirroring declineBooking / cancelBooking: a missing id and an existing-but-foreign
         // booking are indistinguishable to the caller (a plain full-graph load would surface a 404
         // for a missing id BEFORE the ownership guard, leaking existence). Ownership enforcement is
         // unchanged (below): a foreign provider still gets 403.
         Booking booking = bookingRepository.findByIdWithFullGraph(bookingId)
                 .orElseThrow(() -> new ForbiddenException("Access denied"));
-        // Phase 18.4 / 24.2: completion, decline, and not-complete all share the same
+        // Phase 18.4 / 24.2: completion and decline share the same
         // provider-authority shape (admits SALON_ADMIN) — see AuthorizationService.enforceCanCompleteBooking
         // / enforceCanCancelBooking.
         authz.enforceCanCompleteBooking(actorUserId, booking);
@@ -3178,78 +3235,16 @@ public class BookingService {
     }
 
     /**
-     * Provider-initiated no-show closure of an already-{@code CONFIRMED} booking.
-     *
-     * <p><b>Freshness re-check (G5, HIGH — same defect class as G4/G5 above; see {@link
-     * #declineBookingCore}'s Javadoc for the full rationale).</b> {@code assertTransition(booking,
-     * BookingStatus.CONFIRMED, BookingStatus.NOT_COMPLETED)} below fixes this method's source state
-     * as {@code CONFIRMED}, so {@link #isStillConfirmed} is the correct freshness probe here too —
-     * without it, this method could commit NOT_COMPLETED over a booking a concurrent client {@link
-     * #cancelBooking} already moved to CANCELLED in the gap between this method's {@code
-     * findByIdWithFullGraph} load and its own save.
-     */
-    @Transactional
-    public BookingResponse notCompleteBooking(UUID actorUserId, UUID bookingId, StatusUpdateRequest req) {
-        // Existence + ownership collapse to a single uniform 403 (Finding 8 — existence oracle),
-        // mirroring cancelBooking: a missing id and an existing-but-foreign booking must be
-        // indistinguishable to the caller. Since /not-complete dropped its redundant
-        // @authz.canCancelBooking SpEL clause (which duplicated the service-layer fetch), a plain
-        // full-graph load surfaced a 404 for a missing id BEFORE the ownership guard ran — letting
-        // a valid provider distinguish "exists-but-not-mine" (403) from "doesn't-exist" (404). A
-        // missing booking now short-circuits to the SAME 403 the ownership guard throws for a foreign
-        // one. Ownership enforcement is unchanged (below): a foreign provider still gets 403.
-        Booking booking = bookingRepository.findByIdWithFullGraph(bookingId)
-                .orElseThrow(() -> new ForbiddenException("Access denied"));
-        // Phase 24.2: aligned to the same provider-authority shape as completeBooking/
-        // declineBooking (admits SALON_ADMIN) — leaving admin able to complete/decline but not
-        // mark a no-show would be an incoherent permission set (decision D2).
-        authz.enforceCanCancelBooking(actorUserId, booking);
-        // Multi-service visit item: refuse the single-booking transition (use /appointments/{id}).
-        assertNotAppointmentChild(booking);
-        if (req.cancellationReason() == null) {
-            throw new BusinessException("Cancellation reason required");
-        }
-        assertTransition(booking, BookingStatus.CONFIRMED, BookingStatus.NOT_COMPLETED);
-
-        // Freshness re-check (G5) — see this method's own Javadoc. Must run immediately before the
-        // mutation below: assertTransition above only proves CONFIRMED on the stale pre-load
-        // snapshot, not on the current row.
-        if (!isStillConfirmed(booking.getId())) {
-            throw new BusinessException(HttpStatus.CONFLICT, "Service changed concurrently — please retry");
-        }
-        booking.setStatus(BookingStatus.NOT_COMPLETED);
-        booking.setCancellationReason(req.cancellationReason());
-        booking.setProviderComment(BookingComments.normalize(req.comment()));
-        Booking saved = bookingRepository.save(booking);
-        outboxService.enqueueStatusChanged(saved.getId());
-        // Phase 333, matrix row 6 — client only (if registered); the provider is the actor. `saved`
-        // is the same full-graph instance `booking` was loaded as above — never reloaded (audit-fix
-        // cycle 1, finding 1).
-        inAppNotificationService.notifyBookingEvent(
-                InAppNotificationType.BOOKING_NOT_COMPLETED, saved, actorUserId);
-        // NOT_COMPLETED leaves the `status = 'CONFIRMED'` occupancy predicate, so it FREES the
-        // booking's window. No-show carries NO temporal guard, so the booking may still be in the
-        // future — its slot is then genuinely re-bookable and must return to the picker at once
-        // rather than staying hidden for the availability TTL.
-        registerSlotEviction(saved.getMaster().getId(), salonIdOf(saved));
-        evictMasterCalendarAfterCommit(saved.getMaster().getId());
-        evictRevenueDashboardAfterCommit(actorUserId);
-        return BookingResponse.from(saved, resolveNow());
-    }
-
-    /**
      * Client-initiated cancel of a single {@code CONFIRMED} booking.
      *
      * <p><b>Track 27.x widening (per-leg client cancel).</b> Unlike the sibling provider transitions
-     * ({@link #declineBooking}, {@link #completeBooking}, {@link #notCompleteBooking}), this path
+     * ({@link #declineBooking}, {@link #completeBooking}), this path
      * deliberately does NOT call {@link #assertNotAppointmentChild} — a multi-service visit child
      * (non-null {@code booking.getAppointment()}) is now a legal target here. Product decision: the
      * client's booking list renders ONE card per service, each with its own cancel action, so a
      * client must be able to cancel exactly one leg of a visit without cancelling its siblings. The
-     * whole-visit cancel ({@code PATCH /appointments/{id}/cancel} →
-     * {@link AppointmentTransitionService#cancelAppointment}) is unchanged and stays the only way to
-     * cancel every leg atomically in one call. Every other single-booking transition
-     * (decline/complete/not-complete, all provider-initiated) still refuses an appointment child via
+     * whole-visit cancel route was removed in phase 475, so every leg is cancelled on its own. Every
+     * other single-booking transition (decline/complete, both provider-initiated) still refuses an appointment child via
      * {@link #assertNotAppointmentChild} — see that method's Javadoc.
      *
      * <p>Every other CLIENT guard below still applies, evaluated on THIS child row alone: ownership
@@ -3650,7 +3645,7 @@ public class BookingService {
      * {@link #assertNotElapsedForClient} — the two are NOT the same predicate: the client guard
      * compares {@code endsAt} (a client may still act right up until the appointment has fully
      * ended), while the provider guard compares {@code startsAt} (a provider can no longer move a
-     * booking that has already begun — {@code /complete}/{@code /not-complete} are the only
+     * booking that has already begun — {@code /complete}/{@code /decline} are the only
      * remaining resolutions once that happens). They are therefore kept as two independent guards,
      * not a shared helper.
      *
@@ -3684,7 +3679,7 @@ public class BookingService {
      * <p><b>Freshness re-check (G2, HIGH, cycle-7 audit 2026-08-03 — fixed here).</b> This method is
      * the LEGACY {@code PATCH /bookings/{id}/reschedule} route, reachable for an appointment child by
      * BOTH the CLIENT and PROVIDER paths (see {@code BookingController} — unlike
-     * {@link #declineBooking}/{@link #completeBooking}/{@link #notCompleteBooking}, this path never
+     * {@link #declineBooking}/{@link #completeBooking}, this path never
      * calls {@link #assertNotAppointmentChild}). Before this fix it took the header lock above but
      * never re-verified {@code booking} itself afterward — the one per-item mutator in this class
      * missing the freshness re-check every OTHER per-item path (this class's
@@ -3951,7 +3946,7 @@ public class BookingService {
      * PROVIDER-path authorization + status + elapsed resolution for {@link #rescheduleBooking}
      * (Phase 27.2). Existence + ownership collapse to a single uniform 403 (Finding 8 — existence
      * oracle): a missing id and an existing-but-foreign booking are indistinguishable to the caller,
-     * exactly as decline/complete/not-complete now do — a plain full-graph load would surface a 404
+     * exactly as decline/complete now do — a plain full-graph load would surface a 404
      * for a missing id BEFORE the ownership guard, leaking existence to a valid provider. Authorizes
      * via {@link AuthorizationService#enforceCanRescheduleBooking}, which reuses the same
      * provider-authority predicate as decline/complete (owner, assigned admin, or the owning
@@ -4028,7 +4023,8 @@ public class BookingService {
         // Pinned by FavoriteServiceIT#should_return404_when_bookingAFavoritedServiceThatWasDeactivated.
         MasterServiceAssignment msa = masterServiceRepository
                 .findByMasterIdAndIdWithGraph(request.masterId(), request.masterServiceId())
-                .filter(MasterServiceAssignment::isActive)
+                // Active assignment AND active definition (a deactivated definition does not cascade).
+                .filter(ServiceBookability::isBookable)
                 .orElseThrow(() -> new NotFoundException("Master service not found"));
 
         OffsetDateTime startsAt = request.startsAt().toOffsetDateTime();
@@ -4180,10 +4176,10 @@ public class BookingService {
      * {@link BookingRepository#existsConfirmedById} — the freshness re-check
      * {@link #cancelBooking(UUID, Booking, CancelBookingRequest)} and {@link #rescheduleBooking}
      * run immediately before their own terminal save (G2/G4, cycle-7 audit 2026-08-03), and which
-     * {@link #declineBookingCore}, {@link #completeBooking} and {@link #notCompleteBooking} now
+     * {@link #declineBookingCore} and {@link #completeBooking} now
      * run too (G5 — same defect class, closing the reverse direction of the race G4 only
      * half-covered: G4 protected {@code cancelBooking} when it lands SECOND, but nothing protected
-     * these three provider transitions from unconditionally overwriting an already-CANCELLED row
+     * the provider transitions from unconditionally overwriting an already-CANCELLED row
      * when THEY land second instead).
      *
      * <p>Mirrors the exact precedent {@code AppointmentTransitionService
@@ -4202,8 +4198,8 @@ public class BookingService {
      * <p>{@code cancelBooking}/{@code rescheduleBooking} had no behavioural change when they were
      * routed through this wrapper (both previously called {@link
      * BookingRepository#existsConfirmedById} directly) — but {@code declineBookingCore}/{@code
-     * completeBooking}/{@code notCompleteBooking} calling it (G5) IS a behavioural change: those
-     * three previously made no freshness check at all.
+     * completeBooking} calling it (G5) IS a behavioural change: those previously made no freshness
+     * check at all.
      */
     boolean isStillConfirmed(UUID bookingId) {
         return bookingRepository.existsConfirmedById(bookingId);
@@ -4357,7 +4353,7 @@ public class BookingService {
      * {@link #validateStartsAt} uses), so tests can pin an elapsed booking deterministically.
      *
      * <p>Deliberately NOT applied to the provider paths ({@link #declineBooking},
-     * {@link #completeBooking}, {@link #notCompleteBooking}) — resolving an elapsed booking is
+     * {@link #completeBooking}) — resolving an elapsed booking is
      * exactly their job.
      */
     private void assertNotElapsedForClient(Booking booking) {
@@ -4377,10 +4373,10 @@ public class BookingService {
      * Rejects a single-booking transition on a booking that is one item of a multi-service
      * visit (BE-3/BE-4). Such a booking carries a non-null {@link Booking#getAppointment()}
      * FK; its status is owned by the {@link com.beautica.booking.entity.Appointment} header,
-     * which moves the header <em>and every sibling item</em> in lockstep only through the
-     * {@code PATCH /appointments/{id}/...} endpoints (all-or-nothing). Transitioning a single
-     * child through {@code PATCH /bookings/{id}/decline|complete|not-complete} would desync the
-     * visit header from its OTHER siblings, so it is refused here with a 409.
+     * which the per-service {@code PATCH /appointments/{id}/services/{bookingId}/...} endpoints
+     * collapse once the last CONFIRMED child leaves. Transitioning a single child through
+     * {@code PATCH /bookings/{id}/decline|complete} would bypass that collapse and desync the visit
+     * header from its OTHER siblings, so it is refused here with a 409.
      *
      * <p><b>Track 27.x narrowing.</b> {@link #cancelBooking} — the fourth, CLIENT-initiated
      * transition — deliberately stopped calling this guard: a client may now cancel exactly one

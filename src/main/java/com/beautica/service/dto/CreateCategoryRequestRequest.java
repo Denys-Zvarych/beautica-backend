@@ -20,8 +20,8 @@ import jakarta.validation.constraints.Size;
  *   <li>{@code initialServiceName} — OPTIONAL free-text name of an initial service-type
  *       the requester wants under the new category. Validated <em>optional</em>:
  *       {@code @Size(max = 255)} matching the {@code service_type_suggestion.suggested_name}
- *       column it eventually populates, plus a control-char ban
- *       ({@code @Pattern("^[^\\p{Cntrl}]*$")}). No {@code @NotBlank} — {@code null} and
+ *       column it eventually populates, plus the phase-464 service-name allow-list
+ *       ({@link ServiceNameConstraints#NAME_REGEX}, raw-input form — also bans control chars). No {@code @NotBlank} — {@code null} and
  *       blank both pass and are normalized to {@code null} at the service layer. When
  *       present, category approval creates a PENDING {@link com.beautica.service.entity.ServiceTypeSuggestion}
  *       for the now-approved category (no auto-promotion; Phase 16.8 decision).</li>
@@ -41,10 +41,8 @@ public record CreateCategoryRequestRequest(
         String displayName,
 
         @Size(max = 255, message = "Initial service name must be at most 255 characters")
-        @Pattern(
-                regexp = "^[^\\p{Cntrl}]*$",
-                message = "Initial service name must not contain control characters"
-        )
+        // Phase 464 service-name allow-list on the RAW input (blank still passes: \p{Zs} only).
+        @Pattern(regexp = ServiceNameConstraints.NAME_REGEX, message = ServiceNameConstraints.NAME_REGEX_MESSAGE)
         String initialServiceName
 ) {
 }

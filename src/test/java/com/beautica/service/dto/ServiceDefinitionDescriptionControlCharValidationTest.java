@@ -8,9 +8,14 @@ import jakarta.validation.ValidatorFactory;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 
 import java.math.BigDecimal;
 import java.util.Set;
+import java.util.UUID;
+import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -26,6 +31,8 @@ class ServiceDefinitionDescriptionControlCharValidationTest {
     private static final String NUL = "\u0000";
     private static final String VTAB = "\u000B";
     private static final String DEL = "\u007F";
+
+    private static final String NAME_CONTROL_CHAR_MESSAGE = ServiceNameConstraints.NAME_REGEX_MESSAGE;
 
     private static Validator validator;
 
@@ -117,5 +124,66 @@ class ServiceDefinitionDescriptionControlCharValidationTest {
         assertThat(hasDescriptionViolation(validator.validate(updateWithDescription(description))))
                 .as("update description with DEL (0x7F) must still fail @Pattern validation")
                 .isTrue();
+    }
+
+    // -- phase 464: name ALLOW-LIST at the DTO boundary (fast 400) --------------------------
+    // Combining marks (U+034F, U+FE0F) deliberately pass the raw-input pattern so a
+    // decomposed й reaches NFKC; ServiceCatalogService.canonicalName rejects them (service tests).
+
+    static Stream<Arguments> disallowedNameCharsPerNameDto() {
+        String[] rejected = {"\uD83D\uDC85", "\u200B", "\u3164", "\u2028", "\u0085", "#", "@", "\u2605",
+                "\u202E", "\uFEFF", "\u115F", "\u1160", "\uFFA0", "\u2800", "\u009F"};
+        return Stream.of(rejected).flatMap(ch -> namePerDto(
+                String.format("U+%04X", ch.codePointAt(0)), "Мані" + ch + "кюр"));
+    }
+
+    static Stream<Arguments> allowedNamesPerNameDto() {
+        String[] accepted = {"Манікюр", "Пам'ять", "Пам\u2019ять", "пам\u02BCять", "Стрижка + укладка",
+                "Масаж (60 хв) \u21162", "SPA-догляд", "Стрижка  +  укладка", "Мані\u0438\u0306",
+                "\u00A0Манікюр\u00A0", "«Люкс» — 100%: так! ні? 2/3 & 4, 5.6 \"А\" – б"};
+        return Stream.of(accepted).flatMap(name -> namePerDto(name, name));
+    }
+
+    private static Stream<Arguments> namePerDto(String label, String name) {
+        return Stream.of(
+                Arguments.of(label, "create", new CreateServiceDefinitionRequest(
+                        name, null, "MANICURE", 60, 0,
+                        PriceType.FIXED, new BigDecimal("350.00"), null, null, UUID.randomUUID())),
+                Arguments.of(label, "update", new UpdateServiceDefinitionRequest(
+                        name, null, null, null, null, null, null, null, null, null)),
+                Arguments.of(label, "bulk", new BulkServiceItemRequest(
+                        UUID.randomUUID(), 60, PriceType.FIXED, new BigDecimal("350.00"),
+                        null, null, name)));
+    }
+
+    @ParameterizedTest(name = "{1} name with {0} -> name violation")
+    @MethodSource("disallowedNameCharsPerNameDto")
+    @DisplayName("name DTOs reject any character outside the allow-list")
+    void should_rejectName_when_containsCharOutsideAllowList(String codePoint, String dto, Object request) {
+        var violations = validator.validate(request);
+
+        assertNameControlCharViolation(violations,
+                dto + " name with " + codePoint + " must fail @Pattern validation");
+    }
+
+    @ParameterizedTest(name = "{1} name \"{0}\" -> no name violation")
+    @MethodSource("allowedNamesPerNameDto")
+    @DisplayName("name DTOs accept allow-listed names (Ukrainian apostrophes, punctuation, raw spacing)")
+    void should_acceptName_when_onlyAllowListedChars(String name, String dto, Object request) {
+        var violations = validator.validate(request);
+
+        assertThat(violations)
+                .as(dto + " name \"" + name + "\" must pass validation")
+                .noneMatch(v -> v.getPropertyPath().toString().equals("name"));
+    }
+
+    private static void assertNameControlCharViolation(
+            Set<? extends ConstraintViolation<?>> violations, String description) {
+        assertThat(violations)
+                .as(description)
+                .anySatisfy(v -> {
+                    assertThat(v.getPropertyPath().toString()).isEqualTo("name");
+                    assertThat(v.getMessage()).isEqualTo(NAME_CONTROL_CHAR_MESSAGE);
+                });
     }
 }

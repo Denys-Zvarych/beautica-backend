@@ -306,21 +306,9 @@ class GuestMessageRoutingIT extends AbstractWalkInBookingSmsIT {
     }
 
     @Test
-    @DisplayName("audit-fix: a 10-service walk-in visit declined as a whole → exactly ONE message")
-    void should_sendOneMessage_when_tenServiceWalkInVisitDeclined() {
-        UUID appointmentId = insertWalkInVisit(E164_PHONE, at(now.plus(Duration.ofDays(1))), 10);
-        authenticateAsOwner();
-
-        appointmentTransitionService.declineAppointment(salon.ownerId(), appointmentId,
-                new AppointmentProviderNoteRequest(null));
-        drainWorker.drain();
-
-        TURBOSMS.verify(1, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
-    }
-
-    @Test
-    @DisplayName("audit-fix: walk-in visit lines declined one by one → one message per visit per window")
-    void should_sendOneMessagePerVisit_when_walkInLinesDeclinedOneByOne() {
+    @DisplayName("GST-75: walk-in visit lines declined one by one → one message per declined service; the visit "
+            + "spends the per-phone budget once")
+    void should_sendOneMessagePerService_when_walkInLinesDeclinedOneByOne() {
         UUID appointmentId = insertWalkInVisit(E164_PHONE, at(now.plus(Duration.ofDays(1))), 3);
         authenticateAsOwner();
         List<UUID> items = jdbcTemplate.queryForList(
@@ -333,7 +321,37 @@ class GuestMessageRoutingIT extends AbstractWalkInBookingSmsIT {
                 new AppointmentProviderNoteRequest(null));
         drainWorker.drain();
 
-        TURBOSMS.verify(1, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
+        TURBOSMS.verify(2, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
+        assertThat(jdbcTemplate.queryForObject("SELECT count(*) FROM guest_reschedule_sms_sends s "
+                + "JOIN bookings b ON b.id = s.booking_id WHERE b.appointment_id = ?", Integer.class, appointmentId))
+                .as("one budget reservation for the visit, not one per service").isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("GST-75 bound: once the phone budget is spent, a further service of an already-charged visit is "
+            + "still sent, but a NEW walk-in visit's cancellation is suppressed")
+    void should_sendChargedVisitSiblingButSuppressNewVisit_when_phoneBudgetExhausted() {
+        UUID appointmentId = insertWalkInVisit(E164_PHONE, at(now.plus(Duration.ofDays(1))), 2);
+        authenticateAsOwner();
+        List<UUID> items = jdbcTemplate.queryForList(
+                "SELECT id FROM bookings WHERE appointment_id = ? ORDER BY starts_at", UUID.class, appointmentId);
+        appointmentTransitionService.declineAppointmentItem(salon.ownerId(), appointmentId, items.get(0),
+                new AppointmentProviderNoteRequest(null));
+        drainWorker.drain();
+        for (int i = 0; i < 4; i++) {
+            assertThat(smsBudget.tryReserveWalkInCancellation(
+                    insertWalkIn(E164_PHONE, at(now.plus(Duration.ofDays(2 + i)))), null, E164_PHONE, null))
+                    .as("fixture: spend the rest of the 5/hour budget").isTrue();
+        }
+        UUID newVisitBooking = insertWalkIn(E164_PHONE, at(now.plus(Duration.ofDays(9))));
+
+        appointmentTransitionService.declineAppointmentItem(salon.ownerId(), appointmentId, items.get(1),
+                new AppointmentProviderNoteRequest(null));
+        decline(newVisitBooking);
+        drainWorker.drain();
+
+        TURBOSMS.verify(2, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
+        assertThat(statusChangedRowStatus(newVisitBooking)).as("suppressed silently, row still SENT").isEqualTo("SENT");
     }
 
     @Test

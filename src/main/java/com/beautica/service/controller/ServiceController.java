@@ -74,8 +74,9 @@ public class ServiceController {
     /**
      * Description attached to the {@code 409 DUPLICATE_SERVICE} declaration on every write
      * endpoint that can raise {@code DuplicateServiceException} — the five below, i.e. every path
-     * that inserts or re-types a {@code ServiceDefinition} and so can collide with V121's
-     * {@code ux_service_def_owner_service_type_active}.
+     * that inserts or re-keys a {@code ServiceDefinition} and so can collide with V233's
+     * {@code ux_service_def_owner_type_duration_name_active} (phase 464: one active copy per
+     * owner, type, base duration and trimmed case-insensitive name).
      *
      * <p>Declared explicitly because springdoc scans controller signatures, not
      * {@code @RestControllerAdvice} handlers: without these annotations the 409's body has no
@@ -85,8 +86,10 @@ public class ServiceController {
      * this project's response envelope, which is the return type of nearly every method here.
      */
     private static final String DUPLICATE_SERVICE_409 =
-            "The owner already offers an active service of this type. One active service per "
-                    + "(owner, service type); price and duration are irrelevant. Branch on "
+            "The owner already offers an active copy of this service with the same type, same "
+                    + "duration and same name (name compared trimmed and case-insensitive). Copies "
+                    + "of one type must differ in duration or name; price is irrelevant. "
+                    + "`existingServiceDefId` names the colliding copy. Branch on "
                     + "`data.code` == DUPLICATE_SERVICE, never on `message`.";
 
     /**
@@ -103,12 +106,13 @@ public class ServiceController {
      * every other path; only this endpoint's semantics changed with Phase 302 D4.
      */
     private static final String DUPLICATE_SERVICE_PER_MASTER_409 =
-            "The service type is already assigned to THIS master (Phase 302 D4 — the conflict is "
-                    + "per-MASTER, not per-salon: another master in the same salon already offering "
-                    + "this type is NOT a conflict here, the salon's existing definition is reused "
-                    + "and this call returns 201). One active assignment per (master, service "
-                    + "type); price and duration are irrelevant. Branch on `data.code` == "
-                    + "DUPLICATE_SERVICE, never on `message`.";
+            "The same service copy (same type, same duration and same name) is already assigned "
+                    + "to THIS master (Phase 302 D4 / 465 — the conflict is per-MASTER and per copy, "
+                    + "not per-salon or per type: another master in the same salon already offering "
+                    + "this copy is NOT a conflict here, the salon's existing copy is reused and this "
+                    + "call returns 201; another copy of the type — a different duration or name — "
+                    + "is assigned as its own row). Price never participates. Branch on `data.code` "
+                    + "== DUPLICATE_SERVICE, never on `message`.";
 
     /**
      * Description attached to {@link #getSalonServiceCatalog}'s {@code @Operation} (Phase 305 D2):
@@ -249,20 +253,17 @@ public class ServiceController {
     }
 
     /**
-     * Edits ONE master's OWN price band and/or duration override (Phase 311) — the only
+     * Edits ONE master's price band and/or duration override (Phase 311) — the only
      * {@code PATCH}/{@code PUT} anywhere on {@code master_services}. Same path as
      * {@link #unassignServiceFromMaster}'s {@code DELETE}, one verb apart (D1):
      * {@code POST .../services} assigns, this {@code PATCH} edits the assignment's band, and
      * {@code DELETE .../services/{serviceDefId}} unassigns.
      *
-     * <p><b>D5 — narrows the "SALON_MASTER is read-only" invariant for ONE row and ONE column
-     * group.</b> Unlike every other write in this controller, {@code @authz.canEditMasterServiceBand}
-     * ALSO admits the {@code SALON_MASTER} whose own {@code masters} row is {@code #masterId} —
-     * they may edit their own band and nothing else (Phase 306 D6 / Phase 310 D5 still hold for
-     * every other endpoint). The predicate is a NEW, independent entry point from
-     * {@code canReadSalonMasterServices}; it does not reuse or widen that read gate, and the
-     * service-definition write gate ({@code enforceCanManageServiceDefinition} behind a role gate
-     * that excludes {@code SALON_MASTER}) is untouched.
+     * <p><b>Phase 463 — owner/admin only.</b> The gate is the salon bulk endpoint's exact
+     * expression ({@code canManageSalon} AND {@code masterBelongsToSalon}). A {@code SALON_MASTER}
+     * never sets or edits their own durations or prices (locked decision) and gets {@code 403},
+     * including on their own row; this reverses Phase 311 D5. The service-layer twin
+     * {@code enforceCanEditMasterServiceBand} re-proves the same predicate.
      *
      * <p><b>D4 — {@code null} means "leave unchanged"; {@code clearBand}/{@code
      * clearDurationOverride} are the explicit reverts.</b> See
@@ -292,10 +293,14 @@ public class ServiceController {
                             + "serviceDefId) — also returned when master/definition are missing, "
                             + "in another salon, or the assignment is inactive."),
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "403", description = "Caller is not the owner or an admin of "
+                            + "salonId, or masterId is not in salonId. A SALON_MASTER is always "
+                            + "denied, including on their own row (Phase 463)."),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
                     responseCode = "429", description = RATE_LIMITED_429)
     })
     @PatchMapping("/salons/{salonId}/masters/{masterId}/services/{serviceDefId}")
-    @PreAuthorize("@authz.canEditMasterServiceBand(authentication, #salonId, #masterId)")
+    @PreAuthorize("@authz.canManageSalon(authentication, #salonId) and @authz.masterBelongsToSalonForBandEdit(#masterId, #salonId)")
     public ResponseEntity<ApiResponse<MasterServiceResponse>> updateMasterServiceBand(
             @PathVariable UUID salonId,
             @Parameter(description = "Master row id (NOT a user id)") @PathVariable UUID masterId,
@@ -614,8 +619,8 @@ public class ServiceController {
      *
      * <p>Additive: callable whether the target master's catalogue is empty or already populated.
      * The whole batch is created in one transaction (all-or-nothing). The only 409 this endpoint
-     * returns is {@code DUPLICATE_SERVICE} — a batch item whose service type the master already
-     * offers.
+     * returns is {@code DUPLICATE_SERVICE} — a batch item whose service copy (type + duration +
+     * name, phase 465) the master already offers.
      */
     @Operation(summary = "Bulk-create a salon master's services",
             description = "Creates every selected service for the given master in one "

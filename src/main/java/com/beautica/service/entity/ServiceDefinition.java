@@ -25,21 +25,23 @@ import java.util.UUID;
 /**
  * A service offered by an owner (a salon or a master).
  *
- * <p><b>Uniqueness — one ACTIVE service per {@code (ownerType, ownerId, serviceType)}.</b>
- * Enforced by the partial unique index {@code ux_service_def_owner_service_type_active}
- * (V121):
+ * <p><b>Uniqueness — one ACTIVE copy per {@code (ownerType, ownerId, serviceType, baseDuration,
+ * name)}.</b> Enforced by the partial unique index
+ * {@code ux_service_def_owner_type_duration_name_active} (V233, phase 464, which dropped V121's
+ * one-active-per-type index):
  *
  * <pre>{@code
- * CREATE UNIQUE INDEX ux_service_def_owner_service_type_active
- *     ON service_definitions (owner_type, owner_id, service_type_id)
+ * CREATE UNIQUE INDEX ux_service_def_owner_type_duration_name_active
+ *     ON service_definitions (owner_type, owner_id, service_type_id, base_duration_minutes,
+ *                             lower(btrim(name)))
  *     WHERE is_active = true;
  * }</pre>
  *
- * <p>The key is {@code service_type_id}, never {@code name}: the name is derived from the type
- * ({@code ServiceCatalogService#resolveCreateName} defaults to {@code serviceType.nameUk}, and
- * the bulk path always uses it), so a custom name must not be able to bypass the rule. Price and
- * duration are deliberately NOT part of the key — two rows of the same type at different prices
- * are duplicates by the locked product decision, not variants.
+ * <p>An owner may hold several active copies of one service type («копії послуги»), each with its
+ * own duration, price and optional custom name; two copies must differ in base duration OR in name
+ * (compared trimmed and case-insensitive). Price is deliberately NOT part of the key — two copies
+ * that differ only in price are duplicates by the locked product decision. The per-master
+ * {@code duration_override_minutes} does not participate either.
  *
  * <p>The index is <b>partial on {@code is_active = true}</b> because deletion is soft
  * ({@code ServiceRepository#deactivateById} flips the flag and the row survives). An
@@ -67,8 +69,8 @@ import java.util.UUID;
 // cosmetic and will never fail a boot. Only a reader can catch it — hence this note.
 //
 // Not every real index appears here: idx_service_def_category, the GIN trigram
-// idx_service_definitions_name_trgm (V98) and the PARTIAL unique ux_service_def_owner_service_type_active
-// (V121) are absent because JPA's @Index cannot express GIN or partial indices at all — see the class
+// idx_service_definitions_name_trgm (V98) and the PARTIAL unique ux_service_def_owner_type_duration_name_active
+// (V233) are absent because JPA's @Index cannot express GIN or partial indices at all — see the class
 // javadoc above for the unique one. Absent-but-real is harmless; declared-but-absent is the drift.
 @Table(name = "service_definitions",
         indexes = {

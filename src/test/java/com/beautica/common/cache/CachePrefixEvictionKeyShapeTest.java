@@ -15,6 +15,7 @@ import com.beautica.master.service.MasterScheduleService;
 import com.beautica.master.service.MasterService;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.service.entity.MasterServiceAssignment;
+import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.repository.MasterServiceRepository;
 import com.beautica.service.service.SalonCatalogCacheEvictor;
 import com.beautica.user.UserRepository;
@@ -192,6 +193,11 @@ class CachePrefixEvictionKeyShapeTest {
             MasterServiceAssignment msa = mock(MasterServiceAssignment.class);
             when(msa.isActive()).thenReturn(true);
             when(msa.getMaster()).thenReturn(master);
+            // ServiceBookability.isBookable requires an active definition; without it the lookup 404s
+            // before the inactive-master early return this test pins.
+            ServiceDefinition definition = mock(ServiceDefinition.class);
+            when(definition.isActive()).thenReturn(true);
+            when(msa.getServiceDefinition()).thenReturn(definition);
             when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
                     .thenReturn(Optional.of(msa));
         }

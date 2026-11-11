@@ -201,6 +201,109 @@ public class InAppNotificationService {
     }
 
     /**
+     * One event of {@link #notifyBookingEventsBulk}: {@code appointmentId == null} is a booking-keyed event
+     * (the {@link #notifyBookingEvent} shape, keyed to {@code representative}), non-null a visit-keyed one (the
+     * {@link #notifyVisitEvent(InAppNotificationType, UUID, Booking, UUID)} shape).
+     */
+    public record BookingEventTarget(Booking representative, UUID appointmentId) {
+
+        public BookingEventTarget {
+            Objects.requireNonNull(representative, "representative must not be null");
+        }
+
+        public static BookingEventTarget forBooking(Booking booking) {
+            return new BookingEventTarget(booking, null);
+        }
+
+        public static BookingEventTarget forVisit(UUID appointmentId, Booking representative) {
+            return new BookingEventTarget(representative, Objects.requireNonNull(appointmentId, "appointmentId"));
+        }
+    }
+
+    /**
+     * Phase 474 audit-fix (perf, finding 1) — MANY {@link #notifyBookingEvent}/{@link #notifyVisitEvent} calls of
+     * one {@code type} in ONE statement ({@link InAppNotificationRepository#insertEventRowsBulk}), for a caller
+     * that declines many visits in one write (the schedule-override mass decline). Every row — recipient set
+     * (same {@link #recipientsForSimpleEvent} switch, actor removed), {@code booking_id}/{@code appointment_id},
+     * {@code salon_id}, dedup key — equals what the per-event method would write for that target; only the
+     * statement count changes. An empty {@code targets} (or every target recipient-less) writes nothing.
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void notifyBookingEventsBulk(
+            InAppNotificationType type, Collection<BookingEventTarget> targets, UUID actorUserId) {
+        EventRows rows = new EventRows();
+        for (BookingEventTarget target : targets) {
+            addEventRows(rows, type, target, actorUserId);
+        }
+        if (rows.isEmpty()) {
+            return;
+        }
+        int written = pushEnabled
+                ? repository.insertEventRowsBulkWithPush(type.name(), rows.recipients(), rows.bookingIds(),
+                        rows.appointmentIds(), rows.salonIds(), rows.dedupKeys())
+                : repository.insertEventRowsBulk(type.name(), rows.recipients(), rows.bookingIds(),
+                        rows.appointmentIds(), rows.salonIds(), rows.dedupKeys());
+        log.debug("in-app notify(bulk events) type={} events={} rowsWritten={}", type, targets.size(), written);
+    }
+
+    private void addEventRows(
+            EventRows rows, InAppNotificationType type, BookingEventTarget target, UUID actorUserId) {
+        Booking representative = target.representative();
+        boolean walkIn = representative.getBookingSource() == BookingSource.STAFF;
+        Set<UUID> recipients = recipientsForSimpleEvent(
+                type, representative.getMaster(), representative.getSalon(), clientIdOf(representative), walkIn);
+        recipients.remove(actorUserId);
+        boolean visitKeyed = target.appointmentId() != null;
+        UUID bookingId = visitKeyed ? null : representative.getId();
+        String key = visitKeyed ? dedupKey(type, target.appointmentId()) : dedupKey(type, representative.getId());
+        UUID salonId = salonIdOf(representative.getSalon());
+        for (UUID recipient : recipients) {
+            rows.add(recipient, bookingId, target.appointmentId(), salonId, key);
+        }
+    }
+
+    /** Column-wise accumulator for {@link InAppNotificationRepository#insertEventRowsBulk}'s parallel arrays. */
+    private static final class EventRows {
+        private final List<UUID> recipients = new ArrayList<>();
+        private final List<UUID> bookingIds = new ArrayList<>();
+        private final List<UUID> appointmentIds = new ArrayList<>();
+        private final List<UUID> salonIds = new ArrayList<>();
+        private final List<String> dedupKeys = new ArrayList<>();
+
+        void add(UUID recipient, UUID bookingId, UUID appointmentId, UUID salonId, String dedupKey) {
+            recipients.add(recipient);
+            bookingIds.add(bookingId);
+            appointmentIds.add(appointmentId);
+            salonIds.add(salonId);
+            dedupKeys.add(dedupKey);
+        }
+
+        boolean isEmpty() {
+            return recipients.isEmpty();
+        }
+
+        UUID[] recipients() {
+            return recipients.toArray(UUID[]::new);
+        }
+
+        UUID[] bookingIds() {
+            return bookingIds.toArray(UUID[]::new);
+        }
+
+        UUID[] appointmentIds() {
+            return appointmentIds.toArray(UUID[]::new);
+        }
+
+        UUID[] salonIds() {
+            return salonIds.toArray(UUID[]::new);
+        }
+
+        String[] dedupKeys() {
+            return dedupKeys.toArray(String[]::new);
+        }
+    }
+
+    /**
      * Row 3 (decline) and rows 6/7/9/10 (client-only) share one recipient shape switch; row 1/1w and
      * row 2 share {@link InAppRecipientResolver#providerSet}/{@link
      * InAppRecipientResolver#masterOnly}. Kept as ONE switch, called by both {@link
@@ -273,33 +376,12 @@ public class InAppNotificationService {
         writeReschedule(
                 booking.getMaster(), booking.getSalon(), clientIdOf(booking),
                 booking.getBookingSource() == BookingSource.STAFF,
-                booking.getId(), null, initiatedByProvider, newStart, actorUserId);
-    }
-
-    /**
-     * The visit-level twin of {@link #notifyRescheduled} — {@code AppointmentTransitionService
-     * #rescheduleAppointment}'s whole-visit reschedule, once per appointment.
-     *
-     * @param appointmentId       the visit that was rescheduled; becomes {@code appointment_id}
-     * @param representative      any one already-loaded item {@code Booking} of the visit — see
-     *                            {@link #notifyVisitEvent}'s javadoc for why this is free to read
-     * @param initiatedByProvider see {@link #notifyRescheduled}
-     * @param newStart            see {@link #notifyRescheduled}
-     * @param actorUserId         see {@link #notifyRescheduled}
-     */
-    @Transactional(propagation = Propagation.MANDATORY)
-    public void notifyRescheduledVisit(
-            UUID appointmentId, Booking representative, boolean initiatedByProvider,
-            Instant newStart, UUID actorUserId) {
-        writeReschedule(
-                representative.getMaster(), representative.getSalon(), clientIdOf(representative),
-                representative.getBookingSource() == BookingSource.STAFF,
-                null, appointmentId, initiatedByProvider, newStart, actorUserId);
+                booking.getId(), initiatedByProvider, newStart, actorUserId);
     }
 
     private void writeReschedule(
             Master master, Salon salon, UUID clientId, boolean walkIn,
-            UUID bookingId, UUID appointmentId, boolean initiatedByProvider, Instant newStart, UUID actorUserId) {
+            UUID bookingId, boolean initiatedByProvider, Instant newStart, UUID actorUserId) {
         Set<UUID> recipients = recipientResolver.masterOnly(master); // rule 6 — always, unless actor
         if (!walkIn) {
             if (initiatedByProvider) {
@@ -315,11 +397,11 @@ public class InAppNotificationService {
             return;
         }
         UUID salonId = salonIdOf(salon);
-        UUID keyId = appointmentId != null ? appointmentId : bookingId;
-        String dedupKey = dedupKey(InAppNotificationType.BOOKING_RESCHEDULED, keyId, newStart.getEpochSecond());
-        write(InAppNotificationType.BOOKING_RESCHEDULED, recipients, bookingId, appointmentId, salonId, null, dedupKey);
-        log.debug("in-app notify type=BOOKING_RESCHEDULED bookingId={} appointmentId={} recipients={}",
-                bookingId, appointmentId, recipients.size());
+        // Booking-keyed only: the visit-keyed whole-visit reschedule was removed in phase 475.
+        String dedupKey = dedupKey(InAppNotificationType.BOOKING_RESCHEDULED, bookingId, newStart.getEpochSecond());
+        write(InAppNotificationType.BOOKING_RESCHEDULED, recipients, bookingId, null, salonId, null, dedupKey);
+        log.debug("in-app notify type=BOOKING_RESCHEDULED bookingId={} recipients={}",
+                bookingId, recipients.size());
     }
 
     /**

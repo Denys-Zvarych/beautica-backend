@@ -150,8 +150,8 @@ final class BookingSlotAvailabilityGuard {
      * service that fits alone while the CHAIN runs past the master's working window.
      *
      * <p>Shared by {@code AppointmentService#doCreateAppointment}, {@code GuestBookingService}'s LINK
-     * visit create and {@code AppointmentTransitionService#rescheduleAppointment} — which previously
-     * carried a byte-for-byte duplicate of this body, the exact drift risk this class exists to remove.
+     * visit create (the whole-visit reschedule that also used it was removed in phase 475). One body, so
+     * the create paths cannot drift.
      *
      * <p><b>{@code preloaded} (Perf MEDIUM, 2026-08-11).</b> The PARALLEL assignment list the caller's
      * {@code VisitPlanner#planChainedItems} already resolved (same size, same order as
@@ -198,29 +198,6 @@ final class BookingSlotAvailabilityGuard {
         if (!slotCalculationService.isStaffVisitSlotAvailable(
                 masterId, kyivDate(startsAt), masterServiceIds, preloaded, startsAt)) {
             throw new BusinessException(HttpStatus.CONFLICT, SLOT_NOT_AVAILABLE);
-        }
-    }
-
-    /**
-     * <b>Whole-chain actor-dispatching overload (reschedule parity)</b> — the multi-service twin of
-     * {@link #assertStartsOnAvailableSlot(SlotCalculationService, UUID, UUID, MasterServiceAssignment,
-     * OffsetDateTime, boolean)}, selecting between {@link #assertStaffVisitStartsOnAvailableSlot} (staff
-     * floor, minimum lead 0) and {@link #assertVisitStartsOnAvailableSlot} (client floor, 15 min).
-     * Defines no oracle of its own; both arms are the existing methods above.
-     *
-     * <p>Used by {@code AppointmentTransitionService#rescheduleAppointment}, where the WHOLE visit block
-     * moves — never N per-item checks, for the reason
-     * {@link #assertStaffVisitStartsOnAvailableSlot} spells out.
-     */
-    static void assertVisitStartsOnAvailableSlot(
-            SlotCalculationService slotCalculationService, UUID masterId, List<UUID> masterServiceIds,
-            List<MasterServiceAssignment> preloaded, OffsetDateTime startsAt, boolean initiatedByProvider) {
-        if (initiatedByProvider) {
-            assertStaffVisitStartsOnAvailableSlot(
-                    slotCalculationService, masterId, masterServiceIds, preloaded, startsAt);
-        } else {
-            assertVisitStartsOnAvailableSlot(
-                    slotCalculationService, masterId, masterServiceIds, preloaded, startsAt);
         }
     }
 

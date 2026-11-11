@@ -28,7 +28,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * QA-authored (track 25.x audit, 2026-07-14) — closes the biggest gap found in the dev-authored
  * suite: NOTHING proved that the four comment write paths in {@code BookingService} actually
- * persist the note text through the real HTTP endpoints. Every existing decline/not-complete/
+ * persist the note text through the real HTTP endpoints. Every existing decline/
  * cancel integration test asserted status + cancellation_reason only, never the comment column —
  * so a regression that deleted {@code booking.setProviderComment(...)} or
  * {@code booking.setClientCancellationNote(...)} (i.e. exactly D2, the live prod bug this track
@@ -39,8 +39,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * HTTP actually lands normalized in the database; (2) the comment CONTRACT on
  * {@code StatusUpdateRequest.comment} (below) — Phase 25.2 originally made it required (
  * {@code @NotBlank} + {@code @Size(min=10,max=1000)}), then Phase 25.9, shipped the same day,
- * reversed that: the note is now optional for all roles on both {@code /decline} and
- * {@code /not-complete}. Only the raw {@code @Size(max=1000)} DoS ceiling and the
+ * reversed that: the note is now optional for all roles on {@code /decline} ({@code /not-complete}
+ * was removed in phase 475, with its tests here). Only the raw {@code @Size(max=1000)} DoS ceiling and the
  * control-character {@code @Pattern} guard remain — this class asserts both directions: an
  * absent/blank/short comment is accepted and persists NULL/verbatim, while the surviving
  * ceiling/pattern guards still 400.
@@ -108,7 +108,7 @@ class BookingCommentPersistenceIT extends AbstractIntegrationTest {
         assertThat(dbNote).isNull();
     }
 
-    // ── provider_comment must actually persist on /decline and /not-complete ─────
+    // ── provider_comment must actually persist on /decline ─────
 
     @Test
     @DisplayName("PATCH /decline persists the provider's note to provider_comment (DB) — "
@@ -129,27 +129,6 @@ class BookingCommentPersistenceIT extends AbstractIntegrationTest {
         assertThat(dbNote)
                 .as("provider's /decline comment must be persisted to provider_comment")
                 .isEqualTo("Майстер захворів, перенесемо на інший день");
-    }
-
-    @Test
-    @DisplayName("PATCH /not-complete persists the provider's note to provider_comment (DB) — "
-            + "existing suites only asserted status + cancellation_reason, never this column")
-    void should_persistProviderComment_when_providerMarksNotComplete() {
-        Fixture fx = seedSalonBooking();
-        UUID bookingId = insertElapsedBookingWithStatus(fx, "CONFIRMED", null);
-
-        String body = "{\"cancellationReason\":\"CLIENT_NO_SHOW\",\"comment\":\"Клієнт не з'явився, чекали 20 хвилин\"}";
-        ResponseEntity<Void> resp = restTemplate.exchange(
-                BOOKINGS_URL + "/" + bookingId + "/not-complete", HttpMethod.PATCH,
-                new HttpEntity<>(body, bearerHeaders(tokenFor(fx.ownerEmail))),
-                Void.class);
-        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
-
-        String dbNote = jdbcTemplate.queryForObject(
-                "SELECT provider_comment FROM bookings WHERE id = ?", String.class, bookingId);
-        assertThat(dbNote)
-                .as("provider's /not-complete comment must be persisted to provider_comment")
-                .isEqualTo("Клієнт не з'явився, чекали 20 хвилин");
     }
 
     // ── normalization end-to-end (not just the BookingComments unit test) ────────
@@ -186,7 +165,7 @@ class BookingCommentPersistenceIT extends AbstractIntegrationTest {
 
     // ── optional-note contract (Phase 25.9 — reverses Phase 25.2's "required, ≥10-char" ─────
     // decision, made and shipped earlier the same day): comment is now optional for all roles
-    // on both /decline and /not-complete. @NotBlank and the normalized-length floor
+    // on /decline. @NotBlank and the normalized-length floor
     // (@NormalizedSize) were removed from StatusUpdateRequest.comment; only the raw
     // @Size(max=1000) DoS ceiling and the control-character @Pattern guard remain.
 
@@ -252,83 +231,6 @@ class BookingCommentPersistenceIT extends AbstractIntegrationTest {
 
         assertThat(resp.getStatusCode())
                 .as("an over-1000-char comment must still fail the raw @Size ceiling")
-                .isEqualTo(HttpStatus.BAD_REQUEST);
-        assertUnchanged(bookingId, "CONFIRMED");
-    }
-
-    @Test
-    @DisplayName("Phase 25.9: PATCH /not-complete — 204 when comment field is entirely absent, "
-            + "and provider_comment persists NULL")
-    void should_return204WithNullProviderComment_when_notCompleteCommentFieldAbsent() {
-        Fixture fx = seedSalonBooking();
-        UUID bookingId = insertElapsedBookingWithStatus(fx, "CONFIRMED", null);
-
-        String body = "{\"cancellationReason\":\"CLIENT_NO_SHOW\"}";
-        ResponseEntity<Void> resp = restTemplate.exchange(
-                BOOKINGS_URL + "/" + bookingId + "/not-complete", HttpMethod.PATCH,
-                new HttpEntity<>(body, bearerHeaders(tokenFor(fx.ownerEmail))),
-                Void.class);
-
-        assertThat(resp.getStatusCode())
-                .as("an absent comment must now be accepted on /not-complete too")
-                .isEqualTo(HttpStatus.NO_CONTENT);
-        assertThat(dbStatus(bookingId)).isEqualTo("NOT_COMPLETED");
-        assertThat(dbProviderComment(bookingId)).isNull();
-    }
-
-    @Test
-    @DisplayName("Phase 25.9: PATCH /not-complete — 204 when comment is blank (whitespace only), "
-            + "and provider_comment persists NULL")
-    void should_return204WithNullProviderComment_when_notCompleteCommentIsBlank() {
-        Fixture fx = seedSalonBooking();
-        UUID bookingId = insertElapsedBookingWithStatus(fx, "CONFIRMED", null);
-
-        String body = "{\"cancellationReason\":\"CLIENT_NO_SHOW\",\"comment\":\"   \"}";
-        ResponseEntity<Void> resp = restTemplate.exchange(
-                BOOKINGS_URL + "/" + bookingId + "/not-complete", HttpMethod.PATCH,
-                new HttpEntity<>(body, bearerHeaders(tokenFor(fx.ownerEmail))),
-                Void.class);
-
-        assertThat(resp.getStatusCode())
-                .as("a blank comment must now be accepted on /not-complete too")
-                .isEqualTo(HttpStatus.NO_CONTENT);
-        assertThat(dbProviderComment(bookingId)).isNull();
-    }
-
-    @Test
-    @DisplayName("Phase 25.9: PATCH /not-complete — 204 when comment is 9 characters (below the "
-            + "old, now-removed 10-char floor), persisted verbatim")
-    void should_return204_when_notCompleteCommentIsNineChars() {
-        Fixture fx = seedSalonBooking();
-        UUID bookingId = insertElapsedBookingWithStatus(fx, "CONFIRMED", null);
-
-        String body = "{\"cancellationReason\":\"CLIENT_NO_SHOW\",\"comment\":\"123456789\"}";
-        ResponseEntity<Void> resp = restTemplate.exchange(
-                BOOKINGS_URL + "/" + bookingId + "/not-complete", HttpMethod.PATCH,
-                new HttpEntity<>(body, bearerHeaders(tokenFor(fx.ownerEmail))),
-                Void.class);
-
-        assertThat(resp.getStatusCode())
-                .as("a 9-char comment must be accepted on /not-complete too")
-                .isEqualTo(HttpStatus.NO_CONTENT);
-        assertThat(dbProviderComment(bookingId)).isEqualTo("123456789");
-    }
-
-    @Test
-    @DisplayName("PATCH /not-complete — 400 when comment contains a forbidden control character "
-            + "(NUL byte) — the @Pattern guard survives the note becoming optional")
-    void should_return400_when_notCompleteCommentContainsControlCharacter() {
-        Fixture fx = seedSalonBooking();
-        UUID bookingId = insertBookingWithStatus(fx, "CONFIRMED", null);
-
-        String body = "{\"cancellationReason\":\"CLIENT_NO_SHOW\",\"comment\":\"legit note\u0000embedded\"}";
-        ResponseEntity<String> resp = restTemplate.exchange(
-                BOOKINGS_URL + "/" + bookingId + "/not-complete", HttpMethod.PATCH,
-                new HttpEntity<>(body, bearerHeaders(tokenFor(fx.ownerEmail))),
-                String.class);
-
-        assertThat(resp.getStatusCode())
-                .as("an embedded NUL byte must still fail the control-character @Pattern")
                 .isEqualTo(HttpStatus.BAD_REQUEST);
         assertUnchanged(bookingId, "CONFIRMED");
     }
@@ -412,24 +314,6 @@ class BookingCommentPersistenceIT extends AbstractIntegrationTest {
                         "starts_at, ends_at, price_at_booking, duration_minutes_at_booking, buffer_minutes_at_booking, " +
                         "booking_source, provider_comment, created_at, updated_at) " +
                         "VALUES (?, ?, ?, ?, ?, ?, NOW() + interval '1 day', NOW() + interval '1 day 1 hour', " +
-                        "500.00, 60, 0, 'APP', ?, NOW(), NOW())",
-                bookingId, fx.clientId, fx.masterId, fx.masterServiceId, fx.salonId, status, providerComment);
-        return bookingId;
-    }
-
-    /**
-     * ELAPSED variant of {@link #insertBookingWithStatus} — used by this class's
-     * {@code /not-complete} tests as the conventional no-show fixture (neither {@code /decline}
-     * nor {@code /not-complete} carries a temporal guard, so this is not a correctness
-     * requirement).
-     */
-    private UUID insertElapsedBookingWithStatus(Fixture fx, String status, String providerComment) {
-        UUID bookingId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO bookings (id, client_id, master_id, master_service_id, salon_id, status, " +
-                        "starts_at, ends_at, price_at_booking, duration_minutes_at_booking, buffer_minutes_at_booking, " +
-                        "booking_source, provider_comment, created_at, updated_at) " +
-                        "VALUES (?, ?, ?, ?, ?, ?, NOW() - interval '2 hours', NOW() - interval '1 hour', " +
                         "500.00, 60, 0, 'APP', ?, NOW(), NOW())",
                 bookingId, fx.clientId, fx.masterId, fx.masterServiceId, fx.salonId, status, providerComment);
         return bookingId;

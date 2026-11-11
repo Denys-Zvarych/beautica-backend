@@ -99,10 +99,14 @@ class SalonGuestBookingSmsIT extends AbstractWalkInBookingSmsIT {
         assertThat(created.getStatusCode()).as(created.getBody()).isEqualTo(HttpStatus.CREATED);
         drainWorker.drain();
         resetTurbosms();
-        // masterServiceIds (the website's body) creates a visit, so the provider declines the visit.
+        // masterServiceIds (the website's body) creates a visit, so the provider declines the visit's
+        // service through the per-service route (phase 475 removed the whole-visit decline).
         UUID appointmentId = UUID.fromString(readJson(created.getBody()).path("appointmentId").asText());
+        UUID item = jdbcTemplate.queryForObject(
+                "SELECT id FROM bookings WHERE appointment_id = ? ORDER BY starts_at LIMIT 1", UUID.class, appointmentId);
 
-        ResponseEntity<String> decline = restTemplate.exchange("/api/v1/appointments/" + appointmentId + "/decline",
+        ResponseEntity<String> decline = restTemplate.exchange(
+                "/api/v1/appointments/" + appointmentId + "/services/" + item + "/decline",
                 HttpMethod.PATCH, new HttpEntity<>("{}", bearerHeaders(tokenFor(salon.ownerEmail()))), String.class);
         drainWorker.drain();
 
