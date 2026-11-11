@@ -1,3 +1,11 @@
+-- non-destructive
+-- Reason: the new unique key is strictly weaker than V121's (a superset of its columns), so every existing active row set and every previous-app write already satisfies it.
+-- contract-of: V121
+-- Why contract-of V121: the CREATE UNIQUE INDEX is covered by the marker above, but the DROP of V121's
+-- ux_service_def_owner_service_type_active is a real contract step. The previous app version maps a violation of
+-- THAT index name to the 409 DUPLICATE_SERVICE and assumes one active row per (owner, service type); copies created
+-- under this file's key break both. Forward-only (D4 below): never roll the previous image back onto this schema.
+--
 -- Phase 464 — one owner may hold several ACTIVE copies of one service type («копії послуги»).
 --
 -- Replaces V121's ux_service_def_owner_service_type_active (owner_type, owner_id, service_type_id)
