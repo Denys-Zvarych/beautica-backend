@@ -15,6 +15,8 @@ import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
@@ -682,129 +684,24 @@ class BookingControllerTest {
                 .andExpect(status().isForbidden());
     }
 
-    // ── PATCH /{bookingId}/not-complete ──────────────────────────────────────
+    // ── PATCH /{bookingId}/not-complete — removed in phase 475 (D2: framework default, no tombstone) ──
 
-    @Test
-    @DisplayName("PATCH /{bookingId}/not-complete — 204 when authorized SALON_OWNER marks not-completed")
-    void should_return204_when_authorizedNotCompleteBooking() throws Exception {
-        var ownerId = UUID.randomUUID();
+    @ParameterizedTest(name = "PATCH /bookings/:id/not-complete as {0} → 404")
+    @EnumSource(value = Role.class, names = {"SALON_OWNER", "SALON_ADMIN", "INDEPENDENT_MASTER", "CLIENT"})
+    @DisplayName("PATCH /{bookingId}/not-complete — unmapped since phase 475: an authorised caller gets "
+            + "Spring's 404 and the booking service is never reached")
+    void should_return404AndNeverReachService_when_removedNotCompleteRouteCalled(Role role) throws Exception {
         var bookingId = UUID.randomUUID();
-        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, "Тестовий коментар"));
-        when(authorizationService.canCancelBooking(any(), eq(bookingId))).thenReturn(true);
-        when(bookingService.notCompleteBooking(any(), eq(bookingId), any())).thenReturn(null);
+        var body = "{\"cancellationReason\":\"CLIENT_NO_SHOW\",\"comment\":\"no-show\"}";
 
         mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/not-complete")
-                        .with(authenticatedAs(ownerId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(authenticatedAs(UUID.randomUUID(), "user@beautica.test", role))
                         .with(csrf())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(body))
-                .andExpect(status().isNoContent());
-    }
+                .andExpect(status().isNotFound());
 
-    @Test
-    @DisplayName("Phase 25.9: PATCH /{bookingId}/not-complete — 204 when comment is absent (the note "
-            + "is optional for all roles, reverses Phase 25.2's required-comment decision)")
-    void should_return204_when_notCompleteCalledWithNoComment() throws Exception {
-        var ownerId = UUID.randomUUID();
-        var bookingId = UUID.randomUUID();
-        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(CancellationReason.CLIENT_NO_SHOW, null));
-        when(authorizationService.canCancelBooking(any(), eq(bookingId))).thenReturn(true);
-        when(bookingService.notCompleteBooking(any(), eq(bookingId), any())).thenReturn(null);
-
-        mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/not-complete")
-                        .with(authenticatedAs(ownerId, "owner@beautica.test", Role.SALON_OWNER))
-                        .with(csrf())
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content(body))
-                .andExpect(status().isNoContent());
-    }
-
-    @Test
-    @DisplayName("PATCH /{bookingId}/not-complete — 204 when INDEPENDENT_MASTER marks booking not-completed")
-    void should_return204_when_independentMasterMarksNotCompleted() throws Exception {
-        var masterId = UUID.randomUUID();
-        var bookingId = UUID.randomUUID();
-        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(CancellationReason.CLIENT_NO_SHOW, "Клієнт не з'явився"));
-        when(authorizationService.canCancelBooking(any(), eq(bookingId))).thenReturn(true);
-        when(bookingService.notCompleteBooking(any(), eq(bookingId), any())).thenReturn(null);
-
-        mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/not-complete")
-                        .with(authenticatedAs(masterId, "master@beautica.test", Role.INDEPENDENT_MASTER))
-                        .with(csrf())
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content(body))
-                .andExpect(status().isNoContent());
-    }
-
-    @Test
-    @DisplayName("PATCH /{bookingId}/not-complete — 403 when SALON_MASTER attempts to mark booking not-completed")
-    void should_return403_when_salonMasterMarksNotCompleted() throws Exception {
-        var masterId = UUID.randomUUID();
-        var bookingId = UUID.randomUUID();
-        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, "Тестовий коментар"));
-
-        mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/not-complete")
-                        .with(authenticatedAs(masterId, "master@beautica.test", Role.SALON_MASTER))
-                        .with(csrf())
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content(body))
-                .andExpect(status().isForbidden());
-    }
-
-    // Phase 24.2: SALON_ADMIN passes the controller role gate. Unlike /decline, the /not-complete
-    // annotation is role-only (§D — the redundant SpEL @authz.canCancelBooking ownership clause was
-    // dropped), so ownership for an admin NOT assigned to the booking's salon is enforced by the
-    // service-layer @authz.enforceCanCancelBooking guard in BookingService#notCompleteBooking. Here
-    // that mocked service throws ForbiddenException, which the controller propagates as 403.
-    // TODO(24.7): add the assigned-SALON_ADMIN ✅ 204 case to the authz matrix.
-    @Test
-    @DisplayName("PATCH /{bookingId}/not-complete — 403 when SALON_ADMIN is not assigned to the booking's salon")
-    void should_return403_when_salonAdminAttemptsToNotComplete() throws Exception {
-        var adminId = UUID.randomUUID();
-        var bookingId = UUID.randomUUID();
-        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, "Тестовий коментар"));
-        when(bookingService.notCompleteBooking(any(), eq(bookingId), any()))
-                .thenThrow(new ForbiddenException("Access denied"));
-
-        mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/not-complete")
-                        .with(authenticatedAs(adminId, "admin@beautica.test", Role.SALON_ADMIN))
-                        .with(csrf())
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content(body))
-                .andExpect(status().isForbidden());
-    }
-
-    @Test
-    @DisplayName("PATCH /{bookingId}/not-complete — 403 when CLIENT attempts to mark not-completed")
-    void should_return403_when_clientNotCompletesBooking() throws Exception {
-        var clientId = UUID.randomUUID();
-        var bookingId = UUID.randomUUID();
-        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, "Тестовий коментар"));
-
-        mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/not-complete")
-                        .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
-                        .with(csrf())
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content(body))
-                .andExpect(status().isForbidden());
-    }
-
-    @Test
-    @DisplayName("PATCH /{bookingId}/not-complete — 400 when cancellationReason is absent")
-    void should_return400_when_notCompleteCalledWithoutReason() throws Exception {
-        var ownerId = UUID.randomUUID();
-        var bookingId = UUID.randomUUID();
-        var body = objectMapper.writeValueAsString(new StatusUpdateRequest(null, "Тестовий коментар"));
-        when(authorizationService.canCancelBooking(any(), eq(bookingId))).thenReturn(true);
-        when(bookingService.notCompleteBooking(any(), any(), any()))
-                .thenThrow(new BusinessException(HttpStatus.BAD_REQUEST, "Cancellation reason required"));
-
-        mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/not-complete")
-                        .with(authenticatedAs(ownerId, "owner@beautica.test", Role.SALON_OWNER))
-                        .with(csrf())
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content(body))
-                .andExpect(status().isBadRequest());
+        org.mockito.Mockito.verifyNoInteractions(bookingService);
     }
 
     // ── PATCH /{bookingId}/cancel (additional) ────────────────────────────────
@@ -2649,47 +2546,6 @@ class BookingControllerTest {
                 .andExpect(jsonPath("$.success").value(false));
 
         org.mockito.Mockito.verify(bookingService, org.mockito.Mockito.never()).declineBooking(any(), any(), any());
-    }
-
-    // ── QA-HIGH: StatusUpdateRequest.comment @Pattern — not-complete control-char guard
-
-    @Test
-    @DisplayName("PATCH /{bookingId}/not-complete — 204 when comment contains a tab (whitespace is allowed)")
-    void should_return204_when_notCompleteCommentContainsTab() throws Exception {
-        var ownerId = UUID.randomUUID();
-        var bookingId = UUID.randomUUID();
-        // Tab (0x09) is whitespace, not a forbidden C0 control char — @Pattern must accept it
-        var body = "{\"cancellationReason\":\"CLIENT_NO_SHOW\""
-                + ",\"comment\":\"no-show note\\ttab-separated\"}";
-        when(authorizationService.canCancelBooking(any(), eq(bookingId))).thenReturn(true);
-        when(bookingService.notCompleteBooking(any(), eq(bookingId), any())).thenReturn(null);
-
-        mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/not-complete")
-                        .with(authenticatedAs(ownerId, "owner@beautica.test", Role.SALON_OWNER))
-                        .with(csrf())
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content(body))
-                .andExpect(status().isNoContent());
-    }
-
-    @Test
-    @DisplayName("PATCH /{bookingId}/not-complete — 400 when comment contains a forbidden control character (NUL byte)")
-    void should_return400_when_notCompleteCommentContainsControlCharacter() throws Exception {
-        var ownerId = UUID.randomUUID();
-        var bookingId = UUID.randomUUID();
-        // NUL byte (0x00) — a forbidden C0 control char, must be rejected before the service is reached
-        var body = "{\"cancellationReason\":\"CLIENT_NO_SHOW\""
-                + ",\"comment\":\"no-show note\\u0000tab-injected\"}";
-
-        mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/not-complete")
-                        .with(authenticatedAs(ownerId, "owner@beautica.test", Role.SALON_OWNER))
-                        .with(csrf())
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content(body))
-                .andExpect(status().isBadRequest())
-                .andExpect(jsonPath("$.success").value(false));
-
-        org.mockito.Mockito.verify(bookingService, org.mockito.Mockito.never()).notCompleteBooking(any(), any(), any());
     }
 
     // ── Phase 357: archive pending-actions badge ──────────────────────────────

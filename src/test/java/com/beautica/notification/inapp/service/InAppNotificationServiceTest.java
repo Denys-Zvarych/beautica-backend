@@ -250,28 +250,6 @@ class InAppNotificationServiceTest {
     }
 
     @Test
-    @DisplayName("notifyRescheduledVisit: dedup key is keyed to the appointment id, never a booking id")
-    void should_useAppointmentIdDedupKey_when_notifyRescheduledVisit() {
-        UUID appointmentId = UUID.randomUUID();
-        UUID bookingId = UUID.randomUUID();
-        Booking item = bookingWith(bookingId, userWithId(clientId), master, salon, BookingSource.APP);
-        Instant newStart = Instant.parse("2026-10-01T12:00:00Z");
-
-        service.notifyRescheduledVisit(appointmentId, item, false, newStart, clientId);
-
-        // initiatedByProvider=false: performing master (always) + owner/admins (client-initiated
-        // leg) = {masterUserId, ownerId}; the CLIENT is the actor and was never in that set.
-        ArgumentCaptor<Collection<UUID>> recipients = recipientsCaptor();
-        ArgumentCaptor<String> keyCaptor = ArgumentCaptor.forClass(String.class);
-        verify(repository, times(1)).insertForRecipients(
-                eq("BOOKING_RESCHEDULED"), recipients.capture(), isNull(), eq(appointmentId), any(), isNull(),
-                keyCaptor.capture());
-        assertThat(recipients.getValue()).containsExactlyInAnyOrder(masterUserId, ownerId);
-        assertThat(keyCaptor.getValue())
-                .isEqualTo("BOOKING_RESCHEDULED:" + appointmentId + ":" + newStart.getEpochSecond());
-    }
-
-    @Test
     @DisplayName("notifyInviteAccepted: dedup key is INVITE_ACCEPTED:salonId:newMemberUserId")
     void should_useSalonAndMemberIdDedupKey_when_notifyInviteAccepted() {
         UUID newMemberId = UUID.randomUUID();

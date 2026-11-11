@@ -186,8 +186,9 @@ class ScheduleOverrideDeclineNotificationIT extends AbstractWalkInBookingSmsIT {
     }
 
     @Test
-    @DisplayName("LINK guest visit of 3 services, 2 conflict — exactly ONE SMS for the visit")
-    void should_sendOneSmsPerVisit_when_twoOfThreeGuestVisitItemsConflict() throws Exception {
+    @DisplayName("GST-75 — LINK guest visit of 3 services, 2 conflict: one SMS per declined service, each naming "
+            + "that service's own start; the in-hours service gets none")
+    void should_sendOneSmsPerDeclinedService_when_twoOfThreeGuestVisitItemsConflict() throws Exception {
         OffsetDateTime start = tomorrowAt(LocalTime.of(10, 0));
         UUID second = insertService(salon.masterId(), "SALON", salon.salonId());
         UUID third = insertService(salon.masterId(), "SALON", salon.salonId());
@@ -200,10 +201,41 @@ class ScheduleOverrideDeclineNotificationIT extends AbstractWalkInBookingSmsIT {
         drainWorker.drain();
 
         assertThat(put.getStatusCode()).as("override body=%s", put.getBody()).isEqualTo(HttpStatus.OK);
-        assertThat(jdbcTemplate.queryForObject("SELECT count(*) FROM bookings WHERE status = 'DECLINED'",
-                Integer.class)).isEqualTo(2);
-        assertThat(sentText()).as("one SMS naming the first declined service's start")
-                .startsWith(expectedBody(start.plusHours(1)));
+        List<OffsetDateTime> declinedStarts = declinedStarts();
+        assertThat(declinedStarts).hasSize(2);
+        assertThat(outboxCount("STATUS_CHANGED")).as("one guest row per declined service").isEqualTo(2);
+        assertThat(sentTexts()).as("one SMS per declined service, each naming its own start")
+                .hasSize(2)
+                .anyMatch(text -> text.startsWith(expectedBody(declinedStarts.get(0))))
+                .anyMatch(text -> text.startsWith(expectedBody(declinedStarts.get(1))))
+                .noneMatch(text -> text.startsWith(expectedBody(start)));
+    }
+
+    @Test
+    @DisplayName("GST-75 — Telegram-linked LINK guest, whole 3-service visit declined by a day off: one Telegram "
+            + "message per service, zero SMS")
+    void should_sendOneTelegramPerDeclinedService_when_linkedGuestVisitDeclinedByDayOff() {
+        OffsetDateTime start = tomorrowAt(LocalTime.of(10, 0));
+        UUID second = insertService(salon.masterId(), "SALON", salon.salonId());
+        UUID third = insertService(salon.masterId(), "SALON", salon.salonId());
+        createGuestVisitSettled(start, List.of(salon.masterServiceId(), second, third));
+        resetTurbosms();
+        link(LINK_PHONE, LINKED_CHAT);
+
+        ResponseEntity<String> put = putDayOff(salon.masterId(), tokenFor(salon.ownerEmail()),
+                start.toLocalDate(), true);
+        drainWorker.drain();
+
+        assertThat(put.getStatusCode()).as("override body=%s", put.getBody()).isEqualTo(HttpStatus.OK);
+        org.mockito.ArgumentCaptor<String> text = org.mockito.ArgumentCaptor.forClass(String.class);
+        verify(telegramMessenger, org.mockito.Mockito.times(3)).sendWaiting(eq(LINKED_CHAT), text.capture());
+        List<OffsetDateTime> declinedStarts = declinedStarts();
+        assertThat(declinedStarts).hasSize(3);
+        assertThat(text.getAllValues()).as("each message names its own service's start")
+                .allMatch(value -> declinedStarts.stream().anyMatch(at -> value.startsWith(expectedBody(at))))
+                .extracting(value -> value.substring(0, expectedBody(start).length()))
+                .doesNotHaveDuplicates();
+        TURBOSMS.verify(0, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
     }
 
     @Test
@@ -475,6 +507,33 @@ class ScheduleOverrideDeclineNotificationIT extends AbstractWalkInBookingSmsIT {
     }
 
     /**
+     * Perf guard (phase 478, AC4) — per-service guest rows (GST-75) still JDBC-batch: 30 two-service LINK guest
+     * visits queue 60 {@code STATUS_CHANGED} rows (plus the per-visit master rows), and the notification leg stays
+     * within the 1-visit count plus one statement per extra batch of 50 — never one per row or per visit.
+     */
+    @Test
+    @DisplayName("perf — 30 guest visits x 2 declined services (one outbox row per service) keep the notification "
+            + "statements bounded by the batch count")
+    void should_boundNotificationStatementsByBatchCount_when_guestVisitsDeclinedPerService() {
+        String ownerToken = tokenFor(salon.ownerEmail());
+        Map<String, Integer> one = declineGuestVisitsAndCountStatements(ownerToken, 1, 2,
+                tomorrowAt(LocalTime.of(7, 0)));
+        int outboxBefore = jdbcTemplate.queryForObject("SELECT count(*) FROM notification_outbox", Integer.class);
+        Map<String, Integer> thirty = declineGuestVisitsAndCountStatements(ownerToken, 30, 2,
+                tomorrowAt(LocalTime.of(7, 0)).plusDays(1));
+        int outboxRows = jdbcTemplate.queryForObject("SELECT count(*) FROM notification_outbox", Integer.class)
+                - outboxBefore;
+        int batches = (outboxRows + 49) / 50;
+
+        assertThat(outboxRows).as("fixture: per-service guest rows exceed one JDBC batch").isGreaterThan(50);
+        assertThat(thirty.get("notification"))
+                .as("30 guest visits (%s outbox rows, %s batches) must cost at most 1-visit count + batches; 1=%s, 30=%s",
+                        outboxRows, batches, one, thirty)
+                .isLessThanOrEqualTo(one.get("notification") + batches)
+                .isLessThan(30);
+    }
+
+    /**
      * Security INFO (phase 474 QA) — an independent master has no salon, so the bulk statement binds a
      * {@code NULL} element in its {@code salon_id} uuid[]. With an actor other than the master (a system/admin
      * actor) BOTH the client's and the master's rows are written, and neither may pick up any salon id.
@@ -571,6 +630,36 @@ class ScheduleOverrideDeclineNotificationIT extends AbstractWalkInBookingSmsIT {
                 insertRegisteredItem(clientId, appointmentId, visitStart.plusMinutes(15L * item), 15);
             }
         }
+        Map<String, Integer> counts = measureDayOffStatements(ownerToken, firstStart);
+        assertThat(outboxCountForDeclinedVisits(firstStart.toLocalDate()))
+                .as("fixture: every visit was notified").isEqualTo(visits);
+        return counts;
+    }
+
+    /**
+     * Phase 478 — guest twin of {@link #declineVisitsAndCountStatements}: {@code visits} LINK guest visits of
+     * {@code itemsPerVisit} 15-minute items; every declined item gets its own {@code STATUS_CHANGED} row (GST-75).
+     */
+    private Map<String, Integer> declineGuestVisitsAndCountStatements(String ownerToken, int visits,
+                                                                      int itemsPerVisit, OffsetDateTime firstStart) {
+        Instant created = Instant.now().minus(Duration.ofDays(1));
+        for (int i = 0; i < visits; i++) {
+            UUID appointmentId = insertGuestLinkAppointment(LINK_PHONE, created, created);
+            OffsetDateTime visitStart = firstStart.plusMinutes(15L * itemsPerVisit * i);
+            for (int item = 0; item < itemsPerVisit; item++) {
+                UUID itemId = insertGuestLinkBooking(LINK_PHONE, visitStart.plusMinutes(15L * item),
+                        Duration.ofMinutes(15), created);
+                jdbcTemplate.update("UPDATE bookings SET appointment_id = ? WHERE id = ?", appointmentId, itemId);
+            }
+        }
+        Map<String, Integer> counts = measureDayOffStatements(ownerToken, firstStart);
+        assertThat(outboxCountForDeclinedVisits(firstStart.toLocalDate()))
+                .as("fixture: every declined guest service was notified").isEqualTo(visits * itemsPerVisit);
+        return counts;
+    }
+
+    /** One DAY_OFF write on {@code firstStart}'s date, measured; returns notification-table and total statements. */
+    private Map<String, Integer> measureDayOffStatements(String ownerToken, OffsetDateTime firstStart) {
         CAPTURED_SQL.clear();
         capturing = true;
         ResponseEntity<String> put;
@@ -580,8 +669,6 @@ class ScheduleOverrideDeclineNotificationIT extends AbstractWalkInBookingSmsIT {
             capturing = false;
         }
         assertThat(put.getStatusCode()).as("override body=%s", put.getBody()).isEqualTo(HttpStatus.OK);
-        assertThat(outboxCountForDeclinedVisits(firstStart.toLocalDate()))
-                .as("fixture: every visit was notified").isEqualTo(visits);
         List<String> sql = new ArrayList<>(CAPTURED_SQL);
         int notification = (int) sql.stream().map(q -> q.toLowerCase(Locale.ROOT))
                 .filter(q -> q.contains("in_app_notification") || q.contains("notification_outbox"))
@@ -696,6 +783,12 @@ class ScheduleOverrideDeclineNotificationIT extends AbstractWalkInBookingSmsIT {
                 bookingId, clientId, salon.masterId(), salon.masterServiceId(), salon.salonId(),
                 startsAt, startsAt.plusHours(1));
         return bookingId;
+    }
+
+    /** Start instants of every DECLINED booking, earliest first. */
+    private List<OffsetDateTime> declinedStarts() {
+        return jdbcTemplate.queryForList("SELECT starts_at FROM bookings WHERE status = 'DECLINED' ORDER BY starts_at",
+                OffsetDateTime.class);
     }
 
     private String bookingStatus(UUID bookingId) {

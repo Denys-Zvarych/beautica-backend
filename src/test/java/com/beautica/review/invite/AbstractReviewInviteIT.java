@@ -5,6 +5,7 @@ import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.auth.Role;
+import com.beautica.booking.service.AppointmentTransitionService;
 import com.beautica.review.support.GuestReviewFixtures;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -63,6 +64,9 @@ abstract class AbstractReviewInviteIT extends AbstractIntegrationTest {
 
     @Autowired
     protected ObjectMapper objectMapper;
+
+    @Autowired
+    private AppointmentTransitionService appointmentTransitionService;
 
     protected GuestReviewFixtures fixtures;
     protected UUID masterId;
@@ -151,6 +155,20 @@ abstract class AbstractReviewInviteIT extends AbstractIntegrationTest {
     protected void attachToSalon(UUID salonId, UUID... bookingIds) {
         for (UUID bookingId : bookingIds) {
             jdbcTemplate.update("UPDATE bookings SET salon_id = ? WHERE id = ?", salonId, bookingId);
+        }
+    }
+
+    /**
+     * Phase 475 — completes every still-CONFIRMED item of {@code appointmentId} one by one through the per-service
+     * path ({@code completeAppointmentItem}), as the master. Replaces the removed whole-visit {@code completeAppointment};
+     * each item completion publishes {@code GuestVisitCompletedEvent}, and the scheduler keeps one invite per visit.
+     */
+    protected void completeVisitItems(UUID appointmentId) {
+        List<UUID> itemIds = jdbcTemplate.queryForList(
+                "SELECT id FROM bookings WHERE appointment_id = ? AND status = 'CONFIRMED' ORDER BY starts_at, id",
+                UUID.class, appointmentId);
+        for (UUID itemId : itemIds) {
+            appointmentTransitionService.completeAppointmentItem(masterUserId, appointmentId, itemId);
         }
     }
 

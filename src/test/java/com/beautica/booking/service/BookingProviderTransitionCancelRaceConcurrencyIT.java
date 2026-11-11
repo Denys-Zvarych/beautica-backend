@@ -36,8 +36,9 @@ import org.springframework.security.crypto.password.PasswordEncoder;
 
 /**
  * Regression test for G5 — the asymmetric half of the G4 defect class that survived cycle-7's
- * widening. Races each of the three standalone-booking PROVIDER transitions ({@code
- * BookingService#declineBookingCore}, {@code #completeBooking}, {@code #notCompleteBooking})
+ * widening. Races each standalone-booking PROVIDER transition ({@code
+ * BookingService#declineBookingCore}, {@code #completeBooking}; the not-complete case was removed
+ * with its route in phase 475)
  * against a client-initiated {@code PATCH /bookings/{id}/cancel} of the SAME standalone booking.
  *
  * <p><b>Why this is the reverse direction of {@link BookingCancelRescheduleConcurrencyIT}, not a
@@ -47,8 +48,8 @@ import org.springframework.security.crypto.password.PasswordEncoder;
  * that loaded the row while still CONFIRMED could commit its own terminal status UNCONDITIONALLY,
  * even after a concurrent client cancel had already committed CANCELLED first — silently
  * overwriting the client's CANCELLED record and discarding {@code clientCancellationNote}. A
- * provider could trigger this deliberately by firing decline/complete/not-complete the instant a
- * cancellation looked imminent, forcing a DECLINED/COMPLETED/NOT_COMPLETED outcome over the
+ * provider could trigger this deliberately by firing decline/complete the instant a
+ * cancellation looked imminent, forcing a DECLINED/COMPLETED outcome over the
  * client's own cancellation.
  *
  * <p><b>Deterministic rendezvous, roles reversed from the sibling test.</b> Exactly like {@link
@@ -63,7 +64,7 @@ import org.springframework.security.crypto.password.PasswordEncoder;
  * completing its mutation — that 409 is the assertion this whole class exists to make.
  */
 @Import(TestSecurityConfig.class)
-@DisplayName("Standalone booking — provider decline/complete/not-complete racing a client cancel of "
+@DisplayName("Standalone booking — provider decline/complete racing a client cancel of "
         + "the SAME booking (G5 — the reverse direction of G4's freshness re-check)")
 class BookingProviderTransitionCancelRaceConcurrencyIT extends AbstractIntegrationTest {
 
@@ -122,24 +123,6 @@ class BookingProviderTransitionCancelRaceConcurrencyIT extends AbstractIntegrati
 
         assertProviderTransitionRejected(providerResponse);
         assertCancellationSurvived(race.bookingId());
-    }
-
-    @Test
-    @DisplayName("G5: a provider not-complete whose load raced a client cancel that commits FIRST "
-            + "must abort 409, not overwrite the CANCELLED row — clientCancellationNote survives")
-    void should_return409AndPreserveCancellation_when_notCompleteRacesClientCancelOfSameStandaloneBooking() throws Exception {
-        RaceFixture race = setUpRace("not-complete");
-
-        ResponseEntity<String> providerResponse = runRace(race,
-                BOOKINGS_URL + "/" + race.bookingId() + "/not-complete", HttpMethod.PATCH,
-                "{\"cancellationReason\":\"CLIENT_NO_SHOW\"}");
-
-        assertProviderTransitionRejected(providerResponse);
-        assertCancellationSurvived(race.bookingId());
-        assertThat(providerCommentInDb(race.bookingId()))
-                .as("the not-complete's own providerComment must never have been written — the save "
-                        + "aborted before any column was persisted")
-                .isNull();
     }
 
     // ── shared race harness ──────────────────────────────────────────────────────────────────────

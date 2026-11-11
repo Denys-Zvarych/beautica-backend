@@ -30,7 +30,7 @@ import org.springframework.security.crypto.password.PasswordEncoder;
 
 /**
  * Full-HTTP-stack suite for {@code PATCH /appointments/{appointmentId}/services/{bookingId}/reschedule}
- * (track 30.x) — the NEW per-item counterpart of {@link AppointmentRescheduleIT}'s whole-visit route.
+ * (track 30.x). The whole-visit reschedule route it was the counterpart of was removed in phase 475.
  *
  * <p><b>Locked semantics under test (phase 30.1 design record).</b> L1: exactly ONE child {@code
  * Booking} row moves. L2: every sibling keeps its {@code startsAt}/{@code endsAt} byte-for-byte —
@@ -39,7 +39,7 @@ import org.springframework.security.crypto.password.PasswordEncoder;
  * individually. This suite deliberately never asserts that items stay contiguous after a per-item
  * move — that would pin the OPPOSITE of the locked decision.
  *
- * <p>Visits are seeded directly via SQL (mirrors {@link AppointmentRescheduleIT}'s
+ * <p>Visits are seeded directly via SQL (the former {@code AppointmentRescheduleIT}'s
  * {@code seedIndependentVisit}/{@code seedVisitRows} pattern) — deterministic windows, no
  * slot-availability coupling for the ORIGINAL state. Working hours are always seeded 00:00–23:59
  * for every day so the NEW target time re-validates against the master's schedule
@@ -510,43 +510,7 @@ class AppointmentItemRescheduleIT extends AbstractIntegrationTest {
         assertThat(payloadNode.path("initiatedBy").asText()).isEqualTo("CLIENT");
     }
 
-    // ── 8. Whole-visit reschedule after per-item moves re-contiguates (ACCEPTED consequence, L4) ────
-
-    @Test
-    @DisplayName("performing a WHOLE-VISIT reschedule after a per-item move re-lays-out every CONFIRMED "
-            + "item back into ONE contiguous block, DISCARDING the manual per-item separation — this is "
-            + "the phase 30.1 D2 ACCEPTED consequence of L4 ('the whole-visit route is unchanged'), "
-            + "pinned here as INTENDED behaviour, not a regression")
-    void should_reContiguateConfirmedItems_when_wholeVisitRescheduledAfterPerItemMove() throws Exception {
-        Visit v = seedContiguousVisit("recontiguate", 3, futureStart());
-        List<ItemRow> before = itemRows(v.id());
-        UUID middleId = before.get(1).id();
-        OffsetDateTime detachedStart = futureStart().plusDays(10).withHour(9);
-
-        ResponseEntity<String> perItem = reschedule(v.clientToken(), v.id(), middleId, detachedStart);
-        assertThat(perItem.getStatusCode()).isEqualTo(HttpStatus.OK);
-        List<ItemRow> afterPerItemMove = itemRows(v.id());
-        assertThat(afterPerItemMove.get(1).startsAt().toInstant())
-                .as("sanity: the visit is now genuinely non-contiguous")
-                .isNotEqualTo(afterPerItemMove.get(0).endsAt().toInstant());
-
-        OffsetDateTime wholeVisitNewStart = futureStart().plusDays(20).withHour(11);
-        ResponseEntity<String> wholeVisit = rescheduleWholeVisit(v.clientToken(), v.id(), wholeVisitNewStart);
-
-        assertThat(wholeVisit.getStatusCode())
-                .as("the whole-visit reschedule must still succeed after a prior per-item move — body: %s",
-                        wholeVisit.getBody())
-                .isEqualTo(HttpStatus.OK);
-        List<ItemRow> afterWholeVisit = itemRows(v.id());
-        assertThat(afterWholeVisit).hasSize(3);
-        assertThat(afterWholeVisit.get(0).startsAt().toInstant()).isEqualTo(wholeVisitNewStart.toInstant());
-        assertThat(afterWholeVisit.get(0).endsAt().toInstant())
-                .as("item 0 is back-to-back with item 1 — CONTIGUOUS again")
-                .isEqualTo(afterWholeVisit.get(1).startsAt().toInstant());
-        assertThat(afterWholeVisit.get(1).endsAt().toInstant())
-                .as("item 1 is back-to-back with item 2 — CONTIGUOUS again")
-                .isEqualTo(afterWholeVisit.get(2).startsAt().toInstant());
-    }
+    // ── 8. (retired in phase 475 — the whole-visit reschedule route was removed) ──────────────────
 
     // ── 9. Concurrency — perf/QA audit F8a (cross-batch) ────────────────────────────────────────────
     //
@@ -631,14 +595,9 @@ class AppointmentItemRescheduleIT extends AbstractIntegrationTest {
                 .isEqualTo(loserOriginal.toInstant());
     }
 
-    // NOTE (F8b — per-item reschedule racing a whole-visit decline): that test lives in
-    // AppointmentCrossPathTransitionConcurrencyIT (com.beautica.booking.service), NOT here — it
-    // needs a @SpyBean CyclicBarrier rendezvous on AppointmentTransitionService's package-private
-    // lockHeaderForWholeVisitTransition/lockAppointmentHeaderBeforeItemReschedule methods, which this
-    // class's package (com.beautica.booking) cannot see. Reusing that class (rather than widening
-    // either method's visibility, or duplicating its @SpyBean scaffolding here) follows this repo's
-    // established "one shared concurrency-IT-per-package-for-@SpyBean-races" convention exactly —
-    // see that class's own Javadoc.
+    // NOTE (F8b — per-item reschedule racing a whole-visit decline): retired in phase 475 together
+    // with the whole-visit decline route. Per-item cross-path races live in
+    // AppointmentCrossPathTransitionConcurrencyIT (com.beautica.booking.service).
 
     // ── helpers ──────────────────────────────────────────────────────────────
 
@@ -722,14 +681,6 @@ class AppointmentItemRescheduleIT extends AbstractIntegrationTest {
         String body = "{\"newStartsAt\":\"" + newStartsAt + "\"}";
         return restTemplate.exchange(
                 APPOINTMENTS_URL + "/" + appointmentId + "/services/" + bookingId + "/reschedule",
-                HttpMethod.PATCH, new HttpEntity<>(body, headers), String.class);
-    }
-
-    private ResponseEntity<String> rescheduleWholeVisit(String token, UUID appointmentId, OffsetDateTime newStartsAt) {
-        HttpHeaders headers = fixtures.bearerHeaders(token);
-        String body = "{\"newStartsAt\":\"" + newStartsAt + "\"}";
-        return restTemplate.exchange(
-                APPOINTMENTS_URL + "/" + appointmentId + "/reschedule",
                 HttpMethod.PATCH, new HttpEntity<>(body, headers), String.class);
     }
 

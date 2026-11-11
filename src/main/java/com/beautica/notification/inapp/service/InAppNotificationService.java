@@ -376,33 +376,12 @@ public class InAppNotificationService {
         writeReschedule(
                 booking.getMaster(), booking.getSalon(), clientIdOf(booking),
                 booking.getBookingSource() == BookingSource.STAFF,
-                booking.getId(), null, initiatedByProvider, newStart, actorUserId);
-    }
-
-    /**
-     * The visit-level twin of {@link #notifyRescheduled} — {@code AppointmentTransitionService
-     * #rescheduleAppointment}'s whole-visit reschedule, once per appointment.
-     *
-     * @param appointmentId       the visit that was rescheduled; becomes {@code appointment_id}
-     * @param representative      any one already-loaded item {@code Booking} of the visit — see
-     *                            {@link #notifyVisitEvent}'s javadoc for why this is free to read
-     * @param initiatedByProvider see {@link #notifyRescheduled}
-     * @param newStart            see {@link #notifyRescheduled}
-     * @param actorUserId         see {@link #notifyRescheduled}
-     */
-    @Transactional(propagation = Propagation.MANDATORY)
-    public void notifyRescheduledVisit(
-            UUID appointmentId, Booking representative, boolean initiatedByProvider,
-            Instant newStart, UUID actorUserId) {
-        writeReschedule(
-                representative.getMaster(), representative.getSalon(), clientIdOf(representative),
-                representative.getBookingSource() == BookingSource.STAFF,
-                null, appointmentId, initiatedByProvider, newStart, actorUserId);
+                booking.getId(), initiatedByProvider, newStart, actorUserId);
     }
 
     private void writeReschedule(
             Master master, Salon salon, UUID clientId, boolean walkIn,
-            UUID bookingId, UUID appointmentId, boolean initiatedByProvider, Instant newStart, UUID actorUserId) {
+            UUID bookingId, boolean initiatedByProvider, Instant newStart, UUID actorUserId) {
         Set<UUID> recipients = recipientResolver.masterOnly(master); // rule 6 — always, unless actor
         if (!walkIn) {
             if (initiatedByProvider) {
@@ -418,11 +397,11 @@ public class InAppNotificationService {
             return;
         }
         UUID salonId = salonIdOf(salon);
-        UUID keyId = appointmentId != null ? appointmentId : bookingId;
-        String dedupKey = dedupKey(InAppNotificationType.BOOKING_RESCHEDULED, keyId, newStart.getEpochSecond());
-        write(InAppNotificationType.BOOKING_RESCHEDULED, recipients, bookingId, appointmentId, salonId, null, dedupKey);
-        log.debug("in-app notify type=BOOKING_RESCHEDULED bookingId={} appointmentId={} recipients={}",
-                bookingId, appointmentId, recipients.size());
+        // Booking-keyed only: the visit-keyed whole-visit reschedule was removed in phase 475.
+        String dedupKey = dedupKey(InAppNotificationType.BOOKING_RESCHEDULED, bookingId, newStart.getEpochSecond());
+        write(InAppNotificationType.BOOKING_RESCHEDULED, recipients, bookingId, null, salonId, null, dedupKey);
+        log.debug("in-app notify type=BOOKING_RESCHEDULED bookingId={} recipients={}",
+                bookingId, recipients.size());
     }
 
     /**

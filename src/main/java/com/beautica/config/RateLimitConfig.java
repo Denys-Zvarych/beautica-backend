@@ -640,9 +640,9 @@ public class RateLimitConfig {
 
     private static final Duration BOOKING_WRITE_WINDOW = Duration.ofSeconds(10);
 
-    // Per-user cap for the SMS/notification-triggering booking-write endpoints:
-    //   - PATCH /api/v1/bookings/{bookingId}/decline
-    //   - PATCH /api/v1/bookings/{bookingId}/not-complete
+    // Per-user cap for the SMS/notification-triggering booking-write endpoint
+    // PATCH /api/v1/bookings/{bookingId}/decline (and the per-service visit decline routed here by
+    // BookingRateLimitFilter). The single-booking not-complete route was removed in phase 475.
     // Deliberately a SEPARATE bucket from bookingWriteCapacity above (different threat model —
     // see BookingRateLimitFilter's class javadoc): declineBooking substitutes the provider's own
     // free text into a Beautica-branded SMS sent to a real, OTP-verified guest phone number
@@ -651,7 +651,7 @@ public class RateLimitConfig {
     // (smishing / SMS-bomb concern), which the tight 5-per-10s create/reschedule budget was never
     // sized to bound. 10 requests / 60s mirrors the other authenticated-write buckets in this
     // class (media upload, profile update, bulk service setup) — generous enough for a provider
-    // clearing a backlog of no-shows/declines in one sitting. Configurable so integration tests
+    // clearing a backlog of declines in one sitting. Configurable so integration tests
     // can raise the cap.
     //
     // NOT shared with PUT /api/v1/masters/{masterId}/overrides/{date} (2026-07-26 product decision
@@ -1361,9 +1361,8 @@ public class RateLimitConfig {
     }
 
     /**
-     * Per-user bucket (see {@link #bookingDeclineCapacity} field javadoc) shared by
-     * {@code PATCH /api/v1/bookings/{bookingId}/decline} and {@code PATCH
-     * /api/v1/bookings/{bookingId}/not-complete}, consumed by
+     * Per-user bucket (see {@link #bookingDeclineCapacity} field javadoc) for
+     * {@code PATCH /api/v1/bookings/{bookingId}/decline} and the per-service visit decline, consumed by
      * {@link com.beautica.booking.filter.BookingRateLimitFilter}'s flat one-token-per-request entry
      * charge. {@code expireAfterAccess} gives a 5-minute grace past the 60-second window so a bucket
      * entry is not evicted the instant the window rolls over.

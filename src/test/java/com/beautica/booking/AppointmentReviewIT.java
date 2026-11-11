@@ -291,8 +291,8 @@ class AppointmentReviewIT extends AbstractIntegrationTest {
     private record Visit(UUID id, String clientToken, UUID masterId, String masterToken) {}
 
     /**
-     * Creates an INDEPENDENT_MASTER + CLIENT, posts a two-service CONFIRMED visit, then completes it
-     * through {@code PATCH /appointments/{id}/complete} so it is reviewable.
+     * Creates an INDEPENDENT_MASTER + CLIENT, posts a two-service CONFIRMED visit, then completes every
+     * service through {@code PATCH /appointments/{id}/services/{bookingId}/complete} so it is reviewable.
      */
     private Visit createCompletedTwoServiceVisit(String tag) throws Exception {
         Visit visit = createConfirmedTwoServiceVisit(tag);
@@ -330,30 +330,17 @@ class AppointmentReviewIT extends AbstractIntegrationTest {
         return new Visit(appointmentId, clientToken, masterId, masterToken);
     }
 
-    /** Provider completes the whole visit (no elapse guard on complete) so it becomes reviewable. */
+    /**
+     * Provider completes every service of the visit through the per-service route (no elapse guard
+     * on complete) so it becomes reviewable — phase 475 removed the whole-visit complete route.
+     */
     private void completeVisit(Visit visit) {
-        HttpHeaders providerHeaders = fixtures.bearerHeaders(visit.masterToken());
-        ResponseEntity<String> completed = restTemplate.exchange(
-                APPOINTMENTS_URL + "/" + visit.id() + "/complete", HttpMethod.PATCH,
-                new HttpEntity<>(providerHeaders), String.class);
-        assertThat(completed.getStatusCode())
-                .as("visit completion must succeed — body: %s", completed.getBody())
-                .isEqualTo(HttpStatus.NO_CONTENT);
+        fixtures.completeEveryService(visit.id(), visit.masterToken());
     }
 
-    /**
-     * Provider completes the whole visit (no elapse guard on complete) so it becomes reviewable —
-     * overload for {@link BookingTestFixtures.VisitFixture} (the N1-N5 fixture-driven visits),
-     * mirroring {@link #completeVisit(Visit)} for the local {@link Visit} record.
-     */
+    /** Overload for {@link BookingTestFixtures.VisitFixture} (the N1-N5 fixture-driven visits). */
     private void completeVisit(BookingTestFixtures.VisitFixture visit) {
-        HttpHeaders providerHeaders = fixtures.bearerHeaders(visit.masterToken());
-        ResponseEntity<String> completed = restTemplate.exchange(
-                APPOINTMENTS_URL + "/" + visit.id() + "/complete", HttpMethod.PATCH,
-                new HttpEntity<>(providerHeaders), String.class);
-        assertThat(completed.getStatusCode())
-                .as("visit completion must succeed — body: %s", completed.getBody())
-                .isEqualTo(HttpStatus.NO_CONTENT);
+        fixtures.completeEveryService(visit.id(), visit.masterToken());
     }
 
     /** Ordered child booking ids of a visit — mirrors {@code AppointmentTransitionIT#childIdsOf}. */

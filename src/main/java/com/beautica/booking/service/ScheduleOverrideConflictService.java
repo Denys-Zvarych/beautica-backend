@@ -103,12 +103,12 @@ public class ScheduleOverrideConflictService {
      * write).
      *
      * <p><b>Also bounds outbound messages (phase 474, D3).</b> Every declined booking is notified
-     * exactly like a provider decline (one notice per visit — registered client feed + push + e-mail,
-     * guest fixed-text GST-41 SMS/Telegram), so this cap is also the per-write ceiling on guest
+     * exactly like a provider decline (registered client feed + push + e-mail once per visit; guest fixed-text
+     * GST-41 SMS/Telegram once per declined service — phase 478, GST-75), so this cap is also the per-write ceiling on guest
      * messages. The copy is fixed (no note — SCH-D07), a booking can be declined only once (terminal),
      * and the aggregate decline budget ({@code RateLimitConfig#scheduleOverrideDeclineBudgetCapacity})
      * and the booking-SMS gate (NTF-18) still apply on top. Per-guest limits differ by source: walk-in
-     * guests: per-phone + per-visit budget; LINK guests: OTP-verified, one message per booking.
+     * guests: per-phone budget charged once per visit; LINK guests: OTP-verified, one message per booking.
      *
      * <p>{@code public} (not {@code private}) for two reasons: {@code ScheduleOverrideConflictServiceTest}
      * pins the CRITICAL "aggregate decline-budget capacity must exceed this constant" invariant
@@ -306,8 +306,8 @@ public class ScheduleOverrideConflictService {
         // (see RateLimitConfig#scheduleOverrideWriteBuckets and BookingRateLimitFilter), enforced in the
         // filter BEFORE this method runs. Phase 474 notifies every declined visit (fixed copy, no note —
         // the guest SMS carries no provider free text), bounded by MAX_CONFLICTS_PER_WRITE and the
-        // decline budget below plus the SMS gate at drain time (walk-in guests: per-phone + per-visit
-        // budget; LINK guests: OTP-verified, one message per booking).
+        // decline budget below plus the SMS gate at drain time (walk-in guests: per-phone budget charged once
+        // per visit; LINK guests: OTP-verified, one message per booking — phase 478).
         //
         // 2026-07-26 re-audit, security audit finding 1 (MEDIUM) — a DIFFERENT proportional charge is
         // reintroduced below, from a bucket dedicated to THIS route (never the SMS-driven
@@ -381,7 +381,8 @@ public class ScheduleOverrideConflictService {
      * decline, through the existing calls: a standalone booking via
      * {@link BookingService#enqueueProviderDeclineNotifications} (the {@code PATCH /bookings/{id}/decline}
      * set), a visit ONCE via {@link AppointmentTransitionService#enqueueVisitItemsDeclineOutbox}
-     * (D4 — siblings declined in one write give one notice). The note is {@code null} by construction
+     * (D4 — siblings declined in one write give one notice; a guest visit gets one {@code STATUS_CHANGED} row
+     * per declined item instead, phase 478 / GST-75). The note is {@code null} by construction
      * (D2). Enqueues run after every decline so the outbox INSERTs never interleave with a decline's
      * own reads; a rollback drops them together with the declines.
      *

@@ -278,33 +278,14 @@ class InAppNotificationLifecycleIT extends AbstractIntegrationTest {
                 .isEqualTo("BOOKING");
     }
 
-    // ── 4. no-show ───────────────────────────────────────────────────────────────────────────
-
-    @Test
-    @DisplayName("no-show: provider marks not-completed — only the client gets BOOKING_NOT_COMPLETED; "
-            + "the provider set's feeds do not change")
-    void should_notifyOnlyClient_when_providerMarksNoShow() throws Exception {
-        SalonRig rig = seedSalonRig();
-        String client = token(createClientEmail());
-        String owner = token(rig.ownerEmail());
-        String admin = token(rig.adminEmail());
-        String master = token(rig.masterEmail());
-        UUID bookingId = createBooking(client, rig.masterId(), rig.masterServiceId(), day2At(12));
-
-        String body = objectMapper.writeValueAsString(Map.of("cancellationReason", "CLIENT_NO_SHOW"));
-        expectStatus(patch(BOOKINGS_URL + "/" + bookingId + "/not-complete", owner, body), HttpStatus.NO_CONTENT);
-
-        assertFeed("client", client, 1, "BOOKING_NOT_COMPLETED");
-        assertFeed("owner (actor)", owner, 1, "BOOKING_CREATED");
-        assertFeed("admin", admin, 1, "BOOKING_CREATED");
-        assertFeed("master", master, 1, "BOOKING_CREATED");
-    }
+    // ── 4. no-show — retired in phase 475 (no route sets NOT_COMPLETED; BOOK-D12) ──────────────
 
     // ── 5. walk-in E2E ───────────────────────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("walk-in: admin creates a 2-service visit -> reschedules -> declines — the performing master "
-            + "gets exactly one item per step, owner/admin none, and the outbox stays untouched by CREATE")
+    @DisplayName("walk-in: admin creates a 2-service visit -> reschedules one service -> declines it — the "
+            + "performing master gets exactly one item per step, owner/admin none, and the outbox stays "
+            + "untouched by CREATE")
     void should_notifyOnlyPerformingMasterOncePerStep_when_adminWalksInReschedulesAndDeclines() throws Exception {
         SalonRig rig = seedSalonRig();
         UUID secondService = fixtures.createSalonService(rig.salonId(), rig.masterId());
@@ -337,8 +318,10 @@ class InAppNotificationLifecycleIT extends AbstractIntegrationTest {
 
         String rescheduleBody = objectMapper.writeValueAsString(
                 Map.of("newStartsAt", day2At(15).toOffsetDateTime().toString()));
-        expectStatus(patch("/api/v1/appointments/" + appointmentId + "/reschedule", admin, rescheduleBody),
-                HttpStatus.OK);
+        UUID firstItem = jdbcTemplate.queryForObject(
+                "SELECT id FROM bookings WHERE appointment_id = ? ORDER BY starts_at LIMIT 1", UUID.class, appointmentId);
+        expectStatus(patch("/api/v1/appointments/" + appointmentId + "/services/" + firstItem + "/reschedule",
+                admin, rescheduleBody), HttpStatus.OK);
 
         assertThat(types(master)).as("master after reschedule").containsExactlyInAnyOrder(
                 "BOOKING_CREATED", "BOOKING_RESCHEDULED");
@@ -351,15 +334,16 @@ class InAppNotificationLifecycleIT extends AbstractIntegrationTest {
         assertThat(outboxTypeDelta(typesBefore)).as("outbox rows enqueued by the reschedule")
                 .containsOnly(Map.entry("BOOKING_RESCHEDULED", 1), Map.entry("MASTER_BOOKING_RESCHEDULED", 1));
 
-        expectStatus(patch("/api/v1/appointments/" + appointmentId + "/decline", admin, "{}"), HttpStatus.NO_CONTENT);
+        expectStatus(patch("/api/v1/appointments/" + appointmentId + "/services/" + firstItem + "/decline", admin, "{}"),
+                HttpStatus.NO_CONTENT);
 
         assertThat(types(master)).as("master after decline").containsExactlyInAnyOrder(
                 "BOOKING_CREATED", "BOOKING_RESCHEDULED", "BOOKING_DECLINED");
         assertThat(unread(master)).isEqualTo(3);
         assertThat(types(owner)).as("owner never hears about walk-ins").isEmpty();
         assertThat(types(admin)).as("admin (actor) never hears about walk-ins").isEmpty();
-        // NOTE (phase 336 finding): unlike CREATE, the pre-existing appointment reschedule/decline
-        // paths (AppointmentTransitionService#enqueueBookingRescheduled / #enqueueStatusChanged) DO
+        // NOTE (phase 336 finding): unlike CREATE, the per-service reschedule/decline paths
+        // (AppointmentTransitionService#rescheduleAppointmentItem / #declineAppointmentItem) DO
         // enqueue one client/guest outbox row each, walk-in or not. Phase 431 adds exactly one
         // performing-master row per step (MASTER_BOOKING_RESCHEDULED / MASTER_BOOKING_DECLINED), because
         // the admin actor is not the performing master. Pinned by type so a change is deliberate.

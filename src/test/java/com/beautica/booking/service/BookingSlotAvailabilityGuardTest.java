@@ -440,42 +440,4 @@ class BookingSlotAvailabilityGuardTest {
                 .isInstanceOf(BusinessException.class)
                 .hasMessage("Slot not available");
     }
-
-    @Test
-    @DisplayName("whole-visit dispatch — a provider-initiated visit reschedule asks the STAFF chain "
-            + "oracle, so a block starting inside the 15-minute window is accepted")
-    void should_askStaffChainOracle_when_visitRescheduleIsInitiatedByProvider() {
-        List<UUID> serviceIds = List.of(masterServiceId, secondMasterServiceId);
-        when(slotCalculationService.isStaffVisitSlotAvailable(masterId, KYIV_DAY, serviceIds, null, NOW_KYIV))
-                .thenReturn(true);
-        lenient().when(slotCalculationService.getAvailableSlots(masterId, KYIV_DAY, serviceIds, null))
-                .thenReturn(List.of());
-
-        assertThatCode(() -> BookingSlotAvailabilityGuard.assertVisitStartsOnAvailableSlot(
-                slotCalculationService, masterId, serviceIds, null, NOW_KYIV, PROVIDER))
-                .as("AppointmentTransitionService#rescheduleAppointment reaches this overload — the "
-                        + "whole-visit route must relax with the single-booking one")
-                .doesNotThrowAnyException();
-
-        verify(slotCalculationService).isStaffVisitSlotAvailable(masterId, KYIV_DAY, serviceIds, null, NOW_KYIV);
-    }
-
-    @Test
-    @DisplayName("whole-visit dispatch — a CLIENT-initiated visit reschedule still asks the client chain "
-            + "oracle and 409s on a start it does not offer")
-    void should_askClientChainOracle_when_visitRescheduleIsInitiatedByClient() {
-        List<UUID> serviceIds = List.of(masterServiceId, secondMasterServiceId);
-        when(slotCalculationService.getAvailableSlots(masterId, KYIV_DAY, serviceIds, null))
-                .thenReturn(List.of());
-        lenient().when(slotCalculationService.isStaffVisitSlotAvailable(
-                        masterId, KYIV_DAY, serviceIds, null, NOW_KYIV))
-                .thenReturn(true);
-
-        assertThatThrownBy(() -> BookingSlotAvailabilityGuard.assertVisitStartsOnAvailableSlot(
-                slotCalculationService, masterId, serviceIds, null, NOW_KYIV, CLIENT))
-                .isInstanceOf(BusinessException.class)
-                .hasMessage("Slot not available")
-                .extracting(ex -> ((BusinessException) ex).getStatus())
-                .isEqualTo(HttpStatus.CONFLICT);
-    }
 }

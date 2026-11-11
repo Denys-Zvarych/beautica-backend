@@ -14,7 +14,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * Pure Jakarta Bean Validation coverage for {@link StatusUpdateRequest#comment()} — the shared
- * request body for {@code PATCH /decline} and {@code PATCH /not-complete}.
+ * request body for {@code PATCH /bookings/{id}/decline} (not-complete removed in phase 475).
  *
  * <p>Phase 25.9 (reverses Phase 25.2's "required, ≥10-char" decision, made and shipped earlier
  * the same day): {@code comment} is now OPTIONAL for all roles. {@code @NotBlank} and the

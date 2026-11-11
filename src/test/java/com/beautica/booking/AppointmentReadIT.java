@@ -271,15 +271,14 @@ class AppointmentReadIT extends AbstractIntegrationTest {
         assertThat(confirmed.path("providerComment").isNull())
                 .as("a CONFIRMED visit has no provider note yet").isTrue();
 
-        // Provider (the independent master) declines the whole visit with a note.
-        String masterToken = fixtures.tokenFor(masterEmail);
+        // A legacy whole-visit decline with a note on the HEADER (the shape the whole-visit decline
+        // route wrote before phase 475 removed it) — seeded directly, since no route writes a header
+        // note any more; the read path must keep surfacing it.
         String note = "Майстер захворів — переносимо візит";
-        ResponseEntity<Void> declineResp = restTemplate.exchange(
-                APPOINTMENTS_URL + "/" + appointmentId + "/decline", HttpMethod.PATCH,
-                new HttpEntity<>("{\"providerComment\":\"" + note + "\"}", jsonHeaders(masterToken)),
-                Void.class);
-        assertThat(declineResp.getStatusCode())
-                .as("the visit's own master must be able to decline it").isEqualTo(HttpStatus.NO_CONTENT);
+        jdbcTemplate.update("UPDATE bookings SET status = 'DECLINED', cancellation_reason = 'PROVIDER_UNAVAILABLE' "
+                + "WHERE appointment_id = ?", appointmentId);
+        jdbcTemplate.update("UPDATE appointments SET status = 'DECLINED', cancellation_reason = 'PROVIDER_UNAVAILABLE', "
+                + "provider_comment = ? WHERE id = ?", note, appointmentId);
 
         // The mutually-visible header note is surfaced to the OWNING CLIENT on the DECLINED visit —
         // by the locked "all notes visible for all sides" decision (mirrors BookingNoteVisibilityIT).

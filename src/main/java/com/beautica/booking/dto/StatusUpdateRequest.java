@@ -5,7 +5,8 @@ import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Size;
 
 /**
- * Shared request body for {@code PATCH /decline} and {@code PATCH /not-complete}.
+ * Request body for {@code PATCH /bookings/{id}/decline} (the not-complete route that shared it was
+ * removed in phase 475).
  *
  * <p>{@code comment} is OPTIONAL (Phase 25.9 — reverses the Phase 25.2 "required, ≥10 chars"
  * decision from earlier the same day: the product call is now that a provider may decline or

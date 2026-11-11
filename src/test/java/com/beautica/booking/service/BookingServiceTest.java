@@ -966,7 +966,7 @@ class BookingServiceTest {
             + "cancelBooking/rescheduleBooking a dedicated unit test for this exact false branch (see "
             + "should_throw409AndNeverSave_when_cancelBookingFreshnessRecheckFailsForStandaloneBooking "
             + "above) but G5 — the reverse direction, closed by routing declineBookingCore/"
-            + "completeBooking/notCompleteBooking through the SAME isStillConfirmed seam — had none; "
+            + "completeBooking through the SAME isStillConfirmed seam — had none; "
             + "the only prior coverage was the real-DB, virtual-thread "
             + "BookingProviderTransitionCancelRaceConcurrencyIT, with no fast deterministic signal.")
     void should_throw409AndNeverSave_when_declineBookingFreshnessRecheckFailsForStandaloneBooking() {
@@ -1745,166 +1745,6 @@ class BookingServiceTest {
         verify(eventPublisher, never()).publishEvent(any(GuestBookingCompletedEvent.class));
     }
 
-    // ── notCompleteBooking ─────────────────────────────────────────────────────
-
-    @Test
-    @DisplayName("booking moves to NOT_COMPLETED with CLIENT_NO_SHOW reason when master records a no-show on an ELAPSED booking")
-    void should_markNotCompleted_when_masterRecordsNoShow() {
-        UUID actorId = UUID.randomUUID();
-        // not-complete has no temporal guard — an elapsed booking is just the conventional
-        // no-show fixture here, not a requirement (see the future-booking variant below).
-        Booking booking = buildElapsedBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
-        StatusUpdateRequest req = new StatusUpdateRequest(CancellationReason.CLIENT_NO_SHOW, "No show");
-        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
-        when(bookingRepository.save(any())).thenReturn(booking);
-
-        bookingService.notCompleteBooking(actorId, bookingId, req);
-
-        assertThat(booking.getStatus()).isEqualTo(BookingStatus.NOT_COMPLETED);
-        assertThat(booking.getCancellationReason()).isEqualTo(CancellationReason.CLIENT_NO_SHOW);
-        verify(outboxService).enqueueStatusChanged(bookingId);
-    }
-
-    @Test
-    @DisplayName("booking moves to NOT_COMPLETED when not-complete is called on a booking that has not started yet (not-complete has no temporal guard)")
-    void should_markNotCompleted_when_notCompleteCalledOnFutureBooking() {
-        UUID actorId = UUID.randomUUID();
-        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
-        StatusUpdateRequest req = new StatusUpdateRequest(CancellationReason.CLIENT_NO_SHOW, null);
-        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
-        when(bookingRepository.save(any())).thenReturn(booking);
-
-        bookingService.notCompleteBooking(actorId, bookingId, req);
-
-        assertThat(booking.getStatus())
-                .as("a not-yet-started booking may still be marked not-completed")
-                .isEqualTo(BookingStatus.NOT_COMPLETED);
-        verify(outboxService).enqueueStatusChanged(bookingId);
-    }
-
-    @Test
-    @DisplayName("availability caches are evicted by master when a FUTURE booking is marked not-completed — "
-            + "NOT_COMPLETED leaves the `status = 'CONFIRMED'` occupancy predicate, so the slot is freed "
-            + "and must reappear in the picker at once instead of staying hidden for the availability TTL")
-    void should_evictMasterAvailabilityCaches_when_futureBookingMarkedNotCompleted() {
-        // Arrange — a future booking: no-show has NO temporal guard, so this is the case where the
-        // freed window is genuinely still bookable and the missing eviction was observable.
-        UUID actorId = UUID.randomUUID();
-        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
-        StatusUpdateRequest req = new StatusUpdateRequest(CancellationReason.CLIENT_NO_SHOW, "No show");
-        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
-        when(bookingRepository.save(any())).thenReturn(booking);
-
-        // Act
-        bookingService.notCompleteBooking(actorId, bookingId, req);
-
-        // Assert
-        verify(slotCalculationService).evictMasterAvailabilityCaches(masterId);
-    }
-
-    @Test
-    @DisplayName("ForbiddenException is thrown when an unauthorized actor attempts to mark a booking not-completed")
-    void should_throwForbidden_when_unauthorizedActorMarksNotCompleted() {
-        UUID actorId = UUID.randomUUID();
-        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
-        StatusUpdateRequest req = new StatusUpdateRequest(CancellationReason.CLIENT_NO_SHOW, null);
-        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
-        org.mockito.Mockito.doThrow(new ForbiddenException("Access denied"))
-                .when(authz).enforceCanCancelBooking(actorId, booking);
-
-        assertThatThrownBy(() -> bookingService.notCompleteBooking(actorId, bookingId, req))
-                .isInstanceOf(ForbiddenException.class);
-    }
-
-    @Test
-    @DisplayName("400 is thrown when not-complete is called without a cancellation reason")
-    void should_throw400_when_notCompleteCalledWithoutCancellationReason() {
-        UUID actorId = UUID.randomUUID();
-        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
-        StatusUpdateRequest req = new StatusUpdateRequest(null, "some comment");
-        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
-
-        assertThatThrownBy(() -> bookingService.notCompleteBooking(actorId, bookingId, req))
-                .isInstanceOf(BusinessException.class)
-                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
-                        .isEqualTo(HttpStatus.BAD_REQUEST));
-    }
-
-    @Test
-    @DisplayName("400 is thrown when not-complete is called on a booking that is not CONFIRMED (assertTransition guard)")
-    void should_throw400_when_notCompleteCalledOnNonConfirmedBooking() {
-        UUID actorId = UUID.randomUUID();
-        // DECLINED exercises the assertTransition(booking, CONFIRMED, NOT_COMPLETED) guard — a
-        // booking the provider already declined can never also be marked a no-show.
-        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.DECLINED);
-        StatusUpdateRequest req = new StatusUpdateRequest(CancellationReason.CLIENT_NO_SHOW, null);
-        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
-
-        assertThatThrownBy(() -> bookingService.notCompleteBooking(actorId, bookingId, req))
-                .isInstanceOf(BusinessException.class)
-                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
-                        .isEqualTo(HttpStatus.BAD_REQUEST));
-        assertThat(booking.getStatus())
-                .as("status must remain unchanged after a rejected not-complete transition")
-                .isEqualTo(BookingStatus.DECLINED);
-        verify(outboxService, never()).enqueueStatusChanged(bookingId);
-    }
-
-    @Test
-    @DisplayName("notCompleteBooking — G5 freshness re-check rejects a STANDALONE booking a concurrent "
-            + "client cancel already moved off CONFIRMED between the load and this recheck: 409, no "
-            + "save, no outbox events. Coverage gap (backend-qa, cycle-7 batch) — the "
-            + "notCompleteBooking counterpart of declineBooking's identical new test above; see that "
-            + "test's Javadoc for why the real-DB concurrency IT alone is not a substitute for this "
-            + "fast, deterministic signal.")
-    void should_throw409AndNeverSave_when_notCompleteBookingFreshnessRecheckFailsForStandaloneBooking() {
-        UUID actorId = UUID.randomUUID();
-        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
-        StatusUpdateRequest req = new StatusUpdateRequest(CancellationReason.CLIENT_NO_SHOW, "No show");
-        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
-        // Overrides setUp()'s lenient "still CONFIRMED" default: a concurrent client cancel already
-        // moved this row off CONFIRMED between the load above and this recheck.
-        when(bookingRepository.existsConfirmedById(bookingId)).thenReturn(false);
-
-        assertThatThrownBy(() -> bookingService.notCompleteBooking(actorId, bookingId, req))
-                .as("a lost freshness race must surface as a clean 409, not a silent overwrite of the "
-                        + "client's cancellation")
-                .isInstanceOf(BusinessException.class)
-                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus()).isEqualTo(HttpStatus.CONFLICT));
-
-        assertThat(booking.getStatus())
-                .as("the in-memory entity must be left untouched — no partial mutation before the throw")
-                .isEqualTo(BookingStatus.CONFIRMED);
-        assertThat(booking.getProviderComment())
-                .as("providerComment must never be written once the recheck aborts")
-                .isNull();
-        verify(bookingRepository, never()).save(any());
-        verify(outboxService, never()).enqueueStatusChanged(any());
-    }
-
-    @Test
-    @DisplayName("revenue-dashboard cache is evicted for the actor when a booking is marked not-completed")
-    void should_evictRevenueDashboardCache_when_bookingMarkedNotCompleted() {
-        // Arrange
-        UUID actorId = UUID.randomUUID();
-        // Elapsed fixture — see should_markNotCompleted_when_masterRecordsNoShow above.
-        Booking booking = buildElapsedBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
-        StatusUpdateRequest req = new StatusUpdateRequest(CancellationReason.CLIENT_NO_SHOW, "No show");
-        Cache masterCalendarCacheMock = mock(Cache.class);
-        Cache revenueCacheMock = mock(Cache.class);
-        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
-        when(bookingRepository.save(any())).thenReturn(booking);
-        when(cacheManager.getCache("master-calendar")).thenReturn(masterCalendarCacheMock);
-        when(cacheManager.getCache("revenue-dashboard")).thenReturn(revenueCacheMock);
-
-        // Act
-        bookingService.notCompleteBooking(actorId, bookingId, req);
-
-        // Assert
-        verify(cacheManager).getCache("revenue-dashboard");
-        verify(revenueCacheMock).clear();
-    }
-
     // ── cancelBooking ──────────────────────────────────────────────────────────
 
     @Test
@@ -2021,7 +1861,7 @@ class BookingServiceTest {
     // Prior behaviour (pinned at IT level by BookingAppointmentChildTransitionGuardIT): an
     // appointment child (non-null booking.getAppointment()) was refused with a 409 by
     // assertNotAppointmentChild BEFORE the status guard ran. That call is now removed from
-    // cancelBooking specifically (declineBooking/completeBooking/notCompleteBooking still call it
+    // cancelBooking specifically (declineBooking/completeBooking still call it
     // unchanged) — these two tests pin the widened contract: the cancel succeeds, and the visit
     // header recompute is delegated to AppointmentTransitionService rather than reimplemented here.
 

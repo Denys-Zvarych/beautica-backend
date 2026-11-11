@@ -6,7 +6,7 @@ import java.util.regex.Pattern;
  * Normalizes every free-text booking note before it is persisted (Phase 25.1).
  *
  * <p>Applied uniformly to {@code client_comment} (booking creation), {@code provider_comment}
- * (decline / not-complete), and {@code client_cancellation_note} (client cancel) — the four
+ * (decline), and {@code client_cancellation_note} (client cancel) — the four
  * comment write paths in {@code BookingService}. Bean Validation ({@code @Size}/{@code @Pattern}
  * on the request DTOs) rejects control characters and oversized payloads at the controller
  * boundary; this class handles what validation does not: presentation-layer whitespace/line-break

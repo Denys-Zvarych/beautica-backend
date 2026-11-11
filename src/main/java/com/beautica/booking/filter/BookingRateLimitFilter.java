@@ -27,19 +27,17 @@ import java.util.UUID;
  * /api/v1/appointments} (BE-3 multi-service visit create), {@code POST
  * /api/v1/masters/&#123;masterId&#125;/bookings} (Phase 22.4 staff walk-in create), {@code PATCH
  * /api/v1/bookings/{bookingId}/{reschedule,cancel}}, {@code PATCH
- * /api/v1/bookings/{bookingId}/{decline,not-complete}}, the WHOLE {@code PATCH
- * /api/v1/appointments/{appointmentId}/*} mutation family ({@code cancel}, {@code decline},
- * {@code complete}, {@code not-complete}, {@code reschedule}) PLUS its per-item counterparts
- * (track 30.x) at {@code services/{bookingId}/{decline,reschedule,cancel}} — all three per-item
- * verbs are matched by the identical {@code endsWith} suffix checks as their whole-visit siblings
- * and bucketed with them, never on a dedicated per-item budget — and {@code PUT
+ * /api/v1/bookings/{bookingId}/decline}, the per-service {@code PATCH
+ * /api/v1/appointments/{appointmentId}/services/{bookingId}/{decline,reschedule,cancel,complete}}
+ * family (phase 475 removed the whole-visit {@code /appointments/{appointmentId}/&lt;verb&gt;} routes and
+ * every {@code /not-complete} route, and their matchers with them) — and {@code PUT
  * /api/v1/masters/{masterId}/overrides/{date}} (the schedule-override write, which can bulk-decline
  * every conflicting booking on a date). These map to FOUR independent buckets with different
  * capacities, because they close different threat models:
  *
  * <ul>
  *   <li><b>{@code bookingWriteBuckets}:</b> create/appointment-create/reschedule
- *   (both paths), plus cancel (both paths) and appointment-complete. All of these take a real row
+ *   (both paths), plus cancel (both paths) and per-service appointment-complete. All of these take a real row
  *   lock that can
  *   pin a Hikari connection under contention — either the per-client advisory lock
  *   ({@code BookingRepository.acquireClientAdvisoryLockWithTimeout}, salted by the CALLER'S OWN
@@ -53,7 +51,7 @@ import java.util.UUID;
  *   and the whole app 503s for every other tenant — the lock-contention DoS this bucket closes
  *   (paired with the bounded {@code lock_timeout} fused into every lock query above, the second,
  *   independent half of the same fix). {@code PATCH .../cancel} and {@code PATCH
- *   .../{appointmentId}/complete} are ordinary, infrequent user actions (a client cancelling
+ *   .../services/{bookingId}/complete} are ordinary, infrequent user actions (a client cancelling
  *   their own booking; a provider closing out a visit), so they share the generous
  *   create/reschedule budget rather than the tighter decline budget below — nothing about them is
  *   an abuse signal on its own, only the row lock they take is the concern.
@@ -61,18 +59,17 @@ import java.util.UUID;
  *   still-unthrottled-route test below): a single-booking complete touches only the
  *   {@code bookings} table, never {@code appointments}, so it carries none of the lock-contention
  *   risk above.</li>
- *   <li><b>{@code bookingDeclineBuckets}:</b> decline/not-complete on both paths (including the
- *   PER-SERVICE {@code /appointments/{id}/services/{bookingId}/decline} variant). {@code decline}
+ *   <li><b>{@code bookingDeclineBuckets}:</b> decline on both paths (the single-booking route and
+ *   the PER-SERVICE {@code /appointments/{id}/services/{bookingId}/decline} variant). {@code decline}
  *   substitutes the calling provider's free-text note into a Beautica-branded SMS sent to a real,
  *   OTP-verified guest phone number ({@code NotificationService.buildGuestDeclineSms}, Phase
- *   25.7); {@code not-complete} writes the same {@code provider_comment} column and is grouped
- *   into the same budget for consistency/defense-in-depth. A single compromised/malicious
+ *   25.7). A single compromised/malicious
  *   provider account could otherwise fire either endpoint against every booking (or every
  *   service line of every visit) they own back-to-back, mass-dispatching an attacker-controlled
  *   message to many real phone numbers in one burst (a smishing/SMS-bomb concern, NOT a
  *   connection-pool concern) — a separate, smaller bucket with its own {@code Retry-After} bounds
  *   that bursts independently of the create/reschedule/cancel budget. {@code complete} carries no
- *   free-text note field at all (see {@code AppointmentTransitionService#completeAppointment}),
+ *   free-text note field at all (see {@code AppointmentTransitionService#completeAppointmentItem}),
  *   so it is never grouped here.</li>
  *   <li><b>{@code scheduleOverrideWriteBuckets}:</b> {@code PUT
  *   /api/v1/masters/{masterId}/overrides/{date}} — its OWN bucket, not shared with either bucket
@@ -245,7 +242,8 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
     private static final String CANCEL_SUFFIX = "/cancel";
     private static final String COMPLETE_SUFFIX = "/complete";
     private static final String DECLINE_SUFFIX = "/decline";
-    private static final String NOT_COMPLETE_SUFFIX = "/not-complete";
+    /** Every remaining appointment PATCH route is per-service: {@code /{appointmentId}/services/{bookingId}/&lt;verb&gt;}. */
+    private static final String SERVICES_SEGMENT = "/services/";
 
     /**
      * Base path covering all FOUR in-app notification feed endpoints (phase 334): {@code GET
@@ -279,7 +277,7 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
     /** {@code Retry-After} for the create/reschedule bucket — matches its 10s refill window. */
     private static final int CREATE_RESCHEDULE_RETRY_AFTER_SECONDS = 10;
 
-    /** {@code Retry-After} for the decline/not-complete bucket — matches its 60s refill window. */
+    /** {@code Retry-After} for the decline bucket — matches its 60s refill window. */
     private static final int DECLINE_RETRY_AFTER_SECONDS = 60;
 
     /**
@@ -572,36 +570,26 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
         if (path.endsWith(RESCHEDULE_SUFFIX) || path.endsWith(CANCEL_SUFFIX)) {
             return new BucketRoute(bookingWriteBuckets, CREATE_RESCHEDULE_RETRY_AFTER_SECONDS);
         }
-        if (path.endsWith(DECLINE_SUFFIX) || path.endsWith(NOT_COMPLETE_SUFFIX)) {
+        if (path.endsWith(DECLINE_SUFFIX)) {
             return new BucketRoute(bookingDeclineBuckets, DECLINE_RETRY_AFTER_SECONDS);
         }
         return null;
     }
 
     /**
-     * {@code PATCH /appointments/{appointmentId}/*} routing — the whole mutation family (SEC MEDIUM
-     * finding; previously entirely unmatched by this filter). {@code endsWith} is deliberately used
-     * rather than a fixed segment count: {@code .../services/{bookingId}/decline} (the per-service
-     * decline variant, TWO path segments after the appointment id) ends with the identical
-     * {@code "/decline"} suffix as the whole-visit {@code .../{appointmentId}/decline} route (ONE
-     * segment after the id), and both are INTENTIONALLY bucketed together (same SMS/free-text-note
-     * threat model, same per-user budget) — so no extra segment-counting is needed to route it
-     * correctly. {@code /not-complete} cannot be mis-matched by the {@code "/complete"} check below:
-     * the character immediately before {@code "complete"} in {@code ".../not-complete"} is a hyphen,
-     * not a slash, so {@code endsWith("/complete")} is {@code false} for it.
-     *
-     * <p><b>Track 30.x — the per-item reschedule/cancel routes need no change here either.</b>
-     * {@code .../services/{bookingId}/reschedule} and {@code .../services/{bookingId}/cancel} are
-     * two-segment siblings of the {@code /decline} shape above, and the SAME {@code endsWith} logic
-     * that already bucketed the per-service decline with its whole-visit sibling buckets these two
-     * with {@code bookingWriteBuckets} alongside {@code .../{appointmentId}/reschedule} and
-     * {@code .../{appointmentId}/cancel} — no new constant, no new branch. All THREE per-item verbs
-     * ({@code /services/{bookingId}/{decline,reschedule,cancel}}) are therefore matched by the
-     * identical suffix checks as their whole-visit counterparts and are intentionally bucketed with
-     * them, never on a dedicated per-item budget.
+     * {@code PATCH /appointments/{appointmentId}/services/{bookingId}/*} routing (SEC MEDIUM finding;
+     * previously entirely unmatched by this filter). Phase 475 removed the whole-visit
+     * {@code /{appointmentId}/&lt;verb&gt;} routes, so only the per-service shape (containing
+     * {@link #SERVICES_SEGMENT}) is matched: per-service decline goes to the decline bucket (same
+     * SMS/free-text-note threat model as the single-booking decline), per-service
+     * reschedule/cancel/complete to the write bucket. {@code endsWith} keeps the suffix match
+     * independent of the id segments.
      */
     private BucketRoute selectAppointmentPatchRoute(String path) {
-        if (path.endsWith(DECLINE_SUFFIX) || path.endsWith(NOT_COMPLETE_SUFFIX)) {
+        if (!path.contains(SERVICES_SEGMENT)) {
+            return null;
+        }
+        if (path.endsWith(DECLINE_SUFFIX)) {
             return new BucketRoute(bookingDeclineBuckets, DECLINE_RETRY_AFTER_SECONDS);
         }
         if (path.endsWith(RESCHEDULE_SUFFIX) || path.endsWith(CANCEL_SUFFIX) || path.endsWith(COMPLETE_SUFFIX)) {

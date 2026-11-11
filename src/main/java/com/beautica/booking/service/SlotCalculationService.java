@@ -536,9 +536,9 @@ public class SlotCalculationService {
         // tap.
         //
         // For the CREATE paths this guard is only that dead-CTA fix — they re-check MasterBookability
-        // themselves. For the three RESCHEDULE routes it IS the security boundary, and the only one:
-        // BookingService#rescheduleBooking, AppointmentTransitionService#rescheduleAppointment and
-        // #rescheduleAppointmentItem all authorize a start time by requiring it to MATCH a slot this
+        // themselves. For the two RESCHEDULE routes it IS the security boundary, and the only one:
+        // BookingService#rescheduleBooking and AppointmentTransitionService#rescheduleAppointmentItem
+        // both authorize a start time by requiring it to MATCH a slot this
         // method returns, and never call MasterBookability directly. Returning an empty list here is
         // what stops a client moving a live booking onto a master whose salon has since closed —
         // so do NOT weaken or relocate this check without giving those three their own guard
@@ -1453,7 +1453,7 @@ public class SlotCalculationService {
      * {@code master-bookable-days} (2 000 entries) by master prefix for exactly this reason.
      *
      * <p>Called from every booking-write {@code afterCommit} hook — {@code BookingService} (create,
-     * decline, complete, not-complete, cancel, reschedule; {@code declineBookingForBatch} deliberately
+     * decline, complete, cancel, reschedule; {@code declineBookingForBatch} deliberately
      * does NOT, because its caller {@code ScheduleOverrideConflictService} issues ONE combined sweep for
      * the whole batch), {@code AppointmentService} and {@code AppointmentTransitionService}
      * (multi-service visits), {@code GuestBookingService} and {@code GuestVisitCancellationService} (LINK),

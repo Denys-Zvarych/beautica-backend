@@ -16,9 +16,9 @@ import java.time.OffsetDateTime;
  * existed, {@code completeBooking} trusted the {@code CONFIRMED} status guard alone: a provider
  * could mark COMPLETED a booking that had not even begun yet.
  *
- * <p>Decline and not-complete are deliberately NOT guarded here — a provider may resolve either
- * transition on a CONFIRMED booking at any time, elapsed or not (product decision reversing the
- * earlier future-only decline guard and the earlier elapsed-only not-complete guard).
+ * <p>Decline is deliberately NOT guarded here — a provider may resolve a CONFIRMED booking at any
+ * time, elapsed or not (BOOK-09; product decision reversing the earlier future-only decline guard).
+ * The not-complete routes, which had no guard either, were removed in phase 475.
  *
  * <p>Every guard throws a 409 {@link BusinessException} — the same status the existing
  * {@code assertNotElapsedForClient}/{@code BookingElapsedException} client-side guard uses, since

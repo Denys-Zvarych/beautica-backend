@@ -37,7 +37,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <h2>The blind spot this closes</h2>
  * Sub-15-minute reschedule was exercised only CLIENT-initiated
  * ({@link BookingRescheduleGuardChainIT#should_return400_when_rescheduleTargetsTimeInsideLeadTimeWindow()},
- * {@code AppointmentRescheduleIT:254}), and every provider-initiated reschedule test used a
+ * the former {@code AppointmentRescheduleIT:254}), and every provider-initiated reschedule test used a
  * {@code plusDays(2)}-class target far above BOTH floors
  * ({@link BookingProviderRescheduleIT}). Reverting the fix therefore left the whole scoped suite
  * green. Each test below drives a provider token at a target only ~5 minutes out, so it fails
@@ -142,33 +142,7 @@ class ProviderNearNowRescheduleIT extends AbstractIntegrationTest {
         assertThat(dbStatus(f.bookingIds().get(0))).isEqualTo("CONFIRMED");
     }
 
-    // ── 2. AppointmentTransitionService#rescheduleAppointment — whole visit ───────────────────────
-
-    @Test
-    @DisplayName("PATCH /appointments/{id}/reschedule — the provider moves a two-service visit to ~5 "
-            + "minutes from now: 200 and the whole chain re-lays out from the new start")
-    void should_moveWholeVisit_when_providerReschedulesToUnderFifteenMinutesFromNow() throws Exception {
-        Fixture f = seedVisit("nearnow-visit", 2);
-        // The WHOLE-CHAIN oracle sizes the block to the sum of both services' durations, so the
-        // fixture's day-end headroom must be sized to the sum too — not to one service.
-        NearNow near = NearNow.forBlockOf(2 * SERVICE_MINUTES);
-        giveWorkingHoursAnchoredOn(f.masterId(), near.gridAnchor());
-
-        ResponseEntity<String> resp = patch(
-                APPOINTMENTS_URL + "/" + f.appointmentId() + "/reschedule", f.masterToken(), near.target());
-
-        assertThat(resp.getStatusCode())
-                .as("a provider moving a whole visit to %s (%d min out) must be accepted — body: %s",
-                        near.target(), near.leadMinutes(), resp.getBody())
-                .isEqualTo(HttpStatus.OK);
-        assertThat(dbStartsAt(f.bookingIds().get(0)).toInstant())
-                .as("the visit's FIRST item must sit exactly on the requested near-now start")
-                .isEqualTo(near.target().toInstant());
-        assertThat(dbStartsAt(f.bookingIds().get(1)).toInstant())
-                .as("the SECOND item must be chained directly onto the first — the re-layout preserves "
-                        + "every frozen duration")
-                .isEqualTo(near.target().plusMinutes(SERVICE_MINUTES).toInstant());
-    }
+    // ── 2. (whole-visit reschedule — route removed in phase 475) ───────────────────────────────
 
     // ── 3. AppointmentTransitionService#rescheduleAppointmentItem — one leg ───────────────────────
 
@@ -208,10 +182,10 @@ class ProviderNearNowRescheduleIT extends AbstractIntegrationTest {
     // ── 4. The negative pin on the newly-covered route ────────────────────────────────────────────
 
     /**
-     * The client-initiated counterpart for the PER-ITEM route specifically. The plain-booking and
-     * whole-visit routes already carry this pin
-     * ({@link BookingRescheduleGuardChainIT#should_return400_when_rescheduleTargetsTimeInsideLeadTimeWindow()}
-     * and {@code AppointmentRescheduleIT:254}) and are deliberately not duplicated here; the per-item
+     * The client-initiated counterpart for the PER-ITEM route specifically. The plain-booking route
+     * already carries this pin
+     * ({@link BookingRescheduleGuardChainIT#should_return400_when_rescheduleTargetsTimeInsideLeadTimeWindow()})
+     * and is deliberately not duplicated here; the per-item
      * route had none, and without it a mutation that relaxes the floor for EVERY actor — rather than
      * dispatching on one — would pass every other test in this class.
      */

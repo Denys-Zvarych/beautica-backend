@@ -405,6 +405,13 @@ abstract class AbstractWalkInBookingSmsIT extends AbstractStaffBookingIT {
                 + fixtureSalonName(salon.salonId()) + " | " + MASTER_NAME + " | ";
     }
 
+    /** Every Turbosms message text recorded since the last reset, in order. Promoted from GuestRescheduleSmsIT (phase 478). */
+    protected List<String> sentTexts() {
+        return TURBOSMS.findAll(postRequestedFor(urlEqualTo(TURBOSMS_PATH))).stream()
+                .map(request -> readJson(request.getBodyAsString()).path("sms").path("text").asText())
+                .toList();
+    }
+
     protected String sentText() throws Exception {
         List<LoggedRequest> requests = TURBOSMS.findAll(postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
         assertThat(requests).as("exactly one SMS").hasSize(1);
