@@ -48,7 +48,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 class TaxonomySeedContractIT extends AbstractIntegrationTest {
 
     // V75 seeds 140; V81 hard-deletes nail-service-pedicure-toes (a Nails leaf) -> 139.
-    private static final int TOTAL_SERVICE_TYPES = 139;
+    // Phase 453 / V234 adds 11 BODY_MASSAGE leaves -> 150.
+    private static final int TOTAL_SERVICE_TYPES = 150;
 
     /**
      * The DB CHECK on {@code service_types.slug}
@@ -202,9 +203,9 @@ class TaxonomySeedContractIT extends AbstractIntegrationTest {
         }
 
         @Test
-        @DisplayName("Body bucket (0006) holds 6 leaves")
-        void should_have6BodyLeaves_when_v75Applied() {
-            assertBucketLeafCount("11111111-0006-0000-0000-000000000000", 6);
+        @DisplayName("Body bucket (0006) holds 17 leaves (6 HAIR_REMOVAL + 11 BODY_MASSAGE from phase 453 / V234)")
+        void should_have17BodyLeaves_when_v234Applied() {
+            assertBucketLeafCount("11111111-0006-0000-0000-000000000000", 17);
         }
 
         @Test
