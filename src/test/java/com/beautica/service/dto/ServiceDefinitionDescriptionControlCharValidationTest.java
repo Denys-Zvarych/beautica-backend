@@ -32,7 +32,7 @@ class ServiceDefinitionDescriptionControlCharValidationTest {
     private static final String VTAB = "\u000B";
     private static final String DEL = "\u007F";
 
-    private static final String NAME_CONTROL_CHAR_MESSAGE = "Name contains invalid characters";
+    private static final String NAME_CONTROL_CHAR_MESSAGE = ServiceNameConstraints.NAME_REGEX_MESSAGE;
 
     private static Validator validator;
 
