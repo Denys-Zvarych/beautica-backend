@@ -24,6 +24,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
 import java.math.BigDecimal;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -38,7 +39,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  * salon and a client 403; an independent master's own service paths are unaffected.
  *
  * <p>Acceptance 3 (the same matrix on a second copy of one type) needs phase 464, which is not on
- * this branch; the gate is per {@code master_services} row, so this matrix covers it by construction.
+ * this branch. Here the per-row gate is pinned on two DIFFERENT services of the same master
+ * ({@link #should_applyRoleMatrixPerRow_when_masterHasTwoServices}); the second-copy variant is
+ * exercised once this branch is merged with {@code feat/duplicate-services}.
  */
 @Import(TestSecurityConfig.class)
 @DisplayName("Phase 463 — salon master band PATCH lockdown (owner/admin only)")
@@ -48,6 +51,7 @@ class SalonMasterBandLockdownIT extends AbstractIntegrationTest {
     private static final BigDecimal EDITED_PRICE = new BigDecimal("750.00");
     private static final BigDecimal OWNER_PRICE = new BigDecimal("650.00");
     private static final int OWNER_DURATION = 90;
+    private static final String ACCESS_DENIED = "Access denied";
 
     @Autowired
     private TestRestTemplate restTemplate;
@@ -76,7 +80,7 @@ class SalonMasterBandLockdownIT extends AbstractIntegrationTest {
         ResponseEntity<String> resp = patchBand(self.token(), salonId, self.masterId(), own.definitionId());
 
         assertThat(resp.getStatusCode()).as("own row, body=%s", resp.getBody()).isEqualTo(HttpStatus.FORBIDDEN);
-        assertThat(resp.getBody()).contains("Access denied");
+        assertThat(resp.getBody()).contains(ACCESS_DENIED);
         assertThat(bandRow(own.assignmentId()).get("price_override"))
                 .as("the refused self-edit must write nothing").isNull();
     }
@@ -124,6 +128,7 @@ class SalonMasterBandLockdownIT extends AbstractIntegrationTest {
         ResponseEntity<String> resp = patchBand(foreignAdminToken, salonId, masterId, row.definitionId());
 
         assertThat(resp.getStatusCode()).as("foreign admin").isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(resp.getBody()).contains(ACCESS_DENIED);
         assertThat(bandRow(row.assignmentId()).get("price_override")).as("nothing written").isNull();
     }
 
@@ -139,6 +144,7 @@ class SalonMasterBandLockdownIT extends AbstractIntegrationTest {
         ResponseEntity<String> resp = patchBand(clientToken, salonId, masterId, row.definitionId());
 
         assertThat(resp.getStatusCode()).as("client").isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(resp.getBody()).contains(ACCESS_DENIED);
         assertThat(bandRow(row.assignmentId()).get("price_override")).as("nothing written").isNull();
     }
 
@@ -163,6 +169,7 @@ class SalonMasterBandLockdownIT extends AbstractIntegrationTest {
         assertThat(ownEdit.getStatusCode()).as("own service edit, body=%s", ownEdit.getBody())
                 .isEqualTo(HttpStatus.OK);
         assertThat(bandOnSalonPath.getStatusCode()).as("salon-scoped band PATCH").isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(bandOnSalonPath.getBody()).contains(ACCESS_DENIED);
     }
 
     @Test
@@ -187,6 +194,7 @@ class SalonMasterBandLockdownIT extends AbstractIntegrationTest {
 
         assertThat(ownResp.getStatusCode()).as("own row, body=%s", ownResp.getBody()).isEqualTo(HttpStatus.FORBIDDEN);
         assertThat(peerResp.getStatusCode()).as("peer row, body=%s", peerResp.getBody()).isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(List.of(ownResp.getBody(), peerResp.getBody())).allSatisfy(b -> assertThat(b).contains(ACCESS_DENIED));
         for (Assignment row : List.of(own, peer)) {
             Map<String, Object> db = bandRow(row.assignmentId());
             assertThat((BigDecimal) db.get("price_override")).as("price kept on %s", row.assignmentId())
@@ -229,6 +237,7 @@ class SalonMasterBandLockdownIT extends AbstractIntegrationTest {
         ResponseEntity<String> resp = patchBand(ownerToken, salonId, foreignMasterId, foreign.definitionId());
 
         assertThat(resp.getStatusCode()).as("foreign master, body=%s", resp.getBody()).isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(resp.getBody()).contains(ACCESS_DENIED);
         assertThat(bandRow(foreign.assignmentId()).get("price_override")).as("foreign row untouched").isNull();
     }
 
@@ -252,6 +261,79 @@ class SalonMasterBandLockdownIT extends AbstractIntegrationTest {
         assertThat(rows.get(0).serviceDefinition().id()).isEqualTo(own.definitionId());
     }
 
+    @Test
+    @DisplayName("Anonymous band PATCH — 401, nothing written")
+    void should_return401_when_anonymousPatchesBand() throws Exception {
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(uniqueEmail("owner-anon"));
+        UUID salonId = fixtures.createSalon(ownerToken, "Phase 463 Anon Salon");
+        UUID masterId = fixtures.createSalonMaster(salonId);
+        Assignment row = bulkCreateFixed(ownerToken, salonId, masterId);
+        var request = new UpdateMasterServiceBandRequest(PriceType.FIXED, EDITED_PRICE, null, null, null, null);
+
+        ResponseEntity<String> resp = restTemplate.exchange(
+                "/api/v1/salons/" + salonId + "/masters/" + masterId + "/services/" + row.definitionId(),
+                HttpMethod.PATCH, new HttpEntity<>(request), String.class);
+
+        assertThat(resp.getStatusCode()).as("anonymous, body=%s", resp.getBody()).isEqualTo(HttpStatus.UNAUTHORIZED);
+        assertThat(bandRow(row.assignmentId()).get("price_override")).as("nothing written").isNull();
+    }
+
+    @Test
+    @DisplayName("SALON_OWNER (always a master) patches their OWN master row — 200, band written")
+    void should_return200_when_ownerPatchesOwnMasterRow() throws Exception {
+        String ownerEmail = uniqueEmail("owner-self");
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(ownerEmail);
+        UUID salonId = fixtures.createSalon(ownerToken, "Phase 463 Owner Self Salon");
+        UUID ownerMasterId = fixtures.resolveMasterIdForUserEmail(ownerEmail);
+        Assignment own = bulkCreateFixed(ownerToken, salonId, ownerMasterId);
+
+        ResponseEntity<String> resp = patchBand(ownerToken, salonId, ownerMasterId, own.definitionId());
+
+        assertThat(resp.getStatusCode()).as("owner own row, body=%s", resp.getBody()).isEqualTo(HttpStatus.OK);
+        assertThat((BigDecimal) bandRow(own.assignmentId()).get("price_override")).isEqualByComparingTo(EDITED_PRICE);
+    }
+
+    @Test
+    @DisplayName("Two DIFFERENT services of one salon master — the role matrix holds on each row: the "
+            + "master 403 on both, owner 200 on row 1, admin 200 on row 2, foreign admin and client "
+            + "403, and each write touches only its own row")
+    void should_applyRoleMatrixPerRow_when_masterHasTwoServices() throws Exception {
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(uniqueEmail("owner-two"));
+        UUID salonId = fixtures.createSalon(ownerToken, "Phase 463 Two Services Salon");
+        var self = fixtures.createSalonMasterWithRowAndGetToken(salonId, uniqueEmail("self-two"));
+        Assignment first = bulkCreateFixed(ownerToken, salonId, self.masterId(), 0);
+        Assignment second = bulkCreateFixed(ownerToken, salonId, self.masterId(), 1);
+        String adminToken = fixtures.createSalonAdminAndGetToken(salonId, uniqueEmail("admin-two"));
+        String otherOwnerToken = fixtures.createSalonOwnerAndGetToken(uniqueEmail("owner-two-other"));
+        UUID otherSalonId = fixtures.createSalon(otherOwnerToken, "Phase 463 Two Services Other Salon");
+        String foreignAdminToken = fixtures.createSalonAdminAndGetToken(otherSalonId, uniqueEmail("admin-two-for"));
+        String clientToken = fixtures.createClientAndGetToken(uniqueEmail("client-two"));
+        assertThat(second.definitionId()).as("two distinct services").isNotEqualTo(first.definitionId());
+
+        List<ResponseEntity<String>> denied = new ArrayList<>();
+        for (Assignment row : List.of(first, second)) {
+            for (String token : List.of(self.token(), foreignAdminToken, clientToken)) {
+                denied.add(patchBand(token, salonId, self.masterId(), row.definitionId()));
+            }
+        }
+        var ownerBand = new UpdateMasterServiceBandRequest(PriceType.FIXED, OWNER_PRICE, null, null, null, null);
+        ResponseEntity<String> ownerOnFirst = patchBand(ownerToken, salonId, self.masterId(), first.definitionId(), ownerBand);
+        ResponseEntity<String> adminOnSecond = patchBand(adminToken, salonId, self.masterId(), second.definitionId());
+
+        assertThat(denied).as("master, foreign admin, client on both rows").hasSize(6).allSatisfy(r -> {
+            assertThat(r.getStatusCode()).as("body=%s", r.getBody()).isEqualTo(HttpStatus.FORBIDDEN);
+            assertThat(r.getBody()).contains(ACCESS_DENIED);
+        });
+        assertThat(ownerOnFirst.getStatusCode()).as("owner row 1, body=%s", ownerOnFirst.getBody())
+                .isEqualTo(HttpStatus.OK);
+        assertThat(adminOnSecond.getStatusCode()).as("admin row 2, body=%s", adminOnSecond.getBody())
+                .isEqualTo(HttpStatus.OK);
+        assertThat((BigDecimal) bandRow(first.assignmentId()).get("price_override")).as("row 1 = owner price only")
+                .isEqualByComparingTo(OWNER_PRICE);
+        assertThat((BigDecimal) bandRow(second.assignmentId()).get("price_override")).as("row 2 = admin price only")
+                .isEqualByComparingTo(EDITED_PRICE);
+    }
+
     // ── helpers ────────────────────────────────────────────────────────────────────────────────
 
     private record Assignment(UUID assignmentId, UUID definitionId) {
@@ -262,7 +344,12 @@ class SalonMasterBandLockdownIT extends AbstractIntegrationTest {
     }
 
     private Assignment bulkCreateFixed(String ownerToken, UUID salonId, UUID masterId) throws Exception {
-        UUID typeId = fixtures.activeSelectableServiceTypes(1).get(0).id();
+        return bulkCreateFixed(ownerToken, salonId, masterId, 0);
+    }
+
+    private Assignment bulkCreateFixed(String ownerToken, UUID salonId, UUID masterId, int typeIndex)
+            throws Exception {
+        UUID typeId = fixtures.activeSelectableServiceTypes(typeIndex + 1).get(typeIndex).id();
         var item = new BulkServiceItemRequest(typeId, 60, PriceType.FIXED, SEEDED_PRICE, null, null);
         ResponseEntity<String> resp = restTemplate.exchange(
                 "/api/v1/salons/" + salonId + "/masters/" + masterId + "/services/bulk", HttpMethod.POST,
