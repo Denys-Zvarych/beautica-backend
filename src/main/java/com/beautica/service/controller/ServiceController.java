@@ -253,20 +253,17 @@ public class ServiceController {
     }
 
     /**
-     * Edits ONE master's OWN price band and/or duration override (Phase 311) — the only
+     * Edits ONE master's price band and/or duration override (Phase 311) — the only
      * {@code PATCH}/{@code PUT} anywhere on {@code master_services}. Same path as
      * {@link #unassignServiceFromMaster}'s {@code DELETE}, one verb apart (D1):
      * {@code POST .../services} assigns, this {@code PATCH} edits the assignment's band, and
      * {@code DELETE .../services/{serviceDefId}} unassigns.
      *
-     * <p><b>D5 — narrows the "SALON_MASTER is read-only" invariant for ONE row and ONE column
-     * group.</b> Unlike every other write in this controller, {@code @authz.canEditMasterServiceBand}
-     * ALSO admits the {@code SALON_MASTER} whose own {@code masters} row is {@code #masterId} —
-     * they may edit their own band and nothing else (Phase 306 D6 / Phase 310 D5 still hold for
-     * every other endpoint). The predicate is a NEW, independent entry point from
-     * {@code canReadSalonMasterServices}; it does not reuse or widen that read gate, and the
-     * service-definition write gate ({@code enforceCanManageServiceDefinition} behind a role gate
-     * that excludes {@code SALON_MASTER}) is untouched.
+     * <p><b>Phase 463 — owner/admin only.</b> The gate is the salon bulk endpoint's exact
+     * expression ({@code canManageSalon} AND {@code masterBelongsToSalon}). A {@code SALON_MASTER}
+     * never sets or edits their own durations or prices (locked decision) and gets {@code 403},
+     * including on their own row; this reverses Phase 311 D5. The service-layer twin
+     * {@code enforceCanEditMasterServiceBand} re-proves the same predicate.
      *
      * <p><b>D4 — {@code null} means "leave unchanged"; {@code clearBand}/{@code
      * clearDurationOverride} are the explicit reverts.</b> See
@@ -296,10 +293,14 @@ public class ServiceController {
                             + "serviceDefId) — also returned when master/definition are missing, "
                             + "in another salon, or the assignment is inactive."),
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "403", description = "Caller is not the owner or an admin of "
+                            + "salonId, or masterId is not in salonId. A SALON_MASTER is always "
+                            + "denied, including on their own row (Phase 463)."),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
                     responseCode = "429", description = RATE_LIMITED_429)
     })
     @PatchMapping("/salons/{salonId}/masters/{masterId}/services/{serviceDefId}")
-    @PreAuthorize("@authz.canEditMasterServiceBand(authentication, #salonId, #masterId)")
+    @PreAuthorize("@authz.canManageSalon(authentication, #salonId) and @authz.masterBelongsToSalonForBandEdit(#masterId, #salonId)")
     public ResponseEntity<ApiResponse<MasterServiceResponse>> updateMasterServiceBand(
             @PathVariable UUID salonId,
             @Parameter(description = "Master row id (NOT a user id)") @PathVariable UUID masterId,

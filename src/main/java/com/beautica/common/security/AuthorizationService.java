@@ -59,11 +59,13 @@ public class AuthorizationService {
     private final ActorSalonAssignmentMemo actorSalonAssignmentMemo;
 
     /**
-     * Request-lifetime memo of the two boolean facts the band-edit gate and its service-layer
-     * enforce twin both read (perf LOW, 2026-09-13 cycle-2 audit, B5). Used ONLY by
-     * {@link #canEditMasterServiceBand} / {@link #enforceCanEditMasterServiceBand} — see
-     * {@link SalonScopeFactMemo} for why it memoises the repository FACTS and never the grant, and
-     * for the call sites it must never be extended to.
+     * Request-lifetime memo of the two boolean facts (salon ownership, master-in-salon) that a
+     * SpEL gate and its service-layer enforce twin both read (perf LOW, 2026-09-13 cycle-2 audit,
+     * B5). Used ONLY by {@link #canManageSalon}, {@link #masterBelongsToSalonForBandEdit},
+     * {@link #enforceCanEditMasterServiceBand}, {@link #enforceCanManageSalon(UUID, UUID)} and
+     * {@link #enforceOwnerMasterRowWritableByOwnerOnly} — see {@link SalonScopeFactMemo} for why
+     * it memoises the repository FACTS and never the grant, and for the call sites it must never
+     * be extended to.
      */
     private final SalonScopeFactMemo salonScopeFactMemo;
 
@@ -300,59 +302,17 @@ public class AuthorizationService {
     }
 
     /**
-     * Phase 311 D5 — the ONLY {@code master_services} write a {@code SALON_MASTER} may perform,
-     * and only on their OWN row. Admits the {@code SALON_OWNER} of {@code salonId}, a
-     * {@code SALON_ADMIN} assigned to it, and the {@code SALON_MASTER} whose {@code masters} row
-     * IS {@code masterId} — the identical audience {@link #canReadSalonMasterServices} admits.
-     *
-     * <p><b>Deliberately its own entry point, not a call to the read predicate.</b> A later
-     * widening of the READ gate (e.g. admitting a peer master, or a receptionist role) must not
-     * silently widen this WRITE gate too, and {@code grep canEditMasterServiceBand} must remain
-     * the complete answer to "where can a SALON_MASTER write?". Both methods delegate to the same
-     * private helper so the shared traversal is written once (promote-don't-duplicate), but they
-     * are two named, independently-evolvable public symbols.
-     *
-     * <p>The service-definition write gate is NOT widened by this phase —
-     * {@code PATCH /services/{serviceDefId}} and {@code DELETE /services/{id}} keep a
-     * controller role gate that excludes {@code SALON_MASTER}/{@code CLIENT}, plus
-     * {@link #enforceCanManageServiceDefinition} in the service layer; a master must stay out (D6).
-     *
-     * <p><b>Cross-tenant fix (post-311 audit).</b> {@link #isOwnerAdminOrSelfMaster}'s management
-     * branch does NOT itself verify {@code masterId} belongs to {@code salonId} — deliberately, for
-     * {@link #canReadSalonMasterServices} (see that method's javadoc: a cross-salon
-     * {@code masterId} must fall through to the service layer's own 404, not 403 here). This WRITE
-     * gate has no such 404 fallback, so it proves membership itself on BOTH branches, matching this
-     * method's service-layer twin {@link #enforceCanEditMasterServiceBand}.
-     *
-     * <p><b>The controller's {@code @PreAuthorize} no longer restates it (2026-09-13 audit).</b> It
-     * used to read {@code "@authz.canEditMasterServiceBand(...) and @authz.masterBelongsToSalon(...)"},
-     * which made the SAME {@code existsByIdAndSalonId} run a second time per request on top of the
-     * two this method and its enforce-twin already issued. The conjunct is retained INSIDE this
-     * predicate — the truth table is unchanged, the statement count is not. Do not re-add it to the
-     * SpEL: the gate is complete on its own, and a second site is one more place a widening can be
-     * applied to only half of.
-     */
-    public boolean canEditMasterServiceBand(Authentication auth, UUID salonId, UUID masterId) {
-        if (isClientCaller(auth)) return false;
-        UUID actorId = principalId(auth);
-        Role actorRole = roleFromAuthentication(auth);
-        if (hasManagementAccessMemoised(salonId, actorId, actorRole)) {
-            // The management branch has no 404 fallback (unlike the READ gate), so membership is
-            // proven here — ONE existsByIdAndSalonId, not one per conjunct.
-            return masterBelongsToSalonMemoised(masterId, salonId);
-        }
-        return ownsMasterRowInSalon(actorId, salonId, masterId);
-    }
-
-    /**
      * {@link #hasManagementAccess(UUID, UUID, Role)} with the {@code SALON_OWNER} arm's
      * {@code existsByIdAndOwnerId} read at most once per request (perf LOW, cycle-2 audit B5).
      *
-     * <p>Scoped to the band-edit pair on purpose. The {@code SALON_ADMIN} arm is left alone because
-     * {@link ActorSalonAssignmentMemo} already deduplicates it one level down, and every OTHER
-     * caller of {@code hasManagementAccess} is left alone because many of them authorize a write
-     * that can itself move {@code salons.owner_id} — see {@link SalonScopeFactMemo}'s "any future
-     * call site" warning.
+     * <p>Callers: the SpEL {@link #canManageSalon} and its service-layer twins
+     * {@link #enforceCanEditMasterServiceBand} and {@link #enforceCanManageSalon(UUID, UUID)}
+     * (via {@link #enforceCanManageSalonMemoised}) — every one of them authorizes a write to
+     * {@code master_services} / {@code service_definitions} only, never {@code salons.owner_id}.
+     * The {@code SALON_ADMIN} arm is left alone because {@link ActorSalonAssignmentMemo} already
+     * deduplicates it one level down, and the public {@code hasManagementAccess} overloads stay
+     * unmemoised because many of their callers authorize a write that can itself move
+     * {@code salons.owner_id} — see {@link SalonScopeFactMemo}'s "any future call site" warning.
      */
     private boolean hasManagementAccessMemoised(UUID salonId, UUID actorId, Role actorRole) {
         if (actorRole != Role.SALON_OWNER) {
@@ -362,7 +322,11 @@ public class AuthorizationService {
                 () -> salonRepository.existsByIdAndOwnerId(salonId, actorId));
     }
 
-    /** {@link #masterBelongsToSalon} with its {@code existsByIdAndSalonId} read at most once per request. */
+    /**
+     * {@link #masterBelongsToSalon} with its {@code existsByIdAndSalonId} read at most once per
+     * request. Callers: {@link #masterBelongsToSalonForBandEdit} (SpEL gate) and
+     * {@link #enforceCanEditMasterServiceBand} (service twin) — the band PATCH only.
+     */
     private boolean masterBelongsToSalonMemoised(UUID masterId, UUID salonId) {
         if (masterId == null || salonId == null) return false;
         return salonScopeFactMemo.masterInSalon(masterId, salonId,
@@ -370,10 +334,10 @@ public class AuthorizationService {
     }
 
     /**
-     * Shared traversal behind {@link #canReadSalonMasterServices} and
-     * {@link #canEditMasterServiceBand} (Phase 311 D5) — promoted out of the former's body rather
-     * than duplicated, mirroring {@link #canManageServiceOwnerAccess}'s role as the single shared
-     * predicate behind a SpEL gate and its service-layer defense-in-depth twin.
+     * Read-only predicate behind {@link #canReadSalonMasterServices} (Phase 311 D5) — its sole
+     * caller. Admits the salon's owner/admin, or a {@code SALON_MASTER} reading their OWN row.
+     * It authorizes no write: since Phase 463 a {@code SALON_MASTER} cannot edit their band, so
+     * never reuse it for a mutation gate.
      */
     private boolean isOwnerAdminOrSelfMaster(Authentication auth, UUID salonId, UUID masterId) {
         if (isClientCaller(auth)) return false;
@@ -385,7 +349,7 @@ public class AuthorizationService {
         return ownsMasterRowInSalon(actorId, salonId, masterId);
     }
 
-    /** CLIENT fast-reject shared by the two Phase 311 gates — no DB round trip for a client JWT. */
+    /** CLIENT fast-reject for the Phase 311 read gate — no DB round trip for a client JWT. */
     private static boolean isClientCaller(Authentication auth) {
         return auth.getAuthorities().stream()
                 .anyMatch(a -> a.getAuthority().equals("ROLE_CLIENT"));
@@ -399,15 +363,12 @@ public class AuthorizationService {
      * MEDIUM perf + security).</b> {@link MasterRepository#findByIdWithUserAndSalon} already
      * {@code LEFT JOIN FETCH}es the salon, so the membership predicate is answerable in memory at
      * zero additional statements. The old spelling issued
-     * {@code existsByIdAndSalonId} as a second round trip, and because the same conjunction was
-     * re-stated in {@link #canEditMasterServiceBand}, in the controller's {@code @PreAuthorize}
-     * SpEL and again in {@link #enforceCanEditMasterServiceBand}, ONE band PATCH executed that
-     * identical {@code EXISTS} four to five times.
+     * {@code existsByIdAndSalonId} as a second round trip.
      *
      * <p><b>An {@code INDEPENDENT_MASTER} is denied here by an explicit rule, not by accident.</b>
      * Their {@code masters} row carries {@code salon_id IS NULL}, so {@code m.getSalon() == null}
      * rejects them outright: a solo master has no salon-scoped catalogue to read or price, and
-     * these two gates are salon-scoped by definition (Phase 311 D5). This used to fall out
+     * this gate is salon-scoped by definition (Phase 311 D5). This used to fall out
      * incidentally of {@code existsByIdAndSalonId} never matching a NULL {@code salon_id}; it is
      * now stated directly so the denial cannot be lost to a refactor of that finder.
      */
@@ -422,36 +383,22 @@ public class AuthorizationService {
     }
 
     /**
-     * Service-layer (defense-in-depth) twin of {@link #canEditMasterServiceBand}, mirroring the
-     * {@link #enforceCanManageServiceDefinition} idiom — re-proves the SpEL gate's grant using the
-     * caller-supplied {@code actorId} so a future non-HTTP caller of
-     * {@code ServiceCatalogService#updateMasterServiceBand} cannot bypass it (same correction
-     * Phase 310 applied to {@code getSalonMasterServices}).
+     * Service-layer (defense-in-depth) twin of the band PATCH's {@code @PreAuthorize}
+     * ({@code canManageSalon AND masterBelongsToSalon}) — re-proves that grant using the
+     * caller-supplied {@code actorId} so a non-HTTP caller of
+     * {@code ServiceCatalogService#updateMasterServiceBand} cannot bypass it.
      *
-     * <p><b>Cross-tenant fix (post-311 audit).</b> The management branch used to return on
-     * {@link #hasManagementAccess} alone, without checking {@code masterId} actually belongs to
-     * {@code salonId} — unlike the controller's {@code @PreAuthorize}, which ANDs
-     * {@link #masterBelongsToSalon} as a separate conjunct. That let a SALON_OWNER/SALON_ADMIN
-     * managing their own salon pass this guard for a master belonging to a DIFFERENT salon; the
-     * SpEL gate rejected it first over HTTP, but a non-HTTP caller of
-     * {@code ServiceCatalogService#updateMasterServiceBand} would not have been protected. Now
-     * mirrors the compound SpEL exactly, matching {@link #canEditMasterServiceBand}'s own fix.
+     * <p><b>Phase 463 — owner/admin only.</b> A {@code SALON_MASTER} never edits their own
+     * durations or prices (locked decision); the former own-row branch (Phase 311 D5) is gone.
      *
-     * <p><b>The actor must BE the current principal (2026-09-13 cycle-3 audit, A2).</b> Exactly the
-     * split-identity defect cycle 2 closed on {@link #enforceCanManageSalon(UUID, UUID)} (B6): this
-     * method takes {@code actorId} as a parameter but resolves the actor's ROLE from
-     * {@code SecurityContextHolder} via {@link #roleFromCurrentAuthentication()}. Without the
-     * assertion below, a non-HTTP caller running under principal A (role SALON_OWNER) could pass
-     * {@code actorId} = B and have <em>A's role</em> checked against <em>B's ownership</em>. Not
-     * reachable over HTTP today — {@code ServiceController} passes
-     * {@code AuthenticationUtils.userId(authentication)} read from the same context — but the hole
-     * is refused outright rather than left latent. {@link #principalId} itself throws
-     * {@link ForbiddenException} on a missing or non-UUID principal, so an unauthenticated caller
-     * is denied first.
+     * <p><b>The actor must BE the current principal (2026-09-13 cycle-3 audit, A2).</b> The actor's
+     * ROLE is resolved from {@code SecurityContextHolder}; without the assertion below a non-HTTP
+     * caller under principal A could pass {@code actorId} = B and have A's role checked against
+     * B's ownership. {@link #principalId} throws {@link ForbiddenException} on a missing or
+     * non-UUID principal, so an unauthenticated caller is denied first.
      *
      * @throws ForbiddenException if {@code actorId} is not the authenticated principal, if the
-     *                             actor is neither managing {@code salonId} nor the
-     *                             {@code SALON_MASTER} of {@code masterId} within it, or if
+     *                             actor does not own or administer {@code salonId}, or if
      *                             {@code masterId} does not belong to {@code salonId}
      */
     public void enforceCanEditMasterServiceBand(UUID actorId, UUID salonId, UUID masterId) {
@@ -460,16 +407,10 @@ public class AuthorizationService {
             throw new ForbiddenException("Access denied");
         }
         Role actorRole = roleFromCurrentAuthentication();
-        // Perf LOW (cycle-2 audit B5): identical predicate, identical arguments, SAME request as
-        // the SpEL gate that just ran — so for a SALON_OWNER both statements are served from
-        // SalonScopeFactMemo and the owner path drops from 4 authorization statements to 2. The
-        // DECISION is still re-derived here from scratch (the memo holds repository facts, never a
-        // grant), so the defense-in-depth property this method exists for is unchanged.
-        if (hasManagementAccessMemoised(salonId, actorId, actorRole)
-                && masterBelongsToSalonMemoised(masterId, salonId)) {
-            return;
-        }
-        if (!ownsMasterRowInSalon(actorId, salonId, masterId)) {
+        // The memo holds repository facts, never a grant: the owner read shared with the SpEL
+        // canManageSalon is served once; the DECISION is re-derived here from scratch.
+        if (!hasManagementAccessMemoised(salonId, actorId, actorRole)
+                || !masterBelongsToSalonMemoised(masterId, salonId)) {
             throw new ForbiddenException("Access denied");
         }
     }
@@ -895,6 +836,18 @@ public class AuthorizationService {
     public boolean masterBelongsToSalon(UUID masterId, UUID salonId) {
         if (masterId == null || salonId == null) return false;
         return masterRepository.existsByIdAndSalonId(masterId, salonId);
+    }
+
+    /**
+     * {@link #masterBelongsToSalon} for the band PATCH {@code @PreAuthorize} ONLY — reads
+     * {@code existsByIdAndSalonId} through the request memo so the service-layer twin
+     * {@link #enforceCanEditMasterServiceBand} does not repeat it (perf LOW, Phase 463 audit).
+     * Memo-safe: that endpoint writes {@code master_services} only, never {@code masters.salon_id}.
+     * Every other caller keeps the unmemoised {@link #masterBelongsToSalon}; do not reuse this
+     * on any path whose write can move a master between salons.
+     */
+    public boolean masterBelongsToSalonForBandEdit(UUID masterId, UUID salonId) {
+        return masterBelongsToSalonMemoised(masterId, salonId);
     }
 
     /**

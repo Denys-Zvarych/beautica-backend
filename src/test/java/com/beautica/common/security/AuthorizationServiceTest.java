@@ -30,6 +30,9 @@ import org.springframework.security.core.Authentication;
 import org.springframework.security.core.authority.SimpleGrantedAuthority;
 import org.springframework.security.core.context.SecurityContextHolder;
 
+import org.springframework.mock.web.MockHttpServletRequest;
+import org.springframework.web.context.request.RequestContextHolder;
+import org.springframework.web.context.request.ServletRequestAttributes;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -352,11 +355,13 @@ class AuthorizationServiceTest {
 
     /** A masters row owned by {@code ownerUserId}, sitting in {@code salonId} (null = solo). */
     private static Master masterRow(UUID ownerUserId, UUID salonId) {
+        // lenient (Phase 463): the band-edit enforce tests build a genuine own-row fixture to prove
+        // the owner/admin-only gate denies WITHOUT reading it — those stubs are unreached by design.
         User masterUser = mock(User.class);
-        when(masterUser.getId()).thenReturn(ownerUserId);
+        lenient().when(masterUser.getId()).thenReturn(ownerUserId);
 
         Master master = mock(Master.class);
-        when(master.getUser()).thenReturn(masterUser);
+        lenient().when(master.getUser()).thenReturn(masterUser);
         if (salonId != null) {
             Salon salon = mock(Salon.class);
             // lenient: ownsMasterRowInSalon short-circuits on the user-id comparison, so a PEER-row
@@ -497,167 +502,10 @@ class AuthorizationServiceTest {
         verifyNoInteractions(salonRepository, userRepository);
     }
 
-    // ── canEditMasterServiceBand (Phase 311 D5) ───────────────────────────────
-    // PATCH .../masters/{masterId}/services/{serviceDefId}. Same audience as
-    // canReadSalonMasterServices, via the shared isOwnerAdminOrSelfMaster helper — this block
-    // mirrors that one's matrix EXACTLY, one test per branch, so a future edit that inlines
-    // different logic into either method (instead of sharing the helper) is caught here rather
-    // than only at the controller/IT layer.
+    // canEditMasterServiceBand was removed in Phase 463: the band PATCH's SpEL is now
+    // canManageSalon AND masterBelongsToSalon (both covered by their own blocks in this class).
 
-    @Test
-    @DisplayName("canEditMasterServiceBand returns true when a SALON_MASTER edits their OWN row "
-            + "(D5) — actor id, masters row id and salon id are all distinct")
-    void should_returnTrue_when_salonMasterEditsOwnBand() {
-        UUID actorId = UUID.randomUUID();
-        UUID masterId = UUID.randomUUID();
-        UUID salonId = UUID.randomUUID();
-
-        Master master = masterRow(actorId, salonId);
-        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
-
-        Authentication auth = mockAuth(actorId, "ROLE_SALON_MASTER");
-
-        boolean result = authorizationService.canEditMasterServiceBand(auth, salonId, masterId);
-
-        assertThat(result).isTrue();
-        verify(masterRepository, never())
-                .existsByIdAndSalonId(any(), any());
-    }
-
-    @Test
-    @DisplayName("canEditMasterServiceBand returns false when a SALON_MASTER edits a PEER master's "
-            + "row — mutation 10's pin (comparing against m.getId() instead of m.getUser().getId() "
-            + "would make this pass)")
-    void should_returnFalse_when_salonMasterEditsPeerBand() {
-        UUID actorId = UUID.randomUUID();
-        UUID masterId = UUID.randomUUID();
-        UUID salonId = UUID.randomUUID();
-        UUID peerUserId = UUID.randomUUID();
-
-        Master master = masterRow(peerUserId, salonId);
-        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
-
-        Authentication auth = mockAuth(actorId, "ROLE_SALON_MASTER");
-
-        boolean result = authorizationService.canEditMasterServiceBand(auth, salonId, masterId);
-
-        assertThat(result)
-                .as("a SALON_MASTER must never edit a peer master's band — the single most "
-                        + "important negative case for D5, case 19")
-                .isFalse();
-        verify(salonRepository, never()).existsByIdAndOwnerId(any(), any());
-        verify(userRepository, never()).findSalonIdById(any());
-    }
-
-    @Test
-    @DisplayName("canEditMasterServiceBand returns false when a SALON_MASTER's own masterId sits "
-            + "behind a FOREIGN salonId in the path")
-    void should_returnFalse_when_salonMasterOwnBandButForeignSalonId() {
-        UUID actorId = UUID.randomUUID();
-        UUID masterId = UUID.randomUUID();
-        UUID foreignSalonId = UUID.randomUUID();
-
-        Master master = masterRow(actorId, UUID.randomUUID());
-        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
-
-        Authentication auth = mockAuth(actorId, "ROLE_SALON_MASTER");
-
-        boolean result = authorizationService.canEditMasterServiceBand(auth, foreignSalonId, masterId);
-
-        assertThat(result).isFalse();
-    }
-
-    @Test
-    @DisplayName("canEditMasterServiceBand returns true when the SALON_OWNER manages the PATH's salonId")
-    void should_returnTrue_when_salonOwnerEditsAnyMasterBandInSalon() {
-        UUID actorId = UUID.randomUUID();
-        UUID masterId = UUID.randomUUID();
-        UUID salonId = UUID.randomUUID();
-
-        when(salonRepository.existsByIdAndOwnerId(salonId, actorId)).thenReturn(true);
-        when(masterRepository.existsByIdAndSalonId(masterId, salonId)).thenReturn(true);
-
-        Authentication auth = mockAuth(actorId, "ROLE_SALON_OWNER");
-
-        boolean result = authorizationService.canEditMasterServiceBand(auth, salonId, masterId);
-
-        assertThat(result).isTrue();
-        verify(masterRepository, never()).findByIdWithUserAndSalon(any());
-    }
-
-    @Test
-    @DisplayName("canEditMasterServiceBand returns true when the SALON_ADMIN manages the PATH's salonId")
-    void should_returnTrue_when_salonAdminEditsAnyMasterBandInSalon() {
-        UUID actorId = UUID.randomUUID();
-        UUID masterId = UUID.randomUUID();
-        UUID salonId = UUID.randomUUID();
-
-        when(userRepository.findSalonIdById(actorId)).thenReturn(Optional.of(salonId));
-        when(masterRepository.existsByIdAndSalonId(masterId, salonId)).thenReturn(true);
-
-        Authentication auth = mockAuth(actorId, "ROLE_SALON_ADMIN");
-
-        boolean result = authorizationService.canEditMasterServiceBand(auth, salonId, masterId);
-
-        assertThat(result).isTrue();
-        verify(masterRepository, never()).findByIdWithUserAndSalon(any());
-    }
-
-    @Test
-    @DisplayName("canEditMasterServiceBand returns false WITHOUT a DB hit when actor has ROLE_CLIENT")
-    void should_returnFalse_withoutDbHit_when_actorIsClientEditingBand() {
-        UUID salonId = UUID.randomUUID();
-        UUID masterId = UUID.randomUUID();
-        Authentication auth = mockAuth(UUID.randomUUID(), "ROLE_CLIENT");
-
-        boolean result = authorizationService.canEditMasterServiceBand(auth, salonId, masterId);
-
-        assertThat(result).isFalse();
-        verify(masterRepository, never()).findByIdWithUserAndSalon(any());
-        verifyNoInteractions(salonRepository, userRepository);
-    }
-
-    @Test
-    @DisplayName("canEditMasterServiceBand returns false when the SALON_OWNER manages the PATH's "
-            + "salonId but masterId belongs to a DIFFERENT salon — unlike canReadSalonMasterServices, "
-            + "this WRITE gate has no service-layer 404 fallback so it must reject here, not just at "
-            + "the controller's separate masterBelongsToSalon conjunct")
-    void should_returnFalse_when_ownerManagesSalonButMasterBelongsToDifferentSalon() {
-        UUID actorId = UUID.randomUUID();
-        UUID salonId = UUID.randomUUID();
-        UUID foreignMasterId = UUID.randomUUID();
-
-        when(salonRepository.existsByIdAndOwnerId(salonId, actorId)).thenReturn(true);
-        when(masterRepository.existsByIdAndSalonId(foreignMasterId, salonId)).thenReturn(false);
-
-        Authentication auth = mockAuth(actorId, "ROLE_SALON_OWNER");
-
-        boolean result = authorizationService.canEditMasterServiceBand(auth, salonId, foreignMasterId);
-
-        assertThat(result).isFalse();
-    }
-
-    @Test
-    @DisplayName("Phase 311 D5, mutation 9: canReadSalonMasterServices and canEditMasterServiceBand "
-            + "are genuinely SEPARATE entry points — both delegate to the identical private helper, "
-            + "so they agree on this peer-row negative case by construction, not by the read gate "
-            + "widening to cover the write gate")
-    void should_agree_betweenReadAndEditPredicates_onPeerRowNegativeCase() {
-        UUID actorId = UUID.randomUUID();
-        UUID masterId = UUID.randomUUID();
-        UUID salonId = UUID.randomUUID();
-        UUID peerUserId = UUID.randomUUID();
-
-        Master master = masterRow(peerUserId, salonId);
-        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
-
-        Authentication auth = mockAuth(actorId, "ROLE_SALON_MASTER");
-
-        assertThat(authorizationService.canReadSalonMasterServices(auth, salonId, masterId)).isFalse();
-        assertThat(authorizationService.canEditMasterServiceBand(auth, salonId, masterId)).isFalse();
-    }
-
-    // ── enforceCanEditMasterServiceBand (Phase 311 D5 service-layer guard) ────
+    // ── enforceCanEditMasterServiceBand (owner/admin only since Phase 463) ────
 
     @Test
     @DisplayName("enforceCanEditMasterServiceBand does not throw when the actor manages the salon")
@@ -686,7 +534,6 @@ class AuthorizationServiceTest {
 
         when(salonRepository.existsByIdAndOwnerId(salonId, actorId)).thenReturn(true);
         when(masterRepository.existsByIdAndSalonId(foreignMasterId, salonId)).thenReturn(false);
-        when(masterRepository.findByIdWithUserAndSalon(foreignMasterId)).thenReturn(Optional.empty());
         SecurityContextHolder.getContext().setAuthentication(mockAuth(actorId, "ROLE_SALON_OWNER"));
 
         assertThatThrownBy(() -> authorizationService.enforceCanEditMasterServiceBand(actorId, salonId, foreignMasterId))
@@ -695,42 +542,43 @@ class AuthorizationServiceTest {
     }
 
     @Test
-    @DisplayName("enforceCanEditMasterServiceBand does not throw when the actor is the SALON_MASTER "
-            + "of masterId, within salonId")
-    void should_notThrow_when_selfMasterEnforcesEditOwnBand() {
+    @DisplayName("Phase 463: enforceCanEditMasterServiceBand throws ForbiddenException when the "
+            + "actor is the SALON_MASTER of masterId, within salonId — own row no longer editable")
+    void should_throwForbidden_when_selfMasterEnforcesEditOwnBand() {
         UUID actorId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
         UUID masterId = UUID.randomUUID();
 
-        // Actor role SALON_MASTER short-circuits hasManagementAccess to false without any
-        // repository call (AuthorizationService#hasManagementAccess), so no salonRepository stub
-        // is needed here — one would be an UnnecessaryStubbingException under strict Mockito.
+        // The row genuinely IS the actor's own and sits in salonId (lenient: the old own-row
+        // branch would read it and admit; the owner/admin-only gate never reaches it).
         Master master = masterRow(actorId, salonId);
-        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
-        SecurityContextHolder.getContext().setAuthentication(mockAuth(actorId, "ROLE_SALON_MASTER"));
-
-        assertThatCode(() -> authorizationService.enforceCanEditMasterServiceBand(actorId, salonId, masterId))
-                .doesNotThrowAnyException();
-    }
-
-    @Test
-    @DisplayName("enforceCanEditMasterServiceBand throws ForbiddenException for a peer master or a "
-            + "non-managing actor")
-    void should_throwForbidden_when_actorNeitherManagesSalonNorOwnsMasterRow() {
-        UUID actorId = UUID.randomUUID();
-        UUID salonId = UUID.randomUUID();
-        UUID masterId = UUID.randomUUID();
-        UUID peerUserId = UUID.randomUUID();
-
-        // No salonRepository stub needed — SALON_MASTER short-circuits hasManagementAccess (see
-        // the sibling happy-path test above).
-        Master master = masterRow(peerUserId, salonId);
-        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
+        lenient().when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
+        lenient().when(masterRepository.existsByIdAndSalonId(masterId, salonId)).thenReturn(true);
         SecurityContextHolder.getContext().setAuthentication(mockAuth(actorId, "ROLE_SALON_MASTER"));
 
         assertThatThrownBy(() -> authorizationService.enforceCanEditMasterServiceBand(actorId, salonId, masterId))
                 .isInstanceOf(ForbiddenException.class)
                 .hasMessageContaining("Access denied");
+        verify(masterRepository, never()).findByIdWithUserAndSalon(any());
+    }
+
+    @Test
+    @DisplayName("Phase 463: enforceCanEditMasterServiceBand denies a SALON_MASTER the band edit "
+            + "without reading the master row")
+    void should_throwForbiddenWithoutReadingMasterRow_when_salonMasterEditsBand() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+
+        // No repository stub needed — hasManagementAccess returns false for a SALON_MASTER
+        // role without any repository read (Phase 463: no SALON_MASTER ever edits a band), so
+        // the short-circuit skips the master-membership read (existsByIdAndSalonId).
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(actorId, "ROLE_SALON_MASTER"));
+
+        assertThatThrownBy(() -> authorizationService.enforceCanEditMasterServiceBand(actorId, salonId, masterId))
+                .isInstanceOf(ForbiddenException.class)
+                .hasMessageContaining("Access denied");
+        verify(masterRepository, never()).existsByIdAndSalonId(any(), any());
     }
 
     /**
@@ -813,24 +661,6 @@ class AuthorizationServiceTest {
     }
 
     @Test
-    @DisplayName("Q5: canEditMasterServiceBand DENIES an INDEPENDENT_MASTER on their own row — "
-            + "the write gate agrees with the read gate for the solo-master shape")
-    void should_returnFalse_when_independentMasterEditsOwnRowUnderASalonPath() {
-        UUID actorId = UUID.randomUUID();
-        UUID masterId = UUID.randomUUID();
-        UUID salonId = UUID.randomUUID();
-
-        Master master = masterRow(actorId, null);
-        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
-
-        Authentication auth = mockAuth(actorId, "ROLE_INDEPENDENT_MASTER");
-
-        assertThat(authorizationService.canEditMasterServiceBand(auth, salonId, masterId)).isFalse();
-        verify(salonRepository, never()).existsByIdAndOwnerId(any(), any());
-        verify(userRepository, never()).findSalonIdById(any());
-    }
-
-    @Test
     @DisplayName("Q5: an INDEPENDENT_MASTER whose row DOES sit in a salon (a rotated staff member "
             + "whose JWT role is stale) is still admitted on the own-row branch — the gates key on "
             + "the masters row, not the token role, and this pins that boundary deliberately")
@@ -885,7 +715,7 @@ class AuthorizationServiceTest {
         Master foreignMaster = masterRow(UUID.randomUUID(), salonId);
         when(userRepository.findSalonIdById(actorId)).thenReturn(Optional.of(UUID.randomUUID()));
         // The master row EXISTS and DOES belong to salonId — it simply is not this actor's.
-        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(foreignMaster));
+        lenient().when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(foreignMaster));
         // lenient: unreached while the gate is correct (`&&` short-circuits after the management
         // arm denies), and reached only by the mutant this test exists to catch.
         lenient().when(masterRepository.existsByIdAndSalonId(masterId, salonId)).thenReturn(true);
@@ -909,7 +739,7 @@ class AuthorizationServiceTest {
         // absent row. verifyNoInteractions(salonRepository) below still proves no ownership query
         // was even attempted.
         Master foreignMaster = masterRow(UUID.randomUUID(), salonId);
-        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(foreignMaster));
+        lenient().when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(foreignMaster));
         lenient().when(masterRepository.existsByIdAndSalonId(masterId, salonId)).thenReturn(true);
         SecurityContextHolder.getContext().setAuthentication(mockAuth(actorId, "ROLE_CLIENT"));
 
@@ -927,7 +757,7 @@ class AuthorizationServiceTest {
         UUID masterId = UUID.randomUUID();
 
         Master master = masterRow(actorId, null);
-        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
+        lenient().when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         SecurityContextHolder.getContext().setAuthentication(mockAuth(actorId, "ROLE_INDEPENDENT_MASTER"));
 
         assertThatThrownBy(() -> authorizationService.enforceCanEditMasterServiceBand(actorId, salonId, masterId))
@@ -1190,6 +1020,55 @@ class AuthorizationServiceTest {
 
         assertThat(result).isFalse();
         verify(masterRepository, never()).existsByIdAndSalonId(any(), any());
+    }
+
+    // ── masterBelongsToSalonForBandEdit — request memo (Phase 463 perf LOW) ─────
+
+    @Test
+    @DisplayName("masterBelongsToSalonForBandEdit reads existsByIdAndSalonId once per request — the "
+            + "band enforce twin reuses the gate's answer")
+    void should_readMembershipOnce_when_bandEditGateAndEnforceTwinRunInOneRequest() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(actorId, "ROLE_SALON_OWNER"));
+        when(salonRepository.existsByIdAndOwnerId(salonId, actorId)).thenReturn(true);
+        when(masterRepository.existsByIdAndSalonId(masterId, salonId)).thenReturn(true);
+        RequestContextHolder.setRequestAttributes(
+                new ServletRequestAttributes(new MockHttpServletRequest()));
+
+        try {
+            boolean gate = authorizationService.masterBelongsToSalonForBandEdit(masterId, salonId);
+            boolean again = authorizationService.masterBelongsToSalonForBandEdit(masterId, salonId);
+            authorizationService.enforceCanEditMasterServiceBand(actorId, salonId, masterId);
+
+            assertThat(gate).isTrue();
+            assertThat(again).isTrue();
+            verify(masterRepository, times(1)).existsByIdAndSalonId(masterId, salonId);
+        } finally {
+            RequestContextHolder.resetRequestAttributes();
+        }
+    }
+
+    @Test
+    @DisplayName("masterBelongsToSalon stays UNMEMOISED inside a request — every call re-reads "
+            + "existsByIdAndSalonId (other callers must see a fresh fact)")
+    void should_readMembershipEveryCall_when_publicMasterBelongsToSalonCalledTwiceInOneRequest() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        when(masterRepository.existsByIdAndSalonId(masterId, salonId)).thenReturn(true);
+        RequestContextHolder.setRequestAttributes(
+                new ServletRequestAttributes(new MockHttpServletRequest()));
+
+        try {
+            authorizationService.masterBelongsToSalonForBandEdit(masterId, salonId);
+            authorizationService.masterBelongsToSalon(masterId, salonId);
+            authorizationService.masterBelongsToSalon(masterId, salonId);
+
+            verify(masterRepository, times(3)).existsByIdAndSalonId(masterId, salonId);
+        } finally {
+            RequestContextHolder.resetRequestAttributes();
+        }
     }
 
     // ── adminBelongsToSalon ────────────────────────────────────────────────────

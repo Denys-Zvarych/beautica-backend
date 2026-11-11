@@ -342,8 +342,8 @@ public class ServiceCatalogService {
      * restate the current value must not trigger a needless sweep.
      *
      * @throws NotFoundException  if no ACTIVE assignment exists for {@code (masterId, serviceDefId)}
-     * @throws ForbiddenException if the actor cannot manage {@code salonId} and is not the
-     *                            {@code SALON_MASTER} of {@code masterId}
+     * @throws ForbiddenException if the actor cannot manage {@code salonId} or {@code masterId}
+     *                            is not in it — a {@code SALON_MASTER} is always denied (Phase 463)
      */
     @Transactional
     public MasterServiceResponse updateMasterServiceBand(
@@ -407,7 +407,8 @@ public class ServiceCatalogService {
         BigDecimal floorAfter = ServicePricing.effectivePriceOf(assignment);
         Integer durationAfter = assignment.getDurationOverrideMinutes();
 
-        // S4 (2026-09-13 audit) — a SALON_MASTER may write this row (Phase 311 D5, deliberate), and
+        // S4 (2026-09-13 audit) — only the salon owner or a SALON_ADMIN of the salon may write this
+        // row (Phase 463 reversed Phase 311 D5: a SALON_MASTER never edits their own band), and
         // the write immediately moves PUBLIC state: the salon-catalogue price hull and, when the
         // floor moves, masters.min_effective_price (the search band). Without this line there is no
         // record of WHICH actor moved a salon's advertised price. IDs and numbers only — this
