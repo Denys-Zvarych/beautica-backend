@@ -153,9 +153,10 @@ class ReviewInviteEndToEndIT extends AbstractReviewInviteIT {
             + "a tick sends ONE review SMS, row SENT with hash only")
     void should_sendOneReviewSms_when_staffWalkInVisitCompletedOverRest() throws Exception {
         UUID appointmentId = fixtures.staffGuestVisit("CONFIRMED", GUEST_PHONE);
-        fixtures.visitItem(appointmentId, masterId, masterServiceId, "STAFF", "CONFIRMED", GUEST_PHONE, 3);
+        UUID item = fixtures.visitItem(appointmentId, masterId, masterServiceId, "STAFF", "CONFIRMED", GUEST_PHONE, 3);
 
-        ResponseEntity<String> completed = patch("/api/v1/appointments/" + appointmentId + "/complete");
+        ResponseEntity<String> completed =
+                patch("/api/v1/appointments/" + appointmentId + "/services/" + item + "/complete");
         List<Map<String, Object>> rows = jdbcTemplate.queryForList("SELECT * FROM review_invites");
         int smsBeforeTick = turbosmsRequests().size();
         Instant sendAfter = ((Timestamp) rows.get(0).get("send_after")).toInstant();
@@ -182,7 +183,7 @@ class ReviewInviteEndToEndIT extends AbstractReviewInviteIT {
     void should_skipAnonymised_when_visitAnonymisedBetweenCreateAndSend() {
         UUID appointmentId = fixtures.linkVisit("CONFIRMED", GUEST_PHONE, POLICY);
         UUID item = fixtures.visitItem(appointmentId, masterId, masterServiceId, "LINK", "CONFIRMED", GUEST_PHONE, 3);
-        patch("/api/v1/appointments/" + appointmentId + "/complete");
+        patch("/api/v1/appointments/" + appointmentId + "/services/" + item + "/complete");
         UUID inviteId = singleInviteId();
         String statusAtCreate = (String) inviteRow(inviteId).get("status");
 

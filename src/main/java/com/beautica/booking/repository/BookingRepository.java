@@ -547,25 +547,71 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     PhoneSmsBudgetUsage countPhoneSmsBudgetUsedSince(@Param("phone") String phone, @Param("since") Instant since);
 
     /**
-     * Phase 408 audit-fix (security MEDIUM) — whether another service line of the same walk-in visit was already
-     * DECLINED and its cancellation message reserved since {@code since} (a {@code guest_reschedule_sms_sends} row on
-     * that sibling). One cancellation message per visit per window, however many lines are declined one by one.
-     * Known edge (accepted, no {@code kind} column): a RESCHEDULE reservation on a sibling that was later declined also
-     * counts as "already notified" for that visit within the window.
+     * Phase 478 audit-fix cycle 1 — everything the walk-in provider-cancellation message budget
+     * ({@code GuestRescheduleSmsBudget#tryReserveWalkInCancellation}) needs, in ONE statement under the per-phone lock:
+     * <ul>
+     *   <li>{@code walkInVisits} + {@code rescheduleSends} — the shared per-phone budget, same predicates as
+     *       {@link #countPhoneSmsBudgetUsedSince};</li>
+     *   <li>{@code visitCharged} — another service line of the same walk-in visit ({@code appointmentId}, may be
+     *       {@code null}) was already DECLINED and its cancellation message reserved since {@code since} (GST-75: the
+     *       visit already spent its budget charge, so this line's message goes out without spending another). Known
+     *       edge (accepted, no {@code kind} column): a RESCHEDULE reservation on a sibling that was later declined
+     *       also counts as "already charged";</li>
+     *   <li>{@code cancellationMessages} — DECLINED walk-in lines of this phone, other than {@code bookingId}, whose
+     *       cancellation message was released in the window: their own reservation row, or a reservation on a
+     *       DECLINED sibling of their visit (the free-ride lines, which hold no row). Feeds the hard per-phone
+     *       ceiling. Conservative: a declined sibling whose message is still queued counts already.
+     *       Driven from the {@code sent_at}-windowed send log (cost bounded by the window, not the phone's
+     *       history), fanned out to {@code c} by PK or {@code idx_bookings_appointment}. The charged reservation's
+     *       booking must carry the same phone — visit lines share one guest phone, and erasure/retention null it
+     *       per phone or long after the window.</li>
+     * </ul>
      */
     @Query(value = """
-            SELECT EXISTS (
-                SELECT 1
-                  FROM guest_reschedule_sms_sends s
-                  JOIN bookings sib ON sib.id = s.booking_id
-                 WHERE sib.appointment_id = :appointmentId
-                   AND sib.id <> :bookingId
-                   AND sib.status = 'DECLINED'
-                   AND s.sent_at > :since)
+            SELECT (SELECT count(DISTINCT coalesce(b.appointment_id, b.id))
+                      FROM bookings b
+                     WHERE b.guest_phone = :phone
+                       AND b.booking_source = 'STAFF'
+                       AND b.created_at > :since) AS "walkInVisits",
+                   (SELECT count(*)
+                      FROM guest_reschedule_sms_sends s
+                      JOIN bookings rb ON rb.id = s.booking_id
+                     WHERE rb.guest_phone = :phone
+                       AND s.sent_at > :since) AS "rescheduleSends",
+                   (CAST(:appointmentId AS uuid) IS NOT NULL AND EXISTS (
+                        SELECT 1
+                          FROM guest_reschedule_sms_sends s
+                          JOIN bookings sib ON sib.id = s.booking_id
+                         WHERE sib.appointment_id = CAST(:appointmentId AS uuid)
+                           AND sib.id <> :bookingId
+                           AND sib.status = 'DECLINED'
+                           AND s.sent_at > :since)) AS "visitCharged",
+                   (SELECT count(*)
+                      FROM (SELECT sib.id
+                              FROM guest_reschedule_sms_sends s
+                              JOIN bookings sib ON sib.id = s.booking_id
+                             WHERE s.sent_at > :since
+                               AND sib.guest_phone = :phone
+                               AND sib.booking_source = 'STAFF'
+                               AND sib.status = 'DECLINED'
+                               AND sib.id <> :bookingId
+                            UNION
+                            SELECT c.id
+                              FROM guest_reschedule_sms_sends s
+                              JOIN bookings sib ON sib.id = s.booking_id
+                              JOIN bookings c ON c.appointment_id = sib.appointment_id
+                             WHERE s.sent_at > :since
+                               AND sib.guest_phone = :phone
+                               AND sib.status = 'DECLINED'
+                               AND c.guest_phone = :phone
+                               AND c.booking_source = 'STAFF'
+                               AND c.status = 'DECLINED'
+                               AND c.id <> :bookingId) cm) AS "cancellationMessages"
             """, nativeQuery = true)
-    boolean existsVisitCancellationSendSince(@Param("appointmentId") UUID appointmentId,
-                                             @Param("bookingId") UUID bookingId,
-                                             @Param("since") Instant since);
+    WalkInCancellationBudgetUsage readWalkInCancellationBudgetSince(@Param("phone") String phone,
+                                                                    @Param("appointmentId") UUID appointmentId,
+                                                                    @Param("bookingId") UUID bookingId,
+                                                                    @Param("since") Instant since);
 
     /**
      * Phase 431 — provider reschedules of one guest booking/visit ({@code scopeId}: the appointment id
@@ -1703,7 +1749,8 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
                 b.id,
                 b.appointment.id,
                 b.master.id,
-                b.startsAt
+                b.startsAt,
+                CASE WHEN b.client IS NULL THEN true ELSE false END
             )
             FROM Booking b
             WHERE b.salon.id = :salonId
@@ -1739,7 +1786,8 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
                 b.id,
                 b.appointment.id,
                 b.master.id,
-                b.startsAt
+                b.startsAt,
+                CASE WHEN b.client IS NULL THEN true ELSE false END
             )
             FROM Booking b
             WHERE b.master.id = :masterId
@@ -1917,7 +1965,8 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
                 b.id,
                 b.appointment.id,
                 b.master.id,
-                b.startsAt
+                b.startsAt,
+                true
             )
             FROM Booking b
             WHERE b.master.id = :masterId
@@ -1942,7 +1991,8 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
                 b.id,
                 b.appointment.id,
                 b.master.id,
-                b.startsAt
+                b.startsAt,
+                true
             )
             FROM Booking b
             WHERE b.salon.id = :salonId

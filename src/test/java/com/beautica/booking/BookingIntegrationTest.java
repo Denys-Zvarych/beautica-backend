@@ -251,78 +251,58 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("PATCH /bookings/{id}/not-complete — CONFIRMED booking transitions to NOT_COMPLETED with reason stored in DB")
-    void should_markNotCompleted_and_return204_when_confirmedBookingMarkedNotCompleted() throws Exception {
-        String ownerEmail = "integ-notcomplete-owner-" + System.nanoTime() + "@beautica.test";
+    @DisplayName("phase 475 (D4): a LEGACY NOT_COMPLETED booking stays readable — GET /bookings/{id} shows the "
+            + "status and the provider note to the client (BOOK-40), it is not review-eligible, and "
+            + "?status=NOT_COMPLETED and partition=PAST both still return it")
+    void should_keepLegacyNotCompletedBookingReadable_when_noRouteSetsTheStatusAnyMore() throws Exception {
+        String ownerEmail = "integ-legacy-nc-owner-" + System.nanoTime() + "@beautica.test";
         UUID masterId = createSalonOwnerSalonAndMaster(ownerEmail);
-        String ownerToken = loginAndGetToken(ownerEmail);
         UUID masterServiceId = createMasterService(masterId);
         addWorkingHoursForEveryDay(masterId);
+        String clientToken = createClientAndGetToken("integ-legacy-nc-client-" + System.nanoTime() + "@beautica.test");
+        UUID bookingId = createBooking(clientToken, masterId, masterServiceId);
+        String note = "Клієнт не з'явився";
+        LegacyNotCompletedSeeder.markNotCompleted(jdbcTemplate, bookingId, note);
 
-        String clientToken = createClientAndGetToken("integ-notcomplete-client-" + System.nanoTime() + "@beautica.test");
-        ZonedDateTime startsAt = ZonedDateTime.now().plusDays(3).withHour(14).withMinute(0).withSecond(0).withNano(0);
-        UUID bookingId = createBooking(clientToken, masterId, masterServiceId, startsAt);
+        JsonNode detail = getData(BOOKINGS_URL + "/" + bookingId, clientToken);
+        JsonNode byStatus = getData(BOOKINGS_URL + "/me?status=NOT_COMPLETED", clientToken);
+        JsonNode past = getData(BOOKINGS_URL + "/me?partition=PAST", clientToken);
 
-        // Bookings are auto-confirmed at creation (track 24.x) — no /confirm hop exists any more.
-        String dbStatusAfterCreate = jdbcTemplate.queryForObject(
-                "SELECT status FROM bookings WHERE id = ?", String.class, bookingId);
-        assertThat(dbStatusAfterCreate)
-                .as("booking must be CONFIRMED immediately after creation, before not-complete transition")
-                .isEqualTo("CONFIRMED");
-
-        String body = "{\"cancellationReason\":\"CLIENT_NO_SHOW\",\"comment\":\"Клієнт не з'явився вчасно\"}";
-        log.debug("Act: PATCH {}/{}/not-complete as SALON_OWNER — must return 204", BOOKINGS_URL, bookingId);
-        ResponseEntity<Void> response = restTemplate.exchange(
-                BOOKINGS_URL + "/" + bookingId + "/not-complete", HttpMethod.PATCH,
-                new HttpEntity<>(body, bearerHeaders(ownerToken)),
-                Void.class);
-
-        assertThat(response.getStatusCode())
-                .as("owner marking CONFIRMED booking not-completed must return 204")
-                .isEqualTo(HttpStatus.NO_CONTENT);
-
-        String dbStatus = jdbcTemplate.queryForObject(
-                "SELECT status FROM bookings WHERE id = ?", String.class, bookingId);
-        assertThat(dbStatus)
-                .as("booking status in DB must be NOT_COMPLETED after not-complete transition")
-                .isEqualTo("NOT_COMPLETED");
-
-        String dbReason = jdbcTemplate.queryForObject(
-                "SELECT cancellation_reason FROM bookings WHERE id = ?", String.class, bookingId);
-        assertThat(dbReason)
-                .as("cancellation_reason must be stored as CLIENT_NO_SHOW")
-                .isEqualTo("CLIENT_NO_SHOW");
+        assertThat(detail.path("status").asText()).isEqualTo("NOT_COMPLETED");
+        assertThat(detail.path("providerComment").asText())
+                .as("the provider's no-show note stays visible to the client (BOOK-40)").isEqualTo(note);
+        assertThat(detail.path("canReview").isBoolean())
+                .as("canReview must be present, or the isFalse() below is vacuous (MissingNode → false)").isTrue();
+        assertThat(detail.path("canReview").asBoolean())
+                .as("a no-show is never review-eligible (BOOK-03)").isFalse();
+        assertThat(idsOf(byStatus)).as("?status=NOT_COMPLETED still filters legacy rows").contains(bookingId);
+        assertThat(idsOf(past)).as("partition=PAST still includes legacy NOT_COMPLETED rows").contains(bookingId);
     }
 
     @Test
-    @DisplayName("Phase 25.9: PATCH /bookings/{id}/not-complete — 204 with no comment in the body; "
-            + "the note is optional for all roles (reverses Phase 25.2's required-comment decision)")
-    void should_markNotCompleted_and_return204_when_noCommentProvided() throws Exception {
-        String ownerEmail = "integ-notcomplete-nocomment-owner-" + System.nanoTime() + "@beautica.test";
+    @DisplayName("phase 475 (D4) + DASH-01 — the revenue dashboard counts only COMPLETED: a legacy NOT_COMPLETED "
+            + "booking in range is excluded from totalCompletedBookings and estimatedRevenue, as before")
+    void should_excludeLegacyNotCompletedFromDashboard_when_completedBookingAlsoInRange() throws Exception {
+        String ownerEmail = "integ-legacy-nc-dash-owner-" + System.nanoTime() + "@beautica.test";
         UUID masterId = createSalonOwnerSalonAndMaster(ownerEmail);
-        String ownerToken = loginAndGetToken(ownerEmail);
         UUID masterServiceId = createMasterService(masterId);
         addWorkingHoursForEveryDay(masterId);
+        String clientToken = createClientAndGetToken("integ-legacy-nc-dash-client-" + System.nanoTime() + "@beautica.test");
+        ZonedDateTime day = ZonedDateTime.now(TimeZones.KYIV).plusDays(2).withMinute(0).withSecond(0).withNano(0);
+        UUID completed = createBooking(clientToken, masterId, masterServiceId, day.withHour(10));
+        UUID legacy = createBooking(clientToken, masterId, masterServiceId, day.withHour(13));
+        jdbcTemplate.update("UPDATE bookings SET status = 'COMPLETED' WHERE id = ?", completed);
+        LegacyNotCompletedSeeder.markNotCompleted(jdbcTemplate, legacy, null);
+        String range = "?from=" + LocalDate.now(TimeZones.KYIV) + "&to=" + day.toLocalDate().plusDays(1);
 
-        String clientToken = createClientAndGetToken("integ-notcomplete-nocomment-client-" + System.nanoTime() + "@beautica.test");
-        ZonedDateTime startsAt = ZonedDateTime.now().plusDays(3).withHour(15).withMinute(0).withSecond(0).withNano(0);
-        UUID bookingId = createBooking(clientToken, masterId, masterServiceId, startsAt);
+        JsonNode revenue = getData("/api/v1/dashboard/revenue" + range, loginAndGetToken(ownerEmail));
 
-        String body = "{\"cancellationReason\":\"CLIENT_NO_SHOW\"}";
-        ResponseEntity<Void> response = restTemplate.exchange(
-                BOOKINGS_URL + "/" + bookingId + "/not-complete", HttpMethod.PATCH,
-                new HttpEntity<>(body, bearerHeaders(ownerToken)),
-                Void.class);
-
-        assertThat(response.getStatusCode())
-                .as("owner marking not-complete with no comment must return 204 — the note is optional")
-                .isEqualTo(HttpStatus.NO_CONTENT);
-
-        String dbProviderComment = jdbcTemplate.queryForObject(
-                "SELECT provider_comment FROM bookings WHERE id = ?", String.class, bookingId);
-        assertThat(dbProviderComment)
-                .as("no comment supplied must persist as NULL, never an empty string")
-                .isNull();
+        assertThat(revenue.path("totalCompletedBookings").asLong())
+                .as("only the COMPLETED booking counts; the legacy NOT_COMPLETED one is excluded").isEqualTo(1L);
+        assertThat(revenue.path("estimatedRevenue").decimalValue())
+                .as("revenue sums the COMPLETED booking's price snapshot only")
+                .isEqualByComparingTo(jdbcTemplate.queryForObject(
+                        "SELECT price_at_booking FROM bookings WHERE id = ?", java.math.BigDecimal.class, completed));
     }
 
     @Test
@@ -1281,6 +1261,19 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
                 LIMIT 1
                 """,
                 String.class, ownerEmail);
+    }
+
+    private JsonNode getData(String url, String token) throws Exception {
+        ResponseEntity<String> resp = restTemplate.exchange(
+                url, HttpMethod.GET, new HttpEntity<>(bearerHeaders(token)), String.class);
+        assertThat(resp.getStatusCode()).as("GET %s — body: %s", url, resp.getBody()).isEqualTo(HttpStatus.OK);
+        return objectMapper.readTree(resp.getBody()).path("data");
+    }
+
+    private static List<UUID> idsOf(JsonNode page) {
+        List<UUID> ids = new java.util.ArrayList<>();
+        page.path("data").forEach(row -> ids.add(UUID.fromString(row.path("id").asText())));
+        return ids;
     }
 
     private HttpHeaders bearerHeaders(String token) {

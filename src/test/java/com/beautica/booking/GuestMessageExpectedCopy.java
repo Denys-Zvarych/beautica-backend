@@ -44,6 +44,13 @@ public final class GuestMessageExpectedCopy {
         return "Beautica: Ваш запис перенесено на " + DATE_FMT.format(kyiv) + " о " + TIME_FMT.format(kyiv) + ".";
     }
 
+    /** Provider decline / cancellation of the service starting at {@code start}, with the guest's own page linked. */
+    public static String providerCancellationWithDetails(OffsetDateTime start, String pageUrl) {
+        var kyiv = start.atZoneSameInstant(TimeZones.KYIV);
+        return "Beautica: Ваш запис " + DATE_FMT.format(kyiv) + " о " + TIME_FMT.format(kyiv) + " скасовано."
+                + DETAILS_PARAGRAPH_PREFIX + pageUrl;
+    }
+
     /** Provider reschedule plus the «Деталі або записатись знову {url}» paragraph. */
     public static String rescheduleWithDetails(OffsetDateTime newStart, String pageUrl) {
         return reschedule(newStart) + DETAILS_PARAGRAPH_PREFIX + pageUrl;

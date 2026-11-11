@@ -3,6 +3,7 @@ package com.beautica.booking.service;
 import com.beautica.booking.entity.GuestRescheduleSmsSend;
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.booking.repository.GuestRescheduleSmsSendRepository;
+import com.beautica.booking.repository.WalkInCancellationBudgetUsage;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.lang.Nullable;
@@ -52,6 +53,13 @@ public class GuestRescheduleSmsBudget {
     /** Rows older than the window are dead weight. */
     static final Duration RETENTION = Duration.ofDays(2);
 
+    /**
+     * Phase 478 audit-fix cycle 1 — hard ceiling on walk-in provider-cancellation messages per phone per
+     * {@link StaffBookingService#WALK_IN_PHONE_WINDOW}: two full {@link SlotCalculationService#MAX_SERVICES_PER_VISIT}
+     * visits, so one visit's per-service messages (GST-D13) are never dropped by it.
+     */
+    static final int MAX_CANCELLATION_MESSAGES_PER_PHONE_PER_HOUR = 2 * SlotCalculationService.MAX_SERVICES_PER_VISIT;
+
     private final BookingRepository bookingRepository;
     private final GuestRescheduleSmsSendRepository sendRepository;
     private final Clock clock;
@@ -87,12 +95,24 @@ public class GuestRescheduleSmsBudget {
      * walk-in's typed-in phone. Shares the SAME count as the walk-in confirmation and the reschedule SMS (5 per phone
      * per rolling hour, {@link BookingRepository#countPhoneSmsBudgetUsedSince}) and records its reservation in the
      * same {@code guest_reschedule_sms_sends} log, so create + reschedule + decline spam on one number stays capped.
-     * Also at most one cancellation message per visit per window ({@link
-     * BookingRepository#existsVisitCancellationSendSince}). Silent: {@code false} skips the message only.
+     * Silent: {@code false} skips the message only.
+     *
+     * <p><b>Charged once per visit (phase 478, GST-75).</b> A guest gets one cancellation message per cancelled
+     * SERVICE. When another service line of the same visit already reserved its cancellation message within the
+     * window, this one is a legitimate per-service message of an already-charged visit: it is allowed WITHOUT a budget
+     * check and WITHOUT a reservation row, so the per-phone budget never drops it (logged as
+     * {@code event=walk_in_cancellation_sms_visit_charged}, so free-ride sends stay reconstructable).
+     *
+     * <p><b>Hard per-phone ceiling (phase 478 audit-fix cycle 1).</b> Regardless of path, at most
+     * {@link #MAX_CANCELLATION_MESSAGES_PER_PHONE_PER_HOUR} cancellation messages go to one phone per
+     * {@link StaffBookingService#WALK_IN_PHONE_WINDOW} — two full {@link SlotCalculationService#MAX_SERVICES_PER_VISIT}
+     * visits, so a single visit's per-service messages (GST-D13) are never truncated by it. Beyond it the message is
+     * suppressed and logged ({@code reason=per_phone_ceiling}).
      *
      * <p>Idempotent per outbox row (audit-fix cycle 2, same precedent as {@link #tryReserve}): a back-pressure re-queue
      * of the same row finds its own reservation ({@code outbox_entry_id}, V223 partial unique index) and proceeds
-     * without spending budget again, so retries can never exhaust it and silently drop the message.
+     * without spending budget again, so retries can never exhaust it and silently drop the message. One fused read
+     * ({@link BookingRepository#readWalkInCancellationBudgetSince}) per message after the lock.
      */
     @Transactional
     public boolean tryReserveWalkInCancellation(UUID bookingId, @Nullable UUID appointmentId, String phoneE164,
@@ -102,13 +122,17 @@ public class GuestRescheduleSmsBudget {
             return true; // a back-pressure retry of the same outbox row reuses its reservation
         }
         Instant now = clock.instant();
-        Instant since = now.minus(StaffBookingService.WALK_IN_PHONE_WINDOW);
-        if (appointmentId != null && bookingRepository.existsVisitCancellationSendSince(appointmentId, bookingId, since)) {
-            log.info("event=walk_in_cancellation_sms_suppressed reason=visit_already_notified bookingId={}", bookingId);
+        WalkInCancellationBudgetUsage usage = bookingRepository.readWalkInCancellationBudgetSince(
+                phoneE164, appointmentId, bookingId, now.minus(StaffBookingService.WALK_IN_PHONE_WINDOW));
+        if (usage.getCancellationMessages() >= MAX_CANCELLATION_MESSAGES_PER_PHONE_PER_HOUR) {
+            log.info("event=walk_in_cancellation_sms_suppressed reason=per_phone_ceiling bookingId={}", bookingId);
             return false;
         }
-        if (bookingRepository.countPhoneSmsBudgetUsedSince(phoneE164, since).total()
-                >= StaffBookingService.MAX_WALK_INS_PER_PHONE_PER_WINDOW) {
+        if (usage.isVisitCharged()) {
+            log.info("event=walk_in_cancellation_sms_visit_charged bookingId={}", bookingId);
+            return true; // phase 478 — another service of this visit already spent the visit's charge
+        }
+        if (usage.budgetUsed() >= StaffBookingService.MAX_WALK_INS_PER_PHONE_PER_WINDOW) {
             log.info("event=walk_in_cancellation_sms_suppressed reason=per_phone_budget bookingId={}", bookingId);
             return false;
         }

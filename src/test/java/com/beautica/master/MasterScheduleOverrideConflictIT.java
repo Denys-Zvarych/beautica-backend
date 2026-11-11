@@ -728,11 +728,10 @@ class MasterScheduleOverrideConflictIT extends AbstractIntegrationTest {
     }
 
     // ════════════════════════════════════════════════════════════════════════════════
-    // 12 — STATUS_CHANGED outbox row accounting, real DB (backend-QA re-audit finding 4; INVERTED
-    // 2026-07-26 for D6, product decision reversal). This test used to pin exactly ONE
-    // STATUS_CHANGED row per declined standalone booking; it now pins exactly ZERO — an
-    // override-driven decline enqueues no notification at all, so this is now the regression guard
-    // for D6 (a future reader must not "fix" this back to enqueueing).
+    // 12 — STATUS_CHANGED outbox row accounting, real DB (backend-QA re-audit finding 4). D6
+    // (2026-07-26, zero rows) is RETIRED by B474 / SCH-37 (2026-11-11): an override-driven decline
+    // notifies like any provider decline, so each declined standalone booking enqueues exactly ONE
+    // STATUS_CHANGED row (registered client: one feed row per visit, never SMS/Telegram — NTF-D04).
     // ════════════════════════════════════════════════════════════════════════════════
 
     @Nested
@@ -740,9 +739,9 @@ class MasterScheduleOverrideConflictIT extends AbstractIntegrationTest {
     class OutboxRowAccounting {
 
         @Test
-        @DisplayName("3 standalone conflicting bookings declined -> ZERO STATUS_CHANGED rows (D6 — no "
-                + "notification for override-driven declines)")
-        void should_enqueueNoStatusChangedRows_onRealDb() throws Exception {
+        @DisplayName("3 standalone conflicting bookings declined -> exactly ONE STATUS_CHANGED row each "
+                + "(SCH-37 — override declines notify like a provider decline)")
+        void should_enqueueOneStatusChangedRowPerBooking_when_overrideDeclinesStandaloneBookings() throws Exception {
             SeededMaster master = seedIndependentMaster();
             Actor client = seedUser(Role.CLIENT);
             UUID masterServiceId = createMasterService(master, "Outbox accounting service");
@@ -762,10 +761,9 @@ class MasterScheduleOverrideConflictIT extends AbstractIntegrationTest {
                     .isEqualTo(HttpStatus.OK);
             for (UUID bookingId : List.of(booking1, booking2, booking3)) {
                 assertThat(countStatusChangedOutboxRows(bookingId))
-                        .as("D6 (2026-07-26 product decision reversal): an override-driven decline enqueues "
-                                + "NOTHING — the client discovers the cancellation from the booking's status "
-                                + "alone; notifying for this flow is deferred to a later phase")
-                        .isEqualTo(0L);
+                        .as("SCH-37 (B474): an override-driven decline notifies like any provider decline — "
+                                + "exactly one STATUS_CHANGED row per declined standalone booking (one visit)")
+                        .isEqualTo(1L);
             }
         }
 
@@ -812,9 +810,9 @@ class MasterScheduleOverrideConflictIT extends AbstractIntegrationTest {
             assertThat(jdbcTemplate.queryForObject(
                     "SELECT COUNT(*) FROM notification_outbox WHERE event_type = 'STATUS_CHANGED' AND aggregate_id = ?",
                     Long.class, guestBookingId))
-                    .as("D6 (2026-07-26 product decision reversal): the guest decline enqueues NOTHING either — "
-                            + "no note, no notification, for any booking declined via this path")
-                    .isEqualTo(0L);
+                    .as("SCH-37 / GST-75 (B474, B478): the guest gets one SMS/Telegram per cancelled service — "
+                            + "a single-service guest booking enqueues exactly one STATUS_CHANGED row (no note)")
+                    .isEqualTo(1L);
         }
     }
 

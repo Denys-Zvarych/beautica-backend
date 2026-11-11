@@ -8,7 +8,6 @@ import com.beautica.notification.entity.NotificationOutboxEntry;
 import com.beautica.notification.entity.OutboxEventType;
 import com.beautica.notification.entity.OutboxStatus;
 import com.beautica.notification.repository.NotificationOutboxRepository;
-import com.beautica.notification.service.BookingVisit;
 import com.beautica.notification.service.NotificationOutboxDrainWorker;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -34,7 +33,6 @@ import static com.github.tomakehurst.wiremock.client.WireMock.urlEqualTo;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
-import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -169,25 +167,6 @@ class GuestRescheduleSmsIT extends AbstractWalkInBookingSmsIT {
         assertThat(sentText()).isEqualTo(expectedSms(newStart, visit.cancelUrl()));
     }
 
-    @Test
-    @DisplayName("a whole guest visit is moved — exactly ONE SMS for the visit, naming its new start")
-    void should_sendOneSmsPerVisit_when_wholeGuestVisitMoved() throws Exception {
-        UUID second = insertService(salon.masterId(), "SALON", salon.salonId());
-        SettledGuest visit = createGuestVisitSettled(tomorrowAt(LocalTime.of(10, 0)),
-                List.of(salon.masterServiceId(), second));
-        UUID appointmentId = visit.id();
-        OffsetDateTime newStart = tomorrowAt(LocalTime.of(13, 0));
-
-        ResponseEntity<String> resp = restTemplate.exchange(
-                "/api/v1/appointments/" + appointmentId + "/reschedule", HttpMethod.PATCH,
-                new HttpEntity<>("{\"newStartsAt\":\"" + newStart + "\"}", bearerHeaders(tokenFor(salon.ownerEmail()))),
-                String.class);
-        drainWorker.drain();
-
-        assertThat(resp.getStatusCode()).as("body=%s", resp.getBody()).isEqualTo(HttpStatus.OK);
-        assertThat(sentText()).isEqualTo(expectedSms(newStart, visit.cancelUrl()));
-    }
-
     // ── Audit-fix cycle 1: burst collapse, staleness, request cap, per-phone budget ───
 
     @Test
@@ -245,61 +224,34 @@ class GuestRescheduleSmsIT extends AbstractWalkInBookingSmsIT {
     }
 
     @Test
-    @DisplayName("a one-service move counts against its VISIT: 5 visit moves (whole + per-service) then the 6th is rejected")
+    @DisplayName("one-service moves count against their VISIT: 5 moves spread over BOTH services, then a 6th on "
+            + "either service is rejected — 409 RESCHEDULE_LIMIT_REACHED, items and outbox unchanged")
     void should_countServiceMovesAgainstVisit_when_guestVisitRescheduled() {
         UUID second = insertService(salon.masterId(), "SALON", salon.salonId());
         UUID appointmentId = createGuestVisitAndSettle(tomorrowAt(LocalTime.of(9, 0)),
                 List.of(salon.masterServiceId(), second));
         String token = tokenFor(salon.ownerEmail());
-        // Non-overlapping hops: a whole-visit move onto its own current span trips the DB exclusion
-        // constraint mid-update (an existing, unrelated 409).
-        List<LocalTime> wholeMoves = List.of(LocalTime.of(12, 0), LocalTime.of(15, 0), LocalTime.of(9, 0));
-        for (LocalTime move : wholeMoves) {
-            ResponseEntity<String> resp = moveVisit(token, appointmentId, tomorrowAt(move));
-            assertThat(resp.getStatusCode()).as("whole move to %s body=%s", move, resp.getBody()).isEqualTo(HttpStatus.OK);
+        List<UUID> items = visitItems(appointmentId);
+        UUID firstItem = items.get(0);
+        UUID secondItem = items.get(1);
+        // Non-overlapping hops (items start 09:00 and 10:00), alternating services, so every move
+        // lands on a free hour and only the visit-level cap can reject the 6th.
+        List<UUID> movers = List.of(firstItem, secondItem, firstItem, secondItem, firstItem);
+        List<LocalTime> targets = List.of(LocalTime.of(12, 0), LocalTime.of(13, 0), LocalTime.of(14, 0),
+                LocalTime.of(15, 0), LocalTime.of(11, 0));
+        for (int i = 0; i < movers.size(); i++) {
+            ResponseEntity<String> resp = moveVisitItem(token, appointmentId, movers.get(i), tomorrowAt(targets.get(i)));
+            assertThat(resp.getStatusCode()).as("move %d to %s body=%s", i + 1, targets.get(i), resp.getBody())
+                    .isEqualTo(HttpStatus.OK);
         }
-        UUID secondItem = visitItems(appointmentId).get(1);
-        for (LocalTime move : List.of(LocalTime.of(13, 0), LocalTime.of(14, 0))) {
-            ResponseEntity<String> resp = moveVisitItem(token, appointmentId, secondItem, tomorrowAt(move));
-            assertThat(resp.getStatusCode()).as("item move to %s body=%s", move, resp.getBody()).isEqualTo(HttpStatus.OK);
-        }
-
-        List<Instant> startsBefore = visitItems(appointmentId).stream().map(this::itemStart).toList();
+        Instant secondStartBefore = itemStart(secondItem);
         int rowsBefore = outboxRepository.findAll().size();
 
-        ResponseEntity<String> sixth = moveVisit(token, appointmentId, tomorrowAt(LocalTime.of(15, 0)));
-
-        assertThat(sixth.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
-        assertThat(sixth.getBody()).contains("RESCHEDULE_LIMIT_REACHED");
-        assertThat(visitItems(appointmentId).stream().map(this::itemStart).toList())
-                .as("the rejected whole-visit move changes no item").isEqualTo(startsBefore);
-        assertThat(outboxRepository.findAll()).as("nothing enqueued for the rejected move").hasSize(rowsBefore);
-    }
-
-    @Test
-    @DisplayName("the cap holds on the ONE-SERVICE route too: after 5 whole-visit moves, moving one item of the same "
-            + "visit is the 6th reschedule — 409 RESCHEDULE_LIMIT_REACHED, the item and the outbox unchanged")
-    void should_reject6thRescheduleOnItemRoute_when_visitAlreadyMovedFiveTimes() {
-        UUID second = insertService(salon.masterId(), "SALON", salon.salonId());
-        UUID appointmentId = createGuestVisitAndSettle(tomorrowAt(LocalTime.of(9, 0)),
-                List.of(salon.masterServiceId(), second));
-        String token = tokenFor(salon.ownerEmail());
-        // Non-overlapping hops ending back at 09:00, so the 6th (item 10:00 -> 13:00) is a move that
-        // succeeds on an uncapped visit (see should_countServiceMovesAgainstVisit_when_guestVisitRescheduled).
-        for (LocalTime move : List.of(LocalTime.of(12, 0), LocalTime.of(15, 0), LocalTime.of(9, 0),
-                LocalTime.of(13, 0), LocalTime.of(9, 0))) {
-            ResponseEntity<String> resp = moveVisit(token, appointmentId, tomorrowAt(move));
-            assertThat(resp.getStatusCode()).as("whole move to %s body=%s", move, resp.getBody()).isEqualTo(HttpStatus.OK);
-        }
-        UUID secondItem = visitItems(appointmentId).get(1);
-        Instant itemStartBefore = itemStart(secondItem);
-        int rowsBefore = outboxRepository.findAll().size();
-
-        ResponseEntity<String> sixth = moveVisitItem(token, appointmentId, secondItem, tomorrowAt(LocalTime.of(13, 0)));
+        ResponseEntity<String> sixth = moveVisitItem(token, appointmentId, secondItem, tomorrowAt(LocalTime.of(9, 0)));
 
         assertThat(sixth.getStatusCode()).as("body=%s", sixth.getBody()).isEqualTo(HttpStatus.CONFLICT);
         assertThat(readJson(sixth.getBody()).path("data").path("code").asText()).isEqualTo("RESCHEDULE_LIMIT_REACHED");
-        assertThat(itemStart(secondItem)).as("the rejected item move changes nothing").isEqualTo(itemStartBefore);
+        assertThat(itemStart(secondItem)).as("the rejected item move changes nothing").isEqualTo(secondStartBefore);
         assertThat(outboxRepository.findAll()).as("nothing enqueued for the rejected move").hasSize(rowsBefore);
     }
 
@@ -541,25 +493,6 @@ class GuestRescheduleSmsIT extends AbstractWalkInBookingSmsIT {
         verify(emailNotificationService, never()).sendBookingDeclinedBySalonEmail(anyString(), any());
     }
 
-    @Test
-    @DisplayName("an ADMIN declines a whole 2-service guest visit — the performing master gets exactly ONE e-mail, "
-            + "naming both services")
-    void should_emailMasterOncePerVisit_when_adminDeclinesWholeVisit() {
-        SeededUser admin = insertUser("SALON_ADMIN", salon.salonId());
-        UUID second = insertService(salon.masterId(), "SALON", salon.salonId());
-        UUID appointmentId = createGuestVisitAndSettle(tomorrowAt(LocalTime.of(10, 0)),
-                List.of(salon.masterServiceId(), second));
-
-        ResponseEntity<String> resp = restTemplate.exchange(
-                "/api/v1/appointments/" + appointmentId + "/decline", HttpMethod.PATCH,
-                new HttpEntity<>("{}", bearerHeaders(tokenFor(admin.email()))), String.class);
-        drainWorker.drain();
-
-        assertThat(resp.getStatusCode()).as("body=%s", resp.getBody()).isEqualTo(HttpStatus.NO_CONTENT);
-        verify(emailNotificationService, times(1)).sendBookingDeclinedBySalonEmail(eq(salon.ownerEmail()),
-                argThat((BookingVisit visit) -> visit.items().size() == 2));
-    }
-
     // ── helpers ────────────────────────────────────────────────────────────────────
 
     private record SalonMaster(UUID userId, String email, UUID masterId, UUID masterServiceId) {
@@ -616,22 +549,10 @@ class GuestRescheduleSmsIT extends AbstractWalkInBookingSmsIT {
         drainWorker.drain();
     }
 
-    private ResponseEntity<String> moveVisit(String token, UUID appointmentId, OffsetDateTime newStart) {
-        return restTemplate.exchange("/api/v1/appointments/" + appointmentId + "/reschedule", HttpMethod.PATCH,
-                new HttpEntity<>("{\"newStartsAt\":\"" + newStart + "\"}", bearerHeaders(token)), String.class);
-    }
-
     private ResponseEntity<String> moveVisitItem(String token, UUID appointmentId, UUID bookingId, OffsetDateTime newStart) {
         return restTemplate.exchange(
                 "/api/v1/appointments/" + appointmentId + "/services/" + bookingId + "/reschedule", HttpMethod.PATCH,
                 new HttpEntity<>("{\"newStartsAt\":\"" + newStart + "\"}", bearerHeaders(token)), String.class);
-    }
-
-    /** Every Turbosms message text recorded since the last reset, in order. */
-    private List<String> sentTexts() {
-        return TURBOSMS.findAll(postRequestedFor(urlEqualTo(TURBOSMS_PATH))).stream()
-                .map(request -> readJson(request.getBodyAsString()).path("sms").path("text").asText())
-                .toList();
     }
 
     private List<UUID> visitItems(UUID appointmentId) {

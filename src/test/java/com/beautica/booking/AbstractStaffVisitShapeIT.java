@@ -308,61 +308,35 @@ abstract class AbstractStaffVisitShapeIT extends AbstractStaffBookingIT {
         }
 
         /**
-         * <b>The one thing that genuinely does not work the same on both shapes.</b>
-         * {@code AppointmentController} has NO {@code /services/&#123;bookingId&#125;/not-complete}
-         * twin — {@code not-complete} is the only whole-visit transition without a per-item route
-         * (see {@code docs/backend-phases/backlog.md}'s NOT_COMPLETED-retirement row: the status is
-         * being retired rather than grown a new per-item form). Combined with Phase 22.12 D2 (every
-         * new-shape visit has a header, even at N = 1), this means:
-         * <ul>
-         *   <li><b>LEGACY</b> — {@code PATCH /bookings/&#123;id&#125;/not-complete} works exactly
-         *       like decline/complete: one booking moves, its (independent, header-less) siblings
-         *       are untouched.</li>
-         *   <li><b>NEW</b> — the plain route 409s ({@code assertNotAppointmentChild}), and the ONLY
-         *       route that exists, {@code PATCH /appointments/&#123;id&#125;/not-complete}, is
-         *       whole-visit: {@code AppointmentTransitionService#notCompleteAppointment} calls
-         *       {@code transitionItems} over every item, so ALL THREE siblings move to
-         *       {@code NOT_COMPLETED} together. There is no way to mark ONE service of a NEW-shape
-         *       visit as a no-show without marking every CONFIRMED sibling too.</li>
-         * </ul>
-         * Pinned here rather than glossed over: a per-item not-complete route added later must
-         * change THIS test, not leave it silently proving the old all-or-nothing behaviour.
+         * Phase 475 — there is no not-complete route on EITHER shape any more (BOOK-D12): the
+         * whole-visit {@code PATCH /appointments/&#123;id&#125;/not-complete} and the single-booking
+         * {@code PATCH /bookings/&#123;id&#125;/not-complete} were both removed, and no per-item twin was
+         * added. Both shapes answer Spring's 404 and every sibling stays {@code CONFIRMED},
+         * byte-identical. (This replaces the old pin that the NEW shape's only route moved every
+         * sibling at once.)
          */
         @Test
-        @DisplayName("not-complete: LEGACY siblings stay CONFIRMED; NEW shape has no per-item route and moves every sibling")
-        void should_applyNotCompleteAccordingToItsOnlyAvailableRoute() throws Exception {
+        @DisplayName("not-complete: no route on either shape — 404, every sibling stays CONFIRMED and byte-identical")
+        void should_return404AndTouchNoSibling_when_notCompleteCalledOnEitherShape() throws Exception {
             Visit visit = threeServiceVisit();
             String token = providerToken();
+            Map<String, Object> sibling0Before = bookingRow(visit.booking(0));
+            Map<String, Object> sibling1Before = bookingRow(visit.booking(1));
+            Map<String, Object> sibling2Before = bookingRow(visit.booking(2));
+            String path = hasAppointmentHeader()
+                    ? APPOINTMENTS_URL + "/" + visit.appointmentId() + "/not-complete"
+                    : BOOKINGS_URL + "/" + visit.booking(1) + "/not-complete";
 
-            if (hasAppointmentHeader()) {
-                ResponseEntity<String> resp = restTemplate.exchange(
-                        APPOINTMENTS_URL + "/" + visit.appointmentId() + "/not-complete", HttpMethod.PATCH,
-                        new HttpEntity<>("{}", bearerHeaders(token)), String.class);
+            ResponseEntity<String> resp = restTemplate.exchange(path, HttpMethod.PATCH,
+                    new HttpEntity<>("{\"cancellationReason\":\"" + CancellationReason.CLIENT_NO_SHOW + "\"}",
+                            bearerHeaders(token)),
+                    String.class);
 
-                assertThat(resp.getStatusCode()).as("body=%s", resp.getBody()).isEqualTo(HttpStatus.NO_CONTENT);
-                assertThat(bookingRow(visit.booking(0)).get("status"))
-                        .as("no per-item route exists for NEW-shape not-complete — the only route "
-                                + "is whole-visit and moves every CONFIRMED child")
-                        .isEqualTo("NOT_COMPLETED");
-                assertThat(bookingRow(visit.booking(1)).get("status")).isEqualTo("NOT_COMPLETED");
-                assertThat(bookingRow(visit.booking(2)).get("status")).isEqualTo("NOT_COMPLETED");
-            } else {
-                Map<String, Object> sibling0Before = bookingRow(visit.booking(0));
-                Map<String, Object> sibling2Before = bookingRow(visit.booking(2));
-
-                ResponseEntity<String> resp = restTemplate.exchange(
-                        BOOKINGS_URL + "/" + visit.booking(1) + "/not-complete", HttpMethod.PATCH,
-                        new HttpEntity<>("{\"cancellationReason\":\"" + CancellationReason.CLIENT_NO_SHOW + "\"}",
-                                bearerHeaders(token)),
-                        String.class);
-
-                assertThat(resp.getStatusCode()).as("body=%s", resp.getBody()).isEqualTo(HttpStatus.NO_CONTENT);
-                assertThat(bookingRow(visit.booking(1)).get("status")).isEqualTo("NOT_COMPLETED");
-                assertThat(bookingRow(visit.booking(0)))
-                        .as("LEGACY siblings are independent standalone bookings — untouched")
-                        .isEqualTo(sibling0Before);
-                assertThat(bookingRow(visit.booking(2))).isEqualTo(sibling2Before);
-            }
+            assertThat(resp.getStatusCode()).as("%s must be unmapped — body=%s", path, resp.getBody())
+                    .isEqualTo(HttpStatus.NOT_FOUND);
+            assertThat(bookingRow(visit.booking(0))).isEqualTo(sibling0Before);
+            assertThat(bookingRow(visit.booking(1))).isEqualTo(sibling1Before);
+            assertThat(bookingRow(visit.booking(2))).isEqualTo(sibling2Before);
         }
 
         /**

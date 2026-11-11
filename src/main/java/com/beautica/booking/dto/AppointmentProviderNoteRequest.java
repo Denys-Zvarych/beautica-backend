@@ -4,9 +4,9 @@ import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Size;
 
 /**
- * Shared request body for the two provider-terminated visit transitions (BE-4):
- * {@code PATCH /api/v1/appointments/{id}/decline} and
- * {@code PATCH /api/v1/appointments/{id}/not-complete}.
+ * Request body for the per-service visit decline
+ * {@code PATCH /api/v1/appointments/{id}/services/{bookingId}/decline} (the whole-visit decline and
+ * not-complete routes that also used it were removed in phase 475).
  *
  * <p>{@code providerComment} is OPTIONAL for all roles (CLAUDE.md — Phase 25.9 reversed the earlier
  * "required, ≥10 chars" rule; a provider may decline or record a no-show without a note);

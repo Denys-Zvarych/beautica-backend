@@ -21,6 +21,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.OffsetDateTime;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 import static com.github.tomakehurst.wiremock.client.WireMock.postRequestedFor;
@@ -88,24 +89,96 @@ class GuestProviderCancellationSmsIT extends AbstractWalkInBookingSmsIT {
     }
 
     @Test
-    @DisplayName("provider declines a whole multi-service guest visit — exactly ONE SMS for the visit")
-    void should_sendOneSmsPerVisit_when_providerDeclinesWholeGuestVisit() throws Exception {
+    @DisplayName("provider declines ONE service of a multi-service guest visit — exactly ONE SMS linking the "
+            + "visit page (phase 475: the whole-visit decline route is gone; the per-service route is the one left)")
+    void should_sendOneSms_when_providerDeclinesOneServiceOfGuestVisit() throws Exception {
         OffsetDateTime startsAt = tomorrowAt(java.time.LocalTime.of(10, 0));
         UUID second = insertService(salon.masterId(), "SALON", salon.salonId());
         SettledGuest visit = createGuestVisitSettled(startsAt, List.of(salon.masterServiceId(), second));
         UUID appointmentId = visit.id();
         giveSalonSlug();
 
+        String ownerToken = tokenFor(salon.ownerEmail());
+        UUID firstItem = jdbcTemplate.queryForObject(
+                "SELECT id FROM bookings WHERE appointment_id = ? ORDER BY starts_at LIMIT 1", UUID.class, appointmentId);
+
         ResponseEntity<String> resp = restTemplate.exchange(
-                "/api/v1/appointments/" + appointmentId + "/decline", HttpMethod.PATCH,
-                new HttpEntity<>("{}", bearerHeaders(tokenFor(salon.ownerEmail()))), String.class);
+                "/api/v1/appointments/" + appointmentId + "/services/" + firstItem + "/decline", HttpMethod.PATCH,
+                new HttpEntity<>("{}", bearerHeaders(ownerToken)), String.class);
         drainWorker.drain();
 
-        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(resp.getStatusCode()).as("body: %s", resp.getBody()).isEqualTo(HttpStatus.NO_CONTENT);
         assertThat(jdbcTemplate.queryForObject(
                 "SELECT count(*) FROM bookings WHERE appointment_id = ? AND status = 'DECLINED'",
-                Integer.class, appointmentId)).isEqualTo(2);
+                Integer.class, appointmentId)).isEqualTo(1);
         assertThat(sentText()).isEqualTo(expectedWithPage(startsAt, visit.cancelUrl()));
+    }
+
+    @Test
+    @DisplayName("GST-75 regression — provider declines BOTH services of a guest visit one by one: one SMS per "
+            + "declined service, each naming that service's own start")
+    void should_sendOneSmsPerService_when_providerDeclinesGuestVisitServicesOneByOne() {
+        OffsetDateTime startsAt = tomorrowAt(java.time.LocalTime.of(10, 0));
+        UUID second = insertService(salon.masterId(), "SALON", salon.salonId());
+        SettledGuest visit = createGuestVisitSettled(startsAt, List.of(salon.masterServiceId(), second));
+        String ownerToken = tokenFor(salon.ownerEmail());
+        List<Map<String, Object>> items = jdbcTemplate.queryForList(
+                "SELECT id, starts_at FROM bookings WHERE appointment_id = ? ORDER BY starts_at", visit.id());
+
+        for (Map<String, Object> item : items) {
+            ResponseEntity<String> resp = restTemplate.exchange(
+                    "/api/v1/appointments/" + visit.id() + "/services/" + item.get("id") + "/decline",
+                    HttpMethod.PATCH, new HttpEntity<>("{}", bearerHeaders(ownerToken)), String.class);
+            assertThat(resp.getStatusCode()).as("body: %s", resp.getBody()).isEqualTo(HttpStatus.NO_CONTENT);
+            drainWorker.drain();
+        }
+
+        assertThat(sentTexts()).containsExactly(
+                expectedWithPage(startOf(items.get(0)), visit.cancelUrl()),
+                expectedWithPage(startOf(items.get(1)), visit.cancelUrl()));
+    }
+
+    @Test
+    @DisplayName("GST-75 — salon closure over a 2-service guest visit: one SALON_CLOSED row and one SMS per "
+            + "service, each naming that service's own start")
+    void should_sendOneSmsPerService_when_salonClosureCancelsGuestVisit() {
+        OffsetDateTime startsAt = tomorrowAt(java.time.LocalTime.of(10, 0));
+        UUID second = insertService(salon.masterId(), "SALON", salon.salonId());
+        SettledGuest visit = createGuestVisitSettled(startsAt, List.of(salon.masterServiceId(), second));
+        List<Map<String, Object>> items = jdbcTemplate.queryForList(
+                "SELECT id, starts_at FROM bookings WHERE appointment_id = ? ORDER BY starts_at", visit.id());
+
+        ResponseEntity<String> resp = restTemplate.exchange(
+                "/api/v1/salons/" + salon.salonId(), HttpMethod.DELETE,
+                new HttpEntity<>(bearerHeaders(tokenFor(salon.ownerEmail()))), String.class);
+        drainWorker.drain();
+
+        assertThat(resp.getStatusCode()).as("salon delete body=%s", resp.getBody()).isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(jdbcTemplate.queryForList("SELECT aggregate_id FROM notification_outbox "
+                + "WHERE event_type = 'SALON_CLOSED'", UUID.class))
+                .containsExactlyInAnyOrder((UUID) items.get(0).get("id"), (UUID) items.get(1).get("id"));
+        assertThat(sentTexts()).containsExactlyInAnyOrder(
+                expectedWithPage(startOf(items.get(0)), visit.cancelUrl()),
+                expectedWithPage(startOf(items.get(1)), visit.cancelUrl()));
+    }
+
+    @Test
+    @DisplayName("NTF-06 / D12 — salon closure over a REGISTERED client's 2-service visit: still ONE SALON_CLOSED "
+            + "row per visit, zero SMS (NTF-D04)")
+    void should_keepOneRowPerVisit_when_salonClosureCancelsRegisteredVisit() {
+        SeededUser client = insertUser("CLIENT", null);
+        insertRegisteredVisit(client.id(), salon.masterId(), salon.masterServiceId(),
+                tomorrowAt(java.time.LocalTime.of(10, 0)), 2);
+
+        ResponseEntity<String> resp = restTemplate.exchange(
+                "/api/v1/salons/" + salon.salonId(), HttpMethod.DELETE,
+                new HttpEntity<>(bearerHeaders(tokenFor(salon.ownerEmail()))), String.class);
+        drainWorker.drain();
+
+        assertThat(resp.getStatusCode()).as("salon delete body=%s", resp.getBody()).isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(jdbcTemplate.queryForObject("SELECT count(*) FROM notification_outbox "
+                + "WHERE event_type = 'SALON_CLOSED'", Integer.class)).isEqualTo(1);
+        TURBOSMS.verify(0, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
     }
 
     @Test
@@ -124,24 +197,6 @@ class GuestProviderCancellationSmsIT extends AbstractWalkInBookingSmsIT {
         drainWorker.drain();
 
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
-        TURBOSMS.verify(0, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
-    }
-
-    @Test
-    @DisplayName("provider marks a guest booking NOT_COMPLETED (no-show) — zero SMS")
-    void should_sendNoSms_when_guestBookingNotCompleted() {
-        UUID bookingId = createGuestBookingAndSettle(tomorrowAtNoon());
-        jdbcTemplate.update("UPDATE bookings SET starts_at = NOW() - interval '3 hours', "
-                + "ends_at = NOW() - interval '2 hours' WHERE id = ?", bookingId);
-
-        ResponseEntity<Void> resp = restTemplate.exchange(
-                "/api/v1/bookings/" + bookingId + "/not-complete", HttpMethod.PATCH,
-                new HttpEntity<>("{\"cancellationReason\":\"CLIENT_NO_SHOW\"}",
-                        bearerHeaders(tokenFor(salon.ownerEmail()))), Void.class);
-        drainWorker.drain();
-
-        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
-        assertThat(onlyBooking().get("status")).isEqualTo("NOT_COMPLETED");
         TURBOSMS.verify(0, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
     }
 
@@ -249,7 +304,249 @@ class GuestProviderCancellationSmsIT extends AbstractWalkInBookingSmsIT {
         assertThat(text).as("a salon master's own page is never offered").doesNotContain(salonMasterSlug);
     }
 
+    // ── phase 478 QA — per-service guest messages on every cascade, registered clients untouched ──────────
+
+    @Test
+    @DisplayName("GST-75 bound (security LOW) — a 10-service walk-in visit (MAX_SERVICES_PER_VISIT) declined "
+            + "service by service: exactly 10 dispatches, one per service, each naming its own start; the visit "
+            + "spends ONE per-phone budget reservation")
+    void should_dispatchExactlyTen_when_tenServiceWalkInVisitDeclinedServiceByService() {
+        Visit visit = createSettledTenServiceWalkIn();
+        String ownerToken = tokenFor(salon.ownerEmail());
+        List<Map<String, Object>> items = jdbcTemplate.queryForList(
+                "SELECT id, starts_at FROM bookings WHERE appointment_id = ? ORDER BY starts_at", visit.appointmentId());
+        assertThat(items).as("fixture: a full-size visit").hasSize(MAX_SERVICES_PER_VISIT);
+
+        for (Map<String, Object> item : items) {
+            declineVisitItem(ownerToken, visit.appointmentId(), (UUID) item.get("id"));
+            drainWorker.drain();
+        }
+
+        List<String> sent = sentTexts();
+        assertThat(sent).as("one message per declined service, in decline order")
+                .extracting(text -> text.split("\n\n", 2)[0])
+                .containsExactlyElementsOf(items.stream().map(i -> expectedBody(startOf(i))).toList());
+        assertThat(sent).as("every message links the same visit page").extracting(text -> text.split("\n\n", 2)[1])
+                .containsOnly(sent.get(0).split("\n\n", 2)[1]);
+        assertThat(walkInCancellationReservations(visit.appointmentId()))
+                .as("the visit is charged once, not once per service").isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("GST-75 hard per-phone ceiling (phase 478 audit-fix) — two full 10-service walk-in visits to ONE phone "
+            + "send all 20 per-service cancellation messages; the 21st cancellation message to that phone in the window "
+            + "(a third visit) is suppressed and logged, while the decline itself succeeds")
+    void should_suppressFurtherCancellationMessage_when_phoneAlreadyGotPerVisitBoundInWindow(CapturedOutput output) {
+        Visit firstVisit = createSettledTenServiceWalkIn(tomorrowAt(java.time.LocalTime.of(10, 0)));
+        Visit secondVisit = createSettledTenServiceWalkIn(tomorrowAt(java.time.LocalTime.of(10, 0)).plusDays(1));
+        Visit extra = postWalkIn(salon.masterId(), List.of(salon.masterServiceId()), tokenFor(salon.ownerEmail()),
+                tomorrowAt(java.time.LocalTime.of(16, 0)));
+        drainWorker.drain();
+        resetTurbosms();
+        // The walk-ins were created before the window, so the shared per-phone budget (5) is NOT what suppresses the
+        // 21st message — only the hard ceiling can.
+        jdbcTemplate.update("UPDATE bookings SET created_at = created_at - INTERVAL '2 hours' "
+                + "WHERE appointment_id IN (?, ?, ?)", firstVisit.appointmentId(), secondVisit.appointmentId(),
+                extra.appointmentId());
+        String ownerToken = tokenFor(salon.ownerEmail());
+        for (Visit visit : List.of(firstVisit, secondVisit)) {
+            for (UUID item : jdbcTemplate.queryForList("SELECT id FROM bookings WHERE appointment_id = ? "
+                    + "ORDER BY starts_at", UUID.class, visit.appointmentId())) {
+                declineVisitItem(ownerToken, visit.appointmentId(), item);
+                drainWorker.drain();
+            }
+        }
+        assertThat(sentTexts()).as("precondition: two full visits are never truncated by the ceiling")
+                .hasSize(2 * MAX_SERVICES_PER_VISIT);
+
+        declineVisitItem(ownerToken, extra.appointmentId(), extra.bookingIds().get(0));
+        drainWorker.drain();
+
+        assertThat(jdbcTemplate.queryForObject("SELECT status FROM bookings WHERE id = ?", String.class,
+                extra.bookingIds().get(0))).as("the decline itself always succeeds").isEqualTo("DECLINED");
+        assertThat(sentTexts()).as("the 21st cancellation message to one phone in the window is suppressed")
+                .hasSize(2 * MAX_SERVICES_PER_VISIT);
+        assertThat(output.getAll())
+                .contains("event=walk_in_cancellation_sms_suppressed reason=per_phone_ceiling bookingId="
+                        + extra.bookingIds().get(0))
+                .contains("event=walk_in_cancellation_sms_visit_charged bookingId=");
+    }
+
+    @Test
+    @DisplayName("GST-75 — master removal over a 2-service guest (LINK) visit: one MASTER_REMOVED row and one SMS "
+            + "per service, each naming that service's own start")
+    void should_sendOneSmsPerService_when_masterRemovalCancelsGuestVisit() {
+        UUID removedMasterId = insertRemovableSalonMaster();
+        UUID masterServiceId = insertService(removedMasterId, "SALON", salon.salonId());
+        OffsetDateTime startsAt = tomorrowAt(java.time.LocalTime.of(10, 0));
+        UUID appointmentId = insertGuestLinkAppointment(LINK_PHONE, java.time.Instant.now(), java.time.Instant.now());
+        UUID first = insertGuestVisitItem(appointmentId, removedMasterId, masterServiceId, startsAt);
+        UUID second = insertGuestVisitItem(appointmentId, removedMasterId, masterServiceId, startsAt.plusHours(1));
+
+        ResponseEntity<String> resp = removeMaster(removedMasterId);
+        drainWorker.drain();
+
+        assertThat(resp.getStatusCode()).as("master removal body=%s", resp.getBody()).isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(outboxAggregateIds("MASTER_REMOVED")).containsExactlyInAnyOrder(first, second);
+        assertThat(sentTexts()).containsExactlyInAnyOrder(expectedBody(startsAt), expectedBody(startsAt.plusHours(1)));
+    }
+
+    @Test
+    @DisplayName("GST-75 — a guest block (POST /blocks) over a 2-service LINK visit: one STATUS_CHANGED row and one "
+            + "SMS per declined service, each naming its own start, nothing about a block")
+    void should_sendOneSmsPerService_when_guestBlockCancelsGuestVisit() {
+        OffsetDateTime startsAt = tomorrowAt(java.time.LocalTime.of(10, 0));
+        UUID second = insertService(salon.masterId(), "SALON", salon.salonId());
+        SettledGuest visit = createGuestVisitSettled(startsAt, List.of(salon.masterServiceId(), second));
+        List<Map<String, Object>> items = jdbcTemplate.queryForList(
+                "SELECT id, starts_at FROM bookings WHERE appointment_id = ? ORDER BY starts_at", visit.id());
+
+        ResponseEntity<String> resp = postBlock((UUID) items.get(0).get("id"));
+        drainWorker.drain();
+
+        assertThat(resp.getStatusCode()).as("block body=%s", resp.getBody()).isEqualTo(HttpStatus.CREATED);
+        assertThat(outboxAggregateIds("STATUS_CHANGED"))
+                .containsExactlyInAnyOrder((UUID) items.get(0).get("id"), (UUID) items.get(1).get("id"));
+        assertThat(sentTexts()).containsExactlyInAnyOrder(
+                expectedWithPage(startOf(items.get(0)), visit.cancelUrl()),
+                expectedWithPage(startOf(items.get(1)), visit.cancelUrl()));
+    }
+
+    @Test
+    @DisplayName("NTF-D04 / D2 — master removal over a REGISTERED client's 2-service visit: ONE MASTER_REMOVED row "
+            + "per visit, zero SMS")
+    void should_keepOneRowAndSendNoSms_when_masterRemovalCancelsRegisteredVisit() {
+        UUID removedMasterId = insertRemovableSalonMaster();
+        UUID masterServiceId = insertService(removedMasterId, "SALON", salon.salonId());
+        SeededUser client = insertUser("CLIENT", null);
+        insertRegisteredVisit(client.id(), removedMasterId, masterServiceId, tomorrowAt(java.time.LocalTime.of(10, 0)), 2);
+
+        ResponseEntity<String> resp = removeMaster(removedMasterId);
+        drainWorker.drain();
+
+        assertThat(resp.getStatusCode()).as("master removal body=%s", resp.getBody()).isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(outboxAggregateIds("MASTER_REMOVED")).hasSize(1);
+        TURBOSMS.verify(0, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
+    }
+
+    @Test
+    @DisplayName("NTF-D04 / D2 — a client block over a REGISTERED client's 2-service visit: both services declined, "
+            + "ONE STATUS_CHANGED row per visit, zero SMS")
+    void should_keepOneRowAndSendNoSms_when_clientBlockCancelsRegisteredVisit() {
+        SeededUser client = insertUser("CLIENT", null);
+        UUID appointmentId = insertRegisteredVisit(client.id(), salon.masterId(), salon.masterServiceId(),
+                tomorrowAt(java.time.LocalTime.of(10, 0)), 2);
+        UUID anyItem = jdbcTemplate.queryForObject(
+                "SELECT id FROM bookings WHERE appointment_id = ? ORDER BY starts_at LIMIT 1", UUID.class, appointmentId);
+
+        ResponseEntity<String> resp = postBlock(anyItem);
+        drainWorker.drain();
+
+        assertThat(resp.getStatusCode()).as("block body=%s", resp.getBody()).isEqualTo(HttpStatus.CREATED);
+        assertThat(jdbcTemplate.queryForList("SELECT status FROM bookings WHERE appointment_id = ?", String.class,
+                appointmentId)).containsExactly("DECLINED", "DECLINED");
+        assertThat(outboxAggregateIds("STATUS_CHANGED")).hasSize(1);
+        TURBOSMS.verify(0, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
+    }
+
     // ── helpers ──────────────────────────────────────────────────────────────────
+
+    private static final int MAX_SERVICES_PER_VISIT =
+            com.beautica.booking.service.SlotCalculationService.MAX_SERVICES_PER_VISIT;
+
+    /**
+     * A real 10-service STAFF walk-in (RAW_PHONE) tomorrow 10:00–15:00: 30-minute services so the whole visit fits the
+     * 09:00–17:00 fixture day. Its confirmation SMS is drained and cleared.
+     */
+    private Visit createSettledTenServiceWalkIn() {
+        return createSettledTenServiceWalkIn(tomorrowAt(java.time.LocalTime.of(10, 0)));
+    }
+
+    /** {@link #createSettledTenServiceWalkIn()} starting at {@code startsAt} (fresh services each call). */
+    private Visit createSettledTenServiceWalkIn(OffsetDateTime startsAt) {
+        List<UUID> serviceIds = new java.util.ArrayList<>(List.of(salon.masterServiceId()));
+        while (serviceIds.size() < MAX_SERVICES_PER_VISIT) {
+            serviceIds.add(insertService(salon.masterId(), "SALON", salon.salonId()));
+        }
+        jdbcTemplate.update("UPDATE service_definitions SET base_duration_minutes = 30 WHERE owner_id = ?",
+                salon.salonId());
+        Visit visit = postWalkIn(salon.masterId(), serviceIds, tokenFor(salon.ownerEmail()), startsAt);
+        drainWorker.drain();
+        resetTurbosms();
+        return visit;
+    }
+
+    private void declineVisitItem(String token, UUID appointmentId, UUID bookingId) {
+        ResponseEntity<String> resp = restTemplate.exchange(
+                "/api/v1/appointments/" + appointmentId + "/services/" + bookingId + "/decline", HttpMethod.PATCH,
+                new HttpEntity<>("{}", bearerHeaders(token)), String.class);
+        assertThat(resp.getStatusCode()).as("per-service decline body: %s", resp.getBody())
+                .isEqualTo(HttpStatus.NO_CONTENT);
+    }
+
+    private int walkInCancellationReservations(UUID appointmentId) {
+        return jdbcTemplate.queryForObject("SELECT count(*) FROM guest_reschedule_sms_sends s "
+                + "JOIN bookings b ON b.id = s.booking_id WHERE b.appointment_id = ?", Integer.class, appointmentId);
+    }
+
+    private List<UUID> outboxAggregateIds(String eventType) {
+        return jdbcTemplate.queryForList(
+                "SELECT aggregate_id FROM notification_outbox WHERE event_type = ?", UUID.class, eventType);
+    }
+
+    /** An invited SALON_MASTER of the fixture salon whom the owner can remove; returns the master id. */
+    private UUID insertRemovableSalonMaster() {
+        SeededUser masterUser = insertUser("SALON_MASTER", salon.salonId());
+        UUID masterId = UUID.randomUUID();
+        jdbcTemplate.update("INSERT INTO masters (id, user_id, salon_id, master_type, is_active, created_at, "
+                + "updated_at) VALUES (?, ?, ?, 'SALON_MASTER', true, NOW(), NOW())", masterId, masterUser.id(),
+                salon.salonId());
+        return masterId;
+    }
+
+    private ResponseEntity<String> removeMaster(UUID masterId) {
+        return restTemplate.exchange("/api/v1/salons/" + salon.salonId() + "/masters/" + masterId, HttpMethod.DELETE,
+                new HttpEntity<>(bearerHeaders(tokenFor(salon.ownerEmail()))), String.class);
+    }
+
+    /** {@code POST /api/v1/blocks {bookingId}} as the salon owner. */
+    private ResponseEntity<String> postBlock(UUID bookingId) {
+        String body = objectMapper.createObjectNode().put("bookingId", bookingId.toString()).toString();
+        return restTemplate.exchange("/api/v1/blocks", HttpMethod.POST,
+                new HttpEntity<>(body, bearerHeaders(tokenFor(salon.ownerEmail()))), String.class);
+    }
+
+    /** One CONFIRMED LINK guest item (no sealed token — body-only SMS) of {@code appointmentId}; returns its id. */
+    private UUID insertGuestVisitItem(UUID appointmentId, UUID masterId, UUID masterServiceId, OffsetDateTime startsAt) {
+        UUID bookingId = UUID.randomUUID();
+        jdbcTemplate.update("INSERT INTO bookings (id, master_id, master_service_id, salon_id, appointment_id, status, "
+                        + "starts_at, ends_at, price_at_booking, duration_minutes_at_booking, buffer_minutes_at_booking, "
+                        + "booking_source, guest_name, guest_surname, guest_phone, cancel_token_hash, created_at, "
+                        + "updated_at) VALUES (?, ?, ?, ?, ?, 'CONFIRMED', ?, ?, 350.00, 60, 0, 'LINK', ?, ?, ?, "
+                        + "encode(sha256(convert_to(?, 'UTF8')), 'hex'), NOW(), NOW())",
+                bookingId, masterId, masterServiceId, salon.salonId(), appointmentId, startsAt, startsAt.plusHours(1),
+                GUEST_NAME, GUEST_SURNAME, LINK_PHONE, UUID.randomUUID().toString());
+        return bookingId;
+    }
+
+    /** A registered client's CONFIRMED APP visit of {@code count} hourly items from {@code startsAt}; returns its id. */
+    private UUID insertRegisteredVisit(UUID clientId, UUID masterId, UUID masterServiceId, OffsetDateTime startsAt,
+                                       int count) {
+        UUID appointmentId = UUID.randomUUID();
+        jdbcTemplate.update("INSERT INTO appointments (id, client_id, salon_id, status, booking_source, created_at, "
+                + "updated_at) VALUES (?, ?, ?, 'CONFIRMED', 'APP', NOW(), NOW())", appointmentId, clientId,
+                salon.salonId());
+        for (int i = 0; i < count; i++) {
+            OffsetDateTime itemStart = startsAt.plusHours(i);
+            jdbcTemplate.update("INSERT INTO bookings (id, client_id, master_id, master_service_id, salon_id, "
+                            + "appointment_id, status, starts_at, ends_at, price_at_booking, "
+                            + "duration_minutes_at_booking, buffer_minutes_at_booking, booking_source, created_at, "
+                            + "updated_at) VALUES (?, ?, ?, ?, ?, ?, 'CONFIRMED', ?, ?, 350.00, 60, 0, 'APP', NOW(), NOW())",
+                    UUID.randomUUID(), clientId, masterId, masterServiceId, salon.salonId(),
+                    appointmentId, itemStart, itemStart.plusHours(1));
+        }
+        return appointmentId;
+    }
 
     private static String expectedBody(OffsetDateTime startsAt) {
         return "Beautica: Ваш запис " + DATE_FMT.format(startsAt.atZoneSameInstant(TimeZones.KYIV))
@@ -259,6 +556,12 @@ class GuestProviderCancellationSmsIT extends AbstractWalkInBookingSmsIT {
     /** Phase 435 — the body plus the guest's own booking page paragraph (sealed-token rows). */
     private static String expectedWithPage(OffsetDateTime startsAt, String cancelUrl) {
         return expectedBody(startsAt) + "\n\nДеталі або записатись знову " + cancelUrl;
+    }
+
+    private static OffsetDateTime startOf(Map<String, Object> row) {
+        Object value = row.get("starts_at");
+        return value instanceof OffsetDateTime odt ? odt
+                : ((java.sql.Timestamp) value).toInstant().atOffset(java.time.ZoneOffset.UTC);
     }
 
     /** Gives the fixture salon a V200-shaped booking slug and returns it. */

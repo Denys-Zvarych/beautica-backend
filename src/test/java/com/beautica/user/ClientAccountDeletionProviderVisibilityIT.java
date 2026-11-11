@@ -46,7 +46,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  *       self-delete time — outside the future-only cancel-cascade's {@code startsAt > now} scan,
  *       so it is untouched by the cancel step but IS swept into the uniform step-6 detach loop;
  *       the 2026-09-28 audit pinned this as "ends CONFIRMED + detached", and this class proves that
- *       exact persisted state AND that a provider can still complete/decline/not-complete it
+ *       exact persisted state AND that a provider can still complete/decline it
  *       afterwards without error;</li>
  *   <li>re-registration with the SAME email after a self-delete — the new account must never see
  *       the old (kept, detached) bookings in its own lists.</li>
@@ -332,31 +332,6 @@ class ClientAccountDeletionProviderVisibilityIT extends AbstractIntegrationTest 
                 new HttpEntity<>(body, headers), Void.class);
         assertThat(declineResp.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
         assertThat(csd.bookingStatusOf(bookingId)).isEqualTo("DECLINED");
-    }
-
-    @Test
-    @DisplayName("...and the provider can mark an elapsed detached booking NOT_COMPLETED (no-show) "
-            + "without error")
-    void should_allowProviderNotComplete_onElapsedConfirmedDetachedBooking() throws Exception {
-        ClientSelfDeleteTestFixtures.Salon salon = csd.createSalon();
-        UUID clientId = csd.createClient();
-        String clientToken = fixtures.tokenFor(emailOf(clientId));
-        UUID bookingId = csd.insertBooking(clientId, salon, "CONFIRMED", OffsetDateTime.now().minusHours(3));
-
-        restTemplate.exchange("/api/v1/users/me", HttpMethod.DELETE,
-                new HttpEntity<>(fixtures.bearerHeaders(clientToken)), Void.class);
-        assertThat(csd.bookingStatusOf(bookingId)).isEqualTo("CONFIRMED");
-        assertThat(csd.clientIdOf(bookingId)).isNull();
-
-        String ownerToken = fixtures.tokenFor(emailOf(salon.ownerId()));
-        String body = objectMapper.writeValueAsString(Map.of("cancellationReason", "CLIENT_NO_SHOW"));
-        HttpHeaders headers = fixtures.bearerHeaders(ownerToken);
-        headers.setContentType(MediaType.APPLICATION_JSON);
-        ResponseEntity<Void> notCompleteResp = restTemplate.exchange(
-                "/api/v1/bookings/" + bookingId + "/not-complete", HttpMethod.PATCH,
-                new HttpEntity<>(body, headers), Void.class);
-        assertThat(notCompleteResp.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
-        assertThat(csd.bookingStatusOf(bookingId)).isEqualTo("NOT_COMPLETED");
     }
 
     // ── 4. re-registration with the SAME email ──────────────────────────────

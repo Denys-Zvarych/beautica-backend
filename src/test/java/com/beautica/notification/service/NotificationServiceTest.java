@@ -261,7 +261,8 @@ class NotificationServiceTest {
     }
 
     @Test
-    @DisplayName("Phase 390: a WHOLE-VISIT decline queues ONE SMS naming the visit start")
+    @DisplayName("Phase 390/478: a per-visit row on a whole-declined guest visit's EARLIEST item (pre-478 rows) "
+            + "queues ONE SMS naming that item's start = the visit start")
     void should_dispatchOneSmsAtVisitStart_when_wholeGuestVisitDeclined() {
         Booking lead = buildGuestBookingMockForDecline(null);
         BookingVisit visit = wholeVisitDecline(lead, 3);
@@ -270,6 +271,37 @@ class NotificationServiceTest {
 
         // visitOf re-stubs the lead to 2026-06-15T10:00Z = 13:00 Kyiv (EEST).
         assertThat(dispatchedText()).startsWith("Beautica: Ваш запис 15.06.2026 о 13:00 скасовано.");
+        verifyNoMoreInteractions(bookingSmsDispatcher);
+    }
+
+    @Test
+    @DisplayName("Phase 478 (GST-75): a per-service row of a WHOLE-declined guest visit names its OWN service's "
+            + "start, not the visit start")
+    void should_nameOwnServiceStart_when_laterItemOfWholeDeclinedGuestVisitDispatched() {
+        Booking declined = buildGuestBookingMockForDecline(null);
+        Booking earlierSibling = mock(Booking.class);
+        lenient().when(earlierSibling.getId()).thenReturn(UUID.randomUUID());
+        lenient().when(earlierSibling.getStartsAt()).thenReturn(OffsetDateTime.parse("2026-08-01T09:00:00+03:00"));
+        BookingVisit wholeVisit = BookingVisit.of(declined, List.of(earlierSibling, declined), BookingStatus.DECLINED);
+
+        service.notifyBookingStatusChanged(wholeVisit);
+
+        assertThat(dispatchedText()).startsWith(BODY_0108);
+        verifyNoMoreInteractions(bookingSmsDispatcher);
+    }
+
+    @Test
+    @DisplayName("Phase 478 (GST-75): a per-service SALON_CLOSED row of a guest visit names its OWN service's start")
+    void should_nameOwnServiceStart_when_laterItemOfClosedGuestVisitDispatched() {
+        Booking later = buildGuestBookingMockForSalonClosed(
+                "Тест послуга", OffsetDateTime.parse("2026-08-01T10:00:00+03:00"));
+        Booking earlierSibling = mock(Booking.class);
+        lenient().when(earlierSibling.getId()).thenReturn(UUID.randomUUID());
+        lenient().when(earlierSibling.getStartsAt()).thenReturn(OffsetDateTime.parse("2026-08-01T09:00:00+03:00"));
+
+        service.notifySalonClosed(BookingVisit.of(later, List.of(earlierSibling, later), BookingStatus.DECLINED));
+
+        assertThat(dispatchedText()).isEqualTo(BODY_0108);
         verifyNoMoreInteractions(bookingSmsDispatcher);
     }
 
@@ -577,8 +609,8 @@ class NotificationServiceTest {
     }
 
     @Test
-    @DisplayName("Phase 390: a multi-service guest visit closed by the salon gets ONE SMS at the visit "
-            + "start and no service names")
+    @DisplayName("Phase 390/478: a SALON_CLOSED row on a guest visit's EARLIEST item gets ONE SMS at its own "
+            + "start (= the visit start) and no service names")
     void should_dispatchOneSmsAtVisitStart_when_notifySalonClosedForMultiServiceGuestVisit() {
         Booking lead = buildGuestBookingMockForSalonClosed(
                 "Тест послуга", OffsetDateTime.parse("2026-08-01T10:00:00+03:00"));

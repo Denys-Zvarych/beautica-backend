@@ -39,8 +39,8 @@ import java.util.UUID;
  * covers every public method. Cache key is the 6-element composite
  * {@code {actorId, from, to, filterMasterId, serviceDefId, salonIdFilter}}. Eviction uses
  * {@code cache.clear()} on the whole {@code revenue-dashboard} region, called from
- * {@code BookingService.evictRevenueDashboardAfterCommit()} after any COMPLETED /
- * NOT_COMPLETED transition. Targeted single-key eviction is not feasible because
+ * {@code BookingService.evictRevenueDashboardAfterCommit()} after any COMPLETED transition (DASH-13;
+ * phase 475 removed the not-complete routes, so no transition leads to NOT_COMPLETED any more). Targeted single-key eviction is not feasible because
  * {@code BookingService} does not have access to the date/filter parameters at eviction time.
  *
  * <p>The native SQL aggregates against {@code price_at_booking} — the snapshot price

@@ -30,13 +30,24 @@ import java.util.UUID;
  *                      exactly the masters actually touched by this cascade
  * @param startsAt      absolute start instant — the D3 boundary is applied by the query itself
  *                      ({@code startsAt > now}), so every row returned is already future
+ * @param guest         phase 478 (GST-75) — the booking has no client account ({@code client_id IS NULL}): its
+ *                      cancellation message goes out once PER DECLINED SERVICE, so the cascade queues one
+ *                      notification row per declined item of the visit instead of one per visit. Only the
+ *                      scans whose scope can hold a guest booking project it; the 4-arg constructor
+ *                      (registered-client scans, tests) defaults it to {@code false}
  */
 public record SalonClosureBookingCandidate(
         UUID bookingId,
         UUID appointmentId,
         UUID masterId,
-        OffsetDateTime startsAt
+        OffsetDateTime startsAt,
+        boolean guest
 ) {
+
+    /** A registered-client candidate ({@code guest = false}) — the pre-478 shape. */
+    public SalonClosureBookingCandidate(UUID bookingId, UUID appointmentId, UUID masterId, OffsetDateTime startsAt) {
+        this(bookingId, appointmentId, masterId, startsAt, false);
+    }
 
     /**
      * The key every candidate of the SAME visit shares: {@code coalesce(appointmentId, bookingId)}

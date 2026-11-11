@@ -503,20 +503,6 @@ public class BookingController {
         return ResponseEntity.noContent().build();
     }
 
-    // Role-only gate here + service-layer @authz.enforceCanCancelBooking ownership guard in
-    // BookingService#notCompleteBooking (§D — ownership enforced once, in the service). Mirrors
-    // the sibling AppointmentController /not-complete, which is likewise role-only.
-    @PatchMapping("/{bookingId}/not-complete")
-    @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN','INDEPENDENT_MASTER')")
-    public ResponseEntity<Void> notCompleteBooking(
-            @PathVariable UUID bookingId,
-            @Valid @RequestBody StatusUpdateRequest req,
-            Authentication auth
-    ) {
-        bookingService.notCompleteBooking(AuthenticationUtils.userId(auth), bookingId, req);
-        return ResponseEntity.noContent().build();
-    }
-
     /**
      * Moves a booking to a new future time — the client's own booking, OR (Phase 27.2 — REVERSES
      * the previously-locked "reschedule is client-only" decision) the provider (salon owner /

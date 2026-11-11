@@ -1,6 +1,5 @@
 package com.beautica.review.invite;
 
-import com.beautica.booking.service.AppointmentTransitionService;
 import com.beautica.common.security.PhoneHasher;
 import com.beautica.review.invite.service.ReviewInviteSendJob;
 import org.junit.jupiter.api.DisplayName;
@@ -20,8 +19,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 @DisplayName("Review invites flag off — phase 400 IT")
 class ReviewInviteInvitesDisabledIT extends AbstractReviewInviteIT {
 
-    @Autowired
-    private AppointmentTransitionService appointmentTransitionService;
 
     @Autowired
     private ReviewInviteSendJob job;
@@ -36,7 +33,7 @@ class ReviewInviteInvitesDisabledIT extends AbstractReviewInviteIT {
         fixtures.visitItem(appointmentId, masterId, masterServiceId, "LINK", "CONFIRMED", GUEST_PHONE, 3);
 
         authenticateAsMaster();
-        appointmentTransitionService.completeAppointment(masterUserId, appointmentId);
+        completeVisitItems(appointmentId);
         job.tick(MIDDAY);
 
         assertThat(inviteCount()).isZero();

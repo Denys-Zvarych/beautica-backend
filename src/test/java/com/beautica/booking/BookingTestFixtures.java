@@ -420,6 +420,28 @@ public class BookingTestFixtures {
     }
 
     /**
+     * Phase 475 — completes every still-CONFIRMED service of a visit, one by one, through
+     * {@code PATCH /appointments/{id}/services/{bookingId}/complete} (the whole-visit complete route was
+     * removed). The last completion collapses the header to {@code COMPLETED} and fires the visit's
+     * single review prompt. Asserts every call returns 204 so a caller's later assertions are never
+     * vacuous.
+     */
+    public void completeEveryService(UUID appointmentId, String providerToken) {
+        List<UUID> itemIds = jdbcTemplate.queryForList(
+                "SELECT id FROM bookings WHERE appointment_id = ? AND status = 'CONFIRMED' ORDER BY starts_at, id",
+                UUID.class, appointmentId);
+        assertThat(itemIds).as("visit %s must have a CONFIRMED service to complete", appointmentId).isNotEmpty();
+        for (UUID itemId : itemIds) {
+            ResponseEntity<String> resp = restTemplate.exchange(
+                    "/api/v1/appointments/" + appointmentId + "/services/" + itemId + "/complete",
+                    HttpMethod.PATCH, new HttpEntity<>(bearerHeaders(providerToken)), String.class);
+            assertThat(resp.getStatusCode())
+                    .as("per-service complete of %s must succeed — body: %s", itemId, resp.getBody())
+                    .isEqualTo(HttpStatus.NO_CONTENT);
+        }
+    }
+
+    /**
      * Open-ended weekly schedule with all seven ISO weekdays 08:00–20:00 so a near-future visit can
      * be booked on any day.
      */

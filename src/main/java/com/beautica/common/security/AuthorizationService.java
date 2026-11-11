@@ -1176,9 +1176,9 @@ public class AuthorizationService {
     }
 
     /**
-     * Service-layer provider-authority guard for the WHOLE-VISIT transitions
-     * ({@code AppointmentTransitionService#declineAppointment} / {@code #completeAppointment} /
-     * {@code #notCompleteAppointment}), evaluated via the lightweight {@link BookingCompletionAccess}
+     * Service-layer provider-authority guard for the per-service visit transitions
+     * ({@code AppointmentTransitionService#declineAppointmentItem} / {@code #completeAppointmentItem} /
+     * {@code #rescheduleAppointmentItem}; the whole-visit ones were removed in phase 475), evaluated via the lightweight {@link BookingCompletionAccess}
      * projection — the same projection {@link #canRescheduleAppointment} uses — instead of a full
      * {@code Booking} entity load.
      *
@@ -1441,7 +1441,8 @@ public class AuthorizationService {
 
     /**
      * Service-layer provider-cancellation guard (Phase 24.2) — the entity-based twin of
-     * {@link #canCancelBooking}, backing {@code declineBooking}/{@code notCompleteBooking}.
+     * {@link #canCancelBooking}, backing {@code declineBooking} and the cascades' batched declines
+     * ({@code BookingService#assertBatchDeclinePreconditions}).
      * Same predicate as {@link #enforceCanCompleteBooking}: an actor trusted to mark a visit
      * completed is trusted to cancel one or mark a no-show (decisions D1/D2).
      */

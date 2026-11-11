@@ -56,7 +56,7 @@ class ReviewInviteSchedulerIT extends AbstractReviewInviteIT {
     private PhoneHasher phoneHasher;
 
     @Test
-    @DisplayName("item-level completion then header completion → exactly ONE SCHEDULED invite, send_after from the "
+    @DisplayName("item-level completion then the remaining item → exactly ONE SCHEDULED invite, send_after from the "
             + "first completion, keyed by the PhoneHasher hash, no token yet")
     void should_createOneInvite_when_itemThenHeaderCompleted() {
         UUID appointmentId = fixtures.linkVisit("CONFIRMED", GUEST_PHONE, POLICY);
@@ -67,7 +67,7 @@ class ReviewInviteSchedulerIT extends AbstractReviewInviteIT {
         authenticateAsMaster();
         appointmentTransitionService.completeAppointmentItem(masterUserId, appointmentId, first);
         Instant after = Instant.now();
-        appointmentTransitionService.completeAppointment(masterUserId, appointmentId);
+        completeVisitItems(appointmentId);
 
         assertThat(inviteCount()).isEqualTo(1);
         Map<String, Object> row = jdbcTemplate.queryForMap(
@@ -81,12 +81,12 @@ class ReviewInviteSchedulerIT extends AbstractReviewInviteIT {
     }
 
     @Test
-    @DisplayName("whole-visit completion of a LINK visit → one SCHEDULED invite")
+    @DisplayName("completing every item of a LINK visit → one SCHEDULED invite")
     void should_createInvite_when_wholeVisitCompleted() {
         UUID appointmentId = confirmedLinkVisit(GUEST_PHONE, POLICY);
 
         authenticateAsMaster();
-        appointmentTransitionService.completeAppointment(masterUserId, appointmentId);
+        completeVisitItems(appointmentId);
 
         assertThat(statusOf(appointmentId)).isEqualTo("SCHEDULED");
     }
@@ -98,7 +98,7 @@ class ReviewInviteSchedulerIT extends AbstractReviewInviteIT {
         fixtures.visitItem(appointmentId, masterId, masterServiceId, "STAFF", "CONFIRMED", GUEST_PHONE, 3);
 
         authenticateAsMaster();
-        appointmentTransitionService.completeAppointment(masterUserId, appointmentId);
+        completeVisitItems(appointmentId);
 
         assertThat(inviteCount()).isEqualTo(1);
         assertThat(statusOf(appointmentId)).isEqualTo("SCHEDULED");
@@ -120,15 +120,15 @@ class ReviewInviteSchedulerIT extends AbstractReviewInviteIT {
     }
 
     @Test
-    @DisplayName("phase 434 — whole-visit completion of an APP visit and of a STAFF visit WITH an account → no invite")
+    @DisplayName("phase 434 — completing every item of an APP visit and of a STAFF visit WITH an account → no invite")
     void should_createNoInvite_when_appVisitOrStaffVisitWithClientCompleted() {
         UUID clientId = fixtures.user("CLIENT", "Олена", "Бондар");
         UUID appVisit = confirmedClientVisit(clientId, "APP", 5);
         UUID staffVisit = confirmedClientVisit(clientId, "STAFF", 3);
 
         authenticateAsMaster();
-        appointmentTransitionService.completeAppointment(masterUserId, appVisit);
-        appointmentTransitionService.completeAppointment(masterUserId, staffVisit);
+        completeVisitItems(appVisit);
+        completeVisitItems(staffVisit);
 
         assertThat(jdbcTemplate.queryForObject(
                 "SELECT COUNT(*) FROM bookings WHERE appointment_id IN (?, ?) AND status = 'COMPLETED'",
@@ -163,7 +163,7 @@ class ReviewInviteSchedulerIT extends AbstractReviewInviteIT {
         UUID appointmentId = confirmedLinkVisit(GUEST_PHONE, POLICY);
 
         authenticateAsMaster();
-        appointmentTransitionService.completeAppointment(masterUserId, appointmentId);
+        completeVisitItems(appointmentId);
 
         assertThat(statusOf(appointmentId)).isEqualTo("SKIPPED");
         assertThat(skipReasonOf(appointmentId)).isEqualTo("OPTED_OUT");
@@ -175,7 +175,7 @@ class ReviewInviteSchedulerIT extends AbstractReviewInviteIT {
         UUID appointmentId = confirmedLinkVisit(GUEST_PHONE, "2026-10-19");
 
         authenticateAsMaster();
-        appointmentTransitionService.completeAppointment(masterUserId, appointmentId);
+        completeVisitItems(appointmentId);
 
         assertThat(skipReasonOf(appointmentId)).isEqualTo("POLICY_VERSION");
     }

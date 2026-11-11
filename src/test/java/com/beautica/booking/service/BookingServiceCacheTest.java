@@ -238,8 +238,8 @@ class BookingServiceCacheTest {
 
         Booking booking = mockBookingInStatus(bookingId, BookingStatus.CONFIRMED);
         // Phase 27.1: completeBooking now requires now >= startsAt (assertElapsedForComplete) —
-        // mockBookingInStatus's default startsAt is FUTURE (needed by the decline/not-complete
-        // tests sharing this helper), so override it to an ELAPSED time for this test only.
+        // mockBookingInStatus's default startsAt is FUTURE (needed by the decline
+        // test sharing this helper), so override it to an ELAPSED time for this test only.
         when(booking.getStartsAt()).thenReturn(OffsetDateTime.now(clock).minusHours(1));
 
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
@@ -260,50 +260,6 @@ class BookingServiceCacheTest {
                 .isNotNull();
         assertThat(cache.get(calendarKey))
                 .as("the booking master's master-calendar entry must be evicted after completeBooking")
-                .isNull();
-    }
-
-    @Test
-    @DisplayName("notCompleteBooking evicts the master-calendar cache")
-    void should_evictMasterCalendarCache_when_notCompleteBookingCalled() {
-        UUID actorUserId = UUID.randomUUID();
-        UUID bookingId = UUID.randomUUID();
-
-        // Arrange — put a sentinel entry in master-calendar to confirm eviction
-        Cache cache = cacheManager.getCache("master-calendar");
-        assertThat(cache).isNotNull();
-        Object calendarKey = CacheKeyFixtures.spelKey(MASTER_ID, LocalDate.now(), LocalDate.now().plusDays(7), 0, 20);
-        Object bystanderKey = CacheKeyFixtures.spelKey(UUID.randomUUID(), LocalDate.now(), LocalDate.now().plusDays(7), 0, 20);
-        cache.put(calendarKey, "value");
-        cache.put(bystanderKey, "value");
-
-        Booking booking = mockBookingInStatus(bookingId, BookingStatus.CONFIRMED);
-        // not-complete has no temporal guard — an elapsed startsAt is just the conventional
-        // no-show fixture here, not a requirement.
-        when(booking.getStartsAt()).thenReturn(OffsetDateTime.now(clock).minusHours(1));
-
-        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
-        when(bookingRepository.save(any())).thenReturn(booking);
-        doNothing().when(authz).enforceCanCancelBooking(actorUserId, booking);
-
-        StatusUpdateRequest request = new StatusUpdateRequest(
-                CancellationReason.CLIENT_NO_SHOW,
-                "Client did not show up"
-        );
-
-        // Act — wrap in transaction so afterCommit() fires
-        transactionTemplate.execute(status -> {
-            bookingService.notCompleteBooking(actorUserId, bookingId, request);
-            return null;
-        });
-
-        // Assert — sentinel must be gone: allEntries=true evicts the entire cache
-        assertThat(cache.get(bystanderKey))
-                .as("eviction is scoped to the booking's master — an unrelated master's calendar "
-                        + "page must survive, so a regression cannot hide behind a blanket clear()")
-                .isNotNull();
-        assertThat(cache.get(calendarKey))
-                .as("the booking master's master-calendar entry must be evicted after notCompleteBooking")
                 .isNull();
     }
 
@@ -375,7 +331,7 @@ class BookingServiceCacheTest {
         when(booking.getPriceAtBooking()).thenReturn(new BigDecimal("200.00"));
         when(booking.getDurationMinutesAtBooking()).thenReturn(60);
         when(booking.getCreatedAt()).thenReturn(Instant.now());
-        // Freshness re-check seam (G4/G5): cancel/complete/decline/notComplete all re-probe the
+        // Freshness re-check seam (G4/G5): cancel/complete/decline all re-probe the
         // CURRENT row via existsConfirmedById immediately before mutating, because assertTransition
         // only proves the status of the stale pre-load snapshot. An unstubbed mock returns false,
         // which short-circuits to a 409 "Service changed concurrently" BEFORE any eviction runs —

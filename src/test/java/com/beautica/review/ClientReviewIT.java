@@ -535,7 +535,7 @@ class ClientReviewIT extends AbstractIntegrationTest {
         BookingTestFixtures fixtures =
                 new BookingTestFixtures(restTemplate, jdbcTemplate, objectMapper, passwordEncoder);
         BookingTestFixtures.VisitFixture visit = fixtures.createConfirmedVisit("clirev-visit3", 3);
-        completeVisit(visit);
+        fixtures.completeEveryService(visit.id(), visit.masterToken());
         List<UUID> children = childIdsOf(visit.id());
         assertThat(children).hasSize(3);
         int[] ratings = {5, 3, 4};
@@ -571,19 +571,6 @@ class ClientReviewIT extends AbstractIntegrationTest {
     private List<UUID> childIdsOf(UUID appointmentId) {
         return jdbcTemplate.queryForList(
                 "SELECT id FROM bookings WHERE appointment_id = ? ORDER BY starts_at", UUID.class, appointmentId);
-    }
-
-    /**
-     * Provider completes the whole visit (no elapse guard on complete) so its children become
-     * reviewable — mirrors {@code AppointmentReviewIT#completeVisit(VisitFixture)}.
-     */
-    private void completeVisit(BookingTestFixtures.VisitFixture visit) {
-        ResponseEntity<String> completed = restTemplate.exchange(
-                "/api/v1/appointments/" + visit.id() + "/complete", HttpMethod.PATCH,
-                new HttpEntity<>(bearerHeaders(visit.masterToken())), String.class);
-        assertThat(completed.getStatusCode())
-                .as("visit completion must succeed — body: %s", completed.getBody())
-                .isEqualTo(HttpStatus.NO_CONTENT);
     }
 
     // ── HTTP helpers ─────────────────────────────────────────────────────────────

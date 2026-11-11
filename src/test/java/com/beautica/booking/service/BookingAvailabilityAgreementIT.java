@@ -1,8 +1,8 @@
 package com.beautica.booking.service;
 
+import com.beautica.auth.Role;
 import com.beautica.booking.domain.GuestCancelToken;
 import com.beautica.AbstractIntegrationTest;
-import com.beautica.booking.dto.AppointmentCancelRequest;
 import com.beautica.booking.dto.AvailableSlotResponse;
 import com.beautica.booking.dto.CancelBookingRequest;
 import com.beautica.booking.dto.CreateBookingRequest;
@@ -19,6 +19,9 @@ import com.beautica.master.entity.WeekdayMode;
 import com.beautica.master.service.MasterScheduleService;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.cache.Cache;
@@ -752,7 +755,7 @@ class BookingAvailabilityAgreementIT extends AbstractIntegrationTest {
     // bookings with raw JDBC and read `/slots` once, so they never touch the `available-slots`
     // cache — a correct calculator behind a stale cache still ships the bug the user reported.
     //
-    // These two cases are the only ones anywhere that drive a REAL booking write (BookingService,
+    // These cases are the only ones anywhere that drive a REAL booking write (BookingService,
     // real transaction, real afterCommit hook) and then re-read `/slots` through the REAL Caffeine
     // cache with NO sleep and NO TTL wait. What they pin:
     //
@@ -761,10 +764,8 @@ class BookingAvailabilityAgreementIT extends AbstractIntegrationTest {
     //     write sweeps the whole master prefix. Before the fix the write evicted only the BOOKED
     //     service's key, so for up to the 60-second TTL a second client browsing service B was
     //     still offered the time service A had just consumed.
-    //   * case 12 — eviction on CONFIRMED -> NOT_COMPLETED, a transition that FREES a slot (the
-    //     occupancy predicate is `status = 'CONFIRMED'` only) and evicted nothing at all before
-    //     the fix. No-show carries no temporal guard, so the booking here is deliberately FUTURE:
-    //     its slot must return to the picker immediately.
+    //   * case 12 — retired in phase 475 with the not-complete routes (no transition leads to
+    //     NOT_COMPLETED any more).
     //
     // Both assert the OUTCOME (which wall-clocks `/slots` offers) and, as the mechanism guard, that
     // the warm read really did populate the cache — without that a green could mean "nothing was
@@ -808,48 +809,6 @@ class BookingAvailabilityAgreementIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("case 12 — marking a FUTURE booking NOT_COMPLETED returns its 11:00 slot to the "
-            + "already-cached slot list on the very next read (no TTL wait)")
-    void should_restoreTheFreedSlotImmediately_when_aFutureBookingIsMarkedNotCompleted() {
-        LocalDate day = TODAY.plusDays(21);
-
-        Master m = seedIndependentMaster();
-        UUID svc = addService(m, 60, 0);
-        UUID client = seedClient();
-        masterScheduleService.upsertOverride(m.userId(), m.masterId(),
-                new ScheduleOverrideRequest(day, ScheduleExceptionKind.CUSTOM_HOURS,
-                        WeekdayMode.EXPLICIT_TIMES, null,
-                        List.of(LocalTime.of(11, 0), LocalTime.of(15, 0))));
-
-        UUID bookingId = bookingService.createBooking(client, null, new CreateBookingRequest(
-                m.masterId(), svc, day.atTime(11, 0).atZone(TimeZones.KYIV), null, null, false)).id();
-        // Isolation, so this case fails for exactly ONE reason. The create above ran the schedule-fit
-        // gate, which populated this master's `available-slots` key with the PRE-booking list; clearing
-        // here means the warm read below is unambiguously fresh and case 12 pins the no-show eviction
-        // alone, never the create-path eviction that case 11 owns.
-        clearSlotCache();
-
-        // 1) Warm the cache with the POST-booking picture: 11:00 is taken.
-        assertThat(slotStarts(m.masterId(), day, svc))
-                .as("the CONFIRMED booking occupies 11:00")
-                .containsExactly(LocalTime.of(15, 0));
-        assertThat(cachedSlotEntryCount(m.masterId()))
-                .as("mechanism guard — the taken-slot list above is genuinely cached, so failing to "
-                        + "evict below would serve it again")
-                .isEqualTo(1);
-
-        // 2) CONFIRMED -> NOT_COMPLETED drops the row out of the `status = 'CONFIRMED'` occupancy
-        //    predicate, i.e. it FREES 11:00. The booking is still in the future — no-show has no
-        //    temporal guard — so the slot is genuinely re-bookable.
-        bookingService.notCompleteBooking(m.userId(), bookingId,
-                new StatusUpdateRequest(CancellationReason.CLIENT_NO_SHOW, null));
-
-        assertThat(slotStarts(m.masterId(), day, svc))
-                .as("11:00 is bookable again on the very next read — not 60 seconds later")
-                .containsExactly(LocalTime.of(11, 0), LocalTime.of(15, 0));
-    }
-
-    @Test
     @DisplayName("case 13 — completing an IN-PROGRESS booking early returns its unused 17:00–19:00 tail "
             + "to the already-cached slot list on the very next read (no TTL wait)")
     void should_returnTheUnusedTailImmediately_when_anInProgressBookingIsCompletedEarly() {
@@ -890,7 +849,7 @@ class BookingAvailabilityAgreementIT extends AbstractIntegrationTest {
     // transition, and for the two non-BookingService writers into the same sweep
     // ════════════════════════════════════════════════════════════════════════════════════════
     //
-    // Cases 11–13 pinned create / not-complete / complete. Cancel, decline, reschedule and the
+    // Cases 11 and 13 pin create / complete (case 12, not-complete, retired in phase 475). Cancel, decline, reschedule and the
     // appointment-level + guest analogues route through the identical
     // SlotCalculationService#evictMasterAvailabilityCaches by-master sweep, but were covered only
     // by Mockito verifies — which prove the CALL is written, never that the sweep actually reaches
@@ -901,8 +860,10 @@ class BookingAvailabilityAgreementIT extends AbstractIntegrationTest {
     //   * case 15 — decline  (BookingService#declineBooking,    provider-initiated → DECLINED)
     //   * case 16 — reschedule (BookingService#rescheduleBooking) — a MOVE, so BOTH halves are
     //     asserted off ONE post-write read: the vacated time returns AND the target time goes.
-    //   * case 17 — whole-visit cancel (AppointmentTransitionService#cancelAppointment) — the
-    //     appointment-level analogue, whose eviction lives in its OWN registerEviction hook.
+    //   * case 17 — per-service visit decline of both legs
+    //     (AppointmentTransitionService#declineAppointmentItem; the whole-visit cancel it used to
+    //     drive was removed in phase 475) — the appointment-level analogue, whose eviction lives in
+    //     its OWN registerEviction hook.
     //   * case 18 — guest cancel-by-token (BookingCancellationService#cancel) — the third writer,
     //     whose eviction lives inside registerAfterCommitSms, downstream of the SMS attempt.
     //
@@ -925,7 +886,7 @@ class BookingAvailabilityAgreementIT extends AbstractIntegrationTest {
 
         UUID bookingId = bookingService.createBooking(client, null, new CreateBookingRequest(
                 m.masterId(), svcA, day.atTime(11, 0).atZone(TimeZones.KYIV), null, null, false)).id();
-        // Isolation (case 12's reasoning verbatim): the create above already swept this master's
+        // Isolation: the create above already swept this master's
         // keys, so clearing here makes the warm read below unambiguously fresh and this case pin
         // the CANCEL eviction alone, never the create-path eviction case 11 owns.
         clearSlotCache();
@@ -1025,9 +986,9 @@ class BookingAvailabilityAgreementIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("case 17 — cancelling a whole multi-service VISIT returns both its 11:00 and 12:00 "
-            + "legs to a third service's ALREADY-CACHED slot list on the very next read")
-    void should_evictAThirdServicesCachedSlots_when_aWholeAppointmentIsCancelled() {
+    @DisplayName("case 17 — declining both legs of a multi-service VISIT per service returns its 11:00 and "
+            + "12:00 legs to a third service's ALREADY-CACHED slot list on the very next read")
+    void should_evictAThirdServicesCachedSlots_when_everyVisitLegIsDeclined() {
         LocalDate day = TODAY.plusDays(25);
 
         Master m = seedIndependentMaster();
@@ -1041,9 +1002,9 @@ class BookingAvailabilityAgreementIT extends AbstractIntegrationTest {
         // the warm read, and seeding it directly keeps this case pinned to the CANCEL eviction
         // alone rather than to AppointmentService's create-path eviction.
         UUID appointmentId = insertConfirmedAppointment(client);
-        insertAppointmentItem(appointmentId, m.masterId(), svcA, client, day,
+        UUID legA = insertAppointmentItem(appointmentId, m.masterId(), svcA, client, day,
                 LocalTime.of(11, 0), LocalTime.of(12, 0));
-        insertAppointmentItem(appointmentId, m.masterId(), svcB, client, day,
+        UUID legB = insertAppointmentItem(appointmentId, m.masterId(), svcB, client, day,
                 LocalTime.of(12, 0), LocalTime.of(13, 0));
 
         // 1) Warm the THIRD service's entry — neither leg's own service, so only a by-master sweep
@@ -1056,13 +1017,21 @@ class BookingAvailabilityAgreementIT extends AbstractIntegrationTest {
                         + "to evict below would serve it again")
                 .isEqualTo(1);
 
-        // 2) The whole-visit client cancel — header + every item to CANCELLED, evicting through
+        // 2) The provider declines each leg per service — both items to DECLINED, evicting through
         //    AppointmentTransitionService's own after-commit hook, not BookingService's.
-        appointmentTransitionService.cancelAppointment(client, appointmentId,
-                new AppointmentCancelRequest(null));
+        //    The provider authority check reads the actor's role from the SecurityContext (the HTTP
+        //    filter that normally sets it is bypassed at service level), so the master is
+        //    authenticated for the two calls only.
+        authenticateAsIndependentMaster(m.userId());
+        try {
+            appointmentTransitionService.declineAppointmentItem(m.userId(), appointmentId, legA, null);
+            appointmentTransitionService.declineAppointmentItem(m.userId(), appointmentId, legB, null);
+        } finally {
+            SecurityContextHolder.clearContext();
+        }
 
         assertThat(slotStarts(m.masterId(), day, svcC))
-                .as("both cancelled legs are bookable on service C on the very next read; 15:00 "
+                .as("both declined legs are bookable on service C on the very next read; 15:00 "
                         + "survives, which proves a recomputation rather than an empty-list failure")
                 .containsExactly(LocalTime.of(11, 0), LocalTime.of(12, 0), LocalTime.of(15, 0));
     }
@@ -1299,7 +1268,10 @@ class BookingAvailabilityAgreementIT extends AbstractIntegrationTest {
                 .count();
     }
 
-    /** Test-fixture reset of the slot cache — see its one caller (case 12) for why it is needed. */
+    /**
+     * Test-fixture reset of the slot cache: a create sweeps the master's keys, so clearing afterwards
+     * makes the next warm read unambiguously fresh and pins the transition's own eviction alone.
+     */
     private void clearSlotCache() {
         slotCache().clear();
     }
@@ -1379,16 +1351,24 @@ class BookingAvailabilityAgreementIT extends AbstractIntegrationTest {
         return id;
     }
 
+    private static void authenticateAsIndependentMaster(UUID userId) {
+        UsernamePasswordAuthenticationToken auth = new UsernamePasswordAuthenticationToken(
+                "master@beautica.test", null, List.of(new SimpleGrantedAuthority("ROLE_" + Role.INDEPENDENT_MASTER)));
+        auth.setDetails(userId);
+        SecurityContextHolder.getContext().setAuthentication(auth);
+    }
+
     /**
      * One CONFIRMED leg of a visit — an ordinary booking row additionally pointing at the
      * appointment header (V125's {@code bookings.appointment_id}), which is what makes
      * {@code AppointmentTransitionService} treat it as a child rather than a standalone booking.
      */
-    private void insertAppointmentItem(UUID appointmentId, UUID masterId, UUID masterServiceId,
+    private UUID insertAppointmentItem(UUID appointmentId, UUID masterId, UUID masterServiceId,
                                        UUID clientId, LocalDate date, LocalTime start, LocalTime end) {
         UUID id = UUID.randomUUID();
         insertBooking(masterId, masterServiceId, clientId, date, start, end, "CONFIRMED", id);
         jdbcTemplate.update("UPDATE bookings SET appointment_id = ? WHERE id = ?", appointmentId, id);
+        return id;
     }
 
     /**

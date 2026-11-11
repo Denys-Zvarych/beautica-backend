@@ -14,6 +14,8 @@ import java.util.UUID;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.context.annotation.Import;
@@ -26,14 +28,15 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
 /**
- * Full-HTTP-stack smoke suite for BE-4's four appointment-level (visit) status transitions over real
- * Postgres. Each transition acts on the WHOLE visit: the {@code appointments} header AND every chained
- * {@code bookings} item move to the terminal state in lockstep, atomically. These tests prove the
- * lockstep + atomicity + single-notification guarantees and the illegal/foreign-actor error contract;
- * the exhaustive QA matrix (per-role authz, elapsed-clock guard, cache-eviction assertions) follows.
+ * Full-HTTP-stack suite for visit (appointment) transitions over real Postgres. Phase 475 removed the
+ * whole-visit {@code cancel}/{@code decline}/{@code complete}/{@code not-complete}/{@code reschedule}
+ * routes and {@code PATCH /bookings/{id}/not-complete}; this suite pins that each is unmapped (404) and
+ * changes nothing, then covers the per-service decline
+ * ({@code PATCH /appointments/{id}/services/{bookingId}/decline}): one child only, header collapse on
+ * the last CONFIRMED child, note on the child row, slot release, 404/409 error contract.
  */
 @Import(TestSecurityConfig.class)
-@DisplayName("PATCH /appointments/{id}/(cancel|decline|complete|not-complete) — visit transitions")
+@DisplayName("Visit transitions — removed whole-visit routes (404) + per-service decline")
 class AppointmentTransitionIT extends AbstractIntegrationTest {
 
     private static final String APPOINTMENTS_URL = "/api/v1/appointments";
@@ -54,123 +57,73 @@ class AppointmentTransitionIT extends AbstractIntegrationTest {
         fixtures = new BookingTestFixtures(restTemplate, jdbcTemplate, objectMapper, passwordEncoder);
     }
 
-    @Test
-    @DisplayName("client cancel moves the visit AND all items to CANCELLED in lockstep, writes the "
-            + "note+reason on the header, and enqueues exactly ONE STATUS_CHANGED notification")
-    void should_moveAllItemsToCancelled_when_clientCancelsVisit() throws Exception {
-        Visit visit = createTwoServiceVisit("cancel");
+    // ══════════════════════════════════════════════════════════════════════════════════════════════
+    // Phase 475 — the whole-visit routes and every not-complete route are unmapped (D2: Spring's 404)
+    // ══════════════════════════════════════════════════════════════════════════════════════════════
 
-        ResponseEntity<String> resp = patch(visit.clientToken(), visit.id(), "cancel",
-                "{\"clientCancellationNote\":\"Змінилися плани\"}");
+    @ParameterizedTest(name = "PATCH {0} as the visit''s own {1} → 404, visit untouched")
+    @CsvSource({
+            "/api/v1/appointments/{a}/cancel,       CLIENT",
+            "/api/v1/appointments/{a}/cancel,       PROVIDER",
+            "/api/v1/appointments/{a}/decline,      CLIENT",
+            "/api/v1/appointments/{a}/decline,      PROVIDER",
+            "/api/v1/appointments/{a}/complete,     CLIENT",
+            "/api/v1/appointments/{a}/complete,     PROVIDER",
+            "/api/v1/appointments/{a}/not-complete, CLIENT",
+            "/api/v1/appointments/{a}/not-complete, PROVIDER",
+            "/api/v1/appointments/{a}/reschedule,   CLIENT",
+            "/api/v1/appointments/{a}/reschedule,   PROVIDER",
+            "/api/v1/bookings/{b}/not-complete,     CLIENT",
+            "/api/v1/bookings/{b}/not-complete,     PROVIDER"
+    })
+    @DisplayName("every removed route (5 whole-visit + PATCH /bookings/{id}/not-complete) answers 404 to BOTH the "
+            + "visit's own client and its provider, and changes nothing (no route sets NOT_COMPLETED, BOOK-D12)")
+    void should_return404AndChangeNothing_when_removedRouteCalledByClientOrProvider(String template, String actor)
+            throws Exception {
+        Visit visit = createTwoServiceVisit("gone-" + actor.toLowerCase() + "-" + Math.abs(template.hashCode()));
+        UUID child = childIdsOf(visit.id()).get(0);
+        String path = template.replace("{a}", visit.id().toString()).replace("{b}", child.toString());
+        String token = "CLIENT".equals(actor) ? visit.clientToken() : visit.masterToken();
+        HttpHeaders headers = fixtures.bearerHeaders(token);
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        String body = "{\"newStartsAt\":\"" + ZonedDateTime.now(TimeZones.KYIV).plusDays(20).toOffsetDateTime()
+                + "\",\"providerComment\":\"note\",\"cancellationReason\":\"CLIENT_NO_SHOW\"}";
 
-        assertThat(resp.getStatusCode())
-                .as("client cancel must succeed — body: %s", resp.getBody())
-                .isEqualTo(HttpStatus.NO_CONTENT);
-        assertVisitStatus(visit.id(), "CANCELLED");
-        assertAllItemsStatus(visit.id(), "CANCELLED", 2);
-        Map<String, Object> header = header(visit.id());
-        assertThat(header.get("cancellation_reason")).isEqualTo("CLIENT_CANCELLED");
-        assertThat(header.get("client_cancellation_note")).isEqualTo("Змінилися плани");
-        assertThat(header.get("provider_comment")).as("client cancel writes no provider note").isNull();
-        assertThat(statusChangedCount(visit.id()))
-                .as("exactly ONE STATUS_CHANGED per visit transition, not one per item")
-                .isEqualTo(1L);
-    }
-
-    @Test
-    @DisplayName("provider decline moves the visit AND all items to DECLINED in lockstep, writes the "
-            + "provider note + PROVIDER_UNAVAILABLE on the header, and enqueues ONE STATUS_CHANGED")
-    void should_moveAllItemsToDeclined_when_providerDeclinesVisit() throws Exception {
-        Visit visit = createTwoServiceVisit("decline");
-
-        ResponseEntity<String> resp = patch(visit.masterToken(), visit.id(), "decline",
-                "{\"providerComment\":\"Майстер захворів\"}");
-
-        assertThat(resp.getStatusCode())
-                .as("provider decline must succeed — body: %s", resp.getBody())
-                .isEqualTo(HttpStatus.NO_CONTENT);
-        assertVisitStatus(visit.id(), "DECLINED");
-        assertAllItemsStatus(visit.id(), "DECLINED", 2);
-        Map<String, Object> header = header(visit.id());
-        assertThat(header.get("cancellation_reason")).isEqualTo("PROVIDER_UNAVAILABLE");
-        assertThat(header.get("provider_comment")).isEqualTo("Майстер захворів");
-        assertThat(statusChangedCount(visit.id())).isEqualTo(1L);
-    }
-
-    @Test
-    @DisplayName("provider complete moves the visit AND all items to COMPLETED in lockstep and "
-            + "enqueues exactly ONE STATUS_CHANGED notification")
-    void should_moveAllItemsToCompleted_when_providerCompletesVisit() throws Exception {
-        Visit visit = createTwoServiceVisit("complete");
-
-        ResponseEntity<String> resp = patch(visit.masterToken(), visit.id(), "complete", null);
+        ResponseEntity<String> resp = restTemplate.exchange(path, HttpMethod.PATCH, new HttpEntity<>(body, headers),
+                String.class);
 
         assertThat(resp.getStatusCode())
-                .as("provider complete must succeed — body: %s", resp.getBody())
-                .isEqualTo(HttpStatus.NO_CONTENT);
-        assertVisitStatus(visit.id(), "COMPLETED");
-        assertAllItemsStatus(visit.id(), "COMPLETED", 2);
-        assertThat(statusChangedCount(visit.id())).isEqualTo(1L);
-    }
-
-    @Test
-    @DisplayName("provider no-show moves the visit AND all items to NOT_COMPLETED in lockstep and "
-            + "writes the provider note + CLIENT_NO_SHOW on the header")
-    void should_moveAllItemsToNotCompleted_when_providerMarksNoShow() throws Exception {
-        Visit visit = createTwoServiceVisit("noshow");
-
-        ResponseEntity<String> resp = patch(visit.masterToken(), visit.id(), "not-complete",
-                "{\"providerComment\":\"Клієнт не прийшов\"}");
-
-        assertThat(resp.getStatusCode())
-                .as("provider no-show must succeed — body: %s", resp.getBody())
-                .isEqualTo(HttpStatus.NO_CONTENT);
-        assertVisitStatus(visit.id(), "NOT_COMPLETED");
-        assertAllItemsStatus(visit.id(), "NOT_COMPLETED", 2);
-        Map<String, Object> header = header(visit.id());
-        assertThat(header.get("cancellation_reason")).isEqualTo("CLIENT_NO_SHOW");
-        assertThat(header.get("provider_comment")).isEqualTo("Клієнт не прийшов");
-        assertThat(statusChangedCount(visit.id())).isEqualTo(1L);
-    }
-
-    @Test
-    @DisplayName("re-declining an already-DECLINED visit returns 400 and changes nothing — the visit "
-            + "and every item stay DECLINED and no second STATUS_CHANGED is enqueued (idempotent-safe)")
-    void should_return400AndChangeNothing_when_decliningAnAlreadyTerminalVisit() throws Exception {
-        Visit visit = createTwoServiceVisit("re-decline");
-        patch(visit.masterToken(), visit.id(), "decline", "{}");
-
-        ResponseEntity<String> second = patch(visit.masterToken(), visit.id(), "decline", "{}");
-
-        assertThat(second.getStatusCode())
-                .as("a second decline is an illegal transition from a terminal state — 400, "
-                        + "the same error the single-booking path returns")
-                .isEqualTo(HttpStatus.BAD_REQUEST);
-        assertVisitStatus(visit.id(), "DECLINED");
-        assertAllItemsStatus(visit.id(), "DECLINED", 2);
-        assertThat(statusChangedCount(visit.id()))
-                .as("the rejected re-decline must not enqueue a second notification")
-                .isEqualTo(1L);
-    }
-
-    @Test
-    @DisplayName("a foreign provider (a different master) declining someone else's visit is denied "
-            + "with 403 and the visit + all items stay CONFIRMED (nothing transitions)")
-    void should_return403AndKeepConfirmed_when_foreignProviderDeclines() throws Exception {
-        Visit visit = createTwoServiceVisit("foreign");
-        // A completely unrelated independent master authenticates and tries to decline the visit.
-        String foreignEmail = "appt-foreign-provider-" + System.nanoTime() + "@beautica.test";
-        fixtures.createIndependentMaster(foreignEmail);
-        String foreignToken = fixtures.tokenFor(foreignEmail);
-
-        ResponseEntity<String> resp = patch(foreignToken, visit.id(), "decline", "{}");
-
-        assertThat(resp.getStatusCode())
-                .as("a provider with no authority over the visit's master must be forbidden")
-                .isEqualTo(HttpStatus.FORBIDDEN);
+                .as("PATCH %s must be unmapped for %s — body: %s", template, actor, resp.getBody())
+                .isEqualTo(HttpStatus.NOT_FOUND);
         assertVisitStatus(visit.id(), "CONFIRMED");
         assertAllItemsStatus(visit.id(), "CONFIRMED", 2);
         assertThat(statusChangedCount(visit.id())).isEqualTo(0L);
+    }
+
+    @ParameterizedTest(name = "PATCH {0} with NO token → 401, visit untouched")
+    @CsvSource({
+            "/api/v1/appointments/{a}/cancel",
+            "/api/v1/appointments/{a}/decline",
+            "/api/v1/appointments/{a}/complete",
+            "/api/v1/appointments/{a}/not-complete",
+            "/api/v1/appointments/{a}/reschedule",
+            "/api/v1/bookings/{b}/not-complete"
+    })
+    @DisplayName("a removed route answers 401 (not 404) to an anonymous caller — the auth gate runs before handler "
+            + "mapping, so an unauthenticated caller cannot enumerate which routes exist; with a token it is 404")
+    void should_return401NotFoundOracle_when_removedRouteCalledWithoutToken(String template) throws Exception {
+        Visit visit = createTwoServiceVisit("gone-anon-" + Math.abs(template.hashCode()));
+        UUID child = childIdsOf(visit.id()).get(0);
+        String path = template.replace("{a}", visit.id().toString()).replace("{b}", child.toString());
+        HttpHeaders anonymous = new HttpHeaders();
+        anonymous.setContentType(MediaType.APPLICATION_JSON);
+
+        ResponseEntity<String> resp = restTemplate.exchange(path, HttpMethod.PATCH,
+                new HttpEntity<>("{\"cancellationReason\":\"CLIENT_NO_SHOW\"}", anonymous), String.class);
+
+        assertThat(resp.getStatusCode()).as("anonymous PATCH %s — body: %s", path, resp.getBody())
+                .isEqualTo(HttpStatus.UNAUTHORIZED);
+        assertAllItemsStatus(visit.id(), "CONFIRMED", 2);
     }
 
     // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -248,66 +201,6 @@ class AppointmentTransitionIT extends AbstractIntegrationTest {
                 .as("collapsing the header via per-service declines writes NO note to the header — the "
                         + "notes live on the individual child rows")
                 .isNull();
-    }
-
-    @Test
-    @DisplayName("a subsequent whole-visit COMPLETE does NOT resurrect an already per-service-DECLINED "
-            + "child — the declined line stays DECLINED while the surviving sibling is COMPLETED "
-            + "(transitionItems is CONFIRMED-only)")
-    void should_notResurrectDeclinedChild_when_wholeVisitCompletedAfterPerServiceDecline() throws Exception {
-        Visit visit = createTwoServiceVisit("per-svc-complete");
-        List<UUID> children = childIdsOf(visit.id());
-        UUID declined = children.get(0);
-        UUID surviving = children.get(1);
-
-        assertThat(patchServiceDecline(visit.masterToken(), visit.id(), declined, "{}").getStatusCode())
-                .isEqualTo(HttpStatus.NO_CONTENT);
-
-        // Whole-visit complete while the header is still CONFIRMED (sibling live).
-        ResponseEntity<String> resp = patch(visit.masterToken(), visit.id(), "complete", null);
-
-        assertThat(resp.getStatusCode())
-                .as("completing the visit after a per-service decline must succeed — body: %s", resp.getBody())
-                .isEqualTo(HttpStatus.NO_CONTENT);
-        assertThat(itemStatus(declined))
-                .as("the per-service-declined child must NOT be flipped to COMPLETED by a whole-visit "
-                        + "complete — the resurrection guard keeps it DECLINED")
-                .isEqualTo("DECLINED");
-        assertThat(itemStatus(surviving)).as("the surviving sibling is completed").isEqualTo("COMPLETED");
-        assertVisitStatus(visit.id(), "COMPLETED");
-    }
-
-    @Test
-    @DisplayName("a subsequent whole-visit DECLINE does NOT re-touch an already per-service-DECLINED "
-            + "child — the surviving sibling moves to DECLINED and the header collapses, the "
-            + "already-declined child is left as-is")
-    void should_notReTouchDeclinedChild_when_wholeVisitDeclinedAfterPerServiceDecline() throws Exception {
-        Visit visit = createTwoServiceVisit("per-svc-wholedecline");
-        List<UUID> children = childIdsOf(visit.id());
-        UUID alreadyDeclined = children.get(0);
-        UUID surviving = children.get(1);
-
-        assertThat(patchServiceDecline(visit.masterToken(), visit.id(), alreadyDeclined,
-                "{\"providerComment\":\"первинне скасування послуги\"}").getStatusCode())
-                .isEqualTo(HttpStatus.NO_CONTENT);
-
-        // Whole-visit decline (header still CONFIRMED — the sibling keeps it alive).
-        ResponseEntity<String> resp = patch(visit.masterToken(), visit.id(), "decline",
-                "{\"providerComment\":\"весь візит скасовано\"}");
-
-        assertThat(resp.getStatusCode())
-                .as("declining the whole visit after a per-service decline must succeed — body: %s", resp.getBody())
-                .isEqualTo(HttpStatus.NO_CONTENT);
-        assertThat(itemStatus(alreadyDeclined)).isEqualTo("DECLINED");
-        assertThat(itemStatus(surviving)).isEqualTo("DECLINED");
-        assertVisitStatus(visit.id(), "DECLINED");
-        // The per-service note on the already-declined CHILD survives (whole-visit decline writes its
-        // note to the header, never onto items — and the resurrection guard skips the declined child).
-        assertThat(childRow(alreadyDeclined).get("provider_comment"))
-                .as("the original per-service note on the child row must survive the whole-visit decline")
-                .isEqualTo("первинне скасування послуги");
-        assertThat(header(visit.id()).get("provider_comment"))
-                .as("the whole-visit decline's note lands on the header").isEqualTo("весь візит скасовано");
     }
 
     @Test
@@ -458,14 +351,6 @@ class AppointmentTransitionIT extends AbstractIntegrationTest {
         UUID appointmentId = UUID.fromString(data.path("id").asText());
         fixtures.dropCreateTimeNotifications(appointmentId);
         return new Visit(appointmentId, clientToken, masterToken);
-    }
-
-    private ResponseEntity<String> patch(String token, UUID appointmentId, String action, String body) {
-        HttpHeaders headers = fixtures.bearerHeaders(token);
-        headers.setContentType(MediaType.APPLICATION_JSON);
-        HttpEntity<String> entity = body == null ? new HttpEntity<>(headers) : new HttpEntity<>(body, headers);
-        return restTemplate.exchange(
-                APPOINTMENTS_URL + "/" + appointmentId + "/" + action, HttpMethod.PATCH, entity, String.class);
     }
 
     /** PATCH the per-service decline route {@code /appointments/{id}/services/{bookingId}/decline}. */
