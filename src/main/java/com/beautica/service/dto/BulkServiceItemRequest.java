@@ -8,7 +8,9 @@ import jakarta.validation.constraints.DecimalMin;
 import jakarta.validation.constraints.Digits;
 import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Positive;
+import jakarta.validation.constraints.Size;
 
 import java.math.BigDecimal;
 import java.util.UUID;
@@ -16,15 +18,16 @@ import java.util.UUID;
 /**
  * A single item in a {@link BulkCreateServicesRequest}.
  *
- * <h2>Why no {@code name} or {@code category} here</h2>
- * Unlike {@link CreateServiceDefinitionRequest}, the bulk setup flow is
- * service-type driven: the mobile picker presents platform categories, expands each to
- * its service types, and the master toggles individual types on. The persisted service
- * <em>name</em> is therefore always derived from the chosen {@link com.beautica.service.entity.ServiceType}'s
- * Ukrainian display name ({@code nameUk}) — no free-text name is accepted. The
- * <em>category</em> is likewise derived from the service type's parent
- * ({@code platform_category_name}); accepting it again per item would only invite an
- * inconsistent pairing, so it is intentionally omitted.
+ * <h2>Name (optional, phase 464) — and why no {@code category}</h2>
+ * The bulk setup flow is service-type driven: the mobile picker presents platform categories,
+ * expands each to its service types, and the master toggles individual types on. The persisted
+ * service <em>name</em> defaults to the chosen {@link com.beautica.service.entity.ServiceType}'s
+ * Ukrainian display name ({@code nameUk}). Since phase 464 an item may carry an optional custom
+ * {@code name}: one owner may hold several copies of a type, and two copies must differ in
+ * duration OR name (the V233 index). {@code null}/blank means {@code nameUk}, exactly as before.
+ * Its constraints are the single-create {@code name}'s, verbatim. The <em>category</em> is
+ * derived from the service type's parent ({@code platform_category_name}); accepting it again
+ * per item would only invite an inconsistent pairing, so it is intentionally omitted.
  *
  * <h2>Pricing</h2>
  * Reuses the existing flexible-pricing contract via {@link ServicePriceValid}:
@@ -75,6 +78,20 @@ public record BulkServiceItemRequest(
         @DecimalMin(value = "0.01", inclusive = true, message = "Maximum price must be at least 0.01")
         @DecimalMax(value = "99999999.99", message = "Maximum price exceeds the maximum allowed value")
         @Digits(integer = 8, fraction = 2, message = "Maximum price must have at most 8 integer digits and 2 decimal places")
-        BigDecimal priceMax
+        BigDecimal priceMax,
+
+        /**
+         * Optional custom name (phase 464). {@code null} or blank → the service type's
+         * {@code nameUk}. Same constraints as {@code CreateServiceDefinitionRequest.name}.
+         */
+        @Size(max = 100, message = "Name must be at most 100 characters")
+        @Pattern(regexp = ServiceNameConstraints.NAME_REGEX, message = ServiceNameConstraints.NAME_REGEX_MESSAGE)
+        String name
 ) implements PricedRequest {
+
+    /** Unnamed item — the persisted name is the service type's {@code nameUk} (pre-464 shape). */
+    public BulkServiceItemRequest(UUID serviceTypeId, Integer durationMinutes, PriceType priceType,
+            BigDecimal price, BigDecimal priceMin, BigDecimal priceMax) {
+        this(serviceTypeId, durationMinutes, priceType, price, priceMin, priceMax, null);
+    }
 }

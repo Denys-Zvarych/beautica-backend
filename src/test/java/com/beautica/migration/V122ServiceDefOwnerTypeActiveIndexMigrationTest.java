@@ -126,10 +126,15 @@ class V122ServiceDefOwnerTypeActiveIndexMigrationTest extends AbstractIntegratio
     }
 
     @Test
-    @DisplayName("V121's partial unique index survives V122 untouched")
+    @DisplayName("the duplicate-service guard survives the full chain — V121's index replaced by V233's (phase 464)")
     void should_keepPartialUniqueIndex_when_v122Applied() {
+        // This class reads the FULLY migrated chain, so it sees V233, which deliberately drops
+        // V121's per-type index and installs the per-copy one. V122 itself never touched either.
         assertThat(indexExists("ux_service_def_owner_service_type_active"))
-                .as("V122 must not disturb the duplicate-service guard V121 installed")
+                .as("V233 replaces V121's per-type index")
+                .isFalse();
+        assertThat(indexExists("ux_service_def_owner_type_duration_name_active"))
+                .as("the duplicate-service guard must exist on the migrated chain")
                 .isTrue();
     }
 

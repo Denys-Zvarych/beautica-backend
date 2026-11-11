@@ -13,7 +13,7 @@ import java.util.UUID;
  * <p><b>Why one projection and not three queries (Phase 302 perf LOW-3).</b> The salon branch used
  * to ask three separate questions inside the advisory lock — "which of these types does this master
  * already perform" ({@code MasterServiceRepository#findActiveAssignedServiceTypeIds}, deleted),
- * "which does the salon already offer" ({@link ServiceRepository#findActiveDuplicateTypeIds}) and
+ * "which does the salon already offer" ({@code findActiveDuplicateTypeIds}, removed in phase 464) and
  * then a bare {@code findAllById} to re-fetch definitions the second query had already joined. Once
  * the advisory lock is keyed on the SALON (audit HIGH-2) the serialized window is salon-wide, so
  * three round-trips inside it multiply across every concurrent master setup in the salon. All three

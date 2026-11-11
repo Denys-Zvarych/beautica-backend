@@ -7,7 +7,7 @@ import java.sql.SQLException;
 
 /**
  * Shared builder for the constraint-violation shape Spring hands
- * {@code ServiceCatalogService} when the V121 partial unique index fires (QA pattern Q4 — the
+ * {@code ServiceCatalogService} when the V233 partial unique index fires (QA pattern Q4 — the
  * same fixture had been re-declared in {@code ServiceCatalogServiceTest},
  * {@code ServiceCatalogServiceUpdateTest} and {@code ServiceCatalogServiceBulkCreateTest}).
  *
@@ -25,8 +25,8 @@ import java.sql.SQLException;
  */
 final class DuplicateServiceViolations {
 
-    /** The partial unique index behind {@code DUPLICATE_SERVICE} (V121). */
-    static final String DUPLICATE_SERVICE_INDEX = "ux_service_def_owner_service_type_active";
+    /** The partial unique index behind {@code DUPLICATE_SERVICE} (V233, phase 464 — replaced V121's). */
+    static final String DUPLICATE_SERVICE_INDEX = "ux_service_def_owner_type_duration_name_active";
 
     private DuplicateServiceViolations() {
     }

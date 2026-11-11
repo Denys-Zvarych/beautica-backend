@@ -74,8 +74,9 @@ public class ServiceController {
     /**
      * Description attached to the {@code 409 DUPLICATE_SERVICE} declaration on every write
      * endpoint that can raise {@code DuplicateServiceException} — the five below, i.e. every path
-     * that inserts or re-types a {@code ServiceDefinition} and so can collide with V121's
-     * {@code ux_service_def_owner_service_type_active}.
+     * that inserts or re-keys a {@code ServiceDefinition} and so can collide with V233's
+     * {@code ux_service_def_owner_type_duration_name_active} (phase 464: one active copy per
+     * owner, type, base duration and trimmed case-insensitive name).
      *
      * <p>Declared explicitly because springdoc scans controller signatures, not
      * {@code @RestControllerAdvice} handlers: without these annotations the 409's body has no
@@ -85,8 +86,10 @@ public class ServiceController {
      * this project's response envelope, which is the return type of nearly every method here.
      */
     private static final String DUPLICATE_SERVICE_409 =
-            "The owner already offers an active service of this type. One active service per "
-                    + "(owner, service type); price and duration are irrelevant. Branch on "
+            "The owner already offers an active copy of this service with the same type, same "
+                    + "duration and same name (name compared trimmed and case-insensitive). Copies "
+                    + "of one type must differ in duration or name; price is irrelevant. "
+                    + "`existingServiceDefId` names the colliding copy. Branch on "
                     + "`data.code` == DUPLICATE_SERVICE, never on `message`.";
 
     /**
@@ -103,12 +106,13 @@ public class ServiceController {
      * every other path; only this endpoint's semantics changed with Phase 302 D4.
      */
     private static final String DUPLICATE_SERVICE_PER_MASTER_409 =
-            "The service type is already assigned to THIS master (Phase 302 D4 — the conflict is "
-                    + "per-MASTER, not per-salon: another master in the same salon already offering "
-                    + "this type is NOT a conflict here, the salon's existing definition is reused "
-                    + "and this call returns 201). One active assignment per (master, service "
-                    + "type); price and duration are irrelevant. Branch on `data.code` == "
-                    + "DUPLICATE_SERVICE, never on `message`.";
+            "The same service copy (same type, same duration and same name) is already assigned "
+                    + "to THIS master (Phase 302 D4 / 465 — the conflict is per-MASTER and per copy, "
+                    + "not per-salon or per type: another master in the same salon already offering "
+                    + "this copy is NOT a conflict here, the salon's existing copy is reused and this "
+                    + "call returns 201; another copy of the type — a different duration or name — "
+                    + "is assigned as its own row). Price never participates. Branch on `data.code` "
+                    + "== DUPLICATE_SERVICE, never on `message`.";
 
     /**
      * Description attached to {@link #getSalonServiceCatalog}'s {@code @Operation} (Phase 305 D2):
@@ -614,8 +618,8 @@ public class ServiceController {
      *
      * <p>Additive: callable whether the target master's catalogue is empty or already populated.
      * The whole batch is created in one transaction (all-or-nothing). The only 409 this endpoint
-     * returns is {@code DUPLICATE_SERVICE} — a batch item whose service type the master already
-     * offers.
+     * returns is {@code DUPLICATE_SERVICE} — a batch item whose service copy (type + duration +
+     * name, phase 465) the master already offers.
      */
     @Operation(summary = "Bulk-create a salon master's services",
             description = "Creates every selected service for the given master in one "

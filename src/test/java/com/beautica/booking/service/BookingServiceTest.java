@@ -594,6 +594,23 @@ class BookingServiceTest {
     }
 
     @Test
+    @DisplayName("404 'Master service not found' when the assignment is ACTIVE but its service DEFINITION was deactivated — nothing written")
+    void should_throw404_when_masterServiceDefinitionDeactivatedButAssignmentActive() {
+        ServiceDefinition retiredDef = buildServiceDef(new BigDecimal("500.00"), 60, 0);
+        retiredDef.setActive(false);
+        MasterServiceAssignment retired = buildMsa(masterServiceId, master, retiredDef, null, null);
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
+                .thenReturn(Optional.of(retired));
+
+        assertThatThrownBy(() -> bookingService.createBooking(clientId, null, validRequest()))
+                .isInstanceOf(NotFoundException.class)
+                .hasMessage("Master service not found");
+
+        verify(bookingRepository, never()).saveAndFlush(any());
+    }
+
+    @Test
     @DisplayName("404 NotFoundException is thrown when the master exists but is inactive")
     void should_throw404_when_masterIsInactive() {
         // Arrange — build a master with isActive = false

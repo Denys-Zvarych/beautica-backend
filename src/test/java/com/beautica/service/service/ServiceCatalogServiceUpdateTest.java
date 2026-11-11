@@ -13,11 +13,14 @@ import com.beautica.service.entity.OwnerType;
 import com.beautica.service.entity.PriceType;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.entity.ServiceType;
+import com.beautica.service.repository.ActiveDuplicateProjection;
 import com.beautica.service.repository.MasterServiceRepository;
 import com.beautica.service.repository.PlatformCategoryRepository;
 import com.beautica.service.repository.ServiceRepository;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InjectMocks;
@@ -33,7 +36,9 @@ import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.catchThrowable;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -100,6 +105,10 @@ class ServiceCatalogServiceUpdateTest {
 
     @Mock
     private com.beautica.common.security.AuthorizationService authz;
+
+    // Flush-time V233 race lookup (REQUIRES_NEW); unstubbed = empty list = the fallback payload.
+    @Mock
+    private DuplicateServiceCopyLookup duplicateServiceCopyLookup;
 
     @InjectMocks
     private ServiceCatalogService serviceCatalogService;
@@ -427,7 +436,7 @@ class ServiceCatalogServiceUpdateTest {
                 .isSameAs(newType);
     }
 
-    // ── duplicate-service guard on PATCH (V121) ────────────────────────────────
+    // ── duplicate-service guard on PATCH (V233, phase 464) ────────────────────────────────
 
     @Test
     @DisplayName("throws DUPLICATE_SERVICE when a PATCH repoints the service at a type the owner already offers")
@@ -448,7 +457,7 @@ class ServiceCatalogServiceUpdateTest {
         when(serviceTypeLookup.getById(newTypeId)).thenReturn(newType);
         // The owner already has an ACTIVE service of the target type on a DIFFERENT row.
         when(serviceRepository.findActiveDuplicateId(
-                OwnerType.SALON, ownerId, newTypeId, serviceDefId))
+                OwnerType.SALON, ownerId, newTypeId, 60, "Original Name", serviceDefId))
                 .thenReturn(Optional.of(existingDefId));
 
         var request = new UpdateServiceDefinitionRequest(
@@ -485,7 +494,7 @@ class ServiceCatalogServiceUpdateTest {
         when(serviceTypeLookup.getById(sameTypeId)).thenReturn(sameType);
         // Own row excluded — the finder sees no OTHER active row of this type.
         when(serviceRepository.findActiveDuplicateId(
-                OwnerType.SALON, ownerId, sameTypeId, serviceDefId))
+                OwnerType.SALON, ownerId, sameTypeId, 60, "Original Name", serviceDefId))
                 .thenReturn(Optional.empty());
         when(serviceRepository.saveAndFlush(any(ServiceDefinition.class))).thenAnswer(inv -> inv.getArgument(0));
         when(masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId))
@@ -499,7 +508,7 @@ class ServiceCatalogServiceUpdateTest {
         // Pins that excludeId is the definition's own id — passing null here would make every
         // no-op type re-submit a false 409.
         verify(serviceRepository).findActiveDuplicateId(
-                OwnerType.SALON, ownerId, sameTypeId, serviceDefId);
+                OwnerType.SALON, ownerId, sameTypeId, 60, "Original Name", serviceDefId);
         verify(serviceRepository).saveAndFlush(any(ServiceDefinition.class));
     }
 
@@ -526,7 +535,7 @@ class ServiceCatalogServiceUpdateTest {
         when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(existing));
         when(serviceTypeLookup.getById(newTypeId)).thenReturn(hairType);
         when(serviceRepository.findActiveDuplicateId(
-                OwnerType.SALON, ownerId, newTypeId, serviceDefId))
+                OwnerType.SALON, ownerId, newTypeId, 60, "Original Name", serviceDefId))
                 .thenReturn(Optional.of(existingDefId));
 
         var request = new UpdateServiceDefinitionRequest(
@@ -554,6 +563,84 @@ class ServiceCatalogServiceUpdateTest {
     }
 
     @Test
+    @DisplayName("phase 464 — PATCH moving copy B onto copy A's duration and name → DUPLICATE_SERVICE naming A, entity untouched")
+    void should_throwDuplicateService_when_patchMovesCopyOntoAnotherCopysDurationAndName() {
+        UUID serviceDefId = UUID.randomUUID();
+        UUID ownerId = UUID.randomUUID();
+        UUID typeId = UUID.randomUUID();
+        UUID copyAId = UUID.randomUUID();
+        ServiceDefinition copyB = buildDefinition(serviceDefId, ownerId); // 60 хв, "Original Name"
+        ServiceType type = mock(ServiceType.class);
+        when(type.getId()).thenReturn(typeId);
+        when(type.getNameUk()).thenReturn("Класичний масаж");
+        copyB.setServiceType(type);
+
+        when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(copyB));
+        when(serviceRepository.findActiveDuplicateId(
+                OwnerType.SALON, ownerId, typeId, 90, "Класичний масаж A", serviceDefId))
+                .thenReturn(Optional.of(copyAId));
+
+        var request = new UpdateServiceDefinitionRequest(
+                "Класичний масаж A", null, null, 90, null, null, null, null, null, null);
+
+        assertThatThrownBy(() -> serviceCatalogService.updateServiceDefinition(ACTOR_ID, serviceDefId, request))
+                .isInstanceOf(DuplicateServiceException.class)
+                .satisfies(ex -> assertThat(((DuplicateServiceException) ex).getExistingServiceDefId())
+                        .isEqualTo(copyAId));
+
+        assertThat(copyB.getBaseDurationMinutes()).as("the guard runs before any setter").isEqualTo(60);
+        assertThat(copyB.getName()).isEqualTo("Original Name");
+        verify(serviceRepository, never()).saveAndFlush(any());
+    }
+
+    @Test
+    @DisplayName("phase 464 — PATCH with a blank name checks the type's nameUk (the name applyNamePatch will store)")
+    void should_guardWithTypeName_when_patchBlanksTheName() {
+        UUID serviceDefId = UUID.randomUUID();
+        UUID ownerId = UUID.randomUUID();
+        UUID typeId = UUID.randomUUID();
+        ServiceDefinition copy = buildDefinition(serviceDefId, ownerId);
+        ServiceType type = mock(ServiceType.class);
+        when(type.getId()).thenReturn(typeId);
+        when(type.getNameUk()).thenReturn("Класичний масаж");
+        copy.setServiceType(type);
+
+        when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(copy));
+        when(serviceRepository.saveAndFlush(any(ServiceDefinition.class))).thenAnswer(inv -> inv.getArgument(0));
+        when(masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId)).thenReturn(List.of());
+
+        var request = new UpdateServiceDefinitionRequest(
+                "   ", null, null, null, null, null, null, null, null, null);
+
+        serviceCatalogService.updateServiceDefinition(ACTOR_ID, serviceDefId, request);
+
+        verify(serviceRepository).findActiveDuplicateId(
+                OwnerType.SALON, ownerId, typeId, 60, "Класичний масаж", serviceDefId);
+        assertThat(copy.getName()).isEqualTo("Класичний масаж");
+    }
+
+    @Test
+    @DisplayName("phase 464 — a PATCH touching no key part (description/price only) never queries the guard")
+    void should_skipGuard_when_patchTouchesNoKeyPart() {
+        UUID serviceDefId = UUID.randomUUID();
+        UUID ownerId = UUID.randomUUID();
+        ServiceDefinition copy = buildDefinition(serviceDefId, ownerId);
+        ServiceType type = mock(ServiceType.class);
+        copy.setServiceType(type);
+
+        when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(copy));
+        when(serviceRepository.saveAndFlush(any(ServiceDefinition.class))).thenAnswer(inv -> inv.getArgument(0));
+        when(masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId)).thenReturn(List.of());
+
+        var request = new UpdateServiceDefinitionRequest(
+                null, "new description", null, null, null, null, null, null, null, null);
+
+        serviceCatalogService.updateServiceDefinition(ACTOR_ID, serviceDefId, request);
+
+        verify(serviceRepository, never()).findActiveDuplicateId(any(), any(), any(), anyInt(), any(), any());
+    }
+
+    @Test
     @DisplayName("translates the index violation on PATCH into DUPLICATE_SERVICE when the guard loses the race")
     void should_translateIndexViolation_onPatch_when_guardRaces() {
         UUID serviceDefId = UUID.randomUUID();
@@ -569,7 +656,7 @@ class ServiceCatalogServiceUpdateTest {
         when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(existing));
         when(serviceTypeLookup.getById(newTypeId)).thenReturn(newType);
         when(serviceRepository.findActiveDuplicateId(
-                OwnerType.SALON, ownerId, newTypeId, serviceDefId))
+                OwnerType.SALON, ownerId, newTypeId, 60, "Original Name", serviceDefId))
                 .thenReturn(Optional.empty());
         // Hibernate's STRUCTURED constraint name is what classification reads — a bare
         // DataIntegrityViolationException whose message merely mentions the index is
@@ -586,6 +673,69 @@ class ServiceCatalogServiceUpdateTest {
         // ("Request conflicts with existing data") carrying no data.code.
         assertThatThrownBy(() -> serviceCatalogService.updateServiceDefinition(ACTOR_ID, serviceDefId, request))
                 .isInstanceOf(DuplicateServiceException.class);
+    }
+
+    @Test
+    @DisplayName("PATCH race 409 names the COMMITTED winner (name + existingServiceDefId), never the patched row itself")
+    void should_fillWinnerIdAndName_onPatchRace_when_lookupFindsCommittedCopy() {
+        UUID serviceDefId = UUID.randomUUID();
+        UUID ownerId = UUID.randomUUID();
+        UUID newTypeId = UUID.randomUUID();
+        UUID winnerId = UUID.randomUUID();
+        ServiceDefinition existing = buildDefinition(serviceDefId, ownerId);
+        ServiceType newType = mock(ServiceType.class);
+        when(newType.isActive()).thenReturn(true);
+        when(newType.getPlatformCategoryName()).thenReturn("MANICURE");
+        when(newType.getId()).thenReturn(newTypeId);
+        when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(existing));
+        when(serviceTypeLookup.getById(newTypeId)).thenReturn(newType);
+        when(serviceRepository.findActiveDuplicateId(
+                OwnerType.SALON, ownerId, newTypeId, 60, "Original Name", serviceDefId))
+                .thenReturn(Optional.empty());
+        when(serviceRepository.saveAndFlush(any(ServiceDefinition.class)))
+                .thenThrow(DuplicateServiceViolations.violationOf(
+                        DuplicateServiceViolations.DUPLICATE_SERVICE_INDEX));
+        // The patched row itself comes back first (excluded), then the real winner.
+        when(duplicateServiceCopyLookup.findCommittedCopies(any(), any(), any(), any(), any()))
+                .thenReturn(List.of(
+                        new ActiveDuplicateProjection(newTypeId, serviceDefId, 60, "Original Name"),
+                        new ActiveDuplicateProjection(newTypeId, winnerId, 60, "original name")));
+        var request = new UpdateServiceDefinitionRequest(
+                null, null, null, null, null, null, null, null, null, newTypeId);
+
+        Throwable thrown = catchThrowable(
+                () -> serviceCatalogService.updateServiceDefinition(ACTOR_ID, serviceDefId, request));
+
+        assertThat(thrown).isInstanceOf(DuplicateServiceException.class);
+        DuplicateServiceException dup = (DuplicateServiceException) thrown;
+        assertThat(dup.getExistingServiceDefId()).isEqualTo(winnerId);
+        assertThat(dup.getServiceName()).isEqualTo("Original Name");
+        verify(duplicateServiceCopyLookup).findCommittedCopies(
+                org.mockito.ArgumentMatchers.eq(OwnerType.SALON), org.mockito.ArgumentMatchers.eq(ownerId),
+                any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("PATCH race on a definition with NO service type → 409 with the patched name + null id, lookup never consulted")
+    void should_throwDuplicateWithNameAndNullId_onPatchRace_when_definitionHasNoServiceType() {
+        UUID serviceDefId = UUID.randomUUID();
+        UUID ownerId = UUID.randomUUID();
+        ServiceDefinition existing = buildDefinition(serviceDefId, ownerId); // serviceType == null
+        when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(existing));
+        when(serviceRepository.saveAndFlush(any(ServiceDefinition.class)))
+                .thenThrow(DuplicateServiceViolations.violationOf(
+                        DuplicateServiceViolations.DUPLICATE_SERVICE_INDEX));
+        var request = new UpdateServiceDefinitionRequest(
+                "Renamed", null, null, null, null, null, null, null, null, null);
+
+        Throwable thrown = catchThrowable(
+                () -> serviceCatalogService.updateServiceDefinition(ACTOR_ID, serviceDefId, request));
+
+        assertThat(thrown).isInstanceOf(DuplicateServiceException.class);
+        DuplicateServiceException dup = (DuplicateServiceException) thrown;
+        assertThat(dup.getServiceName()).isEqualTo("Renamed");
+        assertThat(dup.getExistingServiceDefId()).isNull();
+        verifyNoInteractions(duplicateServiceCopyLookup);
     }
 
     @Test
@@ -887,5 +1037,62 @@ class ServiceCatalogServiceUpdateTest {
                 .extracting("status").hasToString("400 BAD_REQUEST");
 
         verify(serviceRepository, never()).saveAndFlush(any());
+    }
+
+    // ── phase 464 name ALLOW-LIST (PATCH) ─────────────────────────────────────────
+
+    @ParameterizedTest(name = "[{index}] {0}")
+    @MethodSource("com.beautica.service.service.ServiceNameCases#rejectedNames")
+    @DisplayName("phase 464 — 400 on PATCH when the new name carries a character outside the allow-list")
+    void should_throwBadRequest_when_patchNameOutsideAllowList(String codePoint, String name) {
+        UUID serviceDefId = UUID.randomUUID();
+        ServiceDefinition existing = buildDefinition(serviceDefId, UUID.randomUUID());
+        when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(existing));
+        var request = new UpdateServiceDefinitionRequest(
+                name, null, null, null, null, null, null, null, null, null);
+
+        assertThatThrownBy(() -> serviceCatalogService.updateServiceDefinition(ACTOR_ID, serviceDefId, request))
+                .isInstanceOf(BusinessException.class)
+                .hasMessage(ServiceNameCases.INVALID_NAME_MESSAGE)
+                .extracting("status").hasToString("400 BAD_REQUEST");
+
+        verify(serviceRepository, never()).saveAndFlush(any());
+    }
+
+    @ParameterizedTest(name = "[{index}] \"{0}\" -> \"{1}\"")
+    @MethodSource("com.beautica.service.service.ServiceNameCases#acceptedNames")
+    @DisplayName("phase 464 — an allow-listed PATCH name is accepted and stored canonical")
+    void should_storeCanonicalName_when_patchNameIsAllowListed(String input, String stored) {
+        UUID serviceDefId = UUID.randomUUID();
+        ServiceDefinition existing = buildDefinition(serviceDefId, UUID.randomUUID());
+        when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(existing));
+        when(serviceRepository.saveAndFlush(any(ServiceDefinition.class))).thenAnswer(inv -> inv.getArgument(0));
+        var request = new UpdateServiceDefinitionRequest(
+                input, null, null, null, null, null, null, null, null, null);
+
+        serviceCatalogService.updateServiceDefinition(ACTOR_ID, serviceDefId, request);
+
+        ArgumentCaptor<ServiceDefinition> captor = ArgumentCaptor.forClass(ServiceDefinition.class);
+        verify(serviceRepository).saveAndFlush(captor.capture());
+        assertThat(captor.getValue().getName()).isEqualTo(stored);
+    }
+
+    @Test
+    @DisplayName("phase 464 — PATCH without name succeeds on a legacy row whose stored name is outside the allow-list")
+    void should_updatePrice_when_patchOmitsNameAndStoredNameIsLegacy() {
+        UUID serviceDefId = UUID.randomUUID();
+        ServiceDefinition existing = buildDefinition(serviceDefId, UUID.randomUUID());
+        existing.setName("Манікюр \u2605 люкс");
+        when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(existing));
+        when(serviceRepository.saveAndFlush(any(ServiceDefinition.class))).thenAnswer(inv -> inv.getArgument(0));
+        var request = new UpdateServiceDefinitionRequest(
+                null, null, null, null, null, PriceType.FIXED, new BigDecimal("400.00"), null, null, null);
+
+        serviceCatalogService.updateServiceDefinition(ACTOR_ID, serviceDefId, request);
+
+        ArgumentCaptor<ServiceDefinition> captor = ArgumentCaptor.forClass(ServiceDefinition.class);
+        verify(serviceRepository).saveAndFlush(captor.capture());
+        assertThat(captor.getValue().getName()).isEqualTo("Манікюр \u2605 люкс");
+        assertThat(captor.getValue().getBasePrice()).isEqualByComparingTo("400.00");
     }
 }

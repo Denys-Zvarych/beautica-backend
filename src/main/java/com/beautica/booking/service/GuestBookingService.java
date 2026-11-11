@@ -1,5 +1,6 @@
 package com.beautica.booking.service;
 
+import com.beautica.booking.domain.ServiceBookability;
 import com.beautica.booking.domain.GuestCancelToken;
 import com.beautica.booking.dto.AvailableSlotResponse;
 import com.beautica.booking.dto.BookingLinkKind;
@@ -399,7 +400,8 @@ public class GuestBookingService {
         // exist) — this IS the service-ownership check.
         MasterServiceAssignment msa = masterServiceRepository
                 .findByMasterIdAndIdWithGraph(master.getId(), req.serviceId())
-                .filter(MasterServiceAssignment::isActive)
+                // Active assignment AND active definition (a deactivated definition does not cascade).
+                .filter(ServiceBookability::isBookable)
                 .orElseThrow(() -> new NotFoundException("Service not available for this master"));
 
         // SCHEDULE-FIT GATE (2026-08-11 HIGH) — the guest/LINK counterpart of the gate in

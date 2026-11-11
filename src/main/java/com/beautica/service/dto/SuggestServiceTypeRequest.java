@@ -7,9 +7,10 @@ import jakarta.validation.constraints.Size;
 public record SuggestServiceTypeRequest(
         @NotBlank(message = "Name is required")
         @Size(max = 255, message = "Name must be at most 255 characters")
-        // Full control-char ban (§D) — the prior narrow pattern only rejected \r\n\t
-        // but allowed NUL (0x00) and other control bytes that produce a DB 500.
-        @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "Name must not contain control characters")
+        // Phase 464 service-name allow-list on the RAW input (shared with every service-name DTO);
+        // it also bans every control character (NUL included), which the prior
+        // ^[^\\p{Cntrl}]*$ pattern existed for.
+        @Pattern(regexp = ServiceNameConstraints.NAME_REGEX, message = ServiceNameConstraints.NAME_REGEX_MESSAGE)
         String name,
 
         // System-B category-name slug, validated against platform_categories

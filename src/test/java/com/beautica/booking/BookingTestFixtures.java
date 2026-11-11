@@ -234,9 +234,10 @@ public class BookingTestFixtures {
      * Resolves a real, selectable {@code service_types.id} that {@code (ownerType, ownerId)} does
      * NOT already hold an ACTIVE {@code service_definitions} row for.
      *
-     * <p><b>Why this exists.</b> V121 added
-     * {@code ux_service_def_owner_service_type_active} — a partial UNIQUE index on
-     * {@code (owner_type, owner_id, service_type_id) WHERE is_active}. {@link
+     * <p><b>Why this exists.</b> V233 keeps
+     * {@code ux_service_def_owner_type_duration_name_active} — a partial UNIQUE index on
+     * {@code (owner_type, owner_id, service_type_id, base_duration_minutes, lower(btrim(name)))
+     * WHERE is_active} (it replaced V121's per-type index). {@link
      * #resolveServiceTypeId()} is deterministic ({@code ORDER BY st.name_uk LIMIT 1}), so every
      * definition seeded for one owner through it collided on the SAME type: the second insert for
      * a master now raises a unique violation. Seeding a multi-service owner is a legitimate,

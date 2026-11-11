@@ -30,11 +30,12 @@ import static org.assertj.core.api.Assertions.catchThrowable;
 import static org.assertj.core.api.Assertions.tuple;
 
 /**
- * Proves the V121 partial unique index {@code ux_service_def_owner_service_type_active} — one
- * ACTIVE {@link ServiceDefinition} per {@code (owner_type, owner_id, service_type_id)} — actually
- * bites at the storage layer, and that both
+ * Proves the V233 partial unique index {@code ux_service_def_owner_type_duration_name_active}
+ * (phase 464, replacing V121's per-type index) — one ACTIVE {@link ServiceDefinition} per
+ * {@code (owner_type, owner_id, service_type_id, base_duration_minutes, lower(btrim(name)))} —
+ * actually bites at the storage layer, and that both
  * {@link ServiceRepository#findActiveDuplicateId} (single-item, PATCH + create) and
- * {@link ServiceRepository#findActiveDuplicateTypeIds} (batched, bulk create) agree with it.
+ * {@link ServiceRepository#findActiveDuplicateCopies} (batched, bulk create) agree with it.
  *
  * <p>These run against real PostgreSQL (Testcontainers via {@link AbstractDataJpaTest}); an
  * in-memory DB would not evaluate the partial index at all, so the constraint must be exercised
@@ -44,7 +45,9 @@ import static org.assertj.core.api.Assertions.tuple;
  * stubs in {@code ServiceCatalogServiceBulkCreateTest} cannot prove — a stub returns whatever
  * it is told, regardless of what the JPQL {@code WHERE} clause actually says).
  */
-class ServiceDefinitionUniqueActiveTypeTest extends AbstractDataJpaTest {
+class ServiceDefinitionUniqueActiveCopyTest extends AbstractDataJpaTest {
+
+    private static final String INDEX_NAME = "ux_service_def_owner_type_duration_name_active";
 
     @Autowired
     private ServiceRepository serviceRepository;
@@ -130,23 +133,61 @@ class ServiceDefinitionUniqueActiveTypeTest extends AbstractDataJpaTest {
     }
 
     @Test
-    @DisplayName("V121 index — a second ACTIVE definition of the same type is rejected even at a different price and duration")
-    void should_rejectSecondActiveDefinition_when_sameOwnerAndServiceType() {
-        // Arrange — the owner already offers «Класичне нарощення».
+    @DisplayName("V233 index — same type + same duration + same name collides even at a different price")
+    void should_rejectSecondActiveCopy_when_sameTypeDurationAndNameDifferOnlyInPrice() {
+        // Arrange — the owner already offers «Класичне нарощення» 60 хв.
         serviceRepository.saveAndFlush(
                 definition(salonId, manicureType, "Класичне нарощення", "500.00", 60, true));
 
-        // Act + Assert — a second ACTIVE row of the same type is rejected by the index even though
-        // BOTH the price (900 vs 500) and the duration (120 vs 60) differ. That is the locked
-        // product rule: price/duration do not make it a different service.
+        // Act + Assert — price never participates (phase 464 D3).
         assertThatThrownBy(() -> serviceRepository.saveAndFlush(
-                definition(salonId, manicureType, "Класичне нарощення VIP", "900.00", 120, true)))
+                definition(salonId, manicureType, "Класичне нарощення", "900.00", 60, true)))
                 .isInstanceOf(DataIntegrityViolationException.class)
-                .hasMessageContaining("ux_service_def_owner_service_type_active");
+                .hasMessageContaining(INDEX_NAME);
     }
 
     @Test
-    @DisplayName("V121 index — the Postgres dialect populates getConstraintName() for a PARTIAL unique index (the whole DUPLICATE_SERVICE branch depends on it)")
+    @DisplayName("V233 index — a name differing only in case and surrounding spaces collides (lower(btrim(name)))")
+    void should_rejectSecondActiveCopy_when_nameDiffersOnlyInCaseAndSpaces() {
+        // Arrange
+        serviceRepository.saveAndFlush(
+                definition(salonId, manicureType, "Класичне нарощення", "500.00", 60, true));
+
+        // Act + Assert
+        assertThatThrownBy(() -> serviceRepository.saveAndFlush(
+                definition(salonId, manicureType, "  класичне НАРОЩЕННЯ ", "500.00", 60, true)))
+                .isInstanceOf(DataIntegrityViolationException.class)
+                .hasMessageContaining(INDEX_NAME);
+    }
+
+    @Test
+    @DisplayName("V233 index — the same type with a DIFFERENT base duration is a legal second copy")
+    void should_allowSecondActiveCopy_when_durationDiffers() {
+        // Arrange
+        serviceRepository.saveAndFlush(
+                definition(salonId, manicureType, "Класичне нарощення", "500.00", 60, true));
+
+        // Act + Assert
+        assertThatCode(() -> serviceRepository.saveAndFlush(
+                definition(salonId, manicureType, "Класичне нарощення", "500.00", 90, true)))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("V233 index — the same type and duration with a DIFFERENT name is a legal second copy")
+    void should_allowSecondActiveCopy_when_nameDiffers() {
+        // Arrange
+        serviceRepository.saveAndFlush(
+                definition(salonId, manicureType, "Класичне нарощення", "500.00", 60, true));
+
+        // Act + Assert
+        assertThatCode(() -> serviceRepository.saveAndFlush(
+                definition(salonId, manicureType, "Нарощення авторське", "500.00", 60, true)))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("V233 index — the Postgres dialect populates getConstraintName() for a PARTIAL unique index (the whole DUPLICATE_SERVICE branch depends on it)")
     void should_reportConstraintName_when_partialUniqueIndexViolated() {
         // Arrange
         serviceRepository.saveAndFlush(
@@ -154,7 +195,7 @@ class ServiceDefinitionUniqueActiveTypeTest extends AbstractDataJpaTest {
 
         // Act
         Throwable thrown = catchThrowable(() -> serviceRepository.saveAndFlush(
-                definition(salonId, manicureType, "Класичне нарощення VIP", "900.00", 120, true)));
+                definition(salonId, manicureType, "Класичне нарощення", "900.00", 60, true)));
 
         // Assert — ServiceCatalogService.isDuplicateServiceViolation matches ONLY on the structured
         // getConstraintName(), so the whole DUPLICATE_SERVICE branch hangs on the Postgres dialect
@@ -164,7 +205,7 @@ class ServiceDefinitionUniqueActiveTypeTest extends AbstractDataJpaTest {
         // duplicate race would silently degrade to a generic 409 with no `data.code` — the mobile
         // add-service screen would lose its branch — with all other tests still green.
         assertThat(thrown).isInstanceOf(DataIntegrityViolationException.class);
-        assertThat(constraintNameOf(thrown)).isEqualTo("ux_service_def_owner_service_type_active");
+        assertThat(constraintNameOf(thrown)).isEqualTo(INDEX_NAME);
     }
 
     /** Mirrors the production cause-walk in {@code isDuplicateServiceViolation}. */
@@ -178,7 +219,7 @@ class ServiceDefinitionUniqueActiveTypeTest extends AbstractDataJpaTest {
     }
 
     @Test
-    @DisplayName("V121 index — partial on is_active, so a soft-deleted service stays re-creatable")
+    @DisplayName("V233 index — partial on is_active, so a soft-deleted service stays re-creatable")
     void should_allowRecreation_when_previousDefinitionWasSoftDeleted() {
         // Arrange — the owner had this service and deleted it (soft delete flips is_active).
         ServiceDefinition first = serviceRepository.saveAndFlush(
@@ -195,7 +236,7 @@ class ServiceDefinitionUniqueActiveTypeTest extends AbstractDataJpaTest {
     }
 
     @Test
-    @DisplayName("V121 index — scoped per owner: two providers may both offer the same service type")
+    @DisplayName("V233 index — scoped per owner: two providers may both offer the same service type")
     void should_allowSameServiceType_when_ownerIsDifferent() {
         // Arrange
         serviceRepository.saveAndFlush(
@@ -209,7 +250,7 @@ class ServiceDefinitionUniqueActiveTypeTest extends AbstractDataJpaTest {
     }
 
     @Test
-    @DisplayName("V121 index — scoped per owner_type too: the same UUID may be an active SALON owner and an active INDEPENDENT_MASTER owner")
+    @DisplayName("V233 index — scoped per owner_type too: the same UUID may be an active SALON owner and an active INDEPENDENT_MASTER owner")
     void should_allowSameOwnerId_when_ownerTypeDiffers() {
         // Arrange — a SALON offers «Класичне нарощення» under ownerId = salonId.
         serviceRepository.saveAndFlush(
@@ -237,10 +278,43 @@ class ServiceDefinitionUniqueActiveTypeTest extends AbstractDataJpaTest {
 
         // Act
         Optional<UUID> found = serviceRepository.findActiveDuplicateId(
-                OwnerType.SALON, salonId, manicureType.getId(), null);
+                OwnerType.SALON, salonId, manicureType.getId(), 60, "Класичне нарощення", null);
 
         // Assert
         assertThat(found).contains(existing.getId());
+    }
+
+    @Test
+    @DisplayName("findActiveDuplicateId — compares the name lower(trim(...)) on both sides, like the index")
+    void should_returnExistingId_when_probeNameDiffersOnlyInCaseAndSpaces() {
+        // Arrange
+        ServiceDefinition existing = serviceRepository.saveAndFlush(
+                definition(salonId, manicureType, "Класичне нарощення", "500.00", 60, true));
+
+        // Act
+        Optional<UUID> found = serviceRepository.findActiveDuplicateId(
+                OwnerType.SALON, salonId, manicureType.getId(), 60, " класичне НАРОЩЕННЯ  ", null);
+
+        // Assert
+        assertThat(found).contains(existing.getId());
+    }
+
+    @Test
+    @DisplayName("findActiveDuplicateId — a different duration or a different name is not a duplicate")
+    void should_returnEmpty_when_durationOrNameDiffers() {
+        // Arrange
+        serviceRepository.saveAndFlush(
+                definition(salonId, manicureType, "Класичне нарощення", "500.00", 60, true));
+
+        // Act
+        Optional<UUID> otherDuration = serviceRepository.findActiveDuplicateId(
+                OwnerType.SALON, salonId, manicureType.getId(), 90, "Класичне нарощення", null);
+        Optional<UUID> otherName = serviceRepository.findActiveDuplicateId(
+                OwnerType.SALON, salonId, manicureType.getId(), 60, "Нарощення авторське", null);
+
+        // Assert
+        assertThat(otherDuration).isEmpty();
+        assertThat(otherName).isEmpty();
     }
 
     @Test
@@ -252,7 +326,7 @@ class ServiceDefinitionUniqueActiveTypeTest extends AbstractDataJpaTest {
 
         // Act
         Optional<UUID> found = serviceRepository.findActiveDuplicateId(
-                OwnerType.SALON, salonId, manicureType.getId(), existing.getId());
+                OwnerType.SALON, salonId, manicureType.getId(), 60, "Класичне нарощення", existing.getId());
 
         // Assert
         assertThat(found).isEmpty();
@@ -270,7 +344,7 @@ class ServiceDefinitionUniqueActiveTypeTest extends AbstractDataJpaTest {
 
         // Act
         Optional<UUID> found = serviceRepository.findActiveDuplicateId(
-                OwnerType.SALON, salonId, manicureType.getId(), null);
+                OwnerType.SALON, salonId, manicureType.getId(), 60, "Класичне нарощення", null);
 
         // Assert
         assertThat(found).isEmpty();
@@ -286,7 +360,7 @@ class ServiceDefinitionUniqueActiveTypeTest extends AbstractDataJpaTest {
 
         // Act — probing for a SALON duplicate at the exact same (ownerId, serviceTypeId).
         Optional<UUID> found = serviceRepository.findActiveDuplicateId(
-                OwnerType.SALON, salonId, manicureType.getId(), null);
+                OwnerType.SALON, salonId, manicureType.getId(), 60, "Класичне нарощення", null);
 
         // Assert — the finder must mirror the index's full key, including owner_type. If
         // `sd.ownerType = :ownerType` were dropped from the JPQL WHERE clause, this would return
@@ -296,7 +370,7 @@ class ServiceDefinitionUniqueActiveTypeTest extends AbstractDataJpaTest {
     }
 
     @Test
-    @DisplayName("findActiveDuplicateTypeIds — owner scoping keeps a foreign provider’s definition id out of the 409 payload")
+    @DisplayName("findActiveDuplicateCopies — owner scoping keeps a foreign provider’s definition id out of the 409 payload")
     void should_excludeOtherOwners_when_batchResolvingDuplicates() {
         // Arrange — the SAME service type is offered actively by two different owners.
         ServiceDefinition ownedDefinition = serviceRepository.saveAndFlush(
@@ -305,8 +379,9 @@ class ServiceDefinitionUniqueActiveTypeTest extends AbstractDataJpaTest {
                 UUID.randomUUID(), manicureType, "Класичне нарощення", "700.00", 60, true));
 
         // Act
-        List<ActiveDuplicateProjection> found = serviceRepository.findActiveDuplicateTypeIds(
-                OwnerType.SALON, salonId, List.of(manicureType.getId()));
+        List<ActiveDuplicateProjection> found = serviceRepository.findActiveDuplicateCopies(
+                OwnerType.SALON.name(), salonId, new UUID[] {manicureType.getId()},
+                new Integer[] {60}, new String[] {"Класичне нарощення"});
 
         // Assert — owner scoping is this finder's security-critical property: it is unscoped by
         // convention (§E-4) only in the sense that the CALLER must prove write access; the owner
@@ -320,7 +395,7 @@ class ServiceDefinitionUniqueActiveTypeTest extends AbstractDataJpaTest {
     }
 
     @Test
-    @DisplayName("findActiveDuplicateTypeIds — returns only ACTIVE owned rows, each type paired with its own definition id")
+    @DisplayName("findActiveDuplicateCopies — returns only ACTIVE owned rows, each type paired with its own definition id")
     void should_returnOnlyActiveOwnedPairs_when_batchResolvingMixedRows() {
         // Arrange — one owner with two active types + one soft-deleted type, plus a foreign owner
         // holding one of the same types. Only the two active owned rows may come back, correctly
@@ -344,9 +419,11 @@ class ServiceDefinitionUniqueActiveTypeTest extends AbstractDataJpaTest {
         em.clear();
 
         // Act
-        List<ActiveDuplicateProjection> found = serviceRepository.findActiveDuplicateTypeIds(
-                OwnerType.SALON, salonId,
-                List.of(manicureType.getId(), pedicureType.getId(), spaType.getId()));
+        List<ActiveDuplicateProjection> found = serviceRepository.findActiveDuplicateCopies(
+                OwnerType.SALON.name(), salonId,
+                new UUID[] {manicureType.getId(), pedicureType.getId(), spaType.getId()},
+                new Integer[] {60, 90, 120},
+                new String[] {"Класичне нарощення", "Педикюр", "СПА-догляд"});
 
         // Assert — row order is unspecified, hence containsExactlyInAnyOrder.
         assertThat(found)
@@ -355,5 +432,33 @@ class ServiceDefinitionUniqueActiveTypeTest extends AbstractDataJpaTest {
                 .containsExactlyInAnyOrder(
                         tuple(manicureType.getId(), activeManicure.getId()),
                         tuple(pedicureType.getId(), activePedicure.getId()));
+    }
+
+    @Test
+    @DisplayName("findActiveDuplicateCopies — matches the zipped (type, duration, name) tuple per item, never the cross product")
+    void should_matchOnlyZippedTuples_when_batchHoldsSeveralCopiesOfOneType() {
+        // Arrange — the owner holds «Класичне нарощення» at 60 only.
+        ServiceDefinition held60 = serviceRepository.saveAndFlush(
+                definition(salonId, manicureType, "Класичне нарощення", "500.00", 60, true));
+
+        // Act — item A (60, other name) and item B (90, same name): each differs from the held
+        // copy in one key part, but three independent IN lists would match (60 from A, name from B).
+        List<ActiveDuplicateProjection> crossOnly = serviceRepository.findActiveDuplicateCopies(
+                OwnerType.SALON.name(), salonId,
+                new UUID[] {manicureType.getId(), manicureType.getId()},
+                new Integer[] {60, 90},
+                new String[] {"Нарощення авторське", "Класичне нарощення"});
+        List<ActiveDuplicateProjection> exact = serviceRepository.findActiveDuplicateCopies(
+                OwnerType.SALON.name(), salonId,
+                new UUID[] {manicureType.getId(), manicureType.getId()},
+                new Integer[] {120, 60},
+                new String[] {"Класичне нарощення", " класичне НАРОЩЕННЯ "});
+
+        // Assert
+        assertThat(crossOnly).isEmpty();
+        assertThat(exact)
+                .extracting(ActiveDuplicateProjection::serviceTypeId,
+                        ActiveDuplicateProjection::serviceDefinitionId)
+                .containsExactly(tuple(manicureType.getId(), held60.getId()));
     }
 }
