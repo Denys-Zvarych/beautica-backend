@@ -49,6 +49,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Collectors;
@@ -360,13 +361,11 @@ public class AppointmentTransitionService {
      * redundant {@code master-service-bookable}/{@code master-bookable-days} prefix scans collapsed
      * into the ONE scan {@code MasterScheduleService#upsertOverride} already runs for the write).
      *
-     * <p><b>No notification is ever enqueued by this method (D6, 2026-07-26 product decision
-     * reversal).</b> Unlike {@link #declineAppointmentItem}, which always enqueues a status-changed
-     * notification per decline, THIS method is only ever called by the schedule-override-conflict
-     * write path, and that path enqueues nothing at all: the client discovers the cancellation from
-     * the booking's status alone, and notifying for this flow is deferred to a later phase. This is a
-     * deliberate, permanent property of this method — do not "fix" it back by re-adding an
-     * {@code outboxService.enqueueStatusChanged} call here.
+     * <p><b>No notification is enqueued by this method itself.</b> Its schedule-override-conflict
+     * caller notifies ONCE PER VISIT afterwards through {@link #enqueueVisitItemsDeclineOutbox}
+     * (phase 474 — reverses the 2026-07-26 D6 "override declines notify nobody"); the salon-closure /
+     * master-removal cascades reaching the shared core enqueue their own per-visit notice. Keeping
+     * the notify step out of the core is what lets every caller pick its own per-visit grouping.
      *
      * <p><b>Batched freshness re-check (G3, HIGH, cycle-7 audit 2026-08-03 — fixed here).</b> This
      * method has no per-endpoint self-racer ({@code ScheduleOverrideConflictService} is its only
@@ -413,19 +412,30 @@ public class AppointmentTransitionService {
      * @return the SURVIVING targeted items, now DECLINED, in {@code bookingIds} order — may be a
      *         strict subset of {@code bookingIds} (never a superset) if any target raced to a
      *         terminal state between this method's unlocked load and its post-lock recheck; empty if
-     *         every target did
+     *         every target did — plus whether the visit has no CONFIRMED item left (phase 474
+     *         audit-fix: derived from the post-lock recheck already run here, so the override caller's
+     *         per-visit notice needs no second {@code findConfirmedIdsByAppointmentId} probe)
      * @throws ForbiddenException the actor lacks provider authority over the visit (403)
      * @throws NotFoundException  a {@code bookingId} is not a child of this appointment (404)
      * @throws BusinessException  a target child was not CONFIRMED at the initial, unlocked check —
      *                            already terminal at load time, before any race window opened (409)
      */
-    List<Booking> declineAppointmentItems(
+    VisitItemsDecline declineAppointmentItems(
             UUID actorId, UUID appointmentId, List<UUID> bookingIds, AppointmentProviderNoteRequest req,
             boolean evictAfterCommit) {
         // Same projection-only, authz-before-any-load ordering as declineAppointmentItem (cycle-4
         // audit finding 2) — never an entity load before authorization has already succeeded.
         authz.enforceCanManageAppointment(actorId, appointmentId);
         return declineAppointmentItemsAfterAuth(appointmentId, bookingIds, req, evictAfterCommit);
+    }
+
+    /**
+     * {@link #declineAppointmentItems(UUID, UUID, List, AppointmentProviderNoteRequest, boolean)}'s result
+     * (phase 474 audit-fix): the declined survivors, plus {@code wholeVisitDeclined} — {@code true} when no item
+     * of the visit is still CONFIRMED after this decline, i.e. exactly when the header collapsed to
+     * {@code DECLINED}. Computed from the post-header-lock recheck, so it costs no statement.
+     */
+    record VisitItemsDecline(UUID appointmentId, List<Booking> declined, boolean wholeVisitDeclined) {
     }
 
     /**
@@ -448,7 +458,7 @@ public class AppointmentTransitionService {
             UUID actorId, UUID appointmentId, List<UUID> bookingIds, AppointmentProviderNoteRequest req,
             boolean evictAfterCommit, Map<AuthorizationService.MemoKey, Boolean> managementAccessMemo) {
         authz.enforceCanManageAppointment(actorId, appointmentId, managementAccessMemo);
-        return declineAppointmentItemsAfterAuth(appointmentId, bookingIds, req, evictAfterCommit);
+        return declineAppointmentItemsAfterAuth(appointmentId, bookingIds, req, evictAfterCommit).declined();
     }
 
     /**
@@ -478,7 +488,7 @@ public class AppointmentTransitionService {
     List<Booking> declineAppointmentItems(
             UUID appointmentId, List<UUID> bookingIds, AppointmentProviderNoteRequest req,
             boolean evictAfterCommit) {
-        return declineAppointmentItemsAfterAuth(appointmentId, bookingIds, req, evictAfterCommit);
+        return declineAppointmentItemsAfterAuth(appointmentId, bookingIds, req, evictAfterCommit).declined();
     }
 
     /**
@@ -486,7 +496,7 @@ public class AppointmentTransitionService {
      * AppointmentProviderNoteRequest, boolean)} overloads (perf finding 2, 2026-09 re-audit split)
      * — everything the original single method did AFTER its authorization check, unchanged.
      */
-    private List<Booking> declineAppointmentItemsAfterAuth(
+    private VisitItemsDecline declineAppointmentItemsAfterAuth(
             UUID appointmentId, List<UUID> bookingIds, AppointmentProviderNoteRequest req,
             boolean evictAfterCommit) {
         List<Booking> items = loadItemsOrThrow(appointmentId);
@@ -537,8 +547,8 @@ public class AppointmentTransitionService {
         collapseHeaderAfterItemTransition(
                 appointmentId, headerWasLocked, BookingStatus.DECLINED, CancellationReason.PROVIDER_UNAVAILABLE, null);
 
-        // No outboxService.enqueueStatusChanged loop here — see this method's own javadoc (D6): the
-        // schedule-override-conflict write path this method exists for enqueues no notification at all.
+        // No notification here — see this method's own javadoc: every caller enqueues its own
+        // per-visit notice (the override path via enqueueVisitItemsDeclineOutbox, phase 474).
 
         // Guard against the now-possible empty list (every target raced away — see "Batched
         // freshness re-check" above): registerEviction indexes items.get(0) unconditionally and would
@@ -546,7 +556,50 @@ public class AppointmentTransitionService {
         if (evictAfterCommit && !targets.isEmpty()) {
             registerEviction(targets, null);
         }
-        return targets;
+        // Under the header lock nothing else can move a sibling, so "every still-CONFIRMED item was just
+        // declined" is exactly the collapse condition above — no second findConfirmedIdsByAppointmentId.
+        Set<UUID> declinedIds = targets.stream().map(Booking::getId).collect(Collectors.toSet());
+        boolean wholeVisitDeclined = declinedIds.containsAll(stillConfirmedIds);
+        return new VisitItemsDecline(appointmentId, targets, wholeVisitDeclined);
+    }
+
+    /**
+     * Phase 474 (SCH-37 / NTF-40, D4) — the provider-decline OUTBOX rows for ONE visit whose items were
+     * declined in the same write by {@link #declineAppointmentItems}: exactly one notice per visit, through the
+     * SAME calls the interactive decline paths make, never a parallel notifier. Returns the visit's in-app
+     * {@code BOOKING_DECLINED} target; the override caller writes every visit's target in ONE statement
+     * ({@code InAppNotificationService#notifyBookingEventsBulk}, audit-fix finding 1) after queuing every
+     * outbox row, so the outbox INSERTs JDBC-batch instead of being flushed per visit (finding 3).
+     *
+     * <ul>
+     *   <li><b>Whole visit gone</b> ({@link VisitItemsDecline#wholeVisitDeclined()} — the header collapsed to
+     *       {@code DECLINED}): the {@link #declineAppointment} set — {@code STATUS_CHANGED} +
+     *       {@code MASTER_BOOKING_DECLINED} on the visit's representative, in-app target visit-keyed (the
+     *       {@code notifyVisitEvent} row). The drain then names the whole visit (e-mail) or sends the guest
+     *       one GST-41 SMS/Telegram for the visit start.</li>
+     *   <li><b>Partial</b> (≥1 sibling still CONFIRMED): the {@link #declineAppointmentItem} set on the
+     *       representative, in-app target booking-keyed (the {@code notifyBookingEvent} row) — one per visit,
+     *       not per declined item (D4).</li>
+     * </ul>
+     *
+     * <p>The representative is the earliest declined item (ties on id), so a re-run is deterministic.
+     * A registered client gets feed + push + e-mail only — SMS/Telegram is the drain's guest-only
+     * ({@code client == null}) branch (NTF-D04). An empty {@code declined} list (every target raced
+     * away) enqueues nothing and returns empty. Issues no read. Must run inside the caller's transaction.
+     */
+    Optional<InAppNotificationService.BookingEventTarget> enqueueVisitItemsDeclineOutbox(
+            VisitItemsDecline decline, UUID actorId) {
+        if (decline.declined().isEmpty()) {
+            return Optional.empty();
+        }
+        Booking representative = decline.declined().stream()
+                .min(Comparator.comparing(Booking::getStartsAt).thenComparing(Booking::getId))
+                .orElseThrow();
+        outboxService.enqueueStatusChanged(representative.getId());
+        outboxService.enqueueMasterBookingDeclined(representative.getId(), masterUserIdOf(representative), actorId);
+        return Optional.of(decline.wholeVisitDeclined()
+                ? InAppNotificationService.BookingEventTarget.forVisit(decline.appointmentId(), representative)
+                : InAppNotificationService.BookingEventTarget.forBooking(representative));
     }
 
     /**

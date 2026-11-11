@@ -97,6 +97,7 @@ import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
 @ExtendWith(MockitoExtension.class)
@@ -1014,9 +1015,8 @@ class BookingServiceTest {
     }
 
     @Test
-    @DisplayName("declineBookingForBatch never enqueues a notification (D6, 2026-07-26 product decision "
-            + "reversal) — the schedule-override-conflict path this method exists for tells the client "
-            + "nothing beyond the booking's own status")
+    @DisplayName("declineBookingForBatch itself enqueues no notification — its override caller notifies once after "
+            + "the whole decline loop via enqueueProviderDeclineOutbox + one bulk in-app write (phase 474)")
     void should_notEnqueueNotification_when_declineBookingForBatchCalled() {
         UUID actorId = UUID.randomUUID();
         Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
@@ -1058,6 +1058,80 @@ class BookingServiceTest {
 
         assertThatThrownBy(() -> bookingService.declineBookingForBatch(actorId, bookingId, req))
                 .isInstanceOf(ForbiddenException.class);
+    }
+
+    // ── enqueueProviderDeclineNotifications (phase 474 — SCH-37 / NTF-40) ──────────────────────
+
+    @Test
+    @DisplayName("enqueueProviderDeclineNotifications — STATUS_CHANGED, MASTER_BOOKING_DECLINED (performing master's "
+            + "user) and the in-app BOOKING_DECLINED, from the passed graph without reloading the booking")
+    void should_enqueueProviderDeclineSet_when_enqueueProviderDeclineNotificationsCalled() {
+        UUID actorId = UUID.randomUUID();
+        User masterUser = buildUser(UUID.randomUUID(), Role.SALON_MASTER);
+        Master performing = Master.builder().user(masterUser).masterType(MasterType.SALON_MASTER).isActive(true).build();
+        setField(performing, "id", UUID.randomUUID());
+        Booking booking = buildBooking(bookingId, client, performing, msa, BookingStatus.DECLINED);
+
+        bookingService.enqueueProviderDeclineNotifications(booking, actorId);
+
+        verify(outboxService).enqueueStatusChanged(bookingId);
+        verify(outboxService).enqueueMasterBookingDeclined(bookingId, masterUser.getId(), actorId);
+        verify(inAppNotificationService).notifyBookingEvent(InAppNotificationType.BOOKING_DECLINED, booking, actorId);
+        verify(bookingRepository, never()).findByIdWithFullGraph(any());
+        verifyNoInteractions(slotCalculationService);
+    }
+
+    @Test
+    @DisplayName("enqueueProviderDeclineNotifications — a master with no user account passes a null master user "
+            + "(the outbox then skips the master row) without failing")
+    void should_passNullMasterUser_when_performingMasterHasNoAccount() {
+        UUID actorId = UUID.randomUUID();
+        Master accountless = Master.builder().masterType(MasterType.SALON_MASTER).isActive(true).build();
+        setField(accountless, "id", UUID.randomUUID());
+        Booking booking = buildBooking(bookingId, client, accountless, msa, BookingStatus.DECLINED);
+
+        bookingService.enqueueProviderDeclineNotifications(booking, actorId);
+
+        verify(outboxService).enqueueMasterBookingDeclined(bookingId, null, actorId);
+        verify(outboxService).enqueueStatusChanged(bookingId);
+    }
+
+    @Test
+    @DisplayName("enqueueProviderDeclineOutbox (phase 474 audit-fix) — the SAME two outbox rows, and NO in-app write "
+            + "(the override caller writes every feed row in one bulk statement)")
+    void should_enqueueOutboxRowsOnly_when_enqueueProviderDeclineOutboxCalled() {
+        UUID actorId = UUID.randomUUID();
+        User masterUser = buildUser(UUID.randomUUID(), Role.SALON_MASTER);
+        Master performing = Master.builder().user(masterUser).masterType(MasterType.SALON_MASTER).isActive(true).build();
+        setField(performing, "id", UUID.randomUUID());
+        Booking booking = buildBooking(bookingId, client, performing, msa, BookingStatus.DECLINED);
+
+        bookingService.enqueueProviderDeclineOutbox(booking, actorId);
+
+        verify(outboxService).enqueueStatusChanged(bookingId);
+        verify(outboxService).enqueueMasterBookingDeclined(bookingId, masterUser.getId(), actorId);
+        verifyNoMoreInteractions(outboxService);
+        verifyNoInteractions(inAppNotificationService);
+        verify(bookingRepository, never()).findByIdWithFullGraph(any());
+    }
+
+    @Test
+    @DisplayName("parity — declineBooking (PATCH /decline) enqueues exactly the set enqueueProviderDeclineNotifications "
+            + "does, in the same order")
+    void should_enqueueSameSetAsHelper_when_declineBookingCalled() {
+        UUID actorId = UUID.randomUUID();
+        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        when(bookingRepository.save(any())).thenReturn(booking);
+
+        bookingService.declineBooking(actorId, bookingId,
+                new StatusUpdateRequest(CancellationReason.PROVIDER_UNAVAILABLE, null));
+
+        var ordered = inOrder(outboxService, inAppNotificationService);
+        ordered.verify(outboxService).enqueueStatusChanged(bookingId);
+        ordered.verify(outboxService).enqueueMasterBookingDeclined(bookingId, client.getId(), actorId);
+        ordered.verify(inAppNotificationService)
+                .notifyBookingEvent(InAppNotificationType.BOOKING_DECLINED, booking, actorId);
     }
 
     // ── declineFutureConfirmedBookingsForSalonClosure (Phase 269/293 cascade — security finding 4,

@@ -1977,14 +1977,7 @@ public class BookingService {
     @Transactional
     public BookingResponse declineBooking(UUID actorUserId, UUID bookingId, StatusUpdateRequest req) {
         Booking saved = declineBookingCore(actorUserId, bookingId, req);
-        outboxService.enqueueStatusChanged(saved.getId());
-        // Phase 431 — the performing master's e-mail is its OWN row (own retry state), skipped when
-        // the master declined it themselves.
-        outboxService.enqueueMasterBookingDeclined(saved.getId(), masterUserIdOf(saved), actorUserId);
-        // Phase 333, matrix row 3 — client (if registered) + performing master unless actor. `saved`
-        // is already the full graph loaded by declineBookingCore (audit-fix cycle 1, finding 1) —
-        // never reloaded here.
-        inAppNotificationService.notifyBookingEvent(InAppNotificationType.BOOKING_DECLINED, saved, actorUserId);
+        enqueueProviderDeclineNotifications(saved, actorUserId);
         registerSlotEviction(saved.getMaster().getId(), salonIdOf(saved));
         evictMasterCalendarAfterCommit(saved.getMaster().getId());
         return BookingResponse.from(saved, resolveNow());
@@ -2001,11 +1994,10 @@ public class BookingService {
      *       ONE combined eviction itself after the whole decline loop instead of one
      *       {@code registerSlotEviction} + {@code evictMasterCalendarAfterCommit} pair PER declined
      *       booking, all for the same master;</li>
-     *   <li>the {@code outboxService.enqueueStatusChanged} notification call — a booking declined via
-     *       a schedule-override conflict enqueues NOTHING (D6, 2026-07-26 product decision reversal):
-     *       the client discovers the cancellation from the booking's status alone, and notifying for
-     *       this flow is deferred to a later phase. This is a deliberate, permanent property of THIS
-     *       method, not an oversight — do not "fix" it back by re-adding the enqueue call here.</li>
+     *   <li>its notification calls — the batch caller enqueues them itself, after the whole decline
+     *       loop, through {@link #enqueueProviderDeclineOutbox} plus one bulk in-app write (phase 474 reversed the
+     *       2026-07-26 D6 "override declines notify nobody" decision; the notify step stays OUT of this
+     *       method so the caller controls ordering and per-visit grouping).</li>
      * </ul>
      *
      * <p>Package-private: both callers live in this same package —
@@ -2017,6 +2009,43 @@ public class BookingService {
      */
     Booking declineBookingForBatch(UUID actorUserId, UUID bookingId, StatusUpdateRequest req) {
         return declineBookingCore(actorUserId, bookingId, req);
+    }
+
+    /**
+     * The notifications of a provider decline of ONE standalone booking — the exact set
+     * {@link #declineBooking} enqueues, extracted so the schedule-override-conflict path (phase 474,
+     * SCH-37 / NTF-40) notifies through the SAME calls rather than a parallel notifier:
+     * <ul>
+     *   <li>{@code STATUS_CHANGED} outbox row — the drain e-mails a registered client, and sends a
+     *       guest (LINK, or STAFF walk-in with a phone) the fixed GST-41 cancellation SMS/Telegram. A
+     *       registered client never gets SMS or Telegram (NTF-D04) — the drain's guest branch is gated
+     *       on {@code client == null};</li>
+     *   <li>{@code MASTER_BOOKING_DECLINED} row — the performing master's e-mail (phase 431), skipped
+     *       when the master is the actor;</li>
+     *   <li>in-app {@code BOOKING_DECLINED} (feed + push) — client (if registered) + performing
+     *       master unless actor (phase 333, matrix row 3).</li>
+     * </ul>
+     * Must run inside the caller's transaction (the in-app seam is {@code MANDATORY}). {@code saved}
+     * must be the full graph {@link #declineBookingCore} returns — never reloaded here.
+     */
+    void enqueueProviderDeclineNotifications(Booking saved, UUID actorUserId) {
+        enqueueProviderDeclineOutbox(saved, actorUserId);
+        // Phase 333, matrix row 3 — client (if registered) + performing master unless actor.
+        inAppNotificationService.notifyBookingEvent(InAppNotificationType.BOOKING_DECLINED, saved, actorUserId);
+    }
+
+    /**
+     * The two outbox rows of {@link #enqueueProviderDeclineNotifications}, without its in-app write — for the
+     * schedule-override mass decline (phase 474 audit-fix), which queues every outbox row first and then writes
+     * ALL the in-app {@code BOOKING_DECLINED} rows in ONE statement
+     * ({@code InAppNotificationService#notifyBookingEventsBulk} with
+     * {@code BookingEventTarget.forBooking(saved)} — the identical rows {@code notifyBookingEvent} writes).
+     */
+    void enqueueProviderDeclineOutbox(Booking saved, UUID actorUserId) {
+        outboxService.enqueueStatusChanged(saved.getId());
+        // Phase 431 — the performing master's e-mail is its OWN row (own retry state), skipped when
+        // the master declined it themselves.
+        outboxService.enqueueMasterBookingDeclined(saved.getId(), masterUserIdOf(saved), actorUserId);
     }
 
     /**
@@ -3093,7 +3122,8 @@ public class BookingService {
         booking.setCancellationReason(req.cancellationReason());
         booking.setProviderComment(BookingComments.normalize(req.comment()));
         // Notification enqueue is NOT here — see this method's own javadoc: it is the caller's
-        // responsibility (declineBooking always enqueues; declineBookingForBatch never does, D6).
+        // responsibility (declineBooking enqueues inline; the override batch caller enqueues after its loop via
+        // enqueueProviderDeclineOutbox + one bulk in-app write, phase 474).
         return bookingRepository.save(booking);
     }
 

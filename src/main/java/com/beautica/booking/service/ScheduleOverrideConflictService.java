@@ -2,6 +2,7 @@ package com.beautica.booking.service;
 
 import com.beautica.booking.dto.AppointmentProviderNoteRequest;
 import com.beautica.booking.dto.StatusUpdateRequest;
+import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.CancellationReason;
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.booking.repository.OverrideConflictCandidate;
@@ -19,6 +20,9 @@ import com.beautica.master.entity.WeekdayMode;
 import com.beautica.master.service.MasterScheduleService;
 import com.beautica.master.service.ScheduleConflictCalculator;
 import com.beautica.master.service.ScheduleDateMath;
+import com.beautica.notification.inapp.entity.InAppNotificationType;
+import com.beautica.notification.inapp.service.InAppNotificationService;
+import com.beautica.notification.inapp.service.InAppNotificationService.BookingEventTarget;
 import com.github.benmanes.caffeine.cache.LoadingCache;
 import io.github.bucket4j.Bucket;
 import lombok.RequiredArgsConstructor;
@@ -98,15 +102,13 @@ public class ScheduleOverrideConflictService {
      * compromised SALON_OWNER looping a DAY_OFF override to mass-cancel every booking they own in one
      * write).
      *
-     * <p><b>2026-07-26 product decision reversal (D6) — no longer an SMS/notification concern.</b>
-     * This bound predates D6: it used to also guard against fanning an attacker-authored
-     * {@code providerComment} out to every guest phone number on file (this class charged a
-     * proportional rate-limit token per conflict for exactly that reason). Neither applies anymore —
-     * an override-driven decline carries no note and enqueues no notification at all (see
-     * {@link ScheduleOverrideRequest}'s class javadoc), so this route no longer has an outbound-
-     * message abuse vector to bound. The cap is kept regardless: 100 uninvited, unexplained booking
-     * cancellations in one request is still worth rejecting as almost certainly a bug or an abusive
-     * account, independent of whether anyone is notified.
+     * <p><b>Also bounds outbound messages (phase 474, D3).</b> Every declined booking is notified
+     * exactly like a provider decline (one notice per visit — registered client feed + push + e-mail,
+     * guest fixed-text GST-41 SMS/Telegram), so this cap is also the per-write ceiling on guest
+     * messages. The copy is fixed (no note — SCH-D07), a booking can be declined only once (terminal),
+     * and the aggregate decline budget ({@code RateLimitConfig#scheduleOverrideDeclineBudgetCapacity})
+     * and the booking-SMS gate (NTF-18) still apply on top. Per-guest limits differ by source: walk-in
+     * guests: per-phone + per-visit budget; LINK guests: OTP-verified, one message per booking.
      *
      * <p>{@code public} (not {@code private}) for two reasons: {@code ScheduleOverrideConflictServiceTest}
      * pins the CRITICAL "aggregate decline-budget capacity must exceed this constant" invariant
@@ -159,6 +161,7 @@ public class ScheduleOverrideConflictService {
     private final BookingService bookingService;
     private final AppointmentTransitionService appointmentTransitionService;
     private final MasterScheduleService masterScheduleService;
+    private final InAppNotificationService inAppNotificationService;
     private final MasterCachePrefixEvictor cachePrefixEvictor;
     private final ScheduleDateMath dateMath;
     private final Clock clock;
@@ -299,14 +302,12 @@ public class ScheduleOverrideConflictService {
                                     .formatted(conflicts.size()));
         }
 
-        // 2026-07-26 product decision reversal (D6) — this write's per-request rate-limit exposure is
-        // the ordinary destructive-bulk-write concern (see RateLimitConfig#scheduleOverrideWriteBuckets
-        // and BookingRateLimitFilter), enforced entirely in the filter BEFORE this method ever runs.
-        // There used to be an additional, proportional charge here (one extra token per booking about
-        // to be declined, from the SAME bucket PATCH .../decline uses) because a mass-decline could
-        // fan an attacker-authored providerComment out to real guest phone numbers as SMS — that SMS
-        // vector no longer exists: an override-driven decline carries no note and dispatches no
-        // notification at all (D6). Removed along with BookingDeclineRateLimiter.
+        // This write's per-request rate-limit exposure is the ordinary destructive-bulk-write concern
+        // (see RateLimitConfig#scheduleOverrideWriteBuckets and BookingRateLimitFilter), enforced in the
+        // filter BEFORE this method runs. Phase 474 notifies every declined visit (fixed copy, no note —
+        // the guest SMS carries no provider free text), bounded by MAX_CONFLICTS_PER_WRITE and the
+        // decline budget below plus the SMS gate at drain time (walk-in guests: per-phone + per-visit
+        // budget; LINK guests: OTP-verified, one message per booking).
         //
         // 2026-07-26 re-audit, security audit finding 1 (MEDIUM) — a DIFFERENT proportional charge is
         // reintroduced below, from a bucket dedicated to THIS route (never the SMS-driven
@@ -322,9 +323,8 @@ public class ScheduleOverrideConflictService {
         // The ONLY eviction this class still owns for the write — see the class javadoc's perf note.
         if (!conflicts.isEmpty()) {
             registerMasterCalendarEviction(masterId);
-            // Audit trail (security audit finding 2, LOW): D6 removed the client notification for this
-            // path, so a structured log line is the only operational signal an abusive or accidental
-            // mass-cancellation leaves. Ids and a count only — never a client name, phone, email, or
+            // Audit trail (security audit finding 2, LOW): the operational signal an abusive or
+            // accidental mass-cancellation leaves on the server side. Ids and a count only — never a client name, phone, email, or
             // booking note/comment (Anti-Bug §I, track 25.x rules). INFO (not DEBUG) so it is actually
             // visible in production by default; the "Schedule override mass-decline:" prefix makes it
             // greppable for alerting, mirroring MasterService#rotateMasterSalon's audit-log convention.
@@ -373,30 +373,67 @@ public class ScheduleOverrideConflictService {
      * {@code appointmentId} first: every conflicting sibling of the SAME visit is declined through
      * ONE {@link AppointmentTransitionService#declineAppointmentItems} call, not one call per sibling
      * — see that method's javadoc for the O(K²)→O(K) mechanism. Both decline paths run with eviction
-     * AND notification suppressed ({@code evictAfterCommit = false} / the {@code ForBatch} variant —
-     * see D6 in {@link ScheduleOverrideRequest}'s class javadoc); the caller
-     * ({@link #applyOverrideWithConflictHandling}) performs the single combined eviction, and nothing
-     * performs a notification enqueue for this path at all.
+     * suppressed ({@code evictAfterCommit = false} / the {@code ForBatch} variant); the caller
+     * ({@link #applyOverrideWithConflictHandling}) performs the single combined eviction.
+     *
+     * <p><b>Notifications (phase 474, SCH-37 / NTF-40 — reverses the 2026-07-26 D6).</b> After ALL
+     * declines, in this same transaction, every declined booking is notified exactly like a provider
+     * decline, through the existing calls: a standalone booking via
+     * {@link BookingService#enqueueProviderDeclineNotifications} (the {@code PATCH /bookings/{id}/decline}
+     * set), a visit ONCE via {@link AppointmentTransitionService#enqueueVisitItemsDeclineOutbox}
+     * (D4 — siblings declined in one write give one notice). The note is {@code null} by construction
+     * (D2). Enqueues run after every decline so the outbox INSERTs never interleave with a decline's
+     * own reads; a rollback drops them together with the declines.
+     *
+     * <p><b>Statement cost (phase 474 audit-fix, findings 1/3/4).</b> Every outbox row is queued first
+     * (no read in between), then ALL in-app {@code BOOKING_DECLINED} rows go in ONE statement
+     * ({@link InAppNotificationService#notifyBookingEventsBulk}), whose auto-flush sends the queued
+     * outbox rows as JDBC batches of {@code hibernate.jdbc.batch_size} (50). The notification leg is
+     * therefore {@code ceil(outboxRows / 50) + 1} statements: 2 for up to 25 visits, 5 at the
+     * {@value #MAX_CONFLICTS_PER_WRITE}-conflict cap (≤ 200 outbox rows) — never one per visit.
      */
     private void declineConflicts(UUID actorId, List<OverrideConflictCandidate> conflicts) {
         Map<UUID, List<OverrideConflictCandidate>> byAppointment = new LinkedHashMap<>();
+        List<Booking> declinedStandalone = new ArrayList<>();
         for (OverrideConflictCandidate candidate : conflicts) {
             if (candidate.appointmentId() == null) {
-                bookingService.declineBookingForBatch(actorId, candidate.bookingId(),
-                        new StatusUpdateRequest(CancellationReason.PROVIDER_UNAVAILABLE, null));
+                declinedStandalone.add(bookingService.declineBookingForBatch(actorId, candidate.bookingId(),
+                        new StatusUpdateRequest(CancellationReason.PROVIDER_UNAVAILABLE, null)));
             } else {
                 byAppointment.computeIfAbsent(candidate.appointmentId(), id -> new ArrayList<>())
                         .add(candidate);
             }
         }
 
+        List<AppointmentTransitionService.VisitItemsDecline> declinedVisits = new ArrayList<>(byAppointment.size());
         for (Map.Entry<UUID, List<OverrideConflictCandidate>> entry : byAppointment.entrySet()) {
             List<UUID> bookingIds = entry.getValue().stream()
                     .map(OverrideConflictCandidate::bookingId)
                     .collect(Collectors.toList());
-            appointmentTransitionService.declineAppointmentItems(
+            declinedVisits.add(appointmentTransitionService.declineAppointmentItems(
                     actorId, entry.getKey(), bookingIds,
-                    new AppointmentProviderNoteRequest(null), false);
+                    new AppointmentProviderNoteRequest(null), false));
+        }
+
+        notifyDeclined(actorId, declinedStandalone, declinedVisits);
+    }
+
+    /**
+     * Phase 474 — one provider-decline notice per declined standalone booking and per visit (D4): every outbox
+     * row first, then ONE bulk in-app write for all of them (see {@link #declineConflicts}'s statement-cost note).
+     */
+    private void notifyDeclined(UUID actorId, List<Booking> declinedStandalone,
+                                List<AppointmentTransitionService.VisitItemsDecline> declinedVisits) {
+        List<BookingEventTarget> feed = new ArrayList<>(declinedStandalone.size() + declinedVisits.size());
+        for (Booking booking : declinedStandalone) {
+            bookingService.enqueueProviderDeclineOutbox(booking, actorId);
+            feed.add(BookingEventTarget.forBooking(booking));
+        }
+        for (AppointmentTransitionService.VisitItemsDecline visit : declinedVisits) {
+            appointmentTransitionService.enqueueVisitItemsDeclineOutbox(visit, actorId).ifPresent(feed::add);
+        }
+        if (!feed.isEmpty()) {
+            inAppNotificationService.notifyBookingEventsBulk(InAppNotificationType.BOOKING_DECLINED, feed, actorId);
         }
     }
 

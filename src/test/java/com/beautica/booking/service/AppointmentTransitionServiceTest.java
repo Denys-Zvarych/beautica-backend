@@ -21,6 +21,7 @@ import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.security.AuthorizationService;
 import com.beautica.master.entity.Master;
+import com.beautica.notification.inapp.entity.InAppNotificationType;
 import com.beautica.notification.inapp.service.InAppNotificationService;
 import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.service.entity.MasterServiceAssignment;
@@ -639,7 +640,7 @@ class AppointmentTransitionServiceTest {
 
         List<com.beautica.booking.entity.Booking> declined = appointmentTransitionService.declineAppointmentItems(
                 actorId, appointmentId, java.util.List.of(booking1, booking2, booking3),
-                new com.beautica.booking.dto.AppointmentProviderNoteRequest("Sorry, unavailable"), false);
+                new com.beautica.booking.dto.AppointmentProviderNoteRequest("Sorry, unavailable"), false).declined();
 
         assertThat(declined).containsExactly(item1, item2, item3);
         assertThat(item1.getStatus()).isEqualTo(com.beautica.booking.enums.BookingStatus.DECLINED);
@@ -657,6 +658,48 @@ class AppointmentTransitionServiceTest {
         // see should_notEnqueueAnyNotification_when_decliningMultipleSiblings below for the dedicated
         // regression guard.
         verify(outboxService, never()).enqueueStatusChanged(any());
+    }
+
+    @Test
+    @DisplayName("declineAppointmentItems — phase 474 audit-fix: wholeVisitDeclined is derived from the post-lock "
+            + "recheck (true when every still-CONFIRMED item was declined, false when a sibling stays CONFIRMED) "
+            + "with exactly ONE findConfirmedIdsByAppointmentId call")
+    void should_reportWholeVisitDeclinedFromPostLockRecheck_when_declining() {
+        UUID booking1 = UUID.randomUUID();
+        UUID booking2 = UUID.randomUUID();
+        com.beautica.booking.entity.Booking item1 = bookingItem(booking1, com.beautica.booking.enums.BookingStatus.CONFIRMED);
+        com.beautica.booking.entity.Booking item2 = bookingItem(booking2, com.beautica.booking.enums.BookingStatus.CONFIRMED);
+        when(bookingRepository.findByAppointmentIdWithGraph(appointmentId)).thenReturn(java.util.List.of(item1, item2));
+        when(appointmentRepository.lockHeaderIfConfirmed(appointmentId)).thenReturn(Optional.of(appointmentId));
+        when(bookingRepository.findConfirmedIdsByAppointmentId(appointmentId))
+                .thenReturn(java.util.Set.of(booking1, booking2));
+
+        var partial = appointmentTransitionService.declineAppointmentItems(
+                UUID.randomUUID(), appointmentId, java.util.List.of(booking1), null, false);
+
+        assertThat(partial.appointmentId()).isEqualTo(appointmentId);
+        assertThat(partial.declined()).containsExactly(item1);
+        assertThat(partial.wholeVisitDeclined()).as("booking2 is still CONFIRMED").isFalse();
+        verify(bookingRepository, org.mockito.Mockito.times(1)).findConfirmedIdsByAppointmentId(appointmentId);
+    }
+
+    @Test
+    @DisplayName("declineAppointmentItems — phase 474 audit-fix: declining every still-CONFIRMED item reports the "
+            + "whole visit declined")
+    void should_reportWholeVisitDeclined_when_everyConfirmedItemDeclined() {
+        UUID booking1 = UUID.randomUUID();
+        UUID booking2 = UUID.randomUUID();
+        com.beautica.booking.entity.Booking item1 = bookingItem(booking1, com.beautica.booking.enums.BookingStatus.CONFIRMED);
+        com.beautica.booking.entity.Booking item2 = bookingItem(booking2, com.beautica.booking.enums.BookingStatus.CONFIRMED);
+        when(bookingRepository.findByAppointmentIdWithGraph(appointmentId)).thenReturn(java.util.List.of(item1, item2));
+        when(appointmentRepository.lockHeaderIfConfirmed(appointmentId)).thenReturn(Optional.of(appointmentId));
+        when(bookingRepository.findConfirmedIdsByAppointmentId(appointmentId))
+                .thenReturn(java.util.Set.of(booking1, booking2));
+
+        var whole = appointmentTransitionService.declineAppointmentItems(
+                UUID.randomUUID(), appointmentId, java.util.List.of(booking1, booking2), null, false);
+
+        assertThat(whole.wholeVisitDeclined()).isTrue();
     }
 
     /**
@@ -697,7 +740,7 @@ class AppointmentTransitionServiceTest {
 
         List<com.beautica.booking.entity.Booking> declined = appointmentTransitionService.declineAppointmentItems(
                 actorId, appointmentId, java.util.List.of(booking1, booking2, booking3),
-                new com.beautica.booking.dto.AppointmentProviderNoteRequest("Sorry, unavailable"), false);
+                new com.beautica.booking.dto.AppointmentProviderNoteRequest("Sorry, unavailable"), false).declined();
 
         assertThat(declined)
                 .as("the stale target must be a strict SUBSET, never a superset, of the requested ids")
@@ -736,7 +779,7 @@ class AppointmentTransitionServiceTest {
 
         List<com.beautica.booking.entity.Booking> declined = appointmentTransitionService.declineAppointmentItems(
                 actorId, appointmentId, java.util.List.of(booking1),
-                null, true); // evictAfterCommit=true — the branch that would index targets.get(0)
+                null, true).declined(); // evictAfterCommit=true — the branch that would index targets.get(0)
 
         assertThat(declined).as("every target raced away — the survivor list must be empty").isEmpty();
         assertThat(item1.getStatus())
@@ -748,9 +791,9 @@ class AppointmentTransitionServiceTest {
     }
 
     @Test
-    @DisplayName("declineAppointmentItems — never enqueues a notification (D6, 2026-07-26 product "
-            + "decision reversal) — the schedule-override-conflict path this method exists for tells "
-            + "the client nothing beyond the booking's own status")
+    @DisplayName("declineAppointmentItems — never enqueues a notification itself — its schedule-override "
+            + "caller notifies once per visit afterwards via enqueueVisitItemsDeclineOutbox + one bulk "
+            + "in-app write (phase 474)")
     void should_notEnqueueAnyNotification_when_decliningMultipleSiblings() {
         UUID actorId = UUID.randomUUID();
         UUID booking1 = UUID.randomUUID();
@@ -1608,6 +1651,122 @@ class AppointmentTransitionServiceTest {
         assertThat(result).isEmpty();
         verify(appointmentRepository, never())
                 .collapseHeadersIfNoConfirmedSiblingsRemainBulk(any(), any(), any(), any());
+    }
+
+    // ── enqueueVisitItemsDeclineOutbox (phase 474 — SCH-37 / NTF-40, D4; audit-fix findings 1-3) ──
+
+    private AppointmentTransitionService.VisitItemsDecline visitDecline(boolean whole, Booking... declined) {
+        return new AppointmentTransitionService.VisitItemsDecline(appointmentId, List.of(declined), whole);
+    }
+
+    @Test
+    @DisplayName("enqueueVisitItemsDeclineOutbox — whole visit gone: STATUS_CHANGED + MASTER_BOOKING_DECLINED on the "
+            + "representative and a VISIT-keyed in-app target; writes no feed row itself and runs no probe query")
+    void should_returnVisitKeyedTarget_when_wholeVisitDeclined() {
+        UUID actorId = UUID.randomUUID();
+        UUID masterUserId = UUID.randomUUID();
+        Booking first = declinedItemWithMasterUser(UUID.randomUUID(), at(10), masterUserId);
+        Booking second = declinedItemWithMasterUser(UUID.randomUUID(), at(11), masterUserId);
+
+        var target = appointmentTransitionService.enqueueVisitItemsDeclineOutbox(visitDecline(true, first, second), actorId);
+
+        assertThat(target).contains(InAppNotificationService.BookingEventTarget.forVisit(appointmentId, first));
+        verify(outboxService).enqueueStatusChanged(first.getId());
+        verify(outboxService).enqueueMasterBookingDeclined(first.getId(), masterUserId, actorId);
+        verifyNoMoreInteractions(outboxService);
+        verifyNoInteractions(inAppNotificationService, bookingRepository);
+    }
+
+    @Test
+    @DisplayName("enqueueVisitItemsDeclineOutbox — partial (a sibling still CONFIRMED): ONE BOOKING-keyed target on the "
+            + "representative and one outbox pair — not one per item")
+    void should_returnBookingKeyedTarget_when_aConfirmedSiblingRemains() {
+        UUID actorId = UUID.randomUUID();
+        UUID masterUserId = UUID.randomUUID();
+        Booking first = declinedItemWithMasterUser(UUID.randomUUID(), at(11), masterUserId);
+        Booking second = declinedItemWithMasterUser(UUID.randomUUID(), at(12), masterUserId);
+
+        var target = appointmentTransitionService.enqueueVisitItemsDeclineOutbox(visitDecline(false, first, second), actorId);
+
+        assertThat(target).contains(InAppNotificationService.BookingEventTarget.forBooking(first));
+        verify(outboxService).enqueueStatusChanged(first.getId());
+        verify(outboxService).enqueueMasterBookingDeclined(first.getId(), masterUserId, actorId);
+        verifyNoMoreInteractions(outboxService);
+        verifyNoInteractions(inAppNotificationService, bookingRepository);
+    }
+
+    @Test
+    @DisplayName("enqueueVisitItemsDeclineOutbox — the representative is the EARLIEST declined item even when "
+            + "the list arrives out of order")
+    void should_pickEarliestItemAsRepresentative_when_declinedListIsUnordered() {
+        UUID actorId = UUID.randomUUID();
+        Booking late = declinedItemWithMasterUser(UUID.randomUUID(), at(14), UUID.randomUUID());
+        Booking early = declinedItemWithMasterUser(UUID.randomUUID(), at(9), late.getMaster().getUser().getId());
+
+        appointmentTransitionService.enqueueVisitItemsDeclineOutbox(visitDecline(true, late, early), actorId);
+
+        verify(outboxService).enqueueStatusChanged(early.getId());
+        verify(outboxService, never()).enqueueStatusChanged(late.getId());
+    }
+
+    @Test
+    @DisplayName("enqueueVisitItemsDeclineOutbox — equal start times tie-break on the smaller id, so a re-run "
+            + "picks the same representative")
+    void should_tieBreakOnId_when_declinedItemsShareStartTime() {
+        UUID actorId = UUID.randomUUID();
+        UUID lowId = UUID.fromString("00000000-0000-4000-8000-000000000001");
+        UUID highId = UUID.fromString("10000000-0000-4000-8000-000000000001");
+        UUID masterUserId = UUID.randomUUID();
+        Booking high = declinedItemWithMasterUser(highId, at(10), masterUserId);
+        Booking low = declinedItemWithMasterUser(lowId, at(10), masterUserId);
+
+        appointmentTransitionService.enqueueVisitItemsDeclineOutbox(visitDecline(true, high, low), actorId);
+
+        verify(outboxService).enqueueStatusChanged(lowId);
+        verify(outboxService, never()).enqueueStatusChanged(highId);
+    }
+
+    @Test
+    @DisplayName("enqueueVisitItemsDeclineOutbox — an empty declined list (every target raced away) enqueues "
+            + "nothing and returns no target")
+    void should_enqueueNothing_when_declinedListIsEmpty() {
+        var target = appointmentTransitionService.enqueueVisitItemsDeclineOutbox(visitDecline(true), UUID.randomUUID());
+
+        assertThat(target).isEmpty();
+        verifyNoInteractions(outboxService, inAppNotificationService, bookingRepository);
+    }
+
+    @Test
+    @DisplayName("enqueueVisitItemsDeclineOutbox — a master with no user account passes a null master user to "
+            + "the master-row enqueue (which then skips it) without failing")
+    void should_passNullMasterUser_when_masterHasNoUserAccount() {
+        UUID actorId = UUID.randomUUID();
+        Booking item = declinedItemWithMasterUser(UUID.randomUUID(), at(10), null);
+
+        appointmentTransitionService.enqueueVisitItemsDeclineOutbox(visitDecline(true, item), actorId);
+
+        verify(outboxService).enqueueMasterBookingDeclined(item.getId(), null, actorId);
+    }
+
+    private static OffsetDateTime at(int hour) {
+        return OffsetDateTime.of(2026, 8, 1, hour, 0, 0, 0, ZoneOffset.UTC);
+    }
+
+    /** A DECLINED visit item whose master's user id is {@code masterUserId} ({@code null} = no account). */
+    private Booking declinedItemWithMasterUser(UUID bookingId, OffsetDateTime startsAt, UUID masterUserId) {
+        User masterUser = null;
+        if (masterUserId != null) {
+            masterUser = new User("master@example.com", "hash", Role.SALON_MASTER, "M", "U", "+380501112233");
+            setIdViaReflection(masterUser, masterUserId);
+        }
+        Master itemMaster = Master.builder().id(UUID.randomUUID()).user(masterUser).build();
+        return Booking.builder()
+                .id(bookingId)
+                .master(itemMaster)
+                .status(BookingStatus.DECLINED)
+                .startsAt(startsAt)
+                .endsAt(startsAt.plusHours(1))
+                .build();
     }
 
     /** {@code argThat} over a {@link Collection} that ignores element order. */

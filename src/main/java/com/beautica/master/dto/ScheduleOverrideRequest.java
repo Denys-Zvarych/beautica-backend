@@ -59,11 +59,11 @@ import java.util.List;
  * change, {@code providerComment} on the single-booking {@code /decline}/{@code /not-complete}
  * paths, which remain optional free text for every role (CLAUDE.md).
  *
- * <p><b>D6 (new) — no notification for this path.</b> A booking declined via a schedule-override
- * conflict enqueues nothing in the notification outbox; the client discovers the cancellation from
- * the booking's status alone. Notifying the client for this flow is deferred to a later phase — see
- * {@code AppointmentTransitionService#declineAppointmentItems} and
- * {@code BookingService#declineBookingForBatch}.
+ * <p><b>D6 — REVERSED by phase 474 (SCH-37 / SCH-D10 / NTF-40, user decision 2026-11-11).</b> A booking
+ * declined via a schedule-override conflict is notified exactly like any provider decline, one notice
+ * per visit: registered client feed + push (+ the existing e-mail), guest the fixed-text GST-41
+ * SMS/Telegram, performing master per NTF-17 unless they are the actor. No note in any message (D2).
+ * See {@code ScheduleOverrideConflictService#declineConflicts}.
  */
 public record ScheduleOverrideRequest(
         @NotNull(message = "Date is required")
