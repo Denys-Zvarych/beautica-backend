@@ -38,10 +38,10 @@ import static org.assertj.core.api.Assertions.assertThat;
  * decision), so their own row now 403s; owner and admin of the salon keep 200; an admin of another
  * salon and a client 403; an independent master's own service paths are unaffected.
  *
- * <p>Acceptance 3 (the same matrix on a second copy of one type) needs phase 464, which is not on
- * this branch. Here the per-row gate is pinned on two DIFFERENT services of the same master
- * ({@link #should_applyRoleMatrixPerRow_when_masterHasTwoServices}); the second-copy variant is
- * exercised once this branch is merged with {@code feat/duplicate-services}.
+ * <p>Acceptance 3 — the same matrix on the SECOND copy of one service type (phases 464–466) — is
+ * pinned by {@link #should_applyRoleMatrixOnSecondCopyRow_when_salonHoldsTwoCopiesOfOneType}; the
+ * per-row gate across two DIFFERENT services is pinned by
+ * {@link #should_applyRoleMatrixPerRow_when_masterHasTwoServices}.
  */
 @Import(TestSecurityConfig.class)
 @DisplayName("Phase 463 — salon master band PATCH lockdown (owner/admin only)")
@@ -334,6 +334,73 @@ class SalonMasterBandLockdownIT extends AbstractIntegrationTest {
                 .isEqualByComparingTo(EDITED_PRICE);
     }
 
+    @Test
+    @DisplayName("AC3: salon holds TWO copies of one service type (60 / 90 хв via salon bulk); on the "
+            + "master's row of the SECOND copy the master, foreign admin and client 403 with the band "
+            + "unchanged, owner and admin 200, and the first copy's row (and a peer's row on the same copy) "
+            + "is never touched")
+    void should_applyRoleMatrixOnSecondCopyRow_when_salonHoldsTwoCopiesOfOneType() throws Exception {
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(uniqueEmail("owner-copy"));
+        UUID salonId = fixtures.createSalon(ownerToken, "Phase 463 Second Copy Salon");
+        var self = fixtures.createSalonMasterWithRowAndGetToken(salonId, uniqueEmail("self-copy"));
+        UUID peerMasterId = fixtures.createSalonMaster(salonId);
+        UUID typeId = fixtures.activeSelectableServiceTypes(1).get(0).id();
+        Assignment firstCopy = bulkCreate(ownerToken, salonId, peerMasterId, typeId, 60);
+        Assignment peerOnSecondCopy = bulkCreate(ownerToken, salonId, peerMasterId, typeId, 90);
+        Assignment secondCopy = bulkCreate(ownerToken, salonId, self.masterId(), typeId, 90);
+        String adminToken = fixtures.createSalonAdminAndGetToken(salonId, uniqueEmail("admin-copy"));
+        String otherOwnerToken = fixtures.createSalonOwnerAndGetToken(uniqueEmail("owner-copy-other"));
+        UUID otherSalonId = fixtures.createSalon(otherOwnerToken, "Phase 463 Second Copy Other Salon");
+        String foreignAdminToken = fixtures.createSalonAdminAndGetToken(otherSalonId, uniqueEmail("admin-copy-for"));
+        String clientToken = fixtures.createClientAndGetToken(uniqueEmail("client-copy"));
+        assertThat(peerOnSecondCopy.definitionId()).as("the peer's 90 bulk mints a second salon copy")
+                .isNotEqualTo(firstCopy.definitionId());
+        assertThat(secondCopy.definitionId()).as("the master is assigned that second copy")
+                .isEqualTo(peerOnSecondCopy.definitionId());
+        assertThat(jdbcTemplate.queryForList(
+                "SELECT service_type_id FROM service_definitions WHERE id IN (?, ?)", UUID.class,
+                firstCopy.definitionId(), secondCopy.definitionId()))
+                .as("both copies are of the same service type").containsExactly(typeId, typeId);
+        Map<String, Object> firstCopyBefore = bandRow(firstCopy.assignmentId());
+        Map<String, Object> peerSecondCopyBefore = bandRow(peerOnSecondCopy.assignmentId());
+        var masterAttempt = new UpdateMasterServiceBandRequest(PriceType.FIXED, EDITED_PRICE, null, 30, null, null);
+
+        ResponseEntity<String> selfResp = patchBand(self.token(), salonId, self.masterId(), secondCopy.definitionId(), masterAttempt);
+        Map<String, Object> afterSelf = bandRow(secondCopy.assignmentId());
+        ResponseEntity<String> foreignResp = patchBand(foreignAdminToken, salonId, self.masterId(), secondCopy.definitionId());
+        ResponseEntity<String> clientResp = patchBand(clientToken, salonId, self.masterId(), secondCopy.definitionId());
+        Map<String, Object> afterDenied = bandRow(secondCopy.assignmentId());
+        var ownerBand = new UpdateMasterServiceBandRequest(PriceType.FIXED, OWNER_PRICE, null, OWNER_DURATION, null, null);
+        ResponseEntity<String> ownerResp = patchBand(ownerToken, salonId, self.masterId(), secondCopy.definitionId(), ownerBand);
+        Map<String, Object> afterOwner = bandRow(secondCopy.assignmentId());
+        ResponseEntity<String> adminResp = patchBand(adminToken, salonId, self.masterId(), secondCopy.definitionId());
+        Map<String, Object> afterAdmin = bandRow(secondCopy.assignmentId());
+
+        assertThat(selfResp.getStatusCode()).as("self on 2nd copy, body=%s", selfResp.getBody())
+                .isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(selfResp.getBody()).contains(ACCESS_DENIED);
+        assertThat(afterSelf.get("price_override")).as("self 403 writes no price").isNull();
+        assertThat(afterSelf.get("duration_override_minutes")).as("self 403 writes no duration").isNull();
+        assertThat(List.of(foreignResp, clientResp)).as("foreign admin, client").allSatisfy(r -> {
+            assertThat(r.getStatusCode()).as("body=%s", r.getBody()).isEqualTo(HttpStatus.FORBIDDEN);
+            assertThat(r.getBody()).contains(ACCESS_DENIED);
+        });
+        assertThat(afterDenied.get("price_override")).as("denied writes leave the band unchanged").isNull();
+        assertThat(ownerResp.getStatusCode()).as("owner on 2nd copy, body=%s", ownerResp.getBody())
+                .isEqualTo(HttpStatus.OK);
+        assertThat((BigDecimal) afterOwner.get("price_override")).as("owner price").isEqualByComparingTo(OWNER_PRICE);
+        assertThat(afterOwner.get("duration_override_minutes")).as("owner duration").isEqualTo(OWNER_DURATION);
+        assertThat(adminResp.getStatusCode()).as("admin on 2nd copy, body=%s", adminResp.getBody())
+                .isEqualTo(HttpStatus.OK);
+        assertThat((BigDecimal) afterAdmin.get("price_override")).as("admin price").isEqualByComparingTo(EDITED_PRICE);
+        assertThat(bandRow(firstCopy.assignmentId())).as("first copy's row untouched by every write")
+                .isEqualTo(firstCopyBefore)
+                .containsEntry("price_override", null)
+                .containsEntry("duration_override_minutes", null);
+        assertThat(bandRow(peerOnSecondCopy.assignmentId())).as("the peer's row on the same second copy untouched")
+                .isEqualTo(peerSecondCopyBefore);
+    }
+
     // ── helpers ────────────────────────────────────────────────────────────────────────────────
 
     private record Assignment(UUID assignmentId, UUID definitionId) {
@@ -355,6 +422,17 @@ class SalonMasterBandLockdownIT extends AbstractIntegrationTest {
                 "/api/v1/salons/" + salonId + "/masters/" + masterId + "/services/bulk", HttpMethod.POST,
                 new HttpEntity<>(new BulkCreateServicesRequest(List.of(item)), fixtures.bearerHeaders(ownerToken)),
                 String.class);
+        assertThat(resp.getStatusCode()).as("bulk setup, body=%s", resp.getBody()).isEqualTo(HttpStatus.CREATED);
+        MasterServiceResponse created = objectMapper.readValue(resp.getBody(),
+                new TypeReference<ApiResponse<List<MasterServiceResponse>>>() {}).data().get(0);
+        return new Assignment(created.id(), created.serviceDefinition().id());
+    }
+
+    /** One unnamed FIXED item of {@code typeId} at {@code duration} through the salon bulk path. */
+    private Assignment bulkCreate(String ownerToken, UUID salonId, UUID masterId, UUID typeId, int duration)
+            throws Exception {
+        ResponseEntity<String> resp = fixtures.postSalonBulk(ownerToken, salonId, masterId,
+                List.of(ServiceTestFixtures.bulkItem(typeId, duration, SEEDED_PRICE.toPlainString())));
         assertThat(resp.getStatusCode()).as("bulk setup, body=%s", resp.getBody()).isEqualTo(HttpStatus.CREATED);
         MasterServiceResponse created = objectMapper.readValue(resp.getBody(),
                 new TypeReference<ApiResponse<List<MasterServiceResponse>>>() {}).data().get(0);
