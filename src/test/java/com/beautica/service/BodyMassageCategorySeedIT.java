@@ -20,6 +20,10 @@ import org.springframework.security.crypto.password.PasswordEncoder;
 
 import javax.sql.DataSource;
 import java.math.BigDecimal;
+import java.sql.Connection;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -73,6 +77,26 @@ class BodyMassageCategorySeedIT extends AbstractIntegrationTest {
 
     private static final String SIGNATURE = "Авторський масаж";
     private static final String SIGNATURE_MASK = "Авторський масаж + маска";
+    private static final String CLASSIC = "Класичний масаж";
+    private static final String CLASSIC_SLUG = "classic-massage";
+    private static final String SPORTS = "Спортивний масаж";
+
+    /** Locked V234 seed rows: slug is the search contract ({@code serviceTypeSlugs=}), name_en the EN label. */
+    private static final List<SeedRow> SEED_ROWS = List.of(
+            new SeedRow("classic-massage", "Класичний масаж", "Classic Massage"),
+            new SeedRow("relax-massage", "Релакс масаж", "Relax Massage"),
+            new SeedRow("classic-back-massage", "Класичний масаж спини", "Classic Back Massage"),
+            new SeedRow("sports-massage", "Спортивний масаж", "Sports Massage"),
+            new SeedRow("signature-massage", "Авторський масаж", "Signature Massage"),
+            new SeedRow("anti-cellulite-massage", "Антицелюлітний масаж", "Anti-Cellulite Massage"),
+            new SeedRow("lymphatic-drainage-massage", "Лімфодренажний масаж", "Lymphatic Drainage Massage"),
+            new SeedRow("whisky-wrap", "Віскі-пеленання", "Whisky Wrap"),
+            new SeedRow("signature-massage-mask", "Авторський масаж + маска", "Signature Massage + Mask"),
+            new SeedRow("spa-procedure", "SPA-процедура", "SPA Procedure"),
+            new SeedRow("cedar-phyto-barrel", "Кедрова фітобочка", "Cedar Phyto Barrel"));
+
+    private record SeedRow(String slug, String nameUk, String nameEn) {
+    }
 
     @Autowired
     private TestRestTemplate restTemplate;
@@ -144,6 +168,17 @@ class BodyMassageCategorySeedIT extends AbstractIntegrationTest {
     }
 
     @Test
+    @DisplayName("V234 seeds exactly the 11 locked slugs with their exact name_uk and name_en")
+    void should_seedLockedSlugsAndEnglishNames_when_v234Applied() {
+        List<SeedRow> seeded = jdbcTemplate.query(
+                "SELECT slug, name_uk, name_en FROM service_types WHERE platform_category_name = ?",
+                (rs, i) -> new SeedRow(rs.getString("slug"), rs.getString("name_uk"), rs.getString("name_en")),
+                CATEGORY);
+
+        assertThat(seeded).as("slug typo would break serviceTypeSlugs= search").containsExactlyInAnyOrderElementsOf(SEED_ROWS);
+    }
+
+    @Test
     @DisplayName("one master can create both «Авторський масаж» and «Авторський масаж + маска» (distinct types)")
     void should_createBothSignatureServices_when_typesDiffer() throws Exception {
         String token = fixtures.createIndependentMasterAndGetToken("massage-master-" + System.nanoTime() + "@beautica.test");
@@ -204,6 +239,33 @@ class BodyMassageCategorySeedIT extends AbstractIntegrationTest {
     }
 
     @Test
+    @DisplayName("guest GET /search/masters?serviceTypeSlugs=classic-massage finds the «Класичний масаж» master, not a «Спортивний масаж» one")
+    void should_findMasterOfferingClassicMassage_when_guestSearchesByMassageSlug() throws Exception {
+        UUID classicMasterId = bookableMassageMaster("massage-slug-classic-", CLASSIC);
+        bookableMassageMaster("massage-slug-sports-", SPORTS);
+
+        ResponseEntity<String> resp = restTemplate.getForEntity(
+                "/api/v1/search/masters?serviceTypeSlugs=" + CLASSIC_SLUG + "&page=0&size=20", String.class);
+
+        assertThat(resp.getStatusCode()).as("body=%s", resp.getBody()).isEqualTo(HttpStatus.OK);
+        List<String> masterIds = new ArrayList<>();
+        objectMapper.readTree(resp.getBody()).path("data").path("data")
+                .forEach(n -> masterIds.add(n.path("masterId").asText()));
+        assertThat(masterIds).as("same category, only the slug separates them").containsExactly(classicMasterId.toString());
+    }
+
+    /** Independent master offering one BODY_MASSAGE type, with a usable schedule (search hides schedule-less masters). */
+    private UUID bookableMassageMaster(String emailPrefix, String typeName) throws Exception {
+        String email = emailPrefix + System.nanoTime() + "@beautica.test";
+        String token = fixtures.createIndependentMasterAndGetToken(email);
+        ResponseEntity<String> created = createService(token, typeName, SHORT_DURATION);
+        assertThat(created.getStatusCode()).as("arrange, body=%s", created.getBody()).isEqualTo(HttpStatus.CREATED);
+        UUID masterId = fixtures.resolveMasterIdForUserEmail(email);
+        fixtures.seedUsableSchedule(masterId);
+        return masterId;
+    }
+
+    @Test
     @DisplayName("the 11 types sit in the existing «Тіло» bucket; guest GET /service-categories keeps 8 seeded buckets, «Інше» last")
     void should_keepEightBucketsWithOtherLast_when_typesFiledUnderBody() throws Exception {
         String bucketName = jdbcTemplate.queryForObject(
@@ -228,17 +290,37 @@ class BodyMassageCategorySeedIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("re-running the V234 body inserts nothing")
-    void should_insertNothing_when_migrationBodyReRun() {
-        long categoriesBefore = count("SELECT COUNT(*) FROM platform_categories");
-        long bucketsBefore = count("SELECT COUNT(*) FROM service_categories");
-        long typesBefore = count("SELECT COUNT(*) FROM service_types");
+    @DisplayName("re-running the V234 body inserts nothing (run in a rolled-back transaction — shared container untouched)")
+    void should_insertNothing_when_migrationBodyReRun() throws SQLException {
+        List<Long> before;
+        List<Long> after;
 
-        new ResourceDatabasePopulator(new ClassPathResource(MIGRATION)).execute(dataSource);
+        try (Connection connection = dataSource.getConnection()) {
+            connection.setAutoCommit(false);
+            try {
+                before = seedCounts(connection);
+                new ResourceDatabasePopulator(new ClassPathResource(MIGRATION)).populate(connection);
+                after = seedCounts(connection);
+            } finally {
+                connection.rollback();
+                connection.setAutoCommit(true);
+            }
+        }
 
-        assertThat(count("SELECT COUNT(*) FROM platform_categories")).isEqualTo(categoriesBefore);
-        assertThat(count("SELECT COUNT(*) FROM service_categories")).isEqualTo(bucketsBefore);
-        assertThat(count("SELECT COUNT(*) FROM service_types")).isEqualTo(typesBefore);
+        assertThat(after).as("[platform_categories, service_categories, service_types] row counts").isEqualTo(before);
+    }
+
+    /** Counts read on the re-run's own connection, so uncommitted inserts would be visible. */
+    private static List<Long> seedCounts(Connection connection) throws SQLException {
+        List<Long> counts = new ArrayList<>();
+        for (String table : List.of("platform_categories", "service_categories", "service_types")) {
+            try (Statement statement = connection.createStatement();
+                 ResultSet rs = statement.executeQuery("SELECT COUNT(*) FROM " + table)) {
+                rs.next();
+                counts.add(rs.getLong(1));
+            }
+        }
+        return counts;
     }
 
     private ResponseEntity<String> createService(String token, String typeName, int durationMinutes) {
@@ -249,10 +331,5 @@ class BodyMassageCategorySeedIT extends AbstractIntegrationTest {
                 PriceType.FIXED, new BigDecimal("800.00"), null, null, typeId);
         return restTemplate.exchange("/api/v1/independent-masters/me/services", HttpMethod.POST,
                 new HttpEntity<>(request, fixtures.bearerHeaders(token)), String.class);
-    }
-
-    private long count(String sql) {
-        Long value = jdbcTemplate.queryForObject(sql, Long.class);
-        return value == null ? 0L : value;
     }
 }
