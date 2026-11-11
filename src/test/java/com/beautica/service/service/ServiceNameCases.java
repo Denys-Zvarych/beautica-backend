@@ -1,5 +1,6 @@
 package com.beautica.service.service;
 
+import com.beautica.service.dto.ServiceNameConstraints;
 import org.junit.jupiter.params.provider.Arguments;
 
 import java.util.stream.Stream;
@@ -10,7 +11,7 @@ import java.util.stream.Stream;
  */
 final class ServiceNameCases {
 
-    static final String INVALID_NAME_MESSAGE = "Name contains invalid characters";
+    static final String INVALID_NAME_MESSAGE = ServiceNameConstraints.NAME_REGEX_MESSAGE;
 
     private ServiceNameCases() {
     }

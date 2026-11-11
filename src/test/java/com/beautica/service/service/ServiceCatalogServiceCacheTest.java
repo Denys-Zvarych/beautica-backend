@@ -112,6 +112,9 @@ class ServiceCatalogServiceCacheTest {
     @MockBean com.beautica.master.service.MasterSearchVisibilityGuard searchVisibilityGuard;
     // Phase 380 D6: slug-info eviction collaborator; its own behaviour is covered by MasterProfileCacheEvictorTest.
     @MockBean com.beautica.common.cache.MasterProfileCacheEvictor masterProfileCacheEvictor;
+    // Phase 465: duplicate-name 409 copy lookup (own REQUIRES_NEW tx + DataSource); its behaviour is
+    // covered by DuplicateServiceCopyLookupTest, so it is inert constructor wiring here.
+    @MockBean DuplicateServiceCopyLookup duplicateServiceCopyLookup;
     // Phase 23.x (perf/security #2): ServiceCatalogService evicts the salon-service-catalog cache via
     // this collaborator on every definition mutation. It is a REAL bean here (on the @SpringBootTest
     // classes list) so its @CacheEvict fires through the AOP proxy — the salon-catalogue eviction tests
