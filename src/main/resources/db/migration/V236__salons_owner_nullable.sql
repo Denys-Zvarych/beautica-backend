@@ -1,3 +1,5 @@
+-- non-destructive
+-- Reason: the CHECK only constrains rows with owner_id NULL, which no earlier app version can write (owner_id was NOT NULL until this migration), so a rollback image is unaffected.
 -- V236 — salons.owner_id becomes nullable for a deleted owner's detached salons (Phase 488, SUP-67 / SAL-47).
 --
 -- WHY
