@@ -207,6 +207,9 @@ class SalonServiceTest {
     // Phase 379 D7 — deactivateSalon tombstones the salon slug; @InjectMocks would pass null.
     @Mock private com.beautica.booking.service.DeletedBookingSlugTombstoner deletedBookingSlugTombstoner;
 
+    // Phase 488 — detachDeactivatedSalonsForOwnerDeletion deletes the salons' invites; @InjectMocks would pass null.
+    @Mock private com.beautica.user.InviteTokenRepository inviteTokenRepository;
+
     @InjectMocks
     private SalonService salonService;
 
@@ -1276,6 +1279,42 @@ class SalonServiceTest {
         assertThat(salon.getDistrictId())
                 .as("the salon's district must remain unset — the rejected districtId must not be written")
                 .isNull();
+    }
+
+    @Test
+    @DisplayName("detachDeactivatedSalonsForOwnerDeletion — detach count below the owner's salon count fails the whole "
+            + "deletion (IllegalStateException) and evicts nothing")
+    void should_throwIllegalState_when_detachCountMismatchesSalonCount() {
+        UUID ownerId = UUID.randomUUID();
+        List<UUID> salonIds = List.of(UUID.randomUUID(), UUID.randomUUID());
+        Instant now = Instant.parse("2026-11-12T10:00:00Z");
+        ReflectionTestUtils.setField(salonService, "clock", java.time.Clock.fixed(now, java.time.ZoneOffset.UTC));
+        when(salonRepository.findAllIdsByOwnerId(ownerId)).thenReturn(salonIds);
+        when(salonRepository.detachOwnerFromInactiveSalons(ownerId, now)).thenReturn(1);
+
+        assertThatThrownBy(() -> salonService.detachDeactivatedSalonsForOwnerDeletion(ownerId))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("still holds 1 active salon(s)");
+
+        verify(inviteTokenRepository).deleteBySalonIdIn(salonIds);
+        verifyNoInteractions(cacheManager);
+    }
+
+    @Test
+    @DisplayName("updateSalon — a salon detached by its owner's account deletion (owner_id NULL) answers 404, "
+            + "never a null-id owner lock")
+    void should_throwNotFound_when_updateSalonTargetsOwnerlessSalon() {
+        UUID salonId = UUID.randomUUID();
+        var request = new UpdateSalonRequest("New Name", null, null, null, null,
+                null, null, null, null, null, null, null);
+        when(salonRepository.findOwnerStateById(salonId))
+                .thenReturn(Optional.of(new SalonRepository.SalonOwnerState(null, false)));
+
+        assertThatThrownBy(() -> salonService.updateSalon(UUID.randomUUID(), salonId, request))
+                .isInstanceOf(NotFoundException.class);
+
+        verify(userRepository, never()).findByIdForUpdate(any());
+        verify(salonRepository, never()).save(any());
     }
 
     @Test

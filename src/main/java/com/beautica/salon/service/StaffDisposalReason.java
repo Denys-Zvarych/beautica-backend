@@ -28,12 +28,35 @@ public enum StaffDisposalReason {
      * rendering it, since naming the deleted account as the "actor" who ordered its own deletion
      * reads as a third party having done it.
      */
-    SELF_DELETE("Self-delete");
+    SELF_DELETE("Self-delete", true),
+
+    /**
+     * {@code OwnerAccountSelfDeletionService#deleteOwnAccount} (Phase 488) — a {@code SALON_OWNER} with no
+     * active salon deletes its own account; the disposed masters row is the owner-as-master identity.
+     * Self-initiated like {@link #SELF_DELETE}: no {@code by actor} clause, and the caller registers its
+     * own R2 sweep.
+     */
+    OWNER_SELF_DELETE("Owner self-delete", true);
 
     private final String label;
+    private final boolean selfInitiated;
 
     StaffDisposalReason(String label) {
+        this(label, false);
+    }
+
+    StaffDisposalReason(String label, boolean selfInitiated) {
         this.label = label;
+        this.selfInitiated = selfInitiated;
+    }
+
+    /**
+     * {@code true} when the disposed account is its own actor (Phase 488 — additive): the disposal then
+     * omits the {@code by actor} log clause and skips its own R2 sweep, because the self-delete caller
+     * registers that sweep itself (registering twice would double-purge).
+     */
+    public boolean selfInitiated() {
+        return selfInitiated;
     }
 
     /** The human-readable prefix rendered into the disposal audit log line. */

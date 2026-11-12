@@ -49,37 +49,28 @@ class ClientAccountSelfDeleteAuthorizationIT extends AbstractIntegrationTest {
     }
 
     /**
-     * Phase 301 narrowed this case list to {@code SALON_OWNER} ONLY. Before phase 301,
-     * {@code DELETE /api/v1/users/me} was {@code hasRole('CLIENT')}-only and every other role
-     * (including {@code SALON_ADMIN}/{@code SALON_MASTER}/{@code INDEPENDENT_MASTER}) 403'd here.
-     * Phase 301 widened the {@code @PreAuthorize} gate to admit those three roles — they now reach
-     * the real self-delete cascade and are asserted 204 by {@code
-     * StaffAccountSelfDeleteAuthorizationIT} instead. {@code SALON_OWNER} is the ONE role that
-     * still 403s post-widening (D1 — {@code salons.owner_id} is {@code NOT NULL NO ACTION}, so an
-     * owner can never self-delete through this route), so it is the only case left in the shipped
-     * CLIENT-flow regression suite. Running this test with the pre-301 case list against the
-     * widened endpoint would falsely fail for SALON_ADMIN/INDEPENDENT_MASTER (204, not 403) — a
-     * regression discovered by this very QA pass, not a hypothetical.
+     * Phase 488 widened the gate to {@code SALON_OWNER} (SUP-11): the owner is routed to
+     * {@code OwnerAccountSelfDeletionService}, never to the CLIENT cascade. With an ACTIVE salon it is refused
+     * 409 {@code OWNER_HAS_ACTIVE_SALONS} (was 403 before Phase 488) and the account row survives untouched.
      */
     @Test
-    @DisplayName("SALON_OWNER gets 403, never reaches the deletion cascade, and its account row "
-            + "survives untouched — the one role the widened endpoint still refuses (Phase 301 D1)")
-    void should_return403_when_callerIsSalonOwner() throws Exception {
-        String email = "csd-authz-" + System.nanoTime() + "@beautica.test";
-        UUID actorId = csd.createUser(email, "SALON_OWNER", null, "Тест", "Власник");
+    @DisplayName("SALON_OWNER with an active salon gets 409 OWNER_HAS_ACTIVE_SALONS, never reaches the CLIENT "
+            + "cascade, and its account row survives untouched (Phase 488)")
+    void should_return409_when_callerIsSalonOwnerWithActiveSalon() throws Exception {
+        ClientSelfDeleteTestFixtures.Salon salon = csd.createSalon();
+        String email = jdbcTemplate.queryForObject(
+                "SELECT email FROM users WHERE id = ?", String.class, salon.ownerId());
         String token = fixtures.tokenFor(email);
 
         ResponseEntity<String> response = restTemplate.exchange(
                 "/api/v1/users/me", HttpMethod.DELETE,
                 new HttpEntity<>(fixtures.bearerHeaders(token)), String.class);
 
-        assertThat(response.getStatusCode())
-                .as("SALON_OWNER must never reach the self-delete cascade")
-                .isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
         JsonNode body = objectMapper.readTree(response.getBody());
-        assertThat(body.path("message").asText()).isEqualTo("Access denied");
-        assertThat(csd.userExists(actorId))
-                .as("a 403 must be a pure no-op — the account row is untouched")
+        assertThat(body.path("data").path("code").asText()).isEqualTo("OWNER_HAS_ACTIVE_SALONS");
+        assertThat(csd.userExists(salon.ownerId()))
+                .as("a 409 must be a pure no-op — the account row is untouched")
                 .isTrue();
     }
 

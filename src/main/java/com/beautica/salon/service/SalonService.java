@@ -526,10 +526,14 @@ public class SalonService {
      * {@code is_active}. If the salon was active before we waited and a delete committed meanwhile,
      * answer 404 rather than edit a salon the owner just deleted; a salon already inactive before
      * the request keeps today's path. A missing salon has no owner to lock and falls through to the
-     * same 404 as before.
+     * same 404 as before. A salon detached by its owner's account deletion (Phase 488, {@code owner_id}
+     * NULL) has no owner to lock and nobody may edit it: 404, never a 500 from a null-id lock.
      */
     private Salon lockOwnerThenLoadSalon(UUID salonId) {
         var stateBeforeLock = salonRepository.findOwnerStateById(salonId);
+        if (stateBeforeLock.isPresent() && stateBeforeLock.get().ownerId() == null) {
+            throw new NotFoundException("Salon not found: " + salonId);
+        }
         stateBeforeLock.ifPresent(state -> lockOwnerForCreate(state.ownerId()));
         var salon = salonRepository.findById(salonId)
                 .orElseThrow(() -> new NotFoundException("Salon not found: " + salonId));
@@ -2277,6 +2281,40 @@ public class SalonService {
      */
     public Optional<User> lockOwnerForCreate(UUID ownerId) {
         return userRepository.findByIdForUpdate(ownerId);
+    }
+
+    /**
+     * Phase 488 (SAL-47 / SUP-67) — the salon side of a {@code SALON_OWNER} self-delete. Every salon the
+     * owner holds is already deactivated (the caller refused 409 {@code OWNER_HAS_ACTIVE_SALONS} otherwise),
+     * so this only detaches: the salons' invite history is deleted (nobody may accept or inherit it — AC5),
+     * then {@code owner_id} is cleared and the contact columns and owner-written free text are blanked in one
+     * statement. The caller discards the invites' still-queued outbox rows first. Name, address,
+     * bookings, reviews and client_reviews stay on the row (SAL-D05/SAL-D12), so clients keep their history.
+     * The owner-salons and per-salon detail caches are evicted after commit, never on rollback.
+     *
+     * <p>{@code MANDATORY}: the caller must already hold the owner row lock ({@link #lockOwnerForCreate},
+     * taken FIRST — the same owner → salon order as create/update/deactivate), so no salon of this owner can
+     * be created or reactivated between the caller's precondition check and this detach.
+     *
+     * @return the detached salon ids (possibly empty)
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public List<UUID> detachDeactivatedSalonsForOwnerDeletion(UUID ownerId) {
+        List<UUID> salonIds = salonRepository.findAllIdsByOwnerId(ownerId);
+        if (salonIds.isEmpty()) {
+            return salonIds;
+        }
+        inviteTokenRepository.deleteBySalonIdIn(salonIds);
+        int detached = salonRepository.detachOwnerFromInactiveSalons(ownerId, clock.instant());
+        if (detached != salonIds.size()) {
+            // An active salon cannot be detached (predicate + CHECK); the caller's precondition makes this
+            // unreachable. Fail the whole deletion rather than leave an owner_id pointing at a deleted user.
+            throw new IllegalStateException("Owner " + ownerId + " still holds " + (salonIds.size() - detached)
+                    + " active salon(s) at detach time");
+        }
+        evictOwnerSalonsCacheAfterCommit(ownerId);
+        salonIds.forEach(this::evictSalonDetailCacheAfterCommit);
+        return salonIds;
     }
 
     /**

@@ -292,6 +292,19 @@ public class NotificationOutboxService {
     }
 
     /**
+     * Phase 488 (SUP-67) — discards every still-queued {@code INVITE} e-mail for the salons of an owner whose
+     * account is being deleted. Must be called BEFORE those salons' invite tokens are deleted.
+     *
+     * @param ownerId the owner being deleted
+     * @return number of outbox rows discarded
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public int discardPendingInvitesForOwnerSalons(UUID ownerId) {
+        Objects.requireNonNull(ownerId, "ownerId must not be null");
+        return outboxRepository.deletePendingInvitesForOwnerSalons(ownerId);
+    }
+
+    /**
      * Enqueues a {@code CLOSURE_REMINDER} notification entry (Phase 29.5).
      *
      * <p>Writes exactly ONE row into {@code notification_outbox} and performs no other write —
