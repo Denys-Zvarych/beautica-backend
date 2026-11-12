@@ -219,7 +219,7 @@ class SalonServiceTest {
         var savedSalon = buildSalon(UUID.randomUUID(), owner, "Second Salon");
 
         when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
-        when(salonRepository.existsByOwnerId(ownerId)).thenReturn(true);
+        when(salonRepository.countByOwnerIdAndIsActiveTrue(ownerId)).thenReturn(1L);
         when(salonRepository.save(any(Salon.class))).thenReturn(savedSalon);
 
         SalonResponse response = salonService.createSalon(ownerId, request);
@@ -251,7 +251,7 @@ class SalonServiceTest {
         var savedSalon = buildSalon(UUID.randomUUID(), owner, "Geo Salon");
 
         when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
-        when(salonRepository.existsByOwnerId(ownerId)).thenReturn(false);
+        when(salonRepository.countByOwnerIdAndIsActiveTrue(ownerId)).thenReturn(0L);
         when(salonRepository.save(any(Salon.class))).thenReturn(savedSalon);
 
         // Act
@@ -268,7 +268,7 @@ class SalonServiceTest {
         verify(userRepository, never()).save(any(User.class));
         // Locality validation must have been invoked
         verify(localityWriteValidator).validateProviderLocality(request.toLocalityInput());
-        // first-salon path (existsByOwnerId=false) must trigger master auto-creation
+        // first-salon path (no active salon) must trigger master auto-creation
         verify(masterService).createMasterForOwner(owner, savedSalon);
     }
 
@@ -299,7 +299,7 @@ class SalonServiceTest {
         ReflectionTestUtils.setField(savedSalon, "createdAt", Instant.now());
 
         when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
-        when(salonRepository.existsByOwnerId(ownerId)).thenReturn(true);
+        when(salonRepository.countByOwnerIdAndIsActiveTrue(ownerId)).thenReturn(1L);
         when(salonRepository.save(any(Salon.class))).thenReturn(savedSalon);
         when(locationQueryService.resolveCityOblastId(cityId)).thenReturn(oblastId);
 
@@ -322,7 +322,7 @@ class SalonServiceTest {
         var savedSalon = buildSalonNoCity(UUID.randomUUID(), owner, "No Geo Salon");
 
         when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
-        when(salonRepository.existsByOwnerId(ownerId)).thenReturn(true);
+        when(salonRepository.countByOwnerIdAndIsActiveTrue(ownerId)).thenReturn(1L);
         when(salonRepository.save(any(Salon.class))).thenReturn(savedSalon);
 
         SalonResponse response = salonService.createSalon(ownerId, request);
@@ -400,7 +400,7 @@ class SalonServiceTest {
         var savedSalon = buildSalon(UUID.randomUUID(), owner, "Handle Salon");
 
         when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
-        when(salonRepository.existsByOwnerId(ownerId)).thenReturn(true);
+        when(salonRepository.countByOwnerIdAndIsActiveTrue(ownerId)).thenReturn(1L);
         when(salonRepository.save(any(Salon.class))).thenReturn(savedSalon);
 
         salonService.createSalon(ownerId, request);
@@ -424,7 +424,7 @@ class SalonServiceTest {
         var savedSalon = buildSalon(UUID.randomUUID(), owner, "URL Salon");
 
         when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
-        when(salonRepository.existsByOwnerId(ownerId)).thenReturn(true);
+        when(salonRepository.countByOwnerIdAndIsActiveTrue(ownerId)).thenReturn(1L);
         when(salonRepository.save(any(Salon.class))).thenReturn(savedSalon);
 
         salonService.createSalon(ownerId, request);
@@ -448,7 +448,7 @@ class SalonServiceTest {
                 null, null, null, null, null
         );
         when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
-        when(salonRepository.existsByOwnerId(ownerId)).thenReturn(true);
+        when(salonRepository.countByOwnerIdAndIsActiveTrue(ownerId)).thenReturn(1L);
         when(bookingSlugService.generateSalonSlug("Beauty Lab Київ")).thenReturn("beauty-lab-kyiv-x7k2");
         when(salonRepository.save(any(Salon.class)))
                 .thenReturn(buildSalon(UUID.randomUUID(), owner, "Beauty Lab Київ"));
@@ -619,7 +619,7 @@ class SalonServiceTest {
         var request = new CreateSalonRequest("Geo Salon", null, "Stale city", "Stale region", null, null, null,
                 cityId, null, "Shevchenka St", "5A", null);
         when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
-        when(salonRepository.existsByOwnerId(ownerId)).thenReturn(true);
+        when(salonRepository.countByOwnerIdAndIsActiveTrue(ownerId)).thenReturn(1L);
         when(salonRepository.save(any(Salon.class))).thenAnswer(inv -> {
             Salon s = inv.getArgument(0);
             ReflectionTestUtils.setField(s, "id", UUID.randomUUID());
@@ -646,7 +646,7 @@ class SalonServiceTest {
         var request = new CreateSalonRequest("Geo Salon", null, null, null, "вул. Домашня 1, кв. 5", null, null,
                 UUID.randomUUID(), null, "Shevchenka St", "5A", null);
         when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
-        when(salonRepository.existsByOwnerId(ownerId)).thenReturn(true);
+        when(salonRepository.countByOwnerIdAndIsActiveTrue(ownerId)).thenReturn(1L);
         when(salonRepository.save(any(Salon.class))).thenAnswer(inv -> {
             Salon s = inv.getArgument(0);
             ReflectionTestUtils.setField(s, "id", UUID.randomUUID());
@@ -678,7 +678,7 @@ class SalonServiceTest {
         var request = new CreateSalonRequest("Salon B", null, null, null, null, null, null,
                 UUID.randomUUID(), UUID.randomUUID(), "Second St", "2", "second note");
         when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
-        when(salonRepository.existsByOwnerId(ownerId)).thenReturn(true);
+        when(salonRepository.countByOwnerIdAndIsActiveTrue(ownerId)).thenReturn(1L);
         when(salonRepository.save(any(Salon.class)))
                 .thenReturn(buildSalon(UUID.randomUUID(), owner, "Salon B"));
 
@@ -706,7 +706,7 @@ class SalonServiceTest {
         when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
         // FIRST salon: only the first (primary) salon syncs onto the owner row — a later salon
         // must not move the owner's locality (see should_notSyncOwnerLocality_when_nonFirstSalonCreated).
-        when(salonRepository.existsByOwnerId(ownerId)).thenReturn(false);
+        when(salonRepository.countByOwnerIdAndIsActiveTrue(ownerId)).thenReturn(0L);
         when(salonRepository.save(any(Salon.class))).thenReturn(buildSalon(UUID.randomUUID(), owner, "Geo Salon"));
         when(settlementDisplayNameResolver.resolve(cityId)).thenReturn(Optional.of(VINNYTSIA));
 
@@ -1349,7 +1349,7 @@ class SalonServiceTest {
         var savedSalon = buildSalon(UUID.randomUUID(), owner, "Valid Geo Salon");
 
         when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
-        when(salonRepository.existsByOwnerId(ownerId)).thenReturn(true);
+        when(salonRepository.countByOwnerIdAndIsActiveTrue(ownerId)).thenReturn(1L);
         when(salonRepository.save(any(Salon.class))).thenReturn(savedSalon);
 
         SalonResponse response = salonService.createSalon(ownerId, request);
@@ -1368,7 +1368,7 @@ class SalonServiceTest {
         User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
         Salon salon = buildSalon(salonId, owner, "Active Salon");
 
-        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.findByIdAndOwnerId(salonId, ownerId)).thenReturn(Optional.of(salon));
         stubCleanEmptyStaffCascade(salonId);
         // No save() stub: `salon` is a managed entity in-tx; the isActive mutation flushes via
@@ -1379,7 +1379,100 @@ class SalonServiceTest {
 
         assertThat(salon.isActive()).isFalse();
         verify(salonRepository, never()).save(any());
-        verify(userRepository).findById(ownerId);
+        verify(userRepository).findByIdForUpdate(ownerId);
+    }
+
+    @Test
+    @DisplayName("deactivateSalon — stranded owner-master + non-primary active salon left → that salon becomes primary (inactive holders cleared first), row re-homed onto it")
+    void should_makeRemainingSalonPrimaryAndRehomeOwnerMaster_when_deletedSalonCarriedOwnerMaster() {
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        Salon deleted = buildSalon(salonId, owner, "Primary A");
+        deleted.setPrimary(true);
+        Salon remaining = buildSalon(UUID.randomUUID(), owner, "Second B");
+        remaining.setStreet("Franka St");
+        remaining.setBuildingNo("42");
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
+        when(salonRepository.findByIdAndOwnerId(salonId, ownerId)).thenReturn(Optional.of(deleted));
+        stubCleanEmptyStaffCascade(salonId);
+        when(masterService.isOwnerMasterStranded(ownerId)).thenReturn(true);
+        when(salonRepository.findFirstByOwnerIdAndIsActiveTrueOrderByIsPrimaryDescCreatedAtAscIdAsc(ownerId))
+                .thenReturn(Optional.of(remaining));
+
+        salonService.deactivateSalon(ownerId, salonId);
+
+        assertThat(deleted.isPrimary()).as("deleted salon releases is_primary").isFalse();
+        assertThat(remaining.isPrimary()).as("remaining salon becomes the primary").isTrue();
+        assertThat(owner.getCityId()).as("owner address follows the new primary").isEqualTo(remaining.getCityId());
+        assertThat(owner.getStreet()).isEqualTo("Franka St");
+        assertThat(owner.getBuildingNo()).isEqualTo("42");
+        var inOrder = org.mockito.Mockito.inOrder(salonRepository, masterService);
+        inOrder.verify(salonRepository).clearPrimaryOnInactiveSalons(ownerId);
+        inOrder.verify(masterService).createMasterForOwner(owner, remaining);
+    }
+
+    @Test
+    @DisplayName("deactivateSalon — stranded owner-master + an active PRIMARY salon left → re-homed onto it, no primary write")
+    void should_rehomeOwnerMasterWithoutPrimaryWrite_when_remainingSalonAlreadyPrimary() {
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        Salon deleted = buildSalon(salonId, owner, "Non-primary A");
+        Salon primary = buildSalon(UUID.randomUUID(), owner, "Primary B");
+        primary.setPrimary(true);
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
+        when(salonRepository.findByIdAndOwnerId(salonId, ownerId)).thenReturn(Optional.of(deleted));
+        stubCleanEmptyStaffCascade(salonId);
+        when(masterService.isOwnerMasterStranded(ownerId)).thenReturn(true);
+        when(salonRepository.findFirstByOwnerIdAndIsActiveTrueOrderByIsPrimaryDescCreatedAtAscIdAsc(ownerId))
+                .thenReturn(Optional.of(primary));
+
+        salonService.deactivateSalon(ownerId, salonId);
+
+        verify(salonRepository, never()).clearPrimaryOnInactiveSalons(any());
+        verify(masterService).createMasterForOwner(owner, primary);
+        assertThat(owner.getStreet()).as("no hand-over → owner address untouched").isNull();
+    }
+
+    @Test
+    @DisplayName("deactivateSalon — stranded owner-master and NO active salon left → nothing re-homed (createSalon does it later)")
+    void should_leaveOwnerMasterInactive_when_noActiveSalonRemains() {
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        Salon deleted = buildSalon(salonId, owner, "Only A");
+        deleted.setPrimary(true);
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
+        when(salonRepository.findByIdAndOwnerId(salonId, ownerId)).thenReturn(Optional.of(deleted));
+        stubCleanEmptyStaffCascade(salonId);
+        when(masterService.isOwnerMasterStranded(ownerId)).thenReturn(true);
+        when(salonRepository.findFirstByOwnerIdAndIsActiveTrueOrderByIsPrimaryDescCreatedAtAscIdAsc(ownerId))
+                .thenReturn(Optional.empty());
+
+        salonService.deactivateSalon(ownerId, salonId);
+
+        assertThat(deleted.isPrimary()).as("is_primary untouched (today's behaviour)").isTrue();
+        verify(salonRepository, never()).clearPrimaryOnInactiveSalons(any());
+        verify(masterService, never()).createMasterForOwner(any(), any());
+    }
+
+    @Test
+    @DisplayName("deactivateSalon — owner-master NOT stranded (it lives on another active salon) → no re-home lookup at all")
+    void should_notTouchOwnerMaster_when_ownerMasterNotStranded() {
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        Salon deleted = buildSalon(salonId, owner, "Non-master A");
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
+        when(salonRepository.findByIdAndOwnerId(salonId, ownerId)).thenReturn(Optional.of(deleted));
+        stubCleanEmptyStaffCascade(salonId);
+        when(masterService.isOwnerMasterStranded(ownerId)).thenReturn(false);
+
+        salonService.deactivateSalon(ownerId, salonId);
+
+        verify(salonRepository, never()).findFirstByOwnerIdAndIsActiveTrueOrderByIsPrimaryDescCreatedAtAscIdAsc(any());
+        verify(masterService, never()).createMasterForOwner(any(), any());
     }
 
     @Test
@@ -1389,7 +1482,7 @@ class SalonServiceTest {
         UUID salonId = UUID.randomUUID();
         User attacker = buildUser(attackerId, "attacker@beautica.com", Role.SALON_OWNER);
 
-        when(userRepository.findById(attackerId)).thenReturn(Optional.of(attacker));
+        when(userRepository.findByIdForUpdate(attackerId)).thenReturn(Optional.of(attacker));
         when(salonRepository.findByIdAndOwnerId(salonId, attackerId)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> salonService.deactivateSalon(attackerId, salonId))
@@ -1397,7 +1490,7 @@ class SalonServiceTest {
                 .hasMessageContaining("Salon not found or access denied");
 
         verify(salonRepository, never()).save(any());
-        verify(userRepository).findById(attackerId);
+        verify(userRepository).findByIdForUpdate(attackerId);
     }
 
     @Test
@@ -1408,14 +1501,14 @@ class SalonServiceTest {
         User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
         Salon salon = buildSalon(salonId, owner, "Active Salon");
 
-        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.findByIdAndOwnerId(salonId, ownerId)).thenReturn(Optional.of(salon));
         stubCleanEmptyStaffCascade(salonId);
         // No save() stub: managed entity flushes via dirty-checking (PERF-LOW redundant-write drop).
 
         salonService.deactivateSalon(ownerId, salonId);
 
-        verify(userRepository).findById(ownerId);
+        verify(userRepository).findByIdForUpdate(ownerId);
         verify(salonRepository).findByIdAndOwnerId(salonId, ownerId);
         verify(salonRepository, never()).save(any());
         verify(salonRepository, never()).findById(any());
@@ -1435,7 +1528,7 @@ class SalonServiceTest {
         UUID salonId = UUID.randomUUID();
         User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
         Salon salon = buildSalon(salonId, owner, "Active Salon");
-        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.findByIdAndOwnerId(salonId, ownerId)).thenReturn(Optional.of(salon));
         stubCleanEmptyStaffCascade(salonId);
 
@@ -1463,7 +1556,7 @@ class SalonServiceTest {
         var withoutPhoto = org.mockito.Mockito.mock(com.beautica.service.entity.ServiceDefinition.class);
         when(withoutPhoto.getPhotoR2Key()).thenReturn(null);
 
-        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.findByIdAndOwnerId(salonId, ownerId)).thenReturn(Optional.of(salon));
         stubCleanEmptyStaffCascade(salonId);
         when(serviceRepository.lockAllByOwnerOrderById(com.beautica.service.entity.OwnerType.SALON, salonId))
@@ -1483,7 +1576,7 @@ class SalonServiceTest {
         UUID salonId = UUID.randomUUID();
         User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
         Salon salon = buildSalon(salonId, owner, "Active Salon");
-        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.findByIdAndOwnerId(salonId, ownerId)).thenReturn(Optional.of(salon));
         stubCleanEmptyStaffCascade(salonId);
         org.springframework.transaction.support.TransactionSynchronizationManager.initSynchronization();
@@ -1528,7 +1621,7 @@ class SalonServiceTest {
         String logoKey = "salons/" + salonId + "/logo/l.jpg";
         var media = new com.beautica.media.repository.MediaFileKey(UUID.randomUUID(),
                 "portfolio/salons/" + salonId + "/p.jpg", com.beautica.media.entity.EntityType.SALON, salonId);
-        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.findByIdAndOwnerId(salonId, ownerId)).thenReturn(Optional.of(salon));
         when(mediaRepository.findMediaKeysByEntityTypeAndEntityId(
                 com.beautica.media.entity.EntityType.SALON, salonId)).thenReturn(List.of(media));
@@ -1558,7 +1651,7 @@ class SalonServiceTest {
         UUID salonId = UUID.randomUUID();
         User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
         Salon salon = buildSalon(salonId, owner, "Active Salon");
-        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.findByIdAndOwnerId(salonId, ownerId)).thenReturn(Optional.of(salon));
         stubCleanEmptyStaffCascade(salonId);
         ch.qos.logback.classic.Logger logger = (ch.qos.logback.classic.Logger)
@@ -1588,7 +1681,7 @@ class SalonServiceTest {
         UUID salonId = UUID.randomUUID();
         User client = buildUser(userId, "client@beautica.com", Role.CLIENT);
 
-        when(userRepository.findById(userId)).thenReturn(Optional.of(client));
+        when(userRepository.findByIdForUpdate(userId)).thenReturn(Optional.of(client));
 
         assertThatThrownBy(() -> salonService.deactivateSalon(userId, salonId))
                 .isInstanceOf(ForbiddenException.class)
@@ -1602,7 +1695,7 @@ class SalonServiceTest {
     void should_throwNotFoundException_when_deactivateSalonAndUserNotFound() {
         UUID ownerId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
-        when(userRepository.findById(ownerId)).thenReturn(Optional.empty());
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> salonService.deactivateSalon(ownerId, salonId))
                 .isInstanceOf(NotFoundException.class)
@@ -1652,7 +1745,7 @@ class SalonServiceTest {
                                 StaffClientReferenceType.BOOKING_CLIENT, 1)),
                 Instant.now());
 
-        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.findByIdAndOwnerId(salonId, ownerId)).thenReturn(Optional.of(salon));
         when(staffClientReferenceAuditService.runAuditForSalon(salonId)).thenReturn(violating);
 

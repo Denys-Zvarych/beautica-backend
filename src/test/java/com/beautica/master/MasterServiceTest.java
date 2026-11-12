@@ -1652,7 +1652,10 @@ class MasterServiceTest {
         when(requestedSalon.getOwner()).thenReturn(user);
         when(requestedSalon.getId()).thenReturn(salonId);
 
+        // The other salon is ACTIVE: an active row on an active other salon stays a 409
+        // (only a row on a DELETED salon is re-homed — isOwnerMasterStranded).
         Salon otherSalon = mock(Salon.class);
+        when(otherSalon.isActive()).thenReturn(true);
         when(otherSalon.getId()).thenReturn(otherSalonId);
 
         Master ownerMasterInOtherSalon = Master.builder()
@@ -1668,6 +1671,199 @@ class MasterServiceTest {
         assertThatThrownBy(() -> masterService.createMasterForOwner(user, requestedSalon))
                 .isInstanceOf(ConflictException.class);
 
+        verify(masterRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("createMasterForOwner — re-homes and reactivates an inactive owner-master row whose salon was deleted")
+    void should_rehomeAndReactivate_when_inactiveOwnerMasterBelongsToDeletedSalon() {
+        UUID userId = UUID.randomUUID();
+        UUID newSalonId = UUID.randomUUID();
+
+        User user = mock(User.class);
+        when(user.getRole()).thenReturn(Role.SALON_OWNER);
+        when(user.getId()).thenReturn(userId);
+
+        Salon newSalon = mock(Salon.class);
+        when(newSalon.isActive()).thenReturn(true);
+        when(newSalon.getOwner()).thenReturn(user);
+        when(newSalon.getId()).thenReturn(newSalonId);
+
+        Salon deletedSalon = mock(Salon.class);
+        when(deletedSalon.isActive()).thenReturn(false);
+
+        Master orphaned = Master.builder()
+                .user(user)
+                .salon(deletedSalon)
+                .masterType(MasterType.SALON_OWNER)
+                .avgRating(BigDecimal.ZERO)
+                .reviewCount(0)
+                .isActive(false)
+                .build();
+        when(masterRepository.findByUserIdWithSalon(userId)).thenReturn(Optional.of(orphaned));
+
+        Master result = masterService.createMasterForOwner(user, newSalon);
+
+        assertThat(result.isActive()).isTrue();
+        assertThat(result.getSalon()).isSameAs(newSalon);
+        verify(masterRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("createMasterForOwner — still 409 when the inactive owner-master row points at another ACTIVE salon")
+    void should_throwConflict_when_inactiveOwnerMasterBelongsToOtherActiveSalon() {
+        UUID userId = UUID.randomUUID();
+
+        User user = mock(User.class);
+        when(user.getRole()).thenReturn(Role.SALON_OWNER);
+        when(user.getId()).thenReturn(userId);
+
+        Salon requestedSalon = mock(Salon.class);
+        when(requestedSalon.isActive()).thenReturn(true);
+        when(requestedSalon.getOwner()).thenReturn(user);
+        when(requestedSalon.getId()).thenReturn(UUID.randomUUID());
+
+        Salon otherActiveSalon = mock(Salon.class);
+        when(otherActiveSalon.isActive()).thenReturn(true);
+        when(otherActiveSalon.getId()).thenReturn(UUID.randomUUID());
+
+        Master inactiveInOtherSalon = Master.builder()
+                .user(user)
+                .salon(otherActiveSalon)
+                .masterType(MasterType.SALON_OWNER)
+                .isActive(false)
+                .build();
+        when(masterRepository.findByUserIdWithSalon(userId)).thenReturn(Optional.of(inactiveInOtherSalon));
+
+        assertThatThrownBy(() -> masterService.createMasterForOwner(user, requestedSalon))
+                .isInstanceOf(ConflictException.class)
+                .hasMessage("Owner master profile already exists in a different salon");
+
+        verify(masterRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("isOwnerMasterStranded — true for an inactive SALON_OWNER row on a deleted salon")
+    void should_returnTrue_when_ownerMasterInactiveOnDeletedSalon() {
+        UUID userId = UUID.randomUUID();
+        Salon deletedSalon = mock(Salon.class);
+        when(deletedSalon.isActive()).thenReturn(false);
+        Master stranded = Master.builder()
+                .salon(deletedSalon)
+                .masterType(MasterType.SALON_OWNER)
+                .isActive(false)
+                .build();
+        when(masterRepository.findByUserIdWithSalon(userId)).thenReturn(Optional.of(stranded));
+
+        boolean result = masterService.isOwnerMasterStranded(userId);
+
+        assertThat(result).isTrue();
+    }
+
+    @Test
+    @DisplayName("isOwnerMasterStranded — false for an active row on an active salon, an inactive row on an active salon, a non-owner row, or no row")
+    void should_returnFalse_when_ownerMasterNotOnDeletedSalon() {
+        Salon activeSalon = mock(Salon.class);
+        when(activeSalon.isActive()).thenReturn(true);
+        Salon deletedSalon = mock(Salon.class);
+        UUID activeRowUser = UUID.randomUUID();
+        UUID inactiveOnActiveUser = UUID.randomUUID();
+        UUID nonOwnerUser = UUID.randomUUID();
+        UUID noRowUser = UUID.randomUUID();
+        when(masterRepository.findByUserIdWithSalon(activeRowUser)).thenReturn(Optional.of(Master.builder()
+                .salon(activeSalon).masterType(MasterType.SALON_OWNER).isActive(true).build()));
+        when(masterRepository.findByUserIdWithSalon(inactiveOnActiveUser)).thenReturn(Optional.of(Master.builder()
+                .salon(activeSalon).masterType(MasterType.SALON_OWNER).isActive(false).build()));
+        when(masterRepository.findByUserIdWithSalon(nonOwnerUser)).thenReturn(Optional.of(Master.builder()
+                .salon(deletedSalon).masterType(MasterType.SALON_MASTER).isActive(false).build()));
+        when(masterRepository.findByUserIdWithSalon(noRowUser)).thenReturn(Optional.empty());
+
+        boolean activeRow = masterService.isOwnerMasterStranded(activeRowUser);
+        boolean inactiveOnActive = masterService.isOwnerMasterStranded(inactiveOnActiveUser);
+        boolean nonOwner = masterService.isOwnerMasterStranded(nonOwnerUser);
+        boolean noRow = masterService.isOwnerMasterStranded(noRowUser);
+
+        assertThat(activeRow).as("active row on an active salon").isFalse();
+        assertThat(inactiveOnActive).as("inactive row on an active salon").isFalse();
+        assertThat(nonOwner).as("SALON_MASTER row").isFalse();
+        assertThat(noRow).as("no row").isFalse();
+    }
+
+    @Test
+    @DisplayName("isOwnerMasterStranded — true for an ACTIVE SALON_OWNER row left on a deleted salon (defence in depth)")
+    void should_returnTrue_when_activeOwnerMasterOnDeletedSalon() {
+        UUID userId = UUID.randomUUID();
+        Salon deletedSalon = mock(Salon.class);
+        when(deletedSalon.isActive()).thenReturn(false);
+        Master activeOnDeleted = Master.builder()
+                .salon(deletedSalon)
+                .masterType(MasterType.SALON_OWNER)
+                .isActive(true)
+                .build();
+        when(masterRepository.findByUserIdWithSalon(userId)).thenReturn(Optional.of(activeOnDeleted));
+
+        boolean result = masterService.isOwnerMasterStranded(userId);
+
+        assertThat(result).isTrue();
+    }
+
+    @Test
+    @DisplayName("createMasterForOwner — re-homes an ACTIVE owner-master row left on a deleted salon (defence in depth)")
+    void should_rehomeActiveOwnerMaster_when_itBelongsToDeletedSalon() {
+        UUID userId = UUID.randomUUID();
+
+        User user = mock(User.class);
+        when(user.getRole()).thenReturn(Role.SALON_OWNER);
+        when(user.getId()).thenReturn(userId);
+
+        Salon requestedSalon = mock(Salon.class);
+        when(requestedSalon.isActive()).thenReturn(true);
+        when(requestedSalon.getOwner()).thenReturn(user);
+        when(requestedSalon.getId()).thenReturn(UUID.randomUUID());
+
+        Salon deletedSalon = mock(Salon.class);
+        when(deletedSalon.isActive()).thenReturn(false);
+
+        Master activeOnDeleted = Master.builder()
+                .user(user)
+                .salon(deletedSalon)
+                .masterType(MasterType.SALON_OWNER)
+                .isActive(true)
+                .build();
+        when(masterRepository.findByUserIdWithSalon(userId)).thenReturn(Optional.of(activeOnDeleted));
+
+        Master result = masterService.createMasterForOwner(user, requestedSalon);
+
+        assertThat(result).isSameAs(activeOnDeleted);
+        assertThat(result.isActive()).isTrue();
+        assertThat(result.getSalon()).as("row re-homed onto the requested salon").isSameAs(requestedSalon);
+        verify(masterRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("createMasterForOwner — still 409 when the inactive owner-master row has no salon (null salon is not a deleted salon)")
+    void should_throwConflict_when_inactiveOwnerMasterHasNoSalon() {
+        UUID userId = UUID.randomUUID();
+
+        User user = mock(User.class);
+        when(user.getRole()).thenReturn(Role.SALON_OWNER);
+        when(user.getId()).thenReturn(userId);
+
+        Salon requestedSalon = mock(Salon.class);
+        when(requestedSalon.isActive()).thenReturn(true);
+        when(requestedSalon.getOwner()).thenReturn(user);
+
+        Master detached = Master.builder()
+                .user(user)
+                .masterType(MasterType.SALON_OWNER)
+                .isActive(false)
+                .build();
+        when(masterRepository.findByUserIdWithSalon(userId)).thenReturn(Optional.of(detached));
+
+        assertThatThrownBy(() -> masterService.createMasterForOwner(user, requestedSalon))
+                .isInstanceOf(ConflictException.class);
+
+        assertThat(detached.isActive()).as("row must stay inactive").isFalse();
         verify(masterRepository, never()).save(any());
     }
 

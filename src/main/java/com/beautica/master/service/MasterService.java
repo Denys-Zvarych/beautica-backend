@@ -182,10 +182,33 @@ public class MasterService {
     }
 
     /**
+     * True iff the owner's SALON_OWNER master row is stranded on a deleted salon — its salon inactive,
+     * whether the row itself is inactive (the normal shape: deleteSalonStaff deactivated it) or still
+     * active (defence in depth: a race or legacy write left it live on a dead salon) — i.e. exactly the
+     * shape {@link #createMasterForOwner(User, Salon)} re-homes onto a new salon.
+     * {@code SalonService.createSalon}/{@code deactivateSalon} use it to attach the owner-as-master to
+     * an active salon (SAL-04). No row, a non-owner row, a row with no salon, or any row on an ACTIVE
+     * salon → false (an active row on another active salon stays a 409 in createMasterForOwner).
+     */
+    @Transactional(readOnly = true)
+    public boolean isOwnerMasterStranded(UUID ownerId) {
+        return masterRepository.findByUserIdWithSalon(ownerId)
+                .filter(m -> m.getMasterType() == MasterType.SALON_OWNER)
+                .map(MasterService::isStrandedOnDeletedSalon)
+                .orElse(false);
+    }
+
+    /** Row (active or not) on a deleted (inactive) salon — the one shape that may be re-homed (SAL-04). */
+    private static boolean isStrandedOnDeletedSalon(Master m) {
+        return m.getSalon() != null && !m.getSalon().isActive();
+    }
+
+    /**
      * Creates (or reactivates) a {@code SALON_OWNER}-type master row for the given owner
-     * inside their primary salon. Called automatically from {@code SalonService.createSalon}
-     * on first-salon creation. The Phase 12.4 re-enable endpoint and its UUID overload were
-     * removed in Phase 346 — the owner-master row is permanent.
+     * inside the given salon. Called from {@code SalonService.createSalon} on first-salon
+     * creation, and when the owner's row is stranded on a deleted salon
+     * ({@link #isOwnerMasterStranded(UUID)}) — then the row is re-homed onto the new salon.
+     * The Phase 12.4 re-enable endpoint and its UUID overload were removed in Phase 346 — the owner-master row is permanent.
      *
      * <ul>
      *   <li>Idempotent: returns the existing active row if already present.</li>
@@ -223,11 +246,17 @@ public class MasterService {
                 throw new ConflictException(
                         "User already holds a master profile of a different type");
             }
-            if (m.getSalon() == null || !m.getSalon().getId().equals(salon.getId())) {
+            // An owner-master row whose salon was deleted (inactive) — inactive, or (defence in depth)
+            // still active — is re-homed onto the new salon by the branch below (m.setSalon(salon)):
+            // SAL-04 after an owner deletes the salon that carried it. Only a row attached to another
+            // ACTIVE salon (or to none) is a genuine conflict.
+            boolean stranded = isStrandedOnDeletedSalon(m);
+            if (!stranded
+                    && (m.getSalon() == null || !m.getSalon().getId().equals(salon.getId()))) {
                 throw new ConflictException(
                         "Owner master profile already exists in a different salon");
             }
-            if (!m.isActive()) {
+            if (!m.isActive() || stranded) {
                 m.setActive(true); // reactivate — Hibernate dirty-check flushes on commit
                 // Replace the lazy proxies loaded by findByUserId with the already-loaded
                 // entities held by the caller. This guarantees that when getMasterDetail(Master)
