@@ -46,8 +46,19 @@
 SET LOCAL lock_timeout = '5s';
 SET LOCAL statement_timeout = '1min';
 
--- 0. Capture the stuck owner-master rows.
-CREATE TEMPORARY TABLE v235_stuck_owner_masters AS
+-- 0. Capture the stuck owner-master rows into a session-local temp table. No drop statement: the
+--    expand/contract CI gate flags every DROP keyword (ON COMMIT DROP included), and ON COMMIT
+--    DROP / DELETE ROWS would empty the table after each statement under autocommit (the IT
+--    re-applies this script that way). Instead: IF NOT EXISTS + DELETE make a re-run on the same
+--    session safe, and the trailing DELETE leaves only an empty definition that ends with the
+--    session (flyway-pool keeps no idle connections).
+CREATE TEMPORARY TABLE IF NOT EXISTS v235_stuck_owner_masters (
+    master_id     UUID,
+    owner_id      UUID,
+    keep_salon_id UUID
+);
+DELETE FROM v235_stuck_owner_masters;
+INSERT INTO v235_stuck_owner_masters (master_id, owner_id, keep_salon_id)
 SELECT m.id      AS master_id,
        m.user_id AS owner_id,
        CASE WHEN own.is_active THEN m.salon_id END AS keep_salon_id
@@ -128,4 +139,4 @@ CROSS JOIN LATERAL (SELECT COALESCE(AVG(pm.master_avg), 0) AS avg_rating,
                              GROUP BY r.master_id) pm) agg
 WHERE s.id = a.salon_id;
 
-DROP TABLE v235_stuck_owner_masters;
+DELETE FROM v235_stuck_owner_masters;
