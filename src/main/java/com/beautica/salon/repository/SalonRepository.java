@@ -152,6 +152,19 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
     @Query("SELECT s.owner.id FROM Salon s WHERE s.id = :salonId")
     Optional<UUID> findOwnerIdById(@Param("salonId") UUID salonId);
 
+    /** Owner id + active flag, read before {@code SalonService#updateSalon} takes the owner lock. */
+    record SalonOwnerState(UUID ownerId, boolean active) {
+    }
+
+    /**
+     * Scalar pre-lock read for {@code SalonService#updateSalon}: the owner to lock (owner → salon
+     * order) and whether the salon was active before the wait, so a delete committed during the
+     * wait answers 404. No entity is hydrated — the salon is loaded only after the lock.
+     */
+    @Query("SELECT new com.beautica.salon.repository.SalonRepository$SalonOwnerState(s.owner.id, s.isActive) "
+            + "FROM Salon s WHERE s.id = :salonId")
+    Optional<SalonOwnerState> findOwnerStateById(@Param("salonId") UUID salonId);
+
     /**
      * Active salons sharing {@code salonId}'s owner, <b>excluding {@code salonId} itself</b>
      * (Phase 21.3b — {@code GET /salons/{salonId}/sibling-salons}). This is the destination
@@ -226,14 +239,35 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
      * Active-salon headcount for one owner — backs the per-owner portfolio cap enforced by
      * {@code SalonService.createSalon} ({@code MAX_ACTIVE_SALONS_PER_OWNER}, Perf LOW-3).
      *
-     * <p>Deliberately separate from {@link #existsByOwnerId}, which
-     * {@code createSalon} also calls: that one carries <b>no</b> {@code isActive} predicate because
-     * it decides {@code is_primary} ("has this owner EVER had a salon?"), whereas the cap governs
-     * the live portfolio — a deactivated salon must free its slot. Collapsing the two would either
-     * make a deactivated first salon re-claim {@code is_primary} or make the cap count soft-deleted
-     * rows. Both are index-served by the partial {@code idx_salons_owner_active_created} (V46).
+     * <p>Also decides the first-salon path ({@code is_primary} + owner-as-master, SAL-04): zero
+     * ACTIVE salons = first salon, so an owner who deleted their only salon starts over cleanly.
+     * Index-served by the partial {@code idx_salons_owner_active_created} (V46).
      */
     long countByOwnerIdAndIsActiveTrue(UUID ownerId);
+
+    /**
+     * True iff the owner has an ACTIVE primary salon — {@code SalonService.createSalon} makes the new
+     * salon primary when the owner-master is stranded and no active salon is primary (SAL-04).
+     */
+    boolean existsByOwnerIdAndIsActiveTrueAndIsPrimaryTrue(UUID ownerId);
+
+    /**
+     * Clears {@code is_primary} on the owner's DEACTIVATED salons — called by
+     * {@code SalonService.createSalon} before inserting a new primary row,
+     * because {@code idx_salons_owner_primary} (V56) also covers inactive rows. Bulk update without
+     * {@code clearAutomatically}: the caller holds the managed owner {@code User} it later mutates.
+     */
+    @Modifying
+    @Query("UPDATE Salon s SET s.isPrimary = false "
+            + "WHERE s.owner.id = :ownerId AND s.isActive = false AND s.isPrimary = true")
+    int clearPrimaryOnInactiveSalons(@Param("ownerId") UUID ownerId);
+
+    /**
+     * The owner's re-home target after a salon deletion (SAL-04): the ACTIVE primary salon if one
+     * exists, else the oldest active salon (created_at, then id — the same deterministic tie-break as
+     * V235). Empty iff the owner has no active salon. Used by {@code SalonService.deactivateSalon}.
+     */
+    Optional<Salon> findFirstByOwnerIdAndIsActiveTrueOrderByIsPrimaryDescCreatedAtAscIdAsc(UUID ownerId);
 
     /**
      * Lightweight existence + active-flag check (Phase 21.3 rotation PERF fix). Used by
@@ -362,8 +396,7 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
             """, nativeQuery = true)
     Optional<SalonImagePointers> lockImagePointers(@Param("salonId") UUID salonId);
 
-    // True iff the given owner already has at least one salon (primary or not).
-    // Used in SalonService.createSalon to decide is_primary = true/false.
+    // True iff the given owner already has at least one salon (primary or not, active or not).
     boolean existsByOwnerId(UUID ownerId);
 
     // Returns the owner's primary salon, if one exists.

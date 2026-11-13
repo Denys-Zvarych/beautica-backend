@@ -141,7 +141,7 @@ class SalonServiceAdminTest {
         UUID salonId = UUID.randomUUID();
         User admin = buildSalonAdmin(adminId, salonId);
 
-        when(userRepository.findById(adminId)).thenReturn(Optional.of(admin));
+        when(userRepository.findByIdForUpdate(adminId)).thenReturn(Optional.of(admin));
 
         assertThatThrownBy(() -> salonService.deactivateSalon(adminId, salonId))
                 .isInstanceOf(ForbiddenException.class)

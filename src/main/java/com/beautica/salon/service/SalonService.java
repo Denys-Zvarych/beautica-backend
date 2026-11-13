@@ -308,14 +308,32 @@ public class SalonService {
         // capped owner never writes a row. 409, not 400: the request is well-formed; it conflicts
         // with the owner's current state. See MAX_ACTIVE_SALONS_PER_OWNER for the limit's rationale.
         // Runs under the owner row lock taken above, so the count cannot go stale before the insert.
-        if (salonRepository.countByOwnerIdAndIsActiveTrue(owner.getId()) >= MAX_ACTIVE_SALONS_PER_OWNER) {
+        long activeSalonCount = salonRepository.countByOwnerIdAndIsActiveTrue(owner.getId());
+        if (activeSalonCount >= MAX_ACTIVE_SALONS_PER_OWNER) {
             throw new BusinessException(
                     HttpStatus.CONFLICT,
                     "Salon limit reached: an owner may hold at most "
                             + MAX_ACTIVE_SALONS_PER_OWNER + " active salons");
         }
 
-        boolean isFirstSalon = !salonRepository.existsByOwnerId(owner.getId());
+        // SAL-04 "the owner is always a master of their salon". Two shapes attach the owner-as-master
+        // to the new salon:
+        //   - first salon = no ACTIVE salon (an owner who deleted their only salon starts over; the
+        //     old existsByOwnerId check counted deleted rows and left /masters/me 404);
+        //   - stranded owner-master = the row is inactive on a deleted salon while other salons are
+        //     still active (owner deleted the primary salon that carried it) — re-homed here.
+        // An owner whose owner-master is active on an active salon takes neither branch (unchanged).
+        boolean isFirstSalon = activeSalonCount == 0;
+        boolean attachOwnerMaster = isFirstSalon || masterService.isOwnerMasterStranded(owner.getId());
+        // Exactly one ACTIVE primary: the new salon is primary when no active salon already is.
+        boolean becomesPrimary = isFirstSalon
+                || (attachOwnerMaster && !salonRepository.existsByOwnerIdAndIsActiveTrueAndIsPrimaryTrue(owner.getId()));
+        if (becomesPrimary) {
+            // A deleted salon keeps is_primary = true, and idx_salons_owner_primary (V56) is not
+            // filtered on is_active — release the flag before the new primary row is inserted.
+            // Bulk UPDATE runs immediately, so it precedes the INSERT flushed at commit.
+            salonRepository.clearPrimaryOnInactiveSalons(owner.getId());
+        }
 
         // Phase 12.1: a salon is a discoverable provider — its locality must satisfy the
         // most-specific-node rule before anything is persisted. Validate UNCONDITIONALLY
@@ -340,7 +358,7 @@ public class SalonService {
                 .phone(request.phone())
                 .instagramUrl(normalizeInstagram(request.instagramUrl()))
                 .isActive(true)
-                .isPrimary(isFirstSalon)
+                .isPrimary(becomesPrimary)
                 // Phase 376 D4: issued at creation, in the same INSERT (no follow-up UPDATE); legacy
                 // NULL rows are issued by BookingSlugService#issueMissingSalonSlugs. Never changes.
                 // 376 audit — the probe-then-INSERT cannot collide: generateSalonSlug takes the
@@ -363,21 +381,14 @@ public class SalonService {
         // loaded by lockOwnerForCreate (findByIdForUpdate) inside THIS transaction, so it is a
         // managed entity and dirty-checking flushes these setters on commit.
         //
-        // FIRST salon only: that salon is the PRIMARY one (isPrimary = isFirstSalon above, and it
-        // is never reassigned), and /users/me mirrors the primary salon's address — updateSalon's
-        // syncOwnerAddressFromPrimarySalon keeps it in step afterwards. A second salon must not
-        // move the owner's own locality onto itself. No master-detail eviction is needed: a first
-        // salon has no owner-master row yet (createMasterForOwner below creates it and evicts its
-        // own keys).
-        if (isFirstSalon && request.cityId() != null) {
-            owner.setCityId(request.cityId());
-            owner.setDistrictId(request.districtId());
-            // Same denorm UserService applies on a profile cityId write — without it the owner's
-            // /users/me kept its previous city/region text next to the salon's new cityId.
-            owner.applySettlementDisplayNames(settlementNames);
-            owner.setStreet(request.street());
-            owner.setBuildingNo(request.buildingNo());
-            owner.setLocationNote(request.locationNote());
+        // PRIMARY salon only (isPrimary = becomesPrimary above): /users/me mirrors the primary
+        // salon's address — updateSalon's syncOwnerAddressFromPrimarySalon keeps it in step
+        // afterwards. A non-primary salon must not move the owner's own locality onto itself. No master-detail eviction is needed here:
+        // createMasterForOwner below creates (or re-homes + reactivates) the owner-master row and
+        // evicts its own keys after commit.
+        if (becomesPrimary && request.cityId() != null) {
+            copyPrimaryAddressOntoOwner(owner, request.cityId(), request.districtId(), settlementNames,
+                    request.street(), request.buildingNo(), request.locationNote());
         }
 
         // Evict ownerSalons cache after commit so a concurrent reader cannot repopulate
@@ -390,11 +401,12 @@ public class SalonService {
         // this method's gate is ever widened the way updateSalon's was.
         evictOwnerSalonsCacheAfterCommit(ownerIdOf(savedSalon));
 
-        // Auto-create the owner's SALON_OWNER-type master profile on first-salon creation.
+        // Auto-create the owner's SALON_OWNER-type master profile on first-salon creation, or
+        // re-home a stranded one onto this salon (attachOwnerMaster above).
         // Passes already-loaded entities to avoid redundant DB round-trips (Finding 3/4).
         // Runs inside the same @Transactional boundary: if master creation fails, the
         // salon row is rolled back too (atomicity per Phase 12.2 architecture decision).
-        if (isFirstSalon) {
+        if (attachOwnerMaster) {
             masterService.createMasterForOwner(owner, savedSalon);
         }
 
@@ -402,13 +414,19 @@ public class SalonService {
         // GET /users/me is cached as of this cycle:
         //   1. the locality sync above (cityId/districtId/street/buildingNo/locationNote — five
         //      fields carried verbatim by UserProfileResponse), and
-        //   2. on first salon, createMasterForOwner, which flips hasMasterProfile to true.
-        // Unconditional rather than mirroring the `request.cityId() != null` / `isFirstSalon`
+        //   2. when attaching the owner-master, createMasterForOwner, which flips hasMasterProfile to true.
+        // Unconditional rather than mirroring the `request.cityId() != null` / `attachOwnerMaster`
         // guards: an evict that fires when nothing changed costs one recompute of a 5-minute key,
         // whereas re-deriving those two guards on every future edit of this method is how the
         // eviction goes missing. (createMasterForOwner also evicts on its own path — both are
         // idempotent per-key evicts.)
         userProfileCacheEvictor.evictAfterCommit(ownerIdOf(savedSalon));
+
+        // The owner-master was created or re-homed onto this salon — it now appears in (or moves
+        // within) master discovery. Cleared after commit; registered last among the evictions.
+        if (attachOwnerMaster) {
+            evictSearchCachesAfterCommit(SearchCacheNames.MASTERS_ALL);
+        }
 
         // settlementNames was resolved above for this very cityId — reused, not re-looked-up.
         return SalonResponse.from(
@@ -478,6 +496,49 @@ public class SalonService {
      * owner-master's {@code salon_id} is this primary salon (both are fixed at first-salon
      * creation and never reassigned).
      */
+    /**
+     * The owner's {@code /users/me} address mirrors their PRIMARY salon. Written whenever a salon
+     * BECOMES primary — {@code createSalon} (new primary) and {@code rehomeStrandedOwnerMaster}
+     * (primary handed over on salon deletion). {@code owner} must be managed in the caller's
+     * transaction (dirty-checking flushes it); the caller evicts {@code user-profile}.
+     */
+    private static void copyPrimaryAddressOntoOwner(User owner, UUID cityId, UUID districtId,
+            SettlementDisplayNames settlementNames, String street, String buildingNo, String locationNote) {
+        owner.setCityId(cityId);
+        owner.setDistrictId(districtId);
+        // Same denorm UserService applies on a profile cityId write — without it the owner's
+        // /users/me kept its previous city/region text next to the salon's new cityId.
+        owner.applySettlementDisplayNames(settlementNames);
+        owner.setStreet(street);
+        owner.setBuildingNo(buildingNo);
+        owner.setLocationNote(locationNote);
+    }
+
+    /**
+     * Owner lock FIRST, then the salon load — the owner → salon order {@code createSalon} and
+     * {@code deactivateSalon} already use ({@link #lockOwnerForCreate}). Without it, an update's
+     * flush (salons, then users for a primary-salon address sync) inverted that order and a
+     * concurrent same-owner delete could deadlock (40P01).
+     *
+     * <p>Loading the salon AFTER the lock also means it is never a stale pre-delete snapshot: a
+     * concurrent delete that moved {@code is_primary} onto this salon (re-home) or deactivated it is
+     * committed before we read, so the flush cannot write back a stale {@code is_primary} or
+     * {@code is_active}. If the salon was active before we waited and a delete committed meanwhile,
+     * answer 404 rather than edit a salon the owner just deleted; a salon already inactive before
+     * the request keeps today's path. A missing salon has no owner to lock and falls through to the
+     * same 404 as before.
+     */
+    private Salon lockOwnerThenLoadSalon(UUID salonId) {
+        var stateBeforeLock = salonRepository.findOwnerStateById(salonId);
+        stateBeforeLock.ifPresent(state -> lockOwnerForCreate(state.ownerId()));
+        var salon = salonRepository.findById(salonId)
+                .orElseThrow(() -> new NotFoundException("Salon not found: " + salonId));
+        if (stateBeforeLock.map(SalonRepository.SalonOwnerState::active).orElse(false) && !salon.isActive()) {
+            throw new NotFoundException("Salon not found: " + salonId);
+        }
+        return salon;
+    }
+
     private void syncOwnerAddressFromPrimarySalon(Salon salon, UpdateSalonRequest request,
             SettlementDisplayNames writtenSettlement) {
         User owner = salon.getOwner();
@@ -805,8 +866,7 @@ public class SalonService {
 
     @Transactional
     public SalonResponse updateSalon(UUID actorId, UUID salonId, UpdateSalonRequest request) {
-        var salon = salonRepository.findById(salonId)
-                .orElseThrow(() -> new NotFoundException("Salon not found: " + salonId));
+        var salon = lockOwnerThenLoadSalon(salonId);
 
         // Ownership already enforced by @PreAuthorize("... @authz.canManageSalon(...)") on
         // the controller — no redundant DB round-trip needed here.
@@ -1475,7 +1535,14 @@ public class SalonService {
      */
     @Transactional(timeout = DEACTIVATE_SALON_TIMEOUT_SECONDS)
     public void deactivateSalon(UUID ownerId, UUID salonId) {
-        var caller = userRepository.findById(ownerId)
+        // PESSIMISTIC_WRITE on the OWNER row, the same lock createSalon takes (lockOwnerForCreate).
+        // SAL-04: the owner-master re-home below is a read-then-write over the owner's whole
+        // portfolio (isOwnerMasterStranded + the active-salon pick). Two concurrent deletes of
+        // salons A and B by the same owner would otherwise each read a pre-commit snapshot — one
+        // re-homes the row onto the salon the other is deleting, leaving it ACTIVE on a deleted
+        // salon and every later createSalon a 409. Taken FIRST, before any salon row is read, so
+        // every delete/create of one owner serialises and each sees the previous one's commit.
+        var caller = lockOwnerForCreate(ownerId)
                 .orElseThrow(() -> new NotFoundException("User not found: " + ownerId));
 
         if (caller.getRole() != Role.SALON_OWNER) {
@@ -1596,6 +1663,10 @@ public class SalonService {
         serviceRepository.deactivateAllByOwner(OwnerType.SALON, salonId);
         favoriteRepository.deleteAllByTargetTypeAndTargetId(FavoriteTargetType.SALON, salonId);
 
+        // SAL-04 — runs AFTER deleteSalonStaff, which deactivated the owner-master row if it lived here.
+        // Keyed off the salon's OWNER, never the actor (equal today via findByIdAndOwnerId).
+        boolean ownerMasterRehomed = rehomeStrandedOwnerMaster(salon.getOwner(), salon);
+
         // Evict after commit — replaces pre-commit @CacheEvict annotations (PERF-MEDIUM-2).
         // Also evicts search:salons because a deactivated salon must not appear in discovery
         // results for the remaining TTL window (PERF-HIGH-2).
@@ -1606,7 +1677,11 @@ public class SalonService {
         // keyed on an actor again.
         evictOwnerSalonsCacheAfterCommit(ownerIdOf(salon));
         evictSalonDetailCacheAfterCommit(salonId);
-        evictSearchCachesAfterCommit(SearchCacheNames.SALONS_ALL);
+        // A re-home moves the owner-master onto another salon (salon name/locality on its search
+        // row) — master discovery pages are cleared too, after commit, same as the salon pages.
+        evictSearchCachesAfterCommit(ownerMasterRehomed
+                ? SEARCH_CACHES_ON_LOCALITY_CHANGE
+                : SearchCacheNames.SALONS_ALL);
 
         // Phase 268 D2-D4/D8 — registered LAST, after the cache evictions, so a synchronization
         // ordering hiccup among the cheap in-memory evictions above can never prevent the R2 sweep
@@ -1615,6 +1690,48 @@ public class SalonService {
         // method's own javadoc.
         purgeSalonMediaAfterCommit(salonId, logoAtDeletion, coverAtDeletion, salonMediaKeys);
         servicePhotoBlobPurger.purgeAfterCommit(servicePhotoKeys);
+    }
+
+    /**
+     * SAL-04 "the owner is always a master of their salon", at salon-deletion time. When the deleted
+     * salon carried the owner-master row ({@link MasterService#isOwnerMasterStranded} — inactive on an
+     * inactive salon) and the owner still has an ACTIVE salon, the row is re-homed onto the owner's
+     * active primary salon, or — none being primary — onto the oldest active salon, which becomes
+     * primary first. The re-home + reactivation + after-commit cache evictions are
+     * {@link MasterService#createMasterForOwner}'s stranded-row branch, the same one createSalon uses.
+     * No active salon left → no-op: the row stays inactive and createSalon re-homes it later.
+     * A primary hand-over also copies the new primary's address onto the owner (same helper as createSalon).
+     *
+     * <p>Primary hand-over order: the deleted salon's {@code is_primary} is cleared in memory, then
+     * {@code clearPrimaryOnInactiveSalons} auto-flushes it and clears any other inactive holder in
+     * the DB, BEFORE the target's flag is set — {@code idx_salons_owner_primary} (V56) also covers
+     * inactive rows, and {@code order_updates} sorts the commit-time UPDATEs by id, not by intent.
+     *
+     * @return {@code true} iff the owner-master row was re-homed (the caller evicts master search)
+     */
+    private boolean rehomeStrandedOwnerMaster(User owner, Salon deletedSalon) {
+        if (!masterService.isOwnerMasterStranded(owner.getId())) {
+            return false;
+        }
+        Optional<Salon> target = salonRepository
+                .findFirstByOwnerIdAndIsActiveTrueOrderByIsPrimaryDescCreatedAtAscIdAsc(owner.getId());
+        if (target.isEmpty()) {
+            return false;
+        }
+        Salon home = target.get();
+        if (!home.isPrimary()) {
+            deletedSalon.setPrimary(false);
+            salonRepository.clearPrimaryOnInactiveSalons(owner.getId());
+            home.setPrimary(true);
+            evictSalonDetailCacheAfterCommit(home.getId());
+            // The owner's address follows the new primary, exactly as createSalon's new-primary path.
+            copyPrimaryAddressOntoOwner(owner, home.getCityId(), home.getDistrictId(),
+                    settlementDisplayNameResolver.resolve(home.getCityId()).orElse(null),
+                    home.getStreet(), home.getBuildingNo(), home.getLocationNote());
+            userProfileCacheEvictor.evictAfterCommit(owner.getId());
+        }
+        masterService.createMasterForOwner(owner, home);
+        return true;
     }
 
     /**
@@ -2146,6 +2263,11 @@ public class SalonService {
      * <p><b>Cost.</b> None on the happy path: {@code createSalon} had to load the owner row
      * regardless, so this replaces that read rather than adding a statement. Contention is
      * per-owner and salon creation is a rare, human-paced write.
+     *
+     * <p>Also taken first by {@link #deactivateSalon} (SAL-04): deletes and creates by one owner
+     * serialise on the same row, so the owner-master re-home never acts on a stale portfolio.
+     * And by {@link #updateSalon} (every update, before the salon is even loaded), so all
+     * three paths lock owner → salon in one order (no 40P01 between update and delete).
      *
      * <p>Isolated into its own (public, not {@code private}) method so a concurrency test can
      * {@code @SpyBean} it and pause the calling thread here — after the lock is granted, before the
