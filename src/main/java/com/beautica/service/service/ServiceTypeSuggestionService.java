@@ -5,6 +5,8 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.config.PublicBaseUrlProperties;
 import com.beautica.notification.EmailService;
 import com.beautica.notification.inapp.service.InAppNotificationService;
+import com.beautica.notification.service.NotificationOutboxService;
+import com.beautica.notification.service.RequestKind;
 import com.beautica.search.service.SearchSuggestionCatalogue;
 import com.beautica.service.entity.ServiceTypeSuggestion;
 import com.beautica.service.repository.ServiceTypeSuggestionRepository;
@@ -66,6 +68,7 @@ public class ServiceTypeSuggestionService {
     private final ServiceTypePromotionService promotionService;
     private final Clock clock;
     private final InAppNotificationService inAppNotificationService;
+    private final NotificationOutboxService notificationOutboxService;
 
     @Value("${app.admin-email}")
     private String adminEmail;
@@ -280,11 +283,23 @@ public class ServiceTypeSuggestionService {
             promotionService.promote(suggestion);
             // Same transaction (MANDATORY): a promotion failure above rolls the item back with the approval.
             inAppNotificationService.notifySuggestionDecided(suggestion, true);
+            enqueueDecisionEmail(suggestion, true);
             return DecisionOutcome.APPROVED;
         }
         suggestion.reject(now, reason);
         inAppNotificationService.notifySuggestionDecided(suggestion, false);
+        enqueueDecisionEmail(suggestion, false);
         return DecisionOutcome.REJECTED;
+    }
+
+    /**
+     * Phase 491 — the requester's decision e-mail (NTF-35), one outbox row in the decision transaction
+     * (MANDATORY); skipped by the outbox when there is no requester. Ids only: the name and the reason
+     * are read at drain time.
+     */
+    private void enqueueDecisionEmail(ServiceTypeSuggestion suggestion, boolean approved) {
+        notificationOutboxService.enqueueRequestDecided(RequestKind.SERVICE_TYPE_SUGGESTION,
+                String.valueOf(suggestion.getId()), approved, suggestion.getRequestedByUserId());
     }
 
     private Optional<ServiceTypeSuggestion> findLivePending(String rawToken) {

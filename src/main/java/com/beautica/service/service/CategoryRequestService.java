@@ -5,6 +5,8 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.config.PublicBaseUrlProperties;
 import com.beautica.notification.EmailService;
 import com.beautica.notification.inapp.service.InAppNotificationService;
+import com.beautica.notification.service.NotificationOutboxService;
+import com.beautica.notification.service.RequestKind;
 import com.beautica.search.service.SearchSuggestionCatalogue;
 import com.beautica.service.dto.ApprovedCategoryResponse;
 import com.beautica.service.dto.CategoryRequestResponse;
@@ -77,6 +79,7 @@ public class CategoryRequestService {
     private final ServiceTypeSuggestionService serviceTypeSuggestionService;
     private final Clock clock;
     private final InAppNotificationService inAppNotificationService;
+    private final NotificationOutboxService notificationOutboxService;
 
     @Value("${app.admin-email}")
     private String adminEmail;
@@ -247,11 +250,23 @@ public class CategoryRequestService {
             // Same transaction as the decision (MANDATORY): the feed item commits or rolls back with it.
             // Only reached on the PENDING transition — ALREADY_DECIDED / INVALID_OR_EXPIRED returned above.
             inAppNotificationService.notifyCategoryRequestDecided(category, true);
+            enqueueDecisionEmail(category, true);
             return DecisionOutcome.APPROVED;
         }
         category.reject(now, reason);
         inAppNotificationService.notifyCategoryRequestDecided(category, false);
+        enqueueDecisionEmail(category, false);
         return DecisionOutcome.REJECTED;
+    }
+
+    /**
+     * Phase 491 — the requester's decision e-mail (NTF-35), one outbox row in the decision transaction
+     * (MANDATORY); skipped by the outbox when there is no requester. Ids only: the name and the reason
+     * are read at drain time.
+     */
+    private void enqueueDecisionEmail(PlatformCategory category, boolean approved) {
+        notificationOutboxService.enqueueRequestDecided(RequestKind.CATEGORY_REQUEST,
+                String.valueOf(category.getId()), approved, category.getRequestedByUserId());
     }
 
     /**

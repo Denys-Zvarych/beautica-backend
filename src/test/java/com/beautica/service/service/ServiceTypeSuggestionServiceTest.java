@@ -5,6 +5,8 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.config.PublicBaseUrlProperties;
 import com.beautica.notification.EmailService;
 import com.beautica.notification.inapp.service.InAppNotificationService;
+import com.beautica.notification.service.NotificationOutboxService;
+import com.beautica.notification.service.RequestKind;
 import com.beautica.service.entity.ServiceTypeSuggestion;
 import com.beautica.service.entity.ServiceTypeSuggestionStatus;
 import com.beautica.service.repository.ServiceTypeSuggestionRepository;
@@ -33,9 +35,11 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
 /**
@@ -64,6 +68,7 @@ class ServiceTypeSuggestionServiceTest {
     @Mock private PublicBaseUrlProperties publicBaseUrlProperties;
     @Mock private ServiceTypePromotionService promotionService;
     @Mock private InAppNotificationService inAppNotificationService;
+    @Mock private NotificationOutboxService notificationOutboxService;
 
     private ServiceTypeSuggestionService service;
 
@@ -72,7 +77,8 @@ class ServiceTypeSuggestionServiceTest {
         Clock fixedClock = Clock.fixed(NOW, ZoneOffset.UTC);
         service = new ServiceTypeSuggestionService(
                 suggestionRepository, tokenGenerator, emailService,
-                publicBaseUrlProperties, promotionService, fixedClock, inAppNotificationService);
+                publicBaseUrlProperties, promotionService, fixedClock, inAppNotificationService,
+                notificationOutboxService);
         ReflectionTestUtils.setField(service, "adminEmail", ADMIN_EMAIL);
     }
 
@@ -452,5 +458,66 @@ class ServiceTypeSuggestionServiceTest {
         assertThat(service.reject("unknown", "r")).isEqualTo(DecisionOutcome.ALREADY_DECIDED);
 
         verifyNoInteractions(inAppNotificationService);
+    }
+
+    // ── phase 491: request-decision e-mail (outbox) ───────────────────────────
+
+    private ServiceTypeSuggestion pendingWithRequester(UUID requester) {
+        ServiceTypeSuggestion pending = ServiceTypeSuggestion.ofPending(CATEGORY, SUGGESTED, DESCRIPTION, requester,
+                TOKEN_HASH, OffsetDateTime.ofInstant(NOW.plusSeconds(3600), ZoneOffset.UTC));
+        ReflectionTestUtils.setField(pending, "id", UUID.randomUUID());
+        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
+        when(suggestionRepository.findByTokenHashForUpdate(TOKEN_HASH)).thenReturn(Optional.of(pending));
+        return pending;
+    }
+
+    @Test
+    @DisplayName("approve enqueues exactly one REQUEST_DECIDED (approved) for the requester, after the feed item")
+    void should_enqueueOneApprovedDecisionEmail_when_pendingApproved() {
+        UUID requester = UUID.randomUUID();
+        ServiceTypeSuggestion pending = pendingWithRequester(requester);
+
+        service.approve(RAW_TOKEN);
+
+        org.mockito.InOrder order = org.mockito.Mockito.inOrder(inAppNotificationService, notificationOutboxService);
+        order.verify(inAppNotificationService).notifySuggestionDecided(pending, true);
+        order.verify(notificationOutboxService).enqueueRequestDecided(
+                RequestKind.SERVICE_TYPE_SUGGESTION, pending.getId().toString(), true, requester);
+        verifyNoMoreInteractions(notificationOutboxService);
+    }
+
+    @Test
+    @DisplayName("reject enqueues exactly one REQUEST_DECIDED (rejected) for the requester")
+    void should_enqueueOneRejectedDecisionEmail_when_pendingRejected() {
+        UUID requester = UUID.randomUUID();
+        ServiceTypeSuggestion pending = pendingWithRequester(requester);
+
+        service.reject(RAW_TOKEN, "не підходить");
+
+        verify(notificationOutboxService).enqueueRequestDecided(
+                RequestKind.SERVICE_TYPE_SUGGESTION, pending.getId().toString(), false, requester);
+        verifyNoMoreInteractions(notificationOutboxService);
+    }
+
+    @Test
+    @DisplayName("a suggestion without a requester passes a null recipient (the outbox skips it)")
+    void should_passNullRecipient_when_requesterIsNull() {
+        ServiceTypeSuggestion pending = pendingWithRequester(null);
+
+        service.reject(RAW_TOKEN, "r");
+
+        verify(notificationOutboxService).enqueueRequestDecided(
+                RequestKind.SERVICE_TYPE_SUGGESTION, pending.getId().toString(), false, null);
+    }
+
+    @Test
+    @DisplayName("a promotion failure on approve never enqueues the decision e-mail")
+    void should_notEnqueueDecisionEmail_when_promotionThrows() {
+        ServiceTypeSuggestion pending = pendingWithRequester(UUID.randomUUID());
+        doThrow(new IllegalStateException("boom")).when(promotionService).promote(pending);
+
+        assertThatThrownBy(() -> service.approve(RAW_TOKEN)).isInstanceOf(IllegalStateException.class);
+
+        verifyNoInteractions(notificationOutboxService);
     }
 }

@@ -6,6 +6,8 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.config.PublicBaseUrlProperties;
 import com.beautica.notification.EmailService;
 import com.beautica.notification.inapp.service.InAppNotificationService;
+import com.beautica.notification.service.NotificationOutboxService;
+import com.beautica.notification.service.RequestKind;
 import com.beautica.service.dto.CategoryRequestResponse;
 import com.beautica.service.dto.CreateCategoryRequestRequest;
 import com.beautica.service.entity.PlatformCategory;
@@ -61,6 +63,7 @@ class CategoryRequestServiceTest {
     @Mock private PublicBaseUrlProperties publicBaseUrlProperties;
     @Mock private ServiceTypeSuggestionService serviceTypeSuggestionService;
     @Mock private InAppNotificationService inAppNotificationService;
+    @Mock private NotificationOutboxService notificationOutboxService;
 
     private CategoryRequestService service;
 
@@ -69,7 +72,8 @@ class CategoryRequestServiceTest {
         Clock fixedClock = Clock.fixed(NOW, ZoneOffset.UTC);
         service = new CategoryRequestService(
                 platformCategoryRepository, tokenGenerator, emailService,
-                publicBaseUrlProperties, serviceTypeSuggestionService, fixedClock, inAppNotificationService);
+                publicBaseUrlProperties, serviceTypeSuggestionService, fixedClock, inAppNotificationService,
+                notificationOutboxService);
         ReflectionTestUtils.setField(service, "adminEmail", ADMIN_EMAIL);
     }
 
@@ -563,5 +567,62 @@ class CategoryRequestServiceTest {
 
         assertThat(pending.getDecisionReason()).isNull();
         verify(inAppNotificationService).notifyCategoryRequestDecided(pending, false);
+    }
+
+    // ── phase 491: request-decision e-mail (outbox) ───────────────────────────
+
+    private PlatformCategory pendingWithId(UUID requester, long id) {
+        PlatformCategory pending = pendingCategory(
+                OffsetDateTime.ofInstant(NOW.plusSeconds(3600), ZoneOffset.UTC), requester, null);
+        ReflectionTestUtils.setField(pending, "id", id);
+        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(TOKEN_HASH);
+        when(platformCategoryRepository.findByTokenHashForUpdate(TOKEN_HASH)).thenReturn(Optional.of(pending));
+        return pending;
+    }
+
+    @Test
+    @DisplayName("approve enqueues exactly one REQUEST_DECIDED (approved) for the requester")
+    void should_enqueueOneApprovedDecisionEmail_when_pendingApproved() {
+        UUID requester = UUID.randomUUID();
+        pendingWithId(requester, 42L);
+
+        service.approve(RAW_TOKEN);
+
+        verify(notificationOutboxService).enqueueRequestDecided(RequestKind.CATEGORY_REQUEST, "42", true, requester);
+        verifyNoMoreInteractions(notificationOutboxService);
+    }
+
+    @Test
+    @DisplayName("reject enqueues exactly one REQUEST_DECIDED (rejected) for the requester")
+    void should_enqueueOneRejectedDecisionEmail_when_pendingRejected() {
+        UUID requester = UUID.randomUUID();
+        pendingWithId(requester, 43L);
+
+        service.reject(RAW_TOKEN, "дублікат");
+
+        verify(notificationOutboxService).enqueueRequestDecided(RequestKind.CATEGORY_REQUEST, "43", false, requester);
+        verifyNoMoreInteractions(notificationOutboxService);
+    }
+
+    @Test
+    @DisplayName("a request without a requester passes a null recipient (the outbox skips it)")
+    void should_passNullRecipient_when_requesterIsNull() {
+        pendingWithId(null, 44L);
+
+        service.reject(RAW_TOKEN, "r");
+
+        verify(notificationOutboxService).enqueueRequestDecided(RequestKind.CATEGORY_REQUEST, "44", false, null);
+    }
+
+    @Test
+    @DisplayName("ALREADY_DECIDED / expired tokens never enqueue a decision e-mail")
+    void should_notEnqueueDecisionEmail_when_alreadyDecided() {
+        PlatformCategory decided = pendingWithId(UUID.randomUUID(), 45L);
+        decided.approve(OffsetDateTime.ofInstant(NOW, ZoneOffset.UTC));
+        ReflectionTestUtils.setField(decided, "tokenHash", TOKEN_HASH);
+
+        assertThat(service.approve(RAW_TOKEN)).isEqualTo(DecisionOutcome.ALREADY_DECIDED);
+
+        verifyNoInteractions(notificationOutboxService);
     }
 }

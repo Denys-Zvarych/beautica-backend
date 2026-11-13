@@ -94,5 +94,15 @@ public enum OutboxEventType {
      * master is not the actor. Payload {@code {"actorUserId":"<uuid>"}}; aggregate = booking id (the
      * visit's first item for a whole-visit decline).
      */
-    MASTER_BOOKING_DECLINED
+    MASTER_BOOKING_DECLINED,
+
+    /**
+     * Phase 491 — the REQUESTER's e-mail that an admin approved or rejected their category request or
+     * service-type suggestion (NTF-35). One row per decision, in the decision transaction. {@code
+     * aggregate_id} is the requester's user id ({@code platform_categories.id} is a BIGINT); the payload
+     * holds ids and the flag only — {@code kind}, {@code requestId}, {@code approved},
+     * {@code recipientUserId}. The name and the admin's reason are read at drain time, so no free text
+     * sits in the outbox. Widened into the CHECK by {@code V238__outbox_event_type_request_decided.sql}.
+     */
+    REQUEST_DECIDED
 }
