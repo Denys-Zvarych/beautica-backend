@@ -4,6 +4,7 @@ import com.beautica.auth.Role;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.master.entity.Master;
+import com.beautica.notification.RequestDecisionEmailExpectedCopy;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.user.User;
@@ -1491,5 +1492,109 @@ class EmailNotificationServiceTest {
         assertThat(errorLines(events)).as("BrevoApiMailSender already logged the ERROR").isEmpty();
         assertThat(events).anyMatch(e -> e.getLevel() == ch.qos.logback.classic.Level.WARN
                 && e.getFormattedMessage().contains("reported by the brevo-api transport"));
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 491 — sendRequestDecisionEmail (real Thymeleaf engine: escaping is the point)
+    // -------------------------------------------------------------------------
+
+    private MimeMessage sendDecisionWithRealEngine(RequestKind kind, boolean approved, String name, String reason) {
+        var resolver = new org.thymeleaf.templateresolver.ClassLoaderTemplateResolver();
+        resolver.setPrefix("templates/");
+        resolver.setSuffix(".html");
+        resolver.setTemplateMode(org.thymeleaf.templatemode.TemplateMode.HTML);
+        resolver.setCharacterEncoding("UTF-8");
+        var engine = new SpringTemplateEngine();
+        engine.setTemplateResolver(resolver);
+        MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
+        when(mailSender.createMimeMessage()).thenReturn(realMessage);
+        new EmailNotificationService(mailSender, engine, FROM_ADDRESS)
+                .sendRequestDecisionEmail("requester@example.com", kind, approved, name, reason);
+        verify(mailSender).send(realMessage);
+        return realMessage;
+    }
+
+    private static String htmlOf(MimeMessage message) throws Exception {
+        message.saveChanges();
+        MimeMultipart outer = (MimeMultipart) message.getContent();
+        MimeMultipart related = (MimeMultipart) outer.getBodyPart(0).getContent();
+        return (String) related.getBodyPart(0).getContent();
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest(name = "{0} approved={1}")
+    @org.junit.jupiter.params.provider.CsvSource({
+            "CATEGORY_REQUEST, true",
+            "CATEGORY_REQUEST, false",
+            "SERVICE_TYPE_SUGGESTION, true",
+            "SERVICE_TYPE_SUGGESTION, false"
+    })
+    @DisplayName("Phase 491: the four Ukrainian subjects by kind × decision")
+    void should_setDecisionSubject_when_sendRequestDecisionEmailCalled(RequestKind kind, boolean approved)
+            throws Exception {
+        MimeMessage message = sendDecisionWithRealEngine(kind, approved, "Нейл-арт", null);
+
+        assertThat(message.getSubject())
+                .isEqualTo(RequestDecisionEmailExpectedCopy.subject(kind, approved, "Нейл-арт"));
+        assertThat(message.getAllRecipients()).extracting(Object::toString).containsExactly("requester@example.com");
+    }
+
+    @Test
+    @DisplayName("Phase 491: an approve renders the approve copy and no reason block, even if a reason is passed")
+    void should_renderNoReasonBlock_when_approved() throws Exception {
+        String html = htmlOf(sendDecisionWithRealEngine(RequestKind.SERVICE_TYPE_SUGGESTION, true, "Балаяж", "ignored"));
+
+        assertThat(html)
+                .contains(RequestDecisionEmailExpectedCopy.bodyLine(RequestKind.SERVICE_TYPE_SUGGESTION, true, "Балаяж"))
+                .doesNotContain(RequestDecisionEmailExpectedCopy.REASON_MARKER)
+                .doesNotContain("ignored")
+                .doesNotContain(RequestDecisionEmailExpectedCopy.bodyLine(
+                        RequestKind.SERVICE_TYPE_SUGGESTION, false, "Балаяж"));
+    }
+
+    @Test
+    @DisplayName("Phase 491: a reject with a reason shows «Причина: …»")
+    void should_renderReason_when_rejectedWithReason() throws Exception {
+        String html = htmlOf(sendDecisionWithRealEngine(RequestKind.CATEGORY_REQUEST, false, "Нейл-арт", "дублікат"));
+
+        assertThat(html)
+                .contains(RequestDecisionEmailExpectedCopy.bodyLine(RequestKind.CATEGORY_REQUEST, false, "Нейл-арт"))
+                .contains(RequestDecisionEmailExpectedCopy.reasonLine("дублікат"));
+    }
+
+    @Test
+    @DisplayName("Phase 491: a reject without a reason (null or blank) has no Причина line")
+    void should_renderNoReasonLine_when_rejectedWithoutReason() throws Exception {
+        String nullReason = htmlOf(sendDecisionWithRealEngine(RequestKind.CATEGORY_REQUEST, false, "Нейл-арт", null));
+
+        assertThat(nullReason)
+                .contains(RequestDecisionEmailExpectedCopy.bodyLine(RequestKind.CATEGORY_REQUEST, false, "Нейл-арт"))
+                .doesNotContain(RequestDecisionEmailExpectedCopy.REASON_MARKER);
+    }
+
+    @Test
+    @DisplayName("Phase 491: a blank reason renders no Причина line")
+    void should_renderNoReasonLine_when_rejectedWithBlankReason() throws Exception {
+        String blankReason = htmlOf(sendDecisionWithRealEngine(RequestKind.CATEGORY_REQUEST, false, "Нейл-арт", "   "));
+
+        assertThat(blankReason).doesNotContain(RequestDecisionEmailExpectedCopy.REASON_MARKER);
+    }
+
+    @Test
+    @DisplayName("Phase 491: the reason is HTML-escaped (th:text, never th:utext)")
+    void should_escapeReason_when_reasonCarriesMarkup() throws Exception {
+        String html = htmlOf(sendDecisionWithRealEngine(RequestKind.CATEGORY_REQUEST, false, "Нейл-арт", "<b>x</b>&\""));
+
+        assertThat(html)
+                .contains(RequestDecisionEmailExpectedCopy.reasonLine("&lt;b&gt;x&lt;/b&gt;&amp;&quot;"))
+                .doesNotContain("<b>x</b>");
+    }
+
+    @Test
+    @DisplayName("Phase 491: CR/LF in the name are stripped from the subject header")
+    void should_stripCrLfFromSubjectName_when_nameCarriesLineBreaks() throws Exception {
+        MimeMessage message = sendDecisionWithRealEngine(RequestKind.CATEGORY_REQUEST, true, "Нейл\r\n-арт", null);
+
+        assertThat(message.getSubject())
+                .isEqualTo(RequestDecisionEmailExpectedCopy.subject(RequestKind.CATEGORY_REQUEST, true, "Нейл-арт"));
     }
 }

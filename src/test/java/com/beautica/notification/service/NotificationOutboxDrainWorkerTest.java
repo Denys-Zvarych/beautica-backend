@@ -91,6 +91,9 @@ class NotificationOutboxDrainWorkerTest {
     @Spy
     private MeterRegistry meterRegistry = new SimpleMeterRegistry();
 
+    @Mock
+    private RequestDecisionLoader requestDecisionLoader;
+
     @InjectMocks
     private NotificationOutboxDrainWorker worker;
 
@@ -428,7 +431,7 @@ class NotificationOutboxDrainWorkerTest {
     private NotificationOutboxDrainWorker workerWithRealMapper() {
         NotificationOutboxDrainWorker w = new NotificationOutboxDrainWorker(
                 outboxRepository, notificationService, bookingRepository, visitResolver, REAL_MAPPER, cipher,
-                inAppPushDispatcher, meterRegistry);
+                inAppPushDispatcher, meterRegistry, requestDecisionLoader);
         ReflectionTestUtils.setField(w, "self", w);
         return w;
     }
@@ -593,6 +596,78 @@ class NotificationOutboxDrainWorkerTest {
         assertThat(pushEntry.getAttempts()).isEqualTo(3);
     }
 
+    // ── Phase 491: REQUEST_DECIDED ────────────────────────────────────────────
+
+    private NotificationOutboxEntry requestDecidedEntry(UUID recipient, String requestId, int attempts) throws Exception {
+        String payload = REAL_MAPPER.writeValueAsString(Map.of(
+                "kind", "CATEGORY_REQUEST", "requestId", requestId, "approved", false,
+                "recipientUserId", recipient.toString()));
+        return entry(OutboxEventType.REQUEST_DECIDED, attempts, payload, recipient);
+    }
+
+    @Test
+    @DisplayName("REQUEST_DECIDED is pre-loaded once, dispatched with the live snapshot and ends SENT; "
+            + "its aggregate (a user id) is never looked up as a booking")
+    void should_dispatchRequestDecidedWithSnapshot_when_requestDecidedEntryProcessed() throws Exception {
+        NotificationOutboxDrainWorker w = workerWithRealMapper();
+        UUID recipient = UUID.randomUUID();
+        NotificationOutboxEntry outboxEntry = requestDecidedEntry(recipient, "42", 0);
+        RequestDecisionEvent event = new RequestDecisionEvent(RequestKind.CATEGORY_REQUEST, "42", false, recipient);
+        RequestDecisionTarget target = new RequestDecisionTarget("Нейл-арт", "дублікат", recipient);
+        com.beautica.user.User user = mock(com.beautica.user.User.class);
+        when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
+        when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of());
+        when(requestDecisionLoader.load(List.of(event))).thenReturn(new RequestDecisionLoader.Snapshot(
+                Map.of("CATEGORY_REQUEST:42", target), Map.of(recipient, user)));
+
+        w.drain();
+
+        verify(notificationService).notifyRequestDecided(event, target, user);
+        assertThat(outboxEntry.getStatus()).isEqualTo(OutboxStatus.SENT);
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<List<UUID>> bookingIds = ArgumentCaptor.forClass(List.class);
+        verify(bookingRepository).findAllByIdsWithGraph(bookingIds.capture());
+        assertThat(bookingIds.getValue()).doesNotContain(recipient);
+    }
+
+    @Test
+    @DisplayName("a REQUEST_DECIDED pre-load failure fails ONLY those entries (attempt+1, error = class name); "
+            + "the e-mail entry of the same batch is still SENT")
+    void should_failOnlyRequestDecidedEntries_when_loaderThrows() throws Exception {
+        NotificationOutboxDrainWorker w = workerWithRealMapper();
+        UUID bookingId = UUID.randomUUID();
+        NotificationOutboxEntry emailEntry = entry(OutboxEventType.NEW_BOOKING, 0, null, bookingId);
+        NotificationOutboxEntry decided = requestDecidedEntry(UUID.randomUUID(), "7", 0);
+        Booking booking = mock(Booking.class);
+        when(booking.getId()).thenReturn(bookingId);
+        when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(emailEntry, decided));
+        when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(booking));
+        when(requestDecisionLoader.load(any())).thenThrow(new IllegalStateException("db-detail"));
+
+        w.drain();
+
+        assertThat(emailEntry.getStatus()).isEqualTo(OutboxStatus.SENT);
+        assertThat(decided.getStatus()).isEqualTo(OutboxStatus.PENDING);
+        assertThat(decided.getAttempts()).isEqualTo(1);
+        assertThat(decided.getLastError()).isEqualTo("IllegalStateException");
+        verify(notificationService, never()).notifyRequestDecided(any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("a batch without REQUEST_DECIDED never touches the request-decision pre-load")
+    void should_notLoadRequestDecisions_when_batchHasNone() {
+        UUID bookingId = UUID.randomUUID();
+        NotificationOutboxEntry emailEntry = entry(OutboxEventType.NEW_BOOKING, 0, null, bookingId);
+        Booking booking = mock(Booking.class);
+        when(booking.getId()).thenReturn(bookingId);
+        when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(emailEntry));
+        when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(booking));
+
+        worker.drain();
+
+        verifyNoInteractions(requestDecisionLoader);
+    }
+
     // ── Test 2: STATUS_CHANGED dispatches to notifyBookingStatusChanged ───────
 
     @Test
@@ -622,7 +697,7 @@ class NotificationOutboxDrainWorkerTest {
     void should_decryptInviteUrlSealedAndDispatch_when_inviteEntryProcessed() throws Exception {
         // Arrange — use a real ObjectMapper so JSON deserialisation is actually exercised.
         NotificationOutboxDrainWorker workerWithRealMapper = new NotificationOutboxDrainWorker(
-                outboxRepository, notificationService, bookingRepository, visitResolver, REAL_MAPPER, cipher, inAppPushDispatcher, meterRegistry);
+                outboxRepository, notificationService, bookingRepository, visitResolver, REAL_MAPPER, cipher, inAppPushDispatcher, meterRegistry, requestDecisionLoader);
         ReflectionTestUtils.setField(workerWithRealMapper, "self", workerWithRealMapper);
 
         UUID aggregateId = UUID.randomUUID();
@@ -657,7 +732,7 @@ class NotificationOutboxDrainWorkerTest {
     @DisplayName("entry transitions to DEAD without dispatch when cipher.open throws on corrupt ciphertext")
     void should_dead_letter_when_cipherOpenThrows() throws Exception {
         NotificationOutboxDrainWorker workerWithRealMapper = new NotificationOutboxDrainWorker(
-                outboxRepository, notificationService, bookingRepository, visitResolver, REAL_MAPPER, cipher, inAppPushDispatcher, meterRegistry);
+                outboxRepository, notificationService, bookingRepository, visitResolver, REAL_MAPPER, cipher, inAppPushDispatcher, meterRegistry, requestDecisionLoader);
         ReflectionTestUtils.setField(workerWithRealMapper, "self", workerWithRealMapper);
 
         UUID aggregateId = UUID.randomUUID();
@@ -693,7 +768,7 @@ class NotificationOutboxDrainWorkerTest {
     @DisplayName("entry transitions to DEAD without invoking cipher when inviteUrlSealed is missing from payload")
     void should_dead_letter_when_inviteUrlSealedMissing() throws Exception {
         NotificationOutboxDrainWorker workerWithRealMapper = new NotificationOutboxDrainWorker(
-                outboxRepository, notificationService, bookingRepository, visitResolver, REAL_MAPPER, cipher, inAppPushDispatcher, meterRegistry);
+                outboxRepository, notificationService, bookingRepository, visitResolver, REAL_MAPPER, cipher, inAppPushDispatcher, meterRegistry, requestDecisionLoader);
         ReflectionTestUtils.setField(workerWithRealMapper, "self", workerWithRealMapper);
 
         UUID aggregateId = UUID.randomUUID();
@@ -1095,7 +1170,7 @@ class NotificationOutboxDrainWorkerTest {
     @DisplayName("INVITE entry with malformed JSON payload is dead-lettered without throwing")
     void should_setStatusToPending_when_invitePayloadIsInvalidJson() {
         NotificationOutboxDrainWorker workerWithRealMapper = new NotificationOutboxDrainWorker(
-                outboxRepository, notificationService, bookingRepository, visitResolver, REAL_MAPPER, cipher, inAppPushDispatcher, meterRegistry);
+                outboxRepository, notificationService, bookingRepository, visitResolver, REAL_MAPPER, cipher, inAppPushDispatcher, meterRegistry, requestDecisionLoader);
         ReflectionTestUtils.setField(workerWithRealMapper, "self", workerWithRealMapper);
 
         UUID aggregateId = UUID.randomUUID();

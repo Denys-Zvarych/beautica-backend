@@ -56,8 +56,12 @@ public class Salon extends AuditableEntity {
     @GeneratedValue(strategy = GenerationType.UUID)
     private UUID id;
 
+    // Nullable since V236 (Phase 488, SAL-47): an owner self-delete detaches its DEACTIVATED salons
+    // (owner_id = NULL, contacts blanked). chk_salons_ownerless_inactive guarantees an active salon always
+    // has an owner, so every active-salon read path may still treat the owner as present; anything that can
+    // reach an inactive salon (client history, notifications, moderation) must null-guard it.
     @ManyToOne(fetch = FetchType.LAZY)
-    @JoinColumn(name = "owner_id", nullable = false)
+    @JoinColumn(name = "owner_id")
     private User owner;
 
     @Column(nullable = false)

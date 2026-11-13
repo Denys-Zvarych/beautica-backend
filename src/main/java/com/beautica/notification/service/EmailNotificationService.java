@@ -15,6 +15,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.ByteArrayResource;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.core.io.Resource;
+import org.springframework.lang.Nullable;
 import org.springframework.mail.MailException;
 import org.springframework.mail.javamail.JavaMailSender;
 import org.springframework.mail.javamail.MimeMessageHelper;
@@ -203,6 +204,34 @@ public class EmailNotificationService {
         ctx.setVariable("clientName", resolveClientName(booking));
         applyVisitVariables(ctx, visit);
         send(to, "Салон скасував бронювання", "email/booking-declined-by-salon-provider", ctx);
+    }
+
+    /**
+     * Phase 491 — tells the REQUESTER that an admin approved or rejected their category request or
+     * service-type suggestion (NTF-35). One template, approve and reject branches (D4). The reason is
+     * rendered only on a reject with a non-blank reason, through {@code th:text} (HTML-escaped); the
+     * name is CR/LF-stripped before it enters the subject header.
+     *
+     * @param reasonOrNull the admin's reason; ignored on an approve, omitted when blank
+     */
+    public void sendRequestDecisionEmail(String to, RequestKind kind, boolean approved, String name,
+                                         @Nullable String reasonOrNull) {
+        String subjectName = name.replaceAll("[\r\n]", "");
+        boolean category = kind == RequestKind.CATEGORY_REQUEST;
+        String reason = !approved && reasonOrNull != null && !reasonOrNull.isBlank() ? reasonOrNull : null;
+        var ctx = new Context();
+        ctx.setVariable("approved", approved);
+        ctx.setVariable("category", category);
+        ctx.setVariable("name", name);
+        ctx.setVariable("reason", reason);
+        send(to, requestDecisionSubject(category, approved, subjectName), "email/request-decision", ctx);
+    }
+
+    private static String requestDecisionSubject(boolean category, boolean approved, String name) {
+        String verdict = approved ? "схвалено" : "відхилено";
+        return category
+                ? "Beautica: ваш запит на категорію «" + name + "» " + verdict
+                : "Beautica: вашу пропозицію послуги «" + name + "» " + verdict;
     }
 
     /**

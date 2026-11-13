@@ -266,7 +266,7 @@ class SalonServiceCacheTest {
         Salon salon = salonOwnedBy(ownerId);
 
         when(salonRepository.findAllByOwnerIdAndIsActiveTrue(ownerId)).thenReturn(List.of());
-        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.findByIdAndOwnerId(salonId, ownerId)).thenReturn(Optional.of(salon));
         stubCleanEmptyStaffCascade(salonId);
         // No save() stub needed: managed entity flushes via dirty-checking (PERF-LOW redundant-write drop).
@@ -412,7 +412,7 @@ class SalonServiceCacheTest {
         Salon salon = salonOwnedBy(ownerId);
 
         when(salonRepository.findByIdAndIsActiveTrueWithOwner(salonId)).thenReturn(Optional.of(salon));
-        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.findByIdAndOwnerId(salonId, ownerId)).thenReturn(Optional.of(salon));
         stubCleanEmptyStaffCascade(salonId);
         // No save() stub needed: managed entity flushes via dirty-checking (PERF-LOW redundant-write drop).
@@ -439,7 +439,7 @@ class SalonServiceCacheTest {
         User owner = new User("owner3@example.com", "hash", Role.SALON_OWNER, "Test", "Owner", "+380501234569");
         Salon salon = salonOwnedBy(ownerId);
 
-        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.findByIdAndOwnerId(salonId, ownerId)).thenReturn(Optional.of(salon));
         stubCleanEmptyStaffCascade(salonId);
         // No save() stub needed: managed entity flushes via dirty-checking (PERF-LOW redundant-write drop).

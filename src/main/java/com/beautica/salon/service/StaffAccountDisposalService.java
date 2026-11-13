@@ -285,7 +285,7 @@ public class StaffAccountDisposalService {
         // stays the one that batches the masters writes).
         deletedBookingSlugTombstoner.tombstoneMasters(staffMasters);
 
-        if (reason != StaffDisposalReason.SELF_DELETE) {
+        if (!reason.selfInitiated()) {
             registerBlobPurges(staffUserIds, staffMasters, staffMasterIds);
         }
 
@@ -380,7 +380,7 @@ public class StaffAccountDisposalService {
         // did NOT order the deletion, it was never meant to erase who WAS deleted.
         String staffIdsClause = " for staff " + staffUserIds;
         String salonClause = salonId != null ? " for salon " + salonId : "";
-        String actorClause = reason == StaffDisposalReason.SELF_DELETE ? "" : " by actor " + actorId;
+        String actorClause = reason.selfInitiated() ? "" : " by actor " + actorId;
         log.info("{} staff hard-delete: {} account(s) deleted, {} master row(s) deleted, "
                         + "{} master row(s) detached{}{}{}",
                 reason.label(), staffUserIds.size(), deleted, detached,

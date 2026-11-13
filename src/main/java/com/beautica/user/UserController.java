@@ -5,6 +5,8 @@ import com.beautica.auth.Role;
 import com.beautica.common.ApiResponse;
 import com.beautica.common.security.AuthenticationUtils;
 import com.beautica.common.security.BearerTokenExtractor;
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.responses.ApiResponses;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
 import org.springframework.http.ResponseEntity;
@@ -28,14 +30,17 @@ public class UserController {
     private final PasswordResetService passwordResetService;
     private final ClientAccountDeletionService clientAccountDeletionService;
     private final StaffAccountSelfDeletionService staffAccountSelfDeletionService;
+    private final OwnerAccountSelfDeletionService ownerAccountSelfDeletionService;
 
     public UserController(UserService userService, PasswordResetService passwordResetService,
                            ClientAccountDeletionService clientAccountDeletionService,
-                           StaffAccountSelfDeletionService staffAccountSelfDeletionService) {
+                           StaffAccountSelfDeletionService staffAccountSelfDeletionService,
+                           OwnerAccountSelfDeletionService ownerAccountSelfDeletionService) {
         this.userService = userService;
         this.passwordResetService = passwordResetService;
         this.clientAccountDeletionService = clientAccountDeletionService;
         this.staffAccountSelfDeletionService = staffAccountSelfDeletionService;
+        this.ownerAccountSelfDeletionService = ownerAccountSelfDeletionService;
     }
 
     @GetMapping("/me")
@@ -96,8 +101,9 @@ public class UserController {
     /**
      * Self-deletion (Phase 300 D1/D2 for CLIENT; widened to {@code SALON_ADMIN}/{@code
      * SALON_MASTER}/{@code INDEPENDENT_MASTER} by Phase 301). Bearer token only, no confirmation
-     * body — the irreversibility warning lives in the mobile UI. {@code SALON_OWNER} is refused by
-     * this method's own {@code @PreAuthorize} gate and never reaches either service below.
+     * body — the irreversibility warning lives in the mobile UI. {@code SALON_OWNER} is admitted since
+     * Phase 488 and routed to {@link OwnerAccountSelfDeletionService} (409 {@code OWNER_HAS_ACTIVE_SALONS}
+     * while any of its salons is active).
      *
      * <p>Dispatches on the authority already present in {@code Authentication} — no extra DB read:
      * {@code CLIENT} → {@link ClientAccountDeletionService#deleteOwnAccount}, byte-for-byte
@@ -116,13 +122,30 @@ public class UserController {
      * #logout} and {@link com.beautica.auth.JwtAuthenticationFilter} already use — never a second
      * ad hoc header parse.
      */
+    @Operation(summary = "Delete the caller's own account",
+            description = "Hard-deletes the caller's account and ends the session. A SALON_OWNER may delete the "
+                    + "account only when none of its salons is active (SUP-11): with an active salon the call is "
+                    + "refused 409 with `data.code` = `OWNER_HAS_ACTIVE_SALONS` and nothing changes. The owner's "
+                    + "deleted salons stay as ownerless history (SUP-67).")
+    @ApiResponses({
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(responseCode = "204", description = "Account deleted"),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(responseCode = "401", description = "Not authenticated"),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(responseCode = "409",
+                    description = "Refused — for a SALON_OWNER `data.code` is `OWNER_HAS_ACTIVE_SALONS` (delete the "
+                            + "salons first) or `OWNER_SALON_HAS_STAFF`"),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(responseCode = "422",
+                    description = "Too many future bookings to dispose of in one request")
+    })
     @DeleteMapping("/me")
-    @PreAuthorize("hasAnyRole('CLIENT','SALON_ADMIN','SALON_MASTER','INDEPENDENT_MASTER')")
+    @PreAuthorize("hasAnyRole('CLIENT','SALON_OWNER','SALON_ADMIN','SALON_MASTER','INDEPENDENT_MASTER')")
     public ResponseEntity<Void> deleteMyAccount(HttpServletRequest request, Authentication authentication) {
         UUID userId = AuthenticationUtils.userId(authentication);
         String accessToken = BearerTokenExtractor.extract(request);
-        if (AuthenticationUtils.role(authentication) == Role.CLIENT) {
+        Role role = AuthenticationUtils.role(authentication);
+        if (role == Role.CLIENT) {
             clientAccountDeletionService.deleteOwnAccount(userId, accessToken);
+        } else if (role == Role.SALON_OWNER) {
+            ownerAccountSelfDeletionService.deleteOwnAccount(userId, accessToken);
         } else {
             staffAccountSelfDeletionService.deleteOwnAccount(userId, accessToken);
         }

@@ -498,6 +498,44 @@ public class NotificationService {
     }
 
     /**
+     * Phase 491 — e-mails the REQUESTER that their category request or service-type suggestion was
+     * approved or rejected (NTF-35), from the live state pre-loaded by {@link RequestDecisionLoader}.
+     * The address comes from the {@code users} row, never from the outbox payload.
+     *
+     * <p>D3 — a clean no-op (the row ends SENT, never DEAD) when the request row is gone, the account is
+     * gone, the request's current requester is no longer the recipient (an account delete nulls it), or
+     * the account is inactive. The reason reaches the e-mail only on a reject. Ids only in the log.
+     *
+     * @param target    the live request row, {@code null} when it no longer exists
+     * @param recipient the recipient's account, {@code null} when it no longer exists
+     */
+    public void notifyRequestDecided(RequestDecisionEvent event, @Nullable RequestDecisionTarget target,
+                                     @Nullable User recipient) {
+        String skip = requestDecisionSkipReason(event, target, recipient);
+        if (skip != null) {
+            log.debug("Skipping REQUEST_DECIDED e-mail kind={} requestId={}: {}", event.kind(), event.requestId(), skip);
+            return;
+        }
+        emailService.sendRequestDecisionEmail(recipient.getEmail(), event.kind(), event.approved(),
+                target.name(), event.approved() ? null : target.reason());
+    }
+
+    @Nullable
+    private static String requestDecisionSkipReason(RequestDecisionEvent event, @Nullable RequestDecisionTarget target,
+                                                    @Nullable User recipient) {
+        if (target == null) {
+            return "request gone";
+        }
+        if (recipient == null) {
+            return "recipient gone";
+        }
+        if (!event.recipientUserId().equals(target.requestedByUserId())) {
+            return "requester changed";
+        }
+        return recipient.isActive() ? null : "recipient inactive";
+    }
+
+    /**
      * Builds the booking-scoped review deep link and guards the frontend base URL scheme
      * (mirrors {@code InviteService.buildInviteLink}). The booking id is a UUID string, so no
      * URL-encoding is required for the path segment.

@@ -1387,6 +1387,10 @@ class NotificationServiceTest {
             case MASTER_BOOKING_RESCHEDULED -> service.notifyMasterOfProviderReschedule(booking, UUID.randomUUID());
             case MASTER_BOOKING_DECLINED ->
                     service.notifyMasterOfProviderDecline(BookingVisit.single(booking), UUID.randomUUID());
+            // Phase 491 — the requester's decision e-mail; no booking is involved at all.
+            case REQUEST_DECIDED -> service.notifyRequestDecided(
+                    new RequestDecisionEvent(RequestKind.CATEGORY_REQUEST, "1", false, requesterId),
+                    new RequestDecisionTarget("X", "r", requesterId), requesterUser(true));
             default -> throw new IllegalArgumentException("unmapped event type " + type.name());
         }
 
@@ -1416,5 +1420,88 @@ class NotificationServiceTest {
             count++;
         }
         return count;
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 491 — notifyRequestDecided (D3 skips + happy path)
+    // -------------------------------------------------------------------------
+
+    /** Fresh per test instance; every fixture below (event, target, user) reads this one id, so they stay coherent. */
+    private final UUID requesterId = UUID.randomUUID();
+
+    private User requesterUser(boolean active) {
+        User user = mock(User.class);
+        lenient().when(user.getId()).thenReturn(requesterId);
+        lenient().when(user.isActive()).thenReturn(active);
+        lenient().when(user.getEmail()).thenReturn("requester@example.com");
+        return user;
+    }
+
+    private RequestDecisionEvent decision(boolean approved) {
+        return new RequestDecisionEvent(RequestKind.CATEGORY_REQUEST, "42", approved, requesterId);
+    }
+
+    @Test
+    @DisplayName("Phase 491: a reject e-mails the address from the users row, with the stored reason")
+    void should_emailRequesterFromUsersRow_when_requestRejected() {
+        RequestDecisionTarget target = new RequestDecisionTarget("Нейл-арт", "дублікат", requesterId);
+
+        service.notifyRequestDecided(decision(false), target, requesterUser(true));
+
+        verify(emailService).sendRequestDecisionEmail(
+                "requester@example.com", RequestKind.CATEGORY_REQUEST, false, "Нейл-арт", "дублікат");
+    }
+
+    @Test
+    @DisplayName("Phase 491: an approve never passes the reason to the e-mail")
+    void should_passNoReason_when_requestApproved() {
+        RequestDecisionTarget target = new RequestDecisionTarget("Нейл-арт", "stale", requesterId);
+
+        service.notifyRequestDecided(decision(true), target, requesterUser(true));
+
+        verify(emailService).sendRequestDecisionEmail(
+                "requester@example.com", RequestKind.CATEGORY_REQUEST, true, "Нейл-арт", null);
+    }
+
+    @Test
+    @DisplayName("Phase 491 D3: request row gone → no send")
+    void should_notSend_when_requestEntityGone() {
+        service.notifyRequestDecided(decision(false), null, requesterUser(true));
+
+        verifyNoInteractions(emailService);
+    }
+
+    @Test
+    @DisplayName("Phase 491 D3: recipient account gone → no send")
+    void should_notSend_when_recipientGone() {
+        service.notifyRequestDecided(decision(false), new RequestDecisionTarget("X", null, requesterId), null);
+
+        verifyNoInteractions(emailService);
+    }
+
+    @Test
+    @DisplayName("Phase 491 D3: requested_by_user_id nulled on the request row → no send")
+    void should_notSend_when_requesterColumnNulled() {
+        service.notifyRequestDecided(decision(false), new RequestDecisionTarget("X", null, null), requesterUser(true));
+
+        verifyNoInteractions(emailService);
+    }
+
+    @Test
+    @DisplayName("Phase 491 D3: requested_by_user_id now points at another user → no send")
+    void should_notSend_when_requesterColumnPointsAtAnotherUser() {
+        service.notifyRequestDecided(decision(false),
+                new RequestDecisionTarget("X", null, UUID.randomUUID()), requesterUser(true));
+
+        verifyNoInteractions(emailService);
+    }
+
+    @Test
+    @DisplayName("Phase 491 D3: inactive recipient → no send")
+    void should_notSend_when_recipientInactive() {
+        service.notifyRequestDecided(decision(true), new RequestDecisionTarget("X", null, requesterId),
+                requesterUser(false));
+
+        verifyNoInteractions(emailService);
     }
 }
