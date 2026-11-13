@@ -133,6 +133,13 @@ class UserControllerTest {
     private StaffAccountSelfDeletionService staffAccountSelfDeletionService;
 
     /**
+     * Required by {@link UserController}'s constructor for the {@code DELETE /me} endpoint's
+     * SALON_OWNER branch (Phase 488 — owner self-delete).
+     */
+    @MockBean
+    private OwnerAccountSelfDeletionService ownerAccountSelfDeletionService;
+
+    /**
      * Required by {@code SecurityConfig} constructor (via {@code JwtAuthenticationFilter}).
      * The pass-through filter override above does not call {@code jwtTokenProvider} at all,
      * so this mock never needs to be configured.
@@ -709,15 +716,14 @@ class UserControllerTest {
                 .requestResetForUserId(any(UUID.class));
     }
 
-    // ── DELETE /api/v1/users/me (Phase 300/301) ───────────────────────────────
-    // Isolates the @PreAuthorize SpEL gate itself, independent of either self-delete service's
-    // OWN defence-in-depth role re-check (both are @MockBean here and always "succeed" when
-    // invoked) — this is deliberately the ONE place in the whole self-delete test family where a
-    // @PreAuthorize regression cannot hide behind a service-layer guard also catching it. Real-DB
-    // authorization coverage lives in ClientAccountSelfDeleteAuthorizationIT (SALON_OWNER 403) and
-    // StaffAccountSelfDeleteAuthorizationIT (the full role matrix); this slice is what actually
-    // proves those observed 403s trace back to the SpEL expression and not to a coincidence of two
-    // guards agreeing.
+    // ── DELETE /api/v1/users/me (Phase 300/301/488) ───────────────────────────
+    // Isolates the controller's @PreAuthorize gate and role dispatch, independent of each
+    // self-delete service's OWN defence-in-depth role re-check (all three are @MockBean here and
+    // "succeed" unless stubbed otherwise). Since Phase 488 every role is admitted; SALON_OWNER is
+    // routed to OwnerAccountSelfDeletionService. Real-DB coverage lives in
+    // ClientAccountSelfDeleteAuthorizationIT (SALON_OWNER 409 with an active salon) and
+    // StaffAccountSelfDeleteAuthorizationIT (the full role matrix); this slice proves each role
+    // reaches exactly one service and that the owner's 409 body carries data.code.
 
     @Test
     @DisplayName("DELETE /me as CLIENT → 204, delegates to ClientAccountDeletionService only")
@@ -730,7 +736,7 @@ class UserControllerTest {
                 .andExpect(status().isNoContent());
 
         org.mockito.Mockito.verify(clientAccountDeletionService).deleteOwnAccount(eq(userId), any());
-        org.mockito.Mockito.verifyNoInteractions(staffAccountSelfDeletionService);
+        org.mockito.Mockito.verifyNoInteractions(staffAccountSelfDeletionService, ownerAccountSelfDeletionService);
     }
 
     @Test
@@ -748,20 +754,36 @@ class UserControllerTest {
 
             org.mockito.Mockito.verify(staffAccountSelfDeletionService).deleteOwnAccount(eq(userId), any());
         }
-        org.mockito.Mockito.verifyNoInteractions(clientAccountDeletionService);
+        org.mockito.Mockito.verifyNoInteractions(clientAccountDeletionService, ownerAccountSelfDeletionService);
     }
 
     @Test
-    @DisplayName("DELETE /me as SALON_OWNER → 403 from the @PreAuthorize gate ITSELF — neither "
-            + "self-delete service is even invoked, since both are mocked to unconditionally "
-            + "\"succeed\" here and could not otherwise produce a 403")
-    void should_return403_when_deleteMeAsSalonOwner() throws Exception {
+    @DisplayName("DELETE /me as SALON_OWNER → 204, delegates to OwnerAccountSelfDeletionService only (Phase 488)")
+    void should_return204_when_deleteMeAsSalonOwner() throws Exception {
         var userId = UUID.randomUUID();
 
         mockMvc.perform(delete("/api/v1/users/me")
                         .with(authenticatedAs(userId, "owner@example.com", Role.SALON_OWNER))
                         .with(csrf()))
-                .andExpect(status().isForbidden());
+                .andExpect(status().isNoContent());
+
+        org.mockito.Mockito.verify(ownerAccountSelfDeletionService).deleteOwnAccount(eq(userId), any());
+        org.mockito.Mockito.verifyNoInteractions(clientAccountDeletionService, staffAccountSelfDeletionService);
+    }
+
+    @Test
+    @DisplayName("DELETE /me as SALON_OWNER with an active salon → 409, data.code OWNER_HAS_ACTIVE_SALONS")
+    void should_return409WithCode_when_deleteMeAsSalonOwnerWithActiveSalons() throws Exception {
+        var userId = UUID.randomUUID();
+        org.mockito.Mockito.doThrow(new com.beautica.common.exception.OwnerAccountDeletionBlockedException(
+                        com.beautica.common.exception.OwnerAccountDeletionBlockedException.Code.OWNER_HAS_ACTIVE_SALONS))
+                .when(ownerAccountSelfDeletionService).deleteOwnAccount(eq(userId), any());
+
+        mockMvc.perform(delete("/api/v1/users/me")
+                        .with(authenticatedAs(userId, "owner@example.com", Role.SALON_OWNER))
+                        .with(csrf()))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.data.code").value("OWNER_HAS_ACTIVE_SALONS"));
 
         org.mockito.Mockito.verifyNoInteractions(clientAccountDeletionService, staffAccountSelfDeletionService);
     }
@@ -773,6 +795,7 @@ class UserControllerTest {
                         .with(csrf()))
                 .andExpect(status().isUnauthorized());
 
-        org.mockito.Mockito.verifyNoInteractions(clientAccountDeletionService, staffAccountSelfDeletionService);
+        org.mockito.Mockito.verifyNoInteractions(clientAccountDeletionService, staffAccountSelfDeletionService,
+                ownerAccountSelfDeletionService);
     }
 }

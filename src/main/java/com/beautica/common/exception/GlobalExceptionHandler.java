@@ -11,6 +11,7 @@ import com.beautica.media.dto.PortfolioLimitReachedResponse;
 import com.beautica.salon.dto.SalonDeletionBlockedResponse;
 import com.beautica.service.dto.DuplicateServiceResponse;
 import com.beautica.service.dto.ServicePriceShapeMismatchResponse;
+import com.beautica.user.OwnerAccountDeletionBlockedResponse;
 import com.fasterxml.jackson.databind.exc.InvalidFormatException;
 import io.jsonwebtoken.JwtException;
 import jakarta.servlet.http.HttpServletRequest;
@@ -328,6 +329,27 @@ public class GlobalExceptionHandler {
                 .body(new ApiResponse<>(false,
                         new PortfolioLimitReachedResponse(PortfolioLimitReachedException.ERROR_CODE),
                         "Portfolio photo limit reached"));
+    }
+
+    /**
+     * Phase 488 — distinct 409 for a refused {@code SALON_OWNER} self-delete ({@code DELETE /users/me}):
+     * the {@link OwnerAccountDeletionBlockedResponse} body carries {@code OWNER_HAS_ACTIVE_SALONS} /
+     * {@code OWNER_SALON_HAS_STAFF} under {@code data.code}, which {@link #handleBusiness}'s genericised
+     * CONFLICT branch would otherwise drop. The message is fixed here, never {@code ex.getMessage()}.
+     * A new code; no existing body changes.
+     */
+    @ExceptionHandler(OwnerAccountDeletionBlockedException.class)
+    public ResponseEntity<ApiResponse<OwnerAccountDeletionBlockedResponse>> handleOwnerAccountDeletionBlocked(
+            OwnerAccountDeletionBlockedException ex) {
+        log.debug("Owner account deletion refused: {}", ex.getCode());
+        return ResponseEntity
+                .status(HttpStatus.CONFLICT)
+                .body(new ApiResponse<>(false,
+                        new OwnerAccountDeletionBlockedResponse(ex.getCode().name()),
+                        switch (ex.getCode()) {
+                            case OWNER_HAS_ACTIVE_SALONS -> "Спочатку видаліть усі свої салони";
+                            case OWNER_SALON_HAS_STAFF -> "Спочатку видаліть усіх працівників своїх салонів";
+                        }));
     }
 
     /**

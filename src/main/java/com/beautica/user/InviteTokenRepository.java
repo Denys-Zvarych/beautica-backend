@@ -9,6 +9,7 @@ import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -183,4 +184,16 @@ public interface InviteTokenRepository extends JpaRepository<InviteToken, UUID>,
             """, nativeQuery = true)
     int deleteBySalonIdAndStaffUserIds(@Param("salonId") UUID salonId,
                                        @Param("staffUserIds") List<UUID> staffUserIds);
+
+    /**
+     * Phase 488 (SUP-67) — removes EVERY invite the given salons ever dispatched, when their owner's
+     * account is deleted and the salons are detached (SAL-47). An invite is the owner's own outbound
+     * history; once the account is gone nobody can view, revoke or accept it as that salon's staff, and a
+     * re-registered account with the same address must not inherit it (AC5). Salon-scoped, never email-keyed.
+     *
+     * @return number of {@code invite_tokens} rows deleted
+     */
+    @Modifying
+    @Query(value = "DELETE FROM invite_tokens WHERE salon_id IN (:salonIds)", nativeQuery = true)
+    int deleteBySalonIdIn(@Param("salonIds") Collection<UUID> salonIds);
 }

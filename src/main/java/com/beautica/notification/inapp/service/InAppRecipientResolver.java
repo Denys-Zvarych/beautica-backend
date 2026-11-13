@@ -53,7 +53,8 @@ class InAppRecipientResolver {
     Set<UUID> ownerAndMasterOnly(Master master, Salon salon) {
         Set<UUID> ids = new LinkedHashSet<>();
         addMasterUser(master, ids);
-        if (salon != null) {
+        // Phase 488 (SAL-47): a deleted owner's detached salon has no owner — contributes nothing.
+        if (salon != null && salon.getOwner() != null) {
             ids.add(salon.getOwner().getId());
         }
         return ids;
@@ -90,10 +91,13 @@ class InAppRecipientResolver {
             // INDEPENDENT_MASTER booking — no salon, no owner/admin concept.
             return;
         }
-        // Salon.owner is @ManyToOne(LAZY) on a NOT NULL column — getId() is served off the
+        // Salon.owner is @ManyToOne(LAZY) (NOT NULL for every active salon) — getId() is served off the
         // uninitialised proxy without a statement (see BookingRepository#findByIdWithFullGraph's own
         // javadoc for the identical, already-verified claim about this exact association).
-        ids.add(salon.getOwner().getId());
+        // Phase 488 (SAL-47): a detached salon (owner account deleted) has owner_id NULL — no owner to notify.
+        if (salon.getOwner() != null) {
+            ids.add(salon.getOwner().getId());
+        }
         for (User admin : userRepository.findBySalonIdAndRoleAndIsActiveTrue(salon.getId(), Role.SALON_ADMIN)) {
             ids.add(admin.getId());
         }

@@ -399,6 +399,54 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
     // True iff the given owner already has at least one salon (primary or not, active or not).
     boolean existsByOwnerId(UUID ownerId);
 
+    /**
+     * Phase 488 (SUP-11) — the owner self-delete precondition: an owner with at least one ACTIVE salon is
+     * refused 409 {@code OWNER_HAS_ACTIVE_SALONS}. Served by {@code idx_salons_owner_active_created}.
+     */
+    boolean existsByOwnerIdAndIsActiveTrue(UUID ownerId);
+
+    /** Phase 488 — every salon the owner holds, active or not, id-ordered. */
+    @Query("SELECT s.id FROM Salon s WHERE s.owner.id = :ownerId ORDER BY s.id")
+    List<UUID> findAllIdsByOwnerId(@Param("ownerId") UUID ownerId);
+
+    /**
+     * Phase 488 — mirrors the SQL guard of {@code docs/release/delete-owner-account-template.sql} Part B:
+     * is any OTHER account still linked to one of the owner's salons ({@code users.salon_id} or an attached
+     * {@code masters} row)? Unreachable after SAL-21 (salon deletion disposes the staff), enforced anyway so
+     * a detached salon can never keep a live staff account pointing at it.
+     */
+    @Query(value = """
+            SELECT EXISTS (
+                SELECT 1 FROM salons s
+                WHERE s.owner_id = :ownerId
+                  AND (EXISTS (SELECT 1 FROM users u WHERE u.salon_id = s.id AND u.id <> :ownerId)
+                       OR EXISTS (SELECT 1 FROM masters m
+                                  WHERE m.salon_id = s.id AND m.user_id IS NOT NULL AND m.user_id <> :ownerId)))
+            """, nativeQuery = true)
+    boolean existsOtherAccountLinkedToOwnerSalons(@Param("ownerId") UUID ownerId);
+
+    /**
+     * Phase 488 (SAL-47 / SUP-67) — detaches the owner from every DEACTIVATED salon it holds when the owner
+     * account is deleted: {@code owner_id = NULL}, the contact columns ({@code phone},
+     * {@code instagram_url}) and the owner-written free text ({@code description}, {@code location_note})
+     * blanked. Name, address, bookings, reviews and client_reviews stay on the row
+     * (SAL-D05/SAL-D12). {@code is_active = false} in the predicate is belt-and-braces with
+     * {@code chk_salons_ownerless_inactive} (V236): an active salon is never detached. The caller holds the
+     * owner row lock (createSalon/updateSalon/deactivateSalon take it first), so no salon of this owner can
+     * be created or reactivated concurrently. Flushes first so pending entity writes land before the bulk
+     * statement; deliberately does NOT clear the persistence context (the caller still holds managed rows).
+     *
+     * @return number of salons detached
+     */
+    @Modifying(flushAutomatically = true)
+    @Query(value = """
+            UPDATE salons
+               SET owner_id = NULL, phone = NULL, instagram_url = NULL, description = NULL,
+                   location_note = NULL, updated_at = :now
+             WHERE owner_id = :ownerId AND is_active = false
+            """, nativeQuery = true)
+    int detachOwnerFromInactiveSalons(@Param("ownerId") UUID ownerId, @Param("now") java.time.Instant now);
+
     // Returns the owner's primary salon, if one exists.
     Optional<Salon> findByOwnerIdAndIsPrimaryTrue(UUID ownerId);
 

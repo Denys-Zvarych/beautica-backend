@@ -25,9 +25,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * The full role matrix for {@code DELETE /api/v1/users/me} (Phase 301), against the real
  * {@code @PreAuthorize} gate + rate limiter, not a mocked service. {@code
- * ClientAccountSelfDeleteAuthorizationIT} owns the CLIENT-flow regression pin (SALON_OWNER 403,
+ * ClientAccountSelfDeleteAuthorizationIT} owns the CLIENT-flow regression pin (SALON_OWNER 409 with an active salon,
  * self-only scoping); this class is the STAFF-flow counterpart the phase 301 plan's §11 asked for:
- * every one of the four newly-admitted roles actually reaches 204, SALON_OWNER is STILL refused,
+ * every admitted role actually reaches 204, SALON_OWNER (admitted by Phase 488) gets 409 while it has an
+ * active salon,
  * anonymous is 401, and the per-user 3/hour bucket (role-blind, {@code BookingRateLimitFilter}) is
  * exercised end to end.
  */
@@ -53,8 +54,8 @@ class StaffAccountSelfDeleteAuthorizationIT extends AbstractIntegrationTest {
     }
 
     @ParameterizedTest(name = "{0} self-deletes successfully — 204, own account row gone")
-    @ValueSource(strings = {"CLIENT", "SALON_ADMIN", "SALON_MASTER", "INDEPENDENT_MASTER"})
-    @DisplayName("every one of the four newly-widened-or-shipped roles reaches 204")
+    @ValueSource(strings = {"CLIENT", "SALON_OWNER", "SALON_ADMIN", "SALON_MASTER", "INDEPENDENT_MASTER"})
+    @DisplayName("every admitted role reaches 204 (SALON_OWNER since Phase 488, with no active salon)")
     void should_return204_when_callerIsAnyAdmittedRole(String role) throws Exception {
         UUID actorId;
         String email;
@@ -62,6 +63,10 @@ class StaffAccountSelfDeleteAuthorizationIT extends AbstractIntegrationTest {
             case "CLIENT" -> {
                 email = "authz-matrix-" + System.nanoTime() + "@beautica.test";
                 actorId = csd.createUser(email, "CLIENT", null, "Тест", "Клієнт");
+            }
+            case "SALON_OWNER" -> { // Phase 488 — an owner with no active salon (here: none at all)
+                email = "authz-matrix-" + System.nanoTime() + "@beautica.test";
+                actorId = csd.createUser(email, "SALON_OWNER", null, "Тест", "Власник");
             }
             case "INDEPENDENT_MASTER" -> {
                 email = "authz-matrix-" + System.nanoTime() + "@beautica.test";
@@ -98,21 +103,20 @@ class StaffAccountSelfDeleteAuthorizationIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("SALON_OWNER still gets 403 after the widening — the one role never admitted "
-            + "(D1 — salons.owner_id is NOT NULL NO ACTION)")
-    void should_return403_when_callerIsSalonOwner() throws Exception {
-        String email = "authz-matrix-owner-" + System.nanoTime() + "@beautica.test";
-        UUID ownerId = csd.createUser(email, "SALON_OWNER", null, "Тест", "Власник");
-        String token = fixtures.tokenFor(email);
+    @DisplayName("SALON_OWNER with an ACTIVE salon now reaches the owner service and gets 409 "
+            + "OWNER_HAS_ACTIVE_SALONS — not 403 (Phase 488 widened the gate), and the account survives")
+    void should_return409_when_callerIsSalonOwnerWithActiveSalon() throws Exception {
+        ClientSelfDeleteTestFixtures.Salon salon = csd.createSalon();
+        String token = fixtures.tokenFor(emailOf(salon.ownerId()));
 
         ResponseEntity<String> response = restTemplate.exchange(
                 "/api/v1/users/me", HttpMethod.DELETE,
                 new HttpEntity<>(fixtures.bearerHeaders(token)), String.class);
 
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
         JsonNode body = objectMapper.readTree(response.getBody());
-        assertThat(body.path("message").asText()).isEqualTo("Access denied");
-        assertThat(csd.userExists(ownerId)).isTrue();
+        assertThat(body.path("data").path("code").asText()).isEqualTo("OWNER_HAS_ACTIVE_SALONS");
+        assertThat(csd.userExists(salon.ownerId())).isTrue();
     }
 
     @Test
@@ -127,22 +131,21 @@ class StaffAccountSelfDeleteAuthorizationIT extends AbstractIntegrationTest {
 
     @Test
     @DisplayName("the per-user 3/hour self-delete bucket (role-blind, BookingRateLimitFilter) "
-            + "throttles a 4th DELETE /users/me within the window with 429 — using SALON_OWNER, "
-            + "whose calls always 403 and so never delete the account, letting one caller exhaust "
-            + "the budget deterministically")
+            + "throttles a 4th DELETE /users/me within the window with 429 — using a SALON_OWNER with an "
+            + "active salon, whose calls always 409 and so never delete the account, letting one caller "
+            + "exhaust the budget deterministically")
     void should_return429_when_fourthAttemptWithinTheHour() throws Exception {
-        String email = "authz-matrix-ratelimit-" + System.nanoTime() + "@beautica.test";
-        csd.createUser(email, "SALON_OWNER", null, "Тест", "Власник");
-        String token = fixtures.tokenFor(email);
+        ClientSelfDeleteTestFixtures.Salon salon = csd.createSalon();
+        String token = fixtures.tokenFor(emailOf(salon.ownerId()));
         HttpEntity<Void> authed = new HttpEntity<>(fixtures.bearerHeaders(token));
 
         for (int attempt = 1; attempt <= 3; attempt++) {
             ResponseEntity<String> response = restTemplate.exchange(
                     "/api/v1/users/me", HttpMethod.DELETE, authed, String.class);
             assertThat(response.getStatusCode())
-                    .as("attempt %d must still be under the bucket cap — 403 (role gate), not 429",
+                    .as("attempt %d must still be under the bucket cap — 409 (active salon), not 429",
                             attempt)
-                    .isEqualTo(HttpStatus.FORBIDDEN);
+                    .isEqualTo(HttpStatus.CONFLICT);
         }
 
         ResponseEntity<String> fourth = restTemplate.exchange(

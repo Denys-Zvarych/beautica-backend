@@ -313,4 +313,24 @@ public interface NotificationOutboxRepository extends JpaRepository<Notification
     @Modifying
     @Query("DELETE FROM NotificationOutboxEntry e WHERE e.aggregateId IN :aggregateIds")
     void deleteByAggregateIdIn(@Param("aggregateIds") Collection<UUID> aggregateIds);
+
+    /**
+     * Phase 488 (SUP-67) — deletes the still-{@code PENDING} {@code INVITE} rows whose invite token belongs to
+     * a salon owned by {@code ownerId}, so the drain worker can never mail an invite into a salon that is about
+     * to be detached. Mirrors {@code docs/release/delete-owner-account-template.sql} (outbox rows keyed by the
+     * salons' invite ids). MUST run before the invite tokens themselves are deleted (the sub-select resolves
+     * them). A {@code PROCESSING} row is already claimed by a drain worker and is left to finish.
+     *
+     * @return number of outbox rows deleted
+     */
+    @Modifying
+    @Query(value = """
+            DELETE FROM notification_outbox o
+             WHERE o.event_type = 'INVITE'
+               AND o.status = 'PENDING'
+               AND o.aggregate_id IN (SELECT i.id FROM invite_tokens i
+                                        JOIN salons s ON s.id = i.salon_id
+                                       WHERE s.owner_id = :ownerId)
+            """, nativeQuery = true)
+    int deletePendingInvitesForOwnerSalons(@Param("ownerId") UUID ownerId);
 }
