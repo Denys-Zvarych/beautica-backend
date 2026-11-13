@@ -131,6 +131,7 @@ public class NotificationOutboxDrainWorker {
     private final OutboxPayloadCipher cipher;
     private final InAppPushDispatcher inAppPushDispatcher;
     private final MeterRegistry meterRegistry;
+    private final RequestDecisionLoader requestDecisionLoader;
 
     /**
      * Self-proxy reference so that {@link #drain()} (and {@link #persistResults(List)}, for
@@ -272,9 +273,11 @@ public class NotificationOutboxDrainWorker {
     public List<EntryResult> dispatchAll(List<NotificationOutboxEntry> batch) {
         // Pre-load all booking IDs in one query to avoid N+1 (Fix Perf HIGH).
         Set<UUID> bookingIds = batch.stream()
-                // INAPP_PUSH's aggregate_id is a feed-row id, not a booking id (phase 339).
+                // INAPP_PUSH's aggregate_id is a feed-row id, not a booking id (phase 339);
+                // REQUEST_DECIDED's is the requester's user id (phase 491).
                 .filter(e -> e.getEventType() != OutboxEventType.INVITE
-                        && e.getEventType() != OutboxEventType.INAPP_PUSH)
+                        && e.getEventType() != OutboxEventType.INAPP_PUSH
+                        && e.getEventType() != OutboxEventType.REQUEST_DECIDED)
                 .map(NotificationOutboxEntry::getAggregateId)
                 .filter(Objects::nonNull)
                 .collect(Collectors.toSet());
@@ -302,6 +305,20 @@ public class NotificationOutboxDrainWorker {
             log.warn("INAPP_PUSH prepare failed, failing only the push entries of this batch: {}", pushPrepareError);
         }
 
+        // Fourth pre-load (phase 491): the decided requests + recipients of every REQUEST_DECIDED entry,
+        // at most three statements for the batch. A failure costs only those entries, like the push block.
+        RequestDecisionLoader.Snapshot decisions = RequestDecisionLoader.Snapshot.EMPTY;
+        String decisionLoadError = null;
+        List<RequestDecisionEvent> decisionEvents = requestDecisionEvents(batch);
+        if (!decisionEvents.isEmpty()) {
+            try {
+                decisions = requestDecisionLoader.load(decisionEvents);
+            } catch (RuntimeException e) {
+                decisionLoadError = e.getClass().getSimpleName();
+                log.warn("REQUEST_DECIDED pre-load failed, failing only those entries of this batch: {}", decisionLoadError);
+            }
+        }
+
         List<EntryResult> results = new ArrayList<>(batch.size());
         int consecutiveEmailFailures = 0;
         boolean emailBreakerTripped = false;
@@ -326,13 +343,17 @@ public class NotificationOutboxDrainWorker {
                 results.add(failedAttempt(entry, pushPrepareError));
                 continue;
             }
+            if (decisionLoadError != null && entry.getEventType() == OutboxEventType.REQUEST_DECIDED) {
+                results.add(failedAttempt(entry, decisionLoadError));
+                continue;
+            }
             if (smsSaturated && isSmsRow(entry, bookingCache)) {
                 // SMS pool already pushed back this tick: defer without resubmitting — no attempt counted.
                 results.add(EntryResult.smsDeferred(entry));
                 continue;
             }
             try {
-                dispatch(entry, bookingCache, visitSiblings, pushPlans);
+                dispatch(entry, bookingCache, visitSiblings, pushPlans, decisions);
                 results.add(new EntryResult(entry, OutboxStatus.SENT, entry.getAttempts(), null));
                 if (!isPush) {
                     consecutiveEmailFailures = 0;
@@ -417,6 +438,34 @@ public class NotificationOutboxDrainWorker {
     private static void requeueRemaining(List<NotificationOutboxEntry> batch, int from, List<EntryResult> results) {
         for (NotificationOutboxEntry entry : batch.subList(from, batch.size())) {
             results.add(new EntryResult(entry, OutboxStatus.PENDING, entry.getAttempts(), entry.getLastError()));
+        }
+    }
+
+    /**
+     * Phase 491 — the parsed payloads of the batch's {@code REQUEST_DECIDED} entries, the pre-load input.
+     * An unreadable payload is left out here; {@link #requestDecisionEvent} raises it inside the loop,
+     * where the failure is attributed to that one entry rather than to the batch.
+     */
+    private List<RequestDecisionEvent> requestDecisionEvents(List<NotificationOutboxEntry> batch) {
+        List<RequestDecisionEvent> events = new ArrayList<>();
+        for (NotificationOutboxEntry entry : batch) {
+            if (entry.getEventType() != OutboxEventType.REQUEST_DECIDED) {
+                continue;
+            }
+            try {
+                events.add(requestDecisionEvent(entry));
+            } catch (IllegalStateException e) {
+                log.warn("Outbox entry [{}] has an unreadable REQUEST_DECIDED payload", entry.getId());
+            }
+        }
+        return events;
+    }
+
+    private RequestDecisionEvent requestDecisionEvent(NotificationOutboxEntry entry) {
+        try {
+            return RequestDecisionEvent.parse(readPayload(entry));
+        } catch (IllegalArgumentException e) {
+            throw new IllegalStateException(e.getMessage() + " (entry " + entry.getId() + ")");
         }
     }
 
@@ -554,7 +603,8 @@ public class NotificationOutboxDrainWorker {
 
     private void dispatch(NotificationOutboxEntry entry, Map<UUID, Booking> bookingCache,
                           Map<UUID, List<Booking>> visitSiblings,
-                          Map<UUID, InAppPushDispatcher.PushPlan> pushPlans) {
+                          Map<UUID, InAppPushDispatcher.PushPlan> pushPlans,
+                          RequestDecisionLoader.Snapshot decisions) {
         switch (entry.getEventType()) {
             // The two visit-aware events: one outbox row describes the WHOLE visit, so the sibling
             // booking rows are hydrated here (see BookingVisitResolver) and threaded through every
@@ -596,6 +646,12 @@ public class NotificationOutboxDrainWorker {
                 if (plan != null) {
                     inAppPushDispatcher.dispatch(plan);
                 }
+            }
+            // Phase 491 — the requester's decision e-mail from the pre-loaded live state; a gone / changed /
+            // inactive requester or request is a D3 no-op (marked SENT), decided by NotificationService.
+            case REQUEST_DECIDED -> {
+                RequestDecisionEvent event = requestDecisionEvent(entry);
+                notificationService.notifyRequestDecided(event, decisions.target(event), decisions.recipient(event));
             }
             case INVITE -> {
                 Map<String, String> p = readJson(entry.getPayload());

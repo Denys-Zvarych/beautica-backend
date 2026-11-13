@@ -54,6 +54,12 @@ public class NotificationOutboxService {
     /** Phase 436 — {@code CLIENT_CANCELLED} payload key: the request's cancelled booking ids, comma-separated. */
     public static final String CANCELLED_BOOKING_IDS = "cancelledBookingIds";
 
+    /** Phase 491 — {@code REQUEST_DECIDED} payload keys (ids and the flag only, no free text). */
+    public static final String REQUEST_KIND = "kind";
+    public static final String REQUEST_ID = "requestId";
+    public static final String REQUEST_APPROVED = "approved";
+    public static final String RECIPIENT_USER_ID = "recipientUserId";
+
     private static final int MAX_EMAIL_LENGTH = 254;
     private static final int MAX_SALON_NAME_LENGTH = 255;
     private static final int MAX_INVITE_URL_LENGTH = 2048;
@@ -369,6 +375,37 @@ public class NotificationOutboxService {
     public void enqueueMasterRemoved(UUID bookingId) {
         Objects.requireNonNull(bookingId, "bookingId must not be null");
         save(OutboxEventType.MASTER_REMOVED, bookingId, null);
+    }
+
+    /**
+     * Phase 491 — enqueues the REQUESTER's "your category request / service-type suggestion was approved
+     * or rejected" e-mail ({@link OutboxEventType#REQUEST_DECIDED}), once per decision, in the decision
+     * transaction (NTF-01). Nothing is enqueued when the request has no requester (legacy row or deleted
+     * account) — the same skip the feed item makes.
+     *
+     * <p>The payload carries ids and the flag only (D2): {@code kind}, {@code requestId},
+     * {@code approved}, {@code recipientUserId}. The name and the admin's reason are re-read at drain time,
+     * so no admin free text and no e-mail address sits in {@code notification_outbox.payload}.
+     * {@code aggregate_id} is the recipient: a category id is a BIGINT and cannot be the UUID aggregate.
+     *
+     * @param kind            which request type was decided
+     * @param requestId       the decided row's id as text (BIGINT for a category, UUID for a suggestion)
+     * @param approved        {@code true} for approve, {@code false} for reject
+     * @param recipientUserId the requester; {@code null} skips the row
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void enqueueRequestDecided(RequestKind kind, String requestId, boolean approved, UUID recipientUserId) {
+        Objects.requireNonNull(kind, "kind must not be null");
+        Objects.requireNonNull(requestId, "requestId must not be null");
+        if (recipientUserId == null) {
+            return;
+        }
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put(REQUEST_KIND, kind.name());
+        payload.put(REQUEST_ID, requestId);
+        payload.put(REQUEST_APPROVED, approved);
+        payload.put(RECIPIENT_USER_ID, recipientUserId.toString());
+        save(OutboxEventType.REQUEST_DECIDED, recipientUserId, writeJson(payload));
     }
 
     // --- private helpers ---

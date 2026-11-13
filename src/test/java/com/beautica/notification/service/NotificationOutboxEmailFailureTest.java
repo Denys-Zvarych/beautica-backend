@@ -64,7 +64,7 @@ class NotificationOutboxEmailFailureTest {
         NotificationService notification = new NotificationService(email, null, null, null, null, "https://beautica.app");
         worker = new NotificationOutboxDrainWorker(
                 outboxRepository, notification, bookingRepository, visitResolver, MAPPER, cipher, inAppPushDispatcher,
-                new io.micrometer.core.instrument.simple.SimpleMeterRegistry());
+                new io.micrometer.core.instrument.simple.SimpleMeterRegistry(), null);
         ReflectionTestUtils.setField(worker, "self", worker);
 
         lenient().when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of());

@@ -556,4 +556,53 @@ class NotificationOutboxServiceTest {
 
         verifyNoInteractions(outboxRepository);
     }
+
+    // -------------------------------------------------------------------------
+    // Phase 491 — enqueueRequestDecided
+    // -------------------------------------------------------------------------
+
+    @Test
+    @DisplayName("Phase 491: REQUEST_DECIDED payload holds exactly kind, requestId, approved and recipientUserId "
+            + "(no reason, name or e-mail); aggregate = the recipient")
+    void should_saveIdsOnlyPayload_when_enqueueRequestDecidedCalled() throws Exception {
+        UUID recipient = UUID.randomUUID();
+        ArgumentCaptor<NotificationOutboxEntry> captor = ArgumentCaptor.forClass(NotificationOutboxEntry.class);
+
+        service.enqueueRequestDecided(RequestKind.CATEGORY_REQUEST, "42", false, recipient);
+
+        verify(outboxRepository).save(captor.capture());
+        NotificationOutboxEntry saved = captor.getValue();
+        assertThat(saved.getEventType()).isEqualTo(OutboxEventType.REQUEST_DECIDED);
+        assertThat(saved.getAggregateId()).isEqualTo(recipient);
+        assertThat(MAPPER.readValue(saved.getPayload(), new TypeReference<Map<String, Object>>() {}))
+                .containsOnly(
+                        Map.entry("kind", "CATEGORY_REQUEST"),
+                        Map.entry("requestId", "42"),
+                        Map.entry("approved", false),
+                        Map.entry("recipientUserId", recipient.toString()));
+    }
+
+    @Test
+    @DisplayName("Phase 491: the payload round-trips through the drain parser (approved flag read as text)")
+    void should_roundTripThroughDrainParser_when_enqueueRequestDecidedCalled() throws Exception {
+        UUID recipient = UUID.randomUUID();
+        UUID suggestionId = UUID.randomUUID();
+        ArgumentCaptor<NotificationOutboxEntry> captor = ArgumentCaptor.forClass(NotificationOutboxEntry.class);
+
+        service.enqueueRequestDecided(RequestKind.SERVICE_TYPE_SUGGESTION, suggestionId.toString(), true, recipient);
+
+        verify(outboxRepository).save(captor.capture());
+        Map<String, String> asText = MAPPER.readValue(captor.getValue().getPayload(),
+                new TypeReference<Map<String, String>>() {});
+        assertThat(RequestDecisionEvent.parse(asText)).isEqualTo(new RequestDecisionEvent(
+                RequestKind.SERVICE_TYPE_SUGGESTION, suggestionId.toString(), true, recipient));
+    }
+
+    @Test
+    @DisplayName("Phase 491: a null recipient (no requester) saves nothing")
+    void should_notSave_when_requestDecidedRecipientIsNull() {
+        service.enqueueRequestDecided(RequestKind.CATEGORY_REQUEST, "42", true, null);
+
+        verifyNoInteractions(outboxRepository);
+    }
 }
