@@ -5,14 +5,17 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.springdoc.webmvc.api.OpenApiWebMvcResource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.test.context.TestPropertySource;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -30,11 +33,29 @@ class RequestDecisionOpenApiContractIT extends AbstractIntegrationTest {
 
     @Autowired private TestRestTemplate restTemplate;
     @Autowired private ObjectMapper objectMapper;
+    @Autowired private OpenApiWebMvcResource openApiResource;
+
+    /** The spec is static for the shared context — fetched once over HTTP, then reused by every test. */
+    private static JsonNode cachedSchemas;
 
     private JsonNode schemas() throws Exception {
-        ResponseEntity<String> response = restTemplate.getForEntity("/api-docs", String.class);
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
-        return objectMapper.readTree(response.getBody()).path("components").path("schemas");
+        if (cachedSchemas == null) {
+            warmSpringDocInProcess();
+            ResponseEntity<String> response = restTemplate.getForEntity("/api-docs", String.class);
+            assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+            cachedSchemas = objectMapper.readTree(response.getBody()).path("components").path("schemas");
+        }
+        return cachedSchemas;
+    }
+
+    /**
+     * The cold SpringDoc model build takes ~9-10 s under load, which races the base class's 10 s HTTP
+     * read timeout ({@code TestHttpClients.TIMEOUT_MILLIS}). Building it in-process first (no socket,
+     * no timeout) fills SpringDoc's per-locale cache, so the HTTP GET below only serialises it. The
+     * locale matches what the server resolves for a request with no {@code Accept-Language}.
+     */
+    private void warmSpringDocInProcess() throws Exception {
+        openApiResource.openapiJson(new MockHttpServletRequest(), "/api-docs", Locale.getDefault());
     }
 
     private static List<String> texts(JsonNode array) {
