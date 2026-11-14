@@ -2471,36 +2471,52 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
         return claimTwoHourRemindersByIdsNoLockTimeout(ids);
     }
 
+    /** Phase 493 — one booking row a 2h visit claim flipped, with its visit. */
+    interface TwoHourVisitClaim {
+        UUID getId();
+
+        UUID getAppointmentId();
+    }
+
     /**
-     * Phase 413 — visit counterpart: flips EVERY unlocked, unflagged item of each visit and returns each visit it
-     * flipped, once. Audit-fix: {@code SKIP LOCKED} as above, and a visit any of whose items is already flagged is
-     * never claimed again ({@code NOT EXISTS}), so a service added to the visit later — or an item skipped while
-     * locked — can never cause a second 2h reminder. Call {@link #claimTwoHourVisitRemindersByAppointmentIds}.
+     * Phase 413 — visit counterpart: flips EVERY unlocked, unflagged item of each visit and returns every row it
+     * flipped (id + visit). Audit-fix: {@code SKIP LOCKED} as above, and a visit any of whose items is already
+     * flagged is never claimed again ({@code NOT EXISTS}), so a service added to the visit later — or an item skipped
+     * while locked — can never cause a second 2h reminder. Call {@link #claimTwoHourVisitRemindersByAppointmentIds}.
+     *
+     * <p>Phase 493 (GST-77): a row whose start was MOVED ({@code reminder_2h_rearmed}, set by
+     * {@code Booking.reschedule}) bypasses that sibling guard ONLY while it is itself due ({@code :dueIds}, the rows
+     * this sweep selected), so a per-item-moved visit item is reminded about its new time, in its own window; the
+     * claim clears the marker. A due added-but-unmoved row keeps {@code rearmed = FALSE} and stays guarded, so it can
+     * neither be reminded nor consume a not-yet-due moved row's reminder; {@code c} selects only passing rows, so
+     * already-reminded siblings are never re-claimed. The caller builds the message from a CLAIMED row.
      */
     @Query(value = """
             WITH c AS (
                 SELECT b.id FROM bookings b
                  WHERE b.appointment_id IN (:appointmentIds)
                    AND b.reminder_2h_sent = FALSE
-                   AND NOT EXISTS (SELECT 1 FROM bookings o
-                                    WHERE o.appointment_id = b.appointment_id
-                                      AND o.reminder_2h_sent = TRUE)
-                 FOR UPDATE OF b SKIP LOCKED),
-            u AS (
-                UPDATE bookings b
-                   SET reminder_2h_sent = TRUE
-                  FROM c
-                 WHERE b.id = c.id
-                RETURNING b.appointment_id)
-            SELECT DISTINCT appointment_id FROM u
+                   AND ((b.reminder_2h_rearmed AND b.id IN (:dueIds))
+                        OR NOT EXISTS (SELECT 1 FROM bookings o
+                                        WHERE o.appointment_id = b.appointment_id
+                                          AND o.reminder_2h_sent = TRUE))
+                 FOR UPDATE OF b SKIP LOCKED)
+            UPDATE bookings b
+               SET reminder_2h_sent = TRUE,
+                   reminder_2h_rearmed = FALSE
+              FROM c
+             WHERE b.id = c.id
+            RETURNING b.id AS "id", b.appointment_id AS "appointmentId"
             """, nativeQuery = true)
-    List<UUID> claimTwoHourVisitRemindersByAppointmentIdsNoLockTimeout(
-            @Param("appointmentIds") Collection<UUID> appointmentIds);
+    List<TwoHourVisitClaim> claimTwoHourVisitRemindersByAppointmentIdsNoLockTimeout(
+            @Param("appointmentIds") Collection<UUID> appointmentIds,
+            @Param("dueIds") Collection<UUID> dueIds);
 
     /** {@link #claimTwoHourVisitRemindersByAppointmentIdsNoLockTimeout} bounded by the tx-local 3s lock_timeout. */
-    default List<UUID> claimTwoHourVisitRemindersByAppointmentIds(Collection<UUID> appointmentIds) {
+    default List<TwoHourVisitClaim> claimTwoHourVisitRemindersByAppointmentIds(
+            Collection<UUID> appointmentIds, Collection<UUID> dueIds) {
         applyTransactionLockTimeout();
-        return claimTwoHourVisitRemindersByAppointmentIdsNoLockTimeout(appointmentIds);
+        return claimTwoHourVisitRemindersByAppointmentIdsNoLockTimeout(appointmentIds, dueIds);
     }
 
     // ── Guest-cancel by link (Phase 13.4) ─────────────────────────────────────

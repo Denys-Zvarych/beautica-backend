@@ -71,8 +71,12 @@ class BookingReminderJobTwoHourTest {
         meters = new SimpleMeterRegistry();
         lenient().when(bookingRepository.claimTwoHourRemindersByIds(any()))
                 .thenAnswer(inv -> new ArrayList<>((Collection<UUID>) inv.getArgument(0)));
-        lenient().when(bookingRepository.claimTwoHourVisitRemindersByAppointmentIds(any()))
-                .thenAnswer(inv -> new ArrayList<>((Collection<UUID>) inv.getArgument(0)));
+        lenient().when(bookingRepository.claimTwoHourVisitRemindersByAppointmentIds(any(), any()))
+                .thenAnswer(inv -> ((Collection<UUID>) inv.getArgument(0)).stream()
+                        .map(appointmentId -> (BookingRepository.TwoHourVisitClaim) new BookingRepository.TwoHourVisitClaim() {
+                            @Override public UUID getId() { return UUID.randomUUID(); }
+                            @Override public UUID getAppointmentId() { return appointmentId; }
+                        }).toList());
     }
 
     @Test

@@ -505,6 +505,11 @@ public class Booking extends AuditableEntity {
     @Column(name = "reminder_2h_sent", nullable = false)
     private boolean reminder2hSent;
 
+    // Phase 493 (V239, GST-77) — 2h re-arm marker. Set only by reschedule() when starts_at moves; lets the 2h VISIT
+    // claim bypass its already-reminded-sibling guard (phase 413) for this row only. Cleared by that native claim.
+    @Column(name = "reminder_2h_rearmed", nullable = false)
+    private boolean reminder2hRearmed;
+
     // ── Staff-booking provenance (Phase 22.1 / V137) ──────────────────────────
     /**
      * The staff user (SALON_OWNER / SALON_ADMIN) who keyed this booking in, or {@code null}
@@ -761,10 +766,22 @@ public class Booking extends AuditableEntity {
      * responsibility (see {@code BookingService.rescheduleBooking}); this method only
      * moves the time window once those checks have passed.
      *
+     * <p>Phase 493 (GST-77): a move to a different start instant re-arms both reminders
+     * ({@code reminderSent}, {@code reminder2hSent}) so the 24 h / 2 h sweeps remind about the NEW
+     * time. Done here, not in the service tails, so every caller is covered. An unchanged start
+     * (compared as an instant, offset-insensitive) leaves both flags as they were. A move also sets
+     * {@code reminder2hRearmed} on THIS row only, so the 2 h visit claim re-reminds a moved item while
+     * its already-reminded siblings, and a service added to a reminded visit, stay un-re-reminded.
+     *
      * @param newStartsAt the new start instant (already validated by the service)
      * @param newEndsAt   the new end instant ({@code newStartsAt + duration + buffer})
      */
     public void reschedule(OffsetDateTime newStartsAt, OffsetDateTime newEndsAt) {
+        if (this.startsAt == null || !this.startsAt.isEqual(newStartsAt)) {
+            this.reminderSent = false;
+            this.reminder2hSent = false;
+            this.reminder2hRearmed = true;
+        }
         this.startsAt = newStartsAt;
         this.endsAt = newEndsAt;
     }

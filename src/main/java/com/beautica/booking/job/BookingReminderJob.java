@@ -300,11 +300,20 @@ public class BookingReminderJob {
             singles.stream().filter(booking -> claimed.contains(booking.getId())).forEach(leads::add);
         }
         if (!visits.isEmpty()) {
-            Set<UUID> claimed = new HashSet<>(
-                    bookingRepository.claimTwoHourVisitRemindersByAppointmentIds(visits.keySet()));
+            List<UUID> dueIds = visits.values().stream().flatMap(List::stream).map(Booking::getId).toList();
+            Set<UUID> claimedRows = new HashSet<>();
+            Set<UUID> claimedVisits = new HashSet<>();
+            for (BookingRepository.TwoHourVisitClaim claim
+                    : bookingRepository.claimTwoHourVisitRemindersByAppointmentIds(visits.keySet(), dueIds)) {
+                claimedRows.add(claim.getId());
+                claimedVisits.add(claim.getAppointmentId());
+            }
             visits.forEach((appointmentId, items) -> {
-                if (claimed.contains(appointmentId)) {
-                    leads.add(items.get(0));
+                if (claimedVisits.contains(appointmentId)) {
+                    // B493: lead with the earliest due row THIS claim flipped (a moved item, never a guarded added
+                    // service). Fallback keeps phase 413: a due row skipped while locked, rest of the visit claimed.
+                    leads.add(items.stream().filter(b -> claimedRows.contains(b.getId())).findFirst()
+                            .orElse(items.get(0)));
                 }
             });
         }
