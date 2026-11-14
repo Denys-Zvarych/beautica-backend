@@ -13,6 +13,7 @@ import org.springframework.lang.Nullable;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
+import java.time.Instant;
 import java.util.EnumSet;
 import java.util.Set;
 import java.util.UUID;
@@ -533,6 +534,39 @@ public class NotificationService {
             return "requester changed";
         }
         return recipient.isActive() ? null : "recipient inactive";
+    }
+
+    /**
+     * Phase 494 (NTF-47) — a registered client's 24 h / 2 h reminder e-mail for ONE APP booking (NTF-D11), from the
+     * drain's live re-read of the booking. E-mail only (NTF-D04). A clean no-op (row SENT, nothing sent) when the
+     * booking is no longer {@code CONFIRMED}, its start moved out of the window the sweep claimed it from (a reschedule
+     * re-arms the flags, GST-77, so the next sweep reminds about the new time instead), or the client account is gone
+     * or inactive. Ids only in the log.
+     *
+     * @param claimedAt the sweep tick that claimed it (payload {@code claimedAt}); {@code null} (unreadable) skips
+     */
+    public void notifyBookingReminder(Booking booking, ReminderKind kind, Instant claimedAt) {
+        String skip = bookingReminderSkipReason(booking, kind, claimedAt);
+        if (skip != null) {
+            log.debug("Skipping BOOKING_REMINDER kind={} booking={}: {}", kind, booking.getId(), skip);
+            return;
+        }
+        emailService.sendBookingReminderEmail(booking.getClient().getEmail(), booking, kind);
+    }
+
+    @Nullable
+    private static String bookingReminderSkipReason(Booking booking, ReminderKind kind, Instant claimedAt) {
+        if (booking.getStatus() != BookingStatus.CONFIRMED) {
+            return "not confirmed";
+        }
+        if (claimedAt == null || !kind.isInWindow(booking.getStartsAt(), claimedAt)) {
+            return "start moved out of the claimed window";
+        }
+        User client = booking.getClient();
+        if (client == null) {
+            return "client gone";
+        }
+        return client.isActive() ? null : "client inactive";
     }
 
     /**

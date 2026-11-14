@@ -6,6 +6,8 @@ import com.beautica.booking.event.GuestRemindersDueEvent.ReminderType;
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.common.AuditableEntity;
 import com.beautica.config.BookingSmsProperties;
+import com.beautica.notification.service.NotificationOutboxService;
+import com.beautica.notification.service.ReminderKind;
 import com.beautica.master.entity.Master;
 import com.beautica.salon.entity.Salon;
 import com.beautica.service.entity.MasterServiceAssignment;
@@ -60,6 +62,7 @@ class BookingReminderJobTwoHourTest {
 
     @Mock private BookingRepository bookingRepository;
     @Mock private ApplicationEventPublisher events;
+    @Mock private NotificationOutboxService outboxService;
 
     private BookingSmsProperties properties;
     private SimpleMeterRegistry meters;
@@ -70,6 +73,8 @@ class BookingReminderJobTwoHourTest {
         properties.getReminder2h().setEnabled(true);
         meters = new SimpleMeterRegistry();
         lenient().when(bookingRepository.claimTwoHourRemindersByIds(any()))
+                .thenAnswer(inv -> new ArrayList<>((Collection<UUID>) inv.getArgument(0)));
+        lenient().when(bookingRepository.claimRegisteredTwoHourRemindersByIds(any()))
                 .thenAnswer(inv -> new ArrayList<>((Collection<UUID>) inv.getArgument(0)));
         lenient().when(bookingRepository.claimTwoHourVisitRemindersByAppointmentIds(any(), any()))
                 .thenAnswer(inv -> ((Collection<UUID>) inv.getArgument(0)).stream()
@@ -215,9 +220,102 @@ class BookingReminderJobTwoHourTest {
         verifyNoInteractions(events);
     }
 
+    // ── phase 494: registered-client (APP) e-mail leg ────────────────────────────────────────────
+
+    @Test
+    @DisplayName("phase 494: daytime, flag on, booked ≥3h ahead → claimed on the 2h window, one H2 outbox row")
+    void should_enqueueTwoHourReminder_when_registeredBookingDueInDaytime() {
+        // Arrange
+        UUID bookingId = UUID.randomUUID();
+        when(bookingRepository.findRegisteredBookingsForTwoHourReminder(any(), any(), any()))
+                .thenReturn(List.of(candidate(bookingId, MIDDAY_KYIV.plus(Duration.ofHours(2)),
+                        MIDDAY_KYIV.minus(Duration.ofDays(1)))));
+
+        // Act
+        jobAt(MIDDAY_KYIV).sweepTwoHour();
+
+        // Assert
+        verify(bookingRepository).findRegisteredBookingsForTwoHourReminder(
+                OffsetDateTime.ofInstant(MIDDAY_KYIV.plus(Duration.ofMinutes(105)), ZoneOffset.UTC),
+                OffsetDateTime.ofInstant(MIDDAY_KYIV.plus(Duration.ofMinutes(135)), ZoneOffset.UTC),
+                Limit.of(BookingRepository.TWO_HOUR_REMINDER_BATCH_CAP));
+        verify(bookingRepository).claimRegisteredTwoHourRemindersByIds(List.of(bookingId));
+        verify(outboxService).enqueueBookingReminder(bookingId, ReminderKind.H2, MIDDAY_KYIV);
+    }
+
+    @Test
+    @DisplayName("phase 494: a registered booking created <3h before its start is neither claimed nor enqueued")
+    void should_skipRegisteredBooking_when_bookedAtShortNotice() {
+        // Arrange
+        Instant start = MIDDAY_KYIV.plus(Duration.ofHours(2));
+        when(bookingRepository.findRegisteredBookingsForTwoHourReminder(any(), any(), any()))
+                .thenReturn(List.of(candidate(UUID.randomUUID(), start, start.minus(Duration.ofMinutes(170)))));
+
+        // Act
+        jobAt(MIDDAY_KYIV).sweepTwoHour();
+
+        // Assert
+        verify(bookingRepository, never()).claimRegisteredTwoHourRemindersByIds(any());
+        verifyNoInteractions(outboxService);
+    }
+
+    @Test
+    @DisplayName("phase 494: Kyiv night → the registered leg selects and claims nothing")
+    void should_skipRegisteredLeg_when_kyivNight() {
+        // Act
+        jobAt(Instant.parse("2026-06-01T19:30:00Z")).sweepTwoHour(); // 22:30 Kyiv
+
+        // Assert
+        verify(bookingRepository, never()).findRegisteredBookingsForTwoHourReminder(any(), any(), any());
+        verifyNoInteractions(outboxService);
+    }
+
+    @Test
+    @DisplayName("phase 494: 2h flag off → the registered leg selects and claims nothing (D4)")
+    void should_skipRegisteredLeg_when_flagOff() {
+        // Arrange
+        properties.getReminder2h().setEnabled(false);
+
+        // Act
+        jobAt(MIDDAY_KYIV).sweepTwoHour();
+
+        // Assert
+        verify(bookingRepository, never()).findRegisteredBookingsForTwoHourReminder(any(), any(), any());
+        verifyNoInteractions(outboxService);
+    }
+
+    @Test
+    @DisplayName("phase 494: a registered 2h claim another tick already won enqueues nothing")
+    void should_enqueueNothing_when_registeredTwoHourClaimLost() {
+        // Arrange
+        UUID bookingId = UUID.randomUUID();
+        when(bookingRepository.findRegisteredBookingsForTwoHourReminder(any(), any(), any()))
+                .thenReturn(List.of(candidate(bookingId, MIDDAY_KYIV.plus(Duration.ofHours(2)),
+                        MIDDAY_KYIV.minus(Duration.ofDays(1)))));
+        doReturn(List.of()).when(bookingRepository).claimRegisteredTwoHourRemindersByIds(any());
+
+        // Act
+        jobAt(MIDDAY_KYIV).sweepTwoHour();
+
+        // Assert
+        verifyNoInteractions(outboxService);
+    }
+
+    private static BookingRepository.RegisteredReminderCandidate candidate(UUID id, Instant startsAt, Instant createdAt) {
+        return new RegisteredCandidate(id, OffsetDateTime.ofInstant(startsAt, ZoneOffset.UTC), createdAt);
+    }
+
+    private record RegisteredCandidate(UUID id, OffsetDateTime startsAt, Instant createdAt)
+            implements BookingRepository.RegisteredReminderCandidate {
+        @Override public UUID getId() { return id; }
+        @Override public OffsetDateTime getStartsAt() { return startsAt; }
+        @Override public Instant getCreatedAt() { return createdAt; }
+    }
+
     private BookingReminderJob jobAt(Instant now) {
         return new BookingReminderJob(bookingRepository, properties, events, Clock.fixed(now, ZoneOffset.UTC), meters,
-                com.beautica.booking.crypto.GuestCancelTokenCipherFixtures.testPageLinks("https://beautica.app"));
+                com.beautica.booking.crypto.GuestCancelTokenCipherFixtures.testPageLinks("https://beautica.app"),
+                new RegisteredBookingReminderSweep(bookingRepository, outboxService));
     }
 
     // ── phase 435 copy: independent vs salon variant, optional address line, visit phrase ──────────

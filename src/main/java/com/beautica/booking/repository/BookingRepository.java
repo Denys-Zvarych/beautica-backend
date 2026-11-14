@@ -2444,6 +2444,124 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             @Param("includeWalkIns") boolean includeWalkIns,
             org.springframework.data.domain.Limit limit);
 
+    // ── Registered-client (APP) reminder sweeps (Phase 494) ───────────────────
+    /**
+     * Phase 494 — one APP booking due for a registered client's reminder e-mail: the id the claim flips, plus the two
+     * timestamps the 2 h short-notice rule reads. A scalar projection — the e-mail is rendered by the outbox drain
+     * from its own fetch-joined re-read ({@link #findAllByIdsWithGraph}), so the sweep loads no association.
+     */
+    interface RegisteredReminderCandidate {
+        UUID getId();
+
+        OffsetDateTime getStartsAt();
+
+        Instant getCreatedAt();
+    }
+
+    /**
+     * Phase 494 (NTF-47) — registered clients' APP bookings due for the 24 h reminder: {@code CONFIRMED}, not yet
+     * reminded, with a client account, starting in {@code [from, to]} (the guest finder's inclusive window). The
+     * literal source / status / flag predicate matches the partial index {@code idx_bookings_reminder_app} (V240)
+     * exactly, so the planner can serve it from that index only. Bounded twice (Anti-Bug §E-3): the 2-hour window the
+     * job supplies and {@code limit} ({@link #REGISTERED_DAY_BEFORE_REMINDER_BATCH_CAP}); the overflow stays
+     * unclaimed and is picked up by the next hourly tick. One row per booking — never grouped per visit (NTF-D11).
+     */
+    @Query("""
+            SELECT b.id AS id, b.startsAt AS startsAt, b.createdAt AS createdAt
+              FROM Booking b
+             WHERE b.bookingSource = com.beautica.booking.enums.BookingSource.APP
+               AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
+               AND b.reminderSent = false
+               AND b.client IS NOT NULL
+               AND b.startsAt BETWEEN :from AND :to
+             ORDER BY b.startsAt, b.id
+            """)
+    List<RegisteredReminderCandidate> findRegisteredBookingsForReminder(
+            @Param("from") OffsetDateTime from,
+            @Param("to") OffsetDateTime to,
+            org.springframework.data.domain.Limit limit);
+
+    /** Phase 494 audit-fix — rows one registered 24 h sweep tick selects (and therefore claims) at most. */
+    int REGISTERED_DAY_BEFORE_REMINDER_BATCH_CAP = TWO_HOUR_REMINDER_BATCH_CAP;
+
+    /**
+     * Phase 494 audit-fix — claims the given registered (APP) bookings for the 24 h reminder: flips
+     * {@code reminder_sent} only where still {@code false} and returns the ids this call won. Unlike the guest
+     * {@link #claimRemindersByIds} (left unchanged), rows locked by anyone else are SKIPPED
+     * ({@code FOR UPDATE SKIP LOCKED}) rather than waited on, so one held booking row never stalls the hourly sweep
+     * (and with it the guest leg); a skipped row is re-selected next tick if still unclaimed. Call
+     * {@link #claimRegisteredRemindersByIds} (3 s lock_timeout wrapper, kept for any non-skippable lock).
+     */
+    @Query(value = """
+            WITH c AS (
+                SELECT id FROM bookings
+                 WHERE id IN (:ids)
+                   AND reminder_sent = FALSE
+                 FOR UPDATE SKIP LOCKED)
+            UPDATE bookings b
+               SET reminder_sent = TRUE
+              FROM c
+             WHERE b.id = c.id
+            RETURNING b.id
+            """, nativeQuery = true)
+    List<UUID> claimRegisteredRemindersByIdsNoLockTimeout(@Param("ids") Collection<UUID> ids);
+
+    /**
+     * {@link #claimRegisteredRemindersByIdsNoLockTimeout} bounded by the transaction-local 3s {@code lock_timeout},
+     * scoped to THIS claim only (B494 audit-fix cycle 2): the registered leg runs first inside the guest sweep's
+     * transaction, and a bare {@code SET LOCAL} would outlive it and silently cap the guest leg's
+     * {@link #claimRemindersByIds} (no SKIP LOCKED, never bounded before B494) at 3s. The previous transaction value is
+     * captured before and restored right after, so the guest leg runs exactly as before B494. Not restored when the
+     * claim throws: the transaction is then aborted and rolls back, which resets the setting anyway.
+     */
+    default List<UUID> claimRegisteredRemindersByIds(Collection<UUID> ids) {
+        String previous = currentTransactionLockTimeout();
+        applyTransactionLockTimeout();
+        List<UUID> claimed = claimRegisteredRemindersByIdsNoLockTimeout(ids);
+        restoreTransactionLockTimeout(previous);
+        return claimed;
+    }
+
+    /**
+     * B494 audit-fix cycle 2 — the current {@code lock_timeout} of this transaction (session default when none was
+     * set locally). Same never-flush query space as {@link #applyTransactionLockTimeout()}.
+     */
+    @org.springframework.data.jpa.repository.QueryHints(@jakarta.persistence.QueryHint(
+            name = org.hibernate.jpa.HibernateHints.HINT_NATIVE_SPACES, value = "tx_lock_timeout"))
+    @Query(value = "SELECT current_setting('lock_timeout')", nativeQuery = true)
+    String currentTransactionLockTimeout();
+
+    /**
+     * B494 audit-fix cycle 2 — puts back a {@code lock_timeout} captured by {@link #currentTransactionLockTimeout()}
+     * for the rest of the transaction ({@code is_local = true}: reset at commit/rollback like the 3s it replaces).
+     */
+    @org.springframework.data.jpa.repository.QueryHints(@jakarta.persistence.QueryHint(
+            name = org.hibernate.jpa.HibernateHints.HINT_NATIVE_SPACES, value = "tx_lock_timeout"))
+    @Query(value = "SELECT set_config('lock_timeout', :value, true)", nativeQuery = true)
+    String restoreTransactionLockTimeout(@Param("value") String value);
+
+    /**
+     * Phase 494 (NTF-47) — registered clients' APP bookings due for the 2 h reminder, over the guest 2 h finder's
+     * half-open {@code [from, to)} window, on the partial index {@code idx_bookings_reminder_2h_app} (V240). Bounded
+     * twice like the guest finder: the 30-minute window and {@code limit}
+     * ({@link #TWO_HOUR_REMINDER_BATCH_CAP}); the overflow is picked up by the next tick.
+     */
+    @Query("""
+            SELECT b.id AS id, b.startsAt AS startsAt, b.createdAt AS createdAt
+              FROM Booking b
+             WHERE b.bookingSource = com.beautica.booking.enums.BookingSource.APP
+               AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
+               AND b.reminder2hSent = false
+               AND b.client IS NOT NULL
+               AND b.startsAt >= :from
+               AND b.startsAt < :to
+             ORDER BY b.startsAt, b.id
+            """)
+    List<RegisteredReminderCandidate> findRegisteredBookingsForTwoHourReminder(
+            @Param("from") OffsetDateTime from,
+            @Param("to") OffsetDateTime to,
+            org.springframework.data.domain.Limit limit);
+
     /**
      * Phase 413 — claims the given single bookings for the 2h reminder: flips {@code reminder_2h_sent} only where
      * still {@code false} and returns the ids this call won. Audit-fix: rows locked by anyone else are SKIPPED
@@ -2469,6 +2587,20 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     default List<UUID> claimTwoHourRemindersByIds(Collection<UUID> ids) {
         applyTransactionLockTimeout();
         return claimTwoHourRemindersByIdsNoLockTimeout(ids);
+    }
+
+    /**
+     * B494 audit-fix cycle 2 — the registered (APP) leg's 2 h claim: the same statement as
+     * {@link #claimTwoHourRemindersByIds} (left unchanged for the guest leg), but its 3s {@code lock_timeout} is
+     * scoped to this claim and the previous value restored, so the guest 2 h leg that follows in the same transaction
+     * (finder included) runs exactly as before B494. See {@link #claimRegisteredRemindersByIds}.
+     */
+    default List<UUID> claimRegisteredTwoHourRemindersByIds(Collection<UUID> ids) {
+        String previous = currentTransactionLockTimeout();
+        applyTransactionLockTimeout();
+        List<UUID> claimed = claimTwoHourRemindersByIdsNoLockTimeout(ids);
+        restoreTransactionLockTimeout(previous);
+        return claimed;
     }
 
     /** Phase 493 — one booking row a 2h visit claim flipped, with its visit. */

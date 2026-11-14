@@ -4,6 +4,7 @@ import com.beautica.auth.Role;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.master.entity.Master;
+import com.beautica.notification.BookingReminderEmailExpectedCopy;
 import com.beautica.notification.RequestDecisionEmailExpectedCopy;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.ServiceDefinition;
@@ -1498,7 +1499,8 @@ class EmailNotificationServiceTest {
     // Phase 491 — sendRequestDecisionEmail (real Thymeleaf engine: escaping is the point)
     // -------------------------------------------------------------------------
 
-    private MimeMessage sendDecisionWithRealEngine(RequestKind kind, boolean approved, String name, String reason) {
+    /** The real classpath Thymeleaf engine (phase 491; shared with phase 494 when a second suite needed it). */
+    private static SpringTemplateEngine realEngine() {
         var resolver = new org.thymeleaf.templateresolver.ClassLoaderTemplateResolver();
         resolver.setPrefix("templates/");
         resolver.setSuffix(".html");
@@ -1506,9 +1508,13 @@ class EmailNotificationServiceTest {
         resolver.setCharacterEncoding("UTF-8");
         var engine = new SpringTemplateEngine();
         engine.setTemplateResolver(resolver);
+        return engine;
+    }
+
+    private MimeMessage sendDecisionWithRealEngine(RequestKind kind, boolean approved, String name, String reason) {
         MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
         when(mailSender.createMimeMessage()).thenReturn(realMessage);
-        new EmailNotificationService(mailSender, engine, FROM_ADDRESS)
+        new EmailNotificationService(mailSender, realEngine(), FROM_ADDRESS)
                 .sendRequestDecisionEmail("requester@example.com", kind, approved, name, reason);
         verify(mailSender).send(realMessage);
         return realMessage;
@@ -1596,5 +1602,87 @@ class EmailNotificationServiceTest {
 
         assertThat(message.getSubject())
                 .isEqualTo(RequestDecisionEmailExpectedCopy.subject(RequestKind.CATEGORY_REQUEST, true, "Нейл-арт"));
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 494 — sendBookingReminderEmail (real Thymeleaf engine: copy + escaping)
+    // -------------------------------------------------------------------------
+
+    /** 07:30Z on 2 June = 10:30 Kyiv (EEST, UTC+3) — the subject must show Kyiv, not UTC, time. */
+    private static final OffsetDateTime REMINDER_START = OffsetDateTime.parse("2026-06-02T07:30:00Z");
+
+    private MimeMessage sendReminderWithRealEngine(Booking booking, ReminderKind kind) {
+        MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
+        when(mailSender.createMimeMessage()).thenReturn(realMessage);
+        new EmailNotificationService(mailSender, realEngine(), FROM_ADDRESS)
+                .sendBookingReminderEmail("client@example.com", booking, kind);
+        verify(mailSender).send(realMessage);
+        return realMessage;
+    }
+
+    private Booking reminderBooking(String serviceName, com.beautica.salon.entity.Salon salon) {
+        Booking booking = buildBookingMock("Олена", "Коваль", "Марія", "Левченко", serviceName, REMINDER_START);
+        lenient().when(booking.getSalon()).thenReturn(salon);
+        return booking;
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest(name = "{0}")
+    @org.junit.jupiter.params.provider.EnumSource(ReminderKind.class)
+    @DisplayName("Phase 494: the reminder subject names the day and the KYIV start time")
+    void should_setKyivTimeSubject_when_sendBookingReminderEmailCalled(ReminderKind kind) throws Exception {
+        // Act
+        MimeMessage message = sendReminderWithRealEngine(reminderBooking("Манікюр", null), kind);
+
+        // Assert
+        assertThat(message.getSubject()).isEqualTo(BookingReminderEmailExpectedCopy.subject(kind, "10:30"));
+        assertThat(message.getAllRecipients()).extracting(Object::toString).containsExactly("client@example.com");
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest(name = "{0}")
+    @org.junit.jupiter.params.provider.EnumSource(ReminderKind.class)
+    @DisplayName("Phase 494: the body carries the kind's copy, service, master and Kyiv date/time — not the other kind's")
+    void should_renderKindCopyAndDetails_when_sendBookingReminderEmailCalled(ReminderKind kind) throws Exception {
+        // Arrange
+        ReminderKind other = kind == ReminderKind.H24 ? ReminderKind.H2 : ReminderKind.H24;
+
+        // Act
+        String html = htmlOf(sendReminderWithRealEngine(reminderBooking("Манікюр", null), kind));
+
+        // Assert
+        assertThat(html)
+                .contains(BookingReminderEmailExpectedCopy.heading(kind))
+                .contains(BookingReminderEmailExpectedCopy.leadLine(kind))
+                .doesNotContain(BookingReminderEmailExpectedCopy.heading(other))
+                .contains("Манікюр", "Марія Левченко", "Олена Коваль", "10:30, 2 червня 2026");
+    }
+
+    @Test
+    @DisplayName("Phase 494: provider-authored text (service, salon, address) is HTML-escaped, never markup")
+    void should_escapeProviderText_when_sendBookingReminderEmailCalled() throws Exception {
+        // Arrange
+        com.beautica.salon.entity.Salon salon = mock(com.beautica.salon.entity.Salon.class);
+        when(salon.getName()).thenReturn("Salon <b>X</b>");
+        when(salon.getStreet()).thenReturn("Хрещатик <img src=x>");
+        when(salon.getBuildingNo()).thenReturn("10");
+        Booking booking = reminderBooking("<script>alert(1)</script>", salon);
+
+        // Act
+        String html = htmlOf(sendReminderWithRealEngine(booking, ReminderKind.H24));
+
+        // Assert
+        assertThat(html)
+                .doesNotContain("<script>", "<b>X</b>", "<img src=x>")
+                .contains("&lt;script&gt;alert(1)&lt;/script&gt;", "Salon &lt;b&gt;X&lt;/b&gt;",
+                        "Хрещатик &lt;img src=x&gt; 10");
+    }
+
+    @Test
+    @DisplayName("Phase 494: no salon and no address → the Салон and Адреса rows are omitted")
+    void should_omitSalonAndAddressRows_when_noneKnown() throws Exception {
+        // Act
+        String html = htmlOf(sendReminderWithRealEngine(reminderBooking("Манікюр", null), ReminderKind.H2));
+
+        // Assert
+        assertThat(html).doesNotContain("Салон", "Адреса", "Як знайти");
     }
 }

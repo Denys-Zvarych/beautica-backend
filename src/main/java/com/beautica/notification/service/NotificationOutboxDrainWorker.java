@@ -653,6 +653,20 @@ public class NotificationOutboxDrainWorker {
                 RequestDecisionEvent event = requestDecisionEvent(entry);
                 notificationService.notifyRequestDecided(event, decisions.target(event), decisions.recipient(event));
             }
+            // Phase 494 — a registered client's 24 h / 2 h reminder e-mail (NTF-47). The booking was re-read by the
+            // pre-load above; a booking deleted since the claim is a no-op (row SENT), never a retry to DEAD.
+            // NotificationService decides every other skip (no longer CONFIRMED, start moved, client gone/inactive).
+            case BOOKING_REMINDER -> {
+                Booking booking = bookingCache.get(entry.getAggregateId());
+                if (booking == null) {
+                    log.debug("Skipping BOOKING_REMINDER entry [{}]: booking gone", entry.getId());
+                } else {
+                    Map<String, String> payload = readPayload(entry);
+                    Long claimedAt = epochSecondsOrNull(payload.get(NotificationOutboxService.REMINDER_CLAIMED_AT));
+                    notificationService.notifyBookingReminder(booking, reminderKind(entry, payload),
+                            claimedAt == null ? null : Instant.ofEpochSecond(claimedAt));
+                }
+            }
             case INVITE -> {
                 Map<String, String> p = readJson(entry.getPayload());
                 // Decrypt inviteUrlSealed from payload (Phase 5.4a cipher); aggregateId is the
@@ -727,6 +741,17 @@ public class NotificationOutboxDrainWorker {
      */
     private static boolean isProviderInitiated(Map<String, String> payload) {
         return "PROVIDER".equals(payload.get("initiatedBy"));
+    }
+
+    /** Phase 494 — the {@code BOOKING_REMINDER} payload's kind; unreadable → the row fails (retry, then DEAD). */
+    private static ReminderKind reminderKind(NotificationOutboxEntry entry, Map<String, String> payload) {
+        String kind = payload.get(NotificationOutboxService.REMINDER_KIND);
+        for (ReminderKind candidate : ReminderKind.values()) {
+            if (candidate.name().equals(kind)) {
+                return candidate;
+            }
+        }
+        throw new IllegalStateException("BOOKING_REMINDER payload has an unreadable kind (entry " + entry.getId() + ")");
     }
 
     /** The row's JSON payload, parsed once; an absent payload is an empty map. */

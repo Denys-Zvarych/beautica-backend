@@ -104,5 +104,16 @@ public enum OutboxEventType {
      * {@code recipientUserId}. The name and the admin's reason are read at drain time, so no free text
      * sits in the outbox. Widened into the CHECK by {@code V238__outbox_event_type_request_decided.sql}.
      */
-    REQUEST_DECIDED
+    REQUEST_DECIDED,
+
+    /**
+     * Phase 494 — a REGISTERED client's 24 h or 2 h reminder e-mail for one APP booking (NTF-47). One row per
+     * booking, never per visit (NTF-D11), enqueued by {@code BookingReminderJob} in the same transaction as the
+     * {@code reminder_sent} / {@code reminder_2h_sent} claim. {@code aggregate_id} is the booking id; the payload
+     * holds ids only — {@code bookingId}, {@code kind} ({@link com.beautica.notification.service.ReminderKind}) and
+     * {@code claimedAt} (epoch seconds of the claiming sweep tick).
+     * The drain re-reads the booking and skips a no-longer-due one. Widened into the CHECK by
+     * {@code V240__registered_booking_reminders.sql}.
+     */
+    BOOKING_REMINDER
 }

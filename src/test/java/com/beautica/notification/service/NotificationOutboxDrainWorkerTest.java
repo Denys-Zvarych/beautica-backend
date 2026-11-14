@@ -596,6 +596,75 @@ class NotificationOutboxDrainWorkerTest {
         assertThat(pushEntry.getAttempts()).isEqualTo(3);
     }
 
+    // ── Phase 494: BOOKING_REMINDER ───────────────────────────────────────────
+
+    private NotificationOutboxEntry bookingReminderEntry(UUID bookingId, String kind, java.time.Instant claimedAt)
+            throws Exception {
+        return entry(OutboxEventType.BOOKING_REMINDER, 0, REAL_MAPPER.writeValueAsString(Map.of(
+                "bookingId", bookingId.toString(), "kind", kind,
+                "claimedAt", String.valueOf(claimedAt.getEpochSecond()))), bookingId);
+    }
+
+    @Test
+    @DisplayName("Phase 494: BOOKING_REMINDER dispatches the pre-loaded booking with its payload kind and claim instant; SENT")
+    void should_dispatchBookingReminder_when_bookingReminderEntryProcessed() throws Exception {
+        // Arrange
+        NotificationOutboxDrainWorker w = workerWithRealMapper();
+        UUID bookingId = UUID.randomUUID();
+        java.time.Instant claimedAt = java.time.Instant.parse("2026-06-01T09:00:00Z");
+        NotificationOutboxEntry outboxEntry = bookingReminderEntry(bookingId, "H2", claimedAt);
+        Booking booking = mock(Booking.class);
+        when(booking.getId()).thenReturn(bookingId);
+        when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
+        when(bookingRepository.findAllByIdsWithGraph(List.of(bookingId))).thenReturn(List.of(booking));
+
+        // Act
+        w.drain();
+
+        // Assert
+        verify(notificationService).notifyBookingReminder(booking, ReminderKind.H2, claimedAt);
+        assertThat(outboxEntry.getStatus()).isEqualTo(OutboxStatus.SENT);
+    }
+
+    @Test
+    @DisplayName("Phase 494: a BOOKING_REMINDER whose booking is gone is a no-op that ends SENT, never retried")
+    void should_markSentWithoutNotify_when_reminderBookingGone() throws Exception {
+        // Arrange
+        NotificationOutboxDrainWorker w = workerWithRealMapper();
+        NotificationOutboxEntry outboxEntry = bookingReminderEntry(UUID.randomUUID(), "H24", java.time.Instant.parse("2026-06-01T09:00:00Z"));
+        when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
+        when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of());
+
+        // Act
+        w.drain();
+
+        // Assert
+        verify(notificationService, never()).notifyBookingReminder(any(), any(), any());
+        assertThat(outboxEntry.getStatus()).isEqualTo(OutboxStatus.SENT);
+        assertThat(outboxEntry.getAttempts()).isZero();
+    }
+
+    @Test
+    @DisplayName("Phase 494: a BOOKING_REMINDER with an unreadable kind fails that row (attempt+1), sends nothing")
+    void should_failRow_when_reminderKindUnreadable() throws Exception {
+        // Arrange
+        NotificationOutboxDrainWorker w = workerWithRealMapper();
+        UUID bookingId = UUID.randomUUID();
+        NotificationOutboxEntry outboxEntry = bookingReminderEntry(bookingId, "H48", java.time.Instant.parse("2026-06-01T09:00:00Z"));
+        Booking booking = mock(Booking.class);
+        when(booking.getId()).thenReturn(bookingId);
+        when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
+        when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(booking));
+
+        // Act
+        w.drain();
+
+        // Assert
+        verify(notificationService, never()).notifyBookingReminder(any(), any(), any());
+        assertThat(outboxEntry.getStatus()).isEqualTo(OutboxStatus.PENDING);
+        assertThat(outboxEntry.getAttempts()).isEqualTo(1);
+    }
+
     // ── Phase 491: REQUEST_DECIDED ────────────────────────────────────────────
 
     private NotificationOutboxEntry requestDecidedEntry(UUID recipient, String requestId, int attempts) throws Exception {

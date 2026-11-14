@@ -13,6 +13,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
@@ -603,6 +604,45 @@ class NotificationOutboxServiceTest {
     void should_notSave_when_requestDecidedRecipientIsNull() {
         service.enqueueRequestDecided(RequestKind.CATEGORY_REQUEST, "42", true, null);
 
+        verifyNoInteractions(outboxRepository);
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 494 — enqueueBookingReminder
+    // -------------------------------------------------------------------------
+
+    @ParameterizedTest(name = "{0}")
+    @EnumSource(ReminderKind.class)
+    @DisplayName("Phase 494: BOOKING_REMINDER payload holds exactly bookingId, kind and claimedAt; aggregate = the booking")
+    void should_saveIdsOnlyPayload_when_enqueueBookingReminderCalled(ReminderKind kind) throws Exception {
+        // Arrange
+        UUID bookingId = UUID.randomUUID();
+        ArgumentCaptor<NotificationOutboxEntry> captor = ArgumentCaptor.forClass(NotificationOutboxEntry.class);
+
+        // Act
+        service.enqueueBookingReminder(bookingId, kind, java.time.Instant.ofEpochSecond(1_780_000_000L));
+
+        // Assert
+        verify(outboxRepository).save(captor.capture());
+        NotificationOutboxEntry saved = captor.getValue();
+        assertThat(saved.getEventType()).isEqualTo(OutboxEventType.BOOKING_REMINDER);
+        assertThat(saved.getAggregateId()).isEqualTo(bookingId);
+        assertThat(MAPPER.readValue(saved.getPayload(), new TypeReference<Map<String, Object>>() {}))
+                .containsOnly(Map.entry("bookingId", bookingId.toString()), Map.entry("kind", kind.name()),
+                        Map.entry("claimedAt", "1780000000"));
+    }
+
+    @Test
+    @DisplayName("Phase 494: a null booking id, kind or claim instant is refused before any write")
+    void should_throwAndWriteNothing_when_enqueueBookingReminderArgumentNull() {
+        // Act + Assert
+        java.time.Instant tick = java.time.Instant.ofEpochSecond(1_780_000_000L);
+        assertThatThrownBy(() -> service.enqueueBookingReminder(null, ReminderKind.H24, tick))
+                .isInstanceOf(NullPointerException.class);
+        assertThatThrownBy(() -> service.enqueueBookingReminder(UUID.randomUUID(), null, tick))
+                .isInstanceOf(NullPointerException.class);
+        assertThatThrownBy(() -> service.enqueueBookingReminder(UUID.randomUUID(), ReminderKind.H24, null))
+                .isInstanceOf(NullPointerException.class);
         verifyNoInteractions(outboxRepository);
     }
 }

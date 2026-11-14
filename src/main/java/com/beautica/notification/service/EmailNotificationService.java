@@ -1,5 +1,6 @@
 package com.beautica.notification.service;
 
+import com.beautica.booking.domain.GuestVisitAddress;
 import com.beautica.booking.entity.Booking;
 import com.beautica.common.util.SchemeGuard;
 import com.beautica.master.entity.Master;
@@ -258,6 +259,37 @@ public class EmailNotificationService {
         ctx.setVariable("clientName", fullName(visit.lead().getClient()));
         applyVisitVariables(ctx, visit);
         send(to, "Бронювання підтверджено", "email/booking-confirmed", ctx);
+    }
+
+    /**
+     * Phase 494 (NTF-47) — a registered client's reminder e-mail for ONE booking (NTF-D11): «завтра» copy for
+     * {@link ReminderKind#H24}, «сьогодні» for {@link ReminderKind#H2}, both with the Kyiv start time in the subject.
+     * The body names the service, the master (and salon), the Kyiv date/time and the visit address; every value is
+     * rendered with {@code th:text} (escaped). No booking note is read or passed (NTF-03).
+     *
+     * @param to      the client's e-mail (CR/LF stripped by the shared {@code send} helper)
+     * @param booking the reminded booking, loaded with client, master + user, salon and service definition
+     * @param kind    which reminder
+     */
+    public void sendBookingReminderEmail(String to, Booking booking, ReminderKind kind) {
+        boolean dayBefore = kind == ReminderKind.H24;
+        String address = GuestVisitAddress.of(booking);
+        var ctx = new Context();
+        ctx.setVariable("clientName", fullName(booking.getClient()));
+        ctx.setVariable("dayBefore", dayBefore);
+        ctx.setVariable("serviceName", booking.getMasterService().getServiceDefinition().getName());
+        ctx.setVariable("masterName", masterDisplayName(booking));
+        ctx.setVariable("salonName", booking.getSalon() == null ? null : booking.getSalon().getName());
+        ctx.setVariable("startsAt", formatStartsAt(booking));
+        ctx.setVariable("address", address);
+        ctx.setVariable("locationNote", address == null ? null : GuestVisitAddress.locationNote(booking));
+        send(to, bookingReminderSubject(dayBefore, booking.getStartsAt()), "email/booking-reminder", ctx);
+    }
+
+    /** «Beautica: нагадування — ваш запис завтра|сьогодні о HH:mm» (Kyiv time). */
+    static String bookingReminderSubject(boolean dayBefore, OffsetDateTime startsAt) {
+        return "Beautica: нагадування — ваш запис " + (dayBefore ? "завтра" : "сьогодні") + " о "
+                + startsAt.atZoneSameInstant(KYIV).format(TIME_FMT);
     }
 
     /**

@@ -34,8 +34,9 @@ class V238OutboxRequestDecidedMigrationTest extends AbstractIntegrationTest {
     private static final Pattern QUOTED = Pattern.compile("'([A-Z_]+)'");
 
     @Test
-    @DisplayName("the CHECK lists exactly the twelve prior event types plus REQUEST_DECIDED — none dropped, none extra")
-    void should_listExactlyThirteenEventTypes_when_constraintRead() {
+    @DisplayName("the CHECK still lists the twelve prior event types plus REQUEST_DECIDED — none dropped "
+            + "(later migrations, e.g. V240, may widen it further; each pins its own exact set)")
+    void should_listAllThirteenEventTypes_when_constraintRead() {
         String def = jdbcTemplate.queryForObject("""
                 SELECT pg_get_constraintdef(oid) FROM pg_constraint
                  WHERE conrelid = 'notification_outbox'::regclass AND conname = 'chk_outbox_event'
@@ -44,7 +45,7 @@ class V238OutboxRequestDecidedMigrationTest extends AbstractIntegrationTest {
         Set<String> listed = QUOTED.matcher(def).results().map(r -> r.group(1)).collect(Collectors.toSet());
         Set<String> expected = new HashSet<>(PRE_491_EVENT_TYPES);
         expected.add("REQUEST_DECIDED");
-        assertThat(listed).as("chk_outbox_event values, def=%s", def).containsExactlyInAnyOrderElementsOf(expected);
+        assertThat(listed).as("chk_outbox_event values, def=%s", def).containsAll(expected);
     }
 
     @Test

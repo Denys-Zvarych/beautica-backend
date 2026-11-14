@@ -8,6 +8,8 @@ import com.beautica.booking.entity.Booking;
 import com.beautica.booking.event.GuestRemindersDueEvent;
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.config.BookingSmsProperties;
+import com.beautica.notification.service.NotificationOutboxService;
+import com.beautica.notification.service.ReminderKind;
 import com.beautica.master.entity.Master;
 import com.beautica.notification.sms.SmsService;
 import com.beautica.service.entity.MasterServiceAssignment;
@@ -50,6 +52,7 @@ class BookingReminderJobTest {
 
     @Mock private BookingRepository bookingRepository;
     @Mock private ApplicationEventPublisher events;
+    @Mock private NotificationOutboxService outboxService;
 
     private BookingReminderJob job;
     private ListAppender<ILoggingEvent> logAppender;
@@ -59,7 +62,8 @@ class BookingReminderJobTest {
     void setUp() {
         Clock clock = Clock.fixed(OffsetDateTime.parse("2026-06-01T10:00:00Z").toInstant(), ZoneOffset.UTC);
         job = new BookingReminderJob(bookingRepository, new BookingSmsProperties(), events, clock,
-                new io.micrometer.core.instrument.simple.SimpleMeterRegistry(), com.beautica.booking.crypto.GuestCancelTokenCipherFixtures.testPageLinks("https://beautica.app"));
+                new io.micrometer.core.instrument.simple.SimpleMeterRegistry(), com.beautica.booking.crypto.GuestCancelTokenCipherFixtures.testPageLinks("https://beautica.app"),
+                new RegisteredBookingReminderSweep(bookingRepository, outboxService));
         logAppender = new ListAppender<>();
         logAppender.start();
         jobLogger = (Logger) LoggerFactory.getLogger(BookingReminderJob.class);
@@ -67,6 +71,8 @@ class BookingReminderJobTest {
         // Default: this instance WINS every claim (echoes back what it asked for). Tests of the lost-race
         // path re-stub these. Booking ids are null in these POJO fixtures, which the echo preserves.
         lenient().when(bookingRepository.claimRemindersByIds(any()))
+                .thenAnswer(inv -> new ArrayList<>((java.util.Collection<UUID>) inv.getArgument(0)));
+        lenient().when(bookingRepository.claimRegisteredRemindersByIds(any()))
                 .thenAnswer(inv -> new ArrayList<>((java.util.Collection<UUID>) inv.getArgument(0)));
         lenient().when(bookingRepository.claimVisitRemindersByAppointmentIds(any()))
                 .thenAnswer(inv -> new ArrayList<>((java.util.Collection<UUID>) inv.getArgument(0)));
@@ -260,7 +266,8 @@ class BookingReminderJobTest {
         properties.getSms().setEnabled(true);
         job = new BookingReminderJob(bookingRepository, properties, events,
                 Clock.fixed(OffsetDateTime.parse("2026-06-01T10:00:00Z").toInstant(), ZoneOffset.UTC),
-                new io.micrometer.core.instrument.simple.SimpleMeterRegistry(), com.beautica.booking.crypto.GuestCancelTokenCipherFixtures.testPageLinks("https://beautica.app"));
+                new io.micrometer.core.instrument.simple.SimpleMeterRegistry(), com.beautica.booking.crypto.GuestCancelTokenCipherFixtures.testPageLinks("https://beautica.app"),
+                new RegisteredBookingReminderSweep(bookingRepository, outboxService));
         Booking walkIn = walkInBooking("+380503333333", "Акція! пишіть на example.test");
         when(bookingRepository.findGuestBookingsForReminder(any(), any(), org.mockito.ArgumentMatchers.eq(true)))
                 .thenReturn(List.of(walkIn));
@@ -379,6 +386,86 @@ class BookingReminderJobTest {
                 .isEqualTo("Beautica: Нагадуємо, що завтра у Вас запис!\n\nМанікюр о 10:00");
         assertThat(sms.get(1).text())
                 .isEqualTo("Beautica: Нагадуємо, що завтра у Вас запис!\n\nBeauty Room | Манікюр о 10:00");
+    }
+
+    // ── phase 494: registered-client (APP) e-mail leg ────────────────────────────────────────────
+
+    @Test
+    @DisplayName("phase 494: due APP bookings are claimed on the 24h window and get one H24 outbox row each")
+    void should_enqueueOneDayBeforeReminderPerClaimedBooking_when_registeredBookingsDue() {
+        // Arrange
+        UUID first = UUID.randomUUID();
+        UUID second = UUID.randomUUID();
+        when(bookingRepository.findRegisteredBookingsForReminder(any(), any(), any()))
+                .thenReturn(List.of(candidate(first), candidate(second)));
+
+        // Act
+        job.sendReminders();
+
+        // Assert
+        verify(bookingRepository).findRegisteredBookingsForReminder(
+                OffsetDateTime.parse("2026-06-02T09:00:00Z"), OffsetDateTime.parse("2026-06-02T11:00:00Z"),
+                org.springframework.data.domain.Limit.of(BookingRepository.REGISTERED_DAY_BEFORE_REMINDER_BATCH_CAP));
+        verify(bookingRepository).claimRegisteredRemindersByIds(List.of(first, second));
+        verify(outboxService).enqueueBookingReminder(first, ReminderKind.H24, CLAIM_TICK);
+        verify(outboxService).enqueueBookingReminder(second, ReminderKind.H24, CLAIM_TICK);
+    }
+
+    @Test
+    @DisplayName("phase 494: the registered leg runs even when no guest booking is due (guest early return)")
+    void should_runBothLegs_when_onlyRegisteredBookingsDue() {
+        // Arrange
+        UUID bookingId = UUID.randomUUID();
+        when(bookingRepository.findRegisteredBookingsForReminder(any(), any(), any())).thenReturn(List.of(candidate(bookingId)));
+
+        // Act
+        job.sendReminders();
+
+        // Assert
+        verify(outboxService).enqueueBookingReminder(bookingId, ReminderKind.H24, CLAIM_TICK);
+        verify(bookingRepository).findGuestBookingsForReminder(any(), any(), anyBoolean());
+        verifyNoInteractions(events);
+    }
+
+    @Test
+    @DisplayName("phase 494: a registered booking whose claim another instance won is not enqueued")
+    void should_enqueueNothing_when_registeredClaimLost() {
+        // Arrange
+        UUID bookingId = UUID.randomUUID();
+        when(bookingRepository.findRegisteredBookingsForReminder(any(), any(), any())).thenReturn(List.of(candidate(bookingId)));
+        when(bookingRepository.claimRegisteredRemindersByIds(List.of(bookingId))).thenReturn(List.of());
+
+        // Act
+        job.sendReminders();
+
+        // Assert
+        verifyNoInteractions(outboxService);
+    }
+
+    @Test
+    @DisplayName("phase 494: no due registered booking → no claim and no outbox row")
+    void should_notClaim_when_noRegisteredBookingDue() {
+        // Act
+        job.sendReminders();
+
+        // Assert
+        verify(bookingRepository, never()).claimRegisteredRemindersByIds(any());
+        verifyNoInteractions(outboxService);
+    }
+
+    /** The pinned sweep tick — the claim instant every enqueued row carries. */
+    private static final java.time.Instant CLAIM_TICK = java.time.Instant.parse("2026-06-01T10:00:00Z");
+
+    private static BookingRepository.RegisteredReminderCandidate candidate(UUID id) {
+        return new RegisteredCandidate(id, OffsetDateTime.parse("2026-06-02T10:00:00Z"),
+                OffsetDateTime.parse("2026-05-20T10:00:00Z").toInstant());
+    }
+
+    private record RegisteredCandidate(UUID id, OffsetDateTime startsAt, java.time.Instant createdAt)
+            implements BookingRepository.RegisteredReminderCandidate {
+        @Override public UUID getId() { return id; }
+        @Override public OffsetDateTime getStartsAt() { return startsAt; }
+        @Override public java.time.Instant getCreatedAt() { return createdAt; }
     }
 
     private Booking walkInBooking(String phone, String customServiceName) {

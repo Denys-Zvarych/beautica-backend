@@ -60,6 +60,12 @@ public class NotificationOutboxService {
     public static final String REQUEST_APPROVED = "approved";
     public static final String RECIPIENT_USER_ID = "recipientUserId";
 
+    /** Phase 494 — {@code BOOKING_REMINDER} payload keys (ids, the kind and the claim instant only, NTF-03). */
+    public static final String REMINDER_BOOKING_ID = "bookingId";
+    public static final String REMINDER_KIND = "kind";
+    /** Epoch seconds of the sweep tick that claimed the booking, read from the job's injected {@code Clock}. */
+    public static final String REMINDER_CLAIMED_AT = "claimedAt";
+
     private static final int MAX_EMAIL_LENGTH = 254;
     private static final int MAX_SALON_NAME_LENGTH = 255;
     private static final int MAX_INVITE_URL_LENGTH = 2048;
@@ -406,6 +412,30 @@ public class NotificationOutboxService {
         payload.put(REQUEST_APPROVED, approved);
         payload.put(RECIPIENT_USER_ID, recipientUserId.toString());
         save(OutboxEventType.REQUEST_DECIDED, recipientUserId, writeJson(payload));
+    }
+
+    /**
+     * Phase 494 — enqueues a registered client's 24 h / 2 h reminder e-mail ({@link OutboxEventType#BOOKING_REMINDER})
+     * for ONE booking (NTF-D11), in the caller's sweep transaction, right after the caller won the
+     * {@code reminder_sent} / {@code reminder_2h_sent} claim — the flag and the row commit together (NTF-01).
+     * Payload {@code {"bookingId","kind","claimedAt"}} only — no name, address or note; {@code aggregate_id} = the
+     * booking id. {@code claimedAt} (epoch seconds of the sweep tick, from the job's {@code Clock}) lets the drain
+     * re-check the claimed window without relying on the row's wall-clock {@code created_at}.
+     *
+     * @param bookingId the claimed APP booking
+     * @param kind      which reminder
+     * @param claimedAt the sweep tick's instant
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void enqueueBookingReminder(UUID bookingId, ReminderKind kind, Instant claimedAt) {
+        Objects.requireNonNull(bookingId, "bookingId must not be null");
+        Objects.requireNonNull(kind, "kind must not be null");
+        Objects.requireNonNull(claimedAt, "claimedAt must not be null");
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put(REMINDER_BOOKING_ID, bookingId.toString());
+        payload.put(REMINDER_KIND, kind.name());
+        payload.put(REMINDER_CLAIMED_AT, String.valueOf(claimedAt.getEpochSecond()));
+        save(OutboxEventType.BOOKING_REMINDER, bookingId, writeJson(payload));
     }
 
     // --- private helpers ---
