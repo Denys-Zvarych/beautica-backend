@@ -20,6 +20,7 @@ import com.beautica.booking.event.BookingCompletedEvent;
 import com.beautica.booking.event.GuestBookingCompletedEvent;
 import com.beautica.booking.repository.AppointmentRepository;
 import com.beautica.booking.repository.BookingRepository;
+import com.beautica.booking.repository.BookingTimeRange;
 import com.beautica.booking.repository.SalonClosureBookingCandidate;
 import com.beautica.booking.repository.TestPostLockSlotCheck;
 import com.beautica.common.exception.BookingElapsedException;
@@ -84,6 +85,7 @@ import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.catchThrowable;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyLong;
@@ -2491,6 +2493,42 @@ class BookingServiceTest {
         verify(bookingRepository, never()).findPostLockConfirmedAndOverlapExcluding(any(), any(), any(), any());
         verify(bookingRepository, never()).saveAndFlush(any());
         verify(outboxService, never()).enqueueBookingRescheduled(any(), anyBoolean());
+    }
+
+    @Test
+    @DisplayName("PROVIDER-initiated reschedule → CLIENT_BOOKING_CONFLICT is window-only (no id/service/master) "
+            + "and the conflicting row is read via the 2-column window projection, never the full graph")
+    void should_throwRedactedClientBookingConflict_when_providerRescheduleOverlapsClientsOtherBooking() {
+        UUID providerUserId = UUID.randomUUID();
+        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        OffsetDateTime newStartsAt = ZonedDateTime.now(clock).plusHours(4).toOffsetDateTime();
+        RescheduleBookingRequest req = new RescheduleBookingRequest(newStartsAt, false);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        // Provider path uses the STAFF schedule-fit guard (isStaffSlotAvailable), not the client slot list.
+        when(slotCalculationService.isStaffSlotAvailable(eq(masterId), any(LocalDate.class), eq(masterServiceId),
+                nullable(MasterServiceAssignment.class), eq(newStartsAt)))
+                .thenReturn(true);
+        UUID conflictingBookingId = UUID.randomUUID();
+        OffsetDateTime conflictEndsAt = newStartsAt.plusMinutes(90);
+        when(bookingRepository.findFirstConflictingClientBookingIdExcluding(
+                eq(clientId), any(), any(), eq(bookingId)))
+                .thenReturn(Optional.of(conflictingBookingId));
+        when(bookingRepository.findTimeRangeById(conflictingBookingId))
+                .thenReturn(Optional.of(new BookingTimeRange(newStartsAt, conflictEndsAt)));
+
+        Throwable thrown = catchThrowable(() -> bookingService.rescheduleBooking(
+                providerUserId, Role.INDEPENDENT_MASTER, bookingId, req));
+
+        assertThat(thrown).isInstanceOf(ClientBookingConflictException.class);
+        ClientBookingConflictException cbce = (ClientBookingConflictException) thrown;
+        assertThat(cbce.isRedacted()).isTrue();
+        assertThat(cbce.getConflictingBookingId()).isNull();
+        assertThat(cbce.getServiceName()).isNull();
+        assertThat(cbce.getMasterName()).isNull();
+        assertThat(cbce.getStartsAt()).isEqualTo(newStartsAt);
+        assertThat(cbce.getEndsAt()).isEqualTo(conflictEndsAt);
+        verify(bookingRepository, never()).findByIdWithFullGraph(conflictingBookingId);
+        verify(bookingRepository, never()).saveAndFlush(any());
     }
 
     @Test
