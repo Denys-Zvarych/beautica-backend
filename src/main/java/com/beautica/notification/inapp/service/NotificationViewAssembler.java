@@ -408,11 +408,23 @@ public class NotificationViewAssembler {
                 serviceCount,
                 booking.getStartsAt().toInstant(),
                 salon != null ? salon.getName() : null,
-                performingMasterName(type, master, salon, actorId, actorRole, isSingleMaster(visit)),
+                masterNameFor(type, master, salon, actorId, actorRole, visit),
                 null,
                 null,
                 null,
                 null);
+    }
+
+    /**
+     * Phase 495 (NTF-48) — a {@code BOOKING_REMINDER} (client-only, booking-keyed) always names the performing
+     * master; every other type keeps {@link #performingMasterName}'s salon-staff rule unchanged.
+     */
+    private static String masterNameFor(
+            InAppNotificationType type, Master master, Salon salon, UUID actorId, Role actorRole, BookingVisit visit) {
+        if (type == InAppNotificationType.BOOKING_REMINDER) {
+            return masterDisplayName(master);
+        }
+        return performingMasterName(type, master, salon, actorId, actorRole, isSingleMaster(visit));
     }
 
     /**

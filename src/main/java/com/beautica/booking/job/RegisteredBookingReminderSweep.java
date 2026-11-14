@@ -2,6 +2,7 @@ package com.beautica.booking.job;
 
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.booking.repository.BookingRepository.RegisteredReminderCandidate;
+import com.beautica.notification.inapp.service.InAppNotificationService;
 import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.notification.service.ReminderKind;
 import lombok.RequiredArgsConstructor;
@@ -30,6 +31,10 @@ import java.util.UUID;
  *
  * <p>{@code MANDATORY}: runs only inside the job's sweep transaction (the outbox enqueue requires one anyway). The
  * job applies the 2 h flag gate and the Kyiv night skip before calling in, so they bind both legs identically (D4).
+ *
+ * <p>Phase 495 (NTF-48) — the 24 h leg ALSO writes one {@code BOOKING_REMINDER} feed row per claimed booking for its
+ * client, in this same claim transaction, and that row's fan-out is the only push (NTF-12 / NTF-S10). The 2 h leg
+ * writes no feed row (D2).
  */
 @Component
 @RequiredArgsConstructor
@@ -38,11 +43,13 @@ public class RegisteredBookingReminderSweep {
 
     private final BookingRepository bookingRepository;
     private final NotificationOutboxService outboxService;
+    private final InAppNotificationService inAppNotificationService;
 
     /**
      * Claims the due APP bookings in the 24 h window {@code [now+23h, now+25h]} (at most
      * {@link BookingRepository#REGISTERED_DAY_BEFORE_REMINDER_BATCH_CAP}; overflow next tick; locked rows skipped) and
-     * enqueues one {@link ReminderKind#H24} row per claimed booking. Returns how many were enqueued.
+     * enqueues one {@link ReminderKind#H24} row per claimed booking, plus (phase 495) one {@code BOOKING_REMINDER}
+     * feed row for each claimed booking's client. Returns how many e-mails were enqueued.
      */
     @Transactional(propagation = Propagation.MANDATORY)
     public int remindDayBefore(OffsetDateTime now) {
@@ -53,7 +60,21 @@ public class RegisteredBookingReminderSweep {
             return 0;
         }
         List<UUID> dueIds = due.stream().map(RegisteredReminderCandidate::getId).toList();
-        return enqueueClaimed(dueIds, bookingRepository.claimRegisteredRemindersByIds(dueIds), ReminderKind.H24, now);
+        List<UUID> claimedIds = bookingRepository.claimRegisteredRemindersByIds(dueIds);
+        writeReminderFeedRows(claimedIds);
+        return enqueueClaimed(dueIds, claimedIds, ReminderKind.H24, now);
+    }
+
+    /**
+     * Phase 495 — one feed row per booking this instance won (never for a skipped / lost claim). One projection
+     * SELECT reads the claimed rows' ids and start (no {@code Booking} entity is loaded into the session) and one
+     * bulk INSERT writes every row (audit-fix cycle 2 — never one statement per booking).
+     */
+    private void writeReminderFeedRows(List<UUID> claimedIds) {
+        if (claimedIds.isEmpty()) {
+            return;
+        }
+        inAppNotificationService.notifyBookingRemindersBulk(bookingRepository.findReminderFeedTargetsByIds(claimedIds));
     }
 
     /**

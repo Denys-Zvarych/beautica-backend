@@ -3,6 +3,7 @@ package com.beautica.notification.inapp.service;
 import com.beautica.auth.Role;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingSource;
+import com.beautica.booking.repository.BookingRepository;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
 import com.beautica.moderation.entity.ReportResolution;
@@ -15,6 +16,7 @@ import com.beautica.salon.repository.SalonRepository;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
 import java.time.Instant;
+import java.time.OffsetDateTime;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
@@ -247,6 +249,97 @@ class InAppNotificationServiceTest {
         assertThat(recipients.getValue()).containsExactlyInAnyOrder(masterUserId, clientId);
         assertThat(keyCaptor.getValue())
                 .isEqualTo("BOOKING_RESCHEDULED:" + bookingId + ":" + newStart.getEpochSecond());
+    }
+
+    // ── Phase 495 — BOOKING_REMINDER ────────────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("notifyBookingRemindersBulk: ONE statement, a client-only row per booking, key BOOKING_REMINDER:id:startsAt s")
+    void should_writeOneClientRowPerBookingInOneStatement_when_notifyBookingRemindersBulk() {
+        // Arrange
+        UUID first = UUID.randomUUID();
+        UUID second = UUID.randomUUID();
+        UUID otherClient = UUID.randomUUID();
+        OffsetDateTime firstStart = OffsetDateTime.parse("2026-11-15T10:30:00Z");
+        OffsetDateTime secondStart = OffsetDateTime.parse("2026-11-15T12:00:00Z");
+
+        // Act
+        service.notifyBookingRemindersBulk(List.of(
+                reminderTarget(first, clientId, salonId, firstStart),
+                reminderTarget(second, otherClient, null, secondStart)));
+
+        // Assert
+        verify(repository, times(1)).insertEventRowsBulk(eq("BOOKING_REMINDER"),
+                eq(new UUID[] {clientId, otherClient}), eq(new UUID[] {first, second}), eq(new UUID[] {null, null}),
+                eq(new UUID[] {salonId, null}),
+                eq(new String[] {
+                        "BOOKING_REMINDER:" + first + ":" + firstStart.toEpochSecond(),
+                        "BOOKING_REMINDER:" + second + ":" + secondStart.toEpochSecond()}));
+        verify(repository, never()).insertForRecipients(any(), any(), any(), any(), any(), any(), any());
+        org.mockito.Mockito.verifyNoMoreInteractions(repository);
+        org.mockito.Mockito.verifyNoInteractions(userRepository);
+    }
+
+    @Test
+    @DisplayName("notifyBookingRemindersBulk: a booking with no client (guest / walk-in / detached) contributes no row")
+    void should_skipClientlessTarget_when_notifyBookingRemindersBulk() {
+        // Arrange
+        UUID bookingId = UUID.randomUUID();
+        OffsetDateTime startsAt = OffsetDateTime.parse("2026-11-15T10:30:00Z");
+
+        // Act
+        service.notifyBookingRemindersBulk(List.of(
+                reminderTarget(UUID.randomUUID(), null, salonId, startsAt),
+                reminderTarget(bookingId, clientId, salonId, startsAt)));
+
+        // Assert
+        verify(repository, times(1)).insertEventRowsBulk(eq("BOOKING_REMINDER"), eq(new UUID[] {clientId}),
+                eq(new UUID[] {bookingId}), eq(new UUID[] {null}), eq(new UUID[] {salonId}),
+                eq(new String[] {"BOOKING_REMINDER:" + bookingId + ":" + startsAt.toEpochSecond()}));
+    }
+
+    @Test
+    @DisplayName("notifyBookingRemindersBulk: only client-less bookings (or none) → no statement at all")
+    void should_writeNothing_when_noReminderTargetHasClient() {
+        // Act
+        service.notifyBookingRemindersBulk(List.of(
+                reminderTarget(UUID.randomUUID(), null, salonId, OffsetDateTime.parse("2026-11-15T10:30:00Z"))));
+        service.notifyBookingRemindersBulk(List.of());
+
+        // Assert
+        org.mockito.Mockito.verifyNoInteractions(repository);
+    }
+
+    @Test
+    @DisplayName("notifyBookingRemindersBulk with pushEnabled=true writes through the bulk push twin (NTF-12)")
+    void should_usePushTwin_when_pushEnabledReminderBulkWrite() {
+        // Arrange
+        service = new InAppNotificationService(
+                repository, salonRepository, new InAppRecipientResolver(userRepository), true);
+        UUID bookingId = UUID.randomUUID();
+        OffsetDateTime startsAt = OffsetDateTime.parse("2026-11-15T10:30:00Z");
+
+        // Act
+        service.notifyBookingRemindersBulk(List.of(reminderTarget(bookingId, clientId, salonId, startsAt)));
+
+        // Assert
+        verify(repository, times(1)).insertEventRowsBulkWithPush(eq("BOOKING_REMINDER"), eq(new UUID[] {clientId}),
+                eq(new UUID[] {bookingId}), eq(new UUID[] {null}), eq(new UUID[] {salonId}),
+                eq(new String[] {"BOOKING_REMINDER:" + bookingId + ":" + startsAt.toEpochSecond()}));
+        verify(repository, never()).insertEventRowsBulk(any(), any(), any(), any(), any(), any());
+    }
+
+    private static BookingRepository.ReminderFeedTarget reminderTarget(
+            UUID id, UUID clientId, UUID salonId, OffsetDateTime startsAt) {
+        return new ReminderTarget(id, clientId, salonId, startsAt);
+    }
+
+    private record ReminderTarget(UUID id, UUID clientId, UUID salonId, OffsetDateTime startsAt)
+            implements BookingRepository.ReminderFeedTarget {
+        @Override public UUID getId() { return id; }
+        @Override public UUID getClientId() { return clientId; }
+        @Override public UUID getSalonId() { return salonId; }
+        @Override public OffsetDateTime getStartsAt() { return startsAt; }
     }
 
     @Test

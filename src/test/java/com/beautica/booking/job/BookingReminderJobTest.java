@@ -53,6 +53,7 @@ class BookingReminderJobTest {
     @Mock private BookingRepository bookingRepository;
     @Mock private ApplicationEventPublisher events;
     @Mock private NotificationOutboxService outboxService;
+    @Mock private com.beautica.notification.inapp.service.InAppNotificationService inAppNotificationService;
 
     private BookingReminderJob job;
     private ListAppender<ILoggingEvent> logAppender;
@@ -63,7 +64,7 @@ class BookingReminderJobTest {
         Clock clock = Clock.fixed(OffsetDateTime.parse("2026-06-01T10:00:00Z").toInstant(), ZoneOffset.UTC);
         job = new BookingReminderJob(bookingRepository, new BookingSmsProperties(), events, clock,
                 new io.micrometer.core.instrument.simple.SimpleMeterRegistry(), com.beautica.booking.crypto.GuestCancelTokenCipherFixtures.testPageLinks("https://beautica.app"),
-                new RegisteredBookingReminderSweep(bookingRepository, outboxService));
+                new RegisteredBookingReminderSweep(bookingRepository, outboxService, inAppNotificationService));
         logAppender = new ListAppender<>();
         logAppender.start();
         jobLogger = (Logger) LoggerFactory.getLogger(BookingReminderJob.class);
@@ -267,7 +268,7 @@ class BookingReminderJobTest {
         job = new BookingReminderJob(bookingRepository, properties, events,
                 Clock.fixed(OffsetDateTime.parse("2026-06-01T10:00:00Z").toInstant(), ZoneOffset.UTC),
                 new io.micrometer.core.instrument.simple.SimpleMeterRegistry(), com.beautica.booking.crypto.GuestCancelTokenCipherFixtures.testPageLinks("https://beautica.app"),
-                new RegisteredBookingReminderSweep(bookingRepository, outboxService));
+                new RegisteredBookingReminderSweep(bookingRepository, outboxService, inAppNotificationService));
         Booking walkIn = walkInBooking("+380503333333", "Акція! пишіть на example.test");
         when(bookingRepository.findGuestBookingsForReminder(any(), any(), org.mockito.ArgumentMatchers.eq(true)))
                 .thenReturn(List.of(walkIn));
@@ -412,6 +413,31 @@ class BookingReminderJobTest {
     }
 
     @Test
+    @DisplayName("phase 495: every claimed APP booking goes to ONE bulk BOOKING_REMINDER feed write in the claim transaction")
+    void should_writeFeedRowPerClaimedBooking_when_registeredBookingsClaimed() {
+        // Arrange
+        UUID first = UUID.randomUUID();
+        UUID second = UUID.randomUUID();
+        UUID clientId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        OffsetDateTime firstStart = OffsetDateTime.parse("2026-11-15T10:30:00Z");
+        OffsetDateTime secondStart = OffsetDateTime.parse("2026-11-15T11:30:00Z");
+        when(bookingRepository.findRegisteredBookingsForReminder(any(), any(), any()))
+                .thenReturn(List.of(candidate(first), candidate(second)));
+        when(bookingRepository.findReminderFeedTargetsByIds(List.of(first, second))).thenReturn(List.of(
+                feedTarget(first, clientId, salonId, firstStart), feedTarget(second, clientId, null, secondStart)));
+
+        // Act
+        job.sendReminders();
+
+        // Assert
+        verify(inAppNotificationService).notifyBookingRemindersBulk(List.of(
+                feedTarget(first, clientId, salonId, firstStart), feedTarget(second, clientId, null, secondStart)));
+        org.mockito.Mockito.verifyNoMoreInteractions(inAppNotificationService);
+        verify(bookingRepository, never()).findAllById(any());
+    }
+
+    @Test
     @DisplayName("phase 494: the registered leg runs even when no guest booking is due (guest early return)")
     void should_runBothLegs_when_onlyRegisteredBookingsDue() {
         // Arrange
@@ -440,6 +466,8 @@ class BookingReminderJobTest {
 
         // Assert
         verifyNoInteractions(outboxService);
+        verifyNoInteractions(inAppNotificationService);
+        verify(bookingRepository, never()).findReminderFeedTargetsByIds(any());
     }
 
     @Test
@@ -466,6 +494,19 @@ class BookingReminderJobTest {
         @Override public UUID getId() { return id; }
         @Override public OffsetDateTime getStartsAt() { return startsAt; }
         @Override public java.time.Instant getCreatedAt() { return createdAt; }
+    }
+
+    private static BookingRepository.ReminderFeedTarget feedTarget(UUID id, UUID clientId, UUID salonId,
+                                                                  OffsetDateTime startsAt) {
+        return new FeedTarget(id, clientId, salonId, startsAt);
+    }
+
+    private record FeedTarget(UUID id, UUID clientId, UUID salonId, OffsetDateTime startsAt)
+            implements BookingRepository.ReminderFeedTarget {
+        @Override public UUID getId() { return id; }
+        @Override public UUID getClientId() { return clientId; }
+        @Override public UUID getSalonId() { return salonId; }
+        @Override public OffsetDateTime getStartsAt() { return startsAt; }
     }
 
     private Booking walkInBooking(String phone, String customServiceName) {

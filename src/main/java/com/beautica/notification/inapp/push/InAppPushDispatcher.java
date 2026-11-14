@@ -15,6 +15,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.Clock;
 import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -69,6 +70,8 @@ public class InAppPushDispatcher {
     private final DeviceTokenRepository deviceTokenRepository;
     private final NotificationViewAssembler assembler;
     private final PushNotificationService pushNotificationService;
+    /** Push-time reference for the {@code BOOKING_REMINDER} day word (phase 495); read only for that type. */
+    private final Clock clock;
 
     /** Everything one push needs, fully resolved — sending it requires no further DB access. */
     public record PushPlan(
@@ -145,7 +148,7 @@ public class InAppPushDispatcher {
             plans.put(row.getId(), new PushPlan(
                     recipientId,
                     PushCopy.title(row.getType(), client),
-                    PushCopy.body(row.getType(), client, view.params()),
+                    PushCopy.body(row.getType(), client, view.params(), clock),
                     dataPayload(row.getId(), view),
                     tokens));
         }

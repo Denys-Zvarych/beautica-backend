@@ -63,6 +63,7 @@ class BookingReminderJobTwoHourTest {
     @Mock private BookingRepository bookingRepository;
     @Mock private ApplicationEventPublisher events;
     @Mock private NotificationOutboxService outboxService;
+    @Mock private com.beautica.notification.inapp.service.InAppNotificationService inAppNotificationService;
 
     private BookingSmsProperties properties;
     private SimpleMeterRegistry meters;
@@ -241,6 +242,7 @@ class BookingReminderJobTwoHourTest {
                 Limit.of(BookingRepository.TWO_HOUR_REMINDER_BATCH_CAP));
         verify(bookingRepository).claimRegisteredTwoHourRemindersByIds(List.of(bookingId));
         verify(outboxService).enqueueBookingReminder(bookingId, ReminderKind.H2, MIDDAY_KYIV);
+        verifyNoInteractions(inAppNotificationService); // phase 495 D2: the 2h reminder has no feed row / push
     }
 
     @Test
@@ -315,7 +317,7 @@ class BookingReminderJobTwoHourTest {
     private BookingReminderJob jobAt(Instant now) {
         return new BookingReminderJob(bookingRepository, properties, events, Clock.fixed(now, ZoneOffset.UTC), meters,
                 com.beautica.booking.crypto.GuestCancelTokenCipherFixtures.testPageLinks("https://beautica.app"),
-                new RegisteredBookingReminderSweep(bookingRepository, outboxService));
+                new RegisteredBookingReminderSweep(bookingRepository, outboxService, inAppNotificationService));
     }
 
     // ── phase 435 copy: independent vs salon variant, optional address line, visit phrase ──────────

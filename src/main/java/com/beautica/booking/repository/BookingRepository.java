@@ -2481,6 +2481,37 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             @Param("to") OffsetDateTime to,
             org.springframework.data.domain.Limit limit);
 
+    /**
+     * Phase 495 audit-fix — the four values the 24 h leg's {@code BOOKING_REMINDER} feed row needs, read as a
+     * projection so the claimed bookings never enter the persistence context (each following native feed INSERT
+     * would otherwise flush / dirty-check every loaded entity).
+     */
+    interface ReminderFeedTarget {
+        UUID getId();
+
+        UUID getClientId();
+
+        UUID getSalonId();
+
+        OffsetDateTime getStartsAt();
+    }
+
+    /**
+     * Phase 495 audit-fix — {@link ReminderFeedTarget}s for the ids the 24 h claim just won (post-claim read, so the
+     * values are the row's current ones). Bounded by the claim batch cap
+     * ({@link #REGISTERED_DAY_BEFORE_REMINDER_BATCH_CAP}). {@code LEFT JOIN} on the optional salon so an independent
+     * master's booking is not dropped (the sweep's finder already requires a client; the LEFT JOIN on it is defensive).
+     */
+    @Query("""
+            SELECT b.id AS id, c.id AS clientId, s.id AS salonId, b.startsAt AS startsAt
+              FROM Booking b
+              LEFT JOIN b.client c
+              LEFT JOIN b.salon s
+             WHERE b.id IN :ids
+             ORDER BY b.startsAt, b.id
+            """)
+    List<ReminderFeedTarget> findReminderFeedTargetsByIds(@Param("ids") Collection<UUID> ids);
+
     /** Phase 494 audit-fix — rows one registered 24 h sweep tick selects (and therefore claims) at most. */
     int REGISTERED_DAY_BEFORE_REMINDER_BATCH_CAP = TWO_HOUR_REMINDER_BATCH_CAP;
 
