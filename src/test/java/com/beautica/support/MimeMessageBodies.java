@@ -48,4 +48,33 @@ public final class MimeMessageBodies {
         }
         return "";
     }
+
+    /**
+     * Phase 496 — every {@code Content-Disposition: attachment} part of the message, in MIME order, at any depth
+     * (the .ics files of a booking e-mail).
+     */
+    public static java.util.List<Part> attachmentsOf(MimeMessage message) throws Exception {
+        message.saveChanges();
+        java.util.List<Part> found = new java.util.ArrayList<>();
+        collectAttachments(message, found);
+        return found;
+    }
+
+    private static void collectAttachments(Part part, java.util.List<Part> found) throws Exception {
+        if (Part.ATTACHMENT.equalsIgnoreCase(part.getDisposition())) {
+            found.add(part);
+        } else if (part.isMimeType("multipart/*")) {
+            Multipart multipart = (Multipart) part.getContent();
+            for (int i = 0; i < multipart.getCount(); i++) {
+                collectAttachments(multipart.getBodyPart(i), found);
+            }
+        }
+    }
+
+    /** The decoded UTF-8 text of an attachment part. */
+    public static String textOf(Part part) throws Exception {
+        try (java.io.InputStream in = part.getInputStream()) {
+            return new String(in.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+        }
+    }
 }

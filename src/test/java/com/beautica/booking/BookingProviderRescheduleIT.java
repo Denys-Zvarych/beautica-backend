@@ -134,11 +134,25 @@ class BookingProviderRescheduleIT extends AbstractIntegrationTest {
                 String.class);
 
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
-        List<NotificationOutboxEntry> rows = outboxRepository.findAll();
-        assertThat(rows).hasSize(1);
+        // Phase 496 (NTF-49): a client reschedule also enqueues the client's own CLIENT_RESCHEDULE_RECEIPT row —
+        // filter to the BOOKING_RESCHEDULED row this assertion is about, then pin the receipt separately.
+        List<NotificationOutboxEntry> all = outboxRepository.findAll();
+        List<NotificationOutboxEntry> rows = all.stream()
+                .filter(row -> row.getEventType() == com.beautica.notification.entity.OutboxEventType.BOOKING_RESCHEDULED)
+                .toList();
+        assertThat(rows)
+                .as("the reschedule must enqueue exactly one BOOKING_RESCHEDULED row")
+                .hasSize(1);
         assertThat(rows.get(0).getPayload())
                 .as("a client-initiated reschedule must record initiatedBy=CLIENT")
                 .contains("\"initiatedBy\":\"CLIENT\"");
+        assertThat(all)
+                .filteredOn(row -> row.getEventType()
+                        == com.beautica.notification.entity.OutboxEventType.CLIENT_RESCHEDULE_RECEIPT)
+                .as("a client reschedule must enqueue exactly one CLIENT_RESCHEDULE_RECEIPT row for the booking")
+                .singleElement()
+                .extracting(NotificationOutboxEntry::getAggregateId)
+                .isEqualTo(bookingId);
     }
 
     @Test

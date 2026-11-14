@@ -4,6 +4,7 @@ import com.beautica.service.entity.PlatformCategory;
 import com.beautica.service.entity.ServiceTypeSuggestion;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingSource;
+import com.beautica.booking.repository.BookingRepository.ReminderFeedTarget;
 import com.beautica.master.entity.Master;
 import com.beautica.moderation.service.ModerationOutcome;
 import com.beautica.notification.inapp.entity.InAppNotificationType;
@@ -402,6 +403,51 @@ public class InAppNotificationService {
         write(InAppNotificationType.BOOKING_RESCHEDULED, recipients, bookingId, null, salonId, null, dedupKey);
         log.debug("in-app notify type=BOOKING_RESCHEDULED bookingId={} recipients={}",
                 bookingId, recipients.size());
+    }
+
+    /**
+     * Phase 495 (NTF-48) — the registered 24 h reminder's feed item: ONE row for the booking's client, booking-keyed
+     * (never the visit — NTF-D11), pushed through the same {@code *WithPush} fan-out as every other row (NTF-12; the
+     * B494 outbox e-mail row never pushes, NTF-S10). Providers never get it; a guest / walk-in / detached booking has
+     * no client and writes nothing (NTF-08).
+     *
+     * <p>The dedup key carries the start (epoch seconds): a replayed sweep collapses on {@code ON CONFLICT DO
+     * NOTHING}, while a reschedule (re-armed by B493) reminds again under a fresh key.
+     *
+     * <p>Takes a narrow projection, not a {@code Booking}, so the claimed rows never enter the persistence context
+     * (no dirty-check of up to a batch of entities on the feed INSERT).
+     *
+     * <p>Phase 495 audit-fix cycle 2 (perf) — every claimed booking of one sweep tick in ONE statement
+     * ({@link InAppNotificationRepository#insertEventRowsBulk} / its push twin), not one per booking: the sweep runs
+     * this inside its claim transaction for up to a full batch. Each row (recipient, {@code booking_id},
+     * {@code salon_id}, dedup key, {@code appointment_id}/{@code subject_user_id} {@code NULL}) is what the former
+     * per-booking write produced; only the statement count changes. Targets without a client are skipped; if none is
+     * left, nothing is written.
+     *
+     * @param targets the claimed bookings — {@code getClientId()} {@code null} for a guest / walk-in / detached booking
+     *                (no row), {@code getSalonId()} {@code null} for an independent master
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void notifyBookingRemindersBulk(Collection<? extends ReminderFeedTarget> targets) {
+        EventRows rows = new EventRows();
+        for (ReminderFeedTarget target : targets) {
+            if (target.getClientId() == null) {
+                continue;
+            }
+            String key = dedupKey(InAppNotificationType.BOOKING_REMINDER, target.getId(),
+                    target.getStartsAt().toEpochSecond());
+            rows.add(target.getClientId(), target.getId(), null, target.getSalonId(), key);
+        }
+        if (rows.isEmpty()) {
+            return;
+        }
+        String type = InAppNotificationType.BOOKING_REMINDER.name();
+        int written = pushEnabled
+                ? repository.insertEventRowsBulkWithPush(type, rows.recipients(), rows.bookingIds(),
+                        rows.appointmentIds(), rows.salonIds(), rows.dedupKeys())
+                : repository.insertEventRowsBulk(type, rows.recipients(), rows.bookingIds(),
+                        rows.appointmentIds(), rows.salonIds(), rows.dedupKeys());
+        log.debug("in-app notify(bulk) type=BOOKING_REMINDER targets={} written={}", targets.size(), written);
     }
 
     /**

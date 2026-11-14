@@ -12,6 +12,7 @@ import com.beautica.booking.service.GuestBookingPageLinks;
 import com.beautica.common.TimeZones;
 import com.beautica.common.util.Placeholders;
 import com.beautica.config.BookingSmsProperties;
+import com.beautica.notification.service.ReminderKind;
 import com.beautica.review.invite.config.ReviewInviteProperties;
 import io.micrometer.core.instrument.MeterRegistry;
 import lombok.extern.slf4j.Slf4j;
@@ -76,12 +77,13 @@ public class BookingReminderJob {
     private static final Set<String> OPTIONAL_PLACEHOLDERS = Set.of(ADDRESS, SALON_ADDRESS, CANCEL_URL);
     /** Audit-fix — the address placeholders, dropped first when the reminder is over the length cap. */
     private static final Set<String> ADDRESS_PLACEHOLDERS = Set.of(ADDRESS, SALON_ADDRESS);
-    private static final Duration WINDOW_START = Duration.ofHours(23);
-    private static final Duration WINDOW_END = Duration.ofHours(25);
+    /** 24h window {@code [now+23h, now+25h]}; owned by {@link ReminderKind} so the registered leg's drain agrees. */
+    private static final Duration WINDOW_START = ReminderKind.H24.windowStart();
+    private static final Duration WINDOW_END = ReminderKind.H24.windowEnd();
 
     /** Phase 413 D1 — 2h sweep window {@code [now+1h45, now+2h15)}, ticked every 15 min. */
-    static final Duration TWO_HOUR_WINDOW_START = Duration.ofMinutes(105);
-    static final Duration TWO_HOUR_WINDOW_END = Duration.ofMinutes(135);
+    static final Duration TWO_HOUR_WINDOW_START = ReminderKind.H2.windowStart();
+    static final Duration TWO_HOUR_WINDOW_END = ReminderKind.H2.windowEnd();
     /** Phase 413 D2 — Kyiv night: no 2h reminder is selected, claimed or sent from 21:00 to 09:00. */
     static final LocalTime NIGHT_START = LocalTime.of(21, 0);
     static final LocalTime NIGHT_END = LocalTime.of(9, 0);
@@ -99,6 +101,8 @@ public class BookingReminderJob {
     private final MeterRegistry meterRegistry;
     /** Phase 435 — the guest's own booking page for the «Скасувати запис:» line (dropped when absent). */
     private final GuestBookingPageLinks pageLinks;
+    /** Phase 494 — the registered-client (APP) e-mail leg of both sweeps. */
+    private final RegisteredBookingReminderSweep registeredReminders;
 
     public BookingReminderJob(
             BookingRepository bookingRepository,
@@ -106,13 +110,15 @@ public class BookingReminderJob {
             ApplicationEventPublisher events,
             Clock clock,
             MeterRegistry meterRegistry,
-            GuestBookingPageLinks pageLinks) {
+            GuestBookingPageLinks pageLinks,
+            RegisteredBookingReminderSweep registeredReminders) {
         this.bookingRepository = bookingRepository;
         this.smsProperties = smsProperties;
         this.events = events;
         this.clock = clock;
         this.meterRegistry = meterRegistry;
         this.pageLinks = pageLinks;
+        this.registeredReminders = registeredReminders;
     }
 
     @Scheduled(cron = "0 0 * * * *")
@@ -121,6 +127,10 @@ public class BookingReminderJob {
         OffsetDateTime now = OffsetDateTime.now(clock);
         OffsetDateTime from = now.plus(WINDOW_START);
         OffsetDateTime to = now.plus(WINDOW_END);
+
+        // Phase 494 — the registered-client e-mail leg first (same window), so the guest leg's early return on an
+        // empty guest batch cannot skip it. Claim + outbox enqueue share this transaction.
+        registeredReminders.remindDayBefore(now);
 
         List<Booking> due = bookingRepository.findGuestBookingsForReminder(from, to, includeWalkIns());
         if (due.isEmpty()) {
@@ -232,6 +242,9 @@ public class BookingReminderJob {
             countTwoHour(OUTCOME_SKIPPED_NIGHT, 1);
             return;
         }
+        // Phase 494 — the registered-client e-mail leg, behind the same flag (D4) and night skip, same window and
+        // short-notice rule; before the guest query so its early return cannot skip it.
+        registeredReminders.remindTwoHoursBefore(now, config.getMinLead());
         List<Booking> due = bookingRepository.findGuestBookingsForTwoHourReminder(
                 now.plus(TWO_HOUR_WINDOW_START), now.plus(TWO_HOUR_WINDOW_END), includeWalkIns(),
                 Limit.of(BookingRepository.TWO_HOUR_REMINDER_BATCH_CAP));
@@ -300,11 +313,20 @@ public class BookingReminderJob {
             singles.stream().filter(booking -> claimed.contains(booking.getId())).forEach(leads::add);
         }
         if (!visits.isEmpty()) {
-            Set<UUID> claimed = new HashSet<>(
-                    bookingRepository.claimTwoHourVisitRemindersByAppointmentIds(visits.keySet()));
+            List<UUID> dueIds = visits.values().stream().flatMap(List::stream).map(Booking::getId).toList();
+            Set<UUID> claimedRows = new HashSet<>();
+            Set<UUID> claimedVisits = new HashSet<>();
+            for (BookingRepository.TwoHourVisitClaim claim
+                    : bookingRepository.claimTwoHourVisitRemindersByAppointmentIds(visits.keySet(), dueIds)) {
+                claimedRows.add(claim.getId());
+                claimedVisits.add(claim.getAppointmentId());
+            }
             visits.forEach((appointmentId, items) -> {
-                if (claimed.contains(appointmentId)) {
-                    leads.add(items.get(0));
+                if (claimedVisits.contains(appointmentId)) {
+                    // B493: lead with the earliest due row THIS claim flipped (a moved item, never a guarded added
+                    // service). Fallback keeps phase 413: a due row skipped while locked, rest of the visit claimed.
+                    leads.add(items.stream().filter(b -> claimedRows.contains(b.getId())).findFirst()
+                            .orElse(items.get(0)));
                 }
             });
         }
@@ -313,8 +335,12 @@ public class BookingReminderJob {
 
     /** D3 — created less than {@code minLead} before its start; a missing audit timestamp is never short notice. */
     private static boolean isShortNotice(Booking booking, Duration minLead) {
-        Instant createdAt = booking.getCreatedAt();
-        return createdAt != null && createdAt.isAfter(booking.getStartsAt().toInstant().minus(minLead));
+        return isShortNotice(booking.getCreatedAt(), booking.getStartsAt(), minLead);
+    }
+
+    /** D3 kernel, shared with the registered leg ({@link RegisteredBookingReminderSweep}) so the rule cannot drift. */
+    static boolean isShortNotice(Instant createdAt, OffsetDateTime startsAt, Duration minLead) {
+        return createdAt != null && createdAt.isAfter(startsAt.toInstant().minus(minLead));
     }
 
     private void countTwoHour(String outcome, int amount) {

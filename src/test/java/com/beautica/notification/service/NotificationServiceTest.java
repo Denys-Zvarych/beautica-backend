@@ -36,6 +36,7 @@ import java.util.stream.Stream;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
@@ -1391,6 +1392,12 @@ class NotificationServiceTest {
             case REQUEST_DECIDED -> service.notifyRequestDecided(
                     new RequestDecisionEvent(RequestKind.CATEGORY_REQUEST, "1", false, requesterId),
                     new RequestDecisionTarget("X", "r", requesterId), requesterUser(true));
+            // Phase 494 — the registered-client reminder is e-mail only (NTF-D04).
+            case BOOKING_REMINDER -> service.notifyBookingReminder(booking, ReminderKind.H24,
+                    java.time.Instant.parse("2026-06-01T09:00:00Z"));
+            // Phase 496 — the registered client's receipts are e-mail only (NTF-D04), own rows (audit-fix cycle 1).
+            case CLIENT_CANCEL_RECEIPT -> service.notifyClientCancelReceipt(booking);
+            case CLIENT_RESCHEDULE_RECEIPT -> service.notifyClientRescheduleReceipt(booking);
             default -> throw new IllegalArgumentException("unmapped event type " + type.name());
         }
 
@@ -1503,5 +1510,251 @@ class NotificationServiceTest {
                 requesterUser(false));
 
         verifyNoInteractions(emailService);
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 494 — notifyBookingReminder (registered client, e-mail only, drain-time skip rules)
+    // -------------------------------------------------------------------------
+
+    private static final java.time.Instant REMINDER_CLAIMED_AT = java.time.Instant.parse("2026-06-01T09:00:00Z");
+
+    private Booking reminderBooking(BookingStatus status, java.time.Duration startAfterClaim) {
+        Booking booking = buildBookingMock(UUID.randomUUID(), UUID.randomUUID(), status);
+        lenient().when(booking.getStartsAt()).thenReturn(
+                OffsetDateTime.ofInstant(REMINDER_CLAIMED_AT.plus(startAfterClaim), java.time.ZoneOffset.UTC));
+        lenient().when(booking.getClient().isActive()).thenReturn(true);
+        return booking;
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @EnumSource(ReminderKind.class)
+    @DisplayName("Phase 494: a CONFIRMED booking still in its claimed window e-mails the client — and nothing else")
+    void should_emailClient_when_bookingReminderStillDue(ReminderKind kind) {
+        // Arrange
+        Booking booking = reminderBooking(BookingStatus.CONFIRMED, kind.windowStart().plusMinutes(10));
+
+        // Act
+        service.notifyBookingReminder(booking, kind, REMINDER_CLAIMED_AT);
+
+        // Assert
+        verify(emailService).sendBookingReminderEmail("client@example.com", booking, kind);
+        verifyNoInteractions(bookingSmsDispatcher);
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @EnumSource(value = BookingStatus.class, names = "CONFIRMED", mode = EnumSource.Mode.EXCLUDE)
+    @DisplayName("Phase 494: a booking no longer CONFIRMED at drain time sends nothing")
+    void should_sendNothing_when_bookingNoLongerConfirmed(BookingStatus status) {
+        // Arrange
+        Booking booking = reminderBooking(status, java.time.Duration.ofHours(24));
+
+        // Act
+        service.notifyBookingReminder(booking, ReminderKind.H24, REMINDER_CLAIMED_AT);
+
+        // Assert
+        verifyNoInteractions(emailService, bookingSmsDispatcher);
+    }
+
+    @ParameterizedTest(name = "{0} start +{1} min after the claim")
+    @org.junit.jupiter.params.provider.CsvSource({"H24, 1380", "H24, 1500", "H2, 105", "H2, 135"})
+    @DisplayName("Phase 494: a start exactly on either window bound still sends (inclusive drain re-check)")
+    void should_emailClient_when_startOnWindowBound(ReminderKind kind, long minutes) {
+        // Arrange
+        Booking booking = reminderBooking(BookingStatus.CONFIRMED, java.time.Duration.ofMinutes(minutes));
+
+        // Act
+        service.notifyBookingReminder(booking, kind, REMINDER_CLAIMED_AT);
+
+        // Assert
+        verify(emailService).sendBookingReminderEmail("client@example.com", booking, kind);
+    }
+
+    @ParameterizedTest(name = "{0} start +{1} min after the claim")
+    @org.junit.jupiter.params.provider.CsvSource({"H24, 1379", "H24, 1501", "H24, 4320", "H2, 104", "H2, 136", "H2, -30"})
+    @DisplayName("Phase 494: a start moved out of the claimed window (a reschedule) sends nothing")
+    void should_sendNothing_when_startMovedOutOfClaimedWindow(ReminderKind kind, long minutes) {
+        // Arrange
+        Booking booking = reminderBooking(BookingStatus.CONFIRMED, java.time.Duration.ofMinutes(minutes));
+
+        // Act
+        service.notifyBookingReminder(booking, kind, REMINDER_CLAIMED_AT);
+
+        // Assert
+        verifyNoInteractions(emailService);
+    }
+
+    @Test
+    @DisplayName("Phase 494: an inactive client account gets no reminder")
+    void should_sendNothing_when_clientInactive() {
+        // Arrange
+        Booking booking = reminderBooking(BookingStatus.CONFIRMED, java.time.Duration.ofHours(24));
+        when(booking.getClient().isActive()).thenReturn(false);
+
+        // Act
+        service.notifyBookingReminder(booking, ReminderKind.H24, REMINDER_CLAIMED_AT);
+
+        // Assert
+        verifyNoInteractions(emailService);
+    }
+
+    @Test
+    @DisplayName("Phase 494: a booking whose client account is gone (null client) gets no reminder, no SMS")
+    void should_sendNothing_when_clientGone() {
+        // Arrange
+        Booking booking = reminderBooking(BookingStatus.CONFIRMED, java.time.Duration.ofHours(24));
+        when(booking.getClient()).thenReturn(null);
+
+        // Act
+        service.notifyBookingReminder(booking, ReminderKind.H24, REMINDER_CLAIMED_AT);
+
+        // Assert
+        verifyNoInteractions(emailService, bookingSmsDispatcher);
+    }
+
+    @Test
+    @DisplayName("Phase 494: a row with no claim timestamp is skipped, never sent unchecked")
+    void should_sendNothing_when_claimedAtMissing() {
+        // Arrange
+        Booking booking = reminderBooking(BookingStatus.CONFIRMED, java.time.Duration.ofHours(24));
+
+        // Act
+        service.notifyBookingReminder(booking, ReminderKind.H24, null);
+
+        // Assert
+        verifyNoInteractions(emailService);
+    }
+
+    @Test
+    @DisplayName("Phase 494: BOOKING_REMINDER never routes to the guest SMS pool (NTF-D04)")
+    void should_notRouteToSms_when_bookingReminder() {
+        // Arrange
+        Booking booking = reminderBooking(BookingStatus.CONFIRMED, java.time.Duration.ofHours(24));
+
+        // Act + Assert
+        assertThat(service.routesToLinkGuestSms(OutboxEventType.BOOKING_REMINDER, booking)).isFalse();
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 496 — registered-client receipts (NTF-49): only an active registered client, only with the flag
+    // -------------------------------------------------------------------------
+
+    private Booking receiptBooking(BookingStatus status, boolean clientActive) {
+        Booking booking = buildBookingMock(UUID.randomUUID(), UUID.randomUUID(), status);
+        lenient().when(booking.getClient().isActive()).thenReturn(clientActive);
+        return booking;
+    }
+
+    @Test
+    @DisplayName("Phase 496: CLIENT_CANCEL_RECEIPT row + active registered client → the receipt only, never the master")
+    void should_emailOnlyClientReceipt_when_cancelReceiptDispatchedForActiveClient() {
+        // Arrange
+        Booking booking = receiptBooking(BookingStatus.CANCELLED, true);
+
+        // Act
+        service.notifyClientCancelReceipt(booking);
+
+        // Assert
+        verify(emailService).sendClientCancelReceiptEmail("client@example.com", booking);
+        verify(emailService, never()).sendClientCancelledEmail(anyString(), any(Booking.class));
+        verifyNoInteractions(bookingSmsDispatcher);
+    }
+
+    @Test
+    @DisplayName("Phase 496 (D4): the master's CLIENT_CANCELLED row (guest cancel / deletion cascade / self-cancel) "
+            + "→ master only, never a receipt")
+    void should_emailOnlyMaster_when_clientCancelledDispatched() {
+        // Arrange
+        Booking booking = receiptBooking(BookingStatus.CANCELLED, true);
+
+        // Act
+        service.notifyClientCancelled(booking);
+
+        // Assert
+        verify(emailService).sendClientCancelledEmail("master@example.com", booking);
+        verify(emailService, never()).sendClientCancelReceiptEmail(anyString(), any());
+    }
+
+    @Test
+    @DisplayName("Phase 496: cancel receipt but the account is inactive → nothing")
+    void should_skipCancelReceipt_when_clientInactive() {
+        // Arrange
+        Booking booking = receiptBooking(BookingStatus.CANCELLED, false);
+
+        // Act
+        service.notifyClientCancelReceipt(booking);
+
+        // Assert
+        verifyNoInteractions(emailService, bookingSmsDispatcher);
+    }
+
+    @Test
+    @DisplayName("Phase 496: cancel receipt on an account-less guest booking → nothing, no SMS (no receipt channel)")
+    void should_skipCancelReceipt_when_guestBooking() {
+        // Arrange
+        Booking booking = buildGuestBookingMock(UUID.randomUUID(), "Іван", "Петренко");
+
+        // Act
+        service.notifyClientCancelReceipt(booking);
+
+        // Assert
+        verifyNoInteractions(emailService, bookingSmsDispatcher);
+    }
+
+    @Test
+    @DisplayName("Phase 496: a detached master does not stop the client's cancel receipt (own row)")
+    void should_stillSendCancelReceipt_when_masterDetached() {
+        // Arrange
+        Booking booking = receiptBooking(BookingStatus.CANCELLED, true);
+        lenient().when(booking.getMaster()).thenReturn(Master.builder().build());
+
+        // Act
+        service.notifyClientCancelReceipt(booking);
+
+        // Assert
+        verify(emailService).sendClientCancelReceiptEmail("client@example.com", booking);
+    }
+
+    @Test
+    @DisplayName("Phase 496: CLIENT_RESCHEDULE_RECEIPT row, CONFIRMED + active client → the «ви перенесли» receipt only")
+    void should_emailOnlySelfRescheduleReceipt_when_rescheduleReceiptDispatched() {
+        // Arrange
+        Booking booking = receiptBooking(BookingStatus.CONFIRMED, true);
+
+        // Act
+        service.notifyClientRescheduleReceipt(booking);
+
+        // Assert
+        verify(emailService).sendBookingRescheduledClientEmail("client@example.com", booking, true);
+        verify(emailService, never()).sendBookingRescheduledEmail(anyString(), any());
+        verifyNoInteractions(bookingSmsDispatcher);
+    }
+
+    @Test
+    @DisplayName("Phase 496: client-initiated BOOKING_RESCHEDULED row → master only, never the client receipt")
+    void should_emailOnlyMaster_when_clientInitiatedRescheduleDispatched() {
+        // Arrange
+        Booking booking = receiptBooking(BookingStatus.CONFIRMED, true);
+
+        // Act
+        service.notifyBookingRescheduled(booking);
+
+        // Assert
+        verify(emailService).sendBookingRescheduledEmail("master@example.com", booking);
+        verify(emailService, never()).sendBookingRescheduledClientEmail(anyString(), any(), anyBoolean());
+    }
+
+    @Test
+    @DisplayName("Phase 496: reschedule receipt, account inactive or booking no longer CONFIRMED → nothing")
+    void should_skipSelfRescheduleReceipt_when_clientInactiveOrBookingCancelled() {
+        // Arrange
+        Booking inactive = receiptBooking(BookingStatus.CONFIRMED, false);
+        Booking cancelled = receiptBooking(BookingStatus.CANCELLED, true);
+
+        // Act
+        service.notifyClientRescheduleReceipt(inactive);
+        service.notifyClientRescheduleReceipt(cancelled);
+
+        // Assert
+        verifyNoInteractions(emailService, bookingSmsDispatcher);
     }
 }

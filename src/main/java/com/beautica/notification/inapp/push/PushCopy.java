@@ -7,7 +7,9 @@ import com.beautica.notification.inapp.dto.NotificationParams;
 import com.beautica.notification.inapp.entity.InAppNotificationType;
 
 import java.text.Normalizer;
+import java.time.Clock;
 import java.time.Instant;
+import java.time.LocalDate;
 import java.time.ZonedDateTime;
 import java.util.regex.Pattern;
 
@@ -125,15 +127,28 @@ public final class PushCopy {
             case REPORT_CONTENT_REMOVED, REPORT_NO_VIOLATION, REPORT_REVIEWED -> "Скаргу розглянуто";
             case CONTENT_REMOVED -> "Вміст видалено";
             case REVIEW_ABOUT_YOU_REMOVED -> "Відгук видалено";
+            // Phase 495 — must equal the mobile ARB notificationTitleBookingReminder (M497).
+            case BOOKING_REMINDER -> "Нагадування про візит";
         };
     }
 
     /**
      * One body line from the params the READ API resolved for this recipient. {@code params == null}
      * (the recipient lost access / the referent is gone) or any missing field the template needs
-     * yields {@link #GENERIC_BODY} — never a half-filled sentence, never a name.
+     * yields {@link #GENERIC_BODY} — never a half-filled sentence, never a name. Without a clock a
+     * {@code BOOKING_REMINDER} reads its visit day as the short date (never a relative word that could be wrong).
      */
     public static String body(InAppNotificationType type, boolean clientRecipient, NotificationParams params) {
+        return body(type, clientRecipient, params, null);
+    }
+
+    /**
+     * As {@link #body(InAppNotificationType, boolean, NotificationParams)}, with the push-time clock the
+     * {@code BOOKING_REMINDER} day word is computed against (Kyiv calendar date of the visit vs Kyiv today). The
+     * clock is read only for that type, so it may be {@code null} for every other one.
+     */
+    public static String body(InAppNotificationType type, boolean clientRecipient, NotificationParams params,
+                              Clock clock) {
         if (params == null) {
             return GENERIC_BODY;
         }
@@ -151,6 +166,9 @@ public final class PushCopy {
         Instant startsAt = params.startsAt();
         if (counterpart == null || service == null || startsAt == null) {
             return GENERIC_BODY;
+        }
+        if (type == InAppNotificationType.BOOKING_REMINDER) {
+            return reminderBody(service, startsAt, counterpart, clock);
         }
         String serviceLabel = params.serviceCount() > 1 ? service + " +" + (params.serviceCount() - 1) : service;
         String when = whenLabel(startsAt);
@@ -226,15 +244,46 @@ public final class PushCopy {
         return subject + " тепер у команді — " + role;
     }
 
+    /**
+     * Phase 495 — «Манікюр · завтра о 14:30 — Салон Бута»: the client-only 24 h reminder, Kyiv HH:mm, counterpart last
+     * as in every client-side body (NTF-D01). One booking = one service, so no «+N». The day word is relative to the
+     * Kyiv date at push time (the 24 h leg also runs at night, so «завтра» is not a given) — see {@link #reminderDay}.
+     */
+    private static String reminderBody(String service, Instant startsAt, String counterpart, Clock clock) {
+        ZonedDateTime kyiv = startsAt.atZone(TimeZones.KYIV);
+        return "%s · %s о %02d:%02d — %s".formatted(
+                service, reminderDay(kyiv.toLocalDate(), clock), kyiv.getHour(), kyiv.getMinute(), counterpart);
+    }
+
+    /**
+     * «сьогодні» when the visit's Kyiv date is the Kyiv date now, «завтра» when it is the next one, otherwise (and
+     * whenever no clock is given) the short date «вт, 17 листопада» — the mobile app's day format.
+     */
+    private static String reminderDay(LocalDate visitDay, Clock clock) {
+        if (clock != null) {
+            LocalDate today = LocalDate.now(clock.withZone(TimeZones.KYIV));
+            if (visitDay.equals(today)) {
+                return "сьогодні";
+            }
+            if (visitDay.equals(today.plusDays(1))) {
+                return "завтра";
+            }
+        }
+        return shortDate(visitDay);
+    }
+
     /** «пт, 3 жовтня, 14:30» in Europe/Kyiv — never the server or device zone. */
     static String whenLabel(Instant startsAt) {
         ZonedDateTime kyiv = startsAt.atZone(TimeZones.KYIV);
-        return "%s, %d %s, %02d:%02d".formatted(
-                WEEKDAYS[kyiv.getDayOfWeek().getValue() - 1],
-                kyiv.getDayOfMonth(),
-                MONTHS_GENITIVE[kyiv.getMonthValue() - 1],
-                kyiv.getHour(),
-                kyiv.getMinute());
+        return "%s, %02d:%02d".formatted(shortDate(kyiv.toLocalDate()), kyiv.getHour(), kyiv.getMinute());
+    }
+
+    /** «пт, 3 жовтня» — weekday abbreviation, day, genitive month. */
+    private static String shortDate(LocalDate day) {
+        return "%s, %d %s".formatted(
+                WEEKDAYS[day.getDayOfWeek().getValue() - 1],
+                day.getDayOfMonth(),
+                MONTHS_GENITIVE[day.getMonthValue() - 1]);
     }
 
     /**

@@ -863,6 +863,78 @@ class AppointmentTransitionServiceTest {
     }
 
     @Test
+    @DisplayName("rescheduleAppointmentItem — phase 496 (NTF-49): a CLIENT moving ONE item of a two-service visit "
+            + "enqueues exactly one self-reschedule receipt, for the MOVED booking only — never the sibling")
+    void should_enqueueOneReceiptForMovedItemOnly_when_clientReschedulesVisitItem() {
+        // Arrange
+        setUpRescheduleItemFixtures();
+        UUID targetId = UUID.randomUUID();
+        UUID siblingId = UUID.randomUUID();
+        OffsetDateTime siblingStart = OffsetDateTime.parse("2026-08-10T09:00:00Z");
+        Booking sibling = confirmedItem(siblingId, siblingStart, siblingStart.plusHours(1));
+        Booking target = confirmedItem(targetId, siblingStart.plusHours(2), siblingStart.plusHours(3));
+        Appointment appointment = Appointment.builder().id(appointmentId).client(itemClient).build();
+        OffsetDateTime newStartsAt = OffsetDateTime.parse("2026-08-11T09:00:00Z");
+        AppointmentItemRescheduleRequest req = new AppointmentItemRescheduleRequest(newStartsAt, false);
+        when(appointmentRepository.findById(appointmentId)).thenReturn(Optional.of(appointment));
+        when(appointmentRepository.findClientIdById(appointmentId)).thenReturn(Optional.of(clientId));
+        when(bookingRepository.findByAppointmentIdWithGraph(appointmentId)).thenReturn(List.of(sibling, target));
+        stubItemSlotAvailable(newStartsAt);
+        when(appointmentRepository.lockHeaderIfConfirmed(appointmentId)).thenReturn(Optional.of(appointmentId));
+        when(bookingRepository.acquireClientAdvisoryLockWithTimeout(clientId)).thenReturn(1);
+        when(bookingRepository.findFirstConflictingClientBookingIdExcluding(eq(clientId), any(), any(), eq(targetId)))
+                .thenReturn(Optional.empty());
+        when(bookingRepository.acquireAdvisoryLock(masterId)).thenReturn(1);
+        when(bookingRepository.findPostLockConfirmedAndOverlapExcluding(eq(masterId), any(), any(), eq(targetId)))
+                .thenReturn(PostLockRescheduleChecks.free());
+        when(bookingRepository.saveAndFlush(target)).thenReturn(target);
+        when(appointmentService.enrich(eq(appointment), any()))
+                .thenReturn(org.mockito.Mockito.mock(AppointmentDetailResponse.class));
+
+        // Act
+        appointmentTransitionService.rescheduleAppointmentItem(clientId, Role.CLIENT, appointmentId, targetId, req);
+
+        // Assert
+        verify(outboxService, org.mockito.Mockito.times(1)).enqueueClientRescheduleReceipt(any());
+        verify(outboxService).enqueueClientRescheduleReceipt(targetId);
+        verify(outboxService, never()).enqueueClientRescheduleReceipt(siblingId);
+    }
+
+    @Test
+    @DisplayName("rescheduleAppointmentItem — phase 496 (NTF-49): a PROVIDER moving one visit item enqueues NO "
+            + "client self-reschedule receipt (the client gets the provider-reschedule e-mail instead)")
+    void should_enqueueNoClientReceipt_when_providerReschedulesVisitItem() {
+        // Arrange
+        setUpRescheduleItemFixtures();
+        UUID targetId = UUID.randomUUID();
+        UUID actorId = UUID.randomUUID();
+        OffsetDateTime start = OffsetDateTime.parse("2026-08-10T09:00:00Z");
+        Booking target = confirmedItem(targetId, start, start.plusHours(1));
+        Appointment appointment = Appointment.builder().id(appointmentId).client(itemClient).build();
+        OffsetDateTime newStartsAt = OffsetDateTime.parse("2026-08-11T09:00:00Z");
+        AppointmentItemRescheduleRequest req = new AppointmentItemRescheduleRequest(newStartsAt, false);
+        when(appointmentRepository.findById(appointmentId)).thenReturn(Optional.of(appointment));
+        when(bookingRepository.findByAppointmentIdWithGraph(appointmentId)).thenReturn(List.of(target));
+        stubStaffItemSlotAvailable(newStartsAt);
+        when(appointmentRepository.lockHeaderIfConfirmed(appointmentId)).thenReturn(Optional.of(appointmentId));
+        when(bookingRepository.acquireClientAdvisoryLockWithTimeout(clientId)).thenReturn(1);
+        when(bookingRepository.findFirstConflictingClientBookingIdExcluding(eq(clientId), any(), any(), eq(targetId)))
+                .thenReturn(Optional.empty());
+        when(bookingRepository.acquireAdvisoryLock(masterId)).thenReturn(1);
+        when(bookingRepository.findPostLockConfirmedAndOverlapExcluding(eq(masterId), any(), any(), eq(targetId)))
+                .thenReturn(PostLockRescheduleChecks.free());
+        when(bookingRepository.saveAndFlush(target)).thenReturn(target);
+        when(appointmentService.enrich(any(), any())).thenReturn(org.mockito.Mockito.mock(AppointmentDetailResponse.class));
+
+        // Act
+        appointmentTransitionService.rescheduleAppointmentItem(actorId, Role.SALON_OWNER, appointmentId, targetId, req);
+
+        // Assert
+        verify(outboxService).enqueueBookingRescheduled(targetId, true, newStartsAt.toInstant());
+        verify(outboxService, never()).enqueueClientRescheduleReceipt(any());
+    }
+
+    @Test
     @DisplayName("assertNoSiblingOverlap (phase 30.3) — moving the target onto a CONFIRMED sibling's "
             + "window is a 409, and NOTHING is mutated or locked")
     void should_throw409_when_targetWouldOverlapConfirmedSibling() {

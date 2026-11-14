@@ -412,6 +412,23 @@ abstract class AbstractWalkInBookingSmsIT extends AbstractStaffBookingIT {
                 .toList();
     }
 
+    /**
+     * Runs {@code action} as the fixture salon's owner: the visit-item path reads the actor's role from the
+     * SecurityContext. Shared by the phase 493 reminder re-arm ITs.
+     */
+    protected void asOwner(Runnable action) {
+        var auth = new org.springframework.security.authentication.UsernamePasswordAuthenticationToken(
+                salon.ownerEmail(), null,
+                List.of(new org.springframework.security.core.authority.SimpleGrantedAuthority("ROLE_SALON_OWNER")));
+        auth.setDetails(salon.ownerId());
+        org.springframework.security.core.context.SecurityContextHolder.getContext().setAuthentication(auth);
+        try {
+            action.run();
+        } finally {
+            org.springframework.security.core.context.SecurityContextHolder.clearContext();
+        }
+    }
+
     protected String sentText() throws Exception {
         List<LoggedRequest> requests = TURBOSMS.findAll(postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
         assertThat(requests).as("exactly one SMS").hasSize(1);

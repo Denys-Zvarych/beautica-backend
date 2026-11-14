@@ -115,6 +115,11 @@ app:
       # logged instead of billed (the OTP goes to Mailpit via beautica.sms.mode=capture above). Hardcoded false with NO env placeholder — unlike the base
       # profile, local must not be flippable by a stray shell export.
       enabled: false
+    reminder-2h:
+      # Phase 494 — 2h reminder ON locally so start-backend.sh exercises it with no exports (base default false).
+      # min-lead 0m: a booking made now ~2h ahead is still reminded (GST-46 3h stays the default elsewhere).
+      enabled: ${APP_BOOKING_REMINDER_2H_ENABLED:true}
+      min-lead: ${APP_BOOKING_REMINDER_2H_MIN_LEAD:0m}
   telegram:
     # Phase 404 — local never reaches the Bot API: with APP_TELEGRAM_ENABLED=true messages go to Mailpit
     # (tg+<chatId>@telegram.local.invalid). Flag itself stays inherited (default false).

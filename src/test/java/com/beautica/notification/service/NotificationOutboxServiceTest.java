@@ -13,11 +13,13 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
@@ -188,6 +190,39 @@ class NotificationOutboxServiceTest {
         // Pin @Builder.Default values so a future refactor that drops them is caught.
         assertThat(saved.getStatus()).isEqualTo(OutboxStatus.PENDING);
         assertThat(saved.getAttempts()).isEqualTo(0);
+    }
+
+    @Test
+    @DisplayName("Phase 496: enqueueClientCancelReceipt / enqueueClientRescheduleReceipt write their OWN payload-less "
+            + "rows keyed to the booking; enqueueClientCancelled keeps the pre-496 null payload")
+    void should_writeOwnReceiptRows_when_receiptEnqueued() {
+        // Arrange
+        UUID cancelId = UUID.randomUUID();
+        UUID rescheduleId = UUID.randomUUID();
+        UUID masterRowId = UUID.randomUUID();
+        ArgumentCaptor<NotificationOutboxEntry> captor = ArgumentCaptor.forClass(NotificationOutboxEntry.class);
+
+        // Act
+        service.enqueueClientCancelReceipt(cancelId);
+        service.enqueueClientRescheduleReceipt(rescheduleId);
+        service.enqueueClientCancelled(masterRowId);
+
+        // Assert
+        verify(outboxRepository, org.mockito.Mockito.times(3)).save(captor.capture());
+        List<NotificationOutboxEntry> rows = captor.getAllValues();
+        assertThat(rows).extracting(NotificationOutboxEntry::getEventType).containsExactly(
+                OutboxEventType.CLIENT_CANCEL_RECEIPT, OutboxEventType.CLIENT_RESCHEDULE_RECEIPT,
+                OutboxEventType.CLIENT_CANCELLED);
+        assertThat(rows).extracting(NotificationOutboxEntry::getAggregateId)
+                .containsExactly(cancelId, rescheduleId, masterRowId);
+        assertThat(rows).extracting(NotificationOutboxEntry::getPayload).containsOnlyNulls();
+    }
+
+    @Test
+    @DisplayName("Phase 496: the receipt enqueues reject a null booking id")
+    void should_throwNullPointerException_when_receiptEnqueuedWithNull() {
+        assertThatThrownBy(() -> service.enqueueClientCancelReceipt(null)).isInstanceOf(NullPointerException.class);
+        assertThatThrownBy(() -> service.enqueueClientRescheduleReceipt(null)).isInstanceOf(NullPointerException.class);
     }
 
     // -------------------------------------------------------------------------
@@ -603,6 +638,45 @@ class NotificationOutboxServiceTest {
     void should_notSave_when_requestDecidedRecipientIsNull() {
         service.enqueueRequestDecided(RequestKind.CATEGORY_REQUEST, "42", true, null);
 
+        verifyNoInteractions(outboxRepository);
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 494 — enqueueBookingReminder
+    // -------------------------------------------------------------------------
+
+    @ParameterizedTest(name = "{0}")
+    @EnumSource(ReminderKind.class)
+    @DisplayName("Phase 494: BOOKING_REMINDER payload holds exactly bookingId, kind and claimedAt; aggregate = the booking")
+    void should_saveIdsOnlyPayload_when_enqueueBookingReminderCalled(ReminderKind kind) throws Exception {
+        // Arrange
+        UUID bookingId = UUID.randomUUID();
+        ArgumentCaptor<NotificationOutboxEntry> captor = ArgumentCaptor.forClass(NotificationOutboxEntry.class);
+
+        // Act
+        service.enqueueBookingReminder(bookingId, kind, java.time.Instant.ofEpochSecond(1_780_000_000L));
+
+        // Assert
+        verify(outboxRepository).save(captor.capture());
+        NotificationOutboxEntry saved = captor.getValue();
+        assertThat(saved.getEventType()).isEqualTo(OutboxEventType.BOOKING_REMINDER);
+        assertThat(saved.getAggregateId()).isEqualTo(bookingId);
+        assertThat(MAPPER.readValue(saved.getPayload(), new TypeReference<Map<String, Object>>() {}))
+                .containsOnly(Map.entry("bookingId", bookingId.toString()), Map.entry("kind", kind.name()),
+                        Map.entry("claimedAt", "1780000000"));
+    }
+
+    @Test
+    @DisplayName("Phase 494: a null booking id, kind or claim instant is refused before any write")
+    void should_throwAndWriteNothing_when_enqueueBookingReminderArgumentNull() {
+        // Act + Assert
+        java.time.Instant tick = java.time.Instant.ofEpochSecond(1_780_000_000L);
+        assertThatThrownBy(() -> service.enqueueBookingReminder(null, ReminderKind.H24, tick))
+                .isInstanceOf(NullPointerException.class);
+        assertThatThrownBy(() -> service.enqueueBookingReminder(UUID.randomUUID(), null, tick))
+                .isInstanceOf(NullPointerException.class);
+        assertThatThrownBy(() -> service.enqueueBookingReminder(UUID.randomUUID(), ReminderKind.H24, null))
+                .isInstanceOf(NullPointerException.class);
         verifyNoInteractions(outboxRepository);
     }
 }

@@ -324,8 +324,19 @@ class NotificationOutboxIntegrationTest extends AbstractIntegrationTest {
                 new HttpEntity<>(body, bearerHeaders(clientToken)), String.class);
         assertThat(reschedResp.getStatusCode()).isEqualTo(HttpStatus.OK);
 
-        List<NotificationOutboxEntry> rows = outboxRepository.findAll();
+        // Phase 496 (NTF-49): a client reschedule also enqueues the client's own CLIENT_RESCHEDULE_RECEIPT row —
+        // filter to the BOOKING_RESCHEDULED row this test drains, then pin the receipt separately.
+        List<NotificationOutboxEntry> all = outboxRepository.findAll();
+        List<NotificationOutboxEntry> rows = all.stream()
+                .filter(row -> row.getEventType() == OutboxEventType.BOOKING_RESCHEDULED)
+                .toList();
         assertThat(rows).hasSize(1);
+        assertThat(all)
+                .filteredOn(row -> row.getEventType() == OutboxEventType.CLIENT_RESCHEDULE_RECEIPT)
+                .as("a client reschedule must enqueue exactly one CLIENT_RESCHEDULE_RECEIPT row for the booking")
+                .singleElement()
+                .extracting(NotificationOutboxEntry::getAggregateId)
+                .isEqualTo(bookingId);
         NotificationOutboxEntry only = rows.get(0);
         assertThat(only.getEventType()).isEqualTo(OutboxEventType.BOOKING_RESCHEDULED);
         assertThat(only.getStatus()).isEqualTo(OutboxStatus.PENDING);

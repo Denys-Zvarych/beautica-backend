@@ -1758,7 +1758,11 @@ class BookingServiceTest {
         bookingService.cancelBooking(clientId, bookingId, req);
 
         assertThat(booking.getStatus()).isEqualTo(BookingStatus.CANCELLED);
-        verify(outboxService).enqueueStatusChanged(bookingId);
+        // Phase 496 audit-fix cycle 1 — one row per recipient (master e-mail, client receipt); the drain-no-op
+        // STATUS_CHANGED row is no longer written for a client self-cancel.
+        verify(outboxService).enqueueClientCancelled(bookingId);
+        verify(outboxService).enqueueClientCancelReceipt(bookingId);
+        verify(outboxService, never()).enqueueStatusChanged(any());
         verify(slotCalculationService).evictMasterAvailabilityCaches(masterId);
     }
 
@@ -1897,7 +1901,7 @@ class BookingServiceTest {
         inOrder.verify(bookingRepository).save(any());
         inOrder.verify(appointmentTransitionService)
                 .collapseAppointmentHeaderAfterClientItemCancel(appointmentId, true, "одну послугу не потрібно");
-        verify(outboxService).enqueueStatusChanged(bookingId);
+        verify(outboxService).enqueueClientCancelled(bookingId);
     }
 
     @Test
@@ -2132,7 +2136,7 @@ class BookingServiceTest {
         assertThat(booking.getStatus())
                 .as("endsAt == now is the last non-elapsed instant (guard uses strict isBefore) — cancel must succeed")
                 .isEqualTo(BookingStatus.CANCELLED);
-        verify(outboxService).enqueueStatusChanged(bookingId);
+        verify(outboxService).enqueueClientCancelled(bookingId);
     }
 
     /** Matrix #3 (boundary, strictly after). endsAt one nanosecond after now → not elapsed → cancel allowed. */
@@ -2147,7 +2151,7 @@ class BookingServiceTest {
         bookingService.cancelBooking(clientId, bookingId, req);
 
         assertThat(booking.getStatus()).isEqualTo(BookingStatus.CANCELLED);
-        verify(outboxService).enqueueStatusChanged(bookingId);
+        verify(outboxService).enqueueClientCancelled(bookingId);
     }
 
     /** Matrix #7 (ordering). An elapsed but NON-CONFIRMED booking reports the STATUS conflict, not the elapsed code. */
@@ -2215,7 +2219,7 @@ class BookingServiceTest {
         bookingService.cancelBooking(clientId, bookingId, req);
 
         assertThat(booking.getStatus()).isEqualTo(BookingStatus.CANCELLED);
-        verify(outboxService).enqueueStatusChanged(bookingId);
+        verify(outboxService).enqueueClientCancelled(bookingId);
     }
 
     /** Matrix #4 (regression, reschedule). A FUTURE CONFIRMED booking still reschedules to the new time. */
@@ -2236,6 +2240,7 @@ class BookingServiceTest {
         assertThat(booking.getStartsAt()).isEqualTo(newStartsAt);
         assertThat(result.status()).isEqualTo(BookingStatus.CONFIRMED);
         verify(outboxService).enqueueBookingRescheduled(bookingId, false);
+        verify(outboxService).enqueueClientRescheduleReceipt(bookingId);
     }
 
     // ── rescheduleBooking (Phase 19.2) ─────────────────────────────────────────
@@ -2279,6 +2284,7 @@ class BookingServiceTest {
         assertThat(booking.getStartsAt()).isEqualTo(newStartsAt);
         assertThat(result.status()).isEqualTo(BookingStatus.CONFIRMED);
         verify(outboxService).enqueueBookingRescheduled(bookingId, false);
+        verify(outboxService).enqueueClientRescheduleReceipt(bookingId);
     }
 
     // TODO(24.7): a non-CONFIRMED reschedule source (formerly PENDING) has no replacement —

@@ -13,6 +13,7 @@ import org.springframework.lang.Nullable;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
+import java.time.Instant;
 import java.util.EnumSet;
 import java.util.Set;
 import java.util.UUID;
@@ -223,6 +224,20 @@ public class NotificationService {
             return;
         }
         emailService.sendBookingRescheduledEmail(masterUser.getEmail(), booking);
+    }
+
+    /**
+     * Phase 496 (NTF-49) — the registered client's own «ви перенесли запис» receipt (+ REQUEST .ics), dispatched from
+     * its OWN {@code CLIENT_RESCHEDULE_RECEIPT} row (audit-fix cycle 1: the master's e-mail rides the separate
+     * {@code BOOKING_RESCHEDULED} row, so neither retry repeats the other). E-mail only (NTF-D04); an account-less
+     * booking or an inactive account gets nothing. Skipped once the booking left {@code CONFIRMED} (cancelled before
+     * the drain), so a stale «you moved it» never follows a cancel receipt.
+     */
+    public void notifyClientRescheduleReceipt(Booking booking) {
+        User client = activeClient(booking);
+        if (client != null && booking.getStatus() == BookingStatus.CONFIRMED) {
+            emailService.sendBookingRescheduledClientEmail(client.getEmail(), booking, true);
+        }
     }
 
     /**
@@ -471,6 +486,26 @@ public class NotificationService {
     }
 
     /**
+     * Phase 496 (NTF-49) — the registered client's own cancel receipt + CANCEL .ics, dispatched from its OWN
+     * {@code CLIENT_CANCEL_RECEIPT} row (audit-fix cycle 1: the master's e-mail rides the separate
+     * {@code CLIENT_CANCELLED} row, so neither retry repeats the other). Only the authenticated client self-cancel
+     * enqueues that row (D4); an account-less booking or an inactive account gets nothing.
+     */
+    public void notifyClientCancelReceipt(Booking booking) {
+        User client = activeClient(booking);
+        if (client != null) {
+            emailService.sendClientCancelReceiptEmail(client.getEmail(), booking);
+        }
+    }
+
+    /** The booking's registered client when the account is active, else {@code null} (guest, detached, inactive). */
+    @Nullable
+    private static User activeClient(Booking booking) {
+        User client = booking.getClient();
+        return client != null && client.isActive() ? client : null;
+    }
+
+    /**
      * Phase 436 — the aggregated {@code CLIENT_CANCELLED} e-mail of one guest cancel-by-link request: ONE e-mail
      * listing every service in {@code visit} (exactly the services cancelled in that request).
      */
@@ -533,6 +568,39 @@ public class NotificationService {
             return "requester changed";
         }
         return recipient.isActive() ? null : "recipient inactive";
+    }
+
+    /**
+     * Phase 494 (NTF-47) — a registered client's 24 h / 2 h reminder e-mail for ONE APP booking (NTF-D11), from the
+     * drain's live re-read of the booking. E-mail only (NTF-D04). A clean no-op (row SENT, nothing sent) when the
+     * booking is no longer {@code CONFIRMED}, its start moved out of the window the sweep claimed it from (a reschedule
+     * re-arms the flags, GST-77, so the next sweep reminds about the new time instead), or the client account is gone
+     * or inactive. Ids only in the log.
+     *
+     * @param claimedAt the sweep tick that claimed it (payload {@code claimedAt}); {@code null} (unreadable) skips
+     */
+    public void notifyBookingReminder(Booking booking, ReminderKind kind, Instant claimedAt) {
+        String skip = bookingReminderSkipReason(booking, kind, claimedAt);
+        if (skip != null) {
+            log.debug("Skipping BOOKING_REMINDER kind={} booking={}: {}", kind, booking.getId(), skip);
+            return;
+        }
+        emailService.sendBookingReminderEmail(booking.getClient().getEmail(), booking, kind);
+    }
+
+    @Nullable
+    private static String bookingReminderSkipReason(Booking booking, ReminderKind kind, Instant claimedAt) {
+        if (booking.getStatus() != BookingStatus.CONFIRMED) {
+            return "not confirmed";
+        }
+        if (claimedAt == null || !kind.isInWindow(booking.getStartsAt(), claimedAt)) {
+            return "start moved out of the claimed window";
+        }
+        User client = booking.getClient();
+        if (client == null) {
+            return "client gone";
+        }
+        return client.isActive() ? null : "client inactive";
     }
 
     /**

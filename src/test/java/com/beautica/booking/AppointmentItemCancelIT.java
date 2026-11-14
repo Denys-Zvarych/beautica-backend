@@ -317,9 +317,9 @@ class AppointmentItemCancelIT extends AbstractIntegrationTest {
     // ── outbox / slot release ────────────────────────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("a per-item cancel enqueues exactly ONE STATUS_CHANGED outbox row for the cancelled "
-            + "child, with no note text ever entering the payload")
-    void should_enqueueOneStatusChangedRow_when_legCancelled() throws Exception {
+    @DisplayName("a per-item cancel enqueues exactly one row per recipient for the cancelled child — CLIENT_CANCELLED "
+            + "(master) + CLIENT_CANCEL_RECEIPT (client), no STATUS_CHANGED — with no note text ever entering a payload")
+    void should_enqueueOneRowPerRecipient_when_legCancelled() throws Exception {
         Visit v = seedContiguousVisit("cancel-outbox", 2, futureStart());
         UUID leg0 = itemIds(v.id()).get(0);
 
@@ -327,14 +327,15 @@ class AppointmentItemCancelIT extends AbstractIntegrationTest {
                 "{\"cancellationReason\":\"CLIENT_CANCELLED\",\"comment\":\"конфіденційна причина\"}");
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
 
-        Integer outboxCount = jdbcTemplate.queryForObject(
-                "SELECT COUNT(*) FROM notification_outbox WHERE aggregate_id = ? AND event_type = 'STATUS_CHANGED'",
-                Integer.class, leg0);
-        assertThat(outboxCount).as("exactly one STATUS_CHANGED row for the cancelled child").isEqualTo(1);
-        String payload = jdbcTemplate.queryForObject(
-                "SELECT payload FROM notification_outbox WHERE aggregate_id = ? AND event_type = 'STATUS_CHANGED'",
-                String.class, leg0);
-        assertThat(payload).as("no note text ever enters the outbox payload (locked rule)").isNull();
+        // Phase 496 audit-fix cycle 1 — one row per recipient (own retry state); the former STATUS_CHANGED row of a
+        // client cancel was a drain no-op and is no longer written.
+        List<String> types = jdbcTemplate.queryForList(
+                "SELECT event_type FROM notification_outbox WHERE aggregate_id = ?", String.class, leg0);
+        assertThat(types).as("the cancelled child's outbox rows")
+                .containsExactlyInAnyOrder("CLIENT_CANCELLED", "CLIENT_CANCEL_RECEIPT");
+        List<String> payloads = jdbcTemplate.queryForList(
+                "SELECT payload FROM notification_outbox WHERE aggregate_id = ?", String.class, leg0);
+        assertThat(payloads).as("no note text ever enters the outbox payload (locked rule)").containsOnlyNulls();
     }
 
     @Test

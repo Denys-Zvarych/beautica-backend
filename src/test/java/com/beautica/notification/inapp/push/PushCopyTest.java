@@ -9,7 +9,9 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.time.Clock;
 import java.time.Instant;
+import java.time.ZoneOffset;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -18,6 +20,17 @@ class PushCopyTest {
 
     // 2026-10-03T11:30:00Z == 14:30 in Europe/Kyiv (EEST, UTC+3), a Saturday.
     private static final Instant STARTS_AT = Instant.parse("2026-10-03T11:30:00Z");
+
+    /** The day before {@link #STARTS_AT}, same wall time: 2026-10-02 14:30 Kyiv (Friday). */
+    private static final Clock DAY_BEFORE = clockAt("2026-10-02T11:30:00Z");
+
+    private static Clock clockAt(String instant) {
+        return Clock.fixed(Instant.parse(instant), ZoneOffset.UTC);
+    }
+
+    private static NotificationParams reminderParams(Instant startsAt) {
+        return new NotificationParams("Салон Бута", "Манікюр", 1, startsAt, "Салон Бута", null, null, null);
+    }
 
     private static NotificationParams bookingParams(String counterpart, String service, int count) {
         return new NotificationParams(counterpart, service, count, STARTS_AT, "Salon", null, null, null);
@@ -29,6 +42,120 @@ class PushCopyTest {
     void should_haveTitle_when_anyType(InAppNotificationType type) {
         assertThat(PushCopy.title(type, true)).isNotBlank();
         assertThat(PushCopy.title(type, false)).isNotBlank();
+    }
+
+    // ── Phase 495 — BOOKING_REMINDER ─────────────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("BOOKING_REMINDER title equals the mobile ARB «Нагадування про візит»")
+    void should_useReminderTitle_when_bookingReminder() {
+        assertThat(PushCopy.title(InAppNotificationType.BOOKING_REMINDER, true)).isEqualTo(BookingReminderPushExpectedCopy.TITLE);
+    }
+
+    @Test
+    @DisplayName("BOOKING_REMINDER body, visit on the next Kyiv date: service · завтра о Kyiv HH:mm — counterpart")
+    void should_renderTomorrow_when_visitIsNextKyivDay() {
+        NotificationParams params = new NotificationParams(
+                "Салон Бута", "Манікюр", 1, STARTS_AT, "Салон Бута", "Ірина Мельник", null, null);
+
+        String body = PushCopy.body(InAppNotificationType.BOOKING_REMINDER, true, params, DAY_BEFORE);
+
+        assertThat(body).isEqualTo(BookingReminderPushExpectedCopy.body(
+                "Манікюр", BookingReminderPushExpectedCopy.TOMORROW, "14:30", "Салон Бута"));
+    }
+
+    @Test
+    @DisplayName("BOOKING_REMINDER body, visit later the same Kyiv date: «сьогодні»")
+    void should_renderToday_when_visitIsSameKyivDay() {
+        Clock morning = clockAt("2026-10-03T05:00:00Z"); // 08:00 Kyiv, same date as the 14:30 visit
+
+        String body = PushCopy.body(InAppNotificationType.BOOKING_REMINDER, true, reminderParams(STARTS_AT), morning);
+
+        assertThat(body).isEqualTo(BookingReminderPushExpectedCopy.body(
+                "Манікюр", BookingReminderPushExpectedCopy.TODAY, "14:30", "Салон Бута"));
+    }
+
+    @Test
+    @DisplayName("BOOKING_REMINDER body, 23:30 tick → 00:15 visit two Kyiv dates later: the short date, not «завтра»")
+    void should_renderShortDate_when_visitIsTwoKyivDaysAway() {
+        // 2026-11-16 23:30 Kyiv (EET, UTC+2, Monday) → visit 2026-11-18 00:15 Kyiv (Wednesday), 24 h 45 min later.
+        Clock lateTick = clockAt("2026-11-16T21:30:00Z");
+        Instant startsAt = Instant.parse("2026-11-17T22:15:00Z");
+
+        String body = PushCopy.body(InAppNotificationType.BOOKING_REMINDER, true, reminderParams(startsAt), lateTick);
+
+        assertThat(body).isEqualTo(BookingReminderPushExpectedCopy.body(
+                "Манікюр", "ср, 18 листопада", "00:15", "Салон Бута"));
+    }
+
+    @Test
+    @DisplayName("BOOKING_REMINDER body across the autumn DST switch uses Kyiv dates on both sides, not a fixed offset")
+    void should_useKyivDates_when_reminderSpansDstSwitch() {
+        // 2026-10-25 23:30 Kyiv (EET after the 04:00→03:00 switch that night) → visit 2026-10-27 00:15 Kyiv (Tuesday).
+        // A fixed summer +3 offset would read "today" as 10-26 and print «завтра о 01:15».
+        Clock afterSwitch = clockAt("2026-10-25T21:30:00Z");
+        Instant startsAt = Instant.parse("2026-10-26T22:15:00Z");
+
+        String body = PushCopy.body(
+                InAppNotificationType.BOOKING_REMINDER, true, reminderParams(startsAt), afterSwitch);
+
+        assertThat(body).isEqualTo(BookingReminderPushExpectedCopy.body(
+                "Манікюр", "вт, 27 жовтня", "00:15", "Салон Бута"));
+    }
+
+    @Test
+    @DisplayName("BOOKING_REMINDER body without a clock never guesses a relative word: the short date")
+    void should_renderShortDate_when_noClockGiven() {
+        String body = PushCopy.body(InAppNotificationType.BOOKING_REMINDER, true, reminderParams(STARTS_AT));
+
+        assertThat(body).isEqualTo(BookingReminderPushExpectedCopy.body(
+                "Манікюр", "сб, 3 жовтня", "14:30", "Салон Бута"));
+    }
+
+    @Test
+    @DisplayName("BOOKING_REMINDER body in winter (EET, UTC+2) renders Kyiv wall time, not a fixed summer offset")
+    void should_renderKyivWinterTime_when_reminderStartsInWinter() {
+        // 2026-12-05T12:30:00Z == 14:30 in Europe/Kyiv (EET, UTC+2); a fixed +3 offset would print 15:30.
+        NotificationParams params = new NotificationParams(
+                "Салон Бута", "Манікюр", 1, Instant.parse("2026-12-05T12:30:00Z"), "Салон Бута", null, null, null);
+
+        assertThat(PushCopy.body(InAppNotificationType.BOOKING_REMINDER, true, params, clockAt("2026-12-04T12:30:00Z")))
+                .isEqualTo(BookingReminderPushExpectedCopy.body(
+                        "Манікюр", BookingReminderPushExpectedCopy.TOMORROW, "14:30", "Салон Бута"));
+    }
+
+    @Test
+    @DisplayName("BOOKING_REMINDER body never appends «+N» even when the params carry serviceCount > 1")
+    void should_notAppendServiceCount_when_reminderParamsCarryCount() {
+        NotificationParams params = new NotificationParams(
+                "Салон Бута", "Манікюр", 3, STARTS_AT, "Салон Бута", null, null, null);
+
+        assertThat(PushCopy.body(InAppNotificationType.BOOKING_REMINDER, true, params, DAY_BEFORE))
+                .isEqualTo(BookingReminderPushExpectedCopy.body(
+                        "Манікюр", BookingReminderPushExpectedCopy.TOMORROW, "14:30", "Салон Бута"));
+    }
+
+    @Test
+    @DisplayName("BOOKING_REMINDER body never carries a note, phone or e-mail planted in a name")
+    void should_stripContactData_when_reminderNamesCarryIt() {
+        NotificationParams params = new NotificationParams(
+                "Салон www.evil.com", "Манікюр\u0000", 1, STARTS_AT, "Салон", "Ірина", null, null);
+
+        String body = PushCopy.body(InAppNotificationType.BOOKING_REMINDER, true, params, DAY_BEFORE);
+
+        assertThat(body).isEqualTo(BookingReminderPushExpectedCopy.body(
+                        "Манікюр", BookingReminderPushExpectedCopy.TOMORROW, "14:30", "Салон"))
+                .doesNotContain("evil", "@", "+380");
+    }
+
+    @Test
+    @DisplayName("BOOKING_REMINDER with lost access (params null) or a missing start falls back to the generic body")
+    void should_returnGenericBody_when_reminderParamsMissing() {
+        assertThat(PushCopy.body(InAppNotificationType.BOOKING_REMINDER, true, null, DAY_BEFORE))
+                .isEqualTo(PushCopy.GENERIC_BODY);
+        assertThat(PushCopy.body(InAppNotificationType.BOOKING_REMINDER, true,
+                new NotificationParams("Салон", "Манікюр", 1, null, null, null, null, null), DAY_BEFORE))
+                .isEqualTo(PushCopy.GENERIC_BODY);
     }
 
     @Test

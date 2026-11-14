@@ -1404,6 +1404,8 @@ public class AppointmentTransitionService {
             outboxService.enqueueMasterBookingRescheduled(moved.getId(), masterUserIdOf(moved), actorUserId);
         } else {
             outboxService.enqueueBookingRescheduled(moved.getId(), false);
+            // Phase 496 (NTF-49) — the client's own receipt rides its own row (audit-fix cycle 1).
+            outboxService.enqueueClientRescheduleReceipt(moved.getId());
         }
     }
 

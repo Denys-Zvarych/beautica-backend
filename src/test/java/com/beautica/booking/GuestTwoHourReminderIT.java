@@ -1,6 +1,9 @@
 package com.beautica.booking;
 
+import com.beautica.auth.Role;
+import com.beautica.booking.dto.AppointmentItemRescheduleRequest;
 import com.beautica.booking.job.BookingReminderJob;
+import com.beautica.booking.service.AppointmentTransitionService;
 import com.beautica.config.BookingSmsProperties;
 import com.beautica.support.HeldDbLock;
 import com.beautica.support.MutableTestClock;
@@ -47,6 +50,7 @@ class GuestTwoHourReminderIT extends AbstractWalkInBookingSmsIT {
             .atTime(12, 0).atZone(com.beautica.common.TimeZones.KYIV).toInstant();
 
     @Autowired private BookingReminderJob reminderJob;
+    @Autowired private AppointmentTransitionService appointmentTransitionService;
     @Autowired private BookingSmsProperties smsProperties;
     @Autowired private MutableTestClock clock;
     @Autowired private DataSource dataSource;
@@ -188,6 +192,148 @@ class GuestTwoHourReminderIT extends AbstractWalkInBookingSmsIT {
 
         TURBOSMS.verify(0, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
         assertThat(reminded(added)).isFalse();
+    }
+
+    @Test
+    @DisplayName("B493: a per-item-moved visit item is 2h-reminded about its new time and its re-arm marker is cleared")
+    void should_clearRearmMarker_when_movedItemClaimed() throws Exception {
+        UUID appointmentId = insertLinkVisit(at(NOW.plus(Duration.ofMinutes(110))), 2);
+        reminderJob.sweepTwoHour();
+        UUID moved = visitItem(appointmentId, 1);
+        UUID sibling = visitItem(appointmentId, 0);
+        OffsetDateTime newStart = at(NOW.plus(Duration.ofHours(26)));
+        reschedule(appointmentId, moved, newStart);
+        assertThat(rearmed(moved)).as("reschedule sets the re-arm marker").isTrue();
+        resetTurbosms();
+        clock.set(NOW.plus(Duration.ofHours(24)));
+
+        reminderJob.sweepTwoHour();
+        reminderJob.sweepTwoHour();
+
+        assertThat(twoHourReminders()).as("one reminder naming the moved item's NEW time").singleElement()
+                .satisfies(text -> assertThat(text).endsWith(" о " + kyivHhMm(newStart)));
+        assertThat(reminded(moved)).isTrue();
+        assertThat(rearmed(moved)).as("claim clears the re-arm marker").isFalse();
+        assertThat(reminded(sibling)).as("sibling keeps its flag").isTrue();
+        assertThat(rearmed(sibling)).isFalse();
+    }
+
+    @Test
+    @DisplayName("B493: moved item re-reminded once; a service added to the reminded visit still gets no 2h reminder")
+    void should_notRemindAddedSibling_when_movedItemRearmed() throws Exception {
+        UUID appointmentId = insertLinkVisit(at(NOW.plus(Duration.ofMinutes(110))), 2);
+        reminderJob.sweepTwoHour();
+        UUID moved = visitItem(appointmentId, 1);
+        clock.set(NOW.plus(Duration.ofMinutes(60)));
+        OffsetDateTime newStart = at(NOW.plus(Duration.ofMinutes(180)));
+        reschedule(appointmentId, moved, newStart);
+        UUID added = addServiceToVisit(appointmentId, at(NOW.plus(Duration.ofMinutes(200))));
+        resetTurbosms();
+
+        reminderJob.sweepTwoHour();
+
+        assertThat(twoHourReminders()).as("exactly one reminder, for the moved item").singleElement()
+                .satisfies(text -> assertThat(text).endsWith(" о " + kyivHhMm(newStart)));
+        assertThat(reminded(moved)).isTrue();
+        assertThat(reminded(added)).as("added row not swept up by the moved row's claim").isFalse();
+        resetTurbosms();
+        clock.set(NOW.plus(Duration.ofMinutes(80)));
+
+        reminderJob.sweepTwoHour();
+
+        assertThat(twoHourReminders()).isEmpty();
+        assertThat(reminded(added)).as("phase 413: an added service never triggers a second reminder").isFalse();
+    }
+
+    @Test
+    @DisplayName("B493: added service due, moved item not yet due → nothing sent; the moved item keeps its re-arm marker")
+    void should_sendNothingAndKeepRearm_when_addedServiceDueAndMovedItemNotYetDue() throws Exception {
+        UUID appointmentId = insertLinkVisit(at(NOW.plus(Duration.ofMinutes(110))), 2);
+        reminderJob.sweepTwoHour();
+        UUID moved = visitItem(appointmentId, 1);
+        clock.set(NOW.plus(Duration.ofMinutes(60)));
+        OffsetDateTime newStart = at(NOW.plus(Duration.ofHours(26)));
+        reschedule(appointmentId, moved, newStart);
+        UUID added = addServiceToVisit(appointmentId, at(NOW.plus(Duration.ofMinutes(170))));
+        resetTurbosms();
+
+        reminderJob.sweepTwoHour();
+
+        assertThat(twoHourReminders()).as("the added service alone is due → no reminder").isEmpty();
+        assertThat(reminded(added)).isFalse();
+        assertThat(reminded(moved)).as("the not-yet-due moved row is not consumed early").isFalse();
+        assertThat(rearmed(moved)).isTrue();
+        clock.set(NOW.plus(Duration.ofHours(24)));
+
+        reminderJob.sweepTwoHour();
+
+        assertThat(twoHourReminders()).as("the moved row is reminded in its own window").singleElement()
+                .satisfies(text -> assertThat(text).endsWith(" о " + kyivHhMm(newStart)));
+        assertThat(reminded(moved)).isTrue();
+        assertThat(reminded(added)).isFalse();
+    }
+
+    @Test
+    @DisplayName("B493: added service and moved item due in one sweep → one reminder led by the moved item")
+    void should_leadWithMovedItem_when_addedServiceAndMovedItemDueTogether() throws Exception {
+        UUID appointmentId = insertLinkVisit(at(NOW.plus(Duration.ofMinutes(110))), 2);
+        reminderJob.sweepTwoHour();
+        UUID moved = visitItem(appointmentId, 1);
+        clock.set(NOW.plus(Duration.ofMinutes(60)));
+        OffsetDateTime newStart = at(NOW.plus(Duration.ofMinutes(180)));
+        reschedule(appointmentId, moved, newStart);
+        // Earlier than the moved item, so a lead taken from the due rows (not the claimed ones) would name it.
+        OffsetDateTime addedStart = at(NOW.plus(Duration.ofMinutes(166)));
+        UUID added = addServiceToVisit(appointmentId, addedStart);
+        resetTurbosms();
+
+        reminderJob.sweepTwoHour();
+        reminderJob.sweepTwoHour();
+
+        assertThat(twoHourReminders()).as("one reminder, lead = the moved item").singleElement()
+                .satisfies(text -> assertThat(text).endsWith(" о " + kyivHhMm(newStart))
+                        .doesNotContain(" о " + kyivHhMm(addedStart)));
+        assertThat(reminded(moved)).isTrue();
+        assertThat(rearmed(moved)).isFalse();
+        assertThat(reminded(added)).as("phase 413: the added service is not reminded").isFalse();
+    }
+
+    /** The visit's {@code index}-th item by start time. */
+    private UUID visitItem(UUID appointmentId, int index) {
+        return jdbcTemplate.queryForList("SELECT id FROM bookings WHERE appointment_id = ? ORDER BY starts_at",
+                UUID.class, appointmentId).get(index);
+    }
+
+    /** The real per-item move (BOOK-14) the provider makes, through {@code AppointmentTransitionService}. */
+    private void reschedule(UUID appointmentId, UUID bookingId, OffsetDateTime newStart) {
+        asOwner(() -> appointmentTransitionService.rescheduleAppointmentItem(salon.ownerId(), Role.SALON_OWNER,
+                appointmentId, bookingId, new AppointmentItemRescheduleRequest(newStart, false)));
+    }
+
+    /**
+     * A service added to an existing visit. No API adds an item to a visit, so this is the same row shape phase
+     * 413's {@code should_notRemindAgain_when_serviceAddedToRemindedVisit} uses: a fresh LINK row re-parented.
+     */
+    private UUID addServiceToVisit(UUID appointmentId, OffsetDateTime startsAt) {
+        UUID added = insertLinkBooking(startsAt, NOW.minus(Duration.ofDays(1)));
+        jdbcTemplate.update("UPDATE bookings SET appointment_id = ? WHERE id = ?", appointmentId, added);
+        return added;
+    }
+
+    /** 2 h reminder texts only — a reschedule may also send its own (non-reminder) guest SMS. */
+    private List<String> twoHourReminders() {
+        String prefix = salonReminderPrefix("сьогодні");
+        return sentTexts().stream().filter(text -> text.startsWith(prefix)).toList();
+    }
+
+    private boolean rearmed(UUID bookingId) {
+        return Boolean.TRUE.equals(jdbcTemplate.queryForObject(
+                "SELECT reminder_2h_rearmed FROM bookings WHERE id = ?", Boolean.class, bookingId));
+    }
+
+    private static String kyivHhMm(OffsetDateTime instant) {
+        return java.time.format.DateTimeFormatter.ofPattern("HH:mm")
+                .format(instant.atZoneSameInstant(com.beautica.common.TimeZones.KYIV));
     }
 
     @Test
