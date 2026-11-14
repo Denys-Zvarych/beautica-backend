@@ -329,6 +329,36 @@ class BrevoApiOutboxIT extends AbstractIntegrationTest {
     }
 
     /** Minimal booking graph for the visit templates; a real {@link Master} so the display-name branch runs. */
+    @Test
+    @DisplayName("Phase 496 — a CONFIRMED booking's .ics travels the Brevo API as one base64 attachment "
+            + "named beautica-booking.ics whose bytes are the METHOD:REQUEST calendar")
+    void should_sendIcsAsBase64Attachment_when_confirmedEmailOverApi() throws Exception {
+        // Arrange
+        stub(201, "{\"messageId\":\"m\"}");
+        Booking booking = booking();
+        UUID bookingId = UUID.randomUUID();
+        when(booking.getId()).thenReturn(bookingId);
+        when(booking.getStatus()).thenReturn(com.beautica.booking.enums.BookingStatus.CONFIRMED);
+        when(booking.getEndsAt()).thenReturn(OffsetDateTime.of(2026, 11, 3, 11, 0, 0, 0, ZoneOffset.UTC));
+        when(booking.getClient().getEmail()).thenReturn("otp-zq374@beautica.test");
+        EmailNotificationService realEmail =
+                new EmailNotificationService(mailSender, templateEngine, "noreply@beautica.app", mailProperties);
+
+        // Act
+        realEmail.sendBookingConfirmedEmail("otp-zq374@beautica.test", BookingVisit.single(booking));
+
+        // Assert
+        assertThat(BREVO.getAllServeEvents()).singleElement().satisfies(e -> {
+            JsonNode json = JSON.readTree(e.getRequest().getBodyAsString());
+            assertThat(json.get("attachment")).hasSize(1);
+            assertThat(json.at("/attachment/0/name").asText()).isEqualTo(BookingIcsExpectedContent.FILE_NAME);
+            String ics = new String(Base64.getDecoder().decode(json.at("/attachment/0/content").asText()),
+                    java.nio.charset.StandardCharsets.UTF_8);
+            assertThat(BookingIcsExpectedContent.lines(ics)).contains(BookingIcsExpectedContent.METHOD_REQUEST,
+                    BookingIcsExpectedContent.uidLine(bookingId));
+        });
+    }
+
     private static Booking booking() {
         User client = mock(User.class);
         when(client.getFirstName()).thenReturn("Olena");

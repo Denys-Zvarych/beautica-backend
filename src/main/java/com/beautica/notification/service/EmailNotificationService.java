@@ -1,13 +1,20 @@
 package com.beautica.notification.service;
 
+import com.beautica.booking.domain.GuestVisitAddress;
 import com.beautica.booking.entity.Booking;
 import com.beautica.common.util.SchemeGuard;
+import com.beautica.booking.enums.BookingStatus;
 import com.beautica.master.entity.Master;
+import com.beautica.notification.ics.BookingIcs;
+import com.beautica.notification.ics.IcsAttachment;
+import com.beautica.notification.ics.IcsMethod;
 import com.beautica.notification.mail.BrevoPermanentMailException;
 import com.beautica.notification.mail.MailSendFailures;
 import com.beautica.notification.mail.MailTransportProperties;
 import com.beautica.user.User;
 import jakarta.mail.MessagingException;
+import jakarta.mail.internet.AddressException;
+import jakarta.mail.internet.InternetAddress;
 import jakarta.mail.internet.MimeMessage;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -24,9 +31,12 @@ import org.thymeleaf.context.Context;
 import org.thymeleaf.spring6.SpringTemplateEngine;
 
 import java.io.IOException;
+import java.time.Clock;
 import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Locale;
 
 /**
@@ -45,6 +55,8 @@ public class EmailNotificationService {
             DateTimeFormatter.ofPattern("HH:mm, d MMMM yyyy", Locale.forLanguageTag("uk"));
     /** Visit end time in the «(до HH:mm)» suffix — same Kyiv zone as {@link #DATE_FMT}. */
     private static final DateTimeFormatter TIME_FMT = DateTimeFormatter.ofPattern("HH:mm");
+    /** Phase 496 — the day in the receipt subjects, «20 травня» (Kyiv). */
+    private static final DateTimeFormatter DAY_FMT = DateTimeFormatter.ofPattern("d MMMM", Locale.forLanguageTag("uk"));
     private static final int MINUTES_PER_HOUR = 60;
     private static final String LOGO_CID = "beauticaLogo";
     /** Template variable for the header logo {@code src} (Phase 374, D4). */
@@ -99,6 +111,8 @@ public class EmailNotificationService {
     private final String fromAddress;
     /** {@code null} = inline CID logo (SMTP, unchanged); otherwise the hosted https logo URL (Brevo API, D4). */
     private final String hostedLogoUrl;
+    /** Phase 496 — the .ics {@code DTSTAMP} source. */
+    private final Clock clock;
 
     /** Inline CID logo — the pre-Phase-374 behaviour, kept for direct construction in tests. */
     public EmailNotificationService(
@@ -109,18 +123,30 @@ public class EmailNotificationService {
         this(mailSender, templateEngine, fromAddress, null);
     }
 
+    /** Direct construction (tests): the .ics {@code DTSTAMP} reads the system UTC clock. */
+    public EmailNotificationService(
+            JavaMailSender mailSender,
+            SpringTemplateEngine templateEngine,
+            String fromAddress,
+            MailTransportProperties mailProperties
+    ) {
+        this(mailSender, templateEngine, fromAddress, mailProperties, Clock.systemUTC());
+    }
+
     // Explicit constructor — @RequiredArgsConstructor cannot bind @Value defaults.
     @Autowired
     public EmailNotificationService(
             JavaMailSender mailSender,
             SpringTemplateEngine templateEngine,
             @Value("${app.invite.from-email:noreply@beautica.app}") String fromAddress,
-            MailTransportProperties mailProperties
+            MailTransportProperties mailProperties,
+            Clock clock
     ) {
         this.mailSender = mailSender;
         this.templateEngine = templateEngine;
         this.fromAddress = fromAddress;
         this.hostedLogoUrl = mailProperties != null && mailProperties.hostedLogo() ? mailProperties.logoUrl() : null;
+        this.clock = clock;
     }
 
     /** {@code src} of the header logo: the hosted URL when configured, else {@code cid:beauticaLogo}. */
@@ -240,12 +266,48 @@ public class EmailNotificationService {
      * to the client with client-appropriate copy.
      */
     public void sendBookingRescheduledClientEmail(String to, Booking booking) {
+        sendBookingRescheduledClientEmail(to, booking, false);
+    }
+
+    /**
+     * Phase 496 — {@link #sendBookingRescheduledClientEmail(String, Booking)} for either actor. {@code selfAction}
+     * marks the client's own move (NTF-49 receipt): «Ви перенесли запис» copy and the subject
+     * «Beautica: ви перенесли запис на {d MMMM} о {HH:mm}»; {@code false} is the provider-move e-mail, unchanged
+     * except for the .ics. Both carry a REQUEST .ics while the booking is still {@code CONFIRMED} (NTF-50).
+     */
+    public void sendBookingRescheduledClientEmail(String to, Booking booking, boolean selfAction) {
         var ctx = new Context();
         ctx.setVariable("masterName", masterDisplayName(booking));
         ctx.setVariable("clientName", fullName(booking.getClient()));
         ctx.setVariable("serviceName", booking.getMasterService().getServiceDefinition().getName());
         ctx.setVariable("startsAt", formatStartsAt(booking));
-        send(to, "Бронювання перенесено", "email/booking-rescheduled-client", ctx);
+        ctx.setVariable("selfAction", selfAction);
+        String subject = selfAction
+                ? "Beautica: ви перенесли запис на " + receiptDateTime(booking.getStartsAt())
+                : "Бронювання перенесено";
+        send(to, subject, "email/booking-rescheduled-client", ctx, requestIcs(List.of(booking)));
+    }
+
+    /**
+     * Phase 496 (NTF-49) — the registered client's receipt for cancelling ONE booking in the app (NTF-D11): subject
+     * «Beautica: ви скасували запис {d MMMM} о {HH:mm}», template {@code email/booking-cancelled-client}, and a CANCEL
+     * .ics that removes the event the confirmation .ics created. No note is read (NTF-03).
+     */
+    public void sendClientCancelReceiptEmail(String to, Booking booking) {
+        var ctx = new Context();
+        ctx.setVariable("clientName", fullName(booking.getClient()));
+        ctx.setVariable("serviceName", booking.getMasterService().getServiceDefinition().getName());
+        ctx.setVariable("masterName", masterDisplayName(booking));
+        ctx.setVariable("salonName", booking.getSalon() == null ? null : booking.getSalon().getName());
+        ctx.setVariable("startsAt", formatStartsAt(booking));
+        send(to, "Beautica: ви скасували запис " + receiptDateTime(booking.getStartsAt()),
+                "email/booking-cancelled-client", ctx, icsFor(List.of(booking), IcsMethod.CANCEL));
+    }
+
+    /** «20 травня о 10:00» (Kyiv) — the date/time part of the receipt subjects. */
+    static String receiptDateTime(OffsetDateTime startsAt) {
+        var kyiv = startsAt.atZoneSameInstant(KYIV);
+        return kyiv.format(DAY_FMT) + " о " + kyiv.format(TIME_FMT);
     }
 
     /**
@@ -257,7 +319,39 @@ public class EmailNotificationService {
         var ctx = new Context();
         ctx.setVariable("clientName", fullName(visit.lead().getClient()));
         applyVisitVariables(ctx, visit);
-        send(to, "Бронювання підтверджено", "email/booking-confirmed", ctx);
+        // Phase 496 (NTF-50, D1): the first REQUEST — one event per booking of the visit (each its own UID).
+        send(to, "Бронювання підтверджено", "email/booking-confirmed", ctx, requestIcs(visit.items()));
+    }
+
+    /**
+     * Phase 494 (NTF-47) — a registered client's reminder e-mail for ONE booking (NTF-D11): «завтра» copy for
+     * {@link ReminderKind#H24}, «сьогодні» for {@link ReminderKind#H2}, both with the Kyiv start time in the subject.
+     * The body names the service, the master (and salon), the Kyiv date/time and the visit address; every value is
+     * rendered with {@code th:text} (escaped). No booking note is read or passed (NTF-03).
+     *
+     * @param to      the client's e-mail (CR/LF stripped by the shared {@code send} helper)
+     * @param booking the reminded booking, loaded with client, master + user, salon and service definition
+     * @param kind    which reminder
+     */
+    public void sendBookingReminderEmail(String to, Booking booking, ReminderKind kind) {
+        boolean dayBefore = kind == ReminderKind.H24;
+        String address = GuestVisitAddress.of(booking);
+        var ctx = new Context();
+        ctx.setVariable("clientName", fullName(booking.getClient()));
+        ctx.setVariable("dayBefore", dayBefore);
+        ctx.setVariable("serviceName", booking.getMasterService().getServiceDefinition().getName());
+        ctx.setVariable("masterName", masterDisplayName(booking));
+        ctx.setVariable("salonName", booking.getSalon() == null ? null : booking.getSalon().getName());
+        ctx.setVariable("startsAt", formatStartsAt(booking));
+        ctx.setVariable("address", address);
+        ctx.setVariable("locationNote", address == null ? null : GuestVisitAddress.locationNote(booking));
+        send(to, bookingReminderSubject(dayBefore, booking.getStartsAt()), "email/booking-reminder", ctx);
+    }
+
+    /** «Beautica: нагадування — ваш запис завтра|сьогодні о HH:mm» (Kyiv time). */
+    static String bookingReminderSubject(boolean dayBefore, OffsetDateTime startsAt) {
+        return "Beautica: нагадування — ваш запис " + (dayBefore ? "завтра" : "сьогодні") + " о "
+                + startsAt.atZoneSameInstant(KYIV).format(TIME_FMT);
     }
 
     /**
@@ -392,7 +486,8 @@ public class EmailNotificationService {
         ctx.setVariable("serviceNames", visit.serviceNames());
         ctx.setVariable("serviceLabel", visit.isMultiService() ? "Послуги" : "Послуга");
         ctx.setVariable("comment", comment);
-        send(to, "Бронювання скасовано", "email/booking-declined", ctx);
+        // Phase 496 (NTF-50): a CANCEL per declined booking removes the event its confirmation created.
+        send(to, "Бронювання скасовано", "email/booking-declined", ctx, icsFor(visit.items(), IcsMethod.CANCEL));
     }
 
     /**
@@ -528,6 +623,18 @@ public class EmailNotificationService {
     }
 
     private void send(String to, String subject, String template, Context ctx) {
+        send(to, subject, template, ctx, List.of());
+    }
+
+    /**
+     * Phase 496 — {@link #send(String, String, String, Context)} with one .ics attached; {@code null} is the old
+     * behaviour exactly (no attachment part).
+     */
+    void send(String to, String subject, String template, Context ctx, @Nullable IcsAttachment ics) {
+        send(to, subject, template, ctx, ics == null ? List.of() : List.of(ics));
+    }
+
+    private void send(String to, String subject, String template, Context ctx, List<IcsAttachment> icsAttachments) {
         try {
             ctx.setVariable(LOGO_SRC_VARIABLE, logoSrc());
             String html = templateEngine.process(template, ctx);
@@ -535,6 +642,7 @@ public class EmailNotificationService {
             helper.setSubject(subject);
             helper.setText(html, true);
             addLogo(helper);
+            addIcsAttachments(helper, icsAttachments);
             mailSender.send(helper.getMimeMessage());
         } catch (BrevoPermanentMailException ex) {
             // Phase 374 D5: the Brevo API rejected THIS message (bad parameter, unconvertible MIME). Not evidence
@@ -556,6 +664,49 @@ public class EmailNotificationService {
             log.error("Unexpected error sending email [template={}]: {}", template, ex.getClass().getSimpleName());
             // Permanent/local (e.g. template render): fails the row, but is not evidence the relay is down.
             throw new EmailDeliveryException(template, false);
+        }
+    }
+
+    /**
+     * Phase 496 — each .ics as a {@code Content-Disposition: attachment} part of type
+     * {@code text/calendar; charset=UTF-8; method=<METHOD>}. A plain attachment part is what the Brevo API path
+     * ({@code MimeToBrevoPayloadMapper}) forwards as a base64 attachment, so both transports carry it.
+     */
+    private static void addIcsAttachments(MimeMessageHelper helper, List<IcsAttachment> icsAttachments)
+            throws MessagingException {
+        for (int i = 0; i < icsAttachments.size(); i++) {
+            IcsAttachment ics = icsAttachments.get(i);
+            helper.addAttachment(IcsAttachment.fileName(i + 1), new ByteArrayResource(ics.bytes()), ics.contentType());
+        }
+    }
+
+    /** REQUEST .ics for the bookings still {@code CONFIRMED} — a booking cancelled before the drain gets none. */
+    private List<IcsAttachment> requestIcs(List<Booking> bookings) {
+        return icsFor(bookings.stream().filter(b -> b.getStatus() == BookingStatus.CONFIRMED).toList(),
+                IcsMethod.REQUEST);
+    }
+
+    /**
+     * One .ics per booking with a registered client (an account-less booking has no calendar to update). A row with
+     * no id or no times (never a persisted booking) describes no event and gets none — the e-mail still goes out.
+     */
+    private List<IcsAttachment> icsFor(List<Booking> bookings, IcsMethod method) {
+        List<IcsAttachment> result = new ArrayList<>(bookings.size());
+        for (Booking booking : bookings) {
+            if (booking.getClient() != null && booking.getId() != null && booking.getStartsAt() != null
+                    && booking.getEndsAt() != null) {
+                result.add(IcsAttachment.of(BookingIcs.of(booking, organizerAddress(), clock.instant()), method));
+            }
+        }
+        return result;
+    }
+
+    /** The bare address of {@code From} (a «Name &lt;addr&gt;» form is reduced to the addr). */
+    private String organizerAddress() {
+        try {
+            return new InternetAddress(fromAddress).getAddress();
+        } catch (AddressException e) {
+            return fromAddress;
         }
     }
 

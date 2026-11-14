@@ -288,8 +288,8 @@ class BookingAppointmentChildTransitionGuardIT extends AbstractIntegrationTest {
     @Test
     @DisplayName("cancelling the SAME leg twice returns 400 on the replay (the CONFIRMED-status guard, "
             + "same status BookingService#cancelBooking already used for any non-CONFIRMED booking), leaves "
-            + "the leg CANCELLED from the first call, does NOT double-enqueue the STATUS_CHANGED outbox "
-            + "event for that booking, and leaves the header untouched by the replay")
+            + "the leg CANCELLED from the first call, does NOT double-enqueue the outbox "
+            + "rows for that booking, and leaves the header untouched by the replay")
     void should_reject400OnReplay_when_sameLegCancelledTwice() throws Exception {
         Visit visit = createTwoServiceVisit("replay");
         UUID child0 = firstChildOf(visit.id());
@@ -299,9 +299,10 @@ class BookingAppointmentChildTransitionGuardIT extends AbstractIntegrationTest {
         assertThat(first.getStatusCode())
                 .as("the first cancel of the leg must succeed — body: %s", first.getBody())
                 .isEqualTo(HttpStatus.NO_CONTENT);
-        int outboxCountAfterFirst = statusChangedOutboxCount(child0);
-        assertThat(outboxCountAfterFirst).as("the first cancel enqueues exactly one STATUS_CHANGED event")
-                .isEqualTo(1);
+        int outboxCountAfterFirst = outboxRowCount(child0);
+        assertThat(outboxCountAfterFirst)
+                .as("the first cancel enqueues exactly one row per recipient (CLIENT_CANCELLED + CLIENT_CANCEL_RECEIPT)")
+                .isEqualTo(2);
 
         ResponseEntity<String> replay = patch(visit.clientToken(), child0, "cancel",
                 "{\"cancellationReason\":\"CLIENT_CANCELLED\"}");
@@ -311,8 +312,8 @@ class BookingAppointmentChildTransitionGuardIT extends AbstractIntegrationTest {
                         + "guard, not silently accepted or double-processed — body: %s", replay.getBody())
                 .isEqualTo(HttpStatus.BAD_REQUEST);
         assertThat(dbStatus(child0)).as("the leg stays CANCELLED as the first call left it").isEqualTo("CANCELLED");
-        assertThat(statusChangedOutboxCount(child0))
-                .as("the rejected replay must NOT enqueue a second STATUS_CHANGED event")
+        assertThat(outboxRowCount(child0))
+                .as("the rejected replay must NOT enqueue any further outbox row")
                 .isEqualTo(outboxCountAfterFirst);
         assertThat(appointmentStatus(visit.id()))
                 .as("the header is untouched by the rejected replay — the sibling leg still keeps it CONFIRMED")
@@ -551,10 +552,11 @@ class BookingAppointmentChildTransitionGuardIT extends AbstractIntegrationTest {
                 "SELECT appointment_id FROM bookings WHERE id = ?", UUID.class, bookingId);
     }
 
-    /** Count of {@code STATUS_CHANGED} outbox rows enqueued for this specific booking id. */
-    private int statusChangedOutboxCount(UUID bookingId) {
+    /** Count of client-cancel outbox rows (master row + receipt row) enqueued for this specific booking id. */
+    private int outboxRowCount(UUID bookingId) {
         Integer count = jdbcTemplate.queryForObject(
-                "SELECT COUNT(*) FROM notification_outbox WHERE aggregate_id = ? AND event_type = 'STATUS_CHANGED'",
+                "SELECT COUNT(*) FROM notification_outbox WHERE aggregate_id = ? "
+                        + "AND event_type IN ('CLIENT_CANCELLED', 'CLIENT_CANCEL_RECEIPT', 'STATUS_CHANGED')",
                 Integer.class, bookingId);
         return count == null ? 0 : count;
     }

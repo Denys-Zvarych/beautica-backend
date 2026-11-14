@@ -3343,7 +3343,13 @@ public class BookingService {
      */
     private BookingResponse cancelBooking(UUID clientUserId, Booking booking, CancelBookingRequest req) {
         Booking saved = cancelBookingCore(clientUserId, booking, req);
-        outboxService.enqueueStatusChanged(saved.getId());
+        // Phase 496 (NTF-49) — per cancelled booking (BOOK-05, NTF-D11) two rows, one per recipient so each retries
+        // alone (audit-fix cycle 1): CLIENT_CANCELLED → the performing master's e-mail; CLIENT_CANCEL_RECEIPT → the
+        // client's own receipt + CANCEL .ics. The receipt row is written ONLY here — the account-deletion cascade
+        // (cancelBookingForBatch) and the guest paths never write one (D4). The former STATUS_CHANGED row is no longer
+        // written: its CANCELLED branch was a drain no-op (NotificationService#notifyBookingStatusChanged default arm).
+        outboxService.enqueueClientCancelled(saved.getId());
+        outboxService.enqueueClientCancelReceipt(saved.getId());
         // Phase 333, matrix row 2 — provider set (owner + admins + performing master); the CLIENT is
         // the actor and is excluded. Shared by the standalone client-cancel entry point AND
         // cancelAppointmentItem (the per-item client cancel within a visit) — never by
@@ -3367,8 +3373,9 @@ public class BookingService {
      * skips both of the ordinary wrapper's own post-mutation steps, each performed ONCE by the
      * batch caller instead of once per booking:
      * <ul>
-     *   <li>the {@code outboxService.enqueueStatusChanged} call — this batch caller never enqueues
-     *       a per-booking {@code STATUS_CHANGED} row at all; it enqueues exactly one {@code
+     *   <li>the per-booking outbox rows ({@code CLIENT_CANCELLED} + the phase 496
+     *       {@code CLIENT_CANCEL_RECEIPT}) — this batch caller never enqueues a per-booking row at
+     *       all (so never a receipt); it enqueues exactly one {@code
      *       CLIENT_CANCELLED} row per VISIT itself, via {@link #enqueueClientCancelledPerVisit},
      *       after every booking in the cascade has been cancelled. Not writing the per-booking row
      *       in the first place also removes the need to ever delete it afterwards — see {@link
@@ -3883,6 +3890,8 @@ public class BookingService {
             outboxService.enqueueMasterBookingRescheduled(saved.getId(), masterUserIdOf(saved), actorUserId);
         } else {
             outboxService.enqueueBookingRescheduled(saved.getId(), false);
+            // Phase 496 (NTF-49) — the client's own receipt rides its own row (audit-fix cycle 1).
+            outboxService.enqueueClientRescheduleReceipt(saved.getId());
         }
         // Phase 333, matrix row 4 — performing master always (unless actor), plus the other party
         // (client if provider-initiated, owner+admins if client-initiated); walk-ins restrict to the

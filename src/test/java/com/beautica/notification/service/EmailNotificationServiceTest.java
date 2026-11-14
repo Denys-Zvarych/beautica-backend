@@ -4,6 +4,7 @@ import com.beautica.auth.Role;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.master.entity.Master;
+import com.beautica.notification.BookingReminderEmailExpectedCopy;
 import com.beautica.notification.RequestDecisionEmailExpectedCopy;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.ServiceDefinition;
@@ -1498,7 +1499,8 @@ class EmailNotificationServiceTest {
     // Phase 491 — sendRequestDecisionEmail (real Thymeleaf engine: escaping is the point)
     // -------------------------------------------------------------------------
 
-    private MimeMessage sendDecisionWithRealEngine(RequestKind kind, boolean approved, String name, String reason) {
+    /** The real classpath Thymeleaf engine (phase 491; shared with phase 494 when a second suite needed it). */
+    private static SpringTemplateEngine realEngine() {
         var resolver = new org.thymeleaf.templateresolver.ClassLoaderTemplateResolver();
         resolver.setPrefix("templates/");
         resolver.setSuffix(".html");
@@ -1506,9 +1508,13 @@ class EmailNotificationServiceTest {
         resolver.setCharacterEncoding("UTF-8");
         var engine = new SpringTemplateEngine();
         engine.setTemplateResolver(resolver);
+        return engine;
+    }
+
+    private MimeMessage sendDecisionWithRealEngine(RequestKind kind, boolean approved, String name, String reason) {
         MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
         when(mailSender.createMimeMessage()).thenReturn(realMessage);
-        new EmailNotificationService(mailSender, engine, FROM_ADDRESS)
+        new EmailNotificationService(mailSender, realEngine(), FROM_ADDRESS)
                 .sendRequestDecisionEmail("requester@example.com", kind, approved, name, reason);
         verify(mailSender).send(realMessage);
         return realMessage;
@@ -1596,5 +1602,295 @@ class EmailNotificationServiceTest {
 
         assertThat(message.getSubject())
                 .isEqualTo(RequestDecisionEmailExpectedCopy.subject(RequestKind.CATEGORY_REQUEST, true, "Нейл-арт"));
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 494 — sendBookingReminderEmail (real Thymeleaf engine: copy + escaping)
+    // -------------------------------------------------------------------------
+
+    /** 07:30Z on 2 June = 10:30 Kyiv (EEST, UTC+3) — the subject must show Kyiv, not UTC, time. */
+    private static final OffsetDateTime REMINDER_START = OffsetDateTime.parse("2026-06-02T07:30:00Z");
+
+    private MimeMessage sendReminderWithRealEngine(Booking booking, ReminderKind kind) {
+        MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
+        when(mailSender.createMimeMessage()).thenReturn(realMessage);
+        new EmailNotificationService(mailSender, realEngine(), FROM_ADDRESS)
+                .sendBookingReminderEmail("client@example.com", booking, kind);
+        verify(mailSender).send(realMessage);
+        return realMessage;
+    }
+
+    private Booking reminderBooking(String serviceName, com.beautica.salon.entity.Salon salon) {
+        Booking booking = buildBookingMock("Олена", "Коваль", "Марія", "Левченко", serviceName, REMINDER_START);
+        lenient().when(booking.getSalon()).thenReturn(salon);
+        return booking;
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest(name = "{0}")
+    @org.junit.jupiter.params.provider.EnumSource(ReminderKind.class)
+    @DisplayName("Phase 494: the reminder subject names the day and the KYIV start time")
+    void should_setKyivTimeSubject_when_sendBookingReminderEmailCalled(ReminderKind kind) throws Exception {
+        // Act
+        MimeMessage message = sendReminderWithRealEngine(reminderBooking("Манікюр", null), kind);
+
+        // Assert
+        assertThat(message.getSubject()).isEqualTo(BookingReminderEmailExpectedCopy.subject(kind, "10:30"));
+        assertThat(message.getAllRecipients()).extracting(Object::toString).containsExactly("client@example.com");
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest(name = "{0}")
+    @org.junit.jupiter.params.provider.EnumSource(ReminderKind.class)
+    @DisplayName("Phase 494: the body carries the kind's copy, service, master and Kyiv date/time — not the other kind's")
+    void should_renderKindCopyAndDetails_when_sendBookingReminderEmailCalled(ReminderKind kind) throws Exception {
+        // Arrange
+        ReminderKind other = kind == ReminderKind.H24 ? ReminderKind.H2 : ReminderKind.H24;
+
+        // Act
+        String html = htmlOf(sendReminderWithRealEngine(reminderBooking("Манікюр", null), kind));
+
+        // Assert
+        assertThat(html)
+                .contains(BookingReminderEmailExpectedCopy.heading(kind))
+                .contains(BookingReminderEmailExpectedCopy.leadLine(kind))
+                .doesNotContain(BookingReminderEmailExpectedCopy.heading(other))
+                .contains("Манікюр", "Марія Левченко", "Олена Коваль", "10:30, 2 червня 2026");
+    }
+
+    @Test
+    @DisplayName("Phase 494: provider-authored text (service, salon, address) is HTML-escaped, never markup")
+    void should_escapeProviderText_when_sendBookingReminderEmailCalled() throws Exception {
+        // Arrange
+        com.beautica.salon.entity.Salon salon = mock(com.beautica.salon.entity.Salon.class);
+        when(salon.getName()).thenReturn("Salon <b>X</b>");
+        when(salon.getStreet()).thenReturn("Хрещатик <img src=x>");
+        when(salon.getBuildingNo()).thenReturn("10");
+        Booking booking = reminderBooking("<script>alert(1)</script>", salon);
+
+        // Act
+        String html = htmlOf(sendReminderWithRealEngine(booking, ReminderKind.H24));
+
+        // Assert
+        assertThat(html)
+                .doesNotContain("<script>", "<b>X</b>", "<img src=x>")
+                .contains("&lt;script&gt;alert(1)&lt;/script&gt;", "Salon &lt;b&gt;X&lt;/b&gt;",
+                        "Хрещатик &lt;img src=x&gt; 10");
+    }
+
+    @Test
+    @DisplayName("Phase 494: no salon and no address → the Салон and Адреса rows are omitted")
+    void should_omitSalonAndAddressRows_when_noneKnown() throws Exception {
+        // Act
+        String html = htmlOf(sendReminderWithRealEngine(reminderBooking("Манікюр", null), ReminderKind.H2));
+
+        // Assert
+        assertThat(html).doesNotContain("Салон", "Адреса", "Як знайти");
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 496 — .ics attachments + registered-client receipts (NTF-49, NTF-50)
+    // -------------------------------------------------------------------------
+
+    /** 07:00Z on 20 May = 10:00 Kyiv (EEST, UTC+3). */
+    private static final OffsetDateTime ICS_START = OffsetDateTime.parse("2026-05-20T07:00:00Z");
+    private static final java.time.Instant ICS_NOW = java.time.Instant.parse("2026-05-01T09:30:15Z");
+    private static final java.time.Instant ICS_UPDATED_AT = java.time.Instant.parse("2026-01-01T00:01:40Z");
+    private static final String ICS_CLIENT_EMAIL = "olena@example.com";
+
+    private EmailNotificationService icsService() {
+        return new EmailNotificationService(mailSender, realEngine(), FROM_ADDRESS, null,
+                java.time.Clock.fixed(ICS_NOW, ZoneOffset.UTC));
+    }
+
+    private MimeMessage stubRealMessage() {
+        MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
+        when(mailSender.createMimeMessage()).thenReturn(realMessage);
+        return realMessage;
+    }
+
+    /** A complete booking mock, as the drain's graph load hands it over: id, times, status, client, updatedAt. */
+    private Booking icsBooking(String serviceName, OffsetDateTime startsAt, BookingStatus status) {
+        Booking booking = buildBookingMock("Олена", "Коваль", "Марія", "Левченко", serviceName, startsAt);
+        User client = booking.getClient();
+        lenient().when(client.getEmail()).thenReturn(ICS_CLIENT_EMAIL);
+        lenient().when(booking.getId()).thenReturn(java.util.UUID.randomUUID());
+        lenient().when(booking.getEndsAt()).thenReturn(startsAt.plusMinutes(60));
+        lenient().when(booking.getStatus()).thenReturn(status);
+        lenient().when(booking.getUpdatedAt()).thenReturn(ICS_UPDATED_AT);
+        return booking;
+    }
+
+    private static List<jakarta.mail.Part> attachmentsOf(MimeMessage message) throws Exception {
+        return com.beautica.support.MimeMessageBodies.attachmentsOf(message);
+    }
+
+    private static String icsText(jakarta.mail.Part part) throws Exception {
+        return com.beautica.support.MimeMessageBodies.textOf(part);
+    }
+
+    @Test
+    @DisplayName("Phase 496: booking-confirmed carries ONE REQUEST .ics — text/calendar; method=REQUEST, beautica-booking.ics")
+    void should_attachRequestIcs_when_sendBookingConfirmedEmailCalled() throws Exception {
+        // Arrange
+        MimeMessage message = stubRealMessage();
+        Booking booking = icsBooking("Манікюр", ICS_START, BookingStatus.CONFIRMED);
+
+        // Act
+        icsService().sendBookingConfirmedEmail(ICS_CLIENT_EMAIL, BookingVisit.single(booking));
+
+        // Assert
+        assertThat(message.getSubject()).isEqualTo(com.beautica.notification.ClientReceiptEmailExpectedCopy.CONFIRMED_SUBJECT);
+        List<jakarta.mail.Part> attachments = attachmentsOf(message);
+        assertThat(attachments).hasSize(1);
+        jakarta.mail.Part part = attachments.get(0);
+        assertThat(part.getFileName()).isEqualTo(com.beautica.notification.BookingIcsExpectedContent.FILE_NAME);
+        assertThat(part.getContentType()).startsWith(com.beautica.notification.BookingIcsExpectedContent.CONTENT_TYPE_PREFIX)
+                .containsIgnoringCase("method=REQUEST").containsIgnoringCase("charset=UTF-8");
+        String ics = icsText(part);
+        assertThat(com.beautica.notification.BookingIcsExpectedContent.lines(ics)).contains(
+                com.beautica.notification.BookingIcsExpectedContent.METHOD_REQUEST,
+                com.beautica.notification.BookingIcsExpectedContent.uidLine(booking.getId()),
+                com.beautica.notification.BookingIcsExpectedContent.ORGANIZER_PREFIX + FROM_ADDRESS,
+                "DTSTAMP:20260501T093015Z", "DTSTART:20260520T070000Z", "DTEND:20260520T080000Z", "SEQUENCE:100");
+        assertThat(com.beautica.notification.BookingIcsExpectedContent.property(ics, "ATTENDEE"))
+                .hasValue("mailto:" + ICS_CLIENT_EMAIL);
+    }
+
+    @Test
+    @DisplayName("Phase 496: a two-service confirmed visit gets one REQUEST .ics per booking (own UID each)")
+    void should_attachOneIcsPerBooking_when_confirmedVisitHasTwoServices() throws Exception {
+        // Arrange
+        MimeMessage message = stubRealMessage();
+        Booking lead = icsBooking("Манікюр", ICS_START, BookingStatus.CONFIRMED);
+        Booking second = icsBooking("Педикюр", ICS_START.plusMinutes(60), BookingStatus.CONFIRMED);
+        lenient().when(lead.getDurationMinutesAtBooking()).thenReturn(60);
+        lenient().when(second.getDurationMinutesAtBooking()).thenReturn(60);
+
+        // Act
+        icsService().sendBookingConfirmedEmail(ICS_CLIENT_EMAIL, BookingVisit.of(lead, List.of(lead, second)));
+
+        // Assert
+        List<jakarta.mail.Part> attachments = attachmentsOf(message);
+        assertThat(attachments).extracting(jakarta.mail.Part::getFileName).containsExactly(
+                com.beautica.notification.BookingIcsExpectedContent.FILE_NAME,
+                com.beautica.notification.BookingIcsExpectedContent.SECOND_FILE_NAME);
+        assertThat(icsText(attachments.get(0))).contains(com.beautica.notification.BookingIcsExpectedContent.uidLine(lead.getId()));
+        assertThat(icsText(attachments.get(1))).contains(com.beautica.notification.BookingIcsExpectedContent.uidLine(second.getId()));
+    }
+
+    @Test
+    @DisplayName("Phase 496: booking-declined carries a CANCEL .ics — method=CANCEL, STATUS:CANCELLED")
+    void should_attachCancelIcs_when_sendBookingDeclinedEmailCalled() throws Exception {
+        // Arrange
+        MimeMessage message = stubRealMessage();
+        Booking booking = icsBooking("Манікюр", ICS_START, BookingStatus.DECLINED);
+
+        // Act
+        icsService().sendBookingDeclinedEmail(ICS_CLIENT_EMAIL, booking);
+
+        // Assert
+        assertThat(message.getSubject()).isEqualTo(com.beautica.notification.ClientReceiptEmailExpectedCopy.DECLINED_SUBJECT);
+        List<jakarta.mail.Part> attachments = attachmentsOf(message);
+        assertThat(attachments).singleElement().satisfies(part ->
+                assertThat(part.getContentType()).containsIgnoringCase("method=CANCEL"));
+        assertThat(com.beautica.notification.BookingIcsExpectedContent.lines(icsText(attachments.get(0)))).contains(
+                com.beautica.notification.BookingIcsExpectedContent.METHOD_CANCEL,
+                com.beautica.notification.BookingIcsExpectedContent.STATUS_CANCELLED);
+    }
+
+    @Test
+    @DisplayName("Phase 496: send(..., null attachment) is the old behaviour — no attachment part at all")
+    void should_sendWithoutAttachment_when_icsAttachmentNull() throws Exception {
+        // Arrange
+        MimeMessage message = stubRealMessage();
+        when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>x</html>");
+
+        // Act
+        service.send("someone@example.com", "Тема", "email/anything", new Context(),
+                (com.beautica.notification.ics.IcsAttachment) null);
+
+        // Assert
+        verify(mailSender).send(message);
+        assertThat(attachmentsOf(message)).isEmpty();
+    }
+
+    @Test
+    @DisplayName("Phase 496: the client's own reschedule → «ви перенесли запис на …» subject, «Ви перенесли запис» copy, REQUEST .ics")
+    void should_sendSelfRescheduleReceipt_when_selfActionTrue() throws Exception {
+        // Arrange
+        MimeMessage message = stubRealMessage();
+        Booking booking = icsBooking("Манікюр", ICS_START, BookingStatus.CONFIRMED);
+
+        // Act
+        icsService().sendBookingRescheduledClientEmail(ICS_CLIENT_EMAIL, booking, true);
+
+        // Assert
+        assertThat(message.getSubject()).isEqualTo(
+                com.beautica.notification.ClientReceiptEmailExpectedCopy.selfRescheduleSubject("20 травня", "10:00"));
+        assertThat(htmlOf(message))
+                .contains(com.beautica.notification.ClientReceiptEmailExpectedCopy.SELF_RESCHEDULE_HEADING,
+                        com.beautica.notification.ClientReceiptEmailExpectedCopy.SELF_RESCHEDULE_LEAD)
+                .doesNotContain(com.beautica.notification.ClientReceiptEmailExpectedCopy.PROVIDER_RESCHEDULE_LEAD);
+        assertThat(attachmentsOf(message)).singleElement().satisfies(part ->
+                assertThat(part.getContentType()).containsIgnoringCase("method=REQUEST"));
+    }
+
+    @Test
+    @DisplayName("Phase 496: a provider move keeps its subject and copy, now with a REQUEST .ics")
+    void should_keepProviderCopyAndAttachIcs_when_selfActionFalse() throws Exception {
+        // Arrange
+        MimeMessage message = stubRealMessage();
+        Booking booking = icsBooking("Манікюр", ICS_START, BookingStatus.CONFIRMED);
+
+        // Act
+        icsService().sendBookingRescheduledClientEmail(ICS_CLIENT_EMAIL, booking);
+
+        // Assert
+        assertThat(message.getSubject())
+                .isEqualTo(com.beautica.notification.ClientReceiptEmailExpectedCopy.PROVIDER_RESCHEDULE_SUBJECT);
+        assertThat(htmlOf(message)).contains(com.beautica.notification.ClientReceiptEmailExpectedCopy.PROVIDER_RESCHEDULE_LEAD)
+                .doesNotContain(com.beautica.notification.ClientReceiptEmailExpectedCopy.SELF_RESCHEDULE_LEAD);
+        assertThat(attachmentsOf(message)).hasSize(1);
+    }
+
+    @Test
+    @DisplayName("Phase 496: a booking no longer CONFIRMED at drain time gets no REQUEST .ics (the e-mail still goes out)")
+    void should_omitRequestIcs_when_bookingNoLongerConfirmed() throws Exception {
+        // Arrange
+        MimeMessage message = stubRealMessage();
+        Booking booking = icsBooking("Манікюр", ICS_START, BookingStatus.CANCELLED);
+
+        // Act
+        icsService().sendBookingRescheduledClientEmail(ICS_CLIENT_EMAIL, booking);
+
+        // Assert
+        verify(mailSender).send(message);
+        assertThat(attachmentsOf(message)).isEmpty();
+    }
+
+    @Test
+    @DisplayName("Phase 496: the cancel receipt → «ви скасували запис …» subject, its template copy, CANCEL .ics, no note")
+    void should_sendCancelReceiptWithCancelIcs_when_sendClientCancelReceiptEmailCalled() throws Exception {
+        // Arrange
+        MimeMessage message = stubRealMessage();
+        Booking booking = icsBooking("Манікюр", ICS_START, BookingStatus.CANCELLED);
+        lenient().when(booking.getClientCancellationNote()).thenReturn("SENTINEL-NOTE");
+        lenient().when(booking.getClientComment()).thenReturn("SENTINEL-COMMENT");
+
+        // Act
+        icsService().sendClientCancelReceiptEmail(ICS_CLIENT_EMAIL, booking);
+
+        // Assert
+        assertThat(message.getSubject()).isEqualTo(
+                com.beautica.notification.ClientReceiptEmailExpectedCopy.cancelReceiptSubject("20 травня", "10:00"));
+        assertThat(message.getAllRecipients()).extracting(Object::toString).containsExactly(ICS_CLIENT_EMAIL);
+        assertThat(htmlOf(message))
+                .contains(com.beautica.notification.ClientReceiptEmailExpectedCopy.CANCEL_HEADING,
+                        com.beautica.notification.ClientReceiptEmailExpectedCopy.CANCEL_LEAD,
+                        "Манікюр", "Марія Левченко", "10:00, 20 травня 2026")
+                .doesNotContain("SENTINEL-NOTE", "SENTINEL-COMMENT");
+        List<jakarta.mail.Part> attachments = attachmentsOf(message);
+        assertThat(attachments).singleElement().satisfies(part ->
+                assertThat(part.getContentType()).containsIgnoringCase("method=CANCEL"));
+        assertThat(icsText(attachments.get(0))).doesNotContain("SENTINEL");
     }
 }
