@@ -3829,7 +3829,11 @@ public class BookingService {
             // vs resolveBookingForClientReschedule and validateStartsAt above — reused here rather
             // than threading a new parameter.
             if (initiatedByProvider || !req.allowClientOverlap()) {
-                assertNoClientConflictExcluding(owningClient.getId(), newStartsAt, newEndsAt, bookingId);
+                // Provider actor → redacted 409 body (window only): the scan spans every salon, so
+                // the conflicting row may be the client's booking at a competitor (mobile-security
+                // HIGH, 2026-11-14).
+                assertNoClientConflictExcluding(
+                        owningClient.getId(), newStartsAt, newEndsAt, bookingId, initiatedByProvider);
             }
             // acquireClientLock already fused the transaction-scoped lock_timeout — reuse the
             // plain (untimed-fuse) master lock, same as every other call site that took the
@@ -4279,7 +4283,7 @@ public class BookingService {
     private void assertNoClientConflict(UUID clientId, OffsetDateTime startsAt, OffsetDateTime endsAt) {
         bookingRepository.findFirstConflictingClientBookingId(clientId, startsAt, endsAt)
                 .ifPresent(conflictId -> {
-                    throw clientConflictException(conflictId);
+                    throw clientConflictException(conflictId, false);
                 });
     }
 
@@ -4288,20 +4292,19 @@ public class BookingService {
      * its own conflict scan, so a booking never collides with itself when only its time moves.
      */
     private void assertNoClientConflictExcluding(
-            UUID clientId, OffsetDateTime startsAt, OffsetDateTime endsAt, UUID excludeBookingId) {
+            UUID clientId, OffsetDateTime startsAt, OffsetDateTime endsAt, UUID excludeBookingId,
+            boolean initiatedByProvider) {
         bookingRepository.findFirstConflictingClientBookingIdExcluding(clientId, startsAt, endsAt, excludeBookingId)
                 .ifPresent(conflictId -> {
-                    throw clientConflictException(conflictId);
+                    throw clientConflictException(conflictId, initiatedByProvider);
                 });
     }
 
     /**
-     * Re-hydrated with the full association graph (client/master/masterService/
-     * serviceDefinition) so the exception can read service name + master display name
-     * without triggering a lazy load. The row was just found by the query above in this
-     * same transaction, so it is guaranteed to still exist.
+     * Delegates to {@link ClientBookingConflicts#build}: client path re-hydrates the full graph
+     * (service name + master display name); provider path reads only the window (redacted body).
      *
-     * <p><b>Lock-window note (backend-perf audit):</b> this JOIN FETCH runs while the CLIENT
+     * <p><b>Lock-window note (backend-perf audit):</b> this read runs while the CLIENT
      * advisory lock is still held — {@code pg_advisory_xact_lock} releases only at
      * commit/rollback, so it cannot be dropped mid-transaction before throwing. The
      * client-then-master reorder already shrank this window versus the prior master-then-client
@@ -4311,11 +4314,9 @@ public class BookingService {
      * per-master lock other clients may be waiting on. The fetch itself only runs on the rare
      * conflict path (never on the common success path), so its cost is bounded to that case.
      */
-    private ClientBookingConflictException clientConflictException(UUID conflictingBookingId) {
-        Booking conflict = bookingRepository.findByIdWithFullGraph(conflictingBookingId)
-                .orElseThrow(() -> new BusinessException(
-                        HttpStatus.INTERNAL_SERVER_ERROR, "Conflicting booking could not be loaded"));
-        return new ClientBookingConflictException(conflict);
+    private ClientBookingConflictException clientConflictException(
+            UUID conflictingBookingId, boolean initiatedByProvider) {
+        return ClientBookingConflicts.build(bookingRepository, conflictingBookingId, initiatedByProvider);
     }
 
     /** Discovery/catalogue salon id for a booking: the booked salon, or null for an independent master. */

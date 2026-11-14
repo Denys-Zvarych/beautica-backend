@@ -171,6 +171,21 @@ public class BookingTestFixtures {
         return masterId;
     }
 
+    /**
+     * Gives a seeded master's {@code users} row a random first/last name and returns the display name
+     * ({@code "first last"}) the API renders. Every {@code create*Master} factory here leaves the names
+     * NULL, so a {@code masterName} assertion against them can only ever compare {@code ""} — this makes
+     * such an assertion able to fail (added for {@code ClientConflictOverrideIT}, backend-qa LOW 2026-11-14).
+     */
+    public String nameMaster(UUID masterId) {
+        String firstName = "fn" + UUID.randomUUID().toString().substring(0, 8);
+        String lastName = "ln" + UUID.randomUUID().toString().substring(0, 8);
+        jdbcTemplate.update(
+                "UPDATE users SET first_name = ?, last_name = ? WHERE id = (SELECT user_id FROM masters WHERE id = ?)",
+                firstName, lastName, masterId);
+        return firstName + " " + lastName;
+    }
+
     public UUID createIndependentMasterService(UUID masterId) {
         return createIndependentMasterService(masterId, "Test Service");
     }

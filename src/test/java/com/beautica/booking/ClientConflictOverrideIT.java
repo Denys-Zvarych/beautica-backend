@@ -7,11 +7,13 @@ import com.beautica.booking.dto.AppointmentItemRescheduleRequest;
 import com.beautica.booking.dto.CreateBookingRequest;
 import com.beautica.booking.dto.RescheduleBookingRequest;
 import com.beautica.common.TimeZones;
+import com.beautica.common.exception.ClientBookingConflictException;
 import com.beautica.config.TestSecurityConfig;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.time.OffsetDateTime;
 import java.time.ZonedDateTime;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -346,6 +348,7 @@ class ClientConflictOverrideIT extends AbstractIntegrationTest {
                 .as("must be the client-conflict code — proves the guard actually ran rather than "
                         + "failing for an unrelated reason")
                 .isEqualTo("CLIENT_BOOKING_CONFLICT");
+        assertProviderRedactedBody(body, slotT1);
 
         OffsetDateTime persistedStartsAt = jdbcTemplate.queryForObject(
                 "SELECT starts_at FROM bookings WHERE id = ?", OffsetDateTime.class, bookingBId);
@@ -425,11 +428,241 @@ class ClientConflictOverrideIT extends AbstractIntegrationTest {
                 .as("must be the client-conflict code — proves the guard actually ran rather than "
                         + "failing for an unrelated reason")
                 .isEqualTo("CLIENT_BOOKING_CONFLICT");
+        assertProviderRedactedBody(body, slotT1);
 
         OffsetDateTime persistedStartsAt = jdbcTemplate.queryForObject(
                 "SELECT starts_at FROM bookings WHERE id = ?", OffsetDateTime.class, itemBookingId);
         assertThat(persistedStartsAt.toInstant())
                 .as("the rejected provider reschedule must leave the item at its ORIGINAL time")
                 .isEqualTo(slotT2.toOffsetDateTime().toInstant());
+    }
+
+    // ── REDACTION — client-initiated reschedule keeps the FULL body (mobile-security HIGH, 2026-11-14) ──
+
+    @Test
+    @DisplayName("RESCHEDULE — CLIENT-initiated 409 CLIENT_BOOKING_CONFLICT keeps the full body "
+            + "(conflictingBookingId, serviceName, masterName + window); only provider requests are redacted")
+    void should_returnFullConflictBody_when_clientReschedulesIntoOwnOverlap() throws Exception {
+        String clientEmail = "cco-redact-client-" + System.nanoTime() + "@beautica.test";
+        fixtures.createUser(clientEmail, "CLIENT", null);
+        String clientToken = fixtures.tokenFor(clientEmail);
+        UUID masterAId = fixtures.createIndependentMaster("cco-redact-masterA-" + System.nanoTime() + "@beautica.test");
+        String serviceAName = "svc-" + UUID.randomUUID();
+        UUID masterAServiceId = fixtures.createIndependentMasterService(masterAId, serviceAName);
+        String masterAName = fixtures.nameMaster(masterAId);
+        fixtures.addWorkingHoursForEveryDay(masterAId);
+        UUID masterBId = fixtures.createIndependentMaster("cco-redact-masterB-" + System.nanoTime() + "@beautica.test");
+        UUID masterBServiceId = fixtures.createIndependentMasterService(masterBId);
+        fixtures.addWorkingHoursForEveryDay(masterBId);
+        ZonedDateTime slotT1 = ZonedDateTime.now(TimeZones.KYIV).plusDays(2)
+                .withHour(10).withMinute(0).withSecond(0).withNano(0);
+        UUID bookingAId = createBooking(clientToken, masterAId, masterAServiceId, slotT1);
+        UUID bookingBId = createBooking(clientToken, masterBId, masterBServiceId, slotT1.plusHours(4));
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                BOOKINGS_URL + "/" + bookingBId + "/reschedule", HttpMethod.PATCH,
+                new HttpEntity<>(new RescheduleBookingRequest(slotT1.toOffsetDateTime(), false),
+                        fixtures.bearerHeaders(clientToken)), String.class);
+
+        assertThat(response.getStatusCode()).as("body: %s", response.getBody()).isEqualTo(HttpStatus.CONFLICT);
+        assertClientFullBody(objectMapper.readTree(response.getBody()), bookingAId, slotT1, serviceAName, masterAName);
+    }
+
+    @Test
+    @DisplayName("RESCHEDULE ITEM — CLIENT-initiated 409 CLIENT_BOOKING_CONFLICT keeps the full body "
+            + "(conflictingBookingId, serviceName, masterName + window); only provider requests are redacted")
+    void should_returnFullConflictBody_when_clientReschedulesItemIntoOwnOverlap() throws Exception {
+        String clientEmail = "cco-redact-item-client-" + System.nanoTime() + "@beautica.test";
+        fixtures.createUser(clientEmail, "CLIENT", null);
+        String clientToken = fixtures.tokenFor(clientEmail);
+        UUID masterAId = fixtures.createIndependentMaster(
+                "cco-redact-item-masterA-" + System.nanoTime() + "@beautica.test");
+        String serviceAName = "svc-" + UUID.randomUUID();
+        UUID masterAServiceId = fixtures.createIndependentMasterService(masterAId, serviceAName);
+        String masterAName = fixtures.nameMaster(masterAId);
+        fixtures.addWorkingHoursForEveryDay(masterAId);
+        UUID masterBId = fixtures.createIndependentMaster(
+                "cco-redact-item-masterB-" + System.nanoTime() + "@beautica.test");
+        UUID masterBServiceId = fixtures.createIndependentMasterService(masterBId);
+        fixtures.addWorkingHoursForEveryDay(masterBId);
+        ZonedDateTime slotT1 = ZonedDateTime.now(TimeZones.KYIV).plusDays(2)
+                .withHour(10).withMinute(0).withSecond(0).withNano(0);
+        UUID bookingAId = createBooking(clientToken, masterAId, masterAServiceId, slotT1);
+        String visitBody = objectMapper.writeValueAsString(Map.of(
+                "masterId", masterBId.toString(),
+                "masterServiceIds", List.of(masterBServiceId.toString()),
+                "startsAt", slotT1.plusHours(4).toOffsetDateTime().toString()));
+        ResponseEntity<String> visitResponse = restTemplate.exchange(
+                APPOINTMENTS_URL, HttpMethod.POST,
+                new HttpEntity<>(visitBody, fixtures.bearerHeaders(clientToken)), String.class);
+        assertThat(visitResponse.getStatusCode())
+                .as("setup: visit on master B — body: %s", visitResponse.getBody())
+                .isEqualTo(HttpStatus.CREATED);
+        JsonNode visitData = objectMapper.readTree(visitResponse.getBody()).path("data");
+        UUID appointmentId = UUID.fromString(visitData.path("id").asText());
+        UUID itemBookingId = UUID.fromString(visitData.path("items").get(0).path("bookingId").asText());
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                APPOINTMENTS_URL + "/" + appointmentId + "/services/" + itemBookingId + "/reschedule",
+                HttpMethod.PATCH,
+                new HttpEntity<>(new AppointmentItemRescheduleRequest(slotT1.toOffsetDateTime(), false),
+                        fixtures.bearerHeaders(clientToken)), String.class);
+
+        assertThat(response.getStatusCode()).as("body: %s", response.getBody()).isEqualTo(HttpStatus.CONFLICT);
+        assertClientFullBody(objectMapper.readTree(response.getBody()), bookingAId, slotT1, serviceAName, masterAName);
+    }
+
+    // ── REDACTION — the real leak: the client's conflicting booking is at a COMPETING salon (BOOK-74/75) ──
+
+    @Test
+    @DisplayName("RESCHEDULE — SALON_OWNER of salon B hits the client's booking at competing salon A: "
+            + "409 body is code + window ONLY; salon A's booking id, master, salon and service never appear")
+    void should_returnWindowOnlyBody_when_salonOwnerReschedulesIntoClientsBookingAtCompetingSalon()
+            throws Exception {
+        CrossSalonSetup s = crossSalonSetup("cco-xs-owner");
+        UUID bookingBId = createBooking(s.clientToken(), s.salonB().masterId(), s.salonBServiceId(), s.slotT2());
+        String ownerBToken = fixtures.tokenFor(s.salonB().ownerEmail());
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                BOOKINGS_URL + "/" + bookingBId + "/reschedule", HttpMethod.PATCH,
+                new HttpEntity<>(new RescheduleBookingRequest(s.slotT1().toOffsetDateTime(), false),
+                        fixtures.bearerHeaders(ownerBToken)), String.class);
+
+        assertThat(response.getStatusCode()).as("body: %s", response.getBody()).isEqualTo(HttpStatus.CONFLICT);
+        assertNoCompetitorLeak(response.getBody(), s);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT starts_at FROM bookings WHERE id = ?", OffsetDateTime.class, bookingBId).toInstant())
+                .as("rejected reschedule leaves salon B's booking at its original time")
+                .isEqualTo(s.slotT2().toInstant());
+    }
+
+    @Test
+    @DisplayName("RESCHEDULE ITEM — SALON_ADMIN of salon B hits the client's booking at competing salon A: "
+            + "409 body is code + window ONLY; salon A's booking id, master, salon and service never appear")
+    void should_returnWindowOnlyBody_when_salonAdminReschedulesItemIntoClientsBookingAtCompetingSalon()
+            throws Exception {
+        CrossSalonSetup s = crossSalonSetup("cco-xs-admin");
+        String visitBody = objectMapper.writeValueAsString(Map.of(
+                "masterId", s.salonB().masterId().toString(),
+                "masterServiceIds", List.of(s.salonBServiceId().toString()),
+                "startsAt", s.slotT2().toOffsetDateTime().toString()));
+        ResponseEntity<String> visitResponse = restTemplate.exchange(
+                APPOINTMENTS_URL, HttpMethod.POST,
+                new HttpEntity<>(visitBody, fixtures.bearerHeaders(s.clientToken())), String.class);
+        assertThat(visitResponse.getStatusCode())
+                .as("setup: visit at salon B — body: %s", visitResponse.getBody())
+                .isEqualTo(HttpStatus.CREATED);
+        JsonNode visitData = objectMapper.readTree(visitResponse.getBody()).path("data");
+        UUID appointmentId = UUID.fromString(visitData.path("id").asText());
+        UUID itemBookingId = UUID.fromString(visitData.path("items").get(0).path("bookingId").asText());
+        String adminEmail = "cco-xs-admin-b-" + System.nanoTime() + "@beautica.test";
+        fixtures.createUser(adminEmail, "SALON_ADMIN", s.salonB().salonId());
+        String adminBToken = fixtures.tokenFor(adminEmail);
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                APPOINTMENTS_URL + "/" + appointmentId + "/services/" + itemBookingId + "/reschedule",
+                HttpMethod.PATCH,
+                new HttpEntity<>(new AppointmentItemRescheduleRequest(s.slotT1().toOffsetDateTime(), false),
+                        fixtures.bearerHeaders(adminBToken)), String.class);
+
+        assertThat(response.getStatusCode()).as("body: %s", response.getBody()).isEqualTo(HttpStatus.CONFLICT);
+        assertNoCompetitorLeak(response.getBody(), s);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT starts_at FROM bookings WHERE id = ?", OffsetDateTime.class, itemBookingId).toInstant())
+                .as("rejected reschedule leaves salon B's item at its original time")
+                .isEqualTo(s.slotT2().toInstant());
+    }
+
+    /** Client + competing salon A (client booked at T1) + salon B (provider side), both bookable. */
+    private record CrossSalonSetup(String clientToken, BookingTestFixtures.SalonFixture salonA,
+            UUID competitorBookingId, BookingTestFixtures.SalonFixture salonB, UUID salonBServiceId,
+            ZonedDateTime slotT1, ZonedDateTime slotT2) {
+    }
+
+    private CrossSalonSetup crossSalonSetup(String prefix) throws Exception {
+        String clientEmail = prefix + "-client-" + System.nanoTime() + "@beautica.test";
+        fixtures.createUser(clientEmail, "CLIENT", null);
+        String clientToken = fixtures.tokenFor(clientEmail);
+        BookingTestFixtures.SalonFixture salonA =
+                fixtures.createSalon(prefix + "-owner-a-" + System.nanoTime() + "@beautica.test");
+        UUID salonAServiceId = fixtures.createSalonService(salonA.salonId(), salonA.masterId());
+        fixtures.addWorkingHoursForEveryDay(salonA.masterId());
+        BookingTestFixtures.SalonFixture salonB =
+                fixtures.createSalon(prefix + "-owner-b-" + System.nanoTime() + "@beautica.test");
+        UUID salonBServiceId = fixtures.createSalonService(salonB.salonId(), salonB.masterId());
+        fixtures.addWorkingHoursForEveryDay(salonB.masterId());
+        ZonedDateTime slotT1 = ZonedDateTime.now(TimeZones.KYIV).plusDays(2)
+                .withHour(10).withMinute(0).withSecond(0).withNano(0);
+        UUID competitorBookingId = createBooking(clientToken, salonA.masterId(), salonAServiceId, slotT1);
+        return new CrossSalonSetup(clientToken, salonA, competitorBookingId, salonB, salonBServiceId,
+                slotT1, slotT1.plusHours(4));
+    }
+
+    /**
+     * The provider of salon B must learn only THAT the client is busy and WHEN — nothing identifying
+     * salon A's booking. Data keys are pinned to the exact set (absent, not null), and the raw body is
+     * scanned for every salon-A identifier read back from the DB.
+     */
+    private void assertNoCompetitorLeak(String rawBody, CrossSalonSetup s) throws Exception {
+        JsonNode body = objectMapper.readTree(rawBody);
+        JsonNode data = body.path("data");
+        assertThat(data.path("code").asText()).isEqualTo(ClientBookingConflictException.ERROR_CODE);
+        List<String> keys = new ArrayList<>();
+        data.fieldNames().forEachRemaining(keys::add);
+        assertThat(keys).as("redacted body carries exactly code + window: %s", data)
+                .containsExactlyInAnyOrder("code", "startsAt", "endsAt");
+        assertProviderRedactedBody(body, s.slotT1());
+        String competitorServiceName = jdbcTemplate.queryForObject(
+                "SELECT sd.name FROM bookings b JOIN master_services ms ON ms.id = b.master_service_id "
+                        + "JOIN service_definitions sd ON sd.id = ms.service_def_id WHERE b.id = ?",
+                String.class, s.competitorBookingId());
+        assertThat(rawBody)
+                .as("salon A identifiers must never reach salon B's provider")
+                .doesNotContain(s.competitorBookingId().toString())
+                .doesNotContain(s.salonA().salonId().toString())
+                .doesNotContain(s.salonA().masterId().toString())
+                .doesNotContain(competitorServiceName);
+    }
+
+    private UUID createBooking(String clientToken, UUID masterId, UUID masterServiceId, ZonedDateTime startsAt)
+            throws Exception {
+        ResponseEntity<String> response = restTemplate.exchange(
+                BOOKINGS_URL, HttpMethod.POST,
+                new HttpEntity<>(new CreateBookingRequest(masterId, masterServiceId, startsAt, null, null, false),
+                        fixtures.bearerHeaders(clientToken)), String.class);
+        assertThat(response.getStatusCode())
+                .as("setup: booking must succeed — body: %s", response.getBody())
+                .isEqualTo(HttpStatus.CREATED);
+        return UUID.fromString(objectMapper.readTree(response.getBody()).path("data").path("id").asText());
+    }
+
+    /**
+     * Provider-initiated body: the conflicting row may be the client's booking at a COMPETING salon,
+     * so only {@code code} + the window survive — the keys must be ABSENT, not merely null.
+     */
+    private static void assertProviderRedactedBody(JsonNode body, ZonedDateTime expectedStart) {
+        JsonNode data = body.path("data");
+        assertThat(data.has("conflictingBookingId")).as("provider body leaks booking id: %s", data).isFalse();
+        assertThat(data.has("serviceName")).as("provider body leaks service name: %s", data).isFalse();
+        assertThat(data.has("masterName")).as("provider body leaks master name: %s", data).isFalse();
+        assertThat(OffsetDateTime.parse(data.path("startsAt").asText()).toInstant())
+                .as("provider body still carries the conflicting window start")
+                .isEqualTo(expectedStart.toInstant());
+        assertThat(data.path("endsAt").isTextual()).as("provider body still carries the window end").isTrue();
+        assertThat(body.path("message").asText()).isEqualTo("Client already has an overlapping booking");
+    }
+
+    private static void assertClientFullBody(JsonNode body, UUID expectedBookingId, ZonedDateTime expectedStart,
+            String expectedServiceName, String expectedMasterName) {
+        JsonNode data = body.path("data");
+        assertThat(data.path("code").asText()).isEqualTo("CLIENT_BOOKING_CONFLICT");
+        assertThat(data.path("conflictingBookingId").asText()).isEqualTo(expectedBookingId.toString());
+        assertThat(data.path("serviceName").asText()).as("client body keeps service name: %s", data)
+                .isEqualTo(expectedServiceName);
+        assertThat(data.path("masterName").asText()).as("client body keeps master name: %s", data)
+                .isEqualTo(expectedMasterName);
+        assertThat(OffsetDateTime.parse(data.path("startsAt").asText()).toInstant())
+                .isEqualTo(expectedStart.toInstant());
+        assertThat(data.path("endsAt").isTextual()).isTrue();
     }
 }

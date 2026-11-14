@@ -2,6 +2,7 @@ package com.beautica.booking.dto;
 
 import com.beautica.common.TimeZones;
 import com.beautica.common.exception.ClientBookingConflictException;
+import com.fasterxml.jackson.annotation.JsonInclude;
 import java.time.ZonedDateTime;
 import java.util.UUID;
 
@@ -12,6 +13,11 @@ import java.util.UUID;
  * {@link BookingResponse} and {@link BookingDetailResponse} — the two other DTOs that surface
  * booking start/end instants to the mobile client.
  *
+ * <p>Provider-initiated requests get a redacted body ({@link ClientBookingConflictException#isRedacted()}):
+ * {@code conflictingBookingId}/{@code serviceName}/{@code masterName} are null and OMITTED from
+ * the JSON ({@code NON_NULL}), leaving only {@code code} + the window. The client body is
+ * unchanged — none of its fields is ever null ({@code masterName} falls back to {@code ""}).
+ *
  * @param code                  stable machine-readable error code, always
  *                              {@link ClientBookingConflictException#ERROR_CODE}
  * @param conflictingBookingId  id of the client's existing booking that overlaps the request
@@ -20,6 +26,7 @@ import java.util.UUID;
  * @param startsAt              start of the conflicting booking, Kyiv-zoned
  * @param endsAt                end of the conflicting booking, Kyiv-zoned
  */
+@JsonInclude(JsonInclude.Include.NON_NULL)
 public record ClientBookingConflictResponse(
         String code,
         UUID conflictingBookingId,

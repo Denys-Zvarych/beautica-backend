@@ -1135,6 +1135,27 @@ class GlobalExceptionHandlerTest {
     }
 
     @Test
+    @DisplayName("handleClientBookingConflict — provider-initiated exception yields window-only body "
+            + "(no booking id / service / master), same 409 + code + message")
+    void should_return409WithWindowOnly_when_providerInitiatedClientBookingConflictThrown() {
+        Booking conflicting = buildConflictingBooking(UUID.randomUUID());
+        var ex = ClientBookingConflictException.windowOnly(conflicting.getStartsAt(), conflicting.getEndsAt());
+
+        ResponseEntity<ApiResponse<ClientBookingConflictResponse>> response =
+                handler.handleClientBookingConflict(ex);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+        assertThat(response.getBody().message()).isEqualTo("Client already has an overlapping booking");
+        ClientBookingConflictResponse data = response.getBody().data();
+        assertThat(data.code()).isEqualTo(ClientBookingConflictException.ERROR_CODE);
+        assertThat(data.conflictingBookingId()).as("provider must not learn the booking id").isNull();
+        assertThat(data.serviceName()).as("provider must not learn the service").isNull();
+        assertThat(data.masterName()).as("provider must not learn the master").isNull();
+        assertThat(data.startsAt().toInstant()).isEqualTo(conflicting.getStartsAt().toInstant());
+        assertThat(data.endsAt().toInstant()).isEqualTo(conflicting.getEndsAt().toInstant());
+    }
+
+    @Test
     @DisplayName("handleClientBookingConflict — emits DEBUG log marker only")
     void should_emitDebugLog_when_clientBookingConflictExceptionThrown() {
         Booking conflicting = buildConflictingBooking(UUID.randomUUID());
