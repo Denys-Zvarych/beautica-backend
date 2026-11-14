@@ -1023,6 +1023,71 @@ class NotificationOutboxDrainWorkerTest {
         assertThat(outboxEntry.getStatus()).isEqualTo(OutboxStatus.SENT);
     }
 
+    @Test
+    @DisplayName("Phase 496: a CLIENT_CANCEL_RECEIPT row → notifyClientCancelReceipt only, never the master's e-mail")
+    void should_callNotifyClientCancelReceipt_when_cancelReceiptEntryProcessed() {
+        // Arrange
+        UUID bookingId = UUID.randomUUID();
+        NotificationOutboxEntry outboxEntry = entry(OutboxEventType.CLIENT_CANCEL_RECEIPT, 0, null, bookingId);
+        Booking booking = mock(Booking.class);
+        when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
+        when(booking.getId()).thenReturn(bookingId);
+        when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(booking));
+
+        // Act
+        worker.drain();
+
+        // Assert
+        verify(notificationService).notifyClientCancelReceipt(booking);
+        verify(notificationService, never()).notifyClientCancelled(any(Booking.class));
+        assertThat(outboxEntry.getStatus()).isEqualTo(OutboxStatus.SENT);
+    }
+
+    @Test
+    @DisplayName("Phase 496: a CLIENT_RESCHEDULE_RECEIPT row → notifyClientRescheduleReceipt only, never the master's")
+    void should_callNotifyClientRescheduleReceipt_when_rescheduleReceiptEntryProcessed() {
+        // Arrange
+        UUID bookingId = UUID.randomUUID();
+        NotificationOutboxEntry outboxEntry = entry(OutboxEventType.CLIENT_RESCHEDULE_RECEIPT, 0, null, bookingId);
+        Booking booking = mock(Booking.class);
+        when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
+        when(booking.getId()).thenReturn(bookingId);
+        when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(booking));
+
+        // Act
+        worker.drain();
+
+        // Assert
+        verify(notificationService).notifyClientRescheduleReceipt(booking);
+        verify(notificationService, never()).notifyBookingRescheduled(any());
+        assertThat(outboxEntry.getStatus()).isEqualTo(OutboxStatus.SENT);
+    }
+
+    @Test
+    @DisplayName("Phase 496: a failed receipt row retries alone — the master's CLIENT_CANCELLED row of the same booking "
+            + "is SENT once and never re-dispatched")
+    void should_retryOnlyReceiptRow_when_receiptSendFails() {
+        // Arrange
+        UUID bookingId = UUID.randomUUID();
+        NotificationOutboxEntry masterRow = entry(OutboxEventType.CLIENT_CANCELLED, 0, null, bookingId);
+        NotificationOutboxEntry receiptRow = entry(OutboxEventType.CLIENT_CANCEL_RECEIPT, 0, null, bookingId);
+        Booking booking = mock(Booking.class);
+        when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(masterRow, receiptRow));
+        when(booking.getId()).thenReturn(bookingId);
+        when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(booking));
+        doThrow(new EmailDeliveryException("email/booking-cancelled-client", true))
+                .when(notificationService).notifyClientCancelReceipt(booking);
+
+        // Act
+        worker.drain();
+
+        // Assert
+        verify(notificationService, times(1)).notifyClientCancelled(booking);
+        assertThat(masterRow.getStatus()).isEqualTo(OutboxStatus.SENT);
+        assertThat(receiptRow.getStatus()).isEqualTo(OutboxStatus.PENDING);
+        assertThat(receiptRow.getAttempts()).isEqualTo(1);
+    }
+
     // ── Test 10b: CLOSURE_REMINDER dispatches to notifyClosureReminder (Phase 29.5) ──
 
     @Test

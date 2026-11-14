@@ -84,8 +84,9 @@ class V240RegisteredBookingRemindersMigrationTest extends AbstractIntegrationTes
     }
 
     @Test
-    @DisplayName("the CHECK lists exactly the thirteen prior event types plus BOOKING_REMINDER — none dropped, none extra")
-    void should_listExactlyFourteenEventTypes_when_constraintRead() {
+    @DisplayName("the CHECK still lists the thirteen prior event types plus BOOKING_REMINDER — none dropped "
+            + "(V243 widens it further and pins its own exact set)")
+    void should_listAllFourteenEventTypes_when_constraintRead() {
         // Act
         String def = jdbcTemplate.queryForObject("""
                 SELECT pg_get_constraintdef(oid) FROM pg_constraint
@@ -96,7 +97,7 @@ class V240RegisteredBookingRemindersMigrationTest extends AbstractIntegrationTes
         Set<String> listed = QUOTED.matcher(def).results().map(r -> r.group(1)).collect(Collectors.toSet());
         Set<String> expected = new HashSet<>(PRE_494_EVENT_TYPES);
         expected.add("BOOKING_REMINDER");
-        assertThat(listed).as("chk_outbox_event values, def=%s", def).containsExactlyInAnyOrderElementsOf(expected);
+        assertThat(listed).as("chk_outbox_event values, def=%s", def).containsAll(expected);
     }
 
     @ParameterizedTest(name = "{0}")

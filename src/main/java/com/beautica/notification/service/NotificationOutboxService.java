@@ -228,6 +228,31 @@ public class NotificationOutboxService {
     }
 
     /**
+     * Phase 496 (NTF-49) — the registered client's cancel receipt as its OWN row
+     * ({@link OutboxEventType#CLIENT_CANCEL_RECEIPT}), beside the master's {@code CLIENT_CANCELLED} row: one retry
+     * state per recipient, so a failed receipt never re-sends the master's e-mail (audit-fix cycle 1). Called solely by
+     * the authenticated client self-cancel, one row per cancelled booking (NTF-D11, D4) — never by a guest cancel or
+     * the account-deletion cascade. No payload (ids only).
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void enqueueClientCancelReceipt(UUID bookingId) {
+        Objects.requireNonNull(bookingId, "bookingId must not be null");
+        save(OutboxEventType.CLIENT_CANCEL_RECEIPT, bookingId, null);
+    }
+
+    /**
+     * Phase 496 (NTF-49) — the registered client's «ви перенесли запис» receipt as its OWN row
+     * ({@link OutboxEventType#CLIENT_RESCHEDULE_RECEIPT}), beside the client-initiated {@code BOOKING_RESCHEDULED}
+     * row that mails the master (audit-fix cycle 1, same reason as {@link #enqueueClientCancelReceipt}). Called solely
+     * by a client-initiated reschedule. No payload (ids only).
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void enqueueClientRescheduleReceipt(UUID bookingId) {
+        Objects.requireNonNull(bookingId, "bookingId must not be null");
+        save(OutboxEventType.CLIENT_RESCHEDULE_RECEIPT, bookingId, null);
+    }
+
+    /**
      * Phase 436 — a {@code CLIENT_CANCELLED} row for a guest's cancel by link that names exactly the services
      * cancelled in that request: ONE row per request, keyed to {@code leadBookingId}, whose payload carries the
      * request's booking ids ({@value #CANCELLED_BOOKING_IDS}, comma-separated) so the drain worker lists only those

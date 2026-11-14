@@ -19,6 +19,7 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
@@ -189,6 +190,39 @@ class NotificationOutboxServiceTest {
         // Pin @Builder.Default values so a future refactor that drops them is caught.
         assertThat(saved.getStatus()).isEqualTo(OutboxStatus.PENDING);
         assertThat(saved.getAttempts()).isEqualTo(0);
+    }
+
+    @Test
+    @DisplayName("Phase 496: enqueueClientCancelReceipt / enqueueClientRescheduleReceipt write their OWN payload-less "
+            + "rows keyed to the booking; enqueueClientCancelled keeps the pre-496 null payload")
+    void should_writeOwnReceiptRows_when_receiptEnqueued() {
+        // Arrange
+        UUID cancelId = UUID.randomUUID();
+        UUID rescheduleId = UUID.randomUUID();
+        UUID masterRowId = UUID.randomUUID();
+        ArgumentCaptor<NotificationOutboxEntry> captor = ArgumentCaptor.forClass(NotificationOutboxEntry.class);
+
+        // Act
+        service.enqueueClientCancelReceipt(cancelId);
+        service.enqueueClientRescheduleReceipt(rescheduleId);
+        service.enqueueClientCancelled(masterRowId);
+
+        // Assert
+        verify(outboxRepository, org.mockito.Mockito.times(3)).save(captor.capture());
+        List<NotificationOutboxEntry> rows = captor.getAllValues();
+        assertThat(rows).extracting(NotificationOutboxEntry::getEventType).containsExactly(
+                OutboxEventType.CLIENT_CANCEL_RECEIPT, OutboxEventType.CLIENT_RESCHEDULE_RECEIPT,
+                OutboxEventType.CLIENT_CANCELLED);
+        assertThat(rows).extracting(NotificationOutboxEntry::getAggregateId)
+                .containsExactly(cancelId, rescheduleId, masterRowId);
+        assertThat(rows).extracting(NotificationOutboxEntry::getPayload).containsOnlyNulls();
+    }
+
+    @Test
+    @DisplayName("Phase 496: the receipt enqueues reject a null booking id")
+    void should_throwNullPointerException_when_receiptEnqueuedWithNull() {
+        assertThatThrownBy(() -> service.enqueueClientCancelReceipt(null)).isInstanceOf(NullPointerException.class);
+        assertThatThrownBy(() -> service.enqueueClientRescheduleReceipt(null)).isInstanceOf(NullPointerException.class);
     }
 
     // -------------------------------------------------------------------------

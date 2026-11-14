@@ -227,6 +227,20 @@ public class NotificationService {
     }
 
     /**
+     * Phase 496 (NTF-49) — the registered client's own «ви перенесли запис» receipt (+ REQUEST .ics), dispatched from
+     * its OWN {@code CLIENT_RESCHEDULE_RECEIPT} row (audit-fix cycle 1: the master's e-mail rides the separate
+     * {@code BOOKING_RESCHEDULED} row, so neither retry repeats the other). E-mail only (NTF-D04); an account-less
+     * booking or an inactive account gets nothing. Skipped once the booking left {@code CONFIRMED} (cancelled before
+     * the drain), so a stale «you moved it» never follows a cancel receipt.
+     */
+    public void notifyClientRescheduleReceipt(Booking booking) {
+        User client = activeClient(booking);
+        if (client != null && booking.getStatus() == BookingStatus.CONFIRMED) {
+            emailService.sendBookingRescheduledClientEmail(client.getEmail(), booking, true);
+        }
+    }
+
+    /**
      * Notifies the CLIENT that the PROVIDER moved their booking to a new time (Phase 27.3 —
      * REVERSES the previously-locked "reschedule is client-only" decision; this is the
      * client-facing twin of {@link #notifyBookingRescheduled(Booking)}, which stays unchanged for
@@ -469,6 +483,26 @@ public class NotificationService {
             return;
         }
         emailService.sendClientCancelledEmail(masterUser.getEmail(), booking);
+    }
+
+    /**
+     * Phase 496 (NTF-49) — the registered client's own cancel receipt + CANCEL .ics, dispatched from its OWN
+     * {@code CLIENT_CANCEL_RECEIPT} row (audit-fix cycle 1: the master's e-mail rides the separate
+     * {@code CLIENT_CANCELLED} row, so neither retry repeats the other). Only the authenticated client self-cancel
+     * enqueues that row (D4); an account-less booking or an inactive account gets nothing.
+     */
+    public void notifyClientCancelReceipt(Booking booking) {
+        User client = activeClient(booking);
+        if (client != null) {
+            emailService.sendClientCancelReceiptEmail(client.getEmail(), booking);
+        }
+    }
+
+    /** The booking's registered client when the account is active, else {@code null} (guest, detached, inactive). */
+    @Nullable
+    private static User activeClient(Booking booking) {
+        User client = booking.getClient();
+        return client != null && client.isActive() ? client : null;
     }
 
     /**

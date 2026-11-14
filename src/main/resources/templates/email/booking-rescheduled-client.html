@@ -2,7 +2,8 @@
 <!--
   Template: email/booking-rescheduled-client
   Variables: masterName (String), clientName (String), serviceName (String),
-             startsAt (String — pre-formatted new time)
+             startsAt (String — pre-formatted new time),
+             selfAction (boolean, optional — phase 496: true = the CLIENT moved it, «Ви перенесли запис» receipt)
   Client-facing twin of email/booking-rescheduled-provider.html (Phase 27.3) — sent when a
   PROVIDER moves a booking. Mirrors that template's structure/styling verbatim; only the
   addressee and copy change.
@@ -43,14 +44,16 @@
             <tr><td style="color:#0D0906;font-size:22px;font-weight:700;line-height:1.3;
                            padding-top:16px;padding-bottom:8px;
                            font-family:'Nunito','Trebuchet MS',Arial,sans-serif;">
-              Бронювання перенесено
+              <span th:if="${selfAction}">Ви перенесли запис</span>
+              <span th:unless="${selfAction}">Бронювання перенесено</span>
             </td></tr>
 
             <!-- Greeting -->
             <tr><td style="color:#3D2B1A;font-size:15px;line-height:1.7;padding-bottom:20px;
                            font-family:'Nunito','Trebuchet MS',Arial,sans-serif;">
               Вітаємо, <strong th:text="${clientName}" style="color:#0D0906;">Клієнте</strong>!
-              Ваш майстер переніс бронювання на новий час:
+              <span th:if="${selfAction}">Ви перенесли запис на новий час:</span>
+              <span th:unless="${selfAction}">Ваш майстер переніс бронювання на новий час:</span>
             </td></tr>
 
             <!-- Booking details table -->

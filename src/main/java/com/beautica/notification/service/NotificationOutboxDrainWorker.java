@@ -628,6 +628,11 @@ public class NotificationOutboxDrainWorker {
                     notificationService.notifyBookingRescheduled(booking);
                 }
             }
+            // Phase 496 audit-fix cycle 1 — the registered client's receipts ride their OWN rows (NTF-49), so a failed
+            // receipt retries alone and never re-sends the master's CLIENT_CANCELLED / BOOKING_RESCHEDULED e-mail.
+            case CLIENT_CANCEL_RECEIPT -> notificationService.notifyClientCancelReceipt(getBooking(entry, bookingCache));
+            case CLIENT_RESCHEDULE_RECEIPT ->
+                    notificationService.notifyClientRescheduleReceipt(getBooking(entry, bookingCache));
             case REVIEW_REQUESTED -> notificationService.notifyReviewRequested(getBooking(entry, bookingCache));
             // Phase 431 — the performing master's own rows (own retry state, see OutboxEventType).
             case MASTER_BOOKING_RESCHEDULED -> notificationService.notifyMasterOfProviderReschedule(
