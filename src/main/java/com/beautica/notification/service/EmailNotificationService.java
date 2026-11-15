@@ -5,6 +5,8 @@ import com.beautica.booking.entity.Booking;
 import com.beautica.common.util.SchemeGuard;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.master.entity.Master;
+import com.beautica.notification.email.ServiceLine;
+import com.beautica.notification.email.ServiceLines;
 import com.beautica.notification.ics.BookingIcs;
 import com.beautica.notification.ics.IcsAttachment;
 import com.beautica.notification.ics.IcsMethod;
@@ -57,7 +59,6 @@ public class EmailNotificationService {
     private static final DateTimeFormatter TIME_FMT = DateTimeFormatter.ofPattern("HH:mm");
     /** Phase 496 — the day in the receipt subjects, «20 травня» (Kyiv). */
     private static final DateTimeFormatter DAY_FMT = DateTimeFormatter.ofPattern("d MMMM", Locale.forLanguageTag("uk"));
-    private static final int MINUTES_PER_HOUR = 60;
     private static final String LOGO_CID = "beauticaLogo";
     /** Template variable for the header logo {@code src} (Phase 374, D4). */
     static final String LOGO_SRC_VARIABLE = "logoSrc";
@@ -177,11 +178,11 @@ public class EmailNotificationService {
      * lead service.
      *
      * <p>Takes a {@link BookingVisit} because exactly ONE {@code NEW_BOOKING} outbox row is
-     * enqueued per visit; {@code serviceNames} carries every chained service in visit order and the
+     * enqueued per visit; {@code serviceLines} carries every chained service in visit order and the
      * template loops over it. A single-service booking arrives as
-     * {@link BookingVisit#single(Booking)}, so {@code serviceNames} is a one-element list,
-     * {@code serviceLabel} is the singular «Послуга» and {@code visitDuration} is {@code null}
-     * (its row is suppressed) — the rendered e-mail is byte-identical to the pre-visit output.
+     * {@link BookingVisit#single(Booking)}, so {@code serviceLines} is a one-element list,
+     * {@code serviceLabel} is the singular «Послуга» and {@code visitHeader} is {@code null}
+     * (its row is suppressed).
      */
     public void sendNewBookingEmail(String to, BookingVisit visit) {
         Booking booking = visit.lead();
@@ -196,7 +197,7 @@ public class EmailNotificationService {
         var ctx = new Context();
         ctx.setVariable("masterName", masterDisplayName(booking));
         ctx.setVariable("clientName", fullName(booking.getClient()));
-        ctx.setVariable("serviceName", booking.getMasterService().getServiceDefinition().getName());
+        ctx.setVariable("serviceLine", ServiceLines.of(booking));
         ctx.setVariable("startsAt", formatStartsAt(booking));
         send(to, "Бронювання перенесено", "email/booking-rescheduled-provider", ctx);
     }
@@ -211,7 +212,7 @@ public class EmailNotificationService {
         var ctx = new Context();
         ctx.setVariable("masterName", masterDisplayName(booking));
         ctx.setVariable("clientName", resolveClientName(booking));
-        ctx.setVariable("serviceName", booking.getMasterService().getServiceDefinition().getName());
+        ctx.setVariable("serviceLine", ServiceLines.of(booking));
         ctx.setVariable("startsAt", formatStartsAt(booking));
         send(to, "Салон переніс бронювання", "email/booking-rescheduled-by-salon-provider", ctx);
     }
@@ -279,7 +280,7 @@ public class EmailNotificationService {
         var ctx = new Context();
         ctx.setVariable("masterName", masterDisplayName(booking));
         ctx.setVariable("clientName", fullName(booking.getClient()));
-        ctx.setVariable("serviceName", booking.getMasterService().getServiceDefinition().getName());
+        ctx.setVariable("serviceLine", ServiceLines.of(booking));
         ctx.setVariable("startsAt", formatStartsAt(booking));
         ctx.setVariable("selfAction", selfAction);
         String subject = selfAction
@@ -296,7 +297,7 @@ public class EmailNotificationService {
     public void sendClientCancelReceiptEmail(String to, Booking booking) {
         var ctx = new Context();
         ctx.setVariable("clientName", fullName(booking.getClient()));
-        ctx.setVariable("serviceName", booking.getMasterService().getServiceDefinition().getName());
+        ctx.setVariable("serviceLine", ServiceLines.of(booking));
         ctx.setVariable("masterName", masterDisplayName(booking));
         ctx.setVariable("salonName", booking.getSalon() == null ? null : booking.getSalon().getName());
         ctx.setVariable("startsAt", formatStartsAt(booking));
@@ -339,7 +340,7 @@ public class EmailNotificationService {
         var ctx = new Context();
         ctx.setVariable("clientName", fullName(booking.getClient()));
         ctx.setVariable("dayBefore", dayBefore);
-        ctx.setVariable("serviceName", booking.getMasterService().getServiceDefinition().getName());
+        ctx.setVariable("serviceLine", ServiceLines.of(booking));
         ctx.setVariable("masterName", masterDisplayName(booking));
         ctx.setVariable("salonName", booking.getSalon() == null ? null : booking.getSalon().getName());
         ctx.setVariable("startsAt", formatStartsAt(booking));
@@ -373,7 +374,7 @@ public class EmailNotificationService {
         var ctx = new Context();
         ctx.setVariable("clientName", fullName(booking.getClient()));
         ctx.setVariable("masterName", masterDisplayName(booking));
-        ctx.setVariable("serviceName", booking.getMasterService().getServiceDefinition().getName());
+        ctx.setVariable("serviceLine", ServiceLines.of(booking));
         ctx.setVariable("startsAt", formatStartsAt(booking));
         ctx.setVariable("reviewUrl", reviewUrl);
         send(to, "Оцініть візит", "email/review-request", ctx);
@@ -397,7 +398,7 @@ public class EmailNotificationService {
         }
         var ctx = new Context();
         ctx.setVariable("clientName", resolveClientName(booking));
-        ctx.setVariable("serviceName", booking.getMasterService().getServiceDefinition().getName());
+        ctx.setVariable("serviceLine", ServiceLines.of(booking));
         ctx.setVariable("startsAt", formatStartsAt(booking));
         ctx.setVariable("bookingUrl", bookingUrl);
         send(to, "Візит завершився — позначте його статус", "email/closure-reminder", ctx);
@@ -483,8 +484,9 @@ public class EmailNotificationService {
     private void sendDeclined(String to, BookingVisit visit, String comment) {
         var ctx = new Context();
         ctx.setVariable("clientName", fullName(visit.lead().getClient()));
-        ctx.setVariable("serviceNames", visit.serviceNames());
         ctx.setVariable("serviceLabel", visit.isMultiService() ? "Послуги" : "Послуга");
+        ctx.setVariable("serviceLines", ServiceLines.of(visit));
+        ctx.setVariable("visitHeader", ServiceLines.visitHeader(visit));
         ctx.setVariable("comment", comment);
         // Phase 496 (NTF-50): a CANCEL per declined booking removes the event its confirmation created.
         send(to, "Бронювання скасовано", "email/booking-declined", ctx, icsFor(visit.items(), IcsMethod.CANCEL));
@@ -578,7 +580,7 @@ public class EmailNotificationService {
     }
 
     /**
-     * Phase 436 — the client-cancelled provider e-mail for one or more services: {@code serviceNames} gets one row
+     * Phase 436 — the client-cancelled provider e-mail for one or more services: {@code serviceLines} gets one row
      * per cancelled service (visit order) under «Послуга»/«Послуги»; {@code startsAt} is the first one's start. The
      * notes are the lead booking's, exactly as the single-booking e-mail had them.
      */
@@ -587,9 +589,9 @@ public class EmailNotificationService {
         var ctx = new Context();
         ctx.setVariable("masterName", masterDisplayName(booking));
         ctx.setVariable("clientName", resolveClientName(booking));
-        ctx.setVariable("serviceName", visit.leadServiceName());
-        ctx.setVariable("serviceNames", visit.serviceNames());
         ctx.setVariable("serviceLabel", visit.isMultiService() ? "Послуги" : "Послуга");
+        ctx.setVariable("serviceLines", ServiceLines.of(visit));
+        ctx.setVariable("visitHeader", ServiceLines.visitHeader(visit));
         ctx.setVariable("startsAt", formatStartsAt(visit.startsAt()));
         ctx.setVariable("cancellationNote", booking.getClientCancellationNote());
         ctx.setVariable("creationNote", booking.getClientComment());
@@ -806,13 +808,14 @@ public class EmailNotificationService {
      * multi-service visit is described:
      *
      * <ul>
-     *   <li>{@code serviceNames} — every chained service name, in visit order; the template's
+     *   <li>{@code serviceLines} — every chained service line, in visit order; the template's
      *       {@code th:each} emits one table row per entry.</li>
      *   <li>{@code serviceLabel} — «Послуга» for one service, «Послуги» for several. Resolved in
      *       Java, not in Thymeleaf, so the wording is unit-testable and shared.</li>
-     *   <li>{@code visitDuration} — total duration + visit end time, e.g. «2 год 30 хв (до 13:15)».
-     *       <b>{@code null} for a single-service booking</b>, which suppresses the row entirely
-     *       ({@code th:if}) and is what keeps the legacy single-service render byte-identical.</li>
+     *   <li>{@code serviceLines} — one {@link ServiceLine} per service (time · name · duration · frozen
+     *       price, NTF-52); the template's {@code th:each} renders them.</li>
+     *   <li>{@code visitHeader} — «пт, 21 листопада, 14:00–16:30» (Kyiv).
+     *       <b>{@code null} for a single-service booking</b>, which suppresses the row ({@code th:if}).</li>
      * </ul>
      *
      * <p>{@code startsAt} is taken from the visit ({@code items[0]}), not from {@code lead} — the
@@ -823,25 +826,9 @@ public class EmailNotificationService {
      * {@code providerComment}) is read here or passed into either context — locked track-25 rule.
      */
     private static void applyVisitVariables(Context ctx, BookingVisit visit) {
-        ctx.setVariable("serviceNames", visit.serviceNames());
         ctx.setVariable("serviceLabel", visit.isMultiService() ? "Послуги" : "Послуга");
         ctx.setVariable("startsAt", formatStartsAt(visit.startsAt()));
-        ctx.setVariable("visitDuration", visit.isMultiService() ? formatVisitDuration(visit) : null);
-    }
-
-    /** «2 год 30 хв (до 13:15)» — total service time (buffers excluded) plus the visit's end. */
-    private static String formatVisitDuration(BookingVisit visit) {
-        return formatDuration(visit.totalDurationMinutes())
-                + " (до " + visit.endsAt().atZoneSameInstant(KYIV).format(TIME_FMT) + ")";
-    }
-
-    /** «45 хв» / «2 год» / «2 год 30 хв». */
-    private static String formatDuration(int totalMinutes) {
-        int hours = totalMinutes / MINUTES_PER_HOUR;
-        int minutes = totalMinutes % MINUTES_PER_HOUR;
-        if (hours == 0) {
-            return minutes + " хв";
-        }
-        return minutes == 0 ? hours + " год" : hours + " год " + minutes + " хв";
+        ctx.setVariable("serviceLines", ServiceLines.of(visit));
+        ctx.setVariable("visitHeader", ServiceLines.visitHeader(visit));
     }
 }

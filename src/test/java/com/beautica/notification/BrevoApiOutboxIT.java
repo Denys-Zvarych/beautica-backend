@@ -375,6 +375,9 @@ class BrevoApiOutboxIT extends AbstractIntegrationTest {
         when(booking.getMaster()).thenReturn(Master.builder().user(masterUser).build());
         when(booking.getMasterService()).thenReturn(assignment);
         when(booking.getStartsAt()).thenReturn(OffsetDateTime.of(2026, 11, 3, 10, 0, 0, 0, ZoneOffset.UTC));
+        // price_at_booking is NOT NULL (V18): a real row always carries the snapshot ServiceLines renders
+        when(booking.getPriceAtBooking()).thenReturn(new java.math.BigDecimal("500.00"));
+        when(booking.getDurationMinutesAtBooking()).thenReturn(60);
         return booking;
     }
 }

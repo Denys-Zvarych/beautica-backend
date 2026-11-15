@@ -8,9 +8,9 @@ import com.beautica.notification.service.RequestKind;
 import com.beautica.service.dto.CreateCategoryRequestRequest;
 import com.beautica.service.service.CategoryRequestService;
 import com.beautica.service.service.ServiceTypeSuggestionService;
+import com.beautica.support.MockedMailSender;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import jakarta.mail.Session;
 import jakarta.mail.internet.MimeMessage;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -35,7 +35,6 @@ import org.thymeleaf.spring6.SpringTemplateEngine;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
-import java.util.Properties;
 import java.util.UUID;
 
 import static com.beautica.notification.RequestDecisionEmailExpectedCopy.REASON_MARKER;
@@ -49,7 +48,6 @@ import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.doAnswer;
-import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
@@ -95,9 +93,7 @@ class RequestDecisionEmailIT extends AbstractIntegrationTest {
 
     @BeforeEach
     void wireRealDecisionEmailOverAMockedTransport() {
-        mailSender = mock(JavaMailSender.class);
-        Session session = Session.getInstance(new Properties());
-        when(mailSender.createMimeMessage()).thenAnswer(inv -> new MimeMessage(session));
+        mailSender = MockedMailSender.create();
         EmailNotificationService real = new EmailNotificationService(mailSender, templateEngine, fromAddress);
         doAnswer(inv -> {
             real.sendRequestDecisionEmail(inv.getArgument(0), inv.getArgument(1), inv.getArgument(2),

@@ -58,7 +58,7 @@ public abstract class AbstractIntegrationTest {
     private TestRestTemplate baseRestTemplate;
 
     @AfterEach
-    void cleanDb() {
+    protected void cleanDb() {
         // Phase 332 (V181): in_app_notification FKs users/bookings/appointments/salons (booking_id
         // and appointment_id ON DELETE CASCADE, salon_id ON DELETE SET NULL) — delete first, before
         // any of those parents, so cleanup does not rely on CASCADE (§O-7).
