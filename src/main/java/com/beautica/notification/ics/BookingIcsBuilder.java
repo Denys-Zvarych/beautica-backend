@@ -16,8 +16,9 @@ import java.util.stream.Collectors;
  * one-hour {@code VALARM} — plus the iTIP fields an e-mail invitation needs ({@code METHOD}, {@code SEQUENCE},
  * {@code ORGANIZER}, {@code ATTENDEE}, {@code STATUS}). Pure and stateless.
  *
- * <p>No DESCRIPTION: the website's carries the guest cancel link, which a registered client does not have; no note
- * and no phone ever reaches the event (NTF-03). The alarm rides only on {@link IcsMethod#REQUEST} — a CANCEL removes
+ * <p>The event DESCRIPTION (phase 499) is only the booking's service line «14:00–15:00 Манікюр · 1 год · 500 ₴»
+ * (NTF-52), absent when not set: the website's carries the guest cancel link, which a registered client does not
+ * have; no note and no phone ever reaches the event (NTF-03). The alarm rides only on {@link IcsMethod#REQUEST} — a CANCEL removes
  * the event, it has nothing to remind about.
  */
 public final class BookingIcsBuilder {
@@ -57,6 +58,9 @@ public final class BookingIcsBuilder {
         lines.add("SUMMARY:" + escape(ics.summary()));
         if (ics.location() != null && !ics.location().isBlank()) {
             lines.add("LOCATION:" + escape(ics.location()));
+        }
+        if (ics.description() != null && !ics.description().isBlank()) {
+            lines.add("DESCRIPTION:" + escape(ics.description()));
         }
         lines.add("ORGANIZER;CN=Beautica:mailto:" + address(ics.organizerEmail()));
         lines.add("ATTENDEE;CN=\"" + paramValue(ics.attendeeName()) + "\";RSVP=FALSE:mailto:"

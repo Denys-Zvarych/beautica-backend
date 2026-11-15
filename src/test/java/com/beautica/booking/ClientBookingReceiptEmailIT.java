@@ -10,6 +10,7 @@ import com.beautica.booking.service.AppointmentTransitionService;
 import com.beautica.booking.service.BookingService;
 import com.beautica.common.TimeZones;
 import com.beautica.notification.BookingIcsExpectedContent;
+import com.beautica.notification.ServiceLineExpectedCopy;
 import com.beautica.notification.ClientReceiptEmailExpectedCopy;
 import com.beautica.notification.service.BookingVisit;
 import com.beautica.notification.service.EmailDeliveryException;
@@ -469,6 +470,124 @@ class ClientBookingReceiptEmailIT extends AbstractWalkInBookingSmsIT {
                         + MASTER_NAME + BookingIcsExpectedContent.SUMMARY_SEPARATOR
                         + BookingIcsExpectedContent.ESCAPED_HOSTILE_SALON_NAME);
         assertThat(BookingIcsExpectedContent.property(ics, "ATTENDEE")).hasValue("mailto:" + client.email());
+        OffsetDateTime start = at(NOW.plus(Duration.ofDays(2)));
+        DateTimeFormatter hhmm = DateTimeFormatter.ofPattern("HH:mm");
+        assertThat(BookingIcsExpectedContent.property(ics, "DESCRIPTION")).hasValue(ServiceLineExpectedCopy.rangeText(
+                start.format(hhmm), start.plusMinutes(30).format(hhmm),
+                BookingIcsExpectedContent.ESCAPED_HOSTILE_SERVICE_NAME, ServiceLineExpectedCopy.DURATION_HALF_HOUR,
+                ServiceLineExpectedCopy.PRICE_350));
+    }
+
+    // ── phase 499 (NTF-50): the .ics DESCRIPTION is the booking's service line ──
+
+    @Test
+    @DisplayName("confirmation .ics DESCRIPTION = «HH:mm–HH:mm name · 30 хв · 350 ₴» of the booking, no phone/note")
+    void should_describeServiceLine_when_confirmationIcsAttached() throws Exception {
+        // Arrange
+        OffsetDateTime start = at(NOW.plus(Duration.ofDays(2)));
+        UUID bookingId = insertAppBooking(start, null);
+
+        // Act
+        enqueueConfirmed(bookingId);
+        drainWorker.drain();
+
+        // Assert
+        String ics = onlyIcs(onlyMailTo(client.email()), "REQUEST");
+        assertThat(BookingIcsExpectedContent.property(ics, "DESCRIPTION"))
+                .hasValue(expectedDescription(start, ServiceLineExpectedCopy.PRICE_350));
+    }
+
+    @Test
+    @DisplayName("confirmation .ics DESCRIPTION shows the frozen price range «350–700 ₴» when the booking has a ceiling")
+    void should_describeRangePrice_when_confirmedBookingHasPriceCeiling() throws Exception {
+        // Arrange
+        OffsetDateTime start = at(NOW.plus(Duration.ofDays(2)));
+        UUID bookingId = insertAppBooking(start, null);
+        jdbcTemplate.update("UPDATE bookings SET price_max_at_booking = 700.00 WHERE id = ?", bookingId);
+
+        // Act
+        enqueueConfirmed(bookingId);
+        drainWorker.drain();
+
+        // Assert
+        String ics = onlyIcs(onlyMailTo(client.email()), "REQUEST");
+        assertThat(BookingIcsExpectedContent.property(ics, "DESCRIPTION"))
+                .hasValue(expectedDescription(start, ServiceLineExpectedCopy.RANGE_PRICE_350));
+    }
+
+    @Test
+    @DisplayName("client reschedule .ics DESCRIPTION carries the NEW start–end of the moved booking")
+    void should_describeNewTimes_when_clientReschedules() throws Exception {
+        // Arrange
+        UUID bookingId = insertAppBooking(at(NOW.plus(Duration.ofDays(2))), null);
+        OffsetDateTime newStart = at(NOW.plus(Duration.ofDays(3)).plus(Duration.ofHours(2)));
+
+        // Act
+        bookingService.rescheduleBooking(client.id(), Role.CLIENT, bookingId, new RescheduleBookingRequest(newStart, false));
+        drainWorker.drain();
+
+        // Assert
+        String ics = onlyIcs(onlyMailTo(client.email()), "REQUEST");
+        assertThat(BookingIcsExpectedContent.property(ics, "DESCRIPTION"))
+                .hasValue(expectedDescription(newStart, ServiceLineExpectedCopy.PRICE_350));
+    }
+
+    @Test
+    @DisplayName("provider decline CANCEL .ics keeps the UID and the same DESCRIPTION as the booking line")
+    void should_keepDescription_when_providerDeclinesCancelIcs() throws Exception {
+        // Arrange
+        OffsetDateTime start = at(NOW.plus(Duration.ofDays(2)));
+        UUID bookingId = insertAppBooking(start, null);
+
+        // Act
+        bookingService.declineBooking(salon.ownerId(), bookingId,
+                new StatusUpdateRequest(CancellationReason.PROVIDER_UNAVAILABLE, null));
+        drainWorker.drain();
+
+        // Assert
+        String ics = onlyIcs(onlyMailTo(client.email()), "CANCEL");
+        assertThat(BookingIcsExpectedContent.lines(ics)).contains(BookingIcsExpectedContent.uidLine(bookingId));
+        assertThat(BookingIcsExpectedContent.property(ics, "DESCRIPTION"))
+                .hasValue(expectedDescription(start, ServiceLineExpectedCopy.PRICE_350));
+    }
+
+    @Test
+    @DisplayName("each service of a visit gets its own DESCRIPTION on its own CANCEL .ics (own time range)")
+    void should_describeOwnLine_when_clientCancelsOneVisitItem() throws Exception {
+        // Arrange
+        UUID appointmentId = insertAppAppointment();
+        OffsetDateTime first = at(NOW.plus(Duration.ofDays(2)));
+        UUID firstItem = insertAppBooking(first, appointmentId);
+        insertAppBooking(first.plusMinutes(30), appointmentId);
+
+        // Act
+        bookingService.cancelAppointmentItem(client.id(), appointmentId, firstItem, clientCancel());
+        drainWorker.drain();
+
+        // Assert
+        String ics = onlyIcs(onlyMailTo(client.email()), "CANCEL");
+        assertThat(BookingIcsExpectedContent.property(ics, "DESCRIPTION"))
+                .hasValue(expectedDescription(first, ServiceLineExpectedCopy.PRICE_350));
+    }
+
+    @Test
+    @DisplayName("guest cancels by link → no e-mail carries an .ics attachment (guests have no calendar invite)")
+    void should_attachNoIcs_when_guestCancelsByLink() throws Exception {
+        // Arrange
+        SettledGuest guest = createGuestBookingSettled(tomorrowAtNoon());
+        sentMails.clear();
+        String token = guest.cancelUrl().substring(guest.cancelUrl().lastIndexOf('/') + 1);
+
+        // Act
+        restTemplate.exchange("/api/v1/book/cancel/" + token, HttpMethod.POST, new HttpEntity<>(ipHeaders()),
+                String.class);
+        drainWorker.drain();
+
+        // Assert
+        assertThat(sentMails).as("the master e-mail is still sent").isNotEmpty();
+        for (MimeMessage mail : sentMails) {
+            assertThat(MimeMessageBodies.attachmentsOf(mail)).as("attachments of %s", mail.getSubject()).isEmpty();
+        }
     }
 
     // ── audit-fix cycle 1: one outbox row per recipient ─────────────────────────
@@ -615,6 +734,15 @@ class ClientBookingReceiptEmailIT extends AbstractWalkInBookingSmsIT {
                 + "updated_at) VALUES (?, ?, ?, 'CONFIRMED', 'APP', ?, ?)",
                 appointmentId, client.id(), salon.salonId(), created, created);
         return appointmentId;
+    }
+
+    /** The expected .ics DESCRIPTION of a 30-min booking of the fixture service starting at {@code start} (Kyiv). */
+    private String expectedDescription(OffsetDateTime start, String price) {
+        String name = jdbcTemplate.queryForObject("SELECT sd.name FROM service_definitions sd "
+                + "JOIN master_services ms ON ms.service_def_id = sd.id WHERE ms.id = ?", String.class,
+                salon.masterServiceId());
+        return ServiceLineExpectedCopy.rangeText(kyivTime(start), kyivTime(start.plusMinutes(30)), name,
+                ServiceLineExpectedCopy.DURATION_HALF_HOUR, price);
     }
 
     private String status(UUID bookingId) {

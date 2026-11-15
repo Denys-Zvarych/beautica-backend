@@ -34,6 +34,16 @@ public final class ServiceLines {
         return lineOf(booking);
     }
 
+    /**
+     * «14:00–15:00 Манікюр · 1 год · 500 ₴» (Kyiv; the booking's own start–end, frozen duration and price) — the
+     * single-booking .ics DESCRIPTION (NTF-50).
+     */
+    public static String rangeText(Booking booking) {
+        ServiceLine line = lineOf(booking);
+        String end = booking.getEndsAt().atZoneSameInstant(KYIV).format(TIME_FMT);
+        return line.time() + EN_DASH + end + " " + line.body();
+    }
+
     /** «пт, 21 листопада, 14:00–16:30» (Kyiv; first item's start to the visit's end), or {@code null} for one service. */
     public static String visitHeader(BookingVisit visit) {
         if (!visit.isMultiService()) {

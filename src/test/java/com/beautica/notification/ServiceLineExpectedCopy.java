@@ -18,6 +18,11 @@ public final class ServiceLineExpectedCopy {
     public static final String DURATION = "1 год";
     public static final String PRICE = "500 ₴";
     public static final String RANGE_PRICE = "500–700 ₴";
+    /** The 30-minute / 350 ₴ booking of the receipt-e-mail ITs. */
+    public static final String DURATION_HALF_HOUR = "30 хв";
+    public static final String PRICE_350 = "350 ₴";
+    /** The 350 ₴ booking of the receipt-e-mail ITs with a frozen ceiling of 700. */
+    public static final String RANGE_PRICE_350 = "350–700 ₴";
     /** The multi-service visit header row. */
     public static final String VISIT_HEADER = "пт, 21 листопада, 14:00–16:30";
     /** The label of the visit header row. */
@@ -34,6 +39,11 @@ public final class ServiceLineExpectedCopy {
     /** «{time} {name} · {duration} · {price}» for a line whose values differ from the default fixture. */
     public static String text(String time, String name, String duration, String price) {
         return time + " " + name + " · " + duration + " · " + price;
+    }
+
+    /** «{from}–{to} {name} · {duration} · {price}» — the single-booking .ics DESCRIPTION (phase 499, un-escaped). */
+    public static String rangeText(String from, String to, String name, String duration, String price) {
+        return timeRange(from, to) + " " + name + durationSegment(duration) + price;
     }
 
     /** «{day}, {from}–{to}» — e.g. {@code visitHeader("пт, 21 листопада", "14:00", "16:30")}. */

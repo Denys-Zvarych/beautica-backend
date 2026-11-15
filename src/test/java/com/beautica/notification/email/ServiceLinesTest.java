@@ -52,6 +52,21 @@ class ServiceLinesTest {
     }
 
     @Test
+    @DisplayName("rangeText is «{start}–{end} » + the same body the line uses")
+    void should_composeRangeFromLineBody_when_rangeTextBuilt() {
+        Booking booking = booking("Манікюр", WINTER_START, 60, "500", null);
+
+        String range = ServiceLines.rangeText(booking);
+
+        assertThat(range).isEqualTo(ServiceLineExpectedCopy.timeRange("14:00", "15:00") + " "
+                + ServiceLines.of(booking).body());
+        assertThat(range).isEqualTo(ServiceLineExpectedCopy.rangeText(
+                "14:00", "15:00", "Манікюр", ServiceLineExpectedCopy.DURATION, ServiceLineExpectedCopy.PRICE));
+        assertThat(ServiceLines.of(booking).body()).isEqualTo(
+                ServiceLineExpectedCopy.text("Манікюр").substring(ServiceLineExpectedCopy.TIME.length() + 1));
+    }
+
+    @Test
     @DisplayName("visit header is Kyiv time, winter offset")
     void should_renderKyivHeader_when_winterVisit() {
         Booking first = booking("Манікюр", WINTER_START, 60, "500", null);

@@ -3,6 +3,7 @@ package com.beautica.notification.ics;
 import com.beautica.booking.domain.GuestVisitAddress;
 import com.beautica.booking.entity.Booking;
 import com.beautica.master.entity.Master;
+import com.beautica.notification.email.ServiceLines;
 import com.beautica.user.User;
 import org.springframework.lang.Nullable;
 
@@ -21,6 +22,8 @@ import java.util.stream.Stream;
  * @param startsAt      event start (rendered in UTC)
  * @param endsAt        event end (rendered in UTC)
  * @param summary       «service · master[ · salon]»
+ * @param description   phase 499 — the booking's service line «14:00–15:00 Манікюр · 1 год · 500 ₴» (NTF-52), the
+ *                      VEVENT DESCRIPTION; {@code null} = no DESCRIPTION
  * @param location      the visit address, {@code null} when there is none
  * @param sequence      RFC 5545 SEQUENCE — {@link #sequenceOf(Instant)} of the booking's {@code updatedAt}
  * @param dtStamp       when this .ics was produced
@@ -38,8 +41,17 @@ public record BookingIcs(
         Instant dtStamp,
         String organizerEmail,
         String attendeeName,
-        String attendeeEmail
+        String attendeeEmail,
+        @Nullable String description
 ) {
+
+    /** The pre-499 shape: an event without a DESCRIPTION. */
+    public BookingIcs(UUID bookingId, Instant startsAt, Instant endsAt, String summary, @Nullable String location,
+                      long sequence, Instant dtStamp, String organizerEmail, String attendeeName,
+                      String attendeeEmail) {
+        this(bookingId, startsAt, endsAt, summary, location, sequence, dtStamp, organizerEmail, attendeeName,
+                attendeeEmail, null);
+    }
 
     /** SEQUENCE counts seconds from this instant (D2): monotonic per change, fits 32 bits until 2094. */
     static final Instant SEQUENCE_EPOCH = Instant.parse("2026-01-01T00:00:00Z");
@@ -73,7 +85,8 @@ public record BookingIcs(
                 dtStamp,
                 organizerEmail,
                 joinNonBlank(" ", client.getFirstName(), client.getLastName()),
-                client.getEmail());
+                client.getEmail(),
+                ServiceLines.rangeText(booking));
     }
 
     /** Seconds since {@link #SEQUENCE_EPOCH}; {@code 0} for a missing or earlier timestamp. */
