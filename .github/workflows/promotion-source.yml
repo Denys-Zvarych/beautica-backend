@@ -18,9 +18,10 @@ name: Promotion Source
 #     `env:`, never through expression interpolation inside `run:`.
 #
 # Rule:
-#   base main -> head must be `dev` (release) or `hotfix/*` (hotfix), from THIS repo (a fork branch named
-#                `dev` is not the dev branch)
-#   base dev  -> head must not be `main`, unless the PR title starts with `sync:` (hotfix sync-back)
+#   base main -> head must be `dev` (release), from THIS repo (a fork branch named `dev` is not the dev
+#                branch). No hotfix branches.
+#   base dev  -> head must not be `main` (dev never accepts main; no main -> dev sync PRs)
+#   User rule 2026-11-15 (replaces phase 370 D4): only `dev` may open a PR into `main`.
 #   any other base is rejected (the `branches` filter below means it never runs for one).
 #
 # REQUIRED GITHUB SETTINGS (repo admin; cannot be set from code):
@@ -79,10 +80,10 @@ jobs:
             case "$target" in
               main)
                 [[ "$src_repo" == "$dst_repo" ]] || return 1
-                [[ "$source" == "dev" || "$source" =~ ^hotfix/. ]] ;;
+                [[ "$source" == "dev" ]] ;;
               dev)
                 if [[ "$source" == "main" && "$src_repo" == "$dst_repo" ]]; then
-                  [[ "$title" == sync:* ]]
+                  return 1
                 fi ;;
               *) return 1 ;;
             esac
@@ -101,13 +102,14 @@ jobs:
           }
           R=o/r
           expect 0 main dev "release: backend v2026.10.16" $R $R
-          expect 0 main hotfix/fix-x "hotfix" $R $R
+          expect 1 main hotfix/fix-x "hotfix no longer allowed" $R $R
+          expect 1 main fix/x "fix" $R $R
           expect 1 main feat/x "feat" $R $R
           expect 1 main hotfix/ "empty slug" $R $R
           expect 1 main dev "fork named dev" fork/r $R
           expect 1 main dev "deleted fork (empty head repo)" "" $R
           expect 1 main main "self" $R $R
-          expect 0 dev main "sync: hotfix x into dev" $R $R
+          expect 1 dev main "sync: hotfix x into dev" $R $R
           expect 1 dev main "no prefix" $R $R
           expect 0 dev main "fork branch named main is just a fork branch" fork/r $R
           expect 0 dev feat/x "feat" $R $R
@@ -115,7 +117,7 @@ jobs:
           echo "promotion-source self-test passed"
 
           if ! check_promotion_source "$BASE_REF" "$HEAD_REF" "$PR_TITLE" "$HEAD_REPO" "$BASE_REPO"; then
-            echo "::error::PR into '$BASE_REF' from '$HEAD_REF' is not an allowed promotion path. Into main: only dev (release) or hotfix/* (hotfix). Into dev: not from main unless the title starts with 'sync:'."
+            echo "::error::PR into '$BASE_REF' from '$HEAD_REF' is not an allowed promotion path. Into main: only dev (release). dev never accepts main. User rule 2026-11-15 (replaces phase 370 D4)."
             exit 1
           fi
           echo "promotion source ok: $HEAD_REF -> $BASE_REF"
