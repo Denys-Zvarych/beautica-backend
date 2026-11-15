@@ -6,6 +6,8 @@ import com.beautica.booking.enums.BookingStatus;
 import com.beautica.master.entity.Master;
 import com.beautica.notification.BookingReminderEmailExpectedCopy;
 import com.beautica.notification.RequestDecisionEmailExpectedCopy;
+import com.beautica.notification.ServiceLineExpectedCopy;
+import com.beautica.notification.email.ServiceLine;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.user.User;
@@ -28,6 +30,7 @@ import org.thymeleaf.context.Context;
 import org.thymeleaf.context.IContext;
 import org.thymeleaf.spring6.SpringTemplateEngine;
 
+import java.math.BigDecimal;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.List;
@@ -50,6 +53,7 @@ import static org.mockito.Mockito.when;
 @DisplayName("EmailNotificationService — unit")
 class EmailNotificationServiceTest {
 
+    private static final int DEFAULT_DURATION_MINUTES = 60;
     private static final String FROM_ADDRESS = "noreply@beautica.app";
 
     @Mock
@@ -135,10 +139,11 @@ class EmailNotificationServiceTest {
         assertThat(captured.getVariable("masterName")).isEqualTo("Майстер Іванов");
         // A single-service booking must still produce the exact one-service shape the template
         // rendered before visits existed: a one-element list, the singular label, and NO duration
-        // row (visitDuration null suppresses it) — that is what keeps the render byte-identical.
-        assertThat(captured.getVariable("serviceNames")).isEqualTo(List.of("Тест послуга"));
+        // row (visitHeader null suppresses it) — that is what keeps the render byte-identical.
         assertThat(captured.getVariable("serviceLabel")).isEqualTo("Послуга");
-        assertThat(captured.getVariable("visitDuration")).isNull();
+        assertThat(captured.getVariable("visitHeader")).isNull();
+        assertThat(lineTexts(captured)).containsExactly(
+                ServiceLineExpectedCopy.text("13:00", "Тест послуга", "1 год", "500 ₴"));
     }
 
     @Test
@@ -197,14 +202,14 @@ class EmailNotificationServiceTest {
 
         verify(templateEngine).process(anyString(), contextCaptor.capture());
         Context captured = (Context) contextCaptor.getValue();
-        assertThat(captured.getVariable("serviceNames"))
-                .as("the sibling service must reach the template — this is the defect under test")
-                .isEqualTo(List.of("Стрижка", "Фарбування"));
         assertThat(captured.getVariable("serviceLabel")).isEqualTo("Послуги");
         assertThat((String) captured.getVariable("startsAt")).isEqualTo("13:00, 15 червня 2025");
-        assertThat((String) captured.getVariable("visitDuration"))
-                .as("60+90 min of service time; last item runs 11:00–12:30 UTC = 15:30 Kyiv")
-                .isEqualTo("2 год 30 хв (до 15:30)");
+        assertThat((String) captured.getVariable("visitHeader"))
+                .as("60+90 min; first item 13:00 Kyiv, last item ends 12:30 UTC = 15:30 Kyiv")
+                .isEqualTo(ServiceLineExpectedCopy.visitHeader("нд, 15 червня", "13:00", "15:30"));
+        assertThat(lineTexts(captured)).containsExactly(
+                ServiceLineExpectedCopy.text("13:00", "Стрижка", "1 год", "500 ₴"),
+                ServiceLineExpectedCopy.text("14:00", "Фарбування", "1 год 30 хв", "500 ₴"));
     }
 
     @Test
@@ -225,9 +230,12 @@ class EmailNotificationServiceTest {
 
         verify(templateEngine).process(anyString(), contextCaptor.capture());
         Context captured = (Context) contextCaptor.getValue();
-        assertThat(captured.getVariable("serviceNames")).isEqualTo(List.of("Манікюр", "Педикюр"));
         assertThat(captured.getVariable("serviceLabel")).isEqualTo("Послуги");
-        assertThat((String) captured.getVariable("visitDuration")).isEqualTo("1 год 30 хв (до 13:30)");
+        assertThat((String) captured.getVariable("visitHeader"))
+                .isEqualTo(ServiceLineExpectedCopy.visitHeader("вт, 1 липня", "12:00", "13:30"));
+        assertThat(lineTexts(captured)).containsExactly(
+                ServiceLineExpectedCopy.text("12:00", "Манікюр", "45 хв", "500 ₴"),
+                ServiceLineExpectedCopy.text("12:45", "Педикюр", "45 хв", "500 ₴"));
     }
 
     // -------------------------------------------------------------------------
@@ -257,9 +265,8 @@ class EmailNotificationServiceTest {
 
         Context captured = (Context) contextCaptor.getValue();
         assertThat(captured.getVariable("clientName")).isEqualTo("Тест Клієнт");
-        assertThat(captured.getVariable("serviceNames")).isEqualTo(List.of("Тест послуга"));
         assertThat(captured.getVariable("serviceLabel")).isEqualTo("Послуга");
-        assertThat(captured.getVariable("visitDuration")).isNull();
+        assertThat(captured.getVariable("visitHeader")).isNull();
         // UTC 09:00 on 2025-07-01 = Kyiv (UTC+3) 12:00 same date
         assertThat((String) captured.getVariable("startsAt")).isEqualTo("12:00, 1 липня 2025");
     }
@@ -293,7 +300,6 @@ class EmailNotificationServiceTest {
         Context captured = (Context) contextCaptor.getValue();
         assertThat(captured.getVariable("clientName")).isEqualTo("Тест Клієнт");
         assertThat(captured.getVariable("masterName")).isEqualTo("Майстер Іванов");
-        assertThat(captured.getVariable("serviceName")).isEqualTo("Тест послуга");
         assertThat(captured.getVariable("reviewUrl")).isEqualTo(reviewUrl);
         // UTC 09:00 on 2025-07-01 = Kyiv (UTC+3) 12:00 same date — pre-formatted, never a raw datetime.
         assertThat((String) captured.getVariable("startsAt")).isEqualTo("12:00, 1 липня 2025");
@@ -365,7 +371,6 @@ class EmailNotificationServiceTest {
 
         Context captured = (Context) contextCaptor.getValue();
         assertThat(captured.getVariable("clientName")).isEqualTo("Тест Клієнт");
-        assertThat(captured.getVariable("serviceName")).isEqualTo("Тест послуга");
         assertThat(captured.getVariable("bookingUrl")).isEqualTo(bookingUrl);
         // UTC 09:00 on 2025-07-01 = Kyiv (UTC+3) 12:00 same date — pre-formatted, never a raw datetime.
         assertThat((String) captured.getVariable("startsAt")).isEqualTo("12:00, 1 липня 2025");
@@ -441,9 +446,8 @@ class EmailNotificationServiceTest {
 
         Context captured = (Context) contextCaptor.getValue();
         assertThat(captured.getVariable("clientName")).isEqualTo("Тест Клієнт");
-        assertThat(captured.getVariable("serviceNames")).isEqualTo(List.of("Тест послуга"));
         assertThat(captured.getVariable("serviceLabel")).isEqualTo("Послуга");
-        assertThat(captured.getVariable("visitDuration")).isNull();
+        assertThat(captured.getVariable("visitHeader")).isNull();
         // UTC 09:00 on 2025-07-01 = Kyiv (UTC+3) 12:00 same date
         assertThat((String) captured.getVariable("startsAt")).isEqualTo("12:00, 1 липня 2025");
         // D10 pin (mutation-checked, Phase 269 test case 14): per the locked track-25 rule, notes
@@ -479,9 +483,12 @@ class EmailNotificationServiceTest {
 
         verify(templateEngine).process(anyString(), contextCaptor.capture());
         Context captured = (Context) contextCaptor.getValue();
-        assertThat(captured.getVariable("serviceNames")).isEqualTo(List.of("Манікюр", "Педикюр"));
         assertThat(captured.getVariable("serviceLabel")).isEqualTo("Послуги");
-        assertThat((String) captured.getVariable("visitDuration")).isEqualTo("1 год 30 хв (до 13:30)");
+        assertThat((String) captured.getVariable("visitHeader"))
+                .isEqualTo(ServiceLineExpectedCopy.visitHeader("вт, 1 липня", "12:00", "13:30"));
+        assertThat(lineTexts(captured)).containsExactly(
+                ServiceLineExpectedCopy.text("12:00", "Манікюр", "45 хв", "500 ₴"),
+                ServiceLineExpectedCopy.text("12:45", "Педикюр", "45 хв", "500 ₴"));
     }
 
     @Test
@@ -536,9 +543,8 @@ class EmailNotificationServiceTest {
 
         Context captured = (Context) contextCaptor.getValue();
         assertThat(captured.getVariable("clientName")).isEqualTo("Тест Клієнт");
-        assertThat(captured.getVariable("serviceNames")).isEqualTo(List.of("Тест послуга"));
         assertThat(captured.getVariable("serviceLabel")).isEqualTo("Послуга");
-        assertThat(captured.getVariable("visitDuration")).isNull();
+        assertThat(captured.getVariable("visitHeader")).isNull();
         assertThat((String) captured.getVariable("startsAt")).isEqualTo("12:00, 1 липня 2025");
         // D10 pin, same posture as sendSalonClosedEmail's own case 14.
         assertThat(captured.getVariable("providerComment")).isNull();
@@ -567,9 +573,12 @@ class EmailNotificationServiceTest {
 
         verify(templateEngine).process(anyString(), contextCaptor.capture());
         Context captured = (Context) contextCaptor.getValue();
-        assertThat(captured.getVariable("serviceNames")).isEqualTo(List.of("Манікюр", "Педикюр"));
         assertThat(captured.getVariable("serviceLabel")).isEqualTo("Послуги");
-        assertThat((String) captured.getVariable("visitDuration")).isEqualTo("1 год 30 хв (до 13:30)");
+        assertThat((String) captured.getVariable("visitHeader"))
+                .isEqualTo(ServiceLineExpectedCopy.visitHeader("вт, 1 липня", "12:00", "13:30"));
+        assertThat(lineTexts(captured)).containsExactly(
+                ServiceLineExpectedCopy.text("12:00", "Манікюр", "45 хв", "500 ₴"),
+                ServiceLineExpectedCopy.text("12:45", "Педикюр", "45 хв", "500 ₴"));
     }
 
     // -------------------------------------------------------------------------
@@ -603,7 +612,6 @@ class EmailNotificationServiceTest {
         assertThat(captured.getVariable("clientName")).isEqualTo("Тест Клієнт");
         // A per-item decline cancels exactly ONE service line, so the list the template loops over
         // carries exactly that one name and the singular label — the pre-visit rendered shape.
-        assertThat(captured.getVariable("serviceNames")).isEqualTo(List.of("Тест послуга"));
         assertThat(captured.getVariable("serviceLabel")).isEqualTo("Послуга");
     }
 
@@ -616,6 +624,7 @@ class EmailNotificationServiceTest {
         when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>declined</html>");
         OffsetDateTime start = OffsetDateTime.of(2025, 7, 1, 9, 0, 0, 0, ZoneOffset.UTC);
         Booking lead = buildBookingMock("Тест", "Клієнт", "Майстер", "Іванов", "Стрижка", start);
+        lenient().when(lead.getEndsAt()).thenReturn(start.plusHours(1));
         // Minimal sibling: this e-mail reads nothing off a non-lead item but its ordering key and
         // its service name, so a full fixture would only add stubs the path never touches.
         Booking second = buildVisitItemMock("Фарбування", start.plusHours(1), 60);
@@ -629,9 +638,11 @@ class EmailNotificationServiceTest {
         Context captured = (Context) contextCaptor.getValue();
         // The defect: ONE STATUS_CHANGED row describes the whole visit, so naming only the lead
         // left the client believing the second service was still on.
-        assertThat(captured.getVariable("serviceNames")).isEqualTo(List.of("Стрижка", "Фарбування"));
         assertThat(captured.getVariable("serviceLabel")).isEqualTo("Послуги");
         assertThat(captured.getVariable("comment")).isEqualTo("Майстер захворів");
+        assertThat((String) captured.getVariable("visitHeader"))
+                .isEqualTo(ServiceLineExpectedCopy.visitHeader("вт, 1 липня", "12:00", "14:00"));
+        assertThat(lineTexts(captured)).hasSize(2);
     }
 
     // -------------------------------------------------------------------------
@@ -671,7 +682,6 @@ class EmailNotificationServiceTest {
         assertThat(captured.getVariable("creationNote")).isEqualTo("Будь ласка, без ароматизаторів");
         assertThat(captured.getVariable("clientName")).isEqualTo("Тест Клієнт");
         assertThat(captured.getVariable("masterName")).isEqualTo("Майстер Іванов");
-        assertThat(captured.getVariable("serviceName")).isEqualTo("Тест послуга");
     }
 
     // -------------------------------------------------------------------------
@@ -693,6 +703,7 @@ class EmailNotificationServiceTest {
         MasterServiceAssignment masterService = mock(MasterServiceAssignment.class);
         when(masterService.getServiceDefinition()).thenReturn(serviceDefinition);
         Booking booking = mock(Booking.class);
+        stubFrozenSnapshots(booking, DEFAULT_DURATION_MINUTES);
         when(booking.getClient()).thenReturn(null);
         when(booking.getGuestName()).thenReturn("Гість");
         when(booking.getGuestSurname()).thenReturn("Тестовий");
@@ -711,7 +722,6 @@ class EmailNotificationServiceTest {
         Context captured = (Context) contextCaptor.getValue();
         assertThat(captured.getVariable("clientName")).isEqualTo("Гість Тестовий");
         assertThat(captured.getVariable("masterName")).isEqualTo("Майстер Іванов");
-        assertThat(captured.getVariable("serviceName")).isEqualTo("Тест послуга");
         assertThat(captured.getVariableNames()).noneMatch(name -> name.toLowerCase().contains("phone"))
                 .noneMatch(name -> name.toLowerCase().contains("note") || name.toLowerCase().contains("comment"));
         verify(booking, never()).getGuestPhone();
@@ -736,8 +746,7 @@ class EmailNotificationServiceTest {
         assertThat(realMessage.getSubject()).isEqualTo("Салон скасував бронювання");
         Context captured = (Context) contextCaptor.getValue();
         assertThat(captured.getVariable("clientName")).isEqualTo("Тест Клієнт");
-        assertThat(captured.getVariable("serviceNames")).isEqualTo(List.of("Тест послуга"));
-        assertThat(captured.getVariable("visitDuration")).isNull();
+        assertThat(captured.getVariable("visitHeader")).isNull();
         assertThat(captured.getVariableNames()).noneMatch(name -> name.toLowerCase().contains("phone"))
                 .noneMatch(name -> name.toLowerCase().contains("note") || name.toLowerCase().contains("comment"));
         verify(booking, never()).getProviderComment();
@@ -1383,6 +1392,7 @@ class EmailNotificationServiceTest {
         lenient().when(booking.getMaster()).thenReturn(master);
         when(booking.getMasterService()).thenReturn(masterService);
         lenient().when(booking.getStartsAt()).thenReturn(startsAt);
+        stubFrozenSnapshots(booking, DEFAULT_DURATION_MINUTES);
 
         return booking;
     }
@@ -1402,8 +1412,20 @@ class EmailNotificationServiceTest {
         lenient().when(booking.getMasterService()).thenReturn(masterService);
         lenient().when(booking.getStartsAt()).thenReturn(startsAt);
         lenient().when(booking.getEndsAt()).thenReturn(startsAt.plusMinutes(durationMinutes));
-        lenient().when(booking.getDurationMinutesAtBooking()).thenReturn(durationMinutes);
+        stubFrozenSnapshots(booking, durationMinutes);
         return booking;
+    }
+
+    /** Frozen price (a 500–700 band is set per test where needed) and duration the e-mail service lines read. */
+    private static List<String> lineTexts(Context captured) {
+        @SuppressWarnings("unchecked")
+        List<ServiceLine> lines = (List<ServiceLine>) captured.getVariable("serviceLines");
+        return lines.stream().map(ServiceLine::text).toList();
+    }
+
+    private static void stubFrozenSnapshots(Booking booking, int durationMinutes) {
+        lenient().when(booking.getPriceAtBooking()).thenReturn(BigDecimal.valueOf(500));
+        lenient().when(booking.getDurationMinutesAtBooking()).thenReturn(durationMinutes);
     }
 
     /**
