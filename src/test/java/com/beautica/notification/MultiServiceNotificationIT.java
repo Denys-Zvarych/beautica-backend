@@ -12,16 +12,20 @@ import com.beautica.notification.repository.NotificationOutboxRepository;
 import com.beautica.notification.service.BookingVisit;
 import com.beautica.notification.service.EmailNotificationService;
 import com.beautica.notification.service.NotificationOutboxDrainWorker;
+import com.beautica.support.MockedMailSender;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.mail.Message;
-import jakarta.mail.Session;
 import jakarta.mail.internet.MimeMessage;
 import jakarta.persistence.EntityManagerFactory;
 import org.hibernate.SessionFactory;
 import org.hibernate.stat.Statistics;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestInstance;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.mockito.ArgumentCaptor;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
@@ -37,7 +41,6 @@ import org.springframework.security.crypto.password.PasswordEncoder;
 import org.thymeleaf.spring6.SpringTemplateEngine;
 
 import java.util.List;
-import java.util.Properties;
 import java.util.UUID;
 import java.util.stream.Stream;
 
@@ -46,7 +49,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.doAnswer;
-import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -82,6 +84,7 @@ import static org.mockito.Mockito.when;
  * the outbox payload entirely.
  */
 @Import(TestSecurityConfig.class)
+@TestInstance(TestInstance.Lifecycle.PER_CLASS)
 @DisplayName("Multi-service visit — the drained e-mails name EVERY service, over real Postgres")
 class MultiServiceNotificationIT extends AbstractIntegrationTest {
 
@@ -118,15 +121,26 @@ class MultiServiceNotificationIT extends AbstractIntegrationTest {
     private BookingTestFixtures fixtures;
     private JavaMailSender mailSender;
 
+    /**
+     * Pays the cold-start cost (first HTTP round trip, Hibernate/Jackson/Thymeleaf warm-up) once,
+     * outside any timed test, so whichever test JUnit runs first is not measured against
+     * {@code SlowTestExtension}'s 10 s ceiling for it. Does the real create + drain path, then wipes
+     * the DB so no row leaks into the first test's assertions.
+     */
+    @BeforeAll
+    void warmUpColdStart() throws Exception {
+        wireRealEmailRenderingOverAMockedTransport();
+        fixtures.createConfirmedVisit("warm-up", List.of("Стрижка", "Фарбування"));
+        drainWorker.drain();
+        cleanDb();
+    }
+
     @BeforeEach
     void wireRealEmailRenderingOverAMockedTransport() {
         fixtures = new BookingTestFixtures(restTemplate, jdbcTemplate, objectMapper, passwordEncoder);
 
-        mailSender = mock(JavaMailSender.class);
-        // A FRESH MimeMessage per call — a single shared instance would let the second e-mail
-        // overwrite the first and collapse both assertions onto one body.
-        Session session = Session.getInstance(new Properties());
-        when(mailSender.createMimeMessage()).thenAnswer(inv -> new MimeMessage(session));
+        // A FRESH MimeMessage per call (see MockedMailSender).
+        mailSender = MockedMailSender.create();
 
         EmailNotificationService real =
                 new EmailNotificationService(mailSender, templateEngine, fromAddress);
@@ -183,7 +197,8 @@ class MultiServiceNotificationIT extends AbstractIntegrationTest {
         assertVisitOrder(providerBody);
         assertThat(providerBody)
                 .as("3 × 60 min of service time, 10:00 Kyiv start, zero buffers")
-                .contains("3 год (до 13:00)")
+                .contains(ServiceLineExpectedCopy.timeRange("10:00", "13:00"))
+                .contains(ServiceLineExpectedCopy.durationSegment("1 год"))
                 .contains("Послуги");
 
         MimeMessage client = messageWithSubject(captor.getAllValues(), CONFIRMED_SUBJECT);
@@ -197,13 +212,14 @@ class MultiServiceNotificationIT extends AbstractIntegrationTest {
                 .contains("Стрижка")
                 .contains("Фарбування")
                 .contains("Укладка")
-                .contains("3 год (до 13:00)");
+                .contains(ServiceLineExpectedCopy.timeRange("10:00", "13:00"))
+                .contains(ServiceLineExpectedCopy.durationSegment("1 год"));
         assertVisitOrder(clientBody);
     }
 
     @Test
     @DisplayName("the dominant single-service path renders exactly ONE service row, the singular "
-            + "«Послуга» label and NO «Тривалість» row — the pre-visit e-mail, unchanged")
+            + "«Послуга» label and NO visit-header row — the pre-visit e-mail, unchanged")
     void should_renderTheLegacySingleServiceShape_when_aOneServiceVisitIsDrained() throws Exception {
         BookingTestFixtures.VisitFixture visit =
                 fixtures.createConfirmedVisit("single-notif", List.of("Манікюр"));
@@ -222,13 +238,14 @@ class MultiServiceNotificationIT extends AbstractIntegrationTest {
             String body = markupOf(htmlBodyOf(message));
             assertThat(body)
                     .as("subject=%s must still name its one service", message.getSubject())
-                    .contains("Манікюр");
+                    .contains("Манікюр")
+                    .contains(ServiceLineExpectedCopy.durationSegment("1 год"));
             assertThat(countOccurrences(body, "Манікюр"))
                     .as("exactly one service row — a visit loop must not duplicate the lead")
                     .isEqualTo(1);
             assertThat(body)
                     .as("the visit-only rows must stay suppressed for a one-service booking")
-                    .doesNotContain("Тривалість")
+                    .doesNotContain(ServiceLineExpectedCopy.VISIT_HEADER_LABEL)
                     .doesNotContain("Послуги");
             assertThat(countOccurrences(body, "Послуга"))
                     .as("the singular label, printed exactly once")
@@ -269,9 +286,7 @@ class MultiServiceNotificationIT extends AbstractIntegrationTest {
         nameUser(visit.clientId(), "Марія", "Коваленко");
         drainWorker.drain();
         outboxRepository.deleteAll();
-        org.mockito.Mockito.reset(mailSender);
-        Session session = Session.getInstance(new Properties());
-        when(mailSender.createMimeMessage()).thenAnswer(inv -> new MimeMessage(session));
+        MockedMailSender.resetAndStub(mailSender);
         // The MIDDLE item, so a "names the lead instead" regression is distinguishable from a
         // "names the right one" pass.
         UUID middle = jdbcTemplate.queryForList(
@@ -345,6 +360,117 @@ class MultiServiceNotificationIT extends AbstractIntegrationTest {
         assertThat(stats.getPrepareStatementCount())
                 .as("reading the master/client identifiers off detached proxies must issue NOTHING")
                 .isZero();
+    }
+
+    // ── NTF-52 / phase 498: service lines «HH:mm name · duration · price» ──────
+
+    @Test
+    @DisplayName("NTF-52 — a two-service visit confirmation carries the Kyiv visit header and one "
+            + "«HH:mm name · duration · price» line per service, in visit order")
+    void should_renderVisitHeaderAndBothServiceLines_when_twoServiceVisitConfirmationDrained() throws Exception {
+        BookingTestFixtures.VisitFixture visit = fixtures.createConfirmedVisit(
+                "lines-visit", List.of("Манікюр", "Педикюр"));
+        // Friday 2025-11-21: 14:00–15:00 (1 год) then 15:00–16:30 (1 год 30 хв), Kyiv winter time (UTC+2).
+        List<UUID> ids = bookingIdsInVisitOrder(visit.id());
+        setBookingTimes(ids.get(0), "2025-11-21T12:00:00Z", "2025-11-21T13:00:00Z", 60);
+        setBookingTimes(ids.get(1), "2025-11-21T13:00:00Z", "2025-11-21T14:30:00Z", 90);
+
+        drainWorker.drain();
+
+        String clientBody = clientConfirmationBody();
+        assertThat(clientBody)
+                .as("visit header row. body=%s", clientBody)
+                .contains(ServiceLineExpectedCopy.VISIT_HEADER_LABEL)
+                .contains(ServiceLineExpectedCopy.VISIT_HEADER);
+        assertThat(clientBody)
+                .contains(ServiceLineExpectedCopy.text("Манікюр"))
+                .contains(ServiceLineExpectedCopy.text("15:00", "Педикюр", "1 год 30 хв", ServiceLineExpectedCopy.PRICE));
+        assertThat(clientBody.indexOf(ServiceLineExpectedCopy.text("Манікюр")))
+                .isLessThan(clientBody.indexOf("Педикюр"));
+    }
+
+    @Test
+    @DisplayName("NTF-52 — a single-service e-mail shows «14:00 Манікюр · 1 год · 500 ₴» and no visit header")
+    void should_renderOneSingleServiceLine_when_oneServiceVisitDrained() throws Exception {
+        BookingTestFixtures.VisitFixture visit = fixtures.createConfirmedVisit("lines-single", List.of("Манікюр"));
+        setBookingTimes(bookingIdsInVisitOrder(visit.id()).get(0), "2025-11-21T12:00:00Z", "2025-11-21T13:00:00Z", 60);
+
+        drainWorker.drain();
+
+        assertThat(clientConfirmationBody())
+                .contains(ServiceLineExpectedCopy.text("Манікюр"))
+                .doesNotContain(ServiceLineExpectedCopy.VISIT_HEADER_LABEL);
+    }
+
+    @Test
+    @DisplayName("NTF-52 — a booking with a frozen price ceiling renders the range «500–700 ₴»")
+    void should_renderRangePrice_when_bookingSnapshotHasCeiling() throws Exception {
+        BookingTestFixtures.VisitFixture visit = fixtures.createConfirmedVisit("lines-range", List.of("Манікюр"));
+        UUID bookingId = bookingIdsInVisitOrder(visit.id()).get(0);
+        setBookingTimes(bookingId, "2025-11-21T12:00:00Z", "2025-11-21T13:00:00Z", 60);
+        jdbcTemplate.update("UPDATE bookings SET price_max_at_booking = 700.00 WHERE id = ?", bookingId);
+
+        drainWorker.drain();
+
+        assertThat(clientConfirmationBody()).contains(ServiceLineExpectedCopy.text(
+                ServiceLineExpectedCopy.TIME, "Манікюр", ServiceLineExpectedCopy.DURATION,
+                ServiceLineExpectedCopy.RANGE_PRICE));
+    }
+
+    @Test
+    @DisplayName("NTF-52 / D2 — catalogue price changed AFTER booking: both e-mails still show the frozen snapshot")
+    void should_showSnapshotPrice_when_cataloguePriceChangedAfterBooking() throws Exception {
+        BookingTestFixtures.VisitFixture visit = fixtures.createConfirmedVisit("lines-snap", List.of("Манікюр"));
+        setBookingTimes(bookingIdsInVisitOrder(visit.id()).get(0), "2025-11-21T12:00:00Z", "2025-11-21T13:00:00Z", 60);
+        jdbcTemplate.update("UPDATE service_definitions SET base_price = 999.00 WHERE name = 'Манікюр' "
+                + "AND owner_id = ?", visit.masterId());
+
+        drainWorker.drain();
+
+        ArgumentCaptor<MimeMessage> captor = ArgumentCaptor.forClass(MimeMessage.class);
+        verify(mailSender, times(2)).send(captor.capture());
+        for (MimeMessage message : captor.getAllValues()) {
+            assertThat(htmlBodyOf(message))
+                    .as("subject=%s", message.getSubject())
+                    .contains(ServiceLineExpectedCopy.text("Манікюр"))
+                    .doesNotContain("999");
+        }
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @CsvSource({
+            "winter UTC+2, 2025-11-21T12:00:00Z, 2025-11-21T13:00:00Z",
+            "summer UTC+3, 2025-07-04T11:00:00Z, 2025-07-04T12:00:00Z"
+    })
+    @DisplayName("NTF-52 — the line time is Kyiv wall-clock 14:00 in both DST seasons")
+    void should_renderKyivWallClockTime_when_visitStartsInEitherDstSeason(
+            String season, String startUtc, String endUtc) throws Exception {
+        BookingTestFixtures.VisitFixture visit = fixtures.createConfirmedVisit("lines-dst", List.of("Манікюр"));
+        setBookingTimes(bookingIdsInVisitOrder(visit.id()).get(0), startUtc, endUtc, 60);
+
+        drainWorker.drain();
+
+        assertThat(clientConfirmationBody())
+                .as(season)
+                .contains(ServiceLineExpectedCopy.text("Манікюр"));
+    }
+
+    private List<UUID> bookingIdsInVisitOrder(UUID appointmentId) {
+        return jdbcTemplate.queryForList(
+                "SELECT id FROM bookings WHERE appointment_id = ? ORDER BY starts_at, id", UUID.class, appointmentId);
+    }
+
+    private void setBookingTimes(UUID bookingId, String startUtc, String endUtc, int durationMinutes) {
+        jdbcTemplate.update(
+                "UPDATE bookings SET starts_at = ?, ends_at = ?, duration_minutes_at_booking = ? WHERE id = ?",
+                java.sql.Timestamp.from(java.time.Instant.parse(startUtc)),
+                java.sql.Timestamp.from(java.time.Instant.parse(endUtc)), durationMinutes, bookingId);
+    }
+
+    private String clientConfirmationBody() throws Exception {
+        ArgumentCaptor<MimeMessage> captor = ArgumentCaptor.forClass(MimeMessage.class);
+        verify(mailSender, times(2)).send(captor.capture());
+        return htmlBodyOf(messageWithSubject(captor.getAllValues(), CONFIRMED_SUBJECT));
     }
 
     /**

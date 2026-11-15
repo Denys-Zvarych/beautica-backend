@@ -33,7 +33,7 @@ class CiInfraCoverageTest {
      * SHA-256 of the raw bytes of .github/workflows/promotion-source.yml. Update in the SAME PR as any edit to
      * that file (`sha256sum .github/workflows/promotion-source.yml`).
      */
-    static final String PROMOTION_SOURCE_SHA256 = "6919ea775a6bbc7b23b72559fbd859e8712faadb26376c91dac46f9d8a614889";
+    static final String PROMOTION_SOURCE_SHA256 = "2052876bb6a6c67352210a66023fc5526038981dc80033da0574ef233a44495a";
 
     /** Application source: always-full for the selector, but it cannot change how tests execute. */
     private static boolean isMainSource(String glob) {

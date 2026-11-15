@@ -49,6 +49,20 @@ public final class PriceDisplayFormatter {
     }
 
     /**
+     * Compact price for e-mail service lines: {@code "500 ₴"} or, with a ceiling above the floor,
+     * {@code "500–700 ₴"} (en dash). A {@code null} or equal {@code priceMax} is a single price.
+     *
+     * @throws IllegalArgumentException if {@code priceMin} is null
+     */
+    public static String compact(BigDecimal priceMin, BigDecimal priceMax) {
+        if (priceMin == null) throw new IllegalArgumentException("priceMin must not be null");
+        if (priceMax == null || priceMax.compareTo(priceMin) == 0) {
+            return formatAmount(priceMin) + CURRENCY_SUFFIX;
+        }
+        return formatAmount(priceMin) + "–" + formatAmount(priceMax) + CURRENCY_SUFFIX;
+    }
+
+    /**
      * Formats a single monetary amount: strips {@code .00} for whole amounts,
      * keeps two decimal places otherwise.
      */

@@ -1,5 +1,6 @@
 package com.beautica.service.util;
 
+import com.beautica.notification.ServiceLineExpectedCopy;
 import com.beautica.service.entity.PriceType;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -133,5 +134,43 @@ class PriceDisplayFormatterTest {
         assertThatThrownBy(() -> PriceDisplayFormatter.format(PriceType.RANGE, new BigDecimal("500.00"), null))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("priceMax");
+    }
+
+    // ── compact (e-mail service lines, NTF-52) ────────────────────────────────
+
+    @Test
+    @DisplayName("compact single price — no ceiling")
+    void should_formatCompactSingle_when_maxNull() {
+        assertThat(PriceDisplayFormatter.compact(new BigDecimal("500.00"), null))
+                .isEqualTo(ServiceLineExpectedCopy.PRICE);
+    }
+
+    @Test
+    @DisplayName("compact range — en dash between floor and ceiling")
+    void should_formatCompactRange_when_maxAboveMin() {
+        assertThat(PriceDisplayFormatter.compact(new BigDecimal("500.00"), new BigDecimal("700.00")))
+                .isEqualTo(ServiceLineExpectedCopy.RANGE_PRICE);
+    }
+
+    @Test
+    @DisplayName("compact — equal floor and ceiling collapse to a single price, scale ignored")
+    void should_formatCompactSingle_when_maxEqualsMin() {
+        assertThat(PriceDisplayFormatter.compact(new BigDecimal("500"), new BigDecimal("500.00")))
+                .isEqualTo(ServiceLineExpectedCopy.PRICE);
+    }
+
+    @Test
+    @DisplayName("compact keeps non-zero decimals")
+    void should_keepDecimals_when_compactAmountsFractional() {
+        assertThat(PriceDisplayFormatter.compact(new BigDecimal("500.50"), new BigDecimal("800.99")))
+                .isEqualTo("500.50–800.99 ₴");
+    }
+
+    @Test
+    @DisplayName("compact rejects a null floor")
+    void should_throwIllegalArgument_when_compactMinNull() {
+        assertThatThrownBy(() -> PriceDisplayFormatter.compact(null, null))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("priceMin");
     }
 }

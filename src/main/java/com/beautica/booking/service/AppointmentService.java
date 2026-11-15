@@ -489,10 +489,8 @@ public class AppointmentService {
     }
 
     private ClientBookingConflictException clientConflictException(UUID conflictingBookingId) {
-        Booking conflict = bookingRepository.findByIdWithFullGraph(conflictingBookingId)
-                .orElseThrow(() -> new BusinessException(
-                        HttpStatus.INTERNAL_SERVER_ERROR, "Conflicting booking could not be loaded"));
-        return new ClientBookingConflictException(conflict);
+        // CLIENT-only create path → never redacted.
+        return ClientBookingConflicts.build(bookingRepository, conflictingBookingId, false);
     }
 
     private static UUID salonIdOf(Master master) {

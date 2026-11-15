@@ -1,6 +1,7 @@
 package com.beautica.notification.ics;
 
 import com.beautica.notification.BookingIcsExpectedContent;
+import com.beautica.notification.ServiceLineExpectedCopy;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
@@ -171,5 +172,61 @@ class BookingIcsBuilderTest {
         assertThat(BookingIcsExpectedContent.property(out, "LOCATION")).isEmpty();
         assertThat(BookingIcsExpectedContent.property(out, "DESCRIPTION")).isEmpty();
         assertThat(BookingIcsExpectedContent.property(out, "TEL")).isEmpty();
+    }
+
+    private static BookingIcs withDescription(String description) {
+        return new BookingIcs(PARITY_ID, START, END, "Манікюр", null, 0, NOW, ORGANIZER, "Олена", CLIENT_EMAIL,
+                description);
+    }
+
+    @Test
+    @DisplayName("phase 499: the VEVENT carries DESCRIPTION = the escaped service line; SUMMARY is unchanged; CANCEL keeps it")
+    void should_writeEscapedDescription_when_set() {
+        // Arrange
+        String line = ServiceLineExpectedCopy.rangeText("14:00", "15:00", "Гель; френч, дизайн\nX-INJECT:1",
+                ServiceLineExpectedCopy.DURATION, ServiceLineExpectedCopy.PRICE);
+        BookingIcs ics = withDescription(line);
+
+        // Act
+        String request = BookingIcsBuilder.build(ics, IcsMethod.REQUEST);
+        String cancel = BookingIcsBuilder.build(ics, IcsMethod.CANCEL);
+
+        // Assert
+        String expected = ServiceLineExpectedCopy.rangeText("14:00", "15:00",
+                BookingIcsExpectedContent.ESCAPED_HOSTILE_SERVICE_NAME + "\\nX-INJECT:1",
+                ServiceLineExpectedCopy.DURATION, ServiceLineExpectedCopy.PRICE);
+        assertThat(BookingIcsExpectedContent.property(request, "DESCRIPTION")).hasValue(expected);
+        assertThat(BookingIcsExpectedContent.property(cancel, "DESCRIPTION")).hasValue(expected);
+        assertThat(BookingIcsExpectedContent.property(request, "SUMMARY")).hasValue("Манікюр");
+        assertThat(BookingIcsExpectedContent.lines(request)).noneMatch(l -> l.startsWith("X-INJECT"));
+    }
+
+    @Test
+    @DisplayName("phase 499: a long Cyrillic DESCRIPTION folds at 75 octets without splitting a code point and unfolds intact")
+    void should_foldDescriptionAcrossCyrillic_when_long() {
+        // Arrange
+        String line = ServiceLineExpectedCopy.rangeText("14:00", "15:00", "Дуже довга назва послуги ".repeat(6),
+                ServiceLineExpectedCopy.DURATION, ServiceLineExpectedCopy.PRICE);
+
+        // Act
+        String out = BookingIcsBuilder.build(withDescription(line), IcsMethod.REQUEST);
+
+        // Assert
+        assertThat(out.split(CRLF)).allSatisfy(l -> assertThat(l.getBytes(StandardCharsets.UTF_8).length)
+                .isLessThanOrEqualTo(75));
+        assertThat(out).contains(CRLF + " ");
+        assertThat(BookingIcsExpectedContent.property(out, "DESCRIPTION")).hasValue(line);
+    }
+
+    @Test
+    @DisplayName("phase 499: DESCRIPTION is absent on the VEVENT when null or blank")
+    void should_omitDescription_when_nullOrBlank() {
+        // Arrange / Act
+        String nullOut = BookingIcsBuilder.build(withDescription(null), IcsMethod.CANCEL);
+        String blankOut = BookingIcsBuilder.build(withDescription("  "), IcsMethod.CANCEL);
+
+        // Assert
+        assertThat(BookingIcsExpectedContent.property(nullOut, "DESCRIPTION")).isEmpty();
+        assertThat(BookingIcsExpectedContent.property(blankOut, "DESCRIPTION")).isEmpty();
     }
 }

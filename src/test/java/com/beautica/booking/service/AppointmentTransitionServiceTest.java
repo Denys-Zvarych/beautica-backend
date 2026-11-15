@@ -13,6 +13,8 @@ import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.enums.CancellationReason;
 import com.beautica.booking.repository.AppointmentRepository;
 import com.beautica.booking.repository.BookingRepository;
+import com.beautica.booking.repository.BookingTimeRange;
+import com.beautica.common.exception.ClientBookingConflictException;
 import com.beautica.common.cache.MasterCachePrefixEvictor;
 import com.beautica.common.exception.BookingElapsedException;
 import com.beautica.common.exception.BusinessException;
@@ -50,6 +52,8 @@ import java.util.Optional;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.catchThrowable;
+import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
@@ -860,6 +864,46 @@ class AppointmentTransitionServiceTest {
         // Provider path never touches enforceCanManageAppointment's return value here — this test
         // stubs it as a no-op via the default Mockito void behaviour (authorized).
         verify(authz).enforceCanManageAppointment(actorId, appointmentId);
+    }
+
+    @Test
+    @DisplayName("rescheduleAppointmentItem — PROVIDER-initiated move into the client's overlap → CLIENT_BOOKING_CONFLICT "
+            + "is window-only (no id/service/master), read via the window projection, never the full graph (BOOK-74/75)")
+    void should_throwRedactedClientBookingConflict_when_providerReschedulesItemIntoClientOverlap() {
+        setUpRescheduleItemFixtures();
+        UUID targetId = UUID.randomUUID();
+        UUID actorId = UUID.randomUUID();
+        OffsetDateTime start = OffsetDateTime.parse("2026-08-10T09:00:00Z");
+        Booking target = confirmedItem(targetId, start, start.plusHours(1));
+        Appointment appointment = Appointment.builder().id(appointmentId).client(itemClient).build();
+        OffsetDateTime newStartsAt = OffsetDateTime.parse("2026-08-11T09:00:00Z");
+        AppointmentItemRescheduleRequest req = new AppointmentItemRescheduleRequest(newStartsAt, false);
+        UUID conflictingBookingId = UUID.randomUUID();
+        OffsetDateTime conflictEndsAt = newStartsAt.plusMinutes(90);
+
+        when(appointmentRepository.findById(appointmentId)).thenReturn(Optional.of(appointment));
+        when(bookingRepository.findByAppointmentIdWithGraph(appointmentId)).thenReturn(List.of(target));
+        stubStaffItemSlotAvailable(newStartsAt);
+        when(bookingRepository.acquireClientAdvisoryLockWithTimeout(clientId)).thenReturn(1);
+        when(bookingRepository.findFirstConflictingClientBookingIdExcluding(eq(clientId), any(), any(), eq(targetId)))
+                .thenReturn(Optional.of(conflictingBookingId));
+        when(bookingRepository.findTimeRangeById(conflictingBookingId))
+                .thenReturn(Optional.of(new BookingTimeRange(newStartsAt, conflictEndsAt)));
+
+        Throwable thrown = catchThrowable(() -> appointmentTransitionService.rescheduleAppointmentItem(
+                actorId, Role.SALON_ADMIN, appointmentId, targetId, req));
+
+        assertThat(thrown).isInstanceOf(ClientBookingConflictException.class);
+        ClientBookingConflictException cbce = (ClientBookingConflictException) thrown;
+        assertThat(cbce.isRedacted()).as("provider-initiated item reschedule must redact the conflict").isTrue();
+        assertThat(cbce.getConflictingBookingId()).as("provider must not learn the booking id").isNull();
+        assertThat(cbce.getServiceName()).as("provider must not learn the service").isNull();
+        assertThat(cbce.getMasterName()).as("provider must not learn the master").isNull();
+        assertThat(cbce.getStartsAt()).isEqualTo(newStartsAt);
+        assertThat(cbce.getEndsAt()).isEqualTo(conflictEndsAt);
+        verify(bookingRepository, never()).findByIdWithFullGraph(conflictingBookingId);
+        verify(bookingRepository, never()).saveAndFlush(any());
+        verify(outboxService, never()).enqueueBookingRescheduled(any(), anyBoolean(), any());
     }
 
     @Test

@@ -858,6 +858,18 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     Optional<Booking> findByIdWithFullGraph(@Param("id") UUID id);
 
     /**
+     * Only the window of one booking, by primary key — two columns, no joins, no managed entity.
+     * Serves the provider-initiated {@code CLIENT_BOOKING_CONFLICT} (redacted body carries only
+     * the window), so the client's booking at another salon is never hydrated.
+     */
+    @Query("""
+            SELECT new com.beautica.booking.repository.BookingTimeRange(b.startsAt, b.endsAt)
+            FROM Booking b
+            WHERE b.id = :id
+            """)
+    Optional<BookingTimeRange> findTimeRangeById(@Param("id") UUID id);
+
+    /**
      * Phase 401 D8 — the reviewable bookings of a VISIT-keyed review invite: the COMPLETED LINK guest bookings
      * (phase 434: or STAFF walk-in bookings) with {@code client_id IS NULL} of {@code appointmentId}, ordered by {@code startsAt}. One statement, same fetch graph
      * as {@link #findByIdWithFullGraph} (master + user, salon, service definition), because the guest review page reads

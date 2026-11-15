@@ -927,7 +927,9 @@ public class AppointmentTransitionService {
             // BookingTemporalGuard/assertItemNotElapsedForClient branch above — reused here
             // rather than threading a new parameter.
             if (initiatedByProvider || !req.allowClientOverlap()) {
-                assertNoClientConflictExcludingBooking(owningClient.getId(), newStartsAt, newEndsAt, bookingId);
+                // Provider actor → redacted 409 body (window only) — see BookingService#rescheduleBooking.
+                assertNoClientConflictExcludingBooking(
+                        owningClient.getId(), newStartsAt, newEndsAt, bookingId, initiatedByProvider);
             }
             lockResult = bookingRepository.acquireAdvisoryLock(masterId);
         } else {
@@ -1337,24 +1339,18 @@ public class AppointmentTransitionService {
      * carries for the overlap check (phase 30.3).
      */
     private void assertNoClientConflictExcludingBooking(
-            UUID clientId, OffsetDateTime startsAt, OffsetDateTime endsAt, UUID excludeBookingId) {
+            UUID clientId, OffsetDateTime startsAt, OffsetDateTime endsAt, UUID excludeBookingId,
+            boolean initiatedByProvider) {
         bookingRepository.findFirstConflictingClientBookingIdExcluding(clientId, startsAt, endsAt, excludeBookingId)
                 .ifPresent(conflictId -> {
-                    throw clientConflictException(conflictId);
+                    throw clientConflictException(conflictId, initiatedByProvider);
                 });
     }
 
-    /**
-     * Re-hydrated with the full association graph so the exception can read service name +
-     * master display name without a lazy load — mirrors {@code BookingService}'s identical helper.
-     * The row was just found by the query above in this same transaction, so it is guaranteed to
-     * still exist.
-     */
-    private ClientBookingConflictException clientConflictException(UUID conflictingBookingId) {
-        Booking conflict = bookingRepository.findByIdWithFullGraph(conflictingBookingId)
-                .orElseThrow(() -> new BusinessException(
-                        HttpStatus.INTERNAL_SERVER_ERROR, "Conflicting booking could not be loaded"));
-        return new ClientBookingConflictException(conflict);
+    /** Shared builder — full body for a client actor, window-only for a provider (see {@link ClientBookingConflicts}). */
+    private ClientBookingConflictException clientConflictException(
+            UUID conflictingBookingId, boolean initiatedByProvider) {
+        return ClientBookingConflicts.build(bookingRepository, conflictingBookingId, initiatedByProvider);
     }
 
     private static UUID salonIdOfMaster(Master master) {

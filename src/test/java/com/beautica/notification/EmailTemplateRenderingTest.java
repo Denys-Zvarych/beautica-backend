@@ -1,5 +1,6 @@
 package com.beautica.notification;
 
+import com.beautica.notification.ServiceLineExpectedCopy;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -30,10 +31,10 @@ class EmailTemplateRenderingTest {
         var ctx = new Context();
         ctx.setVariable("masterName", "Оксана");
         ctx.setVariable("clientName", "Іван Петренко");
-        ctx.setVariable("serviceNames", List.of("Стрижка"));
+        ctx.setVariable("serviceLines", ServiceLineExpectedCopy.lines("Стрижка"));
         ctx.setVariable("serviceLabel", "Послуга");
         ctx.setVariable("startsAt", "10:00, 20 травня 2026");
-        ctx.setVariable("visitDuration", null);
+        ctx.setVariable("visitHeader", null);
 
         String html = templateEngine.process("email/new-booking", ctx);
 
@@ -50,10 +51,10 @@ class EmailTemplateRenderingTest {
         var ctx = new Context();
         ctx.setVariable("masterName", "Оксана");
         ctx.setVariable("clientName", "Іван Петренко");
-        ctx.setVariable("serviceNames", List.of("Стрижка", "Фарбування", "Укладка"));
+        ctx.setVariable("serviceLines", ServiceLineExpectedCopy.lines("Стрижка", "Фарбування", "Укладка"));
         ctx.setVariable("serviceLabel", "Послуги");
         ctx.setVariable("startsAt", "10:00, 20 травня 2026");
-        ctx.setVariable("visitDuration", "2 год 30 хв (до 12:30)");
+        ctx.setVariable("visitHeader", ServiceLineExpectedCopy.VISIT_HEADER);
 
         String html = templateEngine.process("email/new-booking", ctx);
 
@@ -66,24 +67,24 @@ class EmailTemplateRenderingTest {
         assertThat(body(html)).contains("Послуги");
         assertThat(countOccurrences(body(html), "Послуги")).isEqualTo(1);
         // Visit-level totals appear only for a visit.
-        assertThat(html).contains("Тривалість").contains("2 год 30 хв (до 12:30)");
+        assertThat(html).contains(ServiceLineExpectedCopy.VISIT_HEADER_LABEL).contains(ServiceLineExpectedCopy.VISIT_HEADER);
     }
 
     @Test
-    @DisplayName("new-booking template omits the «Тривалість» row entirely when visitDuration is null "
+    @DisplayName("new-booking template omits the visit-header row entirely when visitHeader is null "
             + "(single-service booking renders exactly as it did before visits existed)")
     void should_omitDurationRow_when_newBookingTemplateProcessedWithNullVisitDuration() {
         var ctx = new Context();
         ctx.setVariable("masterName", "Оксана");
         ctx.setVariable("clientName", "Іван Петренко");
-        ctx.setVariable("serviceNames", List.of("Стрижка"));
+        ctx.setVariable("serviceLines", ServiceLineExpectedCopy.lines("Стрижка"));
         ctx.setVariable("serviceLabel", "Послуга");
         ctx.setVariable("startsAt", "10:00, 20 травня 2026");
-        ctx.setVariable("visitDuration", null);
+        ctx.setVariable("visitHeader", null);
 
         String html = templateEngine.process("email/new-booking", ctx);
 
-        assertThat(html).doesNotContain("Тривалість");
+        assertThat(html).doesNotContain(ServiceLineExpectedCopy.VISIT_HEADER_LABEL);
         assertThat(body(html)).doesNotContain("Послуги");
         assertThat(countOccurrences(body(html), "Послуга")).isEqualTo(1);
     }
@@ -93,17 +94,17 @@ class EmailTemplateRenderingTest {
     void should_renderRequiredFields_when_bookingConfirmedTemplateProcessed() {
         var ctx = new Context();
         ctx.setVariable("clientName", "Марія Коваль");
-        ctx.setVariable("serviceNames", List.of("Манікюр"));
+        ctx.setVariable("serviceLines", ServiceLineExpectedCopy.lines("Манікюр"));
         ctx.setVariable("serviceLabel", "Послуга");
         ctx.setVariable("startsAt", "14:30, 22 травня 2026");
-        ctx.setVariable("visitDuration", null);
+        ctx.setVariable("visitHeader", null);
 
         String html = templateEngine.process("email/booking-confirmed", ctx);
 
         assertThat(html).contains("Марія Коваль");
         assertThat(html).contains("Манікюр");
         assertThat(html).contains("14:30, 22 травня 2026");
-        assertThat(html).doesNotContain("Тривалість");
+        assertThat(html).doesNotContain(ServiceLineExpectedCopy.VISIT_HEADER_LABEL);
     }
 
     @Test
@@ -112,17 +113,17 @@ class EmailTemplateRenderingTest {
     void should_renderEveryServiceRow_when_bookingConfirmedTemplateProcessedForVisit() {
         var ctx = new Context();
         ctx.setVariable("clientName", "Марія Коваль");
-        ctx.setVariable("serviceNames", List.of("Манікюр", "Педикюр"));
+        ctx.setVariable("serviceLines", ServiceLineExpectedCopy.lines("Манікюр", "Педикюр"));
         ctx.setVariable("serviceLabel", "Послуги");
         ctx.setVariable("startsAt", "14:30, 22 травня 2026");
-        ctx.setVariable("visitDuration", "3 год (до 17:30)");
+        ctx.setVariable("visitHeader", ServiceLineExpectedCopy.VISIT_HEADER);
 
         String html = templateEngine.process("email/booking-confirmed", ctx);
 
         assertThat(html).contains("Манікюр").contains("Педикюр");
         assertThat(html.indexOf("Манікюр")).isLessThan(html.indexOf("Педикюр"));
         assertThat(countOccurrences(body(html), "Послуги")).isEqualTo(1);
-        assertThat(html).contains("Тривалість").contains("3 год (до 17:30)");
+        assertThat(html).contains(ServiceLineExpectedCopy.VISIT_HEADER_LABEL).contains(ServiceLineExpectedCopy.VISIT_HEADER);
     }
 
     @Test
@@ -131,17 +132,17 @@ class EmailTemplateRenderingTest {
     void should_borderOnlyLaterServiceRows_when_bookingConfirmedTemplateProcessedForVisit() {
         var single = new Context();
         single.setVariable("clientName", "Марія Коваль");
-        single.setVariable("serviceNames", List.of("Манікюр"));
+        single.setVariable("serviceLines", ServiceLineExpectedCopy.lines("Манікюр"));
         single.setVariable("serviceLabel", "Послуга");
         single.setVariable("startsAt", "14:30, 22 травня 2026");
-        single.setVariable("visitDuration", null);
+        single.setVariable("visitHeader", null);
 
         var visit = new Context();
         visit.setVariable("clientName", "Марія Коваль");
-        visit.setVariable("serviceNames", List.of("Манікюр", "Педикюр"));
+        visit.setVariable("serviceLines", ServiceLineExpectedCopy.lines("Манікюр", "Педикюр"));
         visit.setVariable("serviceLabel", "Послуги");
         visit.setVariable("startsAt", "14:30, 22 травня 2026");
-        visit.setVariable("visitDuration", "3 год (до 17:30)");
+        visit.setVariable("visitHeader", ServiceLineExpectedCopy.VISIT_HEADER);
 
         String singleHtml = templateEngine.process("email/booking-confirmed", single);
         String visitHtml = templateEngine.process("email/booking-confirmed", visit);
@@ -161,10 +162,10 @@ class EmailTemplateRenderingTest {
         var ctx = new Context();
         ctx.setVariable("masterName", "Оксана");
         ctx.setVariable("clientName", "Іван Петренко");
-        ctx.setVariable("serviceNames", List.of("Стрижка", HOSTILE_SERVICE_NAME));
+        ctx.setVariable("serviceLines", ServiceLineExpectedCopy.lines("Стрижка", HOSTILE_SERVICE_NAME));
         ctx.setVariable("serviceLabel", "Послуги");
         ctx.setVariable("startsAt", "10:00, 20 травня 2026");
-        ctx.setVariable("visitDuration", "2 год (до 12:00)");
+        ctx.setVariable("visitHeader", ServiceLineExpectedCopy.VISIT_HEADER);
 
         String html = templateEngine.process("email/new-booking", ctx);
 
@@ -177,10 +178,10 @@ class EmailTemplateRenderingTest {
     void should_escapeHostileServiceName_when_bookingConfirmedTemplateProcessedForVisit() {
         var ctx = new Context();
         ctx.setVariable("clientName", "Марія Коваль");
-        ctx.setVariable("serviceNames", List.of("Манікюр", HOSTILE_SERVICE_NAME));
+        ctx.setVariable("serviceLines", ServiceLineExpectedCopy.lines("Манікюр", HOSTILE_SERVICE_NAME));
         ctx.setVariable("serviceLabel", "Послуги");
         ctx.setVariable("startsAt", "14:30, 22 травня 2026");
-        ctx.setVariable("visitDuration", "2 год (до 16:30)");
+        ctx.setVariable("visitHeader", ServiceLineExpectedCopy.VISIT_HEADER);
 
         String html = templateEngine.process("email/booking-confirmed", ctx);
 
@@ -235,7 +236,7 @@ class EmailTemplateRenderingTest {
     void should_renderCommentRow_when_bookingDeclinedWithComment() {
         var ctx = new Context();
         ctx.setVariable("clientName", "Сергій");
-        ctx.setVariable("serviceNames", List.of("Фарбування"));
+        ctx.setVariable("serviceLines", ServiceLineExpectedCopy.lines("Фарбування"));
         ctx.setVariable("serviceLabel", "Послуга");
         ctx.setVariable("comment", "Майстер хворіє");
 
@@ -250,7 +251,7 @@ class EmailTemplateRenderingTest {
     void should_omitCommentRow_when_bookingDeclinedWithNullComment() {
         var ctx = new Context();
         ctx.setVariable("clientName", "Сергій");
-        ctx.setVariable("serviceNames", List.of("Фарбування"));
+        ctx.setVariable("serviceLines", ServiceLineExpectedCopy.lines("Фарбування"));
         ctx.setVariable("serviceLabel", "Послуга");
         ctx.setVariable("comment", null);
 
@@ -264,7 +265,7 @@ class EmailTemplateRenderingTest {
     void should_renderEveryCancelledService_when_theWholeVisitWasDeclined() {
         var ctx = new Context();
         ctx.setVariable("clientName", "Сергій");
-        ctx.setVariable("serviceNames", List.of("Стрижка", "Фарбування", "Укладка"));
+        ctx.setVariable("serviceLines", ServiceLineExpectedCopy.lines("Стрижка", "Фарбування", "Укладка"));
         ctx.setVariable("serviceLabel", "Послуги");
         ctx.setVariable("comment", null);
 
@@ -285,7 +286,7 @@ class EmailTemplateRenderingTest {
     void should_renderTheSingleServiceShape_when_onlyOneServiceWasDeclined() {
         var ctx = new Context();
         ctx.setVariable("clientName", "Сергій");
-        ctx.setVariable("serviceNames", List.of("Фарбування"));
+        ctx.setVariable("serviceLines", ServiceLineExpectedCopy.lines("Фарбування"));
         ctx.setVariable("serviceLabel", "Послуга");
         ctx.setVariable("comment", null);
 
@@ -309,6 +310,7 @@ class EmailTemplateRenderingTest {
         ctx.setVariable("masterName", "Оксана");
         ctx.setVariable("clientName", "Гість Тестовий");
         ctx.setVariable("serviceName", "Стрижка");
+        ctx.setVariable("serviceLine", ServiceLineExpectedCopy.line("Стрижка"));
         ctx.setVariable("startsAt", "11:00, 21 травня 2026");
 
         String html = templateEngine.process("email/booking-rescheduled-by-salon-provider", ctx);
@@ -324,16 +326,16 @@ class EmailTemplateRenderingTest {
         var ctx = new Context();
         ctx.setVariable("masterName", "Оксана");
         ctx.setVariable("clientName", "Іван Петренко");
-        ctx.setVariable("serviceNames", List.of("Стрижка", "Фарбування"));
+        ctx.setVariable("serviceLines", ServiceLineExpectedCopy.lines("Стрижка", "Фарбування"));
         ctx.setVariable("serviceLabel", "Послуги");
         ctx.setVariable("startsAt", "10:00, 20 травня 2026");
-        ctx.setVariable("visitDuration", "2 год (до 12:00)");
+        ctx.setVariable("visitHeader", ServiceLineExpectedCopy.VISIT_HEADER);
 
         String html = templateEngine.process("email/booking-declined-by-salon-provider", ctx);
 
         assertThat(html).contains("Оксана").contains("Іван Петренко").contains("Стрижка").contains("Фарбування")
                 .contains("10:00, 20 травня 2026").contains("Салон скасував ваше бронювання")
-                .contains("2 год (до 12:00)");
+                .contains(ServiceLineExpectedCopy.VISIT_HEADER);
         assertThat(body(html)).doesNotContain("Нове бронювання");
     }
 
@@ -343,14 +345,14 @@ class EmailTemplateRenderingTest {
         var ctx = new Context();
         ctx.setVariable("masterName", "Оксана");
         ctx.setVariable("clientName", "Іван Петренко");
-        ctx.setVariable("serviceNames", List.of("Стрижка"));
+        ctx.setVariable("serviceLines", ServiceLineExpectedCopy.lines("Стрижка"));
         ctx.setVariable("serviceLabel", "Послуга");
         ctx.setVariable("startsAt", "10:00, 20 травня 2026");
-        ctx.setVariable("visitDuration", null);
+        ctx.setVariable("visitHeader", null);
 
         String html = templateEngine.process("email/booking-declined-by-salon-provider", ctx);
 
-        assertThat(html).contains("Стрижка").doesNotContain("Тривалість");
+        assertThat(html).contains("Стрижка").doesNotContain(ServiceLineExpectedCopy.VISIT_HEADER_LABEL);
     }
 
     // Phase 25.5 (Fix D3): booking-cancelled-provider no longer takes a single `comment`
@@ -365,6 +367,7 @@ class EmailTemplateRenderingTest {
         ctx.setVariable("masterName", "Оксана");
         ctx.setVariable("clientName", "Іван");
         ctx.setVariable("serviceName", "Стрижка");
+        ctx.setVariable("serviceLine", ServiceLineExpectedCopy.line("Стрижка"));
         ctx.setVariable("startsAt", "10:00, 25 травня 2026");
         ctx.setVariable("cancellationNote", "Особисті обставини");
         ctx.setVariable("creationNote", null);
@@ -383,6 +386,7 @@ class EmailTemplateRenderingTest {
         ctx.setVariable("masterName", "Оксана");
         ctx.setVariable("clientName", "Іван");
         ctx.setVariable("serviceName", "Стрижка");
+        ctx.setVariable("serviceLine", ServiceLineExpectedCopy.line("Стрижка"));
         ctx.setVariable("startsAt", "10:00, 25 травня 2026");
         ctx.setVariable("cancellationNote", null);
         ctx.setVariable("creationNote", null);
@@ -401,6 +405,7 @@ class EmailTemplateRenderingTest {
         ctx.setVariable("masterName", "Оксана");
         ctx.setVariable("clientName", "Іван");
         ctx.setVariable("serviceName", "Стрижка");
+        ctx.setVariable("serviceLine", ServiceLineExpectedCopy.line("Стрижка"));
         ctx.setVariable("startsAt", "10:00, 25 травня 2026");
         ctx.setVariable("cancellationNote", "Захворів у день візиту");
         ctx.setVariable("creationNote", "Будь ласка, без ароматизаторів");
@@ -579,6 +584,7 @@ class EmailTemplateRenderingTest {
         var ctx = new Context();
         ctx.setVariable("clientName", "Іван Петренко");
         ctx.setVariable("serviceName", "Стрижка");
+        ctx.setVariable("serviceLine", ServiceLineExpectedCopy.line("Стрижка"));
         ctx.setVariable("startsAt", "10:00, 20 травня 2026");
         ctx.setVariable("bookingUrl", bookingUrl);
 
@@ -600,6 +606,7 @@ class EmailTemplateRenderingTest {
         var ctx = new Context();
         ctx.setVariable("clientName", "Марія Коваль");
         ctx.setVariable("serviceName", "Манікюр");
+        ctx.setVariable("serviceLine", ServiceLineExpectedCopy.line("Манікюр"));
         ctx.setVariable("startsAt", "14:30, 22 травня 2026");
         ctx.setVariable("bookingUrl", "https://app.beautica.ua/bookings/xyz");
 
@@ -623,6 +630,7 @@ class EmailTemplateRenderingTest {
         var ctx = new Context();
         ctx.setVariable("clientName", "Тест Клієнт");
         ctx.setVariable("serviceName", "Тест послуга");
+        ctx.setVariable("serviceLine", ServiceLineExpectedCopy.line("Тест послуга"));
         ctx.setVariable("startsAt", "10:00, 20 травня 2026");
         ctx.setVariable("bookingUrl", "https://app.beautica.ua/bookings/note-sentinel-fixture");
 
@@ -663,12 +671,13 @@ class EmailTemplateRenderingTest {
         ctx.setVariable("masterName", "Оксана");
         ctx.setVariable("clientName", "Іван Петренко");
         ctx.setVariable("serviceName", "Стрижка");
-        ctx.setVariable("serviceNames", List.of("Стрижка", "Укладка"));
+        ctx.setVariable("serviceLine", ServiceLineExpectedCopy.line("Стрижка"));
+        ctx.setVariable("serviceLines", ServiceLineExpectedCopy.lines("Стрижка", "Укладка"));
         ctx.setVariable("serviceLabel", "Послуги");
         ctx.setVariable("startsAt", "10:00, 20 травня 2026");
         ctx.setVariable("oldStartsAt", "09:00, 19 травня 2026");
         ctx.setVariable("newStartsAt", "10:00, 20 травня 2026");
-        ctx.setVariable("visitDuration", "1 год (до 11:00)");
+        ctx.setVariable("visitHeader", ServiceLineExpectedCopy.VISIT_HEADER);
         ctx.setVariable("salonName", "Aurora");
         ctx.setVariable("inviteUrl", "https://beautica.app/invite/t");
         ctx.setVariable("reviewUrl", "https://beautica.app/review/t");
