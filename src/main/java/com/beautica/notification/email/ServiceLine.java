@@ -10,6 +10,11 @@ public record ServiceLine(String time, String name, String durationLabel, String
 
     /** «14:00 Манікюр · 1 год · 500 ₴». */
     public String text() {
-        return time + " " + name + SEPARATOR + durationLabel + SEPARATOR + priceLabel;
+        return time + " " + body();
+    }
+
+    /** «Манікюр · 1 год · 500 ₴» — the line without its start time. */
+    public String body() {
+        return name + SEPARATOR + durationLabel + SEPARATOR + priceLabel;
     }
 }
