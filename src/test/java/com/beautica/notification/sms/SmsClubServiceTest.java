@@ -176,13 +176,15 @@ class SmsClubServiceTest {
 
     @ParameterizedTest(name = "add_info ''{0}'' -> {1}")
     @CsvSource(delimiter = '|', value = {
-            "Incorrect phone number (380671234567)|PHONE_INVALID",
             "Phone number cannot be blank|PHONE_INVALID",
             "Incorrect phones array format|PHONE_INVALID",
             "This number is in the black list|BLACKLISTED",
             "THIS NUMBER IS IN THE BLACK LIST|BLACKLISTED",
             "Not enough money. It is necessary to refill the balance|NO_FUNDS",
             "Message cannot be blank|MESSAGE_BLANK",
+            "Sender name is incorrect|SENDER_INVALID",
+            "Некорректный номер отправителя|OTHER",
+            "Некоректний номер відправника|OTHER",
             "Something new from the provider 380671234567|OTHER"})
     @DisplayName("an add_info entry for the sent number is a definite rejection: the exception carries only the reason "
             + "token, the ERROR log adds the provider text with the number masked (phase 441)")
@@ -312,11 +314,101 @@ class SmsClubServiceTest {
         });
     }
 
+    @ParameterizedTest(name = "add_info ''{0}''")
+    @ValueSource(strings = {"Incorrect phone number (380671234567)", "Некорректный номер получателя",
+            "Некоректний номер одержувача", "  НЕКОРРЕКТНЫЙ НОМЕР ПОЛУЧАТЕЛЯ"})
+    @DisplayName("a 200 add_info rejecting the recipient number is RECIPIENT_INVALID: one WARN with the masked "
+            + "recipient, no ERROR, no Sentry event, still a definite SmsDeliveryException")
+    void should_logWarnNotError_when_addInfoRejectsTheRecipientNumber(String text) {
+        stub(200, addInfo(DIGITS, text));
+        List<SentryEvent> events;
+
+        try (SentryEventCapture sentry = SentryEventCapture.attach(serviceLogger)) {
+            assertThatThrownBy(() -> service.send(PHONE, OTP_TEXT))
+                    .isInstanceOf(SmsDeliveryException.class)
+                    .isNotInstanceOf(SmsDeliveryAmbiguousException.class)
+                    .hasMessage("SMSClub rejected the message reason=RECIPIENT_INVALID");
+            events = sentry.forwarded();
+        }
+
+        wireMock.verify(1, postRequestedFor(urlEqualTo(PATH)));
+        assertThat(logAppender.list).noneMatch(e -> e.getLevel() == Level.ERROR);
+        assertThat(logAppender.list).filteredOn(e -> e.getLevel() == Level.WARN).singleElement()
+                .satisfies(e -> assertThat(e.getFormattedMessage()).isEqualTo(
+                        "SMS send status=FAILED provider=smsclub to=+380***4567 reason=RECIPIENT_INVALID"));
+        assertThat(renderLogs()).doesNotContain(DIGITS).doesNotContain(OTP_TEXT).doesNotContain(TOKEN);
+        assertThat(events).isEmpty();
+    }
+
+    @ParameterizedTest(name = "HTTP 400 add_info ''{0}''")
+    @ValueSource(strings = {"Incorrect phone number", "Некорректный номер получателя", "Некоректний номер одержувача"})
+    @DisplayName("a non-2xx whose add_info rejects the recipient number is one WARN, no ERROR, same HTTP exception")
+    void should_logWarnNotError_when_non2xxRejectsTheRecipientNumber(String text) {
+        stub(400, addInfo(DIGITS, text));
+
+        assertThatThrownBy(() -> service.send(PHONE, OTP_TEXT))
+                .isInstanceOf(SmsDeliveryException.class)
+                .isNotInstanceOf(SmsDeliveryAmbiguousException.class)
+                .hasMessage("SMSClub rejected the request with HTTP 400");
+
+        assertThat(logAppender.list).noneMatch(e -> e.getLevel() == Level.ERROR);
+        assertThat(logAppender.list).filteredOn(e -> e.getLevel() == Level.WARN).singleElement()
+                .satisfies(e -> assertThat(e.getFormattedMessage()).isEqualTo(
+                        "SMS send status=FAILED provider=smsclub to=+380***4567 reason=RECIPIENT_INVALID"));
+    }
+
+    @ParameterizedTest(name = "HTTP {0} ''{1}'' -> {2}")
+    @CsvSource(delimiter = '|', value = {
+            "400|This number is in the black list|blacklisted",
+            "400|Not enough money|no_funds",
+            "400|Sender name is incorrect|sender_invalid",
+            "400|Некорректный номер отправителя|other",
+            "400|Message cannot be blank|message_blank",
+            "400|Incorrect phones array|phone_invalid",
+            "400|Phone number cannot be blank|phone_invalid",
+            "422|Something new from the provider|other",
+            "401|Unauthorized|auth"})
+    @DisplayName("every non-2xx rejection other than an invalid recipient number stays ONE ERROR and no WARN")
+    void should_keepError_when_non2xxRejectionIsNotARecipientNumber(int status, String text, String reason) {
+        stub(status, addInfo(DIGITS, text));
+
+        assertThatThrownBy(() -> service.send(PHONE, OTP_TEXT)).isInstanceOf(SmsDeliveryException.class)
+                .hasMessage("SMSClub rejected the request with HTTP " + status);
+
+        assertThat(logAppender.list).filteredOn(e -> e.getLevel() == Level.ERROR).singleElement()
+                .satisfies(e -> assertThat(e.getFormattedMessage())
+                        .contains("http=" + status + " reason=" + reason));
+        assertThat(logAppender.list).noneMatch(e -> e.getLevel() == Level.WARN);
+    }
+
     @Test
-    @DisplayName("audit-fix 441: a visitor-driven PHONE_INVALID flood stays ERROR on every attempt but reaches "
+    @DisplayName("an invalid-recipient run one short of the spike threshold is WARN on every attempt and never "
+            + "reaches Sentry")
+    void should_neverLogErrorOrReachSentry_when_recipientInvalidRejectionsStayBelowSpikeThreshold() {
+        stub(200, addInfo(DIGITS, "Некорректный номер получателя"));
+        int attempts = 30;
+        SmsClubService alarmed = withSpikeAlarm(new RecipientInvalidSpikeAlarm(
+                clockAt(SPIKE_T0), attempts + 1, SPIKE_WINDOW));
+        List<SentryEvent> events;
+
+        try (SentryEventCapture sentry = SentryEventCapture.attach(serviceLogger)) {
+            for (int i = 0; i < attempts; i++) {
+                assertThatThrownBy(() -> alarmed.send(PHONE, OTP_TEXT)).isInstanceOf(SmsDeliveryException.class);
+            }
+            events = sentry.forwarded();
+        }
+
+        assertThat(logAppender.list).noneMatch(e -> e.getLevel() == Level.ERROR);
+        assertThat(logAppender.list).filteredOn(e -> e.getLevel() == Level.WARN).hasSize(attempts)
+                .allSatisfy(e -> assertThat(e.getFormattedMessage()).contains("reason=RECIPIENT_INVALID"));
+        assertThat(events).isEmpty();
+    }
+
+    @Test
+    @DisplayName("audit-fix 441: a malformed-request PHONE_INVALID flood stays ERROR on every attempt but reaches "
             + "Sentry exactly 5 times (the window budget), under one smsclub/phone_invalid fingerprint")
     void should_capSentryEvents_when_manyPhoneInvalidRejections() {
-        stub(200, addInfo(DIGITS, "incorrect phone number"));
+        stub(200, addInfo(DIGITS, "Incorrect phones array"));
         int attempts = 30;
         List<SentryEvent> events;
 
@@ -424,6 +516,107 @@ class SmsClubServiceTest {
                 .isInstanceOf(SmsDeliveryException.class)
                 .hasMessage("SMS provider is not configured");
         wireMock.verify(0, postRequestedFor(urlEqualTo(PATH)));
+    }
+
+    // ── RECIPIENT_INVALID spike (phase 441 audit-fix) ───────────────────────
+
+    private static final int SPIKE_THRESHOLD = 3;
+    private static final Duration SPIKE_WINDOW = Duration.ofMinutes(10);
+    private static final Instant SPIKE_T0 = Instant.parse("2026-11-16T10:00:00Z");
+    private static final String SPIKE_ERROR = "External call failed service=smsclub op=send http=- "
+            + "reason=recipient_invalid_spike to=- detail=count=3 window=PT10M";
+
+    private SmsClubService withSpikeAlarm(RecipientInvalidSpikeAlarm alarm) {
+        return new SmsClubService(RestClient.builder(), props(wireMock.baseUrl() + PATH), LIFETIME, null, alarm);
+    }
+
+    private static Clock clockAt(Instant instant) {
+        Clock clock = org.mockito.Mockito.mock(Clock.class);
+        org.mockito.Mockito.when(clock.millis()).thenReturn(instant.toEpochMilli());
+        return clock;
+    }
+
+    private void sendRejected(SmsClubService target, int times) {
+        for (int i = 0; i < times; i++) {
+            assertThatThrownBy(() -> target.send(PHONE, OTP_TEXT)).isInstanceOf(SmsDeliveryException.class);
+        }
+    }
+
+    private List<String> errorLines() {
+        return logAppender.list.stream().filter(e -> e.getLevel() == Level.ERROR)
+                .map(ILoggingEvent::getFormattedMessage).toList();
+    }
+
+    @Test
+    @DisplayName("spike: N-1 invalid-recipient rejections in the window — WARN each, no ERROR")
+    void should_logNoError_when_recipientInvalidCountIsOneBelowThreshold() {
+        stub(200, addInfo(DIGITS, "Некорректный номер получателя"));
+        SmsClubService alarmed = withSpikeAlarm(
+                new RecipientInvalidSpikeAlarm(clockAt(SPIKE_T0), SPIKE_THRESHOLD, SPIKE_WINDOW));
+
+        sendRejected(alarmed, SPIKE_THRESHOLD - 1);
+
+        assertThat(errorLines()).isEmpty();
+        assertThat(logAppender.list).filteredOn(e -> e.getLevel() == Level.WARN).hasSize(SPIKE_THRESHOLD - 1);
+    }
+
+    @Test
+    @DisplayName("spike: the N-th invalid-recipient rejection logs exactly one aggregate ERROR, one Sentry event, no PII")
+    void should_logExactlyOneAggregateError_when_recipientInvalidCountReachesThreshold() {
+        stub(200, addInfo(DIGITS, "Некорректный номер получателя"));
+        SmsClubService alarmed = withSpikeAlarm(
+                new RecipientInvalidSpikeAlarm(clockAt(SPIKE_T0), SPIKE_THRESHOLD, SPIKE_WINDOW));
+        List<SentryEvent> events;
+
+        try (SentryEventCapture sentry = SentryEventCapture.attach(serviceLogger)) {
+            sendRejected(alarmed, SPIKE_THRESHOLD);
+            events = sentry.forwarded();
+        }
+
+        assertThat(errorLines()).containsExactly(SPIKE_ERROR);
+        assertThat(logAppender.list).filteredOn(e -> e.getLevel() == Level.WARN).hasSize(SPIKE_THRESHOLD);
+        assertThat(events).singleElement().satisfies(event -> assertThat(event.getFingerprints())
+                .containsExactly("external-call", "smsclub", "recipient_invalid_spike"));
+        assertThat(renderLogs()).doesNotContain(DIGITS).doesNotContain(OTP_TEXT).doesNotContain(TOKEN);
+    }
+
+    @Test
+    @DisplayName("spike: 2N invalid-recipient rejections in the same window — still exactly one aggregate ERROR")
+    void should_logOnlyOneAggregateError_when_recipientInvalidCountDoublesThresholdInOneWindow() {
+        stub(200, addInfo(DIGITS, "Некорректный номер получателя"));
+        SmsClubService alarmed = withSpikeAlarm(
+                new RecipientInvalidSpikeAlarm(clockAt(SPIKE_T0), SPIKE_THRESHOLD, SPIKE_WINDOW));
+
+        sendRejected(alarmed, 2 * SPIKE_THRESHOLD);
+
+        assertThat(errorLines()).containsExactly(SPIKE_ERROR);
+    }
+
+    @Test
+    @DisplayName("spike: once the window has elapsed the count restarts and the aggregate ERROR can fire again")
+    void should_fireAggregateErrorAgain_when_windowHasElapsed() {
+        stub(200, addInfo(DIGITS, "Некорректный номер получателя"));
+        Clock clock = clockAt(SPIKE_T0);
+        SmsClubService alarmed = withSpikeAlarm(new RecipientInvalidSpikeAlarm(clock, SPIKE_THRESHOLD, SPIKE_WINDOW));
+        sendRejected(alarmed, 2 * SPIKE_THRESHOLD);
+        org.mockito.Mockito.when(clock.millis()).thenReturn(SPIKE_T0.plus(SPIKE_WINDOW).toEpochMilli());
+
+        sendRejected(alarmed, SPIKE_THRESHOLD);
+
+        assertThat(errorLines()).containsExactly(SPIKE_ERROR, SPIKE_ERROR);
+    }
+
+    @Test
+    @DisplayName("spike: other rejection reasons never count toward the invalid-recipient spike")
+    void should_notCountTowardSpike_when_rejectionIsNotRecipientInvalid() {
+        stub(200, addInfo(DIGITS, "This number is in the black list"));
+        SmsClubService alarmed = withSpikeAlarm(
+                new RecipientInvalidSpikeAlarm(clockAt(SPIKE_T0), SPIKE_THRESHOLD, SPIKE_WINDOW));
+
+        sendRejected(alarmed, SPIKE_THRESHOLD);
+
+        assertThat(errorLines()).hasSize(SPIKE_THRESHOLD)
+                .allMatch(line -> line.contains("reason=blacklisted"));
     }
 
     // ── staging daily cap (phase 439 audit-fix) ─────────────────────────────
