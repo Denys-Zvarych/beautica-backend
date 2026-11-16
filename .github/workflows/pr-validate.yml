@@ -20,7 +20,7 @@ run-name: >-
 # Pull requests run only the test classes the affected-test selector says can
 # observe the change (scripts/ci/select-tests.sh, src/test/java/com/beautica/ci).
 # FULL suites run on: push to dev/main, workflow_dispatch (the nightly run dispatches
-# this workflow on `dev`, see nightly.yml), PRs labelled `full-ci`, and any PR that touches CI
+# this workflow on `main`, see nightly.yml), PRs labelled `full-ci`, and any PR that touches CI
 # infrastructure. Full runs, and selective runs above 120 classes, are sharded across 3 runners,
 # balanced by class weight (heavy integration tests spread evenly, see TestSharder).
 #
@@ -31,7 +31,7 @@ run-name: >-
 #   selector-self-test  only when CI infra changed
 #   test           matrix shard, skipped when mode=none
 #   verify         proves every selected class executed (runs the BASE copy of the script, read-only token)
-#   report         publishes results (write token, no PR code, no scripts); presentation only, NOT a ci-gate need
+#   report         publishes results to the job summary (read-only token, no PR code, no scripts); presentation only, NOT a ci-gate need
 #   ci-gate        the ONLY required status check (if: always(), skipped != failure)
 #
 # TRUST MODEL. A pull_request run executes the PR's own code, so the gate must not be decided by it:
@@ -570,9 +570,10 @@ jobs:
           ./scripts/ci/verify-selected-ran.sh "$RUNNER_TEMP/ci-out/selected-tests.txt" build/merged-results "$RUNNER_TEMP/ci-out/report-aliases.txt"
           echo "Executed test-class reports: $(find build/merged-results -name '*.xml' | wc -l)" >> "$GITHUB_STEP_SUMMARY"
 
-  # Holds the write scope, so it runs NO repository scripts and checks out NO pull-request code: it
-  # downloads artifacts and hands them to the pinned reporter action. The trusted (base) checkout
-  # is sparse and exists only because the reporter lists tracked files with `git ls-files`.
+  # Read-only: the reporter writes the job summary (use-actions-summary), never the Checks API --
+  # v1.9.1's checks.update right after checks.create hit GitHub's transient 404 (dorny/test-reporter
+  # #866) and failed the nightly dispatch run 43841923539. Still runs NO repository scripts and checks
+  # out NO pull-request code; the sparse trusted checkout exists only for the reporter's `git ls-files`.
   report:
     name: Report
     needs: [plan, test]
@@ -580,7 +581,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
-      checks: write
       contents: read
     steps:
       - name: Checkout trusted tree (no PR code)
@@ -598,12 +598,13 @@ jobs:
           merge-multiple: true
 
       - name: Publish test results
-        uses: dorny/test-reporter@31a54ee7ebcacc03a09ea97a7e5465a47b84aea5 # v1.9.1
+        uses: dorny/test-reporter@d1b5dff021aa968b288b02285a8bf47471c5928a # v3.2.0
         with:
           name: JUnit Tests
           path: build/merged-results/*.xml
           reporter: java-junit
           fail-on-error: false
+          use-actions-summary: 'true'
 
   ci-gate:
     name: CI Gate
