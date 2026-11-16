@@ -60,11 +60,11 @@ class ExternalCallSentryVolumeTest {
     }
 
     @Test
-    @DisplayName("visitor-driven smsclub PHONE_INVALID flood — every ERROR line kept, at most 5 Sentry events")
+    @DisplayName("smsclub PHONE_INVALID (malformed request) flood — every ERROR line kept, at most 5 Sentry events")
     void should_capSentryEvents_when_manyPhoneInvalidRejections() {
         for (int i = 0; i < 200; i++) {
             ExternalCallFailure.of("smsclub", "send").http(200).reason("PHONE_INVALID").to("+380***" + i)
-                    .detail("incorrect phone number").log(logger);
+                    .detail("incorrect phones array").log(logger);
         }
 
         assertThat(errorLines()).isEqualTo(200);

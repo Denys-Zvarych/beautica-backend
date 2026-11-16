@@ -26,6 +26,9 @@ public class SmsClubProperties {
     /** The only send endpoint prod may use ({@code EnvironmentFingerprintGuard} rule {@code prod-smsclub-base-url}). */
     /** Staging-only real-send ceiling per Kyiv day while the {@code smsclub} opt-in is on (Phase 439 audit-fix). */
     static final int DEFAULT_STAGING_DAILY_CAP = 50;
+    /** RECIPIENT_INVALID rejections per window that raise ONE aggregate ERROR (phase 441 audit-fix). */
+    static final int DEFAULT_RECIPIENT_INVALID_SPIKE_THRESHOLD = 20;
+    static final Duration DEFAULT_RECIPIENT_INVALID_SPIKE_WINDOW = Duration.ofMinutes(10);
     static final String DEFAULT_BASE_URL = "https://im.smsclub.mobi/sms/send";
 
     /** Provider API token (Bearer). Blank when SMSClub is unconfigured. */
@@ -51,6 +54,12 @@ public class SmsClubProperties {
 
     /** Staging-only daily send cap ({@code StagingSmsDailyCap}); ignored outside the {@code staging} profile. */
     private Integer stagingDailyCap = DEFAULT_STAGING_DAILY_CAP;
+
+    /** {@code RecipientInvalidSpikeAlarm} threshold (validated positive by its constructor). */
+    private Integer recipientInvalidSpikeThreshold = DEFAULT_RECIPIENT_INVALID_SPIKE_THRESHOLD;
+
+    /** {@code RecipientInvalidSpikeAlarm} window (validated positive by its constructor). */
+    private Duration recipientInvalidSpikeWindow = DEFAULT_RECIPIENT_INVALID_SPIKE_WINDOW;
 
     public String getToken() {
         return token;
@@ -114,5 +123,21 @@ public class SmsClubProperties {
 
     public void setStagingDailyCap(Integer stagingDailyCap) {
         this.stagingDailyCap = stagingDailyCap;
+    }
+
+    public Integer getRecipientInvalidSpikeThreshold() {
+        return recipientInvalidSpikeThreshold;
+    }
+
+    public void setRecipientInvalidSpikeThreshold(Integer recipientInvalidSpikeThreshold) {
+        this.recipientInvalidSpikeThreshold = recipientInvalidSpikeThreshold;
+    }
+
+    public Duration getRecipientInvalidSpikeWindow() {
+        return recipientInvalidSpikeWindow;
+    }
+
+    public void setRecipientInvalidSpikeWindow(Duration recipientInvalidSpikeWindow) {
+        this.recipientInvalidSpikeWindow = recipientInvalidSpikeWindow;
     }
 }

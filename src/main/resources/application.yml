@@ -573,6 +573,10 @@ app:
       # Phase 439 audit-fix: staging-only real-send ceiling per Kyiv day while the smsclub opt-in is on
       # (StagingSmsDailyCap); ignored in prod and in capture mode.
       staging-daily-cap: ${SMSCLUB_STAGING_DAILY_CAP:50}
+      # Phase 441 audit-fix: each RECIPIENT_INVALID rejection is a WARN; this many within the window log ONE aggregate
+      # ERROR (reason=recipient_invalid_spike) so a number-formatting regression or an abuse flood reaches Sentry.
+      recipient-invalid-spike-threshold: 20
+      recipient-invalid-spike-window: 10m
   telegram:
     # Phase 404 — opt-in Telegram reminder channel (TelegramConfig). OFF by default: NoOpTelegramMessenger
     # throws, so every message falls back to SMS. Write the flag as true/false (no relaxed binding).

@@ -1,20 +1,28 @@
 package com.beautica.config;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import com.beautica.notification.sms.CapturingOtpSmsSender;
 import com.beautica.notification.sms.CapturingSmsService;
 import com.beautica.notification.sms.NoOpSmsService;
 import com.beautica.notification.sms.OtpSmsSender;
+import com.beautica.notification.sms.RecipientInvalidSpikeAlarm;
 import com.beautica.notification.sms.SmsClubOtpSmsSender;
 import com.beautica.notification.sms.SmsClubService;
+import com.beautica.notification.sms.SmsDeliveryException;
 import com.beautica.notification.sms.SmsService;
 import com.beautica.notification.sms.TurbosmsOtpSmsSender;
 import com.beautica.notification.sms.TurbosmsService;
+import com.github.tomakehurst.wiremock.WireMockServer;
 import com.tngtech.archunit.core.domain.JavaClass;
 import com.tngtech.archunit.core.domain.JavaClasses;
 import com.tngtech.archunit.core.importer.ClassFileImporter;
 import com.tngtech.archunit.core.importer.ImportOption;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.NoSuchBeanDefinitionException;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
@@ -24,8 +32,13 @@ import org.springframework.mail.javamail.JavaMailSender;
 import org.springframework.web.client.RestClient;
 import org.mockito.Mockito;
 
+import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
+import static com.github.tomakehurst.wiremock.client.WireMock.post;
+import static com.github.tomakehurst.wiremock.client.WireMock.urlEqualTo;
+import static com.github.tomakehurst.wiremock.core.WireMockConfiguration.options;
 import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.noClasses;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Phase 22.7 — the {@code app.booking.sms.enabled} bean-selection matrix.
@@ -61,6 +74,11 @@ class SmsFeatureGateTest {
     private static final String OTP_SENDER_SMSCLUB_IMPL_SIMPLE_NAME = "SmsClubOtpSmsSender";
 
     private static final String MODE = "beautica.sms.mode";
+
+    private static final String SMSCLUB_PATH = "/sms/send";
+    private static final String SMSCLUB_PHONE = "+380671234567";
+    private static final String SMSCLUB_DIGITS = "380671234567";
+    private static final int SPIKE_THRESHOLD = 3;
 
     private final ApplicationContextRunner runner = new ApplicationContextRunner()
             .withUserConfiguration(SmsDependencies.class, SmsConfig.class);
@@ -327,6 +345,56 @@ class SmsFeatureGateTest {
         }
     }
 
+    /**
+     * Phase 441 audit-fix — the booking and OTP {@link SmsClubService}s must share ONE
+     * {@link RecipientInvalidSpikeAlarm}. Two instances would each count half the rejections, silently halving the
+     * spike sensitivity. Proven by behaviour (no accessor, no reflection): threshold-1 rejections through the booking
+     * sender plus 1 through the OTP sender reach the threshold — and raise the one ERROR — only if the count is shared.
+     *
+     * <p><b>Falsified:</b> {@code SmsConfig} building a separate alarm per sender turned this row RED.
+     */
+    @Test
+    @DisplayName("audit-fix 441: mode=smsclub — booking and OTP senders share ONE RecipientInvalidSpikeAlarm")
+    void should_shareOneSpikeAlarm_when_modeIsSmsClub() {
+        WireMockServer wireMock = new WireMockServer(options().dynamicPort());
+        wireMock.start();
+        wireMock.stubFor(post(urlEqualTo(SMSCLUB_PATH)).willReturn(aResponse().withStatus(200)
+                .withHeader("Content-Type", "application/json")
+                .withBody("{\"success_request\":{\"add_info\":{\"" + SMSCLUB_DIGITS
+                        + "\":\"Некорректный номер получателя\"}}}")));
+        Logger serviceLogger = (Logger) LoggerFactory.getLogger(SmsClubService.class);
+        ListAppender<ILoggingEvent> logAppender = new ListAppender<>();
+        logAppender.start();
+        serviceLogger.addAppender(logAppender);
+
+        try {
+            runner.withPropertyValues(FLAG + "=true", MODE + "=smsclub",
+                    "app.sms.smsclub.token=test-token",
+                    "app.sms.smsclub.base-url=" + wireMock.baseUrl() + SMSCLUB_PATH,
+                    "app.sms.smsclub.recipient-invalid-spike-threshold=" + SPIKE_THRESHOLD).run(context -> {
+                assertThat(context).hasNotFailed();
+                assertThat(context).hasSingleBean(RecipientInvalidSpikeAlarm.class);
+                SmsService booking = context.getBean(SmsService.class);
+                OtpSmsSender otp = context.getBean(OtpSmsSender.class);
+
+                for (int i = 0; i < SPIKE_THRESHOLD - 1; i++) {
+                    assertThatThrownBy(() -> booking.send(SMSCLUB_PHONE, "booking"))
+                            .isInstanceOf(SmsDeliveryException.class);
+                }
+                assertThat(logAppender.list).noneMatch(e -> e.getLevel() == Level.ERROR);
+                assertThatThrownBy(() -> otp.send(SMSCLUB_PHONE, "otp")).isInstanceOf(SmsDeliveryException.class);
+
+                assertThat(logAppender.list)
+                        .as("the OTP rejection must complete the booking sender's count — one shared alarm")
+                        .filteredOn(e -> e.getLevel() == Level.ERROR).singleElement()
+                        .satisfies(e -> assertThat(e.getFormattedMessage()).contains("recipient_invalid_spike"));
+            });
+        } finally {
+            serviceLogger.detachAppender(logAppender);
+            wireMock.stop();
+        }
+    }
+
     @Test
     @DisplayName("phase 439: mode=turbosms/absent/capture — no SMSClub bean in any flag state")
     void should_notRegisterSmsClubBeans_when_modeIsNotSmsClub() {
@@ -409,6 +477,12 @@ class SmsFeatureGateTest {
         @Bean
         TurbosmsProperties turbosmsProperties() {
             return new TurbosmsProperties();
+        }
+
+        /** The app's ClockConfig bean; smsclub mode's RecipientInvalidSpikeAlarm (phase 441 audit-fix) needs it. */
+        @Bean
+        java.time.Clock clock() {
+            return java.time.Clock.systemUTC();
         }
     }
 }
