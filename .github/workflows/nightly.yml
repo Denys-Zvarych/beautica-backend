@@ -1,13 +1,13 @@
 name: Nightly
 
-# Nightly full-suite run (phase 359 D5).
+# Nightly full-suite run on main (phase 359 D5; retargeted dev -> main 2026-11-16, "only main").
 #
-# GitHub runs `schedule:` triggers from the DEFAULT branch's copy of a workflow file, and dev runs
-# ahead of main. So this file (the only one with a schedule) lives on main and merely dispatches
-# pr-validate.yml on `dev`, which then runs dev's workflow against dev's code, always as a full
-# run with --rerun (reason=nightly). pr-validate.yml itself has no `schedule:`.
+# GitHub runs `schedule:` triggers from the DEFAULT branch's copy of a workflow file, so this file (the
+# only one with a schedule) lives on main. It merely dispatches pr-validate.yml on `main`, which then
+# runs main's workflow against main's code, always as a full run with --rerun (reason=nightly).
+# pr-validate.yml itself has no `schedule:`.
 #
-# Takes effect only once it is on main (hotfix PR). Requires the repo setting
+# Takes effect only once it is on main (via the dev -> main release PR; never a hotfix). Requires the repo setting
 # "Workflow permissions" to allow the GITHUB_TOKEN `actions: write` scope below.
 #
 # Failure notification: a dispatched run is fire-and-forget, so a red nightly would be invisible. This
@@ -15,9 +15,9 @@ name: Nightly
 # THIS workflow is what GitHub e-mails/notifies (the user who last touched the cron), so the dispatched
 # result needs no extra notification plumbing. Cost: one idle runner for the length of the suite.
 #
-# Skip rule: a scheduled run is skipped when the newest NIGHTLY run on dev (run title
+# Skip rule: a scheduled run is skipped when the newest NIGHTLY run on main (run title
 # `dispatch:nightly:*`, i.e. reason=nightly, which always runs with --rerun) succeeded on the current
-# dev HEAD. Manual dispatches (any other reason) never satisfy it, since they may not have re-executed
+# main HEAD. Manual dispatches (any other reason) never satisfy it, since they may not have re-executed
 # cached tests. A manual run of this workflow never skips.
 #
 # Identifying the dispatched run: pr-validate.yml titles dispatched runs `dispatch:<reason>:<token>` and
@@ -37,7 +37,7 @@ permissions:
 
 jobs:
   dispatch-full-run:
-    name: Dispatch full run on dev
+    name: Dispatch full run on main
     runs-on: ubuntu-latest
     timeout-minutes: 75
     permissions:
@@ -48,7 +48,7 @@ jobs:
       GH_REPO: ${{ github.repository }}
     steps:
       # No checkout needed anywhere: GH_REPO names the repo.
-      - name: Skip when dev HEAD already passed a full run
+      - name: Skip when main HEAD already passed a full run
         id: gate
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -56,30 +56,30 @@ jobs:
           set -euo pipefail
           skip=false
           if [[ "$EVENT_NAME" == "schedule" ]]; then
-            head=$(gh api "repos/$GH_REPO/commits/dev" --jq .sha)
-            last_ok=$(gh run list --workflow pr-validate.yml --event workflow_dispatch --branch dev --limit 30 \
+            head=$(gh api "repos/$GH_REPO/commits/main" --jq .sha)
+            last_ok=$(gh run list --workflow pr-validate.yml --event workflow_dispatch --branch main --limit 30 \
               --json headSha,conclusion,displayTitle,createdAt \
               --jq 'map(select(.displayTitle | startswith("dispatch:nightly:"))) | sort_by(.createdAt) | last
                     | select(. != null and .conclusion == "success") | .headSha // empty')
             if [[ "$last_ok" == "$head" ]]; then
               skip=true
-              echo "dev HEAD $head already passed the last full run; skipping." | tee -a "$GITHUB_STEP_SUMMARY"
+              echo "main HEAD $head already passed the last full run; skipping." | tee -a "$GITHUB_STEP_SUMMARY"
             fi
           fi
           echo "skip=$skip" >> "$GITHUB_OUTPUT"
 
       # GITHUB_TOKEN is allowed to trigger workflow_dispatch (the one exception to the
       # "no recursive workflow triggers" rule).
-      - name: Dispatch pr-validate on dev and wait for it
+      - name: Dispatch pr-validate on main and wait for it
         if: steps.gate.outputs.skip != 'true'
         run: |
           set -euo pipefail
           token="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           title="dispatch:nightly:$token"
-          gh workflow run pr-validate.yml --ref dev -f reason=nightly -f token="$token"
+          gh workflow run pr-validate.yml --ref main -f reason=nightly -f token="$token"
           id=""
           for _ in $(seq 1 20); do
-            id=$(gh run list --workflow pr-validate.yml --event workflow_dispatch --branch dev --limit 30 \
+            id=$(gh run list --workflow pr-validate.yml --event workflow_dispatch --branch main --limit 30 \
               --json databaseId,displayTitle \
               --jq "map(select(.displayTitle == \"$title\")) | first | .databaseId // empty")
             [[ -n "$id" ]] && break
