@@ -116,6 +116,23 @@ class PhoneOtpSendConcurrencyIT extends AbstractIntegrationTest {
     }
 
     @Test
+    @DisplayName("the per-phone cap counts every purpose together, so a guest + registration mix still stops at 3 SMS")
+    void should_throw429_when_fourthSendOfAnyPurposeMixWithinWindow() {
+        String phone = "+380671234599";
+        phoneOtpService.sendCode(phone, null, PhoneOtpPurpose.GUEST_BOOKING);
+        phoneOtpService.sendCode(phone, null, PhoneOtpPurpose.REGISTRATION);
+        phoneOtpService.sendCode(phone, null, PhoneOtpPurpose.GUEST_BOOKING);
+
+        assertThatThrownBy(() -> phoneOtpService.sendCode(phone, null, PhoneOtpPurpose.REGISTRATION))
+                .isInstanceOfSatisfying(BusinessException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(HttpStatus.TOO_MANY_REQUESTS));
+        assertThatThrownBy(() -> phoneOtpService.sendCode(phone, null, PhoneOtpPurpose.PASSWORD_RESET))
+                .isInstanceOfSatisfying(BusinessException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(HttpStatus.TOO_MANY_REQUESTS));
+        Mockito.verify(otpSmsSender, Mockito.times(CAP)).send(eq(phone), anyString());
+    }
+
+    @Test
     @DisplayName("should_keepPreviousCodeVerifiable_when_newSendFails")
     void should_keepPreviousCodeVerifiable_when_newSendFails() throws Exception {
         insertOldCode();
@@ -160,7 +177,7 @@ class PhoneOtpSendConcurrencyIT extends AbstractIntegrationTest {
         long idB = insertCode("333333");
 
         // A's post-delivery invalidation runs AFTER B committed its row.
-        new TransactionTemplate(txManager).executeWithoutResult(s -> phoneOtpRepository.markOlderAsUsed(PHONE, idA));
+        new TransactionTemplate(txManager).executeWithoutResult(s -> phoneOtpRepository.markOlderAsUsed(PHONE, PhoneOtpPurpose.GUEST_BOOKING, idA));
 
         assertThat(jdbc.queryForObject("SELECT used FROM phone_otps WHERE id = ?", Boolean.class, idB))
                 .as("the newer row is untouched by the older send").isFalse();

@@ -98,17 +98,16 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
                     }
                 }
 
+                // B514 (AUTH-D11): a phone-registered account has no email, so its token carries no email claim.
+                // The principal is the email when present, otherwise "" — identity is the user id in the details
+                // (sub), which every authorization path reads (AuthenticationUtils.userId).
                 String email = jwtTokenProvider.getEmailFromToken(claims);
-                if (email == null) {
-                    log.debug("JWT is missing required email claim — skipping authentication");
-                    filterChain.doFilter(request, response);
-                    return;
-                }
+                String principal = email == null ? "" : email;
                 Role role = jwtTokenProvider.getRoleFromToken(claims);
 
                 var authority = new SimpleGrantedAuthority(role.springRole);
                 var authentication = new UsernamePasswordAuthenticationToken(
-                        email,
+                        principal,
                         null,
                         List.of(authority)
                 );

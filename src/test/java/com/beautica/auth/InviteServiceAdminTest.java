@@ -74,6 +74,9 @@ class InviteServiceAdminTest {
     @Mock
     private InAppNotificationService inAppNotificationService;
 
+    @Mock
+    private com.beautica.auth.registration.RegistrationTicketService registrationTicketService;
+
     private InviteService inviteService;
 
     @BeforeEach
@@ -91,7 +94,8 @@ class InviteServiceAdminTest {
                 "http://localhost:3000",
                 48L,
                 Clock.systemUTC(),
-                inAppNotificationService
+                inAppNotificationService,
+                registrationTicketService
         );
     }
 

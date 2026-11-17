@@ -336,6 +336,16 @@ app:
   # Flip to true only after (1) mobile 443 is live on Play and (2) APP_ANDROID_MIN_VERSION_CODE forces that build.
   auth:
     require-terms-consent: ${APP_AUTH_REQUIRE_TERMS_CONSENT:false}
+    # B514 (AUTH-02, AUTH-43) — false: register / invite accept still take the legacy email shape. Flip to true only
+    # after M515 is the Play minimum (APP_ANDROID_MIN_VERSION_CODE), same order as require-terms-consent.
+    require-phone-registration: ${APP_AUTH_REQUIRE_PHONE_REGISTRATION:false}
+    # B514 (AUTH-54) — Firebase App Check on endpoints that send an SMS. ENFORCE here (prod); staging overlay
+    # LOG_ONLY, local/test OFF. A mode other than OFF needs the project number and at least one app id (boot fails
+    # otherwise); prod refuses OFF (EnvironmentFingerprintGuard rule prod-app-check-off).
+    app-check:
+      mode: ${APP_AUTH_APP_CHECK_MODE:ENFORCE}
+      project-number: ${APP_AUTH_APP_CHECK_PROJECT_NUMBER:}
+      app-ids: ${APP_AUTH_APP_CHECK_APP_IDS:}
   # Phase 437 — GET /api/v1/app/config (mobile 438 forced-update gate). Compared against the Android versionCode
   # (pubspec +N). Defaults never block anyone. Boot fails on a negative code, latest < min, or a store URL not on
   # https://play.google.com/. Raise APP_ANDROID_MIN_VERSION_CODE only after the replacement build is live on Play.

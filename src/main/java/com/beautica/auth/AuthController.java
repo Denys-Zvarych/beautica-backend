@@ -16,6 +16,7 @@ import com.beautica.auth.dto.ResetPasswordRequest;
 import com.beautica.auth.dto.VerifyEmailRequest;
 import com.beautica.auth.dto.VerifyPasswordResetOtpRequest;
 import com.beautica.auth.dto.VerifyPasswordResetOtpResponse;
+import com.beautica.auth.filter.ClientIpResolver;
 import com.beautica.common.ApiResponse;
 import com.beautica.common.security.AuthenticationUtils;
 import com.beautica.common.security.BearerTokenExtractor;
@@ -72,9 +73,10 @@ public class AuthController {
 
     @PostMapping("/login")
     public ResponseEntity<ApiResponse<AuthResponse>> login(
-            @Valid @RequestBody LoginRequest request
+            @Valid @RequestBody LoginRequest request,
+            HttpServletRequest httpRequest
     ) {
-        AuthResponse response = authService.login(request);
+        AuthResponse response = authService.login(request, ClientIpResolver.resolve(httpRequest));
         return ResponseEntity.ok(ApiResponse.ok(response));
     }
 

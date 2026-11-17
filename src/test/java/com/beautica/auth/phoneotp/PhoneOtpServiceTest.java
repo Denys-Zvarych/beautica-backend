@@ -310,7 +310,7 @@ class PhoneOtpServiceTest {
         org.mockito.InOrder order = org.mockito.Mockito.inOrder(phoneOtpRepository, otpSmsSender);
         order.verify(phoneOtpRepository).save(any());
         order.verify(otpSmsSender).send(eq(PHONE), anyString());
-        order.verify(phoneOtpRepository).markOlderAsUsed(PHONE, 42L);
+        order.verify(phoneOtpRepository).markOlderAsUsed(PHONE, PhoneOtpPurpose.GUEST_BOOKING, 42L);
         assertThat(txManager.events).containsExactly("begin", "commit", "begin", "commit");
     }
 
@@ -323,7 +323,7 @@ class PhoneOtpServiceTest {
 
         assertThatThrownBy(() -> service.sendOtp(PHONE)).isInstanceOf(BusinessException.class);
 
-        verify(phoneOtpRepository, never()).markOlderAsUsed(anyString(), any());
+        verify(phoneOtpRepository, never()).markOlderAsUsed(anyString(), any(), any());
     }
 
     @Test
@@ -344,7 +344,7 @@ class PhoneOtpServiceTest {
     void should_stillReturn_when_olderCodeInvalidationFailsAfterDelivery() {
         stubSaveAssigningId(42L);
         org.mockito.Mockito.doThrow(new IllegalStateException("db"))
-                .when(phoneOtpRepository).markOlderAsUsed(PHONE, 42L);
+                .when(phoneOtpRepository).markOlderAsUsed(PHONE, PhoneOtpPurpose.GUEST_BOOKING, 42L);
 
         service.sendOtp(PHONE);
 
@@ -484,7 +484,7 @@ class PhoneOtpServiceTest {
         String code = "482913";
         PhoneOtp otp = PhoneOtp.issue(PHONE, sha256Hex(code), FIXED_NOW.plusSeconds(600));
         when(phoneOtpRepository
-                .findTopByPhoneAndUsedFalseAndExpiresAtAfterOrderByIdDesc(eq(PHONE), any()))
+                .findTopByPhoneAndPurposeAndUsedFalseAndExpiresAtAfterOrderByIdDesc(eq(PHONE), eq(PhoneOtpPurpose.GUEST_BOOKING), any()))
                 .thenReturn(Optional.of(otp));
         when(guestTokenProvider.generate(PHONE)).thenReturn(GUEST_TOKEN);
 
@@ -499,7 +499,7 @@ class PhoneOtpServiceTest {
     void should_throw401Generic_when_wrongCode() throws Exception {
         PhoneOtp otp = PhoneOtp.issue(PHONE, sha256Hex("482913"), FIXED_NOW.plusSeconds(600));
         when(phoneOtpRepository
-                .findTopByPhoneAndUsedFalseAndExpiresAtAfterOrderByIdDesc(eq(PHONE), any()))
+                .findTopByPhoneAndPurposeAndUsedFalseAndExpiresAtAfterOrderByIdDesc(eq(PHONE), eq(PhoneOtpPurpose.GUEST_BOOKING), any()))
                 .thenReturn(Optional.of(otp));
 
         assertThatThrownBy(() -> service.verifyOtp(PHONE, "000000"))
@@ -517,7 +517,7 @@ class PhoneOtpServiceTest {
         // findTop returns empty for both the expired and the nonexistent cases — the
         // service cannot (and must not) distinguish them: a single generic 401.
         when(phoneOtpRepository
-                .findTopByPhoneAndUsedFalseAndExpiresAtAfterOrderByIdDesc(eq(PHONE), any()))
+                .findTopByPhoneAndPurposeAndUsedFalseAndExpiresAtAfterOrderByIdDesc(eq(PHONE), eq(PhoneOtpPurpose.GUEST_BOOKING), any()))
                 .thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> service.verifyOtp(PHONE, "482913"))

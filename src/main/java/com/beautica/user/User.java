@@ -36,7 +36,12 @@ public class User extends AuditableEntity {
     @Column(name = "id", updatable = false, nullable = false)
     private UUID id;
 
-    @Column(name = "email", nullable = false, unique = true)
+    /**
+     * Optional since B514 (AUTH-D11, V244): a phone-registered account has no email until one is added and
+     * confirmed later (B516). Unique among non-null values. Business emails go only to a non-null address
+     * (NTF-D15 / NTF-56, {@code EmailNotificationService}).
+     */
+    @Column(name = "email", unique = true)
     private String email;
 
     @Column(name = "password_hash", nullable = false)
@@ -54,6 +59,16 @@ public class User extends AuditableEntity {
 
     @Column(name = "phone_number", length = 20)
     private String phoneNumber;
+
+    /**
+     * B514 (AUTH-D08, V244) — when {@link #phoneNumber} was proven by SMS code. Non-null means the phone is the
+     * normalised {@code +380…} form (CHECK {@code ck_users_verified_phone_format}), unique among verified accounts
+     * (partial unique index {@code ux_users_verified_phone}) and usable as a login identifier (AUTH-D09). NULL on
+     * every pre-B514 account (AUTH-D12).
+     */
+    @JsonIgnore
+    @Column(name = "phone_verified_at")
+    private Instant phoneVerifiedAt;
 
     @Column(name = "city", length = 100)
     private String city;
@@ -304,6 +319,33 @@ public class User extends AuditableEntity {
         return user;
     }
 
+    /**
+     * B514 (AUTH-D11) — a self-registered account whose phone was proven by an SMS code (registration ticket). No
+     * email: one is added and confirmed later (B516). The phone must already be normalised E.164 ({@code +380…}).
+     */
+    public static User registerWithVerifiedPhone(
+            String phoneE164,
+            String passwordHash,
+            Role role,
+            String firstName,
+            String lastName,
+            String businessName,
+            Instant phoneVerifiedAt
+    ) {
+        User user = new User(null, passwordHash, role, firstName, lastName, phoneE164, businessName);
+        user.phoneVerifiedAt = phoneVerifiedAt;
+        return user;
+    }
+
+    /**
+     * B514 (AUTH-43) — stamps the phone proven by a registration ticket on an invited account at accept time.
+     * Only for a freshly created, not yet persisted user; phone change of an existing account is B516.
+     */
+    public void markPhoneVerified(String phoneE164, Instant verifiedAt) {
+        this.phoneNumber = phoneE164;
+        this.phoneVerifiedAt = verifiedAt;
+    }
+
     public UUID getId() {
         return id;
     }
@@ -378,6 +420,24 @@ public class User extends AuditableEntity {
 
     public boolean isEmailVerified() {
         return emailVerified;
+    }
+
+    @JsonIgnore
+    public Instant getPhoneVerifiedAt() {
+        return phoneVerifiedAt;
+    }
+
+    /** B514 — the phone was proven by SMS code (AUTH-D08). */
+    public boolean isPhoneVerified() {
+        return phoneVerifiedAt != null;
+    }
+
+    /**
+     * B514 (AUTH-08) — the account has proven at least one login identifier: a verified phone, or (legacy accounts)
+     * a confirmed email. Gates login and refresh.
+     */
+    public boolean hasVerifiedIdentity() {
+        return phoneVerifiedAt != null || emailVerified;
     }
 
     public void setEmailVerified(boolean emailVerified) {

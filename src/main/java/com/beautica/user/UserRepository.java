@@ -43,6 +43,18 @@ public interface UserRepository extends JpaRepository<User, UUID>, TransactionLo
     boolean existsByEmail(String email);
 
     /**
+     * B514 (AUTH-D09) — login by phone: the account whose phone is VERIFIED and equals {@code phoneE164}. An
+     * unverified legacy {@code phone_number} never matches (same 401 as a wrong password). Served by the partial
+     * unique index {@code ux_users_verified_phone} (V244), whose predicate is exactly this one, so at most one row.
+     */
+    @Query("SELECT u FROM User u WHERE u.phoneNumber = :phone AND u.phoneVerifiedAt IS NOT NULL")
+    Optional<User> findByVerifiedPhone(@Param("phone") String phoneE164);
+
+    /** B514 (AUTH-42) — a verified account already holds {@code phoneE164}. Same index as {@link #findByVerifiedPhone}. */
+    @Query("SELECT COUNT(u) > 0 FROM User u WHERE u.phoneNumber = :phone AND u.phoneVerifiedAt IS NOT NULL")
+    boolean existsByVerifiedPhone(@Param("phone") String phoneE164);
+
+    /**
      * The user's assigned salon id, EMPTY for a missing or DEACTIVATED ({@code is_active = false})
      * user. The liveness predicate lives in this one statement (no extra round trip) because every
      * caller uses the result as an admin's management authority: a deactivated admin keeps login

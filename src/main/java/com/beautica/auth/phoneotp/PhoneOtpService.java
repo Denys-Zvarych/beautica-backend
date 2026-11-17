@@ -126,17 +126,32 @@ public class PhoneOtpService {
      */
     @Transactional(propagation = Propagation.NOT_SUPPORTED)
     public void sendOtp(String phone, String requestedFormat) {
-        if (!E164_UA.matcher(phone).matches()) {
+        sendCode(phone, requestedFormat, PhoneOtpPurpose.GUEST_BOOKING);
+    }
+
+    /**
+     * B514 (D1) — the one send path for every {@link PhoneOtpPurpose}: same row lifecycle, same SMS sender and text,
+     * same 503 compensation; the per-phone cap ({@value #MAX_SENDS_PER_WINDOW} per 15 min) counts the codes of EVERY
+     * purpose together (one victim gets at most that many SMS per window, whatever the flow mix), and a newer send invalidates only older codes of the same purpose. {@code phone} must already be
+     * {@code +380…} (callers normalise; a malformed value is a 400 here as before).
+     */
+    @Transactional(propagation = Propagation.NOT_SUPPORTED)
+    public void sendCode(String phone, String requestedFormat, PhoneOtpPurpose purpose) {
+        if (phone == null || !E164_UA.matcher(phone).matches()) {
             throw new BusinessException(HttpStatus.BAD_REQUEST, "Invalid phone format");
         }
         OtpSmsFormat format = resolveFormat(requestedFormat);
 
         String code = generateCode();
-        Long otpId = requiresNewTx.execute(status -> issueOtpRow(phone, code));
+        Long otpId = requiresNewTx.execute(status -> issueOtpRow(phone, code, purpose));
 
         dispatchCode(phone, code, otpId, format);
-        invalidateOlderCodesQuietly(phone, otpId);
-        log.info("OTP sent to {} format={}", maskPhone(phone), format.metricTag());
+        invalidateOlderCodesQuietly(phone, purpose, otpId);
+        if (purpose == PhoneOtpPurpose.GUEST_BOOKING) {
+            log.info("OTP sent to {} format={}", maskPhone(phone), format.metricTag()); // pre-B514 line, unchanged
+        } else {
+            log.info("OTP sent to {} format={} purpose={}", maskPhone(phone), format.metricTag(), purpose);
+        }
     }
 
     private OtpSmsFormat resolveFormat(String requestedFormat) {
@@ -152,17 +167,16 @@ public class PhoneOtpService {
      * provider outage cannot be used to kill a victim's live code. The lock serialises the
      * count-then-insert per phone so concurrent sends cannot all pass the cap.
      */
-    private Long issueOtpRow(String phone, String code) {
+    private Long issueOtpRow(String phone, String code, PhoneOtpPurpose purpose) {
         phoneOtpRepository.lockPhoneForSend(phone);
 
         Instant now = clock.instant();
-        int recentSends = phoneOtpRepository.countByPhoneAndCreatedAtAfter(
-                phone, now.minus(RATE_LIMIT_WINDOW));
+        int recentSends = phoneOtpRepository.countByPhoneAndCreatedAtAfter(phone, now.minus(RATE_LIMIT_WINDOW));
         if (recentSends >= MAX_SENDS_PER_WINDOW) {
             throw new BusinessException(HttpStatus.TOO_MANY_REQUESTS, "OTP limit exceeded");
         }
 
-        PhoneOtp otp = PhoneOtp.issue(phone, sha256Hex(code), now.plus(OTP_TTL));
+        PhoneOtp otp = PhoneOtp.issue(phone, sha256Hex(code), now.plus(OTP_TTL), purpose, null);
         phoneOtpRepository.save(otp);
         return otp.getId();
     }
@@ -228,12 +242,13 @@ public class PhoneOtpService {
      * new row's), so the newest delivered code stays redeemable even when sends overlap. Failure is logged, not surfaced: the SMS is already
      * out, and {@code verifyOtp} redeems only the newest unused row regardless.
      */
-    private void invalidateOlderCodesQuietly(String phone, Long newId) {
+    private void invalidateOlderCodesQuietly(String phone, PhoneOtpPurpose purpose, Long newId) {
         if (newId == null) {
             return;
         }
         try {
-            requiresNewTx.executeWithoutResult(status -> phoneOtpRepository.markOlderAsUsed(phone, newId));
+            requiresNewTx.executeWithoutResult(
+                    status -> phoneOtpRepository.markOlderAsUsed(phone, purpose, newId));
         } catch (RuntimeException e) {
             log.warn("OTP older-code invalidation failed for {}: {}",
                     maskPhone(phone), e.getClass().getSimpleName());
@@ -250,12 +265,26 @@ public class PhoneOtpService {
      */
     @Transactional
     public String verifyOtp(String phone, String code) {
+        if (!consumeCode(phone, code, PhoneOtpPurpose.GUEST_BOOKING)) {
+            throw unauthorized();
+        }
+        return guestTokenProvider.generate(phone);
+    }
+
+    /**
+     * B514 (D1) — redeems the newest live code of {@code phone} for {@code purpose}: on a match marks it used and
+     * returns {@code true}; on a wrong, expired, missing or other-purpose code records the attempt (per-OTP cap) and
+     * returns {@code false}. One result for every failure, so the caller answers with one generic error (no oracle).
+     * Joins the caller's transaction (the used flag commits with the caller's own write).
+     */
+    @Transactional
+    public boolean consumeCode(String phone, String code, PhoneOtpPurpose purpose) {
         Instant now = clock.instant();
         Optional<PhoneOtp> active = phoneOtpRepository
-                .findTopByPhoneAndUsedFalseAndExpiresAtAfterOrderByIdDesc(phone, now);
+                .findTopByPhoneAndPurposeAndUsedFalseAndExpiresAtAfterOrderByIdDesc(phone, purpose, now);
 
         if (active.isEmpty()) {
-            throw unauthorized();
+            return false;
         }
 
         PhoneOtp otp = active.get();
@@ -269,13 +298,13 @@ public class PhoneOtpService {
             // attempts < cap and overshoot the cap — the DB serialises the increments.
             // Runs in a separate REQUIRES_NEW transaction so the increment commits BEFORE the
             // generic-401 throw rolls back this verify transaction (otherwise the counter
-            // could never accumulate). Must precede the throw.
+            // could never accumulate). Must precede the caller's throw.
             attemptRecorder.recordFailedAttempt(otp.getId(), PhoneOtp.MAX_VERIFY_ATTEMPTS);
-            throw unauthorized();
+            return false;
         }
 
         otp.markUsed();
-        return guestTokenProvider.generate(phone);
+        return true;
     }
 
     private String generateCode() {

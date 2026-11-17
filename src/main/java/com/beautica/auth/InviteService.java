@@ -5,8 +5,10 @@ import com.beautica.auth.dto.InviteAcceptRequest;
 import com.beautica.auth.dto.InvitePreviewResponse;
 import com.beautica.auth.dto.InviteRequest;
 import com.beautica.auth.dto.InviteResponse;
+import com.beautica.auth.registration.RegistrationTicketService;
 import com.beautica.common.exception.EmailAlreadyRegisteredException;
 import com.beautica.common.exception.ForbiddenException;
+import com.beautica.common.exception.IdentityException;
 import com.beautica.common.exception.InviteTokenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.util.SchemeGuard;
@@ -66,6 +68,8 @@ public class InviteService {
     private final Clock clock;
     // Phase 333 — see InAppNotificationService's class javadoc for why this is a separate seam.
     private final InAppNotificationService inAppNotificationService;
+    // B514 (AUTH-43) — the invitee's phone, proven by a registration ticket before accept.
+    private final RegistrationTicketService registrationTicketService;
 
     public InviteService(
             InviteTokenRepository inviteTokenRepository,
@@ -79,7 +83,8 @@ public class InviteService {
             @Value("${app.frontend.base-url}") String frontendBaseUrl,
             @Value("${app.invite.token-expiration-hours:48}") long tokenExpirationHours,
             Clock clock,
-            InAppNotificationService inAppNotificationService
+            InAppNotificationService inAppNotificationService,
+            RegistrationTicketService registrationTicketService
     ) {
         this.inviteTokenRepository = inviteTokenRepository;
         this.userRepository = userRepository;
@@ -93,6 +98,7 @@ public class InviteService {
         this.tokenExpirationHours = tokenExpirationHours;
         this.clock = clock;
         this.inAppNotificationService = inAppNotificationService;
+        this.registrationTicketService = registrationTicketService;
     }
 
     /**
@@ -387,6 +393,15 @@ public class InviteService {
             }
         }
 
+        // B514 (AUTH-43): a ticket proves the invitee's phone; consumed under its row lock in this transaction, so a
+        // rejected accept leaves it redeemable. The phone match against a phone invite is B520.
+        String verifiedPhone = request.hasRegistrationTicket()
+                ? registrationTicketService.consume(request.registrationTicket())
+                : null;
+        if (verifiedPhone != null && userRepository.existsByVerifiedPhone(verifiedPhone)) {
+            throw new IdentityException(IdentityException.Code.PHONE_ALREADY_REGISTERED);
+        }
+
         token.markUsed();
         inviteTokenRepository.save(token);
 
@@ -402,8 +417,15 @@ public class InviteService {
                 request.phoneNumber(),
                 token.getSalonId()
         );
+        if (verifiedPhone != null) {
+            user.markPhoneVerified(verifiedPhone, clock.instant());
+        }
         TermsConsentStamp.apply(user, request, clock.instant());
-        var savedUser = userRepository.save(user);
+        // A ticket-verified phone can lose a race to a concurrent claim: flush through the shared claim path so the
+        // partial unique index surfaces as 409 PHONE_ALREADY_REGISTERED, not a 500 at commit.
+        var savedUser = verifiedPhone != null
+                ? PhoneRegistrationService.saveClaimingPhone(userRepository, user)
+                : userRepository.save(user);
 
         if (token.getRole() == Role.SALON_MASTER) {
             masterService.createMasterFromInvite(savedUser.getId(), token.getSalonId());

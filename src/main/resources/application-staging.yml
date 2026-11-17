@@ -39,6 +39,11 @@ spring:
           writetimeout: 3000
 
 app:
+  # B514 (AUTH-54) — staging verifies and logs App Check tokens but never blocks until a real release build and a
+  # debug build both log result=valid (then set APP_AUTH_APP_CHECK_MODE=ENFORCE on Railway).
+  auth:
+    app-check:
+      mode: ${APP_AUTH_APP_CHECK_MODE:LOG_ONLY}
   # Phase 382 — staging runs the REAL siteverify round trip with Cloudflare's always-pass TEST secret as the
   # default (the staging website must use the matching test site key 1x00000000000000000000AA and the dummy
   # token XXXX.DUMMY.TOKEN.XXXX). Hostname/action checks stay off: test keys return dummy values. The guard

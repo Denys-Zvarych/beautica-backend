@@ -15,12 +15,13 @@ public interface PhoneOtpRepository extends JpaRepository<PhoneOtp, Long> {
      * at most one row even though {@code sendOtp} expires prior unused codes after
      * delivering a new one (the newest unused row always wins in between) — defence-in-depth against a duplicate slipping through a race.
      */
-    Optional<PhoneOtp> findTopByPhoneAndUsedFalseAndExpiresAtAfterOrderByIdDesc(
-            String phone, Instant now);
+    Optional<PhoneOtp> findTopByPhoneAndPurposeAndUsedFalseAndExpiresAtAfterOrderByIdDesc(
+            String phone, PhoneOtpPurpose purpose, Instant now);
 
     /**
-     * Rate-limit counter: how many OTPs this phone has requested since {@code since}
-     * (includes used rows). Index-served by {@code idx_phone_otps_phone_created_at}
+     * Rate-limit counter: how many OTPs this phone has requested since {@code since}, across EVERY
+     * {@link PhoneOtpPurpose} (B514: the cap is per phone, not per flow — otherwise each purpose would add its own
+     * 3 SMS per window to one victim) and including used rows. Index-served by {@code idx_phone_otps_phone_created_at}
      * {@code (phone, created_at)} (V88) — a plain composite, not the partial
      * {@code WHERE NOT used} active-lookup index, since the count must see used rows too.
      */
@@ -53,8 +54,10 @@ public interface PhoneOtpRepository extends JpaRepository<PhoneOtp, Long> {
      * with {@code verifyOtp}, where the newest unused row wins.
      */
     @Modifying
-    @Query("UPDATE PhoneOtp o SET o.used = true WHERE o.phone = :phone AND o.used = false AND o.id < :keepId")
-    int markOlderAsUsed(@Param("phone") String phone, @Param("keepId") Long keepId);
+    @Query("UPDATE PhoneOtp o SET o.used = true "
+            + "WHERE o.phone = :phone AND o.purpose = :purpose AND o.used = false AND o.id < :keepId")
+    int markOlderAsUsed(@Param("phone") String phone, @Param("purpose") PhoneOtpPurpose purpose,
+                        @Param("keepId") Long keepId);
 
     /**
      * Single-statement UPDATE by id marking an undelivered code as used: it can never be redeemed,

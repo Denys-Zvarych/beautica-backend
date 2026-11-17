@@ -1,6 +1,8 @@
 package com.beautica.auth.dto;
 
 import com.beautica.common.validation.NoDigits;
+import com.beautica.common.validation.PhoneRegistrationPayload;
+import com.beautica.common.validation.PhoneRegistrationShape;
 import com.beautica.common.validation.PolicyVersionDate;
 import com.beautica.common.validation.TermsConsentComplete;
 import com.beautica.common.validation.TermsConsentPayload;
@@ -11,6 +13,7 @@ import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Size;
 
 @TermsConsentComplete
+@PhoneRegistrationShape
 public record InviteAcceptRequest(
         // max=512 mirrors invite_tokens.token VARCHAR(512) — the previous cap of 200
         // was under-sized and would reject valid HMAC-SHA256 hex tokens.
@@ -38,7 +41,7 @@ public record InviteAcceptRequest(
         @NoDigits(message = "Last name must not contain a number")
         String lastName,
 
-        @NotBlank(message = "Phone number is required")
+        // Legacy shape only; ignored with a registrationTicket (@PhoneRegistrationShape).
         @Size(max = 20, message = "Phone number must be at most 20 characters")
         @Pattern(regexp = "^[+\\d\\s\\-()]*$", message = "Phone number contains invalid characters")
         String phoneNumber,
@@ -59,8 +62,15 @@ public record InviteAcceptRequest(
         @Pattern(regexp = "^\\d{4}-\\d{2}-\\d{2}(\\.\\d{1,3})?$",
                 message = "Privacy policy version must look like 2026-10-20")
         @PolicyVersionDate
-        String privacyPolicyVersion
-) implements TermsConsentPayload {
+        String privacyPolicyVersion,
+
+        // B514 (AUTH-41, AUTH-43) — the ticket from POST /auth/register/phone/otp/verify: the invitee proves a phone
+        // before accept (required once app.auth.require-phone-registration is true). The class-level
+        // @PhoneRegistrationShape decides which shape is complete. Base64url, ~43 chars.
+        @Size(max = 128, message = "Registration ticket is invalid")
+        @Pattern(regexp = "^[A-Za-z0-9_-]*$", message = "Registration ticket is invalid")
+        String registrationTicket
+) implements TermsConsentPayload, PhoneRegistrationPayload {
 
     /**
      * The pre-phase-442 shape (no consent fields) — exactly what a legacy build sends. Keeps existing call sites
@@ -68,6 +78,13 @@ public record InviteAcceptRequest(
      */
     public InviteAcceptRequest(String token, String password, String firstName, String lastName, String phoneNumber) {
         this(token, password, firstName, lastName, phoneNumber, null, null, null);
+    }
+
+    /** The pre-B514 shape (no {@code registrationTicket}). */
+    public InviteAcceptRequest(String token, String password, String firstName, String lastName, String phoneNumber,
+                               Boolean termsAccepted, String termsVersion, String privacyPolicyVersion) {
+        this(token, password, firstName, lastName, phoneNumber, termsAccepted, termsVersion, privacyPolicyVersion,
+                null);
     }
 
     /**

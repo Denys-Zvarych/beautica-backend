@@ -131,9 +131,11 @@ public abstract class AbstractIntegrationTest {
         // users DELETE.
         jdbcTemplate.execute("DELETE FROM password_reset_tickets");
         jdbcTemplate.execute("DELETE FROM device_tokens");
-        // Phase 13.2: phone_otps has no FK (guest flow, no user row) — delete anywhere,
-        // kept here with the other side tables so a fresh DB is left for the next test.
+        // Phase 13.2: phone_otps had no FK (guest flow, no user row). B514 (V244) adds phone_otps.user_id ->
+        // users(id) ON DELETE CASCADE, so it must precede the users DELETE (§O-7, no reliance on CASCADE).
         jdbcTemplate.execute("DELETE FROM phone_otps");
+        // B514 (V244): phone_registration_tickets has no FK either way (phone + hash only).
+        jdbcTemplate.execute("DELETE FROM phone_registration_tickets");
         jdbcTemplate.execute("DELETE FROM users");
         // Phase 368 (V195): singleton environment stamp; no FK. Only staging/prod boots write it.
         jdbcTemplate.execute("DELETE FROM deployment_environment");

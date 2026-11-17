@@ -1,5 +1,7 @@
 package com.beautica.config;
 
+import com.beautica.config.appcheck.AppCheckLogOnlyAlarm;
+import com.beautica.config.appcheck.AppCheckProperties;
 import com.beautica.notification.mail.MailTransportKind;
 import com.beautica.review.invite.config.ReviewInviteProperties;
 import org.apache.commons.logging.Log;
@@ -141,6 +143,7 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
             checkRetentionJobs(env, environment, violations);
             if (environment == DeployEnvironment.PROD) {
                 checkProd(env, violations);
+                alertAppCheckLogOnly(env, log);
                 if (brevoApiTransport(env)) {
                     checkBrevoApi(env, violations);
                 } else {
@@ -471,6 +474,7 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
             violations.add("rule prod-admin-email-placeholder: ADMIN_EMAIL must not use a reserved test/example domain in prod");
         }
         checkProdTurnstile(env, violations);
+        checkProdAppCheck(env, violations);
         checkProdReviewInviteLink(env, violations);
         // The EFFECTIVE recipient: APP_ADMIN_EMAIL (relaxed binding of app.admin-email) overrides ADMIN_EMAIL.
         String effective = readOrNull(env, "app.admin-email");
@@ -632,6 +636,35 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
             java.util.regex.Pattern.compile("^[123]x0{31}AA$");
 
     private static final String TURNSTILE_SITEVERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
+
+    /**
+     * B514 (AUTH-54, D5) — prod (without staging) must check App Check: {@code OFF} is refused, {@code LOG_ONLY} stays
+     * allowed as the incident lever (e.g. a Play Integrity outage). Unset means the yml default ENFORCE. The JWKS URL,
+     * when overridden, must be Google's: a redirected key set would let any self-signed token pass.
+     */
+    private static void checkProdAppCheck(Environment env, List<String> violations) {
+        String mode = boundOrNull(env, "app.auth.app-check.mode");
+        if (mode != null && "OFF".equalsIgnoreCase(mode.strip())) {
+            violations.add("rule prod-app-check-off: app.auth.app-check.mode (APP_AUTH_APP_CHECK_MODE) must be "
+                    + "ENFORCE or LOG_ONLY in prod");
+        }
+        String jwksUrl = boundOrNull(env, "app.auth.app-check.jwks-url");
+        if (jwksUrl != null && !AppCheckProperties.GOOGLE_JWKS_URL.equals(jwksUrl.strip())) {
+            violations.add("rule prod-app-check-jwks-url: app.auth.app-check.jwks-url must be exactly "
+                    + AppCheckProperties.GOOGLE_JWKS_URL + " in prod");
+        }
+    }
+
+    /**
+     * B514 (AUTH-54) — LOG_ONLY is allowed in prod but never silent: ERROR at boot (an alert), repeated hourly by
+     * {@link AppCheckLogOnlyAlarm} while it stays on.
+     */
+    private static void alertAppCheckLogOnly(Environment env, Log log) {
+        String mode = boundOrNull(env, "app.auth.app-check.mode");
+        if (mode != null && "LOG_ONLY".equalsIgnoreCase(mode.strip())) {
+            log.error(AppCheckLogOnlyAlarm.LOG_ONLY_ALERT);
+        }
+    }
 
     private static void checkProdTurnstile(Environment env, List<String> violations) {
         if (!boundFlag(env, "app.turnstile.enabled")) {

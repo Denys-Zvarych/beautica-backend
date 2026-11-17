@@ -210,9 +210,14 @@ public class EmailService {
             helper.setFrom(fromEmail);
             helper.setTo(toEmail);
             // Reply-To is the authenticated sender so support can answer directly,
-            // while From stays the platform no-reply (DMARC-aligned).
-            helper.setReplyTo(senderEmail);
-            helper.setSubject("[Beautica Support] message from " + senderEmail);
+            // while From stays the platform no-reply (DMARC-aligned). B514: a phone-only account has no
+            // email — no Reply-To; support identifies the sender by the user id in the subject and body.
+            if (senderEmail != null && !senderEmail.isBlank()) {
+                helper.setReplyTo(senderEmail);
+                helper.setSubject("[Beautica Support] message from " + senderEmail);
+            } else {
+                helper.setSubject("[Beautica Support] message from user " + senderUserId);
+            }
             helper.setText(html, true);
 
             for (SupportAttachment attachment : attachments) {

@@ -1825,4 +1825,16 @@ class GlobalExceptionHandlerTest {
                 .doesNotContain("30")
                 .doesNotContain("3600");
     }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(IdentityException.Code.class)
+    @DisplayName("handleIdentity — B514: status, data.code and the fixed message come from the code")
+    void should_renderCodeStatusAndFixedMessage_when_identityExceptionThrown(IdentityException.Code code) {
+        ResponseEntity<ApiResponse<IdentityErrorResponse>> response = handler.handleIdentity(new IdentityException(code));
+
+        assertThat(response.getStatusCode()).isEqualTo(code.status());
+        assertThat(response.getBody().success()).isFalse();
+        assertThat(response.getBody().data().code()).isEqualTo(code.name());
+        assertThat(response.getBody().message()).isEqualTo(code.clientMessage());
+    }
 }

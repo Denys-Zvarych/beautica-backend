@@ -81,6 +81,9 @@ class InviteServiceTest {
     @Mock
     private InAppNotificationService inAppNotificationService;
 
+    @Mock
+    private com.beautica.auth.registration.RegistrationTicketService registrationTicketService;
+
     private PasswordEncoder passwordEncoder;
     private InviteService inviteService;
 
@@ -99,7 +102,8 @@ class InviteServiceTest {
                 "http://localhost:3000",
                 48L,
                 Clock.systemUTC(),
-                inAppNotificationService
+                inAppNotificationService,
+                registrationTicketService
         );
     }
 
@@ -484,6 +488,40 @@ class InviteServiceTest {
         verify(userRepository).save(userCaptor.capture());
         assertThat(userCaptor.getValue().getRole()).isEqualTo(Role.SALON_MASTER);
         assertThat(userCaptor.getValue().getSalonId()).isEqualTo(salonId);
+    }
+
+    @Test
+    @DisplayName("acceptInvite answers 409 PHONE_ALREADY_REGISTERED when a concurrent claim takes the ticket's phone "
+            + "between the pre-check and the flush (ux_users_verified_phone)")
+    void should_throwPhoneAlreadyRegistered_when_verifiedPhoneIndexViolatedOnAcceptFlush() {
+        var rawToken = "raw-race-token";
+        var hashedToken = "hashed-race-token";
+        var salonId = UUID.randomUUID();
+        var phone = "+380501234567";
+        var invite = buildInviteToken("race@example.com", Instant.now().plusSeconds(3600));
+        ReflectionTestUtils.setField(invite, "salonId", salonId);
+        var request = new InviteAcceptRequest(rawToken, "Str0ngP@ss1!", "Jane", "Doe", null, null, null, null,
+                "ticket");
+        when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
+        when(inviteTokenRepository.findByTokenForUpdate(hashedToken)).thenReturn(Optional.of(invite));
+        when(userRepository.existsByEmail("race@example.com")).thenReturn(false);
+        var salon = mock(Salon.class);
+        when(salon.isActive()).thenReturn(true);
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+        when(registrationTicketService.consume("ticket")).thenReturn(phone);
+        when(userRepository.existsByVerifiedPhone(phone)).thenReturn(false);
+        when(userRepository.saveAndFlush(any(User.class))).thenThrow(
+                new org.springframework.dao.DataIntegrityViolationException("could not execute statement",
+                        new RuntimeException("duplicate key value violates unique constraint "
+                                + "\"ux_users_verified_phone\"")));
+
+        Throwable thrown = org.assertj.core.api.Assertions.catchThrowable(() -> inviteService.acceptInvite(request));
+
+        assertThat(thrown).isInstanceOfSatisfying(com.beautica.common.exception.IdentityException.class,
+                e -> assertThat(e.getCode())
+                        .isEqualTo(com.beautica.common.exception.IdentityException.Code.PHONE_ALREADY_REGISTERED));
+        verify(userRepository, never()).save(any(User.class));
+        verify(masterService, never()).createMasterFromInvite(any(), any());
     }
 
     @Test
@@ -1075,7 +1113,8 @@ class InviteServiceTest {
                 "http://example.com",
                 48L,
                 Clock.systemUTC(),
-                inAppNotificationService
+                inAppNotificationService,
+                registrationTicketService
         );
 
         assertThatThrownBy(service::validateConfig)
@@ -1098,7 +1137,8 @@ class InviteServiceTest {
                 null,
                 48L,
                 Clock.systemUTC(),
-                inAppNotificationService
+                inAppNotificationService,
+                registrationTicketService
         );
 
         assertThatThrownBy(service::validateConfig)
@@ -1121,7 +1161,8 @@ class InviteServiceTest {
                 "https://beautica.app",
                 48L,
                 Clock.systemUTC(),
-                inAppNotificationService
+                inAppNotificationService,
+                registrationTicketService
         );
 
         // Must not throw
@@ -1143,7 +1184,8 @@ class InviteServiceTest {
                 "http://localhost:3000",
                 48L,
                 Clock.systemUTC(),
-                inAppNotificationService
+                inAppNotificationService,
+                registrationTicketService
         );
 
         // Must not throw — localhost dev URLs are allowed
@@ -1172,7 +1214,8 @@ class InviteServiceTest {
                 "http://example.com",
                 48L,
                 Clock.systemUTC(),
-                inAppNotificationService
+                inAppNotificationService,
+                registrationTicketService
         );
 
         when(tokenGenerator.generateToken()).thenReturn("raw-token");
@@ -1208,7 +1251,8 @@ class InviteServiceTest {
                 "https://beautica.app",
                 48L,
                 Clock.systemUTC(),
-                inAppNotificationService
+                inAppNotificationService,
+                registrationTicketService
         );
 
         when(tokenGenerator.generateToken()).thenReturn("raw-token");
@@ -1247,7 +1291,8 @@ class InviteServiceTest {
                 "http://localhost.attacker.com",
                 48L,
                 Clock.systemUTC(),
-                inAppNotificationService
+                inAppNotificationService,
+                registrationTicketService
         );
 
         when(tokenGenerator.generateToken()).thenReturn("raw-token");
@@ -1284,7 +1329,8 @@ class InviteServiceTest {
                 "http://localhostXYZ",
                 48L,
                 Clock.systemUTC(),
-                inAppNotificationService
+                inAppNotificationService,
+                registrationTicketService
         );
 
         when(tokenGenerator.generateToken()).thenReturn("raw-token");
@@ -1323,7 +1369,8 @@ class InviteServiceTest {
                 "http://localhost:3000",
                 48L,
                 Clock.systemUTC(),
-                inAppNotificationService
+                inAppNotificationService,
+                registrationTicketService
         );
 
         when(tokenGenerator.generateToken()).thenReturn("raw-token");

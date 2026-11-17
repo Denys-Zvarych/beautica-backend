@@ -1,0 +1,60 @@
+package com.beautica.common.exception;
+
+import org.springframework.http.HttpStatus;
+
+/**
+ * B514 — phone-first identity and App Check rejections that the app branches on by {@code data.code}
+ * ({@link IdentityErrorResponse}). Each {@link Code} fixes its HTTP status and its client message, so a throw site
+ * can never put a phone, token or other value on the wire ({@code GlobalExceptionHandler#handleIdentity}).
+ * B516 / B520 add their codes here (e.g. {@code PHONE_CHANGE_REQUIRES_OTP}, {@code INVITE_PHONE_MISMATCH}).
+ *
+ * <p>Stack-trace capture is suppressed: flow-control exception translated straight to a response.
+ */
+public class IdentityException extends BusinessException {
+
+    /** Stable codes; the message is human prose only, never parsed by a client. */
+    public enum Code {
+        /** AUTH-D15 — not a Ukrainian mobile number; checked before any SMS is sent. */
+        PHONE_NOT_UA_MOBILE(HttpStatus.BAD_REQUEST, "Only a Ukrainian mobile number is accepted"),
+        /** AUTH-42 — a verified account already holds the phone (answered only after the code proved ownership). */
+        PHONE_ALREADY_REGISTERED(HttpStatus.CONFLICT, "This phone number is already registered"),
+        /** AUTH-41 — the registration ticket is unknown, used or expired. */
+        REGISTRATION_TICKET_INVALID(HttpStatus.BAD_REQUEST, "Invalid or expired registration ticket"),
+        /** AUTH-54 — missing or invalid Firebase App Check token in ENFORCE mode. */
+        APP_CHECK_FAILED(HttpStatus.FORBIDDEN, "App verification failed"),
+        /** AUTH-54 — Google's App Check keys could not be fetched and none are cached. */
+        APP_CHECK_UNAVAILABLE(HttpStatus.SERVICE_UNAVAILABLE, "App verification is temporarily unavailable, please retry");
+
+        private final HttpStatus status;
+        private final String clientMessage;
+
+        Code(HttpStatus status, String clientMessage) {
+            this.status = status;
+            this.clientMessage = clientMessage;
+        }
+
+        public HttpStatus status() {
+            return status;
+        }
+
+        public String clientMessage() {
+            return clientMessage;
+        }
+    }
+
+    private final Code code;
+
+    public IdentityException(Code code) {
+        super(code.status(), code.clientMessage());
+        this.code = code;
+    }
+
+    public Code getCode() {
+        return code;
+    }
+
+    @Override
+    public synchronized Throwable fillInStackTrace() {
+        return this;
+    }
+}

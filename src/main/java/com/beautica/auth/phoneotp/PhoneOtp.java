@@ -2,6 +2,8 @@ package com.beautica.auth.phoneotp;
 
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
+import jakarta.persistence.EnumType;
+import jakarta.persistence.Enumerated;
 import jakarta.persistence.GeneratedValue;
 import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
@@ -12,6 +14,7 @@ import lombok.NoArgsConstructor;
 import org.hibernate.annotations.DynamicInsert;
 
 import java.time.Instant;
+import java.util.UUID;
 
 /**
  * One-time SMS verification code issued to an unauthenticated client during the
@@ -73,18 +76,29 @@ public class PhoneOtp {
     @Column(name = "attempts", nullable = false)
     private int attempts;
 
+    /** B514 (D1, V244) — the flow this code belongs to; verify matches it. */
+    @Enumerated(EnumType.STRING)
+    @Column(name = "purpose", nullable = false, length = 32)
+    private PhoneOtpPurpose purpose;
+
+    /** B514 (V244) — the signed-in owner of a PHONE_ADD / PHONE_CHANGE code (B516); NULL for anonymous purposes. */
+    @Column(name = "user_id")
+    private UUID userId;
+
     /**
      * Maximum wrong verify attempts before the OTP is invalidated. After this many wrong
      * codes the OTP is marked used, so even a subsequent <i>correct</i> code is rejected.
      */
     public static final int MAX_VERIFY_ATTEMPTS = 5;
 
-    private PhoneOtp(String phone, String codeHash, Instant expiresAt) {
+    private PhoneOtp(String phone, String codeHash, Instant expiresAt, PhoneOtpPurpose purpose, UUID userId) {
         this.phone = phone;
         this.codeHash = codeHash;
         this.expiresAt = expiresAt;
         this.used = false;
         this.attempts = 0;
+        this.purpose = purpose;
+        this.userId = userId;
     }
 
     /**
@@ -95,7 +109,17 @@ public class PhoneOtp {
      * @param expiresAt absolute expiry instant ({@code now + 10 min})
      */
     public static PhoneOtp issue(String phone, String codeHash, Instant expiresAt) {
-        return new PhoneOtp(phone, codeHash, expiresAt);
+        return issue(phone, codeHash, expiresAt, PhoneOtpPurpose.GUEST_BOOKING, null);
+    }
+
+    /**
+     * B514 — as {@link #issue(String, String, Instant)} for any {@link PhoneOtpPurpose}.
+     *
+     * @param userId the signed-in owner (B516 PHONE_ADD / PHONE_CHANGE), {@code null} otherwise
+     */
+    public static PhoneOtp issue(String phone, String codeHash, Instant expiresAt, PhoneOtpPurpose purpose,
+                                 UUID userId) {
+        return new PhoneOtp(phone, codeHash, expiresAt, purpose, userId);
     }
 
     /** Marks this OTP as consumed so it cannot be redeemed again. */
