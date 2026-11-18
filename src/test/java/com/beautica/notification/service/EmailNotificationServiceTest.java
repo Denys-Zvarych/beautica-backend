@@ -71,43 +71,6 @@ class EmailNotificationServiceTest {
     }
 
     // -------------------------------------------------------------------------
-    // sendInviteEmail
-    // -------------------------------------------------------------------------
-
-    @Test
-    @DisplayName("should call mailSender.send and pass correct template variables when sendInviteEmail is called")
-    void should_callMailSenderSend_when_sendInviteEmailCalled() throws Exception {
-        MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
-        when(mailSender.createMimeMessage()).thenReturn(realMessage);
-        when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>invite</html>");
-        ArgumentCaptor<String> templateCaptor = ArgumentCaptor.forClass(String.class);
-        ArgumentCaptor<IContext> contextCaptor = ArgumentCaptor.forClass(IContext.class);
-
-        service.sendInviteEmail("master@example.com", "https://beautica.app/invite/token123", "Salon Aurora");
-
-        verify(templateEngine).process(templateCaptor.capture(), contextCaptor.capture());
-        verify(mailSender).send(realMessage);
-
-        assertThat(templateCaptor.getValue()).isEqualTo("email/invite-master");
-
-        Context captured = (Context) contextCaptor.getValue();
-        assertThat(captured.getVariable("inviteUrl")).isEqualTo("https://beautica.app/invite/token123");
-        assertThat(captured.getVariable("salonName")).isEqualTo("Salon Aurora");
-    }
-
-    @Test
-    @DisplayName("should set Ukrainian subject when sendInviteEmail is called")
-    void should_setSubjectToUkrainian_when_sendInviteEmailCalled() throws Exception {
-        MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
-        when(mailSender.createMimeMessage()).thenReturn(realMessage);
-        when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>invite</html>");
-
-        service.sendInviteEmail("master@example.com", "https://beautica.app/invite/x", "Salon Aurora");
-
-        assertThat(realMessage.getSubject()).isEqualTo("Запрошення до салону");
-    }
-
-    // -------------------------------------------------------------------------
     // sendNewBookingEmail
     // -------------------------------------------------------------------------
 
@@ -766,9 +729,9 @@ class EmailNotificationServiceTest {
         doThrow(new MailSendException("SMTP unavailable")).when(mailSender).send(any(MimeMessage.class));
 
         assertThatThrownBy(() ->
-                service.sendInviteEmail("fail@example.com", "https://beautica.app/invite/x", "Salon")
+                service.sendRequestDecisionEmail("fail@example.com", RequestKind.CATEGORY_REQUEST, true, "Манікюр", null)
         ).isInstanceOf(EmailDeliveryException.class)
-                .hasMessageContaining("email/invite-master")
+                .hasMessageContaining("email/request-decision")
                 .hasMessageNotContaining("fail@example.com")
                 .hasNoCause()
                 .satisfies(ex -> assertThat(((EmailDeliveryException) ex).isTransientSmtp()).isTrue());
@@ -783,7 +746,7 @@ class EmailNotificationServiceTest {
                 .when(mailSender).send(any(MimeMessage.class));
 
         assertThatThrownBy(() ->
-                service.sendInviteEmail("fail@example.com", "https://beautica.app/invite/x", "Salon")
+                service.sendRequestDecisionEmail("fail@example.com", RequestKind.CATEGORY_REQUEST, true, "Манікюр", null)
         ).isInstanceOf(EmailDeliveryException.class)
                 .hasNoCause()
                 .hasMessageNotContaining("fail@example.com")
@@ -799,7 +762,7 @@ class EmailNotificationServiceTest {
                 .when(mailSender).send(any(MimeMessage.class));
 
         assertThatThrownBy(() ->
-                service.sendInviteEmail("fail@example.com", "https://beautica.app/invite/x", "Salon")
+                service.sendRequestDecisionEmail("fail@example.com", RequestKind.CATEGORY_REQUEST, true, "Манікюр", null)
         ).isInstanceOf(EmailDeliveryException.class)
                 .satisfies(ex -> assertThat(((EmailDeliveryException) ex).isTransientSmtp()).isTrue());
     }
@@ -820,7 +783,7 @@ class EmailNotificationServiceTest {
         User user = mock(User.class);
         when(user.getEmail()).thenReturn("u@example.com");
 
-        hosted.sendInviteEmail("m@example.com", "https://beautica.app/invite/t", "Salon");
+        hosted.sendRequestDecisionEmail("m@example.com", RequestKind.CATEGORY_REQUEST, true, "Манікюр", null);
         hosted.sendPasswordResetOtpEmail(user, "123456");
         hosted.sendVerificationEmail("v@example.com", "654321");
 
@@ -843,7 +806,7 @@ class EmailNotificationServiceTest {
         ArgumentCaptor<IContext> ctx = ArgumentCaptor.forClass(IContext.class);
         when(templateEngine.process(anyString(), ctx.capture())).thenReturn("<html>x</html>");
 
-        service.sendInviteEmail("m@example.com", "https://beautica.app/invite/t", "Salon");
+        service.sendRequestDecisionEmail("m@example.com", RequestKind.CATEGORY_REQUEST, true, "Манікюр", null);
 
         assertThat(ctx.getValue().getVariable("logoSrc")).isEqualTo("cid:beauticaLogo");
         realMessage.saveChanges();
@@ -859,7 +822,7 @@ class EmailNotificationServiceTest {
                 .thenThrow(new org.thymeleaf.exceptions.TemplateProcessingException("bad template"));
 
         assertThatThrownBy(() ->
-                service.sendInviteEmail("fail@example.com", "https://beautica.app/invite/x", "Salon")
+                service.sendRequestDecisionEmail("fail@example.com", RequestKind.CATEGORY_REQUEST, true, "Манікюр", null)
         ).isInstanceOf(EmailDeliveryException.class)
                 .satisfies(ex -> assertThat(((EmailDeliveryException) ex).isTransientSmtp()).isFalse());
     }
@@ -878,9 +841,9 @@ class EmailNotificationServiceTest {
         when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>invite</html>");
 
         assertThatThrownBy(() ->
-                service.sendInviteEmail("fail@example.com", "https://beautica.app/invite/x", "Salon")
+                service.sendRequestDecisionEmail("fail@example.com", RequestKind.CATEGORY_REQUEST, true, "Манікюр", null)
         ).isInstanceOf(EmailDeliveryException.class)
-                .hasMessageContaining("email/invite-master")
+                .hasMessageContaining("email/request-decision")
                 .hasMessageNotContaining("fail@example.com")
                 .hasNoCause();
     }
@@ -890,13 +853,13 @@ class EmailNotificationServiceTest {
     // -------------------------------------------------------------------------
 
     @Test
-    @DisplayName("should set correct From address header when sendInviteEmail is called")
-    void should_setFromAddress_when_sendInviteEmailCalled() throws Exception {
+    @DisplayName("should set correct From address header when an e-mail is sent")
+    void should_setFromAddress_when_emailSent() throws Exception {
         MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
         when(mailSender.createMimeMessage()).thenReturn(realMessage);
         when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>invite</html>");
 
-        service.sendInviteEmail("master@example.com", "https://beautica.app/invite/x", "Salon Aurora");
+        service.sendRequestDecisionEmail("master@example.com", RequestKind.CATEGORY_REQUEST, true, "Манікюр", null);
 
         assertThat(realMessage.getFrom())
                 .isNotNull()
@@ -905,13 +868,13 @@ class EmailNotificationServiceTest {
     }
 
     @Test
-    @DisplayName("should set correct To recipient header when sendInviteEmail is called")
-    void should_setToRecipient_when_sendInviteEmailCalled() throws Exception {
+    @DisplayName("should set correct To recipient header when an e-mail is sent")
+    void should_setToRecipient_when_emailSent() throws Exception {
         MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
         when(mailSender.createMimeMessage()).thenReturn(realMessage);
         when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>invite</html>");
 
-        service.sendInviteEmail("master@example.com", "https://beautica.app/invite/x", "Salon Aurora");
+        service.sendRequestDecisionEmail("master@example.com", RequestKind.CATEGORY_REQUEST, true, "Манікюр", null);
 
         assertThat(realMessage.getRecipients(Message.RecipientType.TO))
                 .isNotNull()
@@ -1327,7 +1290,7 @@ class EmailNotificationServiceTest {
     }
 
     @Test
-    @DisplayName("should strip CRLF from To address in send() helper before setTo is called (via sendInviteEmail)")
+    @DisplayName("should strip CRLF from To address in send() helper before setTo is called (via sendRequestDecisionEmail)")
     void should_stripCrlf_when_sendHelperCalledWithInjectedNewline() throws Exception {
         // Use an address that is valid after newline stripping so MimeMessageHelper.setTo() succeeds.
         // "master@example.com\n" → stripped → "master@example.com" (valid RFC 5321 address).
@@ -1335,10 +1298,7 @@ class EmailNotificationServiceTest {
         when(mailSender.createMimeMessage()).thenReturn(realMessage);
         when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>invite</html>");
 
-        service.sendInviteEmail(
-                "master@example.com\n",
-                "https://beautica.app/invite/token",
-                "Salon Aurora");
+        service.sendRequestDecisionEmail("master@example.com\n", RequestKind.CATEGORY_REQUEST, true, "Манікюр", null);
 
         assertThat(realMessage.getRecipients(Message.RecipientType.TO))
                 .as("To header must be set (newline stripped, address remains valid)")
@@ -1496,11 +1456,11 @@ class EmailNotificationServiceTest {
         stubSendFailure(new MailSendException("550 rejected"));
 
         var events = logsOf(() -> assertThatThrownBy(() ->
-                service.sendInviteEmail("i441@example.com", "https://beautica.app/invite/x", "Salon"))
+                service.sendRequestDecisionEmail("i441@example.com", RequestKind.CATEGORY_REQUEST, true, "Манікюр", null))
                 .isInstanceOf(EmailDeliveryException.class));
 
         assertThat(errorLines(events)).containsExactly("External call failed service=brevo-smtp op=send http=- "
-                + "reason=rejected to=- detail=email/invite-master MailSendException");
+                + "reason=rejected to=- detail=email/request-decision MailSendException");
     }
 
     @Test
@@ -1509,7 +1469,7 @@ class EmailNotificationServiceTest {
         stubSendFailure(new com.beautica.notification.mail.BrevoPermanentMailException("Brevo API HTTP 400"));
 
         var events = logsOf(() -> assertThatThrownBy(() ->
-                service.sendInviteEmail("i441@example.com", "https://beautica.app/invite/x", "Salon"))
+                service.sendRequestDecisionEmail("i441@example.com", RequestKind.CATEGORY_REQUEST, true, "Манікюр", null))
                 .isInstanceOf(EmailDeliveryException.class));
 
         assertThat(errorLines(events)).as("BrevoApiMailSender already logged the ERROR").isEmpty();

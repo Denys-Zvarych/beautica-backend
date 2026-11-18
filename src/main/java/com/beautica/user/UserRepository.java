@@ -40,7 +40,67 @@ public interface UserRepository extends JpaRepository<User, UUID>, TransactionLo
     @Query("SELECT (u.emailVerified = true AND u.isActive = true) FROM User u WHERE u.email = :email")
     Optional<Boolean> findPasswordResetEligibleByEmail(@Param("email") String email);
 
+    /**
+     * B516 (AUTH-15) — column-only pre-read for change-password-from-settings: {@code true} when the code would go by
+     * SMS (no confirmed email, a verified phone), so App Check runs BEFORE the row lock is taken. Scalar projection
+     * for the same stale-entity reason as {@link #findPasswordResetEligibleByEmail}. Empty for a deleted account.
+     */
+    @Query("SELECT CASE WHEN (u.email IS NULL OR u.emailVerified = false) AND u.phoneVerifiedAt IS NOT NULL "
+            + "THEN true ELSE false END FROM User u WHERE u.id = :userId")
+    Optional<Boolean> findPasswordResetSmsBranchById(@Param("userId") UUID userId);
+
     boolean existsByEmail(String email);
+
+    /**
+     * B514 (AUTH-D09) — login by phone: the account whose phone is VERIFIED and equals {@code phoneE164}. An
+     * unverified legacy {@code phone_number} never matches (same 401 as a wrong password). Served by the partial
+     * unique index {@code ux_users_verified_phone} (V244), whose predicate is exactly this one, so at most one row.
+     */
+    @Query("SELECT u FROM User u WHERE u.phoneNumber = :phone AND u.phoneVerifiedAt IS NOT NULL")
+    Optional<User> findByVerifiedPhone(@Param("phone") String phoneE164);
+
+    /** B514 (AUTH-42) — a verified account already holds {@code phoneE164}. Same index as {@link #findByVerifiedPhone}. */
+    @Query("SELECT COUNT(u) > 0 FROM User u WHERE u.phoneNumber = :phone AND u.phoneVerifiedAt IS NOT NULL")
+    boolean existsByVerifiedPhone(@Param("phone") String phoneE164);
+
+    /** B516 (AUTH-44) — another verified account holds {@code phoneE164}; same index as {@link #findByVerifiedPhone}. */
+    @Query("SELECT COUNT(u) > 0 FROM User u WHERE u.phoneNumber = :phone AND u.phoneVerifiedAt IS NOT NULL "
+            + "AND u.id <> :userId")
+    boolean existsByVerifiedPhoneOnOtherUser(@Param("phone") String phoneE164, @Param("userId") UUID userId);
+
+    /** B516 (AUTH-50) — another account already holds {@code email} (users.email is unique among non-null values). */
+    @Query("SELECT COUNT(u) > 0 FROM User u WHERE u.email = :email AND u.id <> :userId")
+    boolean existsByEmailOnOtherUser(@Param("email") String email, @Param("userId") UUID userId);
+
+    /**
+     * B516 (AUTH-45) — column-only read for the verified-phone gate: role and whether the phone is verified. Empty
+     * for a deleted account. A projection, not an entity: the gate runs before the handler's own transaction.
+     */
+    @Query("SELECT new com.beautica.user.PhoneGateRow(u.role, "
+            + "CASE WHEN u.phoneVerifiedAt IS NOT NULL THEN true ELSE false END) FROM User u "
+            + "WHERE u.id = :userId")
+    Optional<PhoneGateRow> findPhoneGateRow(@Param("userId") UUID userId);
+
+    /**
+     * B516 (AUTH-D19) — password hash + phone-verified flag WITHOUT a row lock, so the current-password BCrypt runs
+     * before {@link #findByIdForUpdate} (never under the lock). A projection, not an entity, so the locked re-read
+     * that follows returns fresh state (an entity loaded here would be returned stale by the locking query). Empty for
+     * a deleted account.
+     */
+    @Query("SELECT new com.beautica.user.CurrentPasswordRow(u.passwordHash, "
+            + "CASE WHEN u.phoneVerifiedAt IS NOT NULL THEN true ELSE false END) FROM User u WHERE u.id = :userId")
+    Optional<CurrentPasswordRow> findCurrentPasswordRow(@Param("userId") UUID userId);
+
+    /** B516 (AUTH-D18) — forgot-password by phone: the VERIFIED account, row-locked (cooldown TOCTOU, as by email). */
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("SELECT u FROM User u WHERE u.phoneNumber = :phone AND u.phoneVerifiedAt IS NOT NULL")
+    Optional<User> findByVerifiedPhoneForUpdateNoLockTimeout(@Param("phone") String phoneE164);
+
+    /** {@link #findByVerifiedPhoneForUpdateNoLockTimeout} bounded by the 3s {@code lock_timeout}. */
+    default Optional<User> findByVerifiedPhoneForUpdate(String phoneE164) {
+        applyTransactionLockTimeout();
+        return findByVerifiedPhoneForUpdateNoLockTimeout(phoneE164);
+    }
 
     /**
      * The user's assigned salon id, EMPTY for a missing or DEACTIVATED ({@code is_active = false})
@@ -57,7 +117,7 @@ public interface UserRepository extends JpaRepository<User, UUID>, TransactionLo
      * (which carries {@code passwordHash}), mirroring {@link #findSalonIdById}'s pattern.
      *
      * <p>Needed because {@code users.salon_id} is populated for BOTH an invited
-     * {@code SALON_ADMIN} and an invited {@code SALON_MASTER} ({@code User.createFromInvite} sets
+     * {@code SALON_ADMIN} and an invited {@code SALON_MASTER} ({@code User.createFromPhoneInvite} sets
      * it from the invite token regardless of role) — a salon-id match alone cannot distinguish a
      * staff manager from a read-only master, so the caller must resolve the role first.
      */

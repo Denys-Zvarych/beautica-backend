@@ -101,7 +101,7 @@ class PhoneOtpVerifyBruteForceTest {
         AtomicBoolean dbUsed = new AtomicBoolean(false);
 
         when(phoneOtpRepository
-                .findTopByPhoneAndUsedFalseAndExpiresAtAfterOrderByIdDesc(eq(PHONE), any()))
+                .findTopByPhoneAndPurposeAndUsedFalseAndExpiresAtAfterOrderByIdDesc(eq(PHONE), eq(PhoneOtpPurpose.GUEST_BOOKING), any()))
                 .thenAnswer(inv -> dbUsed.get() ? Optional.empty() : Optional.of(otp));
         org.mockito.Mockito.doAnswer(inv -> {
                     int cap = inv.getArgument(1);

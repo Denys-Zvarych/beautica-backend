@@ -141,6 +141,31 @@ class ScheduleOverrideDeclineNotificationIT extends AbstractWalkInBookingSmsIT {
     }
 
     @Test
+    @DisplayName("B522 audit-fix cycle 2 — NTF-40 parity: a DEACTIVATED registered client whose booking is declined "
+            + "by a day off still gets the BOOKING_DECLINED feed row, exactly as a provider decline writes it")
+    void should_writeFeedRowForInactiveClient_when_bookingDeclinedByDayOff() {
+        SeededUser client = insertUser("CLIENT", null);
+        OffsetDateTime first = tomorrowAtNoon();
+        OffsetDateTime second = first.plusDays(1);
+        UUID patchDeclined = insertRegisteredBooking(client.id(), first);
+        UUID overrideDeclined = insertRegisteredBooking(client.id(), second);
+        jdbcTemplate.update("UPDATE users SET is_active = false WHERE id = ?", client.id());
+        String ownerToken = tokenFor(salon.ownerEmail());
+
+        restTemplate.exchange("/api/v1/bookings/" + patchDeclined + "/decline", HttpMethod.PATCH,
+                new HttpEntity<>("{\"cancellationReason\":\"PROVIDER_UNAVAILABLE\"}", bearerHeaders(ownerToken)),
+                String.class);
+        List<String> patchFeed = feedRows();
+        clearNotifications();
+        ResponseEntity<String> put = putDayOff(salon.masterId(), ownerToken, second.toLocalDate(), true);
+
+        assertThat(put.getStatusCode()).as("override body=%s", put.getBody()).isEqualTo(HttpStatus.OK);
+        assertThat(bookingStatus(overrideDeclined)).isEqualTo("DECLINED");
+        assertThat(feedRows()).as("mass decline = single decline for an inactive recipient").isEqualTo(patchFeed)
+                .containsExactly("BOOKING_DECLINED:" + client.id());
+    }
+
+    @Test
     @DisplayName("registered client's visit of 3 services, 2 conflict with narrowed hours — one feed row and one "
             + "STATUS_CHANGED row for the visit, zero SMS")
     void should_notifyOncePerVisit_when_twoOfThreeRegisteredVisitItemsConflict() {

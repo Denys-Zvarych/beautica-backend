@@ -3,8 +3,9 @@ package com.beautica.auth;
 import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.InviteAcceptRequest;
 import com.beautica.auth.dto.InviteRequest;
-import com.beautica.common.exception.EmailAlreadyRegisteredException;
+import com.beautica.auth.registration.RegistrationTicketService;
 import com.beautica.common.exception.ForbiddenException;
+import com.beautica.common.exception.IdentityException;
 import com.beautica.master.service.MasterService;
 import com.beautica.notification.inapp.service.InAppNotificationService;
 import com.beautica.salon.entity.Salon;
@@ -21,476 +22,246 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
-import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.test.util.ReflectionTestUtils;
-import java.time.Clock;
 
+import java.time.Clock;
 import java.time.Instant;
+import java.time.ZoneOffset;
 import java.util.Optional;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.catchThrowableOfType;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 /**
- * Unit tests for the SALON_ADMIN invite flow in InviteService (Phase 2.8 / Phase 2.9).
- *
- * Covers:
- * - sending admin invites (role guard, conflict guard)
- * - accepting admin invites (role assignment, no Master record created)
- * - accepting master invites (Master record created)
+ * B520 — who may invite whom, by phone (salon.md: owner and admin invite admins and masters; an admin only into their own
+ * salon; nobody else). The controller role gate is pinned by the ITs; these pin the service-side branches, and that the
+ * 409 for a registered phone never overtakes a 403 (AUTH-18). Accept: the token's role decides the account and whether
+ * a master row is made.
  */
 @ExtendWith(MockitoExtension.class)
-@DisplayName("InviteService — SALON_ADMIN invite flow")
+@DisplayName("InviteService — owner / admin invite permissions (B520)")
 class InviteServiceAdminTest {
 
-    @Mock
-    private InviteTokenRepository inviteTokenRepository;
+    private static final Instant NOW = Instant.parse("2026-11-18T10:00:00Z");
+    private static final String PHONE = "+380501234567";
 
-    @Mock
-    private UserRepository userRepository;
-
-    @Mock
-    private SalonRepository salonRepository;
-
-    @Mock
-    private InvitePersistenceService invitePersistenceService;
-
-    @Mock
-    private TokenGenerator tokenGenerator;
-
-    @Mock
-    private MasterService masterService;
-
-    @Mock
-    private AuthResponseBuilder authResponseBuilder;
-
-    @Mock
-    private InAppNotificationService inAppNotificationService;
+    @Mock private InviteTokenRepository inviteTokenRepository;
+    @Mock private UserRepository userRepository;
+    @Mock private SalonRepository salonRepository;
+    @Mock private InvitePersistenceService invitePersistenceService;
+    @Mock private TokenGenerator tokenGenerator;
+    @Mock private MasterService masterService;
+    @Mock private AuthResponseBuilder authResponseBuilder;
+    @Mock private InAppNotificationService inAppNotificationService;
+    @Mock private RegistrationTicketService registrationTicketService;
 
     private InviteService inviteService;
+    private final UUID salonId = UUID.randomUUID();
+    private final UUID callerId = UUID.randomUUID();
 
     @BeforeEach
     void setUp() {
-        PasswordEncoder passwordEncoder = new BCryptPasswordEncoder(4);
-        inviteService = new InviteService(
-                inviteTokenRepository,
-                userRepository,
-                salonRepository,
-                passwordEncoder,
-                tokenGenerator,
-                masterService,
-                authResponseBuilder,
-                invitePersistenceService,
-                "http://localhost:3000",
-                48L,
-                Clock.systemUTC(),
-                inAppNotificationService
-        );
+        inviteService = new InviteService(inviteTokenRepository, userRepository, salonRepository,
+                new BCryptPasswordEncoder(4), tokenGenerator, masterService, authResponseBuilder,
+                invitePersistenceService, "https://beautica.app", 48L, Clock.fixed(NOW, ZoneOffset.UTC),
+                inAppNotificationService, registrationTicketService,
+                new InviteConflictProbeBudget(Clock.fixed(NOW, ZoneOffset.UTC)));
     }
 
-    // ── sendInvite — admin role guard ─────────────────────────────────────────
-
     @Test
-    @DisplayName("sendInvite forwards SALON_ADMIN role to the delegate when SALON_OWNER invites admin")
+    @DisplayName("owner invites a SALON_ADMIN into their salon → the delegate gets role SALON_ADMIN")
     void should_sendAdminInvite_when_ownerInvitesAdmin() {
-        var salonId = UUID.randomUUID();
-        var callerId = UUID.randomUUID();
-        var owner = buildOwner(callerId, salonId);
-        var request = new InviteRequest("admin@example.com", salonId, Role.SALON_ADMIN);
+        callerIs(Role.SALON_OWNER, salonId);
+        Salon salon = salon();
+        when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(salon));
+        when(tokenGenerator.generateToken()).thenReturn("raw");
 
-        var salonStub = mock(com.beautica.salon.entity.Salon.class);
-        when(salonStub.getName()).thenReturn("Test Salon");
+        inviteService.sendInvite(new InviteRequest(PHONE, salonId, Role.SALON_ADMIN), callerId);
 
-        when(userRepository.existsByEmail("admin@example.com")).thenReturn(false);
-        when(userRepository.findById(callerId)).thenReturn(Optional.of(owner));
-        when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(salonStub));
-        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull("admin@example.com", salonId))
-                .thenReturn(Optional.empty());
-        when(tokenGenerator.generateToken()).thenReturn("raw-admin-tok");
-
-        inviteService.sendInvite(request, callerId);
-
-        ArgumentCaptor<Role> roleCaptor = ArgumentCaptor.forClass(Role.class);
-        verify(invitePersistenceService).persistInviteAndEnqueue(
-                any(), any(), roleCaptor.capture(), any(), any(), any(), any());
-        assertThat(roleCaptor.getValue()).isEqualTo(Role.SALON_ADMIN);
+        assertThat(persistedInvite().role()).isEqualTo(Role.SALON_ADMIN);
     }
 
     @Test
-    @DisplayName("Phase 21.1: sendInvite forwards SALON_ADMIN role when a SALON_ADMIN caller invites another admin into their own salon")
-    void should_sendAdminInvite_when_adminInvitesAnotherAdminIntoOwnSalon() {
-        var salonId = UUID.randomUUID();
-        var callerId = UUID.randomUUID();
-        var adminCaller = buildSalonAdmin(callerId, salonId);
-        var request = new InviteRequest("second-admin@example.com", salonId, Role.SALON_ADMIN);
+    @DisplayName("admin invites a SALON_MASTER into their own salon → findById, never the owner lookup")
+    void should_sendMasterInvite_when_adminInvitesIntoOwnSalon() {
+        callerIs(Role.SALON_ADMIN, salonId);
+        Salon salon = salon();
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+        when(tokenGenerator.generateToken()).thenReturn("raw");
 
-        var salonStub = mock(com.beautica.salon.entity.Salon.class);
-        when(salonStub.getName()).thenReturn("Test Salon");
+        inviteService.sendInvite(new InviteRequest(PHONE, salonId, Role.SALON_MASTER), callerId);
 
-        when(userRepository.existsByEmail("second-admin@example.com")).thenReturn(false);
-        when(userRepository.findById(callerId)).thenReturn(Optional.of(adminCaller));
-        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salonStub));
-        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull("second-admin@example.com", salonId))
-                .thenReturn(Optional.empty());
-        when(tokenGenerator.generateToken()).thenReturn("raw-second-admin-tok");
-
-        inviteService.sendInvite(request, callerId);
-
-        ArgumentCaptor<Role> roleCaptor = ArgumentCaptor.forClass(Role.class);
-        verify(invitePersistenceService).persistInviteAndEnqueue(
-                any(), any(), roleCaptor.capture(), any(), any(), any(), any());
-        assertThat(roleCaptor.getValue()).isEqualTo(Role.SALON_ADMIN);
-        verify(salonRepository).findById(salonId);
+        var invite = persistedInvite();
+        assertThat(invite.role()).isEqualTo(Role.SALON_MASTER);
+        assertThat(invite.inviterId()).isEqualTo(callerId);
         verify(salonRepository, never()).findByIdAndOwnerId(any(), any());
     }
 
     @Test
-    @DisplayName("Phase 21.1: sendInvite succeeds (no conflict) when the salon already has a SALON_ADMIN")
-    void should_sendAdminInvite_when_salonAlreadyHasAdmin() {
-        var salonId = UUID.randomUUID();
-        var callerId = UUID.randomUUID();
-        var owner = buildOwner(callerId, salonId);
-        var request = new InviteRequest("another-admin@example.com", salonId, Role.SALON_ADMIN);
+    @DisplayName("admin invites a co-admin into their own salon (phase 21.1) → allowed")
+    void should_sendAdminInvite_when_adminInvitesCoAdminIntoOwnSalon() {
+        callerIs(Role.SALON_ADMIN, salonId);
+        Salon salon = salon();
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+        when(tokenGenerator.generateToken()).thenReturn("raw");
 
-        var salonStub = mock(com.beautica.salon.entity.Salon.class);
-        when(salonStub.getName()).thenReturn("Test Salon");
+        inviteService.sendInvite(new InviteRequest(PHONE, salonId, Role.SALON_ADMIN), callerId);
 
-        when(userRepository.existsByEmail("another-admin@example.com")).thenReturn(false);
-        when(userRepository.findById(callerId)).thenReturn(Optional.of(owner));
-        when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(salonStub));
-        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull("another-admin@example.com", salonId))
-                .thenReturn(Optional.empty());
-        when(tokenGenerator.generateToken()).thenReturn("raw-another-admin-tok");
-
-        inviteService.sendInvite(request, callerId);
-
-        ArgumentCaptor<Role> roleCaptor = ArgumentCaptor.forClass(Role.class);
-        verify(invitePersistenceService).persistInviteAndEnqueue(
-                any(), any(), roleCaptor.capture(), any(), any(), any(), any());
-        assertThat(roleCaptor.getValue()).isEqualTo(Role.SALON_ADMIN);
+        assertThat(persistedInvite().role()).isEqualTo(Role.SALON_ADMIN);
     }
 
     @Test
-    @DisplayName("Phase 21.1: sendInvite still throws ForbiddenException when a SALON_ADMIN caller invites an admin into a different salon")
-    void should_throwForbidden_when_adminInvitesAdminIntoDifferentSalon() {
-        var callerSalonId = UUID.randomUUID();
-        var targetSalonId = UUID.randomUUID();
-        var callerId = UUID.randomUUID();
-        var adminCaller = buildSalonAdmin(callerId, callerSalonId);
-        var request = new InviteRequest("cross-salon-admin@example.com", targetSalonId, Role.SALON_ADMIN);
+    @DisplayName("admin invites into ANOTHER salon → 403, even when the phone is registered (no 409 leak)")
+    void should_throwForbidden_when_adminInvitesIntoOtherSalon() {
+        callerIs(Role.SALON_ADMIN, UUID.randomUUID());
+        when(userRepository.existsByVerifiedPhone(PHONE)).thenReturn(true);
 
-        when(userRepository.existsByEmail("cross-salon-admin@example.com")).thenReturn(false);
-        when(userRepository.findById(callerId)).thenReturn(Optional.of(adminCaller));
-
-        assertThatThrownBy(() -> inviteService.sendInvite(request, callerId))
+        assertThatThrownBy(() -> inviteService.sendInvite(new InviteRequest(PHONE, salonId, null), callerId))
                 .isInstanceOf(ForbiddenException.class)
                 .hasMessageContaining("SALON_ADMIN may only invite to their own assigned salon");
-
-        verify(invitePersistenceService, never())
-                .persistInviteAndEnqueue(any(), any(), any(), any(), any(), any(), any());
-    }
-
-    // ── sendInvite — email conflict guard ─────────────────────────────────────
-
-    @Test
-    @DisplayName("sendInvite (SALON_OWNER caller) throws EmailAlreadyRegisteredException when email is already registered — phase 287 reversal")
-    void should_throwEmailAlreadyRegistered_when_emailAlreadyRegistered() {
-        // Phase 287: already-registered is now an honest 409, not a distinguishing-oracle concern.
-        // Authorization + ownership still run first — ONLY THEN does the already-registered branch
-        // throw, without delegating any persistence.
-        var salonId = UUID.randomUUID();
-        var callerId = UUID.randomUUID();
-        var owner = buildOwner(callerId, salonId);
-        var request = new InviteRequest("existing@example.com", salonId, Role.SALON_MASTER);
-
-        when(userRepository.existsByEmail("existing@example.com")).thenReturn(true);
-        when(userRepository.findById(callerId)).thenReturn(Optional.of(owner));
-        when(salonRepository.findByIdAndOwnerId(salonId, callerId))
-                .thenReturn(Optional.of(mock(com.beautica.salon.entity.Salon.class)));
-
-        assertThatThrownBy(() -> inviteService.sendInvite(request, callerId))
-                .isInstanceOf(EmailAlreadyRegisteredException.class);
-
-        verify(invitePersistenceService, never())
-                .persistInviteAndEnqueue(any(), any(), any(), any(), any(), any(), any());
+        verifyNoInteractions(invitePersistenceService);
     }
 
     @Test
-    @DisplayName("sendInvite (SALON_ADMIN caller) throws the SAME EmailAlreadyRegisteredException as a SALON_OWNER caller — phase 287")
-    void should_throwEmailAlreadyRegistered_when_salonAdminCallerAndTargetAlreadyRegistered() {
-        // Phase 287 explicitly requires parity: a SALON_ADMIN caller inviting into their own salon
-        // gets the identical 409 EMAIL_ALREADY_REGISTERED a SALON_OWNER caller gets — the reversal
-        // is not SALON_OWNER-specific.
-        var salonId = UUID.randomUUID();
-        var callerId = UUID.randomUUID();
-        var adminCaller = buildSalonAdmin(callerId, salonId);
-        var request = new InviteRequest("existing-admin-caller@example.com", salonId, Role.SALON_MASTER);
+    @DisplayName("owner of ANOTHER salon → 403 'do not own'")
+    void should_throwForbidden_when_ownerDoesNotOwnSalon() {
+        callerIs(Role.SALON_OWNER, UUID.randomUUID());
+        when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.empty());
 
-        var salonStub = mock(com.beautica.salon.entity.Salon.class);
-        when(userRepository.existsByEmail("existing-admin-caller@example.com")).thenReturn(true);
-        when(userRepository.findById(callerId)).thenReturn(Optional.of(adminCaller));
-        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salonStub));
-
-        assertThatThrownBy(() -> inviteService.sendInvite(request, callerId))
-                .isInstanceOf(EmailAlreadyRegisteredException.class);
-
-        verify(salonRepository).findById(salonId);
-        verify(invitePersistenceService, never())
-                .persistInviteAndEnqueue(any(), any(), any(), any(), any(), any(), any());
-    }
-
-    // ── sendInvite — caller-ownership guard ───────────────────────────────────
-
-    @Test
-    @DisplayName("sendInvite throws ForbiddenException when caller's salonId does not match request salonId")
-    void should_throwForbidden_when_callerDoesNotBelongToSalon() {
-        var callerId = UUID.randomUUID();
-        var callerSalonId = UUID.randomUUID();
-        var requestSalonId = UUID.randomUUID(); // different salon
-        var caller = buildOwner(callerId, callerSalonId);
-        var request = new InviteRequest("master@example.com", requestSalonId, Role.SALON_MASTER);
-
-        when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
-        when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
-        when(salonRepository.findByIdAndOwnerId(requestSalonId, callerId)).thenReturn(Optional.empty());
-
-        assertThatThrownBy(() -> inviteService.sendInvite(request, callerId))
+        assertThatThrownBy(() -> inviteService.sendInvite(new InviteRequest(PHONE, salonId, null), callerId))
                 .isInstanceOf(ForbiddenException.class)
-                .hasMessageContaining("own the specified salon");
-
-        verify(salonRepository).findByIdAndOwnerId(requestSalonId, callerId);
-        verify(invitePersistenceService, never())
-                .persistInviteAndEnqueue(any(), any(), any(), any(), any(), any(), any());
+                .hasMessageContaining("do not own");
+        verifyNoInteractions(invitePersistenceService);
     }
 
     @Test
-    @DisplayName("sendInvite throws ForbiddenException when salon does not exist")
-    void should_throwForbiddenException_when_salonNotFound() {
-        var callerId = UUID.randomUUID();
-        var nonExistentSalonId = UUID.randomUUID();
-        var owner = buildOwner(callerId, UUID.randomUUID());
-        var request = new InviteRequest("master@example.com", nonExistentSalonId, Role.SALON_MASTER);
+    @DisplayName("a SALON_MASTER caller may not invite at all (master invite → 403)")
+    void should_throwForbidden_when_salonMasterInvitesMaster() {
+        callerIs(Role.SALON_MASTER, salonId);
 
-        when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
-        when(userRepository.findById(callerId)).thenReturn(Optional.of(owner));
-        when(salonRepository.findByIdAndOwnerId(nonExistentSalonId, callerId)).thenReturn(Optional.empty());
-
-        assertThatThrownBy(() -> inviteService.sendInvite(request, callerId))
+        assertThatThrownBy(() -> inviteService.sendInvite(new InviteRequest(PHONE, salonId, null), callerId))
                 .isInstanceOf(ForbiddenException.class)
-                .hasMessageContaining("You do not own the specified salon");
-
-        verify(salonRepository).findByIdAndOwnerId(nonExistentSalonId, callerId);
-        verify(invitePersistenceService, never())
-                .persistInviteAndEnqueue(any(), any(), any(), any(), any(), any(), any());
+                .hasMessageContaining("cannot send invites");
+        verifyNoInteractions(invitePersistenceService);
     }
 
     @Test
-    @DisplayName("sendInvite throws ForbiddenException when salon exists but is owned by another user")
-    void should_throwForbiddenException_when_salonExistsButOwnedByOther() {
-        var callerId = UUID.randomUUID();
-        var salonOwnedByOther = UUID.randomUUID();
-        var owner = buildOwner(callerId, UUID.randomUUID());
-        var request = new InviteRequest("master@example.com", salonOwnedByOther, Role.SALON_MASTER);
+    @DisplayName("a SALON_MASTER caller may not invite an admin (403 before any salon lookup)")
+    void should_throwForbidden_when_salonMasterInvitesAdmin() {
+        callerIs(Role.SALON_MASTER, salonId);
 
-        when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
-        when(userRepository.findById(callerId)).thenReturn(Optional.of(owner));
-        // Salon exists but the combined id+ownerId query returns empty — same result as non-existent.
-        when(salonRepository.findByIdAndOwnerId(salonOwnedByOther, callerId)).thenReturn(Optional.empty());
-
-        assertThatThrownBy(() -> inviteService.sendInvite(request, callerId))
+        assertThatThrownBy(() -> inviteService.sendInvite(
+                new InviteRequest(PHONE, salonId, Role.SALON_ADMIN), callerId))
                 .isInstanceOf(ForbiddenException.class)
-                .hasMessageContaining("You do not own the specified salon");
-
-        verify(salonRepository).findByIdAndOwnerId(salonOwnedByOther, callerId);
-        verify(invitePersistenceService, never())
-                .persistInviteAndEnqueue(any(), any(), any(), any(), any(), any(), any());
+                .hasMessageContaining("Only SALON_OWNER or SALON_ADMIN may invite a SALON_ADMIN");
+        verifyNoInteractions(salonRepository, invitePersistenceService);
     }
 
-    // ── sendInvite — SALON_ADMIN master invite success path ───────────────────
-
     @Test
-    @DisplayName("sendInvite forwards SALON_MASTER role and uses findById (not findByIdAndOwnerId) when SALON_ADMIN invites their own salon")
-    void should_sendMasterInvite_when_salonAdminInvitesOwnSalon() {
-        // Arrange
-        var salonId = UUID.randomUUID();
-        var callerId = UUID.randomUUID();
-        var adminCaller = buildSalonAdmin(callerId, salonId);
-        var request = new InviteRequest("master@example.com", salonId, Role.SALON_MASTER);
+    @DisplayName("roles other than SALON_ADMIN / SALON_MASTER cannot be invited (CLIENT → 403)")
+    void should_throwForbidden_when_roleNotInvitable() {
+        callerIs(Role.SALON_OWNER, salonId);
 
-        var salonStub = mock(com.beautica.salon.entity.Salon.class);
-        when(salonStub.getName()).thenReturn("Salon A");
-
-        when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
-        when(userRepository.findById(callerId)).thenReturn(Optional.of(adminCaller));
-        // SALON_ADMIN branch calls findById, NOT findByIdAndOwnerId
-        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salonStub));
-        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull("master@example.com", salonId))
-                .thenReturn(Optional.empty());
-        when(tokenGenerator.generateToken()).thenReturn("raw-master-tok");
-
-        // Act
-        inviteService.sendInvite(request, callerId);
-
-        // Assert — the delegate received the SALON_MASTER role
-        ArgumentCaptor<Role> roleCaptor = ArgumentCaptor.forClass(Role.class);
-        verify(invitePersistenceService).persistInviteAndEnqueue(
-                any(), any(), roleCaptor.capture(), any(), any(), any(), any());
-        assertThat(roleCaptor.getValue())
-                .as("role forwarded to the delegate must be SALON_MASTER when SALON_ADMIN invites a master")
-                .isEqualTo(Role.SALON_MASTER);
-
-        // Assert — the ownership path used by SALON_ADMIN is findById, not findByIdAndOwnerId
-        verify(salonRepository).findById(salonId);
-        verify(salonRepository, never()).findByIdAndOwnerId(any(), any());
-    }
-
-    // ── sendInvite — invalid role guard ───────────────────────────────────────
-
-    @Test
-    @DisplayName("sendInvite throws ForbiddenException when requested role cannot be assigned via invite")
-    void should_throwForbidden_when_invalidRoleRequested() {
-        var salonId = UUID.randomUUID();
-        var callerId = UUID.randomUUID();
-        var caller = buildOwner(callerId, salonId);
-        var request = new InviteRequest("client@example.com", salonId, Role.CLIENT);
-
-        when(userRepository.existsByEmail("client@example.com")).thenReturn(false);
-        when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
-
-        assertThatThrownBy(() -> inviteService.sendInvite(request, callerId))
+        assertThatThrownBy(() -> inviteService.sendInvite(new InviteRequest(PHONE, salonId, Role.CLIENT), callerId))
                 .isInstanceOf(ForbiddenException.class)
                 .hasMessageContaining("cannot be assigned via invite");
-
-        verify(invitePersistenceService, never())
-                .persistInviteAndEnqueue(any(), any(), any(), any(), any(), any(), any());
-    }
-
-    // ── sendInvite — IDOR / cross-salon guard ─────────────────────────────────
-
-    @Test
-    @DisplayName("sendInvite throws ForbiddenException when SALON_ADMIN invites into a different salon")
-    void should_throwForbidden_when_adminInvitesToDifferentSalon() {
-        var callerId = UUID.randomUUID();
-        var callerSalonId = UUID.randomUUID();
-        var targetSalonId = UUID.randomUUID(); // salon B — admin does not belong here
-        var adminCaller = buildSalonAdmin(callerId, callerSalonId);
-        var request = new InviteRequest("master@example.com", targetSalonId, Role.SALON_MASTER);
-
-        when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
-        when(userRepository.findById(callerId)).thenReturn(Optional.of(adminCaller));
-
-        // Fix 2: SALON_ADMIN branch now detects cross-salon attempts via salonId equality
-        // before reaching the salonRepository.findByIdAndOwnerId path, so the message is
-        // the SALON_ADMIN-specific one (not the SALON_OWNER "own the specified salon" message).
-        assertThatThrownBy(() -> inviteService.sendInvite(request, callerId))
-                .isInstanceOf(ForbiddenException.class)
-                .hasMessageContaining("SALON_ADMIN may only invite to their own assigned salon");
-
-        verify(invitePersistenceService, never())
-                .persistInviteAndEnqueue(any(), any(), any(), any(), any(), any(), any());
-    }
-
-    // ── acceptInvite — role assignment ────────────────────────────────────────
-
-    @Test
-    @DisplayName("acceptInvite assigns SALON_ADMIN role to the new user when token carries that role")
-    void should_assignRoleFromToken_when_acceptingAdminInvite() {
-        var rawToken = "raw-admin-accept";
-        var hashedToken = "hashed-admin-accept";
-        var salonId = UUID.randomUUID();
-        var userId = UUID.randomUUID();
-        var invite = new InviteToken(hashedToken, "admin@example.com", salonId,
-                Role.SALON_ADMIN, Instant.now().plusSeconds(3600));
-        var request = new InviteAcceptRequest(rawToken, "Password1!", "Admin", "User", null);
-
-        stubAcceptInviteHappyPath(rawToken, hashedToken, userId, salonId, Role.SALON_ADMIN, invite);
-
-        inviteService.acceptInvite(request);
-
-        ArgumentCaptor<User> userCaptor = ArgumentCaptor.forClass(User.class);
-        verify(userRepository).save(userCaptor.capture());
-        assertThat(userCaptor.getValue().getRole()).isEqualTo(Role.SALON_ADMIN);
+        verifyNoInteractions(invitePersistenceService);
     }
 
     @Test
-    @DisplayName("acceptInvite never calls masterService when token role is SALON_ADMIN")
-    void should_notCreateMasterRecord_when_acceptingAdminInvite() {
-        var rawToken = "raw-admin-accept-no-master";
-        var hashedToken = "hashed-admin-accept-no-master";
-        var salonId = UUID.randomUUID();
-        var userId = UUID.randomUUID();
-        var invite = new InviteToken(hashedToken, "admin2@example.com", salonId,
-                Role.SALON_ADMIN, Instant.now().plusSeconds(3600));
-        var request = new InviteAcceptRequest(rawToken, "Password1!", "Admin", "Two", null);
+    @DisplayName("admin caller + registered phone → the same 409 PHONE_ALREADY_REGISTERED an owner gets")
+    void should_throwPhoneAlreadyRegistered_when_adminCallerAndPhoneRegistered() {
+        callerIs(Role.SALON_ADMIN, salonId);
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(activeSalon()));
+        when(userRepository.existsByVerifiedPhone(PHONE)).thenReturn(true);
 
-        stubAcceptInviteHappyPath(rawToken, hashedToken, userId, salonId, Role.SALON_ADMIN, invite);
+        var thrown = catchThrowableOfType(
+                () -> inviteService.sendInvite(new InviteRequest(PHONE, salonId, null), callerId),
+                IdentityException.class);
 
-        inviteService.acceptInvite(request);
+        assertThat(thrown.getCode()).isEqualTo(IdentityException.Code.PHONE_ALREADY_REGISTERED);
+        verifyNoInteractions(invitePersistenceService);
+    }
 
+    @Test
+    @DisplayName("accept of a SALON_ADMIN invite → account role SALON_ADMIN, no master row")
+    void should_createAdminWithoutMasterRow_when_acceptingAdminInvite() {
+        UUID userId = stubAccept(Role.SALON_ADMIN);
+
+        inviteService.acceptInvite(acceptRequest());
+
+        var captor = ArgumentCaptor.forClass(User.class);
+        verify(userRepository).saveAndFlush(captor.capture());
+        assertThat(captor.getValue().getRole()).isEqualTo(Role.SALON_ADMIN);
         verify(masterService, never()).createMasterFromInvite(any(), any());
+        verify(inAppNotificationService).notifyInviteAccepted(salonId, userId);
     }
 
     @Test
-    @DisplayName("acceptInvite calls masterService exactly once when token role is SALON_MASTER")
-    void should_createMasterRecord_when_acceptingMasterInvite() {
-        var rawToken = "raw-master-accept";
-        var hashedToken = "hashed-master-accept";
-        var salonId = UUID.randomUUID();
-        var userId = UUID.randomUUID();
-        var invite = new InviteToken(hashedToken, "master@example.com", salonId,
-                Role.SALON_MASTER, Instant.now().plusSeconds(3600));
-        var request = new InviteAcceptRequest(rawToken, "Password1!", "Master", "One", null);
+    @DisplayName("accept of a SALON_MASTER invite → exactly one master row for the new user")
+    void should_createMasterRow_when_acceptingMasterInvite() {
+        UUID userId = stubAccept(Role.SALON_MASTER);
 
-        stubAcceptInviteHappyPath(rawToken, hashedToken, userId, salonId, Role.SALON_MASTER, invite);
+        inviteService.acceptInvite(acceptRequest());
 
-        inviteService.acceptInvite(request);
-
-        verify(masterService).createMasterFromInvite(eq(userId), eq(salonId));
+        verify(masterService).createMasterFromInvite(userId, salonId);
     }
 
-    // ── helpers ───────────────────────────────────────────────────────────────
+    // ── helpers ──────────────────────────────────────────────────────────────
 
-    private void stubAcceptInviteHappyPath(
-            String rawToken, String hashedToken,
-            UUID userId, UUID salonId, Role role, InviteToken invite) {
+    private InvitePersistenceService.PhoneInvite persistedInvite() {
+        var captor = ArgumentCaptor.forClass(InvitePersistenceService.PhoneInvite.class);
+        verify(invitePersistenceService).persistInviteAndEnqueue(captor.capture());
+        return captor.getValue();
+    }
 
-        var stubResponse = AuthResponse.of(
-                "access-tok", "refresh-tok", userId,
-                invite.getEmail(), role, salonId);
-
-        when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
-        when(inviteTokenRepository.findByTokenForUpdate(hashedToken)).thenReturn(Optional.of(invite));
-        when(userRepository.existsByEmail(invite.getEmail())).thenReturn(false);
-        // Phase 286: acceptInvite now loads the salon to verify it is still active before
-        // provisioning — stub an active salon so this happy-path helper still exercises success.
-        var acceptSalonStub = mock(Salon.class);
-        when(acceptSalonStub.isActive()).thenReturn(true);
-        when(salonRepository.findById(salonId)).thenReturn(Optional.of(acceptSalonStub));
-        when(userRepository.save(any(User.class))).thenAnswer(inv -> {
-            var u = (User) inv.getArgument(0);
+    private UUID stubAccept(Role role) {
+        UUID userId = UUID.randomUUID();
+        var invite = InviteToken.forPhone("hashed", PHONE, salonId, role, NOW.plusSeconds(3600), callerId);
+        var activeSalon = mock(Salon.class);
+        when(activeSalon.isActive()).thenReturn(true);
+        when(tokenGenerator.hash("raw")).thenReturn("hashed");
+        when(inviteTokenRepository.findByTokenForUpdate("hashed")).thenReturn(Optional.of(invite));
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(activeSalon));
+        when(registrationTicketService.consume("ticket")).thenReturn(PHONE);
+        when(userRepository.saveAndFlush(any(User.class))).thenAnswer(inv -> {
+            User u = inv.getArgument(0);
             ReflectionTestUtils.setField(u, "id", userId);
             return u;
         });
-        when(inviteTokenRepository.save(any(InviteToken.class))).thenAnswer(inv -> inv.getArgument(0));
-        when(authResponseBuilder.buildAuthResponse(any(User.class))).thenReturn(stubResponse);
+        when(authResponseBuilder.buildAuthResponse(any(User.class)))
+                .thenReturn(AuthResponse.of("a", "r", userId, null, role, salonId));
+        return userId;
     }
 
-    private User buildOwner(UUID id, UUID salonId) {
-        var user = new User("owner@beautica.test", "hash", Role.SALON_OWNER, null, null, null, salonId);
-        ReflectionTestUtils.setField(user, "id", id);
-        return user;
+    private static InviteAcceptRequest acceptRequest() {
+        return new InviteAcceptRequest("raw", "Str0ngP@ss1!", "Ірина", "Мельник", null, null, null, null, "ticket");
     }
 
-    private User buildSalonAdmin(UUID id, UUID salonId) {
-        var user = new User("admin@beautica.test", "hash", Role.SALON_ADMIN, null, null, null, salonId);
-        ReflectionTestUtils.setField(user, "id", id);
-        return user;
+    private Salon salon() {
+        var salon = activeSalon();
+        when(salon.getName()).thenReturn("Salon A");
+        return salon;
+    }
+
+    /** A salon that passes the B520 audit-fix live-salon check of {@code sendInvite}. */
+    private static Salon activeSalon() {
+        // A default answer, not a when(...): this helper is called inside other thenReturn(...) stubbings.
+        return mock(Salon.class, invocation -> "isActive".equals(invocation.getMethod().getName())
+                ? Boolean.TRUE : org.mockito.Answers.RETURNS_DEFAULTS.answer(invocation));
+    }
+
+    private void callerIs(Role role, UUID callerSalonId) {
+        var caller = new User("caller@beautica.test", "hash", role, null, null, null, callerSalonId);
+        ReflectionTestUtils.setField(caller, "id", callerId);
+        when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
     }
 }

@@ -65,10 +65,18 @@ public class SupportController {
         return ResponseEntity.accepted().body(ApiResponse.ok(response));
     }
 
+    /**
+     * The sender's email from the principal, or {@code null} for a phone-only account (B514, AUTH-D11: no email until
+     * one is added). The caller is already authenticated — {@code senderUserId} above was resolved from the same
+     * {@link Authentication}.
+     */
     private String extractEmail(Authentication authentication) {
         if (authentication != null && authentication.getPrincipal() instanceof String email
                 && !email.isBlank()) {
             return email;
+        }
+        if (authentication != null && authentication.getPrincipal() instanceof String) {
+            return null;
         }
         throw new ForbiddenException("Not authenticated");
     }

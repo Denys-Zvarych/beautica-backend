@@ -22,6 +22,7 @@ import org.springframework.security.web.authentication.UsernamePasswordAuthentic
 import org.springframework.test.web.servlet.MockMvc;
 
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
@@ -85,7 +86,7 @@ class AuthControllerLoginGateTest {
     @Test
     @DisplayName("should return 403 with EMAIL_NOT_VERIFIED code when service throws EmailNotVerifiedException")
     void should_return403WithEmailNotVerified_when_serviceThrowsEmailNotVerifiedException() throws Exception {
-        when(authService.login(any(LoginRequest.class)))
+        when(authService.login(any(LoginRequest.class), anyString()))
                 .thenThrow(new EmailNotVerifiedException("user@example.com"));
 
         mvc.perform(post(LOGIN_URL)

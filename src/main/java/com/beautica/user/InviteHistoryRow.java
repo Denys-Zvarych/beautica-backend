@@ -28,7 +28,8 @@ import java.util.UUID;
  * so it is evaluated against ONE hoisted {@code now} for the whole page.
  *
  * @param id            invite id, passed back to {@code DELETE /salons/{salonId}/invites/{id}}
- * @param email         recipient address
+ * @param email         recipient address of a pre-B520 email invite; {@code null} on a phone invite
+ * @param phone         B520 — the invited {@code +380} number; {@code null} on a pre-B520 email invite
  * @param role          role the invite grants
  * @param used          {@code is_used} — set by BOTH acceptance and cancellation, hence ambiguous
  *                      on its own; see {@code SalonInviteResponse#from}
@@ -39,6 +40,7 @@ import java.util.UUID;
 public record InviteHistoryRow(
         UUID id,
         String email,
+        String phone,
         Role role,
         boolean used,
         RevocationReason revokedReason,

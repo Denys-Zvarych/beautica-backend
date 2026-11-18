@@ -1,5 +1,6 @@
 package com.beautica.auth;
 
+import com.beautica.auth.appcheck.AppCheckGuard;
 import com.beautica.auth.dto.ForgotPasswordRequest;
 import com.beautica.auth.dto.ResetPasswordRequest;
 import com.beautica.auth.dto.VerifyPasswordResetOtpRequest;
@@ -7,6 +8,7 @@ import com.beautica.auth.dto.VerifyPasswordResetOtpResponse;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.exception.ResendThrottledException;
+import com.beautica.common.util.UaMobilePhone;
 import com.beautica.config.PasswordResetOtpPolicyConfig;
 import com.beautica.notification.service.EmailNotificationService;
 import com.beautica.user.PasswordResetTicket;
@@ -29,6 +31,7 @@ import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Locale;
+import java.util.Optional;
 import java.util.UUID;
 
 /**
@@ -72,6 +75,8 @@ public class PasswordResetService {
     private final PasswordResetOtpProcessor passwordResetOtpProcessor;
     private final PasswordResetOtpPolicyConfig passwordResetOtpPolicy;
     private final Clock clock;
+    private final AppCheckGuard appCheckGuard;
+    private final PasswordResetSmsChannel smsChannel;
 
     public PasswordResetService(
             PasswordResetTicketRepository passwordResetTicketRepository,
@@ -84,7 +89,9 @@ public class PasswordResetService {
             TokensValidAfterCache tokensValidAfterCache,
             PasswordResetOtpProcessor passwordResetOtpProcessor,
             PasswordResetOtpPolicyConfig passwordResetOtpPolicy,
-            Clock clock
+            Clock clock,
+            AppCheckGuard appCheckGuard,
+            PasswordResetSmsChannel smsChannel
     ) {
         this.passwordResetTicketRepository = passwordResetTicketRepository;
         this.userRepository = userRepository;
@@ -97,6 +104,8 @@ public class PasswordResetService {
         this.passwordResetOtpProcessor = passwordResetOtpProcessor;
         this.passwordResetOtpPolicy = passwordResetOtpPolicy;
         this.clock = clock;
+        this.appCheckGuard = appCheckGuard;
+        this.smsChannel = smsChannel;
     }
 
     /**
@@ -113,7 +122,12 @@ public class PasswordResetService {
      */
     @Transactional
     public void requestReset(ForgotPasswordRequest request) {
-        String email = request.email().toLowerCase(Locale.ROOT).strip();
+        String identifier = request.resolvedIdentifier();
+        if (!identifier.contains("@")) {
+            requestResetByPhone(identifier);
+            return;
+        }
+        String email = identifier.toLowerCase(Locale.ROOT).strip();
 
         // Non-locking, column-only pre-read — unknown / inactive / unverified take NO row lock. A scalar
         // projection (not an entity) on purpose: an entity loaded here would be returned again by
@@ -151,9 +165,76 @@ public class PasswordResetService {
      */
     @Transactional
     public void requestResetForUserId(UUID userId) {
+        // B516 (AUTH-15): confirmed email first; SMS only for an account without one. A legacy account with neither a
+        // confirmed email nor a verified phone keeps the pre-B516 behaviour (code to its stored email). The branch is
+        // decided by a non-locking pre-read so App Check (a remote key fetch on a cold cache) never runs while the
+        // user row is locked — the by-phone path's order (App Check, then lock).
+        boolean smsBranch = userRepository.findPasswordResetSmsBranchById(userId)
+                .orElseThrow(() -> new NotFoundException("User not found"));
+        if (smsBranch) {
+            appCheckGuard.checkCurrentRequest();
+        }
         User user = userRepository.findByIdForUpdate(userId)
                 .orElseThrow(() -> new NotFoundException("User not found"));
-        mintAndSendOtp(user, false);
+        if (user.hasConfirmedEmail() || !user.isPhoneVerified()) {
+            mintAndSendOtp(user, false);
+            return;
+        }
+        if (!smsBranch) {
+            // The phone was verified between the pre-read and the lock: still never an SMS without App Check.
+            appCheckGuard.checkCurrentRequest();
+        }
+        if (passwordResetOtpProcessor.isLocked(user)) {
+            return; // as mintAndSendOtp: a locked account is silently not re-issued a code
+        }
+        smsChannel.cooldownRemainingSeconds(user.getPasswordResetSmsSentAt()).ifPresent(retryAfter -> {
+            throw new ResendThrottledException(retryAfter);
+        });
+        requestSmsCode(user);
+    }
+
+    /**
+     * Stamps the SMS cooldown on the row-locked account (V248, same transaction — a concurrent request waits on the
+     * lock and then sees the stamp) and hands the code to {@link PasswordResetSmsChannel} after commit.
+     */
+    private void requestSmsCode(User user) {
+        user.markPasswordResetSmsRequested(clock.instant());
+        smsChannel.sendAfterCommit(user.getPhoneNumber());
+    }
+
+    /**
+     * B516 (AUTH-12, AUTH-D18, AUTH-54) — the phone-shaped identifier branch of {@link #requestReset}. App Check runs
+     * FIRST, before any lookup, so a 403 never tells whether the phone is registered. The channel comes from the
+     * account: a confirmed email gets the emailed code (same path as by email); otherwise the verified phone gets an
+     * SMS code. An unparseable / non-mobile / unknown / unverified / inactive phone sends nothing. Every outcome
+     * returns normally (the controller answers one 200); the SMS itself goes after commit
+     * ({@link PasswordResetSmsChannel}), so neither its latency nor its failure is observable.
+     */
+    private void requestResetByPhone(String identifier) {
+        appCheckGuard.checkCurrentRequest();
+        Optional<String> phone = UaMobilePhone.parse(identifier);
+        User user = phone.flatMap(userRepository::findByVerifiedPhoneForUpdate).orElse(null);
+        if (user == null || !user.isActive()) {
+            performPhoneDecoyWork(phone.orElse(null));
+            return;
+        }
+        if (user.hasConfirmedEmail()) {
+            mintAndSendOtp(user, true);
+            return;
+        }
+        if (passwordResetOtpProcessor.isLocked(user)
+                || smsChannel.cooldownRemainingSeconds(user.getPasswordResetSmsSentAt()).isPresent()) {
+            return;
+        }
+        requestSmsCode(user);
+    }
+
+    /** Phone twin of {@link #performDecoyWork}: same OTP hash cost, a non-locking lookup when the phone parsed. */
+    private void performPhoneDecoyWork(String phoneE164) {
+        tokenGenerator.hashOtp(tokenGenerator.generateOtp());
+        if (phoneE164 != null) {
+            userRepository.findByVerifiedPhone(phoneE164);
+        }
     }
 
     /**

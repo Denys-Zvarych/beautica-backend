@@ -1,5 +1,6 @@
 package com.beautica.auth;
 
+import com.beautica.auth.appcheck.RequireAppCheck;
 import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.ForgotPasswordRequest;
 import com.beautica.auth.dto.InviteAcceptRequest;
@@ -16,6 +17,7 @@ import com.beautica.auth.dto.ResetPasswordRequest;
 import com.beautica.auth.dto.VerifyEmailRequest;
 import com.beautica.auth.dto.VerifyPasswordResetOtpRequest;
 import com.beautica.auth.dto.VerifyPasswordResetOtpResponse;
+import com.beautica.auth.filter.ClientIpResolver;
 import com.beautica.common.ApiResponse;
 import com.beautica.common.security.AuthenticationUtils;
 import com.beautica.common.security.BearerTokenExtractor;
@@ -72,9 +74,10 @@ public class AuthController {
 
     @PostMapping("/login")
     public ResponseEntity<ApiResponse<AuthResponse>> login(
-            @Valid @RequestBody LoginRequest request
+            @Valid @RequestBody LoginRequest request,
+            HttpServletRequest httpRequest
     ) {
-        AuthResponse response = authService.login(request);
+        AuthResponse response = authService.login(request, ClientIpResolver.resolve(httpRequest));
         return ResponseEntity.ok(ApiResponse.ok(response));
     }
 
@@ -120,8 +123,9 @@ public class AuthController {
     public ResponseEntity<ApiResponse<Void>> forgotPassword(
             @Valid @RequestBody ForgotPasswordRequest request) {
         passwordResetService.requestReset(request);
+        // B516 (AUTH-12 / D6): one body for every identifier and every channel — never names email or SMS.
         return ResponseEntity.ok(ApiResponse.ok(null,
-                "If an account exists for that email, a reset code has been sent."));
+                "If an account exists, a reset code has been sent."));
     }
 
     /**
@@ -172,7 +176,9 @@ public class AuthController {
         return ResponseEntity.noContent().build();
     }
 
+    // B520: the invitee gets one SMS (AUTH-54 — App Check before the handler; AUTH-52 caps in the service).
     @PostMapping("/invite")
+    @RequireAppCheck
     @PreAuthorize("hasRole('SALON_OWNER')")
     public ResponseEntity<ApiResponse<InviteResponse>> sendInvite(
             @Valid @RequestBody InviteRequest request,

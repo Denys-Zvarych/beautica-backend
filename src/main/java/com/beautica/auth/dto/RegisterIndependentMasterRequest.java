@@ -1,6 +1,8 @@
 package com.beautica.auth.dto;
 
 import com.beautica.common.validation.NoDigits;
+import com.beautica.common.validation.PhoneRegistrationPayload;
+import com.beautica.common.validation.PhoneRegistrationShape;
 import com.beautica.common.validation.PolicyVersionDate;
 import com.beautica.common.validation.TermsConsentComplete;
 import com.beautica.common.validation.TermsConsentPayload;
@@ -12,8 +14,9 @@ import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Size;
 
 @TermsConsentComplete
+@PhoneRegistrationShape
 public record RegisterIndependentMasterRequest(
-        @NotBlank(message = "Email is required")
+        // Required only on the legacy shape (no registrationTicket) — see @PhoneRegistrationShape.
         @Email(message = "Email must be valid")
         @Size(max = 255, message = "Email must not exceed 255 characters")
         String email,
@@ -30,13 +33,13 @@ public record RegisterIndependentMasterRequest(
         @NoDigits(message = "First name must not contain a number")
         String firstName,
 
-        @NotBlank(message = "Last name is required")
+        // Optional with a registrationTicket; required on the legacy shape (@PhoneRegistrationShape).
         @Size(max = 100, message = "Last name must not exceed 100 characters")
         @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "Last name must not contain control characters")
         @NoDigits(message = "Last name must not contain a number")
         String lastName,
 
-        @NotBlank(message = "Phone number is required")
+        // Legacy shape only; ignored with a registrationTicket (the ticket's verified phone is stored).
         @Size(max = 20, message = "Phone number must not exceed 20 characters")
         @Pattern(regexp = "^\\+?[0-9][0-9\\s\\-()]{6,19}$", message = "Phone number contains invalid characters")
         String phoneNumber,
@@ -57,8 +60,15 @@ public record RegisterIndependentMasterRequest(
         @Pattern(regexp = "^\\d{4}-\\d{2}-\\d{2}(\\.\\d{1,3})?$",
                 message = "Privacy policy version must look like 2026-10-20")
         @PolicyVersionDate
-        String privacyPolicyVersion
-) implements TermsConsentPayload {
+        String privacyPolicyVersion,
+
+        // B514 (AUTH-41) — the ticket from POST /auth/register/phone/otp/verify (phone proven by SMS code). With it the
+        // account is phone-only (no email, AUTH-D11) and tokens are issued at once; the class-level
+        // @PhoneRegistrationShape decides which shape is complete. Base64url, ~43 chars.
+        @Size(max = 128, message = "Registration ticket is invalid")
+        @Pattern(regexp = "^[A-Za-z0-9_-]*$", message = "Registration ticket is invalid")
+        String registrationTicket
+) implements TermsConsentPayload, PhoneRegistrationPayload {
 
     /**
      * The pre-phase-442 shape (no consent fields) — exactly what a legacy build sends. Keeps existing call sites
@@ -68,6 +78,19 @@ public record RegisterIndependentMasterRequest(
         this(email, password, firstName, lastName, phoneNumber, null, null, null);
     }
 
+    /** The pre-B514 shape (no {@code registrationTicket}) — the legacy email-code registration. */
+    public RegisterIndependentMasterRequest(String email, String password, String firstName, String lastName,
+                                            String phoneNumber, Boolean termsAccepted, String termsVersion,
+                                            String privacyPolicyVersion) {
+        this(email, password, firstName, lastName, phoneNumber, termsAccepted, termsVersion, privacyPolicyVersion,
+                null);
+    }
+
+    @Override
+    public boolean legacyShapeNeedsEmailAndLastName() {
+        return true;
+    }
+
     /**
      * Phase 442 audit — the password (and the user's identity, which is PII) must never reach a log line: the
      * default record {@code toString} would print every component, including {@code password}.
@@ -75,6 +98,7 @@ public record RegisterIndependentMasterRequest(
     @Override
     public String toString() {
         return "RegisterIndependentMasterRequest[termsAccepted=" + termsAccepted
-                + ", termsVersion=" + termsVersion + ", privacyPolicyVersion=" + privacyPolicyVersion + "]";
+                + ", termsVersion=" + termsVersion + ", privacyPolicyVersion=" + privacyPolicyVersion
+                + ", hasRegistrationTicket=" + hasRegistrationTicket() + "]";
     }
 }

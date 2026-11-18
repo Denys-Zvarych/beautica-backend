@@ -4,6 +4,7 @@ import com.beautica.AbstractIntegrationTest;
 import com.beautica.auth.dto.LoginRequest;
 import com.beautica.auth.dto.RegisterRequest;
 import com.beautica.auth.InvitePersistenceService;
+import com.beautica.support.StaffInviteFixtures;
 import com.beautica.auth.dto.SelfRegistrationRole;
 import com.beautica.booking.BookingTestFixtures;
 import com.beautica.config.TestSecurityConfig;
@@ -164,12 +165,12 @@ abstract class AbstractOwnerSelfDeleteWorldIT extends AbstractIntegrationTest {
 
     /** A real invite through the API, so the INVITE outbox row is written exactly as production writes it. */
     protected UUID inviteViaApi(String token, UUID salonId) {
-        String invitee = "invitee-" + System.nanoTime() + "@beautica.test";
+        String invitee = StaffInviteFixtures.newPhone();
         ResponseEntity<String> response = exchange(HttpMethod.POST, "/api/v1/salons/" + salonId + "/invite", token,
-                Map.of("email", invitee, "salonId", salonId));
+                Map.of("phone", invitee, "salonId", salonId));
         assertThat(response.getStatusCode()).as("POST /invite — body: %s", response.getBody())
                 .isEqualTo(HttpStatus.CREATED);
-        return jdbcTemplate.queryForObject("SELECT id FROM invite_tokens WHERE salon_id = ? AND email = ?",
+        return jdbcTemplate.queryForObject("SELECT id FROM invite_tokens WHERE salon_id = ? AND phone = ?",
                 UUID.class, salonId, invitee);
     }
 

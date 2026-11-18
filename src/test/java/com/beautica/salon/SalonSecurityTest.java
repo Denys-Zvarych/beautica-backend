@@ -108,7 +108,7 @@ class SalonSecurityTest extends AbstractIntegrationTest {
         String ownerBToken = createSalonOwnerAndGetToken(
                 "owner-b-invite-" + System.nanoTime() + "@beautica.test");
 
-        String inviteBody = "{\"email\":\"master-" + System.nanoTime() + "@beautica.test\"}";
+        String inviteBody = "{\"phone\":\"+380501234567\"}";
 
         log.debug("Act: POST {}/{}/invite with Owner B's token targeting Owner A's salon — cross-owner invite must be denied", SALONS_URL, salonAId);
         ResponseEntity<String> response = restTemplate.exchange(

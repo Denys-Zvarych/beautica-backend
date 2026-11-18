@@ -164,11 +164,12 @@ class UserControllerIT extends AbstractIntegrationTest {
         String accessToken = registerAndGetToken(
                 "patch@beautica.com", "Str0ngP@ss1!", "Stara", "Familiya", "+380671111111");
 
-        var patchRequest = new UpdateProfileRequest("Nova", "Familiya", "+380672222222",
+        // B516 (CLI-04): the phone is echoed unchanged — a different one is 400 PHONE_CHANGE_REQUIRES_OTP (UserPhoneOtpIT).
+        var patchRequest = new UpdateProfileRequest("Nova", "Familiya", "+380671111111",
                 null, null, null, null, null, null, null);
         HttpHeaders headers = bearerHeaders(accessToken);
 
-        log.debug("Act: PATCH /api/v1/users/me changing firstName='Nova', lastName, and phoneNumber");
+        log.debug("Act: PATCH /api/v1/users/me changing firstName='Nova', lastName; phoneNumber echoed unchanged");
         ResponseEntity<String> response = restTemplate.exchange(
                 "/api/v1/users/me",
                 HttpMethod.PATCH,
@@ -184,7 +185,7 @@ class UserControllerIT extends AbstractIntegrationTest {
         assertThat(apiResponse.success()).isTrue();
         assertThat(apiResponse.data().firstName()).isEqualTo("Nova");
         assertThat(apiResponse.data().lastName()).isEqualTo("Familiya");
-        assertThat(apiResponse.data().phoneNumber()).isEqualTo("+380672222222");
+        assertThat(apiResponse.data().phoneNumber()).isEqualTo("+380671111111");
         assertThat(apiResponse.data().email()).isEqualTo("patch@beautica.com");
     }
 

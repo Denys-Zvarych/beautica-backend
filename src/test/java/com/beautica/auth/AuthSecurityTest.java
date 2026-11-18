@@ -110,7 +110,7 @@ class AuthSecurityTest extends AbstractIntegrationTest {
         headers.setContentType(MediaType.APPLICATION_JSON);
 
         // The role check fires before bean validation, so any syntactically valid JSON body works here
-        var body = "{\"email\":\"target@beautica.test\",\"salonId\":\"00000000-0000-0000-0000-000000000001\"}";
+        var body = "{\"phone\":\"+380501234567\",\"salonId\":\"00000000-0000-0000-0000-000000000001\"}";
 
         log.debug("Act: POST /auth/invite as CLIENT role (should be denied — owner-only endpoint)");
         ResponseEntity<String> response = restTemplate.exchange(

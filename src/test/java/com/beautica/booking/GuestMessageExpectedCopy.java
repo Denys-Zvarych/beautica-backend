@@ -38,6 +38,26 @@ public final class GuestMessageExpectedCopy {
     private GuestMessageExpectedCopy() {
     }
 
+    /**
+     * B520 (NTF-59) — the staff invite SMS ({@code StaffInviteSmsText}): this fixture is also the expected copy for that
+     * SMS, the one non-guest SMS outside OTP, so every SMS copy lives in one place. {@code salonName} is the name as it
+     * should appear (already cut, when a test exercises the three-segment cut).
+     */
+    public static String staffInvite(String salonName, String inviteUrl) {
+        return "Beautica: «" + salonName + "» запрошує вас до команди. Приєднатися: " + inviteUrl;
+    }
+
+    /**
+     * B520 audit-fix — the staff invite SMS when nothing safe is left of the salon name (it was only URLs / domains,
+     * which never go out under the trusted sender).
+     */
+    public static String staffInviteWithoutSalonName(String inviteUrl) {
+        return "Beautica: вас запрошують до команди салону. Приєднатися: " + inviteUrl;
+    }
+
+    /** B520 — three concatenated UCS-2 segments, the staff invite SMS ceiling. */
+    public static final int STAFF_INVITE_MAX_CHARS = 201;
+
     /** Provider reschedule with no linkable guest page: {@code «Beautica: Ваш запис перенесено на {date} о {time}.»}. */
     public static String reschedule(OffsetDateTime newStart) {
         var kyiv = newStart.atZoneSameInstant(TimeZones.KYIV);

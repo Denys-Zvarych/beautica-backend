@@ -310,7 +310,7 @@ class PhoneOtpServiceTest {
         org.mockito.InOrder order = org.mockito.Mockito.inOrder(phoneOtpRepository, otpSmsSender);
         order.verify(phoneOtpRepository).save(any());
         order.verify(otpSmsSender).send(eq(PHONE), anyString());
-        order.verify(phoneOtpRepository).markOlderAsUsed(PHONE, 42L);
+        order.verify(phoneOtpRepository).markOlderAsUsed(PHONE, PhoneOtpPurpose.GUEST_BOOKING, 42L);
         assertThat(txManager.events).containsExactly("begin", "commit", "begin", "commit");
     }
 
@@ -323,7 +323,7 @@ class PhoneOtpServiceTest {
 
         assertThatThrownBy(() -> service.sendOtp(PHONE)).isInstanceOf(BusinessException.class);
 
-        verify(phoneOtpRepository, never()).markOlderAsUsed(anyString(), any());
+        verify(phoneOtpRepository, never()).markOlderAsUsed(anyString(), any(), any());
     }
 
     @Test
@@ -344,7 +344,7 @@ class PhoneOtpServiceTest {
     void should_stillReturn_when_olderCodeInvalidationFailsAfterDelivery() {
         stubSaveAssigningId(42L);
         org.mockito.Mockito.doThrow(new IllegalStateException("db"))
-                .when(phoneOtpRepository).markOlderAsUsed(PHONE, 42L);
+                .when(phoneOtpRepository).markOlderAsUsed(PHONE, PhoneOtpPurpose.GUEST_BOOKING, 42L);
 
         service.sendOtp(PHONE);
 
@@ -484,7 +484,7 @@ class PhoneOtpServiceTest {
         String code = "482913";
         PhoneOtp otp = PhoneOtp.issue(PHONE, sha256Hex(code), FIXED_NOW.plusSeconds(600));
         when(phoneOtpRepository
-                .findTopByPhoneAndUsedFalseAndExpiresAtAfterOrderByIdDesc(eq(PHONE), any()))
+                .findTopByPhoneAndPurposeAndUsedFalseAndExpiresAtAfterOrderByIdDesc(eq(PHONE), eq(PhoneOtpPurpose.GUEST_BOOKING), any()))
                 .thenReturn(Optional.of(otp));
         when(guestTokenProvider.generate(PHONE)).thenReturn(GUEST_TOKEN);
 
@@ -499,7 +499,7 @@ class PhoneOtpServiceTest {
     void should_throw401Generic_when_wrongCode() throws Exception {
         PhoneOtp otp = PhoneOtp.issue(PHONE, sha256Hex("482913"), FIXED_NOW.plusSeconds(600));
         when(phoneOtpRepository
-                .findTopByPhoneAndUsedFalseAndExpiresAtAfterOrderByIdDesc(eq(PHONE), any()))
+                .findTopByPhoneAndPurposeAndUsedFalseAndExpiresAtAfterOrderByIdDesc(eq(PHONE), eq(PhoneOtpPurpose.GUEST_BOOKING), any()))
                 .thenReturn(Optional.of(otp));
 
         assertThatThrownBy(() -> service.verifyOtp(PHONE, "000000"))
@@ -517,7 +517,7 @@ class PhoneOtpServiceTest {
         // findTop returns empty for both the expired and the nonexistent cases — the
         // service cannot (and must not) distinguish them: a single generic 401.
         when(phoneOtpRepository
-                .findTopByPhoneAndUsedFalseAndExpiresAtAfterOrderByIdDesc(eq(PHONE), any()))
+                .findTopByPhoneAndPurposeAndUsedFalseAndExpiresAtAfterOrderByIdDesc(eq(PHONE), eq(PhoneOtpPurpose.GUEST_BOOKING), any()))
                 .thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> service.verifyOtp(PHONE, "482913"))
@@ -556,5 +556,117 @@ class PhoneOtpServiceTest {
                 .as("log must carry only the masked phone")
                 .contains("+380***4567")
                 .doesNotContain(PHONE);
+    }
+
+    // ── B516 — user-bound purposes (AUTH-44) ─────────────────────────────────
+
+    private static final java.util.UUID OWNER = java.util.UUID.fromString("11111111-1111-1111-1111-111111111111");
+
+    @Test
+    @DisplayName("B516: a PHONE_ADD send persists the owner's user id on the row")
+    void should_persistOwner_when_userBoundCodeSent() {
+        service.sendCode(PHONE, null, PhoneOtpPurpose.PHONE_ADD, OWNER);
+
+        ArgumentCaptor<PhoneOtp> saved = ArgumentCaptor.forClass(PhoneOtp.class);
+        verify(phoneOtpRepository).save(saved.capture());
+        assertThat(saved.getValue().getUserId()).isEqualTo(OWNER);
+        assertThat(saved.getValue().getPurpose()).isEqualTo(PhoneOtpPurpose.PHONE_ADD);
+        String sms = capturedSms();
+        assertThat(sms).isEqualTo(OtpSmsExpectedCopy.domainBound(codeIn(sms), OTP_DOMAIN));
+    }
+
+    @Test
+    @DisplayName("B516: the account cap (3 per 15 min across its phones) answers 429 and sends nothing")
+    void should_return429_when_accountCapReached() {
+        when(phoneOtpRepository.countByUserIdAndCreatedAtAfter(eq(OWNER), any())).thenReturn(3);
+
+        assertThatThrownBy(() -> service.sendCode(PHONE, null, PhoneOtpPurpose.PHONE_CHANGE, OWNER))
+                .isInstanceOfSatisfying(BusinessException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(HttpStatus.TOO_MANY_REQUESTS));
+
+        verify(otpSmsSender, never()).send(anyString(), anyString());
+    }
+
+    @Test
+    @DisplayName("B516: a signed-in send takes the per-account lock before the phone lock and counts the account cap under it")
+    void should_lockAccountBeforePhoneAndCount_when_userBoundCodeSent() {
+        service.sendCode(PHONE, null, PhoneOtpPurpose.PHONE_CHANGE, OWNER);
+
+        org.mockito.InOrder order = org.mockito.Mockito.inOrder(phoneOtpRepository);
+        order.verify(phoneOtpRepository).lockUserForSend(OWNER);
+        order.verify(phoneOtpRepository).lockPhoneForSend(PHONE);
+        order.verify(phoneOtpRepository).countByUserIdAndCreatedAtAfter(eq(OWNER), any());
+        order.verify(phoneOtpRepository).save(any());
+    }
+
+    @Test
+    @DisplayName("B516: an anonymous send takes no per-account lock")
+    void should_notLockAccount_when_anonymousCodeSent() {
+        service.sendCode(PHONE, null, PhoneOtpPurpose.REGISTRATION);
+
+        verify(phoneOtpRepository, never()).lockUserForSend(any());
+    }
+
+    @Test
+    @DisplayName("B516: a wrong current password counts one failed try on the caller's live code")
+    void should_recordAttempt_when_liveUserBoundCodeExists() {
+        PhoneOtp live = PhoneOtp.issue(PHONE, "h".repeat(64), FIXED_NOW.plusSeconds(300), PhoneOtpPurpose.PHONE_CHANGE,
+                OWNER);
+        org.springframework.test.util.ReflectionTestUtils.setField(live, "id", 7L);
+        when(phoneOtpRepository.findTopByPhoneAndPurposeAndUserIdAndUsedFalseAndExpiresAtAfterOrderByIdDesc(
+                PHONE, PhoneOtpPurpose.PHONE_CHANGE, OWNER, FIXED_NOW)).thenReturn(Optional.of(live));
+
+        boolean counted = service.recordFailedAttempt(PHONE, PhoneOtpPurpose.PHONE_CHANGE, OWNER);
+
+        assertThat(counted).isTrue();
+        verify(attemptRecorder).recordFailedAttempt(7L, PhoneOtp.MAX_VERIFY_ATTEMPTS);
+    }
+
+    @Test
+    @DisplayName("B516: with no live code there is nothing to count against")
+    void should_reportNothingCounted_when_noLiveCode() {
+        when(phoneOtpRepository.findTopByPhoneAndPurposeAndUserIdAndUsedFalseAndExpiresAtAfterOrderByIdDesc(
+                PHONE, PhoneOtpPurpose.PHONE_CHANGE, OWNER, FIXED_NOW)).thenReturn(Optional.empty());
+
+        assertThat(service.recordFailedAttempt(PHONE, PhoneOtpPurpose.PHONE_CHANGE, OWNER)).isFalse();
+
+        verifyNoInteractions(attemptRecorder);
+    }
+
+    @Test
+    @DisplayName("B516: a user-bound purpose without an owner (or an owner on an anonymous purpose) is refused")
+    void should_refuseMismatchedOwner_when_purposeAndOwnerDisagree() {
+        assertThatThrownBy(() -> service.sendCode(PHONE, null, PhoneOtpPurpose.PHONE_ADD))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> service.consumeCode(PHONE, "123456", PhoneOtpPurpose.PHONE_CHANGE))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> service.sendCode(PHONE, null, PhoneOtpPurpose.REGISTRATION, OWNER))
+                .isInstanceOf(IllegalArgumentException.class);
+
+        verifyNoInteractions(otpSmsSender);
+    }
+
+    @Test
+    @DisplayName("B516: consumeCode for a user-bound purpose looks up only the caller's own code")
+    void should_lookUpOwnCodeOnly_when_userBoundCodeConsumed() {
+        when(phoneOtpRepository.findTopByPhoneAndPurposeAndUserIdAndUsedFalseAndExpiresAtAfterOrderByIdDesc(
+                PHONE, PhoneOtpPurpose.PHONE_ADD, OWNER, FIXED_NOW)).thenReturn(Optional.empty());
+
+        boolean redeemed = service.consumeCode(PHONE, "123456", PhoneOtpPurpose.PHONE_ADD, OWNER);
+
+        assertThat(redeemed).isFalse();
+        verify(phoneOtpRepository, never())
+                .findTopByPhoneAndPurposeAndUsedFalseAndExpiresAtAfterOrderByIdDesc(any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("B516: a PASSWORD_RESET code lives 15 minutes (AUTH-12), other purposes 10")
+    void should_expireIn15Minutes_when_passwordResetCodeSent() {
+        service.sendCode(PHONE, null, PhoneOtpPurpose.PASSWORD_RESET);
+
+        ArgumentCaptor<PhoneOtp> saved = ArgumentCaptor.forClass(PhoneOtp.class);
+        verify(phoneOtpRepository).save(saved.capture());
+        assertThat(saved.getValue().getExpiresAt()).isEqualTo(FIXED_NOW.plusSeconds(15 * 60));
+        assertThat(saved.getValue().getUserId()).isNull();
     }
 }

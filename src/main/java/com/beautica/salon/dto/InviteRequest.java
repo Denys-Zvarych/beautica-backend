@@ -3,15 +3,18 @@ package com.beautica.salon.dto;
 import com.beautica.auth.Role;
 import jakarta.annotation.Nullable;
 import jakarta.validation.constraints.AssertTrue;
-import jakarta.validation.constraints.Email;
-import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Size;
 
+/**
+ * Body of {@code POST /api/v1/salons/{salonId}/invite}. B520: the invitee's Ukrainian mobile number; see
+ * {@link com.beautica.auth.dto.InviteRequest} for why {@code phone} is not {@code @NotBlank} (a body without it answers
+ * 400 {@code INVITE_PHONE_REQUIRED}).
+ */
 public record InviteRequest(
-        @NotBlank(message = "Email is required")
-        @Email(message = "Email must be a valid address")
-        @Size(max = 255, message = "Email must not exceed 255 characters")
-        String email,
+        @Size(max = 32, message = "Phone must not exceed 32 characters")
+        @Pattern(regexp = "^[+\\d\\s\\-().]*$", message = "Phone contains invalid characters")
+        String phone,
 
         @Nullable Role role
 ) {
@@ -27,5 +30,11 @@ public record InviteRequest(
 
     public Role effectiveRole() {
         return role != null ? role : Role.SALON_MASTER;
+    }
+
+    /** The phone is PII — never in a log line. */
+    @Override
+    public String toString() {
+        return "InviteRequest[role=" + role + "]";
     }
 }

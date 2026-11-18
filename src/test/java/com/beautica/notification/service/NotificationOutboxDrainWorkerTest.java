@@ -108,6 +108,7 @@ class NotificationOutboxDrainWorkerTest {
         ReflectionTestUtils.setField(worker, "self", worker);
         lenient().when(visitResolver.resolve(any(Booking.class), anyMap()))
                 .thenAnswer(inv -> BookingVisit.single(inv.getArgument(0)));
+        lenient().when(requestDecisionLoader.load(any())).thenReturn(RequestDecisionLoader.Snapshot.EMPTY);
     }
 
     // ── Helper ────────────────────────────────────────────────────────────────
@@ -241,14 +242,13 @@ class NotificationOutboxDrainWorkerTest {
         UUID id2 = UUID.randomUUID();
         NotificationOutboxEntry push1 = entry(OutboxEventType.INAPP_PUSH, 1, null, id1);
         NotificationOutboxEntry push2 = entry(OutboxEventType.INAPP_PUSH, 2, null, id2);
-        NotificationOutboxEntry email1 = inviteEntry();
-        NotificationOutboxEntry email2 = inviteEntry();
+        NotificationOutboxEntry email1 = emailEntry();
+        NotificationOutboxEntry email2 = emailEntry();
         InAppPushDispatcher.PushPlan p1 = plan();
         InAppPushDispatcher.PushPlan p2 = plan();
 
         when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(push1, push2, email1, email2));
         when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of());
-        when(cipher.open("v1:STUB")).thenReturn("https://app.beautica.ua/invite/accept?token=ABC");
         when(inAppPushDispatcher.prepare(any())).thenReturn(Map.of(id1, p1, id2, p2));
         lenient().doThrow(new org.springframework.core.task.TaskRejectedException("queue full"))
                 .when(inAppPushDispatcher).dispatch(any());
@@ -261,7 +261,7 @@ class NotificationOutboxDrainWorkerTest {
         assertThat(push2.getAttempts()).isEqualTo(2);
         assertThat(email1.getStatus()).isEqualTo(OutboxStatus.SENT);
         assertThat(email2.getStatus()).isEqualTo(OutboxStatus.SENT);
-        verify(notificationService, times(2)).sendInviteEmail(any(), any(), any());
+        verify(notificationService, times(2)).notifyRequestDecided(any(), any(), any());
     }
 
     @Test
@@ -314,9 +314,9 @@ class NotificationOutboxDrainWorkerTest {
         UUID declinedId = UUID.randomUUID();
         UUID closedId = UUID.randomUUID();
         NotificationOutboxEntry declinedSms = entry(OutboxEventType.STATUS_CHANGED, 1, null, declinedId);
-        NotificationOutboxEntry email1 = inviteEntry();
+        NotificationOutboxEntry email1 = emailEntry();
         NotificationOutboxEntry closedSms = entry(OutboxEventType.SALON_CLOSED, 2, null, closedId);
-        NotificationOutboxEntry email2 = inviteEntry();
+        NotificationOutboxEntry email2 = emailEntry();
         Booking declined = mock(Booking.class);
         Booking closed = mock(Booking.class);
         when(declined.getId()).thenReturn(declinedId);
@@ -324,7 +324,6 @@ class NotificationOutboxDrainWorkerTest {
 
         when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(declinedSms, email1, closedSms, email2));
         when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(declined, closed));
-        when(cipher.open("v1:STUB")).thenReturn("https://app.beautica.ua/invite/accept?token=ABC");
         doThrow(new com.beautica.notification.sms.SmsBackpressureException("smsSendExecutor saturated"))
                 .when(notificationService).notifyBookingStatusChanged(eq(BookingVisit.single(declined)), any());
         when(notificationService.routesToLinkGuestSms(OutboxEventType.SALON_CLOSED, closed)).thenReturn(true);
@@ -337,7 +336,7 @@ class NotificationOutboxDrainWorkerTest {
         assertThat(closedSms.getAttempts()).as("deferred, not attempted").isEqualTo(2);
         assertThat(email1.getStatus()).isEqualTo(OutboxStatus.SENT);
         assertThat(email2.getStatus()).isEqualTo(OutboxStatus.SENT);
-        verify(notificationService, times(2)).sendInviteEmail(any(), any(), any());
+        verify(notificationService, times(2)).notifyRequestDecided(any(), any(), any());
         verify(notificationService, never()).notifySalonClosed(any(), any());
     }
 
@@ -376,7 +375,7 @@ class NotificationOutboxDrainWorkerTest {
         UUID declinedId = UUID.randomUUID();
         UUID closedId = UUID.randomUUID();
         NotificationOutboxEntry declinedSms = entry(OutboxEventType.STATUS_CHANGED, 1, null, declinedId);
-        NotificationOutboxEntry email = inviteEntry();
+        NotificationOutboxEntry email = emailEntry();
         NotificationOutboxEntry closedSms = entry(OutboxEventType.SALON_CLOSED, 2, null, closedId);
         declinedSms.setId(UUID.randomUUID());
         email.setId(UUID.randomUUID());
@@ -387,7 +386,6 @@ class NotificationOutboxDrainWorkerTest {
         when(closed.getId()).thenReturn(closedId);
         when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(declinedSms, email, closedSms));
         when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(declined, closed));
-        when(cipher.open("v1:STUB")).thenReturn("https://app.beautica.ua/invite/accept?token=ABC");
         doThrow(new com.beautica.notification.sms.SmsBackpressureException("smsSendExecutor saturated"))
                 .when(notificationService).notifyBookingStatusChanged(eq(BookingVisit.single(declined)), any());
         when(notificationService.routesToLinkGuestSms(OutboxEventType.SALON_CLOSED, closed)).thenReturn(true);
@@ -436,10 +434,19 @@ class NotificationOutboxDrainWorkerTest {
         return w;
     }
 
-    private NotificationOutboxEntry inviteEntry() throws Exception {
+    /**
+     * An e-mail row. B520: the invite became an SMS, so the requester's decision e-mail (REQUEST_DECIDED, no booking
+     * pre-load) is the plain e-mail row these breaker / backpressure tests drive; {@code notificationService} is a
+     * mock, so the row's dispatch is whatever {@code notifyRequestDecided} is stubbed to do.
+     */
+    private NotificationOutboxEntry emailEntry() throws Exception {
+        UUID requesterId = UUID.randomUUID();
         String payload = REAL_MAPPER.writeValueAsString(Map.of(
-                "email", "a@b.com", "salonName", "Beauty", "inviteUrlSealed", "v1:STUB"));
-        return entry(OutboxEventType.INVITE, 1, payload, UUID.randomUUID());
+                NotificationOutboxService.REQUEST_KIND, RequestKind.CATEGORY_REQUEST.name(),
+                NotificationOutboxService.REQUEST_ID, "1",
+                NotificationOutboxService.REQUEST_APPROVED, "true",
+                NotificationOutboxService.RECIPIENT_USER_ID, requesterId.toString()));
+        return entry(OutboxEventType.REQUEST_DECIDED, 1, payload, requesterId);
     }
 
     @Test
@@ -449,7 +456,7 @@ class NotificationOutboxDrainWorkerTest {
         NotificationOutboxDrainWorker w = workerWithRealMapper();
         List<NotificationOutboxEntry> invites = new java.util.ArrayList<>();
         for (int i = 0; i < 5; i++) {
-            invites.add(inviteEntry());
+            invites.add(emailEntry());
         }
         UUID feedRowId = UUID.randomUUID();
         NotificationOutboxEntry push = entry(OutboxEventType.INAPP_PUSH, 0, null, feedRowId);
@@ -459,9 +466,8 @@ class NotificationOutboxDrainWorkerTest {
 
         when(outboxRepository.claimPendingBatch(50)).thenReturn(batch);
         when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of());
-        when(cipher.open("v1:STUB")).thenReturn("https://app.beautica.ua/invite/accept?token=ABC");
         when(inAppPushDispatcher.prepare(any())).thenReturn(Map.of(feedRowId, plan));
-        doThrow(new EmailDeliveryException("invite", true)).when(notificationService).sendInviteEmail(any(), any(), any());
+        doThrow(new EmailDeliveryException("invite", true)).when(notificationService).notifyRequestDecided(any(), any(), any());
 
         w.drain();
 
@@ -474,7 +480,7 @@ class NotificationOutboxDrainWorkerTest {
             assertThat(invites.get(i).getAttempts()).as("breaker-deferred rows burn no attempt").isEqualTo(1);
             assertThat(invites.get(i).getLastError()).isNull();
         }
-        verify(notificationService, times(3)).sendInviteEmail(any(), any(), any());
+        verify(notificationService, times(3)).notifyRequestDecided(any(), any(), any());
         verify(inAppPushDispatcher).dispatch(plan);
         assertThat(push.getStatus()).isEqualTo(OutboxStatus.SENT);
     }
@@ -486,23 +492,22 @@ class NotificationOutboxDrainWorkerTest {
         NotificationOutboxDrainWorker w = workerWithRealMapper();
         List<NotificationOutboxEntry> invites = new java.util.ArrayList<>();
         for (int i = 0; i < 6; i++) {
-            invites.add(inviteEntry());
+            invites.add(emailEntry());
         }
 
         when(outboxRepository.claimPendingBatch(50)).thenReturn(List.copyOf(invites));
         when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of());
-        when(cipher.open("v1:STUB")).thenReturn("https://app.beautica.ua/invite/accept?token=ABC");
         doThrow(new EmailDeliveryException("invite", true))
                 .doThrow(new EmailDeliveryException("invite", true))
                 .doNothing()
                 .doThrow(new EmailDeliveryException("invite", true))
                 .doThrow(new EmailDeliveryException("invite", true))
                 .doNothing()
-                .when(notificationService).sendInviteEmail(any(), any(), any());
+                .when(notificationService).notifyRequestDecided(any(), any(), any());
 
         w.drain();
 
-        verify(notificationService, times(6)).sendInviteEmail(any(), any(), any());
+        verify(notificationService, times(6)).notifyRequestDecided(any(), any(), any());
         assertThat(invites.get(2).getStatus()).isEqualTo(OutboxStatus.SENT);
         assertThat(invites.get(5).getStatus()).isEqualTo(OutboxStatus.SENT);
         assertThat(invites.get(4).getAttempts()).isEqualTo(2);
@@ -515,17 +520,16 @@ class NotificationOutboxDrainWorkerTest {
         NotificationOutboxDrainWorker w = workerWithRealMapper();
         List<NotificationOutboxEntry> invites = new java.util.ArrayList<>();
         for (int i = 0; i < 5; i++) {
-            invites.add(inviteEntry());
+            invites.add(emailEntry());
         }
 
         when(outboxRepository.claimPendingBatch(50)).thenReturn(List.copyOf(invites));
         when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of());
-        when(cipher.open("v1:STUB")).thenReturn("https://app.beautica.ua/invite/accept?token=ABC");
-        doThrow(new EmailDeliveryException("invite", false)).when(notificationService).sendInviteEmail(any(), any(), any());
+        doThrow(new EmailDeliveryException("invite", false)).when(notificationService).notifyRequestDecided(any(), any(), any());
 
         w.drain();
 
-        verify(notificationService, times(5)).sendInviteEmail(any(), any(), any());
+        verify(notificationService, times(5)).notifyRequestDecided(any(), any(), any());
         assertThat(invites).allSatisfy(e -> assertThat(e.getAttempts()).isEqualTo(2));
         assertThat(meterRegistry.counter(NotificationOutboxDrainWorker.METRIC_BREAKER_TRIPS).count()).isZero();
     }
@@ -537,15 +541,14 @@ class NotificationOutboxDrainWorkerTest {
         NotificationOutboxDrainWorker w = workerWithRealMapper();
         List<NotificationOutboxEntry> invites = new java.util.ArrayList<>();
         for (int i = 0; i < 4; i++) {
-            invites.add(inviteEntry());
+            invites.add(emailEntry());
         }
         invites.get(0).setAttempts(NotificationOutboxDrainWorker.MAX_ATTEMPTS - 1);
         invites.get(3).setLastError("previous failure");
 
         when(outboxRepository.claimPendingBatch(50)).thenReturn(List.copyOf(invites));
         when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of());
-        when(cipher.open("v1:STUB")).thenReturn("https://app.beautica.ua/invite/accept?token=ABC");
-        doThrow(new EmailDeliveryException("invite", true)).when(notificationService).sendInviteEmail(any(), any(), any());
+        doThrow(new EmailDeliveryException("invite", true)).when(notificationService).notifyRequestDecided(any(), any(), any());
 
         w.drain();
 
@@ -759,40 +762,235 @@ class NotificationOutboxDrainWorkerTest {
         assertThat(outboxEntry.getStatus()).isEqualTo(OutboxStatus.SENT);
     }
 
-    // ── Test 3a: INVITE happy path — sealed URL is decrypted via cipher ───────
+    /** B520 — a staff invite SMS row; the cipher stub opens its sealed phone and link. */
+    private NotificationOutboxEntry inviteSmsEntry() throws Exception {
+        String payload = REAL_MAPPER.writeValueAsString(Map.of(
+                "phoneSealed", "v1:PHONE", "salonName", "Beauty", "inviteUrlSealed", "v1:URL"));
+        return entry(OutboxEventType.INVITE, 0, payload, UUID.randomUUID());
+    }
+
+    private List<NotificationOutboxEntry> inviteSmsBatch(int size) throws Exception {
+        List<NotificationOutboxEntry> rows = new java.util.ArrayList<>();
+        for (int i = 0; i < size; i++) {
+            rows.add(inviteSmsEntry());
+        }
+        when(outboxRepository.claimPendingBatch(50)).thenReturn(List.copyOf(rows));
+        when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of());
+        when(cipher.open(anyString())).thenAnswer(inv -> "v1:PHONE".equals(inv.getArgument(0))
+                ? "+380501234567" : "https://app.beautica.ua/invite/accept?token=A");
+        return rows;
+    }
 
     @Test
-    @DisplayName("inviteUrlSealed is decrypted and forwarded to sendInviteEmail when INVITE entry processed")
-    void should_decryptInviteUrlSealedAndDispatch_when_inviteEntryProcessed() throws Exception {
-        // Arrange — use a real ObjectMapper so JSON deserialisation is actually exercised.
-        NotificationOutboxDrainWorker workerWithRealMapper = new NotificationOutboxDrainWorker(
-                outboxRepository, notificationService, bookingRepository, visitResolver, REAL_MAPPER, cipher, inAppPushDispatcher, meterRegistry, requestDecisionLoader);
-        ReflectionTestUtils.setField(workerWithRealMapper, "self", workerWithRealMapper);
+    @DisplayName("B520 audit-fix: 3 consecutive TRANSIENT invite-SMS failures (provider outage) trip the breaker: the "
+            + "remaining rows are deferred without an attempt, and the trip is counted")
+    void should_tripBreaker_when_threeConsecutiveTransientSmsFailures() throws Exception {
+        NotificationOutboxDrainWorker w = workerWithRealMapper();
+        List<NotificationOutboxEntry> rows = inviteSmsBatch(5);
+        doThrow(new com.beautica.notification.sms.SmsDeliveryException("SMS delivery failed", null, true))
+                .when(notificationService).sendStaffInviteSms(any(), any(), any());
 
+        w.drain();
+
+        verify(notificationService, times(NotificationOutboxDrainWorker.SMS_BREAKER_THRESHOLD))
+                .sendStaffInviteSms(any(), any(), any());
+        for (int i = 0; i < 3; i++) {
+            assertThat(rows.get(i).getAttempts()).as("failed sends are counted").isEqualTo(1);
+        }
+        for (int i = 3; i < 5; i++) {
+            assertThat(rows.get(i).getStatus()).isEqualTo(OutboxStatus.PENDING);
+            assertThat(rows.get(i).getAttempts()).as("breaker-deferred rows burn no attempt").isZero();
+        }
+        assertThat(meterRegistry.counter(NotificationOutboxDrainWorker.METRIC_BREAKER_TRIPS).count()).isEqualTo(1.0);
+    }
+
+    @Test
+    @DisplayName("B520 audit-fix: per-message SMS refusals (not transient) never trip the breaker — every row is sent")
+    void should_notTripBreaker_when_smsFailuresAreRefusals() throws Exception {
+        NotificationOutboxDrainWorker w = workerWithRealMapper();
+        List<NotificationOutboxEntry> rows = inviteSmsBatch(5);
+        doThrow(new com.beautica.notification.sms.SmsDeliveryException("SMSClub rejected the request with HTTP 400"))
+                .when(notificationService).sendStaffInviteSms(any(), any(), any());
+
+        w.drain();
+
+        verify(notificationService, times(5)).sendStaffInviteSms(any(), any(), any());
+        assertThat(rows).allSatisfy(e -> assertThat(e.getAttempts()).isEqualTo(1));
+        assertThat(meterRegistry.counter(NotificationOutboxDrainWorker.METRIC_BREAKER_TRIPS).count()).isZero();
+    }
+
+    @Test
+    @DisplayName("B520 audit-fix 2: 3 transient invite-SMS failures trip only the SMS breaker — a later e-mail row of "
+            + "the same batch is still sent, while a later INVITE row is deferred without an attempt")
+    void should_stillSendEmailRow_when_smsBreakerTrips() throws Exception {
+        NotificationOutboxDrainWorker w = workerWithRealMapper();
+        List<NotificationOutboxEntry> sms = new java.util.ArrayList<>();
+        for (int i = 0; i < 4; i++) {
+            sms.add(inviteSmsEntry());
+        }
+        NotificationOutboxEntry email = emailEntry();
+        List<NotificationOutboxEntry> batch = new java.util.ArrayList<>(sms.subList(0, 3));
+        batch.add(email);
+        batch.add(sms.get(3));
+        when(outboxRepository.claimPendingBatch(50)).thenReturn(batch);
+        when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of());
+        when(cipher.open(anyString())).thenReturn("+380501234567");
+        doThrow(new com.beautica.notification.sms.SmsDeliveryException("SMS delivery failed", null, true))
+                .when(notificationService).sendStaffInviteSms(any(), any(), any());
+
+        w.drain();
+
+        verify(notificationService).notifyRequestDecided(any(), any(), any());
+        assertThat(email.getStatus()).isEqualTo(OutboxStatus.SENT);
+        verify(notificationService, times(NotificationOutboxDrainWorker.SMS_BREAKER_THRESHOLD))
+                .sendStaffInviteSms(any(), any(), any());
+        assertThat(sms.get(3).getStatus()).isEqualTo(OutboxStatus.PENDING);
+        assertThat(sms.get(3).getAttempts()).isZero();
+    }
+
+    @Test
+    @DisplayName("B520 audit-fix 3: 3 transient e-mail failures trip only the e-mail breaker — a later INVITE (SMS) row "
+            + "of the same batch is still sent, while a later e-mail row is deferred without an attempt")
+    void should_stillSendInviteSmsRow_when_emailBreakerTrips() throws Exception {
+        NotificationOutboxDrainWorker w = workerWithRealMapper();
+        List<NotificationOutboxEntry> emails = new java.util.ArrayList<>();
+        for (int i = 0; i < 4; i++) {
+            emails.add(emailEntry());
+        }
+        NotificationOutboxEntry invite = inviteSmsEntry();
+        List<NotificationOutboxEntry> batch = new java.util.ArrayList<>(emails.subList(0, 3));
+        batch.add(invite);
+        batch.add(emails.get(3));
+        when(outboxRepository.claimPendingBatch(50)).thenReturn(batch);
+        when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of());
+        when(cipher.open(anyString())).thenReturn("+380501234567");
+        doThrow(new EmailDeliveryException("decided", true)).when(notificationService).notifyRequestDecided(any(), any(), any());
+
+        w.drain();
+
+        verify(notificationService).sendStaffInviteSms(any(), any(), any());
+        assertThat(invite.getStatus()).isEqualTo(OutboxStatus.SENT);
+        verify(notificationService, times(NotificationOutboxDrainWorker.EMAIL_BREAKER_THRESHOLD))
+                .notifyRequestDecided(any(), any(), any());
+        assertThat(emails.get(3).getStatus()).isEqualTo(OutboxStatus.PENDING);
+        assertThat(emails.get(3).getAttempts()).as("breaker-deferred rows burn no attempt").isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("B520 extra pass: a guest-SMS booking row's success never touched the relay, so it does not reset the "
+            + "e-mail breaker — fail, sms ok, fail, sms ok, fail still trips it and the next e-mail row is deferred")
+    void should_tripEmailBreaker_when_emailFailuresInterleavedWithGuestSmsSuccesses() throws Exception {
+        NotificationOutboxDrainWorker w = workerWithRealMapper();
+        List<NotificationOutboxEntry> emails = new java.util.ArrayList<>();
+        for (int i = 0; i < 4; i++) {
+            emails.add(emailEntry());
+        }
+        UUID smsId1 = UUID.randomUUID();
+        UUID smsId2 = UUID.randomUUID();
+        NotificationOutboxEntry sms1 = entry(OutboxEventType.STATUS_CHANGED, 0, null, smsId1);
+        NotificationOutboxEntry sms2 = entry(OutboxEventType.STATUS_CHANGED, 0, null, smsId2);
+        Booking guest1 = mock(Booking.class);
+        Booking guest2 = mock(Booking.class);
+        when(guest1.getId()).thenReturn(smsId1);
+        when(guest2.getId()).thenReturn(smsId2);
+        when(outboxRepository.claimPendingBatch(50))
+                .thenReturn(List.of(emails.get(0), sms1, emails.get(1), sms2, emails.get(2), emails.get(3)));
+        when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(guest1, guest2));
+        when(notificationService.routesToLinkGuestSms(eq(OutboxEventType.STATUS_CHANGED), any())).thenReturn(true);
+        doThrow(new EmailDeliveryException("decided", true)).when(notificationService).notifyRequestDecided(any(), any(), any());
+
+        w.drain();
+
+        assertThat(sms1.getStatus()).isEqualTo(OutboxStatus.SENT);
+        assertThat(sms2.getStatus()).isEqualTo(OutboxStatus.SENT);
+        verify(notificationService, times(NotificationOutboxDrainWorker.EMAIL_BREAKER_THRESHOLD))
+                .notifyRequestDecided(any(), any(), any());
+        assertThat(emails.get(3).getStatus()).isEqualTo(OutboxStatus.PENDING);
+        assertThat(emails.get(3).getAttempts()).as("breaker-deferred rows burn no attempt").isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("B520 audit-fix 2: an ambiguous invite-SMS outcome (request on the wire) is final — one send, row SENT "
+            + "with the outcome noted, never back to PENDING for a duplicate paid SMS")
+    void should_finishRowWithoutRetry_when_inviteSmsOutcomeAmbiguous() throws Exception {
+        NotificationOutboxDrainWorker w = workerWithRealMapper();
+        List<NotificationOutboxEntry> rows = inviteSmsBatch(1);
+        doThrow(new com.beautica.notification.sms.SmsDeliveryAmbiguousException("SMS read timeout", null))
+                .when(notificationService).sendStaffInviteSms(any(), any(), any());
+
+        w.drain();
+
+        verify(notificationService, times(1)).sendStaffInviteSms(any(), any(), any());
+        assertThat(rows.get(0).getStatus()).isEqualTo(OutboxStatus.SENT);
+        assertThat(rows.get(0).getAttempts()).isEqualTo(1);
+        assertThat(rows.get(0).getLastError()).isEqualTo(NotificationOutboxDrainWorker.AMBIGUOUS_SMS_ERROR);
+    }
+
+    // ── Test 3a: INVITE (B520 SMS) happy path — sealed phone + URL are opened via cipher ──
+
+    private NotificationOutboxDrainWorker realMapperWorker() {
+        NotificationOutboxDrainWorker w = new NotificationOutboxDrainWorker(
+                outboxRepository, notificationService, bookingRepository, visitResolver, REAL_MAPPER, cipher,
+                inAppPushDispatcher, meterRegistry, requestDecisionLoader);
+        ReflectionTestUtils.setField(w, "self", w);
+        return w;
+    }
+
+    @Test
+    @DisplayName("B520: phoneSealed and inviteUrlSealed are opened and forwarded to sendStaffInviteSms")
+    void should_openSealedPhoneAndUrlAndSendSms_when_inviteEntryProcessed() throws Exception {
         UUID aggregateId = UUID.randomUUID();
-        String sealed = "v1:STUB-SEALED";
         String decryptedUrl = "https://app.beautica.ua/invite/accept?token=ABC123";
         String payload = REAL_MAPPER.writeValueAsString(Map.of(
-                "email", "a@b.com",
+                "phoneSealed", "v1:PHONE",
                 "salonName", "Beauty",
-                "inviteUrlSealed", sealed));
+                "inviteUrlSealed", "v1:URL"));
         NotificationOutboxEntry outboxEntry = entry(OutboxEventType.INVITE, 0, payload, aggregateId);
-
         when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
         // INVITE entries are excluded from the bookingIds set — stub returns empty to be safe.
         when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of());
-        when(cipher.open(sealed)).thenReturn(decryptedUrl);
+        when(cipher.open("v1:PHONE")).thenReturn("+380501234567");
+        when(cipher.open("v1:URL")).thenReturn(decryptedUrl);
 
-        // Act
-        workerWithRealMapper.drain();
+        realMapperWorker().drain();
 
-        // Assert — decrypted URL is forwarded; aggregateId is NOT used as URL.
-        verify(cipher, times(1)).open(eq(sealed));
-        verify(notificationService, times(1))
-                .sendInviteEmail("a@b.com", decryptedUrl, "Beauty");
-        // Forward-dependency regex check from Phase 5.11 QA contract.
-        assertThat(decryptedUrl).matches("^https?://.+/invite/accept\\?token=.+");
+        verify(notificationService).sendStaffInviteSms("+380501234567", decryptedUrl, "Beauty");
         assertThat(outboxEntry.getStatus()).isEqualTo(OutboxStatus.SENT);
+    }
+
+    @Test
+    @DisplayName("B520: a provider failure of the invite SMS retries the row (PENDING, attempt +1), never SENT")
+    void should_retryRow_when_inviteSmsSendFails() throws Exception {
+        String payload = REAL_MAPPER.writeValueAsString(Map.of(
+                "phoneSealed", "v1:PHONE", "salonName", "Beauty", "inviteUrlSealed", "v1:URL"));
+        NotificationOutboxEntry outboxEntry = entry(OutboxEventType.INVITE, 0, payload, UUID.randomUUID());
+        when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
+        when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of());
+        when(cipher.open(anyString())).thenReturn("+380501234567", "https://app.beautica.ua/invite/accept?token=A");
+        doThrow(new com.beautica.notification.sms.SmsDeliveryException("provider down"))
+                .when(notificationService).sendStaffInviteSms(any(), any(), any());
+
+        realMapperWorker().drain();
+
+        assertThat(outboxEntry.getStatus()).isEqualTo(OutboxStatus.PENDING);
+        assertThat(outboxEntry.getAttempts()).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("B520: a pre-deploy e-mail INVITE row (no phoneSealed) is finished as a no-op — SENT, nothing sent, "
+            + "nothing decrypted")
+    void should_skipRetiredEmailInvite_when_payloadHasNoPhone() throws Exception {
+        String payload = REAL_MAPPER.writeValueAsString(Map.of(
+                "email", "a@b.com", "salonName", "Beauty", "inviteUrlSealed", "v1:STUB"));
+        NotificationOutboxEntry outboxEntry = entry(OutboxEventType.INVITE, 0, payload, UUID.randomUUID());
+        when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
+        when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of());
+
+        realMapperWorker().drain();
+
+        assertThat(outboxEntry.getStatus()).isEqualTo(OutboxStatus.SENT);
+        verify(cipher, never()).open(anyString());
+        verify(notificationService, never()).sendStaffInviteSms(any(), any(), any());
     }
 
     // ── Test 3b: INVITE corrupt ciphertext → dead-letter after MAX_ATTEMPTS ──
@@ -800,35 +998,29 @@ class NotificationOutboxDrainWorkerTest {
     @Test
     @DisplayName("entry transitions to DEAD without dispatch when cipher.open throws on corrupt ciphertext")
     void should_dead_letter_when_cipherOpenThrows() throws Exception {
-        NotificationOutboxDrainWorker workerWithRealMapper = new NotificationOutboxDrainWorker(
-                outboxRepository, notificationService, bookingRepository, visitResolver, REAL_MAPPER, cipher, inAppPushDispatcher, meterRegistry, requestDecisionLoader);
-        ReflectionTestUtils.setField(workerWithRealMapper, "self", workerWithRealMapper);
-
-        UUID aggregateId = UUID.randomUUID();
         String payload = REAL_MAPPER.writeValueAsString(Map.of(
-                "email", "a@b.com",
+                "phoneSealed", "v1:CORRUPT",
                 "salonName", "Beauty",
                 "inviteUrlSealed", "v1:CORRUPT"));
         // attempts=2 so this third attempt promotes the entry to DEAD.
-        NotificationOutboxEntry outboxEntry = entry(OutboxEventType.INVITE, 2, payload, aggregateId);
-
+        NotificationOutboxEntry outboxEntry = entry(OutboxEventType.INVITE, 2, payload, UUID.randomUUID());
         when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
         when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of());
         when(cipher.open(anyString())).thenThrow(new IllegalStateException(
                 "OutboxPayloadCipher open failed — corrupt or tampered ciphertext"));
 
-        workerWithRealMapper.drain();
+        realMapperWorker().drain();
 
         assertThat(outboxEntry.getStatus()).isEqualTo(OutboxStatus.DEAD);
         assertThat(outboxEntry.getAttempts()).isEqualTo(3);
         assertThat(outboxEntry.getLastError())
                 .isNotNull()
                 .contains("OutboxPayloadCipher")
-                // Sanitiser must not leak plaintext URL fragments or sealed Base64.
+                // Sanitiser must not leak plaintext fragments or sealed Base64.
                 .doesNotContain("v1:CORRUPT")
-                .doesNotContain("https://")
+                .doesNotContain("+380")
                 .doesNotContain("token=");
-        verify(notificationService, never()).sendInviteEmail(any(), any(), any());
+        verify(notificationService, never()).sendStaffInviteSms(any(), any(), any());
     }
 
     // ── Test 3c: INVITE missing inviteUrlSealed → dead-letter, cipher untouched ─
@@ -836,21 +1028,14 @@ class NotificationOutboxDrainWorkerTest {
     @Test
     @DisplayName("entry transitions to DEAD without invoking cipher when inviteUrlSealed is missing from payload")
     void should_dead_letter_when_inviteUrlSealedMissing() throws Exception {
-        NotificationOutboxDrainWorker workerWithRealMapper = new NotificationOutboxDrainWorker(
-                outboxRepository, notificationService, bookingRepository, visitResolver, REAL_MAPPER, cipher, inAppPushDispatcher, meterRegistry, requestDecisionLoader);
-        ReflectionTestUtils.setField(workerWithRealMapper, "self", workerWithRealMapper);
-
-        UUID aggregateId = UUID.randomUUID();
-        // Older-schema row: email + salonName only, no inviteUrlSealed key.
         String payload = REAL_MAPPER.writeValueAsString(Map.of(
-                "email", "a@b.com",
+                "phoneSealed", "v1:PHONE",
                 "salonName", "Beauty"));
-        NotificationOutboxEntry outboxEntry = entry(OutboxEventType.INVITE, 2, payload, aggregateId);
-
+        NotificationOutboxEntry outboxEntry = entry(OutboxEventType.INVITE, 2, payload, UUID.randomUUID());
         when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
         when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of());
 
-        workerWithRealMapper.drain();
+        realMapperWorker().drain();
 
         assertThat(outboxEntry.getStatus()).isEqualTo(OutboxStatus.DEAD);
         assertThat(outboxEntry.getAttempts()).isEqualTo(3);
@@ -858,7 +1043,7 @@ class NotificationOutboxDrainWorkerTest {
                 .isNotNull()
                 .contains("missing inviteUrlSealed");
         verify(cipher, never()).open(anyString());
-        verify(notificationService, never()).sendInviteEmail(any(), any(), any());
+        verify(notificationService, never()).sendStaffInviteSms(any(), any(), any());
     }
 
     // ── Test 4: failure below MAX_ATTEMPTS → PENDING ──────────────────────────
@@ -1189,7 +1374,7 @@ class NotificationOutboxDrainWorkerTest {
 
         verify(notificationService, never()).notifyNewBooking(any());
         verify(notificationService, never()).notifyBookingStatusChanged(any(), any());
-        verify(notificationService, never()).sendInviteEmail(any(), any(), any());
+        verify(notificationService, never()).notifyRequestDecided(any(), any(), any());
     }
 
     // ── Test B: Bearer header token redaction ─────────────────────────────────
@@ -1317,7 +1502,7 @@ class NotificationOutboxDrainWorkerTest {
 
         assertThat(outboxEntry.getStatus()).isIn(OutboxStatus.PENDING, OutboxStatus.DEAD);
         assertThat(outboxEntry.getLastError()).isNotNull();
-        verify(notificationService, never()).sendInviteEmail(any(), any(), any());
+        verify(notificationService, never()).notifyRequestDecided(any(), any(), any());
     }
 
     // ── Phase 431 audit-fix cycle 1: the performing-master mail is its own row ─────────────────

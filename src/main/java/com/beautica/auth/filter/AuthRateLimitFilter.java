@@ -191,6 +191,17 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     private static final String SUPPORT_CONTACT_PATH = "/api/v1/support/contact";
     private static final String OTP_SEND_PATH = "/api/v1/book/otp/send";
     private static final String OTP_VERIFY_PATH = "/api/v1/book/otp/verify";
+    // B514 (AUTH-41, AUTH-D14) — the registration phone OTP shares the guest OTP per-IP buckets: same SMS cost class
+    // (3 sends / 15 min per IP across both flows) and the same brute-force class (10 verifies / 15 min per IP).
+    private static final String REGISTER_OTP_SEND_PATH = "/api/v1/auth/register/phone/otp/send";
+    private static final String REGISTER_OTP_VERIFY_PATH = "/api/v1/auth/register/phone/otp/verify";
+    // B516 (AUTH-44) — signed-in add / change phone: same SMS cost class and brute-force class as the two above, so the
+    // same per-IP buckets (3 sends / 15 min, 10 verifies / 15 min per IP across all three flows).
+    private static final String USER_PHONE_OTP_SEND_PATH = "/api/v1/users/me/phone/otp/send";
+    private static final String USER_PHONE_OTP_VERIFY_PATH = "/api/v1/users/me/phone/otp/verify";
+    // B516 (AUTH-50) — notifications email code: the email-verification resend / verify buckets (same mail class).
+    private static final String USER_EMAIL_REQUEST_CODE_PATH = "/api/v1/users/me/email/request-code";
+    private static final String USER_EMAIL_VERIFY_PATH = "/api/v1/users/me/email/verify";
     // Guest-booking POST carries the {slug} variable, so it is matched by prefix + suffix
     // (same technique as BULK_SALON_SERVICES / SLOTS): /api/v1/book/{slug}/booking. The suffix
     // /booking does not collide with the OTP paths (/send, /verify) nor with the public GET
@@ -1788,10 +1799,10 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             cache = loginBuckets;
         } else if (REFRESH_PATH.equals(path)) {
             cache = refreshBuckets;
-        } else if (VERIFY_EMAIL_PATH.equals(path)) {
+        } else if (VERIFY_EMAIL_PATH.equals(path) || USER_EMAIL_VERIFY_PATH.equals(path)) {
             cache = verifyEmailBuckets;
             retryAfterSeconds = VERIFY_EMAIL_RETRY_AFTER_SECONDS;
-        } else if (RESEND_VERIFICATION_PATH.equals(path)) {
+        } else if (RESEND_VERIFICATION_PATH.equals(path) || USER_EMAIL_REQUEST_CODE_PATH.equals(path)) {
             cache = resendVerificationBuckets;
         } else if (FORGOT_PASSWORD_PATH.equals(path)) {
             cache = forgotPasswordBuckets;
@@ -1824,10 +1835,12 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         } else if (SUPPORT_CONTACT_PATH.equals(path)) {
             cache = supportContactBuckets;
             retryAfterSeconds = SUPPORT_CONTACT_RETRY_AFTER_SECONDS;
-        } else if (OTP_SEND_PATH.equals(path)) {
+        } else if (OTP_SEND_PATH.equals(path) || REGISTER_OTP_SEND_PATH.equals(path)
+                || USER_PHONE_OTP_SEND_PATH.equals(path)) {
             cache = otpSendBuckets;
             retryAfterSeconds = OTP_SEND_RETRY_AFTER_SECONDS;
-        } else if (OTP_VERIFY_PATH.equals(path)) {
+        } else if (OTP_VERIFY_PATH.equals(path) || REGISTER_OTP_VERIFY_PATH.equals(path)
+                || USER_PHONE_OTP_VERIFY_PATH.equals(path)) {
             cache = otpVerifyBuckets;
             retryAfterSeconds = OTP_VERIFY_RETRY_AFTER_SECONDS;
         } else {

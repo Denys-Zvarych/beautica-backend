@@ -38,14 +38,17 @@ import java.util.Collection;
 import java.util.List;
 import java.util.UUID;
 
+import static com.beautica.booking.repository.ReminderFeedTargetFixtures.reminderFeedTarget;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
 /**
@@ -61,6 +64,7 @@ class BookingReminderJobTwoHourTest {
     private static final Instant MIDDAY_KYIV = Instant.parse("2026-06-01T09:00:00Z");
 
     @Mock private BookingRepository bookingRepository;
+    @Mock private org.springframework.transaction.PlatformTransactionManager transactionManager;
     @Mock private ApplicationEventPublisher events;
     @Mock private NotificationOutboxService outboxService;
     @Mock private com.beautica.notification.inapp.service.InAppNotificationService inAppNotificationService;
@@ -224,13 +228,17 @@ class BookingReminderJobTwoHourTest {
     // ── phase 494: registered-client (APP) e-mail leg ────────────────────────────────────────────
 
     @Test
-    @DisplayName("phase 494: daytime, flag on, booked ≥3h ahead → claimed on the 2h window, one H2 outbox row")
+    @DisplayName("phase 494/522: daytime, flag on, booked ≥3h ahead → claimed on the 2h window, one H2 outbox row "
+            + "and one H2 feed write for the claimed booking")
     void should_enqueueTwoHourReminder_when_registeredBookingDueInDaytime() {
         // Arrange
         UUID bookingId = UUID.randomUUID();
+        Instant start = MIDDAY_KYIV.plus(Duration.ofHours(2));
         when(bookingRepository.findRegisteredBookingsForTwoHourReminder(any(), any(), any()))
-                .thenReturn(List.of(candidate(bookingId, MIDDAY_KYIV.plus(Duration.ofHours(2)),
-                        MIDDAY_KYIV.minus(Duration.ofDays(1)))));
+                .thenReturn(List.of(candidate(bookingId, start, MIDDAY_KYIV.minus(Duration.ofDays(1)))));
+        BookingRepository.ReminderFeedTarget target = reminderFeedTarget(bookingId, UUID.randomUUID(), null,
+                OffsetDateTime.ofInstant(start, ZoneOffset.UTC));
+        when(bookingRepository.findReminderFeedTargetsByIds(List.of(bookingId))).thenReturn(List.of(target));
 
         // Act
         jobAt(MIDDAY_KYIV).sweepTwoHour();
@@ -242,7 +250,8 @@ class BookingReminderJobTwoHourTest {
                 Limit.of(BookingRepository.TWO_HOUR_REMINDER_BATCH_CAP));
         verify(bookingRepository).claimRegisteredTwoHourRemindersByIds(List.of(bookingId));
         verify(outboxService).enqueueBookingReminder(bookingId, ReminderKind.H2, MIDDAY_KYIV);
-        verifyNoInteractions(inAppNotificationService); // phase 495 D2: the 2h reminder has no feed row / push
+        verify(inAppNotificationService).notifyBookingRemindersBulk(List.of(target), ReminderKind.H2);
+        verifyNoMoreInteractions(inAppNotificationService);
     }
 
     @Test
@@ -258,7 +267,7 @@ class BookingReminderJobTwoHourTest {
 
         // Assert
         verify(bookingRepository, never()).claimRegisteredTwoHourRemindersByIds(any());
-        verifyNoInteractions(outboxService);
+        verifyNoInteractions(outboxService, inAppNotificationService);
     }
 
     @Test
@@ -269,7 +278,7 @@ class BookingReminderJobTwoHourTest {
 
         // Assert
         verify(bookingRepository, never()).findRegisteredBookingsForTwoHourReminder(any(), any(), any());
-        verifyNoInteractions(outboxService);
+        verifyNoInteractions(outboxService, inAppNotificationService);
     }
 
     @Test
@@ -283,7 +292,7 @@ class BookingReminderJobTwoHourTest {
 
         // Assert
         verify(bookingRepository, never()).findRegisteredBookingsForTwoHourReminder(any(), any(), any());
-        verifyNoInteractions(outboxService);
+        verifyNoInteractions(outboxService, inAppNotificationService);
     }
 
     @Test
@@ -300,7 +309,96 @@ class BookingReminderJobTwoHourTest {
         jobAt(MIDDAY_KYIV).sweepTwoHour();
 
         // Assert
-        verifyNoInteractions(outboxService);
+        verifyNoInteractions(outboxService, inAppNotificationService);
+        verify(bookingRepository, never()).findReminderFeedTargetsByIds(any());
+    }
+
+    @Test
+    @DisplayName("B522: two due, only one claim won → the H2 feed write reads and writes ONLY the claimed booking")
+    void should_feedOnlyClaimedBooking_when_registeredTwoHourClaimPartlyLost() {
+        // Arrange
+        UUID won = UUID.randomUUID();
+        UUID lost = UUID.randomUUID();
+        Instant start = MIDDAY_KYIV.plus(Duration.ofHours(2));
+        Instant created = MIDDAY_KYIV.minus(Duration.ofDays(1));
+        when(bookingRepository.findRegisteredBookingsForTwoHourReminder(any(), any(), any()))
+                .thenReturn(List.of(candidate(won, start, created), candidate(lost, start, created)));
+        doReturn(List.of(won)).when(bookingRepository).claimRegisteredTwoHourRemindersByIds(any());
+        BookingRepository.ReminderFeedTarget target = reminderFeedTarget(won, UUID.randomUUID(), null,
+                OffsetDateTime.ofInstant(start, ZoneOffset.UTC));
+        when(bookingRepository.findReminderFeedTargetsByIds(List.of(won))).thenReturn(List.of(target));
+
+        // Act
+        jobAt(MIDDAY_KYIV).sweepTwoHour();
+
+        // Assert
+        verify(bookingRepository).findReminderFeedTargetsByIds(List.of(won));
+        verify(inAppNotificationService).notifyBookingRemindersBulk(List.of(target), ReminderKind.H2);
+        verifyNoMoreInteractions(inAppNotificationService);
+        verify(outboxService).enqueueBookingReminder(won, ReminderKind.H2, MIDDAY_KYIV);
+        verify(outboxService, never()).enqueueBookingReminder(eq(lost), any(), any());
+    }
+
+    @Test
+    @DisplayName("B522 audit-fix 4: the registered 2 h leg (claim + feed + outbox) finishes BEFORE the job opens the "
+            + "guest leg's transaction, and the job opens exactly one transaction (the guest leg's)")
+    void should_runRegisteredLegOutsideGuestTransaction_when_twoHourSweepRuns() {
+        // Arrange
+        UUID bookingId = UUID.randomUUID();
+        Instant start = MIDDAY_KYIV.plus(Duration.ofHours(2));
+        when(bookingRepository.findRegisteredBookingsForTwoHourReminder(any(), any(), any()))
+                .thenReturn(List.of(candidate(bookingId, start, MIDDAY_KYIV.minus(Duration.ofDays(1)))));
+        BookingRepository.ReminderFeedTarget target = reminderFeedTarget(bookingId, UUID.randomUUID(), null,
+                OffsetDateTime.ofInstant(start, ZoneOffset.UTC));
+        when(bookingRepository.findReminderFeedTargetsByIds(List.of(bookingId))).thenReturn(List.of(target));
+        org.mockito.InOrder order = org.mockito.Mockito.inOrder(
+                bookingRepository, inAppNotificationService, outboxService, transactionManager);
+
+        // Act
+        jobAt(MIDDAY_KYIV).sweepTwoHour();
+
+        // Assert
+        order.verify(bookingRepository).claimRegisteredTwoHourRemindersByIds(List.of(bookingId));
+        order.verify(inAppNotificationService).notifyBookingRemindersBulk(List.of(target), ReminderKind.H2);
+        order.verify(outboxService).enqueueBookingReminder(bookingId, ReminderKind.H2, MIDDAY_KYIV);
+        order.verify(transactionManager).getTransaction(any());
+        order.verify(bookingRepository).findGuestBookingsForTwoHourReminder(any(), any(), anyBoolean(), any());
+        order.verify(transactionManager).commit(any());
+        verify(transactionManager, org.mockito.Mockito.times(1)).getTransaction(any());
+    }
+
+    @Test
+    @DisplayName("B522 audit-fix cycle 2: the registered 2 h leg throws → the guest 2 h reminder is still published, "
+            + "the failure is counted and logged by class name only")
+    void should_publishGuestReminder_when_registeredTwoHourLegThrows() {
+        // Arrange
+        when(bookingRepository.findRegisteredBookingsForTwoHourReminder(any(), any(), any()))
+                .thenThrow(new IllegalStateException("secret +380501111111"));
+        Booking booking = guestBooking("+380501111111", MIDDAY_KYIV.plus(Duration.ofHours(2)),
+                MIDDAY_KYIV.minus(Duration.ofDays(1)));
+        when(bookingRepository.findGuestBookingsForTwoHourReminder(any(), any(), anyBoolean(), any()))
+                .thenReturn(List.of(booking));
+        ch.qos.logback.classic.Logger jobLogger =
+                (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(BookingReminderJob.class);
+        ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> logs =
+                new ch.qos.logback.core.read.ListAppender<>();
+        logs.start();
+        jobLogger.addAppender(logs);
+
+        // Act
+        try {
+            jobAt(MIDDAY_KYIV).sweepTwoHour();
+        } finally {
+            jobLogger.detachAppender(logs);
+        }
+
+        // Assert
+        assertThat(publishedEvent().reminders()).hasSize(1);
+        assertThat(meters.counter(BookingReminderJob.REMINDER_METRIC, "type", "h2", "outcome",
+                BookingReminderJob.OUTCOME_REGISTERED_FAILED).count()).isEqualTo(1.0);
+        assertThat(logs.list).anySatisfy(e -> assertThat(e.getFormattedMessage())
+                .contains("IllegalStateException").doesNotContain("secret").doesNotContain("+380"));
+        verifyNoInteractions(outboxService, inAppNotificationService);
     }
 
     private static BookingRepository.RegisteredReminderCandidate candidate(UUID id, Instant startsAt, Instant createdAt) {
@@ -314,10 +412,12 @@ class BookingReminderJobTwoHourTest {
         @Override public Instant getCreatedAt() { return createdAt; }
     }
 
+
     private BookingReminderJob jobAt(Instant now) {
         return new BookingReminderJob(bookingRepository, properties, events, Clock.fixed(now, ZoneOffset.UTC), meters,
                 com.beautica.booking.crypto.GuestCancelTokenCipherFixtures.testPageLinks("https://beautica.app"),
-                new RegisteredBookingReminderSweep(bookingRepository, outboxService, inAppNotificationService));
+                new RegisteredBookingReminderSweep(bookingRepository, outboxService, inAppNotificationService),
+                transactionManager);
     }
 
     // ── phase 435 copy: independent vs salon variant, optional address line, visit phrase ──────────

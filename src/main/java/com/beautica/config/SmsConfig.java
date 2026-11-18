@@ -246,20 +246,26 @@ public class SmsConfig {
 
     /**
      * Phase 439 — the auth-channel sender in {@code smsclub} mode: unconditional on the money gate, like
-     * {@link #otpSmsSender}, with its own {@link SmsClubService} built with the OTP lifetime.
+     * {@link #otpSmsSender}, with its own {@link SmsClubService} built with the OTP lifetime. B520 audit-fix: a second
+     * instance for the staff invite SMS ({@link OtpSmsSender#sendStaffInvite}) with {@code invite-lifetime-minutes}
+     * and the invite timeouts — still ONE {@link OtpSmsSender} bean.
      */
     @Bean
     @OnSmsClubMode
     public OtpSmsSender smsClubOtpSmsSender(RestClient.Builder restClientBuilder, SmsClubProperties properties,
                                             ObjectProvider<StagingSmsDailyCap> stagingDailyCap,
                                             RecipientInvalidSpikeAlarm recipientInvalidSpikeAlarm) {
-        return new SmsClubOtpSmsSender(new SmsClubService(restClientBuilder, properties,
-                properties.getOtpLifetimeMinutes(), stagingDailyCap.getIfAvailable(), recipientInvalidSpikeAlarm));
+        StagingSmsDailyCap cap = stagingDailyCap.getIfAvailable();
+        SmsClubService otp = new SmsClubService(restClientBuilder, properties, properties.getOtpLifetimeMinutes(), cap,
+                recipientInvalidSpikeAlarm);
+        SmsClubService invite = new SmsClubService(restClientBuilder.clone(), properties.forStaffInvite(),
+                properties.getInviteLifetimeMinutes(), cap, recipientInvalidSpikeAlarm);
+        return new SmsClubOtpSmsSender(otp, invite);
     }
 
     /**
-     * Phase 441 audit-fix — one aggregate RECIPIENT_INVALID counter, shared by both {@link SmsClubService}s above, so a
-     * spike across booking and OTP sends raises ONE ERROR per window.
+     * Phase 441 audit-fix — one aggregate RECIPIENT_INVALID counter, shared by every {@link SmsClubService} above
+     * (booking, OTP and staff invite), so a spike across them raises ONE ERROR per window.
      */
     @Bean
     @OnSmsClubMode

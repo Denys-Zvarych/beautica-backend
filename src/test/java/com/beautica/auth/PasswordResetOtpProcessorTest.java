@@ -32,6 +32,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 /**
@@ -67,6 +68,9 @@ class PasswordResetOtpProcessorTest {
     private TokenGenerator tokenGenerator;
 
     private final BCryptPasswordEncoder passwordEncoder = new BCryptPasswordEncoder(4);
+    @Mock
+    private com.beautica.auth.phoneotp.PhoneOtpService phoneOtpService;
+
     private PasswordResetOtpProcessor processor;
 
     @BeforeEach
@@ -76,7 +80,7 @@ class PasswordResetOtpProcessorTest {
                 Duration.ofMinutes(15), MAX_ATTEMPTS, CUMULATIVE_THRESHOLD, LOCKOUT,
                 Duration.ofSeconds(60), TICKET_TTL);
         processor = new PasswordResetOtpProcessor(
-                userRepository, passwordResetTicketRepository, tokenGenerator, clock, policy);
+                userRepository, passwordResetTicketRepository, tokenGenerator, clock, policy, phoneOtpService);
     }
 
     // ─── happy path ───────────────────────────────────────────────────────────
@@ -308,7 +312,7 @@ class PasswordResetOtpProcessorTest {
     // ─── cumulative lockout ────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("should_tripLockout_when_cumulativeFailuresReachThreshold")
+    @DisplayName("the failure that reaches the cumulative threshold locks the account for the lockout window")
     void should_tripLockout_when_cumulativeFailuresReachThreshold() {
         var email = "abuser@example.com";
         var user = buildUser(UUID.randomUUID(), email);
@@ -332,7 +336,7 @@ class PasswordResetOtpProcessorTest {
     }
 
     @Test
-    @DisplayName("should_rejectWireIdentically_when_accountLocked (lock does not leak via response shape)")
+    @DisplayName("a locked account is refused with the same INVALID_CODE answer as a wrong code, so the lock is not revealed")
     void should_rejectWireIdentically_when_accountLocked() {
         var email = "locked@example.com";
         var user = buildUser(UUID.randomUUID(), email);
@@ -352,7 +356,7 @@ class PasswordResetOtpProcessorTest {
     }
 
     @Test
-    @DisplayName("should_allowVerify_when_lockoutWindowExpired")
+    @DisplayName("verify works again once the lockout window has passed")
     void should_allowVerify_when_lockoutWindowExpired() {
         var email = "waslocked@example.com";
         var user = buildUser(UUID.randomUUID(), email);
@@ -390,5 +394,130 @@ class PasswordResetOtpProcessorTest {
         var user = new User(email, passwordEncoder.encode("test-password"), Role.CLIENT, null, null, null);
         ReflectionTestUtils.setField(user, "id", id);
         return user;
+    }
+
+    // ── B516 — verify by phone identifier (AUTH-12, AUTH-D18) ─────────────────
+
+    private static final String PHONE = "+380671234567";
+
+    private User phoneOnlyUser(UUID id) {
+        var user = User.registerWithVerifiedPhone(PHONE, "hash", Role.CLIENT, null, null, null,
+                FIXED_NOW.minusSeconds(3600));
+        ReflectionTestUtils.setField(user, "id", id);
+        return user;
+    }
+
+    @Test
+    @DisplayName("B516: phone identifier, no email -> the SMS code is redeemed and a ticket minted")
+    void should_mintTicket_when_smsCodeMatchesForPhoneOnlyAccount() {
+        var userId = UUID.randomUUID();
+        when(userRepository.findByVerifiedPhoneForUpdate(PHONE)).thenReturn(Optional.of(phoneOnlyUser(userId)));
+        when(phoneOtpService.consumeCode(PHONE, "123456", com.beautica.auth.phoneotp.PhoneOtpPurpose.PASSWORD_RESET))
+                .thenReturn(true);
+        when(tokenGenerator.generateToken()).thenReturn(RAW_TICKET);
+        when(tokenGenerator.hash(RAW_TICKET)).thenReturn(HASHED_TICKET);
+
+        String ticket = processor.verifyAndIssueTicket(new VerifyPasswordResetOtpRequest(null, "123456", "0671234567"));
+
+        assertThat(ticket).isEqualTo(RAW_TICKET);
+        verify(passwordResetTicketRepository).markAllUsedByUserId(userId);
+    }
+
+    @Test
+    @DisplayName("B516: phone identifier, wrong SMS code -> INVALID_CODE, no ticket")
+    void should_throwInvalidCode_when_smsCodeWrong() {
+        when(userRepository.findByVerifiedPhoneForUpdate(PHONE)).thenReturn(Optional.of(phoneOnlyUser(UUID.randomUUID())));
+        when(phoneOtpService.consumeCode(PHONE, "000000", com.beautica.auth.phoneotp.PhoneOtpPurpose.PASSWORD_RESET))
+                .thenReturn(false);
+
+        assertThatThrownBy(() -> processor.verifyAndIssueTicket(
+                new VerifyPasswordResetOtpRequest(null, "000000", PHONE)))
+                .isInstanceOfSatisfying(VerificationException.class,
+                        e -> assertThat(e.getCode()).isEqualTo(VerificationException.Code.INVALID_CODE));
+
+        verify(passwordResetTicketRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("B516: phone identifier on an account with a confirmed email -> the EMAILED code is checked, not SMS")
+    void should_checkEmailedCode_when_phoneIdentifierAndConfirmedEmail() {
+        var userId = UUID.randomUUID();
+        var user = buildUser(userId, "both@example.com");
+        user.setEmailVerified(true);
+        user.markPhoneVerified(PHONE, FIXED_NOW.minusSeconds(60));
+        user.setPasswordResetCodeHash("b".repeat(64));
+        user.setPasswordResetCodeExpiresAt(FIXED_NOW.plusSeconds(600));
+        when(userRepository.findByVerifiedPhoneForUpdate(PHONE)).thenReturn(Optional.of(user));
+        when(tokenGenerator.hashOtp("123456")).thenReturn("b".repeat(64));
+        when(tokenGenerator.generateToken()).thenReturn(RAW_TICKET);
+        when(tokenGenerator.hash(RAW_TICKET)).thenReturn(HASHED_TICKET);
+
+        String ticket = processor.verifyAndIssueTicket(new VerifyPasswordResetOtpRequest(null, "123456", PHONE));
+
+        assertThat(ticket).isEqualTo(RAW_TICKET);
+        verifyNoInteractions(phoneOtpService);
+    }
+
+    @Test
+    @DisplayName("B516: unknown phone -> INVALID_CODE after the decoy compare")
+    void should_throwInvalidCode_when_phoneUnknown() {
+        when(userRepository.findByVerifiedPhoneForUpdate(PHONE)).thenReturn(Optional.empty());
+        when(tokenGenerator.hashOtp("000000")).thenReturn("0".repeat(64));
+
+        assertThatThrownBy(() -> processor.verifyAndIssueTicket(
+                new VerifyPasswordResetOtpRequest(null, "123456", PHONE)))
+                .isInstanceOf(VerificationException.class);
+
+        verify(tokenGenerator).hashOtp("000000");
+        verifyNoInteractions(phoneOtpService);
+    }
+
+    @Test
+    @DisplayName("B516: a wrong SMS reset code feeds the resend-surviving failure total, and the threshold locks the account")
+    void should_countCumulativeFailure_when_smsCodeWrong() {
+        User user = phoneOnlyUser(UUID.randomUUID());
+        user.setPasswordResetFailedTotal((short) (CUMULATIVE_THRESHOLD - 1));
+        when(userRepository.findByVerifiedPhoneForUpdate(PHONE)).thenReturn(Optional.of(user));
+        when(phoneOtpService.consumeCode(PHONE, "000000", com.beautica.auth.phoneotp.PhoneOtpPurpose.PASSWORD_RESET))
+                .thenReturn(false);
+
+        assertThatThrownBy(() -> processor.verifyAndIssueTicket(new VerifyPasswordResetOtpRequest(null, "000000", PHONE)))
+                .isInstanceOf(VerificationException.class);
+
+        assertThat(user.getPasswordResetFailedTotal()).isEqualTo((short) CUMULATIVE_THRESHOLD);
+        assertThat(user.getPasswordResetLockedUntil()).isEqualTo(FIXED_NOW.plus(LOCKOUT));
+    }
+
+    @Test
+    @DisplayName("B516: a locked phone-only account refuses even a correct SMS code, without touching the code")
+    void should_refuseCorrectSmsCode_when_accountLocked() {
+        User user = phoneOnlyUser(UUID.randomUUID());
+        user.setPasswordResetLockedUntil(FIXED_NOW.plusSeconds(60));
+        when(userRepository.findByVerifiedPhoneForUpdate(PHONE)).thenReturn(Optional.of(user));
+        when(tokenGenerator.hashOtp("000000")).thenReturn("0".repeat(64)); // the decoy compare
+
+        assertThatThrownBy(() -> processor.verifyAndIssueTicket(new VerifyPasswordResetOtpRequest(null, "123456", PHONE)))
+                .isInstanceOfSatisfying(VerificationException.class,
+                        e -> assertThat(e.getCode()).isEqualTo(VerificationException.Code.INVALID_CODE));
+
+        verifyNoInteractions(phoneOtpService);
+        verify(passwordResetTicketRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("B516: a correct SMS reset code ends the failure streak like a correct emailed code")
+    void should_clearFailureTotal_when_smsCodeMatches() {
+        User user = phoneOnlyUser(UUID.randomUUID());
+        user.setPasswordResetFailedTotal((short) 3);
+        when(userRepository.findByVerifiedPhoneForUpdate(PHONE)).thenReturn(Optional.of(user));
+        when(phoneOtpService.consumeCode(PHONE, "123456", com.beautica.auth.phoneotp.PhoneOtpPurpose.PASSWORD_RESET))
+                .thenReturn(true);
+        when(tokenGenerator.generateToken()).thenReturn(RAW_TICKET);
+        when(tokenGenerator.hash(RAW_TICKET)).thenReturn(HASHED_TICKET);
+
+        processor.verifyAndIssueTicket(new VerifyPasswordResetOtpRequest(null, "123456", PHONE));
+
+        assertThat(user.getPasswordResetFailedTotal()).isZero();
+        assertThat(user.getPasswordResetLockedUntil()).isNull();
     }
 }

@@ -1708,4 +1708,69 @@ class EnvironmentFingerprintGuardTest {
                 .hasMessageContaining("rule staging-turbosms-token-blank")
                 .message().doesNotContain("staging-sms-mode").doesNotContain("staging-smsclub-token-present");
     }
+
+    // ── B514 (AUTH-54) — App Check rules ─────────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("prod with App Check OFF fails naming prod-app-check-off")
+    void should_fail_when_prodAppCheckOff() {
+        MockEnvironment env = prodEnv().withProperty("app.auth.app-check.mode", "OFF");
+
+        assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("prod-app-check-off");
+    }
+
+    @Test
+    @DisplayName("prod with App Check LOG_ONLY passes (the incident lever stays allowed)")
+    void should_pass_when_prodAppCheckLogOnly() {
+        MockEnvironment env = prodEnv().withProperty("app.auth.app-check.mode", "LOG_ONLY");
+
+        assertThatCode(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS)).doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("prod with App Check LOG_ONLY logs the prod-app-check-log-only alert at ERROR on boot")
+    void should_logErrorAtBoot_when_prodAppCheckLogOnly() {
+        MockEnvironment env = prodEnv().withProperty("app.auth.app-check.mode", "LOG_ONLY");
+        env.setProperty("beautica.environment", DeployEnvironment.PROD.name());
+        env.setProperty("beautica.sms.mode", SmsMode.TURBOSMS.name());
+        org.apache.commons.logging.Log log = org.mockito.Mockito.mock(org.apache.commons.logging.Log.class);
+
+        EnvironmentFingerprintGuard.verify(env, log);
+
+        org.mockito.Mockito.verify(log).error(com.beautica.config.appcheck.AppCheckLogOnlyAlarm.LOG_ONLY_ALERT);
+    }
+
+    @Test
+    @DisplayName("prod with App Check ENFORCE logs no App Check alert")
+    void should_notLogAppCheckAlert_when_prodAppCheckEnforce() {
+        MockEnvironment env = prodEnv().withProperty("app.auth.app-check.mode", "ENFORCE");
+        env.setProperty("beautica.environment", DeployEnvironment.PROD.name());
+        env.setProperty("beautica.sms.mode", SmsMode.TURBOSMS.name());
+        org.apache.commons.logging.Log log = org.mockito.Mockito.mock(org.apache.commons.logging.Log.class);
+
+        EnvironmentFingerprintGuard.verify(env, log);
+
+        org.mockito.Mockito.verify(log, org.mockito.Mockito.never())
+                .error(com.beautica.config.appcheck.AppCheckLogOnlyAlarm.LOG_ONLY_ALERT);
+    }
+
+    @Test
+    @DisplayName("staging with App Check OFF passes (only prod refuses OFF)")
+    void should_pass_when_stagingAppCheckOff() {
+        MockEnvironment env = stagingEnv().withProperty("app.auth.app-check.mode", "OFF");
+
+        assertThatCode(() -> run(env, DeployEnvironment.STAGING, SmsMode.CAPTURE)).doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("prod with a non-Google App Check JWKS URL fails naming prod-app-check-jwks-url")
+    void should_fail_when_prodAppCheckJwksUrlRedirected() {
+        MockEnvironment env = prodEnv().withProperty("app.auth.app-check.jwks-url", "https://evil.example/jwks");
+
+        assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("prod-app-check-jwks-url");
+    }
 }

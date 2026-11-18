@@ -1,5 +1,6 @@
 package com.beautica.auth;
 
+import com.beautica.support.StaffInviteFixtures;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.LoginRequest;
@@ -91,10 +92,10 @@ class InviteRecycleSupersedesIntegrationTest extends AbstractIntegrationTest {
         // Arrange
         UUID ownerId = insertUser("owner-recycle-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
         UUID salonId = insertSalon(ownerId, "Recycle Salon");
-        String inviteeEmail = "recycle-invitee-" + System.nanoTime() + "@beautica.test";
+        String inviteePhone = StaffInviteFixtures.newPhone();
 
-        salonService.inviteMaster(ownerId, salonId, inviteeEmail, Role.SALON_MASTER);
-        UUID firstInviteId = onlyInviteIdFor(salonId, inviteeEmail);
+        salonService.inviteMaster(ownerId, salonId, inviteePhone, Role.SALON_MASTER);
+        UUID firstInviteId = onlyInviteIdFor(salonId, inviteePhone);
         // Lapse the first invite: an invite sent a week ago that nobody opened. Backdating
         // created_at as well keeps the newest-first assertion below deterministic instead of
         // resting on two same-request timestamps differing by microseconds.
@@ -102,13 +103,13 @@ class InviteRecycleSupersedesIntegrationTest extends AbstractIntegrationTest {
 
         // Act — the owner tries again, exactly as they would from the app
         log.debug("Act: re-invite the same address a week after its first invite lapsed");
-        salonService.inviteMaster(ownerId, salonId, inviteeEmail, Role.SALON_MASTER);
+        salonService.inviteMaster(ownerId, salonId, inviteePhone, Role.SALON_MASTER);
 
         // Assert — the DB keeps both rows with distinct, coherent revocation state
         List<Map<String, Object>> rows = jdbcTemplate.queryForList(
                 "SELECT id, is_used, revoked_at, revoked_reason FROM invite_tokens "
-                        + "WHERE salon_id = ? AND lower(email) = lower(?) ORDER BY created_at DESC",
-                salonId, inviteeEmail);
+                        + "WHERE salon_id = ? AND phone = ? ORDER BY created_at DESC",
+                salonId, inviteePhone);
         assertThat(rows)
                 .as("the lapsed invite must SURVIVE the re-invite — hard-deleting it (the pre-change "
                         + "behaviour) erases the owner's record that they already tried this address")
@@ -156,35 +157,35 @@ class InviteRecycleSupersedesIntegrationTest extends AbstractIntegrationTest {
     @DisplayName("a THIRD invite to the same address does not raise IncorrectResultSizeDataAccessException "
             + "(the dispatch finder must be narrowed by revoked_at IS NULL, or two kept rows collide)")
     void should_notThrowIncorrectResultSize_when_theAddressIsInvitedAThirdTime() {
-        // Arrange — two retired rows for one (salon, email), which is only reachable at all
+        // Arrange — two retired rows for one (salon, phone), which is only reachable at all
         // because supersede keeps them. This is the exact state B3 exists to survive.
         UUID ownerId = insertUser("owner-third-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
         UUID salonId = insertSalon(ownerId, "Third Invite Salon");
-        String inviteeEmail = "third-invitee-" + System.nanoTime() + "@beautica.test";
+        String inviteePhone = StaffInviteFixtures.newPhone();
 
-        salonService.inviteMaster(ownerId, salonId, inviteeEmail, Role.SALON_MASTER);
-        lapse(onlyInviteIdFor(salonId, inviteeEmail), 14);
+        salonService.inviteMaster(ownerId, salonId, inviteePhone, Role.SALON_MASTER);
+        lapse(onlyInviteIdFor(salonId, inviteePhone), 14);
 
-        salonService.inviteMaster(ownerId, salonId, inviteeEmail, Role.SALON_MASTER);
-        lapse(activeInviteIdFor(salonId, inviteeEmail), 7);
+        salonService.inviteMaster(ownerId, salonId, inviteePhone, Role.SALON_MASTER);
+        lapse(activeInviteIdFor(salonId, inviteePhone), 7);
 
         // Act + Assert — the third dispatch now sees TWO is_used = false rows for this pair
         log.debug("Act: invite the same address a third time, with two superseded rows already kept");
-        assertThatCode(() -> salonService.inviteMaster(ownerId, salonId, inviteeEmail, Role.SALON_MASTER))
+        assertThatCode(() -> salonService.inviteMaster(ownerId, salonId, inviteePhone, Role.SALON_MASTER))
                 .as("an Optional-returning finder that still matched superseded rows would raise "
                         + "IncorrectResultSizeDataAccessException here — a 500 on every second "
                         + "re-invite of any address, for every salon")
                 .doesNotThrowAnyException();
 
         assertThat(jdbcTemplate.queryForObject(
-                        "SELECT COUNT(*) FROM invite_tokens WHERE salon_id = ? AND lower(email) = lower(?)",
-                        Integer.class, salonId, inviteeEmail))
+                        "SELECT COUNT(*) FROM invite_tokens WHERE salon_id = ? AND phone = ?",
+                        Integer.class, salonId, inviteePhone))
                 .as("all three dispatches must be preserved as history")
                 .isEqualTo(3);
         assertThat(jdbcTemplate.queryForObject(
-                        "SELECT COUNT(*) FROM invite_tokens WHERE salon_id = ? AND lower(email) = lower(?) "
+                        "SELECT COUNT(*) FROM invite_tokens WHERE salon_id = ? AND phone = ? "
                                 + "AND is_used = false AND revoked_at IS NULL",
-                        Integer.class, salonId, inviteeEmail))
+                        Integer.class, salonId, inviteePhone))
                 .as("ux_invite_tokens_active's predicate must still match exactly one row — that is "
                         + "what makes the narrowed Optional finder single-valued by construction")
                 .isEqualTo(1);
@@ -200,17 +201,17 @@ class InviteRecycleSupersedesIntegrationTest extends AbstractIntegrationTest {
                 Timestamp.from(sentAt), Timestamp.from(sentAt.plus(2, ChronoUnit.DAYS)), inviteId);
     }
 
-    private UUID onlyInviteIdFor(UUID salonId, String email) {
+    private UUID onlyInviteIdFor(UUID salonId, String phone) {
         return jdbcTemplate.queryForObject(
-                "SELECT id FROM invite_tokens WHERE salon_id = ? AND lower(email) = lower(?)",
-                UUID.class, salonId, email);
+                "SELECT id FROM invite_tokens WHERE salon_id = ? AND phone = ?",
+                UUID.class, salonId, phone);
     }
 
-    private UUID activeInviteIdFor(UUID salonId, String email) {
+    private UUID activeInviteIdFor(UUID salonId, String phone) {
         return jdbcTemplate.queryForObject(
-                "SELECT id FROM invite_tokens WHERE salon_id = ? AND lower(email) = lower(?) "
+                "SELECT id FROM invite_tokens WHERE salon_id = ? AND phone = ? "
                         + "AND is_used = false AND revoked_at IS NULL",
-                UUID.class, salonId, email);
+                UUID.class, salonId, phone);
     }
 
     /**

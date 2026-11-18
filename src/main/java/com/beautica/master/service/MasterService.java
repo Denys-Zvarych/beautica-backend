@@ -600,7 +600,7 @@ public class MasterService {
      * <p><b>Corrected (Phase 290 audit, security MEDIUM):</b> this javadoc previously claimed
      * parity with {@code AuthorizationService#hasManagementAccess(UUID, UUID, Role)} while
      * {@link #canManageSalonStaff} never actually checked the actor's role — it admitted any actor
-     * whose {@code users.salon_id} matched, which {@code User.createFromInvite} populates for an
+     * whose {@code users.salon_id} matched, which {@code User.createFromPhoneInvite} populates for an
      * invited {@code SALON_MASTER} (read-only) exactly as it does for {@code SALON_ADMIN}. The
      * role gate now lives in {@link #canManageSalonStaff} itself; see its javadoc.
      *
@@ -666,7 +666,7 @@ public class MasterService {
      * <p><b>Security fix (Phase 290 audit, MEDIUM):</b> the previous version of this method
      * answered {@code salonRepository.existsByIdAndOwnerId(...) ||
      * userRepository.findSalonIdById(...).map(salonId::equals)} with NO role check at all. Because
-     * {@code User.createFromInvite} populates {@code users.salon_id} for an invited
+     * {@code User.createFromPhoneInvite} populates {@code users.salon_id} for an invited
      * {@code SALON_MASTER} exactly as it does for {@code SALON_ADMIN} (both branches of
      * {@code InviteService}'s invite-acceptance set it from the invite token regardless of
      * {@code token.getRole()}), a {@code SALON_MASTER} — a read-only role — satisfied the second

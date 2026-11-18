@@ -5,6 +5,7 @@ import com.beautica.service.entity.ServiceTypeSuggestion;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingSource;
 import com.beautica.booking.repository.BookingRepository.ReminderFeedTarget;
+import com.beautica.notification.service.ReminderKind;
 import com.beautica.master.entity.Master;
 import com.beautica.moderation.service.ModerationOutcome;
 import com.beautica.notification.inapp.entity.InAppNotificationType;
@@ -429,13 +430,23 @@ public class InAppNotificationService {
      */
     @Transactional(propagation = Propagation.MANDATORY)
     public void notifyBookingRemindersBulk(Collection<? extends ReminderFeedTarget> targets) {
+        notifyBookingRemindersBulk(targets, ReminderKind.H24);
+    }
+
+    /**
+     * Phase 522 (NTF-48) — {@link #notifyBookingRemindersBulk(Collection)} for a given reminder window. The dedup key
+     * carries the window so the 24 h and 2 h rows of one booking and start never collapse into each other:
+     * {@link ReminderKind#H24} → {@code BOOKING_REMINDER:<id>:<epoch>} (the B495 key, byte-identical),
+     * {@link ReminderKind#H2} → {@code BOOKING_REMINDER:<id>:<epoch>:H2} (admitted by V253's dedup-key CHECK).
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void notifyBookingRemindersBulk(Collection<? extends ReminderFeedTarget> targets, ReminderKind kind) {
         EventRows rows = new EventRows();
         for (ReminderFeedTarget target : targets) {
             if (target.getClientId() == null) {
                 continue;
             }
-            String key = dedupKey(InAppNotificationType.BOOKING_REMINDER, target.getId(),
-                    target.getStartsAt().toEpochSecond());
+            String key = reminderDedupKey(target.getId(), target.getStartsAt().toEpochSecond(), kind);
             rows.add(target.getClientId(), target.getId(), null, target.getSalonId(), key);
         }
         if (rows.isEmpty()) {
@@ -447,7 +458,8 @@ public class InAppNotificationService {
                         rows.appointmentIds(), rows.salonIds(), rows.dedupKeys())
                 : repository.insertEventRowsBulk(type, rows.recipients(), rows.bookingIds(),
                         rows.appointmentIds(), rows.salonIds(), rows.dedupKeys());
-        log.debug("in-app notify(bulk) type=BOOKING_REMINDER targets={} written={}", targets.size(), written);
+        log.debug("in-app notify(bulk) type=BOOKING_REMINDER kind={} targets={} written={}", kind, targets.size(),
+                written);
     }
 
     /**
@@ -506,6 +518,30 @@ public class InAppNotificationService {
             log.debug("in-app notify type=INVITE_ACCEPTED salonId={} newMemberUserId={} recipients={}",
                     salonId, newMemberUserId, recipients.size());
         });
+    }
+
+    /**
+     * B516 (AUTH-D19) — the account's own security notice after a phone change or an email add / change, in the
+     * caller's transaction (a rolled-back change writes nothing). One row for {@code userId} only, with
+     * {@code subject_user_id = userId} and the changed value masked AT THE TIME OF THE CHANGE
+     * ({@code masked_contact}; the read path shows it as stored, never the account's later value); dedup key
+     * {@code TYPE:<userId>:<epoch seconds>}. Push rides the same CTE twin as every other row.
+     *
+     * @param maskedContact the new value already masked ({@code ContactMask}); {@code null} stores no value
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void notifySecurityNotice(InAppNotificationType type, UUID userId, String maskedContact,
+                                     Instant changedAt) {
+        if (!type.isSecurityNotice()) {
+            throw new IllegalArgumentException("Not a security notice type: " + type);
+        }
+        String dedupKey = dedupKey(type, userId, changedAt.getEpochSecond());
+        if (pushEnabled) {
+            repository.insertSecurityNoticeWithPush(type.name(), userId, maskedContact, dedupKey);
+        } else {
+            repository.insertSecurityNotice(type.name(), userId, maskedContact, dedupKey);
+        }
+        log.debug("in-app notify type={}", type);
     }
 
     /**
@@ -719,5 +755,11 @@ public class InAppNotificationService {
 
     private static String dedupKey(InAppNotificationType type, UUID id, long suffix) {
         return type.name() + ":" + id + ":" + suffix;
+    }
+
+    /** B495 / B522 — the 24 h key is the plain 3-part form; every other window appends its {@link ReminderKind} name. */
+    private static String reminderDedupKey(UUID bookingId, long startsAtEpochSecond, ReminderKind kind) {
+        String key = dedupKey(InAppNotificationType.BOOKING_REMINDER, bookingId, startsAtEpochSecond);
+        return kind == ReminderKind.H24 ? key : key + ":" + kind.name();
     }
 }

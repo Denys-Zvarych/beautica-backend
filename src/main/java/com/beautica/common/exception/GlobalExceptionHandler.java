@@ -388,6 +388,21 @@ public class GlobalExceptionHandler {
      * which {@link #handleBusiness}'s genericised BAD_REQUEST branch ("Invalid request") would replace.
      * The most specific handler wins, so declaration order relative to {@link #handleBusiness} is irrelevant.
      */
+    /**
+     * B514 — phone-first identity / App Check rejections ({@link IdentityException}): status and message both come
+     * from the {@link IdentityException.Code}, never from {@code ex.getMessage()}, and {@code data.code} carries the
+     * code the app branches on ({@code PHONE_NOT_UA_MOBILE}, {@code PHONE_ALREADY_REGISTERED},
+     * {@code REGISTRATION_TICKET_INVALID}, {@code APP_CHECK_FAILED}, {@code APP_CHECK_UNAVAILABLE}).
+     */
+    @ExceptionHandler(IdentityException.class)
+    public ResponseEntity<ApiResponse<IdentityErrorResponse>> handleIdentity(IdentityException ex) {
+        log.debug("Identity request rejected: {}", ex.getCode());
+        IdentityException.Code code = ex.getCode();
+        return ResponseEntity
+                .status(code.status())
+                .body(new ApiResponse<>(false, new IdentityErrorResponse(code.name()), code.clientMessage()));
+    }
+
     @ExceptionHandler(TurnstileRejectedException.class)
     public ResponseEntity<ApiResponse<Void>> handleTurnstileRejected(TurnstileRejectedException ex) {
         return ResponseEntity

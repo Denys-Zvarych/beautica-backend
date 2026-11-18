@@ -47,6 +47,7 @@ class NotificationOutboxEmailFailureTest {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final String RECIPIENT = "fail-recipient@example.com";
+    private static final UUID REQUESTER_ID = UUID.fromString("00000000-0000-0000-0000-000000000491");
 
     @Mock private NotificationOutboxRepository outboxRepository;
     @Mock private BookingRepository bookingRepository;
@@ -55,33 +56,44 @@ class NotificationOutboxEmailFailureTest {
     @Mock private InAppPushDispatcher inAppPushDispatcher;
     @Mock private JavaMailSender mailSender;
     @Mock private SpringTemplateEngine templateEngine;
+    @Mock private RequestDecisionLoader requestDecisionLoader;
+    @Mock private RequestDecisionLoader.Snapshot decisions;
+    @Mock private com.beautica.user.User requester;
 
     private NotificationOutboxDrainWorker worker;
 
     @BeforeEach
     void setUp() {
         EmailNotificationService email = new EmailNotificationService(mailSender, templateEngine, "noreply@beautica.app");
-        NotificationService notification = new NotificationService(email, null, null, null, null, "https://beautica.app");
+        NotificationService notification = new NotificationService(email, null, null, null, null, null, "https://beautica.app");
         worker = new NotificationOutboxDrainWorker(
                 outboxRepository, notification, bookingRepository, visitResolver, MAPPER, cipher, inAppPushDispatcher,
-                new io.micrometer.core.instrument.simple.SimpleMeterRegistry(), null);
+                new io.micrometer.core.instrument.simple.SimpleMeterRegistry(), requestDecisionLoader);
         ReflectionTestUtils.setField(worker, "self", worker);
 
         lenient().when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of());
-        lenient().when(cipher.open(anyString())).thenReturn("https://beautica.app/invite/accept?token=ABC");
+        // B520: the invite is an SMS now — the requester's decision e-mail (REQUEST_DECIDED) is the e-mail row here.
+        lenient().when(requestDecisionLoader.load(any())).thenReturn(decisions);
+        lenient().when(decisions.target(any())).thenReturn(new RequestDecisionTarget("Манікюр", null, REQUESTER_ID));
+        lenient().when(decisions.recipient(any())).thenReturn(requester);
+        lenient().when(requester.getEmail()).thenReturn(RECIPIENT);
+        lenient().when(requester.isActive()).thenReturn(true);
         lenient().when(mailSender.createMimeMessage())
                 .thenAnswer(inv -> new MimeMessage(Session.getInstance(new Properties())));
         lenient().when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>x</html>");
     }
 
-    private NotificationOutboxEntry inviteEntry(int attempts) throws Exception {
+    private NotificationOutboxEntry emailEntry(int attempts) throws Exception {
         NotificationOutboxEntry e = new NotificationOutboxEntry();
-        e.setEventType(OutboxEventType.INVITE);
+        e.setEventType(OutboxEventType.REQUEST_DECIDED);
         e.setAttempts(attempts);
         e.setStatus(OutboxStatus.PENDING);
-        e.setAggregateId(UUID.randomUUID());
-        e.setPayload(MAPPER.writeValueAsString(
-                Map.of("email", RECIPIENT, "salonName", "Salon", "inviteUrlSealed", "v1:X")));
+        e.setAggregateId(REQUESTER_ID);
+        e.setPayload(MAPPER.writeValueAsString(Map.of(
+                NotificationOutboxService.REQUEST_KIND, RequestKind.CATEGORY_REQUEST.name(),
+                NotificationOutboxService.REQUEST_ID, "1",
+                NotificationOutboxService.REQUEST_APPROVED, "true",
+                NotificationOutboxService.RECIPIENT_USER_ID, REQUESTER_ID.toString())));
         return e;
     }
 
@@ -96,7 +108,7 @@ class NotificationOutboxEmailFailureTest {
     void should_markRetry_when_smtpThrowsMailException() throws Exception {
         doThrow(new MailSendException("550 rejected " + RECIPIENT)).when(mailSender).send(any(MimeMessage.class));
 
-        NotificationOutboxEntry entry = drain(inviteEntry(0));
+        NotificationOutboxEntry entry = drain(emailEntry(0));
 
         assertThat(entry.getStatus()).isEqualTo(OutboxStatus.PENDING);
         assertThat(entry.getAttempts()).isEqualTo(1);
@@ -108,7 +120,7 @@ class NotificationOutboxEmailFailureTest {
     void should_markDead_when_smtpKeepsFailingUntilMaxAttempts() throws Exception {
         doThrow(new MailSendException("SMTP down")).when(mailSender).send(any(MimeMessage.class));
 
-        NotificationOutboxEntry entry = drain(inviteEntry(NotificationOutboxDrainWorker.MAX_ATTEMPTS - 1));
+        NotificationOutboxEntry entry = drain(emailEntry(NotificationOutboxDrainWorker.MAX_ATTEMPTS - 1));
 
         assertThat(entry.getStatus()).isEqualTo(OutboxStatus.DEAD);
         assertThat(entry.getAttempts()).isEqualTo(NotificationOutboxDrainWorker.MAX_ATTEMPTS);
@@ -119,7 +131,7 @@ class NotificationOutboxEmailFailureTest {
     void should_markSent_when_smtpSucceeds() throws Exception {
         doNothing().when(mailSender).send(any(MimeMessage.class));
 
-        NotificationOutboxEntry entry = drain(inviteEntry(0));
+        NotificationOutboxEntry entry = drain(emailEntry(0));
 
         assertThat(entry.getStatus()).isEqualTo(OutboxStatus.SENT);
         assertThat(entry.getLastError()).isNull();

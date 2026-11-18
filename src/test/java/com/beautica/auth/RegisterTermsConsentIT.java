@@ -1,5 +1,6 @@
 package com.beautica.auth;
 
+import com.beautica.support.StaffInviteFixtures;
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
@@ -104,7 +105,7 @@ class RegisterTermsConsentIT extends AbstractIntegrationTest {
         // Assert
         Instant after = Instant.now().plusMillis(1);
         assertThat(response.getStatusCode()).as("body %s", response.getBody()).isEqualTo(endpoint.success);
-        Map<String, Object> row = consentRow(request.email());
+        Map<String, Object> row = consentRow(request.identifier());
         Instant stamped = ((Timestamp) row.get("terms_accepted_at")).toInstant();
         assertThat(stamped).isBetween(before, after);
         assertThat(row.get("terms_version")).isEqualTo(TERMS_VERSION);
@@ -123,7 +124,7 @@ class RegisterTermsConsentIT extends AbstractIntegrationTest {
 
         // Assert
         assertThat(response.getStatusCode()).as("body %s", response.getBody()).isEqualTo(endpoint.success);
-        Map<String, Object> row = consentRow(request.email());
+        Map<String, Object> row = consentRow(request.identifier());
         assertThat(row.get("terms_accepted_at")).isNull();
         assertThat(row.get("terms_version")).isNull();
         assertThat(row.get("privacy_policy_version")).isNull();
@@ -207,15 +208,15 @@ class RegisterTermsConsentIT extends AbstractIntegrationTest {
 
         // Act + Assert — ck_users_terms_consent_triple (V232)
         assertThatThrownBy(() -> jdbcTemplate.update(
-                "UPDATE users SET terms_accepted_at = NOW() WHERE email = ?", request.email()))
+                "UPDATE users SET terms_accepted_at = NOW() WHERE email = ?", request.identifier()))
                 .isInstanceOf(DataIntegrityViolationException.class)
                 .hasMessageContaining("ck_users_terms_consent_triple");
         assertThatThrownBy(() -> jdbcTemplate.update(
                 "UPDATE users SET terms_accepted_at = NOW(), terms_version = '2026-11-07' WHERE email = ?",
-                request.email()))
+                request.identifier()))
                 .isInstanceOf(DataIntegrityViolationException.class);
         assertThat(jdbcTemplate.update("UPDATE users SET terms_accepted_at = NOW(), terms_version = '2026-11-07', "
-                + "privacy_policy_version = '2026-10-20' WHERE email = ?", request.email())).isEqualTo(1);
+                + "privacy_policy_version = '2026-10-20' WHERE email = ?", request.identifier())).isEqualTo(1);
     }
 
     @ParameterizedTest
@@ -250,7 +251,8 @@ class RegisterTermsConsentIT extends AbstractIntegrationTest {
         // Assert
         assertThat(me.getStatusCode()).isEqualTo(HttpStatus.OK);
         JsonNode body = objectMapper.readTree(me.getBody());
-        assertThat(body.path("data").path("email").asText()).as("profile really loaded").isEqualTo(request.email());
+        assertThat(body.path("data").path("phoneNumber").asText()).as("profile really loaded")
+                .isEqualTo(request.identifier());
         assertThat(fieldNames(body)).doesNotContainAnyElementsOf(CONSENT_KEYS);
     }
 
@@ -261,7 +263,7 @@ class RegisterTermsConsentIT extends AbstractIntegrationTest {
         var request = newRequest(Endpoint.INVITE_ACCEPT);
         request.body().putAll(fullConsent());
         String accessToken = accessToken(post(request));
-        Map<String, Object> stored = consentRow(request.email());
+        Map<String, Object> stored = consentRow(request.identifier());
         Map<String, Object> patch = new LinkedHashMap<>();
         patch.put("firstName", "Iryna");
         patch.put("termsAccepted", false);
@@ -275,9 +277,10 @@ class RegisterTermsConsentIT extends AbstractIntegrationTest {
 
         // Assert
         assertThat(response.getStatusCode()).as("body %s", response.getBody()).isEqualTo(HttpStatus.OK);
-        assertThat(jdbcTemplate.queryForObject("SELECT first_name FROM users WHERE email = ?", String.class,
-                request.email())).as("the update itself was applied").isEqualTo("Iryna");
-        assertThat(consentRow(request.email())).isEqualTo(stored);
+        assertThat(jdbcTemplate.queryForObject("SELECT first_name FROM users WHERE email = ? OR phone_number = ?",
+                String.class, request.identifier(), request.identifier()))
+                .as("the update itself was applied").isEqualTo("Iryna");
+        assertThat(consentRow(request.identifier())).isEqualTo(stored);
     }
 
     @ParameterizedTest
@@ -294,7 +297,7 @@ class RegisterTermsConsentIT extends AbstractIntegrationTest {
         assertThat(events).extracting(ILoggingEvent::getFormattedMessage)
                 .containsExactly("register.consent.legacy role=" + endpoint.role);
         assertThat(events.get(0).getFormattedMessage())
-                .doesNotContain(request.email(), "Olena", "Shevchenko", "+380501234567");
+                .doesNotContain(request.identifier(), "Olena", "Shevchenko", "+380501234567");
     }
 
     @ParameterizedTest
@@ -309,7 +312,7 @@ class RegisterTermsConsentIT extends AbstractIntegrationTest {
         List<ILoggingEvent> events = captureConsentLog(() -> post(request));
 
         // Assert
-        assertThat(consentRow(request.email()).get("terms_version")).isEqualTo(TERMS_VERSION);
+        assertThat(consentRow(request.identifier()).get("terms_version")).isEqualTo(TERMS_VERSION);
         assertThat(events).isEmpty();
     }
 
@@ -421,14 +424,15 @@ class RegisterTermsConsentIT extends AbstractIntegrationTest {
 
             // Assert
             assertThat(response.getStatusCode()).as("body %s", response.getBody()).isEqualTo(endpoint.success);
-            assertThat(consentRow(request.email()).get("terms_version")).isEqualTo(TERMS_VERSION);
-            assertThat(consentRow(request.email()).get("terms_accepted_at")).isNotNull();
+            assertThat(consentRow(request.identifier()).get("terms_version")).isEqualTo(TERMS_VERSION);
+            assertThat(consentRow(request.identifier()).get("terms_accepted_at")).isNotNull();
         }
     }
 
     // ── helpers ──────────────────────────────────────────────────────────────────────────────────
 
-    private record Request(String url, String email, Map<String, Object> body) { }
+    /** {@code identifier}: the new account's email, or — B520 invite accept, which creates no email — its phone. */
+    private record Request(String url, String identifier, Map<String, Object> body) { }
 
     private JsonNode assertRejected(Endpoint endpoint, Map<String, Object> consent, String errorField)
             throws Exception {
@@ -446,7 +450,7 @@ class RegisterTermsConsentIT extends AbstractIntegrationTest {
         assertThat(response.getStatusCode()).as("%s %s", endpoint, consent).isEqualTo(HttpStatus.BAD_REQUEST);
         JsonNode body = objectMapper.readTree(response.getBody());
         assertThat(body.path("errors").has(errorField)).as("errors of %s: %s", consent, body).isTrue();
-        assertThat(countUsers(request.email())).isZero();
+        assertThat(countUsers(request.identifier())).isZero();
         return body.path("errors");
     }
 
@@ -527,14 +531,18 @@ class RegisterTermsConsentIT extends AbstractIntegrationTest {
                 yield new Request("/api/v1/auth/register/independent-master", email, body);
             }
             case INVITE_ACCEPT -> {
-                body.put("token", seedInvite(email));
-                yield new Request("/api/v1/auth/invite/accept", email, body);
+                // B520: a phone invite, accepted with a registration ticket for that phone; no email, no free-text phone.
+                String phone = StaffInviteFixtures.newPhone();
+                body.remove("phoneNumber");
+                body.put("token", seedInvite(phone));
+                body.put("registrationTicket", StaffInviteFixtures.seedRegistrationTicket(jdbcTemplate, phone));
+                yield new Request("/api/v1/auth/invite/accept", phone, body);
             }
         };
     }
 
-    /** One acceptable SALON_MASTER invite for {@code email}; returns the raw token. */
-    private String seedInvite(String email) {
+    /** One acceptable SALON_MASTER phone invite for {@code phone}; returns the raw token. */
+    private String seedInvite(String phone) {
         UUID ownerId = UUID.randomUUID();
         jdbcTemplate.update("INSERT INTO users (id, email, password_hash, role, is_active, email_verified) "
                         + "VALUES (?, ?, ?, 'SALON_OWNER', true, true)",
@@ -544,20 +552,21 @@ class RegisterTermsConsentIT extends AbstractIntegrationTest {
                         + "VALUES (?, ?, ?, true, NOW(), NOW(), ?)",
                 salonId, ownerId, "Consent Salon " + salonId, testCityId());
         String rawToken = "raw-consent-" + UUID.randomUUID();
-        jdbcTemplate.update("INSERT INTO invite_tokens (id, token, email, salon_id, role, expires_at, is_used, "
+        jdbcTemplate.update("INSERT INTO invite_tokens (id, token, phone, salon_id, role, expires_at, is_used, "
                         + "created_at, updated_at) VALUES (?, ?, ?, ?, 'SALON_MASTER', ?, false, NOW(), NOW())",
-                UUID.randomUUID(), sha256Hex(rawToken), email, salonId,
+                UUID.randomUUID(), sha256Hex(rawToken), phone, salonId,
                 Timestamp.from(Instant.now().plus(2, ChronoUnit.DAYS)));
         return rawToken;
     }
 
-    private Map<String, Object> consentRow(String email) {
-        return jdbcTemplate.queryForMap(
-                "SELECT terms_accepted_at, terms_version, privacy_policy_version FROM users WHERE email = ?", email);
+    private Map<String, Object> consentRow(String identifier) {
+        return jdbcTemplate.queryForMap("SELECT terms_accepted_at, terms_version, privacy_policy_version FROM users "
+                + "WHERE email = ? OR phone_number = ?", identifier, identifier);
     }
 
-    private Integer countUsers(String email) {
-        return jdbcTemplate.queryForObject("SELECT COUNT(*) FROM users WHERE email = ?", Integer.class, email);
+    private Integer countUsers(String identifier) {
+        return jdbcTemplate.queryForObject("SELECT COUNT(*) FROM users WHERE email = ? OR phone_number = ?",
+                Integer.class, identifier, identifier);
     }
 
     private static String sha256Hex(String input) {

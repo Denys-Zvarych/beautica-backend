@@ -36,7 +36,12 @@ public class User extends AuditableEntity {
     @Column(name = "id", updatable = false, nullable = false)
     private UUID id;
 
-    @Column(name = "email", nullable = false, unique = true)
+    /**
+     * Optional since B514 (AUTH-D11, V244): a phone-registered account has no email until one is added and
+     * confirmed later (B516). Unique among non-null values. Business emails go only to a non-null address
+     * (NTF-D15 / NTF-56, {@code EmailNotificationService}).
+     */
+    @Column(name = "email", unique = true)
     private String email;
 
     @Column(name = "password_hash", nullable = false)
@@ -54,6 +59,16 @@ public class User extends AuditableEntity {
 
     @Column(name = "phone_number", length = 20)
     private String phoneNumber;
+
+    /**
+     * B514 (AUTH-D08, V244) — when {@link #phoneNumber} was proven by SMS code. Non-null means the phone is the
+     * normalised {@code +380…} form (CHECK {@code ck_users_verified_phone_format}), unique among verified accounts
+     * (partial unique index {@code ux_users_verified_phone}) and usable as a login identifier (AUTH-D09). NULL on
+     * every pre-B514 account (AUTH-D12).
+     */
+    @JsonIgnore
+    @Column(name = "phone_verified_at")
+    private Instant phoneVerifiedAt;
 
     @Column(name = "city", length = 100)
     private String city;
@@ -160,6 +175,12 @@ public class User extends AuditableEntity {
     @JsonIgnore
     @Column(name = "password_reset_locked_until")
     private Instant passwordResetLockedUntil;
+
+    // B516 (AUTH-12/15, V248) — last password-reset SMS request on this account; the 60 s SMS-branch cooldown reads it
+    // on the locked row (the phone_otps row is written after commit, too late to serialise concurrent requests).
+    @JsonIgnore
+    @Column(name = "password_reset_sms_sent_at")
+    private Instant passwordResetSmsSentAt;
 
     @Column(name = "bio", columnDefinition = "TEXT")
     private String bio;
@@ -273,35 +294,52 @@ public class User extends AuditableEntity {
     }
 
     /**
-     * Creates a user accepted through a salon invite (SALON_ADMIN or SALON_MASTER).
-     * <p>
-     * The invite token was single-use and emailed to this exact address by
-     * {@code InviteService}; presenting it back at accept-time <em>is</em> the proof
-     * of mailbox ownership for this account — the invite token was the email
-     * verification. Deferring to the normal OTP-verification flow afterward is both
-     * redundant and, as originally shipped, unsatisfiable (nothing on the invite path
-     * ever issues a verification code), which locked every invited user out of login.
-     * <p>
-     * The salonId-taking constructor above stays public — it also backs fixtures that
-     * represent an already-onboarded salon staff member (e.g. an existing SALON_ADMIN
-     * used as the caller of {@code sendInvite}), which is a different scenario from
-     * "just accepted an invite" and must not be forced verified by construction. This
-     * factory is the one InviteService#acceptInvite must call, so the verified-by-token
-     * intent stays documented and centralized rather than a call-site
-     * {@code setEmailVerified(true)} that a future edit could silently drop.
+     * B520 (AUTH-52, AUTH-D16) — the account an accepted PHONE invite creates: the invited phone, proven equal to the
+     * registration ticket's phone, is verified from the start; no email (one is added later as a notifications channel,
+     * AUTH-D11), so {@code emailVerified} stays {@code false}. The salon and role come from the invite token. Callers
+     * persist through {@code PhoneRegistrationService.saveClaimingPhone} (a concurrently claimed phone is a 409).
      */
-    public static User createFromInvite(
-            String email,
+    public static User createFromPhoneInvite(
+            String phoneE164,
             String passwordHash,
             Role role,
             String firstName,
             String lastName,
-            String phoneNumber,
-            UUID salonId
+            UUID salonId,
+            Instant phoneVerifiedAt
     ) {
-        User user = new User(email, passwordHash, role, firstName, lastName, phoneNumber, salonId);
-        user.emailVerified = true;
+        User user = new User(null, passwordHash, role, firstName, lastName, phoneE164, salonId);
+        user.phoneVerifiedAt = phoneVerifiedAt;
         return user;
+    }
+
+    /**
+     * B514 (AUTH-D11) — a self-registered account whose phone was proven by an SMS code (registration ticket). No
+     * email: one is added and confirmed later (B516). The phone must already be normalised E.164 ({@code +380…}).
+     */
+    public static User registerWithVerifiedPhone(
+            String phoneE164,
+            String passwordHash,
+            Role role,
+            String firstName,
+            String lastName,
+            String businessName,
+            Instant phoneVerifiedAt
+    ) {
+        User user = new User(null, passwordHash, role, firstName, lastName, phoneE164, businessName);
+        user.phoneVerifiedAt = phoneVerifiedAt;
+        return user;
+    }
+
+    /**
+     * B514 (AUTH-43) — stamps the phone proven by a registration ticket on an invited account at accept time; B516
+     * (AUTH-44, D3) — swaps an existing account's phone to the number its SMS code just proved, in the same single
+     * write (number and {@code phone_verified_at} together). Callers persist through
+     * {@code PhoneRegistrationService.saveClaimingPhone} so a number verified on another account is a clean 409.
+     */
+    public void markPhoneVerified(String phoneE164, Instant verifiedAt) {
+        this.phoneNumber = phoneE164;
+        this.phoneVerifiedAt = verifiedAt;
     }
 
     public UUID getId() {
@@ -378,6 +416,39 @@ public class User extends AuditableEntity {
 
     public boolean isEmailVerified() {
         return emailVerified;
+    }
+
+    @JsonIgnore
+    public Instant getPhoneVerifiedAt() {
+        return phoneVerifiedAt;
+    }
+
+    /** B514 — the phone was proven by SMS code (AUTH-D08). */
+    public boolean isPhoneVerified() {
+        return phoneVerifiedAt != null;
+    }
+
+    /**
+     * B514 (AUTH-08) — the account has proven at least one login identifier: a verified phone, or (legacy accounts)
+     * a confirmed email. Gates login and refresh.
+     */
+    public boolean hasVerifiedIdentity() {
+        return phoneVerifiedAt != null || emailVerified;
+    }
+
+    /**
+     * B516 (AUTH-50, CLI-50) — stores an optional notifications email only once its emailed code was confirmed:
+     * address and {@code email_verified = true} in one write. An unconfirmed address is never written here (it stays
+     * in {@code user_pending_emails}, NTF-56). The address must already be lower-cased and trimmed.
+     */
+    public void confirmEmail(String normalisedEmail) {
+        this.email = normalisedEmail;
+        this.emailVerified = true;
+    }
+
+    /** B516 (AUTH-D18) — a non-null email that was confirmed by code: the forgot / change-password channel. */
+    public boolean hasConfirmedEmail() {
+        return email != null && emailVerified;
     }
 
     public void setEmailVerified(boolean emailVerified) {
@@ -466,6 +537,15 @@ public class User extends AuditableEntity {
     }
 
     @JsonIgnore
+    public Instant getPasswordResetSmsSentAt() {
+        return passwordResetSmsSentAt;
+    }
+
+    /** B516 — stamps a password-reset SMS request (the cooldown source); call on the row-locked entity only. */
+    public void markPasswordResetSmsRequested(Instant requestedAt) {
+        this.passwordResetSmsSentAt = requestedAt;
+    }
+
     public Instant getPasswordResetLockedUntil() {
         return passwordResetLockedUntil;
     }

@@ -63,6 +63,11 @@ class AuthServiceOwnerRegistrationTest {
     @Mock
     private AccessTokenDenylist accessTokenDenylist;
 
+    @Mock
+    private PhoneRegistrationService phoneRegistrationService;
+
+    private final LoginFailureLimiter loginFailureLimiter = new LoginFailureLimiter(java.time.Clock.systemUTC());
+
     private AuthService authService;
 
     @BeforeEach
@@ -84,7 +89,9 @@ class AuthServiceOwnerRegistrationTest {
                 emailVerificationProcessor,
                 verificationPolicyConfig,
                 jwtTokenProvider,
-                accessTokenDenylist
+                accessTokenDenylist,
+                phoneRegistrationService,
+                loginFailureLimiter
         );
     }
 

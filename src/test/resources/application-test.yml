@@ -23,6 +23,10 @@ spring:
       '[mail.smtp.writetimeout]': 1000
 
 app:
+  # B514 (AUTH-54) — OFF by default; the App Check ITs set the mode per class.
+  auth:
+    app-check:
+      mode: "OFF"
   # Phase 382: explicit — the test profile never calls Cloudflare; ITs that exercise the verifier opt in.
   turnstile:
     enabled: false

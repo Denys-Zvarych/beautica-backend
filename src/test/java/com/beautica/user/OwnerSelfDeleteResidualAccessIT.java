@@ -1,5 +1,6 @@
 package com.beautica.user;
 
+import com.beautica.support.StaffInviteFixtures;
 import com.beautica.auth.dto.SelfRegistrationRole;
 import com.fasterxml.jackson.databind.JsonNode;
 import org.junit.jupiter.api.DisplayName;
@@ -93,7 +94,7 @@ class OwnerSelfDeleteResidualAccessIT extends AbstractOwnerSelfDeleteWorldIT {
             calls.put("PATCH salon", exchange(HttpMethod.PATCH, salon, fresh,
                     Map.of("name", "Hijacked", "street", "Hijack St", "buildingNo", "1", "cityId", testCityId())));
             calls.put("POST invite", exchange(HttpMethod.POST, salon + "/invite", fresh,
-                    Map.of("email", "hijack-" + System.nanoTime() + "@beautica.test", "salonId", old.salonId())));
+                    Map.of("phone", StaffInviteFixtures.newPhone(), "salonId", old.salonId())));
             calls.put("DELETE salon", exchange(HttpMethod.DELETE, salon, fresh, null));
             calls.put("DELETE invite", exchange(HttpMethod.DELETE, salon + "/invites/" + old.inviteId(), fresh, null));
             calls.put("DELETE block", exchange(HttpMethod.DELETE, "/api/v1/blocks/" + old.blockId(), fresh, null));

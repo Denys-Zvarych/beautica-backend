@@ -9,6 +9,7 @@ import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
+import java.time.Instant;
 import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
@@ -18,35 +19,68 @@ public interface InviteTokenRepository extends JpaRepository<InviteToken, UUID>,
 
     Optional<InviteToken> findByToken(String token);
 
+    /** {@code hashtextextended} seed of the per-inviter invite-SMS cap lock (0–7 are taken; see {@code TelegramLinkRepository}). */
+    int INVITER_CAP_LOCK_SEED = 8;
+    /** {@code hashtextextended} seed of the per-salon invite-SMS cap lock. */
+    int SALON_CAP_LOCK_SEED = 9;
+    /** {@code hashtextextended} seed of the per-phone invite-SMS cap lock (AUTH-D14). */
+    int PHONE_CAP_LOCK_SEED = 10;
+
     /**
-     * Salon-scoped active-invite lookup used by the invite-dispatch idempotency check.
-     * Scoping by {@code salonId} lets independent salons each hold a pending invite for
-     * the same email — one salon's pending invite no longer short-circuits another salon's
-     * dispatch (the cross-salon silent-drop fix).
-     *
-     * <p><strong>{@code revokedAt IS NULL} IS LOAD-BEARING, NOT COSMETIC.</strong> Since V153 an
-     * expired invite displaced by a re-invite is no longer hard-deleted — it is marked
-     * {@link RevocationReason#SUPERSEDED} and KEPT as history, still carrying
-     * {@code is_used = false}. Without this clause the second re-invite of any address would see
-     * two matching rows and this {@code Optional} return would throw
-     * {@code IncorrectResultSizeDataAccessException} — a 500 on
-     * {@code POST /salons/{id}/invite}. The predicate is deliberately identical to the
-     * {@code ux_invite_tokens_active} partial-unique predicate, which is what guarantees at most
-     * one match.
-     *
-     * <p><strong>Index roles:</strong> this {@code email = ? AND salon_id = ? AND is_used = false
-     * AND revoked_at IS NULL} predicate is served by the partial index
-     * {@code idx_invite_tokens_email_active (email, salon_id) WHERE is_used = false AND revoked_at
-     * IS NULL} (V153, replacing V16's plain {@code (email, is_used)}). The whole predicate is now
-     * covered — no residual filter. That matters BECAUSE of this phase: superseded rows are
-     * retained forever with {@code is_used = false}, so under the old index a churned address
-     * accumulated one extra heap fetch per re-invite (measured: {@code Rows Removed by Filter: 50}
-     * after 50 re-invites, growing linearly). Postgres cannot use the expression index
-     * {@code ux_invite_tokens_active} on {@code lower(email)} for a bare {@code email = ?}
-     * comparison, which is why a second, non-expression index is required at all;
-     * {@code ux_invite_tokens_active} is the INSERT-time uniqueness/concurrency backstop only.
+     * B520 — salon-scoped ACTIVE phone-invite lookup, the dispatch idempotency check (a live invite to the same phone
+     * for the same salon is a 201 with no second token and no second SMS). Each salon decides independently (the
+     * cross-salon silent-drop fix). {@code revokedAt IS NULL} is load-bearing: SUPERSEDED rows keep
+     * {@code is_used = false}, so without it a twice re-invited phone would match two rows. The predicate is the one of
+     * {@code ux_invite_tokens_active_phone} (V251), which serves it and guarantees at most one match.
      */
-    Optional<InviteToken> findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull(String email, UUID salonId);
+    Optional<InviteToken> findByPhoneAndSalonIdAndIsUsedFalseAndRevokedAtIsNull(String phone, UUID salonId);
+
+    /**
+     * B520 (AUTH-52) — serialises the invite-SMS caps per inviter, then per salon (always in that order, so two
+     * dispatches never wait on each other crosswise): the count-then-insert in {@code InvitePersistenceService} cannot
+     * be raced past a cap. Transaction-scoped, released at commit; fused 3 s {@code lock_timeout} like every
+     * first-in-transaction advisory lock in the codebase.
+     */
+    @Query(value = "SELECT 1 FROM (SELECT set_config('lock_timeout', '3s', true), "
+            + "pg_advisory_xact_lock(hashtextextended(CAST(:inviterId AS text), " + INVITER_CAP_LOCK_SEED + ")), "
+            + "pg_advisory_xact_lock(hashtextextended(CAST(:salonId AS text), " + SALON_CAP_LOCK_SEED + "))) sub",
+            nativeQuery = true)
+    Integer acquireInviteSmsCapLocks(@Param("inviterId") UUID inviterId, @Param("salonId") UUID salonId);
+
+    /**
+     * B520 audit-fix (AUTH-D14) — serialises the per-PHONE invite-SMS cap across every salon and inviter. Taken AFTER
+     * {@link #acquireInviteSmsCapLocks} (one global order: inviter, salon, phone — no deadlock); the 3 s
+     * {@code lock_timeout} set there still applies (transaction-local).
+     */
+    @Query(value = "SELECT 1 FROM (SELECT pg_advisory_xact_lock(hashtextextended(:phone, " + PHONE_CAP_LOCK_SEED
+            + "))) sub", nativeQuery = true)
+    Integer acquireInvitePhoneCapLock(@Param("phone") String phone);
+
+    /** B520 (AUTH-52) — phone invites (= invite SMS) the user sent since {@code since}; idx_invite_tokens_invited_by_created. */
+    @Query("SELECT COUNT(t) FROM InviteToken t WHERE t.invitedBy = :inviterId AND t.phone IS NOT NULL "
+            + "AND t.createdAt > :since")
+    long countPhoneInvitesByInviterSince(@Param("inviterId") UUID inviterId, @Param("since") Instant since);
+
+    /** B520 (AUTH-52) — phone invites (= invite SMS) of the salon since {@code since}; idx_invite_tokens_salon_created. */
+    @Query("SELECT COUNT(t) FROM InviteToken t WHERE t.salonId = :salonId AND t.phone IS NOT NULL "
+            + "AND t.createdAt > :since")
+    long countPhoneInvitesBySalonSince(@Param("salonId") UUID salonId, @Param("since") Instant since);
+
+    /**
+     * B520 (D5, SAL-48) — deletes every UNACCEPTED phone invite that expired, or was revoked (cancelled /
+     * superseded), before {@code cutoff}. Accepted invites ({@code is_used} without a revocation) and pre-B520 email
+     * rows are kept. One bounded statement, no per-row materialisation.
+     *
+     * @return number of rows deleted
+     */
+    @Modifying
+    @Query(value = """
+            DELETE FROM invite_tokens
+            WHERE phone IS NOT NULL
+              AND (is_used = false OR revoked_at IS NOT NULL)
+              AND COALESCE(revoked_at, expires_at) < :cutoff
+            """, nativeQuery = true)
+    int deleteUnacceptedPhoneInvitesEndedBefore(@Param("cutoff") Instant cutoff);
 
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("SELECT t FROM InviteToken t WHERE t.token = :token")
@@ -109,20 +143,27 @@ public interface InviteTokenRepository extends JpaRepository<InviteToken, UUID>,
      *
      * <p>Served index-ordered (no sort node) by {@code idx_invite_tokens_salon_created}
      * {@code (salon_id, created_at DESC, id DESC)} (V153).
+     *
+     * <p><strong>B520 (SAL-48):</strong> a pre-deploy email invite that would still read PENDING at {@code now}
+     * (no phone, unused, unrevoked, unexpired) is left out — it can no longer be accepted. Its predicate is the
+     * negation of the PENDING rung of the status ladder, with the same canonical expiry boundary
+     * ({@code expiresAt <= now} = {@link InviteToken#isExpired}).
      */
     @Query("""
             SELECT new com.beautica.user.InviteHistoryRow(
-                       t.id, t.email, t.role, t.isUsed, t.revokedReason, t.expiresAt, t.createdAt)
+                       t.id, t.email, t.phone, t.role, t.isUsed, t.revokedReason, t.expiresAt, t.createdAt)
             FROM InviteToken t
             WHERE t.salonId = :salonId
+              AND (t.phone IS NOT NULL OR t.isUsed = true OR t.revokedAt IS NOT NULL OR t.expiresAt <= :now)
             ORDER BY t.createdAt DESC, t.id DESC
             """)
-    List<InviteHistoryRow> findSalonInviteHistory(@Param("salonId") UUID salonId, Pageable pageable);
+    List<InviteHistoryRow> findSalonInviteHistory(@Param("salonId") UUID salonId, @Param("now") Instant now,
+                                                  Pageable pageable);
 
     /**
      * Deletes every {@code invite_tokens} row this salon dispatched to any of
-     * {@code staffUserIds}, matched by the staff member's CURRENT {@code users.email}
-     * (phase 295 — the salon-deletion staff HARD-DELETE cascade).
+     * {@code staffUserIds}, matched by the staff member's CURRENT {@code users.email} or — B520, phone invites —
+     * {@code users.phone_number} (phase 295 — the salon-deletion staff HARD-DELETE cascade).
      *
      * <p><strong>Supersedes {@code redactEmailsBySalonIdAndStaffUserIds} (phase 291 D9).</strong>
      * That statement rewrote the same rows to a {@code deleted+<uuid>@beautica-deleted.invalid}
@@ -180,7 +221,7 @@ public interface InviteTokenRepository extends JpaRepository<InviteToken, UUID>,
             USING users u
             WHERE u.id IN (:staffUserIds)
               AND t.salon_id = :salonId
-              AND lower(t.email) = lower(u.email)
+              AND (lower(t.email) = lower(u.email) OR t.phone = u.phone_number)
             """, nativeQuery = true)
     int deleteBySalonIdAndStaffUserIds(@Param("salonId") UUID salonId,
                                        @Param("staffUserIds") List<UUID> staffUserIds);

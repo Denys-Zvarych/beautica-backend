@@ -336,6 +336,21 @@ app:
   # Flip to true only after (1) mobile 443 is live on Play and (2) APP_ANDROID_MIN_VERSION_CODE forces that build.
   auth:
     require-terms-consent: ${APP_AUTH_REQUIRE_TERMS_CONSENT:false}
+    # B514 (AUTH-02, AUTH-43) — false: register still takes the legacy email shape (B520: invite accept always needs a
+    # registration ticket for the invited phone, whatever this flag says). Flip to true only
+    # after M515 is the Play minimum (APP_ANDROID_MIN_VERSION_CODE), same order as require-terms-consent.
+    require-phone-registration: ${APP_AUTH_REQUIRE_PHONE_REGISTRATION:false}
+    # B516 (AUTH-45, AUTH-D12) — false: no server-side phone gate. Flip to true only after M517 is the Play minimum.
+    # When true, an APP booking by a CLIENT without a verified phone, and any non-exempt write by a provider without
+    # a verified phone (no provider deadline), -> 409 PHONE_NOT_VERIFIED.
+    require-verified-phone: ${APP_AUTH_REQUIRE_VERIFIED_PHONE:false}
+    # B514 (AUTH-54) — Firebase App Check on endpoints that send an SMS. ENFORCE here (prod); staging overlay
+    # LOG_ONLY, local/test OFF. A mode other than OFF needs the project number and at least one app id (boot fails
+    # otherwise); prod refuses OFF (EnvironmentFingerprintGuard rule prod-app-check-off).
+    app-check:
+      mode: ${APP_AUTH_APP_CHECK_MODE:ENFORCE}
+      project-number: ${APP_AUTH_APP_CHECK_PROJECT_NUMBER:}
+      app-ids: ${APP_AUTH_APP_CHECK_APP_IDS:}
   # Phase 437 — GET /api/v1/app/config (mobile 438 forced-update gate). Compared against the Android versionCode
   # (pubspec +N). Defaults never block anyone. Boot fails on a negative code, latest < min, or a store URL not on
   # https://play.google.com/. Raise APP_ANDROID_MIN_VERSION_CODE only after the replacement build is live on Play.
@@ -353,6 +368,17 @@ app:
   invite:
     token-expiration-hours: 48
     from-email: noreply@beautica.app
+    # B520 (AUTH-52, SAL-48) — staff invites go by SMS (never behind app.booking.sms.enabled, NTF-D14). Caps answer
+    # 429 INVITE_SMS_LIMIT beyond them. Unaccepted phone invites are deleted `retention` after expiry / revocation
+    # (InviteTokenCleanupJob, daily; the privacy policy states 30 days — change both together).
+    sms:
+      per-inviter-per-hour: 10
+      per-salon-per-day: 30
+      # AUTH-D14 — invite SMS one phone may receive per rolling 24 h across ALL salons and inviters (cancel +
+      # re-invite and cross-salon invites included); counted on invite_tokens, not the 15-min OTP bucket.
+      per-phone-per-day: 3
+      retention: 30d
+      cleanup-cron: "0 52 3 * * *"
   # Phase 374 — outbound mail transport. smtp (spring.mail.*, local/test/staging) | brevo-api (prod, HTTPS
   # api.brevo.com:443). Set by the profile yml; no dedicated env var is documented, but like any property it CAN be
   # overridden (e.g. APP_MAIL_TRANSPORT) — the fingerprint guard therefore pins it: prod must resolve brevo-api
@@ -570,6 +596,11 @@ app:
       read-timeout: 5s
       lifetime-minutes: 60       # booking / reminder / review SMS
       otp-lifetime-minutes: 10   # OTP sender; must be <= the OTP code TTL (SmsClubPropertiesTest)
+      # B520 audit-fix — staff invite SMS: a day of delivery lifetime (the link lives 48 h; a re-invite of a live
+      # invite sends nothing) and shorter timeouts, since it is sent on the single outbox drain thread.
+      invite-lifetime-minutes: 1440
+      invite-connect-timeout: 2s
+      invite-read-timeout: 3s
       # Phase 439 audit-fix: staging-only real-send ceiling per Kyiv day while the smsclub opt-in is on
       # (StagingSmsDailyCap); ignored in prod and in capture mode.
       staging-daily-cap: ${SMSCLUB_STAGING_DAILY_CAP:50}

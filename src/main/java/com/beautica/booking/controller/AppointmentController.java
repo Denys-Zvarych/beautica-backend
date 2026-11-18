@@ -1,5 +1,6 @@
 package com.beautica.booking.controller;
 
+import com.beautica.user.phone.RequireVerifiedPhone;
 import com.beautica.booking.dto.AppointmentDetailResponse;
 import com.beautica.booking.dto.AppointmentItemRescheduleRequest;
 import com.beautica.booking.dto.AppointmentProviderNoteRequest;
@@ -63,6 +64,7 @@ public class AppointmentController {
     private final BookingService bookingService;
 
     @PostMapping
+    @RequireVerifiedPhone // B516 (AUTH-45): 409 PHONE_NOT_VERIFIED when the flag is on
     @PreAuthorize("hasRole('CLIENT')")
     public ResponseEntity<ApiResponse<AppointmentDetailResponse>> createAppointment(
             @Valid @RequestBody CreateAppointmentRequest request,

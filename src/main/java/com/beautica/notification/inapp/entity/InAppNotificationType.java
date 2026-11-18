@@ -2,7 +2,7 @@ package com.beautica.notification.inapp.entity;
 
 /**
  * The set of in-app feed event types (phase 332). Mirrors the DB CHECK constraint
- * {@code in_app_notification_type_chk} in {@code V181__create_in_app_notification.sql} (latest form: V241) exactly —
+ * {@code in_app_notification_type_chk} in {@code V181__create_in_app_notification.sql} (latest form: V246) exactly —
  * an unknown value is rejected at compile time here rather than reaching the DB and failing the
  * CHECK at insert time. Any addition to this enum MUST be added to that CHECK in the same PR.
  *
@@ -45,7 +45,19 @@ public enum InAppNotificationType {
      * Phase 495 (NTF-48) — the registered client's 24 h reminder for one APP booking; client-only, booking-keyed,
      * written by the registered 24 h reminder sweep in the claim transaction. Appended last (mobile contract M497).
      */
-    BOOKING_REMINDER;
+    BOOKING_REMINDER,
+    /**
+     * B516 (AUTH-D19) — the account's own security notice after a phone CHANGE (never a first add). Recipient-only;
+     * {@code subject_user_id} = the recipient, so the masked new number is resolved from the live row at read time.
+     */
+    SECURITY_PHONE_CHANGED,
+    /** B516 (AUTH-D19) — as {@link #SECURITY_PHONE_CHANGED}, after the notifications email was added or changed. */
+    SECURITY_EMAIL_CHANGED;
+
+    /** B516 — the account security notices; each carries only {@code subject_user_id} (= the recipient). */
+    public boolean isSecurityNotice() {
+        return this == SECURITY_PHONE_CHANGED || this == SECURITY_EMAIL_CHANGED;
+    }
 
     /** Phase 415 — the moderation-outcome types; each carries {@code moderated_target_type} and no other referent. */
     public boolean isModerationOutcome() {

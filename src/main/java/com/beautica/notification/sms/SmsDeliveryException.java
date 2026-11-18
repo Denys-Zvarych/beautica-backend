@@ -10,11 +10,28 @@ package com.beautica.notification.sms;
  */
 public class SmsDeliveryException extends RuntimeException {
 
+    /** B520 audit-fix — a provider outage signal (transport failure, 5xx / 429), not a per-message refusal. */
+    private final boolean transientFailure;
+
     public SmsDeliveryException(String message) {
-        super(message);
+        this(message, null, false);
     }
 
     public SmsDeliveryException(String message, Throwable cause) {
+        this(message, cause, false);
+    }
+
+    /**
+     * @param transientFailure {@code true} when the provider was unreachable or answered 5xx / 429 — the failure says
+     *                         the provider is down, not that this message is bad; the outbox circuit breaker counts it
+     */
+    public SmsDeliveryException(String message, Throwable cause, boolean transientFailure) {
         super(message, cause);
+        this.transientFailure = transientFailure;
+    }
+
+    /** Whether this failure signals a provider outage (see the constructor); {@code false} for a refusal. */
+    public boolean isTransient() {
+        return transientFailure;
     }
 }

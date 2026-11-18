@@ -1,5 +1,6 @@
 package com.beautica.auth;
 
+import com.beautica.support.StaffInviteFixtures;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.InviteAcceptRequest;
@@ -113,15 +114,15 @@ class SalonMasterIntegrationTest extends AbstractIntegrationTest {
         UUID salonId = UUID.randomUUID();
         createSalonOwnerWithSalon(ownerEmail, salonId);
 
-        String masterEmail = uniqueEmail("newmaster");
-        createdEmails.add(masterEmail);
+        String masterPhone = StaffInviteFixtures.newPhone();
 
-        log.debug("Arrange: owner={} sends invite to master={} for salon={}", ownerEmail, masterEmail, salonId);
+        log.debug("Arrange: owner={} has a phone invite out for salon={}", ownerEmail, salonId);
         String rawToken = UUID.randomUUID().toString();
-        saveValidInviteToken(masterEmail, salonId, rawToken);
+        saveValidInviteToken(masterPhone, salonId, rawToken);
 
-        // Act: master accepts the invite
-        var request = new InviteAcceptRequest(rawToken, TEST_PASSWORD, "Oksana", "Kovalenko", "+380501234567");
+        // Act: master accepts the invite with a registration ticket for the invited phone (B520)
+        var request = new InviteAcceptRequest(rawToken, TEST_PASSWORD, "Oksana", "Kovalenko", null, null, null, null,
+                StaffInviteFixtures.seedRegistrationTicket(jdbcTemplate, masterPhone));
         log.debug("Act: POST /auth/invite/accept");
         ResponseEntity<String> response = restTemplate.postForEntity(
                 "/api/v1/auth/invite/accept", request, String.class);
@@ -135,7 +136,9 @@ class SalonMasterIntegrationTest extends AbstractIntegrationTest {
                 response.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
         assertThat(body.success()).isTrue();
         assertThat(body.data().role()).isEqualTo(Role.SALON_MASTER);
-        assertThat(body.data().email()).isEqualTo(masterEmail);
+        assertThat(body.data().email()).as("B520: an invited account has no email").isNull();
+        assertThat(jdbcTemplate.queryForObject("SELECT phone_number FROM users WHERE id = ?", String.class,
+                body.data().userId())).isEqualTo(masterPhone);
 
         // Assert: master row exists linked to the correct salon
         UUID createdUserId = body.data().userId();
@@ -158,22 +161,22 @@ class SalonMasterIntegrationTest extends AbstractIntegrationTest {
     @DisplayName("transaction rolls back: invite token remains unused when master creation fails")
     void should_rollbackTransaction_when_masterCreationFailsAfterInviteConsumed() throws Exception {
         // Arrange: create a real salon so invite_tokens FK is satisfied
-        String masterEmail = uniqueEmail("rollback-master");
-        createdEmails.add(masterEmail);
+        String masterPhone = StaffInviteFixtures.newPhone();
         UUID salonId = UUID.randomUUID();
         String ownerEmail = uniqueEmail("rollback-owner");
         createdEmails.add(ownerEmail);
         createSalonOwnerWithSalon(ownerEmail, salonId);
 
         String rawToken = UUID.randomUUID().toString();
-        saveValidInviteToken(masterEmail, salonId, rawToken);
+        saveValidInviteToken(masterPhone, salonId, rawToken);
 
         log.debug("Arrange: stub masterService.createMasterFromInvite to throw RuntimeException");
         doThrow(new RuntimeException("Simulated master creation failure"))
                 .when(masterService).createMasterFromInvite(any(UUID.class), any(UUID.class));
 
         // Act: attempt invite accept — expect 500 due to uncaught RuntimeException
-        var request = new InviteAcceptRequest(rawToken, TEST_PASSWORD, "Fail", "Master", "+380501234567");
+        var request = new InviteAcceptRequest(rawToken, TEST_PASSWORD, "Fail", "Master", null, null, null, null,
+                StaffInviteFixtures.seedRegistrationTicket(jdbcTemplate, masterPhone));
         log.debug("Act: POST /auth/invite/accept with failing masterService");
         ResponseEntity<String> response = restTemplate.postForEntity(
                 "/api/v1/auth/invite/accept", request, String.class);
@@ -191,9 +194,9 @@ class SalonMasterIntegrationTest extends AbstractIntegrationTest {
                 .as("invite token must remain unused after transaction rollback")
                 .isFalse();
 
-        // Assert: no user row was created for this email
+        // Assert: no user row was created for this phone
         Integer userCount = jdbcTemplate.queryForObject(
-                "SELECT COUNT(*) FROM users WHERE email = ?", Integer.class, masterEmail);
+                "SELECT COUNT(*) FROM users WHERE phone_number = ?", Integer.class, masterPhone);
         assertThat(userCount).isZero();
     }
 
@@ -330,10 +333,10 @@ class SalonMasterIntegrationTest extends AbstractIntegrationTest {
 
         String ownerBToken = loginAndGetToken(ownerBEmail);
 
-        String targetEmail = uniqueEmail("target-master");
+        String targetPhone = StaffInviteFixtures.newPhone();
         // owner B sends an invite for salonA — caller's salonId (salonB) != requested salonId (salonA)
         var requestBody = objectMapper.writeValueAsString(
-                new com.beautica.auth.dto.InviteRequest(targetEmail, salonAId, null));
+                new com.beautica.auth.dto.InviteRequest(targetPhone, salonAId, null));
 
         log.debug("Act: POST /auth/invite with ownerB token targeting salonA={}", salonAId);
 
@@ -489,13 +492,14 @@ class SalonMasterIntegrationTest extends AbstractIntegrationTest {
         return body.data().accessToken();
     }
 
-    private InviteToken saveValidInviteToken(String email, UUID salonId, String rawToken) {
-        var token = new InviteToken(
+    private InviteToken saveValidInviteToken(String phone, UUID salonId, String rawToken) {
+        var token = InviteToken.forPhone(
                 sha256Hex(rawToken),
-                email,
+                phone,
                 salonId,
                 Role.SALON_MASTER,
-                Instant.now().plusSeconds(3600)
+                Instant.now().plusSeconds(3600),
+                null
         );
         return inviteTokenRepository.save(token);
     }

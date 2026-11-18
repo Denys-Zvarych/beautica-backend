@@ -1,6 +1,9 @@
 package com.beautica.auth;
 
 import com.beautica.auth.dto.VerifyPasswordResetOtpRequest;
+import com.beautica.auth.phoneotp.PhoneOtpPurpose;
+import com.beautica.auth.phoneotp.PhoneOtpService;
+import com.beautica.common.util.UaMobilePhone;
 import com.beautica.common.exception.VerificationException;
 import com.beautica.config.PasswordResetOtpPolicyConfig;
 import com.beautica.user.PasswordResetTicket;
@@ -15,6 +18,7 @@ import java.security.MessageDigest;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.Locale;
+import java.util.Optional;
 import java.util.UUID;
 
 /**
@@ -62,18 +66,21 @@ public class PasswordResetOtpProcessor {
     private final TokenGenerator tokenGenerator;
     private final Clock clock;
     private final PasswordResetOtpPolicyConfig passwordResetOtpPolicy;
+    private final PhoneOtpService phoneOtpService;
 
     public PasswordResetOtpProcessor(
             UserRepository userRepository,
             PasswordResetTicketRepository passwordResetTicketRepository,
             TokenGenerator tokenGenerator,
             Clock clock,
-            PasswordResetOtpPolicyConfig passwordResetOtpPolicy) {
+            PasswordResetOtpPolicyConfig passwordResetOtpPolicy,
+            PhoneOtpService phoneOtpService) {
         this.userRepository = userRepository;
         this.passwordResetTicketRepository = passwordResetTicketRepository;
         this.tokenGenerator = tokenGenerator;
         this.clock = clock;
         this.passwordResetOtpPolicy = passwordResetOtpPolicy;
+        this.phoneOtpService = phoneOtpService;
     }
 
     /**
@@ -88,7 +95,11 @@ public class PasswordResetOtpProcessor {
      */
     @Transactional(noRollbackFor = VerificationException.class)
     public String verifyAndIssueTicket(VerifyPasswordResetOtpRequest request) {
-        String email = request.email().toLowerCase(Locale.ROOT).strip();
+        String identifier = request.resolvedIdentifier();
+        if (!identifier.contains("@")) {
+            return verifyByPhone(identifier, request.code());
+        }
+        String email = identifier.toLowerCase(Locale.ROOT).strip();
         // Pessimistic write lock serializes concurrent OTP submissions for the same
         // account, preventing attempt-counter double-spend.
         var userOpt = userRepository.findByEmailForUpdate(email);
@@ -100,7 +111,44 @@ public class PasswordResetOtpProcessor {
             throw new VerificationException(VerificationException.Code.INVALID_CODE);
         }
 
-        var user = userOpt.get();
+        return verifyEmailedCode(userOpt.get(), request.code());
+    }
+
+    /**
+     * B516 (AUTH-12, AUTH-D18) — a phone identifier: the code is wherever forgot-password sent it for THIS account —
+     * the emailed code in the user columns when the account has a confirmed email, else the SMS code in
+     * {@code phone_otps} ({@link PhoneOtpPurpose#PASSWORD_RESET}; per-code attempt cap there, recorded in its own
+     * transaction). Unknown / unverified / unparseable phone → the same decoy + {@code INVALID_CODE} as an unknown
+     * email.
+     */
+    private String verifyByPhone(String identifier, String code) {
+        Optional<String> phone = UaMobilePhone.parse(identifier);
+        Optional<User> userOpt = phone.flatMap(userRepository::findByVerifiedPhoneForUpdate);
+        if (userOpt.isEmpty()) {
+            decoyCompare();
+            throw new VerificationException(VerificationException.Code.INVALID_CODE);
+        }
+        User user = userOpt.get();
+        if (user.hasConfirmedEmail()) {
+            return verifyEmailedCode(user, code);
+        }
+        if (isLocked(user)) {
+            // A locked account refuses even a correct code, with the same work as a wrong-code attempt.
+            decoyCompare();
+            throw new VerificationException(VerificationException.Code.INVALID_CODE);
+        }
+        if (!phoneOtpService.consumeCode(phone.get(), code, PhoneOtpPurpose.PASSWORD_RESET)) {
+            // Same resend-surviving cumulative bound as the emailed code (commits through noRollbackFor): the per-code
+            // cap alone would let a fresh SMS every window reopen the guess budget.
+            registerCumulativeFailure(user);
+            throw new VerificationException(VerificationException.Code.INVALID_CODE);
+        }
+        clearCumulativeFailures(user);
+        return mintTicket(user.getId());
+    }
+
+    /** The pre-B516 critical section on an already row-locked account whose code was emailed. */
+    private String verifyEmailedCode(User user, String code) {
 
         // Cumulative lock check first. While locked, reject with the generic INVALID_CODE —
         // no distinct status/body/code that would leak lock state. Timing-oracle defense:
@@ -143,7 +191,7 @@ public class PasswordResetOtpProcessor {
         }
         user.setPasswordResetAttempts((short) (user.getPasswordResetAttempts() + 1));
 
-        String incomingHash = tokenGenerator.hashOtp(request.code());
+        String incomingHash = tokenGenerator.hashOtp(code);
         boolean match = MessageDigest.isEqual(
                 incomingHash.getBytes(StandardCharsets.UTF_8),
                 user.getPasswordResetCodeHash().getBytes(StandardCharsets.UTF_8));
@@ -160,8 +208,7 @@ public class PasswordResetOtpProcessor {
         user.setPasswordResetCodeHash(null);
         user.setPasswordResetCodeExpiresAt(null);
         user.setPasswordResetAttempts((short) 0);
-        user.setPasswordResetFailedTotal((short) 0);
-        user.setPasswordResetLockedUntil(null);
+        clearCumulativeFailures(user);
 
         return mintTicket(user.getId());
     }
@@ -181,6 +228,12 @@ public class PasswordResetOtpProcessor {
         MessageDigest.isEqual(
                 decoyIncoming.getBytes(StandardCharsets.UTF_8),
                 DECOY_HASH.getBytes(StandardCharsets.UTF_8));
+    }
+
+    /** A proven code ends the cumulative failure streak (both channels). */
+    private static void clearCumulativeFailures(User user) {
+        user.setPasswordResetFailedTotal((short) 0);
+        user.setPasswordResetLockedUntil(null);
     }
 
     private void registerCumulativeFailure(User user) {

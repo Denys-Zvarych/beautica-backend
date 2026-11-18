@@ -42,22 +42,6 @@ class InviteTokenRevocationIndexMigrationTest extends AbstractIntegrationTest {
             "SELECT * FROM invite_tokens WHERE salon_id = '00000000-0000-0000-0000-000000000001'::uuid "
                     + "ORDER BY created_at DESC, id DESC LIMIT 200";
 
-    /**
-     * The dispatch idempotency lookup, exactly as
-     * {@code findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull} renders it.
-     */
-    private static final String DISPATCH_SQL =
-            "SELECT * FROM invite_tokens WHERE email = 'probe@beautica.test' "
-                    + "AND salon_id = '00000000-0000-0000-0000-000000000001'::uuid "
-                    + "AND is_used = false AND revoked_at IS NULL";
-
-    /**
-     * Control: the same lookup plus one predicate the index cannot cover, which MUST therefore
-     * appear as a residual {@code Filter}. Without it, "no Filter line" could just mean EXPLAIN
-     * never prints Filter lines for this table.
-     */
-    private static final String DISPATCH_RESIDUAL_SQL = DISPATCH_SQL + " AND role = 'SALON_ADMIN'";
-
     /** Control: same table, same shape, an ORDER BY this index cannot serve. */
     private static final String UNSERVEABLE_SQL =
             "SELECT * FROM invite_tokens WHERE salon_id = '00000000-0000-0000-0000-000000000001'::uuid "
@@ -220,69 +204,16 @@ class InviteTokenRevocationIndexMigrationTest extends AbstractIntegrationTest {
     }
 
     /**
-     * P2. V16's {@code idx_invite_tokens_email_used (email, is_used)} was adequate only while an
-     * expired invite displaced by a re-invite was HARD-DELETED. V153 retains those rows as
-     * SUPERSEDED history and a SUPERSEDED row keeps {@code is_used = false}, so under V16's shape
-     * every past invite for a churned address was fetched and then discarded by
-     * {@code revoked_at IS NULL} as a residual filter — measured at
-     * {@code Rows Removed by Filter: 50} after 50 re-invites of one address, growing linearly.
-     * The retention change is what created the cost, so the index fix ships in the same migration.
+     * V153 replaced V16's {@code idx_invite_tokens_email_used} with a partial
+     * {@code idx_invite_tokens_email_active}; B520's V251 then dropped that one too, because its only reader (the email
+     * dispatch-idempotency lookup) left with the email invite path. Neither may come back.
      */
     @Test
-    @DisplayName("V153 — idx_invite_tokens_email_used is REPLACED by a partial "
-            + "idx_invite_tokens_email_active on (email, salon_id)")
-    void should_replaceTheEmailIndexWithAPartialActiveIndex_when_v153Applied() {
+    @DisplayName("V153 + V251 — neither email lookup index survives: V16's is dropped by V153, V153's by V251")
+    void should_haveNoEmailLookupIndex_when_v251Applied() {
         assertThat(indexNamesOnInviteTokens())
-                .as("V16's index must be dropped, not left alongside — two indexes serving one "
-                        + "lookup is pure write amplification on every invite dispatch")
-                .doesNotContain(RETIRED_EMAIL_INDEX);
-
-        String indexDef = indexDefinitionOf(EMAIL_ACTIVE_INDEX);
-        assertThat(indexDef)
-                .as("the dispatch lookup needs a NON-expression index: Postgres cannot answer a "
-                        + "bare `email = ?` from ux_invite_tokens_active's lower(email) key")
-                .isNotNull();
-        assertThat(indexDef)
-                .as("salon_id joins email in the KEY so the equality half of the predicate is fully "
-                        + "an Index Cond — def: %s", indexDef)
-                .containsPattern("\\(email[^)]*salon_id\\)");
-        assertThat(indexDef)
-                .as("both booleans belong in the PREDICATE, not the key: a row leaves the live set "
-                        + "permanently once accepted/cancelled/superseded, so the index stays a "
-                        + "handful of rows instead of growing with every invite ever sent — def: %s",
-                        indexDef)
-                .containsIgnoringCase("WHERE")
-                .containsIgnoringCase("is_used = false")
-                .containsIgnoringCase("revoked_at IS NULL");
-    }
-
-    /**
-     * The behavioural half of the assertion above: the whole dispatch predicate must resolve
-     * inside the index, leaving NO residual {@code Filter}. That is precisely what V16's shape
-     * could not do, and the residual is what accumulated with churn. The control query adds one
-     * uncovered predicate and must show a Filter, so a green result here cannot come from EXPLAIN
-     * simply never printing Filter lines.
-     */
-    @Test
-    @DisplayName("V153 — the dispatch lookup resolves entirely as an Index Cond with no residual "
-            + "filter, while the same query plus an uncovered predicate keeps one")
-    void should_serveTheDispatchLookupWithNoResidualFilter_when_v153Applied() {
-        Plans plans = explainPair(DISPATCH_SQL, DISPATCH_RESIDUAL_SQL);
-
-        assertThat(plans.history())
-                .as("the dispatch lookup must ride the partial index. Plan:%n%s", plans.history())
-                .contains(EMAIL_ACTIVE_INDEX);
-        assertThat(plans.history())
-                .as("no residual Filter: every clause is either an Index Cond or implied by the "
-                        + "index predicate. A Filter line here means superseded history rows are "
-                        + "being fetched and thrown away, without bound. Plan:%n%s", plans.history())
-                .doesNotContain("Filter:");
-
-        assertThat(plans.control())
-                .as("CONTROL — `role = ?` is in neither the key nor the predicate, so this plan "
-                        + "MUST carry a Filter. If it does not, the assertion above proves nothing. "
-                        + "Plan:%n%s", plans.control())
-                .contains("Filter:");
+                .doesNotContain(RETIRED_EMAIL_INDEX)
+                .doesNotContain(EMAIL_ACTIVE_INDEX);
     }
 
     // ── helpers ────────────────────────────────────────────────────────────────

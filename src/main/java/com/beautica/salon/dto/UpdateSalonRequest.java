@@ -51,6 +51,11 @@ import java.util.UUID;
 public record UpdateSalonRequest(
         @Size(max = 255, message = "Name must be at most 255 characters")
         @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "Name must not contain control characters")
+        // B520 audit-fix 2: invisible format characters (soft hyphen, zero-width space, word joiner, bidi marks) are
+        // rejected too — the salon name is rendered into the staff invite SMS, where they could hide a domain.
+        // Audit-fix 3 (SAL-50 "except emoji joiners"): ZWJ U+200D / ZWNJ U+200C stay allowed so emoji sequences
+        // like 👩‍🎨 survive. Written as one class (any non-Cf, or the two joiners) — no per-char alternation.
+        @Pattern(regexp = "^[\\P{Cf}\\u200C\\u200D]*$", message = "Name must not contain invisible format characters")
         String name,
         @Size(max = 2000, message = "Description must be at most 2000 characters")
         @Pattern(regexp = "^[^\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F\\x7F]*$",

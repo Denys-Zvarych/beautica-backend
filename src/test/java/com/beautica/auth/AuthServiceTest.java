@@ -98,6 +98,11 @@ class AuthServiceTest {
     @Mock
     private AccessTokenDenylist accessTokenDenylist;
 
+    @Mock
+    private PhoneRegistrationService phoneRegistrationService;
+
+    private final LoginFailureLimiter loginFailureLimiter = new LoginFailureLimiter(java.time.Clock.systemUTC());
+
     private PasswordEncoder passwordEncoder;
     private AuthService authService;
     // Inline synchronous TaskExecutor: runs the Runnable on the calling thread so
@@ -113,6 +118,7 @@ class AuthServiceTest {
 
     // Mirrors AuthService.OTP_TTL — used to construct expiresAt in stubs.
     private static final Duration OTP_TTL = Duration.ofMinutes(15);
+    private static final String CLIENT_IP = "203.0.113.7";
 
     // Resend cooldown used for unit-test VerificationPolicyConfig instances.
     // Tests that need the cooldown elapsed use deltas > 60 s; tests within cooldown use < 60 s.
@@ -151,7 +157,9 @@ class AuthServiceTest {
                 emailVerificationProcessor,
                 verificationPolicyConfig,
                 jwtTokenProvider,
-                accessTokenDenylist
+                accessTokenDenylist,
+                phoneRegistrationService,
+                loginFailureLimiter
         );
         // AuthService#revokeFamilyIndependently is called through the `self` proxy field so its
         // REQUIRES_NEW propagation is honoured in production (Spring AOP self-invocation bypass
@@ -286,7 +294,7 @@ class AuthServiceTest {
         when(authResponseBuilder.buildAuthResponse(any(User.class))).thenReturn(stubResponse);
 
         log.debug("Act: login with correct credentials for SALON_OWNER email=login@example.com");
-        var response = authService.login(new LoginRequest("login@example.com", rawPassword));
+        var response = authService.login(new LoginRequest("login@example.com", rawPassword), CLIENT_IP);
 
         assertThat(response.email()).isEqualTo("login@example.com");
         assertThat(response.role()).isEqualTo(Role.SALON_OWNER);
@@ -303,7 +311,7 @@ class AuthServiceTest {
         when(userRepository.findByEmail("u@example.com")).thenReturn(Optional.of(user));
 
         log.debug("Act: login with wrong password for existing email u@example.com");
-        assertThatThrownBy(() -> authService.login(new LoginRequest("u@example.com", "wrongPass")))
+        assertThatThrownBy(() -> authService.login(new LoginRequest("u@example.com", "wrongPass"), CLIENT_IP))
                 .isInstanceOf(BusinessException.class)
                 .hasMessageContaining("Invalid email or password");
     }
@@ -315,7 +323,7 @@ class AuthServiceTest {
         when(userRepository.findByEmail(anyString())).thenReturn(Optional.empty());
 
         log.debug("Act: login with email no@example.com that has no matching user");
-        assertThatThrownBy(() -> authService.login(new LoginRequest("no@example.com", "pass")))
+        assertThatThrownBy(() -> authService.login(new LoginRequest("no@example.com", "pass"), CLIENT_IP))
                 .isInstanceOf(BusinessException.class)
                 .hasMessageContaining("Invalid email or password");
     }
@@ -333,7 +341,7 @@ class AuthServiceTest {
         when(userRepository.findByEmail("inactive@example.com")).thenReturn(Optional.of(user));
 
         log.debug("Act: login with correct credentials for inactive account inactive@example.com");
-        assertThatThrownBy(() -> authService.login(new LoginRequest("inactive@example.com", rawPassword)))
+        assertThatThrownBy(() -> authService.login(new LoginRequest("inactive@example.com", rawPassword), CLIENT_IP))
                 .isInstanceOf(BusinessException.class)
                 .extracting(ex -> ((BusinessException) ex).getStatus())
                 .isEqualTo(org.springframework.http.HttpStatus.UNAUTHORIZED);
@@ -1090,7 +1098,7 @@ class AuthServiceTest {
         ReflectionTestUtils.setField(user, "isActive", true);
         when(userRepository.findByEmail(TEST_EMAIL)).thenReturn(Optional.of(user));
 
-        assertThatThrownBy(() -> authService.login(new LoginRequest(TEST_EMAIL, "correctpassword")))
+        assertThatThrownBy(() -> authService.login(new LoginRequest(TEST_EMAIL, "correctpassword"), CLIENT_IP))
                 .isInstanceOf(EmailNotVerifiedException.class)
                 .satisfies(ex -> assertThat(((EmailNotVerifiedException) ex).getEmail()).isEqualTo(TEST_EMAIL));
     }
@@ -1105,7 +1113,7 @@ class AuthServiceTest {
         ReflectionTestUtils.setField(user, "isActive", true);
         when(userRepository.findByEmail(TEST_EMAIL)).thenReturn(Optional.of(user));
 
-        assertThatThrownBy(() -> authService.login(new LoginRequest(TEST_EMAIL, "wrongpassword")))
+        assertThatThrownBy(() -> authService.login(new LoginRequest(TEST_EMAIL, "wrongpassword"), CLIENT_IP))
                 .isInstanceOf(BusinessException.class)
                 .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
                         .isEqualTo(org.springframework.http.HttpStatus.UNAUTHORIZED));
@@ -1124,7 +1132,7 @@ class AuthServiceTest {
         when(userRepository.findByEmail(TEST_EMAIL)).thenReturn(Optional.of(user));
         when(authResponseBuilder.buildAuthResponse(any(User.class))).thenReturn(stubResponse);
 
-        AuthResponse response = authService.login(new LoginRequest(TEST_EMAIL, "correctpassword"));
+        AuthResponse response = authService.login(new LoginRequest(TEST_EMAIL, "correctpassword"), CLIENT_IP);
 
         assertThat(response.accessToken()).isEqualTo("access-token");
     }
@@ -1139,7 +1147,7 @@ class AuthServiceTest {
         ReflectionTestUtils.setField(user, "isActive", false);
         when(userRepository.findByEmail(TEST_EMAIL)).thenReturn(Optional.of(user));
 
-        assertThatThrownBy(() -> authService.login(new LoginRequest(TEST_EMAIL, "correctpassword")))
+        assertThatThrownBy(() -> authService.login(new LoginRequest(TEST_EMAIL, "correctpassword"), CLIENT_IP))
                 .isInstanceOf(BusinessException.class)
                 .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
                         .isEqualTo(org.springframework.http.HttpStatus.UNAUTHORIZED));
@@ -1155,7 +1163,7 @@ class AuthServiceTest {
         ReflectionTestUtils.setField(user, "isActive", true);
         when(userRepository.findByEmail(TEST_EMAIL)).thenReturn(Optional.of(user));
 
-        assertThatThrownBy(() -> authService.login(new LoginRequest(TEST_EMAIL, "pass")))
+        assertThatThrownBy(() -> authService.login(new LoginRequest(TEST_EMAIL, "pass"), CLIENT_IP))
                 .isInstanceOf(EmailNotVerifiedException.class)
                 .satisfies(ex -> {
                     assertThat(((EmailNotVerifiedException) ex).getEmail()).isEqualTo(TEST_EMAIL);
@@ -1212,7 +1220,9 @@ class AuthServiceTest {
                 emailVerificationProcessor,
                 verificationPolicyConfig,
                 jwtTokenProvider,
-                accessTokenDenylist
+                accessTokenDenylist,
+                phoneRegistrationService,
+                loginFailureLimiter
         );
 
         when(userRepository.existsByEmail("reject@example.com")).thenReturn(false);
@@ -1256,7 +1266,9 @@ class AuthServiceTest {
                 emailVerificationProcessor,
                 verificationPolicyConfig,
                 jwtTokenProvider,
-                accessTokenDenylist
+                accessTokenDenylist,
+                phoneRegistrationService,
+                loginFailureLimiter
         );
 
         when(userRepository.existsByEmail("logreject@example.com")).thenReturn(false);

@@ -425,20 +425,6 @@ class EmailTemplateRenderingTest {
                 .isGreaterThan(cancellationLabelIdx);
     }
 
-    @Test
-    @DisplayName("invite-master template renders inviteUrl in href attribute")
-    void should_renderInviteUrlInHref_when_inviteMasterTemplateProcessed() {
-        var inviteUrl = "https://beautica.app/invite/accept?token=abc-123";
-        var ctx = new Context();
-        ctx.setVariable("salonName", "Glamour Studio");
-        ctx.setVariable("inviteUrl", inviteUrl);
-
-        String html = templateEngine.process("email/invite-master", ctx);
-
-        assertThat(html).contains("href=\"" + inviteUrl + "\"");
-        assertThat(html).contains("Glamour Studio");
-    }
-
     // ── reset-password-otp template ───────────────────────────────────────────
 
     @Test
@@ -533,48 +519,6 @@ class EmailTemplateRenderingTest {
                 .contains("15 хвилин");
     }
 
-    // ── invite (owner invite) template ────────────────────────────────────────
-
-    @Test
-    @DisplayName("invite — @{${inviteLink}} renders https:// href and salonName and expiresHours")
-    void should_renderInviteLinkAndSalonName_when_inviteTemplateProcessed() {
-        var inviteLink = "https://beautica.app/invite/accept?token=xyz-owner-invite";
-        var ctx = new Context();
-        ctx.setVariable("inviteLink", inviteLink);
-        ctx.setVariable("salonName", "Stella Beauty");
-        ctx.setVariable("expiresHours", 48L);
-
-        String html = templateEngine.process("email/invite", ctx);
-
-        assertThat(html)
-                .as("rendered href must equal the https:// invite link")
-                .contains("href=\"" + inviteLink + "\"");
-        assertThat(html)
-                .as("rendered body must contain the salon name")
-                .contains("Stella Beauty");
-        assertThat(html)
-                .as("rendered body must contain the expiry hours value")
-                .contains("48");
-    }
-
-    @Test
-    @DisplayName("invite — rendered HTML contains no raw Thymeleaf syntax (no ${ or th:)")
-    void should_notContainRawThymeleafSyntax_when_inviteTemplateProcessed() {
-        var ctx = new Context();
-        ctx.setVariable("inviteLink", "https://beautica.app/invite/accept?token=tok");
-        ctx.setVariable("salonName", "Test Salon");
-        ctx.setVariable("expiresHours", 72L);
-
-        String html = templateEngine.process("email/invite", ctx);
-
-        assertThat(html)
-                .as("rendered template must not contain unresolved Thymeleaf expression '\\${'")
-                .doesNotContain("${");
-        assertThat(html)
-                .as("rendered template must not contain unresolved Thymeleaf attribute like 'th:text' or 'th:href'")
-                .doesNotContainPattern("th:[a-z]");
-    }
-
     // ── closure-reminder template (Phase 29.5) ──────────────────────────────────
 
     @Test
@@ -648,7 +592,7 @@ class EmailTemplateRenderingTest {
     private static final String HEAD_LOGO_ATTR = "<img src=\"cid:beauticaLogo\"";
     private static final List<String> LOGO_TEMPLATES = List.of("booking-cancelled-provider", "booking-confirmed",
             "booking-declined", "booking-rescheduled-client", "booking-rescheduled-provider", "closure-reminder",
-            "invite-master", "invite", "master-removed", "new-booking", "reset-password-otp", "review-request",
+            "master-removed", "new-booking", "reset-password-otp", "review-request",
             "salon-closed", "verify-email");
 
     private static String source(String template) throws java.io.IOException {
@@ -679,7 +623,6 @@ class EmailTemplateRenderingTest {
         ctx.setVariable("newStartsAt", "10:00, 20 травня 2026");
         ctx.setVariable("visitHeader", ServiceLineExpectedCopy.VISIT_HEADER);
         ctx.setVariable("salonName", "Aurora");
-        ctx.setVariable("inviteUrl", "https://beautica.app/invite/t");
         ctx.setVariable("reviewUrl", "https://beautica.app/review/t");
         ctx.setVariable("bookingUrl", "https://beautica.app/bookings/t");
         ctx.setVariable("code", "123456");

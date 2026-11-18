@@ -1,5 +1,6 @@
 package com.beautica.salon;
 
+import com.beautica.support.StaffInviteFixtures;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.auth.InvitePersistenceService;
 import com.beautica.auth.Role;
@@ -19,7 +20,6 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
-import org.mockito.ArgumentCaptor;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.mock.mockito.SpyBean;
 import org.springframework.boot.test.web.client.TestRestTemplate;
@@ -30,18 +30,11 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
-import java.net.URLDecoder;
-import java.nio.charset.StandardCharsets;
-import java.time.Instant;
 import java.time.OffsetDateTime;
-import java.util.List;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
-import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.anyString;
-import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 
@@ -191,27 +184,31 @@ class AdminRemovalHardDeleteIT extends AbstractIntegrationTest {
     // ── case 5 — the promised re-invite actually works (Phase 296 acceptance shape) ─────────
 
     @Test
-    @DisplayName("case 5 — the removed admin's email can be re-invited to the SAME salon and the "
+    @DisplayName("case 5 — the removed admin's phone can be re-invited to the SAME salon and the "
             + "invite is accepted end to end — the capability the old javadoc promised and did not "
-            + "deliver")
+            + "deliver (B520: keyed by the verified phone, AUTH-19)")
     void should_allowReInviteToSameSalon_when_adminRemoved() {
         Admin admin = createSalonWithAdmin();
-        String adminEmail = fx.emailOf(admin.adminUserId());
+        String adminPhone = StaffInviteFixtures.newPhone();
+        jdbcTemplate.update("UPDATE users SET phone_number = ?, phone_verified_at = NOW() WHERE id = ?",
+                adminPhone, admin.adminUserId());
 
         salonService.removeAdmin(admin.ownerId(), admin.salonId(), admin.adminUserId());
 
-        salonService.inviteMaster(admin.ownerId(), admin.salonId(), adminEmail, Role.SALON_ADMIN);
-        String rawToken = lastCapturedRawToken();
+        salonService.inviteMaster(admin.ownerId(), admin.salonId(), adminPhone, Role.SALON_ADMIN);
+        String rawToken = StaffInviteFixtures.lastRawInviteToken(invitePersistenceService);
         ResponseEntity<String> accepted = restTemplate.postForEntity(
                 "/api/v1/auth/invite/accept",
-                new InviteAcceptRequest(rawToken, "N0vaP@rol9x!", "Нова", "Особа", "+380501234567"),
+                new InviteAcceptRequest(rawToken, "N0vaP@rol9x!", "Нова", "Особа", null, null, null, null,
+                        StaffInviteFixtures.seedRegistrationTicket(jdbcTemplate, adminPhone)),
                 String.class);
 
         assertThat(accepted.getStatusCode())
-                .as("acceptance criterion — the whole point of the hard delete: existsByEmail no "
-                        + "longer blocks a fresh invite for this address")
+                .as("acceptance criterion — the whole point of the hard delete: the verified phone no "
+                        + "longer blocks a fresh invite for this person")
                 .isEqualTo(HttpStatus.CREATED);
-        UUID newUserId = userIdOf(adminEmail);
+        UUID newUserId = jdbcTemplate.queryForObject("SELECT id FROM users WHERE phone_number = ?", UUID.class,
+                adminPhone);
         assertThat(newUserId).isNotEqualTo(admin.adminUserId());
         assertThat(userRole(newUserId)).isEqualTo("SALON_ADMIN");
         assertThat(userSalonId(newUserId)).isEqualTo(admin.salonId());
@@ -536,21 +533,6 @@ class AdminRemovalHardDeleteIT extends AbstractIntegrationTest {
     }
 
     /**
-     * The last raw invite token minted in this test — see
-     * {@code SalonStaffReinviteAfterDeletionIT#lastCapturedRawToken}'s identical rationale.
-     */
-    private String lastCapturedRawToken() {
-        ArgumentCaptor<String> linkCaptor = ArgumentCaptor.forClass(String.class);
-        verify(invitePersistenceService, atLeastOnce()).persistInviteAndEnqueue(
-                anyString(), any(UUID.class), any(Role.class), any(Instant.class),
-                anyString(), linkCaptor.capture(), anyString());
-        List<String> links = linkCaptor.getAllValues();
-        String link = links.get(links.size() - 1);
-        String encoded = link.substring(link.indexOf("token=") + "token=".length());
-        return URLDecoder.decode(encoded, StandardCharsets.UTF_8);
-    }
-
-    /**
      * Logs in and returns the FULL {@link AuthResponse} (access + refresh token) — unlike
      * {@link SalonItFixtures#loginAndGetToken}, which discards the refresh token, cases 13-14 need
      * it to prove a denied removal left the target's outstanding session fully intact.
@@ -583,10 +565,6 @@ class AdminRemovalHardDeleteIT extends AbstractIntegrationTest {
     private UUID bookingCreatedByUserId(UUID bookingId) {
         return jdbcTemplate.queryForObject(
                 "SELECT created_by_user_id FROM bookings WHERE id = ?", UUID.class, bookingId);
-    }
-
-    private UUID userIdOf(String email) {
-        return jdbcTemplate.queryForObject("SELECT id FROM users WHERE email = ?", UUID.class, email);
     }
 
     private String userRole(UUID userId) {

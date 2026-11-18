@@ -9,6 +9,8 @@ import com.beautica.notification.entity.OutboxStatus;
 import com.beautica.notification.inapp.push.InAppPushDispatcher;
 import com.beautica.notification.repository.NotificationOutboxRepository;
 import com.beautica.notification.sms.SmsBackpressureException;
+import com.beautica.notification.sms.SmsDeliveryAmbiguousException;
+import com.beautica.notification.sms.SmsDeliveryException;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -68,12 +70,24 @@ public class NotificationOutboxDrainWorker {
      * {@link #SMS_BACKPRESSURE_DEFER_SECONDS}): the deferred rows are simply retried on the next
      * tick, where the first of them is the probe that decides whether the breaker trips again.
      *
-     * <p>Only transient relay failures ({@link EmailDeliveryException#isTransientSmtp()}) count; a
-     * permanent local error (template render) fails its row but neither counts nor resets the streak.
+     * <p>Only transient relay failures ({@link EmailDeliveryException#isTransientSmtp()}) count; a permanent local
+     * error (template render, a refused recipient) fails its row but neither counts nor resets the streak. Transient
+     * SMS failures have their own breaker ({@link #SMS_BREAKER_THRESHOLD}).
      * Push rows are never deferred, and {@code claimPendingBatch} claims {@code INAPP_PUSH} rows
      * before e-mail rows, so a deferred e-mail backlog cannot starve them out of the batch.
      */
     static final int EMAIL_BREAKER_THRESHOLD = 3;
+
+    /**
+     * B520 audit-fix cycle 2 — the SMS twin of {@link #EMAIL_BREAKER_THRESHOLD}: after this many CONSECUTIVE transient
+     * {@link SmsDeliveryException}s of the synchronously sent staff invite, the batch's remaining SMS rows (INVITE rows
+     * and booking rows routed to guest SMS) are put back to {@code PENDING} with their attempts untouched. A separate
+     * streak, so an SMSClub outage defers only SMS rows and never the e-mail rows of the same batch.
+     */
+    static final int SMS_BREAKER_THRESHOLD = 3;
+
+    /** {@code last_error} of an INVITE row whose SMS outcome is unknown — finished SENT, never re-sent. */
+    static final String AMBIGUOUS_SMS_ERROR = "SMS outcome unknown; not retried";
 
     /**
      * Seconds an SMS-backpressure-deferred row stays unclaimable (phase 390 D11, V203
@@ -321,17 +335,29 @@ public class NotificationOutboxDrainWorker {
 
         List<EntryResult> results = new ArrayList<>(batch.size());
         int consecutiveEmailFailures = 0;
+        int consecutiveSmsFailures = 0;
         boolean emailBreakerTripped = false;
+        boolean smsBreakerTripped = false;
+        int deferredSmsRows = 0;
         boolean pushSaturated = false;
         boolean smsSaturated = false;
         int deferredEmailRows = 0;
         for (int i = 0; i < batch.size(); i++) {
             NotificationOutboxEntry entry = batch.get(i);
             boolean isPush = entry.getEventType() == OutboxEventType.INAPP_PUSH;
-            if (emailBreakerTripped && !isPush) {
-                // Breaker open: not a delivery failure, so no attempt is counted.
+            boolean isSyncSms = entry.getEventType() == OutboxEventType.INVITE;
+            // isSmsRow is in-memory (pre-loaded booking): checked once a breaker/saturation flag is up, or on success.
+            if (emailBreakerTripped && !isPush && !isSyncSms && !isSmsRow(entry, bookingCache)) {
+                // E-mail breaker open: not a delivery failure, so no attempt is counted. SMS rows (INVITE,
+                // guest-SMS booking rows) never touch the relay, so they keep going (B520 audit-fix cycle 3).
                 results.add(new EntryResult(entry, OutboxStatus.PENDING, entry.getAttempts(), entry.getLastError()));
                 deferredEmailRows++;
+                continue;
+            }
+            if (smsBreakerTripped && (isSyncSms || isSmsRow(entry, bookingCache))) {
+                // SMS breaker open: not a delivery failure, so no attempt is counted; e-mail rows keep going.
+                results.add(new EntryResult(entry, OutboxStatus.PENDING, entry.getAttempts(), entry.getLastError()));
+                deferredSmsRows++;
                 continue;
             }
             if (pushSaturated && isPush) {
@@ -355,8 +381,21 @@ public class NotificationOutboxDrainWorker {
             try {
                 dispatch(entry, bookingCache, visitSiblings, pushPlans, decisions);
                 results.add(new EntryResult(entry, OutboxStatus.SENT, entry.getAttempts(), null));
-                if (!isPush) {
+                if (isSyncSms) {
+                    consecutiveSmsFailures = 0;
+                } else if (!isPush && !isSmsRow(entry, bookingCache)) {
+                    // A guest-SMS booking row never touched the relay, so its success says nothing about e-mail
+                    // health; it resets neither counter (its async SMS outcome is not observed here).
                     consecutiveEmailFailures = 0;
+                }
+            } catch (SmsDeliveryAmbiguousException e) {
+                // B520 audit-fix cycle 2 (ReviewInviteSendJob precedent): the request was on the wire and SMSClub may
+                // already have billed and delivered it — a retry would be a duplicate paid SMS. Final: SENT, at most
+                // once. Still a provider stall, so it counts toward the SMS breaker.
+                results.add(new EntryResult(entry, OutboxStatus.SENT, entry.getAttempts() + 1, AMBIGUOUS_SMS_ERROR));
+                log.warn("Outbox SMS outcome unknown [{}], not retried: {}", entry.getId(), e.getClass().getSimpleName());
+                if (++consecutiveSmsFailures >= SMS_BREAKER_THRESHOLD) {
+                    smsBreakerTripped = true;
                 }
             } catch (SmsBackpressureException e) {
                 // Phase 390 (perf LOW-1): same shape as the push branch below — an SMS pushback must not
@@ -397,8 +436,11 @@ public class NotificationOutboxDrainWorker {
                 results.add(new EntryResult(entry, status, next, error));
                 log.warn("Outbox dispatch failed [{}] attempt {}/{}: {}",
                         entry.getId(), next, MAX_ATTEMPTS, e.getClass().getSimpleName());
-                if (e instanceof EmailDeliveryException ede && ede.isTransientSmtp()
-                        && ++consecutiveEmailFailures >= EMAIL_BREAKER_THRESHOLD) {
+                if (e instanceof SmsDeliveryException sde) {
+                    if (sde.isTransient() && ++consecutiveSmsFailures >= SMS_BREAKER_THRESHOLD) {
+                        smsBreakerTripped = true;
+                    }
+                } else if (isTransientEmailFailure(e) && ++consecutiveEmailFailures >= EMAIL_BREAKER_THRESHOLD) {
                     emailBreakerTripped = true;
                 }
             }
@@ -412,7 +454,18 @@ public class NotificationOutboxDrainWorker {
                     + "{} remaining e-mail rows of this batch re-queued without counting an attempt",
                     EMAIL_BREAKER_THRESHOLD, deferredEmailRows);
         }
+        if (smsBreakerTripped) {
+            meterRegistry.counter(METRIC_BREAKER_TRIPS).increment();
+            log.warn("Outbox SMS circuit breaker tripped after {} consecutive delivery failures; "
+                    + "{} remaining SMS rows of this batch re-queued without counting an attempt",
+                    SMS_BREAKER_THRESHOLD, deferredSmsRows);
+        }
         return results;
+    }
+
+    /** Whether a dispatch failure is a transient e-mail relay failure, the only kind the e-mail breaker counts. */
+    private static boolean isTransientEmailFailure(Exception e) {
+        return e instanceof EmailDeliveryException ede && ede.isTransientSmtp();
     }
 
     /** One counted failed attempt: PENDING for a retry, DEAD once {@code MAX_ATTEMPTS} is reached. */
@@ -672,24 +725,29 @@ public class NotificationOutboxDrainWorker {
                             claimedAt == null ? null : Instant.ofEpochSecond(claimedAt));
                 }
             }
-            case INVITE -> {
-                Map<String, String> p = readJson(entry.getPayload());
-                // Decrypt inviteUrlSealed from payload (Phase 5.4a cipher); aggregateId is the
-                // invite_tokens row UUID for traceability only — the URL itself is derived from
-                // the sealed payload field, not from aggregateId.
-                String sealedUrl = p.get("inviteUrlSealed");
-                if (sealedUrl == null || sealedUrl.isBlank()) {
-                    throw new IllegalStateException(
-                            "INVITE outbox payload missing inviteUrlSealed (entry " + entry.getId() + ")");
-                }
-                String inviteUrl = cipher.open(sealedUrl);
-                notificationService.sendInviteEmail(
-                        p.get("email"),
-                        inviteUrl,
-                        p.get("salonName")
-                );
-            }
+            case INVITE -> dispatchStaffInvite(entry);
         }
+    }
+
+    /**
+     * B520 (NTF-59) — the staff invite SMS. Phone and link are opened from the sealed payload ({@code aggregate_id} is
+     * the invite row, traceability only). A pre-B520 row (no {@code phoneSealed}) is a retired e-mail invite: email
+     * invites stop working at deploy (AUTH-D16), so it is finished as a no-op (SENT) rather than retried to DEAD.
+     */
+    private void dispatchStaffInvite(NotificationOutboxEntry entry) {
+        Map<String, String> p = readJson(entry.getPayload());
+        String sealedPhone = p.get(NotificationOutboxService.INVITE_PHONE_SEALED);
+        if (sealedPhone == null || sealedPhone.isBlank()) {
+            log.info("Skipping INVITE entry [{}]: retired e-mail invite (B520)", entry.getId());
+            return;
+        }
+        String sealedUrl = p.get(NotificationOutboxService.INVITE_URL_SEALED);
+        if (sealedUrl == null || sealedUrl.isBlank()) {
+            throw new IllegalStateException(
+                    "INVITE outbox payload missing inviteUrlSealed (entry " + entry.getId() + ")");
+        }
+        notificationService.sendStaffInviteSms(cipher.open(sealedPhone), cipher.open(sealedUrl),
+                p.get(NotificationOutboxService.INVITE_SALON_NAME));
     }
 
     /**
