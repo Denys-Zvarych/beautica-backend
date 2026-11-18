@@ -18,6 +18,7 @@ import lombok.Builder;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
+import org.hibernate.annotations.BatchSize;
 import org.springframework.lang.Nullable;
 
 import java.time.LocalDate;
@@ -49,6 +50,13 @@ import java.util.UUID;
 @AllArgsConstructor
 @Builder
 public class WeeklySchedule extends AuditableEntity {
+
+    /**
+     * Keys per {@link #discreteTimes} batch-fetch statement: twice the strict search candidate cap
+     * (2 000 masters), so a capped resolve with up to two overlapping templates per master
+     * hydrates every template's times in one statement.
+     */
+    public static final int DISCRETE_TIMES_BATCH_SIZE = 4096;
 
     @Id
     @GeneratedValue(strategy = GenerationType.UUID)
@@ -86,7 +94,15 @@ public class WeeklySchedule extends AuditableEntity {
      * extra batched query per fold (never one per date) and avoids the cartesian product a second
      * fetch-join would multiply in. Mode exclusivity (a day is EITHER in {@code intervals} OR here) is a
      * service-layer invariant.
+     *
+     * <p><b>Batch size {@value #DISCRETE_TIMES_BATCH_SIZE}, not the default 50 (B523 perf gate).</b>
+     * The strict search verdict folds the templates of up to 2 000 masters in one batch
+     * ({@code StrictBookableResolver.CANDIDATE_CAP}); at 50 keys per statement that hydration cost 40
+     * statements, growing with the candidate count. Hibernate binds the batch as ONE array parameter
+     * ({@code schedule_id = any (?)}), so a large batch size adds no SQL text: up to 50 schedules the
+     * statement is the same single query as before, and a capped search pays ONE.
      */
+    @BatchSize(size = DISCRETE_TIMES_BATCH_SIZE)
     @OneToMany(
             mappedBy = "schedule",
             cascade = CascadeType.ALL,

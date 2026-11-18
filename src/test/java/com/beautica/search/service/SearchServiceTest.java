@@ -42,6 +42,7 @@ import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -109,6 +110,11 @@ class SearchServiceTest {
     @Mock
     private CacheManager cacheManager;
 
+    // SRCH-30/31 strict verdict. Stubbed in setUp() to a non-empty set so every pre-existing test
+    // still reaches the main query; the strict-gate tests below override it.
+    @Mock
+    private StrictBookableResolver strictBookableResolver;
+
     private SearchService service;
 
     private ArgumentCaptor<String> sqlCaptor;
@@ -117,7 +123,8 @@ class SearchServiceTest {
     void setUp() {
         service = new SearchService(
                 salonRepository, discoveryLocationResolver, serviceTypeSlugResolver,
-                platformCategoryLabelResolver, cacheManager, new ScheduleDateMath(FIXED_CLOCK));
+                platformCategoryLabelResolver, cacheManager, new ScheduleDateMath(FIXED_CLOCK),
+                strictBookableResolver);
         ReflectionTestUtils.setField(service, "entityManager", entityManager);
         sqlCaptor = ArgumentCaptor.forClass(String.class);
         // The seam passes through the (cityId, districtId) pair by default;
@@ -135,6 +142,8 @@ class SearchServiceTest {
         // → every category disjunct collapses to the empty string, so the generated SQL
         // is byte-identical to the pre-feature form for all existing assertions.
         lenient().when(platformCategoryLabelResolver.selectableLabels()).thenReturn(List.of());
+        lenient().when(strictBookableResolver.resolveCandidateQuery(anyString(), any(), anyString()))
+                .thenReturn(STRICT_SET);
     }
 
     private void stubNativeQueries(List<Object[]> rows, long total) {
@@ -188,6 +197,11 @@ class SearchServiceTest {
      */
     private static final Clock FIXED_CLOCK = Clock.fixed(Instant.parse("2026-10-05T22:30:00Z"), ZoneOffset.UTC);
     private static final LocalDate KYIV_TODAY_AT_FIXED_CLOCK = LocalDate.of(2026, 10, 6);
+
+    private static final UUID STRICT_MASTER_ID = UUID.fromString("33333333-3333-3333-3333-333333333333");
+    private static final UUID STRICT_ASSIGNMENT_ID = UUID.fromString("44444444-4444-4444-4444-444444444444");
+    private static final StrictBookableResolver.StrictBookableSet STRICT_SET =
+            new StrictBookableResolver.StrictBookableSet(Set.of(STRICT_MASTER_ID), Set.of(STRICT_ASSIGNMENT_ID));
 
     private static final UUID CITY_ID = UUID.fromString("11111111-1111-1111-1111-111111111111");
     private static final UUID DISTRICT_ID = UUID.fromString("22222222-2222-2222-2222-222222222222");
@@ -247,7 +261,7 @@ class SearchServiceTest {
         ArgumentCaptor<LocalDate> todayCaptor = ArgumentCaptor.forClass(LocalDate.class);
         when(salonRepository.findActiveByCityIdNoPriceAsProjection(
                 eq(CITY_ID), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(),
-                todayCaptor.capture()))
+                todayCaptor.capture(), any()))
                 .thenReturn(stubRows);
 
         service.searchSalons(salonRequest(CITY_ID, null), PageRequest.of(0, 20));
@@ -623,17 +637,17 @@ class SearchServiceTest {
         // unfinished stub if nested inside when(salonRepository...).
         List<SalonSearchProjection> stubRows = oneSalonProjectionList();
         when(salonRepository.findActiveByDistrictIdNoPriceAsProjection(
-                eq(DISTRICT_ID), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any()))
+                eq(DISTRICT_ID), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any(), any()))
                 .thenReturn(stubRows);
 
         service.searchSalons(salonRequest(CITY_ID, DISTRICT_ID), PageRequest.of(0, 20));
 
         // No price bounds → no-price variant (no COUNT lateral).
         verify(salonRepository, times(1)).findActiveByDistrictIdNoPriceAsProjection(
-                eq(DISTRICT_ID), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any());
-        verify(salonRepository, never()).findActiveByDistrictIdAsProjection(any(), any(), any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any());
-        verify(salonRepository, never()).findActiveByCityIdNoPriceAsProjection(any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any());
-        verify(salonRepository, never()).findByIsActiveTrueNoPriceAsProjection(any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any());
+                eq(DISTRICT_ID), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any(), any());
+        verify(salonRepository, never()).findActiveByDistrictIdAsProjection(any(), any(), any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any(), any());
+        verify(salonRepository, never()).findActiveByCityIdNoPriceAsProjection(any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any(), any());
+        verify(salonRepository, never()).findByIsActiveTrueNoPriceAsProjection(any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any(), any());
         // Must NOT touch the full-entity variants — they hydrate unnecessary columns.
         verify(salonRepository, never()).findActiveByDistrictId(any(), any());
         verify(salonRepository, never()).findActiveByCityId(any(), any());
@@ -645,16 +659,16 @@ class SearchServiceTest {
     void should_dispatchToCityRepoMethod_when_onlyCityResolved() {
         List<SalonSearchProjection> stubRows = oneSalonProjectionList();
         when(salonRepository.findActiveByCityIdNoPriceAsProjection(
-                eq(CITY_ID), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any()))
+                eq(CITY_ID), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any(), any()))
                 .thenReturn(stubRows);
 
         service.searchSalons(salonRequest(CITY_ID, null), PageRequest.of(0, 20));
 
         verify(salonRepository, times(1)).findActiveByCityIdNoPriceAsProjection(
-                eq(CITY_ID), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any());
-        verify(salonRepository, never()).findActiveByCityIdAsProjection(any(), any(), any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any());
-        verify(salonRepository, never()).findActiveByDistrictIdNoPriceAsProjection(any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any());
-        verify(salonRepository, never()).findByIsActiveTrueNoPriceAsProjection(any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any());
+                eq(CITY_ID), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any(), any());
+        verify(salonRepository, never()).findActiveByCityIdAsProjection(any(), any(), any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any(), any());
+        verify(salonRepository, never()).findActiveByDistrictIdNoPriceAsProjection(any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any(), any());
+        verify(salonRepository, never()).findByIsActiveTrueNoPriceAsProjection(any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any(), any());
         verify(salonRepository, never()).findActiveByDistrictId(any(), any());
         verify(salonRepository, never()).findActiveByCityId(any(), any());
         verify(salonRepository, never()).findByIsActiveTrue(any());
@@ -664,15 +678,15 @@ class SearchServiceTest {
     @DisplayName("salon search dispatches to the no-price active-only variant when no locality filter and no price bounds are supplied (HIGH PERF gate)")
     void should_dispatchToActiveOnlyRepoMethod_when_noLocalityFilter() {
         List<SalonSearchProjection> stubRows = oneSalonProjectionList();
-        when(salonRepository.findByIsActiveTrueNoPriceAsProjection(any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any()))
+        when(salonRepository.findByIsActiveTrueNoPriceAsProjection(any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any(), any()))
                 .thenReturn(stubRows);
 
         service.searchSalons(salonRequest(null, null), PageRequest.of(0, 20));
 
-        verify(salonRepository, times(1)).findByIsActiveTrueNoPriceAsProjection(any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any());
-        verify(salonRepository, never()).findByIsActiveTrueAsProjection(any(), any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any());
-        verify(salonRepository, never()).findActiveByDistrictIdNoPriceAsProjection(any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any());
-        verify(salonRepository, never()).findActiveByCityIdNoPriceAsProjection(any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any());
+        verify(salonRepository, times(1)).findByIsActiveTrueNoPriceAsProjection(any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any(), any());
+        verify(salonRepository, never()).findByIsActiveTrueAsProjection(any(), any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any(), any());
+        verify(salonRepository, never()).findActiveByDistrictIdNoPriceAsProjection(any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any(), any());
+        verify(salonRepository, never()).findActiveByCityIdNoPriceAsProjection(any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any(), any());
         verify(salonRepository, never()).findActiveByDistrictId(any(), any());
         verify(salonRepository, never()).findActiveByCityId(any(), any());
         verify(salonRepository, never()).findByIsActiveTrue(any());
@@ -683,7 +697,7 @@ class SearchServiceTest {
     void should_dispatchToPriceVariant_when_priceBoundSupplied() {
         List<SalonSearchProjection> stubRows = oneSalonProjectionList();
         when(salonRepository.findActiveByCityIdAsProjection(
-                eq(CITY_ID), any(), any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any()))
+                eq(CITY_ID), any(), any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any(), any()))
                 .thenReturn(stubRows);
         SalonSearchRequest request = new SalonSearchRequest(
                 new LocationFilter(CITY_ID, null), null, null, null,
@@ -692,8 +706,8 @@ class SearchServiceTest {
         service.searchSalons(request, PageRequest.of(0, 20));
 
         verify(salonRepository, times(1)).findActiveByCityIdAsProjection(
-                eq(CITY_ID), any(), any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any());
-        verify(salonRepository, never()).findActiveByCityIdNoPriceAsProjection(any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any());
+                eq(CITY_ID), any(), any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any(), any());
+        verify(salonRepository, never()).findActiveByCityIdNoPriceAsProjection(any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any(), any());
     }
 
     @Test
@@ -704,7 +718,7 @@ class SearchServiceTest {
         when(proj.getAvatarUrl()).thenReturn("https://cdn.example.com/avatar.jpg");
 
         when(salonRepository.findActiveByCityIdNoPriceAsProjection(
-                eq(CITY_ID), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any()))
+                eq(CITY_ID), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any(), any()))
                 .thenReturn(List.of(proj));
         when(discoveryLocationResolver.resolveLabels(any(), any()))
                 .thenReturn(new DiscoveryLabels(
@@ -729,7 +743,7 @@ class SearchServiceTest {
         SalonSearchProjection b = stubProjection(UUID.randomUUID(), "B", CITY_ID, DISTRICT_ID);
         SalonSearchProjection c = stubProjection(UUID.randomUUID(), "C", CITY_ID, DISTRICT_ID);
         when(salonRepository.findActiveByCityIdNoPriceAsProjection(
-                eq(CITY_ID), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any()))
+                eq(CITY_ID), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any(), any()))
                 .thenReturn(List.of(a, b, c));
 
         Page<SalonSearchResult> page =
@@ -1214,7 +1228,7 @@ class SearchServiceTest {
 
         verify(entityManager, never()).createNativeQuery(anyString());
         verify(salonRepository).findByIsActiveTrueNoPriceAsProjection(
-                any(), any(), any(), any(), isNull(), anyString(), anyInt(), anyLong(), any());
+                any(), any(), any(), any(), isNull(), anyString(), anyInt(), anyLong(), any(), any());
     }
 
     @Test
@@ -1595,7 +1609,7 @@ class SearchServiceTest {
     void should_forwardQAndPriceBounds_toSalonRepo() {
         List<SalonSearchProjection> stubRows = oneSalonProjectionList();
         when(salonRepository.findActiveByCityIdAsProjection(
-                eq(CITY_ID), any(), any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any()))
+                eq(CITY_ID), any(), any(), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any(), any()))
                 .thenReturn(stubRows);
         SalonSearchRequest request = new SalonSearchRequest(
                 new LocationFilter(CITY_ID, null), "glow", null, null,
@@ -1611,7 +1625,7 @@ class SearchServiceTest {
                 eq("%glow%"), isNull(), isNull(), isNull(),
                 eq(new BigDecimal("100.00")),
                 eq(new BigDecimal("500.00")),
-                anyString(), anyInt(), anyLong(), any());
+                anyString(), anyInt(), anyLong(), any(), any());
     }
 
     @Test
@@ -1622,7 +1636,7 @@ class SearchServiceTest {
         // No price bounds → no-price city variant (HIGH PERF gate).
         when(salonRepository.findActiveByCityIdNoPriceAsProjection(
                 eq(CITY_ID), any(), any(), any(), any(), any(),
-                sortModeCaptor.capture(), anyInt(), anyLong(), any()))
+                sortModeCaptor.capture(), anyInt(), anyLong(), any(), any()))
                 .thenReturn(stubRows);
         SalonSearchRequest request = new SalonSearchRequest(
                 new LocationFilter(CITY_ID, null), null, null, SearchSort.PRICE_ASC,
@@ -1644,7 +1658,7 @@ class SearchServiceTest {
         ArgumentCaptor<Long> offsetCaptor = ArgumentCaptor.forClass(Long.class);
         when(salonRepository.findActiveByCityIdNoPriceAsProjection(
                 eq(CITY_ID), any(), any(), any(), any(), any(), anyString(),
-                limitCaptor.capture(), offsetCaptor.capture(), any()))
+                limitCaptor.capture(), offsetCaptor.capture(), any(), any()))
                 .thenReturn(stubRows);
 
         service.searchSalons(salonRequest(CITY_ID, null), PageRequest.of(2, 15));
@@ -1659,7 +1673,7 @@ class SearchServiceTest {
         SalonSearchProjection proj = stubProjection(UUID.randomUUID(), "Glow", CITY_ID, DISTRICT_ID);
         when(proj.getTotalCount()).thenReturn(137L);
         when(salonRepository.findActiveByCityIdNoPriceAsProjection(
-                eq(CITY_ID), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any()))
+                eq(CITY_ID), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any(), any()))
                 .thenReturn(List.of(proj));
 
         Page<SalonSearchResult> page =
@@ -1667,5 +1681,203 @@ class SearchServiceTest {
 
         assertThat(page.getTotalElements()).isEqualTo(137L);
         assertThat(page.getContent()).hasSize(1);
+    }
+
+    // ── SRCH-30 / SRCH-31 strict free-slot verdict ───────────────────────────
+
+    @Test
+    @DisplayName("master search binds the strict master ids as an array and gates m.id = ANY(:strictMasterIds); "
+            + "the card previews read the strict assignment ids through a hashed semi-join")
+    void should_bindStrictMasterIds_when_masterSearchRuns() {
+        stubNativeQueries(List.of(), 0L);
+
+        service.searchMasters(cityRequest(), PageRequest.of(0, 20));
+
+        assertThat(sqlCaptor.getAllValues().get(0)).contains("m.id = ANY(:strictMasterIds)")
+                .as("the serviceNames preview lists strictly bookable services only")
+                .contains("ms.id IN (SELECT unnest(:strictAssignmentIds))")
+                .doesNotContain("= ANY(:strictAssignmentIds)");
+        ArgumentCaptor<Object> bound = ArgumentCaptor.forClass(Object.class);
+        verify(dataQuery).setParameter(eq("strictMasterIds"), bound.capture());
+        assertThat((UUID[]) bound.getValue()).containsExactly(STRICT_MASTER_ID);
+    }
+
+    @Test
+    @DisplayName("master slug filter additionally requires a strictly bookable MATCHING assignment")
+    void should_gateMatchingAssignment_when_masterSlugFilterActive() {
+        stubNativeQueries(List.of(), 0L);
+        UUID typeId = UUID.fromString("55555555-5555-5555-5555-555555555555");
+        when(serviceTypeSlugResolver.resolve(List.of("nail-service-manicure")))
+                .thenReturn(List.of(Optional.of(new ServiceTypeMatch(typeId, "Манікюр"))));
+        MasterSearchRequest request = new MasterSearchRequest(
+                null, null, null, null, null, null, null, 0, 20, List.of("nail-service-manicure"));
+
+        service.searchMasters(request, PageRequest.of(0, 20));
+
+        assertThat(sqlCaptor.getAllValues().get(0))
+                .contains("sbm.id IN (SELECT unnest(:strictAssignmentIds))")
+                .contains("sbd.service_type_id = :stId0");
+        ArgumentCaptor<Object> bound = ArgumentCaptor.forClass(Object.class);
+        verify(dataQuery).setParameter(eq("strictAssignmentIds"), bound.capture());
+        assertThat((UUID[]) bound.getValue()).containsExactly(STRICT_ASSIGNMENT_ID);
+    }
+
+    @Test
+    @DisplayName("an empty strict master set returns an empty page and never runs the main query")
+    void should_returnEmptyPageWithoutMainQuery_when_noMasterIsStrictlyBookable() {
+        when(strictBookableResolver.resolveCandidateQuery(anyString(), any(), eq("masters")))
+                .thenReturn(StrictBookableResolver.StrictBookableSet.EMPTY);
+
+        Page<MasterSearchResult> page = service.searchMasters(cityRequest(), PageRequest.of(0, 20));
+
+        assertThat(page.getContent()).isEmpty();
+        assertThat(page.getTotalElements()).isZero();
+        verifyNoInteractions(entityManager);
+    }
+
+    @Test
+    @DisplayName("the master candidate query carries the search filters, the structural pre-filter and the cap")
+    void should_buildCappedCandidateQuery_when_masterSearchRuns() {
+        stubNativeQueries(List.of(), 0L);
+        ArgumentCaptor<String> candidateSql = ArgumentCaptor.forClass(String.class);
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<Map<String, Object>> candidateParams = ArgumentCaptor.forClass(Map.class);
+
+        service.searchMasters(cityRequest(), PageRequest.of(0, 20));
+
+        verify(strictBookableResolver).resolveCandidateQuery(
+                candidateSql.capture(), candidateParams.capture(), eq("masters"));
+        assertThat(candidateSql.getValue())
+                .startsWith("SELECT m.id ")
+                .contains(":cityId")
+                .contains("EXISTS (SELECT 1 FROM master_services bms")
+                .contains("LIMIT :candidateLimit")
+                .doesNotContain("strictMasterIds");
+        assertThat(candidateParams.getValue())
+                .containsEntry("candidateLimit", StrictBookableResolver.CANDIDATE_CAP + 1)
+                .containsEntry("cityId", CITY_ID)
+                .containsEntry(MasterBookabilitySql.TODAY_PARAM, KYIV_TODAY_AT_FIXED_CLOCK);
+    }
+
+    @Test
+    @DisplayName("an empty strict set returns an empty salon page without touching the salon repository")
+    void should_returnEmptySalonPageWithoutQuery_when_noSalonMasterIsStrictlyBookable() {
+        when(strictBookableResolver.resolveCandidateQuery(anyString(), any(), eq("salons")))
+                .thenReturn(StrictBookableResolver.StrictBookableSet.EMPTY);
+
+        Page<SalonSearchResult> page = service.searchSalons(salonRequest(CITY_ID, null), PageRequest.of(0, 20));
+
+        assertThat(page.getContent()).isEmpty();
+        assertThat(page.getTotalElements()).isZero();
+        verifyNoInteractions(salonRepository);
+    }
+
+    @Test
+    @DisplayName("static salon search passes the strict assignment ids to the repository")
+    void should_passStrictAssignmentIds_when_staticSalonSearchRuns() {
+        List<SalonSearchProjection> stubRows = oneSalonProjectionList();
+        ArgumentCaptor<UUID[]> strictCaptor = ArgumentCaptor.forClass(UUID[].class);
+        when(salonRepository.findActiveByCityIdNoPriceAsProjection(
+                eq(CITY_ID), any(), any(), any(), any(), any(), anyString(), anyInt(), anyLong(), any(),
+                strictCaptor.capture()))
+                .thenReturn(stubRows);
+
+        service.searchSalons(salonRequest(CITY_ID, null), PageRequest.of(0, 20));
+
+        assertThat(strictCaptor.getValue()).containsExactly(STRICT_ASSIGNMENT_ID);
+    }
+
+    @Test
+    @DisplayName("dynamic salon search gates the price lateral and membership on the strict assignment ids")
+    void should_gateDynamicSalonSql_when_slugFilterActive() {
+        stubNativeQueries(List.of(), 0L);
+        UUID typeId = UUID.fromString("55555555-5555-5555-5555-555555555555");
+        when(serviceTypeSlugResolver.resolve(List.of("nail-service-manicure")))
+                .thenReturn(List.of(Optional.of(new ServiceTypeMatch(typeId, "Манікюр"))));
+        SalonSearchRequest request = new SalonSearchRequest(
+                null, null, null, null, null, null, 0, 20, List.of("nail-service-manicure"));
+
+        service.searchSalons(request, PageRequest.of(0, 20));
+
+        assertThat(sqlCaptor.getAllValues().get(0))
+                .contains("ms.id IN (SELECT unnest(:strictAssignmentIds))")
+                .contains("sbm.id IN (SELECT unnest(:strictAssignmentIds))")
+                .as("name preview and matched names list strictly bookable services only")
+                .contains("mss.id IN (SELECT unnest(:strictAssignmentIds))")
+                .doesNotContain("= ANY(:strictAssignmentIds)")
+                .contains("sbx.salon_id = s.id")
+                .contains("sbd.service_type_id = :stId0")
+                .doesNotContain("CAST(:");
+        verify(dataQuery).setParameter(eq("strictAssignmentIds"), any());
+    }
+
+    @Test
+    @DisplayName("master ?q requires a match carried by a service to be carried by a strictly bookable one")
+    void should_gateFreeTextMatchOnStrictAssignments_when_masterQueryActive() {
+        stubNativeQueries(List.of(), 0L);
+        MasterSearchRequest request = new MasterSearchRequest(
+                null, "манікюр", null, null, null, null, null, 0, 20, null);
+
+        service.searchMasters(request, PageRequest.of(0, 20));
+
+        assertThat(sqlCaptor.getAllValues().get(0))
+                .contains("OR EXISTS (SELECT 1 FROM master_services sqm ")
+                .contains("sqm.id IN (SELECT unnest(:strictAssignmentIds))")
+                .contains("sqd.name ILIKE :q0");
+    }
+
+    @Test
+    @DisplayName("the salon candidate query mirrors the salon filters (q, category, price) and orders by the "
+            + "search sort, so the cap keeps the salons the first pages show")
+    void should_filterAndSortSalonCandidates_when_salonSearchIsFiltered() {
+        ArgumentCaptor<String> candidateSql = ArgumentCaptor.forClass(String.class);
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<Map<String, Object>> candidateParams = ArgumentCaptor.forClass(Map.class);
+        when(strictBookableResolver.resolveCandidateQuery(candidateSql.capture(), candidateParams.capture(),
+                eq("salons"))).thenReturn(StrictBookableResolver.StrictBookableSet.EMPTY);
+        SalonSearchRequest request = new SalonSearchRequest(new LocationFilter(CITY_ID, null), "Aura", "NAILS",
+                SearchSort.PRICE_ASC, new BigDecimal("100"), new BigDecimal("900"), 0, 20, null);
+
+        service.searchSalons(request, PageRequest.of(0, 20));
+
+        assertThat(candidateSql.getValue())
+                .startsWith("SELECT m.id FROM salons s ")
+                .contains("s.city_id = :cityId")
+                .contains("s.name ILIKE :q0")
+                .contains("sd.category = :category")
+                .contains("pr.candidate_rows > 0")
+                .contains("pr.pmax >= :minPrice")
+                .contains("pr.pmin <= :maxPrice")
+                .contains("ORDER BY pr.pmin ASC NULLS LAST, s.name, s.id, m.id LIMIT :candidateLimit")
+                .doesNotContain("strictAssignmentIds")
+                .doesNotContain("CAST(:");
+        assertThat(candidateParams.getValue())
+                .containsEntry("cityId", CITY_ID)
+                .containsEntry("category", "NAILS")
+                .containsKeys("minPrice", "maxPrice")
+                .containsEntry("candidateLimit", StrictBookableResolver.CANDIDATE_CAP + 1);
+        assertThat((BigDecimal) candidateParams.getValue().get("minPrice")).isEqualByComparingTo("100");
+        assertThat((BigDecimal) candidateParams.getValue().get("maxPrice")).isEqualByComparingTo("900");
+    }
+
+    @Test
+    @DisplayName("the salon candidate query of a slug-filtered search requires a matching structural service")
+    void should_requireMatchingServiceInSalonCandidates_when_slugFilterActive() {
+        ArgumentCaptor<String> candidateSql = ArgumentCaptor.forClass(String.class);
+        when(strictBookableResolver.resolveCandidateQuery(candidateSql.capture(), any(), eq("salons")))
+                .thenReturn(StrictBookableResolver.StrictBookableSet.EMPTY);
+        UUID typeId = UUID.fromString("55555555-5555-5555-5555-555555555555");
+        when(serviceTypeSlugResolver.resolve(List.of("nail-service-manicure")))
+                .thenReturn(List.of(Optional.of(new ServiceTypeMatch(typeId, "Манікюр"))));
+        SalonSearchRequest request = new SalonSearchRequest(
+                null, null, null, null, null, null, 0, 20, List.of("nail-service-manicure"));
+
+        service.searchSalons(request, PageRequest.of(0, 20));
+
+        assertThat(candidateSql.getValue())
+                .contains("sdf.service_type_id = :stId0")
+                .contains("sd.service_type_id = :stId0")
+                .doesNotContain("pr.candidate_rows > 0")
+                .doesNotContain("strictAssignmentIds");
     }
 }

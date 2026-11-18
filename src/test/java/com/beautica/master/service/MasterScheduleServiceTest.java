@@ -27,6 +27,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.AdditionalMatchers.aryEq;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
@@ -305,8 +307,8 @@ class MasterScheduleServiceTest {
         when(dateMath.expandInclusive(DATE, to)).thenReturn(horizon());
         when(scheduleExceptionRepository.findByMasterIdsAndDateBetweenWithIntervals(
                 List.of(MASTER_ID), DATE, to)).thenReturn(List.of());
-        when(weeklyScheduleRepository.findOverlappingRangeWithIntervalsByMasterIds(
-                List.of(MASTER_ID), DATE, to)).thenReturn(List.of());
+        when(weeklyScheduleRepository.findTemplateIntervalRowsByMasterIds(
+                aryEq(new UUID[] {MASTER_ID}), eq(DATE), eq(to))).thenReturn(List.of());
         when(scheduleMapper.toEffectiveDay(any(), any(), anyList()))
                 .thenAnswer(invocation -> new EffectiveDayResponse(
                         invocation.getArgument(0), invocation.getArgument(1), List.of()));

@@ -555,7 +555,8 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
             @Param("sortMode") String sortMode,
             @Param("limit") int limit,
             @Param("offset") long offset,
-            @Param(com.beautica.master.repository.MasterBookabilitySql.TODAY_PARAM) java.time.LocalDate today
+            @Param(com.beautica.master.repository.MasterBookabilitySql.TODAY_PARAM) java.time.LocalDate today,
+            @Param(SalonSearchSql.STRICT_ASSIGNMENT_IDS_PARAM) UUID[] strictAssignmentIds
     );
 
     /**
@@ -593,7 +594,8 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
             @Param("sortMode") String sortMode,
             @Param("limit") int limit,
             @Param("offset") long offset,
-            @Param(com.beautica.master.repository.MasterBookabilitySql.TODAY_PARAM) java.time.LocalDate today
+            @Param(com.beautica.master.repository.MasterBookabilitySql.TODAY_PARAM) java.time.LocalDate today,
+            @Param(SalonSearchSql.STRICT_ASSIGNMENT_IDS_PARAM) UUID[] strictAssignmentIds
     );
 
     /**
@@ -654,7 +656,8 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
             @Param("sortMode") String sortMode,
             @Param("limit") int limit,
             @Param("offset") long offset,
-            @Param(com.beautica.master.repository.MasterBookabilitySql.TODAY_PARAM) java.time.LocalDate today
+            @Param(com.beautica.master.repository.MasterBookabilitySql.TODAY_PARAM) java.time.LocalDate today,
+            @Param(SalonSearchSql.STRICT_ASSIGNMENT_IDS_PARAM) UUID[] strictAssignmentIds
     );
 
     /**
@@ -684,7 +687,8 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
             @Param("sortMode") String sortMode,
             @Param("limit") int limit,
             @Param("offset") long offset,
-            @Param(com.beautica.master.repository.MasterBookabilitySql.TODAY_PARAM) java.time.LocalDate today
+            @Param(com.beautica.master.repository.MasterBookabilitySql.TODAY_PARAM) java.time.LocalDate today,
+            @Param(SalonSearchSql.STRICT_ASSIGNMENT_IDS_PARAM) UUID[] strictAssignmentIds
     );
 
     /**
@@ -730,7 +734,8 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
             @Param("sortMode") String sortMode,
             @Param("limit") int limit,
             @Param("offset") long offset,
-            @Param(com.beautica.master.repository.MasterBookabilitySql.TODAY_PARAM) java.time.LocalDate today
+            @Param(com.beautica.master.repository.MasterBookabilitySql.TODAY_PARAM) java.time.LocalDate today,
+            @Param(SalonSearchSql.STRICT_ASSIGNMENT_IDS_PARAM) UUID[] strictAssignmentIds
     );
 
     /**
@@ -756,7 +761,8 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
             @Param("sortMode") String sortMode,
             @Param("limit") int limit,
             @Param("offset") long offset,
-            @Param(com.beautica.master.repository.MasterBookabilitySql.TODAY_PARAM) java.time.LocalDate today
+            @Param(com.beautica.master.repository.MasterBookabilitySql.TODAY_PARAM) java.time.LocalDate today,
+            @Param(SalonSearchSql.STRICT_ASSIGNMENT_IDS_PARAM) UUID[] strictAssignmentIds
     );
 
     // ── Phase 376 — salon booking slug (beautica.app/book/s/{slug}) ─────────────────────────────

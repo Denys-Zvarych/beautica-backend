@@ -6,7 +6,11 @@ import com.beautica.location.DiscoveryLocationResolver;
 import com.beautica.search.dto.SalonSearchRequest;
 import com.beautica.search.dto.LocationFilter;
 import com.beautica.search.service.SearchService;
+import com.beautica.search.service.StrictBookableResolver;
+import com.beautica.search.dto.MasterSearchRequest;
+import com.beautica.search.dto.SearchSort;
 import com.beautica.support.HibernateStatistics;
+import com.beautica.support.NotATimedTest;
 import com.beautica.support.IndexCapabilityProbe;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -161,6 +165,70 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
     @Autowired
     private SearchService searchService;
 
+    @Autowired
+    private StrictBookableResolver strictBookableResolver;
+
+    @Autowired
+    private org.springframework.cache.CacheManager cacheManager;
+
+    /**
+     * B523 perf gate (phase-523 § Perf gate): ONE cold-cache strict resolve at
+     * {@link StrictBookableResolver#CANDIDATE_CAP} candidates finishes within 500 ms on a dev
+     * machine. The JVM and Hibernate plans are warmed by one discarded resolve (production JVMs are
+     * warm; "cold" means an empty {@code master-bookable-assignments} cache), and the MEDIAN of
+     * {@link #STRICT_RESOLVE_SAMPLES} cold resolves is asserted, which rejects a single GC / container
+     * scheduling outlier. The asserted gate is {@link #STRICT_RESOLVE_GATE_MS} — this budget scaled
+     * by {@link #CI_RUNNER_FACTOR} for the slower shared GitHub Actions runner.
+     */
+    private static final long STRICT_RESOLVE_COLD_BUDGET_MS = 500L;
+
+    /**
+     * Wall-clock headroom for the shared GitHub Actions runner (B523 audit cycle 3): 1.75 when
+     * {@code GITHUB_ACTIONS=true}, else 1.0. Applies to latency gates only — the statement-count
+     * gates are deterministic and stay unscaled.
+     */
+    private static final double CI_RUNNER_FACTOR =
+            "true".equals(System.getenv("GITHUB_ACTIONS")) ? 1.75 : 1.0;
+
+    /** The asserted cold-resolve gate: {@link #STRICT_RESOLVE_COLD_BUDGET_MS} × {@link #CI_RUNNER_FACTOR}. */
+    private static final long STRICT_RESOLVE_GATE_MS = Math.round(STRICT_RESOLVE_COLD_BUDGET_MS * CI_RUNNER_FACTOR);
+
+    /** Cold resolves per case whose median is asserted against the budget. */
+    private static final int STRICT_RESOLVE_SAMPLES = 3;
+
+    /**
+     * Statements ONE cold resolve issues, whatever the candidate count (phase-523 § Perf gate:
+     * constant in the candidate count): the assignment-duration projection
+     * ({@code MasterServiceRepository#findBookableAssignmentDurationsByMasterIds}), the window
+     * bookings ({@code BookingRepository#findActiveTimeRangesByMasterIdsInRange}), the schedule
+     * overrides and the overlapping weekly templates ({@code MasterScheduleService#loadRowsForMasters}),
+     * and the templates' discrete times (one {@code WeeklySchedule#DISCRETE_TIMES_BATCH_SIZE} batch —
+     * at the default 50 keys this was 40 statements at the cap). The phase doc's "≤ 3 batch
+     * statements" predates the assignment load and the discrete-times hydration; the gate's intent —
+     * constant in the candidate count — is what this pins.
+     */
+    private static final long STRICT_RESOLVE_BATCH_STATEMENTS = 5L;
+
+    /**
+     * The same cold resolve over masters that carry an explicit-times {@code CUSTOM_HOURS} override on
+     * the first walked day: {@link #STRICT_RESOLVE_BATCH_STATEMENTS} plus ONE hydration of the
+     * overrides' discrete times ({@code ScheduleException#getDiscreteTimes()},
+     * {@code WeeklySchedule#DISCRETE_TIMES_BATCH_SIZE} batch — at the default 50 keys it was 40
+     * statements at the cap, B523 audit cycle 2).
+     */
+    private static final long STRICT_RESOLVE_BATCH_STATEMENTS_WITH_OVERRIDE_TIMES =
+            STRICT_RESOLVE_BATCH_STATEMENTS + 1;
+
+    /** Services per seeded master — a realistic menu, so the per-duration memo and the walk are exercised. */
+    private static final int[] COMMON_DURATIONS = {30, 60, 90, 120};
+
+    /** Each longer than the 09:00–17:00 day: no free day in the 181-day horizon (full walk). */
+    private static final int[] UNFITTABLE_DURATIONS = {540, 570, 600};
+
+    /** Real BCrypt (cost 4), never a fake hash string (§M-5). */
+    private static final String PERF_PASSWORD_HASH =
+            new org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder(4).encode("test-password");
+
     /**
      * Thread-safe sink the {@link CapturingStatementInspector} appends every
      * SQL string Hibernate prepares to. Tests clear it, invoke the real
@@ -227,6 +295,9 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
     @DisplayName("AC1 — V54 idx_salons_city_id exists AND still serves the REAL production salon CITY-filter SQL as an Index Cond (capability probe, every competing salons index removed)")
     void should_useCityIndex_when_salonSearchFiltersByCity() {
         UUID kyivCityId = majorCityIdByName("Київ");
+        // SRCH-31: with no strictly bookable salon master the main salon query is skipped, so one
+        // bookable salon is seeded for the production SELECT to be emitted at all.
+        seedActiveSalon("Київ");
 
         // Invoke the REAL production path. SearchService.searchSalons →
         // SalonRepository.findActiveByCityId — exactly the SQL Hibernate emits
@@ -266,6 +337,10 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
     @DisplayName("AC1 — V54 idx_salons_district_id exists AND still serves the REAL production salon DISTRICT-filter SQL as an Index Cond (capability probe, every competing salons index removed)")
     void should_useDistrictIndex_when_salonSearchFiltersByDistrict() {
         UUID districtId = districtIdInCity("Київ", 0);
+        // SRCH-31: a strictly bookable salon in the district, so the main salon query runs.
+        seedActiveSalon("Київ");
+        jdbcTemplate.update("UPDATE salons SET district_id = ? WHERE district_id IS NULL AND city_id = ?",
+                districtId, majorCityIdByName("Київ"));
 
         String productionSql = captureSalonSearchSelect(
                 new SalonSearchRequest(
@@ -378,6 +453,209 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
                         + "(seeded population is ~hundreds of rows; a lost ON clause "
                         + "would explode the estimate into 5+ digits)")
                 .doesNotContainPattern("rows=\\d{5,}");
+    }
+
+    // ── SRCH-30 — cold strict resolve at the candidate cap ───────────────────
+
+    @Test
+    @NotATimedTest(reason = "seeding 4 000 masters (16 000 rows of menu) dominates the wall clock; "
+            + "the resolve itself carries its own 500 ms budget assertion (× CI_RUNNER_FACTOR on CI)")
+    @DisplayName("SRCH-30 perf gate — a COLD strict resolve of CANDIDATE_CAP masters (3–4 services each; "
+            + "common case: a free day early; worst case: no free day, custom-hours overrides with explicit "
+            + "times and partly booked days, full 181-day walk) stays within 500 ms (× CI factor) with exact verdicts")
+    void should_resolveCandidateCapColdWithinBudget_when_cacheIsEmpty() {
+        int cap = StrictBookableResolver.CANDIDATE_CAP;
+        List<UUID> bookable = seedBulkIndependentMasters(cap, COMMON_DURATIONS, false);
+        List<UUID> unfittable = seedBulkIndependentMasters(cap, UNFITTABLE_DURATIONS, true);
+        coldResolve(bookable); // JIT + Hibernate plan warm-up, discarded (see the budget javadoc)
+
+        long commonMs = medianColdResolveMs(bookable);
+        long worstMs = medianColdResolveMs(unfittable);
+        StrictBookableResolver.StrictBookableSet common = coldResolve(bookable);
+        StrictBookableResolver.StrictBookableSet worst = coldResolve(unfittable);
+
+        log.info("SRCH-30 cold strict resolve @ {} candidates (median of {}): common case {} ms, "
+                        + "worst case (no free day) {} ms; gate {} ms (budget {} ms x CI factor {})",
+                cap, STRICT_RESOLVE_SAMPLES, commonMs, worstMs, STRICT_RESOLVE_GATE_MS,
+                STRICT_RESOLVE_COLD_BUDGET_MS, CI_RUNNER_FACTOR);
+        assertThat(common.masterIds()).as("every common-case master has a free day").hasSize(cap);
+        assertThat(common.assignmentIds()).as("every common-case service fits")
+                .hasSize(cap * COMMON_DURATIONS.length);
+        assertThat(worst.isEmpty()).as("no worst-case master has a free day").isTrue();
+        assertThat(commonMs).as("common-case cold resolve (ms)").isLessThanOrEqualTo(STRICT_RESOLVE_GATE_MS);
+        assertThat(worstMs).as("worst-case cold resolve (ms)").isLessThanOrEqualTo(STRICT_RESOLVE_GATE_MS);
+    }
+
+    @Test
+    @NotATimedTest(reason = "seeding 2 000 masters dominates the wall clock; the assertion is a statement count")
+    @DisplayName("SRCH-30 perf gate — a cold resolve over masters with custom-hours overrides (explicit times) "
+            + "and partly booked days issues the same 6 batch statements for 20 or 2 000 candidates, a warm "
+            + "one none; a cold master search adds only the candidate and main query")
+    void should_issueConstantStatements_when_resolvingAnyCandidateCount() {
+        List<UUID> bookable =
+                seedBulkIndependentMasters(StrictBookableResolver.CANDIDATE_CAP, COMMON_DURATIONS, true);
+        Statistics statistics = statistics();
+
+        List<String> small = coldResolveStatements(statistics, bookable.subList(0, 20));
+        List<String> capped = coldResolveStatements(statistics, bookable);
+        statistics.clear();
+        strictBookableResolver.resolve(bookable, "perf-test");
+        long warm = statistics.getPrepareStatementCount();
+        clearAllCaches();
+        statistics.clear();
+        CAPTURED_SQL.clear();
+        searchService.searchMasters(new MasterSearchRequest(
+                null, null, null, SearchSort.RATING_DESC, null, null, null, 0, 20, null), PageRequest.of(0, 20));
+        List<String> search = List.copyOf(CAPTURED_SQL);
+
+        int batch = (int) STRICT_RESOLVE_BATCH_STATEMENTS_WITH_OVERRIDE_TIMES;
+        assertThat(small).as("cold resolve, 20 candidates").hasSize(batch);
+        assertThat(capped).as("cold resolve, CANDIDATE_CAP candidates (%s)", capped).hasSize(batch);
+        assertThat(warm).as("warm resolve — every verdict cached").isZero();
+        // candidate query + the 6 batch statements + the main paged query (COUNT(*) OVER() rides
+        // on it, so the "count" of the phase-doc formula costs no statement of its own).
+        assertThat(search).as("cold GET /search/masters").hasSize(1 + batch + 1);
+        assertThat(statistics.getPrepareStatementCount()).as("inspector and statistics agree")
+                .isEqualTo(search.size());
+    }
+
+    private List<String> coldResolveStatements(Statistics statistics, List<UUID> masterIds) {
+        clearBookableAssignmentsCache();
+        statistics.clear();
+        CAPTURED_SQL.clear();
+        strictBookableResolver.resolve(masterIds, "perf-test");
+        assertThat(statistics.getPrepareStatementCount()).as("inspector and statistics agree")
+                .isEqualTo(CAPTURED_SQL.size());
+        return List.copyOf(CAPTURED_SQL);
+    }
+
+    private long medianColdResolveMs(List<UUID> masterIds) {
+        long[] samples = new long[STRICT_RESOLVE_SAMPLES];
+        for (int i = 0; i < samples.length; i++) {
+            clearBookableAssignmentsCache();
+            long start = System.nanoTime();
+            strictBookableResolver.resolve(masterIds, "perf-test");
+            samples[i] = (System.nanoTime() - start) / 1_000_000;
+        }
+        java.util.Arrays.sort(samples);
+        return samples[samples.length / 2];
+    }
+
+    private StrictBookableResolver.StrictBookableSet coldResolve(List<UUID> masterIds) {
+        clearBookableAssignmentsCache();
+        return strictBookableResolver.resolve(masterIds, "perf-test");
+    }
+
+    private void clearBookableAssignmentsCache() {
+        cacheManager.getCache(com.beautica.booking.service.BookingMasterService.BOOKABLE_ASSIGNMENTS_CACHE).clear();
+    }
+
+    private void clearAllCaches() {
+        cacheManager.getCacheNames().forEach(name -> cacheManager.getCache(name).clear());
+    }
+
+    /**
+     * Batched seed of {@code count} independent masters, each with one own service per entry of
+     * {@code durations} and an open-ended 09:00–17:00 template on every weekday. With
+     * {@code busyDays} every master also gets (see {@link #seedOverridesAndBookings}):
+     * an explicit-times {@code CUSTOM_HOURS} override today (16:00, 18:00 — the first day every walk
+     * folds, so the overrides' discrete times are hydrated), an interval {@code CUSTOM_HOURS} override
+     * (10:00–15:00) the day after tomorrow, and two {@code CONFIRMED} bookings on partly booked days
+     * (tomorrow 10:00–12:00, in three days 13:00–15:00). None of it makes a 540+ min service fit.
+     */
+    private List<UUID> seedBulkIndependentMasters(int count, int[] durations, boolean busyDays) {
+        UUID typeId = jdbcTemplate.queryForObject(
+                "SELECT id FROM service_types WHERE is_active = TRUE ORDER BY slug LIMIT 1", UUID.class);
+        java.time.LocalDate today = java.time.LocalDate.now(java.time.ZoneId.of("Europe/Kyiv"));
+        List<UUID> masterIds = new ArrayList<>(count);
+        List<Object[]> users = new ArrayList<>(count);
+        List<Object[]> masters = new ArrayList<>(count);
+        List<Object[]> defs = new ArrayList<>(count * durations.length);
+        List<Object[]> assignments = new ArrayList<>(count * durations.length);
+        List<Object[]> schedules = new ArrayList<>(count);
+        List<Object[]> intervals = new ArrayList<>(count * 7);
+        List<UUID[]> masterAndAssignment = new ArrayList<>(count);
+        for (int i = 0; i < count; i++) {
+            UUID userId = UUID.randomUUID();
+            UUID masterId = UUID.randomUUID();
+            UUID scheduleId = UUID.randomUUID();
+            masterIds.add(masterId);
+            users.add(new Object[] {userId, "perf-strict-" + userId + "@beautica.test", PERF_PASSWORD_HASH});
+            masters.add(new Object[] {masterId, userId});
+            for (int duration : durations) {
+                UUID defId = UUID.randomUUID();
+                UUID assignmentId = UUID.randomUUID();
+                defs.add(new Object[] {defId, masterId, "Perf " + defId, typeId, duration});
+                assignments.add(new Object[] {assignmentId, masterId, defId});
+                if (masterAndAssignment.size() == i) {
+                    masterAndAssignment.add(new UUID[] {masterId, assignmentId});
+                }
+            }
+            schedules.add(new Object[] {scheduleId, masterId, today});
+            for (int dow = 1; dow <= 7; dow++) {
+                intervals.add(new Object[] {UUID.randomUUID(), scheduleId, dow});
+            }
+        }
+        jdbcTemplate.batchUpdate("INSERT INTO users (id, email, password_hash, role, is_active, email_verified) "
+                + "VALUES (?, ?, ?, 'INDEPENDENT_MASTER', true, true)", users);
+        jdbcTemplate.batchUpdate("INSERT INTO masters (id, user_id, master_type, is_active, created_at, updated_at) "
+                + "VALUES (?, ?, 'INDEPENDENT_MASTER', true, NOW(), NOW())", masters);
+        jdbcTemplate.batchUpdate("INSERT INTO service_definitions (id, owner_type, owner_id, name, service_type_id, "
+                + "base_duration_minutes, price_type, base_price, buffer_minutes_after, is_active, created_at, "
+                + "updated_at) VALUES (?, 'INDEPENDENT_MASTER', ?, ?, ?, ?, 'FIXED', 500.00, 0, true, NOW(), NOW())",
+                defs);
+        jdbcTemplate.batchUpdate("INSERT INTO master_services (id, master_id, service_def_id, is_active, "
+                + "created_at, updated_at) VALUES (?, ?, ?, true, NOW(), NOW())", assignments);
+        jdbcTemplate.batchUpdate("INSERT INTO weekly_schedules (id, master_id, valid_from, valid_to, created_at, "
+                + "updated_at) VALUES (?, ?, ?, NULL, NOW(), NOW())", schedules);
+        jdbcTemplate.batchUpdate("INSERT INTO working_intervals (id, schedule_id, day_of_week, start_time, end_time) "
+                + "VALUES (?, ?, ?, TIME '09:00', TIME '17:00')", intervals);
+        if (busyDays) {
+            seedOverridesAndBookings(masterAndAssignment, today);
+        }
+        // Production tables carry autovacuum statistics; a just-bulk-inserted test table does not,
+        // and its empty-table estimates would time a plan production never runs.
+        jdbcTemplate.execute("ANALYZE users, masters, service_definitions, master_services, "
+                + "weekly_schedules, working_intervals, schedule_exceptions, schedule_exception_intervals, "
+                + "schedule_exception_times, bookings");
+        return masterIds;
+    }
+
+    /** {@code masterAndAssignment}: per master {@code {masterId, one of its assignment ids}}. */
+    private void seedOverridesAndBookings(List<UUID[]> masterAndAssignment, java.time.LocalDate today) {
+        UUID clientId = UUID.randomUUID();
+        jdbcTemplate.update("INSERT INTO users (id, email, password_hash, role, is_active, email_verified) "
+                + "VALUES (?, ?, ?, 'CLIENT', true, true)", clientId, "perf-client-" + clientId + "@beautica.test",
+                PERF_PASSWORD_HASH);
+        List<Object[]> overrides = new ArrayList<>();
+        List<Object[]> overrideIntervals = new ArrayList<>();
+        List<Object[]> overrideTimes = new ArrayList<>();
+        List<Object[]> bookings = new ArrayList<>();
+        for (UUID[] row : masterAndAssignment) {
+            UUID masterId = row[0];
+            UUID explicitTimesId = UUID.randomUUID();
+            UUID intervalId = UUID.randomUUID();
+            overrides.add(new Object[] {explicitTimesId, masterId, today});
+            overrides.add(new Object[] {intervalId, masterId, today.plusDays(2)});
+            overrideTimes.add(new Object[] {UUID.randomUUID(), explicitTimesId, java.time.LocalTime.of(16, 0)});
+            overrideTimes.add(new Object[] {UUID.randomUUID(), explicitTimesId, java.time.LocalTime.of(18, 0)});
+            overrideIntervals.add(new Object[] {UUID.randomUUID(), intervalId});
+            bookings.add(new Object[] {UUID.randomUUID(), clientId, masterId, row[1], today.plusDays(1),
+                    java.time.LocalTime.of(10, 0), today.plusDays(1), java.time.LocalTime.of(12, 0)});
+            bookings.add(new Object[] {UUID.randomUUID(), clientId, masterId, row[1], today.plusDays(3),
+                    java.time.LocalTime.of(13, 0), today.plusDays(3), java.time.LocalTime.of(15, 0)});
+        }
+        jdbcTemplate.batchUpdate("INSERT INTO schedule_exceptions (id, master_id, date, kind, created_at, "
+                + "updated_at) VALUES (?, ?, ?, 'CUSTOM_HOURS', NOW(), NOW())", overrides);
+        jdbcTemplate.batchUpdate("INSERT INTO schedule_exception_intervals (id, exception_id, start_time, "
+                + "end_time) VALUES (?, ?, TIME '10:00', TIME '15:00')", overrideIntervals);
+        jdbcTemplate.batchUpdate("INSERT INTO schedule_exception_times (id, exception_id, slot_time) "
+                + "VALUES (?, ?, ?)", overrideTimes);
+        jdbcTemplate.batchUpdate("INSERT INTO bookings (id, client_id, master_id, master_service_id, salon_id, "
+                + "status, starts_at, ends_at, price_at_booking, duration_minutes_at_booking, "
+                + "buffer_minutes_at_booking, booking_source, created_at, updated_at) VALUES (?, ?, ?, ?, NULL, "
+                + "'CONFIRMED', (?::date + ?::time) AT TIME ZONE 'Europe/Kyiv', "
+                + "(?::date + ?::time) AT TIME ZONE 'Europe/Kyiv', 500.00, 120, 0, 'APP', NOW(), NOW())", bookings);
     }
 
     // ── AC2 — no N+1 on cityLabel / districtLabel resolution ──────────────────
@@ -572,6 +850,9 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
         searchService.searchSalons(request, PageRequest.of(0, 20));
         String salonSelect = CAPTURED_SQL.stream()
                 .filter(s -> s.toLowerCase(java.util.Locale.ROOT).contains("from salons"))
+                // SRCH-31: the strict-verdict candidate query (ids only) also reads salons first;
+                // the probe targets the production salon PAGE query.
+                .filter(s -> !s.toLowerCase(java.util.Locale.ROOT).startsWith("select m.id "))
                 .findFirst()
                 .orElseThrow(() -> new IllegalStateException(
                         "No salons SELECT captured from SearchService.searchSalons; "
@@ -665,7 +946,11 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
         // Preserving the real LIMIT lets the planner stop early on the index path —
         // exactly the production execution shape.
         String paginationFilled = todayFilled
-                .replaceAll("(?i)limit\\s+\\?\\s+offset\\s+\\?", "LIMIT 20 OFFSET 0");
+                .replaceAll("(?i)limit\\s+\\?\\s+offset\\s+\\?", "LIMIT 20 OFFSET 0")
+                // SRCH-31 strict assignment-id array (`= ANY(?)`), matched structurally; the
+                // capability probe only needs the locality Index Cond, so an empty typed array does.
+                .replaceAll("(?i)=\\s*any\\s*\\(\\s*\\?\\s*\\)", "= ANY(ARRAY[]::uuid[])")
+                .replaceAll("(?i)unnest\\s*\\(\\s*\\?\\s*\\)", "unnest(ARRAY[]::uuid[])");
 
         long remaining = paginationFilled.chars().filter(c -> c == '?').count();
         if (remaining != 1) {

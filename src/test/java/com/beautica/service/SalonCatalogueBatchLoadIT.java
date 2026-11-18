@@ -556,6 +556,10 @@ class SalonCatalogueBatchLoadIT extends AbstractIntegrationTest {
      * booking bulk load). Named so a rise in the FIXED base is caught even if invariance alone would
      * pass (e.g. every count doubling).
      *
+     * <p><b>B523 re-baseline:</b> the discrete-times load is now ONE projection statement per batch
+     * ({@code WeeklyScheduleRepository#findTemplateTimeRowsByScheduleIds}), so this constant holds at
+     * every master count — cases 12 and 14 pin it across the former 50 boundary. History below.
+     *
      * <p><b>QA follow-up — this constant, and case 9's whole 1..20 sweep, hold ONLY below
      * {@code hibernate.default_batch_fetch_size} (50, {@code application.yml}).</b> The
      * {@code discreteTimes} lazy batch-fetch collapses every distinct, still-uninitialised
@@ -709,8 +713,8 @@ class SalonCatalogueBatchLoadIT extends AbstractIntegrationTest {
             + "measures a quantity this test makes no claim about, and on a loaded machine the "
             + "fixture build alone has been observed at 14.6s against a 5.66s quiet-machine figure. "
             + "Trimming the fixture would delete the boundary crossing, i.e. the test.")
-    @DisplayName("Case 12 (D8 caveat): the discreteTimes surcharge is O(walked rows / 50) — 51 "
-            + "masters x 1 row costs one statement MORE than 1 master x 51 rows, never fewer")
+    @DisplayName("Case 12 (D8 caveat, B523 re-baseline): the discrete-times load is ONE statement "
+            + "per batch — 51 masters x 1 row and 1 master x 51 rows both cost the base 5")
     void should_makeDiscreteTimesSurchargeIndependentOfMasterCount() throws Exception {
         String ownerToken = fixtures.createSalonOwnerAndGetToken(
                 "owner-315-c12-" + System.nanoTime() + "@beautica.test");
@@ -755,25 +759,19 @@ class SalonCatalogueBatchLoadIT extends AbstractIntegrationTest {
         log.info("Case 12: {} masters x 1 explicit row -> {}, 1 master x {} explicit rows -> {}",
                 rows, manyMastersStatements, rows, oneMasterStatements);
 
+        // B523 re-baseline: the batched gate now reads templates through the narrow projection
+        // (WeeklyScheduleRepository#findTemplateIntervalRowsByMasterIds) and loads EVERY template's
+        // discrete times of the batch in ONE unnest statement on first read — no 50-key batch-fetch
+        // buckets any more, so neither master count nor row count can add a statement.
         assertThat(manyMastersStatements)
-                .as("51 masters must each be folded, so all 51 schedule rows are walked and cross "
-                        + "the batch_fetch_size=50 ceiling -> ceil(51/50)+4 = 6, the SAME named "
-                        + "formula case 14 pins by master count")
-                .isEqualTo(ONE_MASTER_STATEMENT_COUNT + 1);
-        assertThat(oneMasterStatements)
-                .as("ONE master's 51 rows cost ceil(1/50)+4 = 5, NOT 51/50+4: the fold stops at "
-                        + "that master's first bookable day (day 1 — 09:00 on TODAY is already past "
-                        + "the 09:15 cutoff), which lies inside the FIRST 3-day template, so the "
-                        + "other 50 rows are loaded but never walked and their discreteTimes "
-                        + "proxies are never initialised. 51x the ROWS on one master therefore "
-                        + "costs LESS than 51 masters, never more — the surcharge tracks neither "
-                        + "master count NOR loaded rows, but WALKED rows")
+                .as("51 masters x 1 EXPLICIT_TIMES row: all 51 rows' times load in ONE statement "
+                        + "-> the base 5 (candidates, overrides, templates, discrete times, bookings)")
                 .isEqualTo(ONE_MASTER_STATEMENT_COUNT);
         assertThat(oneMasterStatements)
-                .as("the direction is the claim: piling rows onto one master may only ever cost "
-                        + "LESS than spreading them across masters. Strictly more would mean the "
-                        + "surcharge had started tracking loaded rows per master — a per-row N+1")
-                .isLessThan(manyMastersStatements);
+                .as("1 master x 51 EXPLICIT_TIMES rows: the same ONE discrete-times statement -> 5. "
+                        + "Piling rows onto one master costs exactly what spreading them does — "
+                        + "neither a per-master nor a per-row N+1")
+                .isEqualTo(ONE_MASTER_STATEMENT_COUNT);
     }
 
     /**
@@ -792,8 +790,8 @@ class SalonCatalogueBatchLoadIT extends AbstractIntegrationTest {
             + "gate. Measured 8.52s quiet / 19.9s under concurrent load against a 10s ceiling: the "
             + "wall clock here reports machine load, not a regression. Shrinking either salon "
             + "destroys the boundary the case pins.")
-    @DisplayName("Case 14 (D8 boundary): prepareStatementCount grows by exactly one more statement the "
-            + "instant schedule rows cross the batch_fetch_size=50 boundary (50 vs 51 masters)")
+    @DisplayName("Case 14 (D8 boundary, B523 re-baseline): prepareStatementCount stays at the base "
+            + "across the former batch_fetch_size=50 boundary (50 vs 51 masters)")
     void should_growStatementCountByOne_whenScheduleRowsCrossTheBatchFetchSizeBoundary() throws Exception {
         String ownerToken = fixtures.createSalonOwnerAndGetToken(
                 "owner-315-c14-" + System.nanoTime() + "@beautica.test");
@@ -805,16 +803,17 @@ class SalonCatalogueBatchLoadIT extends AbstractIntegrationTest {
 
         log.info("Case 14: 50 masters -> {} statements, 51 masters -> {} statements", atFifty, atFiftyOne);
 
+        // B523 re-baseline: the old premise (statement #4 = ceil(rows / 50) lazy batch-fetches) is
+        // gone. The batched gate loads discrete times through ONE unnest statement per batch, and
+        // WeeklySchedule.DISCRETE_TIMES_BATCH_SIZE = 4096 bounds the entity paths that still
+        // batch-fetch the collection — far above any fixture. 50 -> 51 must therefore cost NOTHING.
         assertThat(atFifty)
-                .as("50 schedule rows sit AT the batch_fetch_size=50 ceiling -> still ceil(50/50)=1 "
-                        + "batch statement, same base case 9's 1..20 sweep measures")
+                .as("50 masters -> the same base case 9's 1..20 sweep measures")
                 .isEqualTo(ONE_MASTER_STATEMENT_COUNT);
         assertThat(atFiftyOne)
-                .as("51 schedule rows need a SECOND batch statement (ceil(51/50)=2) -> exactly ONE "
-                        + "more statement than the 50-master figure — not zero (row-count-blind, "
-                        + "which case 9 alone cannot rule out) and not 51x (a per-master N+1 "
-                        + "regression, which case 9's under-the-ceiling sweep also cannot rule out)")
-                .isEqualTo(ONE_MASTER_STATEMENT_COUNT + 1);
+                .as("51 masters -> STILL the base: crossing the former 50-key boundary adds no "
+                        + "statement (a per-master N+1 would add 51)")
+                .isEqualTo(atFifty);
     }
 
     private long statementCountForNMasters(String ownerToken, UUID typeId, int count) throws Exception {

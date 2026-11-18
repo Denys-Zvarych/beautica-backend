@@ -3,6 +3,7 @@ package com.beautica.config;
 import com.beautica.booking.service.BookingMasterService;
 import com.beautica.booking.service.RetiredBookingSlugGuard;
 import com.beautica.client.service.ClientPassportService;
+import com.beautica.common.cache.JitteredExpiry;
 import com.beautica.common.cache.SalonBookingInfoCacheEvictor;
 import com.beautica.common.cache.UserProfileCacheEvictor;
 import com.beautica.location.SettlementDisplayNameResolver;
@@ -22,6 +23,7 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.core.Ordered;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 
@@ -207,6 +209,14 @@ public class CacheConfig {
      * query that returned it). 60-second TTL trades freshness for hit-rate on
      * the hot-path first 5 pages and avoids tying every write to a fan-out
      * eviction.
+     *
+     * <p><b>Strict search (SRCH-30/31, 2026-11-18).</b> Search membership now rides the strict
+     * free-slot verdict ({@code StrictBookableResolver} → {@code master-bookable-assignments}).
+     * That per-master cache is already evicted afterCommit on every booking, schedule and
+     * assignment write, so a master who fills her last slot leaves search within the search
+     * page TTL above (≤ 60 s browse / 30 s free text) — not the 120 s the two TTLs would sum to.
+     * The search pages themselves are still not cleared per booking (blanket {@code clear()} on a
+     * hot write path is the §F-6 thundering-herd amplifier).
      */
     @Bean
     public CacheManager cacheManager(ObjectProvider<MeterRegistry> meterRegistryProvider) {
@@ -795,12 +805,19 @@ public class CacheConfig {
         // [masterId] (one-element list), so the existing by-master afterCommit sweeps
         // (SlotCalculationService BOOKING_WRITE_CACHES, MasterScheduleService SCHEDULE_WRITE_CACHES)
         // evict it with no parallel wiring; assignment writes evict the key directly. 60-sec TTL
-        // backstop, sync=true on the @Cacheable (the read is permitAll — §F-7). Sized like
-        // master-service-bookable: one small id set per browsed master.
+        // backstop, sync=true on the @Cacheable (the read is permitAll — §F-7). Also read and
+        // filled in bulk by search (StrictBookableResolver, SRCH-30/31): one search resolve can
+        // touch up to StrictBookableResolver.CANDIDATE_CAP (2 000) masters, so the size is 5 000 —
+        // a full capped resolve plus the profile-tab working set without self-eviction. One small
+        // id set per master (a few UUIDs), so 5 000 entries stay well under a megabyte.
+        // Jittered write expiry (B523 fix pass): a cold search writes up to 2 000 entries at once;
+        // a flat 60 s TTL would expire them as one block and re-run the walk for all of them
+        // together. Each entry lives 50–60 s — never longer than the 60 s the staleness bound
+        // (D4) assumes.
         registerMetered(manager, meterRegistry, BookingMasterService.BOOKABLE_ASSIGNMENTS_CACHE,
                 Caffeine.newBuilder()
-                        .maximumSize(2000)
-                        .expireAfterWrite(60, TimeUnit.SECONDS));
+                        .maximumSize(5000)
+                        .expireAfter(new JitteredExpiry(Duration.ofSeconds(60), Duration.ofSeconds(10))));
         // Phase 13.6 (perf follow-up) — approved+active PlatformCategory ordering backing
         // ServiceCatalogService#buildCategoryOrderAndNames. Mirrors service-categories's config: this
         // is admin-approval-gated reference data, identical across every request, previously

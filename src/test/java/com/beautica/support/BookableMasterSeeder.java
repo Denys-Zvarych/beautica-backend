@@ -209,6 +209,19 @@ public final class BookableMasterSeeder {
                 UUID.randomUUID(), exceptionId, start, end);
     }
 
+    /**
+     * The "prod case" of the strict verdict (SRCH-30, SAL-09): a 09:00–17:00 template valid only
+     * today → today + 1, with a DAY_OFF override on both days — structurally bookable (a schedule
+     * with hours), yet no free slot anywhere in the horizon. Schedule only; the caller assigns the
+     * service.
+     */
+    public static void seedEveryRemainingDayOff(JdbcTemplate jdbc, UUID masterId) {
+        LocalDate today = LocalDate.now(KYIV);
+        seedWeeklyTemplate(jdbc, masterId, today, today.plusDays(1), true);
+        seedDayOffOverride(jdbc, masterId, today);
+        seedDayOffOverride(jdbc, masterId, today.plusDays(1));
+    }
+
     /** Inserts a DAY_OFF override on {@code date}. */
     public static void seedDayOffOverride(JdbcTemplate jdbc, UUID masterId, LocalDate date) {
         jdbc.update(

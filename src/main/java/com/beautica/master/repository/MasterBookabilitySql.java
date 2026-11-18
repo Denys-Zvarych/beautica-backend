@@ -3,13 +3,19 @@ package com.beautica.master.repository;
 import java.util.regex.Pattern;
 
 /**
- * The ONE SQL definition of "a bookable master" for client discovery surfaces (search, search
- * suggestions, favourites) — locked product decision 2026-10-05: a master is bookable when they
- * offer at least one active service AND have a schedule; a salon is bookable when at least one of
- * its active masters is. This is the cheap STRUCTURAL rule: it never walks the free-slot calendar
- * (a master who is merely fully booked right now stays visible). Also gates the public salon roster
- * ({@code MasterRepository#findBookableIdsBySalonId}). The strict free-slot verdict is
- * {@code BookingMasterService#getBookableAssignmentIds} / the salon catalogue's batch gate.
+ * The ONE SQL definition of "a structurally bookable master" (MAS-02) — locked product decision
+ * 2026-10-05: a master is bookable when they offer at least one active service AND have a schedule;
+ * a salon is bookable when at least one of its active masters is. This is the cheap STRUCTURAL rule:
+ * it never walks the free-slot calendar (a master who is merely fully booked right now passes).
+ * It is the visibility verdict for search suggestions, favourites and the home rail.
+ *
+ * <p><b>Search and the public salon roster no longer use it as their verdict (SRCH-30, SRCH-31,
+ * SAL-09, 2026-11-18).</b> There it is only the cheap PRE-filter that narrows the candidate set
+ * ({@code SearchService} candidate queries, {@code MasterRepository#findBookableIdsBySalonId});
+ * membership is then decided by the strict free-slot verdict
+ * ({@code StrictBookableResolver} → {@code BookingMasterService#computeBookableAssignmentIds} /
+ * the salon catalogue's batch gate). Every strictly bookable master also passes this predicate, so
+ * the pre-filter can never hide a bookable master.
  *
  * <h3>What counts as a schedule</h3>
  * Override beats template beats gap ({@code MasterScheduleService#foldDates}), so both sources are
@@ -42,7 +48,7 @@ import java.util.regex.Pattern;
  * CURRENT context owns: a salon-attached master's definition must be SALON-owned by that same salon,
  * a salon-less (independent) master's must be INDEPENDENT_MASTER-owned by that master. A stale
  * cross-owner assignment (a master who moved between solo practice and a salon) never counts —
- * the same ownership rule {@code MasterServiceRepository#findBookableAssignmentsByMasterIds} applies
+ * the same ownership rule {@code MasterServiceRepository#findBookableAssignmentDurationsByMasterIds} applies
  * to the strict verdict.
  *
  * <h3>Forms</h3>

@@ -19,6 +19,7 @@ import lombok.Builder;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
+import org.hibernate.annotations.BatchSize;
 
 import java.time.LocalDate;
 import java.time.LocalTime;
@@ -80,7 +81,13 @@ public class ScheduleException extends AuditableEntity {
      * override finders {@code LEFT JOIN FETCH} only {@code intervals}; this {@code Set} is hydrated by
      * {@code hibernate.default_batch_fetch_size} (no second fetch-join — avoids the cartesian product).
      * Mode exclusivity (an override is EITHER in {@code intervals} OR here) is a service-layer invariant.
+     *
+     * <p><b>Batch size {@value WeeklySchedule#DISCRETE_TIMES_BATCH_SIZE}, not the default 50 (B523 perf
+     * gate)</b> — same reason as {@link WeeklySchedule#getDiscreteTimes()}: the strict search verdict folds
+     * the overrides of up to 2 000 masters in one batch, so at 50 keys per statement the hydration grew
+     * with the candidate count; one array-bound statement covers a capped search.
      */
+    @BatchSize(size = WeeklySchedule.DISCRETE_TIMES_BATCH_SIZE)
     @OneToMany(
             mappedBy = "exception",
             cascade = CascadeType.ALL,

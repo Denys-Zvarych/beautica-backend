@@ -152,6 +152,13 @@ public final class SalonSearchSql {
      */
     public static final int STATIC_TOKEN_PARAM_COUNT = 4;
 
+    /**
+     * Bind name of the strict-bookable {@code master_services} id array (SRCH-31) every salon search
+     * form reads: the static {@code pr} lateral (membership gate + price band), the q gate and the
+     * dynamic builder's strict {@code EXISTS}. Bound as a {@code UUID[]} — one bind whatever its size.
+     */
+    public static final String STRICT_ASSIGNMENT_IDS_PARAM = "strictAssignmentIds";
+
     // ── bookable-master gate (alias-parameterised via constant concatenation) ──
 
     /*
@@ -170,11 +177,23 @@ public final class SalonSearchSql {
                     + "JOIN masters mmq ON mmq.id = msq.master_id AND mmq.is_active = true "
                     + "AND mmq.salon_id = ";
     private static final String GATE_MID = ".id WHERE msq.service_def_id = ";
-    private static final String GATE_TAIL = ".id AND msq.is_active = true AND "
-            + MasterBookabilitySql.HAS_SCHEDULE_MMQ + ") ";
+    private static final String GATE_TAIL_STRUCTURAL = ".id AND msq.is_active = true AND "
+            + MasterBookabilitySql.HAS_SCHEDULE_MMQ;
+    private static final String GATE_TAIL = GATE_TAIL_STRUCTURAL
+            // SRCH-31 (2026-11-18): the performing assignment must pass the strict free-slot
+            // verdict — a q match is only explained by a service a client can actually book.
+            // Hashed semi-join (one hash of the array per statement), not a per-row `= ANY` scan.
+            + " AND msq.id IN (SELECT unnest(:" + STRICT_ASSIGNMENT_IDS_PARAM + "))) ";
 
     /** Bookable gate for the WHERE-clause form: salon {@code s}, definition {@code sdq}. */
     private static final String BOOKABLE_MASTER_GATE = GATE_HEAD + "s" + GATE_MID + "sdq" + GATE_TAIL;
+
+    /**
+     * Structural twin of {@link #BOOKABLE_MASTER_GATE} (no strict id set) — only for the salon
+     * search CANDIDATE query, which runs before the strict set exists ({@link #structuralQGroupPredicate}).
+     */
+    private static final String BOOKABLE_MASTER_GATE_STRUCTURAL =
+            GATE_HEAD + "s" + GATE_MID + "sdq" + GATE_TAIL_STRUCTURAL + ") ";
 
     /** Bookable gate for the matched-names lateral: salon {@code t}, definition {@code sd4}. */
     private static final String BOOKABLE_MASTER_GATE_MATCHED = GATE_HEAD + "t" + GATE_MID + "sd4" + GATE_TAIL;
@@ -184,11 +203,15 @@ public final class SalonSearchSql {
      * services, up to (but excluding) the per-token conjunction — callers append
      * the token conditions and the closing parenthesis.
      */
-    private static final String BOOKABLE_SERVICE_MATCH_HEAD =
+    private static final String SERVICE_MATCH_HEAD_PREFIX =
             "EXISTS (SELECT 1 FROM service_definitions sdq "
-                    + "WHERE sdq.owner_type = 'SALON' AND sdq.owner_id = s.id AND sdq.is_active = true "
-                    + BOOKABLE_MASTER_GATE
-                    + "AND ";
+                    + "WHERE sdq.owner_type = 'SALON' AND sdq.owner_id = s.id AND sdq.is_active = true ";
+    private static final String BOOKABLE_SERVICE_MATCH_HEAD =
+            SERVICE_MATCH_HEAD_PREFIX + BOOKABLE_MASTER_GATE + "AND ";
+
+    /** {@link #BOOKABLE_SERVICE_MATCH_HEAD} on the structural gate — candidate query only. */
+    private static final String STRUCTURAL_SERVICE_MATCH_HEAD =
+            SERVICE_MATCH_HEAD_PREFIX + BOOKABLE_MASTER_GATE_STRUCTURAL + "AND ";
 
     // ── static (@Query) form: null-gated, one branch per bind slot ────────────
 
@@ -471,23 +494,17 @@ public final class SalonSearchSql {
      * BUFFERS)} plans for this lateral live in {@code docs/backend-phases/} (Phase 315 perf
      * appendix).</p>
      *
-     * <p><b>The OCCUPANCY half is deliberately NOT replicated, and that residual divergence is
-     * intentional.</b> The catalogue's gate also walks the free-slot calendar — day-off overrides,
-     * CONFIRMED bookings filling a day, {@code EXPLICIT_TIMES} whose declared times have all
-     * elapsed — over a 180-day window, per master, in Java. That walk is not expressible here
-     * without either a per-row function call inside a paginated Top-N over every salon in the
-     * result set, or duplicating the slot calculator in SQL, which is the fork
-     * {@code ServicePricing}/{@code SlotCalculationService} exist to prevent. Search answers "what
-     * price range might I find at this salon", a discovery band; the catalogue answers "what can I
-     * book here right now". A salon whose masters all happen to be fully booked for the next six
-     * months keeps its search band and shows an empty catalogue — that is the accepted, documented
-     * shape. It is no longer documented ONLY here:
-     * {@code SalonSearchPriceBandIT#should_keepTheSearchBand_when_theCatalogueIsEmptyForAFullyOccupiedMaster_pinningTheOccupancyDivergenceAsDeliberate}
-     * seeds exactly that salon and asserts the asymmetry, so closing it in SQL turns a test RED
-     * instead of silently passing — the same convention
-     * {@code SalonCatalogueVisibilityIT#should_notBeVisible_when_masterHasNoWorkingHours_pinningD1AsDeliberate}
-     * uses for its own deliberate rule. The structural half is pinned by that class's
-     * reconciliation cases.</p>
+     * <p><b>The OCCUPANCY half is now closed by the strict id gate (SRCH-31, 2026-11-18).</b> The
+     * catalogue's gate also walks the free-slot calendar — day-off overrides, CONFIRMED bookings
+     * filling a day, {@code EXPLICIT_TIMES} whose declared times have all elapsed — over a 180-day
+     * window, per master, in Java. That walk is still not re-implemented in SQL: {@code SearchService}
+     * resolves it up front through {@code StrictBookableResolver} (the catalogue's own
+     * {@code filterBookableAssignmentsBatch} verdict, cached per master) and binds the surviving
+     * {@code master_services} ids as {@code :strictAssignmentIds}. {@code ms.id IN (SELECT unnest(...))} then makes
+     * {@code pr.bookable_rows > 0} a strict membership gate and prices the band from bookable
+     * assignments only, so a fully occupied salon leaves search instead of keeping its band
+     * ({@code SalonSearchPriceBandIT} pins the new rule; the previous deliberate-divergence pin was
+     * inverted with this change).</p>
      */
     public static final String STATIC_PROJECTION_HEAD = """
             SELECT t.id           AS id,
@@ -529,6 +546,7 @@ public final class SalonSearchSql {
                       AND sd.owner_id = s.id
                       AND ms.is_active = true
                       AND """ + MasterBookabilitySql.HAS_SCHEDULE_MAD + """
+                      AND ms.id IN (SELECT unnest(:strictAssignmentIds))
                       AND (CAST(:category AS text) IS NULL OR sd.category = CAST(:category AS text))
                 ) pr ON true
                 WHERE s.is_active = true
@@ -624,6 +642,7 @@ public final class SalonSearchSql {
                                       JOIN masters mm2 ON mm2.id = ms2.master_id AND mm2.is_active = true AND mm2.salon_id = t.id
                                       WHERE ms2.service_def_id = sd2.id AND ms2.is_active = true
                                         AND """ + MasterBookabilitySql.HAS_SCHEDULE_MM2 + """
+                                        AND ms2.id IN (SELECT unnest(:strictAssignmentIds))
                                       )
                           AND (CAST(:category AS text) IS NULL OR sd2.category = CAST(:category AS text))
                         ORDER BY sd2.name
@@ -731,6 +750,20 @@ public final class SalonSearchSql {
      * @return the {@code AND (…)} predicate, or the empty string when {@code tokenCount == 0}
      */
     public static String dynamicQGroupPredicate(int tokenCount, int categoryCount) {
+        return qGroupPredicate(BOOKABLE_SERVICE_MATCH_HEAD, tokenCount, categoryCount);
+    }
+
+    /**
+     * {@link #dynamicQGroupPredicate} on the STRUCTURAL bookable gate (no strict id set) — for the
+     * salon search candidate query only ({@code SearchService#resolveStrictSalonMasters}), which runs
+     * before the strict set is known. It matches a superset of the strict form; the main query then
+     * applies the strict form.
+     */
+    public static String structuralQGroupPredicate(int tokenCount, int categoryCount) {
+        return qGroupPredicate(STRUCTURAL_SERVICE_MATCH_HEAD, tokenCount, categoryCount);
+    }
+
+    private static String qGroupPredicate(String serviceMatchHead, int tokenCount, int categoryCount) {
         if (tokenCount <= 0) {
             return "";
         }
@@ -743,7 +776,7 @@ public final class SalonSearchSql {
             }
             sb.append("s.name ILIKE :q").append(i);
         }
-        sb.append(") OR ").append(BOOKABLE_SERVICE_MATCH_HEAD);
+        sb.append(") OR ").append(serviceMatchHead);
         for (int i = 0; i < tokenCount; i++) {
             if (i > 0) {
                 sb.append(" AND ");

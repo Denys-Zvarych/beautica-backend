@@ -146,6 +146,8 @@ class CachePrefixEvictionKeyShapeTest {
     @MockBean MasterServiceRepository masterServiceRepository;
     @MockBean MasterScheduleService masterScheduleService;
     @MockBean com.beautica.master.service.ScheduleDateMath scheduleDateMath;
+    // MasterService ctor dependency: the public roster's strict verdict (SAL-09).
+    @MockBean com.beautica.search.service.StrictBookableResolver strictBookableResolver;
     @MockBean com.beautica.common.util.TimeSlotCalculator timeSlotCalculator;
 
     // DashboardService collaborators
