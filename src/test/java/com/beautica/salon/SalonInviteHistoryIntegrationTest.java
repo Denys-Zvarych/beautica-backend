@@ -1,5 +1,6 @@
 package com.beautica.salon;
 
+import com.beautica.support.StaffInviteFixtures;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.LoginRequest;
@@ -81,15 +82,15 @@ class SalonInviteHistoryIntegrationTest extends AbstractIntegrationTest {
         UUID ownerId = insertUser("owner-statuses-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
         UUID salonId = insertSalon(ownerId, "All Statuses Salon");
 
-        UUID pendingId = insertInvite("pending@beautica.test", salonId, "SALON_MASTER",
+        UUID pendingId = insertInvite(StaffInviteFixtures.newPhone(), salonId, "SALON_MASTER",
                 Instant.now().plus(7, ChronoUnit.DAYS), false, null, hoursAgo(1));
-        UUID acceptedId = insertInvite("accepted@beautica.test", salonId, "SALON_ADMIN",
+        UUID acceptedId = insertInvite(StaffInviteFixtures.newPhone(), salonId, "SALON_ADMIN",
                 Instant.now().plus(7, ChronoUnit.DAYS), true, null, hoursAgo(2));
-        UUID lapsedId = insertInvite("lapsed@beautica.test", salonId, "SALON_MASTER",
+        UUID lapsedId = insertInvite(StaffInviteFixtures.newPhone(), salonId, "SALON_MASTER",
                 Instant.now().minus(1, ChronoUnit.DAYS), false, null, hoursAgo(3));
-        UUID supersededId = insertInvite("superseded@beautica.test", salonId, "SALON_MASTER",
+        UUID supersededId = insertInvite(StaffInviteFixtures.newPhone(), salonId, "SALON_MASTER",
                 Instant.now().minus(2, ChronoUnit.DAYS), false, "SUPERSEDED", hoursAgo(4));
-        UUID cancelledId = insertInvite("cancelled@beautica.test", salonId, "SALON_MASTER",
+        UUID cancelledId = insertInvite(StaffInviteFixtures.newPhone(), salonId, "SALON_MASTER",
                 Instant.now().plus(7, ChronoUnit.DAYS), true, "CANCELLED", hoursAgo(5));
 
         String ownerToken = loginAndGetToken(emailOf(ownerId));
@@ -135,13 +136,13 @@ class SalonInviteHistoryIntegrationTest extends AbstractIntegrationTest {
         UUID salonId = insertSalon(ownerId, "Ordering Salon");
 
         // Inserted 3rd-newest, newest, oldest, 2nd-newest — no relationship to the expected order.
-        UUID third = insertInvite("third@beautica.test", salonId, "SALON_MASTER",
+        UUID third = insertInvite(StaffInviteFixtures.newPhone(), salonId, "SALON_MASTER",
                 Instant.now().plus(7, ChronoUnit.DAYS), false, null, hoursAgo(30));
-        UUID first = insertInvite("first@beautica.test", salonId, "SALON_MASTER",
+        UUID first = insertInvite(StaffInviteFixtures.newPhone(), salonId, "SALON_MASTER",
                 Instant.now().plus(7, ChronoUnit.DAYS), false, null, hoursAgo(1));
-        UUID fourth = insertInvite("fourth@beautica.test", salonId, "SALON_MASTER",
+        UUID fourth = insertInvite(StaffInviteFixtures.newPhone(), salonId, "SALON_MASTER",
                 Instant.now().plus(7, ChronoUnit.DAYS), false, null, hoursAgo(200));
-        UUID second = insertInvite("second@beautica.test", salonId, "SALON_MASTER",
+        UUID second = insertInvite(StaffInviteFixtures.newPhone(), salonId, "SALON_MASTER",
                 Instant.now().plus(7, ChronoUnit.DAYS), false, null, hoursAgo(10));
 
         String ownerToken = loginAndGetToken(emailOf(ownerId));
@@ -170,7 +171,7 @@ class SalonInviteHistoryIntegrationTest extends AbstractIntegrationTest {
     void should_neverSerialiseTokenMaterial_when_listingHistory() throws Exception {
         UUID ownerId = insertUser("owner-notoken-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
         UUID salonId = insertSalon(ownerId, "No Token Leak Salon");
-        UUID inviteId = insertInvite("leak-check@beautica.test", salonId, "SALON_MASTER",
+        UUID inviteId = insertInvite(StaffInviteFixtures.newPhone(), salonId, "SALON_MASTER",
                 Instant.now().plus(7, ChronoUnit.DAYS), false, null, hoursAgo(1));
         String storedToken = jdbcTemplate.queryForObject(
                 "SELECT token FROM invite_tokens WHERE id = ?", String.class, inviteId);
@@ -200,7 +201,7 @@ class SalonInviteHistoryIntegrationTest extends AbstractIntegrationTest {
         UUID ownerId = insertUser("owner-admin-list-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
         UUID salonId = insertSalon(ownerId, "Admin Lists Invites Salon");
         UUID adminId = insertSalonAdminUser("admin-list-" + System.nanoTime() + "@beautica.test", salonId);
-        UUID inviteId = insertInvite("invitee-admin@beautica.test", salonId, "SALON_ADMIN",
+        UUID inviteId = insertInvite(StaffInviteFixtures.newPhone(), salonId, "SALON_ADMIN",
                 Instant.now().plus(7, ChronoUnit.DAYS), false, null, hoursAgo(1));
         String adminToken = loginAndGetToken(emailOf(adminId));
 
@@ -221,7 +222,7 @@ class SalonInviteHistoryIntegrationTest extends AbstractIntegrationTest {
     void should_return403_when_adminFromDifferentSalonListsHistory() throws Exception {
         UUID ownerAId = insertUser("owner-a-list-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
         UUID salonAId = insertSalon(ownerAId, "Salon A List");
-        insertInvite("invitee-a@beautica.test", salonAId, "SALON_MASTER",
+        insertInvite(StaffInviteFixtures.newPhone(), salonAId, "SALON_MASTER",
                 Instant.now().plus(7, ChronoUnit.DAYS), false, null, hoursAgo(1));
 
         UUID ownerBId = insertUser("owner-b-list-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
@@ -245,7 +246,7 @@ class SalonInviteHistoryIntegrationTest extends AbstractIntegrationTest {
     void should_return403_when_nonManagingOwnerListsHistory() throws Exception {
         UUID ownerAId = insertUser("owner-a-hist-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
         UUID salonAId = insertSalon(ownerAId, "Salon A Owner Isolation");
-        insertInvite("invitee-a-owner@beautica.test", salonAId, "SALON_MASTER",
+        insertInvite(StaffInviteFixtures.newPhone(), salonAId, "SALON_MASTER",
                 Instant.now().plus(7, ChronoUnit.DAYS), false, null, hoursAgo(1));
 
         UUID ownerBId = insertUser("owner-b-hist-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
@@ -331,7 +332,7 @@ class SalonInviteHistoryIntegrationTest extends AbstractIntegrationTest {
         // Arrange
         UUID ownerId = insertUser("owner-cancel-hist-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
         UUID salonId = insertSalon(ownerId, "Cancel Stays In History Salon");
-        UUID inviteId = insertInvite("cancel-history@beautica.test", salonId, "SALON_MASTER",
+        UUID inviteId = insertInvite(StaffInviteFixtures.newPhone(), salonId, "SALON_MASTER",
                 Instant.now().plus(7, ChronoUnit.DAYS), false, null, hoursAgo(1));
         String ownerToken = loginAndGetToken(emailOf(ownerId));
 
@@ -371,7 +372,7 @@ class SalonInviteHistoryIntegrationTest extends AbstractIntegrationTest {
         // Arrange
         UUID ownerId = insertUser("owner-cancel-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
         UUID salonId = insertSalon(ownerId, "Cancel Invite Salon");
-        UUID inviteId = insertInvite("cancel-target@beautica.test", salonId, "SALON_MASTER",
+        UUID inviteId = insertInvite(StaffInviteFixtures.newPhone(), salonId, "SALON_MASTER",
                 Instant.now().plus(7, ChronoUnit.DAYS), false, null, hoursAgo(1));
         String ownerToken = loginAndGetToken(emailOf(ownerId));
 
@@ -409,7 +410,7 @@ class SalonInviteHistoryIntegrationTest extends AbstractIntegrationTest {
         UUID ownerId = insertUser("owner-admin-cancel-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
         UUID salonId = insertSalon(ownerId, "Admin Cancel Salon");
         UUID adminId = insertSalonAdminUser("admin-cancel-" + System.nanoTime() + "@beautica.test", salonId);
-        UUID inviteId = insertInvite("admin-cancel-target@beautica.test", salonId,
+        UUID inviteId = insertInvite(StaffInviteFixtures.newPhone(), salonId,
                 "SALON_MASTER", Instant.now().plus(7, ChronoUnit.DAYS), false, null, hoursAgo(1));
         String adminToken = loginAndGetToken(emailOf(adminId));
 
@@ -429,7 +430,7 @@ class SalonInviteHistoryIntegrationTest extends AbstractIntegrationTest {
         // Arrange — salon A's invite, salon B's admin
         UUID ownerAId = insertUser("owner-a-cancel-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
         UUID salonAId = insertSalon(ownerAId, "Salon A Cancel");
-        UUID inviteAId = insertInvite("invite-a-cancel@beautica.test", salonAId,
+        UUID inviteAId = insertInvite(StaffInviteFixtures.newPhone(), salonAId,
                 "SALON_MASTER", Instant.now().plus(7, ChronoUnit.DAYS), false, null, hoursAgo(1));
 
         UUID ownerBId = insertUser("owner-b-cancel-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
@@ -464,7 +465,7 @@ class SalonInviteHistoryIntegrationTest extends AbstractIntegrationTest {
         // itself belongs there. SalonService.cancelInvite's defense-in-depth check must 404.
         UUID ownerAId = insertUser("owner-a-mismatch-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
         UUID salonAId = insertSalon(ownerAId, "Salon A Mismatch");
-        UUID inviteAId = insertInvite("invite-a-mismatch@beautica.test", salonAId,
+        UUID inviteAId = insertInvite(StaffInviteFixtures.newPhone(), salonAId,
                 "SALON_MASTER", Instant.now().plus(7, ChronoUnit.DAYS), false, null, hoursAgo(1));
 
         UUID ownerBId = insertUser("owner-b-mismatch-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
@@ -494,7 +495,7 @@ class SalonInviteHistoryIntegrationTest extends AbstractIntegrationTest {
         // Arrange
         UUID ownerId = insertUser("owner-client-cancel-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
         UUID salonId = insertSalon(ownerId, "Client Cancel Denied Salon");
-        UUID inviteId = insertInvite("cancel-denied@beautica.test", salonId,
+        UUID inviteId = insertInvite(StaffInviteFixtures.newPhone(), salonId,
                 "SALON_MASTER", Instant.now().plus(7, ChronoUnit.DAYS), false, null, hoursAgo(1));
         UUID clientId = insertUser("client-cancel-" + System.nanoTime() + "@beautica.test", "CLIENT");
         String clientToken = loginAndGetToken(emailOf(clientId));
@@ -523,8 +524,9 @@ class SalonInviteHistoryIntegrationTest extends AbstractIntegrationTest {
         UUID ownerId = insertUser("owner-cancel-then-accept-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
         UUID salonId = insertSalon(ownerId, "Cancel Then Accept Salon");
         String rawToken = "raw-cancel-then-accept-" + UUID.randomUUID();
+        String inviteePhone = StaffInviteFixtures.newPhone();
         UUID inviteId = insertInviteTokenWithRawToken(
-                "cancel-then-accept-" + System.nanoTime() + "@beautica.test", salonId, "SALON_MASTER",
+                inviteePhone, salonId, "SALON_MASTER",
                 Instant.now().plus(7, ChronoUnit.DAYS), rawToken);
         String ownerToken = loginAndGetToken(emailOf(ownerId));
 
@@ -539,7 +541,8 @@ class SalonInviteHistoryIntegrationTest extends AbstractIntegrationTest {
 
         // Act 2 — the invitee, who never saw the cancellation, tries to accept the now-dead link
         var acceptRequest = new com.beautica.auth.dto.InviteAcceptRequest(
-                rawToken, "Str0ngP@ss1!", "Jane", "Doe", "+380501234567");
+                rawToken, "Str0ngP@ss1!", "Jane", "Doe", null, null, null, null,
+                StaffInviteFixtures.seedRegistrationTicket(jdbcTemplate, inviteePhone));
         log.debug("Act 2: the invitee posts the cancelled invite's raw token to /auth/invite/accept");
         ResponseEntity<String> acceptResponse = restTemplate.postForEntity(
                 "/api/v1/auth/invite/accept", acceptRequest, String.class);
@@ -556,7 +559,7 @@ class SalonInviteHistoryIntegrationTest extends AbstractIntegrationTest {
                 .as("phase 285: a cancelled invite must report INVITE_REVOKED, not INVITE_USED")
                 .isEqualTo(com.beautica.common.exception.InviteTokenException.Code.INVITE_REVOKED.name());
         assertThat(jdbcTemplate.queryForObject(
-                        "SELECT COUNT(*) FROM users WHERE email = (SELECT email FROM invite_tokens WHERE id = ?)",
+                        "SELECT COUNT(*) FROM users WHERE phone_number = (SELECT phone FROM invite_tokens WHERE id = ?)",
                         Integer.class, inviteId))
                 .as("no account must ever be provisioned from a cancelled invite")
                 .isZero();
@@ -574,7 +577,7 @@ class SalonInviteHistoryIntegrationTest extends AbstractIntegrationTest {
     void should_carryTruncationFlagOnTheWire_when_listingHistory() throws Exception {
         UUID ownerId = insertUser("owner-trunc-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
         UUID salonId = insertSalon(ownerId, "Truncation Signal Salon");
-        UUID inviteId = insertInvite("trunc-check@beautica.test", salonId, "SALON_MASTER",
+        UUID inviteId = insertInvite(StaffInviteFixtures.newPhone(), salonId, "SALON_MASTER",
                 Instant.now().plus(7, ChronoUnit.DAYS), false, null, hoursAgo(1));
         String ownerToken = loginAndGetToken(emailOf(ownerId));
 
@@ -612,7 +615,7 @@ class SalonInviteHistoryIntegrationTest extends AbstractIntegrationTest {
     void should_return404_when_cancellingSupersededInvite() throws Exception {
         UUID ownerId = insertUser("owner-cancel-superseded-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
         UUID salonId = insertSalon(ownerId, "Cancel Superseded Salon");
-        UUID inviteId = insertInvite("superseded-target@beautica.test", salonId, "SALON_MASTER",
+        UUID inviteId = insertInvite(StaffInviteFixtures.newPhone(), salonId, "SALON_MASTER",
                 Instant.now().minus(1, ChronoUnit.DAYS), false, "SUPERSEDED", hoursAgo(48));
         String ownerToken = loginAndGetToken(emailOf(ownerId));
 
@@ -645,7 +648,7 @@ class SalonInviteHistoryIntegrationTest extends AbstractIntegrationTest {
     void should_return404_when_cancellingExpiredInvite() throws Exception {
         UUID ownerId = insertUser("owner-cancel-expired-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
         UUID salonId = insertSalon(ownerId, "Cancel Expired Salon");
-        UUID inviteId = insertInvite("expired-target@beautica.test", salonId, "SALON_MASTER",
+        UUID inviteId = insertInvite(StaffInviteFixtures.newPhone(), salonId, "SALON_MASTER",
                 Instant.now().minus(1, ChronoUnit.HOURS), false, null, hoursAgo(72));
         String ownerToken = loginAndGetToken(emailOf(ownerId));
 
@@ -675,7 +678,7 @@ class SalonInviteHistoryIntegrationTest extends AbstractIntegrationTest {
     void should_keepHistoryStatusUnchanged_when_cancelIsRefused() throws Exception {
         UUID ownerId = insertUser("owner-refused-cancel-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
         UUID salonId = insertSalon(ownerId, "Refused Cancel Salon");
-        UUID supersededId = insertInvite("superseded-hist@beautica.test", salonId, "SALON_MASTER",
+        UUID supersededId = insertInvite(StaffInviteFixtures.newPhone(), salonId, "SALON_MASTER",
                 Instant.now().minus(1, ChronoUnit.DAYS), false, "SUPERSEDED", hoursAgo(48));
         String ownerToken = loginAndGetToken(emailOf(ownerId));
 
@@ -744,7 +747,8 @@ class SalonInviteHistoryIntegrationTest extends AbstractIntegrationTest {
      * {@code revoked_at} null too, satisfying V153's {@code ck_invite_tokens_revoked_pair} CHECK
      * — pass a reason and both columns are written together, exactly as the entity does.
      */
-    private UUID insertInvite(String email, UUID salonId, String role, Instant expiresAt,
+    /** B520 — a phone invite row (pre-B520 email rows still PENDING are hidden from the list, SAL-48). */
+    private UUID insertInvite(String phone, UUID salonId, String role, Instant expiresAt,
             boolean isUsed, String revokedReason, Instant createdAt) {
         UUID id = UUID.randomUUID();
         // Namespaced per row so parallel classes sharing the container cannot collide on the
@@ -753,10 +757,10 @@ class SalonInviteHistoryIntegrationTest extends AbstractIntegrationTest {
         String token = "test-invite-token-" + id;
         jdbcTemplate.update(
                 "INSERT INTO invite_tokens "
-                        + "(id, token, email, salon_id, role, expires_at, is_used, revoked_at, revoked_reason, "
+                        + "(id, token, phone, salon_id, role, expires_at, is_used, revoked_at, revoked_reason, "
                         + "created_at, updated_at) "
                         + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
-                id, token, email, salonId, role, java.sql.Timestamp.from(expiresAt), isUsed,
+                id, token, phone, salonId, role, java.sql.Timestamp.from(expiresAt), isUsed,
                 revokedReason == null ? null : java.sql.Timestamp.from(createdAt), revokedReason,
                 java.sql.Timestamp.from(createdAt));
         return id;
@@ -769,13 +773,13 @@ class SalonInviteHistoryIntegrationTest extends AbstractIntegrationTest {
      * it up). {@link #insertInvite}'s literal token value is never accepted by that endpoint;
      * this helper exists specifically for tests that exercise the accept flow end-to-end.
      */
-    private UUID insertInviteTokenWithRawToken(String email, UUID salonId, String role, Instant expiresAt,
+    private UUID insertInviteTokenWithRawToken(String phone, UUID salonId, String role, Instant expiresAt,
             String rawToken) {
         UUID id = UUID.randomUUID();
         jdbcTemplate.update(
-                "INSERT INTO invite_tokens (id, token, email, salon_id, role, expires_at, is_used, created_at, updated_at) "
+                "INSERT INTO invite_tokens (id, token, phone, salon_id, role, expires_at, is_used, created_at, updated_at) "
                         + "VALUES (?, ?, ?, ?, ?, ?, false, NOW(), NOW())",
-                id, sha256Hex(rawToken), email, salonId, role, java.sql.Timestamp.from(expiresAt));
+                id, sha256Hex(rawToken), phone, salonId, role, java.sql.Timestamp.from(expiresAt));
         return id;
     }
 

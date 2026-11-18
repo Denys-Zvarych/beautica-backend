@@ -1,5 +1,6 @@
 package com.beautica.salon.controller;
 
+import com.beautica.auth.appcheck.RequireAppCheck;
 import com.beautica.common.web.PerViewerResponses;
 import com.beautica.auth.dto.InviteResponse;
 import com.beautica.booking.dto.BookableMasterResponse;
@@ -114,7 +115,9 @@ public class SalonController {
 
     // SALON_ADMIN may invite masters to their own salon — intentional per product decision.
     // canManageSalon enforces salonId == admin's assigned salon_id set at invite time.
+    // B520: the invitee gets one SMS (AUTH-54 — App Check before the handler; AUTH-52 caps in the service).
     @PostMapping("/{salonId}/invite")
+    @RequireAppCheck
     @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN') and @authz.canManageSalon(authentication, #salonId)")
     public ResponseEntity<ApiResponse<InviteResponse>> inviteMaster(
             @PathVariable UUID salonId,
@@ -122,7 +125,7 @@ public class SalonController {
             Authentication authentication
     ) {
         UUID ownerId = AuthenticationUtils.userId(authentication);
-        InviteResponse response = salonService.inviteMaster(ownerId, salonId, request.email(), request.effectiveRole());
+        InviteResponse response = salonService.inviteMaster(ownerId, salonId, request.phone(), request.effectiveRole());
         return ResponseEntity.status(201).body(ApiResponse.ok(response));
     }
 

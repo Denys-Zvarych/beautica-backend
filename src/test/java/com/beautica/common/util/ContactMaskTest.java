@@ -29,4 +29,18 @@ class ContactMaskTest {
         assertThat(ContactMask.email("@gmail.com")).isNull();
         assertThat(ContactMask.email("olena@")).isNull();
     }
+
+    @Test
+    @DisplayName("B520: the invite preview mask shows only the last two digits, grouped like a UA number")
+    void should_maskAllButLastTwoDigits_when_invitePhone() {
+        assertThat(ContactMask.invitePhone("+380671234545")).isEqualTo("+380 •• ••• •• 45");
+    }
+
+    @Test
+    @DisplayName("B520: anything but a +380 nine-digit number masks to nothing")
+    void should_returnNull_when_invitePhoneMalformed() {
+        assertThat(ContactMask.invitePhone(null)).isNull();
+        assertThat(ContactMask.invitePhone("+38067123")).isNull();
+        assertThat(ContactMask.invitePhone("+48501234567")).isNull();
+    }
 }

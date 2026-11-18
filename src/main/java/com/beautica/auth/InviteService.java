@@ -6,12 +6,13 @@ import com.beautica.auth.dto.InvitePreviewResponse;
 import com.beautica.auth.dto.InviteRequest;
 import com.beautica.auth.dto.InviteResponse;
 import com.beautica.auth.registration.RegistrationTicketService;
-import com.beautica.common.exception.EmailAlreadyRegisteredException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.IdentityException;
 import com.beautica.common.exception.InviteTokenException;
 import com.beautica.common.exception.NotFoundException;
+import com.beautica.common.util.ContactMask;
 import com.beautica.common.util.SchemeGuard;
+import com.beautica.common.util.UaMobilePhone;
 import com.beautica.master.service.MasterService;
 import com.beautica.notification.inapp.service.InAppNotificationService;
 import com.beautica.salon.entity.Salon;
@@ -35,7 +36,6 @@ import java.time.Clock;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.EnumSet;
-import java.util.Locale;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
@@ -70,6 +70,8 @@ public class InviteService {
     private final InAppNotificationService inAppNotificationService;
     // B514 (AUTH-43) — the invitee's phone, proven by a registration ticket before accept.
     private final RegistrationTicketService registrationTicketService;
+    // B520 audit-fix — bounds the free 409 PHONE_ALREADY_REGISTERED answers per inviter.
+    private final InviteConflictProbeBudget conflictProbeBudget;
 
     public InviteService(
             InviteTokenRepository inviteTokenRepository,
@@ -84,7 +86,8 @@ public class InviteService {
             @Value("${app.invite.token-expiration-hours:48}") long tokenExpirationHours,
             Clock clock,
             InAppNotificationService inAppNotificationService,
-            RegistrationTicketService registrationTicketService
+            RegistrationTicketService registrationTicketService,
+            InviteConflictProbeBudget conflictProbeBudget
     ) {
         this.inviteTokenRepository = inviteTokenRepository;
         this.userRepository = userRepository;
@@ -99,6 +102,7 @@ public class InviteService {
         this.clock = clock;
         this.inAppNotificationService = inAppNotificationService;
         this.registrationTicketService = registrationTicketService;
+        this.conflictProbeBudget = conflictProbeBudget;
     }
 
     /**
@@ -115,330 +119,248 @@ public class InviteService {
     }
 
     /**
-     * Sends a salon invite for the target email.
+     * Sends a salon staff invite to a Ukrainian mobile number (B520, AUTH-16 / AUTH-18 / AUTH-52): one SMS with the
+     * salon name and the join link, enqueued in the invite's own commit.
      *
-     * <p><strong>Phase 287 — anti-enumeration reasoning REVERSED for the already-registered
-     * branch.</strong> This method used to swallow an already-registered target into the same
-     * non-distinguishing generic 201 as a brand-new invite, on the theory that a distinguishing
-     * 4xx here would turn this endpoint into an enumeration oracle (an authenticated caller
-     * could probe arbitrary emails for registration status). That trade-off is reversed as of
-     * phase 287, on the identical precedent {@link AuthService#register}'s duplicate-email 409
-     * already established: {@code AuthService#register} is {@code permitAll} and already returns
-     * an honest 409 {@code EMAIL_ALREADY_REGISTERED} <em>to anyone on the internet</em>, rejecting
-     * the silent-200 as "an undebuggable 'we sent a code, but it never comes' footgun" — the bit
-     * this endpoint was hiding is therefore already public to anonymous callers, so silence here
-     * was paying the footgun cost to protect nothing. This endpoint's caller is, on top of that,
-     * authenticated, role-gated to {@code SALON_OWNER}/{@code SALON_ADMIN}, attributable to a
-     * named principal, and rate-limited on two dedicated Bucket4j buckets ({@code inviteBuckets}
-     * for {@code POST /api/v1/auth/invite}, {@code salonInviteBuckets} for
-     * {@code POST /api/v1/salons/{salonId}/invite}) — it leaks strictly less than
-     * {@code register} already does. See the phase-287 doc for the full ruling.
+     * <p><strong>Order.</strong> Input first ({@code INVITE_PHONE_REQUIRED} for a body without a phone — an old build
+     * still sending only {@code email}; {@code PHONE_NOT_UA_MOBILE} for anything else that is not a UA mobile) — these
+     * reveal nothing about anyone. Then every authorization branch. Only then the honest 409
+     * {@code PHONE_ALREADY_REGISTERED} for a phone verified on any account (AUTH-D02; phase 287's reasoning, now keyed
+     * by phone): {@code alreadyRegistered} is computed up front so the round-trip happens once, but thrown only AFTER
+     * authorization, so a caller who may not invite into that salon still gets an unchanged {@link ForbiddenException}
+     * and learns nothing about the phone. A removed staff member is re-invitable once the account row is gone (AUTH-19,
+     * staff removal hard-deletes it); no invite path reactivates or reassigns an account.
      *
-     * <p><strong>Where the throw sits matters.</strong> {@code alreadyRegistered} is computed
-     * up front, before the caller/role/salon authorization branches below, but the
-     * {@link EmailAlreadyRegisteredException} is thrown only AFTER every authorization check has
-     * passed — at the site of what used to be the synthetic-success early return. Throwing at the
-     * computation site instead would leak registration status to a caller who is not even
-     * authorized to invite into that salon; such a caller must still receive their unchanged
-     * {@link ForbiddenException}, regardless of the target's registration status.
+     * <p>A live invite to the same phone for the same salon is an idempotent 201: no second token, no second SMS, not
+     * counted against the caps. Each salon decides independently (the cross-salon silent-drop fix).
      *
-     * <p>The duplicate-active-invite branch further down keeps its idempotent 201 — this reversal
-     * does not touch it; see its own comment for why.
-     *
-     * <p><strong>Scope:</strong> this reversal covers only the invite-send path. It does not
-     * license changing {@code /auth/forgot-password}, which keeps its deliberate uniform response
-     * — that endpoint is keyed by a guessable email from an anonymous caller and is genuinely
-     * enumerable.
+     * <p>The caps (10 invite SMS per inviter per hour, 30 per salon per day, 3 per phone per day across all salons →
+     * 429 {@code INVITE_SMS_LIMIT}) are enforced inside {@link InvitePersistenceService} under locks. The 409 itself is
+     * budgeted per inviter ({@link InviteConflictProbeBudget}, 10 per hour → then 429 for every invite of theirs). An
+     * inactive salon → 409 {@code INVITE_SALON_INACTIVE}, after authorization and before anything is written. App Check (AUTH-54) runs before this method
+     * ({@code @RequireAppCheck} on both create endpoints).
      */
     @Transactional(readOnly = true)
     public InviteResponse sendInvite(InviteRequest request, UUID callerId) {
-        // Normalise e-mail (lower-case + strip) exactly as AuthService does on every write path,
-        // so this pre-check and the persisted row agree with the case-insensitive
-        // ux_invite_tokens_active index (lower(email), salon_id). Without this, re-inviting
-        // "a@x" while an active "A@x" token exists would miss the salon-scoped pre-check yet
-        // still collide on the lower(email) guard — silently dropping the invite (no token, no
-        // e-mail). Normalising once here keeps existsByEmail, the finder, the persisted token,
-        // the outbox enqueue and the response all on the same canonical value.
-        String email = request.email().toLowerCase(Locale.ROOT).strip();
+        if (request.phone() == null || request.phone().isBlank()) {
+            throw new IdentityException(IdentityException.Code.INVITE_PHONE_REQUIRED);
+        }
+        String phone = UaMobilePhone.require(request.phone());
 
-        // Phase 287: computed here, BEFORE the authorization branches below, purely so the
-        // slow DB round-trip happens once regardless of outcome — the resulting boolean is NOT
-        // acted on until after every authorization check passes (see the throw at the site of
-        // the former synthetic-success early return, further down). Acting on it here would let
-        // an unauthorized caller learn a target's registration status via a ForbiddenException
-        // that never fires; see the method javadoc for the full reversal.
-        boolean alreadyRegistered = userRepository.existsByEmail(email);
+        // Computed BEFORE the authorization branches, acted on only after them (see the method javadoc).
+        boolean alreadyRegistered = userRepository.existsByVerifiedPhone(phone);
 
         User caller = userRepository.findById(callerId)
                 .orElseThrow(() -> new NotFoundException("Caller not found"));
-
         Role targetRole = request.effectiveRole();
+        Salon salon = authorizeInvite(caller, callerId, request.salonId(), targetRole);
 
+        Instant expiresAt = clock.instant().plus(tokenExpirationHours, ChronoUnit.HOURS);
+
+        // Honest 409, thrown HERE — after every authorization/ownership branch above has passed — but only while the
+        // inviter's probe budget lasts; once spent, every invite of theirs is 429 so 429 vs 201 is no oracle either.
+        if (alreadyRegistered) {
+            if (!conflictProbeBudget.tryRecordConflict(callerId)) {
+                throw new IdentityException(IdentityException.Code.INVITE_SMS_LIMIT);
+            }
+            throw new IdentityException(IdentityException.Code.PHONE_ALREADY_REGISTERED);
+        }
+        if (conflictProbeBudget.isExhausted(callerId)) {
+            throw new IdentityException(IdentityException.Code.INVITE_SMS_LIMIT);
+        }
+
+        // Negation of the SAME canonical predicate the recycle filter uses (InviteToken#isExpired): "still live" here
+        // and "recyclable" in InvitePersistenceService partition the timeline with no gap and no overlap.
+        Optional<InviteToken> existingInvite =
+                inviteTokenRepository.findByPhoneAndSalonIdAndIsUsedFalseAndRevokedAtIsNull(phone, request.salonId());
+        if (existingInvite.isPresent() && !existingInvite.get().isExpiredAt(clock.instant())) {
+            log.debug("Invite idempotent: active invite already exists for this salon (salonId={})", request.salonId());
+            return new InviteResponse(phone, expiresAt);
+        }
+
+        String rawToken = tokenGenerator.generateToken();
+        var invite = new InvitePersistenceService.PhoneInvite(phone, request.salonId(), targetRole, expiresAt,
+                tokenGenerator.hash(rawToken), buildInviteLink(rawToken), salon.getName(), callerId);
+
+        // CORRECTNESS (race path): recycle + INSERT + SMS enqueue run in a SEPARATE physical transaction (REQUIRES_NEW).
+        // A concurrent same-(salon, phone) request that raced past the pre-check above trips
+        // ux_invite_tokens_active_phone; the violation poisons only the inner transaction (the caller's — possibly
+        // SalonService.inviteMaster's — is suspended), so it is caught here and answered with the generic 201: one
+        // row, one SMS.
+        try {
+            invitePersistenceService.persistInviteAndEnqueue(invite);
+        } catch (DataIntegrityViolationException e) {
+            log.debug("Invite idempotent: concurrent same-salon invite raced the unique guard (salonId={})", request.salonId());
+        }
+        return new InviteResponse(phone, expiresAt);
+    }
+
+    /**
+     * Every authorization branch of {@link #sendInvite}, in order; returns the target salon.
+     *
+     * <p>Phase 21.1 (multi-admin relaxation): an existing SALON_ADMIN may invite a new SALON_ADMIN into their own
+     * salon. Fix MEDIUM-2: SALON_ADMIN is assigned to a salon but is NOT its owner, so SALON_OWNER verifies ownership
+     * via the owner FK while SALON_ADMIN verifies their assigned salonId matches the request.
+     */
+    private Salon authorizeInvite(User caller, UUID callerId, UUID salonId, Role targetRole) {
+        Salon salon = authorizedSalon(caller, callerId, salonId, targetRole);
+        // Audit-fix: a deactivated salon cannot take staff (its invites could never be accepted, AUTH-E03) — refuse
+        // before any SMS or outbox row; same code as accept's live-salon check.
+        if (!salon.isActive()) {
+            throw new InviteTokenException(
+                    InviteTokenException.Code.INVITE_SALON_INACTIVE, "This salon is no longer active");
+        }
+        return salon;
+    }
+
+    private Salon authorizedSalon(User caller, UUID callerId, UUID salonId, Role targetRole) {
         if (targetRole != Role.SALON_MASTER && targetRole != Role.SALON_ADMIN) {
             throw new ForbiddenException("Role " + targetRole + " cannot be assigned via invite");
         }
-
-        // Phase 21.1 (multi-admin relaxation): an existing SALON_ADMIN may now also invite
-        // a new SALON_ADMIN into their own salon. The salon-scoping branch below (SALON_ADMIN
-        // callers verify request.salonId() == caller.getSalonId()) still fully applies, so a
-        // SALON_ADMIN can never invite an admin into a salon other than their own.
         if (targetRole == Role.SALON_ADMIN
                 && caller.getRole() != Role.SALON_OWNER
                 && caller.getRole() != Role.SALON_ADMIN) {
             throw new ForbiddenException("Only SALON_OWNER or SALON_ADMIN may invite a SALON_ADMIN");
         }
-
-        // Fix MEDIUM-2: SALON_ADMIN is assigned to a salon but is NOT its owner, so
-        // findByIdAndOwnerId always returns empty for them — the invite feature was dead
-        // for SALON_ADMIN callers. Use a role-based branch: SALON_OWNER verifies ownership
-        // via the owner FK; SALON_ADMIN verifies their assigned salonId matches the request.
-        Salon salon;
         if (caller.getRole() == Role.SALON_OWNER) {
-            salon = salonRepository.findByIdAndOwnerId(request.salonId(), callerId)
+            return salonRepository.findByIdAndOwnerId(salonId, callerId)
                     .orElseThrow(() -> new ForbiddenException("You do not own the specified salon"));
-        } else if (caller.getRole() == Role.SALON_ADMIN) {
-            if (!request.salonId().equals(caller.getSalonId())) {
+        }
+        if (caller.getRole() == Role.SALON_ADMIN) {
+            if (!salonId.equals(caller.getSalonId())) {
                 throw new ForbiddenException("SALON_ADMIN may only invite to their own assigned salon");
             }
-            salon = salonRepository.findById(request.salonId())
+            return salonRepository.findById(salonId)
                     .orElseThrow(() -> new NotFoundException("Salon not found"));
-        } else {
-            throw new ForbiddenException("Role " + caller.getRole() + " cannot send invites");
         }
-
-        Instant expiresAt = clock.instant().plus(tokenExpirationHours, ChronoUnit.HOURS);
-
-        // Phase 287: honest 409, thrown HERE — after every authorization/ownership branch above
-        // has already passed — never at the `alreadyRegistered` computation site up top. Reusing
-        // the EXISTING EmailAlreadyRegisteredException/EMAIL_ALREADY_REGISTERED code (same type
-        // AuthService#register throws for the same wire code) rather than minting a second
-        // spelling of it: one code, one handler, no divergence. See the method javadoc for the
-        // full reversal and why this is safe on this endpoint specifically.
-        if (alreadyRegistered) {
-            throw new EmailAlreadyRegisteredException();
-        }
-
-        // A pre-existing *active* (unused, unexpired) invite for THIS salon is an idempotent
-        // success — return the same generic response WITHOUT issuing a second token or e-mail.
-        // UNCHANGED by phase 287: this branch's justification was never anti-enumeration secrecy
-        // in the first place, it is correctness — re-inviting the same person to the same salon
-        // should not mint a second token or send a second e-mail, independent of the target's
-        // registration status. The comment that used to live here argued raising a 409 would
-        // re-open a 200-vs-409 registration-status oracle when combined with the (now-removed)
-        // already-registered silent-201 above; that argument is void now that the already-
-        // registered branch throws its own honest 409 directly two paragraphs up — there is no
-        // longer a silent branch for a 409 here to be compared against. This branch keeps its 201
-        // because it is the correct idempotent response, not because silence protects anything.
-        // An expired prior token is retired (marked SUPERSEDED, not deleted) before a fresh one
-        // is issued.
-        //
-        // SECURITY/CORRECTNESS (cross-salon silent-drop): the lookup is salon-scoped via
-        // salonId. An email-global lookup let salon A's pending invite short-circuit salon B's
-        // dispatch — B's owner saw a false success while no invite for B was ever created. Each
-        // salon now decides idempotency independently against its own pending invite.
-        Optional<InviteToken> existingInvite =
-                inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull(
-                        email, request.salonId());
-        // Negation of the SAME canonical predicate the recycle filter uses (InviteToken#isExpired):
-        // "still live" here and "recyclable" in InvitePersistenceService must partition the
-        // timeline with no gap and no overlap. Two open-coded comparisons could leave a token
-        // that is neither — short-circuiting as idempotent while the row is never retired.
-        if (existingInvite.isPresent() && !existingInvite.get().isExpiredAt(clock.instant())) {
-            log.debug("Invite idempotent: active invite already exists for this salon (salonId={})", request.salonId());
-            return new InviteResponse(email, expiresAt);
-        }
-        // An expired-but-unused token still carries is_used = false; it occupies the
-        // ux_invite_tokens_active slot for (lower(email), salon_id) until revoked_at is set. It is
-        // retired (marked SUPERSEDED — kept as history, never deleted) atomically inside
-        // persistInviteAndEnqueue, in the same transaction as the new INSERT, so the update and
-        // insert never deadlock across transaction boundaries.
-
-        String rawToken = tokenGenerator.generateToken();
-        String hashedToken = tokenGenerator.hash(rawToken);
-        String inviteLink = buildInviteLink(rawToken);
-
-        // CORRECTNESS (race path): the recycle + INSERT + outbox enqueue run in a SEPARATE
-        // physical transaction (REQUIRES_NEW on InvitePersistenceService). A concurrent
-        // same-(salon, lower(email)) request that raced past the pre-check above trips the
-        // ux_invite_tokens_active guard, throwing DataIntegrityViolationException. Because that
-        // violation poisons only the inner transaction (the caller's — possibly
-        // SalonService.inviteMaster's — transaction is suspended), we can catch it here and
-        // return the generic success WITHOUT triggering UnexpectedRollbackException. The loser
-        // gets a generic 201, no second token, and no second outbox row (both roll back together).
-        try {
-            invitePersistenceService.persistInviteAndEnqueue(
-                    email, request.salonId(), targetRole, expiresAt, hashedToken, inviteLink, salon.getName());
-        } catch (DataIntegrityViolationException e) {
-            log.debug("Invite idempotent: concurrent same-salon invite raced the unique guard (salonId={})", request.salonId());
-            return new InviteResponse(email, expiresAt);
-        }
-
-        return new InviteResponse(email, expiresAt);
+        throw new ForbiddenException("Role " + caller.getRole() + " cannot send invites");
     }
 
     /**
-     * Previews an invite by token, without accepting it — the mobile "who invited you" landing
-     * screen calls this before the invitee sets a password.
+     * Previews an invite by token, without accepting it — the accept screen calls this before sign-up (AUTH-21).
      *
-     * <p><strong>Phase 285 — anti-enumeration reasoning REVERSED.</strong> This method used to
-     * collapse every failure (not-found / used / expired / revoked) into one identical
-     * {@code BusinessException} message, on the theory that distinguishing "revoked" from "never
-     * existed" would turn this endpoint into an invite-id oracle. That reasoning is reversed as of
-     * phase 285, on the same precedent {@link AuthService#register}'s duplicate-email 409 already
-     * established: a uniform failure is an undebuggable "why didn't my invite work?" footgun for
-     * the invitee, and the anti-enumeration argument for silence does not actually hold on THIS
-     * endpoint — it is keyed by possession of a high-entropy single-use token, not a guessable
-     * identifier like an email, so there is no enumeration surface to close. A caller without a
-     * valid token learns only {@code INVITE_NOT_FOUND}, which they already knew by definition; a
-     * caller with a valid token learns the state of an invite that was mailed to them. See
-     * phase-285's doc for the full two-part ruling (user + architect).
+     * <p><strong>Phase 285 — typed failures.</strong> Not-found / revoked / used / expired are distinguished: this
+     * endpoint is keyed by possession of a high-entropy single-use token, so there is no enumeration surface to close,
+     * and a uniform failure was an undebuggable "why didn't my invite work?" footgun. Scope: this token-keyed pair
+     * ({@code previewInvite} / {@link #acceptInvite}) only.
      *
-     * <p>Scope note: this reasoning covers ONLY this token-keyed pair of endpoints
-     * ({@code previewInvite} / {@link #acceptInvite}). It does not license distinguishing failures
-     * on any email-keyed endpoint — {@code /auth/forgot-password} keeps its deliberate uniform
-     * response.
+     * <p><strong>B520.</strong> A pre-deploy e-mail invite (no phone) is refused exactly like an unknown token
+     * (AUTH-17 copy): e-mail invites stopped working at deploy (AUTH-D16). The response masks the phone
+     * ({@code +380 •• ••• •• 45}, D3) and names the salon.
      */
     @Transactional(readOnly = true)
     public InvitePreviewResponse previewInvite(String rawToken) {
         InviteToken token = inviteTokenRepository.findByToken(tokenGenerator.hash(rawToken))
+                .filter(found -> !found.isLegacyEmailInvite())
                 .orElseThrow(() -> new InviteTokenException(
                         InviteTokenException.Code.INVITE_NOT_FOUND, "Invalid or expired invite token"));
 
-        // InviteToken.isExpiredAt is THE canonical expiry predicate — shared with acceptInvite,
-        // InvitePersistenceService's recycle filter, SalonService#cancelInvite and the history
-        // status ladder, so no two of them can drift at the boundary instant. See its Javadoc.
-        //
-        // Order: revoked, then used, then expired. InviteToken#markCancelled sets BOTH revokedAt
-        // AND isUsed, so revokedAt must be checked FIRST to report the more specific
-        // INVITE_REVOKED rather than INVITE_USED; InviteToken#markSuperseded leaves isUsed =
-        // false, so a superseded token is reachable ONLY through this first check (see
-        // InviteAcceptRejectsRevokedIntegrationTest — "a revoked token is dead regardless of what
-        // retired it").
-        if (token.getRevokedAt() != null) {
-            throw new InviteTokenException(InviteTokenException.Code.INVITE_REVOKED, "This invite is no longer valid");
-        }
-        if (token.isUsed()) {
-            throw new InviteTokenException(InviteTokenException.Code.INVITE_USED, "This invite has already been used");
-        }
-        if (token.isExpiredAt(clock.instant())) {
-            throw new InviteTokenException(InviteTokenException.Code.INVITE_EXPIRED, "This invite has expired");
-        }
+        rejectDeadToken(token);
 
-        return new InvitePreviewResponse(token.getEmail(), token.getRole(), token.getExpiresAt());
+        String salonName = token.getSalonId() == null
+                ? null
+                : salonRepository.findById(token.getSalonId()).map(Salon::getName).orElse(null);
+        return new InvitePreviewResponse(
+                ContactMask.invitePhone(token.getPhone()), token.getRole(), salonName, token.getExpiresAt());
     }
 
+    /**
+     * Accepts a phone invite (B520, AUTH-52): the registration ticket must prove the INVITED phone, else 400
+     * {@code INVITE_PHONE_MISMATCH} and no account. The account gets that phone verified and no email.
+     *
+     * <p>Every refusal throws before anything is written, and the token row is locked ({@code findByTokenForUpdate}),
+     * so a rejected accept burns neither the single-use invite nor the ticket (consumed in this transaction).
+     */
     @Transactional
     public AuthResponse acceptInvite(InviteAcceptRequest request) {
-        // Status stays 404 here (NOT the 400 previewInvite uses for the same case) — a deliberate,
-        // pre-existing asymmetry phase 285 preserves rather than "tidies" (see InviteTokenException's
-        // javadoc and the phase doc's backward-compatibility gate).
+        // Status stays 404 here (NOT the 400 previewInvite uses for the same case) — a deliberate, pre-existing
+        // asymmetry phase 285 preserves. A pre-deploy e-mail invite is refused like an unknown token (B520).
         InviteToken token = inviteTokenRepository.findByTokenForUpdate(tokenGenerator.hash(request.token()))
+                .filter(found -> !found.isLegacyEmailInvite())
                 .orElseThrow(() -> new InviteTokenException(
                         InviteTokenException.Code.INVITE_NOT_FOUND, HttpStatus.NOT_FOUND, "Invite token not found"));
 
-        // Same ordering rationale as previewInvite: revoked before used, so a CANCELLED token
-        // (which sets both) reports INVITE_REVOKED, not the less specific INVITE_USED. A SUPERSEDED
-        // token leaves isUsed = false and is reachable only through this first check.
-        if (token.getRevokedAt() != null) {
-            throw new InviteTokenException(InviteTokenException.Code.INVITE_REVOKED, "This invite is no longer valid");
-        }
+        rejectDeadToken(token);
+        requireLiveSalon(token);
 
-        if (token.isUsed()) {
-            throw new InviteTokenException(InviteTokenException.Code.INVITE_USED, "This invite has already been used");
+        // D4 — the phone match is proven by the B514 ticket (purpose REGISTRATION), required for every phone invite
+        // whatever app.auth.require-phone-registration says (that flag only shaped the retired e-mail accept).
+        if (!request.hasRegistrationTicket()) {
+            throw new IdentityException(IdentityException.Code.REGISTRATION_TICKET_INVALID);
         }
-
-        // Same canonical predicate as previewInvite / the history ladder (InviteToken#isExpired).
-        if (token.isExpiredAt(clock.instant())) {
-            throw new InviteTokenException(InviteTokenException.Code.INVITE_EXPIRED, "This invite has expired");
+        String verifiedPhone = registrationTicketService.consume(request.registrationTicket());
+        if (!verifiedPhone.equals(token.getPhone())) {
+            throw new IdentityException(IdentityException.Code.INVITE_PHONE_MISMATCH);
         }
-
-        // Phase 285: reuse the EXISTING EmailAlreadyRegisteredException/EMAIL_ALREADY_REGISTERED
-        // code (AuthService#register throws the same type for the same wire code) rather than
-        // minting a second spelling of it as an InviteTokenException.Code — one code, one handler,
-        // no divergence. See InviteTokenException's class javadoc.
-        if (userRepository.existsByEmail(token.getEmail())) {
-            throw new EmailAlreadyRegisteredException();
-        }
-
-        // Phase 286: a salon-bound invite must not be redeemable once its salon has been
-        // soft-deactivated (SalonService.deactivateSalon). Placed AFTER the
-        // used/revoked/expired/email checks (those are cheaper and are properties of the token
-        // itself — a used token must still report "used", not "salon inactive") and BEFORE
-        // markUsed() (a rejected redemption must not burn the single-use token;
-        // findByTokenForUpdate's row lock means throwing here rolls the whole transaction back
-        // with no partial state).
-        //
-        // SECURITY (fail-closed on null salonId): InviteRequest.salonId() is @NotNull and
-        // InviteService#sendInvite only ever mints tokens for SALON_MASTER/SALON_ADMIN
-        // (InviteRequest#isRoleAllowed) — both always salon-bound at creation, so a live token
-        // for either role NEVER has a legitimately null salonId. The one way salon_id can go
-        // null on a live row is invite_tokens.salon_id's ON DELETE SET NULL FK
-        // (V5__Fix_invite_tokens_cascade.sql) firing when the referenced salons row is hard-
-        // deleted — currently unreachable (SalonService.deactivateSalon only soft-deletes,
-        // nothing hard-deletes a Salon) but must fail closed, not silently skip, in case a
-        // future admin/cleanup tool arms it: skipping would let acceptInvite proceed and
-        // MasterService#createMasterFromInvite would then call
-        // salonRepository.findById(null), which Spring Data rejects with an uncaught
-        // IllegalArgumentException (500) instead of a clean 409. SALON_BOUND_ROLES is therefore
-        // the set of roles for which sendInvite requires a resolved Salon before issuing a
-        // token; a role outside that set (none exist today — see the set's Javadoc) is
-        // genuinely salon-less and skips this guard entirely, exactly as before.
-        if (SALON_BOUND_ROLES.contains(token.getRole())) {
-            Salon salon = token.getSalonId() == null
-                    ? null
-                    : salonRepository.findById(token.getSalonId()).orElse(null);
-            if (salon == null || !salon.isActive()) {
-                throw new InviteTokenException(
-                        InviteTokenException.Code.INVITE_SALON_INACTIVE, "This salon is no longer active");
-            }
-        }
-
-        // B514 (AUTH-43): a ticket proves the invitee's phone; consumed under its row lock in this transaction, so a
-        // rejected accept leaves it redeemable. The phone match against a phone invite is B520.
-        String verifiedPhone = request.hasRegistrationTicket()
-                ? registrationTicketService.consume(request.registrationTicket())
-                : null;
-        if (verifiedPhone != null && userRepository.existsByVerifiedPhone(verifiedPhone)) {
+        if (userRepository.existsByVerifiedPhone(verifiedPhone)) {
             throw new IdentityException(IdentityException.Code.PHONE_ALREADY_REGISTERED);
         }
 
         token.markUsed();
         inviteTokenRepository.save(token);
 
-        // Accepting the invite IS the email verification: the token was single-use and
-        // emailed to token.getEmail(); User.createFromInvite marks the account verified
-        // structurally so this path can never regress to the locked-out-forever bug.
-        var user = User.createFromInvite(
-                token.getEmail(),
+        Instant now = clock.instant();
+        var user = User.createFromPhoneInvite(
+                verifiedPhone,
                 passwordEncoder.encode(request.password()),
                 token.getRole(),
                 request.firstName(),
                 request.lastName(),
-                request.phoneNumber(),
-                token.getSalonId()
+                token.getSalonId(),
+                now
         );
-        if (verifiedPhone != null) {
-            user.markPhoneVerified(verifiedPhone, clock.instant());
-        }
-        TermsConsentStamp.apply(user, request, clock.instant());
+        TermsConsentStamp.apply(user, request, now);
         // A ticket-verified phone can lose a race to a concurrent claim: flush through the shared claim path so the
         // partial unique index surfaces as 409 PHONE_ALREADY_REGISTERED, not a 500 at commit.
-        var savedUser = verifiedPhone != null
-                ? PhoneRegistrationService.saveClaimingPhone(userRepository, user)
-                : userRepository.save(user);
+        var savedUser = PhoneRegistrationService.saveClaimingPhone(userRepository, user);
 
         if (token.getRole() == Role.SALON_MASTER) {
             masterService.createMasterFromInvite(savedUser.getId(), token.getSalonId());
         }
 
-        // Phase 333, matrix row 5 — after the membership row commits (savedUser above, plus the
-        // Master row just created for a SALON_MASTER invite). Owner + every OTHER active admin; the
-        // new teammate (savedUser) is the actor and is excluded, including from their own just-
-        // persisted SALON_ADMIN row. Both invitable roles (SALON_MASTER, SALON_ADMIN) are always
-        // salon-bound (SALON_BOUND_ROLES, asserted above), so token.getSalonId() is never null here.
+        // Phase 333, matrix row 5 — after the membership row is written. Owner + every OTHER active admin; the new
+        // teammate (savedUser) is the actor and is excluded. Both invitable roles are always salon-bound
+        // (SALON_BOUND_ROLES, asserted by requireLiveSalon), so token.getSalonId() is never null here.
         inAppNotificationService.notifyInviteAccepted(token.getSalonId(), savedUser.getId());
 
         return buildAuthResponse(savedUser);
+    }
+
+    /**
+     * Revoked, then used, then expired. {@code InviteToken#markCancelled} sets BOTH {@code revokedAt} and
+     * {@code isUsed}, so {@code revokedAt} is checked FIRST to report the more specific {@code INVITE_REVOKED}; a
+     * SUPERSEDED token leaves {@code isUsed = false} and is reachable only through that first check. Expiry is the
+     * canonical {@link InviteToken#isExpiredAt} predicate shared with the recycle filter and the history ladder.
+     */
+    private void rejectDeadToken(InviteToken token) {
+        if (token.getRevokedAt() != null) {
+            throw new InviteTokenException(InviteTokenException.Code.INVITE_REVOKED, "This invite is no longer valid");
+        }
+        if (token.isUsed()) {
+            throw new InviteTokenException(InviteTokenException.Code.INVITE_USED, "This invite has already been used");
+        }
+        if (token.isExpiredAt(clock.instant())) {
+            throw new InviteTokenException(InviteTokenException.Code.INVITE_EXPIRED, "This invite has expired");
+        }
+    }
+
+    /**
+     * Phase 286: a salon-bound invite must not be redeemable once its salon has been soft-deactivated. Placed after the
+     * token-state checks (a used token must still report "used") and before any write. Fails CLOSED on a null
+     * {@code salonId} (only reachable through {@code invite_tokens.salon_id}'s ON DELETE SET NULL FK): skipping would
+     * let {@code MasterService#createMasterFromInvite} call {@code findById(null)} — a 500 instead of a clean 409.
+     */
+    private void requireLiveSalon(InviteToken token) {
+        if (!SALON_BOUND_ROLES.contains(token.getRole())) {
+            return;
+        }
+        Salon salon = token.getSalonId() == null
+                ? null
+                : salonRepository.findById(token.getSalonId()).orElse(null);
+        if (salon == null || !salon.isActive()) {
+            throw new InviteTokenException(
+                    InviteTokenException.Code.INVITE_SALON_INACTIVE, "This salon is no longer active");
+        }
     }
 
     private String buildInviteLink(String rawToken) {

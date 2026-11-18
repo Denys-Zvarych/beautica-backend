@@ -81,9 +81,10 @@ class PhoneRegistrationRequiredFlagIT extends AbstractPhoneIdentityIT {
         ResponseEntity<String> response = post(ACCEPT_URL, body);
 
         assertTicketRequired(response);
-        assertThat(jdbcTemplate.queryForObject("SELECT is_used FROM invite_tokens WHERE email = ?",
-                Boolean.class, invite.email())).isFalse();
-        assertThat(usersWithEmail(invite.email())).isZero();
+        assertThat(jdbcTemplate.queryForObject("SELECT is_used FROM invite_tokens WHERE phone = ?",
+                Boolean.class, invite.phone())).isFalse();
+        assertThat(jdbcTemplate.queryForObject("SELECT count(*) FROM users WHERE phone_number = ?", Long.class,
+                invite.phone())).isZero();
     }
 
     @Test

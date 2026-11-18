@@ -1,5 +1,6 @@
 package com.beautica.auth;
 
+import com.beautica.support.StaffInviteFixtures;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.auth.dto.InviteAcceptRequest;
 import com.beautica.auth.dto.InviteErrorResponse;
@@ -79,7 +80,8 @@ class InviteAcceptRejectsRevokedIntegrationTest extends AbstractIntegrationTest 
         log.debug("Act: accept a SUPERSEDED invite that has NOT yet expired and is not is_used");
         ResponseEntity<String> response = restTemplate.postForEntity(
                 ACCEPT_URL,
-                new InviteAcceptRequest(fixture.rawToken(), TEST_PASSWORD, "Sup", "Erseded", "+380501234567"),
+                new InviteAcceptRequest(fixture.rawToken(), TEST_PASSWORD, "Sup", "Erseded", null, null, null, null,
+                        StaffInviteFixtures.seedRegistrationTicket(jdbcTemplate, fixture.phone())),
                 String.class);
 
         // Assert
@@ -93,7 +95,7 @@ class InviteAcceptRejectsRevokedIntegrationTest extends AbstractIntegrationTest 
                 .as("phase 285: a SUPERSEDED token is revoked regardless of what retired it — "
                         + "INVITE_REVOKED, not INVITE_USED or INVITE_EXPIRED")
                 .isEqualTo(InviteTokenException.Code.INVITE_REVOKED.name());
-        assertThat(countUsers(fixture.email()))
+        assertThat(countUsers(fixture.phone()))
                 .as("THE decisive assertion: no account may exist for a superseded invite's address")
                 .isZero();
         assertThat(readIsUsed(fixture.inviteId()))
@@ -122,12 +124,12 @@ class InviteAcceptRejectsRevokedIntegrationTest extends AbstractIntegrationTest 
         // data.code now legitimately says INVITE_REVOKED (see InviteService#previewInvite's
         // rewritten javadoc for the ruling). What must still never leak is the DB-internal
         // revoked_reason enum constant ("SUPERSEDED"/"CANCELLED" — distinct from the wire-level
-        // INVITE_REVOKED code) and any PII (the invitee's email).
+        // INVITE_REVOKED code) and any PII (the invitee's phone).
         assertThat(body.data().code()).isEqualTo(InviteTokenException.Code.INVITE_REVOKED.name());
         assertThat(response.getBody())
                 .as("the response must never leak the internal revoked_reason enum constant or PII")
                 .doesNotContain("SUPERSEDED")
-                .doesNotContain(fixture.email());
+                .doesNotContain(fixture.phone());
     }
 
     @Test
@@ -140,7 +142,8 @@ class InviteAcceptRejectsRevokedIntegrationTest extends AbstractIntegrationTest 
         log.debug("Act: accept an invite the salon owner had already cancelled");
         ResponseEntity<String> response = restTemplate.postForEntity(
                 ACCEPT_URL,
-                new InviteAcceptRequest(fixture.rawToken(), TEST_PASSWORD, "Can", "Celled", "+380501234567"),
+                new InviteAcceptRequest(fixture.rawToken(), TEST_PASSWORD, "Can", "Celled", null, null, null, null,
+                        StaffInviteFixtures.seedRegistrationTicket(jdbcTemplate, fixture.phone())),
                 String.class);
 
         assertThat(response.getStatusCode())
@@ -150,7 +153,7 @@ class InviteAcceptRejectsRevokedIntegrationTest extends AbstractIntegrationTest 
                 response.getBody(), new TypeReference<ApiResponse<InviteErrorResponse>>() {});
         assertThat(body.success()).isFalse();
         assertThat(body.data().code()).isEqualTo(InviteTokenException.Code.INVITE_REVOKED.name());
-        assertThat(countUsers(fixture.email()))
+        assertThat(countUsers(fixture.phone()))
                 .as("no account may be provisioned from a cancelled invite")
                 .isZero();
     }
@@ -186,19 +189,20 @@ class InviteAcceptRejectsRevokedIntegrationTest extends AbstractIntegrationTest 
         log.debug("Act: accept the control invite — same fixture shape, revocation columns left null");
         ResponseEntity<String> response = restTemplate.postForEntity(
                 ACCEPT_URL,
-                new InviteAcceptRequest(fixture.rawToken(), TEST_PASSWORD, "Con", "Trol", "+380501234567"),
+                new InviteAcceptRequest(fixture.rawToken(), TEST_PASSWORD, "Con", "Trol", null, null, null, null,
+                        StaffInviteFixtures.seedRegistrationTicket(jdbcTemplate, fixture.phone())),
                 String.class);
 
         assertThat(response.getStatusCode())
                 .as("if this is not 201 the fixture itself is unusable and the guard tests above "
                         + "prove nothing — body: %s", response.getBody())
                 .isEqualTo(HttpStatus.CREATED);
-        assertThat(countUsers(fixture.email())).isEqualTo(1);
+        assertThat(countUsers(fixture.phone())).isEqualTo(1);
     }
 
     // ── helpers ────────────────────────────────────────────────────────────────
 
-    private record Fixture(UUID inviteId, String rawToken, String email) { }
+    private record Fixture(UUID inviteId, String rawToken, String phone) { }
 
     /**
      * Seeds an owner, a salon and one genuinely acceptable invite (SHA-256 digest of
@@ -214,25 +218,25 @@ class InviteAcceptRejectsRevokedIntegrationTest extends AbstractIntegrationTest 
         UUID ownerId = insertUser("owner-revoked-" + nonce + "@beautica.test", "SALON_OWNER");
         UUID salonId = insertSalon(ownerId, "Revoked Invite Salon " + nonce);
 
-        String email = "revoked-invitee-" + nonce + "@beautica.test";
+        String phone = StaffInviteFixtures.newPhone();
         String rawToken = "raw-revoked-" + UUID.randomUUID();
         UUID inviteId = UUID.randomUUID();
         Instant now = Instant.now();
         jdbcTemplate.update(
                 "INSERT INTO invite_tokens "
-                        + "(id, token, email, salon_id, role, expires_at, is_used, revoked_at, revoked_reason, "
+                        + "(id, token, phone, salon_id, role, expires_at, is_used, revoked_at, revoked_reason, "
                         + "created_at, updated_at) "
                         + "VALUES (?, ?, ?, ?, 'SALON_MASTER', ?, ?, ?, ?, NOW(), NOW())",
-                inviteId, sha256Hex(rawToken), email, salonId,
+                inviteId, sha256Hex(rawToken), phone, salonId,
                 Timestamp.from(now.plus(2, ChronoUnit.DAYS)), isUsed,
                 revokedReason == null ? null : Timestamp.from(now.minus(1, ChronoUnit.HOURS)),
                 revokedReason);
-        return new Fixture(inviteId, rawToken, email);
+        return new Fixture(inviteId, rawToken, phone);
     }
 
-    private Integer countUsers(String email) {
+    private Integer countUsers(String phone) {
         return jdbcTemplate.queryForObject(
-                "SELECT COUNT(*) FROM users WHERE email = ?", Integer.class, email);
+                "SELECT COUNT(*) FROM users WHERE phone_number = ?", Integer.class, phone);
     }
 
     private Boolean readIsUsed(UUID inviteId) {

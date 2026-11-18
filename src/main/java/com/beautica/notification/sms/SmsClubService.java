@@ -157,7 +157,7 @@ public class SmsClubService implements SmsService {
             if (SmsTransportErrors.isOutcomeUnknownOrCancelled(e)) {
                 throw new SmsDeliveryAmbiguousException("SMS delivery outcome unknown", e);
             }
-            throw new SmsDeliveryException("SMS delivery failed", e);
+            throw new SmsDeliveryException("SMS delivery failed", e, true);
         }
     }
 
@@ -198,7 +198,10 @@ public class SmsClubService implements SmsService {
         }
         String detail = providerText.isEmpty() ? unparsedDetail(errorBody) : scrub(providerText, digits, text);
         failure(to).http(code).reason(reason).detail(detail).log(log);
-        return new SmsDeliveryException("SMSClub rejected the request with HTTP " + code);
+        // 5xx / 429: the provider is down or throttling — transient (counted by the outbox breaker). 4xx: a refusal.
+        boolean providerSide = code >= HttpStatus.INTERNAL_SERVER_ERROR.value()
+                || code == HttpStatus.TOO_MANY_REQUESTS.value();
+        return new SmsDeliveryException("SMSClub rejected the request with HTTP " + code, null, providerSide);
     }
 
     /**

@@ -24,11 +24,13 @@ import org.springframework.test.context.TestPropertySource;
 import org.springframework.test.util.ReflectionTestUtils;
 import org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerMapping;
 
+import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.Date;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.UUID;
 import java.util.function.UnaryOperator;
 import java.util.stream.Stream;
 
@@ -186,8 +188,9 @@ class AppCheckGuardIT extends AbstractPhoneIdentityIT {
     }
 
     @Test
-    @DisplayName("only the registration and the signed-in phone OTP sends carry @RequireAppCheck (B514 + B516; B520 extends it)")
-    void should_pinRequireAppCheckLedger_to_registrationAndUserPhoneOtpSend() {
+    @DisplayName("@RequireAppCheck sits exactly on the SMS-sending endpoints: B514 + B516 OTP sends and both B520 "
+            + "invite creates")
+    void should_pinRequireAppCheckLedger_to_smsSendingEndpoints() {
         Set<String> annotated = new TreeSet<>();
         handlerMapping.getHandlerMethods().forEach((info, method) -> {
             if (method.hasMethodAnnotation(RequireAppCheck.class)) {
@@ -197,7 +200,9 @@ class AppCheckGuardIT extends AbstractPhoneIdentityIT {
         });
 
         assertThat(annotated).containsExactly(
+                "POST /api/v1/auth/invite",
                 "POST /api/v1/auth/register/phone/otp/send",
+                "POST /api/v1/salons/{salonId}/invite",
                 "POST /api/v1/users/me/phone/otp/send");
     }
 
@@ -274,5 +279,78 @@ class AppCheckGuardIT extends AbstractPhoneIdentityIT {
         assertThat(json(sms).at("/data/code").asText()).isEqualTo("APP_CHECK_FAILED");
         assertThat(mail.getStatusCode()).isEqualTo(HttpStatus.OK);
         verify(otpSmsSender, never()).send(anyString(), anyString());
+    }
+
+    // ── B520 (AUTH-54): staff invite create, both endpoints ──────────────────
+
+    private static final String AUTH_INVITE_URL = "/api/v1/auth/invite";
+
+    static Stream<Arguments> inviteCreateEndpoints() {
+        return Stream.of(Arguments.of("POST /auth/invite", false), Arguments.of("POST /salons/{id}/invite", true));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("inviteCreateEndpoints")
+    @DisplayName("B520: invite create without an App Check token -> 403 APP_CHECK_FAILED, no invite row, no SMS row")
+    void should_return403AndPersistNothing_when_inviteCreateHasNoToken(String label, boolean salonScoped) {
+        String ownerEmail = newEmail();
+        UUID salonId = seedOwnerWithSalon(ownerEmail);
+        String invited = newPhone();
+        String token = accessToken(ownerEmail);
+        Timestamp requestStart = jdbcTemplate.queryForObject("SELECT clock_timestamp()", Timestamp.class);
+
+        ResponseEntity<String> response = postAs(token, inviteUrl(salonScoped, salonId),
+                Map.of("phone", invited, "salonId", salonId.toString()));
+
+        assertThat(response.getStatusCode()).as("%s body: %s", label, response.getBody())
+                .isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(json(response).at("/data/code").asText()).isEqualTo("APP_CHECK_FAILED");
+        assertThat(jdbcTemplate.queryForObject("SELECT COUNT(*) FROM invite_tokens WHERE salon_id = ?",
+                Integer.class, salonId)).isZero();
+        assertThat(inviteOutboxRowsOf(salonId, requestStart))
+                .as("%s: no INVITE outbox row for this salon's invites or written by this request", label).isZero();
+    }
+
+    /**
+     * INVITE outbox rows of THIS test: rows whose aggregate (the invite_tokens id) belongs to {@code salonId}, plus any
+     * INVITE row written since {@code since} (DB clock) — the latter still catches a row enqueued without its invite.
+     */
+    private int inviteOutboxRowsOf(UUID salonId, Timestamp since) {
+        return jdbcTemplate.queryForObject("SELECT COUNT(*) FROM notification_outbox WHERE event_type = 'INVITE' "
+                + "AND (aggregate_id IN (SELECT id FROM invite_tokens WHERE salon_id = ?) OR created_at >= ?)",
+                Integer.class, salonId, since);
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("inviteCreateEndpoints")
+    @DisplayName("B520: invite create with a valid App Check token -> 201 and one invite row")
+    void should_return201_when_inviteCreateHasValidToken(String label, boolean salonScoped) {
+        String ownerEmail = newEmail();
+        UUID salonId = seedOwnerWithSalon(ownerEmail);
+        HttpHeaders headers = bearer(accessToken(ownerEmail));
+        headers.set(AppCheckGuard.HEADER, AppCheckTestTokens.valid(Instant.now()));
+
+        ResponseEntity<String> response = post(inviteUrl(salonScoped, salonId),
+                Map.of("phone", newPhone(), "salonId", salonId.toString()), headers);
+
+        assertThat(response.getStatusCode()).as("%s body: %s", label, response.getBody())
+                .isEqualTo(HttpStatus.CREATED);
+        assertThat(jdbcTemplate.queryForObject("SELECT COUNT(*) FROM invite_tokens WHERE salon_id = ?",
+                Integer.class, salonId)).isEqualTo(1);
+        assertThat(inviteOutboxRowsOf(salonId, Timestamp.from(Instant.now().plusSeconds(3600))))
+                .as("%s: the salon-scoped count sees this invite's one SMS row (the 403 case's query is live)", label)
+                .isEqualTo(1);
+    }
+
+    private static String inviteUrl(boolean salonScoped, UUID salonId) {
+        return salonScoped ? "/api/v1/salons/" + salonId + "/invite" : AUTH_INVITE_URL;
+    }
+
+    private UUID seedOwnerWithSalon(String ownerEmail) {
+        UUID ownerId = seedUser("SALON_OWNER", ownerEmail, true, null, null);
+        UUID salonId = UUID.randomUUID();
+        jdbcTemplate.update("INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at, city_id) "
+                + "VALUES (?, ?, ?, true, NOW(), NOW(), ?)", salonId, ownerId, "App Check Salon", testCityId());
+        return salonId;
     }
 }

@@ -27,7 +27,13 @@ public class IdentityException extends BusinessException {
         /** B516 (CLI-04, AUTH-44) — {@code PATCH /users/me} (or the master profile update) tried to set a different phone. */
         PHONE_CHANGE_REQUIRES_OTP(HttpStatus.BAD_REQUEST, "The phone number can only be changed with an SMS code"),
         /** B516 (AUTH-45) — {@code APP_AUTH_REQUIRE_VERIFIED_PHONE}: the action needs a verified phone first. */
-        PHONE_NOT_VERIFIED(HttpStatus.CONFLICT, "Confirm your phone number to continue");
+        PHONE_NOT_VERIFIED(HttpStatus.CONFLICT, "Confirm your phone number to continue"),
+        /** B520 (AUTH-18) — an invite-create body without a phone (an old build still sending only {@code email}). */
+        INVITE_PHONE_REQUIRED(HttpStatus.BAD_REQUEST, "Invites are sent to a phone number; update the app"),
+        /** B520 (AUTH-52) — the registration ticket proves a phone other than the invited one; no account is made. */
+        INVITE_PHONE_MISMATCH(HttpStatus.BAD_REQUEST, "This invite was sent to a different phone number"),
+        /** B520 (AUTH-52) — 10 invite SMS per inviter per hour or 30 per salon per day reached. */
+        INVITE_SMS_LIMIT(HttpStatus.TOO_MANY_REQUESTS, "Too many invites sent, please try again later");
 
         private final HttpStatus status;
         private final String clientMessage;

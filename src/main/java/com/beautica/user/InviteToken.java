@@ -20,16 +20,8 @@ import java.util.UUID;
  *
  * <p><strong>DB-side indexes (Flyway, not mirrored as JPA {@code @Index}):</strong>
  * <ul>
- *   <li>{@code idx_invite_tokens_email_active} — partial on {@code (email, salon_id) WHERE
- *       is_used = false AND revoked_at IS NULL} (V153, replacing V16's plain
- *       {@code (email, is_used)}). Serves the dispatch idempotency lookup
- *       {@code findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull}, whose predicate it now
- *       covers in full — no residual filter. V16's shape left {@code revoked_at IS NULL} as a
- *       residual, which stopped being free the moment this phase started RETAINING superseded
- *       rows with {@code is_used = false}: a churned address accumulated one discarded heap fetch
- *       per past invite, without bound. Partial, not a third key column, because a row leaves the
- *       live set permanently once accepted/cancelled/superseded — so the index stays a handful of
- *       rows platform-wide instead of growing with every invite ever sent.</li>
+ *   <li>{@code idx_invite_tokens_email_active} — dropped by V251 (B520): its only reader, the email
+ *       dispatch-idempotency lookup, left with the email invite path.</li>
  *   <li>{@code ux_invite_tokens_active} — partial UNIQUE on
  *       {@code (lower(email), salon_id) WHERE is_used = false AND revoked_at IS NULL} (V101,
  *       re-scoped by V153). The INSERT-time uniqueness/concurrency backstop: enforces at most one
@@ -41,6 +33,10 @@ import java.util.UUID;
  *       which cannot be expressed via {@code @Index columnList}, and Hibernate
  *       {@code ddl-auto=validate} does not verify indexes — hence documented here instead of
  *       annotated.</li>
+ *   <li>{@code ux_invite_tokens_active_phone} — partial UNIQUE on {@code (salon_id, phone) WHERE is_used = false
+ *       AND revoked_at IS NULL} (V251): the phone path's race guard, and it serves the phone idempotency lookup.</li>
+ *   <li>{@code idx_invite_tokens_invited_by_created} — {@code (invited_by, created_at)} (V251): the per-inviter SMS
+ *       cap count.</li>
  *   <li>{@code idx_invite_tokens_salon_created} — {@code (salon_id, created_at DESC, id DESC)}
  *       (V153, replacing V149's {@code idx_invite_tokens_salon_pending}). Serves the invite
  *       HISTORY listing {@code findSalonInviteHistory} behind
@@ -51,12 +47,13 @@ import java.util.UUID;
  *       the {@code LIMIT 200} is an index-ordered scan with no sort node.</li>
  * </ul>
  *
- * <p><strong>Lifecycle / status derivation.</strong> There is deliberately NO cleanup job for
- * this table. Display status is derived on read from {@code (revokedReason, isUsed, expiresAt,
- * clock)} — see {@code com.beautica.salon.dto.SalonInviteResponse#from}. {@code isUsed} alone is
- * ambiguous: acceptance AND cancellation both set it, which is exactly why {@link #revokedReason}
- * exists. Rows are never hard-deleted; an expired row displaced by a re-invite is marked
- * {@link RevocationReason#SUPERSEDED} so the history stays complete.
+ * <p><strong>Lifecycle / status derivation.</strong> Display status is derived on read from
+ * {@code (revokedReason, isUsed, expiresAt, clock)} — see {@code com.beautica.salon.dto.SalonInviteResponse#from}.
+ * {@code isUsed} alone is ambiguous: acceptance AND cancellation both set it, which is exactly why
+ * {@link #revokedReason} exists. An expired row displaced by a re-invite is marked
+ * {@link RevocationReason#SUPERSEDED} so the history stays complete. B520 (D5, SAL-48): an UNACCEPTED phone invite is
+ * deleted by {@code InviteTokenCleanupJob} 30 days after it expired or was revoked (the phone is personal data);
+ * accepted invites and pre-B520 email rows are kept.
  *
  * <p><strong>{@code email} rows are DELETED when the recipient's account is deleted.</strong>
  * Phase 295's salon-deletion cascade ({@code SalonService#deleteSalonStaff}) removes every row
@@ -81,8 +78,20 @@ public class InviteToken extends AuditableEntity {
     @Column(name = "token", nullable = false, unique = true, length = 512)
     private String token;
 
-    @Column(name = "email", nullable = false)
+    /** Recipient of a pre-B520 email invite; {@code null} on every phone invite (CHECK {@code ck_invite_tokens_one_recipient}). */
+    @Column(name = "email")
     private String email;
+
+    /**
+     * B520 (AUTH-16) — the invited Ukrainian mobile number, {@code +380…}; {@code null} only on rows written before V251
+     * (email invites), which can no longer be validated, accepted or listed as pending.
+     */
+    @Column(name = "phone", length = 20)
+    private String phone;
+
+    /** B520 (AUTH-52) — who sent the invite; the per-inviter SMS cap counts by it. {@code null} on old rows. */
+    @Column(name = "invited_by")
+    private UUID invitedBy;
 
     @Column(name = "salon_id")
     private UUID salonId;
@@ -112,6 +121,10 @@ public class InviteToken extends AuditableEntity {
     protected InviteToken() {
     }
 
+    /**
+     * A pre-B520 email invite. No production path writes one any more (the email invite path was retired by B520);
+     * kept so tests can seed the rows a deploy leaves behind and prove they are refused.
+     */
     public InviteToken(String token, String email, UUID salonId, Role role, Instant expiresAt) {
         this.token = token;
         this.email = email;
@@ -119,6 +132,24 @@ public class InviteToken extends AuditableEntity {
         this.role = role;
         this.expiresAt = expiresAt;
         this.isUsed = false;
+    }
+
+    /**
+     * B520 — a phone invite.
+     *
+     * @param phoneE164 the invited number, already normalised by {@code UaMobilePhone}
+     * @param invitedBy the inviting user (per-inviter SMS cap)
+     */
+    public static InviteToken forPhone(String token, String phoneE164, UUID salonId, Role role, Instant expiresAt,
+                                       UUID invitedBy) {
+        InviteToken invite = new InviteToken();
+        invite.token = token;
+        invite.phone = phoneE164;
+        invite.salonId = salonId;
+        invite.role = role;
+        invite.expiresAt = expiresAt;
+        invite.invitedBy = invitedBy;
+        return invite;
     }
 
     public UUID getId() {
@@ -132,6 +163,19 @@ public class InviteToken extends AuditableEntity {
 
     public String getEmail() {
         return email;
+    }
+
+    public String getPhone() {
+        return phone;
+    }
+
+    /** B520 — a pre-deploy email invite (no phone): refused by validate and accept like an unknown token. */
+    public boolean isLegacyEmailInvite() {
+        return phone == null;
+    }
+
+    public UUID getInvitedBy() {
+        return invitedBy;
     }
 
     public UUID getSalonId() {

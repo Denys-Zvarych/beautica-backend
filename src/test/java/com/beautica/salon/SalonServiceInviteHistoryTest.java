@@ -372,7 +372,7 @@ class SalonServiceInviteHistoryTest {
         UUID salonId = UUID.randomUUID();
         UUID inviteId = UUID.randomUUID();
         Instant createdAt = FIXED_NOW.minusSeconds(120);
-        InviteHistoryRow row = new InviteHistoryRow(inviteId, "invitee@beautica.test",
+        InviteHistoryRow row = new InviteHistoryRow(inviteId, null, "+380501234567",
                 Role.SALON_MASTER, false, null, FIXED_NOW.plusSeconds(3600), createdAt);
 
         stubHistory(salonId, row);
@@ -381,9 +381,10 @@ class SalonServiceInviteHistoryTest {
 
         assertThat(result.invites()).singleElement()
                 .extracting(SalonInviteResponse::inviteId, SalonInviteResponse::recipientEmail,
+                        SalonInviteResponse::recipientPhone,
                         SalonInviteResponse::role, SalonInviteResponse::status,
                         SalonInviteResponse::createdAt, SalonInviteResponse::expiresAt)
-                .containsExactly(inviteId, "invitee@beautica.test", "SALON_MASTER", "PENDING",
+                .containsExactly(inviteId, null, "+380501234567", "SALON_MASTER", "PENDING",
                         createdAt, FIXED_NOW.plusSeconds(3600));
 
         // Structural, not stylistic: the record's component set IS the wire shape, so a future
@@ -392,7 +393,7 @@ class SalonServiceInviteHistoryTest {
                 .extracting(java.lang.reflect.RecordComponent::getName)
                 .as("SalonInviteResponse must never gain a token/hash component — invite_tokens.token "
                         + "is a SHA-256 digest of a live credential")
-                .containsExactlyInAnyOrder("inviteId", "recipientEmail", "role", "status",
+                .containsExactlyInAnyOrder("inviteId", "recipientEmail", "recipientPhone", "role", "status",
                         "createdAt", "expiresAt");
     }
 
@@ -409,7 +410,7 @@ class SalonServiceInviteHistoryTest {
                 .extracting(java.lang.reflect.RecordComponent::getName)
                 .as("InviteHistoryRow is the read-path projection — a token/hash component here "
                         + "would put credential material back in the heap for every history read")
-                .containsExactlyInAnyOrder("id", "email", "role", "used", "revokedReason",
+                .containsExactlyInAnyOrder("id", "email", "phone", "role", "used", "revokedReason",
                         "expiresAt", "createdAt");
     }
 
@@ -424,13 +425,13 @@ class SalonServiceInviteHistoryTest {
             + "truncation probe row)")
     void should_requestOneCapPlusProbePage_when_listingSalonInvites() {
         UUID salonId = UUID.randomUUID();
-        when(inviteTokenRepository.findSalonInviteHistory(eq(salonId), any(Pageable.class)))
+        when(inviteTokenRepository.findSalonInviteHistory(eq(salonId), eq(FIXED_NOW), any(Pageable.class)))
                 .thenReturn(List.of());
 
         salonService.listSalonInvites(salonId);
 
         var pageable = forClass(Pageable.class);
-        verify(inviteTokenRepository).findSalonInviteHistory(eq(salonId), pageable.capture());
+        verify(inviteTokenRepository).findSalonInviteHistory(eq(salonId), eq(FIXED_NOW), pageable.capture());
         assertThat(pageable.getValue())
                 .as("the unbounded-collection guard (Anti-Bug §E3) requests the 200-row cap plus "
                         + "ONE probe row, so truncation is detectable without a COUNT round trip")
@@ -728,7 +729,7 @@ class SalonServiceInviteHistoryTest {
     }
 
     private void stubHistory(UUID salonId, List<InviteHistoryRow> rows) {
-        when(inviteTokenRepository.findSalonInviteHistory(eq(salonId), any(Pageable.class)))
+        when(inviteTokenRepository.findSalonInviteHistory(eq(salonId), eq(FIXED_NOW), any(Pageable.class)))
                 .thenReturn(rows);
     }
 
@@ -742,7 +743,8 @@ class SalonServiceInviteHistoryTest {
 
     private InviteHistoryRow row(String email, Role role, boolean used, RevocationReason reason,
             Instant expiresAt, Instant createdAt) {
-        return new InviteHistoryRow(UUID.randomUUID(), email, role, used, reason, expiresAt, createdAt);
+        // Pre-B520 email rows: the status ladder is recipient-agnostic, so the email-keyed fixtures stay valid.
+        return new InviteHistoryRow(UUID.randomUUID(), email, null, role, used, reason, expiresAt, createdAt);
     }
 
     private InviteToken buildToken(UUID id, String email, UUID salonId, Role role, Instant expiresAt,

@@ -23,6 +23,11 @@ public class SmsClubProperties {
     static final int DEFAULT_LIFETIME_MINUTES = 60;
     /** Delivery lifetime for the guest OTP, minutes; must not exceed the OTP code TTL (asserted in a test). */
     static final int DEFAULT_OTP_LIFETIME_MINUTES = 10;
+    /**
+     * B520 audit-fix — delivery lifetime for the staff invite SMS, minutes: the invite link lives 48 h and a re-invite of
+     * a live invite sends nothing, so the SMS must survive a switched-off phone for a day, not the 10-min OTP window.
+     */
+    static final int DEFAULT_INVITE_LIFETIME_MINUTES = 24 * 60;
     /** The only send endpoint prod may use ({@code EnvironmentFingerprintGuard} rule {@code prod-smsclub-base-url}). */
     /** Staging-only real-send ceiling per Kyiv day while the {@code smsclub} opt-in is on (Phase 439 audit-fix). */
     static final int DEFAULT_STAGING_DAILY_CAP = 50;
@@ -60,6 +65,17 @@ public class SmsClubProperties {
 
     /** {@code RecipientInvalidSpikeAlarm} window (validated positive by its constructor). */
     private Duration recipientInvalidSpikeWindow = DEFAULT_RECIPIENT_INVALID_SPIKE_WINDOW;
+
+    /** {@code lifetime} for the staff invite SMS (B520), minutes; at least a day. */
+    private Integer inviteLifetimeMinutes = DEFAULT_INVITE_LIFETIME_MINUTES;
+
+    /**
+     * B520 audit-fix (perf) — connect / read timeouts of the staff invite sender only. The invite is sent on the single
+     * outbox drain thread, so it gets shorter timeouts than the request-thread OTP (worst case per drain tick =
+     * breaker threshold × (connect + read)).
+     */
+    private Duration inviteConnectTimeout = Duration.ofSeconds(2);
+    private Duration inviteReadTimeout = Duration.ofSeconds(3);
 
     public String getToken() {
         return token;
@@ -139,5 +155,51 @@ public class SmsClubProperties {
 
     public void setRecipientInvalidSpikeWindow(Duration recipientInvalidSpikeWindow) {
         this.recipientInvalidSpikeWindow = recipientInvalidSpikeWindow;
+    }
+
+    public Integer getInviteLifetimeMinutes() {
+        return inviteLifetimeMinutes;
+    }
+
+    public void setInviteLifetimeMinutes(Integer inviteLifetimeMinutes) {
+        this.inviteLifetimeMinutes = inviteLifetimeMinutes;
+    }
+
+    public Duration getInviteConnectTimeout() {
+        return inviteConnectTimeout;
+    }
+
+    public void setInviteConnectTimeout(Duration inviteConnectTimeout) {
+        this.inviteConnectTimeout = inviteConnectTimeout;
+    }
+
+    public Duration getInviteReadTimeout() {
+        return inviteReadTimeout;
+    }
+
+    public void setInviteReadTimeout(Duration inviteReadTimeout) {
+        this.inviteReadTimeout = inviteReadTimeout;
+    }
+
+    /**
+     * The settings of the staff invite sender: this provider's endpoint, token and sender name with the invite
+     * connect / read timeouts. A copy — this bean is never mutated.
+     */
+    public SmsClubProperties forStaffInvite() {
+        SmsClubProperties invite = new SmsClubProperties();
+        invite.setToken(token);
+        invite.setSenderName(senderName);
+        invite.setBaseUrl(baseUrl);
+        invite.setConnectTimeout(inviteConnectTimeout);
+        invite.setReadTimeout(inviteReadTimeout);
+        invite.setLifetimeMinutes(inviteLifetimeMinutes);
+        invite.setOtpLifetimeMinutes(otpLifetimeMinutes);
+        invite.setStagingDailyCap(stagingDailyCap);
+        invite.setRecipientInvalidSpikeThreshold(recipientInvalidSpikeThreshold);
+        invite.setRecipientInvalidSpikeWindow(recipientInvalidSpikeWindow);
+        invite.setInviteLifetimeMinutes(inviteLifetimeMinutes);
+        invite.setInviteConnectTimeout(inviteConnectTimeout);
+        invite.setInviteReadTimeout(inviteReadTimeout);
+        return invite;
     }
 }

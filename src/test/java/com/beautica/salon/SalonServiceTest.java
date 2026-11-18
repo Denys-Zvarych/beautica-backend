@@ -1812,7 +1812,7 @@ class SalonServiceTest {
 
         when(salonRepository.findById(salonId)).thenReturn(Optional.empty());
 
-        assertThatThrownBy(() -> salonService.inviteMaster(actorId, salonId, "master@test.com", Role.SALON_MASTER))
+        assertThatThrownBy(() -> salonService.inviteMaster(actorId, salonId, "+380501234567", Role.SALON_MASTER))
                 .isInstanceOf(NotFoundException.class)
                 .hasMessageContaining("Salon not found");
 
@@ -1839,14 +1839,14 @@ class SalonServiceTest {
         UUID actorId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
         Salon salon = buildSalon(salonId, buildUser(actorId, "owner@test.com", Role.SALON_OWNER), "Test");
-        var expected = new InviteResponse("master@test.com", Instant.now().plusSeconds(3600));
+        var expected = new InviteResponse("+380501234567", Instant.now().plusSeconds(3600));
 
         when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
         when(inviteService.sendInvite(any(InviteRequest.class), eq(actorId))).thenReturn(expected);
 
-        InviteResponse result = salonService.inviteMaster(actorId, salonId, "master@test.com", Role.SALON_MASTER);
+        InviteResponse result = salonService.inviteMaster(actorId, salonId, "+380501234567", Role.SALON_MASTER);
 
-        assertThat(result.invitedEmail()).isEqualTo("master@test.com");
+        assertThat(result.invitedPhone()).isEqualTo("+380501234567");
         verify(inviteService).sendInvite(any(InviteRequest.class), eq(actorId));
     }
 

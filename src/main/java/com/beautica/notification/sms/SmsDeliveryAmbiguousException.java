@@ -15,6 +15,7 @@ package com.beautica.notification.sms;
 public class SmsDeliveryAmbiguousException extends SmsDeliveryException {
 
     public SmsDeliveryAmbiguousException(String message, Throwable cause) {
-        super(message, cause);
+        // The request was on the wire and no answer came back: a provider-side stall, transient by definition.
+        super(message, cause, true);
     }
 }

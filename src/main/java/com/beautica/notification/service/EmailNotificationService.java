@@ -162,20 +162,6 @@ public class EmailNotificationService {
         }
     }
 
-    public void sendInviteEmail(String to, String inviteUrl, String salonName) {
-        if (lacksRecipient(to, "sendInviteEmail")) {
-            return;
-        }
-        if (!SchemeGuard.isAllowedScheme(inviteUrl)) {
-            throw new IllegalArgumentException(
-                    "inviteUrl must use https:// scheme or http://localhost — caller must validate before reaching email transport");
-        }
-        var ctx = new Context();
-        ctx.setVariable("salonName", salonName);
-        ctx.setVariable("inviteUrl", inviteUrl);
-        send(to, "Запрошення до салону", "email/invite-master", ctx);
-    }
-
     /**
      * Sends the PROVIDER the "new booking" e-mail — for a whole multi-service visit, not just its
      * lead service.
@@ -392,7 +378,7 @@ public class EmailNotificationService {
      * Sends the client a "please leave a review" email after a booking is completed (Phase 18.5).
      *
      * <p>The {@code reviewUrl} deep link is scheme-guarded via {@link SchemeGuard#isAllowedScheme}
-     * <em>before</em> the template is rendered (mirrors {@link #sendInviteEmail}) so an unsafe scheme
+     * <em>before</em> the template is rendered so an unsafe scheme
      * can never reach the CTA. All template variables are system-derived — no free-text user input.
      *
      * @param to        the client's email address (CR/LF stripped by the shared {@code send} helper)

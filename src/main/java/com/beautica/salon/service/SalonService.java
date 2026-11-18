@@ -201,7 +201,8 @@ public class SalonService {
      *
      * <p>The invite-history endpoint is deliberately NOT paginated — a salon's realistic invite
      * count is single- to low-double-digit, so a page cursor would be ceremony the client has to
-     * carry for no benefit. But {@code invite_tokens} has no cleanup job, so the underlying table
+     * carry for no benefit. But accepted invites are never cleaned up (B520's
+     * {@code InviteTokenCleanupJob} only removes unaccepted phone invites after 30 days), so the table
      * only grows; returning it unbounded would be exactly the unbounded-collection-at-a-public-
      * service-boundary defect Anti-Bug §E3 forbids. This cap is the bound.
      *
@@ -1159,13 +1160,13 @@ public class SalonService {
     }
 
     @Transactional
-    public InviteResponse inviteMaster(UUID actorId, UUID salonId, String email, Role role) {
+    public InviteResponse inviteMaster(UUID actorId, UUID salonId, String phone, Role role) {
         // Ownership already enforced by @PreAuthorize("... @authz.canManageSalon(...)") on
         // the controller — no redundant DB round-trip needed here.
         salonRepository.findById(salonId)
                 .orElseThrow(() -> new NotFoundException("Salon not found: " + salonId));
 
-        var inviteRequest = new InviteRequest(email, salonId, role);
+        var inviteRequest = new InviteRequest(phone, salonId, role);
         return inviteService.sendInvite(inviteRequest, actorId);
     }
 
@@ -2142,7 +2143,7 @@ public class SalonService {
     public SalonInviteHistoryResponse listSalonInvites(UUID salonId) {
         Instant now = clock.instant();
         List<InviteHistoryRow> rows = inviteTokenRepository
-                .findSalonInviteHistory(salonId, PageRequest.of(0, MAX_INVITE_HISTORY + 1));
+                .findSalonInviteHistory(salonId, now, PageRequest.of(0, MAX_INVITE_HISTORY + 1));
 
         List<SalonInviteResponse> invites = rows.stream()
                 .limit(MAX_INVITE_HISTORY)

@@ -12,14 +12,27 @@ package com.beautica.notification.sms;
 public final class SmsClubOtpSmsSender implements OtpSmsSender {
 
     private final SmsClubService delegate;
+    /** B520 audit-fix — its own instance: invite lifetime (≥ 24 h) and the shorter invite timeouts. */
+    private final SmsClubService inviteDelegate;
 
+    /** OTP and staff invite through the same instance (tests; the bean uses the two-delegate form). */
     public SmsClubOtpSmsSender(SmsClubService delegate) {
+        this(delegate, delegate);
+    }
+
+    public SmsClubOtpSmsSender(SmsClubService delegate, SmsClubService inviteDelegate) {
         this.delegate = delegate;
+        this.inviteDelegate = inviteDelegate;
     }
 
     /** Delegates verbatim — including the loud throw on a blank token, which is the contract. */
     @Override
     public void send(String phoneE164, String text) {
         delegate.send(phoneE164, text);
+    }
+
+    @Override
+    public void sendStaffInvite(String phoneE164, String text) {
+        inviteDelegate.send(phoneE164, text);
     }
 }

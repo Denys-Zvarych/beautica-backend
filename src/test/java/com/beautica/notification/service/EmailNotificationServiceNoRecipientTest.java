@@ -80,9 +80,9 @@ class EmailNotificationServiceNoRecipientTest {
     }
 
     @Test
-    @DisplayName("account emails (invite, email verification code) are not attempted without a recipient address")
+    @DisplayName("account emails (request decision, email verification code) are not attempted without a recipient address")
     void should_sendNothing_when_accountEmailRecipientMissing() {
-        service.sendInviteEmail(null, "https://beautica.app/invite/accept?token=t", "Salon");
+        service.sendRequestDecisionEmail(null, RequestKind.CATEGORY_REQUEST, true, "Манікюр", null);
         service.sendVerificationEmail(null, "123456");
 
         verifyNoInteractions(mailSender, templateEngine);

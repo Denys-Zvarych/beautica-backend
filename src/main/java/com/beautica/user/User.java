@@ -294,34 +294,22 @@ public class User extends AuditableEntity {
     }
 
     /**
-     * Creates a user accepted through a salon invite (SALON_ADMIN or SALON_MASTER).
-     * <p>
-     * The invite token was single-use and emailed to this exact address by
-     * {@code InviteService}; presenting it back at accept-time <em>is</em> the proof
-     * of mailbox ownership for this account — the invite token was the email
-     * verification. Deferring to the normal OTP-verification flow afterward is both
-     * redundant and, as originally shipped, unsatisfiable (nothing on the invite path
-     * ever issues a verification code), which locked every invited user out of login.
-     * <p>
-     * The salonId-taking constructor above stays public — it also backs fixtures that
-     * represent an already-onboarded salon staff member (e.g. an existing SALON_ADMIN
-     * used as the caller of {@code sendInvite}), which is a different scenario from
-     * "just accepted an invite" and must not be forced verified by construction. This
-     * factory is the one InviteService#acceptInvite must call, so the verified-by-token
-     * intent stays documented and centralized rather than a call-site
-     * {@code setEmailVerified(true)} that a future edit could silently drop.
+     * B520 (AUTH-52, AUTH-D16) — the account an accepted PHONE invite creates: the invited phone, proven equal to the
+     * registration ticket's phone, is verified from the start; no email (one is added later as a notifications channel,
+     * AUTH-D11), so {@code emailVerified} stays {@code false}. The salon and role come from the invite token. Callers
+     * persist through {@code PhoneRegistrationService.saveClaimingPhone} (a concurrently claimed phone is a 409).
      */
-    public static User createFromInvite(
-            String email,
+    public static User createFromPhoneInvite(
+            String phoneE164,
             String passwordHash,
             Role role,
             String firstName,
             String lastName,
-            String phoneNumber,
-            UUID salonId
+            UUID salonId,
+            Instant phoneVerifiedAt
     ) {
-        User user = new User(email, passwordHash, role, firstName, lastName, phoneNumber, salonId);
-        user.emailVerified = true;
+        User user = new User(null, passwordHash, role, firstName, lastName, phoneE164, salonId);
+        user.phoneVerifiedAt = phoneVerifiedAt;
         return user;
     }
 

@@ -65,7 +65,8 @@ public record InviteAcceptRequest(
         String privacyPolicyVersion,
 
         // B514 (AUTH-41, AUTH-43) — the ticket from POST /auth/register/phone/otp/verify: the invitee proves a phone
-        // before accept (required once app.auth.require-phone-registration is true). The class-level
+        // before accept. B520 (AUTH-52): required for every invite (the service answers 400
+        // REGISTRATION_TICKET_INVALID without it) and its phone must equal the invited one. The class-level
         // @PhoneRegistrationShape decides which shape is complete. Base64url, ~43 chars.
         @Size(max = 128, message = "Registration ticket is invalid")
         @Pattern(regexp = "^[A-Za-z0-9_-]*$", message = "Registration ticket is invalid")

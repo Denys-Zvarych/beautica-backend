@@ -123,6 +123,8 @@ public abstract class AbstractIntegrationTest {
         jdbcTemplate.execute("DELETE FROM retired_booking_slugs");
         jdbcTemplate.execute("DELETE FROM masters");
         jdbcTemplate.execute("DELETE FROM invite_tokens");
+        // B520 audit-fix 2 (V252): no FK in or out — the per-phone invite-SMS cap log; cleared so caps never leak.
+        jdbcTemplate.execute("DELETE FROM invite_sms_phone_sends");
         jdbcTemplate.execute("DELETE FROM salons");
         jdbcTemplate.execute("DELETE FROM refresh_tokens");
         // Phase 11.1 / A1: password_reset_tickets (renamed from password_reset_tokens) has FK

@@ -117,7 +117,7 @@ public interface UserRepository extends JpaRepository<User, UUID>, TransactionLo
      * (which carries {@code passwordHash}), mirroring {@link #findSalonIdById}'s pattern.
      *
      * <p>Needed because {@code users.salon_id} is populated for BOTH an invited
-     * {@code SALON_ADMIN} and an invited {@code SALON_MASTER} ({@code User.createFromInvite} sets
+     * {@code SALON_ADMIN} and an invited {@code SALON_MASTER} ({@code User.createFromPhoneInvite} sets
      * it from the invite token regardless of role) — a salon-id match alone cannot distinguish a
      * staff manager from a read-only master, so the caller must resolve the role first.
      */

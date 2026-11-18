@@ -60,6 +60,8 @@ class NotificationServiceTest {
     private BookingSmsDispatcher bookingSmsDispatcher;
     @Mock
     private com.beautica.booking.service.GuestRescheduleSmsBudget rescheduleSmsBudget;
+    @Mock
+    private StaffInviteSmsChannel staffInviteSmsChannel;
 
     private NotificationService service;
 
@@ -84,6 +86,7 @@ class NotificationServiceTest {
                 emailService, bookingSmsDispatcher, cancellationText,
                 new GuestRescheduleSmsText(new com.beautica.config.BookingSmsProperties(), cancellationText),
                 rescheduleSmsBudget,
+                staffInviteSmsChannel,
                 FRONTEND_BASE_URL);
         // Phase 431: the budget grants by default; the cap rows below override it.
         lenient().when(rescheduleSmsBudget.tryReserve(any(), any(), any())).thenReturn(true);
@@ -729,23 +732,19 @@ class NotificationServiceTest {
     }
 
     // -------------------------------------------------------------------------
-    // sendInviteEmail
+    // B520 — sendStaffInviteSms
     // -------------------------------------------------------------------------
 
     @Test
-    @DisplayName("should forward URL verbatim to EmailService when sendInviteEmail called")
-    void should_delegateToEmailService_when_sendInviteEmailCalled() {
-        // Arrange
-        String email = "user@example.com";
-        String inviteUrl = "https://app.beautica.ua/invite/accept?token=ABC123";
-        String salonName = "Test Salon";
+    @DisplayName("B520: the staff invite goes as ONE SMS through the invite channel — never e-mail, never the booking dispatcher")
+    void should_sendInviteSmsThroughChannel_when_sendStaffInviteSmsCalled() {
+        String inviteUrl = "https://beautica.app/invite/accept?token=ABC123";
 
-        // Act
-        service.sendInviteEmail(email, inviteUrl, salonName);
+        service.sendStaffInviteSms(GUEST_PHONE, inviteUrl, "Студія Аврора");
 
-        // Assert — exact-arg forwarding, no transformation
-        verify(emailService).sendInviteEmail(email, inviteUrl, salonName);
-        verifyNoMoreInteractions(emailService);
+        verify(staffInviteSmsChannel).send(GUEST_PHONE,
+                com.beautica.booking.GuestMessageExpectedCopy.staffInvite("Студія Аврора", inviteUrl));
+        verifyNoInteractions(emailService, bookingSmsDispatcher);
     }
 
     // -------------------------------------------------------------------------
@@ -1384,7 +1383,7 @@ class NotificationServiceTest {
             case CLIENT_CANCELLED -> service.notifyClientCancelled(booking);
             case REVIEW_REQUESTED -> service.notifyReviewRequested(booking);
             case CLOSURE_REMINDER -> service.notifyClosureReminder(booking);
-            case INVITE -> service.sendInviteEmail("invitee@example.com", "https://app.beautica.ua/i", "Salon");
+            case INVITE -> service.sendStaffInviteSms(GUEST_PHONE, "https://app.beautica.ua/i", "Salon");
             case MASTER_BOOKING_RESCHEDULED -> service.notifyMasterOfProviderReschedule(booking, UUID.randomUUID());
             case MASTER_BOOKING_DECLINED ->
                     service.notifyMasterOfProviderDecline(BookingVisit.single(booking), UUID.randomUUID());

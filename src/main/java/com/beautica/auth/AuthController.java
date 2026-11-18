@@ -1,5 +1,6 @@
 package com.beautica.auth;
 
+import com.beautica.auth.appcheck.RequireAppCheck;
 import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.ForgotPasswordRequest;
 import com.beautica.auth.dto.InviteAcceptRequest;
@@ -175,7 +176,9 @@ public class AuthController {
         return ResponseEntity.noContent().build();
     }
 
+    // B520: the invitee gets one SMS (AUTH-54 — App Check before the handler; AUTH-52 caps in the service).
     @PostMapping("/invite")
+    @RequireAppCheck
     @PreAuthorize("hasRole('SALON_OWNER')")
     public ResponseEntity<ApiResponse<InviteResponse>> sendInvite(
             @Valid @RequestBody InviteRequest request,

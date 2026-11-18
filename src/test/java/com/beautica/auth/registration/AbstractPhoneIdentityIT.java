@@ -197,11 +197,33 @@ public abstract class AbstractPhoneIdentityIT extends AbstractIntegrationTest {
         return withConsent;
     }
 
-    protected record Invite(String rawToken, String email) {
+    /** B520 — the name every {@link #newSalon()} salon carries (Cyrillic, like a real one). */
+    protected static final String SALON_NAME = "Студія Аврора";
+
+    /** B520 — an active salon with a signed-in owner: ids and the owner's access token. */
+    protected record Salon(UUID salonId, UUID ownerId, String ownerToken) {
     }
 
-    /** An unused 48 h SALON_MASTER invite into a fresh active salon (moved here from InviteAcceptPhoneIT). */
+    /** B520 — a fresh active salon named {@link #SALON_NAME}, owned by a fresh signed-in SALON_OWNER. */
+    protected Salon newSalon() {
+        String ownerEmail = newEmail();
+        UUID ownerId = seedUser("SALON_OWNER", ownerEmail, true, null, null);
+        UUID salonId = UUID.randomUUID();
+        jdbcTemplate.update("INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at, city_id) "
+                + "VALUES (?, ?, ?, true, NOW(), NOW(), ?)", salonId, ownerId, SALON_NAME, testCityId());
+        return new Salon(salonId, ownerId, accessToken(ownerEmail));
+    }
+
+    /** B520 — a pending PHONE invite: the raw link token, the invited phone and its salon. */
+    protected record Invite(String rawToken, String phone, UUID salonId) {
+    }
+
+    /** An unused 48 h SALON_MASTER phone invite into a fresh active salon (B520: invites go to a phone). */
     protected Invite seedInvite() {
+        return seedInvite(newPhone());
+    }
+
+    protected Invite seedInvite(String invitedPhone) {
         long nonce = System.nanoTime();
         UUID ownerId = UUID.randomUUID();
         jdbcTemplate.update("INSERT INTO users (id, email, password_hash, role, is_active, email_verified) "
@@ -209,13 +231,12 @@ public abstract class AbstractPhoneIdentityIT extends AbstractIntegrationTest {
         UUID salonId = UUID.randomUUID();
         jdbcTemplate.update("INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at, city_id) "
                 + "VALUES (?, ?, ?, true, NOW(), NOW(), ?)", salonId, ownerId, "Salon " + nonce, testCityId());
-        String email = "invitee-" + nonce + "@beautica.test";
         String rawToken = "raw-" + UUID.randomUUID();
-        jdbcTemplate.update("INSERT INTO invite_tokens (id, token, email, salon_id, role, expires_at, is_used, "
+        jdbcTemplate.update("INSERT INTO invite_tokens (id, token, phone, salon_id, role, expires_at, is_used, "
                         + "created_at, updated_at) VALUES (?, ?, ?, ?, 'SALON_MASTER', ?, false, NOW(), NOW())",
-                UUID.randomUUID(), sha256Hex(rawToken), email, salonId,
+                UUID.randomUUID(), sha256Hex(rawToken), invitedPhone, salonId,
                 Timestamp.from(Instant.now().plus(2, ChronoUnit.DAYS)));
-        return new Invite(rawToken, email);
+        return new Invite(rawToken, invitedPhone, salonId);
     }
 
     protected static String sha256Hex(String input) {

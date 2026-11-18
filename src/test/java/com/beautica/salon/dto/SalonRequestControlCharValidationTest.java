@@ -126,4 +126,93 @@ class SalonRequestControlCharValidationTest {
                 .as("update description with DEL (0x7F) must still fail @Pattern validation")
                 .isTrue();
     }
+
+    // -- B520 audit-fix 2: invisible format characters in the name ------------
+
+    private static boolean hasNameViolation(Set<? extends ConstraintViolation<?>> violations) {
+        return violations.stream().anyMatch(v -> v.getPropertyPath().toString().equals("name"));
+    }
+
+    @Test
+    @DisplayName("CreateSalonRequest.name rejects a zero-width space (U+200B) — it could hide a domain in the invite SMS")
+    void should_rejectCreateName_when_containsZeroWidthSpace() {
+        CreateSalonRequest request = new CreateSalonRequest(
+                "evil.\u200Bcom", null, null, null, null, null, null,
+                VALID_CITY_ID, null, VALID_STREET, VALID_BUILDING_NO, null);
+
+        assertThat(hasNameViolation(validator.validate(request))).isTrue();
+    }
+
+    @Test
+    @DisplayName("UpdateSalonRequest.name rejects a zero-width space (U+200B)")
+    void should_rejectUpdateName_when_containsZeroWidthSpace() {
+        UpdateSalonRequest request = new UpdateSalonRequest(
+                "evil.\u200Bcom", null, null, null, null,
+                null, null, VALID_STREET, VALID_BUILDING_NO, null, null, null);
+
+        assertThat(hasNameViolation(validator.validate(request))).isTrue();
+    }
+
+    @Test
+    @DisplayName("a plain Cyrillic name with an apostrophe and accented letters stays valid")
+    void should_acceptCreateName_when_noFormatCharacters() {
+        CreateSalonRequest request = new CreateSalonRequest(
+                "Салон «Мар'яна» Café", null, null, null, null, null, null,
+                VALID_CITY_ID, null, VALID_STREET, VALID_BUILDING_NO, null);
+
+        assertThat(hasNameViolation(validator.validate(request))).isFalse();
+    }
+
+    // -- B520 audit-fix 3: emoji joiners allowed, other format characters still rejected --------
+
+    /** «Студія 👩‍🎨» — WOMAN + ZERO WIDTH JOINER (U+200D) + ARTIST PALETTE, one emoji sequence. */
+    private static final String EMOJI_ZWJ_NAME = "Студія \uD83D\uDC69\u200D\uD83C\uDFA8";
+
+    private static CreateSalonRequest createWithName(String name) {
+        return new CreateSalonRequest(
+                name, null, null, null, null, null, null,
+                VALID_CITY_ID, null, VALID_STREET, VALID_BUILDING_NO, null);
+    }
+
+    private static UpdateSalonRequest updateWithName(String name) {
+        return new UpdateSalonRequest(
+                name, null, null, null, null,
+                null, null, VALID_STREET, VALID_BUILDING_NO, null, null, null);
+    }
+
+    @Test
+    @DisplayName("CreateSalonRequest.name accepts an emoji ZWJ sequence (U+200D)")
+    void should_acceptCreateName_when_containsEmojiZeroWidthJoiner() {
+        assertThat(validator.validate(createWithName(EMOJI_ZWJ_NAME))).isEmpty();
+    }
+
+    @Test
+    @DisplayName("UpdateSalonRequest.name accepts an emoji ZWJ sequence (U+200D)")
+    void should_acceptUpdateName_when_containsEmojiZeroWidthJoiner() {
+        assertThat(validator.validate(updateWithName(EMOJI_ZWJ_NAME))).isEmpty();
+    }
+
+    @Test
+    @DisplayName("CreateSalonRequest.name accepts a zero-width non-joiner (U+200C)")
+    void should_acceptCreateName_when_containsZeroWidthNonJoiner() {
+        assertThat(validator.validate(createWithName("Studio\u200Cname"))).isEmpty();
+    }
+
+    @Test
+    @DisplayName("CreateSalonRequest.name still rejects a soft hyphen (U+00AD)")
+    void should_rejectCreateName_when_containsSoftHyphen() {
+        assertThat(hasNameViolation(validator.validate(createWithName("evil.\u00ADcom")))).isTrue();
+    }
+
+    @Test
+    @DisplayName("UpdateSalonRequest.name still rejects a soft hyphen (U+00AD)")
+    void should_rejectUpdateName_when_containsSoftHyphen() {
+        assertThat(hasNameViolation(validator.validate(updateWithName("evil.\u00ADcom")))).isTrue();
+    }
+
+    @Test
+    @DisplayName("an emoji name next to a zero-width space (U+200B) is still rejected — the joiner allowance is narrow")
+    void should_rejectCreateName_when_emojiNameAlsoContainsZeroWidthSpace() {
+        assertThat(hasNameViolation(validator.validate(createWithName(EMOJI_ZWJ_NAME + "\u200B")))).isTrue();
+    }
 }

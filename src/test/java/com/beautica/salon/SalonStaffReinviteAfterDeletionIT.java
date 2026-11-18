@@ -1,5 +1,6 @@
 package com.beautica.salon;
 
+import com.beautica.support.StaffInviteFixtures;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.auth.InvitePersistenceService;
 import com.beautica.auth.Role;
@@ -14,7 +15,6 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
-import org.mockito.ArgumentCaptor;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.mock.mockito.SpyBean;
 import org.springframework.boot.test.web.client.TestRestTemplate;
@@ -27,18 +27,11 @@ import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import java.math.BigDecimal;
-import java.net.URLDecoder;
-import java.nio.charset.StandardCharsets;
-import java.time.Instant;
 import java.time.OffsetDateTime;
-import java.util.List;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.anyString;
-import static org.mockito.Mockito.atLeastOnce;
-import static org.mockito.Mockito.verify;
 
 /**
  * Phase 296 — the acceptance test for the whole 2026-09-04 salon-deletion reversal. See
@@ -74,7 +67,7 @@ import static org.mockito.Mockito.verify;
  * here, referenced rather than re-seeded.
  *
  * <p><b>THE TRAP, asserted rather than assumed.</b> Re-invite was historically blocked by
- * {@code userRepository.existsByEmail} ({@code InviteService:159}, thrown as a 409 at
+ * {@code userRepository.existsByVerifiedPhone} ({@code InviteService:159}, thrown as a 409 at
  * {@code :206-208} since phase 287) — NOT by the {@code ux_invite_tokens_active} unique index. Case
  * 1 therefore asserts that exact predicate directly, TRUE before the delete and FALSE after, so a
  * 201 that happened to arrive for some unrelated reason cannot pass this class off as green while a
@@ -99,7 +92,7 @@ import static org.mockito.Mockito.verify;
  *       they are not equivalent and the phase doc names only one outcome.
  *       <ul>
  *         <li>address KEPT (the {@code deleteAllByIdInBatch} call removed, row left standing) —
- *             ✅ EXECUTED, <b>7/7 RED</b>, and case 1 fails on the {@code existsByEmail} trap
+ *             ✅ EXECUTED, <b>7/7 RED</b>, and case 1 fails on the {@code existsByVerifiedPhone} trap
  *             assertion itself, before it ever reaches a status code;</li>
  *         <li>address SCRUBBED (row updated to {@code deleted+&lt;id&gt;@…}, {@code is_active =
  *             false} — phase 291 D9's actual PII redaction) — ✅ EXECUTED, <b>exactly case 3
@@ -142,7 +135,6 @@ class SalonStaffReinviteAfterDeletionIT extends AbstractIntegrationTest {
     private static final String FIRST_PASSWORD = SalonItFixtures.TEST_PASSWORD;
     /** A genuinely different password, set when redeeming the SALON B invite (case 2). */
     private static final String SECOND_PASSWORD = "N0vaP@rol9x!";
-    private static final String PHONE = "+380501234567";
 
     /** The name snapshotted onto the detached stub, and therefore onto the client's old receipt. */
     private static final String OLD_FIRST_NAME = "Олена";
@@ -166,7 +158,7 @@ class SalonStaffReinviteAfterDeletionIT extends AbstractIntegrationTest {
     private PasswordEncoder passwordEncoder;
 
     /**
-     * The production bean whose {@code existsByEmail} IS the gate under test. Asserted directly so
+     * The production bean whose {@code existsByVerifiedPhone} IS the gate under test. Asserted directly so
      * the acceptance criterion reads against the same predicate {@code InviteService:159} calls,
      * not against a hand-rolled {@code SELECT count(*)} that could drift from it (case 3 does carry
      * the raw SQL count as well — the phase doc asks for both).
@@ -207,7 +199,7 @@ class SalonStaffReinviteAfterDeletionIT extends AbstractIntegrationTest {
      * criterion for the entire 2026-09-04 reversal; everything in 294 and 295 is machinery in
      * service of it."</em>
      *
-     * <p>The two {@code existsByEmail} assertions are the point of the case, not decoration. The
+     * <p>The two {@code existsByVerifiedPhone} assertions are the point of the case, not decoration. The
      * 409 that used to block this loop came from that predicate, so proving it flips from TRUE to
      * FALSE across the delete is what makes the 201 below attributable to the hard delete rather
      * than to any other change in the invite path.
@@ -218,16 +210,16 @@ class SalonStaffReinviteAfterDeletionIT extends AbstractIntegrationTest {
     void should_return201_when_reInvitingTheAddressOfHardDeletedSalonStaff() throws Exception {
         Loop loop = buildSalonAWithWorkedMaster();
 
-        assertThat(userRepository.existsByEmail(loop.staffEmail()))
-                .as("precondition — InviteService:159's gate (userRepository.existsByEmail) is TRUE "
+        assertThat(userRepository.existsByVerifiedPhone(loop.staffPhone()))
+                .as("precondition — InviteService:159's gate (userRepository.existsByVerifiedPhone) is TRUE "
                         + "while the account lives, so the 201 below cannot pass vacuously on a "
                         + "check that was never armed")
                 .isTrue();
 
         deleteSalon(loop.ownerToken(), loop.salonAId());
 
-        assertThat(userRepository.existsByEmail(loop.staffEmail()))
-                .as("THE trap, asserted not assumed: re-invite was blocked by existsByEmail — not "
+        assertThat(userRepository.existsByVerifiedPhone(loop.staffPhone()))
+                .as("THE trap, asserted not assumed: re-invite was blocked by existsByVerifiedPhone — not "
                         + "by ux_invite_tokens_active — and the phase 295 hard delete is what "
                         + "flips it. A future regression that stops deleting the row fails HERE, "
                         + "not silently downstream")
@@ -235,15 +227,15 @@ class SalonStaffReinviteAfterDeletionIT extends AbstractIntegrationTest {
 
         UUID salonB = fx.insertSalon(loop.ownerId(), "Salon B " + System.nanoTime());
         ResponseEntity<String> reinvite =
-                postInvite(loop.ownerToken(), salonB, loop.staffEmail(), Role.SALON_MASTER);
+                postInvite(loop.ownerToken(), salonB, loop.staffPhone(), Role.SALON_MASTER);
 
         assertThat(reinvite.getStatusCode())
                 .as("acceptance criterion 1 — the whole reversal reduces to this status code")
                 .isEqualTo(HttpStatus.CREATED);
-        assertThat(dataOf(reinvite).path("invitedEmail").asText())
+        assertThat(dataOf(reinvite).path("invitedPhone").asText())
                 .as("a real invite response for the freed address, not an empty envelope")
-                .isEqualTo(loop.staffEmail());
-        assertThat(countLiveInvites(loop.staffEmail(), salonB))
+                .isEqualTo(loop.staffPhone());
+        assertThat(countLiveInvites(loop.staffPhone(), salonB))
                 .as("a redeemable token really was minted — a silently-swallowed idempotent 201 "
                         + "would also be a 201, and would leave no row here")
                 .isEqualTo(1);
@@ -251,10 +243,11 @@ class SalonStaffReinviteAfterDeletionIT extends AbstractIntegrationTest {
         // NEGATIVE CONTROL, same test, same salon, same bucket: an address that IS still registered
         // must still be refused. Without it, a 201 above would be equally consistent with the 409
         // gate having been removed outright rather than with the row having been deleted.
-        String liveEmail = fx.emailOf(fx.insertUser("reinvite-live-" + System.nanoTime()
-                + "@beautica.test", "CLIENT"));
-        assertThat(postInvite(loop.ownerToken(), salonB, liveEmail, Role.SALON_MASTER).getStatusCode())
-                .as("the EMAIL_ALREADY_REGISTERED gate is armed in exactly this context — the 201 "
+        String livePhone = StaffInviteFixtures.newPhone();
+        jdbcTemplate.update("UPDATE users SET phone_number = ?, phone_verified_at = NOW() WHERE id = ?", livePhone,
+                fx.insertUser("reinvite-live-" + System.nanoTime() + "@beautica.test", "CLIENT"));
+        assertThat(postInvite(loop.ownerToken(), salonB, livePhone, Role.SALON_MASTER).getStatusCode())
+                .as("the PHONE_ALREADY_REGISTERED gate is armed in exactly this context — the 201 "
                         + "above is a deleted row, not a disabled check")
                 .isEqualTo(HttpStatus.CONFLICT);
     }
@@ -270,9 +263,9 @@ class SalonStaffReinviteAfterDeletionIT extends AbstractIntegrationTest {
         UUID salonB = fx.insertSalon(loop.ownerId(), "Salon B " + System.nanoTime());
 
         String rawToken = postInviteAndCaptureToken(
-                loop.ownerToken(), salonB, loop.staffEmail(), Role.SALON_MASTER);
+                loop.ownerToken(), salonB, loop.staffPhone(), Role.SALON_MASTER);
         ResponseEntity<String> accepted =
-                acceptInvite(rawToken, SECOND_PASSWORD, NEW_FIRST_NAME, NEW_LAST_NAME);
+                acceptInvite(loop.staffPhone(), rawToken, SECOND_PASSWORD, NEW_FIRST_NAME, NEW_LAST_NAME);
 
         assertThat(accepted.getStatusCode())
                 .as("the second invite is redeemable end to end — a token, not just a 201")
@@ -280,10 +273,10 @@ class SalonStaffReinviteAfterDeletionIT extends AbstractIntegrationTest {
         assertThat(dataOf(accepted).path("accessToken").asText())
                 .as("acceptance mints a working session on the spot")
                 .isNotBlank();
-        assertThat(login(loop.staffEmail(), SECOND_PASSWORD).getStatusCode())
+        assertThat(login(loop.staffPhone(), SECOND_PASSWORD).getStatusCode())
                 .as("the NEW password is the account's password")
                 .isEqualTo(HttpStatus.OK);
-        assertThat(login(loop.staffEmail(), FIRST_PASSWORD).getStatusCode())
+        assertThat(login(loop.staffPhone(), FIRST_PASSWORD).getStatusCode())
                 .as("there is no old password to fall back to — the row that held its hash is "
                         + "gone, so this is a plain unknown-credential 401")
                 .isEqualTo(HttpStatus.UNAUTHORIZED);
@@ -298,7 +291,7 @@ class SalonStaffReinviteAfterDeletionIT extends AbstractIntegrationTest {
      * refining, so it is recorded here rather than restated:
      * <ul>
      *   <li>a tombstone that <b>keeps</b> the address ({@code UPDATE users SET is_active = false})
-     *       never reaches this case at all — {@code existsByEmail} stays TRUE, the re-invite 409s,
+     *       never reaches this case at all — {@code existsByVerifiedPhone} stays TRUE, the re-invite 409s,
      *       and cases 1, 2, 3, 4, 5 and 7 all go red at the invite;</li>
      *   <li>a tombstone that <b>scrubs</b> the address (phase 291 D9's actual PII redaction) lets
      *       the invite through, and the plain {@code count(*) WHERE email = ?} the doc names would
@@ -318,14 +311,14 @@ class SalonStaffReinviteAfterDeletionIT extends AbstractIntegrationTest {
         deleteSalon(loop.ownerToken(), loop.salonAId());
         UUID salonB = fx.insertSalon(loop.ownerId(), "Salon B " + System.nanoTime());
         String rawToken = postInviteAndCaptureToken(
-                loop.ownerToken(), salonB, loop.staffEmail(), Role.SALON_MASTER);
+                loop.ownerToken(), salonB, loop.staffPhone(), Role.SALON_MASTER);
 
-        acceptInvite(rawToken, SECOND_PASSWORD, NEW_FIRST_NAME, NEW_LAST_NAME);
+        acceptInvite(loop.staffPhone(), rawToken, SECOND_PASSWORD, NEW_FIRST_NAME, NEW_LAST_NAME);
 
-        assertThat(countUsersWithEmail(loop.staffEmail()))
+        assertThat(countUsersWithPhone(loop.staffPhone()))
                 .as("one address, one account — never an account plus a tombstone")
                 .isEqualTo(1);
-        assertThat(userIdOf(loop.staffEmail()))
+        assertThat(userIdOfPhone(loop.staffPhone()))
                 .as("and it is a NEW identity (D3), not the old row revived")
                 .isNotEqualTo(loop.oldUserId());
         assertThat(count("SELECT COUNT(*) FROM users WHERE id = ?", loop.oldUserId()))
@@ -351,8 +344,8 @@ class SalonStaffReinviteAfterDeletionIT extends AbstractIntegrationTest {
         deleteSalon(loop.ownerToken(), loop.salonAId());
         UUID salonB = fx.insertSalon(loop.ownerId(), "Salon B " + System.nanoTime());
         String rawToken = postInviteAndCaptureToken(
-                loop.ownerToken(), salonB, loop.staffEmail(), Role.SALON_MASTER);
-        acceptInvite(rawToken, SECOND_PASSWORD, NEW_FIRST_NAME, NEW_LAST_NAME);
+                loop.ownerToken(), salonB, loop.staffPhone(), Role.SALON_MASTER);
+        acceptInvite(loop.staffPhone(), rawToken, SECOND_PASSWORD, NEW_FIRST_NAME, NEW_LAST_NAME);
 
         String clientToken = fx.loginAndGetToken(loop.clientEmail());
         ResponseEntity<String> booking = restTemplate.exchange(
@@ -393,10 +386,10 @@ class SalonStaffReinviteAfterDeletionIT extends AbstractIntegrationTest {
         insertMasterPortfolioMedia(loop.ownerId(), loop.oldMasterId());
         UUID salonB = fx.insertSalon(loop.ownerId(), "Salon B " + System.nanoTime());
         String rawToken = postInviteAndCaptureToken(
-                loop.ownerToken(), salonB, loop.staffEmail(), Role.SALON_MASTER);
-        acceptInvite(rawToken, SECOND_PASSWORD, NEW_FIRST_NAME, NEW_LAST_NAME);
+                loop.ownerToken(), salonB, loop.staffPhone(), Role.SALON_MASTER);
+        acceptInvite(loop.staffPhone(), rawToken, SECOND_PASSWORD, NEW_FIRST_NAME, NEW_LAST_NAME);
 
-        UUID newUserId = userIdOf(loop.staffEmail());
+        UUID newUserId = userIdOfPhone(loop.staffPhone());
         UUID newMasterId = masterIdOfUser(newUserId);
 
         assertThat(newMasterId)
@@ -472,7 +465,7 @@ class SalonStaffReinviteAfterDeletionIT extends AbstractIntegrationTest {
      *
      * <p>The doc predicts: skip phase 295 step 3 → "case 6 must go red on the {@code V101} unique
      * index". It cannot, and no assertion could make it. {@code ux_invite_tokens_active} is
-     * {@code (lower(email), salon_id) WHERE is_used = false AND revoked_at IS NULL} (V101, re-scoped
+     * {@code (salon_id, phone) WHERE is_used = false AND revoked_at IS NULL} (B520 V251; email form V101, re-scoped
      * by V153) — <b>salon-scoped</b>. Salon A's stale row and salon B's new row differ in
      * {@code salon_id}, so they can never collide; {@code InviteService#sendInvite}'s idempotency
      * pre-check is salon-scoped for the same reason (see V101's own header). Deleting a salon is a
@@ -491,7 +484,7 @@ class SalonStaffReinviteAfterDeletionIT extends AbstractIntegrationTest {
             + "cascade and does not interfere with the salon B invite")
     void should_sweepStalePendingInvite_when_salonIsDeleted() throws Exception {
         Loop loop = buildSalonAWithWorkedMaster();
-        UUID staleInviteId = insertPendingInvite(loop.staffEmail(), loop.salonAId());
+        UUID staleInviteId = insertPendingInvite(loop.staffPhone(), loop.salonAId());
         assertThat(count("SELECT COUNT(*) FROM invite_tokens WHERE id = ?", staleInviteId))
                 .as("fixture check — the stale row exists BEFORE the cascade, so the zero below "
                         + "proves a sweep rather than an insert that never happened")
@@ -506,10 +499,10 @@ class SalonStaffReinviteAfterDeletionIT extends AbstractIntegrationTest {
 
         UUID salonB = fx.insertSalon(loop.ownerId(), "Salon B " + System.nanoTime());
         ResponseEntity<String> reinvite =
-                postInvite(loop.ownerToken(), salonB, loop.staffEmail(), Role.SALON_MASTER);
+                postInvite(loop.ownerToken(), salonB, loop.staffPhone(), Role.SALON_MASTER);
 
         assertThat(reinvite.getStatusCode()).isEqualTo(HttpStatus.CREATED);
-        assertThat(countLiveInvites(loop.staffEmail(), salonB))
+        assertThat(countLiveInvites(loop.staffPhone(), salonB))
                 .as("a genuine token for salon B, not an idempotent short-circuit against a "
                         + "leftover salon A row")
                 .isEqualTo(1);
@@ -530,13 +523,13 @@ class SalonStaffReinviteAfterDeletionIT extends AbstractIntegrationTest {
         deleteSalon(loop.ownerToken(), loop.salonAId());
         UUID salonB = fx.insertSalon(loop.ownerId(), "Salon B " + System.nanoTime());
         String rawToken = postInviteAndCaptureToken(
-                loop.ownerToken(), salonB, loop.staffEmail(), Role.SALON_ADMIN);
+                loop.ownerToken(), salonB, loop.staffPhone(), Role.SALON_ADMIN);
 
-        assertThat(acceptInvite(rawToken, SECOND_PASSWORD, NEW_FIRST_NAME, NEW_LAST_NAME)
+        assertThat(acceptInvite(loop.staffPhone(), rawToken, SECOND_PASSWORD, NEW_FIRST_NAME, NEW_LAST_NAME)
                 .getStatusCode())
                 .isEqualTo(HttpStatus.CREATED);
 
-        UUID newUserId = userIdOf(loop.staffEmail());
+        UUID newUserId = userIdOfPhone(loop.staffPhone());
         assertThat(userRole(newUserId)).isEqualTo("SALON_ADMIN");
         assertThat(userSalonId(newUserId)).isEqualTo(salonB);
         assertThat(count("SELECT COUNT(*) FROM masters WHERE user_id = ?", newUserId))
@@ -578,16 +571,16 @@ class SalonStaffReinviteAfterDeletionIT extends AbstractIntegrationTest {
         Loop loop = buildSalonAWithWorkedMaster();
 
         assertThat(count(
-                "SELECT COUNT(*) FROM invite_tokens WHERE lower(email) = lower(?) AND is_used = true",
-                loop.staffEmail()))
+                "SELECT COUNT(*) FROM invite_tokens WHERE phone = ? AND is_used = true",
+                loop.staffPhone()))
                 .as("fixture check — the invite the master actually redeemed is present and marked "
                         + "used BEFORE the cascade, so the zero below is a sweep and not an absence")
                 .isEqualTo(1);
 
         deleteSalon(loop.ownerToken(), loop.salonAId());
 
-        assertThat(count("SELECT COUNT(*) FROM invite_tokens WHERE lower(email) = lower(?)",
-                loop.staffEmail()))
+        assertThat(count("SELECT COUNT(*) FROM invite_tokens WHERE phone = ?",
+                loop.staffPhone()))
                 .as("the address is gone from invite_tokens too — the sweep is status-blind, so a "
                         + "narrowing to `is_used = false` (which case 6 would not notice) leaves "
                         + "the hard-deleted address standing in this salon's invite history")
@@ -626,7 +619,7 @@ class SalonStaffReinviteAfterDeletionIT extends AbstractIntegrationTest {
         UUID otherOwnerId = fx.insertUser(
                 "reinvite-owner-c-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
         UUID salonC = fx.insertSalon(otherOwnerId, "Salon C " + System.nanoTime());
-        UUID siblingInviteId = insertPendingInvite(loop.staffEmail(), salonC);
+        UUID siblingInviteId = insertPendingInvite(loop.staffPhone(), salonC);
 
         deleteSalon(loop.ownerToken(), loop.salonAId());
 
@@ -637,11 +630,11 @@ class SalonStaffReinviteAfterDeletionIT extends AbstractIntegrationTest {
                         + "destroy a third party's invite history as a side effect")
                 .isEqualTo(1);
         assertThat(jdbcTemplate.queryForObject(
-                "SELECT email FROM invite_tokens WHERE id = ?", String.class, siblingInviteId))
+                "SELECT phone FROM invite_tokens WHERE id = ?", String.class, siblingInviteId))
                 .as("and it still carries the address, so it is genuinely redeemable rather than "
                         + "surviving as a blanked shell")
-                .isEqualTo(loop.staffEmail());
-        assertThat(userRepository.existsByEmail(loop.staffEmail()))
+                .isEqualTo(loop.staffPhone());
+        assertThat(userRepository.existsByVerifiedPhone(loop.staffPhone()))
                 .as("the address is free at the same time — salon C's invitee can register on it "
                         + "with no 409 from InviteService:159, which is what makes the surviving "
                         + "row worth surviving")
@@ -655,7 +648,7 @@ class SalonStaffReinviteAfterDeletionIT extends AbstractIntegrationTest {
      * completed booking and a review — the D2 "master with real history" precondition, which is
      * what forces the phase 295 detach branch instead of the trivial delete-outright branch.
      */
-    private record Loop(UUID ownerId, String ownerToken, UUID salonAId, String staffEmail,
+    private record Loop(UUID ownerId, String ownerToken, UUID salonAId, String staffPhone,
                         UUID oldUserId, UUID oldMasterId, String oldRole,
                         String clientEmail, UUID bookingId) {}
 
@@ -665,17 +658,17 @@ class SalonStaffReinviteAfterDeletionIT extends AbstractIntegrationTest {
         UUID salonAId = fx.insertSalon(ownerId, "Salon A " + System.nanoTime());
         String ownerToken = fx.loginAndGetToken(ownerEmail);
 
-        String staffEmail = "reinvite-staff-" + System.nanoTime() + "@beautica.test";
+        String staffPhone = StaffInviteFixtures.newPhone();
         // Setup invite via the service the controller delegates to — see the class javadoc's
         // rate-limit budget note for why this one hop is not made over HTTP.
-        salonService.inviteMaster(ownerId, salonAId, staffEmail, Role.SALON_MASTER);
-        String rawToken = lastCapturedRawToken();
-        assertThat(acceptInvite(rawToken, FIRST_PASSWORD, OLD_FIRST_NAME, OLD_LAST_NAME)
+        salonService.inviteMaster(ownerId, salonAId, staffPhone, Role.SALON_MASTER);
+        String rawToken = StaffInviteFixtures.lastRawInviteToken(invitePersistenceService);
+        assertThat(acceptInvite(staffPhone, rawToken, FIRST_PASSWORD, OLD_FIRST_NAME, OLD_LAST_NAME)
                 .getStatusCode())
                 .as("the first invite must genuinely redeem, or the whole loop is untested")
                 .isEqualTo(HttpStatus.CREATED);
 
-        UUID oldUserId = userIdOf(staffEmail);
+        UUID oldUserId = userIdOfPhone(staffPhone);
         UUID oldMasterId = masterIdOfUser(oldUserId);
 
         UUID serviceDefId = insertServiceDefinition(salonAId);
@@ -688,37 +681,40 @@ class SalonStaffReinviteAfterDeletionIT extends AbstractIntegrationTest {
         tx.executeWithoutResult(s -> reviewRepository.recalculateMasterRating(oldMasterId));
         insertMasterPortfolioMedia(ownerId, oldMasterId);
 
-        return new Loop(ownerId, ownerToken, salonAId, staffEmail, oldUserId, oldMasterId,
+        return new Loop(ownerId, ownerToken, salonAId, staffPhone, oldUserId, oldMasterId,
                 userRole(oldUserId), clientEmail, bookingId);
     }
 
     // ── HTTP ────────────────────────────────────────────────────────────────────────────────
 
-    private ResponseEntity<String> postInvite(String ownerToken, UUID salonId, String email, Role role) {
+    private ResponseEntity<String> postInvite(String ownerToken, UUID salonId, String phone, Role role) {
         return restTemplate.exchange(
                 "/api/v1/salons/" + salonId + "/invite", HttpMethod.POST,
-                new HttpEntity<>(new InviteRequest(email, salonId, role), fx.bearerHeaders(ownerToken)),
+                new HttpEntity<>(new InviteRequest(phone, salonId, role), fx.bearerHeaders(ownerToken)),
                 String.class);
     }
 
-    private String postInviteAndCaptureToken(String ownerToken, UUID salonId, String email, Role role) {
-        assertThat(postInvite(ownerToken, salonId, email, role).getStatusCode())
+    private String postInviteAndCaptureToken(String ownerToken, UUID salonId, String phone, Role role) {
+        assertThat(postInvite(ownerToken, salonId, phone, role).getStatusCode())
                 .as("the re-invite under test must be a real 201 before its token is redeemed")
                 .isEqualTo(HttpStatus.CREATED);
-        return lastCapturedRawToken();
+        return StaffInviteFixtures.lastRawInviteToken(invitePersistenceService);
     }
 
-    private ResponseEntity<String> acceptInvite(String rawToken, String password,
+    /** B520 — accepts with a registration ticket for the invited phone. */
+    private ResponseEntity<String> acceptInvite(String phone, String rawToken, String password,
                                                 String firstName, String lastName) {
         return restTemplate.postForEntity(
                 "/api/v1/auth/invite/accept",
-                new InviteAcceptRequest(rawToken, password, firstName, lastName, PHONE),
+                new InviteAcceptRequest(rawToken, password, firstName, lastName, null, null, null, null,
+                        StaffInviteFixtures.seedRegistrationTicket(jdbcTemplate, phone)),
                 String.class);
     }
 
-    private ResponseEntity<String> login(String email, String password) {
+    /** Signs in by the verified phone (B514 identifier). */
+    private ResponseEntity<String> login(String phone, String password) {
         return restTemplate.postForEntity(
-                "/api/v1/auth/login", new LoginRequest(email, password), String.class);
+                "/api/v1/auth/login", new LoginRequest(null, password, phone), String.class);
     }
 
     private void deleteSalon(String ownerToken, UUID salonId) {
@@ -728,22 +724,6 @@ class SalonStaffReinviteAfterDeletionIT extends AbstractIntegrationTest {
                 .as("the delete must actually run — a 409 from the phase 289 staff-as-client "
                         + "audit here would silently turn every case below into a no-op")
                 .isEqualTo(HttpStatus.NO_CONTENT);
-    }
-
-    /**
-     * The last raw invite token minted in this test. {@code inviteLink} is the only place the
-     * plaintext exists outside the invitee's mailbox; {@code invite_tokens.token} holds an
-     * irreversible hash.
-     */
-    private String lastCapturedRawToken() {
-        ArgumentCaptor<String> linkCaptor = ArgumentCaptor.forClass(String.class);
-        verify(invitePersistenceService, atLeastOnce()).persistInviteAndEnqueue(
-                anyString(), any(UUID.class), any(Role.class), any(Instant.class),
-                anyString(), linkCaptor.capture(), anyString());
-        List<String> links = linkCaptor.getAllValues();
-        String link = links.get(links.size() - 1);
-        String encoded = link.substring(link.indexOf("token=") + "token=".length());
-        return URLDecoder.decode(encoded, StandardCharsets.UTF_8);
     }
 
     private JsonNode dataOf(ResponseEntity<String> response) throws Exception {
@@ -828,21 +808,21 @@ class SalonStaffReinviteAfterDeletionIT extends AbstractIntegrationTest {
      * the only honest way to represent the shape phase 295 step 3 exists to clean up is to insert
      * it.
      */
-    private UUID insertPendingInvite(String email, UUID salonId) {
+    private UUID insertPendingInvite(String phone, UUID salonId) {
         UUID id = UUID.randomUUID();
         jdbcTemplate.update(
-                "INSERT INTO invite_tokens (id, token, email, salon_id, role, expires_at, is_used, "
+                "INSERT INTO invite_tokens (id, token, phone, salon_id, role, expires_at, is_used, "
                         + "created_at, updated_at) "
                         + "VALUES (?, ?, ?, ?, 'SALON_MASTER', NOW() + interval '48 hours', false, "
                         + "NOW(), NOW())",
-                id, "stale-" + UUID.randomUUID(), email, salonId);
+                id, "stale-" + UUID.randomUUID(), phone, salonId);
         return id;
     }
 
     // ── reads ───────────────────────────────────────────────────────────────────────────────
 
-    private UUID userIdOf(String email) {
-        return jdbcTemplate.queryForObject("SELECT id FROM users WHERE email = ?", UUID.class, email);
+    private UUID userIdOfPhone(String phone) {
+        return jdbcTemplate.queryForObject("SELECT id FROM users WHERE phone_number = ?", UUID.class, phone);
     }
 
     private UUID masterIdOfUser(UUID userId) {
@@ -880,16 +860,16 @@ class SalonStaffReinviteAfterDeletionIT extends AbstractIntegrationTest {
                 "SELECT avg_rating FROM masters WHERE id = ?", BigDecimal.class, masterId);
     }
 
-    private int countUsersWithEmail(String email) {
-        return count("SELECT COUNT(*) FROM users WHERE email = ?", email);
+    private int countUsersWithPhone(String phone) {
+        return count("SELECT COUNT(*) FROM users WHERE phone_number = ?", phone);
     }
 
     /** Live = the exact row set {@code ux_invite_tokens_active} covers. */
-    private int countLiveInvites(String email, UUID salonId) {
+    private int countLiveInvites(String phone, UUID salonId) {
         Integer value = jdbcTemplate.queryForObject(
-                "SELECT COUNT(*) FROM invite_tokens WHERE lower(email) = lower(?) AND salon_id = ? "
+                "SELECT COUNT(*) FROM invite_tokens WHERE phone = ? AND salon_id = ? "
                         + "AND is_used = false AND revoked_at IS NULL",
-                Integer.class, email, salonId);
+                Integer.class, phone, salonId);
         return value == null ? -1 : value;
     }
 

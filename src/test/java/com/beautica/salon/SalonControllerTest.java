@@ -151,6 +151,14 @@ class SalonControllerTest {
     @MockBean
     private JwtTokenProvider jwtTokenProvider;
 
+    /**
+     * B520: {@code POST /{salonId}/invite} carries {@code @RequireAppCheck}; the slice loads the interceptor but not
+     * the guard, and an annotated handler without a guard fails closed (500). A no-op mock = App Check passes; the
+     * ENFORCE behaviour is pinned by {@code AppCheckGuardIT}.
+     */
+    @MockBean
+    private com.beautica.auth.appcheck.AppCheckGuard appCheckGuard;
+
     // Phase 23.x: SalonController now constructor-injects BookingMasterService for the
     // GET /{salonId}/services/{serviceDefId}/masters booking-selection endpoint. Without this
     // @MockBean the @WebMvcTest context fails to load (no bean of type BookingMasterService),
@@ -373,35 +381,36 @@ class SalonControllerTest {
     // ── POST /api/v1/salons/{id}/invite ───────────────────────────────────────
 
     @Test
-    @DisplayName("POST /api/v1/salons/{id}/invite — 201 when owner sends invite to valid email")
+    @DisplayName("POST /api/v1/salons/{id}/invite — 201 when owner invites a phone; the phone reaches the service")
     void should_return201_when_ownerSendsInvite() throws Exception {
         var userId = UUID.randomUUID();
         var salonId = UUID.randomUUID();
         when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
-        when(salonService.inviteMaster(eq(userId), eq(salonId), any(), any()))
-                .thenReturn(new InviteResponse("master@beautica.test", java.time.Instant.now().plusSeconds(86400)));
+        when(salonService.inviteMaster(eq(userId), eq(salonId), eq("050 123 45 67"), eq(Role.SALON_MASTER)))
+                .thenReturn(new InviteResponse("+380501234567", java.time.Instant.now().plusSeconds(86400)));
 
-        String body = "{\"email\":\"master@beautica.test\"}";
+        String body = "{\"phone\":\"050 123 45 67\"}";
 
-        log.debug("Act: POST {}/{}/invite as SALON_OWNER with valid master email", SALONS_URL, salonId);
+        log.debug("Act: POST {}/{}/invite as SALON_OWNER with a phone", SALONS_URL, salonId);
         mockMvc.perform(post(SALONS_URL + "/" + salonId + "/invite")
                         .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
                         .with(csrf())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(body))
-                .andExpect(status().isCreated());
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.data.invitedPhone").value("+380501234567"));
     }
 
     @Test
-    @DisplayName("POST /api/v1/salons/{id}/invite — 400 when invite email is invalid")
-    void should_return400_when_inviteEmailInvalid() throws Exception {
+    @DisplayName("POST /api/v1/salons/{id}/invite — 400 at the boundary when the phone carries letters")
+    void should_return400_when_invitePhoneHasInvalidCharacters() throws Exception {
         var userId = UUID.randomUUID();
         var salonId = UUID.randomUUID();
         when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
 
-        String body = "{\"email\":\"not-an-email\"}";
+        String body = "{\"phone\":\"not-a-phone\"}";
 
-        log.debug("Act: POST {}/{}/invite with malformed email='not-an-email'", SALONS_URL, salonId);
+        log.debug("Act: POST {}/{}/invite with a phone containing letters", SALONS_URL, salonId);
         mockMvc.perform(post(SALONS_URL + "/" + salonId + "/invite")
                         .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
                         .with(csrf())
@@ -584,7 +593,7 @@ class SalonControllerTest {
         // short-circuits on the role check before calling authz.
         when(authorizationService.canManageSalon(any(), any())).thenReturn(false);
 
-        String body = "{\"email\":\"victim@test.com\"}";
+        String body = "{\"phone\":\"+380501234567\"}";
 
         log.debug("Act: POST {}/{}/invite as SALON_MASTER — must be denied with 403", SALONS_URL, salonId);
         mockMvc.perform(post(SALONS_URL + "/" + salonId + "/invite")
@@ -603,7 +612,7 @@ class SalonControllerTest {
         // Admin belongs to salon A, not salon B — authz denies
         when(authorizationService.canManageSalon(any(), eq(salonBId))).thenReturn(false);
 
-        String body = "{\"email\":\"victim@test.com\"}";
+        String body = "{\"phone\":\"+380501234567\"}";
 
         log.debug("Act: POST {}/{}/invite as SALON_ADMIN of a different salon — cross-salon invite must be denied", SALONS_URL, salonBId);
         mockMvc.perform(post(SALONS_URL + "/" + salonBId + "/invite")

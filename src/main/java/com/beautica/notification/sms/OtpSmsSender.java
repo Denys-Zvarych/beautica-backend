@@ -48,4 +48,13 @@ public interface OtpSmsSender {
      *                              unreachable
      */
     void send(String phoneE164, String text);
+
+    /**
+     * B520 audit-fix (NTF-59) — delivers the staff invite SMS, or throws like {@link #send}. A provider with a delivery
+     * lifetime (SMSClub) uses the long invite lifetime and the invite timeouts instead of the 10-min OTP ones; the
+     * default, for providers without either, is a plain {@link #send}.
+     */
+    default void sendStaffInvite(String phoneE164, String text) {
+        send(phoneE164, text);
+    }
 }

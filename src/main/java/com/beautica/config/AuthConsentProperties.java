@@ -22,8 +22,8 @@ public class AuthConsentProperties {
     /**
      * B514 (AUTH-02, AUTH-43) — {@code app.auth.require-phone-registration} (env
      * {@code APP_AUTH_REQUIRE_PHONE_REGISTRATION}), default {@code false}. While {@code false}, register /
-     * register-independent-master accept the legacy email + password shape (email-code path) and invite accept works
-     * without a {@code registrationTicket}. Flip to {@code true} only after M515 is the Play minimum (same order as
+     * register-independent-master accept the legacy email + password shape (email-code path). Invite accept is not
+     * gated by it since B520: a phone invite always needs a {@code registrationTicket} for the invited phone. Flip to {@code true} only after M515 is the Play minimum (same order as
      * {@code require-terms-consent}). Read by {@code PhoneRegistrationShapeValidator}.
      */
     private boolean requirePhoneRegistration = false;

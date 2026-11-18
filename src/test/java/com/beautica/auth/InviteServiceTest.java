@@ -4,9 +4,9 @@ import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.InviteAcceptRequest;
 import com.beautica.auth.dto.InvitePreviewResponse;
 import com.beautica.auth.dto.InviteRequest;
-import com.beautica.common.exception.BusinessException;
-import com.beautica.common.exception.EmailAlreadyRegisteredException;
+import com.beautica.auth.registration.RegistrationTicketService;
 import com.beautica.common.exception.ForbiddenException;
+import com.beautica.common.exception.IdentityException;
 import com.beautica.common.exception.InviteTokenException;
 import com.beautica.master.service.MasterService;
 import com.beautica.notification.inapp.service.InAppNotificationService;
@@ -22,16 +22,16 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
-import java.time.Clock;
 import org.mockito.junit.jupiter.MockitoExtension;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
-import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.test.util.ReflectionTestUtils;
 
+import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
+import java.time.ZoneOffset;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -39,1562 +39,583 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.catchThrowableOfType;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
+/**
+ * B520 — {@link InviteService} by phone: create (input, AUTH-18 ordering, idempotency, race), validate (masked phone,
+ * pre-deploy email rows refused) and accept (the registration ticket must prove the invited phone, AUTH-52). The
+ * owner/admin permission matrix lives in {@link InviteServiceAdminTest}.
+ */
 @ExtendWith(MockitoExtension.class)
-@DisplayName("InviteService — unit")
+@DisplayName("InviteService — phone invites (B520)")
 class InviteServiceTest {
 
-    private static final Logger log = LoggerFactory.getLogger(InviteServiceTest.class);
+    private static final Instant NOW = Instant.parse("2026-11-18T10:00:00Z");
+    private static final String PHONE = "+380501234567";
+    private static final String OTHER_PHONE = "+380671112233";
+    private static final String TICKET = "ticket-abc";
+    private static final String RAW_TOKEN = "raw-invite-token";
+    private static final String HASHED_TOKEN = "hashed-invite-token";
 
-    private static final String SECRET =
-            "test-secret-that-is-long-enough-for-hs256-ok-padding-here";
-    private static final long ACCESS_MS = 900_000L;
-    private static final long REFRESH_MS = 2_592_000_000L;
+    @Mock private InviteTokenRepository inviteTokenRepository;
+    @Mock private UserRepository userRepository;
+    @Mock private SalonRepository salonRepository;
+    @Mock private InvitePersistenceService invitePersistenceService;
+    @Mock private TokenGenerator tokenGenerator;
+    @Mock private MasterService masterService;
+    @Mock private AuthResponseBuilder authResponseBuilder;
+    @Mock private InAppNotificationService inAppNotificationService;
+    @Mock private RegistrationTicketService registrationTicketService;
 
-    @Mock
-    private InviteTokenRepository inviteTokenRepository;
-
-    @Mock
-    private UserRepository userRepository;
-
-    @Mock
-    private SalonRepository salonRepository;
-
-    @Mock
-    private InvitePersistenceService invitePersistenceService;
-
-    @Mock
-    private TokenGenerator tokenGenerator;
-
-    @Mock
-    private MasterService masterService;
-
-    @Mock
-    private AuthResponseBuilder authResponseBuilder;
-
-    @Mock
-    private InAppNotificationService inAppNotificationService;
-
-    @Mock
-    private com.beautica.auth.registration.RegistrationTicketService registrationTicketService;
-
-    private PasswordEncoder passwordEncoder;
+    private final InviteConflictProbeBudget probeBudget =
+            new InviteConflictProbeBudget(Clock.fixed(NOW, ZoneOffset.UTC));
     private InviteService inviteService;
+    private final UUID salonId = UUID.randomUUID();
+    private final UUID callerId = UUID.randomUUID();
 
     @BeforeEach
     void setUp() {
-        passwordEncoder = new BCryptPasswordEncoder(4);
-        inviteService = new InviteService(
-                inviteTokenRepository,
-                userRepository,
-                salonRepository,
-                passwordEncoder,
-                tokenGenerator,
-                masterService,
-                authResponseBuilder,
-                invitePersistenceService,
-                "http://localhost:3000",
-                48L,
-                Clock.systemUTC(),
-                inAppNotificationService,
-                registrationTicketService
-        );
+        inviteService = service("https://beautica.app");
+    }
+
+    private InviteService service(String frontendBaseUrl) {
+        return new InviteService(inviteTokenRepository, userRepository, salonRepository, new BCryptPasswordEncoder(4),
+                tokenGenerator, masterService, authResponseBuilder, invitePersistenceService, frontendBaseUrl, 48L,
+                Clock.fixed(NOW, ZoneOffset.UTC), inAppNotificationService, registrationTicketService, probeBudget);
+    }
+
+    // ── create ───────────────────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("create: persists ONE phone invite with the hashed token, the join link, salon name and inviter")
+    void should_persistPhoneInvite_when_ownerInvitesUnregisteredPhone() {
+        stubOwnerOfSalon("Студія Аврора");
+        when(tokenGenerator.generateToken()).thenReturn(RAW_TOKEN);
+        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(HASHED_TOKEN);
+
+        var response = inviteService.sendInvite(new InviteRequest(PHONE, salonId, null), callerId);
+
+        var captor = ArgumentCaptor.forClass(InvitePersistenceService.PhoneInvite.class);
+        verify(invitePersistenceService).persistInviteAndEnqueue(captor.capture());
+        var invite = captor.getValue();
+        assertThat(invite.phoneE164()).isEqualTo(PHONE);
+        assertThat(invite.hashedToken()).isEqualTo(HASHED_TOKEN);
+        assertThat(invite.inviteLink()).isEqualTo("https://beautica.app/invite/accept?token=" + RAW_TOKEN);
+        assertThat(invite.salonName()).isEqualTo("Студія Аврора");
+        assertThat(invite.inviterId()).isEqualTo(callerId);
+        assertThat(invite.role()).isEqualTo(Role.SALON_MASTER);
+        assertThat(invite.expiresAt()).isEqualTo(NOW.plus(Duration.ofHours(48)));
+        assertThat(response.invitedPhone()).isEqualTo(PHONE);
+        assertThat(response.expiresAt()).isEqualTo(NOW.plus(Duration.ofHours(48)));
     }
 
     @Test
-    @DisplayName("sendInvite passes the hashed token (not the raw token) to the persistence delegate")
-    void should_storeHashedToken_when_sendInviteSucceeds() {
-        var salonId = UUID.randomUUID();
-        var callerId = UUID.randomUUID();
-        var request = new InviteRequest("master@example.com", salonId, null);
-        var caller = buildCallerWithSalon(callerId, salonId);
-        var rawToken = "raw-invite-token";
-        var hashedToken = "hashed-invite-token";
-        log.debug("Arrange: caller owns salon salonId={}", salonId);
+    @DisplayName("create: any human spelling of a UA mobile is normalised to +380 before every lookup and the insert")
+    void should_normalisePhone_when_requestUsesHumanSpelling() {
+        stubOwnerOfSalon("S");
+        when(tokenGenerator.generateToken()).thenReturn(RAW_TOKEN);
 
-        var salonStub = mock(Salon.class);
-        when(salonStub.getName()).thenReturn("Test Salon");
+        var response = inviteService.sendInvite(new InviteRequest("050 123-45-67", salonId, null), callerId);
 
-        when(tokenGenerator.generateToken()).thenReturn(rawToken);
-        when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
-        when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
-        when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
-        when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(salonStub));
-        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull("master@example.com", salonId))
-                .thenReturn(Optional.empty());
-
-        log.debug("Act: sendInvite with tokenGenerator returning raw='{}' hashed='{}'", rawToken, hashedToken);
-        inviteService.sendInvite(request, callerId);
-
-        // Persistence (saveAndFlush) moved into InvitePersistenceService; assert the hashed value
-        // and the link are forwarded to the delegate, not the raw token.
-        ArgumentCaptor<String> hashedCaptor = ArgumentCaptor.forClass(String.class);
-        ArgumentCaptor<String> linkCaptor = ArgumentCaptor.forClass(String.class);
-        verify(invitePersistenceService).persistInviteAndEnqueue(
-                any(), any(), any(), any(), hashedCaptor.capture(), linkCaptor.capture(), any());
-        assertThat(hashedCaptor.getValue())
-                .as("hashed token forwarded to persistence must equal the hashed value, not raw='%s'", rawToken)
-                .isEqualTo(hashedToken);
-        assertThat(hashedCaptor.getValue()).isNotEqualTo(rawToken);
-        assertThat(linkCaptor.getValue()).endsWith(rawToken);
+        verify(userRepository).existsByVerifiedPhone(PHONE);
+        verify(inviteTokenRepository).findByPhoneAndSalonIdAndIsUsedFalseAndRevokedAtIsNull(PHONE, salonId);
+        assertThat(response.invitedPhone()).isEqualTo(PHONE);
     }
 
     @Test
-    @DisplayName("sendInvite delegates persist + enqueue to InvitePersistenceService on the happy path")
-    void should_saveTokenAndEnqueueOutbox_when_sendInviteSucceeds() {
-        var salonId = UUID.randomUUID();
-        var callerId = UUID.randomUUID();
-        var request = new InviteRequest("master@example.com", salonId, null);
-        var caller = buildCallerWithSalon(callerId, salonId);
-        log.debug("Arrange: email={} salonId={}", request.email(), salonId);
+    @DisplayName("create: a body without a phone (old build sending only email) → 400 INVITE_PHONE_REQUIRED, nothing read")
+    void should_throwInvitePhoneRequired_when_phoneMissing() {
+        var thrown = catchThrowableOfType(
+                () -> inviteService.sendInvite(new InviteRequest(null, salonId, null), callerId),
+                IdentityException.class);
 
-        var salonStub = mock(Salon.class);
-        when(salonStub.getName()).thenReturn("Test Salon");
-
-        when(tokenGenerator.generateToken()).thenReturn("raw-token");
-        when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
-        when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
-        when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(salonStub));
-        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull("master@example.com", salonId))
-                .thenReturn(Optional.empty());
-
-        log.debug("Act: sendInvite for email={} salonId={} on happy path", request.email(), salonId);
-        var response = inviteService.sendInvite(request, callerId);
-
-        assertThat(response.invitedEmail())
-                .as("response must carry the invited email address")
-                .isEqualTo("master@example.com");
-        assertThat(response.expiresAt()).isAfter(Instant.now());
-
-        verify(invitePersistenceService).persistInviteAndEnqueue(
-                any(), any(), any(), any(), any(), any(), any());
+        assertThat(thrown.getCode()).isEqualTo(IdentityException.Code.INVITE_PHONE_REQUIRED);
+        assertThat(thrown.getStatus()).isEqualTo(HttpStatus.BAD_REQUEST);
+        verifyNoInteractions(userRepository, salonRepository, inviteTokenRepository, invitePersistenceService);
     }
 
     @Test
-    @DisplayName("sendInvite throws EmailAlreadyRegisteredException (409 EMAIL_ALREADY_REGISTERED) when target email already registered — phase 287 reversal")
-    void should_throwEmailAlreadyRegistered_when_targetEmailAlreadyRegistered() {
-        // Phase 287: an already-registered target is now an honest 409, not a distinguishing-
-        // oracle concern (see InviteService#sendInvite javadoc for the reversal). Authorization/
-        // ownership checks still run first — the flow reaches findById(callerId) and
-        // findByIdAndOwnerId — and ONLY THEN does the already-registered branch throw.
-        var salonId = UUID.randomUUID();
-        var callerId = UUID.randomUUID();
-        var request = new InviteRequest("taken@example.com", salonId, null);
-        var caller = buildCallerWithSalon(callerId, salonId);
-        log.debug("Arrange: email={} already registered; caller owns salonId={}", request.email(), salonId);
+    @DisplayName("create: a landline / foreign number → 400 PHONE_NOT_UA_MOBILE before any lookup or SMS")
+    void should_throwPhoneNotUaMobile_when_phoneIsLandline() {
+        var thrown = catchThrowableOfType(
+                () -> inviteService.sendInvite(new InviteRequest("+380441234567", salonId, null), callerId),
+                IdentityException.class);
 
-        when(userRepository.existsByEmail("taken@example.com")).thenReturn(true);
-        when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
-        when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(mock(Salon.class)));
-
-        log.debug("Act: sendInvite for already-registered email={} — must throw EmailAlreadyRegisteredException", request.email());
-        assertThatThrownBy(() -> inviteService.sendInvite(request, callerId))
-                .isInstanceOf(EmailAlreadyRegisteredException.class);
-
-        // Zero side effects on the 409 path.
-        verify(invitePersistenceService, never())
-                .persistInviteAndEnqueue(any(), any(), any(), any(), any(), any(), any());
+        assertThat(thrown.getCode()).isEqualTo(IdentityException.Code.PHONE_NOT_UA_MOBILE);
+        verifyNoInteractions(userRepository, salonRepository, inviteTokenRepository, invitePersistenceService);
     }
 
     @Test
-    @DisplayName("sendInvite splits registered (409) from unregistered-with-active-invite (201) — the intended post-287 contract")
-    void should_splitRegisteredFrom_unregisteredActiveInvite() {
-        // Phase 287 REPLACES the old indistinguishability proof (brand-new vs already-registered
-        // both returning 201) with the opposite assertion: the split is now INTENDED. A registered
-        // target must throw; an unregistered target with a pre-existing active invite for the same
-        // salon must still return the idempotent 201 unchanged (see the duplicate-invite branch's
-        // own comment — that 201 was never an anti-enumeration control, it is correctness).
-        var salonId = UUID.randomUUID();
-        var callerId = UUID.randomUUID();
-        var caller = buildCallerWithSalon(callerId, salonId);
-        when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
-        when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(mock(Salon.class)));
+    @DisplayName("create: a phone verified on any account → 409 PHONE_ALREADY_REGISTERED after authorization, no invite")
+    void should_throwPhoneAlreadyRegistered_when_phoneVerifiedOnAnyAccount() {
+        when(userRepository.existsByVerifiedPhone(PHONE)).thenReturn(true);
+        when(userRepository.findById(callerId)).thenReturn(Optional.of(owner()));
+        when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(activeSalon()));
 
-        // Registered target → 409, regardless of any pending invite state.
-        var registeredRequest = new InviteRequest("registered@example.com", salonId, null);
-        when(userRepository.existsByEmail("registered@example.com")).thenReturn(true);
+        var thrown = catchThrowableOfType(
+                () -> inviteService.sendInvite(new InviteRequest(PHONE, salonId, null), callerId),
+                IdentityException.class);
 
-        assertThatThrownBy(() -> inviteService.sendInvite(registeredRequest, callerId))
-                .as("registered target must throw EmailAlreadyRegisteredException")
-                .isInstanceOf(EmailAlreadyRegisteredException.class);
-
-        // Unregistered target with an active invite already pending for this salon → idempotent 201.
-        var pendingRequest = new InviteRequest("pending-active@example.com", salonId, null);
-        var existing = buildInviteToken("pending-active@example.com", Instant.now().plusSeconds(3600));
-        when(userRepository.existsByEmail("pending-active@example.com")).thenReturn(false);
-        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull(
-                "pending-active@example.com", salonId)).thenReturn(Optional.of(existing));
-
-        var pendingResponse = inviteService.sendInvite(pendingRequest, callerId);
-
-        assertThat(pendingResponse.invitedEmail())
-                .as("unregistered-with-active-invite must still return the idempotent generic 201")
-                .isEqualTo("pending-active@example.com");
-        assertThat(pendingResponse.expiresAt()).isNotNull();
-        verify(invitePersistenceService, never())
-                .persistInviteAndEnqueue(any(), any(), any(), any(), any(), any(), any());
+        assertThat(thrown.getCode()).isEqualTo(IdentityException.Code.PHONE_ALREADY_REGISTERED);
+        assertThat(thrown.getStatus()).isEqualTo(HttpStatus.CONFLICT);
+        verify(salonRepository).findByIdAndOwnerId(salonId, callerId);
+        verify(inviteTokenRepository, never()).findByPhoneAndSalonIdAndIsUsedFalseAndRevokedAtIsNull(any(), any());
+        verifyNoInteractions(invitePersistenceService);
     }
 
     @Test
-    @DisplayName("sendInvite throws EmailAlreadyRegisteredException BEFORE checking for a pending active invite — the already-registered branch wins the ordering, phase 287")
-    void should_throwEmailAlreadyRegistered_beforeCheckingActiveInvite_when_bothConditionsHold() {
-        // Phase-287 report Q4: the alreadyRegistered check and the active-invite idempotency check
-        // are two independent early-return branches in the same method. Every other test exercises
-        // them one at a time (registered-with-no-invite-state-given, or unregistered-with-active-
-        // invite). This is the ONE test where BOTH conditions are simultaneously true, so it proves
-        // the actual precedence: alreadyRegistered wins, and the method never even reaches the
-        // active-invite lookup. If the two branches were swapped (active-invite checked first), this
-        // target would silently get the idempotent 201 instead of the 409 — that regression would be
-        // invisible to every other existing test, because none of them sets both conditions at once.
-        var salonId = UUID.randomUUID();
-        var callerId = UUID.randomUUID();
-        var caller = buildCallerWithSalon(callerId, salonId);
-        var request = new InviteRequest("registered-with-pending-invite@example.com", salonId, null);
-        log.debug("Arrange: email={} is BOTH already registered AND (would-be) has an active pending "
-                + "invite for salonId={} — the active-invite lookup is deliberately left unstubbed, "
-                + "since a correct implementation must never call it here", request.email(), salonId);
+    @DisplayName("create: the inviter's 11th 409 within the hour → 429 INVITE_SMS_LIMIT (probe budget), no invite")
+    void should_throwSmsLimit_when_inviterSpentConflictProbeBudget() {
+        when(userRepository.existsByVerifiedPhone(PHONE)).thenReturn(true);
+        when(userRepository.findById(callerId)).thenReturn(Optional.of(owner()));
+        when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(activeSalon()));
+        var request = new InviteRequest(PHONE, salonId, null);
+        for (int i = 0; i < InviteConflictProbeBudget.MAX_CONFLICTS; i++) {
+            assertThat(catchThrowableOfType(() -> inviteService.sendInvite(request, callerId), IdentityException.class)
+                    .getCode()).isEqualTo(IdentityException.Code.PHONE_ALREADY_REGISTERED);
+        }
 
-        when(userRepository.existsByEmail("registered-with-pending-invite@example.com")).thenReturn(true);
-        when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
-        when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(mock(Salon.class)));
+        var thrown = catchThrowableOfType(() -> inviteService.sendInvite(request, callerId), IdentityException.class);
 
-        log.debug("Act: sendInvite where target is registered AND has an active invite — must throw 409, not return the idempotent 201");
-        assertThatThrownBy(() -> inviteService.sendInvite(request, callerId))
-                .as("already-registered must win over the idempotent-active-invite branch")
-                .isInstanceOf(EmailAlreadyRegisteredException.class);
-
-        // The strongest proof of ordering: the active-invite lookup is never even reached.
-        verify(inviteTokenRepository, never())
-                .findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull(any(), any());
-        verify(invitePersistenceService, never())
-                .persistInviteAndEnqueue(any(), any(), any(), any(), any(), any(), any());
+        assertThat(thrown.getCode()).isEqualTo(IdentityException.Code.INVITE_SMS_LIMIT);
+        assertThat(thrown.getStatus()).isEqualTo(HttpStatus.TOO_MANY_REQUESTS);
+        verifyNoInteractions(invitePersistenceService);
     }
 
     @Test
-    @DisplayName("sendInvite throws ForbiddenException (NOT EmailAlreadyRegisteredException) when caller does not own the salon, even for a registered target — authorization ordering")
-    void should_throwForbiddenNotEmailAlreadyRegistered_when_callerDoesNotOwnSalon_andTargetIsRegistered() {
-        // THE important test: the already-registered branch is placed AFTER authorization on
-        // purpose (phase 287). This pins that an unauthorized caller gets their ForbiddenException
-        // unchanged and never learns the target's registration status via a 409 vs 403 split.
-        // Mutation check: moving the `alreadyRegistered` throw up to before the authorization
-        // branches must turn this test red — see the phase-287 report for the mutation run.
-        var callerId = UUID.randomUUID();
-        var requestedSalonId = UUID.randomUUID();
-        var callerOwnedSalonId = UUID.randomUUID();
-        var request = new InviteRequest("registered-target@example.com", requestedSalonId, null);
-        var caller = buildCallerWithSalon(callerId, callerOwnedSalonId);
-        log.debug("Arrange: caller salonId={} != requested salonId={}; target email IS registered",
-                callerOwnedSalonId, requestedSalonId);
+    @DisplayName("create: once the probe budget is spent an UNREGISTERED phone is 429 too (no 429-vs-201 oracle)")
+    void should_throwSmsLimitForUnregisteredPhone_when_conflictProbeBudgetSpent() {
+        stubOwnerOfSalonWithoutName();
+        for (int i = 0; i < InviteConflictProbeBudget.MAX_CONFLICTS; i++) {
+            probeBudget.tryRecordConflict(callerId);
+        }
 
-        when(userRepository.existsByEmail("registered-target@example.com")).thenReturn(true);
-        when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
-        when(salonRepository.findByIdAndOwnerId(requestedSalonId, callerId)).thenReturn(Optional.empty());
+        var thrown = catchThrowableOfType(
+                () -> inviteService.sendInvite(new InviteRequest(PHONE, salonId, null), callerId),
+                IdentityException.class);
 
-        log.debug("Act: sendInvite where caller does not own salonId={} and target email is registered — must throw ForbiddenException, not 409", requestedSalonId);
-        assertThatThrownBy(() -> inviteService.sendInvite(request, callerId))
-                .as("an unauthorized caller must get 403, never a 409 that would leak registration status")
+        assertThat(thrown.getCode()).isEqualTo(IdentityException.Code.INVITE_SMS_LIMIT);
+        verifyNoInteractions(invitePersistenceService);
+    }
+
+    @Test
+    @DisplayName("create: a deactivated salon → 409 INVITE_SALON_INACTIVE after authorization, nothing persisted or sent")
+    void should_throwSalonInactive_when_invitingIntoDeactivatedSalon() {
+        var inactive = mock(Salon.class);
+        when(inactive.isActive()).thenReturn(false);
+        when(userRepository.findById(callerId)).thenReturn(Optional.of(owner()));
+        when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(inactive));
+
+        var thrown = catchThrowableOfType(
+                () -> inviteService.sendInvite(new InviteRequest(PHONE, salonId, null), callerId),
+                InviteTokenException.class);
+
+        assertThat(thrown.getCode()).isEqualTo(InviteTokenException.Code.INVITE_SALON_INACTIVE);
+        assertThat(thrown.getStatus()).isEqualTo(HttpStatus.CONFLICT);
+        verifyNoInteractions(invitePersistenceService);
+    }
+
+    @Test
+    @DisplayName("create: an unauthorized caller gets 403, never the 409 that would reveal a registered phone (AUTH-18)")
+    void should_throwForbiddenNotConflict_when_callerDoesNotOwnSalonAndPhoneIsRegistered() {
+        when(userRepository.existsByVerifiedPhone(PHONE)).thenReturn(true);
+        when(userRepository.findById(callerId)).thenReturn(Optional.of(owner()));
+        when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> inviteService.sendInvite(new InviteRequest(PHONE, salonId, null), callerId))
                 .isInstanceOf(ForbiddenException.class)
                 .hasMessageContaining("do not own");
-
-        verify(salonRepository).findByIdAndOwnerId(requestedSalonId, callerId);
-        verify(invitePersistenceService, never())
-                .persistInviteAndEnqueue(any(), any(), any(), any(), any(), any(), any());
+        verifyNoInteractions(invitePersistenceService);
     }
 
     @Test
-    @DisplayName("sendInvite throws ForbiddenException when caller does not own the salon")
-    void should_throwForbiddenException_when_callerDoesNotOwnSalon() {
-        var callerId = UUID.randomUUID();
-        var requestedSalonId = UUID.randomUUID();
-        var callerOwnedSalonId = UUID.randomUUID();
-        var request = new InviteRequest("master@example.com", requestedSalonId, null);
-        var caller = buildCallerWithSalon(callerId, callerOwnedSalonId);
-        log.debug("Arrange: caller salonId={} != requested salonId={}", callerOwnedSalonId, requestedSalonId);
+    @DisplayName("create: a live invite to the same phone for this salon is an idempotent 201 — no second token, no SMS")
+    void should_returnIdempotentSuccess_when_activeInviteExists() {
+        stubOwnerOfSalonWithoutName();
+        when(inviteTokenRepository.findByPhoneAndSalonIdAndIsUsedFalseAndRevokedAtIsNull(PHONE, salonId))
+                .thenReturn(Optional.of(phoneInvite(NOW.plusSeconds(3600))));
 
-        when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
-        when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
-        when(salonRepository.findByIdAndOwnerId(requestedSalonId, callerId)).thenReturn(Optional.empty());
+        var response = inviteService.sendInvite(new InviteRequest(PHONE, salonId, null), callerId);
 
-        log.debug("Act: sendInvite where caller salonId={} differs from requested salonId={} — must throw ForbiddenException", callerOwnedSalonId, requestedSalonId);
-        assertThatThrownBy(() -> inviteService.sendInvite(request, callerId))
-                .isInstanceOf(ForbiddenException.class)
-                .hasMessageContaining("do not own");
-
-        verify(salonRepository).findByIdAndOwnerId(requestedSalonId, callerId);
-        verify(invitePersistenceService, never())
-                .persistInviteAndEnqueue(any(), any(), any(), any(), any(), any(), any());
+        assertThat(response.invitedPhone()).isEqualTo(PHONE);
+        verifyNoInteractions(invitePersistenceService);
+        verify(tokenGenerator, never()).generateToken();
     }
 
     @Test
-    @DisplayName("sendInvite throws ForbiddenException when salon does not exist")
-    void should_throwForbiddenException_when_salonNotFound() {
-        var callerId = UUID.randomUUID();
-        var nonExistentSalonId = UUID.randomUUID();
-        var request = new InviteRequest("master@example.com", nonExistentSalonId, null);
-        var caller = buildCallerWithSalon(callerId, UUID.randomUUID());
-        log.debug("Arrange: salon salonId={} does not exist in DB", nonExistentSalonId);
+    @DisplayName("create: an expired invite in the slot does not short-circuit — the delegate recycles it and sends")
+    void should_delegate_when_expiredInviteExists() {
+        stubOwnerOfSalon("S");
+        when(tokenGenerator.generateToken()).thenReturn(RAW_TOKEN);
+        when(inviteTokenRepository.findByPhoneAndSalonIdAndIsUsedFalseAndRevokedAtIsNull(PHONE, salonId))
+                .thenReturn(Optional.of(phoneInvite(NOW)));
 
-        when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
-        when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
-        when(salonRepository.findByIdAndOwnerId(nonExistentSalonId, callerId)).thenReturn(Optional.empty());
+        inviteService.sendInvite(new InviteRequest(PHONE, salonId, null), callerId);
 
-        log.debug("Act: sendInvite for salonId={} that does not exist — must throw ForbiddenException", nonExistentSalonId);
-        assertThatThrownBy(() -> inviteService.sendInvite(request, callerId))
-                .isInstanceOf(ForbiddenException.class)
-                .hasMessageContaining("You do not own the specified salon");
-
-        verify(salonRepository).findByIdAndOwnerId(nonExistentSalonId, callerId);
-        verify(invitePersistenceService, never())
-                .persistInviteAndEnqueue(any(), any(), any(), any(), any(), any(), any());
+        verify(invitePersistenceService).persistInviteAndEnqueue(any());
     }
 
     @Test
-    @DisplayName("sendInvite throws ForbiddenException when salon exists but is owned by another user")
-    void should_throwForbiddenException_when_salonExistsButOwnedByOther() {
-        var callerId = UUID.randomUUID();
-        var salonOwnedByOther = UUID.randomUUID();
-        var request = new InviteRequest("master@example.com", salonOwnedByOther, null);
-        var caller = buildCallerWithSalon(callerId, UUID.randomUUID());
-        log.debug("Arrange: salon salonId={} exists but belongs to a different owner", salonOwnedByOther);
+    @DisplayName("create: a same-phone race lost at the unique guard resolves to the generic 201 (one row, one SMS)")
+    void should_returnGenericSuccess_when_persistenceRacesUniqueGuard() {
+        stubOwnerOfSalon("S");
+        when(tokenGenerator.generateToken()).thenReturn(RAW_TOKEN);
+        doThrow(new DataIntegrityViolationException("ux_invite_tokens_active_phone"))
+                .when(invitePersistenceService).persistInviteAndEnqueue(any());
 
-        when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
-        when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
-        // Salon exists but the combined id+ownerId query returns empty — same result as non-existent.
-        when(salonRepository.findByIdAndOwnerId(salonOwnedByOther, callerId)).thenReturn(Optional.empty());
+        var response = inviteService.sendInvite(new InviteRequest(PHONE, salonId, null), callerId);
 
-        log.debug("Act: sendInvite for salonId={} owned by another user — must throw ForbiddenException", salonOwnedByOther);
-        assertThatThrownBy(() -> inviteService.sendInvite(request, callerId))
-                .isInstanceOf(ForbiddenException.class)
-                .hasMessageContaining("You do not own the specified salon");
-
-        verify(salonRepository).findByIdAndOwnerId(salonOwnedByOther, callerId);
-        verify(invitePersistenceService, never())
-                .persistInviteAndEnqueue(any(), any(), any(), any(), any(), any(), any());
+        assertThat(response.invitedPhone()).isEqualTo(PHONE);
     }
 
     @Test
-    @DisplayName("sendInvite is idempotent (no delegate call) when an active unexpired invite already exists")
-    void should_returnGenericSuccessNoNewToken_when_activeInviteExists() {
-        // A pre-existing active (unused, unexpired) invite is an idempotent success. UNCHANGED by
-        // phase 287 (this branch's 201 was always a correctness property, not an anti-enumeration
-        // control — see InviteService#sendInvite's duplicate-invite branch comment). Returns the
-        // same generic InviteResponse WITHOUT delegating to persistInviteAndEnqueue — so no second
-        // token, no second e-mail, and the still-valid existing token is left untouched.
-        var salonId = UUID.randomUUID();
-        var callerId = UUID.randomUUID();
-        var request = new InviteRequest("pending@example.com", salonId, null);
-        var caller = buildCallerWithSalon(callerId, salonId);
-        var existing = buildInviteToken("pending@example.com", Instant.now().plusSeconds(3600));
-        log.debug("Arrange: active unexpired invite already exists for email={}", request.email());
+    @DisplayName("create: the SMS cap (429 INVITE_SMS_LIMIT) from the delegate reaches the caller")
+    void should_propagateSmsLimit_when_delegateRefusesOverCap() {
+        stubOwnerOfSalon("S");
+        when(tokenGenerator.generateToken()).thenReturn(RAW_TOKEN);
+        doThrow(new IdentityException(IdentityException.Code.INVITE_SMS_LIMIT))
+                .when(invitePersistenceService).persistInviteAndEnqueue(any());
 
-        when(userRepository.existsByEmail("pending@example.com")).thenReturn(false);
-        when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
-        when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(mock(Salon.class)));
-        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull("pending@example.com", salonId))
-                .thenReturn(Optional.of(existing));
+        var thrown = catchThrowableOfType(
+                () -> inviteService.sendInvite(new InviteRequest(PHONE, salonId, null), callerId),
+                IdentityException.class);
 
-        log.debug("Act: sendInvite for email={} with an active invite — must be idempotent success", request.email());
-        var response = inviteService.sendInvite(request, callerId);
-
-        assertThat(response.invitedEmail())
-                .as("idempotent active-invite path must echo the same generic invited email")
-                .isEqualTo("pending@example.com");
-        assertThat(response.expiresAt()).isAfter(Instant.now());
-
-        // Active invite short-circuits before any persistence: the delegate is never called.
-        verify(invitePersistenceService, never())
-                .persistInviteAndEnqueue(any(), any(), any(), any(), any(), any(), any());
+        assertThat(thrown.getStatus()).isEqualTo(HttpStatus.TOO_MANY_REQUESTS);
     }
 
     @Test
-    @DisplayName("sendInvite delegates to persistInviteAndEnqueue (recycle handled internally) when an expired invite occupies the slot")
-    void should_callPersistInviteAndEnqueue_when_expiredInviteExists() {
-        var salonId = UUID.randomUUID();
-        var callerId = UUID.randomUUID();
-        var request = new InviteRequest("expired@example.com", salonId, null);
-        var caller = buildCallerWithSalon(callerId, salonId);
-        var expired = buildInviteToken("expired@example.com", Instant.now().minusSeconds(1));
-        log.debug("Arrange: expired invite exists for email={}", request.email());
+    @DisplayName("create: an http:// (non-localhost) frontend base URL never builds a link — fail closed")
+    void should_throwIllegalState_when_frontendBaseUrlIsPlainHttp() {
+        var httpService = service("http://example.com");
+        stubOwnerOfSalonWithoutName();
+        when(tokenGenerator.generateToken()).thenReturn(RAW_TOKEN);
 
-        var salonStub = mock(Salon.class);
-        when(salonStub.getName()).thenReturn("Test Salon");
-
-        when(tokenGenerator.generateToken()).thenReturn("new-raw-token");
-        when(userRepository.existsByEmail("expired@example.com")).thenReturn(false);
-        when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
-        when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(salonStub));
-        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull("expired@example.com", salonId))
-                .thenReturn(Optional.of(expired));
-
-        log.debug("Act: sendInvite for email={} — expired invite exists; recycle + insert delegated to persistence service", request.email());
-        var response = inviteService.sendInvite(request, callerId);
-
-        // Expired prior token does NOT short-circuit; the recycle (delete-before-insert) now happens
-        // INSIDE InvitePersistenceService, so here we only assert the delegate was invoked.
-        verify(invitePersistenceService).persistInviteAndEnqueue(
-                any(), any(), any(), any(), any(), any(), any());
-        assertThat(response.invitedEmail()).isEqualTo("expired@example.com");
+        assertThatThrownBy(() -> httpService.sendInvite(new InviteRequest(PHONE, salonId, null), callerId))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("must use HTTPS scheme");
+        verifyNoInteractions(invitePersistenceService);
     }
 
     @Test
-    @DisplayName("acceptInvite creates SALON_MASTER user and returns auth response")
-    void should_createSalonMasterAndReturnAuthResponse_when_acceptInviteSucceeds() {
-        var rawToken = "raw-accept-token";
-        var hashedToken = "hashed-accept-token";
-        var salonId = UUID.randomUUID();
+    @DisplayName("validateConfig: plain http fails boot, https and http://localhost pass")
+    void should_validateFrontendBaseUrlScheme_when_contextStarts() {
+        assertThatThrownBy(() -> service("http://example.com").validateConfig())
+                .isInstanceOf(IllegalStateException.class);
+        service("https://beautica.app").validateConfig();
+        service("http://localhost:3000").validateConfig();
+    }
+
+    // ── validate (preview) ───────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("validate: returns the MASKED phone, role, salon name and expiry — never the full number (D3)")
+    void should_returnMaskedPhoneAndSalonName_when_previewingPhoneInvite() {
+        var invite = phoneInvite(NOW.plusSeconds(3600));
+        var salon = mock(Salon.class);
+        when(salon.getName()).thenReturn("Студія Аврора");
+        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(HASHED_TOKEN);
+        when(inviteTokenRepository.findByToken(HASHED_TOKEN)).thenReturn(Optional.of(invite));
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+
+        InvitePreviewResponse preview = inviteService.previewInvite(RAW_TOKEN);
+
+        assertThat(preview.phoneMasked()).isEqualTo("+380 •• ••• •• 67").doesNotContain("501234");
+        assertThat(preview.role()).isEqualTo(Role.SALON_MASTER);
+        assertThat(preview.salonName()).isEqualTo("Студія Аврора");
+        assertThat(preview.expiresAt()).isEqualTo(invite.getExpiresAt());
+    }
+
+    @Test
+    @DisplayName("validate: a pre-deploy EMAIL invite is refused exactly like an unknown token (400 INVITE_NOT_FOUND)")
+    void should_refuseLegacyEmailInvite_when_previewing() {
+        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(HASHED_TOKEN);
+        when(inviteTokenRepository.findByToken(HASHED_TOKEN)).thenReturn(Optional.of(emailInvite()));
+
+        var thrown = catchThrowableOfType(() -> inviteService.previewInvite(RAW_TOKEN), InviteTokenException.class);
+
+        assertThat(thrown.getCode()).isEqualTo(InviteTokenException.Code.INVITE_NOT_FOUND);
+        assertThat(thrown.getStatus()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(thrown).hasMessage("Invalid or expired invite token");
+    }
+
+    @Test
+    @DisplayName("validate: unknown token → 400 INVITE_NOT_FOUND")
+    void should_throwNotFound_when_previewTokenUnknown() {
+        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(HASHED_TOKEN);
+        when(inviteTokenRepository.findByToken(HASHED_TOKEN)).thenReturn(Optional.empty());
+
+        var thrown = catchThrowableOfType(() -> inviteService.previewInvite(RAW_TOKEN), InviteTokenException.class);
+
+        assertThat(thrown.getCode()).isEqualTo(InviteTokenException.Code.INVITE_NOT_FOUND);
+    }
+
+    @Test
+    @DisplayName("validate: revoked wins over used (a cancelled token sets both), then used, then expired")
+    void should_reportTypedFailure_when_previewTokenIsDead() {
+        when(tokenGenerator.hash(anyString())).thenAnswer(inv -> inv.getArgument(0));
+        var cancelled = phoneInvite(NOW.plusSeconds(3600));
+        cancelled.markCancelled(NOW);
+        var used = phoneInvite(NOW.plusSeconds(3600));
+        used.markUsed();
+        var expired = phoneInvite(NOW);
+        when(inviteTokenRepository.findByToken("c")).thenReturn(Optional.of(cancelled));
+        when(inviteTokenRepository.findByToken("u")).thenReturn(Optional.of(used));
+        when(inviteTokenRepository.findByToken("e")).thenReturn(Optional.of(expired));
+
+        assertThat(codeOfPreview("c")).isEqualTo(InviteTokenException.Code.INVITE_REVOKED);
+        assertThat(codeOfPreview("u")).isEqualTo(InviteTokenException.Code.INVITE_USED);
+        assertThat(codeOfPreview("e")).isEqualTo(InviteTokenException.Code.INVITE_EXPIRED);
+    }
+
+    // ── accept ───────────────────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("accept: a ticket for the INVITED phone creates the account with that phone verified and no email")
+    void should_createAccountWithVerifiedPhoneAndNoEmail_when_ticketPhoneMatchesInvite() {
+        var invite = stubLiveAcceptableInvite(Role.SALON_MASTER);
+        when(registrationTicketService.consume(TICKET)).thenReturn(PHONE);
         var userId = UUID.randomUUID();
-        var invite = buildInviteToken("new@example.com", Instant.now().plusSeconds(3600));
-        ReflectionTestUtils.setField(invite, "salonId", salonId);
-        var request = new InviteAcceptRequest(rawToken, "Str0ngP@ss1!", "Jane", "Doe", null);
-        log.debug("Arrange: valid unused token for email=new@example.com salonId={}", salonId);
-
-        var stubResponse = AuthResponse.of("access-tok", "refresh-tok",
-                userId, "new@example.com", Role.SALON_MASTER, salonId);
-        when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
-        when(inviteTokenRepository.findByTokenForUpdate(hashedToken)).thenReturn(Optional.of(invite));
-        when(userRepository.existsByEmail("new@example.com")).thenReturn(false);
-        // Phase 286: acceptInvite now loads the salon to verify it is still active before
-        // provisioning — stub an active salon so this happy-path test still exercises success.
-        var acceptSalonStub = mock(Salon.class);
-        when(acceptSalonStub.isActive()).thenReturn(true);
-        when(salonRepository.findById(salonId)).thenReturn(Optional.of(acceptSalonStub));
-        when(userRepository.save(any(User.class))).thenAnswer(inv -> {
-            var u = (User) inv.getArgument(0);
+        when(userRepository.saveAndFlush(any(User.class))).thenAnswer(inv -> {
+            User u = inv.getArgument(0);
             ReflectionTestUtils.setField(u, "id", userId);
             return u;
         });
-        when(inviteTokenRepository.save(any(InviteToken.class))).thenAnswer(inv -> inv.getArgument(0));
-        when(authResponseBuilder.buildAuthResponse(any(User.class))).thenReturn(stubResponse);
+        var auth = AuthResponse.of("a", "r", userId, null, Role.SALON_MASTER, salonId);
+        when(authResponseBuilder.buildAuthResponse(any(User.class))).thenReturn(auth);
 
-        log.debug("Act: acceptInvite with valid SALON_MASTER token for email=new@example.com salonId={}", salonId);
-        var response = inviteService.acceptInvite(request);
+        var response = inviteService.acceptInvite(acceptRequest(TICKET));
 
-        assertThat(response.role())
-                .as("response role must be SALON_MASTER for a master invite token")
-                .isEqualTo(Role.SALON_MASTER);
-        assertThat(response.email()).isEqualTo("new@example.com");
-        assertThat(response.accessToken()).isNotBlank();
-        assertThat(response.refreshToken()).isNotBlank();
-        assertThat(response.salonId()).isEqualTo(salonId);
+        var userCaptor = ArgumentCaptor.forClass(User.class);
+        verify(userRepository).saveAndFlush(userCaptor.capture());
+        User created = userCaptor.getValue();
+        assertThat(created.getEmail()).isNull();
+        assertThat(created.getPhoneNumber()).isEqualTo(PHONE);
+        assertThat(created.getPhoneVerifiedAt()).isEqualTo(NOW);
+        assertThat(created.isEmailVerified()).isFalse();
+        assertThat(created.getRole()).isEqualTo(Role.SALON_MASTER);
+        assertThat(created.getSalonId()).isEqualTo(salonId);
         assertThat(invite.isUsed()).isTrue();
-
-        ArgumentCaptor<User> userCaptor = ArgumentCaptor.forClass(User.class);
-        verify(userRepository).save(userCaptor.capture());
-        assertThat(userCaptor.getValue().getRole()).isEqualTo(Role.SALON_MASTER);
-        assertThat(userCaptor.getValue().getSalonId()).isEqualTo(salonId);
+        verify(masterService).createMasterFromInvite(userId, salonId);
+        verify(inAppNotificationService).notifyInviteAccepted(salonId, userId);
+        assertThat(response).isSameAs(auth);
     }
 
     @Test
-    @DisplayName("acceptInvite answers 409 PHONE_ALREADY_REGISTERED when a concurrent claim takes the ticket's phone "
-            + "between the pre-check and the flush (ux_users_verified_phone)")
-    void should_throwPhoneAlreadyRegistered_when_verifiedPhoneIndexViolatedOnAcceptFlush() {
-        var rawToken = "raw-race-token";
-        var hashedToken = "hashed-race-token";
-        var salonId = UUID.randomUUID();
-        var phone = "+380501234567";
-        var invite = buildInviteToken("race@example.com", Instant.now().plusSeconds(3600));
-        ReflectionTestUtils.setField(invite, "salonId", salonId);
-        var request = new InviteAcceptRequest(rawToken, "Str0ngP@ss1!", "Jane", "Doe", null, null, null, null,
-                "ticket");
-        when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
-        when(inviteTokenRepository.findByTokenForUpdate(hashedToken)).thenReturn(Optional.of(invite));
-        when(userRepository.existsByEmail("race@example.com")).thenReturn(false);
+    @DisplayName("accept: a ticket for ANOTHER phone → 400 INVITE_PHONE_MISMATCH, no account, invite not burned "
+            + "(mutation guard: dropping the equality check turns this red)")
+    void should_refuseWithMismatch_when_ticketPhoneDiffersFromInvite() {
+        var invite = stubLiveAcceptableInvite(Role.SALON_MASTER);
+        when(registrationTicketService.consume(TICKET)).thenReturn(OTHER_PHONE);
+
+        var thrown = catchThrowableOfType(() -> inviteService.acceptInvite(acceptRequest(TICKET)),
+                IdentityException.class);
+
+        assertThat(thrown.getCode()).isEqualTo(IdentityException.Code.INVITE_PHONE_MISMATCH);
+        assertThat(thrown.getStatus()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(invite.isUsed()).isFalse();
+        verify(userRepository, never()).saveAndFlush(any());
+        verify(userRepository, never()).save(any());
+        verifyNoInteractions(masterService);
+    }
+
+    @Test
+    @DisplayName("accept: no registration ticket → 400 REGISTRATION_TICKET_INVALID whatever the B514 flag, no account")
+    void should_refuse_when_ticketMissing() {
+        var invite = stubLiveAcceptableInvite(Role.SALON_MASTER);
+
+        var thrown = catchThrowableOfType(() -> inviteService.acceptInvite(acceptRequest(null)),
+                IdentityException.class);
+
+        assertThat(thrown.getCode()).isEqualTo(IdentityException.Code.REGISTRATION_TICKET_INVALID);
+        assertThat(invite.isUsed()).isFalse();
+        verifyNoInteractions(registrationTicketService);
+        verify(userRepository, never()).saveAndFlush(any());
+    }
+
+    @Test
+    @DisplayName("accept: the invited phone already verified on an account → 409 PHONE_ALREADY_REGISTERED, no account")
+    void should_throwConflict_when_invitedPhoneAlreadyClaimed() {
+        var invite = stubLiveAcceptableInvite(Role.SALON_MASTER);
+        when(registrationTicketService.consume(TICKET)).thenReturn(PHONE);
+        when(userRepository.existsByVerifiedPhone(PHONE)).thenReturn(true);
+
+        var thrown = catchThrowableOfType(() -> inviteService.acceptInvite(acceptRequest(TICKET)),
+                IdentityException.class);
+
+        assertThat(thrown.getCode()).isEqualTo(IdentityException.Code.PHONE_ALREADY_REGISTERED);
+        assertThat(invite.isUsed()).isFalse();
+        verify(userRepository, never()).saveAndFlush(any());
+    }
+
+    @Test
+    @DisplayName("accept: a concurrent claim of the phone between pre-check and flush → 409, no master row")
+    void should_throwConflict_when_verifiedPhoneIndexViolatedOnFlush() {
+        stubLiveAcceptableInvite(Role.SALON_MASTER);
+        when(registrationTicketService.consume(TICKET)).thenReturn(PHONE);
+        when(userRepository.saveAndFlush(any(User.class))).thenThrow(new DataIntegrityViolationException("dup",
+                new RuntimeException("duplicate key value violates unique constraint \"ux_users_verified_phone\"")));
+
+        var thrown = catchThrowableOfType(() -> inviteService.acceptInvite(acceptRequest(TICKET)),
+                IdentityException.class);
+
+        assertThat(thrown.getCode()).isEqualTo(IdentityException.Code.PHONE_ALREADY_REGISTERED);
+        verifyNoInteractions(masterService);
+    }
+
+    @Test
+    @DisplayName("accept: a pre-deploy EMAIL invite token is refused like an unknown token (404), no ticket consumed")
+    void should_refuseLegacyEmailInvite_when_accepting() {
+        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(HASHED_TOKEN);
+        when(inviteTokenRepository.findByTokenForUpdate(HASHED_TOKEN)).thenReturn(Optional.of(emailInvite()));
+
+        var thrown = catchThrowableOfType(() -> inviteService.acceptInvite(acceptRequest(TICKET)),
+                InviteTokenException.class);
+
+        assertThat(thrown.getCode()).isEqualTo(InviteTokenException.Code.INVITE_NOT_FOUND);
+        assertThat(thrown.getStatus()).isEqualTo(HttpStatus.NOT_FOUND);
+        verifyNoInteractions(registrationTicketService);
+        verify(userRepository, never()).saveAndFlush(any());
+    }
+
+    @Test
+    @DisplayName("accept: unknown token keeps its 404 INVITE_NOT_FOUND (phase 285 backward-compat)")
+    void should_throw404_when_acceptTokenUnknown() {
+        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(HASHED_TOKEN);
+        when(inviteTokenRepository.findByTokenForUpdate(HASHED_TOKEN)).thenReturn(Optional.empty());
+
+        var thrown = catchThrowableOfType(() -> inviteService.acceptInvite(acceptRequest(TICKET)),
+                InviteTokenException.class);
+
+        assertThat(thrown.getStatus()).isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(thrown.getCode()).isEqualTo(InviteTokenException.Code.INVITE_NOT_FOUND);
+    }
+
+    @Test
+    @DisplayName("accept: an expired phone invite → INVITE_EXPIRED, no ticket consumed")
+    void should_throwExpired_when_acceptingExpiredPhoneInvite() {
+        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(HASHED_TOKEN);
+        when(inviteTokenRepository.findByTokenForUpdate(HASHED_TOKEN)).thenReturn(Optional.of(phoneInvite(NOW)));
+
+        var thrown = catchThrowableOfType(() -> inviteService.acceptInvite(acceptRequest(TICKET)),
+                InviteTokenException.class);
+
+        assertThat(thrown.getCode()).isEqualTo(InviteTokenException.Code.INVITE_EXPIRED);
+        verifyNoInteractions(registrationTicketService);
+    }
+
+    @Test
+    @DisplayName("accept: a cancelled token reports INVITE_REVOKED (revoked checked before used)")
+    void should_throwRevoked_when_acceptingCancelledInvite() {
+        var invite = phoneInvite(NOW.plusSeconds(3600));
+        invite.markCancelled(NOW);
+        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(HASHED_TOKEN);
+        when(inviteTokenRepository.findByTokenForUpdate(HASHED_TOKEN)).thenReturn(Optional.of(invite));
+
+        var thrown = catchThrowableOfType(() -> inviteService.acceptInvite(acceptRequest(TICKET)),
+                InviteTokenException.class);
+
+        assertThat(thrown.getCode()).isEqualTo(InviteTokenException.Code.INVITE_REVOKED);
+    }
+
+    @Test
+    @DisplayName("accept: an inactive salon → 409 INVITE_SALON_INACTIVE before the ticket is consumed")
+    void should_throwSalonInactive_when_salonDeactivated() {
+        var invite = phoneInvite(NOW.plusSeconds(3600));
+        var salon = mock(Salon.class);
+        when(salon.isActive()).thenReturn(false);
+        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(HASHED_TOKEN);
+        when(inviteTokenRepository.findByTokenForUpdate(HASHED_TOKEN)).thenReturn(Optional.of(invite));
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+
+        var thrown = catchThrowableOfType(() -> inviteService.acceptInvite(acceptRequest(TICKET)),
+                InviteTokenException.class);
+
+        assertThat(thrown.getCode()).isEqualTo(InviteTokenException.Code.INVITE_SALON_INACTIVE);
+        assertThat(invite.isUsed()).isFalse();
+        verifyNoInteractions(registrationTicketService);
+    }
+
+    @Test
+    @DisplayName("accept: a salon-bound token whose salonId went null fails closed (409) without a findById(null)")
+    void should_failClosed_when_salonIdIsNull() {
+        var invite = phoneInvite(NOW.plusSeconds(3600));
+        ReflectionTestUtils.setField(invite, "salonId", null);
+        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(HASHED_TOKEN);
+        when(inviteTokenRepository.findByTokenForUpdate(HASHED_TOKEN)).thenReturn(Optional.of(invite));
+
+        var thrown = catchThrowableOfType(() -> inviteService.acceptInvite(acceptRequest(TICKET)),
+                InviteTokenException.class);
+
+        assertThat(thrown.getCode()).isEqualTo(InviteTokenException.Code.INVITE_SALON_INACTIVE);
+        verify(salonRepository, never()).findById(any());
+    }
+
+    @Test
+    @DisplayName("accept DTO: @StrongPassword still rejects a weak password")
+    void should_rejectWeakPassword_when_acceptRequestValidated() {
+        var request = new InviteAcceptRequest("t", "aaaaaaaaaaaa", "First", "Last", null, null, null, null, TICKET);
+
+        var violations = jakarta.validation.Validation.buildDefaultValidatorFactory().getValidator().validate(request);
+
+        assertThat(violations).anyMatch(v -> v.getPropertyPath().toString().equals("password"));
+    }
+
+    // ── helpers ──────────────────────────────────────────────────────────────
+
+    private InviteTokenException.Code codeOfPreview(String token) {
+        return catchThrowableOfType(() -> inviteService.previewInvite(token), InviteTokenException.class).getCode();
+    }
+
+    private InviteToken stubLiveAcceptableInvite(Role role) {
+        var invite = InviteToken.forPhone(HASHED_TOKEN, PHONE, salonId, role, NOW.plusSeconds(3600), callerId);
         var salon = mock(Salon.class);
         when(salon.isActive()).thenReturn(true);
+        when(tokenGenerator.hash(RAW_TOKEN)).thenReturn(HASHED_TOKEN);
+        when(inviteTokenRepository.findByTokenForUpdate(HASHED_TOKEN)).thenReturn(Optional.of(invite));
         when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
-        when(registrationTicketService.consume("ticket")).thenReturn(phone);
-        when(userRepository.existsByVerifiedPhone(phone)).thenReturn(false);
-        when(userRepository.saveAndFlush(any(User.class))).thenThrow(
-                new org.springframework.dao.DataIntegrityViolationException("could not execute statement",
-                        new RuntimeException("duplicate key value violates unique constraint "
-                                + "\"ux_users_verified_phone\"")));
-
-        Throwable thrown = org.assertj.core.api.Assertions.catchThrowable(() -> inviteService.acceptInvite(request));
-
-        assertThat(thrown).isInstanceOfSatisfying(com.beautica.common.exception.IdentityException.class,
-                e -> assertThat(e.getCode())
-                        .isEqualTo(com.beautica.common.exception.IdentityException.Code.PHONE_ALREADY_REGISTERED));
-        verify(userRepository, never()).save(any(User.class));
-        verify(masterService, never()).createMasterFromInvite(any(), any());
+        return invite;
     }
 
-    @Test
-    @DisplayName("acceptInvite throws InviteTokenException(404, INVITE_NOT_FOUND) when token does not exist "
-            + "— phase 285 backward-compat: status stays 404, only the type/code are new")
-    void should_throwNotFoundException_when_tokenNotFound() {
-        var rawToken = "nonexistent";
-        var hashedToken = "hashed-nonexistent";
-        var request = new InviteAcceptRequest(rawToken, "Str0ngP@ss1!", null, null, null);
-        log.debug("Arrange: no invite token found");
-
-        when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
-        when(inviteTokenRepository.findByTokenForUpdate(hashedToken)).thenReturn(Optional.empty());
-
-        log.debug("Act: acceptInvite with non-existent token='{}' — must throw InviteTokenException(404)", rawToken);
-        InviteTokenException thrown = catchThrowableOfType(
-                () -> inviteService.acceptInvite(request), InviteTokenException.class);
-        assertThat(thrown).hasMessageContaining("not found");
-        assertThat(thrown.getStatus())
-                .as("phase 285 backward-compat gate: accept's token-not-found status must stay 404")
-                .isEqualTo(HttpStatus.NOT_FOUND);
-        assertThat(thrown.getCode()).isEqualTo(InviteTokenException.Code.INVITE_NOT_FOUND);
+    private static InviteAcceptRequest acceptRequest(String ticket) {
+        return new InviteAcceptRequest(RAW_TOKEN, "Str0ngP@ss1!", "Олена", "Коваль", null, null, null, null, ticket);
     }
 
-    @Test
-    @DisplayName("acceptInvite throws InviteTokenException(INVITE_USED) when token is already used")
-    void should_throwBusinessException_when_tokenAlreadyUsed() {
-        var rawToken = "raw-used-token";
-        var hashedToken = "hashed-used-token";
-        var invite = buildInviteToken("used@example.com", Instant.now().plusSeconds(3600));
-        invite.markUsed();
-        var request = new InviteAcceptRequest(rawToken, "Str0ngP@ss1!", null, null, null);
-        log.debug("Arrange: invite token already marked used (markUsed only — NOT markCancelled, so "
-                + "revokedAt stays null and this must report INVITE_USED, not INVITE_REVOKED)");
-
-        when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
-        when(inviteTokenRepository.findByTokenForUpdate(hashedToken)).thenReturn(Optional.of(invite));
-
-        log.debug("Act: acceptInvite with a token already marked used — must throw InviteTokenException");
-        InviteTokenException thrown = catchThrowableOfType(
-                () -> inviteService.acceptInvite(request), InviteTokenException.class);
-        assertThat(thrown).hasMessageContaining("already been used");
-        assertThat(thrown.getCode()).isEqualTo(InviteTokenException.Code.INVITE_USED);
+    private InviteToken phoneInvite(Instant expiresAt) {
+        return InviteToken.forPhone(HASHED_TOKEN, PHONE, salonId, Role.SALON_MASTER, expiresAt, callerId);
     }
 
-    @Test
-    @DisplayName("acceptInvite throws InviteTokenException(INVITE_REVOKED) when token was cancelled — "
-            + "the mutation-check case: a CANCELLED token sets isUsed AND revokedAt, so the revoked "
-            + "check must run BEFORE the used check to report the more specific code")
-    void should_throwInviteRevoked_when_tokenWasCancelled() {
-        var rawToken = "raw-cancelled-token";
-        var hashedToken = "hashed-cancelled-token";
-        var invite = buildInviteToken("cancelled@example.com", Instant.now().plusSeconds(3600));
-        invite.markCancelled(Instant.now());
-        var request = new InviteAcceptRequest(rawToken, "Str0ngP@ss1!", null, null, null);
-        log.debug("Arrange: invite token cancelled (markCancelled sets isUsed=true AND revokedAt)");
-
-        when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
-        when(inviteTokenRepository.findByTokenForUpdate(hashedToken)).thenReturn(Optional.of(invite));
-
-        log.debug("Act: acceptInvite with a cancelled token — must throw INVITE_REVOKED, not INVITE_USED");
-        InviteTokenException thrown = catchThrowableOfType(
-                () -> inviteService.acceptInvite(request), InviteTokenException.class);
-        assertThat(thrown.getCode()).isEqualTo(InviteTokenException.Code.INVITE_REVOKED);
+    private InviteToken emailInvite() {
+        return new InviteToken(HASHED_TOKEN, "legacy@example.com", salonId, Role.SALON_MASTER, NOW.plusSeconds(3600));
     }
 
-    @Test
-    @DisplayName("acceptInvite throws InviteTokenException(INVITE_EXPIRED) when token is expired")
-    void should_throwBusinessException_when_tokenExpired() {
-        var rawToken = "raw-expired-token";
-        var hashedToken = "hashed-expired-token";
-        var invite = buildInviteToken("expired2@example.com", Instant.now().minusSeconds(1));
-        var request = new InviteAcceptRequest(rawToken, "Str0ngP@ss1!", null, null, null);
-        log.debug("Arrange: invite token is expired");
-
-        when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
-        when(inviteTokenRepository.findByTokenForUpdate(hashedToken)).thenReturn(Optional.of(invite));
-
-        log.debug("Act: acceptInvite with an expired token — must throw InviteTokenException");
-        InviteTokenException thrown = catchThrowableOfType(
-                () -> inviteService.acceptInvite(request), InviteTokenException.class);
-        assertThat(thrown).hasMessageContaining("expired");
-        assertThat(thrown.getCode()).isEqualTo(InviteTokenException.Code.INVITE_EXPIRED);
-    }
-
-    @Test
-    @DisplayName("acceptInvite throws the EXISTING EmailAlreadyRegisteredException (EMAIL_ALREADY_REGISTERED) "
-            + "when email already registered — phase 285 chose to reuse this type rather than mint a "
-            + "second code, see InviteTokenException's class javadoc")
-    void should_throwBusinessException_when_emailAlreadyRegisteredOnAccept() {
-        var rawToken = "raw-collision-token";
-        var hashedToken = "hashed-collision-token";
-        var invite = buildInviteToken("collision@example.com", Instant.now().plusSeconds(3600));
-        var request = new InviteAcceptRequest(rawToken, "Str0ngP@ss1!", null, null, null);
-        log.debug("Arrange: invite token valid but email collision detected");
-
-        when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
-        when(inviteTokenRepository.findByTokenForUpdate(hashedToken)).thenReturn(Optional.of(invite));
-        when(userRepository.existsByEmail("collision@example.com")).thenReturn(true);
-
-        log.debug("Act: acceptInvite where email=collision@example.com is already registered — must throw EmailAlreadyRegisteredException");
-        assertThatThrownBy(() -> inviteService.acceptInvite(request))
-                .isInstanceOf(EmailAlreadyRegisteredException.class)
-                .extracting(e -> ((BusinessException) e).getStatus())
-                .isEqualTo(HttpStatus.CONFLICT);
-    }
-
-    // ── Phase 286: salon-liveness guard, exercised directly at the service unit level ──────────
-    //
-    // The Testcontainers IT (InviteAcceptRejectsInactiveSalonIntegrationTest) proves the HTTP
-    // contract end to end but only reaches the guard through the full Spring context. These three
-    // pin the guard's own three branches (present-but-inactive, absent, null-salonId-fail-closed)
-    // at the unit level, cheaply and independently of wiring, and assert the SAME "no side effect"
-    // invariant the IT does: no user persisted and the token still reports isUsed() == false.
-
-    @Test
-    @DisplayName("acceptInvite throws 409 CONFLICT and burns nothing when the invite's salon is inactive")
-    void should_throwConflictAndLeaveTokenUnused_when_acceptInviteSalonIsInactive() {
-        var rawToken = "raw-inactive-salon-token";
-        var hashedToken = "hashed-inactive-salon-token";
-        var salonId = UUID.randomUUID();
-        var invite = buildInviteToken("inactive-salon@example.com", Instant.now().plusSeconds(3600));
-        ReflectionTestUtils.setField(invite, "salonId", salonId);
-        var request = new InviteAcceptRequest(rawToken, "Str0ngP@ss1!", null, null, null);
-        log.debug("Arrange: valid unused SALON_MASTER token whose salon exists but is inactive");
-
-        var inactiveSalon = mock(Salon.class);
-        when(inactiveSalon.isActive()).thenReturn(false);
-        when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
-        when(inviteTokenRepository.findByTokenForUpdate(hashedToken)).thenReturn(Optional.of(invite));
-        when(userRepository.existsByEmail("inactive-salon@example.com")).thenReturn(false);
-        when(salonRepository.findById(salonId)).thenReturn(Optional.of(inactiveSalon));
-
-        log.debug("Act: acceptInvite against a deactivated salon — must throw 409, not provision anything");
-        InviteTokenException thrown = catchThrowableOfType(
-                () -> inviteService.acceptInvite(request), InviteTokenException.class);
-        assertThat(thrown.getStatus()).isEqualTo(HttpStatus.CONFLICT);
-        assertThat(thrown.getCode())
-                .as("phase 285: phase 286's throw is re-pointed at InviteTokenException.Code.INVITE_SALON_INACTIVE")
-                .isEqualTo(InviteTokenException.Code.INVITE_SALON_INACTIVE);
-
-        assertThat(invite.isUsed())
-                .as("a rejected redemption must not burn the single-use token — guard must run "
-                        + "BEFORE markUsed()")
-                .isFalse();
-        verify(userRepository, never()).save(any(User.class));
-        verify(masterService, never()).createMasterFromInvite(any(), any());
-    }
-
-    @Test
-    @DisplayName("acceptInvite throws 409 CONFLICT when the invite's salonId no longer resolves to any salon row")
-    void should_throwConflictAndLeaveTokenUnused_when_acceptInviteSalonNotFound() {
-        // Distinct from the null-salonId case below: here salonId is non-null (the invite was
-        // legitimately salon-bound at creation) but salonRepository.findById comes back empty.
-        // Not reachable via a real DB today (invite_tokens.salon_id carries a hard FK to
-        // salons(id) with ON DELETE SET NULL, never a dangling reference — V5), but the guard's
-        // `.orElse(null)` branch exists in the code, so it must be pinned to fail exactly like
-        // the present-but-inactive case, not to fall through and provision an account.
-        var rawToken = "raw-missing-salon-token";
-        var hashedToken = "hashed-missing-salon-token";
-        var salonId = UUID.randomUUID();
-        var invite = buildInviteToken("missing-salon@example.com", Instant.now().plusSeconds(3600));
-        ReflectionTestUtils.setField(invite, "salonId", salonId);
-        var request = new InviteAcceptRequest(rawToken, "Str0ngP@ss1!", null, null, null);
-        log.debug("Arrange: valid unused SALON_MASTER token whose salonId resolves to no salon row");
-
-        when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
-        when(inviteTokenRepository.findByTokenForUpdate(hashedToken)).thenReturn(Optional.of(invite));
-        when(userRepository.existsByEmail("missing-salon@example.com")).thenReturn(false);
-        when(salonRepository.findById(salonId)).thenReturn(Optional.empty());
-
-        log.debug("Act: acceptInvite where findById(salonId) is empty — must throw 409, not NPE/500");
-        InviteTokenException thrown = catchThrowableOfType(
-                () -> inviteService.acceptInvite(request), InviteTokenException.class);
-        assertThat(thrown.getStatus()).isEqualTo(HttpStatus.CONFLICT);
-        assertThat(thrown.getCode()).isEqualTo(InviteTokenException.Code.INVITE_SALON_INACTIVE);
-
-        assertThat(invite.isUsed()).isFalse();
-        verify(userRepository, never()).save(any(User.class));
-        verify(masterService, never()).createMasterFromInvite(any(), any());
-    }
-
-    @Test
-    @DisplayName("acceptInvite fails closed with 409 for a SALON_MASTER token whose salonId is null, "
-            + "without ever calling salonRepository")
-    void should_throwConflictAndSkipSalonLookup_when_acceptInviteSalonBoundTokenHasNullSalonId() {
-        // SALON_MASTER is salon-bound (SALON_BOUND_ROLES); a live token for it never legitimately
-        // carries a null salonId (see acceptInvite's SECURITY javadoc — only reachable via
-        // invite_tokens.salon_id's ON DELETE SET NULL FK). The ternary in the guard must treat
-        // null as "no salon" WITHOUT calling salonRepository.findById(null), which Spring Data
-        // would reject with an uncaught IllegalArgumentException (500) instead of a clean 409.
-        var rawToken = "raw-null-salon-token";
-        var hashedToken = "hashed-null-salon-token";
-        var invite = buildInviteToken("null-salon@example.com", Instant.now().plusSeconds(3600));
-        ReflectionTestUtils.setField(invite, "salonId", null);
-        var request = new InviteAcceptRequest(rawToken, "Str0ngP@ss1!", null, null, null);
-        log.debug("Arrange: valid unused SALON_MASTER token with a corrupt null salonId");
-
-        when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
-        when(inviteTokenRepository.findByTokenForUpdate(hashedToken)).thenReturn(Optional.of(invite));
-        when(userRepository.existsByEmail("null-salon@example.com")).thenReturn(false);
-
-        log.debug("Act: acceptInvite with salonId == null for a salon-bound role — must fail closed");
-        InviteTokenException thrown = catchThrowableOfType(
-                () -> inviteService.acceptInvite(request), InviteTokenException.class);
-        assertThat(thrown.getStatus()).isEqualTo(HttpStatus.CONFLICT);
-        assertThat(thrown.getCode()).isEqualTo(InviteTokenException.Code.INVITE_SALON_INACTIVE);
-
-        assertThat(invite.isUsed()).isFalse();
-        verify(salonRepository, never()).findById(any());
-        verify(userRepository, never()).save(any(User.class));
-    }
-
-    @Test
-    @DisplayName("previewInvite returns InvitePreviewResponse for a valid token")
-    void should_return_previewResponse_when_validToken() {
-        var rawToken = "raw-preview-token";
-        var hashedToken = "hashed-preview-token";
-        var expiresAt = Instant.now().plusSeconds(3600);
-        var invite = buildInviteToken("preview@example.com", expiresAt);
-        log.debug("Arrange: valid unused token for email=preview@example.com");
-
-        when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
-        when(inviteTokenRepository.findByToken(hashedToken)).thenReturn(Optional.of(invite));
-
-        log.debug("Act: previewInvite with valid token for email=preview@example.com");
-        InvitePreviewResponse response = inviteService.previewInvite(rawToken);
-
-        assertThat(response.invitedEmail())
-                .as("preview response must return the email stored in the invite token")
-                .isEqualTo("preview@example.com");
-        assertThat(response.role()).isEqualTo(Role.SALON_MASTER);
-        assertThat(response.expiresAt()).isEqualTo(invite.getExpiresAt());
-    }
-
-    @Test
-    @DisplayName("previewInvite throws InviteTokenException(400, INVITE_NOT_FOUND) when token does not "
-            + "exist — phase 285 backward-compat: status stays 400, only the type/code are new")
-    void should_throwNotFound_when_previewTokenNotFound() {
-        var rawToken = "unknown-raw-token";
-        var hashedToken = "hashed-unknown-token";
-        log.debug("Arrange: no matching token in repository");
-
-        when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
-        when(inviteTokenRepository.findByToken(hashedToken)).thenReturn(Optional.empty());
-
-        log.debug("Act: previewInvite with unknown token='{}' — must throw InviteTokenException(400)", rawToken);
-        InviteTokenException thrown = catchThrowableOfType(
-                () -> inviteService.previewInvite(rawToken), InviteTokenException.class);
-        assertThat(thrown).hasMessage("Invalid or expired invite token");
-        assertThat(thrown.getStatus())
-                .as("phase 285 backward-compat gate: preview's token-not-found status must stay 400")
-                .isEqualTo(HttpStatus.BAD_REQUEST);
-        assertThat(thrown.getCode()).isEqualTo(InviteTokenException.Code.INVITE_NOT_FOUND);
-    }
-
-    @Test
-    @DisplayName("previewInvite throws InviteTokenException(INVITE_USED) when token is already used")
-    void should_throw400_when_previewTokenAlreadyUsed() {
-        var rawToken = "raw-used-preview-token";
-        var hashedToken = "hashed-used-preview-token";
-        var invite = buildInviteToken("used@example.com", Instant.now().plusSeconds(3600));
-        invite.markUsed();
-        log.debug("Arrange: invite token already marked used (markUsed only, revokedAt stays null)");
-
-        when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
-        when(inviteTokenRepository.findByToken(hashedToken)).thenReturn(Optional.of(invite));
-
-        log.debug("Act: previewInvite with an already-used token for email=used@example.com — must throw InviteTokenException");
-        InviteTokenException thrown = catchThrowableOfType(
-                () -> inviteService.previewInvite(rawToken), InviteTokenException.class);
-        assertThat(thrown).hasMessageContaining("already been used");
-        assertThat(thrown.getCode()).isEqualTo(InviteTokenException.Code.INVITE_USED);
-    }
-
-    @Test
-    @DisplayName("previewInvite throws InviteTokenException(INVITE_REVOKED) when token was cancelled — "
-            + "mutation-check case: a CANCELLED token sets isUsed AND revokedAt, revoked must win")
-    void should_throwInviteRevoked_when_previewTokenWasCancelled() {
-        var rawToken = "raw-cancelled-preview-token";
-        var hashedToken = "hashed-cancelled-preview-token";
-        var invite = buildInviteToken("cancelled-preview@example.com", Instant.now().plusSeconds(3600));
-        invite.markCancelled(Instant.now());
-        log.debug("Arrange: invite token cancelled (markCancelled sets isUsed=true AND revokedAt)");
-
-        when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
-        when(inviteTokenRepository.findByToken(hashedToken)).thenReturn(Optional.of(invite));
-
-        log.debug("Act: previewInvite with a cancelled token — must throw INVITE_REVOKED, not INVITE_USED");
-        InviteTokenException thrown = catchThrowableOfType(
-                () -> inviteService.previewInvite(rawToken), InviteTokenException.class);
-        assertThat(thrown.getCode()).isEqualTo(InviteTokenException.Code.INVITE_REVOKED);
-    }
-
-    @Test
-    @DisplayName("previewInvite throws InviteTokenException(INVITE_EXPIRED) when token is expired")
-    void should_throw400_when_previewTokenExpired() {
-        var rawToken = "raw-expired-preview-token";
-        var hashedToken = "hashed-expired-preview-token";
-        var invite = buildInviteToken("expired@example.com", Instant.now().minusSeconds(1));
-        log.debug("Arrange: invite token is expired");
-
-        when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
-        when(inviteTokenRepository.findByToken(hashedToken)).thenReturn(Optional.of(invite));
-
-        log.debug("Act: previewInvite with an expired token for email=expired@example.com — must throw InviteTokenException");
-        InviteTokenException thrown = catchThrowableOfType(
-                () -> inviteService.previewInvite(rawToken), InviteTokenException.class);
-        assertThat(thrown).hasMessageContaining("expired");
-        assertThat(thrown.getCode()).isEqualTo(InviteTokenException.Code.INVITE_EXPIRED);
-    }
-
-    // ── Phase 2.8 — SALON_ADMIN invite flow ──────────────────────────────────
-
-    @Test
-    @DisplayName("sendInvite forwards SALON_ADMIN role to the delegate when SALON_OWNER requests admin role")
-    void should_inviteSalonAdmin_when_salonOwnerRequestsAdminRole() {
-        var salonId = UUID.randomUUID();
-        var callerId = UUID.randomUUID();
-        var request = new InviteRequest("admin@example.com", salonId, Role.SALON_ADMIN);
-        var caller = buildCallerWithSalon(callerId, salonId);
-        log.debug("Arrange: SALON_OWNER invites SALON_ADMIN for salonId={}", salonId);
-
-        var salonStub = mock(Salon.class);
-        when(salonStub.getName()).thenReturn("Test Salon");
-
-        when(userRepository.existsByEmail("admin@example.com")).thenReturn(false);
-        when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
-        when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(salonStub));
-        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull("admin@example.com", salonId))
-                .thenReturn(Optional.empty());
-        when(tokenGenerator.generateToken()).thenReturn("raw-admin-token");
-
-        log.debug("Act: sendInvite with SALON_ADMIN role for email={} salonId={}", request.email(), salonId);
-        var response = inviteService.sendInvite(request, callerId);
-
-        assertThat(response.invitedEmail()).isEqualTo("admin@example.com");
-        ArgumentCaptor<Role> roleCaptor = ArgumentCaptor.forClass(Role.class);
-        verify(invitePersistenceService).persistInviteAndEnqueue(
-                any(), any(), roleCaptor.capture(), any(), any(), any(), any());
-        assertThat(roleCaptor.getValue()).isEqualTo(Role.SALON_ADMIN);
-    }
-
-    @Test
-    @DisplayName("sendInvite throws ForbiddenException when non-owner tries to invite SALON_ADMIN")
-    void should_throwForbiddenException_when_nonOwnerInvitesSalonAdmin() {
-        var salonId = UUID.randomUUID();
-        var callerId = UUID.randomUUID();
-        var request = new InviteRequest("admin@example.com", salonId, Role.SALON_ADMIN);
-        var masterCaller = new User("master@beautica.test", "hash", Role.SALON_MASTER, null, null, null, salonId);
-        ReflectionTestUtils.setField(masterCaller, "id", callerId);
-        log.debug("Arrange: SALON_MASTER caller tries to invite SALON_ADMIN for salonId={}", salonId);
-
-        when(userRepository.existsByEmail("admin@example.com")).thenReturn(false);
-        when(userRepository.findById(callerId)).thenReturn(Optional.of(masterCaller));
-
-        log.debug("Act: sendInvite with SALON_ADMIN role by non-owner callerId={} — must throw ForbiddenException", callerId);
-        assertThatThrownBy(() -> inviteService.sendInvite(request, callerId))
-                .isInstanceOf(ForbiddenException.class)
-                .hasMessageContaining("SALON_OWNER");
-
-        verify(invitePersistenceService, never())
-                .persistInviteAndEnqueue(any(), any(), any(), any(), any(), any(), any());
-    }
-
-    @Test
-    @DisplayName("Phase 21.1: sendInvite succeeds when the salon already has a SALON_ADMIN (uniqueness relaxed)")
-    void should_sendAdminInvite_when_salonAlreadyHasAdmin() {
-        var salonId = UUID.randomUUID();
-        var callerId = UUID.randomUUID();
-        var request = new InviteRequest("admin2@example.com", salonId, Role.SALON_ADMIN);
-        var caller = buildCallerWithSalon(callerId, salonId);
-        var salonStub = mock(Salon.class);
-        when(salonStub.getName()).thenReturn("Test Salon");
-        log.debug("Arrange: salon already has a SALON_ADMIN, salonId={}", salonId);
-
-        when(userRepository.existsByEmail("admin2@example.com")).thenReturn(false);
-        when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
-        when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(salonStub));
-        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull("admin2@example.com", salonId))
-                .thenReturn(Optional.empty());
-        when(tokenGenerator.generateToken()).thenReturn("raw-second-admin-token");
-
-        log.debug("Act: sendInvite with SALON_ADMIN role for salonId={} that already has an admin — must now succeed", salonId);
-        var response = inviteService.sendInvite(request, callerId);
-
-        assertThat(response.invitedEmail()).isEqualTo("admin2@example.com");
-        ArgumentCaptor<Role> roleCaptor = ArgumentCaptor.forClass(Role.class);
-        verify(invitePersistenceService).persistInviteAndEnqueue(
-                any(), any(), roleCaptor.capture(), any(), any(), any(), any());
-        assertThat(roleCaptor.getValue()).isEqualTo(Role.SALON_ADMIN);
-    }
-
-    @Test
-    @DisplayName("acceptInvite creates user with SALON_ADMIN role and does not create a Master record")
-    void should_createUserWithTokenRole_when_acceptInviteWithSalonAdminToken() {
-        var rawToken = "raw-admin-accept-token";
-        var hashedToken = "hashed-admin-accept-token";
-        var salonId = UUID.randomUUID();
-        var userId = UUID.randomUUID();
-        var invite = new InviteToken(hashedToken, "admin@example.com", salonId, Role.SALON_ADMIN,
-                Instant.now().plusSeconds(3600));
-        var request = new InviteAcceptRequest(rawToken, "Password1!", "Admin", "User", null);
-        log.debug("Arrange: SALON_ADMIN invite token for email=admin@example.com salonId={}", salonId);
-
-        var stubResponse = AuthResponse.of("access-tok", "refresh-tok",
-                userId, "admin@example.com", Role.SALON_ADMIN, salonId);
-        when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
-        when(inviteTokenRepository.findByTokenForUpdate(hashedToken)).thenReturn(Optional.of(invite));
-        when(userRepository.existsByEmail("admin@example.com")).thenReturn(false);
-        // Phase 286: acceptInvite now loads the salon to verify it is still active before
-        // provisioning — stub an active salon so this happy-path test still exercises success.
-        var acceptSalonStub = mock(Salon.class);
-        when(acceptSalonStub.isActive()).thenReturn(true);
-        when(salonRepository.findById(salonId)).thenReturn(Optional.of(acceptSalonStub));
-        when(userRepository.save(any(User.class))).thenAnswer(inv -> {
-            var u = (User) inv.getArgument(0);
-            ReflectionTestUtils.setField(u, "id", userId);
-            return u;
-        });
-        when(inviteTokenRepository.save(any(InviteToken.class))).thenAnswer(inv -> inv.getArgument(0));
-        when(authResponseBuilder.buildAuthResponse(any(User.class))).thenReturn(stubResponse);
-
-        log.debug("Act: acceptInvite with SALON_ADMIN token for email=admin@example.com salonId={}", salonId);
-        inviteService.acceptInvite(request);
-
-        ArgumentCaptor<User> userCaptor = ArgumentCaptor.forClass(User.class);
-        verify(userRepository).save(userCaptor.capture());
-        assertThat(userCaptor.getValue().getRole()).isEqualTo(Role.SALON_ADMIN);
-        verify(masterService, never()).createMasterFromInvite(any(), any());
-    }
-
-    @Test
-    @DisplayName("acceptInvite creates Master record when token role is SALON_MASTER")
-    void should_createMasterRecord_when_acceptInviteWithSalonMasterToken() {
-        var rawToken = "raw-master-accept-token";
-        var hashedToken = "hashed-master-accept-token";
-        var salonId = UUID.randomUUID();
-        var userId = UUID.randomUUID();
-        var invite = buildInviteToken("newmaster@example.com", Instant.now().plusSeconds(3600));
-        ReflectionTestUtils.setField(invite, "salonId", salonId);
-        var request = new InviteAcceptRequest(rawToken, "Password1!", "New", "Master", null);
-        log.debug("Arrange: SALON_MASTER invite token for email=newmaster@example.com salonId={}", salonId);
-
-        var stubResponse = AuthResponse.of("access-tok", "refresh-tok",
-                userId, "newmaster@example.com", Role.SALON_MASTER, salonId);
-        when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
-        when(inviteTokenRepository.findByTokenForUpdate(hashedToken)).thenReturn(Optional.of(invite));
-        when(userRepository.existsByEmail("newmaster@example.com")).thenReturn(false);
-        // Phase 286: acceptInvite now loads the salon to verify it is still active before
-        // provisioning — stub an active salon so this happy-path test still exercises success.
-        var acceptSalonStub = mock(Salon.class);
-        when(acceptSalonStub.isActive()).thenReturn(true);
-        when(salonRepository.findById(salonId)).thenReturn(Optional.of(acceptSalonStub));
-        when(userRepository.save(any(User.class))).thenAnswer(inv -> {
-            var u = (User) inv.getArgument(0);
-            ReflectionTestUtils.setField(u, "id", userId);
-            return u;
-        });
-        when(inviteTokenRepository.save(any(InviteToken.class))).thenAnswer(inv -> inv.getArgument(0));
-        when(authResponseBuilder.buildAuthResponse(any(User.class))).thenReturn(stubResponse);
-
-        log.debug("Act: acceptInvite with SALON_MASTER token for email=newmaster@example.com salonId={}", salonId);
-        inviteService.acceptInvite(request);
-
-        ArgumentCaptor<User> userCaptor = ArgumentCaptor.forClass(User.class);
-        verify(userRepository).save(userCaptor.capture());
-        assertThat(userCaptor.getValue().getRole()).isEqualTo(Role.SALON_MASTER);
-        verify(masterService).createMasterFromInvite(eq(userId), eq(salonId));
-    }
-
-    @Test
-    @DisplayName("sendInvite throws ForbiddenException when owner tries to invite CLIENT role")
-    void should_throwForbiddenException_when_ownerInvitesClientRole() {
-        var salonId = UUID.randomUUID();
-        var callerId = UUID.randomUUID();
-        var request = new InviteRequest("client@example.com", salonId, Role.CLIENT);
-        var caller = buildCallerWithSalon(callerId, salonId);
-        log.debug("Arrange: SALON_OWNER tries to invite CLIENT role for salonId={}", salonId);
-
-        when(userRepository.existsByEmail("client@example.com")).thenReturn(false);
-        when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
-
-        log.debug("Act: sendInvite with CLIENT role for email={} — must throw ForbiddenException", request.email());
-        assertThatThrownBy(() -> inviteService.sendInvite(request, callerId))
-                .isInstanceOf(ForbiddenException.class)
-                .hasMessageContaining("cannot be assigned via invite");
-
-        verify(invitePersistenceService, never())
-                .persistInviteAndEnqueue(any(), any(), any(), any(), any(), any(), any());
-    }
-
-    @Test
-    @DisplayName("sendInvite throws ForbiddenException when owner tries to invite INDEPENDENT_MASTER role")
-    void should_throwForbiddenException_when_ownerInvitesIndependentMasterRole() {
-        var salonId = UUID.randomUUID();
-        var callerId = UUID.randomUUID();
-        var request = new InviteRequest("indie@example.com", salonId, Role.INDEPENDENT_MASTER);
-        var caller = buildCallerWithSalon(callerId, salonId);
-        log.debug("Arrange: SALON_OWNER tries to invite INDEPENDENT_MASTER role for salonId={}", salonId);
-
-        when(userRepository.existsByEmail("indie@example.com")).thenReturn(false);
-        when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
-
-        log.debug("Act: sendInvite with INDEPENDENT_MASTER role for email={} — must throw ForbiddenException", request.email());
-        assertThatThrownBy(() -> inviteService.sendInvite(request, callerId))
-                .isInstanceOf(ForbiddenException.class)
-                .hasMessageContaining("cannot be assigned via invite");
-
-        verify(invitePersistenceService, never())
-                .persistInviteAndEnqueue(any(), any(), any(), any(), any(), any(), any());
-    }
-
-    @Test
-    @DisplayName("sendInvite passes salon name to the persistence delegate when salon is found")
-    void should_passSalonNameToOutbox_when_salonFoundDuringSendInvite() {
-        var salonId = UUID.randomUUID();
-        var callerId = UUID.randomUUID();
-        var request = new InviteRequest("master@example.com", salonId, null);
-        var caller = buildCallerWithSalon(callerId, salonId);
-        log.debug("Arrange: salon 'Glamour Studio' found for salonId={}", salonId);
-
-        var salon = mock(Salon.class);
-        when(salon.getName()).thenReturn("Glamour Studio");
-
-        when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
-        when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
+    private void stubOwnerOfSalon(String salonName) {
+        var salon = activeSalon();
+        when(salon.getName()).thenReturn(salonName);
+        when(userRepository.findById(callerId)).thenReturn(Optional.of(owner()));
         when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(salon));
-        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull("master@example.com", salonId))
-                .thenReturn(Optional.empty());
-        when(tokenGenerator.generateToken()).thenReturn("raw-tok");
-
-        log.debug("Act: sendInvite for salon 'Glamour Studio' salonId={} — salon name must be forwarded to the delegate", salonId);
-        inviteService.sendInvite(request, callerId);
-
-        ArgumentCaptor<String> salonNameCaptor = ArgumentCaptor.forClass(String.class);
-        verify(invitePersistenceService).persistInviteAndEnqueue(
-                any(), any(), any(), any(), any(), any(), salonNameCaptor.capture());
-        assertThat(salonNameCaptor.getValue()).isEqualTo("Glamour Studio");
     }
 
-    @Test
-    @DisplayName("sendInvite delegates persist+enqueue with the invitee email, raw-token link and salon name")
-    void should_writeOutboxRow_when_sendInviteSucceeds() {
-        var salonId = UUID.randomUUID();
-        var callerId = UUID.randomUUID();
-        var request = new InviteRequest("master@example.com", salonId, null);
-        var caller = buildCallerWithSalon(callerId, salonId);
-        var salonStub = mock(Salon.class);
-        when(salonStub.getName()).thenReturn("Test Salon");
-
-        when(tokenGenerator.generateToken()).thenReturn("raw-token");
-        when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
-        when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
-        when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(salonStub));
-        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull("master@example.com", salonId)).thenReturn(Optional.empty());
-
-        inviteService.sendInvite(request, callerId);
-
-        // The persist+enqueue delegation must run once with the normalized invitee email, the salon
-        // id, the full URL ending in the raw token, and the salon name. The saveAndFlush-before-
-        // enqueue ORDERING is now an internal detail of InvitePersistenceService (verified there).
-        ArgumentCaptor<String> linkCaptor = ArgumentCaptor.forClass(String.class);
-        verify(invitePersistenceService).persistInviteAndEnqueue(
-                eq("master@example.com"),
-                eq(salonId),
-                any(),
-                any(),
-                any(),
-                linkCaptor.capture(),
-                eq("Test Salon"));
-        assertThat(linkCaptor.getValue()).endsWith("raw-token");
+    private void stubOwnerOfSalonWithoutName() {
+        when(userRepository.findById(callerId)).thenReturn(Optional.of(owner()));
+        when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(activeSalon()));
     }
 
-    // ── @PostConstruct startup validation ────────────────────────────────────
-
-    @Test
-    @DisplayName("validateConfig throws IllegalStateException at startup when frontendBaseUrl is plain HTTP")
-    void should_throwIllegalState_when_validateConfig_withPlainHttp() {
-        var service = new InviteService(
-                inviteTokenRepository,
-                userRepository,
-                salonRepository,
-                passwordEncoder,
-                tokenGenerator,
-                masterService,
-                authResponseBuilder,
-                invitePersistenceService,
-                "http://example.com",
-                48L,
-                Clock.systemUTC(),
-                inAppNotificationService,
-                registrationTicketService
-        );
-
-        assertThatThrownBy(service::validateConfig)
-                .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("must use HTTPS scheme");
+    /** A salon that passes the B520 audit-fix live-salon check of {@code sendInvite}. */
+    private static Salon activeSalon() {
+        // A default answer, not a when(...): this helper is called inside other thenReturn(...) stubbings.
+        return mock(Salon.class, invocation -> "isActive".equals(invocation.getMethod().getName())
+                ? Boolean.TRUE : org.mockito.Answers.RETURNS_DEFAULTS.answer(invocation));
     }
 
-    @Test
-    @DisplayName("validateConfig throws IllegalStateException at startup when frontendBaseUrl is null")
-    void should_throwIllegalState_when_validateConfig_withNull() {
-        var service = new InviteService(
-                inviteTokenRepository,
-                userRepository,
-                salonRepository,
-                passwordEncoder,
-                tokenGenerator,
-                masterService,
-                authResponseBuilder,
-                invitePersistenceService,
-                null,
-                48L,
-                Clock.systemUTC(),
-                inAppNotificationService,
-                registrationTicketService
-        );
-
-        assertThatThrownBy(service::validateConfig)
-                .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("must use HTTPS scheme");
-    }
-
-    @Test
-    @DisplayName("validateConfig passes silently when frontendBaseUrl is HTTPS")
-    void should_notThrow_when_validateConfig_withHttps() {
-        var service = new InviteService(
-                inviteTokenRepository,
-                userRepository,
-                salonRepository,
-                passwordEncoder,
-                tokenGenerator,
-                masterService,
-                authResponseBuilder,
-                invitePersistenceService,
-                "https://beautica.app",
-                48L,
-                Clock.systemUTC(),
-                inAppNotificationService,
-                registrationTicketService
-        );
-
-        // Must not throw
-        service.validateConfig();
-    }
-
-    @Test
-    @DisplayName("validateConfig passes silently when frontendBaseUrl is http://localhost with port")
-    void should_notThrow_when_validateConfig_withLocalhostPort() {
-        var service = new InviteService(
-                inviteTokenRepository,
-                userRepository,
-                salonRepository,
-                passwordEncoder,
-                tokenGenerator,
-                masterService,
-                authResponseBuilder,
-                invitePersistenceService,
-                "http://localhost:3000",
-                48L,
-                Clock.systemUTC(),
-                inAppNotificationService,
-                registrationTicketService
-        );
-
-        // Must not throw — localhost dev URLs are allowed
-        service.validateConfig();
-    }
-
-    // ── Phase 5.9 — buildInviteLink HTTPS scheme guard ───────────────────────
-
-    @Test
-    @DisplayName("buildInviteLink throws IllegalStateException when frontendBaseUrl is plain HTTP")
-    void should_throwIllegalState_when_frontendBaseUrlIsPlainHttp() {
-        var salonId = UUID.randomUUID();
-        var callerId = UUID.randomUUID();
-        var request = new InviteRequest("master@example.com", salonId, null);
-        var caller = buildCallerWithSalon(callerId, salonId);
-
-        var httpService = new InviteService(
-                inviteTokenRepository,
-                userRepository,
-                salonRepository,
-                passwordEncoder,
-                tokenGenerator,
-                masterService,
-                authResponseBuilder,
-                invitePersistenceService,
-                "http://example.com",
-                48L,
-                Clock.systemUTC(),
-                inAppNotificationService,
-                registrationTicketService
-        );
-
-        when(tokenGenerator.generateToken()).thenReturn("raw-token");
-        when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
-        when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
-        when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(mock(Salon.class)));
-        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull("master@example.com", salonId)).thenReturn(Optional.empty());
-
-        assertThatThrownBy(() -> httpService.sendInvite(request, callerId))
-                .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("must use HTTPS scheme");
-    }
-
-    @Test
-    @DisplayName("buildInviteLink returns link starting with HTTPS base URL when frontendBaseUrl uses HTTPS")
-    void should_buildInviteLink_withHttps_when_frontendBaseUrlIsHttps() {
-        var salonId = UUID.randomUUID();
-        var callerId = UUID.randomUUID();
-        var request = new InviteRequest("master@example.com", salonId, null);
-        var caller = buildCallerWithSalon(callerId, salonId);
-        var salonStub = mock(Salon.class);
-        when(salonStub.getName()).thenReturn("Test Salon");
-
-        var httpsService = new InviteService(
-                inviteTokenRepository,
-                userRepository,
-                salonRepository,
-                passwordEncoder,
-                tokenGenerator,
-                masterService,
-                authResponseBuilder,
-                invitePersistenceService,
-                "https://beautica.app",
-                48L,
-                Clock.systemUTC(),
-                inAppNotificationService,
-                registrationTicketService
-        );
-
-        when(tokenGenerator.generateToken()).thenReturn("raw-token");
-        when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
-        when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
-        when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(salonStub));
-        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull("master@example.com", salonId)).thenReturn(Optional.empty());
-
-        httpsService.sendInvite(request, callerId);
-
-        ArgumentCaptor<String> linkCaptor = ArgumentCaptor.forClass(String.class);
-        verify(invitePersistenceService).persistInviteAndEnqueue(
-                any(), any(), any(), any(), any(), linkCaptor.capture(), any());
-        assertThat(linkCaptor.getValue()).startsWith("https://beautica.app");
-    }
-
-    // ── Localhost prefix-spoof rejection (boundary-correct scheme guard) ──────
-
-    @Test
-    @DisplayName("buildInviteLink rejects http://localhost.attacker.com (prefix-spoof)")
-    void should_throwIllegalState_when_frontendBaseUrlIsLocalhostSpoof() {
-        var salonId = UUID.randomUUID();
-        var callerId = UUID.randomUUID();
-        var request = new InviteRequest("master@example.com", salonId, null);
-        var caller = buildCallerWithSalon(callerId, salonId);
-
-        var spoofService = new InviteService(
-                inviteTokenRepository,
-                userRepository,
-                salonRepository,
-                passwordEncoder,
-                tokenGenerator,
-                masterService,
-                authResponseBuilder,
-                invitePersistenceService,
-                "http://localhost.attacker.com",
-                48L,
-                Clock.systemUTC(),
-                inAppNotificationService,
-                registrationTicketService
-        );
-
-        when(tokenGenerator.generateToken()).thenReturn("raw-token");
-        when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
-        when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
-        when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(mock(Salon.class)));
-        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull("master@example.com", salonId)).thenReturn(Optional.empty());
-
-        assertThatThrownBy(() -> spoofService.sendInvite(request, callerId))
-                .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("HTTPS scheme");
-
-        verify(invitePersistenceService, never())
-                .persistInviteAndEnqueue(any(), any(), any(), any(), any(), any(), any());
-    }
-
-    @Test
-    @DisplayName("buildInviteLink rejects http://localhostXYZ (suffix-spoof, no separator)")
-    void should_throwIllegalState_when_frontendBaseUrlIsLocalhostSuffixSpoof() {
-        var salonId = UUID.randomUUID();
-        var callerId = UUID.randomUUID();
-        var request = new InviteRequest("master@example.com", salonId, null);
-        var caller = buildCallerWithSalon(callerId, salonId);
-
-        var spoofService = new InviteService(
-                inviteTokenRepository,
-                userRepository,
-                salonRepository,
-                passwordEncoder,
-                tokenGenerator,
-                masterService,
-                authResponseBuilder,
-                invitePersistenceService,
-                "http://localhostXYZ",
-                48L,
-                Clock.systemUTC(),
-                inAppNotificationService,
-                registrationTicketService
-        );
-
-        when(tokenGenerator.generateToken()).thenReturn("raw-token");
-        when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
-        when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
-        when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(mock(Salon.class)));
-        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull("master@example.com", salonId)).thenReturn(Optional.empty());
-
-        assertThatThrownBy(() -> spoofService.sendInvite(request, callerId))
-                .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("HTTPS scheme");
-
-        verify(invitePersistenceService, never())
-                .persistInviteAndEnqueue(any(), any(), any(), any(), any(), any(), any());
-    }
-
-    @Test
-    @DisplayName("buildInviteLink accepts http://localhost:3000 (positive boundary, with port)")
-    void should_buildInviteLink_when_frontendBaseUrlIsLocalhostWithPort() {
-        var salonId = UUID.randomUUID();
-        var callerId = UUID.randomUUID();
-        var request = new InviteRequest("master@example.com", salonId, null);
-        var caller = buildCallerWithSalon(callerId, salonId);
-        var salonStub = mock(Salon.class);
-        when(salonStub.getName()).thenReturn("Test Salon");
-
-        var localhostService = new InviteService(
-                inviteTokenRepository,
-                userRepository,
-                salonRepository,
-                passwordEncoder,
-                tokenGenerator,
-                masterService,
-                authResponseBuilder,
-                invitePersistenceService,
-                "http://localhost:3000",
-                48L,
-                Clock.systemUTC(),
-                inAppNotificationService,
-                registrationTicketService
-        );
-
-        when(tokenGenerator.generateToken()).thenReturn("raw-token");
-        when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
-        when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
-        when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(salonStub));
-        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull("master@example.com", salonId)).thenReturn(Optional.empty());
-
-        localhostService.sendInvite(request, callerId);
-
-        ArgumentCaptor<String> linkCaptor = ArgumentCaptor.forClass(String.class);
-        // Positive proof the URL passed validation: the delegate was actually invoked with the link.
-        verify(invitePersistenceService).persistInviteAndEnqueue(
-                any(), any(), any(), any(), any(), linkCaptor.capture(), any());
-        assertThat(linkCaptor.getValue()).startsWith("http://localhost:3000/invite/accept?token=");
-    }
-
-    // ── Finding 2: SALON_ADMIN can invite masters ─────────────────────────────
-
-    @Test
-    @DisplayName("SALON_ADMIN can invite a SALON_MASTER to their own assigned salon")
-    void should_allow_salonAdmin_to_invite_master() {
-        var salonId = UUID.randomUUID();
-        var callerId = UUID.randomUUID();
-        var request = new InviteRequest("newmaster@example.com", salonId, null);
-
-        // SALON_ADMIN caller — salonId is the assigned salon
-        var adminCaller = new User("admin@beautica.test", "hash", Role.SALON_ADMIN, null, null, null, salonId);
-        ReflectionTestUtils.setField(adminCaller, "id", callerId);
-
-        var salonStub = mock(Salon.class);
-        when(salonStub.getName()).thenReturn("Test Salon");
-
-        when(tokenGenerator.generateToken()).thenReturn("raw-token");
-        when(userRepository.existsByEmail("newmaster@example.com")).thenReturn(false);
-        when(userRepository.findById(callerId)).thenReturn(Optional.of(adminCaller));
-        // SALON_ADMIN branch: salonRepository.findById is called (not findByIdAndOwnerId)
-        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salonStub));
-        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull("newmaster@example.com", salonId))
-                .thenReturn(Optional.empty());
-
-        var response = inviteService.sendInvite(request, callerId);
-
-        assertThat(response.invitedEmail()).isEqualTo("newmaster@example.com");
-        verify(salonRepository).findById(salonId);
-        verify(invitePersistenceService).persistInviteAndEnqueue(
-                any(), any(), any(), any(), any(), any(), any());
-    }
-
-    @Test
-    @DisplayName("SALON_ADMIN is rejected with ForbiddenException when inviting to a foreign salon")
-    void should_reject_salonAdmin_inviting_to_foreign_salon() {
-        var assignedSalonId = UUID.randomUUID();
-        var foreignSalonId  = UUID.randomUUID();
-        var callerId        = UUID.randomUUID();
-        // Request targets a salon the admin is NOT assigned to
-        var request = new InviteRequest("master@example.com", foreignSalonId, null);
-
-        var adminCaller = new User("admin@beautica.test", "hash", Role.SALON_ADMIN, null, null, null, assignedSalonId);
-        ReflectionTestUtils.setField(adminCaller, "id", callerId);
-
-        when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
-        when(userRepository.findById(callerId)).thenReturn(Optional.of(adminCaller));
-
-        assertThatThrownBy(() -> inviteService.sendInvite(request, callerId))
-                .isInstanceOf(ForbiddenException.class)
-                .hasMessageContaining("SALON_ADMIN may only invite to their own assigned salon");
-
-        verify(invitePersistenceService, never())
-                .persistInviteAndEnqueue(any(), any(), any(), any(), any(), any(), any());
-    }
-
-    // ── Finding 3: weak password rejected on invite accept ───────────────────
-
-    @Test
-    @DisplayName("InviteAcceptRequest @StrongPassword rejects a weak password that only satisfies @Size(min=12)")
-    void should_reject_weakPassword_on_inviteAccept() {
-        // @StrongPassword requires uppercase + digit + special char; "aaaaaaaaaaaa" only passes @Size(min=12).
-        // Validate directly using Jakarta Validation to confirm the annotation is in place.
-        var request = new InviteAcceptRequest("valid-token", "aaaaaaaaaaaa", "First", "Last", null);
-
-        var validator = jakarta.validation.Validation.buildDefaultValidatorFactory().getValidator();
-        var violations = validator.validate(request);
-
-        assertThat(violations)
-                .as("@StrongPassword should reject 'aaaaaaaaaaaa' (no uppercase/digit/special)")
-                .anyMatch(v -> v.getPropertyPath().toString().equals("password"));
-    }
-
-    // ── Concurrency + cross-salon scope (delegate unique-guard fix) ───────────
-
-    @Test
-    @DisplayName("sendInvite returns generic success when the persistence delegate trips the unique guard (concurrent same-salon race)")
-    void should_returnGenericSuccessAndNotEnqueue_when_concurrentInviteRacesUniqueGuard() {
-        var salonId = UUID.randomUUID();
-        var callerId = UUID.randomUUID();
-        var request = new InviteRequest("racer@example.com", salonId, null);
-        var caller = buildCallerWithSalon(callerId, salonId);
-        log.debug("Arrange: brand-new email, but the delegate hits the active-invite unique guard (salonId={})", salonId);
-
-        when(tokenGenerator.generateToken()).thenReturn("raw-token");
-        when(userRepository.existsByEmail("racer@example.com")).thenReturn(false);
-        when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
-        when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(mock(Salon.class)));
-        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull("racer@example.com", salonId))
-                .thenReturn(Optional.empty());
-        doThrow(new org.springframework.dao.DataIntegrityViolationException("ux_invite_tokens_active"))
-                .when(invitePersistenceService)
-                .persistInviteAndEnqueue(any(), any(), any(), any(), any(), any(), any());
-
-        log.debug("Act: sendInvite where a concurrent request already inserted the active invite — must resolve idempotently");
-        var response = inviteService.sendInvite(request, callerId);
-
-        assertThat(response)
-                .as("a raced unique-guard violation must resolve idempotently, not by throwing")
-                .isNotNull();
-        assertThat(response.invitedEmail())
-                .as("racing branch must echo the same generic invited email")
-                .isEqualTo("racer@example.com");
-        // The delegate WAS attempted (and threw); the caller swallowed it and returned generic success.
-        verify(invitePersistenceService).persistInviteAndEnqueue(
-                any(), any(), any(), any(), any(), any(), any());
-    }
-
-    @Test
-    @DisplayName("sendInvite creates this salon's own token even when another salon holds an active invite for the same email (cross-salon scope fix)")
-    void should_createOwnToken_when_anotherSalonHoldsActiveInviteForSameEmail() {
-        var salonId = UUID.randomUUID();
-        var callerId = UUID.randomUUID();
-        var request = new InviteRequest("shared@example.com", salonId, null);
-        var caller = buildCallerWithSalon(callerId, salonId);
-        log.debug("Arrange: another salon holds an active invite for shared@example.com — invisible to this salon's scoped lookup (salonId={})", salonId);
-
-        var salonStub = mock(Salon.class);
-        when(salonStub.getName()).thenReturn("This Salon");
-
-        when(tokenGenerator.generateToken()).thenReturn("raw-token");
-        when(userRepository.existsByEmail("shared@example.com")).thenReturn(false);
-        when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
-        when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(salonStub));
-        // Scoped to THIS salon → empty; the other salon's active invite is invisible here.
-        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull("shared@example.com", salonId))
-                .thenReturn(Optional.empty());
-
-        log.debug("Act: sendInvite for this salon — a token must be created despite the other salon's invite");
-        inviteService.sendInvite(request, callerId);
-
-        verify(invitePersistenceService).persistInviteAndEnqueue(
-                any(), any(), any(), any(), any(), any(), any());
-    }
-
-    // ── Email normalization (lower + strip) — salon-scoped pre-check must agree with lower(email) guard ──
-
-    @Test
-    @DisplayName("sendInvite normalizes email (lower+strip) so a re-invite in different case hits the salon-scoped active invite idempotently — no silent drop")
-    void should_normalizeEmailAndResolveIdempotently_when_reInvitedWithDifferentCase() {
-        var salonId = UUID.randomUUID();
-        var callerId = UUID.randomUUID();
-        // Raw input carries mixed case + surrounding whitespace; the canonical form is master@example.com.
-        var request = new InviteRequest("  MASTER@Example.COM  ", salonId, null);
-        var caller = buildCallerWithSalon(callerId, salonId);
-        var existing = buildInviteToken("master@example.com", Instant.now().plusSeconds(3600));
-        log.debug("Arrange: active invite stored under normalized email; re-invite arrives in different case+whitespace");
-
-        when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
-        when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
-        when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(mock(Salon.class)));
-        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull("master@example.com", salonId))
-                .thenReturn(Optional.of(existing));
-
-        log.debug("Act: sendInvite with mixed-case/whitespace email — must normalize before the salon-scoped pre-check");
-        var response = inviteService.sendInvite(request, callerId);
-
-        // The scoped pre-check MUST run on the canonical value so the existing active invite is FOUND.
-        // Without normalization the raw-case lookup misses it, then the INSERT silently collides on the
-        // case-insensitive lower(email) guard — dropping the invite (no token, no e-mail).
-        verify(inviteTokenRepository).findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull("master@example.com", salonId);
-        // Registration probe also runs on the canonical value (agrees with AuthService write path).
-        verify(userRepository).existsByEmail("master@example.com");
-        assertThat(response.invitedEmail())
-                .as("response must echo the normalized email, actual=%s", response.invitedEmail())
-                .isEqualTo("master@example.com");
-        // Idempotent: an active invite already exists, so no second token and no second e-mail.
-        verify(invitePersistenceService, never())
-                .persistInviteAndEnqueue(any(), any(), any(), any(), any(), any(), any());
-    }
-
-    @Test
-    @DisplayName("sendInvite forwards the normalized (lower+strip) email to the persistence delegate for a brand-new mixed-case invite")
-    void should_forwardNormalizedEmailToDelegate_when_brandNewInviteHasMixedCaseEmail() {
-        var salonId = UUID.randomUUID();
-        var callerId = UUID.randomUUID();
-        var request = new InviteRequest("  NewMaster@Example.COM ", salonId, null);
-        var caller = buildCallerWithSalon(callerId, salonId);
-        var salonStub = mock(Salon.class);
-        when(salonStub.getName()).thenReturn("Test Salon");
-        log.debug("Arrange: brand-new invite arrives in mixed case + whitespace, canonical = newmaster@example.com");
-
-        when(tokenGenerator.generateToken()).thenReturn("raw-token");
-        when(userRepository.existsByEmail("newmaster@example.com")).thenReturn(false);
-        when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
-        when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(salonStub));
-        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull("newmaster@example.com", salonId))
-                .thenReturn(Optional.empty());
-
-        log.debug("Act: sendInvite for a brand-new mixed-case email — delegate must receive the canonical value");
-        var response = inviteService.sendInvite(request, callerId);
-
-        // The persisted token + outbox must use the canonical email so the row agrees with the
-        // case-insensitive ux_invite_tokens_active index and the accept-time existsByEmail check.
-        verify(invitePersistenceService).persistInviteAndEnqueue(
-                eq("newmaster@example.com"), eq(salonId), any(), any(), any(), any(), any());
-        assertThat(response.invitedEmail())
-                .as("response must echo the normalized email, actual=%s", response.invitedEmail())
-                .isEqualTo("newmaster@example.com");
-    }
-
-    private InviteToken buildInviteToken(String email, Instant expiresAt) {
-        return new InviteToken(UUID.randomUUID().toString(), email, UUID.randomUUID(), Role.SALON_MASTER, expiresAt);
-    }
-
-    private User buildCallerWithSalon(UUID callerId, UUID salonId) {
-        var caller = new User("owner@beautica.test", "hash", Role.SALON_OWNER, null, null, null, salonId);
-        ReflectionTestUtils.setField(caller, "id", callerId);
-        return caller;
+    private User owner() {
+        var owner = new User("owner@beautica.test", "hash", Role.SALON_OWNER, null, null, null, salonId);
+        ReflectionTestUtils.setField(owner, "id", callerId);
+        return owner;
     }
 }

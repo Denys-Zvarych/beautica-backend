@@ -1,6 +1,7 @@
 package com.beautica.booking;
 
 import com.beautica.AbstractIntegrationTest;
+import com.beautica.support.StaffInviteFixtures;
 import com.beautica.auth.dto.InviteAcceptRequest;
 import com.beautica.auth.phoneotp.GuestTokenProvider;
 import com.beautica.booking.entity.Booking;
@@ -445,20 +446,21 @@ class InAppNotificationWritePathIT extends AbstractIntegrationTest {
         SalonRig rig = seedSalonRig(); // owner + one existing admin already seeded
 
         String rawToken = "raw-invite-" + UUID.randomUUID();
-        String inviteeEmail = "rig-invitee-" + System.nanoTime() + "@beautica.test";
+        String inviteePhone = StaffInviteFixtures.newPhone();
         jdbcTemplate.update(
-                "INSERT INTO invite_tokens (id, token, email, salon_id, role, expires_at, is_used, "
+                "INSERT INTO invite_tokens (id, token, phone, salon_id, role, expires_at, is_used, "
                         + "created_at, updated_at) VALUES (?, ?, ?, ?, 'SALON_ADMIN', ?, false, NOW(), NOW())",
-                UUID.randomUUID(), sha256Hex(rawToken), inviteeEmail, rig.salonId(),
+                UUID.randomUUID(), sha256Hex(rawToken), inviteePhone, rig.salonId(),
                 Timestamp.from(Instant.now().plus(2, ChronoUnit.DAYS)));
 
         ResponseEntity<String> resp = restTemplate.postForEntity("/api/v1/auth/invite/accept",
-                new InviteAcceptRequest(rawToken, "Str0ngP@ss1!", "Invited", "Admin", "+380501234567"),
+                new InviteAcceptRequest(rawToken, "Str0ngP@ss1!", "Invited", "Admin", null, null, null, null,
+                        StaffInviteFixtures.seedRegistrationTicket(jdbcTemplate, inviteePhone)),
                 String.class);
         assertThat(resp.getStatusCode()).as("invite accept must succeed — body=%s", resp.getBody())
                 .isEqualTo(HttpStatus.CREATED);
         UUID newAdminId = jdbcTemplate.queryForObject(
-                "SELECT id FROM users WHERE email = ?", UUID.class, inviteeEmail);
+                "SELECT id FROM users WHERE phone_number = ?", UUID.class, inviteePhone);
 
         List<Map<String, Object>> rows = feedRows();
         assertThat(rows).hasSize(2);
