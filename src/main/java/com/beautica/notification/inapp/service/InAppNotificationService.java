@@ -509,6 +509,30 @@ public class InAppNotificationService {
     }
 
     /**
+     * B516 (AUTH-D19) — the account's own security notice after a phone change or an email add / change, in the
+     * caller's transaction (a rolled-back change writes nothing). One row for {@code userId} only, with
+     * {@code subject_user_id = userId} and the changed value masked AT THE TIME OF THE CHANGE
+     * ({@code masked_contact}; the read path shows it as stored, never the account's later value); dedup key
+     * {@code TYPE:<userId>:<epoch seconds>}. Push rides the same CTE twin as every other row.
+     *
+     * @param maskedContact the new value already masked ({@code ContactMask}); {@code null} stores no value
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void notifySecurityNotice(InAppNotificationType type, UUID userId, String maskedContact,
+                                     Instant changedAt) {
+        if (!type.isSecurityNotice()) {
+            throw new IllegalArgumentException("Not a security notice type: " + type);
+        }
+        String dedupKey = dedupKey(type, userId, changedAt.getEpochSecond());
+        if (pushEnabled) {
+            repository.insertSecurityNoticeWithPush(type.name(), userId, maskedContact, dedupKey);
+        } else {
+            repository.insertSecurityNotice(type.name(), userId, maskedContact, dedupKey);
+        }
+        log.debug("in-app notify type={}", type);
+    }
+
+    /**
      * Phase 372 — a platform admin approved or rejected a self-service category request. Notifies the
      * REQUESTER only (no salon fan-out; requests are platform-wide). Skips when the requester is gone
      * (legacy row / deleted user) — the decision still commits. Dedup key {@code TYPE:<categoryId>}

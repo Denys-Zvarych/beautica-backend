@@ -24,7 +24,8 @@ import java.util.regex.Pattern;
  *
  * <p><b>Allowed in a body:</b> the counterpart display name, the first service name (+N), the Kyiv
  * start time, and the invitee name + role. <b>Never:</b> a booking note, a
- * phone, an e-mail — {@link NotificationParams} carries no field for any of them, and this class
+ * phone, an e-mail — this class reads no contact field of {@link NotificationParams} (its B516 {@code maskedContact}
+ * is for the in-app feed only), and
  * reads nothing else.
  *
  * <p>{@link #title} is an exhaustive {@code switch} over {@link InAppNotificationType} with no
@@ -129,6 +130,9 @@ public final class PushCopy {
             case REVIEW_ABOUT_YOU_REMOVED -> "Відгук видалено";
             // Phase 495 — must equal the mobile ARB notificationTitleBookingReminder (M497).
             case BOOKING_REMINDER -> "Нагадування про візит";
+            // B516 (AUTH-D19) — must equal the mobile ARB titles (M517).
+            case SECURITY_PHONE_CHANGED -> "Номер телефону змінено";
+            case SECURITY_EMAIL_CHANGED -> "Email для сповіщень змінено";
         };
     }
 
@@ -160,6 +164,9 @@ public final class PushCopy {
         }
         if (type.isModerationOutcome()) {
             return moderationOutcomeBody(type, params.contentKind());
+        }
+        if (type.isSecurityNotice()) {
+            return securityNoticeBody();
         }
         String counterpart = sanitize(params.counterpartName());
         String service = sanitize(params.serviceName());
@@ -223,6 +230,18 @@ public final class PushCopy {
             case REVIEW_ABOUT_YOU_REMOVED -> "Відгук про вас видалено модерацією Beautica: він порушував правила спільноти.";
             default -> GENERIC_BODY;
         };
+    }
+
+    /** AUTH-D19 copy line closing every security notice (feed, push and email). */
+    public static final String SECURITY_NOTICE_SUPPORT_LINE = "Якщо це не ви — зверніться в підтримку.";
+
+    /**
+     * B516 (AUTH-D19) — the lock-screen body is the support line only: NTF-D01 keeps every phone and e-mail (masked or
+     * not) off the lock screen, the title says what changed, and the masked new value is shown in the feed
+     * ({@code params.maskedContact}) and the email. {@code params} is non-null here (the subject row exists).
+     */
+    private static String securityNoticeBody() {
+        return SECURITY_NOTICE_SUPPORT_LINE;
     }
 
     private static String contentRemovedBody(ModeratedContentKind kind) {

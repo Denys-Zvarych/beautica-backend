@@ -77,4 +77,49 @@ class AppCheckGuardTest {
             assertThat(counter.count()).as(result).isEqualTo(1);
         }
     }
+
+    // ── B516 — checkCurrentRequest (forgot / change password SMS branch) ──────
+
+    private AppCheckGuard guardIn(AppCheckMode mode) {
+        AppCheckProperties properties = new AppCheckProperties();
+        properties.setMode(mode);
+        return new AppCheckGuard(verifier, properties, meterRegistry);
+    }
+
+    @org.junit.jupiter.api.AfterEach
+    void unbindRequest() {
+        org.springframework.web.context.request.RequestContextHolder.resetRequestAttributes();
+    }
+
+    @Test
+    @DisplayName("B516: checkCurrentRequest verifies the header of the request bound to the thread")
+    void should_verifyBoundRequestHeader_when_checkCurrentRequest() {
+        MockHttpServletRequest request = request();
+        request.addHeader(AppCheckGuard.HEADER, "token-value");
+        org.springframework.web.context.request.RequestContextHolder.setRequestAttributes(
+                new org.springframework.web.context.request.ServletRequestAttributes(request));
+        when(verifier.verify("token-value")).thenReturn(AppCheckVerifier.Result.INVALID);
+
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> guardIn(AppCheckMode.ENFORCE).checkCurrentRequest())
+                .isInstanceOfSatisfying(com.beautica.common.exception.IdentityException.class, e ->
+                        assertThat(e.getCode())
+                                .isEqualTo(com.beautica.common.exception.IdentityException.Code.APP_CHECK_FAILED));
+    }
+
+    @Test
+    @DisplayName("B516: checkCurrentRequest without a bound request fails closed in ENFORCE")
+    void should_failClosed_when_noRequestBoundInEnforce() {
+        when(verifier.verify(null)).thenReturn(AppCheckVerifier.Result.MISSING);
+
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> guardIn(AppCheckMode.ENFORCE).checkCurrentRequest())
+                .isInstanceOf(com.beautica.common.exception.IdentityException.class);
+    }
+
+    @Test
+    @DisplayName("B516: checkCurrentRequest is a no-op in OFF")
+    void should_doNothing_when_modeOff() {
+        guardIn(AppCheckMode.OFF).checkCurrentRequest();
+
+        org.mockito.Mockito.verifyNoInteractions(verifier);
+    }
 }

@@ -144,6 +144,11 @@ class V241InAppBookingReminderTypeMigrationTest extends AbstractIntegrationTest 
         if (type.equals("INVITE_ACCEPTED")) {
             return jdbcTemplate.update(sql, id, recipient, type, null, ref, null, null, null, type + ":" + ref);
         }
+        if (type.startsWith("SECURITY_")) {
+            // B516 (V246): no referent but the optional subject (= the recipient, ON DELETE SET NULL).
+            return jdbcTemplate.update(sql, id, recipient, type, null, null, null, null, null,
+                    type + ":" + ref + ":1763202600");
+        }
         String key = type.equals("BOOKING_REMINDER") ? type + ":" + ref + ":1763202600" : type + ":" + ref;
         return jdbcTemplate.update(sql, id, recipient, type, ref, null, null, null, null, key);
     }

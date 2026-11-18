@@ -30,6 +30,10 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
+import com.beautica.user.phone.PhoneChangeGuard;
+import com.beautica.user.phone.PhoneRequirementPolicy;
+
+import java.time.LocalDate;
 import java.util.Comparator;
 import java.util.EnumSet;
 import java.util.List;
@@ -64,6 +68,7 @@ public class UserService {
     private final ClientReviewRepository clientReviewRepository;
     private final MasterRepository masterRepository;
     private final SalonBookingInfoCacheEvictor salonBookingInfoCacheEvictor;
+    private final PhoneRequirementPolicy phoneRequirementPolicy;
 
     public UserService(UserRepository userRepository,
                        LocalityWriteValidator localityWriteValidator,
@@ -73,7 +78,8 @@ public class UserService {
                        CacheManager cacheManager,
                        ClientReviewRepository clientReviewRepository,
                        MasterRepository masterRepository,
-                       SalonBookingInfoCacheEvictor salonBookingInfoCacheEvictor) {
+                       SalonBookingInfoCacheEvictor salonBookingInfoCacheEvictor,
+                       PhoneRequirementPolicy phoneRequirementPolicy) {
         this.userRepository = userRepository;
         this.localityWriteValidator = localityWriteValidator;
         this.settlementDisplayNameResolver = settlementDisplayNameResolver;
@@ -83,6 +89,7 @@ public class UserService {
         this.clientReviewRepository = clientReviewRepository;
         this.masterRepository = masterRepository;
         this.salonBookingInfoCacheEvictor = salonBookingInfoCacheEvictor;
+        this.phoneRequirementPolicy = phoneRequirementPolicy;
     }
 
     /**
@@ -167,7 +174,7 @@ public class UserService {
                 ? null
                 : locationQueryService.resolveCityOblastId(user.getCityId());
         return UserProfileResponse.from(user, districtName, oblastId, resolveHasMasterProfile(user),
-                resolveSettlement(user));
+                resolveSettlement(user), phoneRequiredBy(user));
     }
 
     /**
@@ -205,6 +212,14 @@ public class UserService {
      * {@code MasterService}, and routing it through that service would create a
      * {@code UserService} ⇄ {@code MasterService} bean cycle.
      */
+    /**
+     * B516 (AUTH-45). A CLIENT's answer is "today"; the profile cache (5 min TTL) may serve yesterday's date for a
+     * few minutes after Kyiv midnight — harmless, the app only compares it with its own today.
+     */
+    private LocalDate phoneRequiredBy(User user) {
+        return phoneRequirementPolicy.phoneRequiredBy(user.getRole(), user.isPhoneVerified());
+    }
+
     private boolean resolveHasMasterProfile(User user) {
         if (user.getRole() != Role.SALON_OWNER) {
             return false;
@@ -218,12 +233,11 @@ public class UserService {
         User user = userRepository.findById(userId)
                 .orElseThrow(() -> new NotFoundException("User not found"));
 
+        // B516 (CLI-04, AUTH-44): the phone changes only through the SMS-code flow; an echoed / absent value is a no-op.
+        PhoneChangeGuard.requireUnchanged(user.getPhoneNumber(), request.phoneNumber());
+
         Optional.ofNullable(request.firstName()).ifPresent(user::setFirstName);
         Optional.ofNullable(request.lastName()).ifPresent(user::setLastName);
-        Optional.ofNullable(request.phoneNumber())
-                .filter(s -> !s.isBlank())
-                .ifPresent(user::setPhoneNumber);
-
         applyLocality(user, request);
 
         // Phase 19.6: optional Instagram handle. A null value leaves the stored handle
@@ -275,7 +289,7 @@ public class UserService {
         // locality edit, and a null type would drop the «м.»/«с.» prefix it had a second ago.
         // Cached lookup — the locality write above has just warmed the same key.
         return UserProfileResponse.from(user, null, null, resolveHasMasterProfile(user),
-                resolveSettlement(user));
+                resolveSettlement(user), phoneRequiredBy(user));
     }
 
     /**
@@ -318,15 +332,15 @@ public class UserService {
             throw new ForbiddenException("Profile update not permitted for role: " + role);
         }
 
+        // B516 (AUTH-44): same rule as PATCH /users/me — this path wrote phone_number too, which would have left
+        // phone_verified_at stamped on an unproven number.
+        PhoneChangeGuard.requireUnchanged(user.getPhoneNumber(), request.phoneNumber());
         Optional.ofNullable(request.firstName())
                 .filter(s -> !s.isBlank())
                 .ifPresent(user::setFirstName);
         Optional.ofNullable(request.lastName())
                 .filter(s -> !s.isBlank())
                 .ifPresent(user::setLastName);
-        Optional.ofNullable(request.phoneNumber())
-                .filter(s -> !s.isBlank())
-                .ifPresent(user::setPhoneNumber);
         if (request.bio() != null) {
             user.setBio(request.bio());
         }

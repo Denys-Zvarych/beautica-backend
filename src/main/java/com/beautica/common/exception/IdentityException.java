@@ -23,7 +23,11 @@ public class IdentityException extends BusinessException {
         /** AUTH-54 — missing or invalid Firebase App Check token in ENFORCE mode. */
         APP_CHECK_FAILED(HttpStatus.FORBIDDEN, "App verification failed"),
         /** AUTH-54 — Google's App Check keys could not be fetched and none are cached. */
-        APP_CHECK_UNAVAILABLE(HttpStatus.SERVICE_UNAVAILABLE, "App verification is temporarily unavailable, please retry");
+        APP_CHECK_UNAVAILABLE(HttpStatus.SERVICE_UNAVAILABLE, "App verification is temporarily unavailable, please retry"),
+        /** B516 (CLI-04, AUTH-44) — {@code PATCH /users/me} (or the master profile update) tried to set a different phone. */
+        PHONE_CHANGE_REQUIRES_OTP(HttpStatus.BAD_REQUEST, "The phone number can only be changed with an SMS code"),
+        /** B516 (AUTH-45) — {@code APP_AUTH_REQUIRE_VERIFIED_PHONE}: the action needs a verified phone first. */
+        PHONE_NOT_VERIFIED(HttpStatus.CONFLICT, "Confirm your phone number to continue");
 
         private final HttpStatus status;
         private final String clientMessage;

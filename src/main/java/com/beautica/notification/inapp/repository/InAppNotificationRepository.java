@@ -353,6 +353,50 @@ public interface InAppNotificationRepository extends Repository<InAppNotificatio
             @Param("dedupKey") String dedupKey);
 
     /**
+     * B516 (AUTH-D19) — the account's own security notice: ONE row for {@code userId}, {@code subject_user_id} =
+     * the same account, plus the changed value masked AT WRITE TIME ({@code masked_contact}, V249) so the feed shows
+     * the value of that change, not the account's current one. Driven by {@code users} so a vanished account yields
+     * no row instead of an FK failure.
+     */
+    @Modifying
+    @Query(value = """
+            INSERT INTO in_app_notification
+                (id, recipient_user_id, type, subject_user_id, masked_contact, dedup_key)
+            SELECT gen_random_uuid(), u.id, :type, u.id, :maskedContact, :dedupKey
+              FROM users u
+             WHERE u.id = :userId
+            ON CONFLICT (recipient_user_id, dedup_key) DO NOTHING
+            """, nativeQuery = true)
+    int insertSecurityNotice(
+            @Param("type") String type,
+            @Param("userId") UUID userId,
+            @Param("maskedContact") String maskedContact,
+            @Param("dedupKey") String dedupKey);
+
+    /** Push twin of {@link #insertSecurityNotice}. */
+    @Modifying
+    @Query(value = """
+            WITH ins AS (
+                INSERT INTO in_app_notification
+                    (id, recipient_user_id, type, subject_user_id, masked_contact, dedup_key)
+                SELECT gen_random_uuid(), u.id, :type, u.id, :maskedContact, :dedupKey
+                  FROM users u
+                 WHERE u.id = :userId
+                ON CONFLICT (recipient_user_id, dedup_key) DO NOTHING
+                RETURNING id, recipient_user_id
+            )
+            INSERT INTO notification_outbox (event_type, aggregate_id)
+            SELECT 'INAPP_PUSH', ins.id FROM ins
+             WHERE EXISTS (SELECT 1 FROM device_tokens dt
+                            WHERE dt.user_id = ins.recipient_user_id AND dt.is_active)
+            """, nativeQuery = true)
+    int insertSecurityNoticeWithPush(
+            @Param("type") String type,
+            @Param("userId") UUID userId,
+            @Param("maskedContact") String maskedContact,
+            @Param("dedupKey") String dedupKey);
+
+    /**
      * Phase 372 — one request-decision item for ONE recipient (the requester). Exactly one of
      * {@code categoryRequestId} / {@code suggestionId} is non-null, matching the type (enforced by
      * {@code in_app_notification_shape_chk}). Driven by {@code users} so a stale requester id yields no

@@ -122,8 +122,9 @@ public class AuthController {
     public ResponseEntity<ApiResponse<Void>> forgotPassword(
             @Valid @RequestBody ForgotPasswordRequest request) {
         passwordResetService.requestReset(request);
+        // B516 (AUTH-12 / D6): one body for every identifier and every channel — never names email or SMS.
         return ResponseEntity.ok(ApiResponse.ok(null,
-                "If an account exists for that email, a reset code has been sent."));
+                "If an account exists, a reset code has been sent."));
     }
 
     /**

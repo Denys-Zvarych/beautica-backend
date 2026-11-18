@@ -176,6 +176,12 @@ public class User extends AuditableEntity {
     @Column(name = "password_reset_locked_until")
     private Instant passwordResetLockedUntil;
 
+    // B516 (AUTH-12/15, V248) — last password-reset SMS request on this account; the 60 s SMS-branch cooldown reads it
+    // on the locked row (the phone_otps row is written after commit, too late to serialise concurrent requests).
+    @JsonIgnore
+    @Column(name = "password_reset_sms_sent_at")
+    private Instant passwordResetSmsSentAt;
+
     @Column(name = "bio", columnDefinition = "TEXT")
     private String bio;
 
@@ -338,8 +344,10 @@ public class User extends AuditableEntity {
     }
 
     /**
-     * B514 (AUTH-43) — stamps the phone proven by a registration ticket on an invited account at accept time.
-     * Only for a freshly created, not yet persisted user; phone change of an existing account is B516.
+     * B514 (AUTH-43) — stamps the phone proven by a registration ticket on an invited account at accept time; B516
+     * (AUTH-44, D3) — swaps an existing account's phone to the number its SMS code just proved, in the same single
+     * write (number and {@code phone_verified_at} together). Callers persist through
+     * {@code PhoneRegistrationService.saveClaimingPhone} so a number verified on another account is a clean 409.
      */
     public void markPhoneVerified(String phoneE164, Instant verifiedAt) {
         this.phoneNumber = phoneE164;
@@ -440,6 +448,21 @@ public class User extends AuditableEntity {
         return phoneVerifiedAt != null || emailVerified;
     }
 
+    /**
+     * B516 (AUTH-50, CLI-50) — stores an optional notifications email only once its emailed code was confirmed:
+     * address and {@code email_verified = true} in one write. An unconfirmed address is never written here (it stays
+     * in {@code user_pending_emails}, NTF-56). The address must already be lower-cased and trimmed.
+     */
+    public void confirmEmail(String normalisedEmail) {
+        this.email = normalisedEmail;
+        this.emailVerified = true;
+    }
+
+    /** B516 (AUTH-D18) — a non-null email that was confirmed by code: the forgot / change-password channel. */
+    public boolean hasConfirmedEmail() {
+        return email != null && emailVerified;
+    }
+
     public void setEmailVerified(boolean emailVerified) {
         this.emailVerified = emailVerified;
     }
@@ -526,6 +549,15 @@ public class User extends AuditableEntity {
     }
 
     @JsonIgnore
+    public Instant getPasswordResetSmsSentAt() {
+        return passwordResetSmsSentAt;
+    }
+
+    /** B516 — stamps a password-reset SMS request (the cooldown source); call on the row-locked entity only. */
+    public void markPasswordResetSmsRequested(Instant requestedAt) {
+        this.passwordResetSmsSentAt = requestedAt;
+    }
+
     public Instant getPasswordResetLockedUntil() {
         return passwordResetLockedUntil;
     }

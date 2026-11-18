@@ -41,6 +41,10 @@ import static org.mockito.ArgumentMatchers.eq;
  */
 @TestPropertySource(properties = {
         "app.rate-limit.otp-send-capacity=100000",
+        // B516: forgot / change-password / email-code tests make several calls per test from one IP.
+        "app.rate-limit.forgot-password-capacity=1000",
+        "app.rate-limit.change-password-otp-capacity=1000",
+        "app.rate-limit.resend-verification-capacity=1000",
         // B514 QA: PhoneOnlyAccountJourneyIT posts the support form; without an inbox it answers 503.
         "app.support.email=" + AbstractPhoneIdentityIT.SUPPORT_INBOX})
 @Import(TestSecurityConfig.class)
@@ -83,6 +87,69 @@ public abstract class AbstractPhoneIdentityIT extends AbstractIntegrationTest {
         } catch (JsonProcessingException e) {
             throw new IllegalStateException(e);
         }
+    }
+
+    // ── B516 helpers: seeded accounts + signed-in calls ─────────────────────────
+
+    protected static final String LOGIN_URL = "/api/v1/auth/login";
+    private static final org.springframework.security.crypto.password.PasswordEncoder FIXTURE_ENCODER =
+            new org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder(4);
+
+    /**
+     * Inserts an account. {@code email} / {@code verifiedPhone} may be null (not both — ck_users_login_identity);
+     * {@code legacyPhone} is an unverified free-text phone_number (used only when {@code verifiedPhone} is null).
+     */
+    protected UUID seedUser(String role, String email, boolean emailVerified, String verifiedPhone,
+                            String legacyPhone) {
+        UUID id = UUID.randomUUID();
+        String phone = verifiedPhone != null ? verifiedPhone : legacyPhone;
+        jdbcTemplate.update("INSERT INTO users (id, email, password_hash, role, first_name, phone_number, "
+                        + "phone_verified_at, is_active, email_verified) VALUES (?, ?, ?, ?, 'Тест', ?, ?, true, ?)",
+                id, email, FIXTURE_ENCODER.encode(PASSWORD), role, phone,
+                verifiedPhone == null ? null : Timestamp.from(Instant.now().minus(1, ChronoUnit.DAYS)),
+                emailVerified);
+        return id;
+    }
+
+    protected static String newEmail() {
+        return "b516-" + UUID.randomUUID() + "@beautica.test";
+    }
+
+    /** Signs in with an email or a verified phone; returns the access token. */
+    protected String accessToken(String identifier) {
+        ResponseEntity<String> login = post(LOGIN_URL, Map.of("identifier", identifier, "password", PASSWORD));
+        assertThat(login.getStatusCode().value()).as("login body: %s", login.getBody()).isEqualTo(200);
+        return json(login).at("/data/accessToken").asText();
+    }
+
+    protected HttpHeaders bearer(String token) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.setBearerAuth(token);
+        return headers;
+    }
+
+    protected ResponseEntity<String> postAs(String token, String url, Object body) {
+        return post(url, body, bearer(token));
+    }
+
+    protected ResponseEntity<String> exchangeAs(String token, org.springframework.http.HttpMethod method, String url,
+                                                Object body) {
+        HttpHeaders headers = bearer(token);
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        headers.set("X-Forwarded-For", clientIp);
+        try {
+            String payload = body == null ? null : objectMapper.writeValueAsString(body);
+            return restTemplate.exchange(url, method, new HttpEntity<>(payload, headers), String.class);
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    /** Number of SMS sent to {@code phoneE164} so far in this test. */
+    protected int smsCountTo(String phoneE164) {
+        return Mockito.mockingDetails(otpSmsSender).getInvocations().stream()
+                .filter(i -> i.getMethod().getName().equals("send") && phoneE164.equals(i.getArguments()[0]))
+                .toList().size();
     }
 
     protected ResponseEntity<String> sendCode(String phone) {

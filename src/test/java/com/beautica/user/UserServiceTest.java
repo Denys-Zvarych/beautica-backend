@@ -75,6 +75,9 @@ class UserServiceTest {
     @Mock
     private com.beautica.common.cache.SalonBookingInfoCacheEvictor salonBookingInfoCacheEvictor;
 
+    @Mock
+    private com.beautica.user.phone.PhoneRequirementPolicy phoneRequirementPolicy;
+
     private UserService userService;
 
     @BeforeEach
@@ -83,7 +86,7 @@ class UserServiceTest {
                 userRepository, localityWriteValidator,
                 new com.beautica.location.SettlementDisplayNameResolver(cityRepository), cityDistrictRepository,
                 locationQueryService, cacheManager, clientReviewRepository, masterRepository,
-                salonBookingInfoCacheEvictor);
+                salonBookingInfoCacheEvictor, phoneRequirementPolicy);
     }
 
     @Test
@@ -545,21 +548,36 @@ class UserServiceTest {
     }
 
     @Test
-    @DisplayName("updateProfile patches phoneNumber when non-null phoneNumber provided")
-    void should_updatePhoneNumber_when_phoneNumberPatched() {
+    @DisplayName("B516 CLI-04: updateProfile refuses a different phone with PHONE_CHANGE_REQUIRES_OTP and keeps the stored one")
+    void should_throwPhoneChangeRequiresOtp_when_differentPhonePatched() {
         UUID userId = UUID.randomUUID();
         User user = buildUser(userId, "master@example.com", Role.INDEPENDENT_MASTER,
                 "Ivan", "Kovalenko", "+380631111111");
-
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
-
         UpdateProfileRequest request = new UpdateProfileRequest(null, null, "+380991234567",
+                null, null, null, null, null, null, null);
+
+        assertThatThrownBy(() -> userService.updateProfile(userId, request))
+                .isInstanceOfSatisfying(com.beautica.common.exception.IdentityException.class, e ->
+                        assertThat(e.getCode()).isEqualTo(
+                                com.beautica.common.exception.IdentityException.Code.PHONE_CHANGE_REQUIRES_OTP));
+
+        assertThat(user.getPhoneNumber()).isEqualTo("+380631111111");
+    }
+
+    @Test
+    @DisplayName("B516 CLI-04: updateProfile treats the same phone in another spelling as a no-op (old builds echo it)")
+    void should_keepPhone_when_samePhoneEchoedInNationalSpelling() {
+        UUID userId = UUID.randomUUID();
+        User user = buildUser(userId, "echo@example.com", Role.CLIENT, "Echo", "Client", "+380631111111");
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+        UpdateProfileRequest request = new UpdateProfileRequest("Новий", null, "063 111 11 11",
                 null, null, null, null, null, null, null);
 
         UserProfileResponse response = userService.updateProfile(userId, request);
 
-        assertThat(response.phoneNumber()).isEqualTo("+380991234567");
-        verify(userRepository, never()).save(any());
+        assertThat(response.phoneNumber()).isEqualTo("+380631111111");
+        assertThat(response.firstName()).isEqualTo("Новий");
     }
 
     @Test
@@ -996,8 +1014,8 @@ class UserServiceTest {
     // ── updateMasterProfile ───────────────────────────────────────────────────
 
     @Test
-    @DisplayName("updateMasterProfile sets phone, bio, and instagram from request")
-    void should_updatePhoneAndBioAndInstagram_when_updateMasterProfileCalled() {
+    @DisplayName("updateMasterProfile sets bio and instagram from request; the echoed same phone is a no-op (B516)")
+    void should_updateBioAndInstagram_when_updateMasterProfileCalled() {
         UUID userId = UUID.randomUUID();
         User user = buildUser(userId, "master@example.com", Role.INDEPENDENT_MASTER,
                 "Olena", "Koval", "+380630000000");
@@ -1005,14 +1023,14 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         MasterProfileUpdateRequest request =
-                new MasterProfileUpdateRequest(null, null, "+380671112233", "bio text", "@instagram", null);
+                new MasterProfileUpdateRequest(null, null, "+380630000000", "bio text", "@instagram", null);
 
         MasterPublicProfileResponse response = userService.updateMasterProfile(userId, request);
 
-        assertThat(user.getPhoneNumber()).isEqualTo("+380671112233");
+        assertThat(user.getPhoneNumber()).isEqualTo("+380630000000");
         assertThat(user.getBio()).isEqualTo("bio text");
         assertThat(user.getInstagram()).isEqualTo("@instagram");
-        assertThat(response.phoneNumber()).isEqualTo("+380671112233");
+        assertThat(response.phoneNumber()).isEqualTo("+380630000000");
         assertThat(response.bio()).isEqualTo("bio text");
         assertThat(response.instagram()).isEqualTo("@instagram");
     }
@@ -1111,20 +1129,20 @@ class UserServiceTest {
     }
 
     @Test
-    @DisplayName("updateMasterProfile updates only phone when bio and instagram are null in request")
-    void should_updateOnlyPhone_when_bioAndInstagramAreNull() {
+    @DisplayName("B516 AUTH-44: updateMasterProfile refuses a different phone and changes nothing")
+    void should_throwPhoneChangeRequiresOtp_when_masterProfileSendsDifferentPhone() {
         UUID userId = UUID.randomUUID();
         User user = buildUser(userId, "master4@example.com", Role.INDEPENDENT_MASTER,
                 "Natalia", "P", "+380670000000");
         user.setBio("original bio");
         user.setInstagram("@original");
-
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
-        userService.updateMasterProfile(userId,
-                new MasterProfileUpdateRequest(null, null, "+380679999999", null, null, null));
+        assertThatThrownBy(() -> userService.updateMasterProfile(userId,
+                new MasterProfileUpdateRequest(null, null, "+380679999999", "new bio", null, null)))
+                .isInstanceOf(com.beautica.common.exception.IdentityException.class);
 
-        assertThat(user.getPhoneNumber()).isEqualTo("+380679999999");
+        assertThat(user.getPhoneNumber()).isEqualTo("+380670000000");
         assertThat(user.getBio()).isEqualTo("original bio");
         assertThat(user.getInstagram()).isEqualTo("@original");
     }
@@ -1236,7 +1254,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         MasterProfileUpdateRequest request =
-                new MasterProfileUpdateRequest(null, null, "+380671112233", null, null, "Візажист");
+                new MasterProfileUpdateRequest(null, null, "+380630000000", null, null, "Візажист");
 
         MasterPublicProfileResponse response = userService.updateMasterProfile(userId, request);
 
@@ -1295,7 +1313,7 @@ class UserServiceTest {
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         userService.updateMasterProfile(userId,
-                new MasterProfileUpdateRequest(null, null, "+380670000000", null, null, null));
+                new MasterProfileUpdateRequest(null, null, "+380630000000", null, null, null));
 
         assertThat(user.getProfessionalTitle())
                 .as("a null professionalTitle in the patch leaves the stored title unchanged")

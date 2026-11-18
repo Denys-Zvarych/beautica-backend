@@ -4,6 +4,7 @@ import com.beautica.location.SettlementDisplayNames;
 import com.beautica.location.entity.SettlementType;
 import io.swagger.v3.oas.annotations.media.Schema;
 
+import java.time.LocalDate;
 import java.util.UUID;
 
 /**
@@ -114,7 +115,21 @@ public record UserProfileResponse(
          */
         @Schema(types = {"string", "null"}, nullable = true, description = "The caller's own avatar "
                 + "URL (https); null when no avatar is set. Written only via /api/v1/media/avatar.")
-        String avatarUrl
+        String avatarUrl,
+
+        /** B516 (AUTH-45) — the phone was confirmed by SMS code ({@code users.phone_verified_at} set). */
+        @Schema(description = "True once the phone was confirmed by an SMS code.")
+        boolean phoneVerified,
+
+        /**
+         * B516 (AUTH-45) — the date (Europe/Kyiv) by which the phone must be confirmed: today for a CLIENT without a
+         * verified phone (the app blocks), {@code APP_PHONE_PROVIDER_DEADLINE} for a provider, null once verified (or
+         * for a provider while no deadline is configured). Resolved by {@code PhoneRequirementPolicy}.
+         */
+        @Schema(types = {"string", "null"}, nullable = true, format = "date", description = "ISO date by which the "
+                + "phone must be confirmed by SMS: today for a client without a verified phone, the provider deadline "
+                + "for a provider, null once verified.")
+        LocalDate phoneRequiredBy
 ) {
 
     // NOTE — there is deliberately NO `from(User)` convenience overload.
@@ -124,7 +139,7 @@ public record UserProfileResponse(
     // opted-in owner while GET /users/me answered `true` — one non-nullable field with two
     // meanings on the same wire type. A single four-argument factory forces every call site to
     // state what it knows about the flag, so the bug cannot silently come back through a
-    // convenience shortcut. Callers with nothing to resolve pass `from(user, null, null, false, null)`
+    // convenience shortcut. Callers with nothing to resolve pass `from(user, null, null, false, null, null)`
     // explicitly.
 
     /**
@@ -146,10 +161,12 @@ public record UserProfileResponse(
      * @param settlement       resolved label parts of {@code user.getCityId()}, or {@code null}
      *                         when no city is set / unresolved — supplies
      *                         {@code citySettlementType} and {@code cityHromadaNameUk}
+     * @param phoneRequiredBy  B516 — {@code PhoneRequirementPolicy#phoneRequiredBy} for this user, resolved by the
+     *                         caller (no clock / config here)
      */
     public static UserProfileResponse from(
             User user, String districtName, UUID oblastId, boolean hasMasterProfile,
-            SettlementDisplayNames settlement) {
+            SettlementDisplayNames settlement, LocalDate phoneRequiredBy) {
         return new UserProfileResponse(
                 user.getId(),
                 user.getEmail(),
@@ -175,7 +192,9 @@ public record UserProfileResponse(
                 hasMasterProfile,
                 settlement == null ? null : settlement.settlementType(),
                 settlement == null ? null : settlement.hromadaNameUk(),
-                user.getAvatarUrl()
+                user.getAvatarUrl(),
+                user.isPhoneVerified(),
+                phoneRequiredBy
         );
     }
 }

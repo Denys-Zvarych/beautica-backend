@@ -7,6 +7,7 @@ import org.springframework.data.repository.query.Param;
 
 import java.time.Instant;
 import java.util.Optional;
+import java.util.UUID;
 
 public interface PhoneOtpRepository extends JpaRepository<PhoneOtp, Long> {
 
@@ -17,6 +18,27 @@ public interface PhoneOtpRepository extends JpaRepository<PhoneOtp, Long> {
      */
     Optional<PhoneOtp> findTopByPhoneAndPurposeAndUsedFalseAndExpiresAtAfterOrderByIdDesc(
             String phone, PhoneOtpPurpose purpose, Instant now);
+
+    /**
+     * B516 (AUTH-44) — the newest live code of a USER-BOUND purpose issued to {@code userId}: another account's code
+     * for the same phone is never returned.
+     */
+    Optional<PhoneOtp> findTopByPhoneAndPurposeAndUserIdAndUsedFalseAndExpiresAtAfterOrderByIdDesc(
+            String phone, PhoneOtpPurpose purpose, UUID userId, Instant now);
+
+    /** B516 — per-account send cap (AUTH-44); served by {@code idx_phone_otps_user_id}. */
+    int countByUserIdAndCreatedAtAfter(UUID userId, Instant since);
+
+    /**
+     * B516 — serialises concurrent signed-in sends of ONE account (the per-account cap counts across all its phones,
+     * so the per-phone lock alone lets an account spread parallel sends over several numbers past the cap). Same
+     * transaction-scoped advisory lock + fused 3 s {@code lock_timeout} shape as {@link #lockPhoneForSend}; the key is
+     * namespaced ({@code 'phone-otp-user:'} prefix) so it never shares a hash bucket by construction with a phone key.
+     * Taken BEFORE the phone lock on every user-bound send (one global order: user, then phone — no deadlock).
+     */
+    @Query(value = "SELECT 1 FROM (SELECT set_config('lock_timeout', '3s', true), "
+            + "pg_advisory_xact_lock(hashtext('phone-otp-user:' || CAST(:userId AS text)))) AS l", nativeQuery = true)
+    int lockUserForSend(@Param("userId") UUID userId);
 
     /**
      * Rate-limit counter: how many OTPs this phone has requested since {@code since}, across EVERY

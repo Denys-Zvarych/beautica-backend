@@ -10,5 +10,13 @@ public enum PhoneOtpPurpose {
     REGISTRATION,
     PHONE_ADD,
     PHONE_CHANGE,
-    PASSWORD_RESET
+    PASSWORD_RESET;
+
+    /**
+     * B516 (AUTH-44) — the code belongs to a signed-in account ({@code phone_otps.user_id}) and is redeemable only by
+     * that account ({@link PhoneOtpService#consumeCode(String, String, PhoneOtpPurpose, java.util.UUID)}).
+     */
+    public boolean isUserBound() {
+        return this == PHONE_ADD || this == PHONE_CHANGE;
+    }
 }

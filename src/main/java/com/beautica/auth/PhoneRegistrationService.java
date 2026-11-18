@@ -94,9 +94,9 @@ public class PhoneRegistrationService {
      * Flushes so a concurrent claim of the same phone hits {@code ux_users_verified_phone} here, as a clean
      * 409 {@code PHONE_ALREADY_REGISTERED}, instead of a 500 at commit. The transaction is rollback-only afterwards
      * either way. The ONE save path for every flow that persists a user with a verified phone (self-registration,
-     * invite accept — {@link InviteService}); never re-implement the index-name match.
+     * invite accept — {@link InviteService}; B516 add / change phone — {@code UserPhoneService}); never re-implement the index-name match.
      */
-    static User saveClaimingPhone(UserRepository userRepository, User user) {
+    public static User saveClaimingPhone(UserRepository userRepository, User user) {
         try {
             return userRepository.saveAndFlush(user);
         } catch (DataIntegrityViolationException e) {

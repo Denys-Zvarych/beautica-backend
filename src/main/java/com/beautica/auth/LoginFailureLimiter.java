@@ -3,6 +3,7 @@ package com.beautica.auth;
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.github.benmanes.caffeine.cache.Ticker;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.time.Clock;
@@ -22,22 +23,40 @@ import java.util.concurrent.TimeUnit;
  *
  * <p>In memory (Caffeine, bounded, single instance — the same deployment model as the Bucket4j buckets). The
  * ticker reads the injected {@link Clock} so tests can pin time (Anti-Bug §G). Keys are never logged.
+ *
+ * <p>B516 audit-fix cycle 3 (security) — the per-ACCOUNT current-password lockout (AUTH-D19,
+ * {@link #tryAcquireAccountAttempt} / {@link #resetAccount}) lives in its OWN bounded cache with the same threshold and
+ * window, so a flood of failed logins filling the (identifier, IP) cache can never evict an account's lock.
  */
 @Component
 public class LoginFailureLimiter {
 
-    static final int MAX_FAILURES = 10;
-    static final Duration LOCK_WINDOW = Duration.ofMinutes(15);
+    public static final int MAX_FAILURES = 10;
+    public static final Duration LOCK_WINDOW = Duration.ofMinutes(15);
     private static final long MAX_TRACKED_IDENTIFIERS = 100_000;
+    /** One entry per signed-in account that typed a wrong current password inside the window. */
+    private static final long MAX_TRACKED_ACCOUNTS = 100_000;
     /** Neither a normalised email nor a {@code +380} phone nor an IP literal contains a newline. */
     private static final String KEY_SEPARATOR = "\n";
 
     private final Cache<String, Integer> failures;
+    private final Cache<String, Integer> accountFailures;
 
+    @Autowired
     public LoginFailureLimiter(Clock clock) {
+        this(clock, MAX_TRACKED_IDENTIFIERS, MAX_TRACKED_ACCOUNTS);
+    }
+
+    /** Test seam: small bounds so a test can overflow the login cache. */
+    LoginFailureLimiter(Clock clock, long maxTrackedPairs, long maxTrackedAccounts) {
         Ticker ticker = () -> TimeUnit.MILLISECONDS.toNanos(clock.millis());
-        this.failures = Caffeine.newBuilder()
-                .maximumSize(MAX_TRACKED_IDENTIFIERS)
+        this.failures = newCounterCache(ticker, maxTrackedPairs);
+        this.accountFailures = newCounterCache(ticker, maxTrackedAccounts);
+    }
+
+    private static Cache<String, Integer> newCounterCache(Ticker ticker, long maximumSize) {
+        return Caffeine.newBuilder()
+                .maximumSize(maximumSize)
                 .expireAfterWrite(LOCK_WINDOW)
                 .ticker(ticker)
                 .build();
@@ -57,6 +76,35 @@ public class LoginFailureLimiter {
     /** A successful login clears the count of the identifier from that IP. */
     public void reset(String identifierKey, String clientIp) {
         failures.invalidate(key(identifierKey, clientIp));
+    }
+
+    /**
+     * B516 (AUTH-D19) — atomically claims one current-password attempt for {@code accountKey} BEFORE the password is
+     * checked: {@code false} (nothing written) once the account holds {@value #MAX_FAILURES} counted attempts inside
+     * the window, else the attempt is counted and {@code true} returned. Counting first and clearing on success
+     * ({@link #resetAccount}) means concurrent requests can never get more than {@value #MAX_FAILURES} password checks
+     * between them (a check-then-record race could). Kept in the account cache, never the login one.
+     */
+    public boolean tryAcquireAccountAttempt(String accountKey) {
+        Integer current = accountFailures.getIfPresent(accountKey);
+        if (current != null && current >= MAX_FAILURES) {
+            return false; // fast path: no write, so a locked key's window is not restarted
+        }
+        boolean[] acquired = {false};
+        accountFailures.asMap().compute(accountKey, (k, count) -> {
+            int value = count == null ? 0 : count;
+            if (value >= MAX_FAILURES) {
+                return count;
+            }
+            acquired[0] = true;
+            return value + 1;
+        });
+        return acquired[0];
+    }
+
+    /** The correct current password clears the account's count. */
+    public void resetAccount(String accountKey) {
+        accountFailures.invalidate(accountKey);
     }
 
     /** Number of tracked (identifier, IP) pairs — for tests of the cache-flood guard. */

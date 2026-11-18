@@ -136,6 +136,8 @@ public abstract class AbstractIntegrationTest {
         jdbcTemplate.execute("DELETE FROM phone_otps");
         // B514 (V244): phone_registration_tickets has no FK either way (phone + hash only).
         jdbcTemplate.execute("DELETE FROM phone_registration_tickets");
+        // B516 (V245): user_pending_emails.user_id -> users(id) ON DELETE CASCADE; deleted explicitly first (§O-7).
+        jdbcTemplate.execute("DELETE FROM user_pending_emails");
         jdbcTemplate.execute("DELETE FROM users");
         // Phase 368 (V195): singleton environment stamp; no FK. Only staging/prod boots write it.
         jdbcTemplate.execute("DELETE FROM deployment_environment");

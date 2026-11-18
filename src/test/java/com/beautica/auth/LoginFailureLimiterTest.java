@@ -90,4 +90,37 @@ class LoginFailureLimiterTest {
         assertThat(limiter.isLocked(KEY, IP)).isTrue();
         assertThat(limiter.isLocked(KEY, OTHER_IP)).isFalse();
     }
+
+    @Test
+    @DisplayName("a flood of failed logins past the login cache bound never evicts an account's current-password lock")
+    void should_keepAccountLock_when_loginCacheOverflowed() {
+        int smallBound = 8;
+        LoginFailureLimiter limiter = new LoginFailureLimiter(clock, smallBound, smallBound);
+        String account = "current-password:33333333-3333-3333-3333-333333333333";
+        for (int i = 0; i < LoginFailureLimiter.MAX_FAILURES; i++) {
+            limiter.tryAcquireAccountAttempt(account);
+        }
+
+        for (int i = 0; i < smallBound * 50; i++) {
+            limiter.recordFailure("+38050" + String.format("%07d", i), IP);
+        }
+        long trackedPairs = limiter.trackedCount();
+
+        assertThat(trackedPairs).isLessThanOrEqualTo(smallBound);
+        assertThat(limiter.tryAcquireAccountAttempt(account)).isFalse();
+    }
+
+    @Test
+    @DisplayName("the correct current password clears the account count")
+    void should_clearAccountCount_when_resetAccount() {
+        LoginFailureLimiter limiter = new LoginFailureLimiter(clock);
+        String account = "current-password:33333333-3333-3333-3333-333333333333";
+        for (int i = 0; i < LoginFailureLimiter.MAX_FAILURES; i++) {
+            limiter.tryAcquireAccountAttempt(account);
+        }
+
+        limiter.resetAccount(account);
+
+        assertThat(limiter.tryAcquireAccountAttempt(account)).isTrue();
+    }
 }

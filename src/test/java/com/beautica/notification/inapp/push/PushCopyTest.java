@@ -427,7 +427,10 @@ class PushCopyTest {
                         // phase 372: a category name and the admin's reject reason (free text, never on a lock screen)
                         "categoryName", "decisionReason",
                         // phase 415: an enum (content kind of a moderation outcome), never free text
-                        "contentKind");
+                        "contentKind",
+                        // B516 (AUTH-D19): the account's OWN masked phone / email for the in-app feed only; PushCopy
+                        // never renders it (SecurityNoticePushCopyTest pins the lock-screen body without it)
+                        "maskedContact");
     }
 
     @Test

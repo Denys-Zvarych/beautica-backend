@@ -27,6 +27,7 @@ import java.util.EnumMap;
 import java.util.HexFormat;
 import java.util.Map;
 import java.util.Optional;
+import java.util.UUID;
 import java.util.regex.Pattern;
 
 /**
@@ -55,6 +56,8 @@ public class PhoneOtpService {
     private static final int MAX_SENDS_PER_WINDOW = 3;
     private static final Duration RATE_LIMIT_WINDOW = Duration.ofMinutes(15);
     private static final Duration OTP_TTL = Duration.ofMinutes(10);
+    /** B516 (AUTH-12) — a password-reset code by SMS keeps the reset OTP lifetime (15 min), not the 10-min OTP one. */
+    private static final Duration PASSWORD_RESET_OTP_TTL = Duration.ofMinutes(15);
     private static final int CODE_BOUND_EXCLUSIVE = 1_000_000; // 000000..999999
     private static final String GENERIC_VERIFY_FAILURE = "Invalid or expired code";
     /** Phase 440 — delivered OTP SMS per format (tag {@code format}); naming as {@code beautica.guest_message}. */
@@ -137,13 +140,27 @@ public class PhoneOtpService {
      */
     @Transactional(propagation = Propagation.NOT_SUPPORTED)
     public void sendCode(String phone, String requestedFormat, PhoneOtpPurpose purpose) {
+        sendCode(phone, requestedFormat, purpose, null);
+    }
+
+    /**
+     * B516 (AUTH-44) — as {@link #sendCode(String, String, PhoneOtpPurpose)}, with the signed-in owner of a
+     * {@link PhoneOtpPurpose#isUserBound() user-bound} code. The row carries {@code userId}, only
+     * {@link #consumeCode(String, String, PhoneOtpPurpose, UUID)} with the same id redeems it, and on top of the
+     * per-phone cap the account gets the same {@value #MAX_SENDS_PER_WINDOW} sends per 15 min across all its phones.
+     *
+     * @throws IllegalArgumentException when {@code userId} is missing for a user-bound purpose or present otherwise
+     */
+    @Transactional(propagation = Propagation.NOT_SUPPORTED)
+    public void sendCode(String phone, String requestedFormat, PhoneOtpPurpose purpose, UUID userId) {
+        requireOwnerMatchesPurpose(purpose, userId);
         if (phone == null || !E164_UA.matcher(phone).matches()) {
             throw new BusinessException(HttpStatus.BAD_REQUEST, "Invalid phone format");
         }
         OtpSmsFormat format = resolveFormat(requestedFormat);
 
         String code = generateCode();
-        Long otpId = requiresNewTx.execute(status -> issueOtpRow(phone, code, purpose));
+        Long otpId = requiresNewTx.execute(status -> issueOtpRow(phone, code, purpose, userId));
 
         dispatchCode(phone, code, otpId, format);
         invalidateOlderCodesQuietly(phone, purpose, otpId);
@@ -167,16 +184,25 @@ public class PhoneOtpService {
      * provider outage cannot be used to kill a victim's live code. The lock serialises the
      * count-then-insert per phone so concurrent sends cannot all pass the cap.
      */
-    private Long issueOtpRow(String phone, String code, PhoneOtpPurpose purpose) {
+    private Long issueOtpRow(String phone, String code, PhoneOtpPurpose purpose, UUID userId) {
+        if (userId != null) {
+            // B516: the per-account cap is counted under a per-ACCOUNT lock (always taken before the phone lock).
+            phoneOtpRepository.lockUserForSend(userId);
+        }
         phoneOtpRepository.lockPhoneForSend(phone);
 
         Instant now = clock.instant();
-        int recentSends = phoneOtpRepository.countByPhoneAndCreatedAtAfter(phone, now.minus(RATE_LIMIT_WINDOW));
-        if (recentSends >= MAX_SENDS_PER_WINDOW) {
+        Instant windowStart = now.minus(RATE_LIMIT_WINDOW);
+        int recentSends = phoneOtpRepository.countByPhoneAndCreatedAtAfter(phone, windowStart);
+        // B516: per-account cap for signed-in sends, counted under the account lock taken above.
+        boolean accountCapped = userId != null
+                && phoneOtpRepository.countByUserIdAndCreatedAtAfter(userId, windowStart) >= MAX_SENDS_PER_WINDOW;
+        if (recentSends >= MAX_SENDS_PER_WINDOW || accountCapped) {
             throw new BusinessException(HttpStatus.TOO_MANY_REQUESTS, "OTP limit exceeded");
         }
 
-        PhoneOtp otp = PhoneOtp.issue(phone, sha256Hex(code), now.plus(OTP_TTL), purpose, null);
+        Duration ttl = purpose == PhoneOtpPurpose.PASSWORD_RESET ? PASSWORD_RESET_OTP_TTL : OTP_TTL;
+        PhoneOtp otp = PhoneOtp.issue(phone, sha256Hex(code), now.plus(ttl), purpose, userId);
         phoneOtpRepository.save(otp);
         return otp.getId();
     }
@@ -279,10 +305,50 @@ public class PhoneOtpService {
      */
     @Transactional
     public boolean consumeCode(String phone, String code, PhoneOtpPurpose purpose) {
+        requireOwnerMatchesPurpose(purpose, null);
         Instant now = clock.instant();
-        Optional<PhoneOtp> active = phoneOtpRepository
-                .findTopByPhoneAndPurposeAndUsedFalseAndExpiresAtAfterOrderByIdDesc(phone, purpose, now);
+        return redeem(phoneOtpRepository
+                .findTopByPhoneAndPurposeAndUsedFalseAndExpiresAtAfterOrderByIdDesc(phone, purpose, now), code);
+    }
 
+    /**
+     * B516 (AUTH-44) — as {@link #consumeCode(String, String, PhoneOtpPurpose)} for a user-bound purpose: only a code
+     * issued to {@code userId} for {@code phone} is considered, so one account can never redeem another account's
+     * PHONE_ADD / PHONE_CHANGE code (the other account's row is invisible here and counts as "no code").
+     */
+    @Transactional
+    public boolean consumeCode(String phone, String code, PhoneOtpPurpose purpose, UUID userId) {
+        requireOwnerMatchesPurpose(purpose, userId);
+        Instant now = clock.instant();
+        return redeem(phoneOtpRepository
+                .findTopByPhoneAndPurposeAndUserIdAndUsedFalseAndExpiresAtAfterOrderByIdDesc(
+                        phone, purpose, userId, now), code);
+    }
+
+    /**
+     * B516 (AUTH-D19) — a wrong current password on a {@link PhoneOtpPurpose#PHONE_CHANGE} verify counts as one failed
+     * try on the caller's newest live code: the same per-code cap ({@link PhoneOtp#MAX_VERIFY_ATTEMPTS}, then the code
+     * is burnt) and the same REQUIRES_NEW recorder as a wrong code, so the count survives the caller's rollback.
+     *
+     * @return {@code false} when {@code userId} holds no live code for {@code phone} (nothing to count against)
+     */
+    @Transactional
+    public boolean recordFailedAttempt(String phone, PhoneOtpPurpose purpose, UUID userId) {
+        requireOwnerMatchesPurpose(purpose, userId);
+        Optional<PhoneOtp> active = phoneOtpRepository
+                .findTopByPhoneAndPurposeAndUserIdAndUsedFalseAndExpiresAtAfterOrderByIdDesc(
+                        phone, purpose, userId, clock.instant());
+        active.ifPresent(otp -> attemptRecorder.recordFailedAttempt(otp.getId(), PhoneOtp.MAX_VERIFY_ATTEMPTS));
+        return active.isPresent();
+    }
+
+    private static void requireOwnerMatchesPurpose(PhoneOtpPurpose purpose, UUID userId) {
+        if (purpose.isUserBound() != (userId != null)) {
+            throw new IllegalArgumentException("Owner does not match OTP purpose " + purpose);
+        }
+    }
+
+    private boolean redeem(Optional<PhoneOtp> active, String code) {
         if (active.isEmpty()) {
             return false;
         }

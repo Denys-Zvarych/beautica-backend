@@ -339,6 +339,13 @@ app:
     # B514 (AUTH-02, AUTH-43) — false: register / invite accept still take the legacy email shape. Flip to true only
     # after M515 is the Play minimum (APP_ANDROID_MIN_VERSION_CODE), same order as require-terms-consent.
     require-phone-registration: ${APP_AUTH_REQUIRE_PHONE_REGISTRATION:false}
+    # B516 (AUTH-45) — false: no server-side phone gate. Flip to true only after M517 is the Play minimum. When true,
+    # an APP booking by a CLIENT without a verified phone, and a provider write after phone-provider-deadline, -> 409
+    # PHONE_NOT_VERIFIED.
+    require-verified-phone: ${APP_AUTH_REQUIRE_VERIFIED_PHONE:false}
+    # B516 (AUTH-45, D1) — ISO date (Europe/Kyiv), ~ release + 30 days: last day an existing provider may work
+    # without a verified phone; GET /users/me phoneRequiredBy for providers. Blank = no deadline.
+    phone-provider-deadline: ${APP_PHONE_PROVIDER_DEADLINE:}
     # B514 (AUTH-54) — Firebase App Check on endpoints that send an SMS. ENFORCE here (prod); staging overlay
     # LOG_ONLY, local/test OFF. A mode other than OFF needs the project number and at least one app id (boot fails
     # otherwise); prod refuses OFF (EnvironmentFingerprintGuard rule prod-app-check-off).

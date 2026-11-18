@@ -586,6 +586,32 @@ public class EmailNotificationService {
         }
     }
 
+    /**
+     * B516 (AUTH-D19) — the security-notice email after a phone change (to the confirmed email) or an email change
+     * (to the PREVIOUS confirmed email). Carries only the masked new value and the fixed support line — never a code.
+     * Fire-and-forget from {@code emailExecutor}: a delivery failure is logged by {@link #send} (template + class
+     * only) and dropped, the change itself is already committed.
+     */
+    public void sendContactChangedEmail(String to, ContactChangeKind kind, String maskedNewValue) {
+        if (lacksRecipient(to, "sendContactChangedEmail")) {
+            return;
+        }
+        var ctx = new Context();
+        ctx.setVariable("phone", kind == ContactChangeKind.PHONE);
+        ctx.setVariable("maskedValue", maskedNewValue);
+        try {
+            send(to, contactChangedSubject(kind), "email/contact-changed", ctx);
+        } catch (EmailDeliveryException alreadyLogged) {
+            log.debug("sendContactChangedEmail dropped after a logged delivery failure");
+        }
+    }
+
+    static String contactChangedSubject(ContactChangeKind kind) {
+        return kind == ContactChangeKind.PHONE
+                ? "Beautica: номер телефону змінено"
+                : "Beautica: email для сповіщень змінено";
+    }
+
     public void sendVerificationEmail(String to, String rawOtp) {
         if (lacksRecipient(to, "sendVerificationEmail")) {
             return;

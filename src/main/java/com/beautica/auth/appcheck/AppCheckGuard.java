@@ -9,6 +9,8 @@ import jakarta.servlet.http.HttpServletRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
+import org.springframework.web.context.request.RequestContextHolder;
+import org.springframework.web.context.request.ServletRequestAttributes;
 import org.springframework.web.servlet.HandlerMapping;
 
 import java.util.concurrent.ConcurrentHashMap;
@@ -72,6 +74,34 @@ public class AppCheckGuard {
         throw new IdentityException(result == AppCheckVerifier.Result.UNAVAILABLE
                 ? IdentityException.Code.APP_CHECK_UNAVAILABLE
                 : IdentityException.Code.APP_CHECK_FAILED);
+    }
+
+    /**
+     * B516 (AUTH-54) — the guard for endpoints that send an SMS on ONE branch only (forgot-password by phone,
+     * change-password by SMS): the service calls this right before choosing the SMS branch, so the controller needs
+     * no servlet plumbing. Outside a request (no bound {@link HttpServletRequest}) the token counts as missing — fail
+     * closed in ENFORCE.
+     *
+     * @throws IdentityException as {@link #check}
+     */
+    public void checkCurrentRequest() {
+        if (properties.getMode() == AppCheckMode.OFF) {
+            return;
+        }
+        HttpServletRequest request = RequestContextHolder.getRequestAttributes() instanceof ServletRequestAttributes attrs
+                ? attrs.getRequest()
+                : null;
+        if (request != null) {
+            check(request);
+            return;
+        }
+        AppCheckMode mode = properties.getMode();
+        AppCheckVerifier.Result result = verifier.verify(null);
+        count(result, UNKNOWN_ENDPOINT, mode);
+        log.warn("app-check rejected reason={} endpoint={} mode={}", result.tag(), UNKNOWN_ENDPOINT, mode);
+        if (mode == AppCheckMode.ENFORCE) {
+            throw new IdentityException(IdentityException.Code.APP_CHECK_FAILED);
+        }
     }
 
     private void count(AppCheckVerifier.Result result, String endpoint, AppCheckMode mode) {

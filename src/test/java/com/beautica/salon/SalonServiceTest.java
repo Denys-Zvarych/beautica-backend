@@ -851,7 +851,7 @@ class SalonServiceTest {
         // owner's cityId through the same resolver (UserService#resolveSettlement). So what must
         // hold is: the SYNCED cityId resolves to VINNYTSIA's parts on the owner's own response.
         var ownerView = com.beautica.user.UserProfileResponse.from(owner, null, null, false,
-                settlementDisplayNameResolver.resolve(owner.getCityId()).orElse(null));
+                settlementDisplayNameResolver.resolve(owner.getCityId()).orElse(null), null);
         assertThat(ownerView.citySettlementType()).isEqualTo(VINNYTSIA.settlementType());
         assertThat(ownerView.cityHromadaNameUk()).isEqualTo(VINNYTSIA.hromadaNameUk());
         verify(userProfileCacheEvictor).evictAfterCommit(ownerId);
