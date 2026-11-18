@@ -35,6 +35,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 
+import static com.beautica.booking.repository.ReminderFeedTargetFixtures.reminderFeedTarget;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
@@ -51,20 +52,24 @@ import static org.mockito.Mockito.when;
 class BookingReminderJobTest {
 
     @Mock private BookingRepository bookingRepository;
+    @Mock private org.springframework.transaction.PlatformTransactionManager transactionManager;
     @Mock private ApplicationEventPublisher events;
     @Mock private NotificationOutboxService outboxService;
     @Mock private com.beautica.notification.inapp.service.InAppNotificationService inAppNotificationService;
 
     private BookingReminderJob job;
+    private io.micrometer.core.instrument.simple.SimpleMeterRegistry meters;
     private ListAppender<ILoggingEvent> logAppender;
     private Logger jobLogger;
 
     @BeforeEach
     void setUp() {
         Clock clock = Clock.fixed(OffsetDateTime.parse("2026-06-01T10:00:00Z").toInstant(), ZoneOffset.UTC);
+        meters = new io.micrometer.core.instrument.simple.SimpleMeterRegistry();
         job = new BookingReminderJob(bookingRepository, new BookingSmsProperties(), events, clock,
-                new io.micrometer.core.instrument.simple.SimpleMeterRegistry(), com.beautica.booking.crypto.GuestCancelTokenCipherFixtures.testPageLinks("https://beautica.app"),
-                new RegisteredBookingReminderSweep(bookingRepository, outboxService, inAppNotificationService));
+                meters, com.beautica.booking.crypto.GuestCancelTokenCipherFixtures.testPageLinks("https://beautica.app"),
+                new RegisteredBookingReminderSweep(bookingRepository, outboxService, inAppNotificationService),
+                transactionManager);
         logAppender = new ListAppender<>();
         logAppender.start();
         jobLogger = (Logger) LoggerFactory.getLogger(BookingReminderJob.class);
@@ -268,7 +273,8 @@ class BookingReminderJobTest {
         job = new BookingReminderJob(bookingRepository, properties, events,
                 Clock.fixed(OffsetDateTime.parse("2026-06-01T10:00:00Z").toInstant(), ZoneOffset.UTC),
                 new io.micrometer.core.instrument.simple.SimpleMeterRegistry(), com.beautica.booking.crypto.GuestCancelTokenCipherFixtures.testPageLinks("https://beautica.app"),
-                new RegisteredBookingReminderSweep(bookingRepository, outboxService, inAppNotificationService));
+                new RegisteredBookingReminderSweep(bookingRepository, outboxService, inAppNotificationService),
+                transactionManager);
         Booking walkIn = walkInBooking("+380503333333", "Акція! пишіть на example.test");
         when(bookingRepository.findGuestBookingsForReminder(any(), any(), org.mockito.ArgumentMatchers.eq(true)))
                 .thenReturn(List.of(walkIn));
@@ -425,14 +431,15 @@ class BookingReminderJobTest {
         when(bookingRepository.findRegisteredBookingsForReminder(any(), any(), any()))
                 .thenReturn(List.of(candidate(first), candidate(second)));
         when(bookingRepository.findReminderFeedTargetsByIds(List.of(first, second))).thenReturn(List.of(
-                feedTarget(first, clientId, salonId, firstStart), feedTarget(second, clientId, null, secondStart)));
+                reminderFeedTarget(first, clientId, salonId, firstStart), reminderFeedTarget(second, clientId, null, secondStart)));
 
         // Act
         job.sendReminders();
 
         // Assert
         verify(inAppNotificationService).notifyBookingRemindersBulk(List.of(
-                feedTarget(first, clientId, salonId, firstStart), feedTarget(second, clientId, null, secondStart)));
+                reminderFeedTarget(first, clientId, salonId, firstStart), reminderFeedTarget(second, clientId, null, secondStart)),
+                com.beautica.notification.service.ReminderKind.H24);
         org.mockito.Mockito.verifyNoMoreInteractions(inAppNotificationService);
         verify(bookingRepository, never()).findAllById(any());
     }
@@ -481,6 +488,60 @@ class BookingReminderJobTest {
         verifyNoInteractions(outboxService);
     }
 
+    @Test
+    @DisplayName("B522 audit-fix cycle 2: the registered 24 h leg throws → the guest 24 h reminder is still "
+            + "published, the failure is counted and logged by class name only")
+    void should_publishGuestReminder_when_registeredDayBeforeLegThrows() {
+        // Arrange
+        when(bookingRepository.findRegisteredBookingsForReminder(any(), any(), any()))
+                .thenThrow(new IllegalStateException("secret +380501111111"));
+        when(bookingRepository.findGuestBookingsForReminder(any(), any(), anyBoolean()))
+                .thenReturn(List.of(guestBooking("+380501111111")));
+
+        // Act
+        job.sendReminders();
+
+        // Assert
+        assertThat(publishedEvent().reminders()).hasSize(1);
+        assertThat(meters.counter(BookingReminderJob.REMINDER_METRIC, "type", "h24", "outcome",
+                BookingReminderJob.OUTCOME_REGISTERED_FAILED).count()).isEqualTo(1.0);
+        assertThat(logAppender.list).anySatisfy(e -> assertThat(e.getFormattedMessage())
+                .contains("IllegalStateException").doesNotContain("secret").doesNotContain("+380"));
+        verifyNoInteractions(outboxService, inAppNotificationService);
+    }
+
+    @Test
+    @DisplayName("B522 audit-fix cycle 2: the registered 24 h leg (claim + outbox) finishes BEFORE the job opens the "
+            + "guest leg's transaction, and the job opens exactly one transaction (the guest leg's)")
+    void should_runRegisteredLegOutsideGuestTransaction_when_dayBeforeSweepRuns() {
+        // Arrange
+        UUID bookingId = UUID.randomUUID();
+        when(bookingRepository.findRegisteredBookingsForReminder(any(), any(), any()))
+                .thenReturn(List.of(candidate(bookingId)));
+        org.mockito.InOrder order = org.mockito.Mockito.inOrder(bookingRepository, outboxService, transactionManager);
+
+        // Act
+        job.sendReminders();
+
+        // Assert
+        order.verify(bookingRepository).claimRegisteredRemindersByIds(List.of(bookingId));
+        order.verify(outboxService).enqueueBookingReminder(bookingId, ReminderKind.H24, CLAIM_TICK);
+        order.verify(transactionManager).getTransaction(any());
+        order.verify(bookingRepository).findGuestBookingsForReminder(any(), any(), anyBoolean());
+        order.verify(transactionManager).commit(any());
+        verify(transactionManager, times(1)).getTransaction(any());
+    }
+
+    @Test
+    @DisplayName("B522 audit-fix cycle 2: the 24 h sweep is no longer @Transactional (the legs own their transactions)")
+    void should_notBeTransactional_when_dayBeforeSweepDeclared() throws NoSuchMethodException {
+        assertThat(BookingReminderJob.class.getMethod("sendReminders")
+                .isAnnotationPresent(org.springframework.transaction.annotation.Transactional.class)).isFalse();
+        assertThat(RegisteredBookingReminderSweep.class.getMethod("remindDayBefore", OffsetDateTime.class)
+                .getAnnotation(org.springframework.transaction.annotation.Transactional.class).propagation())
+                .isEqualTo(org.springframework.transaction.annotation.Propagation.REQUIRES_NEW);
+    }
+
     /** The pinned sweep tick — the claim instant every enqueued row carries. */
     private static final java.time.Instant CLAIM_TICK = java.time.Instant.parse("2026-06-01T10:00:00Z");
 
@@ -496,18 +557,7 @@ class BookingReminderJobTest {
         @Override public java.time.Instant getCreatedAt() { return createdAt; }
     }
 
-    private static BookingRepository.ReminderFeedTarget feedTarget(UUID id, UUID clientId, UUID salonId,
-                                                                  OffsetDateTime startsAt) {
-        return new FeedTarget(id, clientId, salonId, startsAt);
-    }
 
-    private record FeedTarget(UUID id, UUID clientId, UUID salonId, OffsetDateTime startsAt)
-            implements BookingRepository.ReminderFeedTarget {
-        @Override public UUID getId() { return id; }
-        @Override public UUID getClientId() { return clientId; }
-        @Override public UUID getSalonId() { return salonId; }
-        @Override public OffsetDateTime getStartsAt() { return startsAt; }
-    }
 
     private Booking walkInBooking(String phone, String customServiceName) {
         User user = new User("m@beautica.test", "x", com.beautica.auth.Role.SALON_MASTER, "Марія", "Левченко", null);

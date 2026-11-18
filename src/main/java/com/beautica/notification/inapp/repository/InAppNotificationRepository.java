@@ -285,7 +285,9 @@ public interface InAppNotificationRepository extends Repository<InAppNotificatio
      * {@code notifyBookingEvent}/{@code notifyVisitEvent} use, so each row is byte-identical to what those
      * per-event calls would write (the SQL-LATERAL shape of {@link #insertProviderSetBulk} would re-derive the
      * salon from {@code masters.salon_id}, not the booking's own salon, and could not express the decline
-     * recipient set). Driven by {@code users} like {@link #insertForRecipients}; {@code subject_user_id} stays
+     * recipient set). Driven by {@code users} like {@link #insertForRecipients} — deliberately NOT filtered to
+     * active accounts (per-event parity; the reminder sweep filters inactive clients in its own target read,
+     * {@code BookingRepository#findReminderFeedTargetsByIds}); {@code subject_user_id} stays
      * {@code NULL}. A {@code NULL} array element ({@code booking_id} of a visit-keyed row, {@code salon_id} of an
      * independent master) is bound as SQL {@code NULL}.
      *

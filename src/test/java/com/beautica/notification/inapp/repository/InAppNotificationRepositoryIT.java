@@ -1521,6 +1521,39 @@ class InAppNotificationRepositoryIT extends AbstractDataJpaTest {
     }
 
     @Test
+    @DisplayName("B522 audit-fix cycle 2: insertEventRowsBulk still writes for a deactivated recipient — per-event "
+            + "parity with insertForRecipients (NTF-40 mass decline); the reminder filters in its own target read")
+    void should_writeForInactiveRecipient_when_insertEventRowsBulk() {
+        jdbcTemplate.update("UPDATE users SET is_active = false WHERE id = ?", teammate.getId());
+
+        int written = repository.insertEventRowsBulk("BOOKING_REMINDER",
+                new UUID[] {client.getId(), teammate.getId()}, new UUID[] {booking.getId(), booking.getId()},
+                new UUID[] {null, null}, new UUID[] {salon.getId(), salon.getId()},
+                new String[] {"BOOKING_REMINDER:" + booking.getId() + ":1", "BOOKING_REMINDER:" + booking.getId() + ":2"});
+
+        assertThat(written).isEqualTo(2);
+        assertThat(jdbcTemplate.queryForList("SELECT recipient_user_id FROM in_app_notification", UUID.class))
+                .containsExactlyInAnyOrder(client.getId(), teammate.getId());
+    }
+
+    @Test
+    @DisplayName("B522 audit-fix cycle 2: insertEventRowsBulkWithPush still writes for a deactivated recipient — "
+            + "feed row and push, per-event parity with insertForRecipientsWithPush")
+    void should_writeForInactiveRecipient_when_insertEventRowsBulkWithPush() {
+        giveEveryUserAToken();
+        jdbcTemplate.update("UPDATE users SET is_active = false WHERE id = ?", teammate.getId());
+
+        repository.insertEventRowsBulkWithPush("BOOKING_REMINDER",
+                new UUID[] {client.getId(), teammate.getId()}, new UUID[] {booking.getId(), booking.getId()},
+                new UUID[] {null, null}, new UUID[] {salon.getId(), salon.getId()},
+                new String[] {"BOOKING_REMINDER:" + booking.getId() + ":1", "BOOKING_REMINDER:" + booking.getId() + ":2"});
+
+        assertThat(jdbcTemplate.queryForList("SELECT recipient_user_id FROM in_app_notification", UUID.class))
+                .containsExactlyInAnyOrder(client.getId(), teammate.getId());
+        assertThat(countPushRows()).isEqualTo(2);
+    }
+
+    @Test
     @DisplayName("a duplicate write (same dedup key) writes ZERO feed rows and ZERO outbox rows")
     void should_writeNoPushRow_when_dedupSuppressesFeedRow() {
         giveEveryUserAToken();

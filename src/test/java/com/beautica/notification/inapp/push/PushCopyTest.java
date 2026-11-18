@@ -76,6 +76,20 @@ class PushCopyTest {
     }
 
     @Test
+    @DisplayName("B522: BOOKING_REMINDER body at the 2 h tick: «сьогодні о HH:mm — counterpart», no note / phone")
+    void should_renderToday_when_twoHourReminderPushPrepared() {
+        Clock twoHoursBefore = clockAt("2026-10-03T09:30:00Z"); // 12:30 Kyiv, the 14:30 visit 2 h later
+        NotificationParams params = new NotificationParams(
+                "Салон Бута", "Манікюр", 1, STARTS_AT, "Салон Бута", "Ірина Мельник", null, null);
+
+        String body = PushCopy.body(InAppNotificationType.BOOKING_REMINDER, true, params, twoHoursBefore);
+
+        assertThat(body).isEqualTo(BookingReminderPushExpectedCopy.body(
+                        "Манікюр", BookingReminderPushExpectedCopy.TODAY, "14:30", "Салон Бута"))
+                .doesNotContain("@", "+380", "Ірина");
+    }
+
+    @Test
     @DisplayName("BOOKING_REMINDER body, 23:30 tick → 00:15 visit two Kyiv dates later: the short date, not «завтра»")
     void should_renderShortDate_when_visitIsTwoKyivDaysAway() {
         // 2026-11-16 23:30 Kyiv (EET, UTC+2, Monday) → visit 2026-11-18 00:15 Kyiv (Wednesday), 24 h 45 min later.
