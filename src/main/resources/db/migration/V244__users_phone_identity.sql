@@ -2,6 +2,12 @@
 -- Reason: one nullable column added, one NOT NULL dropped (email), one partial unique index over an empty predicate
 -- set, two CHECKs that hold on every existing row, one nullable FK column, one defaulted column and one new table.
 --
+-- contract-of: V87
+-- Why contract-of V87: the one hit the non-destructive marker cannot cover is the FK on V87's phone_otps
+-- (ADD COLUMN user_id UUID REFERENCES users (id) ON DELETE CASCADE). The FK sits on a NEW nullable column: every
+-- existing row gets NULL (the FK holds trivially, nothing to backfill or validate) and the previous app version never
+-- reads or writes user_id, so a rollback to it on this schema is safe.
+--
 -- V244 — Phase B514 (phone-first identity, AUTH-D08..D15): phone registration + login by phone or email.
 --
 -- users

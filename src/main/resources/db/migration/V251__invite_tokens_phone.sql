@@ -1,3 +1,9 @@
+-- contract-of: V1
+-- Why contract-of V1: this file reshapes V1's invite_tokens; the flagged step is the FK of the NEW nullable column
+-- invited_by (ADD COLUMN invited_by UUID REFERENCES users (id) ON DELETE SET NULL). Every existing row gets NULL (the
+-- FK holds trivially, nothing to backfill or validate) and the previous app version never reads or writes invited_by,
+-- so a rollback to it on this schema is safe.
+--
 -- B520 (AUTH-16, AUTH-18, AUTH-52, SAL-48) — staff invites go to a Ukrainian mobile number by SMS; the email
 -- invite path is retired in the same release.
 --
