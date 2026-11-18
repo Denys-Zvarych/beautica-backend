@@ -8,6 +8,7 @@ import com.beautica.salon.repository.SalonRepository;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.OwnerType;
 import com.beautica.service.entity.ServiceDefinition;
+import com.beautica.service.repository.BookableAssignmentDurationRow;
 import com.beautica.service.repository.MasterServiceRepository;
 import com.beautica.service.repository.ServiceRepository;
 import org.springframework.cache.annotation.Cacheable;
@@ -16,6 +17,8 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Clock;
 import java.time.LocalDate;
+import java.util.Collection;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -97,9 +100,10 @@ public class BookingMasterService {
     /**
      * Ids of {@code masterId}'s {@code master_services} rows that pass the strict free-slot verdict —
      * the client view of {@code GET /masters/{id}/services} ({@code MasterServiceBookabilityFilter}).
-     * Candidates from {@link MasterServiceRepository#findBookableAssignmentsByMasterIds} (the
+     * Candidates from {@link MasterServiceRepository#findBookableAssignmentDurationsByMasterIds} (the
      * master-scoped sibling of the salon catalogue finder, same ownership rule) through the single
-     * {@link SlotCalculationService#filterBookableAssignmentsBatch} call — the catalogue's verdict.
+     * {@link SlotCalculationService#filterBookableDurationsBatch} call — the catalogue's verdict
+     * (the duration-row overload of the same gate).
      *
      * <p><b>Cached (perf + security audit 2026-10-05, finding 2).</b> The caller backs a
      * {@code permitAll} read, and the batch walks up to the 180-day horizon for a master with no
@@ -116,23 +120,49 @@ public class BookingMasterService {
     @Transactional(readOnly = true)
     @Cacheable(value = BOOKABLE_ASSIGNMENTS_CACHE, key = "{#masterId}", sync = true)
     public Set<UUID> getBookableAssignmentIds(UUID masterId) {
-        return bookableAssignmentsByMaster(
-                masterServiceRepository.findBookableAssignmentsByMasterIds(List.of(masterId)))
-                .values().stream()
-                .flatMap(List::stream)
-                .map(MasterServiceAssignment::getId)
-                .collect(Collectors.toUnmodifiableSet());
+        return computeBookableAssignmentIds(List.of(masterId)).get(masterId);
     }
 
-    /** Groups candidates by master and applies the ONE shared free-slot batch gate. */
-    private Map<UUID, List<MasterServiceAssignment>> bookableAssignmentsByMaster(
-            List<MasterServiceAssignment> candidates) {
-        Map<UUID, List<MasterServiceAssignment>> candidatesByMaster = candidates.stream()
-                .collect(Collectors.groupingBy(a -> a.getMaster().getId()));
-        if (candidatesByMaster.isEmpty()) {
-            return Map.of();
+    /**
+     * The {@value #BOOKABLE_ASSIGNMENTS_CACHE} key for {@code masterId} — equal (by the
+     * {@link List} contract) to the one-element list the {@code {#masterId}} SpEL key of
+     * {@link #getBookableAssignmentIds} produces. Exposed so the bulk reader
+     * ({@code StrictBookableResolver}, search SRCH-30/31) reads and fills the SAME entries this
+     * method caches and the by-master sweeps evict; the key format stays owned here.
+     */
+    public static Object bookableAssignmentsCacheKey(UUID masterId) {
+        return List.of(masterId);
+    }
+
+    /**
+     * Uncached multi-master form of {@link #getBookableAssignmentIds}: every requested master
+     * maps to its strict bookable assignment ids (an empty set when none pass) — ONE candidate
+     * load plus ONE {@link SlotCalculationService#filterBookableDurationsBatch} call for the
+     * whole set, the same verdict by construction (the single-master method delegates here).
+     * Callers own caching; see {@link #bookableAssignmentsCacheKey}.
+     *
+     * <p>Candidates are the narrow {@link BookableAssignmentDurationRow} projection, bound as ONE
+     * {@code uuid[]} (B523 perf fix): a cold search resolve sends up to 2 000 masters here, and the
+     * former managed-entity graph dominated its cost. The gate reads only the duration columns.
+     */
+    @Transactional(readOnly = true)
+    public Map<UUID, Set<UUID>> computeBookableAssignmentIds(Collection<UUID> masterIds) {
+        Map<UUID, Set<UUID>> result = new LinkedHashMap<>();
+        if (masterIds.isEmpty()) {
+            return result;
         }
-        return slotCalculationService.filterBookableAssignmentsBatch(candidatesByMaster);
+        Map<UUID, List<BookableAssignmentDurationRow>> candidatesByMaster = masterServiceRepository
+                .findBookableAssignmentDurationsByMasterIds(masterIds.toArray(UUID[]::new)).stream()
+                .collect(Collectors.groupingBy(BookableAssignmentDurationRow::getMasterId));
+        Map<UUID, List<BookableAssignmentDurationRow>> gated = candidatesByMaster.isEmpty()
+                ? Map.of()
+                : slotCalculationService.filterBookableDurationsBatch(candidatesByMaster);
+        for (UUID masterId : masterIds) {
+            result.put(masterId, gated.getOrDefault(masterId, List.of()).stream()
+                    .map(BookableAssignmentDurationRow::getAssignmentId)
+                    .collect(Collectors.toUnmodifiableSet()));
+        }
+        return result;
     }
 
     /**

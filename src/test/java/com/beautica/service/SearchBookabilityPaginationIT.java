@@ -21,7 +21,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * Search counts and pagination under the bookability gate: {@code totalElements}/{@code totalPages}
  * must count exactly the rows a client can page through — non-bookable providers are excluded from
  * the COUNT as well as the content, and a salon with several bookable masters (which the bookable
- * rows join can multiply) is counted and returned ONCE.
+ * rows join can multiply) is counted and returned ONCE. Since SRCH-30/31 (2026-11-18) the gate is
+ * the strict free-slot verdict, fed into the paged SQL as an id set, so pages stay exact.
  */
 @DisplayName("Search pagination + totals respect the bookability gate (full HTTP + real Postgres)")
 class SearchBookabilityPaginationIT extends AbstractIntegrationTest {
@@ -125,6 +126,55 @@ class SearchBookabilityPaginationIT extends AbstractIntegrationTest {
         List<String> seen = pageThrough("/api/v1/search/salons?q=Lumina", "salonId", 2, List.of(2));
 
         assertThat(seen).containsExactlyInAnyOrder(a.toString(), b.toString());
+    }
+
+    @Test
+    @DisplayName("master browse (SRCH-30): 3 strictly bookable + 3 structurally bookable masters with every "
+            + "remaining working day off, interleaved; size=2 → totalElements 3, pages 2/1, no holes")
+    void should_countAndPageOnlyStrictlyBookableMasters_when_strictFilterRemovesRowsMidPage() throws Exception {
+        List<String> bookable = new ArrayList<>();
+        for (int i = 0; i < 3; i++) {
+            UUID id = BookableMasterSeeder.insertIndependentMaster(jdbcTemplate, "Strict" + (char) ('a' + i));
+            BookableMasterSeeder.makeIndependentBookable(jdbcTemplate, id);
+            bookable.add(id.toString());
+            UUID daysOff = BookableMasterSeeder.insertIndependentMaster(jdbcTemplate, "Dayoff" + (char) ('a' + i));
+            BookableMasterSeeder.assignNewIndependentService(jdbcTemplate, daysOff);
+            BookableMasterSeeder.seedEveryRemainingDayOff(jdbcTemplate, daysOff);
+        }
+
+        List<String> seen = pageThrough("/api/v1/search/masters", "masterId", 3, List.of(2, 1));
+
+        assertThat(seen).containsExactlyInAnyOrderElementsOf(bookable);
+    }
+
+    @Test
+    @DisplayName("salon browse (SRCH-31): 2 bookable salons + 1 mixing a bookable and a days-off master + "
+            + "2 whose only master has every remaining day off; size=2 → totalElements 3, pages 2/1")
+    void should_countAndPageOnlyStrictlyBookableSalons_when_strictFilterRemovesSalonsMidPage() throws Exception {
+        List<String> bookable = new ArrayList<>();
+        for (String name : List.of("Alfa Strict", "Gamma Strict")) {
+            UUID salon = BookableMasterSeeder.insertSalon(jdbcTemplate, name);
+            BookableMasterSeeder.addBookableSalonMaster(jdbcTemplate, salon);
+            bookable.add(salon.toString());
+        }
+        UUID mixed = BookableMasterSeeder.insertSalon(jdbcTemplate, "Epsilon Strict");
+        BookableMasterSeeder.addBookableSalonMaster(jdbcTemplate, mixed);
+        bookable.add(mixed.toString());
+        List<UUID> daysOffMasters = new ArrayList<>();
+        daysOffMasters.add(BookableMasterSeeder.insertSalonMaster(jdbcTemplate, mixed));
+        for (String name : List.of("Beta Strict", "Delta Strict")) {
+            UUID salon = BookableMasterSeeder.insertSalon(jdbcTemplate, name);
+            daysOffMasters.add(BookableMasterSeeder.insertSalonMaster(jdbcTemplate, salon));
+        }
+        for (UUID master : daysOffMasters) {
+            UUID salonId = jdbcTemplate.queryForObject("SELECT salon_id FROM masters WHERE id = ?", UUID.class, master);
+            BookableMasterSeeder.assignNewSalonService(jdbcTemplate, salonId, master);
+            BookableMasterSeeder.seedEveryRemainingDayOff(jdbcTemplate, master);
+        }
+
+        List<String> seen = pageThrough("/api/v1/search/salons", "salonId", 3, List.of(2, 1));
+
+        assertThat(seen).containsExactlyInAnyOrderElementsOf(bookable);
     }
 
     // ── helpers ─────────────────────────────────────────────────────────────────────────────

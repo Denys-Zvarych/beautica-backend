@@ -164,4 +164,52 @@ public interface WeeklyScheduleRepository extends JpaRepository<WeeklySchedule, 
             WHERE ws.id = :scheduleId
             """)
     Optional<WeeklySchedule> findByIdWithIntervals(@Param("scheduleId") UUID scheduleId);
+
+    /**
+     * Narrow-projection twin of {@link #findOverlappingRangeWithIntervalsByMasterIds} for the batched
+     * free-slot gate (B523 perf fix): the same overlap predicate and the same
+     * {@code master, valid_from DESC, id} order (so the per-master fold picks the same covering
+     * template), but one flat row per (template, interval) instead of managed entities — no entity
+     * hydration and no persistence-context growth over up to 2 000 masters.
+     *
+     * <p>The ids are JOINED as {@code unnest(CAST(:masterIds AS uuid[]))} — one bind whatever the set
+     * size, and the join drives {@code idx_weekly_schedules_master_window} from the array — the
+     * {@code MasterServiceRepository#findBookableAssignmentDurationsByMasterIds} pattern. The ids must
+     * be distinct; callers MUST short-circuit an empty array.
+     */
+    @Query(value = """
+            SELECT ws.id          AS scheduleId,
+                   ws.master_id   AS masterId,
+                   ws.valid_from  AS validFrom,
+                   ws.valid_to    AS validTo,
+                   wi.day_of_week AS dayOfWeek,
+                   wi.start_time  AS startTime,
+                   wi.end_time    AS endTime
+            FROM unnest(CAST(:masterIds AS uuid[])) AS req(master_id)
+            JOIN weekly_schedules ws ON ws.master_id = req.master_id
+            LEFT JOIN working_intervals wi ON wi.schedule_id = ws.id
+            WHERE ws.valid_from <= :to
+              AND (ws.valid_to IS NULL OR ws.valid_to >= :from)
+            ORDER BY ws.master_id, ws.valid_from DESC, ws.id ASC
+            """, nativeQuery = true)
+    List<ScheduleTemplateIntervalRow> findTemplateIntervalRowsByMasterIds(
+            @Param("masterIds") UUID[] masterIds,
+            @Param("from") LocalDate from,
+            @Param("to") LocalDate to);
+
+    /**
+     * The discrete start times of the given templates in ONE statement — the projection counterpart of
+     * the lazy {@code WeeklySchedule.discreteTimes} batch fetch, for templates loaded through
+     * {@link #findTemplateIntervalRowsByMasterIds}. Served by
+     * {@code idx_working_interval_times_schedule_day}. Callers MUST short-circuit an empty array.
+     */
+    @Query(value = """
+            SELECT wit.schedule_id AS scheduleId,
+                   wit.day_of_week AS dayOfWeek,
+                   wit.slot_time   AS slotTime
+            FROM unnest(CAST(:scheduleIds AS uuid[])) AS req(schedule_id)
+            JOIN working_interval_times wit ON wit.schedule_id = req.schedule_id
+            """, nativeQuery = true)
+    List<ScheduleTemplateTimeRow> findTemplateTimeRowsByScheduleIds(
+            @Param("scheduleIds") UUID[] scheduleIds);
 }

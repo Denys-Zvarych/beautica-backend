@@ -3,7 +3,9 @@ package com.beautica.service;
 import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.LoginRequest;
 import com.beautica.auth.dto.RegisterIndependentMasterRequest;
+import com.beautica.booking.dto.CreateBookingRequest;
 import com.beautica.common.ApiResponse;
+import com.beautica.common.TimeZones;
 import com.beautica.service.dto.BulkCreateServicesRequest;
 import com.beautica.service.dto.BulkServiceItemRequest;
 import com.beautica.service.dto.CreateServiceDefinitionRequest;
@@ -28,6 +30,9 @@ import org.springframework.security.crypto.password.PasswordEncoder;
 import java.io.InputStream;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
+import java.time.LocalDate;
+import java.time.LocalTime;
+import java.time.ZonedDateTime;
 import java.util.List;
 import java.util.Locale;
 import java.util.UUID;
@@ -301,6 +306,24 @@ public class ServiceTestFixtures {
                 .isEqualTo(HttpStatus.OK);
         var body = objectMapper.readValue(resp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
         return body.data().accessToken();
+    }
+
+    /**
+     * Books {@code masterId}'s 10:00 Kyiv slot on {@code day} for its single active service through
+     * the real {@code POST /bookings} API (as a fresh CLIENT), asserting 201 — so every write-path
+     * eviction a real booking triggers runs. Shared by the strict-bookability ITs (B523).
+     */
+    public void bookTenOClockSlot(UUID masterId, LocalDate day) throws Exception {
+        UUID assignmentId = jdbcTemplate.queryForObject(
+                "SELECT id FROM master_services WHERE master_id = ? AND is_active = true", UUID.class, masterId);
+        String clientToken = createClientAndGetToken("strict-book-" + System.nanoTime() + "@beautica.test");
+        ResponseEntity<String> booked = restTemplate.exchange("/api/v1/bookings", HttpMethod.POST,
+                new HttpEntity<>(new CreateBookingRequest(masterId, assignmentId,
+                        ZonedDateTime.of(day, LocalTime.of(10, 0), TimeZones.KYIV),
+                        null, null, false),
+                        bearerHeaders(clientToken)),
+                String.class);
+        assertThat(booked.getStatusCode()).as(booked.getBody()).isEqualTo(HttpStatus.CREATED);
     }
 
     /**

@@ -469,15 +469,10 @@ class SearchSuggestionIT extends AbstractIntegrationTest {
                             + "&serviceTypeSlugs=" + service.path("serviceTypeSlug").asText()
                             + "&page=0&size=20",
                     HttpMethod.GET, anonymous(), String.class));
-            long salonsTotal = totalElements(restTemplate.exchange(
-                    SALONS_URL + "?location.cityId=" + cityId
-                            + "&category=" + service.path("categoryKey").asText()
-                            + "&serviceTypeSlugs=" + service.path("serviceTypeSlug").asText()
-                            + "&page=0&size=20",
-                    HttpMethod.GET, anonymous(), String.class));
 
-            assertThat(mastersTotal + salonsTotal)
-                    .as("a SERVICE suggestion must never open an empty results page for the same place")
+            assertThat(mastersTotal)
+                    .as("a SERVICE suggestion must never open an empty master results page for the same place "
+                            + "(the seeded performer is an independent master)")
                     .isGreaterThanOrEqualTo(1L);
         }
 
@@ -485,13 +480,14 @@ class SearchSuggestionIT extends AbstractIntegrationTest {
         JsonNode categorySuggestions = data(get("?q=" + queryPrefix(categoryLabel(typeA.categoryKey()))
                 + "&location.cityId=" + cityId));
         JsonNode categoryRow = findByType(categorySuggestions, "CATEGORY", null);
-        if (categoryRow != null) {
-            long mastersTotal = totalElements(restTemplate.exchange(
-                    MASTERS_URL + "?location.cityId=" + cityId + "&q=" + categoryRow.path("label").asText()
-                            + "&page=0&size=20",
-                    HttpMethod.GET, anonymous(), String.class));
-            assertThat(mastersTotal).isGreaterThanOrEqualTo(0L); // q-as-category is a weaker guarantee; smoke only
-        }
+        assertThat(categoryRow).as("a CATEGORY suggestion for typeA's category label").isNotNull();
+        long categoryMastersTotal = totalElements(restTemplate.exchange(
+                MASTERS_URL + "?location.cityId=" + cityId + "&q=" + categoryRow.path("label").asText()
+                        + "&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class));
+        assertThat(categoryMastersTotal)
+                .as("q = the CATEGORY label must list the master whose service is in that category (SRCH-33)")
+                .isGreaterThanOrEqualTo(1L);
     }
 
     private long totalElements(ResponseEntity<String> response) throws Exception {

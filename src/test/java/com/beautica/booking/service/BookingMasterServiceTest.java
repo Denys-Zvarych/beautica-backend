@@ -1,8 +1,7 @@
 package com.beautica.booking.service;
 
-import com.beautica.master.entity.Master;
 import com.beautica.salon.repository.SalonRepository;
-import com.beautica.service.entity.MasterServiceAssignment;
+import com.beautica.service.repository.BookableAssignmentDurationRow;
 import com.beautica.service.repository.MasterServiceRepository;
 import com.beautica.service.repository.ServiceRepository;
 import org.junit.jupiter.api.BeforeEach;
@@ -22,6 +21,7 @@ import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
@@ -30,7 +30,7 @@ import static org.mockito.Mockito.when;
 /**
  * Unit tests for the master-scoped strict verdict added for the detail {@code bookable} flags and
  * the client view of {@code GET /masters/{id}/services}. The free-slot walk itself is
- * {@link SlotCalculationService#filterBookableAssignmentsBatch} (mocked here; covered by its own
+ * {@link SlotCalculationService#filterBookableDurationsBatch} (mocked here; covered by its own
  * suites) — these tests pin the candidate loading, grouping and projection around it.
  */
 @ExtendWith(MockitoExtension.class)
@@ -54,7 +54,7 @@ class BookingMasterServiceTest {
     @DisplayName("getBookableAssignmentIds — no candidate assignment means no batch call, empty result")
     void should_skipBatch_when_noCandidateAssignments() {
         UUID masterId = UUID.randomUUID();
-        when(masterServiceRepository.findBookableAssignmentsByMasterIds(List.of(masterId))).thenReturn(List.of());
+        when(masterServiceRepository.findBookableAssignmentDurationsByMasterIds(onlyMaster(masterId))).thenReturn(List.of());
 
         Set<UUID> result = service.getBookableAssignmentIds(masterId);
 
@@ -66,16 +66,16 @@ class BookingMasterServiceTest {
     @DisplayName("getBookableAssignmentIds — a master the batch gates out entirely yields an empty set")
     void should_returnEmpty_when_batchGatesOutEveryAssignment() {
         UUID masterId = UUID.randomUUID();
-        MasterServiceAssignment only = assignment(UUID.randomUUID(), masterId);
-        when(masterServiceRepository.findBookableAssignmentsByMasterIds(List.of(masterId)))
+        BookableAssignmentDurationRow only = assignment(UUID.randomUUID(), masterId);
+        when(masterServiceRepository.findBookableAssignmentDurationsByMasterIds(onlyMaster(masterId)))
                 .thenReturn(List.of(only));
-        when(slotCalculationService.filterBookableAssignmentsBatch(any()))
+        when(slotCalculationService.filterBookableDurationsBatch(any()))
                 .thenReturn(Map.of(masterId, List.of()));
 
         Set<UUID> result = service.getBookableAssignmentIds(masterId);
 
         assertThat(result).isEmpty();
-        verify(slotCalculationService).filterBookableAssignmentsBatch(Map.of(masterId, List.of(only)));
+        verify(slotCalculationService).filterBookableDurationsBatch(Map.of(masterId, List.of(only)));
     }
 
     @Test
@@ -83,11 +83,11 @@ class BookingMasterServiceTest {
     void should_returnSurvivingAssignmentIds_when_batchGates() {
         UUID masterId = UUID.randomUUID();
         UUID keptId = UUID.randomUUID();
-        MasterServiceAssignment kept = assignment(keptId, masterId);
-        MasterServiceAssignment dropped = assignment(UUID.randomUUID(), masterId);
-        when(masterServiceRepository.findBookableAssignmentsByMasterIds(List.of(masterId)))
+        BookableAssignmentDurationRow kept = assignment(keptId, masterId);
+        BookableAssignmentDurationRow dropped = assignment(UUID.randomUUID(), masterId);
+        when(masterServiceRepository.findBookableAssignmentDurationsByMasterIds(onlyMaster(masterId)))
                 .thenReturn(List.of(kept, dropped));
-        when(slotCalculationService.filterBookableAssignmentsBatch(any()))
+        when(slotCalculationService.filterBookableDurationsBatch(any()))
                 .thenReturn(Map.of(masterId, List.of(kept)));
 
         Set<UUID> result = service.getBookableAssignmentIds(masterId);
@@ -95,12 +95,15 @@ class BookingMasterServiceTest {
         assertThat(result).containsExactly(keptId);
     }
 
-    private static MasterServiceAssignment assignment(UUID assignmentId, UUID masterId) {
-        Master master = mock(Master.class);
-        when(master.getId()).thenReturn(masterId);
-        MasterServiceAssignment msa = mock(MasterServiceAssignment.class);
-        org.mockito.Mockito.lenient().when(msa.getId()).thenReturn(assignmentId);
-        when(msa.getMaster()).thenReturn(master);
-        return msa;
+    /** Matches the one-element {@code uuid[]} bind for {@code masterId}. */
+    private static UUID[] onlyMaster(UUID masterId) {
+        return argThat(ids -> java.util.Arrays.equals(ids, new UUID[] {masterId}));
+    }
+
+    private static BookableAssignmentDurationRow assignment(UUID assignmentId, UUID masterId) {
+        BookableAssignmentDurationRow row = mock(BookableAssignmentDurationRow.class);
+        org.mockito.Mockito.lenient().when(row.getAssignmentId()).thenReturn(assignmentId);
+        when(row.getMasterId()).thenReturn(masterId);
+        return row;
     }
 }

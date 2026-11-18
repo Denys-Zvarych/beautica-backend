@@ -1,7 +1,6 @@
 package com.beautica.service;
 
 import com.beautica.AbstractIntegrationTest;
-import com.beautica.booking.dto.CreateBookingRequest;
 import com.beautica.common.TimeZones;
 import com.beautica.config.TestSecurityConfig;
 import com.beautica.service.dto.AssignServiceToMasterRequest;
@@ -24,7 +23,6 @@ import org.springframework.security.crypto.password.PasswordEncoder;
 import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.time.LocalTime;
-import java.time.ZonedDateTime;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -34,9 +32,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * The public salon roster ({@code GET /salons/{id}/masters}, {@code GET /masters/by-salon/{id}})
  * lists only client-visible masters — the CHEAP structural rule ({@code MasterBookabilitySql}: ≥1
- * active, correctly-owned service AND working hours within the 180-day horizon), the same predicate
- * discovery search applies. It never walks the free-slot calendar: a FULLY BOOKED master stays
- * listed. User report: an auto-enrolled owner-master with no services and no hours appeared in a
+ * active, correctly-owned service AND working hours within the 180-day horizon) narrows the
+ * candidates, then the strict free-slot verdict search uses (SAL-09, SRCH-30, 2026-11-18) decides: a
+ * FULLY BOOKED master is not listed. User report: an auto-enrolled owner-master with no services and no hours appeared in a
  * client's «Майстри» tab. The management roster {@code GET /salons/{id}/staff} stays unfiltered.
  *
  * <p>Fixture per salon: an owner-master auto-enrolled by the real {@code POST /salons} path (no
@@ -171,9 +169,9 @@ class SalonPublicRosterVisibilityIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("A FULLY BOOKED master (service + hours, but every slot taken) IS listed — the roster "
-            + "uses the cheap rule, never the free-slot calendar, matching search")
-    void should_listMaster_when_masterIsFullyBooked() throws Exception {
+    @DisplayName("A FULLY BOOKED master (service + hours, but every slot taken) is NOT listed — the roster "
+            + "uses the strict free-slot verdict (SAL-09), and the booking evicts the cached verdict")
+    void should_hideMaster_when_masterIsFullyBooked() throws Exception {
         SalonRoster roster = seedRoster("full");
         UUID fullyBooked = fixtures.createSalonMaster(roster.salonId());
         BookableMasterSeeder.assignNewSalonService(jdbcTemplate, roster.salonId(), fullyBooked);
@@ -181,24 +179,17 @@ class SalonPublicRosterVisibilityIT extends AbstractIntegrationTest {
         // Its ONLY hours: one 60-min window for a 60-min service — exactly one slot.
         BookableMasterSeeder.seedCustomHoursOverride(jdbcTemplate, fullyBooked, day,
                 LocalTime.of(10, 0), LocalTime.of(11, 0));
-        UUID assignmentId = jdbcTemplate.queryForObject(
-                "SELECT id FROM master_services WHERE master_id = ? AND is_active = true", UUID.class, fullyBooked);
         assertThat(servicesTab(fullyBooked)).as("precondition: one free slot — service bookable").hasSize(1);
         String clientToken = fixtures.createClientAndGetToken("client-full-" + System.nanoTime() + "@beautica.test");
 
-        ResponseEntity<String> booked = restTemplate.exchange("/api/v1/bookings", HttpMethod.POST,
-                new HttpEntity<>(new CreateBookingRequest(fullyBooked, assignmentId,
-                        ZonedDateTime.of(day, LocalTime.of(10, 0), TimeZones.KYIV), null, null, false),
-                        fixtures.bearerHeaders(clientToken)),
-                String.class);
+        fixtures.bookTenOClockSlot(fullyBooked, day);
 
-        assertThat(booked.getStatusCode()).as(booked.getBody()).isEqualTo(HttpStatus.CREATED);
         assertThat(servicesTab(fullyBooked))
                 .as("the only slot is taken — the strict free-slot verdict now says unbookable").isEmpty();
         assertThat(masterIds(getPage("/api/v1/salons/" + roster.salonId() + "/masters", null)))
-                .containsExactlyInAnyOrder(roster.configuredMasterId().toString(), fullyBooked.toString());
+                .containsExactly(roster.configuredMasterId().toString());
         assertThat(masterIds(getPage("/api/v1/masters/by-salon/" + roster.salonId(), clientToken)))
-                .containsExactlyInAnyOrder(roster.configuredMasterId().toString(), fullyBooked.toString());
+                .containsExactly(roster.configuredMasterId().toString());
     }
 
     @Test
@@ -297,7 +288,76 @@ class SalonPublicRosterVisibilityIT extends AbstractIntegrationTest {
                         roster.configuredMasterId().toString(), second.toString(), third.toString());
     }
 
+    @Test
+    @DisplayName("SAL-09: masters with no free slot (every remaining day off; only service longer than the "
+            + "day) are dropped mid-roster — both endpoints return identical exact pages (3 rows, 2/1)")
+    void should_returnIdenticalExactPages_when_strictVerdictRemovesMastersMidRoster() throws Exception {
+        SalonRoster roster = seedRoster("strictpaging");
+        UUID daysOff = fixtures.createSalonMaster(roster.salonId());
+        seedEveryRemainingDayOff(roster.salonId(), daysOff);
+        UUID second = fixtures.createSalonMaster(roster.salonId());
+        BookableMasterSeeder.makeBookable(jdbcTemplate, roster.salonId(), second);
+        UUID tooLong = fixtures.createSalonMaster(roster.salonId());
+        seedOnlyUnfittableService(roster.salonId(), tooLong);
+        UUID third = fixtures.createSalonMaster(roster.salonId());
+        BookableMasterSeeder.makeBookable(jdbcTemplate, roster.salonId(), third);
+        String clientToken = fixtures.createClientAndGetToken("client-strict-" + System.nanoTime() + "@beautica.test");
+        String query = "?size=2&sort=createdAt,asc&page=";
+        List<String> seen = new ArrayList<>();
+
+        for (int page = 0; page < 2; page++) {
+            JsonNode salons = getPage("/api/v1/salons/" + roster.salonId() + "/masters" + query + page, null);
+            JsonNode bySalon = getPage("/api/v1/masters/by-salon/" + roster.salonId() + query + page, clientToken);
+
+            assertThat(bySalon.path("data")).as("page %d rows (incl. order)", page).isEqualTo(salons.path("data"));
+            assertThat(salons.path("totalElements").asLong()).as("page %d total", page).isEqualTo(3);
+            assertThat(salons.path("totalPages").asInt()).as("page %d totalPages", page).isEqualTo(2);
+            assertThat(masterIds(salons)).as("page %d size", page).hasSize(page == 0 ? 2 : 1);
+            seen.addAll(masterIds(salons));
+        }
+
+        assertThat(seen).containsExactlyInAnyOrder(
+                roster.configuredMasterId().toString(), second.toString(), third.toString());
+    }
+
+    @Test
+    @DisplayName("SAL-09/SAL-10: every structurally bookable master has no free slot → both public "
+            + "endpoints return an empty page with total 0, while «Команда» still lists them")
+    void should_returnEmptyRoster_when_noMasterHasAFreeSlot() throws Exception {
+        String ownerEmail = "owner-roster-nofree-" + System.nanoTime() + "@beautica.test";
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(ownerEmail);
+        UUID salonId = fixtures.createSalon(ownerToken, "Public Roster nofree");
+        UUID daysOff = fixtures.createSalonMaster(salonId);
+        seedEveryRemainingDayOff(salonId, daysOff);
+        UUID tooLong = fixtures.createSalonMaster(salonId);
+        seedOnlyUnfittableService(salonId, tooLong);
+        String clientToken = fixtures.createClientAndGetToken("client-nofree-" + System.nanoTime() + "@beautica.test");
+
+        JsonNode salonsPage = getPage("/api/v1/salons/" + salonId + "/masters", null);
+        JsonNode bySalonPage = getPage("/api/v1/masters/by-salon/" + salonId, clientToken);
+
+        assertThat(masterIds(salonsPage)).as("/salons/{id}/masters rows").isEmpty();
+        assertThat(salonsPage.path("totalElements").asLong()).as("/salons/{id}/masters total").isZero();
+        assertThat(masterIds(bySalonPage)).as("/masters/by-salon/{id} rows").isEmpty();
+        assertThat(bySalonPage.path("totalElements").asLong()).as("/masters/by-salon/{id} total").isZero();
+        assertThat(staffMasterIds(salonId, ownerToken)).as("«Команда» is not gated (SAL-10)")
+                .contains(daysOff.toString(), tooLong.toString());
+    }
+
     // ── helpers ─────────────────────────────────────────────────────────────────────────────
+
+    /** Service + the shared "every remaining day off" schedule ({@link BookableMasterSeeder}). */
+    private void seedEveryRemainingDayOff(UUID salonId, UUID masterId) {
+        BookableMasterSeeder.assignNewSalonService(jdbcTemplate, salonId, masterId);
+        BookableMasterSeeder.seedEveryRemainingDayOff(jdbcTemplate, masterId);
+    }
+
+    /** Usable 09:00–17:00 schedule but the only service lasts 540 min — it never fits a day. */
+    private void seedOnlyUnfittableService(UUID salonId, UUID masterId) {
+        UUID defId = BookableMasterSeeder.assignNewSalonService(jdbcTemplate, salonId, masterId);
+        jdbcTemplate.update("UPDATE service_definitions SET base_duration_minutes = 540 WHERE id = ?", defId);
+        BookableMasterSeeder.seedUsableSchedule(jdbcTemplate, masterId);
+    }
 
     /** Master ids (rows with a masterId) of the management roster {@code GET /salons/{id}/staff}. */
     private List<String> staffMasterIds(UUID salonId, String token) throws Exception {

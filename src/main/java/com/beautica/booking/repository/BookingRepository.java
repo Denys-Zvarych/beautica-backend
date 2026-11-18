@@ -1151,36 +1151,35 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
 
     /**
      * Phase 315 (D1/D4) — the multi-master sibling of {@link #findActiveTimeRangesByMasterInRange},
-     * used ONLY by the salon catalogue's batched bookability gate
-     * ({@code SlotCalculationService#filterBookableAssignmentsBatch}), which resolves every distinct
-     * master in a salon in ONE statement instead of one per master (the N+1 this phase kills).
+     * used ONLY by the batched bookability gate ({@code SlotCalculationService#filterBookableBatch}:
+     * the salon catalogue, the wish list and the strict search verdict), which resolves every master
+     * in ONE statement instead of one per master.
      *
-     * <p>Same predicate, same index ({@code idx_bookings_master_slot_overlap}), same
-     * {@code [windowStart, windowEnd)} semantics as the single-master finder — only the {@code =} became
-     * an {@code IN}, and the projection widened to {@link BookingMasterTimeRange} so the batched result
-     * can be regrouped by master in memory (a batched result set has no per-row caller-side anchor the
-     * way a single-master call does). {@link BookingTimeRange} and the single-master finder are
-     * UNTOUCHED — every existing consumer keeps its exact query and shape.
+     * <p>Same predicate, same index ({@code idx_bookings_master_slot_overlap}, partial on
+     * {@code status = 'CONFIRMED'}), same {@code [windowStart, windowEnd)} semantics as the
+     * single-master finder. {@code ORDER BY master_id, starts_at} keeps each master's rows contiguous
+     * and in the single-master order.
      *
-     * <p><b>{@code ORDER BY b.master.id, b.startsAt ASC} (D4).</b> The {@code startsAt ASC} tail
-     * preserves the ordering the single-master query has always returned within one master; the
-     * leading {@code master.id} groups each master's rows contiguously so the caller's regroup is a
-     * single linear pass, not a second sort.
-     *
-     * <p>No {@code IN}-list chunking (D11): Postgres' bind-parameter ceiling is 65535, two orders of
-     * magnitude above the largest conceivable salon's master count.
+     * <p><b>B523 perf fix — native {@code unnest}.</b> The ids are JOINED as
+     * {@code unnest(CAST(:masterIds AS uuid[]))} — one bind whatever the set size (the strict search
+     * passes up to 2 000 masters), driving the overlap index per master — the
+     * {@code MasterServiceRepository#findBookableAssignmentDurationsByMasterIds} pattern; it replaced
+     * the JPQL {@code IN :masterIds} form, which expanded one bind parameter per id. The ids must be
+     * distinct; callers MUST short-circuit an empty array.
      */
-    @Query("""
-            SELECT new com.beautica.booking.repository.BookingMasterTimeRange(b.master.id, b.startsAt, b.endsAt)
-            FROM Booking b
-            WHERE b.master.id IN :masterIds
-              AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
-              AND b.startsAt < :windowEnd
-              AND b.endsAt   > :windowStart
-            ORDER BY b.master.id, b.startsAt ASC
-            """)
+    @Query(value = """
+            SELECT b.master_id AS masterId,
+                   b.starts_at AS startsAt,
+                   b.ends_at   AS endsAt
+            FROM unnest(CAST(:masterIds AS uuid[])) AS req(master_id)
+            JOIN bookings b ON b.master_id = req.master_id
+            WHERE b.status = 'CONFIRMED'
+              AND b.starts_at < :windowEnd
+              AND b.ends_at   > :windowStart
+            ORDER BY b.master_id, b.starts_at ASC
+            """, nativeQuery = true)
     List<BookingMasterTimeRange> findActiveTimeRangesByMasterIdsInRange(
-            @Param("masterIds") Collection<UUID> masterIds,
+            @Param("masterIds") UUID[] masterIds,
             @Param("windowStart") OffsetDateTime windowStart,
             @Param("windowEnd") OffsetDateTime windowEnd
     );

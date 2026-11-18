@@ -135,6 +135,8 @@ class OwnerMasterCacheTest {
     @MockBean com.beautica.common.cache.MasterProfileCacheEvictor masterProfileCacheEvictor;
     // MasterService ctor dependency: public-roster gate's :bookableToday (getMastersByPage).
     @MockBean com.beautica.master.service.ScheduleDateMath scheduleDateMath;
+    // MasterService ctor dependency: the public roster's strict verdict (SAL-09).
+    @MockBean com.beautica.search.service.StrictBookableResolver strictBookableResolver;
 
     @Autowired MasterService masterService;
     @Autowired CacheManager cacheManager;

@@ -144,13 +144,16 @@ class BookabilityRuleEdgeCasesIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("a weekly template ending TODAY still counts (boundary): listed")
-    void should_listMaster_when_weeklyTemplateEndsToday() throws Exception {
+    @DisplayName("a weekly template ending TODAY still counts structurally (boundary, MAS-02): favourite listed; "
+            + "search is strict (SRCH-30) and time-of-day dependent, so it is not asserted here")
+    void should_keepFavouriteMasterVisible_when_weeklyTemplateEndsToday() throws Exception {
         UUID masterId = independentWithService("Ultima");
         BookableMasterSeeder.seedWeeklyTemplate(jdbcTemplate, masterId, today().minusDays(30), today(), true);
-        // Structural half only: the strict free-slot half legitimately turns false once today's
-        // 17:00 has passed ("fully booked right now" stays listed by design).
-        assertThat(masterSearch("Ultima")).containsExactly(masterId.toString());
+        String clientToken = fixtures.createClientAndGetToken("end-" + System.nanoTime() + "@beautica.test");
+        http.addFavorite(clientToken, FavoriteTargetType.MASTER, masterId);
+
+        assertThat(ids(http.get("/api/v1/favorites/masters", clientToken), "masterId"))
+                .containsExactly(masterId.toString());
     }
 
     @Test

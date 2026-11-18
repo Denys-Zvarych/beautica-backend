@@ -17,6 +17,7 @@ import com.beautica.master.dto.MasterWorkingDayResponse;
 import com.beautica.master.dto.WorkIntervalDto;
 import com.beautica.master.entity.Master;
 import com.beautica.master.service.MasterScheduleService;
+import com.beautica.master.service.SpanBoundedDays;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.repository.MasterServiceRepository;
@@ -54,6 +55,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.AdditionalMatchers.aryEq;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
@@ -1828,7 +1830,8 @@ class SlotCalculationServiceTest {
     private void stubFilterEnvironment(UUID masterId, LocalDate workingDay, long fittingMinutes) {
         stubReduceEffectiveRangeBatch(Map.of(masterId,
                 List.of(templateDay(workingDay, LocalTime.of(9, 0), LocalTime.of(17, 0)))));
-        when(bookingRepository.findActiveTimeRangesByMasterIdsInRange(eq(List.of(masterId)), any(), any()))
+        when(bookingRepository.findActiveTimeRangesByMasterIdsInRange(
+                aryEq(new UUID[] {masterId}), any(), any()))
                 .thenReturn(List.of());
         when(timeSlotCalculator.hasAvailableSlot(any(), any(), any(), any(), any(), any(), any()))
                 .thenAnswer(inv -> ((Duration) inv.getArgument(3)).toMinutes() <= fittingMinutes);
@@ -1922,8 +1925,102 @@ class SlotCalculationServiceTest {
         verify(masterScheduleService).reduceEffectiveRangeBatch(
                 eq(List.of(loadedMasterId)), eq(FILTER_TODAY), eq(FILTER_HORIZON), any());
         verify(bookingRepository).findActiveTimeRangesByMasterIdsInRange(
-                eq(List.of(loadedMasterId)), any(), any());
+                aryEq(new UUID[] {loadedMasterId}), any(), any());
         verifyNoMoreInteractions(masterScheduleService, bookingRepository, timeSlotCalculator);
+    }
+
+    // ── B523 perf fix: exact early exit on the span bound ──
+
+    /** 09:00–11:00 = a 2 h longest window; the bound adds the 1 h DST slack. */
+    private static final Duration TWO_HOUR_WINDOW_BOUND = Duration.ofHours(2).plus(Duration.ofHours(1));
+
+    /**
+     * A day list carrying the {@link SpanBoundedDays} capability, as the real lazily folding view
+     * does, counting every day read so a test can prove the walk never started.
+     */
+    private static final class CountingBoundedDays extends java.util.AbstractList<EffectiveDayResponse>
+            implements SpanBoundedDays {
+
+        private final List<EffectiveDayResponse> days;
+        private final Duration bound;
+        private int reads;
+
+        private CountingBoundedDays(List<EffectiveDayResponse> days, Duration bound) {
+            this.days = days;
+            this.bound = bound;
+        }
+
+        @Override
+        public EffectiveDayResponse get(int index) {
+            reads++;
+            return days.get(index);
+        }
+
+        @Override
+        public int size() {
+            return days.size();
+        }
+
+        @Override
+        public Duration longestPossibleSpan() {
+            return bound;
+        }
+    }
+
+    private CountingBoundedDays stubBoundedTwoHourDay(UUID masterId) {
+        CountingBoundedDays days = new CountingBoundedDays(
+                List.of(templateDay(FILTER_TODAY.plusDays(1), LocalTime.of(9, 0), LocalTime.of(11, 0))),
+                TWO_HOUR_WINDOW_BOUND);
+        stubReduceEffectiveRangeBatch(Map.of(masterId, days));
+        when(bookingRepository.findActiveTimeRangesByMasterIdsInRange(
+                aryEq(new UUID[] {masterId}), any(), any()))
+                .thenReturn(List.of());
+        return days;
+    }
+
+    @Test
+    @DisplayName("filterBookableAssignmentsBatch skips the walk when even the shortest duration exceeds every window")
+    void should_skipWithoutWalking_when_shortestDurationExceedsTheLongestPossibleWindow() {
+        UUID masterId = UUID.randomUUID();
+        // 181 and 300 minutes: both longer than the 2 h window plus the 1 h slack.
+        MasterServiceAssignment justOver = activeAssignment(masterId, 181, 0);
+        MasterServiceAssignment farOver = activeAssignment(masterId, 300, 0);
+        CountingBoundedDays days = stubBoundedTwoHourDay(masterId);
+
+        Map<UUID, List<MasterServiceAssignment>> bookable = slotCalculationService
+                .filterBookableAssignmentsBatch(Map.of(masterId, List.of(justOver, farOver)));
+
+        assertThat(bookable.get(masterId))
+                .as("no service can fit a day whose longest span is below the duration")
+                .isEmpty();
+        assertThat(days.reads)
+                .as("the early exit is exact: not one day of the horizon was read (folded)")
+                .isZero();
+        verifyNoInteractions(timeSlotCalculator);
+    }
+
+    @Test
+    @DisplayName("filterBookableAssignmentsBatch still walks a duration that only fits within the DST slack")
+    void should_walkTheDays_when_shortestDurationFitsWithinTheDstSlack() {
+        UUID masterId = UUID.randomUUID();
+        // 180 minutes: longer than the 2 h window itself, but equal to the bound (window + 1 h slack),
+        // so the bound must NOT skip it — only the real walk may decide.
+        MasterServiceAssignment withinSlack = activeAssignment(masterId, 180, 0);
+        CountingBoundedDays days = stubBoundedTwoHourDay(masterId);
+        when(timeSlotCalculator.hasAvailableSlot(any(), any(), any(), any(), any(), any(), any()))
+                .thenReturn(true);
+
+        Map<UUID, List<MasterServiceAssignment>> bookable = slotCalculationService
+                .filterBookableAssignmentsBatch(Map.of(masterId, List.of(withinSlack)));
+
+        assertThat(bookable.get(masterId))
+                .as("a duration within the bound is decided by the walk, which here finds a slot")
+                .containsExactly(withinSlack);
+        assertThat(days.reads)
+                .as("the walk ran: the day was read")
+                .isPositive();
+        verify(timeSlotCalculator).hasAvailableSlot(
+                any(), any(), any(), eq(Duration.ofMinutes(180)), any(), any(), any());
     }
 
     /** Active assignment with a caller-chosen id, so multiple chained ids can be stubbed distinctly. */
