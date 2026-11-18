@@ -85,6 +85,18 @@ public class UserProfileCacheEvictor {
      */
     public static final String USER_PROFILE_CACHE = "user-profile";
 
+    /**
+     * B516 (AUTH-45) — user ids KNOWN to hold a verified phone, read by {@code VerifiedPhoneGate} so a verified
+     * provider's writes skip the row read. Evicted together with {@link #USER_PROFILE_CACHE}: its only source,
+     * {@code users.phone_verified_at}, is surfaced as {@code UserProfileResponse.phoneVerified}, so every writer of it
+     * (phone add / change in {@code UserPhoneService}, every account deletion through
+     * {@code ClientAccountDeletionService} / {@code StaffAccountDisposalService}) is already a caller of
+     * {@link #evictAfterCommit}. Holds only "verified" (never "unverified"), so a stale entry can at worst let a
+     * just-deleted account through a gate whose row read would also pass it. Any writer that nulls
+     * {@code phone_verified_at} MUST call {@link #evictAfterCommit} (verified-phone cache).
+     */
+    public static final String VERIFIED_PHONE_CACHE = "verified-phone";
+
     private final CacheManager cacheManager;
 
     public UserProfileCacheEvictor(CacheManager cacheManager) {
@@ -92,7 +104,7 @@ public class UserProfileCacheEvictor {
     }
 
     /**
-     * Evicts {@code userId}'s {@code user-profile} entry once the current transaction commits.
+     * Evicts {@code userId}'s {@code user-profile} and {@code verified-phone} entries once the current transaction commits.
      * Per-key, never {@code clear()} (Anti-Bug §F-6).
      *
      * @param userId the account owner's UUID — the {@code @Cacheable(key = "#userId")} key shape
@@ -118,7 +130,12 @@ public class UserProfileCacheEvictor {
     }
 
     private void evict(UUID userId) {
-        Cache cache = cacheManager.getCache(USER_PROFILE_CACHE);
+        evict(USER_PROFILE_CACHE, userId);
+        evict(VERIFIED_PHONE_CACHE, userId);
+    }
+
+    private void evict(String cacheName, UUID userId) {
+        Cache cache = cacheManager.getCache(cacheName);
         if (cache != null) {
             cache.evict(userId);
         }

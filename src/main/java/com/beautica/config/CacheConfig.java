@@ -422,6 +422,15 @@ public class CacheConfig {
                         .maximumSize(2000)
                         .expireAfterWrite(5, TimeUnit.MINUTES)
                         .build());
+        // B516 (AUTH-45) — VerifiedPhoneGate remembers ONLY "this user's phone is verified", so a verified
+        // provider's writes skip the per-request row read. Evicted with user-profile (same writer set, see
+        // UserProfileCacheEvictor#VERIFIED_PHONE_CACHE); 5 min TTL is the backstop. 10 000 entries × (UUID +
+        // Boolean) is well under 1 MB.
+        manager.registerCustomCache(UserProfileCacheEvictor.VERIFIED_PHONE_CACHE,
+                Caffeine.newBuilder()
+                        .maximumSize(10_000)
+                        .expireAfterWrite(5, TimeUnit.MINUTES)
+                        .build());
         manager.registerCustomCache("service-type-search",
                 Caffeine.newBuilder()
                         .maximumSize(1000)
@@ -811,6 +820,7 @@ public class CacheConfig {
         // no-op rather than a loud failure — while @Cacheable on the read side failed loudly. Fail
         // at context refresh instead.
         assertCustomRegistration(manager, UserProfileCacheEvictor.USER_PROFILE_CACHE);
+        assertCustomRegistration(manager, UserProfileCacheEvictor.VERIFIED_PHONE_CACHE);
         assertCustomRegistration(manager, RetiredBookingSlugGuard.KNOWN_RETIRED_CACHE);
         return manager;
     }

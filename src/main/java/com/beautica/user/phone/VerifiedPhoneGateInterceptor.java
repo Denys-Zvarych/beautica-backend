@@ -3,12 +3,9 @@ package com.beautica.user.phone;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import org.springframework.beans.factory.ObjectProvider;
-import org.springframework.http.HttpMethod;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.web.method.HandlerMethod;
 import org.springframework.web.servlet.HandlerInterceptor;
-
-import java.util.Set;
 
 /**
  * B516 (AUTH-45) — runs {@link VerifiedPhoneGate#check} before a gated controller handler. Short-circuits before the
@@ -18,9 +15,6 @@ import java.util.Set;
  * A rejection is rendered by {@code GlobalExceptionHandler} like any controller exception.
  */
 class VerifiedPhoneGateInterceptor implements HandlerInterceptor {
-
-    private static final Set<String> SAFE_METHODS = Set.of(
-            HttpMethod.GET.name(), HttpMethod.HEAD.name(), HttpMethod.OPTIONS.name());
 
     private final ObjectProvider<VerifiedPhoneGate> gate;
 
@@ -34,7 +28,7 @@ class VerifiedPhoneGateInterceptor implements HandlerInterceptor {
             return true;
         }
         boolean bookingCreate = method.hasMethodAnnotation(RequireVerifiedPhone.class);
-        boolean write = !SAFE_METHODS.contains(request.getMethod());
+        boolean write = VerifiedPhoneGate.isWrite(request.getMethod());
         if (!bookingCreate && !write) {
             return true;
         }
@@ -42,7 +36,7 @@ class VerifiedPhoneGateInterceptor implements HandlerInterceptor {
         if (resolved == null || !resolved.isActive()) {
             return true;
         }
-        resolved.check(SecurityContextHolder.getContext().getAuthentication(), bookingCreate, write,
+        resolved.check(SecurityContextHolder.getContext().getAuthentication(), bookingCreate, request.getMethod(),
                 request.getRequestURI().substring(request.getContextPath().length()));
         return true;
     }

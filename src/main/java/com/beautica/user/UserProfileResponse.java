@@ -122,13 +122,12 @@ public record UserProfileResponse(
         boolean phoneVerified,
 
         /**
-         * B516 (AUTH-45) — the date (Europe/Kyiv) by which the phone must be confirmed: today for a CLIENT without a
-         * verified phone (the app blocks), {@code APP_PHONE_PROVIDER_DEADLINE} for a provider, null once verified (or
-         * for a provider while no deadline is configured). Resolved by {@code PhoneRequirementPolicy}.
+         * B516 (AUTH-45, AUTH-D12) — the date (Europe/Kyiv) by which the phone must be confirmed: today for any role
+         * without a verified phone (the app blocks), null once verified. Resolved by {@code PhoneRequirementPolicy}.
          */
         @Schema(types = {"string", "null"}, nullable = true, format = "date", description = "ISO date by which the "
-                + "phone must be confirmed by SMS: today for a client without a verified phone, the provider deadline "
-                + "for a provider, null once verified.")
+                + "phone must be confirmed by SMS: today for any account without a verified phone, null once "
+                + "verified.")
         LocalDate phoneRequiredBy
 ) {
 

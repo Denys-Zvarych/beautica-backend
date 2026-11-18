@@ -217,7 +217,7 @@ public class UserService {
      * few minutes after Kyiv midnight — harmless, the app only compares it with its own today.
      */
     private LocalDate phoneRequiredBy(User user) {
-        return phoneRequirementPolicy.phoneRequiredBy(user.getRole(), user.isPhoneVerified());
+        return phoneRequirementPolicy.phoneRequiredBy(user.isPhoneVerified());
     }
 
     private boolean resolveHasMasterProfile(User user) {

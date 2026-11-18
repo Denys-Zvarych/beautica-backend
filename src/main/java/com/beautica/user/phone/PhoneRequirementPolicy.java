@@ -9,13 +9,13 @@ import java.time.Clock;
 import java.time.LocalDate;
 
 /**
- * B516 (AUTH-45, D1, D2) — the one place that knows WHEN an account must have a verified phone:
+ * B516 (AUTH-45, AUTH-D12) — the one place that knows WHEN an account must have a verified phone. Every role must
+ * verify immediately; there is no provider deadline (user 2026-11-18):
  * <ul>
- *   <li>{@link #phoneRequiredBy} — {@code GET /users/me phoneRequiredBy}: a CLIENT without a verified phone → today
- *       (Europe/Kyiv; the app blocks at first open), a provider → {@code APP_PHONE_PROVIDER_DEADLINE} (null when
- *       unset), a verified account → null.</li>
+ *   <li>{@link #phoneRequiredBy} — {@code GET /users/me phoneRequiredBy}: any account without a verified phone →
+ *       today (Europe/Kyiv; the app blocks), a verified account → null.</li>
  *   <li>{@link #blocksClientBooking} / {@link #blocksProviderWrite} — the server gate behind the app, only while
- *       {@code APP_AUTH_REQUIRE_VERIFIED_PHONE=true}; a provider is gated only once the deadline date has passed.</li>
+ *       {@code APP_AUTH_REQUIRE_VERIFIED_PHONE=true}.</li>
  * </ul>
  */
 @Component
@@ -29,12 +29,9 @@ public class PhoneRequirementPolicy {
         this.kyivClock = clock.withZone(TimeZones.KYIV);
     }
 
-    /** @return the date by which the phone must be verified, or {@code null} (verified, or a provider with no deadline) */
-    public LocalDate phoneRequiredBy(Role role, boolean phoneVerified) {
-        if (phoneVerified) {
-            return null;
-        }
-        return role == Role.CLIENT ? LocalDate.now(kyivClock) : properties.providerDeadline();
+    /** @return today (Europe/Kyiv) for any role without a verified phone, {@code null} once verified */
+    public LocalDate phoneRequiredBy(boolean phoneVerified) {
+        return phoneVerified ? null : LocalDate.now(kyivClock);
     }
 
     /** An APP booking create by an unverified CLIENT is refused (flag on). */
@@ -42,16 +39,8 @@ public class PhoneRequirementPolicy {
         return properties.isRequireVerifiedPhone() && role == Role.CLIENT && !phoneVerified;
     }
 
-    /** A provider write is refused once the deadline day is over (flag on, deadline set, phone unverified). */
+    /** A (non-exempt) write by an unverified provider is refused (flag on). */
     public boolean blocksProviderWrite(Role role, boolean phoneVerified) {
-        return role != Role.CLIENT && !phoneVerified && providerDeadlinePassed();
-    }
-
-    /** Flag on, a provider deadline set and its (Kyiv) day over — no account data needed. */
-    public boolean providerDeadlinePassed() {
-        LocalDate deadline = properties.providerDeadline();
-        return properties.isRequireVerifiedPhone()
-                && deadline != null
-                && LocalDate.now(kyivClock).isAfter(deadline);
+        return properties.isRequireVerifiedPhone() && role != Role.CLIENT && !phoneVerified;
     }
 }

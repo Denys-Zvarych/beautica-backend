@@ -29,6 +29,8 @@ import org.springframework.cache.CacheManager;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import java.math.BigDecimal;
+import java.time.Instant;
+import java.time.LocalDate;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -106,6 +108,38 @@ class UserServiceTest {
         assertThat(response.lastName()).isEqualTo("Smith");
         assertThat(response.phoneNumber()).isEqualTo("+380671234567");
         assertThat(response.isActive()).isTrue();
+    }
+
+    @Test
+    @DisplayName("getProfile passes phoneVerified=false to PhoneRequirementPolicy and returns its phoneRequiredBy")
+    void should_returnPolicyPhoneRequiredBy_when_phoneUnverified() {
+        UUID userId = UUID.randomUUID();
+        User user = buildUser(userId, "unverified@example.com", Role.SALON_OWNER, "Una", "Verified", null);
+        LocalDate policyDate = LocalDate.of(2026, 11, 18);
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+        when(phoneRequirementPolicy.phoneRequiredBy(false)).thenReturn(policyDate);
+
+        UserProfileResponse response = userService.getProfile(userId);
+
+        assertThat(response.phoneRequiredBy()).isEqualTo(policyDate);
+        verify(phoneRequirementPolicy).phoneRequiredBy(false);
+    }
+
+    @Test
+    @DisplayName("getProfile passes phoneVerified=true to PhoneRequirementPolicy and returns its value unchanged")
+    void should_returnPolicyValue_when_phoneVerified() {
+        UUID userId = UUID.randomUUID();
+        User user = buildUser(userId, "verified@example.com", Role.CLIENT, "Vera", "Fied", null);
+        user.markPhoneVerified("+380671234567", Instant.parse("2026-11-01T10:00:00Z"));
+        // a sentinel (the real policy answers null here): proves the response carries the policy's answer verbatim
+        LocalDate sentinel = LocalDate.of(2030, 1, 1);
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+        when(phoneRequirementPolicy.phoneRequiredBy(true)).thenReturn(sentinel);
+
+        UserProfileResponse response = userService.getProfile(userId);
+
+        assertThat(response.phoneRequiredBy()).isEqualTo(sentinel);
+        verify(phoneRequirementPolicy).phoneRequiredBy(true);
     }
 
     @Test

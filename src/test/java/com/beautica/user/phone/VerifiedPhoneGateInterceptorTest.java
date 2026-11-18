@@ -1,6 +1,7 @@
 package com.beautica.user.phone;
 
 import com.beautica.auth.Role;
+import com.beautica.common.cache.UserProfileCacheEvictor;
 import com.beautica.config.AuthConsentProperties;
 import com.beautica.user.UserRepository;
 import org.junit.jupiter.api.AfterEach;
@@ -11,6 +12,7 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.cache.concurrent.ConcurrentMapCacheManager;
 import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.mock.web.MockHttpServletResponse;
 import org.springframework.security.core.context.SecurityContextHolder;
@@ -19,6 +21,7 @@ import org.springframework.web.method.HandlerMethod;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.never;
@@ -41,9 +44,10 @@ class VerifiedPhoneGateInterceptorTest {
     @BeforeEach
     void setUp() {
         Clock clock = Clock.fixed(Instant.parse("2026-11-20T10:00:00Z"), ZoneOffset.UTC);
-        gate = spy(new VerifiedPhoneGate(userRepository, new PhoneRequirementPolicy(properties, clock), properties));
+        gate = spy(new VerifiedPhoneGate(userRepository, new PhoneRequirementPolicy(properties, clock), properties,
+                new ConcurrentMapCacheManager(UserProfileCacheEvictor.VERIFIED_PHONE_CACHE)));
         interceptor = new VerifiedPhoneGateInterceptor(provider);
-        SecurityContextHolder.getContext().setAuthentication(VerifiedPhoneGateTest.token(Role.CLIENT));
+        SecurityContextHolder.getContext().setAuthentication(VerifiedPhoneGateTest.token(Role.CLIENT, UUID.randomUUID()));
     }
 
     @AfterEach
@@ -76,7 +80,7 @@ class VerifiedPhoneGateInterceptorTest {
 
         assertThat(proceed).isTrue();
         verify(gate, never()).check(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.anyBoolean(),
-                org.mockito.ArgumentMatchers.anyBoolean(), org.mockito.ArgumentMatchers.any());
+                org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any());
         verifyNoInteractions(userRepository);
     }
 

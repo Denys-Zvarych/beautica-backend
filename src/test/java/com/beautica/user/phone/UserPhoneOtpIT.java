@@ -2,12 +2,16 @@ package com.beautica.user.phone;
 
 import com.beautica.auth.registration.AbstractPhoneIdentityIT;
 import com.beautica.common.TimeZones;
+import com.beautica.common.cache.UserProfileCacheEvictor;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.cache.CacheManager;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 
+import java.time.Clock;
 import java.time.LocalDate;
 import java.util.Map;
 import java.util.UUID;
@@ -28,6 +32,17 @@ class UserPhoneOtpIT extends AbstractPhoneIdentityIT {
     static final String PHONE_SEND_URL = "/api/v1/users/me/phone/otp/send";
     static final String PHONE_VERIFY_URL = "/api/v1/users/me/phone/otp/verify";
     private static final String ME_URL = "/api/v1/users/me";
+
+    @Autowired
+    private Clock clock;
+
+    @Autowired
+    private CacheManager cacheManager;
+
+    /** The app clock's Kyiv date (read before and after a request, so a midnight crossing cannot flake). */
+    private LocalDate kyivToday() {
+        return LocalDate.now(clock.withZone(TimeZones.KYIV));
+    }
 
     private String legacyClientToken(String email) {
         seedUser("CLIENT", email, true, null, "0671112233");
@@ -182,13 +197,14 @@ class UserPhoneOtpIT extends AbstractPhoneIdentityIT {
     @DisplayName("a client without a verified phone sees phoneRequiredBy = today (Kyiv)")
     void should_reportPhoneRequiredByToday_when_clientHasNoVerifiedPhone() {
         String token = legacyClientToken(newEmail());
+        LocalDate before = kyivToday();
 
         ResponseEntity<String> me = exchangeAs(token, HttpMethod.GET, ME_URL, null);
 
         assertThat(json(me).at("/data/phoneVerified").asBoolean()).isFalse();
         assertThat(json(me).at("/data/emailVerified").asBoolean()).isTrue();
         assertThat(json(me).at("/data/phoneRequiredBy").asText())
-                .isEqualTo(LocalDate.now(TimeZones.KYIV).toString());
+                .isIn(before.toString(), kyivToday().toString());
     }
 
     @Test
@@ -210,14 +226,35 @@ class UserPhoneOtpIT extends AbstractPhoneIdentityIT {
     }
 
     @Test
-    @DisplayName("an unverified provider sees no phoneRequiredBy while no deadline is configured")
-    void should_reportNoPhoneRequiredBy_when_providerUnverifiedAndNoDeadlineConfigured() {
+    @DisplayName("an unverified provider sees phoneRequiredBy = today (Kyiv): no provider deadline (AUTH-D12)")
+    void should_reportPhoneRequiredByToday_when_providerUnverified() {
         String email = newEmail();
         seedUser("SALON_OWNER", email, true, null, null);
+        String token = accessToken(email);
+        LocalDate before = kyivToday();
 
-        ResponseEntity<String> me = exchangeAs(accessToken(email), HttpMethod.GET, ME_URL, null);
+        ResponseEntity<String> me = exchangeAs(token, HttpMethod.GET, ME_URL, null);
 
         assertThat(json(me).at("/data/phoneVerified").asBoolean()).isFalse();
-        assertThat(json(me).at("/data/phoneRequiredBy").isNull()).as("APP_PHONE_PROVIDER_DEADLINE unset").isTrue();
+        assertThat(json(me).at("/data/phoneRequiredBy").asText())
+                .isIn(before.toString(), kyivToday().toString());
+    }
+
+    @Test
+    @DisplayName("a phone change evicts the account's verified-phone gate entry after commit")
+    void should_evictVerifiedPhoneEntry_when_phoneChanged() {
+        String oldPhone = newPhone();
+        UUID id = seedUser("SALON_OWNER", null, false, oldPhone, null);
+        String token = accessToken(oldPhone);
+        var verifiedPhones = cacheManager.getCache(UserProfileCacheEvictor.VERIFIED_PHONE_CACHE);
+        verifiedPhones.put(id, Boolean.TRUE);
+        String newPhone = newPhone();
+        postAs(token, PHONE_SEND_URL, Map.of("phone", newPhone));
+
+        ResponseEntity<String> changed = postAs(token, PHONE_VERIFY_URL, Map.of("phone", newPhone,
+                "code", lastCodeSentTo(newPhone), "currentPassword", PASSWORD));
+
+        assertThat(changed.getStatusCode()).as("body: %s", changed.getBody()).isEqualTo(HttpStatus.OK);
+        assertThat(verifiedPhones.get(id)).as("evicted after the swap committed").isNull();
     }
 }
