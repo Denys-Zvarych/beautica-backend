@@ -460,7 +460,7 @@ class EmailTemplateRenderingTest {
     }
 
     @Test
-    @DisplayName("reset-password-otp — renders 15-minute validity note")
+    @DisplayName("reset-password-otp — renders 10-minute validity note")
     void should_renderValidityNote_when_resetPasswordOtpTemplateProcessed() {
         var ctx = new Context();
         ctx.setVariable("code", "000111");
@@ -468,8 +468,11 @@ class EmailTemplateRenderingTest {
         String html = templateEngine.process("email/reset-password-otp", ctx);
 
         assertThat(html)
-                .as("reset-password-otp template must mention the 15-minute OTP expiry")
-                .contains("15 хвилин");
+                .as("reset-password-otp template must mention the 10-minute OTP expiry")
+                .contains("10 хвилин");
+        assertThat(html)
+                .as("reset-password-otp must not carry the stale 15-minute expiry (AUTH-D26 b)")
+                .doesNotContain("15 хвилин");
     }
 
     // ── verify-email template ─────────────────────────────────────────────────
