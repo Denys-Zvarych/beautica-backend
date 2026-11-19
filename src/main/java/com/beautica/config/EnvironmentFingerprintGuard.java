@@ -69,6 +69,7 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
     private static final Profiles PROD = Profiles.of("prod");
     private static final Profiles STAGING = Profiles.of("staging");
     private static final Profiles TEST = Profiles.of("test");
+    private static final Profiles LOCAL = Profiles.of("local");
     static final String GUEST_PII_RETENTION_ENABLED = "app.guest-pii-retention.enabled";
 
     /** Placeholder an operator sets for {@code BREVO_SMTP_LOGIN}/{@code BREVO_SMTP_KEY} until Brevo exists (Phase 367 D9). */
@@ -135,8 +136,10 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
             return;
         }
         checkProfiles(environment, prodProfile, stagingProfile, violations);
+        checkLocalProfile(env, prodProfile, stagingProfile, onRailway, violations);
         checkRailwayName(env, environment, violations);
         if (environment != DeployEnvironment.LOCAL) {
+            checkAuthLimits(env, violations);
             checkR2Bucket(env, environment, violations);
             checkLinkBaseUrls(env, environment, violations);
             checkInternalApiKey(env, violations);
@@ -271,6 +274,62 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
             violations.add("rule profile-environment: staging profile active but beautica.environment is not staging");
         } else if (prodProfile && !stagingProfile && environment != DeployEnvironment.PROD) {
             violations.add("rule profile-environment: prod profile active but beautica.environment is not prod");
+        }
+    }
+
+    /**
+     * The {@code local} profile relaxes auth limits and rate limits for manual phone testing
+     * ({@code application-local.yml}), so it must never ride along with a prod/staging profile or run on Railway.
+     * Reached only when the guard is not skipped, i.e. a prod/staging profile, a non-LOCAL environment or Railway.
+     */
+    private static void checkLocalProfile(Environment env, boolean prodProfile, boolean stagingProfile, boolean onRailway,
+                                          List<String> violations) {
+        if (env.acceptsProfiles(LOCAL) && (prodProfile || stagingProfile || onRailway)) {
+            violations.add("rule local-profile: local profile must not be active with prod/staging or on Railway");
+        }
+    }
+
+    /**
+     * Outside LOCAL the {@code app.auth-limits.*} values may only tighten the {@link AuthLimitsProperties#defaults()}:
+     * no count above its default, no {@code login-lock-window} below it. Bound exactly as the
+     * {@code @ConfigurationProperties} bean binds it (unset = defaults); a value that cannot be bound fails closed
+     * with this rule. Names the properties only, never a value or the bind error's message.
+     */
+    private static void checkAuthLimits(Environment env, List<String> violations) {
+        AuthLimitsProperties limits;
+        try {
+            limits = Binder.get(env).bind(AUTH_LIMITS_PREFIX, AuthLimitsProperties.class)
+                    .orElseGet(AuthLimitsProperties::defaults);
+        } catch (org.springframework.boot.context.properties.bind.BindException e) {
+            violations.add("rule auth-limits-not-loosened: " + AUTH_LIMITS_PREFIX + ".* could not be bound");
+            return;
+        }
+        AuthLimitsProperties defaults = AuthLimitsProperties.defaults();
+        List<String> loosened = new ArrayList<>();
+        addIfAbove(loosened, "phone-otp-max-sends-per-window", limits.phoneOtpMaxSendsPerWindow(),
+                defaults.phoneOtpMaxSendsPerWindow());
+        addIfAbove(loosened, "phone-otp-max-verify-attempts", limits.phoneOtpMaxVerifyAttempts(),
+                defaults.phoneOtpMaxVerifyAttempts());
+        addIfAbove(loosened, "email-code-max-verify-attempts", limits.emailCodeMaxVerifyAttempts(),
+                defaults.emailCodeMaxVerifyAttempts());
+        addIfAbove(loosened, "login-max-failures", limits.loginMaxFailures(), defaults.loginMaxFailures());
+        addIfAbove(loosened, "otp-verify-ip-capacity", limits.otpVerifyIpCapacity(), defaults.otpVerifyIpCapacity());
+        addIfAbove(loosened, "guest-booking-ip-capacity", limits.guestBookingIpCapacity(),
+                defaults.guestBookingIpCapacity());
+        if (limits.loginLockWindow().compareTo(defaults.loginLockWindow()) < 0) {
+            loosened.add(AUTH_LIMITS_PREFIX + ".login-lock-window");
+        }
+        if (!loosened.isEmpty()) {
+            violations.add("rule auth-limits-not-loosened: " + String.join(", ", loosened)
+                    + " must not be looser than the AuthLimitsProperties defaults outside local");
+        }
+    }
+
+    static final String AUTH_LIMITS_PREFIX = "app.auth-limits";
+
+    private static void addIfAbove(List<String> loosened, String key, long value, long defaultValue) {
+        if (value > defaultValue) {
+            loosened.add(AUTH_LIMITS_PREFIX + "." + key);
         }
     }
 

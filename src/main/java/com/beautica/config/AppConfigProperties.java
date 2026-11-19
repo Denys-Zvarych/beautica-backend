@@ -47,7 +47,8 @@ import org.springframework.context.annotation.Configuration;
         ExternalCallSentryLimitProperties.class,
         AuthConsentProperties.class,
         AppCheckProperties.class,
-        InviteSmsPolicyConfig.class
+        InviteSmsPolicyConfig.class,
+        AuthLimitsProperties.class
 })
 public class AppConfigProperties {
 }

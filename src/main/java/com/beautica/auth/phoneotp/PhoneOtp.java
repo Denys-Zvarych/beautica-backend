@@ -89,6 +89,7 @@ public class PhoneOtp {
      * Maximum wrong verify attempts before the OTP is invalidated. After this many wrong
      * codes the OTP is marked used, so even a subsequent <i>correct</i> code is rejected.
      */
+    // Production default of app.auth-limits.phone-otp-max-verify-attempts (PhoneOtpService passes the bound value).
     public static final int MAX_VERIFY_ATTEMPTS = 5;
 
     private PhoneOtp(String phone, String codeHash, Instant expiresAt, PhoneOtpPurpose purpose, UUID userId) {

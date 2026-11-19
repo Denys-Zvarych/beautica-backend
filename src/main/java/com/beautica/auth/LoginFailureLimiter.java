@@ -3,6 +3,7 @@ package com.beautica.auth;
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.github.benmanes.caffeine.cache.Ticker;
+import com.beautica.config.AuthLimitsProperties;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
@@ -31,7 +32,9 @@ import java.util.concurrent.TimeUnit;
 @Component
 public class LoginFailureLimiter {
 
+    /** Production default of {@code app.auth-limits.login-max-failures}. */
     public static final int MAX_FAILURES = 10;
+    /** Production default of {@code app.auth-limits.login-lock-window}. */
     public static final Duration LOCK_WINDOW = Duration.ofMinutes(15);
     private static final long MAX_TRACKED_IDENTIFIERS = 100_000;
     /** One entry per signed-in account that typed a wrong current password inside the window. */
@@ -41,23 +44,35 @@ public class LoginFailureLimiter {
 
     private final Cache<String, Integer> failures;
     private final Cache<String, Integer> accountFailures;
+    private final int maxFailures;
+
+    /** Production defaults ({@link #MAX_FAILURES} / {@link #LOCK_WINDOW}); kept for the tests that build it directly. */
+    public LoginFailureLimiter(Clock clock) {
+        this(clock, AuthLimitsProperties.defaults());
+    }
 
     @Autowired
-    public LoginFailureLimiter(Clock clock) {
-        this(clock, MAX_TRACKED_IDENTIFIERS, MAX_TRACKED_ACCOUNTS);
+    public LoginFailureLimiter(Clock clock, AuthLimitsProperties limits) {
+        this(clock, MAX_TRACKED_IDENTIFIERS, MAX_TRACKED_ACCOUNTS, limits);
     }
 
     /** Test seam: small bounds so a test can overflow the login cache. */
     LoginFailureLimiter(Clock clock, long maxTrackedPairs, long maxTrackedAccounts) {
-        Ticker ticker = () -> TimeUnit.MILLISECONDS.toNanos(clock.millis());
-        this.failures = newCounterCache(ticker, maxTrackedPairs);
-        this.accountFailures = newCounterCache(ticker, maxTrackedAccounts);
+        this(clock, maxTrackedPairs, maxTrackedAccounts, AuthLimitsProperties.defaults());
     }
 
-    private static Cache<String, Integer> newCounterCache(Ticker ticker, long maximumSize) {
+    private LoginFailureLimiter(Clock clock, long maxTrackedPairs, long maxTrackedAccounts,
+                                AuthLimitsProperties limits) {
+        Ticker ticker = () -> TimeUnit.MILLISECONDS.toNanos(clock.millis());
+        this.maxFailures = limits.loginMaxFailures();
+        this.failures = newCounterCache(ticker, maxTrackedPairs, limits.loginLockWindow());
+        this.accountFailures = newCounterCache(ticker, maxTrackedAccounts, limits.loginLockWindow());
+    }
+
+    private static Cache<String, Integer> newCounterCache(Ticker ticker, long maximumSize, Duration lockWindow) {
         return Caffeine.newBuilder()
                 .maximumSize(maximumSize)
-                .expireAfterWrite(LOCK_WINDOW)
+                .expireAfterWrite(lockWindow)
                 .ticker(ticker)
                 .build();
     }
@@ -65,7 +80,7 @@ public class LoginFailureLimiter {
     /** {@code true} when {@code identifierKey} reached the failure cap from {@code clientIp} inside the window. */
     public boolean isLocked(String identifierKey, String clientIp) {
         Integer count = failures.getIfPresent(key(identifierKey, clientIp));
-        return count != null && count >= MAX_FAILURES;
+        return count != null && count >= maxFailures;
     }
 
     /** Counts one failed login of a real account from {@code clientIp}; each failure restarts the window. */
@@ -87,13 +102,13 @@ public class LoginFailureLimiter {
      */
     public boolean tryAcquireAccountAttempt(String accountKey) {
         Integer current = accountFailures.getIfPresent(accountKey);
-        if (current != null && current >= MAX_FAILURES) {
+        if (current != null && current >= maxFailures) {
             return false; // fast path: no write, so a locked key's window is not restarted
         }
         boolean[] acquired = {false};
         accountFailures.asMap().compute(accountKey, (k, count) -> {
             int value = count == null ? 0 : count;
-            if (value >= MAX_FAILURES) {
+            if (value >= maxFailures) {
                 return count;
             }
             acquired[0] = true;

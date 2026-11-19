@@ -55,6 +55,31 @@ app:
   # socket address only (rotating the headers cannot dodge a 429).
   rate-limit:
     trust-forwarded-headers: false
+    # local manual testing — limits relaxed (user 2026-11-19); prod/staging unaffected.
+    # A phone on adb reverse arrives from 127.0.0.1, so every per-IP bucket is shared by the whole session.
+    # Pinned by LocalProfileAuthLimitsRelaxedTest (also the app.auth-limits block below).
+    register-capacity: 100000
+    login-capacity: 100000
+    refresh-capacity: 100000
+    otp-send-capacity: 100000
+    verify-email-capacity: 100000
+    resend-verification-capacity: 100000
+    forgot-password-capacity: 100000
+    reset-password-capacity: 100000
+    verify-password-reset-otp-capacity: 100000
+    change-password-otp-capacity: 100000
+    invite-validate-capacity: 100000
+    invite-accept-capacity: 100000
+  # local manual testing — limits relaxed (user 2026-11-19); prod/staging unaffected (AuthLimitsProperties defaults =
+  # the old hard-coded constants). Wrong-code / wrong-password locks stay functional at 1000.
+  auth-limits:
+    phone-otp-max-sends-per-window: 100000
+    phone-otp-max-verify-attempts: 1000
+    email-code-max-verify-attempts: 1000
+    login-max-failures: 1000
+    login-lock-window: 15m
+    otp-verify-ip-capacity: 100000
+    guest-booking-ip-capacity: 100000
   # B514 (AUTH-54) — no App Check locally (debug builds and curl work without a token).
   auth:
     app-check:
@@ -94,21 +119,23 @@ app:
     otp-pepper: ${APP_OTP_PEPPER:local-dev-otp-pepper-not-for-prod-min32chars}
     # Phase 397 — local dev only; prod value: openssl rand -base64 32.
     phone-hash-pepper: ${PHONE_HASH_PEPPER:local-dev-phone-hash-pepper-not-for-prod-min32}
+  # local manual testing — limits relaxed (user 2026-11-19); prod/staging unaffected. Locks stay functional
+  # (1000 wrong codes), cooldowns at the 1s minimum (the policy records reject zero).
   verification:
-    cumulative-failure-threshold: 10
+    cumulative-failure-threshold: 1000
     lockout-duration: 15m
     stale-code-retention: 24h
-    resend-cooldown: 10s   # Short cooldown for local dev — avoid waiting 60 s between resend attempts
+    resend-cooldown: 1s
   password-reset:
     cleanup-retention: 7d
   refresh-token:
     cleanup-retention: 7d
   password-reset-otp:
     otp-ttl: 15m
-    max-attempts-per-code: 5
-    cumulative-failure-threshold: 10
+    max-attempts-per-code: 1000
+    cumulative-failure-threshold: 1000
     lockout-duration: 15m
-    resend-cooldown: 10s   # Short cooldown for local dev — avoid waiting 60 s between requests
+    resend-cooldown: 1s
     ticket-ttl: 10m
   outbox:
     # Local dev only — never use in prod. Generate prod value with: openssl rand -base64 32

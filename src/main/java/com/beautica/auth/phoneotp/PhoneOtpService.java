@@ -2,12 +2,14 @@ package com.beautica.auth.phoneotp;
 
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ServiceUnavailableMessages;
+import com.beautica.config.AuthLimitsProperties;
 import com.beautica.config.DeploymentProperties;
 import com.beautica.notification.sms.OtpSmsSender;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -53,7 +55,8 @@ public class PhoneOtpService {
     private static final Logger log = LoggerFactory.getLogger(PhoneOtpService.class);
 
     private static final Pattern E164_UA = Pattern.compile("\\+380[0-9]{9}");
-    private static final int MAX_SENDS_PER_WINDOW = 3;
+    /** Production default of {@code app.auth-limits.phone-otp-max-sends-per-window}. */
+    public static final int MAX_SENDS_PER_WINDOW = 3;
     private static final Duration RATE_LIMIT_WINDOW = Duration.ofMinutes(15);
     private static final Duration OTP_TTL = Duration.ofMinutes(10);
     /** B516 (AUTH-12) — a password-reset code by SMS keeps the reset OTP lifetime (15 min), not the 10-min OTP one. */
@@ -76,7 +79,10 @@ public class PhoneOtpService {
     private final OtpSmsText otpSmsText;
     private final Map<OtpSmsFormat, Counter> sentCounters = new EnumMap<>(OtpSmsFormat.class);
     private final Counter formatFallbackCounter;
+    private final int maxSendsPerWindow;
+    private final int maxVerifyAttempts;
 
+    /** Production defaults ({@link #MAX_SENDS_PER_WINDOW}, {@link PhoneOtp#MAX_VERIFY_ATTEMPTS}); kept for tests. */
     public PhoneOtpService(PhoneOtpRepository phoneOtpRepository,
                            PhoneOtpAttemptRecorder attemptRecorder,
                            GuestTokenProvider guestTokenProvider,
@@ -85,6 +91,22 @@ public class PhoneOtpService {
                            PlatformTransactionManager transactionManager,
                            DeploymentProperties deploymentProperties,
                            MeterRegistry meterRegistry) {
+        this(phoneOtpRepository, attemptRecorder, guestTokenProvider, otpSmsSender, clock, transactionManager,
+                deploymentProperties, meterRegistry, AuthLimitsProperties.defaults());
+    }
+
+    @Autowired
+    public PhoneOtpService(PhoneOtpRepository phoneOtpRepository,
+                           PhoneOtpAttemptRecorder attemptRecorder,
+                           GuestTokenProvider guestTokenProvider,
+                           OtpSmsSender otpSmsSender,
+                           Clock clock,
+                           PlatformTransactionManager transactionManager,
+                           DeploymentProperties deploymentProperties,
+                           MeterRegistry meterRegistry,
+                           AuthLimitsProperties limits) {
+        this.maxSendsPerWindow = limits.phoneOtpMaxSendsPerWindow();
+        this.maxVerifyAttempts = limits.phoneOtpMaxVerifyAttempts();
         this.otpSmsText = OtpSmsText.forDomain(deploymentProperties.sms().otpDomainHost());
         this.phoneOtpRepository = phoneOtpRepository;
         this.attemptRecorder = attemptRecorder;
@@ -196,8 +218,8 @@ public class PhoneOtpService {
         int recentSends = phoneOtpRepository.countByPhoneAndCreatedAtAfter(phone, windowStart);
         // B516: per-account cap for signed-in sends, counted under the account lock taken above.
         boolean accountCapped = userId != null
-                && phoneOtpRepository.countByUserIdAndCreatedAtAfter(userId, windowStart) >= MAX_SENDS_PER_WINDOW;
-        if (recentSends >= MAX_SENDS_PER_WINDOW || accountCapped) {
+                && phoneOtpRepository.countByUserIdAndCreatedAtAfter(userId, windowStart) >= maxSendsPerWindow;
+        if (recentSends >= maxSendsPerWindow || accountCapped) {
             throw new BusinessException(HttpStatus.TOO_MANY_REQUESTS, "OTP limit exceeded");
         }
 
@@ -338,7 +360,7 @@ public class PhoneOtpService {
         Optional<PhoneOtp> active = phoneOtpRepository
                 .findTopByPhoneAndPurposeAndUserIdAndUsedFalseAndExpiresAtAfterOrderByIdDesc(
                         phone, purpose, userId, clock.instant());
-        active.ifPresent(otp -> attemptRecorder.recordFailedAttempt(otp.getId(), PhoneOtp.MAX_VERIFY_ATTEMPTS));
+        active.ifPresent(otp -> attemptRecorder.recordFailedAttempt(otp.getId(), maxVerifyAttempts));
         return active.isPresent();
     }
 
@@ -365,7 +387,7 @@ public class PhoneOtpService {
             // Runs in a separate REQUIRES_NEW transaction so the increment commits BEFORE the
             // generic-401 throw rolls back this verify transaction (otherwise the counter
             // could never accumulate). Must precede the caller's throw.
-            attemptRecorder.recordFailedAttempt(otp.getId(), PhoneOtp.MAX_VERIFY_ATTEMPTS);
+            attemptRecorder.recordFailedAttempt(otp.getId(), maxVerifyAttempts);
             return false;
         }
 

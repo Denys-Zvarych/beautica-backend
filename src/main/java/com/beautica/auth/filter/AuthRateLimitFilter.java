@@ -2,6 +2,7 @@ package com.beautica.auth.filter;
 
 import com.beautica.common.security.BearerTokenExtractor;
 import com.beautica.common.security.ConstantTimeSecrets;
+import com.beautica.config.AuthLimitsProperties;
 import com.beautica.config.BookingInfoWorkerProperties;
 import com.beautica.config.ClientIpProperties;
 import com.beautica.config.RateLimitConfig;
@@ -345,7 +346,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // re-sending. This bucket is built internally (not an injected @Qualifier bean) so the
     // existing 16-arg constructor — depended on by several slice/regression tests — is
     // unchanged.
-    private static final long OTP_VERIFY_CAPACITY = 10;
+    // Production default of app.auth-limits.otp-verify-ip-capacity (the Spring constructor binds AuthLimitsProperties).
+    public static final long OTP_VERIFY_CAPACITY = 10;
     private static final Duration OTP_VERIFY_WINDOW = Duration.ofMinutes(15);
     // Per-IP cap for POST /api/v1/book/{slug}/booking AND its salon twin
     // /api/v1/book/s/{slug}/masters/{masterId}/booking (10 / 15 min, shared bucket). The endpoint is
@@ -359,7 +361,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // visit split across >5 masters from one IP. 10 = one maximum-size visit (10 services, one master each). The
     // per-IP bucket is no longer the only replay bound: GuestTokenBookingCap caps every guest token at 10
     // committed bookings regardless of source IP, so IP rotation no longer multiplies one token's reach.
-    private static final long GUEST_BOOKING_CAPACITY = 10;
+    // Production default of app.auth-limits.guest-booking-ip-capacity.
+    public static final long GUEST_BOOKING_CAPACITY = 10;
     private static final Duration GUEST_BOOKING_WINDOW = Duration.ofMinutes(15);
     // Per-IP cap for POST /api/v1/book/cancel/{token} (10 / 15 min). The endpoint is
     // permitAll() — the guest holds only the one-time cancel token, validated inside the
@@ -984,9 +987,77 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                 new ClientIpResolver(ClientIpProperties.trustingForwardedHeaders()));
     }
 
+    /** Pre-2026-11-19 Spring shape, kept for same-package tests: the auth limits get their production defaults. */
+    AuthRateLimitFilter(
+            @Qualifier("registerBuckets") LoadingCache<String, Bucket> registerBuckets,
+            @Qualifier("loginBuckets") LoadingCache<String, Bucket> loginBuckets,
+            @Qualifier("refreshBuckets") LoadingCache<String, Bucket> refreshBuckets,
+            @Qualifier("verifyEmailBuckets") LoadingCache<String, Bucket> verifyEmailBuckets,
+            @Qualifier("slotsBuckets") LoadingCache<String, Bucket> slotsBuckets,
+            @Qualifier("deviceTokenBuckets") LoadingCache<String, Bucket> deviceTokenBuckets,
+            @Qualifier("mediaUploadBuckets") LoadingCache<String, Bucket> mediaUploadBuckets,
+            @Qualifier("profileUpdateBuckets") LoadingCache<String, Bucket> profileUpdateBuckets,
+            @Qualifier("resendVerificationBuckets") LoadingCache<String, Bucket> resendVerificationBuckets,
+            @Qualifier("forgotPasswordBuckets") LoadingCache<String, Bucket> forgotPasswordBuckets,
+            @Qualifier("resetPasswordBuckets") LoadingCache<String, Bucket> resetPasswordBuckets,
+            @Qualifier("categoryRequestBuckets") LoadingCache<String, Bucket> categoryRequestBuckets,
+            @Qualifier("suggestServiceTypeBuckets") LoadingCache<String, Bucket> suggestServiceTypeBuckets,
+            @Qualifier("bulkServiceSetupBuckets") LoadingCache<String, Bucket> bulkServiceSetupBuckets,
+            @Qualifier("supportContactBuckets") LoadingCache<String, Bucket> supportContactBuckets,
+            @Qualifier("otpSendBuckets") LoadingCache<String, Bucket> otpSendBuckets,
+            @Qualifier("verifyPasswordResetOtpBuckets") LoadingCache<String, Bucket> verifyPasswordResetOtpBuckets,
+            @Qualifier("changePasswordOtpBuckets") LoadingCache<String, Bucket> changePasswordOtpBuckets,
+            @Qualifier("serviceWriteBuckets") LoadingCache<String, Bucket> serviceWriteBuckets,
+            @Qualifier("inviteValidateBuckets") LoadingCache<String, Bucket> inviteValidateBuckets,
+            @Qualifier("inviteAcceptBuckets") LoadingCache<String, Bucket> inviteAcceptBuckets,
+            @Qualifier("catalogueBrowseBuckets") LoadingCache<String, Bucket> catalogueBrowseBuckets,
+            @Qualifier("inviteBuckets") LoadingCache<String, Bucket> inviteBuckets,
+            @Qualifier("reviewDecisionBuckets") LoadingCache<String, Bucket> reviewDecisionBuckets,
+            @Qualifier("reviewPageBuckets") LoadingCache<String, Bucket> reviewPageBuckets,
+            @Qualifier("moderationActionPageBuckets") LoadingCache<String, Bucket> moderationActionPageBuckets,
+            @Qualifier("moderationActionDecisionBuckets") LoadingCache<String, Bucket> moderationActionDecisionBuckets,
+            @Qualifier("telegramLinkIssueBuckets") LoadingCache<String, Bucket> telegramLinkIssueBuckets,
+            @Qualifier("telegramLinkReadBuckets") LoadingCache<String, Bucket> telegramLinkReadBuckets,
+            BookingInfoWorkerProperties bookingInfoWorker,
+            ClientIpResolver clientIpResolver) {
+        this(registerBuckets,
+                loginBuckets,
+                refreshBuckets,
+                verifyEmailBuckets,
+                slotsBuckets,
+                deviceTokenBuckets,
+                mediaUploadBuckets,
+                profileUpdateBuckets,
+                resendVerificationBuckets,
+                forgotPasswordBuckets,
+                resetPasswordBuckets,
+                categoryRequestBuckets,
+                suggestServiceTypeBuckets,
+                bulkServiceSetupBuckets,
+                supportContactBuckets,
+                otpSendBuckets,
+                verifyPasswordResetOtpBuckets,
+                changePasswordOtpBuckets,
+                serviceWriteBuckets,
+                inviteValidateBuckets,
+                inviteAcceptBuckets,
+                catalogueBrowseBuckets,
+                inviteBuckets,
+                reviewDecisionBuckets,
+                reviewPageBuckets,
+                moderationActionPageBuckets,
+                moderationActionDecisionBuckets,
+                telegramLinkIssueBuckets,
+                telegramLinkReadBuckets,
+                bookingInfoWorker,
+                clientIpResolver,
+                AuthLimitsProperties.defaults());
+    }
+
     /**
      * Spring constructor: as the public one, plus the optional website-Worker key (feature off when blank) and the
-     * client-IP resolver bound to the forwarded-header trust flag (the other constructors trust the header, the prod rule).
+     * client-IP resolver bound to the forwarded-header trust flag (the other constructors trust the header, the prod rule), and the
+     * {@code app.auth-limits} OTP-verify / guest-booking per-IP capacities (defaults = the old constants).
      */
     @Autowired
     AuthRateLimitFilter(
@@ -1020,7 +1091,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             @Qualifier("telegramLinkIssueBuckets") LoadingCache<String, Bucket> telegramLinkIssueBuckets,
             @Qualifier("telegramLinkReadBuckets") LoadingCache<String, Bucket> telegramLinkReadBuckets,
             BookingInfoWorkerProperties bookingInfoWorker,
-            ClientIpResolver clientIpResolver) {
+            ClientIpResolver clientIpResolver,
+            AuthLimitsProperties authLimits) {
         this.registerBuckets = registerBuckets;
         this.loginBuckets = loginBuckets;
         this.refreshBuckets = refreshBuckets;
@@ -1056,13 +1128,13 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                 .maximumSize(100_000)
                 .expireAfterAccess(OTP_VERIFY_WINDOW.plusMinutes(5))
                 .build(key -> Bucket.builder()
-                        .addLimit(otpVerifyBandwidth())
+                        .addLimit(otpVerifyBandwidth(authLimits.otpVerifyIpCapacity()))
                         .build());
         this.guestBookingBuckets = Caffeine.newBuilder()
                 .maximumSize(100_000)
                 .expireAfterAccess(GUEST_BOOKING_WINDOW.plusMinutes(5))
                 .build(key -> Bucket.builder()
-                        .addLimit(guestBookingBandwidth())
+                        .addLimit(guestBookingBandwidth(authLimits.guestBookingIpCapacity()))
                         .build());
         this.cancelPostBuckets = Caffeine.newBuilder()
                 .maximumSize(100_000)
@@ -1177,17 +1249,17 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                 .build();
     }
 
-    private static Bandwidth otpVerifyBandwidth() {
+    private static Bandwidth otpVerifyBandwidth(long capacity) {
         return BandwidthBuilder.builder()
-                .capacity(OTP_VERIFY_CAPACITY)
-                .refillIntervally(OTP_VERIFY_CAPACITY, OTP_VERIFY_WINDOW)
+                .capacity(capacity)
+                .refillIntervally(capacity, OTP_VERIFY_WINDOW)
                 .build();
     }
 
-    private static Bandwidth guestBookingBandwidth() {
+    private static Bandwidth guestBookingBandwidth(long capacity) {
         return BandwidthBuilder.builder()
-                .capacity(GUEST_BOOKING_CAPACITY)
-                .refillIntervally(GUEST_BOOKING_CAPACITY, GUEST_BOOKING_WINDOW)
+                .capacity(capacity)
+                .refillIntervally(capacity, GUEST_BOOKING_WINDOW)
                 .build();
     }
 

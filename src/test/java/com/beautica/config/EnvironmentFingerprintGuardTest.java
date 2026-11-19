@@ -5,13 +5,16 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.boot.test.system.CapturedOutput;
 import org.springframework.boot.test.system.OutputCaptureExtension;
 import org.springframework.mock.env.MockEnvironment;
 
 import java.util.List;
+import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
@@ -1772,5 +1775,127 @@ class EnvironmentFingerprintGuardTest {
         assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("prod-app-check-jwks-url");
+    }
+
+    @Test
+    @DisplayName("audit-fix: prod,local profile pair fails the local-profile rule")
+    void should_fail_when_localProfileActiveWithProd() {
+        MockEnvironment env = prodEnv();
+        env.setActiveProfiles("prod", "local");
+
+        assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("rule local-profile: local profile must not be active with prod/staging or on Railway");
+    }
+
+    @Test
+    @DisplayName("audit-fix: local profile on Railway fails the local-profile rule")
+    void should_fail_when_localProfileActiveOnRailway() {
+        MockEnvironment env = new MockEnvironment().withProperty("RAILWAY_ENVIRONMENT_NAME", "staging");
+        env.setActiveProfiles("local");
+
+        assertThatThrownBy(() -> run(env, DeployEnvironment.LOCAL, SmsMode.TURBOSMS))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("rule local-profile");
+    }
+
+    @Test
+    @DisplayName("audit-fix: local profile alone (no Railway, no prod/staging) passes, even with relaxed auth limits")
+    void should_pass_when_localProfileAlone() {
+        MockEnvironment env = new MockEnvironment().withProperty("app.auth-limits.login-max-failures", "1000");
+        env.setActiveProfiles("local");
+
+        assertThatCode(() -> run(env, DeployEnvironment.LOCAL, SmsMode.TURBOSMS)).doesNotThrowAnyException();
+    }
+
+    static Stream<Arguments> authLimitCountDefaults() {
+        AuthLimitsProperties d = AuthLimitsProperties.defaults();
+        return Stream.of(
+                Arguments.of("phone-otp-max-sends-per-window", (long) d.phoneOtpMaxSendsPerWindow()),
+                Arguments.of("phone-otp-max-verify-attempts", (long) d.phoneOtpMaxVerifyAttempts()),
+                Arguments.of("email-code-max-verify-attempts", (long) d.emailCodeMaxVerifyAttempts()),
+                Arguments.of("login-max-failures", (long) d.loginMaxFailures()),
+                Arguments.of("otp-verify-ip-capacity", d.otpVerifyIpCapacity()),
+                Arguments.of("guest-booking-ip-capacity", d.guestBookingIpCapacity()));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("authLimitCountDefaults")
+    @DisplayName("audit-fix: prod with any auth-limit count one above its default fails auth-limits-not-loosened")
+    void should_fail_when_prodLoosensAuthLimitCount(String key, long defaultValue) {
+        MockEnvironment env = prodEnv().withProperty("app.auth-limits." + key, String.valueOf(defaultValue + 1));
+
+        assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("rule auth-limits-not-loosened")
+                .hasMessageContaining("app.auth-limits." + key);
+    }
+
+    @Test
+    @DisplayName("audit-fix: the auth-limits-not-loosened message names the property but never its configured value")
+    void should_omitConfiguredValue_when_prodLoosensAuthLimit() {
+        MockEnvironment env = prodEnv().withProperty("app.auth-limits.login-max-failures", "987654");
+
+        assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("app.auth-limits.login-max-failures")
+                .hasMessageNotContaining("987654");
+    }
+
+    @Test
+    @DisplayName("audit-fix: prod with an unbindable auth limit fails closed without echoing the value")
+    void should_fail_when_prodAuthLimitUnbindable() {
+        MockEnvironment env = prodEnv().withProperty("app.auth-limits.login-max-failures", "abc");
+
+        assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("rule auth-limits-not-loosened: app.auth-limits.* could not be bound")
+                .hasMessageNotContaining("abc");
+    }
+
+    @Test
+    @DisplayName("audit-fix: prod with login-lock-window below its default fails auth-limits-not-loosened")
+    void should_fail_when_prodShortensLoginLockWindow() {
+        MockEnvironment env = prodEnv().withProperty("app.auth-limits.login-lock-window", "1m");
+
+        assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("app.auth-limits.login-lock-window");
+    }
+
+    @Test
+    @DisplayName("audit-fix: prod with every auth limit set to its default passes")
+    void should_pass_when_prodAuthLimitsAreDefaults() {
+        AuthLimitsProperties d = AuthLimitsProperties.defaults();
+        MockEnvironment env = prodEnv()
+                .withProperty("app.auth-limits.phone-otp-max-sends-per-window", String.valueOf(d.phoneOtpMaxSendsPerWindow()))
+                .withProperty("app.auth-limits.phone-otp-max-verify-attempts", String.valueOf(d.phoneOtpMaxVerifyAttempts()))
+                .withProperty("app.auth-limits.email-code-max-verify-attempts", String.valueOf(d.emailCodeMaxVerifyAttempts()))
+                .withProperty("app.auth-limits.login-max-failures", String.valueOf(d.loginMaxFailures()))
+                .withProperty("app.auth-limits.login-lock-window", d.loginLockWindow().toString())
+                .withProperty("app.auth-limits.otp-verify-ip-capacity", String.valueOf(d.otpVerifyIpCapacity()))
+                .withProperty("app.auth-limits.guest-booking-ip-capacity", String.valueOf(d.guestBookingIpCapacity()));
+
+        assertThatCode(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS)).doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("audit-fix: prod with tighter auth limits (lower count, longer lock window) passes")
+    void should_pass_when_prodTightensAuthLimits() {
+        MockEnvironment env = prodEnv()
+                .withProperty("app.auth-limits.login-max-failures", "1")
+                .withProperty("app.auth-limits.login-lock-window", "1h");
+
+        assertThatCode(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS)).doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("audit-fix: staging with a relaxed auth limit fails auth-limits-not-loosened too")
+    void should_fail_when_stagingLoosensAuthLimits() {
+        MockEnvironment env = stagingEnv().withProperty("app.auth-limits.otp-verify-ip-capacity", "100000");
+
+        assertThatThrownBy(() -> run(env, DeployEnvironment.STAGING, SmsMode.CAPTURE))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("app.auth-limits.otp-verify-ip-capacity");
     }
 }
