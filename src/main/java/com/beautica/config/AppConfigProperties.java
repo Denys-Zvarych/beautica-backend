@@ -37,6 +37,7 @@ import org.springframework.context.annotation.Configuration;
         GuestPiiRetentionProperties.class,
         BookingLinksProperties.class,
         BookingInfoWorkerProperties.class,
+        ClientIpProperties.class,
         TurnstileProperties.class,
         ModerationProperties.class,
         ModerationActionLinkProperties.class,

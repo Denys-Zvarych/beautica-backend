@@ -3,6 +3,7 @@ package com.beautica.auth.filter;
 import com.beautica.common.security.BearerTokenExtractor;
 import com.beautica.common.security.ConstantTimeSecrets;
 import com.beautica.config.BookingInfoWorkerProperties;
+import com.beautica.config.ClientIpProperties;
 import com.beautica.config.RateLimitConfig;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.github.benmanes.caffeine.cache.LoadingCache;
@@ -850,6 +851,9 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // A secret: never logged.
     private final String bookingInfoWorkerKey;
 
+    // Bound to app.rate-limit.trust-forwarded-headers — false (local profile) keys every bucket on the socket address only.
+    private final ClientIpResolver clientIpResolver;
+
     /**
      * Feature-off constructor: identical to the Spring constructor with no website-Worker key configured.
      * The only PUBLIC constructor, so the slice/regression tests that build this filter directly (and the
@@ -910,7 +914,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                 moderationActionBuckets(MODERATION_ACTION_DECISION_DEFAULT_CAPACITY),
                 telegramLinkBuckets(RateLimitConfig.TELEGRAM_LINK_DEFAULT_CAPACITY),
                 telegramLinkBuckets(RateLimitConfig.TELEGRAM_LINK_READ_DEFAULT_CAPACITY),
-                new BookingInfoWorkerProperties());
+                new BookingInfoWorkerProperties(),
+                new ClientIpResolver(ClientIpProperties.trustingForwardedHeaders()));
     }
 
     /**
@@ -975,10 +980,14 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                 moderationActionDecisionBuckets,
                 telegramLinkBuckets(RateLimitConfig.TELEGRAM_LINK_DEFAULT_CAPACITY),
                 telegramLinkBuckets(RateLimitConfig.TELEGRAM_LINK_READ_DEFAULT_CAPACITY),
-                bookingInfoWorker);
+                bookingInfoWorker,
+                new ClientIpResolver(ClientIpProperties.trustingForwardedHeaders()));
     }
 
-    /** Spring constructor: as the public one, plus the optional website-Worker key (feature off when blank). */
+    /**
+     * Spring constructor: as the public one, plus the optional website-Worker key (feature off when blank) and the
+     * client-IP resolver bound to the forwarded-header trust flag (the other constructors trust the header, the prod rule).
+     */
     @Autowired
     AuthRateLimitFilter(
             @Qualifier("registerBuckets") LoadingCache<String, Bucket> registerBuckets,
@@ -1010,7 +1019,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             @Qualifier("moderationActionDecisionBuckets") LoadingCache<String, Bucket> moderationActionDecisionBuckets,
             @Qualifier("telegramLinkIssueBuckets") LoadingCache<String, Bucket> telegramLinkIssueBuckets,
             @Qualifier("telegramLinkReadBuckets") LoadingCache<String, Bucket> telegramLinkReadBuckets,
-            BookingInfoWorkerProperties bookingInfoWorker) {
+            BookingInfoWorkerProperties bookingInfoWorker,
+            ClientIpResolver clientIpResolver) {
         this.registerBuckets = registerBuckets;
         this.loginBuckets = loginBuckets;
         this.refreshBuckets = refreshBuckets;
@@ -1041,6 +1051,7 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         this.telegramLinkIssueBuckets = telegramLinkIssueBuckets;
         this.telegramLinkReadBuckets = telegramLinkReadBuckets;
         this.bookingInfoWorkerKey = bookingInfoWorker.isEnabled() ? bookingInfoWorker.getWorkerKey() : null;
+        this.clientIpResolver = clientIpResolver;
         this.otpVerifyBuckets = Caffeine.newBuilder()
                 .maximumSize(100_000)
                 .expireAfterAccess(OTP_VERIFY_WINDOW.plusMinutes(5))
@@ -1837,12 +1848,16 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             retryAfterSeconds = SUPPORT_CONTACT_RETRY_AFTER_SECONDS;
         } else if (OTP_SEND_PATH.equals(path) || REGISTER_OTP_SEND_PATH.equals(path)
                 || USER_PHONE_OTP_SEND_PATH.equals(path)) {
-            cache = otpSendBuckets;
-            retryAfterSeconds = OTP_SEND_RETRY_AFTER_SECONDS;
+            // Keyed per IPv6 /64 like the review-invite and Telegram-link routes: one host rotating the low 64 bits
+            // of its address must not mint a fresh 3-SMS budget per address. IPv4 keys are unchanged.
+            applyRateLimit(request, response, filterChain, otpSendBuckets,
+                    OTP_SEND_RETRY_AFTER_SECONDS, 1L, perIpv6Prefix(resolveBucketKey(request)));
+            return;
         } else if (OTP_VERIFY_PATH.equals(path) || REGISTER_OTP_VERIFY_PATH.equals(path)
                 || USER_PHONE_OTP_VERIFY_PATH.equals(path)) {
-            cache = otpVerifyBuckets;
-            retryAfterSeconds = OTP_VERIFY_RETRY_AFTER_SECONDS;
+            applyRateLimit(request, response, filterChain, otpVerifyBuckets,
+                    OTP_VERIFY_RETRY_AFTER_SECONDS, 1L, perIpv6Prefix(resolveBucketKey(request)));
+            return;
         } else {
             filterChain.doFilter(request, response);
             return;
@@ -2188,7 +2203,7 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     }
 
     /**
-     * Phase 401 audit-fix — the review-invite buckets only: {@code key} re-keyed by {@link #visitorIpBucketKey} (an IPv6
+     * Phase 401 audit-fix — the review-invite, Telegram-link and OTP send/verify buckets only: {@code key} re-keyed by {@link #visitorIpBucketKey} (an IPv6
      * client on its /64, IPv4 unchanged), so one subscriber rotating the low 64 bits of its address cannot mint a fresh
      * 5-request POST budget per address. A key that is not a bare IP literal (already {@code …/64}, or the clamped
      * remote address) is returned as is. Every other bucket keeps its per-address key.
@@ -2236,6 +2251,6 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     }
 
     private String resolveClientIp(HttpServletRequest request) {
-        return ClientIpResolver.resolve(request);
+        return clientIpResolver.resolve(request);
     }
 }
