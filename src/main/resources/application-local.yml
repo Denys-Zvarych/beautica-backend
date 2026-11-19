@@ -172,3 +172,10 @@ springdoc:
     enabled: true
   swagger-ui:
     enabled: true
+
+# Local seeding speed (seed-demo-fleet.sh): drain the notification outbox every 0.5 s instead of 5 s, so a staff-invite
+# SMS (B520, sent by NotificationOutboxDrainWorker) reaches Mailpit quickly. Local profile only; base default stays 5000.
+notification:
+  outbox:
+    drain:
+      fixed-delay-ms: 500
