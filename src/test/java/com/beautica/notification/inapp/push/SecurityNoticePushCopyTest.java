@@ -33,4 +33,17 @@ class SecurityNoticePushCopyTest {
                 .isEqualTo(SecurityNoticeExpectedCopy.PUSH_BODY)
                 .doesNotContain("gmail");
     }
+
+    @Test
+    @DisplayName("should_renderPasswordNotice_when_passwordReset")
+    void should_renderPasswordNotice_when_passwordReset() {
+        var params = NotificationParams.securityNotice(null);
+
+        String title = PushCopy.title(InAppNotificationType.SECURITY_PASSWORD_RESET, true);
+        String body = PushCopy.body(InAppNotificationType.SECURITY_PASSWORD_RESET, true, params);
+
+        assertThat(title).isEqualTo(SecurityNoticeExpectedCopy.PUSH_TITLE_PASSWORD);
+        assertThat(body).isEqualTo(SecurityNoticeExpectedCopy.PUSH_BODY_PASSWORD)
+                .doesNotContainPattern("\\d{6}");
+    }
 }

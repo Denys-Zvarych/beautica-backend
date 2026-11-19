@@ -116,7 +116,7 @@ class LocalProfileAuthLimitsRelaxedTest {
         AuthLimitsProperties staging = bindAuthLimits(STAGING);
         AuthLimitsProperties test = bindAuthLimits("application-test.yml", "application.yml");
 
-        AuthLimitsProperties oldConstants = new AuthLimitsProperties(3, 5, 5, 10, Duration.ofMinutes(15), 10, 10);
+        AuthLimitsProperties oldConstants = new AuthLimitsProperties(3, 5, 5, 10, Duration.ofMinutes(15), 10, 10, 10, 60);
         assertThat(prod).as("prod").isEqualTo(oldConstants);
         assertThat(staging).as("prod,staging").isEqualTo(oldConstants);
         assertThat(test).as("test").isEqualTo(oldConstants);

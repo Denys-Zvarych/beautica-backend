@@ -8,7 +8,6 @@ import com.beautica.master.service.MasterService;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
 import org.springframework.dao.DataIntegrityViolationException;
-import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
@@ -32,30 +31,30 @@ public class PhoneRegistrationService {
 
     private final RegistrationTicketService ticketService;
     private final UserRepository userRepository;
-    private final PasswordEncoder passwordEncoder;
     private final MasterService masterService;
     private final AuthResponseBuilder authResponseBuilder;
     private final Clock clock;
 
     public PhoneRegistrationService(RegistrationTicketService ticketService,
                                     UserRepository userRepository,
-                                    PasswordEncoder passwordEncoder,
                                     MasterService masterService,
                                     AuthResponseBuilder authResponseBuilder,
                                     Clock clock) {
         this.ticketService = ticketService;
         this.userRepository = userRepository;
-        this.passwordEncoder = passwordEncoder;
         this.masterService = masterService;
         this.authResponseBuilder = authResponseBuilder;
         this.clock = clock;
     }
 
-    /** Self-registration fields of a phone account; {@code businessName} only for SALON_OWNER. */
-    public record PhoneAccount(String registrationTicket, String password, Role role, String firstName,
+    /**
+     * Self-registration fields of a phone account; {@code businessName} only for SALON_OWNER. Phone-first hardening
+     * B12: carries the BCrypt hash, computed by the caller BEFORE its transaction — never the raw password.
+     */
+    public record PhoneAccount(String registrationTicket, String passwordHash, Role role, String firstName,
                                String lastName, String businessName, TermsConsentPayload consent) {
 
-        /** Carries the password — never print it. */
+        /** Carries the ticket and the password hash — never print them. */
         @Override
         public String toString() {
             return "PhoneAccount[role=" + role + "]";
@@ -68,12 +67,10 @@ public class PhoneRegistrationService {
      */
     @Transactional(propagation = Propagation.MANDATORY)
     public AuthResponse register(PhoneAccount account) {
-        // BCrypt before consume: consume row-locks the ticket, so hashing first keeps the lock and connection short.
-        String passwordHash = passwordEncoder.encode(account.password());
         String phone = ticketService.consume(account.registrationTicket());
         assertPhoneFree(phone);
         Instant now = clock.instant();
-        User user = User.registerWithVerifiedPhone(phone, passwordHash,
+        User user = User.registerWithVerifiedPhone(phone, account.passwordHash(),
                 account.role(), account.firstName(), blankToNull(account.lastName()), account.businessName(), now);
         TermsConsentStamp.apply(user, account.consent(), now);
         User saved = saveClaimingPhone(userRepository, user);

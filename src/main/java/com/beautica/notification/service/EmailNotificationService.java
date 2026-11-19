@@ -584,6 +584,7 @@ public class EmailNotificationService {
         }
         var ctx = new Context();
         ctx.setVariable("phone", kind == ContactChangeKind.PHONE);
+        ctx.setVariable("password", kind == ContactChangeKind.PASSWORD);
         ctx.setVariable("maskedValue", maskedNewValue);
         try {
             send(to, contactChangedSubject(kind), "email/contact-changed", ctx);
@@ -593,9 +594,11 @@ public class EmailNotificationService {
     }
 
     static String contactChangedSubject(ContactChangeKind kind) {
-        return kind == ContactChangeKind.PHONE
-                ? "Beautica: номер телефону змінено"
-                : "Beautica: email для сповіщень змінено";
+        return switch (kind) {
+            case PHONE -> "Beautica: номер телефону змінено";
+            case EMAIL -> "Beautica: email для сповіщень змінено";
+            case PASSWORD -> "Beautica: пароль змінено";
+        };
     }
 
     public void sendVerificationEmail(String to, String rawOtp) {

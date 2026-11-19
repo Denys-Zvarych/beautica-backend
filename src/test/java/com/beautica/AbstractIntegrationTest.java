@@ -136,6 +136,8 @@ public abstract class AbstractIntegrationTest {
         // Phase 13.2: phone_otps had no FK (guest flow, no user row). B514 (V244) adds phone_otps.user_id ->
         // users(id) ON DELETE CASCADE, so it must precede the users DELETE (§O-7, no reliance on CASCADE).
         jdbcTemplate.execute("DELETE FROM phone_otps");
+        // V258 — the per-(phone, network) failed-verify log; no FK, listed explicitly (§O7).
+        jdbcTemplate.execute("DELETE FROM phone_otp_failures");
         // B514 (V244): phone_registration_tickets has no FK either way (phone + hash only).
         jdbcTemplate.execute("DELETE FROM phone_registration_tickets");
         // B516 (V245): user_pending_emails.user_id -> users(id) ON DELETE CASCADE; deleted explicitly first (§O-7).

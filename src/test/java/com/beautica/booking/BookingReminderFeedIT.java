@@ -8,6 +8,7 @@ import com.beautica.booking.service.BookingService;
 import com.beautica.common.TimeZones;
 import com.beautica.config.FirebaseConfig;
 import com.beautica.notification.inapp.push.BookingReminderPushExpectedCopy;
+import com.beautica.notification.inapp.push.PushTestSupport;
 import com.beautica.notification.service.NotificationOutboxDrainWorker;
 import com.beautica.support.MutableTestClock;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -20,7 +21,6 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.mockito.ArgumentCaptor;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpMethod;
@@ -58,7 +58,7 @@ import static org.mockito.Mockito.verifyNoMoreInteractions;
  * is its own cached context (FIREBASE_ENABLED differs from every other reminder IT).
  */
 @TestPropertySource(properties = {"FIREBASE_ENABLED=true", "app.booking.reminder-2h.enabled=true"})
-@Import(GuestTwoHourReminderIT.ClockConfig.class)
+@Import({GuestTwoHourReminderIT.ClockConfig.class, PushTestSupport.class})
 @DisplayName("BookingReminderFeedIT — phase 495 BOOKING_REMINDER feed row + push")
 class BookingReminderFeedIT extends AbstractStaffBookingIT {
 
@@ -69,7 +69,7 @@ class BookingReminderFeedIT extends AbstractStaffBookingIT {
     /** Short slot so two same-master CONFIRMED bookings fit the 30-minute 2 h window without overlapping. */
     private static final int SHORT_SLOT_MINUTES = 10;
 
-    @MockBean private FirebaseConfig.FirebaseSender firebaseSender;
+    @Autowired private FirebaseConfig.FirebaseSender firebaseSender; // Mockito mock, PushTestSupport
 
     @Autowired private BookingReminderJob reminderJob;
     @Autowired private RegisteredBookingReminderSweep registeredSweep;
@@ -87,8 +87,7 @@ class BookingReminderFeedIT extends AbstractStaffBookingIT {
         clock.set(NOW);
         client = insertUser("CLIENT", null);
         // The push twin enqueues INAPP_PUSH only for a recipient with an active device token.
-        jdbcTemplate.update("INSERT INTO device_tokens (user_id, token, platform) VALUES (?, ?, 'ANDROID')",
-                client.id(), "reminder-feed-token-" + client.id());
+        PushTestSupport.registerAndroidDevice(jdbcTemplate, client.id(), "reminder-feed-token-" + client.id());
     }
 
     @AfterEach
@@ -146,8 +145,7 @@ class BookingReminderFeedIT extends AbstractStaffBookingIT {
     void should_writeOneRowAndOnePushPerBooking_when_twoBookingsClaimedInOneTick() {
         // Arrange
         SeededUser secondClient = insertUser("CLIENT", null);
-        jdbcTemplate.update("INSERT INTO device_tokens (user_id, token, platform) VALUES (?, ?, 'ANDROID')",
-                secondClient.id(), "reminder-feed-token-" + secondClient.id());
+        PushTestSupport.registerAndroidDevice(jdbcTemplate, secondClient.id(), "reminder-feed-token-" + secondClient.id());
         // Both inside the 24 h window [23h, 25h]; 60-minute slots that do not overlap (same master).
         OffsetDateTime firstStart = at(NOW.plus(Duration.ofMinutes(24 * 60 + 30)));
         OffsetDateTime secondStart = at(NOW.plus(Duration.ofMinutes(23 * 60 + 10)));
@@ -386,8 +384,7 @@ class BookingReminderFeedIT extends AbstractStaffBookingIT {
     void should_writeNoH2Row_when_clientDeactivated() {
         // Arrange
         SeededUser inactiveClient = insertUser("CLIENT", null);
-        jdbcTemplate.update("INSERT INTO device_tokens (user_id, token, platform) VALUES (?, ?, 'ANDROID')",
-                inactiveClient.id(), "reminder-feed-token-" + inactiveClient.id());
+        PushTestSupport.registerAndroidDevice(jdbcTemplate, inactiveClient.id(), "reminder-feed-token-" + inactiveClient.id());
         UUID inactiveBooking = insertAppBooking(inactiveClient.id(), at(NOW.plus(Duration.ofMinutes(120))),
                 NOW.minus(Duration.ofDays(1)), SHORT_SLOT_MINUTES);
         jdbcTemplate.update("UPDATE users SET is_active = false WHERE id = ?", inactiveClient.id());
@@ -414,8 +411,7 @@ class BookingReminderFeedIT extends AbstractStaffBookingIT {
     void should_writeNo24hRow_when_clientDeactivated() {
         // Arrange
         SeededUser inactiveClient = insertUser("CLIENT", null);
-        jdbcTemplate.update("INSERT INTO device_tokens (user_id, token, platform) VALUES (?, ?, 'ANDROID')",
-                inactiveClient.id(), "reminder-feed-token-" + inactiveClient.id());
+        PushTestSupport.registerAndroidDevice(jdbcTemplate, inactiveClient.id(), "reminder-feed-token-" + inactiveClient.id());
         // Both inside the 24 h window [now+23h, now+25h]; 10-minute slots so they never overlap.
         UUID inactiveBooking = insertAppBooking(inactiveClient.id(), at(NOW.plus(Duration.ofMinutes(24 * 60 + 30))),
                 NOW.minus(Duration.ofDays(2)), SHORT_SLOT_MINUTES);

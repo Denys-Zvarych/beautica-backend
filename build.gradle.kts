@@ -237,6 +237,9 @@ tasks.withType<Test> {
     val testRootLogLevel = (project.findProperty("testRootLogLevel") as String?) ?: "INFO"
     systemProperty("test.log.level", testLogLevel)
     systemProperty("test.root.log.level", testRootLogLevel)
+    // Phone-first hardening B17: `./gradlew test --tests '*IdentityErrorCodeContractTest' -Dcontract.update=true`
+    // rewrites src/test/resources/contract/identity-error-codes.json from the code table (forwarded to the test JVM).
+    System.getProperty("contract.update")?.let { systemProperty("contract.update", it) }
 
     testLogging {
         // Lifecycle logs come from the SLF4J TestSuiteLoggerListener / TestIntentLoggerExtension,

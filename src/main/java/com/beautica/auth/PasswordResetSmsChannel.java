@@ -19,7 +19,7 @@ import java.util.Optional;
 /**
  * B516 (AUTH-12, AUTH-15, AUTH-D18) — the SMS branch of forgot / change password, for an account WITHOUT a confirmed
  * email: the code goes to its verified phone through {@link PhoneOtpService} (purpose
- * {@link PhoneOtpPurpose#PASSWORD_RESET}, 15 min, 5 attempts per code, the per-phone cap shared with every other
+ * {@link PhoneOtpPurpose#PASSWORD_RESET}, 10 min (AUTH-D26 b), 5 attempts per code, the per-phone cap shared with every other
  * purpose, same SMS text). The caller has already passed App Check (AUTH-54).
  *
  * <p>Like the email branch, the SMS is handed to {@code smsSendExecutor} after the caller's transaction commits:
@@ -67,7 +67,10 @@ public class PasswordResetSmsChannel {
 
     /** Sends the code after the current transaction commits (immediately when none is active). */
     public void sendAfterCommit(String phoneE164) {
-        Runnable handOff = () -> handOff(phoneE164);
+        // AUTH-D26 (c) audit-fix: the per-(phone, network) cap needs the caller's network, which only the request
+        // thread knows — captured here, carried to the executor.
+        String clientNet = phoneOtpService.currentClientNetwork();
+        Runnable handOff = () -> handOff(phoneE164, clientNet);
         if (!TransactionSynchronizationManager.isSynchronizationActive()) {
             handOff.run();
             return;
@@ -80,18 +83,18 @@ public class PasswordResetSmsChannel {
         });
     }
 
-    private void handOff(String phoneE164) {
+    private void handOff(String phoneE164, String clientNet) {
         try {
-            smsSendExecutor.execute(() -> sendQuietly(phoneE164));
+            smsSendExecutor.execute(() -> sendQuietly(phoneE164, clientNet));
         } catch (RuntimeException rejected) {
             log.warn("password-reset SMS hand-off refused: {}", rejected.getClass().getSimpleName());
         }
     }
 
     /** Never throws: a 429 (per-phone cap) or 503 (provider) is logged by class name only — no phone, no code. */
-    private void sendQuietly(String phoneE164) {
+    private void sendQuietly(String phoneE164, String clientNet) {
         try {
-            phoneOtpService.sendCode(phoneE164, null, PhoneOtpPurpose.PASSWORD_RESET);
+            phoneOtpService.sendCodeFromNetwork(phoneE164, PhoneOtpPurpose.PASSWORD_RESET, clientNet);
         } catch (RuntimeException e) {
             log.warn("password-reset SMS not sent: {}", e.getClass().getSimpleName());
         }

@@ -20,7 +20,9 @@ import java.time.Duration;
  *   <li>{@code phone-otp-max-verify-attempts} — wrong tries before a phone OTP code is invalidated;</li>
  *   <li>{@code email-code-max-verify-attempts} — wrong tries before an email-change code expires ({@link NotificationEmailService});</li>
  *   <li>{@code login-max-failures} / {@code login-lock-window} — login and current-password lockout ({@link LoginFailureLimiter});</li>
- *   <li>{@code otp-verify-ip-capacity} / {@code guest-booking-ip-capacity} — per-IP buckets per 15 min ({@link AuthRateLimitFilter}).</li>
+ *   <li>{@code otp-verify-ip-capacity} / {@code guest-booking-ip-capacity} — per-IP buckets per 15 min ({@link AuthRateLimitFilter});</li>
+ *   <li>{@code phone-failed-verifies-per-day} — wrong SMS codes per phone per rolling 24 h, every purpose (AUTH-D26 c);</li>
+ *   <li>{@code otp-resend-cooldown-seconds} — gap between two SMS codes to one phone for one purpose (AUTH-D27 a).</li>
  * </ul>
  */
 @ConfigurationProperties(prefix = "app.auth-limits")
@@ -31,7 +33,9 @@ public record AuthLimitsProperties(
         @DefaultValue("" + LoginFailureLimiter.MAX_FAILURES) int loginMaxFailures,
         @DefaultValue("15m") Duration loginLockWindow,
         @DefaultValue("" + AuthRateLimitFilter.OTP_VERIFY_CAPACITY) long otpVerifyIpCapacity,
-        @DefaultValue("" + AuthRateLimitFilter.GUEST_BOOKING_CAPACITY) long guestBookingIpCapacity
+        @DefaultValue("" + AuthRateLimitFilter.GUEST_BOOKING_CAPACITY) long guestBookingIpCapacity,
+        @DefaultValue("" + PhoneOtpService.MAX_FAILED_VERIFIES_PER_DAY) int phoneFailedVerifiesPerDay,
+        @DefaultValue("" + PhoneOtpService.RESEND_COOLDOWN_SECONDS) int otpResendCooldownSeconds
 ) {
 
     public AuthLimitsProperties {
@@ -41,6 +45,8 @@ public record AuthLimitsProperties(
         requirePositive(loginMaxFailures, "login-max-failures");
         requirePositive(otpVerifyIpCapacity, "otp-verify-ip-capacity");
         requirePositive(guestBookingIpCapacity, "guest-booking-ip-capacity");
+        requirePositive(phoneFailedVerifiesPerDay, "phone-failed-verifies-per-day");
+        requirePositive(otpResendCooldownSeconds, "otp-resend-cooldown-seconds");
         if (loginLockWindow == null || loginLockWindow.isNegative() || loginLockWindow.isZero()) {
             throw new IllegalStateException("app.auth-limits.login-lock-window must be a positive duration");
         }
@@ -55,7 +61,9 @@ public record AuthLimitsProperties(
                 LoginFailureLimiter.MAX_FAILURES,
                 LoginFailureLimiter.LOCK_WINDOW,
                 AuthRateLimitFilter.OTP_VERIFY_CAPACITY,
-                AuthRateLimitFilter.GUEST_BOOKING_CAPACITY);
+                AuthRateLimitFilter.GUEST_BOOKING_CAPACITY,
+                PhoneOtpService.MAX_FAILED_VERIFIES_PER_DAY,
+                PhoneOtpService.RESEND_COOLDOWN_SECONDS);
     }
 
     private static void requirePositive(long value, String key) {

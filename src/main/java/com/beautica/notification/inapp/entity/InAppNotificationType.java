@@ -52,11 +52,16 @@ public enum InAppNotificationType {
      */
     SECURITY_PHONE_CHANGED,
     /** B516 (AUTH-D19) — as {@link #SECURITY_PHONE_CHANGED}, after the notifications email was added or changed. */
-    SECURITY_EMAIL_CHANGED;
+    SECURITY_EMAIL_CHANGED,
+    /**
+     * Phone-first hardening (AUTH-D26 a, V256) — as {@link #SECURITY_PHONE_CHANGED}, after a successful password reset;
+     * carries no masked contact. Appended last.
+     */
+    SECURITY_PASSWORD_RESET;
 
     /** B516 — the account security notices; each carries only {@code subject_user_id} (= the recipient). */
     public boolean isSecurityNotice() {
-        return this == SECURITY_PHONE_CHANGED || this == SECURITY_EMAIL_CHANGED;
+        return this == SECURITY_PHONE_CHANGED || this == SECURITY_EMAIL_CHANGED || this == SECURITY_PASSWORD_RESET;
     }
 
     /** Phase 415 — the moderation-outcome types; each carries {@code moderated_target_type} and no other referent. */

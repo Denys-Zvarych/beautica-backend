@@ -440,16 +440,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // forwards the visitor IP in this header. Trusted ONLY with a matching worker key (like CF-Connecting-IP) and
     // preferred over CF-Connecting-IP when both hold a valid IP literal.
     private static final String CLIENT_IP_HEADER = "X-Beautica-Client-IP";
-    private static final int MAX_IP_LITERAL_LENGTH = 45;
-    private static final Pattern IPV4_LITERAL = Pattern.compile(
-            "^((25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)\\.){3}(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)$");
-    // First char hex or ':' — InetAddress.getByName only takes its literal-parsing path for such a value
-    // (a leading '.' would fall through to a DNS lookup); the ':' requirement below makes it IPv6-only.
-    private static final Pattern IPV6_LITERAL_CHARS = Pattern.compile("^[0-9A-Fa-f:][0-9A-Fa-f:.]*$");
-    // IPv6 visitors are keyed on their /64: one subscriber is routinely handed a whole /64, so a per-/128
-    // key would let a single host mint 2^64 fresh buckets by rotating its interface identifier.
-    private static final int IPV6_BUCKET_PREFIX_BYTES = 8;
-    private static final String IPV6_BUCKET_SUFFIX = "/64";
+    // IP-literal parsing and the IPv6 /64 keying moved to ClientIpResolver (phone-first hardening B10) so the
+    // login lockout keys an address exactly as the login bucket does.
     // Per-IP cap for GET /api/v1/search/** (240 / 60 s). These permitAll() discovery reads
     // expose authed-only street addresses for independent masters, so the throttle bounds the
     // RATE at which a single source can page through every district/city and the DB work each
@@ -1879,7 +1871,10 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         if (REGISTER_PATH.equals(path) || REGISTER_IM_PATH.equals(path)) {
             cache = registerBuckets;
         } else if (LOGIN_PATH.equals(path)) {
-            cache = loginBuckets;
+            // AUTH-D27 (e): keyed per IPv6 /64 (IPv4 unchanged), the key the AUTH-08 lockout uses too.
+            applyRateLimit(request, response, filterChain, loginBuckets,
+                    RETRY_AFTER_SECONDS, 1L, perIpv6Prefix(resolveBucketKey(request)));
+            return;
         } else if (REFRESH_PATH.equals(path)) {
             cache = refreshBuckets;
         } else if (VERIFY_EMAIL_PATH.equals(path) || USER_EMAIL_VERIFY_PATH.equals(path)) {
@@ -2246,80 +2241,22 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         return visitorKey != null ? visitorKey : resolveBucketKey(request);
     }
 
-    /**
-     * Bucket key for a forwarded visitor IP literal, or {@code null} when the value is not one. IPv4 (and
-     * IPv4-mapped IPv6, which parses to IPv4) keys on the canonical address; any other IPv6 address keys on
-     * its /64 prefix ({@code 2001:db8:0:0:0:0:0:0/64}), so rotating the low 64 bits never mints a new bucket.
-     * An IPv6 address whose /64 prefix is all zeros (IPv4-compatible {@code ::1.2.3.4}, loopback, ...) keys
-     * on the full canonical /128 address instead, so such values never collapse into one shared
-     * {@code 0:0:0:0:0:0:0:0/64} bucket.
-     */
+    /** Delegates to {@link ClientIpResolver#visitorIpBucketKey} (moved there, B10). */
     static String visitorIpBucketKey(String value) {
-        InetAddress address = parseIpLiteral(value);
-        if (address == null) {
-            return null;
-        }
-        if (!(address instanceof Inet6Address)) {
-            return address.getHostAddress();
-        }
-        byte[] bytes = address.getAddress();
-        if (isZeroPrefix(bytes)) {
-            return address.getHostAddress();
-        }
-        Arrays.fill(bytes, IPV6_BUCKET_PREFIX_BYTES, bytes.length, (byte) 0);
-        try {
-            return InetAddress.getByAddress(bytes).getHostAddress() + IPV6_BUCKET_SUFFIX;
-        } catch (UnknownHostException e) {
-            return null;
-        }
+        return ClientIpResolver.visitorIpBucketKey(value);
     }
 
     /**
-     * Phase 401 audit-fix — the review-invite, Telegram-link and OTP send/verify buckets only: {@code key} re-keyed by {@link #visitorIpBucketKey} (an IPv6
-     * client on its /64, IPv4 unchanged), so one subscriber rotating the low 64 bits of its address cannot mint a fresh
-     * 5-request POST budget per address. A key that is not a bare IP literal (already {@code …/64}, or the clamped
-     * remote address) is returned as is. Every other bucket keeps its per-address key.
+     * Phase 401 audit-fix — the review-invite, Telegram-link, OTP send/verify and (AUTH-D27 e) login buckets: {@code key}
+     * re-keyed per IPv6 /64 ({@link ClientIpResolver#prefixKey}).
      */
     static String perIpv6Prefix(String key) {
-        String prefixed = visitorIpBucketKey(key);
-        return prefixed != null ? prefixed : key;
+        return ClientIpResolver.prefixKey(key);
     }
 
-    /** True when the first {@value #IPV6_BUCKET_PREFIX_BYTES} bytes (the /64 prefix) are all zero. */
-    private static boolean isZeroPrefix(byte[] bytes) {
-        for (int i = 0; i < IPV6_BUCKET_PREFIX_BYTES; i++) {
-            if (bytes[i] != 0) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    /**
-     * Parses an IPv4/IPv6 LITERAL, or returns {@code null}. No DNS lookup is possible: a value reaches
-     * {@link InetAddress#getByName} only when it is a strict dotted-quad, or contains a ':' and starts with a
-     * hex digit or ':' — exactly the values the JDK parses as a literal (an IPv6 that fails to parse throws
-     * {@link UnknownHostException} instead of resolving). A leading '.' or any other character is rejected
-     * up front.
-     */
+    /** Delegates to {@link ClientIpResolver#parseIpLiteral} (moved there, B10). */
     static InetAddress parseIpLiteral(String value) {
-        if (value == null) {
-            return null;
-        }
-        String candidate = value.trim();
-        if (candidate.isEmpty() || candidate.length() > MAX_IP_LITERAL_LENGTH) {
-            return null;
-        }
-        boolean ipv4 = IPV4_LITERAL.matcher(candidate).matches();
-        boolean ipv6 = !ipv4 && candidate.indexOf(':') >= 0 && IPV6_LITERAL_CHARS.matcher(candidate).matches();
-        if (!ipv4 && !ipv6) {
-            return null;
-        }
-        try {
-            return InetAddress.getByName(candidate);
-        } catch (UnknownHostException e) {
-            return null;
-        }
+        return ClientIpResolver.parseIpLiteral(value);
     }
 
     private String resolveClientIp(HttpServletRequest request) {

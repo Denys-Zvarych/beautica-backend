@@ -29,7 +29,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * Concurrency regression (security LOW — Phase 13.2 hardening): the per-OTP verify
  * attempt counter must be atomic. {@link PhoneOtpService#verifyOtp} on a wrong code
  * increments {@code attempts} via a single conditional UPDATE
- * ({@link PhoneOtpRepository#recordFailedAttempt(Long, int)}) — never a read-modify-write
+ * ({@link PhoneOtpRepository#reserveAttempt(Long, int)}, phone-first hardening B1) — never a read-modify-write
  * of a managed entity. This test fires many parallel wrong-code verifies against ONE live
  * OTP row and asserts:
  * <ul>

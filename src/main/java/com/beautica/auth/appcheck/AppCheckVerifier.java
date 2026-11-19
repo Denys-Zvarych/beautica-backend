@@ -13,6 +13,7 @@ import org.springframework.stereotype.Component;
 
 import java.security.Key;
 import java.time.Clock;
+import java.time.Instant;
 import java.util.Date;
 import java.util.Set;
 
@@ -26,8 +27,9 @@ import java.util.Set;
  *   <li>{@code exp} in the future (injected {@link Clock});</li>
  *   <li>{@code sub} (the Firebase app id) is one of {@code app.auth.app-check.app-ids}.</li>
  * </ul>
- * No replay {@code consume} call (beta, one network call per send); the per-phone and per-IP limits cover replay
- * inside a token's lifetime. The parser is built once (Anti-Bug §C).
+ * No replay {@code consume} call (beta, one network call per send): {@link #verifyToken} hands the valid token's
+ * {@code jti} and {@code exp} to {@link AppCheckGuard}, which remembers accepted ids locally
+ * ({@link AppCheckReplayStore}, AUTH-D27 d). The parser is built once (Anti-Bug §C).
  */
 @Component
 public class AppCheckVerifier {
@@ -38,7 +40,9 @@ public class AppCheckVerifier {
 
     /** Outcome of one verification; also the {@code result} tag of the {@code appcheck.verify} counter. */
     public enum Result {
-        VALID("valid"), MISSING("missing"), INVALID("invalid"), UNAVAILABLE("unavailable");
+        VALID("valid"), MISSING("missing"), INVALID("invalid"), UNAVAILABLE("unavailable"),
+        /** Set by {@link AppCheckGuard} only: a valid token whose {@code jti} was already accepted. */
+        REPLAY("replay");
 
         private final String tag;
 
@@ -71,26 +75,45 @@ public class AppCheckVerifier {
     }
 
     /**
+     * One verification: the outcome, and for a {@link Result#VALID} token its {@code jti} (may be {@code null} when
+     * the token carries none) and {@code exp}.
+     */
+    public record Verification(Result result, String jti, Instant expiresAt) {
+
+        static Verification of(Result result) {
+            return new Verification(result, null, null);
+        }
+    }
+
+    /**
      * @param token the raw {@code X-Firebase-AppCheck} header value, possibly {@code null}
      * @return the outcome; never throws
      */
     public Result verify(String token) {
+        return verifyToken(token).result();
+    }
+
+    /** As {@link #verify}, plus the valid token's {@code jti} and {@code exp} for the replay check; never throws. */
+    public Verification verifyToken(String token) {
         if (token == null || token.isBlank()) {
-            return Result.MISSING;
+            return Verification.of(Result.MISSING);
         }
         if (token.length() > MAX_TOKEN_LENGTH || expectedAudience == null) {
-            return Result.INVALID;
+            return Verification.of(Result.INVALID);
         }
         try {
             Claims claims = parser.parseSignedClaims(token.strip()).getPayload();
-            return audienceMatches(claims) && allowedAppIds.contains(claims.getSubject())
-                    ? Result.VALID
-                    : Result.INVALID;
+            if (!audienceMatches(claims) || !allowedAppIds.contains(claims.getSubject())) {
+                return Verification.of(Result.INVALID);
+            }
+            Date exp = claims.getExpiration();
+            return new Verification(Result.VALID, claims.getId(), exp == null ? null : exp.toInstant());
         } catch (AppCheckKeysUnavailableException e) {
-            return Result.UNAVAILABLE;
+            return Verification.of(Result.UNAVAILABLE);
         } catch (JwtException | IllegalArgumentException e) {
             // Defensive: should the parser ever wrap a locator exception, the outage still reads as one.
-            return e.getCause() instanceof AppCheckKeysUnavailableException ? Result.UNAVAILABLE : Result.INVALID;
+            return Verification.of(e.getCause() instanceof AppCheckKeysUnavailableException
+                    ? Result.UNAVAILABLE : Result.INVALID);
         }
     }
 

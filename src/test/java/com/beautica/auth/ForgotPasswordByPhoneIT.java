@@ -78,8 +78,11 @@ class ForgotPasswordByPhoneIT extends AbstractPhoneIdentityIT {
 
         assertThat(verified.getStatusCode()).as("body: %s", verified.getBody()).isEqualTo(HttpStatus.OK);
         assertThat(smsCountTo(phone)).isZero();
-        assertThat(jdbcTemplate.queryForObject("SELECT COUNT(*) FROM phone_otps WHERE phone = ?", Integer.class,
-                phone)).isZero();
+        // AUTH-D27 (c): the email channel still burns one per-phone slot — a used, never-sent PASSWORD_RESET row.
+        assertThat(jdbcTemplate.queryForObject("SELECT COUNT(*) FROM phone_otps WHERE phone = ? AND used = false",
+                Integer.class, phone)).isZero();
+        assertThat(jdbcTemplate.queryForObject("SELECT COUNT(*) FROM phone_otps WHERE phone = ? AND used = true "
+                + "AND purpose = 'PASSWORD_RESET'", Integer.class, phone)).isOne();
     }
 
     @Test
@@ -224,5 +227,49 @@ class ForgotPasswordByPhoneIT extends AbstractPhoneIdentityIT {
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
         verify(otpSmsSender, never()).send(anyString(), anyString());
+    }
+
+    // ── Phone-first hardening AUTH-D26 (a) — the reset security notice ──
+
+    private int passwordResetNotices(UUID userId) {
+        return jdbcTemplate.queryForObject("SELECT COUNT(*) FROM in_app_notification WHERE recipient_user_id = ? "
+                + "AND type = 'SECURITY_PASSWORD_RESET'", Integer.class, userId);
+    }
+
+    @Test
+    @DisplayName("should_writeFeedNoticeAndEmailConfirmedAddress_when_passwordResetSucceeds")
+    void should_writeFeedNoticeAndEmailConfirmedAddress_when_passwordResetSucceeds() {
+        String phone = newPhone();
+        String email = newEmail();
+        UUID id = seedUser("CLIENT", email, true, phone, null);
+        forgot(phone);
+        String ticket = json(post(VERIFY_OTP_URL, Map.of("identifier", phone, "code", emailedResetCode())))
+                .at("/data/resetTicket").asText();
+        int smsBefore = smsCountTo(phone);
+
+        ResponseEntity<String> reset = post(RESET_URL, Map.of("resetTicket", ticket, "newPassword", NEW_PASSWORD));
+
+        assertThat(reset.getStatusCode()).as("body: %s", reset.getBody()).isEqualTo(HttpStatus.OK);
+        assertThat(passwordResetNotices(id)).isOne();
+        verify(emailNotificationService, org.mockito.Mockito.timeout(5_000)).sendContactChangedEmail(
+                email, com.beautica.notification.service.ContactChangeKind.PASSWORD, null);
+        assertThat(smsCountTo(phone)).as("the notice never goes by SMS").isEqualTo(smsBefore);
+    }
+
+    @Test
+    @DisplayName("should_writeFeedNoticeOnly_when_smsResetOnAccountWithoutEmail")
+    void should_writeFeedNoticeOnly_when_smsResetOnAccountWithoutEmail() {
+        String phone = newPhone();
+        UUID id = seedUser("CLIENT", null, false, phone, null);
+        forgot(phone);
+        String ticket = json(post(VERIFY_OTP_URL, Map.of("identifier", phone, "code", lastCodeSentTo(phone))))
+                .at("/data/resetTicket").asText();
+
+        ResponseEntity<String> reset = post(RESET_URL, Map.of("resetTicket", ticket, "newPassword", NEW_PASSWORD));
+
+        assertThat(reset.getStatusCode()).as("body: %s", reset.getBody()).isEqualTo(HttpStatus.OK);
+        assertThat(passwordResetNotices(id)).isOne();
+        assertThat(smsCountTo(phone)).as("only the reset code itself went by SMS").isOne();
+        verify(emailNotificationService, never()).sendContactChangedEmail(any(), any(), any());
     }
 }

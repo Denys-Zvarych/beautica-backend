@@ -91,11 +91,12 @@ class PhoneOtpVerifyBruteForceTest {
     @DisplayName("should_return401_andInvalidateOtp_afterNthWrongCode")
     void should_return401_andInvalidateOtp_afterNthWrongCode() throws Exception {
         // A single active OTP is returned for every lookup — the same row the attacker is
-        // hammering. The fix increments the attempt counter via an atomic conditional UPDATE
-        // (PhoneOtpRepository#recordFailedAttempt), not by mutating the loaded entity. We
-        // simulate that DB-side state here: the mock's recordFailedAttempt bumps a counter
-        // and flips `used` at the cap, and the active-OTP lookup returns empty once used —
-        // so the final CORRECT attempt no longer finds an active OTP and never mints a token.
+        // hammering. B1: each verify reserves one compare via an atomic conditional UPDATE
+        // (PhoneOtpRepository#reserveAttempt, `attempts < cap`), and a mismatch at the cap burns
+        // the row (recordMismatch). We simulate that DB-side state here: the reserve mock bumps
+        // a counter and refuses at the cap, the mismatch mock flips `used` at the cap, and the
+        // active-OTP lookup returns empty once used — so the final CORRECT attempt no longer
+        // finds an active OTP and never mints a token.
         PhoneOtp otp = PhoneOtp.issue(PHONE, sha256Hex(CORRECT_CODE), FIXED_NOW.plusSeconds(600));
         AtomicInteger dbAttempts = new AtomicInteger(0);
         AtomicBoolean dbUsed = new AtomicBoolean(false);
@@ -105,12 +106,21 @@ class PhoneOtpVerifyBruteForceTest {
                 .thenAnswer(inv -> dbUsed.get() ? Optional.empty() : Optional.of(otp));
         org.mockito.Mockito.doAnswer(inv -> {
                     int cap = inv.getArgument(1);
-                    if (dbAttempts.incrementAndGet() >= cap) {
+                    if (dbUsed.get() || dbAttempts.get() >= cap) {
+                        return false;
+                    }
+                    dbAttempts.incrementAndGet();
+                    return true;
+                }).when(attemptRecorder)
+                .reserveAttempt(any(), eq(PhoneOtp.MAX_VERIFY_ATTEMPTS));
+        org.mockito.Mockito.doAnswer(inv -> {
+                    int cap = inv.getArgument(1);
+                    if (dbAttempts.get() >= cap) {
                         dbUsed.set(true);
                     }
                     return null;
                 }).when(attemptRecorder)
-                .recordFailedAttempt(any(), eq(PhoneOtp.MAX_VERIFY_ATTEMPTS));
+                .recordMismatch(any(), eq(PhoneOtp.MAX_VERIFY_ATTEMPTS), any());
 
         // Burn the attempt budget with wrong codes. Each is a generic 401.
         for (int attempt = 1; attempt <= MAX_WRONG_ATTEMPTS_BEFORE_INVALIDATION; attempt++) {
@@ -134,7 +144,7 @@ class PhoneOtpVerifyBruteForceTest {
         // The increment must always pass the entity id + the MAX cap to the atomic UPDATE
         // (the conditional-invalidation contract lives in the query, not in-memory).
         verify(attemptRecorder, atLeastOnce())
-                .recordFailedAttempt(otp.getId(), PhoneOtp.MAX_VERIFY_ATTEMPTS);
+                .recordMismatch(otp.getId(), PhoneOtp.MAX_VERIFY_ATTEMPTS, OtpClientNetwork.UNKNOWN);
         assertThat(dbUsed.get())
                 .as("the brute-forced OTP must be marked used/invalidated after the attempt cap")
                 .isTrue();

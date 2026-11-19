@@ -78,9 +78,23 @@ public abstract class AbstractPhoneIdentityIT extends AbstractIntegrationTest {
         return post(url, body, new HttpHeaders());
     }
 
+    /** This test instance's client IP (IPv4, so it is also its per-network key, AUTH-D27 e). */
+    protected String clientIp() {
+        return clientIp;
+    }
+
+    /** As {@link #post(String, Object)} from another client address (a different network). */
+    protected ResponseEntity<String> postFrom(String ip, String url, Object body) {
+        return postWithIp(url, body, new HttpHeaders(), ip);
+    }
+
     protected ResponseEntity<String> post(String url, Object body, HttpHeaders headers) {
+        return postWithIp(url, body, headers, clientIp);
+    }
+
+    private ResponseEntity<String> postWithIp(String url, Object body, HttpHeaders headers, String ip) {
         headers.setContentType(MediaType.APPLICATION_JSON);
-        headers.set("X-Forwarded-For", clientIp);
+        headers.set("X-Forwarded-For", ip);
         try {
             return restTemplate.postForEntity(url, new HttpEntity<>(objectMapper.writeValueAsString(body), headers),
                     String.class);
@@ -158,6 +172,16 @@ public abstract class AbstractPhoneIdentityIT extends AbstractIntegrationTest {
 
     protected ResponseEntity<String> verifyCode(String phone, String code) {
         return post(VERIFY_URL, Map.of("phone", phone, "code", code));
+    }
+
+    /**
+     * Phone-first hardening (AUTH-D27 a) — moves every code row of {@code phoneE164} 61 s into the past, as if the 60 s
+     * per-phone+purpose resend cooldown had elapsed; the rows stay inside the 15-min send window and the 24 h
+     * failed-verify window, so those caps still count them. No sleeping, no clock bean.
+     */
+    protected void elapseResendCooldown(String phoneE164) {
+        jdbcTemplate.update("UPDATE phone_otps SET created_at = created_at - interval '61 seconds' WHERE phone = ?",
+                phoneE164);
     }
 
     /** The 6-digit code of the LAST SMS sent to {@code phoneE164}. */

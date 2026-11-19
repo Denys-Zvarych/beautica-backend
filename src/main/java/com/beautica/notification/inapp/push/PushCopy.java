@@ -133,6 +133,8 @@ public final class PushCopy {
             // B516 (AUTH-D19) — must equal the mobile ARB titles (M517).
             case SECURITY_PHONE_CHANGED -> "Номер телефону змінено";
             case SECURITY_EMAIL_CHANGED -> "Email для сповіщень змінено";
+            // AUTH-D26 (a) — the mobile ARB title must match (mobile follow-up).
+            case SECURITY_PASSWORD_RESET -> "Пароль змінено";
         };
     }
 
@@ -166,7 +168,7 @@ public final class PushCopy {
             return moderationOutcomeBody(type, params.contentKind());
         }
         if (type.isSecurityNotice()) {
-            return securityNoticeBody();
+            return securityNoticeBody(type);
         }
         String counterpart = sanitize(params.counterpartName());
         String service = sanitize(params.serviceName());
@@ -240,9 +242,15 @@ public final class PushCopy {
      * not) off the lock screen, the title says what changed, and the masked new value is shown in the feed
      * ({@code params.maskedContact}) and the email. {@code params} is non-null here (the subject row exists).
      */
-    private static String securityNoticeBody() {
-        return SECURITY_NOTICE_SUPPORT_LINE;
+    private static String securityNoticeBody(InAppNotificationType type) {
+        // AUTH-D26 (a): the password notice names no contact value, so its full sentence fits the lock screen.
+        return type == InAppNotificationType.SECURITY_PASSWORD_RESET
+                ? PASSWORD_RESET_NOTICE_LINE + " " + SECURITY_NOTICE_SUPPORT_LINE
+                : SECURITY_NOTICE_SUPPORT_LINE;
     }
+
+    /** AUTH-D26 (a) — the first sentence of the password-reset notice (push and email). */
+    public static final String PASSWORD_RESET_NOTICE_LINE = "Пароль до вашого акаунта змінено.";
 
     private static String contentRemovedBody(ModeratedContentKind kind) {
         if (kind == ModeratedContentKind.PORTFOLIO_PHOTO) {

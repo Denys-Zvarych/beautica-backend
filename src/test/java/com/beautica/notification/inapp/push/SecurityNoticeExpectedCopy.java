@@ -17,6 +17,16 @@ public final class SecurityNoticeExpectedCopy {
     /** The AUTH-D19 line closing every channel's notice. */
     public static final String SUPPORT_LINE = "Якщо це не ви — зверніться в підтримку.";
 
+    /** Push / feed title of {@code SECURITY_PASSWORD_RESET} (AUTH-D26 a). */
+    public static final String PUSH_TITLE_PASSWORD = "Пароль змінено";
+
+    /** Lock-screen body of {@code SECURITY_PASSWORD_RESET}: it names no contact, so the full sentence fits. */
+    public static final String PUSH_BODY_PASSWORD =
+            "Пароль до вашого акаунта змінено. Якщо це не ви — зверніться в підтримку.";
+
+    /** Email subject after a password reset (sent to the confirmed email). */
+    public static final String EMAIL_SUBJECT_PASSWORD = "Beautica: пароль змінено";
+
     /** Email subject after a phone change (sent to the confirmed email). */
     public static final String EMAIL_SUBJECT_PHONE = "Beautica: номер телефону змінено";
 

@@ -968,7 +968,8 @@ class AuthRateLimitFilterTest {
             // 45 chars is the guard boundary: length > 45 triggers fallback, so a valid exactly-45 literal
             // must be accepted and NOT replaced by REMOTE_ADDR. The key is its canonical form.
             String exactly45Chars = "2001:0db8:0000:0000:0000:0000:192.168.100.228";
-            String canonical = "2001:db8:0:0:0:0:c0a8:64e4";
+            // AUTH-D27 (e): the login bucket keys an IPv6 client on its /64 — the canonical address's prefix.
+            String canonical = "2001:db8:0:0:0:0:0:0/64";
             log.debug("Arrange: XFF rightmost entry is exactly {} chars — must be used as bucket key, not REMOTE_ADDR",
                     exactly45Chars.length());
             when(loginBuckets.get(canonical)).thenReturn(bucket);
@@ -2711,6 +2712,48 @@ class AuthRateLimitFilterTest {
 
             assertThat(limited).isEqualTo(429);
             assertThat(linkTokenStillOpen).isEqualTo(200);
+        }
+    }
+
+    // Phone-first hardening AUTH-D27 (e): the login bucket counts an IPv6 client per /64 (IPv4 per address).
+    @Nested
+    @DisplayName("login — IPv6 /64 keying")
+    class LoginIpv6PrefixKeying {
+
+        private MockHttpServletResponse loginFrom(AuthRateLimitFilter subject, String remoteAddr) throws Exception {
+            var request = new MockHttpServletRequest("POST", "/api/v1/auth/login");
+            request.setRemoteAddr(remoteAddr);
+            var response = new MockHttpServletResponse();
+            subject.doFilterInternal(request, response, new MockFilterChain());
+            return response;
+        }
+
+        @Test
+        @DisplayName("should_return429OnFourthLogin_when_addressesShareIpv6Slash64")
+        void should_return429OnFourthLogin_when_addressesShareIpv6Slash64() throws Exception {
+            AuthRateLimitFilter subject = realFilter(3, 1_000_000, false);
+
+            loginFrom(subject, "2001:db8:1:2::a");
+            loginFrom(subject, "2001:db8:1:2::b");
+            loginFrom(subject, "2001:db8:1:2::c");
+            MockHttpServletResponse fourth = loginFrom(subject, "2001:db8:1:2:ffff::d");
+
+            assertThat(fourth.getStatus()).isEqualTo(429);
+        }
+
+        @Test
+        @DisplayName("should_passLogin_when_otherSlash64OrOtherIpv4")
+        void should_passLogin_when_otherSlash64OrOtherIpv4() throws Exception {
+            AuthRateLimitFilter subject = realFilter(3, 1_000_000, false);
+            for (int i = 0; i < 3; i++) {
+                loginFrom(subject, "2001:db8:1:2::" + (i + 1));
+            }
+
+            MockHttpServletResponse otherPrefix = loginFrom(subject, "2001:db8:1:3::1");
+            MockHttpServletResponse ipv4 = loginFrom(subject, "203.0.113.9");
+
+            assertThat(otherPrefix.getStatus()).isNotEqualTo(429);
+            assertThat(ipv4.getStatus()).isNotEqualTo(429);
         }
     }
 }

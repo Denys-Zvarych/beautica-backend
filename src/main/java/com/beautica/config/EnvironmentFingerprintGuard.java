@@ -1,6 +1,7 @@
 package com.beautica.config;
 
 import com.beautica.config.appcheck.AppCheckLogOnlyAlarm;
+import com.beautica.config.appcheck.AppCheckMode;
 import com.beautica.config.appcheck.AppCheckProperties;
 import com.beautica.notification.mail.MailTransportKind;
 import com.beautica.review.invite.config.ReviewInviteProperties;
@@ -140,6 +141,7 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
         checkRailwayName(env, environment, violations);
         if (environment != DeployEnvironment.LOCAL) {
             checkAuthLimits(env, violations);
+            checkPhoneFirstRollout(env, log, violations);
             checkR2Bucket(env, environment, violations);
             checkLinkBaseUrls(env, environment, violations);
             checkInternalApiKey(env, violations);
@@ -316,6 +318,11 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
         addIfAbove(loosened, "otp-verify-ip-capacity", limits.otpVerifyIpCapacity(), defaults.otpVerifyIpCapacity());
         addIfAbove(loosened, "guest-booking-ip-capacity", limits.guestBookingIpCapacity(),
                 defaults.guestBookingIpCapacity());
+        addIfAbove(loosened, "phone-failed-verifies-per-day", limits.phoneFailedVerifiesPerDay(),
+                defaults.phoneFailedVerifiesPerDay());
+        if (limits.otpResendCooldownSeconds() < defaults.otpResendCooldownSeconds()) {
+            loosened.add(AUTH_LIMITS_PREFIX + ".otp-resend-cooldown-seconds");
+        }
         if (limits.loginLockWindow().compareTo(defaults.loginLockWindow()) < 0) {
             loosened.add(AUTH_LIMITS_PREFIX + ".login-lock-window");
         }
@@ -326,6 +333,51 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
     }
 
     static final String AUTH_LIMITS_PREFIX = "app.auth-limits";
+    static final String REQUIRE_PHONE_REGISTRATION = "app.auth.require-phone-registration";
+    static final String REQUIRE_VERIFIED_PHONE = "app.auth.require-verified-phone";
+    static final String ANDROID_MIN_VERSION_CODE = "app.client-version.android.min-version-code";
+    static final String APP_CHECK_REPLAY_MODE = "app.auth.app-check.replay-mode";
+
+    /**
+     * AUTH-D29 (rule {@code phone-first-rollout}, staging and prod only — tests and local flip the flags freely):
+     * {@code APP_AUTH_REQUIRE_PHONE_REGISTRATION} or {@code APP_AUTH_REQUIRE_VERIFIED_PHONE} true needs
+     * {@code APP_ANDROID_MIN_VERSION_CODE} &ge; {@link ClientBuildFloors#PHONE_FIRST_MIN_VERSION_CODE};
+     * {@code APP_AUTH_APP_CHECK_REPLAY=ENFORCE} needs it &ge; {@link ClientBuildFloors#APP_CHECK_LIMITED_USE_MIN_VERSION_CODE}
+     * — otherwise builds that still pass the forced-update gate would be locked out. Bound as the properties beans bind
+     * them; a value that cannot be bound fails closed with this rule. Logs the effective flags and floors at INFO.
+     */
+    private static void checkPhoneFirstRollout(Environment env, Log log, List<String> violations) {
+        boolean requirePhoneRegistration;
+        boolean requireVerifiedPhone;
+        int minVersionCode;
+        AppCheckMode replayMode;
+        try {
+            Binder binder = Binder.get(env);
+            requirePhoneRegistration = binder.bind(REQUIRE_PHONE_REGISTRATION, Boolean.class).orElse(false);
+            requireVerifiedPhone = binder.bind(REQUIRE_VERIFIED_PHONE, Boolean.class).orElse(false);
+            minVersionCode = binder.bind(ANDROID_MIN_VERSION_CODE, Integer.class).orElse(0);
+            replayMode = binder.bind(APP_CHECK_REPLAY_MODE, AppCheckMode.class).orElse(AppCheckMode.LOG_ONLY);
+        } catch (org.springframework.boot.context.properties.bind.BindException e) {
+            violations.add("rule phone-first-rollout: " + REQUIRE_PHONE_REGISTRATION + ", " + REQUIRE_VERIFIED_PHONE
+                    + ", " + ANDROID_MIN_VERSION_CODE + " or " + APP_CHECK_REPLAY_MODE + " could not be bound");
+            return;
+        }
+        log.info("Phone-first rollout: require-phone-registration=" + requirePhoneRegistration
+                + " require-verified-phone=" + requireVerifiedPhone + " app-check-replay=" + replayMode
+                + " android-min-version-code=" + minVersionCode
+                + " phone-first-floor=" + ClientBuildFloors.PHONE_FIRST_MIN_VERSION_CODE
+                + " limited-use-floor=" + ClientBuildFloors.APP_CHECK_LIMITED_USE_MIN_VERSION_CODE);
+        if ((requirePhoneRegistration || requireVerifiedPhone)
+                && minVersionCode < ClientBuildFloors.PHONE_FIRST_MIN_VERSION_CODE) {
+            violations.add("rule phone-first-rollout: " + REQUIRE_PHONE_REGISTRATION + " / " + REQUIRE_VERIFIED_PHONE
+                    + " true needs " + ANDROID_MIN_VERSION_CODE + " >= " + ClientBuildFloors.PHONE_FIRST_MIN_VERSION_CODE);
+        }
+        if (replayMode == AppCheckMode.ENFORCE
+                && minVersionCode < ClientBuildFloors.APP_CHECK_LIMITED_USE_MIN_VERSION_CODE) {
+            violations.add("rule phone-first-rollout: " + APP_CHECK_REPLAY_MODE + " ENFORCE needs "
+                    + ANDROID_MIN_VERSION_CODE + " >= " + ClientBuildFloors.APP_CHECK_LIMITED_USE_MIN_VERSION_CODE);
+        }
+    }
 
     private static void addIfAbove(List<String> loosened, String key, long value, long defaultValue) {
         if (value > defaultValue) {
