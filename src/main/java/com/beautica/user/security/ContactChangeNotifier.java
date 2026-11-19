@@ -75,6 +75,20 @@ public class ContactChangeNotifier {
         }
     }
 
+    /**
+     * Phone-first hardening (AUTH-D26 a) — after a successful password reset, inside the resetting transaction: the
+     * feed row (+ push to the account's device tokens; a reset revokes refresh tokens only) always, the email after
+     * commit to the confirmed email when there is one. Never an SMS, never a code, no contact value.
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void passwordReset(User user) {
+        inAppNotificationService.notifySecurityNotice(
+                InAppNotificationType.SECURITY_PASSWORD_RESET, user.getId(), null, clock.instant());
+        if (user.hasConfirmedEmail()) {
+            mailAfterCommit(user.getEmail(), ContactChangeKind.PASSWORD, null);
+        }
+    }
+
     private void mailAfterCommit(String to, ContactChangeKind kind, String maskedNewValue) {
         AfterCommitHandOff.submit(emailExecutor,
                 () -> emailNotificationService.sendContactChangedEmail(to, kind, maskedNewValue),

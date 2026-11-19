@@ -318,7 +318,7 @@ class InAppNotificationRepositoryIT extends AbstractDataJpaTest {
             "REPORT_CONTENT_REMOVED", "REPORT_NO_VIOLATION", "REPORT_REVIEWED", "CONTENT_REMOVED",
             "REVIEW_ABOUT_YOU_REMOVED",
             // B516: security notices carry no booking — covered by V246InAppSecurityNoticeTypeMigrationTest
-            "SECURITY_PHONE_CHANGED", "SECURITY_EMAIL_CHANGED"})
+            "SECURITY_PHONE_CHANGED", "SECURITY_EMAIL_CHANGED", "SECURITY_PASSWORD_RESET"})
     @DisplayName("in_app_notification_dedup_key_chk (V183) — every one of the 10 booking-keyed TYPE literals accepts "
             + "the common TYPE:uuid form, not just the 2-3 spot-checked above")
     void should_acceptTypeColonUuid_when_everyEnumType(InAppNotificationType type) {
@@ -674,7 +674,7 @@ class InAppNotificationRepositoryIT extends AbstractDataJpaTest {
     @ParameterizedTest
     @EnumSource(value = InAppNotificationType.class, names = {"INVITE_ACCEPTED",
             // B516: security notices carry no booking by design (V246 shape) — see V246InAppSecurityNoticeTypeMigrationTest
-            "SECURITY_PHONE_CHANGED", "SECURITY_EMAIL_CHANGED"}, mode = EnumSource.Mode.EXCLUDE)
+            "SECURITY_PHONE_CHANGED", "SECURITY_EMAIL_CHANGED", "SECURITY_PASSWORD_RESET"}, mode = EnumSource.Mode.EXCLUDE)
     @DisplayName("in_app_notification_shape_chk — every booking/review type requires booking_id or "
             + "appointment_id; a raw INSERT with neither set is rejected")
     void should_rejectWithNoBookingOrAppointment_when_rawInsert(InAppNotificationType type) {
@@ -692,7 +692,7 @@ class InAppNotificationRepositoryIT extends AbstractDataJpaTest {
             "REPORT_CONTENT_REMOVED", "REPORT_NO_VIOLATION", "REPORT_REVIEWED", "CONTENT_REMOVED",
             "REVIEW_ABOUT_YOU_REMOVED",
             // B516: security notices carry no booking — covered by V246InAppSecurityNoticeTypeMigrationTest
-            "SECURITY_PHONE_CHANGED", "SECURITY_EMAIL_CHANGED"})
+            "SECURITY_PHONE_CHANGED", "SECURITY_EMAIL_CHANGED", "SECURITY_PASSWORD_RESET"})
     @DisplayName("in_app_notification_shape_chk — booking_id alone satisfies every booking/review type")
     void should_acceptWithBookingIdOnly_when_rawInsert(InAppNotificationType type) {
         int inserted = repository.insertIgnoringDuplicate(UUID.randomUUID(), client.getId(), type.name(),
@@ -1435,7 +1435,7 @@ class InAppNotificationRepositoryIT extends AbstractDataJpaTest {
             "REPORT_CONTENT_REMOVED", "REPORT_NO_VIOLATION", "REPORT_REVIEWED", "CONTENT_REMOVED",
             "REVIEW_ABOUT_YOU_REMOVED",
             // B516: security notices carry no booking — covered by V246InAppSecurityNoticeTypeMigrationTest
-            "SECURITY_PHONE_CHANGED", "SECURITY_EMAIL_CHANGED"})
+            "SECURITY_PHONE_CHANGED", "SECURITY_EMAIL_CHANGED", "SECURITY_PASSWORD_RESET"})
     @DisplayName("insertForRecipientsWithPush writes exactly one INAPP_PUSH row per feed row, for every "
             + "type — aggregate_id is the feed row id, status PENDING, NO payload (ids only)")
     void should_writeOnePushRowPerFeedRow_when_insertForRecipientsWithPush(InAppNotificationType type) {

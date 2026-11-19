@@ -41,6 +41,11 @@ class AppCheckGuardTest {
         guard = new AppCheckGuard(verifier, properties, meterRegistry);
     }
 
+    /** A verification without {@code jti} (replay mode LOG_ONLY by default: passes untracked). */
+    private static AppCheckVerifier.Verification verification(AppCheckVerifier.Result result) {
+        return new AppCheckVerifier.Verification(result, null, null);
+    }
+
     private static MockHttpServletRequest request() {
         MockHttpServletRequest request = new MockHttpServletRequest("POST", ROUTE);
         request.setAttribute(HandlerMapping.BEST_MATCHING_PATTERN_ATTRIBUTE, ROUTE);
@@ -50,7 +55,7 @@ class AppCheckGuardTest {
     @Test
     @DisplayName("repeated requests with the same result, endpoint and mode reuse one cached counter")
     void should_reuseCachedCounter_when_sameTagsRepeat() {
-        when(verifier.verify(any())).thenReturn(AppCheckVerifier.Result.VALID);
+        when(verifier.verifyToken(any())).thenReturn(verification(AppCheckVerifier.Result.VALID));
         guard.check(request());
         Counter counter = meterRegistry.find(AppCheckGuard.METRIC).tag("result", "valid").counter();
         meterRegistry.remove(counter);
@@ -65,7 +70,8 @@ class AppCheckGuardTest {
     @Test
     @DisplayName("each distinct result gets its own counter tagged with endpoint and mode")
     void should_countPerResult_when_resultsDiffer() {
-        when(verifier.verify(any())).thenReturn(AppCheckVerifier.Result.VALID, AppCheckVerifier.Result.MISSING);
+        when(verifier.verifyToken(any())).thenReturn(verification(AppCheckVerifier.Result.VALID),
+                verification(AppCheckVerifier.Result.MISSING));
 
         guard.check(request());
         guard.check(request());
@@ -98,7 +104,7 @@ class AppCheckGuardTest {
         request.addHeader(AppCheckGuard.HEADER, "token-value");
         org.springframework.web.context.request.RequestContextHolder.setRequestAttributes(
                 new org.springframework.web.context.request.ServletRequestAttributes(request));
-        when(verifier.verify("token-value")).thenReturn(AppCheckVerifier.Result.INVALID);
+        when(verifier.verifyToken("token-value")).thenReturn(verification(AppCheckVerifier.Result.INVALID));
 
         org.assertj.core.api.Assertions.assertThatThrownBy(() -> guardIn(AppCheckMode.ENFORCE).checkCurrentRequest())
                 .isInstanceOfSatisfying(com.beautica.common.exception.IdentityException.class, e ->

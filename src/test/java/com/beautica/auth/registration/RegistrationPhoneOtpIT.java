@@ -58,6 +58,7 @@ class RegistrationPhoneOtpIT extends AbstractPhoneIdentityIT {
         String phone = newPhone();
         for (int i = 0; i < 3; i++) {
             assertThat(sendCode(phone).getStatusCode()).isEqualTo(HttpStatus.OK);
+            elapseResendCooldown(phone); // AUTH-D27 (a): only the 15-min window may answer below
         }
 
         ResponseEntity<String> fourth = sendCode(phone);

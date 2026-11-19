@@ -160,4 +160,27 @@ class AppCheckVerifierTest {
 
         assertThat(result).isEqualTo(AppCheckVerifier.Result.INVALID);
     }
+
+    @Test
+    @DisplayName("should_returnJtiAndExp_when_validTokenCarriesThem")
+    void should_returnJtiAndExp_when_validTokenCarriesThem() {
+        String token = AppCheckTestTokens.token(NOW, b -> b.id("jti-1"));
+
+        AppCheckVerifier.Verification verification = verifier.verifyToken(token);
+
+        assertThat(verification.result()).isEqualTo(AppCheckVerifier.Result.VALID);
+        assertThat(verification.jti()).isEqualTo("jti-1");
+        assertThat(verification.expiresAt()).isEqualTo(NOW.plusSeconds(3600));
+    }
+
+    @Test
+    @DisplayName("should_returnNoJti_when_invalidToken")
+    void should_returnNoJti_when_invalidToken() {
+        String token = AppCheckTestTokens.signedByForeignKey(NOW);
+
+        AppCheckVerifier.Verification verification = verifier.verifyToken(token);
+
+        assertThat(verification.result()).isEqualTo(AppCheckVerifier.Result.INVALID);
+        assertThat(verification.jti()).isNull();
+    }
 }

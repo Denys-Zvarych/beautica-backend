@@ -1816,7 +1816,8 @@ class EnvironmentFingerprintGuardTest {
                 Arguments.of("email-code-max-verify-attempts", (long) d.emailCodeMaxVerifyAttempts()),
                 Arguments.of("login-max-failures", (long) d.loginMaxFailures()),
                 Arguments.of("otp-verify-ip-capacity", d.otpVerifyIpCapacity()),
-                Arguments.of("guest-booking-ip-capacity", d.guestBookingIpCapacity()));
+                Arguments.of("guest-booking-ip-capacity", d.guestBookingIpCapacity()),
+                Arguments.of("phone-failed-verifies-per-day", (long) d.phoneFailedVerifiesPerDay()));
     }
 
     @ParameterizedTest(name = "{0}")
@@ -1897,5 +1898,114 @@ class EnvironmentFingerprintGuardTest {
         assertThatThrownBy(() -> run(env, DeployEnvironment.STAGING, SmsMode.CAPTURE))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("app.auth-limits.otp-verify-ip-capacity");
+    }
+
+    @Test
+    @DisplayName("prod shortens the OTP resend cooldown — boot fails (limits may only tighten)")
+    void should_fail_when_prodShortensOtpResendCooldown() {
+        MockEnvironment env = prodEnv().withProperty("app.auth-limits.otp-resend-cooldown-seconds", "59");
+
+        assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("rule auth-limits-not-loosened")
+                .hasMessageContaining("app.auth-limits.otp-resend-cooldown-seconds");
+    }
+
+    @Test
+    @DisplayName("prod lengthens the OTP resend cooldown — boot passes")
+    void should_pass_when_prodLengthensOtpResendCooldown() {
+        MockEnvironment env = prodEnv().withProperty("app.auth-limits.otp-resend-cooldown-seconds", "120")
+                .withProperty("app.auth-limits.phone-failed-verifies-per-day", "5");
+
+        assertThatCode(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS)).doesNotThrowAnyException();
+    }
+
+    // ── AUTH-D29 — phone-first rollout boot guard (rule phone-first-rollout) ──────────────────────────
+
+    private static MockEnvironment rolloutEnv(DeployEnvironment environment) {
+        return environment == DeployEnvironment.PROD ? prodEnv() : stagingEnv();
+    }
+
+    private static SmsMode smsModeFor(DeployEnvironment environment) {
+        return environment == DeployEnvironment.PROD ? SmsMode.TURBOSMS : SmsMode.CAPTURE;
+    }
+
+    @ParameterizedTest(name = "{0} {1}=true min={2}")
+    @CsvSource({
+            "PROD,    app.auth.require-phone-registration, 13",
+            "PROD,    app.auth.require-verified-phone,     13",
+            "STAGING, app.auth.require-phone-registration, 0",
+            "STAGING, app.auth.require-verified-phone,     13"})
+    @DisplayName("a REQUIRE_* flag on with min build below the phone-first floor — boot fails")
+    void should_failBoot_when_requireFlagOnBelowPhoneFirstBuild(DeployEnvironment environment, String flag,
+                                                               int minVersionCode) {
+        MockEnvironment env = rolloutEnv(environment).withProperty(flag, "true")
+                .withProperty("app.client-version.android.min-version-code", String.valueOf(minVersionCode));
+
+        assertThatThrownBy(() -> run(env, environment, smsModeFor(environment)))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("rule phone-first-rollout")
+                .hasMessageContaining(String.valueOf(ClientBuildFloors.PHONE_FIRST_MIN_VERSION_CODE));
+    }
+
+    @ParameterizedTest(name = "{0} {1}=true")
+    @CsvSource({
+            "PROD,    app.auth.require-phone-registration",
+            "PROD,    app.auth.require-verified-phone",
+            "STAGING, app.auth.require-verified-phone"})
+    @DisplayName("a REQUIRE_* flag on with min build at the phone-first floor — boot passes")
+    void should_boot_when_requireFlagOnAtPhoneFirstBuild(DeployEnvironment environment, String flag) {
+        MockEnvironment env = rolloutEnv(environment).withProperty(flag, "true")
+                .withProperty("app.client-version.android.min-version-code",
+                        String.valueOf(ClientBuildFloors.PHONE_FIRST_MIN_VERSION_CODE));
+
+        assertThatCode(() -> run(env, environment, smsModeFor(environment))).doesNotThrowAnyException();
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @CsvSource({"PROD", "STAGING"})
+    @DisplayName("App Check replay ENFORCE with min build below the limited-use floor — boot fails")
+    void should_failBoot_when_replayEnforceBelowLimitedUseBuild(DeployEnvironment environment) {
+        MockEnvironment env = rolloutEnv(environment).withProperty("app.auth.app-check.replay-mode", "ENFORCE")
+                .withProperty("app.client-version.android.min-version-code",
+                        String.valueOf(ClientBuildFloors.APP_CHECK_LIMITED_USE_MIN_VERSION_CODE - 1));
+
+        assertThatThrownBy(() -> run(env, environment, smsModeFor(environment)))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("rule phone-first-rollout")
+                .hasMessageContaining("app.auth.app-check.replay-mode");
+    }
+
+    @ParameterizedTest(name = "{0} replay={1}")
+    @CsvSource({"PROD, ENFORCE, 14", "PROD, LOG_ONLY, 0", "STAGING, OFF, 0", "STAGING, ENFORCE, 20"})
+    @DisplayName("App Check replay mode allowed for the configured min build — boot passes")
+    void should_boot_when_replayModeAllowedForMinimum(DeployEnvironment environment, String replayMode,
+                                                      int minVersionCode) {
+        MockEnvironment env = rolloutEnv(environment).withProperty("app.auth.app-check.replay-mode", replayMode)
+                .withProperty("app.client-version.android.min-version-code", String.valueOf(minVersionCode));
+
+        assertThatCode(() -> run(env, environment, smsModeFor(environment))).doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("rollout flags on in test or local — the rule does not apply, boot passes")
+    void should_boot_when_flagsOnInTestOrLocal() {
+        MockEnvironment env = new MockEnvironment()
+                .withProperty("app.auth.require-phone-registration", "true")
+                .withProperty("app.auth.require-verified-phone", "true")
+                .withProperty("app.auth.app-check.replay-mode", "ENFORCE");
+        env.setActiveProfiles("test");
+
+        assertThatCode(() -> EnvironmentFingerprintGuard.verify(env)).doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("an unbindable rollout flag — boot fails closed")
+    void should_failBoot_when_rolloutFlagUnbindable() {
+        MockEnvironment env = prodEnv().withProperty("app.auth.app-check.replay-mode", "SOMETIMES");
+
+        assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("rule phone-first-rollout");
     }
 }

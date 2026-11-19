@@ -80,7 +80,8 @@ public class AuthController {
             @Valid @RequestBody LoginRequest request,
             HttpServletRequest httpRequest
     ) {
-        AuthResponse response = authService.login(request, clientIpResolver.resolve(httpRequest));
+        // AUTH-D27 (e): the lockout counts an IPv6 client per /64, IPv4 per address — the login bucket's key.
+        AuthResponse response = authService.login(request, ClientIpResolver.prefixKey(clientIpResolver.resolve(httpRequest)));
         return ResponseEntity.ok(ApiResponse.ok(response));
     }
 

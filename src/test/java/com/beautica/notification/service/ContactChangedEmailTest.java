@@ -87,4 +87,17 @@ class ContactChangedEmailTest {
         assertThat(message.getSubject()).isEqualTo(SecurityNoticeExpectedCopy.EMAIL_SUBJECT_EMAIL);
         assertThat(renderedHtml()).contains("n***@beautica.test").contains(SecurityNoticeExpectedCopy.SUPPORT_LINE);
     }
+
+    @Test
+    @DisplayName("should_renderPasswordNoticeWithoutValueOrCode_when_passwordReset")
+    void should_renderPasswordNoticeWithoutValueOrCode_when_passwordReset() throws Exception {
+        service.sendContactChangedEmail("olena@beautica.test", ContactChangeKind.PASSWORD, null);
+
+        assertThat(message.getSubject()).isEqualTo(SecurityNoticeExpectedCopy.EMAIL_SUBJECT_PASSWORD);
+        String html = renderedHtml();
+        assertThat(html).contains("Пароль змінено").contains("Пароль до вашого акаунта змінено.")
+                .contains(SecurityNoticeExpectedCopy.SUPPORT_LINE)
+                .doesNotContain("Новий номер").doesNotContain("+380*****4567")
+                .doesNotContainPattern("\\b\\d{6}\\b");
+    }
 }

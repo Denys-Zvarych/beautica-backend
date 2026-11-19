@@ -13,12 +13,10 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
-import org.mockito.InOrder;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
-import org.springframework.security.crypto.password.PasswordEncoder;
 
 import java.sql.SQLException;
 import java.time.Clock;
@@ -29,9 +27,7 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.never;
-import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -51,19 +47,20 @@ class PhoneRegistrationServiceTest {
     @Mock
     private AuthResponseBuilder authResponseBuilder;
 
-    private final PasswordEncoder passwordEncoder = spy(new BCryptPasswordEncoder(4));
+    /** B12: the caller hashes before its transaction; the service stores this value untouched. */
+    private static final String PASSWORD_HASH = new BCryptPasswordEncoder(4).encode("Str0ng!Passw0rd#");
     private PhoneRegistrationService service;
 
     @BeforeEach
     void setUp() {
-        service = new PhoneRegistrationService(ticketService, userRepository, passwordEncoder,
+        service = new PhoneRegistrationService(ticketService, userRepository,
                 masterService, authResponseBuilder, Clock.fixed(NOW, ZoneOffset.UTC));
     }
 
     private static PhoneRegistrationService.PhoneAccount account(Role role) {
         RegisterRequest consent = new RegisterRequest(null, "pw", SelfRegistrationRole.CLIENT, "Olena", null, null,
                 null, true, "2026-10-20", "2026-10-20", "ticket");
-        return new PhoneRegistrationService.PhoneAccount("ticket", "Str0ng!Passw0rd#", role, "Olena", " ", null,
+        return new PhoneRegistrationService.PhoneAccount("ticket", PASSWORD_HASH, role, "Olena", " ", null,
                 consent);
     }
 
@@ -89,16 +86,16 @@ class PhoneRegistrationServiceTest {
     }
 
     @Test
-    @DisplayName("should_hashPasswordBeforeConsumingTicket_when_registering")
-    void should_hashPasswordBeforeConsumingTicket_when_registering() {
+    @DisplayName("should_storeCallerHashUnchanged_when_registering")
+    void should_storeCallerHashUnchanged_when_registering() {
         when(ticketService.consume("ticket")).thenReturn(PHONE);
         when(userRepository.saveAndFlush(any(User.class))).thenAnswer(inv -> inv.getArgument(0));
 
         service.register(account(Role.CLIENT));
 
-        InOrder order = inOrder(passwordEncoder, ticketService);
-        order.verify(passwordEncoder).encode("Str0ng!Passw0rd#");
-        order.verify(ticketService).consume("ticket");
+        ArgumentCaptor<User> saved = ArgumentCaptor.forClass(User.class);
+        verify(userRepository).saveAndFlush(saved.capture());
+        assertThat(saved.getValue().getPasswordHash()).isEqualTo(PASSWORD_HASH);
     }
 
     @Test

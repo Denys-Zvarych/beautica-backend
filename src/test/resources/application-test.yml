@@ -168,7 +168,7 @@ app:
   refresh-token:
     cleanup-retention: 7d
   password-reset-otp:
-    otp-ttl: 15m
+    otp-ttl: 10m
     max-attempts-per-code: 5
     cumulative-failure-threshold: 10
     lockout-duration: 15m

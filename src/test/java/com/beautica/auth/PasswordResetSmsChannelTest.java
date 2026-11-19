@@ -57,17 +57,20 @@ class PasswordResetSmsChannelTest {
     @Test
     @DisplayName("without an active transaction the reset code is handed to the SMS sender at once")
     void should_sendPasswordResetCode_when_noTransactionActive() {
+        org.mockito.Mockito.when(phoneOtpService.currentClientNetwork()).thenReturn("203.0.113.7");
+
         channel.sendAfterCommit(PHONE);
 
-        verify(phoneOtpService).sendCode(PHONE, null, PhoneOtpPurpose.PASSWORD_RESET);
+        // AUTH-D26 (c) audit-fix: the network captured on the request thread travels with the async send.
+        verify(phoneOtpService).sendCodeFromNetwork(PHONE, PhoneOtpPurpose.PASSWORD_RESET, "203.0.113.7");
     }
 
     @Test
     @DisplayName("a provider failure is swallowed so the forgot response stays identical")
     void should_swallowProviderFailure_when_sendFails() {
         doThrow(new BusinessException(HttpStatus.SERVICE_UNAVAILABLE, "down"))
-                .when(phoneOtpService).sendCode(org.mockito.ArgumentMatchers.eq(PHONE), isNull(),
-                        org.mockito.ArgumentMatchers.eq(PhoneOtpPurpose.PASSWORD_RESET));
+                .when(phoneOtpService).sendCodeFromNetwork(org.mockito.ArgumentMatchers.eq(PHONE),
+                        org.mockito.ArgumentMatchers.eq(PhoneOtpPurpose.PASSWORD_RESET), isNull());
 
         assertThatCode(() -> channel.sendAfterCommit(PHONE)).doesNotThrowAnyException();
     }

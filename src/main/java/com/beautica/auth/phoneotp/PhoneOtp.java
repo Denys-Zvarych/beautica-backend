@@ -27,8 +27,8 @@ import java.util.UUID;
  *
  * <p>Rows are short-lived (10-minute expiry) and reclaimed daily by
  * {@link PhoneOtpCleanupJob}. Public setters are intentionally absent — state
- * transitions go through the {@link #issue(String, String, Instant)} factory and the
- * {@link #markUsed()} mutator.
+ * transitions go through the {@link #issue(String, String, Instant)} factory and the single-statement UPDATEs of
+ * {@link PhoneOtpRepository} (no read-modify-write of a managed row).
  *
  * <p>{@code created_at} is populated by the DB {@code DEFAULT now()} (V87), so
  * {@link DynamicInsert} omits the column from the INSERT to let the default apply.
@@ -38,7 +38,9 @@ import java.util.UUID;
         name = "phone_otps",
         indexes = {
                 @Index(name = "idx_phone_otps_lookup", columnList = "phone, used, expires_at"),
-                @Index(name = "idx_phone_otps_phone_created_at", columnList = "phone, created_at")
+                @Index(name = "idx_phone_otps_phone_created_at", columnList = "phone, created_at"),
+                // Partial in the DB (V244: WHERE user_id IS NOT NULL); JPA cannot express the predicate.
+                @Index(name = "idx_phone_otps_user_id", columnList = "user_id")
         }
 )
 @DynamicInsert
@@ -66,15 +68,21 @@ public class PhoneOtp {
     private boolean used;
 
     /**
-     * Count of wrong verify attempts against this code. Incremented atomically by
-     * {@link PhoneOtpRepository#recordFailedAttempt(Long, int)}, which also invalidates the
-     * OTP once {@link #MAX_VERIFY_ATTEMPTS} is reached, so a brute-force run can never
-     * enumerate the full code space within the TTL — and concurrent wrong-code verifies of
-     * the same row cannot overshoot the cap (the increment is a single conditional UPDATE,
-     * not a read-modify-write).
+     * Count of verify compares reserved against this code (phone-first hardening B1). Reserved atomically BEFORE the
+     * compare by {@link PhoneOtpRepository#reserveAttempt(Long, int)} ({@code attempts < cap} in the WHERE clause), so N
+     * concurrent verifies can never run more than {@link #MAX_VERIFY_ATTEMPTS} compares; a mismatch at the cap burns
+     * the code ({@link PhoneOtpRepository#recordMismatch(Long, int)}).
      */
     @Column(name = "attempts", nullable = false)
     private int attempts;
+
+    /**
+     * Phone-first hardening (V255) — wrong codes typed against THIS row (a per-code tally). The 10-per-24 h cap
+     * (AUTH-D26 c) counts {@code phone_otp_failures} per phone + client network (V258) instead; {@link #attempts}
+     * counts the reserved compares of the per-code cap.
+     */
+    @Column(name = "failed_attempts", nullable = false)
+    private int failedAttempts;
 
     /** B514 (D1, V244) — the flow this code belongs to; verify matches it. */
     @Enumerated(EnumType.STRING)
@@ -98,6 +106,7 @@ public class PhoneOtp {
         this.expiresAt = expiresAt;
         this.used = false;
         this.attempts = 0;
+        this.failedAttempts = 0;
         this.purpose = purpose;
         this.userId = userId;
     }
@@ -123,8 +132,14 @@ public class PhoneOtp {
         return new PhoneOtp(phone, codeHash, expiresAt, purpose, userId);
     }
 
-    /** Marks this OTP as consumed so it cannot be redeemed again. */
-    public void markUsed() {
-        this.used = true;
+    /**
+     * Phone-first hardening (AUTH-D27 c) — a row that was never sent and can never be redeemed ({@code used = true},
+     * a random hash nobody knows): it only occupies a per-phone send slot and the resend cooldown, so a forgot-password
+     * request that sends nothing costs the same slot as one that sends an SMS.
+     */
+    public static PhoneOtp burned(String phone, String randomHash, Instant expiresAt, PhoneOtpPurpose purpose) {
+        PhoneOtp otp = new PhoneOtp(phone, randomHash, expiresAt, purpose, null);
+        otp.used = true;
+        return otp;
     }
 }

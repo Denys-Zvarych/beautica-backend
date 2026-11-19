@@ -1,10 +1,14 @@
 package com.beautica.auth.phoneotp;
 
+import com.beautica.auth.filter.ClientIpResolver;
 import com.beautica.common.exception.BusinessException;
+import com.beautica.common.exception.ResendThrottledException;
 import com.beautica.common.exception.ServiceUnavailableMessages;
 import com.beautica.config.AuthLimitsProperties;
+import com.beautica.config.ClientIpProperties;
 import com.beautica.config.DeploymentProperties;
 import com.beautica.notification.sms.OtpSmsSender;
+import com.beautica.notification.sms.SmsDeliveryAmbiguousException;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
@@ -27,6 +31,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.EnumMap;
 import java.util.HexFormat;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
@@ -59,14 +64,41 @@ public class PhoneOtpService {
     public static final int MAX_SENDS_PER_WINDOW = 3;
     private static final Duration RATE_LIMIT_WINDOW = Duration.ofMinutes(15);
     private static final Duration OTP_TTL = Duration.ofMinutes(10);
-    /** B516 (AUTH-12) — a password-reset code by SMS keeps the reset OTP lifetime (15 min), not the 10-min OTP one. */
-    private static final Duration PASSWORD_RESET_OTP_TTL = Duration.ofMinutes(15);
+    /** AUTH-D26 (b) — a password-reset code by SMS lives 10 min, like the emailed reset code (was 15 min, B516). */
+    private static final Duration PASSWORD_RESET_OTP_TTL = Duration.ofMinutes(10);
+    /** Production default of {@code app.auth-limits.phone-failed-verifies-per-day} (AUTH-D26 c). */
+    public static final int MAX_FAILED_VERIFIES_PER_DAY = 10;
+    /** Production default of {@code app.auth-limits.otp-resend-cooldown-seconds} (AUTH-D27 a). */
+    public static final int RESEND_COOLDOWN_SECONDS = 60;
+    private static final Duration FAILED_VERIFY_WINDOW = Duration.ofHours(24);
     private static final int CODE_BOUND_EXCLUSIVE = 1_000_000; // 000000..999999
     private static final String GENERIC_VERIFY_FAILURE = "Invalid or expired code";
     /** Phase 440 — delivered OTP SMS per format (tag {@code format}); naming as {@code beautica.guest_message}. */
     static final String SENT_METRIC = "beautica.otp_sms.sent";
     /** Phase 440 — a non-blank {@code smsFormat} that named no format (sent as {@code DOMAIN_BOUND}). */
     static final String FORMAT_FALLBACK_METRIC = "beautica.otp_sms.format_fallback";
+    /** B7 — every send attempt, tags {@code purpose} and {@code result} ({@link SendResult}). */
+    public static final String SEND_METRIC = "beautica.otp.send";
+    /** B7 — every verify, tags {@code purpose} and {@code result} ({@link VerifyResult}). */
+    public static final String VERIFY_METRIC = "beautica.otp.verify";
+
+    /** {@code result} tag of {@value #SEND_METRIC}. */
+    enum SendResult {
+        OK, PROVIDER_ERROR, AMBIGUOUS, RATE_LIMITED, COOLDOWN;
+
+        String tag() {
+            return name().toLowerCase(Locale.ROOT);
+        }
+    }
+
+    /** {@code result} tag of {@value #VERIFY_METRIC}. */
+    enum VerifyResult {
+        OK, INVALID, EXHAUSTED, DAILY_CAP;
+
+        String tag() {
+            return name().toLowerCase(Locale.ROOT);
+        }
+    }
 
     private final PhoneOtpRepository phoneOtpRepository;
     private final PhoneOtpAttemptRecorder attemptRecorder;
@@ -81,6 +113,11 @@ public class PhoneOtpService {
     private final Counter formatFallbackCounter;
     private final int maxSendsPerWindow;
     private final int maxVerifyAttempts;
+    private final int maxFailedVerifiesPerDay;
+    private final Duration resendCooldown;
+    private final MeterRegistry meterRegistry;
+    /** AUTH-D26 (c) audit-fix — the second half of the per-(phone, client network) failed-verify key. */
+    private final OtpClientNetwork clientNetwork;
 
     /** Production defaults ({@link #MAX_SENDS_PER_WINDOW}, {@link PhoneOtp#MAX_VERIFY_ATTEMPTS}); kept for tests. */
     public PhoneOtpService(PhoneOtpRepository phoneOtpRepository,
@@ -95,7 +132,7 @@ public class PhoneOtpService {
                 deploymentProperties, meterRegistry, AuthLimitsProperties.defaults());
     }
 
-    @Autowired
+    /** As the Spring constructor with a socket-address-only network resolver (unit tests bind no request anyway). */
     public PhoneOtpService(PhoneOtpRepository phoneOtpRepository,
                            PhoneOtpAttemptRecorder attemptRecorder,
                            GuestTokenProvider guestTokenProvider,
@@ -105,8 +142,28 @@ public class PhoneOtpService {
                            DeploymentProperties deploymentProperties,
                            MeterRegistry meterRegistry,
                            AuthLimitsProperties limits) {
+        this(phoneOtpRepository, attemptRecorder, guestTokenProvider, otpSmsSender, clock, transactionManager,
+                deploymentProperties, meterRegistry, limits,
+                new OtpClientNetwork(new ClientIpResolver(new ClientIpProperties(false))));
+    }
+
+    @Autowired
+    public PhoneOtpService(PhoneOtpRepository phoneOtpRepository,
+                           PhoneOtpAttemptRecorder attemptRecorder,
+                           GuestTokenProvider guestTokenProvider,
+                           OtpSmsSender otpSmsSender,
+                           Clock clock,
+                           PlatformTransactionManager transactionManager,
+                           DeploymentProperties deploymentProperties,
+                           MeterRegistry meterRegistry,
+                           AuthLimitsProperties limits,
+                           OtpClientNetwork clientNetwork) {
+        this.clientNetwork = clientNetwork;
         this.maxSendsPerWindow = limits.phoneOtpMaxSendsPerWindow();
         this.maxVerifyAttempts = limits.phoneOtpMaxVerifyAttempts();
+        this.maxFailedVerifiesPerDay = limits.phoneFailedVerifiesPerDay();
+        this.resendCooldown = Duration.ofSeconds(limits.otpResendCooldownSeconds());
+        this.meterRegistry = meterRegistry;
         this.otpSmsText = OtpSmsText.forDomain(deploymentProperties.sms().otpDomainHost());
         this.phoneOtpRepository = phoneOtpRepository;
         this.attemptRecorder = attemptRecorder;
@@ -175,6 +232,26 @@ public class PhoneOtpService {
      */
     @Transactional(propagation = Propagation.NOT_SUPPORTED)
     public void sendCode(String phone, String requestedFormat, PhoneOtpPurpose purpose, UUID userId) {
+        send(phone, requestedFormat, purpose, userId, clientNetwork.current());
+    }
+
+    /**
+     * AUTH-D26 (c) audit-fix — as {@link #sendCode(String, String, PhoneOtpPurpose)} for a send that runs AFTER its
+     * request (the forgot-password SMS on {@code smsSendExecutor}): {@code clientNet} is the network the caller
+     * captured on the request thread ({@link OtpClientNetwork#current()}), so the per-(phone, network) cap still
+     * applies.
+     */
+    @Transactional(propagation = Propagation.NOT_SUPPORTED)
+    public void sendCodeFromNetwork(String phone, PhoneOtpPurpose purpose, String clientNet) {
+        send(phone, null, purpose, null, clientNet);
+    }
+
+    /** The network key of the current request, for a caller that sends later on another thread. */
+    public String currentClientNetwork() {
+        return clientNetwork.current();
+    }
+
+    private void send(String phone, String requestedFormat, PhoneOtpPurpose purpose, UUID userId, String clientNet) {
         requireOwnerMatchesPurpose(purpose, userId);
         if (phone == null || !E164_UA.matcher(phone).matches()) {
             throw new BusinessException(HttpStatus.BAD_REQUEST, "Invalid phone format");
@@ -182,9 +259,10 @@ public class PhoneOtpService {
         OtpSmsFormat format = resolveFormat(requestedFormat);
 
         String code = generateCode();
-        Long otpId = requiresNewTx.execute(status -> issueOtpRow(phone, code, purpose, userId));
+        Long otpId = issueOrCount(phone, code, purpose, userId, clientNet);
 
-        dispatchCode(phone, code, otpId, format);
+        dispatchCode(phone, code, otpId, format, purpose);
+        countSend(purpose, SendResult.OK);
         invalidateOlderCodesQuietly(phone, purpose, otpId);
         if (purpose == PhoneOtpPurpose.GUEST_BOOKING) {
             log.info("OTP sent to {} format={}", maskPhone(phone), format.metricTag()); // pre-B514 line, unchanged
@@ -200,13 +278,28 @@ public class PhoneOtpService {
         return OtpSmsFormat.fromRequest(requestedFormat);
     }
 
+    /** Tx 1 ({@link #issueOtpRow}), counting a refusal on {@value #SEND_METRIC} before rethrowing it. */
+    private Long issueOrCount(String phone, String code, PhoneOtpPurpose purpose, UUID userId, String clientNet) {
+        try {
+            return requiresNewTx.execute(status -> issueOtpRow(phone, code, purpose, userId, clientNet));
+        } catch (ResendThrottledException e) {
+            countSend(purpose, SendResult.COOLDOWN);
+            throw e;
+        } catch (BusinessException e) {
+            if (e.getStatus() == HttpStatus.TOO_MANY_REQUESTS) {
+                countSend(purpose, SendResult.RATE_LIMITED);
+            }
+            throw e;
+        }
+    }
+
     /**
-     * Tx 1: per-phone advisory lock, rate-limit check, persist ONLY the new hashed row. Runs in
-     * REQUIRES_NEW. The previous code is deliberately left valid until delivery succeeds, so a
-     * provider outage cannot be used to kill a victim's live code. The lock serialises the
-     * count-then-insert per phone so concurrent sends cannot all pass the cap.
+     * Tx 1: per-phone advisory lock, send limits ({@link #enforceSendLimits}), persist ONLY the new hashed row. Runs
+     * in REQUIRES_NEW. The previous code is deliberately left valid until delivery succeeds, so a provider outage
+     * cannot be used to kill a victim's live code. The lock serialises the count-then-insert per phone so concurrent
+     * sends cannot all pass the cap.
      */
-    private Long issueOtpRow(String phone, String code, PhoneOtpPurpose purpose, UUID userId) {
+    private Long issueOtpRow(String phone, String code, PhoneOtpPurpose purpose, UUID userId, String clientNet) {
         if (userId != null) {
             // B516: the per-account cap is counted under a per-ACCOUNT lock (always taken before the phone lock).
             phoneOtpRepository.lockUserForSend(userId);
@@ -214,19 +307,74 @@ public class PhoneOtpService {
         phoneOtpRepository.lockPhoneForSend(phone);
 
         Instant now = clock.instant();
-        Instant windowStart = now.minus(RATE_LIMIT_WINDOW);
-        int recentSends = phoneOtpRepository.countByPhoneAndCreatedAtAfter(phone, windowStart);
-        // B516: per-account cap for signed-in sends, counted under the account lock taken above.
-        boolean accountCapped = userId != null
-                && phoneOtpRepository.countByUserIdAndCreatedAtAfter(userId, windowStart) >= maxSendsPerWindow;
-        if (recentSends >= maxSendsPerWindow || accountCapped) {
-            throw new BusinessException(HttpStatus.TOO_MANY_REQUESTS, "OTP limit exceeded");
-        }
+        enforceSendLimits(phone, purpose, userId, clientNet, now);
 
         Duration ttl = purpose == PhoneOtpPurpose.PASSWORD_RESET ? PASSWORD_RESET_OTP_TTL : OTP_TTL;
         PhoneOtp otp = PhoneOtp.issue(phone, sha256Hex(code), now.plus(ttl), purpose, userId);
         phoneOtpRepository.save(otp);
         return otp.getId();
+    }
+
+    /**
+     * Every per-phone send limit, checked under the phone lock from ONE aggregate read
+     * ({@link PhoneOtpRepository#sendLimitStats}): {@value #MAX_SENDS_PER_WINDOW} per 15 min per phone (and per
+     * signed-in account, a separate count), then {@value #MAX_FAILED_VERIFIES_PER_DAY} failed verifies per phone + client
+     * network per 24 h (AUTH-D26 c), both 429 "OTP limit exceeded"; then the per-phone+purpose resend cooldown
+     * (AUTH-D27 a), 429 with {@code Retry-After} = the seconds left.
+     */
+    private void enforceSendLimits(String phone, PhoneOtpPurpose purpose, UUID userId, String clientNet,
+                                   Instant now) {
+        Instant windowStart = now.minus(RATE_LIMIT_WINDOW);
+        Instant cooldownStart = now.minus(resendCooldown);
+        Instant rangeStart = windowStart.isBefore(cooldownStart) ? windowStart : cooldownStart;
+        PhoneOtpRepository.SendLimitStats stats = phoneOtpRepository.sendLimitStats(phone, purpose.name(), clientNet,
+                rangeStart, windowStart, cooldownStart, now.minus(FAILED_VERIFY_WINDOW));
+        // B516: per-account cap for signed-in sends, counted under the account lock taken above.
+        boolean accountCapped = userId != null
+                && phoneOtpRepository.countByUserIdAndCreatedAtAfter(userId, windowStart) >= maxSendsPerWindow;
+        if (stats.getRecentSends() >= maxSendsPerWindow || accountCapped
+                || stats.getRecentFailures() >= maxFailedVerifiesPerDay) {
+            throw new BusinessException(HttpStatus.TOO_MANY_REQUESTS, "OTP limit exceeded");
+        }
+        Long latestMillis = stats.getLatestSamePurposeMillis();
+        if (latestMillis != null) {
+            throw new ResendThrottledException(cooldownRemainingSeconds(Instant.ofEpochMilli(latestMillis), now));
+        }
+    }
+
+    /** Seconds until {@code latest + cooldown}, rounded up, clamped to {@code [1, cooldown]} (DB vs app clock skew). */
+    private long cooldownRemainingSeconds(Instant latest, Instant now) {
+        long remainingMillis = Duration.between(now, latest.plus(resendCooldown)).toMillis();
+        long seconds = (remainingMillis + 999) / 1000;
+        return Math.max(1, Math.min(resendCooldown.getSeconds(), seconds));
+    }
+
+    /**
+     * AUTH-D27 (c) — a forgot-password request for a UA mobile number that sends NO SMS (unknown or inactive number,
+     * email channel, account lock or cooldown) still takes one per-phone send slot: under the same phone lock and the
+     * same limits as a real send it stores a burned row ({@link PhoneOtp#burned}: never sent, never redeemable) that
+     * counts toward the 15-min cap and the resend cooldown — so a per-phone 429 on another purpose tells nothing
+     * about the account. When a limit already refuses a send, nothing is stored (a real send would be refused too).
+     * Own committed transaction; never throws (the forgot-password answer stays the uniform 200).
+     *
+     * @param phoneE164 an already-parsed {@code +380…} mobile number
+     */
+    @Transactional(propagation = Propagation.NOT_SUPPORTED)
+    public void burnSlot(String phoneE164, PhoneOtpPurpose purpose) {
+        requireOwnerMatchesPurpose(purpose, null);
+        try {
+            requiresNewTx.executeWithoutResult(status -> {
+                phoneOtpRepository.lockPhoneForSend(phoneE164);
+                Instant now = clock.instant();
+                enforceSendLimits(phoneE164, purpose, null, clientNetwork.current(), now);
+                phoneOtpRepository.save(PhoneOtp.burned(phoneE164, sha256Hex(generateCode() + UUID.randomUUID()),
+                        now.plus(OTP_TTL), purpose));
+            });
+        } catch (BusinessException | ResendThrottledException e) {
+            // A limit already holds the slot — exactly what a real send would have hit. Nothing to store.
+        } catch (RuntimeException e) {
+            log.warn("OTP slot burn failed for {}: {}", maskPhone(phoneE164), e.getClass().getSimpleName());
+        }
     }
 
     /**
@@ -261,12 +409,14 @@ public class PhoneOtpService {
      * the code and never the unmasked phone (Anti-Bug §I). The 503 body is generic for the same
      * reason.
      */
-    private void dispatchCode(String phone, String code, Long otpId, OtpSmsFormat format) {
+    private void dispatchCode(String phone, String code, Long otpId, OtpSmsFormat format, PhoneOtpPurpose purpose) {
         try {
             otpSmsSender.send(phone, otpSmsText.render(code, format));
             sentCounters.get(format).increment();
         } catch (RuntimeException e) {
             log.warn("OTP send failed for {}: {}", maskPhone(phone), e.getClass().getSimpleName());
+            countSend(purpose, e instanceof SmsDeliveryAmbiguousException
+                    ? SendResult.AMBIGUOUS : SendResult.PROVIDER_ERROR);
             burnUndeliveredRowQuietly(otpId);
             throw new BusinessException(
                     HttpStatus.SERVICE_UNAVAILABLE, ServiceUnavailableMessages.OTP_SEND_FAILED);
@@ -329,8 +479,13 @@ public class PhoneOtpService {
     public boolean consumeCode(String phone, String code, PhoneOtpPurpose purpose) {
         requireOwnerMatchesPurpose(purpose, null);
         Instant now = clock.instant();
+        String clientNet = clientNetwork.current();
+        if (dailyCapRefuses(phone, clientNet, purpose, now)) {
+            return false;
+        }
         return redeem(phoneOtpRepository
-                .findTopByPhoneAndPurposeAndUsedFalseAndExpiresAtAfterOrderByIdDesc(phone, purpose, now), code);
+                .findTopByPhoneAndPurposeAndUsedFalseAndExpiresAtAfterOrderByIdDesc(phone, purpose, now), code,
+                purpose, clientNet);
     }
 
     /**
@@ -342,15 +497,19 @@ public class PhoneOtpService {
     public boolean consumeCode(String phone, String code, PhoneOtpPurpose purpose, UUID userId) {
         requireOwnerMatchesPurpose(purpose, userId);
         Instant now = clock.instant();
+        String clientNet = clientNetwork.current();
+        if (dailyCapRefuses(phone, clientNet, purpose, now)) {
+            return false;
+        }
         return redeem(phoneOtpRepository
                 .findTopByPhoneAndPurposeAndUserIdAndUsedFalseAndExpiresAtAfterOrderByIdDesc(
-                        phone, purpose, userId, now), code);
+                        phone, purpose, userId, now), code, purpose, clientNet);
     }
 
     /**
      * B516 (AUTH-D19) — a wrong current password on a {@link PhoneOtpPurpose#PHONE_CHANGE} verify counts as one failed
      * try on the caller's newest live code: the same per-code cap ({@link PhoneOtp#MAX_VERIFY_ATTEMPTS}, then the code
-     * is burnt) and the same REQUIRES_NEW recorder as a wrong code, so the count survives the caller's rollback.
+     * is burnt) and the same autocommit recorder as a wrong code, so the count survives the caller's rollback.
      *
      * @return {@code false} when {@code userId} holds no live code for {@code phone} (nothing to count against)
      */
@@ -360,7 +519,11 @@ public class PhoneOtpService {
         Optional<PhoneOtp> active = phoneOtpRepository
                 .findTopByPhoneAndPurposeAndUserIdAndUsedFalseAndExpiresAtAfterOrderByIdDesc(
                         phone, purpose, userId, clock.instant());
-        active.ifPresent(otp -> attemptRecorder.recordFailedAttempt(otp.getId(), maxVerifyAttempts));
+        active.ifPresent(otp -> {
+            if (attemptRecorder.reserveAttempt(otp.getId(), maxVerifyAttempts)) {
+                attemptRecorder.recordMismatch(otp.getId(), maxVerifyAttempts, clientNetwork.current());
+            }
+        });
         return active.isPresent();
     }
 
@@ -370,29 +533,69 @@ public class PhoneOtpService {
         }
     }
 
-    private boolean redeem(Optional<PhoneOtp> active, String code) {
-        if (active.isEmpty()) {
+    /**
+     * AUTH-D26 (c) — once {@value #MAX_FAILED_VERIFIES_PER_DAY} wrong codes were typed for the phone from this client
+     * network in 24 h, every verify from that network fails before any code row is read or touched (the same generic
+     * error as a wrong code). Per (phone, network), user decision 2026-11-19: a stranger cannot lock the owner out.
+     */
+    private boolean dailyCapRefuses(String phone, String clientNet, PhoneOtpPurpose purpose, Instant now) {
+        if (phoneOtpRepository.countFailuresSince(phone, clientNet, now.minus(FAILED_VERIFY_WINDOW))
+                < maxFailedVerifiesPerDay) {
             return false;
         }
-
-        PhoneOtp otp = active.get();
-        byte[] candidate = sha256Hex(code).getBytes(StandardCharsets.UTF_8);
-        byte[] stored = otp.getCodeHash().getBytes(StandardCharsets.UTF_8);
-        if (!MessageDigest.isEqual(candidate, stored)) {
-            // Per-OTP brute-force cap: count this wrong attempt and invalidate the OTP once
-            // the cap is reached, so the code space cannot be enumerated within the TTL.
-            // A single atomic conditional UPDATE (not a read-modify-write of the managed
-            // entity) so concurrent wrong-code verifies of the same row cannot each read
-            // attempts < cap and overshoot the cap — the DB serialises the increments.
-            // Runs in a separate REQUIRES_NEW transaction so the increment commits BEFORE the
-            // generic-401 throw rolls back this verify transaction (otherwise the counter
-            // could never accumulate). Must precede the caller's throw.
-            attemptRecorder.recordFailedAttempt(otp.getId(), maxVerifyAttempts);
-            return false;
-        }
-
-        otp.markUsed();
+        countVerify(purpose, VerifyResult.DAILY_CAP);
         return true;
+    }
+
+    /**
+     * Phone-first hardening B1 — race-free redeem, no {@code FOR UPDATE}:
+     * <ol>
+     *   <li>reserve one compare with an autocommit UPDATE guarded by {@code attempts < cap} on the dedicated
+     *       {@code otpAttemptDataSource} (0 rows → fail, so concurrent verifies can never exceed the per-code cap of
+     *       compares; never a second connection of the main pool);</li>
+     *   <li>constant-time hash compare;</li>
+     *   <li>mismatch → autocommit {@code recordMismatch}: {@code failed_attempts + 1}, burnt at the cap, one row in
+     *       {@code phone_otp_failures} for (phone, network) — committed before the caller's generic error rolls its
+     *       own transaction back;</li>
+     *   <li>match → {@code markUsedIfUnused} in the CALLER's transaction: exactly one concurrent correct verify gets
+     *       the row (1 row updated), every other fails.</li>
+     * </ol>
+     */
+    private boolean redeem(Optional<PhoneOtp> active, String code, PhoneOtpPurpose purpose, String clientNet) {
+        if (active.isEmpty()) {
+            countVerify(purpose, VerifyResult.INVALID);
+            return false;
+        }
+        Long otpId = active.get().getId();
+        if (!attemptRecorder.reserveAttempt(otpId, maxVerifyAttempts)) {
+            countVerify(purpose, VerifyResult.EXHAUSTED);
+            return false;
+        }
+        byte[] candidate = sha256Hex(code).getBytes(StandardCharsets.UTF_8);
+        byte[] stored = active.get().getCodeHash().getBytes(StandardCharsets.UTF_8);
+        if (!MessageDigest.isEqual(candidate, stored)) {
+            attemptRecorder.recordMismatch(otpId, maxVerifyAttempts, clientNet);
+            countVerify(purpose, VerifyResult.INVALID);
+            return false;
+        }
+        if (phoneOtpRepository.markUsedIfUnused(otpId) != 1) {
+            countVerify(purpose, VerifyResult.INVALID);
+            return false;
+        }
+        countVerify(purpose, VerifyResult.OK);
+        return true;
+    }
+
+    private void countSend(PhoneOtpPurpose purpose, SendResult result) {
+        meterRegistry.counter(SEND_METRIC, "purpose", purposeTag(purpose), "result", result.tag()).increment();
+    }
+
+    private void countVerify(PhoneOtpPurpose purpose, VerifyResult result) {
+        meterRegistry.counter(VERIFY_METRIC, "purpose", purposeTag(purpose), "result", result.tag()).increment();
+    }
+
+    private static String purposeTag(PhoneOtpPurpose purpose) {
+        return purpose.name().toLowerCase(Locale.ROOT);
     }
 
     private String generateCode() {
@@ -408,6 +611,7 @@ public class PhoneOtpService {
      */
     @Transactional(propagation = Propagation.MANDATORY)
     public int deleteAllForPhone(String e164Phone) {
+        phoneOtpRepository.deleteFailuresByPhone(e164Phone); // V258 failure log stores the phone too
         return phoneOtpRepository.deleteByPhone(e164Phone);
     }
 

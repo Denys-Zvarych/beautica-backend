@@ -18,6 +18,10 @@ import java.util.regex.Pattern;
  *       {@code beautica-cb9fb}; the token's {@code iss} and {@code aud} are derived from it. Not a secret.</li>
  *   <li>{@code app-ids} ({@code APP_AUTH_APP_CHECK_APP_IDS}) — comma list of allowed Firebase app ids; the token's
  *       {@code sub} must be one of them.</li>
+ *   <li>{@code replay-mode} ({@code APP_AUTH_APP_CHECK_REPLAY}) — phone-first hardening (AUTH-D27 d): what a token
+ *       whose {@code jti} was already accepted gets — OFF ignore, LOG_ONLY count + WARN, ENFORCE 403
+ *       {@code APP_CHECK_FAILED} (a token without {@code jti} is invalid in ENFORCE). Default LOG_ONLY everywhere;
+ *       the boot guard refuses ENFORCE below the first limited-use build (AUTH-D29).</li>
  *   <li>{@code jwks-url} — Google's App Check JWKS; prod must use the default (fingerprint rule
  *       {@code prod-app-check-jwks-url}). ITs point it at a WireMock stub.</li>
  * </ul>
@@ -35,6 +39,7 @@ public class AppCheckProperties implements InitializingBean {
     private static final Pattern PROJECT_NUMBER = Pattern.compile("[0-9]{1,20}");
 
     private AppCheckMode mode = AppCheckMode.ENFORCE;
+    private AppCheckMode replayMode = AppCheckMode.LOG_ONLY;
     private String projectNumber;
     private List<String> appIds = List.of();
     private String jwksUrl = GOOGLE_JWKS_URL;
@@ -48,6 +53,9 @@ public class AppCheckProperties implements InitializingBean {
     public void afterPropertiesSet() {
         if (mode == null) {
             throw new IllegalStateException("app.auth.app-check.mode must be OFF, LOG_ONLY or ENFORCE");
+        }
+        if (replayMode == null) {
+            throw new IllegalStateException("app.auth.app-check.replay-mode must be OFF, LOG_ONLY or ENFORCE");
         }
         if (mode == AppCheckMode.OFF) {
             return;
@@ -86,6 +94,14 @@ public class AppCheckProperties implements InitializingBean {
 
     public void setMode(AppCheckMode mode) {
         this.mode = mode;
+    }
+
+    public AppCheckMode getReplayMode() {
+        return replayMode;
+    }
+
+    public void setReplayMode(AppCheckMode replayMode) {
+        this.replayMode = replayMode;
     }
 
     public String getProjectNumber() {

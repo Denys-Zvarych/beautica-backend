@@ -213,6 +213,7 @@ class PhoneChangeIT extends AbstractPhoneIdentityIT {
         for (int i = 0; i < 5; i++) {
             postAs(token, EMAIL_VERIFY_URL, Map.of("email", email, "code", "123456", "currentPassword", "Wr0ng!Passw0rd#"));
         }
+        elapseResendCooldown(newPhone); // AUTH-D27 (a): a fresh code for the same phone needs the 60 s gap
         postAs(token, UserPhoneOtpIT.PHONE_SEND_URL, Map.of("phone", newPhone));
 
         ResponseEntity<String> response = verifyChange(token, newPhone, lastCodeSentTo(newPhone), PASSWORD);

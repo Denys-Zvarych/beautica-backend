@@ -26,9 +26,14 @@ import java.util.UUID;
         // Mirrors the partial index idx_users_stale_unverified_otp from V50 so
         // ddl-auto=validate catches drift. JPA cannot express the partial
         // predicate (WHERE email_verified = false) — the column list documents it.
-        indexes = @Index(
-                name = "idx_users_stale_unverified_otp",
-                columnList = "verification_code_expires_at"))
+        indexes = {
+                @Index(
+                        name = "idx_users_stale_unverified_otp",
+                        columnList = "verification_code_expires_at"),
+                // Partial UNIQUE, WHERE phone_verified_at IS NOT NULL — DDL is V244:50; annotation is documentation only
+                // (JPA cannot express the predicate; no unique=true, which would claim a full unique index).
+                @Index(name = "ux_users_verified_phone", columnList = "phone_number")
+        })
 public class User extends AuditableEntity {
 
     @Id

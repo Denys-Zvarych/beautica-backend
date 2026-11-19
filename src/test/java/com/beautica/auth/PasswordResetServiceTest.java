@@ -90,6 +90,12 @@ class PasswordResetServiceTest {
     @Mock
     private PasswordResetSmsChannel smsChannel;
 
+    @Mock
+    private com.beautica.auth.phoneotp.PhoneOtpService phoneOtpService;
+
+    @Mock
+    private com.beautica.user.security.ContactChangeNotifier contactChangeNotifier;
+
     private PasswordEncoder passwordEncoder;
     private PasswordResetService service;
 
@@ -115,7 +121,9 @@ class PasswordResetServiceTest {
                 policy,
                 fixedClock,
                 appCheckGuard,
-                smsChannel
+                smsChannel,
+                phoneOtpService,
+                contactChangeNotifier
         );
     }
 
@@ -446,6 +454,7 @@ class PasswordResetServiceTest {
         assertThat(boundaryTicket.isUsed()).isTrue();
     }
 
+
     // =========================================================================
     // resetPassword — oracle protection (identical 400 for all failure modes)
     // =========================================================================
@@ -724,5 +733,122 @@ class PasswordResetServiceTest {
 
         verify(emailNotificationService).sendPasswordResetOtpEmail(eq(user), eq("123456"));
         verifyNoInteractions(appCheckGuard, smsChannel);
+    }
+
+    // ── Phone-first hardening — AUTH-D27 (c) slot burn, AUTH-D26 (a) reset notice ──
+
+    private static final com.beautica.auth.phoneotp.PhoneOtpPurpose RESET =
+            com.beautica.auth.phoneotp.PhoneOtpPurpose.PASSWORD_RESET;
+
+    @Test
+    @DisplayName("should_burnPhoneSlot_when_forgotByUnknownUaMobile")
+    void should_burnPhoneSlot_when_forgotByUnknownUaMobile() {
+        when(userRepository.findByVerifiedPhoneForUpdate(PHONE)).thenReturn(Optional.empty());
+        when(tokenGenerator.generateOtp()).thenReturn("000000");
+
+        service.requestReset(new ForgotPasswordRequest(null, PHONE));
+
+        verify(phoneOtpService).burnSlot(PHONE, RESET);
+        verify(smsChannel, never()).sendAfterCommit(any());
+    }
+
+    @Test
+    @DisplayName("should_burnPhoneSlot_when_forgotByPhoneGoesToEmailChannel")
+    void should_burnPhoneSlot_when_forgotByPhoneGoesToEmailChannel() {
+        User user = activeVerifiedUser();
+        user.markPhoneVerified(PHONE, FIXED_NOW.minusSeconds(60));
+        when(userRepository.findByVerifiedPhoneForUpdate(PHONE)).thenReturn(Optional.of(user));
+        when(tokenGenerator.generateOtp()).thenReturn("123456");
+        when(tokenGenerator.hashOtp("123456")).thenReturn("hashedOtp");
+
+        service.requestReset(new ForgotPasswordRequest(null, PHONE));
+
+        verify(phoneOtpService).burnSlot(PHONE, RESET);
+        verify(emailNotificationService).sendPasswordResetOtpEmail(eq(user), eq("123456"));
+    }
+
+    @Test
+    @DisplayName("should_burnPhoneSlot_when_forgotByPhoneWithinCooldown")
+    void should_burnPhoneSlot_when_forgotByPhoneWithinCooldown() {
+        when(userRepository.findByVerifiedPhoneForUpdate(PHONE)).thenReturn(Optional.of(phoneOnlyUser()));
+        when(smsChannel.cooldownRemainingSeconds(any())).thenReturn(Optional.of(30L));
+
+        service.requestReset(new ForgotPasswordRequest(null, PHONE));
+
+        verify(phoneOtpService).burnSlot(PHONE, RESET);
+        verify(smsChannel, never()).sendAfterCommit(any());
+    }
+
+    @Test
+    @DisplayName("should_burnPhoneSlot_when_forgotByPhoneOnLockedAccount")
+    void should_burnPhoneSlot_when_forgotByPhoneOnLockedAccount() {
+        User user = phoneOnlyUser();
+        when(userRepository.findByVerifiedPhoneForUpdate(PHONE)).thenReturn(Optional.of(user));
+        when(passwordResetOtpProcessor.isLocked(user)).thenReturn(true);
+
+        service.requestReset(new ForgotPasswordRequest(null, PHONE));
+
+        verify(phoneOtpService).burnSlot(PHONE, RESET);
+        verify(smsChannel, never()).sendAfterCommit(any());
+    }
+
+    @Test
+    @DisplayName("should_notBurnSlot_when_smsActuallySent")
+    void should_notBurnSlot_when_smsActuallySent() {
+        when(userRepository.findByVerifiedPhoneForUpdate(PHONE)).thenReturn(Optional.of(phoneOnlyUser()));
+        when(smsChannel.cooldownRemainingSeconds(null)).thenReturn(Optional.empty());
+
+        service.requestReset(new ForgotPasswordRequest(null, PHONE));
+
+        verify(smsChannel).sendAfterCommit(PHONE);
+        verify(phoneOtpService, never()).burnSlot(any(), any());
+    }
+
+    @Test
+    @DisplayName("should_notBurnSlot_when_identifierIsNoUaMobile")
+    void should_notBurnSlot_when_identifierIsNoUaMobile() {
+        when(tokenGenerator.generateOtp()).thenReturn("000000");
+
+        service.requestReset(new ForgotPasswordRequest(null, "+4915112345678"));
+
+        verifyNoInteractions(phoneOtpService);
+    }
+
+    @Test
+    @DisplayName("should_notBurnSlot_when_forgotByEmail")
+    void should_notBurnSlot_when_forgotByEmail() {
+        when(userRepository.findPasswordResetEligibleByEmail(TEST_EMAIL)).thenReturn(Optional.empty());
+        when(tokenGenerator.generateOtp()).thenReturn("000000");
+
+        service.requestReset(new ForgotPasswordRequest(null, TEST_EMAIL));
+
+        verifyNoInteractions(phoneOtpService);
+    }
+
+    @Test
+    @DisplayName("resetPassword — a successful reset raises the security notice and sends no SMS")
+    void should_sendSecurityNotice_when_passwordResetSucceeds() {
+        User user = activeVerifiedUser();
+        when(tokenGenerator.hash(RAW_TICKET)).thenReturn(HASHED_TICKET);
+        when(passwordResetTicketRepository.findByTicketHashForUpdate(HASHED_TICKET))
+                .thenReturn(Optional.of(validTicket()));
+        when(userRepository.findById(USER_ID)).thenReturn(Optional.of(user));
+
+        service.resetPassword(new ResetPasswordRequest(RAW_TICKET, "NewValidPass1!"));
+
+        verify(contactChangeNotifier).passwordReset(user);
+        verifyNoInteractions(smsChannel, phoneOtpService);
+    }
+
+    @Test
+    @DisplayName("resetPassword — an invalid ticket raises no security notice")
+    void should_sendNoNotice_when_resetTicketInvalid() {
+        when(tokenGenerator.hash(RAW_TICKET)).thenReturn(HASHED_TICKET);
+        when(passwordResetTicketRepository.findByTicketHashForUpdate(HASHED_TICKET)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> service.resetPassword(new ResetPasswordRequest(RAW_TICKET, "NewValidPass1!")))
+                .isInstanceOf(BusinessException.class);
+
+        verifyNoInteractions(contactChangeNotifier);
     }
 }

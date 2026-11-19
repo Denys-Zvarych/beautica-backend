@@ -1,0 +1,22 @@
+[
+  {"code": "ALREADY_VERIFIED", "status": 400, "family": "verification"},
+  {"code": "APP_CHECK_FAILED", "status": 403, "family": "identity"},
+  {"code": "APP_CHECK_UNAVAILABLE", "status": 503, "family": "identity"},
+  {"code": "CODE_EXPIRED", "status": 400, "family": "verification"},
+  {"code": "CURRENT_PASSWORD_INVALID", "status": 400, "family": "verification"},
+  {"code": "EMAIL_NOT_VERIFIED", "status": 403, "family": "login"},
+  {"code": "INVALID_CODE", "status": 400, "family": "verification"},
+  {"code": "INVITE_EXPIRED", "status": 400, "family": "invite"},
+  {"code": "INVITE_NOT_FOUND", "status": 400, "family": "invite"},
+  {"code": "INVITE_PHONE_MISMATCH", "status": 400, "family": "identity"},
+  {"code": "INVITE_PHONE_REQUIRED", "status": 400, "family": "identity"},
+  {"code": "INVITE_REVOKED", "status": 400, "family": "invite"},
+  {"code": "INVITE_SALON_INACTIVE", "status": 409, "family": "invite"},
+  {"code": "INVITE_SMS_LIMIT", "status": 429, "family": "identity"},
+  {"code": "INVITE_USED", "status": 400, "family": "invite"},
+  {"code": "PHONE_ALREADY_REGISTERED", "status": 409, "family": "identity"},
+  {"code": "PHONE_CHANGE_REQUIRES_OTP", "status": 400, "family": "identity"},
+  {"code": "PHONE_NOT_UA_MOBILE", "status": 400, "family": "identity"},
+  {"code": "PHONE_NOT_VERIFIED", "status": 409, "family": "identity"},
+  {"code": "REGISTRATION_TICKET_INVALID", "status": 400, "family": "identity"}
+]

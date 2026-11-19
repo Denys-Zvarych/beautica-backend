@@ -1,6 +1,8 @@
 package com.beautica.auth;
 
 import com.beautica.auth.appcheck.AppCheckGuard;
+import com.beautica.auth.phoneotp.PhoneOtpPurpose;
+import com.beautica.auth.phoneotp.PhoneOtpService;
 import com.beautica.auth.dto.ForgotPasswordRequest;
 import com.beautica.auth.dto.ResetPasswordRequest;
 import com.beautica.auth.dto.VerifyPasswordResetOtpRequest;
@@ -16,6 +18,7 @@ import com.beautica.user.PasswordResetTicketRepository;
 import com.beautica.user.RefreshTokenRepository;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
+import com.beautica.user.security.ContactChangeNotifier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Qualifier;
@@ -77,6 +80,8 @@ public class PasswordResetService {
     private final Clock clock;
     private final AppCheckGuard appCheckGuard;
     private final PasswordResetSmsChannel smsChannel;
+    private final PhoneOtpService phoneOtpService;
+    private final ContactChangeNotifier contactChangeNotifier;
 
     public PasswordResetService(
             PasswordResetTicketRepository passwordResetTicketRepository,
@@ -91,7 +96,9 @@ public class PasswordResetService {
             PasswordResetOtpPolicyConfig passwordResetOtpPolicy,
             Clock clock,
             AppCheckGuard appCheckGuard,
-            PasswordResetSmsChannel smsChannel
+            PasswordResetSmsChannel smsChannel,
+            PhoneOtpService phoneOtpService,
+            ContactChangeNotifier contactChangeNotifier
     ) {
         this.passwordResetTicketRepository = passwordResetTicketRepository;
         this.userRepository = userRepository;
@@ -106,6 +113,8 @@ public class PasswordResetService {
         this.clock = clock;
         this.appCheckGuard = appCheckGuard;
         this.smsChannel = smsChannel;
+        this.phoneOtpService = phoneOtpService;
+        this.contactChangeNotifier = contactChangeNotifier;
     }
 
     /**
@@ -209,6 +218,10 @@ public class PasswordResetService {
      * SMS code. An unparseable / non-mobile / unknown / unverified / inactive phone sends nothing. Every outcome
      * returns normally (the controller answers one 200); the SMS itself goes after commit
      * ({@link PasswordResetSmsChannel}), so neither its latency nor its failure is observable.
+     *
+     * <p>AUTH-D27 (c): every branch that sends no SMS still burns one per-phone send slot for a parsed UA mobile
+     * number ({@link PhoneOtpService#burnSlot}), so the per-phone 429 of the other OTP purposes says nothing about
+     * whether the number has an account or which channel it uses.
      */
     private void requestResetByPhone(String identifier) {
         appCheckGuard.checkCurrentRequest();
@@ -216,17 +229,24 @@ public class PasswordResetService {
         User user = phone.flatMap(userRepository::findByVerifiedPhoneForUpdate).orElse(null);
         if (user == null || !user.isActive()) {
             performPhoneDecoyWork(phone.orElse(null));
+            burnSlot(phone);
             return;
         }
         if (user.hasConfirmedEmail()) {
             mintAndSendOtp(user, true);
+            burnSlot(phone);
             return;
         }
         if (passwordResetOtpProcessor.isLocked(user)
                 || smsChannel.cooldownRemainingSeconds(user.getPasswordResetSmsSentAt()).isPresent()) {
+            burnSlot(phone);
             return;
         }
         requestSmsCode(user);
+    }
+
+    private void burnSlot(Optional<String> phoneE164) {
+        phoneE164.ifPresent(phone -> phoneOtpService.burnSlot(phone, PhoneOtpPurpose.PASSWORD_RESET));
     }
 
     /** Phone twin of {@link #performDecoyWork}: same OTP hash cost, a non-locking lookup when the phone parsed. */
@@ -344,6 +364,9 @@ public class PasswordResetService {
         // closes that race: by the time anyone can observe an evicted cache, the fresh value
         // is already committed and visible.
         evictTokensValidAfterCache(user.getId());
+
+        // AUTH-D26 (a): feed + push always, email to a confirmed address after commit; never SMS, never a code.
+        contactChangeNotifier.passwordReset(user);
 
         log.info("Password reset completed: userId={}", user.getId());
     }

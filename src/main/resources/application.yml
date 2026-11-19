@@ -351,6 +351,17 @@ app:
       mode: ${APP_AUTH_APP_CHECK_MODE:ENFORCE}
       project-number: ${APP_AUTH_APP_CHECK_PROJECT_NUMBER:}
       app-ids: ${APP_AUTH_APP_CHECK_APP_IDS:}
+      # Phone-first hardening (AUTH-D27 d) — a limited-use token whose jti was already accepted (remembered until its
+      # exp): OFF ignore, LOG_ONLY count appcheck.verify{result=replay} + WARN, ENFORCE 403 APP_CHECK_FAILED.
+      # LOG_ONLY in every env until build 14 is the Play minimum; the boot guard refuses ENFORCE below it (AUTH-D29).
+      replay-mode: ${APP_AUTH_APP_CHECK_REPLAY:LOG_ONLY}
+  # Phone-first hardening — per-phone SMS-code controls (AuthLimitsProperties; the other app.auth-limits keys keep their
+  # code defaults). Outside local they may only tighten (EnvironmentFingerprintGuard rule auth-limits-not-loosened).
+  auth-limits:
+    # AUTH-D26 (c): wrong SMS codes per phone per rolling 24 h, every purpose; then verify INVALID_CODE, send 429.
+    phone-failed-verifies-per-day: ${APP_AUTH_PHONE_FAILED_VERIFIES_PER_DAY:10}
+    # AUTH-D27 (a): a second SMS code to one phone for one purpose within this many seconds -> 429 + Retry-After.
+    otp-resend-cooldown-seconds: ${APP_AUTH_OTP_RESEND_COOLDOWN_SECONDS:60}
   # Phase 437 — GET /api/v1/app/config (mobile 438 forced-update gate). Compared against the Android versionCode
   # (pubspec +N). Defaults never block anyone. Boot fails on a negative code, latest < min, or a store URL not on
   # https://play.google.com/. Raise APP_ANDROID_MIN_VERSION_CODE only after the replacement build is live on Play.
@@ -673,8 +684,8 @@ app:
     cleanup-retention: 7d
   password-reset-otp:
     # 6-digit OTP lifetime for the password-reset request/verify step (mirrors
-    # app.verification's shape). Kept short — 15 minutes is plenty to check an inbox.
-    otp-ttl: 15m
+    # app.verification's shape). AUTH-D26 (b): 10 minutes, the same as the SMS reset code.
+    otp-ttl: 10m
     # Per-code attempt cap before PasswordResetOtpProcessor treats the code as expired.
     max-attempts-per-code: 5
     # Resend-surviving cumulative brute-force bound: after this many lifetime failed

@@ -126,4 +126,25 @@ class ClientIpResolverTest {
 
         assertThat(resolved).isEqualTo(REMOTE_ADDR);
     }
+
+    // ── Phone-first hardening B10 (AUTH-D27 e) — one per-client key for the login bucket and lockout ──
+
+    @Test
+    @DisplayName("should_keyOnSlash64_when_ipv6")
+    void should_keyOnSlash64_when_ipv6() {
+        String first = ClientIpResolver.prefixKey("2001:db8:1:2::1");
+        String rotated = ClientIpResolver.prefixKey("2001:db8:1:2:ffff:ffff:ffff:fffe");
+        String otherPrefix = ClientIpResolver.prefixKey("2001:db8:1:3::1");
+
+        org.assertj.core.api.Assertions.assertThat(first).isEqualTo("2001:db8:1:2:0:0:0:0/64").isEqualTo(rotated);
+        org.assertj.core.api.Assertions.assertThat(otherPrefix).isNotEqualTo(first);
+    }
+
+    @Test
+    @DisplayName("should_keepAddress_when_ipv4OrNotAnIpLiteral")
+    void should_keepAddress_when_ipv4OrNotAnIpLiteral() {
+        org.assertj.core.api.Assertions.assertThat(ClientIpResolver.prefixKey("203.0.113.7")).isEqualTo("203.0.113.7");
+        org.assertj.core.api.Assertions.assertThat(ClientIpResolver.prefixKey("not-an-ip")).isEqualTo("not-an-ip");
+        org.assertj.core.api.Assertions.assertThat(ClientIpResolver.prefixKey("::1")).isEqualTo("0:0:0:0:0:0:0:1");
+    }
 }

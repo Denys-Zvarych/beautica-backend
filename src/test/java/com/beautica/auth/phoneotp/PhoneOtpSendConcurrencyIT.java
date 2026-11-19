@@ -77,8 +77,12 @@ class PhoneOtpSendConcurrencyIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("concurrent sends for one phone stop at the cap of 3")
+    @DisplayName("concurrent sends for one phone stop at the cap of 3 (one per purpose: the 60 s cooldown, AUTH-D27 a)")
     void should_allowAtMostCapSends_when_concurrentSendsForSamePhone() throws Exception {
+        // Three anonymous purposes, so the per-purpose cooldown admits at most one send each and the per-phone lock
+        // must serialise the rest: without it two sends of one purpose (or a 4th row) could both pass.
+        PhoneOtpPurpose[] purposes = {PhoneOtpPurpose.GUEST_BOOKING, PhoneOtpPurpose.REGISTRATION,
+                PhoneOtpPurpose.PASSWORD_RESET};
         var startLatch = new CountDownLatch(1);
         var doneLatch = new CountDownLatch(PARALLEL_SENDS);
         var succeeded = new AtomicInteger();
@@ -86,15 +90,18 @@ class PhoneOtpSendConcurrencyIT extends AbstractIntegrationTest {
         ExecutorService pool = Executors.newFixedThreadPool(PARALLEL_SENDS);
         try {
             for (int i = 0; i < PARALLEL_SENDS; i++) {
+                PhoneOtpPurpose purpose = purposes[i % purposes.length];
                 pool.execute(() -> {
                     try {
                         startLatch.await();
-                        phoneOtpService.sendOtp(PHONE);
+                        phoneOtpService.sendCode(PHONE, null, purpose);
                         succeeded.incrementAndGet();
                     } catch (BusinessException e) {
                         if (e.getStatus() == HttpStatus.TOO_MANY_REQUESTS) {
                             tooMany.incrementAndGet();
                         }
+                    } catch (com.beautica.common.exception.ResendThrottledException e) {
+                        tooMany.incrementAndGet();
                     } catch (InterruptedException ie) {
                         Thread.currentThread().interrupt();
                     } finally {
@@ -157,9 +164,10 @@ class PhoneOtpSendConcurrencyIT extends AbstractIntegrationTest {
     @DisplayName("the per-phone cap counts every purpose together, so a guest + registration mix still stops at 3 SMS")
     void should_throw429_when_fourthSendOfAnyPurposeMixWithinWindow() {
         String phone = "+380671234599";
+        // Three different purposes: a repeat of one purpose inside 60 s is the resend cooldown (AUTH-D27 a), not the cap.
         phoneOtpService.sendCode(phone, null, PhoneOtpPurpose.GUEST_BOOKING);
         phoneOtpService.sendCode(phone, null, PhoneOtpPurpose.REGISTRATION);
-        phoneOtpService.sendCode(phone, null, PhoneOtpPurpose.GUEST_BOOKING);
+        phoneOtpService.sendCode(phone, null, PhoneOtpPurpose.PASSWORD_RESET);
 
         assertThatThrownBy(() -> phoneOtpService.sendCode(phone, null, PhoneOtpPurpose.REGISTRATION))
                 .isInstanceOfSatisfying(BusinessException.class,
@@ -199,6 +207,8 @@ class PhoneOtpSendConcurrencyIT extends AbstractIntegrationTest {
             assertThatThrownBy(() -> phoneOtpService.sendOtp(PHONE))
                     .extracting(ex -> ((BusinessException) ex).getStatus())
                     .isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
+            // AUTH-D27 (a): move past the 60 s resend cooldown; the rows stay in the 15-min window.
+            jdbc.update("UPDATE phone_otps SET created_at = created_at - interval '61 seconds' WHERE phone = ?", PHONE);
         }
 
         assertThatThrownBy(() -> phoneOtpService.sendOtp(PHONE))

@@ -111,4 +111,25 @@ class ContactChangeNotifierTest {
                 InAppNotificationType.SECURITY_EMAIL_CHANGED, USER_ID, "n***@beautica.test", NOW);
         verifyNoInteractions(emailNotificationService);
     }
+
+    @Test
+    @DisplayName("password reset with a confirmed email — feed notice plus contact-changed email")
+    void should_notifyFeedAndConfirmedEmail_when_passwordReset() {
+        notifier.passwordReset(phoneUser("olena@beautica.test"));
+
+        verify(inAppNotificationService).notifySecurityNotice(
+                InAppNotificationType.SECURITY_PASSWORD_RESET, USER_ID, null, NOW);
+        verify(emailNotificationService).sendContactChangedEmail(
+                "olena@beautica.test", ContactChangeKind.PASSWORD, null);
+    }
+
+    @Test
+    @DisplayName("password reset without a confirmed email — feed notice only, no email")
+    void should_notifyFeedOnly_when_passwordResetWithoutConfirmedEmail() {
+        notifier.passwordReset(phoneUser(null));
+
+        verify(inAppNotificationService).notifySecurityNotice(
+                InAppNotificationType.SECURITY_PASSWORD_RESET, USER_ID, null, NOW);
+        verifyNoInteractions(emailNotificationService);
+    }
 }

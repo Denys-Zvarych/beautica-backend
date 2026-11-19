@@ -284,4 +284,65 @@ class AuthServiceLoginIdentifierTest {
         assertThat(response.auth()).isNotNull();
         assertThat(account.getValue().role()).isEqualTo(Role.INDEPENDENT_MASTER);
     }
+
+    // ── Phone-first hardening — B11 lock-before-lookup, AUTH-D27 (e) /64 lockout, B12 hash before tx ──
+
+    @Test
+    @DisplayName("should_skipAccountLookup_when_identifierAndClientLocked")
+    void should_skipAccountLookup_when_identifierAndClientLocked() {
+        User user = phoneUser();
+        when(userRepository.findByVerifiedPhone(PHONE)).thenReturn(Optional.of(user));
+        failTenTimesFrom(CLIENT_IP);
+        clearInvocations(userRepository);
+
+        assertThatThrownBy(() -> authService.login(new LoginRequest(null, PASSWORD, "050 123 45 67"), CLIENT_IP))
+                .isInstanceOf(BusinessException.class);
+
+        verify(userRepository, never()).findByVerifiedPhone(anyString());
+        verify(userRepository, never()).findByEmail(anyString());
+    }
+
+    @Test
+    @DisplayName("should_shareLock_when_twoAddressesInSameIpv6Slash64")
+    void should_shareLock_when_twoAddressesInSameIpv6Slash64() {
+        User user = phoneUser();
+        when(userRepository.findByVerifiedPhone(PHONE)).thenReturn(Optional.of(user));
+        failTenTimesFrom(com.beautica.auth.filter.ClientIpResolver.prefixKey("2001:db8:1:2::1"));
+
+        String rotatedAddress = com.beautica.auth.filter.ClientIpResolver.prefixKey("2001:db8:1:2:abcd::ffff");
+
+        assertThatThrownBy(() -> authService.login(new LoginRequest(null, PASSWORD, PHONE), rotatedAddress))
+                .isInstanceOfSatisfying(BusinessException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(HttpStatus.UNAUTHORIZED));
+    }
+
+    @Test
+    @DisplayName("should_signIn_when_lockedSlash64IsAnotherPrefix")
+    void should_signIn_when_lockedSlash64IsAnotherPrefix() {
+        User user = phoneUser();
+        when(userRepository.findByVerifiedPhone(PHONE)).thenReturn(Optional.of(user));
+        when(authResponseBuilder.buildAuthResponse(user)).thenReturn(tokens());
+        failTenTimesFrom(com.beautica.auth.filter.ClientIpResolver.prefixKey("2001:db8:1:2::1"));
+
+        AuthResponse response = authService.login(new LoginRequest(null, PASSWORD, PHONE),
+                com.beautica.auth.filter.ClientIpResolver.prefixKey("2001:db8:1:3::1"));
+
+        assertThat(response.accessToken()).isEqualTo("access");
+    }
+
+    @Test
+    @DisplayName("should_handPhoneRegistrationTheHashNotThePassword_when_registerWithTicket")
+    void should_handPhoneRegistrationTheHashNotThePassword_when_registerWithTicket() {
+        when(phoneRegistrationService.register(any())).thenReturn(tokens());
+        RegisterRequest request = new RegisterRequest(null, PASSWORD, SelfRegistrationRole.CLIENT, "Olena",
+                null, null, null, null, null, null, "ticket");
+
+        authService.register(request);
+
+        ArgumentCaptor<PhoneRegistrationService.PhoneAccount> account =
+                ArgumentCaptor.forClass(PhoneRegistrationService.PhoneAccount.class);
+        verify(phoneRegistrationService).register(account.capture());
+        assertThat(account.getValue().passwordHash()).isNotEqualTo(PASSWORD);
+        assertThat(passwordEncoder.matches(PASSWORD, account.getValue().passwordHash())).isTrue();
+    }
 }

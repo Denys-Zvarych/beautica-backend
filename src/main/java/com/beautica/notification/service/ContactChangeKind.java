@@ -5,5 +5,7 @@ public enum ContactChangeKind {
     /** The verified phone was changed (sent to the account's confirmed email). */
     PHONE,
     /** The notifications email was changed (sent to the PREVIOUS confirmed email). */
-    EMAIL
+    EMAIL,
+    /** AUTH-D26 (a) — the password was reset (sent to the account's confirmed email); no new value is shown. */
+    PASSWORD
 }
