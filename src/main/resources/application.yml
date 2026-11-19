@@ -113,7 +113,7 @@ server:
   # Setting it to 'framework' (ForwardedHeaderFilter) would strip X-Forwarded-For before
   # AuthRateLimitFilter runs, and 'native' (Tomcat RemoteIpValve) rewrites remoteAddr from it,
   # either of which makes IP-based rate limiting ineffective. The raw XFF header is read
-  # directly by AuthRateLimitFilter. Consequence: behind the TLS proxy the app sees http, so the
+  # directly by AuthRateLimitFilter (when app.rate-limit.trust-forwarded-headers is true). Consequence: behind the TLS proxy the app sees http, so the
   # same-origin admin review POSTs get a scoped CORS entry in SecurityConfig.
   compression:
     # Gzip responses at the Tomcat layer. Deliberately set HERE (shared config), not per
@@ -690,6 +690,10 @@ app:
     # immediately (unlike the old 1-hour email-link TTL).
     ticket-ttl: 10m
   rate-limit:
+    # Per-IP key source (ClientIpProperties / ClientIpResolver). true = the rightmost X-Forwarded-For entry
+    # if it is a valid IP literal, else the socket address (X-Real-IP is never read) — correct only behind exactly one Railway edge-proxy hop.
+    # false = socket address only (local: no proxy, every header is caller-typed). Profile config, no env var.
+    trust-forwarded-headers: true
     # Per-IP cap for POST/DELETE /api/v1/devices/token (60 s window).
     # Other capacities (login/refresh/slots) use @Value defaults in RateLimitConfig.
     device-token-capacity: 30

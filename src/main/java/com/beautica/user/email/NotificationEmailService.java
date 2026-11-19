@@ -6,6 +6,7 @@ import com.beautica.common.exception.EmailAlreadyRegisteredException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.exception.ResendThrottledException;
 import com.beautica.common.exception.VerificationException;
+import com.beautica.config.AuthLimitsProperties;
 import com.beautica.config.VerificationPolicyConfig;
 import com.beautica.notification.service.EmailNotificationService;
 import com.beautica.user.AfterCommitHandOff;
@@ -16,6 +17,7 @@ import com.beautica.user.security.ContactChangeNotifier;
 import com.beautica.user.security.CurrentPasswordCheck;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.core.task.TaskExecutor;
 import org.springframework.dao.DataIntegrityViolationException;
@@ -58,8 +60,8 @@ public class NotificationEmailService {
 
     /** AUTH-03. */
     static final Duration CODE_TTL = Duration.ofMinutes(15);
-    /** AUTH-03 — after this many wrong codes the code counts as expired. */
-    static final int MAX_ATTEMPTS_PER_CODE = 5;
+    /** AUTH-03 — after this many wrong codes the code counts as expired; default of app.auth-limits.email-code-max-verify-attempts. */
+    public static final int MAX_ATTEMPTS_PER_CODE = 5;
     /** Postgres default name of {@code users.email UNIQUE} (V1). */
     static final String USERS_EMAIL_UNIQUE = "users_email_key";
 
@@ -74,7 +76,9 @@ public class NotificationEmailService {
     private final ContactChangeNotifier contactChangeNotifier;
     private final TransactionTemplate transactionTemplate;
     private final Clock clock;
+    private final int maxAttemptsPerCode;
 
+    /** Production default {@link #MAX_ATTEMPTS_PER_CODE}; kept for the tests that build it directly. */
     public NotificationEmailService(UserRepository userRepository,
                                     PendingEmailRepository pendingEmailRepository,
                                     TokenGenerator tokenGenerator,
@@ -86,6 +90,25 @@ public class NotificationEmailService {
                                     ContactChangeNotifier contactChangeNotifier,
                                     PlatformTransactionManager transactionManager,
                                     Clock clock) {
+        this(userRepository, pendingEmailRepository, tokenGenerator, emailNotificationService, emailExecutor,
+                verificationPolicy, userProfileCacheEvictor, currentPasswordCheck, contactChangeNotifier,
+                transactionManager, clock, AuthLimitsProperties.defaults());
+    }
+
+    @Autowired
+    public NotificationEmailService(UserRepository userRepository,
+                                    PendingEmailRepository pendingEmailRepository,
+                                    TokenGenerator tokenGenerator,
+                                    EmailNotificationService emailNotificationService,
+                                    @Qualifier("emailExecutor") TaskExecutor emailExecutor,
+                                    VerificationPolicyConfig verificationPolicy,
+                                    UserProfileCacheEvictor userProfileCacheEvictor,
+                                    CurrentPasswordCheck currentPasswordCheck,
+                                    ContactChangeNotifier contactChangeNotifier,
+                                    PlatformTransactionManager transactionManager,
+                                    Clock clock,
+                                    AuthLimitsProperties limits) {
+        this.maxAttemptsPerCode = limits.emailCodeMaxVerifyAttempts();
         this.userRepository = userRepository;
         this.pendingEmailRepository = pendingEmailRepository;
         this.tokenGenerator = tokenGenerator;
@@ -164,7 +187,7 @@ public class NotificationEmailService {
         if (pending.isLocked(now)) {
             throw invalid(code);
         }
-        if (!pending.getExpiresAt().isAfter(now) || pending.getAttempts() >= MAX_ATTEMPTS_PER_CODE) {
+        if (!pending.getExpiresAt().isAfter(now) || pending.getAttempts() >= maxAttemptsPerCode) {
             throw new VerificationException(VerificationException.Code.CODE_EXPIRED);
         }
         if (!passwordOk) {

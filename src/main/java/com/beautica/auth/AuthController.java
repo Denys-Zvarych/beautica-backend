@@ -47,13 +47,16 @@ public class AuthController {
     private final AuthService authService;
     private final InviteService inviteService;
     private final PasswordResetService passwordResetService;
+    private final ClientIpResolver clientIpResolver;
 
     public AuthController(AuthService authService,
                           InviteService inviteService,
-                          PasswordResetService passwordResetService) {
+                          PasswordResetService passwordResetService,
+                          ClientIpResolver clientIpResolver) {
         this.authService = authService;
         this.inviteService = inviteService;
         this.passwordResetService = passwordResetService;
+        this.clientIpResolver = clientIpResolver;
     }
 
     @PostMapping("/register")
@@ -77,7 +80,7 @@ public class AuthController {
             @Valid @RequestBody LoginRequest request,
             HttpServletRequest httpRequest
     ) {
-        AuthResponse response = authService.login(request, ClientIpResolver.resolve(httpRequest));
+        AuthResponse response = authService.login(request, clientIpResolver.resolve(httpRequest));
         return ResponseEntity.ok(ApiResponse.ok(response));
     }
 
