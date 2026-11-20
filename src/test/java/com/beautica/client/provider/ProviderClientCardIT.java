@@ -223,7 +223,7 @@ class ProviderClientCardIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("6: a registered client's users.phone_number never appears, for any role (pre-B518)")
+    @DisplayName("6: a registered client's UNVERIFIED users.phone_number never appears, for any role (B518: verified is ProviderClientPhoneIT)")
     void should_neverExposeRegisteredPhone_when_anyRoleViewsTheCard() throws Exception {
         Salon s = fx.salon();
         UUID c = fx.client("Петро", "Сидоренко");

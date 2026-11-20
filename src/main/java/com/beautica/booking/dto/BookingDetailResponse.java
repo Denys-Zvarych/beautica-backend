@@ -520,7 +520,16 @@ public record BookingDetailResponse(
         @Schema(description = "True when the viewer may block this booking's client (POST /blocks would not "
                 + "answer 400/403/404): a provider viewer in scope, and a registered client or a link guest with a "
                 + "verified phone. False for a STAFF walk-in, an erased guest, list rows and non-provider viewers.")
-        boolean clientBlockable
+        boolean clientBlockable,
+        // B518 (GST-D14, GST-80). Appended LAST. Populated ONLY by the two provider-visible withers on the detail read.
+        @Schema(types = {"string", "null"}, nullable = true, format = "phone",
+                description = "E.164 phone of the booking's client, for the provider's tap-to-call: the guest's phone "
+                        + "for a guest booking, or the registered client's SMS-VERIFIED phone (never an unverified "
+                        + "one). NON-NULL ONLY on the booking DETAIL read (GET /bookings/{id}) for an "
+                        + "INDEPENDENT_MASTER, SALON_OWNER or assigned SALON_ADMIN - a SALON_MASTER NEVER sees it. "
+                        + "NULL on every list/feed row, on create and reschedule responses and for a client viewer. "
+                        + "guestPhone keeps its legacy guest-only semantics for old app builds.")
+        String clientPhone
 ) {
 
     /**
@@ -538,7 +547,7 @@ public record BookingDetailResponse(
                 districtLabel, street, buildingNo, locationNote, categoryName, canReview, providerCanReviewClient,
                 appointmentId, clientAvatarUrl, awaitingClosure, masterAvgRating, masterReviewCount, salonId,
                 categoryKey, reviewByClient, clientAvgRating, clientReviewCount, guestPhone,
-                blockId != null, blockId, blockable);
+                blockId != null, blockId, blockable, clientPhone);
     }
 
     /**
@@ -557,6 +566,25 @@ public record BookingDetailResponse(
         if (phone == null) {
             return this;
         }
+        return withPhones(phone, phone);
+    }
+
+    /**
+     * B518 (GST-D14, GST-80) - attaches {@code clientPhone} for a REGISTERED client's booking, and only when the
+     * account's phone is SMS-verified ({@code users.phone_verified_at IS NOT NULL}); an unverified number is never
+     * read onto the wire. {@code guestPhone} stays null (legacy semantics). The caller has already applied the
+     * audience gate ({@code AuthorizationService#isGuestPhoneAudience}) in {@code BookingService#getBooking}.
+     */
+    public BookingDetailResponse withProviderVisibleRegisteredPhone(Booking booking) {
+        User client = booking.getClient();
+        if (client == null || client.getPhoneVerifiedAt() == null || client.getPhoneNumber() == null) {
+            return this;
+        }
+        return withPhones(guestPhone, client.getPhoneNumber());
+    }
+
+    /** The single positional-constructor copy for the phone withers: only guestPhone and clientPhone differ. */
+    private BookingDetailResponse withPhones(String newGuestPhone, String newClientPhone) {
         return new BookingDetailResponse(
                 id, clientId, masterId, masterServiceId, serviceName, status, startsAt, endsAt, priceAtBooking,
                 priceMaxAtBooking, durationMinutesAtBooking, createdAt, clientFirstName, clientLastName,
@@ -564,8 +592,8 @@ public record BookingDetailResponse(
                 clientCancellationNote, masterAvatarUrl, masterType, salonName, cityLabel,
                 districtLabel, street, buildingNo, locationNote, categoryName, canReview, providerCanReviewClient,
                 appointmentId, clientAvatarUrl, awaitingClosure, masterAvgRating, masterReviewCount, salonId,
-                categoryKey, reviewByClient, clientAvgRating, clientReviewCount, phone,
-                clientBlocked, clientBlockId, clientBlockable);
+                categoryKey, reviewByClient, clientAvgRating, clientReviewCount, newGuestPhone,
+                clientBlocked, clientBlockId, clientBlockable, newClientPhone);
     }
 
     /**
@@ -575,7 +603,8 @@ public record BookingDetailResponse(
     @Override
     public String toString() {
         return "BookingDetailResponse[id=" + id + ", status=" + status
-                + ", guestPhone=" + (guestPhone == null ? "null" : "+380***") + "]";
+                + ", guestPhone=" + (guestPhone == null ? "null" : "+380***")
+                + ", clientPhone=" + (clientPhone == null ? "null" : "+380***") + "]";
     }
 
     /**
@@ -788,7 +817,9 @@ public record BookingDetailResponse(
                 // Phase 397: block state is attached afterwards by the detail read only (withClientBlockState).
                 false,
                 null,
-                false
+                false,
+                // B518: clientPhone is attached afterwards by the detail read only, like guestPhone.
+                null
         );
     }
 }

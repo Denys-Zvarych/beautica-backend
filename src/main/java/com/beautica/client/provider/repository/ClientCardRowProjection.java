@@ -5,7 +5,7 @@ import java.time.Instant;
 import java.util.UUID;
 
 /**
- * B508 — the one aggregate row behind a client card. INTERNAL: {@link #getGuestPhone()} is the raw E.164 and a Spring
+ * B508 — the one aggregate row behind a client card. INTERNAL: {@link #getGuestPhone()} / {@link #getVerifiedPhone()} are raw E.164 and a Spring
  * projection proxy's {@code toString} prints every column, so the service copies what it needs and never logs this
  * object or puts it in an exception message.
  */
@@ -28,6 +28,9 @@ public interface ClientCardRowProjection {
 
     /** Raw E.164; guest only. */
     String getGuestPhone();
+
+    /** B518: the registered client's phone ONLY when SMS-verified (SQL-gated); null otherwise and for a guest. */
+    String getVerifiedPhone();
 
     String getGuestName();
 

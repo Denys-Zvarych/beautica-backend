@@ -1841,8 +1841,8 @@ public class AuthorizationService {
      *   <li>{@code SALON_MASTER} - NEVER, even as the performing master of that very booking;</li>
      *   <li>{@code CLIENT} and anything else - never.</li>
      * </ul>
-     * Only the role half of the decision lives here; the data half (a registered user's phone is never read) lives in
-     * {@code BookingDetailResponse#withProviderVisibleGuestPhone}.
+     * Only the role half of the decision lives here; the data half lives in {@code BookingDetailResponse#withProviderVisibleGuestPhone} (guest phone) and
+     * {@code #withProviderVisibleRegisteredPhone} (a registered client's SMS-verified phone only, B518).
      */
     public boolean isGuestPhoneAudience() {
         Role actorRole = roleFromCurrentAuthentication();

@@ -16,7 +16,7 @@ import java.util.UUID;
  * @param displayName    null when blank (the app renders «Гість»)
  * @param avatarUrl      REGISTERED only
  * @param phone          E.164, only for the independent master / salon owner / assigned salon admin (GST-D14); never
- *                       for a SALON_MASTER. A GUEST's phone; a REGISTERED client's stays null until SMS-verified (B514)
+ *                       for a SALON_MASTER. A GUEST's phone, or a REGISTERED client's SMS-VERIFIED phone (B518, GST-80); null otherwise
  * @param ratingAvg      REGISTERED only; null when unrated, always null for a guest
  * @param firstVisitAt   earliest booking start in scope, any status
  */
@@ -34,6 +34,13 @@ public record ClientCardResponse(
         OffsetDateTime nextVisitAt,
         Stats stats
 ) {
+
+    /** Redacted: the generated record {@code toString} would print the client's phone and name in clear. */
+    @Override
+    public String toString() {
+        return "ClientCardResponse[kind=" + kind + ", userId=" + userId + ", guestBookingId=" + guestBookingId
+                + ", phone=" + (phone == null ? "null" : "+380***") + "]";
+    }
 
     /**
      * Exactly three counts (D3); a cancelled / declined / no-show / legacy NOT_COMPLETED visit counts only in

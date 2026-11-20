@@ -162,8 +162,8 @@ class ProviderClientServiceTest {
     }
 
     @Test
-    @DisplayName("should_returnNullPhoneForRegistered_when_audienceIsAllowed")
-    void should_returnNullPhoneForRegistered_when_audienceIsAllowed() {
+    @DisplayName("should_returnNullPhoneForRegistered_when_phoneIsUnverified")
+    void should_returnNullPhoneForRegistered_when_phoneIsUnverified() {
         lenient().when(authz.isGuestPhoneAudience()).thenReturn(true);
         when(repository.cardUserBySalon(salonId, userId, utc(NOW))).thenAnswer(i -> registeredRow(1, BigDecimal.ONE));
         when(clientBlockService.blockedAmong(any(), anyCollection(), anyCollection()))
@@ -171,8 +171,42 @@ class ProviderClientServiceTest {
 
         ClientCardResponse card = service.getCard(new SalonScope(salonId, null), new ClientRef.Registered(userId));
 
-        assertThat(card.phone()).as("registered phone is B518").isNull();
+        assertThat(card.phone()).as("unverified: the SQL yields no verified phone").isNull();
         assertThat(card.blocked()).isFalse();
+    }
+
+    @Test
+    @DisplayName("should_returnVerifiedPhoneForRegistered_when_audienceIsAllowed")
+    void should_returnVerifiedPhoneForRegistered_when_audienceIsAllowed() {
+        when(authz.isGuestPhoneAudience()).thenReturn(true);
+        when(repository.cardUserBySalon(salonId, userId, utc(NOW))).thenAnswer(i -> {
+            ClientCardRowProjection p = registeredRow(1, BigDecimal.ONE);
+            lenient().when(p.getVerifiedPhone()).thenReturn(PHONE);
+            return p;
+        });
+        when(clientBlockService.blockedAmong(any(), anyCollection(), anyCollection()))
+                .thenReturn(new BlockedAmong(Set.of(), Set.of()));
+
+        ClientCardResponse card = service.getCard(new SalonScope(salonId, null), new ClientRef.Registered(userId));
+
+        assertThat(card.phone()).isEqualTo(PHONE);
+    }
+
+    @Test
+    @DisplayName("should_returnNullPhoneForRegistered_when_audienceIsNotAllowedEvenIfVerified")
+    void should_returnNullPhoneForRegistered_when_audienceIsNotAllowedEvenIfVerified() {
+        when(authz.isGuestPhoneAudience()).thenReturn(false);
+        when(repository.cardUserByMaster(masterId, userId, utc(NOW))).thenAnswer(i -> {
+            ClientCardRowProjection p = registeredRow(1, BigDecimal.ONE);
+            lenient().when(p.getVerifiedPhone()).thenReturn(PHONE);
+            return p;
+        });
+        when(clientBlockService.blockedAmong(any(), anyCollection(), anyCollection()))
+                .thenReturn(new BlockedAmong(Set.of(), Set.of()));
+
+        ClientCardResponse card = service.getCard(new MasterScope(masterId, salonId), new ClientRef.Registered(userId));
+
+        assertThat(card.phone()).isNull();
     }
 
     @Test
@@ -357,18 +391,19 @@ class ProviderClientServiceTest {
         ClientPhonePolicy policy = new ClientPhonePolicy(authz);
         when(authz.isGuestPhoneAudience()).thenReturn(false);
 
-        assertThat(policy.phoneFor(ClientKind.GUEST, PHONE, null)).isNull();
-        assertThat(policy.phoneFor(ClientKind.REGISTERED, null, userId)).isNull();
+        assertThat(policy.phoneFor(PHONE)).isNull();
+        assertThat(policy.phoneFor(PHONE)).isNull();
     }
 
     @Test
-    @DisplayName("should_returnGuestPhoneOnly_when_audienceIsAllowed")
-    void should_returnGuestPhoneOnly_when_audienceIsAllowed() {
+    @DisplayName("should_returnPhone_when_audienceIsAllowed")
+    void should_returnPhone_when_audienceIsAllowed() {
         ClientPhonePolicy policy = new ClientPhonePolicy(authz);
         lenient().when(authz.isGuestPhoneAudience()).thenReturn(true);
 
-        assertThat(policy.phoneFor(ClientKind.GUEST, PHONE, null)).isEqualTo(PHONE);
-        assertThat(policy.phoneFor(ClientKind.REGISTERED, PHONE, userId)).as("registered stays null until B518").isNull();
-        assertThat(policy.phoneFor(ClientKind.GUEST, null, null)).isNull();
+        assertThat(policy.phoneFor(PHONE)).isEqualTo(PHONE);
+        assertThat(policy.phoneFor(PHONE)).as("B518: verified registered phone").isEqualTo(PHONE);
+        assertThat(policy.phoneFor(null)).as("unverified/absent").isNull();
+        assertThat(policy.phoneFor(null)).isNull();
     }
 }

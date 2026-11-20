@@ -191,7 +191,7 @@ public class ProviderClientService {
                 int ratingCount = row.getReviewCount() == null ? 0 : row.getReviewCount();
                 yield new ClientCardResponse(ClientKind.REGISTERED, userId, null,
                         joinName(row.getFirstName(), row.getLastName()), row.getAvatarUrl(),
-                        phonePolicy.phoneFor(ClientKind.REGISTERED, null, userId), blocked,
+                        phonePolicy.phoneFor(row.getVerifiedPhone()), blocked,
                         ratingCount > 0 ? row.getAvgRating() : null, utc(row.getFirstVisitAt()),
                         utc(row.getLastVisitAt()), utc(row.getNextVisitAt()), stats);
             }
@@ -202,7 +202,7 @@ public class ProviderClientService {
                         .blockedAmong(scope.blockScope(), List.of(), List.of(hashed)).isPhoneBlocked(hashed);
                 yield new ClientCardResponse(ClientKind.GUEST, null, row.getAnchorBookingId(),
                         joinName(row.getGuestName(), row.getGuestSurname()), null,
-                        phonePolicy.phoneFor(ClientKind.GUEST, guestPhone, null), blocked, null,
+                        phonePolicy.phoneFor(guestPhone), blocked, null,
                         utc(row.getFirstVisitAt()), utc(row.getLastVisitAt()), utc(row.getNextVisitAt()), stats);
             }
         };

@@ -61,13 +61,17 @@ final class ClientCardSql {
 
     private static final String CARD_GUEST_SELECT = "SELECT a.*, (SELECT guest_phone FROM anchor) AS guestPhone, "
             + """
-            CAST(NULL AS text) AS firstName, CAST(NULL AS text) AS lastName, CAST(NULL AS text) AS avatarUrl,
+            CAST(NULL AS text) AS verifiedPhone, CAST(NULL AS text) AS firstName,
+                   CAST(NULL AS text) AS lastName, CAST(NULL AS text) AS avatarUrl,
                    CAST(NULL AS numeric) AS avgRating, CAST(NULL AS integer) AS reviewCount
               FROM (""" + CARD_AGG + ") a\n";
 
+    // B518 (GST-80): the registered phone rides the existing users join (no extra statement) and is NULL unless the
+    // number is SMS-verified (V244 phone_verified_at) - the unverified number never leaves the database.
     private static final String CARD_USER_SELECT_COLS = "SELECT a.*, CAST(NULL AS text) AS guestPhone, "
             + """
-            u.first_name AS firstName, u.last_name AS lastName, u.avatar_url AS avatarUrl,
+            CASE WHEN u.phone_verified_at IS NOT NULL THEN u.phone_number END AS verifiedPhone,
+                   u.first_name AS firstName, u.last_name AS lastName, u.avatar_url AS avatarUrl,
                    u.avg_rating AS avgRating, u.review_count AS reviewCount
               FROM (""" + CARD_AGG + """
             ) a
