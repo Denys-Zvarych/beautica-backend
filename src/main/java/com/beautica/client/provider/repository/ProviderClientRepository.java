@@ -6,6 +6,7 @@ import org.springframework.data.repository.Repository;
 import org.springframework.data.repository.query.Param;
 
 import java.time.OffsetDateTime;
+import java.util.Collection;
 import java.util.List;
 import java.util.UUID;
 
@@ -42,4 +43,79 @@ public interface ProviderClientRepository extends Repository<Booking, UUID> {
 
     @Query(value = ClientListSql.COUNT_MASTER, nativeQuery = true)
     long countByMaster(@Param("masterId") UUID masterId, @Param("now") OffsetDateTime now, @Param("q") String q);
+
+    // ── B508: client card (one aggregate row, always returned; totalVisits 0 = unknown / out of scope) ──
+
+    @Query(value = ClientCardSql.CARD_USER_SALON, nativeQuery = true)
+    ClientCardRowProjection cardUserBySalon(
+            @Param("salonId") UUID salonId, @Param("userId") UUID userId, @Param("now") OffsetDateTime now);
+
+    @Query(value = ClientCardSql.CARD_USER_SALON_MASTER, nativeQuery = true)
+    ClientCardRowProjection cardUserBySalonAndMaster(
+            @Param("salonId") UUID salonId, @Param("masterId") UUID masterId, @Param("userId") UUID userId,
+            @Param("now") OffsetDateTime now);
+
+    @Query(value = ClientCardSql.CARD_USER_MASTER, nativeQuery = true)
+    ClientCardRowProjection cardUserByMaster(
+            @Param("masterId") UUID masterId, @Param("userId") UUID userId, @Param("now") OffsetDateTime now);
+
+    @Query(value = ClientCardSql.CARD_GUEST_SALON, nativeQuery = true)
+    ClientCardRowProjection cardGuestBySalon(
+            @Param("salonId") UUID salonId, @Param("bookingId") UUID bookingId, @Param("now") OffsetDateTime now);
+
+    @Query(value = ClientCardSql.CARD_GUEST_SALON_MASTER, nativeQuery = true)
+    ClientCardRowProjection cardGuestBySalonAndMaster(
+            @Param("salonId") UUID salonId, @Param("masterId") UUID masterId, @Param("bookingId") UUID bookingId,
+            @Param("now") OffsetDateTime now);
+
+    @Query(value = ClientCardSql.CARD_GUEST_MASTER, nativeQuery = true)
+    ClientCardRowProjection cardGuestByMaster(
+            @Param("masterId") UUID masterId, @Param("bookingId") UUID bookingId, @Param("now") OffsetDateTime now);
+
+    // ── B508: visit page (always >= 1 row; visitKey null when the page is empty; total on every row) ──
+
+    @Query(value = ClientCardSql.VISITS_USER_SALON, nativeQuery = true)
+    List<ClientVisitPageRowProjection> visitsUserBySalon(
+            @Param("salonId") UUID salonId, @Param("userId") UUID userId, @Param("limit") int limit,
+            @Param("offset") long offset);
+
+    @Query(value = ClientCardSql.VISITS_USER_SALON_MASTER, nativeQuery = true)
+    List<ClientVisitPageRowProjection> visitsUserBySalonAndMaster(
+            @Param("salonId") UUID salonId, @Param("masterId") UUID masterId, @Param("userId") UUID userId,
+            @Param("limit") int limit, @Param("offset") long offset);
+
+    @Query(value = ClientCardSql.VISITS_USER_MASTER, nativeQuery = true)
+    List<ClientVisitPageRowProjection> visitsUserByMaster(
+            @Param("masterId") UUID masterId, @Param("userId") UUID userId, @Param("limit") int limit,
+            @Param("offset") long offset);
+
+    @Query(value = ClientCardSql.VISITS_GUEST_SALON, nativeQuery = true)
+    List<ClientVisitPageRowProjection> visitsGuestBySalon(
+            @Param("salonId") UUID salonId, @Param("bookingId") UUID bookingId, @Param("limit") int limit,
+            @Param("offset") long offset);
+
+    @Query(value = ClientCardSql.VISITS_GUEST_SALON_MASTER, nativeQuery = true)
+    List<ClientVisitPageRowProjection> visitsGuestBySalonAndMaster(
+            @Param("salonId") UUID salonId, @Param("masterId") UUID masterId, @Param("bookingId") UUID bookingId,
+            @Param("limit") int limit, @Param("offset") long offset);
+
+    @Query(value = ClientCardSql.VISITS_GUEST_MASTER, nativeQuery = true)
+    List<ClientVisitPageRowProjection> visitsGuestByMaster(
+            @Param("masterId") UUID masterId, @Param("bookingId") UUID bookingId, @Param("limit") int limit,
+            @Param("offset") long offset);
+
+    // ── B508: the page's visits' rows in scope, with service + master names (one statement) ──
+
+    @Query(value = ClientCardSql.ITEMS_SALON, nativeQuery = true)
+    List<ClientVisitItemProjection> visitItemsBySalon(
+            @Param("salonId") UUID salonId, @Param("visitKeys") Collection<UUID> visitKeys);
+
+    @Query(value = ClientCardSql.ITEMS_SALON_MASTER, nativeQuery = true)
+    List<ClientVisitItemProjection> visitItemsBySalonAndMaster(
+            @Param("salonId") UUID salonId, @Param("masterId") UUID masterId,
+            @Param("visitKeys") Collection<UUID> visitKeys);
+
+    @Query(value = ClientCardSql.ITEMS_MASTER, nativeQuery = true)
+    List<ClientVisitItemProjection> visitItemsByMaster(
+            @Param("masterId") UUID masterId, @Param("visitKeys") Collection<UUID> visitKeys);
 }

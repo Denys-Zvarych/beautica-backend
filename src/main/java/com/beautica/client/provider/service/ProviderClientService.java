@@ -1,12 +1,21 @@
 package com.beautica.client.provider.service;
 
+import com.beautica.booking.enums.BookingStatus;
+import com.beautica.client.provider.dto.ClientCardResponse;
 import com.beautica.client.provider.dto.ClientKind;
 import com.beautica.client.provider.dto.ClientListItemResponse;
+import com.beautica.client.provider.dto.ClientVisitResponse;
+import com.beautica.client.provider.repository.ClientCardRowProjection;
 import com.beautica.client.provider.repository.ClientListRowProjection;
+import com.beautica.client.provider.repository.ClientVisitItemProjection;
+import com.beautica.client.provider.repository.ClientVisitPageRowProjection;
 import com.beautica.client.provider.repository.ProviderClientRepository;
 import com.beautica.client.provider.service.ClientScope.MasterScope;
+import com.beautica.client.provider.service.ClientRef.GuestAnchor;
+import com.beautica.client.provider.service.ClientRef.Registered;
 import com.beautica.client.provider.service.ClientScope.SalonScope;
 import com.beautica.common.exception.BusinessException;
+import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.security.PhoneHasher;
 import com.beautica.common.security.PhoneHasher.HashedPhone;
 import com.beautica.moderation.service.ClientBlockService;
@@ -25,7 +34,9 @@ import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 /**
@@ -44,6 +55,7 @@ public class ProviderClientService {
     private final ProviderClientRepository repository;
     private final ClientBlockService clientBlockService;
     private final PhoneHasher phoneHasher;
+    private final ClientPhonePolicy phonePolicy;
     private final Clock clock;
 
     /** The row as the service reads it; {@code guestPhone} never leaves this class. */
@@ -154,6 +166,148 @@ public class ProviderClientService {
         String l = last == null ? "" : last.strip();
         String joined = (f + " " + l).strip();
         return joined.isEmpty() ? null : joined;
+    }
+
+    // ── B508: client card + visit history (CLI-42..45) ───────────────────────
+
+    /**
+     * One aggregate statement + one block lookup (the guest phone is read inside the aggregate from the anchor booking).
+     * Unknown / out-of-scope / anonymised / registered-anchor all produce zero visits in scope and the same
+     * {@link NotFoundException} (D6) — never a 403, so ids cannot be probed across salons.
+     */
+    @Transactional(readOnly = true)
+    public ClientCardResponse getCard(ClientScope scope, ClientRef ref) {
+        ClientCardRowProjection row = loadCard(scope, ref, OffsetDateTime.now(clock));
+        long total = row == null || row.getTotalVisits() == null ? 0 : row.getTotalVisits();
+        if (total == 0) {
+            throw clientNotFound();
+        }
+        ClientCardResponse.Stats stats = new ClientCardResponse.Stats((int) total,
+                toInt(row.getCompletedVisits()), toInt(row.getUpcomingVisits()));
+        return switch (ref) {
+            case Registered(UUID userId) -> {
+                boolean blocked = clientBlockService.blockedAmong(scope.blockScope(), List.of(userId), List.of())
+                        .isUserBlocked(userId);
+                int ratingCount = row.getReviewCount() == null ? 0 : row.getReviewCount();
+                yield new ClientCardResponse(ClientKind.REGISTERED, userId, null,
+                        joinName(row.getFirstName(), row.getLastName()), row.getAvatarUrl(),
+                        phonePolicy.phoneFor(ClientKind.REGISTERED, null, userId), blocked,
+                        ratingCount > 0 ? row.getAvgRating() : null, utc(row.getFirstVisitAt()),
+                        utc(row.getLastVisitAt()), utc(row.getNextVisitAt()), stats);
+            }
+            case GuestAnchor ignored -> {
+                String guestPhone = row.getGuestPhone();
+                HashedPhone hashed = guestPhone == null ? null : phoneHasher.tryHash(guestPhone).orElse(null);
+                boolean blocked = hashed != null && clientBlockService
+                        .blockedAmong(scope.blockScope(), List.of(), List.of(hashed)).isPhoneBlocked(hashed);
+                yield new ClientCardResponse(ClientKind.GUEST, null, row.getAnchorBookingId(),
+                        joinName(row.getGuestName(), row.getGuestSurname()), null,
+                        phonePolicy.phoneFor(ClientKind.GUEST, guestPhone, null), blocked, null,
+                        utc(row.getFirstVisitAt()), utc(row.getLastVisitAt()), utc(row.getNextVisitAt()), stats);
+            }
+        };
+    }
+
+    /**
+     * Newest visit first; two statements whatever the page size or the items per visit: the page of visit keys (with
+     * the total) and every row of those visits in scope, assembled here. A client with no visit in scope is the same
+     * 404 as the card.
+     *
+     * @param pageable page + size only; the order is fixed
+     */
+    @Transactional(readOnly = true)
+    public Page<ClientVisitResponse> getVisits(ClientScope scope, ClientRef ref, Pageable pageable) {
+        List<ClientVisitPageRowProjection> pageRows = loadVisitPage(scope, ref, pageable.getPageSize(),
+                pageable.getOffset());
+        long total = pageRows.isEmpty() || pageRows.get(0).getTotal() == null ? 0 : pageRows.get(0).getTotal();
+        if (total == 0) {
+            throw clientNotFound();
+        }
+        List<UUID> keys = pageRows.stream().map(ClientVisitPageRowProjection::getVisitKey)
+                .filter(java.util.Objects::nonNull).toList();
+        if (keys.isEmpty()) {
+            return new PageImpl<>(List.of(), pageable, total);
+        }
+        Map<UUID, List<ClientVisitItemProjection>> itemsByVisit = new LinkedHashMap<>();
+        for (ClientVisitItemProjection item : loadVisitItems(scope, keys)) {
+            itemsByVisit.computeIfAbsent(item.getVisitKey(), k -> new ArrayList<>()).add(item);
+        }
+        List<ClientVisitResponse> visits = new ArrayList<>(keys.size());
+        for (ClientVisitPageRowProjection page : pageRows) {
+            List<ClientVisitItemProjection> items = itemsByVisit.getOrDefault(page.getVisitKey(), List.of());
+            visits.add(new ClientVisitResponse(page.getVisitKey(), utc(page.getStartsAt()),
+                    items.isEmpty() ? null : items.get(0).getSalonId(),
+                    items.stream().map(ProviderClientService::toItem).toList()));
+        }
+        return new PageImpl<>(visits, pageable, total);
+    }
+
+    private ClientCardRowProjection loadCard(ClientScope scope, ClientRef ref, OffsetDateTime now) {
+        return switch (ref) {
+            case Registered(UUID userId) -> switch (scope) {
+                case SalonScope(UUID salonId, UUID masterId) when masterId == null ->
+                        repository.cardUserBySalon(salonId, userId, now);
+                case SalonScope(UUID salonId, UUID masterId) ->
+                        repository.cardUserBySalonAndMaster(salonId, masterId, userId, now);
+                case MasterScope(UUID masterId, UUID ignoredSalonId) ->
+                        repository.cardUserByMaster(masterId, userId, now);
+            };
+            case GuestAnchor(UUID bookingId) -> switch (scope) {
+                case SalonScope(UUID salonId, UUID masterId) when masterId == null ->
+                        repository.cardGuestBySalon(salonId, bookingId, now);
+                case SalonScope(UUID salonId, UUID masterId) ->
+                        repository.cardGuestBySalonAndMaster(salonId, masterId, bookingId, now);
+                case MasterScope(UUID masterId, UUID ignoredSalonId) ->
+                        repository.cardGuestByMaster(masterId, bookingId, now);
+            };
+        };
+    }
+
+    private List<ClientVisitPageRowProjection> loadVisitPage(ClientScope scope, ClientRef ref, int limit,
+                                                             long offset) {
+        return switch (ref) {
+            case Registered(UUID userId) -> switch (scope) {
+                case SalonScope(UUID salonId, UUID masterId) when masterId == null ->
+                        repository.visitsUserBySalon(salonId, userId, limit, offset);
+                case SalonScope(UUID salonId, UUID masterId) ->
+                        repository.visitsUserBySalonAndMaster(salonId, masterId, userId, limit, offset);
+                case MasterScope(UUID masterId, UUID ignoredSalonId) ->
+                        repository.visitsUserByMaster(masterId, userId, limit, offset);
+            };
+            case GuestAnchor(UUID bookingId) -> switch (scope) {
+                case SalonScope(UUID salonId, UUID masterId) when masterId == null ->
+                        repository.visitsGuestBySalon(salonId, bookingId, limit, offset);
+                case SalonScope(UUID salonId, UUID masterId) ->
+                        repository.visitsGuestBySalonAndMaster(salonId, masterId, bookingId, limit, offset);
+                case MasterScope(UUID masterId, UUID ignoredSalonId) ->
+                        repository.visitsGuestByMaster(masterId, bookingId, limit, offset);
+            };
+        };
+    }
+
+    private List<ClientVisitItemProjection> loadVisitItems(ClientScope scope, List<UUID> keys) {
+        return switch (scope) {
+            case SalonScope(UUID salonId, UUID masterId) when masterId == null ->
+                    repository.visitItemsBySalon(salonId, keys);
+            case SalonScope(UUID salonId, UUID masterId) ->
+                    repository.visitItemsBySalonAndMaster(salonId, masterId, keys);
+            case MasterScope(UUID masterId, UUID ignoredSalonId) -> repository.visitItemsByMaster(masterId, keys);
+        };
+    }
+
+    private static ClientVisitResponse.Item toItem(ClientVisitItemProjection p) {
+        return new ClientVisitResponse.Item(p.getBookingId(), p.getServiceName(), BookingStatus.valueOf(p.getStatus()),
+                utc(p.getStartsAt()), p.getMasterId(), joinName(p.getMasterFirstName(), p.getMasterLastName()),
+                p.getPriceAtBooking(), p.getPriceMaxAtBooking());
+    }
+
+    private static int toInt(@Nullable Long value) {
+        return value == null ? 0 : Math.toIntExact(value);
+    }
+
+    /** One identical 404 for every "no such client in your scope" cause (D6); the message is never echoed. */
+    private static NotFoundException clientNotFound() {
+        return new NotFoundException("CLIENT_NOT_FOUND");
     }
 
     /**

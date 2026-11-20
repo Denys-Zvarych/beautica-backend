@@ -1,0 +1,140 @@
+package com.beautica.client.provider.repository;
+
+import static com.beautica.client.provider.repository.ClientListSql.MASTER_WHERE;
+import static com.beautica.client.provider.repository.ClientListSql.SALON_MASTER_WHERE;
+import static com.beautica.client.provider.repository.ClientListSql.SALON_WHERE;
+
+/**
+ * B508 — the native statements behind the provider client card and visit history (CLI-42..45). The scope variants
+ * reuse B507's {@link ClientListSql} WHERE blocks verbatim (no nullable-UUID OR bind); the identity variants are:
+ * <ul>
+ *   <li><b>user</b>: {@code client_id = :userId};</li>
+ *   <li><b>guest</b>: the anchor booking ({@code :bookingId}) must itself be in scope, {@code client_id IS NULL},
+ *       carry a phone and not be anonymised (GST-51) — its {@code guest_phone} (read once by the {@code anchor} CTE,
+ *       served by {@code idx_bookings_guest_phone_starts_at}, V259) then selects "all scope bookings with that phone
+ *       and {@code client_id IS NULL}". An invalid anchor yields an empty {@code scoped} set, which the service turns
+ *       into the one uniform 404.</li>
+ * </ul>
+ * A visit is {@code COALESCE(appointment_id, id)} over the rows in scope (a SALON_MASTER's scope holds only their own
+ * rows of a multi-master visit). {@code :now} is the injected Clock's instant. Three counts only (D3).
+ */
+final class ClientCardSql {
+
+    private ClientCardSql() {
+    }
+
+    private static final String SCOPED_COLS = """
+            SELECT b.id, COALESCE(b.appointment_id, b.id) AS visit_key, b.status, b.starts_at,
+                   b.guest_name, b.guest_surname
+              FROM bookings b
+            """;
+
+    // ── identity: registered user ──
+    private static final String USER_OPEN = "WITH scoped AS (" + SCOPED_COLS;
+    private static final String USER_CLOSE = "   AND b.client_id = :userId)\n";
+
+    // ── identity: guest by anchor booking ──
+    private static final String GUEST_OPEN_ANCHOR = "WITH anchor AS (SELECT b.guest_phone FROM bookings b\n";
+    private static final String GUEST_CLOSE_ANCHOR = """
+               AND b.id = :bookingId AND b.client_id IS NULL AND b.guest_phone IS NOT NULL
+               AND b.guest_pii_anonymised_at IS NULL),
+            scoped AS (""" + SCOPED_COLS;
+    private static final String GUEST_CLOSE = """
+               AND b.client_id IS NULL AND b.guest_phone = (SELECT guest_phone FROM anchor)
+               AND b.guest_pii_anonymised_at IS NULL)
+            """;
+
+    // ── card ──
+    private static final String CARD_AGG = """
+            SELECT COUNT(DISTINCT visit_key) AS totalVisits,
+                   COUNT(DISTINCT visit_key) FILTER (WHERE status = 'COMPLETED') AS completedVisits,
+                   COUNT(DISTINCT visit_key) FILTER (WHERE status = 'CONFIRMED' AND starts_at > :now) AS upcomingVisits,
+                   MIN(starts_at) AS firstVisitAt,
+                   MAX(starts_at) FILTER (WHERE starts_at <= :now AND status IN ('COMPLETED','CONFIRMED')) AS lastVisitAt,
+                   MIN(starts_at) FILTER (WHERE starts_at >  :now AND status = 'CONFIRMED') AS nextVisitAt,
+                   (ARRAY_AGG(id ORDER BY starts_at DESC, id DESC))[1] AS anchorBookingId,
+                   (ARRAY_AGG(guest_name ORDER BY starts_at DESC) FILTER (WHERE guest_name IS NOT NULL))[1] AS guestName,
+                   (ARRAY_AGG(guest_surname ORDER BY starts_at DESC)
+                        FILTER (WHERE guest_surname IS NOT NULL))[1] AS guestSurname
+              FROM scoped
+            """;
+
+    private static final String CARD_GUEST_SELECT = "SELECT a.*, (SELECT guest_phone FROM anchor) AS guestPhone, "
+            + """
+            CAST(NULL AS text) AS firstName, CAST(NULL AS text) AS lastName, CAST(NULL AS text) AS avatarUrl,
+                   CAST(NULL AS numeric) AS avgRating, CAST(NULL AS integer) AS reviewCount
+              FROM (""" + CARD_AGG + ") a\n";
+
+    private static final String CARD_USER_SELECT_COLS = "SELECT a.*, CAST(NULL AS text) AS guestPhone, "
+            + """
+            u.first_name AS firstName, u.last_name AS lastName, u.avatar_url AS avatarUrl,
+                   u.avg_rating AS avgRating, u.review_count AS reviewCount
+              FROM (""" + CARD_AGG + """
+            ) a
+              LEFT JOIN users u ON u.id = :userId
+            """;
+
+    static final String CARD_USER_SALON = USER_OPEN + SALON_WHERE + USER_CLOSE + CARD_USER_SELECT_COLS;
+    static final String CARD_USER_SALON_MASTER = USER_OPEN + SALON_MASTER_WHERE + USER_CLOSE + CARD_USER_SELECT_COLS;
+    static final String CARD_USER_MASTER = USER_OPEN + MASTER_WHERE + USER_CLOSE + CARD_USER_SELECT_COLS;
+
+    static final String CARD_GUEST_SALON =
+            GUEST_OPEN_ANCHOR + SALON_WHERE + GUEST_CLOSE_ANCHOR + SALON_WHERE + GUEST_CLOSE + CARD_GUEST_SELECT;
+    static final String CARD_GUEST_SALON_MASTER = GUEST_OPEN_ANCHOR + SALON_MASTER_WHERE + GUEST_CLOSE_ANCHOR
+            + SALON_MASTER_WHERE + GUEST_CLOSE + CARD_GUEST_SELECT;
+    static final String CARD_GUEST_MASTER =
+            GUEST_OPEN_ANCHOR + MASTER_WHERE + GUEST_CLOSE_ANCHOR + MASTER_WHERE + GUEST_CLOSE + CARD_GUEST_SELECT;
+
+    // ── visits page: one row per page entry; an empty page still returns ONE row (visitKey null) carrying the total.
+    //    `grouped` is MATERIALIZED (computed exactly once) and carries COUNT(*) OVER () on every row, so the total
+    //    rides on the page rows with no second aggregate pass. A page past the end has no row to carry it: only then
+    //    does COALESCE reach the lazily-run InitPlan COUNT(*) over the already-materialised `grouped`. ──
+    private static final String VISITS_PAGE_SELECT = """
+            , grouped AS MATERIALIZED (SELECT visit_key, MIN(starts_at) AS starts_at, COUNT(*) OVER () AS total
+                                         FROM scoped GROUP BY visit_key)
+            SELECT COALESCE(p.total, (SELECT COUNT(*) FROM grouped)) AS total, p.visit_key AS visitKey,
+                   p.starts_at AS startsAt
+              FROM (SELECT 1) one
+              LEFT JOIN (SELECT visit_key, starts_at, total FROM grouped
+                          ORDER BY starts_at DESC, visit_key DESC LIMIT :limit OFFSET :offset) p ON TRUE
+             ORDER BY p.starts_at DESC, p.visit_key DESC
+            """;
+
+    static final String VISITS_USER_SALON = USER_OPEN + SALON_WHERE + USER_CLOSE + VISITS_PAGE_SELECT;
+    static final String VISITS_USER_SALON_MASTER = USER_OPEN + SALON_MASTER_WHERE + USER_CLOSE + VISITS_PAGE_SELECT;
+    static final String VISITS_USER_MASTER = USER_OPEN + MASTER_WHERE + USER_CLOSE + VISITS_PAGE_SELECT;
+
+    static final String VISITS_GUEST_SALON =
+            GUEST_OPEN_ANCHOR + SALON_WHERE + GUEST_CLOSE_ANCHOR + SALON_WHERE + GUEST_CLOSE + VISITS_PAGE_SELECT;
+    static final String VISITS_GUEST_SALON_MASTER = GUEST_OPEN_ANCHOR + SALON_MASTER_WHERE + GUEST_CLOSE_ANCHOR
+            + SALON_MASTER_WHERE + GUEST_CLOSE + VISITS_PAGE_SELECT;
+    static final String VISITS_GUEST_MASTER =
+            GUEST_OPEN_ANCHOR + MASTER_WHERE + GUEST_CLOSE_ANCHOR + MASTER_WHERE + GUEST_CLOSE + VISITS_PAGE_SELECT;
+
+    // ── visit items: the page's visit keys, in scope only. appointment_id / id are separate index paths (an OR of two
+    //    indexable predicates, not COALESCE(...) IN, which would scan the whole scope). ──
+    private static final String ITEMS_SELECT = """
+            SELECT COALESCE(b.appointment_id, b.id) AS visitKey, b.id AS bookingId, sd.name AS serviceName,
+                   b.status AS status, b.starts_at AS startsAt, b.salon_id AS salonId, b.master_id AS masterId,
+                   COALESCE(mu.first_name, m.detached_first_name) AS masterFirstName,
+                   COALESCE(mu.last_name, m.detached_last_name) AS masterLastName,
+                   b.price_at_booking AS priceAtBooking, b.price_max_at_booking AS priceMaxAtBooking
+              FROM bookings b
+              JOIN master_services ms ON ms.id = b.master_service_id
+              JOIN service_definitions sd ON sd.id = ms.service_def_id
+              JOIN masters m ON m.id = b.master_id
+              LEFT JOIN users mu ON mu.id = m.user_id
+            """;
+    // The anonymised guard mirrors GUEST_CLOSE: a row anonymised after the page was keyed (GST-51) can share a visit
+    // (appointment_id) with an in-scope row and must not surface its placeholder identity in the items. The identity
+    // (client_id / phone) is deliberately not re-bound here: the keys already come from the identity-resolved page.
+    private static final String ITEMS_KEYS = """
+               AND b.guest_pii_anonymised_at IS NULL
+               AND (b.appointment_id IN (:visitKeys) OR b.id IN (:visitKeys))
+             ORDER BY b.starts_at, b.id
+            """;
+
+    static final String ITEMS_SALON = ITEMS_SELECT + SALON_WHERE + ITEMS_KEYS;
+    static final String ITEMS_SALON_MASTER = ITEMS_SELECT + SALON_MASTER_WHERE + ITEMS_KEYS;
+    static final String ITEMS_MASTER = ITEMS_SELECT + MASTER_WHERE + ITEMS_KEYS;
+}
