@@ -63,6 +63,26 @@ public interface ClientBlockRepository extends JpaRepository<ClientBlock, UUID> 
             Limit limit);
 
     /**
+     * B507 — batch probe for the provider client list: ONE statement for every CLIENT row among {@code userIds} and
+     * every GUEST row among {@code phoneHashes} in this scope (exactly one of {@code masterId} / {@code salonId} is
+     * non-null; the null one never matches). The two keys stay per-type (never OR'd across types): a CLIENT row is
+     * matched by user id only, a GUEST row (blocked_user_id IS NULL) by hash only. Callers never pass both lists
+     * empty; the page is bounded (&lt;= 50 ids and hashes).
+     */
+    @Query("""
+            SELECT new com.beautica.moderation.repository.ClientBlockKeyRow(cb.blockedUserId, cb.phoneHash)
+              FROM ClientBlock cb
+             WHERE (cb.blockerMasterId = :masterId OR cb.blockerSalonId = :salonId)
+               AND (cb.blockedUserId IN :userIds
+                    OR (cb.blockedUserId IS NULL AND cb.phoneHash IN :phoneHashes))
+            """)
+    List<ClientBlockKeyRow> findBlockedAmong(
+            @Param("masterId") UUID masterId,
+            @Param("salonId") UUID salonId,
+            @Param("userIds") Collection<UUID> userIds,
+            @Param("phoneHashes") Collection<byte[]> phoneHashes);
+
+    /**
      * Race-safe insert: a concurrent twin colliding on any V210 partial unique index inserts nothing (0) and the
      * caller re-reads the winner. HQL insert so nullable parameters are typed from the entity attributes.
      */

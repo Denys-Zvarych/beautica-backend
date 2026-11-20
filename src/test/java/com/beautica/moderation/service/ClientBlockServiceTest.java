@@ -17,6 +17,7 @@ import com.beautica.master.repository.MasterRepository;
 import com.beautica.moderation.dto.BlockKind;
 import com.beautica.moderation.dto.BlockResponse;
 import com.beautica.moderation.dto.ClientBlockState;
+import com.beautica.moderation.repository.ClientBlockKeyRow;
 import com.beautica.moderation.repository.ClientBlockListRow;
 import com.beautica.moderation.repository.ClientBlockRepository;
 import com.beautica.salon.entity.Salon;
@@ -490,6 +491,67 @@ class ClientBlockServiceTest {
     void should_returnFalse_when_noGuestRowForPhone() {
         assertThat(service.isGuestPhoneBlocked(BlockScope.master(masterId), phoneHasher.hash("+380501234567")))
                 .isFalse();
+    }
+
+    // ── B507: batch probe ─────────────────────────────────────────────────────
+
+    @Test
+    void should_makeNoQuery_when_blockedAmongGetsEmptyInputs() {
+        ClientBlockService.BlockedAmong result =
+                service.blockedAmong(BlockScope.salon(salonId), List.of(), List.of());
+
+        assertThat(result.userIds()).isEmpty();
+        assertThat(result.phones()).isEmpty();
+        verifyNoInteractions(clientBlockRepository);
+    }
+
+    @Test
+    void should_returnBlockedAccountsAndPhones_when_blockedAmongMixedInputs() {
+        UUID blockedUser = UUID.randomUUID();
+        UUID freeUser = UUID.randomUUID();
+        PhoneHasher.HashedPhone blockedPhone = phoneHasher.hash("+380501234567");
+        PhoneHasher.HashedPhone freePhone = phoneHasher.hash("+380671112233");
+        when(clientBlockRepository.findBlockedAmong(any(), any(), any(), any())).thenReturn(List.of(
+                new ClientBlockKeyRow(blockedUser, null),
+                new ClientBlockKeyRow(null, blockedPhone.hash())));
+
+        ClientBlockService.BlockedAmong result = service.blockedAmong(
+                BlockScope.salon(salonId), List.of(blockedUser, freeUser), List.of(blockedPhone, freePhone));
+
+        assertThat(result.isUserBlocked(blockedUser)).isTrue();
+        assertThat(result.isUserBlocked(freeUser)).isFalse();
+        assertThat(result.isPhoneBlocked(blockedPhone)).isTrue();
+        assertThat(result.isPhoneBlocked(freePhone)).isFalse();
+        verify(clientBlockRepository, org.mockito.Mockito.times(1))
+                .findBlockedAmong(any(), any(), any(), any());
+    }
+
+    @Test
+    void should_notCrossMatchTypes_when_blockedAmongRowsOfTheOtherType() {
+        UUID user = UUID.randomUUID();
+        PhoneHasher.HashedPhone phone = phoneHasher.hash("+380501234567");
+        // a GUEST row for a hash we did not ask for, and a CLIENT row for a user we did not ask for
+        when(clientBlockRepository.findBlockedAmong(any(), any(), any(), any())).thenReturn(List.of(
+                new ClientBlockKeyRow(null, phoneHasher.hash("+380990000000").hash()),
+                new ClientBlockKeyRow(UUID.randomUUID(), null)));
+
+        ClientBlockService.BlockedAmong result =
+                service.blockedAmong(BlockScope.master(masterId), List.of(user), List.of(phone));
+
+        assertThat(result.isUserBlocked(user)).isFalse();
+        assertThat(result.isPhoneBlocked(phone)).isFalse();
+    }
+
+    @Test
+    void should_passTheScopeThrough_when_blockedAmongInSalonOrMasterScope() {
+        UUID user = UUID.randomUUID();
+        when(clientBlockRepository.findBlockedAmong(any(), any(), any(), any())).thenReturn(List.of());
+
+        service.blockedAmong(BlockScope.salon(salonId), List.of(user), List.of());
+        service.blockedAmong(BlockScope.master(masterId), List.of(user), List.of());
+
+        verify(clientBlockRepository).findBlockedAmong(isNull(), eq(salonId), eq(List.of(user)), eq(List.of()));
+        verify(clientBlockRepository).findBlockedAmong(eq(masterId), isNull(), eq(List.of(user)), eq(List.of()));
     }
 
     // ── phase-398 D7: guest PII erase ────────────────────────────────────────

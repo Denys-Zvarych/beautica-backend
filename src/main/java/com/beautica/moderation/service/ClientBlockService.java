@@ -15,6 +15,7 @@ import com.beautica.config.RateLimitConfig;
 import com.beautica.moderation.dto.BlockDisplayNames;
 import com.beautica.moderation.dto.BlockResponse;
 import com.beautica.moderation.dto.ClientBlockState;
+import com.beautica.moderation.repository.ClientBlockKeyRow;
 import com.beautica.moderation.repository.ClientBlockListRow;
 import com.beautica.moderation.repository.ClientBlockRepository;
 import com.beautica.moderation.service.ClientBlockScopeResolver.ActorScopes;
@@ -32,9 +33,13 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Clock;
 import java.time.temporal.ChronoUnit;
+import java.util.Collection;
+import java.util.HashSet;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 
 /**
@@ -234,6 +239,58 @@ public class ClientBlockService {
     @Transactional(readOnly = true)
     public boolean isGuestPhoneBlocked(BlockScope scope, HashedPhone phone) {
         return clientBlockRepository.findIdByGuestPhone(scope.masterId(), scope.salonId(), phone.hash()).isPresent();
+    }
+
+    /** B507 — the subset of a batch that is blocked: account ids, and the guest phones (as the caller passed them). */
+    public record BlockedAmong(Set<UUID> userIds, Set<HashedPhone> phones) {
+
+        static final BlockedAmong NONE = new BlockedAmong(Set.of(), Set.of());
+
+        public BlockedAmong {
+            userIds = Set.copyOf(userIds);
+            phones = Set.copyOf(phones);
+        }
+
+        public boolean isUserBlocked(UUID userId) {
+            return userIds.contains(userId);
+        }
+
+        public boolean isPhoneBlocked(HashedPhone phone) {
+            return phones.contains(phone);
+        }
+    }
+
+    /**
+     * B507 (provider client list) — which of these accounts / guest phones are blocked in this scope, in ONE
+     * {@code client_blocks} statement whatever the batch size (empty inputs: none). Per-type identity as everywhere
+     * else: accounts match CLIENT rows by id, phones match GUEST rows by hash, never across. The single-lookup probes
+     * above are unchanged.
+     */
+    @Transactional(readOnly = true)
+    public BlockedAmong blockedAmong(BlockScope scope, Collection<UUID> userIds, Collection<HashedPhone> phones) {
+        if (userIds.isEmpty() && phones.isEmpty()) {
+            return BlockedAmong.NONE;
+        }
+        List<byte[]> hashes = phones.stream().map(HashedPhone::hash).toList();
+        List<ClientBlockKeyRow> rows = clientBlockRepository.findBlockedAmong(
+                scope.masterId(), scope.salonId(), userIds, hashes);
+        Set<UUID> blockedUsers = new HashSet<>();
+        Set<String> blockedHashes = new HashSet<>();
+        HexFormat hex = HexFormat.of();
+        for (ClientBlockKeyRow row : rows) {
+            if (row.blockedUserId() != null) {
+                blockedUsers.add(row.blockedUserId());
+            } else if (row.phoneHash() != null) {
+                blockedHashes.add(hex.formatHex(row.phoneHash()));
+            }
+        }
+        Set<HashedPhone> blockedPhones = new HashSet<>();
+        for (HashedPhone phone : phones) {
+            if (blockedHashes.contains(hex.formatHex(phone.hash()))) {
+                blockedPhones.add(phone);
+            }
+        }
+        return new BlockedAmong(blockedUsers, blockedPhones);
     }
 
     /**
