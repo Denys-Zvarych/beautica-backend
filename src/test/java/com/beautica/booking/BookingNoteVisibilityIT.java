@@ -315,12 +315,40 @@ class BookingNoteVisibilityIT extends AbstractIntegrationTest {
                 "SELECT column_name FROM information_schema.columns "
                         + "WHERE table_name = 'in_app_notification' "
                         + "AND data_type IN ('text', 'character varying') "
-                        + "AND column_name NOT IN ('type', 'dedup_key', 'moderated_target_type')",
+                        + "AND column_name NOT IN ('type', 'dedup_key', 'moderated_target_type', "
+                        + "'masked_contact')",
                 String.class);
         assertThat(textColumns)
-                .as("every column besides the closed-enum type/dedup_key/moderated_target_type is a UUID "
-                        + "or timestamp")
+                .as("every column besides the closed-enum type/dedup_key/moderated_target_type and the "
+                        + "CHECK-guarded masked_contact is a UUID or timestamp")
                 .isEmpty();
+
+        // masked_contact (V249/V250, B516 AUTH-D19) is exempt above ONLY because it can never carry a
+        // booking note: it is written solely by the security-notice path
+        // (InAppNotificationService.notifySecurityNotice -> insertSecurityNotice*), from a ContactMask-ed
+        // phone/email, and a validated CHECK pins it to NULL on every non-SECURITY_* row (all booking rows
+        // included) and to a masked value ('***') on SECURITY_* rows. Prove that CHECK here so the
+        // exemption can never widen into a note-bearing column.
+        var maskedContactChecks = jdbcTemplate.queryForList(
+                "SELECT pg_get_constraintdef(c.oid) FROM pg_constraint c "
+                        + "JOIN pg_class t ON t.oid = c.conrelid "
+                        + "WHERE t.relname = 'in_app_notification' AND c.contype = 'c' AND c.convalidated "
+                        + "AND c.conname = 'in_app_notification_masked_contact_chk'",
+                String.class);
+        assertThat(maskedContactChecks)
+                .as("masked_contact is guarded by exactly one validated CHECK")
+                .hasSize(1);
+        String maskedCheckDef = maskedContactChecks.get(0);
+        assertThat(maskedCheckDef)
+                .as("the CHECK allows masked_contact only on the two SECURITY_* types, and only masked")
+                .contains("masked_contact IS NULL")
+                .contains("'SECURITY_PHONE_CHANGED'")
+                .contains("'SECURITY_EMAIL_CHANGED'")
+                .contains("'***'");
+        assertThat(maskedCheckDef.split("'", -1).length / 2)
+                .as("CHECK names exactly the 2 SECURITY_* types + the '***' mask marker — no booking type "
+                        + "can ever carry masked_contact")
+                .isEqualTo(3);
 
         // moderated_target_type (V219) is exempt above ONLY because a validated CHECK pins it to the
         // ReportTargetType literals — prove that here so the exemption can never admit free text.

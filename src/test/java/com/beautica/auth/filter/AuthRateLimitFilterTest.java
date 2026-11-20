@@ -1,5 +1,7 @@
 package com.beautica.auth.filter;
 
+import com.beautica.config.BookingInfoWorkerProperties;
+import com.beautica.config.ClientIpProperties;
 import com.github.benmanes.caffeine.cache.LoadingCache;
 import io.github.bucket4j.Bucket;
 import io.github.bucket4j.ConsumptionProbe;
@@ -102,6 +104,25 @@ class AuthRateLimitFilterTest {
                 realBuckets(open), realBuckets(open), realBuckets(open), realBuckets(open),
                 realBuckets(open), realBuckets(open), realBuckets(open), realBuckets(open),
                 realBuckets(open), realBuckets(open), realBuckets(open), realBuckets(open), realBuckets(open));
+    }
+
+    /**
+     * Real filter built through the Spring constructor (so the forwarded-header trust flag is explicit) with real
+     * login and otp-send buckets of the given capacities; every other bucket is permissive.
+     */
+    private static AuthRateLimitFilter realFilter(long loginCapacity, long otpSendCapacity,
+                                                  boolean trustForwardedHeaders) {
+        long open = 1_000_000;
+        return new AuthRateLimitFilter(
+                realBuckets(open), realBuckets(loginCapacity), realBuckets(open), realBuckets(open),
+                realBuckets(open), realBuckets(open), realBuckets(open), realBuckets(open),
+                realBuckets(open), realBuckets(open), realBuckets(open), realBuckets(open),
+                realBuckets(open), realBuckets(open), realBuckets(open), realBuckets(otpSendCapacity),
+                realBuckets(open), realBuckets(open), realBuckets(open), realBuckets(open),
+                realBuckets(open), realBuckets(open), realBuckets(open), realBuckets(open), realBuckets(open),
+                realBuckets(open), realBuckets(open), realBuckets(open), realBuckets(open),
+                new BookingInfoWorkerProperties(),
+                new ClientIpResolver(new ClientIpProperties(trustForwardedHeaders)));
     }
 
     private MockHttpServletRequest postRequest(String uri) {
@@ -942,14 +963,16 @@ class AuthRateLimitFilterTest {
         }
 
         @Test
-        @DisplayName("uses XFF value when rightmost XFF entry is exactly 45 characters (boundary: accepted, not replaced by REMOTE_ADDR)")
+        @DisplayName("uses XFF value when rightmost XFF entry is a valid 45-character IP literal (boundary: accepted, not replaced by REMOTE_ADDR)")
         void should_useXffValue_when_xffEntryIsExactly45Chars() throws Exception {
-            // 45 chars is the guard boundary: ip.length() > 45 triggers fallback, so exactly-45
-            // must be accepted as the bucket key and NOT replaced by REMOTE_ADDR.
-            String exactly45Chars = "a".repeat(45);
+            // 45 chars is the guard boundary: length > 45 triggers fallback, so a valid exactly-45 literal
+            // must be accepted and NOT replaced by REMOTE_ADDR. The key is its canonical form.
+            String exactly45Chars = "2001:0db8:0000:0000:0000:0000:192.168.100.228";
+            // AUTH-D27 (e): the login bucket keys an IPv6 client on its /64 — the canonical address's prefix.
+            String canonical = "2001:db8:0:0:0:0:0:0/64";
             log.debug("Arrange: XFF rightmost entry is exactly {} chars — must be used as bucket key, not REMOTE_ADDR",
                     exactly45Chars.length());
-            when(loginBuckets.get(exactly45Chars)).thenReturn(bucket);
+            when(loginBuckets.get(canonical)).thenReturn(bucket);
             when(bucket.tryConsumeAndReturnRemaining(1)).thenReturn(ALLOW);
 
             var request = postRequest("/api/v1/auth/login");
@@ -967,7 +990,7 @@ class AuthRateLimitFilterTest {
                     .as("filter chain must be forwarded — 45-char XFF entry is within the accepted length")
                     .isNotNull();
             // Bucket must be keyed on the XFF value, NOT on REMOTE_ADDR (10.0.0.1)
-            verify(loginBuckets).get(exactly45Chars);
+            verify(loginBuckets).get(canonical);
             verify(loginBuckets, never()).get(REMOTE_ADDR);
         }
 
@@ -1065,10 +1088,10 @@ class AuthRateLimitFilterTest {
         @Test
         @DisplayName("Rate limit is applied to rightmost XFF IP — client-supplied leftmost entry cannot spoof a different bucket")
         void should_rateLimit_when_attackerSpoofsFakeLeftmostXffEntry() throws Exception {
-            // An attacker sends X-Forwarded-For: fake-ip-{i}, real-client-ip.
-            // The rightmost entry (real-client-ip) is the Railway-appended real IP and is
+            // An attacker sends X-Forwarded-For: fake-ip-{i}, 203.0.113.50.
+            // The rightmost entry (203.0.113.50) is the Railway-appended real IP and is
             // always the bucket key — cycling the leftmost spoofed entry has no effect.
-            String realClientIp = "real-client-ip";
+            String realClientIp = "203.0.113.50";
             log.debug("Arrange: bucket keyed on rightmost (real) XFF entry {}", realClientIp);
             when(loginBuckets.get(realClientIp)).thenReturn(bucket);
             when(bucket.tryConsumeAndReturnRemaining(1))
@@ -2121,6 +2144,123 @@ class AuthRateLimitFilterTest {
         }
     }
 
+    // app.rate-limit.trust-forwarded-headers — false (local) keys on the socket address only.
+    @Nested
+    @DisplayName("app.rate-limit.trust-forwarded-headers")
+    class ForwardedHeaderTrust {
+
+        private static final int LOGIN_CAPACITY = 3;
+
+        /** LOGIN_CAPACITY + 1 logins from one socket, each with a fresh rightmost X-Forwarded-For entry. */
+        private MockHttpServletResponse lastOfRotatingLogins(AuthRateLimitFilter subject) throws Exception {
+            MockHttpServletResponse response = null;
+            for (int i = 1; i <= LOGIN_CAPACITY + 1; i++) {
+                var request = postRequest("/api/v1/auth/login");
+                request.addHeader("X-Forwarded-For", "198.51.100." + i + ", 203.0.113." + i);
+                response = new MockHttpServletResponse();
+                subject.doFilterInternal(request, response, new MockFilterChain());
+            }
+            return response;
+        }
+
+        @Test
+        @DisplayName("false: rotating X-Forwarded-For still hits 429 — the socket address is the key")
+        void should_return429_when_headersRotateAndForwardedHeadersNotTrusted() throws Exception {
+            AuthRateLimitFilter untrusting = realFilter(LOGIN_CAPACITY, 1_000_000, false);
+
+            MockHttpServletResponse last = lastOfRotatingLogins(untrusting);
+
+            assertThat(last.getStatus())
+                    .as("4th login from one socket must be 429 whatever the forwarded headers say")
+                    .isEqualTo(429);
+        }
+
+        @Test
+        @DisplayName("true: rotating forwarded headers are distinct clients (current prod behaviour)")
+        void should_passEveryRequest_when_headersRotateAndForwardedHeadersTrusted() throws Exception {
+            AuthRateLimitFilter trusting = realFilter(LOGIN_CAPACITY, 1_000_000, true);
+
+            MockHttpServletResponse last = lastOfRotatingLogins(trusting);
+
+            assertThat(last.getStatus())
+                    .as("each request resolves to its own rightmost X-Forwarded-For entry, so no bucket is exhausted")
+                    .isNotEqualTo(429);
+        }
+    }
+
+    // OTP send/verify are keyed per IPv6 /64 (perIpv6Prefix), like review-invite and Telegram-link.
+    @Nested
+    @DisplayName("OTP send/verify — IPv6 /64 keying")
+    class OtpIpv6PrefixKeying {
+
+        private static final String SAME_PREFIX_A = "2001:db8:1:2::a";
+        private static final String SAME_PREFIX_B = "2001:db8:1:2:ffff:ffff:ffff:fffe";
+
+        private MockHttpServletResponse sendFrom(AuthRateLimitFilter subject, String path, String remoteAddr)
+                throws Exception {
+            var request = new MockHttpServletRequest("POST", path);
+            request.setRemoteAddr(remoteAddr);
+            var response = new MockHttpServletResponse();
+            subject.doFilterInternal(request, response, new MockFilterChain());
+            return response;
+        }
+
+        @Test
+        @DisplayName("two addresses in one IPv6 /64 share the otp-send bucket — the 4th send is 429")
+        void should_return429OnFourthSend_when_addressesShareIpv6Prefix() throws Exception {
+            AuthRateLimitFilter subject = realFilter(1_000_000, 3, true);
+
+            sendFrom(subject, "/api/v1/book/otp/send", SAME_PREFIX_A);
+            sendFrom(subject, "/api/v1/book/otp/send", SAME_PREFIX_B);
+            MockHttpServletResponse third = sendFrom(subject, "/api/v1/auth/register/phone/otp/send", SAME_PREFIX_A);
+            MockHttpServletResponse fourth = sendFrom(subject, "/api/v1/book/otp/send", SAME_PREFIX_B);
+
+            assertThat(third.getStatus()).as("3rd send within the 3/15min cap").isNotEqualTo(429);
+            assertThat(fourth.getStatus()).as("4th send from the same /64 must be throttled").isEqualTo(429);
+        }
+
+        @Test
+        @DisplayName("a different IPv6 /64 keeps its own otp-send bucket")
+        void should_passSend_when_otherIpv6PrefixExhausted() throws Exception {
+            AuthRateLimitFilter subject = realFilter(1_000_000, 3, true);
+            for (int i = 0; i < 4; i++) {
+                sendFrom(subject, "/api/v1/book/otp/send", SAME_PREFIX_A);
+            }
+
+            MockHttpServletResponse other = sendFrom(subject, "/api/v1/book/otp/send", "2001:db8:1:3::a");
+
+            assertThat(other.getStatus()).isNotEqualTo(429);
+        }
+
+        @Test
+        @DisplayName("IPv4 otp-send keys stay per address")
+        void should_keepPerAddressBucket_when_ipv4() throws Exception {
+            AuthRateLimitFilter subject = realFilter(1_000_000, 3, true);
+            for (int i = 0; i < 4; i++) {
+                sendFrom(subject, "/api/v1/book/otp/send", "203.0.113.1");
+            }
+
+            MockHttpServletResponse neighbour = sendFrom(subject, "/api/v1/book/otp/send", "203.0.113.2");
+
+            assertThat(neighbour.getStatus()).isNotEqualTo(429);
+        }
+
+        @Test
+        @DisplayName("two addresses in one IPv6 /64 share the otp-verify bucket — the 11th verify is 429")
+        void should_return429OnEleventhVerify_when_addressesShareIpv6Prefix() throws Exception {
+            AuthRateLimitFilter subject = realFilter(1_000_000, 1_000_000, true);
+            for (int i = 0; i < 10; i++) {
+                MockHttpServletResponse allowed = sendFrom(subject, "/api/v1/book/otp/verify",
+                        i % 2 == 0 ? SAME_PREFIX_A : SAME_PREFIX_B);
+                assertThat(allowed.getStatus()).as("verify %d within the 10/15min cap", i + 1).isNotEqualTo(429);
+            }
+
+            MockHttpServletResponse eleventh = sendFrom(subject, "/api/v1/book/otp/verify", SAME_PREFIX_B);
+
+            assertThat(eleventh.getStatus()).isEqualTo(429);
+        }
+    }
+
     // Phase 13.2 — POST /api/v1/book/otp/send: per-IP SMS-bomb guard (3 / 15 min).
     // Window is 15 minutes → Retry-After 900. This is the IP-layer defence complementing
     // the per-phone rate limit inside PhoneOtpService.
@@ -2572,6 +2712,48 @@ class AuthRateLimitFilterTest {
 
             assertThat(limited).isEqualTo(429);
             assertThat(linkTokenStillOpen).isEqualTo(200);
+        }
+    }
+
+    // Phone-first hardening AUTH-D27 (e): the login bucket counts an IPv6 client per /64 (IPv4 per address).
+    @Nested
+    @DisplayName("login — IPv6 /64 keying")
+    class LoginIpv6PrefixKeying {
+
+        private MockHttpServletResponse loginFrom(AuthRateLimitFilter subject, String remoteAddr) throws Exception {
+            var request = new MockHttpServletRequest("POST", "/api/v1/auth/login");
+            request.setRemoteAddr(remoteAddr);
+            var response = new MockHttpServletResponse();
+            subject.doFilterInternal(request, response, new MockFilterChain());
+            return response;
+        }
+
+        @Test
+        @DisplayName("should_return429OnFourthLogin_when_addressesShareIpv6Slash64")
+        void should_return429OnFourthLogin_when_addressesShareIpv6Slash64() throws Exception {
+            AuthRateLimitFilter subject = realFilter(3, 1_000_000, false);
+
+            loginFrom(subject, "2001:db8:1:2::a");
+            loginFrom(subject, "2001:db8:1:2::b");
+            loginFrom(subject, "2001:db8:1:2::c");
+            MockHttpServletResponse fourth = loginFrom(subject, "2001:db8:1:2:ffff::d");
+
+            assertThat(fourth.getStatus()).isEqualTo(429);
+        }
+
+        @Test
+        @DisplayName("should_passLogin_when_otherSlash64OrOtherIpv4")
+        void should_passLogin_when_otherSlash64OrOtherIpv4() throws Exception {
+            AuthRateLimitFilter subject = realFilter(3, 1_000_000, false);
+            for (int i = 0; i < 3; i++) {
+                loginFrom(subject, "2001:db8:1:2::" + (i + 1));
+            }
+
+            MockHttpServletResponse otherPrefix = loginFrom(subject, "2001:db8:1:3::1");
+            MockHttpServletResponse ipv4 = loginFrom(subject, "203.0.113.9");
+
+            assertThat(otherPrefix.getStatus()).isNotEqualTo(429);
+            assertThat(ipv4.getStatus()).isNotEqualTo(429);
         }
     }
 }

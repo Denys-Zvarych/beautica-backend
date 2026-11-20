@@ -15,6 +15,10 @@ import com.beautica.notification.mail.MailTransportProperties;
 import com.beautica.notification.service.EmailNotificationService;
 import com.beautica.notification.service.NotificationOutboxDrainWorker;
 import com.beautica.notification.service.NotificationOutboxService;
+import com.beautica.notification.service.RequestDecisionEvent;
+import com.beautica.notification.service.RequestDecisionLoader;
+import com.beautica.notification.service.RequestDecisionTarget;
+import com.beautica.notification.service.RequestKind;
 import com.beautica.support.dto.SupportAttachment;
 import com.github.tomakehurst.wiremock.WireMockServer;
 import com.github.tomakehurst.wiremock.stubbing.ServeEvent;
@@ -52,6 +56,8 @@ import static com.github.tomakehurst.wiremock.client.WireMock.postRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.urlEqualTo;
 import static com.github.tomakehurst.wiremock.core.WireMockConfiguration.options;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
@@ -61,7 +67,7 @@ import static org.mockito.Mockito.when;
  * Phase 374 — the outbox over the Brevo HTTPS API transport, end to end on real Postgres: the context runs with
  * {@code app.mail.transport=brevo-api}, so the ONLY {@link JavaMailSender} is {@link BrevoApiMailSender}, pointed at
  * WireMock. Real outbox, real drain worker, real Thymeleaf; the base class's {@code @MockBean EmailNotificationService}
- * delegates {@code sendInviteEmail} to a real instance built on the context's sender and mail properties.
+ * delegates {@code sendRequestDecisionEmail} (B520: was the invite e-mail) to a real instance built on the context's sender and mail properties.
  */
 @ExtendWith(OutputCaptureExtension.class)
 @TestPropertySource(properties = {
@@ -111,9 +117,14 @@ class BrevoApiOutboxIT extends AbstractIntegrationTest {
         EmailNotificationService realEmail =
                 new EmailNotificationService(mailSender, templateEngine, "noreply@beautica.app", mailProperties);
         doAnswer(inv -> {
-            realEmail.sendInviteEmail(inv.getArgument(0), inv.getArgument(1), inv.getArgument(2));
+            realEmail.sendRequestDecisionEmail(inv.getArgument(0), inv.getArgument(1), inv.getArgument(2),
+                    inv.getArgument(3), inv.getArgument(4));
             return null;
-        }).when(emailNotificationService).sendInviteEmail(anyString(), anyString(), anyString());
+        }).when(emailNotificationService).sendRequestDecisionEmail(anyString(), any(), anyBoolean(), anyString(), any());
+        // B520: the invite is an SMS now — the requester's decision e-mail (REQUEST_DECIDED) is this test's e-mail row.
+        // The loader is mocked so no category-request fixture is needed: every row resolves to its seeded address.
+        recipients.clear();
+        when(requestDecisionLoader.load(any())).thenAnswer(inv -> snapshotFor(inv.getArgument(0)));
     }
 
     private static void stub(int status, String body) {
@@ -121,13 +132,36 @@ class BrevoApiOutboxIT extends AbstractIntegrationTest {
                 .withHeader("Content-Type", "application/json").withBody(body)));
     }
 
-    private UUID enqueueInvite(String email, int minutesAgo) {
+    private UUID enqueueEmail(String email, int minutesAgo) {
         UUID aggregateId = UUID.randomUUID();
-        new TransactionTemplate(txManager).executeWithoutResult(status -> outboxService.enqueueInvite(
-                aggregateId, email, "https://beautica.app/invite/accept?token=QA374", "QA Salon"));
+        recipients.put(aggregateId, email);
+        new TransactionTemplate(txManager).executeWithoutResult(status -> outboxService.enqueueRequestDecided(
+                RequestKind.CATEGORY_REQUEST, "1", true, aggregateId));
         jdbcTemplate.update("UPDATE notification_outbox SET created_at = now() - make_interval(mins => ?) "
                 + "WHERE aggregate_id = ?", minutesAgo, aggregateId);
         return aggregateId;
+    }
+
+    @org.springframework.boot.test.mock.mockito.MockBean
+    private RequestDecisionLoader requestDecisionLoader;
+
+    /** Recipient user id (= aggregate id) → address, per test. */
+    private final Map<UUID, String> recipients = new java.util.concurrent.ConcurrentHashMap<>();
+
+    private RequestDecisionLoader.Snapshot snapshotFor(java.util.Collection<RequestDecisionEvent> events) {
+        Map<UUID, com.beautica.user.User> users = new java.util.HashMap<>();
+        for (RequestDecisionEvent event : events) {
+            com.beautica.user.User user = mock(com.beautica.user.User.class);
+            when(user.getEmail()).thenReturn(recipients.get(event.recipientUserId()));
+            when(user.isActive()).thenReturn(true);
+            users.put(event.recipientUserId(), user);
+        }
+        RequestDecisionLoader.Snapshot snapshot = mock(RequestDecisionLoader.Snapshot.class);
+        when(snapshot.target(any())).thenAnswer(inv -> new RequestDecisionTarget("Манікюр", null,
+                ((RequestDecisionEvent) inv.getArgument(0)).recipientUserId()));
+        when(snapshot.recipient(any())).thenAnswer(inv ->
+                users.get(((RequestDecisionEvent) inv.getArgument(0)).recipientUserId()));
+        return snapshot;
     }
 
     private Map<String, Object> row(UUID aggregateId) {
@@ -149,7 +183,7 @@ class BrevoApiOutboxIT extends AbstractIntegrationTest {
     @DisplayName("201 — an invite row drains to SENT; the API got htmlContent with the hosted logo; no recipient in logs")
     void should_sendRowOverApi_when_brevoAccepts(CapturedOutput output) {
         stub(201, "{\"messageId\":\"<it@smtp-relay.mailin.fr>\"}");
-        UUID invite = enqueueInvite("invitee-zq374@beautica.test", 1);
+        UUID invite = enqueueEmail("invitee-zq374@beautica.test", 1);
 
         drainWorker.drain();
 
@@ -168,10 +202,10 @@ class BrevoApiOutboxIT extends AbstractIntegrationTest {
     @DisplayName("503 ×3 — the breaker trips once, the 4th (youngest) row stays PENDING with attempts unchanged")
     void should_tripBreaker_when_brevoReturns503() {
         stub(503, "{\"code\":\"x\",\"message\":\"down\"}");
-        UUID first = enqueueInvite("a-zq374@beautica.test", 40);
-        UUID second = enqueueInvite("b-zq374@beautica.test", 30);
-        UUID third = enqueueInvite("c-zq374@beautica.test", 20);
-        UUID youngest = enqueueInvite("d-zq374@beautica.test", 10);
+        UUID first = enqueueEmail("a-zq374@beautica.test", 40);
+        UUID second = enqueueEmail("b-zq374@beautica.test", 30);
+        UUID third = enqueueEmail("c-zq374@beautica.test", 20);
+        UUID youngest = enqueueEmail("d-zq374@beautica.test", 10);
         double tripsBefore = counter(BREAKER_METRIC);
 
         drainWorker.drain();
@@ -190,8 +224,8 @@ class BrevoApiOutboxIT extends AbstractIntegrationTest {
     @DisplayName("400 invalid_parameter — not counted by the breaker (all 4 rows attempted); DEAD after 3 attempts")
     void should_notTripBreakerAndDeadLetter_when_brevoReturns400InvalidParameter() {
         stub(400, "{\"code\":\"invalid_parameter\",\"message\":\"bad a-zq374@beautica.test\"}");
-        List<UUID> rows = List.of(enqueueInvite("a-zq374@beautica.test", 40), enqueueInvite("b-zq374@beautica.test", 30),
-                enqueueInvite("c-zq374@beautica.test", 20), enqueueInvite("d-zq374@beautica.test", 10));
+        List<UUID> rows = List.of(enqueueEmail("a-zq374@beautica.test", 40), enqueueEmail("b-zq374@beautica.test", 30),
+                enqueueEmail("c-zq374@beautica.test", 20), enqueueEmail("d-zq374@beautica.test", 10));
         double tripsBefore = counter(BREAKER_METRIC);
         double deadBefore = counter(DEAD_METRIC);
 
@@ -212,7 +246,7 @@ class BrevoApiOutboxIT extends AbstractIntegrationTest {
     @DisplayName("phase 441: Brevo 503 on an outbox row — exactly one ERROR (brevo-api, at the call); the drain worker re-maps at WARN")
     void should_logOneErrorOnly_when_outboxDrainHitsBrevo503() {
         stub(503, "{\"code\":\"x\",\"message\":\"down\"}");
-        UUID row = enqueueInvite("one-zq441@beautica.test", 5);
+        UUID row = enqueueEmail("one-zq441@beautica.test", 5);
         ch.qos.logback.classic.Logger root = (ch.qos.logback.classic.Logger)
                 org.slf4j.LoggerFactory.getLogger(org.slf4j.Logger.ROOT_LOGGER_NAME);
         var appender = new ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent>();
@@ -261,9 +295,9 @@ class BrevoApiOutboxIT extends AbstractIntegrationTest {
     @DisplayName("401 unauthorized ×3 — a revoked/IP-blocked key trips the breaker; rows stay PENDING, none DEAD (D5)")
     void should_tripBreakerWithoutDeadLetter_when_brevoRejectsTheKey() {
         stub(401, "{\"code\":\"unauthorized\",\"message\":\"Key not found\"}");
-        List<UUID> attempted = List.of(enqueueInvite("a-zq374@beautica.test", 40),
-                enqueueInvite("b-zq374@beautica.test", 30), enqueueInvite("c-zq374@beautica.test", 20));
-        UUID youngest = enqueueInvite("d-zq374@beautica.test", 10);
+        List<UUID> attempted = List.of(enqueueEmail("a-zq374@beautica.test", 40),
+                enqueueEmail("b-zq374@beautica.test", 30), enqueueEmail("c-zq374@beautica.test", 20));
+        UUID youngest = enqueueEmail("d-zq374@beautica.test", 10);
         double tripsBefore = counter(BREAKER_METRIC);
         double deadBefore = counter(DEAD_METRIC);
 

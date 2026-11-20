@@ -316,7 +316,9 @@ class InAppNotificationRepositoryIT extends AbstractDataJpaTest {
             "SERVICE_TYPE_SUGGESTION_APPROVED", "SERVICE_TYPE_SUGGESTION_REJECTED",
             // phase 415: moderation outcomes carry no booking — covered by their own shape/push tests
             "REPORT_CONTENT_REMOVED", "REPORT_NO_VIOLATION", "REPORT_REVIEWED", "CONTENT_REMOVED",
-            "REVIEW_ABOUT_YOU_REMOVED"})
+            "REVIEW_ABOUT_YOU_REMOVED",
+            // B516: security notices carry no booking — covered by V246InAppSecurityNoticeTypeMigrationTest
+            "SECURITY_PHONE_CHANGED", "SECURITY_EMAIL_CHANGED", "SECURITY_PASSWORD_RESET"})
     @DisplayName("in_app_notification_dedup_key_chk (V183) — every one of the 10 booking-keyed TYPE literals accepts "
             + "the common TYPE:uuid form, not just the 2-3 spot-checked above")
     void should_acceptTypeColonUuid_when_everyEnumType(InAppNotificationType type) {
@@ -670,7 +672,9 @@ class InAppNotificationRepositoryIT extends AbstractDataJpaTest {
     // ── shape CHECK (audit-fix cycle 1, finding 8) ─────────────────────────────
 
     @ParameterizedTest
-    @EnumSource(value = InAppNotificationType.class, names = "INVITE_ACCEPTED", mode = EnumSource.Mode.EXCLUDE)
+    @EnumSource(value = InAppNotificationType.class, names = {"INVITE_ACCEPTED",
+            // B516: security notices carry no booking by design (V246 shape) — see V246InAppSecurityNoticeTypeMigrationTest
+            "SECURITY_PHONE_CHANGED", "SECURITY_EMAIL_CHANGED", "SECURITY_PASSWORD_RESET"}, mode = EnumSource.Mode.EXCLUDE)
     @DisplayName("in_app_notification_shape_chk — every booking/review type requires booking_id or "
             + "appointment_id; a raw INSERT with neither set is rejected")
     void should_rejectWithNoBookingOrAppointment_when_rawInsert(InAppNotificationType type) {
@@ -686,7 +690,9 @@ class InAppNotificationRepositoryIT extends AbstractDataJpaTest {
             "CATEGORY_REQUEST_APPROVED", "CATEGORY_REQUEST_REJECTED", "SERVICE_TYPE_SUGGESTION_APPROVED", "SERVICE_TYPE_SUGGESTION_REJECTED",
             // phase 415: moderation outcomes carry no booking — covered by their own shape/push tests
             "REPORT_CONTENT_REMOVED", "REPORT_NO_VIOLATION", "REPORT_REVIEWED", "CONTENT_REMOVED",
-            "REVIEW_ABOUT_YOU_REMOVED"})
+            "REVIEW_ABOUT_YOU_REMOVED",
+            // B516: security notices carry no booking — covered by V246InAppSecurityNoticeTypeMigrationTest
+            "SECURITY_PHONE_CHANGED", "SECURITY_EMAIL_CHANGED", "SECURITY_PASSWORD_RESET"})
     @DisplayName("in_app_notification_shape_chk — booking_id alone satisfies every booking/review type")
     void should_acceptWithBookingIdOnly_when_rawInsert(InAppNotificationType type) {
         int inserted = repository.insertIgnoringDuplicate(UUID.randomUUID(), client.getId(), type.name(),
@@ -1427,7 +1433,9 @@ class InAppNotificationRepositoryIT extends AbstractDataJpaTest {
             "CATEGORY_REQUEST_APPROVED", "CATEGORY_REQUEST_REJECTED", "SERVICE_TYPE_SUGGESTION_APPROVED", "SERVICE_TYPE_SUGGESTION_REJECTED",
             // phase 415: moderation outcomes carry no booking — covered by their own shape/push tests
             "REPORT_CONTENT_REMOVED", "REPORT_NO_VIOLATION", "REPORT_REVIEWED", "CONTENT_REMOVED",
-            "REVIEW_ABOUT_YOU_REMOVED"})
+            "REVIEW_ABOUT_YOU_REMOVED",
+            // B516: security notices carry no booking — covered by V246InAppSecurityNoticeTypeMigrationTest
+            "SECURITY_PHONE_CHANGED", "SECURITY_EMAIL_CHANGED", "SECURITY_PASSWORD_RESET"})
     @DisplayName("insertForRecipientsWithPush writes exactly one INAPP_PUSH row per feed row, for every "
             + "type — aggregate_id is the feed row id, status PENDING, NO payload (ids only)")
     void should_writeOnePushRowPerFeedRow_when_insertForRecipientsWithPush(InAppNotificationType type) {
@@ -1510,6 +1518,39 @@ class InAppNotificationRepositoryIT extends AbstractDataJpaTest {
         assertThat(written).isEqualTo(1);
         assertThat(jdbcTemplate.queryForList("SELECT recipient_user_id FROM in_app_notification", UUID.class))
                 .containsExactly(client.getId());
+    }
+
+    @Test
+    @DisplayName("B522 audit-fix cycle 2: insertEventRowsBulk still writes for a deactivated recipient — per-event "
+            + "parity with insertForRecipients (NTF-40 mass decline); the reminder filters in its own target read")
+    void should_writeForInactiveRecipient_when_insertEventRowsBulk() {
+        jdbcTemplate.update("UPDATE users SET is_active = false WHERE id = ?", teammate.getId());
+
+        int written = repository.insertEventRowsBulk("BOOKING_REMINDER",
+                new UUID[] {client.getId(), teammate.getId()}, new UUID[] {booking.getId(), booking.getId()},
+                new UUID[] {null, null}, new UUID[] {salon.getId(), salon.getId()},
+                new String[] {"BOOKING_REMINDER:" + booking.getId() + ":1", "BOOKING_REMINDER:" + booking.getId() + ":2"});
+
+        assertThat(written).isEqualTo(2);
+        assertThat(jdbcTemplate.queryForList("SELECT recipient_user_id FROM in_app_notification", UUID.class))
+                .containsExactlyInAnyOrder(client.getId(), teammate.getId());
+    }
+
+    @Test
+    @DisplayName("B522 audit-fix cycle 2: insertEventRowsBulkWithPush still writes for a deactivated recipient — "
+            + "feed row and push, per-event parity with insertForRecipientsWithPush")
+    void should_writeForInactiveRecipient_when_insertEventRowsBulkWithPush() {
+        giveEveryUserAToken();
+        jdbcTemplate.update("UPDATE users SET is_active = false WHERE id = ?", teammate.getId());
+
+        repository.insertEventRowsBulkWithPush("BOOKING_REMINDER",
+                new UUID[] {client.getId(), teammate.getId()}, new UUID[] {booking.getId(), booking.getId()},
+                new UUID[] {null, null}, new UUID[] {salon.getId(), salon.getId()},
+                new String[] {"BOOKING_REMINDER:" + booking.getId() + ":1", "BOOKING_REMINDER:" + booking.getId() + ":2"});
+
+        assertThat(jdbcTemplate.queryForList("SELECT recipient_user_id FROM in_app_notification", UUID.class))
+                .containsExactlyInAnyOrder(client.getId(), teammate.getId());
+        assertThat(countPushRows()).isEqualTo(2);
     }
 
     @Test

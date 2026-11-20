@@ -58,6 +58,7 @@ public class TelegramWebhookSecretVerifier {
     private final byte[] expectedSecret;
     private final LoadingCache<String, Bucket> rejectBuckets;
     private final Clock clock;
+    private final ClientIpResolver clientIpResolver;
     private final AtomicLong nextRejectLogAtMillis = new AtomicLong(Long.MIN_VALUE);
     private final AtomicLong pendingRejected = new AtomicLong();
     private final AtomicLong pendingThrottled = new AtomicLong();
@@ -66,10 +67,12 @@ public class TelegramWebhookSecretVerifier {
     public TelegramWebhookSecretVerifier(
             TelegramProperties properties,
             @Qualifier("telegramWebhookRejectBuckets") LoadingCache<String, Bucket> rejectBuckets,
-            Clock clock) {
+            Clock clock,
+            ClientIpResolver clientIpResolver) {
         this.expectedSecret = properties.webhookSecret().getBytes(StandardCharsets.UTF_8);
         this.rejectBuckets = rejectBuckets;
         this.clock = clock;
+        this.clientIpResolver = clientIpResolver;
     }
 
     public Outcome verify(HttpServletRequest request) {
@@ -79,7 +82,7 @@ public class TelegramWebhookSecretVerifier {
             flushRejectLogIfDue();
             return Outcome.ACCEPTED;
         }
-        Bucket bucket = rejectBuckets.get(ClientIpResolver.resolve(request));
+        Bucket bucket = rejectBuckets.get(clientIpResolver.resolve(request));
         Outcome outcome = bucket.tryConsume(1) ? Outcome.REJECTED : Outcome.THROTTLED;
         pendingSinceMillis.compareAndSet(NONE, clock.millis());
         (outcome == Outcome.REJECTED ? pendingRejected : pendingThrottled).incrementAndGet();

@@ -1,5 +1,6 @@
 package com.beautica.auth;
 
+import com.beautica.support.StaffInviteFixtures;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.auth.dto.InviteAcceptRequest;
 import com.beautica.auth.dto.InviteErrorResponse;
@@ -77,7 +78,8 @@ class InviteAcceptRejectsInactiveSalonIntegrationTest extends AbstractIntegratio
         log.debug("Act: accept a SALON_MASTER invite whose salon is deactivated");
         ResponseEntity<String> response = restTemplate.postForEntity(
                 ACCEPT_URL,
-                new InviteAcceptRequest(fixture.rawToken(), TEST_PASSWORD, "Dead", "Salon", "+380501234567"),
+                new InviteAcceptRequest(fixture.rawToken(), TEST_PASSWORD, "Dead", "Salon", null, null, null, null,
+                        StaffInviteFixtures.seedRegistrationTicket(jdbcTemplate, fixture.phone())),
                 String.class);
 
         // Assert
@@ -94,7 +96,7 @@ class InviteAcceptRejectsInactiveSalonIntegrationTest extends AbstractIntegratio
         assertThat(countMasters(fixture.salonId()))
                 .as("no master row may ever be bound to a deactivated salon")
                 .isZero();
-        assertThat(countUsers(fixture.email()))
+        assertThat(countUsers(fixture.phone()))
                 .as("no account may be provisioned for a rejected redemption")
                 .isZero();
         assertThat(readIsUsed(fixture.inviteId()))
@@ -112,14 +114,15 @@ class InviteAcceptRejectsInactiveSalonIntegrationTest extends AbstractIntegratio
         log.debug("Act: accept the same SALON_MASTER fixture shape against an active salon");
         ResponseEntity<String> response = restTemplate.postForEntity(
                 ACCEPT_URL,
-                new InviteAcceptRequest(fixture.rawToken(), TEST_PASSWORD, "Live", "Salon", "+380501234567"),
+                new InviteAcceptRequest(fixture.rawToken(), TEST_PASSWORD, "Live", "Salon", null, null, null, null,
+                        StaffInviteFixtures.seedRegistrationTicket(jdbcTemplate, fixture.phone())),
                 String.class);
 
         assertThat(response.getStatusCode())
                 .as("if this is not 201 the fixture itself is unusable and the 409 test above "
                         + "proves nothing — body: %s", response.getBody())
                 .isEqualTo(HttpStatus.CREATED);
-        assertThat(countUsers(fixture.email())).isEqualTo(1);
+        assertThat(countUsers(fixture.phone())).isEqualTo(1);
         assertThat(countMasters(fixture.salonId())).isEqualTo(1);
     }
 
@@ -140,7 +143,8 @@ class InviteAcceptRejectsInactiveSalonIntegrationTest extends AbstractIntegratio
         log.debug("Act: accept a SALON_ADMIN invite with a corrupt null salonId");
         ResponseEntity<String> response = restTemplate.postForEntity(
                 ACCEPT_URL,
-                new InviteAcceptRequest(fixture.rawToken(), TEST_PASSWORD, "No", "Salon", "+380501234567"),
+                new InviteAcceptRequest(fixture.rawToken(), TEST_PASSWORD, "No", "Salon", null, null, null, null,
+                        StaffInviteFixtures.seedRegistrationTicket(jdbcTemplate, fixture.phone())),
                 String.class);
 
         assertThat(response.getStatusCode())
@@ -150,7 +154,7 @@ class InviteAcceptRejectsInactiveSalonIntegrationTest extends AbstractIntegratio
         var body = objectMapper.readValue(
                 response.getBody(), new TypeReference<ApiResponse<InviteErrorResponse>>() {});
         assertThat(body.data().code()).isEqualTo(InviteTokenException.Code.INVITE_SALON_INACTIVE.name());
-        assertThat(countUsers(fixture.email()))
+        assertThat(countUsers(fixture.phone()))
                 .as("no account may be provisioned for a rejected redemption")
                 .isZero();
         assertThat(readIsUsed(fixture.inviteId()))
@@ -171,7 +175,8 @@ class InviteAcceptRejectsInactiveSalonIntegrationTest extends AbstractIntegratio
         log.debug("Act: accept a SALON_MASTER invite with a corrupt null salonId");
         ResponseEntity<String> response = restTemplate.postForEntity(
                 ACCEPT_URL,
-                new InviteAcceptRequest(fixture.rawToken(), TEST_PASSWORD, "No", "Salon", "+380501234567"),
+                new InviteAcceptRequest(fixture.rawToken(), TEST_PASSWORD, "No", "Salon", null, null, null, null,
+                        StaffInviteFixtures.seedRegistrationTicket(jdbcTemplate, fixture.phone())),
                 String.class);
 
         assertThat(response.getStatusCode())
@@ -182,7 +187,7 @@ class InviteAcceptRejectsInactiveSalonIntegrationTest extends AbstractIntegratio
         var body = objectMapper.readValue(
                 response.getBody(), new TypeReference<ApiResponse<InviteErrorResponse>>() {});
         assertThat(body.data().code()).isEqualTo(InviteTokenException.Code.INVITE_SALON_INACTIVE.name());
-        assertThat(countUsers(fixture.email()))
+        assertThat(countUsers(fixture.phone()))
                 .as("no account may be provisioned for a rejected redemption")
                 .isZero();
         assertThat(countMasters(fixture.salonId()))
@@ -210,9 +215,9 @@ class InviteAcceptRejectsInactiveSalonIntegrationTest extends AbstractIntegratio
         long nonce = System.nanoTime();
         UUID ownerId = insertUser("owner-interleave-" + nonce + "@beautica.test", "SALON_OWNER");
         UUID salonId = insertSalon(ownerId, "Interleave Test Salon " + nonce, true);
-        String email = "interleave-invitee-" + nonce + "@beautica.test";
+        String phone = StaffInviteFixtures.newPhone();
         String rawToken = "raw-interleave-" + UUID.randomUUID();
-        UUID inviteId = insertInvite(email, salonId, Role.SALON_MASTER, rawToken);
+        UUID inviteId = insertInvite(phone, salonId, Role.SALON_MASTER, rawToken);
 
         log.debug("Arrange: deactivate the salon via the real SalonService AFTER the invite exists");
         salonService.deactivateSalon(ownerId, salonId);
@@ -220,7 +225,8 @@ class InviteAcceptRejectsInactiveSalonIntegrationTest extends AbstractIntegratio
         log.debug("Act: redeem an invite minted before, but deactivated after, salon deletion");
         ResponseEntity<String> response = restTemplate.postForEntity(
                 ACCEPT_URL,
-                new InviteAcceptRequest(rawToken, TEST_PASSWORD, "Late", "Comer", "+380501234567"),
+                new InviteAcceptRequest(rawToken, TEST_PASSWORD, "Late", "Comer", null, null, null, null,
+                        StaffInviteFixtures.seedRegistrationTicket(jdbcTemplate, phone)),
                 String.class);
 
         assertThat(response.getStatusCode())
@@ -231,7 +237,7 @@ class InviteAcceptRejectsInactiveSalonIntegrationTest extends AbstractIntegratio
                 response.getBody(), new TypeReference<ApiResponse<InviteErrorResponse>>() {});
         assertThat(body.data().code()).isEqualTo(InviteTokenException.Code.INVITE_SALON_INACTIVE.name());
         assertThat(countMasters(salonId)).isZero();
-        assertThat(countUsers(email)).isZero();
+        assertThat(countUsers(phone)).isZero();
         assertThat(readIsUsed(inviteId))
                 .as("the token must survive the rejected redemption unburned")
                 .isFalse();
@@ -239,7 +245,7 @@ class InviteAcceptRejectsInactiveSalonIntegrationTest extends AbstractIntegratio
 
     // ── helpers ────────────────────────────────────────────────────────────────
 
-    private record Fixture(UUID inviteId, String rawToken, String email, UUID salonId) { }
+    private record Fixture(UUID inviteId, String rawToken, String phone, UUID salonId) { }
 
     /**
      * Seeds an owner, a salon (active per {@code salonActive}) and one genuinely acceptable
@@ -252,36 +258,37 @@ class InviteAcceptRejectsInactiveSalonIntegrationTest extends AbstractIntegratio
         UUID ownerId = insertUser("owner-inactive-salon-" + nonce + "@beautica.test", "SALON_OWNER");
         UUID salonId = insertSalon(ownerId, "Guard Test Salon " + nonce, salonActive);
 
-        String email = "inactive-salon-invitee-" + nonce + "@beautica.test";
+        String phone = StaffInviteFixtures.newPhone();
         String rawToken = "raw-inactive-salon-" + UUID.randomUUID();
-        UUID inviteId = insertInvite(email, salonId, role, rawToken);
-        return new Fixture(inviteId, rawToken, email, salonId);
+        UUID inviteId = insertInvite(phone, salonId, role, rawToken);
+        return new Fixture(inviteId, rawToken, phone, salonId);
     }
 
     private Fixture seedInviteWithNullSalon(Role role) {
         long nonce = System.nanoTime();
-        String email = "null-salon-invitee-" + nonce + "@beautica.test";
+        String phone = StaffInviteFixtures.newPhone();
         String rawToken = "raw-null-salon-" + UUID.randomUUID();
-        UUID inviteId = insertInvite(email, null, role, rawToken);
-        return new Fixture(inviteId, rawToken, email, null);
+        UUID inviteId = insertInvite(phone, null, role, rawToken);
+        return new Fixture(inviteId, rawToken, phone, null);
     }
 
-    private UUID insertInvite(String email, UUID salonId, Role role, String rawToken) {
+    /** B520 — a phone invite (the only kind accept takes). */
+    private UUID insertInvite(String phone, UUID salonId, Role role, String rawToken) {
         UUID inviteId = UUID.randomUUID();
         Instant now = Instant.now();
         jdbcTemplate.update(
                 "INSERT INTO invite_tokens "
-                        + "(id, token, email, salon_id, role, expires_at, is_used, revoked_at, "
+                        + "(id, token, phone, salon_id, role, expires_at, is_used, revoked_at, "
                         + "created_at, updated_at) "
                         + "VALUES (?, ?, ?, ?, ?, ?, false, NULL, NOW(), NOW())",
-                inviteId, sha256Hex(rawToken), email, salonId, role.name(),
+                inviteId, sha256Hex(rawToken), phone, salonId, role.name(),
                 Timestamp.from(now.plus(2, ChronoUnit.DAYS)));
         return inviteId;
     }
 
-    private Integer countUsers(String email) {
+    private Integer countUsers(String phone) {
         return jdbcTemplate.queryForObject(
-                "SELECT COUNT(*) FROM users WHERE email = ?", Integer.class, email);
+                "SELECT COUNT(*) FROM users WHERE phone_number = ?", Integer.class, phone);
     }
 
     private Integer countMasters(UUID salonId) {

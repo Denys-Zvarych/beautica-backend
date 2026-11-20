@@ -20,7 +20,8 @@ import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.data.domain.Limit;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
-import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.Clock;
 import java.time.Duration;
@@ -92,7 +93,10 @@ public class BookingReminderJob {
     static final String OUTCOME_SENT = "sent";
     static final String OUTCOME_SKIPPED_NIGHT = "skipped_night";
     static final String OUTCOME_SKIPPED_SHORT_NOTICE = "skipped_short_notice";
-    private static final String TYPE_H2 = "h2";
+    /** Phase 522 audit-fix cycle 2 — the registered (APP) leg threw; the guest leg still ran. */
+    static final String OUTCOME_REGISTERED_FAILED = "registered_failed";
+    static final String TYPE_H2 = "h2";
+    static final String TYPE_H24 = "h24";
 
     private final BookingRepository bookingRepository;
     private final BookingSmsProperties smsProperties;
@@ -103,6 +107,11 @@ public class BookingReminderJob {
     private final GuestBookingPageLinks pageLinks;
     /** Phase 494 — the registered-client (APP) e-mail leg of both sweeps. */
     private final RegisteredBookingReminderSweep registeredReminders;
+    /**
+     * Phase 522 audit-fix 4 (2 h) / cycle 2 (24 h) — both sweeps' GUEST leg transaction. The registered leg commits
+     * its own ({@code REQUIRES_NEW}) first, so its claimed booking rows are not held locked through the guest leg.
+     */
+    private final TransactionTemplate guestLegTx;
 
     public BookingReminderJob(
             BookingRepository bookingRepository,
@@ -111,7 +120,8 @@ public class BookingReminderJob {
             Clock clock,
             MeterRegistry meterRegistry,
             GuestBookingPageLinks pageLinks,
-            RegisteredBookingReminderSweep registeredReminders) {
+            RegisteredBookingReminderSweep registeredReminders,
+            PlatformTransactionManager transactionManager) {
         this.bookingRepository = bookingRepository;
         this.smsProperties = smsProperties;
         this.events = events;
@@ -119,19 +129,28 @@ public class BookingReminderJob {
         this.meterRegistry = meterRegistry;
         this.pageLinks = pageLinks;
         this.registeredReminders = registeredReminders;
+        this.guestLegTx = new TransactionTemplate(transactionManager);
     }
 
+    /**
+     * Phase 13.3 / 494 — the hourly 24 h sweep. Phase 522 audit-fix cycle 2 — NOT {@code @Transactional}: the
+     * registered leg commits its own transaction ({@code REQUIRES_NEW}) and the guest leg runs in {@link #guestLegTx}
+     * afterwards, so the registered claim's row locks end before the guest leg; a failing registered leg is contained
+     * ({@link #runRegisteredLeg}) and never skips the guest leg.
+     */
     @Scheduled(cron = "0 0 * * * *")
-    @Transactional
     public void sendReminders() {
         OffsetDateTime now = OffsetDateTime.now(clock);
+        // Phase 494 — the registered-client e-mail leg first (same window), so the guest leg's early return on an
+        // empty guest batch cannot skip it.
+        runRegisteredLeg(TYPE_H24, () -> registeredReminders.remindDayBefore(now));
+        guestLegTx.executeWithoutResult(status -> sweepGuestDayBefore(now));
+    }
+
+    /** Phase 13.3 — the guest 24 h leg of {@link #sendReminders()}, inside {@link #guestLegTx}. */
+    private void sweepGuestDayBefore(OffsetDateTime now) {
         OffsetDateTime from = now.plus(WINDOW_START);
         OffsetDateTime to = now.plus(WINDOW_END);
-
-        // Phase 494 — the registered-client e-mail leg first (same window), so the guest leg's early return on an
-        // empty guest batch cannot skip it. Claim + outbox enqueue share this transaction.
-        registeredReminders.remindDayBefore(now);
-
         List<Booking> due = bookingRepository.findGuestBookingsForReminder(from, to, includeWalkIns());
         if (due.isEmpty()) {
             return;
@@ -230,8 +249,9 @@ public class BookingReminderJob {
      */
     // Offset to :05/:20/:35/:50 (audit-fix) so it never fires together with the hourly :00 24h sweep and the other
     // top-of-hour jobs; the 30-minute window still covers every start at two ticks.
+    // Phase 522 audit-fix 4 — NOT @Transactional: the registered leg commits its own transaction (REQUIRES_NEW) and
+    // the guest leg runs in guestLegTx afterwards, so the registered claim's row locks end before the guest leg.
     @Scheduled(cron = "0 5/15 * * * *")
-    @Transactional
     public void sweepTwoHour() {
         BookingSmsProperties.Reminder2h config = smsProperties.getReminder2h();
         if (!config.isEnabled()) {
@@ -243,8 +263,28 @@ public class BookingReminderJob {
             return;
         }
         // Phase 494 — the registered-client e-mail leg, behind the same flag (D4) and night skip, same window and
-        // short-notice rule; before the guest query so its early return cannot skip it.
-        registeredReminders.remindTwoHoursBefore(now, config.getMinLead());
+        // short-notice rule; before the guest query so its early return cannot skip it. Its own transaction (522).
+        runRegisteredLeg(TYPE_H2, () -> registeredReminders.remindTwoHoursBefore(now, config.getMinLead()));
+        guestLegTx.executeWithoutResult(status -> sweepGuestTwoHour(now, config));
+    }
+
+    /**
+     * Phase 522 audit-fix cycle 2 — runs one registered (APP) leg so its failure cannot skip the guest leg that
+     * follows: the leg's own {@code REQUIRES_NEW} transaction has already rolled back when the exception reaches here,
+     * so the claims stay unclaimed and the next tick retries them. Logs the cause class only (never a message, which
+     * may carry SQL / PII) and counts {@link #OUTCOME_REGISTERED_FAILED}.
+     */
+    private void runRegisteredLeg(String type, Runnable leg) {
+        try {
+            leg.run();
+        } catch (RuntimeException ex) {
+            log.error("Registered-client {} reminder leg failed: {}", type, ex.getClass().getSimpleName());
+            count(type, OUTCOME_REGISTERED_FAILED, 1);
+        }
+    }
+
+    /** Phase 413 — the guest 2 h leg of {@link #sweepTwoHour()}, inside {@link #guestLegTx}. */
+    private void sweepGuestTwoHour(OffsetDateTime now, BookingSmsProperties.Reminder2h config) {
         List<Booking> due = bookingRepository.findGuestBookingsForTwoHourReminder(
                 now.plus(TWO_HOUR_WINDOW_START), now.plus(TWO_HOUR_WINDOW_END), includeWalkIns(),
                 Limit.of(BookingRepository.TWO_HOUR_REMINDER_BATCH_CAP));
@@ -344,8 +384,12 @@ public class BookingReminderJob {
     }
 
     private void countTwoHour(String outcome, int amount) {
+        count(TYPE_H2, outcome, amount);
+    }
+
+    private void count(String type, String outcome, int amount) {
         if (amount > 0) {
-            meterRegistry.counter(REMINDER_METRIC, "type", TYPE_H2, "outcome", outcome).increment(amount);
+            meterRegistry.counter(REMINDER_METRIC, "type", type, "outcome", outcome).increment(amount);
         }
     }
 

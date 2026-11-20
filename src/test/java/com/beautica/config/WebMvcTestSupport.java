@@ -6,6 +6,7 @@ import com.beautica.auth.JwtTokenProvider;
 import com.beautica.auth.PasswordResetService;
 import com.beautica.auth.TokensValidAfterCache;
 import com.beautica.auth.filter.AuthRateLimitFilter;
+import com.beautica.auth.filter.ClientIpResolver;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.benmanes.caffeine.cache.LoadingCache;
 import io.github.bucket4j.Bucket;
@@ -119,6 +120,15 @@ public class WebMvcTestSupport {
                 return true;
             }
         };
+    }
+
+    /**
+     * Real {@link ClientIpResolver} under the prod trust rule: a plain {@code @Component}, excluded from
+     * {@code @WebMvcTest} scanning, provided here so the {@code AuthController} constructor resolves.
+     */
+    @Bean
+    public ClientIpResolver clientIpResolver() {
+        return new ClientIpResolver(ClientIpProperties.trustingForwardedHeaders());
     }
 
     // NOTE: BookingRateLimitFilter deliberately has NO stand-in here. It is not a @Component —

@@ -98,6 +98,8 @@ class MasterServiceTest {
     @Mock private com.beautica.booking.service.SlotCalculationService slotCalculationService;
     // Public-roster gate (getMastersByPage) binds :bookableToday from the app-clock Kyiv date.
     @Mock private ScheduleDateMath scheduleDateMath;
+    // SAL-09: the public roster keeps only masters who pass the strict free-slot verdict.
+    @Mock private com.beautica.search.service.StrictBookableResolver strictBookableResolver;
     @Mock private com.beautica.service.service.SalonCatalogCacheEvictor salonCatalogCacheEvictor;
     // Prefix-eviction fix: the master-calendar / available-slots afterCommit callbacks now delegate to
     // the shared evictor, so @InjectMocks must have one to wire or every deactivate/reactivate path
@@ -1955,6 +1957,9 @@ class MasterServiceTest {
         LocalDate today = LocalDate.of(2026, 10, 5);
         when(scheduleDateMath.today()).thenReturn(today);
         when(masterRepository.findBookableIdsBySalonId(salonId, today)).thenReturn(List.of(masterId));
+        when(strictBookableResolver.resolve(List.of(masterId), "salon-roster"))
+                .thenReturn(new com.beautica.search.service.StrictBookableResolver.StrictBookableSet(
+                        java.util.Set.of(masterId), java.util.Set.of(UUID.randomUUID())));
         when(masterRepository.findBySalonIdAndIdInAndIsActiveTrueWithUser(
                 salonId, List.of(masterId), expectedNormalized))
                 .thenReturn(masterPage);
@@ -1978,6 +1983,24 @@ class MasterServiceTest {
         LocalDate today = LocalDate.of(2026, 10, 5);
         when(scheduleDateMath.today()).thenReturn(today);
         when(masterRepository.findBookableIdsBySalonId(salonId, today)).thenReturn(List.of());
+
+        Page<MasterSummaryResponse> result = masterService.getMastersByPage(salonId, Pageable.ofSize(10));
+
+        assertThat(result.getContent()).isEmpty();
+        assertThat(result.getTotalElements()).isZero();
+        verify(masterRepository, never()).findBySalonIdAndIdInAndIsActiveTrueWithUser(any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("getMastersByPage drops a structurally bookable master who fails the strict free-slot verdict (SAL-09)")
+    void should_returnEmptyPageWithoutRosterQuery_when_noCandidatePassesStrictVerdict() {
+        UUID salonId = UUID.randomUUID();
+        UUID fullyBookedMasterId = UUID.randomUUID();
+        LocalDate today = LocalDate.of(2026, 10, 5);
+        when(scheduleDateMath.today()).thenReturn(today);
+        when(masterRepository.findBookableIdsBySalonId(salonId, today)).thenReturn(List.of(fullyBookedMasterId));
+        when(strictBookableResolver.resolve(List.of(fullyBookedMasterId), "salon-roster"))
+                .thenReturn(com.beautica.search.service.StrictBookableResolver.StrictBookableSet.EMPTY);
 
         Page<MasterSummaryResponse> result = masterService.getMastersByPage(salonId, Pageable.ofSize(10));
 

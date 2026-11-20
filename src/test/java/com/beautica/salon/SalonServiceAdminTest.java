@@ -159,14 +159,14 @@ class SalonServiceAdminTest {
         UUID salonId = UUID.randomUUID();
         User owner = buildOwner(UUID.randomUUID(), salonId);
         Salon salon = buildSalon(salonId, owner, "Glamour Studio");
-        var expectedResponse = new InviteResponse("newmaster@example.com",
+        var expectedResponse = new InviteResponse("+380501234567",
                 Instant.now().plusSeconds(259200));
 
         when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
         when(inviteService.sendInvite(any(), any())).thenReturn(expectedResponse);
         // authorizationService.enforceCanManageSalon does nothing — access granted for SALON_ADMIN
 
-        assertThatCode(() -> salonService.inviteMaster(adminId, salonId, "newmaster@example.com", Role.SALON_MASTER))
+        assertThatCode(() -> salonService.inviteMaster(adminId, salonId, "+380501234567", Role.SALON_MASTER))
                 .doesNotThrowAnyException();
 
         verify(inviteService).sendInvite(any(), any());

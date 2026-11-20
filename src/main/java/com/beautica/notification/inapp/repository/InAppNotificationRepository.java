@@ -285,7 +285,9 @@ public interface InAppNotificationRepository extends Repository<InAppNotificatio
      * {@code notifyBookingEvent}/{@code notifyVisitEvent} use, so each row is byte-identical to what those
      * per-event calls would write (the SQL-LATERAL shape of {@link #insertProviderSetBulk} would re-derive the
      * salon from {@code masters.salon_id}, not the booking's own salon, and could not express the decline
-     * recipient set). Driven by {@code users} like {@link #insertForRecipients}; {@code subject_user_id} stays
+     * recipient set). Driven by {@code users} like {@link #insertForRecipients} — deliberately NOT filtered to
+     * active accounts (per-event parity; the reminder sweep filters inactive clients in its own target read,
+     * {@code BookingRepository#findReminderFeedTargetsByIds}); {@code subject_user_id} stays
      * {@code NULL}. A {@code NULL} array element ({@code booking_id} of a visit-keyed row, {@code salon_id} of an
      * independent master) is bound as SQL {@code NULL}.
      *
@@ -350,6 +352,50 @@ public interface InAppNotificationRepository extends Repository<InAppNotificatio
             @Param("appointmentId") UUID appointmentId,
             @Param("salonId") UUID salonId,
             @Param("subjectUserId") UUID subjectUserId,
+            @Param("dedupKey") String dedupKey);
+
+    /**
+     * B516 (AUTH-D19) — the account's own security notice: ONE row for {@code userId}, {@code subject_user_id} =
+     * the same account, plus the changed value masked AT WRITE TIME ({@code masked_contact}, V249) so the feed shows
+     * the value of that change, not the account's current one. Driven by {@code users} so a vanished account yields
+     * no row instead of an FK failure.
+     */
+    @Modifying
+    @Query(value = """
+            INSERT INTO in_app_notification
+                (id, recipient_user_id, type, subject_user_id, masked_contact, dedup_key)
+            SELECT gen_random_uuid(), u.id, :type, u.id, :maskedContact, :dedupKey
+              FROM users u
+             WHERE u.id = :userId
+            ON CONFLICT (recipient_user_id, dedup_key) DO NOTHING
+            """, nativeQuery = true)
+    int insertSecurityNotice(
+            @Param("type") String type,
+            @Param("userId") UUID userId,
+            @Param("maskedContact") String maskedContact,
+            @Param("dedupKey") String dedupKey);
+
+    /** Push twin of {@link #insertSecurityNotice}. */
+    @Modifying
+    @Query(value = """
+            WITH ins AS (
+                INSERT INTO in_app_notification
+                    (id, recipient_user_id, type, subject_user_id, masked_contact, dedup_key)
+                SELECT gen_random_uuid(), u.id, :type, u.id, :maskedContact, :dedupKey
+                  FROM users u
+                 WHERE u.id = :userId
+                ON CONFLICT (recipient_user_id, dedup_key) DO NOTHING
+                RETURNING id, recipient_user_id
+            )
+            INSERT INTO notification_outbox (event_type, aggregate_id)
+            SELECT 'INAPP_PUSH', ins.id FROM ins
+             WHERE EXISTS (SELECT 1 FROM device_tokens dt
+                            WHERE dt.user_id = ins.recipient_user_id AND dt.is_active)
+            """, nativeQuery = true)
+    int insertSecurityNoticeWithPush(
+            @Param("type") String type,
+            @Param("userId") UUID userId,
+            @Param("maskedContact") String maskedContact,
             @Param("dedupKey") String dedupKey);
 
     /**

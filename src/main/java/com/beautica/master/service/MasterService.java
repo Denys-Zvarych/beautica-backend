@@ -110,6 +110,8 @@ public class MasterService {
     // and bounded gap than the "never cached" concern Phase 29.2 raises for the uncached
     // GET /bookings/me family this DTO also backs).
     private final Clock clock;
+    // SAL-09 (2026-11-18): the public roster lists only masters who pass the strict free-slot verdict.
+    private final com.beautica.search.service.StrictBookableResolver strictBookableResolver;
 
     @Transactional
     public Master createMasterForIndependentUser(UUID userId) {
@@ -600,7 +602,7 @@ public class MasterService {
      * <p><b>Corrected (Phase 290 audit, security MEDIUM):</b> this javadoc previously claimed
      * parity with {@code AuthorizationService#hasManagementAccess(UUID, UUID, Role)} while
      * {@link #canManageSalonStaff} never actually checked the actor's role — it admitted any actor
-     * whose {@code users.salon_id} matched, which {@code User.createFromInvite} populates for an
+     * whose {@code users.salon_id} matched, which {@code User.createFromPhoneInvite} populates for an
      * invited {@code SALON_MASTER} (read-only) exactly as it does for {@code SALON_ADMIN}. The
      * role gate now lives in {@link #canManageSalonStaff} itself; see its javadoc.
      *
@@ -666,7 +668,7 @@ public class MasterService {
      * <p><b>Security fix (Phase 290 audit, MEDIUM):</b> the previous version of this method
      * answered {@code salonRepository.existsByIdAndOwnerId(...) ||
      * userRepository.findSalonIdById(...).map(salonId::equals)} with NO role check at all. Because
-     * {@code User.createFromInvite} populates {@code users.salon_id} for an invited
+     * {@code User.createFromPhoneInvite} populates {@code users.salon_id} for an invited
      * {@code SALON_MASTER} exactly as it does for {@code SALON_ADMIN} (both branches of
      * {@code InviteService}'s invite-acceptance set it from the invite token regardless of
      * {@code token.getRole()}), a {@code SALON_MASTER} — a read-only role — satisfied the second
@@ -1250,13 +1252,14 @@ public class MasterService {
      * {@code GET /masters/by-salon/{salonId}} and {@code GET /salons/{salonId}/masters}
      * ({@code SalonService#getMastersBySalon} delegates here).
      *
-     * <p>Lists only client-visible masters — the CHEAP structural rule
-     * ({@code MasterBookabilitySql}: ≥1 active, correctly-owned service AND working hours within the
-     * 180-day horizon), the same predicate discovery search applies. It never walks the free-slot
-     * calendar, so a fully booked master stays listed; an auto-enrolled owner-master or an invited
-     * master without services / working hours is not shown. The id gate
-     * ({@link MasterRepository#findBookableIdsBySalonId}, bounded by one salon's headcount) runs
-     * first; no visible master → empty page with no roster query. Otherwise the ids narrow the
+     * <p>Lists only masters a client can actually book (SAL-09, 2026-11-18): the CHEAP structural
+     * rule ({@code MasterBookabilitySql}: ≥1 active, correctly-owned service AND working hours within
+     * the 180-day horizon) narrows the candidates
+     * ({@link MasterRepository#findBookableIdsBySalonId}, bounded by one salon's headcount), then the
+     * strict free-slot verdict search uses ({@code StrictBookableResolver}, SRCH-30 — cached per
+     * master, one batched walk for the misses) drops a fully booked master or one whose remaining
+     * working days are all days off. No visible master → empty page with no roster query. Otherwise
+     * the ids narrow the
      * {@code JOIN FETCH m.user} roster query in SQL ({@code m.id IN :ids}), so paging, sort and
      * {@code totalElements} stay exact and the mapping stays N+1-free. The management roster
      * ({@code SalonService#getSalonStaff}) is deliberately NOT gated.
@@ -1265,8 +1268,10 @@ public class MasterService {
     public Page<MasterSummaryResponse> getMastersByPage(UUID salonId, Pageable pageable) {
         Pageable safePageable = SortWhitelist.apply(
                 pageable, SORTABLE_MASTER_PROPERTIES, DEFAULT_MASTER_SORT, MASTER_ID_TIEBREAKER);
-        List<UUID> bookableMasterIds =
+        List<UUID> candidateIds =
                 masterRepository.findBookableIdsBySalonId(salonId, scheduleDateMath.today());
+        List<UUID> bookableMasterIds = candidateIds.isEmpty() ? List.of()
+                : List.copyOf(strictBookableResolver.resolve(candidateIds, "salon-roster").masterIds());
         if (bookableMasterIds.isEmpty()) {
             return Page.empty(safePageable);
         }

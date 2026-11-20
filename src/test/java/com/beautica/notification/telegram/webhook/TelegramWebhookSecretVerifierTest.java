@@ -1,5 +1,7 @@
 package com.beautica.notification.telegram.webhook;
 
+import com.beautica.auth.filter.ClientIpResolver;
+import com.beautica.config.ClientIpProperties;
 import com.beautica.config.TelegramMode;
 import com.beautica.config.TelegramProperties;
 import com.beautica.notification.telegram.webhook.TelegramWebhookSecretVerifier.Outcome;
@@ -53,7 +55,8 @@ class TelegramWebhookSecretVerifierTest {
                 .addLimit(BandwidthBuilder.builder().capacity(CAPACITY)
                         .refillIntervally(CAPACITY, Duration.ofMinutes(1)).build())
                 .build());
-        return new TelegramWebhookSecretVerifier(properties, buckets, clock);
+        return new TelegramWebhookSecretVerifier(properties, buckets, clock,
+                new ClientIpResolver(ClientIpProperties.trustingForwardedHeaders()));
     }
 
     private static MockHttpServletRequest request(String secretHeader, String ip) {

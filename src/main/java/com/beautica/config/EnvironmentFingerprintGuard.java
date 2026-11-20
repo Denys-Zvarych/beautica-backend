@@ -1,5 +1,8 @@
 package com.beautica.config;
 
+import com.beautica.config.appcheck.AppCheckLogOnlyAlarm;
+import com.beautica.config.appcheck.AppCheckMode;
+import com.beautica.config.appcheck.AppCheckProperties;
 import com.beautica.notification.mail.MailTransportKind;
 import com.beautica.review.invite.config.ReviewInviteProperties;
 import org.apache.commons.logging.Log;
@@ -67,6 +70,7 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
     private static final Profiles PROD = Profiles.of("prod");
     private static final Profiles STAGING = Profiles.of("staging");
     private static final Profiles TEST = Profiles.of("test");
+    private static final Profiles LOCAL = Profiles.of("local");
     static final String GUEST_PII_RETENTION_ENABLED = "app.guest-pii-retention.enabled";
 
     /** Placeholder an operator sets for {@code BREVO_SMTP_LOGIN}/{@code BREVO_SMTP_KEY} until Brevo exists (Phase 367 D9). */
@@ -133,14 +137,18 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
             return;
         }
         checkProfiles(environment, prodProfile, stagingProfile, violations);
+        checkLocalProfile(env, prodProfile, stagingProfile, onRailway, violations);
         checkRailwayName(env, environment, violations);
         if (environment != DeployEnvironment.LOCAL) {
+            checkAuthLimits(env, violations);
+            checkPhoneFirstRollout(env, log, violations);
             checkR2Bucket(env, environment, violations);
             checkLinkBaseUrls(env, environment, violations);
             checkInternalApiKey(env, violations);
             checkRetentionJobs(env, environment, violations);
             if (environment == DeployEnvironment.PROD) {
                 checkProd(env, violations);
+                alertAppCheckLogOnly(env, log);
                 if (brevoApiTransport(env)) {
                     checkBrevoApi(env, violations);
                 } else {
@@ -268,6 +276,112 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
             violations.add("rule profile-environment: staging profile active but beautica.environment is not staging");
         } else if (prodProfile && !stagingProfile && environment != DeployEnvironment.PROD) {
             violations.add("rule profile-environment: prod profile active but beautica.environment is not prod");
+        }
+    }
+
+    /**
+     * The {@code local} profile relaxes auth limits and rate limits for manual phone testing
+     * ({@code application-local.yml}), so it must never ride along with a prod/staging profile or run on Railway.
+     * Reached only when the guard is not skipped, i.e. a prod/staging profile, a non-LOCAL environment or Railway.
+     */
+    private static void checkLocalProfile(Environment env, boolean prodProfile, boolean stagingProfile, boolean onRailway,
+                                          List<String> violations) {
+        if (env.acceptsProfiles(LOCAL) && (prodProfile || stagingProfile || onRailway)) {
+            violations.add("rule local-profile: local profile must not be active with prod/staging or on Railway");
+        }
+    }
+
+    /**
+     * Outside LOCAL the {@code app.auth-limits.*} values may only tighten the {@link AuthLimitsProperties#defaults()}:
+     * no count above its default, no {@code login-lock-window} below it. Bound exactly as the
+     * {@code @ConfigurationProperties} bean binds it (unset = defaults); a value that cannot be bound fails closed
+     * with this rule. Names the properties only, never a value or the bind error's message.
+     */
+    private static void checkAuthLimits(Environment env, List<String> violations) {
+        AuthLimitsProperties limits;
+        try {
+            limits = Binder.get(env).bind(AUTH_LIMITS_PREFIX, AuthLimitsProperties.class)
+                    .orElseGet(AuthLimitsProperties::defaults);
+        } catch (org.springframework.boot.context.properties.bind.BindException e) {
+            violations.add("rule auth-limits-not-loosened: " + AUTH_LIMITS_PREFIX + ".* could not be bound");
+            return;
+        }
+        AuthLimitsProperties defaults = AuthLimitsProperties.defaults();
+        List<String> loosened = new ArrayList<>();
+        addIfAbove(loosened, "phone-otp-max-sends-per-window", limits.phoneOtpMaxSendsPerWindow(),
+                defaults.phoneOtpMaxSendsPerWindow());
+        addIfAbove(loosened, "phone-otp-max-verify-attempts", limits.phoneOtpMaxVerifyAttempts(),
+                defaults.phoneOtpMaxVerifyAttempts());
+        addIfAbove(loosened, "email-code-max-verify-attempts", limits.emailCodeMaxVerifyAttempts(),
+                defaults.emailCodeMaxVerifyAttempts());
+        addIfAbove(loosened, "login-max-failures", limits.loginMaxFailures(), defaults.loginMaxFailures());
+        addIfAbove(loosened, "otp-verify-ip-capacity", limits.otpVerifyIpCapacity(), defaults.otpVerifyIpCapacity());
+        addIfAbove(loosened, "guest-booking-ip-capacity", limits.guestBookingIpCapacity(),
+                defaults.guestBookingIpCapacity());
+        addIfAbove(loosened, "phone-failed-verifies-per-day", limits.phoneFailedVerifiesPerDay(),
+                defaults.phoneFailedVerifiesPerDay());
+        if (limits.otpResendCooldownSeconds() < defaults.otpResendCooldownSeconds()) {
+            loosened.add(AUTH_LIMITS_PREFIX + ".otp-resend-cooldown-seconds");
+        }
+        if (limits.loginLockWindow().compareTo(defaults.loginLockWindow()) < 0) {
+            loosened.add(AUTH_LIMITS_PREFIX + ".login-lock-window");
+        }
+        if (!loosened.isEmpty()) {
+            violations.add("rule auth-limits-not-loosened: " + String.join(", ", loosened)
+                    + " must not be looser than the AuthLimitsProperties defaults outside local");
+        }
+    }
+
+    static final String AUTH_LIMITS_PREFIX = "app.auth-limits";
+    static final String REQUIRE_PHONE_REGISTRATION = "app.auth.require-phone-registration";
+    static final String REQUIRE_VERIFIED_PHONE = "app.auth.require-verified-phone";
+    static final String ANDROID_MIN_VERSION_CODE = "app.client-version.android.min-version-code";
+    static final String APP_CHECK_REPLAY_MODE = "app.auth.app-check.replay-mode";
+
+    /**
+     * AUTH-D29 (rule {@code phone-first-rollout}, staging and prod only — tests and local flip the flags freely):
+     * {@code APP_AUTH_REQUIRE_PHONE_REGISTRATION} or {@code APP_AUTH_REQUIRE_VERIFIED_PHONE} true needs
+     * {@code APP_ANDROID_MIN_VERSION_CODE} &ge; {@link ClientBuildFloors#PHONE_FIRST_MIN_VERSION_CODE};
+     * {@code APP_AUTH_APP_CHECK_REPLAY=ENFORCE} needs it &ge; {@link ClientBuildFloors#APP_CHECK_LIMITED_USE_MIN_VERSION_CODE}
+     * — otherwise builds that still pass the forced-update gate would be locked out. Bound as the properties beans bind
+     * them; a value that cannot be bound fails closed with this rule. Logs the effective flags and floors at INFO.
+     */
+    private static void checkPhoneFirstRollout(Environment env, Log log, List<String> violations) {
+        boolean requirePhoneRegistration;
+        boolean requireVerifiedPhone;
+        int minVersionCode;
+        AppCheckMode replayMode;
+        try {
+            Binder binder = Binder.get(env);
+            requirePhoneRegistration = binder.bind(REQUIRE_PHONE_REGISTRATION, Boolean.class).orElse(false);
+            requireVerifiedPhone = binder.bind(REQUIRE_VERIFIED_PHONE, Boolean.class).orElse(false);
+            minVersionCode = binder.bind(ANDROID_MIN_VERSION_CODE, Integer.class).orElse(0);
+            replayMode = binder.bind(APP_CHECK_REPLAY_MODE, AppCheckMode.class).orElse(AppCheckMode.LOG_ONLY);
+        } catch (org.springframework.boot.context.properties.bind.BindException e) {
+            violations.add("rule phone-first-rollout: " + REQUIRE_PHONE_REGISTRATION + ", " + REQUIRE_VERIFIED_PHONE
+                    + ", " + ANDROID_MIN_VERSION_CODE + " or " + APP_CHECK_REPLAY_MODE + " could not be bound");
+            return;
+        }
+        log.info("Phone-first rollout: require-phone-registration=" + requirePhoneRegistration
+                + " require-verified-phone=" + requireVerifiedPhone + " app-check-replay=" + replayMode
+                + " android-min-version-code=" + minVersionCode
+                + " phone-first-floor=" + ClientBuildFloors.PHONE_FIRST_MIN_VERSION_CODE
+                + " limited-use-floor=" + ClientBuildFloors.APP_CHECK_LIMITED_USE_MIN_VERSION_CODE);
+        if ((requirePhoneRegistration || requireVerifiedPhone)
+                && minVersionCode < ClientBuildFloors.PHONE_FIRST_MIN_VERSION_CODE) {
+            violations.add("rule phone-first-rollout: " + REQUIRE_PHONE_REGISTRATION + " / " + REQUIRE_VERIFIED_PHONE
+                    + " true needs " + ANDROID_MIN_VERSION_CODE + " >= " + ClientBuildFloors.PHONE_FIRST_MIN_VERSION_CODE);
+        }
+        if (replayMode == AppCheckMode.ENFORCE
+                && minVersionCode < ClientBuildFloors.APP_CHECK_LIMITED_USE_MIN_VERSION_CODE) {
+            violations.add("rule phone-first-rollout: " + APP_CHECK_REPLAY_MODE + " ENFORCE needs "
+                    + ANDROID_MIN_VERSION_CODE + " >= " + ClientBuildFloors.APP_CHECK_LIMITED_USE_MIN_VERSION_CODE);
+        }
+    }
+
+    private static void addIfAbove(List<String> loosened, String key, long value, long defaultValue) {
+        if (value > defaultValue) {
+            loosened.add(AUTH_LIMITS_PREFIX + "." + key);
         }
     }
 
@@ -471,6 +585,7 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
             violations.add("rule prod-admin-email-placeholder: ADMIN_EMAIL must not use a reserved test/example domain in prod");
         }
         checkProdTurnstile(env, violations);
+        checkProdAppCheck(env, violations);
         checkProdReviewInviteLink(env, violations);
         // The EFFECTIVE recipient: APP_ADMIN_EMAIL (relaxed binding of app.admin-email) overrides ADMIN_EMAIL.
         String effective = readOrNull(env, "app.admin-email");
@@ -632,6 +747,35 @@ public class EnvironmentFingerprintGuard implements EnvironmentPostProcessor, Or
             java.util.regex.Pattern.compile("^[123]x0{31}AA$");
 
     private static final String TURNSTILE_SITEVERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
+
+    /**
+     * B514 (AUTH-54, D5) — prod (without staging) must check App Check: {@code OFF} is refused, {@code LOG_ONLY} stays
+     * allowed as the incident lever (e.g. a Play Integrity outage). Unset means the yml default ENFORCE. The JWKS URL,
+     * when overridden, must be Google's: a redirected key set would let any self-signed token pass.
+     */
+    private static void checkProdAppCheck(Environment env, List<String> violations) {
+        String mode = boundOrNull(env, "app.auth.app-check.mode");
+        if (mode != null && "OFF".equalsIgnoreCase(mode.strip())) {
+            violations.add("rule prod-app-check-off: app.auth.app-check.mode (APP_AUTH_APP_CHECK_MODE) must be "
+                    + "ENFORCE or LOG_ONLY in prod");
+        }
+        String jwksUrl = boundOrNull(env, "app.auth.app-check.jwks-url");
+        if (jwksUrl != null && !AppCheckProperties.GOOGLE_JWKS_URL.equals(jwksUrl.strip())) {
+            violations.add("rule prod-app-check-jwks-url: app.auth.app-check.jwks-url must be exactly "
+                    + AppCheckProperties.GOOGLE_JWKS_URL + " in prod");
+        }
+    }
+
+    /**
+     * B514 (AUTH-54) — LOG_ONLY is allowed in prod but never silent: ERROR at boot (an alert), repeated hourly by
+     * {@link AppCheckLogOnlyAlarm} while it stays on.
+     */
+    private static void alertAppCheckLogOnly(Environment env, Log log) {
+        String mode = boundOrNull(env, "app.auth.app-check.mode");
+        if (mode != null && "LOG_ONLY".equalsIgnoreCase(mode.strip())) {
+            log.error(AppCheckLogOnlyAlarm.LOG_ONLY_ALERT);
+        }
+    }
 
     private static void checkProdTurnstile(Environment env, List<String> violations) {
         if (!boundFlag(env, "app.turnstile.enabled")) {

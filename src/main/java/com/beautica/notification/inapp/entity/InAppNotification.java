@@ -131,6 +131,14 @@ public class InAppNotification {
     private String moderatedTargetType;
 
     /**
+     * B516 (V249, AUTH-D19) — the changed phone / email AS MASKED AT THE TIME OF THE CHANGE ({@code +380*****4567},
+     * {@code o***@gmail.com}), set only on the two {@code SECURITY_*} types; null on every other type and on security
+     * rows written before V249 ({@code in_app_notification_masked_contact_chk}). Never the unmasked value.
+     */
+    @Column(name = "masked_contact", length = 320, updatable = false)
+    private String maskedContact;
+
+    /**
      * Idempotency key, unique per {@code (recipient_user_id, dedup_key)} — enforced by
      * {@code in_app_notification_dedup_uq}. A re-entrant transition (retry, a per-booking loop
      * inside a whole-visit op) collapses to one item via {@code INSERT ... ON CONFLICT DO NOTHING}.

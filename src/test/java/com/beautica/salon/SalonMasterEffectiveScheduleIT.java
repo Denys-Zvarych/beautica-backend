@@ -5,6 +5,7 @@ import com.beautica.common.ApiResponse;
 import com.beautica.common.TimeZones;
 import com.beautica.master.dto.EffectiveDayResponse;
 import com.beautica.master.dto.EffectiveDaySource;
+import com.beautica.master.entity.WeeklySchedule;
 import com.beautica.salon.dto.SalonMasterEffectiveScheduleResponse;
 import com.beautica.support.NotATimedTest;
 import com.fasterxml.jackson.core.type.TypeReference;
@@ -59,24 +60,29 @@ import static org.assertj.core.api.Assertions.assertThat;
  *
  * <h2>2. The statement ledgers at N = 60 (cases 10 and 11) — measured by SQL capture, never by a counter</h2>
  * The whole justification for this endpoint over an N-request mobile fan-out is that its cost is
- * {@code 3 + ceil(S/50) + ceil(O/50)} statements — three fixed, two CHUNKED, none per-master — where
- * S is weekly-schedule rows and O is non-{@code DAY_OFF} override rows inside the window. Those are
+ * a fixed set of statements, none per-master: since B523 the templates are read through a batched
+ * projection and the override discrete times are batch-fetched in ONE
+ * {@code WeeklySchedule#DISCRETE_TIMES_BATCH_SIZE} chunk ({@code ceil(O/4096)}, was {@code ceil(O/50)}),
+ * where O is non-{@code DAY_OFF} override rows inside the window. Those are
  * TWO independent dimensions and they need two cases: case 10 seeds templates only and pins S; case 11
  * holds the roster and the span constant and varies O alone. Case 10's "no statement may scale"
  * sweep cannot speak for the override dimension at all — with no overrides seeded,
  * {@code schedule_exception_times} is never issued and that half of the sweep passes vacuously.
  *
- * <p>A per-item count reported by a counter is a FLOOR, and — the trap
- * this project has already been bitten by — this codebase runs
- * {@code hibernate.default_batch_fetch_size: 50}, so ANY statement count taken at N &lt; 50 is flat
- * for the wrong reason: Hibernate's lazy {@code WeeklySchedule.discreteTimes} batch-fetch collapses
- * into a single chunk and hides its own N-dependence. N = 60 crosses that boundary deliberately.
+ * <p>A per-item count reported by a counter is a FLOOR, and a count taken below a batch-fetch chunk
+ * is flat for the wrong reason (the chunk hides its own N-dependence). Since B523 the template reads
+ * are ONE array-bound projection ({@code WeeklyScheduleRepository#findTemplateIntervalRowsByMasterIds},
+ * {@code FROM unnest(...) JOIN weekly_schedules}) whatever the roster, and the remaining lazy
+ * discrete-times collections batch in chunks of {@code WeeklySchedule#DISCRETE_TIMES_BATCH_SIZE}
+ * (4096) — no roster in reach crosses a chunk; the former global
+ * {@code hibernate.default_batch_fetch_size} (50) boundary no longer applies to this endpoint.
  *
  * <p>The assertion is therefore a DIFFERENTIAL, not a magic total: going from a 10-master salon to a
- * 60-master salon — six times the roster — must add exactly ONE statement, the second
- * {@code working_interval_times} chunk ({@code ceil(60/50) = 2} vs {@code ceil(10/50) = 1}). A
- * regression to per-master resolution would add 50. The per-table enumeration alongside it names
- * every statement, so a future reader does not have to trust a bare number.
+ * 60-master salon — six times the roster — must add NO statement. A regression to per-master
+ * resolution would add 50; a regression from the projection back to entity-graph reads with a small
+ * batch size would add a chunk. The per-table enumeration alongside it names every statement, and the
+ * template projection is pinned to exactly one statement, so a future reader does not have to trust a
+ * bare number.
  *
  * <p><b>Harness</b>: the dependency-free Hibernate {@link StatementInspector} capture already proven
  * by {@code SalonSiblingProjectionShapeIT}, {@code UserDynamicUpdateShapeIT} and
@@ -116,18 +122,25 @@ class SalonMasterEffectiveScheduleIT extends AbstractIntegrationTest {
 
     static final List<String> CAPTURED_SQL = new CopyOnWriteArrayList<>();
 
-    /** Roster sizes for the differential ledger — 10 is below Hibernate's batch-fetch chunk, 60 above. */
+    /**
+     * Roster sizes for the differential ledger — 6x apart; 60 is above the former 50-key batch-fetch
+     * chunk, so a regression to small-batch entity reads shows as statement growth.
+     */
     private static final int SMALL_ROSTER = 10;
     private static final int LARGE_ROSTER = 60;
 
     /**
-     * Statements a 6x roster is allowed to add: exactly one — the SECOND
-     * {@code working_interval_times} batch-fetch chunk ({@code ceil(60/50)} vs {@code ceil(10/50)}).
+     * Statements a 6x roster is allowed to add: none (B523). Template discrete times are read through
+     * the batched projection and every discrete-times collection that is still batch-fetched carries
+     * {@code @BatchSize(WeeklySchedule.DISCRETE_TIMES_BATCH_SIZE)}, so no roster in reach crosses a chunk.
      */
-    private static final long ALLOWED_STATEMENT_GROWTH = 1L;
+    private static final long ALLOWED_STATEMENT_GROWTH = 0L;
 
-    /** Mirrors {@code spring.jpa.properties.hibernate.default_batch_fetch_size} in application.yml. */
-    private static final int BATCH_FETCH_SIZE = 50;
+    /**
+     * Mirrors {@code @BatchSize} on {@code ScheduleException#getDiscreteTimes()} (B523 audit cycle 2) — the
+     * chunk {@code schedule_exception_times} is hydrated in; was the global default of 50.
+     */
+    private static final int BATCH_FETCH_SIZE = WeeklySchedule.DISCRETE_TIMES_BATCH_SIZE;
 
     /**
      * Overrides per master in case 11's DENSE fixture. 60 masters x 10 = 600 {@code CUSTOM_HOURS}
@@ -475,17 +488,17 @@ class SalonMasterEffectiveScheduleIT extends AbstractIntegrationTest {
     // ── 10-11: the statement ledgers ───────────────────────────────────────────────────────
 
     @Test
-    @NotATimedTest(reason = "The 70-master fixture IS the experiment: the ledger only means "
-            + "anything above hibernate.default_batch_fetch_size (50), so the seeding cost this "
-            + "test pays is the property under test, not overhead that could be trimmed away. "
+    @NotATimedTest(reason = "The 70-master fixture IS the experiment: the differential only catches "
+            + "a regression to small-batch (50-key) entity reads with a roster above that chunk, so the "
+            + "seeding cost this test pays is the property under test, not overhead that could be trimmed away. "
             + "The wall clock here measures how fast Postgres ingests 70 masters, never whether "
             + "the read path regressed — the statement differential is what does that.")
-    @DisplayName("10 — statement count is flat in roster size: 10 -> 60 masters adds exactly one "
-            + "statement (the second batch-fetch chunk), not fifty")
-    void should_keepStatementCountFlat_when_rosterGrowsAcrossTheBatchFetchBoundary() throws Exception {
-        // Arrange — two salons, one below and one above hibernate.default_batch_fetch_size (50).
-        // Templates only, no overrides: this isolates the ONE statement in the ledger that is
-        // legitimately N-dependent (the chunked discreteTimes batch-fetch) from every other.
+    @DisplayName("10 — statement count is flat in roster size: 10 -> 60 masters adds no statement, "
+            + "not fifty")
+    void should_keepStatementCountFlat_when_rosterGrowsSixfold() throws Exception {
+        // Arrange — two salons, 10 and 60 masters (60 is above the former 50-key batch-fetch chunk).
+        // Templates only, no overrides: this isolates the template reads (batched projection since
+        // B523, no per-chunk discreteTimes batch-fetch) from every other statement.
         Fixture small = salonWithOwner("ledger-small");
         Fixture large = salonWithOwner("ledger-large");
         seedRoster(small.salonId(), SMALL_ROSTER);
@@ -509,7 +522,7 @@ class SalonMasterEffectiveScheduleIT extends AbstractIntegrationTest {
 
         // Assert — the differential is the load-bearing claim; the enumeration names every statement.
         assertThat((long) largeSql.size() - smallSql.size())
-                .as("6x the roster must add at most the extra batch-fetch chunk. "
+                .as("6x the roster must add no statement. "
                         + "small(%d)=%s%nlarge(%d)=%s",
                         SMALL_ROSTER, byTable(smallSql), LARGE_ROSTER, byTable(largeSql))
                 .isEqualTo(ALLOWED_STATEMENT_GROWTH);
@@ -519,8 +532,11 @@ class SalonMasterEffectiveScheduleIT extends AbstractIntegrationTest {
                         LARGE_ROSTER, String.join("\n", largeSql))
                 .containsEntry("masters", 1L)
                 .containsEntry("schedule_exceptions", 1L)
-                .containsEntry("weekly_schedules", 1L)
-                .containsEntry("working_interval_times", 2L);
+                .doesNotContainKey("working_interval_times");
+        assertThat(templateProjectionReads(largeSql))
+                .as("the templates are read by ONE batched projection (unnest JOIN weekly_schedules) — "
+                        + "full capture:%n%s", String.join("\n", largeSql))
+                .isEqualTo(1L);
         // Scoped to THIS fixture's tables. It cannot speak for schedule_exception_times, which is never
         // issued here because nothing seeds an override — that dimension is case 11's.
         assertThat(byTable(largeSql))
@@ -532,20 +548,20 @@ class SalonMasterEffectiveScheduleIT extends AbstractIntegrationTest {
 
     @Test
     @NotATimedTest(reason = "Same reasoning as case 10: the 120-master, 660-override fixture IS the "
-            + "experiment. The override dimension only means anything above "
-            + "hibernate.default_batch_fetch_size (50), so the seeding cost is the property under "
-            + "test rather than trimmable overhead. The wall clock measures Postgres ingest, never "
+            + "experiment. The override differential only catches a regression to small-batch (50-key) "
+            + "discrete-times hydration with an override count above that chunk, so the seeding cost is the "
+            + "property under test rather than trimmable overhead. The wall clock measures Postgres ingest, never "
             + "the read path — the statement differential does that.")
     @DisplayName("11 — statement count is flat in OVERRIDE count: 60 -> 600 CUSTOM_HOURS rows in the "
-            + "window adds only the extra schedule_exception_times chunks, not 540 statements")
-    void should_keepStatementCountFlat_when_overrideCountGrowsAcrossTheBatchFetchBoundary()
+            + "window share ONE schedule_exception_times batch, not 540 statements")
+    void should_keepStatementCountFlat_when_overrideCountGrowsTenfold()
             throws Exception {
         // Arrange — case 10 seeds TEMPLATES ONLY, which leaves the whole override dimension
         // unmeasured: its `no statement may scale with N` sweep passes vacuously on
         // schedule_exception_times because that table is never read there. This case supplies the
         // missing dimension. ScheduleException.discreteTimes is LAZY and batch-fetched, and
         // ScheduleMapper#toOverrideDiscreteTimes touches it for EVERY non-DAY_OFF override, so the
-        // cost of this endpoint is ceil(O/50) statements in O = CUSTOM_HOURS rows inside the window
+        // cost of this endpoint is ceil(O/BATCH_FETCH_SIZE) statements in O = CUSTOM_HOURS rows inside the window
         // — NOT flat, and the javadoc that used to claim "1 roster query + 2 schedule queries, flat
         // in roster size" was wrong on exactly this term.
         //
@@ -590,7 +606,6 @@ class SalonMasterEffectiveScheduleIT extends AbstractIntegrationTest {
                         denseOverrides, String.join("\n", denseSql))
                 .containsEntry("masters", 1L)
                 .containsEntry("schedule_exceptions", 1L)
-                .containsEntry("weekly_schedules", 1L)
                 .containsEntry("schedule_exception_times", chunks(denseOverrides));
     }
 
@@ -729,6 +744,14 @@ class SalonMasterEffectiveScheduleIT extends AbstractIntegrationTest {
     /** Hibernate batch-fetch chunk count for {@code rows} uninitialised proxies of one type. */
     private static long chunks(long rows) {
         return (rows + BATCH_FETCH_SIZE - 1) / BATCH_FETCH_SIZE;
+    }
+
+    /** Statements that are the batched template projection: {@code FROM unnest(...) JOIN weekly_schedules}. */
+    private static long templateProjectionReads(List<String> sql) {
+        return sql.stream()
+                .map(statement -> statement.toLowerCase(Locale.ROOT))
+                .filter(statement -> statement.contains("from unnest(") && statement.contains("join weekly_schedules"))
+                .count();
     }
 
     /** Groups captured statements by the table in their {@code FROM} clause. */

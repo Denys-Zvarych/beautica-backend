@@ -42,6 +42,9 @@ public class SecurityConfig {
 
     private static final Logger log = LoggerFactory.getLogger(SecurityConfig.class);
 
+    /** BCrypt cost factor; {@code AuthService.DUMMY_PASSWORD_HASH} must be hashed at the same cost. */
+    public static final int BCRYPT_STRENGTH = 10;
+
     /** Same-origin POSTs from the server-rendered admin review pages; see {@link #corsConfigurationSource()}. */
     private static final List<String> REVIEW_POST_PATHS = List.of(
             "/api/v1/service-categories/requests/approve",
@@ -97,6 +100,9 @@ public class SecurityConfig {
                     auth.requestMatchers(
                             "/api/v1/auth/register",
                             "/api/v1/auth/register/independent-master",
+                            // B514 (AUTH-41) — phone step of registration; the caller has no account yet.
+                            "/api/v1/auth/register/phone/otp/send",
+                            "/api/v1/auth/register/phone/otp/verify",
                             "/api/v1/auth/login",
                             "/api/v1/auth/refresh",
                             "/api/v1/auth/invite/accept",
@@ -397,7 +403,7 @@ public class SecurityConfig {
 
     @Bean
     public PasswordEncoder passwordEncoder() {
-        return new BCryptPasswordEncoder(10);
+        return new BCryptPasswordEncoder(BCRYPT_STRENGTH);
     }
 
     @Bean

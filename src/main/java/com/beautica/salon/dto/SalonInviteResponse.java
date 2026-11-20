@@ -28,6 +28,10 @@ import java.util.UUID;
  *                       scrubbed address does not appear here rewritten; it does not appear here
  *                       at all. An address still listed by this endpoint therefore belongs to a
  *                       LIVE invite of a salon the caller owns.
+ *                       B520: {@code null} on a phone invite (every invite since B520).
+ * @param recipientPhone B520 (SAL-48) — the invited {@code +380} number, shown in full to the salon's owner/admin who
+ *                       typed it; {@code null} on a pre-B520 email invite. A pre-B520 email invite still PENDING is
+ *                       not listed at all (it can no longer be accepted).
  * @param role           {@link com.beautica.auth.Role} name the invite grants
  * @param status         derived {@link InviteStatus} name — see {@link #from(InviteHistoryRow, Instant)}
  * @param createdAt      when the invite was dispatched (the sort key of the history listing)
@@ -36,6 +40,7 @@ import java.util.UUID;
 public record SalonInviteResponse(
         UUID inviteId,
         String recipientEmail,
+        String recipientPhone,
         String role,
         String status,
         Instant createdAt,
@@ -77,6 +82,7 @@ public record SalonInviteResponse(
         return new SalonInviteResponse(
                 row.id(),
                 row.email(),
+                row.phone(),
                 row.role().name(),
                 deriveStatus(row, now).name(),
                 row.createdAt(),

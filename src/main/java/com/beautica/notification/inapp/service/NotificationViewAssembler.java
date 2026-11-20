@@ -186,7 +186,9 @@ public class NotificationViewAssembler {
                 : bookingRepository.findAllByIdsWithGraph(List.copyOf(bookingIdsToHydrate)).stream()
                         .collect(Collectors.toMap(Booking::getId, Function.identity()));
 
-        Set<UUID> subjectUserIds = idsOf(rows, InAppNotification::getSubjectUserId);
+        // B516: a security notice reads its stored masked value, never its subject row — no user load for it.
+        Set<UUID> subjectUserIds = idsOf(rows.stream().filter(r -> !r.getType().isSecurityNotice()).toList(),
+                InAppNotification::getSubjectUserId);
         Map<UUID, User> subjectsById = subjectUserIds.isEmpty()
                 ? Map.of()
                 : userRepository.findAllById(subjectUserIds).stream()
@@ -288,6 +290,9 @@ public class NotificationViewAssembler {
         if (row.getType().isModerationOutcome()) {
             return resolveModerationOutcome(row);
         }
+        if (row.getType().isSecurityNotice()) {
+            return resolveSecurityNotice(row);
+        }
         if (row.getType() == InAppNotificationType.INVITE_ACCEPTED) {
             return resolveInviteAccepted(row, actorId, actorRole, hydrated.subjectsById(), facts);
         }
@@ -307,6 +312,25 @@ public class NotificationViewAssembler {
     private static NotificationResponse resolveModerationOutcome(InAppNotification row) {
         NotificationParams params = NotificationParams.moderationOutcome(
                 ModeratedContentKind.fromTargetType(row.getModeratedTargetType()));
+        return new NotificationResponse(row.getId(), row.getType(), row.getCreatedAt(), row.getReadAt() != null,
+                NotificationTarget.none(null), params);
+    }
+
+    // ── B516: account security notices ──────────────────────────────────────────────────────────
+
+    /**
+     * AUTH-D19 — the recipient IS the subject (the write path targets nobody else), so no visibility check applies.
+     * The masked value is the one stored on the row when the change happened ({@code masked_contact}, V249) — never
+     * the account's current phone / email, which a later change would have replaced. A row written before V249 has
+     * none and yields null params (the password-reset notice, which never has one, keeps params with no value).
+     * Target is always NONE.
+     */
+    private static NotificationResponse resolveSecurityNotice(InAppNotification row) {
+        String masked = row.getMaskedContact();
+        // AUTH-D26 (a): the password-reset notice never carries a value, yet its copy is complete — params stay non-null
+        // so the push renders the notice text instead of the lost-access generic body.
+        NotificationParams params = masked == null && row.getType() != InAppNotificationType.SECURITY_PASSWORD_RESET
+                ? null : NotificationParams.securityNotice(masked);
         return new NotificationResponse(row.getId(), row.getType(), row.getCreatedAt(), row.getReadAt() != null,
                 NotificationTarget.none(null), params);
     }

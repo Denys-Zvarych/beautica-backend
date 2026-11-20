@@ -37,6 +37,9 @@ import static com.github.tomakehurst.wiremock.client.WireMock.urlMatching;
         // First-deploy authorisation for the DB environment stamp (Phase 368 N2); ignored once stamped.
         "BEAUTICA_DB_STAMP_INIT=staging",
         "app.rate-limit.otp-send-capacity=100000",
+        // B514: staging runs App Check in LOG_ONLY, which needs a project number and an app id to boot.
+        "APP_AUTH_APP_CHECK_PROJECT_NUMBER=123456789012",
+        "APP_AUTH_APP_CHECK_APP_IDS=1:123456789012:android:0123456789abcdef",
         // TestAsyncConfig (from AbstractIntegrationTest) redefines emailExecutor; application-test.yml normally allows it.
         "spring.main.allow-bean-definition-overriding=true"
 })

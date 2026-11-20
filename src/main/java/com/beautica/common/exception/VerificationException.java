@@ -4,7 +4,11 @@ import org.springframework.http.HttpStatus;
 
 public class VerificationException extends RuntimeException {
 
-    public enum Code { INVALID_CODE, CODE_EXPIRED, ALREADY_VERIFIED }
+    /**
+     * {@code CURRENT_PASSWORD_INVALID} (B516, AUTH-D19): the verify step of a phone change / email add or change got a
+     * wrong or missing current password — a 400 (never 401, the app must not sign out) that says nothing about the code.
+     */
+    public enum Code { INVALID_CODE, CODE_EXPIRED, ALREADY_VERIFIED, CURRENT_PASSWORD_INVALID }
 
     private final Code code;
 

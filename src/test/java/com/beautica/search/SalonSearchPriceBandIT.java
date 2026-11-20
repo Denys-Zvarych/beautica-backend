@@ -428,29 +428,19 @@ class SalonSearchPriceBandIT extends AbstractIntegrationTest {
     }
 
     /**
-     * Case 26 — the residual OCCUPANCY divergence, pinned as DELIBERATE.
+     * Case 26 — the OCCUPANCY divergence is CLOSED (SRCH-31, user decision 2026-11-18).
      *
-     * <p>Follows the convention {@code SalonCatalogueVisibilityIT
-     * #should_notBeVisible_when_masterHasNoWorkingHours_pinningD1AsDeliberate} established for a
-     * deliberate rule: state the asymmetry as an assertion so a future "fix" that closes it in SQL
-     * — or a refactor that closes it by accident — turns this RED instead of silently passing, and
-     * the reviewer reads WHY before changing it.
-     *
-     * <p><b>Why it is deliberate.</b> {@code SalonSearchSql}'s lateral gates on the STRUCTURAL
-     * half of bookability (a schedule source exists inside the booking window) because that is
-     * expressible as two index-backed {@code EXISTS}es. The catalogue's gate additionally walks the
-     * free-slot calendar per master over 180 days in Java — day-off overrides, CONFIRMED bookings
-     * filling a day, elapsed {@code EXPLICIT_TIMES}. Replicating THAT in SQL means either a
-     * per-row function call inside a paginated Top-N over every salon in the result set, or a
-     * second implementation of the slot calculator — the fork {@code ServicePricing} and
-     * {@code SlotCalculationService} exist to prevent. Search answers "what price range might I
-     * find at this salon" (a discovery band); the catalogue answers "what can I book here right
-     * now". Do not merge the two predicates.
+     * <p>This case used to pin the asymmetry as deliberate: search gated on schedule STRUCTURE and
+     * kept a salon's band while its catalogue was empty. Search now resolves the catalogue's own
+     * free-slot verdict up front ({@code StrictBookableResolver} → {@code filterBookableAssignmentsBatch})
+     * and binds the surviving assignment ids into the SQL — no second slot calculator in SQL — so a
+     * salon whose only master is day-offed across the whole window is no longer a search result, in
+     * agreement with its empty catalogue.
      */
     @Test
-    @DisplayName("Case 26: a structurally-scheduled but fully day-offed master KEEPS the search "
-            + "band while its catalogue is EMPTY — pinning the occupancy divergence as deliberate")
-    void should_keepTheSearchBand_when_theCatalogueIsEmptyForAFullyOccupiedMaster_pinningTheOccupancyDivergenceAsDeliberate() {
+    @DisplayName("Case 26 (occupancy closed): a structurally-scheduled but fully day-offed master no longer "
+            + "lists or prices the salon — search agrees with the EMPTY catalogue")
+    void should_notListTheSalon_when_theCatalogueIsEmptyForAFullyOccupiedMaster() {
         UUID salonId = seedSalon();
         UUID masterId = seedSalonMaster(salonId);
 
@@ -462,21 +452,16 @@ class SalonSearchPriceBandIT extends AbstractIntegrationTest {
         seedDayOffAcrossTheWholeBookingWindow(masterId);
         seedService(masterId, salonId, "FIXED", new BigDecimal("777.00"), null, null, null, null);
 
-        JsonNode searchRow = onlySalonRow(restTemplate.exchange(
+        JsonNode data = readData(restTemplate.exchange(
                 SALONS_URL + "?location.cityId=" + testCityId() + "&category=MANICURE&page=0&size=20",
-                HttpMethod.GET, anonymous(), String.class), salonId);
+                HttpMethod.GET, anonymous(), String.class));
         ResponseEntity<String> catalogueResp = restTemplate.getForEntity(
                 "/api/v1/salons/" + salonId + "/services", String.class);
 
-        assertThat(searchRow.path("priceMin").decimalValue())
-                .as("DELIBERATE: search keeps the discovery band — it gates on schedule STRUCTURE, "
-                        + "never on occupancy")
-                .isEqualByComparingTo(new BigDecimal("777.00"));
-        assertThat(catalogueServiceCount(catalogueResp))
-                .as("DELIBERATE: the catalogue is empty for the same salon, because its gate DOES "
-                        + "walk the calendar. If you are here because you closed this gap in SQL, "
-                        + "read this test's javadoc first — the asymmetry is the contract.")
-                .isZero();
+        assertThat(data.path("data").findValuesAsText("salonId"))
+                .as("the strict verdict drops the only (fully day-offed) master, so the salon is gone")
+                .doesNotContain(salonId.toString());
+        assertThat(catalogueServiceCount(catalogueResp)).as("the catalogue agrees: nothing bookable").isZero();
     }
 
     // ── Cases 27-29 — the bookability decision (2026-10-05) CLOSED the two divergences cycle-3

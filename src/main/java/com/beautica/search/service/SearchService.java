@@ -302,6 +302,26 @@ public class SearchService {
     // Source of the bound "today" every bookability fragment reads (MasterBookabilitySql#TODAY_PARAM):
     // the Kyiv civil date of the app Clock, so search and the strict slot verdict agree on the date.
     private final ScheduleDateMath scheduleDateMath;
+    // Strict free-slot verdict (SRCH-30/31): search lists only masters a client can actually book.
+    private final StrictBookableResolver strictBookableResolver;
+
+    /** Bind name of the strict-bookable master id array (SRCH-30). */
+    private static final String STRICT_MASTER_IDS_PARAM = "strictMasterIds";
+
+    /** Bind name of the strict-bookable assignment id array (SRCH-30 service filter, SRCH-31). */
+    private static final String STRICT_ASSIGNMENT_IDS_PARAM = SalonSearchSql.STRICT_ASSIGNMENT_IDS_PARAM;
+
+    /** Bind name of the candidate-query row limit ({@link StrictBookableResolver#CANDIDATE_CAP} + 1). */
+    private static final String CANDIDATE_LIMIT_PARAM = "candidateLimit";
+
+    /**
+     * {@code IN (SELECT unnest(:strictAssignmentIds))} — the strict assignment membership test used
+     * inside correlated sub-queries and laterals. A hashed semi-join: Postgres hashes the unnested
+     * array once per statement, where {@code = ANY(:arr)} re-scans the whole array (up to thousands
+     * of ids) linearly for every row the sub-plan visits.
+     */
+    private static final String IN_STRICT_ASSIGNMENTS =
+            " IN (SELECT unnest(:" + SalonSearchSql.STRICT_ASSIGNMENT_IDS_PARAM + ")) ";
 
     /**
      * Discover masters matching optional location (FK, district-primary),
@@ -378,6 +398,16 @@ public class SearchService {
             }
         }
 
+        // SRCH-30: resolve the strict-bookable set from an unpaged ids-only candidate query that
+        // carries the SAME filters (structural predicate kept as the cheap pre-filter). Feeding the
+        // set into the paged SQL keeps page contents and COUNT(*) OVER() exact — no holes. An empty
+        // set is an empty page with no main query.
+        StrictBookableResolver.StrictBookableSet strict = resolveStrictMasters(filters);
+        if (strict.isEmpty()) {
+            writeMemoizedTotal(SearchCacheNames.MASTERS_TOTAL, totalKey, 0L);
+            return new PageImpl<>(List.of(), pageable, 0L);
+        }
+
         // PERF-M1: single query — COUNT(*) OVER() is column index 10.
         // No separate count round-trip on cache miss.
         //
@@ -389,7 +419,7 @@ public class SearchService {
         // bound as named :limit/:offset params on that subquery rather than via
         // Hibernate's setMaxResults/setFirstResult (which would wrap the outer
         // lateral and re-expand the work).
-        SqlAndParams dataSql = buildMasterSearchSql(filters, pageable);
+        SqlAndParams dataSql = buildMasterSearchSql(filters, strict, pageable);
         Query dataQuery = entityManager.createNativeQuery(dataSql.sql());
         bind(dataQuery, dataSql);
 
@@ -401,7 +431,7 @@ public class SearchService {
             // true total with a first-page probe. See probeTotalForEmptyPage.
             long recovered = pageable.getOffset() == 0 ? 0L
                     : probeTotalForEmptyPage(
-                            buildMasterSearchSql(filters, TOTAL_PROBE_PAGE), TOTAL_COUNT_IDX);
+                            buildMasterSearchSql(filters, strict, TOTAL_PROBE_PAGE), TOTAL_COUNT_IDX);
             writeMemoizedTotal(SearchCacheNames.MASTERS_TOTAL, totalKey, recovered);
             return new PageImpl<>(List.of(), pageable, recovered);
         }
@@ -534,10 +564,20 @@ public class SearchService {
             }
         }
 
+        // SRCH-31: only salons with a strictly bookable master service are listed.
+        StrictBookableResolver.StrictBookableSet strict = resolveStrictSalonMasters(new SalonCandidateFilters(
+                cityId, districtId, category, query.tokens(), List.of(), minPrice, maxPrice, sort, List.of()));
+        if (strict.isEmpty()) {
+            writeMemoizedTotal(SearchCacheNames.SALONS_TOTAL, totalKey, 0L);
+            return new PageImpl<>(List.of(), pageable, 0L);
+        }
+        UUID[] strictAssignmentIds = strict.assignmentIdArray();
+
         // The ordering is an allow-listed enum NAME bound as :sortMode — caller text
         // never reaches the ORDER BY (see SalonSearchSql.STATIC_ORDER_LIMIT_TAIL).
         List<SalonSearchProjection> projections = findSalonsByLocation(
-                cityId, districtId, category, query.tokens(), minPrice, maxPrice, sort, pageable);
+                cityId, districtId, category, query.tokens(), minPrice, maxPrice, sort, pageable,
+                strictAssignmentIds);
 
         if (projections.isEmpty()) {
             // Out-of-range page: recover the true total from a first-page probe of the
@@ -546,7 +586,7 @@ public class SearchService {
             if (pageable.getOffset() > 0) {
                 List<SalonSearchProjection> probe = findSalonsByLocation(
                         cityId, districtId, category, query.tokens(),
-                        minPrice, maxPrice, sort, TOTAL_PROBE_PAGE);
+                        minPrice, maxPrice, sort, TOTAL_PROBE_PAGE, strictAssignmentIds);
                 recovered = probe.isEmpty() ? 0L : probe.get(0).getTotalCount();
             }
             writeMemoizedTotal(SearchCacheNames.SALONS_TOTAL, totalKey, recovered);
@@ -598,9 +638,17 @@ public class SearchService {
             }
         }
 
+        // SRCH-31 — see searchSalons.
+        StrictBookableResolver.StrictBookableSet strict = resolveStrictSalonMasters(new SalonCandidateFilters(
+                cityId, districtId, category, qTokens, qCategories, minPrice, maxPrice, sort, serviceTypes));
+        if (strict.isEmpty()) {
+            writeMemoizedTotal(SearchCacheNames.SALONS_TOTAL, totalKey, 0L);
+            return new PageImpl<>(List.of(), pageable, 0L);
+        }
+
         SqlAndParams dataSql = buildSalonSearchSql(
                 cityId, districtId, category, qTokens, qCategories, minPrice, maxPrice,
-                sort, serviceTypes, pageable);
+                sort, serviceTypes, strict, pageable);
         Query dataQuery = entityManager.createNativeQuery(dataSql.sql());
         bind(dataQuery, dataSql);
 
@@ -613,7 +661,7 @@ public class SearchService {
             long recovered = pageable.getOffset() == 0 ? 0L
                     : probeTotalForEmptyPage(
                             buildSalonSearchSql(cityId, districtId, category, qTokens, qCategories,
-                                    minPrice, maxPrice, sort, serviceTypes, TOTAL_PROBE_PAGE),
+                                    minPrice, maxPrice, sort, serviceTypes, strict, TOTAL_PROBE_PAGE),
                             SALON_TOTAL_COUNT_IDX);
             writeMemoizedTotal(SearchCacheNames.SALONS_TOTAL, totalKey, recovered);
             return new PageImpl<>(List.of(), pageable, recovered);
@@ -666,7 +714,8 @@ public class SearchService {
      */
     private List<SalonSearchProjection> findSalonsByLocation(
             UUID cityId, UUID districtId, String category, List<String> qTokens,
-            BigDecimal minPrice, BigDecimal maxPrice, SearchSort sort, Pageable pageable) {
+            BigDecimal minPrice, BigDecimal maxPrice, SearchSort sort, Pageable pageable,
+            UUID[] strict) {
         boolean noPriceFilter = minPrice == null && maxPrice == null;
         // The static queries declare a fixed number of :qN slots, so the token
         // patterns are padded with null (an unbound-equivalent, always-true branch).
@@ -679,24 +728,138 @@ public class SearchService {
         if (districtId != null) {
             return noPriceFilter
                     ? salonRepository.findActiveByDistrictIdNoPriceAsProjection(
-                            districtId, category, q[0], q[1], q[2], q[3], sortMode, limit, offset, today)
+                            districtId, category, q[0], q[1], q[2], q[3], sortMode, limit, offset, today, strict)
                     : salonRepository.findActiveByDistrictIdAsProjection(
                             districtId, category, q[0], q[1], q[2], q[3],
-                            minPrice, maxPrice, sortMode, limit, offset, today);
+                            minPrice, maxPrice, sortMode, limit, offset, today, strict);
         }
         if (cityId != null) {
             return noPriceFilter
                     ? salonRepository.findActiveByCityIdNoPriceAsProjection(
-                            cityId, category, q[0], q[1], q[2], q[3], sortMode, limit, offset, today)
+                            cityId, category, q[0], q[1], q[2], q[3], sortMode, limit, offset, today, strict)
                     : salonRepository.findActiveByCityIdAsProjection(
                             cityId, category, q[0], q[1], q[2], q[3],
-                            minPrice, maxPrice, sortMode, limit, offset, today);
+                            minPrice, maxPrice, sortMode, limit, offset, today, strict);
         }
         return noPriceFilter
                 ? salonRepository.findByIsActiveTrueNoPriceAsProjection(
-                        q[0], q[1], q[2], q[3], category, sortMode, limit, offset, today)
+                        q[0], q[1], q[2], q[3], category, sortMode, limit, offset, today, strict)
                 : salonRepository.findByIsActiveTrueAsProjection(
-                        q[0], q[1], q[2], q[3], minPrice, maxPrice, category, sortMode, limit, offset, today);
+                        q[0], q[1], q[2], q[3], minPrice, maxPrice, category, sortMode, limit, offset, today, strict);
+    }
+
+    /**
+     * Candidate masters for salon search (SRCH-31): structurally bookable active masters of the
+     * active salons that pass the SAME salon filters as the search itself — locality, {@code q}
+     * (structural form), {@code serviceTypeSlugs}, price band and, on the static path, the category
+     * gate — ordered by the requested salon sort, ids only, bounded by
+     * {@link StrictBookableResolver#CANDIDATE_CAP} {@code + 1}; then the strict verdict. Filtering
+     * here is what makes the cap drop the right rows: without it a broad city would resolve its
+     * first 2 000 masters by id, whatever the client searched for.
+     *
+     * <p>Every structural predicate is a SUPERSET of its strict counterpart in the main query (the
+     * strict assignment set is a subset of the structural one, and the candidate price band is the
+     * widest of both band formulas), so no salon the main query would list is ever lost here — the
+     * main query re-applies every filter strictly. The salon then gates on the returned ASSIGNMENT
+     * ids, so it is listed only when a master of THAT salon has a strictly bookable service (a
+     * matching one under a filter).
+     */
+    private StrictBookableResolver.StrictBookableSet resolveStrictSalonMasters(SalonCandidateFilters f) {
+        SqlAndParams candidateSql = buildSalonCandidateSql(f);
+        return resolveCandidates(candidateSql.sql(), candidateSql.params(), "salons");
+    }
+
+    /**
+     * Salon filters the candidate query mirrors (see {@link #resolveStrictSalonMasters}).
+     * {@code qCategories} and {@code serviceTypes} are empty on the static path.
+     */
+    private record SalonCandidateFilters(
+            UUID cityId, UUID districtId, String category, List<String> qTokens,
+            List<String> qCategories, BigDecimal minPrice, BigDecimal maxPrice, SearchSort sort,
+            List<ResolvedServiceType> serviceTypes) {
+
+        /** The static {@code SalonRepository} path: category is a membership gate there. */
+        boolean staticPath() {
+            return serviceTypes.isEmpty() && qCategories.isEmpty();
+        }
+    }
+
+    private static SqlAndParams buildSalonCandidateSql(SalonCandidateFilters f) {
+        StringBuilder sb = new StringBuilder("SELECT m.id FROM salons s ");
+        Map<String, Object> params = new LinkedHashMap<>();
+        boolean hasCategory = f.category() != null;
+        appendSalonCandidatePriceLateral(sb, hasCategory, f.serviceTypes());
+        sb.append("JOIN masters m ON m.salon_id = s.id AND m.is_active = true ")
+                .append("WHERE s.is_active = true ")
+                .append("AND").append(MasterBookabilitySql.bookableMaster("m")).append(' ');
+        if (f.districtId() != null) {
+            sb.append("AND s.district_id = :districtId ");
+            params.put("districtId", f.districtId());
+        } else if (f.cityId() != null) {
+            sb.append("AND s.city_id = :cityId ");
+            params.put("cityId", f.cityId());
+        }
+        for (int i = 0; i < f.qTokens().size(); i++) {
+            params.put(Q_PARAM_PREFIX + i, likeContains(f.qTokens().get(i)));
+        }
+        bindQueryCategoryParams(f.qCategories(), params);
+        sb.append(SalonSearchSql.structuralQGroupPredicate(f.qTokens().size(), f.qCategories().size()));
+        if (hasCategory) {
+            params.put("category", f.category());
+            // SRCH-33: a salon is a candidate only with a matching-category service row.
+            sb.append("AND pr.candidate_rows > 0 ");
+        }
+        if (f.minPrice() != null) {
+            sb.append("AND pr.pmax >= :minPrice ");
+            params.put("minPrice", f.minPrice());
+        }
+        if (f.maxPrice() != null) {
+            sb.append("AND pr.pmin <= :maxPrice ");
+            params.put("maxPrice", f.maxPrice());
+        }
+        appendSalonServiceTypeExists(sb, f.serviceTypes(), params);
+        appendSalonOrderBy(sb, f.sort());
+        sb.append(", m.id LIMIT :").append(CANDIDATE_LIMIT_PARAM);
+        params.put(CANDIDATE_LIMIT_PARAM, StrictBookableResolver.CANDIDATE_CAP + 1);
+        return new SqlAndParams(sb.toString(), params);
+    }
+
+    /**
+     * Structural price band of the salon candidate query: the active salon services of its active,
+     * scheduled masters (no strict gate — the strict set is what this query feeds), scoped like the
+     * search band (slugs and category). The ceiling is the GREATER of the static and dynamic band
+     * formulas, so the candidate band contains the band of whichever path then runs and a price
+     * filter can never drop a salon that path would list.
+     */
+    private static void appendSalonCandidatePriceLateral(
+            StringBuilder sb, boolean hasCategory, List<ResolvedServiceType> serviceTypes) {
+        sb.append("LEFT JOIN LATERAL (")
+                .append("SELECT MIN(COALESCE(ms.price_override, sd.base_price)) AS pmin, ")
+                .append("MAX(GREATEST(")
+                .append("COALESCE(ms.price_override, ")
+                .append("CASE WHEN sd.price_type = 'RANGE' THEN sd.price_max ELSE sd.base_price END), ")
+                .append("CASE WHEN COALESCE(ms.price_type_override, sd.price_type) = 'RANGE' ")
+                .append("THEN COALESCE(ms.price_max_override, sd.price_max) ")
+                .append("ELSE COALESCE(ms.price_override, sd.base_price) END)) AS pmax, ")
+                .append("COUNT(*) AS candidate_rows ")
+                .append("FROM master_services ms ")
+                .append("JOIN service_definitions sd ON sd.id = ms.service_def_id AND sd.is_active = true ")
+                .append("JOIN masters mad ON mad.id = ms.master_id AND mad.is_active = true ")
+                .append("AND mad.salon_id = s.id ")
+                .append("WHERE sd.owner_type = 'SALON' AND sd.owner_id = s.id ")
+                .append("AND ms.is_active = true ")
+                .append("AND").append(MasterBookabilitySql.hasSchedule("mad")).append(' ');
+        if (!serviceTypes.isEmpty()) {
+            sb.append("AND (");
+            appendServiceTypeMatchDisjunction(sb, "sd", serviceTypes.size());
+            sb.append(") ");
+        }
+        // Category is bound whenever present, so it must be emitted on the same flag —
+        // independent of slugs (SRCH-33: category is a strict service filter).
+        if (hasCategory) {
+            sb.append("AND sd.category = :category ");
+        }
+        sb.append(") pr ON true ");
     }
 
     // ── location seam (M2) ────────────────────────────────────────────────────
@@ -1067,13 +1230,15 @@ public class SearchService {
      * {@code setMaxResults}/{@code setFirstResult} would wrap the outer lateral
      * and re-expand it over the full district.
      */
-    private static SqlAndParams buildMasterSearchSql(MasterSearchFilters filters, Pageable pageable) {
+    private static SqlAndParams buildMasterSearchSql(
+            MasterSearchFilters filters, StrictBookableResolver.StrictBookableSet strict, Pageable pageable) {
         StringBuilder inner = new StringBuilder();
         Map<String, Object> params = new LinkedHashMap<>();
 
         appendDataSelect(inner);
         appendFromClause(inner);
         appendWhereClause(inner, filters, params);
+        appendStrictMasterPredicate(inner, filters, strict, params);
         appendOrderBy(inner, filters.sort());
         // Inner Top-N: LIMIT/OFFSET bound here so the index-ordered scan feeds a
         // bounded ~pageSize row set into the serviceNames lateral above.
@@ -1085,6 +1250,103 @@ public class SearchService {
                 inner.toString(), filters.sort(), filters.category() != null,
                 filters.serviceTypes(), filters.qTokens().size(), filters.qCategories());
         return new SqlAndParams(sql, params);
+    }
+
+    /**
+     * Runs the ids-only candidate query for master search and resolves the strict-bookable subset
+     * (SRCH-30). Same FROM / WHERE as {@link #buildMasterSearchSql} (so every filter narrows the
+     * candidates, and the structural {@code MasterBookabilitySql} rule stays the cheap pre-filter),
+     * same ORDER BY (so a cap hit keeps the rows the first pages would show), unpaged but bounded
+     * by {@link StrictBookableResolver#CANDIDATE_CAP} {@code + 1}.
+     */
+    private StrictBookableResolver.StrictBookableSet resolveStrictMasters(MasterSearchFilters filters) {
+        StringBuilder sb = new StringBuilder("SELECT m.id ");
+        Map<String, Object> params = new LinkedHashMap<>();
+        appendFromClause(sb);
+        appendWhereClause(sb, filters, params);
+        appendOrderBy(sb, filters.sort());
+        sb.append(" LIMIT :").append(CANDIDATE_LIMIT_PARAM);
+        params.put(CANDIDATE_LIMIT_PARAM, StrictBookableResolver.CANDIDATE_CAP + 1);
+        return resolveCandidates(sb.toString(), params, "masters");
+    }
+
+    /**
+     * Hands an ids-only candidate query to the resolver, with the bookability "today" added when the
+     * SQL splices a {@code MasterBookabilitySql} fragment (same rule as {@link #bind}).
+     */
+    private StrictBookableResolver.StrictBookableSet resolveCandidates(
+            String sql, Map<String, Object> params, String surface) {
+        if (MasterBookabilitySql.referencesToday(sql)) {
+            params.put(MasterBookabilitySql.TODAY_PARAM, scheduleDateMath.today());
+        }
+        return strictBookableResolver.resolveCandidateQuery(sql, params, surface);
+    }
+
+    /**
+     * SRCH-30 strict gate on the master Top-N: {@code m.id = ANY(:strictMasterIds)} (top level, served
+     * by the {@code masters} primary key), and — with a {@code serviceTypeSlugs} and/or {@code category}
+     * filter — a matching service (slug-matched and in the category, SRCH-33) must itself be strictly
+     * bookable; with a free-text {@code q}, a match carried by a
+     * service must be carried by a strictly bookable one (the same group-scoped rule as
+     * {@link #appendQPredicate}, restricted to the strict assignments — the salon q gate's rule).
+     * Strict assignment ids already carry the active / ownership rule
+     * ({@code MasterServiceRepository#findBookableAssignmentDurationsByMasterIds}), so the EXISTS
+     * blocks need only the slug / token match. Both ids are bound as SQL arrays — one bind each
+     * whatever the set size, and no {@code CAST(:p …)} idiom. The assignment array is always bound:
+     * the card previews read it too ({@link #wrapWithServiceNamesLateral}).
+     */
+    private static void appendStrictMasterPredicate(
+            StringBuilder sb, MasterSearchFilters filters,
+            StrictBookableResolver.StrictBookableSet strict, Map<String, Object> params) {
+        sb.append("AND m.id = ANY(:").append(STRICT_MASTER_IDS_PARAM).append(") ");
+        params.put(STRICT_MASTER_IDS_PARAM, strict.masterIdArray());
+        params.put(STRICT_ASSIGNMENT_IDS_PARAM, strict.assignmentIdArray());
+        List<ResolvedServiceType> serviceTypes = filters.serviceTypes();
+        boolean hasCategory = filters.category() != null;
+        if (!serviceTypes.isEmpty() || hasCategory) {
+            sb.append("AND EXISTS (SELECT 1 FROM master_services sbm ")
+                    .append("JOIN service_definitions sbd ON sbd.id = sbm.service_def_id ")
+                    .append("WHERE sbm.master_id = m.id AND sbm.id").append(IN_STRICT_ASSIGNMENTS);
+            if (!serviceTypes.isEmpty()) {
+                sb.append("AND (");
+                appendServiceTypeMatchDisjunction(sb, "sbd", serviceTypes.size());
+                sb.append(") ");
+            }
+            if (hasCategory) {
+                // SRCH-33: the matched strictly bookable assignment must be in the category
+                // (:category is bound by appendWhereClause's structural category EXISTS).
+                sb.append("AND sbd.category = :category ");
+            }
+            sb.append(") ");
+        }
+        appendStrictQPredicate(sb, filters.qTokens(), filters.qCategories());
+    }
+
+    /**
+     * Strict half of the master {@code q} rule (SRCH-30, B523 fix pass): all tokens by the master's
+     * name, OR all tokens by the name / ONE strictly bookable service. ANDed onto the structural
+     * {@link #appendQPredicate} (which binds the {@code :qN} / {@code :qcatN} params), so a master
+     * found only through a service no client can book is no longer listed.
+     */
+    private static void appendStrictQPredicate(
+            StringBuilder sb, List<String> qTokens, List<String> qCategories) {
+        if (qTokens.isEmpty()) {
+            return;
+        }
+        sb.append("AND ((");
+        for (int i = 0; i < qTokens.size(); i++) {
+            String param = Q_PARAM_PREFIX + i;
+            if (i > 0) {
+                sb.append(" AND ");
+            }
+            sb.append("(u.first_name ILIKE :").append(param)
+                    .append(" OR u.last_name ILIKE :").append(param).append(")");
+        }
+        sb.append(") OR EXISTS (SELECT 1 FROM master_services sqm ")
+                .append("JOIN service_definitions sqd ON sqd.id = sqm.service_def_id ")
+                .append("WHERE sqm.master_id = m.id AND sqm.id").append(IN_STRICT_ASSIGNMENTS);
+        appendMasterTokenConjunction(sb, "u", "sqd", qTokens.size(), qCategories);
+        sb.append(")) ");
     }
 
     /**
@@ -1176,7 +1438,9 @@ public class SearchService {
                 .append("SELECT DISTINCT sd.name ")
                 .append("FROM master_services ms ")
                 .append("JOIN service_definitions sd ON sd.id = ms.service_def_id AND sd.is_active = true ")
-                .append("WHERE ms.master_id = t.master_id AND ms.is_active = true ");
+                .append("WHERE ms.master_id = t.master_id AND ms.is_active = true ")
+                // B523: the preview lists only strictly bookable services (SRCH-30).
+                .append("AND ms.id").append(IN_STRICT_ASSIGNMENTS);
         // Ownership gate: an active assignment alone does not prove the definition
         // belongs to THIS master (service_definitions is polymorphic). Without it a
         // stale cross-owner row would print a salon's service name on an independent
@@ -1943,7 +2207,9 @@ public class SearchService {
                 .append("SELECT DISTINCT sd.name ")
                 .append("FROM master_services ms ")
                 .append("JOIN service_definitions sd ON sd.id = ms.service_def_id AND sd.is_active = true ")
-                .append("WHERE ms.master_id = t.master_id AND ms.is_active = true ");
+                .append("WHERE ms.master_id = t.master_id AND ms.is_active = true ")
+                // B523: only a strictly bookable service explains the match (SRCH-30).
+                .append("AND ms.id").append(IN_STRICT_ASSIGNMENTS);
         // Same ownership gate as the serviceNames preview — a stale cross-owner
         // assignment must not "explain" the match with a salon's service name.
         appendMasterOwnedServiceGate(sb, "sd", "t.master_id");
@@ -2012,14 +2278,13 @@ public class SearchService {
      * not keep the salon's service visible) — matching the same predicate now present on the
      * catalogue query and the assignment-level {@code findBookableAssignmentsBySalon} query.
      *
-     * <p><b>Free-slot bookability is NOT reflected in search SQL.</b> The authoritative catalogue
-     * ({@code ServiceCatalogService#getSalonServiceCatalog}) additionally hides a service unless a
-     * performing master has ≥1 free future slot (the Phase 23.x fix). That per-slot computation is
-     * intentionally not expressed in this search SQL — search stays on the coarse gate and may show a
-     * salon whose masters are momentarily fully booked. Reconciling the two in SQL is a separate
-     * architect follow-up.
+     * <p><b>Coarse by design — the strict verdict is applied separately.</b> This gate stays
+     * structural because search suggestions reuse it AS-IS (suggestions keep the structural rule).
+     * Salon search adds the strict free-slot verdict on top (SRCH-31): the resolved
+     * {@code :strictAssignmentIds} gate the price lateral, the q gate ({@code SalonSearchSql}) and
+     * the membership {@code EXISTS} ({@code appendSalonStrictExists}); the name previews add
+     * {@code appendSalonStrictServiceGate} on top of this coarse gate.
      */
-    // TODO(architect follow-up): free-slot bookability not reflected in search SQL — see catalogue authoritative gate
     // Widened from private to public (Phase 331): reused AS-IS by
     // search.repository.SearchSuggestionAvailabilityRepository's salon branch — a different
     // package, hence public rather than package-private (the doc's original "package-private"
@@ -2135,10 +2400,13 @@ public class SearchService {
     private static SqlAndParams buildSalonSearchSql(
             UUID cityId, UUID districtId, String category, List<String> qTokens,
             List<String> qCategories, BigDecimal minPrice, BigDecimal maxPrice, SearchSort sort,
-            List<ResolvedServiceType> serviceTypes, Pageable pageable) {
+            List<ResolvedServiceType> serviceTypes, StrictBookableResolver.StrictBookableSet strict,
+            Pageable pageable) {
         StringBuilder inner = new StringBuilder();
         Map<String, Object> params = new LinkedHashMap<>();
         boolean hasCategory = category != null;
+        // SRCH-31: the price lateral, the q gate and the strict EXISTS below all read this array.
+        params.put(STRICT_ASSIGNMENT_IDS_PARAM, strict.assignmentIdArray());
 
         // Inner Top-N: only the columns + price aggregates needed for WHERE /
         // ORDER BY / LIMIT. Name previews are deferred to the outer block.
@@ -2202,6 +2470,7 @@ public class SearchService {
             params.put("maxPrice", maxPrice);
         }
         appendSalonServiceTypeExists(inner, serviceTypes, params);
+        appendSalonStrictExists(inner, serviceTypes, hasCategory);
 
         appendSalonOrderBy(inner, sort);
         inner.append(" LIMIT :limit OFFSET :offset");
@@ -2280,15 +2549,18 @@ public class SearchService {
                 .append("AND ms.is_active = true ")
                 // Only masters with a schedule price the band — the static pr lateral's rule
                 // (SalonSearchSql), previously missing on this dynamic path.
-                .append("AND").append(MasterBookabilitySql.hasSchedule("mad")).append(' ');
-        // Slug precedence: scope the price band to the matched services. Category
-        // narrows only when no slug filter is active (defensive — this path always
-        // carries slugs).
+                .append("AND").append(MasterBookabilitySql.hasSchedule("mad")).append(' ')
+                // SRCH-31: only strictly bookable assignments price the band (mirrors the static pr).
+                .append("AND ms.id").append(IN_STRICT_ASSIGNMENTS);
+        // Scope the price band to the matched services: slugs and category both narrow.
         if (!serviceTypes.isEmpty()) {
             sb.append("AND (");
             appendServiceTypeMatchDisjunction(sb, "sd", serviceTypes.size());
             sb.append(") ");
-        } else if (hasCategory) {
+        }
+        // Category is bound whenever present, so it must be emitted on the same flag —
+        // independent of slugs (SRCH-33: category is a strict service filter).
+        if (hasCategory) {
             sb.append("AND sd.category = :category ");
         }
         sb.append(") pr ON true ");
@@ -2309,6 +2581,7 @@ public class SearchService {
                 .append("WHERE sd2.owner_type = 'SALON' AND sd2.owner_id = t.id ")
                 .append("AND sd2.is_active = true ");
         appendSalonBookableGate(sb, "sd2", "t");
+        appendSalonStrictServiceGate(sb, "sd2", "t");
         if (hasCategory) {
             sb.append("AND sd2.category = :category ");
         }
@@ -2349,6 +2622,7 @@ public class SearchService {
                 .append("WHERE sd3.owner_type = 'SALON' AND sd3.owner_id = t.id ")
                 .append("AND sd3.is_active = true ");
         appendSalonBookableGate(sb, "sd3", "t");
+        appendSalonStrictServiceGate(sb, "sd3", "t");
         if (!serviceTypes.isEmpty()) {
             sb.append("AND (");
             appendServiceTypeMatchDisjunction(sb, "sd3", serviceTypes.size());
@@ -2382,6 +2656,47 @@ public class SearchService {
         appendServiceTypeMatchDisjunction(sb, "sdf", serviceTypes.size());
         sb.append(")) ");
         bindServiceTypeParams(serviceTypes, params);
+    }
+
+    /**
+     * B523: a salon-owned definition {@code defAlias} is shown on a card (name preview, matched
+     * names) only if a master of THIS salon performs it through a strictly bookable assignment —
+     * the same set that prices the band ({@code pr}) and gates membership, so the card never names a
+     * service the client cannot book. Appended after {@link #appendSalonBookableGate}, which stays
+     * structural because search suggestions reuse it AS-IS.
+     */
+    private static void appendSalonStrictServiceGate(StringBuilder sb, String defAlias, String salonAlias) {
+        sb.append("AND EXISTS (SELECT 1 FROM master_services mss ")
+                .append("JOIN masters mxs ON mxs.id = mss.master_id AND mxs.salon_id = ")
+                .append(salonAlias).append(".id ")
+                .append("WHERE mss.service_def_id = ").append(defAlias).append(".id ")
+                .append("AND mss.id").append(IN_STRICT_ASSIGNMENTS).append(") ");
+    }
+
+    /**
+     * SRCH-31 membership gate for the dynamic salon builder: at least one strictly bookable
+     * assignment of a master attached to THIS salon — of a matching service when a
+     * {@code serviceTypeSlugs} filter is active (reuses the {@code :stId{n}} params already bound).
+     * Strict assignment ids already carry the active / ownership rule, so no further gate is needed.
+     */
+    private static void appendSalonStrictExists(
+            StringBuilder sb, List<ResolvedServiceType> serviceTypes, boolean hasCategory) {
+        sb.append("AND EXISTS (SELECT 1 FROM master_services sbm ")
+                .append("JOIN masters sbx ON sbx.id = sbm.master_id AND sbx.salon_id = s.id ");
+        if (!serviceTypes.isEmpty() || hasCategory) {
+            sb.append("JOIN service_definitions sbd ON sbd.id = sbm.service_def_id ");
+        }
+        sb.append("WHERE sbm.id").append(IN_STRICT_ASSIGNMENTS);
+        if (!serviceTypes.isEmpty()) {
+            sb.append("AND (");
+            appendServiceTypeMatchDisjunction(sb, "sbd", serviceTypes.size());
+            sb.append(") ");
+        }
+        if (hasCategory) {
+            // SRCH-33: the strictly bookable assignment must itself be in the category.
+            sb.append("AND sbd.category = :category ");
+        }
+        sb.append(") ");
     }
 
     /**

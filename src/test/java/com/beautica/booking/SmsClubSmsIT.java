@@ -156,6 +156,62 @@ class SmsClubSmsIT extends AbstractWalkInBookingSmsIT {
                         + "reason=blacklisted") && line.contains("detail=This number is in the black list"));
         assertNoPiiInLogs(E164_PHONE, PHONE_SUBSCRIBER_DIGITS);
     }
+
+    /**
+     * Phase 441 regression (prod Sentry breadcrumb: walk-in booking → SMSClub HTTP 200 «Некорректный номер получателя»
+     * paged as an ERROR). A recipient number the provider rejects is the master's typo, not an outage: the booking
+     * still lands, the whole request logs the RECIPIENT_INVALID line at WARN, and nothing reaches ERROR or Sentry.
+     */
+    @Test
+    @DisplayName("phase 441: walk-in + SMSClub «Некорректный номер получателя» — 201 CONFIRMED, one WARN "
+            + "reason=RECIPIENT_INVALID, no ERROR line, no Sentry event")
+    void should_logWarnWithoutErrorOrSentry_when_smsClubRejectsTheWalkInRecipientNumber() {
+        SMSCLUB.stubFor(post(urlEqualTo(SMSCLUB_PATH)).willReturn(aResponse().withStatus(200)
+                .withHeader("Content-Type", "application/json; charset=utf-8")
+                .withBody("{\"success_request\":{\"add_info\":{\"" + E164_PHONE.substring(1)
+                        + "\":\"Некорректный номер получателя\"}}}")));
+        Logger root = (Logger) LoggerFactory.getLogger(org.slf4j.Logger.ROOT_LOGGER_NAME);
+        ListAppender<ILoggingEvent> levels = new ListAppender<>();
+        levels.start();
+        root.addAppender(levels);
+        ResponseEntity<String> resp;
+        List<SentryEvent> events;
+        try (SentryEventCapture sentry = SentryEventCapture.attach(root)) {
+            log.debug("Act: master books a walk-in whose phone SMSClub rejects as an invalid recipient");
+            resp = createWalkIn(tomorrowAtNoon());
+            events = sentry.forwarded();
+        } finally {
+            root.detachAppender(levels);
+            levels.stop();
+        }
+
+        assertConfirmedWalkInBody(resp);
+        SMSCLUB.verify(1, postRequestedFor(urlEqualTo(SMSCLUB_PATH)));
+        assertThat(onlyBooking().get("status")).isEqualTo("CONFIRMED");
+        List<ILoggingEvent> appEvents = levels.list.stream()
+                .filter(e -> !e.getLoggerName().startsWith("com.beautica.support"))
+                .toList();
+        assertThat(appEvents).as("an invalid recipient number is user input — no ERROR anywhere in the request")
+                .noneMatch(e -> e.getLevel() == Level.ERROR)
+                .noneMatch(e -> e.getFormattedMessage().startsWith("External call failed"));
+        assertThat(appEvents).as("exactly one WARN line carries the reason token, phone masked")
+                .filteredOn(e -> e.getFormattedMessage().contains("reason=RECIPIENT_INVALID"))
+                .singleElement()
+                .satisfies(e -> {
+                    assertThat(e.getLevel()).isEqualTo(Level.WARN);
+                    assertThat(e.getFormattedMessage()).isEqualTo(
+                            "SMS send status=FAILED provider=smsclub to=+380***4567 reason=RECIPIENT_INVALID");
+                });
+        assertThat(appEvents).as("the dispatcher still records the failed send at WARN")
+                .anyMatch(e -> e.getLevel() == Level.WARN
+                        && e.getFormattedMessage().contains("Booking SMS send failed")
+                        && e.getFormattedMessage().contains("cause=SmsDeliveryException"));
+        assertThat(appEvents).as("the provider's raw text never reaches the log")
+                .noneMatch(e -> e.getFormattedMessage().contains("Некорректный"));
+        assertThat(events).as("no Sentry event for a rejected recipient number").isEmpty();
+        assertNoPiiInLogs(E164_PHONE, PHONE_SUBSCRIBER_DIGITS);
+    }
+
     /** Phase 440 — the guest OTP send with an explicit {@code smsFormat}, body via Jackson (Q16). */
     private ResponseEntity<String> sendOtp(String phone, String smsFormat) throws Exception {
         org.springframework.http.HttpHeaders headers = new org.springframework.http.HttpHeaders();
@@ -288,6 +344,58 @@ class SmsClubSmsIT extends AbstractWalkInBookingSmsIT {
                     assertThat(event.getTag(ExternalCallFailure.TAG_SERVICE)).isEqualTo("smsclub");
                     assertThat(event.getTag(ExternalCallFailure.TAG_REASON)).isEqualTo("sender_invalid");
                 });
+    }
+
+    /**
+     * Phase 441 audit-fix — the guest OTP path when SMSClub answers HTTP 200 «Некорректный номер получателя»: still the
+     * generic 503 (GST-E03, one call, no retry), but the rejected number is user input — one RECIPIENT_INVALID WARN,
+     * no external-call ERROR, no Sentry event (one rejection is far below the aggregate spike threshold).
+     */
+    @Test
+    @DisplayName("phase 441: guest OTP + SMSClub 200 «Некорректный номер получателя» — 503, RECIPIENT_INVALID WARN, "
+            + "no ERROR line, no Sentry event")
+    void should_return503WithWarnAndNoError_when_smsClubRejectsTheOtpRecipientNumber() throws Exception {
+        SMSCLUB.stubFor(post(urlEqualTo(SMSCLUB_PATH)).willReturn(aResponse().withStatus(200)
+                .withHeader("Content-Type", "application/json; charset=utf-8")
+                .withBody("{\"success_request\":{\"add_info\":{\"" + OTP_PHONE.substring(1)
+                        + "\":\"Некорректный номер получателя\"}}}")));
+        Logger root = (Logger) LoggerFactory.getLogger(org.slf4j.Logger.ROOT_LOGGER_NAME);
+        ListAppender<ILoggingEvent> levels = new ListAppender<>();
+        levels.start();
+        root.addAppender(levels);
+        ResponseEntity<String> resp;
+        List<SentryEvent> events;
+        try (SentryEventCapture sentry = SentryEventCapture.attach(root)) {
+            log.debug("Act: guest requests an OTP for a number SMSClub rejects as an invalid recipient");
+            resp = sendOtp(OTP_PHONE);
+            events = sentry.forwarded();
+        } finally {
+            root.detachAppender(levels);
+            levels.stop();
+        }
+
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
+        assertThat(resp.getBody()).contains(ServiceUnavailableMessages.OTP_SEND_FAILED)
+                .doesNotContain("reason=").doesNotContain(OTP_SUBSCRIBER_DIGITS);
+        SMSCLUB.verify(1, postRequestedFor(urlEqualTo(SMSCLUB_PATH)));
+        List<ILoggingEvent> appEvents = levels.list.stream()
+                .filter(e -> !e.getLoggerName().startsWith("com.beautica.support"))
+                .toList();
+        assertThat(appEvents).as("an invalid recipient number is user input — no ERROR anywhere in the request")
+                .noneMatch(e -> e.getLevel() == Level.ERROR)
+                .noneMatch(e -> e.getFormattedMessage().startsWith("External call failed"));
+        assertThat(appEvents).as("exactly one WARN line carries the reason token, phone masked")
+                .filteredOn(e -> e.getFormattedMessage().contains("reason=RECIPIENT_INVALID"))
+                .singleElement()
+                .satisfies(e -> {
+                    assertThat(e.getLevel()).isEqualTo(Level.WARN);
+                    assertThat(e.getFormattedMessage()).isEqualTo("SMS send status=FAILED provider=smsclub to="
+                            + MASKED_OTP_PHONE + " reason=RECIPIENT_INVALID");
+                });
+        assertThat(appEvents).as("PhoneOtpService re-maps at WARN")
+                .anyMatch(e -> e.getLevel() == Level.WARN && e.getFormattedMessage().contains("OTP send failed"));
+        assertThat(events).as("no Sentry event for a rejected recipient number").isEmpty();
+        assertNoPiiInLogs(OTP_PHONE, OTP_SUBSCRIBER_DIGITS);
     }
 
     @Test

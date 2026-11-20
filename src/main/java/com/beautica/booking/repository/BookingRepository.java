@@ -1151,36 +1151,35 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
 
     /**
      * Phase 315 (D1/D4) — the multi-master sibling of {@link #findActiveTimeRangesByMasterInRange},
-     * used ONLY by the salon catalogue's batched bookability gate
-     * ({@code SlotCalculationService#filterBookableAssignmentsBatch}), which resolves every distinct
-     * master in a salon in ONE statement instead of one per master (the N+1 this phase kills).
+     * used ONLY by the batched bookability gate ({@code SlotCalculationService#filterBookableBatch}:
+     * the salon catalogue, the wish list and the strict search verdict), which resolves every master
+     * in ONE statement instead of one per master.
      *
-     * <p>Same predicate, same index ({@code idx_bookings_master_slot_overlap}), same
-     * {@code [windowStart, windowEnd)} semantics as the single-master finder — only the {@code =} became
-     * an {@code IN}, and the projection widened to {@link BookingMasterTimeRange} so the batched result
-     * can be regrouped by master in memory (a batched result set has no per-row caller-side anchor the
-     * way a single-master call does). {@link BookingTimeRange} and the single-master finder are
-     * UNTOUCHED — every existing consumer keeps its exact query and shape.
+     * <p>Same predicate, same index ({@code idx_bookings_master_slot_overlap}, partial on
+     * {@code status = 'CONFIRMED'}), same {@code [windowStart, windowEnd)} semantics as the
+     * single-master finder. {@code ORDER BY master_id, starts_at} keeps each master's rows contiguous
+     * and in the single-master order.
      *
-     * <p><b>{@code ORDER BY b.master.id, b.startsAt ASC} (D4).</b> The {@code startsAt ASC} tail
-     * preserves the ordering the single-master query has always returned within one master; the
-     * leading {@code master.id} groups each master's rows contiguously so the caller's regroup is a
-     * single linear pass, not a second sort.
-     *
-     * <p>No {@code IN}-list chunking (D11): Postgres' bind-parameter ceiling is 65535, two orders of
-     * magnitude above the largest conceivable salon's master count.
+     * <p><b>B523 perf fix — native {@code unnest}.</b> The ids are JOINED as
+     * {@code unnest(CAST(:masterIds AS uuid[]))} — one bind whatever the set size (the strict search
+     * passes up to 2 000 masters), driving the overlap index per master — the
+     * {@code MasterServiceRepository#findBookableAssignmentDurationsByMasterIds} pattern; it replaced
+     * the JPQL {@code IN :masterIds} form, which expanded one bind parameter per id. The ids must be
+     * distinct; callers MUST short-circuit an empty array.
      */
-    @Query("""
-            SELECT new com.beautica.booking.repository.BookingMasterTimeRange(b.master.id, b.startsAt, b.endsAt)
-            FROM Booking b
-            WHERE b.master.id IN :masterIds
-              AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
-              AND b.startsAt < :windowEnd
-              AND b.endsAt   > :windowStart
-            ORDER BY b.master.id, b.startsAt ASC
-            """)
+    @Query(value = """
+            SELECT b.master_id AS masterId,
+                   b.starts_at AS startsAt,
+                   b.ends_at   AS endsAt
+            FROM unnest(CAST(:masterIds AS uuid[])) AS req(master_id)
+            JOIN bookings b ON b.master_id = req.master_id
+            WHERE b.status = 'CONFIRMED'
+              AND b.starts_at < :windowEnd
+              AND b.ends_at   > :windowStart
+            ORDER BY b.master_id, b.starts_at ASC
+            """, nativeQuery = true)
     List<BookingMasterTimeRange> findActiveTimeRangesByMasterIdsInRange(
-            @Param("masterIds") Collection<UUID> masterIds,
+            @Param("masterIds") UUID[] masterIds,
             @Param("windowStart") OffsetDateTime windowStart,
             @Param("windowEnd") OffsetDateTime windowEnd
     );
@@ -2509,17 +2508,21 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     }
 
     /**
-     * Phase 495 audit-fix — {@link ReminderFeedTarget}s for the ids the 24 h claim just won (post-claim read, so the
-     * values are the row's current ones). Bounded by the claim batch cap
-     * ({@link #REGISTERED_DAY_BEFORE_REMINDER_BATCH_CAP}). {@code LEFT JOIN} on the optional salon so an independent
-     * master's booking is not dropped (the sweep's finder already requires a client; the LEFT JOIN on it is defensive).
+     * Phase 495 audit-fix — {@link ReminderFeedTarget}s for the ids the 24 h (and, phase 522, the 2 h) claim just won
+     * (post-claim read, so the values are the row's current ones). Bounded by the claim batch cap
+     * ({@link #REGISTERED_DAY_BEFORE_REMINDER_BATCH_CAP} / {@link #TWO_HOUR_REMINDER_BATCH_CAP}). {@code LEFT JOIN}
+     * on the optional salon so an independent master's booking is not dropped. Phase 522 audit-fix cycle 2 — inner
+     * {@code JOIN} on the client filtered to ACTIVE accounts: a deactivated client gets no reminder feed row (nor its
+     * push). The filter lives HERE, not in the shared {@code InAppNotificationRepository#insertEventRowsBulk}, so the
+     * schedule-override mass decline keeps per-event parity (NTF-40).
      */
     @Query("""
             SELECT b.id AS id, c.id AS clientId, s.id AS salonId, b.startsAt AS startsAt
               FROM Booking b
-              LEFT JOIN b.client c
+              JOIN b.client c
               LEFT JOIN b.salon s
              WHERE b.id IN :ids
+               AND c.isActive = true
              ORDER BY b.startsAt, b.id
             """)
     List<ReminderFeedTarget> findReminderFeedTargetsByIds(@Param("ids") Collection<UUID> ids);
@@ -2533,13 +2536,16 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * {@link #claimRemindersByIds} (left unchanged), rows locked by anyone else are SKIPPED
      * ({@code FOR UPDATE SKIP LOCKED}) rather than waited on, so one held booking row never stalls the hourly sweep
      * (and with it the guest leg); a skipped row is re-selected next tick if still unclaimed. Call
-     * {@link #claimRegisteredRemindersByIds} (3 s lock_timeout wrapper, kept for any non-skippable lock).
+     * {@link #claimRegisteredRemindersByIds} (3 s lock_timeout wrapper, kept for any non-skippable lock). Phase 522
+     * audit-fix 3 — re-checks {@code status = 'CONFIRMED'} under the row lock, so a booking cancelled between the
+     * finder and this claim is never claimed (no e-mail, no feed row, no push).
      */
     @Query(value = """
             WITH c AS (
                 SELECT id FROM bookings
                  WHERE id IN (:ids)
                    AND reminder_sent = FALSE
+                   AND status = 'CONFIRMED'
                  FOR UPDATE SKIP LOCKED)
             UPDATE bookings b
                SET reminder_sent = TRUE
@@ -2633,18 +2639,40 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     }
 
     /**
-     * B494 audit-fix cycle 2 — the registered (APP) leg's 2 h claim: the same statement as
-     * {@link #claimTwoHourRemindersByIds} (left unchanged for the guest leg), but its 3s {@code lock_timeout} is
-     * scoped to this claim and the previous value restored, so the guest 2 h leg that follows in the same transaction
-     * (finder included) runs exactly as before B494. See {@link #claimRegisteredRemindersByIds}.
+     * B494 audit-fix cycle 2 — the registered (APP) leg's 2 h claim: {@link
+     * #claimRegisteredTwoHourRemindersByIdsNoLockTimeout} (the guest statement + a CONFIRMED re-check), and its 3s
+     * {@code lock_timeout} is scoped to this claim and the previous value restored, so whatever follows in the same
+     * transaction runs exactly as before B494 (since phase 522 audit-fix 4 the 2 h leg is its own transaction, so this
+     * is defensive there). See {@link #claimRegisteredRemindersByIds}.
      */
     default List<UUID> claimRegisteredTwoHourRemindersByIds(Collection<UUID> ids) {
         String previous = currentTransactionLockTimeout();
         applyTransactionLockTimeout();
-        List<UUID> claimed = claimTwoHourRemindersByIdsNoLockTimeout(ids);
+        List<UUID> claimed = claimRegisteredTwoHourRemindersByIdsNoLockTimeout(ids);
         restoreTransactionLockTimeout(previous);
         return claimed;
     }
+
+    /**
+     * Phase 522 audit-fix 3 — the registered (APP) leg's 2 h claim statement: {@link
+     * #claimTwoHourRemindersByIdsNoLockTimeout} (left unchanged for the guest leg) plus a {@code status = 'CONFIRMED'}
+     * re-check under the row lock, so a booking cancelled between the finder and this claim is never claimed (no
+     * e-mail, no {@code …:H2} feed row, no push). Call {@link #claimRegisteredTwoHourRemindersByIds}.
+     */
+    @Query(value = """
+            WITH c AS (
+                SELECT id FROM bookings
+                 WHERE id IN (:ids)
+                   AND reminder_2h_sent = FALSE
+                   AND status = 'CONFIRMED'
+                 FOR UPDATE SKIP LOCKED)
+            UPDATE bookings b
+               SET reminder_2h_sent = TRUE
+              FROM c
+             WHERE b.id = c.id
+            RETURNING b.id
+            """, nativeQuery = true)
+    List<UUID> claimRegisteredTwoHourRemindersByIdsNoLockTimeout(@Param("ids") Collection<UUID> ids);
 
     /** Phase 493 — one booking row a 2h visit claim flipped, with its visit. */
     interface TwoHourVisitClaim {

@@ -116,6 +116,14 @@ class PhoneOtpSendHttpIT extends AbstractIntegrationTest {
                 json("{\"phone\":\"" + phone + "\",\"code\":\"" + code + "\"}"), String.class);
     }
 
+    /**
+     * Phone-first hardening (AUTH-D27 a) — moves the phone's codes 61 s back, as if the 60 s resend cooldown had
+     * elapsed; they stay inside the 15-min window, so only the per-phone cap can answer 429 afterwards.
+     */
+    private void elapseResendCooldown(String phone) {
+        jdbc.update("UPDATE phone_otps SET created_at = created_at - interval '61 seconds' WHERE phone = ?", phone);
+    }
+
     private void seedOldCode(String phone) throws Exception {
         jdbc.update("INSERT INTO phone_otps(phone, code_hash, expires_at, used, created_at) "
                         + "VALUES (?, ?, now() + interval '9 minutes', false, now() - interval '1 minute')",
@@ -288,8 +296,11 @@ class PhoneOtpSendHttpIT extends AbstractIntegrationTest {
         String phone = "+380501000003";
 
         var first = send(phone);
+        elapseResendCooldown(phone);
         var second = send(phone);
+        elapseResendCooldown(phone);
         var third = send(phone);
+        elapseResendCooldown(phone);
         var fourth = send(phone);
 
         assertThat(java.util.List.of(first, second, third))
@@ -305,8 +316,11 @@ class PhoneOtpSendHttpIT extends AbstractIntegrationTest {
         doThrow(new SmsDeliveryException("provider down")).when(otpSmsSender).send(eq(phone), anyString());
 
         var first = send(phone);
+        elapseResendCooldown(phone);
         var second = send(phone);
+        elapseResendCooldown(phone);
         var third = send(phone);
+        elapseResendCooldown(phone);
         var fourth = send(phone);
 
         assertThat(java.util.List.of(first, second, third))

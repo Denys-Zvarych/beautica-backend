@@ -2,7 +2,9 @@ package com.beautica.auth.filter;
 
 import com.beautica.common.security.BearerTokenExtractor;
 import com.beautica.common.security.ConstantTimeSecrets;
+import com.beautica.config.AuthLimitsProperties;
 import com.beautica.config.BookingInfoWorkerProperties;
+import com.beautica.config.ClientIpProperties;
 import com.beautica.config.RateLimitConfig;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.github.benmanes.caffeine.cache.LoadingCache;
@@ -191,6 +193,17 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     private static final String SUPPORT_CONTACT_PATH = "/api/v1/support/contact";
     private static final String OTP_SEND_PATH = "/api/v1/book/otp/send";
     private static final String OTP_VERIFY_PATH = "/api/v1/book/otp/verify";
+    // B514 (AUTH-41, AUTH-D14) — the registration phone OTP shares the guest OTP per-IP buckets: same SMS cost class
+    // (3 sends / 15 min per IP across both flows) and the same brute-force class (10 verifies / 15 min per IP).
+    private static final String REGISTER_OTP_SEND_PATH = "/api/v1/auth/register/phone/otp/send";
+    private static final String REGISTER_OTP_VERIFY_PATH = "/api/v1/auth/register/phone/otp/verify";
+    // B516 (AUTH-44) — signed-in add / change phone: same SMS cost class and brute-force class as the two above, so the
+    // same per-IP buckets (3 sends / 15 min, 10 verifies / 15 min per IP across all three flows).
+    private static final String USER_PHONE_OTP_SEND_PATH = "/api/v1/users/me/phone/otp/send";
+    private static final String USER_PHONE_OTP_VERIFY_PATH = "/api/v1/users/me/phone/otp/verify";
+    // B516 (AUTH-50) — notifications email code: the email-verification resend / verify buckets (same mail class).
+    private static final String USER_EMAIL_REQUEST_CODE_PATH = "/api/v1/users/me/email/request-code";
+    private static final String USER_EMAIL_VERIFY_PATH = "/api/v1/users/me/email/verify";
     // Guest-booking POST carries the {slug} variable, so it is matched by prefix + suffix
     // (same technique as BULK_SALON_SERVICES / SLOTS): /api/v1/book/{slug}/booking. The suffix
     // /booking does not collide with the OTP paths (/send, /verify) nor with the public GET
@@ -333,7 +346,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // re-sending. This bucket is built internally (not an injected @Qualifier bean) so the
     // existing 16-arg constructor — depended on by several slice/regression tests — is
     // unchanged.
-    private static final long OTP_VERIFY_CAPACITY = 10;
+    // Production default of app.auth-limits.otp-verify-ip-capacity (the Spring constructor binds AuthLimitsProperties).
+    public static final long OTP_VERIFY_CAPACITY = 10;
     private static final Duration OTP_VERIFY_WINDOW = Duration.ofMinutes(15);
     // Per-IP cap for POST /api/v1/book/{slug}/booking AND its salon twin
     // /api/v1/book/s/{slug}/masters/{masterId}/booking (10 / 15 min, shared bucket). The endpoint is
@@ -347,7 +361,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // visit split across >5 masters from one IP. 10 = one maximum-size visit (10 services, one master each). The
     // per-IP bucket is no longer the only replay bound: GuestTokenBookingCap caps every guest token at 10
     // committed bookings regardless of source IP, so IP rotation no longer multiplies one token's reach.
-    private static final long GUEST_BOOKING_CAPACITY = 10;
+    // Production default of app.auth-limits.guest-booking-ip-capacity.
+    public static final long GUEST_BOOKING_CAPACITY = 10;
     private static final Duration GUEST_BOOKING_WINDOW = Duration.ofMinutes(15);
     // Per-IP cap for POST /api/v1/book/cancel/{token} (10 / 15 min). The endpoint is
     // permitAll() — the guest holds only the one-time cancel token, validated inside the
@@ -425,16 +440,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // forwards the visitor IP in this header. Trusted ONLY with a matching worker key (like CF-Connecting-IP) and
     // preferred over CF-Connecting-IP when both hold a valid IP literal.
     private static final String CLIENT_IP_HEADER = "X-Beautica-Client-IP";
-    private static final int MAX_IP_LITERAL_LENGTH = 45;
-    private static final Pattern IPV4_LITERAL = Pattern.compile(
-            "^((25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)\\.){3}(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)$");
-    // First char hex or ':' — InetAddress.getByName only takes its literal-parsing path for such a value
-    // (a leading '.' would fall through to a DNS lookup); the ':' requirement below makes it IPv6-only.
-    private static final Pattern IPV6_LITERAL_CHARS = Pattern.compile("^[0-9A-Fa-f:][0-9A-Fa-f:.]*$");
-    // IPv6 visitors are keyed on their /64: one subscriber is routinely handed a whole /64, so a per-/128
-    // key would let a single host mint 2^64 fresh buckets by rotating its interface identifier.
-    private static final int IPV6_BUCKET_PREFIX_BYTES = 8;
-    private static final String IPV6_BUCKET_SUFFIX = "/64";
+    // IP-literal parsing and the IPv6 /64 keying moved to ClientIpResolver (phone-first hardening B10) so the
+    // login lockout keys an address exactly as the login bucket does.
     // Per-IP cap for GET /api/v1/search/** (240 / 60 s). These permitAll() discovery reads
     // expose authed-only street addresses for independent masters, so the throttle bounds the
     // RATE at which a single source can page through every district/city and the DB work each
@@ -839,6 +846,9 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // A secret: never logged.
     private final String bookingInfoWorkerKey;
 
+    // Bound to app.rate-limit.trust-forwarded-headers — false (local profile) keys every bucket on the socket address only.
+    private final ClientIpResolver clientIpResolver;
+
     /**
      * Feature-off constructor: identical to the Spring constructor with no website-Worker key configured.
      * The only PUBLIC constructor, so the slice/regression tests that build this filter directly (and the
@@ -899,7 +909,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                 moderationActionBuckets(MODERATION_ACTION_DECISION_DEFAULT_CAPACITY),
                 telegramLinkBuckets(RateLimitConfig.TELEGRAM_LINK_DEFAULT_CAPACITY),
                 telegramLinkBuckets(RateLimitConfig.TELEGRAM_LINK_READ_DEFAULT_CAPACITY),
-                new BookingInfoWorkerProperties());
+                new BookingInfoWorkerProperties(),
+                new ClientIpResolver(ClientIpProperties.trustingForwardedHeaders()));
     }
 
     /**
@@ -964,10 +975,82 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                 moderationActionDecisionBuckets,
                 telegramLinkBuckets(RateLimitConfig.TELEGRAM_LINK_DEFAULT_CAPACITY),
                 telegramLinkBuckets(RateLimitConfig.TELEGRAM_LINK_READ_DEFAULT_CAPACITY),
-                bookingInfoWorker);
+                bookingInfoWorker,
+                new ClientIpResolver(ClientIpProperties.trustingForwardedHeaders()));
     }
 
-    /** Spring constructor: as the public one, plus the optional website-Worker key (feature off when blank). */
+    /** Pre-2026-11-19 Spring shape, kept for same-package tests: the auth limits get their production defaults. */
+    AuthRateLimitFilter(
+            @Qualifier("registerBuckets") LoadingCache<String, Bucket> registerBuckets,
+            @Qualifier("loginBuckets") LoadingCache<String, Bucket> loginBuckets,
+            @Qualifier("refreshBuckets") LoadingCache<String, Bucket> refreshBuckets,
+            @Qualifier("verifyEmailBuckets") LoadingCache<String, Bucket> verifyEmailBuckets,
+            @Qualifier("slotsBuckets") LoadingCache<String, Bucket> slotsBuckets,
+            @Qualifier("deviceTokenBuckets") LoadingCache<String, Bucket> deviceTokenBuckets,
+            @Qualifier("mediaUploadBuckets") LoadingCache<String, Bucket> mediaUploadBuckets,
+            @Qualifier("profileUpdateBuckets") LoadingCache<String, Bucket> profileUpdateBuckets,
+            @Qualifier("resendVerificationBuckets") LoadingCache<String, Bucket> resendVerificationBuckets,
+            @Qualifier("forgotPasswordBuckets") LoadingCache<String, Bucket> forgotPasswordBuckets,
+            @Qualifier("resetPasswordBuckets") LoadingCache<String, Bucket> resetPasswordBuckets,
+            @Qualifier("categoryRequestBuckets") LoadingCache<String, Bucket> categoryRequestBuckets,
+            @Qualifier("suggestServiceTypeBuckets") LoadingCache<String, Bucket> suggestServiceTypeBuckets,
+            @Qualifier("bulkServiceSetupBuckets") LoadingCache<String, Bucket> bulkServiceSetupBuckets,
+            @Qualifier("supportContactBuckets") LoadingCache<String, Bucket> supportContactBuckets,
+            @Qualifier("otpSendBuckets") LoadingCache<String, Bucket> otpSendBuckets,
+            @Qualifier("verifyPasswordResetOtpBuckets") LoadingCache<String, Bucket> verifyPasswordResetOtpBuckets,
+            @Qualifier("changePasswordOtpBuckets") LoadingCache<String, Bucket> changePasswordOtpBuckets,
+            @Qualifier("serviceWriteBuckets") LoadingCache<String, Bucket> serviceWriteBuckets,
+            @Qualifier("inviteValidateBuckets") LoadingCache<String, Bucket> inviteValidateBuckets,
+            @Qualifier("inviteAcceptBuckets") LoadingCache<String, Bucket> inviteAcceptBuckets,
+            @Qualifier("catalogueBrowseBuckets") LoadingCache<String, Bucket> catalogueBrowseBuckets,
+            @Qualifier("inviteBuckets") LoadingCache<String, Bucket> inviteBuckets,
+            @Qualifier("reviewDecisionBuckets") LoadingCache<String, Bucket> reviewDecisionBuckets,
+            @Qualifier("reviewPageBuckets") LoadingCache<String, Bucket> reviewPageBuckets,
+            @Qualifier("moderationActionPageBuckets") LoadingCache<String, Bucket> moderationActionPageBuckets,
+            @Qualifier("moderationActionDecisionBuckets") LoadingCache<String, Bucket> moderationActionDecisionBuckets,
+            @Qualifier("telegramLinkIssueBuckets") LoadingCache<String, Bucket> telegramLinkIssueBuckets,
+            @Qualifier("telegramLinkReadBuckets") LoadingCache<String, Bucket> telegramLinkReadBuckets,
+            BookingInfoWorkerProperties bookingInfoWorker,
+            ClientIpResolver clientIpResolver) {
+        this(registerBuckets,
+                loginBuckets,
+                refreshBuckets,
+                verifyEmailBuckets,
+                slotsBuckets,
+                deviceTokenBuckets,
+                mediaUploadBuckets,
+                profileUpdateBuckets,
+                resendVerificationBuckets,
+                forgotPasswordBuckets,
+                resetPasswordBuckets,
+                categoryRequestBuckets,
+                suggestServiceTypeBuckets,
+                bulkServiceSetupBuckets,
+                supportContactBuckets,
+                otpSendBuckets,
+                verifyPasswordResetOtpBuckets,
+                changePasswordOtpBuckets,
+                serviceWriteBuckets,
+                inviteValidateBuckets,
+                inviteAcceptBuckets,
+                catalogueBrowseBuckets,
+                inviteBuckets,
+                reviewDecisionBuckets,
+                reviewPageBuckets,
+                moderationActionPageBuckets,
+                moderationActionDecisionBuckets,
+                telegramLinkIssueBuckets,
+                telegramLinkReadBuckets,
+                bookingInfoWorker,
+                clientIpResolver,
+                AuthLimitsProperties.defaults());
+    }
+
+    /**
+     * Spring constructor: as the public one, plus the optional website-Worker key (feature off when blank) and the
+     * client-IP resolver bound to the forwarded-header trust flag (the other constructors trust the header, the prod rule), and the
+     * {@code app.auth-limits} OTP-verify / guest-booking per-IP capacities (defaults = the old constants).
+     */
     @Autowired
     AuthRateLimitFilter(
             @Qualifier("registerBuckets") LoadingCache<String, Bucket> registerBuckets,
@@ -999,7 +1082,9 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             @Qualifier("moderationActionDecisionBuckets") LoadingCache<String, Bucket> moderationActionDecisionBuckets,
             @Qualifier("telegramLinkIssueBuckets") LoadingCache<String, Bucket> telegramLinkIssueBuckets,
             @Qualifier("telegramLinkReadBuckets") LoadingCache<String, Bucket> telegramLinkReadBuckets,
-            BookingInfoWorkerProperties bookingInfoWorker) {
+            BookingInfoWorkerProperties bookingInfoWorker,
+            ClientIpResolver clientIpResolver,
+            AuthLimitsProperties authLimits) {
         this.registerBuckets = registerBuckets;
         this.loginBuckets = loginBuckets;
         this.refreshBuckets = refreshBuckets;
@@ -1030,17 +1115,18 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         this.telegramLinkIssueBuckets = telegramLinkIssueBuckets;
         this.telegramLinkReadBuckets = telegramLinkReadBuckets;
         this.bookingInfoWorkerKey = bookingInfoWorker.isEnabled() ? bookingInfoWorker.getWorkerKey() : null;
+        this.clientIpResolver = clientIpResolver;
         this.otpVerifyBuckets = Caffeine.newBuilder()
                 .maximumSize(100_000)
                 .expireAfterAccess(OTP_VERIFY_WINDOW.plusMinutes(5))
                 .build(key -> Bucket.builder()
-                        .addLimit(otpVerifyBandwidth())
+                        .addLimit(otpVerifyBandwidth(authLimits.otpVerifyIpCapacity()))
                         .build());
         this.guestBookingBuckets = Caffeine.newBuilder()
                 .maximumSize(100_000)
                 .expireAfterAccess(GUEST_BOOKING_WINDOW.plusMinutes(5))
                 .build(key -> Bucket.builder()
-                        .addLimit(guestBookingBandwidth())
+                        .addLimit(guestBookingBandwidth(authLimits.guestBookingIpCapacity()))
                         .build());
         this.cancelPostBuckets = Caffeine.newBuilder()
                 .maximumSize(100_000)
@@ -1155,17 +1241,17 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                 .build();
     }
 
-    private static Bandwidth otpVerifyBandwidth() {
+    private static Bandwidth otpVerifyBandwidth(long capacity) {
         return BandwidthBuilder.builder()
-                .capacity(OTP_VERIFY_CAPACITY)
-                .refillIntervally(OTP_VERIFY_CAPACITY, OTP_VERIFY_WINDOW)
+                .capacity(capacity)
+                .refillIntervally(capacity, OTP_VERIFY_WINDOW)
                 .build();
     }
 
-    private static Bandwidth guestBookingBandwidth() {
+    private static Bandwidth guestBookingBandwidth(long capacity) {
         return BandwidthBuilder.builder()
-                .capacity(GUEST_BOOKING_CAPACITY)
-                .refillIntervally(GUEST_BOOKING_CAPACITY, GUEST_BOOKING_WINDOW)
+                .capacity(capacity)
+                .refillIntervally(capacity, GUEST_BOOKING_WINDOW)
                 .build();
     }
 
@@ -1785,13 +1871,16 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         if (REGISTER_PATH.equals(path) || REGISTER_IM_PATH.equals(path)) {
             cache = registerBuckets;
         } else if (LOGIN_PATH.equals(path)) {
-            cache = loginBuckets;
+            // AUTH-D27 (e): keyed per IPv6 /64 (IPv4 unchanged), the key the AUTH-08 lockout uses too.
+            applyRateLimit(request, response, filterChain, loginBuckets,
+                    RETRY_AFTER_SECONDS, 1L, perIpv6Prefix(resolveBucketKey(request)));
+            return;
         } else if (REFRESH_PATH.equals(path)) {
             cache = refreshBuckets;
-        } else if (VERIFY_EMAIL_PATH.equals(path)) {
+        } else if (VERIFY_EMAIL_PATH.equals(path) || USER_EMAIL_VERIFY_PATH.equals(path)) {
             cache = verifyEmailBuckets;
             retryAfterSeconds = VERIFY_EMAIL_RETRY_AFTER_SECONDS;
-        } else if (RESEND_VERIFICATION_PATH.equals(path)) {
+        } else if (RESEND_VERIFICATION_PATH.equals(path) || USER_EMAIL_REQUEST_CODE_PATH.equals(path)) {
             cache = resendVerificationBuckets;
         } else if (FORGOT_PASSWORD_PATH.equals(path)) {
             cache = forgotPasswordBuckets;
@@ -1824,12 +1913,18 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         } else if (SUPPORT_CONTACT_PATH.equals(path)) {
             cache = supportContactBuckets;
             retryAfterSeconds = SUPPORT_CONTACT_RETRY_AFTER_SECONDS;
-        } else if (OTP_SEND_PATH.equals(path)) {
-            cache = otpSendBuckets;
-            retryAfterSeconds = OTP_SEND_RETRY_AFTER_SECONDS;
-        } else if (OTP_VERIFY_PATH.equals(path)) {
-            cache = otpVerifyBuckets;
-            retryAfterSeconds = OTP_VERIFY_RETRY_AFTER_SECONDS;
+        } else if (OTP_SEND_PATH.equals(path) || REGISTER_OTP_SEND_PATH.equals(path)
+                || USER_PHONE_OTP_SEND_PATH.equals(path)) {
+            // Keyed per IPv6 /64 like the review-invite and Telegram-link routes: one host rotating the low 64 bits
+            // of its address must not mint a fresh 3-SMS budget per address. IPv4 keys are unchanged.
+            applyRateLimit(request, response, filterChain, otpSendBuckets,
+                    OTP_SEND_RETRY_AFTER_SECONDS, 1L, perIpv6Prefix(resolveBucketKey(request)));
+            return;
+        } else if (OTP_VERIFY_PATH.equals(path) || REGISTER_OTP_VERIFY_PATH.equals(path)
+                || USER_PHONE_OTP_VERIFY_PATH.equals(path)) {
+            applyRateLimit(request, response, filterChain, otpVerifyBuckets,
+                    OTP_VERIFY_RETRY_AFTER_SECONDS, 1L, perIpv6Prefix(resolveBucketKey(request)));
+            return;
         } else {
             filterChain.doFilter(request, response);
             return;
@@ -2146,83 +2241,25 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         return visitorKey != null ? visitorKey : resolveBucketKey(request);
     }
 
-    /**
-     * Bucket key for a forwarded visitor IP literal, or {@code null} when the value is not one. IPv4 (and
-     * IPv4-mapped IPv6, which parses to IPv4) keys on the canonical address; any other IPv6 address keys on
-     * its /64 prefix ({@code 2001:db8:0:0:0:0:0:0/64}), so rotating the low 64 bits never mints a new bucket.
-     * An IPv6 address whose /64 prefix is all zeros (IPv4-compatible {@code ::1.2.3.4}, loopback, ...) keys
-     * on the full canonical /128 address instead, so such values never collapse into one shared
-     * {@code 0:0:0:0:0:0:0:0/64} bucket.
-     */
+    /** Delegates to {@link ClientIpResolver#visitorIpBucketKey} (moved there, B10). */
     static String visitorIpBucketKey(String value) {
-        InetAddress address = parseIpLiteral(value);
-        if (address == null) {
-            return null;
-        }
-        if (!(address instanceof Inet6Address)) {
-            return address.getHostAddress();
-        }
-        byte[] bytes = address.getAddress();
-        if (isZeroPrefix(bytes)) {
-            return address.getHostAddress();
-        }
-        Arrays.fill(bytes, IPV6_BUCKET_PREFIX_BYTES, bytes.length, (byte) 0);
-        try {
-            return InetAddress.getByAddress(bytes).getHostAddress() + IPV6_BUCKET_SUFFIX;
-        } catch (UnknownHostException e) {
-            return null;
-        }
+        return ClientIpResolver.visitorIpBucketKey(value);
     }
 
     /**
-     * Phase 401 audit-fix — the review-invite buckets only: {@code key} re-keyed by {@link #visitorIpBucketKey} (an IPv6
-     * client on its /64, IPv4 unchanged), so one subscriber rotating the low 64 bits of its address cannot mint a fresh
-     * 5-request POST budget per address. A key that is not a bare IP literal (already {@code …/64}, or the clamped
-     * remote address) is returned as is. Every other bucket keeps its per-address key.
+     * Phase 401 audit-fix — the review-invite, Telegram-link, OTP send/verify and (AUTH-D27 e) login buckets: {@code key}
+     * re-keyed per IPv6 /64 ({@link ClientIpResolver#prefixKey}).
      */
     static String perIpv6Prefix(String key) {
-        String prefixed = visitorIpBucketKey(key);
-        return prefixed != null ? prefixed : key;
+        return ClientIpResolver.prefixKey(key);
     }
 
-    /** True when the first {@value #IPV6_BUCKET_PREFIX_BYTES} bytes (the /64 prefix) are all zero. */
-    private static boolean isZeroPrefix(byte[] bytes) {
-        for (int i = 0; i < IPV6_BUCKET_PREFIX_BYTES; i++) {
-            if (bytes[i] != 0) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    /**
-     * Parses an IPv4/IPv6 LITERAL, or returns {@code null}. No DNS lookup is possible: a value reaches
-     * {@link InetAddress#getByName} only when it is a strict dotted-quad, or contains a ':' and starts with a
-     * hex digit or ':' — exactly the values the JDK parses as a literal (an IPv6 that fails to parse throws
-     * {@link UnknownHostException} instead of resolving). A leading '.' or any other character is rejected
-     * up front.
-     */
+    /** Delegates to {@link ClientIpResolver#parseIpLiteral} (moved there, B10). */
     static InetAddress parseIpLiteral(String value) {
-        if (value == null) {
-            return null;
-        }
-        String candidate = value.trim();
-        if (candidate.isEmpty() || candidate.length() > MAX_IP_LITERAL_LENGTH) {
-            return null;
-        }
-        boolean ipv4 = IPV4_LITERAL.matcher(candidate).matches();
-        boolean ipv6 = !ipv4 && candidate.indexOf(':') >= 0 && IPV6_LITERAL_CHARS.matcher(candidate).matches();
-        if (!ipv4 && !ipv6) {
-            return null;
-        }
-        try {
-            return InetAddress.getByName(candidate);
-        } catch (UnknownHostException e) {
-            return null;
-        }
+        return ClientIpResolver.parseIpLiteral(value);
     }
 
     private String resolveClientIp(HttpServletRequest request) {
-        return ClientIpResolver.resolve(request);
+        return clientIpResolver.resolve(request);
     }
 }

@@ -302,18 +302,19 @@ class FavoriteListProjectionTest extends AbstractIntegrationTest {
             2 the candidate load for every definition on the page \
             (MasterServiceRepository#findBookableAssignmentsForSalonServices) | \
             3 the batched override load (ScheduleExceptionRepository#findByMasterIdsAndDateBetweenWithIntervals) | \
-            4 the batched template load (WeeklyScheduleRepository#findOverlappingRangeWithIntervalsByMasterIds) | \
-            5 the LAZY WeeklySchedule.discreteTimes batch-fetch (working_interval_times) — issued by \
-            Hibernate, not by any call site: MasterScheduleService#resolveFromTemplate reads \
-            getDiscreteTimes() on every covering template to decide EXPLICIT_TIMES vs INTERVAL, and \
-            the first such read initialises every already-loaded proxy in one go \
-            (hibernate.default_batch_fetch_size=50), so it is ceil(distinct schedule rows / 50) \
-            statements, NOT one per master | \
+            4 the batched template projection (WeeklyScheduleRepository#findTemplateIntervalRowsByMasterIds) | \
+            5 the batched discrete-times projection (working_interval_times, \
+            WeeklyScheduleRepository#findTemplateTimeRowsByScheduleIds) — issued lazily on the fold's \
+            first template read, ONE unnest statement for every template of the batch (B523), so it \
+            is one statement at every master count, NOT ceil(rows / 50) and NOT one per master | \
             6 the batched booking load (BookingRepository#findActiveTimeRangesByMasterIdsInRange)""";
 
     private static final int SALON_SERVICE_WISH_LIST_STATEMENTS = 6;
 
-    /** {@code hibernate.default_batch_fetch_size}, {@code application.yml} — statement #5's divisor. */
+    /**
+     * {@code hibernate.default_batch_fetch_size}, {@code application.yml} — statement #5's divisor
+     * before B523; kept as the sweep's boundary so the arm proves crossing it costs nothing now.
+     */
     private static final int BATCH_FETCH_SIZE = 50;
 
     // ── the MASTER dimension — the one every gate query is actually keyed by ──
@@ -325,7 +326,7 @@ class FavoriteListProjectionTest extends AbstractIntegrationTest {
 
     @Test
     @DisplayName("listServiceFavorites prices ONE salon service performed by many masters with the "
-            + "same batched gate — flat in the MASTER count, across the batch_fetch_size boundary")
+            + "same batched gate — flat in the MASTER count, across the former batch_fetch_size boundary")
     void should_runBoundedStatementCount_when_oneSalonServiceIsPerformedByManyMasters() {
         long atTen = countManyMasterWishListStatements("ten", 10);
         long atFifty = countManyMasterWishListStatements("fifty", BATCH_FETCH_SIZE);
@@ -342,14 +343,12 @@ class FavoriteListProjectionTest extends AbstractIntegrationTest {
                         + "salon-dimension arms — %s; got %s", SIX_STATEMENTS, atFifty)
                 .isEqualTo(SALON_SERVICE_WISH_LIST_STATEMENTS);
         assertThat(atSixty)
-                .as("60 schedule rows cross the batch_fetch_size=50 ceiling, so statement #5 — and "
-                        + "ONLY #5 — becomes ceil(60/50)=2: exactly ONE more statement than 50 "
-                        + "masters cost. Not zero (which would mean the sweep never crossed the "
-                        + "boundary and the flatness above proves nothing) and not ten more (a "
-                        + "per-master regression). This is the same ceil(rows/50) formula "
+                .as("60 schedule rows cross the former batch_fetch_size=50 ceiling, yet statement #5 "
+                        + "is ONE unnest projection per batch (B523), so 60 masters cost exactly what "
+                        + "50 do — ten more would be a per-master regression. Same flatness "
                         + "SalonCatalogueBatchLoadIT case 14 pins on the catalogue side; got %s",
                         atSixty)
-                .isEqualTo(atFifty + 1);
+                .isEqualTo(atFifty);
     }
 
     /**
@@ -390,10 +389,10 @@ class FavoriteListProjectionTest extends AbstractIntegrationTest {
                         + "definition's 500 — otherwise the gate never ran and the count is vacuous")
                 .allMatch(row -> "777 ₴".equals(row.priceDisplay()));
         assertThat(stats.getCollectionStatistics(DISCRETE_TIMES_COLLECTION).getFetchCount())
-                .as("statement #5 attributed by NAME, not by subtraction: the lazy "
-                        + "WeeklySchedule.discreteTimes fetch really is what the sixth statement is, "
-                        + "and it is ceil(%s masters / %s) of them", masters, BATCH_FETCH_SIZE)
-                .isEqualTo((masters + BATCH_FETCH_SIZE - 1) / BATCH_FETCH_SIZE);
+                .as("statement #5 is the discrete-times PROJECTION, not the entity collection: the "
+                        + "batched gate hydrates no WeeklySchedule.discreteTimes at %s masters (B523) — "
+                        + "a non-zero count means the fold fell back to the entity path", masters)
+                .isZero();
         return statementCount;
     }
 
@@ -453,8 +452,9 @@ class FavoriteListProjectionTest extends AbstractIntegrationTest {
                         + "measurement proves nothing")
                 .allMatch(row -> "777 \u20b4".equals(row.priceDisplay()));
         assertThat(stats.getCollectionStatistics(DISCRETE_TIMES_COLLECTION).getFetchCount())
-                .as("the sixth statement, named rather than inferred \u2014 see SIX_STATEMENTS #5")
-                .isEqualTo(1);
+                .as("SIX_STATEMENTS #5 is the discrete-times PROJECTION (B523): the batched gate "
+                        + "hydrates no WeeklySchedule.discreteTimes entity collection")
+                .isZero();
         return statementCount;
     }
 

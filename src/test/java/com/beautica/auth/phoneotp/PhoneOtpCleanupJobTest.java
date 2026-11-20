@@ -26,7 +26,8 @@ import static org.mockito.Mockito.when;
 class PhoneOtpCleanupJobTest {
 
     private static final Instant FIXED_NOW = Instant.parse("2026-06-17T03:00:00Z");
-    private static final Duration RETENTION = Duration.ofHours(24);
+    /** Phone-first hardening: by created_at, 25 h, so the 24 h failed-verify window survives the 03:00 sweep. */
+    private static final Duration RETENTION = Duration.ofHours(25);
 
     @Mock
     private PhoneOtpRepository phoneOtpRepository;
@@ -36,16 +37,16 @@ class PhoneOtpCleanupJobTest {
     void should_deleteRowsOlderThanRetention_when_sweepRuns() {
         Clock clock = Clock.fixed(FIXED_NOW, ZoneOffset.UTC);
         var job = new PhoneOtpCleanupJob(phoneOtpRepository, clock);
-        // 2 of the 3 rows are older than now-24h; the 1 fresh row is not matched by the cutoff.
-        when(phoneOtpRepository.deleteByExpiresAtBefore(FIXED_NOW.minus(RETENTION))).thenReturn(2);
+        // 2 of the 3 rows were created before now-25h; the 1 fresh row is not matched by the cutoff.
+        when(phoneOtpRepository.deleteByCreatedAtBefore(FIXED_NOW.minus(RETENTION))).thenReturn(2);
 
         int deleted = job.sweep();
 
         assertThat(deleted).as("only the 2 expired rows are deleted; the fresh row is kept").isEqualTo(2);
         ArgumentCaptor<Instant> cutoff = ArgumentCaptor.forClass(Instant.class);
-        verify(phoneOtpRepository).deleteByExpiresAtBefore(cutoff.capture());
+        verify(phoneOtpRepository).deleteByCreatedAtBefore(cutoff.capture());
         assertThat(cutoff.getValue())
-                .as("cutoff must be exactly clock.now - 24h retention")
+                .as("cutoff must be exactly clock.now - 25h retention")
                 .isEqualTo(FIXED_NOW.minus(RETENTION));
     }
 
@@ -54,10 +55,29 @@ class PhoneOtpCleanupJobTest {
     void should_notFail_when_noExpiredRows() {
         Clock clock = Clock.fixed(FIXED_NOW, ZoneOffset.UTC);
         var job = new PhoneOtpCleanupJob(phoneOtpRepository, clock);
-        when(phoneOtpRepository.deleteByExpiresAtBefore(FIXED_NOW.minus(RETENTION))).thenReturn(0);
+        when(phoneOtpRepository.deleteByCreatedAtBefore(FIXED_NOW.minus(RETENTION))).thenReturn(0);
 
         job.sweepExpiredOtps();
 
-        verify(phoneOtpRepository).deleteByExpiresAtBefore(FIXED_NOW.minus(RETENTION));
+        verify(phoneOtpRepository).deleteByCreatedAtBefore(FIXED_NOW.minus(RETENTION));
+    }
+
+    @Test
+    @DisplayName("should_keepTheFullFailedVerifyWindow_when_retentionCompared")
+    void should_keepTheFullFailedVerifyWindow_when_retentionCompared() {
+        assertThat(PhoneOtpCleanupJob.RETENTION)
+                .as("rows must outlive the 24 h per-phone failed-verify window (AUTH-D26 c)")
+                .isEqualTo(RETENTION)
+                .isGreaterThan(Duration.ofHours(24));
+    }
+
+    @Test
+    @DisplayName("should_sweepFailureLogWithSameCutoff_when_sweepRuns")
+    void should_sweepFailureLogWithSameCutoff_when_sweepRuns() {
+        var job = new PhoneOtpCleanupJob(phoneOtpRepository, Clock.fixed(FIXED_NOW, ZoneOffset.UTC));
+
+        job.sweep();
+
+        verify(phoneOtpRepository).deleteFailuresBefore(FIXED_NOW.minus(RETENTION));
     }
 }

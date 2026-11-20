@@ -42,6 +42,7 @@ public class NotificationService {
     private final GuestProviderCancellationSmsText guestCancellationSmsText;
     private final GuestRescheduleSmsText guestRescheduleSmsText;
     private final GuestRescheduleSmsBudget guestRescheduleSmsBudget;
+    private final StaffInviteSmsChannel staffInviteSmsChannel;
     private final String frontendBaseUrl;
 
     /**
@@ -71,6 +72,7 @@ public class NotificationService {
             GuestProviderCancellationSmsText guestCancellationSmsText,
             GuestRescheduleSmsText guestRescheduleSmsText,
             GuestRescheduleSmsBudget guestRescheduleSmsBudget,
+            StaffInviteSmsChannel staffInviteSmsChannel,
             @Value("${app.frontend.base-url}") String frontendBaseUrl
     ) {
         this.emailService = emailService;
@@ -78,6 +80,7 @@ public class NotificationService {
         this.guestCancellationSmsText = guestCancellationSmsText;
         this.guestRescheduleSmsText = guestRescheduleSmsText;
         this.guestRescheduleSmsBudget = guestRescheduleSmsBudget;
+        this.staffInviteSmsChannel = staffInviteSmsChannel;
         this.frontendBaseUrl = frontendBaseUrl;
     }
 
@@ -518,18 +521,24 @@ public class NotificationService {
     }
 
     /**
-     * Forwards a pre-built invite acceptance URL to the email transport.
+     * B520 (NTF-59) — sends the staff invite SMS ({@link StaffInviteSmsText}) to the invited phone, synchronously on the
+     * outbox drain thread: invites are rare and the provider call is bounded by its client timeouts, and sending here
+     * (not handed to a pool) lets a provider failure propagate so the drain retries the row (at-least-once, like the
+     * invite e-mail it replaces). Not behind {@code app.booking.sms.enabled} (NTF-D14).
      *
-     * <p>The caller is responsible for URL construction and validation
-     * (scheme guard, encoding). See {@code InviteService.buildInviteLink}.
+     * <p>Audit-fix (perf) — the drain thread is protected by two bounds rather than a hand-off: the invite sender has
+     * its own short timeouts ({@code app.sms.smsclub.invite-*-timeout}, 2 s + 3 s), and a transient provider failure
+     * counts toward the outbox circuit breaker, so an SMSClub outage stalls a tick for at most the breaker threshold
+     * × those timeouts before the remaining rows are deferred.
      *
-     * @param email     recipient address
-     * @param inviteUrl the fully-built invite acceptance URL — caller is
-     *                  responsible for URL construction and validation
-     * @param salonName salon display name shown in the email body
+     * <p>The caller built and scheme-checked the URL ({@code InviteService.buildInviteLink}).
+     *
+     * @param phoneE164 the invited {@code +380…} number
+     * @param inviteUrl the join link — never logged
+     * @param salonName the inviting salon's name
      */
-    public void sendInviteEmail(String email, String inviteUrl, String salonName) {
-        emailService.sendInviteEmail(email, inviteUrl, salonName);
+    public void sendStaffInviteSms(String phoneE164, String inviteUrl, String salonName) {
+        staffInviteSmsChannel.send(phoneE164, StaffInviteSmsText.render(salonName, inviteUrl));
     }
 
     /**

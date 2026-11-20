@@ -77,8 +77,12 @@ class PhoneOtpSendConcurrencyIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("should_allowAtMostCapSends_when_concurrentSendsForSamePhone")
+    @DisplayName("concurrent sends for one phone stop at the cap of 3 (one per purpose: the 60 s cooldown, AUTH-D27 a)")
     void should_allowAtMostCapSends_when_concurrentSendsForSamePhone() throws Exception {
+        // Three anonymous purposes, so the per-purpose cooldown admits at most one send each and the per-phone lock
+        // must serialise the rest: without it two sends of one purpose (or a 4th row) could both pass.
+        PhoneOtpPurpose[] purposes = {PhoneOtpPurpose.GUEST_BOOKING, PhoneOtpPurpose.REGISTRATION,
+                PhoneOtpPurpose.PASSWORD_RESET};
         var startLatch = new CountDownLatch(1);
         var doneLatch = new CountDownLatch(PARALLEL_SENDS);
         var succeeded = new AtomicInteger();
@@ -86,15 +90,18 @@ class PhoneOtpSendConcurrencyIT extends AbstractIntegrationTest {
         ExecutorService pool = Executors.newFixedThreadPool(PARALLEL_SENDS);
         try {
             for (int i = 0; i < PARALLEL_SENDS; i++) {
+                PhoneOtpPurpose purpose = purposes[i % purposes.length];
                 pool.execute(() -> {
                     try {
                         startLatch.await();
-                        phoneOtpService.sendOtp(PHONE);
+                        phoneOtpService.sendCode(PHONE, null, purpose);
                         succeeded.incrementAndGet();
                     } catch (BusinessException e) {
                         if (e.getStatus() == HttpStatus.TOO_MANY_REQUESTS) {
                             tooMany.incrementAndGet();
                         }
+                    } catch (com.beautica.common.exception.ResendThrottledException e) {
+                        tooMany.incrementAndGet();
                     } catch (InterruptedException ie) {
                         Thread.currentThread().interrupt();
                     } finally {
@@ -116,7 +123,63 @@ class PhoneOtpSendConcurrencyIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("should_keepPreviousCodeVerifiable_when_newSendFails")
+    @DisplayName("B516: concurrent signed-in sends of ONE account over different phones still stop at the account cap of 3")
+    void should_allowAtMostCapSends_when_concurrentSendsOfOneAccountOverDifferentPhones() throws Exception {
+        java.util.UUID owner = java.util.UUID.randomUUID();
+        jdbc.update("INSERT INTO users (id, email, password_hash, role, is_active, email_verified) "
+                + "VALUES (?, ?, 'x', 'CLIENT', true, true)", owner, "acct-cap-" + owner + "@beautica.test");
+        var startLatch = new CountDownLatch(1);
+        var doneLatch = new CountDownLatch(PARALLEL_SENDS);
+        var succeeded = new AtomicInteger();
+        ExecutorService pool = Executors.newFixedThreadPool(PARALLEL_SENDS);
+        try {
+            for (int i = 0; i < PARALLEL_SENDS; i++) {
+                String phone = "+38050" + String.format("%07d", 1_000_000 + i);
+                pool.execute(() -> {
+                    try {
+                        startLatch.await();
+                        phoneOtpService.sendCode(phone, null, PhoneOtpPurpose.PHONE_ADD, owner);
+                        succeeded.incrementAndGet();
+                    } catch (BusinessException ignoredCapped) {
+                        // 429 — counted by the assertions below via the persisted rows
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                    } finally {
+                        doneLatch.countDown();
+                    }
+                });
+            }
+            startLatch.countDown();
+            assertThat(doneLatch.await(30, TimeUnit.SECONDS)).isTrue();
+        } finally {
+            pool.shutdownNow();
+        }
+
+        assertThat(succeeded.get()).as("sends that passed the per-account cap").isEqualTo(CAP);
+        assertThat(jdbc.queryForObject("SELECT count(*) FROM phone_otps WHERE user_id = ?", Integer.class, owner))
+                .as("persisted rows never exceed the per-account cap").isEqualTo(CAP);
+    }
+
+    @Test
+    @DisplayName("the per-phone cap counts every purpose together, so a guest + registration mix still stops at 3 SMS")
+    void should_throw429_when_fourthSendOfAnyPurposeMixWithinWindow() {
+        String phone = "+380671234599";
+        // Three different purposes: a repeat of one purpose inside 60 s is the resend cooldown (AUTH-D27 a), not the cap.
+        phoneOtpService.sendCode(phone, null, PhoneOtpPurpose.GUEST_BOOKING);
+        phoneOtpService.sendCode(phone, null, PhoneOtpPurpose.REGISTRATION);
+        phoneOtpService.sendCode(phone, null, PhoneOtpPurpose.PASSWORD_RESET);
+
+        assertThatThrownBy(() -> phoneOtpService.sendCode(phone, null, PhoneOtpPurpose.REGISTRATION))
+                .isInstanceOfSatisfying(BusinessException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(HttpStatus.TOO_MANY_REQUESTS));
+        assertThatThrownBy(() -> phoneOtpService.sendCode(phone, null, PhoneOtpPurpose.PASSWORD_RESET))
+                .isInstanceOfSatisfying(BusinessException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(HttpStatus.TOO_MANY_REQUESTS));
+        Mockito.verify(otpSmsSender, Mockito.times(CAP)).send(eq(phone), anyString());
+    }
+
+    @Test
+    @DisplayName("a failed new send leaves the previous code verifiable")
     void should_keepPreviousCodeVerifiable_when_newSendFails() throws Exception {
         insertOldCode();
         doThrow(new SmsDeliveryException("down")).when(otpSmsSender).send(eq(PHONE), anyString());
@@ -136,7 +199,7 @@ class PhoneOtpSendConcurrencyIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("should_return429OnFourthSend_when_threeSendsFailed")
+    @DisplayName("three failed sends still count: the fourth is 429")
     void should_return429OnFourthSend_when_threeSendsFailed() {
         doThrow(new SmsDeliveryException("down")).when(otpSmsSender).send(eq(PHONE), anyString());
 
@@ -144,6 +207,8 @@ class PhoneOtpSendConcurrencyIT extends AbstractIntegrationTest {
             assertThatThrownBy(() -> phoneOtpService.sendOtp(PHONE))
                     .extracting(ex -> ((BusinessException) ex).getStatus())
                     .isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
+            // AUTH-D27 (a): move past the 60 s resend cooldown; the rows stay in the 15-min window.
+            jdbc.update("UPDATE phone_otps SET created_at = created_at - interval '61 seconds' WHERE phone = ?", PHONE);
         }
 
         assertThatThrownBy(() -> phoneOtpService.sendOtp(PHONE))
@@ -154,13 +219,13 @@ class PhoneOtpSendConcurrencyIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("should_keepNewestCodeVerifiable_when_olderSendInvalidatesAfterNewerSend")
+    @DisplayName("an older send's late invalidation never kills the newest code")
     void should_keepNewestCodeVerifiable_when_olderSendInvalidatesAfterNewerSend() throws Exception {
         long idA = insertCode("222222");
         long idB = insertCode("333333");
 
         // A's post-delivery invalidation runs AFTER B committed its row.
-        new TransactionTemplate(txManager).executeWithoutResult(s -> phoneOtpRepository.markOlderAsUsed(PHONE, idA));
+        new TransactionTemplate(txManager).executeWithoutResult(s -> phoneOtpRepository.markOlderAsUsed(PHONE, PhoneOtpPurpose.GUEST_BOOKING, idA));
 
         assertThat(jdbc.queryForObject("SELECT used FROM phone_otps WHERE id = ?", Boolean.class, idB))
                 .as("the newer row is untouched by the older send").isFalse();
@@ -168,7 +233,7 @@ class PhoneOtpSendConcurrencyIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("should_verifyHigherIdRow_when_higherIdHasOlderCreatedAt")
+    @DisplayName("the higher-id row wins even with an older created_at")
     void should_verifyHigherIdRow_when_higherIdHasOlderCreatedAt() throws Exception {
         // Clock skew between instances: the higher-id (newer) row carries the OLDER created_at.
         jdbc.update("INSERT INTO phone_otps(phone, code_hash, expires_at, used, created_at) "
@@ -189,7 +254,7 @@ class PhoneOtpSendConcurrencyIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("should_invalidatePreviousCode_when_newSendSucceeds")
+    @DisplayName("a delivered new send invalidates the previous code")
     void should_invalidatePreviousCode_when_newSendSucceeds() throws Exception {
         insertOldCode();
 

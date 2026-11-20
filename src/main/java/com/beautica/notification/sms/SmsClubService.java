@@ -54,6 +54,7 @@ public class SmsClubService implements SmsService {
     private static final String OP_SEND = "send";
     private static final String REASON_NOT_CONFIGURED = "not_configured";
     private static final String REASON_AUTH = "auth";
+    private static final String REASON_RECIPIENT_INVALID_SPIKE = "recipient_invalid_spike";
     private static final int MAX_ERROR_BODY_BYTES = 4096;
     /** 4–8 digit runs (an OTP code, a partial number) are masked in provider text on top of {@code PiiRedactor}. */
     private static final Pattern SHORT_DIGIT_RUN = Pattern.compile("\\d{4,8}");
@@ -68,6 +69,8 @@ public class SmsClubService implements SmsService {
     private final Integer lifetimeMinutes;
     /** {@code null} outside staging — no cap in prod, and capture mode never builds this service. */
     private final StagingSmsDailyCap stagingDailyCap;
+    /** {@code null} disables the aggregate RECIPIENT_INVALID ERROR (tests); {@code SmsConfig} always wires one. */
+    private final RecipientInvalidSpikeAlarm recipientInvalidSpikeAlarm;
 
     /**
      * @param lifetimeMinutes provider {@code lifetime} in minutes; {@code null} omits the field, otherwise positive
@@ -81,6 +84,15 @@ public class SmsClubService implements SmsService {
      */
     public SmsClubService(RestClient.Builder restClientBuilder, SmsClubProperties properties, Integer lifetimeMinutes,
                           StagingSmsDailyCap stagingDailyCap) {
+        this(restClientBuilder, properties, lifetimeMinutes, stagingDailyCap, null);
+    }
+
+    /**
+     * @param recipientInvalidSpikeAlarm shared aggregate signal for RECIPIENT_INVALID rejections (phase 441 audit-fix);
+     *                                   {@code null} disables it
+     */
+    public SmsClubService(RestClient.Builder restClientBuilder, SmsClubProperties properties, Integer lifetimeMinutes,
+                          StagingSmsDailyCap stagingDailyCap, RecipientInvalidSpikeAlarm recipientInvalidSpikeAlarm) {
         if (lifetimeMinutes != null && lifetimeMinutes <= 0) {
             throw new IllegalStateException("app.sms.smsclub lifetime must be positive");
         }
@@ -99,6 +111,7 @@ public class SmsClubService implements SmsService {
         this.senderName = properties.getSenderName();
         this.lifetimeMinutes = lifetimeMinutes;
         this.stagingDailyCap = stagingDailyCap;
+        this.recipientInvalidSpikeAlarm = recipientInvalidSpikeAlarm;
     }
 
     @Override
@@ -144,7 +157,7 @@ public class SmsClubService implements SmsService {
             if (SmsTransportErrors.isOutcomeUnknownOrCancelled(e)) {
                 throw new SmsDeliveryAmbiguousException("SMS delivery outcome unknown", e);
             }
-            throw new SmsDeliveryException("SMS delivery failed", e);
+            throw new SmsDeliveryException("SMS delivery failed", e, true);
         }
     }
 
@@ -176,11 +189,19 @@ public class SmsClubService implements SmsService {
         } else if (providerText.isEmpty()) {
             reason = "http_" + code;
         } else {
-            reason = Reason.of(providerText).name();
+            Reason parsed = Reason.of(providerText);
+            if (parsed == Reason.RECIPIENT_INVALID) {
+                logRecipientInvalid(to);
+                return new SmsDeliveryException("SMSClub rejected the request with HTTP " + code);
+            }
+            reason = parsed.name();
         }
         String detail = providerText.isEmpty() ? unparsedDetail(errorBody) : scrub(providerText, digits, text);
         failure(to).http(code).reason(reason).detail(detail).log(log);
-        return new SmsDeliveryException("SMSClub rejected the request with HTTP " + code);
+        // 5xx / 429: the provider is down or throttling — transient (counted by the outbox breaker). 4xx: a refusal.
+        boolean providerSide = code >= HttpStatus.INTERNAL_SERVER_ERROR.value()
+                || code == HttpStatus.TOO_MANY_REQUESTS.value();
+        return new SmsDeliveryException("SMSClub rejected the request with HTTP " + code, null, providerSide);
     }
 
     /**
@@ -255,11 +276,30 @@ public class SmsClubService implements SmsService {
         if (addInfo.isObject() && !addInfo.isEmpty()) {
             String providerText = rejectionText(addInfo, digits);
             Reason reason = Reason.of(providerText);
+            if (reason == Reason.RECIPIENT_INVALID) {
+                logRecipientInvalid(to);
+                throw new SmsDeliveryException("SMSClub rejected the message reason=" + reason);
+            }
             failure(to).http(HttpStatus.OK.value()).reason(reason.name())
                     .detail(scrub(providerText, digits, text)).log(log);
             throw new SmsDeliveryException("SMSClub rejected the message reason=" + reason);
         }
         throw ambiguous(to, null);
+    }
+
+    /**
+     * The provider rejected the recipient number itself (user input, not an outage): WARN per send. Same shape as the
+     * pre-send {@code RECIPIENT_NOT_UA_MOBILE} line; {@code to} is already masked. A spike of them within the alarm's
+     * window (our own number formatting regressed, or an abuse flood) logs ONE aggregate ERROR so it reaches Sentry.
+     */
+    private void logRecipientInvalid(String to) {
+        log.warn("SMS send status=FAILED provider={} to={} reason=RECIPIENT_INVALID", PROVIDER, to);
+        if (recipientInvalidSpikeAlarm != null && recipientInvalidSpikeAlarm.recordAndCheck()) {
+            ExternalCallFailure.of(PROVIDER, OP_SEND).reason(REASON_RECIPIENT_INVALID_SPIKE)
+                    .detail("count=" + recipientInvalidSpikeAlarm.threshold()
+                            + " window=" + recipientInvalidSpikeAlarm.window())
+                    .log(log);
+        }
     }
 
     private static JsonNode parse(String responseBody, String to) {
@@ -300,7 +340,10 @@ public class SmsClubService implements SmsService {
 
     /** Fixed reason tokens for the provider's {@code add_info} texts; the raw text never leaves this class. */
     enum Reason {
-        PHONE_INVALID("incorrect phone number", "phone number cannot be blank", "incorrect phones array"),
+        // Before PHONE_INVALID: a rejected recipient number is user input (WARN); the rest are malformed requests (ERROR).
+        // Full RU/UA phrases on purpose: a bare «некорректный номер» prefix would also catch «… отправителя» (sender).
+        RECIPIENT_INVALID("incorrect phone number", "некорректный номер получателя", "некоректний номер одержувача"),
+        PHONE_INVALID("phone number cannot be blank", "incorrect phones array"),
         SENDER_INVALID("sender name cannot be blank", "sender name is incorrect", "sender name has state"),
         MESSAGE_BLANK("message cannot be blank"),
         BLACKLISTED("this number is in the black list"),

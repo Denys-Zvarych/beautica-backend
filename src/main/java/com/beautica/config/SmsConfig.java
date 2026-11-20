@@ -6,6 +6,7 @@ import com.beautica.notification.sms.CapturingSmsService;
 import com.beautica.notification.sms.NoOpSmsService;
 import com.beautica.notification.sms.OtpSmsSender;
 import com.beautica.notification.sms.SmsClubOtpSmsSender;
+import com.beautica.notification.sms.RecipientInvalidSpikeAlarm;
 import com.beautica.notification.sms.SmsClubService;
 import com.beautica.notification.sms.SmsService;
 import com.beautica.notification.sms.StagingSmsDailyCap;
@@ -235,23 +236,42 @@ public class SmsConfig {
     @OnSmsClubMode
     @ConditionalOnProperty(prefix = "app.booking.sms", name = "enabled", havingValue = "true")
     public SmsService smsClubService(RestClient.Builder restClientBuilder, SmsClubProperties properties,
-                                     ObjectProvider<StagingSmsDailyCap> stagingDailyCap) {
+                                     ObjectProvider<StagingSmsDailyCap> stagingDailyCap,
+                                     RecipientInvalidSpikeAlarm recipientInvalidSpikeAlarm) {
         log.info("Booking SMS is ENABLED (app.booking.sms.enabled=true) in SMSCLUB mode — "
                 + "registering SmsClubService; outbound messages will be billed");
         return new SmsClubService(restClientBuilder, properties, properties.getLifetimeMinutes(),
-                stagingDailyCap.getIfAvailable());
+                stagingDailyCap.getIfAvailable(), recipientInvalidSpikeAlarm);
     }
 
     /**
      * Phase 439 — the auth-channel sender in {@code smsclub} mode: unconditional on the money gate, like
-     * {@link #otpSmsSender}, with its own {@link SmsClubService} built with the OTP lifetime.
+     * {@link #otpSmsSender}, with its own {@link SmsClubService} built with the OTP lifetime. B520 audit-fix: a second
+     * instance for the staff invite SMS ({@link OtpSmsSender#sendStaffInvite}) with {@code invite-lifetime-minutes}
+     * and the invite timeouts — still ONE {@link OtpSmsSender} bean.
      */
     @Bean
     @OnSmsClubMode
     public OtpSmsSender smsClubOtpSmsSender(RestClient.Builder restClientBuilder, SmsClubProperties properties,
-                                            ObjectProvider<StagingSmsDailyCap> stagingDailyCap) {
-        return new SmsClubOtpSmsSender(new SmsClubService(restClientBuilder, properties,
-                properties.getOtpLifetimeMinutes(), stagingDailyCap.getIfAvailable()));
+                                            ObjectProvider<StagingSmsDailyCap> stagingDailyCap,
+                                            RecipientInvalidSpikeAlarm recipientInvalidSpikeAlarm) {
+        StagingSmsDailyCap cap = stagingDailyCap.getIfAvailable();
+        SmsClubService otp = new SmsClubService(restClientBuilder, properties, properties.getOtpLifetimeMinutes(), cap,
+                recipientInvalidSpikeAlarm);
+        SmsClubService invite = new SmsClubService(restClientBuilder.clone(), properties.forStaffInvite(),
+                properties.getInviteLifetimeMinutes(), cap, recipientInvalidSpikeAlarm);
+        return new SmsClubOtpSmsSender(otp, invite);
+    }
+
+    /**
+     * Phase 441 audit-fix — one aggregate RECIPIENT_INVALID counter, shared by every {@link SmsClubService} above
+     * (booking, OTP and staff invite), so a spike across them raises ONE ERROR per window.
+     */
+    @Bean
+    @OnSmsClubMode
+    public RecipientInvalidSpikeAlarm recipientInvalidSpikeAlarm(Clock clock, SmsClubProperties properties) {
+        return new RecipientInvalidSpikeAlarm(clock, properties.getRecipientInvalidSpikeThreshold(),
+                properties.getRecipientInvalidSpikeWindow());
     }
 
     /**

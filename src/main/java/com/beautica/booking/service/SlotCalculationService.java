@@ -17,8 +17,10 @@ import com.beautica.master.dto.EffectiveDayResponse;
 import com.beautica.master.dto.MasterWorkingDayResponse;
 import com.beautica.master.dto.WorkIntervalDto;
 import com.beautica.master.service.MasterScheduleService;
+import com.beautica.master.service.SpanBoundedDays;
 import com.beautica.master.service.ScheduleDateMath;
 import com.beautica.service.entity.MasterServiceAssignment;
+import com.beautica.service.repository.BookableAssignmentDurationRow;
 import com.beautica.service.repository.MasterServiceRepository;
 import org.springframework.cache.annotation.Cacheable;
 import org.springframework.stereotype.Service;
@@ -42,6 +44,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.function.Function;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
 @Service
@@ -944,13 +947,14 @@ public class SlotCalculationService {
      * {@code NO_SCHEDULE} list) for every master it was asked about — the default here is defensive,
      * not load-bearing.
      *
-     * <p><b>Memoised by effective DURATION, per master (phase-302 audit LOW-4; kept per master by
-     * Phase 315).</b> {@code days}, {@code occupiedByDay} and {@code cutoff} are loop-invariant WITHIN
-     * one master's evaluation, so {@link #hasFreeFutureSlot}'s verdict is a pure function of
-     * {@link #effectiveDuration} for that master. The memo map is allocated FRESH per master — sharing
-     * one memo across the whole batch would let master A's duration-600 verdict answer for master B's
-     * identical duration, which is wrong whenever the two masters' schedules or bookings differ (case 7
-     * pins this). {@code Duration} is a value type with proper {@code equals}/{@code hashCode}.
+     * <p><b>Evaluated by effective DURATION, per master (phase-302 audit LOW-4; kept per master by
+     * Phase 315; monotone search since B523).</b> {@code days}, {@code occupiedByDay} and
+     * {@code cutoff} are loop-invariant WITHIN one master's evaluation, so {@link #hasFreeFutureSlot}'s
+     * verdict is a pure, monotone function of {@link #effectiveDuration} for that master — each
+     * master's DISTINCT durations are searched for the longest that fits
+     * ({@link #longestFittingDuration}). The search is FRESH per master — sharing verdicts across the
+     * whole batch would let master A's duration-600 verdict answer for master B's identical duration,
+     * which is wrong whenever the two masters' schedules or bookings differ (case 7 pins this).
      *
      * <p>Bind-parameter ceiling / no chunking (D11): documented on
      * {@code MasterScheduleService#resolveEffectiveRangeBatch} and
@@ -959,13 +963,38 @@ public class SlotCalculationService {
     @Transactional(readOnly = true)
     public Map<UUID, List<MasterServiceAssignment>> filterBookableAssignmentsBatch(
             Map<UUID, List<MasterServiceAssignment>> assignmentsByMaster) {
-        List<UUID> loadedMasterIds = assignmentsByMaster.entrySet().stream()
+        return filterBookableBatch(assignmentsByMaster, this::effectiveDuration);
+    }
+
+    /**
+     * Duration-row overload of {@link #filterBookableAssignmentsBatch} (B523 perf fix): the same gate
+     * — same horizon, same three batched loads, same per-master duration memo, same
+     * {@link #hasFreeFutureSlot} — fed the narrow
+     * {@link BookableAssignmentDurationRow} projection instead of managed assignment entities, so a
+     * cold search resolve over thousands of masters hydrates no entity graph. The effective duration
+     * is the ONE formula ({@link #effectiveDuration(Integer, int, int)}) the entity form also uses,
+     * so the two overloads cannot disagree for the same assignment.
+     */
+    @Transactional(readOnly = true)
+    public Map<UUID, List<BookableAssignmentDurationRow>> filterBookableDurationsBatch(
+            Map<UUID, List<BookableAssignmentDurationRow>> rowsByMaster) {
+        return filterBookableBatch(rowsByMaster, row -> effectiveDuration(
+                row.getDurationOverrideMinutes(), row.getBaseDurationMinutes(), row.getBufferMinutesAfter()));
+    }
+
+    /**
+     * The body both public overloads share — the pre-B523 {@code filterBookableAssignmentsBatch}
+     * verbatim, generic only over how a candidate yields its effective duration.
+     */
+    private <T> Map<UUID, List<T>> filterBookableBatch(
+            Map<UUID, List<T>> candidatesByMaster, Function<T, Duration> durationOf) {
+        List<UUID> loadedMasterIds = candidatesByMaster.entrySet().stream()
                 .filter(e -> !e.getValue().isEmpty())
                 .map(Map.Entry::getKey)
                 .toList();
 
         Instant cutoff = bookableCutoff();
-        Map<UUID, List<MasterServiceAssignment>> gated;
+        Map<UUID, List<T>> gated;
         if (loadedMasterIds.isEmpty()) {
             gated = Map.of();
         } else {
@@ -979,12 +1008,12 @@ public class SlotCalculationService {
             // per-master loop verbatim, only relocated into the callback.
             gated = masterScheduleService.reduceEffectiveRangeBatch(loadedMasterIds, from, to,
                     (masterId, days) -> gateByDuration(
-                            assignmentsByMaster.get(masterId), days,
+                            candidatesByMaster.get(masterId), durationOf, days,
                             occupiedByMaster.getOrDefault(masterId, Map.of()), cutoff));
         }
 
-        Map<UUID, List<MasterServiceAssignment>> result = new LinkedHashMap<>();
-        for (Map.Entry<UUID, List<MasterServiceAssignment>> entry : assignmentsByMaster.entrySet()) {
+        Map<UUID, List<T>> result = new LinkedHashMap<>();
+        for (Map.Entry<UUID, List<T>> entry : candidatesByMaster.entrySet()) {
             // A master excluded from loadedMasterIds (empty assignment list) keeps its D3.3
             // zero-cost List.of(); every loaded master is a key of `gated` by construction, the
             // getOrDefault being defensive rather than load-bearing.
@@ -996,28 +1025,86 @@ public class SlotCalculationService {
     }
 
     /**
-     * One master's bookable subset: the assignments whose effective duration fits somewhere in
-     * {@code days}, memoised by duration (phase-302 audit LOW-4, kept per master by Phase 315 — see
-     * {@link #filterBookableAssignmentsBatch}).
+     * One master's bookable subset: the candidates whose effective duration fits somewhere in
+     * {@code days} — every candidate up to the longest fitting DISTINCT duration
+     * ({@link #longestFittingDuration}; per master, see {@link #filterBookableAssignmentsBatch}).
      *
      * <p>{@code days} may be a lazily folding view
-     * ({@code MasterScheduleService#reduceEffectiveRangeBatch}), so the memo earns a second keep:
-     * besides skipping a repeated walk, it stops two same-duration assignments from re-walking — and
-     * therefore re-folding — the same prefix. The view memoises folded days itself, so even the
-     * distinct-duration walks share every day either of them reaches.
+     * ({@code MasterScheduleService#reduceEffectiveRangeBatch}): walking each distinct duration at
+     * most once, and only O(log k) of them, stops same- or redundant-duration assignments from
+     * re-walking — and therefore re-folding — the same prefix. The view memoises folded days itself,
+     * so even the distinct-duration walks share every day either of them reaches.
      */
-    private List<MasterServiceAssignment> gateByDuration(
-            List<MasterServiceAssignment> assignments, List<EffectiveDayResponse> days,
+    private <T> List<T> gateByDuration(
+            List<T> candidates, Function<T, Duration> durationOf, List<EffectiveDayResponse> days,
             Map<LocalDate, List<TimeRange>> occupiedByDay, Instant cutoff) {
-        Map<Duration, Boolean> verdictByDuration = new HashMap<>();
-        List<MasterServiceAssignment> bookable = new ArrayList<>();
-        for (MasterServiceAssignment msa : assignments) {
-            if (verdictByDuration.computeIfAbsent(effectiveDuration(msa),
-                    duration -> hasFreeFutureSlot(days, duration, occupiedByDay, cutoff))) {
-                bookable.add(msa);
+        List<Duration> ascending = candidates.stream().map(durationOf).distinct().sorted().toList();
+        if (exceedsEveryWindow(ascending, days)) {
+            return new ArrayList<>();
+        }
+        Duration longestFitting = longestFittingDuration(ascending,
+                duration -> hasFreeFutureSlot(days, duration, occupiedByDay, cutoff));
+        List<T> bookable = new ArrayList<>();
+        if (longestFitting == null) {
+            return bookable;
+        }
+        for (T candidate : candidates) {
+            if (durationOf.apply(candidate).compareTo(longestFitting) <= 0) {
+                bookable.add(candidate);
             }
         }
         return bookable;
+    }
+
+    /**
+     * Exact early exit (B523 perf fix): true when even the master's SHORTEST duration is longer than
+     * the longest span any day of the range can offer ({@link SpanBoundedDays#longestPossibleSpan()},
+     * read off the loaded schedule rows without folding a day). {@link #hasFreeFutureSlot} would then
+     * walk every day of the horizon and return false for every duration — the costliest shape of the
+     * gate — so the verdict is the same empty list, minus the walk. The bound carries an hour of DST
+     * slack and counts any unread override shape as a whole day, so it can never skip a master that
+     * fits. A day list without the capability (a plain list) is always walked.
+     */
+    private static boolean exceedsEveryWindow(List<Duration> ascending, List<EffectiveDayResponse> days) {
+        return !ascending.isEmpty()
+                && days instanceof SpanBoundedDays bounded
+                && ascending.get(0).compareTo(bounded.longestPossibleSpan()) > 0;
+    }
+
+    /**
+     * The longest of {@code ascending} (distinct, sorted) durations that {@code fits}, or {@code null}
+     * when none does — found with O(log k) walks instead of one walk per distinct duration (B523 perf
+     * fix: a master with no free day used to walk the whole 181-day horizon once PER service).
+     *
+     * <p><b>Why this is the same verdict, not an approximation.</b> {@link #hasFreeFutureSlot} is
+     * monotone in the duration: a start {@code t} that fits {@code d} — {@code t + d} inside the
+     * interval / the Kyiv day, at or after the cutoff, overlapping no booking — also fits every
+     * shorter {@code d'} (a sub-range of a free range is free; the 30-minute grid and the declared
+     * times do not depend on the duration). So {@code fits(d) ⇒ fits(d' < d)}: the fitting durations
+     * are exactly a prefix of {@code ascending}, and keeping every candidate up to the longest
+     * fitting one returns the set the per-duration loop returned. The shortest is tried first (no
+     * free slot for it ⇒ none for any), then the longest (fits ⇒ all fit) — one or two walks in
+     * the two common shapes — then a binary search between them.
+     */
+    static Duration longestFittingDuration(List<Duration> ascending, Predicate<Duration> fits) {
+        if (ascending.isEmpty() || !fits.test(ascending.get(0))) {
+            return null;
+        }
+        int last = ascending.size() - 1;
+        if (last == 0 || fits.test(ascending.get(last))) {
+            return ascending.get(last);
+        }
+        int lo = 0;          // fits
+        int hi = last - 1;   // last does not fit
+        while (lo < hi) {
+            int mid = (lo + hi + 1) >>> 1;
+            if (fits.test(ascending.get(mid))) {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        return ascending.get(lo);
     }
 
     // ── shared internals ────────────────────────────────────────────────────────────────────
@@ -1166,10 +1253,16 @@ public class SlotCalculationService {
 
     /** Effective service duration + buffer (override beats base). Shared by the slot list and the gate. */
     private Duration effectiveDuration(MasterServiceAssignment msa) {
-        int durationMinutes = msa.getDurationOverrideMinutes() != null
-                ? msa.getDurationOverrideMinutes()
-                : msa.getServiceDefinition().getBaseDurationMinutes();
-        return Duration.ofMinutes(durationMinutes + msa.getServiceDefinition().getBufferMinutesAfter());
+        return effectiveDuration(msa.getDurationOverrideMinutes(),
+                msa.getServiceDefinition().getBaseDurationMinutes(),
+                msa.getServiceDefinition().getBufferMinutesAfter());
+    }
+
+    /** THE effective-duration formula — override beats base, plus the buffer — for both gate inputs. */
+    private static Duration effectiveDuration(Integer durationOverrideMinutes, int baseDurationMinutes,
+                                              int bufferMinutesAfter) {
+        int durationMinutes = durationOverrideMinutes != null ? durationOverrideMinutes : baseDurationMinutes;
+        return Duration.ofMinutes(durationMinutes + bufferMinutesAfter);
     }
 
     /**
@@ -1394,12 +1487,13 @@ public class SlotCalculationService {
         OffsetDateTime windowStart = from.atStartOfDay(TimeZones.KYIV).toOffsetDateTime();
         OffsetDateTime windowEnd = to.plusDays(1).atStartOfDay(TimeZones.KYIV).toOffsetDateTime();
         Map<UUID, Map<LocalDate, List<TimeRange>>> byMaster = new HashMap<>();
+        UUID[] ids = masterIds.stream().distinct().toArray(UUID[]::new);
         for (BookingMasterTimeRange b : bookingRepository
-                .findActiveTimeRangesByMasterIdsInRange(masterIds, windowStart, windowEnd)) {
-            TimeRange range = new TimeRange(b.startsAt().toInstant(), b.endsAt().toInstant());
+                .findActiveTimeRangesByMasterIdsInRange(ids, windowStart, windowEnd)) {
+            TimeRange range = new TimeRange(b.getStartsAt(), b.getEndsAt());
             LocalDate firstDay = LocalDate.ofInstant(range.start(), TimeZones.KYIV);
             LocalDate lastDay = LocalDate.ofInstant(range.end().minusNanos(1), TimeZones.KYIV);
-            Map<LocalDate, List<TimeRange>> byDay = byMaster.computeIfAbsent(b.masterId(), k -> new HashMap<>());
+            Map<LocalDate, List<TimeRange>> byDay = byMaster.computeIfAbsent(b.getMasterId(), k -> new HashMap<>());
             for (LocalDate d = firstDay; !d.isAfter(lastDay); d = d.plusDays(1)) {
                 byDay.computeIfAbsent(d, k -> new ArrayList<>()).add(range);
             }

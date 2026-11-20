@@ -99,7 +99,7 @@ class AuthControllerInviteTokenSizeTest {
     void should_delegateToService_when_tokenIs256Chars() throws Exception {
         String token = "a".repeat(256);
         var preview = new InvitePreviewResponse(
-                "master@beautica.test", Role.SALON_MASTER,
+                "+380 •• ••• •• 67", Role.SALON_MASTER, "Salon",
                 Instant.now().plus(7, ChronoUnit.DAYS));
         when(inviteService.previewInvite(eq(token))).thenReturn(preview);
 
@@ -107,7 +107,7 @@ class AuthControllerInviteTokenSizeTest {
         mvc.perform(get(VALIDATE_URL).param("token", token).accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.success").value(true))
-                .andExpect(jsonPath("$.data.invitedEmail").value("master@beautica.test"))
+                .andExpect(jsonPath("$.data.phoneMasked").value("+380 •• ••• •• 67"))
                 .andExpect(jsonPath("$.data.role").value("SALON_MASTER"));
 
         verify(inviteService).previewInvite(eq(token));
@@ -118,7 +118,7 @@ class AuthControllerInviteTokenSizeTest {
     void should_delegateToService_when_tokenIsExactly512Chars() throws Exception {
         String token = "b".repeat(512);
         var preview = new InvitePreviewResponse(
-                "edge@beautica.test", Role.SALON_ADMIN,
+                "+380 •• ••• •• 67", Role.SALON_ADMIN, "Salon",
                 Instant.now().plus(1, ChronoUnit.DAYS));
         when(inviteService.previewInvite(eq(token))).thenReturn(preview);
 

@@ -181,7 +181,7 @@ class MasterProfileUpdateContractIT extends AbstractIntegrationTest {
 
         // 1) Set professionalTitle and read the column back FROM THE DATABASE (not the echo).
         var setBody = new LinkedHashMap<String, Object>();
-        setBody.put("phoneNumber", "+380671234567");
+        // B516 (AUTH-44): no phoneNumber here — a profile write can no longer set a phone (PHONE_CHANGE_REQUIRES_OTP).
         setBody.put("professionalTitle", "Візажист");
 
         log.debug("Act: PATCH /me/profile setting professionalTitle='Візажист'");

@@ -3,6 +3,10 @@ package com.beautica.notification.inapp.push;
 import com.beautica.notification.service.EmailNotificationService;
 import com.beautica.notification.service.NotificationOutboxDrainWorker;
 import com.beautica.notification.service.NotificationOutboxService;
+import com.beautica.notification.service.RequestDecisionEvent;
+import com.beautica.notification.service.RequestDecisionLoader;
+import com.beautica.notification.service.RequestDecisionTarget;
+import com.beautica.notification.service.RequestKind;
 import com.google.firebase.messaging.Message;
 import io.micrometer.core.instrument.MeterRegistry;
 import jakarta.mail.Session;
@@ -25,6 +29,7 @@ import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
@@ -40,7 +45,7 @@ import static org.mockito.Mockito.when;
  * real {@link NotificationOutboxDrainWorker}, real {@code NotificationService}, and a REAL
  * {@link EmailNotificationService} (real Thymeleaf engine) whose only fake is the SMTP edge: a
  * {@link JavaMailSender} that throws {@link MailSendException} on every send (a Brevo outage / {@code PENDING}
- * creds). The base class's {@code @MockBean EmailNotificationService} delegates {@code sendInviteEmail} to
+ * creds). The base class's {@code @MockBean EmailNotificationService} delegates {@code sendRequestDecisionEmail} (B520: was the invite e-mail) to
  * that real instance, so the {@code MailException -> EmailDeliveryException(transient)} translation runs for
  * real. Push goes through the real dispatcher to the mocked FCM edge ({@code FirebaseSender}).
  *
@@ -77,19 +82,47 @@ class OutboxSmtpOutageIT extends AbstractInAppPushFlowIT {
         EmailNotificationService realEmail =
                 new EmailNotificationService(failingSmtp, templateEngine, "noreply@beautica.app");
         doAnswer(inv -> {
-            realEmail.sendInviteEmail(inv.getArgument(0), inv.getArgument(1), inv.getArgument(2));
+            realEmail.sendRequestDecisionEmail(inv.getArgument(0), inv.getArgument(1), inv.getArgument(2),
+                    inv.getArgument(3), inv.getArgument(4));
             return null;
-        }).when(emailNotificationService).sendInviteEmail(anyString(), anyString(), anyString());
+        }).when(emailNotificationService).sendRequestDecisionEmail(anyString(), any(), anyBoolean(), anyString(), any());
+        // B520: the invite is an SMS now — the requester's decision e-mail (REQUEST_DECIDED) is this test's e-mail row.
+        // The loader is mocked so no category-request fixture is needed: every row resolves to its seeded address.
+        recipients.clear();
+        when(requestDecisionLoader.load(any())).thenAnswer(inv -> snapshotFor(inv.getArgument(0)));
     }
 
     /** Enqueues one INVITE row through the real service and backdates it, so claim order is deterministic. */
-    private UUID enqueueInvite(String email, int minutesAgo) {
+    private UUID enqueueEmail(String email, int minutesAgo) {
         UUID aggregateId = UUID.randomUUID();
-        new TransactionTemplate(txManager).executeWithoutResult(status -> outboxService.enqueueInvite(
-                aggregateId, email, "https://beautica.app/invite/accept?token=QA367", "QA Salon"));
+        recipients.put(aggregateId, email);
+        new TransactionTemplate(txManager).executeWithoutResult(status -> outboxService.enqueueRequestDecided(
+                RequestKind.CATEGORY_REQUEST, "1", true, aggregateId));
         jdbcTemplate.update("UPDATE notification_outbox SET created_at = now() - make_interval(mins => ?) "
                 + "WHERE aggregate_id = ?", minutesAgo, aggregateId);
         return aggregateId;
+    }
+
+    @org.springframework.boot.test.mock.mockito.MockBean
+    private RequestDecisionLoader requestDecisionLoader;
+
+    /** Recipient user id (= aggregate id) → address, per test. */
+    private final Map<UUID, String> recipients = new java.util.concurrent.ConcurrentHashMap<>();
+
+    private RequestDecisionLoader.Snapshot snapshotFor(java.util.Collection<RequestDecisionEvent> events) {
+        Map<UUID, com.beautica.user.User> users = new java.util.HashMap<>();
+        for (RequestDecisionEvent event : events) {
+            com.beautica.user.User user = mock(com.beautica.user.User.class);
+            when(user.getEmail()).thenReturn(recipients.get(event.recipientUserId()));
+            when(user.isActive()).thenReturn(true);
+            users.put(event.recipientUserId(), user);
+        }
+        RequestDecisionLoader.Snapshot snapshot = mock(RequestDecisionLoader.Snapshot.class);
+        when(snapshot.target(any())).thenAnswer(inv -> new RequestDecisionTarget("Манікюр", null,
+                ((RequestDecisionEvent) inv.getArgument(0)).recipientUserId()));
+        when(snapshot.recipient(any())).thenAnswer(inv ->
+                users.get(((RequestDecisionEvent) inv.getArgument(0)).recipientUserId()));
+        return snapshot;
     }
 
     private Map<String, Object> row(UUID aggregateId) {
@@ -105,7 +138,7 @@ class OutboxSmtpOutageIT extends AbstractInAppPushFlowIT {
     @DisplayName("an invite whose SMTP send keeps failing is retried on each tick and lands DEAD after 3 attempts — "
             + "never SENT, last_error names the template only, DEAD counter +1")
     void should_retryThenDeadLetter_when_smtpKeepsFailing() {
-        UUID invite = enqueueInvite("invitee-zq91@beautica.test", 1);
+        UUID invite = enqueueEmail("invitee-zq91@beautica.test", 1);
         double deadBefore = counter(DEAD_METRIC);
 
         drainWorker.drain();
@@ -144,10 +177,10 @@ class OutboxSmtpOutageIT extends AbstractInAppPushFlowIT {
         jdbcTemplate.update("DELETE FROM notification_outbox WHERE event_type <> 'INAPP_PUSH'");
         assertThat(countOutbox("INAPP_PUSH")).as("one push row per provider feed row").isEqualTo(3);
         // E-mail rows OLDER than the push rows: under plain oldest-first they would be claimed first.
-        UUID oldest = enqueueInvite("outage-a@beautica.test", 40);
-        UUID second = enqueueInvite("outage-b@beautica.test", 30);
-        UUID third = enqueueInvite("outage-c@beautica.test", 20);
-        UUID youngest = enqueueInvite("outage-d@beautica.test", 10);
+        UUID oldest = enqueueEmail("outage-a@beautica.test", 40);
+        UUID second = enqueueEmail("outage-b@beautica.test", 30);
+        UUID third = enqueueEmail("outage-c@beautica.test", 20);
+        UUID youngest = enqueueEmail("outage-d@beautica.test", 10);
         double tripsBefore = counter(BREAKER_METRIC);
 
         drainWorker.drain();

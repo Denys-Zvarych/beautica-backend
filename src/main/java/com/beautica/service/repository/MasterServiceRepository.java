@@ -534,39 +534,56 @@ public interface MasterServiceRepository extends JpaRepository<MasterServiceAssi
     List<MasterServiceAssignment> findBookableAssignmentsBySalon(@Param("salonId") UUID salonId);
 
     /**
-     * Master-scoped sibling of {@link #findBookableAssignmentsBySalon}: the strict-verdict
-     * candidates of each given master, for the public
-     * {@code GET /masters/{id}/services} tab ({@code BookingMasterService#getBookableAssignmentIds}), which feed them to the same
-     * {@code SlotCalculationService#filterBookableAssignmentsBatch} the salon catalogue uses.
+     * Master-scoped strict-verdict candidates: the active assignments of each given master, as the
+     * narrow {@link BookableAssignmentDurationRow} the free-slot gate needs
+     * ({@code SlotCalculationService#filterBookableDurationsBatch}). Backs
+     * {@code BookingMasterService#computeBookableAssignmentIds} — the public
+     * {@code GET /masters/{id}/services} tab and the search / roster resolver (SRCH-30/31, SAL-09).
      *
      * <p>Ownership follows the master's CURRENT context, the same rule as
      * {@code MasterBookabilitySql}: a salon-attached master's definition must be SALON-owned by that
      * salon (closing the rotated-master / cross-salon leaks exactly as the salon finder does), a
-     * salon-less master's must be INDEPENDENT_MASTER-owned by that master. {@code s.isActive} is
+     * salon-less master's must be INDEPENDENT_MASTER-owned by that master. {@code s.is_active} is
      * required for a salon-attached master because {@code SalonService.deactivateSalon} does not
      * cascade to {@code masters.is_active} — the {@code MasterBookability#isBookable} rule.
      *
-     * <p>{@code LEFT JOIN FETCH m.salon} keeps salon-less independent masters. Bounded by the caller's
-     * id set (one master for a detail read); callers MUST short-circuit an empty {@code masterIds}.
+     * <p><b>Projection + one array bind (B523 perf fix).</b> This replaced a JPQL
+     * {@code JOIN FETCH} of assignment, definition, master and salon entities with an
+     * {@code IN (:masterIds)} list: a cold search resolve hands up to 2 000 masters here, and the
+     * entity graph plus a 2 000-placeholder statement dominated its 1.5 s. Same WHERE, column for
+     * column. The ids are ONE {@code uuid[]} bind whatever the set size, so the statement text (and
+     * its server-side plan) is identical for every call, and they are JOINED as
+     * {@code unnest(:masterIds)} rather than tested with {@code master_id = ANY(:masterIds)}: a
+     * parameter array is never hashed, so the {@code ANY} form re-scanned all 2 000 ids for every
+     * {@code master_services} row and was measured at 1–3 s (statement timeout under load) on a
+     * fresh table, where the join drives the {@code master_id} index (or a hash join) from the
+     * array. The ids are unique (the resolver passes distinct masters), so the join adds no
+     * duplicate rows. The two-armed ownership rule is spelled as equalities
+     * ({@code sd.owner_id = COALESCE(m.salon_id, m.id)} plus the matching owner type) rather than an
+     * {@code OR} of two arms — the same rule, but one the planner can use as a join condition; the
+     * {@code OR} form let a stale row estimate pick a masters × definitions cartesian product
+     * (measured 2.4 s for 2 000 masters). Callers MUST short-circuit an empty array.
      */
-    @Query("""
-            SELECT msa FROM MasterServiceAssignment msa
-            JOIN FETCH msa.serviceDefinition sd
-            JOIN FETCH msa.master m
-            LEFT JOIN FETCH m.salon s
-            WHERE m.id IN :masterIds
-              AND m.isActive = true
-              AND msa.isActive = true
-              AND sd.isActive = true
-              AND ((s IS NOT NULL AND s.isActive = true
-                    AND sd.ownerType = com.beautica.service.entity.OwnerType.SALON
-                    AND sd.ownerId = s.id)
-                OR (s IS NULL
-                    AND sd.ownerType = com.beautica.service.entity.OwnerType.INDEPENDENT_MASTER
-                    AND sd.ownerId = m.id))
-            """)
-    List<MasterServiceAssignment> findBookableAssignmentsByMasterIds(
-            @Param("masterIds") Collection<UUID> masterIds);
+    @Query(value = """
+            SELECT msa.id                        AS assignmentId,
+                   msa.master_id                 AS masterId,
+                   msa.duration_override_minutes AS durationOverrideMinutes,
+                   sd.base_duration_minutes      AS baseDurationMinutes,
+                   sd.buffer_minutes_after       AS bufferMinutesAfter
+            FROM unnest(CAST(:masterIds AS uuid[])) AS req(master_id)
+            JOIN masters m ON m.id = req.master_id
+            JOIN master_services msa ON msa.master_id = m.id
+            JOIN service_definitions sd ON sd.id = msa.service_def_id
+            LEFT JOIN salons s ON s.id = m.salon_id
+            WHERE m.is_active = true
+              AND msa.is_active = true
+              AND sd.is_active = true
+              AND sd.owner_id = COALESCE(m.salon_id, m.id)
+              AND sd.owner_type = CASE WHEN m.salon_id IS NULL THEN 'INDEPENDENT_MASTER' ELSE 'SALON' END
+              AND (m.salon_id IS NULL OR s.is_active = true)
+            """, nativeQuery = true)
+    List<BookableAssignmentDurationRow> findBookableAssignmentDurationsByMasterIds(
+            @Param("masterIds") UUID[] masterIds);
 
     /**
      * Cross-salon sibling of {@link #findBookableAssignmentsBySalon}, keyed by a SET of SALON-owned

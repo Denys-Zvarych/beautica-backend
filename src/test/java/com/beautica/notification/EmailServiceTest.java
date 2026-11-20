@@ -291,4 +291,40 @@ class EmailServiceTest {
         assertThat(events).anyMatch(e -> e.getLevel() == ch.qos.logback.classic.Level.WARN
                 && e.getFormattedMessage().contains(reportId.toString()));
     }
+
+    // ── B514 QA: support mail from a phone-only account (AUTH-D11) ─────────────────────────────────────────────
+
+    private MimeMessage captureSupportMail(String senderUserId, String senderEmail) throws Exception {
+        MimeMessage message = new MimeMessage(Session.getInstance(new Properties()));
+        when(mailSender.createMimeMessage()).thenReturn(message);
+        when(templateEngine.process(org.mockito.ArgumentMatchers.anyString(),
+                any(org.thymeleaf.context.IContext.class))).thenReturn("<p>support</p>");
+
+        emailService.sendSupportContactEmail("support@beautica.test", senderUserId, senderEmail, null,
+                "Не можу знайти свій запис", java.util.List.of());
+
+        verify(mailSender).send(message);
+        message.saveChanges();
+        return message;
+    }
+
+    @Test
+    @DisplayName("B514: support mail from a phone-only sender has no Reply-To and names the sender by user id")
+    void should_omitReplyToAndUseUserIdInSubject_when_senderHasNoEmail() throws Exception {
+        String senderUserId = java.util.UUID.randomUUID().toString();
+
+        MimeMessage message = captureSupportMail(senderUserId, null);
+
+        assertThat(message.getHeader("Reply-To")).as("no address to reply to").isNull();
+        assertThat(message.getSubject()).isEqualTo("[Beautica Support] message from user " + senderUserId);
+    }
+
+    @Test
+    @DisplayName("B514: support mail from a sender with an email keeps Reply-To = that email and the email subject")
+    void should_keepReplyToAndEmailSubject_when_senderHasEmail() throws Exception {
+        MimeMessage message = captureSupportMail(java.util.UUID.randomUUID().toString(), "olena@example.com");
+
+        assertThat(message.getHeader("Reply-To")).containsExactly("olena@example.com");
+        assertThat(message.getSubject()).isEqualTo("[Beautica Support] message from olena@example.com");
+    }
 }

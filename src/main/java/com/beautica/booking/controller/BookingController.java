@@ -1,5 +1,6 @@
 package com.beautica.booking.controller;
 
+import com.beautica.user.phone.RequireVerifiedPhone;
 import com.beautica.booking.dto.BookingDetailResponse;
 import com.beautica.booking.dto.BookingResponse;
 import com.beautica.booking.dto.CreateBookingRequest;
@@ -106,6 +107,7 @@ public class BookingController {
      * only to fetch master name, avatar, salon name and address for the confirmation screen.
      */
     @PostMapping
+    @RequireVerifiedPhone // B516 (AUTH-45): 409 PHONE_NOT_VERIFIED when the flag is on
     @PreAuthorize("hasRole('CLIENT')")
     public ResponseEntity<ApiResponse<BookingDetailResponse>> createBooking(
             @Valid @RequestBody CreateBookingRequest request,

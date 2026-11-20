@@ -1,6 +1,7 @@
 package com.beautica.notification.inapp;
 
 import com.beautica.AbstractIntegrationTest;
+import com.beautica.support.StaffInviteFixtures;
 import com.beautica.auth.dto.InviteAcceptRequest;
 import com.beautica.booking.BookingTestFixtures;
 import com.beautica.common.TimeZones;
@@ -385,14 +386,15 @@ class InAppNotificationLifecycleIT extends AbstractIntegrationTest {
     void should_renderInviteAcceptedThenLoseParams_when_recipientAdminIsRotatedOutOfTheSalon() throws Exception {
         SalonRig rig = seedSalonRig();
         String rawToken = "raw-invite-" + UUID.randomUUID();
-        String inviteeEmail = "lc-invitee-" + System.nanoTime() + "@beautica.test";
+        String inviteePhone = StaffInviteFixtures.newPhone();
         jdbcTemplate.update(
-                "INSERT INTO invite_tokens (id, token, email, salon_id, role, expires_at, is_used, "
+                "INSERT INTO invite_tokens (id, token, phone, salon_id, role, expires_at, is_used, "
                         + "created_at, updated_at) VALUES (?, ?, ?, ?, 'SALON_ADMIN', ?, false, NOW(), NOW())",
-                UUID.randomUUID(), sha256Hex(rawToken), inviteeEmail, rig.salonId(),
+                UUID.randomUUID(), sha256Hex(rawToken), inviteePhone, rig.salonId(),
                 Timestamp.from(Instant.now().plus(2, ChronoUnit.DAYS)));
         ResponseEntity<String> accepted = restTemplate.postForEntity("/api/v1/auth/invite/accept",
-                new InviteAcceptRequest(rawToken, "Str0ngP@ss1!", "Invited", "Admin", "+380501234567"), String.class);
+                new InviteAcceptRequest(rawToken, "Str0ngP@ss1!", "Invited", "Admin", null, null, null, null,
+                        StaffInviteFixtures.seedRegistrationTicket(jdbcTemplate, inviteePhone)), String.class);
         expectStatus(accepted, HttpStatus.CREATED);
         String owner = token(rig.ownerEmail());
         String admin = token(rig.adminEmail());

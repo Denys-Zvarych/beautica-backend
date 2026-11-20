@@ -95,7 +95,8 @@ public class UserController {
     public ResponseEntity<ApiResponse<Void>> requestChangePasswordOtp(Authentication authentication) {
         UUID userId = AuthenticationUtils.userId(authentication);
         passwordResetService.requestResetForUserId(userId);
-        return ResponseEntity.ok(ApiResponse.ok(null, "A reset code has been sent to your email."));
+        // B516 (AUTH-15): the code goes to the confirmed email, else by SMS to the verified phone — neutral wording.
+        return ResponseEntity.ok(ApiResponse.ok(null, "A reset code has been sent."));
     }
 
     /**

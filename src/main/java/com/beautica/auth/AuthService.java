@@ -14,6 +14,7 @@ import com.beautica.common.exception.EmailAlreadyRegisteredException;
 import com.beautica.common.exception.EmailNotVerifiedException;
 import com.beautica.common.exception.ResendThrottledException;
 import com.beautica.common.exception.VerificationException;
+import com.beautica.common.util.UaMobilePhone;
 import com.beautica.config.VerificationPolicyConfig;
 import com.beautica.master.service.MasterService;
 import com.beautica.notification.service.EmailNotificationService;
@@ -29,10 +30,13 @@ import org.springframework.core.task.TaskExecutor;
 import org.springframework.http.HttpStatus;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
+import org.springframework.transaction.support.TransactionOperations;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -52,6 +56,13 @@ public class AuthService {
 
     private static final Duration OTP_TTL = Duration.ofMinutes(15);
 
+    /**
+     * BCrypt of a throw-away string at the SAME cost factor as {@code SecurityConfig#passwordEncoder} (10) — matched
+     * against when the login identifier names no account, so an unknown identifier costs the same time as a wrong
+     * password. {@code AuthServiceLoginIdentifierTest} pins the cost parity.
+     */
+    static final String DUMMY_PASSWORD_HASH = "$2a$10$HEoJYzvHn1rJuaMjlcFb/Od12QEDzO/iS8s.RO2KRYZKqVm6VJPsu";
+
     private final UserRepository userRepository;
     private final RefreshTokenRepository refreshTokenRepository;
     private final PasswordEncoder passwordEncoder;
@@ -65,6 +76,14 @@ public class AuthService {
     private final VerificationPolicyConfig verificationPolicyConfig;
     private final JwtTokenProvider jwtTokenProvider;
     private final AccessTokenDenylist accessTokenDenylist;
+    private final PhoneRegistrationService phoneRegistrationService;
+    private final LoginFailureLimiter loginFailureLimiter;
+    /**
+     * Phone-first hardening B11/B12 — the short write transactions of login (token issue) and register (ticket consume
+     * + insert), opened only AFTER BCrypt so no pooled connection waits on 80–150 ms of hashing. The pre-hardening
+     * constructor (unit tests) runs the callbacks inline ({@link TransactionOperations#withoutTransaction()}).
+     */
+    private final TransactionOperations writeTx;
 
     /**
      * Self-proxy reference so {@link #revokeFamilyIndependently(UUID)} runs through the Spring
@@ -97,8 +116,60 @@ public class AuthService {
             EmailVerificationProcessor emailVerificationProcessor,
             VerificationPolicyConfig verificationPolicyConfig,
             JwtTokenProvider jwtTokenProvider,
-            AccessTokenDenylist accessTokenDenylist
+            AccessTokenDenylist accessTokenDenylist,
+            PhoneRegistrationService phoneRegistrationService,
+            LoginFailureLimiter loginFailureLimiter
     ) {
+        this(userRepository, refreshTokenRepository, passwordEncoder, tokenGenerator, masterService,
+                authResponseBuilder, clock, emailNotificationService, emailExecutor, emailVerificationProcessor,
+                verificationPolicyConfig, jwtTokenProvider, accessTokenDenylist, phoneRegistrationService,
+                loginFailureLimiter, TransactionOperations.withoutTransaction());
+    }
+
+    @Autowired
+    public AuthService(
+            UserRepository userRepository,
+            RefreshTokenRepository refreshTokenRepository,
+            PasswordEncoder passwordEncoder,
+            TokenGenerator tokenGenerator,
+            MasterService masterService,
+            AuthResponseBuilder authResponseBuilder,
+            Clock clock,
+            EmailNotificationService emailNotificationService,
+            @Qualifier("emailExecutor") TaskExecutor emailExecutor,
+            EmailVerificationProcessor emailVerificationProcessor,
+            VerificationPolicyConfig verificationPolicyConfig,
+            JwtTokenProvider jwtTokenProvider,
+            AccessTokenDenylist accessTokenDenylist,
+            PhoneRegistrationService phoneRegistrationService,
+            LoginFailureLimiter loginFailureLimiter,
+            PlatformTransactionManager transactionManager
+    ) {
+        this(userRepository, refreshTokenRepository, passwordEncoder, tokenGenerator, masterService,
+                authResponseBuilder, clock, emailNotificationService, emailExecutor, emailVerificationProcessor,
+                verificationPolicyConfig, jwtTokenProvider, accessTokenDenylist, phoneRegistrationService,
+                loginFailureLimiter, (TransactionOperations) new TransactionTemplate(transactionManager));
+    }
+
+    private AuthService(
+            UserRepository userRepository,
+            RefreshTokenRepository refreshTokenRepository,
+            PasswordEncoder passwordEncoder,
+            TokenGenerator tokenGenerator,
+            MasterService masterService,
+            AuthResponseBuilder authResponseBuilder,
+            Clock clock,
+            EmailNotificationService emailNotificationService,
+            TaskExecutor emailExecutor,
+            EmailVerificationProcessor emailVerificationProcessor,
+            VerificationPolicyConfig verificationPolicyConfig,
+            JwtTokenProvider jwtTokenProvider,
+            AccessTokenDenylist accessTokenDenylist,
+            PhoneRegistrationService phoneRegistrationService,
+            LoginFailureLimiter loginFailureLimiter,
+            TransactionOperations writeTx
+    ) {
+        this.writeTx = writeTx;
         this.userRepository = userRepository;
         this.refreshTokenRepository = refreshTokenRepository;
         this.passwordEncoder = passwordEncoder;
@@ -112,10 +183,32 @@ public class AuthService {
         this.verificationPolicyConfig = verificationPolicyConfig;
         this.jwtTokenProvider = jwtTokenProvider;
         this.accessTokenDenylist = accessTokenDenylist;
+        this.phoneRegistrationService = phoneRegistrationService;
+        this.loginFailureLimiter = loginFailureLimiter;
     }
 
-    @Transactional
+    /**
+     * B514 (AUTH-02): with a {@code registrationTicket} the account is created phone-only and signed in at once
+     * ({@link PhoneRegistrationService}); without one, the legacy email-code path below (until
+     * {@code app.auth.require-phone-registration} is flipped, enforced by {@code @PhoneRegistrationShape}).
+     */
+    @Transactional(propagation = Propagation.NOT_SUPPORTED)
     public RegistrationResponse register(RegisterRequest request) {
+        if (request.hasRegistrationTicket()) {
+            requireBusinessNameForOwner(request);
+        }
+        // B12: BCrypt (80–150 ms) before any transaction; the ticket consume / insert then run in one short one.
+        String passwordHash = passwordEncoder.encode(request.password());
+        return writeTx.execute(status -> registerHashed(request, passwordHash));
+    }
+
+    private RegistrationResponse registerHashed(RegisterRequest request, String passwordHash) {
+        if (request.hasRegistrationTicket()) {
+            return RegistrationResponse.signedIn(phoneRegistrationService.register(
+                    new PhoneRegistrationService.PhoneAccount(request.registrationTicket(), passwordHash,
+                            request.role().toRole(), request.firstName(), request.lastName(),
+                            ownerBusinessName(request), request)));
+        }
         String email = request.email().toLowerCase(Locale.ROOT).strip();
 
         // Honest 409 on duplicate email. The prior anti-enumeration silent-200 was
@@ -128,22 +221,15 @@ public class AuthService {
             throw new EmailAlreadyRegisteredException();
         }
 
-        if (request.role() == SelfRegistrationRole.SALON_OWNER) {
-            if (request.businessName() == null || request.businessName().isBlank()) {
-                throw new BusinessException(HttpStatus.BAD_REQUEST,
-                        "businessName is required for SALON_OWNER");
-            }
-        }
+        requireBusinessNameForOwner(request);
 
-        String businessName = request.role() == SelfRegistrationRole.SALON_OWNER
-                ? request.businessName()
-                : null;
+        String businessName = ownerBusinessName(request);
 
         String rawOtp = tokenGenerator.generateOtp();
 
         var user = new User(
                 email,
-                passwordEncoder.encode(request.password()),
+                passwordHash,
                 request.role().toRole(),
                 request.firstName(),
                 request.lastName(),
@@ -161,8 +247,31 @@ public class AuthService {
         return RegistrationResponse.of(savedUser.getEmail());
     }
 
-    @Transactional
+    private static void requireBusinessNameForOwner(RegisterRequest request) {
+        if (request.role() == SelfRegistrationRole.SALON_OWNER
+                && (request.businessName() == null || request.businessName().isBlank())) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST, "businessName is required for SALON_OWNER");
+        }
+    }
+
+    private static String ownerBusinessName(RegisterRequest request) {
+        return request.role() == SelfRegistrationRole.SALON_OWNER ? request.businessName() : null;
+    }
+
+    /** B514 (AUTH-02): as {@link #register} — a {@code registrationTicket} creates a phone-only, signed-in master. */
+    @Transactional(propagation = Propagation.NOT_SUPPORTED)
     public RegistrationResponse registerIndependentMaster(RegisterIndependentMasterRequest request) {
+        String passwordHash = passwordEncoder.encode(request.password());
+        return writeTx.execute(status -> registerIndependentMasterHashed(request, passwordHash));
+    }
+
+    private RegistrationResponse registerIndependentMasterHashed(RegisterIndependentMasterRequest request,
+                                                                 String passwordHash) {
+        if (request.hasRegistrationTicket()) {
+            return RegistrationResponse.signedIn(phoneRegistrationService.register(
+                    new PhoneRegistrationService.PhoneAccount(request.registrationTicket(), passwordHash,
+                            Role.INDEPENDENT_MASTER, request.firstName(), request.lastName(), null, request)));
+        }
         String email = request.email().toLowerCase(Locale.ROOT).strip();
 
         // Honest 409 on duplicate email. See register() for the rationale.
@@ -174,7 +283,7 @@ public class AuthService {
 
         var user = new User(
                 email,
-                passwordEncoder.encode(request.password()),
+                passwordHash,
                 Role.INDEPENDENT_MASTER,
                 request.firstName(),
                 request.lastName(),
@@ -246,29 +355,81 @@ public class AuthService {
         return email.charAt(0) + "***" + email.substring(at);
     }
 
-    @Transactional
-    public AuthResponse login(LoginRequest request) {
-        String email = request.email().toLowerCase(Locale.ROOT).strip();
-        var user = userRepository.findByEmail(email)
-                .orElseThrow(() -> new BusinessException(HttpStatus.UNAUTHORIZED, "Invalid email or password"));
+    /**
+     * AUTH-08 / AUTH-D09 (B514): one identifier — input with «@» is an email, anything else is normalised to
+     * {@code +380…} and matched against VERIFIED phones only. Wrong password, unknown identifier, unverified phone,
+     * inactive account and a locked identifier + client-key pair ({@link LoginFailureLimiter}) are the same 401. Only a
+     * legacy account with neither a verified phone nor a confirmed email gets 403 {@code EMAIL_NOT_VERIFIED}. Never
+     * sends an SMS.
+     *
+     * <p>Phone-first hardening B11 — no transaction around BCrypt: the lock is checked on the NORMALISED identifier
+     * before any DB read (a locked pair costs no lookup), the account is read by a plain repository call, the password
+     * is checked with no connection held, and only the token issue (refresh-token insert) runs in a short write
+     * transaction.
+     *
+     * @param clientKey the client key of AUTH-D27 (e): an IPv6 client's /64, an IPv4 address as is
+     */
+    @Transactional(propagation = Propagation.NOT_SUPPORTED)
+    public AuthResponse login(LoginRequest request, String clientKey) {
+        String key = lockKey(request.loginIdentifier().strip());
+        if (loginFailureLimiter.isLocked(key, clientKey)) {
+            // AUTH-08: a locked reply costs the same BCrypt time as any other 401, so its speed is no oracle.
+            passwordEncoder.matches(request.password(), DUMMY_PASSWORD_HASH);
+            throw invalidCredentials();
+        }
 
+        var user = findLoginAccount(key);
+        if (user == null) {
+            // Same BCrypt work as a known account, so response time is no account-existence oracle; garbage
+            // identifiers are not counted (they would only flood the limiter's bounded cache).
+            passwordEncoder.matches(request.password(), DUMMY_PASSWORD_HASH);
+            throw invalidCredentials();
+        }
         if (!passwordEncoder.matches(request.password(), user.getPasswordHash())) {
-            throw new BusinessException(HttpStatus.UNAUTHORIZED, "Invalid email or password");
+            loginFailureLimiter.recordFailure(key, clientKey);
+            throw invalidCredentials();
         }
 
         if (!user.isActive()) {
-            throw new BusinessException(HttpStatus.UNAUTHORIZED, "Invalid email or password");
+            throw invalidCredentials();
         }
 
         // By design: the 403 response reveals that the password was correct and the account is
         // unverified. The caller (the account owner) needs this signal to route to the
         // verification screen. An attacker reaching this branch already knows the correct
         // password — the verification state is not the secret being protected here.
-        if (!user.isEmailVerified()) {
+        // B514: only a legacy account (no verified phone) can reach it; its email is never null (V244 CHECK).
+        if (!user.hasVerifiedIdentity()) {
             throw new EmailNotVerifiedException(user.getEmail());
         }
 
-        return buildAuthResponse(user);
+        loginFailureLimiter.reset(key, clientKey);
+        return writeTx.execute(status -> buildAuthResponse(user));
+    }
+
+    /**
+     * The lockout key of a login identifier, derived from the input alone (no DB): an email lower-cased, a phone in
+     * any accepted notation normalised to {@code +380…}, anything else lower-cased (it names no account).
+     */
+    private static String lockKey(String identifier) {
+        if (identifier.indexOf('@') >= 0) {
+            return identifier.toLowerCase(Locale.ROOT);
+        }
+        return UaMobilePhone.parse(identifier).orElseGet(() -> identifier.toLowerCase(Locale.ROOT));
+    }
+
+    /** The account a normalised key names, or {@code null}: email by address, phone by VERIFIED phone only. */
+    private User findLoginAccount(String key) {
+        if (key.indexOf('@') >= 0) {
+            return userRepository.findByEmail(key).orElse(null);
+        }
+        return key.startsWith("+380") && UaMobilePhone.parse(key).isPresent()
+                ? userRepository.findByVerifiedPhone(key).orElse(null)
+                : null;
+    }
+
+    private static BusinessException invalidCredentials() {
+        return new BusinessException(HttpStatus.UNAUTHORIZED, "Invalid email or password");
     }
 
     @Transactional
@@ -315,7 +476,8 @@ public class AuthService {
             throw new BusinessException(HttpStatus.UNAUTHORIZED, "Refresh token not found");
         }
 
-        if (!user.isEmailVerified()) {
+        // B514: a phone-registered account has no email but a verified phone — both count as verified.
+        if (!user.hasVerifiedIdentity()) {
             throw new BusinessException(HttpStatus.UNAUTHORIZED, "Refresh token not found");
         }
 

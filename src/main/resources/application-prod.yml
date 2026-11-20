@@ -81,3 +81,7 @@ app:
   # Base config defaults it to http://localhost:8080; omit the default here so a missing PUBLIC_BASE_URL
   # fails at property resolution, and EnvironmentFingerprintGuard rejects loopback/non-https values.
   public-base-url: ${PUBLIC_BASE_URL}
+  rate-limit:
+    # Pinned: behind Railway's edge proxy the socket peer is the proxy, so the per-IP buckets need the proxy
+    # header (rightmost X-Forwarded-For; X-Real-IP is never read). Inherited by `prod,staging`.
+    trust-forwarded-headers: true

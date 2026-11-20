@@ -18,6 +18,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /**
@@ -37,10 +38,9 @@ import java.util.stream.Collectors;
  *       the transaction boundary, risking notifications for rolled-back domain events.
  * </ul>
  *
- * <p><strong>Security note ({@code enqueueInvite}):</strong> The raw invite URL is
- * never stored in plaintext; the AES-GCM ciphertext is persisted under
- * {@code inviteUrlSealed} (see {@link OutboxPayloadCipher}). The drain worker decrypts
- * the sealed value at send time (Phase 5.6).
+ * <p><strong>Security note ({@code enqueueStaffInviteSms}):</strong> the invited phone and the raw invite URL are
+ * never stored in plaintext; their AES-GCM ciphertexts are persisted under {@code phoneSealed} /
+ * {@code inviteUrlSealed} (see {@link OutboxPayloadCipher}). The drain worker opens them at send time.
  */
 @Service
 @RequiredArgsConstructor
@@ -66,7 +66,12 @@ public class NotificationOutboxService {
     /** Epoch seconds of the sweep tick that claimed the booking, read from the job's injected {@code Clock}. */
     public static final String REMINDER_CLAIMED_AT = "claimedAt";
 
-    private static final int MAX_EMAIL_LENGTH = 254;
+    /** B520 — {@code INVITE} payload keys: the sealed phone, the salon name and the sealed join link. */
+    public static final String INVITE_PHONE_SEALED = "phoneSealed";
+    public static final String INVITE_SALON_NAME = "salonName";
+    public static final String INVITE_URL_SEALED = "inviteUrlSealed";
+
+    private static final Pattern UA_E164 = Pattern.compile("^\\+380\\d{9}$");
     private static final int MAX_SALON_NAME_LENGTH = 255;
     private static final int MAX_INVITE_URL_LENGTH = 2048;
 
@@ -270,39 +275,30 @@ public class NotificationOutboxService {
     }
 
     /**
-     * Enqueues an {@code INVITE} notification entry.
+     * B520 (NTF-59) — enqueues the staff invite SMS as an {@code INVITE} entry, in the caller's (invite-insert)
+     * transaction: the invite row and its SMS commit or roll back together, and the SMS is sent by the drain only after
+     * that commit.
      *
-     * <p><strong>Security:</strong> {@code inviteUrl} is encrypted with
-     * {@link OutboxPayloadCipher} before persistence; plaintext never reaches the DB.
-     * The sealed ciphertext is stored under the {@code inviteUrlSealed} key. The drain
-     * worker decrypts the sealed value at send time (Phase 5.6).
+     * <p><strong>Security:</strong> both the phone and {@code inviteUrl} (it embeds the raw one-time token) are
+     * encrypted with {@link OutboxPayloadCipher} before persistence, under {@value #INVITE_PHONE_SEALED} and
+     * {@value #INVITE_URL_SEALED}; plaintext never reaches the DB. The drain opens them at send time. A pre-B520 row
+     * (an {@code email} key, no {@value #INVITE_PHONE_SEALED}) is a retired e-mail invite and is skipped by the drain.
      *
-     * <p><strong>{@code inviteUrl} validation:</strong>
-     * <ul>
-     *   <li>Must not be {@code null} or blank — throws {@link IllegalArgumentException}.</li>
-     *   <li>Length must be {@code <= 2048} characters — throws {@link IllegalArgumentException}.</li>
-     *   <li>Must start with {@code https://} or {@code http://localhost} (mirroring the
-     *       guard in {@code InviteService.buildInviteLink}) — throws
-     *       {@link IllegalArgumentException}.</li>
-     * </ul>
-     * Validation runs <strong>before</strong> {@link OutboxPayloadCipher#seal(String)}
-     * is invoked, so malformed input never reaches the cipher.
+     * <p>Validation runs <strong>before</strong> {@link OutboxPayloadCipher#seal(String)}, so malformed input never
+     * reaches the cipher: {@code phoneE164} must be {@code +380} + 9 digits; {@code salonName} non-blank and
+     * {@code <= 255}; {@code inviteUrl} non-blank, {@code <= 2048} and {@code https://} (or {@code http://localhost},
+     * mirroring {@code InviteService.buildInviteLink}) — else {@link IllegalArgumentException}.
      *
-     * @param inviteTokenId the UUID of the {@code InviteToken} row (used as aggregateId
-     *                      by the drain worker to look up the row at send time)
-     * @param toEmail       the recipient's e-mail address
-     * @param inviteUrl     the fully-formed invite URL embedding the raw one-time token;
-     *                      will be encrypted before persistence — never logged
-     * @param salonName     the salon name displayed in the invite e-mail
+     * @param inviteTokenId the {@code invite_tokens} row id (aggregate id, traceability only)
+     * @param phoneE164     the invited number — sealed, never logged
+     * @param inviteUrl     the join link — sealed, never logged
+     * @param salonName     the inviting salon's name (public data)
      */
     @Transactional(propagation = Propagation.MANDATORY)
-    public void enqueueInvite(UUID inviteTokenId, String toEmail, String inviteUrl, String salonName) {
+    public void enqueueStaffInviteSms(UUID inviteTokenId, String phoneE164, String inviteUrl, String salonName) {
         Objects.requireNonNull(inviteTokenId, "inviteTokenId must not be null");
-        if (toEmail == null || toEmail.isBlank()) {
-            throw new IllegalArgumentException("toEmail must not be blank");
-        }
-        if (toEmail.length() > MAX_EMAIL_LENGTH) {
-            throw new IllegalArgumentException("toEmail exceeds maximum length of " + MAX_EMAIL_LENGTH);
+        if (phoneE164 == null || !UA_E164.matcher(phoneE164).matches()) {
+            throw new IllegalArgumentException("phoneE164 must be a +380 number");
         }
         if (salonName == null || salonName.isBlank()) {
             throw new IllegalArgumentException("salonName must not be blank");
@@ -320,11 +316,10 @@ public class NotificationOutboxService {
             throw new IllegalArgumentException(
                     "inviteUrl must use https:// scheme or http://localhost for non-prod");
         }
-        String sealedInviteUrl = cipher.seal(inviteUrl);
         String payload = writeJson(Map.of(
-                "email", toEmail,
-                "salonName", salonName,
-                "inviteUrlSealed", sealedInviteUrl));
+                INVITE_PHONE_SEALED, cipher.seal(phoneE164),
+                INVITE_SALON_NAME, salonName,
+                INVITE_URL_SEALED, cipher.seal(inviteUrl)));
         save(OutboxEventType.INVITE, inviteTokenId, payload);
     }
 

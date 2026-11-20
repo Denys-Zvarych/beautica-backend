@@ -7,6 +7,7 @@ import org.springframework.data.repository.query.Param;
 
 import java.time.Instant;
 import java.util.Optional;
+import java.util.UUID;
 
 public interface PhoneOtpRepository extends JpaRepository<PhoneOtp, Long> {
 
@@ -15,16 +16,29 @@ public interface PhoneOtpRepository extends JpaRepository<PhoneOtp, Long> {
      * at most one row even though {@code sendOtp} expires prior unused codes after
      * delivering a new one (the newest unused row always wins in between) — defence-in-depth against a duplicate slipping through a race.
      */
-    Optional<PhoneOtp> findTopByPhoneAndUsedFalseAndExpiresAtAfterOrderByIdDesc(
-            String phone, Instant now);
+    Optional<PhoneOtp> findTopByPhoneAndPurposeAndUsedFalseAndExpiresAtAfterOrderByIdDesc(
+            String phone, PhoneOtpPurpose purpose, Instant now);
 
     /**
-     * Rate-limit counter: how many OTPs this phone has requested since {@code since}
-     * (includes used rows). Index-served by {@code idx_phone_otps_phone_created_at}
-     * {@code (phone, created_at)} (V88) — a plain composite, not the partial
-     * {@code WHERE NOT used} active-lookup index, since the count must see used rows too.
+     * B516 (AUTH-44) — the newest live code of a USER-BOUND purpose issued to {@code userId}: another account's code
+     * for the same phone is never returned.
      */
-    int countByPhoneAndCreatedAtAfter(String phone, Instant since);
+    Optional<PhoneOtp> findTopByPhoneAndPurposeAndUserIdAndUsedFalseAndExpiresAtAfterOrderByIdDesc(
+            String phone, PhoneOtpPurpose purpose, UUID userId, Instant now);
+
+    /** B516 — per-account send cap (AUTH-44); served by {@code idx_phone_otps_user_id}. */
+    int countByUserIdAndCreatedAtAfter(UUID userId, Instant since);
+
+    /**
+     * B516 — serialises concurrent signed-in sends of ONE account (the per-account cap counts across all its phones,
+     * so the per-phone lock alone lets an account spread parallel sends over several numbers past the cap). Same
+     * transaction-scoped advisory lock + fused 3 s {@code lock_timeout} shape as {@link #lockPhoneForSend}; the key is
+     * namespaced ({@code 'phone-otp-user:'} prefix) so it never shares a hash bucket by construction with a phone key.
+     * Taken BEFORE the phone lock on every user-bound send (one global order: user, then phone — no deadlock).
+     */
+    @Query(value = "SELECT 1 FROM (SELECT set_config('lock_timeout', '3s', true), "
+            + "pg_advisory_xact_lock(hashtext('phone-otp-user:' || CAST(:userId AS text)))) AS l", nativeQuery = true)
+    int lockUserForSend(@Param("userId") UUID userId);
 
     /**
      * Serialises concurrent sends for one phone: takes a transaction-scoped Postgres advisory lock
@@ -53,8 +67,10 @@ public interface PhoneOtpRepository extends JpaRepository<PhoneOtp, Long> {
      * with {@code verifyOtp}, where the newest unused row wins.
      */
     @Modifying
-    @Query("UPDATE PhoneOtp o SET o.used = true WHERE o.phone = :phone AND o.used = false AND o.id < :keepId")
-    int markOlderAsUsed(@Param("phone") String phone, @Param("keepId") Long keepId);
+    @Query("UPDATE PhoneOtp o SET o.used = true "
+            + "WHERE o.phone = :phone AND o.purpose = :purpose AND o.used = false AND o.id < :keepId")
+    int markOlderAsUsed(@Param("phone") String phone, @Param("purpose") PhoneOtpPurpose purpose,
+                        @Param("keepId") Long keepId);
 
     /**
      * Single-statement UPDATE by id marking an undelivered code as used: it can never be redeemed,
@@ -67,34 +83,80 @@ public interface PhoneOtpRepository extends JpaRepository<PhoneOtp, Long> {
     int markAsUsedById(@Param("id") Long id);
 
     /**
-     * Atomically records one wrong verify attempt against a single OTP row and, in the
-     * same statement, invalidates it ({@code used = true}) once the incremented count
-     * reaches {@code cap}. A single conditional UPDATE — never a read-modify-write — so N
-     * concurrent wrong-code verifies of the same row cannot each read {@code attempts < cap}
-     * and overshoot the per-OTP brute-force cap (the {@code PhoneOtp} entity has no
-     * {@code @Version}; the DB serialises the increments instead). The
-     * {@code AND o.used = false} guard caps {@code attempts} at exactly {@code cap}: once
-     * one increment crosses the cap and commits {@code used = true}, every subsequent
-     * row-locked UPDATE re-evaluates the predicate against that committed version, matches
-     * zero rows, and does not increment further.
-     *
-     * <p>This is a bulk modifying query: it bypasses the persistence context.
-     * {@code flushAutomatically} forces any pending SELECT-loaded state out first and
-     * {@code clearAutomatically} evicts the now-stale loaded {@code PhoneOtp} so a later
-     * read in the same transaction cannot resurrect its pre-increment {@code attempts}/
-     * {@code used} (project convention — see {@code ReviewRepository}). The verify path
-     * returns immediately after calling this, so it never re-reads the instance anyway.
+     * B1 step 4 (match) — the single-use claim, in the CALLER's transaction so it commits or rolls back with the
+     * caller's own write (ticket, phone swap). Exactly one of N concurrent correct verifies gets 1 row: the others
+     * block on the row lock and then see {@code used = true} (0 rows), or win only if the first one rolled back.
+     * No {@code clearAutomatically}: the caller's managed entities (the locked user row) must stay attached.
      */
-    @Modifying(clearAutomatically = true, flushAutomatically = true)
-    @Query("UPDATE PhoneOtp o SET o.attempts = o.attempts + 1, "
-            + "o.used = CASE WHEN o.attempts + 1 >= :cap THEN true ELSE o.used END "
-            + "WHERE o.id = :id AND o.used = false")
-    int recordFailedAttempt(@Param("id") Long id, @Param("cap") int cap);
+    @Modifying(flushAutomatically = true)
+    @Query("UPDATE PhoneOtp o SET o.used = true WHERE o.id = :id AND o.used = false")
+    int markUsedIfUnused(@Param("id") Long id);
 
-    /** Cleanup-job sweep: hard-deletes rows that expired before {@code cutoff}. */
+    /**
+     * Phone-first hardening audit-fix (sql review) — every per-phone send limit in ONE round trip, read under the
+     * phone lock: the codes of the last window (any purpose, used ones too), the newest code of {@code purpose} inside
+     * the cooldown (epoch millis, {@code null} when none), and the wrong codes typed for the phone from
+     * {@code clientNet} since {@code failuresSince} (AUTH-D26 c, per phone + client network). The outer scan is the
+     * {@code (phone, created_at)} range on {@code idx_phone_otps_phone_created_at} from {@code rangeStart} (the earlier
+     * of the window and cooldown starts); the failure count is an index-only range on
+     * {@code ix_phone_otp_failures_phone_net_at}. Aggregates without GROUP BY: always exactly one row.
+     */
+    @Query(value = """
+            SELECT count(*) FILTER (WHERE o.created_at > :windowStart) AS recentSends,
+                   CAST(EXTRACT(EPOCH FROM max(o.created_at)
+                           FILTER (WHERE o.purpose = :purpose AND o.created_at > :cooldownStart)) * 1000 AS bigint)
+                       AS latestSamePurposeMillis,
+                   (SELECT count(*) FROM phone_otp_failures f
+                     WHERE f.phone = :phone AND f.client_net = :clientNet AND f.failed_at > :failuresSince)
+                       AS recentFailures
+              FROM phone_otps o
+             WHERE o.phone = :phone AND o.created_at > :rangeStart
+            """, nativeQuery = true)
+    SendLimitStats sendLimitStats(@Param("phone") String phone,
+                                  @Param("purpose") String purpose,
+                                  @Param("clientNet") String clientNet,
+                                  @Param("rangeStart") Instant rangeStart,
+                                  @Param("windowStart") Instant windowStart,
+                                  @Param("cooldownStart") Instant cooldownStart,
+                                  @Param("failuresSince") Instant failuresSince);
+
+    /** The single row of {@link #sendLimitStats}. */
+    interface SendLimitStats {
+        long getRecentSends();
+
+        Long getLatestSamePurposeMillis();
+
+        long getRecentFailures();
+    }
+
+    /**
+     * AUTH-D26 (c) — wrong codes typed for {@code phone} (every purpose) from {@code clientNet} since {@code since};
+     * index-only on {@code ix_phone_otp_failures_phone_net_at}.
+     */
+    @Query(value = """
+            SELECT count(*) FROM phone_otp_failures
+             WHERE phone = :phone AND client_net = :clientNet AND failed_at > :since
+            """, nativeQuery = true)
+    long countFailuresSince(@Param("phone") String phone, @Param("clientNet") String clientNet,
+                            @Param("since") Instant since);
+
+    /** Cleanup-job sweep of {@code phone_otp_failures} (25 h, like the codes); served by {@code ix_phone_otp_failures_at}. */
     @Modifying
-    @Query("DELETE FROM PhoneOtp o WHERE o.expiresAt < :cutoff")
-    int deleteByExpiresAtBefore(@Param("cutoff") Instant cutoff);
+    @Query(value = "DELETE FROM phone_otp_failures WHERE failed_at < :cutoff", nativeQuery = true)
+    int deleteFailuresBefore(@Param("cutoff") Instant cutoff);
+
+    /** Guest-PII erase twin of {@link #deleteByPhone} for the failure log (it stores the phone). */
+    @Modifying
+    @Query(value = "DELETE FROM phone_otp_failures WHERE phone = :phone", nativeQuery = true)
+    int deleteFailuresByPhone(@Param("phone") String phone);
+
+    /**
+     * Cleanup-job sweep: hard-deletes rows CREATED before {@code cutoff} (25 h back, so the 24 h failed-verify window
+     * of the send limits is never cut short by the 03:00 run).
+     */
+    @Modifying
+    @Query("DELETE FROM PhoneOtp o WHERE o.createdAt < :cutoff")
+    int deleteByCreatedAtBefore(@Param("cutoff") Instant cutoff);
 
     /**
      * Phase 373 D9 — hard-deletes every OTP row of one E.164 phone (internal guest-PII erase).

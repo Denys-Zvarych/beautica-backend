@@ -113,6 +113,8 @@ class MasterServiceCacheTest {
     @MockBean com.beautica.common.cache.MasterProfileCacheEvictor masterProfileCacheEvictor;
     // MasterService ctor dependency: public-roster gate's :bookableToday (getMastersByPage).
     @MockBean com.beautica.master.service.ScheduleDateMath scheduleDateMath;
+    // MasterService ctor dependency: the public roster's strict verdict (SAL-09).
+    @MockBean com.beautica.search.service.StrictBookableResolver strictBookableResolver;
     // c4d69ac: MasterService now constructor-depends on UserProfileCacheEvictor (evicts the
     // GET /users/me cache on every create/reactivate/deactivate-master path, since
     // hasMasterProfile is derived from the masters table). None of these tests assert on

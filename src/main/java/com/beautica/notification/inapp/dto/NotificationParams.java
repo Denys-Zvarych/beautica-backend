@@ -45,6 +45,9 @@ import java.time.Instant;
  * @param contentKind      phase 415, moderation-outcome types only — which kind of content the resolved report was
  *                         about ({@code REVIEW} / {@code CLIENT_REVIEW} / {@code PORTFOLIO_PHOTO} / {@code PROFILE}),
  *                         so the client picks the copy variant. Null on every other type.
+ * @param maskedContact    B516 (AUTH-D19), {@code SECURITY_*} only — the recipient's NEW phone
+ *                         ({@code +380*****4567}) or notifications email ({@code o***@gmail.com}), masked, as stored
+ *                         on the row at the time of the change. Null on every other type and on older rows.
  */
 public record NotificationParams(
         @Schema(types = {"string", "null"}, nullable = true) String counterpartName,
@@ -57,8 +60,23 @@ public record NotificationParams(
         @Schema(types = {"string", "null"}, nullable = true) Role subjectRole,
         @Schema(types = {"string", "null"}, nullable = true) String categoryName,
         @Schema(types = {"string", "null"}, nullable = true) String decisionReason,
-        @Schema(types = {"string", "null"}, nullable = true) ModeratedContentKind contentKind
+        @Schema(types = {"string", "null"}, nullable = true) ModeratedContentKind contentKind,
+        @Schema(types = {"string", "null"}, nullable = true) String maskedContact
 ) {
+
+    /** Pre-B516 shape: every item type except the security notices. */
+    public NotificationParams(
+            String counterpartName, String serviceName, int serviceCount, Instant startsAt,
+            String salonName, String masterName, String subjectName, Role subjectRole,
+            String categoryName, String decisionReason, ModeratedContentKind contentKind) {
+        this(counterpartName, serviceName, serviceCount, startsAt, salonName, masterName,
+                subjectName, subjectRole, categoryName, decisionReason, contentKind, null);
+    }
+
+    /** B516 — a security-notice item: only {@code maskedContact} is set. */
+    public static NotificationParams securityNotice(String maskedContact) {
+        return new NotificationParams(null, null, 0, null, null, null, null, null, null, null, null, maskedContact);
+    }
 
     /** Pre-phase-415 shape: every item type except the moderation outcomes. */
     public NotificationParams(
@@ -66,12 +84,12 @@ public record NotificationParams(
             String salonName, String masterName, String subjectName, Role subjectRole,
             String categoryName, String decisionReason) {
         this(counterpartName, serviceName, serviceCount, startsAt, salonName, masterName,
-                subjectName, subjectRole, categoryName, decisionReason, null);
+                subjectName, subjectRole, categoryName, decisionReason, null, null);
     }
 
     /** Phase 415 — a moderation-outcome item: only {@code contentKind} is set. */
     public static NotificationParams moderationOutcome(ModeratedContentKind contentKind) {
-        return new NotificationParams(null, null, 0, null, null, null, null, null, null, null, contentKind);
+        return new NotificationParams(null, null, 0, null, null, null, null, null, null, null, contentKind, null);
     }
 
     /** Pre-phase-372 shape: every booking/invite item, with no request-decision fields. */
@@ -79,6 +97,6 @@ public record NotificationParams(
             String counterpartName, String serviceName, int serviceCount, Instant startsAt,
             String salonName, String masterName, String subjectName, Role subjectRole) {
         this(counterpartName, serviceName, serviceCount, startsAt, salonName, masterName,
-                subjectName, subjectRole, null, null, null);
+                subjectName, subjectRole, null, null, null, null);
     }
 }

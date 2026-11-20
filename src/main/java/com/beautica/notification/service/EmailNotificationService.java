@@ -162,17 +162,6 @@ public class EmailNotificationService {
         }
     }
 
-    public void sendInviteEmail(String to, String inviteUrl, String salonName) {
-        if (!SchemeGuard.isAllowedScheme(inviteUrl)) {
-            throw new IllegalArgumentException(
-                    "inviteUrl must use https:// scheme or http://localhost — caller must validate before reaching email transport");
-        }
-        var ctx = new Context();
-        ctx.setVariable("salonName", salonName);
-        ctx.setVariable("inviteUrl", inviteUrl);
-        send(to, "Запрошення до салону", "email/invite-master", ctx);
-    }
-
     /**
      * Sends the PROVIDER the "new booking" e-mail — for a whole multi-service visit, not just its
      * lead service.
@@ -185,6 +174,9 @@ public class EmailNotificationService {
      * (its row is suppressed).
      */
     public void sendNewBookingEmail(String to, BookingVisit visit) {
+        if (lacksRecipient(to, "sendNewBookingEmail")) {
+            return;
+        }
         Booking booking = visit.lead();
         var ctx = new Context();
         ctx.setVariable("masterName", masterDisplayName(booking));
@@ -194,6 +186,9 @@ public class EmailNotificationService {
     }
 
     public void sendBookingRescheduledEmail(String to, Booking booking) {
+        if (lacksRecipient(to, "sendBookingRescheduledEmail")) {
+            return;
+        }
         var ctx = new Context();
         ctx.setVariable("masterName", masterDisplayName(booking));
         ctx.setVariable("clientName", fullName(booking.getClient()));
@@ -209,6 +204,9 @@ public class EmailNotificationService {
      * or walk-in by name only — the guest phone is never put into a master-facing context. No note.
      */
     public void sendBookingRescheduledBySalonEmail(String to, Booking booking) {
+        if (lacksRecipient(to, "sendBookingRescheduledBySalonEmail")) {
+            return;
+        }
         var ctx = new Context();
         ctx.setVariable("masterName", masterDisplayName(booking));
         ctx.setVariable("clientName", resolveClientName(booking));
@@ -225,6 +223,9 @@ public class EmailNotificationService {
      * guest phone is never put into a master-facing context — and no note of any kind is read.
      */
     public void sendBookingDeclinedBySalonEmail(String to, BookingVisit visit) {
+        if (lacksRecipient(to, "sendBookingDeclinedBySalonEmail")) {
+            return;
+        }
         Booking booking = visit.lead();
         var ctx = new Context();
         ctx.setVariable("masterName", masterDisplayName(booking));
@@ -243,6 +244,9 @@ public class EmailNotificationService {
      */
     public void sendRequestDecisionEmail(String to, RequestKind kind, boolean approved, String name,
                                          @Nullable String reasonOrNull) {
+        if (lacksRecipient(to, "sendRequestDecisionEmail")) {
+            return;
+        }
         String subjectName = name.replaceAll("[\r\n]", "");
         boolean category = kind == RequestKind.CATEGORY_REQUEST;
         String reason = !approved && reasonOrNull != null && !reasonOrNull.isBlank() ? reasonOrNull : null;
@@ -267,6 +271,9 @@ public class EmailNotificationService {
      * to the client with client-appropriate copy.
      */
     public void sendBookingRescheduledClientEmail(String to, Booking booking) {
+        if (lacksRecipient(to, "sendBookingRescheduledClientEmail")) {
+            return;
+        }
         sendBookingRescheduledClientEmail(to, booking, false);
     }
 
@@ -277,6 +284,9 @@ public class EmailNotificationService {
      * except for the .ics. Both carry a REQUEST .ics while the booking is still {@code CONFIRMED} (NTF-50).
      */
     public void sendBookingRescheduledClientEmail(String to, Booking booking, boolean selfAction) {
+        if (lacksRecipient(to, "sendBookingRescheduledClientEmail")) {
+            return;
+        }
         var ctx = new Context();
         ctx.setVariable("masterName", masterDisplayName(booking));
         ctx.setVariable("clientName", fullName(booking.getClient()));
@@ -295,6 +305,9 @@ public class EmailNotificationService {
      * .ics that removes the event the confirmation .ics created. No note is read (NTF-03).
      */
     public void sendClientCancelReceiptEmail(String to, Booking booking) {
+        if (lacksRecipient(to, "sendClientCancelReceiptEmail")) {
+            return;
+        }
         var ctx = new Context();
         ctx.setVariable("clientName", fullName(booking.getClient()));
         ctx.setVariable("serviceLine", ServiceLines.of(booking));
@@ -317,6 +330,9 @@ public class EmailNotificationService {
      * with the same single-service guarantee.
      */
     public void sendBookingConfirmedEmail(String to, BookingVisit visit) {
+        if (lacksRecipient(to, "sendBookingConfirmedEmail")) {
+            return;
+        }
         var ctx = new Context();
         ctx.setVariable("clientName", fullName(visit.lead().getClient()));
         applyVisitVariables(ctx, visit);
@@ -335,6 +351,9 @@ public class EmailNotificationService {
      * @param kind    which reminder
      */
     public void sendBookingReminderEmail(String to, Booking booking, ReminderKind kind) {
+        if (lacksRecipient(to, "sendBookingReminderEmail")) {
+            return;
+        }
         boolean dayBefore = kind == ReminderKind.H24;
         String address = GuestVisitAddress.of(booking);
         var ctx = new Context();
@@ -359,7 +378,7 @@ public class EmailNotificationService {
      * Sends the client a "please leave a review" email after a booking is completed (Phase 18.5).
      *
      * <p>The {@code reviewUrl} deep link is scheme-guarded via {@link SchemeGuard#isAllowedScheme}
-     * <em>before</em> the template is rendered (mirrors {@link #sendInviteEmail}) so an unsafe scheme
+     * <em>before</em> the template is rendered so an unsafe scheme
      * can never reach the CTA. All template variables are system-derived — no free-text user input.
      *
      * @param to        the client's email address (CR/LF stripped by the shared {@code send} helper)
@@ -367,6 +386,9 @@ public class EmailNotificationService {
      * @param reviewUrl the fully-built {@code https://.../bookings/{id}/review} deep link
      */
     public void sendReviewRequestEmail(String to, Booking booking, String reviewUrl) {
+        if (lacksRecipient(to, "sendReviewRequestEmail")) {
+            return;
+        }
         if (!SchemeGuard.isAllowedScheme(reviewUrl)) {
             throw new IllegalArgumentException(
                     "reviewUrl must use https:// scheme or http://localhost — caller must validate before reaching email transport");
@@ -392,6 +414,9 @@ public class EmailNotificationService {
      * @param bookingUrl the fully-built {@code https://.../bookings/{id}} deep link
      */
     public void sendClosureReminderEmail(String to, Booking booking, String bookingUrl) {
+        if (lacksRecipient(to, "sendClosureReminderEmail")) {
+            return;
+        }
         if (!SchemeGuard.isAllowedScheme(bookingUrl)) {
             throw new IllegalArgumentException(
                     "bookingUrl must use https:// scheme or http://localhost — caller must validate before reaching email transport");
@@ -418,6 +443,9 @@ public class EmailNotificationService {
      * accidentally wire in.
      */
     public void sendSalonClosedEmail(String to, BookingVisit visit) {
+        if (lacksRecipient(to, "sendSalonClosedEmail")) {
+            return;
+        }
         var ctx = new Context();
         ctx.setVariable("clientName", fullName(visit.lead().getClient()));
         applyVisitVariables(ctx, visit);
@@ -441,6 +469,9 @@ public class EmailNotificationService {
      * accidentally wire in.
      */
     public void sendMasterRemovedEmail(String to, BookingVisit visit) {
+        if (lacksRecipient(to, "sendMasterRemovedEmail")) {
+            return;
+        }
         var ctx = new Context();
         ctx.setVariable("clientName", fullName(visit.lead().getClient()));
         applyVisitVariables(ctx, visit);
@@ -456,6 +487,9 @@ public class EmailNotificationService {
      * are told apart.
      */
     public void sendBookingDeclinedEmail(String to, Booking booking) {
+        if (lacksRecipient(to, "sendBookingDeclinedEmail")) {
+            return;
+        }
         sendDeclined(to, BookingVisit.single(booking), booking.getProviderComment());
     }
 
@@ -477,6 +511,9 @@ public class EmailNotificationService {
      * through {@link BookingVisit} deliberately, or the header write has to fan out to the items.
      */
     public void sendVisitDeclinedEmail(String to, BookingVisit visit) {
+        if (lacksRecipient(to, "sendVisitDeclinedEmail")) {
+            return;
+        }
         sendDeclined(to, visit, visit.lead().getProviderComment());
     }
 
@@ -535,7 +572,39 @@ public class EmailNotificationService {
         }
     }
 
+    /**
+     * B516 (AUTH-D19) — the security-notice email after a phone change (to the confirmed email) or an email change
+     * (to the PREVIOUS confirmed email). Carries only the masked new value and the fixed support line — never a code.
+     * Fire-and-forget from {@code emailExecutor}: a delivery failure is logged by {@link #send} (template + class
+     * only) and dropped, the change itself is already committed.
+     */
+    public void sendContactChangedEmail(String to, ContactChangeKind kind, String maskedNewValue) {
+        if (lacksRecipient(to, "sendContactChangedEmail")) {
+            return;
+        }
+        var ctx = new Context();
+        ctx.setVariable("phone", kind == ContactChangeKind.PHONE);
+        ctx.setVariable("password", kind == ContactChangeKind.PASSWORD);
+        ctx.setVariable("maskedValue", maskedNewValue);
+        try {
+            send(to, contactChangedSubject(kind), "email/contact-changed", ctx);
+        } catch (EmailDeliveryException alreadyLogged) {
+            log.debug("sendContactChangedEmail dropped after a logged delivery failure");
+        }
+    }
+
+    static String contactChangedSubject(ContactChangeKind kind) {
+        return switch (kind) {
+            case PHONE -> "Beautica: номер телефону змінено";
+            case EMAIL -> "Beautica: email для сповіщень змінено";
+            case PASSWORD -> "Beautica: пароль змінено";
+        };
+    }
+
     public void sendVerificationEmail(String to, String rawOtp) {
+        if (lacksRecipient(to, "sendVerificationEmail")) {
+            return;
+        }
         try {
             var helper = buildMimeHelper(to, true);
             helper.setSubject("Код підтвердження Beautica");
@@ -576,6 +645,9 @@ public class EmailNotificationService {
      * row — the two can never swap slots again.
      */
     public void sendClientCancelledEmail(String to, Booking booking) {
+        if (lacksRecipient(to, "sendClientCancelledEmail")) {
+            return;
+        }
         sendClientCancelledEmail(to, BookingVisit.single(booking));
     }
 
@@ -585,6 +657,9 @@ public class EmailNotificationService {
      * notes are the lead booking's, exactly as the single-booking e-mail had them.
      */
     public void sendClientCancelledEmail(String to, BookingVisit visit) {
+        if (lacksRecipient(to, "sendClientCancelledEmail")) {
+            return;
+        }
         Booking booking = visit.lead();
         var ctx = new Context();
         ctx.setVariable("masterName", masterDisplayName(booking));
@@ -601,6 +676,20 @@ public class EmailNotificationService {
     // -------------------------------------------------------------------------
     // Private helpers
     // -------------------------------------------------------------------------
+
+    /**
+     * B514 (NTF-56, NTF-D15) — a registered user of any role without a confirmed email (a phone-registered account
+     * has {@code email = null} until one is added and confirmed, B516) gets no email at all; push and feed are
+     * unaffected. Checked first in every recipient-addressed send, BEFORE any .ics is built (the ICS attendee is the
+     * client's email), so the outbox row drains as a successful no-op instead of failing toward DEAD.
+     */
+    private static boolean lacksRecipient(String to, String what) {
+        if (to == null || to.isBlank()) {
+            log.debug("Skipping {} — recipient has no confirmed email", what);
+            return true;
+        }
+        return false;
+    }
 
     /**
      * Builds a {@link MimeMessageHelper} carrying the envelope every send path in this

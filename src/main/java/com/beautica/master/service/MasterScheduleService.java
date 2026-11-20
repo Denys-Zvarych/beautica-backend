@@ -36,6 +36,7 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
+import java.time.Duration;
 import java.time.LocalDate;
 import java.time.LocalTime;
 import java.util.AbstractList;
@@ -332,7 +333,7 @@ public class MasterScheduleService {
         }
         List<WeeklySchedule> covering =
                 weeklyScheduleRepository.findOverlappingRangeWithIntervals(masterId, date, date);
-        return resolveFromTemplate(date, covering.isEmpty() ? null : covering.get(0));
+        return resolveFromTemplate(date, covering.isEmpty() ? null : entityTemplate(covering.get(0)));
     }
 
     // ---- Step 6: range resolver (O(1) queries, in-memory fold) --------------------------
@@ -390,7 +391,7 @@ public class MasterScheduleService {
         // so use the read-window guard rather than assertWithinBounds (which forbids a past start).
         dateMath.assertExpandable(from, to);
         List<LocalDate> dates = dateMath.expandInclusive(from, to);
-        BatchLoadedRows rows = loadRowsForMasters(List.of(masterId), from, to);
+        BatchLoadedRows rows = loadRowsForMasters(List.of(masterId), from, to, false);
         return foldDates(dates,
                 rows.overridesByMaster().getOrDefault(masterId, Map.of()),
                 rows.windowsByMaster().getOrDefault(masterId, List.of()));
@@ -510,7 +511,7 @@ public class MasterScheduleService {
         }
         dateMath.assertExpandable(from, to);
         List<LocalDate> dates = dateMath.expandInclusive(from, to);
-        BatchLoadedRows rows = loadRowsForMasters(masterIds, from, to);
+        BatchLoadedRows rows = loadRowsForMasters(masterIds, from, to, true);
 
         Map<UUID, T> result = new LinkedHashMap<>();
         for (UUID masterId : masterIds) {
@@ -541,7 +542,7 @@ public class MasterScheduleService {
      * by {@code SalonCatalogueBatchLoadIT}'s case 15c.
      */
     private LazyFoldedDays lazyFoldedDays(List<LocalDate> dates,
-            Map<LocalDate, ScheduleException> overridesByDate, List<WeeklySchedule> windows) {
+            Map<LocalDate, ScheduleException> overridesByDate, List<ScheduleTemplate> windows) {
         return new LazyFoldedDays(dates, overridesByDate, windows);
     }
 
@@ -550,16 +551,18 @@ public class MasterScheduleService {
      * reducer — see that method's javadoc for the laziness contract and for why
      * {@link #markSpent()} exists.
      */
-    private final class LazyFoldedDays extends AbstractList<EffectiveDayResponse> {
+    private final class LazyFoldedDays extends AbstractList<EffectiveDayResponse>
+            implements SpanBoundedDays {
 
         private final List<LocalDate> dates;
         private final Map<LocalDate, ScheduleException> overridesByDate;
-        private final List<WeeklySchedule> windows;
+        private final List<ScheduleTemplate> windows;
         private final EffectiveDayResponse[] memo;
+        private Duration longestPossibleSpan;
         private boolean spent;
 
         private LazyFoldedDays(List<LocalDate> dates,
-                Map<LocalDate, ScheduleException> overridesByDate, List<WeeklySchedule> windows) {
+                Map<LocalDate, ScheduleException> overridesByDate, List<ScheduleTemplate> windows) {
             this.dates = dates;
             this.overridesByDate = overridesByDate;
             this.windows = windows;
@@ -591,6 +594,22 @@ public class MasterScheduleService {
             return folded;
         }
 
+        /**
+         * B523 perf fix — read off the already-loaded rows, folding no day; memoised. Same spent rule
+         * as {@link #get}: only legal while the reducer runs.
+         */
+        @Override
+        public Duration longestPossibleSpan() {
+            if (spent) {
+                throw new IllegalStateException("reduceEffectiveRangeBatch's day view is SPENT");
+            }
+            if (longestPossibleSpan == null) {
+                longestPossibleSpan =
+                        ScheduleSpanBound.longestPossibleSpan(windows, overridesByDate.values());
+            }
+            return longestPossibleSpan;
+        }
+
         /** Called by {@link #reduceEffectiveRangeBatch} once its reducer has returned. */
         private void markSpent() {
             this.spent = true;
@@ -611,24 +630,56 @@ public class MasterScheduleService {
      * {@code ORDER BY} order, which {@link #firstCovering} and the override {@code toMap} both depend
      * on (D4).
      */
-    private BatchLoadedRows loadRowsForMasters(Collection<UUID> masterIds, LocalDate from, LocalDate to) {
+    private BatchLoadedRows loadRowsForMasters(
+            Collection<UUID> masterIds, LocalDate from, LocalDate to, boolean projectedTemplates) {
         Map<UUID, Map<LocalDate, ScheduleException>> overridesByMaster = scheduleExceptionRepository
                 .findByMasterIdsAndDateBetweenWithIntervals(masterIds, from, to).stream()
                 .collect(Collectors.groupingBy(
                         se -> se.getMaster().getId(),
                         LinkedHashMap::new,
                         Collectors.toMap(ScheduleException::getDate, e -> e, (a, b) -> a, LinkedHashMap::new)));
-        Map<UUID, List<WeeklySchedule>> windowsByMaster = weeklyScheduleRepository
+        Map<UUID, List<ScheduleTemplate>> windowsByMaster = projectedTemplates
+                ? loadProjectedTemplates(masterIds, from, to)
+                : loadEntityTemplates(masterIds, from, to);
+        return new BatchLoadedRows(overridesByMaster, windowsByMaster);
+    }
+
+    /**
+     * Entity templates ({@code WeeklySchedule} graph) — the single-master {@link #foldRange} path, whose
+     * display variant ({@link #withWindow}) reads the covering entity's day windows.
+     */
+    private Map<UUID, List<ScheduleTemplate>> loadEntityTemplates(
+            Collection<UUID> masterIds, LocalDate from, LocalDate to) {
+        return weeklyScheduleRepository
                 .findOverlappingRangeWithIntervalsByMasterIds(masterIds, from, to).stream()
                 .collect(Collectors.groupingBy(
-                        ws -> ws.getMaster().getId(), LinkedHashMap::new, Collectors.toList()));
-        return new BatchLoadedRows(overridesByMaster, windowsByMaster);
+                        ws -> ws.getMaster().getId(), LinkedHashMap::new,
+                        Collectors.mapping(this::entityTemplate, Collectors.toList())));
+    }
+
+    /**
+     * Projected templates (B523 perf fix) — the batched {@link #reduceEffectiveRangeBatch} path: one
+     * narrow {@code unnest} statement for the templates + intervals, and at most one more for the
+     * discrete times (issued only when a fold first reads them). Same overlap predicate and same
+     * {@code master, valid_from DESC, id} order as {@link #loadEntityTemplates}, so the fold picks the
+     * same covering template and resolves the same days.
+     */
+    private Map<UUID, List<ScheduleTemplate>> loadProjectedTemplates(
+            Collection<UUID> masterIds, LocalDate from, LocalDate to) {
+        UUID[] ids = masterIds.stream().distinct().toArray(UUID[]::new);
+        return ProjectedScheduleTemplates.byMaster(
+                weeklyScheduleRepository.findTemplateIntervalRowsByMasterIds(ids, from, to),
+                weeklyScheduleRepository::findTemplateTimeRowsByScheduleIds);
+    }
+
+    private ScheduleTemplate entityTemplate(WeeklySchedule schedule) {
+        return new EntityScheduleTemplate(schedule, scheduleMapper);
     }
 
     /** Two batched, master-grouped result sets — see {@link #loadRowsForMasters}. */
     private record BatchLoadedRows(
             Map<UUID, Map<LocalDate, ScheduleException>> overridesByMaster,
-            Map<UUID, List<WeeklySchedule>> windowsByMaster) {
+            Map<UUID, List<ScheduleTemplate>> windowsByMaster) {
     }
 
     /**
@@ -638,7 +689,7 @@ public class MasterScheduleService {
      * called once (the single-master case) or once per master in a batch — one fold, never a second.
      */
     private List<ResolvedDay> foldDates(List<LocalDate> dates,
-            Map<LocalDate, ScheduleException> overridesByDate, List<WeeklySchedule> windows) {
+            Map<LocalDate, ScheduleException> overridesByDate, List<ScheduleTemplate> windows) {
         List<ResolvedDay> result = new ArrayList<>(dates.size());
         for (LocalDate date : dates) {
             result.add(foldDate(date, overridesByDate, windows));
@@ -653,12 +704,12 @@ public class MasterScheduleService {
      * different number of times, which is why their verdicts cannot diverge.
      */
     private ResolvedDay foldDate(LocalDate date,
-            Map<LocalDate, ScheduleException> overridesByDate, List<WeeklySchedule> windows) {
+            Map<LocalDate, ScheduleException> overridesByDate, List<ScheduleTemplate> windows) {
         ScheduleException override = overridesByDate.get(date);
         if (override != null) {
             return new ResolvedDay(resolveFromOverride(date, override), override, null);
         }
-        WeeklySchedule covering = firstCovering(windows, date);
+        ScheduleTemplate covering = firstCovering(windows, date);
         return new ResolvedDay(resolveFromTemplate(date, covering), null, covering);
     }
 
@@ -668,7 +719,7 @@ public class MasterScheduleService {
      * {@code override}/{@code covering} is non-null (and both are null for a {@code NO_SCHEDULE} date).
      */
     private record ResolvedDay(
-            EffectiveDayResponse day, ScheduleException override, WeeklySchedule covering) {
+            EffectiveDayResponse day, ScheduleException override, ScheduleTemplate covering) {
     }
 
     /**
@@ -692,10 +743,11 @@ public class MasterScheduleService {
             return scheduleMapper.toEffectiveDayWithWindow(day.date(), day.source(), day.intervals(),
                     resolved.override().getWindowStart(), resolved.override().getWindowEnd());
         }
-        if (resolved.covering() == null) {
+        // Only the entity path (foldRange) reaches here; a projected template carries no day windows.
+        if (!(resolved.covering() instanceof EntityScheduleTemplate covering)) {
             return day;
         }
-        var window = scheduleMapper.findDayWindow(resolved.covering(), dateMath.isoDow(day.date()));
+        var window = scheduleMapper.findDayWindow(covering.schedule(), dateMath.isoDow(day.date()));
         return scheduleMapper.toEffectiveDayWithWindow(day.date(), day.source(), day.intervals(),
                 window.map(WeeklyScheduleDayWindow::getWindowStart).orElse(null),
                 window.map(WeeklyScheduleDayWindow::getWindowEnd).orElse(null));
@@ -767,8 +819,10 @@ public class MasterScheduleService {
         Map<LocalDate, ScheduleException> overridesByDate = scheduleExceptionRepository
                 .findByMasterIdAndDateBetweenWithIntervals(masterId, from, to).stream()
                 .collect(Collectors.toMap(ScheduleException::getDate, e -> e, (a, b) -> a));
-        List<WeeklySchedule> windows =
-                weeklyScheduleRepository.findOverlappingRangeWithIntervals(masterId, from, to);
+        List<ScheduleTemplate> windows = weeklyScheduleRepository
+                .findOverlappingRangeWithIntervals(masterId, from, to).stream()
+                .map(this::entityTemplate)
+                .toList();
 
         for (LocalDate date : dates) {
             ScheduleException override = overridesByDate.get(date);
@@ -804,27 +858,27 @@ public class MasterScheduleService {
                 scheduleMapper.toIntervalDtos(override.getIntervals()));
     }
 
-    private EffectiveDayResponse resolveFromTemplate(LocalDate date, WeeklySchedule covering) {
+    private EffectiveDayResponse resolveFromTemplate(LocalDate date, ScheduleTemplate covering) {
         if (covering == null) {
             return scheduleMapper.toEffectiveDay(date, EffectiveDaySource.NO_SCHEDULE, List.of());
         }
         int isoDow = dateMath.isoDow(date);
         // Phase 15.8: an EXPLICIT_TIMES day (≥1 discrete-time row) projects its discrete times AND a
         // derived window [min..max] as the single interval, so window-only consumers keep working.
-        List<LocalTime> times = scheduleMapper.toDiscreteTimesForDay(covering, isoDow);
+        List<LocalTime> times = covering.discreteTimesForDay(isoDow);
         if (!times.isEmpty()) {
             return scheduleMapper.toEffectiveDay(
                     date, EffectiveDaySource.TEMPLATE, scheduleMapper.toDerivedWindow(times), times);
         }
         // Availability only — the display-only working window is layered on afterwards by #withWindow, and
         // only for the display path, so this core never initializes the LAZY dayWindows collection.
-        List<WorkIntervalDto> intervals = scheduleMapper.toIntervalDtosForDay(covering, isoDow);
+        List<WorkIntervalDto> intervals = covering.intervalsForDay(isoDow);
         return scheduleMapper.toEffectiveDay(date, EffectiveDaySource.TEMPLATE, intervals);
     }
 
-    private WeeklySchedule firstCovering(List<WeeklySchedule> windows, LocalDate date) {
+    private ScheduleTemplate firstCovering(List<ScheduleTemplate> windows, LocalDate date) {
         return windows.stream()
-                .filter(ws -> new DateRange(ws.getValidFrom(), ws.getValidTo()).contains(date))
+                .filter(ws -> new DateRange(ws.validFrom(), ws.validTo()).contains(date))
                 .findFirst()
                 .orElse(null);
     }

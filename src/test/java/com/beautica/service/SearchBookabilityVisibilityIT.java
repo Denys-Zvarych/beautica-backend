@@ -1,6 +1,7 @@
 package com.beautica.service;
 
 import com.beautica.AbstractIntegrationTest;
+import com.beautica.common.TimeZones;
 import com.beautica.support.BookableMasterSeeder;
 import com.beautica.support.LocalityTestLookup;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -16,6 +17,8 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
 import java.math.BigDecimal;
+import java.time.LocalDate;
+import java.time.LocalTime;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -27,7 +30,10 @@ import static org.assertj.core.api.Assertions.assertThat;
  * Client discovery shows only bookable providers (locked product decision 2026-10-05): a master is
  * listed only with ≥1 active service AND a schedule, a salon only with ≥1 such master — the shared
  * {@code MasterBookabilitySql} rule, applied on every search path (static browse, static {@code q},
- * dynamic {@code serviceTypeSlugs}), in the salon price band, and in search suggestions.
+ * dynamic {@code serviceTypeSlugs}), in the salon price band, and in search suggestions. Since
+ * 2026-11-18 search additionally applies the strict free-slot verdict (SRCH-30/31): a FULLY BOOKED
+ * master leaves master search, and a salon whose only master is fully booked leaves salon search;
+ * suggestions keep the structural rule.
  *
  * <p>Fixture (one per test, real Postgres, real caches):
  * <ul>
@@ -134,6 +140,44 @@ class SearchBookabilityVisibilityIT extends AbstractIntegrationTest {
             assertThat(new BigDecimal(row.path("priceMin").asText())).isEqualByComparingTo("500.00");
             assertThat(new BigDecimal(row.path("priceMax").asText())).isEqualByComparingTo("500.00");
         }
+    }
+
+    // ── strict verdict: fully booked (SRCH-30 / SRCH-31) ────────────────────────────────────
+
+    @Test
+    @DisplayName("a master whose only slot gets booked leaves master search; her salon-less card is gone "
+            + "from the next uncached page (the booking evicts the per-master verdict)")
+    void should_hideMaster_when_lastSlotIsBooked() throws Exception {
+        UUID zoria = insertIndependentMaster("Zoria");
+        assignIndependentService(zoria, fx.configuredType());
+        LocalDate day = LocalDate.now(TimeZones.KYIV).plusDays(2);
+        BookableMasterSeeder.seedCustomHoursOverride(jdbcTemplate, zoria, day, LocalTime.of(10, 0), LocalTime.of(11, 0));
+        assertThat(ids(http.get(MASTERS_URL + "?page=0&size=20"), "masterId"))
+                .as("precondition: one free slot — listed (and the verdict is now cached)")
+                .contains(zoria.toString());
+
+        fixtures.bookTenOClockSlot(zoria, day);
+
+        assertThat(ids(http.get(MASTERS_URL + "?page=0&size=19"), "masterId"))
+                .containsExactly(fx.kalyna().toString());
+    }
+
+    @Test
+    @DisplayName("a salon whose only master's only slot gets booked leaves salon search (static + dynamic)")
+    void should_hideSalon_when_onlyMastersLastSlotIsBooked() throws Exception {
+        UUID vega = insertSalon("Vega Studio");
+        UUID vegaMaster = fixtures.createSalonMaster(vega);
+        assignSalonService(vega, vegaMaster, fx.configuredType(), "700.00");
+        LocalDate day = LocalDate.now(TimeZones.KYIV).plusDays(2);
+        BookableMasterSeeder.seedCustomHoursOverride(jdbcTemplate, vegaMaster, day, LocalTime.of(10, 0), LocalTime.of(11, 0));
+        assertThat(ids(http.get(SALONS_URL + "?page=0&size=20"), "salonId"))
+                .as("precondition: one free slot — listed").contains(vega.toString());
+
+        fixtures.bookTenOClockSlot(vegaMaster, day);
+
+        assertThat(ids(http.get(SALONS_URL + "?page=0&size=19"), "salonId")).containsExactly(fx.aurora().toString());
+        assertThat(ids(http.get(SALONS_URL + "?serviceTypeSlugs=" + fx.configuredType().slug()), "salonId"))
+                .containsExactly(fx.aurora().toString());
     }
 
     // ── suggestions ─────────────────────────────────────────────────────────────────────────

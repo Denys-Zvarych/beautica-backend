@@ -35,8 +35,12 @@ services:
       - beautica-net
 
   mailpit:
-    image: axllent/mailpit
+    # Pinned to the version running locally (2026-11-19); bump deliberately. Seed scripts read SMS codes and invite
+    # links out of it — MP_MAX_MESSAGES bounds the mailbox so long seeding sessions keep searches fast.
+    image: axllent/mailpit:v1.30.0
     container_name: beautica-mailpit
+    environment:
+      MP_MAX_MESSAGES: 5000
     ports:
       - "127.0.0.1:1025:1025"
       - "127.0.0.1:8025:8025"

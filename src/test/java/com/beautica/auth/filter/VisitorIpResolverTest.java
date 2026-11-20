@@ -1,6 +1,7 @@
 package com.beautica.auth.filter;
 
 import com.beautica.config.BookingInfoWorkerProperties;
+import com.beautica.config.ClientIpProperties;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.mock.web.MockHttpServletRequest;
@@ -16,7 +17,7 @@ class VisitorIpResolverTest {
     private static VisitorIpResolver resolver(String key) {
         BookingInfoWorkerProperties props = new BookingInfoWorkerProperties();
         props.setWorkerKey(key);
-        return new VisitorIpResolver(props);
+        return new VisitorIpResolver(props, new ClientIpResolver(ClientIpProperties.trustingForwardedHeaders()));
     }
 
     private static MockHttpServletRequest request(String workerKey, String cfIp) {

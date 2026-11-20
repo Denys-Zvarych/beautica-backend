@@ -23,6 +23,10 @@ spring:
       '[mail.smtp.writetimeout]': 1000
 
 app:
+  # B514 (AUTH-54) — OFF by default; the App Check ITs set the mode per class.
+  auth:
+    app-check:
+      mode: "OFF"
   # Phase 382: explicit — the test profile never calls Cloudflare; ITs that exercise the verifier opt in.
   turnstile:
     enabled: false
@@ -30,6 +34,8 @@ app:
   mail:
     transport: smtp
   rate-limit:
+    # ITs reach the app from 127.0.0.1 and isolate their per-IP buckets with a random X-Forwarded-For per request.
+    trust-forwarded-headers: true
     register-capacity: 100000
     login-capacity: 100000
     refresh-capacity: 100000
@@ -162,7 +168,7 @@ app:
   refresh-token:
     cleanup-retention: 7d
   password-reset-otp:
-    otp-ttl: 15m
+    otp-ttl: 10m
     max-attempts-per-code: 5
     cumulative-failure-threshold: 10
     lockout-duration: 15m

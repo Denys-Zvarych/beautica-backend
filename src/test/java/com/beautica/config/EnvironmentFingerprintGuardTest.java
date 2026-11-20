@@ -5,13 +5,16 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.boot.test.system.CapturedOutput;
 import org.springframework.boot.test.system.OutputCaptureExtension;
 import org.springframework.mock.env.MockEnvironment;
 
 import java.util.List;
+import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
@@ -1707,5 +1710,302 @@ class EnvironmentFingerprintGuardTest {
         assertThatThrownBy(() -> run(env, DeployEnvironment.STAGING, SmsMode.SMSCLUB))
                 .hasMessageContaining("rule staging-turbosms-token-blank")
                 .message().doesNotContain("staging-sms-mode").doesNotContain("staging-smsclub-token-present");
+    }
+
+    // ── B514 (AUTH-54) — App Check rules ─────────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("prod with App Check OFF fails naming prod-app-check-off")
+    void should_fail_when_prodAppCheckOff() {
+        MockEnvironment env = prodEnv().withProperty("app.auth.app-check.mode", "OFF");
+
+        assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("prod-app-check-off");
+    }
+
+    @Test
+    @DisplayName("prod with App Check LOG_ONLY passes (the incident lever stays allowed)")
+    void should_pass_when_prodAppCheckLogOnly() {
+        MockEnvironment env = prodEnv().withProperty("app.auth.app-check.mode", "LOG_ONLY");
+
+        assertThatCode(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS)).doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("prod with App Check LOG_ONLY logs the prod-app-check-log-only alert at ERROR on boot")
+    void should_logErrorAtBoot_when_prodAppCheckLogOnly() {
+        MockEnvironment env = prodEnv().withProperty("app.auth.app-check.mode", "LOG_ONLY");
+        env.setProperty("beautica.environment", DeployEnvironment.PROD.name());
+        env.setProperty("beautica.sms.mode", SmsMode.TURBOSMS.name());
+        org.apache.commons.logging.Log log = org.mockito.Mockito.mock(org.apache.commons.logging.Log.class);
+
+        EnvironmentFingerprintGuard.verify(env, log);
+
+        org.mockito.Mockito.verify(log).error(com.beautica.config.appcheck.AppCheckLogOnlyAlarm.LOG_ONLY_ALERT);
+    }
+
+    @Test
+    @DisplayName("prod with App Check ENFORCE logs no App Check alert")
+    void should_notLogAppCheckAlert_when_prodAppCheckEnforce() {
+        MockEnvironment env = prodEnv().withProperty("app.auth.app-check.mode", "ENFORCE");
+        env.setProperty("beautica.environment", DeployEnvironment.PROD.name());
+        env.setProperty("beautica.sms.mode", SmsMode.TURBOSMS.name());
+        org.apache.commons.logging.Log log = org.mockito.Mockito.mock(org.apache.commons.logging.Log.class);
+
+        EnvironmentFingerprintGuard.verify(env, log);
+
+        org.mockito.Mockito.verify(log, org.mockito.Mockito.never())
+                .error(com.beautica.config.appcheck.AppCheckLogOnlyAlarm.LOG_ONLY_ALERT);
+    }
+
+    @Test
+    @DisplayName("staging with App Check OFF passes (only prod refuses OFF)")
+    void should_pass_when_stagingAppCheckOff() {
+        MockEnvironment env = stagingEnv().withProperty("app.auth.app-check.mode", "OFF");
+
+        assertThatCode(() -> run(env, DeployEnvironment.STAGING, SmsMode.CAPTURE)).doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("prod with a non-Google App Check JWKS URL fails naming prod-app-check-jwks-url")
+    void should_fail_when_prodAppCheckJwksUrlRedirected() {
+        MockEnvironment env = prodEnv().withProperty("app.auth.app-check.jwks-url", "https://evil.example/jwks");
+
+        assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("prod-app-check-jwks-url");
+    }
+
+    @Test
+    @DisplayName("audit-fix: prod,local profile pair fails the local-profile rule")
+    void should_fail_when_localProfileActiveWithProd() {
+        MockEnvironment env = prodEnv();
+        env.setActiveProfiles("prod", "local");
+
+        assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("rule local-profile: local profile must not be active with prod/staging or on Railway");
+    }
+
+    @Test
+    @DisplayName("audit-fix: local profile on Railway fails the local-profile rule")
+    void should_fail_when_localProfileActiveOnRailway() {
+        MockEnvironment env = new MockEnvironment().withProperty("RAILWAY_ENVIRONMENT_NAME", "staging");
+        env.setActiveProfiles("local");
+
+        assertThatThrownBy(() -> run(env, DeployEnvironment.LOCAL, SmsMode.TURBOSMS))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("rule local-profile");
+    }
+
+    @Test
+    @DisplayName("audit-fix: local profile alone (no Railway, no prod/staging) passes, even with relaxed auth limits")
+    void should_pass_when_localProfileAlone() {
+        MockEnvironment env = new MockEnvironment().withProperty("app.auth-limits.login-max-failures", "1000");
+        env.setActiveProfiles("local");
+
+        assertThatCode(() -> run(env, DeployEnvironment.LOCAL, SmsMode.TURBOSMS)).doesNotThrowAnyException();
+    }
+
+    static Stream<Arguments> authLimitCountDefaults() {
+        AuthLimitsProperties d = AuthLimitsProperties.defaults();
+        return Stream.of(
+                Arguments.of("phone-otp-max-sends-per-window", (long) d.phoneOtpMaxSendsPerWindow()),
+                Arguments.of("phone-otp-max-verify-attempts", (long) d.phoneOtpMaxVerifyAttempts()),
+                Arguments.of("email-code-max-verify-attempts", (long) d.emailCodeMaxVerifyAttempts()),
+                Arguments.of("login-max-failures", (long) d.loginMaxFailures()),
+                Arguments.of("otp-verify-ip-capacity", d.otpVerifyIpCapacity()),
+                Arguments.of("guest-booking-ip-capacity", d.guestBookingIpCapacity()),
+                Arguments.of("phone-failed-verifies-per-day", (long) d.phoneFailedVerifiesPerDay()));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("authLimitCountDefaults")
+    @DisplayName("audit-fix: prod with any auth-limit count one above its default fails auth-limits-not-loosened")
+    void should_fail_when_prodLoosensAuthLimitCount(String key, long defaultValue) {
+        MockEnvironment env = prodEnv().withProperty("app.auth-limits." + key, String.valueOf(defaultValue + 1));
+
+        assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("rule auth-limits-not-loosened")
+                .hasMessageContaining("app.auth-limits." + key);
+    }
+
+    @Test
+    @DisplayName("audit-fix: the auth-limits-not-loosened message names the property but never its configured value")
+    void should_omitConfiguredValue_when_prodLoosensAuthLimit() {
+        MockEnvironment env = prodEnv().withProperty("app.auth-limits.login-max-failures", "987654");
+
+        assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("app.auth-limits.login-max-failures")
+                .hasMessageNotContaining("987654");
+    }
+
+    @Test
+    @DisplayName("audit-fix: prod with an unbindable auth limit fails closed without echoing the value")
+    void should_fail_when_prodAuthLimitUnbindable() {
+        MockEnvironment env = prodEnv().withProperty("app.auth-limits.login-max-failures", "abc");
+
+        assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("rule auth-limits-not-loosened: app.auth-limits.* could not be bound")
+                .hasMessageNotContaining("abc");
+    }
+
+    @Test
+    @DisplayName("audit-fix: prod with login-lock-window below its default fails auth-limits-not-loosened")
+    void should_fail_when_prodShortensLoginLockWindow() {
+        MockEnvironment env = prodEnv().withProperty("app.auth-limits.login-lock-window", "1m");
+
+        assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("app.auth-limits.login-lock-window");
+    }
+
+    @Test
+    @DisplayName("audit-fix: prod with every auth limit set to its default passes")
+    void should_pass_when_prodAuthLimitsAreDefaults() {
+        AuthLimitsProperties d = AuthLimitsProperties.defaults();
+        MockEnvironment env = prodEnv()
+                .withProperty("app.auth-limits.phone-otp-max-sends-per-window", String.valueOf(d.phoneOtpMaxSendsPerWindow()))
+                .withProperty("app.auth-limits.phone-otp-max-verify-attempts", String.valueOf(d.phoneOtpMaxVerifyAttempts()))
+                .withProperty("app.auth-limits.email-code-max-verify-attempts", String.valueOf(d.emailCodeMaxVerifyAttempts()))
+                .withProperty("app.auth-limits.login-max-failures", String.valueOf(d.loginMaxFailures()))
+                .withProperty("app.auth-limits.login-lock-window", d.loginLockWindow().toString())
+                .withProperty("app.auth-limits.otp-verify-ip-capacity", String.valueOf(d.otpVerifyIpCapacity()))
+                .withProperty("app.auth-limits.guest-booking-ip-capacity", String.valueOf(d.guestBookingIpCapacity()));
+
+        assertThatCode(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS)).doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("audit-fix: prod with tighter auth limits (lower count, longer lock window) passes")
+    void should_pass_when_prodTightensAuthLimits() {
+        MockEnvironment env = prodEnv()
+                .withProperty("app.auth-limits.login-max-failures", "1")
+                .withProperty("app.auth-limits.login-lock-window", "1h");
+
+        assertThatCode(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS)).doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("audit-fix: staging with a relaxed auth limit fails auth-limits-not-loosened too")
+    void should_fail_when_stagingLoosensAuthLimits() {
+        MockEnvironment env = stagingEnv().withProperty("app.auth-limits.otp-verify-ip-capacity", "100000");
+
+        assertThatThrownBy(() -> run(env, DeployEnvironment.STAGING, SmsMode.CAPTURE))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("app.auth-limits.otp-verify-ip-capacity");
+    }
+
+    @Test
+    @DisplayName("prod shortens the OTP resend cooldown — boot fails (limits may only tighten)")
+    void should_fail_when_prodShortensOtpResendCooldown() {
+        MockEnvironment env = prodEnv().withProperty("app.auth-limits.otp-resend-cooldown-seconds", "59");
+
+        assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("rule auth-limits-not-loosened")
+                .hasMessageContaining("app.auth-limits.otp-resend-cooldown-seconds");
+    }
+
+    @Test
+    @DisplayName("prod lengthens the OTP resend cooldown — boot passes")
+    void should_pass_when_prodLengthensOtpResendCooldown() {
+        MockEnvironment env = prodEnv().withProperty("app.auth-limits.otp-resend-cooldown-seconds", "120")
+                .withProperty("app.auth-limits.phone-failed-verifies-per-day", "5");
+
+        assertThatCode(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS)).doesNotThrowAnyException();
+    }
+
+    // ── AUTH-D29 — phone-first rollout boot guard (rule phone-first-rollout) ──────────────────────────
+
+    private static MockEnvironment rolloutEnv(DeployEnvironment environment) {
+        return environment == DeployEnvironment.PROD ? prodEnv() : stagingEnv();
+    }
+
+    private static SmsMode smsModeFor(DeployEnvironment environment) {
+        return environment == DeployEnvironment.PROD ? SmsMode.TURBOSMS : SmsMode.CAPTURE;
+    }
+
+    @ParameterizedTest(name = "{0} {1}=true min={2}")
+    @CsvSource({
+            "PROD,    app.auth.require-phone-registration, 13",
+            "PROD,    app.auth.require-verified-phone,     13",
+            "STAGING, app.auth.require-phone-registration, 0",
+            "STAGING, app.auth.require-verified-phone,     13"})
+    @DisplayName("a REQUIRE_* flag on with min build below the phone-first floor — boot fails")
+    void should_failBoot_when_requireFlagOnBelowPhoneFirstBuild(DeployEnvironment environment, String flag,
+                                                               int minVersionCode) {
+        MockEnvironment env = rolloutEnv(environment).withProperty(flag, "true")
+                .withProperty("app.client-version.android.min-version-code", String.valueOf(minVersionCode));
+
+        assertThatThrownBy(() -> run(env, environment, smsModeFor(environment)))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("rule phone-first-rollout")
+                .hasMessageContaining(String.valueOf(ClientBuildFloors.PHONE_FIRST_MIN_VERSION_CODE));
+    }
+
+    @ParameterizedTest(name = "{0} {1}=true")
+    @CsvSource({
+            "PROD,    app.auth.require-phone-registration",
+            "PROD,    app.auth.require-verified-phone",
+            "STAGING, app.auth.require-verified-phone"})
+    @DisplayName("a REQUIRE_* flag on with min build at the phone-first floor — boot passes")
+    void should_boot_when_requireFlagOnAtPhoneFirstBuild(DeployEnvironment environment, String flag) {
+        MockEnvironment env = rolloutEnv(environment).withProperty(flag, "true")
+                .withProperty("app.client-version.android.min-version-code",
+                        String.valueOf(ClientBuildFloors.PHONE_FIRST_MIN_VERSION_CODE));
+
+        assertThatCode(() -> run(env, environment, smsModeFor(environment))).doesNotThrowAnyException();
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @CsvSource({"PROD", "STAGING"})
+    @DisplayName("App Check replay ENFORCE with min build below the limited-use floor — boot fails")
+    void should_failBoot_when_replayEnforceBelowLimitedUseBuild(DeployEnvironment environment) {
+        MockEnvironment env = rolloutEnv(environment).withProperty("app.auth.app-check.replay-mode", "ENFORCE")
+                .withProperty("app.client-version.android.min-version-code",
+                        String.valueOf(ClientBuildFloors.APP_CHECK_LIMITED_USE_MIN_VERSION_CODE - 1));
+
+        assertThatThrownBy(() -> run(env, environment, smsModeFor(environment)))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("rule phone-first-rollout")
+                .hasMessageContaining("app.auth.app-check.replay-mode");
+    }
+
+    @ParameterizedTest(name = "{0} replay={1}")
+    @CsvSource({"PROD, ENFORCE, 14", "PROD, LOG_ONLY, 0", "STAGING, OFF, 0", "STAGING, ENFORCE, 20"})
+    @DisplayName("App Check replay mode allowed for the configured min build — boot passes")
+    void should_boot_when_replayModeAllowedForMinimum(DeployEnvironment environment, String replayMode,
+                                                      int minVersionCode) {
+        MockEnvironment env = rolloutEnv(environment).withProperty("app.auth.app-check.replay-mode", replayMode)
+                .withProperty("app.client-version.android.min-version-code", String.valueOf(minVersionCode));
+
+        assertThatCode(() -> run(env, environment, smsModeFor(environment))).doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("rollout flags on in test or local — the rule does not apply, boot passes")
+    void should_boot_when_flagsOnInTestOrLocal() {
+        MockEnvironment env = new MockEnvironment()
+                .withProperty("app.auth.require-phone-registration", "true")
+                .withProperty("app.auth.require-verified-phone", "true")
+                .withProperty("app.auth.app-check.replay-mode", "ENFORCE");
+        env.setActiveProfiles("test");
+
+        assertThatCode(() -> EnvironmentFingerprintGuard.verify(env)).doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("an unbindable rollout flag — boot fails closed")
+    void should_failBoot_when_rolloutFlagUnbindable() {
+        MockEnvironment env = prodEnv().withProperty("app.auth.app-check.replay-mode", "SOMETIMES");
+
+        assertThatThrownBy(() -> run(env, DeployEnvironment.PROD, SmsMode.TURBOSMS))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("rule phone-first-rollout");
     }
 }

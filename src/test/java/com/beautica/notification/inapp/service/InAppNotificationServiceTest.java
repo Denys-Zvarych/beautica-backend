@@ -11,6 +11,7 @@ import com.beautica.moderation.entity.ReportTargetType;
 import com.beautica.moderation.service.ModerationOutcome;
 import com.beautica.notification.inapp.entity.InAppNotificationType;
 import com.beautica.notification.inapp.repository.InAppNotificationRepository;
+import com.beautica.notification.service.ReminderKind;
 import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.user.User;
@@ -31,6 +32,7 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
+import static com.beautica.booking.repository.ReminderFeedTargetFixtures.reminderFeedTarget;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
@@ -265,8 +267,8 @@ class InAppNotificationServiceTest {
 
         // Act
         service.notifyBookingRemindersBulk(List.of(
-                reminderTarget(first, clientId, salonId, firstStart),
-                reminderTarget(second, otherClient, null, secondStart)));
+                reminderFeedTarget(first, clientId, salonId, firstStart),
+                reminderFeedTarget(second, otherClient, null, secondStart)));
 
         // Assert
         verify(repository, times(1)).insertEventRowsBulk(eq("BOOKING_REMINDER"),
@@ -289,8 +291,8 @@ class InAppNotificationServiceTest {
 
         // Act
         service.notifyBookingRemindersBulk(List.of(
-                reminderTarget(UUID.randomUUID(), null, salonId, startsAt),
-                reminderTarget(bookingId, clientId, salonId, startsAt)));
+                reminderFeedTarget(UUID.randomUUID(), null, salonId, startsAt),
+                reminderFeedTarget(bookingId, clientId, salonId, startsAt)));
 
         // Assert
         verify(repository, times(1)).insertEventRowsBulk(eq("BOOKING_REMINDER"), eq(new UUID[] {clientId}),
@@ -303,7 +305,7 @@ class InAppNotificationServiceTest {
     void should_writeNothing_when_noReminderTargetHasClient() {
         // Act
         service.notifyBookingRemindersBulk(List.of(
-                reminderTarget(UUID.randomUUID(), null, salonId, OffsetDateTime.parse("2026-11-15T10:30:00Z"))));
+                reminderFeedTarget(UUID.randomUUID(), null, salonId, OffsetDateTime.parse("2026-11-15T10:30:00Z"))));
         service.notifyBookingRemindersBulk(List.of());
 
         // Assert
@@ -320,7 +322,7 @@ class InAppNotificationServiceTest {
         OffsetDateTime startsAt = OffsetDateTime.parse("2026-11-15T10:30:00Z");
 
         // Act
-        service.notifyBookingRemindersBulk(List.of(reminderTarget(bookingId, clientId, salonId, startsAt)));
+        service.notifyBookingRemindersBulk(List.of(reminderFeedTarget(bookingId, clientId, salonId, startsAt)));
 
         // Assert
         verify(repository, times(1)).insertEventRowsBulkWithPush(eq("BOOKING_REMINDER"), eq(new UUID[] {clientId}),
@@ -329,18 +331,86 @@ class InAppNotificationServiceTest {
         verify(repository, never()).insertEventRowsBulk(any(), any(), any(), any(), any(), any());
     }
 
-    private static BookingRepository.ReminderFeedTarget reminderTarget(
-            UUID id, UUID clientId, UUID salonId, OffsetDateTime startsAt) {
-        return new ReminderTarget(id, clientId, salonId, startsAt);
+    // ── Phase 522 — 2 h BOOKING_REMINDER (window-carrying dedup key) ──────────────────────────────
+
+    @Test
+    @DisplayName("B522: notifyBookingRemindersBulk(H2) keys the row BOOKING_REMINDER:id:startsAt s:H2")
+    void should_suffixKeyWithH2_when_notifyBookingRemindersBulkTwoHour() {
+        // Arrange
+        UUID bookingId = UUID.randomUUID();
+        OffsetDateTime startsAt = OffsetDateTime.parse("2026-11-15T10:30:00Z");
+
+        // Act
+        service.notifyBookingRemindersBulk(List.of(reminderFeedTarget(bookingId, clientId, salonId, startsAt)),
+                ReminderKind.H2);
+
+        // Assert
+        verify(repository, times(1)).insertEventRowsBulk(eq("BOOKING_REMINDER"), eq(new UUID[] {clientId}),
+                eq(new UUID[] {bookingId}), eq(new UUID[] {null}), eq(new UUID[] {salonId}),
+                eq(new String[] {"BOOKING_REMINDER:" + bookingId + ":" + startsAt.toEpochSecond() + ":H2"}));
+        org.mockito.Mockito.verifyNoMoreInteractions(repository);
     }
 
-    private record ReminderTarget(UUID id, UUID clientId, UUID salonId, OffsetDateTime startsAt)
-            implements BookingRepository.ReminderFeedTarget {
-        @Override public UUID getId() { return id; }
-        @Override public UUID getClientId() { return clientId; }
-        @Override public UUID getSalonId() { return salonId; }
-        @Override public OffsetDateTime getStartsAt() { return startsAt; }
+    @Test
+    @DisplayName("B522: notifyBookingRemindersBulk(H24) keeps the B495 key byte-identical (no window suffix)")
+    void should_keepUnsuffixedKey_when_notifyBookingRemindersBulkDayBefore() {
+        // Arrange
+        UUID bookingId = UUID.randomUUID();
+        OffsetDateTime startsAt = OffsetDateTime.parse("2026-11-15T10:30:00Z");
+
+        // Act
+        service.notifyBookingRemindersBulk(List.of(reminderFeedTarget(bookingId, clientId, salonId, startsAt)),
+                ReminderKind.H24);
+
+        // Assert
+        verify(repository, times(1)).insertEventRowsBulk(eq("BOOKING_REMINDER"), eq(new UUID[] {clientId}),
+                eq(new UUID[] {bookingId}), eq(new UUID[] {null}), eq(new UUID[] {salonId}),
+                eq(new String[] {"BOOKING_REMINDER:" + bookingId + ":" + startsAt.toEpochSecond()}));
     }
+
+    @Test
+    @DisplayName("B522: the 24 h and 2 h writes for ONE booking produce two distinct keys (both rows survive dedup)")
+    void should_writeDistinctKeys_when_dayBeforeAndTwoHourForSameBooking() {
+        // Arrange
+        UUID bookingId = UUID.randomUUID();
+        OffsetDateTime startsAt = OffsetDateTime.parse("2026-11-15T10:30:00Z");
+        List<BookingRepository.ReminderFeedTarget> targets =
+                List.of(reminderFeedTarget(bookingId, clientId, salonId, startsAt));
+        ArgumentCaptor<String[]> keys = ArgumentCaptor.forClass(String[].class);
+
+        // Act
+        service.notifyBookingRemindersBulk(targets);
+        service.notifyBookingRemindersBulk(targets, ReminderKind.H2);
+
+        // Assert
+        verify(repository, times(2)).insertEventRowsBulk(eq("BOOKING_REMINDER"), any(), any(), any(), any(),
+                keys.capture());
+        assertThat(keys.getAllValues()).extracting(k -> k[0]).containsExactly(
+                "BOOKING_REMINDER:" + bookingId + ":" + startsAt.toEpochSecond(),
+                "BOOKING_REMINDER:" + bookingId + ":" + startsAt.toEpochSecond() + ":H2");
+    }
+
+    @Test
+    @DisplayName("B522: notifyBookingRemindersBulk(H2) with pushEnabled=true writes through the bulk push twin")
+    void should_usePushTwin_when_pushEnabledTwoHourReminderBulkWrite() {
+        // Arrange
+        service = new InAppNotificationService(
+                repository, salonRepository, new InAppRecipientResolver(userRepository), true);
+        UUID bookingId = UUID.randomUUID();
+        OffsetDateTime startsAt = OffsetDateTime.parse("2026-11-15T10:30:00Z");
+
+        // Act
+        service.notifyBookingRemindersBulk(List.of(reminderFeedTarget(bookingId, clientId, salonId, startsAt)),
+                ReminderKind.H2);
+
+        // Assert
+        verify(repository, times(1)).insertEventRowsBulkWithPush(eq("BOOKING_REMINDER"), eq(new UUID[] {clientId}),
+                eq(new UUID[] {bookingId}), eq(new UUID[] {null}), eq(new UUID[] {salonId}),
+                eq(new String[] {"BOOKING_REMINDER:" + bookingId + ":" + startsAt.toEpochSecond() + ":H2"}));
+        verify(repository, never()).insertEventRowsBulk(any(), any(), any(), any(), any(), any());
+    }
+
+
 
     @Test
     @DisplayName("notifyInviteAccepted: dedup key is INVITE_ACCEPTED:salonId:newMemberUserId")

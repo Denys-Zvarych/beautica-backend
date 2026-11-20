@@ -29,9 +29,11 @@ public class VisitorIpResolver {
     private static final String CLIENT_IP_HEADER = "X-Beautica-Client-IP";
 
     private final String workerKey;
+    private final ClientIpResolver clientIpResolver;
 
-    public VisitorIpResolver(BookingInfoWorkerProperties properties) {
+    public VisitorIpResolver(BookingInfoWorkerProperties properties, ClientIpResolver clientIpResolver) {
         this.workerKey = properties.isEnabled() ? properties.getWorkerKey() : null;
+        this.clientIpResolver = clientIpResolver;
     }
 
     /** @return the trusted forwarded visitor IP, else the rate-limit filter's client IP */
@@ -49,6 +51,6 @@ public class VisitorIpResolver {
                 }
             }
         }
-        return ClientIpResolver.resolve(request);
+        return clientIpResolver.resolve(request);
     }
 }

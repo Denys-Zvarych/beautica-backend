@@ -1,5 +1,6 @@
 package com.beautica.salon;
 
+import com.beautica.support.StaffInviteFixtures;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.auth.dto.InviteAcceptRequest;
 import com.beautica.auth.dto.InviteErrorResponse;
@@ -123,9 +124,9 @@ class PendingInviteCancelAcceptRaceIT extends AbstractIntegrationTest {
         // Arrange
         UUID ownerId = insertUser("owner-race-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
         UUID salonId = insertSalon(ownerId, "Cancel-Accept Race Salon");
-        String raceEmail = "race-invitee-" + System.nanoTime() + "@beautica.test";
+        String racePhone = StaffInviteFixtures.newPhone();
         String rawToken = "raw-race-token-" + UUID.randomUUID();
-        UUID inviteId = insertInviteTokenWithRawToken(raceEmail, salonId, "SALON_MASTER",
+        UUID inviteId = insertInviteTokenWithRawToken(racePhone, salonId, "SALON_MASTER",
                 Instant.now().plus(7, ChronoUnit.DAYS), rawToken);
         String ownerToken = loginAndGetToken(emailOf(ownerId));
 
@@ -171,7 +172,8 @@ class PendingInviteCancelAcceptRaceIT extends AbstractIntegrationTest {
         AtomicReference<ResponseEntity<String>> respAccept = new AtomicReference<>();
         log.debug("Act: launch accept thread — POST {} for the SAME invite's raw token while cancel holds the lock",
                 ACCEPT_URL);
-        var acceptRequest = new InviteAcceptRequest(rawToken, TEST_PASSWORD, "Race", "Invitee", "+380501234567");
+        var acceptRequest = new InviteAcceptRequest(rawToken, TEST_PASSWORD, "Race", "Invitee", null, null, null, null,
+                StaffInviteFixtures.seedRegistrationTicket(jdbcTemplate, racePhone));
         Thread.ofVirtual().start(() -> {
             try {
                 respAccept.set(restTemplate.postForEntity(ACCEPT_URL, acceptRequest, String.class));
@@ -239,7 +241,7 @@ class PendingInviteCancelAcceptRaceIT extends AbstractIntegrationTest {
         assertThat(acceptBody.data().code()).isEqualTo(InviteTokenException.Code.INVITE_REVOKED.name());
 
         Integer provisionedAccounts = jdbcTemplate.queryForObject(
-                "SELECT COUNT(*) FROM users WHERE email = ?", Integer.class, raceEmail);
+                "SELECT COUNT(*) FROM users WHERE phone_number = ?", Integer.class, racePhone);
         assertThat(provisionedAccounts)
                 .as("THE decisive security assertion: no account must ever be provisioned for an "
                         + "invite the admin was told (204) had been cancelled — this is exactly what the "
@@ -284,13 +286,13 @@ class PendingInviteCancelAcceptRaceIT extends AbstractIntegrationTest {
         return salonId;
     }
 
-    private UUID insertInviteTokenWithRawToken(String email, UUID salonId, String role, Instant expiresAt,
+    private UUID insertInviteTokenWithRawToken(String phone, UUID salonId, String role, Instant expiresAt,
             String rawToken) {
         UUID id = UUID.randomUUID();
         jdbcTemplate.update(
-                "INSERT INTO invite_tokens (id, token, email, salon_id, role, expires_at, is_used, created_at, updated_at) "
+                "INSERT INTO invite_tokens (id, token, phone, salon_id, role, expires_at, is_used, created_at, updated_at) "
                         + "VALUES (?, ?, ?, ?, ?, ?, false, NOW(), NOW())",
-                id, sha256Hex(rawToken), email, salonId, role, Timestamp.from(expiresAt));
+                id, sha256Hex(rawToken), phone, salonId, role, Timestamp.from(expiresAt));
         return id;
     }
 
